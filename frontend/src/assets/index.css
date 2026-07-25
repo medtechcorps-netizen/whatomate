@@ -5,8 +5,8 @@
 @layer base {
   /* Dark-first: Linear/Vercel inspired dark mode */
   :root {
-    /* True black background like Linear/Vercel */
-    --background: 0 0% 2.5%;
+    /* ReReply olive-black foundation */
+    --background: 80 13% 5%;
     --foreground: 0 0% 98%;
 
     /* Glass morphism cards - slightly transparent */
@@ -15,8 +15,8 @@
     --popover: 0 0% 7%;
     --popover-foreground: 0 0% 98%;
 
-    /* Emerald green primary (WhatsApp style) */
-    --primary: 160 84% 39%;
+    /* Olive primary drawn from the supplied Reaform family mark */
+    --primary: 70 23% 36%;
     --primary-foreground: 0 0% 100%;
 
     /* Subtle secondary/muted for glass effect */
@@ -33,7 +33,7 @@
     /* Subtle borders - key for Linear look */
     --border: 0 0% 12%;
     --input: 0 0% 12%;
-    --ring: 160 84% 39%;
+    --ring: 69 40% 72%;
     --radius: 0.75rem;
 
     /* Glass effect utilities */
@@ -50,7 +50,7 @@
     --card-foreground: 0 0% 9%;
     --popover: 0 0% 100%;
     --popover-foreground: 0 0% 9%;
-    --primary: 160 84% 39%;
+    --primary: 70 23% 36%;
     --primary-foreground: 0 0% 100%;
     --secondary: 0 0% 96%;
     --secondary-foreground: 0 0% 9%;
@@ -62,7 +62,7 @@
     --destructive-foreground: 0 0% 100%;
     --border: 0 0% 90%;
     --input: 0 0% 90%;
-    --ring: 160 84% 39%;
+    --ring: 70 23% 36%;
 
     /* Glass effect utilities for light mode */
     --glass-bg: rgba(0, 0, 0, 0.02);
@@ -72,13 +72,13 @@
 
   /* Legacy dark class support */
   .dark {
-    --background: 0 0% 2.5%;
+    --background: 80 13% 5%;
     --foreground: 0 0% 98%;
     --card: 0 0% 5%;
     --card-foreground: 0 0% 98%;
     --popover: 0 0% 7%;
     --popover-foreground: 0 0% 98%;
-    --primary: 160 84% 39%;
+    --primary: 70 23% 36%;
     --primary-foreground: 0 0% 100%;
     --secondary: 0 0% 8%;
     --secondary-foreground: 0 0% 90%;
@@ -90,7 +90,7 @@
     --destructive-foreground: 0 0% 100%;
     --border: 0 0% 12%;
     --input: 0 0% 12%;
-    --ring: 160 84% 39%;
+    --ring: 69 40% 72%;
 
     /* Glass effect utilities */
     --glass-bg: rgba(255, 255, 255, 0.03);
@@ -113,10 +113,10 @@
     line-height: 1.5;
     font-weight: 400;
     /* Subtle gradient for depth like Linear/Vercel */
-    background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(16, 185, 129, 0.08), transparent);
+    background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(105, 112, 70, 0.1), transparent);
   }
   .light body {
-    background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(16, 185, 129, 0.05), transparent);
+    background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(105, 112, 70, 0.07), transparent);
   }
   h1, h2, h3, h4, h5, h6 {
     @apply font-medium;
@@ -140,6 +140,60 @@
   a {
     @apply text-primary font-medium;
     text-decoration: none;
+  }
+}
+
+.brand-mark-light {
+  filter: brightness(2.35) saturate(0.72);
+}
+
+.brand-wordmark,
+.auth-title {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-weight: 500;
+}
+
+.auth-grid {
+  background-image:
+    linear-gradient(rgba(203, 212, 154, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(203, 212, 154, 0.035) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: linear-gradient(to bottom, black, transparent 78%);
+}
+
+.light .auth-grid {
+  background-image:
+    linear-gradient(rgba(78, 82, 51, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(78, 82, 51, 0.06) 1px, transparent 1px);
+}
+
+.auth-glow {
+  background: rgba(105, 112, 70, 0.18);
+  filter: blur(95px);
+  pointer-events: none;
+}
+
+.auth-glow-bottom {
+  background: rgba(203, 212, 154, 0.08);
+}
+
+.auth-orbit {
+  animation: brand-orbit 24s linear infinite;
+}
+
+.auth-orbit-inner {
+  animation-direction: reverse;
+  animation-duration: 18s;
+}
+
+@keyframes brand-orbit {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-orbit {
+    animation: none;
   }
 }
 
@@ -199,7 +253,7 @@
   left: 0;
   width: 100%;
   height: 2px;
-  background: linear-gradient(90deg, #22c55e, #10b981, #059669);
+  background: linear-gradient(90deg, #4e5233, #77804f, #cbd49a);
   transform: scaleX(0);
   transform-origin: left;
   transition: transform 0.3s ease;
@@ -240,7 +294,7 @@
   box-shadow:
     0 25px 50px -12px rgba(0, 0, 0, 0.5),
     0 0 0 1px rgba(255, 255, 255, 0.1),
-    0 0 30px -5px rgba(16, 185, 129, 0.15);
+    0 0 30px -5px rgba(105, 112, 70, 0.18);
   transform: translateY(-2px);
 }
 
@@ -249,7 +303,7 @@
   box-shadow:
     0 25px 50px -12px rgba(0, 0, 0, 0.1),
     0 0 0 1px rgba(0, 0, 0, 0.05),
-    0 0 30px -5px rgba(16, 185, 129, 0.1);
+    0 0 30px -5px rgba(105, 112, 70, 0.12);
 }
 
 /* List item hover - for contact lists, menu items, etc */
@@ -702,7 +756,7 @@
   position: absolute;
   inset: -2px;
   border-radius: 9999px;
-  background: linear-gradient(135deg, hsl(var(--primary)), hsl(160 84% 55%));
+  background: linear-gradient(135deg, hsl(var(--primary)), hsl(69 40% 72%));
   z-index: -1;
 }
 

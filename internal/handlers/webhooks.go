@@ -357,7 +357,7 @@ func (a *App) TestWebhook(r *fastglue.Request) error {
 	// Send a test event synchronously
 	testData := map[string]any{
 		"test":      true,
-		"message":   "This is a test webhook from Omnitech",
+		"message":   "This is a test webhook from ReReply",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	}
 

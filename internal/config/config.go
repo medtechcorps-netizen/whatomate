@@ -228,7 +228,7 @@ func Load(configPath string) (*Config, error) {
 
 func setDefaults(cfg *Config) {
 	if cfg.App.Name == "" {
-		cfg.App.Name = "Whatomate"
+		cfg.App.Name = "ReReply"
 	}
 	if cfg.App.Environment == "" {
 		cfg.App.Environment = "development"

@@ -8,8 +8,8 @@ export const buttonVariants = cva(
   {
     variants: {
       variant: {
-        // Gradient primary button with glow
-        default: "bg-gradient-to-r from-emerald-500 to-green-600 text-white shadow-lg shadow-emerald-500/25 hover:shadow-emerald-500/40 hover:from-emerald-600 hover:to-green-700",
+        // ReReply olive primary button with a restrained brand glow
+        default: "bg-gradient-to-r from-[#5b613c] to-[#747c4d] text-white shadow-lg shadow-[#4e5233]/25 hover:shadow-[#697046]/35 hover:from-[#697046] hover:to-[#838c57]",
         destructive:
           "bg-gradient-to-r from-red-500 to-rose-600 text-white shadow-lg shadow-red-500/25 hover:shadow-red-500/40",
         // Glass outline for dark mode

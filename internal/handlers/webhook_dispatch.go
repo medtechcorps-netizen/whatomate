@@ -183,7 +183,7 @@ func (a *App) sendWebhookRequest(ctx context.Context, webhook models.Webhook, js
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Omnitech-Webhook/1.0")
+	req.Header.Set("User-Agent", "ReReply-Webhook/1.0")
 
 	// Add custom headers from webhook config
 	if webhook.Headers != nil {
