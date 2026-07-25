@@ -7,6 +7,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/middleware"
+	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -550,6 +551,45 @@ func TestAuth_MultipleMiddlewareChain(t *testing.T) {
 
 	// Verify CORS headers are still present
 	assert.Equal(t, "https://example.com", string(req.RequestCtx.Response.Header.Peek("Access-Control-Allow-Origin")))
+}
+
+func TestAuthWithDB_RejectsTokenAfterOrganizationMembershipIsRemoved(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, org.ID)
+	token := generateTestToken(t, user.ID, org.ID, user.Email, user.RoleID, time.Hour)
+
+	require.NoError(t, db.Where("user_id = ? AND organization_id = ?", user.ID, org.ID).
+		Delete(&models.UserOrganization{}).Error)
+
+	req := newTestRequest()
+	req.RequestCtx.Request.Header.Set("Authorization", "Bearer "+token)
+
+	result := middleware.AuthWithDB(testJWTSecret, db)(req)
+
+	assert.Nil(t, result)
+	assert.Equal(t, fasthttp.StatusUnauthorized, req.RequestCtx.Response.StatusCode())
+}
+
+func TestAuthWithDB_UsesCurrentOrganizationRoleInsteadOfStaleTokenRole(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	oldRole := testutil.CreateTestRole(t, db, org.ID, "old-role", nil)
+	newRole := testutil.CreateTestRole(t, db, org.ID, "new-role", nil)
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithRoleID(&oldRole.ID))
+	token := generateTestToken(t, user.ID, org.ID, user.Email, &oldRole.ID, time.Hour)
+
+	require.NoError(t, db.Model(&models.UserOrganization{}).
+		Where("user_id = ? AND organization_id = ?", user.ID, org.ID).
+		Update("role_id", newRole.ID).Error)
+
+	req := newTestRequest()
+	req.RequestCtx.Request.Header.Set("Authorization", "Bearer "+token)
+
+	result := middleware.AuthWithDB(testJWTSecret, db)(req)
+
+	require.NotNil(t, result)
+	assert.Equal(t, newRole.ID, result.RequestCtx.UserValue(middleware.ContextKeyRoleID))
 }
 
 // generateTokenWithSecret creates a token signed with a specific secret.

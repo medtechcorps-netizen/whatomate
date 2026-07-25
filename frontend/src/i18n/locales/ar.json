@@ -156,7 +156,7 @@
     "alreadyHaveAccount": "لديك حساب بالفعل؟",
     "fillAllFields": "يرجى ملء جميع الحقول",
     "passwordsMismatch": "كلمات السر غير متطابقة",
-    "passwordTooShort": "يجب أن تكون كلمة السر 8 أحرف على الأقل",
+    "passwordTooShort": "يجب أن تكون كلمة السر 12 حرفًا على الأقل",
     "registrationSuccess": "تم التسجيل بنجاح",
     "registrationFailed": "فشل التسجيل",
     "ssoLoading": "جاري إكمال تسجيل الدخول الموحد...",

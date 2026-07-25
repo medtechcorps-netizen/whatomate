@@ -35,6 +35,17 @@ func cacheTestApp(t *testing.T) *App {
 	}
 }
 
+func TestHasPermission_DoesNotFallBackToHomeRoleWithoutMembership(t *testing.T) {
+	app := cacheTestApp(t)
+	homeOrg := testutil.CreateTestOrganization(t, app.DB)
+	otherOrg := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, homeOrg.ID, "home-admin", []string{"contacts:read"})
+	user := testutil.CreateTestUser(t, app.DB, homeOrg.ID, testutil.WithRoleID(&role.ID))
+
+	assert.False(t, app.HasPermission(user.ID, "contacts", "read", otherOrg.ID),
+		"a user's home role must not grant permissions in an organization they do not belong to")
+}
+
 // makeAccount inserts a WhatsApp account with the given phone ID and tokens.
 func makeAccount(t *testing.T, app *App, orgID uuid.UUID, phoneID, accessToken, appSecret string) *models.WhatsAppAccount {
 	t.Helper()

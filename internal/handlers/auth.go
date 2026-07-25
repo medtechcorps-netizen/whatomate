@@ -22,10 +22,10 @@ type LoginRequest struct {
 
 // RegisterRequest represents registration data
 type RegisterRequest struct {
-	Email          string    `json:"email" validate:"required,email"`
-	Password       string    `json:"password" validate:"required,min=12"`
-	FullName       string    `json:"full_name" validate:"required"`
-	OrganizationID uuid.UUID `json:"organization_id" validate:"required"`
+	Email           string `json:"email" validate:"required,email"`
+	Password        string `json:"password" validate:"required,min=12"`
+	FullName        string `json:"full_name" validate:"required"`
+	InvitationToken string `json:"invitation_token" validate:"required"`
 }
 
 // CookieAuthResponse represents authentication response when tokens are in cookies.
@@ -55,7 +55,24 @@ func (a *App) Login(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid credentials", nil, "")
 	}
 
-	// Load permissions from cache
+	// Check if user is active
+	if !user.IsActive {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Account is disabled", nil, "")
+	}
+
+	// Verify password
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid credentials", nil, "")
+	}
+
+	// The membership table is authoritative. If the user's legacy home
+	// organization is no longer available, login may fall back to another
+	// active membership.
+	if err := a.applyOrganizationMembership(&user, user.OrganizationID, true); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "No active organization membership", nil, "")
+	}
+
+	// Load permissions for the role that belongs to the selected organization.
 	if user.Role != nil && user.RoleID != nil {
 		cachedPerms, err := a.GetRolePermissionsCached(*user.RoleID)
 		if err == nil {
@@ -73,16 +90,6 @@ func (a *App) Login(r *fastglue.Request) error {
 			}
 			user.Role.Permissions = permissions
 		}
-	}
-
-	// Check if user is active
-	if !user.IsActive {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Account is disabled", nil, "")
-	}
-
-	// Verify password
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid credentials", nil, "")
 	}
 
 	// Generate tokens
@@ -113,23 +120,23 @@ func (a *App) Register(r *fastglue.Request) error {
 		return nil
 	}
 
-	if req.OrganizationID == uuid.Nil {
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "organization_id is required", nil, "")
+	invitation, err := a.consumeOrganizationInvitation(req.InvitationToken)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "A valid organization invitation is required", nil, "")
 	}
+	organizationID := invitation.OrganizationID
 
 	// Validate the organization exists
 	var org models.Organization
-	if err := a.DB.Where("id = ?", req.OrganizationID).First(&org).Error; err != nil {
+	if err := a.DB.Where("id = ?", organizationID).First(&org).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
 	}
 
-	// Get the org's default role
+	// Invitations lock the role at creation time and the role must still belong
+	// to the same organization when the invitation is redeemed.
 	var defaultRole models.CustomRole
-	if err := a.DB.Where("organization_id = ? AND is_default = ?", req.OrganizationID, true).First(&defaultRole).Error; err != nil {
-		if err := a.DB.Where("organization_id = ? AND name = ? AND is_system = ?", req.OrganizationID, "agent", true).First(&defaultRole).Error; err != nil {
-			a.Log.Error("Failed to find default role", "error", err)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to find default role", nil, "")
-		}
+	if err := a.DB.Where("id = ? AND organization_id = ?", invitation.RoleID, organizationID).First(&defaultRole).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invitation role is no longer available", nil, "")
 	}
 
 	// Check if email already exists
@@ -148,7 +155,7 @@ func (a *App) Register(r *fastglue.Request) error {
 		// Check if already a member of this org
 		var count int64
 		a.DB.Model(&models.UserOrganization{}).
-			Where("user_id = ? AND organization_id = ?", existingUser.ID, req.OrganizationID).
+			Where("user_id = ? AND organization_id = ?", existingUser.ID, organizationID).
 			Count(&count)
 		if count > 0 {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, "You are already a member of this organization", nil, "")
@@ -157,7 +164,7 @@ func (a *App) Register(r *fastglue.Request) error {
 		// Add as member with default role
 		userOrg := models.UserOrganization{
 			UserID:         existingUser.ID,
-			OrganizationID: req.OrganizationID,
+			OrganizationID: organizationID,
 			RoleID:         &defaultRole.ID,
 			IsDefault:      false,
 		}
@@ -166,10 +173,10 @@ func (a *App) Register(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to join organization", nil, "")
 		}
 
-		a.Log.Info("Existing user joined organization", "user_id", existingUser.ID, "org_id", req.OrganizationID)
+		a.Log.Info("Existing user joined organization", "user_id", existingUser.ID, "org_id", organizationID)
 
 		// Set org context to the new org for token generation
-		existingUser.OrganizationID = req.OrganizationID
+		existingUser.OrganizationID = organizationID
 		existingUser.Role = &defaultRole
 		existingUser.RoleID = &defaultRole.ID
 
@@ -209,7 +216,7 @@ func (a *App) Register(r *fastglue.Request) error {
 	}
 
 	user := models.User{
-		OrganizationID: req.OrganizationID,
+		OrganizationID: organizationID,
 		Email:          req.Email,
 		PasswordHash:   string(hashedPassword),
 		FullName:       req.FullName,
@@ -219,13 +226,13 @@ func (a *App) Register(r *fastglue.Request) error {
 
 	if err := tx.Create(&user).Error; err != nil {
 		tx.Rollback()
-		a.Log.Error("Failed to create user", "error", err, "email", req.Email, "org_id", req.OrganizationID)
+		a.Log.Error("Failed to create user", "error", err, "email", req.Email, "org_id", organizationID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create account", nil, "")
 	}
 
 	userOrg := models.UserOrganization{
 		UserID:         user.ID,
-		OrganizationID: req.OrganizationID,
+		OrganizationID: organizationID,
 		RoleID:         &defaultRole.ID,
 		IsDefault:      true,
 	}
@@ -240,7 +247,7 @@ func (a *App) Register(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create account", nil, "")
 	}
 
-	a.Log.Info("Registration completed", "user_id", user.ID, "org_id", req.OrganizationID)
+	a.Log.Info("Registration completed", "user_id", user.ID, "org_id", organizationID)
 
 	user.Role = &defaultRole
 
@@ -278,9 +285,14 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 	}
 
 	// Parse and validate refresh token
-	token, err := jwt.ParseWithClaims(refreshTokenStr, &middleware.JWTClaims{}, func(token *jwt.Token) (any, error) {
-		return []byte(a.Config.JWT.Secret), nil
-	})
+	token, err := jwt.ParseWithClaims(
+		refreshTokenStr,
+		&middleware.JWTClaims{},
+		func(token *jwt.Token) (any, error) {
+			return []byte(a.Config.JWT.Secret), nil
+		},
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+	)
 
 	if err != nil || !token.Valid {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid refresh token", nil, "")
@@ -312,6 +324,10 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Account is disabled", nil, "")
 	}
 
+	if err := a.applyOrganizationMembership(&user, claims.OrganizationID, false); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Organization access is no longer available", nil, "")
+	}
+
 	// Generate new tokens (rotation: new refresh token with new JTI)
 	accessToken, err := a.generateAccessToken(&user)
 	if err != nil {
@@ -330,6 +346,52 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
 		User:      user,
 	})
+}
+
+// applyOrganizationMembership updates a user with the current organization and
+// role from user_organizations. Only initial login may fall back to a different
+// active membership; refresh and organization switching must honor the exact
+// organization already selected.
+func (a *App) applyOrganizationMembership(user *models.User, orgID uuid.UUID, allowFallback bool) error {
+	var membership models.UserOrganization
+	membershipErr := a.DB.Where("user_id = ? AND organization_id = ?", user.ID, orgID).First(&membership).Error
+	if membershipErr != nil && allowFallback && !user.IsSuperAdmin {
+		membershipErr = a.DB.Where("user_id = ?", user.ID).
+			Order("is_default DESC, created_at ASC").
+			First(&membership).Error
+		if membershipErr == nil {
+			orgID = membership.OrganizationID
+		}
+	}
+
+	if !user.IsSuperAdmin && membershipErr != nil {
+		return membershipErr
+	}
+
+	var org models.Organization
+	if err := a.DB.Where("id = ?", orgID).First(&org).Error; err != nil {
+		return err
+	}
+
+	user.OrganizationID = orgID
+	if membershipErr == nil {
+		user.RoleID = membership.RoleID
+	}
+
+	user.Role = nil
+	if user.RoleID != nil {
+		var role models.CustomRole
+		roleQuery := a.DB.Where("id = ?", *user.RoleID)
+		if !user.IsSuperAdmin || membershipErr == nil {
+			roleQuery = roleQuery.Where("organization_id = ?", orgID)
+		}
+		if err := roleQuery.First(&role).Error; err != nil {
+			return err
+		}
+		user.Role = &role
+	}
+
+	return nil
 }
 
 func (a *App) generateAccessToken(user *models.User) (string, error) {

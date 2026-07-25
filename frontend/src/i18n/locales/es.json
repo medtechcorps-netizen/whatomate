@@ -125,7 +125,7 @@
     "alreadyHaveAccount": "¿Ya tiene una cuenta?",
     "fillAllFields": "Por favor complete todos los campos",
     "passwordsMismatch": "Las contraseñas no coinciden",
-    "passwordTooShort": "La contraseña debe tener al menos 8 caracteres",
+    "passwordTooShort": "La contraseña debe tener al menos 12 caracteres",
     "registrationSuccess": "Registro exitoso",
     "registrationFailed": "Error en el registro",
     "ssoLoading": "Completando inicio de sesión SSO...",

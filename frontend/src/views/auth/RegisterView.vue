@@ -21,10 +21,10 @@ const password = ref('')
 const confirmPassword = ref('')
 const isLoading = ref(false)
 
-const organizationId = computed(() => (route.query.org as string) || '')
+const invitationToken = computed(() => (route.query.invite as string) || '')
 
 const handleRegister = async () => {
-  if (!organizationId.value) {
+  if (!invitationToken.value) {
     toast.error(t('auth.invitationRequired'))
     return
   }
@@ -39,7 +39,7 @@ const handleRegister = async () => {
     return
   }
 
-  if (password.value.length < 8) {
+  if (password.value.length < 12) {
     toast.error(t('auth.passwordTooShort'))
     return
   }
@@ -51,7 +51,7 @@ const handleRegister = async () => {
       full_name: fullName.value,
       email: email.value,
       password: password.value,
-      organization_id: organizationId.value
+      invitation_token: invitationToken.value
     })
     toast.success(t('auth.registrationSuccess'))
     router.push('/')
@@ -79,8 +79,8 @@ const handleRegister = async () => {
         </CardDescription>
       </CardHeader>
 
-      <!-- No org ID in URL — show invitation required message -->
-      <template v-if="!organizationId">
+      <!-- No invitation token in URL - show invitation required message -->
+      <template v-if="!invitationToken">
         <CardContent>
           <div class="text-center py-4">
             <p class="text-sm text-muted-foreground">
@@ -97,7 +97,7 @@ const handleRegister = async () => {
         </CardFooter>
       </template>
 
-      <!-- Has org ID — show registration form -->
+      <!-- Has a signed invitation token — show registration form -->
       <form v-else @submit.prevent="handleRegister">
         <CardContent class="space-y-4">
           <div class="space-y-2">

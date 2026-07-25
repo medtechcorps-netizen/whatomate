@@ -742,6 +742,8 @@ export interface Organization {
 export const organizationsService = {
   list: () => api.get<{ organizations: Organization[] }>('/organizations'),
   create: (data: { name: string }) => api.post('/organizations', data),
+  createInvitation: (data: { role_id?: string } = {}) =>
+    api.post<{ data: { token: string; expires_at: string } }>('/organizations/invitations', data),
   // Members
   addMember: (data: { user_id?: string; email?: string; role_id?: string }) =>
     api.post('/organizations/members', data),

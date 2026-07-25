@@ -125,7 +125,7 @@
     "alreadyHaveAccount": "पहले से ही एक खाता है?",
     "fillAllFields": "कृपया सभी फ़ील्ड भरें",
     "passwordsMismatch": "पासवर्ड मेल नहीं खाते",
-    "passwordTooShort": "पासवर्ड कम से कम 8 अक्षर का होना चाहिए",
+    "passwordTooShort": "पासवर्ड कम से कम 12 अक्षर का होना चाहिए",
     "registrationSuccess": "पंजीकरण सफल",
     "registrationFailed": "पंजीकरण विफल",
     "ssoLoading": "SSO लॉगिन पूरा किया जा रहा है...",

@@ -125,7 +125,7 @@
     "alreadyHaveAccount": "ஏற்கனவே கணக்கு உள்ளதா?",
     "fillAllFields": "அனைத்து புலங்களையும் நிரப்புக",
     "passwordsMismatch": "கடவுச்சொற்கள் பொருந்தவில்லை",
-    "passwordTooShort": "கடவுச்சொல் குறைந்தது 8 எழுத்துகள் இருக்க வேண்டும்",
+    "passwordTooShort": "கடவுச்சொல் குறைந்தது 12 எழுத்துகள் இருக்க வேண்டும்",
     "registrationSuccess": "பதிவு வெற்றிகரமானது",
     "registrationFailed": "பதிவு தோல்வியடைந்தது",
     "ssoLoading": "SSO உள்நுழைப்பு நிறைவடைகிறது...",
