@@ -1,4 +1,5 @@
 # Frontend build stage — pinned to BUILDPLATFORM (output is arch-agnostic JS).
+ARG BUILDPLATFORM=linux/amd64
 FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
 
 WORKDIR /app/frontend
@@ -15,8 +16,8 @@ RUN npm run build
 # so multi-arch builds don't emulate the Go toolchain under QEMU.
 FROM --platform=$BUILDPLATFORM golang:1.25.3-alpine AS builder
 
-ARG TARGETOS
-ARG TARGETARCH
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
 WORKDIR /app
 
@@ -39,7 +40,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -installsuff
 # Piper TTS download stage — runs on BUILDPLATFORM (just wget+tar, no native exec),
 # selects the tarball matching TARGETARCH so the final image gets a binary that runs.
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS piper-dl
-ARG TARGETARCH
+ARG TARGETARCH=amd64
 RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN case "${TARGETARCH}" in \
       amd64) PIPER_ARCH=x86_64 ;; \
