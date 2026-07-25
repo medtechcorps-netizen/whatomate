@@ -7,8 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -831,10 +830,10 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 
-	// Save file locally first
-	localPath, err := a.saveMediaLocally(fileData, mimeType, fileHeader.Filename)
+	// Persist the preview independently of the app instance.
+	mediaPath, err := a.saveMessageMedia(r.RequestCtx, orgID, fileData, mimeType, fileHeader.Filename)
 	if err != nil {
-		a.Log.Error("Failed to save media locally", "error", err)
+		a.Log.Error("Failed to store media", "error", err, "org_id", orgID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save media", nil, "")
 	}
 
@@ -844,7 +843,7 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 		Contact:       &contact,
 		Type:          models.MessageType(mediaType),
 		MediaData:     fileData,
-		MediaURL:      localPath,
+		MediaURL:      mediaPath,
 		MediaMimeType: mimeType,
 		MediaFilename: fileHeader.Filename,
 		Caption:       caption,
@@ -878,8 +877,9 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 	return r.SendEnvelope(response)
 }
 
-// saveMediaLocally saves media data to local storage and returns the relative path
-func (a *App) saveMediaLocally(data []byte, mimeType, filename string) (string, error) {
+// saveMessageMedia stores outbound or template media and returns a durable
+// object key (or a relative path for local development).
+func (a *App) saveMessageMedia(ctx context.Context, orgID uuid.UUID, data []byte, mimeType, filename string) (string, error) {
 	// Determine subdirectory based on MIME type
 	var subdir string
 	switch {
@@ -891,11 +891,6 @@ func (a *App) saveMediaLocally(data []byte, mimeType, filename string) (string, 
 		subdir = "audio"
 	default:
 		subdir = "documents"
-	}
-
-	// Ensure directory exists
-	if err := a.ensureMediaDir(subdir); err != nil {
-		return "", fmt.Errorf("failed to create media directory: %w", err)
 	}
 
 	// Get extension from MIME type or filename
@@ -911,18 +906,7 @@ func (a *App) saveMediaLocally(data []byte, mimeType, filename string) (string, 
 
 	// Generate unique filename
 	newFilename := uuid.New().String() + ext
-	filePath := filepath.Join(a.getMediaStoragePath(), subdir, newFilename)
-
-	// Save file
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		return "", fmt.Errorf("failed to save media file: %w", err)
-	}
-
-	// Return relative path
-	relativePath := filepath.Join(subdir, newFilename)
-	a.Log.Info("Media saved locally", "path", relativePath, "size", len(data))
-
-	return relativePath, nil
+	return a.saveTenantMedia(ctx, orgID, path.Join("messages", subdir), subdir, newFilename, data, mimeType)
 }
 
 // SendReactionRequest represents a request to send a reaction

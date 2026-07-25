@@ -209,16 +209,24 @@ func runServer(args []string) {
 		HTTPClient: httpClient,
 	}
 
-	// Initialize S3 client for call recordings (optional)
+	// Initialize the S3-compatible client when durable media storage or call
+	// recording needs it. Explicit object-storage configuration fails fast so
+	// production never silently falls back to an app instance's local disk.
 	var s3Client *storage.S3Client
-	if cfg.Calling.RecordingEnabled && cfg.Storage.S3Bucket != "" {
+	if cfg.Storage.Type == "s3" || cfg.Calling.RecordingEnabled {
 		var err error
 		s3Client, err = storage.NewS3Client(&cfg.Storage)
 		if err != nil {
+			if cfg.Storage.Type == "s3" {
+				lo.Fatal("Failed to initialize configured object storage", "error", err)
+			}
 			lo.Warn("Failed to initialize S3 client for recordings, recording disabled", "error", err)
 		} else {
-			lo.Info("S3 client initialized for call recordings", "bucket", cfg.Storage.S3Bucket)
+			lo.Info("S3-compatible storage initialized", "bucket", cfg.Storage.S3Bucket)
 		}
+	}
+	if cfg.Storage.Type == "s3" {
+		app.ObjectStore = s3Client
 	}
 
 	// Initialize shared assignment engine (used by both chat and call transfers)

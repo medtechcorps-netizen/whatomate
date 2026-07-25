@@ -1,6 +1,8 @@
 package handlers_test
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,11 +11,39 @@ import (
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/storage"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 )
+
+type memoryObject struct {
+	data        []byte
+	contentType string
+}
+
+type memoryObjectStore struct {
+	objects map[string]memoryObject
+}
+
+var _ storage.ObjectStore = (*memoryObjectStore)(nil)
+
+func (s *memoryObjectStore) Put(_ context.Context, key string, data []byte, contentType string) error {
+	if s.objects == nil {
+		s.objects = make(map[string]memoryObject)
+	}
+	s.objects[key] = memoryObject{data: data, contentType: contentType}
+	return nil
+}
+
+func (s *memoryObjectStore) Get(_ context.Context, key string) ([]byte, string, error) {
+	object, ok := s.objects[key]
+	if !ok {
+		return nil, "", storage.ErrObjectNotFound
+	}
+	return object.data, object.contentType, nil
+}
 
 // withStorageDir creates a temp dir, writes the given relative file with content,
 // and configures app.Config.Storage.LocalPath. Returns the relative file path.
@@ -70,6 +100,73 @@ func TestApp_ServeMedia_Success_WithContactsRead(t *testing.T) {
 	assert.Equal(t, "image/jpeg", string(req.RequestCtx.Response.Header.Peek("Content-Type")))
 	assert.Equal(t, "private, max-age=3600", string(req.RequestCtx.Response.Header.Peek("Cache-Control")))
 	assert.Equal(t, "\xFF\xD8\xFF\xE0jpeg-bytes", string(testutil.GetResponseBody(req)))
+}
+
+func TestApp_ServeMedia_Success_FromObjectStorage(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "object-media-reader", []string{"contacts:read"})
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	key := fmt.Sprintf("organizations/%s/messages/images/cat.jpg", org.ID)
+	app.Config.Storage.Type = "s3"
+	app.ObjectStore = &memoryObjectStore{objects: map[string]memoryObject{
+		key: {data: []byte("object-image"), contentType: "image/jpeg"},
+	}}
+	msg := makeMediaMessage(t, app, org.ID, contact.ID, key)
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "message_id", msg.ID.String())
+
+	require.NoError(t, app.ServeMedia(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Equal(t, "image/jpeg", string(req.RequestCtx.Response.Header.Peek("Content-Type")))
+	assert.Equal(t, "object-image", string(testutil.GetResponseBody(req)))
+}
+
+func TestApp_ServeMedia_RejectsObjectKeyFromAnotherOrganization(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	otherOrg := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "object-key-reader", []string{"contacts:read"})
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	key := fmt.Sprintf("organizations/%s/messages/images/secret.jpg", otherOrg.ID)
+	app.Config.Storage.Type = "s3"
+	app.ObjectStore = &memoryObjectStore{objects: map[string]memoryObject{
+		key: {data: []byte("wrong-org"), contentType: "image/jpeg"},
+	}}
+	msg := makeMediaMessage(t, app, org.ID, contact.ID, key)
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "message_id", msg.ID.String())
+
+	require.NoError(t, app.ServeMedia(req))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+}
+
+func TestApp_ServeMedia_ObjectMissingReturnsNotFound(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "missing-object-reader", []string{"contacts:read"})
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	key := fmt.Sprintf("organizations/%s/messages/images/missing.jpg", org.ID)
+	app.Config.Storage.Type = "s3"
+	app.ObjectStore = &memoryObjectStore{objects: map[string]memoryObject{}}
+	msg := makeMediaMessage(t, app, org.ID, contact.ID, key)
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "message_id", msg.ID.String())
+
+	require.NoError(t, app.ServeMedia(req))
+	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(req))
 }
 
 // --- ServeMedia: directory traversal blocked ---

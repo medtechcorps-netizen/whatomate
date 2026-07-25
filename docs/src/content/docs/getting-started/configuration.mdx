@@ -57,6 +57,8 @@ s3_bucket = ""
 s3_region = ""
 s3_key = ""
 s3_secret = ""
+s3_endpoint = ""             # S3-compatible endpoint; leave empty for AWS S3
+s3_use_path_style = false    # Set only when the provider requires path-style URLs
 
 [cookie]
 domain = ""                   # e.g. ".example.com" to share across subdomains. Empty = current host only.
@@ -159,8 +161,24 @@ JWTs are stored in httpOnly cookies — the frontend never sees them.
 
 Controls media storage (template samples, uploaded files, optional call recordings).
 
-- `type = "local"` — files under `local_path` (default `./uploads`). Suitable for single-host deployments. The directory must be writable by the process and persisted (Docker volume).
-- `type = "s3"` — fill in `s3_bucket`, `s3_region`, `s3_key`, `s3_secret`. Required if you set `calling.recording_enabled = true` and want recordings retained off-host.
+- `type = "local"` — files under `local_path` (default `./uploads`). Suitable for local development and single-host deployments.
+- `type = "s3"` — stores new tenant message and campaign media in S3-compatible object storage. Fill in `s3_bucket`, `s3_region`, `s3_key`, and `s3_secret`. Set `s3_endpoint` for Railway Buckets, Cloudflare R2, or another compatible provider. `s3_use_path_style` is only needed when the provider credentials explicitly require path-style URLs.
+
+S3 object keys are prefixed with `organizations/<organization-id>/`, and media is served through authenticated API routes. Existing local media remains readable during migration.
+
+For a Railway Bucket, map the generated credentials as follows:
+
+| Railway credential | Whatomate field |
+|---|---|
+| `bucketName` | `s3_bucket` |
+| `region` | `s3_region` |
+| `accessKeyId` | `s3_key` |
+| `secretAccessKey` | `s3_secret` |
+| `endpoint` | `s3_endpoint` |
+| `urlStyle = "virtual-host"` | `s3_use_path_style = false` |
+| `urlStyle = "path"` | `s3_use_path_style = true` |
+
+Use the `region` value returned with the credentials (often `auto`), which can differ from the physical bucket location selected in Railway.
 
 ### `[cookie]`
 
@@ -219,24 +237,25 @@ The credentials seeded the first time `whatomate server -migrate` runs against a
 Any key in `config.toml` can be overridden by an environment variable. The mapping is:
 
 ```
-WHATOMATE_<SECTION>_<KEY>
+WHATOMATE_<SECTION>__<KEY>
 ```
 
 with underscores in `<KEY>` preserved. Examples:
 
 | Variable | TOML field |
 |---|---|
-| `WHATOMATE_APP_ENVIRONMENT` | `app.environment` |
-| `WHATOMATE_APP_ENCRYPTION_KEY` | `app.encryption_key` |
-| `WHATOMATE_DATABASE_HOST` | `database.host` |
-| `WHATOMATE_DATABASE_SSL_MODE` | `database.ssl_mode` |
-| `WHATOMATE_REDIS_HOST` | `redis.host` |
-| `WHATOMATE_REDIS_TLS` | `redis.tls` |
-| `WHATOMATE_JWT_SECRET` | `jwt.secret` |
-| `WHATOMATE_STORAGE_S3_BUCKET` | `storage.s3_bucket` |
-| `WHATOMATE_RATE_LIMIT_ENABLED` | `rate_limit.enabled` |
-| `WHATOMATE_CALLING_PUBLIC_IP` | `calling.public_ip` |
-| `WHATOMATE_DEFAULT_ADMIN_PASSWORD` | `default_admin.password` |
+| `WHATOMATE_APP__ENVIRONMENT` | `app.environment` |
+| `WHATOMATE_APP__ENCRYPTION_KEY` | `app.encryption_key` |
+| `WHATOMATE_DATABASE__HOST` | `database.host` |
+| `WHATOMATE_DATABASE__SSL_MODE` | `database.ssl_mode` |
+| `WHATOMATE_REDIS__HOST` | `redis.host` |
+| `WHATOMATE_REDIS__TLS` | `redis.tls` |
+| `WHATOMATE_JWT__SECRET` | `jwt.secret` |
+| `WHATOMATE_STORAGE__S3_BUCKET` | `storage.s3_bucket` |
+| `WHATOMATE_STORAGE__S3_ENDPOINT` | `storage.s3_endpoint` |
+| `WHATOMATE_RATE_LIMIT__ENABLED` | `rate_limit.enabled` |
+| `WHATOMATE_CALLING__PUBLIC_IP` | `calling.public_ip` |
+| `WHATOMATE_DEFAULT_ADMIN__PASSWORD` | `default_admin.password` |
 
 Env vars take precedence over the config file, so the typical pattern is to commit a non-secret `config.toml` and inject secrets (`*_PASSWORD`, `*_KEY`, `*_SECRET`, `JWT_SECRET`) via the deployment environment.
 

@@ -199,3 +199,20 @@ func TestLoad_EnvMapsMultiWordKeys(t *testing.T) {
 	assert.Equal(t, "admin@example.com", cfg.DefaultAdmin.Email)
 	assert.Equal(t, "db.internal", cfg.Database.Host)
 }
+
+func TestLoad_EnvMapsS3CompatibleStorage(t *testing.T) {
+	t.Setenv("WHATOMATE_STORAGE__TYPE", "s3")
+	t.Setenv("WHATOMATE_STORAGE__S3_BUCKET", "omnitech-media")
+	t.Setenv("WHATOMATE_STORAGE__S3_REGION", "sin")
+	t.Setenv("WHATOMATE_STORAGE__S3_ENDPOINT", "https://storage.railway.app")
+	t.Setenv("WHATOMATE_STORAGE__S3_USE_PATH_STYLE", "true")
+
+	cfg, err := config.Load("")
+	require.NoError(t, err)
+
+	assert.Equal(t, "s3", cfg.Storage.Type)
+	assert.Equal(t, "omnitech-media", cfg.Storage.S3Bucket)
+	assert.Equal(t, "sin", cfg.Storage.S3Region)
+	assert.Equal(t, "https://storage.railway.app", cfg.Storage.S3Endpoint)
+	assert.True(t, cfg.Storage.S3UsePathStyle)
+}

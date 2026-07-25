@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
+	"github.com/shridarpatil/whatomate/internal/storage"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/valyala/fasthttp"
@@ -906,10 +909,10 @@ func (a *App) UploadCampaignMedia(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to upload media to WhatsApp", nil, "")
 	}
 
-	// Save file locally for preview
-	localPath, err := a.saveCampaignMedia(campaignUUID.String(), data, mimeType)
+	// Persist a preview independently of the app instance.
+	mediaPath, err := a.saveCampaignMedia(r.RequestCtx, orgID, campaignUUID.String(), data, mimeType)
 	if err != nil {
-		a.Log.Error("Failed to save media locally", "error", err)
+		a.Log.Error("Failed to store campaign media", "error", err, "org_id", orgID)
 		// Don't fail the request, just log the error - preview won't work
 	}
 
@@ -918,52 +921,35 @@ func (a *App) UploadCampaignMedia(r *fastglue.Request) error {
 		"header_media_id":         mediaID,
 		"header_media_filename":   sanitizeFilename(fileHeader.Filename),
 		"header_media_mime_type":  mimeType,
-		"header_media_local_path": localPath,
+		"header_media_local_path": mediaPath,
 	}
 	if err := a.DB.Model(&campaign).Updates(updates).Error; err != nil {
 		a.Log.Error("Failed to update campaign with media info", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save media info", nil, "")
 	}
 
-	a.Log.Info("Campaign media uploaded", "campaign_id", campaignUUID, "media_id", mediaID, "filename", fileHeader.Filename, "local_path", localPath)
+	a.Log.Info("Campaign media uploaded", "campaign_id", campaignUUID, "media_id", mediaID, "filename", fileHeader.Filename, "media_path", mediaPath)
 
 	return r.SendEnvelope(map[string]any{
 		"media_id":   mediaID,
 		"filename":   fileHeader.Filename,
 		"mime_type":  mimeType,
-		"local_path": localPath,
+		"local_path": mediaPath,
 		"message":    "Media uploaded successfully",
 	})
 }
 
-// saveCampaignMedia saves uploaded media locally for preview
-func (a *App) saveCampaignMedia(campaignID string, data []byte, mimeType string) (string, error) {
+// saveCampaignMedia stores uploaded media for preview.
+func (a *App) saveCampaignMedia(ctx context.Context, orgID uuid.UUID, campaignID string, data []byte, mimeType string) (string, error) {
 	// Determine file extension
 	ext := getExtensionFromMimeType(mimeType)
 	if ext == "" {
 		ext = ".bin"
 	}
 
-	// Create campaigns media directory
-	subdir := "campaigns"
-	if err := a.ensureMediaDir(subdir); err != nil {
-		return "", fmt.Errorf("failed to create media directory: %w", err)
-	}
-
-	// Generate filename using campaign ID
+	// Generate a stable filename using the campaign ID.
 	filename := campaignID + ext
-	filePath := filepath.Join(a.getMediaStoragePath(), subdir, filename)
-
-	// Save file
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		return "", fmt.Errorf("failed to save media file: %w", err)
-	}
-
-	// Return relative path for storage
-	relativePath := filepath.Join(subdir, filename)
-	a.Log.Info("Campaign media saved locally", "path", relativePath, "size", len(data))
-
-	return relativePath, nil
+	return a.saveTenantMedia(ctx, orgID, "campaigns", "campaigns", filename, data, mimeType)
 }
 
 // ServeCampaignMedia serves campaign media files for preview
@@ -991,38 +977,24 @@ func (a *App) ServeCampaignMedia(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "No media found", nil, "")
 	}
 
-	// Security: prevent directory traversal and symlink attacks
-	filePath := filepath.Clean(campaign.HeaderMediaLocalPath)
-	baseDir, err := filepath.Abs(a.getMediaStoragePath())
+	data, storedContentType, err := a.loadTenantMedia(r.RequestCtx, orgID, campaign.HeaderMediaLocalPath)
 	if err != nil {
-		a.Log.Error("Storage configuration error", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Storage configuration error", nil, "")
-	}
-	fullPath, err := filepath.Abs(filepath.Join(baseDir, filePath))
-	if err != nil || !strings.HasPrefix(fullPath, baseDir+string(os.PathSeparator)) {
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid file path", nil, "")
-	}
-
-	// Reject symlinks
-	info, err := os.Lstat(fullPath)
-	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "File not found", nil, "")
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid file path", nil, "")
-	}
-
-	// Read file
-	data, err := os.ReadFile(fullPath)
-	if err != nil {
-		a.Log.Error("Failed to read media file", "path", fullPath, "error", err)
+		if errors.Is(err, errInvalidStoredMediaKey) {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid media path", nil, "")
+		}
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, storage.ErrObjectNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "File not found", nil, "")
+		}
+		a.Log.Error("Failed to read campaign media", "key", campaign.HeaderMediaLocalPath, "error", err, "org_id", orgID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to read file", nil, "")
 	}
 
-	// Use stored mime type or determine from extension
-	contentType := campaign.HeaderMediaMimeType
+	contentType := storedContentType
 	if contentType == "" {
-		ext := strings.ToLower(filepath.Ext(filePath))
+		contentType = campaign.HeaderMediaMimeType
+	}
+	if contentType == "" {
+		ext := strings.ToLower(filepath.Ext(campaign.HeaderMediaLocalPath))
 		contentType = getMimeTypeFromExtension(ext)
 	}
 
@@ -1031,32 +1003,6 @@ func (a *App) ServeCampaignMedia(r *fastglue.Request) error {
 	r.RequestCtx.SetBody(data)
 
 	return nil
-}
-
-// getMimeTypeFromExtension returns MIME type from file extension
-func getMimeTypeFromExtension(ext string) string {
-	switch ext {
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".png":
-		return "image/png"
-	case ".gif":
-		return "image/gif"
-	case ".webp":
-		return "image/webp"
-	case ".mp4":
-		return "video/mp4"
-	case ".3gp":
-		return "video/3gpp"
-	case ".pdf":
-		return "application/pdf"
-	case ".doc":
-		return "application/msword"
-	case ".docx":
-		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-	default:
-		return "application/octet-stream"
-	}
 }
 
 // incrementCampaignStat increments the appropriate campaign counter based on status

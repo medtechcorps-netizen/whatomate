@@ -156,12 +156,14 @@ type AIConfig struct {
 }
 
 type StorageConfig struct {
-	Type      string `koanf:"type"` // local, s3
-	LocalPath string `koanf:"local_path"`
-	S3Bucket  string `koanf:"s3_bucket"`
-	S3Region  string `koanf:"s3_region"`
-	S3Key     string `koanf:"s3_key"`
-	S3Secret  string `koanf:"s3_secret"`
+	Type           string `koanf:"type"` // local, s3
+	LocalPath      string `koanf:"local_path"`
+	S3Bucket       string `koanf:"s3_bucket"`
+	S3Region       string `koanf:"s3_region"`
+	S3Key          string `koanf:"s3_key"`
+	S3Secret       string `koanf:"s3_secret"`
+	S3Endpoint     string `koanf:"s3_endpoint"`       // Optional for S3-compatible providers such as Railway.
+	S3UsePathStyle bool   `koanf:"s3_use_path_style"` // Required only by providers that do not use virtual-hosted URLs.
 }
 
 type DefaultAdminConfig struct {

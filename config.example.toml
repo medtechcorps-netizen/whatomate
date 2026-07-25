@@ -49,6 +49,8 @@ s3_bucket = ""
 s3_region = ""
 s3_key = ""
 s3_secret = ""
+s3_endpoint = ""       # Optional for S3-compatible providers such as Railway
+s3_use_path_style = false
 
 [whatsapp]
 webhook_verify_token = "random-string-change-this"
