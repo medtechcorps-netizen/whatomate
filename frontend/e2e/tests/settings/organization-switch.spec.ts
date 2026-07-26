@@ -15,7 +15,7 @@ test.describe('Organization Switching (Super Admin)', () => {
     // Try to login as super admin, skip if not available
     await page.goto('/login')
 
-    // Try admin@admin.com first
+// Try admin@rereply.app first
     await page.locator('input[type="email"]').fill(ADMIN_EMAIL)
     await page.locator('input[type="password"]').fill(ADMIN_PASSWORD)
     await page.locator('button[type="submit"]').click()

@@ -6,7 +6,7 @@
  * permissions like `analytics:read` and silently lands users on the
  * "not allowed" page (cost ~30 minutes of debugging earlier this month).
  *
- * For framework-level tests prefer `loginAsSuperAdmin` (admin@admin.com,
+ * For framework-level tests prefer `loginAsSuperAdmin` (admin@rereply.app,
  * always succeeds) or `loginAs(page, customCreds)` for permission-scoped
  * users created via `createUserWithPermissions`.
  */
@@ -14,7 +14,7 @@
 import type { Page } from '@playwright/test'
 
 export const SUPER_ADMIN = {
-  email: 'admin@admin.com',
+  email: 'admin@rereply.app',
   password: 'admin',
 } as const
 

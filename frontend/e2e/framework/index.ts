@@ -11,7 +11,7 @@
  *   - Per-spec scope prefix on every name / email so test artifacts are
  *     identifiable and don't collide with each other or production-shaped
  *     data.
- *   - Login as the super admin (admin@admin.com) by default so tests
+ *   - Login as the super admin (admin@rereply.app) by default so tests
  *     don't silently land on a permission-denied page.
  *   - One-call permission-scoped user creation.
  */

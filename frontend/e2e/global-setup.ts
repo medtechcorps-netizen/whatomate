@@ -36,7 +36,7 @@ async function globalSetup() {
   // Step 1: Login as the default superadmin (created by migrations)
   // This user has IsSuperAdmin=true and can create users in any org
   const defaultAdmin = {
-    email: 'admin@admin.com',
+    email: 'admin@rereply.app',
     password: 'admin',
   }
 
