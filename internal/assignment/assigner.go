@@ -28,6 +28,15 @@ func New(db *gorm.DB, redis *redis.Client, log logf.Logger) *Assigner {
 	return &Assigner{db: db, redis: redis, log: log}
 }
 
+// WithDB returns an assigner that shares cache/log dependencies but performs
+// database work through the supplied request-scoped transaction.
+func (a *Assigner) WithDB(db *gorm.DB) *Assigner {
+	if a == nil {
+		return nil
+	}
+	return &Assigner{db: db, redis: a.redis, log: a.log}
+}
+
 // AssignToTeam dispatches to the appropriate strategy based on the team's
 // AssignmentStrategy. excludeAgentIDs allows callers to skip agents that have
 // already been tried (e.g., during call transfer rotation). Pass nil for normal

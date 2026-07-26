@@ -432,6 +432,13 @@ func (a *App) CreateOrganization(r *fastglue.Request) error {
 		a.Log.Error("Failed to create organization", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
 	}
+	if a.rlsEnabled() {
+		if err := database.SetTenantContext(tx, org.ID); err != nil {
+			tx.Rollback()
+			a.Log.Error("Failed to bind new organization transaction", "error", err, "org_id", org.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
+		}
+	}
 
 	// Seed system roles for the new organization
 	if err := database.SeedSystemRolesForOrg(tx, org.ID); err != nil {

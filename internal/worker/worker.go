@@ -10,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
@@ -27,6 +28,8 @@ type Worker struct {
 	WhatsApp  *whatsapp.Client
 	Consumer  *queue.RedisConsumer
 	Publisher *queue.Publisher
+
+	tenantScoped bool
 }
 
 // Ensure Worker implements JobHandler interface
@@ -67,6 +70,15 @@ func (w *Worker) Run(ctx context.Context) error {
 
 // HandleRecipientJob processes a single recipient message job
 func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob) error {
+	if w.Config != nil && w.Config.Database.RLSEnabled && !w.tenantScoped {
+		return database.WithTenant(w.DB, job.OrganizationID, func(tx *gorm.DB) error {
+			scoped := *w
+			scoped.DB = tx
+			scoped.tenantScoped = true
+			return scoped.HandleRecipientJob(ctx, job)
+		})
+	}
+
 	// Check if campaign is still active before sending
 	var campaign models.BulkMessageCampaign
 	if err := w.DB.Where("id = ?", job.CampaignID).Preload("Template").First(&campaign).Error; err != nil {
@@ -191,6 +203,9 @@ func (w *Worker) incrementCampaignCount(campaignID uuid.UUID, column string) {
 
 // publishCampaignStats publishes campaign stats for real-time updates
 func (w *Worker) publishCampaignStats(ctx context.Context, campaignID, organizationID uuid.UUID) {
+	if w.Publisher == nil {
+		return
+	}
 	var campaign models.BulkMessageCampaign
 	if err := w.DB.Where("id = ?", campaignID).First(&campaign).Error; err != nil {
 		return
@@ -236,15 +251,17 @@ func (w *Worker) checkCampaignCompletion(ctx context.Context, campaignID, organi
 		w.Log.Info("Campaign completed", "campaign_id", campaignID, "sent", campaign.SentCount, "failed", campaign.FailedCount)
 
 		// Publish completion status
-		_ = w.Publisher.PublishCampaignStats(ctx, &queue.CampaignStatsUpdate{
-			CampaignID:     campaignID.String(),
-			OrganizationID: organizationID,
-			Status:         models.CampaignStatusCompleted,
-			SentCount:      campaign.SentCount,
-			DeliveredCount: campaign.DeliveredCount,
-			ReadCount:      campaign.ReadCount,
-			FailedCount:    campaign.FailedCount,
-		})
+		if w.Publisher != nil {
+			_ = w.Publisher.PublishCampaignStats(ctx, &queue.CampaignStatsUpdate{
+				CampaignID:     campaignID.String(),
+				OrganizationID: organizationID,
+				Status:         models.CampaignStatusCompleted,
+				SentCount:      campaign.SentCount,
+				DeliveredCount: campaign.DeliveredCount,
+				ReadCount:      campaign.ReadCount,
+				FailedCount:    campaign.FailedCount,
+			})
+		}
 	} else {
 		// Publish current stats
 		w.publishCampaignStats(ctx, campaignID, organizationID)

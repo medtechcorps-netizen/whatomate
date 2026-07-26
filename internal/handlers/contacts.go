@@ -476,9 +476,9 @@ func (a *App) markMessagesAsRead(orgID uuid.UUID, contactID uuid.UUID, contact *
 	if len(unreadMessages) > 0 && contact.WhatsAppAccount != "" {
 		if account, err := a.resolveWhatsAppAccount(orgID, contact.WhatsAppAccount); err == nil {
 			if account.AutoReadReceipt {
-				a.wg.Add(1)
+				a.rootApp().wg.Add(1)
 				go func() {
-					defer a.wg.Done()
+					defer a.rootApp().wg.Done()
 					// Use timeout context for external API calls
 					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					defer cancel()

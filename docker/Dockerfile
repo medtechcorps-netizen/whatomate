@@ -95,9 +95,9 @@ EXPOSE 8080
 # Match the GoReleaser image's launch convention so the same orchestrator
 # args work against both tags: the binary is the ENTRYPOINT and CMD holds
 # only the default subcommand/flags. A Nomad job that sets
-# `args = ["server", "-migrate", ...]` (no `command`) then appends to the
+# `args = ["server", ...]` (no `command`) then appends to the
 # entrypoint instead of replacing the binary with "server".
 USER rereply
 
 ENTRYPOINT ["./rereply"]
-CMD ["server", "-config", "config.toml", "-migrate"]
+CMD ["server", "-config", "config.toml"]

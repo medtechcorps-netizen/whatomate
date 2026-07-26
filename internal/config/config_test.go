@@ -33,6 +33,8 @@ func TestLoad_AppliesDefaultsForMissingFields(t *testing.T) {
 	assert.Equal(t, 30, cfg.Server.ReadTimeout)
 	assert.Equal(t, 30, cfg.Server.WriteTimeout)
 	assert.Equal(t, 5432, cfg.Database.Port)
+	assert.Equal(t, "rereply_app", cfg.Database.RuntimeRole)
+	assert.False(t, cfg.Database.RLSEnabled)
 	assert.Equal(t, "disable", cfg.Database.SSLMode)
 	assert.Equal(t, 25, cfg.Database.MaxOpenConns)
 	assert.Equal(t, 5, cfg.Database.MaxIdleConns)
@@ -106,6 +108,9 @@ secure = false
 func TestLoad_EnvVarsOverrideFile(t *testing.T) {
 	t.Setenv("WHATOMATE_DATABASE__HOST", "from-env")
 	t.Setenv("WHATOMATE_DATABASE__URL", "postgres://private-db/app")
+	t.Setenv("WHATOMATE_DATABASE__MIGRATION_URL", "postgres://private-db/owner")
+	t.Setenv("WHATOMATE_DATABASE__RUNTIME_ROLE", "rereply_runtime")
+	t.Setenv("WHATOMATE_DATABASE__RLS_ENABLED", "true")
 	t.Setenv("WHATOMATE_REDIS__URL", "rediss://private-cache/0")
 	t.Setenv("WHATOMATE_SERVER__PORT", "1234")
 
@@ -119,6 +124,9 @@ port = 8080
 	require.NoError(t, err)
 	assert.Equal(t, "from-env", cfg.Database.Host, "WHATOMATE_DATABASE__HOST must override file")
 	assert.Equal(t, "postgres://private-db/app", cfg.Database.URL)
+	assert.Equal(t, "postgres://private-db/owner", cfg.Database.MigrationURL)
+	assert.Equal(t, "rereply_runtime", cfg.Database.RuntimeRole)
+	assert.True(t, cfg.Database.RLSEnabled)
 	assert.Equal(t, "rediss://private-cache/0", cfg.Redis.URL)
 	assert.Equal(t, 1234, cfg.Server.Port, "WHATOMATE_SERVER__PORT must override file")
 }

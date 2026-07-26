@@ -115,6 +115,9 @@ type ServerConfig struct {
 
 type DatabaseConfig struct {
 	URL             string `koanf:"url"`
+	MigrationURL    string `koanf:"migration_url"` // Owner connection used only by pre-deploy migrations.
+	RuntimeRole     string `koanf:"runtime_role"`  // Restricted PostgreSQL role targeted by RLS policies.
+	RLSEnabled      bool   `koanf:"rls_enabled"`   // Require tenant-scoped transactions for CRM queries.
 	Host            string `koanf:"host"`
 	Port            int    `koanf:"port"`
 	User            string `koanf:"user"`
@@ -250,6 +253,9 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Database.Port == 0 {
 		cfg.Database.Port = 5432
+	}
+	if cfg.Database.RuntimeRole == "" {
+		cfg.Database.RuntimeRole = "rereply_app"
 	}
 	if cfg.Database.SSLMode == "" {
 		cfg.Database.SSLMode = "disable"

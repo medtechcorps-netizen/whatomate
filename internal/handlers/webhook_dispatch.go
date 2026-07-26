@@ -61,9 +61,9 @@ const maxConcurrentWebhooks = 10
 
 // DispatchWebhook sends an event to all matching webhooks for the organization
 func (a *App) DispatchWebhook(orgID uuid.UUID, eventType models.WebhookEvent, data any) {
-	a.wg.Add(1)
+	a.rootApp().wg.Add(1)
 	go func() {
-		defer a.wg.Done()
+		defer a.rootApp().wg.Done()
 		// Use detached context with timeout for webhook delivery
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
@@ -73,7 +73,12 @@ func (a *App) DispatchWebhook(orgID uuid.UUID, eventType models.WebhookEvent, da
 
 func (a *App) dispatchWebhookAsync(ctx context.Context, orgID uuid.UUID, eventType string, data any) {
 	// Find all active webhooks for this org that subscribe to this event (use cache)
-	webhooks, err := a.getWebhooksCached(orgID)
+	var webhooks []models.Webhook
+	err := a.WithTenantApp(orgID, func(scoped *App) error {
+		var fetchErr error
+		webhooks, fetchErr = scoped.getWebhooksCached(orgID)
+		return fetchErr
+	})
 	if err != nil {
 		a.Log.Error("failed to fetch webhooks", "error", err)
 		return

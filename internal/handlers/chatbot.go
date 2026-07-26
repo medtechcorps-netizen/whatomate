@@ -9,6 +9,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
 )
 
 // ChatbotSettingsResponse represents the response for chatbot settings
@@ -1051,29 +1052,29 @@ func (a *App) DeleteChatbotFlow(r *fastglue.Request) error {
 	var flowForAudit models.ChatbotFlow
 	a.DB.Where("id = ? AND organization_id = ?", id, orgID).First(&flowForAudit)
 
-	// Delete flow and steps in transaction
-	tx := a.DB.Begin()
-
-	// Delete steps first
-	if err := tx.Where("flow_id = ?", id).Delete(&models.ChatbotFlowStep{}).Error; err != nil {
-		tx.Rollback()
-		a.Log.Error("Failed to delete flow steps", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete flow steps", nil, "")
-	}
-
-	// Delete flow
-	result := tx.Where("id = ? AND organization_id = ?", id, orgID).Delete(&models.ChatbotFlow{})
-	if result.Error != nil {
-		tx.Rollback()
-		a.Log.Error("Failed to delete flow", "error", result.Error)
+	// Delete flow and legacy steps in a nested transaction/savepoint. Using
+	// GORM's Transaction helper works both with and without the outer RLS
+	// request transaction.
+	deleteErr := a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("flow_id = ?", id).Delete(&models.ChatbotFlowStep{}).Error; err != nil {
+			return err
+		}
+		result := tx.Where("id = ? AND organization_id = ?", id, orgID).Delete(&models.ChatbotFlow{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return nil
+	})
+	if deleteErr != nil {
+		if deleteErr == gorm.ErrRecordNotFound {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Flow not found", nil, "")
+		}
+		a.Log.Error("Failed to delete flow", "error", deleteErr)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete flow", nil, "")
 	}
-	if result.RowsAffected == 0 {
-		tx.Rollback()
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Flow not found", nil, "")
-	}
-
-	tx.Commit()
 
 	// Invalidate cache
 	a.InvalidateChatbotFlowsCache(orgID)
