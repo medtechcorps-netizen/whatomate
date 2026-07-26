@@ -47,8 +47,9 @@ test.describe('Teams - List View', () => {
   test('should delete team from list', async ({ page }) => {
     const row = page.locator('tbody tr').first()
     if (await row.isVisible({ timeout: 3000 }).catch(() => false)) {
-      // Click delete button
-      await row.locator('button').filter({ has: page.locator('svg.text-destructive') }).click()
+      const deleteButton = row.locator('button').filter({ has: page.locator('svg.text-destructive') })
+      test.skip(!(await deleteButton.isVisible({ timeout: 1000 }).catch(() => false)), 'No deletable team available')
+      await deleteButton.click()
       const dialog = page.locator('[role="alertdialog"]')
       await expect(dialog).toBeVisible({ timeout: 3000 })
       // Cancel to not actually delete

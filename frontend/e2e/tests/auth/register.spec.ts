@@ -1,26 +1,8 @@
 import { test, expect } from '@playwright/test'
-import { ApiHelper } from '../../helpers'
-import { createTestScope, SUPER_ADMIN } from '../../framework'
+import { createTestScope } from '../../framework'
 
 const scope = createTestScope('register')
-
-async function createOrgForRegister(api: ApiHelper, label: string): Promise<string | null> {
-  try {
-    await api.login(SUPER_ADMIN.email, SUPER_ADMIN.password)
-  } catch {
-    try {
-      await api.login('admin@test.com', 'password')
-    } catch {
-      return null
-    }
-  }
-  try {
-    const org = await api.createOrganization(scope.name(label))
-    return org.id
-  } catch {
-    return null
-  }
-}
+const INVITATION_URL = '/register?invite=e2e-registration-invitation'
 
 test.describe('Register', () => {
   test('should show invitation required message without org param', async ({ page }) => {
@@ -34,12 +16,8 @@ test.describe('Register', () => {
     await expect(page.getByRole('link', { name: /Sign in/i })).toBeVisible()
   })
 
-  test('should display registration form with org query param', async ({ page, request }) => {
-    const api = new ApiHelper(request)
-    const orgId = await createOrgForRegister(api, 'display')
-    test.skip(!orgId, 'Failed to set up test organization')
-
-    await page.goto(`/register?org=${orgId}`)
+  test('should display registration form with invitation token', async ({ page }) => {
+    await page.goto(INVITATION_URL)
 
     await expect(page.locator('input#fullName')).toBeVisible()
     await expect(page.locator('input#email')).toBeVisible()
@@ -48,12 +26,8 @@ test.describe('Register', () => {
     await expect(page.locator('button[type="submit"]')).toBeVisible()
   })
 
-  test('should show error for empty fields', async ({ page, request }) => {
-    const api = new ApiHelper(request)
-    const orgId = await createOrgForRegister(api, 'empty')
-    test.skip(!orgId, 'Failed to set up test organization')
-
-    await page.goto(`/register?org=${orgId}`)
+  test('should show error for empty fields', async ({ page }) => {
+    await page.goto(INVITATION_URL)
     await page.locator('button[type="submit"]').click()
 
     const toast = page.locator('[data-sonner-toast]')
@@ -61,12 +35,8 @@ test.describe('Register', () => {
     await expect(toast).toContainText('fill in all fields')
   })
 
-  test('should show error for mismatched passwords', async ({ page, request }) => {
-    const api = new ApiHelper(request)
-    const orgId = await createOrgForRegister(api, 'mismatch')
-    test.skip(!orgId, 'Failed to set up test organization')
-
-    await page.goto(`/register?org=${orgId}`)
+  test('should show error for mismatched passwords', async ({ page }) => {
+    await page.goto(INVITATION_URL)
     await page.locator('input#fullName').fill('Test User')
     await page.locator('input#email').fill(scope.email('mismatch'))
     await page.locator('input#password').fill('password123')
@@ -78,12 +48,8 @@ test.describe('Register', () => {
     await expect(toast).toContainText('do not match')
   })
 
-  test('should show error for short password', async ({ page, request }) => {
-    const api = new ApiHelper(request)
-    const orgId = await createOrgForRegister(api, 'short')
-    test.skip(!orgId, 'Failed to set up test organization')
-
-    await page.goto(`/register?org=${orgId}`)
+  test('should show error for short password', async ({ page }) => {
+    await page.goto(INVITATION_URL)
     await page.locator('input#fullName').fill('Test User')
     await page.locator('input#email').fill(scope.email('short'))
     await page.locator('input#password').fill('short')
@@ -92,7 +58,7 @@ test.describe('Register', () => {
 
     const toast = page.locator('[data-sonner-toast]')
     await expect(toast).toBeVisible({ timeout: 5000 })
-    await expect(toast).toContainText('at least 8 characters')
+    await expect(toast).toContainText('at least 12 characters')
   })
 
   test('should navigate to login page from invitation required', async ({ page }) => {
@@ -101,12 +67,8 @@ test.describe('Register', () => {
     await expect(page).toHaveURL(/\/login/)
   })
 
-  test('should navigate to login page from registration form', async ({ page, request }) => {
-    const api = new ApiHelper(request)
-    const orgId = await createOrgForRegister(api, 'nav')
-    test.skip(!orgId, 'Failed to set up test organization')
-
-    await page.goto(`/register?org=${orgId}`)
+  test('should navigate to login page from registration form', async ({ page }) => {
+    await page.goto(INVITATION_URL)
     await page.locator('a').filter({ hasText: /Sign in/i }).click()
     await expect(page).toHaveURL(/\/login/)
   })

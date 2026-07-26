@@ -16,7 +16,7 @@ export class TemplatesPage extends BasePage {
   constructor(page: Page) {
     super(page)
     this.heading = page.locator('h1').filter({ hasText: 'Message Templates' })
-    this.createButton = page.locator('a[href="/templates/new"] button').first()
+    this.createButton = page.getByRole('button', { name: /Create Template/i }).first()
     this.syncButton = page.locator('header').getByRole('button', { name: /Sync from Meta/i })
     this.searchInput = page.locator('input[placeholder*="Search templates"], input[placeholder*="search templates"]')
     this.accountSelect = page.locator('button[role="combobox"]').first()
