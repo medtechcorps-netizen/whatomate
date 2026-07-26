@@ -103,12 +103,16 @@ test.describe('Template media header — issue #355', () => {
     const accountCombo = page.locator('button[role="combobox"]').first()
     await accountCombo.click()
     await page.getByRole('option', { name: accountName }).first().click()
+    await page.keyboard.press('Escape')
 
     // Body content.
     await page.locator('textarea').first().fill('Hello no-media')
 
     // Switch header type to IMAGE.
-    const headerCombo = page.locator('button[role="combobox"]').filter({ hasText: /Header|TEXT|None|Type/i }).first()
+    const headerCombo = page
+      .getByText('Header Type', { exact: true })
+      .locator('..')
+      .getByRole('combobox')
     await headerCombo.click()
     await page.getByRole('option', { name: /^Image$/i }).first().click()
     await page.waitForTimeout(200)

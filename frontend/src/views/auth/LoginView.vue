@@ -9,7 +9,8 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { toast } from 'vue-sonner'
-import { MessageSquare, Loader2 } from 'lucide-vue-next'
+import { ArrowRight, CheckCircle2, Loader2 } from 'lucide-vue-next'
+import ReReplyLogo from '@/components/brand/ReReplyLogo.vue'
 
 const { t } = useI18n()
 
@@ -92,83 +93,143 @@ const initiateSSO = (provider: string) => {
 </script>
 
 <template>
-  <div class="min-h-screen flex items-center justify-center bg-[#0a0a0b] light:bg-gradient-to-br light:from-gray-50 light:to-gray-100 p-4">
-    <div class="w-full max-w-md rounded-2xl border border-white/[0.08] bg-white/[0.02] backdrop-blur light:bg-white light:border-gray-200 light:shadow-xl">
-      <div class="p-8 space-y-1 text-center">
-        <div class="flex justify-center mb-4">
-          <div class="h-12 w-12 rounded-xl bg-gradient-to-br from-emerald-500 to-green-600 flex items-center justify-center shadow-lg shadow-emerald-500/20">
-            <MessageSquare class="h-7 w-7 text-white" />
+  <div class="auth-shell relative min-h-screen overflow-hidden bg-[#10120d] light:bg-[#f3f2e9]">
+    <div class="auth-grid absolute inset-0 opacity-50 light:opacity-30" aria-hidden="true" />
+    <div class="auth-glow auth-glow-top absolute -top-44 right-[-8rem] h-[34rem] w-[34rem] rounded-full" aria-hidden="true" />
+    <div class="auth-glow auth-glow-bottom absolute -bottom-52 left-[-12rem] h-[36rem] w-[36rem] rounded-full" aria-hidden="true" />
+
+    <div class="relative z-10 mx-auto grid min-h-screen w-full max-w-[1440px] lg:grid-cols-[minmax(0,0.92fr)_minmax(540px,1.08fr)]">
+      <section class="flex min-h-screen flex-col px-6 py-7 sm:px-10 lg:px-14 xl:px-20">
+        <div class="flex items-center justify-between">
+          <ReReplyLogo size="md" tone="light" tagline class="light:hidden" />
+          <ReReplyLogo size="md" tone="dark" tagline class="hidden light:inline-flex" />
+          <div class="rounded-full border border-[#cbd49a]/20 bg-[#cbd49a]/[0.06] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#cbd49a]/80 light:border-[#697046]/20 light:bg-[#697046]/[0.05] light:text-[#596039]">
+            Secure workspace
           </div>
         </div>
-        <h2 class="text-2xl font-bold text-white light:text-gray-900">{{ $t('auth.welcomeTitle') }}</h2>
-        <p class="text-white/50 light:text-gray-500">
-          {{ $t('auth.welcomeSubtitle') }}
-        </p>
-      </div>
 
-      <form @submit.prevent="handleLogin">
-        <div class="px-8 pb-4 space-y-4">
-          <div class="space-y-2">
-            <Label for="email" class="text-white/70 light:text-gray-700">{{ $t('common.email') }}</Label>
-            <Input
-              id="email"
-              v-model="email"
-              type="email"
-              :placeholder="$t('auth.emailPlaceholder')"
-              :disabled="isLoading"
-              autocomplete="email"
-            />
+        <div class="my-auto w-full max-w-[440px] py-16">
+          <div class="mb-9">
+            <p class="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-[#cbd49a] light:text-[#697046]">
+              <span class="h-px w-8 bg-current opacity-60" />
+              Welcome back
+            </p>
+            <h1 class="auth-title max-w-sm text-[2.55rem] leading-[1.04] tracking-[-0.045em] text-[#f4f4eb] light:text-[#24271b] sm:text-[3.25rem]">
+              Pick up every conversation with context.
+            </h1>
+            <p class="mt-5 max-w-sm text-[15px] leading-6 text-white/48 light:text-[#535646]">
+              Sign in to your shared WhatsApp inbox, customer records, and automated journeys.
+            </p>
           </div>
-          <div class="space-y-2">
-            <Label for="password" class="text-white/70 light:text-gray-700">{{ $t('auth.password') }}</Label>
-            <Input
-              id="password"
-              v-model="password"
-              type="password"
-              :placeholder="$t('auth.passwordPlaceholder')"
-              :disabled="isLoading"
-              autocomplete="current-password"
-            />
+
+          <div class="rounded-[1.4rem] border border-white/[0.09] bg-white/[0.035] p-5 shadow-2xl shadow-black/20 backdrop-blur-xl light:border-[#697046]/15 light:bg-white/70 light:shadow-[#545a37]/10 sm:p-6">
+            <form @submit.prevent="handleLogin">
+              <div class="space-y-5">
+                <div class="space-y-2">
+                  <Label for="email" class="text-[11px] font-semibold uppercase tracking-[0.13em] text-white/55 light:text-[#565a43]">
+                    {{ $t('common.email') }}
+                  </Label>
+                  <Input
+                    id="email"
+                    v-model="email"
+                    type="email"
+                    :placeholder="$t('auth.emailPlaceholder')"
+                    :disabled="isLoading"
+                    autocomplete="email"
+                    class="h-12 rounded-xl border-white/[0.1] bg-black/20 px-4 text-white placeholder:text-white/25 focus-visible:border-[#cbd49a]/55 focus-visible:ring-[#cbd49a]/20 light:border-[#697046]/20 light:bg-white/80 light:text-[#25281b] light:placeholder:text-[#697046]/40"
+                  />
+                </div>
+                <div class="space-y-2">
+                  <Label for="password" class="text-[11px] font-semibold uppercase tracking-[0.13em] text-white/55 light:text-[#565a43]">
+                    {{ $t('auth.password') }}
+                  </Label>
+                  <Input
+                    id="password"
+                    v-model="password"
+                    type="password"
+                    :placeholder="$t('auth.passwordPlaceholder')"
+                    :disabled="isLoading"
+                    autocomplete="current-password"
+                    class="h-12 rounded-xl border-white/[0.1] bg-black/20 px-4 text-white placeholder:text-white/25 focus-visible:border-[#cbd49a]/55 focus-visible:ring-[#cbd49a]/20 light:border-[#697046]/20 light:bg-white/80 light:text-[#25281b] light:placeholder:text-[#697046]/40"
+                  />
+                </div>
+                <Button
+                  type="submit"
+                  class="group h-12 w-full rounded-xl bg-[#697046] text-white shadow-lg shadow-[#697046]/20 transition-all hover:-translate-y-0.5 hover:bg-[#77804f] hover:shadow-xl hover:shadow-[#697046]/25"
+                  :disabled="isLoading"
+                >
+                  <Loader2 v-if="isLoading" class="mr-2 h-4 w-4 animate-spin" />
+                  <template v-else>
+                    {{ $t('auth.signIn') }}
+                    <ArrowRight class="ml-2 h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+                  </template>
+                </Button>
+              </div>
+            </form>
+
+            <div v-if="ssoProviders.length > 0" class="mt-5 space-y-3">
+              <div class="relative my-5">
+                <Separator class="bg-white/[0.08] light:bg-[#697046]/15" />
+                <span class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-[#171912] px-2 text-xs text-white/35 light:bg-[#f8f7f0] light:text-[#697046]/60">
+                  {{ $t('auth.orContinueWith') }}
+                </span>
+              </div>
+
+              <Button
+                v-for="provider in ssoProviders"
+                :key="provider.provider"
+                variant="outline"
+                class="w-full justify-start gap-3 transition-colors bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-[#697046]/15 light:text-[#4e5233] light:hover:bg-[#697046]/5"
+                :class="providerColors[provider.provider] || providerColors.custom"
+                @click="initiateSSO(provider.provider)"
+              >
+                <svg class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
+                  <path :d="providerIcons[provider.provider] || providerIcons.custom" />
+                </svg>
+                {{ provider.name }}
+              </Button>
+            </div>
           </div>
-          <Button type="submit" class="w-full bg-gradient-to-r from-emerald-500 to-green-600 hover:from-emerald-600 hover:to-green-700 text-white shadow-lg shadow-emerald-500/20" :disabled="isLoading">
-            <Loader2 v-if="isLoading" class="mr-2 h-4 w-4 animate-spin" />
-            {{ $t('auth.signIn') }}
-          </Button>
-        </div>
-      </form>
 
-      <!-- SSO Section -->
-      <div v-if="ssoProviders.length > 0" class="px-8 pb-4 space-y-3">
-        <div class="relative my-2">
-          <Separator class="bg-white/[0.08] light:bg-gray-200" />
-          <span class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-[#0a0a0b] light:bg-white px-2 text-xs text-white/40 light:text-gray-500">
-            {{ $t('auth.orContinueWith') }}
-          </span>
+          <p class="mt-6 text-center text-sm text-white/35 light:text-[#666a53]">
+            {{ $t('auth.noAccount') }}
+            <RouterLink to="/register" class="text-[#cbd49a] hover:text-[#e0e6ba] hover:underline light:text-[#697046]">
+              {{ $t('auth.signUp') }}
+            </RouterLink>
+          </p>
         </div>
 
-        <Button
-          v-for="provider in ssoProviders"
-          :key="provider.provider"
-          variant="outline"
-          class="w-full justify-start gap-3 transition-colors bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50"
-          :class="providerColors[provider.provider] || providerColors.custom"
-          @click="initiateSSO(provider.provider)"
-        >
-          <svg class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
-            <path :d="providerIcons[provider.provider] || providerIcons.custom" />
-          </svg>
-          {{ provider.name }}
-        </Button>
-      </div>
+        <div class="flex items-center gap-2 text-[11px] text-white/30 light:text-[#697046]/65">
+          <span class="h-1.5 w-1.5 rounded-full bg-[#aeba69]" />
+          Encrypted sessions · Role-based access · Tenant isolation
+        </div>
+      </section>
 
-      <div class="px-8 pb-8">
-        <p class="text-sm text-center text-white/40 light:text-gray-500">
-          {{ $t('auth.noAccount') }}
-          <RouterLink to="/register" class="text-emerald-400 light:text-emerald-600 hover:underline">
-            {{ $t('auth.signUp') }}
-          </RouterLink>
-        </p>
-      </div>
+      <aside class="relative hidden min-h-screen overflow-hidden border-l border-white/[0.07] bg-[#171912] lg:flex lg:flex-col">
+        <div class="absolute inset-0 bg-[radial-gradient(circle_at_65%_20%,rgba(203,212,154,0.13),transparent_36%),linear-gradient(145deg,transparent_20%,rgba(105,112,70,0.08)_80%)]" />
+        <div class="auth-orbit absolute right-[-18%] top-[8%] h-[38rem] w-[38rem] rounded-full border border-[#cbd49a]/10" aria-hidden="true" />
+        <div class="auth-orbit auth-orbit-inner absolute right-[-5%] top-[21%] h-[24rem] w-[24rem] rounded-full border border-[#cbd49a]/10" aria-hidden="true" />
+        <img src="/brand/rereply-mark.png" alt="" class="absolute -right-14 top-20 h-[31rem] w-[31rem] object-contain opacity-[0.055]" aria-hidden="true">
+
+        <div class="relative z-10 mt-auto p-14 xl:p-20">
+          <p class="mb-5 text-[11px] font-semibold uppercase tracking-[0.24em] text-[#cbd49a]/70">
+            Customer conversations, aligned
+          </p>
+          <h2 class="auth-title max-w-[590px] text-5xl leading-[1.06] tracking-[-0.045em] text-[#f0f0e6] xl:text-[4.35rem]">
+            Reply with the whole relationship in view.
+          </h2>
+          <p class="mt-7 max-w-lg text-base leading-7 text-white/45">
+            ReReply brings WhatsApp conversations, customer context, automation, and human handover into one focused workspace.
+          </p>
+
+          <div class="mt-12 grid max-w-xl grid-cols-3 gap-3">
+            <div v-for="item in ['Shared inbox', 'Smart journeys', 'Clear ownership']" :key="item" class="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-4">
+              <CheckCircle2 class="mb-7 h-4 w-4 text-[#cbd49a]" />
+              <p class="text-xs font-medium leading-5 text-white/58">{{ item }}</p>
+            </div>
+          </div>
+        </div>
+      </aside>
     </div>
   </div>
 </template>

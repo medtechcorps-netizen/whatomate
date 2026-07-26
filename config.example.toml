@@ -1,11 +1,11 @@
-# Whatomate Configuration
+# ReReply Configuration
 # Copy this to config.toml and update values
 #
 # For Docker: use "db" and "redis" as hostnames
 # For local dev: use "localhost"
 
 [app]
-name = "Whatomate"
+name = "ReReply"
 environment = "development"  # development, staging, production
 debug = true
 encryption_key = ""  # AES-256 key for encrypting secrets at rest (32+ chars, required in production)
@@ -19,6 +19,10 @@ base_path = ""  # Set to "/subpath" if behind nginx proxy pass
 allowed_origins = ""  # Comma-separated CORS origins (e.g., "https://app.example.com,https://admin.example.com"). Empty = allow all (dev only).
 
 [database]
+# Optional connection URL. When set, it takes precedence over the individual
+# fields below. On DigitalOcean App Platform, bind this to the managed
+# database's DATABASE_PRIVATE_URL to keep production traffic inside the VPC.
+url = ""
 host = "db"  # Use "localhost" for local development
 port = 5432
 user = "whatomate"
@@ -30,6 +34,9 @@ max_idle_conns = 5
 conn_max_lifetime = 300
 
 [redis]
+# Optional redis:// or rediss:// connection URL. When set, it takes precedence
+# over the individual fields below and can be bound to a private Valkey URL.
+url = ""
 host = "redis"  # Use "localhost" for local development
 port = 6379
 username = ""  # Redis ACL username (Redis 6+). Leave empty to use the default user.
@@ -49,6 +56,8 @@ s3_bucket = ""
 s3_region = ""
 s3_key = ""
 s3_secret = ""
+s3_endpoint = ""       # Optional for S3-compatible providers such as Railway
+s3_use_path_style = false
 
 [whatsapp]
 webhook_verify_token = "random-string-change-this"
@@ -57,6 +66,12 @@ base_url = "https://graph.facebook.com"
 app_id = ""      # Meta App ID for Embedded Signup
 app_secret = ""  # Meta App Secret
 config_id = ""  # WhatsApp Config ID for frontend login
+
+[ai]
+# Alibaba Cloud Model Studio international endpoint. For production workloads,
+# replace this with the workspace-specific Singapore endpoint when available:
+# https://<workspace-id>.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+qwen_base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
 # Auth cookie settings (tokens are stored in httpOnly cookies)
 [cookie]
@@ -133,6 +148,7 @@ udp_port_max = 10100          # WebRTC UDP port range end
 
 # Default admin credentials (only used during initial setup when no users exist)
 [default_admin]
-email = "admin@admin.com"
-password = "admin"
-full_name = "Admin"
+email = "admin@rereply.app"
+# Always override this with WHATOMATE_DEFAULT_ADMIN__PASSWORD.
+password = "replace-with-a-strong-random-password"
+full_name = "ReReply Administrator"

@@ -42,6 +42,8 @@ type App struct {
 	TTS *tts.PiperTTS
 	// S3Client for serving call recording presigned URLs (nil when not configured)
 	S3Client *storage.S3Client
+	// ObjectStore persists tenant media independently of any app replica.
+	ObjectStore storage.ObjectStore
 	// wg tracks background goroutines for graceful shutdown
 	wg sync.WaitGroup
 }
@@ -106,7 +108,7 @@ func (a *App) getOrgID(r *fastglue.Request) (uuid.UUID, error) {
 func (a *App) HealthCheck(r *fastglue.Request) error {
 	return r.SendEnvelope(map[string]string{
 		"status":  "ok",
-		"service": "whatomate",
+		"service": "rereply",
 	})
 }
 

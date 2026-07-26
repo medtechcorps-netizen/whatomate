@@ -893,15 +893,15 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 		}
 	}
 
-	// Save header media locally so it can be served for chat preview
-	var headerLocalPath string
+	// Persist header media so it can be served for chat preview.
+	var headerMediaPath string
 	if len(headerMediaData) > 0 {
-		localPath, err := a.saveMediaLocally(headerMediaData, headerMimeType, "header")
+		mediaPath, err := a.saveMessageMedia(r.RequestCtx, orgID, headerMediaData, headerMimeType, "header")
 		if err != nil {
-			a.Log.Error("Failed to save template header media locally", "error", err)
+			a.Log.Error("Failed to store template header media", "error", err, "org_id", orgID)
 			// Non-fatal — message will still send, just won't show preview
 		} else {
-			headerLocalPath = localPath
+			headerMediaPath = mediaPath
 		}
 	}
 
@@ -948,7 +948,7 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 		HeaderParams:        req.HeaderParams,
 		HeaderMediaID:       headerMediaID,
 		HeaderMediaFilename: headerMediaFilename,
-		MediaURL:            headerLocalPath,
+		MediaURL:            headerMediaPath,
 		MediaMimeType:       headerMimeType,
 		ButtonURLParams:     buttonParams,
 	}

@@ -13,7 +13,32 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
+	"github.com/zerodha/fastglue"
 )
+
+func createTestOrganizationInvitation(t *testing.T, app interface {
+	CreateOrganizationInvitation(*fastglue.Request) error
+}, orgID, userID uuid.UUID, roleID *uuid.UUID) string {
+	t.Helper()
+
+	body := map[string]any{}
+	if roleID != nil {
+		body["role_id"] = roleID.String()
+	}
+	req := testutil.NewJSONRequest(t, body)
+	testutil.SetAuthContext(req, orgID, userID)
+	require.NoError(t, app.CreateOrganizationInvitation(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var resp struct {
+		Data struct {
+			Token string `json:"token"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &resp))
+	require.NotEmpty(t, resp.Data.Token)
+	return resp.Data.Token
+}
 
 func TestApp_Login_Success(t *testing.T) {
 	app := newTestApp(t)
@@ -146,12 +171,14 @@ func TestApp_Register_Success(t *testing.T) {
 
 	// Create a default role for the org (Register looks for is_default=true, then falls back to name="agent" + is_system=true)
 	defaultRole := testutil.CreateTestRoleExact(t, app.DB, org.ID, "agent", true, true, nil)
+	inviter := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
+	invitationToken := createTestOrganizationInvitation(t, app, org.ID, inviter.ID, &defaultRole.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"email":           email,
-		"password":        "securepassword123",
-		"full_name":       "New User",
-		"organization_id": org.ID.String(),
+		"email":            email,
+		"password":         "securepassword123",
+		"full_name":        "New User",
+		"invitation_token": invitationToken,
 	})
 
 	err := app.Register(req)
@@ -199,6 +226,53 @@ func TestApp_Register_Success(t *testing.T) {
 	assert.True(t, userOrg.IsDefault)
 }
 
+func TestApp_Register_RejectsOrganizationIDWithoutInvitation(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	testutil.CreateTestRoleExact(t, app.DB, org.ID, "agent", true, true, nil)
+	email := testutil.UniqueEmail("unguarded-register")
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"email":           email,
+		"password":        "securepassword123",
+		"full_name":       "Uninvited User",
+		"organization_id": org.ID.String(),
+	})
+
+	require.NoError(t, app.Register(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusUnauthorized, "invitation")
+
+	var count int64
+	require.NoError(t, app.DB.Model(&models.User{}).Where("email = ?", email).Count(&count).Error)
+	assert.Zero(t, count, "an organization ID alone must never create a user")
+}
+
+func TestApp_Register_InvitationIsSingleUse(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	defaultRole := testutil.CreateTestRoleExact(t, app.DB, org.ID, "agent", true, true, nil)
+	inviter := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
+	invitationToken := createTestOrganizationInvitation(t, app, org.ID, inviter.ID, &defaultRole.ID)
+
+	first := testutil.NewJSONRequest(t, map[string]any{
+		"email":            testutil.UniqueEmail("invite-first"),
+		"password":         "securepassword123",
+		"full_name":        "First Invitee",
+		"invitation_token": invitationToken,
+	})
+	require.NoError(t, app.Register(first))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(first))
+
+	second := testutil.NewJSONRequest(t, map[string]any{
+		"email":            testutil.UniqueEmail("invite-second"),
+		"password":         "securepassword123",
+		"full_name":        "Second Invitee",
+		"invitation_token": invitationToken,
+	})
+	require.NoError(t, app.Register(second))
+	testutil.AssertErrorResponse(t, second, fasthttp.StatusUnauthorized, "invitation")
+}
+
 func TestApp_Register_EmailAlreadyExists_WrongPassword(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
@@ -207,13 +281,15 @@ func TestApp_Register_EmailAlreadyExists_WrongPassword(t *testing.T) {
 
 	// Create a second org to register into
 	org2 := testutil.CreateTestOrganization(t, app.DB)
-	testutil.CreateTestRoleExact(t, app.DB, org2.ID, "agent", true, true, nil)
+	defaultRole := testutil.CreateTestRoleExact(t, app.DB, org2.ID, "agent", true, true, nil)
+	inviter := testutil.CreateTestUser(t, app.DB, org2.ID, testutil.WithSuperAdmin())
+	invitationToken := createTestOrganizationInvitation(t, app, org2.ID, inviter.ID, &defaultRole.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"email":           email,
-		"password":        "wrongpassword123",
-		"full_name":       "Another User",
-		"organization_id": org2.ID.String(),
+		"email":            email,
+		"password":         "wrongpassword123",
+		"full_name":        "Another User",
+		"invitation_token": invitationToken,
 	})
 
 	err := app.Register(req)
@@ -229,13 +305,15 @@ func TestApp_Register_ExistingUser_JoinsNewOrg(t *testing.T) {
 
 	// Create a second org with a default role
 	org2 := testutil.CreateTestOrganization(t, app.DB)
-	testutil.CreateTestRoleExact(t, app.DB, org2.ID, "agent", true, true, nil)
+	defaultRole := testutil.CreateTestRoleExact(t, app.DB, org2.ID, "agent", true, true, nil)
+	inviter := testutil.CreateTestUser(t, app.DB, org2.ID, testutil.WithSuperAdmin())
+	invitationToken := createTestOrganizationInvitation(t, app, org2.ID, inviter.ID, &defaultRole.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"email":           email,
-		"password":        "password123",
-		"full_name":       "Same User",
-		"organization_id": org2.ID.String(),
+		"email":            email,
+		"password":         "password123",
+		"full_name":        "Same User",
+		"invitation_token": invitationToken,
 	})
 
 	err := app.Register(req)
@@ -352,6 +430,23 @@ func TestApp_RefreshToken_DisabledUser(t *testing.T) {
 	err := app.RefreshToken(req)
 	require.NoError(t, err)
 	testutil.AssertErrorResponse(t, req, fasthttp.StatusUnauthorized, "Account is disabled")
+}
+
+func TestApp_RefreshToken_RejectsRemovedOrganizationMembership(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	token := testutil.GenerateTestRefreshToken(t, user, testutil.TestJWTSecret, time.Hour)
+
+	require.NoError(t, app.DB.Where("user_id = ? AND organization_id = ?", user.ID, org.ID).
+		Delete(&models.UserOrganization{}).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]string{
+		"refresh_token": token,
+	})
+
+	require.NoError(t, app.RefreshToken(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusUnauthorized, "Organization access")
 }
 
 func TestApp_RefreshToken_MalformedToken(t *testing.T) {

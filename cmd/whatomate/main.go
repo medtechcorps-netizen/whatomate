@@ -46,7 +46,7 @@ func main() {
 	case "worker":
 		runWorker(os.Args[2:])
 	case "version":
-		fmt.Printf("Whatomate %s (built %s)\n", Version, BuildTime)
+		fmt.Printf("ReReply %s (built %s)\n", Version, BuildTime)
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -57,10 +57,10 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`Whatomate - WhatsApp Business API Platform
+	fmt.Println(`ReReply - WhatsApp Business API Platform
 
 Usage:
-  whatomate <command> [options]
+  rereply <command> [options]
 
 Commands:
   server    Start the API server (with optional embedded workers)
@@ -78,16 +78,16 @@ Worker Options:
   -workers int      Number of workers to run (default 1)
 
 Examples:
-  whatomate server                     # API + 1 embedded worker
-  whatomate server -workers 0          # API only (no workers)
-  whatomate server -workers 4          # API + 4 embedded workers
-  whatomate server -migrate            # Run migrations and start server
-  whatomate worker -workers 4          # 4 workers only (no API)
+  rereply server                     # API + 1 embedded worker
+  rereply server -workers 0          # API only (no workers)
+  rereply server -workers 4          # API + 4 embedded workers
+  rereply server -migrate            # Run migrations and start server
+  rereply worker -workers 4          # 4 workers only (no API)
 
 Deployment Scenarios:
-  All-in-one:    whatomate server
-  Separate:      whatomate server -workers 0  (on API server)
-                 whatomate worker -workers 4  (on worker server)`)
+  All-in-one:    rereply server
+  Separate:      rereply server -workers 0  (on API server)
+                 rereply worker -workers 4  (on worker server)`)
 }
 
 // ============================================================================
@@ -107,10 +107,10 @@ func runServer(args []string) {
 		Level:           logf.DebugLevel,
 		EnableCaller:    true,
 		TimestampFormat: "2006-01-02 15:04:05",
-		DefaultFields:   []any{"app", "whatomate"},
+		DefaultFields:   []any{"app", "rereply"},
 	})
 
-	lo.Info("Starting Whatomate server...", "version", Version)
+	lo.Info("Starting ReReply server...", "version", Version)
 
 	// Load configuration
 	cfg, err := config.Load(*configPath)
@@ -141,7 +141,7 @@ func runServer(args []string) {
 		lo = logf.New(logf.Opts{
 			Level:           logf.InfoLevel,
 			TimestampFormat: "2006-01-02 15:04:05",
-			DefaultFields:   []any{"app", "whatomate"},
+			DefaultFields:   []any{"app", "rereply"},
 		})
 	}
 
@@ -209,16 +209,24 @@ func runServer(args []string) {
 		HTTPClient: httpClient,
 	}
 
-	// Initialize S3 client for call recordings (optional)
+	// Initialize the S3-compatible client when durable media storage or call
+	// recording needs it. Explicit object-storage configuration fails fast so
+	// production never silently falls back to an app instance's local disk.
 	var s3Client *storage.S3Client
-	if cfg.Calling.RecordingEnabled && cfg.Storage.S3Bucket != "" {
+	if cfg.Storage.Type == "s3" || cfg.Calling.RecordingEnabled {
 		var err error
 		s3Client, err = storage.NewS3Client(&cfg.Storage)
 		if err != nil {
+			if cfg.Storage.Type == "s3" {
+				lo.Fatal("Failed to initialize configured object storage", "error", err)
+			}
 			lo.Warn("Failed to initialize S3 client for recordings, recording disabled", "error", err)
 		} else {
-			lo.Info("S3 client initialized for call recordings", "bucket", cfg.Storage.S3Bucket)
+			lo.Info("S3-compatible storage initialized", "bucket", cfg.Storage.S3Bucket)
 		}
+	}
+	if cfg.Storage.Type == "s3" {
+		app.ObjectStore = s3Client
 	}
 
 	// Initialize shared assignment engine (used by both chat and call transfers)
@@ -264,7 +272,7 @@ func runServer(args []string) {
 		ReadTimeout:        time.Duration(cfg.Server.ReadTimeout) * time.Second,
 		WriteTimeout:       time.Duration(cfg.Server.WriteTimeout) * time.Second,
 		MaxRequestBodySize: 15 * 1024 * 1024,
-		Name:               "Whatomate",
+		Name:               "ReReply",
 	}
 
 	// Start server in goroutine
@@ -361,10 +369,10 @@ func runWorker(args []string) {
 		Level:           logf.DebugLevel,
 		EnableCaller:    true,
 		TimestampFormat: "2006-01-02 15:04:05",
-		DefaultFields:   []any{"app", "whatomate-worker"},
+		DefaultFields:   []any{"app", "rereply-worker"},
 	})
 
-	lo.Info("Starting Whatomate worker...", "version", Version)
+	lo.Info("Starting ReReply worker...", "version", Version)
 
 	// Load configuration
 	cfg, err := config.Load(*configPath)
@@ -377,7 +385,7 @@ func runWorker(args []string) {
 		lo = logf.New(logf.Opts{
 			Level:           logf.InfoLevel,
 			TimestampFormat: "2006-01-02 15:04:05",
-			DefaultFields:   []any{"app", "whatomate-worker"},
+			DefaultFields:   []any{"app", "rereply-worker"},
 		})
 	}
 
@@ -791,6 +799,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// Organizations
 	g.GET("/api/organizations", app.ListOrganizations)
 	g.POST("/api/organizations", app.CreateOrganization)
+	g.POST("/api/organizations/invitations", app.CreateOrganizationInvitation)
 	g.GET("/api/organizations/current", app.GetCurrentOrganization)
 	g.GET("/api/organizations/members", app.ListOrganizationMembers)
 	g.POST("/api/organizations/members", app.AddOrganizationMember)

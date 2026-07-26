@@ -73,6 +73,16 @@ export const useOrganizationsStore = defineStore('organizations', () => {
     }
   }
 
+  async function createInvitation(roleId?: string): Promise<string> {
+    try {
+      const response = await organizationsService.createInvitation(roleId ? { role_id: roleId } : {})
+      return response.data.data.token
+    } catch (err: any) {
+      error.value = err.response?.data?.message || 'Failed to create invitation'
+      throw err
+    }
+  }
+
   return {
     organizations,
     myOrganizations,
@@ -85,6 +95,7 @@ export const useOrganizationsStore = defineStore('organizations', () => {
     fetchOrganizations,
     fetchMyOrganizations,
     selectOrganization,
-    addMember
+    addMember,
+    createInvitation
   }
 })

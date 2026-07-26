@@ -129,32 +129,66 @@ onMounted(async () => {
 async function saveGeneralSettings() {
   isSubmitting.value = true
   try {
-    const payload: any = {
+    await organizationService.updateSettings({
       name: generalSettings.value.organization_name,
       timezone: generalSettings.value.default_timezone,
       date_format: generalSettings.value.date_format,
       mask_phone_numbers: generalSettings.value.mask_phone_numbers
-    }
-    if (canWriteAccounts.value) {
-      payload.meta_app_id = generalSettings.value.meta_app_id
-      payload.meta_config_id = generalSettings.value.meta_config_id
-      if (generalSettings.value.meta_app_secret) {
-        payload.meta_app_secret = generalSettings.value.meta_app_secret
-      }
-    }
-    await organizationService.updateSettings(payload)
+    })
     toast.success(t('settings.generalSaved'))
-    // Clear secret input after save
-    generalSettings.value.meta_app_secret = ''
-    // Refresh organization settings to update has_meta_app_secret status
-    const orgResponse = await organizationService.getSettings()
-    const orgData = orgResponse.data.data || orgResponse.data
-    if (orgData) {
-      generalSettings.value.has_meta_app_secret = orgData.settings?.has_meta_app_secret || false
-    }
     refreshActivityLog(generalLogKey)
   } catch (error) {
     toast.error(t('common.failedSave', { resource: t('resources.settings') }))
+  } finally {
+    isSubmitting.value = false
+  }
+}
+
+async function refreshMetaAppSecretStatus() {
+  generalSettings.value.meta_app_secret = ''
+  const orgResponse = await organizationService.getSettings()
+  const orgData = orgResponse.data.data || orgResponse.data
+  if (orgData) {
+    generalSettings.value.meta_app_id = orgData.settings?.meta_app_id || ''
+    generalSettings.value.meta_config_id = orgData.settings?.meta_config_id || ''
+    generalSettings.value.has_meta_app_secret = orgData.settings?.has_meta_app_secret || false
+  }
+}
+
+async function saveMetaAppCredentials() {
+  isSubmitting.value = true
+  try {
+    const payload: {
+      meta_app_id: string
+      meta_config_id: string
+      meta_app_secret?: string
+    } = {
+      meta_app_id: generalSettings.value.meta_app_id,
+      meta_config_id: generalSettings.value.meta_config_id
+    }
+    if (generalSettings.value.meta_app_secret) {
+      payload.meta_app_secret = generalSettings.value.meta_app_secret
+    }
+    await organizationService.updateSettings(payload)
+    await refreshMetaAppSecretStatus()
+    toast.success(t('settings.metaAppCredentialsSaved'))
+    refreshActivityLog(generalLogKey)
+  } catch (error) {
+    toast.error(t('common.failedSave', { resource: t('settings.metaAppCredentials') }))
+  } finally {
+    isSubmitting.value = false
+  }
+}
+
+async function clearMetaAppSecret() {
+  isSubmitting.value = true
+  try {
+    await organizationService.updateSettings({ clear_meta_app_secret: true })
+    await refreshMetaAppSecretStatus()
+    toast.success(t('settings.metaAppSecretRemoved'))
+    refreshActivityLog(generalLogKey)
+  } catch (error) {
+    toast.error(t('common.failedSave', { resource: t('settings.metaAppCredentials') }))
   } finally {
     isSubmitting.value = false
   }
@@ -348,6 +382,8 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                     <Label for="meta_app_id" class="text-white/70 light:text-gray-700">{{ $t('settings.metaAppId') }}</Label>
                     <Input
                       id="meta_app_id"
+                      name="rereply-meta-app-id"
+                      autocomplete="off"
                       v-model="generalSettings.meta_app_id"
                       placeholder="e.g. 123456789012345"
                     />
@@ -356,6 +392,8 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                     <Label for="meta_config_id" class="text-white/70 light:text-gray-700">{{ $t('settings.metaConfigId') }}</Label>
                     <Input
                       id="meta_config_id"
+                      name="rereply-meta-config-id"
+                      autocomplete="off"
                       v-model="generalSettings.meta_config_id"
                       placeholder="e.g. 987654321098765"
                     />
@@ -365,13 +403,24 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                   <Label for="meta_app_secret" class="text-white/70 light:text-gray-700">{{ $t('settings.metaAppSecret') }}</Label>
                   <Input
                     id="meta_app_secret"
+                    name="rereply-meta-app-secret"
                     type="password"
+                    autocomplete="new-password"
                     v-model="generalSettings.meta_app_secret"
                     :placeholder="generalSettings.has_meta_app_secret ? '••••••••••••' : 'Enter Meta App Secret'"
                   />
                 </div>
-                <div class="flex justify-end">
-                  <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveGeneralSettings" :disabled="isSubmitting">
+                <div class="flex justify-end gap-2">
+                  <Button
+                    v-if="generalSettings.has_meta_app_secret"
+                    variant="destructive"
+                    size="sm"
+                    @click="clearMetaAppSecret"
+                    :disabled="isSubmitting"
+                  >
+                    {{ $t('settings.removeMetaAppSecret') }}
+                  </Button>
+                  <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveMetaAppCredentials" :disabled="isSubmitting">
                     <Loader2 v-if="isSubmitting" class="mr-2 h-4 w-4 animate-spin" />
                     {{ $t('settings.save') }}
                   </Button>

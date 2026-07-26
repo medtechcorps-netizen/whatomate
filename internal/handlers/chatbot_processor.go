@@ -835,6 +835,8 @@ func (a *App) generateAIResponse(settings *models.ChatbotSettings, session *mode
 		return a.generateAnthropicResponse(settings, session, userMessage, contextData)
 	case models.AIProviderGoogle:
 		return a.generateGoogleResponse(settings, session, userMessage, contextData)
+	case models.AIProviderQwen:
+		return a.generateQwenResponse(settings, session, userMessage, contextData)
 	default:
 		return "", fmt.Errorf("unsupported AI provider: %s", settings.AI.Provider)
 	}
@@ -933,10 +935,9 @@ func (a *App) fetchAPIContext(apiConfig models.JSONB, session *models.ChatbotSes
 	return string(respBody), nil
 }
 
-// generateOpenAIResponse generates a response using OpenAI API
-func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
-	url := "https://api.openai.com/v1/chat/completions"
-
+// generateOpenAICompatibleResponse calls an OpenAI-compatible chat completions
+// endpoint. Qwen uses this protocol through Alibaba Cloud Model Studio.
+func (a *App) generateOpenAICompatibleResponse(providerName, url string, settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string, extraPayload map[string]any) (string, error) {
 	// Build messages array
 	messages := []map[string]string{}
 
@@ -984,6 +985,9 @@ func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *
 		"messages":   messages,
 		"max_tokens": settings.AI.MaxTokens,
 	}
+	for key, value := range extraPayload {
+		payload[key] = value
+	}
 
 	if settings.AI.Temperature > 0 {
 		payload["temperature"] = settings.AI.Temperature
@@ -1017,7 +1021,10 @@ func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *
 			} `json:"error"`
 		}
 		_ = json.Unmarshal(body, &errResp)
-		return "", fmt.Errorf("OpenAI API error: %s", errResp.Error.Message)
+		if errResp.Error.Message == "" {
+			errResp.Error.Message = strings.TrimSpace(string(body))
+		}
+		return "", fmt.Errorf("%s API error: %s", providerName, errResp.Error.Message)
 	}
 
 	var result struct {
@@ -1035,7 +1042,47 @@ func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *
 		return strings.TrimSpace(result.Choices[0].Message.Content), nil
 	}
 
-	return "", fmt.Errorf("no response from OpenAI")
+	return "", fmt.Errorf("no response from %s", providerName)
+}
+
+// generateOpenAIResponse generates a response using OpenAI API.
+func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
+	return a.generateOpenAICompatibleResponse(
+		"OpenAI",
+		"https://api.openai.com/v1/chat/completions",
+		settings,
+		session,
+		userMessage,
+		contextData,
+		nil,
+	)
+}
+
+// generateQwenResponse generates a low-latency customer-service response using
+// Alibaba Cloud Model Studio's OpenAI-compatible Qwen API. Thinking is disabled
+// for routine CRM replies to keep latency and token usage predictable.
+func (a *App) generateQwenResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
+	requestSettings := settings
+	if settings.AI.Model == "" {
+		settingsCopy := *settings
+		settingsCopy.AI.Model = "qwen3.7-plus"
+		requestSettings = &settingsCopy
+	}
+
+	baseURL := "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+	if a.Config != nil && a.Config.AI.QwenBaseURL != "" {
+		baseURL = a.Config.AI.QwenBaseURL
+	}
+
+	return a.generateOpenAICompatibleResponse(
+		"Qwen",
+		strings.TrimRight(baseURL, "/")+"/chat/completions",
+		requestSettings,
+		session,
+		userMessage,
+		contextData,
+		map[string]any{"enable_thinking": false},
+	)
 }
 
 // generateAnthropicResponse generates a response using Anthropic API
@@ -1438,9 +1485,9 @@ func (a *App) extractMessageContent(ctx context.Context, msg IncomingTextMessage
 		extracted.Media = &MediaInfo{
 			MediaMimeType: msg.Image.MimeType,
 		}
-		// Download and save media locally
+		// Download and persist media in the configured tenant store.
 		waAccount := a.toWhatsAppAccount(account)
-		if localPath, err := a.DownloadAndSaveMedia(ctx, msg.Image.ID, msg.Image.MimeType, waAccount); err != nil {
+		if localPath, err := a.DownloadAndSaveMedia(ctx, account.OrganizationID, msg.Image.ID, msg.Image.MimeType, waAccount); err != nil {
 			a.Log.Error("Failed to download image", "error", err, "media_id", msg.Image.ID)
 		} else {
 			extracted.Media.MediaURL = localPath
@@ -1452,9 +1499,9 @@ func (a *App) extractMessageContent(ctx context.Context, msg IncomingTextMessage
 			MediaMimeType: msg.Document.MimeType,
 			MediaFilename: msg.Document.Filename,
 		}
-		// Download and save media locally
+		// Download and persist media in the configured tenant store.
 		waAccount := a.toWhatsAppAccount(account)
-		if localPath, err := a.DownloadAndSaveMedia(ctx, msg.Document.ID, msg.Document.MimeType, waAccount); err != nil {
+		if localPath, err := a.DownloadAndSaveMedia(ctx, account.OrganizationID, msg.Document.ID, msg.Document.MimeType, waAccount); err != nil {
 			a.Log.Error("Failed to download document", "error", err, "media_id", msg.Document.ID)
 		} else {
 			extracted.Media.MediaURL = localPath
@@ -1465,9 +1512,9 @@ func (a *App) extractMessageContent(ctx context.Context, msg IncomingTextMessage
 		extracted.Media = &MediaInfo{
 			MediaMimeType: msg.Video.MimeType,
 		}
-		// Download and save media locally
+		// Download and persist media in the configured tenant store.
 		waAccount := a.toWhatsAppAccount(account)
-		if localPath, err := a.DownloadAndSaveMedia(ctx, msg.Video.ID, msg.Video.MimeType, waAccount); err != nil {
+		if localPath, err := a.DownloadAndSaveMedia(ctx, account.OrganizationID, msg.Video.ID, msg.Video.MimeType, waAccount); err != nil {
 			a.Log.Error("Failed to download video", "error", err, "media_id", msg.Video.ID)
 		} else {
 			extracted.Media.MediaURL = localPath
@@ -1477,9 +1524,9 @@ func (a *App) extractMessageContent(ctx context.Context, msg IncomingTextMessage
 		extracted.Media = &MediaInfo{
 			MediaMimeType: msg.Audio.MimeType,
 		}
-		// Download and save media locally
+		// Download and persist media in the configured tenant store.
 		waAccount := a.toWhatsAppAccount(account)
-		if localPath, err := a.DownloadAndSaveMedia(ctx, msg.Audio.ID, msg.Audio.MimeType, waAccount); err != nil {
+		if localPath, err := a.DownloadAndSaveMedia(ctx, account.OrganizationID, msg.Audio.ID, msg.Audio.MimeType, waAccount); err != nil {
 			a.Log.Error("Failed to download audio", "error", err, "media_id", msg.Audio.ID)
 		} else {
 			extracted.Media.MediaURL = localPath
@@ -1489,9 +1536,9 @@ func (a *App) extractMessageContent(ctx context.Context, msg IncomingTextMessage
 		extracted.Media = &MediaInfo{
 			MediaMimeType: msg.Sticker.MimeType,
 		}
-		// Download and save media locally
+		// Download and persist media in the configured tenant store.
 		waAccount := a.toWhatsAppAccount(account)
-		if localPath, err := a.DownloadAndSaveMedia(ctx, msg.Sticker.ID, msg.Sticker.MimeType, waAccount); err != nil {
+		if localPath, err := a.DownloadAndSaveMedia(ctx, account.OrganizationID, msg.Sticker.ID, msg.Sticker.MimeType, waAccount); err != nil {
 			a.Log.Error("Failed to download sticker", "error", err, "media_id", msg.Sticker.ID)
 		} else {
 			extracted.Media.MediaURL = localPath

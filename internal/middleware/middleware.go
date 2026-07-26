@@ -103,6 +103,8 @@ func SecurityHeaders() fastglue.FastMiddleware {
 		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		h.Set("Permissions-Policy", "camera=(), microphone=(self), geolocation=()")
 		h.Set("X-XSS-Protection", "0") // Disabled per OWASP recommendation (use CSP instead)
+		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		h.Set("Content-Security-Policy", "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; media-src 'self' blob: https:; worker-src 'self' blob:; upgrade-insecure-requests")
 		return r
 	}
 }
@@ -166,7 +168,7 @@ func AuthWithDB(secret string, db *gorm.DB) fastglue.FastMiddleware {
 		// Parse and validate token
 		token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (any, error) {
 			return []byte(secret), nil
-		})
+		}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
 
 		if err != nil || !token.Valid {
 			_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid or expired token", nil, "")
@@ -179,17 +181,71 @@ func AuthWithDB(secret string, db *gorm.DB) fastglue.FastMiddleware {
 			return nil
 		}
 
-		// Store claims in context
-		r.RequestCtx.SetUserValue(ContextKeyUserID, claims.UserID)
-		r.RequestCtx.SetUserValue(ContextKeyOrganizationID, claims.OrganizationID)
-		r.RequestCtx.SetUserValue(ContextKeyEmail, claims.Email)
-		if claims.RoleID != nil {
-			r.RequestCtx.SetUserValue(ContextKeyRoleID, *claims.RoleID)
+		if db != nil {
+			if !setAuthenticatedContext(r, db, claims.UserID, claims.OrganizationID) {
+				_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Organization access is no longer available", nil, "")
+				return nil
+			}
+			return r
 		}
-		r.RequestCtx.SetUserValue(ContextKeyIsSuperAdmin, claims.IsSuperAdmin)
 
+		// Legacy mode without a database cannot verify current membership.
+		setClaimsContext(r, claims)
 		return r
 	}
+}
+
+func setClaimsContext(r *fastglue.Request, claims *JWTClaims) {
+	r.RequestCtx.SetUserValue(ContextKeyUserID, claims.UserID)
+	r.RequestCtx.SetUserValue(ContextKeyOrganizationID, claims.OrganizationID)
+	r.RequestCtx.SetUserValue(ContextKeyEmail, claims.Email)
+	if claims.RoleID != nil {
+		r.RequestCtx.SetUserValue(ContextKeyRoleID, *claims.RoleID)
+	}
+	r.RequestCtx.SetUserValue(ContextKeyIsSuperAdmin, claims.IsSuperAdmin)
+}
+
+// setAuthenticatedContext loads the current user and organization membership
+// from the database. JWT and API-key claims identify the principal, but the
+// database remains authoritative for active status, tenant membership, role,
+// and super-admin status.
+func setAuthenticatedContext(r *fastglue.Request, db *gorm.DB, userID, orgID uuid.UUID) bool {
+	if userID == uuid.Nil || orgID == uuid.Nil {
+		return false
+	}
+
+	var user models.User
+	if err := db.Where("id = ?", userID).First(&user).Error; err != nil || !user.IsActive {
+		return false
+	}
+
+	var org models.Organization
+	if err := db.Where("id = ?", orgID).First(&org).Error; err != nil {
+		return false
+	}
+
+	roleID := user.RoleID
+	var membership models.UserOrganization
+	membershipErr := db.Where("user_id = ? AND organization_id = ?", userID, orgID).First(&membership).Error
+	if !user.IsSuperAdmin && membershipErr != nil {
+		return false
+	}
+	if membershipErr == nil {
+		roleID = membership.RoleID
+	}
+
+	user.OrganizationID = orgID
+	user.RoleID = roleID
+	r.RequestCtx.SetUserValue(ContextKeyUserID, user.ID)
+	r.RequestCtx.SetUserValue(ContextKeyOrganizationID, org.ID)
+	r.RequestCtx.SetUserValue(ContextKeyEmail, user.Email)
+	if roleID != nil {
+		r.RequestCtx.SetUserValue(ContextKeyRoleID, *roleID)
+	}
+	r.RequestCtx.SetUserValue(ContextKeyIsSuperAdmin, user.IsSuperAdmin)
+	r.RequestCtx.SetUserValue(ContextKeyUser, &user)
+	r.RequestCtx.SetUserValue(ContextKeyOrganization, &org)
+	return true
 }
 
 // validateAPIKey validates an API key and sets context values
@@ -218,6 +274,10 @@ func validateAPIKey(r *fastglue.Request, key string, db *gorm.DB) bool {
 				return false // Key expired
 			}
 
+			if !setAuthenticatedContext(r, db, apiKey.UserID, apiKey.OrganizationID) {
+				return false
+			}
+
 			// Update last used timestamp (async to not block request)
 			go func(id uuid.UUID) {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -225,18 +285,7 @@ func validateAPIKey(r *fastglue.Request, key string, db *gorm.DB) bool {
 				now := time.Now()
 				db.WithContext(ctx).Model(&models.APIKey{}).Where("id = ?", id).Update("last_used_at", now)
 			}(apiKey.ID)
-
-			// Set context values from the user who created the key
-			if apiKey.User != nil {
-				r.RequestCtx.SetUserValue(ContextKeyUserID, apiKey.UserID)
-				r.RequestCtx.SetUserValue(ContextKeyOrganizationID, apiKey.OrganizationID)
-				r.RequestCtx.SetUserValue(ContextKeyEmail, apiKey.User.Email)
-				if apiKey.User.RoleID != nil {
-					r.RequestCtx.SetUserValue(ContextKeyRoleID, *apiKey.User.RoleID)
-				}
-				r.RequestCtx.SetUserValue(ContextKeyIsSuperAdmin, apiKey.User.IsSuperAdmin)
-				return true
-			}
+			return true
 		}
 	}
 

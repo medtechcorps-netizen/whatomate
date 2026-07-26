@@ -9,10 +9,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  e2e:
+  e2e-shard:
+    name: e2e-shard-${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
 
     services:
       postgres:
@@ -45,13 +54,13 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.25.12'
           cache: true
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -59,7 +68,7 @@ jobs:
         run: |
           cat > config.toml << 'EOF'
           [app]
-          name = "Whatomate"
+          name = "ReReply"
           environment = "test"
           debug = true
 
@@ -112,11 +121,11 @@ jobs:
           cp -r frontend/dist/* internal/frontend/dist/
 
       - name: Build backend
-        run: go build -o whatomate ./cmd/whatomate
+        run: go build -o rereply ./cmd/whatomate
 
       - name: Start backend with migrations
         run: |
-          ./whatomate server -migrate &
+          ./rereply server -migrate &
           sleep 10
           # Verify server is running
           curl -f http://localhost:8080/health || exit 1
@@ -127,7 +136,7 @@ jobs:
         run: cd frontend && npx playwright install chromium --with-deps
 
       - name: Run E2E tests
-        run: cd frontend && npm run test:e2e
+        run: cd frontend && npm run test:e2e -- --shard=${{ matrix.shard }}/4
         env:
           BASE_URL: http://localhost:8080
           TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/whatomate_test
@@ -137,7 +146,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: playwright-report
+          name: playwright-report-${{ matrix.shard }}
           path: frontend/playwright-report/
           retention-days: 7
 
@@ -145,6 +154,17 @@ jobs:
         uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: test-screenshots
+          name: test-screenshots-${{ matrix.shard }}
           path: frontend/test-results/
           retention-days: 7
+
+  e2e:
+    name: e2e
+    if: always()
+    needs: e2e-shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all E2E shards passed
+        env:
+          SHARD_RESULT: ${{ needs.e2e-shard.result }}
+        run: test "$SHARD_RESULT" = "success"

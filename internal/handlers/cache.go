@@ -432,17 +432,25 @@ func (a *App) getUserPermissionsCached(userID uuid.UUID, orgIDs ...uuid.UUID) (*
 	if orgID != uuid.Nil {
 		// Look up role from user_organizations for this specific org
 		var userOrg models.UserOrganization
-		if err := a.DB.Where("user_id = ? AND organization_id = ?", userID, orgID).First(&userOrg).Error; err == nil && userOrg.RoleID != nil {
+		err := a.DB.Where("user_id = ? AND organization_id = ?", userID, orgID).First(&userOrg).Error
+		if err == nil && userOrg.RoleID != nil {
 			roleID = userOrg.RoleID
-		} else {
-			// Fall back to user's default role
+		} else if user.IsSuperAdmin {
+			// Super admins may access organizations without explicit
+			// membership; their global role is only used for display because
+			// permission checks below grant them full access.
 			roleID = user.RoleID
+		} else {
+			return nil, gorm.ErrRecordNotFound
 		}
 	} else {
 		roleID = user.RoleID
 	}
 
 	if roleID == nil {
+		if user.IsSuperAdmin {
+			return &UserPermissions{IsSuperAdmin: true, Permissions: []string{}}, nil
+		}
 		return nil, gorm.ErrRecordNotFound
 	}
 

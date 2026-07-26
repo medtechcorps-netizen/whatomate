@@ -26,7 +26,7 @@ func TestLoad_AppliesDefaultsForMissingFields(t *testing.T) {
 	cfg, err := config.Load(writeConfig(t, ""))
 	require.NoError(t, err)
 
-	assert.Equal(t, "Whatomate", cfg.App.Name)
+	assert.Equal(t, "ReReply", cfg.App.Name)
 	assert.Equal(t, "development", cfg.App.Environment)
 	assert.Equal(t, "0.0.0.0", cfg.Server.Host)
 	assert.Equal(t, 8080, cfg.Server.Port)
@@ -40,12 +40,14 @@ func TestLoad_AppliesDefaultsForMissingFields(t *testing.T) {
 	assert.Equal(t, 6379, cfg.Redis.Port)
 	assert.Equal(t, 15, cfg.JWT.AccessExpiryMins)
 	assert.Equal(t, 1, cfg.JWT.RefreshExpiryDays)
-	assert.Equal(t, "v18.0", cfg.WhatsApp.APIVersion)
+	assert.Equal(t, "v24.0", cfg.WhatsApp.APIVersion)
 	assert.Equal(t, "https://graph.facebook.com", cfg.WhatsApp.BaseURL)
+	assert.Equal(t, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", cfg.AI.QwenBaseURL)
 	assert.Equal(t, "local", cfg.Storage.Type)
 	assert.Equal(t, "./uploads", cfg.Storage.LocalPath)
-	assert.Equal(t, "admin@admin.com", cfg.DefaultAdmin.Email)
+	assert.Equal(t, "admin@rereply.app", cfg.DefaultAdmin.Email)
 	assert.Equal(t, "admin", cfg.DefaultAdmin.Password)
+	assert.Equal(t, "ReReply Administrator", cfg.DefaultAdmin.FullName)
 }
 
 func TestLoad_FileValuesOverrideDefaults(t *testing.T) {
@@ -103,6 +105,8 @@ secure = false
 
 func TestLoad_EnvVarsOverrideFile(t *testing.T) {
 	t.Setenv("WHATOMATE_DATABASE__HOST", "from-env")
+	t.Setenv("WHATOMATE_DATABASE__URL", "postgres://private-db/app")
+	t.Setenv("WHATOMATE_REDIS__URL", "rediss://private-cache/0")
 	t.Setenv("WHATOMATE_SERVER__PORT", "1234")
 
 	cfg, err := config.Load(writeConfig(t, `
@@ -114,13 +118,15 @@ port = 8080
 `))
 	require.NoError(t, err)
 	assert.Equal(t, "from-env", cfg.Database.Host, "WHATOMATE_DATABASE__HOST must override file")
+	assert.Equal(t, "postgres://private-db/app", cfg.Database.URL)
+	assert.Equal(t, "rediss://private-cache/0", cfg.Redis.URL)
 	assert.Equal(t, 1234, cfg.Server.Port, "WHATOMATE_SERVER__PORT must override file")
 }
 
 func TestLoad_EmptyConfigPathStillLoadsDefaults(t *testing.T) {
 	cfg, err := config.Load("")
 	require.NoError(t, err)
-	assert.Equal(t, "Whatomate", cfg.App.Name)
+	assert.Equal(t, "ReReply", cfg.App.Name)
 	assert.Equal(t, 8080, cfg.Server.Port)
 }
 
@@ -198,4 +204,21 @@ func TestLoad_EnvMapsMultiWordKeys(t *testing.T) {
 	assert.Equal(t, "v21.0", cfg.WhatsApp.APIVersion)
 	assert.Equal(t, "admin@example.com", cfg.DefaultAdmin.Email)
 	assert.Equal(t, "db.internal", cfg.Database.Host)
+}
+
+func TestLoad_EnvMapsS3CompatibleStorage(t *testing.T) {
+	t.Setenv("WHATOMATE_STORAGE__TYPE", "s3")
+	t.Setenv("WHATOMATE_STORAGE__S3_BUCKET", "rereply-media")
+	t.Setenv("WHATOMATE_STORAGE__S3_REGION", "sin")
+	t.Setenv("WHATOMATE_STORAGE__S3_ENDPOINT", "https://storage.railway.app")
+	t.Setenv("WHATOMATE_STORAGE__S3_USE_PATH_STYLE", "true")
+
+	cfg, err := config.Load("")
+	require.NoError(t, err)
+
+	assert.Equal(t, "s3", cfg.Storage.Type)
+	assert.Equal(t, "rereply-media", cfg.Storage.S3Bucket)
+	assert.Equal(t, "sin", cfg.Storage.S3Region)
+	assert.Equal(t, "https://storage.railway.app", cfg.Storage.S3Endpoint)
+	assert.True(t, cfg.Storage.S3UsePathStyle)
 }

@@ -4,10 +4,10 @@ import { ChatPage } from '../../pages'
 import { createTestScope } from '../../framework'
 
 const cannedScope = createTestScope('chat-canned-preview')
-// Seed via API as admin@admin.com (always exists per migrations) and log the
+// Seed via API as admin@rereply.app (always exists per migrations) and log the
 // browser in as the same user — otherwise the API-created contact lives in a
 // different org from the UI session and the chat composer never renders.
-const ADMIN_USER = { email: 'admin@admin.com', password: 'admin', role: 'admin' as const }
+const ADMIN_USER = { email: 'admin@rereply.app', password: 'admin', role: 'admin' as const }
 
 test.describe('Chat Page', () => {
   let chatPage: ChatPage
@@ -350,7 +350,7 @@ test.describe('Canned Response Preview', () => {
 
   test.beforeEach(async ({ page, request }) => {
     api = new ApiHelper(request)
-    await api.login('admin@admin.com', 'admin')
+    await api.login('admin@rereply.app', 'admin')
 
     // Names use the random-suffix form (no second arg) so each test creates
     // distinct rows. The DELETE endpoint soft-deletes, so a deterministic

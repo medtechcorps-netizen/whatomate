@@ -53,30 +53,30 @@ test.describe('Dashboard', () => {
     await expect(main.getByText('Common tasks and shortcuts')).toBeVisible()
 
     // Check for quick action links - scope to main to avoid sidebar duplicates
-    await expect(main.locator('a[href="/chat"]')).toBeVisible()
-    await expect(main.locator('a[href="/campaigns"]')).toBeVisible()
-    await expect(main.locator('a[href="/templates"]')).toBeVisible()
-    await expect(main.locator('a[href="/chatbot"]')).toBeVisible()
+    await expect(main.getByRole('link', { name: 'Start Chat', exact: true })).toBeVisible()
+    await expect(main.getByRole('link', { name: 'Campaigns', exact: true })).toBeVisible()
+    await expect(main.getByRole('link', { name: 'Templates', exact: true })).toBeVisible()
+    await expect(main.getByRole('link', { name: 'Chatbot', exact: true })).toBeVisible()
   })
 
   test('should navigate to chat from quick actions', async ({ page }) => {
     // Use main to scope to quick actions, not sidebar
-    await page.locator('main a[href="/chat"]').click()
+    await page.locator('main').getByRole('link', { name: 'Start Chat', exact: true }).click()
     await expect(page).toHaveURL(/\/chat/)
   })
 
   test('should navigate to campaigns from quick actions', async ({ page }) => {
-    await page.locator('main a[href="/campaigns"]').click()
+    await page.locator('main').getByRole('link', { name: 'Campaigns', exact: true }).click()
     await expect(page).toHaveURL(/\/campaigns/)
   })
 
   test('should navigate to templates from quick actions', async ({ page }) => {
-    await page.locator('main a[href="/templates"]').click()
+    await page.locator('main').getByRole('link', { name: 'Templates', exact: true }).click()
     await expect(page).toHaveURL(/\/templates/)
   })
 
   test('should navigate to chatbot from quick actions', async ({ page }) => {
-    await page.locator('main a[href="/chatbot"]').click()
+    await page.locator('main').getByRole('link', { name: 'Chatbot', exact: true }).click()
     await expect(page).toHaveURL(/\/chatbot/)
   })
 

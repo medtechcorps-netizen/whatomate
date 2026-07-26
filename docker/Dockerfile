@@ -1,4 +1,5 @@
 # Frontend build stage — pinned to BUILDPLATFORM (output is arch-agnostic JS).
+ARG BUILDPLATFORM=linux/amd64
 FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
 
 WORKDIR /app/frontend
@@ -13,10 +14,10 @@ RUN npm run build
 
 # Go build stage — runs on BUILDPLATFORM, cross-compiles to TARGETOS/TARGETARCH
 # so multi-arch builds don't emulate the Go toolchain under QEMU.
-FROM --platform=$BUILDPLATFORM golang:1.25.3-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25.12-alpine AS builder
 
-ARG TARGETOS
-ARG TARGETARCH
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
 WORKDIR /app
 
@@ -34,12 +35,12 @@ COPY . .
 COPY --from=frontend-builder /app/frontend/dist/ ./internal/frontend/dist/
 
 # Build the binary
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -installsuffix cgo -o whatomate ./cmd/whatomate
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -installsuffix cgo -o rereply ./cmd/whatomate
 
 # Piper TTS download stage — runs on BUILDPLATFORM (just wget+tar, no native exec),
 # selects the tarball matching TARGETARCH so the final image gets a binary that runs.
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS piper-dl
-ARG TARGETARCH
+FROM --platform=$BUILDPLATFORM ubuntu:24.04 AS piper-dl
+ARG TARGETARCH=amd64
 RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN case "${TARGETARCH}" in \
       amd64) PIPER_ARCH=x86_64 ;; \
@@ -56,8 +57,8 @@ RUN mkdir -p /tmp/piper-models \
     && wget -q https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json \
        -O /tmp/piper-models/en_US-lessac-medium.onnx.json
 
-# Final stage (Debian for glibc — required by Piper TTS)
-FROM debian:bookworm-slim
+# Final stage (Ubuntu for glibc — required by Piper TTS)
+FROM ubuntu:24.04
 
 WORKDIR /app
 
@@ -67,7 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder
-COPY --from=builder /app/whatomate .
+COPY --from=builder /app/rereply .
 
 # Copy config example (will be overridden by env vars in production)
 COPY --from=builder /app/config.example.toml ./config.toml
@@ -82,8 +83,11 @@ RUN ldconfig
 # Install default voice model
 COPY --from=piper-dl /tmp/piper-models /opt/piper/models
 
-# Create directories
-RUN mkdir -p /app/uploads /app/audio
+# Run the service as an unprivileged user.
+RUN groupadd --system rereply \
+    && useradd --system --gid rereply --home /app --shell /usr/sbin/nologin rereply \
+    && mkdir -p /app/uploads /app/audio \
+    && chown -R rereply:rereply /app/uploads /app/audio
 
 # Expose port
 EXPOSE 8080
@@ -93,5 +97,7 @@ EXPOSE 8080
 # only the default subcommand/flags. A Nomad job that sets
 # `args = ["server", "-migrate", ...]` (no `command`) then appends to the
 # entrypoint instead of replacing the binary with "server".
-ENTRYPOINT ["./whatomate"]
+USER rereply
+
+ENTRYPOINT ["./rereply"]
 CMD ["server", "-config", "config.toml", "-migrate"]

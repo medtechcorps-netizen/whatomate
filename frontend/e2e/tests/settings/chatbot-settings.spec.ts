@@ -277,15 +277,16 @@ test.describe('AI Tab', () => {
     await expect(page.getByText('System Prompt')).toBeVisible()
   })
 
-  test('should show AI providers', async ({ page }) => {
+  test('should show the Qwen AI provider', async ({ page }) => {
     const toggle = page.locator('button[role="switch"]').first()
     const state = await toggle.getAttribute('data-state')
     if (state === 'unchecked') {
       await toggle.click()
     }
     await page.locator('button[role="combobox"]').first().click()
-    await expect(page.locator('[role="option"]').filter({ hasText: 'OpenAI' })).toBeVisible()
-    await expect(page.locator('[role="option"]').filter({ hasText: 'Anthropic' })).toBeVisible()
+    await expect(page.locator('[role="option"]').filter({ hasText: 'Qwen (Alibaba Cloud)' })).toBeVisible()
+    await expect(page.locator('[role="option"]').filter({ hasText: 'OpenAI' })).toHaveCount(0)
+    await expect(page.locator('[role="option"]').filter({ hasText: 'Anthropic' })).toHaveCount(0)
     await page.keyboard.press('Escape')
   })
 

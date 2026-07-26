@@ -114,6 +114,7 @@ type ServerConfig struct {
 }
 
 type DatabaseConfig struct {
+	URL             string `koanf:"url"`
 	Host            string `koanf:"host"`
 	Port            int    `koanf:"port"`
 	User            string `koanf:"user"`
@@ -126,6 +127,7 @@ type DatabaseConfig struct {
 }
 
 type RedisConfig struct {
+	URL      string `koanf:"url"`
 	Host     string `koanf:"host"`
 	Port     int    `koanf:"port"`
 	Username string `koanf:"username"`
@@ -153,15 +155,18 @@ type AIConfig struct {
 	OpenAIKey    string `koanf:"openai_key"`
 	AnthropicKey string `koanf:"anthropic_key"`
 	GoogleKey    string `koanf:"google_key"`
+	QwenBaseURL  string `koanf:"qwen_base_url"`
 }
 
 type StorageConfig struct {
-	Type      string `koanf:"type"` // local, s3
-	LocalPath string `koanf:"local_path"`
-	S3Bucket  string `koanf:"s3_bucket"`
-	S3Region  string `koanf:"s3_region"`
-	S3Key     string `koanf:"s3_key"`
-	S3Secret  string `koanf:"s3_secret"`
+	Type           string `koanf:"type"` // local, s3
+	LocalPath      string `koanf:"local_path"`
+	S3Bucket       string `koanf:"s3_bucket"`
+	S3Region       string `koanf:"s3_region"`
+	S3Key          string `koanf:"s3_key"`
+	S3Secret       string `koanf:"s3_secret"`
+	S3Endpoint     string `koanf:"s3_endpoint"`       // Optional for S3-compatible providers such as Railway.
+	S3UsePathStyle bool   `koanf:"s3_use_path_style"` // Required only by providers that do not use virtual-hosted URLs.
 }
 
 type DefaultAdminConfig struct {
@@ -226,7 +231,7 @@ func Load(configPath string) (*Config, error) {
 
 func setDefaults(cfg *Config) {
 	if cfg.App.Name == "" {
-		cfg.App.Name = "Whatomate"
+		cfg.App.Name = "ReReply"
 	}
 	if cfg.App.Environment == "" {
 		cfg.App.Environment = "development"
@@ -268,10 +273,13 @@ func setDefaults(cfg *Config) {
 		cfg.JWT.RefreshExpiryDays = 1
 	}
 	if cfg.WhatsApp.APIVersion == "" {
-		cfg.WhatsApp.APIVersion = "v18.0"
+		cfg.WhatsApp.APIVersion = "v24.0"
 	}
 	if cfg.WhatsApp.BaseURL == "" {
 		cfg.WhatsApp.BaseURL = "https://graph.facebook.com"
+	}
+	if cfg.AI.QwenBaseURL == "" {
+		cfg.AI.QwenBaseURL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 	}
 	if cfg.Storage.Type == "" {
 		cfg.Storage.Type = "local"
@@ -281,13 +289,13 @@ func setDefaults(cfg *Config) {
 	}
 	// Default admin credentials (only used during initial setup)
 	if cfg.DefaultAdmin.Email == "" {
-		cfg.DefaultAdmin.Email = "admin@admin.com"
+		cfg.DefaultAdmin.Email = "admin@rereply.app"
 	}
 	if cfg.DefaultAdmin.Password == "" {
 		cfg.DefaultAdmin.Password = "admin"
 	}
 	if cfg.DefaultAdmin.FullName == "" {
-		cfg.DefaultAdmin.FullName = "Admin"
+		cfg.DefaultAdmin.FullName = "ReReply Administrator"
 	}
 	// Cookie defaults
 	if cfg.App.Environment == "production" {

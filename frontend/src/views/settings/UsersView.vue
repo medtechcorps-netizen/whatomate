@@ -157,6 +157,7 @@ const isAddExistingOpen = ref(false)
 const addExistingEmail = ref('')
 const addExistingRoleId = ref('')
 const isAddExistingSubmitting = ref(false)
+const isInviteLinkLoading = ref(false)
 
 function openAddExistingDialog() {
   addExistingEmail.value = ''
@@ -186,14 +187,17 @@ async function submitAddExisting() {
 }
 
 async function copyInviteLink() {
-  const orgId = organizationsStore.selectedOrgId || authStore.organizationId
-  const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')
-  const url = `${window.location.origin}${basePath}/register?org=${orgId}`
+  isInviteLinkLoading.value = true
   try {
+    const token = await organizationsStore.createInvitation(getDefaultRoleId() || undefined)
+    const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')
+    const url = `${window.location.origin}${basePath}/register?invite=${encodeURIComponent(token)}`
     await navigator.clipboard.writeText(url)
     toast.success(t('users.inviteLinkCopied'))
-  } catch {
-    toast.error(t('common.clipboardFailed'))
+  } catch (e) {
+    toast.error(getErrorMessage(e, t('users.inviteLinkFailed')))
+  } finally {
+    isInviteLinkLoading.value = false
   }
 }
 </script>
@@ -202,7 +206,11 @@ async function copyInviteLink() {
   <div class="flex flex-col h-full bg-[#0a0a0b] light:bg-gray-50">
     <PageHeader :title="$t('users.title')" :icon="Users" icon-gradient="bg-gradient-to-br from-blue-500 to-indigo-600 shadow-blue-500/20" back-link="/settings" :breadcrumbs="breadcrumbs">
       <template #actions>
-        <Button variant="outline" size="sm" @click="copyInviteLink"><Link class="h-4 w-4 mr-2" />{{ $t('users.copyInviteLink') }}</Button>
+        <Button v-if="authStore.hasPermission('organizations', 'assign')" variant="outline" size="sm" :disabled="isInviteLinkLoading" @click="copyInviteLink">
+          <Loader2 v-if="isInviteLinkLoading" class="h-4 w-4 mr-2 animate-spin" />
+          <Link v-else class="h-4 w-4 mr-2" />
+          {{ $t('users.copyInviteLink') }}
+        </Button>
         <Button v-if="organizationsStore.isMultiOrg && authStore.hasPermission('organizations', 'assign')" variant="outline" size="sm" @click="openAddExistingDialog"><UserPlus class="h-4 w-4 mr-2" />{{ $t('users.addExistingUser') }}</Button>
         <Button variant="outline" size="sm" @click="openCreateDialog"><Plus class="h-4 w-4 mr-2" />{{ $t('users.addUser') }}</Button>
       </template>

@@ -52,10 +52,9 @@ func TestApp_ListUsers(t *testing.T) {
 		assert.Len(t, resp.Data.Users, 2)
 	})
 
-	t.Run("empty list for new org", func(t *testing.T) {
+	t.Run("forbidden for admin from another organization", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		// Create a user in a different org so the admin has permissions
 		otherOrg := testutil.CreateTestOrganization(t, app.DB)
 		adminRole := testutil.CreateAdminRole(t, app.DB, otherOrg.ID)
 		admin := testutil.CreateTestUser(t, app.DB, otherOrg.ID,
@@ -64,21 +63,11 @@ func TestApp_ListUsers(t *testing.T) {
 		)
 
 		req := testutil.NewGETRequest(t)
-		// Query for org that has no users, but auth as the admin from otherOrg
 		testutil.SetAuthContext(req, org.ID, admin.ID)
 
 		err := app.ListUsers(req)
 		require.NoError(t, err)
-		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
-
-		var resp struct {
-			Data struct {
-				Users []handlers.UserResponse `json:"users"`
-			} `json:"data"`
-		}
-		err = json.Unmarshal(testutil.GetResponseBody(req), &resp)
-		require.NoError(t, err)
-		assert.Empty(t, resp.Data.Users)
+		assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
 	})
 
 	t.Run("forbidden without users:read permission", func(t *testing.T) {

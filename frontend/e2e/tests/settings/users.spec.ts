@@ -192,9 +192,9 @@ test.describe('Users - Copy Invite Link', () => {
     const toast = page.locator('[data-sonner-toast]')
     await expect(toast).toBeVisible({ timeout: 5000 })
 
-    // Verify clipboard contains a registration URL with org param
+    // Verify clipboard contains the signed, single-use invitation URL.
     const clipboardText = await page.evaluate(() => navigator.clipboard.readText())
-    expect(clipboardText).toContain('/register?org=')
+    expect(clipboardText).toContain('/register?invite=')
   })
 })
 
