@@ -19,6 +19,10 @@ base_path = ""  # Set to "/subpath" if behind nginx proxy pass
 allowed_origins = ""  # Comma-separated CORS origins (e.g., "https://app.example.com,https://admin.example.com"). Empty = allow all (dev only).
 
 [database]
+# Optional connection URL. When set, it takes precedence over the individual
+# fields below. On DigitalOcean App Platform, bind this to the managed
+# database's DATABASE_PRIVATE_URL to keep production traffic inside the VPC.
+url = ""
 host = "db"  # Use "localhost" for local development
 port = 5432
 user = "whatomate"
@@ -30,6 +34,9 @@ max_idle_conns = 5
 conn_max_lifetime = 300
 
 [redis]
+# Optional redis:// or rediss:// connection URL. When set, it takes precedence
+# over the individual fields below and can be bound to a private Valkey URL.
+url = ""
 host = "redis"  # Use "localhost" for local development
 port = 6379
 username = ""  # Redis ACL username (Redis 6+). Leave empty to use the default user.

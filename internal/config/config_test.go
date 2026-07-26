@@ -105,6 +105,8 @@ secure = false
 
 func TestLoad_EnvVarsOverrideFile(t *testing.T) {
 	t.Setenv("WHATOMATE_DATABASE__HOST", "from-env")
+	t.Setenv("WHATOMATE_DATABASE__URL", "postgres://private-db/app")
+	t.Setenv("WHATOMATE_REDIS__URL", "rediss://private-cache/0")
 	t.Setenv("WHATOMATE_SERVER__PORT", "1234")
 
 	cfg, err := config.Load(writeConfig(t, `
@@ -116,6 +118,8 @@ port = 8080
 `))
 	require.NoError(t, err)
 	assert.Equal(t, "from-env", cfg.Database.Host, "WHATOMATE_DATABASE__HOST must override file")
+	assert.Equal(t, "postgres://private-db/app", cfg.Database.URL)
+	assert.Equal(t, "rediss://private-cache/0", cfg.Redis.URL)
 	assert.Equal(t, 1234, cfg.Server.Port, "WHATOMATE_SERVER__PORT must override file")
 }
 
