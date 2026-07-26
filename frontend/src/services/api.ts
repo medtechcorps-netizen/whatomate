@@ -735,6 +735,8 @@ export const organizationService = {
 // Organizations
 export interface Organization {
   id: string
+  reseller_id?: string
+  reseller_name?: string
   name: string
   slug?: string
   created_at: string
@@ -742,12 +744,75 @@ export interface Organization {
 
 export const organizationsService = {
   list: () => api.get<{ organizations: Organization[] }>('/organizations'),
-  create: (data: { name: string }) => api.post('/organizations', data),
+  create: (data: { name: string; reseller_id?: string }) => api.post('/organizations', data),
   createInvitation: (data: { role_id?: string } = {}) =>
     api.post<{ data: { token: string; expires_at: string } }>('/organizations/invitations', data),
   // Members
   addMember: (data: { user_id?: string; email?: string; role_id?: string }) =>
     api.post('/organizations/members', data),
+}
+
+export interface Reseller {
+  id: string
+  name: string
+  slug: string
+  status: 'active' | 'suspended'
+  plan: 'starter' | 'growth' | 'enterprise'
+  max_organizations: number
+  brand_name: string
+  logo_url: string
+  primary_color: string
+  accent_color: string
+  support_email: string
+  custom_domain: string
+  organization_count: number
+  member_count: number
+  created_at: string
+}
+
+export interface ResellerMember {
+  id: string
+  user_id: string
+  email: string
+  full_name: string
+  role: 'owner' | 'admin'
+  is_active: boolean
+  created_at: string
+}
+
+export interface ResellerUsage {
+  reseller_id: string
+  plan: string
+  max_organizations: number
+  organizations: Organization[]
+  organization_count: number
+  user_count: number
+  whatsapp_accounts: number
+  contacts: number
+  messages: number
+}
+
+export const resellersService = {
+  list: () => api.get<{ resellers: Reseller[] }>('/resellers'),
+  get: (id: string) => api.get<Reseller>(`/resellers/${id}`),
+  create: (data: {
+    name: string
+    brand_name?: string
+    plan?: Reseller['plan']
+    max_organizations?: number
+    workspace_name?: string
+    support_email?: string
+  }) => api.post('/resellers', data),
+  update: (id: string, data: Partial<Pick<Reseller,
+    'name' | 'brand_name' | 'logo_url' | 'primary_color' | 'accent_color' |
+    'support_email' | 'custom_domain' | 'status' | 'plan' | 'max_organizations'
+  >>) => api.put<Reseller>(`/resellers/${id}`, data),
+  usage: (id: string) => api.get<ResellerUsage>(`/resellers/${id}/usage`),
+  members: (id: string) => api.get<{ members: ResellerMember[] }>(`/resellers/${id}/members`),
+  addMember: (id: string, data: { email: string; role: ResellerMember['role'] }) =>
+    api.post(`/resellers/${id}/members`, data),
+  removeMember: (id: string, memberId: string) =>
+    api.delete(`/resellers/${id}/members/${memberId}`)
 }
 
 export interface Webhook {

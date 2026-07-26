@@ -89,11 +89,13 @@ type BaseModel struct {
 // Organization represents a tenant in the multi-tenant system
 type Organization struct {
 	BaseModel
-	Name     string `gorm:"size:255;not null" json:"name"`
-	Slug     string `gorm:"size:100;uniqueIndex;not null" json:"slug"`
-	Settings JSONB  `gorm:"type:jsonb;default:'{}'" json:"settings"`
+	ResellerID *uuid.UUID `gorm:"type:uuid;index" json:"reseller_id,omitempty"`
+	Name       string     `gorm:"size:255;not null" json:"name"`
+	Slug       string     `gorm:"size:100;uniqueIndex;not null" json:"slug"`
+	Settings   JSONB      `gorm:"type:jsonb;default:'{}'" json:"settings"`
 
 	// Relations
+	Reseller          *Reseller          `gorm:"foreignKey:ResellerID" json:"reseller,omitempty"`
 	Users             []User             `gorm:"foreignKey:OrganizationID" json:"users,omitempty"`
 	UserOrganizations []UserOrganization `gorm:"foreignKey:OrganizationID" json:"user_organizations,omitempty"`
 	WhatsAppAccounts  []WhatsAppAccount  `gorm:"foreignKey:OrganizationID" json:"whatsapp_accounts,omitempty"`
@@ -106,24 +108,26 @@ func (Organization) TableName() string {
 // User represents a user in the system
 type User struct {
 	BaseModel
-	OrganizationID uuid.UUID  `gorm:"type:uuid;index" json:"organization_id"`
-	Email          string     `gorm:"size:255;uniqueIndex;not null" json:"email"`
-	PasswordHash   string     `gorm:"size:255" json:"-"`
-	FullName       string     `gorm:"size:255" json:"full_name"`
-	RoleID         *uuid.UUID `gorm:"type:uuid;index" json:"role_id,omitempty"`
-	Settings       JSONB      `gorm:"type:jsonb;default:'{}'" json:"settings"`
-	IsActive       bool       `gorm:"default:true" json:"is_active"`
-	IsAvailable    bool       `gorm:"default:true" json:"is_available"`    // Agent availability status (away/available)
-	IsSuperAdmin   bool       `gorm:"default:false" json:"is_super_admin"` // Super admin can access all organizations
+	OrganizationID  uuid.UUID  `gorm:"type:uuid;index" json:"organization_id"`
+	Email           string     `gorm:"size:255;uniqueIndex;not null" json:"email"`
+	PasswordHash    string     `gorm:"size:255" json:"-"`
+	FullName        string     `gorm:"size:255" json:"full_name"`
+	RoleID          *uuid.UUID `gorm:"type:uuid;index" json:"role_id,omitempty"`
+	Settings        JSONB      `gorm:"type:jsonb;default:'{}'" json:"settings"`
+	IsActive        bool       `gorm:"default:true" json:"is_active"`
+	IsAvailable     bool       `gorm:"default:true" json:"is_available"`    // Agent availability status (away/available)
+	IsSuperAdmin    bool       `gorm:"default:false" json:"is_super_admin"` // Super admin can access all organizations
+	IsResellerAdmin bool       `gorm:"-" json:"is_reseller_admin"`
 
 	// SSO fields
 	SSOProvider   string `gorm:"size:50" json:"sso_provider,omitempty"`     // google, microsoft, github, facebook, custom
 	SSOProviderID string `gorm:"size:255" json:"sso_provider_id,omitempty"` // External user ID from provider
 
 	// Relations
-	Organization      *Organization      `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`
-	Role              *CustomRole        `gorm:"foreignKey:RoleID" json:"role,omitempty"`
-	UserOrganizations []UserOrganization `gorm:"foreignKey:UserID" json:"user_organizations,omitempty"`
+	Organization        *Organization      `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`
+	Role                *CustomRole        `gorm:"foreignKey:RoleID" json:"role,omitempty"`
+	UserOrganizations   []UserOrganization `gorm:"foreignKey:UserID" json:"user_organizations,omitempty"`
+	ResellerMemberships []ResellerMember   `gorm:"foreignKey:UserID" json:"reseller_memberships,omitempty"`
 }
 
 func (User) TableName() string {
@@ -133,15 +137,18 @@ func (User) TableName() string {
 // UserOrganization represents a many-to-many relationship between users and organizations
 type UserOrganization struct {
 	BaseModel
-	UserID         uuid.UUID  `gorm:"type:uuid;uniqueIndex:idx_user_org;not null" json:"user_id"`
-	OrganizationID uuid.UUID  `gorm:"type:uuid;uniqueIndex:idx_user_org;not null" json:"organization_id"`
-	RoleID         *uuid.UUID `gorm:"type:uuid;index" json:"role_id,omitempty"`
-	IsDefault      bool       `gorm:"default:false" json:"is_default"`
+	UserID           uuid.UUID  `gorm:"type:uuid;uniqueIndex:idx_user_org;not null" json:"user_id"`
+	OrganizationID   uuid.UUID  `gorm:"type:uuid;uniqueIndex:idx_user_org;not null" json:"organization_id"`
+	RoleID           *uuid.UUID `gorm:"type:uuid;index" json:"role_id,omitempty"`
+	IsDefault        bool       `gorm:"default:false" json:"is_default"`
+	Source           string     `gorm:"size:20;default:'direct';not null" json:"source"`
+	ResellerMemberID *uuid.UUID `gorm:"type:uuid;index" json:"reseller_member_id,omitempty"`
 
 	// Relations
-	User         *User         `gorm:"foreignKey:UserID" json:"user,omitempty"`
-	Organization *Organization `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`
-	Role         *CustomRole   `gorm:"foreignKey:RoleID" json:"role,omitempty"`
+	User           *User           `gorm:"foreignKey:UserID" json:"user,omitempty"`
+	Organization   *Organization   `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`
+	Role           *CustomRole     `gorm:"foreignKey:RoleID" json:"role,omitempty"`
+	ResellerMember *ResellerMember `gorm:"foreignKey:ResellerMemberID" json:"reseller_member,omitempty"`
 }
 
 func (UserOrganization) TableName() string {

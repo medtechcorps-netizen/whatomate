@@ -7,6 +7,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/access"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -17,13 +18,14 @@ import (
 
 // Context keys
 const (
-	ContextKeyUserID         = "user_id"
-	ContextKeyOrganizationID = "organization_id"
-	ContextKeyEmail          = "email"
-	ContextKeyRoleID         = "role_id"
-	ContextKeyIsSuperAdmin   = "is_super_admin"
-	ContextKeyUser           = "user"
-	ContextKeyOrganization   = "organization"
+	ContextKeyUserID          = "user_id"
+	ContextKeyOrganizationID  = "organization_id"
+	ContextKeyEmail           = "email"
+	ContextKeyRoleID          = "role_id"
+	ContextKeyIsSuperAdmin    = "is_super_admin"
+	ContextKeyIsResellerAdmin = "is_reseller_admin"
+	ContextKeyUser            = "user"
+	ContextKeyOrganization    = "organization"
 )
 
 // JWTClaims represents JWT claims
@@ -231,11 +233,15 @@ func setAuthenticatedContext(r *fastglue.Request, db *gorm.DB, userID, orgID uui
 		return false
 	}
 	if membershipErr == nil {
+		if !user.IsSuperAdmin && !access.ResellerDerivedMembershipActive(db, &membership) {
+			return false
+		}
 		roleID = membership.RoleID
 	}
 
 	user.OrganizationID = orgID
 	user.RoleID = roleID
+	user.IsResellerAdmin = access.IsResellerAdmin(db, user.ID)
 	r.RequestCtx.SetUserValue(ContextKeyUserID, user.ID)
 	r.RequestCtx.SetUserValue(ContextKeyOrganizationID, org.ID)
 	r.RequestCtx.SetUserValue(ContextKeyEmail, user.Email)
@@ -243,6 +249,7 @@ func setAuthenticatedContext(r *fastglue.Request, db *gorm.DB, userID, orgID uui
 		r.RequestCtx.SetUserValue(ContextKeyRoleID, *roleID)
 	}
 	r.RequestCtx.SetUserValue(ContextKeyIsSuperAdmin, user.IsSuperAdmin)
+	r.RequestCtx.SetUserValue(ContextKeyIsResellerAdmin, user.IsResellerAdmin)
 	r.RequestCtx.SetUserValue(ContextKeyUser, &user)
 	r.RequestCtx.SetUserValue(ContextKeyOrganization, &org)
 	return true

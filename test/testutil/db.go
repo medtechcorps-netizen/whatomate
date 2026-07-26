@@ -80,10 +80,12 @@ func SetupTestDBWithCleanup(t *testing.T, cleanup bool) *gorm.DB {
 func runMigrations(db *gorm.DB) error {
 	return db.AutoMigrate(
 		// Core models
+		&models.Reseller{},
 		&models.Organization{},
 		&models.Permission{},
 		&models.CustomRole{},
 		&models.User{},
+		&models.ResellerMember{},
 		&models.UserOrganization{},
 		&models.Team{},
 		&models.TeamMember{},
@@ -175,8 +177,10 @@ func cleanupTables(db *gorm.DB) {
 		"custom_actions",
 		"user_availability_logs",
 		"user_organizations",
+		"reseller_members",
 		"users",
 		"organizations",
+		"resellers",
 	}
 
 	for _, table := range tables {
@@ -219,8 +223,10 @@ func TruncateTables(db *gorm.DB) {
 		"custom_actions",
 		"user_availability_logs",
 		"user_organizations",
+		"reseller_members",
 		"users",
 		"organizations",
+		"resellers",
 	}
 
 	for _, table := range tables {

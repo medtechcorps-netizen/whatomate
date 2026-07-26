@@ -2,12 +2,12 @@ package handlers
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
 	"github.com/shridarpatil/whatomate/internal/crypto"
-	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/valyala/fasthttp"
@@ -334,26 +334,41 @@ func (a *App) ShouldMaskPhoneNumbers(orgID any) bool {
 
 // OrganizationResponse represents an organization in API responses
 type OrganizationResponse struct {
-	ID        uuid.UUID `json:"id"`
-	Name      string    `json:"name"`
-	Slug      string    `json:"slug,omitempty"`
-	CreatedAt string    `json:"created_at"`
+	ID           uuid.UUID  `json:"id"`
+	ResellerID   *uuid.UUID `json:"reseller_id,omitempty"`
+	ResellerName string     `json:"reseller_name,omitempty"`
+	Name         string     `json:"name"`
+	Slug         string     `json:"slug,omitempty"`
+	CreatedAt    string     `json:"created_at"`
 }
 
-// ListOrganizations returns all organizations (super admin or users with organizations:read)
+// ListOrganizations returns the platform portfolio to super administrators,
+// reseller-owned organizations to reseller administrators, and direct
+// memberships to ordinary users.
 func (a *App) ListOrganizations(r *fastglue.Request) error {
 	userID, ok := r.RequestCtx.UserValue("user_id").(uuid.UUID)
 	if !ok {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
-	// Super admins or users with organizations:read permission
-	if !a.IsSuperAdmin(userID) && !a.HasPermission(userID, models.ResourceOrganizations, models.ActionRead) {
-		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+	query := a.DB.Preload("Reseller")
+	if !a.IsSuperAdmin(userID) {
+		resellerIDs, err := a.resellerIDsForUser(userID)
+		if err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resolve reseller access", nil, "")
+		}
+		query = query.Where(
+			`organizations.id IN (
+				SELECT organization_id FROM user_organizations
+				WHERE user_id = ? AND deleted_at IS NULL
+				  AND (source = ? OR source = '')
+			) OR organizations.reseller_id IN ?`,
+			userID, models.MembershipSourceDirect, resellerIDs,
+		)
 	}
 
 	var orgs []models.Organization
-	if err := a.DB.Order("name ASC").Find(&orgs).Error; err != nil {
+	if err := query.Order("name ASC").Find(&orgs).Error; err != nil {
 		a.Log.Error("Failed to list organizations", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list organizations", nil, "")
 	}
@@ -361,10 +376,14 @@ func (a *App) ListOrganizations(r *fastglue.Request) error {
 	response := make([]OrganizationResponse, len(orgs))
 	for i, org := range orgs {
 		response[i] = OrganizationResponse{
-			ID:        org.ID,
-			Name:      org.Name,
-			Slug:      org.Slug,
-			CreatedAt: org.CreatedAt.Format("2006-01-02T15:04:05Z"),
+			ID:         org.ID,
+			ResellerID: org.ResellerID,
+			Name:       org.Name,
+			Slug:       org.Slug,
+			CreatedAt:  org.CreatedAt.Format(time.RFC3339),
+		}
+		if org.Reseller != nil {
+			response[i].ResellerName = org.Reseller.Name
 		}
 	}
 
@@ -386,16 +405,18 @@ func (a *App) GetCurrentOrganization(r *fastglue.Request) error {
 	}
 
 	return r.SendEnvelope(OrganizationResponse{
-		ID:        org.ID,
-		Name:      org.Name,
-		Slug:      org.Slug,
-		CreatedAt: org.CreatedAt.Format("2006-01-02T15:04:05Z"),
+		ID:         org.ID,
+		ResellerID: org.ResellerID,
+		Name:       org.Name,
+		Slug:       org.Slug,
+		CreatedAt:  org.CreatedAt.Format(time.RFC3339),
 	})
 }
 
 // CreateOrganizationRequest represents the request body for creating an organization
 type CreateOrganizationRequest struct {
-	Name string `json:"name"`
+	Name       string     `json:"name"`
+	ResellerID *uuid.UUID `json:"reseller_id"`
 }
 
 // CreateOrganization creates a new organization
@@ -410,79 +431,35 @@ func (a *App) CreateOrganization(r *fastglue.Request) error {
 		return nil
 	}
 
+	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Organization name is required", nil, "")
 	}
 
-	// Start transaction
+	reseller, err := a.resolveOrganizationReseller(userID, req.ResellerID)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "An active reseller portfolio is required", nil, "")
+	}
+	var organizationCount int64
+	if err := a.DB.Model(&models.Organization{}).
+		Where("reseller_id = ?", reseller.ID).
+		Count(&organizationCount).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to validate reseller plan", nil, "")
+	}
+	if organizationCount >= int64(reseller.MaxOrganizations) {
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Reseller organization limit reached", nil, "")
+	}
+
 	tx := a.DB.Begin()
 	if tx.Error != nil {
 		a.Log.Error("Failed to begin transaction", "error", tx.Error)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
 	}
 
-	org := models.Organization{
-		Name:     req.Name,
-		Slug:     generateSlug(req.Name),
-		Settings: models.JSONB{},
-	}
-
-	if err := tx.Create(&org).Error; err != nil {
+	org, err := a.createTenantOrganization(tx, req.Name, reseller.ID, userID)
+	if err != nil {
 		tx.Rollback()
-		a.Log.Error("Failed to create organization", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
-	}
-	if a.rlsEnabled() {
-		if err := database.SetTenantContext(tx, org.ID); err != nil {
-			tx.Rollback()
-			a.Log.Error("Failed to bind new organization transaction", "error", err, "org_id", org.ID)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
-		}
-	}
-
-	// Seed system roles for the new organization
-	if err := database.SeedSystemRolesForOrg(tx, org.ID); err != nil {
-		tx.Rollback()
-		a.Log.Error("Failed to seed system roles", "error", err, "org_id", org.ID)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
-	}
-
-	// Create default chatbot settings
-	chatbotSettings := models.ChatbotSettings{
-		OrganizationID:     org.ID,
-		IsEnabled:          false,
-		SessionTimeoutMins: 30,
-	}
-	if err := tx.Create(&chatbotSettings).Error; err != nil {
-		tx.Rollback()
-		a.Log.Error("Failed to create chatbot settings", "error", err, "org_id", org.ID)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
-	}
-
-	// Get admin role for this org and add the creator as admin
-	var adminRole models.CustomRole
-	if err := tx.Where("organization_id = ? AND name = ? AND is_system = ?", org.ID, "admin", true).First(&adminRole).Error; err != nil {
-		tx.Rollback()
-		a.Log.Error("Failed to find admin role", "error", err, "org_id", org.ID)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
-	}
-
-	userOrg := models.UserOrganization{
-		UserID:         userID,
-		OrganizationID: org.ID,
-		RoleID:         &adminRole.ID,
-		IsDefault:      false,
-	}
-	if err := tx.Create(&userOrg).Error; err != nil {
-		tx.Rollback()
-		a.Log.Error("Failed to add creator to organization", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
-	}
-
-	// Seed default dashboard widgets for the new organization
-	if err := database.SeedDefaultWidgetsForOrg(tx, org.ID, userID); err != nil {
-		tx.Rollback()
-		a.Log.Error("Failed to seed default widgets", "error", err, "org_id", org.ID)
+		a.Log.Error("Failed to provision organization", "error", err, "reseller_id", reseller.ID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
 	}
 
@@ -491,13 +468,15 @@ func (a *App) CreateOrganization(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create organization", nil, "")
 	}
 
-	a.Log.Info("Created organization", "org_id", org.ID, "org_name", org.Name, "created_by", userID)
+	a.Log.Info("Created organization", "org_id", org.ID, "org_name", org.Name, "reseller_id", reseller.ID, "created_by", userID)
 
 	return r.SendEnvelope(OrganizationResponse{
-		ID:        org.ID,
-		Name:      org.Name,
-		Slug:      org.Slug,
-		CreatedAt: org.CreatedAt.Format("2006-01-02T15:04:05Z"),
+		ID:           org.ID,
+		ResellerID:   org.ResellerID,
+		ResellerName: reseller.Name,
+		Name:         org.Name,
+		Slug:         org.Slug,
+		CreatedAt:    org.CreatedAt.Format(time.RFC3339),
 	})
 }
 

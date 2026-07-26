@@ -207,6 +207,8 @@
     "Widget": "Widget"
   },
   "nav": {
+    "resellerConsole": "Partner Console",
+    "sectionPartner": "Partner",
     "dashboard": "Panel",
     "chat": "Chat",
     "contacts": "Contactos",

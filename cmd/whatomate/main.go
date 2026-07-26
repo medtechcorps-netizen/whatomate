@@ -668,6 +668,17 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.PUT("/api/me/availability", tenant((*handlers.App).UpdateAvailability))
 	g.GET("/api/me/organizations", tenant((*handlers.App).ListMyOrganizations))
 
+	// Reseller control plane. These routes intentionally run outside a tenant
+	// transaction because they manage portfolios spanning organizations.
+	g.GET("/api/resellers", app.ListResellers)
+	g.POST("/api/resellers", app.CreateReseller)
+	g.GET("/api/resellers/{id}", app.GetReseller)
+	g.PUT("/api/resellers/{id}", app.UpdateReseller)
+	g.GET("/api/resellers/{id}/usage", app.GetResellerUsage)
+	g.GET("/api/resellers/{id}/members", app.ListResellerMembers)
+	g.POST("/api/resellers/{id}/members", app.AddResellerMember)
+	g.DELETE("/api/resellers/{id}/members/{member_id}", app.RemoveResellerMember)
+
 	// User Management (admin only - enforced by middleware)
 	g.GET("/api/users", tenant((*handlers.App).ListUsers))
 	g.POST("/api/users", tenant((*handlers.App).CreateUser))

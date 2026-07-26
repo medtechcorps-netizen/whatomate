@@ -21,7 +21,8 @@ import {
   Tags,
   PhoneCall,
   PhoneForwarded,
-  ScrollText
+  ScrollText,
+  Building2
 } from 'lucide-vue-next'
 import type { Component } from 'vue'
 
@@ -44,6 +45,18 @@ export interface NavSection {
 }
 
 export const navigationSections: NavSection[] = [
+  {
+    label: 'nav.sectionPartner',
+    permissions: ['resellers'],
+    items: [
+      {
+        name: 'nav.resellerConsole',
+        path: '/resellers',
+        icon: Building2,
+        permission: 'resellers'
+      }
+    ]
+  },
   {
     label: 'nav.sectionMain',
     permissions: ['analytics', 'chat'],

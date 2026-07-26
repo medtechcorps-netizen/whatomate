@@ -1,6 +1,7 @@
 package database
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -64,10 +65,12 @@ type MigrationModel struct {
 func GetMigrationModels() []MigrationModel {
 	return []MigrationModel{
 		// Core models
+		{"Reseller", &models.Reseller{}},
 		{"Organization", &models.Organization{}},
 		{"Permission", &models.Permission{}},
 		{"CustomRole", &models.CustomRole{}},
 		{"User", &models.User{}},
+		{"ResellerMember", &models.ResellerMember{}},
 		{"UserOrganization", &models.UserOrganization{}},
 		{"Team", &models.Team{}},
 		{"TeamMember", &models.TeamMember{}},
@@ -208,6 +211,12 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 		return err
 	}
 	currentStep++
+
+	// Initialize the reseller control plane only after the first organization
+	// and platform administrator have been created.
+	if err := EnsurePlatformReseller(silentDB); err != nil {
+		return fmt.Errorf("failed to initialize reseller control plane: %w", err)
+	}
 
 	// Seed default widgets for all organizations
 	printProgress(currentStep, totalSteps)
@@ -395,6 +404,89 @@ func MigrateUserOrganizations(db *gorm.DB) error {
 		LEFT JOIN user_organizations uo ON uo.user_id = u.id AND uo.organization_id = u.organization_id AND uo.deleted_at IS NULL
 		WHERE uo.id IS NULL AND u.deleted_at IS NULL
 	`).Error
+}
+
+const platformResellerSlug = "platform-direct"
+
+// EnsurePlatformReseller creates the first-party reseller, assigns every
+// legacy organization to it, and records platform super administrators as
+// its owners. The operation is idempotent for both fresh installs and
+// upgrades.
+func EnsurePlatformReseller(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("database is required")
+	}
+
+	var reseller models.Reseller
+	err := db.Unscoped().Where("slug = ?", platformResellerSlug).First(&reseller).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		reseller = models.Reseller{
+			BaseModel:        models.BaseModel{ID: uuid.New()},
+			Name:             "Platform Direct",
+			Slug:             platformResellerSlug,
+			Status:           models.ResellerStatusActive,
+			Plan:             models.ResellerPlanEnterprise,
+			MaxOrganizations: 10000,
+			BrandName:        "ReReply",
+			PrimaryColor:     "#0f766e",
+			AccentColor:      "#f59e0b",
+			Settings:         models.JSONB{},
+		}
+		if err := db.Create(&reseller).Error; err != nil {
+			return fmt.Errorf("create platform reseller: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("find platform reseller: %w", err)
+	} else if reseller.DeletedAt.Valid || reseller.Status != models.ResellerStatusActive {
+		if err := db.Unscoped().Model(&reseller).Updates(map[string]any{
+			"deleted_at": nil,
+			"status":     models.ResellerStatusActive,
+		}).Error; err != nil {
+			return fmt.Errorf("restore platform reseller: %w", err)
+		}
+	}
+
+	if err := db.Model(&models.Organization{}).
+		Where("reseller_id IS NULL").
+		Update("reseller_id", reseller.ID).Error; err != nil {
+		return fmt.Errorf("backfill organization resellers: %w", err)
+	}
+
+	var owners []models.User
+	if err := db.Where("is_super_admin = ? AND is_active = ?", true, true).Find(&owners).Error; err != nil {
+		return fmt.Errorf("list platform owners: %w", err)
+	}
+	for _, owner := range owners {
+		var membership models.ResellerMember
+		err := db.Unscoped().
+			Where("reseller_id = ? AND user_id = ?", reseller.ID, owner.ID).
+			First(&membership).Error
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			membership = models.ResellerMember{
+				BaseModel:  models.BaseModel{ID: uuid.New()},
+				ResellerID: reseller.ID,
+				UserID:     owner.ID,
+				Role:       models.ResellerRoleOwner,
+				IsActive:   true,
+			}
+			if err := db.Create(&membership).Error; err != nil {
+				return fmt.Errorf("create platform owner membership: %w", err)
+			}
+		case err != nil:
+			return fmt.Errorf("find platform owner membership: %w", err)
+		default:
+			if err := db.Unscoped().Model(&membership).Updates(map[string]any{
+				"deleted_at": nil,
+				"role":       models.ResellerRoleOwner,
+				"is_active":  true,
+			}).Error; err != nil {
+				return fmt.Errorf("restore platform owner membership: %w", err)
+			}
+		}
+	}
+
+	return nil
 }
 
 // BackfillLastInboundAt sets last_inbound_at for existing contacts from their

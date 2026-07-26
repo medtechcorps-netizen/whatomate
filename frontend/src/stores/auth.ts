@@ -34,6 +34,7 @@ export interface User {
   settings?: UserSettings
   is_available?: boolean
   is_super_admin?: boolean
+  is_reseller_admin?: boolean
 }
 
 export interface AuthState {
@@ -171,6 +172,9 @@ export const useAuthStore = defineStore('auth', () => {
   function hasPermission(resource: string, action: string = 'read'): boolean {
     // Super admins have all permissions
     if (user.value?.is_super_admin) {
+      return true
+    }
+    if (resource === 'resellers' && user.value?.is_reseller_admin) {
       return true
     }
 

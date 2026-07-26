@@ -238,6 +238,8 @@
     "Widget": "ويدجت"
   },
   "nav": {
+    "resellerConsole": "Partner Console",
+    "sectionPartner": "Partner",
     "dashboard": "لوحة القيادة",
     "chat": "الدردشة",
     "contacts": "جهات الاتصال",

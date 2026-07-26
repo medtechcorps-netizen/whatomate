@@ -608,6 +608,67 @@ func TestAuthWithDB_UsesCurrentOrganizationRoleInsteadOfStaleTokenRole(t *testin
 	assert.Equal(t, newRole.ID, result.RequestCtx.UserValue(middleware.ContextKeyRoleID))
 }
 
+func TestAuthWithDB_RejectsSuspendedResellerDerivedMembership(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	reseller := testutil.CreateTestReseller(t, db)
+	org := testutil.CreateTestOrganizationForReseller(t, db, reseller.ID)
+	role := testutil.CreateTestRole(t, db, org.ID, "reseller-admin", nil)
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithRoleID(&role.ID))
+	member := models.ResellerMember{
+		BaseModel:  models.BaseModel{ID: uuid.New()},
+		ResellerID: reseller.ID,
+		UserID:     user.ID,
+		Role:       models.ResellerRoleAdmin,
+		IsActive:   true,
+	}
+	require.NoError(t, db.Create(&member).Error)
+	require.NoError(t, db.Model(&models.UserOrganization{}).
+		Where("user_id = ? AND organization_id = ?", user.ID, org.ID).
+		Updates(map[string]any{
+			"source":             models.MembershipSourceReseller,
+			"reseller_member_id": member.ID,
+		}).Error)
+	token := generateTestToken(t, user.ID, org.ID, user.Email, &role.ID, time.Hour)
+
+	activeRequest := newTestRequest()
+	activeRequest.RequestCtx.Request.Header.Set("Authorization", "Bearer "+token)
+	activeResult := middleware.AuthWithDB(testJWTSecret, db)(activeRequest)
+	require.NotNil(t, activeResult)
+	assert.Equal(t, true, activeResult.RequestCtx.UserValue(middleware.ContextKeyIsResellerAdmin))
+
+	require.NoError(t, db.Model(reseller).Update("status", models.ResellerStatusSuspended).Error)
+	suspendedRequest := newTestRequest()
+	suspendedRequest.RequestCtx.Request.Header.Set("Authorization", "Bearer "+token)
+	suspendedResult := middleware.AuthWithDB(testJWTSecret, db)(suspendedRequest)
+
+	assert.Nil(t, suspendedResult)
+	assert.Equal(t, fasthttp.StatusUnauthorized, suspendedRequest.RequestCtx.Response.StatusCode())
+}
+
+func TestAuthWithDB_PreservesDirectAccessWhenResellerIsSuspended(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	reseller := testutil.CreateTestReseller(t, db)
+	org := testutil.CreateTestOrganizationForReseller(t, db, reseller.ID)
+	user := testutil.CreateTestUser(t, db, org.ID)
+	member := models.ResellerMember{
+		BaseModel:  models.BaseModel{ID: uuid.New()},
+		ResellerID: reseller.ID,
+		UserID:     user.ID,
+		Role:       models.ResellerRoleAdmin,
+		IsActive:   true,
+	}
+	require.NoError(t, db.Create(&member).Error)
+	require.NoError(t, db.Model(reseller).Update("status", models.ResellerStatusSuspended).Error)
+	token := generateTestToken(t, user.ID, org.ID, user.Email, user.RoleID, time.Hour)
+
+	request := newTestRequest()
+	request.RequestCtx.Request.Header.Set("Authorization", "Bearer "+token)
+	result := middleware.AuthWithDB(testJWTSecret, db)(request)
+
+	require.NotNil(t, result)
+	assert.Equal(t, false, result.RequestCtx.UserValue(middleware.ContextKeyIsResellerAdmin))
+}
+
 // generateTokenWithSecret creates a token signed with a specific secret.
 func generateTokenWithSecret(t *testing.T, secret string) string {
 	t.Helper()

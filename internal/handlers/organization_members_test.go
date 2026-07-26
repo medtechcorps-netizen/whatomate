@@ -19,13 +19,23 @@ func TestApp_CreateOrganization_Success(t *testing.T) {
 	t.Parallel()
 
 	app := newTestApp(t)
-	org := testutil.CreateTestOrganization(t, app.DB)
+	reseller := testutil.CreateTestReseller(t, app.DB)
+	org := testutil.CreateTestOrganizationForReseller(t, app.DB, reseller.ID)
 	allPerms := testutil.GetOrCreateTestPermissions(t, app.DB)
 	role := testutil.CreateTestRole(t, app.DB, org.ID, "admin", allPerms)
 	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithEmail(testutil.UniqueEmail("create-org")), testutil.WithRoleID(&role.ID))
+	resellerMember := models.ResellerMember{
+		BaseModel:  models.BaseModel{ID: uuid.New()},
+		ResellerID: reseller.ID,
+		UserID:     user.ID,
+		Role:       models.ResellerRoleAdmin,
+		IsActive:   true,
+	}
+	require.NoError(t, app.DB.Create(&resellerMember).Error)
 
-	req := testutil.NewJSONRequest(t, map[string]string{
-		"name": "New Test Organization",
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"name":        "New Test Organization",
+		"reseller_id": reseller.ID,
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 

@@ -35,17 +35,20 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		testutil.TruncateTables(adminDB)
 	})
 
+	reseller := testutil.CreateTestReseller(t, adminDB)
 	orgA := models.Organization{
-		BaseModel: models.BaseModel{ID: uuid.New()},
-		Name:      "Clinic Alpha",
-		Slug:      "clinic-alpha-" + uuid.NewString()[:8],
-		Settings:  models.JSONB{},
+		BaseModel:  models.BaseModel{ID: uuid.New()},
+		ResellerID: &reseller.ID,
+		Name:       "Clinic Alpha",
+		Slug:       "clinic-alpha-" + uuid.NewString()[:8],
+		Settings:   models.JSONB{},
 	}
 	orgB := models.Organization{
-		BaseModel: models.BaseModel{ID: uuid.New()},
-		Name:      "Clinic Beta",
-		Slug:      "clinic-beta-" + uuid.NewString()[:8],
-		Settings:  models.JSONB{},
+		BaseModel:  models.BaseModel{ID: uuid.New()},
+		ResellerID: &reseller.ID,
+		Name:       "Clinic Beta",
+		Slug:       "clinic-beta-" + uuid.NewString()[:8],
+		Settings:   models.JSONB{},
 	}
 	require.NoError(t, adminDB.Create(&orgA).Error)
 	require.NoError(t, adminDB.Create(&orgB).Error)

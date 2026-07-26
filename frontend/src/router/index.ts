@@ -59,6 +59,12 @@ const router = createRouter({
           // All roles can access profile
         },
         {
+          path: 'resellers',
+          name: 'resellers',
+          component: () => import('@/views/resellers/ResellerPortalView.vue'),
+          meta: { permission: 'resellers' }
+        },
+        {
           path: 'templates',
           name: 'templates',
           component: () => import('@/views/settings/TemplatesView.vue'),
@@ -340,6 +346,7 @@ const router = createRouter({
 // Navigation items with permissions in priority order (matches AppLayout.vue)
 // Used to find the first accessible route for a user
 const navigationOrder = [
+  { path: '/resellers', permission: 'resellers' },
   { path: '/', permission: 'analytics' },
   { path: '/chat', permission: 'chat' },
   { path: '/chatbot', permission: 'settings.chatbot', childPaths: [
