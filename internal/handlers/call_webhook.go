@@ -17,6 +17,16 @@ import (
 // processCallWebhook handles a call webhook event for both incoming and outgoing calls.
 // It creates/updates the CallLog and delegates to the CallManager for WebRTC handling.
 func (a *App) processCallWebhook(phoneNumberID string, call any) {
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+			scoped.processCallWebhook(phoneNumberID, call)
+			return nil
+		}); err != nil {
+			a.Log.Error("Failed to scope call webhook to tenant", "error", err, "phone_id", phoneNumberID)
+		}
+		return
+	}
+
 	// The webhook handler passes an anonymous struct. Convert via JSON round-trip.
 	type callEvent struct {
 		ID         string `json:"id"`
@@ -397,6 +407,16 @@ type CallPermissionReplyData struct {
 // processCallPermissionReply handles the call_permission_reply interactive webhook.
 // Updates the CallPermission record in the DB when the user accepts or rejects.
 func (a *App) processCallPermissionReply(phoneNumberID, fromPhone string, reply *CallPermissionReplyData) {
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+			scoped.processCallPermissionReply(phoneNumberID, fromPhone, reply)
+			return nil
+		}); err != nil {
+			a.Log.Error("Failed to scope call permission reply to tenant", "error", err, "phone_id", phoneNumberID)
+		}
+		return
+	}
+
 	account, err := a.getWhatsAppAccountCached(phoneNumberID)
 	if err != nil {
 		a.Log.Error("Failed to find account for call permission reply", "error", err)

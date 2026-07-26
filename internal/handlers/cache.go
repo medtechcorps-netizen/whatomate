@@ -50,13 +50,15 @@ func (a *App) getChatbotSettingsCached(orgID uuid.UUID, whatsAppAccount string) 
 	cacheKey := fmt.Sprintf("%s%s:%s", settingsCachePrefix, orgID.String(), whatsAppAccount)
 
 	// Try cache first
-	cached, err := a.Redis.Get(ctx, cacheKey).Result()
-	if err == nil && cached != "" {
-		var cacheData chatbotSettingsCache
-		if err := json.Unmarshal([]byte(cached), &cacheData); err == nil {
-			// Restore the API key from the cache wrapper
-			cacheData.AI.APIKey = cacheData.AIAPIKey
-			return &cacheData.ChatbotSettings, nil
+	if a.Redis != nil {
+		cached, err := a.Redis.Get(ctx, cacheKey).Result()
+		if err == nil && cached != "" {
+			var cacheData chatbotSettingsCache
+			if err := json.Unmarshal([]byte(cached), &cacheData); err == nil {
+				// Restore the API key from the cache wrapper
+				cacheData.AI.APIKey = cacheData.AIAPIKey
+				return &cacheData.ChatbotSettings, nil
+			}
 		}
 	}
 
@@ -76,7 +78,7 @@ func (a *App) getChatbotSettingsCached(orgID uuid.UUID, whatsAppAccount string) 
 		ChatbotSettings: settings,
 		AIAPIKey:        settings.AI.APIKey,
 	}
-	if data, err := json.Marshal(cacheData); err == nil {
+	if data, err := json.Marshal(cacheData); err == nil && a.Redis != nil {
 		a.Redis.Set(ctx, cacheKey, data, settingsCacheTTL)
 	}
 
@@ -213,6 +215,16 @@ type whatsAppAccountCache struct {
 
 // getWhatsAppAccountCached retrieves WhatsApp account by phone_id from cache or database
 func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount, error) {
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		var account *models.WhatsAppAccount
+		err := a.withPhoneTenant(phoneID, func(scoped *App) error {
+			var scopedErr error
+			account, scopedErr = scoped.getWhatsAppAccountCached(phoneID)
+			return scopedErr
+		})
+		return account, err
+	}
+
 	ctx := context.Background()
 	cacheKey := fmt.Sprintf("%s%s", whatsappAccountCachePrefix, phoneID)
 

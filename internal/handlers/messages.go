@@ -233,14 +233,25 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 
 	// 3. Execute send (async or sync)
 	if opts.Async {
-		a.wg.Add(1)
+		root := a.rootApp()
+		organizationID := req.Account.OrganizationID
+		root.wg.Add(1)
 		go func() {
-			defer a.wg.Done()
+			defer root.wg.Done()
 			asyncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
 			wamid, sendErr := sendFn(asyncCtx)
-			a.finalizeMessageSend(msg, req, opts, wamid, sendErr)
+			if err := root.WithTenantApp(organizationID, func(scoped *App) error {
+				scoped.finalizeMessageSend(msg, req, opts, wamid, sendErr)
+				return nil
+			}); err != nil {
+				root.Log.Error("Failed to finalize asynchronous message in tenant transaction",
+					"error", err,
+					"organization_id", organizationID,
+					"message_id", msg.ID,
+				)
+			}
 		}()
 	} else {
 		wamid, err := sendFn(ctx)

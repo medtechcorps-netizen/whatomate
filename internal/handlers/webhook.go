@@ -38,16 +38,21 @@ func (a *App) WebhookVerify(r *fastglue.Request) error {
 	}
 
 	// Then check against tokens stored in WhatsApp accounts
+	organizationID, resolveErr := a.resolveWebhookOrganization(token)
 	var account models.WhatsAppAccount
-	result := a.DB.Where("webhook_verify_token = ?", token).First(&account)
-	if result.Error == nil {
+	if resolveErr == nil {
+		resolveErr = a.WithTenantApp(organizationID, func(scoped *App) error {
+			return scoped.DB.Where("webhook_verify_token = ?", token).First(&account).Error
+		})
+	}
+	if resolveErr == nil {
 		a.Log.Info("Webhook verified successfully (account token)", "account", account.Name)
 		r.RequestCtx.SetStatusCode(fasthttp.StatusOK)
 		r.RequestCtx.SetBodyString(challenge)
 		return nil
 	}
 
-	a.Log.Warn("Webhook verification failed - token not found", "token", token)
+	a.Log.Warn("Webhook verification failed - token not found")
 	return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Verification failed", nil, "")
 }
 
@@ -346,6 +351,16 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 }
 
 func (a *App) processIncomingMessage(phoneNumberID string, msg IncomingTextMessage, profileName string) {
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+			scoped.processIncomingMessage(phoneNumberID, msg, profileName)
+			return nil
+		}); err != nil {
+			a.Log.Error("Failed to scope incoming message to tenant", "error", err, "phone_id", phoneNumberID)
+		}
+		return
+	}
+
 	defer func() {
 		if r := recover(); r != nil {
 			a.Log.Error("Panic recovered in processIncomingMessage", "panic", r, "phone_id", phoneNumberID, "message_id", msg.ID)
@@ -366,6 +381,16 @@ func (a *App) processIncomingMessage(phoneNumberID string, msg IncomingTextMessa
 }
 
 func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) {
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+			scoped.processStatusUpdate(phoneNumberID, status)
+			return nil
+		}); err != nil {
+			a.Log.Error("Failed to scope status update to tenant", "error", err, "phone_id", phoneNumberID)
+		}
+		return
+	}
+
 	defer func() {
 		if r := recover(); r != nil {
 			a.Log.Error("Panic recovered in processStatusUpdate", "panic", r, "phone_id", phoneNumberID, "status_id", status.ID)
@@ -500,6 +525,23 @@ func (a *App) updateMessageStatus(whatsappMsgID, statusValue string, errors []We
 
 // processTemplateStatusUpdate updates template status when Meta sends a status update webhook
 func (a *App) processTemplateStatusUpdate(wabaID, event, templateName, templateLanguage, reason string) {
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		organizationIDs, err := a.resolveWABAOrganizations(wabaID)
+		if err != nil {
+			a.Log.Error("Failed to resolve template status tenant", "error", err, "waba_id", wabaID)
+			return
+		}
+		for _, organizationID := range organizationIDs {
+			if err := a.WithTenantApp(organizationID, func(scoped *App) error {
+				scoped.processTemplateStatusUpdate(wabaID, event, templateName, templateLanguage, reason)
+				return nil
+			}); err != nil {
+				a.Log.Error("Failed to process tenant template status", "error", err, "organization_id", organizationID)
+			}
+		}
+		return
+	}
+
 	if templateName == "" {
 		a.Log.Warn("Template status update missing template name")
 		return
@@ -574,6 +616,16 @@ func verifyWebhookSignature(body, signature, appSecret []byte) bool {
 // processMarketingPreference updates a contact's marketing opt-out status
 // based on the user_preferences webhook from Meta.
 func (a *App) processMarketingPreference(phoneNumberID, userPhone, bsuid, value string) {
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+			scoped.processMarketingPreference(phoneNumberID, userPhone, bsuid, value)
+			return nil
+		}); err != nil {
+			a.Log.Error("Failed to scope marketing preference to tenant", "error", err, "phone_id", phoneNumberID)
+		}
+		return
+	}
+
 	// Find the WhatsApp account by phone_number_id
 	var account models.WhatsAppAccount
 	if err := a.DB.Where("phone_id = ?", phoneNumberID).First(&account).Error; err != nil {
@@ -614,6 +666,16 @@ func (a *App) processMarketingPreference(phoneNumberID, userPhone, bsuid, value 
 
 // processMessageEcho handles mirroring of messages sent from the mobile WhatsApp Business App.
 func (a *App) processMessageEcho(phoneNumberID string, msg IncomingTextMessage) {
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+			scoped.processMessageEcho(phoneNumberID, msg)
+			return nil
+		}); err != nil {
+			a.Log.Error("Failed to scope message echo to tenant", "error", err, "phone_id", phoneNumberID)
+		}
+		return
+	}
+
 	defer func() {
 		if r := recover(); r != nil {
 			a.Log.Error("Panic recovered in processMessageEcho", "panic", r, "phone_id", phoneNumberID, "message_id", msg.ID)
@@ -731,6 +793,16 @@ func (a *App) processMessageEcho(phoneNumberID string, msg IncomingTextMessage) 
 
 // processContactSync handles contact additions and deletions from the mobile app address book.
 func (a *App) processContactSync(phoneNumberID, contactPhone, contactName, action string) {
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+			scoped.processContactSync(phoneNumberID, contactPhone, contactName, action)
+			return nil
+		}); err != nil {
+			a.Log.Error("Failed to scope contact sync to tenant", "error", err, "phone_id", phoneNumberID)
+		}
+		return
+	}
+
 	defer func() {
 		if r := recover(); r != nil {
 			a.Log.Error("Panic recovered in processContactSync", "panic", r, "phone_id", phoneNumberID, "phone", contactPhone)

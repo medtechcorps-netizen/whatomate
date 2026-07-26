@@ -46,12 +46,16 @@ type App struct {
 	ObjectStore storage.ObjectStore
 	// wg tracks background goroutines for graceful shutdown
 	wg sync.WaitGroup
+	// root points from a request-scoped clone back to the long-lived App.
+	// tenantOrgID is non-zero only when DB is bound to an RLS transaction.
+	root        *App
+	tenantOrgID uuid.UUID
 }
 
 // WaitForBackgroundTasks blocks until all background goroutines complete.
 // Call this during graceful shutdown to ensure all async work finishes.
 func (a *App) WaitForBackgroundTasks() {
-	a.wg.Wait()
+	a.rootApp().wg.Wait()
 }
 
 // getOrgID extracts organization ID from request context (set by auth middleware)

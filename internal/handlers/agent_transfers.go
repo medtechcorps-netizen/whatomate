@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -876,106 +878,84 @@ func (a *App) PickNextTransfer(r *fastglue.Request) error {
 		userTeamIDs = append(userTeamIDs, m.TeamID)
 	}
 
-	// Use transaction with FOR UPDATE lock to prevent race conditions
-	tx := a.DB.Begin()
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
+	var transfer models.AgentTransfer
+	errTeamAccess := errors.New("agent is not a member of the requested team")
+	pickErr := a.DB.Transaction(func(tx *gorm.DB) error {
+		// Build query for picking transfer with row-level locking.
+		query := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("organization_id = ? AND status = ? AND agent_id IS NULL", orgID, models.TransferStatusActive).
+			Order("transferred_at ASC")
 
-	// Build query for picking transfer with row-level locking
-	query := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-		Where("organization_id = ? AND status = ? AND agent_id IS NULL", orgID, models.TransferStatusActive).
-		Order("transferred_at ASC")
-
-	if teamIDStr != "" {
-		// Pick from specific team
-		if teamIDStr == "general" {
-			query = query.Where("team_id IS NULL")
-		} else {
-			teamID, err := uuid.Parse(teamIDStr)
-			if err == nil {
-				// Verify user is member of this team (unless they have full access)
-				if !hasFullAccess {
-					found := false
-					for _, tid := range userTeamIDs {
-						if tid == teamID {
-							found = true
-							break
+		if teamIDStr != "" {
+			if teamIDStr == "general" {
+				query = query.Where("team_id IS NULL")
+			} else {
+				teamID, parseErr := uuid.Parse(teamIDStr)
+				if parseErr == nil {
+					if !hasFullAccess {
+						found := false
+						for _, candidateID := range userTeamIDs {
+							if candidateID == teamID {
+								found = true
+								break
+							}
+						}
+						if !found {
+							return errTeamAccess
 						}
 					}
-					if !found {
-						tx.Rollback()
-						return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You are not a member of this team", nil, "")
-					}
+					query = query.Where("team_id = ?", teamID)
 				}
-				query = query.Where("team_id = ?", teamID)
+			}
+		} else if !hasFullAccess {
+			if len(userTeamIDs) > 0 {
+				query = query.Where("team_id IS NULL OR team_id IN ?", userTeamIDs)
+			} else {
+				query = query.Where("team_id IS NULL")
 			}
 		}
-	} else if !hasFullAccess {
-		// Users without full access can only pick from their teams or general queue
-		if len(userTeamIDs) > 0 {
-			query = query.Where("team_id IS NULL OR team_id IN ?", userTeamIDs)
-		} else {
-			query = query.Where("team_id IS NULL")
+
+		if err := query.First(&transfer).Error; err != nil {
+			return err
 		}
+
+		transfer.AgentID = &userID
+		if transfer.TransferredByUserID == nil {
+			transfer.TransferredByUserID = &userID
+		}
+		a.UpdateSLAOnPickup(&transfer)
+
+		if err := tx.Save(&transfer).Error; err != nil {
+			return err
+		}
+
+		if settings != nil && settings.AgentAssignment.AssignToSameAgent {
+			var contact models.Contact
+			if err := tx.Where("id = ?", transfer.ContactID).First(&contact).Error; err == nil && contact.AssignedUserID == nil {
+				if err := tx.Model(&models.Contact{}).
+					Where("id = ?", transfer.ContactID).
+					Update("assigned_user_id", userID).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if errors.Is(pickErr, errTeamAccess) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You are not a member of this team", nil, "")
 	}
-	// Users with full access can pick from any queue if no team_id specified
-
-	// Find oldest unassigned active transfer (FIFO) - locked row
-	var transfer models.AgentTransfer
-	result := query.First(&transfer)
-
-	if result.Error != nil {
-		tx.Rollback()
+	if errors.Is(pickErr, gorm.ErrRecordNotFound) {
 		return r.SendEnvelope(map[string]any{
 			"message":  "No transfers in queue",
 			"transfer": nil,
 		})
 	}
-
-	// Assign to current user (self-pick)
-	transfer.AgentID = &userID
-	// If no one initiated the transfer, mark the picker as the one who initiated (self-pick)
-	if transfer.TransferredByUserID == nil {
-		transfer.TransferredByUserID = &userID
-	}
-
-	// Update SLA tracking for pickup
-	a.UpdateSLAOnPickup(&transfer)
-
-	if err := tx.Save(&transfer).Error; err != nil {
-		tx.Rollback()
-		a.Log.Error("Failed to pick transfer", "error", err, "transfer_id", transfer.ID)
+	if pickErr != nil {
+		a.Log.Error("Failed to pick transfer", "error", pickErr, "transfer_id", transfer.ID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to pick transfer", nil, "")
 	}
 
-	// Pin the agent as the contact's relationship manager only when the org
-	// has opted into AssignToSameAgent and no manager is already set. The
-	// active transfer itself grants this agent visibility into the chat (see
-	// ListContacts query in contacts.go), so we don't need contact.AssignedUserID
-	// for visibility. Setting it unconditionally would leak this conversation
-	// into the agent's chat list permanently after resume.
-	if settings != nil && settings.AgentAssignment.AssignToSameAgent {
-		// Re-fetch contact for the up-to-date assigned_user_id under the tx.
-		var contact models.Contact
-		if err := tx.Where("id = ?", transfer.ContactID).First(&contact).Error; err == nil && contact.AssignedUserID == nil {
-			if err := tx.Model(&models.Contact{}).Where("id = ?", transfer.ContactID).Update("assigned_user_id", userID).Error; err != nil {
-				tx.Rollback()
-				a.Log.Error("Failed to update contact assignment", "error", err, "transfer_id", transfer.ID)
-				return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update contact assignment", nil, "")
-			}
-		}
-	}
-
-	// Commit the transaction
-	if err := tx.Commit().Error; err != nil {
-		a.Log.Error("Failed to complete pickup", "error", err, "transfer_id", transfer.ID)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to complete pickup", nil, "")
-	}
-
-	// Load related data for response (outside transaction)
+	// Load related data for response after the savepoint is released.
 	a.DB.Where("id = ?", transfer.ContactID).First(&transfer.Contact)
 	if transfer.TeamID != nil {
 		a.DB.Where("id = ?", transfer.TeamID).First(&transfer.Team)

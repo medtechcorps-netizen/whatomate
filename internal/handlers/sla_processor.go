@@ -59,15 +59,35 @@ func (p *SLAProcessor) Stop() {
 func (p *SLAProcessor) processStaleTransfers() {
 	now := time.Now()
 
-	// Get all organizations with SLA enabled (use cache)
-	settings, err := p.app.getSLAEnabledSettingsCached()
-	if err != nil {
-		p.app.Log.Error("Failed to load SLA settings", "error", err)
+	// Resolve organizations from the control plane, then enter one RLS
+	// transaction per organization. Background processors must never query
+	// tenant tables without an explicit tenant context.
+	var organizationIDs []uuid.UUID
+	if err := p.app.rootApp().DB.Model(&models.Organization{}).
+		Pluck("id", &organizationIDs).Error; err != nil {
+		p.app.Log.Error("Failed to list organizations for SLA processing", "error", err)
 		return
 	}
 
-	for _, s := range settings {
-		p.processOrganizationSLA(s, now)
+	for _, organizationID := range organizationIDs {
+		if err := p.app.WithTenantApp(organizationID, func(scoped *App) error {
+			settings, err := scoped.getChatbotSettingsCached(organizationID, "")
+			if err != nil {
+				return nil // Organization has no chatbot/SLA settings yet.
+			}
+			if !settings.SLA.Enabled && !settings.ClientInactivity.ReminderEnabled {
+				return nil
+			}
+			tenantProcessor := *p
+			tenantProcessor.app = scoped
+			tenantProcessor.processOrganizationSLA(*settings, now)
+			return nil
+		}); err != nil {
+			p.app.Log.Error("Failed to process organization SLA",
+				"error", err,
+				"organization_id", organizationID,
+			)
+		}
 	}
 }
 

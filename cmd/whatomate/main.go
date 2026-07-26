@@ -45,6 +45,8 @@ func main() {
 		runServer(os.Args[2:])
 	case "worker":
 		runWorker(os.Args[2:])
+	case "rls-migrate":
+		runRLSMigration(os.Args[2:])
 	case "version":
 		fmt.Printf("ReReply %s (built %s)\n", Version, BuildTime)
 	case "help", "-h", "--help":
@@ -65,6 +67,7 @@ Usage:
 Commands:
   server    Start the API server (with optional embedded workers)
   worker    Start background workers only (no API server)
+  rls-migrate  Run schema migrations and install PostgreSQL tenant RLS
   version   Show version information
   help      Show this help message
 
@@ -83,11 +86,66 @@ Examples:
   rereply server -workers 4          # API + 4 embedded workers
   rereply server -migrate            # Run migrations and start server
   rereply worker -workers 4          # 4 workers only (no API)
+  rereply rls-migrate                # Pre-deploy migration using database.migration_url
 
 Deployment Scenarios:
   All-in-one:    rereply server
   Separate:      rereply server -workers 0  (on API server)
                  rereply worker -workers 4  (on worker server)`)
+}
+
+// ============================================================================
+// RLS MIGRATION COMMAND
+// ============================================================================
+
+func runRLSMigration(args []string) {
+	migrationFlags := flag.NewFlagSet("rls-migrate", flag.ExitOnError)
+	configPath := migrationFlags.String("config", "config.toml", "Path to config file")
+	rollback := migrationFlags.Bool("rollback", false, "Disable ReReply RLS policies")
+	_ = migrationFlags.Parse(args)
+
+	lo := logf.New(logf.Opts{
+		Level:           logf.InfoLevel,
+		TimestampFormat: "2006-01-02 15:04:05",
+		DefaultFields:   []any{"app", "rereply-rls-migrate"},
+	})
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		lo.Fatal("Failed to load config", "error", err)
+	}
+	if cfg.Database.MigrationURL == "" {
+		lo.Fatal("database.migration_url is required for RLS migrations")
+	}
+	if cfg.Database.RuntimeRole == "" {
+		lo.Fatal("database.runtime_role is required for RLS migrations")
+	}
+
+	migrationCfg := cfg.Database
+	migrationCfg.URL = cfg.Database.MigrationURL
+	db, err := database.NewPostgres(&migrationCfg, false)
+	if err != nil {
+		lo.Fatal("Failed to connect with migration database role", "error", err)
+	}
+
+	if *rollback {
+		if err := database.RemoveTenantRLS(db); err != nil {
+			lo.Fatal("RLS rollback failed", "error", err)
+		}
+		lo.Info("Tenant RLS disabled")
+		return
+	}
+
+	if err := database.RunMigrationWithProgress(db, &cfg.DefaultAdmin); err != nil {
+		lo.Fatal("Schema migration failed", "error", err)
+	}
+	if err := handlers.BackfillChatbotFlowGraph(db, lo); err != nil {
+		lo.Fatal("Chatbot flow graph backfill failed", "error", err)
+	}
+	if err := database.ApplyTenantRLS(db, cfg.Database.RuntimeRole); err != nil {
+		lo.Fatal("Tenant RLS migration failed", "error", err)
+	}
+	lo.Info("Tenant RLS installed", "runtime_role", cfg.Database.RuntimeRole)
 }
 
 // ============================================================================
@@ -116,6 +174,9 @@ func runServer(args []string) {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		lo.Fatal("Failed to load config", "error", err)
+	}
+	if cfg.Database.RLSEnabled && *migrate {
+		lo.Fatal("server -migrate is not allowed when database.rls_enabled=true; run the rls-migrate pre-deploy command")
 	}
 
 	// Validate JWT secret
@@ -151,6 +212,12 @@ func runServer(args []string) {
 		lo.Fatal("Failed to connect to database", "error", err)
 	}
 	lo.Info("Connected to PostgreSQL")
+	if cfg.Database.RLSEnabled {
+		if err := database.VerifyTenantRLS(db, cfg.Database.RuntimeRole); err != nil {
+			lo.Fatal("PostgreSQL tenant RLS verification failed", "error", err)
+		}
+		lo.Info("PostgreSQL tenant RLS verified", "runtime_role", cfg.Database.RuntimeRole)
+	}
 
 	// Run migrations if requested
 	if *migrate {
@@ -395,6 +462,12 @@ func runWorker(args []string) {
 		lo.Fatal("Failed to connect to database", "error", err)
 	}
 	lo.Info("Connected to PostgreSQL")
+	if cfg.Database.RLSEnabled {
+		if err := database.VerifyTenantRLS(db, cfg.Database.RuntimeRole); err != nil {
+			lo.Fatal("PostgreSQL tenant RLS verification failed", "error", err)
+		}
+		lo.Info("PostgreSQL tenant RLS verified", "runtime_role", cfg.Database.RuntimeRole)
+	}
 
 	// Connect to Redis
 	rdb, err := database.NewRedis(&cfg.Redis)
@@ -459,11 +532,13 @@ func runWorker(args []string) {
 // ============================================================================
 
 func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePath string, rdb *redis.Client, cfg *config.Config) {
+	tenant := app.Tenant
+
 	// Health check
 	g.GET("/health", app.HealthCheck)
 	g.GET("/ready", app.ReadyCheck)
 
-	g.GET("/api/embedded-signup/config", app.GetEmbeddedSignupConfig)
+	g.GET("/api/embedded-signup/config", tenant((*handlers.App).GetEmbeddedSignupConfig))
 
 	// Auth routes (public, optionally rate-limited)
 	if cfg.RateLimit.Enabled {
@@ -587,292 +662,292 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	})
 
 	// Current User (all authenticated users)
-	g.GET("/api/me", app.GetCurrentUser)
-	g.PUT("/api/me/settings", app.UpdateCurrentUserSettings)
-	g.PUT("/api/me/password", app.ChangePassword)
-	g.PUT("/api/me/availability", app.UpdateAvailability)
-	g.GET("/api/me/organizations", app.ListMyOrganizations)
+	g.GET("/api/me", tenant((*handlers.App).GetCurrentUser))
+	g.PUT("/api/me/settings", tenant((*handlers.App).UpdateCurrentUserSettings))
+	g.PUT("/api/me/password", tenant((*handlers.App).ChangePassword))
+	g.PUT("/api/me/availability", tenant((*handlers.App).UpdateAvailability))
+	g.GET("/api/me/organizations", tenant((*handlers.App).ListMyOrganizations))
 
 	// User Management (admin only - enforced by middleware)
-	g.GET("/api/users", app.ListUsers)
-	g.POST("/api/users", app.CreateUser)
-	g.GET("/api/users/{id}", app.GetUser)
-	g.PUT("/api/users/{id}", app.UpdateUser)
-	g.DELETE("/api/users/{id}", app.DeleteUser)
+	g.GET("/api/users", tenant((*handlers.App).ListUsers))
+	g.POST("/api/users", tenant((*handlers.App).CreateUser))
+	g.GET("/api/users/{id}", tenant((*handlers.App).GetUser))
+	g.PUT("/api/users/{id}", tenant((*handlers.App).UpdateUser))
+	g.DELETE("/api/users/{id}", tenant((*handlers.App).DeleteUser))
 
 	// Roles & Permissions (admin only - enforced by middleware)
-	g.GET("/api/roles", app.ListRoles)
-	g.POST("/api/roles", app.CreateRole)
-	g.GET("/api/roles/{id}", app.GetRole)
-	g.PUT("/api/roles/{id}", app.UpdateRole)
-	g.DELETE("/api/roles/{id}", app.DeleteRole)
-	g.GET("/api/permissions", app.ListPermissions)
+	g.GET("/api/roles", tenant((*handlers.App).ListRoles))
+	g.POST("/api/roles", tenant((*handlers.App).CreateRole))
+	g.GET("/api/roles/{id}", tenant((*handlers.App).GetRole))
+	g.PUT("/api/roles/{id}", tenant((*handlers.App).UpdateRole))
+	g.DELETE("/api/roles/{id}", tenant((*handlers.App).DeleteRole))
+	g.GET("/api/permissions", tenant((*handlers.App).ListPermissions))
 
 	// API Keys (admin only - enforced by middleware)
-	g.GET("/api/api-keys", app.ListAPIKeys)
-	g.GET("/api/api-keys/{id}", app.GetAPIKey)
-	g.POST("/api/api-keys", app.CreateAPIKey)
-	g.PUT("/api/api-keys/{id}", app.UpdateAPIKey)
-	g.DELETE("/api/api-keys/{id}", app.DeleteAPIKey)
+	g.GET("/api/api-keys", tenant((*handlers.App).ListAPIKeys))
+	g.GET("/api/api-keys/{id}", tenant((*handlers.App).GetAPIKey))
+	g.POST("/api/api-keys", tenant((*handlers.App).CreateAPIKey))
+	g.PUT("/api/api-keys/{id}", tenant((*handlers.App).UpdateAPIKey))
+	g.DELETE("/api/api-keys/{id}", tenant((*handlers.App).DeleteAPIKey))
 
 	// Accounts
-	g.GET("/api/accounts", app.ListAccounts)
-	g.POST("/api/accounts", app.CreateAccount)
-	g.POST("/api/accounts/exchange-token", app.ExchangeToken) // Embedded signup
-	g.GET("/api/accounts/{id}", app.GetAccount)
-	g.PUT("/api/accounts/{id}", app.UpdateAccount)
-	g.DELETE("/api/accounts/{id}", app.DeleteAccount)
-	g.POST("/api/accounts/{id}/register", app.RegisterPhoneNumber) // Embedded signup manual/2fa registration
-	g.POST("/api/accounts/{id}/test", app.TestAccountConnection)
-	g.POST("/api/accounts/{id}/subscribe", app.SubscribeApp)
-	g.GET("/api/accounts/{id}/business_profile", app.GetBusinessProfile)
-	g.PUT("/api/accounts/{id}/business_profile", app.UpdateBusinessProfile)
-	g.POST("/api/accounts/{id}/business_profile/photo", app.UpdateProfilePicture)
+	g.GET("/api/accounts", tenant((*handlers.App).ListAccounts))
+	g.POST("/api/accounts", tenant((*handlers.App).CreateAccount))
+	g.POST("/api/accounts/exchange-token", tenant((*handlers.App).ExchangeToken)) // Embedded signup
+	g.GET("/api/accounts/{id}", tenant((*handlers.App).GetAccount))
+	g.PUT("/api/accounts/{id}", tenant((*handlers.App).UpdateAccount))
+	g.DELETE("/api/accounts/{id}", tenant((*handlers.App).DeleteAccount))
+	g.POST("/api/accounts/{id}/register", tenant((*handlers.App).RegisterPhoneNumber)) // Embedded signup manual/2fa registration
+	g.POST("/api/accounts/{id}/test", tenant((*handlers.App).TestAccountConnection))
+	g.POST("/api/accounts/{id}/subscribe", tenant((*handlers.App).SubscribeApp))
+	g.GET("/api/accounts/{id}/business_profile", tenant((*handlers.App).GetBusinessProfile))
+	g.PUT("/api/accounts/{id}/business_profile", tenant((*handlers.App).UpdateBusinessProfile))
+	g.POST("/api/accounts/{id}/business_profile/photo", tenant((*handlers.App).UpdateProfilePicture))
 
 	// Contacts
-	g.GET("/api/contacts", app.ListContacts)
-	g.POST("/api/contacts", app.CreateContact)
-	g.GET("/api/contacts/{id}", app.GetContact)
-	g.PUT("/api/contacts/{id}", app.UpdateContact)
-	g.DELETE("/api/contacts/{id}", app.DeleteContact)
-	g.PUT("/api/contacts/{id}/assign", app.AssignContact)
-	g.PUT("/api/contacts/{id}/tags", app.UpdateContactTags)
-	g.GET("/api/contacts/{id}/session-data", app.GetContactSessionData)
+	g.GET("/api/contacts", tenant((*handlers.App).ListContacts))
+	g.POST("/api/contacts", tenant((*handlers.App).CreateContact))
+	g.GET("/api/contacts/{id}", tenant((*handlers.App).GetContact))
+	g.PUT("/api/contacts/{id}", tenant((*handlers.App).UpdateContact))
+	g.DELETE("/api/contacts/{id}", tenant((*handlers.App).DeleteContact))
+	g.PUT("/api/contacts/{id}/assign", tenant((*handlers.App).AssignContact))
+	g.PUT("/api/contacts/{id}/tags", tenant((*handlers.App).UpdateContactTags))
+	g.GET("/api/contacts/{id}/session-data", tenant((*handlers.App).GetContactSessionData))
 
 	// Generic Import/Export
-	g.POST("/api/export", app.ExportData)
-	g.POST("/api/import", app.ImportData)
-	g.GET("/api/export/{table}/config", app.GetExportConfig)
-	g.GET("/api/import/{table}/config", app.GetImportConfig)
+	g.POST("/api/export", tenant((*handlers.App).ExportData))
+	g.POST("/api/import", tenant((*handlers.App).ImportData))
+	g.GET("/api/export/{table}/config", tenant((*handlers.App).GetExportConfig))
+	g.GET("/api/import/{table}/config", tenant((*handlers.App).GetImportConfig))
 
 	// Tags
-	g.GET("/api/tags", app.ListTags)
-	g.POST("/api/tags", app.CreateTag)
-	g.PUT("/api/tags/{name}", app.UpdateTag)
-	g.DELETE("/api/tags/{name}", app.DeleteTag)
+	g.GET("/api/tags", tenant((*handlers.App).ListTags))
+	g.POST("/api/tags", tenant((*handlers.App).CreateTag))
+	g.PUT("/api/tags/{name}", tenant((*handlers.App).UpdateTag))
+	g.DELETE("/api/tags/{name}", tenant((*handlers.App).DeleteTag))
 
 	// Messages
-	g.GET("/api/contacts/{id}/messages", app.GetMessages)
-	g.POST("/api/contacts/{id}/messages", app.SendMessage)
-	g.POST("/api/contacts/{id}/mark-read", app.MarkContactRead)
-	g.POST("/api/contacts/{id}/messages/{message_id}/reaction", app.SendReaction)
-	g.POST("/api/messages", app.SendMessage) // Legacy route
-	g.POST("/api/messages/template", app.SendTemplateMessage)
-	g.POST("/api/messages/media", app.SendMediaMessage)
-	g.PUT("/api/messages/{id}/read", app.MarkMessageRead)
+	g.GET("/api/contacts/{id}/messages", tenant((*handlers.App).GetMessages))
+	g.POST("/api/contacts/{id}/messages", tenant((*handlers.App).SendMessage))
+	g.POST("/api/contacts/{id}/mark-read", tenant((*handlers.App).MarkContactRead))
+	g.POST("/api/contacts/{id}/messages/{message_id}/reaction", tenant((*handlers.App).SendReaction))
+	g.POST("/api/messages", tenant((*handlers.App).SendMessage)) // Legacy route
+	g.POST("/api/messages/template", tenant((*handlers.App).SendTemplateMessage))
+	g.POST("/api/messages/media", tenant((*handlers.App).SendMediaMessage))
+	g.PUT("/api/messages/{id}/read", tenant((*handlers.App).MarkMessageRead))
 
 	// Conversation Notes
-	g.GET("/api/contacts/{id}/notes", app.ListConversationNotes)
-	g.POST("/api/contacts/{id}/notes", app.CreateConversationNote)
-	g.PUT("/api/contacts/{id}/notes/{note_id}", app.UpdateConversationNote)
-	g.DELETE("/api/contacts/{id}/notes/{note_id}", app.DeleteConversationNote)
+	g.GET("/api/contacts/{id}/notes", tenant((*handlers.App).ListConversationNotes))
+	g.POST("/api/contacts/{id}/notes", tenant((*handlers.App).CreateConversationNote))
+	g.PUT("/api/contacts/{id}/notes/{note_id}", tenant((*handlers.App).UpdateConversationNote))
+	g.DELETE("/api/contacts/{id}/notes/{note_id}", tenant((*handlers.App).DeleteConversationNote))
 
 	// Media (serves media files for messages, auth-protected)
-	g.GET("/api/media/{message_id}", app.ServeMedia)
+	g.GET("/api/media/{message_id}", tenant((*handlers.App).ServeMedia))
 
 	// Templates
-	g.GET("/api/templates", app.ListTemplates)
-	g.POST("/api/templates", app.CreateTemplate)
-	g.GET("/api/templates/{id}", app.GetTemplate)
-	g.PUT("/api/templates/{id}", app.UpdateTemplate)
-	g.DELETE("/api/templates/{id}", app.DeleteTemplate)
-	g.POST("/api/templates/sync", app.SyncTemplates)
-	g.POST("/api/templates/{id}/publish", app.SubmitTemplate)
-	g.POST("/api/templates/upload-media", app.UploadTemplateMedia)
+	g.GET("/api/templates", tenant((*handlers.App).ListTemplates))
+	g.POST("/api/templates", tenant((*handlers.App).CreateTemplate))
+	g.GET("/api/templates/{id}", tenant((*handlers.App).GetTemplate))
+	g.PUT("/api/templates/{id}", tenant((*handlers.App).UpdateTemplate))
+	g.DELETE("/api/templates/{id}", tenant((*handlers.App).DeleteTemplate))
+	g.POST("/api/templates/sync", tenant((*handlers.App).SyncTemplates))
+	g.POST("/api/templates/{id}/publish", tenant((*handlers.App).SubmitTemplate))
+	g.POST("/api/templates/upload-media", tenant((*handlers.App).UploadTemplateMedia))
 
 	// WhatsApp Flows
-	g.GET("/api/flows", app.ListFlows)
-	g.POST("/api/flows", app.CreateFlow)
-	g.GET("/api/flows/{id}", app.GetFlow)
-	g.PUT("/api/flows/{id}", app.UpdateFlow)
-	g.DELETE("/api/flows/{id}", app.DeleteFlow)
-	g.POST("/api/flows/{id}/save-to-meta", app.SaveFlowToMeta)
-	g.POST("/api/flows/{id}/publish", app.PublishFlow)
-	g.POST("/api/flows/{id}/deprecate", app.DeprecateFlow)
-	g.POST("/api/flows/{id}/duplicate", app.DuplicateFlow)
-	g.POST("/api/flows/sync", app.SyncFlows)
+	g.GET("/api/flows", tenant((*handlers.App).ListFlows))
+	g.POST("/api/flows", tenant((*handlers.App).CreateFlow))
+	g.GET("/api/flows/{id}", tenant((*handlers.App).GetFlow))
+	g.PUT("/api/flows/{id}", tenant((*handlers.App).UpdateFlow))
+	g.DELETE("/api/flows/{id}", tenant((*handlers.App).DeleteFlow))
+	g.POST("/api/flows/{id}/save-to-meta", tenant((*handlers.App).SaveFlowToMeta))
+	g.POST("/api/flows/{id}/publish", tenant((*handlers.App).PublishFlow))
+	g.POST("/api/flows/{id}/deprecate", tenant((*handlers.App).DeprecateFlow))
+	g.POST("/api/flows/{id}/duplicate", tenant((*handlers.App).DuplicateFlow))
+	g.POST("/api/flows/sync", tenant((*handlers.App).SyncFlows))
 
 	// Bulk Campaigns
-	g.GET("/api/campaigns", app.ListCampaigns)
-	g.POST("/api/campaigns", app.CreateCampaign)
-	g.GET("/api/campaigns/{id}", app.GetCampaign)
-	g.PUT("/api/campaigns/{id}", app.UpdateCampaign)
-	g.DELETE("/api/campaigns/{id}", app.DeleteCampaign)
-	g.POST("/api/campaigns/{id}/start", app.StartCampaign)
-	g.POST("/api/campaigns/{id}/pause", app.PauseCampaign)
-	g.POST("/api/campaigns/{id}/cancel", app.CancelCampaign)
-	g.POST("/api/campaigns/{id}/retry-failed", app.RetryFailed)
-	g.GET("/api/campaigns/{id}/progress", app.GetCampaign)
-	g.POST("/api/campaigns/{id}/recipients/import", app.ImportRecipients)
-	g.GET("/api/campaigns/{id}/recipients", app.GetCampaignRecipients)
-	g.DELETE("/api/campaigns/{id}/recipients/{recipientId}", app.DeleteCampaignRecipient)
-	g.POST("/api/campaigns/{id}/media", app.UploadCampaignMedia)
-	g.GET("/api/campaigns/{id}/media", app.ServeCampaignMedia)
+	g.GET("/api/campaigns", tenant((*handlers.App).ListCampaigns))
+	g.POST("/api/campaigns", tenant((*handlers.App).CreateCampaign))
+	g.GET("/api/campaigns/{id}", tenant((*handlers.App).GetCampaign))
+	g.PUT("/api/campaigns/{id}", tenant((*handlers.App).UpdateCampaign))
+	g.DELETE("/api/campaigns/{id}", tenant((*handlers.App).DeleteCampaign))
+	g.POST("/api/campaigns/{id}/start", tenant((*handlers.App).StartCampaign))
+	g.POST("/api/campaigns/{id}/pause", tenant((*handlers.App).PauseCampaign))
+	g.POST("/api/campaigns/{id}/cancel", tenant((*handlers.App).CancelCampaign))
+	g.POST("/api/campaigns/{id}/retry-failed", tenant((*handlers.App).RetryFailed))
+	g.GET("/api/campaigns/{id}/progress", tenant((*handlers.App).GetCampaign))
+	g.POST("/api/campaigns/{id}/recipients/import", tenant((*handlers.App).ImportRecipients))
+	g.GET("/api/campaigns/{id}/recipients", tenant((*handlers.App).GetCampaignRecipients))
+	g.DELETE("/api/campaigns/{id}/recipients/{recipientId}", tenant((*handlers.App).DeleteCampaignRecipient))
+	g.POST("/api/campaigns/{id}/media", tenant((*handlers.App).UploadCampaignMedia))
+	g.GET("/api/campaigns/{id}/media", tenant((*handlers.App).ServeCampaignMedia))
 
 	// Chatbot Settings
-	g.GET("/api/chatbot/settings", app.GetChatbotSettings)
-	g.PUT("/api/chatbot/settings", app.UpdateChatbotSettings)
+	g.GET("/api/chatbot/settings", tenant((*handlers.App).GetChatbotSettings))
+	g.PUT("/api/chatbot/settings", tenant((*handlers.App).UpdateChatbotSettings))
 
 	// Keyword Rules
-	g.GET("/api/chatbot/keywords", app.ListKeywordRules)
-	g.POST("/api/chatbot/keywords", app.CreateKeywordRule)
-	g.GET("/api/chatbot/keywords/{id}", app.GetKeywordRule)
-	g.PUT("/api/chatbot/keywords/{id}", app.UpdateKeywordRule)
-	g.DELETE("/api/chatbot/keywords/{id}", app.DeleteKeywordRule)
+	g.GET("/api/chatbot/keywords", tenant((*handlers.App).ListKeywordRules))
+	g.POST("/api/chatbot/keywords", tenant((*handlers.App).CreateKeywordRule))
+	g.GET("/api/chatbot/keywords/{id}", tenant((*handlers.App).GetKeywordRule))
+	g.PUT("/api/chatbot/keywords/{id}", tenant((*handlers.App).UpdateKeywordRule))
+	g.DELETE("/api/chatbot/keywords/{id}", tenant((*handlers.App).DeleteKeywordRule))
 
 	// Chatbot Flows
-	g.GET("/api/chatbot/flows", app.ListChatbotFlows)
-	g.POST("/api/chatbot/flows", app.CreateChatbotFlow)
-	g.GET("/api/chatbot/flows/{id}", app.GetChatbotFlow)
-	g.PUT("/api/chatbot/flows/{id}", app.UpdateChatbotFlow)
-	g.DELETE("/api/chatbot/flows/{id}", app.DeleteChatbotFlow)
+	g.GET("/api/chatbot/flows", tenant((*handlers.App).ListChatbotFlows))
+	g.POST("/api/chatbot/flows", tenant((*handlers.App).CreateChatbotFlow))
+	g.GET("/api/chatbot/flows/{id}", tenant((*handlers.App).GetChatbotFlow))
+	g.PUT("/api/chatbot/flows/{id}", tenant((*handlers.App).UpdateChatbotFlow))
+	g.DELETE("/api/chatbot/flows/{id}", tenant((*handlers.App).DeleteChatbotFlow))
 
 	// AI Contexts
-	g.GET("/api/chatbot/ai-contexts", app.ListAIContexts)
-	g.POST("/api/chatbot/ai-contexts", app.CreateAIContext)
-	g.GET("/api/chatbot/ai-contexts/{id}", app.GetAIContext)
-	g.PUT("/api/chatbot/ai-contexts/{id}", app.UpdateAIContext)
-	g.DELETE("/api/chatbot/ai-contexts/{id}", app.DeleteAIContext)
+	g.GET("/api/chatbot/ai-contexts", tenant((*handlers.App).ListAIContexts))
+	g.POST("/api/chatbot/ai-contexts", tenant((*handlers.App).CreateAIContext))
+	g.GET("/api/chatbot/ai-contexts/{id}", tenant((*handlers.App).GetAIContext))
+	g.PUT("/api/chatbot/ai-contexts/{id}", tenant((*handlers.App).UpdateAIContext))
+	g.DELETE("/api/chatbot/ai-contexts/{id}", tenant((*handlers.App).DeleteAIContext))
 
 	// Agent Transfers
-	g.GET("/api/chatbot/transfers", app.ListAgentTransfers)
-	g.POST("/api/chatbot/transfers", app.CreateAgentTransfer)
-	g.POST("/api/chatbot/transfers/pick", app.PickNextTransfer)
-	g.PUT("/api/chatbot/transfers/{id}/resume", app.ResumeFromTransfer)
-	g.PUT("/api/chatbot/transfers/{id}/assign", app.AssignAgentTransfer)
+	g.GET("/api/chatbot/transfers", tenant((*handlers.App).ListAgentTransfers))
+	g.POST("/api/chatbot/transfers", tenant((*handlers.App).CreateAgentTransfer))
+	g.POST("/api/chatbot/transfers/pick", tenant((*handlers.App).PickNextTransfer))
+	g.PUT("/api/chatbot/transfers/{id}/resume", tenant((*handlers.App).ResumeFromTransfer))
+	g.PUT("/api/chatbot/transfers/{id}/assign", tenant((*handlers.App).AssignAgentTransfer))
 
 	// Teams (admin/manager - access control in handler)
-	g.GET("/api/teams", app.ListTeams)
-	g.POST("/api/teams", app.CreateTeam)
-	g.GET("/api/teams/{id}", app.GetTeam)
-	g.PUT("/api/teams/{id}", app.UpdateTeam)
-	g.DELETE("/api/teams/{id}", app.DeleteTeam)
-	g.GET("/api/teams/{id}/members", app.ListTeamMembers)
-	g.POST("/api/teams/{id}/members", app.AddTeamMember)
-	g.DELETE("/api/teams/{id}/members/{member_user_id}", app.RemoveTeamMember)
+	g.GET("/api/teams", tenant((*handlers.App).ListTeams))
+	g.POST("/api/teams", tenant((*handlers.App).CreateTeam))
+	g.GET("/api/teams/{id}", tenant((*handlers.App).GetTeam))
+	g.PUT("/api/teams/{id}", tenant((*handlers.App).UpdateTeam))
+	g.DELETE("/api/teams/{id}", tenant((*handlers.App).DeleteTeam))
+	g.GET("/api/teams/{id}/members", tenant((*handlers.App).ListTeamMembers))
+	g.POST("/api/teams/{id}/members", tenant((*handlers.App).AddTeamMember))
+	g.DELETE("/api/teams/{id}/members/{member_user_id}", tenant((*handlers.App).RemoveTeamMember))
 
 	// Audit Logs
-	g.GET("/api/audit-logs", app.ListAuditLogs)
-	g.GET("/api/audit-logs/{id}", app.GetAuditLog)
+	g.GET("/api/audit-logs", tenant((*handlers.App).ListAuditLogs))
+	g.GET("/api/audit-logs/{id}", tenant((*handlers.App).GetAuditLog))
 
 	// Canned Responses
-	g.GET("/api/canned-responses", app.ListCannedResponses)
-	g.POST("/api/canned-responses", app.CreateCannedResponse)
-	g.GET("/api/canned-responses/{id}", app.GetCannedResponse)
-	g.PUT("/api/canned-responses/{id}", app.UpdateCannedResponse)
-	g.DELETE("/api/canned-responses/{id}", app.DeleteCannedResponse)
-	g.POST("/api/canned-responses/{id}/use", app.IncrementCannedResponseUsage)
+	g.GET("/api/canned-responses", tenant((*handlers.App).ListCannedResponses))
+	g.POST("/api/canned-responses", tenant((*handlers.App).CreateCannedResponse))
+	g.GET("/api/canned-responses/{id}", tenant((*handlers.App).GetCannedResponse))
+	g.PUT("/api/canned-responses/{id}", tenant((*handlers.App).UpdateCannedResponse))
+	g.DELETE("/api/canned-responses/{id}", tenant((*handlers.App).DeleteCannedResponse))
+	g.POST("/api/canned-responses/{id}/use", tenant((*handlers.App).IncrementCannedResponseUsage))
 
 	// Sessions (admin/debug)
-	g.GET("/api/chatbot/sessions", app.ListChatbotSessions)
-	g.GET("/api/chatbot/sessions/{id}", app.GetChatbotSession)
+	g.GET("/api/chatbot/sessions", tenant((*handlers.App).ListChatbotSessions))
+	g.GET("/api/chatbot/sessions/{id}", tenant((*handlers.App).GetChatbotSession))
 
 	// Analytics
-	g.GET("/api/analytics/dashboard", app.GetDashboardStats)
-	g.GET("/api/analytics/messages", app.GetMessageAnalytics)
-	g.GET("/api/analytics/chatbot", app.GetChatbotAnalytics)
-	g.GET("/api/analytics/agents", app.GetAgentAnalytics)
-	g.GET("/api/analytics/agents/{id}", app.GetAgentDetails)
-	g.GET("/api/analytics/agents/comparison", app.GetAgentComparison)
+	g.GET("/api/analytics/dashboard", tenant((*handlers.App).GetDashboardStats))
+	g.GET("/api/analytics/messages", tenant((*handlers.App).GetMessageAnalytics))
+	g.GET("/api/analytics/chatbot", tenant((*handlers.App).GetChatbotAnalytics))
+	g.GET("/api/analytics/agents", tenant((*handlers.App).GetAgentAnalytics))
+	g.GET("/api/analytics/agents/{id}", tenant((*handlers.App).GetAgentDetails))
+	g.GET("/api/analytics/agents/comparison", tenant((*handlers.App).GetAgentComparison))
 
 	// Meta WhatsApp Analytics
-	g.GET("/api/analytics/meta", app.GetMetaAnalytics)
-	g.GET("/api/analytics/meta/accounts", app.ListMetaAccountsForAnalytics)
-	g.POST("/api/analytics/meta/refresh", app.RefreshMetaAnalyticsCache)
+	g.GET("/api/analytics/meta", tenant((*handlers.App).GetMetaAnalytics))
+	g.GET("/api/analytics/meta/accounts", tenant((*handlers.App).ListMetaAccountsForAnalytics))
+	g.POST("/api/analytics/meta/refresh", tenant((*handlers.App).RefreshMetaAnalyticsCache))
 
 	// Widgets (customizable analytics)
-	g.GET("/api/widgets", app.ListWidgets)
-	g.POST("/api/widgets", app.CreateWidget)
-	g.GET("/api/widgets/data-sources", app.GetWidgetDataSources)
-	g.GET("/api/widgets/data", app.GetAllWidgetsData)
-	g.GET("/api/widgets/{id}", app.GetWidget)
-	g.PUT("/api/widgets/{id}", app.UpdateWidget)
-	g.DELETE("/api/widgets/{id}", app.DeleteWidget)
-	g.GET("/api/widgets/{id}/data", app.GetWidgetData)
-	g.POST("/api/widgets/layout", app.SaveWidgetLayout)
+	g.GET("/api/widgets", tenant((*handlers.App).ListWidgets))
+	g.POST("/api/widgets", tenant((*handlers.App).CreateWidget))
+	g.GET("/api/widgets/data-sources", tenant((*handlers.App).GetWidgetDataSources))
+	g.GET("/api/widgets/data", tenant((*handlers.App).GetAllWidgetsData))
+	g.GET("/api/widgets/{id}", tenant((*handlers.App).GetWidget))
+	g.PUT("/api/widgets/{id}", tenant((*handlers.App).UpdateWidget))
+	g.DELETE("/api/widgets/{id}", tenant((*handlers.App).DeleteWidget))
+	g.GET("/api/widgets/{id}/data", tenant((*handlers.App).GetWidgetData))
+	g.POST("/api/widgets/layout", tenant((*handlers.App).SaveWidgetLayout))
 
 	// Organization Settings
-	g.GET("/api/org/settings", app.GetOrganizationSettings)
-	g.PUT("/api/org/settings", app.UpdateOrganizationSettings)
-	g.POST("/api/org/audio", app.UploadOrgAudio)
+	g.GET("/api/org/settings", tenant((*handlers.App).GetOrganizationSettings))
+	g.PUT("/api/org/settings", tenant((*handlers.App).UpdateOrganizationSettings))
+	g.POST("/api/org/audio", tenant((*handlers.App).UploadOrgAudio))
 
 	// Organizations
-	g.GET("/api/organizations", app.ListOrganizations)
+	g.GET("/api/organizations", tenant((*handlers.App).ListOrganizations))
 	g.POST("/api/organizations", app.CreateOrganization)
-	g.POST("/api/organizations/invitations", app.CreateOrganizationInvitation)
-	g.GET("/api/organizations/current", app.GetCurrentOrganization)
-	g.GET("/api/organizations/members", app.ListOrganizationMembers)
-	g.POST("/api/organizations/members", app.AddOrganizationMember)
-	g.PUT("/api/organizations/members/{member_id}", app.UpdateOrganizationMemberRole)
-	g.DELETE("/api/organizations/members/{member_id}", app.RemoveOrganizationMember)
+	g.POST("/api/organizations/invitations", tenant((*handlers.App).CreateOrganizationInvitation))
+	g.GET("/api/organizations/current", tenant((*handlers.App).GetCurrentOrganization))
+	g.GET("/api/organizations/members", tenant((*handlers.App).ListOrganizationMembers))
+	g.POST("/api/organizations/members", tenant((*handlers.App).AddOrganizationMember))
+	g.PUT("/api/organizations/members/{member_id}", tenant((*handlers.App).UpdateOrganizationMemberRole))
+	g.DELETE("/api/organizations/members/{member_id}", tenant((*handlers.App).RemoveOrganizationMember))
 
 	// SSO Settings (admin only - enforced by middleware)
-	g.GET("/api/settings/sso", app.GetSSOSettings)
-	g.PUT("/api/settings/sso/{provider}", app.UpdateSSOProvider)
-	g.DELETE("/api/settings/sso/{provider}", app.DeleteSSOProvider)
+	g.GET("/api/settings/sso", tenant((*handlers.App).GetSSOSettings))
+	g.PUT("/api/settings/sso/{provider}", tenant((*handlers.App).UpdateSSOProvider))
+	g.DELETE("/api/settings/sso/{provider}", tenant((*handlers.App).DeleteSSOProvider))
 
 	// Webhooks
-	g.GET("/api/webhooks", app.ListWebhooks)
-	g.POST("/api/webhooks", app.CreateWebhook)
-	g.GET("/api/webhooks/{id}", app.GetWebhook)
-	g.PUT("/api/webhooks/{id}", app.UpdateWebhook)
-	g.DELETE("/api/webhooks/{id}", app.DeleteWebhook)
-	g.POST("/api/webhooks/{id}/test", app.TestWebhook)
+	g.GET("/api/webhooks", tenant((*handlers.App).ListWebhooks))
+	g.POST("/api/webhooks", tenant((*handlers.App).CreateWebhook))
+	g.GET("/api/webhooks/{id}", tenant((*handlers.App).GetWebhook))
+	g.PUT("/api/webhooks/{id}", tenant((*handlers.App).UpdateWebhook))
+	g.DELETE("/api/webhooks/{id}", tenant((*handlers.App).DeleteWebhook))
+	g.POST("/api/webhooks/{id}/test", tenant((*handlers.App).TestWebhook))
 
 	// Custom Actions
-	g.GET("/api/custom-actions", app.ListCustomActions)
-	g.POST("/api/custom-actions", app.CreateCustomAction)
-	g.GET("/api/custom-actions/{id}", app.GetCustomAction)
-	g.PUT("/api/custom-actions/{id}", app.UpdateCustomAction)
-	g.DELETE("/api/custom-actions/{id}", app.DeleteCustomAction)
-	g.POST("/api/custom-actions/{id}/execute", app.ExecuteCustomAction)
+	g.GET("/api/custom-actions", tenant((*handlers.App).ListCustomActions))
+	g.POST("/api/custom-actions", tenant((*handlers.App).CreateCustomAction))
+	g.GET("/api/custom-actions/{id}", tenant((*handlers.App).GetCustomAction))
+	g.PUT("/api/custom-actions/{id}", tenant((*handlers.App).UpdateCustomAction))
+	g.DELETE("/api/custom-actions/{id}", tenant((*handlers.App).DeleteCustomAction))
+	g.POST("/api/custom-actions/{id}/execute", tenant((*handlers.App).ExecuteCustomAction))
 	g.GET("/api/custom-actions/redirect/{token}", app.CustomActionRedirect)
 
 	// IVR Flows
-	g.GET("/api/ivr-flows", app.ListIVRFlows)
-	g.GET("/api/ivr-flows/{id}", app.GetIVRFlow)
-	g.POST("/api/ivr-flows", app.CreateIVRFlow)
-	g.PUT("/api/ivr-flows/{id}", app.UpdateIVRFlow)
-	g.DELETE("/api/ivr-flows/{id}", app.DeleteIVRFlow)
-	g.POST("/api/ivr-flows/audio", app.UploadIVRAudio)
-	g.GET("/api/ivr-flows/audio/{filename}", app.ServeIVRAudio)
+	g.GET("/api/ivr-flows", tenant((*handlers.App).ListIVRFlows))
+	g.GET("/api/ivr-flows/{id}", tenant((*handlers.App).GetIVRFlow))
+	g.POST("/api/ivr-flows", tenant((*handlers.App).CreateIVRFlow))
+	g.PUT("/api/ivr-flows/{id}", tenant((*handlers.App).UpdateIVRFlow))
+	g.DELETE("/api/ivr-flows/{id}", tenant((*handlers.App).DeleteIVRFlow))
+	g.POST("/api/ivr-flows/audio", tenant((*handlers.App).UploadIVRAudio))
+	g.GET("/api/ivr-flows/audio/{filename}", tenant((*handlers.App).ServeIVRAudio))
 
 	// Call Logs
-	g.GET("/api/call-logs", app.ListCallLogs)
-	g.GET("/api/call-logs/{id}", app.GetCallLog)
-	g.GET("/api/call-logs/{id}/recording", app.GetCallRecording)
+	g.GET("/api/call-logs", tenant((*handlers.App).ListCallLogs))
+	g.GET("/api/call-logs/{id}", tenant((*handlers.App).GetCallLog))
+	g.GET("/api/call-logs/{id}/recording", tenant((*handlers.App).GetCallRecording))
 
 	// Call Transfers
-	g.GET("/api/call-transfers", app.ListCallTransfers)
-	g.GET("/api/call-transfers/{id}", app.GetCallTransfer)
-	g.POST("/api/call-transfers/{id}/connect", app.ConnectCallTransfer)
-	g.POST("/api/call-transfers/{id}/hangup", app.HangupCallTransfer)
-	g.POST("/api/call-transfers/initiate", app.InitiateAgentTransfer)
+	g.GET("/api/call-transfers", tenant((*handlers.App).ListCallTransfers))
+	g.GET("/api/call-transfers/{id}", tenant((*handlers.App).GetCallTransfer))
+	g.POST("/api/call-transfers/{id}/connect", tenant((*handlers.App).ConnectCallTransfer))
+	g.POST("/api/call-transfers/{id}/hangup", tenant((*handlers.App).HangupCallTransfer))
+	g.POST("/api/call-transfers/initiate", tenant((*handlers.App).InitiateAgentTransfer))
 
 	// Call Hold
-	g.POST("/api/call-logs/{id}/hold", app.HoldCall)
-	g.POST("/api/call-logs/{id}/resume", app.ResumeCall)
+	g.POST("/api/call-logs/{id}/hold", tenant((*handlers.App).HoldCall))
+	g.POST("/api/call-logs/{id}/resume", tenant((*handlers.App).ResumeCall))
 
 	// Outgoing Calls
-	g.POST("/api/calls/outgoing", app.InitiateOutgoingCall)
-	g.POST("/api/calls/outgoing/{id}/hangup", app.HangupOutgoingCall)
-	g.POST("/api/calls/permission-request", app.SendCallPermissionRequest)
-	g.GET("/api/calls/permission/{contactId}", app.GetCallPermission)
-	g.GET("/api/calls/ice-servers", app.GetICEServers)
+	g.POST("/api/calls/outgoing", tenant((*handlers.App).InitiateOutgoingCall))
+	g.POST("/api/calls/outgoing/{id}/hangup", tenant((*handlers.App).HangupOutgoingCall))
+	g.POST("/api/calls/permission-request", tenant((*handlers.App).SendCallPermissionRequest))
+	g.GET("/api/calls/permission/{contactId}", tenant((*handlers.App).GetCallPermission))
+	g.GET("/api/calls/ice-servers", tenant((*handlers.App).GetICEServers))
 
 	// Catalogs
-	g.GET("/api/catalogs", app.ListCatalogs)
-	g.POST("/api/catalogs", app.CreateCatalog)
-	g.GET("/api/catalogs/{id}", app.GetCatalog)
-	g.DELETE("/api/catalogs/{id}", app.DeleteCatalog)
-	g.POST("/api/catalogs/sync", app.SyncCatalogs)
+	g.GET("/api/catalogs", tenant((*handlers.App).ListCatalogs))
+	g.POST("/api/catalogs", tenant((*handlers.App).CreateCatalog))
+	g.GET("/api/catalogs/{id}", tenant((*handlers.App).GetCatalog))
+	g.DELETE("/api/catalogs/{id}", tenant((*handlers.App).DeleteCatalog))
+	g.POST("/api/catalogs/sync", tenant((*handlers.App).SyncCatalogs))
 
 	// Catalog Products
-	g.GET("/api/catalogs/{id}/products", app.ListCatalogProducts)
-	g.POST("/api/catalogs/{id}/products", app.CreateCatalogProduct)
-	g.GET("/api/products/{id}", app.GetCatalogProduct)
-	g.PUT("/api/products/{id}", app.UpdateCatalogProduct)
-	g.DELETE("/api/products/{id}", app.DeleteCatalogProduct)
+	g.GET("/api/catalogs/{id}/products", tenant((*handlers.App).ListCatalogProducts))
+	g.POST("/api/catalogs/{id}/products", tenant((*handlers.App).CreateCatalogProduct))
+	g.GET("/api/products/{id}", tenant((*handlers.App).GetCatalogProduct))
+	g.PUT("/api/products/{id}", tenant((*handlers.App).UpdateCatalogProduct))
+	g.DELETE("/api/products/{id}", tenant((*handlers.App).DeleteCatalogProduct))
 
 	// Serve embedded frontend (SPA)
 	if frontend.IsEmbedded() {

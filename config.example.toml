@@ -23,6 +23,11 @@ allowed_origins = ""  # Comma-separated CORS origins (e.g., "https://app.example
 # fields below. On DigitalOcean App Platform, bind this to the managed
 # database's DATABASE_PRIVATE_URL to keep production traffic inside the VPC.
 url = ""
+# Owner connection used only by the `rereply rls-migrate` pre-deploy job.
+# Keep this secret out of the web service and worker environments.
+migration_url = ""
+runtime_role = "rereply_app"
+rls_enabled = false
 host = "db"  # Use "localhost" for local development
 port = 5432
 user = "whatomate"
