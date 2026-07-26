@@ -40,12 +40,14 @@ func TestLoad_AppliesDefaultsForMissingFields(t *testing.T) {
 	assert.Equal(t, 6379, cfg.Redis.Port)
 	assert.Equal(t, 15, cfg.JWT.AccessExpiryMins)
 	assert.Equal(t, 1, cfg.JWT.RefreshExpiryDays)
-	assert.Equal(t, "v18.0", cfg.WhatsApp.APIVersion)
+	assert.Equal(t, "v24.0", cfg.WhatsApp.APIVersion)
 	assert.Equal(t, "https://graph.facebook.com", cfg.WhatsApp.BaseURL)
+	assert.Equal(t, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", cfg.AI.QwenBaseURL)
 	assert.Equal(t, "local", cfg.Storage.Type)
 	assert.Equal(t, "./uploads", cfg.Storage.LocalPath)
-	assert.Equal(t, "admin@admin.com", cfg.DefaultAdmin.Email)
+	assert.Equal(t, "admin@rereply.app", cfg.DefaultAdmin.Email)
 	assert.Equal(t, "admin", cfg.DefaultAdmin.Password)
+	assert.Equal(t, "ReReply Administrator", cfg.DefaultAdmin.FullName)
 }
 
 func TestLoad_FileValuesOverrideDefaults(t *testing.T) {

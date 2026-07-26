@@ -7,13 +7,7 @@
     <meta name="description" content="ReReply - WhatsApp customer conversations, CRM, and automation">
     <meta name="theme-color" content="#10120d">
     <title>ReReply</title>
-    <script>
-      (function() {
-        var mode = localStorage.getItem('color-mode');
-        var isDark = mode === 'dark' || (mode === 'system' || !mode) && window.matchMedia('(prefers-color-scheme: dark)').matches;
-        if (isDark) document.documentElement.classList.add('dark');
-      })();
-    </script>
+    <script src="/theme-init.js"></script>
   </head>
   <body>
     <div id="app"></div>

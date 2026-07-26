@@ -472,6 +472,22 @@ func TestRequestLogger(t *testing.T) {
 	assert.WithinDuration(t, time.Now(), startTime, time.Second)
 }
 
+func TestSecurityHeaders(t *testing.T) {
+	t.Parallel()
+
+	req := newTestRequest()
+	result := middleware.SecurityHeaders()(req)
+
+	require.NotNil(t, result)
+	headers := &result.RequestCtx.Response.Header
+	assert.Equal(t, "nosniff", string(headers.Peek("X-Content-Type-Options")))
+	assert.Equal(t, "DENY", string(headers.Peek("X-Frame-Options")))
+	assert.Equal(t, "strict-origin-when-cross-origin", string(headers.Peek("Referrer-Policy")))
+	assert.Equal(t, "max-age=31536000; includeSubDomains", string(headers.Peek("Strict-Transport-Security")))
+	assert.Contains(t, string(headers.Peek("Content-Security-Policy")), "default-src 'self'")
+	assert.Contains(t, string(headers.Peek("Content-Security-Policy")), "frame-ancestors 'none'")
+}
+
 func TestJWTClaims(t *testing.T) {
 	t.Parallel()
 

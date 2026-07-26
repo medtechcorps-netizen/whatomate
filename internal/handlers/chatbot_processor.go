@@ -835,6 +835,8 @@ func (a *App) generateAIResponse(settings *models.ChatbotSettings, session *mode
 		return a.generateAnthropicResponse(settings, session, userMessage, contextData)
 	case models.AIProviderGoogle:
 		return a.generateGoogleResponse(settings, session, userMessage, contextData)
+	case models.AIProviderQwen:
+		return a.generateQwenResponse(settings, session, userMessage, contextData)
 	default:
 		return "", fmt.Errorf("unsupported AI provider: %s", settings.AI.Provider)
 	}
@@ -933,10 +935,9 @@ func (a *App) fetchAPIContext(apiConfig models.JSONB, session *models.ChatbotSes
 	return string(respBody), nil
 }
 
-// generateOpenAIResponse generates a response using OpenAI API
-func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
-	url := "https://api.openai.com/v1/chat/completions"
-
+// generateOpenAICompatibleResponse calls an OpenAI-compatible chat completions
+// endpoint. Qwen uses this protocol through Alibaba Cloud Model Studio.
+func (a *App) generateOpenAICompatibleResponse(providerName, url string, settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string, extraPayload map[string]any) (string, error) {
 	// Build messages array
 	messages := []map[string]string{}
 
@@ -984,6 +985,9 @@ func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *
 		"messages":   messages,
 		"max_tokens": settings.AI.MaxTokens,
 	}
+	for key, value := range extraPayload {
+		payload[key] = value
+	}
 
 	if settings.AI.Temperature > 0 {
 		payload["temperature"] = settings.AI.Temperature
@@ -1017,7 +1021,10 @@ func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *
 			} `json:"error"`
 		}
 		_ = json.Unmarshal(body, &errResp)
-		return "", fmt.Errorf("OpenAI API error: %s", errResp.Error.Message)
+		if errResp.Error.Message == "" {
+			errResp.Error.Message = strings.TrimSpace(string(body))
+		}
+		return "", fmt.Errorf("%s API error: %s", providerName, errResp.Error.Message)
 	}
 
 	var result struct {
@@ -1035,7 +1042,47 @@ func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *
 		return strings.TrimSpace(result.Choices[0].Message.Content), nil
 	}
 
-	return "", fmt.Errorf("no response from OpenAI")
+	return "", fmt.Errorf("no response from %s", providerName)
+}
+
+// generateOpenAIResponse generates a response using OpenAI API.
+func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
+	return a.generateOpenAICompatibleResponse(
+		"OpenAI",
+		"https://api.openai.com/v1/chat/completions",
+		settings,
+		session,
+		userMessage,
+		contextData,
+		nil,
+	)
+}
+
+// generateQwenResponse generates a low-latency customer-service response using
+// Alibaba Cloud Model Studio's OpenAI-compatible Qwen API. Thinking is disabled
+// for routine CRM replies to keep latency and token usage predictable.
+func (a *App) generateQwenResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
+	requestSettings := settings
+	if settings.AI.Model == "" {
+		settingsCopy := *settings
+		settingsCopy.AI.Model = "qwen3.7-plus"
+		requestSettings = &settingsCopy
+	}
+
+	baseURL := "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+	if a.Config != nil && a.Config.AI.QwenBaseURL != "" {
+		baseURL = a.Config.AI.QwenBaseURL
+	}
+
+	return a.generateOpenAICompatibleResponse(
+		"Qwen",
+		strings.TrimRight(baseURL, "/")+"/chat/completions",
+		requestSettings,
+		session,
+		userMessage,
+		contextData,
+		map[string]any{"enable_thinking": false},
+	)
 }
 
 // generateAnthropicResponse generates a response using Anthropic API

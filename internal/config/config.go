@@ -153,6 +153,7 @@ type AIConfig struct {
 	OpenAIKey    string `koanf:"openai_key"`
 	AnthropicKey string `koanf:"anthropic_key"`
 	GoogleKey    string `koanf:"google_key"`
+	QwenBaseURL  string `koanf:"qwen_base_url"`
 }
 
 type StorageConfig struct {
@@ -270,10 +271,13 @@ func setDefaults(cfg *Config) {
 		cfg.JWT.RefreshExpiryDays = 1
 	}
 	if cfg.WhatsApp.APIVersion == "" {
-		cfg.WhatsApp.APIVersion = "v18.0"
+		cfg.WhatsApp.APIVersion = "v24.0"
 	}
 	if cfg.WhatsApp.BaseURL == "" {
 		cfg.WhatsApp.BaseURL = "https://graph.facebook.com"
+	}
+	if cfg.AI.QwenBaseURL == "" {
+		cfg.AI.QwenBaseURL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 	}
 	if cfg.Storage.Type == "" {
 		cfg.Storage.Type = "local"
@@ -283,13 +287,13 @@ func setDefaults(cfg *Config) {
 	}
 	// Default admin credentials (only used during initial setup)
 	if cfg.DefaultAdmin.Email == "" {
-		cfg.DefaultAdmin.Email = "admin@admin.com"
+		cfg.DefaultAdmin.Email = "admin@rereply.app"
 	}
 	if cfg.DefaultAdmin.Password == "" {
 		cfg.DefaultAdmin.Password = "admin"
 	}
 	if cfg.DefaultAdmin.FullName == "" {
-		cfg.DefaultAdmin.FullName = "Admin"
+		cfg.DefaultAdmin.FullName = "ReReply Administrator"
 	}
 	// Cookie defaults
 	if cfg.App.Environment == "production" {

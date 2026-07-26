@@ -136,9 +136,11 @@ const aiSettings = ref({
 const isAIEnabled = ref(false)
 
 const aiProviders = [
-  { value: 'openai', label: 'OpenAI', models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'] },
-  { value: 'anthropic', label: 'Anthropic', models: ['claude-3-5-sonnet-latest', 'claude-3-5-haiku-latest', 'claude-3-opus-latest'] },
-  { value: 'google', label: 'Google AI', models: ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash', 'gemini-1.5-flash-8b'] }
+  {
+    value: 'qwen',
+    label: 'Qwen (Alibaba Cloud)',
+    models: ['qwen3.7-plus', 'qwen3.7-max', 'qwen3.6-flash']
+  }
 ]
 
 const availableModels = computed(() => {
@@ -148,6 +150,13 @@ const availableModels = computed(() => {
 
 watch(isAIEnabled, (newValue) => {
   aiSettings.value.ai_enabled = newValue
+})
+
+watch(() => aiSettings.value.ai_provider, (providerValue) => {
+  const provider = aiProviders.find(p => p.value === providerValue)
+  if (provider && !provider.models.includes(aiSettings.value.ai_model)) {
+    aiSettings.value.ai_model = provider.models[0]
+  }
 })
 
 // SLA Settings
@@ -232,11 +241,17 @@ onMounted(async () => {
 
       const aiEnabledValue = chatbotData.settings.ai_enabled === true
       isAIEnabled.value = aiEnabledValue
+      const loadedProvider = chatbotData.settings.ai_provider
+      const selectedProvider = aiProviders.some((provider) => provider.value === loadedProvider)
+        ? loadedProvider
+        : 'qwen'
+      const selectedProviderModels = aiProviders.find((provider) => provider.value === selectedProvider)?.models || []
+      const loadedModel = chatbotData.settings.ai_model
       aiSettings.value = {
         ai_enabled: aiEnabledValue,
-        ai_provider: chatbotData.settings.ai_provider || '',
+        ai_provider: selectedProvider,
         ai_api_key: '',
-        ai_model: chatbotData.settings.ai_model || '',
+        ai_model: selectedProviderModels.includes(loadedModel) ? loadedModel : selectedProviderModels[0],
         ai_max_tokens: chatbotData.settings.ai_max_tokens || 500,
         ai_system_prompt: chatbotData.settings.ai_system_prompt || ''
       }

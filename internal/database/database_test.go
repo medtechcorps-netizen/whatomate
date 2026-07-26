@@ -194,7 +194,7 @@ func TestCreateDefaultAdmin_CreatesOrgAndUser(t *testing.T) {
 	var org models.Organization
 	err = db.First(&org).Error
 	require.NoError(t, err)
-	assert.Equal(t, "Default Organization", org.Name)
+	assert.Equal(t, "ReReply", org.Name)
 
 	// Verify the user belongs to the organization
 	assert.Equal(t, org.ID, user.OrganizationID)

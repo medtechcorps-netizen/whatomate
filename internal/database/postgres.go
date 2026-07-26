@@ -308,13 +308,13 @@ func CreateDefaultAdmin(db *gorm.DB, cfg *config.DefaultAdminConfig) error {
 		return nil
 	}
 
-	// Find any existing organization, or create "Default Organization" if none exist
+	// Find any existing organization, or create the ReReply organization if none exist
 	var org models.Organization
 	if err := db.First(&org).Error; err != nil {
 		// No organizations exist, create default one
 		org = models.Organization{
 			BaseModel: models.BaseModel{ID: uuid.New()},
-			Name:      "Default Organization",
+			Name:      "ReReply",
 			Settings:  models.JSONB{},
 		}
 		if err := db.Create(&org).Error; err != nil {
@@ -657,9 +657,9 @@ func SeedSystemRolesForOrg(db *gorm.DB, orgID uuid.UUID) error {
 
 // SeedDefaultWidgets creates default dashboard widgets for all organizations
 func SeedDefaultWidgets(db *gorm.DB) error {
-	// Find the super admin user (admin@admin.com)
+	// Find a super admin without coupling the seed to a legacy email address.
 	var superAdmin models.User
-	if err := db.Where("email = ?", "admin@admin.com").First(&superAdmin).Error; err != nil {
+	if err := db.Where("is_super_admin = ?", true).Order("created_at ASC").First(&superAdmin).Error; err != nil {
 		// No super admin exists yet, skip widget creation
 		return nil
 	}

@@ -1,0 +1,16 @@
+.git
+.github
+.idea
+.vscode
+tmp
+temp
+uploads
+audio
+frontend/node_modules
+frontend/dist
+frontend/playwright-report
+frontend/test-results
+internal/frontend/dist
+*.log
+*.out
+config.toml
