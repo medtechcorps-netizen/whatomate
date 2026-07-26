@@ -218,6 +218,54 @@ func TestCreateDefaultAdmin_Idempotent(t *testing.T) {
 	assert.Equal(t, int64(1), count, "should not create duplicate admin")
 }
 
+func TestCreateDefaultAdmin_SkipsWhenAnyUserExists(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+
+	firstCfg := &config.DefaultAdminConfig{
+		Email:    "existing-admin@example.com",
+		Password: "pass123",
+		FullName: "Existing Admin",
+	}
+	require.NoError(t, database.CreateDefaultAdmin(db, firstCfg))
+
+	differentCfg := &config.DefaultAdminConfig{
+		Email:    "new-default@example.com",
+		Password: "pass456",
+		FullName: "New Default",
+	}
+	require.NoError(t, database.CreateDefaultAdmin(db, differentCfg))
+
+	var count int64
+	require.NoError(t, db.Unscoped().Model(&models.User{}).Count(&count).Error)
+	assert.Equal(t, int64(1), count, "an existing installation must not receive another default admin")
+}
+
+func TestCreateDefaultAdmin_SkipsSoftDeletedUser(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+
+	cfg := &config.DefaultAdminConfig{
+		Email:    "deleted-admin@example.com",
+		Password: "pass123",
+		FullName: "Deleted Admin",
+	}
+	require.NoError(t, database.CreateDefaultAdmin(db, cfg))
+
+	var user models.User
+	require.NoError(t, db.Where("email = ?", cfg.Email).First(&user).Error)
+	require.NoError(t, db.Delete(&user).Error)
+	require.NoError(t, database.CreateDefaultAdmin(db, cfg))
+
+	var unscopedCount int64
+	require.NoError(t, db.Unscoped().Model(&models.User{}).Where("email = ?", cfg.Email).Count(&unscopedCount).Error)
+	assert.Equal(t, int64(1), unscopedCount, "soft-deleted users must not be recreated by migrations")
+
+	var activeCount int64
+	require.NoError(t, db.Model(&models.User{}).Where("email = ?", cfg.Email).Count(&activeCount).Error)
+	assert.Zero(t, activeCount)
+}
+
 func TestCreateDefaultAdmin_UsesExistingOrg(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	cleanAll(t, db)

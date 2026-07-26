@@ -306,13 +306,15 @@ func CreateIndexes(db *gorm.DB) error {
 	return nil
 }
 
-// CreateDefaultAdmin creates a default admin user if no users exist
-// This should only be called once during initial setup
+// CreateDefaultAdmin creates a default admin user only for a completely new
+// installation. Existing users, including soft-deleted users, must never be
+// replaced or recreated implicitly by a migration.
 func CreateDefaultAdmin(db *gorm.DB, cfg *config.DefaultAdminConfig) error {
-	// Check if admin already exists (using email from config)
-	var existingAdmin models.User
-	if err := db.Where("email = ?", cfg.Email).First(&existingAdmin).Error; err == nil {
-		// Admin already exists, skip
+	var userCount int64
+	if err := db.Unscoped().Model(&models.User{}).Count(&userCount).Error; err != nil {
+		return fmt.Errorf("failed to check existing users: %w", err)
+	}
+	if userCount > 0 {
 		return nil
 	}
 
