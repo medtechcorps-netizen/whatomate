@@ -215,6 +215,41 @@ func TestApp_UpdateOrganizationSettings_EmptyNameIgnored(t *testing.T) {
 	assert.Equal(t, originalName, updatedOrg.Name)
 }
 
+func TestApp_UpdateOrganizationSettings_ClearsMetaAppSecret(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(
+		t,
+		app.DB,
+		org.ID,
+		testutil.WithEmail(testutil.UniqueEmail("clear-meta-secret")),
+		testutil.WithSuperAdmin(),
+	)
+
+	org.Settings = models.JSONB{
+		"meta_app_id":               "123456789012345",
+		"meta_app_secret_encrypted": "accidental-secret",
+	}
+	require.NoError(t, app.DB.Save(org).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"clear_meta_app_secret": true,
+	})
+	testutil.SetFullAuthContext(req, org.ID, user.ID, nil, true)
+
+	err := app.UpdateOrganizationSettings(req)
+	require.NoError(t, err)
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var updatedOrg models.Organization
+	require.NoError(t, app.DB.Where("id = ?", org.ID).First(&updatedOrg).Error)
+	assert.Equal(t, "123456789012345", updatedOrg.Settings["meta_app_id"])
+	_, exists := updatedOrg.Settings["meta_app_secret_encrypted"]
+	assert.False(t, exists)
+}
+
 func TestApp_UpdateOrganizationSettings_InvalidJSON(t *testing.T) {
 	t.Parallel()
 

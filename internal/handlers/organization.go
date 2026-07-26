@@ -148,6 +148,7 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 		MetaAppID           *string `json:"meta_app_id"`
 		MetaConfigID        *string `json:"meta_config_id"`
 		MetaAppSecret       *string `json:"meta_app_secret"`
+		ClearMetaAppSecret  *bool   `json:"clear_meta_app_secret"`
 	}
 
 	if err := json.Unmarshal(r.RequestCtx.PostBody(), &req); err != nil {
@@ -160,7 +161,8 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 	}
 
 	// Gating Meta App credentials update on accounts:write permission
-	metaAppCredsTouched := req.MetaAppID != nil || req.MetaConfigID != nil || req.MetaAppSecret != nil
+	metaAppCredsTouched := req.MetaAppID != nil || req.MetaConfigID != nil ||
+		req.MetaAppSecret != nil || req.ClearMetaAppSecret != nil
 	if metaAppCredsTouched {
 		if err := a.requirePermission(r, userID, models.ResourceAccounts, models.ActionWrite); err != nil {
 			return nil
@@ -210,7 +212,9 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 	if req.MetaConfigID != nil {
 		org.Settings["meta_config_id"] = *req.MetaConfigID
 	}
-	if req.MetaAppSecret != nil && *req.MetaAppSecret != "" {
+	if req.ClearMetaAppSecret != nil && *req.ClearMetaAppSecret {
+		delete(org.Settings, "meta_app_secret_encrypted")
+	} else if req.MetaAppSecret != nil && *req.MetaAppSecret != "" {
 		encSecret, errEnc := crypto.Encrypt(*req.MetaAppSecret, a.Config.App.EncryptionKey)
 		if errEnc != nil {
 			a.Log.Error("Failed to encrypt meta app secret", "error", errEnc)

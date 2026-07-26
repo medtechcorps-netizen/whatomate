@@ -721,6 +721,7 @@ export const organizationService = {
     meta_app_id?: string
     meta_config_id?: string
     meta_app_secret?: string
+    clear_meta_app_secret?: boolean
   }) => api.put('/org/settings', data),
   uploadOrgAudio: (file: File, type: 'hold_music' | 'ringback') => {
     const formData = new FormData()
