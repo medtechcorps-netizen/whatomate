@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/access"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"gorm.io/gorm"
@@ -422,6 +423,18 @@ func (a *App) getUserPermissionsCached(userID uuid.UUID, orgIDs ...uuid.UUID) (*
 		cacheKey = fmt.Sprintf("%s%s", userPermissionsCachePrefix, userID.String())
 	}
 
+	// Membership state is checked before serving cached permissions so reseller
+	// suspension or removal takes effect immediately.
+	var user models.User
+	if err := a.DB.Where("id = ? AND is_active = ?", userID, true).First(&user).Error; err != nil {
+		return nil, err
+	}
+	if orgID != uuid.Nil && !user.IsSuperAdmin {
+		if _, ok := access.OrganizationMembership(a.DB, userID, orgID); !ok {
+			return nil, gorm.ErrRecordNotFound
+		}
+	}
+
 	// Try cache first (if Redis is available)
 	if a.Redis != nil {
 		cached, err := a.Redis.Get(ctx, cacheKey).Result()
@@ -434,11 +447,6 @@ func (a *App) getUserPermissionsCached(userID uuid.UUID, orgIDs ...uuid.UUID) (*
 	}
 
 	// Cache miss - fetch from database
-	var user models.User
-	if err := a.DB.Where("id = ?", userID).First(&user).Error; err != nil {
-		return nil, err
-	}
-
 	// Determine which role to use
 	var roleID *uuid.UUID
 	if orgID != uuid.Nil {

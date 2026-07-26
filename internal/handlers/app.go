@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"github.com/shridarpatil/whatomate/internal/access"
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/calling"
 	"github.com/shridarpatil/whatomate/internal/config"
@@ -95,10 +96,7 @@ func (a *App) getOrgID(r *fastglue.Request) (uuid.UUID, error) {
 				}
 			} else {
 				// Non-super-admins can switch if they have membership
-				var count int64
-				if err := a.DB.Table("user_organizations").
-					Where("user_id = ? AND organization_id = ? AND deleted_at IS NULL", userID, parsedOrgID).
-					Count(&count).Error; err == nil && count > 0 {
+				if _, ok := access.OrganizationMembership(a.DB, userID, parsedOrgID); ok {
 					return parsedOrgID, nil
 				}
 			}

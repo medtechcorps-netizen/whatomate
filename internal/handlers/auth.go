@@ -7,11 +7,13 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/access"
 	"github.com/shridarpatil/whatomate/internal/middleware"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 )
 
 // LoginRequest represents login credentials
@@ -355,12 +357,23 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 func (a *App) applyOrganizationMembership(user *models.User, orgID uuid.UUID, allowFallback bool) error {
 	var membership models.UserOrganization
 	membershipErr := a.DB.Where("user_id = ? AND organization_id = ?", user.ID, orgID).First(&membership).Error
+	if !user.IsSuperAdmin && membershipErr == nil && !access.ResellerDerivedMembershipActive(a.DB, &membership) {
+		membershipErr = gorm.ErrRecordNotFound
+	}
 	if membershipErr != nil && allowFallback && !user.IsSuperAdmin {
-		membershipErr = a.DB.Where("user_id = ?", user.ID).
+		var memberships []models.UserOrganization
+		if err := a.DB.Where("user_id = ?", user.ID).
 			Order("is_default DESC, created_at ASC").
-			First(&membership).Error
-		if membershipErr == nil {
-			orgID = membership.OrganizationID
+			Find(&memberships).Error; err != nil {
+			return err
+		}
+		for index := range memberships {
+			if access.ResellerDerivedMembershipActive(a.DB, &memberships[index]) {
+				membership = memberships[index]
+				orgID = membership.OrganizationID
+				membershipErr = nil
+				break
+			}
 		}
 	}
 
@@ -374,6 +387,7 @@ func (a *App) applyOrganizationMembership(user *models.User, orgID uuid.UUID, al
 	}
 
 	user.OrganizationID = orgID
+	user.IsResellerAdmin = access.IsResellerAdmin(a.DB, user.ID)
 	if membershipErr == nil {
 		user.RoleID = membership.RoleID
 	}
@@ -484,20 +498,11 @@ func (a *App) SwitchOrg(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "User not found", nil, "")
 	}
 
-	// Super admins can switch to any org; others need membership
-	if !user.IsSuperAdmin {
-		var userOrg models.UserOrganization
-		if err := a.DB.Where("user_id = ? AND organization_id = ?", userID, req.OrganizationID).First(&userOrg).Error; err != nil {
-			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You are not a member of this organization", nil, "")
-		}
-		// Use the role from the user_organizations table for the target org
-		if userOrg.RoleID != nil {
-			user.RoleID = userOrg.RoleID
-		}
+	// Resolve the target membership from the database. Reseller-derived
+	// memberships must still be backed by an active reseller assignment.
+	if err := a.applyOrganizationMembership(&user, req.OrganizationID, false); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You are not a member of this organization", nil, "")
 	}
-
-	// Set the target org on the user for token generation
-	user.OrganizationID = req.OrganizationID
 
 	// Preload role with permissions for the response
 	if user.RoleID != nil {

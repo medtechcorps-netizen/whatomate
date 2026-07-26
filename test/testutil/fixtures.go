@@ -20,6 +20,26 @@ const TestJWTSecret = "test-secret-key-must-be-at-least-32-chars"
 
 // --- Organization ---
 
+// CreateTestReseller creates a test reseller in the database.
+func CreateTestReseller(t *testing.T, db *gorm.DB) *models.Reseller {
+	t.Helper()
+
+	reseller := &models.Reseller{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		Name:             "Test Reseller " + uuid.New().String()[:8],
+		Slug:             "test-reseller-" + uuid.New().String()[:8],
+		Status:           models.ResellerStatusActive,
+		Plan:             models.ResellerPlanGrowth,
+		MaxOrganizations: 25,
+		BrandName:        "Test Partner",
+		PrimaryColor:     "#0f766e",
+		AccentColor:      "#f59e0b",
+		Settings:         models.JSONB{},
+	}
+	require.NoError(t, db.Create(reseller).Error)
+	return reseller
+}
+
 // CreateTestOrganization creates a test organization in the database.
 func CreateTestOrganization(t *testing.T, db *gorm.DB) *models.Organization {
 	t.Helper()
@@ -30,6 +50,16 @@ func CreateTestOrganization(t *testing.T, db *gorm.DB) *models.Organization {
 		Slug:      "test-org-" + uuid.New().String()[:8],
 	}
 	require.NoError(t, db.Create(org).Error)
+	return org
+}
+
+// CreateTestOrganizationForReseller creates a tenant owned by a reseller.
+func CreateTestOrganizationForReseller(t *testing.T, db *gorm.DB, resellerID uuid.UUID) *models.Organization {
+	t.Helper()
+
+	org := CreateTestOrganization(t, db)
+	require.NoError(t, db.Model(org).Update("reseller_id", resellerID).Error)
+	org.ResellerID = &resellerID
 	return org
 }
 

@@ -273,6 +273,25 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		return errors.New("database pool contains a session-level tenant context")
 	}
 
+	// Every active organization must belong to a reseller portfolio. This
+	// control-plane invariant prevents unscoped customer organizations from
+	// appearing after a partial migration or manual database change.
+	if db.Migrator().HasTable("organizations") &&
+		db.Migrator().HasColumn("organizations", "reseller_id") {
+		var unassignedOrganizations int64
+		if err := db.Table("organizations").
+			Where("deleted_at IS NULL AND reseller_id IS NULL").
+			Count(&unassignedOrganizations).Error; err != nil {
+			return fmt.Errorf("verify organization reseller ownership: %w", err)
+		}
+		if unassignedOrganizations > 0 {
+			return fmt.Errorf(
+				"%d active organization(s) have no reseller assignment",
+				unassignedOrganizations,
+			)
+		}
+	}
+
 	tables := append([]string{}, DirectTenantTables...)
 	for table := range RelatedTenantTables {
 		tables = append(tables, table)

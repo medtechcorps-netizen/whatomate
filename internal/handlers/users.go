@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/access"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -39,19 +40,20 @@ func parseSuperAdminField(r *fastglue.Request) *bool {
 
 // UserResponse represents the response for a user (without sensitive data)
 type UserResponse struct {
-	ID             uuid.UUID    `json:"id"`
-	Email          string       `json:"email"`
-	FullName       string       `json:"full_name"`
-	RoleID         *uuid.UUID   `json:"role_id,omitempty"`
-	Role           *RoleInfo    `json:"role,omitempty"`
-	IsActive       bool         `json:"is_active"`
-	IsAvailable    bool         `json:"is_available"`
-	IsSuperAdmin   bool         `json:"is_super_admin"`
-	IsMember       bool         `json:"is_member"`
-	OrganizationID uuid.UUID    `json:"organization_id"`
-	Settings       models.JSONB `json:"settings,omitempty"`
-	CreatedAt      string       `json:"created_at"`
-	UpdatedAt      string       `json:"updated_at"`
+	ID              uuid.UUID    `json:"id"`
+	Email           string       `json:"email"`
+	FullName        string       `json:"full_name"`
+	RoleID          *uuid.UUID   `json:"role_id,omitempty"`
+	Role            *RoleInfo    `json:"role,omitempty"`
+	IsActive        bool         `json:"is_active"`
+	IsAvailable     bool         `json:"is_available"`
+	IsSuperAdmin    bool         `json:"is_super_admin"`
+	IsResellerAdmin bool         `json:"is_reseller_admin"`
+	IsMember        bool         `json:"is_member"`
+	OrganizationID  uuid.UUID    `json:"organization_id"`
+	Settings        models.JSONB `json:"settings,omitempty"`
+	CreatedAt       string       `json:"created_at"`
+	UpdatedAt       string       `json:"updated_at"`
 }
 
 // PermissionInfo represents permission info in role response
@@ -650,18 +652,11 @@ func (a *App) GetCurrentUser(r *fastglue.Request) error {
 	// Use org from JWT context (may differ from DB after org switch)
 	orgID, _ := r.RequestCtx.UserValue("organization_id").(uuid.UUID)
 	if orgID != uuid.Nil {
-		user.OrganizationID = orgID
-
-		// Check for org-specific role from user_organizations
-		var userOrg models.UserOrganization
-		if err := a.DB.Where("user_id = ? AND organization_id = ?", userID, orgID).First(&userOrg).Error; err == nil && userOrg.RoleID != nil {
-			user.RoleID = userOrg.RoleID
-			var role models.CustomRole
-			if err := a.DB.Where("id = ?", *userOrg.RoleID).First(&role).Error; err == nil {
-				user.Role = &role
-			}
+		if err := a.applyOrganizationMembership(&user, orgID, false); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Organization access is no longer available", nil, "")
 		}
 	}
+	user.IsResellerAdmin = access.IsResellerAdmin(a.DB, user.ID)
 
 	// Load permissions from cache
 	if user.Role != nil && user.RoleID != nil {
@@ -821,17 +816,18 @@ func userAuditSnapshot(user *models.User) map[string]any {
 
 func userToResponse(user models.User) UserResponse {
 	resp := UserResponse{
-		ID:             user.ID,
-		Email:          user.Email,
-		FullName:       user.FullName,
-		RoleID:         user.RoleID,
-		IsActive:       user.IsActive,
-		IsAvailable:    user.IsAvailable,
-		IsSuperAdmin:   user.IsSuperAdmin,
-		OrganizationID: user.OrganizationID,
-		Settings:       user.Settings,
-		CreatedAt:      user.CreatedAt.Format("2006-01-02T15:04:05Z"),
-		UpdatedAt:      user.UpdatedAt.Format("2006-01-02T15:04:05Z"),
+		ID:              user.ID,
+		Email:           user.Email,
+		FullName:        user.FullName,
+		RoleID:          user.RoleID,
+		IsActive:        user.IsActive,
+		IsAvailable:     user.IsAvailable,
+		IsSuperAdmin:    user.IsSuperAdmin,
+		IsResellerAdmin: user.IsResellerAdmin,
+		OrganizationID:  user.OrganizationID,
+		Settings:        user.Settings,
+		CreatedAt:       user.CreatedAt.Format("2006-01-02T15:04:05Z"),
+		UpdatedAt:       user.UpdatedAt.Format("2006-01-02T15:04:05Z"),
 	}
 
 	// Include role info if loaded
@@ -888,6 +884,9 @@ func (a *App) ListMyOrganizations(r *fastglue.Request) error {
 
 	response := make([]MyOrganizationResponse, 0, len(userOrgs))
 	for _, uo := range userOrgs {
+		if !access.ResellerDerivedMembershipActive(a.DB, &uo) {
+			continue
+		}
 		item := MyOrganizationResponse{
 			OrganizationID: uo.OrganizationID,
 			IsDefault:      uo.IsDefault,
