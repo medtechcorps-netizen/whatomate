@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/shridarpatil/whatomate/internal/access"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
@@ -81,18 +80,6 @@ type resellerUsageResponse struct {
 
 func resellerRoleCanManage(role string) bool {
 	return role == models.ResellerRoleOwner || role == models.ResellerRoleAdmin
-}
-
-func (a *App) resellerDerivedMembershipActive(membership *models.UserOrganization) bool {
-	return access.ResellerDerivedMembershipActive(a.DB, membership)
-}
-
-func (a *App) organizationAccessAvailable(userID, orgID uuid.UUID) (*models.UserOrganization, bool) {
-	return access.OrganizationMembership(a.DB, userID, orgID)
-}
-
-func (a *App) userIsResellerAdminForOrganization(userID, orgID uuid.UUID) bool {
-	return access.IsResellerAdminForOrganization(a.DB, userID, orgID)
 }
 
 func validResellerPlan(plan string) bool {
