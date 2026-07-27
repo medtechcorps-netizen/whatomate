@@ -94,6 +94,30 @@ func TestChannelOutboundMessageUsesPersistedIdempotencyKey(t *testing.T) {
 	assert.Equal(t, "persisted-key", outbound.IdempotencyKey)
 }
 
+func TestListReadyChannelOutboxOrganizationsWithoutRLS(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	_, _, _, job := createChannelOutboxTestFixture(t, db, org.ID, "ready-org-worker")
+	readyAt := time.Now().UTC().Add(-time.Minute)
+	require.NoError(t, db.Model(&models.OutboxJob{}).
+		Where("id = ? AND organization_id = ?", job.ID, org.ID).
+		Updates(map[string]any{
+			"status":       models.OutboxJobStatusPending,
+			"available_at": readyAt,
+			"locked_at":    nil,
+			"locked_by":    "",
+		}).Error)
+
+	w := &Worker{DB: db, Log: testutil.NopLogger()}
+	organizationIDs, err := w.listReadyChannelOutboxOrganizations(
+		defaultChannelOutboxBatchSize,
+		time.Now().UTC(),
+		time.Now().UTC().Add(-defaultChannelOutboxLease),
+	)
+	require.NoError(t, err)
+	assert.Contains(t, organizationIDs, org.ID)
+}
+
 func TestChannelOutboxRetryThenDeadLettersAtMaxAttempts(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	org := testutil.CreateTestOrganization(t, db)

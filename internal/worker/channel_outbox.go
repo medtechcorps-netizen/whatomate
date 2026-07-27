@@ -67,30 +67,14 @@ func (w *Worker) ProcessChannelOutboxBatch(ctx context.Context, workerID string,
 		limit = defaultChannelOutboxBatchSize
 	}
 
-	// A narrowly granted SECURITY DEFINER resolver exposes only organization
-	// IDs with ready jobs. Actual rows are loaded after entering WithTenant.
-	// The random UUID cursor gives every segment a chance without a full
-	// organizations scan on each poll.
-	var organizationIDs []uuid.UUID
-	resolverErr := w.DB.Raw(
-		"SELECT * FROM public.rereply_ready_channel_outbox_orgs(?, ?, ?)",
-		uuid.New(),
+	now := time.Now().UTC()
+	organizationIDs, err := w.listReadyChannelOutboxOrganizations(
 		limit,
-		time.Now().UTC().Add(-defaultChannelOutboxLease),
-	).Scan(&organizationIDs).Error
-	if resolverErr != nil {
-		if w.Config != nil && w.Config.Database.RLSEnabled {
-			return 0, fmt.Errorf("list channel outbox tenants: %w", resolverErr)
-		}
-		// Local/dev schemas may not install SECURITY DEFINER helpers. RLS is
-		// explicitly disabled here, so a control-plane scan is a safe
-		// compatibility fallback; production never falls back.
-		if err := w.DB.Model(&models.Organization{}).
-			Where("deleted_at IS NULL").
-			Order("id").
-			Pluck("id", &organizationIDs).Error; err != nil {
-			return 0, fmt.Errorf("list development channel outbox tenants: %w", err)
-		}
+		now,
+		now.Add(-defaultChannelOutboxLease),
+	)
+	if err != nil {
+		return 0, err
 	}
 
 	processed := 0
@@ -113,6 +97,63 @@ func (w *Worker) ProcessChannelOutboxBatch(ctx context.Context, workerID string,
 		}
 	}
 	return processed, errors.Join(batchErrors...)
+}
+
+func (w *Worker) listReadyChannelOutboxOrganizations(
+	limit int,
+	now time.Time,
+	staleBefore time.Time,
+) ([]uuid.UUID, error) {
+	cursor := uuid.New()
+	var organizationIDs []uuid.UUID
+
+	if w.Config != nil && w.Config.Database.RLSEnabled {
+		// RLS workers may only discover tenant IDs through this narrowly
+		// granted SECURITY DEFINER resolver. A missing resolver fails closed.
+		if err := w.DB.Raw(
+			"SELECT * FROM public.rereply_ready_channel_outbox_orgs(?, ?, ?)",
+			cursor,
+			limit,
+			staleBefore,
+		).Scan(&organizationIDs).Error; err != nil {
+			return nil, fmt.Errorf("list channel outbox tenants: %w", err)
+		}
+		return organizationIDs, nil
+	}
+
+	// Development and CI intentionally run without RLS or its routing
+	// functions. Query only ready outbox tenants directly instead of invoking
+	// an RLS-only resolver and recovering from a predictable database error.
+	if err := w.DB.Raw(`
+		WITH ready AS (
+			SELECT DISTINCT organization_id
+			FROM outbox_jobs
+			WHERE deleted_at IS NULL
+			  AND available_at <= ?
+			  AND (
+			    status IN (?, ?)
+			    OR (
+			      status = ?
+			      AND (locked_at IS NULL OR locked_at < ?)
+			    )
+			  )
+		)
+		SELECT organization_id
+		FROM ready
+		ORDER BY (organization_id > ?) DESC, organization_id
+		LIMIT ?
+	`,
+		now,
+		models.OutboxJobStatusPending,
+		models.OutboxJobStatusRetrying,
+		models.OutboxJobStatusProcessing,
+		staleBefore,
+		cursor,
+		limit,
+	).Scan(&organizationIDs).Error; err != nil {
+		return nil, fmt.Errorf("list development channel outbox tenants: %w", err)
+	}
+	return organizationIDs, nil
 }
 
 func (w *Worker) claimChannelOutboxJob(orgID uuid.UUID, workerID string) (uuid.UUID, bool, error) {

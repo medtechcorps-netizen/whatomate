@@ -125,10 +125,27 @@ jobs:
 
       - name: Start backend with migrations
         run: |
-          ./rereply server -migrate &
-          sleep 10
-          # Verify server is running
-          curl -f http://localhost:8080/health || exit 1
+          ./rereply server -migrate > backend.log 2>&1 &
+          backend_pid=$!
+
+          for attempt in $(seq 1 90); do
+            if curl --fail --silent --show-error http://localhost:8080/health > /dev/null; then
+              echo "Backend became healthy after $((attempt * 2)) seconds"
+              exit 0
+            fi
+
+            if ! kill -0 "$backend_pid" 2>/dev/null; then
+              echo "Backend exited before becoming healthy"
+              cat backend.log
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "Backend did not become healthy within 180 seconds"
+          cat backend.log
+          exit 1
         env:
           WHATOMATE_CONFIG: config.toml
 
