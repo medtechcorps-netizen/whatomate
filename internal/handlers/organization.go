@@ -239,13 +239,17 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 	userName := audit.GetUserName(a.DB, userID)
 	if generalTouched {
 		newGeneral := generalSettingsSnapshot(org.Name, org.Settings)
-		audit.LogAudit(a.DB, orgID, userID, userName,
-			models.ResourceSettingsGeneral, orgID, models.AuditActionUpdated, oldGeneral, newGeneral)
+		if err := audit.LogAudit(a.DB, orgID, userID, userName,
+			models.ResourceSettingsGeneral, orgID, models.AuditActionUpdated, oldGeneral, newGeneral); err != nil {
+			a.Log.Warn("Failed to record general settings audit entry", "error", err)
+		}
 	}
 	if callingTouched {
 		newCalling := callingSettingsSnapshot(org.Settings)
-		audit.LogAudit(a.DB, orgID, userID, userName,
-			models.ResourceSettingsCalling, orgID, models.AuditActionUpdated, oldCalling, newCalling)
+		if err := audit.LogAudit(a.DB, orgID, userID, userName,
+			models.ResourceSettingsCalling, orgID, models.AuditActionUpdated, oldCalling, newCalling); err != nil {
+			a.Log.Warn("Failed to record calling settings audit entry", "error", err)
+		}
 	}
 
 	return r.SendEnvelope(map[string]any{

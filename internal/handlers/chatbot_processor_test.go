@@ -606,6 +606,33 @@ func TestSaveIncomingMessage_WithMedia(t *testing.T) {
 	assert.Equal(t, "[image]", dbContact.LastMessagePreview)
 }
 
+func TestSaveIncomingMessage_PersistsFlowResponse(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	waMsgID := "wamid." + uuid.New().String()[:16]
+	flowData := map[string]any{
+		"service_id": "physio-initial",
+		"slot":       "2026-08-03T09:00:00+08:00",
+	}
+	app.saveIncomingMessageWithFlow(
+		account,
+		contact,
+		waMsgID,
+		"nfm_reply",
+		"Appointment request",
+		nil,
+		"",
+		flowData,
+	)
+
+	var msg models.Message
+	require.NoError(t, app.DB.Where("whats_app_message_id = ?", waMsgID).First(&msg).Error)
+	assert.Equal(t, "physio-initial", msg.FlowResponse["service_id"])
+	assert.Equal(t, "2026-08-03T09:00:00+08:00", msg.FlowResponse["slot"])
+}
+
 func TestSaveIncomingMessage_WithReplyContext(t *testing.T) {
 	app := newProcessorTestApp(t)
 	org, account := createProcessorTestOrg(t, app)

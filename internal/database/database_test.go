@@ -2,6 +2,7 @@ package database_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/config"
@@ -164,6 +165,188 @@ func TestSeedSystemRolesForOrg_AdminRoleHasAllPermissions(t *testing.T) {
 
 	totalPerms := len(models.DefaultPermissions())
 	assert.Equal(t, totalPerms, len(perms), "admin role should have all permissions")
+}
+
+func TestFixSystemRolePermissionsAddsOnlyNewExpectedPermissions(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+
+	require.NoError(t, database.SeedPermissionsAndRoles(db))
+	org := models.Organization{
+		BaseModel: models.BaseModel{ID: uuid.New()},
+		Name:      "Role Upgrade Org",
+		Settings:  models.JSONB{},
+	}
+	require.NoError(t, db.Create(&org).Error)
+	require.NoError(t, database.SeedSystemRolesForOrg(db, org.ID))
+
+	var agentRole models.CustomRole
+	require.NoError(t, db.Where(
+		"organization_id = ? AND name = ? AND is_system = ?",
+		org.ID,
+		"agent",
+		true,
+	).First(&agentRole).Error)
+
+	var newlyIntroduced models.Permission
+	require.NoError(t, db.Where(
+		"resource = ? AND action = ?",
+		models.ResourceConversations,
+		models.ActionRead,
+	).First(&newlyIntroduced).Error)
+	require.NoError(t, db.Model(&agentRole).
+		Association("Permissions").
+		Delete(&newlyIntroduced))
+	newPermissionTime := agentRole.UpdatedAt.Add(time.Minute)
+	require.NoError(t, db.Model(&models.Permission{}).
+		Where("id = ?", newlyIntroduced.ID).
+		UpdateColumn("created_at", newPermissionTime).Error)
+
+	require.NoError(t, database.FixSystemRolePermissions(db))
+	assert.True(t, roleHasPermission(
+		t,
+		db,
+		agentRole.ID,
+		models.ResourceConversations,
+		models.ActionRead,
+	), "permission introduced after the role's last update should be added")
+
+	var intentionallyRemoved models.Permission
+	require.NoError(t, db.Where(
+		"resource = ? AND action = ?",
+		models.ResourceCRMLeads,
+		models.ActionRead,
+	).First(&intentionallyRemoved).Error)
+	require.NoError(t, db.Model(&agentRole).
+		Association("Permissions").
+		Delete(&intentionallyRemoved))
+	require.NoError(t, db.Model(&models.CustomRole{}).
+		Where("id = ?", agentRole.ID).
+		UpdateColumn("updated_at", time.Now().UTC().Add(time.Hour)).Error)
+
+	require.NoError(t, database.FixSystemRolePermissions(db))
+	assert.False(t, roleHasPermission(
+		t,
+		db,
+		agentRole.ID,
+		models.ResourceCRMLeads,
+		models.ActionRead,
+	), "an older permission removed after a role update must stay removed")
+}
+
+func roleHasPermission(
+	t *testing.T,
+	db *gorm.DB,
+	roleID uuid.UUID,
+	resource, action string,
+) bool {
+	t.Helper()
+	var count int64
+	require.NoError(t, db.Table("role_permissions AS rp").
+		Joins("JOIN permissions AS p ON p.id = rp.permission_id").
+		Where(
+			"rp.custom_role_id = ? AND p.resource = ? AND p.action = ?",
+			roleID,
+			resource,
+			action,
+		).
+		Count(&count).Error)
+	return count > 0
+}
+
+func TestCreateIndexesEnforcesProductTenantAndLedgerIntegrity(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+	require.NoError(t, database.CreateIndexes(db))
+
+	orgA := testutil.CreateTestOrganization(t, db)
+	orgB := testutil.CreateTestOrganization(t, db)
+	contactA := testutil.CreateTestContact(t, db, orgA.ID)
+	serviceA := models.BookingService{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgA.ID,
+		Name:            "Tenant A service",
+		Kind:            models.BookingServiceKindAppointment,
+		DurationMinutes: 30,
+		DefaultCapacity: 1,
+		Currency:        "MYR",
+		IsActive:        true,
+		Version:         1,
+	}
+	require.NoError(t, db.Create(&serviceA).Error)
+	resourceB := models.BookingResource{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgB.ID,
+		Name:           "Tenant B practitioner",
+		Kind:           models.BookingResourceKindPractitioner,
+		Timezone:       "Asia/Kuala_Lumpur",
+		IsActive:       true,
+		Version:        1,
+	}
+	require.NoError(t, db.Create(&resourceB).Error)
+
+	startsAt := time.Now().UTC().Add(time.Hour)
+	crossTenantEvent := models.BookingEvent{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgA.ID,
+		ServiceID:      serviceA.ID,
+		ResourceID:     resourceB.ID,
+		StartsAt:       startsAt,
+		EndsAt:         startsAt.Add(30 * time.Minute),
+		Capacity:       1,
+		Status:         models.BookingEventStatusScheduled,
+		Version:        1,
+	}
+	err := db.Create(&crossTenantEvent).Error
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fk_booking_events_resource_tenant")
+
+	inconsistentInvoice := models.CommerceInvoice{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgA.ID,
+		ContactID:      contactA.ID,
+		InvoiceNumber:  "INV-INCONSISTENT",
+		Status:         models.CommerceInvoiceStatusOpen,
+		Currency:       "MYR",
+		SubtotalMinor:  1000,
+		TotalMinor:     1000,
+		PaidMinor:      0,
+		DueMinor:       500,
+		Version:        1,
+	}
+	err = db.Create(&inconsistentInvoice).Error
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "chk_commerce_invoices_equation")
+
+	channelB := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    orgB.ID,
+		Channel:           models.ChannelWebChat,
+		Provider:          "native",
+		Name:              "Tenant B web chat",
+		ExternalAccountID: "tenant-b-widget",
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, db.Create(&channelB).Error)
+
+	crossTenantConversation := models.InboxConversation{
+		BaseModel:              models.BaseModel{ID: uuid.New()},
+		OrganizationID:         orgA.ID,
+		ChannelAccountID:       channelB.ID,
+		ContactID:              contactA.ID,
+		Channel:                models.ChannelWebChat,
+		ExternalConversationID: "cross-tenant-thread",
+		Status:                 models.InboxConversationStatusOpen,
+		OpenedAt:               time.Now().UTC(),
+		Config:                 models.JSONB{},
+		Metadata:               models.JSONB{},
+	}
+	err = db.Create(&crossTenantConversation).Error
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fk_inbox_conversations_account_tenant")
 }
 
 // --- CreateDefaultAdmin ---

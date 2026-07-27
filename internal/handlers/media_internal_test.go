@@ -35,6 +35,14 @@ func (s *recordingObjectStore) Get(_ context.Context, key string) ([]byte, strin
 	return append([]byte(nil), data...), "", nil
 }
 
+func (s *recordingObjectStore) Delete(_ context.Context, _ string) error {
+	return nil
+}
+
+func (s *recordingObjectStore) ListPrefix(_ context.Context, _ string) ([]storage.ObjectInfo, error) {
+	return nil, nil
+}
+
 func TestSaveTenantMedia_UsesOrganizationPrefixedObjectKey(t *testing.T) {
 	orgID := uuid.New()
 	store := &recordingObjectStore{}

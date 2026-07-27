@@ -6,6 +6,9 @@ declare module 'vue-router' {
   interface RouteMeta {
     requiresAuth?: boolean
     permission?: string // Resource permission required (e.g., 'analytics', 'chat')
+    permissions?: string[] // Every listed read permission is required.
+    anyPermissions?: string[] // At least one listed read permission is required.
+    entitlement?: string // Product feature entitlement required.
   }
 }
 
@@ -51,6 +54,66 @@ const router = createRouter({
           component: () => import('@/views/chat/ChatView.vue'),
           props: true,
           meta: { permission: 'chat', stableKey: true }
+        },
+        {
+          path: 'launchpad',
+          name: 'launchpad',
+          component: () => import('@/views/launchpad/LaunchpadView.vue'),
+          meta: { permission: 'onboarding' }
+        },
+        {
+          path: 'inbox',
+          name: 'omnichannel-inbox',
+          component: () => import('@/views/channels/ChannelsView.vue'),
+          meta: {
+            permission: 'conversations',
+            permissions: ['conversations', 'channel_accounts'],
+            entitlement: 'omnichannel.enabled'
+          }
+        },
+        {
+          path: 'crm/pipeline',
+          name: 'crm-pipeline',
+          component: () => import('@/views/crm/PipelineView.vue'),
+          meta: {
+            permission: 'crm.leads',
+            permissions: ['crm.leads', 'crm.pipelines'],
+            entitlement: 'crm.enabled'
+          }
+        },
+        {
+          path: 'crm/tasks',
+          name: 'crm-tasks',
+          component: () => import('@/views/crm/TasksView.vue'),
+          meta: { permission: 'tasks', entitlement: 'crm.enabled' }
+        },
+        {
+          path: 'calendar',
+          name: 'booking-calendar',
+          component: () => import('@/views/booking/CalendarView.vue'),
+          meta: {
+            permission: 'bookings',
+            permissions: ['bookings', 'booking.settings'],
+            entitlement: 'bookings.enabled'
+          }
+        },
+        {
+          path: 'commerce',
+          name: 'commerce',
+          component: () => import('@/views/commerce/CommerceView.vue'),
+          meta: {
+            anyPermissions: ['packages', 'payments'],
+            entitlement: 'commerce.enabled'
+          }
+        },
+        {
+          path: 'copilot',
+          name: 'copilot',
+          component: () => import('@/views/copilot/CopilotView.vue'),
+          meta: {
+            permission: 'copilot',
+            entitlement: 'copilot.enabled'
+          }
         },
         {
           path: 'profile',
@@ -288,6 +351,18 @@ const router = createRouter({
           meta: { permission: 'settings.sso' }
         },
         {
+          path: 'settings/privacy',
+          name: 'privacy-center',
+          component: () => import('@/views/settings/TrustCenterView.vue'),
+          meta: { anyPermissions: ['privacy.settings', 'privacy.requests'] }
+        },
+        {
+          path: 'settings/support',
+          name: 'support-center',
+          component: () => import('@/views/settings/TrustCenterView.vue'),
+          meta: { permission: 'support' }
+        },
+        {
           path: 'settings/custom-actions',
           name: 'custom-actions',
           component: () => import('@/views/settings/CustomActionsView.vue'),
@@ -345,10 +420,26 @@ const router = createRouter({
 
 // Navigation items with permissions in priority order (matches AppLayout.vue)
 // Used to find the first accessible route for a user
-const navigationOrder = [
+interface NavigationCandidate {
+  path: string
+  permission?: string
+  permissions?: string[]
+  anyPermissions?: string[]
+  entitlement?: string
+  childPaths?: Array<{ path: string; permission: string }>
+}
+
+const navigationOrder: NavigationCandidate[] = [
   { path: '/resellers', permission: 'resellers' },
+  { path: '/launchpad', permission: 'onboarding' },
   { path: '/', permission: 'analytics' },
+  { path: '/inbox', permissions: ['conversations', 'channel_accounts'], entitlement: 'omnichannel.enabled' },
   { path: '/chat', permission: 'chat' },
+  { path: '/crm/pipeline', permissions: ['crm.leads', 'crm.pipelines'], entitlement: 'crm.enabled' },
+  { path: '/crm/tasks', permission: 'tasks', entitlement: 'crm.enabled' },
+  { path: '/calendar', permissions: ['bookings', 'booking.settings'], entitlement: 'bookings.enabled' },
+  { path: '/commerce', anyPermissions: ['packages', 'payments'], entitlement: 'commerce.enabled' },
+  { path: '/copilot', permission: 'copilot', entitlement: 'copilot.enabled' },
   { path: '/chatbot', permission: 'settings.chatbot', childPaths: [
     { path: '/chatbot', permission: 'settings.chatbot' },
     { path: '/chatbot/keywords', permission: 'chatbot.keywords' },
@@ -379,15 +470,30 @@ const navigationOrder = [
     { path: '/settings/api-keys', permission: 'api_keys' },
     { path: '/settings/webhooks', permission: 'webhooks' },
     { path: '/settings/custom-actions', permission: 'custom_actions' },
-    { path: '/settings/sso', permission: 'settings.sso' }
+    { path: '/settings/sso', permission: 'settings.sso' },
+    { path: '/settings/privacy', permission: 'privacy.settings' },
+    { path: '/settings/privacy', permission: 'privacy.requests' },
+    { path: '/settings/support', permission: 'support' }
   ]}
 ]
 
 // Find the first accessible route for the user
 function getFirstAccessibleRoute(authStore: ReturnType<typeof useAuthStore>): string {
   for (const item of navigationOrder) {
-    // Check if user has permission for this item
-    if (authStore.hasPermission(item.permission, 'read')) {
+    if (item.entitlement && !authStore.hasProductEntitlement(item.entitlement)) {
+      continue
+    }
+    const requiredPermissions = item.permissions ??
+      (item.permission ? [item.permission] : [])
+    const hasAllRequired = requiredPermissions.every(
+      permission => authStore.hasPermission(permission, 'read')
+    )
+    const hasAnyRequired = !item.anyPermissions?.length ||
+      item.anyPermissions.some(permission => authStore.hasPermission(permission, 'read'))
+    const hasDirectRequirement = requiredPermissions.length > 0 ||
+      Boolean(item.anyPermissions?.length)
+
+    if (hasDirectRequirement && hasAllRequired && hasAnyRequired) {
       return item.path
     }
     // Check child paths if available
@@ -417,13 +523,24 @@ router.beforeEach(async (to, _from, next) => {
       }
     }
 
+    await authStore.ensureProductEntitlements()
+
     // Check permission-based access
-    const requiredPermission = to.meta.permission
-    if (requiredPermission) {
-      if (!authStore.hasPermission(requiredPermission, 'read')) {
-        // Redirect to first accessible page
-        return next({ path: getFirstAccessibleRoute(authStore) })
-      }
+    const requiredPermissions = to.meta.permissions ??
+      (to.meta.permission ? [to.meta.permission] : [])
+    const missingRequiredPermission = requiredPermissions.some(
+      permission => !authStore.hasPermission(permission, 'read')
+    )
+    const missingAnyPermission = Boolean(
+      to.meta.anyPermissions?.length &&
+      !to.meta.anyPermissions.some(permission => authStore.hasPermission(permission, 'read'))
+    )
+    if (missingRequiredPermission || missingAnyPermission) {
+      // Redirect to first accessible page
+      return next({ path: getFirstAccessibleRoute(authStore) })
+    }
+    if (to.meta.entitlement && !authStore.hasProductEntitlement(to.meta.entitlement)) {
+      return next({ path: getFirstAccessibleRoute(authStore) })
     }
   } else {
     // Redirect to appropriate page if already logged in

@@ -33,6 +33,7 @@ onMounted(() => {
   if (authStore.isAuthenticated) {
     // Fetch fresh permissions in background (non-destructive — interceptor handles 401)
     authStore.refreshUserData()
+    authStore.ensureProductEntitlements()
 
     wsService.connect(async () => {
       try {
@@ -46,17 +47,26 @@ onMounted(() => {
 })
 
 function filterItems(items: NavSection['items']) {
+  const canAccessItem = (item: NavSection['items'][number]) => {
+    if (item.entitlement && !authStore.hasProductEntitlement(item.entitlement)) {
+      return false
+    }
+    if (item.requiredPermissions && !item.requiredPermissions.every(p => authStore.hasPermission(p, 'read'))) {
+      return false
+    }
+    if (item.anyPermissions && !item.anyPermissions.some(p => authStore.hasPermission(p, 'read'))) {
+      return false
+    }
+    if (item.childPermissions) {
+      return item.childPermissions.some(p => authStore.hasPermission(p, 'read'))
+    }
+    return !item.permission || authStore.hasPermission(item.permission, 'read')
+  }
+
   return items
-    .filter(item => {
-      if (item.childPermissions) {
-        return item.childPermissions.some(p => authStore.hasPermission(p, 'read'))
-      }
-      return !item.permission || authStore.hasPermission(item.permission, 'read')
-    })
+    .filter(canAccessItem)
     .map(item => {
-      const filteredChildren = item.children?.filter(
-        child => !child.permission || authStore.hasPermission(child.permission, 'read')
-      )
+      const filteredChildren = item.children?.filter(canAccessItem)
 
       let effectivePath = item.path
       if (item.childPermissions && item.permission && !authStore.hasPermission(item.permission, 'read') && filteredChildren?.length) {

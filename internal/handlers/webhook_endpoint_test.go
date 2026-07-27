@@ -153,9 +153,33 @@ func makeMessagesPayload(phoneNumberID string) []byte {
 	return b
 }
 
-func TestApp_WebhookHandler_NoSignatureNoAppSecret_Accepted(t *testing.T) {
-	// When no AppSecret is configured for the matching account, the handler must
-	// not reject — it just skips signature verification.
+func makeMultiAccountMessagesPayload(phoneNumberIDs ...string) []byte {
+	entries := make([]map[string]any, 0, len(phoneNumberIDs))
+	for index, phoneNumberID := range phoneNumberIDs {
+		entries = append(entries, map[string]any{
+			"id": "WABA-" + string(rune('A'+index)),
+			"changes": []map[string]any{{
+				"field": "messages",
+				"value": map[string]any{
+					"messaging_product": "whatsapp",
+					"metadata": map[string]any{
+						"display_phone_number": "+1234567890",
+						"phone_number_id":      phoneNumberID,
+					},
+				},
+			}},
+		})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"object": "whatsapp_business_account",
+		"entry":  entries,
+	})
+	return body
+}
+
+func TestApp_WebhookHandler_NoSignatureNoAppSecret_Rejected(t *testing.T) {
+	// No request may be processed when Meta's signature and an app secret are
+	// unavailable.
 	app := newAppForWebhook(t, "")
 	org := testutil.CreateTestOrganization(t, app.DB)
 	acc := &models.WhatsAppAccount{
@@ -178,7 +202,7 @@ func TestApp_WebhookHandler_NoSignatureNoAppSecret_Accepted(t *testing.T) {
 	req.RequestCtx.Request.SetBody(body)
 
 	require.NoError(t, app.WebhookHandler(req))
-	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
 }
 
 func TestApp_WebhookHandler_ValidSignature_Accepted(t *testing.T) {
@@ -243,6 +267,55 @@ func TestApp_WebhookHandler_InvalidSignature_Rejected(t *testing.T) {
 		"invalid signature must be rejected before any processing")
 }
 
+func TestApp_WebhookHandler_OneValidAccountCannotAuthorizeAnother(t *testing.T) {
+	app := newAppForWebhook(t, "")
+	orgA := testutil.CreateTestOrganization(t, app.DB)
+	orgB := testutil.CreateTestOrganization(t, app.DB)
+	secretA := "tenant-a-meta-app-secret"
+	secretB := "tenant-b-meta-app-secret"
+	for _, account := range []models.WhatsAppAccount{
+		{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: orgA.ID,
+			Name:           "mixed-a",
+			PhoneID:        "mixed-phone-a",
+			BusinessID:     "mixed-waba-a",
+			AccessToken:    "token-a",
+			AppSecret:      secretA,
+			APIVersion:     "v18.0",
+			Status:         "active",
+		},
+		{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: orgB.ID,
+			Name:           "mixed-b",
+			PhoneID:        "mixed-phone-b",
+			BusinessID:     "mixed-waba-b",
+			AccessToken:    "token-b",
+			AppSecret:      secretB,
+			APIVersion:     "v18.0",
+			Status:         "active",
+		},
+	} {
+		account := account
+		require.NoError(t, app.DB.Create(&account).Error)
+	}
+
+	body := makeMultiAccountMessagesPayload("mixed-phone-a", "mixed-phone-b")
+	req := testutil.NewRequest(t)
+	req.RequestCtx.Request.Header.SetMethod("POST")
+	req.RequestCtx.Request.Header.SetContentType("application/json")
+	req.RequestCtx.Request.Header.Set(
+		"X-Hub-Signature-256",
+		signWebhook(body, secretA),
+	)
+	req.RequestCtx.Request.SetBody(body)
+
+	require.NoError(t, app.WebhookHandler(req))
+	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req),
+		"one tenant's app secret must not authorize changes for another tenant")
+}
+
 func TestApp_WebhookHandler_MalformedJSONRejected(t *testing.T) {
 	app := newAppForWebhook(t, "")
 
@@ -285,9 +358,11 @@ func TestApp_WebhookHandler_BadlyFormattedSignatureRejected(t *testing.T) {
 	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
 }
 
-func TestApp_WebhookHandler_EmptyEntryAccepted(t *testing.T) {
-	// A payload with no entries should still 200 (no work to do).
+func TestApp_WebhookHandler_EmptyEntryRequiresGlobalSignature(t *testing.T) {
+	// A payload with no account hint can still be verified using the global
+	// Meta app secret.
 	app := newAppForWebhook(t, "")
+	app.Config.WhatsApp.AppSecret = "global-meta-secret"
 
 	body, _ := json.Marshal(map[string]any{
 		"object": "whatsapp_business_account",
@@ -297,6 +372,7 @@ func TestApp_WebhookHandler_EmptyEntryAccepted(t *testing.T) {
 	req := testutil.NewRequest(t)
 	req.RequestCtx.Request.Header.SetMethod("POST")
 	req.RequestCtx.Request.Header.SetContentType("application/json")
+	req.RequestCtx.Request.Header.Set("X-Hub-Signature-256", signWebhook(body, app.Config.WhatsApp.AppSecret))
 	req.RequestCtx.Request.SetBody(body)
 
 	require.NoError(t, app.WebhookHandler(req))

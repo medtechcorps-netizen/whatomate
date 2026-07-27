@@ -2,12 +2,14 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/database"
@@ -59,6 +61,13 @@ func New(cfg *config.Config, db *gorm.DB, rdb *redis.Client, log logf.Logger) (*
 func (w *Worker) Run(ctx context.Context) error {
 	w.Log.Info("Worker starting")
 
+	if err := w.publishHeartbeat(ctx); err != nil {
+		return fmt.Errorf("publish initial worker heartbeat: %w", err)
+	}
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	go w.maintainHeartbeat(heartbeatCtx)
+
 	err := w.Consumer.Consume(ctx, w)
 	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("consumer error: %w", err)
@@ -66,6 +75,34 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	w.Log.Info("Worker stopped")
 	return nil
+}
+
+func (w *Worker) publishHeartbeat(ctx context.Context) error {
+	if w == nil || w.Redis == nil {
+		return errors.New("worker heartbeat requires Redis")
+	}
+	return w.Redis.Set(
+		ctx,
+		queue.WorkerHeartbeatKey,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		queue.WorkerHeartbeatTTL,
+	).Err()
+}
+
+func (w *Worker) maintainHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(queue.WorkerHeartbeatInterval())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := w.publishHeartbeat(ctx); err != nil && ctx.Err() == nil {
+				w.Log.Error("Failed to publish worker heartbeat", "error", err)
+			}
+		}
+	}
 }
 
 // HandleRecipientJob processes a single recipient message job
@@ -171,6 +208,27 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 	// Save message record
 	if err := w.DB.Create(&message).Error; err != nil {
 		w.Log.Error("Failed to save message", "error", err, "recipient", job.PhoneNumber)
+	} else if _, err := channelapi.MirrorLegacyWhatsAppMessage(
+		w.DB,
+		channelapi.LegacyMetaAccountRef{
+			ID:             account.ID,
+			OrganizationID: account.OrganizationID,
+			Name:           account.Name,
+			Status:         account.Status,
+		},
+		message.ID,
+	); err != nil {
+		// Delivery remains authoritative. The idempotent migration backfill can
+		// repair a transient omnichannel mirror failure without resending.
+		w.Log.Error(
+			"Failed to mirror campaign message into omnichannel inbox",
+			"error",
+			err,
+			"organization_id",
+			account.OrganizationID,
+			"message_id",
+			message.ID,
+		)
 	}
 
 	// Check if campaign is complete (all recipients processed)

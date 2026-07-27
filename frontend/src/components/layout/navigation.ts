@@ -22,7 +22,14 @@ import {
   PhoneCall,
   PhoneForwarded,
   ScrollText,
-  Building2
+  Building2,
+  Rocket,
+  Inbox,
+  ListTodo,
+  CalendarDays,
+  Package,
+  LockKeyhole,
+  LifeBuoy
 } from 'lucide-vue-next'
 import type { Component } from 'vue'
 
@@ -31,7 +38,10 @@ export interface NavItem {
   path: string
   icon: Component
   permission?: string
+  requiredPermissions?: string[]
+  anyPermissions?: string[]
   childPermissions?: string[]
+  entitlement?: string
   children?: NavItem[]
 }
 
@@ -59,8 +69,14 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: 'nav.sectionMain',
-    permissions: ['analytics', 'chat'],
+    permissions: ['onboarding', 'analytics', 'conversations', 'chat'],
     items: [
+      {
+        name: 'nav.launchpad',
+        path: '/launchpad',
+        icon: Rocket,
+        permission: 'onboarding'
+      },
       {
         name: 'nav.dashboard',
         path: '/',
@@ -68,11 +84,63 @@ export const navigationSections: NavSection[] = [
         permission: 'analytics'
       },
       {
+        name: 'nav.omnichannel',
+        path: '/inbox',
+        icon: Inbox,
+        permission: 'conversations',
+        requiredPermissions: ['conversations', 'channel_accounts'],
+        entitlement: 'omnichannel.enabled'
+      },
+      {
         name: 'nav.chat',
         path: '/chat',
         icon: MessageSquare,
         permission: 'chat'
       },
+    ]
+  },
+  {
+    label: 'nav.sectionGrowth',
+    permissions: ['crm.leads', 'tasks', 'bookings', 'packages', 'payments', 'copilot'],
+    items: [
+      {
+        name: 'nav.pipeline',
+        path: '/crm/pipeline',
+        icon: Workflow,
+        permission: 'crm.leads',
+        requiredPermissions: ['crm.leads', 'crm.pipelines'],
+        entitlement: 'crm.enabled'
+      },
+      {
+        name: 'nav.tasks',
+        path: '/crm/tasks',
+        icon: ListTodo,
+        permission: 'tasks',
+        entitlement: 'crm.enabled'
+      },
+      {
+        name: 'nav.calendar',
+        path: '/calendar',
+        icon: CalendarDays,
+        permission: 'bookings',
+        requiredPermissions: ['bookings', 'booking.settings'],
+        entitlement: 'bookings.enabled'
+      },
+      {
+        name: 'nav.commerce',
+        path: '/commerce',
+        icon: Package,
+        permission: 'packages',
+        childPermissions: ['packages', 'payments'],
+        entitlement: 'commerce.enabled'
+      },
+      {
+        name: 'nav.copilot',
+        path: '/copilot',
+        icon: Sparkles,
+        permission: 'copilot',
+        entitlement: 'copilot.enabled'
+      }
     ]
   },
   {
@@ -142,7 +210,7 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: '',
-    permissions: ['settings.general', 'settings.chatbot', 'accounts', 'contacts', 'canned_responses', 'tags', 'teams', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs'],
+    permissions: ['settings.general', 'settings.chatbot', 'accounts', 'contacts', 'canned_responses', 'tags', 'teams', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
     pinBottom: true,
     items: [
       {
@@ -150,7 +218,7 @@ export const navigationSections: NavSection[] = [
         path: '/settings',
         icon: Settings,
         permission: 'settings.general',
-        childPermissions: ['settings.general', 'settings.chatbot', 'accounts', 'contacts', 'canned_responses', 'tags', 'teams', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs'],
+        childPermissions: ['settings.general', 'settings.chatbot', 'accounts', 'contacts', 'canned_responses', 'tags', 'teams', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
         children: [
           { name: 'nav.general', path: '/settings', icon: Settings, permission: 'settings.general' },
           { name: 'nav.chatbot', path: '/settings/chatbot', icon: Bot, permission: 'settings.chatbot' },
@@ -165,7 +233,14 @@ export const navigationSections: NavSection[] = [
           { name: 'nav.webhooks', path: '/settings/webhooks', icon: Webhook, permission: 'webhooks' },
           { name: 'nav.customActions', path: '/settings/custom-actions', icon: Zap, permission: 'custom_actions' },
           { name: 'nav.sso', path: '/settings/sso', icon: ShieldCheck, permission: 'settings.sso' },
-          { name: 'nav.auditLogs', path: '/settings/audit-logs', icon: ScrollText, permission: 'audit_logs' }
+          { name: 'nav.auditLogs', path: '/settings/audit-logs', icon: ScrollText, permission: 'audit_logs' },
+          {
+            name: 'nav.privacy',
+            path: '/settings/privacy',
+            icon: LockKeyhole,
+            anyPermissions: ['privacy.settings', 'privacy.requests']
+          },
+          { name: 'nav.support', path: '/settings/support', icon: LifeBuoy, permission: 'support' }
         ]
       }
     ]

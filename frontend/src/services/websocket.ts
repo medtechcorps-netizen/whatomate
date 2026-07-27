@@ -63,6 +63,7 @@ const WS_TYPE_CAMPAIGN_STATS_UPDATE = 'campaign_stats_update'
 
 // Permission types
 const WS_TYPE_PERMISSIONS_UPDATED = 'permissions_updated'
+const WS_TYPE_CHANNEL_SYNC = 'channel_sync'
 
 // Call types
 const WS_TYPE_CALL_INCOMING = 'call_incoming'
@@ -102,6 +103,7 @@ class WebSocketService {
   private isConnected = false
   private hasConnectedBefore = false
   private campaignStatsCallbacks: ((payload: any) => void)[] = []
+  private channelSyncCallbacks: ((payload: any) => void)[] = []
   private getTokenFn: (() => Promise<string | null>) | null = null
 
   async connect(getToken?: () => Promise<string | null>) {
@@ -207,6 +209,9 @@ class WebSocketService {
           break
         case WS_TYPE_PERMISSIONS_UPDATED:
           this.handlePermissionsUpdated()
+          break
+        case WS_TYPE_CHANNEL_SYNC:
+          this.channelSyncCallbacks.forEach((callback) => callback(message.payload))
           break
         case WS_TYPE_CALL_INCOMING:
           this.handleCallIncoming(message.payload)
@@ -533,6 +538,16 @@ class WebSocketService {
     }
   }
 
+  onChannelSync(callback: (payload: any) => void) {
+    this.channelSyncCallbacks.push(callback)
+    return () => {
+      const index = this.channelSyncCallbacks.indexOf(callback)
+      if (index > -1) {
+        this.channelSyncCallbacks.splice(index, 1)
+      }
+    }
+  }
+
   private handleReconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       return
@@ -581,6 +596,7 @@ class WebSocketService {
     // Refresh transfers
     const transfersStore = useTransfersStore()
     transfersStore.fetchTransfers()
+    this.channelSyncCallbacks.forEach((callback) => callback({ reason: 'reconnected' }))
 
     // Show subtle notification
     toast.info('Connection restored', {

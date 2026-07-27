@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -128,13 +129,52 @@ func (a *App) ReadyCheck(r *fastglue.Request) error {
 	}
 
 	// Check Redis connection
-	if err := a.Redis.Ping(r.RequestCtx).Err(); err != nil {
+	if a.Redis == nil {
+		a.Log.Error("Redis client is unavailable")
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Redis connection unavailable",
+			nil,
+			"",
+		)
+	}
+	readinessContext := context.Background()
+	if err := a.Redis.Ping(readinessContext).Err(); err != nil {
 		a.Log.Error("Redis connection error", "error", err)
-		return r.SendErrorEnvelope(500, "Redis connection error", nil, "")
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Redis connection error",
+			nil,
+			"",
+		)
+	}
+
+	heartbeatValue, err := a.Redis.Get(readinessContext, queue.WorkerHeartbeatKey).Result()
+	if err != nil {
+		if !errors.Is(err, redis.Nil) {
+			a.Log.Error("Worker heartbeat lookup failed", "error", err)
+		}
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Worker heartbeat unavailable",
+			nil,
+			"",
+		)
+	}
+	heartbeatAt, err := time.Parse(time.RFC3339Nano, heartbeatValue)
+	if err != nil || time.Since(heartbeatAt) > queue.WorkerHeartbeatTTL {
+		a.Log.Error("Worker heartbeat is invalid or stale", "error", err)
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Worker heartbeat stale",
+			nil,
+			"",
+		)
 	}
 
 	return r.SendEnvelope(map[string]string{
 		"status": "ready",
+		"worker": "ready",
 	})
 }
 
@@ -272,6 +312,38 @@ func (a *App) requireAuth(r *fastglue.Request, resource, action string) (orgID, 
 	if !a.HasPermission(userID, resource, action, orgID) {
 		_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
 		return uuid.Nil, uuid.Nil, errEnvelopeSent
+	}
+	if entitlementKey, licensed := ProductEntitlementKeyForResource(resource); licensed {
+		allowed, entitlementErr := a.HasProductEntitlement(userID, orgID, entitlementKey)
+		if entitlementErr != nil {
+			a.Log.Error(
+				"Failed to evaluate product entitlement",
+				"error",
+				entitlementErr,
+				"organization_id",
+				orgID,
+				"resource",
+				resource,
+				"entitlement",
+				entitlementKey,
+			)
+			_ = r.SendErrorEnvelope(
+				fasthttp.StatusInternalServerError,
+				"Product entitlement could not be evaluated",
+				nil,
+				"",
+			)
+			return uuid.Nil, uuid.Nil, errEnvelopeSent
+		}
+		if !allowed {
+			_ = r.SendErrorEnvelope(
+				fasthttp.StatusPaymentRequired,
+				"Feature is not included in the organization's active plan",
+				nil,
+				"",
+			)
+			return uuid.Nil, uuid.Nil, errEnvelopeSent
+		}
 	}
 	return orgID, userID, nil
 }

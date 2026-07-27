@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/calling"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/frontend"
@@ -142,6 +144,19 @@ func runRLSMigration(args []string) {
 	if err := handlers.BackfillChatbotFlowGraph(db, lo); err != nil {
 		lo.Fatal("Chatbot flow graph backfill failed", "error", err)
 	}
+	legacyMetaStats, err := channelapi.BackfillLegacyWhatsAppInbox(db, 500)
+	if err != nil {
+		lo.Fatal("Legacy WhatsApp omnichannel backfill failed", "error", err)
+	}
+	lo.Info(
+		"Legacy WhatsApp omnichannel backfill complete",
+		"accounts",
+		legacyMetaStats.Accounts,
+		"messages",
+		legacyMetaStats.Messages,
+		"linked",
+		legacyMetaStats.Linked,
+	)
 	if err := database.ApplyTenantRLS(db, cfg.Database.RuntimeRole); err != nil {
 		lo.Fatal("Tenant RLS migration failed", "error", err)
 	}
@@ -229,6 +244,19 @@ func runServer(args []string) {
 		if err := handlers.BackfillChatbotFlowGraph(db, lo); err != nil {
 			lo.Fatal("Chatbot flow graph backfill failed", "error", err)
 		}
+		legacyMetaStats, err := channelapi.BackfillLegacyWhatsAppInbox(db, 500)
+		if err != nil {
+			lo.Fatal("Legacy WhatsApp omnichannel backfill failed", "error", err)
+		}
+		lo.Info(
+			"Legacy WhatsApp omnichannel backfill complete",
+			"accounts",
+			legacyMetaStats.Accounts,
+			"messages",
+			legacyMetaStats.Messages,
+			"linked",
+			legacyMetaStats.Linked,
+		)
 	}
 
 	// Connect to Redis
@@ -378,6 +406,12 @@ func runServer(args []string) {
 					lo.Error("Worker error", "error", err, "worker_num", workerNum)
 				}
 			}()
+			go func() {
+				lo.Info("Channel outbox worker started", "worker_num", workerNum)
+				if err := w.RunChannelOutbox(workerCtx); err != nil && err != context.Canceled {
+					lo.Error("Channel outbox worker error", "error", err, "worker_num", workerNum)
+				}
+			}()
 		}
 		lo.Info("Embedded workers started", "count", *numWorkers)
 	} else {
@@ -486,7 +520,7 @@ func runWorker(args []string) {
 
 	// Create and run workers
 	workers := make([]*worker.Worker, *workerCount)
-	errCh := make(chan error, *workerCount)
+	errCh := make(chan error, *workerCount*2)
 
 	for i := 0; i < *workerCount; i++ {
 		w, err := worker.New(cfg, db, rdb, lo)
@@ -498,6 +532,10 @@ func runWorker(args []string) {
 		go func(workerNum int) {
 			lo.Info("Worker started", "worker_num", workerNum)
 			errCh <- w.Run(ctx)
+		}(i + 1)
+		go func(workerNum int) {
+			lo.Info("Channel outbox worker started", "worker_num", workerNum)
+			errCh <- w.RunChannelOutbox(ctx)
 		}(i + 1)
 	}
 
@@ -586,6 +624,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// Webhook routes (public - for Meta)
 	g.GET("/api/webhook", app.WebhookVerify)
 	g.POST("/api/webhook", app.WebhookHandler)
+	g.POST(
+		"/api/webhooks/channels/{channel_account_id}",
+		app.RelayChannelWebhook,
+	)
 
 	// WebSocket route (auth via message-based flow after upgrade)
 	g.GET("/ws", app.WebSocketHandler)
@@ -602,6 +644,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		if path == "/health" || path == "/ready" ||
 			path == "/api/auth/login" || path == "/api/auth/register" || path == "/api/auth/refresh" ||
 			path == "/api/auth/logout" || path == "/api/webhook" || path == "/ws" {
+			return r
+		}
+		if strings.HasPrefix(path, "/api/webhooks/channels/") {
 			return r
 		}
 		// Skip auth for SSO routes (they handle their own auth via state tokens)
@@ -679,6 +724,48 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST("/api/resellers/{id}/members", app.AddResellerMember)
 	g.DELETE("/api/resellers/{id}/members/{member_id}", app.RemoveResellerMember)
 
+	// Product catalog and manual licensing control plane. These handlers
+	// authorize platform/reseller ownership before entering the target tenant.
+	g.POST("/api/admin/product/plans", app.CreateProductPlan)
+	g.PUT("/api/admin/product/plans/{id}", app.UpdateProductPlan)
+	g.GET(
+		"/api/admin/organizations/{organization_id}/subscription",
+		app.GetOrganizationSubscription,
+	)
+	g.PUT(
+		"/api/admin/organizations/{organization_id}/subscription",
+		app.SetOrganizationSubscription,
+	)
+
+	// Commercial, onboarding, privacy, and support tenant surfaces.
+	g.GET("/api/product/plans", tenant((*handlers.App).ListProductPlans))
+	g.GET("/api/product/subscription", tenant((*handlers.App).GetProductSubscription))
+	g.GET("/api/product/entitlements", tenant((*handlers.App).GetProductEntitlements))
+	g.GET("/api/onboarding", tenant((*handlers.App).GetOnboarding))
+	g.PUT("/api/onboarding/profile", tenant((*handlers.App).UpdateOnboardingProfile))
+	g.POST(
+		"/api/onboarding/steps/{key}/complete",
+		tenant((*handlers.App).CompleteOnboardingStep),
+	)
+	g.GET("/api/workspace-templates", tenant((*handlers.App).ListWorkspaceTemplates))
+	g.POST(
+		"/api/workspace-templates/{key}/apply",
+		tenant((*handlers.App).ApplyWorkspaceTemplate),
+	)
+	g.GET("/api/privacy/settings", tenant((*handlers.App).GetPrivacySettings))
+	g.PUT("/api/privacy/settings", tenant((*handlers.App).UpdatePrivacySettings))
+	g.GET("/api/privacy/consents", tenant((*handlers.App).ListConsentStates))
+	g.POST("/api/privacy/consents", tenant((*handlers.App).RecordConsent))
+	g.GET("/api/privacy/requests", tenant((*handlers.App).ListPrivacyRequests))
+	g.POST("/api/privacy/requests", tenant((*handlers.App).CreatePrivacyRequest))
+	g.PUT("/api/privacy/requests/{id}", tenant((*handlers.App).UpdatePrivacyRequest))
+	g.GET("/api/trust/summary", tenant((*handlers.App).GetTrustQueueSummary))
+	g.GET("/api/support/health", tenant((*handlers.App).GetTenantSupportHealth))
+	g.GET("/api/support/cases", tenant((*handlers.App).ListSupportCases))
+	g.POST("/api/support/cases", tenant((*handlers.App).CreateSupportCase))
+	g.PUT("/api/support/cases/{id}", tenant((*handlers.App).UpdateSupportCase))
+	g.GET("/api/support/recovery", tenant((*handlers.App).GetRecoverySummary))
+
 	// User Management (admin only - enforced by middleware)
 	g.GET("/api/users", tenant((*handlers.App).ListUsers))
 	g.POST("/api/users", tenant((*handlers.App).CreateUser))
@@ -715,6 +802,26 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.PUT("/api/accounts/{id}/business_profile", tenant((*handlers.App).UpdateBusinessProfile))
 	g.POST("/api/accounts/{id}/business_profile/photo", tenant((*handlers.App).UpdateProfilePicture))
 
+	// Provider-neutral channel accounts and shared inbox.
+	g.GET("/api/channel-accounts", tenant((*handlers.App).ListChannelAccounts))
+	g.POST("/api/channel-accounts", tenant((*handlers.App).CreateChannelAccount))
+	g.PUT("/api/channel-accounts/{id}", tenant((*handlers.App).UpdateChannelAccount))
+	g.DELETE("/api/channel-accounts/{id}", tenant((*handlers.App).DeleteChannelAccount))
+	g.POST("/api/channel-accounts/{id}/test", tenant((*handlers.App).TestChannelAccount))
+	g.GET("/api/conversations", tenant((*handlers.App).ListInboxConversations))
+	g.GET(
+		"/api/conversations/{id}/messages",
+		tenant((*handlers.App).GetInboxConversationMessages),
+	)
+	g.POST(
+		"/api/conversations/{id}/messages",
+		tenant((*handlers.App).SendInboxConversationMessage),
+	)
+	g.POST(
+		"/api/conversations/{id}/read",
+		tenant((*handlers.App).MarkInboxConversationRead),
+	)
+
 	// Contacts
 	g.GET("/api/contacts", tenant((*handlers.App).ListContacts))
 	g.POST("/api/contacts", tenant((*handlers.App).CreateContact))
@@ -724,6 +831,67 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.PUT("/api/contacts/{id}/assign", tenant((*handlers.App).AssignContact))
 	g.PUT("/api/contacts/{id}/tags", tenant((*handlers.App).UpdateContactTags))
 	g.GET("/api/contacts/{id}/session-data", tenant((*handlers.App).GetContactSessionData))
+
+	// CRM pipeline and follow-up operations
+	g.GET("/api/crm/pipelines", tenant((*handlers.App).ListCRMPipelines))
+	g.POST("/api/crm/pipelines", tenant((*handlers.App).CreateCRMPipeline))
+	g.POST("/api/crm/pipelines/{pipeline_id}/stages", tenant((*handlers.App).CreateCRMPipelineStage))
+	g.PUT("/api/crm/pipelines/{pipeline_id}/stages/{id}", tenant((*handlers.App).UpdateCRMPipelineStage))
+	g.DELETE("/api/crm/pipelines/{pipeline_id}/stages/{id}", tenant((*handlers.App).DeleteCRMPipelineStage))
+	g.GET("/api/crm/leads", tenant((*handlers.App).ListCRMLeads))
+	g.POST("/api/crm/leads", tenant((*handlers.App).CreateCRMLead))
+	g.GET("/api/crm/leads/{id}", tenant((*handlers.App).GetCRMLead))
+	g.PUT("/api/crm/leads/{id}", tenant((*handlers.App).UpdateCRMLead))
+	g.PUT("/api/crm/leads/{id}/move", tenant((*handlers.App).MoveCRMLead))
+	g.GET("/api/tasks", tenant((*handlers.App).ListFollowUpTasks))
+	g.GET("/api/tasks/summary", tenant((*handlers.App).GetFollowUpTaskSummary))
+	g.POST("/api/tasks", tenant((*handlers.App).CreateFollowUpTask))
+	g.PUT("/api/tasks/{id}", tenant((*handlers.App).UpdateFollowUpTask))
+	g.PUT("/api/tasks/{id}/complete", tenant((*handlers.App).CompleteFollowUpTask))
+	g.PUT("/api/tasks/{id}/reopen", tenant((*handlers.App).ReopenFollowUpTask))
+
+	// Scheduling, packages, invoices, and the append-only payment ledger.
+	g.GET("/api/booking/services", tenant((*handlers.App).ListBookingServices))
+	g.POST("/api/booking/services", tenant((*handlers.App).CreateBookingService))
+	g.PUT("/api/booking/services/{id}", tenant((*handlers.App).UpdateBookingService))
+	g.GET("/api/booking/resources", tenant((*handlers.App).ListBookingResources))
+	g.POST("/api/booking/resources", tenant((*handlers.App).CreateBookingResource))
+	g.PUT("/api/booking/resources/{id}", tenant((*handlers.App).UpdateBookingResource))
+	g.GET("/api/booking/events", tenant((*handlers.App).ListBookingEvents))
+	g.POST("/api/booking/events", tenant((*handlers.App).CreateBookingEvent))
+	g.PUT("/api/booking/events/{id}", tenant((*handlers.App).UpdateBookingEvent))
+	g.GET("/api/bookings", tenant((*handlers.App).ListBookings))
+	g.POST(
+		"/api/booking/events/{id}/bookings",
+		tenant((*handlers.App).CreateBooking),
+	)
+	g.POST(
+		"/api/bookings/{id}/{transition}",
+		tenant((*handlers.App).TransitionBooking),
+	)
+	g.GET("/api/packages", tenant((*handlers.App).ListPackages))
+	g.POST("/api/packages", tenant((*handlers.App).CreatePackage))
+	g.PUT("/api/packages/{id}", tenant((*handlers.App).UpdatePackage))
+	g.GET("/api/contact-packages", tenant((*handlers.App).ListContactPackages))
+	g.POST("/api/contact-packages", tenant((*handlers.App).CreateContactPackage))
+	g.POST("/api/package-sales", tenant((*handlers.App).SellContactPackage))
+	g.GET("/api/invoices", tenant((*handlers.App).ListCommerceInvoices))
+	g.POST("/api/invoices", tenant((*handlers.App).CreateCommerceInvoice))
+	g.GET("/api/commerce/summary", tenant((*handlers.App).GetCommerceSummary))
+	g.POST(
+		"/api/invoices/{id}/payment-intents",
+		tenant((*handlers.App).CreateInvoicePaymentIntent),
+	)
+	g.POST(
+		"/api/invoices/{id}/manual-payments",
+		tenant((*handlers.App).RecordManualInvoicePayment),
+	)
+	g.GET("/api/payments", tenant((*handlers.App).ListPaymentTransactions))
+
+	// Human-in-the-loop Qwen Copilot. Generation never sends a message.
+	g.POST("/api/contacts/{id}/copilot/{task}", tenant((*handlers.App).RunContactCopilot))
+	g.GET("/api/copilot/runs", tenant((*handlers.App).ListCopilotRuns))
+	g.POST("/api/copilot/runs/{id}/feedback", tenant((*handlers.App).CreateCopilotFeedback))
 
 	// Generic Import/Export
 	g.POST("/api/export", tenant((*handlers.App).ExportData))

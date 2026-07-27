@@ -140,6 +140,13 @@ func SetupTestRedis(t *testing.T) *redis.Client {
 			testRedisInitErr = err
 			return
 		}
+		// TEST_REDIS_URL must point to a disposable test database. Clearing it
+		// once per package process keeps webhook idempotency and cache tests
+		// deterministic across repeated local/CI runs.
+		if err := testRedis.FlushDB(ctx).Err(); err != nil {
+			testRedisInitErr = err
+			return
+		}
 	})
 
 	if testRedisInitErr != nil {

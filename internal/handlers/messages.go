@@ -151,6 +151,7 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		a.Log.Error("Failed to create message", "error", err)
 		return nil, fmt.Errorf("failed to create message: %w", err)
 	}
+	a.mirrorLegacyWhatsAppMessage(req.Account, msg.ID)
 
 	// 2. Define the send function based on message type
 	sendFn := func(sendCtx context.Context) (string, error) {

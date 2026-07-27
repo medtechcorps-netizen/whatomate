@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -43,6 +44,24 @@ func (s *memoryObjectStore) Get(_ context.Context, key string) ([]byte, string, 
 		return nil, "", storage.ErrObjectNotFound
 	}
 	return object.data, object.contentType, nil
+}
+
+func (s *memoryObjectStore) Delete(_ context.Context, key string) error {
+	delete(s.objects, key)
+	return nil
+}
+
+func (s *memoryObjectStore) ListPrefix(_ context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	var result []storage.ObjectInfo
+	for key, object := range s.objects {
+		if strings.HasPrefix(key, prefix) {
+			result = append(result, storage.ObjectInfo{
+				Key:  key,
+				Size: int64(len(object.data)),
+			})
+		}
+	}
+	return result, nil
 }
 
 // withStorageDir creates a temp dir, writes the given relative file with content,

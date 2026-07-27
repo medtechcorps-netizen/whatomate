@@ -100,3 +100,32 @@ func TestGenerateQwenResponseUsesDefaultModelWithoutMutatingSettings(t *testing.
 	assert.Equal(t, "qwen3.7-plus", payload["model"])
 	assert.Empty(t, settings.AI.Model)
 }
+
+func TestGenerateQwenResponseRejectsOversizedProviderResponse(t *testing.T) {
+	t.Parallel()
+
+	app := &App{
+		HTTPClient: &http.Client{
+			Transport: qwenRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(strings.Repeat("x", (4<<20)+1))),
+					Request:    request,
+				}, nil
+			}),
+		},
+	}
+	settings := &models.ChatbotSettings{
+		AI: models.AIConfig{
+			APIKey:    "test-api-key",
+			Model:     "qwen3.7-plus",
+			MaxTokens: 500,
+		},
+	}
+
+	_, err := app.generateQwenResponse(settings, nil, "Hello", "")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "response exceeded the size limit")
+}
