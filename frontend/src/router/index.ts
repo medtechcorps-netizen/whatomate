@@ -13,7 +13,9 @@ declare module 'vue-router' {
 }
 
 // Get base path from server-injected config or fallback to Vite's BASE_URL
-const basePath = (window as any).__BASE_PATH__ ?? import.meta.env.BASE_URL ?? '/'
+const injectedBasePath = (window as any).__BASE_PATH__
+const viteBasePath = import.meta.env.BASE_URL === './' ? '/' : import.meta.env.BASE_URL
+const basePath = injectedBasePath ?? viteBasePath ?? '/'
 const normalizedBasePath = basePath.endsWith('/') ? basePath : basePath + '/'
 
 const router = createRouter({
@@ -35,6 +37,27 @@ const router = createRouter({
       path: '/auth/sso/callback',
       name: 'sso-callback',
       component: () => import('@/views/auth/SSOCallbackView.vue'),
+      meta: { requiresAuth: false }
+    },
+    {
+      path: '/privacy',
+      name: 'privacy-policy',
+      component: () => import('@/views/legal/LegalDocumentView.vue'),
+      props: { documentKey: 'privacy' },
+      meta: { requiresAuth: false }
+    },
+    {
+      path: '/terms',
+      name: 'terms-of-service',
+      component: () => import('@/views/legal/LegalDocumentView.vue'),
+      props: { documentKey: 'terms' },
+      meta: { requiresAuth: false }
+    },
+    {
+      path: '/data-deletion',
+      name: 'data-deletion',
+      component: () => import('@/views/legal/LegalDocumentView.vue'),
+      props: { documentKey: 'data-deletion' },
       meta: { requiresAuth: false }
     },
     {
