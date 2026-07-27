@@ -32,25 +32,105 @@ var DirectTenantTables = []string{
 	"agent_transfers",
 	"ai_contexts",
 	"audit_logs",
+	"availability_rules",
+	"billing_accounts",
+	"billing_usage_rollups",
+	"booking_events",
+	"booking_resources",
+	"booking_service_resources",
+	"booking_services",
+	"bookings",
+	"breach_incidents",
 	"bulk_message_campaigns",
 	"canned_responses",
 	"catalog_products",
 	"catalogs",
+	"channel_accounts",
+	"channel_credentials",
 	"chatbot_flows",
 	"chatbot_sessions",
 	"chatbot_settings",
+	"commerce_invoices",
+	"consent_events",
+	"consent_states",
+	"contact_channel_preferences",
+	"contact_identities",
+	"contact_packages",
 	"contacts",
 	"conversation_notes",
+	"conversation_participants",
+	"conversation_reads",
+	"copilot_feedback",
+	"copilot_runs",
+	"copilot_settings",
+	"credit_balances",
+	"credit_ledger_entries",
+	"crm_leads",
+	"crm_pipeline_stages",
+	"crm_pipelines",
+	"crm_stage_history",
+	"entitlement_overrides",
+	"follow_up_tasks",
+	"inbound_events",
+	"inbox_conversations",
+	"invoice_lines",
+	"invoices",
 	"keyword_rules",
+	"legal_holds",
+	"message_events",
+	"message_parts",
 	"messages",
 	"notification_rules",
+	"organization_onboardings",
+	"outbox_events",
+	"outbox_jobs",
+	"package_definitions",
+	"package_entitlements",
+	"payment_intents",
+	"payment_provider_accounts",
+	"payment_transactions",
+	"payment_webhook_events",
+	"privacy_jobs",
+	"privacy_request_events",
+	"privacy_requests",
+	"provisioning_runs",
+	"recovery_checkpoints",
+	"resource_time_off",
+	"retention_policies",
+	"scheduled_jobs",
+	"subscriptions",
+	"support_access_grants",
+	"support_cases",
 	"tags",
 	"templates",
+	"usage_events",
 	"user_availability_logs",
 	"webhooks",
 	"whatsapp_accounts",
 	"whatsapp_flows",
 	"widgets",
+	"workspace_template_applications",
+	"workspace_template_resource_maps",
+}
+
+// DirectTenantTableExemptions lists migrated models that carry an
+// organization_id but must be queried before a tenant transaction exists, or
+// that still have a deliberately separate long-lived runtime lifecycle. The
+// coverage test requires every new organization-scoped migration to be either
+// protected above or explicitly reviewed here with a reason.
+var DirectTenantTableExemptions = map[string]string{
+	"api_keys":               "API key lookup authenticates the request before tenant context exists",
+	"billing_webhook_events": "billing webhook ingestion resolves the tenant from a provider event",
+	"call_logs":              "calling uses a separate long-lived WebRTC database lifecycle",
+	"call_permissions":       "calling uses a separate long-lived WebRTC database lifecycle",
+	"call_transfers":         "calling uses a separate long-lived WebRTC database lifecycle",
+	"custom_actions":         "redirect-token lookup occurs before tenant context exists",
+	"custom_roles":           "role lookup is required to authorize and establish tenant context",
+	"ivr_flows":              "calling uses a separate long-lived WebRTC database lifecycle",
+	"sso_providers":          "SSO discovery occurs before tenant context exists",
+	"teams":                  "team membership participates in authorization before tenant context exists",
+	"user_organizations":     "membership lookup establishes tenant context",
+	"users":                  "user authentication occurs before tenant context exists",
 }
 
 // RelatedTenantTables do not carry organization_id themselves. Their policies
@@ -333,6 +413,8 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		"public.rereply_resolve_whatsapp_org(text)",
 		"public.rereply_resolve_webhook_org(text)",
 		"public.rereply_resolve_waba_orgs(text)",
+		"public.rereply_resolve_channel_org(uuid)",
+		"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamp with time zone)",
 	} {
 		var allowed bool
 		if err := db.Raw(
@@ -416,12 +498,63 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		   FROM public.whatsapp_accounts
 		   WHERE business_id = p_business_id AND deleted_at IS NULL
 		 $function$`,
+		"DROP FUNCTION IF EXISTS public.rereply_resolve_channel_org(text,text,text)",
+		`CREATE OR REPLACE FUNCTION public.rereply_resolve_channel_org(
+		   p_channel_account_id uuid
+		 )
+		 RETURNS uuid
+		 LANGUAGE sql
+		 STABLE
+		 SECURITY DEFINER
+		 SET search_path = pg_catalog, public
+		 AS $function$
+		   SELECT organization_id
+		   FROM public.channel_accounts
+		   WHERE id = p_channel_account_id
+		     AND status IN ('pending', 'active', 'degraded')
+		     AND deleted_at IS NULL
+		 $function$`,
+		`CREATE OR REPLACE FUNCTION public.rereply_ready_channel_outbox_orgs(
+		   p_after uuid,
+		   p_limit integer,
+		   p_stale_before timestamptz
+		 )
+		 RETURNS SETOF uuid
+		 LANGUAGE sql
+		 SECURITY DEFINER
+		 SET search_path = pg_catalog, public
+		 AS $function$
+		   WITH ready AS (
+		     SELECT DISTINCT organization_id
+		     FROM public.outbox_jobs
+		     WHERE deleted_at IS NULL
+		       AND available_at <= clock_timestamp()
+		       AND (
+		         status IN ('pending', 'retrying')
+		         OR (
+		           status = 'processing'
+		           AND (locked_at IS NULL OR locked_at < p_stale_before)
+		         )
+		       )
+		   )
+		   SELECT organization_id
+		   FROM ready
+		   ORDER BY (organization_id > p_after) DESC, organization_id
+		   LIMIT LEAST(GREATEST(p_limit, 1), 100)
+		 $function$`,
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_whatsapp_org(text) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_webhook_org(text) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_waba_orgs(text) FROM PUBLIC",
+		"REVOKE ALL ON FUNCTION public.rereply_resolve_channel_org(uuid) FROM PUBLIC",
+		"REVOKE ALL ON FUNCTION public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz) FROM PUBLIC",
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_whatsapp_org(text) TO %s", runtimeRole),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_webhook_org(text) TO %s", runtimeRole),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_waba_orgs(text) TO %s", runtimeRole),
+		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_channel_org(uuid) TO %s", runtimeRole),
+		fmt.Sprintf(
+			"GRANT EXECUTE ON FUNCTION public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz) TO %s",
+			runtimeRole,
+		),
 	}
 	for _, statement := range statements {
 		if err := tx.Exec(statement).Error; err != nil {
@@ -462,6 +595,9 @@ func RemoveTenantRLS(db *gorm.DB) error {
 			"public.rereply_resolve_whatsapp_org(text)",
 			"public.rereply_resolve_webhook_org(text)",
 			"public.rereply_resolve_waba_orgs(text)",
+			"public.rereply_resolve_channel_org(uuid)",
+			"public.rereply_resolve_channel_org(text,text,text)",
+			"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz)",
 		} {
 			if err := tx.Exec("DROP FUNCTION IF EXISTS " + signature).Error; err != nil {
 				return err

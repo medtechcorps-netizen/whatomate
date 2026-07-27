@@ -175,27 +175,12 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid payload", nil, "")
 	}
 
-	// Verify webhook signature before processing any fields.
-	// Find a phoneNumberID from any change to look up the account's AppSecret.
-	if len(signature) > 0 {
-		for _, entry := range payload.Entry {
-			for _, change := range entry.Changes {
-				phoneNumberID := change.Value.Metadata.PhoneNumberID
-				if phoneNumberID == "" {
-					continue
-				}
-				account, err := a.getWhatsAppAccountCached(phoneNumberID)
-				if err != nil || account.AppSecret == "" {
-					continue
-				}
-				if !verifyWebhookSignature(body, signature, []byte(account.AppSecret)) {
-					a.Log.Warn("Invalid webhook signature", "phone_id", phoneNumberID)
-					return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Invalid signature", nil, "")
-				}
-				a.Log.Debug("Webhook signature verified successfully")
-				break
-			}
-		}
+	// Meta signs every webhook POST. Verification is fail-closed: a missing
+	// header, an unknown account, or an account without a usable app secret is
+	// rejected before any event can be dispatched.
+	if !a.verifyMetaWebhookPayload(body, signature, &payload) {
+		a.Log.Warn("Invalid or unverifiable webhook signature")
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Invalid signature", nil, "")
 	}
 
 	// Process each entry
@@ -592,6 +577,103 @@ func (a *App) processTemplateStatusUpdate(wabaID, event, templateName, templateL
 	}
 }
 
+// verifyMetaWebhookPayload checks the configured platform secret first. When a
+// platform secret is unavailable, every change that would be dispatched must
+// resolve to an account (or WABA) whose app secret validates the entire body.
+//
+// It is not sufficient for any one referenced account to validate: a caller
+// with one tenant's app secret could otherwise append forged changes for a
+// different tenant and have the payload-wide signature accepted.
+func (a *App) verifyMetaWebhookPayload(body, signature []byte, payload *WebhookPayload) bool {
+	if len(signature) == 0 || payload == nil {
+		return false
+	}
+
+	if a.Config != nil && a.Config.WhatsApp.AppSecret != "" &&
+		verifyWebhookSignature(body, signature, []byte(a.Config.WhatsApp.AppSecret)) {
+		return true
+	}
+
+	verifiedAnyTarget := false
+	verifiedPhoneIDs := make(map[string]bool)
+	verifiedWABAIDs := make(map[string]bool)
+	for _, entry := range payload.Entry {
+		for _, change := range entry.Changes {
+			verifiedAnyTarget = true
+			phoneNumberID := strings.TrimSpace(change.Value.Metadata.PhoneNumberID)
+			if phoneNumberID != "" {
+				verified, checked := verifiedPhoneIDs[phoneNumberID]
+				if !checked {
+					account, err := a.getWhatsAppAccountCached(phoneNumberID)
+					verified = err == nil &&
+						account.AppSecret != "" &&
+						verifyWebhookSignature(body, signature, []byte(account.AppSecret))
+					verifiedPhoneIDs[phoneNumberID] = verified
+				}
+				if !verified {
+					return false
+				}
+				continue
+			}
+
+			wabaID := strings.TrimSpace(entry.ID)
+			if wabaID == "" {
+				return false
+			}
+			verified, checked := verifiedWABAIDs[wabaID]
+			if !checked {
+				verified = a.verifyMetaWABAPayload(body, signature, wabaID)
+				verifiedWABAIDs[wabaID] = verified
+			}
+			if !verified {
+				return false
+			}
+		}
+	}
+
+	return verifiedAnyTarget
+}
+
+// verifyMetaWABAPayload validates all accounts that a WABA-only event would
+// update. Requiring every resolved account to share the signing authority keeps
+// processTemplateStatusUpdate from crossing an app-secret boundary.
+func (a *App) verifyMetaWABAPayload(body, signature []byte, wabaID string) bool {
+	organizationIDs, err := a.resolveWABAOrganizations(wabaID)
+	if err != nil || len(organizationIDs) == 0 {
+		return false
+	}
+
+	verifiedAccounts := 0
+	for _, organizationID := range organizationIDs {
+		tenantVerified := false
+		if err := a.WithTenantApp(organizationID, func(scoped *App) error {
+			var accounts []models.WhatsAppAccount
+			if err := scoped.DB.Where("business_id = ?", wabaID).Find(&accounts).Error; err != nil {
+				return err
+			}
+			encryptionKey := ""
+			if scoped.Config != nil {
+				encryptionKey = scoped.Config.App.EncryptionKey
+			}
+			for i := range accounts {
+				accounts[i].DecryptSecrets(encryptionKey)
+				if accounts[i].AppSecret == "" ||
+					!verifyWebhookSignature(body, signature, []byte(accounts[i].AppSecret)) {
+					return nil
+				}
+			}
+			if len(accounts) > 0 {
+				tenantVerified = true
+				verifiedAccounts += len(accounts)
+			}
+			return nil
+		}); err != nil || !tenantVerified {
+			return false
+		}
+	}
+	return verifiedAccounts > 0
+}
+
 // verifyWebhookSignature verifies the X-Hub-Signature-256 header from Meta.
 // The signature is HMAC-SHA256 of the request body using the App Secret.
 func verifyWebhookSignature(body, signature, appSecret []byte) bool {
@@ -774,6 +856,7 @@ func (a *App) processMessageEcho(phoneNumberID string, msg IncomingTextMessage) 
 		"is_read":              true, // Echoes from mobile app are outgoing, so conversation is read
 		"whats_app_account":    account.Name,
 	})
+	a.mirrorLegacyWhatsAppMessage(account, message.ID)
 
 	// Broadcast new message via WebSocket to keep UI updated
 	a.broadcastNewMessage(account.OrganizationID, &message, contact)

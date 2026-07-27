@@ -191,7 +191,7 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 	if msg.Context != nil && msg.Context.ID != "" {
 		replyToWAMID = msg.Context.ID
 	}
-	a.saveIncomingMessage(account, contact, msg.ID, messageType, messageText, mediaInfo, replyToWAMID)
+	a.saveIncomingMessageWithFlow(account, contact, msg.ID, messageType, messageText, mediaInfo, replyToWAMID, flowResponseData)
 
 	// Clear chatbot tracking since client has replied
 	a.ClearContactChatbotTracking(contact.ID)
@@ -1012,7 +1012,14 @@ func (a *App) generateOpenAICompatibleResponse(providerName, url string, setting
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(resp.Body)
+	const maxAIResponseBytes = 4 << 20
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAIResponseBytes+1))
+	if readErr != nil {
+		return "", fmt.Errorf("failed to read %s response: %w", providerName, readErr)
+	}
+	if len(body) > maxAIResponseBytes {
+		return "", fmt.Errorf("%s response exceeded the size limit", providerName)
+	}
 
 	if resp.StatusCode != 200 {
 		var errResp struct {
@@ -1591,6 +1598,14 @@ type MediaInfo struct {
 
 // saveIncomingMessage saves an incoming message to the messages table
 func (a *App) saveIncomingMessage(account *models.WhatsAppAccount, contact *models.Contact, whatsappMsgID, msgType, content string, mediaInfo *MediaInfo, replyToWAMID string) {
+	a.saveIncomingMessageWithFlow(account, contact, whatsappMsgID, msgType, content, mediaInfo, replyToWAMID, nil)
+}
+
+// saveIncomingMessageWithFlow persists the normalized WhatsApp Flow response
+// together with the message. Keeping the submitted fields on the immutable
+// inbound record is required for idempotent booking and CRM actions; session
+// data alone can be overwritten by later chatbot steps.
+func (a *App) saveIncomingMessageWithFlow(account *models.WhatsAppAccount, contact *models.Contact, whatsappMsgID, msgType, content string, mediaInfo *MediaInfo, replyToWAMID string, flowResponseData map[string]any) {
 	now := time.Now()
 
 	message := models.Message{
@@ -1603,6 +1618,9 @@ func (a *App) saveIncomingMessage(account *models.WhatsAppAccount, contact *mode
 		MessageType:       models.MessageType(msgType),
 		Content:           content,
 		Status:            models.MessageStatusReceived,
+	}
+	if len(flowResponseData) > 0 {
+		message.FlowResponse = models.JSONB(flowResponseData)
 	}
 
 	// Handle reply context - look up the original message by WhatsApp message ID
@@ -1654,6 +1672,7 @@ func (a *App) saveIncomingMessage(account *models.WhatsAppAccount, contact *mode
 		"whats_app_account":    account.Name,
 		"last_inbound_at":      now,
 	})
+	a.mirrorLegacyWhatsAppMessage(account, message.ID)
 
 	a.Log.Info("Saved incoming message", "message_id", message.ID, "contact_id", contact.ID, "media_url", message.MediaURL)
 

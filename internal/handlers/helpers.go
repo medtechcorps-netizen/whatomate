@@ -101,7 +101,9 @@ func findByIDAndOrg[T any](db *gorm.DB, r *fastglue.Request, id, orgID uuid.UUID
 // actor's display name automatically. It wraps audit.LogAudit to remove the
 // repeated a.DB + GetUserName boilerplate at call sites.
 func (a *App) logAudit(orgID, userID uuid.UUID, resourceType string, resourceID uuid.UUID, action models.AuditAction, oldData, newData any, extraChanges ...map[string]any) {
-	audit.LogAudit(a.DB, orgID, userID, audit.GetUserName(a.DB, userID), resourceType, resourceID, action, oldData, newData, extraChanges...)
+	if err := audit.LogAudit(a.DB, orgID, userID, audit.GetUserName(a.DB, userID), resourceType, resourceID, action, oldData, newData, extraChanges...); err != nil {
+		a.Log.Error("Failed to create audit log", "error", err, "resource_type", resourceType, "resource_id", resourceID)
+	}
 }
 
 // listEnvelope builds the standard paginated list response payload used across

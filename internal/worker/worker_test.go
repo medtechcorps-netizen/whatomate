@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/config"
@@ -37,6 +38,31 @@ func testWorker(t *testing.T) *Worker {
 	}
 
 	return w
+}
+
+func TestWorkerPublishHeartbeatCreatesFreshLease(t *testing.T) {
+	rdb := testutil.SetupTestRedis(t)
+	if rdb == nil {
+		t.Skip("TEST_REDIS_URL not set")
+	}
+	ctx := context.Background()
+	require.NoError(t, rdb.Del(ctx, queue.WorkerHeartbeatKey).Err())
+	t.Cleanup(func() {
+		_ = rdb.Del(ctx, queue.WorkerHeartbeatKey).Err()
+	})
+
+	w := &Worker{Redis: rdb}
+	require.NoError(t, w.publishHeartbeat(ctx))
+
+	value, err := rdb.Get(ctx, queue.WorkerHeartbeatKey).Result()
+	require.NoError(t, err)
+	heartbeatAt, err := time.Parse(time.RFC3339Nano, value)
+	require.NoError(t, err)
+	assert.WithinDuration(t, time.Now().UTC(), heartbeatAt, 5*time.Second)
+	ttl, err := rdb.TTL(ctx, queue.WorkerHeartbeatKey).Result()
+	require.NoError(t, err)
+	assert.Positive(t, ttl)
+	assert.LessOrEqual(t, ttl, queue.WorkerHeartbeatTTL)
 }
 
 // getOrCreateTestPermissions gets existing permissions or creates them for testing.

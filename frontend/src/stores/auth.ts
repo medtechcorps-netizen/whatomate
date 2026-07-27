@@ -44,6 +44,10 @@ export interface AuthState {
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<User | null>(null)
   const breakStartedAt = ref<string | null>(null)
+  const productEntitlements = ref<Record<string, unknown>>({})
+  const productEntitlementMode = ref('unlicensed')
+  const productEntitlementsLoaded = ref(false)
+  let productEntitlementsRequest: Promise<boolean> | null = null
 
   const isAuthenticated = computed(() => !!user.value)
   const userRole = computed(() => user.value?.role?.name || 'agent')
@@ -53,11 +57,13 @@ export const useAuthStore = defineStore('auth', () => {
 
   function setAuth(authData: { user: User }) {
     user.value = authData.user
+    resetProductEntitlements()
     localStorage.setItem('user', JSON.stringify(authData.user))
   }
 
   function clearAuth() {
     user.value = null
+    resetProductEntitlements()
 
     // Clean up localStorage (including legacy token keys)
     localStorage.removeItem('user')
@@ -90,6 +96,7 @@ export const useAuthStore = defineStore('auth', () => {
           return false
         }
         user.value = parsed
+        resetProductEntitlements()
         return true
       } catch {
         clearAuth()
@@ -186,6 +193,60 @@ export const useAuthStore = defineStore('auth', () => {
     return permissions.some(p => p.resource === resource && p.action === action)
   }
 
+  function resetProductEntitlements() {
+    productEntitlements.value = {}
+    productEntitlementMode.value = 'unlicensed'
+    productEntitlementsLoaded.value = false
+    productEntitlementsRequest = null
+  }
+
+  function entitlementValueAllows(value: unknown): boolean {
+    if (typeof value === 'boolean') return value
+    if (typeof value === 'number') return Number.isFinite(value) && value > 0
+    if (typeof value === 'string') {
+      return ['true', 'enabled', 'yes', '1'].includes(value.trim().toLowerCase())
+    }
+    return false
+  }
+
+  function hasProductEntitlement(key?: string): boolean {
+    if (!key) return true
+    if (!productEntitlementsLoaded.value) return false
+    return entitlementValueAllows(productEntitlements.value[key])
+  }
+
+  async function fetchProductEntitlements(): Promise<boolean> {
+    try {
+      const response = await api.get('/product/entitlements')
+      const payload = response.data?.data ?? response.data ?? {}
+      productEntitlements.value =
+        payload.entitlements && typeof payload.entitlements === 'object'
+          ? payload.entitlements
+          : {}
+      productEntitlementMode.value =
+        typeof payload.mode === 'string' ? payload.mode : 'unlicensed'
+      productEntitlementsLoaded.value = true
+      return true
+    } catch {
+      // Licensing is fail-closed. Core modules remain usable, while routes
+      // that require an explicit product entitlement stay unavailable.
+      productEntitlements.value = {}
+      productEntitlementMode.value = 'unavailable'
+      productEntitlementsLoaded.value = true
+      return false
+    }
+  }
+
+  async function ensureProductEntitlements(): Promise<boolean> {
+    if (productEntitlementsLoaded.value) return true
+    if (!productEntitlementsRequest) {
+      productEntitlementsRequest = fetchProductEntitlements().finally(() => {
+        productEntitlementsRequest = null
+      })
+    }
+    return productEntitlementsRequest
+  }
+
   return {
     user,
     breakStartedAt,
@@ -194,6 +255,9 @@ export const useAuthStore = defineStore('auth', () => {
     organizationId,
     userSettings,
     isAvailable,
+    productEntitlements,
+    productEntitlementMode,
+    productEntitlementsLoaded,
     setAuth,
     clearAuth,
     restoreSession,
@@ -204,6 +268,9 @@ export const useAuthStore = defineStore('auth', () => {
     switchOrg,
     logout,
     setAvailability,
-    hasPermission
+    hasPermission,
+    hasProductEntitlement,
+    fetchProductEntitlements,
+    ensureProductEntitlements
   }
 })

@@ -126,6 +126,82 @@ func GetMigrationModels() []MigrationModel {
 		{"CallTransfer", &models.CallTransfer{}},
 		{"CallPermission", &models.CallPermission{}},
 		{"AuditLog", &models.AuditLog{}},
+
+		// Commercial control plane
+		{"Plan", &models.Plan{}},
+		{"PlanPrice", &models.PlanPrice{}},
+		{"PlanEntitlement", &models.PlanEntitlement{}},
+		{"BillingAccount", &models.BillingAccount{}},
+		{"Subscription", &models.Subscription{}},
+		{"Invoice", &models.Invoice{}},
+		{"BillingWebhookEvent", &models.BillingWebhookEvent{}},
+		{"EntitlementOverride", &models.EntitlementOverride{}},
+		{"UsageEvent", &models.UsageEvent{}},
+		{"BillingUsageRollup", &models.BillingUsageRollup{}},
+
+		// Onboarding and workspace templates
+		{"OrganizationOnboarding", &models.OrganizationOnboarding{}},
+		{"ProvisioningRun", &models.ProvisioningRun{}},
+		{"WorkspaceTemplate", &models.WorkspaceTemplate{}},
+		{"WorkspaceTemplateVersion", &models.WorkspaceTemplateVersion{}},
+		{"WorkspaceTemplateApplication", &models.WorkspaceTemplateApplication{}},
+		{"WorkspaceTemplateResourceMap", &models.WorkspaceTemplateResourceMap{}},
+
+		// Privacy, compliance, and support
+		{"ConsentEvent", &models.ConsentEvent{}},
+		{"ConsentState", &models.ConsentState{}},
+		{"RetentionPolicy", &models.RetentionPolicy{}},
+		{"PrivacyRequest", &models.PrivacyRequest{}},
+		{"PrivacyRequestEvent", &models.PrivacyRequestEvent{}},
+		{"PrivacyJob", &models.PrivacyJob{}},
+		{"LegalHold", &models.LegalHold{}},
+		{"BreachIncident", &models.BreachIncident{}},
+		{"SupportAccessGrant", &models.SupportAccessGrant{}},
+		{"SupportCase", &models.SupportCase{}},
+		{"RecoveryCheckpoint", &models.RecoveryCheckpoint{}},
+
+		// CRM, scheduling, commerce, and Qwen Copilot
+		{"ScheduledJob", &models.ScheduledJob{}},
+		{"OutboxEvent", &models.OutboxEvent{}},
+		{"CRMPipeline", &models.CRMPipeline{}},
+		{"CRMPipelineStage", &models.CRMPipelineStage{}},
+		{"CRMLead", &models.CRMLead{}},
+		{"CRMStageHistory", &models.CRMStageHistory{}},
+		{"FollowUpTask", &models.FollowUpTask{}},
+		{"BookingService", &models.BookingService{}},
+		{"BookingResource", &models.BookingResource{}},
+		{"BookingServiceResource", &models.BookingServiceResource{}},
+		{"AvailabilityRule", &models.AvailabilityRule{}},
+		{"ResourceTimeOff", &models.ResourceTimeOff{}},
+		{"BookingEvent", &models.BookingEvent{}},
+		{"Booking", &models.Booking{}},
+		{"PackageDefinition", &models.PackageDefinition{}},
+		{"PackageEntitlement", &models.PackageEntitlement{}},
+		{"ContactPackage", &models.ContactPackage{}},
+		{"CreditBalance", &models.CreditBalance{}},
+		{"CreditLedgerEntry", &models.CreditLedgerEntry{}},
+		{"CommerceInvoice", &models.CommerceInvoice{}},
+		{"InvoiceLine", &models.InvoiceLine{}},
+		{"PaymentProviderAccount", &models.PaymentProviderAccount{}},
+		{"PaymentIntent", &models.PaymentIntent{}},
+		{"PaymentTransaction", &models.PaymentTransaction{}},
+		{"PaymentWebhookEvent", &models.PaymentWebhookEvent{}},
+		{"CopilotSettings", &models.CopilotSettings{}},
+		{"CopilotRun", &models.CopilotRun{}},
+		{"CopilotFeedback", &models.CopilotFeedback{}},
+
+		// Provider-neutral omnichannel inbox
+		{"ChannelAccount", &models.ChannelAccount{}},
+		{"ChannelCredential", &models.ChannelCredential{}},
+		{"ContactIdentity", &models.ContactIdentity{}},
+		{"InboxConversation", &models.InboxConversation{}},
+		{"ConversationParticipant", &models.ConversationParticipant{}},
+		{"ConversationRead", &models.ConversationRead{}},
+		{"MessagePart", &models.MessagePart{}},
+		{"InboundEvent", &models.InboundEvent{}},
+		{"MessageEvent", &models.MessageEvent{}},
+		{"OutboxJob", &models.OutboxJob{}},
+		{"ContactChannelPreference", &models.ContactChannelPreference{}},
 	}
 }
 
@@ -248,7 +324,7 @@ func repeatChar(char string, n int) string {
 
 // getIndexes returns all index creation SQL statements
 func getIndexes() []string {
-	return []string{
+	indexes := []string{
 		// Expand phone_number columns to support group JIDs (e.g., 120363422675615917@g.us)
 		`ALTER TABLE contacts ALTER COLUMN phone_number TYPE varchar(50)`,
 		`ALTER TABLE chatbot_sessions ALTER COLUMN phone_number TYPE varchar(50)`,
@@ -302,7 +378,50 @@ func getIndexes() []string {
 		// IVR flows
 		`CREATE INDEX IF NOT EXISTS idx_ivr_flows_org_active ON ivr_flows(organization_id, whatsapp_account, is_active)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_ivr_flows_org_call_start ON ivr_flows(organization_id, whatsapp_account) WHERE is_call_start = true AND is_active = true AND deleted_at IS NULL`,
+		// Commercial subscriptions, onboarding, privacy, and support
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_org_live ON subscriptions(organization_id) WHERE status IN ('incomplete', 'trialing', 'active', 'past_due', 'paused') AND deleted_at IS NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_org_number ON invoices(organization_id, number) WHERE number <> '' AND deleted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_privacy_requests_org_queue ON privacy_requests(organization_id, status, due_at, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_privacy_jobs_org_due ON privacy_jobs(organization_id, status, next_attempt_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_support_cases_org_queue ON support_cases(organization_id, status, priority, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_recovery_checkpoints_org_created ON recovery_checkpoints(organization_id, created_at DESC)`,
+		// CRM, follow-ups, booking, packages, and payments
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_pipelines_org_default ON crm_pipelines(organization_id) WHERE is_default = true AND is_active = true AND deleted_at IS NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_pipeline_stages_order ON crm_pipeline_stages(pipeline_id, display_order) WHERE deleted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_crm_leads_org_board ON crm_leads(organization_id, pipeline_id, stage_id, status, updated_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_follow_up_tasks_org_due ON follow_up_tasks(organization_id, status, due_at, priority)`,
+		`CREATE INDEX IF NOT EXISTS idx_booking_events_org_window ON booking_events(organization_id, resource_id, starts_at, ends_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_bookings_org_event_status ON bookings(organization_id, event_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_contact_packages_org_contact ON contact_packages(organization_id, contact_id, status, expires_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_commerce_invoices_org_queue ON commerce_invoices(organization_id, status, due_at, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_payment_transactions_org_created ON payment_transactions(organization_id, status, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_copilot_runs_org_contact ON copilot_runs(organization_id, contact_id, created_at DESC)`,
+		// Provider-neutral inbox
+		`CREATE INDEX IF NOT EXISTS idx_messages_inbox_conversation ON messages(inbox_conversation_id, created_at DESC) WHERE inbox_conversation_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_inbox_conversations_org_queue ON inbox_conversations(organization_id, status, priority DESC, last_message_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_inbound_events_processing ON inbound_events(status, next_attempt_at, received_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_outbox_jobs_processing ON outbox_jobs(status, available_at, priority DESC)`,
+		// Domain invariants that GORM's string-backed enums cannot express.
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_booking_events_window') THEN
+				ALTER TABLE booking_events ADD CONSTRAINT chk_booking_events_window CHECK (ends_at > starts_at AND capacity > 0);
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_package_definitions_money') THEN
+				ALTER TABLE package_definitions ADD CONSTRAINT chk_package_definitions_money CHECK (price_minor >= 0 AND validity_days > 0);
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_commerce_invoices_amounts') THEN
+				ALTER TABLE commerce_invoices ADD CONSTRAINT chk_commerce_invoices_amounts CHECK (
+					subtotal_minor >= 0 AND discount_minor >= 0 AND tax_minor >= 0 AND
+					total_minor >= 0 AND paid_minor >= 0 AND due_minor >= 0
+				);
+			END IF;
+		END $$`,
 	}
+	return append(indexes, productIntegrityStatements()...)
 }
 
 // CreateIndexes creates additional indexes not handled by GORM tags
@@ -557,7 +676,12 @@ func SeedSystemRolesForAllOrgs(db *gorm.DB) error {
 	return nil
 }
 
-// FixSystemRolePermissions links permissions to existing system roles that have no permissions
+// FixSystemRolePermissions links permissions to existing system roles.
+//
+// Empty roles receive their complete system definition. Existing roles receive
+// only expected permissions that were introduced after the role was last
+// updated. This upgrades older organizations without restoring permissions a
+// platform owner deliberately removed from a system role later.
 func FixSystemRolePermissions(db *gorm.DB) error {
 	// Get all permissions from database
 	var permissions []models.Permission
@@ -585,31 +709,47 @@ func FixSystemRolePermissions(db *gorm.DB) error {
 	}
 
 	for _, role := range systemRoles {
-		// Check if role has permissions
-		var permCount int64
-		db.Table("role_permissions").Where("custom_role_id = ?", role.ID).Count(&permCount)
-
-		if permCount > 0 {
-			continue // Already has permissions, don't overwrite customizations
-		}
-
-		// Get the permission keys for this role
 		permKeys, ok := rolePermissions[role.Name]
 		if !ok {
 			continue // Unknown role name
 		}
 
-		// Link permissions to role
+		var currentPermissions []models.Permission
+		if err := db.Model(&role).
+			Association("Permissions").
+			Find(&currentPermissions); err != nil {
+			return fmt.Errorf("failed to load permissions for role %s: %w", role.Name, err)
+		}
+		currentPermissionIDs := make(map[uuid.UUID]struct{}, len(currentPermissions))
+		for _, permission := range currentPermissions {
+			currentPermissionIDs[permission.ID] = struct{}{}
+		}
+
+		// An empty role is repaired in full. A populated role receives only
+		// permissions created at or after its last explicit update.
 		var permsToAdd []models.Permission
 		for _, key := range permKeys {
-			if perm, ok := permMap[key]; ok {
-				permsToAdd = append(permsToAdd, perm)
+			permission, exists := permMap[key]
+			if !exists {
+				continue
+			}
+			if _, exists := currentPermissionIDs[permission.ID]; exists {
+				continue
+			}
+			if len(currentPermissions) == 0 ||
+				!permission.CreatedAt.Before(role.UpdatedAt) {
+				permsToAdd = append(permsToAdd, permission)
 			}
 		}
 
 		if len(permsToAdd) > 0 {
-			if err := db.Model(&role).Association("Permissions").Replace(permsToAdd); err != nil {
+			if err := db.Model(&role).Association("Permissions").Append(permsToAdd); err != nil {
 				return fmt.Errorf("failed to link permissions to role %s: %w", role.Name, err)
+			}
+			if err := db.Model(&models.CustomRole{}).
+				Where("id = ?", role.ID).
+				UpdateColumn("updated_at", time.Now().UTC()).Error; err != nil {
+				return fmt.Errorf("failed to record permission upgrade for role %s: %w", role.Name, err)
 			}
 		}
 	}

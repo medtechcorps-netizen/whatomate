@@ -23,6 +23,17 @@ var ErrObjectNotFound = errors.New("object not found")
 type ObjectStore interface {
 	Put(ctx context.Context, key string, data []byte, contentType string) error
 	Get(ctx context.Context, key string) ([]byte, string, error)
+	Delete(ctx context.Context, key string) error
+	ListPrefix(ctx context.Context, prefix string) ([]ObjectInfo, error)
+}
+
+// ObjectInfo is the minimum provider-neutral metadata needed by privacy
+// exports, retention jobs, and recovery checks.
+type ObjectInfo struct {
+	Key          string    `json:"key"`
+	Size         int64     `json:"size"`
+	LastModified time.Time `json:"last_modified"`
+	ETag         string    `json:"etag,omitempty"`
 }
 
 // S3Client provides S3-compatible object storage operations.
@@ -95,6 +106,44 @@ func (s *S3Client) Get(ctx context.Context, key string) ([]byte, string, error) 
 		contentType = *result.ContentType
 	}
 	return data, contentType, nil
+}
+
+// Delete removes one object. S3 deletion is idempotent, which lets privacy and
+// retention jobs retry safely after partial failure.
+func (s *S3Client) Delete(ctx context.Context, key string) error {
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	return err
+}
+
+// ListPrefix returns all objects under a tenant-scoped prefix.
+func (s *S3Client) ListPrefix(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	var objects []ObjectInfo
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range page.Contents {
+			info := ObjectInfo{
+				Key:  aws.ToString(item.Key),
+				Size: aws.ToInt64(item.Size),
+				ETag: aws.ToString(item.ETag),
+			}
+			if item.LastModified != nil {
+				info.LastModified = *item.LastModified
+			}
+			objects = append(objects, info)
+		}
+	}
+	return objects, nil
 }
 
 // GetPresignedURL returns a time-limited download URL for the given S3 key.

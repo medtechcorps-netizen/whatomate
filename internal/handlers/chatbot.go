@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -471,6 +472,15 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		settings.ClientInactivity.AutoCloseMessage = *req.ClientAutoCloseMessage
 	}
 
+	encryptionKey := ""
+	if a.Config != nil {
+		encryptionKey = a.Config.App.EncryptionKey
+	}
+	if err := appcrypto.EncryptFields(encryptionKey, &settings.AI.APIKey); err != nil {
+		a.Log.Error("Failed to encrypt AI credentials", "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to secure AI credentials", nil, "")
+	}
+
 	if err := a.DB.Save(&settings).Error; err != nil {
 		a.Log.Error("Failed to save settings", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save settings", nil, "")
@@ -506,29 +516,39 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 	// Emit per-tab audit entries. LogAudit is a no-op when no fields changed.
 	userName := audit.GetUserName(a.DB, userID)
 	if messagesTouched {
-		audit.LogAudit(a.DB, orgID, userID, userName,
+		if err := audit.LogAudit(a.DB, orgID, userID, userName,
 			models.ResourceSettingsChatbotMessages, orgID, models.AuditActionUpdated,
-			oldMessages, chatbotMessagesSnapshot(&settings))
+			oldMessages, chatbotMessagesSnapshot(&settings)); err != nil {
+			a.Log.Warn("Failed to record chatbot messages audit entry", "error", err)
+		}
 	}
 	if agentsTouched {
-		audit.LogAudit(a.DB, orgID, userID, userName,
+		if err := audit.LogAudit(a.DB, orgID, userID, userName,
 			models.ResourceSettingsChatbotAgents, orgID, models.AuditActionUpdated,
-			oldAgents, chatbotAgentsSnapshot(&settings))
+			oldAgents, chatbotAgentsSnapshot(&settings)); err != nil {
+			a.Log.Warn("Failed to record chatbot agents audit entry", "error", err)
+		}
 	}
 	if hoursTouched {
-		audit.LogAudit(a.DB, orgID, userID, userName,
+		if err := audit.LogAudit(a.DB, orgID, userID, userName,
 			models.ResourceSettingsChatbotHours, orgID, models.AuditActionUpdated,
-			oldHours, chatbotHoursSnapshot(&settings))
+			oldHours, chatbotHoursSnapshot(&settings)); err != nil {
+			a.Log.Warn("Failed to record chatbot hours audit entry", "error", err)
+		}
 	}
 	if slaTouched {
-		audit.LogAudit(a.DB, orgID, userID, userName,
+		if err := audit.LogAudit(a.DB, orgID, userID, userName,
 			models.ResourceSettingsChatbotSLA, orgID, models.AuditActionUpdated,
-			oldSLA, chatbotSLASnapshot(&settings))
+			oldSLA, chatbotSLASnapshot(&settings)); err != nil {
+			a.Log.Warn("Failed to record chatbot SLA audit entry", "error", err)
+		}
 	}
 	if aiTouched {
-		audit.LogAudit(a.DB, orgID, userID, userName,
+		if err := audit.LogAudit(a.DB, orgID, userID, userName,
 			models.ResourceSettingsChatbotAI, orgID, models.AuditActionUpdated,
-			oldAI, chatbotAISnapshot(&settings))
+			oldAI, chatbotAISnapshot(&settings)); err != nil {
+			a.Log.Warn("Failed to record chatbot AI audit entry", "error", err)
+		}
 	}
 
 	return r.SendEnvelope(map[string]any{

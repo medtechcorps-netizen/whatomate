@@ -472,6 +472,7 @@ func (a *App) markMessagesAsRead(orgID uuid.UUID, contactID uuid.UUID, contact *
 		Update("status", models.MessageStatusRead)
 
 	a.DB.Model(contact).Update("is_read", true)
+	a.mirrorLegacyWhatsAppRead(orgID, contactID)
 
 	if len(unreadMessages) > 0 && contact.WhatsAppAccount != "" {
 		if account, err := a.resolveWhatsAppAccount(orgID, contact.WhatsAppAccount); err == nil {

@@ -2,7 +2,6 @@ package audit
 
 import (
 	"encoding/json"
-	"log/slog"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -110,8 +109,18 @@ func ComputeChanges(oldData, newData any) []map[string]any {
 	return changes
 }
 
-// LogAudit creates an audit log entry asynchronously.
-// Optional extraChanges are appended to the computed diff (useful for masked sensitive fields).
+// LogAudit creates an audit log entry on the caller's database session.
+//
+// Audit rows deliberately use the same session as the business mutation. In
+// production that session is commonly an RLS-bound transaction; starting a
+// goroutine here would race the transaction commit and could either lose the
+// audit row or execute against a closed transaction. Callers that need the
+// audit and mutation to be atomic should pass their transaction.
+//
+// Optional extraChanges are appended to the computed diff (useful for masked
+// sensitive fields). The error is returned so new compliance-sensitive code
+// can fail closed. Existing callers may continue to ignore it while they are
+// migrated incrementally.
 func LogAudit(
 	db *gorm.DB,
 	orgID, userID uuid.UUID,
@@ -121,12 +130,12 @@ func LogAudit(
 	action models.AuditAction,
 	oldData, newData any,
 	extraChanges ...map[string]any,
-) {
+) error {
 	changes := ComputeChanges(oldData, newData)
 	changes = append(changes, extraChanges...)
 
 	if action == models.AuditActionUpdated && len(changes) == 0 {
-		return
+		return nil
 	}
 
 	changesArr := make(models.JSONBArray, len(changes))
@@ -144,11 +153,7 @@ func LogAudit(
 		Changes:        changesArr,
 	}
 
-	go func() {
-		if err := db.Create(&entry).Error; err != nil {
-			slog.Error("failed to create audit log", "error", err)
-		}
-	}()
+	return db.Create(&entry).Error
 }
 
 func extractSubField(val any, key string) any {

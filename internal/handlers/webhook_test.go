@@ -17,6 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const webhookTestAppSecret = "webhook-test-app-secret"
+
 func TestVerifyWebhookSignature(t *testing.T) {
 	t.Parallel()
 
@@ -159,6 +161,9 @@ func webhookTestApp(t *testing.T) *App {
 		},
 		App: config.AppConfig{
 			EncryptionKey: "test-encryption-key-32-bytes-long",
+		},
+		WhatsApp: config.WhatsAppConfig{
+			AppSecret: webhookTestAppSecret,
 		},
 	}
 	return &App{
@@ -589,6 +594,10 @@ func TestWebhookHandler_smb_message_echoes(t *testing.T) {
 	req := testutil.NewRequest(t)
 	req.RequestCtx.Request.Header.SetMethod("POST")
 	req.RequestCtx.Request.Header.SetContentType("application/json")
+	req.RequestCtx.Request.Header.Set(
+		"X-Hub-Signature-256",
+		webhookTestSignature(body),
+	)
 	req.RequestCtx.Request.SetBody(body)
 
 	// Execute WebhookHandler
@@ -656,6 +665,10 @@ func TestWebhookHandler_smb_app_state_sync(t *testing.T) {
 	req := testutil.NewRequest(t)
 	req.RequestCtx.Request.Header.SetMethod("POST")
 	req.RequestCtx.Request.Header.SetContentType("application/json")
+	req.RequestCtx.Request.Header.Set(
+		"X-Hub-Signature-256",
+		webhookTestSignature(bodyAdd),
+	)
 	req.RequestCtx.Request.SetBody(bodyAdd)
 
 	require.NoError(t, app.WebhookHandler(req))
@@ -690,6 +703,10 @@ func TestWebhookHandler_smb_app_state_sync(t *testing.T) {
 	reqRemove := testutil.NewRequest(t)
 	reqRemove.RequestCtx.Request.Header.SetMethod("POST")
 	reqRemove.RequestCtx.Request.Header.SetContentType("application/json")
+	reqRemove.RequestCtx.Request.Header.Set(
+		"X-Hub-Signature-256",
+		webhookTestSignature(bodyRemove),
+	)
 	reqRemove.RequestCtx.Request.SetBody(bodyRemove)
 
 	require.NoError(t, app.WebhookHandler(reqRemove))
@@ -704,4 +721,10 @@ func TestWebhookHandler_smb_app_state_sync(t *testing.T) {
 	err := app.DB.Where("organization_id = ? AND phone_number = ?", org.ID, "9199997777").First(&checkDeleted).Error
 	assert.Error(t, err, "contact should have been soft-deleted and not found by standard query")
 	assert.True(t, checkUnscoped.DeletedAt.Valid, "DeletedAt should be populated")
+}
+
+func webhookTestSignature(body []byte) string {
+	mac := hmac.New(sha256.New, []byte(webhookTestAppSecret))
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }

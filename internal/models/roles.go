@@ -85,6 +85,28 @@ const (
 	ResourceCallTransfers           = "call_transfers"
 	ResourceOutgoingCalls           = "outgoing_calls"
 	ResourceAuditLogs               = "audit_logs"
+	ResourceBilling                 = "billing"
+	ResourceEntitlements            = "entitlements"
+	ResourceOnboarding              = "onboarding"
+	ResourceWorkspaceTemplates      = "workspace_templates"
+	ResourcePrivacySettings         = "privacy.settings"
+	ResourcePrivacyConsents         = "privacy.consents"
+	ResourcePrivacyRequests         = "privacy.requests"
+	ResourcePrivacyIncidents        = "privacy.incidents"
+	ResourceSupport                 = "support"
+	ResourceOperations              = "operations"
+	ResourceCRMPipelines            = "crm.pipelines"
+	ResourceCRMLeads                = "crm.leads"
+	ResourceTasks                   = "tasks"
+	ResourceBookings                = "bookings"
+	ResourceBookingSettings         = "booking.settings"
+	ResourcePackages                = "packages"
+	ResourceCredits                 = "credits"
+	ResourcePayments                = "payments"
+	ResourcePaymentRefunds          = "payments.refunds"
+	ResourceCopilot                 = "copilot"
+	ResourceChannelAccounts         = "channel_accounts"
+	ResourceConversations           = "conversations"
 )
 
 // PermissionAction constants for available actions
@@ -235,6 +257,64 @@ func DefaultPermissions() []Permission {
 
 		// Audit Logs
 		{Resource: ResourceAuditLogs, Action: ActionRead, Description: "View audit logs"},
+
+		// Commercial operations
+		{Resource: ResourceBilling, Action: ActionRead, Description: "View subscription and invoices"},
+		{Resource: ResourceBilling, Action: ActionWrite, Description: "Manage subscription and billing profile"},
+		{Resource: ResourceEntitlements, Action: ActionRead, Description: "View effective feature entitlements"},
+		{Resource: ResourceEntitlements, Action: ActionWrite, Description: "Manage entitlement overrides"},
+		{Resource: ResourceOnboarding, Action: ActionRead, Description: "View workspace onboarding"},
+		{Resource: ResourceOnboarding, Action: ActionWrite, Description: "Complete workspace onboarding"},
+		{Resource: ResourceWorkspaceTemplates, Action: ActionRead, Description: "View workspace templates"},
+		{Resource: ResourceWorkspaceTemplates, Action: ActionWrite, Description: "Create and apply workspace templates"},
+
+		// Privacy and support
+		{Resource: ResourcePrivacySettings, Action: ActionRead, Description: "View privacy and retention settings"},
+		{Resource: ResourcePrivacySettings, Action: ActionWrite, Description: "Manage privacy and retention settings"},
+		{Resource: ResourcePrivacyConsents, Action: ActionRead, Description: "View consent evidence"},
+		{Resource: ResourcePrivacyConsents, Action: ActionWrite, Description: "Record consent evidence"},
+		{Resource: ResourcePrivacyRequests, Action: ActionRead, Description: "View privacy requests"},
+		{Resource: ResourcePrivacyRequests, Action: ActionWrite, Description: "Process privacy requests"},
+		{Resource: ResourcePrivacyRequests, Action: ActionExecute, Description: "Reserved for approved privacy fulfillment workers"},
+		{Resource: ResourcePrivacyIncidents, Action: ActionRead, Description: "View privacy incidents"},
+		{Resource: ResourcePrivacyIncidents, Action: ActionWrite, Description: "Manage privacy incidents"},
+		{Resource: ResourceSupport, Action: ActionRead, Description: "View support cases and tenant health"},
+		{Resource: ResourceSupport, Action: ActionWrite, Description: "Create and update support cases"},
+		{Resource: ResourceOperations, Action: ActionRead, Description: "View recovery and delivery operations"},
+		{Resource: ResourceOperations, Action: ActionExecute, Description: "Reserved for approved recovery workers"},
+
+		// CRM and bookings
+		{Resource: ResourceCRMPipelines, Action: ActionRead, Description: "View CRM pipelines"},
+		{Resource: ResourceCRMPipelines, Action: ActionWrite, Description: "Manage CRM pipelines and stages"},
+		{Resource: ResourceCRMPipelines, Action: ActionDelete, Description: "Delete CRM pipelines and stages"},
+		{Resource: ResourceCRMLeads, Action: ActionRead, Description: "View CRM leads"},
+		{Resource: ResourceCRMLeads, Action: ActionWrite, Description: "Create, edit, and move CRM leads"},
+		{Resource: ResourceCRMLeads, Action: ActionDelete, Description: "Archive CRM leads"},
+		{Resource: ResourceTasks, Action: ActionRead, Description: "View follow-up tasks"},
+		{Resource: ResourceTasks, Action: ActionWrite, Description: "Create and complete follow-up tasks"},
+		{Resource: ResourceTasks, Action: ActionDelete, Description: "Cancel follow-up tasks"},
+		{Resource: ResourceBookings, Action: ActionRead, Description: "View bookings and classes"},
+		{Resource: ResourceBookings, Action: ActionWrite, Description: "Create and transition bookings"},
+		{Resource: ResourceBookings, Action: ActionDelete, Description: "Cancel booking records"},
+		{Resource: ResourceBookingSettings, Action: ActionRead, Description: "View services, resources, and availability"},
+		{Resource: ResourceBookingSettings, Action: ActionWrite, Description: "Manage services, resources, and availability"},
+		{Resource: ResourcePackages, Action: ActionRead, Description: "View packages"},
+		{Resource: ResourcePackages, Action: ActionWrite, Description: "Manage packages and customer purchases"},
+		{Resource: ResourcePackages, Action: ActionDelete, Description: "Retire packages"},
+		{Resource: ResourceCredits, Action: ActionRead, Description: "View package credit balances"},
+		{Resource: ResourceCredits, Action: ActionExecute, Description: "Adjust or redeem package credits"},
+		{Resource: ResourcePayments, Action: ActionRead, Description: "View invoices and payments"},
+		{Resource: ResourcePayments, Action: ActionWrite, Description: "Create invoices and payment intents"},
+		{Resource: ResourcePaymentRefunds, Action: ActionExecute, Description: "Issue payment refunds"},
+
+		// AI and omnichannel
+		{Resource: ResourceCopilot, Action: ActionRead, Description: "View Qwen Copilot runs"},
+		{Resource: ResourceCopilot, Action: ActionExecute, Description: "Generate and approve Copilot suggestions"},
+		{Resource: ResourceChannelAccounts, Action: ActionRead, Description: "View channel connections"},
+		{Resource: ResourceChannelAccounts, Action: ActionWrite, Description: "Connect and configure channels"},
+		{Resource: ResourceChannelAccounts, Action: ActionDelete, Description: "Disconnect channels"},
+		{Resource: ResourceConversations, Action: ActionRead, Description: "View omnichannel conversations"},
+		{Resource: ResourceConversations, Action: ActionWrite, Description: "Reply to and manage omnichannel conversations"},
 	}
 }
 
@@ -287,6 +367,26 @@ func SystemRolePermissions() map[string][]string {
 		"ivr_flows:read", "ivr_flows:write", "ivr_flows:delete",
 		"call_transfers:read", "call_transfers:write",
 		"outgoing_calls:read", "outgoing_calls:write",
+		// Commercial workspace
+		"billing:read", "entitlements:read",
+		"onboarding:read", "onboarding:write",
+		"workspace_templates:read",
+		"privacy.settings:read", "privacy.settings:write",
+		"privacy.consents:read", "privacy.consents:write",
+		"privacy.requests:read", "privacy.requests:write",
+		"support:read", "support:write",
+		// CRM, bookings and commerce
+		"crm.pipelines:read", "crm.pipelines:write",
+		"crm.leads:read", "crm.leads:write", "crm.leads:delete",
+		"tasks:read", "tasks:write", "tasks:delete",
+		"bookings:read", "bookings:write", "bookings:delete",
+		"booking.settings:read", "booking.settings:write",
+		"packages:read", "packages:write",
+		"credits:read",
+		"payments:read", "payments:write",
+		"copilot:read", "copilot:execute",
+		"channel_accounts:read", "channel_accounts:write",
+		"conversations:read", "conversations:write",
 	}
 
 	agentPermissions := []string{
@@ -309,6 +409,16 @@ func SystemRolePermissions() map[string][]string {
 		"call_transfers:read", "call_transfers:write",
 		// Outgoing Calls
 		"outgoing_calls:read", "outgoing_calls:write",
+		// CRM workspace
+		"crm.pipelines:read",
+		"crm.leads:read", "crm.leads:write",
+		"tasks:read", "tasks:write",
+		"bookings:read", "bookings:write",
+		"booking.settings:read",
+		"packages:read", "credits:read", "payments:read",
+		"copilot:read", "copilot:execute",
+		"channel_accounts:read",
+		"conversations:read", "conversations:write",
 	}
 
 	return map[string][]string{

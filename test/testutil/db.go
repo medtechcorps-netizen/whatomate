@@ -3,9 +3,11 @@ package testutil
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -78,158 +80,50 @@ func SetupTestDBWithCleanup(t *testing.T, cleanup bool) *gorm.DB {
 
 // runMigrations runs all model migrations.
 func runMigrations(db *gorm.DB) error {
-	return db.AutoMigrate(
-		// Core models
-		&models.Reseller{},
-		&models.Organization{},
-		&models.Permission{},
-		&models.CustomRole{},
-		&models.User{},
-		&models.ResellerMember{},
-		&models.UserOrganization{},
-		&models.Team{},
-		&models.TeamMember{},
-		&models.APIKey{},
-		&models.SSOProvider{},
-		&models.Webhook{},
-		&models.CustomAction{},
-		&models.UserAvailabilityLog{},
-		// WhatsApp models
-		&models.WhatsAppAccount{},
-		&models.Contact{},
-		&models.Tag{},
-		&models.Message{},
-		&models.Template{},
-		&models.WhatsAppFlow{},
-		// Chatbot models
-		&models.ChatbotSettings{},
-		&models.KeywordRule{},
-		&models.ChatbotFlow{},
-		&models.ChatbotFlowStep{},
-		&models.ChatbotSession{},
-		&models.ChatbotSessionMessage{},
-		&models.AIContext{},
-		&models.AgentTransfer{},
-		// Bulk message models
-		&models.BulkMessageCampaign{},
-		&models.BulkMessageRecipient{},
-		&models.NotificationRule{},
-		// Catalog models
-		&models.Catalog{},
-		&models.CatalogProduct{},
-		// Canned responses
-		&models.CannedResponse{},
-		// Dashboard
-		&models.Widget{},
-		// Conversation Notes
-		&models.ConversationNote{},
-		// Calling / IVR
-		&models.CallLog{},
-		&models.IVRFlow{},
-		&models.CallTransfer{},
-		&models.CallPermission{},
-		// Audit
-		&models.AuditLog{},
-	)
+	migrations := database.GetMigrationModels()
+	modelsToMigrate := make([]any, 0, len(migrations)+1)
+	for _, migration := range migrations {
+		modelsToMigrate = append(modelsToMigrate, migration.Model)
+	}
+	// Retain the legacy step table in tests while the graph backfill path still
+	// exercises it. Production intentionally no longer creates this table.
+	modelsToMigrate = append(modelsToMigrate, &models.ChatbotFlowStep{})
+	if err := db.AutoMigrate(modelsToMigrate...); err != nil {
+		return err
+	}
+	// The shared local PostgreSQL container can contain rows from an interrupted
+	// prior test process. Clear disposable test data before applying production
+	// unique indexes so stale fixtures cannot block schema verification.
+	cleanupTables(db)
+	return database.CreateIndexes(db)
 }
 
 // cleanupTables removes all data from tables (for PostgreSQL cleanup).
 // Uses TRUNCATE CASCADE to handle foreign key constraints properly.
 func cleanupTables(db *gorm.DB) {
-	tables := []string{
-		// Dashboard tables
-		"widgets",
-		// Catalog tables
-		"catalog_products",
-		"catalogs",
-		// Canned responses
-		"canned_responses",
-		// Bulk message tables
-		"bulk_message_recipients",
-		"bulk_message_campaigns",
-		"notification_rules",
-		// Chatbot tables
-		"chatbot_session_messages",
-		"chatbot_sessions",
-		"chatbot_flow_steps",
-		"chatbot_flows",
-		"keyword_rules",
-		"chatbot_settings",
-		"ai_contexts",
-		"agent_transfers",
-		// WhatsApp tables
-		"messages",
-		"tags",
-		"contacts",
-		"templates",
-		"whatsapp_flows",
-		"whatsapp_accounts",
-		// Roles and permissions
-		"role_permissions",
-		"custom_roles",
-		"permissions",
-		// Core tables
-		"team_members",
-		"teams",
-		"api_keys",
-		"sso_providers",
-		"webhooks",
-		"custom_actions",
-		"user_availability_logs",
-		"user_organizations",
-		"reseller_members",
-		"users",
-		"organizations",
-		"resellers",
-	}
-
-	for _, table := range tables {
-		db.Exec(fmt.Sprintf("TRUNCATE TABLE %s CASCADE", table))
-	}
+	truncateModelTables(db)
 }
 
 // TruncateTables truncates all tables (PostgreSQL only, faster than DELETE).
 func TruncateTables(db *gorm.DB) {
-	tables := []string{
-		"widgets",
-		"catalog_products",
-		"catalogs",
-		"canned_responses",
-		"bulk_message_recipients",
-		"bulk_message_campaigns",
-		"notification_rules",
-		"chatbot_session_messages",
-		"chatbot_sessions",
-		"chatbot_flow_steps",
-		"chatbot_flows",
-		"keyword_rules",
-		"chatbot_settings",
-		"ai_contexts",
-		"agent_transfers",
-		"messages",
-		"tags",
-		"contacts",
-		"templates",
-		"whatsapp_flows",
-		"whatsapp_accounts",
-		"role_permissions",
-		"custom_roles",
-		"permissions",
-		"team_members",
-		"teams",
-		"api_keys",
-		"sso_providers",
-		"webhooks",
-		"custom_actions",
-		"user_availability_logs",
-		"user_organizations",
-		"reseller_members",
-		"users",
-		"organizations",
-		"resellers",
-	}
+	truncateModelTables(db)
+}
 
-	for _, table := range tables {
-		db.Exec(fmt.Sprintf("TRUNCATE TABLE %s CASCADE", table))
+// truncateModelTables derives the cleanup list from the production migration
+// registry so newly introduced product tables cannot silently retain test data.
+func truncateModelTables(db *gorm.DB) {
+	tables := make(map[string]struct{})
+	for _, migration := range database.GetMigrationModels() {
+		statement := &gorm.Statement{DB: db}
+		if err := statement.Parse(migration.Model); err == nil && statement.Schema != nil {
+			tables[statement.Schema.Table] = struct{}{}
+		}
+	}
+	tables["chatbot_flow_steps"] = struct{}{}
+	tables["role_permissions"] = struct{}{}
+
+	for table := range tables {
+		quoted := `"` + strings.ReplaceAll(table, `"`, `""`) + `"`
+		db.Exec(fmt.Sprintf("TRUNCATE TABLE %s CASCADE", quoted))
 	}
 }

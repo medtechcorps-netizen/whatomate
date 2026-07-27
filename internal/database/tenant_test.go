@@ -3,6 +3,7 @@ package database_test
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/database"
@@ -91,6 +92,123 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	require.NoError(t, adminDB.Create(&contactA).Error)
 	require.NoError(t, adminDB.Create(&contactB).Error)
 
+	onboardingA := models.OrganizationOnboarding{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgA.ID,
+		Status:          models.OnboardingStatusInProgress,
+		ProgressPercent: 25,
+		Checklist:       models.JSONB{},
+		Input:           models.JSONB{},
+		Metadata:        models.JSONB{},
+	}
+	onboardingB := models.OrganizationOnboarding{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgB.ID,
+		Status:          models.OnboardingStatusInProgress,
+		ProgressPercent: 50,
+		Checklist:       models.JSONB{},
+		Input:           models.JSONB{},
+		Metadata:        models.JSONB{},
+	}
+	require.NoError(t, adminDB.Create(&onboardingA).Error)
+	require.NoError(t, adminDB.Create(&onboardingB).Error)
+
+	pipelineA := models.CRMPipeline{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgA.ID,
+		Name:           "Alpha pipeline",
+		IsDefault:      true,
+		IsActive:       true,
+		Version:        1,
+	}
+	pipelineB := models.CRMPipeline{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgB.ID,
+		Name:           "Beta pipeline",
+		IsDefault:      true,
+		IsActive:       true,
+		Version:        1,
+	}
+	require.NoError(t, adminDB.Create(&pipelineA).Error)
+	require.NoError(t, adminDB.Create(&pipelineB).Error)
+
+	serviceA := models.BookingService{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgA.ID,
+		Name:            "Alpha assessment",
+		Kind:            models.BookingServiceKindAppointment,
+		DurationMinutes: 30,
+		DefaultCapacity: 1,
+		Currency:        "MYR",
+		IsActive:        true,
+		Version:         1,
+	}
+	serviceB := models.BookingService{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgB.ID,
+		Name:            "Beta assessment",
+		Kind:            models.BookingServiceKindAppointment,
+		DurationMinutes: 45,
+		DefaultCapacity: 1,
+		Currency:        "MYR",
+		IsActive:        true,
+		Version:         1,
+	}
+	require.NoError(t, adminDB.Create(&serviceA).Error)
+	require.NoError(t, adminDB.Create(&serviceB).Error)
+
+	channelA := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    orgA.ID,
+		Channel:           models.ChannelWebChat,
+		Provider:          "relay",
+		Name:              "Alpha web chat",
+		ExternalAccountID: "alpha-" + uuid.NewString(),
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{},
+		Metadata:          models.JSONB{},
+	}
+	channelB := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    orgB.ID,
+		Channel:           models.ChannelWebChat,
+		Provider:          "relay",
+		Name:              "Beta web chat",
+		ExternalAccountID: "beta-" + uuid.NewString(),
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, adminDB.Create(&channelA).Error)
+	require.NoError(t, adminDB.Create(&channelB).Error)
+	conversationB := models.InboxConversation{
+		BaseModel:              models.BaseModel{ID: uuid.New()},
+		OrganizationID:         orgB.ID,
+		ChannelAccountID:       channelB.ID,
+		ContactID:              contactB.ID,
+		Channel:                channelB.Channel,
+		ExternalConversationID: "outbox-test-" + uuid.NewString(),
+		Status:                 models.InboxConversationStatusOpen,
+		OpenedAt:               time.Now().UTC(),
+		Config:                 models.JSONB{},
+		Metadata:               models.JSONB{},
+	}
+	require.NoError(t, adminDB.Create(&conversationB).Error)
+	outboxB := models.OutboxJob{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   orgB.ID,
+		ChannelAccountID: channelB.ID,
+		ConversationID:   conversationB.ID,
+		IdempotencyKey:   "rls-outbox-" + uuid.NewString(),
+		Status:           models.OutboxJobStatusPending,
+		AvailableAt:      time.Now().UTC().Add(-time.Minute),
+		MaxAttempts:      8,
+		Payload:          models.JSONB{},
+	}
+	require.NoError(t, adminDB.Create(&outboxB).Error)
+
 	flowA := models.ChatbotFlow{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
 		OrganizationID:  orgA.ID,
@@ -161,6 +279,30 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		}))
 		require.Len(t, contacts, 1)
 		require.Equal(t, contactA.ID, contacts[0].ID)
+	})
+
+	t.Run("new commercial CRM booking and channel tables are tenant isolated", func(t *testing.T) {
+		require.NoError(t, asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+			checks := []struct {
+				model any
+				want  uuid.UUID
+			}{
+				{model: &models.OrganizationOnboarding{}, want: onboardingA.ID},
+				{model: &models.CRMPipeline{}, want: pipelineA.ID},
+				{model: &models.BookingService{}, want: serviceA.ID},
+				{model: &models.ChannelAccount{}, want: channelA.ID},
+			}
+			for _, check := range checks {
+				var ids []uuid.UUID
+				if err := tenantDB.Model(check.model).Pluck("id", &ids).Error; err != nil {
+					return err
+				}
+				if len(ids) != 1 || ids[0] != check.want {
+					return fmt.Errorf("tenant table exposed IDs %v, expected only %s", ids, check.want)
+				}
+			}
+			return nil
+		}))
 	})
 
 	t.Run("explicit lookup of another clinic is invisible", func(t *testing.T) {
@@ -252,6 +394,54 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		resolved, err := uuid.Parse(resolvedText)
 		require.NoError(t, err)
 		require.Equal(t, orgB.ID, resolved)
+	})
+
+	t.Run("omnichannel webhook router resolves without exposing channel accounts", func(t *testing.T) {
+		var resolvedText string
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			if err := runtimeDB.Raw(
+				"SELECT public.rereply_resolve_channel_org(?)::text",
+				channelB.ID,
+			).Scan(&resolvedText).Error; err != nil {
+				return err
+			}
+
+			var visibleAccounts int64
+			if err := runtimeDB.Model(&models.ChannelAccount{}).Count(&visibleAccounts).Error; err != nil {
+				return err
+			}
+			if visibleAccounts != 0 {
+				return fmt.Errorf("unscoped channel account query exposed %d rows", visibleAccounts)
+			}
+			return nil
+		}))
+		resolved, err := uuid.Parse(resolvedText)
+		require.NoError(t, err)
+		require.Equal(t, orgB.ID, resolved)
+	})
+
+	t.Run("outbox resolver returns ready tenants without exposing jobs", func(t *testing.T) {
+		var organizationIDs []uuid.UUID
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			if err := runtimeDB.Raw(
+				"SELECT * FROM public.rereply_ready_channel_outbox_orgs(?, ?, ?)",
+				uuid.Nil,
+				20,
+				time.Now().UTC().Add(-2*time.Minute),
+			).Scan(&organizationIDs).Error; err != nil {
+				return err
+			}
+
+			var visibleJobs int64
+			if err := runtimeDB.Model(&models.OutboxJob{}).Count(&visibleJobs).Error; err != nil {
+				return err
+			}
+			if visibleJobs != 0 {
+				return fmt.Errorf("unscoped outbox query exposed %d rows", visibleJobs)
+			}
+			return nil
+		}))
+		require.Contains(t, organizationIDs, orgB.ID)
 	})
 
 	t.Run("transaction-local tenant state does not leak to the pool", func(t *testing.T) {
