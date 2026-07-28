@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // newProcessorTestApp creates a minimal App suitable for chatbot processor tests.
@@ -50,6 +52,76 @@ func createProcessorTestOrg(t *testing.T, app *App) (*models.Organization, *mode
 	org := testutil.CreateTestOrganization(t, app.DB)
 	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
 	return org, account
+}
+
+func TestUpdateContactBSUIDFailureKeepsOuterTransactionUsable(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	suffix := uuid.New().String()[:8]
+	functionName := "fail_bsuid_" + suffix
+	triggerName := "fail_bsuid_trigger_" + suffix
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.id = '%s'::uuid THEN
+				RAISE EXCEPTION 'forced BSUID update failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$`, functionName, contact.ID)).Error)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE TRIGGER %s
+		BEFORE UPDATE OF bs_uid ON contacts
+		FOR EACH ROW EXECUTE FUNCTION %s()`, triggerName, functionName)).Error)
+	t.Cleanup(func() {
+		app.DB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON contacts", triggerName))
+		app.DB.Exec(fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", functionName))
+	})
+
+	var messageID uuid.UUID
+	err := app.DB.Transaction(func(tx *gorm.DB) error {
+		scoped := &App{
+			DB:  tx,
+			Log: app.Log,
+		}
+		scoped.updateContactBSUID(contact, "US.test-business-scoped-id")
+
+		messageID = uuid.New()
+		return tx.Create(&models.Message{
+			BaseModel:         models.BaseModel{ID: messageID},
+			OrganizationID:    org.ID,
+			WhatsAppAccount:   account.Name,
+			ContactID:         contact.ID,
+			WhatsAppMessageID: "wamid.bsuid-savepoint-" + suffix,
+			Direction:         models.DirectionIncoming,
+			MessageType:       models.MessageTypeText,
+			Content:           "message survives optional metadata failure",
+			Status:            models.MessageStatusReceived,
+		}).Error
+	})
+	require.NoError(t, err)
+	assert.Empty(t, contact.BSUID)
+
+	var saved models.Message
+	require.NoError(t, app.DB.First(&saved, "id = ?", messageID).Error)
+	assert.Equal(t, contact.ID, saved.ContactID)
+}
+
+func TestUpdateContactBSUIDPersistsMappedColumn(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, _ := createProcessorTestOrg(t, app)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	expected := "US." + uuid.New().String()
+
+	app.updateContactBSUID(contact, expected)
+
+	var saved models.Contact
+	require.NoError(t, app.DB.First(&saved, "id = ?", contact.ID).Error)
+	assert.Equal(t, expected, saved.BSUID)
 }
 
 // =============================================================================

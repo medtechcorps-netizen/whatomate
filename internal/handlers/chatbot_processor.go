@@ -16,6 +16,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
+	"gorm.io/gorm"
 )
 
 func redactURLForLog(raw string) string {
@@ -133,6 +134,30 @@ type IncomingTextMessage struct {
 	} `json:"contacts,omitempty"`
 }
 
+// updateContactBSUID persists Meta's optional business-scoped user ID without
+// allowing a metadata-write failure to poison the surrounding inbound-message
+// transaction. GORM implements nested transactions with a PostgreSQL savepoint,
+// so rolling this callback back restores the outer tenant transaction.
+func (a *App) updateContactBSUID(contact *models.Contact, bsuid string) {
+	if contact == nil || bsuid == "" || contact.BSUID == bsuid {
+		return
+	}
+
+	err := a.DB.Transaction(func(tx *gorm.DB) error {
+		return tx.Model(&models.Contact{}).
+			Where("id = ?", contact.ID).
+			Update("bs_uid", bsuid).Error
+	})
+	if err != nil {
+		a.Log.Warn("Failed to update contact BSUID; continuing inbound message processing",
+			"error", err,
+			"contact_id", contact.ID,
+		)
+		return
+	}
+	contact.BSUID = bsuid
+}
+
 // processIncomingMessageFull processes incoming WhatsApp messages with chatbot logic
 func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextMessage, profileName string) {
 	a.Log.Info("Processing incoming message",
@@ -162,11 +187,9 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		return
 	}
 
-	// Store BSUID if provided and not already set
-	if msg.FromUserID != "" && contact.BSUID != msg.FromUserID {
-		a.DB.Model(contact).Update("bsuid", msg.FromUserID)
-		contact.BSUID = msg.FromUserID
-	}
+	// Store BSUID if provided and not already set. This optional metadata write
+	// must not prevent the customer message itself from being persisted.
+	a.updateContactBSUID(contact, msg.FromUserID)
 
 	// Dispatch webhook if new contact was created
 	if isNewContact {
