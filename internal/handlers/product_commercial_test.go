@@ -483,6 +483,25 @@ func TestProductCommercialPlanAuditUsesExplicitTenantContext(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(createRequest), &created))
 	require.NotNil(t, created.Data.ID)
+	planID := *created.Data.ID
+	t.Cleanup(func() {
+		require.NoError(t, db.Unscoped().
+			Where("organization_id = ? AND resource_type = ? AND resource_id = ?",
+				auditOrganization.ID,
+				productPlanAuditResource,
+				planID,
+			).
+			Delete(&models.AuditLog{}).Error)
+		require.NoError(t, db.Unscoped().
+			Where("plan_id = ?", planID).
+			Delete(&models.PlanEntitlement{}).Error)
+		require.NoError(t, db.Unscoped().
+			Where("plan_id = ?", planID).
+			Delete(&models.PlanPrice{}).Error)
+		require.NoError(t, db.Unscoped().
+			Where("id = ?", planID).
+			Delete(&models.Plan{}).Error)
+	})
 
 	updatedName := "Audit tenant plan updated"
 	updateRequest := testutil.NewJSONRequest(t, map[string]any{
@@ -495,7 +514,7 @@ func TestProductCommercialPlanAuditUsesExplicitTenantContext(t *testing.T) {
 		owner.RoleID,
 		true,
 	)
-	testutil.SetPathParam(updateRequest, "id", created.Data.ID.String())
+	testutil.SetPathParam(updateRequest, "id", planID.String())
 	require.NoError(t, app.UpdateProductPlan(updateRequest))
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(updateRequest))
 
@@ -505,7 +524,7 @@ func TestProductCommercialPlanAuditUsesExplicitTenantContext(t *testing.T) {
 			"organization_id = ? AND resource_type = ? AND resource_id = ?",
 			auditOrganization.ID,
 			productPlanAuditResource,
-			*created.Data.ID,
+			planID,
 		).
 		Count(&auditCount).Error)
 	require.EqualValues(t, 2, auditCount)
