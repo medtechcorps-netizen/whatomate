@@ -40,8 +40,11 @@ mandatory release gate.
 
 ## Commercial and onboarding lifecycle
 
-1. A platform owner creates or updates a plan and its entitlements.
-2. A platform owner or reseller assigns a subscription to an organization.
+1. A platform superadmin creates or updates a plan and its entitlements.
+2. Only a platform superadmin assigns or changes a manual subscription for an
+   organization. Reseller owners and administrators have read-only portfolio
+   and subscription visibility; they cannot list private assignable plans or
+   mutate tenant licenses.
 3. The organization completes its profile and applies a versioned Clinic,
    Pharmacy, Wellness, or General workspace template.
 4. Entitlements, rather than UI visibility alone, govern access to licensed
@@ -85,7 +88,8 @@ change a published price.
     {"key": "bookings.enabled", "value_type": "boolean", "value": true, "enforcement": "hard"},
     {"key": "commerce.enabled", "value_type": "boolean", "value": true, "enforcement": "hard"},
     {"key": "copilot.enabled", "value_type": "boolean", "value": true, "enforcement": "hard"},
-    {"key": "omnichannel.enabled", "value_type": "boolean", "value": true, "enforcement": "hard"}
+    {"key": "omnichannel.enabled", "value_type": "boolean", "value": true, "enforcement": "hard"},
+    {"key": "threads.public_engagement.enabled", "value_type": "boolean", "value": false, "enforcement": "hard"}
   ]
 }
 ```
@@ -93,23 +97,43 @@ change a published price.
 The zero amount above is a safe trial-catalog placeholder, not a recommended
 selling price. Set the approved amount before using the plan commercially.
 
-Assign the plan to one tenant through
-`PUT /api/admin/organizations/{organization_id}/subscription`:
+As a platform superadmin, load the target-specific assignable catalog through
+`GET /api/admin/organizations/{organization_id}/product/plans`, select the
+exact plan and price IDs, and assign the plan through
+`PUT /api/admin/organizations/{organization_id}/subscription`. The approval or
+contract reference is mandatory:
 
 ```json
 {
-  "plan_code": "omnitech-growth",
-  "price_code": "omnitech-growth-myr-month",
+  "plan_id": "00000000-0000-0000-0000-000000000001",
+  "plan_price_id": "00000000-0000-0000-0000-000000000002",
   "status": "trialing",
   "trial_days": 14,
   "manual_reference": "approved-pilot-reference"
 }
 ```
 
+Reseller owners and administrators may inspect
+`GET /api/admin/organizations/{organization_id}/subscription` for organizations
+in their own portfolio, but a reseller identity must receive `403 Forbidden`
+from both the private assignable-catalog endpoint and the subscription mutation
+endpoint.
+
 After assignment, sign in as a normal tenant administrator and verify
 `GET /api/product/entitlements` before applying a workspace template. An
-expired, canceled, paused, past-due, incomplete, or missing subscription must
-not unlock a feature.
+expired, canceled, paused, incomplete, missing, or past-due subscription
+outside an explicit unexpired grace window must not unlock a feature.
+
+### Partner portfolio performance follow-up
+
+The Partner Console currently obtains each organization's safe subscription
+summary from the target-scoped admin endpoint, so a portfolio refresh performs
+one subscription request per organization. Do not fold tenant subscription
+rows into the existing reseller usage query without an explicit control-plane
+authorization and RLS review. A future bounded, paginated bulk license-summary
+endpoint should replace this request pattern before very large portfolios are
+supported; track portfolio request count and latency until that endpoint is
+available.
 
 ## Privacy and support
 
@@ -214,6 +238,50 @@ For every channel account:
 7. Confirm consent, quiet hours, opt-out behavior, and provider messaging
    windows.
 8. Enable the account for one pilot organization and monitor delivery failures.
+
+### Threads public engagement beta
+
+Threads is a separate `threads` channel and is fail-closed behind both
+`omnichannel.enabled` and `threads.public_engagement.enabled`. It accepts only
+the signed `relay` provider. The feature is for public replies and mentions,
+not messaging:
+
+- every inbound conversation must carry a provider-owned public target in
+  `external_conversation_id`;
+- `metadata.engagement_type` must be exactly `reply` or `mention`;
+- every outbound agent response must set `reply_to_external_id` to that same
+  selected public target; and
+- the account cannot be the default outbound channel or initiate a standalone
+  post.
+
+**Threads direct messages are not supported.** Do not label this channel as a
+DM inbox, and do not translate a public reply into a private message. Threads
+may offer messaging in its consumer product, but this ReReply integration does
+not implement a Threads DM endpoint or permission.
+
+Use least-privilege Threads OAuth access for a future approved relay:
+
+- `threads_basic` for the connected Threads identity;
+- `threads_read_replies` to read replies to the connected account's posts;
+- `threads_manage_replies` to manage eligible public replies;
+- `threads_content_publish` to create the public reply container used with
+  `reply_to_id`; and
+- `threads_manage_mentions` to retrieve and manage mentions.
+
+Meta's official Threads API workspace documents the
+[authorization scopes](https://www.postman.com/meta/threads/folder/34203612-e0373e84-de6b-46f1-b90d-3fea76ba6782),
+[reply-management surface](https://www.postman.com/meta/threads/folder/34203612-1cc7918f-d63d-45fd-bdaa-e8855d0338cb),
+[public reply request](https://www.postman.com/meta/threads/request/34203612-7abb4419-a216-4e06-8027-f9f4fcf8bee9),
+and [`/me/mentions` request](https://www.postman.com/meta/threads/request/34203612-fc3f21da-0a53-44ab-80e2-8cd8c376a42a).
+Verify the granted token scopes in Meta's access-token debugger before any
+provider test.
+
+This release does not contain an approved concrete Threads relay adapter.
+Creating an entitled connection records a pending beta account, while **Test
+and activation deliberately fail closed**. Do not override the pending status
+or enable outbound delivery. Ship and review a Threads-specific adapter,
+provider-scope validation, sandbox evidence, and end-to-end reply-target tests
+before changing this gate.
 
 TikTok remains disabled until the selected TikTok API product and business
 account have been approved for the intended messaging use case.

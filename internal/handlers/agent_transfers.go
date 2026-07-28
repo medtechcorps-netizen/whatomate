@@ -3,12 +3,14 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/assignment"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/shridarpatil/whatomate/internal/websocket"
@@ -17,6 +19,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+var errActiveAgentTransferExists = errors.New("contact already has an active transfer")
 
 // agentTransferRow represents a flat row result from the JOINed query
 type agentTransferRow struct {
@@ -396,6 +400,38 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	})
 }
 
+func createActiveAgentTransferTx(
+	tx *gorm.DB,
+	transfer *models.AgentTransfer,
+) error {
+	if tx == nil || transfer == nil {
+		return errors.New("complete agent transfer transaction state is required")
+	}
+	if err := database.LockContactPolicyScope(
+		tx,
+		transfer.OrganizationID,
+		transfer.ContactID,
+	); err != nil {
+		return fmt.Errorf("lock transfer policy scope: %w", err)
+	}
+
+	var existingCount int64
+	if err := tx.Model(&models.AgentTransfer{}).
+		Where(
+			"organization_id = ? AND contact_id = ? AND status = ?",
+			transfer.OrganizationID,
+			transfer.ContactID,
+			models.TransferStatusActive,
+		).
+		Count(&existingCount).Error; err != nil {
+		return err
+	}
+	if existingCount > 0 {
+		return errActiveAgentTransferExists
+	}
+	return tx.Create(transfer).Error
+}
+
 // CreateAgentTransfer creates a new agent transfer
 func (a *App) CreateAgentTransfer(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
@@ -421,16 +457,6 @@ func (a *App) CreateAgentTransfer(r *fastglue.Request) error {
 	contact, err := findByIDAndOrg[models.Contact](a.DB, r, contactID, orgID, "Contact")
 	if err != nil {
 		return nil
-	}
-
-	// Check for existing active transfer
-	var existingCount int64
-	a.DB.Model(&models.AgentTransfer{}).
-		Where("organization_id = ? AND contact_id = ? AND status = ?", orgID, contactID, models.TransferStatusActive).
-		Count(&existingCount)
-
-	if existingCount > 0 {
-		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Contact already has an active transfer", nil, "")
 	}
 
 	// Get chatbot settings to check AssignToSameAgent (use cache)
@@ -514,25 +540,54 @@ func (a *App) CreateAgentTransfer(r *fastglue.Request) error {
 		a.UpdateSLAOnPickup(&transfer)
 	}
 
-	if err := a.DB.Create(&transfer).Error; err != nil {
+	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := createActiveAgentTransferTx(tx, &transfer); err != nil {
+			return err
+		}
+
+		// When AssignToSameAgent is enabled and no agent is already assigned,
+		// set the contact's assigned agent for future chat routing. The contact
+		// row remains locked through this update.
+		if agentID != nil &&
+			settings != nil &&
+			settings.AgentAssignment.AssignToSameAgent &&
+			contact.AssignedUserID == nil {
+			if err := tx.Model(&models.Contact{}).
+				Where(
+					"id = ? AND organization_id = ? AND assigned_user_id IS NULL",
+					contact.ID,
+					orgID,
+				).
+				Update("assigned_user_id", agentID).Error; err != nil {
+				return err
+			}
+		}
+
+		// End any active chatbot session atomically with the handover.
+		return tx.Model(&models.ChatbotSession{}).
+			Where(
+				"organization_id = ? AND contact_id = ? AND status = ?",
+				orgID,
+				contactID,
+				models.SessionStatusActive,
+			).
+			Updates(map[string]any{
+				"status":       models.SessionStatusCancelled,
+				"completed_at": time.Now(),
+			}).Error
+	})
+	if errors.Is(err, errActiveAgentTransferExists) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusConflict,
+			"Contact already has an active transfer",
+			nil,
+			"",
+		)
+	}
+	if err != nil {
 		a.Log.Error("Failed to create agent transfer", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create transfer", nil, "")
 	}
-
-	// When AssignToSameAgent is enabled and no agent is already assigned,
-	// set the contact's assigned agent for future chat routing.
-	// Skip if already assigned to preserve a manually set relationship manager.
-	if agentID != nil && settings != nil && settings.AgentAssignment.AssignToSameAgent && contact.AssignedUserID == nil {
-		a.DB.Model(contact).Update("assigned_user_id", agentID)
-	}
-
-	// End any active chatbot session
-	a.DB.Model(&models.ChatbotSession{}).
-		Where("organization_id = ? AND contact_id = ? AND status = ?", orgID, contactID, models.SessionStatusActive).
-		Updates(map[string]any{
-			"status":       models.SessionStatusCancelled,
-			"completed_at": time.Now(),
-		})
 
 	// Broadcast WebSocket notification
 	a.broadcastTransferCreated(&transfer, contact)
@@ -1169,25 +1224,48 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		a.UpdateSLAOnPickup(transfer)
 	}
 
-	if err := a.DB.Create(transfer).Error; err != nil {
+	if err := a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := createActiveAgentTransferTx(tx, transfer); err != nil {
+			return err
+		}
+
+		// Update contact assignment if agent assigned, but only when
+		// AssignToSameAgent is enabled and no relationship manager is already
+		// set. The contact remains locked through this update.
+		if transfer.AgentID != nil &&
+			settings != nil &&
+			settings.AgentAssignment.AssignToSameAgent &&
+			contact.AssignedUserID == nil {
+			if err := tx.Model(&models.Contact{}).
+				Where(
+					"id = ? AND organization_id = ? AND assigned_user_id IS NULL",
+					contact.ID,
+					account.OrganizationID,
+				).
+				Update("assigned_user_id", transfer.AgentID).Error; err != nil {
+				return err
+			}
+		}
+
+		// End any active chatbot session atomically with the handover.
+		if endChatbotSession {
+			if err := tx.Model(&models.ChatbotSession{}).
+				Where(
+					"organization_id = ? AND contact_id = ? AND status = ?",
+					account.OrganizationID,
+					contact.ID,
+					models.SessionStatusActive,
+				).
+				Updates(map[string]any{
+					"status":       models.SessionStatusCancelled,
+					"completed_at": time.Now(),
+				}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		return err
-	}
-
-	// Update contact assignment if agent assigned, but only when AssignToSameAgent
-	// is enabled and no relationship manager is already set. Active transfers
-	// already grant the assigned agent visibility into the chat.
-	if transfer.AgentID != nil && settings != nil && settings.AgentAssignment.AssignToSameAgent && contact.AssignedUserID == nil {
-		a.DB.Model(contact).Update("assigned_user_id", transfer.AgentID)
-	}
-
-	// End any active chatbot session
-	if endChatbotSession {
-		a.DB.Model(&models.ChatbotSession{}).
-			Where("organization_id = ? AND contact_id = ? AND status = ?", account.OrganizationID, contact.ID, models.SessionStatusActive).
-			Updates(map[string]any{
-				"status":       models.SessionStatusCancelled,
-				"completed_at": time.Now(),
-			})
 	}
 
 	// Broadcast to WebSocket

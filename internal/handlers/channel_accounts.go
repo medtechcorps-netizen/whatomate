@@ -3,7 +3,9 @@ package handlers
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -15,6 +17,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/audit"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -23,9 +26,16 @@ import (
 
 var ErrChannelAdapterUnavailable = errors.New("channel provider adapter is not available")
 var ErrLegacyMetaAccountManaged = errors.New("legacy Meta channel accounts are managed by WhatsApp setup")
+var ErrChannelAccountChangedDuringValidation = errors.New("channel account changed during validation")
+var ErrChannelAccountValidationSuperseded = errors.New("channel account validation was superseded")
 
 var channelProviderIdentifier = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 var channelExternalAccountIdentifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}$`)
+
+const (
+	threadsPublicEngagementMode            = "public_replies_mentions"
+	channelAccountHealthValidationTokenKey = "health_validation_token"
+)
 
 type ChannelAccountRequest struct {
 	Channel           models.Channel `json:"channel"`
@@ -45,6 +55,7 @@ type UpdateChannelAccountRequest struct {
 	Capabilities      *models.JSONB `json:"capabilities,omitempty"`
 	OutboundSecret    string        `json:"outbound_secret,omitempty"`
 	OutboundEnabled   *bool         `json:"outbound_enabled,omitempty"`
+	AIReplyEnabled    *bool         `json:"ai_reply_enabled,omitempty"`
 	IsDefaultIncoming *bool         `json:"is_default_incoming,omitempty"`
 	IsDefaultOutgoing *bool         `json:"is_default_outgoing,omitempty"`
 }
@@ -122,6 +133,7 @@ func (a *App) ListChannelAccounts(r *fastglue.Request) error {
 			[]models.OutboxJobStatus{
 				models.OutboxJobStatusPending,
 				models.OutboxJobStatusProcessing,
+				models.OutboxJobStatusDispatching,
 				models.OutboxJobStatusRetrying,
 				models.OutboxJobStatusFailed,
 			},
@@ -185,6 +197,9 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 			"",
 		)
 	}
+	if err := validateChannelCreationPolicy(request); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
 	if utf8.RuneCountInString(request.Name) > 100 || !channelExternalAccountIdentifier.MatchString(request.ExternalAccountID) {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid channel account name or external account identifier", nil, "")
 	}
@@ -197,6 +212,36 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 	if request.Provider == channelapi.RelayProvider {
 		if err := validateRelayAccountConfig(request.Config); err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+		}
+	}
+	if entitlementKey, required := additionalChannelCreationEntitlement(request.Channel); required {
+		allowed, entitlementErr := a.HasProductEntitlement(userID, orgID, entitlementKey)
+		if entitlementErr != nil {
+			a.Log.Error(
+				"Failed to evaluate channel-specific product entitlement",
+				"error",
+				entitlementErr,
+				"organization_id",
+				orgID,
+				"channel",
+				request.Channel,
+				"entitlement",
+				entitlementKey,
+			)
+			return r.SendErrorEnvelope(
+				fasthttp.StatusInternalServerError,
+				"Threads public engagement entitlement could not be evaluated",
+				nil,
+				"",
+			)
+		}
+		if !allowed {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusPaymentRequired,
+				"Threads public replies are not included in the organization's active plan",
+				nil,
+				"",
+			)
 		}
 	}
 
@@ -221,8 +266,14 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 	}
 
 	config := cloneJSONB(request.Config)
+	capabilities := cloneJSONB(request.Capabilities)
+	if request.Channel == models.ChannelThreads {
+		config = threadsPublicEngagementConfig(config)
+		capabilities = threadsPublicEngagementCapabilities(capabilities)
+	}
 	// Activation and outbound approval happen only after TestChannelAccount.
 	config["outbound_enabled"] = false
+	config["ai_reply_enabled"] = false
 	account := models.ChannelAccount{
 		OrganizationID:    orgID,
 		Channel:           request.Channel,
@@ -230,7 +281,7 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 		Name:              request.Name,
 		ExternalAccountID: request.ExternalAccountID,
 		Status:            models.ChannelAccountStatusPending,
-		Capabilities:      cloneJSONB(request.Capabilities),
+		Capabilities:      capabilities,
 		Config:            config,
 		Metadata:          models.JSONB{},
 		IsDefaultIncoming: request.IsDefaultIncoming,
@@ -324,6 +375,9 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 
 	var response ChannelAccountResponse
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
+			return err
+		}
 		account, findErr := loadChannelAccount(tx, orgID, id, true)
 		if findErr != nil {
 			return findErr
@@ -332,21 +386,33 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			return ErrLegacyMetaAccountManaged
 		}
 		oldAccount := *account
+		// Channel account JSONB values are maps. Keep detached audit snapshots
+		// so in-place delivery/AI toggles cannot mutate both old and new values.
+		oldAccount.Config = cloneJSONB(account.Config)
+		oldAccount.Capabilities = cloneJSONB(account.Capabilities)
+		oldAccount.Metadata = cloneJSONB(account.Metadata)
 		credentialChanged := false
 		requiresRetest := false
+		profileKeyChanged := false
 
 		if request.Name != nil {
 			name := strings.TrimSpace(*request.Name)
 			if name == "" || utf8.RuneCountInString(name) > 100 {
 				return errors.New("channel account name must be between 1 and 100 characters")
 			}
+			profileKeyChanged = account.Name != name
 			account.Name = name
 		}
 		if request.Config != nil {
 			outboundEnabled := boolConfigValue(account.Config, "outbound_enabled")
+			aiReplyEnabled := boolConfigValue(account.Config, "ai_reply_enabled")
 			previousRelayURL, _ := account.Config["relay_url"].(string)
 			account.Config = cloneJSONB(*request.Config)
 			account.Config["outbound_enabled"] = outboundEnabled
+			account.Config["ai_reply_enabled"] = aiReplyEnabled
+			if account.Channel == models.ChannelThreads {
+				account.Config = threadsPublicEngagementConfig(account.Config)
+			}
 			if account.Provider == channelapi.RelayProvider {
 				if err := validateRelayAccountConfig(account.Config); err != nil {
 					return err
@@ -357,12 +423,18 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		}
 		if request.Capabilities != nil {
 			account.Capabilities = cloneJSONB(*request.Capabilities)
+			if account.Channel == models.ChannelThreads {
+				account.Capabilities = threadsPublicEngagementCapabilities(account.Capabilities)
+			}
 		}
 		if request.OutboundEnabled != nil {
 			if *request.OutboundEnabled && account.Status != models.ChannelAccountStatusActive {
 				return errors.New("test and activate the channel account before enabling outbound delivery")
 			}
 			account.Config["outbound_enabled"] = *request.OutboundEnabled
+		}
+		if err := applyChannelAIReplyOptIn(account, request.AIReplyEnabled); err != nil {
+			return err
 		}
 		if request.IsDefaultIncoming != nil {
 			if *request.IsDefaultIncoming {
@@ -375,6 +447,9 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			account.IsDefaultIncoming = *request.IsDefaultIncoming
 		}
 		if request.IsDefaultOutgoing != nil {
+			if account.Channel == models.ChannelThreads && *request.IsDefaultOutgoing {
+				return errors.New("threads public engagement cannot be a default outbound channel because direct messages are not supported")
+			}
 			if *request.IsDefaultOutgoing {
 				if err := tx.Model(&models.ChannelAccount{}).
 					Where("organization_id = ? AND id <> ? AND is_default_outgoing = ?", orgID, id, true).
@@ -383,6 +458,11 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 				}
 			}
 			account.IsDefaultOutgoing = *request.IsDefaultOutgoing
+		}
+		if account.Channel == models.ChannelThreads {
+			account.Config = threadsPublicEngagementConfig(account.Config)
+			account.Capabilities = threadsPublicEngagementCapabilities(account.Capabilities)
+			account.IsDefaultOutgoing = false
 		}
 		if request.OutboundSecret != "" {
 			if a.Config == nil || strings.TrimSpace(a.Config.App.EncryptionKey) == "" {
@@ -409,19 +489,58 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			requiresRetest = true
 		}
 		if requiresRetest {
-			account.Config["outbound_enabled"] = false
+			disableChannelDeliveryForRetest(account)
 			account.Status = models.ChannelAccountStatusPending
 			account.LastHealthCheckAt = nil
 			account.LastError = ""
 			account.LastErrorAt = nil
 		}
+		cancelAIJobs := requiresRetest || profileKeyChanged ||
+			(request.AIReplyEnabled != nil && !*request.AIReplyEnabled) ||
+			(request.OutboundEnabled != nil && !*request.OutboundEnabled)
+		if cancelAIJobs {
+			cancelReason := "channel_ai_disabled"
+			if requiresRetest {
+				cancelReason = "channel_account_retest_required"
+			} else if profileKeyChanged {
+				cancelReason = "channel_account_profile_changed"
+			} else if request.OutboundEnabled != nil && !*request.OutboundEnabled {
+				cancelReason = "channel_account_outbound_disabled"
+			}
+			if err := cancelChannelAIReplyJobsForAccountTx(
+				tx,
+				orgID,
+				account.ID,
+				cancelReason,
+			); err != nil {
+				return err
+			}
+		}
 
 		account.UpdatedByID = &userID
-		if err := tx.
+		now := time.Now().UTC()
+		update := tx.Model(&models.ChannelAccount{}).
 			Where("id = ? AND organization_id = ?", account.ID, orgID).
-			Save(account).Error; err != nil {
-			return err
+			Updates(map[string]any{
+				"name":                 account.Name,
+				"status":               account.Status,
+				"capabilities":         account.Capabilities,
+				"config":               account.Config,
+				"is_default_incoming":  account.IsDefaultIncoming,
+				"is_default_outgoing":  account.IsDefaultOutgoing,
+				"last_health_check_at": account.LastHealthCheckAt,
+				"last_error":           account.LastError,
+				"last_error_at":        account.LastErrorAt,
+				"updated_by_id":        userID,
+				"updated_at":           now,
+			})
+		if update.Error != nil {
+			return update.Error
 		}
+		if update.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		account.UpdatedAt = now
 		var sensitiveChanges []map[string]any
 		if credentialChanged {
 			sensitiveChanges = append(sensitiveChanges, map[string]any{
@@ -459,8 +578,48 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 	return r.SendEnvelope(response)
 }
 
+func disableChannelDeliveryForRetest(account *models.ChannelAccount) {
+	if account == nil {
+		return
+	}
+	if account.Config == nil {
+		account.Config = models.JSONB{}
+	}
+	account.Config["outbound_enabled"] = false
+	// Changing relay routing or credentials invalidates the previous explicit
+	// AI approval too. A successful retest and outbound approval must not
+	// silently reactivate automatic replies without a fresh opt-in.
+	account.Config["ai_reply_enabled"] = false
+}
+
+func applyChannelAIReplyOptIn(
+	account *models.ChannelAccount,
+	enabled *bool,
+) error {
+	if enabled == nil {
+		return nil
+	}
+	if account == nil {
+		return errors.New("channel account is required")
+	}
+	if account.Channel != models.ChannelInstagram &&
+		account.Channel != models.ChannelMessenger {
+		return errors.New("automatic AI replies are supported only for Instagram and Messenger")
+	}
+	if *enabled &&
+		(account.Status != models.ChannelAccountStatusActive ||
+			!boolConfigValue(account.Config, "outbound_enabled")) {
+		return errors.New("activate and approve outbound delivery before enabling automatic AI replies")
+	}
+	if account.Config == nil {
+		account.Config = models.JSONB{}
+	}
+	account.Config["ai_reply_enabled"] = *enabled
+	return nil
+}
+
 func (a *App) TestChannelAccount(r *fastglue.Request) error {
-	orgID, userID, err := a.requireAuth(r, models.ResourceChannelAccounts, models.ActionWrite)
+	orgID, userID, err := a.requireChannelAccountTestAuth(r)
 	if err != nil {
 		return nil
 	}
@@ -468,9 +627,57 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 	if err != nil {
 		return nil
 	}
-	account, err := loadChannelAccount(a.DB, orgID, id, true)
-	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel account not found", nil, "")
+
+	// Reserve a per-account validation generation before making the network
+	// call. Only the newest reservation may apply a result, so a slow older
+	// success cannot overwrite a newer failure (or vice versa).
+	validationToken := uuid.NewString()
+	var account *models.ChannelAccount
+	var adapter channelapi.Adapter
+	var adapterErr error
+	if err := database.WithTenantReadCommitted(
+		a.rootApp().DB,
+		orgID,
+		func(tx *gorm.DB) error {
+			if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
+				return err
+			}
+			currentAccount, err := loadChannelAccount(tx, orgID, id, true)
+			if err != nil {
+				return err
+			}
+			account = currentAccount
+			if account.Provider == channelapi.LegacyMetaProvider {
+				return nil
+			}
+			adapter, adapterErr = a.channelAdapter(account)
+			if adapterErr != nil {
+				return nil
+			}
+			metadata := cloneJSONB(account.Metadata)
+			metadata[channelAccountHealthValidationTokenKey] = validationToken
+			reserved := tx.Model(&models.ChannelAccount{}).
+				Where("id = ? AND organization_id = ?", account.ID, orgID).
+				UpdateColumn("metadata", metadata)
+			if reserved.Error != nil {
+				return reserved.Error
+			}
+			if reserved.RowsAffected != 1 {
+				return gorm.ErrRecordNotFound
+			}
+			account.Metadata = metadata
+			return nil
+		},
+	); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel account not found", nil, "")
+		}
+		return r.SendErrorEnvelope(
+			fasthttp.StatusInternalServerError,
+			"Failed to prepare channel account validation",
+			nil,
+			"",
+		)
 	}
 	if account.Provider == channelapi.LegacyMetaProvider {
 		return r.SendEnvelope(map[string]any{
@@ -482,8 +689,7 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			},
 		})
 	}
-	adapter, err := a.channelAdapter(account)
-	if err != nil {
+	if adapterErr != nil {
 		return r.SendEnvelope(map[string]any{
 			"success": false,
 			"status":  account.Status,
@@ -491,58 +697,136 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 		})
 	}
 
+	validatedFingerprint, err := channelAccountValidationFingerprint(account)
+	if err != nil {
+		a.Log.Error("Failed to fingerprint channel account validation input", "error", err)
+		return r.SendErrorEnvelope(
+			fasthttp.StatusInternalServerError,
+			"Failed to prepare channel account validation",
+			nil,
+			"",
+		)
+	}
 	result, validationErr := adapter.ValidateAccount(requestContext(r), account)
 	now := time.Now().UTC()
-	oldAccount := *account
-	account.LastHealthCheckAt = &now
-	if validationErr != nil || !result.Valid {
-		account.LastErrorAt = &now
-		if validationErr != nil {
-			account.LastError = validationErr.Error()
-		} else {
-			account.LastError = "Provider rejected the channel account"
-		}
-		if account.Status == models.ChannelAccountStatusActive {
-			account.Status = models.ChannelAccountStatusDegraded
-		}
-	} else {
-		account.Status = models.ChannelAccountStatusActive
-		account.Capabilities = capabilitiesToJSONB(result.Capabilities)
-		account.LastError = ""
-		account.LastErrorAt = nil
-		if account.ConnectedAt == nil {
-			account.ConnectedAt = &now
-		}
-	}
-	account.UpdatedByID = &userID
+	var oldAccount models.ChannelAccount
 
-	if err := a.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&models.ChannelAccount{}).
-			Where("id = ? AND organization_id = ?", account.ID, orgID).
-			Updates(map[string]any{
-				"status":               account.Status,
-				"capabilities":         account.Capabilities,
-				"last_health_check_at": account.LastHealthCheckAt,
-				"last_error":           account.LastError,
-				"last_error_at":        account.LastErrorAt,
-				"connected_at":         account.ConnectedAt,
-				"updated_by_id":        userID,
-				"updated_at":           now,
-			}).Error; err != nil {
-			return err
+	if err := database.WithTenantReadCommitted(
+		a.rootApp().DB,
+		orgID,
+		func(tx *gorm.DB) error {
+			if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
+				return err
+			}
+			currentAccount, err := loadChannelAccount(tx, orgID, account.ID, true)
+			if err != nil {
+				return err
+			}
+			if !channelAccountValidationTokenMatches(
+				currentAccount,
+				validationToken,
+			) {
+				return ErrChannelAccountValidationSuperseded
+			}
+			currentFingerprint, err := channelAccountValidationFingerprint(currentAccount)
+			if err != nil {
+				return err
+			}
+			if currentFingerprint != validatedFingerprint {
+				return ErrChannelAccountChangedDuringValidation
+			}
+			oldAccount = *currentAccount
+			oldAccount.Config = cloneJSONB(currentAccount.Config)
+			oldAccount.Capabilities = cloneJSONB(currentAccount.Capabilities)
+			oldAccount.Metadata = cloneJSONB(currentAccount.Metadata)
+			currentAccount.LastHealthCheckAt = &now
+			if validationErr != nil || !result.Valid {
+				currentAccount.LastErrorAt = &now
+				if validationErr != nil {
+					currentAccount.LastError = validationErr.Error()
+				} else {
+					currentAccount.LastError = "Provider rejected the channel account"
+				}
+				if currentAccount.Status == models.ChannelAccountStatusActive {
+					currentAccount.Status = models.ChannelAccountStatusDegraded
+				}
+			} else {
+				currentAccount.Status = models.ChannelAccountStatusActive
+				currentAccount.Capabilities = capabilitiesToJSONB(result.Capabilities)
+				if currentAccount.Channel == models.ChannelThreads {
+					currentAccount.Capabilities = threadsPublicEngagementCapabilities(
+						currentAccount.Capabilities,
+					)
+				}
+				currentAccount.LastError = ""
+				currentAccount.LastErrorAt = nil
+				if currentAccount.ConnectedAt == nil {
+					currentAccount.ConnectedAt = &now
+				}
+			}
+			currentAccount.UpdatedByID = &userID
+			account = currentAccount
+
+			// A health transition in either direction starts a fresh delivery
+			// epoch. Cancel old AI work before saving the new account status so a
+			// later recovery cannot resurrect an inbound message from the prior
+			// state.
+			if oldAccount.Status != account.Status {
+				if err := cancelChannelAIReplyJobsForAccountTx(
+					tx,
+					orgID,
+					account.ID,
+					"channel_account_health_changed",
+				); err != nil {
+					return err
+				}
+			}
+			if err := tx.Model(&models.ChannelAccount{}).
+				Where("id = ? AND organization_id = ?", account.ID, orgID).
+				Updates(map[string]any{
+					"status":               account.Status,
+					"capabilities":         account.Capabilities,
+					"last_health_check_at": account.LastHealthCheckAt,
+					"last_error":           account.LastError,
+					"last_error_at":        account.LastErrorAt,
+					"connected_at":         account.ConnectedAt,
+					"updated_by_id":        userID,
+					"updated_at":           now,
+				}).Error; err != nil {
+				return err
+			}
+			return audit.LogAudit(
+				tx,
+				orgID,
+				userID,
+				audit.GetUserName(tx, userID),
+				"channel_account",
+				account.ID,
+				models.AuditActionUpdated,
+				&oldAccount,
+				account,
+			)
+		},
+	); err != nil {
+		if errors.Is(err, ErrChannelAccountValidationSuperseded) {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusConflict,
+				"A newer channel account validation superseded this result",
+				nil,
+				"",
+			)
 		}
-		return audit.LogAudit(
-			tx,
-			orgID,
-			userID,
-			audit.GetUserName(tx, userID),
-			"channel_account",
-			account.ID,
-			models.AuditActionUpdated,
-			&oldAccount,
-			account,
-		)
-	}); err != nil {
+		if errors.Is(err, ErrChannelAccountChangedDuringValidation) {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusConflict,
+				"Channel account changed during validation; run the test again",
+				nil,
+				"",
+			)
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel account not found", nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update channel account health", nil, "")
 	}
 
@@ -562,6 +846,54 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 	})
 }
 
+func (a *App) requireChannelAccountTestAuth(
+	r *fastglue.Request,
+) (uuid.UUID, uuid.UUID, error) {
+	orgID, userID, err := a.getOrgAndUserID(r)
+	if err != nil || orgID == uuid.Nil || userID == uuid.Nil {
+		_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return uuid.Nil, uuid.Nil, errEnvelopeSent
+	}
+
+	var authErr error
+	root := a.rootApp()
+	if err := database.WithTenantReadCommitted(
+		root.DB,
+		orgID,
+		func(tx *gorm.DB) error {
+			scoped := root.scopedApp(tx, orgID)
+			_, _, authErr = scoped.requireAuth(
+				r,
+				models.ResourceChannelAccounts,
+				models.ActionWrite,
+			)
+			// requireAuth already sends the specific authorization or
+			// entitlement response. Keep this short read transaction separate
+			// from the provider network call.
+			return nil
+		},
+	); err != nil {
+		a.Log.Error(
+			"Failed to authorize channel account validation",
+			"error",
+			err,
+			"organization_id",
+			orgID,
+		)
+		_ = r.SendErrorEnvelope(
+			fasthttp.StatusInternalServerError,
+			"Failed to authorize channel account validation",
+			nil,
+			"",
+		)
+		return uuid.Nil, uuid.Nil, errEnvelopeSent
+	}
+	if authErr != nil {
+		return uuid.Nil, uuid.Nil, authErr
+	}
+	return orgID, userID, nil
+}
+
 func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 	orgID, userID, err := a.requireAuth(r, models.ResourceChannelAccounts, models.ActionDelete)
 	if err != nil {
@@ -573,6 +905,9 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 	}
 
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
+			return err
+		}
 		account, findErr := loadChannelAccount(tx, orgID, id, false)
 		if findErr != nil {
 			return findErr
@@ -580,10 +915,22 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 		if account.Provider == channelapi.LegacyMetaProvider {
 			return ErrLegacyMetaAccountManaged
 		}
-		if err := tx.
-			Where("id = ? AND organization_id = ?", id, orgID).
-			Delete(&models.ChannelAccount{}).Error; err != nil {
+		if err := cancelChannelAIReplyJobsForAccountTx(
+			tx,
+			orgID,
+			account.ID,
+			"channel_account_deleted",
+		); err != nil {
 			return err
+		}
+		deleted := tx.
+			Where("id = ? AND organization_id = ?", id, orgID).
+			Delete(&models.ChannelAccount{})
+		if deleted.Error != nil {
+			return deleted.Error
+		}
+		if deleted.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
 		}
 		return audit.LogAudit(
 			tx,
@@ -613,6 +960,12 @@ func (a *App) channelAdapter(account *models.ChannelAccount) (channelapi.Adapter
 	if account == nil {
 		return nil, ErrChannelAdapterUnavailable
 	}
+	if account.Channel == models.ChannelThreads {
+		return nil, fmt.Errorf(
+			"%w: Threads public replies are beta and no approved Threads relay adapter is installed",
+			ErrChannelAdapterUnavailable,
+		)
+	}
 	if account.Channel == models.ChannelTikTok {
 		return nil, fmt.Errorf("%w: TikTok connections are not yet approved", ErrChannelAdapterUnavailable)
 	}
@@ -631,6 +984,7 @@ func validChannelIdentifier(channel models.Channel) bool {
 	case models.ChannelWhatsApp,
 		models.ChannelInstagram,
 		models.ChannelMessenger,
+		models.ChannelThreads,
 		models.ChannelWebChat,
 		models.ChannelEmail,
 		models.ChannelSMS,
@@ -642,19 +996,63 @@ func validChannelIdentifier(channel models.Channel) bool {
 	}
 }
 
+func additionalChannelCreationEntitlement(channel models.Channel) (string, bool) {
+	if channel == models.ChannelThreads {
+		return channelapi.ThreadsPublicEngagementEntitlementKey, true
+	}
+	return "", false
+}
+
+func validateChannelCreationPolicy(request ChannelAccountRequest) error {
+	if request.Channel != models.ChannelThreads {
+		return nil
+	}
+	if request.Provider != channelapi.RelayProvider {
+		return errors.New("threads public engagement accounts require the signed relay provider")
+	}
+	if request.IsDefaultOutgoing {
+		return errors.New("threads public engagement supports replies and mentions only; direct messages and default outbound are not supported")
+	}
+	return nil
+}
+
+func threadsPublicEngagementConfig(config models.JSONB) models.JSONB {
+	config = cloneJSONB(config)
+	config["engagement_mode"] = threadsPublicEngagementMode
+	config["direct_messages_supported"] = false
+	config["beta"] = true
+	config["activation_available"] = false
+	return config
+}
+
+func threadsPublicEngagementCapabilities(capabilities models.JSONB) models.JSONB {
+	capabilities = cloneJSONB(capabilities)
+	capabilities["business_initiation"] = false
+	capabilities["direct_messages"] = false
+	capabilities["public_replies"] = false
+	capabilities["mentions"] = false
+	capabilities["reply_target_required"] = true
+	return capabilities
+}
+
 func loadChannelAccount(db *gorm.DB, orgID, accountID uuid.UUID, credentials bool) (*models.ChannelAccount, error) {
 	query := db
 	if credentials {
-		query = query.Preload(
-			"Credentials",
-			"organization_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
-			orgID,
-			[]models.ChannelCredentialStatus{
-				models.ChannelCredentialStatusActive,
-				models.ChannelCredentialStatusExpiring,
-			},
-			time.Now().UTC(),
-		)
+		now := time.Now().UTC()
+		query = query.Preload("Credentials", func(credentials *gorm.DB) *gorm.DB {
+			return credentials.
+				Where(
+					"organization_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+					orgID,
+					[]models.ChannelCredentialStatus{
+						models.ChannelCredentialStatusActive,
+						models.ChannelCredentialStatusExpiring,
+					},
+					now,
+				).
+				Order("version DESC").
+				Order("id ASC")
+		})
 	}
 	var account models.ChannelAccount
 	if err := query.
@@ -705,12 +1103,10 @@ func currentChannelCredential(account *models.ChannelAccount) *models.ChannelCre
 		return nil
 	}
 	now := time.Now().UTC()
-	for i := range account.Credentials {
-		credential := &account.Credentials[i]
-		statusCurrent := credential.Status == models.ChannelCredentialStatusActive ||
-			credential.Status == models.ChannelCredentialStatusExpiring
-		if statusCurrent && (credential.ExpiresAt == nil || credential.ExpiresAt.After(now)) {
-			return &account.Credentials[i]
+	for _, index := range channelapi.CredentialIndexesByPriority(account.Credentials) {
+		credential := &account.Credentials[index]
+		if channelapi.CredentialIsCurrent(credential, now) {
+			return credential
 		}
 	}
 	return nil
@@ -725,6 +1121,75 @@ func cloneJSONB(value models.JSONB) models.JSONB {
 		cloned[key] = item
 	}
 	return cloned
+}
+
+// channelAccountValidationFingerprint hashes only provider-adapter inputs. It
+// deliberately excludes operational timestamps so normal inbound/outbound
+// activity does not invalidate an in-flight health check.
+func channelAccountValidationFingerprint(
+	account *models.ChannelAccount,
+) ([sha256.Size]byte, error) {
+	type credentialInput struct {
+		ID             uuid.UUID                      `json:"id"`
+		Kind           models.ChannelCredentialKind   `json:"kind"`
+		Version        int                            `json:"version"`
+		CredentialBlob models.JSONB                   `json:"credential_blob"`
+		Status         models.ChannelCredentialStatus `json:"status"`
+		KeyVersion     string                         `json:"key_version"`
+		ExpiresAt      *time.Time                     `json:"expires_at,omitempty"`
+	}
+	type validationInput struct {
+		Channel           models.Channel    `json:"channel"`
+		Provider          string            `json:"provider"`
+		ExternalAccountID string            `json:"external_account_id"`
+		Config            models.JSONB      `json:"config"`
+		Capabilities      models.JSONB      `json:"capabilities"`
+		Credentials       []credentialInput `json:"credentials"`
+	}
+
+	var zero [sha256.Size]byte
+	if account == nil {
+		return zero, errors.New("channel account is required")
+	}
+
+	credentials := make([]credentialInput, 0, len(account.Credentials))
+	for _, index := range channelapi.CredentialIndexesByPriority(account.Credentials) {
+		credential := &account.Credentials[index]
+		credentials = append(credentials, credentialInput{
+			ID:             credential.ID,
+			Kind:           credential.Kind,
+			Version:        credential.Version,
+			CredentialBlob: cloneJSONB(credential.CredentialBlob),
+			Status:         credential.Status,
+			KeyVersion:     credential.KeyVersion,
+			ExpiresAt:      credential.ExpiresAt,
+		})
+	}
+	encoded, err := json.Marshal(validationInput{
+		Channel:           account.Channel,
+		Provider:          account.Provider,
+		ExternalAccountID: account.ExternalAccountID,
+		Config:            cloneJSONB(account.Config),
+		Capabilities:      cloneJSONB(account.Capabilities),
+		Credentials:       credentials,
+	})
+	if err != nil {
+		return zero, fmt.Errorf("encode channel account validation input: %w", err)
+	}
+	return sha256.Sum256(encoded), nil
+}
+
+func channelAccountValidationTokenMatches(
+	account *models.ChannelAccount,
+	validationToken string,
+) bool {
+	if account == nil || strings.TrimSpace(validationToken) == "" {
+		return false
+	}
+	return stringConfigValue(
+		account.Metadata,
+		channelAccountHealthValidationTokenKey,
+	) == validationToken
 }
 
 func unsafeConfigKey(config models.JSONB) string {

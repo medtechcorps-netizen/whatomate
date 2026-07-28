@@ -104,10 +104,11 @@ jobs:
           # printed test is the one before the hang.
           # -timeout 10m caps the whole run so a hung test fails the job
           # in a reasonable window instead of waiting for go's default.
+          mapfile -t packages < <(go list ./... | grep -v /test/)
           gotestsum \
             --format testname \
             --hide-summary=skipped \
-            -- -race -p 1 -timeout 10m -coverprofile=coverage.out $(go list ./... | grep -v /test/)
+            -- -race -p 1 -timeout 10m -coverprofile=coverage.out "${packages[@]}"
 
       - name: Display coverage
         run: go tool cover -func=coverage.out | grep "total:"
@@ -185,10 +186,22 @@ jobs:
       - name: Build production container
         run: docker build -f docker/Dockerfile -t rereply:ci .
 
+      - name: Build Meta relay container
+        run: docker build -f docker/meta-relay.Dockerfile -t rereply-meta-relay:ci .
+
       - name: Scan production container
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: rereply:ci
+          format: table
+          exit-code: "1"
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+
+      - name: Scan Meta relay container
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: rereply-meta-relay:ci
           format: table
           exit-code: "1"
           vuln-type: os,library

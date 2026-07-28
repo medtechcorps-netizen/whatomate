@@ -412,6 +412,12 @@ func runServer(args []string) {
 					lo.Error("Channel outbox worker error", "error", err, "worker_num", workerNum)
 				}
 			}()
+			go func() {
+				lo.Info("Channel AI reply worker started", "worker_num", workerNum)
+				if err := w.RunChannelAIReplies(workerCtx); err != nil && err != context.Canceled {
+					lo.Error("Channel AI reply worker error", "error", err, "worker_num", workerNum)
+				}
+			}()
 		}
 		lo.Info("Embedded workers started", "count", *numWorkers)
 	} else {
@@ -520,7 +526,7 @@ func runWorker(args []string) {
 
 	// Create and run workers
 	workers := make([]*worker.Worker, *workerCount)
-	errCh := make(chan error, *workerCount*2)
+	errCh := make(chan error, *workerCount*3)
 
 	for i := 0; i < *workerCount; i++ {
 		w, err := worker.New(cfg, db, rdb, lo)
@@ -536,6 +542,10 @@ func runWorker(args []string) {
 		go func(workerNum int) {
 			lo.Info("Channel outbox worker started", "worker_num", workerNum)
 			errCh <- w.RunChannelOutbox(ctx)
+		}(i + 1)
+		go func(workerNum int) {
+			lo.Info("Channel AI reply worker started", "worker_num", workerNum)
+			errCh <- w.RunChannelAIReplies(ctx)
 		}(i + 1)
 	}
 
@@ -729,6 +739,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST("/api/admin/product/plans", app.CreateProductPlan)
 	g.PUT("/api/admin/product/plans/{id}", app.UpdateProductPlan)
 	g.GET(
+		"/api/admin/organizations/{organization_id}/product/plans",
+		app.ListAssignableProductPlans,
+	)
+	g.GET(
 		"/api/admin/organizations/{organization_id}/subscription",
 		app.GetOrganizationSubscription,
 	)
@@ -807,7 +821,11 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST("/api/channel-accounts", tenant((*handlers.App).CreateChannelAccount))
 	g.PUT("/api/channel-accounts/{id}", tenant((*handlers.App).UpdateChannelAccount))
 	g.DELETE("/api/channel-accounts/{id}", tenant((*handlers.App).DeleteChannelAccount))
-	g.POST("/api/channel-accounts/{id}/test", tenant((*handlers.App).TestChannelAccount))
+	// Health validation performs two short, independently committed tenant
+	// phases around a provider network call. Do not wrap it in the
+	// transaction-spanning Tenant adapter or the outer connection can deadlock
+	// while the phases wait for another pool connection.
+	g.POST("/api/channel-accounts/{id}/test", app.TestChannelAccount)
 	g.GET("/api/conversations", tenant((*handlers.App).ListInboxConversations))
 	g.GET(
 		"/api/conversations/{id}/messages",
@@ -820,6 +838,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST(
 		"/api/conversations/{id}/read",
 		tenant((*handlers.App).MarkInboxConversationRead),
+	)
+	g.PUT(
+		"/api/conversations/{id}/ai",
+		tenant((*handlers.App).SetInboxConversationAIState),
 	)
 
 	// Contacts

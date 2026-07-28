@@ -2,10 +2,11 @@
 
 Status: version 1, production contract
 
-This contract connects Instagram, Messenger, email, web chat, or another approved
-channel through a customer-operated HTTPS relay. The relay translates its
-provider's events into ReReply's canonical envelopes and translates ReReply's
-outbound envelopes back to the provider.
+This contract connects Instagram, Messenger, email, web chat, the pending
+Threads public-engagement beta, or another approved channel through a
+customer-operated HTTPS relay. The relay translates its provider's events into
+ReReply's canonical envelopes and translates ReReply's outbound envelopes back
+to the provider.
 
 ## Connection values
 
@@ -228,6 +229,46 @@ sends:
 - `type: "subscribe"` with `external_account_id` and `channel`.
 
 Those operations may return any `2xx`; `204 No Content` is supported.
+
+### Threads public-engagement profile
+
+This profile is a forward contract for a future approved Threads relay. The
+current release keeps Threads accounts pending and fails Test because no
+concrete Threads relay adapter is installed.
+
+For a public reply or mention, the inbound relay must set:
+
+```json
+{
+  "conversation": {
+    "external_id": "threads-public-reply-or-mention-id",
+    "metadata": {
+      "engagement_type": "reply"
+    }
+  }
+}
+```
+
+`engagement_type` must be `reply` or `mention`. The stable
+`conversation.external_id` is the public provider target. ReReply requires an
+outbound `reply_to_external_id` that exactly matches the selected conversation
+target. A future relay must map that target to Meta's public `reply_to_id`
+operation and reject a missing or mismatched target.
+
+**Threads direct messages and standalone posts are not supported by this
+profile.** The relay must never reinterpret a ReReply contact or conversation
+as a Threads DM recipient, and it must never publish an agent response without
+the existing public reply/mention target.
+
+The least-privilege public-engagement scopes are `threads_basic`,
+`threads_read_replies`, `threads_manage_replies`, `threads_content_publish`,
+and `threads_manage_mentions`. Confirm them against
+[Meta's official Threads API workspace](https://www.postman.com/meta/threads/overview),
+including the official
+[reply-management](https://www.postman.com/meta/threads/folder/34203612-1cc7918f-d63d-45fd-bdaa-e8855d0338cb)
+and
+[mentions](https://www.postman.com/meta/threads/request/34203612-fc3f21da-0a53-44ab-80e2-8cd8c376a42a)
+requests, during implementation and app review.
 
 ## Idempotency and retries
 

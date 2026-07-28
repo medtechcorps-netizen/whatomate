@@ -57,7 +57,8 @@ func TestRelayAdapterRouteAndNormalizeWebhook(t *testing.T) {
 			"message":{
 				"external_message_id":"message-1",
 				"conversation":{"external_id":"thread-1"},
-				"sender":{"external_id":"contact-1","display_name":"Amira"},
+				"sender":{"external_id":"contact-1","display_name":"Amira","role":"customer"},
+				"direction":"incoming",
 				"parts":[{"type":"text","text":"Hello"}]
 			}
 		}]

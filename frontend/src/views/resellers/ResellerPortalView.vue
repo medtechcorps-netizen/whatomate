@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import {
   Building2,
+  CreditCard,
   Check,
   Gauge,
   Globe2,
@@ -20,11 +21,20 @@ import { useAuthStore } from '@/stores/auth'
 import {
   organizationsService,
   resellersService,
+  type Organization,
   type Reseller,
   type ResellerMember,
   type ResellerUsage,
 } from '@/services/api'
-import { getErrorMessage, unwrapItemResponse, unwrapListResponse } from '@/lib/api-utils'
+import {
+  organizationSubscriptionService,
+  type PlanPriceSummary,
+  type PlanSummary,
+  type SetOrganizationSubscriptionRequest,
+  type SubscriptionSummary,
+} from '@/services/productSuite'
+import { getErrorMessage, unwrapItemResponse, unwrapListResponse, } from '@/lib/api-utils'
+import { formatCurrencyMinorUnits } from '@/lib/currency'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -52,10 +62,61 @@ const loading = ref(true)
 const detailLoading = ref(false)
 const activeTab = ref('portfolio')
 
-const selected = computed(() => resellers.value.find(item => item.id === selectedId.value) ?? null)
+interface PlanPriceOption {
+  key: string
+  plan: PlanSummary
+  price: PlanPriceSummary
+}
+
+const selected = computed(() => resellers.value.find((item) => item.id === selectedId.value) ?? null,
+)
+const plans = ref<PlanSummary[]>([])
+const planCatalogLoading = ref(false)
+const planCatalogError = ref('')
+const licensePriceResolutionError = ref('')
+let planCatalogRequestId = 0
+const organizationLicenses = ref<Record<string, SubscriptionSummary>>({})
+const organizationLicenseErrors = ref<Record<string, string>>({})
+const organizationLicenseLoading = ref<Record<string, boolean>>({})
+const selectedOrganizationId = ref('')
+const licenseSubmitting = ref(false)
+
+const selectedOrganization = computed(
+  () =>
+    usage.value?.organizations.find(
+      (item) => item.id === selectedOrganizationId.value,
+    ) ?? null,
+)
+const selectedOrganizationLicense = computed(() =>
+  selectedOrganizationId.value
+    ? (organizationLicenses.value[selectedOrganizationId.value] ?? null)
+    : null,
+)
+const planPriceOptions = computed<PlanPriceOption[]>(() =>
+  plans.value.flatMap((plan) =>
+    plan.prices
+      .filter((price) => price.interval !== 'one_time')
+      .map((price) => ({
+        key: `${plan.id}::${price.id}`,
+        plan,
+        price,
+      })),
+  ),
+)
+const licenseForm = reactive({
+  planPriceKey: '',
+  status: 'active' as SetOrganizationSubscriptionRequest['status'],
+  trialDays: 14,
+  manualReference: '',
+})
+const selectedPlanPrice = computed(
+  () =>
+    planPriceOptions.value.find(
+      (option) => option.key === licenseForm.planPriceKey,
+    ) ?? null,)
 const organizationCapacity = computed(() => {
   if (!usage.value?.max_organizations) return 0
-  return Math.min(100, Math.round((usage.value.organization_count / usage.value.max_organizations) * 100))
+  return Math.min(100, Math.round((usage.value.organization_count / usage.value.max_organizations) * 100,),)
 })
 
 const createOpen = ref(false)
@@ -107,14 +168,143 @@ function hydrateBrandForm(reseller: Reseller | null) {
   brandForm.max_organizations = reseller.max_organizations
 }
 
+function hydrateLicenseForm() {
+  const license = selectedOrganizationLicense.value
+  let option: PlanPriceOption | null = null
+  licensePriceResolutionError.value = ''
+  if (license && license.status !== 'unlicensed') {
+    if (license.plan_id && license.plan_price_id) {
+      option =
+        planPriceOptions.value.find(
+          (item) =>
+            item.plan.id === license.plan_id &&
+            item.price.id === license.plan_price_id,
+        ) ?? null
+    }
+    if (!option && !planCatalogLoading.value) {
+      licensePriceResolutionError.value =
+        'The current license price is not in this workspace’s assignable catalog. Select a price explicitly before saving.'
+    }
+  } else {
+    option = planPriceOptions.value[0] ?? null
+  }
+  licenseForm.planPriceKey = option?.key ?? ''
+  licenseForm.status = license?.status === 'trialing' ? 'trialing' : 'active'
+  licenseForm.trialDays = option?.plan.trial_days || 14
+  licenseForm.manualReference = ''
+}
+
+async function loadPlanCatalog() {
+  const organizationId = selectedOrganizationId.value
+  const requestId = ++planCatalogRequestId
+  plans.value = []
+  planCatalogError.value = ''
+  licensePriceResolutionError.value = ''
+  if (!isPlatformOwner.value || !organizationId) {
+    planCatalogLoading.value = false
+    hydrateLicenseForm()
+    return
+  }
+  planCatalogLoading.value = true
+  try {
+    const response = await organizationSubscriptionService.plans(organizationId)
+    if (
+      requestId !== planCatalogRequestId ||
+      organizationId !== selectedOrganizationId.value
+    )
+      return
+    plans.value = unwrapListResponse<PlanSummary>(response, 'plans')
+  } catch (error) {
+    if (
+      requestId !== planCatalogRequestId ||
+      organizationId !== selectedOrganizationId.value
+    )
+      return
+    plans.value = []
+    planCatalogError.value = getErrorMessage(
+      error,
+      'Unable to load assignable plans',
+    )
+  } finally {
+    if (
+      requestId === planCatalogRequestId &&
+      organizationId === selectedOrganizationId.value
+    ) {
+      planCatalogLoading.value = false
+      hydrateLicenseForm()
+    }
+  }
+}
+
+async function refreshOrganizationLicense(
+  organizationId: string,
+  quiet = false,
+) {
+  organizationLicenseLoading.value = {
+    ...organizationLicenseLoading.value,
+    [organizationId]: true,
+  }
+  try {
+    const response = await organizationSubscriptionService.get(organizationId)
+    const license = unwrapItemResponse<SubscriptionSummary>(response)
+    organizationLicenses.value = {
+      ...organizationLicenses.value,
+      [organizationId]: license,
+    }
+    const nextErrors = { ...organizationLicenseErrors.value }
+    delete nextErrors[organizationId]
+    organizationLicenseErrors.value = nextErrors
+    if (organizationId === selectedOrganizationId.value) hydrateLicenseForm()
+    return license
+  } catch (error) {
+    const message = getErrorMessage(error, 'Unable to load workspace license')
+    organizationLicenseErrors.value = {
+      ...organizationLicenseErrors.value,
+      [organizationId]: message,
+    }
+    if (!quiet) toast.error(message)
+    return null
+  } finally {
+    organizationLicenseLoading.value = {
+      ...organizationLicenseLoading.value,
+      [organizationId]: false,
+    }
+  }
+}
+
+async function loadOrganizationLicenses(organizations: Organization[]) {
+  const organizationIds = new Set(organizations.map((item) => item.id))
+  organizationLicenses.value = Object.fromEntries(
+    Object.entries(organizationLicenses.value).filter(([id]) =>
+      organizationIds.has(id),
+    ),
+  )
+  organizationLicenseErrors.value = Object.fromEntries(
+    Object.entries(organizationLicenseErrors.value).filter(([id]) =>
+      organizationIds.has(id),
+    ),
+  )
+  organizationLicenseLoading.value = {}
+  if (!organizations.length) {
+    selectedOrganizationId.value = ''
+    return
+  }
+  if (!organizationIds.has(selectedOrganizationId.value)) {
+    selectedOrganizationId.value = organizations[0].id
+  }
+  await Promise.all(
+    organizations.map((item) => refreshOrganizationLicense(item.id, true)),
+  )
+}
+
 async function loadResellers(preferredId?: string) {
   loading.value = true
   try {
     const response = await resellersService.list()
     resellers.value = unwrapListResponse<Reseller>(response, 'resellers')
-    const targetId = preferredId && resellers.value.some(item => item.id === preferredId)
+    const targetId = preferredId && resellers.value.some((item) => item.id === preferredId)
       ? preferredId
-      : selectedId.value && resellers.value.some(item => item.id === selectedId.value)
+      : selectedId.value && resellers.value.some((item) => item.id === selectedId.value)
         ? selectedId.value
         : resellers.value[0]?.id || ''
     selectedId.value = targetId
@@ -129,6 +319,10 @@ async function loadSelected() {
   if (!selectedId.value) {
     usage.value = null
     members.value = []
+    selectedOrganizationId.value = ''
+    organizationLicenses.value = {}
+    organizationLicenseErrors.value = {}
+    organizationLicenseLoading.value = {}
     return
   }
   detailLoading.value = true
@@ -137,9 +331,11 @@ async function loadSelected() {
       resellersService.usage(selectedId.value),
       resellersService.members(selectedId.value),
     ])
-    usage.value = unwrapItemResponse<ResellerUsage>(usageResponse)
-    members.value = unwrapListResponse<ResellerMember>(memberResponse, 'members')
+    const nextUsage = unwrapItemResponse<ResellerUsage>(usageResponse)
+    usage.value = nextUsage
+    members.value = unwrapListResponse<ResellerMember>(memberResponse, 'members',)
     hydrateBrandForm(selected.value)
+    await loadOrganizationLicenses(nextUsage.organizations)
   } catch (error) {
     toast.error(getErrorMessage(error, 'Unable to load portfolio details'))
   } finally {
@@ -148,6 +344,11 @@ async function loadSelected() {
 }
 
 watch(selectedId, loadSelected)
+watch(selectedOrganizationId, () => {
+  hydrateLicenseForm()
+  void loadPlanCatalog()
+})
+watch(planPriceOptions, hydrateLicenseForm)
 onMounted(loadResellers)
 
 async function createReseller() {
@@ -229,7 +430,7 @@ async function addMember() {
 
 async function removeMember(member: ResellerMember) {
   if (!selected.value) return
-  if (!window.confirm(`Revoke ${member.full_name || member.email} from this entire portfolio?`)) return
+  if (!window.confirm(`Revoke ${member.full_name || member.email} from this entire portfolio?`,)) return
   try {
     await resellersService.removeMember(selected.value.id, member.id)
     toast.success('Partner access revoked')
@@ -265,6 +466,93 @@ async function saveBranding() {
   } finally {
     brandingSubmitting.value = false
   }
+}
+
+async function assignWorkspaceLicense() {
+  if (!isPlatformOwner.value || !selectedOrganization.value) return
+  if (!selectedPlanPrice.value) {
+    toast.error('Choose an active recurring plan price')
+    return
+  }
+  const reference = licenseForm.manualReference.trim()
+  if (!reference) {
+    toast.error('An approval or contract reference is required')
+    return
+  }
+  const payload: SetOrganizationSubscriptionRequest = {
+    plan_id: selectedPlanPrice.value.plan.id,
+    plan_price_id: selectedPlanPrice.value.price.id,
+    status: licenseForm.status,
+    manual_reference: reference,
+  }
+  if (licenseForm.status === 'trialing') {
+    const trialDays = Number(licenseForm.trialDays)
+    if (!Number.isInteger(trialDays) || trialDays < 1 || trialDays > 365) {
+      toast.error('Trial days must be between 1 and 365')
+      return
+    }
+    payload.trial_days = trialDays
+  }
+
+  licenseSubmitting.value = true
+  try {
+    const organizationId = selectedOrganization.value.id
+    const response = await organizationSubscriptionService.set(
+      organizationId,
+      payload,
+    )
+    organizationLicenses.value = {
+      ...organizationLicenses.value,
+      [organizationId]: unwrapItemResponse<SubscriptionSummary>(response),
+    }
+    toast.success(`${selectedOrganization.value.name} license assigned`)
+    await refreshOrganizationLicense(organizationId, true)
+  } catch (error) {
+    toast.error(getErrorMessage(error, 'Unable to assign workspace license'))
+  } finally {
+    licenseSubmitting.value = false
+  }
+}
+
+function licenseStatusVariant(
+  status?: string,
+): 'success' | 'info' | 'warning' | 'destructive' {
+  if (status === 'active') return 'success'
+  if (status === 'trialing') return 'info'
+  if (status === 'unlicensed') return 'warning'
+  return 'destructive'
+}
+
+function licenseStatusLabel(status?: string) {
+  if (!status) return 'Unavailable'
+  return status
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (character: string) => character.toUpperCase())
+}
+
+function formatMoney(price: PlanPriceSummary) {
+  return formatMoneyAmount(price.currency, price.unit_amount_minor)
+}
+
+function formatMoneyAmount(currency: string, amountMinor: number) {
+  return formatCurrencyMinorUnits(currency, amountMinor)
+}
+
+function formatPriceInterval(price: PlanPriceSummary) {
+  const count = price.interval_count || 1
+  if (count === 1) return price.interval
+  return `${count} ${price.interval}s`
+}
+
+function formatLicenseDate(value?: string) {
+  if (!value) return 'Not scheduled'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return 'Not scheduled'
+  return new Intl.DateTimeFormat('en-MY', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  }).format(date)
 }
 
 function formatNumber(value?: number) {
@@ -321,7 +609,7 @@ function formatNumber(value?: number) {
               <div class="flex items-start gap-3">
                 <div
                   class="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-sm font-bold text-white"
-                  :style="{ backgroundColor: reseller.primary_color || '#0f766e' }"
+                  :style="{ backgroundColor: reseller.primary_color || '#0f766e', }"
                 >
                   {{ (reseller.brand_name || reseller.name).slice(0, 1).toUpperCase() }}
                 </div>
@@ -349,7 +637,7 @@ function formatNumber(value?: number) {
       <section v-if="selected" class="min-w-0 p-5 md:p-7">
         <div
           class="relative overflow-hidden rounded-2xl border border-white/10 bg-[#101214] p-6 light:border-gray-200 light:bg-white"
-          :style="{ '--brand-primary': selected.primary_color, '--brand-accent': selected.accent_color }"
+          :style="{ '--brand-primary': selected.primary_color, '--brand-accent': selected.accent_color, }"
         >
           <div class="absolute inset-y-0 left-0 w-1 bg-[var(--brand-primary)]" />
           <div class="absolute -right-12 -top-20 h-52 w-52 rounded-full bg-[var(--brand-primary)] opacity-[0.09] blur-3xl" />
@@ -415,7 +703,7 @@ function formatNumber(value?: number) {
           </TabsList>
 
           <TabsContent value="portfolio" class="mt-4">
-            <div class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_280px]">
+            <div class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
               <Card class="border-white/[0.08] bg-[#0d0f11] light:border-gray-200 light:bg-white">
                 <CardHeader class="flex-row items-center justify-between space-y-0">
                   <div>
@@ -428,18 +716,82 @@ function formatNumber(value?: number) {
                   <div class="overflow-x-auto">
                     <table class="w-full text-sm">
                       <thead class="border-y border-white/[0.07] bg-white/[0.02] text-left text-[11px] uppercase tracking-wider text-white/35 light:border-gray-200 light:text-gray-500">
-                        <tr><th class="px-6 py-3 font-medium">Business</th><th class="px-4 py-3 font-medium">Workspace ID</th><th class="px-6 py-3 text-right font-medium">Created</th></tr>
+                        <tr><th class="px-6 py-3 font-medium">Business</th><th class="px-4 py-3 font-medium">License</th>
+                          <th class="px-4 py-3 font-medium">Workspace ID</th><th class="px-4 py-3 font-medium">Created</th>
+                          <th class="px-6 py-3 text-right font-medium">
+                            <span class="sr-only">Licensedetails</span></th></tr>
                       </thead>
                       <tbody>
-                        <tr v-for="organization in usage?.organizations" :key="organization.id" class="border-b border-white/[0.06] last:border-0 light:border-gray-100">
+                        <tr v-for="organization in usage?.organizations" :key="organization.id"
+                          data-testid="workspace-license-row" class="border-b border-white/[0.06] transition last:border-0 light:border-gray-100"
+                          :class="{
+                            'bg-emerald-400/[0.045] light:bg-emerald-50':
+                              selectedOrganizationId === organization.id,
+                          }">
                           <td class="px-6 py-4">
                             <p class="font-medium">{{ organization.name }}</p>
                             <p class="mt-0.5 text-xs text-white/35 light:text-gray-500">{{ organization.slug }}</p>
                           </td>
-                          <td class="px-4 py-4 font-mono text-xs text-white/40 light:text-gray-500">{{ organization.id.slice(0, 8) }}…</td>
-                          <td class="px-6 py-4 text-right text-xs text-white/40 light:text-gray-500">{{ new Date(organization.created_at).toLocaleDateString() }}</td>
+                          <td class="px-4 py-4">
+                            <div
+                              v-if="organizationLicenseLoading[organization.id]"
+                              class="space-y-2"
+                            >
+                              <div
+                                class="h-4 w-24 animate-pulse rounded bg-white/[0.07] light:bg-gray-100"
+                              />
+                              <div
+                                class="h-3 w-14 animate-pulse rounded bg-white/[0.04] light:bg-gray-100"
+                              />
+                            </div>
+                            <Badge
+                              v-else-if="
+                                organizationLicenseErrors[organization.id]
+                              "
+                              variant="destructive"
+                            >
+                              Unavailable
+                            </Badge>
+                            <div v-else>
+                              <p class="max-w-48 truncate text-xs font-medium">
+                                {{
+                                  organizationLicenses[organization.id]
+                                    ?.plan_name || 'No active plan'
+                                }}
+                              </p>
+                              <Badge
+                                :variant="
+                                  licenseStatusVariant(
+                                    organizationLicenses[organization.id]
+                                      ?.status,
+                                  )
+                                "
+                                class="mt-1"
+                              >
+                                {{
+                                  licenseStatusLabel(
+                                    organizationLicenses[organization.id]
+                                      ?.status,
+                                  )
+                                }}
+                              </Badge>
+                            </div>
+                          </td>
+                          <td
+                            class="px-4 py-4 font-mono text-xs text-white/40 light:text-gray-500">{{ organization.id.slice(0, 8) }}…</td>
+                          <td class="px-4 py-4 text-xs text-white/40 light:text-gray-500">{{ new Date(organization.created_at,).toLocaleDateString() }}</td>
+                        <td class="px-6 py-4 text-right">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              data-testid="workspace-license-select"
+                              @click="selectedOrganizationId = organization.id"
+                            >
+                              {{ isPlatformOwner ? 'Manage' : 'View' }}
+                            </Button>
+                          </td>
                         </tr>
-                        <tr v-if="!usage?.organizations.length"><td colspan="3" class="px-6 py-12 text-center text-white/35 light:text-gray-500">No customer workspaces yet.</td></tr>
+                        <tr v-if="!usage?.organizations.length"><td colspan="5" class="px-6 py-12 text-center text-white/35 light:text-gray-500">No customer workspaces yet.</td></tr>
                       </tbody>
                     </table>
                   </div>
@@ -447,6 +799,356 @@ function formatNumber(value?: number) {
               </Card>
 
               <div class="space-y-4">
+                <Card
+                  data-testid="workspace-license-panel"
+                  class="border-white/[0.08] bg-[#0d0f11] light:border-gray-200 light:bg-white"
+                >
+                  <CardHeader
+                    class="flex-row items-center justify-between space-y-0"
+                  >
+                    <CardTitle class="flex items-center gap-2 text-sm">
+                      <CreditCard
+                        class="h-4 w-4 text-amber-300 light:text-amber-700"
+                      />
+                      Workspace license
+                    </CardTitle>
+                    <Button
+                      v-if="selectedOrganization"
+                      variant="ghost"
+                      size="icon"
+                      title="Refresh selected workspace license"
+                      aria-label="Refresh selected workspace license"
+                      :disabled="
+                        organizationLicenseLoading[selectedOrganization.id]
+                      "
+                      @click="
+                        refreshOrganizationLicense(selectedOrganization.id)
+                      "
+                    >
+                      <RefreshCw
+                        class="h-4 w-4"
+                        :class="{
+                          'animate-spin':
+                            organizationLicenseLoading[selectedOrganization.id],
+                        }"
+                      />
+                    </Button>
+                  </CardHeader>
+                  <CardContent>
+                    <div v-if="!selectedOrganization" class="py-6 text-center">
+                      <p class="text-sm text-white/45 light:text-gray-500">
+                        Select a workspace to inspect its license.
+                      </p>
+                    </div>
+                    <div
+                      v-else-if="
+                        organizationLicenseLoading[selectedOrganization.id]
+                      "
+                      class="space-y-3"
+                    >
+                      <div
+                        class="h-5 w-36 animate-pulse rounded bg-white/[0.07] light:bg-gray-100"
+                      />
+                      <div
+                        class="h-4 w-24 animate-pulse rounded bg-white/[0.04] light:bg-gray-100"
+                      />
+                      <div
+                        class="h-24 animate-pulse rounded-xl bg-white/[0.025] light:bg-gray-50"
+                      />
+                    </div>
+                    <div
+                      v-else-if="
+                        organizationLicenseErrors[selectedOrganization.id]
+                      "
+                      class="rounded-xl border border-red-400/15 bg-red-400/[0.06] p-4"
+                    >
+                      <p
+                        class="text-sm font-medium text-red-200 light:text-red-700"
+                      >
+                        License unavailable
+                      </p>
+                      <p
+                        class="mt-1 text-xs leading-5 text-red-100/55 light:text-red-600"
+                      >
+                        {{ organizationLicenseErrors[selectedOrganization.id] }}
+                      </p>
+                      <Button
+                        class="mt-3"
+                        variant="outline"
+                        size="sm"
+                        @click="
+                          refreshOrganizationLicense(selectedOrganization.id)
+                        "
+                      >
+                        Try again
+                      </Button>
+                    </div>
+                    <div v-else class="space-y-4">
+                      <div>
+                        <p class="truncate text-sm font-semibold">
+                          {{ selectedOrganization.name }}
+                        </p>
+                        <p
+                          class="mt-0.5 truncate text-xs text-white/35 light:text-gray-500"
+                        >
+                          {{ selectedOrganization.slug }}
+                        </p>
+                      </div>
+                      <div
+                        class="rounded-xl border border-white/[0.07] bg-white/[0.025] p-4 light:border-gray-200 light:bg-gray-50"
+                      >
+                        <div
+                          class="flex flex-wrap items-center justify-between gap-2"
+                        >
+                          <p class="text-sm font-medium">
+                            {{
+                              selectedOrganizationLicense?.plan_name ||
+                              'No active plan'
+                            }}
+                          </p>
+                          <Badge
+                            :variant="
+                              licenseStatusVariant(
+                                selectedOrganizationLicense?.status,
+                              )
+                            "
+                          >
+                            {{
+                              licenseStatusLabel(
+                                selectedOrganizationLicense?.status,
+                              )
+                            }}
+                          </Badge>
+                        </div>
+                        <div class="mt-3 grid grid-cols-2 gap-3 text-xs">
+                          <div>
+                            <p class="text-white/35 light:text-gray-500">
+                              {{
+                                selectedOrganizationLicense?.status ===
+                                'trialing'
+                                  ? 'Trial ends'
+                                  : 'Period ends'
+                              }}
+                            </p>
+                            <p class="mt-1 font-medium">
+                              {{
+                                formatLicenseDate(
+                                  selectedOrganizationLicense?.status ===
+                                    'trialing'
+                                    ? selectedOrganizationLicense?.trial_ends_at
+                                    : selectedOrganizationLicense?.current_period_end,
+                                )
+                              }}
+                            </p>
+                          </div>
+                          <div>
+                            <p class="text-white/35 light:text-gray-500">
+                              Plan code
+                            </p>
+                            <p class="mt-1 truncate font-mono text-[11px]">
+                              {{
+                                selectedOrganizationLicense?.plan_code ||
+                                'unlicensed'
+                              }}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+
+                      <template v-if="isPlatformOwner">
+                        <div
+                          class="border-t border-white/[0.07] pt-4 light:border-gray-200"
+                        >
+                          <div
+                            class="mb-3 flex items-center justify-between gap-2"
+                          >
+                            <div>
+                              <p class="text-sm font-medium">
+                                Assign manual license
+                              </p>
+                              <p
+                                class="mt-0.5 text-xs text-white/35 light:text-gray-500"
+                              >
+                                Stores the approval reference with the license
+                                record.
+                              </p>
+                            </div>
+                            <Badge variant="outline">Platform owner</Badge>
+                          </div>
+
+                          <div v-if="planCatalogLoading" class="space-y-2">
+                            <div
+                              class="h-10 animate-pulse rounded-md bg-white/[0.05] light:bg-gray-100"
+                            />
+                            <div
+                              class="h-10 animate-pulse rounded-md bg-white/[0.035] light:bg-gray-50"
+                            />
+                          </div>
+                          <div
+                            v-else-if="planCatalogError"
+                            class="rounded-lg border border-red-400/15 bg-red-400/[0.05] p-3"
+                          >
+                            <p
+                              class="text-xs leading-5 text-red-100/65 light:text-red-700"
+                            >
+                              {{ planCatalogError }}
+                            </p>
+                            <Button
+                              class="mt-2"
+                              variant="outline"
+                              size="sm"
+                              @click="loadPlanCatalog"
+                              >Retry catalog</Button
+                            >
+                          </div>
+                          <div
+                            v-else-if="
+                              !plans.length || !planPriceOptions.length
+                            "
+                            data-testid="workspace-license-no-plans"
+                            class="rounded-lg border border-amber-400/15 bg-amber-400/[0.05] p-3"
+                          >
+                            <p
+                              class="text-xs font-medium text-amber-100 light:text-amber-800"
+                            >
+                              {{
+                                plans.length
+                                  ? 'No active recurring plan prices'
+                                  : 'No assignable product plans'
+                              }}
+                            </p>
+                            <p
+                              class="mt-1 text-xs leading-5 text-white/40 light:text-gray-600"
+                            >
+                              Create or activate a manual recurring plan for
+                              this workspace’s portfolio before assigning it.
+                            </p>
+                          </div>
+                          <form
+                            v-else
+                            class="space-y-3"
+                            @submit.prevent="assignWorkspaceLicense"
+                          >
+                            <div class="space-y-1.5">
+                              <Label for="workspace-license-plan"
+                                >Active plan price</Label
+                              >
+                              <select
+                                id="workspace-license-plan"
+                                v-model="licenseForm.planPriceKey"
+                                data-testid="workspace-license-plan"
+                                class="control-select"
+                                required
+                              >
+                                <option disabled value="">
+                                  Select a plan price
+                                </option>
+                                <option
+                                  v-for="option in planPriceOptions"
+                                  :key="option.key"
+                                  :value="option.key"
+                                >
+                                  {{ option.plan.name }} ·
+                                  {{ formatMoney(option.price) }} /
+                                  {{ formatPriceInterval(option.price) }}
+                                </option>
+                              </select>
+                              <p
+                                v-if="licensePriceResolutionError"
+                                data-testid="workspace-license-price-unresolved"
+                                class="text-[11px] leading-5 text-amber-200/75 light:text-amber-700"
+                              >
+                                {{ licensePriceResolutionError }}
+                              </p>
+                              <p
+                                v-if="
+                                  selectedPlanPrice?.price.setup_amount_minor
+                                "
+                                class="text-[11px] text-white/35 light:text-gray-500"
+                              >
+                                Setup fee:
+                                {{
+                                  formatMoneyAmount(
+                                    selectedPlanPrice.price.currency,
+                                    selectedPlanPrice.price.setup_amount_minor,
+                                  )
+                                }}
+                              </p>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                              <div class="space-y-1.5">
+                                <Label for="workspace-license-status"
+                                  >Status</Label
+                                >
+                                <select
+                                  id="workspace-license-status"
+                                  v-model="licenseForm.status"
+                                  data-testid="workspace-license-status"
+                                  class="control-select"
+                                >
+                                  <option value="active">Active</option>
+                                  <option value="trialing">Trialing</option>
+                                </select>
+                              </div>
+                              <div
+                                v-if="licenseForm.status === 'trialing'"
+                                class="space-y-1.5"
+                              >
+                                <Label for="workspace-license-trial"
+                                  >Trial days</Label
+                                >
+                                <Input
+                                  id="workspace-license-trial"
+                                  v-model.number="licenseForm.trialDays"
+                                  data-testid="workspace-license-trial"
+                                  type="number"
+                                  min="1"
+                                  max="365"
+                                  required
+                                />
+                              </div>
+                            </div>
+                            <div class="space-y-1.5">
+                              <Label for="workspace-license-reference"
+                                >Approval / contract reference</Label
+                              >
+                              <Input
+                                id="workspace-license-reference"
+                                v-model="licenseForm.manualReference"
+                                data-testid="workspace-license-reference"
+                                maxlength="255"
+                                placeholder="REALIGN-2026-001"
+                                required
+                              />
+                            </div>
+                            <Button
+                              type="submit"
+                              class="w-full"
+                              data-testid="workspace-license-submit"
+                              :loading="licenseSubmitting"
+                              :disabled="
+                                licenseSubmitting ||
+                                !selectedPlanPrice ||
+                                !licenseForm.manualReference.trim()
+                              "
+                            >
+                              <Check class="mr-2 h-4 w-4" />
+                              Assign license
+                            </Button>
+                          </form>
+                        </div>
+                      </template>
+                      <p
+                        v-else
+                        class="border-t border-white/[0.07] pt-3 text-xs leading-5 text-white/35 light:border-gray-200 light:text-gray-500"
+                      >
+                        License changes are reserved for the platform owner.
+                        Partner administrators retain read-only portfolio
+                        visibility.
+                      </p>
+                    </div>
+                  </CardContent>
+                </Card>
                 <Card class="border-white/[0.08] bg-[#0d0f11] light:border-gray-200 light:bg-white">
                 <CardHeader><CardTitle class="flex items-center gap-2 text-sm"><Gauge class="h-4 w-4 text-emerald-300" />Plan capacity</CardTitle></CardHeader>
                   <CardContent>
