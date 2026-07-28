@@ -12,7 +12,10 @@ import (
 	"gorm.io/gorm"
 )
 
-const OmnichannelEntitlementKey = "omnichannel.enabled"
+const (
+	OmnichannelEntitlementKey             = "omnichannel.enabled"
+	ThreadsPublicEngagementEntitlementKey = "threads.public_engagement.enabled"
+)
 
 // HasDurableOmnichannelEntitlement evaluates the commercial entitlement without
 // relying on an authenticated user. Callers must pass a tenant-scoped database

@@ -22,10 +22,19 @@ import (
 )
 
 const (
-	RelayProvider         = "relay"
-	RelaySignatureHeader  = "X-ReReply-Signature-256"
-	relaySignaturePrefix  = "sha256="
-	defaultRelayBodyLimit = int64(1 << 20)
+	RelayProvider              = "relay"
+	RelaySignatureHeader       = "X-ReReply-Signature-256"
+	relaySignaturePrefix       = "sha256="
+	defaultRelayBodyLimit      = int64(1 << 20)
+	maxRelayReplyContextRunes  = 512
+	maxRelayMessageContextSize = 64 << 10
+
+	// RelayWebhookMaxBodyBytes is the public ReReply webhook request limit.
+	// Relay implementations that batch canonical events must stay below
+	// RelayCanonicalWebhookMaxBodyBytes so protocol overhead cannot make an
+	// already-accepted batch fail at the ReReply boundary.
+	RelayWebhookMaxBodyBytes          = 2 << 20
+	RelayCanonicalWebhookMaxBodyBytes = RelayWebhookMaxBodyBytes - (64 << 10)
 )
 
 var (
@@ -35,6 +44,7 @@ var (
 	ErrRelayOutboundDisabled        = errors.New("relay outbound delivery is not approved")
 	ErrRelayURLInvalid              = errors.New("relay URL is invalid")
 	ErrCredentialRefreshUnsupported = errors.New("relay credentials cannot be refreshed automatically")
+	errRelayOutgoingEcho            = errors.New("relay outgoing message echo")
 )
 
 // RelayAdapter implements a generic HMAC-signed HTTPS bridge for channels that
@@ -73,15 +83,9 @@ func (a *RelayAdapter) Provider() string {
 }
 
 func (a *RelayAdapter) Capabilities(account *models.ChannelAccount) Capabilities {
-	capabilities := Capabilities{
-		Text:         true,
-		Media:        true,
-		Replies:      true,
-		ReadReceipts: true,
-		Typing:       true,
-	}
+	capabilities := defaultRelayCapabilities(a.channel)
 	if account == nil {
-		return capabilities
+		return ApplyMandatoryProviderCapabilities(a.channel, capabilities)
 	}
 
 	setCapability := func(key string, target *bool) {
@@ -115,7 +119,24 @@ func (a *RelayAdapter) Capabilities(account *models.ChannelAccount) Capabilities
 			}
 		}
 	}
-	return capabilities
+	return ApplyMandatoryProviderCapabilities(a.channel, capabilities)
+}
+
+func defaultRelayCapabilities(channel models.Channel) Capabilities {
+	switch channel {
+	case models.ChannelInstagram, models.ChannelMessenger:
+		// Meta relay accounts start text-only. Additional capabilities require
+		// an explicit, reviewed account configuration.
+		return Capabilities{Text: true, ServiceWindow: true}
+	default:
+		return Capabilities{
+			Text:         true,
+			Media:        true,
+			Replies:      true,
+			ReadReceipts: true,
+			Typing:       true,
+		}
+	}
 }
 
 func (a *RelayAdapter) RouteHint(_ http.Header, body []byte) (WebhookRouteHint, error) {
@@ -172,6 +193,7 @@ func (a *RelayAdapter) NormalizeWebhook(_ context.Context, account *models.Chann
 
 	now := a.now().UTC()
 	seen := make(map[string]struct{}, len(envelope.Events))
+	normalized := make([]InboundEvent, 0, len(envelope.Events))
 	for i := range envelope.Events {
 		event := &envelope.Events[i]
 		event.DedupeKey = strings.TrimSpace(event.DedupeKey)
@@ -182,31 +204,39 @@ func (a *RelayAdapter) NormalizeWebhook(_ context.Context, account *models.Chann
 			return nil, fmt.Errorf("relay event %d duplicates dedupe_key %q", i, event.DedupeKey)
 		}
 		seen[event.DedupeKey] = struct{}{}
-		if event.OccurredAt.IsZero() {
-			event.OccurredAt = now
-		}
+		event.OccurredAt = capRelayTimestamp(event.OccurredAt, now)
 		switch event.Type {
 		case NormalizedEventTypeMessage:
 			if err := validateRelayMessage(event.Message, i, now); err != nil {
+				if errors.Is(err, errRelayOutgoingEcho) {
+					// Provider echoes of messages sent by ReReply are not
+					// customer inbound events and must never enter the inbox as
+					// incoming messages.
+					continue
+				}
 				return nil, err
 			}
 		case NormalizedEventTypeMessageStatus:
 			if event.MessageStatus == nil {
 				return nil, fmt.Errorf("relay event %d message_status payload is required", i)
 			}
+			event.MessageStatus.OccurredAt = capRelayTimestamp(event.MessageStatus.OccurredAt, now)
 		case NormalizedEventTypeRead:
 			if event.Read == nil {
 				return nil, fmt.Errorf("relay event %d read payload is required", i)
 			}
+			event.Read.ReadAt = capRelayTimestamp(event.Read.ReadAt, now)
 		case NormalizedEventTypeReaction:
 			if event.Reaction == nil {
 				return nil, fmt.Errorf("relay event %d reaction payload is required", i)
 			}
+			event.Reaction.OccurredAt = capRelayTimestamp(event.Reaction.OccurredAt, now)
 		default:
 			return nil, fmt.Errorf("relay event %d type %q is not supported", i, event.Type)
 		}
+		normalized = append(normalized, *event)
 	}
-	return envelope.Events, nil
+	return normalized, nil
 }
 
 func (a *RelayAdapter) Send(ctx context.Context, account *models.ChannelAccount, message OutboundMessage) (SendResult, error) {
@@ -452,12 +482,9 @@ func (a *RelayAdapter) credentialValue(account *models.ChannelAccount, key strin
 		return "", ErrRelaySecretMissing
 	}
 	now := a.now().UTC()
-	for _, credential := range account.Credentials {
-		if credential.Status != models.ChannelCredentialStatusActive &&
-			credential.Status != models.ChannelCredentialStatusExpiring {
-			continue
-		}
-		if credential.ExpiresAt != nil && !credential.ExpiresAt.After(now) {
+	for _, index := range CredentialIndexesByPriority(account.Credentials) {
+		credential := &account.Credentials[index]
+		if !CredentialIsCurrent(credential, now) {
 			continue
 		}
 		value, ok := credential.CredentialBlob[key].(string)
@@ -476,6 +503,19 @@ func (a *RelayAdapter) credentialValue(account *models.ChannelAccount, key strin
 func validateRelayMessage(message *InboundMessage, index int, now time.Time) error {
 	if message == nil {
 		return fmt.Errorf("relay event %d message payload is required", index)
+	}
+	switch message.Direction {
+	case models.DirectionOutgoing:
+		return errRelayOutgoingEcho
+	case models.DirectionIncoming:
+		// Continue with strict customer-inbound validation.
+	case "":
+		return fmt.Errorf("relay event %d message direction is required", index)
+	default:
+		return fmt.Errorf("relay event %d message direction %q is not supported", index, message.Direction)
+	}
+	if message.Sender.Role != models.ConversationParticipantRoleCustomer {
+		return fmt.Errorf("relay event %d sender role must be customer", index)
 	}
 	if strings.TrimSpace(message.ExternalMessageID) == "" {
 		return fmt.Errorf("relay event %d external_message_id is required", index)
@@ -497,6 +537,24 @@ func validateRelayMessage(message *InboundMessage, index int, now time.Time) err
 	if utf8.RuneCountInString(message.Conversation.ExternalID) > 512 ||
 		utf8.RuneCountInString(message.Conversation.Subject) > 998 {
 		return fmt.Errorf("relay event %d conversation field is too long", index)
+	}
+	if utf8.RuneCountInString(message.ReplyToExternalID) > maxRelayReplyContextRunes {
+		return fmt.Errorf("relay event %d reply context is too long", index)
+	}
+	contextPayload, err := json.Marshal(struct {
+		Message      map[string]any `json:"message,omitempty"`
+		Conversation map[string]any `json:"conversation,omitempty"`
+		Sender       map[string]any `json:"sender,omitempty"`
+	}{
+		Message:      message.Metadata,
+		Conversation: message.Conversation.Metadata,
+		Sender:       message.Sender.Metadata,
+	})
+	if err != nil {
+		return fmt.Errorf("relay event %d message context cannot be encoded", index)
+	}
+	if len(contextPayload) > maxRelayMessageContextSize {
+		return fmt.Errorf("relay event %d message context is too large", index)
 	}
 	if len(message.Parts) == 0 {
 		return fmt.Errorf("relay event %d message parts are required", index)
@@ -529,16 +587,17 @@ func validateRelayMessage(message *InboundMessage, index int, now time.Time) err
 			return fmt.Errorf("relay event %d part %d type %q is not supported", index, partIndex, part.Type)
 		}
 	}
-	if message.Direction == "" {
-		message.Direction = models.DirectionIncoming
-	}
-	if message.SentAt.IsZero() {
-		message.SentAt = now
-	}
-	if message.ReceivedAt.IsZero() {
-		message.ReceivedAt = now
-	}
+	message.SentAt = capRelayTimestamp(message.SentAt, now)
+	message.ReceivedAt = capRelayTimestamp(message.ReceivedAt, now)
 	return nil
+}
+
+func capRelayTimestamp(value, now time.Time) time.Time {
+	now = now.UTC()
+	if value.IsZero() || value.After(now) {
+		return now
+	}
+	return value.UTC()
 }
 
 func validateRelayURL(rawURL string, allowLocalhost bool) (*url.URL, error) {

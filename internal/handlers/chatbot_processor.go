@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
+	qwenapi "github.com/shridarpatil/whatomate/internal/qwen"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"gorm.io/gorm"
 )
@@ -1092,27 +1093,41 @@ func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *
 // Alibaba Cloud Model Studio's OpenAI-compatible Qwen API. Thinking is disabled
 // for routine CRM replies to keep latency and token usage predictable.
 func (a *App) generateQwenResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
-	requestSettings := settings
-	if settings.AI.Model == "" {
-		settingsCopy := *settings
-		settingsCopy.AI.Model = "qwen3.7-plus"
-		requestSettings = &settingsCopy
+	messages := make([]qwenapi.Message, 0, 8)
+	systemPrompt := settings.AI.SystemPrompt
+	if contextData != "" {
+		if systemPrompt != "" {
+			systemPrompt += "\n\n" + contextData
+		} else {
+			systemPrompt = contextData
+		}
 	}
+	if systemPrompt != "" {
+		messages = append(messages, qwenapi.Message{Role: "system", Content: systemPrompt})
+	}
+	if settings.AI.IncludeHistory && session != nil {
+		for _, message := range a.getSessionHistory(session.ID, settings.AI.HistoryLimit) {
+			role := "user"
+			if message.Direction == models.DirectionOutgoing {
+				role = "assistant"
+			}
+			messages = append(messages, qwenapi.Message{Role: role, Content: message.Message})
+		}
+	}
+	messages = append(messages, qwenapi.Message{Role: "user", Content: userMessage})
 
-	baseURL := "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+	baseURL := qwenapi.DefaultBaseURL
 	if a.Config != nil && a.Config.AI.QwenBaseURL != "" {
 		baseURL = a.Config.AI.QwenBaseURL
 	}
-
-	return a.generateOpenAICompatibleResponse(
-		"Qwen",
-		strings.TrimRight(baseURL, "/")+"/chat/completions",
-		requestSettings,
-		session,
-		userMessage,
-		contextData,
-		map[string]any{"enable_thinking": false},
-	)
+	return qwenapi.Generate(context.Background(), a.HTTPClient, qwenapi.Options{
+		APIKey:      settings.AI.APIKey,
+		BaseURL:     baseURL,
+		Model:       settings.AI.Model,
+		MaxTokens:   settings.AI.MaxTokens,
+		Temperature: settings.AI.Temperature,
+		Messages:    messages,
+	})
 }
 
 // generateAnthropicResponse generates a response using Anthropic API

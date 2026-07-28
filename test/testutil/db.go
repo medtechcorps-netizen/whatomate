@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -76,6 +77,53 @@ func SetupTestDBWithCleanup(t *testing.T, cleanup bool) *gorm.DB {
 	}
 
 	return db
+}
+
+// RequirePostgresBackendWaitingForLock waits until PostgreSQL confirms that a
+// known backend is blocked on a lock. It makes transaction-serialization tests
+// deterministic instead of treating an elapsed sleep as proof that the
+// competing statement reached its lock.
+func RequirePostgresBackendWaitingForLock(
+	t *testing.T,
+	db *gorm.DB,
+	backendPID int,
+) {
+	t.Helper()
+	if db == nil || backendPID <= 0 {
+		t.Fatalf("valid database and PostgreSQL backend PID are required")
+	}
+
+	type backendActivity struct {
+		State         string `gorm:"column:state"`
+		WaitEventType string `gorm:"column:wait_event_type"`
+		WaitEvent     string `gorm:"column:wait_event"`
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var last backendActivity
+	var lastErr error
+	for time.Now().Before(deadline) {
+		last = backendActivity{}
+		lastErr = db.Raw(`
+			SELECT
+				COALESCE(state, '') AS state,
+				COALESCE(wait_event_type, '') AS wait_event_type,
+				COALESCE(wait_event, '') AS wait_event
+			FROM pg_catalog.pg_stat_activity
+			WHERE pid = ?
+		`, backendPID).Scan(&last).Error
+		if lastErr == nil && last.WaitEventType == "Lock" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf(
+		"PostgreSQL backend %d did not wait for a lock (state=%q wait_type=%q wait=%q error=%v)",
+		backendPID,
+		last.State,
+		last.WaitEventType,
+		last.WaitEvent,
+		lastErr,
+	)
 }
 
 // runMigrations runs all model migrations.

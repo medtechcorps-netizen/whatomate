@@ -5,6 +5,10 @@ import type { AxiosResponse } from 'axios'
 const PRODUCT_PAGE_LIMIT = 100
 const PRODUCT_MAX_PAGES = 200
 
+type APIEnvelope<T> = {
+  data: T
+}
+
 function listTotal(response: AxiosResponse): number | null {
   const payload = response.data?.data ?? response.data
   return typeof payload?.total === 'number' ? payload.total : null
@@ -35,23 +39,56 @@ export type Money = {
   currency: string
 }
 
+export type BillingInterval = 'one_time' | 'month' | 'year'
+
+export interface PlanPriceSummary {
+  id: string
+  code: string
+  currency: string
+  unit_amount_minor: number
+  setup_amount_minor: number
+  interval: BillingInterval
+  interval_count: number
+  tax_behavior: string
+}
+
 export interface PlanSummary {
+  id: string
   code: string
   name: string
   description?: string
+  vertical: string
+  status: 'draft' | 'active' | 'archived'
+  trial_days: number
+  is_public: boolean
   entitlements: Record<string, unknown>
+  prices: PlanPriceSummary[]
 }
 
 export interface SubscriptionSummary {
   id?: string
+  plan_id?: string
+  plan_price_id?: string
   plan_code: string
   plan_name?: string
   status: string
   provider: string
   trial_ends_at?: string
+  current_period_start?: string
   current_period_end?: string
   grace_until?: string
   cancel_at_period_end?: boolean
+  cancel_at?: string
+}
+
+export interface SetOrganizationSubscriptionRequest {
+  plan_id?: string
+  plan_code?: string
+  plan_price_id?: string
+  price_code?: string
+  status: 'active' | 'trialing'
+  trial_days?: number
+  manual_reference: string
 }
 
 export interface OnboardingStep {
@@ -96,7 +133,8 @@ export interface PrivacyRequest {
   id: string
   request_number?: string
   contact_id?: string
-  request_type: 'access' | 'portability' | 'correction' | 'restriction' | 'erasure'
+  request_type:
+    | 'access' | 'portability' | 'correction' | 'restriction' | 'erasure'
   status: string
   verification_status?: string
   due_at?: string
@@ -112,7 +150,8 @@ export interface SupportCase {
   description: string
   severity: 'low' | 'normal' | 'high' | 'critical'
   category?: string
-  status: 'open' | 'investigating' | 'waiting' | 'waiting_customer' | 'waiting_internal' | 'resolved' | 'closed'
+  status:
+    | 'open' | 'investigating' | 'waiting' | 'waiting_customer' | 'waiting_internal' | 'resolved' | 'closed'
   assigned_user_id?: string
   resolution?: string
   created_at: string
@@ -237,7 +276,8 @@ export interface Booking {
   id: string
   event_id: string
   contact_id: string
-  status: 'reserved' | 'confirmed' | 'waitlisted' | 'checked_in' | 'completed' | 'no_show' | 'cancelled'
+  status:
+    | 'reserved' | 'confirmed' | 'waitlisted' | 'checked_in' | 'completed' | 'no_show' | 'cancelled'
   quantity: number
   source: string
   notes?: string
@@ -275,7 +315,8 @@ export interface ContactPackage {
   contact_id: string
   package_definition_id: string
   invoice_id?: string
-  status: 'pending' | 'active' | 'exhausted' | 'expired' | 'cancelled' | 'refunded'
+  status:
+    | 'pending' | 'active' | 'exhausted' | 'expired' | 'cancelled' | 'refunded'
   starts_at?: string
   expires_at?: string
   purchase_amount_minor: number
@@ -334,7 +375,9 @@ export interface CopilotRun {
   created_at: string
 }
 
-export type ChannelType = 'whatsapp' | 'instagram' | 'messenger' | 'email' | 'webchat' | 'tiktok'
+export type ChannelType =
+  | 'whatsapp' | 'instagram' | 'messenger' | 'threads'
+  | 'email' | 'webchat' | 'tiktok'
 
 export interface ChannelAccount {
   id: string
@@ -361,12 +404,16 @@ export interface InboxConversation {
   channel_account_id: string
   contact_id: string
   channel: ChannelType
+  external_conversation_id: string
   subject?: string
   status: string
   last_message_preview?: string
   last_message_at?: string
   unread_count: number
+  ai_paused: boolean
+  ai_pause_reason?: string
   assigned_user_id?: string
+  metadata?: Record<string, unknown>
   contact?: {
     id: string
     profile_name?: string
@@ -381,9 +428,24 @@ export interface InboxConversation {
 }
 
 export const productService = {
-  plans: () => api.get('/product/plans'),
-  subscription: () => api.get('/product/subscription'),
+  plans: () => api.get<APIEnvelope<{ plans: PlanSummary[] }>>('/product/plans'),
+  subscription: () => api.get<APIEnvelope<SubscriptionSummary>>('/product/subscription'),
   entitlements: () => api.get('/product/entitlements'),
+}
+
+export const organizationSubscriptionService = {
+  plans: (organizationId: string) =>
+    api.get<APIEnvelope<{ plans: PlanSummary[] }>>(
+      `/admin/organizations/${encodeURIComponent(organizationId)}/product/plans`,
+    ),
+  get: (organizationId: string) =>
+    api.get<APIEnvelope<SubscriptionSummary>>(
+      `/admin/organizations/${encodeURIComponent(organizationId)}/subscription`,
+    ),
+  set: (organizationId: string, data: SetOrganizationSubscriptionRequest) =>
+    api.put<APIEnvelope<SubscriptionSummary>>(
+      `/admin/organizations/${encodeURIComponent(organizationId)}/subscription`,
+      data,),
 }
 
 export const onboardingService = {
@@ -477,7 +539,7 @@ export const bookingService = {
     ),
   createBooking: (eventId: string, data: Record<string, unknown>) =>
     api.post(`/booking/events/${eventId}/bookings`, data),
-  transitionBooking: (id: string, transition: string, data?: Record<string, unknown>) =>
+  transitionBooking: (id: string, transition: string, data?: Record<string, unknown>,) =>
     api.post(`/bookings/${id}/${encodeURIComponent(transition)}`, data ?? {}),
 }
 
@@ -509,14 +571,14 @@ export const commerceService = {
   recordManualPayment: (invoiceId: string, data: Record<string, unknown>) =>
     api.post(`/invoices/${invoiceId}/manual-payments`, data),
   payments: (params?: Record<string, string | number>) => api.get('/payments', { params }),
-  allPayments: <T = Record<string, unknown>>(params?: Record<string, string | number>) =>
+  allPayments: <T = Record<string, unknown>>(params?: Record<string, string | number>,) =>
     fetchAllPages<T>('payments', (page, limit) =>
       api.get('/payments', { params: { ...params, page, limit } }),
     ),
 }
 
 export const copilotService = {
-  run: (contactId: string, taskType: CopilotRun['task_type'], data?: Record<string, unknown>) =>
+  run: (contactId: string, taskType: CopilotRun['task_type'], data?: Record<string, unknown>,) =>
     api.post(`/contacts/${contactId}/copilot/${taskType}`, data ?? {}),
   runs: (params?: { contact_id?: string; page?: number; limit?: number }) => api.get('/copilot/runs', { params }),
   feedback: (runId: string, data: Record<string, unknown>) => api.post(`/copilot/runs/${runId}/feedback`, data),
@@ -537,4 +599,6 @@ export const channelsService = {
     api.get(`/conversations/${id}/messages`, { params }),
   send: (id: string, data: Record<string, unknown>) => api.post(`/conversations/${id}/messages`, data),
   markRead: (id: string) => api.post(`/conversations/${id}/read`),
+  setAIState: (id: string, paused: boolean) =>
+    api.put(`/conversations/${id}/ai`, { paused }),
 }

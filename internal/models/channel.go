@@ -15,6 +15,7 @@ const (
 	ChannelWhatsApp  Channel = "whatsapp"
 	ChannelInstagram Channel = "instagram"
 	ChannelMessenger Channel = "messenger"
+	ChannelThreads   Channel = "threads"
 	ChannelWebChat   Channel = "webchat"
 	ChannelEmail     Channel = "email"
 	ChannelSMS       Channel = "sms"
@@ -124,10 +125,14 @@ type OutboxJobStatus string
 const (
 	OutboxJobStatusPending    OutboxJobStatus = "pending"
 	OutboxJobStatusProcessing OutboxJobStatus = "processing"
-	OutboxJobStatusRetrying   OutboxJobStatus = "retrying"
-	OutboxJobStatusSent       OutboxJobStatus = "sent"
-	OutboxJobStatusFailed     OutboxJobStatus = "failed"
-	OutboxJobStatusCancelled  OutboxJobStatus = "cancelled"
+	// Dispatching is a delivery fence: policy-cancellation transactions may
+	// cancel processing work, but a job that atomically reached dispatching
+	// has won the race and is allowed to make its single provider attempt.
+	OutboxJobStatusDispatching OutboxJobStatus = "dispatching"
+	OutboxJobStatusRetrying    OutboxJobStatus = "retrying"
+	OutboxJobStatusSent        OutboxJobStatus = "sent"
+	OutboxJobStatusFailed      OutboxJobStatus = "failed"
+	OutboxJobStatusCancelled   OutboxJobStatus = "cancelled"
 )
 
 type ChannelPreferenceStatus string

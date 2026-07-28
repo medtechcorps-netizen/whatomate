@@ -106,11 +106,29 @@ func TestProductCommercialSubscriptionValidationIsManualOnly(t *testing.T) {
 	planID := uuid.New()
 	priceID := uuid.New()
 	valid := SetOrganizationSubscriptionRequest{
-		PlanID:      &planID,
-		PlanPriceID: &priceID,
-		Status:      models.SubscriptionStatusActive,
+		PlanID:          &planID,
+		PlanPriceID:     &priceID,
+		Status:          models.SubscriptionStatusActive,
+		ManualReference: " contract-2026-001 ",
 	}
 	require.NoError(t, productCommercialValidateSetSubscription(&valid))
+	assert.Equal(t, "contract-2026-001", valid.ManualReference)
+
+	missingReference := valid
+	missingReference.ManualReference = " "
+	require.EqualError(
+		t,
+		productCommercialValidateSetSubscription(&missingReference),
+		"manual_reference is required",
+	)
+
+	controlReference := valid
+	controlReference.ManualReference = "contract-2026-001\nforged-line"
+	require.EqualError(
+		t,
+		productCommercialValidateSetSubscription(&controlReference),
+		"manual_reference must not contain control characters",
+	)
 
 	for _, status := range []models.SubscriptionStatus{
 		models.SubscriptionStatusPastDue,

@@ -79,6 +79,12 @@ between clients.
    ./rereply rls-migrate -config config.toml
    ```
 
+   DigitalOcean production must keep `rereply-rls-migrate` as a
+   `PRE_DEPLOY` job sourced from the same protected `main` commit as the web
+   service. The runtime now verifies a versioned routing-function marker, so
+   an old resolver body causes startup to fail closed instead of silently
+   leaving new queue states undiscoverable.
+
 5. Start the service and confirm the log contains:
 
    ```text
