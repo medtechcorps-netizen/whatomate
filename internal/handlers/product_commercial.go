@@ -4044,6 +4044,20 @@ func (a *App) productCommercialCanManagePlan(userID uuid.UUID, plan *models.Plan
 	return plan.ResellerID != nil && a.canManageReseller(userID, *plan.ResellerID)
 }
 
+// productCommercialControlPlaneTransaction keeps cross-tenant catalog writes
+// atomic with their tenant-owned audit row. Control-plane routes run outside
+// the normal tenant middleware, so production RLS needs an explicit audit
+// tenant even though the catalog tables themselves are global.
+func (a *App) productCommercialControlPlaneTransaction(
+	auditOrgID uuid.UUID,
+	fn func(*gorm.DB) error,
+) error {
+	if a.rlsEnabled() {
+		return database.WithTenant(a.rootApp().DB, auditOrgID, fn)
+	}
+	return a.DB.Transaction(fn)
+}
+
 // CreateProductPlan creates a manual-price catalog. Only platform owners may
 // create global plans; reseller administrators may create plans for portfolios
 // they manage.
@@ -4139,7 +4153,7 @@ func (a *App) CreateProductPlan(r *fastglue.Request) error {
 		plan.PublishedAt = &now
 	}
 	var response ProductPlanResponse
-	err = a.DB.Transaction(func(tx *gorm.DB) error {
+	err = a.productCommercialControlPlaneTransaction(auditOrgID, func(tx *gorm.DB) error {
 		var duplicateCount int64
 		if err := tx.Model(&models.Plan{}).
 			Where("scope_key = ? AND code = ?", scopeKey, req.Code).
@@ -4247,7 +4261,7 @@ func (a *App) UpdateProductPlan(r *fastglue.Request) error {
 	}
 
 	var response ProductPlanResponse
-	err = a.DB.Transaction(func(tx *gorm.DB) error {
+	err = a.productCommercialControlPlaneTransaction(auditOrgID, func(tx *gorm.DB) error {
 		var plan models.Plan
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ?", planID).

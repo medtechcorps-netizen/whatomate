@@ -2,16 +2,19 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
+	"gorm.io/gorm"
 )
 
 func TestProductCommercialBuiltInWorkspaceTemplates(t *testing.T) {
@@ -393,6 +396,138 @@ func TestProductCommercialConsentValidationAndEvidenceRedactionBoundary(t *testi
 	_, err = productCommercialValidateConsent(&request)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must not contain credentials or secrets")
+}
+
+func TestProductCommercialPlanAuditUsesExplicitTenantContext(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	auditOrganization := testutil.CreateTestOrganization(t, db)
+	owner := testutil.CreateTestUser(
+		t,
+		db,
+		auditOrganization.ID,
+		testutil.WithEmail(testutil.UniqueEmail("plan-audit-owner")),
+		testutil.WithSuperAdmin(),
+	)
+	app := &App{
+		Config: &config.Config{
+			Database: config.DatabaseConfig{RLSEnabled: true},
+		},
+		DB:  db,
+		Log: testutil.NopLogger(),
+	}
+
+	callbackName := "test:product-plan-audit-tenant:" + uuid.NewString()
+	expectedTenant := auditOrganization.ID.String()
+	require.NoError(t, db.Callback().Create().
+		Before("gorm:create").
+		Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "audit_logs" {
+				return
+			}
+			var currentTenant string
+			lookup := tx.Session(&gorm.Session{NewDB: true}).
+				Raw(
+					"SELECT current_setting('app.current_organization_id', true)",
+				).
+				Scan(&currentTenant)
+			if lookup.Error != nil {
+				_ = tx.AddError(lookup.Error)
+				return
+			}
+			if currentTenant != expectedTenant {
+				_ = tx.AddError(fmt.Errorf(
+					"audit tenant context is %q; expected %q",
+					currentTenant,
+					expectedTenant,
+				))
+			}
+		}))
+	t.Cleanup(func() {
+		_ = db.Callback().Create().Remove(callbackName)
+	})
+
+	planCode := "audit-tenant-" + uuid.NewString()
+	createRequest := testutil.NewJSONRequest(t, map[string]any{
+		"code":       planCode,
+		"name":       "Audit tenant plan",
+		"vertical":   "general",
+		"status":     models.CommercialPlanStatusActive,
+		"trial_days": 14,
+		"is_public":  false,
+		"prices": []map[string]any{{
+			"code":              planCode + "-myr-month",
+			"currency":          "MYR",
+			"unit_amount_minor": 0,
+			"interval":          models.BillingIntervalMonth,
+			"interval_count":    1,
+		}},
+		"entitlements": []map[string]any{{
+			"key":         "omnichannel.enabled",
+			"value_type":  models.EntitlementValueTypeBoolean,
+			"value":       true,
+			"enforcement": models.EntitlementEnforcementHard,
+		}},
+	})
+	testutil.SetFullAuthContext(
+		createRequest,
+		auditOrganization.ID,
+		owner.ID,
+		owner.RoleID,
+		true,
+	)
+	require.NoError(t, app.CreateProductPlan(createRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(createRequest))
+
+	var created struct {
+		Data ProductPlanResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(createRequest), &created))
+	require.NotNil(t, created.Data.ID)
+	planID := *created.Data.ID
+	t.Cleanup(func() {
+		require.NoError(t, db.Unscoped().
+			Where("organization_id = ? AND resource_type = ? AND resource_id = ?",
+				auditOrganization.ID,
+				productPlanAuditResource,
+				planID,
+			).
+			Delete(&models.AuditLog{}).Error)
+		require.NoError(t, db.Unscoped().
+			Where("plan_id = ?", planID).
+			Delete(&models.PlanEntitlement{}).Error)
+		require.NoError(t, db.Unscoped().
+			Where("plan_id = ?", planID).
+			Delete(&models.PlanPrice{}).Error)
+		require.NoError(t, db.Unscoped().
+			Where("id = ?", planID).
+			Delete(&models.Plan{}).Error)
+	})
+
+	updatedName := "Audit tenant plan updated"
+	updateRequest := testutil.NewJSONRequest(t, map[string]any{
+		"name": updatedName,
+	})
+	testutil.SetFullAuthContext(
+		updateRequest,
+		auditOrganization.ID,
+		owner.ID,
+		owner.RoleID,
+		true,
+	)
+	testutil.SetPathParam(updateRequest, "id", planID.String())
+	require.NoError(t, app.UpdateProductPlan(updateRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(updateRequest))
+
+	var auditCount int64
+	require.NoError(t, db.Model(&models.AuditLog{}).
+		Where(
+			"organization_id = ? AND resource_type = ? AND resource_id = ?",
+			auditOrganization.ID,
+			productPlanAuditResource,
+			planID,
+		).
+		Count(&auditCount).Error)
+	require.EqualValues(t, 2, auditCount)
 }
 
 func TestProductCommercialWorkflowTransitions(t *testing.T) {
