@@ -51,10 +51,10 @@ const agents = ref<{ id: string; full_name: string }[]>([])
 const teams = ref<Team[]>([])
 const selectedTeamFilter = ref<string>('all')
 
-// Backend grants full transfer visibility on transfers:write (agent_transfers.go:110).
-// Honor the same permission here instead of hardcoding role names — otherwise
-// custom roles with the right permissions still see the agent-only view.
-const isAdminOrManager = computed(() => authStore.hasPermission('transfers', 'write'))
+// Backend grants organization-wide transfer management through
+// chat.assign:write. transfers:write still lets an assigned agent mutate their
+// own transfer, so it must not switch that agent into the management view.
+const isAdminOrManager = computed(() => authStore.hasPermission('chat.assign', 'write'))
 const currentUserId = computed(() => authStore.user?.id)
 
 const myTransfers = computed(() =>
@@ -119,8 +119,8 @@ onMounted(async () => {
 })
 
 async function fetchAllowQueuePickup() {
-  // Agents (no transfers:write) are gated by allow_agent_queue_pickup; admins
-  // bypass the toggle, so we only need the setting for the agent-only view.
+  // Agents without organization-wide transfer management are gated by
+  // allow_agent_queue_pickup; managers bypass the toggle.
   if (isAdminOrManager.value) return
   try {
     const resp = await chatbotService.getSettings()

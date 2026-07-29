@@ -66,6 +66,7 @@ interface SessionData {
 const props = defineProps<{
   contact: Contact
   sessionData?: SessionData | null
+  embedded?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -242,20 +243,23 @@ async function updateContactTags(tags: string[]) {
 
 <template>
   <div
-    class="flex flex-col bg-card h-full relative"
-    :style="{ width: `${panelWidth}px` }"
+    class="flex min-h-0 flex-col bg-card h-full relative"
+    :class="embedded ? 'w-full' : 'border-l'"
+    :style="embedded ? undefined : { width: `${panelWidth}px` }"
+    data-testid="contact-details-panel"
   >
     <!-- Resize Handle -->
     <div
+      v-if="!embedded"
       class="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/20 active:bg-primary/30 z-10 border-l"
       :class="{ 'bg-primary/30': isResizing }"
       @mousedown="startResize"
     />
 
     <!-- Header -->
-    <div class="h-12 px-3 border-b flex items-center justify-between">
+    <div v-if="!embedded" class="h-12 px-3 border-b flex items-center justify-between">
       <h3 class="font-medium text-sm">Contact Info</h3>
-      <Button variant="ghost" size="icon" class="h-8 w-8" @click="emit('close')">
+      <Button variant="ghost" size="icon" class="h-8 w-8" aria-label="Close contact information" @click="emit('close')">
         <X class="h-4 w-4" />
       </Button>
     </div>
@@ -288,7 +292,7 @@ async function updateContactTags(tags: string[]) {
             </h5>
             <Popover v-if="canEditTags" v-model:open="tagSelectorOpen">
               <PopoverTrigger as-child>
-                <Button variant="ghost" size="sm" class="h-7 px-2">
+                <Button variant="ghost" size="sm" class="h-9 min-w-9 px-2" aria-label="Add customer tag">
                   <Plus class="h-3.5 w-3.5" />
                 </Button>
               </PopoverTrigger>
@@ -334,6 +338,7 @@ async function updateContactTags(tags: string[]) {
                   v-if="canEditTags"
                   type="button"
                   class="ml-1 rounded-full hover:bg-black/10 dark:hover:bg-white/10 p-0.5 transition-colors"
+                  :aria-label="`Remove ${tagName} tag`"
                   :disabled="isUpdatingTags"
                   @click.stop="removeTag(tagName)"
                 >

@@ -705,6 +705,7 @@ func TestApp_SendOutgoingMessage_WithSentByUser(t *testing.T) {
 	}
 	require.NoError(t, app.DB.Create(user).Error)
 	userID := user.ID
+	require.NoError(t, app.DB.Model(contact).Update("assigned_user_id", userID).Error)
 
 	ctx := testutil.TestContext(t)
 

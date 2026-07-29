@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
@@ -252,12 +254,13 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
+	if !a.HasPermission(userID, models.ResourceChat, models.ActionRead, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to view messages", nil, "")
+	}
 	contactID, err := parsePathUUID(r, "id", "contact")
 	if err != nil {
 		return nil
 	}
-
-	hasContactsReadPermission := a.HasPermission(userID, models.ResourceContacts, models.ActionRead, orgID)
 
 	// Verify contact belongs to org (and to user if no contacts:read permission)
 	var contact models.Contact
@@ -276,7 +279,7 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 	}
 
 	// Build base query
-	msgQuery := a.DB.Where("contact_id = ?", contactID)
+	msgQuery := a.DB.Where("organization_id = ? AND contact_id = ?", orgID, contactID)
 
 	// Filter by WhatsApp account if specified
 	accountFilter := string(r.RequestCtx.QueryArgs().Peek("account"))
@@ -284,20 +287,19 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 		msgQuery = msgQuery.Where("whats_app_account = ?", accountFilter)
 	}
 
-	// Check if user without contacts:read should only see current conversation
-	if !hasContactsReadPermission {
-		settings, err := a.getChatbotSettingsCached(orgID, "")
-		if err == nil {
-			if settings.AgentAssignment.CurrentConversationOnly {
-				// Find the most recent session for this contact
-				var session models.ChatbotSession
-				if err := a.DB.Where("contact_id = ? AND organization_id = ?", contactID, orgID).
-					Order("started_at DESC").First(&session).Error; err == nil {
-					// Filter messages to only those from this session onwards
-					msgQuery = msgQuery.Where("created_at >= ?", session.StartedAt)
-				}
-			}
-		}
+	conversationRestricted, conversationCutoff, scopeErr := a.customerConversationScope(
+		orgID,
+		userID,
+		[]uuid.UUID{contactID},
+	)
+	if scopeErr != nil {
+		a.Log.Error("Failed to scope current conversation", "error", scopeErr)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list messages", nil, "")
+	}
+	if conversationRestricted && conversationCutoff == nil {
+		msgQuery = msgQuery.Where("1 = 0")
+	} else if conversationCutoff != nil {
+		msgQuery = msgQuery.Where("created_at >= ?", *conversationCutoff)
 	}
 
 	// Count total messages (with session filter if applied)
@@ -310,7 +312,12 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 		if err == nil {
 			// Get the created_at of the before_id message
 			var beforeMsg models.Message
-			if err := a.DB.Where("id = ?", beforeID).First(&beforeMsg).Error; err == nil {
+			if err := a.DB.Where(
+				"id = ? AND organization_id = ? AND contact_id = ?",
+				beforeID,
+				orgID,
+				contactID,
+			).First(&beforeMsg).Error; err == nil {
 				msgQuery = msgQuery.Where("created_at < ?", beforeMsg.CreatedAt)
 			}
 		}
@@ -549,6 +556,9 @@ func (a *App) SendMessage(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
+	if !a.HasPermission(userID, models.ResourceChat, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to send messages", nil, "")
+	}
 	contactID, err := parsePathUUID(r, "id", "contact")
 	if err != nil {
 		return nil
@@ -581,12 +591,14 @@ func (a *App) SendMessage(r *fastglue.Request) error {
 	// Handle reply context
 	var replyToMessage *models.Message
 	if req.ReplyToMessageID != "" {
-		replyToID, err := uuid.Parse(req.ReplyToMessageID)
-		if err == nil {
-			var replyTo models.Message
-			if err := a.DB.Where("id = ? AND contact_id = ?", replyToID, contactID).First(&replyTo).Error; err == nil {
-				replyToMessage = &replyTo
-			}
+		replyToID, parseErr := uuid.Parse(req.ReplyToMessageID)
+		if parseErr != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid reply message ID", nil, "")
+		}
+		// The unified sender reloads this ID under the canonical-contact lock
+		// and validates both organization and contact ownership.
+		replyToMessage = &models.Message{
+			BaseModel: models.BaseModel{ID: replyToID},
 		}
 	}
 
@@ -672,7 +684,35 @@ func (a *App) SendMessage(r *fastglue.Request) error {
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
 	if err != nil {
 		a.Log.Error("Failed to send message", "error", err)
+		if errors.Is(err, errOutgoingContactNotFound) ||
+			errors.Is(err, errOutgoingContactAccessRevoked) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
+		if errors.Is(err, errOutgoingReplyInvalid) {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Reply message not found for this contact", nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to send message", nil, "")
+	}
+
+	// SendOutgoingMessage validated the reply inside its transaction. Reload
+	// only for the response preview; failure here must not undo the send.
+	if message.IsReply && message.ReplyToMessageID != nil {
+		var validatedReply models.Message
+		if replyErr := a.DB.Where(
+			"id = ? AND organization_id = ? AND contact_id = ?",
+			*message.ReplyToMessageID,
+			orgID,
+			message.ContactID,
+		).First(&validatedReply).Error; replyErr == nil {
+			replyToMessage = &validatedReply
+		} else {
+			a.Log.Error(
+				"Failed to reload validated reply message",
+				"error", replyErr,
+				"message_id", message.ID,
+			)
+			replyToMessage = nil
+		}
 	}
 
 	// Build response
@@ -750,6 +790,9 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	if !a.HasPermission(userID, models.ResourceChat, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to send messages", nil, "")
 	}
 
 	// Parse multipart form
@@ -857,6 +900,13 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
 	if err != nil {
 		a.Log.Error("Failed to send message", "error", err)
+		if errors.Is(err, errOutgoingContactNotFound) ||
+			errors.Is(err, errOutgoingContactAccessRevoked) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
+		if errors.Is(err, errOutgoingReplyInvalid) {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Reply message not found for this contact", nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to send message", nil, "")
 	}
 
@@ -920,6 +970,9 @@ func (a *App) SendReaction(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	if !a.HasPermission(userID, models.ResourceChat, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to send reactions", nil, "")
 	}
 	contactID, err := parsePathUUID(r, "id", "contact")
 	if err != nil {
@@ -1087,6 +1140,8 @@ type AssignContactRequest struct {
 	UserID *uuid.UUID `json:"user_id"` // nil to unassign
 }
 
+var errAssignedContactUserNotFound = errors.New("assigned contact user not found")
+
 // AssignContact assigns a contact to a user (agent)
 // Only users with write permission can assign contacts
 func (a *App) AssignContact(r *fastglue.Request) error {
@@ -1110,22 +1165,78 @@ func (a *App) AssignContact(r *fastglue.Request) error {
 		return nil
 	}
 
-	// Get contact
-	contact, err := findByIDAndOrg[models.Contact](a.DB, r, contactID, orgID, "Contact")
-	if err != nil {
-		return nil
-	}
+	var updatedContact models.Contact
+	activityNonce := uuid.NewString()
+	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(tx, orgID, contactID)
+		if resolveErr != nil {
+			return resolveErr
+		}
 
-	// If assigning to a user, verify they exist in the same org
-	if req.UserID != nil {
-		var user models.User
-		if err := a.DB.Where("id = ? AND organization_id = ?", req.UserID, orgID).First(&user).Error; err != nil {
+		// Validate the assignee in the same transaction as the update. This
+		// prevents an organization change or deletion from racing the write.
+		if req.UserID != nil {
+			var user models.User
+			if userErr := tx.Where(
+				"id = ? AND organization_id = ?",
+				*req.UserID,
+				orgID,
+			).First(&user).Error; userErr != nil {
+				if errors.Is(userErr, gorm.ErrRecordNotFound) {
+					return errAssignedContactUserNotFound
+				}
+				return userErr
+			}
+		}
+
+		result := tx.Model(&models.Contact{}).
+			Where(
+				"id = ? AND organization_id = ? AND merged_into_id IS NULL AND deleted_at IS NULL",
+				contact.ID,
+				orgID,
+			).
+			Update("assigned_user_id", req.UserID)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+
+		if loadErr := tx.Where(
+			"id = ? AND organization_id = ?",
+			contact.ID,
+			orgID,
+		).First(&updatedContact).Error; loadErr != nil {
+			return loadErr
+		}
+		assignedUserID := any(nil)
+		if req.UserID != nil {
+			assignedUserID = req.UserID.String()
+		}
+		_, activityErr := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        updatedContact.ID,
+			EventType:        models.CustomerActivityContactUpdated,
+			Category:         models.CustomerActivityCategoryContact,
+			Title:            "Contact assignment updated",
+			Summary:          updatedContact.ProfileName,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: "contact",
+			SourceObjectID:   &updatedContact.ID,
+			OccurredAt:       time.Now().UTC(),
+			Metadata:         models.JSONB{"assigned_user_id": assignedUserID},
+			IdempotencyKey:   "contact-assigned:" + updatedContact.ID.String() + ":" + activityNonce,
+		})
+		return activityErr
+	})
+	if err != nil {
+		if errors.Is(err, errAssignedContactUserNotFound) {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "User not found", nil, "")
 		}
-	}
-
-	// Update contact assignment
-	if err := a.DB.Model(contact).Update("assigned_user_id", req.UserID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
 		a.Log.Error("Failed to assign contact", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to assign contact", nil, "")
 	}
@@ -1133,6 +1244,7 @@ func (a *App) AssignContact(r *fastglue.Request) error {
 	return r.SendEnvelope(map[string]any{
 		"message":          "Contact assigned successfully",
 		"assigned_user_id": req.UserID,
+		"contact_id":       updatedContact.ID,
 	})
 }
 
@@ -1263,33 +1375,72 @@ func (a *App) UpdateContactTags(r *fastglue.Request) error {
 		return nil
 	}
 
-	// Get contact
-	contact, err := findByIDAndOrg[models.Contact](a.DB, r, contactID, orgID, "Contact")
-	if err != nil {
-		return nil
-	}
-
 	// Convert tags to JSONBArray
 	tagsArray := make(models.JSONBArray, len(req.Tags))
 	for i, tag := range req.Tags {
 		tagsArray[i] = tag
 	}
 
-	// Update contact tags
-	if err := a.DB.Model(contact).Update("tags", tagsArray).Error; err != nil {
+	var updatedContact models.Contact
+	activityNonce := uuid.NewString()
+	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(tx, orgID, contactID)
+		if resolveErr != nil {
+			return resolveErr
+		}
+
+		result := tx.Model(&models.Contact{}).
+			Where(
+				"id = ? AND organization_id = ? AND merged_into_id IS NULL AND deleted_at IS NULL",
+				contact.ID,
+				orgID,
+			).
+			Update("tags", tagsArray)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+
+		if loadErr := tx.Where(
+			"id = ? AND organization_id = ?",
+			contact.ID,
+			orgID,
+		).First(&updatedContact).Error; loadErr != nil {
+			return loadErr
+		}
+		_, activityErr := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        updatedContact.ID,
+			EventType:        models.CustomerActivityContactUpdated,
+			Category:         models.CustomerActivityCategoryContact,
+			Title:            "Contact tags updated",
+			Summary:          updatedContact.ProfileName,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: "contact",
+			SourceObjectID:   &updatedContact.ID,
+			OccurredAt:       time.Now().UTC(),
+			Metadata: models.JSONB{
+				"tags":      req.Tags,
+				"tag_count": len(req.Tags),
+			},
+			IdempotencyKey: "contact-tags-updated:" + updatedContact.ID.String() + ":" + activityNonce,
+		})
+		return activityErr
+	})
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
 		a.Log.Error("Failed to update contact tags", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update contact tags", nil, "")
 	}
 
-	// Reload contact to get updated tags
-	if err := a.DB.First(contact, contactID).Error; err != nil {
-		a.Log.Error("Failed to reload contact", "error", err)
-	}
-
 	// Build response with tag details
 	tags := []string{}
-	if contact.Tags != nil {
-		for _, t := range contact.Tags {
+	if updatedContact.Tags != nil {
+		for _, t := range updatedContact.Tags {
 			if s, ok := t.(string); ok {
 				tags = append(tags, s)
 			}
@@ -1297,8 +1448,9 @@ func (a *App) UpdateContactTags(r *fastglue.Request) error {
 	}
 
 	return r.SendEnvelope(map[string]any{
-		"message": "Contact tags updated",
-		"tags":    tags,
+		"message":    "Contact tags updated",
+		"tags":       tags,
+		"contact_id": updatedContact.ID,
 	})
 }
 
@@ -1340,12 +1492,35 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 
 	// Check if contact exists (including soft-deleted)
 	var existingContact models.Contact
-	if err := a.DB.Unscoped().Where("organization_id = ? AND phone_number = ?", orgID, normalizedPhone).First(&existingContact).Error; err == nil {
+	existingErr := a.DB.Unscoped().
+		Where("organization_id = ? AND phone_number = ?", orgID, normalizedPhone).
+		First(&existingContact).Error
+	if errors.Is(existingErr, gorm.ErrRecordNotFound) {
+		existingErr = a.DB.Unscoped().
+			Where("organization_id = ? AND phone_number = ?", orgID, "+"+normalizedPhone).
+			First(&existingContact).Error
+	}
+	if existingErr == nil {
 		// Contact exists
 		if existingContact.DeletedAt.Valid {
+			if existingContact.MergedIntoID != nil {
+				canonical, resolveErr := contactutil.ResolveCanonicalContact(
+					a.DB,
+					orgID,
+					existingContact.ID,
+				)
+				if resolveErr != nil {
+					a.Log.Error("Failed to resolve merged contact", "error", resolveErr)
+					return r.SendErrorEnvelope(
+						fasthttp.StatusConflict,
+						"Contact is a merged alias whose canonical profile could not be resolved",
+						nil,
+						"",
+					)
+				}
+				return r.SendEnvelope(a.buildContactResponse(canonical, orgID))
+			}
 			// Restore soft-deleted contact
-			a.DB.Unscoped().Model(&existingContact).Update("deleted_at", nil)
-			existingContact.DeletedAt.Valid = false
 			// Update fields
 			updates := map[string]any{}
 			if req.ProfileName != "" {
@@ -1364,14 +1539,40 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 			if req.Metadata != nil {
 				updates["metadata"] = models.JSONB(req.Metadata)
 			}
-			if len(updates) > 0 {
-				a.DB.Model(&existingContact).Updates(updates)
+			updates["deleted_at"] = nil
+			activityKey := "contact-restored:" + existingContact.ID.String() + ":" + uuid.NewString()
+			if err := a.DB.Transaction(func(tx *gorm.DB) error {
+				if err := tx.Unscoped().Model(&existingContact).Updates(updates).Error; err != nil {
+					return err
+				}
+				_, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+					ContactID:        existingContact.ID,
+					EventType:        models.CustomerActivityContactUpdated,
+					Category:         models.CustomerActivityCategoryContact,
+					Title:            "Contact restored",
+					Summary:          existingContact.ProfileName,
+					ActorType:        models.CustomerActivityActorUser,
+					ActorUserID:      &userID,
+					SourceObjectType: "contact",
+					SourceObjectID:   &existingContact.ID,
+					OccurredAt:       time.Now().UTC(),
+					Metadata:         models.JSONB{"restored": true},
+					IdempotencyKey:   activityKey,
+				})
+				return err
+			}); err != nil {
+				a.Log.Error("Failed to restore contact", "error", err)
+				return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to restore contact", nil, "")
 			}
 			// Reload contact
 			a.DB.First(&existingContact, existingContact.ID)
 			return r.SendEnvelope(a.buildContactResponse(&existingContact, orgID))
 		}
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Contact with this phone number already exists", nil, "")
+	}
+	if !errors.Is(existingErr, gorm.ErrRecordNotFound) {
+		a.Log.Error("Failed to check existing contact", "error", existingErr)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create contact", nil, "")
 	}
 
 	// Create new contact
@@ -1395,7 +1596,26 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 		contact.Metadata = models.JSONB(req.Metadata)
 	}
 
-	if err := a.DB.Create(&contact).Error; err != nil {
+	if err := a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&contact).Error; err != nil {
+			return err
+		}
+		_, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        contact.ID,
+			EventType:        models.CustomerActivityContactCreated,
+			Category:         models.CustomerActivityCategoryContact,
+			Title:            "Contact created",
+			Summary:          contact.ProfileName,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: "contact",
+			SourceObjectID:   &contact.ID,
+			OccurredAt:       time.Now().UTC(),
+			Metadata:         models.JSONB{},
+			IdempotencyKey:   "contact-created:" + contact.ID.String(),
+		})
+		return err
+	}); err != nil {
 		a.Log.Error("Failed to create contact", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create contact", nil, "")
 	}
@@ -1440,13 +1660,6 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 		return nil
 	}
 
-	// Get contact
-	contact, err := findByIDAndOrg[models.Contact](a.DB, r, contactID, orgID, "Contact")
-	if err != nil {
-		return nil
-	}
-	oldContact := *contact
-
 	// Build updates map
 	updates := map[string]any{}
 
@@ -1469,10 +1682,6 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 	if req.ClearAssignedAgent != nil && *req.ClearAssignedAgent {
 		updates["assigned_user_id"] = nil
 	} else if req.AssignedUserID != nil {
-		var user models.User
-		if err := a.DB.Where("id = ? AND organization_id = ?", req.AssignedUserID, orgID).First(&user).Error; err != nil {
-			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Assigned user not found", nil, "")
-		}
 		updates["assigned_user_id"] = req.AssignedUserID
 	}
 
@@ -1480,18 +1689,83 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "No fields to update", nil, "")
 	}
 
-	if err := a.DB.Model(contact).Updates(updates).Error; err != nil {
+	var oldContact, updatedContact models.Contact
+	activityNonce := uuid.NewString()
+	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(tx, orgID, contactID)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		oldContact = *contact
+
+		if req.ClearAssignedAgent == nil || !*req.ClearAssignedAgent {
+			if req.AssignedUserID != nil {
+				var user models.User
+				if userErr := tx.Where(
+					"id = ? AND organization_id = ?",
+					*req.AssignedUserID,
+					orgID,
+				).First(&user).Error; userErr != nil {
+					if errors.Is(userErr, gorm.ErrRecordNotFound) {
+						return errAssignedContactUserNotFound
+					}
+					return userErr
+				}
+			}
+		}
+
+		result := tx.Model(&models.Contact{}).
+			Where(
+				"id = ? AND organization_id = ? AND merged_into_id IS NULL AND deleted_at IS NULL",
+				contact.ID,
+				orgID,
+			).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		if loadErr := tx.Where(
+			"id = ? AND organization_id = ?",
+			contact.ID,
+			orgID,
+		).First(&updatedContact).Error; loadErr != nil {
+			return loadErr
+		}
+
+		_, activityErr := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        updatedContact.ID,
+			EventType:        models.CustomerActivityContactUpdated,
+			Category:         models.CustomerActivityCategoryContact,
+			Title:            "Contact updated",
+			Summary:          updatedContact.ProfileName,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: "contact",
+			SourceObjectID:   &updatedContact.ID,
+			OccurredAt:       time.Now().UTC(),
+			Metadata:         models.JSONB{"field_count": len(updates)},
+			IdempotencyKey:   "contact-updated:" + updatedContact.ID.String() + ":" + activityNonce,
+		})
+		return activityErr
+	})
+	if err != nil {
+		if errors.Is(err, errAssignedContactUserNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Assigned user not found", nil, "")
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
 		a.Log.Error("Failed to update contact", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update contact", nil, "")
 	}
 
-	// Reload contact
-	a.DB.First(contact, contactID)
-
 	a.logAudit(orgID, userID,
-		"contact", contact.ID, models.AuditActionUpdated, &oldContact, contact)
+		"contact", updatedContact.ID, models.AuditActionUpdated, &oldContact, &updatedContact)
 
-	return r.SendEnvelope(a.buildContactResponse(contact, orgID))
+	return r.SendEnvelope(a.buildContactResponse(&updatedContact, orgID))
 }
 
 // DeleteContact soft-deletes a contact

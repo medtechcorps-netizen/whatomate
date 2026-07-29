@@ -56,12 +56,10 @@ test.describe('Contact Metadata Panel', () => {
   async function openInfoPanel(page: import('@playwright/test').Page) {
     await chatPage.goto(contactId)
 
-    // Open contact info panel
-    const infoBtn = page.locator('#info-button')
-    await infoBtn.click()
-
-    // Wait for the panel header to appear
-    await expect(page.getByText('Contact Info')).toBeVisible({ timeout: 10000 })
+    // Contact details now live inside the shared customer revenue workspace.
+    await chatPage.openContactInfo()
+    await page.getByRole('tab', { name: 'Details' }).click()
+    await expect(page.getByTestId('contact-details-panel')).toBeVisible({ timeout: 10000 })
   }
 
   test('should display metadata section when contact has metadata', async ({ page }) => {

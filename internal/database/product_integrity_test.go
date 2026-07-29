@@ -13,6 +13,9 @@ func TestProductIntegrityStatementsCoverTenantAndLedgerBoundaries(t *testing.T) 
 
 	statements := strings.Join(productIntegrityStatements(), "\n")
 	for _, required := range []string{
+		"fk_contacts_merged_into_tenant",
+		"fk_customer_activity_contact_tenant",
+		"fk_customer_activity_lead_contact_tenant",
 		"fk_crm_leads_stage_pipeline_tenant",
 		"fk_booking_events_resource_tenant",
 		"fk_bookings_contact_package_tenant",
@@ -31,11 +34,21 @@ func TestProductIntegrityStatementsCoverTenantAndLedgerBoundaries(t *testing.T) 
 		"chk_commerce_invoices_equation",
 		"chk_invoice_lines_equation",
 		"chk_payment_transactions_amount",
+		"trg_customer_activity_events_append_only",
+		"trg_customer_activity_automation_receipt",
+		"trg_automation_policy_versions_append_only",
+		"trg_automation_policy_activations_guard",
 	} {
 		assert.Contains(t, statements, required)
 	}
 	assert.NotContains(t, statements, "ON DELETE SET NULL",
 		"composite nullable tenant foreign keys use RESTRICT to preserve tenant binding")
+	assert.NotContains(
+		t,
+		statements,
+		"FROM customer_activity_events activity",
+		"pre-feature customer activity must not be replayed ahead of live receipts",
+	)
 }
 
 func TestProductIntegrityForeignKeyStatementsAreNamed(t *testing.T) {

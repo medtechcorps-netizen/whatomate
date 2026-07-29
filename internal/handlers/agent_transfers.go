@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/assignment"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
@@ -19,8 +20,6 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
-
-var errActiveAgentTransferExists = errors.New("contact already has an active transfer")
 
 // agentTransferRow represents a flat row result from the JOINed query
 type agentTransferRow struct {
@@ -104,6 +103,21 @@ type AgentTransferResponse struct {
 	ExpiresAt             *string `json:"expires_at,omitempty"`
 }
 
+// transferManagementAccess is deliberately stronger than transfers:write.
+// The default Agent role needs transfers:write to create a handoff, but only
+// managers with conversation-assignment authority may enumerate or mutate
+// arbitrary organization transfers.
+func (a *App) transferManagementAccess(
+	userID, organizationID uuid.UUID,
+) bool {
+	return a.HasPermission(
+		userID,
+		models.ResourceChatAssign,
+		models.ActionWrite,
+		organizationID,
+	)
+}
+
 // ListAgentTransfers lists agent transfers for the organization
 // Agents see only their assigned transfers + their team queues; Admin see all; Managers see their teams
 func (a *App) ListAgentTransfers(r *fastglue.Request) error {
@@ -112,8 +126,11 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
-	// Check permissions - users with write permission have full access (like admin)
-	hasFullAccess := a.HasPermission(userID, models.ResourceTransfers, models.ActionWrite, orgID)
+	if !a.HasPermission(userID, models.ResourceTransfers, models.ActionRead, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to view transfers", nil, "")
+	}
+
+	hasFullAccess := a.transferManagementAccess(userID, orgID)
 
 	// Query params
 	status := string(r.RequestCtx.QueryArgs().Peek("status"))
@@ -203,9 +220,10 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 			query = query.Where("agent_transfers.team_id IS NULL")
 		} else {
 			teamID, err := uuid.Parse(teamIDStr)
-			if err == nil {
-				query = query.Where("agent_transfers.team_id = ?", teamID)
+			if err != nil {
+				return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid team_id", nil, "")
 			}
+			query = query.Where("agent_transfers.team_id = ?", teamID)
 		}
 	}
 
@@ -439,6 +457,10 @@ func (a *App) CreateAgentTransfer(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
+	if !a.HasPermission(userID, models.ResourceTransfers, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to create transfers", nil, "")
+	}
+
 	var req CreateAgentTransferRequest
 	if err := json.Unmarshal(r.RequestCtx.PostBody(), &req); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid request body", nil, "")
@@ -453,10 +475,16 @@ func (a *App) CreateAgentTransfer(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid contact_id", nil, "")
 	}
 
-	// Get contact
-	contact, err := findByIDAndOrg[models.Contact](a.DB, r, contactID, orgID, "Contact")
+	// Resolve aliases for request validation and assignment decisions. The
+	// canonical contact is resolved again under row locks in the creation
+	// transaction so a merge racing this request cannot leave a stale FK.
+	contact, err := contactutil.ResolveCanonicalContact(a.DB, orgID, contactID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+	}
 	if err != nil {
-		return nil
+		a.Log.Error("Failed to resolve transfer contact", "error", err, "contact_id", contactID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resolve contact", nil, "")
 	}
 
 	// Get chatbot settings to check AssignToSameAgent (use cache)
@@ -516,8 +544,10 @@ func (a *App) CreateAgentTransfer(r *fastglue.Request) error {
 
 	// Create transfer
 	transfer := models.AgentTransfer{
-		BaseModel:           models.BaseModel{ID: uuid.New()},
-		OrganizationID:      orgID,
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgID,
+		// Retain the requested ID until saveAndFinalizeTransfer locks and
+		// revalidates its redirect path.
 		ContactID:           contactID,
 		WhatsAppAccount:     req.WhatsAppAccount,
 		PhoneNumber:         contact.PhoneNumber,
@@ -530,67 +560,20 @@ func (a *App) CreateAgentTransfer(r *fastglue.Request) error {
 		TransferredAt:       time.Now(),
 	}
 
-	// Set SLA deadlines if SLA is enabled
-	if settings != nil {
-		a.SetSLADeadlines(&transfer, settings)
+	account := &models.WhatsAppAccount{
+		OrganizationID: orgID,
+		Name:           req.WhatsAppAccount,
 	}
-
-	// If agent is already assigned, mark as picked up
-	if agentID != nil {
-		a.UpdateSLAOnPickup(&transfer)
-	}
-
-	err = a.DB.Transaction(func(tx *gorm.DB) error {
-		if err := createActiveAgentTransferTx(tx, &transfer); err != nil {
-			return err
+	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true); err != nil {
+		if errors.Is(err, errActiveAgentTransferExists) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Contact already has an active transfer", nil, "")
 		}
-
-		// When AssignToSameAgent is enabled and no agent is already assigned,
-		// set the contact's assigned agent for future chat routing. The contact
-		// row remains locked through this update.
-		if agentID != nil &&
-			settings != nil &&
-			settings.AgentAssignment.AssignToSameAgent &&
-			contact.AssignedUserID == nil {
-			if err := tx.Model(&models.Contact{}).
-				Where(
-					"id = ? AND organization_id = ? AND assigned_user_id IS NULL",
-					contact.ID,
-					orgID,
-				).
-				Update("assigned_user_id", agentID).Error; err != nil {
-				return err
-			}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
 		}
-
-		// End any active chatbot session atomically with the handover.
-		return tx.Model(&models.ChatbotSession{}).
-			Where(
-				"organization_id = ? AND contact_id = ? AND status = ?",
-				orgID,
-				contactID,
-				models.SessionStatusActive,
-			).
-			Updates(map[string]any{
-				"status":       models.SessionStatusCancelled,
-				"completed_at": time.Now(),
-			}).Error
-	})
-	if errors.Is(err, errActiveAgentTransferExists) {
-		return r.SendErrorEnvelope(
-			fasthttp.StatusConflict,
-			"Contact already has an active transfer",
-			nil,
-			"",
-		)
-	}
-	if err != nil {
 		a.Log.Error("Failed to create agent transfer", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create transfer", nil, "")
 	}
-
-	// Broadcast WebSocket notification
-	a.broadcastTransferCreated(&transfer, contact)
 
 	// Dispatch webhook for transfer created
 	var agentIDStr *string
@@ -686,28 +669,67 @@ func (a *App) ResumeFromTransfer(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
+	hasManagementAccess := a.transferManagementAccess(userID, orgID)
+	if !hasManagementAccess &&
+		!a.HasPermission(userID, models.ResourceTransfers, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to resume transfers", nil, "")
+	}
+
 	transferID, err := parsePathUUID(r, "id", "transfer")
 	if err != nil {
 		return nil
 	}
 
-	transfer, err := findByIDAndOrg[models.AgentTransfer](a.DB, r, transferID, orgID, "Transfer")
-	if err != nil {
+	errTransferNotActive := errors.New("transfer is not active")
+	errTransferAccessDenied := errors.New("transfer access denied")
+	var transfer models.AgentTransfer
+	txErr := a.DB.Transaction(func(tx *gorm.DB) error {
+		if lockErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", transferID, orgID).
+			First(&transfer).Error; lockErr != nil {
+			return lockErr
+		}
+		if transfer.Status != models.TransferStatusActive {
+			return errTransferNotActive
+		}
+		if !hasManagementAccess &&
+			(transfer.AgentID == nil || *transfer.AgentID != userID) {
+			return errTransferAccessDenied
+		}
+
+		now := time.Now().UTC()
+		result := tx.Model(&models.AgentTransfer{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ?",
+				transfer.ID,
+				orgID,
+				models.TransferStatusActive,
+			).
+			Updates(map[string]any{
+				"status":     models.TransferStatusResumed,
+				"resumed_at": now,
+				"resumed_by": userID,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errTransferNotActive
+		}
+		transfer.Status = models.TransferStatusResumed
+		transfer.ResumedAt = &now
+		transfer.ResumedBy = &userID
 		return nil
-	}
-
-	if transfer.Status != models.TransferStatusActive {
+	})
+	switch {
+	case errors.Is(txErr, gorm.ErrRecordNotFound):
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Transfer not found", nil, "")
+	case errors.Is(txErr, errTransferNotActive):
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Transfer is not active", nil, "")
-	}
-
-	// Update transfer
-	now := time.Now()
-	transfer.Status = models.TransferStatusResumed
-	transfer.ResumedAt = &now
-	transfer.ResumedBy = &userID
-
-	if err := a.DB.Save(transfer).Error; err != nil {
-		a.Log.Error("Failed to resume transfer", "error", err, "transfer_id", transfer.ID)
+	case errors.Is(txErr, errTransferAccessDenied):
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You can only resume a transfer assigned to you", nil, "")
+	case txErr != nil:
+		a.Log.Error("Failed to resume transfer", "error", txErr, "transfer_id", transferID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resume transfer", nil, "")
 	}
 
@@ -715,11 +737,11 @@ func (a *App) ResumeFromTransfer(r *fastglue.Request) error {
 	a.ClearContactChatbotTracking(transfer.ContactID)
 
 	// Broadcast WebSocket notification
-	a.broadcastTransferResumed(transfer)
+	a.broadcastTransferResumed(&transfer)
 
 	// Get contact for webhook data
 	var contact models.Contact
-	a.DB.Where("id = ?", transfer.ContactID).First(&contact)
+	a.DB.Where("id = ? AND organization_id = ?", transfer.ContactID, orgID).First(&contact)
 
 	// Dispatch webhook for transfer resumed
 	a.DispatchWebhook(orgID, models.WebhookEventTransferResumed, TransferEventData{
@@ -743,8 +765,9 @@ func (a *App) AssignAgentTransfer(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
-	// Check permissions - users with write permission can assign transfers to others
-	hasWriteAccess := a.HasPermission(userID, models.ResourceTransfers, models.ActionWrite, orgID)
+	if !a.transferManagementAccess(userID, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to assign transfers", nil, "")
+	}
 
 	transferID, err := parsePathUUID(r, "id", "transfer")
 	if err != nil {
@@ -756,25 +779,10 @@ func (a *App) AssignAgentTransfer(r *fastglue.Request) error {
 		return nil
 	}
 
-	var transfer models.AgentTransfer
-	if err := a.DB.Where("id = ? AND organization_id = ?", transferID, orgID).
-		Preload("Contact").First(&transfer).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Transfer not found", nil, "")
-	}
-
-	if transfer.Status != models.TransferStatusActive {
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Transfer is not active", nil, "")
-	}
-
 	// Determine target agent
 	var targetAgentID *uuid.UUID
 
 	if req.AgentID != nil && *req.AgentID != "" {
-		// Explicit assignment - requires write permission
-		if !hasWriteAccess {
-			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to assign transfers to others", nil, "")
-		}
-
 		parsedAgentID, err := uuid.Parse(*req.AgentID)
 		if err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid agent_id", nil, "")
@@ -789,71 +797,133 @@ func (a *App) AssignAgentTransfer(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Agent is currently away", nil, "")
 		}
 		targetAgentID = &parsedAgentID
-	} else if req.AgentID == nil && !hasWriteAccess {
-		// User without write permission self-assigning (null means "assign to me")
-		targetAgentID = &userID
 	}
 
-	// Handle team reassignment (requires write permission)
-	if req.TeamID != nil {
-		if !hasWriteAccess {
-			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to change team assignment", nil, "")
+	var targetTeamID *uuid.UUID
+	if req.TeamID != nil && *req.TeamID != "" {
+		parsedTeamID, err := uuid.Parse(*req.TeamID)
+		if err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid team_id", nil, "")
+		}
+		var team models.Team
+		if err := a.DB.Where("id = ? AND organization_id = ?", parsedTeamID, orgID).First(&team).Error; err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Team not found", nil, "")
+		}
+		targetTeamID = &parsedTeamID
+	}
+
+	// Resolve and lock the canonical contact before the transfer row, matching
+	// merge lock order. The conditional active-status update prevents a stale
+	// assignment request from reopening a concurrently resumed transfer.
+	var transferHint struct {
+		ContactID uuid.UUID
+	}
+	if err := a.DB.Model(&models.AgentTransfer{}).
+		Select("contact_id").
+		Where("id = ? AND organization_id = ?", transferID, orgID).
+		Take(&transferHint).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Transfer not found", nil, "")
+	}
+
+	settings, _ := a.getChatbotSettingsCached(orgID, "")
+	errTransferNotActive := errors.New("transfer is not active")
+	var transfer models.AgentTransfer
+	txErr := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		canonicalContact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
+			tx,
+			orgID,
+			transferHint.ContactID,
+		)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if lockErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", transferID, orgID).
+			First(&transfer).Error; lockErr != nil {
+			return lockErr
+		}
+		if transfer.ContactID != canonicalContact.ID {
+			return contactutil.ErrCanonicalContactChanged
+		}
+		if transfer.Status != models.TransferStatusActive {
+			return errTransferNotActive
 		}
 
-		if *req.TeamID == "" {
-			// Move to general queue
-			transfer.TeamID = nil
-		} else {
-			// Move to specific team
-			parsedTeamID, err := uuid.Parse(*req.TeamID)
-			if err != nil {
-				return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid team_id", nil, "")
-			}
-			// Verify team exists
-			var team models.Team
-			if err := a.DB.Where("id = ? AND organization_id = ?", parsedTeamID, orgID).First(&team).Error; err != nil {
-				return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Team not found", nil, "")
-			}
-			transfer.TeamID = &parsedTeamID
+		previousAgentID := transfer.AgentID
+		if req.TeamID != nil {
+			transfer.TeamID = targetTeamID
 		}
-	}
+		transfer.AgentID = targetAgentID
+		if targetAgentID != nil && transfer.SLA.PickedUpAt == nil {
+			a.UpdateSLAOnPickup(&transfer)
+		}
 
-	// Capture the previous agent before we overwrite — the unassign branch
-	// below needs it to decide whether the contact's relationship-manager
-	// pointer was pointing at the agent we're removing.
-	previousAgentID := transfer.AgentID
+		result := tx.Model(&models.AgentTransfer{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ?",
+				transfer.ID,
+				orgID,
+				models.TransferStatusActive,
+			).
+			Updates(map[string]any{
+				"agent_id":        transfer.AgentID,
+				"team_id":         transfer.TeamID,
+				"picked_up_at":    transfer.SLA.PickedUpAt,
+				"sla_breached":    transfer.SLA.Breached,
+				"sla_breached_at": transfer.SLA.BreachedAt,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errTransferNotActive
+		}
 
-	// Update transfer
-	transfer.AgentID = targetAgentID
-
-	// Update SLA tracking if being assigned
-	if targetAgentID != nil && transfer.SLA.PickedUpAt == nil {
-		a.UpdateSLAOnPickup(&transfer)
-	}
-
-	if err := a.DB.Save(&transfer).Error; err != nil {
-		a.Log.Error("Failed to assign transfer", "error", err, "transfer_id", transfer.ID)
+		if targetAgentID != nil &&
+			settings != nil &&
+			settings.AgentAssignment.AssignToSameAgent {
+			if updateErr := tx.Model(&models.Contact{}).
+				Where(
+					"id = ? AND organization_id = ? AND assigned_user_id IS NULL",
+					canonicalContact.ID,
+					orgID,
+				).
+				Update("assigned_user_id", targetAgentID).Error; updateErr != nil {
+				return updateErr
+			}
+		} else if targetAgentID == nil && previousAgentID != nil {
+			if updateErr := tx.Model(&models.Contact{}).
+				Where(
+					"id = ? AND organization_id = ? AND assigned_user_id = ?",
+					canonicalContact.ID,
+					orgID,
+					*previousAgentID,
+				).
+				Update("assigned_user_id", nil).Error; updateErr != nil {
+				return updateErr
+			}
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(txErr, gorm.ErrRecordNotFound):
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Transfer not found", nil, "")
+	case errors.Is(txErr, errTransferNotActive):
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Transfer is not active", nil, "")
+	case txErr != nil:
+		a.Log.Error("Failed to assign transfer", "error", txErr, "transfer_id", transferID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to assign transfer", nil, "")
 	}
 
-	// Update contact assignment using the same rule as pickup / auto-assign:
-	// only pin the relationship manager when AssignToSameAgent is enabled and
-	// the contact has no existing manager. Active transfers already grant the
-	// assigned agent visibility, so we don't need to over-write contact.AssignedUserID.
-	if targetAgentID != nil && transfer.Contact != nil {
-		settings, _ := a.getChatbotSettingsCached(orgID, "")
-		if settings != nil && settings.AgentAssignment.AssignToSameAgent && transfer.Contact.AssignedUserID == nil {
-			a.DB.Model(transfer.Contact).Update("assigned_user_id", targetAgentID)
-		}
-	} else if targetAgentID == nil && transfer.Contact != nil {
-		// Unassigning (returning to queue) — clear the relationship-manager
-		// pointer iff it was pointing at the agent we just removed. Don't
-		// blow away a manually set manager that wasn't this transfer's agent.
-		if previousAgentID != nil && transfer.Contact.AssignedUserID != nil && *transfer.Contact.AssignedUserID == *previousAgentID {
-			a.DB.Model(transfer.Contact).Update("assigned_user_id", nil)
-		}
+	// Reload contact details after commit for notification payloads.
+	var contact models.Contact
+	if contactErr := a.DB.Where(
+		"id = ? AND organization_id = ?",
+		transfer.ContactID,
+		orgID,
+	).First(&contact).Error; contactErr == nil {
+		transfer.Contact = &contact
 	}
-
 	// Broadcast WebSocket notification
 	a.broadcastTransferAssigned(&transfer)
 
@@ -899,8 +969,7 @@ func (a *App) PickNextTransfer(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
-	// Check permissions - users with write permission have full access
-	hasFullAccess := a.HasPermission(userID, models.ResourceTransfers, models.ActionWrite, orgID)
+	hasFullAccess := a.transferManagementAccess(userID, orgID)
 	hasPickupPermission := a.HasPermission(userID, models.ResourceTransfers, models.ActionPickup, orgID)
 
 	// Check if agent queue pickup is allowed (use cache)
@@ -922,6 +991,14 @@ func (a *App) PickNextTransfer(r *fastglue.Request) error {
 
 	// Get optional team filter
 	teamIDStr := string(r.RequestCtx.QueryArgs().Peek("team_id"))
+	var requestedTeamID *uuid.UUID
+	if teamIDStr != "" && teamIDStr != "general" {
+		teamID, parseErr := uuid.Parse(teamIDStr)
+		if parseErr != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid team_id", nil, "")
+		}
+		requestedTeamID = &teamID
+	}
 
 	// Get user's team memberships
 	var userTeamIDs []uuid.UUID
@@ -945,22 +1022,20 @@ func (a *App) PickNextTransfer(r *fastglue.Request) error {
 			if teamIDStr == "general" {
 				query = query.Where("team_id IS NULL")
 			} else {
-				teamID, parseErr := uuid.Parse(teamIDStr)
-				if parseErr == nil {
-					if !hasFullAccess {
-						found := false
-						for _, candidateID := range userTeamIDs {
-							if candidateID == teamID {
-								found = true
-								break
-							}
-						}
-						if !found {
-							return errTeamAccess
+				teamID := *requestedTeamID
+				if !hasFullAccess {
+					found := false
+					for _, candidateID := range userTeamIDs {
+						if candidateID == teamID {
+							found = true
+							break
 						}
 					}
-					query = query.Where("team_id = ?", teamID)
+					if !found {
+						return errTeamAccess
+					}
 				}
+				query = query.Where("team_id = ?", teamID)
 			}
 		} else if !hasFullAccess {
 			if len(userTeamIDs) > 0 {
@@ -1107,22 +1182,6 @@ func (a *App) hasActiveAgentTransfer(orgID, contactID uuid.UUID) bool {
 	return count > 0
 }
 
-// willChatbotHandle returns true when an incoming message is expected to be
-// handled by the chatbot — i.e. chatbot is enabled for the account and the
-// contact has no active agent transfer. Used to pre-mark messages as read
-// so the agent's contact-list unread count doesn't flash for bot-handled
-// conversations.
-func (a *App) willChatbotHandle(account *models.WhatsAppAccount, contact *models.Contact) bool {
-	if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
-		return false
-	}
-	settings, err := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
-	if err != nil || !settings.IsEnabled {
-		return false
-	}
-	return true
-}
-
 // WebSocket broadcast helpers
 
 func (a *App) broadcastTransferCreated(transfer *models.AgentTransfer, contact *models.Contact) {
@@ -1224,49 +1283,75 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		a.UpdateSLAOnPickup(transfer)
 	}
 
-	if err := a.DB.Transaction(func(tx *gorm.DB) error {
-		if err := createActiveAgentTransferTx(tx, transfer); err != nil {
+	requestedContactID := transfer.ContactID
+	baseTransfer := *transfer
+	var savedTransfer models.AgentTransfer
+	var canonicalContact models.Contact
+
+	err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		canonical, err := contactutil.ResolveCanonicalContactForUpdate(
+			tx,
+			baseTransfer.OrganizationID,
+			requestedContactID,
+		)
+		if err != nil {
+			return err
+		}
+
+		candidate := baseTransfer
+		candidate.ContactID = canonical.ID
+		candidate.PhoneNumber = canonical.PhoneNumber
+		if err := createActiveAgentTransferTx(tx, &candidate); err != nil {
 			return err
 		}
 
 		// Update contact assignment if agent assigned, but only when
 		// AssignToSameAgent is enabled and no relationship manager is already
-		// set. The contact remains locked through this update.
-		if transfer.AgentID != nil &&
+		// set. The canonical contact row remains locked throughout.
+		if candidate.AgentID != nil &&
 			settings != nil &&
 			settings.AgentAssignment.AssignToSameAgent &&
-			contact.AssignedUserID == nil {
+			canonical.AssignedUserID == nil {
 			if err := tx.Model(&models.Contact{}).
 				Where(
 					"id = ? AND organization_id = ? AND assigned_user_id IS NULL",
-					contact.ID,
-					account.OrganizationID,
+					canonical.ID,
+					baseTransfer.OrganizationID,
 				).
-				Update("assigned_user_id", transfer.AgentID).Error; err != nil {
+				Update("assigned_user_id", candidate.AgentID).Error; err != nil {
 				return err
 			}
+			canonical.AssignedUserID = candidate.AgentID
 		}
 
 		// End any active chatbot session atomically with the handover.
 		if endChatbotSession {
+			now := time.Now().UTC()
 			if err := tx.Model(&models.ChatbotSession{}).
 				Where(
 					"organization_id = ? AND contact_id = ? AND status = ?",
-					account.OrganizationID,
-					contact.ID,
+					baseTransfer.OrganizationID,
+					canonical.ID,
 					models.SessionStatusActive,
 				).
 				Updates(map[string]any{
 					"status":       models.SessionStatusCancelled,
-					"completed_at": time.Now(),
+					"completed_at": now,
 				}).Error; err != nil {
 				return err
 			}
 		}
+
+		savedTransfer = candidate
+		canonicalContact = *canonical
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
+
+	*transfer = savedTransfer
+	*contact = canonicalContact
 
 	// Broadcast to WebSocket
 	a.broadcastTransferCreated(transfer, contact)
@@ -1308,6 +1393,10 @@ func (a *App) createTransferToQueue(account *models.WhatsAppAccount, contact *mo
 	}
 
 	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, false); err != nil {
+		if errors.Is(err, errActiveAgentTransferExists) {
+			a.Log.Debug("Concurrent active transfer already exists, skipping queue transfer", "contact_id", contact.ID, "source", source)
+			return
+		}
 		a.Log.Error("Failed to create transfer to queue", "error", err, "contact_id", contact.ID, "source", string(source))
 		return
 	}
@@ -1357,6 +1446,10 @@ func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact
 	}
 
 	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true); err != nil {
+		if errors.Is(err, errActiveAgentTransferExists) {
+			a.Log.Debug("Concurrent active transfer already exists, skipping keyword transfer", "contact_id", contact.ID)
+			return
+		}
 		a.Log.Error("Failed to create keyword-triggered transfer", "error", err, "contact_id", contact.ID)
 		return
 	}
@@ -1413,6 +1506,10 @@ func (a *App) createTransferToTeam(account *models.WhatsAppAccount, contact *mod
 	}
 
 	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true); err != nil {
+		if errors.Is(err, errActiveAgentTransferExists) {
+			a.Log.Debug("Concurrent active transfer already exists, skipping team transfer", "contact_id", contact.ID, "team_id", teamID)
+			return
+		}
 		a.Log.Error("Failed to create team transfer", "error", err, "contact_id", contact.ID, "team_id", teamID)
 		return
 	}

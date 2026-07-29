@@ -1200,6 +1200,26 @@ func (a *App) CreateBooking(r *fastglue.Request) error {
 				return err
 			}
 		}
+		if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        booking.ContactID,
+			EventType:        models.CustomerActivityBookingCreated,
+			Category:         models.CustomerActivityCategoryBooking,
+			Title:            "Booking created",
+			Summary:          event.StartsAt.Format(time.RFC3339),
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: bookingAuditResource,
+			SourceObjectID:   &booking.ID,
+			OccurredAt:       now,
+			Metadata: models.JSONB{
+				"event_id": event.ID.String(),
+				"status":   string(booking.Status),
+				"quantity": booking.Quantity,
+			},
+			IdempotencyKey: "booking-created:" + booking.ID.String(),
+		}); err != nil {
+			return err
+		}
 		return audit.LogAudit(
 			tx, orgID, userID, audit.GetUserName(tx, userID),
 			bookingAuditResource, booking.ID,
@@ -1356,6 +1376,28 @@ func (a *App) TransitionBooking(r *fastglue.Request) error {
 		}
 		if err := tx.Where("id = ? AND organization_id = ?", bookingID, orgID).
 			First(&updated).Error; err != nil {
+			return err
+		}
+		if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        updated.ContactID,
+			EventType:        models.CustomerActivityBookingStatus,
+			Category:         models.CustomerActivityCategoryBooking,
+			Title:            "Booking status changed",
+			Summary:          fmt.Sprintf("%s → %s", old.Status, updated.Status),
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: bookingAuditResource,
+			SourceObjectID:   &updated.ID,
+			OccurredAt:       now,
+			Metadata: models.JSONB{
+				"event_id":    updated.EventID.String(),
+				"from_status": string(old.Status),
+				"to_status":   string(updated.Status),
+				"version":     updated.Version,
+				"reason":      strings.TrimSpace(req.Reason),
+			},
+			IdempotencyKey: fmt.Sprintf("booking-status:%s:%d", updated.ID, updated.Version),
+		}); err != nil {
 			return err
 		}
 		return audit.LogAudit(
@@ -2075,6 +2117,28 @@ func sellContactPackageTransaction(
 			); err != nil {
 				return response, err
 			}
+			if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+				ContactID:        invoice.ContactID,
+				EventType:        models.CustomerActivityInvoiceCreated,
+				Category:         models.CustomerActivityCategoryInvoice,
+				Title:            "Invoice created",
+				Summary:          invoice.InvoiceNumber,
+				ActorType:        models.CustomerActivityActorUser,
+				ActorUserID:      &userID,
+				SourceObjectType: commerceInvoiceAuditResource,
+				SourceObjectID:   &invoice.ID,
+				OccurredAt:       now,
+				Metadata: models.JSONB{
+					"status":      string(invoice.Status),
+					"currency":    invoice.Currency,
+					"total_minor": invoice.TotalMinor,
+					"due_minor":   invoice.DueMinor,
+					"workflow":    "package_sale",
+				},
+				IdempotencyKey: "invoice-created:" + invoice.ID.String(),
+			}); err != nil {
+				return response, err
+			}
 		}
 	}
 
@@ -2165,6 +2229,29 @@ func sellContactPackageTransaction(
 			nil,
 			&contactPackage,
 		); err != nil {
+			return response, err
+		}
+		if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        contactPackage.ContactID,
+			EventType:        models.CustomerActivityPackageSold,
+			Category:         models.CustomerActivityCategoryPackage,
+			Title:            "Package sold",
+			Summary:          definition.Name,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: contactPackageAuditResource,
+			SourceObjectID:   &contactPackage.ID,
+			OccurredAt:       now,
+			Metadata: models.JSONB{
+				"package_definition_id": definition.ID.String(),
+				"invoice_id":            invoice.ID.String(),
+				"status":                string(contactPackage.Status),
+				"currency":              contactPackage.Currency,
+				"amount_minor":          contactPackage.PurchaseAmountMinor,
+				"expires_at":            contactPackage.ExpiresAt,
+			},
+			IdempotencyKey: "package-sold:" + contactPackage.ID.String(),
+		}); err != nil {
 			return response, err
 		}
 	}
@@ -2350,6 +2437,27 @@ func (a *App) CreateCommerceInvoice(r *fastglue.Request) error {
 			return err
 		}
 		invoice.Lines = lines
+		if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        invoice.ContactID,
+			EventType:        models.CustomerActivityInvoiceCreated,
+			Category:         models.CustomerActivityCategoryInvoice,
+			Title:            "Invoice created",
+			Summary:          invoice.InvoiceNumber,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: commerceInvoiceAuditResource,
+			SourceObjectID:   &invoice.ID,
+			OccurredAt:       now,
+			Metadata: models.JSONB{
+				"status":      string(invoice.Status),
+				"currency":    invoice.Currency,
+				"total_minor": invoice.TotalMinor,
+				"due_minor":   invoice.DueMinor,
+			},
+			IdempotencyKey: "invoice-created:" + invoice.ID.String(),
+		}); err != nil {
+			return err
+		}
 		return audit.LogAudit(
 			tx, orgID, userID, audit.GetUserName(tx, userID),
 			commerceInvoiceAuditResource, invoice.ID,
@@ -2818,6 +2926,51 @@ func (a *App) RecordManualInvoicePayment(r *fastglue.Request) error {
 			if err := activatePaidInvoiceContactPackages(
 				tx, orgID, &invoice, userID, payment.ID,
 			); err != nil {
+				return err
+			}
+		}
+		if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        invoice.ContactID,
+			EventType:        models.CustomerActivityPaymentRecorded,
+			Category:         models.CustomerActivityCategoryPayment,
+			Title:            "Payment recorded",
+			Summary:          invoice.InvoiceNumber,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: paymentAuditResource,
+			SourceObjectID:   &payment.ID,
+			OccurredAt:       payment.OccurredAt,
+			Metadata: models.JSONB{
+				"invoice_id":   invoice.ID.String(),
+				"amount_minor": payment.AmountMinor,
+				"currency":     payment.Currency,
+				"status":       string(payment.Status),
+				"manual":       true,
+			},
+			IdempotencyKey: "payment-recorded:" + payment.ID.String(),
+		}); err != nil {
+			return err
+		}
+		if invoice.Status == models.CommerceInvoiceStatusPaid {
+			if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+				ContactID:        invoice.ContactID,
+				EventType:        models.CustomerActivityInvoicePaid,
+				Category:         models.CustomerActivityCategoryInvoice,
+				Title:            "Invoice paid",
+				Summary:          invoice.InvoiceNumber,
+				ActorType:        models.CustomerActivityActorUser,
+				ActorUserID:      &userID,
+				SourceObjectType: commerceInvoiceAuditResource,
+				SourceObjectID:   &invoice.ID,
+				OccurredAt:       payment.OccurredAt,
+				Metadata: models.JSONB{
+					"currency":   invoice.Currency,
+					"paid_minor": invoice.PaidMinor,
+					"payment_id": payment.ID.String(),
+					"version":    invoice.Version,
+				},
+				IdempotencyKey: fmt.Sprintf("invoice-paid:%s:%d", invoice.ID, invoice.Version),
+			}); err != nil {
 				return err
 			}
 		}

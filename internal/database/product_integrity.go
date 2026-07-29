@@ -32,6 +32,23 @@ func productIntegrityStatements() []string {
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_crm_pipeline_stages_id_pipeline_org ON crm_pipeline_stages(id, pipeline_id, organization_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_crm_pipeline_stages_id_org ON crm_pipeline_stages(id, organization_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_crm_leads_id_org ON crm_leads(id, organization_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_crm_leads_id_contact_org ON crm_leads(id, contact_id, organization_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_activity_events_id_org ON customer_activity_events(id, organization_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_policies_id_org ON automation_policies(id, organization_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_policies_org_name ON automation_policies(organization_id, lower(name)) WHERE deleted_at IS NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_policy_versions_id_org ON automation_policy_versions(id, organization_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_policy_versions_id_policy_org ON automation_policy_versions(id, policy_id, organization_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_policy_versions_identity ON automation_policy_versions(id, policy_id, organization_id, number)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_policy_versions_number ON automation_policy_versions(organization_id, policy_id, number)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_policy_activations_id_org ON automation_policy_activations(id, organization_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_policy_activations_open ON automation_policy_activations(organization_id, policy_id) WHERE active_until IS NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_executions_id_org ON automation_executions(id, organization_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_executions_policy_event ON automation_executions(organization_id, policy_id, activity_event_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_execution_steps_id_org ON automation_execution_steps(id, organization_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_execution_steps_node ON automation_execution_steps(organization_id, execution_id, node_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_execution_steps_idempotency ON automation_execution_steps(organization_id, idempotency_key)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_event_receipts_id_org ON automation_event_receipts(id, organization_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_automation_event_receipts_activity ON automation_event_receipts(organization_id, activity_event_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_crm_leads_org_idempotency ON crm_leads(organization_id, idempotency_key) WHERE idempotency_key <> '' AND deleted_at IS NULL`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_follow_up_tasks_id_org ON follow_up_tasks(id, organization_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_follow_up_tasks_org_idempotency ON follow_up_tasks(organization_id, idempotency_key) WHERE idempotency_key <> '' AND deleted_at IS NULL`,
@@ -128,6 +145,155 @@ func productIntegrityStatements() []string {
 			"payment_transactions",
 			"amount_minor > 0",
 		),
+		productCheckConstraint(
+			"chk_automation_policy_status",
+			"automation_policies",
+			"status IN ('draft', 'active', 'paused', 'archived') AND version > 0 AND active_version_number >= 0 AND ((status = 'active' AND active_version_id IS NOT NULL AND active_version_number > 0) OR status != 'active')",
+		),
+		productCheckConstraint(
+			"chk_automation_execution_status",
+			"automation_executions",
+			"status IN ('pending', 'processing', 'completed', 'skipped', 'failed', 'cancelled') AND policy_version_number > 0",
+		),
+		productCheckConstraint(
+			"chk_automation_activation_interval",
+			"automation_policy_activations",
+			"policy_version_number > 0 AND (active_until IS NULL OR active_until >= active_from)",
+		),
+		productCheckConstraint(
+			"chk_automation_step_status",
+			"automation_execution_steps",
+			"status IN ('pending', 'processing', 'completed', 'skipped', 'failed', 'cancelled') AND length(btrim(idempotency_key)) > 0",
+		),
+		productCheckConstraint(
+			"chk_automation_receipt_status",
+			"automation_event_receipts",
+			"status IN ('pending', 'processing', 'completed', 'failed') AND attempts >= 0 AND max_attempts > 0",
+		),
+		`CREATE OR REPLACE FUNCTION rereply_reject_customer_activity_mutation()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			RAISE EXCEPTION 'customer_activity_events is append-only';
+		END;
+		$$`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1
+				FROM pg_trigger
+				WHERE tgname = 'trg_customer_activity_events_append_only'
+				  AND tgrelid = 'customer_activity_events'::regclass
+			) THEN
+				CREATE TRIGGER trg_customer_activity_events_append_only
+				BEFORE UPDATE OR DELETE ON customer_activity_events
+				FOR EACH ROW
+				EXECUTE FUNCTION rereply_reject_customer_activity_mutation();
+			END IF;
+		END $$`,
+		`CREATE OR REPLACE FUNCTION rereply_create_automation_event_receipt()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			INSERT INTO automation_event_receipts (
+				id,
+				organization_id,
+				activity_event_id,
+				status,
+				attempts,
+				max_attempts,
+				ingested_at,
+				available_at,
+				created_at,
+				updated_at
+			) VALUES (
+				gen_random_uuid(),
+				NEW.organization_id,
+				NEW.id,
+				'pending',
+				0,
+				10,
+				clock_timestamp(),
+				clock_timestamp(),
+				clock_timestamp(),
+				clock_timestamp()
+			)
+			ON CONFLICT (organization_id, activity_event_id) DO NOTHING;
+			RETURN NEW;
+		END;
+		$$`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1
+				FROM pg_trigger
+				WHERE tgname = 'trg_customer_activity_automation_receipt'
+				  AND tgrelid = 'customer_activity_events'::regclass
+			) THEN
+				CREATE TRIGGER trg_customer_activity_automation_receipt
+				AFTER INSERT ON customer_activity_events
+				FOR EACH ROW
+				EXECUTE FUNCTION rereply_create_automation_event_receipt();
+			END IF;
+		END $$`,
+		`CREATE OR REPLACE FUNCTION rereply_reject_automation_policy_version_mutation()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			RAISE EXCEPTION 'automation_policy_versions is append-only';
+		END;
+		$$`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1
+				FROM pg_trigger
+				WHERE tgname = 'trg_automation_policy_versions_append_only'
+				  AND tgrelid = 'automation_policy_versions'::regclass
+			) THEN
+				CREATE TRIGGER trg_automation_policy_versions_append_only
+				BEFORE UPDATE OR DELETE ON automation_policy_versions
+				FOR EACH ROW
+				EXECUTE FUNCTION rereply_reject_automation_policy_version_mutation();
+			END IF;
+		END $$`,
+		`CREATE OR REPLACE FUNCTION rereply_guard_automation_policy_activation()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF TG_OP = 'UPDATE'
+			   AND OLD.active_until IS NULL
+			   AND NEW.active_until IS NOT NULL
+			   AND OLD.closed_by_id IS NULL
+			   AND NEW.closed_by_id IS NOT NULL
+			   AND NEW.id IS NOT DISTINCT FROM OLD.id
+			   AND NEW.organization_id IS NOT DISTINCT FROM OLD.organization_id
+			   AND NEW.policy_id IS NOT DISTINCT FROM OLD.policy_id
+			   AND NEW.policy_version_id IS NOT DISTINCT FROM OLD.policy_version_id
+			   AND NEW.policy_version_number IS NOT DISTINCT FROM OLD.policy_version_number
+			   AND NEW.active_from IS NOT DISTINCT FROM OLD.active_from
+			   AND NEW.created_by_id IS NOT DISTINCT FROM OLD.created_by_id
+			   AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at
+			THEN
+				RETURN NEW;
+			END IF;
+			RAISE EXCEPTION 'automation_policy_activations is immutable except for its first close transition';
+		END;
+		$$`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (
+				SELECT 1
+				FROM pg_trigger
+				WHERE tgname = 'trg_automation_policy_activations_guard'
+				  AND tgrelid = 'automation_policy_activations'::regclass
+			) THEN
+				CREATE TRIGGER trg_automation_policy_activations_guard
+				BEFORE UPDATE OR DELETE ON automation_policy_activations
+				FOR EACH ROW
+				EXECUTE FUNCTION rereply_guard_automation_policy_activation();
+			END IF;
+		END $$`,
 	}
 
 	foreignKeys := []productTenantForeignKey{
@@ -151,6 +317,20 @@ func productIntegrityStatements() []string {
 		{"fk_support_grants_case_tenant", "support_access_grants", "support_case_id, organization_id", "support_cases", "id, organization_id", "RESTRICT"},
 		{"fk_recovery_checkpoints_case_tenant", "recovery_checkpoints", "support_case_id, organization_id", "support_cases", "id, organization_id", "RESTRICT"},
 		{"fk_crm_stages_pipeline_tenant", "crm_pipeline_stages", "pipeline_id, organization_id", "crm_pipelines", "id, organization_id", "RESTRICT"},
+		{"fk_contacts_merged_into_tenant", "contacts", "merged_into_id, organization_id", "contacts", "id, organization_id", "RESTRICT"},
+		{"fk_customer_activity_contact_tenant", "customer_activity_events", "contact_id, organization_id", "contacts", "id, organization_id", "RESTRICT"},
+		{"fk_customer_activity_lead_contact_tenant", "customer_activity_events", "lead_id, contact_id, organization_id", "crm_leads", "id, contact_id, organization_id", "RESTRICT"},
+		{"fk_automation_versions_policy_tenant", "automation_policy_versions", "policy_id, organization_id", "automation_policies", "id, organization_id", "RESTRICT"},
+		{"fk_automation_policy_active_version_tenant", "automation_policies", "active_version_id, id, organization_id, active_version_number", "automation_policy_versions", "id, policy_id, organization_id, number", "RESTRICT"},
+		{"fk_automation_activations_policy_tenant", "automation_policy_activations", "policy_id, organization_id", "automation_policies", "id, organization_id", "RESTRICT"},
+		{"fk_automation_activations_version_tenant", "automation_policy_activations", "policy_version_id, policy_id, organization_id, policy_version_number", "automation_policy_versions", "id, policy_id, organization_id, number", "RESTRICT"},
+		{"fk_automation_executions_policy_tenant", "automation_executions", "policy_id, organization_id", "automation_policies", "id, organization_id", "RESTRICT"},
+		{"fk_automation_executions_version_tenant", "automation_executions", "policy_version_id, policy_id, organization_id, policy_version_number", "automation_policy_versions", "id, policy_id, organization_id, number", "RESTRICT"},
+		{"fk_automation_executions_activity_tenant", "automation_executions", "activity_event_id, organization_id", "customer_activity_events", "id, organization_id", "RESTRICT"},
+		{"fk_automation_executions_contact_tenant", "automation_executions", "contact_id, organization_id", "contacts", "id, organization_id", "RESTRICT"},
+		{"fk_automation_steps_execution_tenant", "automation_execution_steps", "execution_id, organization_id", "automation_executions", "id, organization_id", "CASCADE"},
+		{"fk_automation_steps_task_tenant", "automation_execution_steps", "task_id, organization_id", "follow_up_tasks", "id, organization_id", "RESTRICT"},
+		{"fk_automation_receipts_activity_tenant", "automation_event_receipts", "activity_event_id, organization_id", "customer_activity_events", "id, organization_id", "CASCADE"},
 		{"fk_crm_leads_contact_tenant", "crm_leads", "contact_id, organization_id", "contacts", "id, organization_id", "RESTRICT"},
 		{"fk_crm_leads_pipeline_tenant", "crm_leads", "pipeline_id, organization_id", "crm_pipelines", "id, organization_id", "RESTRICT"},
 		{"fk_crm_leads_stage_pipeline_tenant", "crm_leads", "stage_id, pipeline_id, organization_id", "crm_pipeline_stages", "id, pipeline_id, organization_id", "RESTRICT"},

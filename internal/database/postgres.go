@@ -166,6 +166,14 @@ func GetMigrationModels() []MigrationModel {
 		{"CRMPipeline", &models.CRMPipeline{}},
 		{"CRMPipelineStage", &models.CRMPipelineStage{}},
 		{"CRMLead", &models.CRMLead{}},
+		{"CustomerActivityEvent", &models.CustomerActivityEvent{}},
+		{"AutomationPolicy", &models.AutomationPolicy{}},
+		{"AutomationPolicyVersion", &models.AutomationPolicyVersion{}},
+		{"AutomationPolicyActivation", &models.AutomationPolicyActivation{}},
+		{"AutomationExecution", &models.AutomationExecution{}},
+		{"AutomationExecutionStep", &models.AutomationExecutionStep{}},
+		{"AutomationEventReceipt", &models.AutomationEventReceipt{}},
+		{"AutomationDispatchState", &models.AutomationDispatchState{}},
 		{"CRMStageHistory", &models.CRMStageHistory{}},
 		{"FollowUpTask", &models.FollowUpTask{}},
 		{"BookingService", &models.BookingService{}},
@@ -339,6 +347,26 @@ func getIndexes() []string {
 		`CREATE INDEX IF NOT EXISTS idx_keyword_rules_priority ON keyword_rules(organization_id, is_enabled, priority DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_transfers_active ON agent_transfers(organization_id, phone_number, status)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_transfers_org_contact ON agent_transfers(organization_id, contact_id, status)`,
+		// Preserve the newest active transfer and close historical duplicates
+		// before installing the concurrency invariant.
+		`WITH ranked_active_transfers AS (
+			SELECT id, ROW_NUMBER() OVER (
+				PARTITION BY organization_id, contact_id
+				ORDER BY transferred_at DESC, created_at DESC, id DESC
+			) AS duplicate_rank
+			FROM agent_transfers
+			WHERE status = 'active' AND deleted_at IS NULL
+		)
+		UPDATE agent_transfers AS duplicate
+		SET status = 'expired',
+			updated_at = NOW(),
+			expires_at = COALESCE(duplicate.expires_at, NOW())
+		FROM ranked_active_transfers AS ranked
+		WHERE duplicate.id = ranked.id
+		  AND ranked.duplicate_rank > 1`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_transfers_org_contact_active
+			ON agent_transfers(organization_id, contact_id)
+			WHERE status = 'active' AND deleted_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_transfers_agent_active ON agent_transfers(agent_id, status) WHERE status = 'active'`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_transfers_team ON agent_transfers(team_id, status) WHERE team_id IS NOT NULL`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_accounts_org_phone ON whatsapp_accounts(organization_id, phone_id)`,
@@ -389,6 +417,8 @@ func getIndexes() []string {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_pipelines_org_default ON crm_pipelines(organization_id) WHERE is_default = true AND is_active = true AND deleted_at IS NULL`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_pipeline_stages_order ON crm_pipeline_stages(pipeline_id, display_order) WHERE deleted_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_crm_leads_org_board ON crm_leads(organization_id, pipeline_id, stage_id, status, updated_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_customer_activity_contact_time ON customer_activity_events(organization_id, contact_id, occurred_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_customer_activity_lead_time ON customer_activity_events(organization_id, lead_id, occurred_at DESC) WHERE lead_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_follow_up_tasks_org_due ON follow_up_tasks(organization_id, status, due_at, priority)`,
 		`CREATE INDEX IF NOT EXISTS idx_booking_events_org_window ON booking_events(organization_id, resource_id, starts_at, ends_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_bookings_org_event_status ON bookings(organization_id, event_id, status)`,

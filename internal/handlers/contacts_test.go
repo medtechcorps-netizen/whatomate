@@ -613,6 +613,75 @@ func TestApp_AssignContact(t *testing.T) {
 	})
 }
 
+func TestApp_ChatEndpointsRequireDeclaredChatActions(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	contactsOnlyRole := testutil.CreateTestRoleWithKeys(
+		t,
+		app.DB,
+		org.ID,
+		"contacts-without-chat",
+		[]string{models.ResourceContacts + ":" + models.ActionRead},
+	)
+	user := testutil.CreateTestUser(
+		t,
+		app.DB,
+		org.ID,
+		testutil.WithRoleID(&contactsOnlyRole.ID),
+	)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	tests := []struct {
+		name string
+		req  func() *fastglue.Request
+		call func(*handlers.App, *fastglue.Request) error
+	}{
+		{
+			name: "message transcript requires chat read",
+			req:  func() *fastglue.Request { return testutil.NewGETRequest(t) },
+			call: func(app *handlers.App, req *fastglue.Request) error {
+				return app.GetMessages(req)
+			},
+		},
+		{
+			name: "text send requires chat write",
+			req: func() *fastglue.Request {
+				return testutil.NewJSONRequest(t, map[string]any{
+					"type":    models.MessageTypeText,
+					"content": map[string]string{"body": "blocked"},
+				})
+			},
+			call: func(app *handlers.App, req *fastglue.Request) error {
+				return app.SendMessage(req)
+			},
+		},
+		{
+			name: "media send requires chat write",
+			req:  func() *fastglue.Request { return testutil.NewJSONRequest(t, nil) },
+			call: func(app *handlers.App, req *fastglue.Request) error {
+				return app.SendMediaMessage(req)
+			},
+		},
+		{
+			name: "reaction send requires chat write",
+			req:  func() *fastglue.Request { return testutil.NewJSONRequest(t, nil) },
+			call: func(app *handlers.App, req *fastglue.Request) error {
+				return app.SendReaction(req)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := test.req()
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			testutil.SetPathParam(req, "id", contact.ID.String())
+			require.NoError(t, test.call(app, req))
+			assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+		})
+	}
+}
+
 // --- GetMessages Tests ---
 
 func TestApp_GetMessages(t *testing.T) {

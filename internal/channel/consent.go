@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"gorm.io/gorm"
 )
@@ -45,52 +46,126 @@ func OutboundConsentAllowed(
 	}
 	now = now.UTC()
 
-	var preference models.ContactChannelPreference
-	err := db.Where(
-		"organization_id = ? AND contact_id = ? AND channel_account_id = ? AND purpose = ?",
-		organizationID,
-		contactID,
-		channelAccountID,
-		purpose,
-	).First(&preference).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return false, "preference_lookup_failed", err
+	allowed := false
+	reason := "consent_lookup_failed"
+	err := canonicalConsentTransaction(db, func(tx *gorm.DB) error {
+		canonicalContact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
+			tx,
+			organizationID,
+			contactID,
+		)
+		if resolveErr != nil {
+			reason = "contact_lookup_failed"
+			return resolveErr
+		}
+		canonicalContactID := canonicalContact.ID
+
+		var preference models.ContactChannelPreference
+		preferenceErr := tx.Where(
+			"organization_id = ? AND contact_id = ? AND channel_account_id = ? AND purpose = ?",
+			organizationID,
+			canonicalContactID,
+			channelAccountID,
+			purpose,
+		).First(&preference).Error
+		if preferenceErr != nil && !errors.Is(preferenceErr, gorm.ErrRecordNotFound) {
+			reason = "preference_lookup_failed"
+			return preferenceErr
+		}
+		if preferenceErr == nil {
+			switch preference.Status {
+			case models.ChannelPreferenceStatusOptedOut:
+				allowed = false
+				reason = "channel_preference_opted_out"
+				return nil
+			case models.ChannelPreferenceStatusBlocked:
+				allowed = false
+				reason = "channel_preference_blocked"
+				return nil
+			}
+		}
+
+		var consents []models.ConsentState
+		if consentErr := tx.Where(
+			"organization_id = ? AND contact_id = ? AND purpose = ? AND channel = ?",
+			organizationID,
+			canonicalContactID,
+			purpose,
+			channelName,
+		).Order("effective_at DESC, created_at DESC").Find(&consents).Error; consentErr != nil {
+			reason = "consent_lookup_failed"
+			return consentErr
+		}
+		if len(consents) == 0 {
+			allowed = true
+			reason = "no_negative_consent_signal"
+			return nil
+		}
+
+		// ConsentState is unique per subject key, so every row here is the
+		// current state for one identity of the canonical contact. A newer
+		// grant for one identity must never override a denial or withdrawal for
+		// another.
+		for _, consent := range consents {
+			if consent.Status == models.ConsentStatusDenied {
+				allowed = false
+				reason = "consent_denied"
+				return nil
+			}
+		}
+		for _, consent := range consents {
+			if consent.Status == models.ConsentStatusWithdrawn {
+				allowed = false
+				reason = "consent_withdrawn"
+				return nil
+			}
+		}
+		for _, consent := range consents {
+			if consent.Status == models.ConsentStatusExpired ||
+				(consent.ExpiresAt != nil && !consent.ExpiresAt.After(now)) {
+				allowed = false
+				reason = "consent_expired"
+				return nil
+			}
+		}
+		allowed = true
+		reason = "consent_permits"
+		return nil
+	})
+	if err != nil {
+		return false, reason, err
 	}
-	if err == nil {
-		switch preference.Status {
-		case models.ChannelPreferenceStatusOptedOut:
-			return false, "channel_preference_opted_out", nil
-		case models.ChannelPreferenceStatusBlocked:
-			return false, "channel_preference_blocked", nil
+	return allowed, reason, nil
+}
+
+const canonicalConsentAttempts = 3
+
+func canonicalConsentTransaction(db *gorm.DB, check func(*gorm.DB) error) error {
+	var err error
+	for attempt := 0; attempt < canonicalConsentAttempts; attempt++ {
+		err = db.Transaction(check)
+		if !canonicalConsentRetryable(err) {
+			return err
 		}
 	}
+	return err
+}
 
-	var consent models.ConsentState
-	err = db.Where(
-		"organization_id = ? AND contact_id = ? AND purpose = ? AND channel = ?",
-		organizationID,
-		contactID,
-		purpose,
-		channelName,
-	).Order("effective_at DESC, created_at DESC").First(&consent).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return true, "no_negative_consent_signal", nil
+func canonicalConsentRetryable(err error) bool {
+	if errors.Is(err, contactutil.ErrCanonicalContactChanged) {
+		return true
 	}
-	if err != nil {
-		return false, "consent_lookup_failed", err
+	var sqlState interface {
+		SQLState() string
 	}
-	if consent.ExpiresAt != nil && !consent.ExpiresAt.After(now) {
-		return false, "consent_expired", nil
+	if !errors.As(err, &sqlState) {
+		return false
 	}
-	switch consent.Status {
-	case models.ConsentStatusDenied:
-		return false, "consent_denied", nil
-	case models.ConsentStatusWithdrawn:
-		return false, "consent_withdrawn", nil
-	case models.ConsentStatusExpired:
-		return false, "consent_expired", nil
+	switch sqlState.SQLState() {
+	case "40001", "40P01":
+		return true
 	default:
-		return true, "consent_permits", nil
+		return false
 	}
 }
 

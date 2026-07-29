@@ -60,6 +60,59 @@ const (
 	CRMLeadSourceOther    CRMLeadSource = "other"
 )
 
+// CustomerActivityCategory groups timeline events without weakening the
+// stable, typed event name used by automations and webhook consumers.
+type CustomerActivityCategory string
+
+const (
+	CustomerActivityCategoryContact CustomerActivityCategory = "contact"
+	CustomerActivityCategoryMessage CustomerActivityCategory = "message"
+	CustomerActivityCategoryCRM     CustomerActivityCategory = "crm"
+	CustomerActivityCategoryTask    CustomerActivityCategory = "task"
+	CustomerActivityCategoryBooking CustomerActivityCategory = "booking"
+	CustomerActivityCategoryPackage CustomerActivityCategory = "package"
+	CustomerActivityCategoryInvoice CustomerActivityCategory = "invoice"
+	CustomerActivityCategoryPayment CustomerActivityCategory = "payment"
+	CustomerActivityCategoryConsent CustomerActivityCategory = "consent"
+)
+
+// CustomerActivityEventType is the canonical customer-lifecycle event name.
+// Values are additive API contracts: existing values must never be repurposed.
+type CustomerActivityEventType string
+
+const (
+	CustomerActivityContactCreated  CustomerActivityEventType = "contact.created"
+	CustomerActivityContactUpdated  CustomerActivityEventType = "contact.updated"
+	CustomerActivityContactMerged   CustomerActivityEventType = "contact.merged"
+	CustomerActivityMessageIncoming CustomerActivityEventType = "message.incoming"
+	CustomerActivityCRMLeadCreated  CustomerActivityEventType = "crm.lead.created"
+	CustomerActivityCRMLeadUpdated  CustomerActivityEventType = "crm.lead.updated"
+	CustomerActivityCRMStageMoved   CustomerActivityEventType = "crm.lead.stage_moved"
+	CustomerActivityTaskCreated     CustomerActivityEventType = "task.created"
+	CustomerActivityTaskCompleted   CustomerActivityEventType = "task.completed"
+	CustomerActivityBookingCreated  CustomerActivityEventType = "booking.created"
+	CustomerActivityBookingStatus   CustomerActivityEventType = "booking.status_changed"
+	CustomerActivityPackageSold     CustomerActivityEventType = "package.sold"
+	CustomerActivityPackageLow      CustomerActivityEventType = "package.balance_low"
+	CustomerActivityPackageExpiring CustomerActivityEventType = "package.expiring"
+	CustomerActivityInvoiceCreated  CustomerActivityEventType = "invoice.created"
+	CustomerActivityInvoiceOverdue  CustomerActivityEventType = "invoice.overdue"
+	CustomerActivityInvoicePaid     CustomerActivityEventType = "invoice.paid"
+	CustomerActivityPaymentRecorded CustomerActivityEventType = "payment.recorded"
+	CustomerActivityConsentOptedOut CustomerActivityEventType = "consent.opted_out"
+)
+
+// CustomerActivityActorType identifies who caused a lifecycle event.
+type CustomerActivityActorType string
+
+const (
+	CustomerActivityActorUser     CustomerActivityActorType = "user"
+	CustomerActivityActorContact  CustomerActivityActorType = "contact"
+	CustomerActivityActorSystem   CustomerActivityActorType = "system"
+	CustomerActivityActorProvider CustomerActivityActorType = "provider"
+	CustomerActivityActorImport   CustomerActivityActorType = "import"
+)
+
 // FollowUpTaskStatus is the workflow status of a follow-up task.
 type FollowUpTaskStatus string
 
@@ -294,6 +347,36 @@ type OutboxEvent struct {
 
 func (OutboxEvent) TableName() string {
 	return "outbox_events"
+}
+
+// CustomerActivityEvent is the append-only, customer-facing lifecycle stream.
+// It deliberately does not embed BaseModel: an event can be corrected only by
+// appending another event, never by updating or soft-deleting history.
+type CustomerActivityEvent struct {
+	ID               uuid.UUID                 `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"id"`
+	OrganizationID   uuid.UUID                 `gorm:"type:uuid;not null;index;uniqueIndex:idx_customer_activity_org_idempotency,priority:1" json:"organization_id"`
+	ContactID        uuid.UUID                 `gorm:"type:uuid;not null;index" json:"contact_id"`
+	LeadID           *uuid.UUID                `gorm:"type:uuid;index" json:"lead_id,omitempty"`
+	EventType        CustomerActivityEventType `gorm:"size:120;not null;index" json:"event_type"`
+	Category         CustomerActivityCategory  `gorm:"size:30;not null;index" json:"category"`
+	Title            string                    `gorm:"size:255;not null" json:"title"`
+	Summary          string                    `gorm:"type:text" json:"summary,omitempty"`
+	ActorType        CustomerActivityActorType `gorm:"size:30;not null;default:'system';index" json:"actor_type"`
+	ActorUserID      *uuid.UUID                `gorm:"type:uuid;index" json:"actor_user_id,omitempty"`
+	SourceObjectType string                    `gorm:"size:80;not null;index" json:"source_object_type"`
+	SourceObjectID   *uuid.UUID                `gorm:"type:uuid;index" json:"source_object_id,omitempty"`
+	OccurredAt       time.Time                 `gorm:"not null;index" json:"occurred_at"`
+	Metadata         JSONB                     `gorm:"type:jsonb;not null;default:'{}'" json:"metadata"`
+	IdempotencyKey   string                    `gorm:"size:255;not null;uniqueIndex:idx_customer_activity_org_idempotency,priority:2" json:"idempotency_key"`
+	CreatedAt        time.Time                 `gorm:"not null;autoCreateTime" json:"created_at"`
+
+	Contact *Contact `gorm:"foreignKey:ContactID" json:"contact,omitempty"`
+	Lead    *CRMLead `gorm:"foreignKey:LeadID" json:"lead,omitempty"`
+	Actor   *User    `gorm:"foreignKey:ActorUserID" json:"actor,omitempty"`
+}
+
+func (CustomerActivityEvent) TableName() string {
+	return "customer_activity_events"
 }
 
 // CRMPipeline is an organization-defined lead lifecycle.

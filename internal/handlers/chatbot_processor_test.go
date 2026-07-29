@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // newProcessorTestApp creates a minimal App suitable for chatbot processor tests.
@@ -425,7 +426,8 @@ func TestGetOrCreateSession_NewSession(t *testing.T) {
 	org, account := createProcessorTestOrg(t, app)
 	contact := testutil.CreateTestContact(t, app.DB, org.ID)
 
-	session, isNew := app.getOrCreateSession(org.ID, contact.ID, account.Name, contact.PhoneNumber, 30)
+	session, isNew, err := app.getOrCreateSession(org.ID, contact.ID, account.Name, contact.PhoneNumber, 30)
+	require.NoError(t, err)
 	assert.True(t, isNew)
 	require.NotNil(t, session)
 	assert.Equal(t, models.SessionStatusActive, session.Status)
@@ -458,7 +460,8 @@ func TestGetOrCreateSession_ExistingSession(t *testing.T) {
 	}
 	require.NoError(t, app.DB.Create(&existing).Error)
 
-	session, isNew := app.getOrCreateSession(org.ID, contact.ID, account.Name, contact.PhoneNumber, 30)
+	session, isNew, err := app.getOrCreateSession(org.ID, contact.ID, account.Name, contact.PhoneNumber, 30)
+	require.NoError(t, err)
 	assert.False(t, isNew)
 	require.NotNil(t, session)
 	assert.Equal(t, existing.ID, session.ID)
@@ -483,10 +486,210 @@ func TestGetOrCreateSession_ExpiredSession(t *testing.T) {
 	}
 	require.NoError(t, app.DB.Create(&expired).Error)
 
-	session, isNew := app.getOrCreateSession(org.ID, contact.ID, account.Name, contact.PhoneNumber, 30)
+	session, isNew, err := app.getOrCreateSession(org.ID, contact.ID, account.Name, contact.PhoneNumber, 30)
+	require.NoError(t, err)
 	assert.True(t, isNew)
 	require.NotNil(t, session)
 	assert.NotEqual(t, expired.ID, session.ID, "should create a new session, not return expired one")
+
+	var storedExpired models.ChatbotSession
+	require.NoError(t, app.DB.First(&storedExpired, expired.ID).Error)
+	assert.Equal(t, models.SessionStatusTimeout, storedExpired.Status)
+	require.NotNil(t, storedExpired.CompletedAt)
+}
+
+func TestGetOrCreateSession_ReconcilesDuplicateActiveRows(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	now := time.Now()
+
+	newest := models.ChatbotSession{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		ContactID:       contact.ID,
+		WhatsAppAccount: account.Name,
+		PhoneNumber:     contact.PhoneNumber,
+		Status:          models.SessionStatusActive,
+		SessionData:     models.JSONB{"session": "newest"},
+		StartedAt:       now.Add(-10 * time.Minute),
+		LastActivityAt:  now.Add(-time.Minute),
+	}
+	duplicateLive := models.ChatbotSession{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		ContactID:       contact.ID,
+		WhatsAppAccount: account.Name,
+		PhoneNumber:     contact.PhoneNumber,
+		Status:          models.SessionStatusActive,
+		SessionData:     models.JSONB{"session": "duplicate-live"},
+		StartedAt:       now.Add(-20 * time.Minute),
+		LastActivityAt:  now.Add(-5 * time.Minute),
+	}
+	stale := models.ChatbotSession{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		ContactID:       contact.ID,
+		WhatsAppAccount: account.Name,
+		PhoneNumber:     contact.PhoneNumber,
+		Status:          models.SessionStatusActive,
+		SessionData:     models.JSONB{"session": "stale"},
+		StartedAt:       now.Add(-2 * time.Hour),
+		LastActivityAt:  now.Add(-2 * time.Hour),
+	}
+	require.NoError(t, app.DB.Create(&newest).Error)
+	require.NoError(t, app.DB.Create(&duplicateLive).Error)
+	require.NoError(t, app.DB.Create(&stale).Error)
+
+	session, isNew, err := app.getOrCreateSession(
+		org.ID,
+		contact.ID,
+		account.Name,
+		contact.PhoneNumber,
+		30,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assert.False(t, isNew)
+	assert.Equal(t, newest.ID, session.ID)
+
+	var storedDuplicate, storedStale models.ChatbotSession
+	require.NoError(t, app.DB.First(&storedDuplicate, duplicateLive.ID).Error)
+	require.NoError(t, app.DB.First(&storedStale, stale.ID).Error)
+	assert.Equal(t, models.SessionStatusCancelled, storedDuplicate.Status)
+	assert.Equal(t, models.SessionStatusTimeout, storedStale.Status)
+	require.NotNil(t, storedDuplicate.CompletedAt)
+	require.NotNil(t, storedStale.CompletedAt)
+
+	var activeCount int64
+	require.NoError(t, app.DB.Model(&models.ChatbotSession{}).
+		Where(
+			"organization_id = ? AND contact_id = ? AND whats_app_account = ? AND status = ?",
+			org.ID,
+			contact.ID,
+			account.Name,
+			models.SessionStatusActive,
+		).
+		Count(&activeCount).Error)
+	assert.Equal(t, int64(1), activeCount)
+}
+
+func TestGetOrCreateSession_ConcurrentAliasCreatorsReuseCanonicalSession(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	canonical := testutil.CreateTestContact(t, app.DB, org.ID)
+	alias := testutil.CreateTestContact(t, app.DB, org.ID)
+	require.NoError(t, app.DB.Unscoped().Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", alias.ID, org.ID).
+		Updates(map[string]any{
+			"merged_into_id": canonical.ID,
+			"deleted_at":     time.Now(),
+		}).Error)
+
+	type sessionResult struct {
+		session *models.ChatbotSession
+		isNew   bool
+		err     error
+	}
+	const creators = 8
+	start := make(chan struct{})
+	results := make(chan sessionResult, creators)
+	for range creators {
+		go func() {
+			<-start
+			session, isNew, err := app.getOrCreateSession(
+				org.ID,
+				alias.ID,
+				account.Name,
+				alias.PhoneNumber,
+				30,
+			)
+			results <- sessionResult{session: session, isNew: isNew, err: err}
+		}()
+	}
+	close(start)
+
+	var sessionID uuid.UUID
+	newCount := 0
+	for range creators {
+		result := <-results
+		require.NoError(t, result.err)
+		require.NotNil(t, result.session)
+		if sessionID == uuid.Nil {
+			sessionID = result.session.ID
+		}
+		assert.Equal(t, sessionID, result.session.ID)
+		assert.Equal(t, canonical.ID, result.session.ContactID)
+		if result.isNew {
+			newCount++
+		}
+	}
+	assert.Equal(t, 1, newCount)
+
+	var activeCount int64
+	require.NoError(t, app.DB.Model(&models.ChatbotSession{}).
+		Where(
+			"organization_id = ? AND contact_id = ? AND whats_app_account = ? AND status = ?",
+			org.ID,
+			canonical.ID,
+			account.Name,
+			models.SessionStatusActive,
+		).
+		Count(&activeCount).Error)
+	assert.Equal(t, int64(1), activeCount)
+}
+
+func TestGetOrCreateSession_WaitsForMergeThenUsesCanonicalContact(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	canonical := testutil.CreateTestContact(t, app.DB, org.ID)
+	source := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	mergeTx := app.DB.Begin()
+	require.NoError(t, mergeTx.Error)
+	t.Cleanup(func() { _ = mergeTx.Rollback().Error })
+
+	var lockedSource models.Contact
+	require.NoError(t, mergeTx.Unscoped().
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND organization_id = ?", source.ID, org.ID).
+		First(&lockedSource).Error)
+	require.NoError(t, mergeTx.Unscoped().Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", source.ID, org.ID).
+		Updates(map[string]any{
+			"merged_into_id": canonical.ID,
+			"deleted_at":     time.Now(),
+		}).Error)
+
+	type sessionResult struct {
+		session *models.ChatbotSession
+		isNew   bool
+		err     error
+	}
+	resultCh := make(chan sessionResult, 1)
+	go func() {
+		session, isNew, err := app.getOrCreateSession(
+			org.ID,
+			source.ID,
+			account.Name,
+			source.PhoneNumber,
+			30,
+		)
+		resultCh <- sessionResult{session: session, isNew: isNew, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		t.Fatalf("session creator bypassed the merge row lock: %+v", result)
+	case <-time.After(75 * time.Millisecond):
+	}
+
+	require.NoError(t, mergeTx.Commit().Error)
+	result := <-resultCh
+	require.NoError(t, result.err)
+	require.True(t, result.isNew)
+	require.NotNil(t, result.session)
+	assert.Equal(t, canonical.ID, result.session.ContactID)
 }
 
 // =============================================================================

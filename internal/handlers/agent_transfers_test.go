@@ -2,6 +2,7 @@ package handlers_test
 
 import (
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
+	"github.com/zerodha/fastglue"
 )
 
 // createTestAgent creates a test agent user with agent role in the database.
@@ -113,6 +115,20 @@ func TestApp_ListAgentTransfers_Success(t *testing.T) {
 	assert.Equal(t, models.TransferStatusActive, result.Data.Transfers[0].Status)
 }
 
+func TestApp_ListAgentTransfers_RequiresReadPermission(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	createTestTransfer(t, app, org.ID, contact.ID, "permission-test", models.TransferStatusActive, nil)
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.ListAgentTransfers(req))
+	require.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+}
+
 func TestApp_ListAgentTransfers_FilterByStatus(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
@@ -159,11 +175,13 @@ func TestApp_ListAgentTransfers_AgentRoleFiltering(t *testing.T) {
 
 	// Create another agent
 	otherAgent := createTestAgent(t, app, org.ID)
+	otherContact := testutil.CreateTestContact(t, app.DB, org.ID)
+	queueContact := testutil.CreateTestContact(t, app.DB, org.ID)
 
 	// Create transfers: one assigned to agent, one to other agent, one unassigned
 	_ = createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, &agent.ID)
-	_ = createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, &otherAgent.ID)
-	_ = createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, nil) // Unassigned (general queue)
+	_ = createTestTransfer(t, app, org.ID, otherContact.ID, account.Name, models.TransferStatusActive, &otherAgent.ID)
+	_ = createTestTransfer(t, app, org.ID, queueContact.ID, account.Name, models.TransferStatusActive, nil) // Unassigned (general queue)
 
 	// Agent should only see their assigned transfers + general queue
 	req := testutil.NewGETRequest(t)
@@ -193,10 +211,9 @@ func TestApp_ListAgentTransfers_Pagination(t *testing.T) {
 	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
 	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
 
-	contact := testutil.CreateTestContact(t, app.DB, org.ID)
-
 	// Create multiple transfers
 	for i := 0; i < 5; i++ {
+		contact := testutil.CreateTestContact(t, app.DB, org.ID)
 		createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, nil)
 	}
 
@@ -264,6 +281,30 @@ func TestApp_CreateAgentTransfer_Success(t *testing.T) {
 	assert.Equal(t, contact.ID.String(), result.Data.Transfer.ContactID)
 	assert.Equal(t, models.TransferStatusActive, result.Data.Transfer.Status)
 	assert.Equal(t, models.TransferSourceManual, result.Data.Transfer.Source)
+}
+
+func TestApp_CreateAgentTransfer_RequiresWritePermissionBeforeContactLookup(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "Transfer reader", []string{
+		models.ResourceTransfers + ":" + models.ActionRead,
+	})
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"contact_id":       uuid.New().String(),
+		"whatsapp_account": "permission-test",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.CreateAgentTransfer(req))
+	require.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+
+	var count int64
+	require.NoError(t, app.DB.Model(&models.AgentTransfer{}).
+		Where("organization_id = ?", org.ID).
+		Count(&count).Error)
+	assert.Zero(t, count)
 }
 
 func TestApp_CreateAgentTransfer_WithAgent(t *testing.T) {
@@ -348,6 +389,108 @@ func TestApp_CreateAgentTransfer_DuplicateTransfer(t *testing.T) {
 	var result map[string]any
 	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &result))
 	assert.Equal(t, "Contact already has an active transfer", result["message"])
+}
+
+func TestApp_CreateAgentTransfer_ResolvesMergedAlias(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	canonical := testutil.CreateTestContact(t, app.DB, org.ID)
+	alias := testutil.CreateTestContact(t, app.DB, org.ID)
+	require.NoError(t, app.DB.Unscoped().Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", alias.ID, org.ID).
+		Updates(map[string]any{
+			"merged_into_id": canonical.ID,
+			"deleted_at":     time.Now(),
+		}).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"contact_id":       alias.ID.String(),
+		"whatsapp_account": account.Name,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.CreateAgentTransfer(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var result struct {
+		Data struct {
+			Transfer handlers.AgentTransferResponse `json:"transfer"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &result))
+	assert.Equal(t, canonical.ID.String(), result.Data.Transfer.ContactID)
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", result.Data.Transfer.ID).Error)
+	assert.Equal(t, canonical.ID, stored.ContactID)
+}
+
+func TestApp_CreateAgentTransfer_ConcurrentRequestsReturnConflict(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	requests := make([]*fastglue.Request, 2)
+	for i := range requests {
+		requests[i] = testutil.NewJSONRequest(t, map[string]any{
+			"contact_id":       contact.ID.String(),
+			"whatsapp_account": account.Name,
+		})
+		testutil.SetAuthContext(requests[i], org.ID, user.ID)
+	}
+
+	type requestResult struct {
+		status int
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan requestResult, len(requests))
+	for i := range requests {
+		req := requests[i]
+		go func() {
+			<-start
+			err := app.CreateAgentTransfer(req)
+			results <- requestResult{
+				status: testutil.GetResponseStatusCode(req),
+				err:    err,
+			}
+		}()
+	}
+	close(start)
+
+	okCount := 0
+	conflictCount := 0
+	for range requests {
+		result := <-results
+		require.NoError(t, result.err)
+		switch result.status {
+		case fasthttp.StatusOK:
+			okCount++
+		case fasthttp.StatusConflict:
+			conflictCount++
+		default:
+			t.Fatalf("unexpected concurrent create status: %d", result.status)
+		}
+	}
+	assert.Equal(t, 1, okCount)
+	assert.Equal(t, 1, conflictCount)
+
+	var activeCount int64
+	require.NoError(t, app.DB.Model(&models.AgentTransfer{}).
+		Where(
+			"organization_id = ? AND contact_id = ? AND status = ?",
+			org.ID,
+			contact.ID,
+			models.TransferStatusActive,
+		).
+		Count(&activeCount).Error)
+	assert.Equal(t, int64(1), activeCount)
 }
 
 func TestApp_CreateAgentTransfer_MissingContactID(t *testing.T) {
@@ -439,6 +582,74 @@ func TestApp_ResumeFromTransfer_Success(t *testing.T) {
 	assert.Equal(t, user.ID, *updatedTransfer.ResumedBy)
 }
 
+func TestApp_ResumeFromTransfer_RequiresWritePermissionWithoutMutation(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "Transfer reader cannot resume", []string{
+		models.ResourceTransfers + ":" + models.ActionRead,
+	})
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	transfer := createTestTransfer(t, app, org.ID, contact.ID, "permission-test", models.TransferStatusActive, nil)
+
+	req := testutil.NewJSONRequest(t, nil)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", transfer.ID.String())
+
+	require.NoError(t, app.ResumeFromTransfer(req))
+	require.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+	assert.Equal(t, models.TransferStatusActive, stored.Status)
+	assert.Nil(t, stored.ResumedAt)
+	assert.Nil(t, stored.ResumedBy)
+}
+
+func TestApp_ResumeFromTransfer_DefaultAgentCanOnlyResumeOwnTransfer(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	agent := createTestAgent(t, app, org.ID)
+	otherAgent := createTestAgent(t, app, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	otherTransfer := createTestTransfer(
+		t,
+		app,
+		org.ID,
+		contact.ID,
+		"permission-test",
+		models.TransferStatusActive,
+		&otherAgent.ID,
+	)
+
+	req := testutil.NewJSONRequest(t, nil)
+	testutil.SetAuthContext(req, org.ID, agent.ID)
+	testutil.SetPathParam(req, "id", otherTransfer.ID.String())
+	require.NoError(t, app.ResumeFromTransfer(req))
+	require.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", otherTransfer.ID).Error)
+	assert.Equal(t, models.TransferStatusActive, stored.Status)
+	assert.Nil(t, stored.ResumedAt)
+
+	ownContact := testutil.CreateTestContact(t, app.DB, org.ID)
+	ownTransfer := createTestTransfer(
+		t,
+		app,
+		org.ID,
+		ownContact.ID,
+		"permission-test",
+		models.TransferStatusActive,
+		&agent.ID,
+	)
+	ownReq := testutil.NewJSONRequest(t, nil)
+	testutil.SetAuthContext(ownReq, org.ID, agent.ID)
+	testutil.SetPathParam(ownReq, "id", ownTransfer.ID.String())
+	require.NoError(t, app.ResumeFromTransfer(ownReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(ownReq))
+}
+
 func TestApp_ResumeFromTransfer_NotFound(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
@@ -523,7 +734,7 @@ func TestApp_AssignAgentTransfer_Success(t *testing.T) {
 	assert.Equal(t, agent.ID, *updatedTransfer.AgentID)
 }
 
-func TestApp_AssignAgentTransfer_AgentSelfAssign(t *testing.T) {
+func TestApp_AssignAgentTransfer_RequiresManagementPermissionForSelfAssignment(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
@@ -532,19 +743,51 @@ func TestApp_AssignAgentTransfer_AgentSelfAssign(t *testing.T) {
 	agent := createTestAgent(t, app, org.ID)
 	transfer := createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, nil)
 
-	// Agent self-assigns (no agent_id in body means assign to self)
+	// Omitted agent_id previously bypassed the write gate and self-assigned.
 	req := testutil.NewJSONRequest(t, map[string]any{})
 	testutil.SetAuthContext(req, org.ID, agent.ID)
 	testutil.SetPathParam(req, "id", transfer.ID.String())
 
 	err := app.AssignAgentTransfer(req)
 	require.NoError(t, err)
-	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
 
-	// Verify transfer assigned to the agent
+	// Verify the transfer remains in the queue.
 	var updatedTransfer models.AgentTransfer
 	require.NoError(t, app.DB.First(&updatedTransfer, transfer.ID).Error)
-	assert.Equal(t, agent.ID, *updatedTransfer.AgentID)
+	assert.Nil(t, updatedTransfer.AgentID)
+}
+
+func TestApp_AssignAgentTransfer_RequiresManagementPermissionToUnassign(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	caller := createTestAgent(t, app, org.ID)
+	assignedAgent := createTestAgent(t, app, org.ID)
+	transfer := createTestTransfer(
+		t,
+		app,
+		org.ID,
+		contact.ID,
+		account.Name,
+		models.TransferStatusActive,
+		&assignedAgent.ID,
+	)
+
+	// An explicitly empty agent_id previously bypassed the write gate and
+	// unassigned an arbitrary active transfer.
+	req := testutil.NewJSONRequest(t, map[string]any{"agent_id": ""})
+	testutil.SetAuthContext(req, org.ID, caller.ID)
+	testutil.SetPathParam(req, "id", transfer.ID.String())
+
+	require.NoError(t, app.AssignAgentTransfer(req))
+	require.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+	require.NotNil(t, stored.AgentID)
+	assert.Equal(t, assignedAgent.ID, *stored.AgentID)
 }
 
 func TestApp_AssignAgentTransfer_AgentCannotAssignToOthers(t *testing.T) {
@@ -570,7 +813,72 @@ func TestApp_AssignAgentTransfer_AgentCannotAssignToOthers(t *testing.T) {
 
 	var result map[string]any
 	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &result))
-	assert.Equal(t, "You don't have permission to assign transfers to others", result["message"])
+	assert.Equal(t, "You don't have permission to assign transfers", result["message"])
+}
+
+func TestApp_AssignAndResumeTransfer_SerializeWithoutReopening(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	manager := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	targetAgent := createTestAgent(t, app, org.ID)
+
+	for attempt := 0; attempt < 8; attempt++ {
+		contact := testutil.CreateTestContact(t, app.DB, org.ID)
+		transfer := createTestTransfer(
+			t,
+			app,
+			org.ID,
+			contact.ID,
+			"concurrency-test",
+			models.TransferStatusActive,
+			nil,
+		)
+		assignReq := testutil.NewJSONRequest(t, map[string]any{
+			"agent_id": targetAgent.ID.String(),
+		})
+		testutil.SetAuthContext(assignReq, org.ID, manager.ID)
+		testutil.SetPathParam(assignReq, "id", transfer.ID.String())
+		resumeReq := testutil.NewJSONRequest(t, nil)
+		testutil.SetAuthContext(resumeReq, org.ID, manager.ID)
+		testutil.SetPathParam(resumeReq, "id", transfer.ID.String())
+
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- app.AssignAgentTransfer(assignReq)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- app.ResumeFromTransfer(resumeReq)
+		}()
+		close(start)
+		wg.Wait()
+		close(errs)
+		for handlerErr := range errs {
+			require.NoError(t, handlerErr)
+		}
+
+		var stored models.AgentTransfer
+		require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+		assert.Equal(t, models.TransferStatusResumed, stored.Status)
+		assert.NotNil(t, stored.ResumedAt)
+		assert.NotNil(t, stored.ResumedBy)
+		assert.Contains(
+			t,
+			[]int{
+				fasthttp.StatusOK,
+				fasthttp.StatusBadRequest,
+			},
+			testutil.GetResponseStatusCode(assignReq),
+		)
+		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(resumeReq))
+	}
 }
 
 func TestApp_AssignAgentTransfer_NotActive(t *testing.T) {
@@ -640,6 +948,27 @@ func TestApp_PickNextTransfer_Success(t *testing.T) {
 	assert.Equal(t, agent.ID, *updatedTransfer.AgentID)
 }
 
+func TestApp_PickNextTransfer_RequiresPickupOrWritePermissionWithoutMutation(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "Transfer reader cannot pick", []string{
+		models.ResourceTransfers + ":" + models.ActionRead,
+	})
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	transfer := createTestTransfer(t, app, org.ID, contact.ID, "permission-test", models.TransferStatusActive, nil)
+
+	req := testutil.NewJSONRequest(t, nil)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.PickNextTransfer(req))
+	require.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+	assert.Nil(t, stored.AgentID)
+}
+
 func TestApp_PickNextTransfer_EmptyQueue(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
@@ -674,6 +1003,7 @@ func TestApp_PickNextTransfer_FIFO(t *testing.T) {
 	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
 
 	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	newerContact := testutil.CreateTestContact(t, app.DB, org.ID)
 	agent := createTestAgent(t, app, org.ID)
 
 	// Create multiple transfers with different times
@@ -690,7 +1020,7 @@ func TestApp_PickNextTransfer_FIFO(t *testing.T) {
 
 	transfer2 := &models.AgentTransfer{
 		OrganizationID:  org.ID,
-		ContactID:       contact.ID,
+		ContactID:       newerContact.ID,
 		WhatsAppAccount: account.Name,
 		PhoneNumber:     "2222222222",
 		Status:          models.TransferStatusActive,
@@ -724,6 +1054,7 @@ func TestApp_PickNextTransfer_TeamFiltering(t *testing.T) {
 	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
 
 	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	generalContact := testutil.CreateTestContact(t, app.DB, org.ID)
 	agent := createTestAgent(t, app, org.ID)
 
 	// Create a team and add agent as member
@@ -743,7 +1074,7 @@ func TestApp_PickNextTransfer_TeamFiltering(t *testing.T) {
 	require.NoError(t, app.DB.Create(teamTransfer).Error)
 
 	// Create transfer in general queue
-	generalTransfer := createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, nil)
+	generalTransfer := createTestTransfer(t, app, org.ID, generalContact.ID, account.Name, models.TransferStatusActive, nil)
 
 	// Pick from team queue specifically
 	req := testutil.NewJSONRequest(t, nil)
@@ -765,6 +1096,39 @@ func TestApp_PickNextTransfer_TeamFiltering(t *testing.T) {
 	// Should pick from team queue, not general queue
 	assert.Equal(t, teamTransfer.ID.String(), result.Data.Transfer.ID)
 	assert.NotEqual(t, generalTransfer.ID.String(), result.Data.Transfer.ID)
+}
+
+func TestApp_PickNextTransfer_RejectsMalformedTeamWithoutMutation(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	agent := createTestAgent(t, app, org.ID)
+	otherTeam := createTestTeam(t, app, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	transfer := createTestTransfer(
+		t,
+		app,
+		org.ID,
+		contact.ID,
+		account.Name,
+		models.TransferStatusActive,
+		nil,
+	)
+	require.NoError(t, app.DB.Model(&models.AgentTransfer{}).
+		Where("id = ?", transfer.ID).
+		Update("team_id", otherTeam.ID).Error)
+
+	req := testutil.NewJSONRequest(t, nil)
+	testutil.SetAuthContext(req, org.ID, agent.ID)
+	testutil.SetQueryParam(req, "team_id", "not-a-uuid")
+	require.NoError(t, app.PickNextTransfer(req))
+	require.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+	assert.Nil(t, stored.AgentID)
+	require.NotNil(t, stored.TeamID)
+	assert.Equal(t, otherTeam.ID, *stored.TeamID)
 }
 
 // --- Cross-Organization Isolation Tests ---
@@ -845,11 +1209,12 @@ func TestApp_ReturnAgentTransfersToQueue(t *testing.T) {
 	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
 
 	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	secondContact := testutil.CreateTestContact(t, app.DB, org.ID)
 	agent := createTestAgent(t, app, org.ID)
 
 	// Create transfers assigned to the agent
 	transfer1 := createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, &agent.ID)
-	transfer2 := createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, &agent.ID)
+	transfer2 := createTestTransfer(t, app, org.ID, secondContact.ID, account.Name, models.TransferStatusActive, &agent.ID)
 
 	// Return transfers to queue
 	count := app.ReturnAgentTransfersToQueue(agent.ID, org.ID)

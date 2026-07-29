@@ -159,6 +159,39 @@ async function mockChannels(
     }),
   )
   await page.route(
+    new RegExp(`/api/contacts/${threadsConversation.contact_id}/workspace(?:\\?.*)?$`),
+    route =>
+      route.fulfill({
+        json: {
+          data: {
+            contact: threadsConversation.contact,
+            capabilities: {
+              crm: false,
+              tasks: false,
+              bookings: false,
+              packages: false,
+              payments: false,
+              copilot: false,
+              merge: false,
+            },
+            identities: [],
+            journeys: [],
+            tasks: [],
+            bookings: [],
+            packages: [],
+            invoices: [],
+            payments: [],
+            summary: {
+              pipeline_value: [],
+              outstanding: [],
+              collected: [],
+            },
+            timeline: [],
+          },
+        },
+      }),
+  )
+  await page.route(
     new RegExp(`/api/conversations/${threadsConversation.id}/messages(?:\\?.*)?$`),
     async route => {
       if (route.request().method() === 'POST') {

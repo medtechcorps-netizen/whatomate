@@ -245,6 +245,8 @@
     "sectionGrowth": "Growth",
     "pipeline": "Lead Pipeline",
     "tasks": "Follow-ups",
+    "crmInsights": "CRM Insights",
+    "automations": "Automation Studio",
     "calendar": "Bookings",
     "commerce": "Packages & Payments",
     "copilot": "Qwen Copilot",

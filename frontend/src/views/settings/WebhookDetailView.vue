@@ -256,12 +256,28 @@ onMounted(async () => {
         </CardHeader>
         <CardContent class="space-y-4">
           <div class="space-y-1.5">
-            <Label class="text-xs">{{ $t('webhooks.name') }} <span class="text-destructive">*</span></Label>
-            <Input v-model="form.name" :placeholder="$t('webhooks.namePlaceholder')" :disabled="!canWrite" />
+            <Label for="webhook-name" class="text-xs">{{ $t('webhooks.name') }} <span class="text-destructive">*</span></Label>
+            <Input
+              id="webhook-name"
+              v-model="form.name"
+              name="webhook-name"
+              autocomplete="off"
+              :placeholder="$t('webhooks.namePlaceholder')"
+              :disabled="!canWrite"
+            />
           </div>
           <div class="space-y-1.5">
-            <Label class="text-xs">{{ $t('webhooks.webhookUrl', 'URL') }} <span class="text-destructive">*</span></Label>
-            <Input v-model="form.url" type="url" :placeholder="$t('webhooks.webhookUrlPlaceholder')" :disabled="!canWrite" />
+            <Label for="webhook-url" class="text-xs">{{ $t('webhooks.webhookUrl', 'URL') }} <span class="text-destructive">*</span></Label>
+            <Input
+              id="webhook-url"
+              v-model="form.url"
+              name="webhook-url"
+              type="url"
+              inputmode="url"
+              autocomplete="off"
+              :placeholder="$t('webhooks.webhookUrlPlaceholder')"
+              :disabled="!canWrite"
+            />
           </div>
           <div class="space-y-1.5">
             <Label class="text-xs">{{ $t('webhooks.events') }} <span class="text-destructive">*</span></Label>
@@ -281,8 +297,16 @@ onMounted(async () => {
             </div>
           </div>
           <div class="space-y-1.5">
-            <Label class="text-xs">{{ $t('webhooks.secret') }}</Label>
-            <Input v-model="form.secret" type="password" :placeholder="$t('webhooks.secretPlaceholder')" :disabled="!canWrite" />
+            <Label for="webhook-hmac-secret" class="text-xs">{{ $t('webhooks.secret') }}</Label>
+            <Input
+              id="webhook-hmac-secret"
+              v-model="form.secret"
+              name="webhook-hmac-secret"
+              type="password"
+              autocomplete="new-password"
+              :placeholder="$t('webhooks.secretPlaceholder')"
+              :disabled="!canWrite"
+            />
             <p class="text-xs text-muted-foreground">{{ $t('webhooks.secretHint') }}</p>
           </div>
           <div class="space-y-1.5">

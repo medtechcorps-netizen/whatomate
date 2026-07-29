@@ -111,6 +111,43 @@ const router = createRouter({
           meta: { permission: 'tasks', entitlement: 'crm.enabled' }
         },
         {
+          path: 'crm/insights',
+          name: 'crm-insights',
+          component: () => import('@/views/crm/InsightsView.vue'),
+          meta: {
+            anyPermissions: ['crm.leads', 'tasks', 'bookings', 'packages', 'payments'],
+            entitlement: 'crm.enabled'
+          }
+        },
+        {
+          path: 'crm/automations',
+          name: 'crm-automations',
+          component: () => import('@/views/crm/AutomationPoliciesView.vue'),
+          meta: {
+            permission: 'crm.automations',
+            entitlement: 'crm.enabled'
+          }
+        },
+        {
+          path: 'crm/automations/new',
+          name: 'crm-automation-new',
+          component: () => import('@/views/crm/AutomationStudioView.vue'),
+          meta: {
+            permission: 'crm.automations',
+            entitlement: 'crm.enabled'
+          }
+        },
+        {
+          path: 'crm/automations/:id',
+          name: 'crm-automation-studio',
+          component: () => import('@/views/crm/AutomationStudioView.vue'),
+          meta: {
+            permission: 'crm.automations',
+            entitlement: 'crm.enabled',
+            stableKey: true
+          }
+        },
+        {
           path: 'calendar',
           name: 'booking-calendar',
           component: () => import('@/views/booking/CalendarView.vue'),
@@ -460,6 +497,12 @@ const navigationOrder: NavigationCandidate[] = [
   { path: '/chat', permission: 'chat' },
   { path: '/crm/pipeline', permissions: ['crm.leads', 'crm.pipelines'], entitlement: 'crm.enabled' },
   { path: '/crm/tasks', permission: 'tasks', entitlement: 'crm.enabled' },
+  {
+    path: '/crm/insights',
+    anyPermissions: ['crm.leads', 'tasks', 'bookings', 'packages', 'payments'],
+    entitlement: 'crm.enabled'
+  },
+  { path: '/crm/automations', permission: 'crm.automations', entitlement: 'crm.enabled' },
   { path: '/calendar', permissions: ['bookings', 'booking.settings'], entitlement: 'bookings.enabled' },
   { path: '/commerce', anyPermissions: ['packages', 'payments'], entitlement: 'commerce.enabled' },
   { path: '/copilot', permission: 'copilot', entitlement: 'copilot.enabled' },

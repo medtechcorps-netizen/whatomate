@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, onMounted, onUnmounted, nextTick, computed, defineAsyncComponent } from 'vue'
+import { useMediaQuery } from '@vueuse/core'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useContactsStore, type Contact, type Message } from '@/stores/contacts'
@@ -53,6 +54,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetTitle,
+} from '@/components/ui/sheet'
 import { toast } from 'vue-sonner'
 import {
   Search,
@@ -95,7 +102,7 @@ import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
 import PreviewButtonGroup from '@/components/chatbot/flow-preview/PreviewButtonGroup.vue'
 import TemplatePicker from '@/components/chat/TemplatePicker.vue'
-import ContactInfoPanel from '@/components/chat/ContactInfoPanel.vue'
+import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
 import ConversationNotes from '@/components/chat/ConversationNotes.vue'
 import CallButton from '@/components/calling/CallButton.vue'
 import { useNotesStore } from '@/stores/notes'
@@ -135,6 +142,19 @@ const SCROLL_BOTTOM_THRESHOLD = 80
 const isInfoPanelOpen = ref(false)
 const isNotesPanelOpen = ref(false)
 const contactSessionData = ref<any>(null)
+const isRevenueRail = useMediaQuery('(min-width: 1280px)')
+
+function toggleRevenueWorkspace() {
+  const willOpen = !isInfoPanelOpen.value
+  isInfoPanelOpen.value = willOpen
+  if (willOpen) isNotesPanelOpen.value = false
+}
+
+function toggleNotesPanel() {
+  const willOpen = !isNotesPanelOpen.value
+  isNotesPanelOpen.value = willOpen
+  if (willOpen) isInfoPanelOpen.value = false
+}
 
 // Multi-account state
 const selectedAccount = ref<string | null>(null)
@@ -249,6 +269,7 @@ const messagesScroll = useInfiniteScroll({
     await messagesScroll.preserveScrollPosition(async () => {
       await contactsStore.fetchOlderMessages(contactsStore.currentContact!.id, selectedAccount.value || undefined)
       await nextTick()
+      // Individual message components hydrate newly loaded media.
     })
   },
   hasMore: computed(() => contactsStore.hasMoreMessages),
@@ -605,6 +626,7 @@ async function selectContact(id: string) {
     wsService.setCurrentContact(id)
     // Wait for DOM to render messages before scrolling
     await nextTick()
+    // Individual message components hydrate fetched media.
     // Scroll after a brief delay to ensure content is rendered (instant on initial load)
     setTimeout(() => {
       scrollToBottom(true)
@@ -619,8 +641,9 @@ async function selectContact(id: string) {
     ])
     if (sessionResult) {
       contactSessionData.value = sessionResult.data.data || sessionResult.data
-      if (contactSessionData.value?.panel_config?.sections?.length > 0) {
+      if (isRevenueRail.value && contactSessionData.value?.panel_config?.sections?.length > 0) {
         isInfoPanelOpen.value = true
+        isNotesPanelOpen.value = false
       }
     } else {
       contactSessionData.value = null
@@ -1836,7 +1859,7 @@ async function sendMediaMessage() {
             />
             <Tooltip v-if="canAssignContacts">
               <TooltipTrigger as-child>
-                <Button variant="ghost" size="icon" class="h-8 w-8 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100" @click="isAssignDialogOpen = true">
+                <Button variant="ghost" size="icon" class="h-9 w-9 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100" :aria-label="$t('chat.assignToAgent')" @click="isAssignDialogOpen = true">
                   <UserPlus class="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
@@ -1844,7 +1867,7 @@ async function sendMediaMessage() {
             </Tooltip>
             <Tooltip v-if="activeTransferId">
               <TooltipTrigger as-child>
-                <Button variant="ghost" size="icon" class="h-8 w-8 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100" :disabled="isResuming" @click="resumeChatbot">
+                <Button variant="ghost" size="icon" class="h-9 w-9 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100" :aria-label="$t('chat.resumeChatbot')" :disabled="isResuming" @click="resumeChatbot">
                   <Play class="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
@@ -1856,7 +1879,8 @@ async function sendMediaMessage() {
                 <Button
                   variant="ghost"
                   size="icon"
-                  class="h-8 w-8 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100"
+                  class="h-9 w-9 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100"
+                  :aria-label="action.name"
                   :disabled="executingActionId === action.id"
                   @click="executeCustomAction(action)"
                 >
@@ -1872,9 +1896,10 @@ async function sendMediaMessage() {
                   variant="ghost"
                   size="icon"
                   id="notes-button"
-                  class="h-8 w-8 relative text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100"
+                  class="h-9 w-9 relative text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100"
                   :class="isNotesPanelOpen && 'bg-amber-500/10 text-amber-400 light:bg-amber-50 light:text-amber-600'"
-                  @click="isNotesPanelOpen = !isNotesPanelOpen"
+                  :aria-label="$t('chat.internalNotes')"
+                  @click="toggleNotesPanel"
                 >
                   <StickyNote class="h-4 w-4" />
                   <span
@@ -1894,18 +1919,19 @@ async function sendMediaMessage() {
                   variant="ghost"
                   size="icon"
                   id="info-button"
-                  class="h-8 w-8 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100"
+                  class="h-9 w-9 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100"
                   :class="isInfoPanelOpen && 'bg-white/[0.08] text-white light:bg-gray-100 light:text-gray-900'"
-                  @click="isInfoPanelOpen = !isInfoPanelOpen"
+                  aria-label="Open customer revenue workspace"
+                  @click="toggleRevenueWorkspace"
                 >
                   <Info class="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>{{ $t('chat.contactInfo') }}</TooltipContent>
+              <TooltipContent>Customer revenue workspace</TooltipContent>
             </Tooltip>
             <DropdownMenu>
               <DropdownMenuTrigger as-child>
-                <Button variant="ghost" size="icon" class="h-8 w-8 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100">
+                <Button variant="ghost" size="icon" class="h-9 w-9 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100" :aria-label="$t('chat.contactOptions')">
                   <MoreVertical class="h-4 w-4" />
                 </Button>
               </DropdownMenuTrigger>
@@ -1924,7 +1950,7 @@ async function sendMediaMessage() {
                   <Play class="mr-2 h-4 w-4" />
                   <span>{{ $t('chat.resumeChatbot') }}</span>
                 </DropdownMenuItem>
-                <DropdownMenuItem @click="isInfoPanelOpen = !isInfoPanelOpen">
+                <DropdownMenuItem @click="toggleRevenueWorkspace">
                   <Info class="mr-2 h-4 w-4" />
                   <span>{{ isInfoPanelOpen ? $t('chat.hideContactDetails') : $t('chat.viewContactDetails') }}</span>
                 </DropdownMenuItem>
@@ -2463,14 +2489,43 @@ async function sendMediaMessage() {
       @close="isNotesPanelOpen = false"
     />
 
-    <!-- Contact Info Panel -->
-    <ContactInfoPanel
-      v-if="contactsStore.currentContact && isInfoPanelOpen"
-      :contact="contactsStore.currentContact"
-      :session-data="contactSessionData"
-      @close="isInfoPanelOpen = false"
-      @tags-updated="(tags) => contactsStore.updateContactTags(contactsStore.currentContact!.id, tags)"
-    />
+    <!-- Customer revenue workspace: persistent rail on wide screens -->
+    <div
+      v-if="contactsStore.currentContact && isInfoPanelOpen && isRevenueRail"
+      class="h-full w-[420px] min-w-[360px] max-w-[420px]"
+    >
+      <CustomerRevenueWorkspace
+        :contact-id="contactsStore.currentContact.id"
+        :contact="contactsStore.currentContact"
+        :session-data="contactSessionData"
+        surface="chat"
+        @close="isInfoPanelOpen = false"
+        @tags-updated="(tags) => contactsStore.updateContactTags(contactsStore.currentContact!.id, tags)"
+      />
+    </div>
+
+    <!-- Customer revenue workspace: non-destructive drawer on smaller screens -->
+    <Sheet
+      v-if="contactsStore.currentContact && !isRevenueRail"
+      :open="isInfoPanelOpen"
+      @update:open="isInfoPanelOpen = $event"
+    >
+      <SheetContent side="right" class="!w-full !max-w-[440px] !p-0 [&>button:last-child]:hidden">
+        <SheetTitle class="sr-only">Customer revenue workspace</SheetTitle>
+        <SheetDescription class="sr-only">
+          Customer journeys, tasks, bookings, packages, revenue and activity.
+        </SheetDescription>
+        <CustomerRevenueWorkspace
+          v-if="isInfoPanelOpen"
+          :contact-id="contactsStore.currentContact.id"
+          :contact="contactsStore.currentContact"
+          :session-data="contactSessionData"
+          surface="chat"
+          @close="isInfoPanelOpen = false"
+          @tags-updated="(tags) => contactsStore.updateContactTags(contactsStore.currentContact!.id, tags)"
+        />
+      </SheetContent>
+    </Sheet>
 
     <!-- Template Params Dialog -->
     <Dialog v-model:open="templateDialogOpen">

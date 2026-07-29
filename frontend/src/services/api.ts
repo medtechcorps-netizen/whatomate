@@ -649,6 +649,7 @@ interface DataSourceInfo {
   name: string
   label: string
   fields: string[]
+  aggregate_fields: string[]
 }
 
 export interface LayoutItem {
@@ -695,7 +696,10 @@ export const widgetsService = {
   }>) => api.put<DashboardWidget>(`/widgets/${id}`, data),
   delete: (id: string) => api.delete(`/widgets/${id}`),
   getAllData: (params?: { from?: string; to?: string }) =>
-    api.get<{ data: Record<string, WidgetData> }>('/widgets/data', { params }),
+    api.get<{
+      data: Record<string, WidgetData>
+      errors: Record<string, { status: number; message: string }>
+    }>('/widgets/data', { params }),
   getDataSources: () => api.get<{
     data_sources: DataSourceInfo[]
     metrics: string[]

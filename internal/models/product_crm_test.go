@@ -24,6 +24,7 @@ func TestProductCRMTableNames(t *testing.T) {
 	}{
 		{"scheduled job", models.ScheduledJob{}, "scheduled_jobs"},
 		{"outbox event", models.OutboxEvent{}, "outbox_events"},
+		{"customer activity event", models.CustomerActivityEvent{}, "customer_activity_events"},
 		{"CRM pipeline", models.CRMPipeline{}, "crm_pipelines"},
 		{"CRM pipeline stage", models.CRMPipelineStage{}, "crm_pipeline_stages"},
 		{"CRM lead", models.CRMLead{}, "crm_leads"},
@@ -142,6 +143,9 @@ func TestProductCRMConstants(t *testing.T) {
 		{"scheduled job cancelled", string(models.ScheduledJobStatusCancelled), "cancelled"},
 		{"outbox published", string(models.OutboxEventStatusPublished), "published"},
 		{"outbox failed", string(models.OutboxEventStatusFailed), "failed"},
+		{"customer activity merge", string(models.CustomerActivityContactMerged), "contact.merged"},
+		{"customer activity stage move", string(models.CustomerActivityCRMStageMoved), "crm.lead.stage_moved"},
+		{"customer activity invoice paid", string(models.CustomerActivityInvoicePaid), "invoice.paid"},
 		{"pipeline stage won", string(models.CRMPipelineStageKindWon), "won"},
 		{"lead archived", string(models.CRMLeadStatusArchived), "archived"},
 		{"lead WhatsApp source", string(models.CRMLeadSourceWhatsApp), "whatsapp"},
@@ -187,6 +191,7 @@ func TestProductCRMOrganizationScopeIsExplicit(t *testing.T) {
 	}{
 		{"scheduled job", models.ScheduledJob{}},
 		{"outbox event", models.OutboxEvent{}},
+		{"customer activity event", models.CustomerActivityEvent{}},
 		{"CRM pipeline", models.CRMPipeline{}},
 		{"CRM pipeline stage", models.CRMPipelineStage{}},
 		{"CRM lead", models.CRMLead{}},

@@ -13,11 +13,19 @@ withDefaults(
     edgeType?: string
     fitViewOnInit?: boolean
     controlsPosition?: string
+    nodesDraggable?: boolean
+    nodesConnectable?: boolean
+    edgesUpdatable?: boolean
+    deleteEnabled?: boolean
   }>(),
   {
     edgeType: 'smoothstep',
     fitViewOnInit: false,
     controlsPosition: 'bottom-left',
+    nodesDraggable: true,
+    nodesConnectable: true,
+    edgesUpdatable: true,
+    deleteEnabled: true,
   },
 )
 
@@ -40,9 +48,9 @@ defineEmits<{
       :nodes="nodes"
       :edges="edges"
       :node-types="nodeTypes"
-      :nodes-draggable="true"
-      :nodes-connectable="true"
-      :edges-updatable="true"
+      :nodes-draggable="nodesDraggable"
+      :nodes-connectable="nodesConnectable"
+      :edges-updatable="edgesUpdatable"
       :zoom-on-scroll="true"
       :zoom-on-pinch="true"
       :pan-on-drag="true"
@@ -51,7 +59,7 @@ defineEmits<{
       :snap-grid="[20, 20]"
       :min-zoom="0.2"
       :max-zoom="2"
-      :delete-key-code="['Backspace', 'Delete']"
+      :delete-key-code="deleteEnabled ? ['Backspace', 'Delete'] : null"
       :default-edge-options="{ type: edgeType, animated: true, markerEnd: MarkerType.ArrowClosed }"
       :fit-view-on-init="fitViewOnInit"
       class="h-full"

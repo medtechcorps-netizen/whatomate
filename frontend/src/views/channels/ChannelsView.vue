@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useMediaQuery } from '@vueuse/core'
 import {
   AtSign,
   Bot,
@@ -15,6 +16,7 @@ import {
   PauseCircle,
   Play,
   Plus,
+  PanelRightOpen,
   RefreshCw,
   Send,
   Settings2,
@@ -25,6 +27,13 @@ import PageHeader from '@/components/shared/PageHeader.vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetTitle,
+} from '@/components/ui/sheet'
+import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import { getErrorMessage, unwrapItemResponse, unwrapListResponse } from '@/lib/api-utils'
@@ -72,6 +81,8 @@ const showConnect = ref(false)
 const accounts = ref<ChannelAccount[]>([])
 const conversations = ref<InboxConversation[]>([])
 const selectedConversation = ref<InboxConversation | null>(null)
+const isWorkspaceOpen = ref(false)
+const isWorkspaceRail = useMediaQuery('(min-width: 1280px)')
 const messages = ref<InboxMessage[]>([])
 const channelFilter = ref<ChannelType | 'all'>('all')
 const search = ref('')
@@ -144,6 +155,11 @@ const connectableChannels = computed(() =>
 )
 const filteredConversations = computed(() => conversations.value)
 const hasOlderMessages = computed(() => messages.value.length < messageTotal.value)
+const inboxGridClass = computed(() =>
+  isWorkspaceOpen.value && isWorkspaceRail.value
+    ? 'lg:grid-cols-[320px_minmax(0,1fr)] xl:grid-cols-[320px_minmax(0,1fr)_400px] 2xl:grid-cols-[250px_340px_minmax(0,1fr)_400px]'
+    : 'lg:grid-cols-[320px_minmax(0,1fr)] 2xl:grid-cols-[250px_340px_minmax(0,1fr)]',
+)
 
 const selectedAccount = computed(() =>
   selectedConversation.value
@@ -294,6 +310,7 @@ function scheduleChannelRefresh() {
 
 async function selectConversation(conversation: InboxConversation) {
   selectedConversation.value = conversation
+  if (isWorkspaceRail.value) isWorkspaceOpen.value = true
   loadingMessages.value = true
   try {
     const response = await channelsService.messages(conversation.id, { limit: 100 })
@@ -558,6 +575,7 @@ async function disconnectAccount() {
     settingsAccount.value = null
     if (selectedConversation.value?.channel_account_id === account.id) {
       selectedConversation.value = null
+      isWorkspaceOpen.value = false
       messages.value = []
     }
     toast.success('Channel disconnected')
@@ -590,6 +608,7 @@ watch([search, channelFilter], () => {
   filterDebounceTimer = window.setTimeout(() => {
     filterDebounceTimer = null
     selectedConversation.value = null
+    isWorkspaceOpen.value = false
     messages.value = []
     messageTotal.value = 0
     void load()
@@ -632,7 +651,9 @@ onBeforeUnmount(() => {
             <AlertCircle class="h-3.5 w-3.5" />
             {{ attentionCount }} attention
           </Badge>
-          <Button variant="outline" size="icon" @click="load"><RefreshCw class="h-4 w-4" /></Button>
+          <Button variant="outline" size="icon" aria-label="Refresh omnichannel inbox" @click="load">
+            <RefreshCw class="h-4 w-4" />
+          </Button>
           <Button v-if="canManageAccounts" class="bg-sky-400 text-black hover:bg-sky-300" @click="showConnect = !showConnect">
             <Plus class="mr-2 h-4 w-4" />
             Connect
@@ -822,7 +843,7 @@ onBeforeUnmount(() => {
       <Loader2 class="h-6 w-6 animate-spin text-sky-300" />
     </div>
 
-    <div v-else class="grid min-h-0 flex-1 lg:grid-cols-[320px_1fr] 2xl:grid-cols-[250px_340px_1fr]">
+    <div v-else class="grid min-h-0 flex-1" :class="inboxGridClass">
       <aside class="hidden overflow-y-auto border-r border-white/[0.08] bg-[#0b0c0d] p-3 light:border-gray-200 light:bg-white 2xl:block">
         <p class="px-2 pb-3 pt-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/35 light:text-gray-500">
           Connections
@@ -1006,7 +1027,7 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <main class="flex min-h-0 flex-col bg-[#090a0b] light:bg-[#f8f9fa]">
+      <main class="flex min-h-0 min-w-0 flex-col bg-[#090a0b] light:bg-[#f8f9fa]">
         <template v-if="selectedConversation">
           <header class="flex items-center justify-between border-b border-white/[0.08] bg-[#0d0f10] px-5 py-3.5 light:border-gray-200 light:bg-white">
             <div class="flex items-center gap-3">
@@ -1022,21 +1043,35 @@ onBeforeUnmount(() => {
                 </p>
               </div>
             </div>
-            <Button
-              v-if="canControlConversationAI"
-              data-testid="conversation-ai-toggle"
-              type="button"
-              variant="outline"
-              size="sm"
-              :disabled="aiStateUpdating"
-              :aria-pressed="selectedConversation.ai_paused"
-              @click="toggleConversationAI"
-            >
-              <Loader2 v-if="aiStateUpdating" class="mr-2 h-3.5 w-3.5 animate-spin" />
-              <Play v-else-if="selectedConversation.ai_paused" class="mr-2 h-3.5 w-3.5" />
-              <PauseCircle v-else class="mr-2 h-3.5 w-3.5" />
-              {{ selectedConversation.ai_paused ? 'Resume AI' : 'Pause AI' }}
-            </Button>
+            <div class="flex shrink-0 items-center gap-2">
+              <Button
+                v-if="canControlConversationAI"
+                data-testid="conversation-ai-toggle"
+                type="button"
+                variant="outline"
+                size="sm"
+                :disabled="aiStateUpdating"
+                :aria-pressed="selectedConversation.ai_paused"
+                @click="toggleConversationAI"
+              >
+                <Loader2 v-if="aiStateUpdating" class="mr-2 h-3.5 w-3.5 animate-spin" />
+                <Play v-else-if="selectedConversation.ai_paused" class="mr-2 h-3.5 w-3.5" />
+                <PauseCircle v-else class="mr-2 h-3.5 w-3.5" />
+                {{ selectedConversation.ai_paused ? 'Resume AI' : 'Pause AI' }}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                class="h-10 shrink-0 gap-2"
+                :aria-label="isWorkspaceOpen ? 'Close customer revenue workspace' : 'Open customer revenue workspace'"
+                :aria-pressed="isWorkspaceOpen"
+                @click="isWorkspaceOpen = !isWorkspaceOpen"
+              >
+                <PanelRightOpen class="h-4 w-4" />
+                <span class="hidden sm:inline">Customer workspace</span>
+              </Button>
+            </div>
           </header>
 
           <div v-if="loadingMessages" class="flex flex-1 items-center justify-center">
@@ -1142,7 +1177,40 @@ onBeforeUnmount(() => {
           </p>
         </div>
       </main>
+
+      <aside
+        v-if="selectedConversation && isWorkspaceOpen && isWorkspaceRail"
+        class="min-h-0 min-w-0"
+        aria-label="Customer revenue workspace rail"
+      >
+        <CustomerRevenueWorkspace
+          :contact-id="selectedConversation.contact_id"
+          :contact="selectedConversation.contact"
+          surface="omnichannel"
+          @close="isWorkspaceOpen = false"
+        />
+      </aside>
     </div>
+
+    <Sheet
+      v-if="selectedConversation && !isWorkspaceRail"
+      :open="isWorkspaceOpen"
+      @update:open="isWorkspaceOpen = $event"
+    >
+      <SheetContent side="right" class="!w-full !max-w-[440px] !p-0 [&>button:last-child]:hidden">
+        <SheetTitle class="sr-only">Customer revenue workspace</SheetTitle>
+        <SheetDescription class="sr-only">
+          Customer journeys, tasks, bookings, packages, revenue and activity.
+        </SheetDescription>
+        <CustomerRevenueWorkspace
+          v-if="isWorkspaceOpen"
+          :contact-id="selectedConversation.contact_id"
+          :contact="selectedConversation.contact"
+          surface="omnichannel"
+          @close="isWorkspaceOpen = false"
+        />
+      </SheetContent>
+    </Sheet>
 
     <div
       v-if="settingsAccount"

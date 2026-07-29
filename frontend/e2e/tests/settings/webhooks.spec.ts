@@ -41,13 +41,25 @@ test.describe('Webhooks Management', () => {
     tablePage = new TablePage(page)
   })
 
-  test('should display webhooks list', async ({ page }) => {
+  test('should display webhooks list', async ({ page: _page }) => {
     await expect(tablePage.tableBody).toBeVisible()
   })
 
   test('should navigate to create webhook page', async ({ page }) => {
     await gotoCreateWebhook(page)
     expect(page.url()).toContain('/settings/webhooks/new')
+  })
+
+  test('should isolate webhook credentials from browser login autofill', async ({ page }) => {
+    await gotoCreateWebhook(page)
+
+    const endpoint = page.locator('#webhook-url')
+    const hmacSecret = page.locator('#webhook-hmac-secret')
+
+    await expect(endpoint).toHaveAttribute('name', 'webhook-url')
+    await expect(endpoint).toHaveAttribute('autocomplete', 'off')
+    await expect(hmacSecret).toHaveAttribute('name', 'webhook-hmac-secret')
+    await expect(hmacSecret).toHaveAttribute('autocomplete', 'new-password')
   })
 
   test('should create a new webhook', async ({ page }) => {
