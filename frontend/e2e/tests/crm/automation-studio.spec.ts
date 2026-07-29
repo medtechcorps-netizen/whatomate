@@ -1,11 +1,29 @@
-import { test, expect } from '@playwright/test'
+import { test, expect, type Page } from '@playwright/test'
 import { loginAsAdmin } from '../../helpers'
 import { AutomationStudioPage } from '../../pages'
+
+async function enableCRMEntitlement(page: Page) {
+  await page.route('**/api/product/entitlements**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        data: {
+          mode: 'licensed',
+          entitlements: {
+            'crm.enabled': true,
+          },
+        },
+      }),
+    })
+  })
+}
 
 test.describe('CRM Automation Studio', () => {
   let studio: AutomationStudioPage
 
   test.beforeEach(async ({ page }) => {
+    await enableCRMEntitlement(page)
     await loginAsAdmin(page)
     studio = new AutomationStudioPage(page)
     await studio.gotoList()

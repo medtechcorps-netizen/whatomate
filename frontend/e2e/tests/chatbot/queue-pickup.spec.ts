@@ -51,6 +51,18 @@ async function seedQueuedTransfer(orgId: string, contactId: string, phone: strin
   const rows = await execSQL(`
     INSERT INTO agent_transfers (id, organization_id, contact_id, whats_app_account, phone_number, status, source, transferred_at, created_at, updated_at)
     VALUES (gen_random_uuid(), '${orgId}', '${contactId}', '${accountName}', '${phone}', 'active', 'manual', NOW(), NOW(), NOW())
+    ON CONFLICT (organization_id, contact_id)
+      WHERE status = 'active' AND deleted_at IS NULL
+    DO UPDATE SET
+      whats_app_account = EXCLUDED.whats_app_account,
+      phone_number = EXCLUDED.phone_number,
+      source = EXCLUDED.source,
+      agent_id = NULL,
+      team_id = NULL,
+      picked_up_at = NULL,
+      first_response_at = NULL,
+      transferred_at = EXCLUDED.transferred_at,
+      updated_at = EXCLUDED.updated_at
     RETURNING id::text AS id
   `)
   return rows[0]!.id as string
