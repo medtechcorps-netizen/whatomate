@@ -373,18 +373,20 @@ func TestChatLoadCounter_CountsActiveTransfersPerAgent(t *testing.T) {
 
 	// 2 active transfers for a1, 1 for a2, 1 completed for a1 (must not count).
 	for range 2 {
+		activeContact := testutil.CreateTestContact(t, db, org.ID)
 		require.NoError(t, db.Create(&models.AgentTransfer{
 			BaseModel:      models.BaseModel{ID: uuid.New()},
 			OrganizationID: org.ID,
-			ContactID:      contact.ID,
+			ContactID:      activeContact.ID,
 			AgentID:        &a1.ID,
 			Status:         models.TransferStatusActive,
 		}).Error)
 	}
+	a2Contact := testutil.CreateTestContact(t, db, org.ID)
 	require.NoError(t, db.Create(&models.AgentTransfer{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: org.ID,
-		ContactID:      contact.ID,
+		ContactID:      a2Contact.ID,
 		AgentID:        &a2.ID,
 		Status:         models.TransferStatusActive,
 	}).Error)

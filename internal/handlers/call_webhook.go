@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"gorm.io/gorm"
@@ -109,11 +108,10 @@ func (a *App) processCallWebhook(phoneNumberID string, call any) {
 		return
 	}
 
-	// Get or create the contact
-	contact, _, _ := contactutil.GetOrCreateContact(a.DB, account.OrganizationID, ce.From, "")
-
-	if contact == nil {
-		a.Log.Error("Failed to get or create contact for call", "phone", ce.From)
+	// Get or create the contact and its lifecycle event atomically.
+	contact, _, err := a.getOrCreateInboundContact(account, ce.From, "", ce.FromUserID)
+	if err != nil {
+		a.Log.Error("Failed to get or create contact for call", "phone", ce.From, "error", err)
 		return
 	}
 

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,7 +107,7 @@ func (a *App) runChatGraph(
 		ctx.buttonID = ""
 	}
 
-	for range maxChatGraphIterations {
+	for iteration := range maxChatGraphIterations {
 		node := graph.Node(session.CurrentStep)
 		if node == nil {
 			a.Log.Error("chat graph node not found",
@@ -134,7 +135,20 @@ func (a *App) runChatGraph(
 			}
 		}
 
+		// Every provider-facing effect inside this node derives its durable
+		// action key from the inbound Message + flow + stable node ID. Resetting
+		// the node-local ordinal keeps keys stable even when a prior API result
+		// changes rendered payload text on recovery.
+		restoreActionScope := a.pushInboundContinuationActionScope(
+			fmt.Sprintf(
+				"chat-graph:%s:%s:visit:%d",
+				flow.ID,
+				node.ID,
+				iteration,
+			),
+		)
 		res, err := a.executeChatNode(node, ctx)
+		restoreActionScope()
 		if err != nil {
 			_ = a.persistChatSession(session)
 			return err
@@ -202,7 +216,7 @@ func (a *App) executeChatNode(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, er
 	case ChatNodePrompt:
 		return a.execChatPrompt(node, ctx)
 	case ChatNodeAPICall:
-		return a.execChatAPICall(node, ctx)
+		return a.execChatAPICallDurable(node, ctx)
 	case ChatNodeCondition:
 		return a.execChatCondition(node, ctx)
 	case ChatNodeTiming:
@@ -210,11 +224,11 @@ func (a *App) executeChatNode(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, er
 	case ChatNodeSetVariable:
 		return a.execChatSetVariable(node, ctx)
 	case ChatNodeAIResponse:
-		return a.execChatAIResponse(node, ctx)
+		return a.execChatAIResponseDurable(node, ctx)
 	case ChatNodeTransfer:
 		return a.execChatTransfer(node, ctx)
 	case ChatNodeWebhook:
-		return a.execChatWebhook(node, ctx)
+		return a.execChatWebhookDurable(node, ctx)
 	case ChatNodeGotoFlow:
 		return a.execChatGotoFlow(node, ctx)
 	case ChatNodeWhatsAppFlow:
@@ -461,6 +475,186 @@ func (a *App) execChatAPICall(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, er
 	return nodeOutcome{outcome: "http:2xx"}, nil
 }
 
+// execChatAPICallDurable executes the remote request behind a separately
+// committed at-most-once claim. Only explicitly configured response mappings
+// and the branch outcome are retained so a rolled-back graph transaction can
+// rebuild its state without repeating the HTTP request.
+func (a *App) execChatAPICallDurable(
+	node *ChatNode,
+	ctx *chatNodeCtx,
+) (nodeOutcome, error) {
+	if ctx.session.SessionData == nil {
+		ctx.session.SessionData = models.JSONB{}
+	}
+	sessionData := ctx.session.SessionData
+	sessionData["phone_number"] = ctx.session.PhoneNumber
+
+	claim, claimErr := a.claimInboundContinuationAction(
+		context.Background(),
+		"graph_api_call",
+		nil,
+	)
+	if claimErr != nil {
+		return nodeOutcome{}, claimErr
+	}
+
+	outcome := "http:non2xx"
+	mapped := models.JSONB{}
+	if !claim.Execute {
+		if redacted, _ := claim.Result["redacted_mapping"].(bool); redacted {
+			return nodeOutcome{}, &inboundContinuationManualReviewError{
+				ActionKey: claim.Key,
+				Reason:    "configured API result included a redacted sensitive mapping",
+			}
+		}
+		if storedOutcome, ok := claim.Result["outcome"].(string); ok &&
+			storedOutcome != "" {
+			outcome = storedOutcome
+		}
+		mapped = inboundContinuationResultJSONB(claim.Result["mapped"])
+		maps.Copy(sessionData, mapped)
+	} else {
+		replaceVar := func(value string) string {
+			return processTemplate(value, sessionData)
+		}
+		respBody, statusCode, requestErr := a.executeConfiguredAPI(
+			models.JSONB(node.Config),
+			replaceVar,
+		)
+		if requestErr != nil {
+			a.Log.Error(
+				"api_call node request failed",
+				"node", node.ID,
+				"session", ctx.session.ID,
+				"error", requestErr,
+			)
+		} else if statusCode >= 200 && statusCode < 300 {
+			outcome = "http:2xx"
+			if mapping, ok := node.Config["response_mapping"].(map[string]any); ok &&
+				len(mapping) > 0 {
+				var jsonResponse map[string]any
+				if err := json.Unmarshal(respBody, &jsonResponse); err == nil {
+					mappingStrings := make(map[string]string, len(mapping))
+					for variableName, path := range mapping {
+						if pathString, ok := path.(string); ok {
+							mappingStrings[variableName] = pathString
+						}
+					}
+					extracted := extractResponseMapping(
+						jsonResponse,
+						mappingStrings,
+					)
+					for key, value := range extracted {
+						if inboundContinuationSensitiveResultField(
+							key,
+							mappingStrings[key],
+						) {
+							continue
+						}
+						mapped[key] = value
+					}
+					maps.Copy(sessionData, extracted)
+				}
+			}
+		}
+
+		actionResult := models.JSONB{"outcome": outcome}
+		if len(mapped) > 0 {
+			actionResult["mapped"] = mapped
+		}
+		configuredMappings := inboundContinuationResultJSONB(
+			node.Config["response_mapping"],
+		)
+		for key, rawPath := range configuredMappings {
+			path, _ := rawPath.(string)
+			if inboundContinuationSensitiveResultField(key, path) {
+				actionResult["redacted_mapping"] = true
+				break
+			}
+		}
+		if resolveErr := a.resolveInboundContinuationAction(
+			context.Background(),
+			claim,
+			inboundActionStateResolved,
+			actionResult,
+		); resolveErr != nil {
+			return nodeOutcome{}, errors.Join(
+				&inboundContinuationManualReviewError{
+					ActionKey: claim.Key,
+					Reason:    "configured API ran but its durable result is uncertain",
+				},
+				resolveErr,
+			)
+		}
+	}
+
+	if outcome == "http:2xx" {
+		template := stringFromConfig(node.Config, "message_template")
+		rendered := processTemplate(template, sessionData)
+		if rendered != "" {
+			if err := a.sendAndSaveTextMessage(
+				ctx.account,
+				ctx.contact,
+				rendered,
+			); err != nil {
+				return nodeOutcome{}, fmt.Errorf(
+					"api_call send message_template: %w",
+					err,
+				)
+			}
+			a.logSessionMessage(
+				ctx.session.ID,
+				models.DirectionOutgoing,
+				rendered,
+				node.ID,
+			)
+		}
+	}
+
+	return nodeOutcome{outcome: outcome}, nil
+}
+
+func inboundContinuationResultJSONB(raw any) models.JSONB {
+	switch value := raw.(type) {
+	case models.JSONB:
+		return cloneInboundContinuationJSONB(value)
+	case map[string]any:
+		result := make(models.JSONB, len(value))
+		for key, item := range value {
+			result[key] = item
+		}
+		return result
+	default:
+		return models.JSONB{}
+	}
+}
+
+func inboundContinuationSensitiveResultField(name, path string) bool {
+	value := strings.ToLower(strings.TrimSpace(name + " " + path))
+	replacer := strings.NewReplacer(
+		".", "_",
+		"-", "_",
+		" ", "_",
+	)
+	value = replacer.Replace(value)
+	for _, marker := range []string{
+		"authorization",
+		"password",
+		"passwd",
+		"secret",
+		"token",
+		"api_key",
+		"apikey",
+		"credential",
+		"cookie",
+	} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // execChatCondition is a pure-branch node: evaluates a free-form
 // boolean expression against SessionData and returns "true" or "false"
 // so an edge can route accordingly. No message is sent.
@@ -690,6 +884,126 @@ func (a *App) execChatAIResponse(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome,
 	return nodeOutcome{outcome: "default"}, nil
 }
 
+// execChatAIResponseDurable records the generated user-facing answer before a
+// later WhatsApp send. Recovery can therefore reuse the answer without
+// repeating a billable/non-deterministic model request.
+func (a *App) execChatAIResponseDurable(
+	node *ChatNode,
+	ctx *chatNodeCtx,
+) (nodeOutcome, error) {
+	settings, err := a.getChatbotSettingsCached(
+		ctx.account.OrganizationID,
+		ctx.account.Name,
+	)
+	if err != nil {
+		a.Log.Error(
+			"ai_response node failed to load chatbot settings",
+			"node", node.ID,
+			"session", ctx.session.ID,
+			"error", err,
+		)
+		return nodeOutcome{outcome: "default"}, nil
+	}
+	if !settings.AI.Enabled ||
+		settings.AI.Provider == "" ||
+		settings.AI.APIKey == "" {
+		a.Log.Warn(
+			"ai_response node hit but AI not configured",
+			"node", node.ID,
+			"session", ctx.session.ID,
+			"ai_enabled", settings.AI.Enabled,
+			"has_provider", settings.AI.Provider != "",
+		)
+		return nodeOutcome{outcome: "default"}, nil
+	}
+
+	userMessage := ctx.userInput
+	if template := stringFromConfig(
+		node.Config,
+		"prompt_template",
+		"prompt",
+	); template != "" {
+		if ctx.session.SessionData == nil {
+			ctx.session.SessionData = models.JSONB{}
+		}
+		userMessage = processTemplate(template, ctx.session.SessionData)
+	}
+
+	claim, claimErr := a.claimInboundContinuationAction(
+		context.Background(),
+		"graph_ai_generate",
+		nil,
+	)
+	if claimErr != nil {
+		return nodeOutcome{}, claimErr
+	}
+
+	answer := ""
+	generationOutcome := "empty"
+	if !claim.Execute {
+		answer, _ = claim.Result["answer"].(string)
+		if storedOutcome, ok := claim.Result["outcome"].(string); ok {
+			generationOutcome = storedOutcome
+		}
+	} else {
+		answer, err = a.generateAIResponse(settings, ctx.session, userMessage)
+		switch {
+		case err != nil:
+			generationOutcome = "error"
+			a.Log.Error(
+				"ai_response node generateAIResponse failed",
+				"node", node.ID,
+				"session", ctx.session.ID,
+				"error", err,
+			)
+		case answer == "":
+			generationOutcome = "empty"
+		default:
+			generationOutcome = "generated"
+		}
+
+		actionResult := models.JSONB{"outcome": generationOutcome}
+		if answer != "" {
+			// The answer is user-facing content that is also persisted in the
+			// outgoing Message; model prompts, API keys, and request payloads
+			// are never stored in the action ledger.
+			actionResult["answer"] = answer
+		}
+		if resolveErr := a.resolveInboundContinuationAction(
+			context.Background(),
+			claim,
+			inboundActionStateResolved,
+			actionResult,
+		); resolveErr != nil {
+			return nodeOutcome{}, errors.Join(
+				&inboundContinuationManualReviewError{
+					ActionKey: claim.Key,
+					Reason:    "AI generation ran but its durable result is uncertain",
+				},
+				resolveErr,
+			)
+		}
+	}
+
+	if generationOutcome != "generated" || answer == "" {
+		return nodeOutcome{outcome: "default"}, nil
+	}
+	if err := a.sendAndSaveTextMessage(
+		ctx.account,
+		ctx.contact,
+		answer,
+	); err != nil {
+		return nodeOutcome{}, fmt.Errorf("send ai response: %w", err)
+	}
+	a.logSessionMessage(
+		ctx.session.ID,
+		models.DirectionOutgoing,
+		answer,
+		node.ID,
+	)
+	return nodeOutcome{outcome: "default"}, nil
+}
+
 // execChatTransfer hands the session off to a human team or the general
 // queue. Optionally sends a body message first (e.g. "Connecting you to
 // an agent…"), then creates the transfer row via the same helpers the
@@ -771,6 +1085,72 @@ func (a *App) execChatWebhook(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, er
 	case statusCode < 200 || statusCode >= 300:
 		a.Log.Warn("webhook node returned non-2xx (continuing)",
 			"node", node.ID, "session", ctx.session.ID, "status", statusCode)
+	}
+	return nodeOutcome{outcome: "default"}, nil
+}
+
+// execChatWebhookDurable makes a webhook node at-most-once for one inbound
+// Message. The response is intentionally discarded and no URL, headers, or
+// request body are written to the action ledger.
+func (a *App) execChatWebhookDurable(
+	node *ChatNode,
+	ctx *chatNodeCtx,
+) (nodeOutcome, error) {
+	if ctx.session.SessionData == nil {
+		ctx.session.SessionData = models.JSONB{}
+	}
+	sessionData := ctx.session.SessionData
+	sessionData["phone_number"] = ctx.session.PhoneNumber
+
+	claim, claimErr := a.claimInboundContinuationAction(
+		context.Background(),
+		"graph_webhook",
+		nil,
+	)
+	if claimErr != nil {
+		return nodeOutcome{}, claimErr
+	}
+	if !claim.Execute {
+		return nodeOutcome{outcome: "default"}, nil
+	}
+
+	replaceVar := func(value string) string {
+		return processTemplate(value, sessionData)
+	}
+	_, statusCode, requestErr := a.executeConfiguredAPI(
+		models.JSONB(node.Config),
+		replaceVar,
+	)
+	switch {
+	case requestErr != nil:
+		a.Log.Warn(
+			"webhook node request errored (continuing)",
+			"node", node.ID,
+			"session", ctx.session.ID,
+			"error", requestErr,
+		)
+	case statusCode < 200 || statusCode >= 300:
+		a.Log.Warn(
+			"webhook node returned non-2xx (continuing)",
+			"node", node.ID,
+			"session", ctx.session.ID,
+			"status", statusCode,
+		)
+	}
+
+	if resolveErr := a.resolveInboundContinuationAction(
+		context.Background(),
+		claim,
+		inboundActionStateResolved,
+		models.JSONB{"outcome": "default"},
+	); resolveErr != nil {
+		return nodeOutcome{}, errors.Join(
+			&inboundContinuationManualReviewError{
+				ActionKey: claim.Key,
+				Reason:    "webhook ran but its durable result is uncertain",
+			},
+			resolveErr,
+		)
 	}
 	return nodeOutcome{outcome: "default"}, nil
 }

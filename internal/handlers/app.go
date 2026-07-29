@@ -52,6 +52,10 @@ type App struct {
 	// tenantOrgID is non-zero only when DB is bound to an RLS transaction.
 	root        *App
 	tenantOrgID uuid.UUID
+	// inboundContinuation is set only on a per-job App clone. It gives
+	// chatbot sends a stable WAMID-derived action key without sharing mutable
+	// execution state across concurrent webhook jobs.
+	inboundContinuation *inboundContinuationExecution
 }
 
 // WaitForBackgroundTasks blocks until all background goroutines complete.

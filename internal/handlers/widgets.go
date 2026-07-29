@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -92,6 +94,11 @@ type WidgetDataResponse struct {
 	TableRows     []TableRow         `json:"table_rows"`     // For table display type
 }
 
+type WidgetDataError struct {
+	Status  int    `json:"status"`
+	Message string `json:"message"`
+}
+
 // GroupedSeriesData represents multiple datasets for grouped time-series charts
 type GroupedSeriesData struct {
 	Labels   []string               `json:"labels"`
@@ -117,13 +124,81 @@ type DataPoint struct {
 	Color string  `json:"color,omitempty"`
 }
 
-// Available data sources and their filterable fields
+// Available data sources and their filterable/groupable fields. These values
+// are API names only; SQL identifiers are resolved through the separate,
+// server-owned whitelists below.
 var widgetDataSources = map[string][]string{
 	"messages":  {"status", "direction", "message_type", "whatsapp_account"},
-	"contacts":  {"whatsapp_account", "is_read"},
-	"campaigns": {"status", "message_status"},
-	"transfers": {"status", "source"},
-	"sessions":  {"status"},
+	"contacts":  {"assigned_user_id", "whatsapp_account", "is_read"},
+	"campaigns": {"status", "message_status", "template_name", "created_by_id", "whatsapp_account"},
+	"transfers": {"status", "source", "team_id", "agent_id"},
+	"sessions":  {"status", "current_flow_id"},
+	"crm_leads": {"status", "pipeline_id", "stage_id", "owner_user_id", "source", "currency"},
+	"bookings":  {"status", "event_id", "source", "contact_package_id"},
+	"invoices":  {"status", "currency"},
+	"payments":  {"status", "type", "currency", "provider_account_id"},
+	"packages":  {"status", "package_definition_id", "currency", "source"},
+}
+
+type widgetAggregateField struct {
+	Expression string
+}
+
+// widgetAggregateFields maps public field names to fixed SQL expressions.
+// Never interpolate the public field name itself.
+var widgetAggregateFields = map[string]map[string]widgetAggregateField{
+	"transfers": {
+		"resolution_time": {
+			Expression: "CASE WHEN status = 'resumed' AND resumed_at IS NOT NULL THEN EXTRACT(EPOCH FROM (resumed_at - transferred_at)) / 60 END",
+		},
+	},
+	"crm_leads": {
+		"value_minor": {Expression: "value_minor"},
+	},
+	"invoices": {
+		"total_minor": {Expression: "total_minor"},
+		"due_minor":   {Expression: "due_minor"},
+	},
+	"payments": {
+		"amount_minor": {Expression: "amount_minor"},
+	},
+	"packages": {
+		// Unlimited entitlements are deliberately excluded: representing them
+		// as zero or a sentinel would corrupt sums and averages.
+		"available_credits": {
+			Expression: `(SELECT COALESCE(SUM(cb.available), 0)
+				FROM credit_balances cb
+				JOIN package_entitlements pe
+				  ON pe.id = cb.package_entitlement_id
+				 AND pe.organization_id = cb.organization_id
+				 AND pe.deleted_at IS NULL
+				WHERE cb.organization_id = contact_packages.organization_id
+				  AND cb.contact_package_id = contact_packages.id
+				  AND cb.deleted_at IS NULL
+				  AND pe.is_unlimited = false)`,
+		},
+	},
+}
+
+type widgetSourceAccess struct {
+	Resource string
+	Action   string
+}
+
+var widgetSourceAccessRules = map[string]widgetSourceAccess{
+	"messages":  {Resource: models.ResourceChat},
+	"contacts":  {Resource: models.ResourceContacts},
+	"campaigns": {Resource: models.ResourceCampaigns},
+	// Transfer analytics is organization-wide. The transfers handlers reserve
+	// that visibility for transfers:write; transfers:read is assignment/team
+	// scoped and cannot safely back an unscoped aggregate.
+	"transfers": {Resource: models.ResourceTransfers, Action: models.ActionWrite},
+	"sessions":  {Resource: models.ResourceFlowsChatbot},
+	"crm_leads": {Resource: models.ResourceCRMLeads},
+	"bookings":  {Resource: models.ResourceBookings},
+	"invoices":  {Resource: models.ResourcePayments},
+	"payments":  {Resource: models.ResourcePayments},
+	"packages":  {Resource: models.ResourcePackages},
 }
 
 // Available metrics
@@ -290,6 +365,16 @@ func (a *App) CreateWidget(r *fastglue.Request) error {
 		if !contains(fields, req.GroupByField) {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid group by field for this data source", nil, "")
 		}
+	}
+	if err := validateWidgetQueryDefinition(
+		req.DataSource,
+		req.Metric,
+		req.Field,
+		displayType,
+		req.GroupByField,
+		req.Filters,
+	); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 
 	// Default grid sizes based on display type
@@ -470,6 +555,16 @@ func (a *App) UpdateWidget(r *fastglue.Request) error {
 	if req.GridH != nil {
 		widget.GridH = *req.GridH
 	}
+	if err := validateWidgetQueryDefinition(
+		widget.DataSource,
+		widget.Metric,
+		widget.Field,
+		widget.DisplayType,
+		widget.GroupByField,
+		widgetFiltersFromModel(*widget),
+	); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
 
 	if err := a.DB.Save(widget).Error; err != nil {
 		a.Log.Error("Failed to update widget", "error", err)
@@ -522,6 +617,10 @@ func (a *App) SaveWidgetLayout(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
+	if !a.HasPermission(userID, models.ResourceAnalytics, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to edit widgets", nil, "")
+	}
+
 	var req struct {
 		Layout []struct {
 			ID    uuid.UUID `json:"id"`
@@ -543,7 +642,7 @@ func (a *App) SaveWidgetLayout(r *fastglue.Request) error {
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
 		for i, item := range req.Layout {
 			result := tx.Model(&models.Widget{}).
-				Where("id = ? AND organization_id = ? AND (user_id = ? OR is_shared = true)", item.ID, orgID, userID).
+				Where("id = ? AND organization_id = ? AND user_id = ?", item.ID, orgID, userID).
 				Updates(map[string]any{
 					"grid_x":        item.GridX,
 					"grid_y":        item.GridY,
@@ -554,11 +653,17 @@ func (a *App) SaveWidgetLayout(r *fastglue.Request) error {
 			if result.Error != nil {
 				return result.Error
 			}
+			if result.RowsAffected != 1 {
+				return gorm.ErrRecordNotFound
+			}
 		}
 		return nil
 	})
 
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Widget not found", nil, "")
+		}
 		a.Log.Error("Failed to save widget layout", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save layout", nil, "")
 	}
@@ -568,12 +673,36 @@ func (a *App) SaveWidgetLayout(r *fastglue.Request) error {
 
 // GetWidgetDataSources returns available data sources and their filterable fields
 func (a *App) GetWidgetDataSources(r *fastglue.Request) error {
-	sources := make([]map[string]any, 0)
-	for source, fields := range widgetDataSources {
+	orgID, userID, err := a.requireAuth(r, models.ResourceAnalytics, models.ActionRead)
+	if err != nil {
+		return nil
+	}
+	sourceNames := make([]string, 0, len(widgetDataSources))
+	for source := range widgetDataSources {
+		sourceNames = append(sourceNames, source)
+	}
+	sort.Strings(sourceNames)
+
+	sources := make([]map[string]any, 0, len(sourceNames))
+	for _, source := range sourceNames {
+		status, _, accessErr := a.widgetSourceAccessStatus(orgID, userID, source, "number")
+		if accessErr != nil {
+			a.Log.Error("Failed to evaluate widget data source entitlement", "error", accessErr, "data_source", source)
+			return r.SendErrorEnvelope(
+				fasthttp.StatusInternalServerError,
+				"Failed to load widget data sources",
+				nil,
+				"",
+			)
+		}
+		if status != 0 {
+			continue
+		}
 		sources = append(sources, map[string]any{
-			"name":   source,
-			"label":  formatLabel(source),
-			"fields": fields,
+			"name":             source,
+			"label":            formatLabel(source),
+			"fields":           widgetDataSources[source],
+			"aggregate_fields": widgetAggregateFieldNames(source),
 		})
 	}
 
@@ -667,11 +796,126 @@ func formatLabel(s string) string {
 	return s
 }
 
+var widgetFilterOperators = map[string]bool{
+	"equals":     true,
+	"not_equals": true,
+	"contains":   true,
+	"gt":         true,
+	"lt":         true,
+	"gte":        true,
+	"lte":        true,
+}
+
+func widgetAggregateFieldNames(dataSource string) []string {
+	fields := widgetAggregateFields[dataSource]
+	result := make([]string, 0, len(fields))
+	for field := range fields {
+		result = append(result, field)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func validateWidgetQueryDefinition(
+	dataSource, metric, field, displayType, groupByField string,
+	filters []FilterInput,
+) error {
+	if staticDisplayTypes[displayType] || dataSource == "shortcuts" {
+		return nil
+	}
+	if _, ok := widgetDataSources[dataSource]; !ok {
+		return fmt.Errorf("invalid data source")
+	}
+	if _, _, ok := resolveDataSourceTable(dataSource); !ok {
+		return fmt.Errorf("invalid data source")
+	}
+	if !contains(widgetMetrics, metric) {
+		return fmt.Errorf("invalid metric")
+	}
+	if metric == "sum" || metric == "avg" {
+		if field == "" {
+			return fmt.Errorf("field is required for %s", metric)
+		}
+		if _, ok := widgetAggregateFields[dataSource][field]; !ok {
+			return fmt.Errorf("invalid aggregate field for this data source")
+		}
+	}
+	if groupByField != "" {
+		if _, ok := allowedGroupByFields[dataSource][groupByField]; !ok {
+			return fmt.Errorf("invalid group by field for this data source")
+		}
+	}
+	for _, filter := range filters {
+		if _, ok := allowedFilterFields[dataSource][filter.Field]; !ok {
+			return fmt.Errorf("invalid filter field for this data source")
+		}
+		if !widgetFilterOperators[filter.Operator] {
+			return fmt.Errorf("invalid filter operator")
+		}
+	}
+	return nil
+}
+
+func widgetFiltersFromModel(widget models.Widget) []FilterInput {
+	filters := make([]FilterInput, 0, len(widget.Filters))
+	for _, filter := range widget.Filters {
+		if filterMap, ok := filter.(map[string]any); ok {
+			filters = append(filters, FilterInput{
+				Field:    widgetGetString(filterMap, "field"),
+				Operator: widgetGetString(filterMap, "operator"),
+				Value:    widgetGetString(filterMap, "value"),
+			})
+		}
+	}
+	return filters
+}
+
+// widgetSourceAccessStatus performs the second authorization layer required
+// for dashboard queries. Analytics access alone never grants access to an
+// underlying CRM, booking, commerce, or operational data source.
+func (a *App) widgetSourceAccessStatus(
+	orgID, userID uuid.UUID,
+	dataSource, displayType string,
+) (int, string, error) {
+	if staticDisplayTypes[displayType] || dataSource == "shortcuts" {
+		return 0, "", nil
+	}
+	rule, ok := widgetSourceAccessRules[dataSource]
+	if !ok {
+		return fasthttp.StatusBadRequest, "Invalid widget data source", nil
+	}
+	action := rule.Action
+	if action == "" {
+		action = models.ActionRead
+	}
+	if !a.HasPermission(userID, rule.Resource, action, orgID) {
+		return fasthttp.StatusForbidden, "Insufficient permission for widget data source", nil
+	}
+	// Message table widgets return organization-wide conversation previews.
+	// Chat read access can be assignment-scoped, so it is not sufficient for
+	// this unscoped table query without contact-wide read access as well.
+	if dataSource == "messages" &&
+		displayType == "table" &&
+		!a.HasPermission(userID, models.ResourceContacts, models.ActionRead, orgID) {
+		return fasthttp.StatusForbidden, "Contact-wide read permission is required for message table widgets", nil
+	}
+	if entitlementKey, gated := ProductEntitlementKeyForResource(rule.Resource); gated {
+		allowed, err := a.HasProductEntitlement(userID, orgID, entitlementKey)
+		if err != nil {
+			return fasthttp.StatusInternalServerError, "Product entitlement could not be evaluated", err
+		}
+		if !allowed {
+			return fasthttp.StatusPaymentRequired, "Widget data source is not included in the active plan", nil
+		}
+	}
+	return 0, "", nil
+}
+
 // GetWidgetData executes the widget query and returns the data
 func (a *App) GetWidgetData(r *fastglue.Request) error {
-	orgID, userID, err := a.getOrgAndUserID(r)
+	orgID, userID, err := a.requireAuth(r, models.ResourceAnalytics, models.ActionRead)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	id, err := parsePathUUID(r, "id", "widget")
@@ -691,12 +935,23 @@ func (a *App) GetWidgetData(r *fastglue.Request) error {
 	).First(&widget).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Widget not found", nil, "")
 	}
+	if status, message, accessErr := a.widgetSourceAccessStatus(
+		orgID,
+		userID,
+		widget.DataSource,
+		widget.DisplayType,
+	); status != 0 {
+		if accessErr != nil {
+			a.Log.Error("Failed to authorize widget data source", "error", accessErr)
+		}
+		return r.SendErrorEnvelope(status, message, nil, "")
+	}
 
 	// Execute the query
 	data, err := a.executeWidgetQuery(orgID, widget, fromStr, toStr)
 	if err != nil {
 		a.Log.Error("Failed to execute widget query", "error", err, "widget_id", id)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to get widget data", nil, "")
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 
 	data.WidgetID = widget.ID
@@ -705,9 +960,9 @@ func (a *App) GetWidgetData(r *fastglue.Request) error {
 
 // GetAllWidgetsData returns data for all user's widgets in a single request
 func (a *App) GetAllWidgetsData(r *fastglue.Request) error {
-	orgID, userID, err := a.getOrgAndUserID(r)
+	orgID, userID, err := a.requireAuth(r, models.ResourceAnalytics, models.ActionRead)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	// Parse date range from query params
@@ -726,10 +981,33 @@ func (a *App) GetAllWidgetsData(r *fastglue.Request) error {
 
 	// Execute queries for all widgets
 	results := make(map[string]WidgetDataResponse)
+	queryErrors := make(map[string]WidgetDataError)
 	for _, widget := range widgets {
+		if status, message, accessErr := a.widgetSourceAccessStatus(
+			orgID,
+			userID,
+			widget.DataSource,
+			widget.DisplayType,
+		); status != 0 {
+			if accessErr != nil {
+				a.Log.Error(
+					"Failed to authorize widget data source",
+					"error",
+					accessErr,
+					"widget_id",
+					widget.ID,
+				)
+			}
+			queryErrors[widget.ID.String()] = WidgetDataError{Status: status, Message: message}
+			continue
+		}
 		data, err := a.executeWidgetQuery(orgID, widget, fromStr, toStr)
 		if err != nil {
 			a.Log.Error("Failed to execute widget query", "error", err, "widget_id", widget.ID)
+			queryErrors[widget.ID.String()] = WidgetDataError{
+				Status:  fasthttp.StatusBadRequest,
+				Message: err.Error(),
+			}
 			continue
 		}
 		data.WidgetID = widget.ID
@@ -737,7 +1015,8 @@ func (a *App) GetAllWidgetsData(r *fastglue.Request) error {
 	}
 
 	return r.SendEnvelope(map[string]any{
-		"data": results,
+		"data":   results,
+		"errors": queryErrors,
 	})
 }
 
@@ -766,23 +1045,26 @@ func (a *App) executeWidgetQuery(orgID uuid.UUID, widget models.Widget, fromStr,
 	previousPeriodStart := periodStart.Add(-periodDuration - time.Nanosecond)
 	previousPeriodEnd := periodStart.Add(-time.Nanosecond)
 
-	response := WidgetDataResponse{}
+	response := WidgetDataResponse{
+		ChartData:  []ChartPoint{},
+		DataPoints: []DataPoint{},
+		TableRows:  []TableRow{},
+	}
+	filters := widgetFiltersFromModel(widget)
+	if err := validateWidgetQueryDefinition(
+		widget.DataSource,
+		widget.Metric,
+		widget.Field,
+		widget.DisplayType,
+		widget.GroupByField,
+		filters,
+	); err != nil {
+		return response, err
+	}
 
 	// Early return for static display types (no data query needed)
 	if staticDisplayTypes[widget.DisplayType] {
 		return response, nil
-	}
-
-	// Parse filters
-	filters := make([]FilterInput, 0)
-	for _, f := range widget.Filters {
-		if filterMap, ok := f.(map[string]any); ok {
-			filters = append(filters, FilterInput{
-				Field:    widgetGetString(filterMap, "field"),
-				Operator: widgetGetString(filterMap, "operator"),
-				Value:    widgetGetString(filterMap, "value"),
-			})
-		}
 	}
 
 	// Handle table display type
@@ -797,29 +1079,25 @@ func (a *App) executeWidgetQuery(orgID uuid.UUID, widget models.Widget, fromStr,
 		return response, nil
 	}
 
-	// Get the model and execute query based on data source
-	var currentValue, previousValue float64
-
-	switch widget.DataSource {
-	case "messages":
-		currentValue = a.queryMessages(orgID, widget.Metric, widget.Field, filters, periodStart, periodEnd)
-		previousValue = a.queryMessages(orgID, widget.Metric, widget.Field, filters, previousPeriodStart, previousPeriodEnd)
-
-	case "contacts":
-		currentValue = a.queryContacts(orgID, widget.Metric, filters, periodStart, periodEnd)
-		previousValue = a.queryContacts(orgID, widget.Metric, filters, previousPeriodStart, previousPeriodEnd)
-
-	case "campaigns":
-		currentValue = a.queryCampaigns(orgID, widget.Metric, filters, periodStart, periodEnd)
-		previousValue = a.queryCampaigns(orgID, widget.Metric, filters, previousPeriodStart, previousPeriodEnd)
-
-	case "transfers":
-		currentValue = a.queryTransfers(orgID, widget.Metric, widget.Field, filters, periodStart, periodEnd)
-		previousValue = a.queryTransfers(orgID, widget.Metric, widget.Field, filters, previousPeriodStart, previousPeriodEnd)
-
-	case "sessions":
-		currentValue = a.querySessions(orgID, widget.Metric, filters, periodStart, periodEnd)
-		previousValue = a.querySessions(orgID, widget.Metric, filters, previousPeriodStart, previousPeriodEnd)
+	currentValue, err := a.queryWidgetMetric(
+		orgID,
+		widget,
+		filters,
+		periodStart,
+		periodEnd,
+	)
+	if err != nil {
+		return response, err
+	}
+	previousValue, err := a.queryWidgetMetric(
+		orgID,
+		widget,
+		filters,
+		previousPeriodStart,
+		previousPeriodEnd,
+	)
+	if err != nil {
+		return response, err
 	}
 
 	response.Value = currentValue
@@ -846,97 +1124,59 @@ func (a *App) executeWidgetQuery(orgID uuid.UUID, widget models.Widget, fromStr,
 }
 
 // Query helper functions for each data source
-func (a *App) queryMessages(orgID uuid.UUID, metric, field string, filters []FilterInput, start, end time.Time) float64 {
-	query := a.DB.Model(&models.Message{}).Where("organization_id = ? AND created_at >= ? AND created_at <= ?", orgID, start, end)
-
-	// Apply filters
-	for _, f := range filters {
-		query = applyFilter("messages", query, f)
-	}
-
-	var result float64
-	switch metric {
+func widgetMetricSQLExpression(widget models.Widget) (string, bool) {
+	switch widget.Metric {
 	case "count":
-		var count int64
-		query.Count(&count)
-		result = float64(count)
+		return "COUNT(*)", true
 	case "sum", "avg":
-		// For messages, sum/avg might be on a numeric field. The field name
-		// flows directly into SQL, so reject anything not in the whitelist
-		// (allowedAggregateFields["messages"]) to block injection.
-		if field != "" && allowedAggregateFields["messages"][field] {
-			var val float64
-			if metric == "sum" {
-				query.Select("COALESCE(SUM(" + field + "), 0)").Scan(&val)
-			} else {
-				query.Select("COALESCE(AVG(" + field + "), 0)").Scan(&val)
-			}
-			result = val
+		aggregate, ok := widgetAggregateFields[widget.DataSource][widget.Field]
+		if !ok {
+			return "", false
 		}
+		return fmt.Sprintf(
+			"COALESCE(%s(%s), 0)",
+			strings.ToUpper(widget.Metric),
+			aggregate.Expression,
+		), true
+	default:
+		return "", false
 	}
-	return result
 }
 
-func (a *App) queryContacts(orgID uuid.UUID, _ string, filters []FilterInput, start, end time.Time) float64 {
-	// Filter by last_message_at to get "active" contacts with recent activity
-	query := a.DB.Model(&models.Contact{}).Where("organization_id = ? AND last_message_at >= ? AND last_message_at <= ?", orgID, start, end)
-
-	for _, f := range filters {
-		query = applyFilter("contacts", query, f)
+func (a *App) queryWidgetMetric(
+	orgID uuid.UUID,
+	widget models.Widget,
+	filters []FilterInput,
+	start, end time.Time,
+) (float64, error) {
+	tableName, dateField, ok := resolveDataSourceTable(widget.DataSource)
+	if !ok {
+		return 0, fmt.Errorf("invalid data source")
 	}
-
-	var count int64
-	query.Count(&count)
-	return float64(count)
-}
-
-func (a *App) queryCampaigns(orgID uuid.UUID, _ string, filters []FilterInput, start, end time.Time) float64 {
-	query := a.DB.Model(&models.BulkMessageCampaign{}).Where("organization_id = ? AND created_at >= ? AND created_at <= ?", orgID, start, end)
-
-	for _, f := range filters {
-		query = applyFilter("campaigns", query, f)
+	metricExpression, ok := widgetMetricSQLExpression(widget)
+	if !ok {
+		return 0, fmt.Errorf("invalid metric or aggregate field")
 	}
-
-	var count int64
-	query.Count(&count)
-	return float64(count)
-}
-
-func (a *App) queryTransfers(orgID uuid.UUID, metric, field string, filters []FilterInput, start, end time.Time) float64 {
-	query := a.DB.Model(&models.AgentTransfer{}).Where("organization_id = ? AND transferred_at >= ? AND transferred_at <= ?", orgID, start, end)
-
-	for _, f := range filters {
-		query = applyFilter("transfers", query, f)
+	query := fmt.Sprintf(
+		"SELECT %s AS value FROM %s WHERE organization_id = ? AND %s >= ? AND %s <= ?",
+		metricExpression,
+		tableName,
+		dateField,
+		dateField,
+	)
+	if widgetSourceUsesSoftDelete[widget.DataSource] {
+		query += " AND deleted_at IS NULL"
 	}
+	args := []any{orgID, start, end}
+	query, args = appendFilterSQL(widget.DataSource, query, args, filters)
 
-	var result float64
-	switch metric {
-	case "count":
-		var count int64
-		query.Count(&count)
-		result = float64(count)
-	case "avg":
-		if field == "resolution_time" {
-			var val float64
-			query.Where("status = ? AND resumed_at IS NOT NULL", models.TransferStatusResumed).
-				Select("COALESCE(AVG(EXTRACT(EPOCH FROM (resumed_at - transferred_at))/60), 0)").
-				Scan(&val)
-			result = val
-		}
+	var result struct {
+		Value float64
 	}
-	return result
-}
-
-func (a *App) querySessions(orgID uuid.UUID, _ string, filters []FilterInput, start, end time.Time) float64 {
-	query := a.DB.Model(&models.ChatbotSession{}).Where("organization_id = ? AND created_at >= ? AND created_at <= ?", orgID, start, end)
-
-	for _, f := range filters {
-		query = applyFilter("sessions", query, f)
+	if err := a.DB.Raw(query, args...).Scan(&result).Error; err != nil {
+		return 0, err
 	}
-
-	var count int64
-	query.Count(&count)
-	return float64(count)
+	return result.Value, nil
 }
 
 func (a *App) getChartData(orgID uuid.UUID, widget models.Widget, filters []FilterInput, start, end time.Time) []ChartPoint {
@@ -946,31 +1186,38 @@ func (a *App) getChartData(orgID uuid.UUID, widget models.Widget, filters []Filt
 	if !ok {
 		return chartData
 	}
+	metricExpression, ok := widgetMetricSQLExpression(widget)
+	if !ok {
+		return chartData
+	}
 
 	// Build raw query for daily aggregation
 	query := fmt.Sprintf(`
-		SELECT DATE_TRUNC('day', %s) as date, COUNT(*) as count
+		SELECT DATE_TRUNC('day', %s) as date, %s as value
 		FROM %s
 		WHERE organization_id = ? AND %s >= ? AND %s <= ?
-	`, dateField, tableName, dateField, dateField)
+	`, dateField, metricExpression, tableName, dateField, dateField)
 
 	args := []any{orgID, start, end}
+	if widgetSourceUsesSoftDelete[widget.DataSource] {
+		query += " AND deleted_at IS NULL"
+	}
 	query, args = appendFilterSQL(widget.DataSource, query, args, filters)
 
 	query += fmt.Sprintf(" GROUP BY DATE_TRUNC('day', %s) ORDER BY date ASC", dateField)
 
-	type DailyCount struct {
+	type DailyValue struct {
 		Date  time.Time
-		Count int64
+		Value float64
 	}
 
-	var results []DailyCount
+	var results []DailyValue
 	a.DB.Raw(query, args...).Scan(&results)
 
 	for _, r := range results {
 		chartData = append(chartData, ChartPoint{
 			Label: r.Date.Format("Jan 02"),
-			Value: float64(r.Count),
+			Value: r.Value,
 		})
 	}
 
@@ -987,38 +1234,63 @@ func (a *App) getChartData(orgID uuid.UUID, widget models.Widget, filters []Filt
 // Frontends should keep their filter pickers in sync with this list; any
 // filter whose `field` is not allowed will be silently dropped at query
 // time.
-var allowedFilterFields = map[string]map[string]bool{
+var allowedFilterFields = map[string]map[string]string{
 	"messages": {
-		"status":           true,
-		"direction":        true,
-		"message_type":     true,
-		"contact_id":       true,
-		"sent_by_user_id":  true,
-		"whatsapp_account": true,
-		"conversation_id":  true,
-		"template_name":    true,
+		"status":           "status",
+		"direction":        "direction",
+		"message_type":     "message_type",
+		"whatsapp_account": "whatsapp_account",
 	},
 	"contacts": {
-		"status":           true,
-		"assigned_user_id": true,
-		"whatsapp_account": true,
+		"assigned_user_id": "assigned_user_id",
+		"whatsapp_account": "whatsapp_account",
+		"is_read":          "is_read",
 	},
 	"campaigns": {
-		"status":           true,
-		"template_name":    true,
-		"created_by_id":    true,
-		"whatsapp_account": true,
+		"status":           "status",
+		"template_name":    "template_name",
+		"created_by_id":    "created_by_id",
+		"whatsapp_account": "whatsapp_account",
 	},
 	"transfers": {
-		"status":    true,
-		"team_id":   true,
-		"agent_id":  true,
-		"from_team": true,
-		"to_team":   true,
+		"status":   "status",
+		"source":   "source",
+		"team_id":  "team_id",
+		"agent_id": "agent_id",
 	},
 	"sessions": {
-		"status":  true,
-		"flow_id": true,
+		"status":          "status",
+		"current_flow_id": "current_flow_id",
+	},
+	"crm_leads": {
+		"status":        "status",
+		"pipeline_id":   "pipeline_id",
+		"stage_id":      "stage_id",
+		"owner_user_id": "owner_user_id",
+		"source":        "source",
+		"currency":      "currency",
+	},
+	"bookings": {
+		"status":             "status",
+		"event_id":           "event_id",
+		"source":             "source",
+		"contact_package_id": "contact_package_id",
+	},
+	"invoices": {
+		"status":   "status",
+		"currency": "currency",
+	},
+	"payments": {
+		"status":              "status",
+		"type":                "type",
+		"currency":            "currency",
+		"provider_account_id": "provider_account_id",
+	},
+	"packages": {
+		"status":                "status",
+		"package_definition_id": "package_definition_id",
+		"currency":              "currency",
+		"source":                "source",
 	},
 }
 
@@ -1026,10 +1298,48 @@ var allowedFilterFields = map[string]map[string]bool{
 // allowed to be summed/averaged over (the `field` argument to metric
 // types "sum" / "avg"). Same threat model as allowedFilterFields — the
 // column name flows into raw SQL.
-var allowedAggregateFields = map[string]map[string]bool{
-	// Messages have no obvious numeric column to aggregate on today;
-	// leaving empty until a use case appears.
-	"messages": {},
+// allowedGroupByFields maps public API names to fixed SQL expressions. Query
+// builders use only the mapped expression, never the request value.
+var allowedGroupByFields = map[string]map[string]string{
+	"messages": {
+		"status": "status", "direction": "direction", "message_type": "message_type",
+		"whatsapp_account": "whatsapp_account",
+	},
+	"contacts": {
+		"assigned_user_id": "assigned_user_id", "whatsapp_account": "whatsapp_account", "is_read": "is_read",
+	},
+	"campaigns": {
+		"status": "status", "message_status": "message_status", "template_name": "template_name",
+		"created_by_id": "created_by_id", "whatsapp_account": "whatsapp_account",
+	},
+	"transfers": {
+		"status": "status", "source": "source", "team_id": "team_id", "agent_id": "agent_id",
+	},
+	"sessions": {
+		"status": "status", "current_flow_id": "current_flow_id",
+	},
+	"crm_leads": {
+		"status": "status", "pipeline_id": "pipeline_id", "stage_id": "stage_id",
+		"owner_user_id": "owner_user_id", "source": "source", "currency": "currency",
+	},
+	"bookings": {
+		"status": "status", "event_id": "event_id", "source": "source", "contact_package_id": "contact_package_id",
+	},
+	"invoices": {
+		"status": "status", "currency": "currency",
+	},
+	"payments": {
+		"status": "status", "type": "type", "currency": "currency", "provider_account_id": "provider_account_id",
+	},
+	"packages": {
+		"status": "status", "package_definition_id": "package_definition_id", "currency": "currency", "source": "source",
+	},
+}
+
+var widgetSourceUsesSoftDelete = map[string]bool{
+	"messages": true, "contacts": true, "campaigns": true, "transfers": true,
+	"sessions": true, "crm_leads": true, "bookings": true, "invoices": true,
+	"payments": false, "packages": true,
 }
 
 func resolveDataSourceTable(dataSource string) (tableName, dateField string, ok bool) {
@@ -1044,6 +1354,16 @@ func resolveDataSourceTable(dataSource string) (tableName, dateField string, ok 
 		return "agent_transfers", "transferred_at", true
 	case "sessions":
 		return "chatbot_sessions", "created_at", true
+	case "crm_leads":
+		return "crm_leads", "created_at", true
+	case "bookings":
+		return "bookings", "created_at", true
+	case "invoices":
+		return "commerce_invoices", "created_at", true
+	case "payments":
+		return "payment_transactions", "occurred_at", true
+	case "packages":
+		return "contact_packages", "created_at", true
 	default:
 		return "", "", false
 	}
@@ -1078,35 +1398,36 @@ func (a *App) getGroupedData(orgID uuid.UUID, widget models.Widget, filters []Fi
 		return dataPoints
 	}
 
-	// Validate GroupByField against whitelist to prevent SQL injection
-	allowedGroupByFields := map[string]bool{
-		"status": true, "message_status": true, "direction": true,
-		"message_type": true, "assigned_user_id": true, "channel": true,
-		"is_active": true, "priority": true, "category": true,
-		"type": true, "action_type": true, "provider": true,
-	}
-	if !allowedGroupByFields[widget.GroupByField] {
+	groupExpression, ok := allowedGroupByFields[widget.DataSource][widget.GroupByField]
+	if !ok {
 		a.Log.Error("Invalid GroupByField", "field", widget.GroupByField)
+		return dataPoints
+	}
+	metricExpression, ok := widgetMetricSQLExpression(widget)
+	if !ok {
 		return dataPoints
 	}
 
 	query := fmt.Sprintf(`
-		SELECT %s as label, COUNT(*) as value
+		SELECT COALESCE((%s)::text, '') as label, %s as value
 		FROM %s
 		WHERE organization_id = ? AND %s >= ? AND %s <= ?
-	`, widget.GroupByField, tableName, dateField, dateField)
+	`, groupExpression, metricExpression, tableName, dateField, dateField)
 
 	args := []any{orgID, start, end}
+	if widgetSourceUsesSoftDelete[widget.DataSource] {
+		query += " AND deleted_at IS NULL"
+	}
 	query, args = appendFilterSQL(widget.DataSource, query, args, filters)
 
-	query += fmt.Sprintf(" GROUP BY %s ORDER BY value DESC", widget.GroupByField)
+	query += fmt.Sprintf(" GROUP BY %s ORDER BY value DESC", groupExpression)
 
-	type GroupedCount struct {
+	type GroupedValue struct {
 		Label string
-		Value int64
+		Value float64
 	}
 
-	var results []GroupedCount
+	var results []GroupedValue
 	a.DB.Raw(query, args...).Scan(&results)
 
 	for _, r := range results {
@@ -1116,7 +1437,7 @@ func (a *App) getGroupedData(orgID uuid.UUID, widget models.Widget, filters []Fi
 		}
 		dataPoints = append(dataPoints, DataPoint{
 			Label: label,
-			Value: float64(r.Value),
+			Value: r.Value,
 		})
 	}
 
@@ -1133,6 +1454,7 @@ func (a *App) getCampaignMessageStatusData(orgID uuid.UUID, filters []FilterInpu
 			COALESCE(SUM(failed_count), 0) as failed
 		FROM bulk_message_campaigns
 		WHERE organization_id = ? AND created_at >= ? AND created_at <= ?
+		  AND deleted_at IS NULL
 	`
 
 	args := []any{orgID, start, end}
@@ -1172,22 +1494,35 @@ func (a *App) getGroupedTimeSeriesData(orgID uuid.UUID, widget models.Widget, fi
 	if !ok {
 		return result
 	}
+	groupExpression, ok := allowedGroupByFields[widget.DataSource][widget.GroupByField]
+	if !ok {
+		return result
+	}
+	metricExpression, ok := widgetMetricSQLExpression(widget)
+	if !ok {
+		return result
+	}
 
 	query := fmt.Sprintf(`
-		SELECT DATE_TRUNC('day', %s) as date, %s as group_value, COUNT(*) as count
+		SELECT DATE_TRUNC('day', %s) as date,
+		       COALESCE((%s)::text, '') as group_value,
+		       %s as value
 		FROM %s
 		WHERE organization_id = ? AND %s >= ? AND %s <= ?
-	`, dateField, widget.GroupByField, tableName, dateField, dateField)
+	`, dateField, groupExpression, metricExpression, tableName, dateField, dateField)
 
 	args := []any{orgID, start, end}
+	if widgetSourceUsesSoftDelete[widget.DataSource] {
+		query += " AND deleted_at IS NULL"
+	}
 	query, args = appendFilterSQL(widget.DataSource, query, args, filters)
 
-	query += fmt.Sprintf(" GROUP BY DATE_TRUNC('day', %s), %s ORDER BY date ASC", dateField, widget.GroupByField)
+	query += fmt.Sprintf(" GROUP BY DATE_TRUNC('day', %s), %s ORDER BY date ASC", dateField, groupExpression)
 
 	type GroupedRow struct {
 		Date       time.Time
 		GroupValue string
-		Count      int64
+		Value      float64
 	}
 
 	var rows []GroupedRow
@@ -1228,7 +1563,7 @@ func (a *App) getGroupedTimeSeriesData(orgID uuid.UUID, widget models.Widget, fi
 		if lookup[gv] == nil {
 			lookup[gv] = make(map[string]float64)
 		}
-		lookup[gv][dateLabel] = float64(row.Count)
+		lookup[gv][dateLabel] = row.Value
 	}
 
 	// Build datasets
@@ -1261,6 +1596,7 @@ func (a *App) getCampaignMessageStatusTimeSeries(orgID uuid.UUID, filters []Filt
 			COALESCE(SUM(failed_count), 0) as failed
 		FROM bulk_message_campaigns
 		WHERE organization_id = ? AND created_at >= ? AND created_at <= ?
+		  AND deleted_at IS NULL
 	`
 
 	args := []any{orgID, start, end}
@@ -1321,10 +1657,10 @@ func applyFilter(dataSource string, query *gorm.DB, filter FilterInput) *gorm.DB
 // allowedFilterFields[dataSource]. Returns ok=false (no condition, nil
 // value) for any field that isn't in the whitelist for this data source.
 func buildFilterSQL(dataSource string, filter FilterInput) (string, any, bool) {
-	if !allowedFilterFields[dataSource][filter.Field] {
+	field, ok := allowedFilterFields[dataSource][filter.Field]
+	if !ok {
 		return "", nil, false
 	}
-	field := filter.Field
 	value := filter.Value
 
 	switch filter.Operator {
@@ -1343,7 +1679,7 @@ func buildFilterSQL(dataSource string, filter FilterInput) (string, any, bool) {
 	case "lte":
 		return fmt.Sprintf("%s <= ?", field), value, true
 	default:
-		return fmt.Sprintf("%s = ?", field), value, true
+		return "", nil, false
 	}
 }
 
@@ -1352,38 +1688,118 @@ func buildFilterSQL(dataSource string, filter FilterInput) (string, any, bool) {
 // and use positional args: $1=orgID, $2=start, $3=end.
 var tableQuerySQL = map[string]struct{ base, orderBy string }{
 	"messages": {
-		base: `SELECT m.id, COALESCE(c.profile_name, c.phone_number) as label,
+		base: `SELECT m.id,
+			COALESCE((
+				SELECT COALESCE(NULLIF(c.profile_name, ''), c.phone_number)
+				FROM contacts c
+				WHERE c.id = m.contact_id
+				  AND c.organization_id = m.organization_id
+				  AND c.deleted_at IS NULL
+				LIMIT 1
+			), m.contact_id::text) as label,
 			LEFT(m.content, 80) as sub_label, m.status, m.direction, m.created_at
-			FROM messages m LEFT JOIN contacts c ON c.id = m.contact_id
-			WHERE m.organization_id = ? AND m.created_at >= ? AND m.created_at <= ?`,
+			FROM messages m
+			WHERE m.organization_id = ? AND m.created_at >= ? AND m.created_at <= ?
+			  AND m.deleted_at IS NULL`,
 		orderBy: " ORDER BY m.created_at DESC LIMIT 10",
 	},
 	"contacts": {
-		base: `SELECT id, COALESCE(profile_name, phone_number) as label,
+		base: `SELECT id, COALESCE(NULLIF(profile_name, ''), phone_number) as label,
 			phone_number as sub_label, '' as status, '' as direction, last_message_at as created_at
 			FROM contacts
-			WHERE organization_id = ? AND last_message_at >= ? AND last_message_at <= ?`,
+			WHERE organization_id = ? AND last_message_at >= ? AND last_message_at <= ?
+			  AND deleted_at IS NULL`,
 		orderBy: " ORDER BY last_message_at DESC LIMIT 10",
 	},
 	"campaigns": {
 		base: `SELECT id, name as label, status as sub_label, status, '' as direction, created_at
 			FROM bulk_message_campaigns
-			WHERE organization_id = ? AND created_at >= ? AND created_at <= ?`,
+			WHERE organization_id = ? AND created_at >= ? AND created_at <= ?
+			  AND deleted_at IS NULL`,
 		orderBy: " ORDER BY created_at DESC LIMIT 10",
 	},
 	"transfers": {
-		base: `SELECT t.id, COALESCE(c.profile_name, c.phone_number) as label,
+		base: `SELECT t.id,
+			COALESCE((
+				SELECT COALESCE(NULLIF(c.profile_name, ''), c.phone_number)
+				FROM contacts c
+				WHERE c.id = t.contact_id
+				  AND c.organization_id = t.organization_id
+				  AND c.deleted_at IS NULL
+				LIMIT 1
+			), t.contact_id::text) as label,
 			t.source as sub_label, t.status, '' as direction, t.transferred_at as created_at
-			FROM agent_transfers t LEFT JOIN contacts c ON c.id = t.contact_id
-			WHERE t.organization_id = ? AND t.transferred_at >= ? AND t.transferred_at <= ?`,
+			FROM agent_transfers t
+			WHERE t.organization_id = ? AND t.transferred_at >= ? AND t.transferred_at <= ?
+			  AND t.deleted_at IS NULL`,
 		orderBy: " ORDER BY t.transferred_at DESC LIMIT 10",
 	},
 	"sessions": {
-		base: `SELECT s.id, COALESCE(c.profile_name, c.phone_number) as label,
+		base: `SELECT s.id,
+			COALESCE((
+				SELECT COALESCE(NULLIF(c.profile_name, ''), c.phone_number)
+				FROM contacts c
+				WHERE c.id = s.contact_id
+				  AND c.organization_id = s.organization_id
+				  AND c.deleted_at IS NULL
+				LIMIT 1
+			), s.contact_id::text) as label,
 			s.status as sub_label, s.status, '' as direction, s.created_at
-			FROM chatbot_sessions s LEFT JOIN contacts c ON c.id = s.contact_id
-			WHERE s.organization_id = ? AND s.created_at >= ? AND s.created_at <= ?`,
+			FROM chatbot_sessions s
+			WHERE s.organization_id = ? AND s.created_at >= ? AND s.created_at <= ?
+			  AND s.deleted_at IS NULL`,
 		orderBy: " ORDER BY s.created_at DESC LIMIT 10",
+	},
+	"crm_leads": {
+		base: `SELECT id, title as label, source as sub_label, status,
+			'' as direction, created_at
+			FROM crm_leads
+			WHERE organization_id = ? AND created_at >= ? AND created_at <= ?
+			  AND deleted_at IS NULL`,
+		orderBy: " ORDER BY created_at DESC LIMIT 10",
+	},
+	"bookings": {
+		base: `SELECT id, contact_id::text as label, event_id::text as sub_label,
+			status, '' as direction, created_at
+			FROM bookings
+			WHERE organization_id = ? AND created_at >= ? AND created_at <= ?
+			  AND deleted_at IS NULL`,
+		orderBy: " ORDER BY created_at DESC LIMIT 10",
+	},
+	"invoices": {
+		base: `SELECT id, invoice_number as label,
+			currency || ' ' || total_minor::text as sub_label,
+			status, '' as direction, created_at
+			FROM commerce_invoices
+			WHERE organization_id = ? AND created_at >= ? AND created_at <= ?
+			  AND deleted_at IS NULL`,
+		orderBy: " ORDER BY created_at DESC LIMIT 10",
+	},
+	"payments": {
+		base: `SELECT id,
+			COALESCE(NULLIF(provider_transaction_id, ''), id::text) as label,
+			currency || ' ' || amount_minor::text as sub_label,
+			status, '' as direction, occurred_at as created_at
+			FROM payment_transactions
+			WHERE organization_id = ? AND occurred_at >= ? AND occurred_at <= ?`,
+		orderBy: " ORDER BY occurred_at DESC LIMIT 10",
+	},
+	"packages": {
+		base: `SELECT cp.id,
+			COALESCE((
+				SELECT pd.name
+				FROM package_definitions pd
+				WHERE pd.id = cp.package_definition_id
+				  AND pd.organization_id = cp.organization_id
+				  AND pd.deleted_at IS NULL
+				LIMIT 1
+			), cp.package_definition_id::text) as label,
+			cp.currency || ' ' || cp.purchase_amount_minor::text as sub_label,
+			cp.status, '' as direction, cp.created_at
+			FROM contact_packages cp
+			WHERE cp.organization_id = ? AND cp.created_at >= ? AND cp.created_at <= ?
+			  AND cp.deleted_at IS NULL`,
+		orderBy: " ORDER BY cp.created_at DESC LIMIT 10",
 	},
 }
 
@@ -1391,7 +1807,7 @@ var tableQuerySQL = map[string]struct{ base, orderBy string }{
 func (a *App) getTableRows(orgID uuid.UUID, widget models.Widget, filters []FilterInput, periodStart, periodEnd time.Time) []TableRow {
 	sql, ok := tableQuerySQL[widget.DataSource]
 	if !ok {
-		return nil
+		return []TableRow{}
 	}
 
 	query := sql.base
@@ -1412,10 +1828,18 @@ func (a *App) getTableRows(orgID uuid.UUID, widget models.Widget, filters []Filt
 
 	tableRows := make([]TableRow, len(results))
 	for i, r := range results {
+		label := r.Label
+		subLabel := r.SubLabel
+		switch widget.DataSource {
+		case "contacts":
+			label, subLabel = a.MaskContactFields(orgID, label, subLabel)
+		case "messages", "transfers", "sessions":
+			label, _ = a.MaskContactFields(orgID, label, label)
+		}
 		tableRows[i] = TableRow{
 			ID:        r.ID,
-			Label:     r.Label,
-			SubLabel:  r.SubLabel,
+			Label:     label,
+			SubLabel:  subLabel,
 			Status:    r.Status,
 			Direction: r.Direction,
 			CreatedAt: r.CreatedAt.Format(time.RFC3339),

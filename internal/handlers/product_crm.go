@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -1010,6 +1011,29 @@ func (a *App) CreateCRMLead(r *fastglue.Request) error {
 		if err := tx.Create(&history).Error; err != nil {
 			return err
 		}
+		if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        lead.ContactID,
+			LeadID:           &lead.ID,
+			EventType:        models.CustomerActivityCRMLeadCreated,
+			Category:         models.CustomerActivityCategoryCRM,
+			Title:            "Journey created",
+			Summary:          lead.Title,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: productCRMLeadResource,
+			SourceObjectID:   &lead.ID,
+			OccurredAt:       now,
+			Metadata: models.JSONB{
+				"pipeline_id": lead.PipelineID.String(),
+				"stage_id":    lead.StageID.String(),
+				"status":      string(lead.Status),
+				"value_minor": lead.ValueMinor,
+				"currency":    lead.Currency,
+			},
+			IdempotencyKey: "crm-lead-created:" + lead.ID.String(),
+		}); err != nil {
+			return err
+		}
 
 		return audit.LogAudit(
 			tx,
@@ -1176,6 +1200,27 @@ func (a *App) UpdateCRMLead(r *fastglue.Request) error {
 			First(&updated).Error; err != nil {
 			return err
 		}
+		if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        updated.ContactID,
+			LeadID:           &updated.ID,
+			EventType:        models.CustomerActivityCRMLeadUpdated,
+			Category:         models.CustomerActivityCategoryCRM,
+			Title:            "Journey updated",
+			Summary:          updated.Title,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: productCRMLeadResource,
+			SourceObjectID:   &updated.ID,
+			OccurredAt:       now,
+			Metadata: models.JSONB{
+				"stage_id": updated.StageID.String(),
+				"status":   string(updated.Status),
+				"version":  updated.Version,
+			},
+			IdempotencyKey: fmt.Sprintf("crm-lead-updated:%s:%d", updated.ID, updated.Version),
+		}); err != nil {
+			return err
+		}
 
 		return audit.LogAudit(
 			tx,
@@ -1304,30 +1349,28 @@ func (a *App) MoveCRMLead(r *fastglue.Request) error {
 			return err
 		}
 
-		outbox := models.OutboxEvent{
-			BaseModel:      models.BaseModel{ID: uuid.New()},
-			OrganizationID: orgID,
-			EventType:      "crm.lead.stage_moved",
-			AggregateType:  productCRMLeadResource,
-			AggregateID:    &lead.ID,
-			Payload: models.JSONB{
-				"lead_id":       lead.ID.String(),
+		if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        lead.ContactID,
+			LeadID:           &lead.ID,
+			EventType:        models.CustomerActivityCRMStageMoved,
+			Category:         models.CustomerActivityCategoryCRM,
+			Title:            "Journey stage changed",
+			Summary:          lead.Title,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: productCRMLeadResource,
+			SourceObjectID:   &lead.ID,
+			OccurredAt:       now,
+			Metadata: models.JSONB{
 				"pipeline_id":   lead.PipelineID.String(),
 				"from_stage_id": fromStageID.String(),
 				"to_stage_id":   targetStage.ID.String(),
 				"status":        string(status),
 				"version":       newVersion,
-				"changed_by_id": userID.String(),
 				"reason":        strings.TrimSpace(req.Reason),
 			},
-			AvailableAt:    now,
-			Status:         models.OutboxEventStatusPending,
-			Attempts:       0,
-			MaxAttempts:    10,
 			IdempotencyKey: fmt.Sprintf("crm-lead-stage-move:%s:%d", lead.ID, newVersion),
-			Version:        1,
-		}
-		if err := tx.Create(&outbox).Error; err != nil {
+		}); err != nil {
 			return err
 		}
 
@@ -1689,6 +1732,29 @@ func (a *App) CreateFollowUpTask(r *fastglue.Request) error {
 		if err := touchProductCRMLead(tx, orgID, task.LeadID, now); err != nil {
 			return err
 		}
+		if task.ContactID != nil {
+			if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+				ContactID:        *task.ContactID,
+				LeadID:           task.LeadID,
+				EventType:        models.CustomerActivityTaskCreated,
+				Category:         models.CustomerActivityCategoryTask,
+				Title:            "Task created",
+				Summary:          task.Title,
+				ActorType:        models.CustomerActivityActorUser,
+				ActorUserID:      &userID,
+				SourceObjectType: productCRMTaskResource,
+				SourceObjectID:   &task.ID,
+				OccurredAt:       now,
+				Metadata: models.JSONB{
+					"status":   string(task.Status),
+					"priority": string(task.Priority),
+					"due_at":   task.DueAt,
+				},
+				IdempotencyKey: "follow-up-task-created:" + task.ID.String(),
+			}); err != nil {
+				return err
+			}
+		}
 		return audit.LogAudit(
 			tx,
 			orgID,
@@ -1744,6 +1810,21 @@ func (a *App) UpdateFollowUpTask(r *fastglue.Request) error {
 				fasthttp.StatusConflict,
 				"Follow-up task was modified; refresh and retry",
 			)
+		}
+		if productCRMReservedTaskSource(task.Source) {
+			if req.Source != nil && strings.TrimSpace(*req.Source) != task.Source {
+				return newProductCRMClientError(
+					fasthttp.StatusConflict,
+					"Server-authored task source cannot be changed",
+				)
+			}
+			if req.Metadata != nil &&
+				!productCRMPreservesTaskLineage(task.Metadata, *req.Metadata) {
+				return newProductCRMClientError(
+					fasthttp.StatusConflict,
+					"Server-authored task lineage metadata cannot be changed",
+				)
+			}
 		}
 
 		finalContactID := task.ContactID
@@ -2006,6 +2087,28 @@ func (a *App) transitionFollowUpTask(r *fastglue.Request, targetStatus models.Fo
 		}
 		if err := touchProductCRMLead(tx, orgID, updated.LeadID, now); err != nil {
 			return err
+		}
+		if targetStatus == models.FollowUpTaskStatusCompleted && updated.ContactID != nil {
+			if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+				ContactID:        *updated.ContactID,
+				LeadID:           updated.LeadID,
+				EventType:        models.CustomerActivityTaskCompleted,
+				Category:         models.CustomerActivityCategoryTask,
+				Title:            "Task completed",
+				Summary:          updated.Title,
+				ActorType:        models.CustomerActivityActorUser,
+				ActorUserID:      &userID,
+				SourceObjectType: productCRMTaskResource,
+				SourceObjectID:   &updated.ID,
+				OccurredAt:       now,
+				Metadata: models.JSONB{
+					"status":  string(updated.Status),
+					"version": updated.Version,
+				},
+				IdempotencyKey: fmt.Sprintf("follow-up-task-completed:%s:%d", updated.ID, updated.Version),
+			}); err != nil {
+				return err
+			}
 		}
 		return audit.LogAudit(
 			tx,
@@ -2300,10 +2403,49 @@ func validateCreateFollowUpTaskRequest(req *CreateFollowUpTaskRequest) error {
 	if err := productCRMOptionalString("source", req.Source, 50); err != nil {
 		return err
 	}
+	if productCRMReservedTaskSource(req.Source) {
+		return errors.New("source is reserved for server-created tasks")
+	}
 	if err := productCRMOptionalString("idempotency_key", req.IdempotencyKey, 255); err != nil {
 		return err
 	}
 	return validateFollowUpTaskSchedule(req.DueAt, req.RemindAt)
+}
+
+func productCRMReservedTaskSource(source string) bool {
+	switch strings.TrimSpace(source) {
+	case automationTaskSource, careTaskSource:
+		return true
+	default:
+		return false
+	}
+}
+
+func productCRMPreservesTaskLineage(existing, replacement models.JSONB) bool {
+	reserved := []string{
+		"automation_policy_id",
+		"automation_policy_version_id",
+		"automation_policy_version",
+		"automation_execution_id",
+		"automation_step_id",
+		"automation_node_id",
+		"source_activity_event_id",
+		"automation_kind",
+		"policy_version",
+		"requires_contact_policy_check",
+		"external_message_sent",
+	}
+	for _, key := range reserved {
+		oldValue, protected := existing[key]
+		if !protected {
+			continue
+		}
+		newValue, present := replacement[key]
+		if !present || !reflect.DeepEqual(oldValue, newValue) {
+			return false
+		}
+	}
+	return true
 }
 
 func validateUpdateFollowUpTaskRequest(req *UpdateFollowUpTaskRequest) error {

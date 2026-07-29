@@ -158,17 +158,35 @@ export interface CRMLead {
   status: 'open' | 'won' | 'lost' | 'archived'
   owner_user_id?: string
   source?: string
+  source_reference?: string
   value_minor: number
   currency: string
   next_action_at?: string
   expected_close_date?: string
   last_activity_at?: string
   lost_reason?: string
+  metadata?: Record<string, unknown>
+  idempotency_key?: string
   version: number
   contact?: {
     id: string
     profile_name?: string
     phone_number?: string
+  }
+  pipeline?: {
+    id: string
+    name: string
+  }
+  stage?: {
+    id: string
+    name: string
+    color?: string
+    kind?: 'open' | 'won' | 'lost'
+  }
+  owner?: {
+    id: string
+    name?: string
+    full_name?: string
   }
 }
 
@@ -185,6 +203,9 @@ export interface FollowUpTask {
   due_at?: string
   remind_at?: string
   completed_at?: string
+  source?: string
+  metadata?: Record<string, unknown>
+  idempotency_key?: string
   version: number
 }
 
@@ -251,6 +272,7 @@ export interface Booking {
     profile_name?: string
     phone_number?: string
   }
+  event?: BookingEvent
 }
 
 export interface PackageDefinition {
@@ -312,6 +334,116 @@ export interface CommerceInvoice {
   due_at?: string
   paid_at?: string
   version: number
+}
+
+export interface CustomerWorkspaceContact {
+  id: string
+  phone_number: string
+  name?: string
+  profile_name?: string
+  avatar_url?: string
+  status?: string
+  tags?: string[]
+  metadata?: Record<string, unknown>
+  assigned_user_id?: string
+  marketing_opt_out?: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface CustomerIdentity {
+  id: string
+  channel: ChannelType | string
+  display_name?: string
+  address?: string
+  normalized_address?: string
+  verified?: boolean
+  is_verified?: boolean
+  first_seen_at?: string
+  last_seen_at?: string
+}
+
+export interface CustomerWorkspacePayment {
+  id: string
+  invoice_id?: string
+  type: string
+  status: string
+  amount_minor: number
+  currency: string
+  occurred_at: string
+}
+
+export interface CustomerTimelineEvent {
+  id: string
+  type?: string
+  event_type?: string
+  category: string
+  title: string
+  summary?: string
+  occurred_at: string
+  source_type?: string
+  source_id?: string
+  source_object_type?: string
+  source_object_id?: string
+  actor?: {
+    id: string
+    name: string
+  }
+  actor_type?: string
+  actor_user_id?: string
+  metadata?: Record<string, unknown>
+}
+
+export interface CustomerWorkspaceCapabilities {
+  crm: boolean
+  tasks: boolean
+  bookings: boolean
+  packages: boolean
+  payments: boolean
+  copilot: boolean
+  merge: boolean
+}
+
+export interface CustomerWorkspace {
+  contact: CustomerWorkspaceContact
+  contact_ids?: string[]
+  capabilities?: Partial<CustomerWorkspaceCapabilities>
+  permissions?: {
+    crm?: boolean
+    tasks?: boolean
+    bookings?: boolean
+    commerce?: boolean
+    packages?: boolean
+    payments?: boolean
+    copilot?: boolean
+  }
+  identities?: CustomerIdentity[]
+  journeys?: CRMLead[]
+  tasks?: FollowUpTask[]
+  bookings?: Booking[]
+  packages?: ContactPackage[]
+  invoices?: CommerceInvoice[]
+  payments?: CustomerWorkspacePayment[]
+  summary?: {
+    open_journeys?: number
+    journey_count?: number
+    pipeline_value?: Money[]
+    overdue_tasks?: number
+    open_task_count?: number
+    next_booking?: Booking
+    booking_count?: number
+    active_packages?: number
+    active_package_count?: number
+    available_credits?: number
+    package_expiring_soon?: number
+    outstanding?: Money[]
+    collected?: Money[]
+    outstanding_minor?: number
+    lifetime_value_minor?: number
+    currency?: string
+    last_activity_at?: string
+  }
+  timeline?: CustomerTimelineEvent[]
 }
 
 export interface CommerceSummary {
@@ -441,6 +573,11 @@ export const crmService = {
   createTask: (data: Partial<FollowUpTask>) => api.post('/tasks', data),
   updateTask: (id: string, data: Partial<FollowUpTask>) => api.put(`/tasks/${id}`, data),
   completeTask: (id: string, version: number) => api.put(`/tasks/${id}/complete`, { version }),
+}
+
+export const customerWorkspaceService = {
+  get: (contactId: string) =>
+    api.get(`/contacts/${encodeURIComponent(contactId)}/workspace`),
 }
 
 export const bookingService = {

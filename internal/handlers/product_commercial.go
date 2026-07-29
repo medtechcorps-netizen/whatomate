@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
@@ -688,7 +689,10 @@ func productCommercialUserBelongsToOrganization(
 // map so legacy behavior is unchanged.
 func ProductEntitlementKeyForResource(resource string) (string, bool) {
 	switch resource {
-	case models.ResourceCRMPipelines, models.ResourceCRMLeads, models.ResourceTasks:
+	case models.ResourceCRMPipelines,
+		models.ResourceCRMLeads,
+		models.ResourceCRMAutomations,
+		models.ResourceTasks:
 		return "crm.enabled", true
 	case models.ResourceBookings, models.ResourceBookingSettings:
 		return "bookings.enabled", true
@@ -2249,61 +2253,65 @@ func (a *App) RecordConsent(r *fastglue.Request) error {
 		if *req.ContactID == uuid.Nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid contact_id", nil, "")
 		}
-		var count int64
-		if err := a.DB.Model(&models.Contact{}).
-			Where("id = ? AND organization_id = ?", *req.ContactID, orgID).
-			Count(&count).Error; err != nil {
-			return a.sendProductCommercialError(r, "validate consent contact", err)
-		}
-		if count == 0 {
-			return r.SendErrorEnvelope(
-				fasthttp.StatusBadRequest,
-				"contact_id does not belong to the organization",
-				nil,
-				"",
-			)
-		}
-		if req.SubjectKey == "" {
-			req.SubjectKey = req.ContactID.String()
-		}
 	}
+	subjectKeyFollowsContact := req.ContactID != nil &&
+		(req.SubjectKey == "" ||
+			(req.SubjectType == "contact" && req.SubjectKey == req.ContactID.String()))
 
 	now := time.Now().UTC()
 	hash := sha256.Sum256(evidenceBytes)
-	event := models.ConsentEvent{
-		BaseModel:      models.BaseModel{ID: uuid.New()},
-		OrganizationID: orgID,
-		ContactID:      req.ContactID,
-		SubjectType:    req.SubjectType,
-		SubjectKey:     req.SubjectKey,
-		Purpose:        req.Purpose,
-		Channel:        req.Channel,
-		Action:         req.Action,
-		LegalBasis:     req.LegalBasis,
-		PolicyVersion:  req.PolicyVersion,
-		Source:         req.Source,
-		ActorUserID:    &userID,
-		Evidence:       productCommercialJSONCopy(req.Evidence),
-		EvidenceHash:   fmt.Sprintf("%x", hash),
-		CapturedAt:     now,
-		ExpiresAt:      req.ExpiresAt,
-	}
-	state := models.ConsentState{
-		BaseModel:      models.BaseModel{ID: uuid.New()},
-		OrganizationID: orgID,
-		ContactID:      req.ContactID,
-		SubjectType:    req.SubjectType,
-		SubjectKey:     req.SubjectKey,
-		Purpose:        req.Purpose,
-		Channel:        req.Channel,
-		Status:         productCommercialConsentStatus(req.Action),
-		LatestEventID:  event.ID,
-		PolicyVersion:  req.PolicyVersion,
-		EffectiveAt:    now,
-		ExpiresAt:      req.ExpiresAt,
-		Metadata:       models.JSONB{},
-	}
-	err = a.DB.Transaction(func(tx *gorm.DB) error {
+	var event models.ConsentEvent
+	var state models.ConsentState
+	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		if req.ContactID != nil {
+			canonical, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
+				tx,
+				orgID,
+				*req.ContactID,
+			)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			canonicalID := canonical.ID
+			req.ContactID = &canonicalID
+			if subjectKeyFollowsContact {
+				req.SubjectKey = canonicalID.String()
+			}
+		}
+
+		event = models.ConsentEvent{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: orgID,
+			ContactID:      req.ContactID,
+			SubjectType:    req.SubjectType,
+			SubjectKey:     req.SubjectKey,
+			Purpose:        req.Purpose,
+			Channel:        req.Channel,
+			Action:         req.Action,
+			LegalBasis:     req.LegalBasis,
+			PolicyVersion:  req.PolicyVersion,
+			Source:         req.Source,
+			ActorUserID:    &userID,
+			Evidence:       productCommercialJSONCopy(req.Evidence),
+			EvidenceHash:   fmt.Sprintf("%x", hash),
+			CapturedAt:     now,
+			ExpiresAt:      req.ExpiresAt,
+		}
+		state = models.ConsentState{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: orgID,
+			ContactID:      req.ContactID,
+			SubjectType:    req.SubjectType,
+			SubjectKey:     req.SubjectKey,
+			Purpose:        req.Purpose,
+			Channel:        req.Channel,
+			Status:         productCommercialConsentStatus(req.Action),
+			LatestEventID:  event.ID,
+			PolicyVersion:  req.PolicyVersion,
+			EffectiveAt:    now,
+			ExpiresAt:      req.ExpiresAt,
+			Metadata:       models.JSONB{},
+		}
 		if err := tx.Create(&event).Error; err != nil {
 			return err
 		}
@@ -2358,6 +2366,14 @@ func (a *App) RecordConsent(r *fastglue.Request) error {
 		)
 	})
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) && req.ContactID != nil {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusBadRequest,
+				"contact_id does not belong to the organization",
+				nil,
+				"",
+			)
+		}
 		return a.sendProductCommercialError(r, "record consent", err)
 	}
 	return r.SendEnvelope(map[string]any{

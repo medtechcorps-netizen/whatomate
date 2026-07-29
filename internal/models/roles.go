@@ -97,6 +97,7 @@ const (
 	ResourceOperations              = "operations"
 	ResourceCRMPipelines            = "crm.pipelines"
 	ResourceCRMLeads                = "crm.leads"
+	ResourceCRMAutomations          = "crm.automations"
 	ResourceTasks                   = "tasks"
 	ResourceBookings                = "bookings"
 	ResourceBookingSettings         = "booking.settings"
@@ -290,6 +291,10 @@ func DefaultPermissions() []Permission {
 		{Resource: ResourceCRMLeads, Action: ActionRead, Description: "View CRM leads"},
 		{Resource: ResourceCRMLeads, Action: ActionWrite, Description: "Create, edit, and move CRM leads"},
 		{Resource: ResourceCRMLeads, Action: ActionDelete, Description: "Archive CRM leads"},
+		{Resource: ResourceCRMAutomations, Action: ActionRead, Description: "View CRM automation policies and runs"},
+		{Resource: ResourceCRMAutomations, Action: ActionWrite, Description: "Create and edit CRM automation policies"},
+		{Resource: ResourceCRMAutomations, Action: ActionDelete, Description: "Archive CRM automation policies"},
+		{Resource: ResourceCRMAutomations, Action: ActionExecute, Description: "Preview, activate, and pause CRM automation policies"},
 		{Resource: ResourceTasks, Action: ActionRead, Description: "View follow-up tasks"},
 		{Resource: ResourceTasks, Action: ActionWrite, Description: "Create and complete follow-up tasks"},
 		{Resource: ResourceTasks, Action: ActionDelete, Description: "Cancel follow-up tasks"},
@@ -378,6 +383,8 @@ func SystemRolePermissions() map[string][]string {
 		// CRM, bookings and commerce
 		"crm.pipelines:read", "crm.pipelines:write",
 		"crm.leads:read", "crm.leads:write", "crm.leads:delete",
+		"crm.automations:read", "crm.automations:write",
+		"crm.automations:delete", "crm.automations:execute",
 		"tasks:read", "tasks:write", "tasks:delete",
 		"bookings:read", "bookings:write", "bookings:delete",
 		"booking.settings:read", "booking.settings:write",
@@ -412,6 +419,7 @@ func SystemRolePermissions() map[string][]string {
 		// CRM workspace
 		"crm.pipelines:read",
 		"crm.leads:read", "crm.leads:write",
+		"crm.automations:read",
 		"tasks:read", "tasks:write",
 		"bookings:read", "bookings:write",
 		"booking.settings:read",

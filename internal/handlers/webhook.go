@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
 )
 
 // WebhookVerify handles Meta's webhook verification challenge
@@ -202,7 +205,24 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 			if change.Field == "user_preferences" {
 				for _, pref := range change.Value.UserPreferences {
 					if pref.Category == "marketing_messages" {
-						go a.processMarketingPreference(change.Value.Metadata.PhoneNumberID, pref.WaID, pref.UserID, pref.Value)
+						if err := a.processMarketingPreference(
+							change.Value.Metadata.PhoneNumberID,
+							pref.WaID,
+							pref.UserID,
+							pref.Value,
+						); err != nil {
+							a.Log.Error(
+								"Failed to durably process marketing preference before acknowledgement",
+								"error", err,
+								"phone_id", change.Value.Metadata.PhoneNumberID,
+							)
+							return r.SendErrorEnvelope(
+								fasthttp.StatusServiceUnavailable,
+								"Marketing preference persistence failed",
+								nil,
+								"",
+							)
+						}
 					}
 				}
 				continue
@@ -315,8 +335,40 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 					continue
 				}
 
-				// Process message asynchronously
-				go a.processIncomingMessage(phoneNumberID, msg, profileName)
+				// Reactions update an existing row and retain their specialized
+				// asynchronous path. Every regular inbound message crosses a
+				// durable database boundary before Meta receives HTTP 200.
+				if msg.Type == "reaction" && msg.Reaction != nil {
+					a.startSpecializedIncomingMessage(phoneNumberID, msg, profileName)
+					continue
+				}
+
+				work, duplicate, err := a.persistIncomingMessageBeforeAck(
+					phoneNumberID,
+					msg,
+					profileName,
+				)
+				if err != nil {
+					a.Log.Error(
+						"Failed to durably persist incoming message before acknowledgement",
+						"error", err,
+						"phone_id", phoneNumberID,
+						"message_id", msg.ID,
+					)
+					// A non-2xx response asks Meta to retry. Returning 200 here
+					// would create an unrecoverable ACK-before-commit window.
+					return r.SendErrorEnvelope(
+						fasthttp.StatusServiceUnavailable,
+						"Incoming message persistence failed",
+						nil,
+						"",
+					)
+				}
+				if duplicate {
+					a.startPersistedIncomingMessageContinuation(work)
+					continue
+				}
+				a.startPersistedIncomingMessageContinuation(work)
 			}
 
 			// Process status updates
@@ -352,17 +404,77 @@ func (a *App) processIncomingMessage(phoneNumberID string, msg IncomingTextMessa
 		}
 	}()
 
-	// Check for duplicate message - Meta sometimes sends the same message multiple times
-	if msg.ID != "" {
-		var existingMsg models.Message
-		if err := a.DB.Where("whats_app_message_id = ?", msg.ID).First(&existingMsg).Error; err == nil {
-			a.Log.Debug("Duplicate message detected, skipping", "message_id", msg.ID)
-			return
-		}
-	}
-
 	// Process the message with chatbot logic
 	a.processIncomingMessageFull(phoneNumberID, msg, profileName)
+}
+
+// startSpecializedIncomingMessage tracks reaction processing for graceful
+// shutdown while retaining the existing panic and tenant-scope protections.
+func (a *App) startSpecializedIncomingMessage(
+	phoneNumberID string,
+	msg IncomingTextMessage,
+	profileName string,
+) {
+	root := a.rootApp()
+	root.wg.Add(1)
+	go func() {
+		defer root.wg.Done()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				root.Log.Error(
+					"Panic recovered in specialized incoming message",
+					"panic", recovered,
+					"phone_id", phoneNumberID,
+					"message_id", msg.ID,
+				)
+			}
+		}()
+		root.processIncomingMessage(phoneNumberID, msg, profileName)
+	}()
+}
+
+// startPersistedIncomingMessageContinuation launches only after the synchronous
+// persistence helper has committed. It re-enters tenant scope from the root
+// pool, is tracked for graceful shutdown, and contains all media/provider work.
+func (a *App) startPersistedIncomingMessageContinuation(work *persistedIncomingMessage) {
+	if work == nil {
+		return
+	}
+
+	root := a.rootApp()
+	root.wg.Add(1)
+	go func() {
+		defer root.wg.Done()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				root.Log.Error(
+					"Panic recovered in incoming message continuation",
+					"panic", recovered,
+					"phone_id", work.PhoneNumberID,
+					"message_id", work.Message.ID,
+				)
+			}
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		processor := NewInboundContinuationProcessor(
+			root,
+			defaultInboundContinuationPoll,
+		)
+		if err := processor.ProcessMessage(
+			ctx,
+			work.OrganizationID,
+			work.Persisted.ID,
+		); err != nil {
+			root.Log.Error(
+				"Failed to process durable incoming message continuation",
+				"error", err,
+				"organization_id", work.OrganizationID,
+				"message_id", work.Message.ID,
+			)
+		}
+	}()
 }
 
 func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) {
@@ -697,53 +809,168 @@ func verifyWebhookSignature(body, signature, appSecret []byte) bool {
 
 // processMarketingPreference updates a contact's marketing opt-out status
 // based on the user_preferences webhook from Meta.
-func (a *App) processMarketingPreference(phoneNumberID, userPhone, bsuid, value string) {
+func (a *App) processMarketingPreference(
+	phoneNumberID, userPhone, bsuid, value string,
+) error {
 	if a.rlsEnabled() && !a.hasTenantScope() {
-		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
-			scoped.processMarketingPreference(phoneNumberID, userPhone, bsuid, value)
-			return nil
-		}); err != nil {
-			a.Log.Error("Failed to scope marketing preference to tenant", "error", err, "phone_id", phoneNumberID)
-		}
-		return
+		return a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+			return scoped.processMarketingPreference(
+				phoneNumberID,
+				userPhone,
+				bsuid,
+				value,
+			)
+		})
+	}
+
+	optOut, err := marketingPreferenceOptOut(value)
+	if err != nil {
+		return err
 	}
 
 	// Find the WhatsApp account by phone_number_id
 	var account models.WhatsAppAccount
 	if err := a.DB.Where("phone_id = ?", phoneNumberID).First(&account).Error; err != nil {
-		a.Log.Error("Failed to find account for marketing preference", "error", err, "phone_id", phoneNumberID)
-		return
+		return fmt.Errorf("find account for marketing preference: %w", err)
 	}
 
-	// Find contact by phone number, or by BSUID if phone is empty
-	var contact models.Contact
-	if userPhone != "" {
-		if err := a.DB.Where("phone_number = ? AND organization_id = ?", userPhone, account.OrganizationID).First(&contact).Error; err != nil {
-			a.Log.Info("Contact not found for marketing preference", "phone", userPhone)
-			return
-		}
-	} else if bsuid != "" {
-		if err := a.DB.Where("bsuid = ? AND organization_id = ?", bsuid, account.OrganizationID).First(&contact).Error; err != nil {
-			a.Log.Info("Contact not found by BSUID for marketing preference", "bsuid", bsuid)
-			return
-		}
-	} else {
-		a.Log.Warn("Marketing preference webhook with no phone or BSUID, skipping")
-		return
+	if strings.TrimSpace(userPhone) == "" && strings.TrimSpace(bsuid) == "" {
+		return errors.New("marketing preference has no phone or BSUID")
 	}
 
-	optOut := value == "stop"
-	if err := a.DB.Model(&contact).Update("marketing_opt_out", optOut).Error; err != nil {
-		a.Log.Error("Failed to update marketing opt-out", "error", err, "contact_id", contact.ID, "opt_out", optOut)
-		return
+	var updated models.Contact
+	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		contact, findErr := findMarketingPreferenceContact(
+			tx,
+			account.OrganizationID,
+			userPhone,
+			bsuid,
+		)
+		if errors.Is(findErr, gorm.ErrRecordNotFound) &&
+			strings.TrimSpace(userPhone) != "" {
+			contact, _, findErr = contactutil.GetOrCreateContact(
+				tx,
+				account.OrganizationID,
+				userPhone,
+				"",
+			)
+		}
+		if findErr != nil {
+			return fmt.Errorf("find marketing preference contact: %w", findErr)
+		}
+
+		canonical, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
+			tx,
+			account.OrganizationID,
+			contact.ID,
+		)
+		if resolveErr != nil {
+			return fmt.Errorf(
+				"resolve marketing preference contact: %w",
+				resolveErr,
+			)
+		}
+
+		updates := map[string]any{
+			"marketing_opt_out": optOut,
+		}
+		if strings.TrimSpace(bsuid) != "" && canonical.BSUID != bsuid {
+			updates["bs_uid"] = strings.TrimSpace(bsuid)
+		}
+		if canonical.WhatsAppAccount == "" {
+			updates["whats_app_account"] = account.Name
+		}
+		result := tx.Model(&models.Contact{}).
+			Where(
+				"id = ? AND organization_id = ? AND merged_into_id IS NULL AND deleted_at IS NULL",
+				canonical.ID,
+				account.OrganizationID,
+			).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return contactutil.ErrCanonicalContactChanged
+		}
+
+		updated = *canonical
+		updated.MarketingOptOut = optOut
+		if resolvedBSUID, ok := updates["bs_uid"].(string); ok {
+			updated.BSUID = resolvedBSUID
+		}
+		if resolvedAccount, ok := updates["whats_app_account"].(string); ok {
+			updated.WhatsAppAccount = resolvedAccount
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("persist marketing preference: %w", err)
 	}
 
 	a.Log.Info("Marketing preference updated",
-		"contact_id", contact.ID,
+		"contact_id", updated.ID,
 		"phone", userPhone,
 		"bsuid", bsuid,
 		"opt_out", optOut,
 	)
+	return nil
+}
+
+func findMarketingPreferenceContact(
+	tx *gorm.DB,
+	organizationID uuid.UUID,
+	userPhone, bsuid string,
+) (*models.Contact, error) {
+	normalizedPhone := strings.TrimPrefix(strings.TrimSpace(userPhone), "+")
+	if normalizedPhone != "" {
+		var contact models.Contact
+		err := tx.Unscoped().
+			Where(
+				"organization_id = ? AND phone_number IN ?",
+				organizationID,
+				[]string{normalizedPhone, "+" + normalizedPhone},
+			).
+			Order("CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END, created_at").
+			First(&contact).Error
+		if err == nil {
+			return &contact, nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	}
+
+	normalizedBSUID := strings.TrimSpace(bsuid)
+	if normalizedBSUID != "" {
+		var contact models.Contact
+		err := tx.Unscoped().
+			Where(
+				"organization_id = ? AND bs_uid = ?",
+				organizationID,
+				normalizedBSUID,
+			).
+			Order("CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END, created_at").
+			First(&contact).Error
+		if err == nil {
+			return &contact, nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+func marketingPreferenceOptOut(value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "stop", "opt_out", "opted_out", "unsubscribe", "unsubscribed":
+		return true, nil
+	case "start", "resume", "opt_in", "opted_in", "subscribe", "subscribed":
+		return false, nil
+	default:
+		return false, fmt.Errorf("unsupported marketing preference %q", value)
+	}
 }
 
 // processMessageEcho handles mirroring of messages sent from the mobile WhatsApp Business App.
@@ -774,7 +1001,12 @@ func (a *App) processMessageEcho(phoneNumberID string, msg IncomingTextMessage) 
 	// Check for duplicate message - Meta sometimes sends the same message multiple times
 	if msg.ID != "" {
 		var existingMsg models.Message
-		if err := a.DB.Where("whats_app_message_id = ?", msg.ID).First(&existingMsg).Error; err == nil {
+		if err := a.DB.Where(
+			"organization_id = ? AND whats_app_account = ? AND whats_app_message_id = ?",
+			account.OrganizationID,
+			account.Name,
+			msg.ID,
+		).First(&existingMsg).Error; err == nil {
 			a.Log.Debug("Duplicate echo message detected, skipping", "message_id", msg.ID)
 			return
 		}
@@ -788,16 +1020,10 @@ func (a *App) processMessageEcho(phoneNumberID string, msg IncomingTextMessage) 
 		contactPhone = msg.From
 	}
 
-	contact, _, err := contactutil.GetOrCreateContact(a.DB, account.OrganizationID, contactPhone, "")
+	contact, _, err := a.getOrCreateInboundContact(account, contactPhone, "", msg.FromUserID)
 	if err != nil {
 		a.Log.Error("Failed to get or create contact for echo", "phone", contactPhone, "error", err)
 		return
-	}
-
-	// Store BSUID if provided and not already set
-	if msg.FromUserID != "" && contact.BSUID != msg.FromUserID {
-		a.DB.Model(contact).Update("bsuid", msg.FromUserID)
-		contact.BSUID = msg.FromUserID
 	}
 
 	// Get message content - handle text and media
@@ -901,22 +1127,18 @@ func (a *App) processContactSync(phoneNumberID, contactPhone, contactName, actio
 
 	switch action {
 	case "add":
-		contact, isNewContact, err := contactutil.GetOrCreateContact(a.DB, account.OrganizationID, contactPhone, contactName)
+		contact, isNewContact, err := a.getOrCreateInboundContact(
+			account,
+			contactPhone,
+			contactName,
+			"",
+		)
 		if err != nil {
 			a.Log.Error("Failed to sync new contact from app state sync", "phone", contactPhone, "error", err)
 			return
 		}
 
 		a.Log.Info("Synced contact (add) from mobile app", "contact_id", contact.ID, "is_new", isNewContact)
-
-		if isNewContact {
-			a.DispatchWebhook(account.OrganizationID, models.WebhookEventContactCreated, ContactEventData{
-				ContactID:       contact.ID.String(),
-				ContactPhone:    contact.PhoneNumber,
-				ContactName:     contact.ProfileName,
-				WhatsAppAccount: account.Name,
-			})
-		}
 	case "remove":
 		// Try to find the contact first using the FindContact helper
 		contact, err := contactutil.FindContact(a.DB, account.OrganizationID, contactPhone)

@@ -19,7 +19,13 @@ import (
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/zerodha/logf"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+const campaignCanonicalContactAttempts = 3
+
+const campaignMarketingOptOutMessage = "Contact opted out of marketing messages"
+const campaignAmbiguousDeliveryMessage = "Provider delivery outcome is unknown; message was not retried to prevent a duplicate"
 
 // Worker processes jobs from the queue
 type Worker struct {
@@ -30,8 +36,6 @@ type Worker struct {
 	WhatsApp  *whatsapp.Client
 	Consumer  *queue.RedisConsumer
 	Publisher *queue.Publisher
-
-	tenantScoped bool
 }
 
 // Ensure Worker implements JobHandler interface
@@ -107,134 +111,667 @@ func (w *Worker) maintainHeartbeat(ctx context.Context) {
 
 // HandleRecipientJob processes a single recipient message job
 func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob) error {
-	if w.Config != nil && w.Config.Database.RLSEnabled && !w.tenantScoped {
-		return database.WithTenant(w.DB, job.OrganizationID, func(tx *gorm.DB) error {
-			scoped := *w
-			scoped.DB = tx
-			scoped.tenantScoped = true
-			return scoped.HandleRecipientJob(ctx, job)
-		})
-	}
-
-	// Check if campaign is still active before sending
 	var campaign models.BulkMessageCampaign
-	if err := w.DB.Where("id = ?", job.CampaignID).Preload("Template").First(&campaign).Error; err != nil {
-		w.Log.Error("Failed to load campaign", "error", err, "campaign_id", job.CampaignID)
-		return fmt.Errorf("failed to load campaign: %w", err)
-	}
-
-	// Skip if campaign is paused or cancelled
-	if campaign.Status == models.CampaignStatusPaused || campaign.Status == models.CampaignStatusCancelled {
-		w.Log.Info("Campaign not active, skipping recipient", "campaign_id", job.CampaignID, "status", campaign.Status, "recipient_id", job.RecipientID)
-		return nil // Not an error, just skip
-	}
-
-	// Get WhatsApp account
 	var account models.WhatsAppAccount
-	if err := w.DB.Where("name = ? AND organization_id = ?", campaign.WhatsAppAccount, job.OrganizationID).First(&account).Error; err != nil {
-		w.Log.Error("Failed to load WhatsApp account", "error", err, "account_name", campaign.WhatsAppAccount)
-		w.updateRecipientStatus(job.RecipientID, models.MessageStatusFailed, "", "WhatsApp account not found")
-		w.incrementCampaignCount(job.CampaignID, "failed_count")
-		return nil // Don't retry, mark as failed
+	var contact *models.Contact
+	terminal := false
+	if err := w.withRecipientTenantTransaction(ctx, job.OrganizationID, func(tx *gorm.DB) error {
+		scoped := *w
+		scoped.DB = tx
+
+		if err := tx.
+			Where("id = ? AND organization_id = ?", job.CampaignID, job.OrganizationID).
+			Preload("Template", "organization_id = ?", job.OrganizationID).
+			First(&campaign).Error; err != nil {
+			w.Log.Error("Failed to load campaign", "error", err, "campaign_id", job.CampaignID)
+			return fmt.Errorf("failed to load campaign: %w", err)
+		}
+		if campaign.Status == models.CampaignStatusPaused ||
+			campaign.Status == models.CampaignStatusCancelled {
+			w.Log.Info(
+				"Campaign not active, skipping recipient",
+				"campaign_id", job.CampaignID,
+				"status", campaign.Status,
+				"recipient_id", job.RecipientID,
+			)
+			terminal = true
+			return nil
+		}
+		if err := tx.
+			Where("name = ? AND organization_id = ?", campaign.WhatsAppAccount, job.OrganizationID).
+			First(&account).Error; err != nil {
+			w.Log.Error("Failed to load WhatsApp account", "error", err, "account_name", campaign.WhatsAppAccount)
+			scoped.updateRecipientStatus(job.RecipientID, models.MessageStatusFailed, "", "WhatsApp account not found")
+			scoped.incrementCampaignCount(job.CampaignID, "failed_count")
+			terminal = true
+			return nil
+		}
+
+		resolved, _, err := contactutil.GetOrCreateContact(
+			tx,
+			job.OrganizationID,
+			job.PhoneNumber,
+			job.RecipientName,
+		)
+		if err != nil || resolved == nil {
+			w.Log.Error("Failed to get or create contact", "error", err, "phone", job.PhoneNumber)
+			scoped.updateRecipientStatus(job.RecipientID, models.MessageStatusFailed, "", "Failed to create contact")
+			scoped.incrementCampaignCount(job.CampaignID, "failed_count")
+			terminal = true
+			return nil
+		}
+		contact = resolved
+		return nil
+	}); err != nil {
+		return err
+	}
+	if terminal {
+		return nil
 	}
 	w.decryptAccountSecrets(&account)
 
-	// Get or create contact for this recipient
-	contact, _, err := contactutil.GetOrCreateContact(w.DB, job.OrganizationID, job.PhoneNumber, job.RecipientName)
-	if err != nil || contact == nil {
-		w.Log.Error("Failed to get or create contact", "error", err, "phone", job.PhoneNumber)
-		w.updateRecipientStatus(job.RecipientID, models.MessageStatusFailed, "", "Failed to create contact")
-		w.incrementCampaignCount(job.CampaignID, "failed_count")
-		return nil // Don't retry
+	delivery, err := w.deliverCampaignRecipient(
+		ctx,
+		job,
+		&campaign,
+		&account,
+		contact.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("deliver campaign recipient: %w", err)
+	}
+	if delivery.alreadyProcessed {
+		w.Log.Info(
+			"Campaign recipient was already processed",
+			"campaign_id", job.CampaignID,
+			"recipient_id", job.RecipientID,
+		)
+	} else if delivery.ambiguous {
+		w.Log.Error(
+			"Campaign delivery was dead-lettered without a retry",
+			"campaign_id", job.CampaignID,
+			"recipient_id", job.RecipientID,
+			"message_id", delivery.message.ID,
+		)
+	} else if delivery.consentRejected {
+		w.Log.Info(
+			"Skipping marketing message for opted-out canonical contact",
+			"contact_id", delivery.contactID,
+			"phone", job.PhoneNumber,
+		)
+	} else if delivery.sendErr != nil {
+		w.Log.Error("Failed to send message", "error", delivery.sendErr, "recipient", job.PhoneNumber)
+	} else {
+		w.Log.Info(
+			"Message sent",
+			"recipient", job.PhoneNumber,
+			"message_id", delivery.message.WhatsAppMessageID,
+		)
 	}
 
-	// Check marketing opt-out
-	if contact.MarketingOptOut && campaign.Template != nil && strings.EqualFold(campaign.Template.Category, "MARKETING") {
-		w.Log.Info("Skipping marketing message for opted-out contact", "contact_id", contact.ID, "phone", job.PhoneNumber)
-		w.updateRecipientStatus(job.RecipientID, models.MessageStatusFailed, "", "Contact opted out of marketing messages")
-		w.incrementCampaignCount(job.CampaignID, "failed_count")
+	if err := w.withRecipientTenantTransaction(ctx, job.OrganizationID, func(tx *gorm.DB) error {
+		scoped := *w
+		scoped.DB = tx
+		// The durable legacy message is authoritative. The idempotent
+		// migration backfill can repair a transient omnichannel mirror failure
+		// without resending.
+		if delivery.message != nil {
+			if _, err := channelapi.MirrorLegacyWhatsAppMessage(
+				tx,
+				channelapi.LegacyMetaAccountRef{
+					ID:             account.ID,
+					OrganizationID: account.OrganizationID,
+					Name:           account.Name,
+					Status:         account.Status,
+				},
+				delivery.message.ID,
+			); err != nil {
+				w.Log.Error(
+					"Failed to mirror campaign message into omnichannel inbox",
+					"error", err,
+					"organization_id", account.OrganizationID,
+					"message_id", delivery.message.ID,
+				)
+			}
+		}
+		scoped.checkCampaignCompletion(ctx, job.CampaignID, job.OrganizationID)
 		return nil
+	}); err != nil {
+		return fmt.Errorf("finalize campaign recipient tenant phase: %w", err)
 	}
 
-	// Build recipient for sending
-	recipient := &models.BulkMessageRecipient{
-		PhoneNumber:    job.PhoneNumber,
-		RecipientName:  job.RecipientName,
-		TemplateParams: job.TemplateParams,
-		HeaderParams:   job.HeaderParams,
+	return nil
+}
+
+type campaignRecipientDelivery struct {
+	message          *models.Message
+	contactID        uuid.UUID
+	sendErr          error
+	consentRejected  bool
+	ambiguous        bool
+	alreadyProcessed bool
+}
+
+// deliverCampaignRecipient uses a two-phase, at-most-once protocol for legacy
+// Meta delivery. Meta does not accept a client idempotency key for this API:
+// first we durably claim the recipient with a pending Message, then we hold the
+// canonical contact lock across the final consent check and provider attempt.
+// A redelivery that finds an unresolved claim is dead-lettered rather than
+// risking a duplicate. This deliberately prefers a visible ambiguous failure
+// over duplicate marketing delivery if the process dies around the API call.
+func (w *Worker) deliverCampaignRecipient(
+	ctx context.Context,
+	job *queue.RecipientJob,
+	campaign *models.BulkMessageCampaign,
+	account *models.WhatsAppAccount,
+	requestedContactID uuid.UUID,
+) (campaignRecipientDelivery, error) {
+	delivery, err := w.prepareCampaignRecipient(
+		ctx,
+		job,
+		campaign,
+		requestedContactID,
+	)
+	if err != nil || delivery.alreadyProcessed || delivery.consentRejected ||
+		delivery.ambiguous || delivery.message == nil {
+		return delivery, err
+	}
+	return w.attemptPreparedCampaignDelivery(ctx, job, campaign, account, requestedContactID, delivery)
+}
+
+func (w *Worker) prepareCampaignRecipient(
+	ctx context.Context,
+	job *queue.RecipientJob,
+	campaign *models.BulkMessageCampaign,
+	requestedContactID uuid.UUID,
+) (campaignRecipientDelivery, error) {
+	var delivery campaignRecipientDelivery
+	if campaign == nil || campaign.Template == nil {
+		return delivery, errors.New("campaign template is required")
 	}
 
-	// Send template message
-	waMessageID, err := w.sendTemplateMessage(ctx, &account, campaign.Template, recipient, campaign.HeaderMediaID, campaign.HeaderMediaFilename)
+	err := w.campaignCanonicalContactTransaction(
+		ctx,
+		job.OrganizationID,
+		func(tx *gorm.DB, deliveryAttempted *bool) error {
+			delivery = campaignRecipientDelivery{}
 
-	// Create Message record
+			var storedRecipient models.BulkMessageRecipient
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND campaign_id = ?", job.RecipientID, job.CampaignID).
+				First(&storedRecipient).Error; err != nil {
+				return fmt.Errorf("lock campaign recipient: %w", err)
+			}
+			if storedRecipient.Status != models.MessageStatusPending {
+				delivery.alreadyProcessed = true
+				return nil
+			}
+			if storedRecipient.MessageID != nil {
+				var claimedMessage models.Message
+				if err := tx.Where(
+					"id = ? AND organization_id = ?",
+					*storedRecipient.MessageID,
+					job.OrganizationID,
+				).First(&claimedMessage).Error; err != nil {
+					return fmt.Errorf("load claimed campaign message: %w", err)
+				}
+				if err := finalizePreparedCampaignDeliveryTx(
+					tx,
+					job,
+					&claimedMessage,
+					models.MessageStatusFailed,
+					"",
+					campaignAmbiguousDeliveryMessage,
+					"failed_count",
+				); err != nil {
+					return err
+				}
+				claimedMessage.Status = models.MessageStatusFailed
+				claimedMessage.ErrorMessage = campaignAmbiguousDeliveryMessage
+				delivery.message = &claimedMessage
+				delivery.contactID = claimedMessage.ContactID
+				delivery.ambiguous = true
+				return nil
+			}
+
+			contact, err := contactutil.ResolveCanonicalContactForUpdate(
+				tx,
+				job.OrganizationID,
+				requestedContactID,
+			)
+			if err != nil {
+				return fmt.Errorf("resolve canonical campaign contact: %w", err)
+			}
+			delivery.contactID = contact.ID
+
+			if strings.EqualFold(campaign.Template.Category, "MARKETING") &&
+				contact.MarketingOptOut {
+				recipientUpdate := tx.Model(&models.BulkMessageRecipient{}).
+					Where(
+						"id = ? AND campaign_id = ? AND status = ?",
+						job.RecipientID,
+						job.CampaignID,
+						models.MessageStatusPending,
+					).
+					Updates(map[string]any{
+						"status":               models.MessageStatusFailed,
+						"whats_app_message_id": "",
+						"message_id":           nil,
+						"error_message":        campaignMarketingOptOutMessage,
+						"sent_at":              nil,
+					})
+				if recipientUpdate.Error != nil {
+					return fmt.Errorf("record campaign consent rejection: %w", recipientUpdate.Error)
+				}
+				if recipientUpdate.RowsAffected != 1 {
+					return errors.New("campaign recipient changed before consent rejection")
+				}
+				if err := incrementCampaignCountTx(
+					tx,
+					job.OrganizationID,
+					job.CampaignID,
+					"failed_count",
+				); err != nil {
+					return err
+				}
+				delivery.consentRejected = true
+				return nil
+			}
+
+			message := campaignMessage(job, campaign, contact.ID)
+			if err := tx.Create(&message).Error; err != nil {
+				return fmt.Errorf("create pending campaign message: %w", err)
+			}
+			recipientUpdate := tx.Model(&models.BulkMessageRecipient{}).
+				Where(
+					"id = ? AND campaign_id = ? AND status = ? AND message_id IS NULL",
+					job.RecipientID,
+					job.CampaignID,
+					models.MessageStatusPending,
+				).
+				Updates(map[string]any{
+					"message_id":    message.ID,
+					"error_message": "",
+				})
+			if recipientUpdate.Error != nil {
+				return fmt.Errorf("claim campaign recipient: %w", recipientUpdate.Error)
+			}
+			if recipientUpdate.RowsAffected != 1 {
+				return errors.New("campaign recipient changed before delivery claim")
+			}
+
+			delivery.message = &message
+			return nil
+		},
+	)
+	return delivery, err
+}
+
+func (w *Worker) attemptPreparedCampaignDelivery(
+	ctx context.Context,
+	job *queue.RecipientJob,
+	campaign *models.BulkMessageCampaign,
+	account *models.WhatsAppAccount,
+	requestedContactID uuid.UUID,
+	prepared campaignRecipientDelivery,
+) (campaignRecipientDelivery, error) {
+	delivery := prepared
+	providerAttempted := false
+	var waMessageID string
+	var sendErr error
+	err := w.campaignCanonicalContactTransaction(
+		ctx,
+		job.OrganizationID,
+		func(tx *gorm.DB, deliveryAttempted *bool) error {
+			var storedRecipient models.BulkMessageRecipient
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND campaign_id = ?", job.RecipientID, job.CampaignID).
+				First(&storedRecipient).Error; err != nil {
+				return fmt.Errorf("lock claimed campaign recipient: %w", err)
+			}
+			if storedRecipient.Status != models.MessageStatusPending ||
+				storedRecipient.MessageID == nil ||
+				*storedRecipient.MessageID != prepared.message.ID {
+				delivery.alreadyProcessed = true
+				return nil
+			}
+
+			contact, err := contactutil.ResolveCanonicalContactForUpdate(
+				tx,
+				job.OrganizationID,
+				requestedContactID,
+			)
+			if err != nil {
+				return fmt.Errorf("resolve canonical claimed contact: %w", err)
+			}
+			delivery.contactID = contact.ID
+
+			var message models.Message
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND organization_id = ?", prepared.message.ID, job.OrganizationID).
+				First(&message).Error; err != nil {
+				return fmt.Errorf("lock claimed campaign message: %w", err)
+			}
+			if message.Status != models.MessageStatusPending {
+				delivery.message = &message
+				delivery.alreadyProcessed = true
+				return nil
+			}
+			if message.ContactID != contact.ID {
+				if err := tx.Model(&models.Message{}).
+					Where("id = ? AND organization_id = ?", message.ID, job.OrganizationID).
+					Update("contact_id", contact.ID).Error; err != nil {
+					return fmt.Errorf("move claimed campaign message to canonical contact: %w", err)
+				}
+				message.ContactID = contact.ID
+			}
+
+			if strings.EqualFold(campaign.Template.Category, "MARKETING") &&
+				contact.MarketingOptOut {
+				if err := finalizePreparedCampaignDeliveryTx(
+					tx,
+					job,
+					&message,
+					models.MessageStatusFailed,
+					"",
+					campaignMarketingOptOutMessage,
+					"failed_count",
+				); err != nil {
+					return err
+				}
+				message.Status = models.MessageStatusFailed
+				message.ErrorMessage = campaignMarketingOptOutMessage
+				delivery.message = &message
+				delivery.consentRejected = true
+				return nil
+			}
+
+			recipient := &models.BulkMessageRecipient{
+				PhoneNumber:    contact.PhoneNumber,
+				RecipientName:  job.RecipientName,
+				TemplateParams: job.TemplateParams,
+				HeaderParams:   job.HeaderParams,
+			}
+			*deliveryAttempted = true
+			providerAttempted = true
+			waMessageID, sendErr = w.sendTemplateMessage(
+				ctx,
+				account,
+				campaign.Template,
+				recipient,
+				campaign.HeaderMediaID,
+				campaign.HeaderMediaFilename,
+			)
+
+			status := models.MessageStatusSent
+			counter := "sent_count"
+			errorMessage := ""
+			if sendErr != nil {
+				status = models.MessageStatusFailed
+				counter = "failed_count"
+				errorMessage = sendErr.Error()
+			}
+			if err := finalizePreparedCampaignDeliveryTx(
+				tx,
+				job,
+				&message,
+				status,
+				waMessageID,
+				errorMessage,
+				counter,
+			); err != nil {
+				return err
+			}
+			message.Status = status
+			message.WhatsAppMessageID = waMessageID
+			message.ErrorMessage = errorMessage
+			delivery.message = &message
+			delivery.sendErr = sendErr
+			return nil
+		},
+	)
+	if err == nil {
+		return delivery, nil
+	}
+	if !providerAttempted {
+		return delivery, err
+	}
+
+	recovered, recoveryErr := w.recoverCampaignDelivery(
+		ctx,
+		job,
+		prepared.message.ID,
+		waMessageID,
+		sendErr,
+	)
+	if recoveryErr != nil {
+		return delivery, fmt.Errorf(
+			"persist provider-attempt result after transaction failure: %w (original error: %v)",
+			recoveryErr,
+			err,
+		)
+	}
+	return recovered, nil
+}
+
+func (w *Worker) recoverCampaignDelivery(
+	ctx context.Context,
+	job *queue.RecipientJob,
+	messageID uuid.UUID,
+	waMessageID string,
+	sendErr error,
+) (campaignRecipientDelivery, error) {
+	var delivery campaignRecipientDelivery
+	err := w.withRecipientTenantTransaction(
+		ctx,
+		job.OrganizationID,
+		func(tx *gorm.DB) error {
+			var recipient models.BulkMessageRecipient
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND campaign_id = ?", job.RecipientID, job.CampaignID).
+				First(&recipient).Error; err != nil {
+				return err
+			}
+			var message models.Message
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND organization_id = ?", messageID, job.OrganizationID).
+				First(&message).Error; err != nil {
+				return err
+			}
+			delivery.message = &message
+			delivery.contactID = message.ContactID
+			if recipient.Status != models.MessageStatusPending {
+				delivery.alreadyProcessed = true
+				if message.Status == models.MessageStatusFailed && message.ErrorMessage != "" {
+					delivery.sendErr = errors.New(message.ErrorMessage)
+				}
+				return nil
+			}
+			if recipient.MessageID == nil || *recipient.MessageID != messageID {
+				return errors.New("campaign delivery claim changed before recovery")
+			}
+
+			status := models.MessageStatusSent
+			counter := "sent_count"
+			errorMessage := ""
+			if sendErr != nil {
+				status = models.MessageStatusFailed
+				counter = "failed_count"
+				errorMessage = sendErr.Error()
+			}
+			if err := finalizePreparedCampaignDeliveryTx(
+				tx,
+				job,
+				&message,
+				status,
+				waMessageID,
+				errorMessage,
+				counter,
+			); err != nil {
+				return err
+			}
+			message.Status = status
+			message.WhatsAppMessageID = waMessageID
+			message.ErrorMessage = errorMessage
+			delivery.message = &message
+			delivery.sendErr = sendErr
+			return nil
+		},
+	)
+	return delivery, err
+}
+
+func finalizePreparedCampaignDeliveryTx(
+	tx *gorm.DB,
+	job *queue.RecipientJob,
+	message *models.Message,
+	status models.MessageStatus,
+	waMessageID, errorMessage, counter string,
+) error {
+	messageUpdate := tx.Model(&models.Message{}).
+		Where("id = ? AND organization_id = ?", message.ID, job.OrganizationID).
+		Updates(map[string]any{
+			"whats_app_message_id": waMessageID,
+			"status":               status,
+			"error_message":        errorMessage,
+		})
+	if messageUpdate.Error != nil {
+		return fmt.Errorf("finalize campaign message: %w", messageUpdate.Error)
+	}
+	if messageUpdate.RowsAffected != 1 {
+		return errors.New("pending campaign message changed before finalization")
+	}
+
+	var sentAt any
+	if status == models.MessageStatusSent {
+		sentAt = time.Now().UTC()
+	}
+	recipientUpdate := tx.Model(&models.BulkMessageRecipient{}).
+		Where(
+			"id = ? AND campaign_id = ? AND status = ? AND message_id = ?",
+			job.RecipientID,
+			job.CampaignID,
+			models.MessageStatusPending,
+			message.ID,
+		).
+		Updates(map[string]any{
+			"status":               status,
+			"whats_app_message_id": waMessageID,
+			"error_message":        errorMessage,
+			"sent_at":              sentAt,
+		})
+	if recipientUpdate.Error != nil {
+		return fmt.Errorf("finalize campaign recipient: %w", recipientUpdate.Error)
+	}
+	if recipientUpdate.RowsAffected != 1 {
+		return errors.New("campaign recipient changed before finalization")
+	}
+	return incrementCampaignCountTx(
+		tx,
+		job.OrganizationID,
+		job.CampaignID,
+		counter,
+	)
+}
+
+func campaignMessage(
+	job *queue.RecipientJob,
+	campaign *models.BulkMessageCampaign,
+	contactID uuid.UUID,
+) models.Message {
 	message := models.Message{
-		OrganizationID:    job.OrganizationID,
-		WhatsAppAccount:   campaign.WhatsAppAccount,
-		ContactID:         contact.ID,
-		WhatsAppMessageID: waMessageID,
-		Direction:         models.DirectionOutgoing,
-		MessageType:       models.MessageTypeTemplate,
-		TemplateParams:    job.TemplateParams,
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  job.OrganizationID,
+		WhatsAppAccount: campaign.WhatsAppAccount,
+		ContactID:       contactID,
+		Direction:       models.DirectionOutgoing,
+		MessageType:     models.MessageTypeTemplate,
+		Status:          models.MessageStatusPending,
+		TemplateName:    campaign.Template.Name,
+		TemplateParams:  job.TemplateParams,
+		Content: templateutil.ReplaceWithJSONBParams(
+			campaign.Template.BodyContent,
+			campaign.Template.BodyContent,
+			job.TemplateParams,
+		),
 		Metadata: models.JSONB{
 			"campaign_id":    job.CampaignID.String(),
 			"recipient_name": job.RecipientName,
 		},
 	}
-	if campaign.Template != nil {
-		message.TemplateName = campaign.Template.Name
-		content := templateutil.ReplaceWithJSONBParams(campaign.Template.BodyContent, campaign.Template.BodyContent, job.TemplateParams)
-		message.Content = content
-		// Store campaign header media so it renders in the chat bubble
-		if campaign.HeaderMediaLocalPath != "" {
-			message.MediaURL = campaign.HeaderMediaLocalPath
-			message.MediaMimeType = campaign.HeaderMediaMimeType
+	if campaign.HeaderMediaLocalPath != "" {
+		message.MediaURL = campaign.HeaderMediaLocalPath
+		message.MediaMimeType = campaign.HeaderMediaMimeType
+	}
+	return message
+}
+
+func incrementCampaignCountTx(
+	tx *gorm.DB,
+	organizationID, campaignID uuid.UUID,
+	column string,
+) error {
+	result := tx.Model(&models.BulkMessageCampaign{}).
+		Where("id = ? AND organization_id = ?", campaignID, organizationID).
+		Update(column, gorm.Expr(column+" + 1"))
+	if result.Error != nil {
+		return fmt.Errorf("increment campaign %s: %w", column, result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("increment campaign %s: campaign was not found", column)
+	}
+	return nil
+}
+
+func (w *Worker) campaignCanonicalContactTransaction(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	write func(tx *gorm.DB, deliveryAttempted *bool) error,
+) error {
+	var err error
+	for attempt := 0; attempt < campaignCanonicalContactAttempts; attempt++ {
+		deliveryAttempted := false
+		err = w.withRecipientTenantTransaction(ctx, organizationID, func(tx *gorm.DB) error {
+			return write(tx, &deliveryAttempted)
+		})
+		if err == nil || deliveryAttempted || !retryableCampaignContactWrite(err) {
+			return err
 		}
 	}
+	return err
+}
 
-	if err != nil {
-		w.Log.Error("Failed to send message", "error", err, "recipient", job.PhoneNumber)
-		message.Status = models.MessageStatusFailed
-		message.ErrorMessage = err.Error()
-		w.updateRecipientStatus(job.RecipientID, models.MessageStatusFailed, "", err.Error())
-		w.incrementCampaignCount(job.CampaignID, "failed_count")
-	} else {
-		w.Log.Info("Message sent", "recipient", job.PhoneNumber, "message_id", waMessageID)
-		message.Status = models.MessageStatusSent
-		w.updateRecipientStatus(job.RecipientID, models.MessageStatusSent, waMessageID, "")
-		w.incrementCampaignCount(job.CampaignID, "sent_count")
+// withRecipientTenantTransaction always begins a top-level phase from the
+// worker pool. Under RLS this gives prepare, provider-attempt, recovery and
+// finish independent commits instead of savepoints inside one tenant wrapper.
+func (w *Worker) withRecipientTenantTransaction(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	write func(tx *gorm.DB) error,
+) error {
+	db := w.DB.WithContext(ctx)
+	if w.Config != nil && w.Config.Database.RLSEnabled {
+		return database.WithTenant(db, organizationID, write)
 	}
+	return db.Transaction(write)
+}
 
-	// Save message record
-	if err := w.DB.Create(&message).Error; err != nil {
-		w.Log.Error("Failed to save message", "error", err, "recipient", job.PhoneNumber)
-	} else if _, err := channelapi.MirrorLegacyWhatsAppMessage(
-		w.DB,
-		channelapi.LegacyMetaAccountRef{
-			ID:             account.ID,
-			OrganizationID: account.OrganizationID,
-			Name:           account.Name,
-			Status:         account.Status,
-		},
-		message.ID,
-	); err != nil {
-		// Delivery remains authoritative. The idempotent migration backfill can
-		// repair a transient omnichannel mirror failure without resending.
-		w.Log.Error(
-			"Failed to mirror campaign message into omnichannel inbox",
-			"error",
-			err,
-			"organization_id",
-			account.OrganizationID,
-			"message_id",
-			message.ID,
-		)
+func retryableCampaignContactWrite(err error) bool {
+	if errors.Is(err, contactutil.ErrCanonicalContactChanged) {
+		return true
 	}
-
-	// Check if campaign is complete (all recipients processed)
-	w.checkCampaignCompletion(ctx, job.CampaignID, job.OrganizationID)
-
-	return nil
+	var sqlState interface {
+		SQLState() string
+	}
+	if !errors.As(err, &sqlState) {
+		return false
+	}
+	switch sqlState.SQLState() {
+	case "40001", "40P01":
+		return true
+	default:
+		return false
+	}
 }
 
 // updateRecipientStatus updates the recipient's status in the database

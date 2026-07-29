@@ -101,7 +101,7 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: 'nav.sectionGrowth',
-    permissions: ['crm.leads', 'tasks', 'bookings', 'packages', 'payments', 'copilot'],
+    permissions: ['crm.leads', 'crm.automations', 'tasks', 'bookings', 'packages', 'payments', 'copilot'],
     items: [
       {
         name: 'nav.pipeline',
@@ -116,6 +116,20 @@ export const navigationSections: NavSection[] = [
         path: '/crm/tasks',
         icon: ListTodo,
         permission: 'tasks',
+        entitlement: 'crm.enabled'
+      },
+      {
+        name: 'nav.crmInsights',
+        path: '/crm/insights',
+        icon: LineChart,
+        anyPermissions: ['crm.leads', 'tasks', 'bookings', 'packages', 'payments'],
+        entitlement: 'crm.enabled'
+      },
+      {
+        name: 'nav.automations',
+        path: '/crm/automations',
+        icon: Zap,
+        permission: 'crm.automations',
         entitlement: 'crm.enabled'
       },
       {

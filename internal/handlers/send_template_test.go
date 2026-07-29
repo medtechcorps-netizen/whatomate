@@ -788,3 +788,69 @@ func TestApp_SendTemplateMessage(t *testing.T) {
 		assert.False(t, hasInteractive, "interactive_data should not be present for template without buttons")
 	})
 }
+
+func TestApp_SendTemplateMessage_RequiresChatWrite(t *testing.T) {
+	mockServer := newMockWhatsAppServer()
+	defer mockServer.close()
+
+	app := newMsgTestApp(t, mockServer)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleExact(
+		t,
+		app.DB,
+		org.ID,
+		"template-no-chat-write",
+		false,
+		false,
+		nil,
+	)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	req := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.SendTemplateMessage(req))
+	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+	assert.Empty(t, mockServer.sentMessages)
+}
+
+func TestApp_SendTemplateMessage_MapsCanonicalMarketingOptOutToBadRequest(t *testing.T) {
+	mockServer := newMockWhatsAppServer()
+	defer mockServer.close()
+
+	app := newMsgTestApp(t, mockServer)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	account := createTestAccount(t, app, org.ID)
+	contact := testutil.CreateTestContactWith(
+		t,
+		app.DB,
+		org.ID,
+		testutil.WithContactAccount(account.Name),
+	)
+	require.NoError(t, app.DB.Model(contact).Update("marketing_opt_out", true).Error)
+	template := createTestTemplate(t, app, org.ID, account.Name)
+	require.NoError(t, app.DB.Model(template).Update("category", "MARKETING").Error)
+	template.Category = "MARKETING"
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"contact_id":    contact.ID.String(),
+		"template_name": template.Name,
+		"template_params": map[string]string{
+			"name":     "Alice",
+			"order_id": "ORD-42",
+		},
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.SendTemplateMessage(req))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+	app.WaitForBackgroundTasks()
+	assert.Empty(t, mockServer.sentMessages)
+
+	var messageCount int64
+	require.NoError(t, app.DB.Model(&models.Message{}).
+		Where("organization_id = ? AND contact_id = ?", org.ID, contact.ID).
+		Count(&messageCount).Error)
+	assert.Zero(t, messageCount)
+}

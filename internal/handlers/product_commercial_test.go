@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
+	"gorm.io/gorm/clause"
 )
 
 func TestProductCommercialBuiltInWorkspaceTemplates(t *testing.T) {
@@ -375,6 +376,125 @@ func TestProductCommercialConsentValidationAndEvidenceRedactionBoundary(t *testi
 	_, err = productCommercialValidateConsent(&request)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must not contain credentials or secrets")
+}
+
+func TestRecordConsentWaitsForMergeAndWritesCanonicalIdentity(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	adminRole := testutil.CreateAdminRole(t, db, organization.ID)
+	user := testutil.CreateTestUser(
+		t,
+		db,
+		organization.ID,
+		testutil.WithRoleID(&adminRole.ID),
+	)
+	canonical := testutil.CreateTestContact(t, db, organization.ID)
+	alias := testutil.CreateTestContact(t, db, organization.ID)
+	app := &App{DB: db, Log: testutil.NopLogger()}
+
+	priorCapturedAt := time.Now().UTC().Add(-time.Hour)
+	priorEvent := models.ConsentEvent{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: organization.ID,
+		ContactID:      &alias.ID,
+		SubjectType:    "contact",
+		SubjectKey:     alias.ID.String(),
+		Purpose:        string(models.ChannelPreferencePurposeService),
+		Channel:        string(models.ChannelWhatsApp),
+		Action:         models.ConsentActionGranted,
+		Source:         "pre-merge-test",
+		ActorUserID:    &user.ID,
+		Evidence:       models.JSONB{},
+		CapturedAt:     priorCapturedAt,
+	}
+	require.NoError(t, db.Create(&priorEvent).Error)
+
+	mergeTx := db.Begin()
+	require.NoError(t, mergeTx.Error)
+	t.Cleanup(func() {
+		_ = mergeTx.Rollback().Error
+	})
+	var locked []models.Contact
+	require.NoError(t, mergeTx.Unscoped().
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("organization_id = ? AND id IN ?", organization.ID, []uuid.UUID{
+			canonical.ID,
+			alias.ID,
+		}).
+		Order("id").
+		Find(&locked).Error)
+	require.Len(t, locked, 2)
+	mergedAt := time.Now().UTC()
+	require.NoError(t, mergeTx.Unscoped().Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", alias.ID, organization.ID).
+		Updates(map[string]any{
+			"merged_into_id": canonical.ID,
+			"merged_at":      mergedAt,
+			"merged_by_id":   user.ID,
+			"deleted_at":     mergedAt,
+		}).Error)
+
+	request := testutil.NewJSONRequest(t, RecordConsentRequest{
+		ContactID: &alias.ID,
+		Purpose:   string(models.ChannelPreferencePurposeService),
+		Channel:   string(models.ChannelWhatsApp),
+		Action:    models.ConsentActionDenied,
+		Source:    "post-merge-test",
+		Evidence:  models.JSONB{"case": "stale-alias"},
+	})
+	testutil.SetAuthContext(request, organization.ID, user.ID)
+	recorded := make(chan error, 1)
+	go func() {
+		recorded <- app.RecordConsent(request)
+	}()
+
+	select {
+	case err := <-recorded:
+		require.NoError(t, err)
+		t.Fatal("RecordConsent completed before the contact merge released its row locks")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	require.NoError(t, mergeTx.Commit().Error)
+	select {
+	case err := <-recorded:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("RecordConsent did not resume after the contact merge committed")
+	}
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+
+	var storedPrior models.ConsentEvent
+	require.NoError(t, db.First(&storedPrior, priorEvent.ID).Error)
+	require.NotNil(t, storedPrior.ContactID)
+	require.Equal(t, alias.ID, *storedPrior.ContactID,
+		"immutable consent history must retain its original contact identity")
+
+	var currentEvent models.ConsentEvent
+	require.NoError(t, db.Where(
+		"organization_id = ? AND source = ?",
+		organization.ID,
+		"post-merge-test",
+	).First(&currentEvent).Error)
+	require.NotNil(t, currentEvent.ContactID)
+	require.Equal(t, canonical.ID, *currentEvent.ContactID)
+	require.Equal(t, canonical.ID.String(), currentEvent.SubjectKey)
+
+	var state models.ConsentState
+	require.NoError(t, db.Where(
+		"organization_id = ? AND latest_event_id = ?",
+		organization.ID,
+		currentEvent.ID,
+	).First(&state).Error)
+	require.NotNil(t, state.ContactID)
+	require.Equal(t, canonical.ID, *state.ContactID)
+	require.Equal(t, canonical.ID.String(), state.SubjectKey)
+
+	var aliasStateCount int64
+	require.NoError(t, db.Model(&models.ConsentState{}).
+		Where("organization_id = ? AND contact_id = ?", organization.ID, alias.ID).
+		Count(&aliasStateCount).Error)
+	require.Zero(t, aliasStateCount)
 }
 
 func TestProductCommercialWorkflowTransitions(t *testing.T) {

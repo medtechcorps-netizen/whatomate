@@ -26,7 +26,7 @@ export class ChatPage extends BasePage {
     this.attachButton = page.getByRole('button').filter({ has: page.locator('.lucide-paperclip') })
     this.emojiButton = page.getByRole('button').filter({ has: page.locator('.lucide-smile') })
     this.cannedResponsesButton = page.locator('#canned-response-picker-button')
-    this.contactInfoPanel = page.locator('.contact-info, [data-testid="contact-info"]')
+    this.contactInfoPanel = page.locator('[data-testid="customer-revenue-workspace"]').first()
     this.messageList = page.locator('.messages-container, [data-testid="messages"]')
     this.assignDialog = page.locator('[role="dialog"][data-state="open"]')
     this.mediaDialog = page.locator('[role="dialog"][data-state="open"]').filter({ hasText: /Send|Upload|Media/i })
@@ -153,7 +153,10 @@ export class ChatPage extends BasePage {
 
   // Contact actions
   async openContactInfo() {
-    await this.page.getByRole('button').filter({ has: this.page.locator('.lucide-info') }).click()
+    if (!(await this.contactInfoPanel.isVisible())) {
+      await this.page.locator('#info-button').click()
+    }
+    await expect(this.contactInfoPanel).toBeVisible()
   }
 
   async assignContact() {

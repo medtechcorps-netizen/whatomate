@@ -99,7 +99,12 @@ const isSavingWidget = ref(false)
 const deleteDialogOpen = ref(false)
 const widgetToDelete = ref<DashboardWidget | null>(null)
 
-const dataSources = ref<Array<{ name: string; label: string; fields: string[] }>>([])
+const dataSources = ref<Array<{
+  name: string
+  label: string
+  fields: string[]
+  aggregate_fields: string[]
+}>>([])
 const metrics = ref<string[]>([])
 const displayTypes = ref<string[]>([])
 const operators = ref<Array<{ value: string; label: string }>>([])
@@ -476,6 +481,12 @@ const availableFields = computed(() => {
   return source?.fields || []
 })
 
+const availableAggregateFields = computed(() => {
+  if (!widgetForm.value.data_source) return []
+  const source = dataSources.value.find(s => s.name === widgetForm.value.data_source)
+  return source?.aggregate_fields || []
+})
+
 // Fetch data
 const fetchWidgets = async () => {
   try {
@@ -695,6 +706,20 @@ watch(() => widgetForm.value.display_type, (newVal) => {
     widgetForm.value.metric = 'count'
   }
 })
+
+watch(
+  [
+    () => widgetForm.value.data_source,
+    () => widgetForm.value.metric,
+    () => availableAggregateFields.value.join('|')
+  ],
+  () => {
+    const isAggregate = widgetForm.value.metric === 'sum' || widgetForm.value.metric === 'avg'
+    if (!isAggregate || !availableAggregateFields.value.includes(widgetForm.value.field)) {
+      widgetForm.value.field = ''
+    }
+  }
+)
 
 onMounted(() => {
   fetchDashboardData()
@@ -1145,8 +1170,31 @@ onMounted(() => {
               </SelectTrigger>
               <SelectContent class="bg-[#1a1a1a] border-white/[0.08] light:bg-white light:border-gray-200">
                 <SelectItem value="count" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">{{ $t('dashboard.metricCount') }}</SelectItem>
-                <SelectItem value="sum" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">{{ $t('dashboard.metricSum') }}</SelectItem>
-                <SelectItem value="avg" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">{{ $t('dashboard.metricAverage') }}</SelectItem>
+                <SelectItem v-if="availableAggregateFields.length > 0" value="sum" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">{{ $t('dashboard.metricSum') }}</SelectItem>
+                <SelectItem v-if="availableAggregateFields.length > 0" value="avg" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">{{ $t('dashboard.metricAverage') }}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <!-- Aggregate field (backend-whitelisted fields only) -->
+          <div
+            v-if="widgetForm.display_type !== 'shortcuts' && widgetForm.display_type !== 'table' && (widgetForm.metric === 'sum' || widgetForm.metric === 'avg')"
+            class="space-y-2"
+          >
+            <Label class="text-white/70 light:text-gray-700">{{ $t('dashboard.field') }} *</Label>
+            <Select :model-value="widgetForm.field" @update:model-value="(val) => widgetForm.field = String(val)">
+              <SelectTrigger class="bg-white/[0.04] border-white/[0.1] text-white light:bg-white light:border-gray-300 light:text-gray-900">
+                <SelectValue :placeholder="$t('dashboard.field')" />
+              </SelectTrigger>
+              <SelectContent class="bg-[#1a1a1a] border-white/[0.08] light:bg-white light:border-gray-200">
+                <SelectItem
+                  v-for="field in availableAggregateFields"
+                  :key="field"
+                  :value="field"
+                  class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100"
+                >
+                  {{ field }}
+                </SelectItem>
               </SelectContent>
             </Select>
           </div>

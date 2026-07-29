@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
 	"github.com/shridarpatil/whatomate/internal/utils"
@@ -18,6 +21,8 @@ import (
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ============================================================================
@@ -99,6 +104,23 @@ type MessageSendOptions struct {
 	MarkIncomingRead bool
 }
 
+var (
+	errOutgoingContactNotFound      = errors.New("outgoing message contact not found")
+	errOutgoingContactAccessRevoked = errors.New("outgoing message contact access revoked")
+	errOutgoingReplyInvalid         = errors.New("outgoing reply message is invalid")
+)
+
+// OutgoingConsentError identifies an outbound message rejected by the
+// canonical contact's current consent state. Callers can use errors.As to map
+// this policy decision to a client error without string matching.
+type OutgoingConsentError struct {
+	ContactID uuid.UUID
+}
+
+func (e *OutgoingConsentError) Error() string {
+	return "contact has opted out of marketing messages"
+}
+
 // DefaultSendOptions returns options suitable for agent UI sends
 func DefaultSendOptions() MessageSendOptions {
 	return MessageSendOptions{
@@ -143,20 +165,148 @@ func SLASendOptions() MessageSendOptions {
 // SendOutgoingMessage is the unified method for sending all types of WhatsApp messages.
 // It handles: text, media (image/video/audio/document), interactive (buttons/list/cta_url), and template messages.
 func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageRequest, opts MessageSendOptions) (*models.Message, error) {
-	// 1. Create message record
-	msg := a.createOutgoingMessage(req, opts)
-
-	// Save to database
-	if err := a.DB.Create(msg).Error; err != nil {
-		a.Log.Error("Failed to create message", "error", err)
-		return nil, fmt.Errorf("failed to create message: %w", err)
+	if req.Account == nil || req.Account.OrganizationID == uuid.Nil {
+		return nil, errors.New("WhatsApp account is required")
 	}
-	a.mirrorLegacyWhatsAppMessage(req.Account, msg.ID)
+	if req.Contact == nil || req.Contact.ID == uuid.Nil {
+		return nil, fmt.Errorf("%w: contact is required", errOutgoingContactNotFound)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	organizationID := req.Account.OrganizationID
+	requestedContactID := req.Contact.ID
+	preview := a.getMessagePreview(req)
+	var (
+		msg              *models.Message
+		canonicalContact models.Contact
+		validatedReply   *models.Message
+	)
+
+	// Message persistence and the contact-list preview are one fact. Resolve
+	// and lock the canonical contact in the same transaction so a concurrent
+	// merge cannot strand either write on a soft-deleted alias.
+	err := a.outgoingCanonicalTransaction(ctx, organizationID, func(tx *gorm.DB) error {
+		contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
+			tx,
+			organizationID,
+			requestedContactID,
+		)
+		if resolveErr != nil {
+			if errors.Is(resolveErr, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: %v", errOutgoingContactNotFound, resolveErr)
+			}
+			return resolveErr
+		}
+
+		if req.Type == models.MessageTypeTemplate &&
+			req.Template != nil &&
+			strings.EqualFold(req.Template.Category, "MARKETING") &&
+			contact.MarketingOptOut {
+			return &OutgoingConsentError{ContactID: contact.ID}
+		}
+
+		if opts.SentByUserID != nil {
+			if visibilityErr := a.lockOutgoingContactVisibility(
+				tx,
+				organizationID,
+				*opts.SentByUserID,
+				contact,
+			); visibilityErr != nil {
+				return visibilityErr
+			}
+		}
+
+		transactionalReq := req
+		transactionalReq.Contact = contact
+		validatedReply = nil
+		if req.ReplyToMessage != nil {
+			if req.ReplyToMessage.ID == uuid.Nil {
+				return fmt.Errorf("%w: reply message ID is required", errOutgoingReplyInvalid)
+			}
+			var reply models.Message
+			replyErr := tx.Where(
+				"id = ? AND organization_id = ? AND contact_id = ?",
+				req.ReplyToMessage.ID,
+				organizationID,
+				contact.ID,
+			).First(&reply).Error
+			if replyErr != nil {
+				if errors.Is(replyErr, gorm.ErrRecordNotFound) {
+					return fmt.Errorf(
+						"%w: reply message does not belong to this contact",
+						errOutgoingReplyInvalid,
+					)
+				}
+				return replyErr
+			}
+			validatedReply = &reply
+			transactionalReq.ReplyToMessage = validatedReply
+		}
+
+		candidate := a.createOutgoingMessage(transactionalReq, opts)
+		if createErr := tx.Create(candidate).Error; createErr != nil {
+			return fmt.Errorf("failed to create message: %w", createErr)
+		}
+
+		lastMessageAt := time.Now().UTC()
+		updateResult := tx.Model(&models.Contact{}).
+			Where(
+				"id = ? AND organization_id = ? AND merged_into_id IS NULL AND deleted_at IS NULL",
+				contact.ID,
+				organizationID,
+			).
+			Updates(map[string]any{
+				"last_message_at":      lastMessageAt,
+				"last_message_preview": preview,
+			})
+		if updateResult.Error != nil {
+			return updateResult.Error
+		}
+		if updateResult.RowsAffected != 1 {
+			return fmt.Errorf("%w: canonical contact changed before persistence", errOutgoingContactNotFound)
+		}
+
+		contact.LastMessageAt = &lastMessageAt
+		contact.LastMessagePreview = preview
+		msg = candidate
+		canonicalContact = *contact
+		return nil
+	})
+	if err != nil {
+		a.Log.Error(
+			"Failed to persist outgoing message",
+			"error", err,
+			"organization_id", organizationID,
+			"contact_id", requestedContactID,
+		)
+		return nil, err
+	}
+
+	req.Contact = &canonicalContact
+	req.ReplyToMessage = validatedReply
+	if mirrorErr := a.outgoingTenantTransaction(
+		ctx,
+		organizationID,
+		func(tx *gorm.DB) error {
+			a.scopedApp(tx, organizationID).
+				mirrorLegacyWhatsAppMessage(req.Account, msg.ID)
+			return nil
+		},
+	); mirrorErr != nil {
+		a.Log.Error(
+			"Failed to run legacy WhatsApp mirror phase",
+			"error", mirrorErr,
+			"organization_id", organizationID,
+			"message_id", msg.ID,
+		)
+	}
 
 	// 2. Define the send function based on message type
-	sendFn := func(sendCtx context.Context) (string, error) {
+	sendFn := func(sendCtx context.Context, deliveryContact *models.Contact) (string, error) {
 		waAccount := a.toWhatsAppAccount(req.Account)
-		rcpt := whatsapp.Recipient{Phone: req.Contact.PhoneNumber, BSUID: req.Contact.BSUID}
+		rcpt := whatsapp.Recipient{Phone: deliveryContact.PhoneNumber, BSUID: deliveryContact.BSUID}
 
 		// Get reply-to message ID if this is a reply
 		var replyToMsgID string
@@ -235,19 +385,52 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	// 3. Execute send (async or sync)
 	if opts.Async {
 		root := a.rootApp()
-		organizationID := req.Account.OrganizationID
 		root.wg.Add(1)
 		go func() {
 			defer root.wg.Done()
 			asyncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			wamid, sendErr := sendFn(asyncCtx)
 			if err := root.WithTenantApp(organizationID, func(scoped *App) error {
-				scoped.finalizeMessageSend(msg, req, opts, wamid, sendErr)
+				delivery, deliveryErr := scoped.deliverOutgoingMessage(
+					asyncCtx,
+					msg,
+					req,
+					opts,
+					sendFn,
+				)
+				deliveryReq := req
+				if delivery.contact.ID != uuid.Nil {
+					deliveryReq.Contact = &delivery.contact
+				}
+				if deliveryErr != nil {
+					if delivery.providerAttempted {
+						scoped.Log.Error(
+							"Provider delivery completed but its database result is unresolved; automatic resend is disabled",
+							"error", deliveryErr,
+							"organization_id", organizationID,
+							"message_id", msg.ID,
+						)
+						return nil
+					}
+					scoped.finalizeMessageSend(msg, deliveryReq, opts, "", deliveryErr, true)
+					return nil
+				}
+				finalErr := delivery.sendErr
+				if delivery.policyErr != nil {
+					finalErr = delivery.policyErr
+				}
+				scoped.finalizeMessageSend(
+					msg,
+					deliveryReq,
+					opts,
+					delivery.whatsAppMessageID,
+					finalErr,
+					false,
+				)
 				return nil
 			}); err != nil {
-				root.Log.Error("Failed to finalize asynchronous message in tenant transaction",
+				root.Log.Error("Failed to deliver asynchronous message in tenant transaction",
 					"error", err,
 					"organization_id", organizationID,
 					"message_id", msg.ID,
@@ -255,8 +438,38 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 			}
 		}()
 	} else {
-		wamid, err := sendFn(ctx)
-		a.finalizeMessageSend(msg, req, opts, wamid, err)
+		delivery, deliveryErr := a.deliverOutgoingMessage(ctx, msg, req, opts, sendFn)
+		if delivery.contact.ID != uuid.Nil {
+			req.Contact = &delivery.contact
+		}
+		if deliveryErr != nil {
+			if delivery.providerAttempted {
+				a.Log.Error(
+					"Provider delivery completed but its database result is unresolved; automatic resend is disabled",
+					"error", deliveryErr,
+					"organization_id", organizationID,
+					"message_id", msg.ID,
+				)
+				return msg, nil
+			}
+			a.finalizeMessageSend(msg, req, opts, "", deliveryErr, true)
+			return nil, deliveryErr
+		}
+		finalErr := delivery.sendErr
+		if delivery.policyErr != nil {
+			finalErr = delivery.policyErr
+		}
+		a.finalizeMessageSend(
+			msg,
+			req,
+			opts,
+			delivery.whatsAppMessageID,
+			finalErr,
+			false,
+		)
+		if delivery.policyErr != nil {
+			return nil, delivery.policyErr
+		}
 	}
 
 	// 4. Immediate actions (before send completes for async)
@@ -268,11 +481,302 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		a.UpdateContactChatbotMessage(req.Contact.ID)
 	}
 
-	// Update contact's last message
-	preview := a.getMessagePreview(req)
-	a.updateContactLastMessage(req.Contact, preview)
-
 	return msg, nil
+}
+
+type outgoingDeliveryResult struct {
+	contact           models.Contact
+	whatsAppMessageID string
+	sendErr           error
+	policyErr         error
+	providerAttempted bool
+}
+
+// deliverOutgoingMessage linearizes the final policy decision and provider
+// attempt against contact merges and consent updates. The pending Message was
+// durably created before this call. If persistence fails after the provider
+// attempt, recovery records the captured result without calling Meta again.
+func (a *App) deliverOutgoingMessage(
+	ctx context.Context,
+	msg *models.Message,
+	req OutgoingMessageRequest,
+	opts MessageSendOptions,
+	sendFn func(context.Context, *models.Contact) (string, error),
+) (outgoingDeliveryResult, error) {
+	var result outgoingDeliveryResult
+	if msg == nil || msg.ID == uuid.Nil {
+		return result, errors.New("pending outgoing message is required")
+	}
+
+	err := a.outgoingProviderTransaction(
+		ctx,
+		req.Account.OrganizationID,
+		func(tx *gorm.DB, providerAttempted *bool) error {
+			contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
+				tx,
+				req.Account.OrganizationID,
+				req.Contact.ID,
+			)
+			if resolveErr != nil {
+				if errors.Is(resolveErr, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("%w: %v", errOutgoingContactNotFound, resolveErr)
+				}
+				return resolveErr
+			}
+			result.contact = *contact
+
+			var stored models.Message
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where(
+					"id = ? AND organization_id = ?",
+					msg.ID,
+					req.Account.OrganizationID,
+				).
+				First(&stored).Error; err != nil {
+				return fmt.Errorf("lock pending outgoing message: %w", err)
+			}
+			if stored.Status != models.MessageStatusPending {
+				result.whatsAppMessageID = stored.WhatsAppMessageID
+				if stored.Status == models.MessageStatusFailed && stored.ErrorMessage != "" {
+					result.sendErr = errors.New(stored.ErrorMessage)
+				}
+				return nil
+			}
+
+			if opts.SentByUserID != nil {
+				if visibilityErr := a.lockOutgoingContactVisibility(
+					tx,
+					req.Account.OrganizationID,
+					*opts.SentByUserID,
+					contact,
+				); visibilityErr != nil {
+					result.policyErr = visibilityErr
+					return persistOutgoingDeliveryResult(
+						tx,
+						&stored,
+						contact.ID,
+						"",
+						visibilityErr,
+					)
+				}
+			}
+			if req.Type == models.MessageTypeTemplate &&
+				req.Template != nil &&
+				strings.EqualFold(req.Template.Category, "MARKETING") &&
+				contact.MarketingOptOut {
+				consentErr := &OutgoingConsentError{ContactID: contact.ID}
+				result.policyErr = consentErr
+				return persistOutgoingDeliveryResult(
+					tx,
+					&stored,
+					contact.ID,
+					"",
+					consentErr,
+				)
+			}
+
+			*providerAttempted = true
+			result.providerAttempted = true
+			result.whatsAppMessageID, result.sendErr = sendFn(ctx, contact)
+			return persistOutgoingDeliveryResult(
+				tx,
+				&stored,
+				contact.ID,
+				result.whatsAppMessageID,
+				result.sendErr,
+			)
+		},
+	)
+	if err == nil || !result.providerAttempted {
+		return result, err
+	}
+
+	if recoveryErr := a.recoverOutgoingDeliveryResult(ctx, msg, &result); recoveryErr != nil {
+		return result, fmt.Errorf(
+			"persist provider-attempt result after transaction failure: %w (original error: %v)",
+			recoveryErr,
+			err,
+		)
+	}
+	return result, nil
+}
+
+func persistOutgoingDeliveryResult(
+	tx *gorm.DB,
+	message *models.Message,
+	contactID uuid.UUID,
+	whatsAppMessageID string,
+	sendErr error,
+) error {
+	status := models.MessageStatusSent
+	errorMessage := ""
+	if sendErr != nil {
+		status = models.MessageStatusFailed
+		errorMessage = sendErr.Error()
+	}
+	update := tx.Model(&models.Message{}).
+		Where(
+			"id = ? AND organization_id = ? AND status = ?",
+			message.ID,
+			message.OrganizationID,
+			models.MessageStatusPending,
+		).
+		Updates(map[string]any{
+			"contact_id":           contactID,
+			"status":               status,
+			"whats_app_message_id": whatsAppMessageID,
+			"error_message":        errorMessage,
+		})
+	if update.Error != nil {
+		return fmt.Errorf("persist outgoing delivery result: %w", update.Error)
+	}
+	if update.RowsAffected != 1 {
+		return errors.New("pending outgoing message changed before delivery finalization")
+	}
+	return nil
+}
+
+func (a *App) recoverOutgoingDeliveryResult(
+	ctx context.Context,
+	pendingMessage *models.Message,
+	result *outgoingDeliveryResult,
+) error {
+	return a.outgoingTenantTransaction(
+		ctx,
+		pendingMessage.OrganizationID,
+		func(tx *gorm.DB) error {
+			var message models.Message
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where(
+					"id = ? AND organization_id = ?",
+					pendingMessage.ID,
+					pendingMessage.OrganizationID,
+				).
+				First(&message).Error; err != nil {
+				return err
+			}
+			if message.Status != models.MessageStatusPending {
+				result.whatsAppMessageID = message.WhatsAppMessageID
+				if message.Status == models.MessageStatusFailed && message.ErrorMessage != "" {
+					result.sendErr = errors.New(message.ErrorMessage)
+				}
+				return nil
+			}
+			return persistOutgoingDeliveryResult(
+				tx,
+				&message,
+				result.contact.ID,
+				result.whatsAppMessageID,
+				result.sendErr,
+			)
+		},
+	)
+}
+
+func (a *App) outgoingProviderTransaction(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	deliver func(tx *gorm.DB, providerAttempted *bool) error,
+) error {
+	var err error
+	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
+		providerAttempted := false
+		err = a.outgoingTenantTransaction(ctx, organizationID, func(tx *gorm.DB) error {
+			return deliver(tx, &providerAttempted)
+		})
+		if err == nil || providerAttempted || !isRetryableCanonicalContactWrite(err) {
+			return err
+		}
+	}
+	return err
+}
+
+func (a *App) outgoingCanonicalTransaction(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	write func(tx *gorm.DB) error,
+) error {
+	var err error
+	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
+		err = a.outgoingTenantTransaction(ctx, organizationID, write)
+		if !isRetryableCanonicalContactWrite(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// outgoingTenantTransaction normally starts from the root pool. In
+// particular, generic HTTP sends never become savepoints inside a request
+// Tenant transaction, so a provider attempt cannot be made durable or
+// ambiguous only at the mercy of a later outer commit. The inbound
+// continuation exception below uses its current transaction because a
+// separately committed action claim already provides its crash boundary.
+func (a *App) outgoingTenantTransaction(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	write func(tx *gorm.DB) error,
+) error {
+	// Inbound continuation processing already owns an RLS tenant transaction
+	// and may hold the canonical Contact lock before a chatbot response is
+	// sent. Re-entering through the root pool would wait on our own outer lock.
+	// Its separately committed action claim is the at-most-once boundary, so
+	// keep the pending Message, provider attempt, and result in that current
+	// transaction.
+	if a.inboundContinuation != nil &&
+		a.rlsEnabled() &&
+		a.tenantOrgID == organizationID &&
+		a.DB != nil {
+		return write(a.DB.WithContext(ctx))
+	}
+
+	root := a.rootApp()
+	db := root.DB.WithContext(ctx)
+	if root.rlsEnabled() {
+		return database.WithTenant(db, organizationID, write)
+	}
+	return db.Transaction(write)
+}
+
+// lockOutgoingContactVisibility rechecks an agent's live claim after the
+// canonical contact row is locked. Assignment is protected by that contact
+// lock; an active transfer is share-locked so it cannot be resumed between
+// authorization and message commit.
+func (a *App) lockOutgoingContactVisibility(
+	tx *gorm.DB,
+	orgID, userID uuid.UUID,
+	contact *models.Contact,
+) error {
+	if userID == uuid.Nil || contact == nil {
+		return errOutgoingContactAccessRevoked
+	}
+	if a.scopedApp(tx, orgID).HasPermission(
+		userID,
+		models.ResourceContacts,
+		models.ActionRead,
+		orgID,
+	) {
+		return nil
+	}
+	if contact.AssignedUserID != nil && *contact.AssignedUserID == userID {
+		return nil
+	}
+
+	var transfer models.AgentTransfer
+	err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
+		Select("id").
+		Where(
+			"organization_id = ? AND contact_id = ? AND agent_id = ? AND status = ?",
+			orgID,
+			contact.ID,
+			userID,
+			models.TransferStatusActive,
+		).
+		First(&transfer).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return errOutgoingContactAccessRevoked
+	}
+	return err
 }
 
 // ============================================================================
@@ -429,17 +933,28 @@ func (a *App) buildInteractiveData(req OutgoingMessageRequest) models.JSONB {
 	}
 }
 
-// finalizeMessageSend updates message status and triggers post-send actions
-func (a *App) finalizeMessageSend(msg *models.Message, req OutgoingMessageRequest, opts MessageSendOptions, wamid string, err error) {
+// finalizeMessageSend persists the result when requested and triggers
+// post-send actions. Policy-aware delivery normally persists inside the
+// canonical-contact transaction and passes persist=false.
+func (a *App) finalizeMessageSend(
+	msg *models.Message,
+	req OutgoingMessageRequest,
+	opts MessageSendOptions,
+	wamid string,
+	err error,
+	persist bool,
+) {
 	// Use Where instead of Model(msg) to avoid mutating the shared msg struct,
 	// which may be read concurrently by the caller when sending is async.
 	if err != nil {
 		errMsg := err.Error()
 
-		a.DB.Model(&models.Message{}).Where("id = ?", msg.ID).Updates(map[string]any{
-			"status":        models.MessageStatusFailed,
-			"error_message": errMsg,
-		})
+		if persist {
+			a.DB.Model(&models.Message{}).Where("id = ?", msg.ID).Updates(map[string]any{
+				"status":        models.MessageStatusFailed,
+				"error_message": errMsg,
+			})
+		}
 		a.Log.Error("Failed to send message", "error", err, "message_id", msg.ID, "type", msg.MessageType)
 
 		// Broadcast failure status via WebSocket so frontend updates immediately
@@ -457,10 +972,12 @@ func (a *App) finalizeMessageSend(msg *models.Message, req OutgoingMessageReques
 		return
 	}
 
-	a.DB.Model(&models.Message{}).Where("id = ?", msg.ID).Updates(map[string]any{
-		"status":               models.MessageStatusSent,
-		"whats_app_message_id": wamid,
-	})
+	if persist {
+		a.DB.Model(&models.Message{}).Where("id = ?", msg.ID).Updates(map[string]any{
+			"status":               models.MessageStatusSent,
+			"whats_app_message_id": wamid,
+		})
+	}
 	a.Log.Info("Message sent", "message_id", msg.ID, "wa_message_id", wamid, "type", msg.MessageType)
 
 	// Dispatch webhook for successful send
@@ -585,14 +1102,6 @@ func (a *App) dispatchMessageSentWebhook(account *models.WhatsAppAccount, contac
 	})
 }
 
-// updateContactLastMessage updates contact's last_message_at and preview
-func (a *App) updateContactLastMessage(contact *models.Contact, preview string) {
-	a.DB.Model(contact).Updates(map[string]any{
-		"last_message_at":      time.Now(),
-		"last_message_preview": preview,
-	})
-}
-
 // getMessagePreview returns a preview string for the message
 func (a *App) getMessagePreview(req OutgoingMessageRequest) string {
 	switch req.Type {
@@ -662,9 +1171,9 @@ type SendTemplateMessageRequest struct {
 // SendTemplateMessage sends a template message to a contact or phone number.
 // Accepts either JSON body or multipart/form-data (when a header media file is included).
 func (a *App) SendTemplateMessage(r *fastglue.Request) error {
-	orgID, userID, err := a.getOrgAndUserID(r)
+	orgID, userID, err := a.requireAuth(r, models.ResourceChat, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	var req SendTemplateMessageRequest
@@ -787,24 +1296,45 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 		}
 		contact = c
 	} else {
-		// Find or create contact from phone number
-		phoneNumber := req.PhoneNumber
-		var c models.Contact
-		err := a.DB.Where("phone_number = ? AND organization_id = ?", phoneNumber, orgID).First(&c).Error
+		// SendOutgoingMessage intentionally persists through top-level tenant
+		// phases. Resolve/create the phone-only contact through the same root
+		// boundary so it is committed and visible before those phases begin,
+		// rather than leaving it uncommitted in the HTTP tenant transaction.
+		var created bool
+		err := a.outgoingTenantTransaction(
+			context.Background(),
+			orgID,
+			func(tx *gorm.DB) error {
+				var resolveErr error
+				contact, created, resolveErr = contactutil.GetOrCreateContact(
+					tx,
+					orgID,
+					req.PhoneNumber,
+					"",
+				)
+				return resolveErr
+			},
+		)
 		if err != nil {
-			// Contact not found, create new one
-			c = models.Contact{
-				BaseModel:      models.BaseModel{ID: uuid.New()},
-				OrganizationID: orgID,
-				PhoneNumber:    phoneNumber,
-			}
-			if err := a.DB.Create(&c).Error; err != nil {
-				a.Log.Error("Failed to create contact", "error", err, "phone", phoneNumber)
-				return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create contact", nil, "")
-			}
-			a.Log.Info("Contact created from API", "contact_id", c.ID, "phone", phoneNumber)
+			a.Log.Error(
+				"Failed to find or create contact",
+				"error", err,
+				"phone", req.PhoneNumber,
+			)
+			return r.SendErrorEnvelope(
+				fasthttp.StatusInternalServerError,
+				"Failed to create contact",
+				nil,
+				"",
+			)
 		}
-		contact = &c
+		if created {
+			a.Log.Info(
+				"Contact created from API",
+				"contact_id", contact.ID,
+				"phone", contact.PhoneNumber,
+			)
+		}
 	}
 
 	// Determine which WhatsApp account to use (explicit > template > contact > default)
@@ -917,11 +1447,6 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 		}
 	}
 
-	// Check marketing opt-out
-	if contact.MarketingOptOut && strings.EqualFold(template.Category, "MARKETING") {
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Contact has opted out of marketing messages", nil, "")
-	}
-
 	// For authentication templates with OTP COPY_CODE buttons, Meta expects
 	// a button component with sub_type "url" and the OTP code as a text parameter.
 	// Auto-populate from template_params["1"] so callers don't need button_params.
@@ -971,6 +1496,10 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 	ctx := context.Background()
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
 	if err != nil {
+		var consentErr *OutgoingConsentError
+		if errors.As(err, &consentErr) {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, consentErr.Error(), nil, "")
+		}
 		a.Log.Error("Failed to send template message", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to send template message", nil, "")
 	}

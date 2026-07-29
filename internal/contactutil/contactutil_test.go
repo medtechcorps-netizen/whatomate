@@ -2,6 +2,7 @@ package contactutil
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -104,4 +105,53 @@ func TestGetOrCreateContact_UpdatesProfileName(t *testing.T) {
 	var reloaded models.Contact
 	require.NoError(t, db.First(&reloaded, contact.ID).Error)
 	assert.Equal(t, "New Name", reloaded.ProfileName)
+}
+
+func TestGetOrCreateContact_RoutesMergedAliasToCanonicalWithoutRestoring(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	uid := uuid.New().String()[:8]
+	org := models.Organization{
+		BaseModel: models.BaseModel{ID: uuid.New()},
+		Name:      "test-" + uid,
+		Slug:      "test-" + uid,
+	}
+	require.NoError(t, db.Create(&org).Error)
+
+	canonical := models.Contact{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		PhoneNumber:    "601100000001",
+		ProfileName:    "Canonical",
+	}
+	alias := models.Contact{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		PhoneNumber:    "601100000002",
+		ProfileName:    "Duplicate",
+	}
+	require.NoError(t, db.Create(&canonical).Error)
+	require.NoError(t, db.Create(&alias).Error)
+	now := time.Now().UTC()
+	require.NoError(t, db.Model(&alias).Updates(map[string]any{
+		"merged_into_id": canonical.ID,
+		"merged_at":      now,
+		"deleted_at":     now,
+	}).Error)
+
+	resolved, isNew, err := GetOrCreateContact(
+		db,
+		org.ID,
+		alias.PhoneNumber,
+		"Latest profile",
+	)
+	require.NoError(t, err)
+	require.False(t, isNew)
+	require.Equal(t, canonical.ID, resolved.ID)
+	require.Equal(t, "Latest profile", resolved.ProfileName)
+
+	var storedAlias models.Contact
+	require.NoError(t, db.Unscoped().First(&storedAlias, alias.ID).Error)
+	require.True(t, storedAlias.DeletedAt.Valid)
+	require.NotNil(t, storedAlias.MergedIntoID)
+	require.Equal(t, canonical.ID, *storedAlias.MergedIntoID)
 }

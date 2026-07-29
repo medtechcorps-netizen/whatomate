@@ -385,6 +385,29 @@ func runServer(args []string) {
 	go slaProcessor.Start(slaCtx)
 	lo.Info("SLA processor started")
 
+	// Start the durable care-continuity processor. It creates internal tasks
+	// and agent reminders only; it never sends customer messages.
+	careProcessor := handlers.NewCareContinuityProcessor(app, 30*time.Second)
+	careCtx, careCancel := context.WithCancel(context.Background())
+	go careProcessor.Start(careCtx)
+	lo.Info("Care continuity processor started")
+
+	// Execute immutable visual automation versions from the dedicated customer
+	// activity receipt stream. Multi-replica leases keep this safe when more
+	// than one API instance is running.
+	automationProcessor := handlers.NewAutomationPolicyProcessor(app, 5*time.Second)
+	automationCtx, automationCancel := context.WithCancel(context.Background())
+	go automationProcessor.Start(automationCtx)
+	lo.Info("Automation policy processor started")
+
+	// Recover the post-ACK media/chatbot side of inbound WhatsApp messages.
+	// The durable scheduled-job lease prevents duplicate replicas from
+	// processing the same WAMID concurrently.
+	inboundProcessor := handlers.NewInboundContinuationProcessor(app, 2*time.Second)
+	inboundCtx, inboundCancel := context.WithCancel(context.Background())
+	go inboundProcessor.Start(inboundCtx)
+	lo.Info("Inbound continuation processor started")
+
 	// Start embedded workers
 	var workers []*worker.Worker
 	var workerCancel context.CancelFunc
@@ -429,6 +452,25 @@ func runServer(args []string) {
 	lo.Info("Stopping campaign stats subscriber...")
 	app.StopCampaignStatsSubscriber()
 	lo.Info("Campaign stats subscriber stopped")
+
+	// Stop inbound continuation recovery.
+	lo.Info("Stopping inbound continuation processor...")
+	inboundCancel()
+	inboundProcessor.Stop()
+	lo.Info("Inbound continuation processor stopped")
+
+	// Stop visual automation before legacy care so neither can claim new
+	// customer lifecycle work during shutdown.
+	lo.Info("Stopping automation policy processor...")
+	automationCancel()
+	automationProcessor.Stop()
+	lo.Info("Automation policy processor stopped")
+
+	// Stop care continuity processor
+	lo.Info("Stopping care continuity processor...")
+	careCancel()
+	careProcessor.Stop()
+	lo.Info("Care continuity processor stopped")
 
 	// Stop SLA processor
 	lo.Info("Stopping SLA processor...")
@@ -826,6 +868,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/api/contacts", tenant((*handlers.App).ListContacts))
 	g.POST("/api/contacts", tenant((*handlers.App).CreateContact))
 	g.GET("/api/contacts/{id}", tenant((*handlers.App).GetContact))
+	g.GET("/api/contacts/{id}/workspace", tenant((*handlers.App).GetCustomerWorkspace))
+	g.GET("/api/contacts/{id}/activities", tenant((*handlers.App).ListCustomerActivities))
+	g.POST("/api/contacts/{id}/merge", tenant((*handlers.App).MergeContact))
 	g.PUT("/api/contacts/{id}", tenant((*handlers.App).UpdateContact))
 	g.DELETE("/api/contacts/{id}", tenant((*handlers.App).DeleteContact))
 	g.PUT("/api/contacts/{id}/assign", tenant((*handlers.App).AssignContact))
@@ -840,9 +885,26 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.DELETE("/api/crm/pipelines/{pipeline_id}/stages/{id}", tenant((*handlers.App).DeleteCRMPipelineStage))
 	g.GET("/api/crm/leads", tenant((*handlers.App).ListCRMLeads))
 	g.POST("/api/crm/leads", tenant((*handlers.App).CreateCRMLead))
+	g.GET("/api/crm/insights", tenant((*handlers.App).GetCRMInsights))
+	g.GET("/api/crm/segments", tenant((*handlers.App).ListCRMSystemSegments))
+	g.GET(
+		"/api/crm/segments/{key}/contacts",
+		tenant((*handlers.App).ListCRMSystemSegmentContacts),
+	)
 	g.GET("/api/crm/leads/{id}", tenant((*handlers.App).GetCRMLead))
 	g.PUT("/api/crm/leads/{id}", tenant((*handlers.App).UpdateCRMLead))
 	g.PUT("/api/crm/leads/{id}/move", tenant((*handlers.App).MoveCRMLead))
+	g.GET("/api/automation-policies/catalog", tenant((*handlers.App).GetAutomationPolicyCatalog))
+	g.GET("/api/automation-policies", tenant((*handlers.App).ListAutomationPolicies))
+	g.POST("/api/automation-policies", tenant((*handlers.App).CreateAutomationPolicy))
+	g.POST("/api/automation-policies/{id}/activate", tenant((*handlers.App).ActivateAutomationPolicy))
+	g.POST("/api/automation-policies/{id}/pause", tenant((*handlers.App).PauseAutomationPolicy))
+	g.POST("/api/automation-policies/{id}/preview", tenant((*handlers.App).PreviewAutomationPolicy))
+	g.GET("/api/automation-policies/{id}/versions", tenant((*handlers.App).ListAutomationPolicyVersions))
+	g.GET("/api/automation-policies/{id}/executions", tenant((*handlers.App).ListAutomationPolicyExecutions))
+	g.GET("/api/automation-policies/{id}", tenant((*handlers.App).GetAutomationPolicy))
+	g.PUT("/api/automation-policies/{id}", tenant((*handlers.App).UpdateAutomationPolicy))
+	g.DELETE("/api/automation-policies/{id}", tenant((*handlers.App).DeleteAutomationPolicy))
 	g.GET("/api/tasks", tenant((*handlers.App).ListFollowUpTasks))
 	g.GET("/api/tasks/summary", tenant((*handlers.App).GetFollowUpTaskSummary))
 	g.POST("/api/tasks", tenant((*handlers.App).CreateFollowUpTask))

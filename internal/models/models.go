@@ -373,10 +373,19 @@ type Contact struct {
 	ChatbotLastMessageAt *time.Time `json:"chatbot_last_message_at,omitempty"` // When chatbot last sent a message
 	ChatbotReminderSent  bool       `gorm:"default:false" json:"chatbot_reminder_sent"`
 
+	// Duplicate-merge redirect. A merged source remains as a soft-deleted alias
+	// so inbound identifiers and historical records can resolve to the
+	// canonical contact without destructive rewrites.
+	MergedIntoID *uuid.UUID `gorm:"type:uuid;index" json:"merged_into_id,omitempty"`
+	MergedAt     *time.Time `gorm:"index" json:"merged_at,omitempty"`
+	MergedByID   *uuid.UUID `gorm:"type:uuid;index" json:"merged_by_id,omitempty"`
+
 	// Relations
 	Organization *Organization `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`
 	AssignedUser *User         `gorm:"foreignKey:AssignedUserID" json:"assigned_user,omitempty"`
 	Messages     []Message     `gorm:"foreignKey:ContactID" json:"messages,omitempty"`
+	MergedInto   *Contact      `gorm:"foreignKey:MergedIntoID" json:"merged_into,omitempty"`
+	MergedBy     *User         `gorm:"foreignKey:MergedByID" json:"merged_by,omitempty"`
 }
 
 func (Contact) TableName() string {

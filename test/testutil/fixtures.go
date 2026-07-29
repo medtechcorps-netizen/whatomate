@@ -401,7 +401,7 @@ func CreateAgentRole(t *testing.T, db *gorm.DB, orgID uuid.UUID) *models.CustomR
 		"chat:read", "chat:write",
 		"contacts:read",
 		"analytics.agents:read",
-		"transfers:read", "transfers:pickup",
+		"transfers:read", "transfers:write", "transfers:pickup",
 		"canned_responses:read",
 	}
 	return CreateTestRoleWithKeys(t, db, orgID, "agent", agentPerms)

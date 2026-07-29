@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,8 @@ import (
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func redactURLForLog(raw string) string {
@@ -133,6 +136,20 @@ type IncomingTextMessage struct {
 	} `json:"contacts,omitempty"`
 }
 
+// persistedIncomingMessage is the durable hand-off between Meta's webhook ACK
+// path and the asynchronous media/chatbot continuation. Every field needed by
+// the continuation is copied only after the contact, message, lifecycle event,
+// and outbox row have committed.
+type persistedIncomingMessage struct {
+	OrganizationID uuid.UUID
+	PhoneNumberID  string
+	Message        IncomingTextMessage
+	Account        models.WhatsAppAccount
+	Contact        models.Contact
+	Extracted      ExtractedMessage
+	Persisted      models.Message
+}
+
 // processIncomingMessageFull processes incoming WhatsApp messages with chatbot logic
 func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextMessage, profileName string) {
 	a.Log.Info("Processing incoming message",
@@ -155,43 +172,60 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		return
 	}
 
-	// Get or create contact (always do this for all incoming messages)
-	contact, isNewContact, err := contactutil.GetOrCreateContact(a.DB, account.OrganizationID, msg.From, profileName)
+	work, duplicate, err := a.persistIncomingMessageForAccount(
+		phoneNumberID,
+		msg,
+		profileName,
+		account,
+	)
 	if err != nil {
-		a.Log.Error("Failed to get or create contact", "from", msg.From, "error", err)
+		a.Log.Error("Failed to persist incoming message", "from", msg.From, "error", err)
 		return
 	}
+	if duplicate {
+		a.startPersistedIncomingMessageContinuation(work)
+		return
+	}
+	a.startPersistedIncomingMessageContinuation(work)
+}
 
-	// Store BSUID if provided and not already set
-	if msg.FromUserID != "" && contact.BSUID != msg.FromUserID {
-		a.DB.Model(contact).Update("bsuid", msg.FromUserID)
-		contact.BSUID = msg.FromUserID
+// continuePersistedIncomingMessage performs work that is intentionally outside
+// Meta's acknowledgement critical path. Media download and every chatbot or
+// provider call happen here, after the normalized inbound fact is durable.
+func (a *App) continuePersistedIncomingMessage(
+	ctx context.Context,
+	work *persistedIncomingMessage,
+) error {
+	if work == nil {
+		return nil
 	}
 
-	// Dispatch webhook if new contact was created
-	if isNewContact {
-		a.DispatchWebhook(account.OrganizationID, models.WebhookEventContactCreated, ContactEventData{
-			ContactID:       contact.ID.String(),
-			ContactPhone:    contact.PhoneNumber,
-			ContactName:     contact.ProfileName,
-			WhatsAppAccount: account.Name,
-		})
+	account := &work.Account
+	contact, err := contactutil.ResolveCanonicalContact(
+		a.DB,
+		work.OrganizationID,
+		work.Contact.ID,
+	)
+	if err != nil {
+		a.Log.Error(
+			"Failed to resolve inbound contact for asynchronous continuation",
+			"error", err,
+			"contact_id", work.Contact.ID,
+			"message_id", work.Persisted.ID,
+		)
+		return fmt.Errorf("resolve inbound continuation contact: %w", err)
 	}
 
-	// Get message content - handle text, button replies, list replies, and media
-	extracted := a.extractMessageContent(context.Background(), msg, account)
+	a.hydratePersistedIncomingMedia(ctx, work, account)
+	// Broadcast only after optional hydration so a media message reaches the UI
+	// once, with its durable object-store URL when download succeeded.
+	a.broadcastNewMessage(work.OrganizationID, &work.Persisted, contact)
+
+	msg := work.Message
+	extracted := work.Extracted
 	messageText := extracted.Text
-	messageType := extracted.Type
 	buttonID := extracted.ButtonID
-	mediaInfo := extracted.Media
 	flowResponseData := extracted.FlowResponseData
-
-	// Save incoming message to messages table (always, even if chatbot is disabled)
-	var replyToWAMID string
-	if msg.Context != nil && msg.Context.ID != "" {
-		replyToWAMID = msg.Context.ID
-	}
-	a.saveIncomingMessageWithFlow(account, contact, msg.ID, messageType, messageText, mediaInfo, replyToWAMID, flowResponseData)
 
 	// Clear chatbot tracking since client has replied
 	a.ClearContactChatbotTracking(contact.ID)
@@ -201,20 +235,20 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		a.Log.Info("Contact has active agent transfer, skipping chatbot processing",
 			"contact_id", contact.ID,
 			"phone_number", contact.PhoneNumber)
-		return
+		return nil
 	}
 
 	// Check if chatbot is enabled for this account (use cache)
 	settings, err := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
 	if err != nil {
 		a.Log.Error("Failed to load chatbot settings", "error", err, "account", account.Name, "org_id", account.OrganizationID)
-		return
+		return fmt.Errorf("load inbound continuation chatbot settings: %w", err)
 	}
 	if !settings.IsEnabled {
 		a.Log.Debug("Chatbot not enabled for this account, creating transfer for agent queue", "account", account.Name, "settings_id", settings.ID)
 		// Create transfer to agent queue when chatbot is disabled
 		a.createTransferToQueue(account, contact, models.TransferSourceChatbotDisabled)
-		return
+		return nil
 	}
 	a.Log.Info("Chatbot settings loaded", "settings_id", settings.ID, "is_enabled", settings.IsEnabled, "ai_enabled", settings.AI.Enabled, "ai_provider", settings.AI.Provider, "default_response", settings.DefaultResponse)
 
@@ -227,9 +261,10 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 				if settings.BusinessHours.OutOfHoursMessage != "" {
 					if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
 						a.Log.Error("Failed to send out of hours message", "error", err, "contact", contact.PhoneNumber)
+						return fmt.Errorf("send out-of-hours response: %w", err)
 					}
 				}
-				return
+				return nil
 			}
 			// AllowAutomatedOutsideHours is true, continue processing flows/keywords/AI
 			a.Log.Info("Outside business hours but automated responses allowed, continuing")
@@ -239,13 +274,31 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 	// Only process text and interactive messages for chatbot
 	if messageText == "" {
 		a.Log.Debug("Skipping message with no text content for chatbot", "type", msg.Type)
-		return
+		return nil
 	}
 
 	a.Log.Info("Processing message", "text", messageText, "buttonID", buttonID, "from", msg.From)
 
 	// Get or create active session for this contact
-	session, isNewSession := a.getOrCreateSession(account.OrganizationID, contact.ID, account.Name, msg.From, settings.SessionTimeoutMins)
+	session, isNewSession, err := a.getOrCreateSession(
+		account.OrganizationID,
+		contact.ID,
+		account.Name,
+		msg.From,
+		settings.SessionTimeoutMins,
+	)
+	if err != nil || session == nil {
+		a.Log.Error(
+			"Failed to get or create chatbot session",
+			"error", err,
+			"contact_id", contact.ID,
+			"account", account.Name,
+		)
+		if err == nil {
+			err = errors.New("chatbot session was not returned")
+		}
+		return fmt.Errorf("get inbound continuation chatbot session: %w", err)
+	}
 
 	// Log incoming message to session
 	a.logSessionMessage(session.ID, models.DirectionIncoming, messageText, "keyword_check")
@@ -261,19 +314,24 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 				if settings.BusinessHours.OutOfHoursMessage != "" {
 					if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
 						a.Log.Error("Failed to send out of hours message", "error", err, "contact", contact.PhoneNumber)
+						return fmt.Errorf(
+							"send transfer out-of-hours response: %w",
+							err,
+						)
 					}
 				}
-				return
+				return nil
 			}
 		}
 		// Within business hours - send transfer message and create transfer
 		if keywordResponse.Body != "" {
 			if err := a.sendAndSaveTextMessage(account, contact, keywordResponse.Body); err != nil {
 				a.Log.Error("Failed to send transfer message", "error", err, "contact", contact.PhoneNumber)
+				return fmt.Errorf("send transfer response: %w", err)
 			}
 		}
 		a.createTransferFromKeyword(account, contact)
-		return
+		return nil
 	}
 
 	// Check if user is in an active flow. After Phase 4.2 every flow has
@@ -284,24 +342,28 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		if err != nil || flow == nil {
 			a.Log.Error("Active chatbot flow not loadable", "error", err, "session", session.ID, "flow", session.CurrentFlowID)
 			a.exitFlow(session)
-			return
+			if err != nil {
+				return fmt.Errorf("load active chatbot flow: %w", err)
+			}
+			return nil
 		}
 		if flow.Graph == nil {
 			a.Log.Error("Active chatbot flow has no v2 graph; ignoring inbound", "session", session.ID, "flow", flow.ID)
 			a.exitFlow(session)
-			return
+			return nil
 		}
 		if err := a.runChatGraph(account, contact, session, flow, messageText, buttonID, flowResponseData); err != nil {
 			a.Log.Error("Chat graph runner failed", "error", err, "session", session.ID, "flow", flow.ID)
+			return fmt.Errorf("run active chatbot flow: %w", err)
 		}
-		return
+		return nil
 	}
 
 	// Try to match flow trigger keywords first (before greeting to avoid duplicate messages)
 	if flow := a.matchFlowTrigger(account.OrganizationID, messageText); flow != nil {
 		if flow.Graph == nil {
 			a.Log.Error("Triggered chatbot flow has no v2 graph; ignoring", "flow", flow.ID)
-			return
+			return nil
 		}
 		session.CurrentFlowID = &flow.ID
 		session.CurrentStep = ""
@@ -312,8 +374,9 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		}
 		if err := a.runChatGraph(account, contact, session, flow, messageText, buttonID, flowResponseData); err != nil {
 			a.Log.Error("Chat graph runner failed at flow start", "error", err, "session", session.ID, "flow", flow.ID)
+			return fmt.Errorf("start chatbot flow: %w", err)
 		}
-		return
+		return nil
 	}
 
 	// Send greeting message for new sessions (only if no flow was triggered)
@@ -329,19 +392,22 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 			if len(greetingButtons) > 0 {
 				if err := a.sendAndSaveInteractiveButtons(account, contact, settings.DefaultResponse, greetingButtons); err != nil {
 					a.Log.Error("Failed to send greeting buttons", "error", err, "contact", contact.PhoneNumber)
+					return fmt.Errorf("send chatbot greeting buttons: %w", err)
 				}
 			} else {
 				if err := a.sendAndSaveTextMessage(account, contact, settings.DefaultResponse); err != nil {
 					a.Log.Error("Failed to send greeting message", "error", err, "contact", contact.PhoneNumber)
+					return fmt.Errorf("send chatbot greeting: %w", err)
 				}
 			}
 		} else {
 			if err := a.sendAndSaveTextMessage(account, contact, settings.DefaultResponse); err != nil {
 				a.Log.Error("Failed to send greeting message", "error", err, "contact", contact.PhoneNumber)
+				return fmt.Errorf("send chatbot greeting: %w", err)
 			}
 		}
 		a.logSessionMessage(session.ID, models.DirectionOutgoing, settings.DefaultResponse, "greeting")
-		return // After greeting, don't process further for new sessions
+		return nil // After greeting, don't process further for new sessions
 	}
 
 	// Handle non-transfer keyword matches (transfer was already handled above)
@@ -352,31 +418,64 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		if len(keywordResponse.Buttons) > 0 {
 			if err := a.sendAndSaveInteractiveButtons(account, contact, keywordResponse.Body, keywordResponse.Buttons); err != nil {
 				a.Log.Error("Failed to send interactive buttons", "error", err, "contact", contact.PhoneNumber)
+				return fmt.Errorf("send keyword response buttons: %w", err)
 			}
 		} else {
 			if err := a.sendAndSaveTextMessage(account, contact, keywordResponse.Body); err != nil {
 				a.Log.Error("Failed to send text message", "error", err, "contact", contact.PhoneNumber)
+				return fmt.Errorf("send keyword response: %w", err)
 			}
 		}
 		// Log outgoing message
 		a.logSessionMessage(session.ID, models.DirectionOutgoing, keywordResponse.Body, "keyword_response")
-		return
+		return nil
 	}
 
 	// If no keyword matched, try AI response if enabled
 	if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
 		a.Log.Info("Attempting AI response", "provider", settings.AI.Provider, "model", settings.AI.Model)
-		aiResponse, err := a.generateAIResponse(settings, session, messageText)
-		if err != nil {
-			a.Log.Error("AI response failed", "error", err, "provider", settings.AI.Provider, "model", settings.AI.Model)
+		aiResult, actionErr := a.runInboundContinuationCapturedAction(
+			"legacy_ai_generate",
+			func() models.JSONB {
+				aiResponse, generationErr := a.generateAIResponse(
+					settings,
+					session,
+					messageText,
+				)
+				result := models.JSONB{"outcome": "empty"}
+				switch {
+				case generationErr != nil:
+					result["outcome"] = "error"
+					a.Log.Error("AI response failed", "error", generationErr, "provider", settings.AI.Provider, "model", settings.AI.Model)
+				case aiResponse != "":
+					result["outcome"] = "generated"
+					// Store only the user-facing answer needed for recovery;
+					// prompts, API keys, and request payloads are excluded.
+					result["answer"] = aiResponse
+				}
+				return result
+			},
+		)
+		if actionErr != nil {
+			return fmt.Errorf("generate durable AI response: %w", actionErr)
+		}
+		aiResponse, _ := aiResult["answer"].(string)
+		aiOutcome, _ := aiResult["outcome"].(string)
+		if aiOutcome == "error" {
+			a.Log.Error(
+				"AI response failed",
+				"provider", settings.AI.Provider,
+				"model", settings.AI.Model,
+			)
 			// Fall through to default response
 		} else if aiResponse != "" {
 			a.Log.Info("AI response generated successfully", "response_length", len(aiResponse))
 			if err := a.sendAndSaveTextMessage(account, contact, aiResponse); err != nil {
 				a.Log.Error("Failed to send AI response", "error", err, "contact", contact.PhoneNumber)
+				return fmt.Errorf("send AI response: %w", err)
 			}
 			a.logSessionMessage(session.ID, models.DirectionOutgoing, aiResponse, "ai_response")
-			return
+			return nil
 		} else {
 			a.Log.Warn("AI returned empty response")
 		}
@@ -398,21 +497,25 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 			if len(fallbackButtons) > 0 {
 				if err := a.sendAndSaveInteractiveButtons(account, contact, settings.FallbackMessage, fallbackButtons); err != nil {
 					a.Log.Error("Failed to send fallback buttons", "error", err, "contact", contact.PhoneNumber)
+					return fmt.Errorf("send fallback buttons: %w", err)
 				}
 			} else {
 				if err := a.sendAndSaveTextMessage(account, contact, settings.FallbackMessage); err != nil {
 					a.Log.Error("Failed to send fallback message", "error", err, "contact", contact.PhoneNumber)
+					return fmt.Errorf("send fallback response: %w", err)
 				}
 			}
 		} else {
 			if err := a.sendAndSaveTextMessage(account, contact, settings.FallbackMessage); err != nil {
 				a.Log.Error("Failed to send fallback message", "error", err, "contact", contact.PhoneNumber)
+				return fmt.Errorf("send fallback response: %w", err)
 			}
 		}
 		a.logSessionMessage(session.ID, models.DirectionOutgoing, settings.FallbackMessage, "fallback_response")
 	} else if !isNewSession {
 		a.Log.Info("No fallback message configured for existing session")
 	}
+	return nil
 }
 
 // KeywordResponse holds the response content and optional buttons
@@ -508,14 +611,25 @@ func (a *App) matchKeywordRules(orgID uuid.UUID, accountName, messageText string
 // sendAndSaveTextMessage sends a text message and saves it to the database
 // Uses the unified SendOutgoingMessage for consistent behavior
 func (a *App) sendAndSaveTextMessage(account *models.WhatsAppAccount, contact *models.Contact, message string) error {
-	ctx := context.Background()
-	_, err := a.SendOutgoingMessage(ctx, OutgoingMessageRequest{
-		Account: account,
-		Contact: contact,
-		Type:    models.MessageTypeText,
-		Content: message,
-	}, ChatbotSendOptions())
-	return err
+	return a.runInboundContinuationSend(
+		"text",
+		map[string]any{
+			"contact_id": contact.ID,
+			"content":    message,
+		},
+		func() (*models.Message, error) {
+			return a.SendOutgoingMessage(
+				context.Background(),
+				OutgoingMessageRequest{
+					Account: account,
+					Contact: contact,
+					Type:    models.MessageTypeText,
+					Content: message,
+				},
+				ChatbotSendOptions(),
+			)
+		},
+	)
 }
 
 // sendAndSaveInteractiveButtons sends an interactive button message and saves it to the database.
@@ -576,15 +690,29 @@ func (a *App) sendAndSaveInteractiveButtons(account *models.WhatsAppAccount, con
 			if len(waButtons) > 3 {
 				interactiveType = "list"
 			}
-			ctx := context.Background()
-			if _, err := a.SendOutgoingMessage(ctx, OutgoingMessageRequest{
-				Account:         account,
-				Contact:         contact,
-				Type:            models.MessageTypeInteractive,
-				InteractiveType: interactiveType,
-				BodyText:        bodyText,
-				Buttons:         waButtons,
-			}, ChatbotSendOptions()); err != nil {
+			if err := a.runInboundContinuationSend(
+				"interactive_buttons",
+				map[string]any{
+					"contact_id":       contact.ID,
+					"interactive_type": interactiveType,
+					"body":             bodyText,
+					"buttons":          waButtons,
+				},
+				func() (*models.Message, error) {
+					return a.SendOutgoingMessage(
+						context.Background(),
+						OutgoingMessageRequest{
+							Account:         account,
+							Contact:         contact,
+							Type:            models.MessageTypeInteractive,
+							InteractiveType: interactiveType,
+							BodyText:        bodyText,
+							Buttons:         waButtons,
+						},
+						ChatbotSendOptions(),
+					)
+				},
+			); err != nil {
 				return err
 			}
 		}
@@ -621,70 +749,173 @@ func (a *App) sendAndSaveInteractiveButtons(account *models.WhatsAppAccount, con
 // sendAndSaveCTAURLButton sends a CTA URL button message and saves it to the database
 // Uses the unified SendOutgoingMessage for consistent behavior
 func (a *App) sendAndSaveCTAURLButton(account *models.WhatsAppAccount, contact *models.Contact, bodyText, buttonText, url string) error {
-	ctx := context.Background()
-	_, err := a.SendOutgoingMessage(ctx, OutgoingMessageRequest{
-		Account:         account,
-		Contact:         contact,
-		Type:            models.MessageTypeInteractive,
-		InteractiveType: "cta_url",
-		BodyText:        bodyText,
-		ButtonText:      buttonText,
-		URL:             url,
-	}, ChatbotSendOptions())
-	return err
+	return a.runInboundContinuationSend(
+		"cta_url",
+		map[string]any{
+			"contact_id": contact.ID,
+			"body":       bodyText,
+			"button":     buttonText,
+			"url":        url,
+		},
+		func() (*models.Message, error) {
+			return a.SendOutgoingMessage(
+				context.Background(),
+				OutgoingMessageRequest{
+					Account:         account,
+					Contact:         contact,
+					Type:            models.MessageTypeInteractive,
+					InteractiveType: "cta_url",
+					BodyText:        bodyText,
+					ButtonText:      buttonText,
+					URL:             url,
+				},
+				ChatbotSendOptions(),
+			)
+		},
+	)
 }
 
 // sendAndSaveFlowMessage sends a WhatsApp Flow message and saves it to the database
 // Uses the unified SendOutgoingMessage for consistent behavior
 func (a *App) sendAndSaveFlowMessage(account *models.WhatsAppAccount, contact *models.Contact, flowID, headerText, bodyText, ctaText, flowToken, firstScreen string) error {
-	ctx := context.Background()
-	_, err := a.SendOutgoingMessage(ctx, OutgoingMessageRequest{
-		Account:         account,
-		Contact:         contact,
-		Type:            models.MessageTypeFlow,
-		FlowID:          flowID,
-		FlowHeader:      headerText,
-		BodyText:        bodyText,
-		FlowCTA:         ctaText,
-		FlowToken:       flowToken,
-		FlowFirstScreen: firstScreen,
-	}, ChatbotSendOptions())
-	return err
+	return a.runInboundContinuationSend(
+		"whatsapp_flow",
+		map[string]any{
+			"contact_id":   contact.ID,
+			"flow_id":      flowID,
+			"header":       headerText,
+			"body":         bodyText,
+			"cta":          ctaText,
+			"first_screen": firstScreen,
+		},
+		func() (*models.Message, error) {
+			return a.SendOutgoingMessage(
+				context.Background(),
+				OutgoingMessageRequest{
+					Account:         account,
+					Contact:         contact,
+					Type:            models.MessageTypeFlow,
+					FlowID:          flowID,
+					FlowHeader:      headerText,
+					BodyText:        bodyText,
+					FlowCTA:         ctaText,
+					FlowToken:       flowToken,
+					FlowFirstScreen: firstScreen,
+				},
+				ChatbotSendOptions(),
+			)
+		},
+	)
 }
 
 // getOrCreateSession finds an active session or creates a new one
 // Returns the session and a boolean indicating if it's a new session
-func (a *App) getOrCreateSession(orgID, contactID uuid.UUID, accountName, phoneNumber string, timeoutMins int) (*models.ChatbotSession, bool) {
+func (a *App) getOrCreateSession(
+	orgID, contactID uuid.UUID,
+	accountName, phoneNumber string,
+	timeoutMins int,
+) (*models.ChatbotSession, bool, error) {
+	if timeoutMins <= 0 {
+		timeoutMins = 30
+	}
 	now := time.Now()
-
-	// Look for an active session that hasn't timed out
-	var session models.ChatbotSession
 	timeout := now.Add(-time.Duration(timeoutMins) * time.Minute)
-	result := a.DB.Where("organization_id = ? AND contact_id = ? AND whats_app_account = ? AND status = ? AND last_activity_at > ?",
-		orgID, contactID, accountName, models.SessionStatusActive, timeout).First(&session)
+	var result models.ChatbotSession
+	isNew := false
 
-	if result.Error == nil {
-		// Update last activity
-		a.DB.Model(&session).Update("last_activity_at", now)
-		return &session, false // existing session
-	}
+	err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		canonical, err := contactutil.ResolveCanonicalContactForUpdate(tx, orgID, contactID)
+		if err != nil {
+			return err
+		}
 
-	// Create new session
-	session = models.ChatbotSession{
-		BaseModel:       models.BaseModel{ID: uuid.New()},
-		OrganizationID:  orgID,
-		ContactID:       contactID,
-		WhatsAppAccount: accountName,
-		PhoneNumber:     phoneNumber,
-		Status:          models.SessionStatusActive,
-		SessionData:     models.JSONB{},
-		StartedAt:       now,
-		LastActivityAt:  now,
+		var activeSessions []models.ChatbotSession
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(
+				"organization_id = ? AND contact_id = ? AND whats_app_account = ? AND status = ?",
+				orgID,
+				canonical.ID,
+				accountName,
+				models.SessionStatusActive,
+			).
+			Order("last_activity_at DESC, created_at DESC, id DESC").
+			Find(&activeSessions).Error; err != nil {
+			return err
+		}
+
+		chosen := -1
+		staleIDs := make([]uuid.UUID, 0, len(activeSessions))
+		duplicateLiveIDs := make([]uuid.UUID, 0, len(activeSessions))
+		for i := range activeSessions {
+			if activeSessions[i].LastActivityAt.After(timeout) {
+				if chosen == -1 {
+					chosen = i
+				} else {
+					duplicateLiveIDs = append(duplicateLiveIDs, activeSessions[i].ID)
+				}
+				continue
+			}
+			staleIDs = append(staleIDs, activeSessions[i].ID)
+		}
+
+		if len(staleIDs) > 0 {
+			if err := tx.Model(&models.ChatbotSession{}).
+				Where("id IN ? AND status = ?", staleIDs, models.SessionStatusActive).
+				Updates(map[string]any{
+					"status":       models.SessionStatusTimeout,
+					"completed_at": now,
+				}).Error; err != nil {
+				return err
+			}
+		}
+		if len(duplicateLiveIDs) > 0 {
+			if err := tx.Model(&models.ChatbotSession{}).
+				Where("id IN ? AND status = ?", duplicateLiveIDs, models.SessionStatusActive).
+				Updates(map[string]any{
+					"status":       models.SessionStatusCancelled,
+					"completed_at": now,
+				}).Error; err != nil {
+				return err
+			}
+		}
+
+		if chosen >= 0 {
+			result = activeSessions[chosen]
+			if err := tx.Model(&models.ChatbotSession{}).
+				Where("id = ? AND status = ?", result.ID, models.SessionStatusActive).
+				Update("last_activity_at", now).Error; err != nil {
+				return err
+			}
+			result.LastActivityAt = now
+			isNew = false
+			return nil
+		}
+
+		canonicalPhone := canonical.PhoneNumber
+		if canonicalPhone == "" {
+			canonicalPhone = phoneNumber
+		}
+		result = models.ChatbotSession{
+			BaseModel:       models.BaseModel{ID: uuid.New()},
+			OrganizationID:  orgID,
+			ContactID:       canonical.ID,
+			WhatsAppAccount: accountName,
+			PhoneNumber:     canonicalPhone,
+			Status:          models.SessionStatusActive,
+			SessionData:     models.JSONB{},
+			StartedAt:       now,
+			LastActivityAt:  now,
+		}
+		if err := tx.Create(&result).Error; err != nil {
+			return err
+		}
+		isNew = true
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
 	}
-	if err := a.DB.Create(&session).Error; err != nil {
-		a.Log.Error("Failed to create session", "error", err)
-	}
-	return &session, true // new session
+	return &result, isNew, nil
 }
 
 // logSessionMessage logs a message to the chatbot session
@@ -1345,14 +1576,22 @@ func (a *App) handleIncomingReaction(account *models.WhatsAppAccount, fromPhone,
 	// has different WAMIDs from sender vs recipient perspective.
 	// We match on the suffix after "FQIA" + 4 chars (type indicator like "ERgS" or "EhgU")
 	var message models.Message
-	if err := a.DB.Where("whats_app_message_id = ?", messageWAMID).First(&message).Error; err != nil {
+	if err := a.DB.Where(
+		"organization_id = ? AND whats_app_message_id = ?",
+		account.OrganizationID,
+		messageWAMID,
+	).First(&message).Error; err != nil {
 		// Try matching on WAMID suffix (the unique message ID part)
 		if idx := strings.Index(messageWAMID, "FQIA"); idx != -1 {
 			// Extract suffix after "FQIA" + 4 char type indicator (e.g., "ERgS", "EhgU")
 			suffixStart := idx + 8
 			if suffixStart < len(messageWAMID) {
 				suffix := messageWAMID[suffixStart:]
-				if err := a.DB.Where("whats_app_message_id LIKE ?", "%"+suffix).First(&message).Error; err != nil {
+				if err := a.DB.Where(
+					"organization_id = ? AND whats_app_message_id LIKE ?",
+					account.OrganizationID,
+					"%"+suffix,
+				).First(&message).Error; err != nil {
 					a.Log.Warn("Message not found for reaction", "wamid", messageWAMID, "suffix", suffix)
 					return
 				}
@@ -1366,8 +1605,12 @@ func (a *App) handleIncomingReaction(account *models.WhatsAppAccount, fromPhone,
 		}
 	}
 
-	// Get or create contact
-	contact, _, _ := contactutil.GetOrCreateContact(a.DB, account.OrganizationID, fromPhone, profileName)
+	// Keep any newly discovered contact and its durable lifecycle event atomic.
+	contact, _, err := a.getOrCreateInboundContact(account, fromPhone, profileName, "")
+	if err != nil {
+		a.Log.Error("Failed to get or create reaction contact", "phone", fromPhone, "error", err)
+		return
+	}
 
 	// Parse existing reactions from Metadata
 	var metadata map[string]any
@@ -1445,8 +1688,18 @@ type ExtractedMessage struct {
 }
 
 // extractMessageContent walks an IncomingTextMessage and returns the derived
-// fields. Used by both the inbound and echo paths.
+// fields, including a best-effort media download. The regular inbound webhook
+// path uses extractMessageContentForPersistence directly so network I/O never
+// delays Meta's acknowledgement.
 func (a *App) extractMessageContent(ctx context.Context, msg IncomingTextMessage, account *models.WhatsAppAccount) ExtractedMessage {
+	extracted := a.extractMessageContentForPersistence(msg)
+	a.hydrateExtractedIncomingMedia(ctx, msg, account, &extracted)
+	return extracted
+}
+
+// extractMessageContentForPersistence normalizes only data already present in
+// Meta's payload. It must remain free of provider and object-store calls.
+func (a *App) extractMessageContentForPersistence(msg IncomingTextMessage) ExtractedMessage {
 	extracted := ExtractedMessage{
 		Type: msg.Type,
 	}
@@ -1492,13 +1745,6 @@ func (a *App) extractMessageContent(ctx context.Context, msg IncomingTextMessage
 		extracted.Media = &MediaInfo{
 			MediaMimeType: msg.Image.MimeType,
 		}
-		// Download and persist media in the configured tenant store.
-		waAccount := a.toWhatsAppAccount(account)
-		if localPath, err := a.DownloadAndSaveMedia(ctx, account.OrganizationID, msg.Image.ID, msg.Image.MimeType, waAccount); err != nil {
-			a.Log.Error("Failed to download image", "error", err, "media_id", msg.Image.ID)
-		} else {
-			extracted.Media.MediaURL = localPath
-		}
 	} else if msg.Type == "document" && msg.Document != nil {
 		// Handle document message
 		extracted.Text = msg.Document.Caption
@@ -1506,49 +1752,21 @@ func (a *App) extractMessageContent(ctx context.Context, msg IncomingTextMessage
 			MediaMimeType: msg.Document.MimeType,
 			MediaFilename: msg.Document.Filename,
 		}
-		// Download and persist media in the configured tenant store.
-		waAccount := a.toWhatsAppAccount(account)
-		if localPath, err := a.DownloadAndSaveMedia(ctx, account.OrganizationID, msg.Document.ID, msg.Document.MimeType, waAccount); err != nil {
-			a.Log.Error("Failed to download document", "error", err, "media_id", msg.Document.ID)
-		} else {
-			extracted.Media.MediaURL = localPath
-		}
 	} else if msg.Type == "video" && msg.Video != nil {
 		// Handle video message
 		extracted.Text = msg.Video.Caption
 		extracted.Media = &MediaInfo{
 			MediaMimeType: msg.Video.MimeType,
 		}
-		// Download and persist media in the configured tenant store.
-		waAccount := a.toWhatsAppAccount(account)
-		if localPath, err := a.DownloadAndSaveMedia(ctx, account.OrganizationID, msg.Video.ID, msg.Video.MimeType, waAccount); err != nil {
-			a.Log.Error("Failed to download video", "error", err, "media_id", msg.Video.ID)
-		} else {
-			extracted.Media.MediaURL = localPath
-		}
 	} else if msg.Type == "audio" && msg.Audio != nil {
 		// Handle audio message
 		extracted.Media = &MediaInfo{
 			MediaMimeType: msg.Audio.MimeType,
 		}
-		// Download and persist media in the configured tenant store.
-		waAccount := a.toWhatsAppAccount(account)
-		if localPath, err := a.DownloadAndSaveMedia(ctx, account.OrganizationID, msg.Audio.ID, msg.Audio.MimeType, waAccount); err != nil {
-			a.Log.Error("Failed to download audio", "error", err, "media_id", msg.Audio.ID)
-		} else {
-			extracted.Media.MediaURL = localPath
-		}
 	} else if msg.Type == "sticker" && msg.Sticker != nil {
 		// Handle sticker message (treat like image)
 		extracted.Media = &MediaInfo{
 			MediaMimeType: msg.Sticker.MimeType,
-		}
-		// Download and persist media in the configured tenant store.
-		waAccount := a.toWhatsAppAccount(account)
-		if localPath, err := a.DownloadAndSaveMedia(ctx, account.OrganizationID, msg.Sticker.ID, msg.Sticker.MimeType, waAccount); err != nil {
-			a.Log.Error("Failed to download sticker", "error", err, "media_id", msg.Sticker.ID)
-		} else {
-			extracted.Media.MediaURL = localPath
 		}
 	} else if msg.Type == "location" && msg.Location != nil {
 		// Handle location message - store as JSON in content
@@ -1589,6 +1807,57 @@ func (a *App) extractMessageContent(ctx context.Context, msg IncomingTextMessage
 	return extracted
 }
 
+// hydrateExtractedIncomingMedia performs the optional provider download after
+// the payload-only representation has been normalized.
+func (a *App) hydrateExtractedIncomingMedia(
+	ctx context.Context,
+	msg IncomingTextMessage,
+	account *models.WhatsAppAccount,
+	extracted *ExtractedMessage,
+) {
+	if account == nil || extracted == nil || extracted.Media == nil {
+		return
+	}
+
+	var mediaID, mimeType, label string
+	switch {
+	case msg.Type == "image" && msg.Image != nil:
+		mediaID, mimeType, label = msg.Image.ID, msg.Image.MimeType, "image"
+	case msg.Type == "document" && msg.Document != nil:
+		mediaID, mimeType, label = msg.Document.ID, msg.Document.MimeType, "document"
+	case msg.Type == "video" && msg.Video != nil:
+		mediaID, mimeType, label = msg.Video.ID, msg.Video.MimeType, "video"
+	case msg.Type == "audio" && msg.Audio != nil:
+		mediaID, mimeType, label = msg.Audio.ID, msg.Audio.MimeType, "audio"
+	case msg.Type == "sticker" && msg.Sticker != nil:
+		mediaID, mimeType, label = msg.Sticker.ID, msg.Sticker.MimeType, "sticker"
+	default:
+		return
+	}
+	if mediaID == "" {
+		return
+	}
+
+	waAccount := a.toWhatsAppAccount(account)
+	localPath, err := a.DownloadAndSaveMedia(
+		ctx,
+		account.OrganizationID,
+		mediaID,
+		mimeType,
+		waAccount,
+	)
+	if err != nil {
+		a.Log.Error(
+			"Failed to hydrate incoming media",
+			"error", err,
+			"media_id", mediaID,
+			"media_type", label,
+		)
+		return
+	}
+	extracted.Media.MediaURL = localPath
+}
+
 // MediaInfo holds media-related information for an incoming message
 type MediaInfo struct {
 	MediaURL      string
@@ -1596,23 +1865,352 @@ type MediaInfo struct {
 	MediaFilename string
 }
 
+var errIncomingMessageAlreadyProcessed = errors.New("incoming message already processed")
+
+// persistIncomingMessageBeforeAck is the synchronous Meta webhook boundary for
+// regular inbound messages. It returns only after the contact, normalized
+// Message, customer activity, and durable outbox rows have committed. A replay
+// is a successful no-op so Meta can safely stop retrying it.
+func (a *App) persistIncomingMessageBeforeAck(
+	phoneNumberID string,
+	msg IncomingTextMessage,
+	profileName string,
+) (work *persistedIncomingMessage, duplicate bool, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			work = nil
+			duplicate = false
+			err = fmt.Errorf("panic while persisting incoming message: %v", recovered)
+		}
+	}()
+
+	if strings.TrimSpace(phoneNumberID) == "" {
+		return nil, false, errors.New("incoming message phone number ID is required")
+	}
+	if strings.TrimSpace(msg.ID) == "" {
+		return nil, false, errors.New("incoming WhatsApp message ID is required")
+	}
+	if msg.Type == "reaction" {
+		return nil, false, errors.New("reaction messages use the specialized inbound path")
+	}
+
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		err = a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+			var scopedErr error
+			work, duplicate, scopedErr = scoped.persistIncomingMessageForAccount(
+				phoneNumberID,
+				msg,
+				profileName,
+				nil,
+			)
+			return scopedErr
+		})
+		return work, duplicate, err
+	}
+
+	if a.rlsEnabled() {
+		return a.persistIncomingMessageForAccount(
+			phoneNumberID,
+			msg,
+			profileName,
+			nil,
+		)
+	}
+
+	// RLS supplies an outer tenant transaction in production. Keep the same
+	// all-or-nothing boundary when RLS is disabled by binding a scoped clone to
+	// one explicit transaction.
+	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		txApp := a.scopedApp(tx, uuid.Nil)
+		var transactionErr error
+		work, duplicate, transactionErr = txApp.persistIncomingMessageForAccount(
+			phoneNumberID,
+			msg,
+			profileName,
+			nil,
+		)
+		return transactionErr
+	})
+	return work, duplicate, err
+}
+
+func (a *App) persistIncomingMessageForAccount(
+	phoneNumberID string,
+	msg IncomingTextMessage,
+	profileName string,
+	account *models.WhatsAppAccount,
+) (*persistedIncomingMessage, bool, error) {
+	var err error
+	if account == nil {
+		account, err = a.getWhatsAppAccountCached(phoneNumberID)
+		if err != nil {
+			return nil, false, fmt.Errorf("load WhatsApp account: %w", err)
+		}
+	}
+
+	// Existing merge aliases are locked and resolved before the message write.
+	contact, _, err := a.getOrCreateInboundContact(
+		account,
+		msg.From,
+		profileName,
+		msg.FromUserID,
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf("get or create inbound contact: %w", err)
+	}
+
+	extracted := a.extractMessageContentForPersistence(msg)
+	replyToWAMID := ""
+	if msg.Context != nil {
+		replyToWAMID = msg.Context.ID
+	}
+	message, err := a.persistIncomingMessageWithFlow(
+		account,
+		contact,
+		msg.ID,
+		extracted.Type,
+		extracted.Text,
+		extracted.Media,
+		replyToWAMID,
+		extracted.FlowResponseData,
+	)
+	if errors.Is(err, errIncomingMessageAlreadyProcessed) {
+		a.Log.Info("Ignored duplicate incoming message", "whatsapp_message_id", msg.ID)
+		var existing models.Message
+		if loadErr := a.DB.Where(
+			"organization_id = ? AND whats_app_account = ? AND whats_app_message_id = ?",
+			account.OrganizationID,
+			account.Name,
+			msg.ID,
+		).First(&existing).Error; loadErr != nil {
+			return nil, false, fmt.Errorf(
+				"load duplicate incoming message for continuation: %w",
+				loadErr,
+			)
+		}
+		if queueErr := a.ensureInboundContinuationJob(
+			account,
+			&existing,
+			msg,
+			profileName,
+		); queueErr != nil {
+			return nil, false, queueErr
+		}
+		return &persistedIncomingMessage{
+			OrganizationID: account.OrganizationID,
+			PhoneNumberID:  phoneNumberID,
+			Message:        msg,
+			Account:        *account,
+			Contact:        *contact,
+			Extracted:      extracted,
+			Persisted:      existing,
+		}, true, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	work := &persistedIncomingMessage{
+		OrganizationID: account.OrganizationID,
+		PhoneNumberID:  phoneNumberID,
+		Message:        msg,
+		Account:        *account,
+		Contact:        *contact,
+		Extracted:      extracted,
+		Persisted:      *message,
+	}
+	if err := a.ensureInboundContinuationJob(
+		account,
+		message,
+		msg,
+		profileName,
+	); err != nil {
+		return nil, false, err
+	}
+	return work, false, nil
+}
+
+func (a *App) hydratePersistedIncomingMedia(
+	ctx context.Context,
+	work *persistedIncomingMessage,
+	account *models.WhatsAppAccount,
+) {
+	if work == nil || work.Extracted.Media == nil {
+		return
+	}
+
+	hydrated := work.Extracted
+	hydratedMedia := *work.Extracted.Media
+	hydrated.Media = &hydratedMedia
+	a.hydrateExtractedIncomingMedia(ctx, work.Message, account, &hydrated)
+	if hydrated.Media.MediaURL == "" {
+		return
+	}
+
+	updates := map[string]any{
+		"media_url":       hydrated.Media.MediaURL,
+		"media_mime_type": hydrated.Media.MediaMimeType,
+		"media_filename":  hydrated.Media.MediaFilename,
+	}
+	if err := a.DB.Model(&models.Message{}).
+		Where(
+			"organization_id = ? AND id = ?",
+			work.OrganizationID,
+			work.Persisted.ID,
+		).
+		Updates(updates).Error; err != nil {
+		a.Log.Error(
+			"Failed to persist hydrated incoming media",
+			"error", err,
+			"message_id", work.Persisted.ID,
+		)
+		return
+	}
+
+	work.Extracted = hydrated
+	work.Persisted.MediaURL = hydrated.Media.MediaURL
+	work.Persisted.MediaMimeType = hydrated.Media.MediaMimeType
+	work.Persisted.MediaFilename = hydrated.Media.MediaFilename
+}
+
+// getOrCreateInboundContact keeps the contact row, immutable CRM activity, and
+// durable webhook outbox in one transaction. A unique-contact race aborts the
+// losing PostgreSQL transaction, so retry it from a fresh transaction.
+func (a *App) getOrCreateInboundContact(
+	account *models.WhatsAppAccount,
+	phoneNumber, profileName, bsuid string,
+) (*models.Contact, bool, error) {
+	if account == nil {
+		return nil, false, errors.New("WhatsApp account is required")
+	}
+
+	var result models.Contact
+	var isNew bool
+	var err error
+	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
+		err = a.DB.Transaction(func(tx *gorm.DB) error {
+			contact, created, createErr := contactutil.GetOrCreateContact(
+				tx,
+				account.OrganizationID,
+				phoneNumber,
+				profileName,
+			)
+			if createErr != nil {
+				return createErr
+			}
+
+			canonical, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
+				tx,
+				account.OrganizationID,
+				contact.ID,
+			)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			if profileName != "" && canonical.ProfileName != profileName {
+				if updateErr := tx.Model(canonical).
+					Update("profile_name", profileName).Error; updateErr != nil {
+					return updateErr
+				}
+				canonical.ProfileName = profileName
+			}
+			if bsuid != "" && canonical.BSUID != bsuid {
+				if updateErr := tx.Model(canonical).
+					Update("bs_uid", bsuid).Error; updateErr != nil {
+					return updateErr
+				}
+				canonical.BSUID = bsuid
+			}
+
+			if created {
+				if _, activityErr := recordCustomerActivity(
+					tx,
+					account.OrganizationID,
+					customerActivityInput{
+						ContactID:        canonical.ID,
+						EventType:        models.CustomerActivityContactCreated,
+						Category:         models.CustomerActivityCategoryContact,
+						Title:            "Contact created",
+						Summary:          canonical.ProfileName,
+						ActorType:        models.CustomerActivityActorContact,
+						SourceObjectType: "contact",
+						SourceObjectID:   &canonical.ID,
+						OccurredAt:       time.Now().UTC(),
+						Metadata: models.JSONB{
+							"whatsapp_account": account.Name,
+						},
+						WebhookData: models.JSONB{
+							"contact_phone":    canonical.PhoneNumber,
+							"contact_name":     canonical.ProfileName,
+							"whatsapp_account": account.Name,
+						},
+						IdempotencyKey: "contact-created:" + canonical.ID.String(),
+					},
+				); activityErr != nil {
+					return activityErr
+				}
+			}
+
+			result = *canonical
+			isNew = created
+			return nil
+		})
+		if err == nil {
+			return &result, isNew, nil
+		}
+		if !isUniqueViolation(err) && !isRetryableCanonicalContactWrite(err) {
+			return nil, false, err
+		}
+	}
+	return nil, false, err
+}
+
 // saveIncomingMessage saves an incoming message to the messages table
-func (a *App) saveIncomingMessage(account *models.WhatsAppAccount, contact *models.Contact, whatsappMsgID, msgType, content string, mediaInfo *MediaInfo, replyToWAMID string) {
-	a.saveIncomingMessageWithFlow(account, contact, whatsappMsgID, msgType, content, mediaInfo, replyToWAMID, nil)
+func (a *App) saveIncomingMessage(account *models.WhatsAppAccount, contact *models.Contact, whatsappMsgID, msgType, content string, mediaInfo *MediaInfo, replyToWAMID string) bool {
+	return a.saveIncomingMessageWithFlow(account, contact, whatsappMsgID, msgType, content, mediaInfo, replyToWAMID, nil)
 }
 
 // saveIncomingMessageWithFlow persists the normalized WhatsApp Flow response
 // together with the message. Keeping the submitted fields on the immutable
 // inbound record is required for idempotent booking and CRM actions; session
 // data alone can be overwritten by later chatbot steps.
-func (a *App) saveIncomingMessageWithFlow(account *models.WhatsAppAccount, contact *models.Contact, whatsappMsgID, msgType, content string, mediaInfo *MediaInfo, replyToWAMID string, flowResponseData map[string]any) {
-	now := time.Now()
+func (a *App) saveIncomingMessageWithFlow(account *models.WhatsAppAccount, contact *models.Contact, whatsappMsgID, msgType, content string, mediaInfo *MediaInfo, replyToWAMID string, flowResponseData map[string]any) bool {
+	message, err := a.persistIncomingMessageWithFlow(
+		account,
+		contact,
+		whatsappMsgID,
+		msgType,
+		content,
+		mediaInfo,
+		replyToWAMID,
+		flowResponseData,
+	)
+	if err != nil {
+		if errors.Is(err, errIncomingMessageAlreadyProcessed) {
+			a.Log.Info("Ignored duplicate incoming message", "whatsapp_message_id", whatsappMsgID)
+		} else {
+			a.Log.Error("Failed to save incoming message", "error", err)
+		}
+		return false
+	}
+
+	a.Log.Info("Saved incoming message", "message_id", message.ID, "contact_id", contact.ID, "media_url", message.MediaURL)
+	a.broadcastNewMessage(account.OrganizationID, message, contact)
+	return true
+}
+
+// persistIncomingMessageWithFlow commits the normalized message and its
+// lifecycle/outbox fact but performs no provider or WebSocket work. Callers can
+// therefore place an acknowledgement boundary immediately after this returns.
+func (a *App) persistIncomingMessageWithFlow(account *models.WhatsAppAccount, contact *models.Contact, whatsappMsgID, msgType, content string, mediaInfo *MediaInfo, replyToWAMID string, flowResponseData map[string]any) (*models.Message, error) {
+	if account == nil || contact == nil {
+		return nil, errors.New("cannot save incoming message without account and contact")
+	}
 
 	message := models.Message{
 		BaseModel:         models.BaseModel{ID: uuid.New()},
 		OrganizationID:    account.OrganizationID,
 		WhatsAppAccount:   account.Name,
-		ContactID:         contact.ID,
 		WhatsAppMessageID: whatsappMsgID,
 		Direction:         models.DirectionIncoming,
 		MessageType:       models.MessageType(msgType),
@@ -1623,17 +2221,6 @@ func (a *App) saveIncomingMessageWithFlow(account *models.WhatsAppAccount, conta
 		message.FlowResponse = models.JSONB(flowResponseData)
 	}
 
-	// Handle reply context - look up the original message by WhatsApp message ID
-	if replyToWAMID != "" {
-		var replyToMsg models.Message
-		if err := a.DB.Where("whats_app_message_id = ?", replyToWAMID).First(&replyToMsg).Error; err == nil {
-			message.IsReply = true
-			message.ReplyToMessageID = &replyToMsg.ID
-		} else {
-			a.Log.Warn("Reply-to message not found", "reply_to_wamid", replyToWAMID)
-		}
-	}
-
 	// Add media fields if present
 	if mediaInfo != nil {
 		message.MediaURL = mediaInfo.MediaURL
@@ -1641,22 +2228,7 @@ func (a *App) saveIncomingMessageWithFlow(account *models.WhatsAppAccount, conta
 		message.MediaFilename = mediaInfo.MediaFilename
 	}
 
-	if err := a.DB.Create(&message).Error; err != nil {
-		a.Log.Error("Failed to save incoming message", "error", err)
-		return
-	}
-
-	// If the chatbot will handle this conversation (enabled + no active
-	// agent transfer), pre-mark the message as read so the contact-list
-	// unread badge doesn't briefly flash before the bot's reply arrives.
-	// See issue #280.
-	if a.willChatbotHandle(account, contact) {
-		a.DB.Model(&models.Message{}).Where("id = ?", message.ID).
-			Update("status", models.MessageStatusRead)
-		message.Status = models.MessageStatusRead
-	}
-
-	// Update contact's last message info
+	now := time.Now().UTC()
 	preview := content
 	if len(preview) > 100 {
 		preview = preview[:97] + "..."
@@ -1665,31 +2237,177 @@ func (a *App) saveIncomingMessageWithFlow(account *models.WhatsAppAccount, conta
 		preview = "[" + msgType + "]"
 	}
 
-	a.DB.Model(contact).Updates(map[string]any{
-		"last_message_at":      now,
-		"last_message_preview": preview,
-		"is_read":              false,
-		"whats_app_account":    account.Name,
-		"last_inbound_at":      now,
+	idempotencyKey := "message-incoming:" +
+		uuid.NewSHA1(account.ID, []byte(strings.TrimSpace(whatsappMsgID))).String()
+	var canonicalContact models.Contact
+	transactionErr := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		message.Status = models.MessageStatusReceived
+		message.IsReply = false
+		message.ReplyToMessageID = nil
+
+		canonical, err := contactutil.ResolveCanonicalContactForUpdate(
+			tx,
+			account.OrganizationID,
+			contact.ID,
+		)
+		if err != nil {
+			return err
+		}
+		canonicalContact = *canonical
+		message.ContactID = canonical.ID
+
+		var existingActivity models.CustomerActivityEvent
+		existingErr := tx.Where(
+			"organization_id = ? AND idempotency_key = ?",
+			account.OrganizationID,
+			idempotencyKey,
+		).First(&existingActivity).Error
+		if existingErr == nil {
+			existingCanonical, resolveExistingErr := contactutil.ResolveCanonicalContact(
+				tx,
+				account.OrganizationID,
+				existingActivity.ContactID,
+			)
+			if resolveExistingErr != nil {
+				return resolveExistingErr
+			}
+			if existingCanonical.ID != canonical.ID ||
+				existingActivity.EventType != models.CustomerActivityMessageIncoming ||
+				existingActivity.SourceObjectType != "message" {
+				return errors.New("incoming WhatsApp message ID was reused for a different contact or event")
+			}
+			return errIncomingMessageAlreadyProcessed
+		}
+		if !errors.Is(existingErr, gorm.ErrRecordNotFound) {
+			return existingErr
+		}
+
+		// Also suppress a legacy replay whose message predates the lifecycle
+		// event stream. New concurrent deliveries are still protected by the
+		// globally stable activity idempotency key below.
+		var existingMessage models.Message
+		existingMessageErr := tx.Where(
+			"organization_id = ? AND whats_app_account = ? AND whats_app_message_id = ?",
+			account.OrganizationID,
+			account.Name,
+			whatsappMsgID,
+		).First(&existingMessage).Error
+		if existingMessageErr == nil {
+			existingCanonical, resolveExistingErr := contactutil.ResolveCanonicalContact(
+				tx,
+				account.OrganizationID,
+				existingMessage.ContactID,
+			)
+			if resolveExistingErr != nil {
+				return resolveExistingErr
+			}
+			if existingCanonical.ID != canonical.ID {
+				return errors.New("incoming WhatsApp message ID was reused for a different contact")
+			}
+			return errIncomingMessageAlreadyProcessed
+		}
+		if !errors.Is(existingMessageErr, gorm.ErrRecordNotFound) {
+			return existingMessageErr
+		}
+
+		// Handle reply context within the same tenant and transaction.
+		if replyToWAMID != "" {
+			var replyToMsg models.Message
+			replyErr := tx.Where(
+				"organization_id = ? AND whats_app_message_id = ?",
+				account.OrganizationID,
+				replyToWAMID,
+			).First(&replyToMsg).Error
+			if replyErr == nil {
+				message.IsReply = true
+				message.ReplyToMessageID = &replyToMsg.ID
+			} else if !errors.Is(replyErr, gorm.ErrRecordNotFound) {
+				return replyErr
+			}
+		}
+
+		// Pre-mark bot-handled messages as read so the unread badge does not
+		// flash before the bot reply. Transfer state is checked transactionally
+		// against the canonical contact.
+		settings, settingsErr := a.getChatbotSettingsCached(
+			account.OrganizationID,
+			account.Name,
+		)
+		if settingsErr == nil && settings.IsEnabled {
+			var activeTransfers int64
+			if err := tx.Model(&models.AgentTransfer{}).
+				Where(
+					"organization_id = ? AND contact_id = ? AND status = ?",
+					account.OrganizationID,
+					canonical.ID,
+					models.TransferStatusActive,
+				).
+				Count(&activeTransfers).Error; err != nil {
+				return err
+			}
+			if activeTransfers == 0 {
+				message.Status = models.MessageStatusRead
+			}
+		}
+
+		if err := tx.Create(&message).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(canonical).Updates(map[string]any{
+			"last_message_at":      now,
+			"last_message_preview": preview,
+			"is_read":              false,
+			"whats_app_account":    account.Name,
+			"last_inbound_at":      now,
+		}).Error; err != nil {
+			return err
+		}
+
+		_, err = recordCustomerActivity(
+			tx,
+			account.OrganizationID,
+			customerActivityInput{
+				ContactID:        canonical.ID,
+				EventType:        models.CustomerActivityMessageIncoming,
+				Category:         models.CustomerActivityCategoryMessage,
+				Title:            "Message received",
+				Summary:          preview,
+				ActorType:        models.CustomerActivityActorContact,
+				SourceObjectType: "message",
+				SourceObjectID:   &message.ID,
+				OccurredAt:       now,
+				Metadata: models.JSONB{
+					"message_type":     msgType,
+					"message_status":   string(message.Status),
+					"whatsapp_account": account.Name,
+				},
+				WebhookData: models.JSONB{
+					"message_id":       message.ID.String(),
+					"contact_phone":    canonical.PhoneNumber,
+					"contact_name":     canonical.ProfileName,
+					"message_type":     models.MessageType(msgType),
+					"content":          content,
+					"whatsapp_account": account.Name,
+					"direction":        models.DirectionIncoming,
+				},
+				IdempotencyKey: idempotencyKey,
+			},
+		)
+		return err
 	})
+	if transactionErr != nil {
+		return nil, transactionErr
+	}
+
+	canonicalContact.LastMessageAt = &now
+	canonicalContact.LastMessagePreview = preview
+	canonicalContact.IsRead = false
+	canonicalContact.WhatsAppAccount = account.Name
+	canonicalContact.LastInboundAt = &now
+	*contact = canonicalContact
 	a.mirrorLegacyWhatsAppMessage(account, message.ID)
 
-	a.Log.Info("Saved incoming message", "message_id", message.ID, "contact_id", contact.ID, "media_url", message.MediaURL)
-
-	// Broadcast new message via WebSocket
-	a.broadcastNewMessage(account.OrganizationID, &message, contact)
-
-	// Dispatch webhook for incoming message
-	a.DispatchWebhook(account.OrganizationID, models.WebhookEventMessageIncoming, MessageEventData{
-		MessageID:       message.ID.String(),
-		ContactID:       contact.ID.String(),
-		ContactPhone:    contact.PhoneNumber,
-		ContactName:     contact.ProfileName,
-		MessageType:     models.MessageType(msgType),
-		Content:         content,
-		WhatsAppAccount: account.Name,
-		Direction:       models.DirectionIncoming,
-	})
+	return &message, nil
 }
 
 // isWithinBusinessHours checks if current time is within configured business hours
