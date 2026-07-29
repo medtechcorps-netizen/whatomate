@@ -836,9 +836,10 @@ func (a *App) ListAutomationPolicyExecutions(r *fastglue.Request) error {
 			reasonCode = careJSONString(steps[stepIndex].Output, "reason_code")
 		}
 		branch := ""
-		if reasonCode == "condition_true" {
+		switch reasonCode {
+		case "condition_true":
 			branch = automationBranchTrue
-		} else if reasonCode == "condition_false" {
+		case "condition_false":
 			branch = automationBranchFalse
 		}
 		responses[index].Steps = append(responses[index].Steps, AutomationExecutionStepResponse{
@@ -898,7 +899,7 @@ func (a *App) PreviewAutomationPolicy(r *fastglue.Request) error {
 			"",
 		)
 	}
-	graph := AutomationGraph{}
+	var graph AutomationGraph
 	if req.Graph != nil {
 		graph = *req.Graph
 	} else {
@@ -1315,9 +1316,4 @@ func automationPolicyAuditSnapshot(policy *models.AutomationPolicy) map[string]a
 		"trigger_event_types":   policy.TriggerEventTypes,
 		"version":               policy.Version,
 	}
-}
-
-func automationPolicyEventTypesContain(eventType string) clause.Expr {
-	encoded, _ := json.Marshal([]string{eventType})
-	return gorm.Expr("trigger_event_types @> ?::jsonb", string(encoded))
 }

@@ -532,7 +532,6 @@ func loadInboundContinuationWork(
 	}
 
 	phoneNumberID, _ := job.Payload["phone_number_id"].(string)
-	profileName, _ := job.Payload["profile_name"].(string)
 	rawMessage, exists := job.Payload["message"]
 	if strings.TrimSpace(phoneNumberID) == "" || !exists {
 		return nil, errors.New("inbound continuation payload is incomplete")
@@ -577,10 +576,6 @@ func loadInboundContinuationWork(
 	if err != nil {
 		return nil, fmt.Errorf("resolve inbound continuation contact: %w", err)
 	}
-	if profileName == "" {
-		profileName = contact.ProfileName
-	}
-
 	return &persistedIncomingMessage{
 		OrganizationID: organizationID,
 		PhoneNumberID:  phoneNumberID,

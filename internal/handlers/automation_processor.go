@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -1579,11 +1578,4 @@ func automationPolicyOwnsCareEvent(
 		return false, err
 	}
 	return executionCount > 0, nil
-}
-
-func automationTrimError(err error) string {
-	if err == nil {
-		return ""
-	}
-	return strings.TrimSpace(careErrorString(err))
 }

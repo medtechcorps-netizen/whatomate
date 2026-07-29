@@ -1640,17 +1640,6 @@ func (a *App) getCampaignMessageStatusTimeSeries(orgID uuid.UUID, filters []Filt
 	return result
 }
 
-// applyFilter chains a single user-supplied filter onto a GORM query. Skips
-// filters whose field isn't in the data-source whitelist — that's the SQL
-// injection guard. The query is unchanged in that case.
-func applyFilter(dataSource string, query *gorm.DB, filter FilterInput) *gorm.DB {
-	condition, value, ok := buildFilterSQL(dataSource, filter)
-	if !ok {
-		return query
-	}
-	return query.Where(condition, value)
-}
-
 // buildFilterSQL turns a user-supplied filter into a parameterized SQL
 // fragment. The value is always parameterized (`?`); the column name is
 // interpolated raw, which is why we whitelist the field against
