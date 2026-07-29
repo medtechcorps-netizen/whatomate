@@ -504,6 +504,8 @@ test.describe('Pickup respects assign_to_same_agent', () => {
         { resource: 'chat', action: 'read' },
         { resource: 'transfers', action: 'read' },
         { resource: 'transfers', action: 'pickup' },
+        // Resume is a transfer mutation; the handler separately enforces ownership.
+        { resource: 'transfers', action: 'write' },
         { resource: 'contacts', action: 'read' },
       ],
     })
