@@ -17,10 +17,10 @@ import {
  */
 const scope = createTestScope('transfers-permission-tabs')
 
-test.describe('Transfers tabs respect transfers:write permission', () => {
+test.describe('Transfers tabs respect chat.assign:write permission', () => {
   let api: ApiHelper
   let fullAccess: TestUserHandle
-  let agentOnly: TestUserHandle
+  let transferWriter: TestUserHandle
 
   test.beforeAll(async ({ request }) => {
     api = new ApiHelper(request)
@@ -35,16 +35,17 @@ test.describe('Transfers tabs respect transfers:write permission', () => {
       permissions: [
         { resource: 'chat', action: 'read' },
         { resource: 'transfers', action: 'read' },
-        { resource: 'transfers', action: 'write' },
         { resource: 'transfers', action: 'pickup' },
+        { resource: 'chat.assign', action: 'write' },
       ],
     })
 
-    agentOnly = await createUserWithPermissions(api, scope, {
-      userSlug: 'tx-pickup',
+    transferWriter = await createUserWithPermissions(api, scope, {
+      userSlug: 'tx-writer',
       permissions: [
         { resource: 'chat', action: 'read' },
         { resource: 'transfers', action: 'read' },
+        { resource: 'transfers', action: 'write' },
         { resource: 'transfers', action: 'pickup' },
       ],
     })
@@ -54,12 +55,12 @@ test.describe('Transfers tabs respect transfers:write permission', () => {
     // Best-effort cleanup via existing API endpoints. CI gives a fresh DB
     // per run, so this isn't load-bearing — just a courtesy for local devs.
     await api.deleteUser(fullAccess.user.id).catch(() => {})
-    await api.deleteUser(agentOnly.user.id).catch(() => {})
+    await api.deleteUser(transferWriter.user.id).catch(() => {})
     await api.deleteRole(fullAccess.role.id).catch(() => {})
-    await api.deleteRole(agentOnly.role.id).catch(() => {})
+    await api.deleteRole(transferWriter.role.id).catch(() => {})
   })
 
-  test('user with transfers:write sees all three tabs', async ({ page }) => {
+  test('user with chat.assign:write sees all three tabs', async ({ page }) => {
     await loginAs(page, fullAccess)
     await page.goto('/chatbot/transfers')
     await page.waitForLoadState('networkidle')
@@ -71,8 +72,8 @@ test.describe('Transfers tabs respect transfers:write permission', () => {
     await expect(page.getByRole('tab', { name: /History/i })).toBeVisible()
   })
 
-  test('user without transfers:write sees agent-only view (no tabs)', async ({ page }) => {
-    await loginAs(page, agentOnly)
+  test('user with transfers:write but without chat.assign:write sees agent-only view', async ({ page }) => {
+    await loginAs(page, transferWriter)
     await page.goto('/chatbot/transfers')
     await page.waitForLoadState('networkidle')
 

@@ -127,9 +127,8 @@ test.describe('Pick from queue — agent flow', () => {
     api = new ApiHelper(request)
     await api.login(SUPER_ADMIN.email, SUPER_ADMIN.password)
 
-    // Agent role: read chat + transfers, pickup but NOT transfers:write.
-    // transfers:write would flip the view into admin/manager mode and hide
-    // the Pick Next button under #actions.
+    // Agent role: read chat + transfers and pick from the queue, without the
+    // organization-wide chat.assign:write management capability.
     agent = await createUserWithPermissions(api, scope, {
       userSlug: 'pickup-agent',
       permissions: [
