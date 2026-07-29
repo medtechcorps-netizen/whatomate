@@ -23,7 +23,6 @@ import (
 )
 
 const (
-	maxRelayWebhookBytes      = 2 << 20
 	rawInboundProcessingLease = 2 * time.Minute
 )
 
@@ -38,7 +37,7 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
 	}
 	body := r.RequestCtx.PostBody()
-	if len(body) == 0 || len(body) > maxRelayWebhookBytes {
+	if len(body) == 0 || len(body) > channelapi.RelayWebhookMaxBodyBytes {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid webhook body", nil, "")
 	}
 
@@ -56,17 +55,22 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 
 	var account models.ChannelAccount
 	if err := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
+		now := time.Now().UTC()
 		return tx.
-			Preload(
-				"Credentials",
-				"organization_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
-				orgID,
-				[]models.ChannelCredentialStatus{
-					models.ChannelCredentialStatusActive,
-					models.ChannelCredentialStatusExpiring,
-				},
-				time.Now().UTC(),
-			).
+			Preload("Credentials", func(credentials *gorm.DB) *gorm.DB {
+				return credentials.
+					Where(
+						"organization_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+						orgID,
+						[]models.ChannelCredentialStatus{
+							models.ChannelCredentialStatusActive,
+							models.ChannelCredentialStatusExpiring,
+						},
+						now,
+					).
+					Order("version DESC").
+					Order("id ASC")
+			}).
 			Where(
 				"organization_id = ? AND id = ? AND status IN ?",
 				orgID,
@@ -221,8 +225,19 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 	}
 
 	processErr := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
+		// AI scheduling and every control-plane change share this tenant mutex.
+		// Acquire it before touching account, identity, contact, conversation, or
+		// message rows so no later lock is held while waiting for the mutex.
+		if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
+			return err
+		}
+		currentAccount, err := loadChannelAccount(tx, orgID, account.ID, false)
+		if err != nil {
+			return err
+		}
+		account = *currentAccount
 		for i := range events {
-			if err := processNormalizedChannelEvent(tx, &account, &events[i]); err != nil {
+			if err := processNormalizedChannelEvent(tx, &account, &events[i], rawEvent.ReceivedAt); err != nil {
 				return fmt.Errorf("process normalized event %d: %w", i, err)
 			}
 		}
@@ -362,7 +377,17 @@ func persistOrClaimRawInboundEvent(tx *gorm.DB, rawEvent *models.InboundEvent) (
 	return claimed, claimed, nil
 }
 
-func processNormalizedChannelEvent(tx *gorm.DB, account *models.ChannelAccount, event *channelapi.InboundEvent) error {
+func processNormalizedChannelEvent(
+	tx *gorm.DB,
+	account *models.ChannelAccount,
+	event *channelapi.InboundEvent,
+	acceptedAt time.Time,
+) error {
+	if acceptedAt.IsZero() {
+		acceptedAt = time.Now().UTC()
+	} else {
+		acceptedAt = acceptedAt.UTC()
+	}
 	eventPayload, err := valueToJSONB(event)
 	if err != nil {
 		return err
@@ -375,7 +400,7 @@ func processNormalizedChannelEvent(tx *gorm.DB, account *models.ChannelAccount, 
 		EventType:           string(event.Type),
 		Status:              models.InboundEventStatusProcessing,
 		SignatureValid:      true,
-		ReceivedAt:          time.Now().UTC(),
+		ReceivedAt:          acceptedAt,
 		ProcessingStartedAt: timePointer(time.Now().UTC()),
 		Headers:             models.JSONB{},
 		Payload:             eventPayload,
@@ -397,7 +422,7 @@ func processNormalizedChannelEvent(tx *gorm.DB, account *models.ChannelAccount, 
 
 	switch event.Type {
 	case channelapi.NormalizedEventTypeMessage:
-		err = persistInboundChannelMessage(tx, account, event, event.Message)
+		err = persistInboundChannelMessage(tx, account, event, event.Message, acceptedAt)
 	case channelapi.NormalizedEventTypeMessageStatus:
 		err = persistChannelMessageStatus(tx, account, event, event.MessageStatus)
 	case channelapi.NormalizedEventTypeRead:
@@ -426,10 +451,34 @@ func persistInboundChannelMessage(
 	account *models.ChannelAccount,
 	event *channelapi.InboundEvent,
 	inbound *channelapi.InboundMessage,
+	acceptedAt time.Time,
 ) error {
 	if inbound == nil {
 		return errors.New("normalized message payload is missing")
 	}
+	// Adapter validation is the first line of defense, but persistence remains
+	// fail-closed in case another adapter emits an invalid canonical event.
+	if inbound.Direction != models.DirectionIncoming {
+		return errors.New("normalized inbound message direction must be incoming")
+	}
+	if inbound.Sender.Role != models.ConversationParticipantRoleCustomer {
+		return errors.New("normalized inbound message sender role must be customer")
+	}
+	if acceptedAt.IsZero() {
+		acceptedAt = time.Now().UTC()
+	} else {
+		acceptedAt = acceptedAt.UTC()
+	}
+	var eventOccurredAt time.Time
+	if event != nil {
+		eventOccurredAt = event.OccurredAt
+	}
+	serviceWindowOpenedAt := channelapi.InboundServiceWindowAnchor(
+		acceptedAt,
+		eventOccurredAt,
+		inbound.SentAt,
+		inbound.ReceivedAt,
+	)
 	identity, contact, err := findOrCreateChannelIdentity(tx, account, inbound.Sender, inbound.ReceivedAt)
 	if err != nil {
 		return err
@@ -490,6 +539,17 @@ func persistInboundChannelMessage(
 			return err
 		}
 	}
+	if err := enqueueChannelAIReply(
+		tx,
+		account,
+		conversation,
+		&message,
+		inbound.Parts,
+		serviceWindowOpenedAt,
+		acceptedAt,
+	); err != nil {
+		return err
+	}
 
 	preview := messagePreview(inbound.Parts)
 	when := inbound.ReceivedAt
@@ -507,16 +567,25 @@ func persistInboundChannelMessage(
 		}).Error; err != nil {
 		return err
 	}
+	conversationUpdates := map[string]any{
+		"status":               models.InboxConversationStatusOpen,
+		"last_message_at":      when,
+		"last_inbound_at":      when,
+		"last_message_preview": preview,
+		"unread_count":         gorm.Expr("unread_count + 1"),
+		"updated_at":           when,
+	}
+	if serviceWindowEndsAt := channelapi.InboundServiceWindowEndsAt(
+		account.Channel,
+		serviceWindowOpenedAt,
+	); serviceWindowEndsAt != nil {
+		conversationUpdates["service_window_ends_at"] = monotonicServiceWindowEndsAt(
+			*serviceWindowEndsAt,
+		)
+	}
 	if err := tx.Model(&models.InboxConversation{}).
 		Where("id = ? AND organization_id = ?", conversation.ID, account.OrganizationID).
-		Updates(map[string]any{
-			"status":               models.InboxConversationStatusOpen,
-			"last_message_at":      when,
-			"last_inbound_at":      when,
-			"last_message_preview": preview,
-			"unread_count":         gorm.Expr("unread_count + 1"),
-			"updated_at":           when,
-		}).Error; err != nil {
+		Updates(conversationUpdates).Error; err != nil {
 		return err
 	}
 
@@ -540,6 +609,24 @@ func persistInboundChannelMessage(
 		},
 		DoNothing: true,
 	}).Create(&messageEvent).Error
+}
+
+// monotonicServiceWindowEndsAt keeps the provider service window from moving
+// backwards when delayed events arrive after newer ones. Keeping the comparison
+// inside the UPDATE also makes competing PostgreSQL writers serialize safely:
+// after waiting on the row lock, each statement compares its candidate against
+// the latest committed value rather than a value read before the lock wait.
+func monotonicServiceWindowEndsAt(candidate time.Time) clause.Expr {
+	candidate = candidate.UTC()
+	return gorm.Expr(
+		`CASE
+			WHEN service_window_ends_at IS NULL OR service_window_ends_at < ?
+				THEN ?
+			ELSE service_window_ends_at
+		END`,
+		candidate,
+		candidate,
+	)
 }
 
 func findOrCreateChannelIdentity(

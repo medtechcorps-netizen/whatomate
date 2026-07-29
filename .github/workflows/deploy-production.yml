@@ -1,0 +1,118 @@
+name: Production Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy-production
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: production
+
+    steps:
+      - name: Wait for protected-main checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUIRED_CHECKS: test lint build security e2e tenant-isolation
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 3600))
+
+          while (( SECONDS < deadline )); do
+            check_runs="$(
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100"
+            )"
+            pending=()
+
+            for check_name in ${REQUIRED_CHECKS}; do
+              conclusion="$(
+                jq -r --arg name "${check_name}" \
+                  '[.check_runs[] | select(.name == $name)] |
+                   sort_by(.started_at // .created_at) |
+                   last |
+                   .conclusion // empty' \
+                  <<<"${check_runs}"
+              )"
+
+              case "${conclusion}" in
+                success)
+                  ;;
+                failure|cancelled|timed_out|action_required|stale)
+                  echo "Required check ${check_name} concluded ${conclusion}."
+                  exit 1
+                  ;;
+                *)
+                  pending+=("${check_name}")
+                  ;;
+              esac
+            done
+
+            if (( ${#pending[@]} == 0 )); then
+              echo "All protected-main checks passed for ${GITHUB_SHA}."
+              exit 0
+            fi
+
+            echo "Waiting for: ${pending[*]}"
+            sleep 15
+          done
+
+          echo "Timed out waiting for protected-main checks."
+          exit 1
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Verify production RLS migration gate
+        run: |
+          set -euo pipefail
+          app_spec="$(
+            doctl apps spec get \
+              54bc0d92-73e9-4f8b-86cd-c3fd96e06beb \
+              --format json
+          )"
+          jq -e '
+            any(
+              .jobs[]?;
+              .name == "rereply-rls-migrate"
+              and .kind == "PRE_DEPLOY"
+              and .git.repo_clone_url == "https://github.com/medtechcorps-netizen/whatomate.git"
+              and .git.branch == "main"
+              and .dockerfile_path == "docker/Dockerfile"
+              and (.run_command | contains("rereply rls-migrate"))
+              and any(.envs[]?; .key == "WHATOMATE_DATABASE__MIGRATION_URL")
+              and any(.envs[]?; .key == "WHATOMATE_DATABASE__RUNTIME_ROLE")
+            )
+          ' <<<"${app_spec}" >/dev/null
+
+      - name: Deploy protected main
+        run: |
+          doctl apps create-deployment \
+            54bc0d92-73e9-4f8b-86cd-c3fd96e06beb \
+            --force-rebuild \
+            --wait
+
+      - name: Verify production readiness
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 12 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            https://app.rereply.app/ready

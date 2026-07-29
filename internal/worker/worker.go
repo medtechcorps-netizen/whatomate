@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -34,6 +35,7 @@ type Worker struct {
 	Redis     *redis.Client
 	Log       logf.Logger
 	WhatsApp  *whatsapp.Client
+	QwenHTTP  *http.Client
 	Consumer  *queue.RedisConsumer
 	Publisher *queue.Publisher
 }
@@ -56,6 +58,7 @@ func New(cfg *config.Config, db *gorm.DB, rdb *redis.Client, log logf.Logger) (*
 		Redis:     rdb,
 		Log:       log,
 		WhatsApp:  whatsapp.New(log),
+		QwenHTTP:  &http.Client{Timeout: 30 * time.Second},
 		Consumer:  consumer,
 		Publisher: publisher,
 	}, nil

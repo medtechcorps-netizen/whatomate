@@ -13,6 +13,41 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestWithTenantReadCommittedOverridesSessionDefault(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organizationID := uuid.New()
+
+	require.NoError(t, db.Connection(func(connection *gorm.DB) error {
+		if err := connection.Exec(
+			"SET default_transaction_isolation TO 'repeatable read'",
+		).Error; err != nil {
+			return err
+		}
+		defer func() {
+			_ = connection.Exec("RESET default_transaction_isolation").Error
+		}()
+
+		return database.WithTenantReadCommitted(
+			connection,
+			organizationID,
+			func(tx *gorm.DB) error {
+				var isolation string
+				if err := tx.Raw("SHOW transaction_isolation").
+					Scan(&isolation).Error; err != nil {
+					return err
+				}
+				if isolation != "read committed" {
+					return fmt.Errorf(
+						"transaction isolation is %q; expected read committed",
+						isolation,
+					)
+				}
+				return nil
+			},
+		)
+	}))
+}
+
 func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	adminDB := testutil.SetupTestDB(t)
 	testutil.TruncateTables(adminDB)
@@ -208,6 +243,18 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		Payload:          models.JSONB{},
 	}
 	require.NoError(t, adminDB.Create(&outboxB).Error)
+	scheduledReplyB := models.ScheduledJob{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgB.ID,
+		Kind:           models.ScheduledJobKindChannelAIReply,
+		AggregateType:  models.ChannelAIReplyAggregateType,
+		RunAt:          time.Now().UTC().Add(-time.Minute),
+		Status:         models.ScheduledJobStatusPending,
+		MaxAttempts:    5,
+		IdempotencyKey: "rls-ai-reply-" + uuid.NewString(),
+		Payload:        models.JSONB{},
+	}
+	require.NoError(t, adminDB.Create(&scheduledReplyB).Error)
 
 	flowA := models.ChatbotFlow{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
@@ -258,6 +305,31 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 
 	t.Run("runtime startup verification accepts only the restricted role", func(t *testing.T) {
 		require.Error(t, database.VerifyTenantRLS(adminDB, runtimeRole))
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+		}))
+	})
+
+	t.Run("runtime startup rejects stale routing functions", func(t *testing.T) {
+		require.NoError(t, adminDB.Exec(`
+			CREATE OR REPLACE FUNCTION public.rereply_rls_routing_version()
+			RETURNS integer
+			LANGUAGE sql
+			IMMUTABLE
+			SECURITY DEFINER
+			SET search_path = pg_catalog, public
+			AS $function$
+			  SELECT 1
+			$function$
+		`).Error)
+		err := asRuntime(func(runtimeDB *gorm.DB) error {
+			return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "routing version")
+
+		// Restore the current resolver set for the remaining isolation checks.
+		require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
 		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
 			return database.VerifyTenantRLS(runtimeDB, runtimeRole)
 		}))
@@ -438,6 +510,30 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 			}
 			if visibleJobs != 0 {
 				return fmt.Errorf("unscoped outbox query exposed %d rows", visibleJobs)
+			}
+			return nil
+		}))
+		require.Contains(t, organizationIDs, orgB.ID)
+	})
+
+	t.Run("AI reply resolver returns tenant IDs without exposing scheduled jobs", func(t *testing.T) {
+		var organizationIDs []uuid.UUID
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			if err := runtimeDB.Raw(
+				"SELECT * FROM public.rereply_ready_channel_ai_reply_orgs(?, ?, ?)",
+				uuid.Nil,
+				20,
+				time.Now().UTC().Add(-2*time.Minute),
+			).Scan(&organizationIDs).Error; err != nil {
+				return err
+			}
+
+			var visibleJobs int64
+			if err := runtimeDB.Model(&models.ScheduledJob{}).Count(&visibleJobs).Error; err != nil {
+				return err
+			}
+			if visibleJobs != 0 {
+				return fmt.Errorf("unscoped scheduled job query exposed %d rows", visibleJobs)
 			}
 			return nil
 		}))

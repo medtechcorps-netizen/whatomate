@@ -18,6 +18,10 @@ import (
 // TestJWTSecret is the shared JWT secret for tests.
 const TestJWTSecret = "test-secret-key-must-be-at-least-32-chars"
 
+// testBcryptCost keeps fixture creation fast while still producing valid bcrypt
+// hashes for authentication tests. Production password hashing remains unchanged.
+const testBcryptCost = bcrypt.MinCost
+
 // --- Organization ---
 
 // CreateTestReseller creates a test reseller in the database.
@@ -78,7 +82,7 @@ func WithEmail(email string) UserOption {
 // WithPassword sets the password (bcrypt hashed) for the test user.
 func WithPassword(password string) UserOption {
 	return func(u *models.User) {
-		hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		hash, _ := bcrypt.GenerateFromPassword([]byte(password), testBcryptCost)
 		u.PasswordHash = string(hash)
 	}
 }
@@ -116,7 +120,7 @@ func WithFullName(name string) UserOption {
 func CreateTestUser(t *testing.T, db *gorm.DB, orgID uuid.UUID, opts ...UserOption) *models.User {
 	t.Helper()
 
-	hash, err := bcrypt.GenerateFromPassword([]byte("password123"), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("password123"), testBcryptCost)
 	require.NoError(t, err)
 
 	user := &models.User{

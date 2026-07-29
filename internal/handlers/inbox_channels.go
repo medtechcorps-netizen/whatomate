@@ -44,6 +44,8 @@ type InboxConversationResponse struct {
 	LastInboundAt          *time.Time                     `json:"last_inbound_at,omitempty"`
 	LastOutboundAt         *time.Time                     `json:"last_outbound_at,omitempty"`
 	ServiceWindowEndsAt    *time.Time                     `json:"service_window_ends_at,omitempty"`
+	AIPaused               bool                           `json:"ai_paused"`
+	AIPauseReason          string                         `json:"ai_pause_reason,omitempty"`
 	SnoozedUntil           *time.Time                     `json:"snoozed_until,omitempty"`
 	ResolvedAt             *time.Time                     `json:"resolved_at,omitempty"`
 	Metadata               models.JSONB                   `json:"metadata"`
@@ -296,6 +298,41 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Conversation not found", nil, "")
 	}
+	if conversation.Channel == models.ChannelThreads {
+		allowed, entitlementErr := a.HasProductEntitlement(
+			userID,
+			orgID,
+			channelapi.ThreadsPublicEngagementEntitlementKey,
+		)
+		if entitlementErr != nil {
+			a.Log.Error(
+				"Failed to evaluate Threads public engagement entitlement",
+				"error",
+				entitlementErr,
+				"organization_id",
+				orgID,
+				"conversation_id",
+				conversation.ID,
+			)
+			return r.SendErrorEnvelope(
+				fasthttp.StatusServiceUnavailable,
+				"Threads public engagement entitlement could not be evaluated",
+				nil,
+				"",
+			)
+		}
+		if !allowed {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusPaymentRequired,
+				"Threads public replies are not included in the organization's active plan",
+				nil,
+				"",
+			)
+		}
+	}
+	if err := validateThreadsPublicReplyTarget(conversation, &request); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
 	if conversation.ChannelAccount == nil ||
 		conversation.ChannelAccount.Status != models.ChannelAccountStatusActive {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Channel account is not active", nil, "")
@@ -506,6 +543,16 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 			if count != 1 {
 				return errors.New("reply message was not found in this conversation")
 			}
+		}
+		if _, err := setInboxConversationAIStateTx(
+			tx,
+			orgID,
+			conversation.ID,
+			true,
+			&userID,
+			"human_reply",
+		); err != nil {
+			return err
 		}
 		if err := tx.Create(&message).Error; err != nil {
 			return err
@@ -723,18 +770,23 @@ func loadInboxConversation(db *gorm.DB, orgID, conversationID uuid.UUID, credent
 		Preload("Contact", "organization_id = ?", orgID).
 		Preload("ContactIdentity", "organization_id = ?", orgID)
 	if credentials {
+		now := time.Now().UTC()
 		query = query.
 			Preload("ChannelAccount", "organization_id = ?", orgID).
-			Preload(
-				"ChannelAccount.Credentials",
-				"organization_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
-				orgID,
-				[]models.ChannelCredentialStatus{
-					models.ChannelCredentialStatusActive,
-					models.ChannelCredentialStatusExpiring,
-				},
-				time.Now().UTC(),
-			)
+			Preload("ChannelAccount.Credentials", func(credentials *gorm.DB) *gorm.DB {
+				return credentials.
+					Where(
+						"organization_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+						orgID,
+						[]models.ChannelCredentialStatus{
+							models.ChannelCredentialStatusActive,
+							models.ChannelCredentialStatusExpiring,
+						},
+						now,
+					).
+					Order("version DESC").
+					Order("id ASC")
+			})
 	} else {
 		query = query.Preload("ChannelAccount", "organization_id = ?", orgID)
 	}
@@ -776,6 +828,8 @@ func inboxConversationToResponse(conversation *models.InboxConversation) InboxCo
 		LastInboundAt:          conversation.LastInboundAt,
 		LastOutboundAt:         conversation.LastOutboundAt,
 		ServiceWindowEndsAt:    conversation.ServiceWindowEndsAt,
+		AIPaused:               inboxConversationAIIsPaused(conversation.Config),
+		AIPauseReason:          inboxConversationAIString(conversation.Config, models.ConversationConfigAIPauseReason),
 		SnoozedUntil:           conversation.SnoozedUntil,
 		ResolvedAt:             conversation.ResolvedAt,
 		Metadata:               cloneJSONB(conversation.Metadata),
@@ -857,10 +911,47 @@ func validateOutboundParts(capabilities channelapi.Capabilities, request SendInb
 		if utf8.RuneCountInString(participant.ExternalID) > 512 ||
 			utf8.RuneCountInString(participant.Address) > 320 ||
 			utf8.RuneCountInString(participant.DisplayName) > 255 {
-			return fmt.Errorf("CC recipient %d contains an overlong field", index)
+			return fmt.Errorf("cc recipient %d contains an overlong field", index)
 		}
 	}
 	return nil
+}
+
+func validateThreadsPublicReplyTarget(
+	conversation *models.InboxConversation,
+	request *SendInboxConversationMessageRequest,
+) error {
+	if conversation == nil || conversation.Channel != models.ChannelThreads {
+		return nil
+	}
+	if request == nil {
+		return errors.New("threads public replies require an existing reply or mention target")
+	}
+	if conversation.ChannelAccount == nil ||
+		!strings.EqualFold(conversation.ChannelAccount.Provider, channelapi.RelayProvider) {
+		return errors.New("threads public replies require a compatible signed provider relay")
+	}
+	if stringConfigValue(conversation.ChannelAccount.Config, "engagement_mode") != threadsPublicEngagementMode {
+		return errors.New("threads channel is not configured for public replies and mentions")
+	}
+
+	target := request.ReplyToExternalID
+	conversationTarget := conversation.ExternalConversationID
+	if strings.TrimSpace(target) == "" || strings.TrimSpace(conversationTarget) == "" {
+		return errors.New("threads public replies require an existing reply or mention target")
+	}
+	if target != conversationTarget {
+		return errors.New("threads reply target must match the selected public conversation")
+	}
+
+	engagementType, _ := conversation.Metadata["engagement_type"].(string)
+	switch strings.ToLower(strings.TrimSpace(engagementType)) {
+	case "reply", "mention":
+		request.ReplyToExternalID = conversationTarget
+		return nil
+	default:
+		return errors.New("threads direct messages and standalone posts are not supported; select a public reply or mention")
+	}
 }
 
 func channelSupportsMediaType(supported []string, value string) bool {

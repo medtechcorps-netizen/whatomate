@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -38,6 +39,7 @@ const (
 
 // ProductPlanPriceResponse is the public, provider-neutral price shape.
 type ProductPlanPriceResponse struct {
+	ID               *uuid.UUID             `json:"id,omitempty"`
 	Code             string                 `json:"code"`
 	Currency         string                 `json:"currency"`
 	UnitAmountMinor  int64                  `json:"unit_amount_minor"`
@@ -64,6 +66,8 @@ type ProductPlanResponse struct {
 // ProductSubscriptionResponse is the safe subscription summary used by the UI.
 type ProductSubscriptionResponse struct {
 	ID                 *uuid.UUID             `json:"id,omitempty"`
+	PlanID             *uuid.UUID             `json:"plan_id,omitempty"`
+	PlanPriceID        *uuid.UUID             `json:"plan_price_id,omitempty"`
 	PlanCode           string                 `json:"plan_code"`
 	PlanName           string                 `json:"plan_name,omitempty"`
 	Status             string                 `json:"status"`
@@ -78,11 +82,12 @@ type ProductSubscriptionResponse struct {
 
 // ProductEntitlementsResponse is the effective entitlement set after overrides.
 type ProductEntitlementsResponse struct {
-	PlanCode       string         `json:"plan_code"`
-	Mode           string         `json:"mode"`
-	Entitlements   map[string]any `json:"entitlements"`
-	OverriddenKeys []string       `json:"overridden_keys"`
-	EvaluatedAt    time.Time      `json:"evaluated_at"`
+	PlanCode           string                    `json:"plan_code"`
+	Mode               string                    `json:"mode"`
+	SubscriptionStatus models.SubscriptionStatus `json:"subscription_status,omitempty"`
+	Entitlements       map[string]any            `json:"entitlements"`
+	OverriddenKeys     []string                  `json:"overridden_keys"`
+	EvaluatedAt        time.Time                 `json:"evaluated_at"`
 }
 
 // ProductEntitlementDecision is the server-side licensing result for one
@@ -160,7 +165,7 @@ type SetOrganizationSubscriptionRequest struct {
 	PriceCode       string                    `json:"price_code,omitempty"`
 	Status          models.SubscriptionStatus `json:"status"`
 	TrialDays       *int                      `json:"trial_days,omitempty"`
-	ManualReference string                    `json:"manual_reference,omitempty"`
+	ManualReference string                    `json:"manual_reference"`
 }
 
 // OnboardingStepResponse is one resumable go-live milestone.
@@ -548,9 +553,30 @@ func productCommercialBuiltinToResponse(template builtInWorkspaceTemplate) Works
 	}
 }
 
-func productCommercialSubscriptionToResponse(
+func productCommercialEffectiveSubscriptionStatus(
+	subscription *models.Subscription,
+	now time.Time,
+) models.SubscriptionStatus {
+	if subscription == nil {
+		return ""
+	}
+	if productCommercialSubscriptionPermitsFeatures(subscription, now) {
+		return subscription.Status
+	}
+	switch subscription.Status {
+	case models.SubscriptionStatusActive,
+		models.SubscriptionStatusTrialing,
+		models.SubscriptionStatusPastDue:
+		return models.SubscriptionStatusExpired
+	default:
+		return subscription.Status
+	}
+}
+
+func productCommercialSubscriptionToResponseAt(
 	subscription *models.Subscription,
 	plan *models.Plan,
+	now time.Time,
 ) ProductSubscriptionResponse {
 	if subscription == nil {
 		return ProductSubscriptionResponse{
@@ -560,9 +586,12 @@ func productCommercialSubscriptionToResponse(
 			Provider: models.BillingProviderManual,
 		}
 	}
+	planID := subscription.PlanID
 	response := ProductSubscriptionResponse{
 		ID:                 &subscription.ID,
-		Status:             string(subscription.Status),
+		PlanID:             &planID,
+		PlanPriceID:        subscription.PlanPriceID,
+		Status:             string(productCommercialEffectiveSubscriptionStatus(subscription, now)),
 		Provider:           subscription.Provider,
 		TrialEndsAt:        subscription.TrialEndsAt,
 		GraceUntil:         subscription.GraceUntil,
@@ -579,6 +608,57 @@ func productCommercialSubscriptionToResponse(
 		response.PlanCode = "unavailable"
 	}
 	return response
+}
+
+func productCommercialSubscriptionToResponse(
+	subscription *models.Subscription,
+	plan *models.Plan,
+) ProductSubscriptionResponse {
+	return productCommercialSubscriptionToResponseAt(
+		subscription,
+		plan,
+		time.Now().UTC(),
+	)
+}
+
+type productCommercialSubscriptionAuditSnapshot struct {
+	ProductSubscriptionResponse
+	ManualReference string `json:"manual_reference,omitempty"`
+}
+
+func productCommercialAuditManualReference(providerData models.JSONB) string {
+	reference := productCommercialString(providerData["manual_reference"])
+	reference = strings.Map(func(value rune) rune {
+		if unicode.IsControl(value) {
+			return -1
+		}
+		return value
+	}, reference)
+	runes := []rune(reference)
+	if len(runes) > 255 {
+		reference = string(runes[:255])
+	}
+	return reference
+}
+
+func productCommercialSubscriptionToAuditSnapshotAt(
+	subscription *models.Subscription,
+	plan *models.Plan,
+	now time.Time,
+) productCommercialSubscriptionAuditSnapshot {
+	snapshot := productCommercialSubscriptionAuditSnapshot{
+		ProductSubscriptionResponse: productCommercialSubscriptionToResponseAt(
+			subscription,
+			plan,
+			now,
+		),
+	}
+	if subscription != nil {
+		snapshot.ManualReference = productCommercialAuditManualReference(
+			subscription.ProviderData,
+		)
+	}
+	return snapshot
 }
 
 func productCommercialPrivacyRequestToResponse(request models.PrivacyRequest) PrivacyRequestResponse {
@@ -830,7 +910,10 @@ func (a *App) EvaluateProductEntitlement(
 		return decision, err
 	}
 	decision.SubscriptionID = &subscription.ID
-	decision.SubscriptionStatus = subscription.Status
+	decision.SubscriptionStatus = productCommercialEffectiveSubscriptionStatus(
+		&subscription,
+		now,
+	)
 	if !productCommercialSubscriptionPermitsFeatures(&subscription, now) {
 		decision.Mode = "suspended"
 		decision.Reason = "Subscription status does not permit product features"
@@ -867,25 +950,15 @@ func (a *App) HasProductEntitlement(
 	return decision.Allowed, err
 }
 
-// ListProductPlans returns plans visible to the current organization's reseller.
-func (a *App) ListProductPlans(r *fastglue.Request) error {
-	orgID, _, err := a.requireAuth(r, models.ResourceBilling, models.ActionRead)
-	if err != nil {
-		return nil
+func (a *App) productCommercialPlanCatalog(
+	organization *models.Organization,
+	publicOnly bool,
+	assignableOnly bool,
+) ([]ProductPlanResponse, error) {
+	query := a.DB.Where("status = ?", models.CommercialPlanStatusActive)
+	if publicOnly {
+		query = query.Where("is_public = ?", true)
 	}
-
-	var organization models.Organization
-	if err := a.DB.Select("id", "reseller_id").
-		Where("id = ?", orgID).
-		First(&organization).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
-	}
-
-	query := a.DB.Where(
-		"status = ? AND is_public = ?",
-		models.CommercialPlanStatusActive,
-		true,
-	)
 	if organization.ResellerID != nil {
 		query = query.Where("reseller_id IS NULL OR reseller_id = ?", *organization.ResellerID)
 	} else {
@@ -894,10 +967,10 @@ func (a *App) ListProductPlans(r *fastglue.Request) error {
 
 	var plans []models.Plan
 	if err := query.Order("display_order ASC, name ASC").Find(&plans).Error; err != nil {
-		return a.sendProductCommercialError(r, "list product plans", err)
+		return nil, err
 	}
 	if len(plans) == 0 {
-		return r.SendEnvelope(map[string]any{"plans": []ProductPlanResponse{}})
+		return []ProductPlanResponse{}, nil
 	}
 
 	planIDs := make([]uuid.UUID, len(plans))
@@ -908,18 +981,29 @@ func (a *App) ListProductPlans(r *fastglue.Request) error {
 	if err := a.DB.Where("plan_id IN ?", planIDs).
 		Order("key ASC").
 		Find(&entitlements).Error; err != nil {
-		return a.sendProductCommercialError(r, "list plan entitlements", err)
+		return nil, err
 	}
 	var prices []models.PlanPrice
 	now := time.Now().UTC()
-	if err := a.DB.Where(
+	priceQuery := a.DB.Where(
 		"plan_id IN ? AND is_active = ? AND (effective_from IS NULL OR effective_from <= ?) AND (effective_until IS NULL OR effective_until > ?)",
 		planIDs,
 		true,
 		now,
 		now,
-	).Order("unit_amount_minor ASC").Find(&prices).Error; err != nil {
-		return a.sendProductCommercialError(r, "list plan prices", err)
+	)
+	if assignableOnly {
+		priceQuery = priceQuery.Where(
+			"provider = ? AND interval IN ?",
+			models.BillingProviderManual,
+			[]models.BillingInterval{
+				models.BillingIntervalMonth,
+				models.BillingIntervalYear,
+			},
+		)
+	}
+	if err := priceQuery.Order("unit_amount_minor ASC, code ASC").Find(&prices).Error; err != nil {
+		return nil, err
 	}
 
 	entitlementsByPlan := make(map[uuid.UUID]map[string]any)
@@ -932,7 +1016,9 @@ func (a *App) ListProductPlans(r *fastglue.Request) error {
 	}
 	pricesByPlan := make(map[uuid.UUID][]ProductPlanPriceResponse)
 	for _, price := range prices {
+		priceID := price.ID
 		pricesByPlan[price.PlanID] = append(pricesByPlan[price.PlanID], ProductPlanPriceResponse{
+			ID:               &priceID,
 			Code:             price.Code,
 			Currency:         price.Currency,
 			UnitAmountMinor:  price.UnitAmountMinor,
@@ -943,7 +1029,7 @@ func (a *App) ListProductPlans(r *fastglue.Request) error {
 		})
 	}
 
-	response := make([]ProductPlanResponse, len(plans))
+	response := make([]ProductPlanResponse, 0, len(plans))
 	for i := range plans {
 		entitlementMap := entitlementsByPlan[plans[i].ID]
 		if entitlementMap == nil {
@@ -953,8 +1039,12 @@ func (a *App) ListProductPlans(r *fastglue.Request) error {
 		if planPrices == nil {
 			planPrices = []ProductPlanPriceResponse{}
 		}
-		response[i] = ProductPlanResponse{
-			ID:           &plans[i].ID,
+		if assignableOnly && len(planPrices) == 0 {
+			continue
+		}
+		planID := plans[i].ID
+		response = append(response, ProductPlanResponse{
+			ID:           &planID,
 			Code:         plans[i].Code,
 			Name:         plans[i].Name,
 			Description:  plans[i].Description,
@@ -964,7 +1054,63 @@ func (a *App) ListProductPlans(r *fastglue.Request) error {
 			IsPublic:     plans[i].IsPublic,
 			Entitlements: entitlementMap,
 			Prices:       planPrices,
+		})
+	}
+	return response, nil
+}
+
+// ListProductPlans returns public plans visible to the current organization's reseller.
+func (a *App) ListProductPlans(r *fastglue.Request) error {
+	orgID, _, err := a.requireAuth(r, models.ResourceBilling, models.ActionRead)
+	if err != nil {
+		return nil
+	}
+
+	var organization models.Organization
+	if err := a.DB.Select("id", "reseller_id").
+		Where("id = ?", orgID).
+		First(&organization).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
+	}
+	response, err := a.productCommercialPlanCatalog(&organization, true, false)
+	if err != nil {
+		return a.sendProductCommercialError(r, "list product plans", err)
+	}
+	return r.SendEnvelope(map[string]any{"plans": response})
+}
+
+// ListAssignableProductPlans returns the exact manual recurring catalog that a
+// platform owner may assign to one target organization. Private plans remain
+// hidden from reseller administrators and from the tenant-facing catalog.
+func (a *App) ListAssignableProductPlans(r *fastglue.Request) error {
+	_, userID, err := a.getOrgAndUserID(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	if !a.IsSuperAdmin(userID) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusForbidden,
+			"Platform owner access required",
+			nil,
+			"",
+		)
+	}
+	targetOrgID, err := productCommercialTargetOrganizationID(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid organization ID", nil, "")
+	}
+	var organization models.Organization
+	if err := a.DB.Select("id", "reseller_id").
+		Where("id = ?", targetOrgID).
+		First(&organization).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
 		}
+		return a.sendProductCommercialError(r, "load organization plan catalog", err)
+	}
+	response, err := a.productCommercialPlanCatalog(&organization, false, true)
+	if err != nil {
+		return a.sendProductCommercialError(r, "list assignable product plans", err)
 	}
 	return r.SendEnvelope(map[string]any{"plans": response})
 }
@@ -1026,6 +1172,10 @@ func (a *App) GetProductEntitlements(r *fastglue.Request) error {
 	applyOverrides := false
 	if err == nil {
 		response.Mode = "subscription"
+		response.SubscriptionStatus = productCommercialEffectiveSubscriptionStatus(
+			&subscription,
+			now,
+		)
 		var plan models.Plan
 		if err := a.DB.Where("id = ?", subscription.PlanID).First(&plan).Error; err == nil {
 			response.PlanCode = plan.Code
@@ -2235,7 +2385,87 @@ func (a *App) ListConsentStates(r *fastglue.Request) error {
 	return r.SendEnvelope(listEnvelope("consents", response, total, pg))
 }
 
+func productCommercialRecordConsentTx(
+	tx *gorm.DB,
+	event *models.ConsentEvent,
+	state *models.ConsentState,
+	userID uuid.UUID,
+) error {
+	if tx == nil || event == nil || state == nil {
+		return errors.New("complete consent transaction state is required")
+	}
+	if event.ContactID != nil {
+		if err := database.LockContactPolicyScope(
+			tx,
+			event.OrganizationID,
+			*event.ContactID,
+		); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return newProductCommercialClientError(
+					fasthttp.StatusBadRequest,
+					"contact_id does not belong to the organization",
+				)
+			}
+			return fmt.Errorf("lock consent policy scope: %w", err)
+		}
+	}
+	if err := tx.Create(event).Error; err != nil {
+		return err
+	}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "organization_id"},
+			{Name: "subject_type"},
+			{Name: "subject_key"},
+			{Name: "purpose"},
+			{Name: "channel"},
+		},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"contact_id",
+			"status",
+			"latest_event_id",
+			"policy_version",
+			"effective_at",
+			"expires_at",
+			"metadata",
+			"updated_at",
+		}),
+	}).Create(state).Error; err != nil {
+		return err
+	}
+	if err := tx.Where(
+		"organization_id = ? AND subject_type = ? AND subject_key = ? AND purpose = ? AND channel = ?",
+		event.OrganizationID,
+		event.SubjectType,
+		event.SubjectKey,
+		event.Purpose,
+		event.Channel,
+	).First(state).Error; err != nil {
+		return err
+	}
+	return audit.LogAudit(
+		tx,
+		event.OrganizationID,
+		userID,
+		audit.GetUserName(tx, userID),
+		productConsentAuditResource,
+		event.ID,
+		models.AuditActionCreated,
+		nil,
+		map[string]any{
+			"subject_type":   event.SubjectType,
+			"purpose":        event.Purpose,
+			"channel":        event.Channel,
+			"action":         event.Action,
+			"policy_version": event.PolicyVersion,
+			"evidence_hash":  event.EvidenceHash,
+		},
+	)
+}
+
 // RecordConsent appends evidence and atomically upserts the effective state.
+// Contact-scoped changes share a row lock with the automatic-reply dispatch
+// fence so a committed withdrawal cannot race past provider delivery.
 func (a *App) RecordConsent(r *fastglue.Request) error {
 	orgID, userID, err := a.requireAuth(r, models.ResourcePrivacyConsents, models.ActionWrite)
 	if err != nil {
@@ -2312,58 +2542,7 @@ func (a *App) RecordConsent(r *fastglue.Request) error {
 			ExpiresAt:      req.ExpiresAt,
 			Metadata:       models.JSONB{},
 		}
-		if err := tx.Create(&event).Error; err != nil {
-			return err
-		}
-		if err := tx.Clauses(clause.OnConflict{
-			Columns: []clause.Column{
-				{Name: "organization_id"},
-				{Name: "subject_type"},
-				{Name: "subject_key"},
-				{Name: "purpose"},
-				{Name: "channel"},
-			},
-			DoUpdates: clause.AssignmentColumns([]string{
-				"contact_id",
-				"status",
-				"latest_event_id",
-				"policy_version",
-				"effective_at",
-				"expires_at",
-				"metadata",
-				"updated_at",
-			}),
-		}).Create(&state).Error; err != nil {
-			return err
-		}
-		if err := tx.Where(
-			"organization_id = ? AND subject_type = ? AND subject_key = ? AND purpose = ? AND channel = ?",
-			orgID,
-			req.SubjectType,
-			req.SubjectKey,
-			req.Purpose,
-			req.Channel,
-		).First(&state).Error; err != nil {
-			return err
-		}
-		return audit.LogAudit(
-			tx,
-			orgID,
-			userID,
-			audit.GetUserName(tx, userID),
-			productConsentAuditResource,
-			event.ID,
-			models.AuditActionCreated,
-			nil,
-			map[string]any{
-				"subject_type":   event.SubjectType,
-				"purpose":        event.Purpose,
-				"channel":        event.Channel,
-				"action":         event.Action,
-				"policy_version": event.PolicyVersion,
-				"evidence_hash":  event.EvidenceHash,
-			},
-		)
+		return productCommercialRecordConsentTx(tx, &event, &state, userID)
 	})
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) && req.ContactID != nil {
@@ -3862,7 +4041,9 @@ func productCommercialLoadPlanResponse(
 	}
 	priceResponse := make([]ProductPlanPriceResponse, len(prices))
 	for i := range prices {
+		priceID := prices[i].ID
 		priceResponse[i] = ProductPlanPriceResponse{
+			ID:               &priceID,
 			Code:             prices[i].Code,
 			Currency:         prices[i].Currency,
 			UnitAmountMinor:  prices[i].UnitAmountMinor,
@@ -3891,6 +4072,20 @@ func (a *App) productCommercialCanManagePlan(userID uuid.UUID, plan *models.Plan
 		return true
 	}
 	return plan.ResellerID != nil && a.canManageReseller(userID, *plan.ResellerID)
+}
+
+// productCommercialControlPlaneTransaction keeps cross-tenant catalog writes
+// atomic with their tenant-owned audit row. Control-plane routes run outside
+// the normal tenant middleware, so production RLS needs an explicit audit
+// tenant even though the catalog tables themselves are global.
+func (a *App) productCommercialControlPlaneTransaction(
+	auditOrgID uuid.UUID,
+	fn func(*gorm.DB) error,
+) error {
+	if a.rlsEnabled() {
+		return database.WithTenant(a.rootApp().DB, auditOrgID, fn)
+	}
+	return a.DB.Transaction(fn)
 }
 
 // CreateProductPlan creates a manual-price catalog. Only platform owners may
@@ -3988,7 +4183,7 @@ func (a *App) CreateProductPlan(r *fastglue.Request) error {
 		plan.PublishedAt = &now
 	}
 	var response ProductPlanResponse
-	err = a.DB.Transaction(func(tx *gorm.DB) error {
+	err = a.productCommercialControlPlaneTransaction(auditOrgID, func(tx *gorm.DB) error {
 		var duplicateCount int64
 		if err := tx.Model(&models.Plan{}).
 			Where("scope_key = ? AND code = ?", scopeKey, req.Code).
@@ -4096,7 +4291,7 @@ func (a *App) UpdateProductPlan(r *fastglue.Request) error {
 	}
 
 	var response ProductPlanResponse
-	err = a.DB.Transaction(func(tx *gorm.DB) error {
+	err = a.productCommercialControlPlaneTransaction(auditOrgID, func(tx *gorm.DB) error {
 		var plan models.Plan
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ?", planID).
@@ -4331,6 +4526,12 @@ func productCommercialValidateSetSubscription(req *SetOrganizationSubscriptionRe
 			return errors.New("trial_days must be between 1 and 365")
 		}
 	}
+	if req.ManualReference == "" {
+		return errors.New("manual_reference is required")
+	}
+	if strings.IndexFunc(req.ManualReference, unicode.IsControl) >= 0 {
+		return errors.New("manual_reference must not contain control characters")
+	}
 	if utf8.RuneCountInString(req.ManualReference) > 255 {
 		return errors.New("manual_reference must be at most 255 characters")
 	}
@@ -4368,11 +4569,14 @@ func productCommercialFindSubscriptionPlan(
 		return nil, nil, err
 	}
 
+	now := time.Now().UTC()
 	priceQuery := tx.Where(
-		"plan_id = ? AND provider = ? AND is_active = ?",
+		"plan_id = ? AND provider = ? AND is_active = ? AND (effective_from IS NULL OR effective_from <= ?) AND (effective_until IS NULL OR effective_until > ?)",
 		plan.ID,
 		models.BillingProviderManual,
 		true,
+		now,
+		now,
 	)
 	if req.PlanPriceID != nil && *req.PlanPriceID != uuid.Nil {
 		priceQuery = priceQuery.Where("id = ?", *req.PlanPriceID)
@@ -4389,21 +4593,31 @@ func productCommercialFindSubscriptionPlan(
 		}
 		return nil, nil, err
 	}
-	if price.Interval == models.BillingIntervalOneTime {
+	if price.Interval != models.BillingIntervalMonth &&
+		price.Interval != models.BillingIntervalYear {
 		return nil, nil, newProductCommercialClientError(
 			fasthttp.StatusBadRequest,
-			"One-time prices cannot be assigned as subscriptions",
+			"Only monthly or yearly prices can be assigned as subscriptions",
 		)
 	}
 	return &plan, &price, nil
 }
 
-// SetOrganizationSubscription provisions a manual active or trial license. It
-// cannot mark invoices paid or emulate a verified billing-provider webhook.
+// SetOrganizationSubscription lets a platform owner provision a manual active
+// or trial license. It cannot mark invoices paid or emulate a verified
+// billing-provider webhook.
 func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 	auditOrgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	if !a.IsSuperAdmin(userID) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusForbidden,
+			"Platform owner access required",
+			nil,
+			"",
+		)
 	}
 	targetOrgID, err := productCommercialTargetOrganizationID(r)
 	if err != nil {
@@ -4416,23 +4630,6 @@ func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 	if err := productCommercialValidateSetSubscription(&req); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
-	var authorizedOrganization models.Organization
-	if err := a.DB.Select("id", "reseller_id").
-		Where("id = ?", targetOrgID).
-		First(&authorizedOrganization).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
-		}
-		return a.sendProductCommercialError(r, "load organization for licensing", err)
-	}
-	if !a.productCommercialCanManageOrganization(userID, &authorizedOrganization) {
-		return r.SendErrorEnvelope(
-			fasthttp.StatusForbidden,
-			"Organization licensing access denied",
-			nil,
-			"",
-		)
-	}
 
 	var response ProductSubscriptionResponse
 	err = database.WithTenant(a.DB, targetOrgID, func(tx *gorm.DB) error {
@@ -4444,14 +4641,6 @@ func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 				return newProductCommercialClientError(fasthttp.StatusNotFound, "Organization not found")
 			}
 			return err
-		}
-		// Re-check authorization after the row lock so a concurrent reseller
-		// reassignment cannot turn a valid control-plane check into cross-tenant access.
-		if !a.productCommercialCanManageOrganization(userID, &organization) {
-			return newProductCommercialClientError(
-				fasthttp.StatusForbidden,
-				"Organization licensing access denied",
-			)
 		}
 		plan, price, err := productCommercialFindSubscriptionPlan(tx, &organization, &req)
 		if err != nil {
@@ -4506,9 +4695,8 @@ func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 			trialEndsAt = &end
 			periodEnd = end
 		}
-		providerData := models.JSONB{}
-		if req.ManualReference != "" {
-			providerData["manual_reference"] = req.ManualReference
+		providerData := models.JSONB{
+			"manual_reference": req.ManualReference,
 		}
 
 		var current models.Subscription
@@ -4536,7 +4724,11 @@ func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 				)
 			}
 			_ = tx.Where("id = ?", current.PlanID).First(&oldPlan).Error
-			oldResponse = productCommercialSubscriptionToResponse(&current, &oldPlan)
+			oldResponse = productCommercialSubscriptionToAuditSnapshotAt(
+				&current,
+				&oldPlan,
+				now,
+			)
 		} else if !errors.Is(currentErr, gorm.ErrRecordNotFound) {
 			return currentErr
 		}
@@ -4605,7 +4797,11 @@ func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 					current.ID,
 					models.AuditActionUpdated,
 					oldResponse,
-					productCommercialSubscriptionToResponse(&canceled, &oldPlan),
+					productCommercialSubscriptionToAuditSnapshotAt(
+						&canceled,
+						&oldPlan,
+						now,
+					),
 				); err != nil {
 					return err
 				}
@@ -4632,7 +4828,12 @@ func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 				return err
 			}
 		}
-		response = productCommercialSubscriptionToResponse(&subscription, plan)
+		response = productCommercialSubscriptionToResponseAt(&subscription, plan, now)
+		auditResponse := productCommercialSubscriptionToAuditSnapshotAt(
+			&subscription,
+			plan,
+			now,
+		)
 		action := models.AuditActionUpdated
 		auditOldData := oldResponse
 		if createdSubscription {
@@ -4648,7 +4849,7 @@ func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 			subscription.ID,
 			action,
 			auditOldData,
-			response,
+			auditResponse,
 			map[string]any{
 				"field":     "licensed_by_workspace",
 				"old_value": nil,

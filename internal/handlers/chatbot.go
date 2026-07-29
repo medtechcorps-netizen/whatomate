@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,6 +12,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ChatbotSettingsResponse represents the response for chatbot settings
@@ -258,6 +260,7 @@ func chatbotSLASnapshot(s *models.ChatbotSettings) map[string]any {
 // change the activity log should surface.
 func chatbotAISnapshot(s *models.ChatbotSettings) map[string]any {
 	return map[string]any{
+		"enabled":          s.IsEnabled,
 		"ai_enabled":       s.AI.Enabled,
 		"ai_provider":      s.AI.Provider,
 		"ai_model":         s.AI.Model,
@@ -266,94 +269,47 @@ func chatbotAISnapshot(s *models.ChatbotSettings) map[string]any {
 	}
 }
 
-func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
-	orgID, userID, err := a.getOrgAndUserID(r)
-	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
-	}
+type updateChatbotSettingsRequest struct {
+	Enabled                      *bool              `json:"enabled"`
+	GreetingMessage              *string            `json:"greeting_message"`
+	GreetingButtons              *[]map[string]any  `json:"greeting_buttons"`
+	FallbackMessage              *string            `json:"fallback_message"`
+	FallbackButtons              *[]map[string]any  `json:"fallback_buttons"`
+	SessionTimeoutMinutes        *int               `json:"session_timeout_minutes"`
+	BusinessHoursEnabled         *bool              `json:"business_hours_enabled"`
+	BusinessHours                *[]map[string]any  `json:"business_hours"`
+	OutOfHoursMessage            *string            `json:"out_of_hours_message"`
+	AllowAutomatedOutsideHours   *bool              `json:"allow_automated_outside_hours"`
+	AllowAgentQueuePickup        *bool              `json:"allow_agent_queue_pickup"`
+	AssignToSameAgent            *bool              `json:"assign_to_same_agent"`
+	AgentCurrentConversationOnly *bool              `json:"agent_current_conversation_only"`
+	AIEnabled                    *bool              `json:"ai_enabled"`
+	AIProvider                   *models.AIProvider `json:"ai_provider"`
+	AIAPIKey                     *string            `json:"ai_api_key"`
+	AIModel                      *string            `json:"ai_model"`
+	AIMaxTokens                  *int               `json:"ai_max_tokens"`
+	AISystemPrompt               *string            `json:"ai_system_prompt"`
+	// SLA Settings
+	SLAEnabled             *bool     `json:"sla_enabled"`
+	SLAResponseMinutes     *int      `json:"sla_response_minutes"`
+	SLAResolutionMinutes   *int      `json:"sla_resolution_minutes"`
+	SLAEscalationMinutes   *int      `json:"sla_escalation_minutes"`
+	SLAAutoCloseHours      *int      `json:"sla_auto_close_hours"`
+	SLAAutoCloseMessage    *string   `json:"sla_auto_close_message"`
+	SLAWarningMessage      *string   `json:"sla_warning_message"`
+	SLAEscalationNotifyIDs *[]string `json:"sla_escalation_notify_ids"`
+	// Client Inactivity Settings
+	ClientReminderEnabled  *bool   `json:"client_reminder_enabled"`
+	ClientReminderMinutes  *int    `json:"client_reminder_minutes"`
+	ClientReminderMessage  *string `json:"client_reminder_message"`
+	ClientAutoCloseMinutes *int    `json:"client_auto_close_minutes"`
+	ClientAutoCloseMessage *string `json:"client_auto_close_message"`
+}
 
-	var req struct {
-		Enabled                      *bool              `json:"enabled"`
-		GreetingMessage              *string            `json:"greeting_message"`
-		GreetingButtons              *[]map[string]any  `json:"greeting_buttons"`
-		FallbackMessage              *string            `json:"fallback_message"`
-		FallbackButtons              *[]map[string]any  `json:"fallback_buttons"`
-		SessionTimeoutMinutes        *int               `json:"session_timeout_minutes"`
-		BusinessHoursEnabled         *bool              `json:"business_hours_enabled"`
-		BusinessHours                *[]map[string]any  `json:"business_hours"`
-		OutOfHoursMessage            *string            `json:"out_of_hours_message"`
-		AllowAutomatedOutsideHours   *bool              `json:"allow_automated_outside_hours"`
-		AllowAgentQueuePickup        *bool              `json:"allow_agent_queue_pickup"`
-		AssignToSameAgent            *bool              `json:"assign_to_same_agent"`
-		AgentCurrentConversationOnly *bool              `json:"agent_current_conversation_only"`
-		AIEnabled                    *bool              `json:"ai_enabled"`
-		AIProvider                   *models.AIProvider `json:"ai_provider"`
-		AIAPIKey                     *string            `json:"ai_api_key"`
-		AIModel                      *string            `json:"ai_model"`
-		AIMaxTokens                  *int               `json:"ai_max_tokens"`
-		AISystemPrompt               *string            `json:"ai_system_prompt"`
-		// SLA Settings
-		SLAEnabled             *bool     `json:"sla_enabled"`
-		SLAResponseMinutes     *int      `json:"sla_response_minutes"`
-		SLAResolutionMinutes   *int      `json:"sla_resolution_minutes"`
-		SLAEscalationMinutes   *int      `json:"sla_escalation_minutes"`
-		SLAAutoCloseHours      *int      `json:"sla_auto_close_hours"`
-		SLAAutoCloseMessage    *string   `json:"sla_auto_close_message"`
-		SLAWarningMessage      *string   `json:"sla_warning_message"`
-		SLAEscalationNotifyIDs *[]string `json:"sla_escalation_notify_ids"`
-		// Client Inactivity Settings
-		ClientReminderEnabled  *bool   `json:"client_reminder_enabled"`
-		ClientReminderMinutes  *int    `json:"client_reminder_minutes"`
-		ClientReminderMessage  *string `json:"client_reminder_message"`
-		ClientAutoCloseMinutes *int    `json:"client_auto_close_minutes"`
-		ClientAutoCloseMessage *string `json:"client_auto_close_message"`
-	}
-
-	if err := json.Unmarshal(r.RequestCtx.PostBody(), &req); err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid request body", nil, "")
-	}
-
-	// Get or create settings
-	var settings models.ChatbotSettings
-	isNew := false
-	result := a.DB.Where("organization_id = ? AND whats_app_account = ?", orgID, "").First(&settings)
-	if result.Error != nil {
-		// Create new settings
-		isNew = true
-		settings = models.ChatbotSettings{
-			BaseModel:      models.BaseModel{ID: uuid.New()},
-			OrganizationID: orgID,
-		}
-	}
-
-	// Snapshot each tab's state before mutation so we can compute per-tab
-	// diffs for the activity log. LogAudit is a no-op when no fields changed.
-	oldMessages := chatbotMessagesSnapshot(&settings)
-	oldAgents := chatbotAgentsSnapshot(&settings)
-	oldHours := chatbotHoursSnapshot(&settings)
-	oldSLA := chatbotSLASnapshot(&settings)
-	oldAI := chatbotAISnapshot(&settings)
-
-	// Track which tabs the request touched so we only write audit entries
-	// for tabs the user actually submitted.
-	messagesTouched := req.Enabled != nil || req.GreetingMessage != nil ||
-		req.GreetingButtons != nil || req.FallbackMessage != nil ||
-		req.FallbackButtons != nil || req.SessionTimeoutMinutes != nil
-	agentsTouched := req.AllowAgentQueuePickup != nil || req.AssignToSameAgent != nil ||
-		req.AgentCurrentConversationOnly != nil
-	hoursTouched := req.BusinessHoursEnabled != nil || req.BusinessHours != nil ||
-		req.OutOfHoursMessage != nil || req.AllowAutomatedOutsideHours != nil
-	slaTouched := req.SLAEnabled != nil || req.SLAResponseMinutes != nil ||
-		req.SLAResolutionMinutes != nil || req.SLAEscalationMinutes != nil ||
-		req.SLAAutoCloseHours != nil || req.SLAAutoCloseMessage != nil ||
-		req.SLAWarningMessage != nil || req.SLAEscalationNotifyIDs != nil ||
-		req.ClientReminderEnabled != nil || req.ClientReminderMinutes != nil ||
-		req.ClientReminderMessage != nil || req.ClientAutoCloseMinutes != nil ||
-		req.ClientAutoCloseMessage != nil
-	aiTouched := req.AIEnabled != nil || req.AIProvider != nil || req.AIAPIKey != nil ||
-		req.AIModel != nil || req.AIMaxTokens != nil || req.AISystemPrompt != nil
-
-	// Update fields if provided
+func applyChatbotSettingsRequest(
+	settings *models.ChatbotSettings,
+	req *updateChatbotSettingsRequest,
+) {
 	if req.Enabled != nil {
 		settings.IsEnabled = *req.Enabled
 	}
@@ -380,7 +336,7 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 	if req.SessionTimeoutMinutes != nil {
 		settings.SessionTimeoutMins = *req.SessionTimeoutMinutes
 	}
-	// Business Hours
+
 	if req.BusinessHoursEnabled != nil {
 		settings.BusinessHours.Enabled = *req.BusinessHoursEnabled
 	}
@@ -398,7 +354,6 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		settings.BusinessHours.AllowAutomatedOutside = *req.AllowAutomatedOutsideHours
 	}
 
-	// Agent Assignment
 	if req.AllowAgentQueuePickup != nil {
 		settings.AgentAssignment.AllowQueuePickup = *req.AllowAgentQueuePickup
 	}
@@ -409,7 +364,6 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		settings.AgentAssignment.CurrentConversationOnly = *req.AgentCurrentConversationOnly
 	}
 
-	// AI Settings
 	if req.AIEnabled != nil {
 		settings.AI.Enabled = *req.AIEnabled
 	}
@@ -429,7 +383,6 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		settings.AI.SystemPrompt = *req.AISystemPrompt
 	}
 
-	// SLA Settings
 	if req.SLAEnabled != nil {
 		settings.SLA.Enabled = *req.SLAEnabled
 	}
@@ -455,7 +408,6 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		settings.SLA.EscalationNotifyIDs = *req.SLAEscalationNotifyIDs
 	}
 
-	// Client Inactivity Settings
 	if req.ClientReminderEnabled != nil {
 		settings.ClientInactivity.ReminderEnabled = *req.ClientReminderEnabled
 	}
@@ -471,50 +423,205 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 	if req.ClientAutoCloseMessage != nil {
 		settings.ClientInactivity.AutoCloseMessage = *req.ClientAutoCloseMessage
 	}
+}
+
+func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
+	orgID, userID, err := a.getOrgAndUserID(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+
+	var req updateChatbotSettingsRequest
+
+	if err := json.Unmarshal(r.RequestCtx.PostBody(), &req); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid request body", nil, "")
+	}
+	// The top-level switch gates every automated response, including AI. Treat
+	// it as AI-sensitive so a general settings writer cannot reactivate Qwen.
+	aiTouched := req.Enabled != nil || req.AIEnabled != nil ||
+		req.AIProvider != nil || req.AIAPIKey != nil ||
+		req.AIModel != nil || req.AIMaxTokens != nil || req.AISystemPrompt != nil
+	aiAPIKeyChanged := req.AIAPIKey != nil && *req.AIAPIKey != ""
+	if !a.HasPermission(
+		userID,
+		models.ResourceSettingsChatbot,
+		models.ActionWrite,
+		orgID,
+	) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusForbidden,
+			"Insufficient permissions",
+			nil,
+			"",
+		)
+	}
+	if aiTouched &&
+		!a.HasPermission(userID, models.ResourceChatbotAI, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusForbidden,
+			"Insufficient permissions",
+			nil,
+			"",
+		)
+	}
+
+	// Track which tabs the request touched so we only write audit entries
+	// for tabs the user actually submitted.
+	messagesTouched := req.Enabled != nil || req.GreetingMessage != nil ||
+		req.GreetingButtons != nil || req.FallbackMessage != nil ||
+		req.FallbackButtons != nil || req.SessionTimeoutMinutes != nil
+	agentsTouched := req.AllowAgentQueuePickup != nil || req.AssignToSameAgent != nil ||
+		req.AgentCurrentConversationOnly != nil
+	hoursTouched := req.BusinessHoursEnabled != nil || req.BusinessHours != nil ||
+		req.OutOfHoursMessage != nil || req.AllowAutomatedOutsideHours != nil
+	slaTouched := req.SLAEnabled != nil || req.SLAResponseMinutes != nil ||
+		req.SLAResolutionMinutes != nil || req.SLAEscalationMinutes != nil ||
+		req.SLAAutoCloseHours != nil || req.SLAAutoCloseMessage != nil ||
+		req.SLAWarningMessage != nil || req.SLAEscalationNotifyIDs != nil ||
+		req.ClientReminderEnabled != nil || req.ClientReminderMinutes != nil ||
+		req.ClientReminderMessage != nil || req.ClientAutoCloseMinutes != nil ||
+		req.ClientAutoCloseMessage != nil
 
 	encryptionKey := ""
 	if a.Config != nil {
 		encryptionKey = a.Config.App.EncryptionKey
 	}
-	if err := appcrypto.EncryptFields(encryptionKey, &settings.AI.APIKey); err != nil {
-		a.Log.Error("Failed to encrypt AI credentials", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to secure AI credentials", nil, "")
-	}
 
-	if err := a.DB.Save(&settings).Error; err != nil {
-		a.Log.Error("Failed to save settings", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save settings", nil, "")
-	}
+	var settings models.ChatbotSettings
+	var oldMessages, oldAgents, oldHours, oldSLA, oldAI map[string]any
+	userName := audit.GetUserName(a.DB, userID)
+	if err := a.DB.Transaction(func(tx *gorm.DB) error {
+		// The organization row is the per-tenant mutex for the singleton default
+		// settings record. It also serializes the first-create case, where there
+		// is no ChatbotSettings row to lock yet.
+		if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
+			return err
+		}
 
-	// GORM skips false (zero-value) bool fields on INSERT when the column has
-	// a database default of true, so the DB default wins. After creating the
-	// row we explicitly set any default:true bool columns that were requested
-	// as false.
-	if isNew {
-		zeroOverrides := map[string]any{}
-		if req.AllowAutomatedOutsideHours != nil && !*req.AllowAutomatedOutsideHours {
-			zeroOverrides["allow_automated_outside_hours"] = false
-		}
-		if req.AllowAgentQueuePickup != nil && !*req.AllowAgentQueuePickup {
-			zeroOverrides["allow_agent_queue_pickup"] = false
-		}
-		if req.AssignToSameAgent != nil && !*req.AssignToSameAgent {
-			zeroOverrides["assign_to_same_agent"] = false
-		}
-		if len(zeroOverrides) > 0 {
-			if err := a.DB.Model(&settings).Updates(zeroOverrides).Error; err != nil {
-				a.Log.Error("Failed to save settings", "error", err)
-				return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save settings", nil, "")
+		// Scheduled work must be cancelled before locking ChatbotSettings. A
+		// finalizer already owns its ScheduledJob row while it creates the
+		// Message/Outbox rows, and dispatch owns the Contact policy row before
+		// reading ChatbotSettings. Taking the settings lock first would allow a
+		// settings -> scheduled job -> contact -> settings deadlock.
+		if aiTouched {
+			if err := cancelChannelAIScheduledJobsForOrganizationTx(
+				tx,
+				orgID,
+				"chatbot_ai_settings_changed",
+			); err != nil {
+				return err
 			}
 		}
+
+		isNew := false
+		result := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("organization_id = ? AND whats_app_account = ?", orgID, "").
+			First(&settings)
+		switch {
+		case errors.Is(result.Error, gorm.ErrRecordNotFound):
+			isNew = true
+			settings = models.ChatbotSettings{
+				BaseModel:      models.BaseModel{ID: uuid.New()},
+				OrganizationID: orgID,
+			}
+		case result.Error != nil:
+			return result.Error
+		}
+
+		// Snapshot and mutate only after reloading the latest committed row while
+		// holding its lock. This prevents a concurrent non-AI edit from saving a
+		// stale copy over an authorized Qwen configuration change.
+		oldMessages = chatbotMessagesSnapshot(&settings)
+		oldAgents = chatbotAgentsSnapshot(&settings)
+		oldHours = chatbotHoursSnapshot(&settings)
+		oldSLA = chatbotSLASnapshot(&settings)
+		oldAI = chatbotAISnapshot(&settings)
+		applyChatbotSettingsRequest(&settings, &req)
+
+		if err := appcrypto.EncryptFields(encryptionKey, &settings.AI.APIKey); err != nil {
+			return err
+		}
+		if err := tx.Save(&settings).Error; err != nil {
+			return err
+		}
+
+		// GORM skips false (zero-value) bool fields on INSERT when the column has
+		// a database default of true, so the DB default wins. After creating the
+		// row we explicitly set any default:true bool columns that were requested
+		// as false.
+		if isNew {
+			zeroOverrides := map[string]any{}
+			if req.AllowAutomatedOutsideHours != nil && !*req.AllowAutomatedOutsideHours {
+				zeroOverrides["allow_automated_outside_hours"] = false
+			}
+			if req.AllowAgentQueuePickup != nil && !*req.AllowAgentQueuePickup {
+				zeroOverrides["allow_agent_queue_pickup"] = false
+			}
+			if req.AssignToSameAgent != nil && !*req.AssignToSameAgent {
+				zeroOverrides["assign_to_same_agent"] = false
+			}
+			if len(zeroOverrides) > 0 {
+				if err := tx.Model(&settings).Updates(zeroOverrides).Error; err != nil {
+					return err
+				}
+			}
+		}
+
+		// A finalizer that was already processing before scheduled-job
+		// cancellation may have created an outbox row from the old settings.
+		// Cancel outbox work only after the new settings are saved, while the
+		// same organization mutex is still held.
+		if aiTouched {
+			if err := cancelChannelAIOutboxJobsForOrganizationTx(
+				tx,
+				orgID,
+				"chatbot_ai_settings_changed",
+			); err != nil {
+				return err
+			}
+			var sensitiveChanges []map[string]any
+			if aiAPIKeyChanged {
+				sensitiveChanges = append(sensitiveChanges, map[string]any{
+					"field":     "ai_api_key",
+					"old_value": "********",
+					"new_value": "********",
+				})
+			}
+			// AI configuration and its compliance record commit atomically.
+			// In particular, an API-key rotation must fail closed if its masked
+			// audit marker cannot be persisted.
+			if err := audit.LogAudit(
+				tx,
+				orgID,
+				userID,
+				userName,
+				models.ResourceSettingsChatbotAI,
+				orgID,
+				models.AuditActionUpdated,
+				oldAI,
+				chatbotAISnapshot(&settings),
+				sensitiveChanges...,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		a.Log.Error("Failed to save settings", "error", err)
+		return r.SendErrorEnvelope(
+			fasthttp.StatusInternalServerError,
+			"Failed to save settings",
+			nil,
+			"",
+		)
 	}
 
 	// Invalidate caches
 	a.InvalidateChatbotSettingsCache(orgID)
 	a.InvalidateSLASettingsCache() // SLA settings are part of chatbot settings
 
-	// Emit per-tab audit entries. LogAudit is a no-op when no fields changed.
-	userName := audit.GetUserName(a.DB, userID)
+	// Emit non-AI per-tab audit entries. AI changes are fail-closed and were
+	// recorded atomically with the settings transaction above.
 	if messagesTouched {
 		if err := audit.LogAudit(a.DB, orgID, userID, userName,
 			models.ResourceSettingsChatbotMessages, orgID, models.AuditActionUpdated,
@@ -543,14 +650,6 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 			a.Log.Warn("Failed to record chatbot SLA audit entry", "error", err)
 		}
 	}
-	if aiTouched {
-		if err := audit.LogAudit(a.DB, orgID, userID, userName,
-			models.ResourceSettingsChatbotAI, orgID, models.AuditActionUpdated,
-			oldAI, chatbotAISnapshot(&settings)); err != nil {
-			a.Log.Warn("Failed to record chatbot AI audit entry", "error", err)
-		}
-	}
-
 	return r.SendEnvelope(map[string]any{
 		"message": "Settings updated successfully",
 	})

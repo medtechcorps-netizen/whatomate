@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"regexp"
@@ -10,7 +11,10 @@ import (
 	"gorm.io/gorm"
 )
 
-const tenantSetting = "app.current_organization_id"
+const (
+	tenantSetting           = "app.current_organization_id"
+	tenantRLSRoutingVersion = 2
+)
 
 var (
 	// ErrMissingTenant is returned before any database work when a request or
@@ -185,6 +189,32 @@ func SetTenantContext(tx *gorm.DB, organizationID uuid.UUID) error {
 // WithTenant executes fn in a transaction whose PostgreSQL RLS context is
 // restricted to organizationID.
 func WithTenant(db *gorm.DB, organizationID uuid.UUID, fn func(*gorm.DB) error) error {
+	return withTenantTransaction(db, organizationID, nil, fn)
+}
+
+// WithTenantReadCommitted executes fn with tenant RLS context and explicitly
+// pins PostgreSQL READ COMMITTED isolation. Use it for row-lock serialization
+// protocols whose later statements must observe a policy writer that committed
+// while the transaction was waiting for a lock.
+func WithTenantReadCommitted(
+	db *gorm.DB,
+	organizationID uuid.UUID,
+	fn func(*gorm.DB) error,
+) error {
+	return withTenantTransaction(
+		db,
+		organizationID,
+		&sql.TxOptions{Isolation: sql.LevelReadCommitted},
+		fn,
+	)
+}
+
+func withTenantTransaction(
+	db *gorm.DB,
+	organizationID uuid.UUID,
+	options *sql.TxOptions,
+	fn func(*gorm.DB) error,
+) error {
 	if db == nil {
 		return errors.New("database connection is required")
 	}
@@ -195,12 +225,16 @@ func WithTenant(db *gorm.DB, organizationID uuid.UUID, fn func(*gorm.DB) error) 
 		return errors.New("tenant transaction callback is required")
 	}
 
-	return db.Transaction(func(tx *gorm.DB) error {
+	run := func(tx *gorm.DB) error {
 		if err := SetTenantContext(tx, organizationID); err != nil {
 			return err
 		}
 		return fn(tx)
-	})
+	}
+	if options == nil {
+		return db.Transaction(run)
+	}
+	return db.Transaction(run, options)
 }
 
 // ApplyTenantRLS installs fail-closed row-security policies for the CRM tables.
@@ -423,6 +457,8 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		"public.rereply_resolve_waba_orgs(text)",
 		"public.rereply_resolve_channel_org(uuid)",
 		"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamp with time zone)",
+		"public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamp with time zone)",
+		"public.rereply_rls_routing_version()",
 	} {
 		var allowed bool
 		if err := db.Raw(
@@ -434,6 +470,19 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		if !allowed {
 			return fmt.Errorf("runtime role cannot execute routing function %s", signature)
 		}
+	}
+	var routingVersion int
+	if err := db.Raw(
+		"SELECT public.rereply_rls_routing_version()",
+	).Scan(&routingVersion).Error; err != nil {
+		return fmt.Errorf("read tenant RLS routing version: %w", err)
+	}
+	if routingVersion != tenantRLSRoutingVersion {
+		return fmt.Errorf(
+			"tenant RLS routing version is %d; expected %d (run rereply rls-migrate before deployment)",
+			routingVersion,
+			tenantRLSRoutingVersion,
+		)
 	}
 
 	return nil
@@ -540,6 +589,35 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		       AND (
 		         status IN ('pending', 'retrying')
 		         OR (
+		           status IN ('processing', 'dispatching')
+		           AND (locked_at IS NULL OR locked_at < p_stale_before)
+		         )
+		       )
+		   )
+		   SELECT organization_id
+		   FROM ready
+		   ORDER BY (organization_id > p_after) DESC, organization_id
+		   LIMIT LEAST(GREATEST(p_limit, 1), 100)
+		 $function$`,
+		`CREATE OR REPLACE FUNCTION public.rereply_ready_channel_ai_reply_orgs(
+		   p_after uuid,
+		   p_limit integer,
+		   p_stale_before timestamptz
+		 )
+		 RETURNS SETOF uuid
+		 LANGUAGE sql
+		 SECURITY DEFINER
+		 SET search_path = pg_catalog, public
+		 AS $function$
+		   WITH ready AS (
+		     SELECT DISTINCT organization_id
+		     FROM public.scheduled_jobs
+		     WHERE deleted_at IS NULL
+		       AND kind = 'channel_ai_reply'
+		       AND run_at <= clock_timestamp()
+		       AND (
+		         status = 'pending'
+		         OR (
 		           status = 'processing'
 		           AND (locked_at IS NULL OR locked_at < p_stale_before)
 		         )
@@ -550,17 +628,39 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		   ORDER BY (organization_id > p_after) DESC, organization_id
 		   LIMIT LEAST(GREATEST(p_limit, 1), 100)
 		 $function$`,
+		fmt.Sprintf(
+			`CREATE OR REPLACE FUNCTION public.rereply_rls_routing_version()
+			 RETURNS integer
+			 LANGUAGE sql
+			 IMMUTABLE
+			 SECURITY DEFINER
+			 SET search_path = pg_catalog, public
+			 AS $function$
+			   SELECT %d
+			 $function$`,
+			tenantRLSRoutingVersion,
+		),
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_whatsapp_org(text) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_webhook_org(text) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_waba_orgs(text) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_channel_org(uuid) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz) FROM PUBLIC",
+		"REVOKE ALL ON FUNCTION public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamptz) FROM PUBLIC",
+		"REVOKE ALL ON FUNCTION public.rereply_rls_routing_version() FROM PUBLIC",
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_whatsapp_org(text) TO %s", runtimeRole),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_webhook_org(text) TO %s", runtimeRole),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_waba_orgs(text) TO %s", runtimeRole),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_channel_org(uuid) TO %s", runtimeRole),
 		fmt.Sprintf(
 			"GRANT EXECUTE ON FUNCTION public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz) TO %s",
+			runtimeRole,
+		),
+		fmt.Sprintf(
+			"GRANT EXECUTE ON FUNCTION public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamptz) TO %s",
+			runtimeRole,
+		),
+		fmt.Sprintf(
+			"GRANT EXECUTE ON FUNCTION public.rereply_rls_routing_version() TO %s",
 			runtimeRole,
 		),
 	}
@@ -606,6 +706,8 @@ func RemoveTenantRLS(db *gorm.DB) error {
 			"public.rereply_resolve_channel_org(uuid)",
 			"public.rereply_resolve_channel_org(text,text,text)",
 			"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz)",
+			"public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamptz)",
+			"public.rereply_rls_routing_version()",
 		} {
 			if err := tx.Exec("DROP FUNCTION IF EXISTS " + signature).Error; err != nil {
 				return err

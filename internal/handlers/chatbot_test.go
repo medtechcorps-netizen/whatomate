@@ -2,6 +2,8 @@ package handlers_test
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // getChatbotFlowPermissions returns flows.chatbot permissions from the full permission set.
@@ -29,6 +33,70 @@ func getChatbotFlowPermissions(t *testing.T, app *handlers.App) []models.Permiss
 	}
 	require.NotEmpty(t, flowPerms, "expected flows.chatbot permissions in default set")
 	return flowPerms
+}
+
+func createChatbotSettingsWriter(
+	t *testing.T,
+	app *handlers.App,
+	organizationID uuid.UUID,
+	withAI bool,
+) *models.User {
+	t.Helper()
+	permissionKeys := []string{"settings.chatbot:write"}
+	if withAI {
+		permissionKeys = append(permissionKeys, "chatbot.ai:write")
+	}
+	role := testutil.CreateTestRoleWithKeys(
+		t,
+		app.DB,
+		organizationID,
+		"chatbot-settings-writer",
+		permissionKeys,
+	)
+	return testutil.CreateTestUser(
+		t,
+		app.DB,
+		organizationID,
+		testutil.WithRoleID(&role.ID),
+	)
+}
+
+func rejectChatbotAIAuditForOrg(
+	t *testing.T,
+	app *handlers.App,
+	organizationID uuid.UUID,
+) {
+	t.Helper()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	functionName := "reject_chatbot_ai_audit_" + suffix
+	triggerName := "reject_chatbot_ai_audit_trigger_" + suffix
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.organization_id = '%s'::uuid
+			   AND NEW.resource_type = '%s' THEN
+				RAISE EXCEPTION 'forced chatbot AI audit failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$
+	`, functionName, organizationID, models.ResourceSettingsChatbotAI)).Error)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(
+		"CREATE TRIGGER %s BEFORE INSERT ON audit_logs FOR EACH ROW EXECUTE FUNCTION %s()",
+		triggerName,
+		functionName,
+	)).Error)
+	t.Cleanup(func() {
+		_ = app.DB.Exec(fmt.Sprintf(
+			"DROP TRIGGER IF EXISTS %s ON audit_logs",
+			triggerName,
+		)).Error
+		_ = app.DB.Exec(fmt.Sprintf(
+			"DROP FUNCTION IF EXISTS %s()",
+			functionName,
+		)).Error
+	})
 }
 
 // createTestKeywordRule creates a keyword rule directly in the DB for testing.
@@ -134,7 +202,7 @@ func TestApp_UpdateChatbotSettings(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createChatbotSettingsWriter(t, app, org.ID, true)
 
 		enabled := true
 		greeting := "Welcome to our shop!"
@@ -195,6 +263,259 @@ func TestApp_UpdateChatbotSettings(t *testing.T) {
 		assert.True(t, getResp.Data.Settings.SLAEnabled)
 		assert.Equal(t, 10, getResp.Data.Settings.SLAResponseMinutes)
 	})
+
+	t.Run("AI fields require chatbot AI write permission", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := createChatbotSettingsWriter(t, app, org.ID, false)
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"ai_enabled":  true,
+			"ai_provider": "qwen",
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		err := app.UpdateChatbotSettings(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+
+		var count int64
+		require.NoError(t, app.DB.Model(&models.ChatbotSettings{}).
+			Where("organization_id = ?", org.ID).
+			Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	t.Run("top-level enable requires chatbot AI write permission", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := createChatbotSettingsWriter(t, app, org.ID, false)
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"enabled": true,
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		err := app.UpdateChatbotSettings(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+
+		var count int64
+		require.NoError(t, app.DB.Model(&models.ChatbotSettings{}).
+			Where("organization_id = ?", org.ID).
+			Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	t.Run("API key rotation writes only a masked audit marker", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := createChatbotSettingsWriter(t, app, org.ID, true)
+		secret := "test-qwen-key-must-never-appear-in-audit"
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"ai_api_key": secret,
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		err := app.UpdateChatbotSettings(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+		var entry models.AuditLog
+		require.NoError(t, app.DB.Where(
+			"organization_id = ? AND resource_type = ? AND action = ?",
+			org.ID,
+			models.ResourceSettingsChatbotAI,
+			models.AuditActionUpdated,
+		).Order("created_at DESC").First(&entry).Error)
+		encodedChanges, err := json.Marshal(entry.Changes)
+		require.NoError(t, err)
+		assert.Contains(t, string(encodedChanges), "ai_api_key")
+		assert.Contains(t, string(encodedChanges), "********")
+		assert.NotContains(t, string(encodedChanges), secret)
+	})
+
+	t.Run("API key rotation rolls back when its audit cannot be written", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := createChatbotSettingsWriter(t, app, org.ID, true)
+		rejectChatbotAIAuditForOrg(t, app, org.ID)
+
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"ai_api_key": "test-qwen-key-that-must-roll-back",
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		err := app.UpdateChatbotSettings(req)
+		require.NoError(t, err)
+		assert.Equal(
+			t,
+			fasthttp.StatusInternalServerError,
+			testutil.GetResponseStatusCode(req),
+		)
+
+		var settingsCount int64
+		require.NoError(t, app.DB.Model(&models.ChatbotSettings{}).
+			Where("organization_id = ?", org.ID).
+			Count(&settingsCount).Error)
+		assert.Zero(t, settingsCount)
+
+		var auditCount int64
+		require.NoError(t, app.DB.Model(&models.AuditLog{}).
+			Where(
+				"organization_id = ? AND resource_type = ?",
+				org.ID,
+				models.ResourceSettingsChatbotAI,
+			).
+			Count(&auditCount).Error)
+		assert.Zero(t, auditCount)
+	})
+
+	t.Run("global automation switch rolls back when its AI audit cannot be written", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := createChatbotSettingsWriter(t, app, org.ID, true)
+		initial := &models.ChatbotSettings{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: org.ID,
+			IsEnabled:      false,
+		}
+		require.NoError(t, app.DB.Create(initial).Error)
+		rejectChatbotAIAuditForOrg(t, app, org.ID)
+
+		req := testutil.NewJSONRequest(t, map[string]any{"enabled": true})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		err := app.UpdateChatbotSettings(req)
+		require.NoError(t, err)
+		assert.Equal(
+			t,
+			fasthttp.StatusInternalServerError,
+			testutil.GetResponseStatusCode(req),
+		)
+
+		var persisted models.ChatbotSettings
+		require.NoError(t, app.DB.First(
+			&persisted,
+			"id = ? AND organization_id = ?",
+			initial.ID,
+			org.ID,
+		).Error)
+		assert.False(t, persisted.IsEnabled)
+
+		var auditCount int64
+		require.NoError(t, app.DB.Model(&models.AuditLog{}).
+			Where(
+				"organization_id = ? AND resource_type = ?",
+				org.ID,
+				models.ResourceSettingsChatbotAI,
+			).
+			Count(&auditCount).Error)
+		assert.Zero(t, auditCount)
+	})
+
+	t.Run("all settings fields require chatbot settings write permission", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"greeting_message": "Unauthorized change",
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		err := app.UpdateChatbotSettings(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+
+		var count int64
+		require.NoError(t, app.DB.Model(&models.ChatbotSettings{}).
+			Where("organization_id = ?", org.ID).
+			Count(&count).Error)
+		assert.Zero(t, count)
+	})
+}
+
+func TestApp_UpdateChatbotSettingsPreservesConcurrentAIUpdate(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	generalWriter := createChatbotSettingsWriter(t, app, org.ID, false)
+	settings := models.ChatbotSettings{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		IsEnabled:       true,
+		DefaultResponse: "Before",
+		AI: models.AIConfig{
+			Enabled:      true,
+			Provider:     models.AIProviderQwen,
+			Model:        "qwen-old",
+			SystemPrompt: "Old prompt",
+		},
+	}
+	require.NoError(t, app.DB.Create(&settings).Error)
+
+	authorizedTx := app.DB.Begin()
+	require.NoError(t, authorizedTx.Error)
+	t.Cleanup(func() {
+		_ = authorizedTx.Rollback().Error
+	})
+	var lockedOrganization models.Organization
+	require.NoError(t, authorizedTx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id").
+		Where("id = ?", org.ID).
+		First(&lockedOrganization).Error)
+	require.NoError(t, authorizedTx.Model(&models.ChatbotSettings{}).
+		Where("id = ? AND organization_id = ?", settings.ID, org.ID).
+		Updates(map[string]any{
+			"ai_provider":      models.AIProviderQwen,
+			"ai_model":         "qwen-new",
+			"ai_system_prompt": "New prompt",
+		}).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"greeting_message": "General edit",
+	})
+	testutil.SetAuthContext(req, org.ID, generalWriter.ID)
+
+	backendPID := make(chan int, 1)
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- app.DB.Connection(func(connection *gorm.DB) error {
+			var pid int
+			if err := connection.Session(&gorm.Session{NewDB: true}).
+				Raw("SELECT pg_backend_pid()").
+				Scan(&pid).Error; err != nil {
+				backendPID <- 0
+				return err
+			}
+			backendPID <- pid
+			connectionApp := &handlers.App{
+				Config:     app.Config,
+				DB:         connection.Session(&gorm.Session{NewDB: true}),
+				Redis:      app.Redis,
+				Log:        app.Log,
+				HTTPClient: app.HTTPClient,
+			}
+			return connectionApp.UpdateChatbotSettings(req)
+		})
+	}()
+
+	pid := <-backendPID
+	require.Positive(t, pid)
+	testutil.RequirePostgresBackendWaitingForLock(t, app.DB, pid)
+	require.NoError(t, authorizedTx.Commit().Error)
+
+	select {
+	case err := <-updateDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "chatbot settings update did not resume after the AI update committed")
+	}
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var persisted models.ChatbotSettings
+	require.NoError(t, app.DB.First(&persisted, "id = ?", settings.ID).Error)
+	assert.Equal(t, "General edit", persisted.DefaultResponse)
+	assert.Equal(t, models.AIProviderQwen, persisted.AI.Provider)
+	assert.Equal(t, "qwen-new", persisted.AI.Model)
+	assert.Equal(t, "New prompt", persisted.AI.SystemPrompt)
 }
 
 // =============================================================================
@@ -1108,7 +1429,7 @@ func TestApp_UpdateChatbotSettings_PartialUpdate(t *testing.T) {
 	t.Run("partial update only changes provided fields", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createChatbotSettingsWriter(t, app, org.ID, true)
 
 		// First, create full settings
 		setupReq := testutil.NewJSONRequest(t, map[string]any{
@@ -1153,7 +1474,7 @@ func TestApp_UpdateChatbotSettings_PartialUpdate(t *testing.T) {
 	t.Run("update business hours settings", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createChatbotSettingsWriter(t, app, org.ID, false)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"business_hours_enabled":        true,
@@ -1188,7 +1509,7 @@ func TestApp_UpdateChatbotSettings_PartialUpdate(t *testing.T) {
 	t.Run("update agent assignment settings", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createChatbotSettingsWriter(t, app, org.ID, false)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"allow_agent_queue_pickup":        false,
@@ -1222,7 +1543,7 @@ func TestApp_UpdateChatbotSettings_PartialUpdate(t *testing.T) {
 	t.Run("update client inactivity settings", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createChatbotSettingsWriter(t, app, org.ID, false)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"client_reminder_enabled":   true,
@@ -1260,7 +1581,7 @@ func TestApp_UpdateChatbotSettings_PartialUpdate(t *testing.T) {
 	t.Run("update SLA settings", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createChatbotSettingsWriter(t, app, org.ID, false)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"sla_enabled":            true,

@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/shridarpatil/whatomate/internal/websocket"
@@ -414,6 +416,38 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 		"limit":               limit,
 		"offset":              offset,
 	})
+}
+
+func createActiveAgentTransferTx(
+	tx *gorm.DB,
+	transfer *models.AgentTransfer,
+) error {
+	if tx == nil || transfer == nil {
+		return errors.New("complete agent transfer transaction state is required")
+	}
+	if err := database.LockContactPolicyScope(
+		tx,
+		transfer.OrganizationID,
+		transfer.ContactID,
+	); err != nil {
+		return fmt.Errorf("lock transfer policy scope: %w", err)
+	}
+
+	var existingCount int64
+	if err := tx.Model(&models.AgentTransfer{}).
+		Where(
+			"organization_id = ? AND contact_id = ? AND status = ?",
+			transfer.OrganizationID,
+			transfer.ContactID,
+			models.TransferStatusActive,
+		).
+		Count(&existingCount).Error; err != nil {
+		return err
+	}
+	if existingCount > 0 {
+		return errActiveAgentTransferExists
+	}
+	return tx.Create(transfer).Error
 }
 
 // CreateAgentTransfer creates a new agent transfer
@@ -1280,28 +1314,10 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 			return err
 		}
 
-		var activeCount int64
-		if err := tx.Model(&models.AgentTransfer{}).
-			Where(
-				"organization_id = ? AND contact_id = ? AND status = ?",
-				baseTransfer.OrganizationID,
-				canonical.ID,
-				models.TransferStatusActive,
-			).
-			Count(&activeCount).Error; err != nil {
-			return err
-		}
-		if activeCount > 0 {
-			return errActiveAgentTransferExists
-		}
-
 		candidate := baseTransfer
 		candidate.ContactID = canonical.ID
 		candidate.PhoneNumber = canonical.PhoneNumber
-		if err := tx.Create(&candidate).Error; err != nil {
-			if isUniqueViolation(err) {
-				return errActiveAgentTransferExists
-			}
+		if err := createActiveAgentTransferTx(tx, &candidate); err != nil {
 			return err
 		}
 
@@ -1313,15 +1329,20 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 			settings.AgentAssignment.AssignToSameAgent &&
 			canonical.AssignedUserID == nil {
 			if err := tx.Model(&models.Contact{}).
-				Where("id = ? AND organization_id = ?", canonical.ID, baseTransfer.OrganizationID).
+				Where(
+					"id = ? AND organization_id = ? AND assigned_user_id IS NULL",
+					canonical.ID,
+					baseTransfer.OrganizationID,
+				).
 				Update("assigned_user_id", candidate.AgentID).Error; err != nil {
 				return err
 			}
 			canonical.AssignedUserID = candidate.AgentID
 		}
 
+		// End any active chatbot session atomically with the handover.
 		if endChatbotSession {
-			now := time.Now()
+			now := time.Now().UTC()
 			if err := tx.Model(&models.ChatbotSession{}).
 				Where(
 					"organization_id = ? AND contact_id = ? AND status = ?",

@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
+	qwenapi "github.com/shridarpatil/whatomate/internal/qwen"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -148,6 +149,30 @@ type persistedIncomingMessage struct {
 	Contact        models.Contact
 	Extracted      ExtractedMessage
 	Persisted      models.Message
+}
+
+// updateContactBSUID persists Meta's optional business-scoped user ID without
+// allowing a metadata-write failure to poison the surrounding inbound-message
+// transaction. GORM implements nested transactions with a PostgreSQL savepoint,
+// so rolling this callback back restores the outer tenant transaction.
+func (a *App) updateContactBSUID(contact *models.Contact, bsuid string) {
+	if contact == nil || bsuid == "" || contact.BSUID == bsuid {
+		return
+	}
+
+	err := a.DB.Transaction(func(tx *gorm.DB) error {
+		return tx.Model(&models.Contact{}).
+			Where("id = ?", contact.ID).
+			Update("bs_uid", bsuid).Error
+	})
+	if err != nil {
+		a.Log.Warn("Failed to update contact BSUID; continuing inbound message processing",
+			"error", err,
+			"contact_id", contact.ID,
+		)
+		return
+	}
+	contact.BSUID = bsuid
 }
 
 // processIncomingMessageFull processes incoming WhatsApp messages with chatbot logic
@@ -1300,27 +1325,41 @@ func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *
 // Alibaba Cloud Model Studio's OpenAI-compatible Qwen API. Thinking is disabled
 // for routine CRM replies to keep latency and token usage predictable.
 func (a *App) generateQwenResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
-	requestSettings := settings
-	if settings.AI.Model == "" {
-		settingsCopy := *settings
-		settingsCopy.AI.Model = "qwen3.7-plus"
-		requestSettings = &settingsCopy
+	messages := make([]qwenapi.Message, 0, 8)
+	systemPrompt := settings.AI.SystemPrompt
+	if contextData != "" {
+		if systemPrompt != "" {
+			systemPrompt += "\n\n" + contextData
+		} else {
+			systemPrompt = contextData
+		}
 	}
+	if systemPrompt != "" {
+		messages = append(messages, qwenapi.Message{Role: "system", Content: systemPrompt})
+	}
+	if settings.AI.IncludeHistory && session != nil {
+		for _, message := range a.getSessionHistory(session.ID, settings.AI.HistoryLimit) {
+			role := "user"
+			if message.Direction == models.DirectionOutgoing {
+				role = "assistant"
+			}
+			messages = append(messages, qwenapi.Message{Role: role, Content: message.Message})
+		}
+	}
+	messages = append(messages, qwenapi.Message{Role: "user", Content: userMessage})
 
-	baseURL := "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+	baseURL := qwenapi.DefaultBaseURL
 	if a.Config != nil && a.Config.AI.QwenBaseURL != "" {
 		baseURL = a.Config.AI.QwenBaseURL
 	}
-
-	return a.generateOpenAICompatibleResponse(
-		"Qwen",
-		strings.TrimRight(baseURL, "/")+"/chat/completions",
-		requestSettings,
-		session,
-		userMessage,
-		contextData,
-		map[string]any{"enable_thinking": false},
-	)
+	return qwenapi.Generate(context.Background(), a.HTTPClient, qwenapi.Options{
+		APIKey:      settings.AI.APIKey,
+		BaseURL:     baseURL,
+		Model:       settings.AI.Model,
+		MaxTokens:   settings.AI.MaxTokens,
+		Temperature: settings.AI.Temperature,
+		Messages:    messages,
+	})
 }
 
 // generateAnthropicResponse generates a response using Anthropic API
@@ -2114,14 +2153,6 @@ func (a *App) getOrCreateInboundContact(
 				}
 				canonical.ProfileName = profileName
 			}
-			if bsuid != "" && canonical.BSUID != bsuid {
-				if updateErr := tx.Model(canonical).
-					Update("bs_uid", bsuid).Error; updateErr != nil {
-					return updateErr
-				}
-				canonical.BSUID = bsuid
-			}
-
 			if created {
 				if _, activityErr := recordCustomerActivity(
 					tx,
@@ -2156,6 +2187,10 @@ func (a *App) getOrCreateInboundContact(
 			return nil
 		})
 		if err == nil {
+			// BSUID is optional metadata. Isolate its update behind a
+			// savepoint so a failure cannot roll back the durable contact,
+			// CRM activity, or the inbound message written by the caller.
+			a.updateContactBSUID(&result, bsuid)
 			return &result, isNew, nil
 		}
 		if !isUniqueViolation(err) && !isRetryableCanonicalContactWrite(err) {

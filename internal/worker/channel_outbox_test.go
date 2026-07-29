@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -295,6 +296,505 @@ func TestChannelOutboxReclaimsStaleLeaseAndProtectsCompletion(t *testing.T) {
 	assert.Equal(t, models.OutboxJobStatusSent, job.Status)
 	require.NoError(t, db.Where("id = ? AND organization_id = ?", message.ID, org.ID).First(message).Error)
 	assert.Equal(t, models.MessageStatusSent, message.Status)
+}
+
+func TestChannelAIOutboxDispatchRechecksPolicyAndCancels(t *testing.T) {
+	tests := []struct {
+		name         string
+		frozenWindow func() time.Time
+		changePolicy func(*testing.T, *gorm.DB, *channelAIReplyFixture)
+	}{
+		{
+			name: "conversation paused",
+			changePolicy: func(
+				t *testing.T,
+				db *gorm.DB,
+				fixture *channelAIReplyFixture,
+			) {
+				require.NoError(t, db.Model(&models.InboxConversation{}).
+					Where("id = ?", fixture.Conversation.ID).
+					Update(
+						"config",
+						models.JSONB{models.ConversationConfigAIPaused: true},
+					).Error)
+			},
+		},
+		{
+			name: "account AI disabled",
+			changePolicy: func(
+				t *testing.T,
+				db *gorm.DB,
+				fixture *channelAIReplyFixture,
+			) {
+				require.NoError(t, db.Model(&models.ChannelAccount{}).
+					Where("id = ?", fixture.Account.ID).
+					Update("config", models.JSONB{
+						"outbound_enabled": true,
+						"ai_reply_enabled": false,
+					}).Error)
+			},
+		},
+		{
+			name: "qwen settings disabled",
+			changePolicy: func(
+				t *testing.T,
+				db *gorm.DB,
+				fixture *channelAIReplyFixture,
+			) {
+				require.NoError(t, db.Model(&models.ChatbotSettings{}).
+					Where("id = ?", fixture.Settings.ID).
+					Update("ai_enabled", false).Error)
+			},
+		},
+		{
+			name: "newer human reply",
+			changePolicy: func(
+				t *testing.T,
+				db *gorm.DB,
+				fixture *channelAIReplyFixture,
+			) {
+				createChannelAIReplyHumanMessage(t, db, fixture)
+			},
+		},
+		{
+			name: "active human handover",
+			changePolicy: func(
+				t *testing.T,
+				db *gorm.DB,
+				fixture *channelAIReplyFixture,
+			) {
+				require.NoError(t, db.Create(&models.AgentTransfer{
+					BaseModel:       models.BaseModel{ID: uuid.New()},
+					OrganizationID:  fixture.Organization.ID,
+					ContactID:       fixture.Contact.ID,
+					WhatsAppAccount: fixture.Account.Name,
+					PhoneNumber:     fixture.Contact.PhoneNumber,
+					Status:          models.TransferStatusActive,
+					Source:          models.TransferSourceManual,
+					TransferredAt:   time.Now().UTC(),
+				}).Error)
+			},
+		},
+		{
+			name: "frozen service window expired despite a reopened conversation",
+			frozenWindow: func() time.Time {
+				return time.Now().UTC().Add(-time.Minute)
+			},
+			changePolicy: func(
+				t *testing.T,
+				db *gorm.DB,
+				fixture *channelAIReplyFixture,
+			) {
+				reopened := time.Now().UTC().Add(time.Hour)
+				require.NoError(t, db.Model(&models.InboxConversation{}).
+					Where("id = ?", fixture.Conversation.ID).
+					Update("service_window_ends_at", reopened).Error)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			fixture := createChannelAIReplyWorkerFixture(t, db)
+			windowEnd := time.Now().UTC().Add(time.Hour)
+			if test.frozenWindow != nil {
+				windowEnd = test.frozenWindow()
+			}
+			job, message := createChannelAIOutboxDispatchFixture(
+				t,
+				db,
+				fixture,
+				windowEnd,
+				"ai-dispatch-worker",
+			)
+			test.changePolicy(t, db, fixture)
+
+			worker := &Worker{DB: db, Log: testutil.NopLogger()}
+			err := worker.recheckChannelAIOutboxDispatch(
+				fixture.Organization.ID,
+				job.ID,
+				job.LockedBy,
+			)
+			require.ErrorIs(t, err, errChannelOutboxAIPolicy)
+			require.NoError(t, worker.cancelChannelAIOutboxJob(
+				fixture.Organization.ID,
+				job,
+				job.LockedBy,
+				err,
+			))
+
+			require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+			assert.Equal(t, models.OutboxJobStatusCancelled, job.Status)
+			assert.Equal(t, "ai_reply_cancelled", job.LastErrorCode)
+			require.NoError(t, db.First(message, "id = ?", message.ID).Error)
+			assert.Equal(t, models.MessageStatusFailed, message.Status)
+		})
+	}
+}
+
+func TestChannelAIOutboxDispatchAllowsUnchangedEligibleJob(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	fixture := createChannelAIReplyWorkerFixture(t, db)
+	job, _ := createChannelAIOutboxDispatchFixture(
+		t,
+		db,
+		fixture,
+		time.Now().UTC().Add(time.Hour),
+		"ai-dispatch-worker",
+	)
+
+	worker := &Worker{DB: db, Log: testutil.NopLogger()}
+	require.NoError(t, worker.recheckChannelAIOutboxDispatch(
+		fixture.Organization.ID,
+		job.ID,
+		job.LockedBy,
+	))
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusDispatching, job.Status)
+
+	// Once the atomic fence wins, a later control-plane cancellation cannot
+	// revoke the already-authorized single provider attempt.
+	result := db.Model(&models.OutboxJob{}).
+		Where(
+			"id = ? AND status IN ?",
+			job.ID,
+			[]models.OutboxJobStatus{
+				models.OutboxJobStatusPending,
+				models.OutboxJobStatusRetrying,
+				models.OutboxJobStatusProcessing,
+			},
+		).
+		Update("status", models.OutboxJobStatusCancelled)
+	require.NoError(t, result.Error)
+	assert.Zero(t, result.RowsAffected)
+}
+
+func TestChannelAIOutboxDispatchSerializesCommittedConsentWithdrawal(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	fixture := createChannelAIReplyWorkerFixture(t, db)
+	job, _ := createChannelAIOutboxDispatchFixture(
+		t,
+		db,
+		fixture,
+		time.Now().UTC().Add(time.Hour),
+		"consent-race-worker",
+	)
+
+	withdrawalTx := db.Begin()
+	require.NoError(t, withdrawalTx.Error)
+	t.Cleanup(func() {
+		_ = withdrawalTx.Rollback().Error
+	})
+	require.NoError(t, database.LockContactPolicyScope(
+		withdrawalTx,
+		fixture.Organization.ID,
+		fixture.Contact.ID,
+	))
+	now := time.Now().UTC()
+	event := &models.ConsentEvent{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: fixture.Organization.ID,
+		ContactID:      &fixture.Contact.ID,
+		SubjectType:    "contact",
+		SubjectKey:     fixture.Contact.ID.String(),
+		Purpose:        string(models.ChannelPreferencePurposeService),
+		Channel:        string(fixture.Account.Channel),
+		Action:         models.ConsentActionWithdrawn,
+		Source:         "test",
+		Evidence:       models.JSONB{},
+		CapturedAt:     now,
+	}
+	require.NoError(t, withdrawalTx.Create(event).Error)
+	require.NoError(t, withdrawalTx.Create(&models.ConsentState{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: fixture.Organization.ID,
+		ContactID:      &fixture.Contact.ID,
+		SubjectType:    event.SubjectType,
+		SubjectKey:     event.SubjectKey,
+		Purpose:        event.Purpose,
+		Channel:        event.Channel,
+		Status:         models.ConsentStatusWithdrawn,
+		LatestEventID:  event.ID,
+		EffectiveAt:    now,
+		Metadata:       models.JSONB{},
+	}).Error)
+
+	fencePID := make(chan int, 1)
+	fenceDone := make(chan error, 1)
+	go func() {
+		fenceDone <- db.Connection(func(connection *gorm.DB) error {
+			var backendPID int
+			if err := connection.Raw("SELECT pg_backend_pid()").
+				Scan(&backendPID).Error; err != nil {
+				fencePID <- 0
+				return err
+			}
+			fencePID <- backendPID
+			worker := &Worker{DB: connection, Log: testutil.NopLogger()}
+			return worker.recheckChannelAIOutboxDispatch(
+				fixture.Organization.ID,
+				job.ID,
+				job.LockedBy,
+			)
+		})
+	}()
+	backendPID := <-fencePID
+	require.Positive(t, backendPID)
+	testutil.RequirePostgresBackendWaitingForLock(t, db, backendPID)
+
+	require.NoError(t, withdrawalTx.Commit().Error)
+	select {
+	case err := <-fenceDone:
+		require.ErrorIs(t, err, errChannelOutboxAIPolicy)
+		assert.Contains(t, err.Error(), "consent_withdrawn")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "AI dispatch fence did not resume after consent withdrawal committed")
+	}
+
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusProcessing, job.Status)
+}
+
+func TestChannelAIOutboxDispatchSerializesCommittedHandover(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	fixture := createChannelAIReplyWorkerFixture(t, db)
+	job, _ := createChannelAIOutboxDispatchFixture(
+		t,
+		db,
+		fixture,
+		time.Now().UTC().Add(time.Hour),
+		"handover-race-worker",
+	)
+
+	handoverTx := db.Begin()
+	require.NoError(t, handoverTx.Error)
+	t.Cleanup(func() {
+		_ = handoverTx.Rollback().Error
+	})
+	require.NoError(t, database.LockContactPolicyScope(
+		handoverTx,
+		fixture.Organization.ID,
+		fixture.Contact.ID,
+	))
+	require.NoError(t, handoverTx.Create(&models.AgentTransfer{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  fixture.Organization.ID,
+		ContactID:       fixture.Contact.ID,
+		WhatsAppAccount: fixture.Account.Name,
+		PhoneNumber:     fixture.Contact.PhoneNumber,
+		Status:          models.TransferStatusActive,
+		Source:          models.TransferSourceManual,
+		TransferredAt:   time.Now().UTC(),
+	}).Error)
+
+	fencePID := make(chan int, 1)
+	fenceDone := make(chan error, 1)
+	go func() {
+		fenceDone <- db.Connection(func(connection *gorm.DB) error {
+			var backendPID int
+			if err := connection.Raw("SELECT pg_backend_pid()").
+				Scan(&backendPID).Error; err != nil {
+				fencePID <- 0
+				return err
+			}
+			fencePID <- backendPID
+			worker := &Worker{DB: connection, Log: testutil.NopLogger()}
+			return worker.recheckChannelAIOutboxDispatch(
+				fixture.Organization.ID,
+				job.ID,
+				job.LockedBy,
+			)
+		})
+	}()
+	backendPID := <-fencePID
+	require.Positive(t, backendPID)
+	testutil.RequirePostgresBackendWaitingForLock(t, db, backendPID)
+
+	require.NoError(t, handoverTx.Commit().Error)
+	select {
+	case err := <-fenceDone:
+		require.ErrorIs(t, err, errChannelOutboxAIPolicy)
+		assert.Contains(t, err.Error(), "human handover")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "AI dispatch fence did not resume after handover committed")
+	}
+
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusProcessing, job.Status)
+}
+
+func TestChannelAIOutboxDispatchSerializesCommittedSettingsDisable(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	fixture := createChannelAIReplyWorkerFixture(t, db)
+	job, _ := createChannelAIOutboxDispatchFixture(
+		t,
+		db,
+		fixture,
+		time.Now().UTC().Add(time.Hour),
+		"settings-race-worker",
+	)
+
+	settingsTx := db.Begin()
+	require.NoError(t, settingsTx.Error)
+	t.Cleanup(func() {
+		_ = settingsTx.Rollback().Error
+	})
+	require.NoError(t, settingsTx.Model(&models.ChatbotSettings{}).
+		Where(
+			"id = ? AND organization_id = ?",
+			fixture.Settings.ID,
+			fixture.Organization.ID,
+		).
+		Update("ai_enabled", false).Error)
+
+	fencePID := make(chan int, 1)
+	fenceDone := make(chan error, 1)
+	go func() {
+		fenceDone <- db.Connection(func(connection *gorm.DB) error {
+			var backendPID int
+			if err := connection.Raw("SELECT pg_backend_pid()").
+				Scan(&backendPID).Error; err != nil {
+				fencePID <- 0
+				return err
+			}
+			fencePID <- backendPID
+			worker := &Worker{DB: connection, Log: testutil.NopLogger()}
+			return worker.recheckChannelAIOutboxDispatch(
+				fixture.Organization.ID,
+				job.ID,
+				job.LockedBy,
+			)
+		})
+	}()
+	backendPID := <-fencePID
+	require.Positive(t, backendPID)
+	testutil.RequirePostgresBackendWaitingForLock(t, db, backendPID)
+
+	require.NoError(t, settingsTx.Commit().Error)
+	select {
+	case err := <-fenceDone:
+		require.ErrorIs(t, err, errChannelOutboxAIPolicy)
+		assert.Contains(t, err.Error(), "qwen settings are disabled")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "AI dispatch fence did not resume after settings disable committed")
+	}
+
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusProcessing, job.Status)
+}
+
+func TestChannelOutboxAbandonedDispatchIsNotRetried(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	fixture := createChannelAIReplyWorkerFixture(t, db)
+	job, message := createChannelAIOutboxDispatchFixture(
+		t,
+		db,
+		fixture,
+		time.Now().UTC().Add(time.Hour),
+		"abandoned-dispatch-worker",
+	)
+	stale := time.Now().UTC().Add(-defaultChannelOutboxLease - time.Second)
+	require.NoError(t, db.Model(&models.OutboxJob{}).
+		Where("id = ?", job.ID).
+		Updates(map[string]any{
+			"status":    models.OutboxJobStatusDispatching,
+			"locked_at": stale,
+		}).Error)
+
+	worker := &Worker{DB: db, Log: testutil.NopLogger()}
+	claimedID, claimed, err := worker.claimChannelOutboxJob(
+		fixture.Organization.ID,
+		"replacement-worker",
+	)
+	require.NoError(t, err)
+	assert.False(t, claimed)
+	assert.Equal(t, uuid.Nil, claimedID)
+
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusFailed, job.Status)
+	assert.Equal(t, "delivery_state_unknown", job.LastErrorCode)
+	require.NoError(t, db.First(message, "id = ?", message.ID).Error)
+	assert.Equal(t, models.MessageStatusFailed, message.Status)
+}
+
+func createChannelAIOutboxDispatchFixture(
+	t *testing.T,
+	db *gorm.DB,
+	fixture *channelAIReplyFixture,
+	frozenWindowEnd time.Time,
+	workerID string,
+) (*models.OutboxJob, *models.Message) {
+	t.Helper()
+	messageID := uuid.New()
+	idempotencyKey := models.ChannelAIReplyIdempotencyKey(fixture.Inbound.ID)
+	message := &models.Message{
+		BaseModel:           models.BaseModel{ID: messageID},
+		OrganizationID:      fixture.Organization.ID,
+		WhatsAppAccount:     fixture.Account.Name,
+		ContactID:           fixture.Contact.ID,
+		ConversationID:      fixture.Conversation.ExternalConversationID,
+		InboxConversationID: &fixture.Conversation.ID,
+		Direction:           models.DirectionOutgoing,
+		MessageType:         models.MessageTypeText,
+		Content:             "Pending automatic reply",
+		Status:              models.MessageStatusPending,
+		Metadata: models.JSONB{
+			"ai_generated":       true,
+			"ai_settings_id":     fixture.Settings.ID.String(),
+			"inbound_message_id": fixture.Inbound.ID.String(),
+		},
+	}
+	require.NoError(t, db.Create(message).Error)
+
+	outbound := channelapi.OutboundMessage{
+		OrganizationID: fixture.Organization.ID,
+		MessageID:      message.ID,
+		IdempotencyKey: idempotencyKey,
+		Purpose:        models.ChannelPreferencePurposeService,
+		Conversation: channelapi.ConversationRef{
+			ID:         fixture.Conversation.ID,
+			ExternalID: fixture.Conversation.ExternalConversationID,
+		},
+		Recipient: channelapi.Participant{
+			ID:         fixture.Contact.ID,
+			ExternalID: fixture.Identity.ExternalID,
+			Role:       models.ConversationParticipantRoleCustomer,
+		},
+		Parts: []channelapi.MessagePart{{
+			Type: models.MessagePartTypeText,
+			Text: "Pending automatic reply",
+		}},
+		ServiceWindowEndsAt: &frozenWindowEnd,
+		Metadata: map[string]any{
+			"sender_role":        models.ConversationParticipantRoleBot,
+			"ai_generated":       true,
+			"ai_settings_id":     fixture.Settings.ID,
+			"inbound_message_id": fixture.Inbound.ID,
+		},
+	}
+	payload, digest, err := channelAIReplyOutboxPayload(outbound)
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	job := &models.OutboxJob{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   fixture.Organization.ID,
+		ChannelAccountID: fixture.Account.ID,
+		ConversationID:   fixture.Conversation.ID,
+		MessageID:        &message.ID,
+		IdempotencyKey:   idempotencyKey,
+		PayloadDigest:    digest,
+		Purpose:          models.ChannelPreferencePurposeService,
+		Status:           models.OutboxJobStatusProcessing,
+		AvailableAt:      now,
+		LockedAt:         &now,
+		LockedBy:         workerID,
+		MaxAttempts:      8,
+		Payload:          payload,
+	}
+	require.NoError(t, db.Create(job).Error)
+	return job, message
 }
 
 func createChannelOutboxTestFixture(

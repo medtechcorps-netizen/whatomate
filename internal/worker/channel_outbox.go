@@ -26,6 +26,7 @@ const (
 var (
 	errChannelOutboxUnlicensed = errors.New("omnichannel entitlement is not active")
 	errChannelOutboxConsent    = errors.New("contact consent does not permit delivery")
+	errChannelOutboxAIPolicy   = errors.New("automatic AI reply is no longer eligible")
 )
 
 // RunChannelOutbox runs the durable provider-neutral delivery loop until the
@@ -133,7 +134,7 @@ func (w *Worker) listReadyChannelOutboxOrganizations(
 			  AND (
 			    status IN (?, ?)
 			    OR (
-			      status = ?
+			      status IN (?, ?)
 			      AND (locked_at IS NULL OR locked_at < ?)
 			    )
 			  )
@@ -147,6 +148,7 @@ func (w *Worker) listReadyChannelOutboxOrganizations(
 		models.OutboxJobStatusPending,
 		models.OutboxJobStatusRetrying,
 		models.OutboxJobStatusProcessing,
+		models.OutboxJobStatusDispatching,
 		staleBefore,
 		cursor,
 		limit,
@@ -163,17 +165,19 @@ func (w *Worker) claimChannelOutboxJob(orgID uuid.UUID, workerID string) (uuid.U
 		now := time.Now().UTC()
 		staleBefore := now.Add(-defaultChannelOutboxLease)
 		var candidate struct {
-			ID uuid.UUID
+			ID        uuid.UUID
+			Status    models.OutboxJobStatus
+			MessageID *uuid.UUID
 		}
 		if err := tx.Raw(`
-			SELECT id
+			SELECT id, status, message_id
 			FROM outbox_jobs
 			WHERE organization_id = ?
 			  AND deleted_at IS NULL
 			  AND available_at <= ?
 			  AND (
 			    status IN (?, ?)
-			    OR (status = ? AND (locked_at IS NULL OR locked_at < ?))
+			    OR (status IN (?, ?) AND (locked_at IS NULL OR locked_at < ?))
 			  )
 			ORDER BY priority DESC, available_at, created_at
 			FOR UPDATE SKIP LOCKED
@@ -184,11 +188,57 @@ func (w *Worker) claimChannelOutboxJob(orgID uuid.UUID, workerID string) (uuid.U
 			models.OutboxJobStatusPending,
 			models.OutboxJobStatusRetrying,
 			models.OutboxJobStatusProcessing,
+			models.OutboxJobStatusDispatching,
 			staleBefore,
 		).Scan(&candidate).Error; err != nil {
 			return err
 		}
 		if candidate.ID == uuid.Nil {
+			return nil
+		}
+		if candidate.Status == models.OutboxJobStatusDispatching {
+			// A process that dies after crossing the delivery fence may have
+			// reached the provider. Retrying would risk a duplicate, so recover
+			// the abandoned row as an explicit ambiguous terminal failure.
+			result := tx.Model(&models.OutboxJob{}).
+				Where(
+					"id = ? AND organization_id = ? AND status = ?",
+					candidate.ID,
+					orgID,
+					models.OutboxJobStatusDispatching,
+				).
+				Updates(map[string]any{
+					"status":          models.OutboxJobStatusFailed,
+					"failed_at":       now,
+					"last_attempt_at": now,
+					"last_error_code": "delivery_state_unknown",
+					"last_error":      "Provider delivery state is unknown after an interrupted dispatch",
+					"locked_at":       nil,
+					"locked_by":       "",
+					"updated_at":      now,
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errors.New("abandoned channel outbox dispatch recovery lost its lease")
+			}
+			if candidate.MessageID != nil {
+				if err := tx.Model(&models.Message{}).
+					Where(
+						"id = ? AND organization_id = ? AND status = ?",
+						*candidate.MessageID,
+						orgID,
+						models.MessageStatusPending,
+					).
+					Updates(map[string]any{
+						"status":        models.MessageStatusFailed,
+						"error_message": "Provider delivery state is unknown; review before retrying",
+						"updated_at":    now,
+					}).Error; err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 		result := tx.Model(&models.OutboxJob{}).
@@ -244,17 +294,22 @@ func (w *Worker) deliverChannelOutboxJob(
 		if !entitled {
 			return errChannelOutboxUnlicensed
 		}
+		now := time.Now().UTC()
 		if err := tx.
-			Preload(
-				"Credentials",
-				"organization_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
-				orgID,
-				[]models.ChannelCredentialStatus{
-					models.ChannelCredentialStatusActive,
-					models.ChannelCredentialStatusExpiring,
-				},
-				time.Now().UTC(),
-			).
+			Preload("Credentials", func(credentials *gorm.DB) *gorm.DB {
+				return credentials.
+					Where(
+						"organization_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+						orgID,
+						[]models.ChannelCredentialStatus{
+							models.ChannelCredentialStatusActive,
+							models.ChannelCredentialStatusExpiring,
+						},
+						now,
+					).
+					Order("version DESC").
+					Order("id ASC")
+			}).
 			Where("id = ? AND organization_id = ?", job.ChannelAccountID, orgID).
 			First(&account).Error; err != nil {
 			return err
@@ -327,6 +382,21 @@ func (w *Worker) deliverChannelOutboxJob(
 	); err != nil {
 		return w.failChannelOutboxJob(orgID, &job, workerID, err, false)
 	}
+	if isChannelAIReplyOutbox(&job, outbound) {
+		if err := w.recheckChannelAIOutboxDispatch(
+			orgID,
+			job.ID,
+			workerID,
+		); err != nil {
+			return w.cancelChannelAIOutboxJob(
+				orgID,
+				&job,
+				workerID,
+				err,
+			)
+		}
+		job.Status = models.OutboxJobStatusDispatching
+	}
 
 	result, sendErr := adapter.Send(ctx, &account, outbound)
 	if sendErr != nil {
@@ -344,6 +414,356 @@ func (w *Worker) deliverChannelOutboxJob(
 	return w.completeChannelOutboxJob(orgID, &job, &account, workerID, result)
 }
 
+func isChannelAIReplyOutbox(
+	job *models.OutboxJob,
+	outbound channelapi.OutboundMessage,
+) bool {
+	if job == nil ||
+		!strings.HasPrefix(job.IdempotencyKey, models.ChannelAIReplyKeyPrefix) {
+		return false
+	}
+	aiGenerated, _ := outbound.Metadata["ai_generated"].(bool)
+	senderRole, _ := outbound.Metadata["sender_role"].(string)
+	return aiGenerated &&
+		senderRole == string(models.ConversationParticipantRoleBot)
+}
+
+// recheckChannelAIOutboxDispatch closes the gap between Qwen finalization and
+// provider dispatch and then atomically crosses a delivery fence. Policy
+// transactions may cancel pending/retrying/processing jobs. Once this compare-
+// and-swap commits dispatching, the provider attempt has won that race and
+// later policy changes apply to subsequent messages.
+func (w *Worker) recheckChannelAIOutboxDispatch(
+	orgID, jobID uuid.UUID,
+	workerID string,
+) error {
+	return database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
+		var job models.OutboxJob
+		if err := tx.Where(
+			"id = ? AND organization_id = ? AND status = ? AND locked_by = ?",
+			jobID,
+			orgID,
+			models.OutboxJobStatusProcessing,
+			workerID,
+		).First(&job).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: delivery was cancelled", errChannelOutboxAIPolicy)
+			}
+			return err
+		}
+
+		var account models.ChannelAccount
+		if err := tx.Select("id", "organization_id", "channel", "provider", "status", "config").
+			Where(
+				"id = ? AND organization_id = ?",
+				job.ChannelAccountID,
+				orgID,
+			).
+			First(&account).Error; err != nil {
+			return err
+		}
+		if account.Status != models.ChannelAccountStatusActive ||
+			(account.Channel != models.ChannelInstagram &&
+				account.Channel != models.ChannelMessenger) ||
+			account.Provider != channelapi.RelayProvider ||
+			!channelOutboxBool(account.Config, "outbound_enabled") ||
+			!channelOutboxBool(account.Config, "ai_reply_enabled") {
+			return fmt.Errorf("%w: account AI delivery is disabled", errChannelOutboxAIPolicy)
+		}
+
+		var conversation models.InboxConversation
+		if err := tx.Select(
+			"id",
+			"organization_id",
+			"channel_account_id",
+			"contact_id",
+			"config",
+			"service_window_ends_at",
+		).Where(
+			"id = ? AND organization_id = ? AND channel_account_id = ?",
+			job.ConversationID,
+			orgID,
+			account.ID,
+		).First(&conversation).Error; err != nil {
+			return err
+		}
+		if channelAIReplyBoolValue(
+			conversation.Config[models.ConversationConfigAIPaused],
+		) {
+			return fmt.Errorf("%w: conversation AI is paused", errChannelOutboxAIPolicy)
+		}
+
+		// Consent withdrawal and human handover creation acquire this same
+		// contact-row lock. Whichever transaction commits first becomes the
+		// policy decision for this single provider attempt.
+		if err := database.LockContactPolicyScope(
+			tx,
+			orgID,
+			conversation.ContactID,
+		); err != nil {
+			return fmt.Errorf("lock contact AI policy scope: %w", err)
+		}
+
+		var outbound channelapi.OutboundMessage
+		if err := decodeChannelOutboxPayload(job.Payload, &outbound); err != nil {
+			return fmt.Errorf("%w: invalid AI outbox payload", errChannelOutboxAIPolicy)
+		}
+		settingsID, err := uuid.Parse(strings.TrimSpace(
+			fmt.Sprint(outbound.Metadata["ai_settings_id"]),
+		))
+		if err != nil || settingsID == uuid.Nil {
+			return fmt.Errorf("%w: ai settings binding is invalid", errChannelOutboxAIPolicy)
+		}
+		var settings models.ChatbotSettings
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select(
+				"id",
+				"organization_id",
+				"is_enabled",
+				"ai_enabled",
+				"ai_provider",
+			).
+			Where(
+				"id = ? AND organization_id = ?",
+				settingsID,
+				orgID,
+			).
+			First(&settings).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: ai settings binding is unavailable", errChannelOutboxAIPolicy)
+			}
+			return err
+		}
+		if !settings.IsEnabled ||
+			!settings.AI.Enabled ||
+			settings.AI.Provider != models.AIProviderQwen {
+			return fmt.Errorf("%w: qwen settings are disabled", errChannelOutboxAIPolicy)
+		}
+		now := time.Now().UTC()
+		consentAllowed, consentReason, consentErr := channelapi.OutboundConsentAllowed(
+			tx,
+			orgID,
+			conversation.ContactID,
+			account.ID,
+			account.Channel,
+			outbound.Purpose,
+			now,
+		)
+		if consentErr != nil {
+			return fmt.Errorf("re-evaluate outbound consent at dispatch fence: %w", consentErr)
+		}
+		if !consentAllowed {
+			return fmt.Errorf(
+				"%w: outbound consent changed: %s",
+				errChannelOutboxAIPolicy,
+				consentReason,
+			)
+		}
+
+		var handoverCount int64
+		if err := tx.Model(&models.AgentTransfer{}).
+			Where(
+				"organization_id = ? AND contact_id = ? AND status = ?",
+				orgID,
+				conversation.ContactID,
+				models.TransferStatusActive,
+			).
+			Count(&handoverCount).Error; err != nil {
+			return err
+		}
+		if handoverCount > 0 {
+			return fmt.Errorf("%w: human handover is active", errChannelOutboxAIPolicy)
+		}
+
+		if outbound.ServiceWindowEndsAt == nil ||
+			!outbound.ServiceWindowEndsAt.After(now) ||
+			conversation.ServiceWindowEndsAt == nil ||
+			!conversation.ServiceWindowEndsAt.After(now) {
+			return fmt.Errorf("%w: Meta service window expired", errChannelOutboxAIPolicy)
+		}
+		inboundID, err := uuid.Parse(strings.TrimSpace(
+			fmt.Sprint(outbound.Metadata["inbound_message_id"]),
+		))
+		if err != nil || inboundID == uuid.Nil {
+			return fmt.Errorf("%w: inbound binding is invalid", errChannelOutboxAIPolicy)
+		}
+		var inbound models.Message
+		if err := tx.Select("id", "created_at").
+			Where(
+				"id = ? AND organization_id = ? AND inbox_conversation_id = ? AND direction = ?",
+				inboundID,
+				orgID,
+				conversation.ID,
+				models.DirectionIncoming,
+			).
+			First(&inbound).Error; err != nil {
+			return fmt.Errorf("%w: inbound binding is unavailable", errChannelOutboxAIPolicy)
+		}
+		var newerHumanReplyCount int64
+		if err := tx.Model(&models.Message{}).
+			Where(
+				"organization_id = ? AND inbox_conversation_id = ? AND direction = ? AND sent_by_user_id IS NOT NULL AND created_at > ?",
+				orgID,
+				conversation.ID,
+				models.DirectionOutgoing,
+				inbound.CreatedAt,
+			).
+			Count(&newerHumanReplyCount).Error; err != nil {
+			return err
+		}
+		if newerHumanReplyCount > 0 {
+			return fmt.Errorf("%w: a newer human reply exists", errChannelOutboxAIPolicy)
+		}
+		fencedAt := time.Now().UTC()
+		result := tx.Model(&models.OutboxJob{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ? AND locked_by = ?",
+				job.ID,
+				orgID,
+				channelOutboxLeaseStatus(&job),
+				workerID,
+			).
+			Where(
+				"? > clock_timestamp()",
+				outbound.ServiceWindowEndsAt.UTC(),
+			).
+			Where(`
+				EXISTS (
+					SELECT 1
+					FROM channel_accounts AS ca
+					WHERE ca.id = outbox_jobs.channel_account_id
+					  AND ca.organization_id = outbox_jobs.organization_id
+					  AND ca.deleted_at IS NULL
+					  AND ca.status = ?
+					  AND ca.channel IN (?, ?)
+					  AND ca.provider = ?
+					  AND LOWER(COALESCE(ca.config->>'outbound_enabled', 'false')) IN ('true', '1', 'yes')
+					  AND LOWER(COALESCE(ca.config->>'ai_reply_enabled', 'false')) IN ('true', '1', 'yes')
+				)
+				AND EXISTS (
+					SELECT 1
+					FROM inbox_conversations AS ic
+					WHERE ic.id = outbox_jobs.conversation_id
+					  AND ic.organization_id = outbox_jobs.organization_id
+					  AND ic.channel_account_id = outbox_jobs.channel_account_id
+					  AND ic.deleted_at IS NULL
+					  AND LOWER(COALESCE(ic.config->>?, 'false')) NOT IN ('true', '1', 'yes')
+					  AND ic.service_window_ends_at > clock_timestamp()
+				)
+				AND NOT EXISTS (
+					SELECT 1
+					FROM agent_transfers AS at
+					WHERE at.organization_id = outbox_jobs.organization_id
+					  AND at.contact_id = ?
+					  AND at.status = ?
+					  AND at.deleted_at IS NULL
+				)
+				AND EXISTS (
+					SELECT 1
+					FROM messages AS inbound
+					WHERE inbound.id = ?
+					  AND inbound.organization_id = outbox_jobs.organization_id
+					  AND inbound.inbox_conversation_id = outbox_jobs.conversation_id
+					  AND inbound.direction = ?
+					  AND inbound.deleted_at IS NULL
+				)
+				AND NOT EXISTS (
+					SELECT 1
+					FROM messages AS human_reply
+					WHERE human_reply.organization_id = outbox_jobs.organization_id
+					  AND human_reply.inbox_conversation_id = outbox_jobs.conversation_id
+					  AND human_reply.direction = ?
+					  AND human_reply.sent_by_user_id IS NOT NULL
+					  AND human_reply.created_at > ?
+					  AND human_reply.deleted_at IS NULL
+				)
+			`,
+				models.ChannelAccountStatusActive,
+				models.ChannelInstagram,
+				models.ChannelMessenger,
+				channelapi.RelayProvider,
+				models.ConversationConfigAIPaused,
+				conversation.ContactID,
+				models.TransferStatusActive,
+				inbound.ID,
+				models.DirectionIncoming,
+				models.DirectionOutgoing,
+				inbound.CreatedAt,
+			).
+			Updates(map[string]any{
+				"status":     models.OutboxJobStatusDispatching,
+				"locked_at":  fencedAt,
+				"updated_at": fencedAt,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf(
+				"%w: delivery fence lost to a committed policy change",
+				errChannelOutboxAIPolicy,
+			)
+		}
+		return nil
+	})
+}
+
+func (w *Worker) cancelChannelAIOutboxJob(
+	orgID uuid.UUID,
+	job *models.OutboxJob,
+	workerID string,
+	policyErr error,
+) error {
+	if job == nil || job.ID == uuid.Nil {
+		return policyErr
+	}
+	reason := channelOutboxErrorMessage(policyErr)
+	return database.WithTenant(w.DB, orgID, func(tx *gorm.DB) error {
+		now := time.Now().UTC()
+		result := tx.Model(&models.OutboxJob{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ? AND locked_by = ?",
+				job.ID,
+				orgID,
+				channelOutboxLeaseStatus(job),
+				workerID,
+			).
+			Updates(map[string]any{
+				"status":          models.OutboxJobStatusCancelled,
+				"failed_at":       now,
+				"last_attempt_at": now,
+				"last_error_code": "ai_reply_cancelled",
+				"last_error":      reason,
+				"locked_at":       nil,
+				"locked_by":       "",
+				"updated_at":      now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		// A control-plane transaction may already have cancelled the row and
+		// cleared its lease. That is the desired terminal state.
+		if result.RowsAffected == 0 {
+			return nil
+		}
+		if job.MessageID == nil {
+			return nil
+		}
+		return tx.Model(&models.Message{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ?",
+				*job.MessageID,
+				orgID,
+				models.MessageStatusPending,
+			).
+			Updates(map[string]any{
+				"status":        models.MessageStatusFailed,
+				"error_message": "Automatic AI reply cancelled before delivery",
+				"updated_at":    now,
+			}).Error
+	})
+}
+
 func (w *Worker) completeChannelOutboxJob(
 	orgID uuid.UUID,
 	job *models.OutboxJob,
@@ -359,7 +779,7 @@ func (w *Worker) completeChannelOutboxJob(
 				"id = ? AND organization_id = ? AND status = ? AND locked_by = ?",
 				job.ID,
 				orgID,
-				models.OutboxJobStatusProcessing,
+				channelOutboxLeaseStatus(job),
 				workerID,
 			).
 			Updates(map[string]any{
@@ -465,7 +885,7 @@ func (w *Worker) failChannelOutboxJob(
 				"id = ? AND organization_id = ? AND status = ? AND locked_by = ?",
 				job.ID,
 				orgID,
-				models.OutboxJobStatusProcessing,
+				channelOutboxLeaseStatus(job),
 				workerID,
 			).
 			Updates(updates)
@@ -606,6 +1026,13 @@ func channelOutboxBackoff(attempt int) time.Duration {
 		return time.Hour
 	}
 	return delay
+}
+
+func channelOutboxLeaseStatus(job *models.OutboxJob) models.OutboxJobStatus {
+	if job != nil && job.Status == models.OutboxJobStatusDispatching {
+		return models.OutboxJobStatusDispatching
+	}
+	return models.OutboxJobStatusProcessing
 }
 
 func channelOutboxErrorCode(err error) string {

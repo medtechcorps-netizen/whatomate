@@ -1026,6 +1026,10 @@ func (a *App) processMessageEcho(phoneNumberID string, msg IncomingTextMessage) 
 		return
 	}
 
+	// Store BSUID without allowing this optional metadata write to abort the
+	// message-echo transaction.
+	a.updateContactBSUID(contact, msg.FromUserID)
+
 	// Get message content - handle text and media
 	extracted := a.extractMessageContent(context.Background(), msg, account)
 	messageText := extracted.Text

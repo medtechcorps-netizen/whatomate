@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useMediaQuery } from '@vueuse/core'
 import {
   AtSign,
+  Bot,
   CheckCircle2,
   AlertCircle,
   Facebook,
@@ -12,6 +13,8 @@ import {
   Loader2,
   Mail,
   MessageCircle,
+  PauseCircle,
+  Play,
   Plus,
   PanelRightOpen,
   RefreshCw,
@@ -73,6 +76,7 @@ const loadingMessages = ref(false)
 const loadingMore = ref(false)
 const loadingOlderMessages = ref(false)
 const sending = ref(false)
+const aiStateUpdating = ref(false)
 const showConnect = ref(false)
 const accounts = ref<ChannelAccount[]>([])
 const conversations = ref<InboxConversation[]>([])
@@ -97,6 +101,7 @@ const newAccount = reactive({
 const canManageAccounts = computed(() => authStore.hasPermission('channel_accounts', 'write'))
 const canDeleteAccounts = computed(() => authStore.hasPermission('channel_accounts', 'delete'))
 const canManageConversations = computed(() => authStore.hasPermission('conversations', 'write'))
+const threadsPublicEngagementEntitlement = 'threads.public_engagement.enabled'
 const absoluteWebhookURL = computed(() => {
   if (!createdConnection.value) return ''
   return new URL(createdConnection.value.webhook_path, window.location.origin).toString()
@@ -105,6 +110,7 @@ const accountSettingsDraft = reactive({
   name: '',
   relay_url: '',
   outbound_secret: '',
+  ai_reply_enabled: false,
 })
 let stopChannelSync: (() => void) | null = null
 let pollTimer: number | null = null
@@ -119,15 +125,34 @@ const supportedChannels: Array<{
   provider: string
   gated: boolean
   connectable: boolean
+  entitlement?: string
 }> = [
   { key: 'whatsapp', label: 'WhatsApp', icon: MessageCircle, provider: 'meta', gated: false, connectable: false },
   { key: 'instagram', label: 'Instagram', icon: Instagram, provider: 'relay', gated: true, connectable: true },
   { key: 'messenger', label: 'Messenger', icon: Facebook, provider: 'relay', gated: true, connectable: true },
+  {
+    key: 'threads',
+    label: 'Threads public replies',
+    icon: AtSign,
+    provider: 'relay',
+    gated: true,
+    connectable: true,
+    entitlement: threadsPublicEngagementEntitlement,
+  },
   { key: 'email', label: 'Email', icon: Mail, provider: 'relay', gated: true, connectable: true },
   { key: 'webchat', label: 'Web chat', icon: Globe2, provider: 'relay', gated: true, connectable: true },
   { key: 'tiktok', label: 'TikTok', icon: Smartphone, provider: 'tiktok', gated: true, connectable: false },
 ]
 
+const visibleChannels = computed(() =>
+  supportedChannels.filter(
+    channel =>
+      !channel.entitlement || authStore.hasProductEntitlement(channel.entitlement),
+  ),
+)
+const connectableChannels = computed(() =>
+  visibleChannels.value.filter(channel => channel.connectable),
+)
 const filteredConversations = computed(() => conversations.value)
 const hasOlderMessages = computed(() => messages.value.length < messageTotal.value)
 const inboxGridClass = computed(() =>
@@ -141,12 +166,30 @@ const selectedAccount = computed(() =>
     ? accounts.value.find((account) => account.id === selectedConversation.value?.channel_account_id)
     : undefined,
 )
+const canControlConversationAI = computed(
+  () =>
+    canManageConversations.value &&
+    ['instagram', 'messenger'].includes(selectedConversation.value?.channel ?? '') &&
+    selectedAccount.value?.config?.ai_reply_enabled === true,
+)
 
+const hasThreadsPublicReplyTarget = computed(() => {
+  if (selectedConversation.value?.channel !== 'threads') return true
+  const engagementType =
+    typeof selectedConversation.value.metadata?.engagement_type === 'string'
+      ? selectedConversation.value.metadata.engagement_type.trim().toLowerCase()
+      : ''
+  return (
+    Boolean(selectedConversation.value.external_conversation_id?.trim()) &&
+    ['reply', 'mention'].includes(engagementType)
+  )
+})
 const canSendText = computed(() =>
   canManageConversations.value &&
   selectedAccount.value?.status === 'active' &&
   selectedAccount.value?.config?.outbound_enabled === true &&
-  selectedAccount.value?.capabilities?.text !== false,
+  selectedAccount.value?.capabilities?.text !== false &&
+  hasThreadsPublicReplyTarget.value,
 )
 const activeCount = computed(() => accounts.value.filter(accountReadyForOutbound).length)
 const attentionCount = computed(() =>
@@ -313,21 +356,72 @@ async function loadOlderMessages() {
 }
 
 async function sendMessage() {
-  if (!selectedConversation.value || !composer.value.trim() || !canSendText.value) return
+  if (!selectedConversation.value || !composer.value.trim()) return
+  if (
+    selectedConversation.value.channel === 'threads' &&
+    !hasThreadsPublicReplyTarget.value
+  ) {
+    toast.warning('Select an existing public Threads reply or mention before replying')
+    return
+  }
+  if (!canSendText.value) return
   sending.value = true
   try {
-    const response = await channelsService.send(selectedConversation.value.id, {
+    const payload: Record<string, unknown> = {
       idempotency_key: crypto.randomUUID(),
       purpose: 'service',
       parts: [{ type: 'text', text: composer.value.trim() }],
-    })
+    }
+    if (selectedConversation.value.channel === 'threads') {
+      payload.reply_to_external_id = selectedConversation.value.external_conversation_id
+    }
+    const response = await channelsService.send(selectedConversation.value.id, payload)
     const result = unwrapItemResponse<InboxMessageEnvelope>(response)
     messages.value.push(normalizeMessage(result))
+    updateLocalConversationAIState(true, 'human_reply')
     composer.value = ''
   } catch (error) {
     toast.error('Message was not sent', getErrorMessage(error))
   } finally {
     sending.value = false
+  }
+}
+
+function updateLocalConversationAIState(paused: boolean, reason = '') {
+  const selected = selectedConversation.value
+  if (!selected) return
+  selected.ai_paused = paused
+  selected.ai_pause_reason = reason || undefined
+  const listed = conversations.value.find(conversation => conversation.id === selected.id)
+  if (listed && listed !== selected) {
+    listed.ai_paused = paused
+    listed.ai_pause_reason = reason || undefined
+  }
+}
+
+async function toggleConversationAI() {
+  const conversation = selectedConversation.value
+  if (!conversation || !canControlConversationAI.value || aiStateUpdating.value) return
+  const paused = !conversation.ai_paused
+  aiStateUpdating.value = true
+  try {
+    const response = await channelsService.setAIState(conversation.id, paused)
+    const state = unwrapItemResponse<{
+      conversation_id: string
+      ai_paused: boolean
+      ai_pause_reason?: string
+    }>(response)
+    updateLocalConversationAIState(state.ai_paused, state.ai_pause_reason)
+    toast.success(
+      state.ai_paused ? 'AI replies paused' : 'AI replies resumed',
+      state.ai_paused
+        ? 'Only human replies will be sent in this conversation.'
+        : 'The next eligible customer message can receive an automatic reply.',
+    )
+  } catch (error) {
+    toast.error('AI reply state was not changed', getErrorMessage(error))
+  } finally {
+    aiStateUpdating.value = false
   }
 }
 
@@ -341,7 +435,11 @@ async function connectAccount() {
     return
   }
   try {
-    const meta = channelMeta(newAccount.channel)
+    const meta = connectableChannels.value.find(channel => channel.key === newAccount.channel)
+    if (!meta) {
+      toast.warning('This channel is not included in the active workspace plan')
+      return
+    }
     const response = await channelsService.createAccount({
       channel: newAccount.channel,
       provider: meta.provider,
@@ -416,6 +514,7 @@ function openAccountSettings(account: ChannelAccount) {
   accountSettingsDraft.relay_url =
     typeof account.config?.relay_url === 'string' ? account.config.relay_url : ''
   accountSettingsDraft.outbound_secret = ''
+  accountSettingsDraft.ai_reply_enabled = account.config?.ai_reply_enabled === true
 }
 
 async function saveAccountSettings() {
@@ -437,6 +536,9 @@ async function saveAccountSettings() {
     }
     if (accountSettingsDraft.outbound_secret.trim()) {
       update.outbound_secret = accountSettingsDraft.outbound_secret
+    }
+    if (['instagram', 'messenger'].includes(account.channel)) {
+      update.ai_reply_enabled = accountSettingsDraft.ai_reply_enabled
     }
     await channelsService.updateAccount(account.id, update)
     settingsAccount.value = null
@@ -513,6 +615,16 @@ watch([search, channelFilter], () => {
   }, 300)
 })
 
+watch(
+  connectableChannels,
+  channels => {
+    if (!channels.some(channel => channel.key === newAccount.channel) && channels[0]) {
+      newAccount.channel = channels[0].key
+    }
+  },
+  { immediate: true },
+)
+
 onBeforeUnmount(() => {
   stopChannelSync?.()
   if (pollTimer !== null) window.clearInterval(pollTimer)
@@ -556,10 +668,11 @@ onBeforeUnmount(() => {
     >
       <select
         v-model="newAccount.channel"
+        data-testid="channel-connect-type"
         class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
       >
         <option
-          v-for="channel in supportedChannels.filter((item) => item.connectable)"
+          v-for="channel in connectableChannels"
           :key="channel.key"
           :value="channel.key"
         >
@@ -569,7 +682,28 @@ onBeforeUnmount(() => {
       <Input v-model="newAccount.name" placeholder="Connection name" />
       <Input v-model="newAccount.external_account_id" placeholder="External account ID" />
       <Input v-model="newAccount.relay_url" type="url" placeholder="HTTPS signed-relay URL" />
-      <Button class="bg-sky-400 text-black hover:bg-sky-300" @click="connectAccount">Create</Button>
+      <Button
+        data-testid="channel-connect-submit"
+        class="bg-sky-400 text-black hover:bg-sky-300"
+        @click="connectAccount"
+      >
+        Create
+      </Button>
+      <div
+        v-if="newAccount.channel === 'threads'"
+        data-testid="threads-public-engagement-notice"
+        class="flex items-start gap-3 rounded-xl border border-amber-300/20 bg-amber-300/[0.06] px-4 py-3 md:col-span-2 xl:col-span-5"
+      >
+        <AtSign class="mt-0.5 h-4 w-4 shrink-0 text-amber-200 light:text-amber-700" />
+        <div>
+          <p class="text-xs font-semibold text-amber-50 light:text-amber-900">Beta: public engagement only</p>
+          <p class="mt-1 text-xs leading-5 text-amber-50/60 light:text-amber-800">
+            This connection is limited to existing public Threads replies and mentions. Direct
+            messages and standalone posts are not supported. It remains pending until an approved
+            compatible Threads relay adapter is installed and passes Test.
+          </p>
+        </div>
+      </div>
     </div>
 
     <div
@@ -791,14 +925,23 @@ onBeforeUnmount(() => {
         </p>
         <div class="mt-2 grid grid-cols-2 gap-2">
           <div
-            v-for="channel in supportedChannels"
+            v-for="channel in visibleChannels"
             :key="channel.key"
+            :data-testid="channel.key === 'threads' ? 'threads-public-engagement-adapter' : undefined"
             class="rounded-xl border border-white/[0.06] bg-white/[0.018] p-2.5 light:border-gray-200 light:bg-gray-50"
           >
             <component :is="channel.icon" class="h-4 w-4 text-white/45 light:text-gray-500" />
             <p class="mt-2 text-[10px] font-medium text-white/65 light:text-gray-700">{{ channel.label }}</p>
             <p class="mt-0.5 text-[9px] text-white/25 light:text-gray-400">
-              {{ channel.connectable ? 'Signed relay' : channel.gated ? 'Approval gated' : 'Use WhatsApp setup' }}
+              {{
+                channel.key === 'threads'
+                  ? 'Beta public replies + mentions; no DMs'
+                  : channel.connectable
+                    ? 'Signed relay'
+                    : channel.gated
+                      ? 'Approval gated'
+                      : 'Use WhatsApp setup'
+              }}
             </p>
           </div>
         </div>
@@ -900,17 +1043,35 @@ onBeforeUnmount(() => {
                 </p>
               </div>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              class="h-10 shrink-0 gap-2"
-              :aria-label="isWorkspaceOpen ? 'Close customer revenue workspace' : 'Open customer revenue workspace'"
-              :aria-pressed="isWorkspaceOpen"
-              @click="isWorkspaceOpen = !isWorkspaceOpen"
-            >
-              <PanelRightOpen class="h-4 w-4" />
-              <span class="hidden sm:inline">Customer workspace</span>
-            </Button>
+            <div class="flex shrink-0 items-center gap-2">
+              <Button
+                v-if="canControlConversationAI"
+                data-testid="conversation-ai-toggle"
+                type="button"
+                variant="outline"
+                size="sm"
+                :disabled="aiStateUpdating"
+                :aria-pressed="selectedConversation.ai_paused"
+                @click="toggleConversationAI"
+              >
+                <Loader2 v-if="aiStateUpdating" class="mr-2 h-3.5 w-3.5 animate-spin" />
+                <Play v-else-if="selectedConversation.ai_paused" class="mr-2 h-3.5 w-3.5" />
+                <PauseCircle v-else class="mr-2 h-3.5 w-3.5" />
+                {{ selectedConversation.ai_paused ? 'Resume AI' : 'Pause AI' }}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                class="h-10 shrink-0 gap-2"
+                :aria-label="isWorkspaceOpen ? 'Close customer revenue workspace' : 'Open customer revenue workspace'"
+                :aria-pressed="isWorkspaceOpen"
+                @click="isWorkspaceOpen = !isWorkspaceOpen"
+              >
+                <PanelRightOpen class="h-4 w-4" />
+                <span class="hidden sm:inline">Customer workspace</span>
+              </Button>
+            </div>
           </header>
 
           <div v-if="loadingMessages" class="flex flex-1 items-center justify-center">
@@ -958,18 +1119,31 @@ onBeforeUnmount(() => {
                 <Button size="sm" class="bg-emerald-300 text-black hover:bg-emerald-200">Open WhatsApp</Button>
               </RouterLink>
             </div>
-            <div v-else class="flex items-end gap-3">
+            <div v-else class="space-y-2">
+              <div
+                v-if="selectedConversation.channel === 'threads'"
+                data-testid="threads-public-reply-composer-notice"
+                class="rounded-xl border border-amber-300/15 bg-amber-300/[0.04] px-3 py-2 text-[11px] leading-5 text-amber-100/65 light:text-amber-800"
+              >
+                Beta public-only composer: the selected reply or mention is the required target.
+                Threads direct messages and standalone posts are not supported.
+              </div>
+              <div class="flex items-end gap-3">
               <textarea
                 v-model="composer"
                 rows="2"
                 class="min-h-11 flex-1 resize-none rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm text-white outline-none placeholder:text-white/20 focus:border-sky-300/35 light:border-gray-200 light:bg-gray-50 light:text-gray-900"
                 :disabled="!canSendText"
                 :placeholder="
-                  canSendText
-                    ? 'Write a reply…'
-                    : selectedAccount?.config?.outbound_enabled !== true
-                      ? 'Outbound delivery requires explicit approval'
-                      : 'This adapter does not support text replies'
+                  selectedConversation.channel === 'threads' && !hasThreadsPublicReplyTarget
+                    ? 'Select an existing public reply or mention'
+                    : canSendText
+                      ? selectedConversation.channel === 'threads'
+                        ? 'Write a public Threads reply...'
+                        : 'Write a reply...'
+                      : selectedAccount?.config?.outbound_enabled !== true
+                        ? 'Outbound delivery requires explicit approval'
+                        : 'This adapter does not support text replies'
                 "
                 @keydown.ctrl.enter.prevent="sendMessage"
               />
@@ -977,12 +1151,17 @@ onBeforeUnmount(() => {
                 size="icon"
                 class="h-11 w-11 shrink-0 bg-sky-300 text-black hover:bg-sky-200"
                 :disabled="sending || !composer.trim() || !canSendText"
-                aria-label="Send omnichannel reply"
+                :aria-label="
+                  selectedConversation.channel === 'threads'
+                    ? 'Send public Threads reply'
+                    : 'Send reply'
+                "
                 @click="sendMessage"
               >
                 <Loader2 v-if="sending" class="h-4 w-4 animate-spin" />
                 <Send v-else class="h-4 w-4" />
               </Button>
+              </div>
             </div>
           </footer>
         </template>
@@ -1066,6 +1245,32 @@ onBeforeUnmount(() => {
           <label v-if="settingsAccount.provider === 'relay'" class="block">
             <span class="text-xs font-medium text-white/60 light:text-gray-600">HTTPS relay URL</span>
             <Input v-model="accountSettingsDraft.relay_url" class="mt-1.5" required type="url" />
+          </label>
+          <label
+            v-if="['instagram', 'messenger'].includes(settingsAccount.channel)"
+            class="flex items-start gap-3 rounded-xl border border-sky-300/15 bg-sky-300/[0.035] p-3"
+          >
+            <input
+              v-model="accountSettingsDraft.ai_reply_enabled"
+              data-testid="channel-ai-reply-enabled"
+              type="checkbox"
+              class="mt-0.5 h-4 w-4 rounded border-white/20 accent-sky-300"
+              :disabled="
+                !accountSettingsDraft.ai_reply_enabled &&
+                (settingsAccount.status !== 'active' ||
+                  settingsAccount.config?.outbound_enabled !== true)
+              "
+            />
+            <span>
+              <span class="flex items-center gap-1.5 text-xs font-medium text-white/70 light:text-gray-700">
+                <Bot class="h-3.5 w-3.5 text-sky-300" />
+                Automatic Qwen replies
+              </span>
+              <span class="mt-1 block text-[10px] leading-4 text-white/35 light:text-gray-500">
+                Explicit opt-in. Requires an active tested connection, outbound approval, and an enabled Qwen profile.
+                Human replies pause AI for that conversation.
+              </span>
+            </span>
           </label>
           <label v-if="settingsAccount.provider === 'relay'" class="block">
             <span class="text-xs font-medium text-white/60 light:text-gray-600">Rotate outbound signing secret</span>
