@@ -334,3 +334,80 @@ func TestSetOrganizationSubscriptionAuditsSanitizedManualReference(t *testing.T)
 		}
 	}
 }
+
+func TestSetOrganizationSubscriptionRefreshesSnapshotWhenRelicensingSamePlan(t *testing.T) {
+	app := newTestApp(t)
+	controlOrg := testutil.CreateTestOrganization(t, app.DB)
+	owner := testutil.CreateTestUser(
+		t,
+		app.DB,
+		controlOrg.ID,
+		testutil.WithEmail(testutil.UniqueEmail("license-refresh-owner")),
+		testutil.WithSuperAdmin(),
+	)
+	reseller := testutil.CreateTestReseller(t, app.DB)
+	targetOrg := testutil.CreateTestOrganizationForReseller(t, app.DB, reseller.ID)
+	plan := createCatalogPlan(
+		t,
+		app,
+		&reseller.ID,
+		"refresh-growth",
+		"Refresh Growth",
+		models.CommercialPlanStatusActive,
+	)
+	price := createCatalogPrice(
+		t,
+		app,
+		plan.ID,
+		models.BillingProviderManual,
+		models.BillingIntervalMonth,
+		true,
+		nil,
+	)
+	entitlement := models.PlanEntitlement{
+		BaseModel:   models.BaseModel{ID: uuid.New()},
+		PlanID:      plan.ID,
+		Key:         "crm.enabled",
+		ValueType:   models.EntitlementValueTypeBoolean,
+		Value:       models.JSONB{"value": false},
+		Enforcement: models.EntitlementEnforcementHard,
+	}
+	require.NoError(t, app.DB.Create(&entitlement).Error)
+
+	assign := func(reference string) {
+		t.Helper()
+		request := testutil.NewJSONRequest(t, map[string]any{
+			"plan_id":          plan.ID,
+			"plan_price_id":    price.ID,
+			"status":           models.SubscriptionStatusActive,
+			"manual_reference": reference,
+		})
+		testutil.SetFullAuthContext(
+			request,
+			controlOrg.ID,
+			owner.ID,
+			owner.RoleID,
+			true,
+		)
+		testutil.SetPathParam(request, "organization_id", targetOrg.ID.String())
+		require.NoError(t, app.SetOrganizationSubscription(request))
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+	}
+
+	assign("contract-before-catalog-refresh")
+
+	var subscription models.Subscription
+	require.NoError(t, app.DB.Where("organization_id = ?", targetOrg.ID).
+		First(&subscription).Error)
+	assert.Equal(t, false, subscription.EntitlementsSnapshot["crm.enabled"])
+
+	require.NoError(t, app.DB.Model(&models.PlanEntitlement{}).
+		Where("id = ?", entitlement.ID).
+		Update("value", models.JSONB{"value": true}).Error)
+
+	assign("contract-after-catalog-refresh")
+
+	require.NoError(t, app.DB.Where("id = ?", subscription.ID).
+		First(&subscription).Error)
+	assert.Equal(t, true, subscription.EntitlementsSnapshot["crm.enabled"])
+}

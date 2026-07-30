@@ -4740,20 +4740,21 @@ func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 			current.PlanPriceID != nil &&
 			*current.PlanPriceID == price.ID {
 			updates := map[string]any{
-				"billing_account_id":   billingAccount.ID,
-				"provider":             models.BillingProviderManual,
-				"status":               req.Status,
-				"quantity":             1,
-				"collection_method":    "manual",
-				"provider_data":        providerData,
-				"current_period_start": now,
-				"current_period_end":   periodEnd,
-				"trial_ends_at":        trialEndsAt,
-				"grace_until":          nil,
-				"cancel_at_period_end": false,
-				"cancel_at":            nil,
-				"canceled_at":          nil,
-				"ended_at":             nil,
+				"billing_account_id":    billingAccount.ID,
+				"provider":              models.BillingProviderManual,
+				"status":                req.Status,
+				"quantity":              1,
+				"collection_method":     "manual",
+				"entitlements_snapshot": snapshot,
+				"provider_data":         providerData,
+				"current_period_start":  now,
+				"current_period_end":    periodEnd,
+				"trial_ends_at":         trialEndsAt,
+				"grace_until":           nil,
+				"cancel_at_period_end":  false,
+				"cancel_at":             nil,
+				"canceled_at":           nil,
+				"ended_at":              nil,
 			}
 			if err := tx.Model(&models.Subscription{}).
 				Where("id = ? AND organization_id = ?", current.ID, targetOrgID).
@@ -4764,6 +4765,7 @@ func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 			subscription.BillingAccountID = billingAccount.ID
 			subscription.Provider = models.BillingProviderManual
 			subscription.Status = req.Status
+			subscription.EntitlementsSnapshot = snapshot
 			subscription.ProviderData = providerData
 			subscription.CurrentPeriodStart = &now
 			subscription.CurrentPeriodEnd = &periodEnd
