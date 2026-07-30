@@ -119,7 +119,7 @@ func TestProductEntitlementResponsesUseEffectiveExpiredStatus(t *testing.T) {
 func TestProductSubscriptionReadersPreferLiveSubscriptionOverNewerHistory(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	organization := testutil.CreateTestOrganization(t, db)
-	user := testutil.CreateTestUser(t, db, organization.ID)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithSuperAdmin())
 	plan := models.Plan{
 		BaseModel: models.BaseModel{ID: uuid.New()},
 		ScopeKey:  "test-" + uuid.NewString(),
