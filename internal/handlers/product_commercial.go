@@ -844,6 +844,35 @@ func productCommercialSubscriptionPermitsFeatures(
 	}
 }
 
+var productCommercialLiveSubscriptionStatuses = []models.SubscriptionStatus{
+	models.SubscriptionStatusIncomplete,
+	models.SubscriptionStatusTrialing,
+	models.SubscriptionStatusActive,
+	models.SubscriptionStatusPastDue,
+	models.SubscriptionStatusPaused,
+}
+
+// productCommercialLoadCurrentSubscription prefers the single live lifecycle
+// row guaranteed by idx_subscriptions_org_live. If no live row exists, it falls
+// back to the newest historical row so cancellation and expiry stay visible.
+func productCommercialLoadCurrentSubscription(
+	db *gorm.DB,
+	organizationID uuid.UUID,
+	subscription *models.Subscription,
+) error {
+	err := db.Where(
+		"organization_id = ? AND status IN ?",
+		organizationID,
+		productCommercialLiveSubscriptionStatuses,
+	).Order("created_at DESC, id DESC").First(subscription).Error
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	return db.Where("organization_id = ?", organizationID).
+		Order("created_at DESC, id DESC").
+		First(subscription).Error
+}
+
 func productCommercialActiveOverride(
 	db *gorm.DB,
 	orgID uuid.UUID,
@@ -898,9 +927,7 @@ func (a *App) EvaluateProductEntitlement(
 	}
 	now := time.Now().UTC()
 	var subscription models.Subscription
-	err := a.DB.Where("organization_id = ?", orgID).
-		Order("created_at DESC").
-		First(&subscription).Error
+	err := productCommercialLoadCurrentSubscription(a.DB, orgID, &subscription)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		decision.Mode = "unlicensed"
 		decision.Reason = "No commercial subscription is assigned"
@@ -1123,9 +1150,7 @@ func (a *App) GetProductSubscription(r *fastglue.Request) error {
 	}
 
 	var subscription models.Subscription
-	err = a.DB.Where("organization_id = ?", orgID).
-		Order("created_at DESC").
-		First(&subscription).Error
+	err = productCommercialLoadCurrentSubscription(a.DB, orgID, &subscription)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return r.SendEnvelope(productCommercialSubscriptionToResponse(nil, nil))
 	}
@@ -1163,9 +1188,7 @@ func (a *App) GetProductEntitlements(r *fastglue.Request) error {
 	}
 
 	var subscription models.Subscription
-	err = a.DB.Where("organization_id = ?", orgID).
-		Order("created_at DESC").
-		First(&subscription).Error
+	err = productCommercialLoadCurrentSubscription(a.DB, orgID, &subscription)
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return a.sendProductCommercialError(r, "load product entitlements", err)
 	}
@@ -3201,9 +3224,7 @@ func (a *App) GetTenantSupportHealth(r *fastglue.Request) error {
 	}
 
 	var subscription models.Subscription
-	subscriptionErr := a.DB.Where("organization_id = ?", orgID).
-		Order("created_at DESC").
-		First(&subscription).Error
+	subscriptionErr := productCommercialLoadCurrentSubscription(a.DB, orgID, &subscription)
 	switch {
 	case errors.Is(subscriptionErr, gorm.ErrRecordNotFound):
 		checks = append(checks, TenantHealthCheckResponse{
@@ -4896,9 +4917,7 @@ func (a *App) GetOrganizationSubscription(r *fastglue.Request) error {
 	var response ProductSubscriptionResponse
 	err = database.WithTenant(a.DB, targetOrgID, func(tx *gorm.DB) error {
 		var subscription models.Subscription
-		err := tx.Where("organization_id = ?", targetOrgID).
-			Order("created_at DESC").
-			First(&subscription).Error
+		err := productCommercialLoadCurrentSubscription(tx, targetOrgID, &subscription)
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			response = productCommercialSubscriptionToResponse(nil, nil)
 			return nil
