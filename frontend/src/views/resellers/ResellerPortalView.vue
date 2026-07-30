@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   Building2,
   CreditCard,
@@ -52,6 +53,8 @@ import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 const authStore = useAuthStore()
+const route = useRoute()
+const router = useRouter()
 const isPlatformOwner = computed(() => authStore.user?.is_super_admin === true)
 
 const resellers = ref<Reseller[]>([])
@@ -132,6 +135,10 @@ const createForm = reactive({
 const organizationOpen = ref(false)
 const organizationSubmitting = ref(false)
 const organizationName = ref('')
+const organizationDeleteOpen = ref(false)
+const organizationDeleteSubmitting = ref(false)
+const organizationDeleteTarget = ref<Organization | null>(null)
+const organizationDeleteConfirmation = ref('')
 
 const memberOpen = ref(false)
 const memberSubmitting = ref(false)
@@ -153,6 +160,40 @@ const brandForm = reactive({
   plan: 'starter' as Reseller['plan'],
   max_organizations: 10,
 })
+
+const organizationDeleteBlockingReason = computed(() => {
+  const organization = organizationDeleteTarget.value ?? selectedOrganization.value
+  if (!organization) return 'Select a workspace first'
+  if (organization.id === authStore.organizationId) {
+    return 'Switch to a different organization before deleting this workspace'
+  }
+  if ((usage.value?.organization_count ?? 0) <= 1) {
+    return 'A partner portfolio must retain at least one organization'
+  }
+  const license = organizationLicenses.value[organization.id]
+  if (
+    license?.provider &&
+    license.provider !== 'manual' &&
+    !['canceled', 'expired', 'unlicensed'].includes(license.status)
+  ) {
+    return 'Cancel the provider-managed subscription before deleting this workspace'
+  }
+  return ''
+})
+
+const organizationDeleteConfirmed = computed(() =>
+  Boolean(
+    organizationDeleteTarget.value &&
+      organizationDeleteConfirmation.value.trim() ===
+        organizationDeleteTarget.value.name &&
+      !organizationDeleteBlockingReason.value,
+  ),
+)
+
+function requestedOrganizationId(): string {
+  const value = route.query.organization_id
+  return typeof value === 'string' ? value : ''
+}
 
 function hydrateBrandForm(reseller: Reseller | null) {
   if (!reseller) return
@@ -302,11 +343,38 @@ async function loadResellers(preferredId?: string) {
   try {
     const response = await resellersService.list()
     resellers.value = unwrapListResponse<Reseller>(response, 'resellers')
-    const targetId = preferredId && resellers.value.some((item) => item.id === preferredId)
-      ? preferredId
-      : selectedId.value && resellers.value.some((item) => item.id === selectedId.value)
-        ? selectedId.value
-        : resellers.value[0]?.id || ''
+    const requestedId = requestedOrganizationId()
+    let requestedResellerId = ''
+    if (requestedId) {
+      try {
+        const organizationsResponse = await organizationsService.list()
+        const organizations = unwrapListResponse<Organization>(
+          organizationsResponse,
+          'organizations',
+        )
+        const requestedOrganization = organizations.find(
+          (organization) => organization.id === requestedId,
+        )
+        requestedResellerId = requestedOrganization?.reseller_id || ''
+        if (requestedOrganization) {
+          selectedOrganizationId.value = requestedOrganization.id
+        }
+      } catch {
+        // Partner Console still loads its default portfolio if the deep-link
+        // target is no longer available to this administrator.
+      }
+    }
+    const targetId =
+      requestedResellerId &&
+      resellers.value.some((item) => item.id === requestedResellerId)
+        ? requestedResellerId
+        : preferredId &&
+            resellers.value.some((item) => item.id === preferredId)
+          ? preferredId
+          : selectedId.value &&
+              resellers.value.some((item) => item.id === selectedId.value)
+            ? selectedId.value
+            : resellers.value[0]?.id || ''
     selectedId.value = targetId
   } catch (error) {
     toast.error(getErrorMessage(error, 'Unable to load partner portfolios'))
@@ -348,6 +416,22 @@ watch(selectedOrganizationId, () => {
   hydrateLicenseForm()
   void loadPlanCatalog()
 })
+watch(
+  () => route.query.organization_id,
+  async () => {
+    const requestedId = requestedOrganizationId()
+    if (!requestedId) return
+    if (
+      usage.value?.organizations.some(
+        (organization) => organization.id === requestedId,
+      )
+    ) {
+      selectedOrganizationId.value = requestedId
+      return
+    }
+    await loadResellers()
+  },
+)
 watch(planPriceOptions, hydrateLicenseForm)
 onMounted(loadResellers)
 
@@ -402,6 +486,41 @@ async function createOrganization() {
     toast.error(getErrorMessage(error, 'Unable to create customer workspace'))
   } finally {
     organizationSubmitting.value = false
+  }
+}
+
+function openOrganizationDeleteDialog() {
+  if (!selectedOrganization.value) return
+  organizationDeleteTarget.value = selectedOrganization.value
+  organizationDeleteConfirmation.value = ''
+  organizationDeleteOpen.value = true
+}
+
+async function deleteOrganization() {
+  const target = organizationDeleteTarget.value
+  if (!target || !organizationDeleteConfirmed.value) return
+
+  organizationDeleteSubmitting.value = true
+  try {
+    const resellerId = selectedId.value
+    await organizationsService.delete(target.id)
+    organizationDeleteOpen.value = false
+    organizationDeleteTarget.value = null
+    organizationDeleteConfirmation.value = ''
+    selectedOrganizationId.value = ''
+    await loadSelected()
+    await loadResellers(resellerId)
+    await router.replace({
+      path: '/resellers',
+      query: selectedOrganizationId.value
+        ? { organization_id: selectedOrganizationId.value }
+        : undefined,
+    })
+    toast.success(`${target.name} deleted. Its data is retained for recovery.`)
+  } catch (error) {
+    toast.error(getErrorMessage(error, 'Unable to delete workspace'))
+  } finally {
+    organizationDeleteSubmitting.value = false
   }
 }
 
@@ -1137,6 +1256,39 @@ function formatNumber(value?: number) {
                             </Button>
                           </form>
                         </div>
+                        <div
+                          class="border-t border-red-400/15 pt-4"
+                          data-testid="workspace-danger-zone"
+                        >
+                          <p
+                            class="text-sm font-medium text-red-200 light:text-red-700"
+                          >
+                            Delete workspace
+                          </p>
+                          <p
+                            class="mt-1 text-xs leading-5 text-white/40 light:text-gray-600"
+                          >
+                            Removes this organization from active access. Its
+                            tenant records are retained for recovery.
+                          </p>
+                          <Button
+                            class="mt-3 w-full"
+                            variant="destructive"
+                            size="sm"
+                            data-testid="workspace-delete-open"
+                            :disabled="Boolean(organizationDeleteBlockingReason)"
+                            @click="openOrganizationDeleteDialog"
+                          >
+                            <Trash2 class="mr-2 h-4 w-4" />
+                            Delete organization
+                          </Button>
+                          <p
+                            v-if="organizationDeleteBlockingReason"
+                            class="mt-2 text-[11px] leading-5 text-amber-200/75 light:text-amber-700"
+                          >
+                            {{ organizationDeleteBlockingReason }}
+                          </p>
+                        </div>
                       </template>
                       <p
                         v-else
@@ -1282,6 +1434,70 @@ function formatNumber(value?: number) {
         <DialogHeader><DialogTitle>Provision customer workspace</DialogTitle><DialogDescription>The new business receives its own CRM tenant, roles, settings and RLS boundary.</DialogDescription></DialogHeader>
         <div class="space-y-2 py-3"><Label for="organization-name">Business name</Label><Input id="organization-name" v-model="organizationName" placeholder="Serenity Wellness Clinic" @keyup.enter="createOrganization" /></div>
         <DialogFooter><Button variant="outline" @click="organizationOpen = false">Cancel</Button><Button :loading="organizationSubmitting" @click="createOrganization">Provision workspace</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog v-model:open="organizationDeleteOpen">
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>
+            Delete {{ organizationDeleteTarget?.name || 'organization' }}?
+          </DialogTitle>
+          <DialogDescription>
+            Access is removed immediately and any manual license is canceled.
+            Tenant records are retained so the workspace can be recovered.
+          </DialogDescription>
+        </DialogHeader>
+        <div class="space-y-4 py-3">
+          <div
+            class="rounded-lg border border-red-400/20 bg-red-400/[0.06] p-3 text-xs leading-5 text-red-100/70 light:text-red-700"
+          >
+            Users will no longer be able to switch into this organization.
+            Provider-managed subscriptions must be canceled before deletion.
+          </div>
+          <div class="space-y-2">
+            <Label for="workspace-delete-confirmation">
+              Type
+              <strong>{{ organizationDeleteTarget?.name }}</strong>
+              to confirm
+            </Label>
+            <Input
+              id="workspace-delete-confirmation"
+              v-model="organizationDeleteConfirmation"
+              data-testid="workspace-delete-confirmation"
+              autocomplete="off"
+              @keyup.enter="
+                organizationDeleteConfirmed && deleteOrganization()
+              "
+            />
+          </div>
+          <p
+            v-if="organizationDeleteBlockingReason"
+            class="text-xs leading-5 text-amber-200/75 light:text-amber-700"
+          >
+            {{ organizationDeleteBlockingReason }}
+          </p>
+        </div>
+        <DialogFooter>
+          <Button
+            variant="outline"
+            :disabled="organizationDeleteSubmitting"
+            @click="organizationDeleteOpen = false"
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="destructive"
+            data-testid="workspace-delete-submit"
+            :loading="organizationDeleteSubmitting"
+            :disabled="
+              organizationDeleteSubmitting || !organizationDeleteConfirmed
+            "
+            @click="deleteOrganization"
+          >
+            Delete organization
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
 

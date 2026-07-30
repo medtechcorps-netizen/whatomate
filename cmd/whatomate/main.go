@@ -1137,6 +1137,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// Organizations
 	g.GET("/api/organizations", tenant((*handlers.App).ListOrganizations))
 	g.POST("/api/organizations", app.CreateOrganization)
+	g.DELETE("/api/organizations/{id}", app.DeleteOrganization)
 	g.POST("/api/organizations/invitations", tenant((*handlers.App).CreateOrganizationInvitation))
 	g.GET("/api/organizations/current", tenant((*handlers.App).GetCurrentOrganization))
 	g.GET("/api/organizations/members", tenant((*handlers.App).ListOrganizationMembers))

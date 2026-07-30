@@ -2,16 +2,20 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
 	"github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // generalSettingsSnapshot extracts the fields shown on the General tab into a
@@ -346,6 +350,15 @@ type OrganizationResponse struct {
 	CreatedAt    string     `json:"created_at"`
 }
 
+type organizationDeleteClientError struct {
+	status  int
+	message string
+}
+
+func (e *organizationDeleteClientError) Error() string {
+	return e.message
+}
+
 // ListOrganizations returns the platform portfolio to super administrators,
 // reseller-owned organizations to reseller administrators, and direct
 // memberships to ordinary users.
@@ -481,6 +494,188 @@ func (a *App) CreateOrganization(r *fastglue.Request) error {
 		Name:         org.Name,
 		Slug:         org.Slug,
 		CreatedAt:    org.CreatedAt.Format(time.RFC3339),
+	})
+}
+
+// DeleteOrganization archives a customer workspace without purging its tenant
+// data. Historical records remain recoverable, while the soft-deleted
+// organization immediately fails middleware and portfolio lookups.
+func (a *App) DeleteOrganization(r *fastglue.Request) error {
+	auditOrgID, userID, err := a.getOrgAndUserID(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	if !a.IsSuperAdmin(userID) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusForbidden,
+			"Only a platform owner can delete an organization",
+			nil,
+			"",
+		)
+	}
+
+	targetOrgID, err := parsePathUUID(r, "id", "organization")
+	if err != nil {
+		return nil
+	}
+	if targetOrgID == auditOrgID {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusConflict,
+			"Switch to a different organization before deleting this workspace",
+			nil,
+			"",
+		)
+	}
+
+	var deletedOrganization models.Organization
+	err = database.WithTenant(a.DB, targetOrgID, func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", targetOrgID).
+			First(&deletedOrganization).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return &organizationDeleteClientError{
+					status:  fasthttp.StatusNotFound,
+					message: "Organization not found",
+				}
+			}
+			return err
+		}
+		if deletedOrganization.ResellerID == nil ||
+			*deletedOrganization.ResellerID == uuid.Nil {
+			return &organizationDeleteClientError{
+				status:  fasthttp.StatusConflict,
+				message: "Organization is not assigned to a partner portfolio",
+			}
+		}
+
+		var activeOrganizationCount int64
+		if err := tx.Model(&models.Organization{}).
+			Where("reseller_id = ?", *deletedOrganization.ResellerID).
+			Count(&activeOrganizationCount).Error; err != nil {
+			return err
+		}
+		if activeOrganizationCount <= 1 {
+			return &organizationDeleteClientError{
+				status:  fasthttp.StatusConflict,
+				message: "A partner portfolio must retain at least one organization",
+			}
+		}
+
+		liveStatuses := []models.SubscriptionStatus{
+			models.SubscriptionStatusIncomplete,
+			models.SubscriptionStatusTrialing,
+			models.SubscriptionStatusActive,
+			models.SubscriptionStatusPastDue,
+			models.SubscriptionStatusPaused,
+		}
+		var providerManagedCount int64
+		if err := tx.Model(&models.Subscription{}).
+			Where(
+				"organization_id = ? AND provider <> ? AND status IN ?",
+				targetOrgID,
+				models.BillingProviderManual,
+				liveStatuses,
+			).
+			Count(&providerManagedCount).Error; err != nil {
+			return err
+		}
+		if providerManagedCount > 0 {
+			return &organizationDeleteClientError{
+				status:  fasthttp.StatusConflict,
+				message: "Cancel the provider-managed subscription before deleting this organization",
+			}
+		}
+
+		now := time.Now().UTC()
+		if err := tx.Model(&models.Subscription{}).
+			Where(
+				"organization_id = ? AND provider = ? AND status IN ?",
+				targetOrgID,
+				models.BillingProviderManual,
+				liveStatuses,
+			).
+			Updates(map[string]any{
+				"status":               models.SubscriptionStatusCanceled,
+				"cancel_at_period_end": false,
+				"canceled_at":          now,
+				"ended_at":             now,
+			}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.BillingAccount{}).
+			Where(
+				"organization_id = ? AND provider = ? AND status <> ?",
+				targetOrgID,
+				models.BillingProviderManual,
+				models.BillingAccountStatusClosed,
+			).
+			Updates(map[string]any{
+				"status":    models.BillingAccountStatusClosed,
+				"closed_at": now,
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := audit.LogAudit(
+			tx,
+			targetOrgID,
+			userID,
+			audit.GetUserName(tx, userID),
+			models.ResourceOrganizations,
+			targetOrgID,
+			models.AuditActionDeleted,
+			map[string]any{
+				"name":        deletedOrganization.Name,
+				"slug":        deletedOrganization.Slug,
+				"reseller_id": deletedOrganization.ResellerID,
+			},
+			nil,
+		); err != nil {
+			return err
+		}
+		return tx.Delete(&deletedOrganization).Error
+	})
+	if err != nil {
+		var clientError *organizationDeleteClientError
+		if errors.As(err, &clientError) {
+			return r.SendErrorEnvelope(
+				clientError.status,
+				clientError.message,
+				nil,
+				"",
+			)
+		}
+		a.Log.Error(
+			"Failed to delete organization",
+			"error",
+			err,
+			"organization_id",
+			targetOrgID,
+			"user_id",
+			userID,
+		)
+		return r.SendErrorEnvelope(
+			fasthttp.StatusInternalServerError,
+			"Failed to delete organization",
+			nil,
+			"",
+		)
+	}
+
+	a.InvalidateOrgPermissionsCache(targetOrgID)
+	a.Log.Info(
+		"Deleted organization",
+		"organization_id",
+		targetOrgID,
+		"organization_name",
+		deletedOrganization.Name,
+		"deleted_by",
+		userID,
+	)
+	return r.SendEnvelope(map[string]any{
+		"message":         "Organization deleted successfully",
+		"organization_id": targetOrgID,
+		"recoverable":     true,
 	})
 }
 
