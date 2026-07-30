@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
+import { useOrganizationsStore } from '@/stores/organizations'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
@@ -26,6 +27,7 @@ useI18n() // Enable $t() in template
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
+const organizationsStore = useOrganizationsStore()
 const isCollapsed = ref(false)
 const isMobileMenuOpen = ref(false)
 
@@ -105,10 +107,15 @@ const bottomSections = computed(() => navSections.value.filter(s => s.pinBottom)
 const canManageWorkspaceLicense = computed(() =>
   authStore.hasPermission('resellers', 'read')
 )
+const activeOrganizationId = computed(() =>
+  authStore.user?.is_super_admin
+    ? organizationsStore.selectedOrgId || authStore.organizationId
+    : authStore.organizationId
+)
 const workspaceUpgradeRoute = computed(() => ({
   path: '/resellers',
-  query: authStore.organizationId
-    ? { organization_id: authStore.organizationId }
+  query: activeOrganizationId.value
+    ? { organization_id: activeOrganizationId.value }
     : undefined
 }))
 
