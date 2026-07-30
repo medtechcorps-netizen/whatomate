@@ -9,7 +9,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Menu,
-  X
+  X,
+  Zap
 } from 'lucide-vue-next'
 import { wsService } from '@/services/websocket'
 import { authService } from '@/services/api'
@@ -101,6 +102,15 @@ const navSections = computed(() => {
 
 const mainSections = computed(() => navSections.value.filter(s => !s.pinBottom))
 const bottomSections = computed(() => navSections.value.filter(s => s.pinBottom))
+const canManageWorkspaceLicense = computed(() =>
+  authStore.hasPermission('resellers', 'read')
+)
+const workspaceUpgradeRoute = computed(() => ({
+  path: '/resellers',
+  query: authStore.organizationId
+    ? { organization_id: authStore.organizationId }
+    : undefined
+}))
 
 const toggleSidebar = () => {
   isCollapsed.value = !isCollapsed.value
@@ -238,6 +248,25 @@ const handleLogout = async () => {
           </template>
         </nav>
       </ScrollArea>
+
+      <!-- Licensing shortcut follows the same authorization as Partner Console. -->
+      <div
+        v-if="canManageWorkspaceLicense"
+        class="border-t border-white/[0.06] px-2 py-2 light:border-gray-200"
+      >
+        <RouterLink
+          :to="workspaceUpgradeRoute"
+          title="Upgrade the selected workspace"
+          :class="[
+            'btn-press flex items-center gap-2.5 rounded-lg border border-amber-300/25 bg-amber-300/[0.09] px-2.5 py-2 text-[13px] font-semibold text-amber-200 transition-all duration-200 hover:bg-amber-300/[0.14] light:text-amber-800',
+            isCollapsed && 'md:justify-center md:px-2'
+          ]"
+          @click="isMobileMenuOpen = false"
+        >
+          <Zap class="h-4 w-4 shrink-0" aria-hidden="true" />
+          <span :class="isCollapsed && 'md:sr-only'">Upgrade workspace</span>
+        </RouterLink>
+      </div>
 
       <!-- Bottom-pinned navigation (Settings) -->
       <div v-if="bottomSections.length > 0" class="border-t border-white/[0.06] light:border-gray-200 px-2 py-2">

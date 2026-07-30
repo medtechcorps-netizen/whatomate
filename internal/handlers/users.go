@@ -884,6 +884,11 @@ func (a *App) ListMyOrganizations(r *fastglue.Request) error {
 
 	response := make([]MyOrganizationResponse, 0, len(userOrgs))
 	for _, uo := range userOrgs {
+		// Soft-deleted workspaces keep their historical memberships for
+		// recovery, but must no longer appear in the organization switcher.
+		if uo.Organization == nil {
+			continue
+		}
 		if !access.ResellerDerivedMembershipActive(a.DB, &uo) {
 			continue
 		}
