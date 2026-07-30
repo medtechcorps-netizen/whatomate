@@ -77,6 +77,68 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
+      - name: Ensure production runtime RLS scope
+        run: |
+          set -euo pipefail
+          app_id="54bc0d92-73e9-4f8b-86cd-c3fd96e06beb"
+          repository="https://github.com/medtechcorps-netizen/whatomate.git"
+          rls_key="WHATOMATE_DATABASE__RLS_ENABLED"
+          app_spec="$(
+            doctl apps spec get \
+              "${app_id}" \
+              --format json
+          )"
+
+          if jq -e --arg repository "${repository}" --arg rls_key "${rls_key}" '
+            [.services[]?, .workers[]?]
+            | map(select(.git.repo_clone_url == $repository)) as $runtime
+            | ($runtime | length) > 0
+              and all(
+                $runtime[];
+                any(.envs[]?; .key == $rls_key and .value == "true")
+              )
+          ' <<<"${app_spec}" >/dev/null; then
+            echo "Production runtime RLS scope is already enabled."
+            exit 0
+          fi
+
+          jq --arg repository "${repository}" --arg rls_key "${rls_key}" '
+            def enable_rls:
+              .envs = (
+                ((.envs // []) | map(select(.key != $rls_key)))
+                + [{
+                    key: $rls_key,
+                    value: "true",
+                    scope: "RUN_TIME",
+                    type: "GENERAL"
+                  }]
+              );
+            .services = (
+              (.services // [])
+              | map(if .git.repo_clone_url == $repository then enable_rls else . end)
+            )
+            | .workers = (
+                (.workers // [])
+                | map(if .git.repo_clone_url == $repository then enable_rls else . end)
+              )
+          ' <<<"${app_spec}" > production-app-spec.json
+
+          jq -e --arg repository "${repository}" --arg rls_key "${rls_key}" '
+            [.services[]?, .workers[]?]
+            | map(select(.git.repo_clone_url == $repository)) as $runtime
+            | ($runtime | length) > 0
+              and all(
+                $runtime[];
+                any(.envs[]?; .key == $rls_key and .value == "true")
+              )
+          ' production-app-spec.json >/dev/null
+
+          doctl apps update \
+            "${app_id}" \
+            --spec production-app-spec.json \
+            --update-sources \
+            --wait
+
       - name: Verify production RLS migration gate
         run: |
           set -euo pipefail
@@ -96,6 +158,19 @@ jobs:
               and (.run_command | contains("rereply rls-migrate"))
               and any(.envs[]?; .key == "WHATOMATE_DATABASE__MIGRATION_URL")
               and any(.envs[]?; .key == "WHATOMATE_DATABASE__RUNTIME_ROLE")
+            )
+            and (
+              [.services[]?, .workers[]?]
+              | map(select(.git.repo_clone_url == "https://github.com/medtechcorps-netizen/whatomate.git")) as $runtime
+              | ($runtime | length) > 0
+                and all(
+                  $runtime[];
+                  any(
+                    .envs[]?;
+                    .key == "WHATOMATE_DATABASE__RLS_ENABLED"
+                    and .value == "true"
+                  )
+                )
             )
           ' <<<"${app_spec}" >/dev/null
 

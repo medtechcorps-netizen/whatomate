@@ -116,6 +116,106 @@ func TestProductEntitlementResponsesUseEffectiveExpiredStatus(t *testing.T) {
 	assert.Equal(t, models.SubscriptionStatusActive, stored.Status)
 }
 
+func TestProductSubscriptionReadersPreferLiveSubscriptionOverNewerHistory(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithSuperAdmin())
+	plan := models.Plan{
+		BaseModel: models.BaseModel{ID: uuid.New()},
+		ScopeKey:  "test-" + uuid.NewString(),
+		Code:      "live-growth",
+		Name:      "Live Growth",
+		Status:    models.CommercialPlanStatusActive,
+		Vertical:  "general",
+		IsPublic:  false,
+		Metadata:  models.JSONB{},
+	}
+	require.NoError(t, db.Create(&plan).Error)
+	account := models.BillingAccount{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  organization.ID,
+		Provider:        models.BillingProviderManual,
+		Status:          models.BillingAccountStatusActive,
+		DefaultCurrency: "MYR",
+		BillingProfile:  models.JSONB{},
+		ProviderData:    models.JSONB{},
+		Metadata:        models.JSONB{},
+	}
+	require.NoError(t, db.Create(&account).Error)
+
+	now := time.Now().UTC()
+	periodStart := now.Add(-time.Hour)
+	periodEnd := now.AddDate(0, 1, 0)
+	live := models.Subscription{
+		BaseModel: models.BaseModel{
+			ID:        uuid.New(),
+			CreatedAt: now.Add(-24 * time.Hour),
+		},
+		OrganizationID:       organization.ID,
+		BillingAccountID:     account.ID,
+		PlanID:               plan.ID,
+		Provider:             models.BillingProviderManual,
+		Status:               models.SubscriptionStatusActive,
+		Quantity:             1,
+		CollectionMethod:     "manual",
+		EntitlementsSnapshot: models.JSONB{"crm.enabled": true},
+		ProviderData:         models.JSONB{},
+		CurrentPeriodStart:   &periodStart,
+		CurrentPeriodEnd:     &periodEnd,
+		CreatedByID:          &user.ID,
+	}
+	require.NoError(t, db.Create(&live).Error)
+	canceledAt := now.Add(-time.Minute)
+	history := models.Subscription{
+		BaseModel: models.BaseModel{
+			ID:        uuid.New(),
+			CreatedAt: now,
+		},
+		OrganizationID:       organization.ID,
+		BillingAccountID:     account.ID,
+		PlanID:               plan.ID,
+		Provider:             models.BillingProviderManual,
+		Status:               models.SubscriptionStatusCanceled,
+		Quantity:             1,
+		CollectionMethod:     "manual",
+		EntitlementsSnapshot: models.JSONB{"crm.enabled": false},
+		ProviderData:         models.JSONB{},
+		CanceledAt:           &canceledAt,
+		EndedAt:              &canceledAt,
+		CreatedByID:          &user.ID,
+	}
+	require.NoError(t, db.Create(&history).Error)
+
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	subscriptionRequest := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(subscriptionRequest, organization.ID, user.ID)
+	require.NoError(t, app.GetProductSubscription(subscriptionRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(subscriptionRequest))
+	var subscriptionResponse ProductSubscriptionResponse
+	testutil.ParseEnvelopeResponse(t, subscriptionRequest, &subscriptionResponse)
+	require.NotNil(t, subscriptionResponse.ID)
+	assert.Equal(t, live.ID, *subscriptionResponse.ID)
+	assert.Equal(t, string(models.SubscriptionStatusActive), subscriptionResponse.Status)
+	assert.Equal(t, plan.Code, subscriptionResponse.PlanCode)
+
+	entitlementsRequest := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(entitlementsRequest, organization.ID, user.ID)
+	require.NoError(t, app.GetProductEntitlements(entitlementsRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(entitlementsRequest))
+	var entitlementsResponse ProductEntitlementsResponse
+	testutil.ParseEnvelopeResponse(t, entitlementsRequest, &entitlementsResponse)
+	assert.Equal(t, "subscription", entitlementsResponse.Mode)
+	assert.Equal(t, models.SubscriptionStatusActive, entitlementsResponse.SubscriptionStatus)
+	assert.Equal(t, plan.Code, entitlementsResponse.PlanCode)
+	assert.Equal(t, true, entitlementsResponse.Entitlements["crm.enabled"])
+
+	decision, err := app.EvaluateProductEntitlement(user.ID, organization.ID, "crm.enabled")
+	require.NoError(t, err)
+	require.NotNil(t, decision.SubscriptionID)
+	assert.Equal(t, live.ID, *decision.SubscriptionID)
+	assert.True(t, decision.Allowed)
+}
+
 func TestProductCommercialFindSubscriptionPlanRejectsFuturePrice(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	organization := testutil.CreateTestOrganization(t, db)
