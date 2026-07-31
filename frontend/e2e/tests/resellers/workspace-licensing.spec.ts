@@ -9,6 +9,14 @@ const organization = {
   created_at: '2026-07-20T08:00:00Z',
 }
 
+const deletableOrganization = {
+  ...organization,
+  id: '77777777-7777-4777-8777-777777777777',
+  name: 'Klinik Archive',
+  slug: 'klinik-archive',
+  created_at: '2026-07-21T08:00:00Z',
+}
+
 const reseller = {
   id: organization.reseller_id,
   name: 'Omnitech Partner',
@@ -61,6 +69,54 @@ const growthPlan = {
   ],
 }
 
+const starterPlan = {
+  ...growthPlan,
+  id: '99999999-9999-4999-8999-999999999991',
+  code: 'omnitech-starter',
+  name: 'Omnitech Starter',
+  description: 'Core messaging with a shared omnichannel inbox',
+  entitlements: {
+    'omnichannel.enabled': true,
+    'crm.enabled': false,
+    'bookings.enabled': false,
+    'commerce.enabled': false,
+    'copilot.enabled': false,
+    'threads.public_engagement.enabled': false,
+  },
+  prices: [
+    {
+      ...growthPlan.prices[1],
+      id: '99999999-9999-4999-8999-999999999992',
+      code: 'omnitech-starter-myr-month',
+      unit_amount_minor: 9900,
+    },
+  ],
+}
+
+const enterprisePlan = {
+  ...growthPlan,
+  id: '99999999-9999-4999-8999-999999999993',
+  code: 'omnitech-enterprise',
+  name: 'Omnitech Enterprise',
+  description: 'Complete customer operations and AI workspace',
+  entitlements: {
+    'omnichannel.enabled': true,
+    'crm.enabled': true,
+    'bookings.enabled': true,
+    'commerce.enabled': true,
+    'copilot.enabled': true,
+    'threads.public_engagement.enabled': true,
+  },
+  prices: [
+    {
+      ...growthPlan.prices[1],
+      id: '99999999-9999-4999-8999-999999999994',
+      code: 'omnitech-enterprise-myr-month',
+      unit_amount_minor: 69900,
+    },
+  ],
+}
+
 const platformOwner = {
   id: '55555555-5555-4555-8555-555555555555',
   email: 'owner@example.test',
@@ -80,7 +136,11 @@ const resellerAdmin = {
   is_reseller_admin: true,
 }
 
-async function installWorkspaceSession(page: Page, user = platformOwner) {
+async function installWorkspaceSession(
+  page: Page,
+  user = platformOwner,
+  portfolioOrganizations: (typeof organization)[] = [organization],
+) {
   await page.addInitScript((user) => {
     window.localStorage.setItem('user', JSON.stringify(user))
   }, user)
@@ -93,20 +153,22 @@ async function installWorkspaceSession(page: Page, user = platformOwner) {
       json: {
         data: {
           organizations: [
-            {
-              organization_id: organization.id,
-              name: organization.name,
-              slug: organization.slug,
+            ...portfolioOrganizations.map((item, index) => ({
+              organization_id: item.id,
+              name: item.name,
+              slug: item.slug,
               role_name: 'Platform Owner',
-              is_default: true,
-            },
+              is_default: index === 0,
+            })),
           ],
         },
       },
     }),
   )
   await page.route(/\/api\/organizations(?:\?.*)?$/, (route) =>
-    route.fulfill({ json: { data: { organizations: [organization] } } }),
+    route.fulfill({
+      json: { data: { organizations: portfolioOrganizations } },
+    }),
   )
   await page.route(/\/api\/product\/entitlements(?:\?.*)?$/, (route) =>
     route.fulfill({
@@ -131,23 +193,29 @@ async function mockPartnerPortfolio(
   plans: (typeof growthPlan)[] = [growthPlan],
   user = platformOwner,
   initialPlanPriceId = growthPlan.prices[1].id,
+  initialProvider = 'manual',
+  initialStatus = 'active',
+  portfolioOrganizations: (typeof organization)[] = [organization],
 ) {
-  await installWorkspaceSession(page, user)
+  const currentOrganizations = [...portfolioOrganizations]
+  await installWorkspaceSession(page, user, currentOrganizations)
 
+  let deletedOrganizationId = ''
   let license = {
     id: '44444444-4444-4444-8444-444444444444',
     plan_id: growthPlan.id,
     plan_price_id: initialPlanPriceId,
     plan_code: growthPlan.code,
     plan_name: growthPlan.name,
-    status: 'active',
-    provider: 'manual',
+    status: initialStatus,
+    provider: initialProvider,
     current_period_start: '2026-07-20T08:00:00Z',
     current_period_end: '2026-08-20T08:00:00Z',
     cancel_at_period_end: false,
   }
   let assignment: Record<string, unknown> | null = null
   let catalogRequests = 0
+  let delayNextSubscription = false
 
   await page.route(/\/api\/resellers(?:\?.*)?$/, (route) =>
     route.fulfill({ json: { data: { resellers: [reseller] } } }),
@@ -161,8 +229,8 @@ async function mockPartnerPortfolio(
             reseller_id: reseller.id,
             plan: reseller.plan,
             max_organizations: reseller.max_organizations,
-            organizations: [organization],
-            organization_count: 1,
+            organizations: currentOrganizations,
+            organization_count: currentOrganizations.length,
             user_count: 4,
             whatsapp_accounts: 1,
             contacts: 12,
@@ -186,30 +254,63 @@ async function mockPartnerPortfolio(
   )
   await page.route(
     new RegExp(
-      `/api/admin/organizations/${organization.id}/subscription(?:\\?.*)?$`,
+      `/api/admin/organizations/[^/]+/subscription(?:\\?.*)?$`,
     ),
     async (route) => {
       if (route.request().method() === 'PUT') {
         assignment = route.request().postDataJSON() as Record<string, unknown>
+        const assignedPlan =
+          plans.find((plan) => plan.id === assignment?.plan_id) ?? growthPlan
         license = {
           ...license,
           plan_id: String(assignment.plan_id),
           plan_price_id: String(assignment.plan_price_id),
-          plan_name: growthPlan.name,
+          plan_code: assignedPlan.code,
+          plan_name: assignedPlan.name,
           status: String(assignment.status),
           current_period_end: '2026-08-18T08:00:00Z',
           ...(assignment.status === 'trialing'
             ? { trial_ends_at: '2026-08-18T08:00:00Z' }
             : {}),
         }
+      } else if (delayNextSubscription) {
+        delayNextSubscription = false
+        await new Promise((resolve) => setTimeout(resolve, 800))
       }
       await route.fulfill({ json: { data: license } })
     },
   )
+  await page.route(/\/api\/organizations\/[^/?]+(?:\?.*)?$/, async (route) => {
+    if (route.request().method() !== 'DELETE') {
+      await route.fallback()
+      return
+    }
+    deletedOrganizationId = new URL(route.request().url()).pathname
+      .split('/')
+      .pop()!
+    const deletedIndex = currentOrganizations.findIndex(
+      (item) => item.id === deletedOrganizationId,
+    )
+    if (deletedIndex >= 0) currentOrganizations.splice(deletedIndex, 1)
+    await route.fulfill({
+      json: {
+        data: {
+          message: 'Organization deleted',
+          organization_id: deletedOrganizationId,
+          recoverable: true,
+        },
+      },
+    })
+  })
 
   return {
     assignment: () => assignment,
     catalogRequests: () => catalogRequests,
+    deletedOrganizationId: () => deletedOrganizationId,
+    organizations: () => currentOrganizations,
+    delayNextSubscription: () => {
+      delayNextSubscription = true
+    },
   }
 }
 
@@ -282,6 +383,9 @@ test.describe('Partner Console workspace licensing', () => {
       'License changes are reserved for the platform owner',
     )
     await expect(page.getByTestId('workspace-license-submit')).toHaveCount(0)
+    await expect(
+      page.getByRole('link', { name: 'Upgrade workspace' }),
+    ).toHaveCount(0)
     expect(state.catalogRequests()).toBe(0)
   })
 
@@ -304,5 +408,177 @@ test.describe('Partner Console workspace licensing', () => {
       .getByTestId('workspace-license-reference')
       .fill('REALIGN-2026-UNRESOLVED')
     await expect(page.getByTestId('workspace-license-submit')).toBeDisabled()
+  })
+
+  test('updates portfolio capacity when the partner tier changes', async ({
+    page,
+  }) => {
+    await mockPartnerPortfolio(page)
+    await page.goto('/resellers')
+
+    await page
+      .getByRole('tab', { name: 'Brand & portfolio capacity' })
+      .click()
+    await page.locator('#partner-plan').selectOption('enterprise')
+    await expect(page.locator('#org-limit')).toHaveValue('1000')
+    await expect(page.getByText(/does not change feature access/)).toBeVisible()
+  })
+
+  test('keeps organization deletion visible and stable while licensing refreshes', async ({
+    page,
+  }) => {
+    const state = await mockPartnerPortfolio(page)
+    await page.goto('/resellers')
+
+    await expect(page.getByTestId('workspace-danger-zone')).toBeVisible()
+    state.delayNextSubscription()
+    await page
+      .getByRole('button', { name: 'Refresh selected workspace license' })
+      .click()
+
+    await expect(page.getByTestId('workspace-danger-zone')).toBeVisible()
+    await page.getByTestId('workspace-delete-row').click()
+    await expect(
+      page.getByRole('dialog', { name: `Delete ${organization.name}?` }),
+    ).toBeVisible()
+    await page.waitForTimeout(900)
+    await expect(
+      page.getByRole('dialog', { name: `Delete ${organization.name}?` }),
+    ).toBeVisible()
+    await expect(page.getByTestId('workspace-delete-submit')).toBeDisabled()
+  })
+
+  test('deletes the exact confirmed non-active organization and refreshes the list', async ({
+    page,
+  }) => {
+    const state = await mockPartnerPortfolio(
+      page,
+      [growthPlan],
+      platformOwner,
+      growthPlan.prices[1].id,
+      'manual',
+      'active',
+      [organization, deletableOrganization],
+    )
+    await page.goto('/resellers')
+
+    await page
+      .getByRole('button', { name: `Delete ${deletableOrganization.name}` })
+      .click()
+    await expect(
+      page.getByRole('dialog', {
+        name: `Delete ${deletableOrganization.name}?`,
+      }),
+    ).toBeVisible()
+    await page
+      .getByTestId('workspace-delete-confirmation')
+      .fill(deletableOrganization.name)
+    await expect(page.getByTestId('workspace-delete-submit')).toBeEnabled()
+    await page.getByTestId('workspace-delete-submit').click()
+
+    await expect
+      .poll(state.deletedOrganizationId)
+      .toBe(deletableOrganization.id)
+    await expect(page.getByTestId('workspace-license-row')).toHaveCount(1)
+    await expect(
+      page.getByTestId('workspace-license-row'),
+    ).not.toContainText(deletableOrganization.name)
+    expect(state.organizations()).toHaveLength(1)
+
+    const organizationSwitcher = page
+      .getByRole('navigation', { name: 'Main navigation' })
+      .getByRole('combobox')
+      .first()
+    await organizationSwitcher.click()
+    await expect(
+      page.getByRole('option', { name: organization.name }),
+    ).toBeVisible()
+    await expect(
+      page.getByRole('option', { name: deletableOrganization.name }),
+    ).toHaveCount(0)
+  })
+
+  test('compares real workspace benefits and applies the selected plan', async ({
+    page,
+  }) => {
+    const state = await mockPartnerPortfolio(page, [
+      starterPlan,
+      growthPlan,
+      enterprisePlan,
+    ])
+    await page.goto('/resellers')
+    const upgradeLink = page.getByRole('link', { name: 'Upgrade workspace' })
+    await expect(upgradeLink).toHaveAttribute(
+      'href',
+      `/upgrade-workspace?organization_id=${organization.id}`,
+    )
+    await upgradeLink.click()
+
+    await expect(
+      page.getByRole('heading', { name: 'Upgrade workspace' }),
+    ).toBeVisible()
+    const comparison = page.getByLabel('Workspace plan comparison')
+    await expect(
+      comparison.getByRole('heading', { name: 'Omnitech Starter' }),
+    ).toBeVisible()
+    await expect(
+      comparison.getByRole('heading', { name: 'Omnitech Growth' }),
+    ).toBeVisible()
+    await expect(
+      comparison.getByRole('heading', { name: 'Omnitech Enterprise' }),
+    ).toBeVisible()
+    await expect(
+      page.getByText('CRM pipeline, tasks, insights and automations').last(),
+    ).toBeVisible()
+    await expect(
+      page.getByText('Packages, invoices and payment tracking').last(),
+    ).toBeVisible()
+
+    await page
+      .getByRole('button', { name: 'Choose Omnitech Enterprise' })
+      .click()
+    await expect(page.getByTestId('upgrade-submit')).toBeDisabled()
+    expect(state.assignment()).toBeNull()
+
+    await page.getByTestId('upgrade-reference').fill('RELIVE-2026-ENTERPRISE')
+    await page.getByTestId('upgrade-submit').click()
+
+    await expect.poll(state.assignment).toMatchObject({
+      plan_id: enterprisePlan.id,
+      plan_price_id: enterprisePlan.prices[0].id,
+      status: 'active',
+      manual_reference: 'RELIVE-2026-ENTERPRISE',
+    })
+    await expect(page.getByText('Current', { exact: true })).toBeVisible()
+  })
+
+  test('does not offer manual changes for a provider-managed subscription', async ({
+    page,
+  }) => {
+    const state = await mockPartnerPortfolio(
+      page,
+      [starterPlan, growthPlan, enterprisePlan],
+      platformOwner,
+      growthPlan.prices[1].id,
+      'stripe',
+      'canceled',
+    )
+    await page.goto('/resellers')
+    await expect(
+      page.getByTestId('workspace-license-panel'),
+    ).toContainText('Manual plan change unavailable')
+    await expect(page.getByTestId('workspace-license-submit')).toHaveCount(0)
+
+    await page.goto(`/upgrade-workspace?organization_id=${organization.id}`)
+
+    await page
+      .getByRole('button', { name: 'Choose Omnitech Enterprise' })
+      .click()
+    await expect(page.getByText('Manual plan change unavailable')).toBeVisible()
+    await expect(
+      page.getByText(/Change or cancel it through that billing provider/),
+    ).toBeVisible()
+    await expect(page.getByTestId('upgrade-submit')).toHaveCount(0)
+    expect(state.assignment()).toBeNull()
   })
 })

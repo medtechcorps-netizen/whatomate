@@ -105,7 +105,7 @@ const navSections = computed(() => {
 const mainSections = computed(() => navSections.value.filter(s => !s.pinBottom))
 const bottomSections = computed(() => navSections.value.filter(s => s.pinBottom))
 const canManageWorkspaceLicense = computed(() =>
-  authStore.hasPermission('resellers', 'read')
+  authStore.hasPermission('billing', 'read')
 )
 const activeOrganizationId = computed(() =>
   authStore.user?.is_super_admin
@@ -113,7 +113,7 @@ const activeOrganizationId = computed(() =>
     : authStore.organizationId
 )
 const workspaceUpgradeRoute = computed(() => ({
-  path: '/resellers',
+  path: '/upgrade-workspace',
   query: activeOrganizationId.value
     ? { organization_id: activeOrganizationId.value }
     : undefined
@@ -256,7 +256,7 @@ const handleLogout = async () => {
         </nav>
       </ScrollArea>
 
-      <!-- Licensing shortcut follows the same authorization as Partner Console. -->
+      <!-- Licensing shortcut follows the billing catalog authorization. -->
       <div
         v-if="canManageWorkspaceLicense"
         class="border-t border-white/[0.06] px-2 py-2 light:border-gray-200"

@@ -188,6 +188,12 @@ const router = createRouter({
           meta: { permission: 'resellers' }
         },
         {
+          path: 'upgrade-workspace',
+          name: 'workspace-upgrade',
+          component: () => import('@/views/billing/WorkspaceUpgradeView.vue'),
+          meta: { permission: 'billing' }
+        },
+        {
           path: 'templates',
           name: 'templates',
           component: () => import('@/views/settings/TemplatesView.vue'),
@@ -491,6 +497,7 @@ interface NavigationCandidate {
 
 const navigationOrder: NavigationCandidate[] = [
   { path: '/resellers', permission: 'resellers' },
+  { path: '/upgrade-workspace', permission: 'billing' },
   { path: '/launchpad', permission: 'onboarding' },
   { path: '/', permission: 'analytics' },
   { path: '/inbox', permissions: ['conversations', 'channel_accounts'], entitlement: 'omnichannel.enabled' },
