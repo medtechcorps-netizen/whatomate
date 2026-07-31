@@ -6,6 +6,7 @@ import {
   Bot,
   CheckCircle2,
   AlertCircle,
+  ArrowLeft,
   Facebook,
   Globe2,
   Inbox,
@@ -117,6 +118,14 @@ let pollTimer: number | null = null
 let syncDebounceTimer: number | null = null
 let filterDebounceTimer: number | null = null
 let refreshInFlight = false
+let conversationViewSequence = 0
+
+function isCurrentConversationView(sequence: number, conversationId: string) {
+  return (
+    sequence === conversationViewSequence &&
+    selectedConversation.value?.id === conversationId
+  )
+}
 
 const supportedChannels: Array<{
   key: ChannelType
@@ -276,7 +285,10 @@ async function load(silent = false, append = false) {
         conversations.value.find((item) => item.id === selectedConversation.value?.id) ?? null
     }
     if (silent && selectedConversation.value) {
-      const messageResponse = await channelsService.messages(selectedConversation.value.id, { limit: 100 })
+      const conversationId = selectedConversation.value.id
+      const viewSequence = conversationViewSequence
+      const messageResponse = await channelsService.messages(conversationId, { limit: 100 })
+      if (!isCurrentConversationView(viewSequence, conversationId)) return
       const latest = unwrapListResponse<InboxMessageEnvelope>(messageResponse, 'messages')
         .map(normalizeMessage)
         .reverse()
@@ -309,11 +321,18 @@ function scheduleChannelRefresh() {
 }
 
 async function selectConversation(conversation: InboxConversation) {
+  const viewSequence = ++conversationViewSequence
   selectedConversation.value = conversation
+  messages.value = []
+  messageTotal.value = 0
+  loadingOlderMessages.value = false
+  sending.value = false
+  aiStateUpdating.value = false
   if (isWorkspaceRail.value) isWorkspaceOpen.value = true
   loadingMessages.value = true
   try {
     const response = await channelsService.messages(conversation.id, { limit: 100 })
+    if (!isCurrentConversationView(viewSequence, conversation.id)) return
     messages.value = unwrapListResponse<InboxMessageEnvelope>(response, 'messages')
       .map(normalizeMessage)
       .reverse()
@@ -323,22 +342,41 @@ async function selectConversation(conversation: InboxConversation) {
       conversation.unread_count = 0
     }
   } catch (error) {
-    toast.error('Messages could not be loaded', getErrorMessage(error))
+    if (isCurrentConversationView(viewSequence, conversation.id)) {
+      toast.error('Messages could not be loaded', getErrorMessage(error))
+    }
   } finally {
-    loadingMessages.value = false
+    if (isCurrentConversationView(viewSequence, conversation.id)) {
+      loadingMessages.value = false
+    }
   }
+}
+
+function closeMobileConversation() {
+  conversationViewSequence += 1
+  selectedConversation.value = null
+  isWorkspaceOpen.value = false
+  messages.value = []
+  messageTotal.value = 0
+  composer.value = ''
+  loadingMessages.value = false
+  loadingOlderMessages.value = false
+  sending.value = false
+  aiStateUpdating.value = false
 }
 
 async function loadOlderMessages() {
   const conversation = selectedConversation.value
   const oldest = messages.value[0]
   if (!conversation || !oldest || loadingOlderMessages.value || !hasOlderMessages.value) return
+  const viewSequence = conversationViewSequence
   loadingOlderMessages.value = true
   try {
     const response = await channelsService.messages(conversation.id, {
       before: oldest.id,
       limit: 100,
     })
+    if (!isCurrentConversationView(viewSequence, conversation.id)) return
     const older = unwrapListResponse<InboxMessageEnvelope>(response, 'messages')
       .map(normalizeMessage)
       .reverse()
@@ -349,50 +387,63 @@ async function loadOlderMessages() {
       ...messages.value,
     ]
   } catch (error) {
-    toast.error('Older messages could not be loaded', getErrorMessage(error))
+    if (isCurrentConversationView(viewSequence, conversation.id)) {
+      toast.error('Older messages could not be loaded', getErrorMessage(error))
+    }
   } finally {
-    loadingOlderMessages.value = false
+    if (isCurrentConversationView(viewSequence, conversation.id)) {
+      loadingOlderMessages.value = false
+    }
   }
 }
 
 async function sendMessage() {
-  if (!selectedConversation.value || !composer.value.trim()) return
+  const conversation = selectedConversation.value
+  const messageText = composer.value.trim()
+  if (!conversation || !messageText) return
   if (
-    selectedConversation.value.channel === 'threads' &&
+    conversation.channel === 'threads' &&
     !hasThreadsPublicReplyTarget.value
   ) {
     toast.warning('Select an existing public Threads reply or mention before replying')
     return
   }
   if (!canSendText.value) return
+  const viewSequence = conversationViewSequence
   sending.value = true
   try {
     const payload: Record<string, unknown> = {
       idempotency_key: crypto.randomUUID(),
       purpose: 'service',
-      parts: [{ type: 'text', text: composer.value.trim() }],
+      parts: [{ type: 'text', text: messageText }],
     }
-    if (selectedConversation.value.channel === 'threads') {
-      payload.reply_to_external_id = selectedConversation.value.external_conversation_id
+    if (conversation.channel === 'threads') {
+      payload.reply_to_external_id = conversation.external_conversation_id
     }
-    const response = await channelsService.send(selectedConversation.value.id, payload)
+    const response = await channelsService.send(conversation.id, payload)
+    if (!isCurrentConversationView(viewSequence, conversation.id)) return
     const result = unwrapItemResponse<InboxMessageEnvelope>(response)
     messages.value.push(normalizeMessage(result))
-    updateLocalConversationAIState(true, 'human_reply')
+    updateLocalConversationAIState(conversation.id, true, 'human_reply')
     composer.value = ''
   } catch (error) {
-    toast.error('Message was not sent', getErrorMessage(error))
+    if (isCurrentConversationView(viewSequence, conversation.id)) {
+      toast.error('Message was not sent', getErrorMessage(error))
+    }
   } finally {
-    sending.value = false
+    if (isCurrentConversationView(viewSequence, conversation.id)) {
+      sending.value = false
+    }
   }
 }
 
-function updateLocalConversationAIState(paused: boolean, reason = '') {
+function updateLocalConversationAIState(conversationId: string, paused: boolean, reason = '') {
   const selected = selectedConversation.value
-  if (!selected) return
-  selected.ai_paused = paused
-  selected.ai_pause_reason = reason || undefined
-  const listed = conversations.value.find(conversation => conversation.id === selected.id)
+  if (selected?.id === conversationId) {
+    selected.ai_paused = paused
+    selected.ai_pause_reason = reason || undefined
+  }
+  const listed = conversations.value.find(conversation => conversation.id === conversationId)
   if (listed && listed !== selected) {
     listed.ai_paused = paused
     listed.ai_pause_reason = reason || undefined
@@ -402,6 +453,7 @@ function updateLocalConversationAIState(paused: boolean, reason = '') {
 async function toggleConversationAI() {
   const conversation = selectedConversation.value
   if (!conversation || !canControlConversationAI.value || aiStateUpdating.value) return
+  const viewSequence = conversationViewSequence
   const paused = !conversation.ai_paused
   aiStateUpdating.value = true
   try {
@@ -411,7 +463,8 @@ async function toggleConversationAI() {
       ai_paused: boolean
       ai_pause_reason?: string
     }>(response)
-    updateLocalConversationAIState(state.ai_paused, state.ai_pause_reason)
+    if (!isCurrentConversationView(viewSequence, conversation.id)) return
+    updateLocalConversationAIState(conversation.id, state.ai_paused, state.ai_pause_reason)
     toast.success(
       state.ai_paused ? 'AI replies paused' : 'AI replies resumed',
       state.ai_paused
@@ -419,9 +472,13 @@ async function toggleConversationAI() {
         : 'The next eligible customer message can receive an automatic reply.',
     )
   } catch (error) {
-    toast.error('AI reply state was not changed', getErrorMessage(error))
+    if (isCurrentConversationView(viewSequence, conversation.id)) {
+      toast.error('AI reply state was not changed', getErrorMessage(error))
+    }
   } finally {
-    aiStateUpdating.value = false
+    if (isCurrentConversationView(viewSequence, conversation.id)) {
+      aiStateUpdating.value = false
+    }
   }
 }
 
@@ -574,9 +631,7 @@ async function disconnectAccount() {
     await channelsService.disconnectAccount(account.id)
     settingsAccount.value = null
     if (selectedConversation.value?.channel_account_id === account.id) {
-      selectedConversation.value = null
-      isWorkspaceOpen.value = false
-      messages.value = []
+      closeMobileConversation()
     }
     toast.success('Channel disconnected')
     await load()
@@ -607,10 +662,7 @@ watch([search, channelFilter], () => {
   if (filterDebounceTimer !== null) window.clearTimeout(filterDebounceTimer)
   filterDebounceTimer = window.setTimeout(() => {
     filterDebounceTimer = null
-    selectedConversation.value = null
-    isWorkspaceOpen.value = false
-    messages.value = []
-    messageTotal.value = 0
+    closeMobileConversation()
     void load()
   }, 300)
 })
@@ -626,6 +678,7 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  conversationViewSequence += 1
   stopChannelSync?.()
   if (pollTimer !== null) window.clearInterval(pollTimer)
   if (syncDebounceTimer !== null) window.clearTimeout(syncDebounceTimer)
@@ -634,27 +687,28 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="flex h-full flex-col bg-[#08090a] light:bg-[#f5f6f7]">
+  <div class="flex h-full flex-col bg-[#08090a] light:bg-slate-100">
     <PageHeader
       title="Omnichannel inbox"
       description="One conversation layer across WhatsApp, social, email and web chat."
       :icon="Inbox"
       icon-gradient="bg-gradient-to-br from-sky-400 to-indigo-700 shadow-sky-500/20"
+      compact-actions
     >
       <template #actions>
         <div class="flex items-center gap-2">
-          <Badge variant="outline" class="hidden gap-1.5 border-emerald-400/20 text-emerald-300 md:flex">
+          <Badge variant="outline" class="hidden gap-1.5 border-emerald-400/20 text-emerald-300 light:border-emerald-300 light:text-emerald-700 lg:flex">
             <CheckCircle2 class="h-3.5 w-3.5" />
             {{ activeCount }} active
           </Badge>
-          <Badge v-if="attentionCount" variant="outline" class="hidden gap-1.5 border-amber-400/20 text-amber-300 md:flex">
+          <Badge v-if="attentionCount" variant="outline" class="hidden gap-1.5 border-amber-400/20 text-amber-300 light:border-amber-300 light:text-amber-700 lg:flex">
             <AlertCircle class="h-3.5 w-3.5" />
             {{ attentionCount }} attention
           </Badge>
           <Button variant="outline" size="icon" aria-label="Refresh omnichannel inbox" @click="load">
             <RefreshCw class="h-4 w-4" />
           </Button>
-          <Button v-if="canManageAccounts" class="bg-sky-400 text-black hover:bg-sky-300" @click="showConnect = !showConnect">
+          <Button v-if="canManageAccounts" class="hidden bg-sky-400 text-black hover:bg-sky-300 lg:inline-flex" @click="showConnect = !showConnect">
             <Plus class="mr-2 h-4 w-4" />
             Connect
           </Button>
@@ -755,35 +809,35 @@ onBeforeUnmount(() => {
 
     <details
       v-if="!loading"
-      class="group shrink-0 border-b border-white/[0.08] bg-[#0b0c0d] light:border-gray-200 light:bg-white 2xl:hidden"
+      class="group hidden shrink-0 border-b border-white/[0.08] bg-[#0b0c0d] light:border-slate-300 light:bg-slate-50 lg:block 2xl:hidden"
     >
       <summary
-        class="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-xs font-semibold text-white light:text-gray-900"
+        class="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-xs font-semibold text-white light:text-slate-950"
       >
         <span>Channel connections</span>
-        <span class="rounded-full bg-white/[0.06] px-2 py-1 text-[10px] text-white/45 light:bg-gray-100 light:text-gray-500">
+        <span class="rounded-full bg-white/[0.06] px-2 py-1 text-[10px] text-white/45 light:bg-slate-200 light:text-slate-700">
           {{ accounts.length }} configured · open to test or approve
         </span>
       </summary>
-      <div class="max-h-60 space-y-2 overflow-y-auto border-t border-white/[0.06] p-3 light:border-gray-100">
+      <div class="max-h-60 space-y-2 overflow-y-auto border-t border-white/[0.06] p-3 light:border-slate-300">
         <div
           v-for="account in accounts"
           :key="`compact-${account.id}`"
-          class="flex flex-wrap items-center gap-3 rounded-xl border border-white/[0.07] bg-white/[0.025] p-3 light:border-gray-200 light:bg-gray-50"
+          class="flex flex-wrap items-center gap-3 rounded-xl border border-white/[0.07] bg-white/[0.025] p-3 light:border-slate-300 light:bg-white"
         >
           <button
             type="button"
             class="flex min-w-0 flex-1 items-center gap-3 text-left"
             @click="channelFilter = account.channel"
           >
-            <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white/[0.04] text-white/55 light:bg-white light:text-gray-600">
+            <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white/[0.04] text-white/55 light:bg-slate-100 light:text-slate-700">
               <component :is="channelMeta(account.channel).icon" class="h-4 w-4" />
             </span>
             <span class="min-w-0">
-              <span class="block truncate text-xs font-medium text-white light:text-gray-900">{{ account.name }}</span>
+              <span class="block truncate text-xs font-medium text-white light:text-slate-950">{{ account.name }}</span>
               <span
                 class="mt-0.5 block text-[10px]"
-                :class="accountReadyForOutbound(account) ? 'text-emerald-300' : 'text-amber-300'"
+                :class="accountReadyForOutbound(account) ? 'text-emerald-300 light:text-emerald-700' : 'text-amber-300 light:text-amber-700'"
               >
                 {{
                   accountReadyForOutbound(account)
@@ -793,7 +847,7 @@ onBeforeUnmount(() => {
                       : account.status
                 }}
                 <span v-if="account.outbox_pending"> · {{ account.outbox_pending }} queued</span>
-                <span v-if="account.outbox_failed" class="text-red-300"> · {{ account.outbox_failed }} failed</span>
+                <span v-if="account.outbox_failed" class="text-red-300 light:text-red-700"> · {{ account.outbox_failed }} failed</span>
               </span>
             </span>
           </button>
@@ -832,9 +886,9 @@ onBeforeUnmount(() => {
             Settings
           </Button>
         </div>
-        <div v-if="accounts.length === 0" class="rounded-xl border border-dashed border-white/[0.08] p-5 text-center light:border-gray-200">
-          <Unplug class="mx-auto h-5 w-5 text-white/25 light:text-gray-400" />
-          <p class="mt-2 text-xs text-white/35 light:text-gray-500">No channel connections yet</p>
+        <div v-if="accounts.length === 0" class="rounded-xl border border-dashed border-white/[0.08] p-5 text-center light:border-slate-300">
+          <Unplug class="mx-auto h-5 w-5 text-white/25 light:text-slate-500" />
+          <p class="mt-2 text-xs text-white/35 light:text-slate-600">No channel connections yet</p>
         </div>
       </div>
     </details>
@@ -843,9 +897,9 @@ onBeforeUnmount(() => {
       <Loader2 class="h-6 w-6 animate-spin text-sky-300" />
     </div>
 
-    <div v-else class="grid min-h-0 flex-1" :class="inboxGridClass">
-      <aside class="hidden overflow-y-auto border-r border-white/[0.08] bg-[#0b0c0d] p-3 light:border-gray-200 light:bg-white 2xl:block">
-        <p class="px-2 pb-3 pt-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/35 light:text-gray-500">
+    <div v-else class="grid min-h-0 flex-1 overflow-hidden" :class="inboxGridClass">
+      <aside class="hidden overflow-y-auto border-r border-white/[0.08] bg-[#0b0c0d] p-3 light:border-slate-300 light:bg-slate-50 2xl:block">
+        <p class="px-2 pb-3 pt-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/35 light:text-slate-600">
           Connections
         </p>
         <div class="space-y-1.5">
@@ -854,19 +908,19 @@ onBeforeUnmount(() => {
             :key="account.id"
             role="button"
             tabindex="0"
-            class="flex w-full cursor-pointer items-center gap-3 rounded-xl border border-transparent px-2.5 py-2.5 text-left transition hover:border-white/[0.06] hover:bg-white/[0.025] light:hover:border-gray-200 light:hover:bg-gray-50"
+            class="flex min-h-11 w-full cursor-pointer items-center gap-3 rounded-xl border border-transparent px-2.5 py-2.5 text-left transition hover:border-white/[0.06] hover:bg-white/[0.025] light:hover:border-slate-300 light:hover:bg-slate-200/70"
             @click="channelFilter = account.channel"
             @keydown.enter="channelFilter = account.channel"
           >
-            <div class="flex h-9 w-9 items-center justify-center rounded-xl bg-white/[0.04] text-white/55 light:bg-gray-100 light:text-gray-600">
+            <div class="flex h-9 w-9 items-center justify-center rounded-xl bg-white/[0.04] text-white/55 light:bg-slate-200 light:text-slate-700">
               <component :is="channelMeta(account.channel).icon" class="h-4 w-4" />
             </div>
             <div class="min-w-0 flex-1">
-              <p class="truncate text-xs font-medium text-white light:text-gray-900">{{ account.name }}</p>
-              <p class="mt-0.5 text-[10px] capitalize text-white/35 light:text-gray-500">{{ account.channel }} · {{ account.provider }}</p>
+              <p class="truncate text-xs font-medium text-white light:text-slate-950">{{ account.name }}</p>
+              <p class="mt-0.5 text-[10px] capitalize text-white/35 light:text-slate-600">{{ account.channel }} · {{ account.provider }}</p>
               <p
                 class="mt-1 text-[9px]"
-                :class="accountReadyForOutbound(account) ? 'text-emerald-300' : 'text-amber-300'"
+                :class="accountReadyForOutbound(account) ? 'text-emerald-300 light:text-emerald-700' : 'text-amber-300 light:text-amber-700'"
               >
                 {{
                   accountReadyForOutbound(account)
@@ -876,9 +930,9 @@ onBeforeUnmount(() => {
                       : account.status
                 }}
                 <span v-if="account.outbox_pending"> · {{ account.outbox_pending }} queued</span>
-                <span v-if="account.outbox_failed" class="text-red-300"> · {{ account.outbox_failed }} failed</span>
+                <span v-if="account.outbox_failed" class="text-red-300 light:text-red-700"> · {{ account.outbox_failed }} failed</span>
               </p>
-              <p v-if="account.last_error" class="mt-1 line-clamp-2 text-[9px] text-red-300/75">
+              <p v-if="account.last_error" class="mt-1 line-clamp-2 text-[9px] text-red-300/75 light:text-red-700">
                 {{ account.last_error }}
               </p>
             </div>
@@ -898,7 +952,7 @@ onBeforeUnmount(() => {
             <button
               v-if="canManageAccounts"
               type="button"
-              class="rounded-lg p-1.5 text-white/25 transition hover:bg-white/[0.05] hover:text-sky-300 light:text-gray-400"
+              class="rounded-lg p-1.5 text-white/25 transition hover:bg-white/[0.05] hover:text-sky-300 light:text-slate-500 light:hover:text-sky-700"
               :aria-label="`Test ${account.name}`"
               @click.stop="testAccount(account)"
             >
@@ -907,20 +961,20 @@ onBeforeUnmount(() => {
             <button
               v-if="(canManageAccounts || canDeleteAccounts) && account.provider !== 'meta_legacy'"
               type="button"
-              class="rounded-lg p-1.5 text-white/25 transition hover:bg-white/[0.05] hover:text-sky-300 light:text-gray-400"
+              class="rounded-lg p-1.5 text-white/25 transition hover:bg-white/[0.05] hover:text-sky-300 light:text-slate-500 light:hover:text-sky-700"
               :aria-label="`Manage ${account.name}`"
               @click.stop="openAccountSettings(account)"
             >
               <Settings2 class="h-3.5 w-3.5" />
             </button>
           </div>
-          <div v-if="accounts.length === 0" class="rounded-xl border border-dashed border-white/[0.08] p-5 text-center light:border-gray-200">
-            <Unplug class="mx-auto h-5 w-5 text-white/25 light:text-gray-400" />
-            <p class="mt-2 text-xs text-white/35 light:text-gray-500">No channel connections yet</p>
+          <div v-if="accounts.length === 0" class="rounded-xl border border-dashed border-white/[0.08] p-5 text-center light:border-slate-300">
+            <Unplug class="mx-auto h-5 w-5 text-white/25 light:text-slate-500" />
+            <p class="mt-2 text-xs text-white/35 light:text-slate-600">No channel connections yet</p>
           </div>
         </div>
 
-        <p class="mt-7 px-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/35 light:text-gray-500">
+        <p class="mt-7 px-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/35 light:text-slate-600">
           Available adapters
         </p>
         <div class="mt-2 grid grid-cols-2 gap-2">
@@ -928,11 +982,11 @@ onBeforeUnmount(() => {
             v-for="channel in visibleChannels"
             :key="channel.key"
             :data-testid="channel.key === 'threads' ? 'threads-public-engagement-adapter' : undefined"
-            class="rounded-xl border border-white/[0.06] bg-white/[0.018] p-2.5 light:border-gray-200 light:bg-gray-50"
+            class="rounded-xl border border-white/[0.06] bg-white/[0.018] p-2.5 light:border-slate-300 light:bg-white"
           >
-            <component :is="channel.icon" class="h-4 w-4 text-white/45 light:text-gray-500" />
-            <p class="mt-2 text-[10px] font-medium text-white/65 light:text-gray-700">{{ channel.label }}</p>
-            <p class="mt-0.5 text-[9px] text-white/25 light:text-gray-400">
+            <component :is="channel.icon" class="h-4 w-4 text-white/45 light:text-slate-600" />
+            <p class="mt-2 text-[10px] font-medium text-white/65 light:text-slate-800">{{ channel.label }}</p>
+            <p class="mt-0.5 text-[9px] text-white/25 light:text-slate-500">
               {{
                 channel.key === 'threads'
                   ? 'Beta public replies + mentions; no DMs'
@@ -947,16 +1001,21 @@ onBeforeUnmount(() => {
         </div>
       </aside>
 
-      <section class="flex min-h-0 flex-col border-r border-white/[0.08] bg-[#0d0f10] light:border-gray-200 light:bg-white">
-        <div class="border-b border-white/[0.07] p-3 light:border-gray-100">
+      <section
+        :class="[
+          'min-h-0 flex-col border-r border-white/[0.08] bg-[#0d0f10] light:border-slate-300 light:bg-slate-50',
+          selectedConversation ? 'hidden lg:flex' : 'flex',
+        ]"
+      >
+        <div class="border-b border-white/[0.07] p-3 light:border-slate-300">
           <div class="relative">
-            <AtSign class="absolute left-3 top-2.5 h-4 w-4 text-white/25 light:text-gray-400" />
+            <AtSign class="absolute left-3 top-2.5 h-4 w-4 text-white/25 light:text-slate-500" />
             <Input v-model="search" class="pl-9" placeholder="Search conversations" />
           </div>
-          <div class="mt-2 flex gap-1 overflow-x-auto">
+          <div class="mt-2 flex gap-2 overflow-x-auto pb-1">
             <button
-              class="shrink-0 rounded-full px-2.5 py-1 text-[10px] font-medium transition"
-              :class="channelFilter === 'all' ? 'bg-sky-300 text-black' : 'bg-white/[0.04] text-white/45 light:bg-gray-100 light:text-gray-500'"
+              class="min-h-11 shrink-0 rounded-full px-3 py-1 text-xs font-semibold transition lg:min-h-0 lg:px-2.5 lg:text-[10px] lg:font-medium"
+              :class="channelFilter === 'all' ? 'bg-sky-300 text-black' : 'bg-white/[0.04] text-white/45 light:bg-slate-200 light:text-slate-700'"
               @click="channelFilter = 'all'"
             >
               All
@@ -964,11 +1023,11 @@ onBeforeUnmount(() => {
             <button
               v-for="channel in supportedChannels.filter((item) => accounts.some((account) => account.channel === item.key))"
               :key="channel.key"
-              class="shrink-0 rounded-full px-2.5 py-1 text-[10px] font-medium transition"
+              class="min-h-11 shrink-0 rounded-full px-3 py-1 text-xs font-semibold transition lg:min-h-0 lg:px-2.5 lg:text-[10px] lg:font-medium"
               :class="
                 channelFilter === channel.key
                   ? 'bg-sky-300 text-black'
-                  : 'bg-white/[0.04] text-white/45 light:bg-gray-100 light:text-gray-500'
+                  : 'bg-white/[0.04] text-white/45 light:bg-slate-200 light:text-slate-700'
               "
               @click="channelFilter = channel.key"
             >
@@ -981,15 +1040,15 @@ onBeforeUnmount(() => {
           <button
             v-for="conversation in filteredConversations"
             :key="conversation.id"
-            class="flex w-full gap-3 border-b border-white/[0.055] px-3 py-3.5 text-left transition light:border-gray-100"
+            class="flex min-h-[72px] w-full gap-3 border-b border-white/[0.055] px-3 py-3.5 text-left transition light:border-slate-300"
             :class="
               selectedConversation?.id === conversation.id
                 ? 'bg-sky-300/[0.08]'
-                : 'hover:bg-white/[0.025] light:hover:bg-gray-50'
+                : 'hover:bg-white/[0.025] light:hover:bg-slate-200/70'
             "
             @click="selectConversation(conversation)"
           >
-            <div class="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/[0.045] text-white/55 light:bg-gray-100 light:text-gray-600">
+            <div class="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/[0.045] text-white/55 light:bg-slate-200 light:text-slate-700">
               <component :is="channelMeta(conversation.channel).icon" class="h-4 w-4" />
               <span
                 v-if="conversation.unread_count"
@@ -1000,18 +1059,18 @@ onBeforeUnmount(() => {
             </div>
             <div class="min-w-0 flex-1">
               <div class="flex items-center justify-between gap-2">
-                <p class="truncate text-xs font-semibold text-white light:text-gray-900">
+                <p class="truncate text-sm font-semibold text-white light:text-slate-950 lg:text-xs">
                   {{ conversationName(conversation) }}
                 </p>
-                <span class="shrink-0 text-[9px] text-white/25 light:text-gray-400">{{ formatTime(conversation.last_message_at) }}</span>
+                <span class="shrink-0 text-[10px] text-white/25 light:text-slate-600">{{ formatTime(conversation.last_message_at) }}</span>
               </div>
-              <p v-if="conversation.subject" class="mt-1 truncate text-[10px] font-medium text-white/50 light:text-gray-600">{{ conversation.subject }}</p>
-              <p class="mt-1 truncate text-[11px] text-white/32 light:text-gray-500">{{ conversation.last_message_preview || 'No preview' }}</p>
+              <p v-if="conversation.subject" class="mt-1 truncate text-xs font-medium text-white/50 light:text-slate-700">{{ conversation.subject }}</p>
+              <p class="mt-1 truncate text-xs text-white/40 light:text-slate-600">{{ conversation.last_message_preview || 'No preview' }}</p>
             </div>
           </button>
           <div v-if="filteredConversations.length === 0" class="p-8 text-center">
-            <Inbox class="mx-auto h-6 w-6 text-white/20 light:text-gray-300" />
-            <p class="mt-3 text-xs text-white/35 light:text-gray-500">No matching conversations</p>
+            <Inbox class="mx-auto h-6 w-6 text-white/20 light:text-slate-400" />
+            <p class="mt-3 text-xs text-white/35 light:text-slate-600">No matching conversations</p>
           </div>
           <div v-if="conversations.length < conversationTotal" class="p-3 text-center">
             <Button
@@ -1027,18 +1086,33 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <main class="flex min-h-0 min-w-0 flex-col bg-[#090a0b] light:bg-[#f8f9fa]">
+      <main
+        :class="[
+          'min-h-0 min-w-0 flex-col overflow-hidden bg-[#090a0b] light:bg-slate-100',
+          selectedConversation ? 'flex' : 'hidden lg:flex',
+        ]"
+      >
         <template v-if="selectedConversation">
-          <header class="flex items-center justify-between border-b border-white/[0.08] bg-[#0d0f10] px-5 py-3.5 light:border-gray-200 light:bg-white">
-            <div class="flex items-center gap-3">
+          <header class="flex items-center justify-between gap-2 border-b border-white/[0.08] bg-[#0d0f10] px-3 py-2 light:border-slate-300 light:bg-slate-50 sm:px-5 sm:py-3.5">
+            <div class="flex min-w-0 items-center gap-2 sm:gap-3">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                class="h-11 w-11 shrink-0 lg:hidden"
+                aria-label="Back to conversations"
+                @click="closeMobileConversation"
+              >
+                <ArrowLeft class="h-5 w-5" />
+              </Button>
               <div class="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-300/10 text-sky-200">
                 <component :is="channelMeta(selectedConversation.channel).icon" class="h-4 w-4" />
               </div>
-              <div>
-                <p class="text-sm font-semibold text-white light:text-gray-900">
+              <div class="min-w-0">
+                <p class="truncate text-sm font-semibold text-white light:text-slate-950">
                   {{ conversationName(selectedConversation) }}
                 </p>
-                <p class="mt-0.5 text-[10px] capitalize text-white/35 light:text-gray-500">
+                <p class="mt-0.5 truncate text-[10px] capitalize text-white/35 light:text-slate-600">
                   {{ selectedConversation.channel }} · {{ selectedAccount?.name || 'Channel' }}
                 </p>
               </div>
@@ -1050,20 +1124,22 @@ onBeforeUnmount(() => {
                 type="button"
                 variant="outline"
                 size="sm"
+                class="h-11 w-11 p-0 sm:h-8 sm:w-auto sm:px-3"
                 :disabled="aiStateUpdating"
                 :aria-pressed="selectedConversation.ai_paused"
+                :aria-label="selectedConversation.ai_paused ? 'Resume AI' : 'Pause AI'"
                 @click="toggleConversationAI"
               >
-                <Loader2 v-if="aiStateUpdating" class="mr-2 h-3.5 w-3.5 animate-spin" />
-                <Play v-else-if="selectedConversation.ai_paused" class="mr-2 h-3.5 w-3.5" />
-                <PauseCircle v-else class="mr-2 h-3.5 w-3.5" />
-                {{ selectedConversation.ai_paused ? 'Resume AI' : 'Pause AI' }}
+                <Loader2 v-if="aiStateUpdating" class="h-3.5 w-3.5 animate-spin sm:mr-2" />
+                <Play v-else-if="selectedConversation.ai_paused" class="h-3.5 w-3.5 sm:mr-2" />
+                <PauseCircle v-else class="h-3.5 w-3.5 sm:mr-2" />
+                <span class="hidden sm:inline">{{ selectedConversation.ai_paused ? 'Resume AI' : 'Pause AI' }}</span>
               </Button>
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                class="h-10 shrink-0 gap-2"
+                class="hidden h-10 shrink-0 gap-2 sm:inline-flex"
                 :aria-label="isWorkspaceOpen ? 'Close customer revenue workspace' : 'Open customer revenue workspace'"
                 :aria-pressed="isWorkspaceOpen"
                 @click="isWorkspaceOpen = !isWorkspaceOpen"
@@ -1077,7 +1153,7 @@ onBeforeUnmount(() => {
           <div v-if="loadingMessages" class="flex flex-1 items-center justify-center">
             <Loader2 class="h-5 w-5 animate-spin text-sky-300" />
           </div>
-          <div v-else class="flex-1 space-y-3 overflow-y-auto p-5 md:p-7">
+          <div v-else class="flex-1 space-y-3 overflow-y-auto p-3 sm:p-5 md:p-7">
             <div v-if="hasOlderMessages" class="pb-2 text-center">
               <Button
                 variant="outline"
@@ -1096,11 +1172,11 @@ onBeforeUnmount(() => {
               :class="message.direction === 'outgoing' ? 'justify-end' : 'justify-start'"
             >
               <div
-                class="max-w-[72%] rounded-2xl px-4 py-3 text-sm leading-6"
+                class="max-w-[86%] rounded-2xl px-4 py-3 text-sm leading-6 sm:max-w-[72%]"
                 :class="
                   message.direction === 'outgoing'
                     ? 'rounded-br-md bg-sky-300 text-slate-950'
-                    : 'rounded-bl-md border border-white/[0.07] bg-white/[0.04] text-white/80 light:border-gray-200 light:bg-white light:text-gray-800'
+                    : 'rounded-bl-md border border-white/[0.07] bg-white/[0.04] text-white/80 light:border-slate-300 light:bg-slate-50 light:text-slate-900'
                 "
               >
                 <p>{{ message.content }}</p>
@@ -1109,12 +1185,12 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <footer class="border-t border-white/[0.08] bg-[#0d0f10] p-4 light:border-gray-200 light:bg-white">
+          <footer class="border-t border-white/[0.08] bg-[#0d0f10] p-3 light:border-slate-300 light:bg-slate-50 sm:p-4">
             <div
               v-if="selectedConversation.channel === 'whatsapp'"
-              class="flex items-center justify-between rounded-xl border border-emerald-300/15 bg-emerald-300/[0.04] px-4 py-3"
+                class="flex flex-col items-start gap-3 rounded-xl border border-emerald-300/15 bg-emerald-300/[0.04] px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
             >
-              <p class="text-xs text-emerald-100/65">Open the WhatsApp conversation to use templates, media and service-window controls.</p>
+                <p class="text-xs text-emerald-100/65 light:text-emerald-800">Open the WhatsApp conversation to use templates, media and service-window controls.</p>
               <RouterLink :to="`/chat/${selectedConversation.contact_id}`">
                 <Button size="sm" class="bg-emerald-300 text-black hover:bg-emerald-200">Open WhatsApp</Button>
               </RouterLink>
@@ -1132,7 +1208,7 @@ onBeforeUnmount(() => {
               <textarea
                 v-model="composer"
                 rows="2"
-                class="min-h-11 flex-1 resize-none rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm text-white outline-none placeholder:text-white/20 focus:border-sky-300/35 light:border-gray-200 light:bg-gray-50 light:text-gray-900"
+                class="min-h-11 flex-1 resize-none rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm text-white outline-none placeholder:text-white/20 focus:border-sky-300/35 light:border-slate-400 light:bg-white light:text-slate-950 light:placeholder:text-slate-500"
                 :disabled="!canSendText"
                 :placeholder="
                   selectedConversation.channel === 'threads' && !hasThreadsPublicReplyTarget
@@ -1167,11 +1243,11 @@ onBeforeUnmount(() => {
         </template>
 
         <div v-else class="flex flex-1 flex-col items-center justify-center p-8 text-center">
-          <div class="flex h-16 w-16 items-center justify-center rounded-2xl border border-white/[0.08] bg-white/[0.025] text-white/25 light:border-gray-200 light:bg-white light:text-gray-400">
+          <div class="flex h-16 w-16 items-center justify-center rounded-2xl border border-white/[0.08] bg-white/[0.025] text-white/25 light:border-slate-300 light:bg-slate-50 light:text-slate-500">
             <Inbox class="h-6 w-6" />
           </div>
-          <h2 class="mt-5 text-lg font-semibold text-white light:text-gray-900">Every channel, one operating rhythm</h2>
-          <p class="mt-2 max-w-md text-sm leading-6 text-white/40 light:text-gray-500">
+          <h2 class="mt-5 text-lg font-semibold text-white light:text-slate-950">Every channel, one operating rhythm</h2>
+          <p class="mt-2 max-w-md text-sm leading-6 text-white/40 light:text-slate-600">
             Select a conversation. Provider capabilities decide which composer actions are available, while tenant isolation
             remains the same on every channel.
           </p>

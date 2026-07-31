@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useMediaQuery } from '@vueuse/core'
 import { useI18n } from 'vue-i18n'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
@@ -13,7 +14,7 @@ import {
 import { CalendarIcon } from 'lucide-vue-next'
 import type { TimeRangePreset } from '@/composables/useDateRange'
 
-const props = defineProps<{
+defineProps<{
   selectedRange: TimeRangePreset
   customDateRange: any
   isDatePickerOpen: boolean
@@ -28,6 +29,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const isCompactCalendar = useMediaQuery('(max-width: 639px)')
 </script>
 
 <template>
@@ -35,7 +37,7 @@ const { t } = useI18n()
     :model-value="selectedRange"
     @update:model-value="emit('update:selectedRange', $event as TimeRangePreset)"
   >
-    <SelectTrigger class="w-[140px]">
+    <SelectTrigger class="w-full min-w-[132px] sm:w-[140px]">
       <SelectValue :placeholder="t('dateRange.selectRange', 'Date Range')" />
     </SelectTrigger>
     <SelectContent>
@@ -57,12 +59,12 @@ const { t } = useI18n()
         {{ formatDateRangeDisplay || t('common.select') }}
       </Button>
     </PopoverTrigger>
-    <PopoverContent class="w-auto p-4" align="end">
+    <PopoverContent class="max-w-[calc(100vw-2rem)] overflow-x-auto p-3 sm:w-auto sm:p-4" align="end">
       <div class="space-y-4">
         <RangeCalendar
           :model-value="customDateRange"
           @update:model-value="emit('update:customDateRange', $event)"
-          :number-of-months="2"
+          :number-of-months="isCompactCalendar ? 1 : 2"
         />
         <Button
           class="w-full"

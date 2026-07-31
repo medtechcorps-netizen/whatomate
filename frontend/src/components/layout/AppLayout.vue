@@ -109,6 +109,36 @@ const navSections = computed(() => {
 
 const mainSections = computed(() => navSections.value.filter(s => !s.pinBottom))
 const bottomSections = computed(() => navSections.value.filter(s => s.pinBottom))
+
+// Mobile is intentionally a focused companion experience. Keep the full
+// workspace available on desktop while exposing only the three workflows that
+// are useful on a small screen.
+const mobileNavItems = computed(() => {
+  const items = navSections.value.flatMap(section => section.items)
+  const dashboard = items.find(item => item.path === '/')
+  const inbox = items.find(item => item.path === '/inbox')
+  const analyticsOptions = items.filter(item => item.path.startsWith('/analytics/'))
+  const currentAnalytics = analyticsOptions.find(
+    item => item.path === route.path && item.path.startsWith('/analytics/'),
+  )
+  const analytics = currentAnalytics
+    ?? analyticsOptions.find(item => item.path === '/analytics/agents')
+    ?? analyticsOptions.find(item => item.path === '/analytics/meta-insights')
+
+  const focusedItems = []
+  if (dashboard) focusedItems.push(dashboard)
+  if (analytics) {
+    focusedItems.push({
+      ...analytics,
+      name: 'nav.analytics',
+      active: route.path.startsWith('/analytics/'),
+      children: analyticsOptions,
+    })
+  }
+  if (inbox) focusedItems.push(inbox)
+
+  return focusedItems
+})
 const canManageWorkspaceLicense = computed(() =>
   authStore.hasPermission('billing', 'read')
 )
@@ -135,12 +165,12 @@ const handleLogout = async () => {
 </script>
 
 <template>
-  <div class="flex h-screen bg-[#0a0a0b] light:bg-gray-50">
+  <div class="flex h-screen bg-[#0a0a0b] light:bg-slate-100">
     <!-- Skip link for accessibility -->
     <a href="#main-content" class="skip-link">{{ $t('nav.skipToMain') }}</a>
 
     <!-- Mobile header -->
-    <header class="fixed top-0 left-0 right-0 z-50 flex h-12 items-center justify-between border-b border-white/[0.08] light:border-gray-200 bg-[#0a0a0b]/95 light:bg-white/95 backdrop-blur-sm px-3 md:hidden">
+    <header class="fixed top-0 left-0 right-0 z-50 flex h-12 items-center justify-between border-b border-white/[0.08] light:border-slate-300 bg-[#0a0a0b]/95 light:bg-slate-50/95 backdrop-blur-sm px-3 lg:hidden">
       <RouterLink to="/" class="flex items-center gap-2">
         <ReReplyLogo size="sm" tone="light" class="light:hidden" />
         <ReReplyLogo size="sm" tone="dark" class="hidden light:inline-flex" />
@@ -148,8 +178,8 @@ const handleLogout = async () => {
       <Button
         variant="ghost"
         size="icon"
-        class="h-8 w-8 text-white/70 hover:text-white hover:bg-white/[0.08] light:text-gray-600 light:hover:text-gray-900 light:hover:bg-gray-100"
-        aria-label="Toggle menu"
+        class="h-11 w-11 text-white/70 hover:text-white hover:bg-white/[0.08] light:text-slate-700 light:hover:text-slate-950 light:hover:bg-slate-200"
+        aria-label="Open mobile workspace menu"
         :aria-expanded="isMobileMenuOpen"
         @click="isMobileMenuOpen = !isMobileMenuOpen"
       >
@@ -161,24 +191,24 @@ const handleLogout = async () => {
     <!-- Mobile menu overlay -->
     <div
       v-if="isMobileMenuOpen"
-      class="fixed inset-0 z-40 bg-black/60 light:bg-black/30 backdrop-blur-sm md:hidden"
+      class="fixed inset-0 z-40 bg-black/60 light:bg-black/30 backdrop-blur-sm lg:hidden"
       @click="isMobileMenuOpen = false"
     />
 
     <!-- Sidebar -->
     <aside
       :class="[
-        'flex flex-col border-r border-white/[0.08] light:border-gray-200 bg-[#0a0a0b] light:bg-white transition-all duration-300',
-        'fixed inset-y-0 left-0 z-40 md:relative',
-        'transform md:transform-none',
-        isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0',
-        isCollapsed ? 'w-64 md:w-16' : 'w-64'
+        'flex flex-col border-r border-white/[0.08] light:border-slate-300 bg-[#0a0a0b] light:bg-slate-50 transition-all duration-300',
+        'fixed inset-y-0 left-0 z-40 lg:relative',
+        'transform lg:transform-none',
+        isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0',
+        isCollapsed ? 'w-64 lg:w-16' : 'w-64'
       ]"
       role="navigation"
       aria-label="Main navigation"
     >
       <!-- Logo (hidden on mobile, shown in header instead) -->
-      <div class="hidden md:flex h-12 items-center justify-between px-3 border-b border-white/[0.08] light:border-gray-200">
+      <div class="hidden h-12 items-center justify-between border-b border-white/[0.08] px-3 light:border-slate-300 lg:flex">
         <RouterLink to="/" class="flex items-center gap-2">
           <ReReplyLogo :compact="isCollapsed" size="sm" tone="light" class="light:hidden" />
           <ReReplyLogo :compact="isCollapsed" size="sm" tone="dark" class="hidden light:inline-flex" />
@@ -196,14 +226,66 @@ const handleLogout = async () => {
         </Button>
       </div>
       <!-- Mobile logo spacer -->
-      <div class="h-12 md:hidden" />
+      <div class="h-12 lg:hidden" />
 
       <!-- Organization Switcher (Super Admin only) -->
       <OrganizationSwitcher :collapsed="isCollapsed" />
 
       <!-- Navigation -->
       <ScrollArea class="flex-1 py-2">
-        <nav class="px-2" role="menubar">
+        <div class="px-2 lg:hidden" role="navigation" aria-label="Mobile workspace">
+          <p class="px-2.5 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-white/35 light:text-slate-600">
+            Mobile workspace
+          </p>
+          <div class="space-y-1">
+            <template v-for="item in mobileNavItems" :key="item.path">
+              <RouterLink
+                :to="item.path"
+                :class="[
+                  'nav-active-indicator btn-press flex min-h-11 items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-semibold transition-all duration-200',
+                  item.active
+                    ? 'bg-white/[0.08] text-white light:bg-slate-200 light:text-slate-950'
+                    : 'text-white/55 hover:text-white hover:bg-white/[0.06] light:text-slate-700 light:hover:text-slate-950 light:hover:bg-slate-200/70'
+                ]"
+                data-mobile-primary
+                :data-active="item.active"
+                :aria-current="item.active ? 'page' : undefined"
+                @click="isMobileMenuOpen = false"
+              >
+                <component :is="item.icon" class="h-5 w-5 shrink-0" aria-hidden="true" />
+                <span>{{ $t(item.name) }}</span>
+              </RouterLink>
+
+              <div
+                v-if="item.name === 'nav.analytics' && item.active && item.children && item.children.length > 1"
+                class="ml-5 space-y-1 border-l border-white/[0.08] pl-3 light:border-slate-300"
+                aria-label="Analytics views"
+              >
+                <RouterLink
+                  v-for="child in item.children"
+                  :key="child.path"
+                  :to="child.path"
+                  :class="[
+                    'btn-press flex min-h-11 items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
+                    route.path === child.path
+                      ? 'bg-white/[0.06] text-white light:bg-slate-200/80 light:text-slate-950'
+                      : 'text-white/45 hover:bg-white/[0.04] hover:text-white/80 light:text-slate-600 light:hover:bg-slate-200/60 light:hover:text-slate-900'
+                  ]"
+                  :aria-current="route.path === child.path ? 'page' : undefined"
+                  @click="isMobileMenuOpen = false"
+                >
+                  <component :is="child.icon" class="h-4 w-4 shrink-0" aria-hidden="true" />
+                  <span>{{ $t(child.name) }}</span>
+                </RouterLink>
+              </div>
+            </template>
+          </div>
+          <p class="px-3 pt-4 text-xs leading-5 text-white/35 light:text-slate-600">
+            Advanced workspace tools are available on desktop.
+          </p>
+        </div>
+
+        <nav class="hidden px-2 lg:block" role="menubar">
           <template v-for="(section, sIdx) in mainSections" :key="section.label">
             <!-- Section header -->
             <div
@@ -224,7 +306,7 @@ const handleLogout = async () => {
                     item.active
                       ? 'bg-white/[0.08] text-white light:bg-gray-100 light:text-gray-900'
                       : 'text-white/50 hover:text-white hover:bg-white/[0.06] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-50',
-                    isCollapsed && 'md:justify-center md:px-2'
+                    isCollapsed && 'lg:justify-center lg:px-2'
                   ]"
                   :data-active="item.active"
                   role="menuitem"
@@ -232,7 +314,7 @@ const handleLogout = async () => {
                   @click="isMobileMenuOpen = false"
                 >
                   <component :is="item.icon" class="h-4 w-4 shrink-0" aria-hidden="true" />
-                  <span :class="isCollapsed && 'md:sr-only'">{{ $t(item.name) }}</span>
+                  <span :class="isCollapsed && 'lg:sr-only'">{{ $t(item.name) }}</span>
                 </RouterLink>
 
                 <!-- Submenu items -->
@@ -264,24 +346,24 @@ const handleLogout = async () => {
       <!-- Licensing shortcut follows the billing catalog authorization. -->
       <div
         v-if="canManageWorkspaceLicense"
-        class="border-t border-white/[0.06] px-2 py-2 light:border-gray-200"
+        class="hidden border-t border-white/[0.06] px-2 py-2 light:border-slate-300 lg:block"
       >
         <RouterLink
           :to="workspaceUpgradeRoute"
           title="Upgrade the selected workspace"
           :class="[
             'btn-press flex items-center gap-2.5 rounded-lg border border-amber-300/25 bg-amber-300/[0.09] px-2.5 py-2 text-[13px] font-semibold text-amber-200 transition-all duration-200 hover:bg-amber-300/[0.14] light:text-amber-800',
-            isCollapsed && 'md:justify-center md:px-2'
+            isCollapsed && 'lg:justify-center lg:px-2'
           ]"
           @click="isMobileMenuOpen = false"
         >
           <Zap class="h-4 w-4 shrink-0" aria-hidden="true" />
-          <span :class="isCollapsed && 'md:sr-only'">Upgrade workspace</span>
+          <span :class="isCollapsed && 'lg:sr-only'">Upgrade workspace</span>
         </RouterLink>
       </div>
 
       <!-- Bottom-pinned navigation (Settings) -->
-      <div v-if="bottomSections.length > 0" class="border-t border-white/[0.06] light:border-gray-200 px-2 py-2">
+      <div v-if="bottomSections.length > 0" class="hidden border-t border-white/[0.06] px-2 py-2 light:border-slate-300 lg:block">
         <template v-for="section in bottomSections" :key="section.label">
           <template v-for="item in section.items" :key="item.path">
             <RouterLink
@@ -291,7 +373,7 @@ const handleLogout = async () => {
                 item.active
                   ? 'bg-white/[0.08] text-white light:bg-gray-100 light:text-gray-900'
                   : 'text-white/50 hover:text-white hover:bg-white/[0.06] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-50',
-                isCollapsed && 'md:justify-center md:px-2'
+                isCollapsed && 'lg:justify-center lg:px-2'
               ]"
               :data-active="item.active"
               role="menuitem"
@@ -299,7 +381,7 @@ const handleLogout = async () => {
               @click="isMobileMenuOpen = false"
             >
               <component :is="item.icon" class="h-4 w-4 shrink-0" aria-hidden="true" />
-              <span :class="isCollapsed && 'md:sr-only'">{{ $t(item.name) }}</span>
+              <span :class="isCollapsed && 'lg:sr-only'">{{ $t(item.name) }}</span>
             </RouterLink>
 
             <template v-if="item.children && item.active && !isCollapsed">
@@ -330,7 +412,7 @@ const handleLogout = async () => {
     </aside>
 
     <!-- Main content -->
-    <main id="main-content" class="flex-1 overflow-hidden pt-12 md:pt-0 bg-[#0a0a0b] light:bg-gray-50" role="main">
+    <main id="main-content" class="flex-1 overflow-hidden bg-[#0a0a0b] pt-12 light:bg-slate-100 lg:pt-0" role="main">
       <RouterView v-slot="{ Component, route: viewRoute }">
         <Transition name="page" mode="out-in">
           <component :is="Component" :key="viewRoute.meta.stableKey ? String(viewRoute.name) : viewRoute.path" />

@@ -211,7 +211,7 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="flex h-full flex-col bg-[#08090a] light:bg-[#f6f7f8]">
+  <div class="flex h-full flex-col bg-[#08090a] light:bg-slate-100">
     <PageHeader
       title="Revenue pipeline"
       description="Move every inquiry from first reply to a booked, retained customer."
@@ -222,7 +222,7 @@ onMounted(load)
         <div class="flex items-center gap-2">
           <select
             v-model="selectedPipelineId"
-            class="h-9 rounded-md border border-white/10 bg-white/[0.04] px-3 text-sm text-white outline-none light:border-gray-200 light:bg-white light:text-gray-900"
+            class="h-9 rounded-md border border-white/10 bg-white/[0.04] px-3 text-sm text-white outline-none light:border-slate-400 light:bg-slate-50 light:text-slate-950"
             @change="changePipeline"
           >
             <option v-for="pipeline in pipelines" :key="pipeline.id" :value="pipeline.id">
@@ -245,22 +245,22 @@ onMounted(load)
     </div>
 
     <div v-else class="flex min-h-0 flex-1 flex-col">
-      <div class="grid grid-cols-2 gap-px border-b border-white/[0.08] bg-white/[0.08] light:border-gray-200 light:bg-gray-200 md:grid-cols-4">
-        <div class="bg-[#0d0f10] px-5 py-3 light:bg-white">
-          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-gray-500">Open leads</p>
-          <p class="mt-1 text-xl font-semibold text-white light:text-gray-900">{{ openLeadCount }}</p>
+      <div class="grid grid-cols-2 gap-px border-b border-white/[0.08] bg-white/[0.08] light:border-slate-300 light:bg-slate-300 md:grid-cols-4">
+        <div class="bg-[#0d0f10] px-5 py-3 light:bg-slate-50">
+          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-slate-600">Open leads</p>
+          <p class="mt-1 text-xl font-semibold text-white light:text-slate-950">{{ openLeadCount }}</p>
         </div>
-        <div class="bg-[#0d0f10] px-5 py-3 light:bg-white">
-          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-gray-500">Pipeline value</p>
-          <p class="mt-1 text-base font-semibold text-white light:text-gray-900">{{ formatMoneyTotals(openValues) }}</p>
+        <div class="bg-[#0d0f10] px-5 py-3 light:bg-slate-50">
+          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-slate-600">Pipeline value</p>
+          <p class="mt-1 text-base font-semibold text-white light:text-slate-950">{{ formatMoneyTotals(openValues) }}</p>
         </div>
-        <div class="bg-[#0d0f10] px-5 py-3 light:bg-white">
-          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-gray-500">Open follow-ups</p>
-          <p class="mt-1 text-xl font-semibold text-white light:text-gray-900">{{ tasks.filter((task) => task.status !== 'completed').length }}</p>
+        <div class="bg-[#0d0f10] px-5 py-3 light:bg-slate-50">
+          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-slate-600">Open follow-ups</p>
+          <p class="mt-1 text-xl font-semibold text-white light:text-slate-950">{{ tasks.filter((task) => task.status !== 'completed').length }}</p>
         </div>
-        <div class="bg-[#0d0f10] px-5 py-3 light:bg-white">
-          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-gray-500">Overdue</p>
-          <p class="mt-1 text-xl font-semibold" :class="overdueTasks.length ? 'text-amber-300' : 'text-emerald-300'">
+        <div class="bg-[#0d0f10] px-5 py-3 light:bg-slate-50">
+          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-slate-600">Overdue</p>
+          <p class="mt-1 text-xl font-semibold" :class="overdueTasks.length ? 'text-amber-300 light:text-amber-700' : 'text-emerald-300 light:text-emerald-700'">
             {{ overdueTasks.length }}
           </p>
         </div>
@@ -275,7 +275,7 @@ onMounted(load)
         <Input v-model="newLead.value" type="number" min="0" step="0.01" placeholder="Value" />
         <select
           v-model="newLead.currency"
-          class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
+          class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-3 text-sm text-white light:border-slate-400 light:bg-slate-50 light:text-slate-950"
         >
           <option value="MYR">MYR</option>
           <option value="SGD">SGD</option>
@@ -293,17 +293,17 @@ onMounted(load)
             <section
               v-for="column in columns"
               :key="column.id"
-              class="flex w-[296px] shrink-0 flex-col overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.02] light:border-gray-200 light:bg-white"
+              class="flex w-[296px] shrink-0 flex-col overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.02] light:border-slate-300 light:bg-slate-50"
             >
-              <header class="border-b border-white/[0.07] px-4 py-3 light:border-gray-100">
+              <header class="border-b border-white/[0.07] px-4 py-3 light:border-slate-300">
                 <div class="flex items-center justify-between">
                   <div class="flex items-center gap-2">
                     <span class="h-2.5 w-2.5 rounded-full" :style="{ backgroundColor: column.color || '#67e8f9' }" />
-                    <h3 class="text-sm font-semibold text-white light:text-gray-900">{{ column.name }}</h3>
+                    <h3 class="text-sm font-semibold text-white light:text-slate-950">{{ column.name }}</h3>
                   </div>
                   <Badge variant="secondary" class="h-5 min-w-5 justify-center px-1.5 text-[10px]">{{ column.leads.length }}</Badge>
                 </div>
-                <div class="mt-2 flex items-center justify-between text-[11px] text-white/35 light:text-gray-500">
+                <div class="mt-2 flex items-center justify-between text-[11px] text-white/35 light:text-slate-600">
                   <span>{{ column.probability }}% probability</span>
                   <span>{{ formatMoneyTotals(currencyTotals(column.leads)) }}</span>
                 </div>
@@ -321,24 +321,24 @@ onMounted(load)
               >
                 <template #item="{ element: lead }">
                   <article
-                    class="cursor-grab rounded-xl border border-white/[0.07] bg-[#121416] p-3.5 shadow-lg shadow-black/10 transition hover:border-cyan-300/20 active:cursor-grabbing light:border-gray-200 light:bg-gray-50"
+                    class="cursor-grab rounded-xl border border-white/[0.07] bg-[#121416] p-3.5 shadow-lg shadow-black/10 transition hover:border-cyan-300/20 active:cursor-grabbing light:border-slate-300 light:bg-white light:hover:border-cyan-600/40"
                   >
                     <div class="flex items-start gap-2">
-                      <GripVertical class="mt-0.5 h-4 w-4 shrink-0 text-white/20 light:text-gray-300" />
+                      <GripVertical class="mt-0.5 h-4 w-4 shrink-0 text-white/20 light:text-slate-500" />
                       <div class="min-w-0 flex-1">
-                        <p class="line-clamp-2 text-sm font-medium leading-5 text-white light:text-gray-900">{{ lead.title }}</p>
-                        <div class="mt-2 flex items-center gap-1.5 text-[11px] text-white/40 light:text-gray-500">
+                        <p class="line-clamp-2 text-sm font-medium leading-5 text-white light:text-slate-950">{{ lead.title }}</p>
+                        <div class="mt-2 flex items-center gap-1.5 text-[11px] text-white/40 light:text-slate-600">
                           <UserRound class="h-3 w-3" />
                           <span class="truncate">{{ lead.contact?.profile_name || lead.contact?.phone_number || 'Contact' }}</span>
                         </div>
                       </div>
                     </div>
-                    <div class="mt-3 flex items-center justify-between border-t border-white/[0.06] pt-2.5 light:border-gray-200">
-                      <span class="flex items-center gap-1 text-xs font-medium text-emerald-300">
+                    <div class="mt-3 flex items-center justify-between border-t border-white/[0.06] pt-2.5 light:border-slate-300">
+                      <span class="flex items-center gap-1 text-xs font-medium text-emerald-300 light:text-emerald-700">
                         <CircleDollarSign class="h-3.5 w-3.5" />
                         {{ formatMoney(lead.value_minor, lead.currency) }}
                       </span>
-                      <span v-if="lead.next_action_at" class="flex items-center gap-1 text-[10px] text-white/35 light:text-gray-500">
+                      <span v-if="lead.next_action_at" class="flex items-center gap-1 text-[10px] text-white/35 light:text-slate-600">
                         <CalendarClock class="h-3 w-3" />
                         {{ formatDue(lead.next_action_at) }}
                       </span>
@@ -350,37 +350,37 @@ onMounted(load)
           </div>
         </div>
 
-        <aside class="hidden overflow-y-auto border-l border-white/[0.08] bg-[#0b0c0d] p-4 light:border-gray-200 light:bg-white xl:block">
+        <aside class="hidden overflow-y-auto border-l border-white/[0.08] bg-[#0b0c0d] p-4 light:border-slate-300 light:bg-slate-50 xl:block">
           <div class="mb-4 flex items-center justify-between">
             <div>
-              <p class="text-xs font-semibold uppercase tracking-[0.16em] text-white/45 light:text-gray-500">Follow-up rail</p>
-              <h3 class="mt-1 font-semibold text-white light:text-gray-900">What needs attention</h3>
+              <p class="text-xs font-semibold uppercase tracking-[0.16em] text-white/45 light:text-slate-600">Follow-up rail</p>
+              <h3 class="mt-1 font-semibold text-white light:text-slate-950">What needs attention</h3>
             </div>
-            <Filter class="h-4 w-4 text-white/30 light:text-gray-400" />
+            <Filter class="h-4 w-4 text-white/30 light:text-slate-500" />
           </div>
           <div class="space-y-2">
             <article
               v-for="task in tasks.filter((item) => item.status !== 'completed')"
               :key="task.id"
-              class="rounded-xl border border-white/[0.07] bg-white/[0.025] p-3 light:border-gray-200 light:bg-gray-50"
+              class="rounded-xl border border-white/[0.07] bg-white/[0.025] p-3 light:border-slate-300 light:bg-white"
             >
               <div class="flex items-start gap-2">
                 <button
                   v-if="canWriteTasks"
-                  class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-white/15 text-transparent hover:border-emerald-300 hover:text-emerald-300 light:border-gray-300"
+                  class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-white/15 text-transparent hover:border-emerald-300 hover:text-emerald-300 light:border-slate-400 light:hover:border-emerald-700 light:hover:text-emerald-700"
                   title="Complete task"
                   @click="completeTask(task)"
                 >
                   <Check class="h-3 w-3" />
                 </button>
                 <div class="min-w-0">
-                  <p class="text-xs font-medium leading-5 text-white light:text-gray-900">{{ task.title }}</p>
+                  <p class="text-xs font-medium leading-5 text-white light:text-slate-950">{{ task.title }}</p>
                   <p
                     class="mt-1 text-[10px]"
                     :class="
                       task.due_at && new Date(task.due_at).getTime() < Date.now()
-                        ? 'text-amber-300'
-                        : 'text-white/35 light:text-gray-500'
+                        ? 'text-amber-300 light:text-amber-700'
+                        : 'text-white/35 light:text-slate-600'
                     "
                   >
                     {{ formatDue(task.due_at) }}
@@ -389,12 +389,12 @@ onMounted(load)
               </div>
             </article>
             <div v-if="!tasks.some((item) => item.status !== 'completed')" class="rounded-xl bg-emerald-400/[0.06] p-5 text-center">
-              <Check class="mx-auto h-5 w-5 text-emerald-300" />
-              <p class="mt-2 text-xs text-emerald-300">Follow-up queue is clear</p>
+              <Check class="mx-auto h-5 w-5 text-emerald-300 light:text-emerald-700" />
+              <p class="mt-2 text-xs text-emerald-300 light:text-emerald-700">Follow-up queue is clear</p>
             </div>
           </div>
           <RouterLink v-if="canReadTasks" to="/crm/tasks">
-            <Button variant="ghost" class="mt-4 w-full justify-between text-white/55 light:text-gray-600">
+            <Button variant="ghost" class="mt-4 w-full justify-between text-white/55 light:text-slate-700">
               View all tasks
               <ArrowRight class="h-4 w-4" />
             </Button>

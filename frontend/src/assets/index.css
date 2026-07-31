@@ -42,32 +42,32 @@
     --glass-border: rgba(255, 255, 255, 0.06);
   }
 
-  /* Light mode - clean white like Vercel */
+  /* Light mode - a cooler, lower-glare operations canvas */
   .light {
-    --background: 0 0% 98%;
-    --foreground: 0 0% 9%;
-    --card: 0 0% 100%;
-    --card-foreground: 0 0% 9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 0 0% 9%;
+    --background: 214 28% 94%;
+    --foreground: 222 47% 11%;
+    --card: 210 40% 98%;
+    --card-foreground: 222 47% 11%;
+    --popover: 210 40% 98%;
+    --popover-foreground: 222 47% 11%;
     --primary: 70 23% 36%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 0 0% 96%;
-    --secondary-foreground: 0 0% 9%;
-    --muted: 0 0% 96%;
-    --muted-foreground: 0 0% 45%;
-    --accent: 0 0% 96%;
-    --accent-foreground: 0 0% 9%;
+    --secondary: 214 32% 91%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 214 32% 91%;
+    --muted-foreground: 215 25% 35%;
+    --accent: 214 32% 91%;
+    --accent-foreground: 222 47% 11%;
     --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
-    --border: 0 0% 90%;
-    --input: 0 0% 90%;
+    --border: 214 28% 78%;
+    --input: 214 28% 75%;
     --ring: 70 23% 36%;
 
     /* Glass effect utilities for light mode */
-    --glass-bg: rgba(0, 0, 0, 0.02);
-    --glass-bg-hover: rgba(0, 0, 0, 0.04);
-    --glass-border: rgba(0, 0, 0, 0.06);
+    --glass-bg: rgba(15, 23, 42, 0.04);
+    --glass-bg-hover: rgba(15, 23, 42, 0.07);
+    --glass-border: rgba(15, 23, 42, 0.14);
   }
 
   /* Legacy dark class support */

@@ -18,26 +18,27 @@ defineProps<{
   iconGradient?: string
   backLink?: string
   breadcrumbs?: Array<{ label: string; href?: string }>
+  compactActions?: boolean
 }>()
 </script>
 
 <template>
-  <header class="border-b border-white/[0.08] light:border-gray-200 bg-[#0a0a0b]/95 light:bg-white/95 backdrop-blur">
-    <div class="flex h-16 items-center px-6">
+  <header class="shrink-0 border-b border-white/[0.08] light:border-slate-300 bg-[#0a0a0b]/95 light:bg-slate-50/95 backdrop-blur">
+    <div class="flex min-h-16 flex-wrap items-center gap-y-3 px-4 py-3 sm:px-6">
       <RouterLink v-if="backLink" :to="backLink">
-        <Button variant="ghost" size="icon" class="mr-3">
+        <Button variant="ghost" size="icon" class="mr-1 sm:mr-3">
           <ArrowLeft class="h-5 w-5" />
         </Button>
       </RouterLink>
       <div
         v-if="icon"
-        class="h-8 w-8 rounded-lg flex items-center justify-center mr-3 shadow-lg"
+        class="mr-3 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl shadow-lg sm:h-8 sm:w-8 sm:rounded-lg"
         :class="iconGradient || 'bg-gradient-to-br from-blue-500 to-indigo-600 shadow-blue-500/20'"
       >
         <component :is="icon" class="h-4 w-4 text-white" />
       </div>
-      <div class="flex-1">
-        <h1 class="text-xl font-semibold text-white light:text-gray-900">{{ title }}</h1>
+      <div class="min-w-0 flex-1">
+        <h1 class="truncate text-lg font-semibold text-white light:text-slate-950 sm:text-xl">{{ title }}</h1>
         <template v-if="breadcrumbs?.length">
           <Breadcrumb>
             <BreadcrumbList>
@@ -53,11 +54,21 @@ defineProps<{
             </BreadcrumbList>
           </Breadcrumb>
         </template>
-        <p v-else-if="description" class="text-sm text-white/50 light:text-gray-500">
+        <p v-else-if="description" class="mt-0.5 hidden truncate text-sm text-white/50 light:text-slate-600 sm:block">
           {{ description }}
         </p>
       </div>
-      <slot name="actions" />
+      <div
+        v-if="$slots.actions"
+        :class="[
+          'flex min-w-0 flex-wrap items-center gap-2',
+          compactActions
+            ? 'ml-auto w-auto shrink-0'
+            : 'w-full sm:ml-auto sm:w-auto sm:shrink-0',
+        ]"
+      >
+        <slot name="actions" />
+      </div>
     </div>
   </header>
 </template>

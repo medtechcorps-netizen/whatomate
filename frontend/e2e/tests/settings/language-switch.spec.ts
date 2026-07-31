@@ -141,9 +141,13 @@ test.describe('Language Switching', () => {
       await page.locator('[role="option"]').filter({ hasText: 'Español' }).click()
 
       // Sidebar nav items should be in Spanish
-      const sidebar = page.locator('aside')
-      await expect(sidebar.getByText('Panel')).toBeVisible() // Dashboard -> Panel
-      await expect(sidebar.getByText('Configuración')).toBeVisible() // Settings -> Configuración
+      const desktopSidebar = page.locator('aside[aria-label="Main navigation"]')
+      await expect(
+        desktopSidebar.getByRole('menuitem', { name: 'Panel', exact: true }),
+      ).toBeVisible() // Dashboard -> Panel
+      await expect(
+        desktopSidebar.getByRole('menuitem', { name: 'Configuración', exact: true }),
+      ).toBeVisible() // Settings -> Configuración
     })
   })
 })
