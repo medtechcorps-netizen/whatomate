@@ -700,6 +700,13 @@ func SeedSystemRolesForAllOrgs(db *gorm.DB) error {
 		return fmt.Errorf("failed to fix role permissions: %w", err)
 	}
 
+	// Remove the legacy sensitive Settings grants from system manager roles
+	// exactly once per organization. The version marker prevents a later
+	// explicit super-admin grant from being removed on restart.
+	if err := ApplyManagerSettingsPolicyMigration(db); err != nil {
+		return fmt.Errorf("failed to apply manager settings policy: %w", err)
+	}
+
 	// Migrate existing users from old role column to new role_id
 	if err := MigrateExistingUserRoles(db); err != nil {
 		return fmt.Errorf("failed to migrate user roles: %w", err)
@@ -931,6 +938,15 @@ func SeedSystemRolesForOrg(db *gorm.DB, orgID uuid.UUID) error {
 		}
 	}
 
+	// Fresh roles already use the current policy. Mark the organization now so
+	// an explicit grant made later is never mistaken for a legacy default.
+	var organization models.Organization
+	if err := db.Where("id = ?", orgID).First(&organization).Error; err != nil {
+		return fmt.Errorf("failed to load organization for manager settings policy: %w", err)
+	}
+	if err := markManagerSettingsPolicyVersion(db, &organization); err != nil {
+		return fmt.Errorf("failed to mark manager settings policy: %w", err)
+	}
 	return nil
 }
 

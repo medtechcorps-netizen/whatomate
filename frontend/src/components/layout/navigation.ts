@@ -42,6 +42,7 @@ export interface NavItem {
   anyPermissions?: string[]
   childPermissions?: string[]
   entitlement?: string
+  exact?: boolean
   children?: NavItem[]
 }
 
@@ -69,7 +70,7 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: 'nav.sectionMain',
-    permissions: ['onboarding', 'analytics', 'conversations', 'chat'],
+    permissions: ['onboarding', 'analytics', 'conversations', 'chat', 'contacts', 'tags', 'teams'],
     items: [
       {
         name: 'nav.launchpad',
@@ -96,6 +97,24 @@ export const navigationSections: NavSection[] = [
         path: '/chat',
         icon: MessageSquare,
         permission: 'chat'
+      },
+      {
+        name: 'nav.contacts',
+        path: '/settings/contacts',
+        icon: Contact,
+        permission: 'contacts'
+      },
+      {
+        name: 'nav.tags',
+        path: '/settings/tags',
+        icon: Tags,
+        permission: 'tags'
+      },
+      {
+        name: 'nav.teams',
+        path: '/settings/teams',
+        icon: Users,
+        permission: 'teams'
       },
     ]
   },
@@ -159,8 +178,14 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: 'nav.sectionMessaging',
-    permissions: ['settings.chatbot', 'chatbot.keywords', 'flows.chatbot', 'chatbot.ai', 'transfers', 'campaigns', 'templates', 'flows.whatsapp'],
+    permissions: ['accounts', 'settings.chatbot', 'chatbot.keywords', 'flows.chatbot', 'chatbot.ai', 'transfers', 'campaigns', 'templates', 'flows.whatsapp', 'canned_responses'],
     items: [
+      {
+        name: 'nav.accounts',
+        path: '/settings/accounts',
+        icon: Users,
+        permission: 'accounts'
+      },
       {
         name: 'nav.chatbot',
         path: '/chatbot',
@@ -186,6 +211,12 @@ export const navigationSections: NavSection[] = [
         path: '/templates',
         icon: FileText,
         permission: 'templates'
+      },
+      {
+        name: 'nav.cannedResponses',
+        path: '/settings/canned-responses',
+        icon: MessageSquareText,
+        permission: 'canned_responses'
       },
       {
         name: 'nav.flows',
@@ -224,7 +255,7 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: '',
-    permissions: ['settings.general', 'settings.chatbot', 'accounts', 'contacts', 'canned_responses', 'tags', 'teams', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
+    permissions: ['settings.general', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
     pinBottom: true,
     items: [
       {
@@ -232,15 +263,10 @@ export const navigationSections: NavSection[] = [
         path: '/settings',
         icon: Settings,
         permission: 'settings.general',
-        childPermissions: ['settings.general', 'settings.chatbot', 'accounts', 'contacts', 'canned_responses', 'tags', 'teams', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
+        childPermissions: ['settings.general', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
+        exact: true,
         children: [
-          { name: 'nav.general', path: '/settings', icon: Settings, permission: 'settings.general' },
-          { name: 'nav.chatbot', path: '/settings/chatbot', icon: Bot, permission: 'settings.chatbot' },
-          { name: 'nav.accounts', path: '/settings/accounts', icon: Users, permission: 'accounts' },
-          { name: 'nav.contacts', path: '/settings/contacts', icon: Contact, permission: 'contacts' },
-          { name: 'nav.cannedResponses', path: '/settings/canned-responses', icon: MessageSquareText, permission: 'canned_responses' },
-          { name: 'nav.tags', path: '/settings/tags', icon: Tags, permission: 'tags' },
-          { name: 'nav.teams', path: '/settings/teams', icon: Users, permission: 'teams' },
+          { name: 'nav.general', path: '/settings', icon: Settings, permission: 'settings.general', exact: true },
           { name: 'nav.users', path: '/settings/users', icon: Users, permission: 'users' },
           { name: 'nav.roles', path: '/settings/roles', icon: Shield, permission: 'roles' },
           { name: 'nav.apiKeys', path: '/settings/api-keys', icon: Key, permission: 'api_keys' },

@@ -70,6 +70,63 @@ func TestApp_ListAuditLogs_Success(t *testing.T) {
 	assert.Equal(t, models.AuditActionDeleted, resp.Data.AuditLogs[0].Action)
 }
 
+func TestApp_AuditLogs_RedactAIProviderMetadata(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := auditLogsRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	log := makeAuditLog(
+		t,
+		app.DB,
+		org.ID,
+		user.ID,
+		org.ID,
+		models.ResourceSettingsChatbotAI,
+		models.AuditActionUpdated,
+		time.Now(),
+	)
+	log.Changes = models.JSONBArray{
+		map[string]any{
+			"field":     "ai_provider",
+			"old_value": nil,
+			"new_value": "qwen",
+		},
+		map[string]any{
+			"field":     "ai_model",
+			"old_value": nil,
+			"new_value": "qwen3.7-plus",
+		},
+		map[string]any{
+			"field":     "ai_enabled",
+			"old_value": false,
+			"new_value": true,
+		},
+	}
+	require.NoError(t, app.DB.Model(log).Update("changes", log.Changes).Error)
+
+	listReq := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(listReq, org.ID, user.ID)
+	testutil.SetQueryParam(listReq, "resource_type", models.ResourceSettingsChatbotAI)
+	require.NoError(t, app.ListAuditLogs(listReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(listReq))
+	listBody := string(testutil.GetResponseBody(listReq))
+	assert.NotContains(t, listBody, "qwen")
+	assert.NotContains(t, listBody, "ai_provider")
+	assert.NotContains(t, listBody, "ai_model")
+	assert.Contains(t, listBody, "ai_enabled")
+
+	getReq := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(getReq, org.ID, user.ID)
+	testutil.SetPathParam(getReq, "id", log.ID.String())
+	require.NoError(t, app.GetAuditLog(getReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(getReq))
+	getBody := string(testutil.GetResponseBody(getReq))
+	assert.NotContains(t, getBody, "qwen")
+	assert.NotContains(t, getBody, "ai_provider")
+	assert.NotContains(t, getBody, "ai_model")
+	assert.Contains(t, getBody, "ai_enabled")
+}
+
 func TestApp_ListAuditLogs_FilterByResourceType(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)

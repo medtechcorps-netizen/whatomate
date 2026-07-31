@@ -321,6 +321,26 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	// Check if phone masking is enabled
 	shouldMask := a.ShouldMaskPhoneNumbers(orgID)
 
+	// Queue pickup is an operational policy that transfer readers need in order
+	// to render the correct agent controls. Expose only this non-sensitive flag
+	// instead of requiring access to the full chatbot settings response.
+	//
+	// Preserve the historical behaviour for organizations that have not yet
+	// created chatbot settings (or if the settings store is temporarily
+	// unavailable): queue pickup remains enabled by default.
+	allowAgentQueuePickup := true
+	if settings, settingsErr := a.getChatbotSettingsCached(orgID, ""); settingsErr == nil && settings != nil {
+		allowAgentQueuePickup = settings.AgentAssignment.AllowQueuePickup
+	} else if settingsErr != nil && !errors.Is(settingsErr, gorm.ErrRecordNotFound) {
+		a.Log.Error(
+			"Failed to load chatbot settings for transfer queue policy",
+			"error",
+			settingsErr,
+			"org_id",
+			orgID,
+		)
+	}
+
 	// Build response from flat joined rows
 	response := make([]AgentTransferResponse, len(transfers))
 	for i, t := range transfers {
@@ -409,12 +429,13 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	}
 
 	return r.SendEnvelope(map[string]any{
-		"transfers":           response,
-		"general_queue_count": generalQueueCount,
-		"team_queue_counts":   teamCounts,
-		"total_count":         totalCount,
-		"limit":               limit,
-		"offset":              offset,
+		"transfers":                response,
+		"general_queue_count":      generalQueueCount,
+		"team_queue_counts":        teamCounts,
+		"total_count":              totalCount,
+		"limit":                    limit,
+		"offset":                   offset,
+		"allow_agent_queue_pickup": allowAgentQueuePickup,
 	})
 }
 

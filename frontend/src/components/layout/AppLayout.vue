@@ -77,11 +77,16 @@ function filterItems(items: NavSection['items']) {
       }
 
       const originalPath = item.path
+      const matchesPath = (path: string, exact = false) =>
+        route.path === path || (!exact && route.path.startsWith(`${path}/`))
+      const childIsActive = filteredChildren?.some(child =>
+        matchesPath(child.path, child.exact)
+      ) ?? false
       const isActive = originalPath === '/'
         ? route.name === 'dashboard'
         : originalPath === '/chat'
           ? route.name === 'chat' || route.name === 'chat-conversation'
-          : route.path.startsWith(originalPath)
+          : childIsActive || matchesPath(originalPath, item.exact)
 
       return {
         ...item,

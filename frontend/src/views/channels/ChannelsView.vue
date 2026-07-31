@@ -1264,10 +1264,10 @@ onBeforeUnmount(() => {
             <span>
               <span class="flex items-center gap-1.5 text-xs font-medium text-white/70 light:text-gray-700">
                 <Bot class="h-3.5 w-3.5 text-sky-300" />
-                Automatic Qwen replies
+                Automatic AI replies
               </span>
               <span class="mt-1 block text-[10px] leading-4 text-white/35 light:text-gray-500">
-                Explicit opt-in. Requires an active tested connection, outbound approval, and an enabled Qwen profile.
+                Explicit opt-in. Requires an active tested connection, outbound approval, and an enabled ReReply AI profile.
                 Human replies pause AI for that conversation.
               </span>
             </span>

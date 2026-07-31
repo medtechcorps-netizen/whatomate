@@ -115,6 +115,55 @@ func TestApp_ListAgentTransfers_Success(t *testing.T) {
 	assert.Equal(t, models.TransferStatusActive, result.Data.Transfers[0].Status)
 }
 
+func TestApp_ListAgentTransfers_QueuePickupPolicy(t *testing.T) {
+	t.Run("exposes disabled policy without chatbot settings access", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		agent := createTestAgent(t, app, org.ID)
+
+		settings := &models.ChatbotSettings{OrganizationID: org.ID}
+		require.NoError(t, app.DB.Create(settings).Error)
+		require.NoError(t, app.DB.Model(&models.ChatbotSettings{}).
+			Where("id = ?", settings.ID).
+			Update("allow_agent_queue_pickup", false).Error)
+		app.InvalidateChatbotSettingsCache(org.ID)
+
+		req := testutil.NewGETRequest(t)
+		testutil.SetAuthContext(req, org.ID, agent.ID)
+
+		require.NoError(t, app.ListAgentTransfers(req))
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+		var result struct {
+			Data struct {
+				AllowAgentQueuePickup bool `json:"allow_agent_queue_pickup"`
+			} `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &result))
+		assert.False(t, result.Data.AllowAgentQueuePickup)
+	})
+
+	t.Run("defaults enabled when settings are missing", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		agent := createTestAgent(t, app, org.ID)
+
+		req := testutil.NewGETRequest(t)
+		testutil.SetAuthContext(req, org.ID, agent.ID)
+
+		require.NoError(t, app.ListAgentTransfers(req))
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+		var result struct {
+			Data struct {
+				AllowAgentQueuePickup bool `json:"allow_agent_queue_pickup"`
+			} `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &result))
+		assert.True(t, result.Data.AllowAgentQueuePickup)
+	})
+}
+
 func TestApp_ListAgentTransfers_RequiresReadPermission(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)

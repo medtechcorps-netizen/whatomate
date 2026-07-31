@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -13,6 +14,25 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestCopilotRunResponseDoesNotExposeProviderModel(t *testing.T) {
+	t.Parallel()
+
+	run := &models.CopilotRun{
+		BaseModel:     models.BaseModel{ID: uuid.New(), CreatedAt: time.Now()},
+		ContactID:     uuid.New(),
+		RequestedByID: uuid.New(),
+		TaskType:      models.CopilotTaskTypeReply,
+		Status:        models.CopilotRunStatusCompleted,
+		Model:         "qwen3.7-plus",
+		ResultData:    models.JSONB{},
+	}
+
+	payload, err := json.Marshal(copilotRunToResponse(run))
+	require.NoError(t, err)
+	assert.NotContains(t, string(payload), `"model"`)
+	assert.NotContains(t, strings.ToLower(string(payload)), "qwen")
+}
 
 func TestParseCopilotTaskIsAllowlisted(t *testing.T) {
 	t.Parallel()

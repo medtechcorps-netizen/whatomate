@@ -255,17 +255,20 @@ test.describe('AI Tab', () => {
     if (state === 'unchecked') {
       await toggle.click()
     }
-    await expect(page.locator('label').filter({ hasText: /^AI Provider$/ })).toBeVisible()
-    await expect(page.locator('label').filter({ hasText: /^Model$/ })).toBeVisible()
+    await expect(page.getByText('ReReply AI', { exact: true })).toBeVisible()
+    await expect(page.getByText(/securely managed by ReReply/i)).toBeVisible()
   })
 
-  test('should have API key field', async ({ page }) => {
+  test('should keep provider credentials out of customer settings', async ({ page }) => {
     const toggle = page.locator('button[role="switch"]').first()
     const state = await toggle.getAttribute('data-state')
     if (state === 'unchecked') {
       await toggle.click()
     }
-    await expect(page.locator('label').filter({ hasText: /^API Key$/ })).toBeVisible()
+    await expect(page.locator('label').filter({ hasText: /^AI Provider$/ })).toHaveCount(0)
+    await expect(page.locator('label').filter({ hasText: /^Model$/ })).toHaveCount(0)
+    await expect(page.locator('label').filter({ hasText: /^API Key$/ })).toHaveCount(0)
+    await expect(page.getByText(/Qwen|Alibaba Cloud/i)).toHaveCount(0)
   })
 
   test('should have system prompt field', async ({ page }) => {
@@ -277,17 +280,14 @@ test.describe('AI Tab', () => {
     await expect(page.getByText('System Prompt')).toBeVisible()
   })
 
-  test('should show the Qwen AI provider', async ({ page }) => {
+  test('should use provider-neutral AI branding', async ({ page }) => {
     const toggle = page.locator('button[role="switch"]').first()
     const state = await toggle.getAttribute('data-state')
     if (state === 'unchecked') {
       await toggle.click()
     }
-    await page.locator('button[role="combobox"]').first().click()
-    await expect(page.locator('[role="option"]').filter({ hasText: 'Qwen (Alibaba Cloud)' })).toBeVisible()
-    await expect(page.locator('[role="option"]').filter({ hasText: 'OpenAI' })).toHaveCount(0)
-    await expect(page.locator('[role="option"]').filter({ hasText: 'Anthropic' })).toHaveCount(0)
-    await page.keyboard.press('Escape')
+    await expect(page.getByText('ReReply AI', { exact: true })).toBeVisible()
+    await expect(page.getByText(/Qwen|Alibaba Cloud/i)).toHaveCount(0)
   })
 
   test('should save AI settings', async () => {

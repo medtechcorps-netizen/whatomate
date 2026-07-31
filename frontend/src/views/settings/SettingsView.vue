@@ -28,7 +28,12 @@ const orgID = computed(
   () => localStorage.getItem('selected_organization_id') || authStore.organizationId,
 )
 const userID = computed(() => authStore.user?.id || '')
+const canWriteGeneral = computed(() => authStore.hasPermission('settings.general', 'write'))
+const canReadCalling = computed(() => authStore.hasPermission('settings.calling', 'read'))
+const canWriteCalling = computed(() => authStore.hasPermission('settings.calling', 'write'))
 const canWriteAccounts = computed(() => authStore.hasPermission('accounts', 'write'))
+const canManageMetaApp = computed(() => canWriteGeneral.value && canWriteAccounts.value)
+const canReadAuditLogs = computed(() => authStore.hasPermission('audit_logs', 'read'))
 
 const isSubmitting = ref(false)
 const isLoading = ref(true)
@@ -127,6 +132,7 @@ onMounted(async () => {
 })
 
 async function saveGeneralSettings() {
+  if (!canWriteGeneral.value) return
   isSubmitting.value = true
   try {
     await organizationService.updateSettings({
@@ -145,6 +151,7 @@ async function saveGeneralSettings() {
 }
 
 async function refreshMetaAppSecretStatus() {
+  if (!canManageMetaApp.value) return
   generalSettings.value.meta_app_secret = ''
   const orgResponse = await organizationService.getSettings()
   const orgData = orgResponse.data.data || orgResponse.data
@@ -156,6 +163,7 @@ async function refreshMetaAppSecretStatus() {
 }
 
 async function saveMetaAppCredentials() {
+  if (!canManageMetaApp.value) return
   isSubmitting.value = true
   try {
     const payload: {
@@ -181,6 +189,7 @@ async function saveMetaAppCredentials() {
 }
 
 async function clearMetaAppSecret() {
+  if (!canManageMetaApp.value) return
   isSubmitting.value = true
   try {
     await organizationService.updateSettings({ clear_meta_app_secret: true })
@@ -212,6 +221,7 @@ async function saveNotificationSettings() {
 }
 
 async function saveCallingSettings() {
+  if (!canWriteCalling.value) return
   isSubmitting.value = true
   try {
     await organizationService.updateSettings({
@@ -229,6 +239,7 @@ async function saveCallingSettings() {
 }
 
 async function uploadAudio(type: 'hold_music' | 'ringback', event: Event) {
+  if (!canWriteCalling.value) return
   const input = event.target as HTMLInputElement
   const file = input?.files?.[0]
   if (!file) return
@@ -281,7 +292,10 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
     <ScrollArea class="flex-1">
       <div class="p-6 space-y-4 max-w-4xl mx-auto">
         <Tabs default-value="general" class="w-full">
-          <TabsList class="grid w-full grid-cols-3 mb-6 bg-white/[0.04] border border-white/[0.08] light:bg-gray-100 light:border-gray-200">
+          <TabsList
+            class="grid w-full mb-6 bg-white/[0.04] border border-white/[0.08] light:bg-gray-100 light:border-gray-200"
+            :class="canReadCalling ? 'grid-cols-3' : 'grid-cols-2'"
+          >
             <TabsTrigger value="general" class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500">
               <Settings class="h-4 w-4 mr-2" />
               {{ $t('settings.general') }}
@@ -290,7 +304,7 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
               <Bell class="h-4 w-4 mr-2" />
               {{ $t('settings.notifications') }}
             </TabsTrigger>
-            <TabsTrigger value="calling" class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500">
+            <TabsTrigger v-if="canReadCalling" value="calling" class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500">
               <Phone class="h-4 w-4 mr-2" />
               {{ $t('settings.calling') }}
             </TabsTrigger>
@@ -310,12 +324,13 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                     id="org_name"
                     v-model="generalSettings.organization_name"
                     :placeholder="$t('settings.organizationPlaceholder')"
+                    :readonly="!canWriteGeneral"
                   />
                 </div>
                 <div class="grid grid-cols-2 gap-4">
                   <div class="space-y-2">
                     <Label for="timezone" class="text-white/70 light:text-gray-700">{{ $t('settings.defaultTimezone') }}</Label>
-                    <Select v-model="generalSettings.default_timezone">
+                    <Select v-model="generalSettings.default_timezone" :disabled="!canWriteGeneral">
                       <SelectTrigger class="bg-white/[0.04] border-white/[0.1] text-white/70 light:bg-white light:border-gray-200 light:text-gray-700">
                         <SelectValue :placeholder="$t('settings.selectTimezone')" />
                       </SelectTrigger>
@@ -330,7 +345,7 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                   </div>
                   <div class="space-y-2">
                     <Label for="date_format" class="text-white/70 light:text-gray-700">{{ $t('settings.dateFormat') }}</Label>
-                    <Select v-model="generalSettings.date_format">
+                    <Select v-model="generalSettings.date_format" :disabled="!canWriteGeneral">
                       <SelectTrigger class="bg-white/[0.04] border-white/[0.1] text-white/70 light:bg-white light:border-gray-200 light:text-gray-700">
                         <SelectValue :placeholder="$t('settings.selectFormat')" />
                       </SelectTrigger>
@@ -358,11 +373,15 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                   </div>
                   <Switch
                     :checked="generalSettings.mask_phone_numbers"
+                    :disabled="!canWriteGeneral"
                     @update:checked="generalSettings.mask_phone_numbers = $event"
                   />
                 </div>
                 <div class="flex justify-end">
-                  <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveGeneralSettings" :disabled="isSubmitting">
+                  <p v-if="!canWriteGeneral" class="text-xs text-white/40 light:text-gray-500">
+                    Workspace details are read-only for your role.
+                  </p>
+                  <Button v-else variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveGeneralSettings" :disabled="isSubmitting">
                     <Loader2 v-if="isSubmitting" class="mr-2 h-4 w-4 animate-spin" />
                     {{ $t('settings.save') }}
                   </Button>
@@ -370,8 +389,8 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
               </div>
             </div>
 
-            <!-- Meta App Credentials Card (Gated on canWriteAccounts) -->
-            <div v-if="canWriteAccounts" class="mt-6 rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200">
+            <!-- Shared Meta application credentials are admin-only workspace settings. -->
+            <div v-if="canManageMetaApp" class="mt-6 rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200">
               <div class="p-6 pb-3">
                 <h3 class="text-lg font-semibold text-white light:text-gray-900">{{ $t('settings.metaAppCredentials') }}</h3>
                 <p class="text-sm text-white/40 light:text-gray-500">{{ $t('settings.metaAppCredentialsDesc') }}</p>
@@ -427,7 +446,7 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                 </div>
               </div>
             </div>
-            <div v-if="orgID" class="mt-4">
+            <div v-if="orgID && canReadAuditLogs" class="mt-4">
               <AuditLogPanel :key="generalLogKey" resource-type="settings.general" :resource-id="orgID" />
             </div>
           </TabsContent>
@@ -480,13 +499,13 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                 </div>
               </div>
             </div>
-            <div v-if="userID" class="mt-4">
+            <div v-if="userID && canReadAuditLogs" class="mt-4">
               <AuditLogPanel :key="notificationLogKey" resource-type="settings.notification" :resource-id="userID" />
             </div>
           </TabsContent>
 
           <!-- Calling Settings Tab -->
-          <TabsContent value="calling">
+          <TabsContent v-if="canReadCalling" value="calling">
             <div class="rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200">
               <div class="p-6 pb-3">
                 <h3 class="text-lg font-semibold text-white light:text-gray-900">{{ $t('settings.callingSettings') }}</h3>
@@ -500,11 +519,12 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                   </div>
                   <Switch
                     :checked="callingSettings.calling_enabled"
+                    :disabled="!canWriteCalling"
                     @update:checked="callingSettings.calling_enabled = $event"
                   />
                 </div>
                 <Separator class="bg-white/[0.08] light:bg-gray-200" />
-                <div class="grid grid-cols-2 gap-4" :class="{ 'opacity-50 pointer-events-none': !callingSettings.calling_enabled }">
+                <div class="grid grid-cols-2 gap-4" :class="{ 'opacity-50 pointer-events-none': !callingSettings.calling_enabled || !canWriteCalling }">
                   <div class="space-y-2">
                     <Label for="max_call_duration" class="text-white/70 light:text-gray-700">{{ $t('settings.maxCallDuration') }}</Label>
                     <Input
@@ -513,6 +533,7 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                       v-model.number="callingSettings.max_call_duration"
                       :min="60"
                       :max="3600"
+                      :disabled="!canWriteCalling"
                     />
                     <p class="text-xs text-white/40 light:text-gray-500">{{ $t('settings.maxCallDurationDesc') }}</p>
                   </div>
@@ -524,13 +545,14 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                       v-model.number="callingSettings.transfer_timeout_secs"
                       :min="30"
                       :max="600"
+                      :disabled="!canWriteCalling"
                     />
                     <p class="text-xs text-white/40 light:text-gray-500">{{ $t('settings.transferTimeoutDesc') }}</p>
                   </div>
                 </div>
                 <Separator class="bg-white/[0.08] light:bg-gray-200" />
                 <!-- Hold Music Upload -->
-                <div class="space-y-3" :class="{ 'opacity-50 pointer-events-none': !callingSettings.calling_enabled }">
+                <div class="space-y-3" :class="{ 'opacity-50 pointer-events-none': !callingSettings.calling_enabled || !canWriteCalling }">
                   <div>
                     <Label class="text-white/70 light:text-gray-700 flex items-center gap-2">
                       <Music class="h-4 w-4" />
@@ -554,8 +576,8 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                     </Button>
                   </div>
                   <div class="flex items-center gap-2">
-                    <input ref="holdMusicInput" type="file" accept=".ogg,.opus,.mp3,.wav" class="hidden" @change="uploadAudio('hold_music', $event)" />
-                    <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="holdMusicInput?.click()" :disabled="isUploadingHoldMusic">
+                    <input ref="holdMusicInput" type="file" accept=".ogg,.opus,.mp3,.wav" class="hidden" :disabled="!canWriteCalling" @change="uploadAudio('hold_music', $event)" />
+                    <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="holdMusicInput?.click()" :disabled="isUploadingHoldMusic || !canWriteCalling">
                       <Loader2 v-if="isUploadingHoldMusic" class="mr-2 h-4 w-4 animate-spin" />
                       <Upload v-else class="mr-2 h-4 w-4" />
                       {{ $t('settings.uploadAudio') }}
@@ -564,7 +586,7 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                   </div>
                 </div>
                 <!-- Ringback Tone Upload -->
-                <div class="space-y-3" :class="{ 'opacity-50 pointer-events-none': !callingSettings.calling_enabled }">
+                <div class="space-y-3" :class="{ 'opacity-50 pointer-events-none': !callingSettings.calling_enabled || !canWriteCalling }">
                   <div>
                     <Label class="text-white/70 light:text-gray-700 flex items-center gap-2">
                       <Phone class="h-4 w-4" />
@@ -588,8 +610,8 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                     </Button>
                   </div>
                   <div class="flex items-center gap-2">
-                    <input ref="ringbackInput" type="file" accept=".ogg,.opus,.mp3,.wav" class="hidden" @change="uploadAudio('ringback', $event)" />
-                    <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="ringbackInput?.click()" :disabled="isUploadingRingback">
+                    <input ref="ringbackInput" type="file" accept=".ogg,.opus,.mp3,.wav" class="hidden" :disabled="!canWriteCalling" @change="uploadAudio('ringback', $event)" />
+                    <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="ringbackInput?.click()" :disabled="isUploadingRingback || !canWriteCalling">
                       <Loader2 v-if="isUploadingRingback" class="mr-2 h-4 w-4 animate-spin" />
                       <Upload v-else class="mr-2 h-4 w-4" />
                       {{ $t('settings.uploadAudio') }}
@@ -598,14 +620,17 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                   </div>
                 </div>
                 <div class="flex justify-end pt-4">
-                  <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveCallingSettings" :disabled="isSubmitting">
+                  <p v-if="!canWriteCalling" class="text-xs text-white/40 light:text-gray-500">
+                    Calling settings are read-only for your role.
+                  </p>
+                  <Button v-else variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveCallingSettings" :disabled="isSubmitting">
                     <Loader2 v-if="isSubmitting" class="mr-2 h-4 w-4 animate-spin" />
                     {{ $t('settings.save') }}
                   </Button>
                 </div>
               </div>
             </div>
-            <div v-if="orgID" class="mt-4">
+            <div v-if="orgID && canReadAuditLogs" class="mt-4">
               <AuditLogPanel :key="callingLogKey" resource-type="settings.calling" :resource-id="orgID" />
             </div>
           </TabsContent>

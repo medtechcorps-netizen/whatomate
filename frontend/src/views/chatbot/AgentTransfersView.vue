@@ -33,11 +33,6 @@ const teamsStore = useTeamsStore()
 const isLoading = ref(true)
 const error = ref<string | null>(null)
 const isPicking = ref(false)
-// Org-level kill switch surfaced from chatbot settings. The backend rejects
-// pickup with 403 when this is false (PickNextTransfer in agent_transfers.go),
-// so the UI must hide / disable the action to match. Default true mirrors the
-// server default so we don't briefly disable the button while settings load.
-const allowQueuePickup = ref(true)
 const isAssigning = ref(false)
 const isResuming = ref(false)
 const activeTab = ref('my-transfers')
@@ -56,6 +51,12 @@ const selectedTeamFilter = ref<string>('all')
 // own transfer, so it must not switch that agent into the management view.
 const isAdminOrManager = computed(() => authStore.hasPermission('chat.assign', 'write'))
 const currentUserId = computed(() => authStore.user?.id)
+// The transfers response exposes only this operational flag, so agents can
+// respect the queue kill switch without gaining access to chatbot settings.
+// Managers retain the backend's organization-wide management bypass.
+const allowQueuePickup = computed(() =>
+  isAdminOrManager.value || transfersStore.allowQueuePickup
+)
 
 const myTransfers = computed(() =>
   transfersStore.transfers.filter(t =>
@@ -109,7 +110,7 @@ watch(activeTab, async (newTab) => {
 })
 
 onMounted(async () => {
-  await Promise.all([fetchTransfers(), fetchTeams(), fetchAllowQueuePickup()])
+  await Promise.all([fetchTransfers(), fetchTeams()])
   // Always try to fetch agents for admin/manager - the API will reject if unauthorized
   if (isAdminOrManager.value) {
     await fetchAgents()
@@ -117,23 +118,6 @@ onMounted(async () => {
   // No polling - WebSocket handles real-time updates
   // Reconnection refresh handles sync after disconnect
 })
-
-async function fetchAllowQueuePickup() {
-  // Agents without organization-wide transfer management are gated by
-  // allow_agent_queue_pickup; managers bypass the toggle.
-  if (isAdminOrManager.value) return
-  try {
-    const resp = await chatbotService.getSettings()
-    // API returns { data: { settings: {...}, stats: {...} } }.
-    const settings = resp.data?.data?.settings ?? resp.data?.settings
-    if (typeof settings?.allow_agent_queue_pickup === 'boolean') {
-      allowQueuePickup.value = settings.allow_agent_queue_pickup
-    }
-  } catch {
-    // Settings endpoint may be unavailable for some users; fall back to the
-    // server default (true) — backend will still 403 if pickup is disabled.
-  }
-}
 
 async function fetchTransfers() {
   isLoading.value = true

@@ -500,7 +500,6 @@ export interface CopilotRun {
   contact_id?: string
   task_type: 'reply' | 'summary' | 'qualify' | 'extract_actions'
   status: string
-  model: string
   result_text?: string
   structured_result?: Record<string, unknown>
   source_names?: string[]

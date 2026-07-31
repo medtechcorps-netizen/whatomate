@@ -22,6 +22,27 @@ type AuditLogResponse struct {
 	CreatedAt    time.Time          `json:"created_at"`
 }
 
+func auditChangesForResponse(resourceType string, changes models.JSONBArray) models.JSONBArray {
+	if resourceType != models.ResourceSettingsChatbotAI {
+		return changes
+	}
+
+	filtered := make(models.JSONBArray, 0, len(changes))
+	for _, rawChange := range changes {
+		change, ok := rawChange.(map[string]any)
+		if !ok {
+			filtered = append(filtered, rawChange)
+			continue
+		}
+		field, _ := change["field"].(string)
+		if field == "ai_provider" || field == "ai_model" {
+			continue
+		}
+		filtered = append(filtered, rawChange)
+	}
+	return filtered
+}
+
 // ListAuditLogs returns audit logs with optional filters.
 // Supported query params: resource_type, resource_id, user_id, action, from, to, page, limit.
 func (a *App) ListAuditLogs(r *fastglue.Request) error {
@@ -93,7 +114,7 @@ func (a *App) ListAuditLogs(r *fastglue.Request) error {
 			UserID:       l.UserID,
 			UserName:     l.UserName,
 			Action:       l.Action,
-			Changes:      l.Changes,
+			Changes:      auditChangesForResponse(l.ResourceType, l.Changes),
 			CreatedAt:    l.CreatedAt,
 		}
 	}
@@ -125,7 +146,7 @@ func (a *App) GetAuditLog(r *fastglue.Request) error {
 		UserID:       log.UserID,
 		UserName:     log.UserName,
 		Action:       log.Action,
-		Changes:      log.Changes,
+		Changes:      auditChangesForResponse(log.ResourceType, log.Changes),
 		CreatedAt:    log.CreatedAt,
 	})
 }

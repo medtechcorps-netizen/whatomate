@@ -736,15 +736,19 @@ onMounted(load)
               <article
                 v-for="event in eventsForDay(day)"
                 :key="event.id"
+                data-testid="calendar-event-card"
                 role="button"
                 tabindex="0"
-                class="cursor-pointer rounded-xl border p-3 transition hover:-translate-y-0.5"
+                class="cursor-pointer rounded-xl border p-3 transition hover:-translate-y-0.5 light:text-gray-900"
                 :class="serviceTone(event)"
                 @click="selectEvent(event)"
                 @keydown.enter="selectEvent(event)"
               >
                 <div class="flex items-center justify-between gap-2">
-                  <span class="text-[10px] font-semibold uppercase tracking-wider opacity-70">
+                  <span
+                    data-testid="calendar-event-time"
+                    class="text-[10px] font-semibold uppercase tracking-wider opacity-70 light:opacity-100"
+                  >
                     {{ timeLabel(event.starts_at, event.resource?.timezone) }}
                   </span>
                   <Badge variant="outline" class="h-5 border-current/20 px-1.5 text-[9px]">
@@ -752,7 +756,10 @@ onMounted(load)
                   </Badge>
                 </div>
                 <p class="mt-2 text-xs font-semibold leading-5">{{ event.service?.name || 'Scheduled service' }}</p>
-                <div class="mt-2 space-y-1 text-[10px] opacity-65">
+                <div
+                  data-testid="calendar-event-meta"
+                  class="mt-2 space-y-1 text-[10px] opacity-65 light:opacity-100"
+                >
                   <p class="flex items-center gap-1.5">
                     <UsersRound class="h-3 w-3" />
                     {{ event.resource?.name || 'Resource' }}

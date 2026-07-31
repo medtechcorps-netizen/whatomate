@@ -178,7 +178,7 @@ async function generate() {
     runIdempotencyKey.value = crypto.randomUUID()
     await loadRunHistory()
   } catch (error) {
-    toast.error('Qwen could not generate a result', getErrorMessage(error))
+    toast.error('AI Copilot could not generate a result', getErrorMessage(error))
   } finally {
     generating.value = false
   }
@@ -215,7 +215,7 @@ onMounted(() => {
 <template>
   <div class="h-full overflow-y-auto bg-[#070809] light:bg-[#f5f4f1]">
     <PageHeader
-      title="Qwen Copilot"
+      title="AI Copilot"
       description="Human-reviewed drafts, summaries and next actions grounded in the current tenant."
       :icon="Sparkles"
       icon-gradient="bg-gradient-to-br from-emerald-400 to-teal-700 shadow-emerald-500/20"
@@ -368,7 +368,7 @@ onMounted(() => {
                 {{ historyPreview(historicalRun) }}
               </p>
               <p class="mt-1.5 text-[9px] text-white/20 light:text-gray-400">
-                {{ formatHistoryDate(historicalRun.created_at) }} · {{ historicalRun.model }}
+                {{ formatHistoryDate(historicalRun.created_at) }} · AI-assisted
               </p>
             </button>
 
@@ -391,7 +391,7 @@ onMounted(() => {
             <div>
               <h2 class="text-sm font-semibold text-white light:text-gray-900">{{ activeMode.label }}</h2>
               <p class="mt-0.5 text-[11px] text-white/35 light:text-gray-500">
-                {{ run ? `${run.model} · ${run.status}` : 'Waiting for a grounded request' }}
+                {{ run ? `AI-assisted · ${run.status}` : 'Waiting for a grounded request' }}
               </p>
             </div>
           </div>
@@ -424,7 +424,7 @@ onMounted(() => {
               <Sparkles class="h-5 w-5 animate-pulse text-emerald-200" />
             </div>
           </div>
-          <p class="mt-5 text-sm font-medium text-white light:text-gray-900">Qwen is reviewing the authorized context</p>
+          <p class="mt-5 text-sm font-medium text-white light:text-gray-900">AI Copilot is reviewing the authorized context</p>
           <p class="mt-1 text-xs text-white/35 light:text-gray-500">No draft will be sent automatically.</p>
         </div>
 
@@ -458,7 +458,7 @@ onMounted(() => {
           </div>
           <h2 class="mt-5 text-lg font-semibold text-white light:text-gray-900">A quiet place to think before replying</h2>
           <p class="mt-2 max-w-md text-sm leading-6 text-white/40 light:text-gray-500">
-            Select an action and a contact. Qwen will use only records this user is authorized to read and return an editable,
+            Select an action and a contact. AI Copilot will use only records this user is authorized to read and return an editable,
             human-reviewed result.
           </p>
         </div>

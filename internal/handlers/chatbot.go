@@ -17,24 +17,22 @@ import (
 
 // ChatbotSettingsResponse represents the response for chatbot settings
 type ChatbotSettingsResponse struct {
-	Enabled                      bool              `json:"enabled"`
-	GreetingMessage              string            `json:"greeting_message"`
-	GreetingButtons              []map[string]any  `json:"greeting_buttons"`
-	FallbackMessage              string            `json:"fallback_message"`
-	FallbackButtons              []map[string]any  `json:"fallback_buttons"`
-	SessionTimeoutMinutes        int               `json:"session_timeout_minutes"`
-	BusinessHoursEnabled         bool              `json:"business_hours_enabled"`
-	BusinessHours                []map[string]any  `json:"business_hours"`
-	OutOfHoursMessage            string            `json:"out_of_hours_message"`
-	AllowAutomatedOutsideHours   bool              `json:"allow_automated_outside_hours"`
-	AllowAgentQueuePickup        bool              `json:"allow_agent_queue_pickup"`
-	AssignToSameAgent            bool              `json:"assign_to_same_agent"`
-	AgentCurrentConversationOnly bool              `json:"agent_current_conversation_only"`
-	AIEnabled                    bool              `json:"ai_enabled"`
-	AIProvider                   models.AIProvider `json:"ai_provider"`
-	AIModel                      string            `json:"ai_model"`
-	AIMaxTokens                  int               `json:"ai_max_tokens"`
-	AISystemPrompt               string            `json:"ai_system_prompt"`
+	Enabled                      bool             `json:"enabled"`
+	GreetingMessage              string           `json:"greeting_message"`
+	GreetingButtons              []map[string]any `json:"greeting_buttons"`
+	FallbackMessage              string           `json:"fallback_message"`
+	FallbackButtons              []map[string]any `json:"fallback_buttons"`
+	SessionTimeoutMinutes        int              `json:"session_timeout_minutes"`
+	BusinessHoursEnabled         bool             `json:"business_hours_enabled"`
+	BusinessHours                []map[string]any `json:"business_hours"`
+	OutOfHoursMessage            string           `json:"out_of_hours_message"`
+	AllowAutomatedOutsideHours   bool             `json:"allow_automated_outside_hours"`
+	AllowAgentQueuePickup        bool             `json:"allow_agent_queue_pickup"`
+	AssignToSameAgent            bool             `json:"assign_to_same_agent"`
+	AgentCurrentConversationOnly bool             `json:"agent_current_conversation_only"`
+	AIEnabled                    bool             `json:"ai_enabled"`
+	AIMaxTokens                  int              `json:"ai_max_tokens"`
+	AISystemPrompt               string           `json:"ai_system_prompt"`
 	// SLA Settings
 	SLAEnabled             bool     `json:"sla_enabled"`
 	SLAResponseMinutes     int      `json:"sla_response_minutes"`
@@ -109,9 +107,13 @@ type AIContextResponse struct {
 
 // GetChatbotSettings returns chatbot settings and stats
 func (a *App) GetChatbotSettings(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(
+		r,
+		models.ResourceSettingsChatbot,
+		models.ActionRead,
+	)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	// Get or create default settings
@@ -177,8 +179,6 @@ func (a *App) GetChatbotSettings(r *fastglue.Request) error {
 		AgentCurrentConversationOnly: settings.AgentAssignment.CurrentConversationOnly,
 		// AI
 		AIEnabled:      settings.AI.Enabled,
-		AIProvider:     settings.AI.Provider,
-		AIModel:        settings.AI.Model,
 		AIMaxTokens:    settings.AI.MaxTokens,
 		AISystemPrompt: settings.AI.SystemPrompt,
 		// SLA Settings
@@ -197,7 +197,6 @@ func (a *App) GetChatbotSettings(r *fastglue.Request) error {
 		ClientAutoCloseMinutes: settings.ClientInactivity.AutoCloseMinutes,
 		ClientAutoCloseMessage: settings.ClientInactivity.AutoCloseMessage,
 	}
-
 	return r.SendEnvelope(map[string]any{
 		"settings": settingsResp,
 		"stats":    stats,
@@ -263,8 +262,6 @@ func chatbotAISnapshot(s *models.ChatbotSettings) map[string]any {
 	return map[string]any{
 		"enabled":          s.IsEnabled,
 		"ai_enabled":       s.AI.Enabled,
-		"ai_provider":      s.AI.Provider,
-		"ai_model":         s.AI.Model,
 		"ai_max_tokens":    s.AI.MaxTokens,
 		"ai_system_prompt": s.AI.SystemPrompt,
 	}
@@ -442,6 +439,9 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 	aiTouched := req.Enabled != nil || req.AIEnabled != nil ||
 		req.AIProvider != nil || req.AIAPIKey != nil ||
 		req.AIModel != nil || req.AIMaxTokens != nil || req.AISystemPrompt != nil
+	providerConfigurationTouched := req.AIProvider != nil ||
+		req.AIAPIKey != nil ||
+		req.AIModel != nil
 	aiAPIKeyChanged := req.AIAPIKey != nil && *req.AIAPIKey != ""
 	if !a.HasPermission(
 		userID,
@@ -461,6 +461,14 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusForbidden,
 			"Insufficient permissions",
+			nil,
+			"",
+		)
+	}
+	if providerConfigurationTouched && !a.IsSuperAdmin(userID) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusForbidden,
+			"Only a platform owner can manage the AI service configuration",
 			nil,
 			"",
 		)
