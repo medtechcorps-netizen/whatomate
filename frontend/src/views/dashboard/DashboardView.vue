@@ -65,7 +65,8 @@ import {
   Zap,
   Shield,
   LineChart,
-  Tags
+  Tags,
+  AlertTriangle
 } from 'lucide-vue-next'
 // Centralized Chart.js setup (registered once)
 import { Line, Bar, Pie } from '@/lib/charts'
@@ -87,8 +88,14 @@ const canEditWidget = computed(() => authStore.hasPermission('analytics', 'write
 const canDeleteWidget = computed(() => authStore.hasPermission('analytics', 'delete'))
 
 // Widgets state
+type WidgetDataError = {
+  status: number
+  message: string
+}
+
 const widgets = ref<DashboardWidget[]>([])
 const widgetData = ref<Record<string, WidgetData>>({})
+const widgetDataErrors = ref<Record<string, WidgetDataError>>({})
 
 const isLoading = ref(true)
 const isWidgetDataLoading = ref(false)
@@ -527,16 +534,23 @@ const fetchWidgets = async () => {
 }
 
 const fetchWidgetData = async () => {
-  if (widgets.value.length === 0) return
+  if (widgets.value.length === 0) {
+    widgetData.value = {}
+    widgetDataErrors.value = {}
+    return
+  }
 
   isWidgetDataLoading.value = true
   try {
     const { from, to } = dateRange.value
     const response = await widgetsService.getAllData({ from, to })
-    widgetData.value = (response.data as any).data?.data || {}
+    const payload = (response.data as any).data || response.data
+    widgetData.value = payload?.data || {}
+    widgetDataErrors.value = payload?.errors || {}
   } catch (error) {
     console.error('Failed to load widget data:', error)
     widgetData.value = {}
+    widgetDataErrors.value = {}
   } finally {
     isWidgetDataLoading.value = false
   }
@@ -894,16 +908,25 @@ onMounted(() => {
 
               <div class="pt-2">
                 <div class="text-3xl font-bold text-white light:text-gray-900">
-                  <template v-if="isWidgetDataLoading">
-                    <Skeleton class="h-8 w-20 bg-white/[0.08] light:bg-gray-200" />
-                  </template>
-                  <template v-else>
-                    <Transition name="counter-fade" mode="out-in">
-                      <span :key="widgetData[item.i]?.value">{{ formatNumber(widgetData[item.i]?.value || 0) }}</span>
-                    </Transition>
-                  </template>
-                </div>
-                <div v-if="getWidgetById(item.i)!.show_change && widgetData[item.i]" class="flex items-center text-xs text-white/40 light:text-gray-500 mt-1">
+                   <template v-if="isWidgetDataLoading">
+                     <Skeleton class="h-8 w-20 bg-white/[0.08] light:bg-gray-200" />
+                   </template>
+                   <template v-else-if="widgetDataErrors[item.i]">
+                     <div
+                       role="alert"
+                       class="flex items-start gap-2 rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-sm font-normal text-red-200 light:border-red-200 light:bg-red-50 light:text-red-700"
+                     >
+                       <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
+                       <span class="line-clamp-3">{{ widgetDataErrors[item.i]?.message }}</span>
+                     </div>
+                   </template>
+                   <template v-else>
+                     <Transition name="counter-fade" mode="out-in">
+                       <span :key="widgetData[item.i]?.value">{{ formatNumber(widgetData[item.i]?.value ?? 0) }}</span>
+                     </Transition>
+                   </template>
+                 </div>
+                 <div v-if="getWidgetById(item.i)!.show_change && widgetData[item.i] && !widgetDataErrors[item.i]" class="flex items-center text-xs text-white/40 light:text-gray-500 mt-1">
                   <component
                     :is="widgetData[item.i]?.change > 0 ? TrendingUp : widgetData[item.i]?.change < 0 ? TrendingDown : Minus"
                     :class="[
@@ -963,10 +986,19 @@ onMounted(() => {
                 </div>
               </div>
               <div class="flex-1 min-h-0 pt-2">
-                <template v-if="isWidgetDataLoading">
-                  <Skeleton class="h-full w-full bg-white/[0.08] light:bg-gray-200" />
-                </template>
-                <template v-else-if="(widgetData[item.i]?.chart_data?.length || 0) > 0 || (widgetData[item.i]?.data_points?.length || 0) > 0 || (widgetData[item.i]?.grouped_series?.datasets?.length || 0) > 0">
+                 <template v-if="isWidgetDataLoading">
+                   <Skeleton class="h-full w-full bg-white/[0.08] light:bg-gray-200" />
+                 </template>
+                 <template v-else-if="widgetDataErrors[item.i]">
+                   <div
+                     role="alert"
+                     class="flex h-full items-center justify-center rounded-lg border border-red-400/20 bg-red-500/10 px-4 text-center text-sm text-red-200 light:border-red-200 light:bg-red-50 light:text-red-700"
+                   >
+                     <AlertTriangle class="mr-2 h-4 w-4 shrink-0" />
+                     <span class="line-clamp-3">{{ widgetDataErrors[item.i]?.message }}</span>
+                   </div>
+                 </template>
+                 <template v-else-if="(widgetData[item.i]?.chart_data?.length || 0) > 0 || (widgetData[item.i]?.data_points?.length || 0) > 0 || (widgetData[item.i]?.grouped_series?.datasets?.length || 0) > 0">
                   <Line v-if="getWidgetById(item.i)!.chart_type === 'line'" :data="getChartComponentData(getWidgetById(item.i)!)" :options="lineBarChartOptions" />
                   <Bar v-else-if="getWidgetById(item.i)!.chart_type === 'bar'" :data="getChartComponentData(getWidgetById(item.i)!)" :options="lineBarChartOptions" />
                   <Pie v-else-if="getWidgetById(item.i)!.chart_type === 'pie'" :data="getChartComponentData(getWidgetById(item.i)!)" :options="pieChartOptions" />
@@ -1007,11 +1039,20 @@ onMounted(() => {
               </div>
 
               <div class="flex-1 min-h-0 overflow-auto px-6 pb-6">
-                <template v-if="isWidgetDataLoading">
-                  <Skeleton class="h-full w-full bg-white/[0.08] light:bg-gray-200" />
-                </template>
-                <!-- Grouped table (group_by set) -->
-                <template v-else-if="getWidgetById(item.i)!.group_by_field && widgetData[item.i]?.data_points?.length">
+                 <template v-if="isWidgetDataLoading">
+                   <Skeleton class="h-full w-full bg-white/[0.08] light:bg-gray-200" />
+                 </template>
+                 <template v-else-if="widgetDataErrors[item.i]">
+                   <div
+                     role="alert"
+                     class="flex h-full items-center justify-center rounded-lg border border-red-400/20 bg-red-500/10 px-4 text-center text-sm text-red-200 light:border-red-200 light:bg-red-50 light:text-red-700"
+                   >
+                     <AlertTriangle class="mr-2 h-4 w-4 shrink-0" />
+                     <span class="line-clamp-3">{{ widgetDataErrors[item.i]?.message }}</span>
+                   </div>
+                 </template>
+                 <!-- Grouped table (group_by set) -->
+                 <template v-else-if="getWidgetById(item.i)!.group_by_field && widgetData[item.i]?.data_points?.length">
                   <table class="w-full">
                     <thead>
                       <tr class="border-b border-white/[0.08] light:border-gray-200">
@@ -1115,7 +1156,15 @@ onMounted(() => {
               </div>
 
               <div class="flex-1 min-h-0 overflow-y-auto px-6 pb-6">
-                <div :class="['grid gap-3 pt-1', item.w >= 8 ? 'grid-cols-3' : 'grid-cols-2']">
+                <div
+                  v-if="widgetDataErrors[item.i]"
+                  role="alert"
+                  class="flex h-full items-center justify-center rounded-lg border border-red-400/20 bg-red-500/10 px-4 text-center text-sm text-red-200 light:border-red-200 light:bg-red-50 light:text-red-700"
+                >
+                  <AlertTriangle class="mr-2 h-4 w-4 shrink-0" />
+                  <span class="line-clamp-3">{{ widgetDataErrors[item.i]?.message }}</span>
+                </div>
+                <div v-else :class="['grid gap-3 pt-1', item.w >= 8 ? 'grid-cols-3' : 'grid-cols-2']">
                   <template v-for="key in (getWidgetById(item.i)!.config?.shortcuts || [])" :key="key">
                     <RouterLink
                       v-if="SHORTCUT_REGISTRY[key as keyof typeof SHORTCUT_REGISTRY]"

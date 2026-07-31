@@ -84,6 +84,7 @@ type ChatbotFlowResponse struct {
 	Name            string   `json:"name"`
 	Description     string   `json:"description"`
 	TriggerKeywords []string `json:"trigger_keywords"`
+	StepsCount      int      `json:"steps_count"`
 	Enabled         bool     `json:"enabled"`
 	CreatedAt       string   `json:"created_at"`
 }
@@ -972,12 +973,28 @@ func (a *App) ListChatbotFlows(r *fastglue.Request) error {
 			Name:            flow.Name,
 			Description:     flow.Description,
 			TriggerKeywords: flow.TriggerKeywords,
+			StepsCount:      chatbotFlowStepCount(flow.Graph),
 			Enabled:         flow.IsEnabled,
 			CreatedAt:       flow.CreatedAt.Format(time.RFC3339),
 		}
 	}
 
 	return r.SendEnvelope(listEnvelope("flows", response, total, pg))
+}
+
+func chatbotFlowStepCount(raw models.JSONB) int {
+	graph, err := parseChatGraph(raw)
+	if err != nil || graph == nil {
+		return 0
+	}
+
+	count := 0
+	for _, node := range graph.Nodes {
+		if node.Type != ChatNodeStart {
+			count++
+		}
+	}
+	return count
 }
 
 // CreateChatbotFlow creates a new chatbot flow
@@ -1542,6 +1559,42 @@ func (a *App) getChatbotStats(orgID uuid.UUID) ChatbotStatsResponse {
 		Joins("JOIN chatbot_sessions ON chatbot_sessions.id = chatbot_session_messages.session_id").
 		Where("chatbot_sessions.organization_id = ?", orgID).
 		Count(&stats.MessagesHandled)
+
+	// AI responses are stored as session messages and inherit tenancy through
+	// their parent session. Legacy executions used the literal step name,
+	// while v2 graph executions persist the ID of the ai_response node.
+	a.DB.Model(&models.ChatbotSessionMessage{}).
+		Joins("JOIN chatbot_sessions ON chatbot_sessions.id = chatbot_session_messages.session_id").
+		Joins(`
+			LEFT JOIN chatbot_flows
+				ON chatbot_flows.id = chatbot_sessions.current_flow_id
+				AND chatbot_flows.organization_id = chatbot_sessions.organization_id
+				AND chatbot_flows.deleted_at IS NULL
+		`).
+		Where(
+			`
+				chatbot_sessions.organization_id = ?
+				AND chatbot_sessions.deleted_at IS NULL
+				AND (
+					chatbot_session_messages.step_name = ?
+					OR EXISTS (
+						SELECT 1
+						FROM jsonb_array_elements(
+							CASE
+								WHEN jsonb_typeof(chatbot_flows.graph->'nodes') = 'array'
+								THEN chatbot_flows.graph->'nodes'
+								ELSE '[]'::jsonb
+							END
+						) AS node
+						WHERE node->>'type' = 'ai_response'
+							AND node->>'id' = chatbot_session_messages.step_name
+					)
+				)
+			`,
+			orgID,
+			"ai_response",
+		).
+		Count(&stats.AIResponses)
 
 	// Agent transfers
 	a.DB.Model(&models.AgentTransfer{}).

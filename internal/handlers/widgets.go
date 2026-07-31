@@ -983,12 +983,28 @@ func (a *App) GetAllWidgetsData(r *fastglue.Request) error {
 	results := make(map[string]WidgetDataResponse)
 	queryErrors := make(map[string]WidgetDataError)
 	for _, widget := range widgets {
-		if status, message, accessErr := a.widgetSourceAccessStatus(
-			orgID,
-			userID,
-			widget.DataSource,
-			widget.DisplayType,
-		); status != 0 {
+		var (
+			data          WidgetDataResponse
+			accessStatus  int
+			accessMessage string
+			accessErr     error
+		)
+		queryErr := a.withIsolatedWidgetQuery(orgID, func(queryApp *App) error {
+			accessStatus, accessMessage, accessErr = queryApp.widgetSourceAccessStatus(
+				orgID,
+				userID,
+				widget.DataSource,
+				widget.DisplayType,
+			)
+			if accessStatus != 0 {
+				return accessErr
+			}
+
+			var err error
+			data, err = queryApp.executeWidgetQuery(orgID, widget, fromStr, toStr)
+			return err
+		})
+		if accessStatus != 0 {
 			if accessErr != nil {
 				a.Log.Error(
 					"Failed to authorize widget data source",
@@ -998,15 +1014,17 @@ func (a *App) GetAllWidgetsData(r *fastglue.Request) error {
 					widget.ID,
 				)
 			}
-			queryErrors[widget.ID.String()] = WidgetDataError{Status: status, Message: message}
+			queryErrors[widget.ID.String()] = WidgetDataError{
+				Status:  accessStatus,
+				Message: accessMessage,
+			}
 			continue
 		}
-		data, err := a.executeWidgetQuery(orgID, widget, fromStr, toStr)
-		if err != nil {
-			a.Log.Error("Failed to execute widget query", "error", err, "widget_id", widget.ID)
+		if queryErr != nil {
+			a.Log.Error("Failed to execute widget query", "error", queryErr, "widget_id", widget.ID)
 			queryErrors[widget.ID.String()] = WidgetDataError{
 				Status:  fasthttp.StatusBadRequest,
-				Message: err.Error(),
+				Message: queryErr.Error(),
 			}
 			continue
 		}
@@ -1017,6 +1035,22 @@ func (a *App) GetAllWidgetsData(r *fastglue.Request) error {
 	return r.SendEnvelope(map[string]any{
 		"data":   results,
 		"errors": queryErrors,
+	})
+}
+
+// withIsolatedWidgetQuery uses a nested GORM transaction while handling an
+// RLS-scoped request. On PostgreSQL, GORM implements the nested transaction
+// with a savepoint, so a SQL error in one widget can be rolled back without
+// aborting the outer tenant transaction or suppressing later widget results.
+func (a *App) withIsolatedWidgetQuery(
+	orgID uuid.UUID,
+	query func(*App) error,
+) error {
+	if !a.hasTenantScope() {
+		return query(a)
+	}
+	return a.DB.Transaction(func(tx *gorm.DB) error {
+		return query(a.scopedApp(tx, orgID))
 	})
 }
 
@@ -1239,18 +1273,18 @@ var allowedFilterFields = map[string]map[string]string{
 		"status":           "status",
 		"direction":        "direction",
 		"message_type":     "message_type",
-		"whatsapp_account": "whatsapp_account",
+		"whatsapp_account": "whats_app_account",
 	},
 	"contacts": {
 		"assigned_user_id": "assigned_user_id",
-		"whatsapp_account": "whatsapp_account",
+		"whatsapp_account": "whats_app_account",
 		"is_read":          "is_read",
 	},
 	"campaigns": {
 		"status":           "status",
 		"template_name":    "template_name",
 		"created_by_id":    "created_by_id",
-		"whatsapp_account": "whatsapp_account",
+		"whatsapp_account": "whats_app_account",
 	},
 	"transfers": {
 		"status":   "status",
@@ -1303,14 +1337,14 @@ var allowedFilterFields = map[string]map[string]string{
 var allowedGroupByFields = map[string]map[string]string{
 	"messages": {
 		"status": "status", "direction": "direction", "message_type": "message_type",
-		"whatsapp_account": "whatsapp_account",
+		"whatsapp_account": "whats_app_account",
 	},
 	"contacts": {
-		"assigned_user_id": "assigned_user_id", "whatsapp_account": "whatsapp_account", "is_read": "is_read",
+		"assigned_user_id": "assigned_user_id", "whatsapp_account": "whats_app_account", "is_read": "is_read",
 	},
 	"campaigns": {
 		"status": "status", "message_status": "message_status", "template_name": "template_name",
-		"created_by_id": "created_by_id", "whatsapp_account": "whatsapp_account",
+		"created_by_id": "created_by_id", "whatsapp_account": "whats_app_account",
 	},
 	"transfers": {
 		"status": "status", "source": "source", "team_id": "team_id", "agent_id": "agent_id",
