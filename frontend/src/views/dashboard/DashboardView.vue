@@ -69,6 +69,10 @@ import {
 } from 'lucide-vue-next'
 // Centralized Chart.js setup (registered once)
 import { Line, Bar, Pie } from '@/lib/charts'
+import {
+  dashboardLegendLabels,
+  getDashboardSeriesColor,
+} from '@/lib/dashboardCharts'
 import { DateRangePicker } from '@/components/shared'
 import { useDateRange } from '@/composables/useDateRange'
 import { useAppToast } from '@/composables/useAppToast'
@@ -182,6 +186,17 @@ const chartColors = [
   'rgba(234, 179, 8, 0.8)'
 ]
 
+const solidChartColors = [
+  'rgb(59, 130, 246)',
+  'rgb(16, 185, 129)',
+  'rgb(245, 158, 11)',
+  'rgb(139, 92, 246)',
+  'rgb(239, 68, 68)',
+  'rgb(6, 182, 212)',
+  'rgb(236, 72, 153)',
+  'rgb(234, 179, 8)'
+]
+
 const getChartComponentData = (widget: DashboardWidget) => {
   const data = widgetData.value[widget.id]
   if (!data) return { labels: [], datasets: [] }
@@ -194,14 +209,21 @@ const getChartComponentData = (widget: DashboardWidget) => {
   if (widget.chart_type === 'line' && groupedSeries && groupedSeries.datasets.length > 0) {
     return {
       labels: groupedSeries.labels,
-      datasets: groupedSeries.datasets.map((ds, i) => ({
-        label: ds.label,
-        data: ds.data,
-        borderColor: chartColors[i % chartColors.length],
-        backgroundColor: chartColors[i % chartColors.length].replace('0.8)', '0.1)'),
-        fill: false,
-        tension: 0.3
-      }))
+      datasets: groupedSeries.datasets.map((ds, i) => {
+        const seriesColor = getDashboardSeriesColor(ds.label, i, solidChartColors)
+        return {
+          label: ds.label,
+          data: ds.data,
+          borderColor: seriesColor,
+          backgroundColor: seriesColor,
+          pointBackgroundColor: seriesColor,
+          pointBorderColor: seriesColor,
+          pointRadius: 3,
+          pointHoverRadius: 5,
+          fill: false,
+          tension: 0.3
+        }
+      })
     }
   }
 
@@ -250,6 +272,8 @@ const getChartComponentData = (widget: DashboardWidget) => {
       backgroundColor: widget.chart_type === 'bar'
         ? borderColor.replace('rgb', 'rgba').replace(')', ', 0.8)')
         : borderColor.replace('rgb', 'rgba').replace(')', ', 0.1)'),
+      pointBackgroundColor: borderColor,
+      pointBorderColor: borderColor,
       fill: widget.chart_type === 'line',
       tension: 0.3
     }]
@@ -260,7 +284,11 @@ const lineBarChartOptions = {
   responsive: true,
   maintainAspectRatio: false,
   plugins: {
-    legend: { display: true, position: 'top' as const }
+    legend: {
+      display: true,
+      position: 'top' as const,
+      labels: dashboardLegendLabels
+    }
   },
   scales: {
     y: { beginAtZero: true }

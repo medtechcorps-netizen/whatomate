@@ -836,7 +836,7 @@ onMounted(() => void loadWorkspace())
               <div class="flex items-center justify-between gap-3">
                 <div>
                   <Badge variant="outline" class="text-[9px]">{{ copilotLabel(copilotRun.task_type as CopilotAction) }}</Badge>
-                  <p class="mt-1 text-[9px] text-white/30 light:text-gray-400">{{ copilotRun.model }} · review before use</p>
+                  <p class="mt-1 text-[9px] text-white/30 light:text-gray-400">AI-assisted · review before use</p>
                 </div>
                 <Button variant="ghost" size="icon" class="h-11 w-11" aria-label="Copy Copilot result" @click="copyCopilotResult">
                   <Clipboard class="h-4 w-4" />

@@ -355,7 +355,7 @@ func reReplyEntitlementDescription(key string) string {
 	case "commerce.enabled":
 		return "Packages, invoices and payment tracking"
 	case "copilot.enabled":
-		return "Reviewed Qwen AI Copilot workspace"
+		return "Reviewed AI Copilot workspace"
 	case "threads.public_engagement.enabled":
 		return "Threads public replies and mentions beta"
 	default:

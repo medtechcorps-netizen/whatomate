@@ -68,9 +68,13 @@ type OrganizationSettings struct {
 
 // GetOrganizationSettings returns the organization settings
 func (a *App) GetOrganizationSettings(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, userID, err := a.requireAuth(
+		r,
+		models.ResourceSettingsGeneral,
+		models.ActionRead,
+	)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	var org models.Organization
@@ -126,8 +130,35 @@ func (a *App) GetOrganizationSettings(r *fastglue.Request) error {
 		}
 	}
 
+	responseSettings := map[string]any{
+		"mask_phone_numbers": settings.MaskPhoneNumbers,
+		"timezone":           settings.Timezone,
+		"date_format":        settings.DateFormat,
+	}
+	if a.HasPermission(
+		userID,
+		models.ResourceSettingsCalling,
+		models.ActionRead,
+		orgID,
+	) {
+		responseSettings["calling_enabled"] = settings.CallingEnabled
+		responseSettings["max_call_duration"] = settings.MaxCallDuration
+		responseSettings["transfer_timeout_secs"] = settings.TransferTimeoutSecs
+		responseSettings["hold_music_file"] = settings.HoldMusicFile
+		responseSettings["ringback_file"] = settings.RingbackFile
+	}
+	// Meta application credentials are platform-sensitive workspace settings.
+	// Requiring both permissions keeps operational account management available
+	// to managers without exposing the shared application configuration.
+	if a.HasPermission(userID, models.ResourceSettingsGeneral, models.ActionWrite, orgID) &&
+		a.HasPermission(userID, models.ResourceAccounts, models.ActionWrite, orgID) {
+		responseSettings["meta_app_id"] = settings.MetaAppID
+		responseSettings["meta_config_id"] = settings.MetaConfigID
+		responseSettings["has_meta_app_secret"] = settings.HasMetaAppSecret
+	}
+
 	return r.SendEnvelope(map[string]any{
-		"settings": settings,
+		"settings": responseSettings,
 		"name":     org.Name,
 	})
 }
@@ -159,18 +190,46 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid request body", nil, "")
 	}
 
-	var org models.Organization
-	if err := a.DB.Where("id = ?", orgID).First(&org).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
-	}
-
-	// Gating Meta App credentials update on accounts:write permission
+	generalFieldsTouched := req.MaskPhoneNumbers != nil || req.Timezone != nil ||
+		req.DateFormat != nil || req.Name != nil
 	metaAppCredsTouched := req.MetaAppID != nil || req.MetaConfigID != nil ||
 		req.MetaAppSecret != nil || req.ClearMetaAppSecret != nil
+	callingTouched := req.CallingEnabled != nil || req.MaxCallDuration != nil ||
+		req.TransferTimeoutSecs != nil || req.HoldMusicFile != nil ||
+		req.RingbackFile != nil
+
+	if generalFieldsTouched || metaAppCredsTouched {
+		if err := a.requirePermission(
+			r,
+			userID,
+			models.ResourceSettingsGeneral,
+			models.ActionWrite,
+		); err != nil {
+			return nil
+		}
+	}
 	if metaAppCredsTouched {
 		if err := a.requirePermission(r, userID, models.ResourceAccounts, models.ActionWrite); err != nil {
 			return nil
 		}
+	}
+	if callingTouched {
+		if err := a.requirePermission(
+			r,
+			userID,
+			models.ResourceSettingsCalling,
+			models.ActionWrite,
+		); err != nil {
+			return nil
+		}
+	}
+	if !generalFieldsTouched && !metaAppCredsTouched && !callingTouched {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "No settings fields provided", nil, "")
+	}
+
+	var org models.Organization
+	if err := a.DB.Where("id = ?", orgID).First(&org).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
 	}
 
 	// Snapshot before mutation so we can compute per-tab diffs.
@@ -179,7 +238,6 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 
 	// Track which tabs received updates so we only audit the relevant ones.
 	generalTouched := req.MaskPhoneNumbers != nil || req.Timezone != nil || req.DateFormat != nil || (req.Name != nil && *req.Name != "") || metaAppCredsTouched
-	callingTouched := req.CallingEnabled != nil || req.MaxCallDuration != nil || req.TransferTimeoutSecs != nil || req.HoldMusicFile != nil || req.RingbackFile != nil
 
 	// Update settings
 	if org.Settings == nil {
@@ -235,7 +293,7 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update settings", nil, "")
 	}
 
-	if a.CallManager != nil {
+	if callingTouched && a.CallManager != nil {
 		a.CallManager.InvalidateOrgCallingSettingsCache(orgID)
 	}
 

@@ -44,7 +44,6 @@ type copilotRunResponse struct {
 	RequestedByID    uuid.UUID               `json:"requested_by_id"`
 	TaskType         models.CopilotTaskType  `json:"task_type"`
 	Status           models.CopilotRunStatus `json:"status"`
-	Model            string                  `json:"model"`
 	ResultText       string                  `json:"result_text,omitempty"`
 	StructuredResult models.JSONB            `json:"structured_result"`
 	SourceNames      models.StringArray      `json:"source_names"`
@@ -117,7 +116,7 @@ func (a *App) RunContactCopilot(r *fastglue.Request) error {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return r.SendErrorEnvelope(
 				fasthttp.StatusConflict,
-				"Qwen Copilot is not configured for this organization",
+				"AI Copilot is not configured for this organization",
 				nil,
 				"",
 			)
@@ -251,13 +250,13 @@ func (a *App) RunContactCopilot(r *fastglue.Request) error {
 		a.Log.Error("Qwen Copilot request failed", "error", generationErr, "run_id", run.ID)
 		run.Status = models.CopilotRunStatusFailed
 		run.ErrorCode = "provider_error"
-		run.ErrorMessage = "Qwen request failed"
+		run.ErrorMessage = "AI request failed"
 		run.LatencyMS = latencyMS
 		run.Version++
 		if err := a.DB.Save(&run).Error; err != nil {
 			a.Log.Error("Failed to record Copilot error", "error", err, "run_id", run.ID)
 		}
-		return r.SendErrorEnvelope(fasthttp.StatusBadGateway, "Qwen Copilot is temporarily unavailable", nil, "")
+		return r.SendErrorEnvelope(fasthttp.StatusBadGateway, "AI Copilot is temporarily unavailable", nil, "")
 	}
 
 	run.Status = models.CopilotRunStatusCompleted
@@ -602,7 +601,6 @@ func copilotRunToResponse(run *models.CopilotRun) copilotRunResponse {
 		RequestedByID:    run.RequestedByID,
 		TaskType:         run.TaskType,
 		Status:           run.Status,
-		Model:            run.Model,
 		ResultText:       run.ResultText,
 		StructuredResult: result,
 		SourceNames:      run.ContextSourceNames,

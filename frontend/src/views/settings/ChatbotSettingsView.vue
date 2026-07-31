@@ -10,7 +10,6 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 import { PageHeader, AuditLogPanel } from '@/components/shared'
@@ -126,37 +125,14 @@ const removeFallbackButton = (index: number) => {
 // AI Settings
 const aiSettings = ref({
   ai_enabled: false,
-  ai_provider: '',
-  ai_api_key: '',
-  ai_model: '',
   ai_max_tokens: 500,
   ai_system_prompt: ''
 })
 
 const isAIEnabled = ref(false)
 
-const aiProviders = [
-  {
-    value: 'qwen',
-    label: 'Qwen (Alibaba Cloud)',
-    models: ['qwen3.7-plus', 'qwen3.7-max', 'qwen3.6-flash']
-  }
-]
-
-const availableModels = computed(() => {
-  const provider = aiProviders.find(p => p.value === aiSettings.value.ai_provider)
-  return provider?.models || []
-})
-
 watch(isAIEnabled, (newValue) => {
   aiSettings.value.ai_enabled = newValue
-})
-
-watch(() => aiSettings.value.ai_provider, (providerValue) => {
-  const provider = aiProviders.find(p => p.value === providerValue)
-  if (provider && !provider.models.includes(aiSettings.value.ai_model)) {
-    aiSettings.value.ai_model = provider.models[0]
-  }
 })
 
 // SLA Settings
@@ -241,17 +217,8 @@ onMounted(async () => {
 
       const aiEnabledValue = chatbotData.settings.ai_enabled === true
       isAIEnabled.value = aiEnabledValue
-      const loadedProvider = chatbotData.settings.ai_provider
-      const selectedProvider = aiProviders.some((provider) => provider.value === loadedProvider)
-        ? loadedProvider
-        : 'qwen'
-      const selectedProviderModels = aiProviders.find((provider) => provider.value === selectedProvider)?.models || []
-      const loadedModel = chatbotData.settings.ai_model
       aiSettings.value = {
         ai_enabled: aiEnabledValue,
-        ai_provider: selectedProvider,
-        ai_api_key: '',
-        ai_model: selectedProviderModels.includes(loadedModel) ? loadedModel : selectedProviderModels[0],
         ai_max_tokens: chatbotData.settings.ai_max_tokens || 500,
         ai_system_prompt: chatbotData.settings.ai_system_prompt || ''
       }
@@ -353,17 +320,11 @@ async function saveAISettings() {
   try {
     const payload: any = {
       ai_enabled: aiSettings.value.ai_enabled,
-      ai_provider: aiSettings.value.ai_provider,
-      ai_model: aiSettings.value.ai_model,
       ai_max_tokens: aiSettings.value.ai_max_tokens,
       ai_system_prompt: aiSettings.value.ai_system_prompt
     }
-    if (aiSettings.value.ai_api_key) {
-      payload.ai_api_key = aiSettings.value.ai_api_key
-    }
     await chatbotService.updateSettings(payload)
     toast.success(t('chatbotSettings.aiSettingsSaved'))
-    aiSettings.value.ai_api_key = ''
     refreshActivityLog(aiLogKey)
   } catch (error) {
     toast.error(t('chatbotSettings.aiSaveFailed'))
@@ -917,43 +878,18 @@ function removeEscalationUser(userId: string) {
                 <div v-if="isAIEnabled" class="space-y-4 pt-2">
                   <Separator />
 
-                  <div class="grid grid-cols-2 gap-4">
-                    <div class="space-y-2">
-                      <Label>{{ $t('chatbotSettings.aiProvider') }}</Label>
-                      <Select v-model="aiSettings.ai_provider">
-                        <SelectTrigger>
-                          <SelectValue :placeholder="$t('chatbotSettings.selectProvider') + '...'" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem v-for="provider in aiProviders" :key="provider.value" :value="provider.value">
-                            {{ provider.label }}
-                          </SelectItem>
-                        </SelectContent>
-                      </Select>
+                  <div class="rounded-xl border border-emerald-400/15 bg-emerald-400/[0.04] p-4">
+                    <div class="flex items-center justify-between gap-4">
+                      <div>
+                        <p class="font-medium">ReReply AI</p>
+                        <p class="mt-1 text-sm text-muted-foreground">
+                          The AI service and its credentials are securely managed by ReReply.
+                        </p>
+                      </div>
+                      <span class="rounded-full border border-emerald-400/20 bg-emerald-400/[0.08] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-emerald-300 light:text-emerald-700">
+                        Managed
+                      </span>
                     </div>
-                    <div class="space-y-2">
-                      <Label>{{ $t('chatbotSettings.model') }}</Label>
-                      <Select v-model="aiSettings.ai_model" :disabled="!aiSettings.ai_provider">
-                        <SelectTrigger>
-                          <SelectValue :placeholder="$t('chatbotSettings.selectModel') + '...'" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem v-for="model in availableModels" :key="model" :value="model">
-                            {{ model }}
-                          </SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-
-                  <div class="space-y-2">
-                    <Label>{{ $t('chatbotSettings.apiKey') }}</Label>
-                    <Input
-                      v-model="aiSettings.ai_api_key"
-                      type="password"
-                      :placeholder="$t('chatbotSettings.apiKeyPlaceholder') + '...'"
-                    />
-                    <p class="text-xs text-muted-foreground">{{ $t('chatbotSettings.apiKeyHint') }}</p>
                   </div>
 
                   <div class="space-y-2">

@@ -146,7 +146,7 @@ const planOfferDefinitions: PlanOfferDefinition[] = [
       'Multi-agent assignment and conversation control',
       'CRM lead pipeline, follow-ups and automations',
       'Appointments, packages, invoices and payments',
-      'Qwen AI Copilot for faster reviewed responses',
+      'AI Copilot for faster reviewed responses',
     ],
   },
   {
@@ -304,7 +304,7 @@ const knownBenefits = [
   },
   {
     key: 'copilot.enabled',
-    label: 'Qwen AI Copilot workspace',
+    label: 'AI Copilot workspace',
   },
 ] as const
 

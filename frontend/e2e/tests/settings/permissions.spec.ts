@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
-import { ApiHelper, loginAsAdmin } from '../../helpers'
+import { ApiHelper, loginAsAdmin, loginAsManager } from '../../helpers'
 import {
   createTestScope,
   createUserWithPermissions,
@@ -147,6 +147,43 @@ test.describe('Admin vs Limited Role Comparison', () => {
     await page.goto('/settings')
     await page.waitForLoadState('networkidle')
     expect(page.url()).toContain('/settings')
+  })
+})
+
+test.describe('Manager Settings Policy', () => {
+  test('manager keeps operational navigation outside Settings', async ({ page }) => {
+    await loginAsManager(page)
+    await page.waitForSelector('aside nav')
+
+    const menuItems = await getSidebarMenuItems(page)
+    for (const expectedItem of ['accounts', 'contacts', 'canned responses', 'tags', 'teams']) {
+      expect(
+        menuItems.some((item) => item.includes(expectedItem)),
+        `${expectedItem} should remain reachable as an operational item`,
+      ).toBeTruthy()
+    }
+  })
+
+  test('manager sees read-only general preferences without admin settings', async ({ page }) => {
+    await loginAsManager(page)
+    await page.goto('/settings')
+    await page.waitForLoadState('networkidle')
+
+    await expect(page.locator('#org_name')).toHaveAttribute('readonly', '')
+    await expect(page.getByText('Workspace details are read-only for your role.')).toBeVisible()
+    await expect(page.getByRole('tab', { name: /calling/i })).toHaveCount(0)
+
+    const menuItems = await getSidebarMenuItems(page)
+    for (const sensitiveItem of ['webhooks', 'custom actions', 'privacy', 'support']) {
+      expect(menuItems.some((item) => item.includes(sensitiveItem))).toBeFalsy()
+    }
+  })
+
+  test('manager is redirected from sensitive settings routes', async ({ page }) => {
+    await loginAsManager(page)
+    await page.goto('/settings/webhooks')
+    await page.waitForLoadState('networkidle')
+    expect(page.url()).not.toContain('/settings/webhooks')
   })
 })
 

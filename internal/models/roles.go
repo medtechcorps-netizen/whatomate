@@ -148,6 +148,8 @@ func DefaultPermissions() []Permission {
 		{Resource: ResourceSettingsChatbot, Action: ActionWrite, Description: "Edit chatbot settings"},
 		{Resource: ResourceSettingsSSO, Action: ActionRead, Description: "View SSO settings"},
 		{Resource: ResourceSettingsSSO, Action: ActionWrite, Description: "Edit SSO settings"},
+		{Resource: ResourceSettingsCalling, Action: ActionRead, Description: "View calling settings"},
+		{Resource: ResourceSettingsCalling, Action: ActionWrite, Description: "Edit calling settings"},
 
 		// Accounts
 		{Resource: ResourceAccounts, Action: ActionRead, Description: "View WhatsApp accounts"},
@@ -313,7 +315,7 @@ func DefaultPermissions() []Permission {
 		{Resource: ResourcePaymentRefunds, Action: ActionExecute, Description: "Issue payment refunds"},
 
 		// AI and omnichannel
-		{Resource: ResourceCopilot, Action: ActionRead, Description: "View Qwen Copilot runs"},
+		{Resource: ResourceCopilot, Action: ActionRead, Description: "View AI Copilot runs"},
 		{Resource: ResourceCopilot, Action: ActionExecute, Description: "Generate and approve Copilot suggestions"},
 		{Resource: ResourceChannelAccounts, Action: ActionRead, Description: "View channel connections"},
 		{Resource: ResourceChannelAccounts, Action: ActionWrite, Description: "Connect and configure channels"},
@@ -334,8 +336,9 @@ func SystemRolePermissions() map[string][]string {
 	managerPermissions := []string{
 		// Teams (read only)
 		"teams:read",
-		// Settings
-		"settings.general:read", "settings.general:write",
+		// Workspace settings are intentionally read-only for managers. Operational
+		// tools remain available in their product navigation sections below.
+		"settings.general:read",
 		"settings.chatbot:read", "settings.chatbot:write",
 		// Accounts
 		"accounts:read", "accounts:write", "accounts:delete",
@@ -359,12 +362,8 @@ func SystemRolePermissions() map[string][]string {
 		"analytics:read", "analytics.agents:read",
 		// Transfers
 		"transfers:read", "transfers:write", "transfers:pickup",
-		// Webhooks
-		"webhooks:read", "webhooks:write", "webhooks:delete",
 		// Canned Responses
 		"canned_responses:read", "canned_responses:write", "canned_responses:delete",
-		// Custom Actions
-		"custom_actions:read", "custom_actions:write", "custom_actions:delete",
 		// Organizations (read only)
 		"organizations:read",
 		// Calling
@@ -376,10 +375,7 @@ func SystemRolePermissions() map[string][]string {
 		"billing:read", "entitlements:read",
 		"onboarding:read", "onboarding:write",
 		"workspace_templates:read",
-		"privacy.settings:read", "privacy.settings:write",
 		"privacy.consents:read", "privacy.consents:write",
-		"privacy.requests:read", "privacy.requests:write",
-		"support:read", "support:write",
 		// CRM, bookings and commerce
 		"crm.pipelines:read", "crm.pipelines:write",
 		"crm.leads:read", "crm.leads:write", "crm.leads:delete",

@@ -30,7 +30,6 @@ interface ChatbotSettings {
   fallback_message: string
   session_timeout_minutes: number
   ai_enabled: boolean
-  ai_provider: string
 }
 
 interface Stats {
@@ -49,8 +48,7 @@ const settings = ref<ChatbotSettings>({
   greeting_message: '',
   fallback_message: '',
   session_timeout_minutes: 30,
-  ai_enabled: false,
-  ai_provider: ''
+  ai_enabled: false
 })
 
 const stats = ref<Stats>({
@@ -318,10 +316,10 @@ const statCards = computed(() => [
                 </div>
               </div>
               <div class="space-y-2">
-                <h4 class="font-medium text-sm text-white/70 light:text-gray-700">{{ $t('chatbot.aiProvider') }}</h4>
+                <h4 class="font-medium text-sm text-white/70 light:text-gray-700">{{ $t('chatbot.aiSettings') }}</h4>
                 <div class="flex items-center gap-2">
                   <Badge v-if="settings.ai_enabled" class="bg-emerald-500/20 text-emerald-400 light:bg-emerald-100 light:text-emerald-700">
-                    {{ settings.ai_provider || $t('chatbot.notConfigured') }}
+                    ReReply AI
                   </Badge>
                   <Badge v-else class="bg-white/[0.08] text-white/50 light:bg-gray-100 light:text-gray-500">{{ $t('chatbot.disabled') }}</Badge>
                 </div>

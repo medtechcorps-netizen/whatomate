@@ -167,6 +167,144 @@ func TestSeedSystemRolesForOrg_AdminRoleHasAllPermissions(t *testing.T) {
 	assert.Equal(t, totalPerms, len(perms), "admin role should have all permissions")
 }
 
+func TestSeedSystemRolesForOrg_ManagerKeepsOperationsButNotSensitiveSettings(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+
+	require.NoError(t, database.SeedPermissionsAndRoles(db))
+	org := models.Organization{
+		BaseModel: models.BaseModel{ID: uuid.New()},
+		Name:      "Manager Policy Org",
+		Settings:  models.JSONB{},
+	}
+	require.NoError(t, db.Create(&org).Error)
+	require.NoError(t, database.SeedSystemRolesForOrg(db, org.ID))
+
+	var managerRole models.CustomRole
+	require.NoError(t, db.Where(
+		"organization_id = ? AND name = ? AND is_system = ?",
+		org.ID,
+		"manager",
+		true,
+	).First(&managerRole).Error)
+
+	assert.True(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceSettingsGeneral, models.ActionRead,
+	))
+	assert.False(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceSettingsGeneral, models.ActionWrite,
+	))
+	assert.True(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceAccounts, models.ActionWrite,
+	))
+	assert.True(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceContacts, models.ActionWrite,
+	))
+	assert.True(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceCannedResponses, models.ActionWrite,
+	))
+	assert.False(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceWebhooks, models.ActionRead,
+	))
+	assert.False(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceCustomActions, models.ActionRead,
+	))
+	assert.False(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourcePrivacySettings, models.ActionRead,
+	))
+	assert.False(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceSupport, models.ActionRead,
+	))
+
+	var callingPermissionCount int64
+	require.NoError(t, db.Model(&models.Permission{}).Where(
+		"resource = ? AND action IN ?",
+		models.ResourceSettingsCalling,
+		[]string{models.ActionRead, models.ActionWrite},
+	).Count(&callingPermissionCount).Error)
+	assert.Equal(t, int64(2), callingPermissionCount, "calling settings permissions must be seeded")
+}
+
+func TestApplyManagerSettingsPolicyMigration_RunsOnceAndPreservesCustomRoles(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+
+	require.NoError(t, database.SeedPermissionsAndRoles(db))
+	org := models.Organization{
+		BaseModel: models.BaseModel{ID: uuid.New()},
+		Name:      "Legacy Manager Policy Org",
+		Settings:  models.JSONB{},
+	}
+	require.NoError(t, db.Create(&org).Error)
+	require.NoError(t, database.SeedSystemRolesForOrg(db, org.ID))
+
+	var managerRole models.CustomRole
+	require.NoError(t, db.Where(
+		"organization_id = ? AND name = ? AND is_system = ?",
+		org.ID,
+		"manager",
+		true,
+	).First(&managerRole).Error)
+
+	var legacyPermissions []models.Permission
+	require.NoError(t, db.Where(
+		"(resource = ? AND action = ?) OR (resource = ? AND action = ?) OR (resource = ? AND action = ?)",
+		models.ResourceSettingsGeneral,
+		models.ActionWrite,
+		models.ResourceWebhooks,
+		models.ActionRead,
+		models.ResourcePrivacySettings,
+		models.ActionWrite,
+	).Find(&legacyPermissions).Error)
+	require.Len(t, legacyPermissions, 3)
+	require.NoError(t, db.Model(&managerRole).Association("Permissions").Append(legacyPermissions))
+
+	customRole := testutil.CreateTestRoleExact(
+		t,
+		db,
+		org.ID,
+		"custom-manager-equivalent",
+		false,
+		false,
+		legacyPermissions,
+	)
+
+	// Simulate an organization created before the version marker existed.
+	require.NoError(t, db.Where("id = ?", org.ID).First(&org).Error)
+	delete(org.Settings, database.ManagerSettingsPolicyVersionKey)
+	require.NoError(t, db.Model(&org).Update("settings", org.Settings).Error)
+
+	require.NoError(t, database.ApplyManagerSettingsPolicyMigration(db))
+	assert.False(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceSettingsGeneral, models.ActionWrite,
+	))
+	assert.False(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceWebhooks, models.ActionRead,
+	))
+	assert.False(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourcePrivacySettings, models.ActionWrite,
+	))
+	assert.True(t, roleHasPermission(
+		t, db, customRole.ID, models.ResourceSettingsGeneral, models.ActionWrite,
+	), "custom roles must never be changed by the system-manager migration")
+
+	require.NoError(t, db.Where("id = ?", org.ID).First(&org).Error)
+	assert.NotNil(t, org.Settings[database.ManagerSettingsPolicyVersionKey])
+
+	// A later explicit super-admin grant must survive application restarts.
+	var generalWrite models.Permission
+	require.NoError(t, db.Where(
+		"resource = ? AND action = ?",
+		models.ResourceSettingsGeneral,
+		models.ActionWrite,
+	).First(&generalWrite).Error)
+	require.NoError(t, db.Model(&managerRole).Association("Permissions").Append(&generalWrite))
+	require.NoError(t, database.ApplyManagerSettingsPolicyMigration(db))
+	assert.True(t, roleHasPermission(
+		t, db, managerRole.ID, models.ResourceSettingsGeneral, models.ActionWrite,
+	), "the versioned migration must not reapply after an explicit later grant")
+}
+
 func TestFixSystemRolePermissionsAddsOnlyNewExpectedPermissions(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	cleanAll(t, db)

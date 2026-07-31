@@ -42,7 +42,7 @@ func createChatbotSettingsWriter(
 	withAI bool,
 ) *models.User {
 	t.Helper()
-	permissionKeys := []string{"settings.chatbot:write"}
+	permissionKeys := []string{"settings.chatbot:read", "settings.chatbot:write"}
 	if withAI {
 		permissionKeys = append(permissionKeys, "chatbot.ai:write")
 	}
@@ -58,6 +58,53 @@ func createChatbotSettingsWriter(
 		app.DB,
 		organizationID,
 		testutil.WithRoleID(&role.ID),
+	)
+}
+
+func createChatbotSettingsReader(
+	t *testing.T,
+	app *handlers.App,
+	organizationID uuid.UUID,
+) *models.User {
+	t.Helper()
+	role := testutil.CreateTestRoleWithKeys(
+		t,
+		app.DB,
+		organizationID,
+		"chatbot-settings-reader",
+		[]string{"settings.chatbot:read"},
+	)
+	return testutil.CreateTestUser(
+		t,
+		app.DB,
+		organizationID,
+		testutil.WithRoleID(&role.ID),
+	)
+}
+
+func createChatbotAIConfigurator(
+	t *testing.T,
+	app *handlers.App,
+	organizationID uuid.UUID,
+) *models.User {
+	t.Helper()
+	role := testutil.CreateTestRoleWithKeys(
+		t,
+		app.DB,
+		organizationID,
+		"platform-ai-configurator",
+		[]string{
+			"settings.chatbot:read",
+			"settings.chatbot:write",
+			"chatbot.ai:write",
+		},
+	)
+	return testutil.CreateTestUser(
+		t,
+		app.DB,
+		organizationID,
+		testutil.WithRoleID(&role.ID),
+		testutil.WithSuperAdmin(),
 	)
 }
 
@@ -162,7 +209,7 @@ func TestApp_GetChatbotSettings(t *testing.T) {
 	t.Run("success returns default settings when none exist", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createChatbotSettingsReader(t, app, org.ID)
 
 		req := testutil.NewGETRequest(t)
 		testutil.SetAuthContext(req, org.ID, user.ID)
@@ -170,6 +217,8 @@ func TestApp_GetChatbotSettings(t *testing.T) {
 		err := app.GetChatbotSettings(req)
 		require.NoError(t, err)
 		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+		assert.NotContains(t, string(testutil.GetResponseBody(req)), `"ai_provider"`)
+		assert.NotContains(t, string(testutil.GetResponseBody(req)), `"ai_model"`)
 
 		var resp struct {
 			Data struct {
@@ -190,6 +239,19 @@ func TestApp_GetChatbotSettings(t *testing.T) {
 		assert.Equal(t, int64(0), resp.Data.Stats.TotalSessions)
 		assert.Equal(t, int64(0), resp.Data.Stats.KeywordsCount)
 	})
+
+	t.Run("requires chatbot settings read permission", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := testutil.CreateTestUser(t, app.DB, org.ID)
+
+		req := testutil.NewGETRequest(t)
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		err := app.GetChatbotSettings(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+	})
 }
 
 // =============================================================================
@@ -202,7 +264,7 @@ func TestApp_UpdateChatbotSettings(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := createChatbotSettingsWriter(t, app, org.ID, true)
+		user := createChatbotAIConfigurator(t, app, org.ID)
 
 		enabled := true
 		greeting := "Welcome to our shop!"
@@ -257,11 +319,18 @@ func TestApp_UpdateChatbotSettings(t *testing.T) {
 		assert.Equal(t, timeout, getResp.Data.Settings.SessionTimeoutMinutes)
 		assert.Equal(t, "Sorry, I did not understand that.", getResp.Data.Settings.FallbackMessage)
 		assert.True(t, getResp.Data.Settings.AIEnabled)
-		assert.Equal(t, models.AIProvider("openai"), getResp.Data.Settings.AIProvider)
-		assert.Equal(t, "gpt-4", getResp.Data.Settings.AIModel)
 		assert.Equal(t, 1000, getResp.Data.Settings.AIMaxTokens)
 		assert.True(t, getResp.Data.Settings.SLAEnabled)
 		assert.Equal(t, 10, getResp.Data.Settings.SLAResponseMinutes)
+
+		var persisted models.ChatbotSettings
+		require.NoError(t, app.DB.Where(
+			"organization_id = ? AND whats_app_account = ?",
+			org.ID,
+			"",
+		).First(&persisted).Error)
+		assert.Equal(t, models.AIProvider("openai"), persisted.AI.Provider)
+		assert.Equal(t, "gpt-4", persisted.AI.Model)
 	})
 
 	t.Run("AI fields require chatbot AI write permission", func(t *testing.T) {
@@ -283,6 +352,62 @@ func TestApp_UpdateChatbotSettings(t *testing.T) {
 			Where("organization_id = ?", org.ID).
 			Count(&count).Error)
 		assert.Zero(t, count)
+	})
+
+	t.Run("provider configuration is platform-owner only", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := createChatbotSettingsWriter(t, app, org.ID, true)
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"ai_provider": "qwen",
+			"ai_model":    "qwen3.7-plus",
+			"ai_api_key":  "must-not-be-saved",
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		err := app.UpdateChatbotSettings(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+
+		var count int64
+		require.NoError(t, app.DB.Model(&models.ChatbotSettings{}).
+			Where("organization_id = ?", org.ID).
+			Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	t.Run("manager can update provider-neutral AI behavior", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := createChatbotSettingsWriter(t, app, org.ID, true)
+		settings := models.ChatbotSettings{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: org.ID,
+			AI: models.AIConfig{
+				Provider: models.AIProviderQwen,
+				Model:    "qwen3.7-plus",
+			},
+		}
+		require.NoError(t, app.DB.Create(&settings).Error)
+
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"ai_enabled":       true,
+			"ai_max_tokens":    900,
+			"ai_system_prompt": "Use the approved clinic tone.",
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		err := app.UpdateChatbotSettings(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+		var persisted models.ChatbotSettings
+		require.NoError(t, app.DB.First(&persisted, "id = ?", settings.ID).Error)
+		assert.True(t, persisted.AI.Enabled)
+		assert.Equal(t, 900, persisted.AI.MaxTokens)
+		assert.Equal(t, "Use the approved clinic tone.", persisted.AI.SystemPrompt)
+		assert.Equal(t, models.AIProviderQwen, persisted.AI.Provider)
+		assert.Equal(t, "qwen3.7-plus", persisted.AI.Model)
 	})
 
 	t.Run("top-level enable requires chatbot AI write permission", func(t *testing.T) {
@@ -308,7 +433,7 @@ func TestApp_UpdateChatbotSettings(t *testing.T) {
 	t.Run("API key rotation writes only a masked audit marker", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := createChatbotSettingsWriter(t, app, org.ID, true)
+		user := createChatbotAIConfigurator(t, app, org.ID)
 		secret := "test-qwen-key-must-never-appear-in-audit"
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"ai_api_key": secret,
@@ -336,7 +461,7 @@ func TestApp_UpdateChatbotSettings(t *testing.T) {
 	t.Run("API key rotation rolls back when its audit cannot be written", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := createChatbotSettingsWriter(t, app, org.ID, true)
+		user := createChatbotAIConfigurator(t, app, org.ID)
 		rejectChatbotAIAuditForOrg(t, app, org.ID)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
@@ -415,7 +540,7 @@ func TestApp_UpdateChatbotSettings(t *testing.T) {
 	t.Run("all settings fields require chatbot settings write permission", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createChatbotSettingsReader(t, app, org.ID)
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"greeting_message": "Unauthorized change",
 		})
@@ -1385,14 +1510,12 @@ func TestApp_GetChatbotSettings_ExistingSettings(t *testing.T) {
 		assert.Equal(t, "I do not understand.", resp.Data.Settings.FallbackMessage)
 		assert.Equal(t, 45, resp.Data.Settings.SessionTimeoutMinutes)
 		assert.True(t, resp.Data.Settings.AIEnabled)
-		assert.Equal(t, models.AIProviderOpenAI, resp.Data.Settings.AIProvider)
-		assert.Equal(t, "gpt-4o", resp.Data.Settings.AIModel)
 	})
 
 	t.Run("stats reflect actual data counts", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createChatbotSettingsReader(t, app, org.ID)
 
 		// Create some keyword rules and flows so stats are non-zero
 		createTestKeywordRule(t, app, org.ID, "Rule A", []string{"hi"})
