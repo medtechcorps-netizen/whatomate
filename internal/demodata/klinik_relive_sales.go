@@ -314,7 +314,8 @@ func buildCallLogs(anchor time.Time, refs FixtureReferences, ivr []models.IVRFlo
 		duration := 0
 		disconnectedBy := models.DisconnectedBySystem
 		errorMessage := ""
-		if status == models.CallStatusCompleted {
+		switch status {
+		case models.CallStatusCompleted:
 			answerTime := started.Add(time.Duration(4+(i%9)) * time.Second)
 			duration = 180 + ((i * 37) % 420)
 			endTime := answerTime.Add(time.Duration(duration) * time.Second)
@@ -328,9 +329,9 @@ func buildCallLogs(anchor time.Time, refs FixtureReferences, ivr []models.IVRFlo
 			default:
 				disconnectedBy = models.DisconnectedBySystem
 			}
-		} else if status == models.CallStatusRejected {
+		case models.CallStatusRejected:
 			disconnectedBy = models.DisconnectedByClient
-		} else if status == models.CallStatusFailed {
+		case models.CallStatusFailed:
 			errorMessage = "[MOCK] Synthetic provider failure; no provider request was made."
 		}
 
@@ -811,10 +812,10 @@ func ValidateKlinikReliveSalesFixtures(fixtures FixtureSet, refs FixtureReferenc
 			row.Dataset != KlinikReliveSalesDataset ||
 			row.PeriodEnd.Sub(row.PeriodStart) != 30*24*time.Hour ||
 			!slices.Contains(metaAnalyticsTypes, row.AnalyticsType) {
-			return fmt.Errorf("Meta analytics snapshot %s violates mock-only safety", row.ID)
+			return fmt.Errorf("meta analytics snapshot %s violates mock-only safety", row.ID)
 		}
 		if _, ok := row.Payload[row.AnalyticsType]; !ok {
-			return fmt.Errorf("Meta analytics snapshot %s has no matching payload", row.ID)
+			return fmt.Errorf("meta analytics snapshot %s has no matching payload", row.ID)
 		}
 		metaTypes[row.AnalyticsType]++
 	}
