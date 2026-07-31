@@ -74,6 +74,45 @@ func TestBuildKlinikReliveSalesFixtures(t *testing.T) {
 	if recentCalls != 30 || priorCalls != 6 {
 		t.Fatalf("call time coverage recent=%d prior=%d, want recent=30 prior=6", recentCalls, priorCalls)
 	}
+
+	callsByID := make(map[uuid.UUID]models.CallLog, len(fixtures.CallLogs))
+	for i, row := range fixtures.CallLogs {
+		wantContact := refs.Contacts[i%crmContactReferenceCount]
+		if row.ContactID != wantContact.ID || row.CallerPhone != wantContact.PhoneNumber {
+			t.Fatalf(
+				"call %d contact=(%s, %q), want (%s, %q)",
+				i,
+				row.ContactID,
+				row.CallerPhone,
+				wantContact.ID,
+				wantContact.PhoneNumber,
+			)
+		}
+		callsByID[row.ID] = row
+	}
+	for i, row := range fixtures.CallTransfers {
+		sourceCall, ok := callsByID[row.CallLogID]
+		if !ok {
+			t.Fatalf("transfer %d references unknown call %s", i, row.CallLogID)
+		}
+		if row.ContactID != sourceCall.ContactID ||
+			row.CallerPhone != sourceCall.CallerPhone ||
+			row.WhatsAppCallID != sourceCall.WhatsAppCallID {
+			t.Fatalf("transfer %d does not preserve its source call identity", i)
+		}
+	}
+}
+
+func TestBuildKlinikReliveSalesFixturesRejectsIncompleteCanonicalContacts(t *testing.T) {
+	t.Parallel()
+
+	refs := testFixtureReferences()
+	refs.Contacts = refs.Contacts[:crmContactReferenceCount-1]
+
+	_, err := BuildKlinikReliveSalesFixtures(time.Now().UTC(), refs)
+	if err == nil || !strings.Contains(err.Error(), "expected 28 CRM mock contacts, got 27") {
+		t.Fatalf("BuildKlinikReliveSalesFixtures() error = %v, want exact canonical contact count rejection", err)
+	}
 }
 
 func TestFixtureIDsAreDeterministicAcrossBuilds(t *testing.T) {
@@ -245,8 +284,8 @@ func TestCompareForbiddenState(t *testing.T) {
 }
 
 func testFixtureReferences() FixtureReferences {
-	contacts := make([]ContactReference, 0, 30)
-	for i := 11; i <= 40; i++ {
+	contacts := make([]ContactReference, 0, crmContactReferenceCount)
+	for i := crmContactFirstSequence; i <= crmContactLastSequence; i++ {
 		contacts = append(contacts, ContactReference{
 			ID:          deterministicUUID(fmt.Sprintf("test-contact-%d", i)),
 			PhoneNumber: fmt.Sprintf("6000000000%02d", i),

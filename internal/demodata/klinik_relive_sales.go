@@ -27,6 +27,12 @@ const (
 
 	omnichannelDataset = "klinik-relive-omnichannel-v1"
 	crmDataset         = "klinik-relive-crm-v2"
+
+	// The sales seeder consumes CRM v2's deterministic contact IDs 13 through 40.
+	// Keep this range aligned with mock-data/klinik-relive-crm-v2.sql.
+	crmContactFirstSequence  = 13
+	crmContactLastSequence   = 40
+	crmContactReferenceCount = crmContactLastSequence - crmContactFirstSequence + 1
 )
 
 var (
@@ -112,8 +118,12 @@ func validateReferences(refs FixtureReferences) error {
 	if refs.TeamID == uuid.Nil {
 		return fmt.Errorf("inactive omnichannel team ID is required")
 	}
-	if len(refs.Contacts) != 30 {
-		return fmt.Errorf("expected 30 CRM mock contacts, got %d", len(refs.Contacts))
+	if len(refs.Contacts) != crmContactReferenceCount {
+		return fmt.Errorf(
+			"expected %d CRM mock contacts, got %d",
+			crmContactReferenceCount,
+			len(refs.Contacts),
+		)
 	}
 	if len(refs.AgentIDs) != 3 {
 		return fmt.Errorf("expected 3 inactive omnichannel agents, got %d", len(refs.AgentIDs))
