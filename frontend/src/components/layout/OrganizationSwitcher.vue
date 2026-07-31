@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useRoute, useRouter } from 'vue-router'
 import { useOrganizationsStore } from '@/stores/organizations'
 import { useAuthStore } from '@/stores/auth'
 import { Button } from '@/components/ui/button'
@@ -17,11 +18,13 @@ import { organizationsService } from '@/services/api'
 import { toast } from 'vue-sonner'
 import { Building2, Plus, Loader2 } from 'lucide-vue-next'
 
-const props = defineProps<{
+defineProps<{
   collapsed?: boolean
 }>()
 
 const { t } = useI18n()
+const route = useRoute()
+const router = useRouter()
 const organizationsStore = useOrganizationsStore()
 const authStore = useAuthStore()
 
@@ -76,6 +79,12 @@ const handleOrgChange = async (value: string | number | bigint | Record<string, 
   if (isSuperAdmin.value) {
     // Super admins: set localStorage header and reload
     organizationsStore.selectOrganization(value)
+    if (route.name === 'workspace-upgrade') {
+      await router.replace({
+        path: route.path,
+        query: { ...route.query, organization_id: value }
+      })
+    }
     window.location.reload()
   } else {
     // Multi-org users: call switchOrg API for new JWT tokens, then reload

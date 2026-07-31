@@ -19,6 +19,7 @@ import {
 } from 'lucide-vue-next'
 import { toast } from 'vue-sonner'
 import { useAuthStore } from '@/stores/auth'
+import { useOrganizationsStore } from '@/stores/organizations'
 import {
   organizationsService,
   resellersService,
@@ -53,9 +54,15 @@ import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 const authStore = useAuthStore()
+const organizationsStore = useOrganizationsStore()
 const route = useRoute()
 const router = useRouter()
 const isPlatformOwner = computed(() => authStore.user?.is_super_admin === true)
+const activeOrganizationId = computed(() =>
+  isPlatformOwner.value
+    ? organizationsStore.selectedOrgId || authStore.organizationId
+    : authStore.organizationId,
+)
 
 const resellers = ref<Reseller[]>([])
 const selectedId = ref('')
@@ -162,9 +169,12 @@ const brandForm = reactive({
 })
 
 const organizationDeleteBlockingReason = computed(() => {
-  const organization = organizationDeleteTarget.value ?? selectedOrganization.value
+  const organization =
+    organizationDeleteOpen.value && organizationDeleteTarget.value
+      ? organizationDeleteTarget.value
+      : selectedOrganization.value
   if (!organization) return 'Select a workspace first'
-  if (organization.id === authStore.organizationId) {
+  if (organization.id === activeOrganizationId.value) {
     return 'Switch to a different organization before deleting this workspace'
   }
   if ((usage.value?.organization_count ?? 0) <= 1) {
@@ -179,6 +189,25 @@ const organizationDeleteBlockingReason = computed(() => {
     return 'Cancel the provider-managed subscription before deleting this workspace'
   }
   return ''
+})
+
+const workspaceLicenseChangeBlockingReason = computed(() => {
+  const license = selectedOrganizationLicense.value
+  if (license?.provider && license.provider !== 'manual') {
+    return 'This provider-managed subscription must be changed through its billing provider'
+  }
+  return ''
+})
+
+const portfolioPlanDescription = computed(() => {
+  switch (brandForm.plan) {
+    case 'growth':
+      return 'Growth portfolio · recommended for partner teams managing up to 50 customer workspaces.'
+    case 'enterprise':
+      return 'Enterprise portfolio · expanded operations for up to 1,000 customer workspaces.'
+    default:
+      return 'Starter portfolio · launch and manage up to 10 customer workspaces.'
+  }
 })
 
 const organizationDeleteConfirmed = computed(() =>
@@ -207,6 +236,15 @@ function hydrateBrandForm(reseller: Reseller | null) {
   brandForm.status = reseller.status
   brandForm.plan = reseller.plan
   brandForm.max_organizations = reseller.max_organizations
+}
+
+function applyPortfolioPlanCapacity() {
+  const capacities: Record<Reseller['plan'], number> = {
+    starter: 10,
+    growth: 50,
+    enterprise: 1000,
+  }
+  brandForm.max_organizations = capacities[brandForm.plan]
 }
 
 function hydrateLicenseForm() {
@@ -413,8 +451,14 @@ async function loadSelected() {
 
 watch(selectedId, loadSelected)
 watch(selectedOrganizationId, () => {
+  organizationDeleteOpen.value = false
   hydrateLicenseForm()
   void loadPlanCatalog()
+})
+watch(organizationDeleteOpen, (open) => {
+  if (open) return
+  organizationDeleteTarget.value = null
+  organizationDeleteConfirmation.value = ''
 })
 watch(
   () => route.query.organization_id,
@@ -489,9 +533,10 @@ async function createOrganization() {
   }
 }
 
-function openOrganizationDeleteDialog() {
-  if (!selectedOrganization.value) return
-  organizationDeleteTarget.value = selectedOrganization.value
+function openOrganizationDeleteDialog(target?: Organization) {
+  const organization = target ?? selectedOrganization.value
+  if (!organization) return
+  organizationDeleteTarget.value = organization
   organizationDeleteConfirmation.value = ''
   organizationDeleteOpen.value = true
 }
@@ -509,7 +554,10 @@ async function deleteOrganization() {
     organizationDeleteConfirmation.value = ''
     selectedOrganizationId.value = ''
     await loadSelected()
-    await loadResellers(resellerId)
+    await Promise.all([
+      loadResellers(resellerId),
+      organizationsStore.fetchOrganizations(),
+    ])
     await router.replace({
       path: '/resellers',
       query: selectedOrganizationId.value
@@ -623,6 +671,9 @@ async function assignWorkspaceLicense() {
     organizationLicenses.value = {
       ...organizationLicenses.value,
       [organizationId]: unwrapItemResponse<SubscriptionSummary>(response),
+    }
+    if (organizationId === activeOrganizationId.value) {
+      await authStore.fetchProductEntitlements()
     }
     toast.success(`${selectedOrganization.value.name} license assigned`)
     await refreshOrganizationLicense(organizationId, true)
@@ -818,7 +869,7 @@ function formatNumber(value?: number) {
           <TabsList class="bg-white/[0.04] light:bg-gray-100">
             <TabsTrigger value="portfolio">Portfolio</TabsTrigger>
             <TabsTrigger value="team">Administrators</TabsTrigger>
-            <TabsTrigger value="brand">Brand & plan</TabsTrigger>
+            <TabsTrigger value="brand">Brand & portfolio capacity</TabsTrigger>
           </TabsList>
 
           <TabsContent value="portfolio" class="mt-4">
@@ -900,6 +951,7 @@ function formatNumber(value?: number) {
                             class="px-4 py-4 font-mono text-xs text-white/40 light:text-gray-500">{{ organization.id.slice(0, 8) }}…</td>
                           <td class="px-4 py-4 text-xs text-white/40 light:text-gray-500">{{ new Date(organization.created_at,).toLocaleDateString() }}</td>
                         <td class="px-6 py-4 text-right">
+                            <div class="flex items-center justify-end gap-1">
                             <Button
                               variant="ghost"
                               size="sm"
@@ -908,6 +960,18 @@ function formatNumber(value?: number) {
                             >
                               {{ isPlatformOwner ? 'Manage' : 'View' }}
                             </Button>
+                              <Button
+                                v-if="isPlatformOwner"
+                                variant="ghost"
+                                size="icon"
+                                data-testid="workspace-delete-row"
+                                :aria-label="`Delete ${organization.name}`"
+                                :title="`Delete ${organization.name}`"
+                                @click="openOrganizationDeleteDialog(organization)"
+                              >
+                                <Trash2 class="h-4 w-4 text-red-300 light:text-red-700" />
+                              </Button>
+                            </div>
                           </td>
                         </tr>
                         <tr v-if="!usage?.organizations.length"><td colspan="5" class="px-6 py-12 text-center text-white/35 light:text-gray-500">No customer workspaces yet.</td></tr>
@@ -1143,6 +1207,21 @@ function formatNumber(value?: number) {
                               this workspace’s portfolio before assigning it.
                             </p>
                           </div>
+                          <div
+                            v-else-if="workspaceLicenseChangeBlockingReason"
+                            class="rounded-lg border border-amber-400/15 bg-amber-400/[0.05] p-3"
+                          >
+                            <p
+                              class="text-xs font-medium text-amber-100 light:text-amber-800"
+                            >
+                              Manual plan change unavailable
+                            </p>
+                            <p
+                              class="mt-1 text-xs leading-5 text-white/40 light:text-gray-600"
+                            >
+                              {{ workspaceLicenseChangeBlockingReason }}
+                            </p>
+                          </div>
                           <form
                             v-else
                             class="space-y-3"
@@ -1256,39 +1335,6 @@ function formatNumber(value?: number) {
                             </Button>
                           </form>
                         </div>
-                        <div
-                          class="border-t border-red-400/15 pt-4"
-                          data-testid="workspace-danger-zone"
-                        >
-                          <p
-                            class="text-sm font-medium text-red-200 light:text-red-700"
-                          >
-                            Delete workspace
-                          </p>
-                          <p
-                            class="mt-1 text-xs leading-5 text-white/40 light:text-gray-600"
-                          >
-                            Removes this organization from active access. Its
-                            tenant records are retained for recovery.
-                          </p>
-                          <Button
-                            class="mt-3 w-full"
-                            variant="destructive"
-                            size="sm"
-                            data-testid="workspace-delete-open"
-                            :disabled="Boolean(organizationDeleteBlockingReason)"
-                            @click="openOrganizationDeleteDialog"
-                          >
-                            <Trash2 class="mr-2 h-4 w-4" />
-                            Delete organization
-                          </Button>
-                          <p
-                            v-if="organizationDeleteBlockingReason"
-                            class="mt-2 text-[11px] leading-5 text-amber-200/75 light:text-amber-700"
-                          >
-                            {{ organizationDeleteBlockingReason }}
-                          </p>
-                        </div>
                       </template>
                       <p
                         v-else
@@ -1299,6 +1345,42 @@ function formatNumber(value?: number) {
                         visibility.
                       </p>
                     </div>
+                  </CardContent>
+                </Card>
+                <Card
+                  v-if="isPlatformOwner"
+                  data-testid="workspace-danger-zone"
+                  class="border-red-400/15 bg-[#0d0f11] light:border-red-200 light:bg-white"
+                >
+                  <CardHeader>
+                    <CardTitle class="flex items-center gap-2 text-sm text-red-200 light:text-red-700">
+                      <Trash2 class="h-4 w-4" />
+                      Workspace actions
+                    </CardTitle>
+                    <p class="text-xs leading-5 text-white/40 light:text-gray-600">
+                      This control remains available while license information refreshes. Tenant records are retained
+                      for recovery.
+                    </p>
+                  </CardHeader>
+                  <CardContent>
+                    <Button
+                      class="w-full"
+                      variant="destructive"
+                      size="sm"
+                      data-testid="workspace-delete-open"
+                      :disabled="!selectedOrganization"
+                      @click="openOrganizationDeleteDialog()"
+                    >
+                      <Trash2 class="mr-2 h-4 w-4" />
+                      Delete
+                      {{ selectedOrganization?.name || 'selected organization' }}
+                    </Button>
+                    <p
+                      v-if="organizationDeleteBlockingReason"
+                      class="mt-2 text-[11px] leading-5 text-amber-200/75 light:text-amber-700"
+                    >
+                      {{ organizationDeleteBlockingReason }}
+                    </p>
                   </CardContent>
                 </Card>
                 <Card class="border-white/[0.08] bg-[#0d0f11] light:border-gray-200 light:bg-white">
@@ -1371,7 +1453,17 @@ function formatNumber(value?: number) {
                   <div class="space-y-2"><Label for="accent-color">Accent color</Label><div class="flex gap-2"><Input id="accent-color" v-model="brandForm.accent_color" /><input v-model="brandForm.accent_color" type="color" class="h-10 w-12 rounded-md border border-white/10 bg-transparent p-1" /></div></div>
                   <template v-if="isPlatformOwner">
                     <div class="space-y-2"><Label for="partner-status">Status</Label><select id="partner-status" v-model="brandForm.status" class="control-select"><option value="active">Active</option><option value="suspended">Suspended</option></select></div>
-                    <div class="space-y-2"><Label for="partner-plan">Plan</Label><select id="partner-plan" v-model="brandForm.plan" class="control-select"><option value="starter">Starter</option><option value="growth">Growth</option><option value="enterprise">Enterprise</option></select></div>
+                    <div class="space-y-2">
+                      <Label for="partner-plan">Partner portfolio tier</Label>
+                      <select id="partner-plan" v-model="brandForm.plan" class="control-select" @change="applyPortfolioPlanCapacity">
+                        <option value="starter">Starter · portfolio capacity</option>
+                        <option value="growth">Growth · portfolio capacity</option>
+                        <option value="enterprise">Enterprise · portfolio capacity</option>
+                      </select>
+                      <p class="text-[11px] leading-5 text-white/40 light:text-gray-500">
+                        {{ portfolioPlanDescription }} Selecting a tier updates the organization-limit field below; you can adjust it before saving. This does not change feature access for an individual workspace.
+                      </p>
+                    </div>
                     <div class="space-y-2"><Label for="org-limit">Organization limit</Label><Input id="org-limit" v-model.number="brandForm.max_organizations" type="number" min="1" /></div>
                   </template>
                   <div class="flex justify-end sm:col-span-2"><Button type="submit" :loading="brandingSubmitting"><Check class="mr-2 h-4 w-4" />Save configuration</Button></div>
