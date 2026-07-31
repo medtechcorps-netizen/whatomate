@@ -302,6 +302,13 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 		return fmt.Errorf("failed to initialize reseller control plane: %w", err)
 	}
 
+	// Apply the versioned first-party workspace catalog backfill after the
+	// commercial tables exist. It keeps legacy subscription price identities
+	// intact and does not undo later control-plane retirements on restart.
+	if err := EnsureReReplyProductCatalog(silentDB); err != nil {
+		return fmt.Errorf("failed to initialize ReReply product catalog: %w", err)
+	}
+
 	// Seed default widgets for all organizations
 	printProgress(currentStep, totalSteps)
 	if err := SeedDefaultWidgets(silentDB); err != nil {

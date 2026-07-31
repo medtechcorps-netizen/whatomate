@@ -131,6 +131,15 @@ func TestListAssignableProductPlansIsOwnerOnlyAndTargetScoped(t *testing.T) {
 	createCatalogPrice(
 		t, app, futurePlan.ID, models.BillingProviderManual, models.BillingIntervalMonth, true, &future,
 	)
+	retiredPlan := createCatalogPlan(
+		t, app, &reseller.ID, "retired", "Retired", models.CommercialPlanStatusActive,
+	)
+	retiredPrice := createCatalogPrice(
+		t, app, retiredPlan.ID, models.BillingProviderManual, models.BillingIntervalMonth, true, nil,
+	)
+	require.NoError(t, app.DB.Model(&models.PlanPrice{}).
+		Where("id = ?", retiredPrice.ID).
+		Update("metadata", models.JSONB{"assignable": false}).Error)
 
 	request := testutil.NewGETRequest(t)
 	testutil.SetFullAuthContext(request, controlOrg.ID, owner.ID, owner.RoleID, true)
@@ -151,6 +160,7 @@ func TestListAssignableProductPlansIsOwnerOnlyAndTargetScoped(t *testing.T) {
 		require.NotNil(t, plan.ID)
 		require.Len(t, plan.Prices, 1)
 		require.NotNil(t, plan.Prices[0].ID)
+		assert.True(t, plan.Prices[0].Assignable)
 		assert.False(t, plan.IsPublic)
 		planIDs[*plan.ID] = true
 		priceIDs[*plan.Prices[0].ID] = true

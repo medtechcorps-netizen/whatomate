@@ -50,6 +50,7 @@ export interface PlanPriceSummary {
   interval: BillingInterval
   interval_count: number
   tax_behavior: string
+  assignable?: boolean
 }
 
 export interface PlanSummary {

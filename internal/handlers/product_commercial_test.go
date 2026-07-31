@@ -44,6 +44,54 @@ func TestProductCommercialBuiltInWorkspaceTemplates(t *testing.T) {
 	assert.True(t, seen["wellness"])
 }
 
+func TestProductCommercialRejectsRetiredManualPlanPrice(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	tx := db.Begin()
+	require.NoError(t, tx.Error)
+	t.Cleanup(func() { _ = tx.Rollback().Error })
+
+	organization := testutil.CreateTestOrganization(t, tx)
+	plan := models.Plan{
+		BaseModel:    models.BaseModel{ID: uuid.New()},
+		ScopeKey:     "platform",
+		Code:         fmt.Sprintf("retired-plan-%s", uuid.NewString()),
+		Name:         "Retired price plan",
+		Status:       models.CommercialPlanStatusActive,
+		Vertical:     "general",
+		Metadata:     models.JSONB{},
+		DisplayOrder: 1,
+	}
+	require.NoError(t, tx.Create(&plan).Error)
+
+	price := models.PlanPrice{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		PlanID:          plan.ID,
+		Code:            fmt.Sprintf("retired-price-%s", uuid.NewString()),
+		Provider:        models.BillingProviderManual,
+		Currency:        "MYR",
+		UnitAmountMinor: 0,
+		Interval:        models.BillingIntervalMonth,
+		IntervalCount:   1,
+		TaxBehavior:     "exclusive",
+		IsActive:        true,
+		ProviderData:    models.JSONB{},
+		Metadata:        models.JSONB{"assignable": false},
+	}
+	require.NoError(t, tx.Create(&price).Error)
+
+	req := SetOrganizationSubscriptionRequest{
+		PlanID:      &plan.ID,
+		PlanPriceID: &price.ID,
+	}
+	_, _, err := productCommercialFindSubscriptionPlan(
+		tx,
+		organization,
+		&req,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "retired")
+}
+
 func TestProductCommercialPlanCatalogValidation(t *testing.T) {
 	t.Parallel()
 

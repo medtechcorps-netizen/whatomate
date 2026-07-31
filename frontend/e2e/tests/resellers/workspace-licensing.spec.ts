@@ -37,34 +37,43 @@ const reseller = {
 
 const growthPlan = {
   id: '33333333-3333-4333-8333-333333333333',
-  code: 'omnitech-growth',
-  name: 'Omnitech Growth',
-  description: 'CRM and omnichannel workspace',
+  code: 'rereply-growth',
+  name: 'ReReply Growth',
+  description: 'One customer journey across inbox, CRM and automations',
   vertical: 'general',
   status: 'active',
   trial_days: 14,
-  is_public: false,
-  entitlements: { 'omnichannel.enabled': true },
+  is_public: true,
+  entitlements: {
+    'omnichannel.enabled': true,
+    'crm.enabled': true,
+    'bookings.enabled': true,
+    'commerce.enabled': true,
+    'copilot.enabled': true,
+    'threads.public_engagement.enabled': false,
+  },
   prices: [
     {
       id: '77777777-7777-4777-8777-777777777777',
-      code: 'omnitech-growth-myr-year',
+      code: 'rereply-growth-myr-year-2026-v1',
       currency: 'MYR',
-      unit_amount_minor: 299000,
+      unit_amount_minor: 600000,
       setup_amount_minor: 0,
       interval: 'year',
       interval_count: 1,
       tax_behavior: 'exclusive',
+      assignable: true,
     },
     {
       id: '88888888-8888-4888-8888-888888888888',
-      code: 'omnitech-growth-myr-month',
+      code: 'rereply-growth-myr-month-2026-v1',
       currency: 'MYR',
-      unit_amount_minor: 29900,
+      unit_amount_minor: 60000,
       setup_amount_minor: 0,
       interval: 'month',
       interval_count: 1,
       tax_behavior: 'exclusive',
+      assignable: true,
     },
   ],
 }
@@ -72,11 +81,11 @@ const growthPlan = {
 const starterPlan = {
   ...growthPlan,
   id: '99999999-9999-4999-8999-999999999991',
-  code: 'omnitech-starter',
-  name: 'Omnitech Starter',
-  description: 'Core messaging with a shared omnichannel inbox',
+  code: 'rereply-starter',
+  name: 'ReReply Starter',
+  description: 'WhatsApp chatbot, campaigns and customer conversations',
   entitlements: {
-    'omnichannel.enabled': true,
+    'omnichannel.enabled': false,
     'crm.enabled': false,
     'bookings.enabled': false,
     'commerce.enabled': false,
@@ -87,32 +96,42 @@ const starterPlan = {
     {
       ...growthPlan.prices[1],
       id: '99999999-9999-4999-8999-999999999992',
-      code: 'omnitech-starter-myr-month',
-      unit_amount_minor: 9900,
+      code: 'rereply-starter-myr-month-2026-v1',
+      unit_amount_minor: 30000,
     },
   ],
 }
 
-const enterprisePlan = {
+const legacyGrowthPrice = {
+  ...growthPlan.prices[1],
+  id: '99999999-9999-4999-8999-999999999995',
+  code: 'rereply-growth-myr-month',
+  unit_amount_minor: 0,
+  assignable: false,
+}
+
+const growthPlanWithLegacyPrice = {
   ...growthPlan,
-  id: '99999999-9999-4999-8999-999999999993',
-  code: 'omnitech-enterprise',
-  name: 'Omnitech Enterprise',
-  description: 'Complete customer operations and AI workspace',
+  prices: [legacyGrowthPrice, ...growthPlan.prices],
+}
+
+const specialistPlan = {
+  ...growthPlan,
+  id: '99999999-9999-4999-8999-999999999996',
+  code: 'clinic-operations-plus',
+  name: 'Clinic Operations Plus',
+  description: 'A private clinic operations package',
+  is_public: false,
   entitlements: {
-    'omnichannel.enabled': true,
-    'crm.enabled': true,
-    'bookings.enabled': true,
-    'commerce.enabled': true,
-    'copilot.enabled': true,
-    'threads.public_engagement.enabled': true,
+    ...growthPlan.entitlements,
+    'copilot.enabled': false,
   },
   prices: [
     {
       ...growthPlan.prices[1],
-      id: '99999999-9999-4999-8999-999999999994',
-      code: 'omnitech-enterprise-myr-month',
-      unit_amount_minor: 69900,
+      id: '99999999-9999-4999-8999-999999999997',
+      code: 'clinic-operations-plus-myr-month-2026-v1',
+      unit_amount_minor: 75000,
     },
   ],
 }
@@ -201,12 +220,16 @@ async function mockPartnerPortfolio(
   await installWorkspaceSession(page, user, currentOrganizations)
 
   let deletedOrganizationId = ''
+  const initialPlan =
+    plans.find((plan) =>
+      plan.prices.some((price) => price.id === initialPlanPriceId),
+    ) ?? growthPlan
   let license = {
     id: '44444444-4444-4444-8444-444444444444',
-    plan_id: growthPlan.id,
+    plan_id: initialPlan.id,
     plan_price_id: initialPlanPriceId,
-    plan_code: growthPlan.code,
-    plan_name: growthPlan.name,
+    plan_code: initialPlan.code,
+    plan_name: initialPlan.name,
     status: initialStatus,
     provider: initialProvider,
     current_period_start: '2026-07-20T08:00:00Z',
@@ -253,9 +276,7 @@ async function mockPartnerPortfolio(
     },
   )
   await page.route(
-    new RegExp(
-      `/api/admin/organizations/[^/]+/subscription(?:\\?.*)?$`,
-    ),
+    new RegExp(`/api/admin/organizations/[^/]+/subscription(?:\\?.*)?$`),
     async (route) => {
       if (route.request().method() === 'PUT') {
         assignment = route.request().postDataJSON() as Record<string, unknown>
@@ -325,7 +346,7 @@ test.describe('Partner Console workspace licensing', () => {
       'ReAlign Kajang',
     )
     await expect(page.getByTestId('workspace-license-row')).toContainText(
-      'Omnitech Growth',
+      'ReReply Growth',
     )
     await expect(page.getByTestId('workspace-license-panel')).toContainText(
       'Active',
@@ -377,7 +398,7 @@ test.describe('Partner Console workspace licensing', () => {
     await page.goto('/resellers')
 
     await expect(page.getByTestId('workspace-license-row')).toContainText(
-      'Omnitech Growth',
+      'ReReply Growth',
     )
     await expect(page.getByTestId('workspace-license-panel')).toContainText(
       'License changes are reserved for the platform owner',
@@ -392,7 +413,7 @@ test.describe('Partner Console workspace licensing', () => {
   test('fails closed when the current subscription price cannot be resolved', async ({
     page,
   }) => {
-    await mockPartnerPortfolio(
+    const state = await mockPartnerPortfolio(
       page,
       [growthPlan],
       platformOwner,
@@ -408,6 +429,28 @@ test.describe('Partner Console workspace licensing', () => {
       .getByTestId('workspace-license-reference')
       .fill('REALIGN-2026-UNRESOLVED')
     await expect(page.getByTestId('workspace-license-submit')).toBeDisabled()
+
+    await page.goto(`/upgrade-workspace?organization_id=${organization.id}`)
+    await expect(page.getByTestId('upgrade-price-unresolved')).toContainText(
+      'Nothing will change automatically',
+    )
+    await expect(page.getByTestId('upgrade-plan-review')).toHaveCount(0)
+    await expect(page.getByTestId('upgrade-submit')).toHaveCount(0)
+    expect(state.assignment()).toBeNull()
+
+    await page.getByRole('button', { name: 'Choose Growth' }).click()
+    await expect(page.getByTestId('upgrade-price-unresolved')).toContainText(
+      'You explicitly selected ReReply Growth',
+    )
+    await expect(page.getByTestId('upgrade-plan-review')).toBeVisible()
+    await page.getByTestId('upgrade-reference').fill('REALIGN-2026-REPLACEMENT')
+    await expect(page.getByTestId('upgrade-submit')).toBeEnabled()
+    await page.getByTestId('upgrade-submit').click()
+    await expect.poll(state.assignment).toMatchObject({
+      plan_id: growthPlan.id,
+      plan_price_id: growthPlan.prices[1].id,
+      manual_reference: 'REALIGN-2026-REPLACEMENT',
+    })
   })
 
   test('updates portfolio capacity when the partner tier changes', async ({
@@ -416,9 +459,7 @@ test.describe('Partner Console workspace licensing', () => {
     await mockPartnerPortfolio(page)
     await page.goto('/resellers')
 
-    await page
-      .getByRole('tab', { name: 'Brand & portfolio capacity' })
-      .click()
+    await page.getByRole('tab', { name: 'Brand & portfolio capacity' }).click()
     await page.locator('#partner-plan').selectOption('enterprise')
     await expect(page.locator('#org-limit')).toHaveValue('1000')
     await expect(page.getByText(/does not change feature access/)).toBeVisible()
@@ -432,16 +473,25 @@ test.describe('Partner Console workspace licensing', () => {
 
     await expect(page.getByTestId('workspace-danger-zone')).toBeVisible()
     state.delayNextSubscription()
-    await page
-      .getByRole('button', { name: 'Refresh selected workspace license' })
-      .click()
+    const refreshButton = page.locator(
+      'button[aria-label="Refresh selected workspace license"]',
+    )
+    const refreshedLicense = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'GET' &&
+        response
+          .url()
+          .includes(`/api/admin/organizations/${organization.id}/subscription`),
+    )
+    await refreshButton.click()
 
     await expect(page.getByTestId('workspace-danger-zone')).toBeVisible()
     await page.getByTestId('workspace-delete-row').click()
     await expect(
       page.getByRole('dialog', { name: `Delete ${organization.name}?` }),
     ).toBeVisible()
-    await page.waitForTimeout(900)
+    await refreshedLicense
+    await expect(refreshButton).toBeEnabled()
     await expect(
       page.getByRole('dialog', { name: `Delete ${organization.name}?` }),
     ).toBeVisible()
@@ -480,9 +530,9 @@ test.describe('Partner Console workspace licensing', () => {
       .poll(state.deletedOrganizationId)
       .toBe(deletableOrganization.id)
     await expect(page.getByTestId('workspace-license-row')).toHaveCount(1)
-    await expect(
-      page.getByTestId('workspace-license-row'),
-    ).not.toContainText(deletableOrganization.name)
+    await expect(page.getByTestId('workspace-license-row')).not.toContainText(
+      deletableOrganization.name,
+    )
     expect(state.organizations()).toHaveLength(1)
 
     const organizationSwitcher = page
@@ -498,14 +548,50 @@ test.describe('Partner Console workspace licensing', () => {
     ).toHaveCount(0)
   })
 
+  test('keeps a legacy pilot price visible while selecting its paid replacement', async ({
+    page,
+  }) => {
+    await mockPartnerPortfolio(
+      page,
+      [starterPlan, growthPlanWithLegacyPrice],
+      platformOwner,
+      legacyGrowthPrice.id,
+    )
+    await page.goto('/resellers')
+
+    await expect(
+      page.getByTestId('workspace-license-price-unresolved'),
+    ).toContainText('retired pilot price')
+    await expect(page.getByTestId('workspace-license-plan')).toHaveValue(
+      `${growthPlan.id}::${growthPlan.prices[1].id}`,
+    )
+
+    await page.goto(`/upgrade-workspace?organization_id=${organization.id}`)
+    await expect(page.getByTestId('upgrade-retired-price')).toContainText(
+      'no billing change happens automatically',
+    )
+    await expect(page.getByTestId('workspace-plan-growth')).toContainText(
+      /RM\s*600/,
+    )
+    await expect(
+      page
+        .getByTestId('workspace-plan-growth')
+        .getByRole('button', { name: 'Replacement price selected' }),
+    ).toBeVisible()
+    await expect(page.getByTestId('upgrade-plan-price')).toHaveValue(
+      `${growthPlan.id}::${growthPlan.prices[1].id}`,
+    )
+  })
+
   test('compares real workspace benefits and applies the selected plan', async ({
     page,
   }) => {
-    const state = await mockPartnerPortfolio(page, [
-      starterPlan,
-      growthPlan,
-      enterprisePlan,
-    ])
+    const state = await mockPartnerPortfolio(
+      page,
+      [starterPlan, growthPlan],
+      platformOwner,
+      starterPlan.prices[0].id,
+    )
     await page.goto('/resellers')
     const upgradeLink = page.getByRole('link', { name: 'Upgrade workspace' })
     await expect(upgradeLink).toHaveAttribute(
@@ -518,38 +604,129 @@ test.describe('Partner Console workspace licensing', () => {
       page.getByRole('heading', { name: 'Upgrade workspace' }),
     ).toBeVisible()
     const comparison = page.getByLabel('Workspace plan comparison')
+    await expect(comparison).toContainText('ReReply Starter')
+    for (const key of ['starter', 'growth', 'sprint', 'enterprise']) {
+      await expect(page.getByTestId(`workspace-plan-${key}`)).toBeVisible()
+    }
+    await expect(page.getByTestId('workspace-plan-starter')).toContainText(
+      /RM\s*300/,
+    )
+    await expect(page.getByTestId('workspace-plan-growth')).toContainText(
+      /RM\s*600/,
+    )
+    await expect(page.getByTestId('workspace-plan-growth')).toContainText(
+      'Most popular',
+    )
+    await expect(page.getByTestId('workspace-plan-growth')).toContainText(
+      'Shared inbox for WhatsApp, Instagram, Messenger, email and web chat',
+    )
+    await expect(page.getByTestId('workspace-plan-sprint')).toContainText(
+      /RM\s*900/,
+    )
+    await expect(page.getByTestId('workspace-plan-sprint')).toContainText(
+      'Coming soon',
+    )
     await expect(
-      comparison.getByRole('heading', { name: 'Omnitech Starter' }),
-    ).toBeVisible()
+      page
+        .getByTestId('workspace-plan-sprint')
+        .getByRole('button', { name: 'Planned launch' }),
+    ).toBeDisabled()
     await expect(
-      comparison.getByRole('heading', { name: 'Omnitech Growth' }),
+      page.getByText('any existing Calling beta access is separate', {
+        exact: false,
+      }),
     ).toBeVisible()
+    await expect(page.getByTestId('workspace-plan-enterprise')).toContainText(
+      'Call us',
+    )
     await expect(
-      comparison.getByRole('heading', { name: 'Omnitech Enterprise' }),
-    ).toBeVisible()
-    await expect(
-      page.getByText('CRM pipeline, tasks, insights and automations').last(),
-    ).toBeVisible()
-    await expect(
-      page.getByText('Packages, invoices and payment tracking').last(),
-    ).toBeVisible()
+      page
+        .getByTestId('workspace-plan-enterprise')
+        .getByRole('link', { name: 'Email sales' }),
+    ).toHaveAttribute(
+      'href',
+      'mailto:medtechcorps@gmail.com?subject=ReReply%20Enterprise%20Plan',
+    )
+    expect(state.assignment()).toBeNull()
 
-    await page
-      .getByRole('button', { name: 'Choose Omnitech Enterprise' })
-      .click()
+    await page.getByRole('button', { name: 'Choose Growth' }).click()
     await expect(page.getByTestId('upgrade-submit')).toBeDisabled()
     expect(state.assignment()).toBeNull()
 
-    await page.getByTestId('upgrade-reference').fill('RELIVE-2026-ENTERPRISE')
+    await page.getByTestId('upgrade-reference').fill('RELIVE-2026-GROWTH')
     await page.getByTestId('upgrade-submit').click()
 
     await expect.poll(state.assignment).toMatchObject({
-      plan_id: enterprisePlan.id,
-      plan_price_id: enterprisePlan.prices[0].id,
+      plan_id: growthPlan.id,
+      plan_price_id: growthPlan.prices[1].id,
       status: 'active',
-      manual_reference: 'RELIVE-2026-ENTERPRISE',
+      manual_reference: 'RELIVE-2026-GROWTH',
     })
     await expect(page.getByText('Current', { exact: true })).toBeVisible()
+  })
+
+  test('platform owner can select another assignable catalog plan', async ({
+    page,
+  }) => {
+    const state = await mockPartnerPortfolio(
+      page,
+      [starterPlan, growthPlan, specialistPlan],
+      platformOwner,
+      starterPlan.prices[0].id,
+    )
+    await page.goto(`/upgrade-workspace?organization_id=${organization.id}`)
+
+    await expect(page.getByTestId('upgrade-other-catalog-plan')).toBeVisible()
+    await page.getByTestId('upgrade-other-plan').selectOption(specialistPlan.id)
+
+    const review = page.getByTestId('upgrade-plan-review')
+    await expect(
+      review.getByRole('heading', { name: specialistPlan.name }),
+    ).toBeVisible()
+    await expect(page.getByTestId('upgrade-plan-price')).toHaveValue(
+      `${specialistPlan.id}::${specialistPlan.prices[0].id}`,
+    )
+    await page.getByTestId('upgrade-reference').fill('REALIGN-2026-SPECIALIST')
+    await page.getByTestId('upgrade-submit').click()
+
+    await expect.poll(state.assignment).toMatchObject({
+      plan_id: specialistPlan.id,
+      plan_price_id: specialistPlan.prices[0].id,
+      manual_reference: 'REALIGN-2026-SPECIALIST',
+    })
+  })
+
+  test('keeps the four-plan comparison usable on a narrow mobile viewport', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await mockPartnerPortfolio(page, [starterPlan, growthPlan])
+    await page.goto(`/upgrade-workspace?organization_id=${organization.id}`)
+
+    for (const key of ['starter', 'growth', 'sprint', 'enterprise']) {
+      await expect(page.getByTestId(`workspace-plan-${key}`)).toBeVisible()
+    }
+    const chooseStarter = page.getByRole('button', {
+      name: 'Choose Starter',
+    })
+    await chooseStarter.focus()
+    await expect(chooseStarter).toBeFocused()
+    await page.keyboard.press('Enter')
+
+    const review = page.getByTestId('upgrade-plan-review')
+    await expect(review).toBeVisible()
+    await expect(
+      review.getByRole('heading', { name: 'Starter', exact: true }),
+    ).toBeVisible()
+    await expect(page.getByTestId('upgrade-plan-price')).toHaveValue(
+      `${starterPlan.id}::${starterPlan.prices[0].id}`,
+    )
+    await expect(page.getByTestId('upgrade-reference')).toBeVisible()
+    await expect(page.getByTestId('upgrade-submit')).toBeDisabled()
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - window.innerWidth,
+    )
+    expect(overflow).toBeLessThanOrEqual(1)
   })
 
   test('does not offer manual changes for a provider-managed subscription', async ({
@@ -557,23 +734,21 @@ test.describe('Partner Console workspace licensing', () => {
   }) => {
     const state = await mockPartnerPortfolio(
       page,
-      [starterPlan, growthPlan, enterprisePlan],
+      [starterPlan, growthPlan],
       platformOwner,
       growthPlan.prices[1].id,
       'stripe',
       'canceled',
     )
     await page.goto('/resellers')
-    await expect(
-      page.getByTestId('workspace-license-panel'),
-    ).toContainText('Manual plan change unavailable')
+    await expect(page.getByTestId('workspace-license-panel')).toContainText(
+      'Manual plan change unavailable',
+    )
     await expect(page.getByTestId('workspace-license-submit')).toHaveCount(0)
 
     await page.goto(`/upgrade-workspace?organization_id=${organization.id}`)
 
-    await page
-      .getByRole('button', { name: 'Choose Omnitech Enterprise' })
-      .click()
+    await page.getByRole('button', { name: 'Choose Starter' }).click()
     await expect(page.getByText('Manual plan change unavailable')).toBeVisible()
     await expect(
       page.getByText(/Change or cancel it through that billing provider/),

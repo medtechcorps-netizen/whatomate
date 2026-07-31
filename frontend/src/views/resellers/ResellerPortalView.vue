@@ -102,7 +102,7 @@ const selectedOrganizationLicense = computed(() =>
     ? (organizationLicenses.value[selectedOrganizationId.value] ?? null)
     : null,
 )
-const planPriceOptions = computed<PlanPriceOption[]>(() =>
+const catalogPlanPriceOptions = computed<PlanPriceOption[]>(() =>
   plans.value.flatMap((plan) =>
     plan.prices
       .filter((price) => price.interval !== 'one_time')
@@ -111,6 +111,11 @@ const planPriceOptions = computed<PlanPriceOption[]>(() =>
         plan,
         price,
       })),
+  ),
+)
+const planPriceOptions = computed(() =>
+  catalogPlanPriceOptions.value.filter(
+    (option) => option.price.assignable !== false,
   ),
 )
 const licenseForm = reactive({
@@ -259,6 +264,32 @@ function hydrateLicenseForm() {
             item.plan.id === license.plan_id &&
             item.price.id === license.plan_price_id,
         ) ?? null
+    }
+    const retiredCurrent =
+      license.plan_id && license.plan_price_id
+        ? catalogPlanPriceOptions.value.find(
+            (item) =>
+              item.plan.id === license.plan_id &&
+              item.price.id === license.plan_price_id &&
+              item.price.assignable === false,
+          )
+        : null
+    if (!option && retiredCurrent) {
+      const replacements = planPriceOptions.value.filter(
+        (item) => item.plan.id === retiredCurrent.plan.id,
+      )
+      option =
+        replacements.find(
+          (item) =>
+            item.price.interval === 'month' &&
+            (item.price.interval_count || 1) === 1,
+        ) ??
+        replacements[0] ??
+        null
+      if (option) {
+        licensePriceResolutionError.value =
+          'This workspace uses a retired pilot price. The published replacement is selected; no change occurs until you approve and save it.'
+      }
     }
     if (!option && !planCatalogLoading.value) {
       licensePriceResolutionError.value =

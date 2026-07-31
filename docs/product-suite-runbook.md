@@ -61,41 +61,31 @@ actions. They do not claim that money was collected by a payment provider.
 
 ### Initial activation
 
-Create the plan once through `POST /api/admin/product/plans`. Use a unique plan
-and price code for each commercial catalog; never reuse an existing code to
-change a published price.
+The production migration applies a versioned, idempotent initial backfill for
+the approved first-party workspace catalog:
 
-```json
-{
-  "code": "omnitech-growth",
-  "name": "Omnitech Growth",
-  "description": "CRM, scheduling, commerce, reviewed AI and shared inbox",
-  "vertical": "general",
-  "status": "active",
-  "trial_days": 14,
-  "is_public": false,
-  "prices": [
-    {
-      "code": "omnitech-growth-myr-month",
-      "currency": "MYR",
-      "unit_amount_minor": 0,
-      "interval": "month",
-      "interval_count": 1
-    }
-  ],
-  "entitlements": [
-    {"key": "crm.enabled", "value_type": "boolean", "value": true, "enforcement": "hard"},
-    {"key": "bookings.enabled", "value_type": "boolean", "value": true, "enforcement": "hard"},
-    {"key": "commerce.enabled", "value_type": "boolean", "value": true, "enforcement": "hard"},
-    {"key": "copilot.enabled", "value_type": "boolean", "value": true, "enforcement": "hard"},
-    {"key": "omnichannel.enabled", "value_type": "boolean", "value": true, "enforcement": "hard"},
-    {"key": "threads.public_engagement.enabled", "value_type": "boolean", "value": false, "enforcement": "hard"}
-  ]
-}
-```
+| Plan | Code | Monthly MYR minor units | Licensed modules |
+| --- | --- | ---: | --- |
+| ReReply Starter | `rereply-starter` | `30000` | Core WhatsApp chat, chatbot, campaigns, templates and flows; commercial module entitlements remain disabled |
+| ReReply Growth | `rereply-growth` | `60000` | Omnichannel, CRM, bookings, commerce and reviewed Qwen Copilot |
 
-The zero amount above is a safe trial-catalog placeholder, not a recommended
-selling price. Set the approved amount before using the plan commercially.
+Sprint is advertised at RM900/month as a non-assignable coming-soon plan until
+calling is enforced by the commercial entitlement layer. Enterprise is a
+contact-sales offer and is not represented by a dummy zero-value subscription
+price. Threads public engagement remains disabled in the published plans.
+
+Published prices are immutable. Use a new unique price code whenever an
+approved amount changes; never overwrite a price already referenced by a
+subscription. The legacy RM0 Growth pilot price remains resolvable for existing
+subscription identities but is marked `assignable=false`, so it cannot be used
+for a new manual plan change. Moving an existing pilot workspace to RM600
+requires an explicit audited assignment and never happens automatically.
+After the initial catalog version is recorded, application restarts do not
+reactivate archived plans or disabled prices and do not overwrite later
+control-plane entitlement edits.
+
+Reseller-specific plans may still be created through
+`POST /api/admin/product/plans`. They must use unique plan and price codes.
 
 As a platform superadmin, load the target-specific assignable catalog through
 `GET /api/admin/organizations/{organization_id}/product/plans`, select the
