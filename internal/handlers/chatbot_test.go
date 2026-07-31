@@ -190,6 +190,92 @@ func TestApp_GetChatbotSettings(t *testing.T) {
 		assert.Equal(t, int64(0), resp.Data.Stats.TotalSessions)
 		assert.Equal(t, int64(0), resp.Data.Stats.KeywordsCount)
 	})
+
+	t.Run("AI response stats are scoped through active parent sessions", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		contact := testutil.CreateTestContact(t, app.DB, org.ID)
+		session := createSessionForChatbotTest(
+			t,
+			app,
+			org.ID,
+			contact.ID,
+			"+60111111111",
+			models.SessionStatusActive,
+		)
+
+		aiFlow := createTestChatbotFlow(t, app, org.ID, "AI Support Flow")
+		aiFlow.Graph = models.JSONB{
+			"version":    2,
+			"entry_node": "__start__",
+			"nodes": []map[string]any{
+				{"id": "__start__", "type": "start"},
+				{"id": "clinic_ai_reply", "type": "ai_response"},
+				{"id": "done", "type": "end"},
+			},
+			"edges": []map[string]any{
+				{"from": "__start__", "to": "clinic_ai_reply", "condition": "default"},
+				{"from": "clinic_ai_reply", "to": "done", "condition": "default"},
+			},
+		}
+		require.NoError(t, app.DB.Model(aiFlow).Update("graph", aiFlow.Graph).Error)
+		require.NoError(t, app.DB.Model(session).Update("current_flow_id", aiFlow.ID).Error)
+
+		createMessage := func(sessionID uuid.UUID, stepName string) {
+			t.Helper()
+			require.NoError(t, app.DB.Create(&models.ChatbotSessionMessage{
+				BaseModel: models.BaseModel{ID: uuid.New()},
+				SessionID: sessionID,
+				Direction: models.DirectionOutgoing,
+				Message:   "Test response",
+				StepName:  stepName,
+			}).Error)
+		}
+
+		createMessage(session.ID, "ai_response")
+		createMessage(session.ID, "ai_response")
+		createMessage(session.ID, "clinic_ai_reply")
+		createMessage(session.ID, "greeting")
+
+		otherOrg := testutil.CreateTestOrganization(t, app.DB)
+		otherContact := testutil.CreateTestContact(t, app.DB, otherOrg.ID)
+		otherSession := createSessionForChatbotTest(
+			t,
+			app,
+			otherOrg.ID,
+			otherContact.ID,
+			"+60222222222",
+			models.SessionStatusActive,
+		)
+		createMessage(otherSession.ID, "ai_response")
+
+		deletedSession := createSessionForChatbotTest(
+			t,
+			app,
+			org.ID,
+			contact.ID,
+			"+60333333333",
+			models.SessionStatusCompleted,
+		)
+		createMessage(deletedSession.ID, "ai_response")
+		require.NoError(t, app.DB.Delete(deletedSession).Error)
+
+		req := testutil.NewGETRequest(t)
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		err := app.GetChatbotSettings(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+		var resp struct {
+			Data struct {
+				Stats handlers.ChatbotStatsResponse `json:"stats"`
+			} `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &resp))
+		assert.Equal(t, int64(3), resp.Data.Stats.AIResponses)
+	})
 }
 
 // =============================================================================
@@ -846,8 +932,29 @@ func TestApp_ListChatbotFlows(t *testing.T) {
 			testutil.WithRoleID(&role.ID),
 		)
 
-		createTestChatbotFlow(t, app, org.ID, "Welcome Flow")
-		createTestChatbotFlow(t, app, org.ID, "Support Flow")
+		welcomeFlow := createTestChatbotFlow(t, app, org.ID, "Welcome Flow")
+		welcomeFlow.Graph = models.JSONB{
+			"version":    2,
+			"entry_node": "__start__",
+			"nodes": []map[string]any{
+				{"id": "__start__", "type": "start"},
+				{"id": "welcome", "type": "message"},
+				{"id": "done", "type": "end"},
+			},
+			"edges": []map[string]any{
+				{"from": "__start__", "to": "welcome", "condition": "default"},
+				{"from": "welcome", "to": "done", "condition": "default"},
+			},
+		}
+		require.NoError(t, app.DB.Model(welcomeFlow).Update("graph", welcomeFlow.Graph).Error)
+
+		supportFlow := createTestChatbotFlow(t, app, org.ID, "Support Flow")
+		supportFlow.Graph = models.JSONB{
+			"version":    1,
+			"entry_node": "legacy",
+			"nodes":      []map[string]any{{"id": "legacy", "type": "message"}},
+		}
+		require.NoError(t, app.DB.Model(supportFlow).Update("graph", supportFlow.Graph).Error)
 
 		req := testutil.NewGETRequest(t)
 		testutil.SetAuthContext(req, org.ID, user.ID)
@@ -864,6 +971,13 @@ func TestApp_ListChatbotFlows(t *testing.T) {
 		err = json.Unmarshal(testutil.GetResponseBody(req), &resp)
 		require.NoError(t, err)
 		assert.Len(t, resp.Data.Flows, 2)
+
+		stepsByFlow := make(map[string]int, len(resp.Data.Flows))
+		for _, flow := range resp.Data.Flows {
+			stepsByFlow[flow.Name] = flow.StepsCount
+		}
+		assert.Equal(t, 2, stepsByFlow["Welcome Flow"])
+		assert.Equal(t, 0, stepsByFlow["Support Flow"])
 	})
 
 	t.Run("empty list", func(t *testing.T) {

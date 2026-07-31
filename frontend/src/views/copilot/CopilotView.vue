@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
   Bot,
   Check,
   Clipboard,
   FileSearch,
+  History,
   ListChecks,
   Loader2,
   MessageSquareReply,
+  RefreshCw,
   ShieldAlert,
   Sparkles,
   Wand2,
@@ -18,7 +20,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
-import { getErrorMessage, unwrapItemResponse } from '@/lib/api-utils'
+import { getErrorMessage, unwrapItemResponse, unwrapListResponse } from '@/lib/api-utils'
 import { copilotService, type CopilotRun } from '@/services/productSuite'
 
 const toast = useAppToast()
@@ -31,6 +33,10 @@ const generating = ref(false)
 const accepting = ref(false)
 const run = ref<CopilotRun | null>(null)
 const editableResult = ref('')
+const viewingHistoricalRun = ref(false)
+const recentRuns = ref<CopilotRun[]>([])
+const historyLoading = ref(true)
+const historyError = ref(false)
 const runIdempotencyKey = ref(crypto.randomUUID())
 const canExecute = computed(() => authStore.hasPermission('copilot', 'execute'))
 const canReadContacts = computed(() => authStore.hasPermission('contacts', 'read'))
@@ -73,6 +79,81 @@ const modes = [
 
 const activeMode = computed(() => modes.find((mode) => mode.key === taskType.value) ?? modes[0])
 
+function resultTextForRun(selectedRun: CopilotRun) {
+  if (selectedRun.result_text) return selectedRun.result_text
+  if (
+    selectedRun.structured_result &&
+    Object.keys(selectedRun.structured_result).length > 0
+  ) {
+    return JSON.stringify(selectedRun.structured_result, null, 2)
+  }
+  return ''
+}
+
+function historyPreview(selectedRun: CopilotRun) {
+  const content = resultTextForRun(selectedRun).replace(/\s+/g, ' ').trim()
+  return content || 'No saved result'
+}
+
+function historyModeLabel(value: CopilotRun['task_type']) {
+  return modes.find((mode) => mode.key === value)?.label ?? value
+}
+
+function formatHistoryDate(value: string) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return new Intl.DateTimeFormat('en-MY', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(date)
+}
+
+function historyStatusClass(status: string) {
+  switch (status) {
+    case 'completed':
+      return 'border-emerald-300/20 bg-emerald-300/[0.07] text-emerald-200'
+    case 'failed':
+      return 'border-red-300/20 bg-red-300/[0.07] text-red-200'
+    case 'blocked':
+      return 'border-amber-300/20 bg-amber-300/[0.07] text-amber-200'
+    default:
+      return 'border-white/10 bg-white/[0.04] text-white/45 light:border-gray-200 light:bg-gray-100 light:text-gray-500'
+  }
+}
+
+async function loadRunHistory() {
+  historyLoading.value = true
+  historyError.value = false
+  try {
+    const response = await copilotService.runs({ page: 1, limit: 50 })
+    recentRuns.value = unwrapListResponse<CopilotRun>(response, 'runs')
+  } catch {
+    historyError.value = true
+  } finally {
+    historyLoading.value = false
+  }
+}
+
+function selectHistoricalRun(selectedRun: CopilotRun) {
+  run.value = selectedRun
+  editableResult.value = resultTextForRun(selectedRun)
+  taskType.value = selectedRun.task_type
+  if (selectedRun.contact_id) {
+    contactId.value = selectedRun.contact_id
+  }
+  viewingHistoricalRun.value = true
+}
+
+function selectMode(mode: CopilotRun['task_type']) {
+  taskType.value = mode
+  if (!viewingHistoricalRun.value) return
+  run.value = null
+  editableResult.value = ''
+  viewingHistoricalRun.value = false
+}
+
 async function generate() {
   if (!canExecute.value) {
     toast.warning('You have read-only Copilot access')
@@ -85,6 +166,7 @@ async function generate() {
   generating.value = true
   run.value = null
   editableResult.value = ''
+  viewingHistoricalRun.value = false
   try {
     const response = await copilotService.run(contactId.value.trim(), taskType.value, {
       instruction: instruction.value.trim(),
@@ -92,10 +174,9 @@ async function generate() {
       idempotency_key: runIdempotencyKey.value,
     })
     run.value = unwrapItemResponse<CopilotRun>(response)
-    editableResult.value =
-      run.value.result_text ||
-      (run.value.structured_result ? JSON.stringify(run.value.structured_result, null, 2) : '')
+    editableResult.value = resultTextForRun(run.value)
     runIdempotencyKey.value = crypto.randomUUID()
+    await loadRunHistory()
   } catch (error) {
     toast.error('Qwen could not generate a result', getErrorMessage(error))
   } finally {
@@ -117,6 +198,7 @@ async function acceptResult() {
       accepted: true,
       final_text: editableResult.value,
     })
+    await loadRunHistory()
     toast.success('Draft approved', 'It is still not sent; paste it into the conversation after your final review.')
   } catch (error) {
     toast.error('Approval was not saved', getErrorMessage(error))
@@ -124,6 +206,10 @@ async function acceptResult() {
     accepting.value = false
   }
 }
+
+onMounted(() => {
+  void loadRunHistory()
+})
 </script>
 
 <template>
@@ -156,7 +242,7 @@ async function acceptResult() {
                   ? 'border-emerald-300/30 bg-emerald-300/[0.08]'
                   : 'border-white/[0.07] bg-white/[0.015] hover:bg-white/[0.035] light:border-gray-200 light:bg-gray-50'
               "
-              @click="taskType = mode.key"
+              @click="selectMode(mode.key)"
             >
               <div
                 class="flex h-9 w-9 items-center justify-center rounded-lg"
@@ -214,6 +300,83 @@ async function acceptResult() {
             </p>
           </div>
         </section>
+
+        <section class="overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.025] light:border-gray-200 light:bg-white">
+          <div class="flex items-center justify-between border-b border-white/[0.07] px-4 py-3.5 light:border-gray-100">
+            <div class="flex items-center gap-2.5">
+              <div class="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-300/[0.08] text-emerald-200">
+                <History class="h-4 w-4" />
+              </div>
+              <div>
+                <h2 class="text-xs font-semibold text-white light:text-gray-900">Recent Copilot runs</h2>
+                <p class="mt-0.5 text-[9px] uppercase tracking-[0.14em] text-white/25 light:text-gray-400">
+                  Read-only · latest 50
+                </p>
+              </div>
+            </div>
+            <Button
+              variant="ghost"
+              size="icon"
+              class="h-8 w-8 text-white/35 hover:text-emerald-200 light:text-gray-500"
+              :disabled="historyLoading"
+              aria-label="Refresh Copilot run history"
+              @click="loadRunHistory"
+            >
+              <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': historyLoading }" />
+            </Button>
+          </div>
+
+          <div v-if="historyLoading && !recentRuns.length" class="space-y-2 p-3" aria-label="Loading Copilot run history">
+            <div v-for="index in 3" :key="index" class="h-[76px] animate-pulse rounded-xl bg-white/[0.035] light:bg-gray-100" />
+          </div>
+
+          <div v-else-if="historyError && !recentRuns.length" class="p-5 text-center">
+            <p class="text-xs text-white/40 light:text-gray-500">Run history is temporarily unavailable.</p>
+            <Button variant="ghost" size="sm" class="mt-2 text-emerald-200" @click="loadRunHistory">Try again</Button>
+          </div>
+
+          <div v-else-if="!recentRuns.length" class="p-5 text-center">
+            <p class="text-xs text-white/35 light:text-gray-500">No saved Copilot runs yet.</p>
+          </div>
+
+          <div v-else class="max-h-[390px] space-y-1.5 overflow-y-auto p-2">
+            <button
+              v-for="historicalRun in recentRuns"
+              :key="historicalRun.id"
+              type="button"
+              class="group w-full rounded-xl border px-3 py-2.5 text-left transition"
+              :class="
+                run?.id === historicalRun.id && viewingHistoricalRun
+                  ? 'border-emerald-300/25 bg-emerald-300/[0.07]'
+                  : 'border-transparent bg-white/[0.02] hover:border-white/[0.07] hover:bg-white/[0.04] light:bg-gray-50 light:hover:border-gray-200 light:hover:bg-gray-100'
+              "
+              :aria-pressed="run?.id === historicalRun.id && viewingHistoricalRun"
+              @click="selectHistoricalRun(historicalRun)"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[10px] font-semibold text-white/70 light:text-gray-700">
+                  {{ historyModeLabel(historicalRun.task_type) }}
+                </span>
+                <span
+                  class="rounded-full border px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-wider"
+                  :class="historyStatusClass(historicalRun.status)"
+                >
+                  {{ historicalRun.status }}
+                </span>
+              </div>
+              <p class="mt-1.5 line-clamp-2 text-[10px] leading-4 text-white/35 transition group-hover:text-white/50 light:text-gray-500">
+                {{ historyPreview(historicalRun) }}
+              </p>
+              <p class="mt-1.5 text-[9px] text-white/20 light:text-gray-400">
+                {{ formatHistoryDate(historicalRun.created_at) }} · {{ historicalRun.model }}
+              </p>
+            </button>
+
+            <p v-if="historyError" class="px-2 py-1 text-center text-[9px] text-amber-200/60">
+              Refresh failed; showing the last loaded history.
+            </p>
+          </div>
+        </section>
       </aside>
 
       <main
@@ -233,11 +396,15 @@ async function acceptResult() {
             </div>
           </div>
           <div v-if="run" class="flex gap-2">
+            <Badge v-if="viewingHistoricalRun" variant="outline" class="border-white/10 text-[9px] text-white/40 light:border-gray-200 light:text-gray-500">
+              Saved run · read-only
+            </Badge>
             <Button variant="outline" size="sm" :disabled="!editableResult" @click="copyResult">
               <Clipboard class="mr-2 h-3.5 w-3.5" />
               Copy
             </Button>
             <Button
+              v-if="!viewingHistoricalRun"
               size="sm"
               class="bg-emerald-300 text-black hover:bg-emerald-200"
               :disabled="accepting || !editableResult || !canExecute"
@@ -274,7 +441,8 @@ async function acceptResult() {
 
           <textarea
             v-model="editableResult"
-            class="min-h-[470px] w-full resize-none rounded-2xl border border-white/[0.08] bg-black/15 p-5 text-[15px] leading-7 text-white outline-none transition focus:border-emerald-300/30 light:border-gray-200 light:bg-gray-50 light:text-gray-900"
+            :readonly="viewingHistoricalRun"
+            class="min-h-[470px] w-full resize-none rounded-2xl border border-white/[0.08] bg-black/15 p-5 text-[15px] leading-7 text-white outline-none transition focus:border-emerald-300/30 read-only:cursor-default read-only:focus:border-white/[0.08] light:border-gray-200 light:bg-gray-50 light:text-gray-900 light:read-only:focus:border-gray-200"
           />
 
           <div class="mt-4 flex flex-wrap items-center gap-2">
