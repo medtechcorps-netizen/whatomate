@@ -197,9 +197,9 @@ func loadAndValidatePrerequisites(tx *gorm.DB, opts SeedOptions) (prerequisiteRo
 }
 
 func loadCRMContacts(tx *gorm.DB, organizationID uuid.UUID) ([]ContactReference, error) {
-	expected := make([]uuid.UUID, 0, 30)
-	sequenceByID := make(map[uuid.UUID]int, 30)
-	for sequence := 11; sequence <= 40; sequence++ {
+	expected := make([]uuid.UUID, 0, crmContactReferenceCount)
+	sequenceByID := make(map[uuid.UUID]int, crmContactReferenceCount)
+	for sequence := crmContactFirstSequence; sequence <= crmContactLastSequence; sequence++ {
 		id := deterministicUUID(fmt.Sprintf("%s-contact-%d", crmDataset, sequence))
 		expected = append(expected, id)
 		sequenceByID[id] = sequence
@@ -210,7 +210,11 @@ func loadCRMContacts(tx *gorm.DB, organizationID uuid.UUID) ([]ContactReference,
 		return nil, fmt.Errorf("load CRM mock contacts: %w", err)
 	}
 	if len(rows) != len(expected) {
-		return nil, fmt.Errorf("expected 30 deterministic CRM mock contacts, found %d", len(rows))
+		return nil, fmt.Errorf(
+			"expected %d deterministic CRM mock contacts, found %d",
+			crmContactReferenceCount,
+			len(rows),
+		)
 	}
 	byID := make(map[uuid.UUID]models.Contact, len(rows))
 	for _, row := range rows {
