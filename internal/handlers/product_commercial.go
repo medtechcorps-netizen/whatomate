@@ -47,6 +47,7 @@ type ProductPlanPriceResponse struct {
 	Interval         models.BillingInterval `json:"interval"`
 	IntervalCount    int                    `json:"interval_count"`
 	TaxBehavior      string                 `json:"tax_behavior"`
+	Assignable       bool                   `json:"assignable"`
 }
 
 // ProductPlanResponse deliberately excludes provider IDs and provider payloads.
@@ -977,6 +978,14 @@ func (a *App) HasProductEntitlement(
 	return decision.Allowed, err
 }
 
+func productCommercialPlanPriceAssignable(price *models.PlanPrice) bool {
+	if price == nil || price.Metadata == nil {
+		return true
+	}
+	assignable, configured := price.Metadata["assignable"].(bool)
+	return !configured || assignable
+}
+
 func (a *App) productCommercialPlanCatalog(
 	organization *models.Organization,
 	publicOnly bool,
@@ -1043,6 +1052,9 @@ func (a *App) productCommercialPlanCatalog(
 	}
 	pricesByPlan := make(map[uuid.UUID][]ProductPlanPriceResponse)
 	for _, price := range prices {
+		if assignableOnly && !productCommercialPlanPriceAssignable(&price) {
+			continue
+		}
 		priceID := price.ID
 		pricesByPlan[price.PlanID] = append(pricesByPlan[price.PlanID], ProductPlanPriceResponse{
 			ID:               &priceID,
@@ -1053,6 +1065,7 @@ func (a *App) productCommercialPlanCatalog(
 			Interval:         price.Interval,
 			IntervalCount:    price.IntervalCount,
 			TaxBehavior:      price.TaxBehavior,
+			Assignable:       productCommercialPlanPriceAssignable(&price),
 		})
 	}
 
@@ -4072,6 +4085,7 @@ func productCommercialLoadPlanResponse(
 			Interval:         prices[i].Interval,
 			IntervalCount:    prices[i].IntervalCount,
 			TaxBehavior:      prices[i].TaxBehavior,
+			Assignable:       productCommercialPlanPriceAssignable(&prices[i]),
 		}
 	}
 	return ProductPlanResponse{
@@ -4619,6 +4633,12 @@ func productCommercialFindSubscriptionPlan(
 		return nil, nil, newProductCommercialClientError(
 			fasthttp.StatusBadRequest,
 			"Only monthly or yearly prices can be assigned as subscriptions",
+		)
+	}
+	if !productCommercialPlanPriceAssignable(&price) {
+		return nil, nil, newProductCommercialClientError(
+			fasthttp.StatusBadRequest,
+			"This plan price is retired and cannot be assigned",
 		)
 	}
 	return &plan, &price, nil
