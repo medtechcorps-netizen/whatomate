@@ -679,6 +679,8 @@ test.describe("Focused mobile workspace", () => {
     await expect(
       page.getByRole("button", { name: "Open mobile workspace menu" }),
     ).toBeHidden();
+    await expect(page.locator("aside nav")).toHaveCount(1);
+    await expect(page.locator("aside nav")).toBeVisible();
     const desktopNavigation = page.getByRole("menubar");
     await expect(
       desktopNavigation.getByRole("menuitem", { name: "Lead Pipeline" }),

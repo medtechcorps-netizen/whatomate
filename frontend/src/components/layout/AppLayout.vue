@@ -233,7 +233,7 @@ const handleLogout = async () => {
 
       <!-- Navigation -->
       <ScrollArea class="flex-1 py-2">
-        <nav class="px-2 lg:hidden" aria-label="Mobile workspace">
+        <div class="px-2 lg:hidden" role="navigation" aria-label="Mobile workspace">
           <p class="px-2.5 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-white/35 light:text-slate-600">
             Mobile workspace
           </p>
@@ -283,7 +283,7 @@ const handleLogout = async () => {
           <p class="px-3 pt-4 text-xs leading-5 text-white/35 light:text-slate-600">
             Advanced workspace tools are available on desktop.
           </p>
-        </nav>
+        </div>
 
         <nav class="hidden px-2 lg:block" role="menubar">
           <template v-for="(section, sIdx) in mainSections" :key="section.label">
