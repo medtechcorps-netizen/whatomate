@@ -1472,7 +1472,7 @@ func TestApp_GetChatbotSettings_ExistingSettings(t *testing.T) {
 	t.Run("returns persisted settings when they exist", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createChatbotSettingsReader(t, app, org.ID)
 
 		// Create settings directly in the DB
 		settings := &models.ChatbotSettings{

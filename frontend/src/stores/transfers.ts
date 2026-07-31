@@ -71,6 +71,7 @@ export const useTransfersStore = defineStore('transfers', () => {
   const transfers = ref<AgentTransfer[]>([])
   const generalQueueCount = ref(0)
   const teamQueueCounts = ref<Record<string, number>>({})
+  const allowQueuePickup = ref(true)
   const isLoading = ref(false)
   const lastSyncedAt = ref<number>(0) // Timestamp of last WebSocket sync
 
@@ -131,6 +132,9 @@ export const useTransfersStore = defineStore('transfers', () => {
 
       generalQueueCount.value = data.general_queue_count ?? 0
       teamQueueCounts.value = data.team_queue_counts ?? {}
+      allowQueuePickup.value = typeof data.allow_agent_queue_pickup === 'boolean'
+        ? data.allow_agent_queue_pickup
+        : true
       totalCount.value = data.total_count ?? transfers.value.length
     } catch (error) {
       console.error('Failed to fetch transfers:', error)
@@ -270,6 +274,7 @@ export const useTransfersStore = defineStore('transfers', () => {
     queueCount,
     generalQueueCount,
     teamQueueCounts,
+    allowQueuePickup,
     isLoading,
     lastSyncedAt,
     activeTransfers,
