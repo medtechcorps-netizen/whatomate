@@ -565,6 +565,9 @@ func upsertFixtureRows(tx *gorm.DB, fixtures FixtureSet) error {
 }
 
 func upsertCannedResponses(tx *gorm.DB, rows []models.CannedResponse) error {
+	if len(rows) == 0 {
+		return fmt.Errorf("upsert canned responses: no rows")
+	}
 	conflict := clause.OnConflict{
 		Columns: []clause.Column{{Name: "id"}},
 		DoUpdates: clause.AssignmentColumns([]string{
@@ -575,10 +578,25 @@ func upsertCannedResponses(tx *gorm.DB, rows []models.CannedResponse) error {
 	if err := tx.Clauses(conflict).Omit(clause.Associations).Create(&rows).Error; err != nil {
 		return fmt.Errorf("upsert canned responses: %w", err)
 	}
+	if err := forceFixtureRowsInactive(
+		tx,
+		&models.CannedResponse{},
+		cannedResponseIDs(rows),
+		rows[0].OrganizationID,
+		"canned responses",
+	); err != nil {
+		return err
+	}
+	for i := range rows {
+		rows[i].IsActive = false
+	}
 	return nil
 }
 
 func upsertIVRFlows(tx *gorm.DB, rows []models.IVRFlow) error {
+	if len(rows) == 0 {
+		return fmt.Errorf("upsert disabled IVR flows: no rows")
+	}
 	conflict := clause.OnConflict{
 		Columns: []clause.Column{{Name: "id"}},
 		DoUpdates: clause.AssignmentColumns([]string{
@@ -589,6 +607,45 @@ func upsertIVRFlows(tx *gorm.DB, rows []models.IVRFlow) error {
 	}
 	if err := tx.Clauses(conflict).Omit(clause.Associations).Create(&rows).Error; err != nil {
 		return fmt.Errorf("upsert disabled IVR flows: %w", err)
+	}
+	if err := forceFixtureRowsInactive(
+		tx,
+		&models.IVRFlow{},
+		ivrFlowIDs(rows),
+		rows[0].OrganizationID,
+		"IVR flows",
+	); err != nil {
+		return err
+	}
+	for i := range rows {
+		rows[i].IsActive = false
+	}
+	return nil
+}
+
+// GORM applies default:true to zero-valued bool fields during Create and also
+// mutates the input structs. Force these fixture rows inactive inside the same
+// transaction, before they can be committed or pass persisted validation.
+func forceFixtureRowsInactive(
+	tx *gorm.DB,
+	model any,
+	ids []uuid.UUID,
+	organizationID uuid.UUID,
+	kind string,
+) error {
+	result := tx.Model(model).
+		Where("organization_id = ? AND id IN ?", organizationID, ids).
+		UpdateColumn("is_active", false)
+	if result.Error != nil {
+		return fmt.Errorf("force %s inactive: %w", kind, result.Error)
+	}
+	if result.RowsAffected != int64(len(ids)) {
+		return fmt.Errorf(
+			"force %s inactive: updated %d rows, expected %d",
+			kind,
+			result.RowsAffected,
+			len(ids),
+		)
 	}
 	return nil
 }
