@@ -476,7 +476,6 @@ export const agentAnalyticsService = {
 // Meta WhatsApp Analytics Types
 export type MetaAnalyticsType =
   | 'analytics'
-  | 'conversation_analytics'
   | 'pricing_analytics'
   | 'template_analytics'
   | 'call_analytics'
@@ -487,6 +486,7 @@ export interface MetaAnalyticsAccount {
   id: string
   name: string
   phone_id: string
+  is_mock?: boolean
 }
 
 export interface MetaMessagingDataPoint {
@@ -578,6 +578,7 @@ export interface MetaAnalyticsResponse {
   account_name: string
   data: MetaAnalyticsData | null
   template_names?: Record<string, string> // meta_template_id -> template name
+  is_mock?: boolean
 }
 
 export const metaAnalyticsService = {
@@ -588,9 +589,9 @@ export const metaAnalyticsService = {
     end: string
     granularity?: MetaGranularity
     template_ids?: string
-  }) => api.get<{ accounts: MetaAnalyticsResponse[]; cached: boolean }>('/analytics/meta', { params }),
+  }) => api.get<{ accounts: MetaAnalyticsResponse[]; cached: boolean; demo_data?: boolean }>('/analytics/meta', { params }),
 
-  getAccounts: () => api.get<{ accounts: MetaAnalyticsAccount[] }>('/analytics/meta/accounts'),
+  getAccounts: () => api.get<{ accounts: MetaAnalyticsAccount[]; demo_data?: boolean }>('/analytics/meta/accounts'),
 
   refresh: () => api.post('/analytics/meta/refresh')
 }

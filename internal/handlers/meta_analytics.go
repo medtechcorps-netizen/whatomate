@@ -2,8 +2,11 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,9 +41,27 @@ type MetaAnalyticsResponse struct {
 	AccountName   string                          `json:"account_name"`
 	Data          *whatsapp.MetaAnalyticsResponse `json:"data"`
 	TemplateNames map[string]string               `json:"template_names,omitempty"` // meta_template_id -> template name
+	IsMock        bool                            `json:"is_mock"`
 }
 
-// GetMetaAnalytics fetches Meta WhatsApp analytics with Redis caching
+type metaAnalyticsLogicalAccount struct {
+	ID                uuid.UUID
+	Name              string
+	PhoneID           string
+	IsProviderAccount bool
+	HasSnapshot       bool
+	IsMock            bool
+}
+
+type metaAnalyticsAccountProjection struct {
+	ID      uuid.UUID
+	Name    string
+	PhoneID string
+}
+
+// GetMetaAnalytics fetches Meta WhatsApp analytics with Redis caching. Logical
+// accounts backed by snapshots are always served locally and never fall
+// through to account secret decryption or the Meta client.
 func (a *App) GetMetaAnalytics(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
@@ -89,88 +110,210 @@ func (a *App) GetMetaAnalytics(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid granularity. Must be one of: HALF_HOUR, DAY, MONTH", nil, "")
 	}
 
-	// Auto-adjust granularity based on date range to avoid Meta API errors
-	daysDiff := int(endDate.Sub(startDate).Hours() / 24)
 	originalGranularity := granularity
+	switch granularity {
+	case "DAILY":
+		granularity = "DAY"
+	case "MONTHLY":
+		granularity = "MONTH"
+	}
+
+	// Auto-adjust granularity based on date range to avoid Meta API errors
+	inclusiveDays := int(endDate.Sub(startDate).Hours()/24) + 1
 
 	// MONTHLY requires at least 30 days
-	if (granularity == "MONTH" || granularity == "MONTHLY") && daysDiff < 30 {
+	if granularity == "MONTH" && inclusiveDays < 30 {
 		granularity = "DAY"
 		a.Log.Debug("Auto-adjusted granularity from MONTH to DAY due to small date range",
-			"days", daysDiff,
+			"days", inclusiveDays,
 			"original", originalGranularity,
 		)
 	}
 
 	// HALF_HOUR only makes sense for ranges up to 7 days (too much data otherwise)
-	if granularity == "HALF_HOUR" && daysDiff > 7 {
+	if granularity == "HALF_HOUR" && inclusiveDays > 7 {
 		granularity = "DAY"
 		a.Log.Debug("Auto-adjusted granularity from HALF_HOUR to DAY due to large date range",
-			"days", daysDiff,
+			"days", inclusiveDays,
 			"original", originalGranularity,
 		)
 	}
 
 	// Template analytics have a 90-day lookback limit
 	if analyticsType == string(whatsapp.AnalyticsTypeTemplate) {
-		ninetyDaysAgo := time.Now().AddDate(0, 0, -90)
+		nowUTC := time.Now().UTC()
+		ninetyDaysAgo := time.Date(
+			nowUTC.Year(),
+			nowUTC.Month(),
+			nowUTC.Day(),
+			0,
+			0,
+			0,
+			0,
+			time.UTC,
+		).AddDate(0, 0, -90)
 		if startDate.Before(ninetyDaysAgo) {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Template analytics have a 90-day lookback limit", nil, "")
 		}
+		granularity = "DAY"
 	}
 
 	// Convert dates to Unix timestamps
 	startUnix := startDate.Unix()
-	endUnix := endDate.Add(24*time.Hour - time.Second).Unix() // End of day
+	endUnix := endDate.Unix()
 
-	// Get accounts to query
-	var accounts []models.WhatsAppAccount
-	if accountID != "" {
-		// Specific account
-		var account models.WhatsAppAccount
-		if err := a.DB.Where("id = ? AND organization_id = ?", accountID, orgID).First(&account).Error; err != nil {
-			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Account not found", nil, "")
+	var requestedTemplateIDs []string
+	if analyticsType == string(whatsapp.AnalyticsTypeTemplate) {
+		requestedTemplateIDs, err = parseRequestedMetaTemplateIDs(
+			string(r.RequestCtx.QueryArgs().Peek("template_ids")),
+		)
+		if err != nil {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusBadRequest,
+				"template_ids must be a JSON array of at most 100 numeric template IDs",
+				nil,
+				"",
+			)
 		}
-		accounts = append(accounts, account)
-	} else {
-		// All accounts for the organization
-		if err := a.DB.Where("organization_id = ?", orgID).Find(&accounts).Error; err != nil {
-			a.Log.Error("Failed to fetch accounts", "error", err)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to fetch accounts", nil, "")
-		}
+	}
+
+	// Resolve both provider-backed accounts and snapshot-only logical accounts.
+	accounts, err := a.loadMetaAnalyticsLogicalAccounts(orgID, accountID)
+	if err != nil {
+		a.Log.Error("Failed to fetch analytics accounts", "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to fetch accounts", nil, "")
 	}
 
 	if len(accounts) == 0 {
+		if accountID != "" {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Account not found", nil, "")
+		}
 		return r.SendEnvelope(map[string]any{
 			"accounts": []MetaAnalyticsResponse{},
 			"message":  "No WhatsApp accounts found",
+			"demo_data": false,
 		})
 	}
+	demoData := logicalAccountsContainMockData(accounts)
+	snapshotBackedRequest := logicalAccountsContainSnapshots(accounts)
 
 	// Build cache key
-	cacheKey := a.buildMetaAnalyticsCacheKey(orgID, accountID, analyticsType, startUnix, endUnix, granularity)
+	cacheKey := a.buildMetaAnalyticsCacheKey(
+		orgID,
+		accountID,
+		analyticsType,
+		startUnix,
+		endUnix,
+		granularity,
+		requestedTemplateIDs,
+	)
 
-	// Try cache first
+	// Snapshot-backed requests always read the database source of truth. They
+	// deliberately bypass Redis so a stale provider response can never mask a
+	// newly introduced fixture for the same logical account.
 	ctx := context.Background()
-	cached, err := a.Redis.Get(ctx, cacheKey).Result()
-	if err == nil && cached != "" {
-		var cachedResponse []MetaAnalyticsResponse
-		if err := json.Unmarshal([]byte(cached), &cachedResponse); err == nil {
-			a.Log.Debug("Meta analytics cache hit", "cache_key", cacheKey)
-			return r.SendEnvelope(map[string]any{
-				"accounts": cachedResponse,
-				"cached":   true,
-			})
+	if !snapshotBackedRequest {
+		cached, cacheErr := a.Redis.Get(ctx, cacheKey).Result()
+		if cacheErr == nil && cached != "" {
+			var cachedResponse []MetaAnalyticsResponse
+			if err := json.Unmarshal([]byte(cached), &cachedResponse); err == nil {
+				a.Log.Debug("Meta analytics cache hit", "cache_key", cacheKey)
+				response := map[string]any{
+					"accounts":  cachedResponse,
+					"cached":    true,
+					"demo_data": demoData || metaAnalyticsResponsesContainMockData(cachedResponse),
+				}
+				if granularity != originalGranularity {
+					response["adjusted_granularity"] = granularity
+					response["original_granularity"] = originalGranularity
+				}
+				return r.SendEnvelope(response)
+			}
 		}
 	}
 
 	// Cache miss - fetch from Meta API
 	a.Log.Debug("Meta analytics cache miss", "cache_key", cacheKey)
 
+	snapshotsByAccount, err := a.loadMetaAnalyticsSnapshots(
+		orgID,
+		accountID,
+		analyticsType,
+		granularity,
+		startDate,
+		time.Unix(endUnix, 0).UTC(),
+	)
+	if err != nil {
+		a.Log.Error("Failed to fetch Meta analytics snapshots", "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to fetch analytics snapshots", nil, "")
+	}
+
 	var results []MetaAnalyticsResponse
-	for i := range accounts {
-		a.decryptAccountSecrets(&accounts[i])
-		account := accounts[i]
+	for _, logicalAccount := range accounts {
+		accountSnapshots := snapshotsByAccount[logicalAccount.ID]
+		if len(accountSnapshots) > 0 {
+			data, templateNames, snapshotErr := mergeMetaAnalyticsSnapshots(
+				accountSnapshots,
+				analyticsType,
+				startUnix,
+				endUnix,
+				requestedTemplateIDs,
+			)
+			if snapshotErr != nil {
+				a.Log.Error(
+					"Failed to decode Meta analytics snapshot",
+					"error", snapshotErr,
+					"account_id", logicalAccount.ID,
+					"analytics_type", analyticsType,
+				)
+				return r.SendErrorEnvelope(
+					fasthttp.StatusInternalServerError,
+					"Stored analytics snapshot is invalid",
+					nil,
+					"",
+				)
+			}
+			results = append(results, MetaAnalyticsResponse{
+				AccountID:     logicalAccount.ID.String(),
+				AccountName:   logicalAccount.Name,
+				Data:          data,
+				TemplateNames: templateNames,
+				IsMock:        logicalAccount.IsMock,
+			})
+			continue
+		}
+
+		// Mock logical accounts are fail-closed: a missing type/range snapshot
+		// returns no data and never falls through to a provider account.
+		if logicalAccount.IsMock {
+			results = append(results, MetaAnalyticsResponse{
+				AccountID:   logicalAccount.ID.String(),
+				AccountName: logicalAccount.Name,
+				Data:        nil,
+				IsMock:      true,
+			})
+			continue
+		}
+
+		if !logicalAccount.IsProviderAccount {
+			continue
+		}
+
+		// Secret-bearing columns are fetched only for a provider request, never
+		// while listing or resolving logical snapshot accounts.
+		var account models.WhatsAppAccount
+		if err := a.DB.
+			Where("id = ? AND organization_id = ?", logicalAccount.ID, orgID).
+			First(&account).Error; err != nil {
+			a.Log.Error("Failed to load provider account", "error", err, "account_id", logicalAccount.ID)
+			return r.SendErrorEnvelope(
+				fasthttp.StatusInternalServerError,
+				"Failed to load analytics account",
+				nil,
+				"",
+			)
+		}
+		a.decryptAccountSecrets(&account)
 		waAccount := a.toWhatsAppAccount(&account)
 
 		req := &whatsapp.AnalyticsRequest{
@@ -182,14 +325,7 @@ func (a *App) GetMetaAnalytics(r *fastglue.Request) error {
 		// Get template IDs if this is template analytics (not template_group_analytics)
 		// Note: template_group_analytics requires template_group_ids which are different from template IDs
 		if analyticsType == string(whatsapp.AnalyticsTypeTemplate) {
-			// Check if template_ids provided in query params
-			templateIDsStr := string(r.RequestCtx.QueryArgs().Peek("template_ids"))
-			if templateIDsStr != "" {
-				var templateIDs []string
-				if err := json.Unmarshal([]byte(templateIDsStr), &templateIDs); err == nil {
-					req.TemplateIDs = templateIDs
-				}
-			}
+			req.TemplateIDs = append(req.TemplateIDs, requestedTemplateIDs...)
 
 			// If no template IDs provided, fetch from database
 			if len(req.TemplateIDs) == 0 {
@@ -203,6 +339,16 @@ func (a *App) GetMetaAnalytics(r *fastglue.Request) error {
 							req.TemplateIDs = append(req.TemplateIDs, t.MetaTemplateID)
 						}
 					}
+				}
+				req.TemplateIDs, err = canonicalMetaTemplateIDs(req.TemplateIDs)
+				if err != nil {
+					a.Log.Error("Stored Meta template ID is invalid", "error", err, "account_id", account.ID)
+					return r.SendErrorEnvelope(
+						fasthttp.StatusInternalServerError,
+						"Stored analytics template configuration is invalid",
+						nil,
+						"",
+					)
 				}
 				a.Log.Debug("Auto-fetched template IDs for analytics",
 					"account_name", account.Name,
@@ -220,6 +366,7 @@ func (a *App) GetMetaAnalytics(r *fastglue.Request) error {
 					AccountID:   account.ID.String(),
 					AccountName: account.Name,
 					Data:        nil,
+					IsMock:      false,
 				})
 				continue
 			}
@@ -241,6 +388,7 @@ func (a *App) GetMetaAnalytics(r *fastglue.Request) error {
 				AccountID:   account.ID.String(),
 				AccountName: account.Name,
 				Data:        nil,
+				IsMock:      false,
 			})
 			continue
 		}
@@ -317,18 +465,25 @@ func (a *App) GetMetaAnalytics(r *fastglue.Request) error {
 			AccountName:   account.Name,
 			Data:          data,
 			TemplateNames: templateNames,
+			IsMock:        false,
 		})
 	}
 
-	// Cache the results
-	cacheTTL := a.getMetaAnalyticsCacheTTL(granularity)
-	if cacheData, err := json.Marshal(results); err == nil {
-		a.Redis.Set(ctx, cacheKey, cacheData, cacheTTL)
+	// Provider-only requests retain the existing Redis cache. Snapshot-backed
+	// results are intentionally never written to Redis.
+	if !snapshotBackedRequest {
+		cacheTTL := a.getMetaAnalyticsCacheTTL(granularity)
+		if cacheData, err := json.Marshal(results); err == nil {
+			if err := a.Redis.Set(ctx, cacheKey, cacheData, cacheTTL).Err(); err != nil {
+				a.Log.Error("Failed to cache Meta analytics", "error", err, "cache_key", cacheKey)
+			}
+		}
 	}
 
 	response := map[string]any{
-		"accounts": results,
-		"cached":   false,
+		"accounts":  results,
+		"cached":    false,
+		"demo_data": demoData || metaAnalyticsResponsesContainMockData(results),
 	}
 
 	// Include adjusted granularity if it was changed
@@ -338,6 +493,379 @@ func (a *App) GetMetaAnalytics(r *fastglue.Request) error {
 	}
 
 	return r.SendEnvelope(response)
+}
+
+func (a *App) loadMetaAnalyticsLogicalAccounts(
+	orgID uuid.UUID,
+	accountID string,
+) ([]metaAnalyticsLogicalAccount, error) {
+	var selectedAccountID *uuid.UUID
+	if accountID != "" {
+		parsed, err := uuid.Parse(accountID)
+		if err != nil {
+			return []metaAnalyticsLogicalAccount{}, nil
+		}
+		selectedAccountID = &parsed
+	}
+
+	var realAccounts []metaAnalyticsAccountProjection
+	realQuery := a.DB.
+		Model(&models.WhatsAppAccount{}).
+		Select("id, name, phone_id").
+		Where("organization_id = ?", orgID)
+	if selectedAccountID != nil {
+		realQuery = realQuery.Where("id = ?", *selectedAccountID)
+	}
+	if err := realQuery.Order("name ASC").Find(&realAccounts).Error; err != nil {
+		return nil, err
+	}
+
+	var snapshotRows []models.MetaAnalyticsSnapshot
+	snapshotQuery := a.DB.
+		Select("account_id, account_name, phone_id, is_mock").
+		Where("organization_id = ?", orgID)
+	if selectedAccountID != nil {
+		snapshotQuery = snapshotQuery.Where("account_id = ?", *selectedAccountID)
+	}
+	if err := snapshotQuery.
+		Order("account_name ASC, account_id ASC").
+		Find(&snapshotRows).Error; err != nil {
+		return nil, err
+	}
+
+	logicalAccounts := make([]metaAnalyticsLogicalAccount, 0, len(realAccounts)+len(snapshotRows))
+	accountIndex := make(map[uuid.UUID]int, len(realAccounts)+len(snapshotRows))
+	for i := range realAccounts {
+		account := realAccounts[i]
+		accountIndex[account.ID] = len(logicalAccounts)
+		logicalAccounts = append(logicalAccounts, metaAnalyticsLogicalAccount{
+			ID:                account.ID,
+			Name:              account.Name,
+			PhoneID:           account.PhoneID,
+			IsProviderAccount: true,
+		})
+	}
+
+	for _, snapshot := range snapshotRows {
+		if index, exists := accountIndex[snapshot.AccountID]; exists {
+			logicalAccounts[index].HasSnapshot = true
+			logicalAccounts[index].IsMock = logicalAccounts[index].IsMock || snapshot.IsMock
+			if logicalAccounts[index].Name == "" {
+				logicalAccounts[index].Name = snapshot.AccountName
+			}
+			if logicalAccounts[index].PhoneID == "" {
+				logicalAccounts[index].PhoneID = snapshot.PhoneID
+			}
+			continue
+		}
+
+		accountIndex[snapshot.AccountID] = len(logicalAccounts)
+		logicalAccounts = append(logicalAccounts, metaAnalyticsLogicalAccount{
+			ID:          snapshot.AccountID,
+			Name:        snapshot.AccountName,
+			PhoneID:     snapshot.PhoneID,
+			HasSnapshot: true,
+			IsMock:      snapshot.IsMock,
+		})
+	}
+
+	sort.SliceStable(logicalAccounts, func(i, j int) bool {
+		if logicalAccounts[i].Name == logicalAccounts[j].Name {
+			return logicalAccounts[i].ID.String() < logicalAccounts[j].ID.String()
+		}
+		return logicalAccounts[i].Name < logicalAccounts[j].Name
+	})
+	return logicalAccounts, nil
+}
+
+func (a *App) loadMetaAnalyticsSnapshots(
+	orgID uuid.UUID,
+	accountID string,
+	analyticsType string,
+	granularity string,
+	periodStart time.Time,
+	periodEnd time.Time,
+) (map[uuid.UUID][]models.MetaAnalyticsSnapshot, error) {
+	query := a.DB.Where(
+		"organization_id = ? AND analytics_type = ? AND granularity = ? AND period_start <= ? AND period_end >= ?",
+		orgID,
+		analyticsType,
+		granularity,
+		periodEnd,
+		periodStart,
+	)
+	if accountID != "" {
+		parsed, err := uuid.Parse(accountID)
+		if err != nil {
+			return map[uuid.UUID][]models.MetaAnalyticsSnapshot{}, nil
+		}
+		query = query.Where("account_id = ?", parsed)
+	}
+
+	var snapshots []models.MetaAnalyticsSnapshot
+	if err := query.
+		Order("account_id ASC, period_start ASC, updated_at ASC, id ASC").
+		Find(&snapshots).Error; err != nil {
+		return nil, err
+	}
+
+	byAccount := make(map[uuid.UUID][]models.MetaAnalyticsSnapshot)
+	for _, snapshot := range snapshots {
+		byAccount[snapshot.AccountID] = append(byAccount[snapshot.AccountID], snapshot)
+	}
+	return byAccount, nil
+}
+
+func logicalAccountsContainMockData(accounts []metaAnalyticsLogicalAccount) bool {
+	for _, account := range accounts {
+		if account.IsMock {
+			return true
+		}
+	}
+	return false
+}
+
+func logicalAccountsContainSnapshots(accounts []metaAnalyticsLogicalAccount) bool {
+	for _, account := range accounts {
+		if account.HasSnapshot {
+			return true
+		}
+	}
+	return false
+}
+
+func metaAnalyticsResponsesContainMockData(responses []MetaAnalyticsResponse) bool {
+	for _, response := range responses {
+		if response.IsMock {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeMetaAnalyticsSnapshots(
+	snapshots []models.MetaAnalyticsSnapshot,
+	analyticsType string,
+	periodStart int64,
+	periodEnd int64,
+	requestedTemplateIDs []string,
+) (*whatsapp.MetaAnalyticsResponse, map[string]string, error) {
+	if len(snapshots) == 0 {
+		return nil, nil, nil
+	}
+
+	type messagingKey struct {
+		Start int64
+		End   int64
+	}
+	type pricingKey struct {
+		Start           int64
+		End             int64
+		Country         string
+		PricingType     string
+		PricingCategory string
+		Tier            string
+	}
+	type templateKey struct {
+		TemplateID string
+		Start      int64
+		End        int64
+	}
+	type callKey struct {
+		Start     int64
+		End       int64
+		Direction string
+	}
+
+	merged := &whatsapp.MetaAnalyticsResponse{}
+	templateNames := make(map[string]string)
+	messagingPoints := make(map[messagingKey]whatsapp.MessagingAnalyticsDataPoint)
+	pricingPoints := make(map[pricingKey]whatsapp.PricingAnalyticsDataPoint)
+	templatePoints := make(map[templateKey]whatsapp.TemplateAnalyticsDataPoint)
+	callPoints := make(map[callKey]whatsapp.CallAnalyticsDataPoint)
+	hasAnalyticsPayload := false
+	requestedTemplateIDSet := make(map[string]struct{}, len(requestedTemplateIDs))
+	for _, templateID := range requestedTemplateIDs {
+		requestedTemplateIDSet[templateID] = struct{}{}
+	}
+
+	for _, snapshot := range snapshots {
+		encoded, err := json.Marshal(snapshot.Payload)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal snapshot %s: %w", snapshot.ID, err)
+		}
+		var data whatsapp.MetaAnalyticsResponse
+		if err := json.Unmarshal(encoded, &data); err != nil {
+			return nil, nil, fmt.Errorf("decode snapshot %s: %w", snapshot.ID, err)
+		}
+		if merged.ID == "" && data.ID != "" {
+			merged.ID = data.ID
+		}
+
+		for templateID, value := range snapshot.TemplateNames {
+			if name, ok := value.(string); ok && name != "" {
+				templateNames[templateID] = name
+			}
+		}
+
+		switch analyticsType {
+		case string(whatsapp.AnalyticsTypeMessaging):
+			if data.Analytics == nil {
+				continue
+			}
+			hasAnalyticsPayload = true
+			for _, point := range data.Analytics.DataPoints {
+				if metaAnalyticsPointOverlaps(point.Start, point.End, periodStart, periodEnd) {
+					messagingPoints[messagingKey{Start: point.Start, End: point.End}] = point
+				}
+			}
+		case string(whatsapp.AnalyticsTypePricing):
+			if data.PricingAnalytics == nil {
+				continue
+			}
+			hasAnalyticsPayload = true
+			for _, point := range data.PricingAnalytics.DataPoints {
+				if !metaAnalyticsPointOverlaps(point.Start, point.End, periodStart, periodEnd) {
+					continue
+				}
+				key := pricingKey{
+					Start:           point.Start,
+					End:             point.End,
+					Country:         point.Country,
+					PricingType:     point.PricingType,
+					PricingCategory: point.PricingCategory,
+					Tier:            point.Tier,
+				}
+				pricingPoints[key] = point
+			}
+		case string(whatsapp.AnalyticsTypeTemplate):
+			if data.TemplateAnalytics == nil {
+				continue
+			}
+			hasAnalyticsPayload = true
+			for _, point := range data.TemplateAnalytics.DataPoints {
+				if !metaAnalyticsPointOverlaps(point.Start, point.End, periodStart, periodEnd) {
+					continue
+				}
+				if len(requestedTemplateIDSet) > 0 {
+					if _, requested := requestedTemplateIDSet[point.TemplateID]; !requested {
+						continue
+					}
+				}
+				templatePoints[templateKey{
+					TemplateID: point.TemplateID,
+					Start:      point.Start,
+					End:        point.End,
+				}] = point
+			}
+		case string(whatsapp.AnalyticsTypeCall):
+			if data.CallAnalytics == nil {
+				continue
+			}
+			hasAnalyticsPayload = true
+			for _, point := range data.CallAnalytics.DataPoints {
+				if !metaAnalyticsPointOverlaps(point.Start, point.End, periodStart, periodEnd) {
+					continue
+				}
+				callPoints[callKey{
+					Start:     point.Start,
+					End:       point.End,
+					Direction: point.Direction,
+				}] = point
+			}
+		}
+	}
+
+	if !hasAnalyticsPayload {
+		return nil, emptyMapAsNil(templateNames), nil
+	}
+
+	switch analyticsType {
+	case string(whatsapp.AnalyticsTypeMessaging):
+		points := make([]whatsapp.MessagingAnalyticsDataPoint, 0, len(messagingPoints))
+		for _, point := range messagingPoints {
+			points = append(points, point)
+		}
+		sort.Slice(points, func(i, j int) bool {
+			if points[i].Start == points[j].Start {
+				return points[i].End < points[j].End
+			}
+			return points[i].Start < points[j].Start
+		})
+		merged.Analytics = &whatsapp.MessagingAnalytics{
+			Granularity: snapshots[0].Granularity,
+			DataPoints:  points,
+		}
+	case string(whatsapp.AnalyticsTypePricing):
+		points := make([]whatsapp.PricingAnalyticsDataPoint, 0, len(pricingPoints))
+		for _, point := range pricingPoints {
+			points = append(points, point)
+		}
+		sort.Slice(points, func(i, j int) bool {
+			if points[i].Start != points[j].Start {
+				return points[i].Start < points[j].Start
+			}
+			if points[i].PricingCategory != points[j].PricingCategory {
+				return points[i].PricingCategory < points[j].PricingCategory
+			}
+			if points[i].PricingType != points[j].PricingType {
+				return points[i].PricingType < points[j].PricingType
+			}
+			return points[i].Country < points[j].Country
+		})
+		merged.PricingAnalytics = &whatsapp.PricingAnalytics{
+			Granularity: snapshots[0].Granularity,
+			DataPoints:  points,
+		}
+	case string(whatsapp.AnalyticsTypeTemplate):
+		points := make([]whatsapp.TemplateAnalyticsDataPoint, 0, len(templatePoints))
+		for _, point := range templatePoints {
+			points = append(points, point)
+		}
+		sort.Slice(points, func(i, j int) bool {
+			if points[i].Start != points[j].Start {
+				return points[i].Start < points[j].Start
+			}
+			return points[i].TemplateID < points[j].TemplateID
+		})
+		merged.TemplateAnalytics = &whatsapp.TemplateAnalytics{
+			Granularity: snapshots[0].Granularity,
+			DataPoints:  points,
+		}
+	case string(whatsapp.AnalyticsTypeCall):
+		points := make([]whatsapp.CallAnalyticsDataPoint, 0, len(callPoints))
+		for _, point := range callPoints {
+			points = append(points, point)
+		}
+		sort.Slice(points, func(i, j int) bool {
+			if points[i].Start != points[j].Start {
+				return points[i].Start < points[j].Start
+			}
+			return points[i].Direction < points[j].Direction
+		})
+		merged.CallAnalytics = &whatsapp.CallAnalytics{
+			Granularity: snapshots[0].Granularity,
+			DataPoints:  points,
+		}
+	}
+
+	return merged, emptyMapAsNil(templateNames), nil
+}
+
+func metaAnalyticsPointOverlaps(start, end, periodStart, periodEnd int64) bool {
+	if end == 0 || end == start {
+		return start >= periodStart && start <= periodEnd
+	}
+	// Meta interval endpoints are half-open: a point ending exactly when the
+	// requested period starts belongs to the preceding interval.
+	return start <= periodEnd && end > periodStart
+}
+
+func emptyMapAsNil(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	return values
 }
 
 // ListMetaAccountsForAnalytics lists WhatsApp accounts available for analytics
@@ -356,10 +884,11 @@ func (a *App) ListMetaAccountsForAnalytics(r *fastglue.Request) error {
 		ID      string `json:"id"`
 		Name    string `json:"name"`
 		PhoneID string `json:"phone_id"`
+		IsMock  bool   `json:"is_mock"`
 	}
 
-	var accounts []models.WhatsAppAccount
-	if err := a.DB.Select("id, name, phone_id").Where("organization_id = ?", orgID).Find(&accounts).Error; err != nil {
+	accounts, err := a.loadMetaAnalyticsLogicalAccounts(orgID, "")
+	if err != nil {
 		a.Log.Error("Failed to fetch accounts", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to fetch accounts", nil, "")
 	}
@@ -370,11 +899,13 @@ func (a *App) ListMetaAccountsForAnalytics(r *fastglue.Request) error {
 			ID:      acc.ID.String(),
 			Name:    acc.Name,
 			PhoneID: acc.PhoneID,
+			IsMock:  acc.IsMock,
 		})
 	}
 
 	return r.SendEnvelope(map[string]any{
-		"accounts": result,
+		"accounts":  result,
+		"demo_data": logicalAccountsContainMockData(accounts),
 	})
 }
 
@@ -401,11 +932,23 @@ func (a *App) RefreshMetaAnalyticsCache(r *fastglue.Request) error {
 }
 
 // buildMetaAnalyticsCacheKey builds a cache key for Meta analytics
-func (a *App) buildMetaAnalyticsCacheKey(orgID uuid.UUID, accountID, analyticsType string, start, end int64, granularity string) string {
+func (a *App) buildMetaAnalyticsCacheKey(
+	orgID uuid.UUID,
+	accountID string,
+	analyticsType string,
+	start int64,
+	end int64,
+	granularity string,
+	templateIDs []string,
+) string {
 	if accountID == "" {
 		accountID = "all"
 	}
-	return fmt.Sprintf("%s%s:%s:%s:%d:%d:%s",
+	templateScope := "auto"
+	if len(templateIDs) > 0 {
+		templateScope = fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(templateIDs, ","))))
+	}
+	return fmt.Sprintf("%s%s:%s:%s:%d:%d:%s:%s",
 		metaAnalyticsCachePrefix,
 		orgID.String(),
 		accountID,
@@ -413,7 +956,45 @@ func (a *App) buildMetaAnalyticsCacheKey(orgID uuid.UUID, accountID, analyticsTy
 		start,
 		end,
 		granularity,
+		templateScope,
 	)
+}
+
+func parseRequestedMetaTemplateIDs(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var templateIDs []string
+	if err := json.Unmarshal([]byte(raw), &templateIDs); err != nil {
+		return nil, err
+	}
+	return canonicalMetaTemplateIDs(templateIDs)
+}
+
+func canonicalMetaTemplateIDs(templateIDs []string) ([]string, error) {
+	if len(templateIDs) > 100 {
+		return nil, fmt.Errorf("too many template IDs")
+	}
+	seen := make(map[string]struct{}, len(templateIDs))
+	canonical := make([]string, 0, len(templateIDs))
+	for _, rawID := range templateIDs {
+		templateID := strings.TrimSpace(rawID)
+		if templateID == "" || len(templateID) > 32 {
+			return nil, fmt.Errorf("invalid template ID length")
+		}
+		for _, character := range templateID {
+			if character < '0' || character > '9' {
+				return nil, fmt.Errorf("template ID %q is not numeric", templateID)
+			}
+		}
+		if _, exists := seen[templateID]; exists {
+			continue
+		}
+		seen[templateID] = struct{}{}
+		canonical = append(canonical, templateID)
+	}
+	sort.Strings(canonical)
+	return canonical, nil
 }
 
 // getMetaAnalyticsCacheTTL returns the appropriate cache TTL based on granularity

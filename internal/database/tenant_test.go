@@ -127,6 +127,39 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	require.NoError(t, adminDB.Create(&contactA).Error)
 	require.NoError(t, adminDB.Create(&contactB).Error)
 
+	snapshotPeriodStart := time.Now().UTC().AddDate(0, 0, -7)
+	snapshotPeriodEnd := time.Now().UTC()
+	snapshotA := models.MetaAnalyticsSnapshot{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgA.ID,
+		AccountID:      accountA.ID,
+		AccountName:    "Alpha logical analytics",
+		Dataset:        "rls-test",
+		AnalyticsType:  "analytics",
+		Granularity:    "DAY",
+		PeriodStart:    snapshotPeriodStart,
+		PeriodEnd:      snapshotPeriodEnd,
+		Payload:        models.JSONB{"id": "alpha"},
+		TemplateNames:  models.JSONB{},
+		IsMock:         true,
+	}
+	snapshotB := models.MetaAnalyticsSnapshot{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgB.ID,
+		AccountID:      accountB.ID,
+		AccountName:    "Beta logical analytics",
+		Dataset:        "rls-test",
+		AnalyticsType:  "analytics",
+		Granularity:    "DAY",
+		PeriodStart:    snapshotPeriodStart,
+		PeriodEnd:      snapshotPeriodEnd,
+		Payload:        models.JSONB{"id": "beta"},
+		TemplateNames:  models.JSONB{},
+		IsMock:         true,
+	}
+	require.NoError(t, adminDB.Create(&snapshotA).Error)
+	require.NoError(t, adminDB.Create(&snapshotB).Error)
+
 	onboardingA := models.OrganizationOnboarding{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
 		OrganizationID:  orgA.ID,
@@ -363,6 +396,7 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 				{model: &models.CRMPipeline{}, want: pipelineA.ID},
 				{model: &models.BookingService{}, want: serviceA.ID},
 				{model: &models.ChannelAccount{}, want: channelA.ID},
+				{model: &models.MetaAnalyticsSnapshot{}, want: snapshotA.ID},
 			}
 			for _, check := range checks {
 				var ids []uuid.UUID
@@ -432,6 +466,36 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "row-level security")
+	})
+
+	t.Run("Meta analytics snapshots reject cross-clinic writes", func(t *testing.T) {
+		crossTenantSnapshot := models.MetaAnalyticsSnapshot{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: orgB.ID,
+			AccountID:      uuid.New(),
+			AccountName:    "Forbidden snapshot",
+			Dataset:        "rls-test",
+			AnalyticsType:  "analytics",
+			Granularity:    "DAY",
+			PeriodStart:    snapshotPeriodStart,
+			PeriodEnd:      snapshotPeriodEnd,
+			Payload:        models.JSONB{"id": "forbidden"},
+			TemplateNames:  models.JSONB{},
+			IsMock:         true,
+		}
+		insertErr := asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+			return tenantDB.Create(&crossTenantSnapshot).Error
+		})
+		require.Error(t, insertErr)
+		require.Contains(t, insertErr.Error(), "row-level security")
+
+		updateErr := asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+			return tenantDB.Model(&models.MetaAnalyticsSnapshot{}).
+				Where("id = ?", snapshotA.ID).
+				Update("organization_id", orgB.ID).Error
+		})
+		require.Error(t, updateErr)
+		require.Contains(t, updateErr.Error(), "row-level security")
 	})
 
 	t.Run("cross-clinic delete affects no rows", func(t *testing.T) {
