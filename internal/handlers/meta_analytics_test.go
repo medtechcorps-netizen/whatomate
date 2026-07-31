@@ -25,8 +25,9 @@ import (
 
 // fakeAnalyticsServer simulates Meta's analytics endpoint for tests.
 type fakeAnalyticsServer struct {
-	server *httptest.Server
-	hits   int64
+	server      *httptest.Server
+	hits        int64
+	lastRequest atomic.Value
 }
 
 func newFakeAnalyticsServer(t *testing.T, response string) *fakeAnalyticsServer {
@@ -34,6 +35,7 @@ func newFakeAnalyticsServer(t *testing.T, response string) *fakeAnalyticsServer 
 	f := &fakeAnalyticsServer{}
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&f.hits, 1)
+		f.lastRequest.Store(r.URL.String())
 		_, _ = w.Write([]byte(response))
 	}))
 	t.Cleanup(f.server.Close)
@@ -41,6 +43,14 @@ func newFakeAnalyticsServer(t *testing.T, response string) *fakeAnalyticsServer 
 }
 
 func (f *fakeAnalyticsServer) Hits() int64 { return atomic.LoadInt64(&f.hits) }
+
+func (f *fakeAnalyticsServer) LastRequest() string {
+	value := f.lastRequest.Load()
+	if value == nil {
+		return ""
+	}
+	return value.(string)
+}
 
 func newAppForMetaAnalytics(t *testing.T, fakeURL string) *handlers.App {
 	t.Helper()
@@ -68,6 +78,38 @@ func mkAnalyticsAccount(t *testing.T, db *gorm.DB, orgID uuid.UUID) *models.What
 	}
 	require.NoError(t, db.Create(acc).Error)
 	return acc
+}
+
+func mkMetaAnalyticsSnapshot(
+	t *testing.T,
+	db *gorm.DB,
+	orgID uuid.UUID,
+	accountID uuid.UUID,
+	accountName string,
+	analyticsType string,
+	granularity string,
+	periodStart time.Time,
+	periodEnd time.Time,
+	payload models.JSONB,
+) *models.MetaAnalyticsSnapshot {
+	t.Helper()
+	snapshot := &models.MetaAnalyticsSnapshot{
+		BaseModel:     models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgID,
+		AccountID:      accountID,
+		AccountName:    accountName,
+		PhoneID:        "mock-phone-" + accountID.String()[:8],
+		Dataset:        "handler-test",
+		AnalyticsType:  analyticsType,
+		Granularity:    granularity,
+		PeriodStart:    periodStart,
+		PeriodEnd:      periodEnd,
+		Payload:        payload,
+		TemplateNames:  models.JSONB{},
+		IsMock:         true,
+	}
+	require.NoError(t, db.Create(snapshot).Error)
+	return snapshot
 }
 
 func metaAnalyticsRole(t *testing.T, db *gorm.DB, orgID uuid.UUID) *models.CustomRole {
@@ -144,6 +186,28 @@ func TestApp_GetMetaAnalytics_MissingDates(t *testing.T) {
 	testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "start and end dates are required")
 }
 
+func TestApp_GetMetaAnalytics_RejectsUnsafeTemplateIDs(t *testing.T) {
+	srv := newFakeAnalyticsServer(t, `{}`)
+	app := newAppForMetaAnalytics(t, srv.server.URL)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := metaAnalyticsRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	from, to := dateRange()
+
+	for _, templateIDs := range []string{`not-json`, `["123","bad)injection"]`} {
+		req := testutil.NewGETRequest(t)
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetQueryParam(req, "analytics_type", "template_analytics")
+		testutil.SetQueryParam(req, "start", from)
+		testutil.SetQueryParam(req, "end", to)
+		testutil.SetQueryParam(req, "template_ids", templateIDs)
+
+		require.NoError(t, app.GetMetaAnalytics(req))
+		assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+	}
+	assert.Equal(t, int64(0), srv.Hits())
+}
+
 func TestApp_GetMetaAnalytics_EndBeforeStartRejected(t *testing.T) {
 	srv := newFakeAnalyticsServer(t, `{}`)
 	app := newAppForMetaAnalytics(t, srv.server.URL)
@@ -208,6 +272,204 @@ func TestApp_GetMetaAnalytics_NoAccountsReturnsEmptyList(t *testing.T) {
 	assert.Empty(t, resp.Data.Accounts)
 	assert.Contains(t, resp.Data.Message, "No WhatsApp accounts")
 	assert.Equal(t, int64(0), srv.Hits(), "Meta must not be called when no accounts exist")
+}
+
+func TestApp_GetMetaAnalytics_SnapshotOnlySkipsStaleRedisAndMetaAndFiltersPoints(t *testing.T) {
+	srv := newFakeAnalyticsServer(t, `{"id":"provider-must-not-be-called"}`)
+	app := newAppForMetaAnalytics(t, srv.server.URL)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := metaAnalyticsRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+
+	from, to := dateRange()
+	fromDate, parseErr := time.Parse("2006-01-02", from)
+	require.NoError(t, parseErr)
+	toDate, parseErr := time.Parse("2006-01-02", to)
+	require.NoError(t, parseErr)
+	rangeStart := fromDate.Unix()
+	rangeEnd := toDate.Add(24*time.Hour - time.Second).Unix()
+	accountID := uuid.New()
+	mkMetaAnalyticsSnapshot(
+		t,
+		app.DB,
+		org.ID,
+		accountID,
+		"[MOCK] Snapshot Account",
+		string(whatsapp.AnalyticsTypeMessaging),
+		"DAY",
+		fromDate.AddDate(0, 0, -14),
+		toDate.AddDate(0, 0, 14),
+		models.JSONB{
+			"id": "mock-waba",
+			"analytics": map[string]any{
+				"granularity": "DAY",
+				"data_points": []any{
+					map[string]any{
+						"start":     rangeStart - int64(48*time.Hour/time.Second),
+						"end":       rangeStart - int64(24*time.Hour/time.Second),
+						"sent":      99,
+						"delivered": 98,
+					},
+					map[string]any{
+						"start":     rangeStart + int64(24*time.Hour/time.Second),
+						"end":       rangeStart + int64(48*time.Hour/time.Second) - 1,
+						"sent":      120,
+						"delivered": 114,
+					},
+					map[string]any{
+						"start":     rangeEnd + int64(24*time.Hour/time.Second),
+						"end":       rangeEnd + int64(48*time.Hour/time.Second),
+						"sent":      77,
+						"delivered": 75,
+					},
+				},
+			},
+		},
+	)
+
+	staleResponse := []handlers.MetaAnalyticsResponse{
+		{
+			AccountID:   accountID.String(),
+			AccountName: "STALE PROVIDER CACHE",
+			Data: &whatsapp.MetaAnalyticsResponse{
+				ID: "stale-provider",
+				Analytics: &whatsapp.MessagingAnalytics{
+					Granularity: "DAY",
+					DataPoints: []whatsapp.MessagingAnalyticsDataPoint{
+						{
+							Start:     rangeStart + int64(24*time.Hour/time.Second),
+							End:       rangeStart + int64(48*time.Hour/time.Second) - 1,
+							Sent:      9999,
+							Delivered: 9998,
+						},
+					},
+				},
+			},
+		},
+	}
+	staleJSON, err := json.Marshal(staleResponse)
+	require.NoError(t, err)
+	staleCacheKey := fmt.Sprintf(
+		"meta:analytics:%s:all:analytics:%d:%d:DAY:auto",
+		org.ID.String(),
+		rangeStart,
+		rangeEnd,
+	)
+	ctx := context.Background()
+	require.NoError(t, app.Redis.Set(ctx, staleCacheKey, staleJSON, time.Hour).Err())
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetQueryParam(req, "analytics_type", "analytics")
+	testutil.SetQueryParam(req, "start", from)
+	testutil.SetQueryParam(req, "end", to)
+	testutil.SetQueryParam(req, "granularity", "DAY")
+
+	require.NoError(t, app.GetMetaAnalytics(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Equal(t, int64(0), srv.Hits(), "snapshot cache miss must never call Meta")
+
+	var resp struct {
+		Data struct {
+			Accounts []handlers.MetaAnalyticsResponse `json:"accounts"`
+			Cached   bool                             `json:"cached"`
+			DemoData bool                             `json:"demo_data"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &resp))
+	require.Len(t, resp.Data.Accounts, 1)
+	assert.False(t, resp.Data.Cached, "first snapshot request should exercise the cache-miss path")
+	assert.True(t, resp.Data.DemoData)
+	assert.True(t, resp.Data.Accounts[0].IsMock)
+	assert.Equal(t, accountID.String(), resp.Data.Accounts[0].AccountID)
+	require.NotNil(t, resp.Data.Accounts[0].Data)
+	require.NotNil(t, resp.Data.Accounts[0].Data.Analytics)
+	require.Len(t, resp.Data.Accounts[0].Data.Analytics.DataPoints, 1)
+	assert.Equal(t, int64(120), resp.Data.Accounts[0].Data.Analytics.DataPoints[0].Sent)
+
+	cachedAfterSnapshot, err := app.Redis.Get(ctx, staleCacheKey).Result()
+	require.NoError(t, err)
+	assert.JSONEq(t, string(staleJSON), cachedAfterSnapshot, "snapshot requests must not overwrite provider cache entries")
+
+	refreshReq := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetAuthContext(refreshReq, org.ID, user.ID)
+	require.NoError(t, app.RefreshMetaAnalyticsCache(refreshReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(refreshReq))
+
+	reqAfterRefresh := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(reqAfterRefresh, org.ID, user.ID)
+	testutil.SetQueryParam(reqAfterRefresh, "analytics_type", "analytics")
+	testutil.SetQueryParam(reqAfterRefresh, "start", from)
+	testutil.SetQueryParam(reqAfterRefresh, "end", to)
+	testutil.SetQueryParam(reqAfterRefresh, "granularity", "DAY")
+	require.NoError(t, app.GetMetaAnalytics(reqAfterRefresh))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(reqAfterRefresh))
+	assert.Equal(t, int64(0), srv.Hits(), "snapshot refresh must remain provider-safe")
+}
+
+func TestApp_GetMetaAnalytics_SnapshotTakesProviderSafePrecedenceOverMatchingRealAccount(t *testing.T) {
+	srv := newFakeAnalyticsServer(t, `{"id":"provider-must-not-be-called"}`)
+	app := newAppForMetaAnalytics(t, srv.server.URL)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := metaAnalyticsRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	realAccount := mkAnalyticsAccount(t, app.DB, org.ID)
+
+	from, to := dateRange()
+	fromDate, parseErr := time.Parse("2006-01-02", from)
+	require.NoError(t, parseErr)
+	toDate, parseErr := time.Parse("2006-01-02", to)
+	require.NoError(t, parseErr)
+	mkMetaAnalyticsSnapshot(
+		t,
+		app.DB,
+		org.ID,
+		realAccount.ID,
+		"[MOCK] Snapshot Name",
+		string(whatsapp.AnalyticsTypeMessaging),
+		"DAY",
+		fromDate,
+		toDate.Add(24*time.Hour - time.Second),
+		models.JSONB{
+			"id": "mock-waba",
+			"analytics": map[string]any{
+				"granularity": "DAY",
+				"data_points": []any{
+					map[string]any{
+						"start":     fromDate.Unix(),
+						"end":       fromDate.Add(24*time.Hour - time.Second).Unix(),
+						"sent":      10,
+						"delivered": 9,
+					},
+				},
+			},
+		},
+	)
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetQueryParam(req, "analytics_type", "analytics")
+	testutil.SetQueryParam(req, "start", from)
+	testutil.SetQueryParam(req, "end", to)
+	testutil.SetQueryParam(req, "granularity", "DAY")
+
+	require.NoError(t, app.GetMetaAnalytics(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Equal(t, int64(0), srv.Hits(), "matching snapshot must take precedence before credential decryption/provider use")
+
+	var resp struct {
+		Data struct {
+			Accounts []handlers.MetaAnalyticsResponse `json:"accounts"`
+			DemoData bool                             `json:"demo_data"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &resp))
+	require.Len(t, resp.Data.Accounts, 1)
+	assert.True(t, resp.Data.DemoData)
+	assert.True(t, resp.Data.Accounts[0].IsMock)
+	require.NotNil(t, resp.Data.Accounts[0].Data)
+	require.NotNil(t, resp.Data.Accounts[0].Data.Analytics)
+	assert.Equal(t, int64(10), resp.Data.Accounts[0].Data.Analytics.DataPoints[0].Sent)
 }
 
 func TestApp_GetMetaAnalytics_SpecificAccountNotFound(t *testing.T) {
@@ -295,6 +557,34 @@ func TestApp_GetMetaAnalytics_CacheHitSkipsMetaCall(t *testing.T) {
 	assert.Equal(t, hitsAfterFirst, srv.Hits(), "Meta must NOT be called on cache hit")
 }
 
+func TestApp_GetMetaAnalytics_ProviderEndTimestampIsRequestedDayEnd(t *testing.T) {
+	srv := newFakeAnalyticsServer(t, `{"id":"WABA","analytics":{"granularity":"DAY","data_points":[]}}`)
+	app := newAppForMetaAnalytics(t, srv.server.URL)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := metaAnalyticsRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	mkAnalyticsAccount(t, app.DB, org.ID)
+
+	const from = "2026-07-01"
+	const to = "2026-07-31"
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetQueryParam(req, "analytics_type", "analytics")
+	testutil.SetQueryParam(req, "start", from)
+	testutil.SetQueryParam(req, "end", to)
+	testutil.SetQueryParam(req, "granularity", "DAY")
+
+	require.NoError(t, app.GetMetaAnalytics(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	require.Equal(t, int64(1), srv.Hits())
+
+	endDay, err := time.Parse("2006-01-02", to)
+	require.NoError(t, err)
+	expectedEnd := endDay.Add(24*time.Hour - time.Second).Unix()
+	assert.Contains(t, srv.LastRequest(), fmt.Sprintf("end(%d)", expectedEnd))
+	assert.NotContains(t, srv.LastRequest(), fmt.Sprintf("end(%d)", expectedEnd+24*60*60-1))
+}
+
 func TestApp_GetMetaAnalytics_AdjustedGranularityReportedWhenChanged(t *testing.T) {
 	srv := newFakeAnalyticsServer(t, `{"id":"WABA","analytics":{"granularity":"DAILY","data_points":[]}}`)
 	app := newAppForMetaAnalytics(t, srv.server.URL)
@@ -357,6 +647,64 @@ func TestApp_ListMetaAccountsForAnalytics_OnlyOwnOrg(t *testing.T) {
 	assert.Equal(t, accA.ID.String(), resp.Data.Accounts[0].ID)
 }
 
+func TestApp_ListMetaAccountsForAnalytics_IncludesSnapshotOnlyAccounts(t *testing.T) {
+	srv := newFakeAnalyticsServer(t, `{}`)
+	app := newAppForMetaAnalytics(t, srv.server.URL)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := metaAnalyticsRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	realAccount := mkAnalyticsAccount(t, app.DB, org.ID)
+	snapshotAccountID := uuid.New()
+	now := time.Now().UTC()
+	mkMetaAnalyticsSnapshot(
+		t,
+		app.DB,
+		org.ID,
+		snapshotAccountID,
+		"[MOCK] Logical Account",
+		string(whatsapp.AnalyticsTypeMessaging),
+		"DAY",
+		now.AddDate(0, 0, -30),
+		now,
+		models.JSONB{"id": "mock-waba"},
+	)
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.ListMetaAccountsForAnalytics(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Equal(t, int64(0), srv.Hits())
+
+	var resp struct {
+		Data struct {
+			Accounts []struct {
+				ID     string `json:"id"`
+				Name   string `json:"name"`
+				IsMock bool   `json:"is_mock"`
+			} `json:"accounts"`
+			DemoData bool `json:"demo_data"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &resp))
+	require.Len(t, resp.Data.Accounts, 2)
+	assert.True(t, resp.Data.DemoData)
+
+	accountsByID := make(map[string]struct {
+		Name   string
+		IsMock bool
+	}, len(resp.Data.Accounts))
+	for _, account := range resp.Data.Accounts {
+		accountsByID[account.ID] = struct {
+			Name   string
+			IsMock bool
+		}{Name: account.Name, IsMock: account.IsMock}
+	}
+	assert.False(t, accountsByID[realAccount.ID.String()].IsMock)
+	assert.Equal(t, "[MOCK] Logical Account", accountsByID[snapshotAccountID.String()].Name)
+	assert.True(t, accountsByID[snapshotAccountID.String()].IsMock)
+}
+
 func TestApp_ListMetaAccountsForAnalytics_PermissionDenied(t *testing.T) {
 	srv := newFakeAnalyticsServer(t, `{}`)
 	app := newAppForMetaAnalytics(t, srv.server.URL)
@@ -400,11 +748,11 @@ func TestApp_RefreshMetaAnalyticsCache_ClearsOnlyOrgScopedKeys(t *testing.T) {
 	ctx := context.Background()
 	// Plant cache entries for both orgs.
 	keysA := []string{
-		fmt.Sprintf("meta:analytics:%s:all:analytics:1:2:DAY", orgA.ID.String()),
-		fmt.Sprintf("meta:analytics:%s:specific:pricing_analytics:1:2:DAY", orgA.ID.String()),
+		fmt.Sprintf("meta:analytics:%s:all:analytics:1:2:DAY:auto", orgA.ID.String()),
+		fmt.Sprintf("meta:analytics:%s:specific:pricing_analytics:1:2:DAY:auto", orgA.ID.String()),
 	}
 	keysB := []string{
-		fmt.Sprintf("meta:analytics:%s:all:analytics:1:2:DAY", orgB.ID.String()),
+		fmt.Sprintf("meta:analytics:%s:all:analytics:1:2:DAY:auto", orgB.ID.String()),
 	}
 	for _, k := range keysA {
 		require.NoError(t, app.Redis.Set(ctx, k, "{}", time.Hour).Err())

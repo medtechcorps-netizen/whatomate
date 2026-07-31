@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, computed, watch, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -74,6 +74,9 @@ const accountComboboxOpen = ref(false)
 const activeTab = ref<MetaAnalyticsType>('analytics')
 const analyticsData = ref<MetaAnalyticsResponse[]>([])
 const isCached = ref(false)
+const isDemoData = ref(false)
+let initialLoadComplete = false
+let analyticsRequestSequence = 0
 
 // Granularity
 const selectedGranularity = ref<MetaGranularity>('DAY')
@@ -91,7 +94,13 @@ const {
 // Load other saved preferences (non-date-range)
 const savedGranularity = localStorage.getItem('meta_insights_granularity') as MetaGranularity | null
 const savedAccountId = localStorage.getItem('meta_insights_account_id')
-const savedActiveTab = localStorage.getItem('meta_insights_active_tab') as MetaAnalyticsType | null
+const savedActiveTab = localStorage.getItem('meta_insights_active_tab')
+const supportedAnalyticsTypes: MetaAnalyticsType[] = [
+  'analytics',
+  'pricing_analytics',
+  'template_analytics',
+  'call_analytics'
+]
 
 if (savedGranularity) {
   selectedGranularity.value = savedGranularity as MetaGranularity
@@ -99,7 +108,7 @@ if (savedGranularity) {
 if (savedAccountId) {
   selectedAccountId.value = savedAccountId
 }
-if (savedActiveTab) {
+if (savedActiveTab && supportedAnalyticsTypes.includes(savedActiveTab as MetaAnalyticsType)) {
   activeTab.value = savedActiveTab as MetaAnalyticsType
 }
 
@@ -115,18 +124,33 @@ const selectedAccountName = computed(() => {
   return account?.name || t('metaInsights.selectAccount')
 })
 
+const selectedAccountIsMock = computed(() =>
+  accounts.value.some(account => account.id === selectedAccountId.value && account.is_mock)
+)
 
-const fetchAccounts = async () => {
+
+const fetchAccounts = async (): Promise<boolean> => {
   try {
     const response = await metaAnalyticsService.getAccounts()
     const data = (response.data as any).data || response.data
     accounts.value = data.accounts || []
-  } catch (error) {
-    console.error('Failed to load accounts:', error)
+    return true
+  } catch (accountError) {
+    console.error('Failed to load accounts:', accountError)
+    accounts.value = []
+    analyticsData.value = []
+    isCached.value = false
+    isDemoData.value = false
+    error.value = t('metaInsights.errorLoadingInsights')
+    toast.error(t('metaInsights.errorLoadingInsights'))
+    return false
   }
 }
 
 const fetchAnalytics = async () => {
+  if (!initialLoadComplete) return
+
+  const requestSequence = ++analyticsRequestSequence
   isLoading.value = true
   error.value = null
   try {
@@ -152,26 +176,38 @@ const fetchAnalytics = async () => {
     const envelope = response.data as any
     // Handle error envelope (status: "error")
     if (envelope?.status === 'error') {
+      if (requestSequence !== analyticsRequestSequence) return
       toast.error(envelope.message || 'Failed to load analytics')
       analyticsData.value = []
+      isCached.value = false
+      isDemoData.value = false
       return
     }
     const data = envelope?.data || envelope
+    if (requestSequence !== analyticsRequestSequence) return
     analyticsData.value = data.accounts || []
     isCached.value = data.cached || false
+    isDemoData.value = Boolean(data.demo_data || analyticsData.value.some(account => account.is_mock))
   } catch (err: any) {
+    if (requestSequence !== analyticsRequestSequence) return
     console.error('Failed to load analytics:', err?.response?.data, err)
     const errData = err?.response?.data
     const msg = errData?.data?.message || errData?.message || err?.message || 'Failed to load analytics'
     toast.error(msg)
     error.value = t('metaInsights.errorLoadingInsights')
     analyticsData.value = []
+    isCached.value = false
+    isDemoData.value = false
   } finally {
-    isLoading.value = false
+    if (requestSequence === analyticsRequestSequence) {
+      isLoading.value = false
+    }
   }
 }
 
 const refreshCache = async () => {
+  if (!initialLoadComplete) return
+
   isRefreshing.value = true
   try {
     await metaAnalyticsService.refresh()
@@ -187,34 +223,71 @@ const refreshCache = async () => {
 
 const applyCustomRange = () => {
   applyCustomRangeBase()
-  fetchAnalytics()
+  if (initialLoadComplete) {
+    fetchAnalytics()
+  }
 }
 
 watch(selectedRange, (newValue) => {
-  if (newValue !== 'custom') {
+  if (initialLoadComplete && newValue !== 'custom') {
     fetchAnalytics()
   }
 })
 
 watch(selectedGranularity, () => {
   saveOtherPreferences()
-  fetchAnalytics()
+  if (initialLoadComplete) {
+    fetchAnalytics()
+  }
 })
 
 watch(selectedAccountId, () => {
   saveOtherPreferences()
-  fetchAnalytics()
+  if (selectedAccountIsMock.value && selectedGranularity.value !== 'DAY') {
+    selectedGranularity.value = 'DAY'
+    return
+  }
+  if (initialLoadComplete) {
+    fetchAnalytics()
+  }
 })
 
 watch(activeTab, () => {
   saveOtherPreferences()
-  fetchAnalytics()
+  if (initialLoadComplete) {
+    fetchAnalytics()
+  }
 })
 
-onMounted(() => {
-  fetchAccounts()
-  fetchAnalytics()
-})
+const initializeAnalytics = async () => {
+  initialLoadComplete = false
+  isLoading.value = true
+  error.value = null
+  const accountsLoaded = await fetchAccounts()
+  if (!accountsLoaded) {
+    isLoading.value = false
+    return
+  }
+
+  const selectedAccountExists = accounts.value.some(account => account.id === selectedAccountId.value)
+  const mockAccount = accounts.value.find(account => account.is_mock)
+  if (mockAccount) {
+    selectedAccountId.value = mockAccount.id
+    selectedGranularity.value = 'DAY'
+  } else if (selectedAccountId.value !== 'all' && !selectedAccountExists) {
+    selectedAccountId.value = 'all'
+  }
+
+  saveOtherPreferences()
+  // Flush the account/granularity watchers while initialization is still
+  // guarded. Otherwise Vue's queued watchers observe readiness=true and issue
+  // duplicate initial requests for the values assigned above.
+  await nextTick()
+  initialLoadComplete = true
+  await fetchAnalytics()
+}
+
+onMounted(initializeAnalytics)
 
 // Aggregate data across accounts
 const aggregatedData = computed(() => {
@@ -688,9 +761,9 @@ const chartOptions = {
             <SelectValue :placeholder="$t('metaInsights.granularity')" />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="HALF_HOUR">{{ $t('metaInsights.halfHour') }}</SelectItem>
+            <SelectItem value="HALF_HOUR" :disabled="selectedAccountIsMock">{{ $t('metaInsights.halfHour') }}</SelectItem>
             <SelectItem value="DAY">{{ $t('metaInsights.daily') }}</SelectItem>
-            <SelectItem value="MONTH">{{ $t('metaInsights.monthly') }}</SelectItem>
+            <SelectItem value="MONTH" :disabled="selectedAccountIsMock">{{ $t('metaInsights.monthly') }}</SelectItem>
           </SelectContent>
         </Select>
 
@@ -712,6 +785,15 @@ const chartOptions = {
         <Badge v-if="isCached" variant="secondary" class="ml-2">
           {{ $t('metaInsights.cached') }}
         </Badge>
+
+        <!-- Synthetic fixture indicator -->
+        <Badge
+          v-if="isDemoData"
+          variant="outline"
+          class="border-amber-400/40 bg-amber-500/10 text-amber-300 light:border-amber-300 light:bg-amber-50 light:text-amber-700"
+        >
+          {{ $t('metaInsights.demoData') }}
+        </Badge>
       </template>
     </PageHeader>
 
@@ -724,7 +806,7 @@ const chartOptions = {
           :title="$t('common.loadErrorTitle')"
           :description="error"
           :retry-label="$t('common.retry')"
-          @retry="fetchAnalytics"
+          @retry="initializeAnalytics"
         />
 
         <!-- Analytics Type Tabs -->

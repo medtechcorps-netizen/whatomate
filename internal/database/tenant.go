@@ -92,6 +92,7 @@ var DirectTenantTables = []string{
 	"message_events",
 	"message_parts",
 	"messages",
+	"meta_analytics_snapshots",
 	"notification_rules",
 	"organization_onboardings",
 	"outbox_events",

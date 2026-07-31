@@ -2176,6 +2176,7 @@
     "selectDates": "Select dates",
     "applyRange": "Apply Range",
     "cached": "Cached",
+    "demoData": "Synthetic demo data",
     "cacheCleared": "Cache Cleared",
     "cacheRefreshed": "Analytics cache has been refreshed. Fetching fresh data...",
     "refreshFailed": "Failed to refresh cache",

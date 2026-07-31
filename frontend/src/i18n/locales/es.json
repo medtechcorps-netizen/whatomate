@@ -1902,6 +1902,7 @@
     "selectDates": "Seleccionar fechas",
     "applyRange": "Aplicar rango",
     "cached": "En caché",
+    "demoData": "Datos de demostración sintéticos",
     "cacheCleared": "Caché limpiada",
     "cacheRefreshed": "La caché de analíticas ha sido actualizada. Obteniendo datos nuevos...",
     "refreshFailed": "Error al actualizar la caché",

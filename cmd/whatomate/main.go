@@ -11,12 +11,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/calling"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
+	"github.com/shridarpatil/whatomate/internal/demodata"
 	"github.com/shridarpatil/whatomate/internal/frontend"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/middleware"
@@ -49,6 +51,8 @@ func main() {
 		runWorker(os.Args[2:])
 	case "rls-migrate":
 		runRLSMigration(os.Args[2:])
+	case "seed-klinik-relive-sales":
+		runKlinikReliveSalesSeed(os.Args[2:])
 	case "version":
 		fmt.Printf("ReReply %s (built %s)\n", Version, BuildTime)
 	case "help", "-h", "--help":
@@ -70,6 +74,7 @@ Commands:
   server    Start the API server (with optional embedded workers)
   worker    Start background workers only (no API server)
   rls-migrate  Run schema migrations and install PostgreSQL tenant RLS
+  seed-klinik-relive-sales  Safely validate or apply Klinik Relive sales fixtures
   version   Show version information
   help      Show this help message
 
@@ -89,11 +94,93 @@ Examples:
   rereply server -migrate            # Run migrations and start server
   rereply worker -workers 4          # 4 workers only (no API)
   rereply rls-migrate                # Pre-deploy migration using database.migration_url
+  rereply seed-klinik-relive-sales -organization-id c73f761f-5154-4fe1-9a13-06bae570277a -organization-name "Klinik Relive"
+  rereply seed-klinik-relive-sales -organization-id c73f761f-5154-4fe1-9a13-06bae570277a -organization-name "Klinik Relive" -apply
 
 Deployment Scenarios:
   All-in-one:    rereply server
   Separate:      rereply server -workers 0  (on API server)
                  rereply worker -workers 4  (on worker server)`)
+}
+
+// ============================================================================
+// KLINIK RELIVE SALES FIXTURE COMMAND
+// ============================================================================
+
+func runKlinikReliveSalesSeed(args []string) {
+	seedFlags := flag.NewFlagSet("seed-klinik-relive-sales", flag.ExitOnError)
+	configPath := seedFlags.String("config", "config.toml", "Path to config file")
+	organizationIDText := seedFlags.String("organization-id", "", "Required exact target organization UUID")
+	organizationName := seedFlags.String("organization-name", "", "Required exact target organization name")
+	apply := seedFlags.Bool("apply", false, "Commit fixtures; without this flag the transaction is rolled back")
+	_ = seedFlags.Parse(args)
+
+	if *organizationIDText == "" || *organizationName == "" {
+		fmt.Fprintln(os.Stderr, "Both -organization-id and -organization-name are required; no database changes were made.")
+		os.Exit(1)
+	}
+	organizationID, err := uuid.Parse(*organizationIDText)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "The supplied -organization-id is not a valid UUID; no database changes were made.")
+		os.Exit(1)
+	}
+	if organizationID.String() != demodata.KlinikReliveOrganizationID ||
+		*organizationName != demodata.KlinikReliveOrganizationName {
+		fmt.Fprintln(os.Stderr, "The supplied organization does not exactly match the Klinik Relive fixture target; no database changes were made.")
+		os.Exit(1)
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to load the fixture command configuration; no database changes were made.")
+		os.Exit(1)
+	}
+	if cfg.Database.MigrationURL == "" {
+		fmt.Fprintln(os.Stderr, "database.migration_url is required; no database changes were made.")
+		os.Exit(1)
+	}
+
+	migrationCfg := cfg.Database
+	migrationCfg.URL = cfg.Database.MigrationURL
+	db, err := database.NewPostgres(&migrationCfg, false)
+	if err != nil {
+		// Do not include the driver error: connection failures can echo a DSN.
+		fmt.Fprintln(os.Stderr, "Failed to connect using database.migration_url; no database changes were made.")
+		os.Exit(1)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to initialize the migration database connection; no database changes were made.")
+		os.Exit(1)
+	}
+	defer func() {
+		_ = sqlDB.Close()
+	}()
+
+	report, err := demodata.SeedKlinikReliveSales(context.Background(), db, demodata.SeedOptions{
+		OrganizationID:   organizationID,
+		OrganizationName: *organizationName,
+		Apply:            *apply,
+		Now:              time.Now().UTC(),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Klinik Relive sales fixture validation failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	mode := "DRY RUN (transaction rolled back)"
+	if report.Applied {
+		mode = "APPLIED"
+	}
+	fmt.Printf(
+		"Klinik Relive sales fixtures %s: canned=%d ivr=%d calls=%d transfers=%d meta_snapshots=%d\n",
+		mode,
+		report.CannedResponses,
+		report.IVRFlows,
+		report.CallLogs,
+		report.CallTransfers,
+		report.MetaSnapshots,
+	)
 }
 
 // ============================================================================
