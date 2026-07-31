@@ -1479,6 +1479,106 @@ func TestApp_GetAllWidgetsData_ReportsPerWidgetAuthorizationErrorsWithoutDataLea
 	assert.Equal(t, fasthttp.StatusForbidden, response.Data.Errors[unauthorized.ID.String()].Status)
 }
 
+func TestApp_GetAllWidgetsData_SQLFailureDoesNotAbortTenantTransaction(t *testing.T) {
+	app := newTestApp(t)
+	app.Config.Database.RLSEnabled = true
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "Isolated widget query reader", []string{
+		models.ResourceAnalytics + ":" + models.ActionRead,
+		models.ResourceContacts + ":" + models.ActionRead,
+		models.ResourceFlowsChatbot + ":" + models.ActionRead,
+		models.ResourceTransfers + ":" + models.ActionWrite,
+	})
+	user := testutil.CreateTestUser(
+		t,
+		app.DB,
+		org.ID,
+		testutil.WithEmail(testutil.UniqueEmail("widget-query-isolation")),
+		testutil.WithPassword("password"),
+		testutil.WithRoleID(&role.ID),
+	)
+
+	now := time.Now().UTC()
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	session := &models.ChatbotSession{
+		BaseModel:       models.BaseModel{ID: uuid.New(), CreatedAt: now, UpdatedAt: now},
+		OrganizationID:  org.ID,
+		ContactID:       contact.ID,
+		WhatsAppAccount: "widget-isolation-account",
+		PhoneNumber:     contact.PhoneNumber,
+		Status:          models.SessionStatusActive,
+		SessionData:     models.JSONB{},
+		StartedAt:       now,
+		LastActivityAt:  now,
+	}
+	require.NoError(t, app.DB.Create(session).Error)
+	transfer := &models.AgentTransfer{
+		BaseModel:       models.BaseModel{ID: uuid.New(), CreatedAt: now, UpdatedAt: now},
+		OrganizationID:  org.ID,
+		ContactID:       contact.ID,
+		WhatsAppAccount: "widget-isolation-account",
+		PhoneNumber:     contact.PhoneNumber,
+		Status:          models.TransferStatusActive,
+		Source:          models.TransferSourceManual,
+		TransferredAt:   now,
+	}
+	require.NoError(t, app.DB.Create(transfer).Error)
+
+	failingWidget := createTestWidgetDefinition(
+		t, app, org.ID, user.ID,
+		"Failing contact widget", "contacts", "count", "", "number", "",
+	)
+	failingWidget.Filters = models.JSONBArray{map[string]any{
+		"field":    "assigned_user_id",
+		"operator": "equals",
+		"value":    "not-a-uuid",
+	}}
+	require.NoError(t, app.DB.Model(failingWidget).Updates(map[string]any{
+		"display_order": 0,
+		"filters":       failingWidget.Filters,
+	}).Error)
+
+	sessionWidget := createTestWidgetDefinition(
+		t, app, org.ID, user.ID,
+		"Valid session widget", "sessions", "count", "", "number", "",
+	)
+	require.NoError(t, app.DB.Model(sessionWidget).Update("display_order", 1).Error)
+	transferWidget := createTestWidgetDefinition(
+		t, app, org.ID, user.ID,
+		"Valid transfer widget", "transfers", "count", "", "number", "",
+	)
+	require.NoError(t, app.DB.Model(transferWidget).Update("display_order", 2).Error)
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetQueryParam(req, "from", now.AddDate(0, 0, -1).Format("2006-01-02"))
+	testutil.SetQueryParam(req, "to", now.AddDate(0, 0, 1).Format("2006-01-02"))
+	require.NoError(t, app.WithTenantApp(org.ID, func(scoped *handlers.App) error {
+		return scoped.GetAllWidgetsData(req)
+	}))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var response struct {
+		Data struct {
+			Data   map[string]handlers.WidgetDataResponse `json:"data"`
+			Errors map[string]handlers.WidgetDataError    `json:"errors"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &response))
+	require.Len(t, response.Data.Errors, 1)
+	require.Contains(t, response.Data.Errors, failingWidget.ID.String())
+	assert.Equal(
+		t,
+		fasthttp.StatusBadRequest,
+		response.Data.Errors[failingWidget.ID.String()].Status,
+	)
+
+	require.Contains(t, response.Data.Data, sessionWidget.ID.String())
+	assert.Equal(t, float64(1), response.Data.Data[sessionWidget.ID.String()].Value)
+	require.Contains(t, response.Data.Data, transferWidget.ID.String())
+	assert.Equal(t, float64(1), response.Data.Data[transferWidget.ID.String()].Value)
+}
+
 func TestApp_MessageTableWidgetRequiresContactWideReadPermission(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
@@ -1712,6 +1812,135 @@ func TestApp_WidgetTableRowsMaskContactPhoneLabels(t *testing.T) {
 			} else {
 				require.Equal(t, testCase.wantSubLabel, data.TableRows[0].SubLabel)
 			}
+		})
+	}
+}
+
+func TestApp_GetWidgetData_WhatsAppAccountFilterAndGroupingUsePhysicalColumn(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "WhatsApp account widget reader", []string{
+		models.ResourceAnalytics + ":" + models.ActionRead,
+		models.ResourceChat + ":" + models.ActionRead,
+		models.ResourceContacts + ":" + models.ActionRead,
+		models.ResourceCampaigns + ":" + models.ActionRead,
+	})
+	user := testutil.CreateTestUser(
+		t,
+		app.DB,
+		org.ID,
+		testutil.WithEmail(testutil.UniqueEmail("widget-whatsapp-account")),
+		testutil.WithPassword("password"),
+		testutil.WithRoleID(&role.ID),
+	)
+
+	accountA := "widget-account-a-" + uuid.NewString()[:8]
+	accountB := "widget-account-b-" + uuid.NewString()[:8]
+	now := time.Now().UTC()
+
+	contacts := []*models.Contact{
+		testutil.CreateTestContactWith(t, app.DB, org.ID, testutil.WithContactAccount(accountA)),
+		testutil.CreateTestContactWith(t, app.DB, org.ID, testutil.WithContactAccount(accountA)),
+		testutil.CreateTestContactWith(t, app.DB, org.ID, testutil.WithContactAccount(accountB)),
+	}
+	for _, contact := range contacts {
+		require.NoError(t, app.DB.Model(contact).Update("last_message_at", now).Error)
+	}
+
+	messageAccounts := []string{accountA, accountA, accountB}
+	for index, account := range messageAccounts {
+		message := &models.Message{
+			BaseModel:         models.BaseModel{ID: uuid.New(), CreatedAt: now, UpdatedAt: now},
+			OrganizationID:    org.ID,
+			WhatsAppAccount:   account,
+			ContactID:         contacts[index].ID,
+			WhatsAppMessageID: "widget-account-" + uuid.NewString(),
+			Direction:         models.DirectionIncoming,
+			MessageType:       models.MessageTypeText,
+			Content:           "WhatsApp account widget regression fixture",
+			Status:            models.MessageStatusReceived,
+			Metadata:          models.JSONB{},
+		}
+		require.NoError(t, app.DB.Create(message).Error)
+	}
+
+	template := testutil.CreateTestTemplate(t, app.DB, org.ID, accountA)
+	for _, account := range messageAccounts {
+		campaign := &models.BulkMessageCampaign{
+			BaseModel:       models.BaseModel{ID: uuid.New(), CreatedAt: now, UpdatedAt: now},
+			OrganizationID:  org.ID,
+			WhatsAppAccount: account,
+			Name:            "WhatsApp account widget " + uuid.NewString()[:8],
+			TemplateID:      template.ID,
+			Status:          models.CampaignStatusDraft,
+			CreatedBy:       user.ID,
+		}
+		require.NoError(t, app.DB.Create(campaign).Error)
+	}
+
+	for _, dataSource := range []string{"messages", "contacts", "campaigns"} {
+		t.Run(dataSource, func(t *testing.T) {
+			t.Run("filter", func(t *testing.T) {
+				filteredWidget := createTestWidgetDefinition(
+					t,
+					app,
+					org.ID,
+					user.ID,
+					"Filtered "+dataSource+" by WhatsApp account",
+					dataSource,
+					"count",
+					"",
+					"number",
+					"",
+				)
+				filteredWidget.Filters = models.JSONBArray{map[string]any{
+					"field":    "whatsapp_account",
+					"operator": "equals",
+					"value":    accountA,
+				}}
+				require.NoError(t, app.DB.Model(filteredWidget).Update("filters", filteredWidget.Filters).Error)
+
+				filteredData, status := getTestWidgetData(
+					t,
+					app,
+					org.ID,
+					user.ID,
+					filteredWidget.ID,
+				)
+				require.Equal(t, fasthttp.StatusOK, status)
+				assert.Equal(t, float64(2), filteredData.Value)
+			})
+
+			t.Run("group", func(t *testing.T) {
+				groupedWidget := createTestWidgetDefinition(
+					t,
+					app,
+					org.ID,
+					user.ID,
+					"Grouped "+dataSource+" by WhatsApp account",
+					dataSource,
+					"count",
+					"",
+					"table",
+					"whatsapp_account",
+				)
+				groupedData, status := getTestWidgetData(
+					t,
+					app,
+					org.ID,
+					user.ID,
+					groupedWidget.ID,
+				)
+				require.Equal(t, fasthttp.StatusOK, status)
+				require.Len(t, groupedData.DataPoints, 2)
+
+				groupValues := make(map[string]float64, len(groupedData.DataPoints))
+				for _, dataPoint := range groupedData.DataPoints {
+					groupValues[dataPoint.Label] = dataPoint.Value
+				}
+				assert.Equal(t, float64(2), groupValues[accountA])
+				assert.Equal(t, float64(1), groupValues[accountB])
+			})
 		})
 	}
 }
