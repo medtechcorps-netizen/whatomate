@@ -67,15 +67,23 @@ type addResellerMemberRequest struct {
 }
 
 type resellerUsageResponse struct {
-	ResellerID        uuid.UUID              `json:"reseller_id"`
-	Plan              string                 `json:"plan"`
-	MaxOrganizations  int                    `json:"max_organizations"`
-	Organizations     []OrganizationResponse `json:"organizations"`
-	OrganizationCount int64                  `json:"organization_count"`
-	UserCount         int64                  `json:"user_count"`
-	WhatsAppAccounts  int64                  `json:"whatsapp_accounts"`
-	Contacts          int64                  `json:"contacts"`
-	Messages          int64                  `json:"messages"`
+	ResellerID        uuid.UUID                           `json:"reseller_id"`
+	Plan              string                              `json:"plan"`
+	MaxOrganizations  int                                 `json:"max_organizations"`
+	Organizations     []resellerOrganizationUsageResponse `json:"organizations"`
+	Page              int                                 `json:"page"`
+	Limit             int                                 `json:"limit"`
+	Total             int64                               `json:"total"`
+	OrganizationCount int64                               `json:"organization_count"`
+	UserCount         int64                               `json:"user_count"`
+	WhatsAppAccounts  int64                               `json:"whatsapp_accounts"`
+	Contacts          int64                               `json:"contacts"`
+	Messages          int64                               `json:"messages"`
+}
+
+type resellerOrganizationUsageResponse struct {
+	OrganizationResponse
+	Subscription ProductSubscriptionResponse `json:"subscription"`
 }
 
 func resellerRoleCanManage(role string) bool {
@@ -786,8 +794,17 @@ func (a *App) GetResellerUsage(r *fastglue.Request) error {
 	if err := a.DB.Where("id = ?", resellerID).First(&reseller).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Reseller not found", nil, "")
 	}
-	var orgs []models.Organization
-	if err := a.DB.Where("reseller_id = ?", resellerID).Order("name ASC").Find(&orgs).Error; err != nil {
+
+	pg := parsePagination(r)
+	var orgIDs []uuid.UUID
+	if err := a.DB.Model(&models.Organization{}).
+		Where("reseller_id = ?", resellerID).
+		Pluck("id", &orgIDs).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load reseller organizations", nil, "")
+	}
+	var pageOrganizations []models.Organization
+	if err := pg.Apply(a.DB.Where("reseller_id = ?", resellerID).
+		Order("name ASC, id ASC")).Find(&pageOrganizations).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load reseller organizations", nil, "")
 	}
 
@@ -795,37 +812,75 @@ func (a *App) GetResellerUsage(r *fastglue.Request) error {
 		ResellerID:        reseller.ID,
 		Plan:              reseller.Plan,
 		MaxOrganizations:  reseller.MaxOrganizations,
-		Organizations:     make([]OrganizationResponse, 0, len(orgs)),
-		OrganizationCount: int64(len(orgs)),
+		Organizations:     make([]resellerOrganizationUsageResponse, 0, len(pageOrganizations)),
+		Page:              pg.Page,
+		Limit:             pg.Limit,
+		Total:             int64(len(orgIDs)),
+		OrganizationCount: int64(len(orgIDs)),
 	}
-	orgIDs := make([]uuid.UUID, 0, len(orgs))
-	for _, org := range orgs {
-		orgIDs = append(orgIDs, org.ID)
-		response.Organizations = append(response.Organizations, OrganizationResponse{
-			ID:         org.ID,
-			ResellerID: org.ResellerID,
-			Name:       org.Name,
-			Slug:       org.Slug,
-			CreatedAt:  org.CreatedAt.Format(time.RFC3339),
-		})
-		err := database.WithTenant(a.DB, org.ID, func(tx *gorm.DB) error {
-			var whatsappAccounts, contacts, messages int64
-			if err := tx.Model(&models.WhatsAppAccount{}).Count(&whatsappAccounts).Error; err != nil {
+	pageOrganizationIndexes := make(map[uuid.UUID]int, len(pageOrganizations))
+	for _, org := range pageOrganizations {
+		pageOrganizationIndexes[org.ID] = len(response.Organizations)
+		organizationResponse := resellerOrganizationUsageResponse{
+			OrganizationResponse: OrganizationResponse{
+				ID:         org.ID,
+				ResellerID: org.ResellerID,
+				Name:       org.Name,
+				Slug:       org.Slug,
+				CreatedAt:  org.CreatedAt.Format(time.RFC3339),
+			},
+			Subscription: productCommercialSubscriptionToResponse(nil, nil),
+		}
+		response.Organizations = append(response.Organizations, organizationResponse)
+	}
+
+	// Full-portfolio usage remains one aggregate statement inside each tenant's
+	// RLS context. Pagination safely avoids subscription work for organizations
+	// outside the requested page, but it cannot collapse these counts into a
+	// cross-tenant query without weakening tenant isolation.
+	for _, orgID := range orgIDs {
+		pageIndex, includeSubscription := pageOrganizationIndexes[orgID]
+		err := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
+			var counts struct {
+				WhatsAppAccounts int64 `gorm:"column:whatsapp_accounts"`
+				Contacts         int64 `gorm:"column:contacts"`
+				Messages         int64 `gorm:"column:messages"`
+			}
+			if err := tx.Raw(`
+				SELECT
+					(SELECT COUNT(*) FROM whatsapp_accounts WHERE organization_id = ?) AS whatsapp_accounts,
+					(SELECT COUNT(*) FROM contacts WHERE organization_id = ?) AS contacts,
+					(SELECT COUNT(*) FROM messages WHERE organization_id = ?) AS messages
+			`, orgID, orgID, orgID).Scan(&counts).Error; err != nil {
 				return err
 			}
-			if err := tx.Model(&models.Contact{}).Count(&contacts).Error; err != nil {
+			response.WhatsAppAccounts += counts.WhatsAppAccounts
+			response.Contacts += counts.Contacts
+			response.Messages += counts.Messages
+			if !includeSubscription {
+				return nil
+			}
+
+			var subscription models.Subscription
+			if err := productCommercialLoadCurrentSubscription(tx, orgID, &subscription); err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
 				return err
 			}
-			if err := tx.Model(&models.Message{}).Count(&messages).Error; err != nil {
+			var plan models.Plan
+			if err := tx.Where("id = ?", subscription.PlanID).First(&plan).Error; err != nil &&
+				!errors.Is(err, gorm.ErrRecordNotFound) {
 				return err
 			}
-			response.WhatsAppAccounts += whatsappAccounts
-			response.Contacts += contacts
-			response.Messages += messages
+			response.Organizations[pageIndex].Subscription = productCommercialSubscriptionToResponse(
+				&subscription,
+				&plan,
+			)
 			return nil
 		})
 		if err != nil {
-			a.Log.Error("Failed to aggregate reseller usage", "error", err, "reseller_id", resellerID, "org_id", org.ID)
+			a.Log.Error("Failed to aggregate reseller usage", "error", err, "reseller_id", resellerID, "org_id", orgID)
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to calculate reseller usage", nil, "")
 		}
 	}

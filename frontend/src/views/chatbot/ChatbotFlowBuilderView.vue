@@ -36,6 +36,8 @@ import {
   Plus,
   Trash2,
   Play,
+  Variable,
+  Sparkles,
 } from 'lucide-vue-next'
 
 import AuditLogPanel from '@/components/shared/AuditLogPanel.vue'
@@ -57,6 +59,8 @@ import ChatbotTimingNode from '@/components/chatbot/nodes/ChatbotTimingNode.vue'
 import ChatbotGotoFlowNode from '@/components/chatbot/nodes/ChatbotGotoFlowNode.vue'
 import ChatbotEndNode from '@/components/chatbot/nodes/ChatbotEndNode.vue'
 import ChatbotStartNode from '@/components/chatbot/nodes/ChatbotStartNode.vue'
+import ChatbotSetVariableNode from '@/components/chatbot/nodes/ChatbotSetVariableNode.vue'
+import ChatbotAIResponseNode from '@/components/chatbot/nodes/ChatbotAIResponseNode.vue'
 
 import InteractivePreview from '@/components/chatbot/flow-preview/InteractivePreview.vue'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
@@ -117,6 +121,8 @@ const nodeTypes: any = {
   transfer: markRaw(ChatbotTransferNode),
   condition: markRaw(ChatbotConditionNode),
   timing: markRaw(ChatbotTimingNode),
+  set_variable: markRaw(ChatbotSetVariableNode),
+  ai_response: markRaw(ChatbotAIResponseNode),
   goto_flow: markRaw(ChatbotGotoFlowNode),
   end: markRaw(ChatbotEndNode),
   webhook: markRaw(ChatbotApiNode),
@@ -132,6 +138,8 @@ const palette: { type: ChatNodeType; label: string; icon: any; color: string }[]
   { type: 'transfer', label: 'Transfer', icon: Users, color: 'bg-amber-600' },
   { type: 'condition', label: 'Condition', icon: GitBranch, color: 'bg-indigo-600' },
   { type: 'timing', label: 'Timing', icon: Clock, color: 'bg-cyan-600' },
+  { type: 'set_variable', label: 'Set variable', icon: Variable, color: 'bg-teal-600' },
+  { type: 'ai_response', label: 'AI response', icon: Sparkles, color: 'bg-purple-600' },
   { type: 'goto_flow', label: 'Go to Flow', icon: ExternalLink, color: 'bg-teal-600' },
   { type: 'end', label: 'End', icon: StopCircle, color: 'bg-slate-600' },
 ]
@@ -213,6 +221,10 @@ function defaultConfigFor(type: ChatNodeType): Record<string, any> {
           { day: 'sunday', enabled: false, start_time: '09:00', end_time: '18:00' },
         ],
       }
+    case 'set_variable':
+      return { set: { variable_1: '' } }
+    case 'ai_response':
+      return { prompt_template: '' }
     case 'goto_flow':
       return { flow_id: '' }
     case 'webhook':
@@ -233,6 +245,8 @@ const paletteLabels: Record<string, string> = {
   transfer: 'Transfer',
   condition: 'Condition',
   timing: 'Timing',
+  set_variable: 'Set variable',
+  ai_response: 'AI response',
   goto_flow: 'Go to Flow',
   webhook: 'Webhook',
   end: 'End',
@@ -422,8 +436,73 @@ function toGraphPayload(): ChatFlowGraph {
   }
 }
 
+interface NodeValidationIssue {
+  nodeId: string
+  nodeLabel: string
+  message: string
+}
+
+function firstSupportedNodeValidationIssue(graph: ChatFlowGraph): NodeValidationIssue | null {
+  for (const node of graph.nodes) {
+    if (node.type === 'set_variable') {
+      const set = node.config?.set
+      if (!set || typeof set !== 'object' || Array.isArray(set) || Object.keys(set).length === 0) {
+        return {
+          nodeId: node.id,
+          nodeLabel: node.label || 'Set variable',
+          message: 'Add at least one variable assignment.',
+        }
+      }
+
+      const seen = new Set<string>()
+      for (const name of Object.keys(set)) {
+        const normalized = name.trim()
+        if (!normalized) {
+          return {
+            nodeId: node.id,
+            nodeLabel: node.label || 'Set variable',
+            message: 'Every assignment needs a variable name.',
+          }
+        }
+        if (seen.has(normalized)) {
+          return {
+            nodeId: node.id,
+            nodeLabel: node.label || 'Set variable',
+            message: `Variable "${normalized}" is assigned more than once.`,
+          }
+        }
+        seen.add(normalized)
+      }
+    }
+
+    if (node.type === 'ai_response') {
+      for (const key of ['prompt_template', 'prompt']) {
+        const value = node.config?.[key]
+        if (value != null && typeof value !== 'string') {
+          return {
+            nodeId: node.id,
+            nodeLabel: node.label || 'AI response',
+            message: 'The prompt template must be text.',
+          }
+        }
+      }
+    }
+  }
+  return null
+}
+
+function validateSupportedNodeConfigs(graph: ChatFlowGraph): boolean {
+  const issue = firstSupportedNodeValidationIssue(graph)
+  if (!issue) return true
+
+  selectedNodeId.value = issue.nodeId
+  toast.error(`Fix "${issue.nodeLabel}": ${issue.message}`)
+  return false
+}
+
 // Variables available to the contact-panel editor — captured from
-// prompt nodes (store_as) and api_call nodes (response_mapping keys).
+// prompt nodes (store_as), api_call nodes (response_mapping keys), and
+// explicit set_variable nodes.
 const availableVariables = computed<AvailableVariable[]>(() => {
   const out: AvailableVariable[] = []
   for (const n of nodes.value) {
@@ -434,6 +513,11 @@ const availableVariables = computed<AvailableVariable[]>(() => {
     if (n.type === 'api_call' && cfg.response_mapping && typeof cfg.response_mapping === 'object') {
       for (const k of Object.keys(cfg.response_mapping)) {
         if (k && k.trim()) out.push({ key: k.trim(), source: 'Response mapping', stepName: n.id })
+      }
+    }
+    if (n.type === 'set_variable' && cfg.set && typeof cfg.set === 'object' && !Array.isArray(cfg.set)) {
+      for (const key of Object.keys(cfg.set)) {
+        if (key.trim()) out.push({ key: key.trim(), source: 'Set variable', stepName: n.id })
       }
     }
   }
@@ -604,9 +688,11 @@ async function saveFlow() {
     return
   }
 
+  const graph = toGraphPayload()
+  if (!validateSupportedNodeConfigs(graph)) return
+
   isSaving.value = true
   try {
-    const graph = toGraphPayload()
     const data: Record<string, any> = {
       name: name.value,
       description: description.value,

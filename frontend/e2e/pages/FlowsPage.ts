@@ -338,7 +338,7 @@ export class ChatbotFlowBuilderPage extends BasePage {
   }
 
   /** Click a palette button to add a new node (and auto-select it). */
-  async addNode(type: 'Text' | 'Buttons' | 'API' | 'WA Flow' | 'Transfer' | 'Condition' | 'Timing' | 'Go to Flow' | 'End') {
+  async addNode(type: 'Text' | 'Buttons' | 'API' | 'WA Flow' | 'Transfer' | 'Condition' | 'Timing' | 'Set variable' | 'AI response' | 'Go to Flow' | 'End') {
     await this.paletteToolbar.getByRole('button', { name: type, exact: true }).click()
   }
 

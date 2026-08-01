@@ -11,6 +11,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
+	"gorm.io/gorm"
 )
 
 // runIVRFlow parses the IVR flow graph and executes the node loop.
@@ -53,7 +54,9 @@ func (m *Manager) runIVRFlow(session *CallSession, waAccount *whatsapp.Account) 
 
 	// Load existing IVR path from call log (for goto_flow accumulation)
 	var existingLog models.CallLog
-	if err := m.db.Select("ivr_path").Where("id = ?", session.CallLogID).First(&existingLog).Error; err == nil {
+	if err := m.withTenantDB(session.OrganizationID, func(db *gorm.DB) error {
+		return db.Select("ivr_path").Where("id = ?", session.CallLogID).First(&existingLog).Error
+	}); err == nil {
 		if existingLog.IVRPath != nil {
 			if steps, ok := existingLog.IVRPath["steps"].([]any); ok {
 				for _, s := range steps {
@@ -507,7 +510,7 @@ func (m *Manager) executeGotoFlow(session *CallSession, node *IVRNode, ctx *IVRC
 		return
 	}
 
-	targetFlowPtr := m.getIVRFlowCached(targetFlowID)
+	targetFlowPtr := m.getIVRFlowCached(session.OrganizationID, targetFlowID)
 	if targetFlowPtr == nil {
 		m.log.Error("Failed to load goto_flow target", "call_id", session.ID, "flow_id", flowID)
 		m.saveIVRPath(session, ctx.Path)
@@ -529,9 +532,13 @@ func (m *Manager) executeGotoFlow(session *CallSession, node *IVRNode, ctx *IVRC
 	session.IVRFlow = &targetFlow
 	session.mu.Unlock()
 
-	m.db.Model(&models.CallLog{}).
-		Where("id = ?", session.CallLogID).
-		Update("ivr_flow_id", targetFlow.ID)
+	if err := m.withTenantDB(session.OrganizationID, func(db *gorm.DB) error {
+		return db.Model(&models.CallLog{}).
+			Where("id = ?", session.CallLogID).
+			Update("ivr_flow_id", targetFlow.ID).Error
+	}); err != nil {
+		m.log.Error("Failed to persist goto_flow target", "error", err, "call_id", session.ID)
+	}
 
 	m.runIVRFlow(session, waAccount)
 }
@@ -592,9 +599,13 @@ func (m *Manager) executeHangup(session *CallSession, node *IVRNode, ctx *IVRCon
 	// Mark as system-initiated hangup before terminating so the webhook
 	// handler (which defaults to "client") doesn't overwrite it.
 	if session.CallLogID != uuid.Nil {
-		m.db.Model(&models.CallLog{}).
-			Where("id = ?", session.CallLogID).
-			Update("disconnected_by", models.DisconnectedBySystem)
+		if err := m.withTenantDB(session.OrganizationID, func(db *gorm.DB) error {
+			return db.Model(&models.CallLog{}).
+				Where("id = ?", session.CallLogID).
+				Update("disconnected_by", models.DisconnectedBySystem).Error
+		}); err != nil {
+			m.log.Error("Failed to persist IVR hangup", "error", err, "call_id", session.ID)
+		}
 	}
 
 	m.saveIVRPath(session, ctx.Path)
@@ -666,9 +677,13 @@ func (m *Manager) saveIVRPath(session *CallSession, path []map[string]string) {
 	pathJSON := models.JSONB{}
 	pathJSON["steps"] = path
 
-	m.db.Model(&models.CallLog{}).
-		Where("id = ?", session.CallLogID).
-		Update("ivr_path", pathJSON)
+	if err := m.withTenantDB(session.OrganizationID, func(db *gorm.DB) error {
+		return db.Model(&models.CallLog{}).
+			Where("id = ?", session.CallLogID).
+			Update("ivr_path", pathJSON).Error
+	}); err != nil {
+		m.log.Error("Failed to persist IVR path", "error", err, "call_id", session.ID)
+	}
 }
 
 // getConfigInt extracts an int from a config map with a default fallback.

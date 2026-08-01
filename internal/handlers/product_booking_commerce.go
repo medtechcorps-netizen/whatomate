@@ -857,6 +857,17 @@ func (a *App) CreateBookingEvent(r *fastglue.Request) error {
 				"Event duration cannot be shorter than the booking service duration",
 			)
 		}
+		if event.Status == models.BookingEventStatusScheduled {
+			if err := ensureBookingEventWithinRecurringAvailability(
+				tx,
+				orgID,
+				event.ResourceID,
+				event.StartsAt,
+				event.EndsAt,
+			); err != nil {
+				return err
+			}
+		}
 		if err := ensureBookingEventAvailable(
 			tx, orgID, event.ResourceID, event.StartsAt, event.EndsAt, uuid.Nil,
 		); err != nil {
@@ -928,6 +939,17 @@ func (a *App) UpdateBookingEvent(r *fastglue.Request) error {
 				fasthttp.StatusBadRequest,
 				"Event duration cannot be shorter than the booking service duration",
 			)
+		}
+		if req.Status == models.BookingEventStatusScheduled {
+			if err := ensureBookingEventWithinRecurringAvailability(
+				tx,
+				orgID,
+				req.ResourceID,
+				req.StartsAt.UTC(),
+				req.EndsAt.UTC(),
+			); err != nil {
+				return err
+			}
 		}
 		if err := ensureBookingEventAvailable(
 			tx, orgID, req.ResourceID, req.StartsAt.UTC(), req.EndsAt.UTC(), eventID,
@@ -3252,7 +3274,49 @@ func normalizeBookingEventRequestTimes(req *BookingEventRequest) error {
 				if parsed.In(location).Format(layout) != raw {
 					return time.Time{}, fmt.Errorf("%s is not a valid wall time in %s", field, req.Timezone)
 				}
-				return parsed.UTC(), nil
+
+				// Build candidates from the timezone's actual nearby UTC offsets. This
+				// handles non-hour and historical rollbacks (for example Casey's
+				// three-hour transition) without assuming a fixed DST shift size.
+				wallTime, wallErr := time.Parse(layout, raw)
+				if wallErr != nil {
+					return time.Time{}, fmt.Errorf("%s must use YYYY-MM-DDTHH:MM[:SS]", field)
+				}
+				offsets := make(map[int]struct{})
+				cursor := parsed.Add(-7 * 24 * time.Hour)
+				windowEnd := parsed.Add(7 * 24 * time.Hour)
+				for !cursor.After(windowEnd) {
+					_, offset := cursor.In(location).Zone()
+					offsets[offset] = struct{}{}
+					_, zoneEnd := cursor.In(location).ZoneBounds()
+					if zoneEnd.IsZero() || zoneEnd.After(windowEnd) {
+						break
+					}
+					if !zoneEnd.After(cursor) {
+						cursor = cursor.Add(time.Second)
+						continue
+					}
+					cursor = zoneEnd
+				}
+
+				matches := make(map[int64]time.Time)
+				for offset := range offsets {
+					candidate := wallTime.Add(-time.Duration(offset) * time.Second)
+					if candidate.In(location).Format(layout) == raw {
+						matches[candidate.UnixNano()] = candidate
+					}
+				}
+				if len(matches) > 1 {
+					return time.Time{}, fmt.Errorf(
+						"%s is ambiguous in %s; provide an RFC3339 timestamp with an explicit offset",
+						field,
+						req.Timezone,
+					)
+				}
+				for _, match := range matches {
+					return match.UTC(), nil
+				}
+				return time.Time{}, fmt.Errorf("%s is not a valid wall time in %s", field, req.Timezone)
 			}
 		}
 		return time.Time{}, fmt.Errorf("%s must use YYYY-MM-DDTHH:MM[:SS]", field)

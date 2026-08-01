@@ -1,17 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import {
-  CalendarDays,
-  ChevronLeft,
-  ChevronRight,
-  Clock3,
-  Loader2,
-  MapPin,
-  Plus,
-  UsersRound,
-} from 'lucide-vue-next'
+import { CalendarDays, ChevronLeft, ChevronRight, Clock3, Loader2, MapPin, Plus, UsersRound } from 'lucide-vue-next'
 import PageHeader from '@/components/shared/PageHeader.vue'
 import ContactPicker from '@/components/shared/ContactPicker.vue'
+import ResourceAvailabilityPanel from '@/components/booking/ResourceAvailabilityPanel.vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -82,9 +74,7 @@ const activeServices = computed(() => services.value.filter((service) => service
 const eligibleEventResources = computed(() => {
   const service = activeServices.value.find((item) => item.id === newEvent.service_id)
   const allowed = new Set(service?.resource_ids ?? [])
-  return resources.value.filter(
-    (resource) => resource.is_active && (allowed.size === 0 || allowed.has(resource.id)),
-  )
+  return resources.value.filter((resource) => resource.is_active && (allowed.size === 0 || allowed.has(resource.id)))
 })
 
 const weekDays = computed(() =>
@@ -168,8 +158,7 @@ async function load() {
     resources.value = resourceResponse
     events.value = eventResponse
     if (selectedEvent.value) {
-      selectedEvent.value =
-        events.value.find((event) => event.id === selectedEvent.value?.id) ?? null
+      selectedEvent.value = events.value.find((event) => event.id === selectedEvent.value?.id) ?? null
     }
 
     if (!newEvent.service_id || !activeServices.value.some((service) => service.id === newEvent.service_id)) {
@@ -309,6 +298,11 @@ async function selectEvent(event: BookingEvent) {
   await loadBookings()
 }
 
+function closeSelectedEvent() {
+  selectedEvent.value = null
+  bookings.value = []
+}
+
 async function loadBookings() {
   if (!selectedEvent.value) {
     bookings.value = []
@@ -404,9 +398,7 @@ async function createEvent() {
   }
   const localStartsAt = `${newEvent.date}T${newEvent.start_time}`
   const wallClock = new Date(`${localStartsAt}:00Z`)
-  const localEndsAt = new Date(wallClock.getTime() + service.duration_minutes * 60_000)
-    .toISOString()
-    .slice(0, 16)
+  const localEndsAt = new Date(wallClock.getTime() + service.duration_minutes * 60_000).toISOString().slice(0, 16)
 
   saving.value = true
   try {
@@ -505,16 +497,26 @@ onMounted(load)
       >
         <div class="md:col-span-2">
           <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-cyan-300">1 · Schedulable resource</p>
-          <p class="mt-1 text-xs text-white/40 light:text-gray-500">Add a practitioner, instructor, room, or equipment.</p>
+          <p class="mt-1 text-xs text-white/40 light:text-gray-500">
+            Add a practitioner, instructor, room, or equipment.
+          </p>
         </div>
         <Input v-model="resourceDraft.name" required maxlength="255" placeholder="Resource name" />
-        <select v-model="resourceDraft.kind" class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900">
+        <select
+          v-model="resourceDraft.kind"
+          class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
+        >
           <option value="practitioner">Practitioner</option>
           <option value="instructor">Instructor</option>
           <option value="room">Room</option>
           <option value="equipment">Equipment</option>
         </select>
-        <Input v-model="resourceDraft.timezone" required maxlength="100" placeholder="Timezone, e.g. Asia/Kuala_Lumpur" />
+        <Input
+          v-model="resourceDraft.timezone"
+          required
+          maxlength="100"
+          placeholder="Timezone, e.g. Asia/Kuala_Lumpur"
+        />
         <Input v-model="resourceDraft.location" maxlength="255" placeholder="Location (optional)" />
         <Button type="submit" class="md:col-span-2" variant="outline" :disabled="saving">
           <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
@@ -530,13 +532,22 @@ onMounted(load)
           <div>
             <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-cyan-300">2 · Service offering</p>
             <p class="mt-1 text-xs text-white/40 light:text-gray-500">
-              {{ serviceDraft.id ? 'Review the starter values before activation.' : 'Tie an active service to a resource.' }}
+              {{
+                serviceDraft.id
+                  ? 'Review the starter values before activation.'
+                  : 'Tie an active service to a resource.'
+              }}
             </p>
           </div>
-          <Button v-if="serviceDraft.id" type="button" size="sm" variant="outline" @click="resetServiceDraft">New instead</Button>
+          <Button v-if="serviceDraft.id" type="button" size="sm" variant="outline" @click="resetServiceDraft"
+            >New instead</Button
+          >
         </div>
         <Input v-model="serviceDraft.name" required maxlength="255" placeholder="Service name" />
-        <select v-model="serviceDraft.kind" class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900">
+        <select
+          v-model="serviceDraft.kind"
+          class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
+        >
           <option value="appointment">Appointment</option>
           <option value="class">Class</option>
         </select>
@@ -546,24 +557,54 @@ onMounted(load)
           multiple
           class="min-h-24 rounded-md border border-white/10 bg-[#0d0f10] px-3 py-2 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
         >
-          <option v-for="resource in resources" :key="resource.id" :value="resource.id">{{ resource.name }}</option>
+          <option v-for="resource in resources" :key="resource.id" :value="resource.id">
+            {{ resource.name }}
+          </option>
         </select>
-        <Input v-model.number="serviceDraft.duration_minutes" required type="number" min="1" max="10080" placeholder="Minutes" />
-        <Input v-model.number="serviceDraft.default_capacity" required type="number" min="1" max="100000" placeholder="Capacity" />
+        <Input
+          v-model.number="serviceDraft.duration_minutes"
+          required
+          type="number"
+          min="1"
+          max="10080"
+          placeholder="Minutes"
+        />
+        <Input
+          v-model.number="serviceDraft.default_capacity"
+          required
+          type="number"
+          min="1"
+          max="100000"
+          placeholder="Capacity"
+        />
         <div class="grid grid-cols-[1fr_90px] gap-2">
           <Input v-model="serviceDraft.price" required type="number" min="0" step="0.01" placeholder="Price" />
-          <select v-model="serviceDraft.currency" class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-2 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900">
+          <select
+            v-model="serviceDraft.currency"
+            class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-2 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
+          >
             <option value="MYR">MYR</option>
             <option value="SGD">SGD</option>
             <option value="USD">USD</option>
           </select>
         </div>
-        <Input v-model="serviceDraft.description" maxlength="10000" placeholder="Description (optional)" class="md:col-span-2" />
-        <Button type="submit" class="bg-cyan-400 text-black hover:bg-cyan-300 md:col-span-2" :disabled="saving || !resources.length">
+        <Input
+          v-model="serviceDraft.description"
+          maxlength="10000"
+          placeholder="Description (optional)"
+          class="md:col-span-2"
+        />
+        <Button
+          type="submit"
+          class="bg-cyan-400 text-black hover:bg-cyan-300 md:col-span-2"
+          :disabled="saving || !resources.length"
+        >
           <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
           {{ serviceDraft.id ? 'Review & activate' : 'Create service' }}
         </Button>
       </form>
+
+      <ResourceAvailabilityPanel :resources="resources" />
     </section>
 
     <div
@@ -576,7 +617,9 @@ onMounted(load)
         @change="syncEventResource"
       >
         <option value="" disabled>Service</option>
-        <option v-for="service in activeServices" :key="service.id" :value="service.id">{{ service.name }}</option>
+        <option v-for="service in activeServices" :key="service.id" :value="service.id">
+          {{ service.name }}
+        </option>
       </select>
       <select
         v-model="newEvent.resource_id"
@@ -597,10 +640,7 @@ onMounted(load)
       </Button>
     </div>
 
-    <section
-      v-if="selectedEvent"
-      class="border-b border-violet-300/15 bg-violet-300/[0.035] px-5 py-4"
-    >
+    <section v-if="selectedEvent" class="border-b border-violet-300/15 bg-violet-300/[0.035] px-5 py-4">
       <div class="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-violet-300">Attendee desk</p>
@@ -609,10 +649,11 @@ onMounted(load)
           </h2>
           <p class="mt-1 text-xs text-white/40 light:text-gray-500">
             {{ eventDateTimeLabel(selectedEvent) }}
-            · {{ selectedEvent.booked_quantity ?? 0 }}/{{ selectedEvent.capacity }} seats
+            · {{ selectedEvent.booked_quantity ?? 0 }}/{{ selectedEvent.capacity }}
+            seats
           </p>
         </div>
-        <Button variant="outline" size="sm" @click="selectedEvent = null; bookings = []">Close</Button>
+        <Button variant="outline" size="sm" @click="closeSelectedEvent">Close</Button>
       </div>
 
       <div class="mt-4 grid gap-4 xl:grid-cols-[390px_1fr]">
@@ -646,7 +687,9 @@ onMounted(load)
           You can manage booking statuses, but adding an attendee requires contact read access.
         </div>
 
-        <div class="min-w-0 rounded-2xl border border-white/[0.08] bg-black/15 p-3 light:border-gray-200 light:bg-white">
+        <div
+          class="min-w-0 rounded-2xl border border-white/[0.08] bg-black/15 p-3 light:border-gray-200 light:bg-white"
+        >
           <div v-if="bookingsLoading" class="flex min-h-24 items-center justify-center">
             <Loader2 class="h-5 w-5 animate-spin text-violet-300" />
           </div>
@@ -658,14 +701,19 @@ onMounted(load)
             >
               <div class="flex items-start justify-between gap-3">
                 <div class="min-w-0">
-                  <p class="truncate text-sm font-medium text-white light:text-gray-900">{{ customerLabel(booking) }}</p>
+                  <p class="truncate text-sm font-medium text-white light:text-gray-900">
+                    {{ customerLabel(booking) }}
+                  </p>
                   <p class="mt-1 text-[10px] uppercase tracking-wider text-white/35 light:text-gray-500">
                     {{ booking.quantity }} seat{{ booking.quantity === 1 ? '' : 's' }}
                   </p>
                 </div>
                 <Badge variant="outline" class="shrink-0 capitalize">{{ booking.status.replace('_', ' ') }}</Badge>
               </div>
-              <div v-if="canWriteBookings && bookingTransitions(booking.status).length" class="mt-3 flex flex-wrap gap-1.5">
+              <div
+                v-if="canWriteBookings && bookingTransitions(booking.status).length"
+                class="mt-3 flex flex-wrap gap-1.5"
+              >
                 <Button
                   v-for="transition in bookingTransitions(booking.status)"
                   :key="transition.key"
@@ -692,7 +740,9 @@ onMounted(load)
         <Button variant="outline" size="icon" @click="shiftWeek(-1)"><ChevronLeft class="h-4 w-4" /></Button>
         <Button variant="outline" size="sm" @click="goToday">Today</Button>
         <Button variant="outline" size="icon" @click="shiftWeek(1)"><ChevronRight class="h-4 w-4" /></Button>
-        <p class="ml-2 text-sm font-semibold text-white light:text-gray-900">{{ weekLabel }}</p>
+        <p class="ml-2 text-sm font-semibold text-white light:text-gray-900">
+          {{ weekLabel }}
+        </p>
       </div>
       <div class="hidden items-center gap-5 text-xs text-white/45 light:text-gray-500 md:flex">
         <span>{{ events.length }} schedules</span>
@@ -755,11 +805,10 @@ onMounted(load)
                     {{ event.booked_quantity ?? 0 }}/{{ event.capacity }}
                   </Badge>
                 </div>
-                <p class="mt-2 text-xs font-semibold leading-5">{{ event.service?.name || 'Scheduled service' }}</p>
-                <div
-                  data-testid="calendar-event-meta"
-                  class="mt-2 space-y-1 text-[10px] opacity-65 light:opacity-100"
-                >
+                <p class="mt-2 text-xs font-semibold leading-5">
+                  {{ event.service?.name || 'Scheduled service' }}
+                </p>
+                <div data-testid="calendar-event-meta" class="mt-2 space-y-1 text-[10px] opacity-65 light:opacity-100">
                   <p class="flex items-center gap-1.5">
                     <UsersRound class="h-3 w-3" />
                     {{ event.resource?.name || 'Resource' }}
@@ -781,8 +830,12 @@ onMounted(load)
         </div>
       </div>
 
-      <aside class="hidden overflow-y-auto border-l border-white/[0.08] bg-[#0b0c0d] p-4 light:border-gray-200 light:bg-white xl:block">
-        <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-white/35 light:text-gray-500">Service menu</p>
+      <aside
+        class="hidden overflow-y-auto border-l border-white/[0.08] bg-[#0b0c0d] p-4 light:border-gray-200 light:bg-white xl:block"
+      >
+        <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-white/35 light:text-gray-500">
+          Service menu
+        </p>
         <div class="mt-3 space-y-2">
           <article
             v-for="service in services"
@@ -791,7 +844,9 @@ onMounted(load)
           >
             <div class="flex items-start justify-between gap-2">
               <div>
-                <p class="text-xs font-medium text-white light:text-gray-900">{{ service.name }}</p>
+                <p class="text-xs font-medium text-white light:text-gray-900">
+                  {{ service.name }}
+                </p>
                 <p class="mt-1 flex items-center gap-1 text-[10px] text-white/35 light:text-gray-500">
                   <Clock3 class="h-3 w-3" />
                   {{ service.duration_minutes }} min · {{ service.kind }}
@@ -799,7 +854,12 @@ onMounted(load)
               </div>
               <div class="text-right">
                 <span class="text-[11px] font-medium text-emerald-300">
-                  {{ new Intl.NumberFormat('en-MY', { style: 'currency', currency: service.currency }).format(service.price_minor / 100) }}
+                  {{
+                    new Intl.NumberFormat('en-MY', {
+                      style: 'currency',
+                      currency: service.currency,
+                    }).format(service.price_minor / 100)
+                  }}
                 </span>
                 <button
                   v-if="!service.is_active && canWriteBookingSettings"
@@ -812,24 +872,35 @@ onMounted(load)
               </div>
             </div>
           </article>
-          <div v-if="services.length === 0" class="rounded-xl bg-white/[0.025] p-5 text-center text-xs text-white/35 light:bg-gray-50 light:text-gray-500">
+          <div
+            v-if="services.length === 0"
+            class="rounded-xl bg-white/[0.025] p-5 text-center text-xs text-white/35 light:bg-gray-50 light:text-gray-500"
+          >
             Apply a vertical playbook or add your first service.
           </div>
         </div>
 
-        <p class="mt-7 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/35 light:text-gray-500">Resources</p>
+        <p class="mt-7 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/35 light:text-gray-500">
+          Resources
+        </p>
         <div class="mt-3 space-y-2">
           <div
             v-for="resource in resources"
             :key="resource.id"
             class="flex items-center gap-3 rounded-xl border border-white/[0.07] px-3 py-2.5 light:border-gray-200"
           >
-            <div class="flex h-8 w-8 items-center justify-center rounded-full bg-violet-300/10 text-xs font-semibold text-violet-200">
+            <div
+              class="flex h-8 w-8 items-center justify-center rounded-full bg-violet-300/10 text-xs font-semibold text-violet-200"
+            >
               {{ resource.name.slice(0, 2).toUpperCase() }}
             </div>
             <div class="min-w-0">
-              <p class="truncate text-xs font-medium text-white light:text-gray-900">{{ resource.name }}</p>
-              <p class="mt-0.5 text-[10px] capitalize text-white/35 light:text-gray-500">{{ resource.kind }}</p>
+              <p class="truncate text-xs font-medium text-white light:text-gray-900">
+                {{ resource.name }}
+              </p>
+              <p class="mt-0.5 text-[10px] capitalize text-white/35 light:text-gray-500">
+                {{ resource.kind }}
+              </p>
             </div>
           </div>
         </div>

@@ -6,10 +6,12 @@ import {
   AlertCircle,
   Clock3,
   Loader2,
+  Pencil,
   Plus,
   RefreshCw,
 } from 'lucide-vue-next'
 import PageHeader from '@/components/shared/PageHeader.vue'
+import TaskEditDialog from '@/components/crm/TaskEditDialog.vue'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { useAppToast } from '@/composables/useAppToast'
@@ -25,6 +27,8 @@ const loading = ref(true)
 const saving = ref(false)
 const activeFilter = ref<TaskFilter>('open')
 const tasks = ref<FollowUpTask[]>([])
+const taskEditorOpen = ref(false)
+const editingTask = ref<FollowUpTask | null>(null)
 const draft = ref({
   title: '',
   description: '',
@@ -101,6 +105,16 @@ async function complete(task: FollowUpTask) {
   } catch (error) {
     toast.error('Follow-up was not updated', getErrorMessage(error))
   }
+}
+
+function openTaskEditor(task: FollowUpTask) {
+  editingTask.value = task
+  taskEditorOpen.value = true
+}
+
+async function handleTaskSaved() {
+  toast.success('Follow-up updated')
+  await load()
 }
 
 onMounted(load)
@@ -213,9 +227,22 @@ onMounted(load)
                       {{ task.description }}
                     </p>
                   </div>
-                  <Badge variant="outline" class="capitalize" :class="{ 'border-rose-400/30 text-rose-300': task.priority === 'urgent' }">
-                    {{ task.priority }}
-                  </Badge>
+                  <div class="flex items-center gap-1.5">
+                    <Badge variant="outline" class="capitalize" :class="{ 'border-rose-400/30 text-rose-300': task.priority === 'urgent' }">
+                      {{ task.priority }}
+                    </Badge>
+                    <Button
+                      v-if="canWriteTasks"
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      class="h-8 w-8 text-white/35 hover:text-violet-200 light:text-gray-500 light:hover:text-violet-700"
+                      :aria-label="`Edit ${task.title}`"
+                      @click="openTaskEditor(task)"
+                    >
+                      <Pencil class="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
                 </div>
                 <div class="mt-3 flex flex-wrap items-center gap-3 text-[11px] text-white/35 light:text-gray-500">
                   <span class="flex items-center gap-1.5" :class="{ 'text-rose-300': isOverdue(task) }">
@@ -293,5 +320,11 @@ onMounted(load)
         </form>
       </aside>
     </main>
+
+    <TaskEditDialog
+      v-model="taskEditorOpen"
+      :task="editingTask"
+      @saved="handleTaskSaved"
+    />
   </div>
 </template>

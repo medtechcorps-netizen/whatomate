@@ -479,6 +479,14 @@ func runServer(args []string) {
 	go careProcessor.Start(careCtx)
 	lo.Info("Care continuity processor started")
 
+	// Enforce Copilot data retention independently of HTTP traffic. Expired
+	// output is hidden by handlers immediately and hard-purged here, including
+	// linked feedback, in tenant-scoped batches.
+	copilotRetentionProcessor := handlers.NewCopilotRetentionProcessor(app, time.Hour)
+	copilotRetentionCtx, copilotRetentionCancel := context.WithCancel(context.Background())
+	go copilotRetentionProcessor.Start(copilotRetentionCtx)
+	lo.Info("Copilot retention processor started")
+
 	// Execute immutable visual automation versions from the dedicated customer
 	// activity receipt stream. Multi-replica leases keep this safe when more
 	// than one API instance is running.
@@ -558,6 +566,12 @@ func runServer(args []string) {
 	automationCancel()
 	automationProcessor.Stop()
 	lo.Info("Automation policy processor stopped")
+
+	// Stop Copilot retention before the shared database pool is closed.
+	lo.Info("Stopping Copilot retention processor...")
+	copilotRetentionCancel()
+	copilotRetentionProcessor.Stop()
+	lo.Info("Copilot retention processor stopped")
 
 	// Stop care continuity processor
 	lo.Info("Stopping care continuity processor...")
@@ -1003,6 +1017,8 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/api/crm/leads/{id}", tenant((*handlers.App).GetCRMLead))
 	g.PUT("/api/crm/leads/{id}", tenant((*handlers.App).UpdateCRMLead))
 	g.PUT("/api/crm/leads/{id}/move", tenant((*handlers.App).MoveCRMLead))
+	g.PUT("/api/crm/leads/{id}/archive", tenant((*handlers.App).ArchiveCRMLead))
+	g.PUT("/api/crm/leads/{id}/reopen", tenant((*handlers.App).ReopenCRMLead))
 	g.GET("/api/automation-policies/catalog", tenant((*handlers.App).GetAutomationPolicyCatalog))
 	g.GET("/api/automation-policies", tenant((*handlers.App).ListAutomationPolicies))
 	g.POST("/api/automation-policies", tenant((*handlers.App).CreateAutomationPolicy))
@@ -1028,6 +1044,38 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/api/booking/resources", tenant((*handlers.App).ListBookingResources))
 	g.POST("/api/booking/resources", tenant((*handlers.App).CreateBookingResource))
 	g.PUT("/api/booking/resources/{id}", tenant((*handlers.App).UpdateBookingResource))
+	g.GET(
+		"/api/booking/resources/{resource_id}/availability-rules",
+		tenant((*handlers.App).ListAvailabilityRules),
+	)
+	g.POST(
+		"/api/booking/resources/{resource_id}/availability-rules",
+		tenant((*handlers.App).CreateAvailabilityRule),
+	)
+	g.PUT(
+		"/api/booking/resources/{resource_id}/availability-rules/{id}",
+		tenant((*handlers.App).UpdateAvailabilityRule),
+	)
+	g.DELETE(
+		"/api/booking/resources/{resource_id}/availability-rules/{id}",
+		tenant((*handlers.App).DeleteAvailabilityRule),
+	)
+	g.GET(
+		"/api/booking/resources/{resource_id}/time-off",
+		tenant((*handlers.App).ListResourceTimeOff),
+	)
+	g.POST(
+		"/api/booking/resources/{resource_id}/time-off",
+		tenant((*handlers.App).CreateResourceTimeOff),
+	)
+	g.PUT(
+		"/api/booking/resources/{resource_id}/time-off/{id}",
+		tenant((*handlers.App).UpdateResourceTimeOff),
+	)
+	g.DELETE(
+		"/api/booking/resources/{resource_id}/time-off/{id}",
+		tenant((*handlers.App).DeleteResourceTimeOff),
+	)
 	g.GET("/api/booking/events", tenant((*handlers.App).ListBookingEvents))
 	g.POST("/api/booking/events", tenant((*handlers.App).CreateBookingEvent))
 	g.PUT("/api/booking/events/{id}", tenant((*handlers.App).UpdateBookingEvent))

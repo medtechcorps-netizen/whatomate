@@ -13,6 +13,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/config"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/flowgraph"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/storage"
@@ -180,6 +181,57 @@ func NewManager(cfg *config.CallingConfig, s3Client *storage.S3Client, db *gorm.
 	}
 }
 
+// withTenantDB performs one bounded database operation for a long-lived call
+// session. A WebRTC session can remain active for an hour, so it must never own
+// a database transaction for its lifetime. Instead, every asynchronous read or
+// write establishes transaction-local PostgreSQL tenant context and releases
+// the connection as soon as fn returns.
+func (m *Manager) withTenantDB(organizationID uuid.UUID, fn func(*gorm.DB) error) error {
+	return database.WithTenant(m.db, organizationID, fn)
+}
+
+func (m *Manager) createCallLog(organizationID uuid.UUID, callLog *models.CallLog) error {
+	return m.withTenantDB(organizationID, func(db *gorm.DB) error {
+		return db.Create(callLog).Error
+	})
+}
+
+func (m *Manager) findCallLog(organizationID, callLogID uuid.UUID, callLog *models.CallLog) error {
+	return m.withTenantDB(organizationID, func(db *gorm.DB) error {
+		return db.Where("id = ? AND organization_id = ?", callLogID, organizationID).
+			First(callLog).Error
+	})
+}
+
+func (m *Manager) updateCallLog(organizationID, callLogID uuid.UUID, values map[string]any) error {
+	return m.withTenantDB(organizationID, func(db *gorm.DB) error {
+		return db.Model(&models.CallLog{}).
+			Where("id = ? AND organization_id = ?", callLogID, organizationID).
+			Updates(values).Error
+	})
+}
+
+func (m *Manager) createCallTransfer(organizationID uuid.UUID, transfer *models.CallTransfer) error {
+	return m.withTenantDB(organizationID, func(db *gorm.DB) error {
+		return db.Create(transfer).Error
+	})
+}
+
+func (m *Manager) findCallTransfer(organizationID, transferID uuid.UUID, transfer *models.CallTransfer) error {
+	return m.withTenantDB(organizationID, func(db *gorm.DB) error {
+		return db.Where("id = ? AND organization_id = ?", transferID, organizationID).
+			First(transfer).Error
+	})
+}
+
+func (m *Manager) updateCallTransfer(organizationID, transferID uuid.UUID, values map[string]any) error {
+	return m.withTenantDB(organizationID, func(db *gorm.DB) error {
+		return db.Model(&models.CallTransfer{}).
+			Where("id = ? AND organization_id = ?", transferID, organizationID).
+			Updates(values).Error
+	})
+}
+
 // HandleIncomingCall processes a new incoming call and starts WebRTC negotiation.
 // The sdpOffer parameter is the consumer's SDP offer received from the webhook's
 // session.sdp field in the "connect" event.
@@ -206,7 +258,7 @@ func (m *Manager) HandleIncomingCall(account *models.WhatsAppAccount, contact *m
 	// Load IVR flow if assigned (cached). Skipped for sticky-routed calls —
 	// those bypass IVR entirely and go straight to a transfer.
 	if stickyAgentID == nil && callLog.IVRFlowID != nil {
-		session.IVRFlow = m.getIVRFlowCached(*callLog.IVRFlowID)
+		session.IVRFlow = m.getIVRFlowCached(account.OrganizationID, *callLog.IVRFlowID)
 	}
 
 	m.mu.Lock()
@@ -392,15 +444,21 @@ func (m *Manager) cleanupSession(callID string) {
 	// DB operations and broadcasts (outside lock)
 	if transferID != uuid.Nil && transferStatus == models.CallTransferStatusWaiting {
 		now := time.Now()
-		m.db.Model(&models.CallTransfer{}).
-			Where("id = ? AND status = ?", transferID, models.CallTransferStatusWaiting).
-			Updates(map[string]any{
-				"status":       models.CallTransferStatusAbandoned,
-				"completed_at": now,
-			})
-		m.db.Model(&models.CallLog{}).
-			Where("id = ?", callLogID).
-			Update("disconnected_by", models.DisconnectedByClient)
+		if err := m.withTenantDB(orgID, func(db *gorm.DB) error {
+			if err := db.Model(&models.CallTransfer{}).
+				Where("id = ? AND status = ?", transferID, models.CallTransferStatusWaiting).
+				Updates(map[string]any{
+					"status":       models.CallTransferStatusAbandoned,
+					"completed_at": now,
+				}).Error; err != nil {
+				return err
+			}
+			return db.Model(&models.CallLog{}).
+				Where("id = ?", callLogID).
+				Update("disconnected_by", models.DisconnectedByClient).Error
+		}); err != nil {
+			m.log.Error("Failed to persist abandoned transfer during cleanup", "error", err, "transfer_id", transferID)
+		}
 		m.broadcastEvent(orgID, websocket.TypeCallTransferAbandoned, map[string]any{
 			"id":           transferID.String(),
 			"completed_at": now.Format(time.RFC3339),
@@ -519,8 +577,10 @@ func (m *Manager) terminateCall(session *CallSession, waAccount *whatsapp.Accoun
 // terminates the call. Used when only the session is available.
 func (m *Manager) terminateCallBySession(session *CallSession) {
 	var account models.WhatsAppAccount
-	if err := m.db.Where("organization_id = ? AND name = ?", session.OrganizationID, session.AccountName).
-		First(&account).Error; err != nil {
+	if err := m.withTenantDB(session.OrganizationID, func(db *gorm.DB) error {
+		return db.Where("organization_id = ? AND name = ?", session.OrganizationID, session.AccountName).
+			First(&account).Error
+	}); err != nil {
 		m.log.Error("Failed to look up account for call termination", "error", err, "call_id", session.ID)
 		return
 	}
@@ -631,20 +691,24 @@ func (m *Manager) finalizeRecording(orgID, callLogID uuid.UUID, callerRec, agent
 
 	if err := m.s3.Upload(ctx, s3Key, f, "audio/ogg"); err != nil {
 		m.log.Error("Failed to upload recording to S3", "error", err, "call_log_id", callLogID)
-		if dbErr := m.db.Model(&models.CallLog{}).
-			Where("id = ?", callLogID).
-			Update("recording_error", err.Error()).Error; dbErr != nil {
+		if dbErr := m.withTenantDB(orgID, func(db *gorm.DB) error {
+			return db.Model(&models.CallLog{}).
+				Where("id = ?", callLogID).
+				Update("recording_error", err.Error()).Error
+		}); dbErr != nil {
 			m.log.Error("Failed to update call log with recording error", "error", dbErr, "call_log_id", callLogID)
 		}
 		return
 	}
 
-	if err := m.db.Model(&models.CallLog{}).
-		Where("id = ?", callLogID).
-		Updates(map[string]any{
-			"recording_s3_key":   s3Key,
-			"recording_duration": durationSecs,
-		}).Error; err != nil {
+	if err := m.withTenantDB(orgID, func(db *gorm.DB) error {
+		return db.Model(&models.CallLog{}).
+			Where("id = ?", callLogID).
+			Updates(map[string]any{
+				"recording_s3_key":   s3Key,
+				"recording_duration": durationSecs,
+			}).Error
+	}); err != nil {
 		m.log.Error("Failed to update call log with recording metadata", "error", err, "s3_key", s3Key, "call_log_id", callLogID)
 	}
 

@@ -211,7 +211,7 @@ func (a *App) HangupCallTransfer(r *fastglue.Request) error {
 
 // HoldCall puts an active call on hold and plays hold music to the caller.
 func (a *App) HoldCall(r *fastglue.Request) error {
-	_, _, err := a.requireAuth(r, models.ResourceCallTransfers, models.ActionWrite)
+	orgID, _, err := a.requireAuth(r, models.ResourceCallTransfers, models.ActionWrite)
 	if err != nil {
 		return nil
 	}
@@ -223,6 +223,12 @@ func (a *App) HoldCall(r *fastglue.Request) error {
 
 	if a.CallManager == nil {
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Calling is not enabled", nil, "")
+	}
+
+	var callLog models.CallLog
+	if err := a.DB.Select("id").Where("id = ? AND organization_id = ?", callLogID, orgID).
+		First(&callLog).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Call log not found", nil, "")
 	}
 
 	if err := a.CallManager.HoldCall(callLogID); err != nil {
@@ -234,7 +240,7 @@ func (a *App) HoldCall(r *fastglue.Request) error {
 
 // ResumeCall takes an active call off hold and restores the audio bridge.
 func (a *App) ResumeCall(r *fastglue.Request) error {
-	_, _, err := a.requireAuth(r, models.ResourceCallTransfers, models.ActionWrite)
+	orgID, _, err := a.requireAuth(r, models.ResourceCallTransfers, models.ActionWrite)
 	if err != nil {
 		return nil
 	}
@@ -246,6 +252,12 @@ func (a *App) ResumeCall(r *fastglue.Request) error {
 
 	if a.CallManager == nil {
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Calling is not enabled", nil, "")
+	}
+
+	var callLog models.CallLog
+	if err := a.DB.Select("id").Where("id = ? AND organization_id = ?", callLogID, orgID).
+		First(&callLog).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Call log not found", nil, "")
 	}
 
 	if err := a.CallManager.ResumeCall(callLogID); err != nil {
@@ -281,6 +293,15 @@ func (a *App) InitiateAgentTransfer(r *fastglue.Request) error {
 	callLogID, err := uuid.Parse(req.CallLogID)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid call_log_id", nil, "")
+	}
+
+	// Session control happens in memory, outside PostgreSQL RLS. Resolve the
+	// call log through the tenant transaction before touching the session so a
+	// guessed UUID from another organization cannot be held or transferred.
+	var callLog models.CallLog
+	if err := a.DB.Select("id").Where("id = ? AND organization_id = ?", callLogID, orgID).
+		First(&callLog).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Call log not found", nil, "")
 	}
 
 	teamID, err := uuid.Parse(req.TeamID)

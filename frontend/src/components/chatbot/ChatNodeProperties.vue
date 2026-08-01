@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import type { ChatNode } from '@/services/api'
 import { useTeamsStore } from '@/stores/teams'
 import { Input } from '@/components/ui/input'
@@ -25,6 +25,7 @@ const teamsStore = useTeamsStore()
 if (teamsStore.teams.length === 0) teamsStore.fetchTeams()
 
 const config = computed(() => props.node.config || {})
+const assignmentRenameError = ref('')
 
 function updateConfig(key: string, value: any) {
   emit('update:node', {
@@ -190,6 +191,116 @@ function updateResponseMappingValue(key: string, value: string) {
   updateConfig('response_mapping', m)
 }
 
+// Set-variable helpers. The backend contract is an object map under
+// config.set; values may be strings (with {{template}} interpolation),
+// numbers, or booleans.
+const variableAssignments = computed<[string, any][]>(() => {
+  const set = config.value.set
+  if (!set || typeof set !== 'object' || Array.isArray(set)) return []
+  return Object.entries(set)
+})
+
+const setVariableErrors = computed(() => {
+  if (props.node.type !== 'set_variable') return []
+  if (variableAssignments.value.length === 0) return ['Add at least one variable assignment.']
+
+  const errors: string[] = []
+  const seen = new Set<string>()
+  for (const [name] of variableAssignments.value) {
+    const normalized = name.trim()
+    if (!normalized) {
+      errors.push('Every assignment needs a variable name.')
+      continue
+    }
+    if (seen.has(normalized)) errors.push(`Variable "${normalized}" is assigned more than once.`)
+    seen.add(normalized)
+  }
+  return errors
+})
+
+function nextVariableName(): string {
+  const existing = new Set(variableAssignments.value.map(([name]) => name))
+  let index = variableAssignments.value.length + 1
+  while (existing.has(`variable_${index}`)) index++
+  return `variable_${index}`
+}
+
+function addVariableAssignment() {
+  const set = { ...(config.value.set || {}) }
+  set[nextVariableName()] = ''
+  updateConfig('set', set)
+}
+
+function removeVariableAssignment(name: string) {
+  const set = { ...(config.value.set || {}) }
+  delete set[name]
+  assignmentRenameError.value = ''
+  updateConfig('set', set)
+}
+
+function renameVariableAssignment(oldName: string, event: FocusEvent) {
+  const input = event.target as HTMLInputElement
+  const newName = input.value.trim()
+  if (newName === oldName) return
+
+  const duplicate = variableAssignments.value.some(
+    ([name]) => name !== oldName && name.trim() === newName,
+  )
+  if (newName && duplicate) {
+    assignmentRenameError.value = `Variable "${newName}" already exists.`
+    input.value = oldName
+    return
+  }
+
+  const set: Record<string, any> = {}
+  for (const [name, value] of variableAssignments.value) {
+    set[name === oldName ? newName : name] = value
+  }
+  assignmentRenameError.value = ''
+  updateConfig('set', set)
+}
+
+function variableValueType(value: unknown): 'text' | 'number' | 'boolean' {
+  if (typeof value === 'number') return 'number'
+  if (typeof value === 'boolean') return 'boolean'
+  return 'text'
+}
+
+function updateVariableValue(name: string, value: unknown) {
+  updateConfig('set', { ...(config.value.set || {}), [name]: value })
+}
+
+function updateVariableType(name: string, type: 'text' | 'number' | 'boolean') {
+  const current = config.value.set?.[name]
+  if (type === 'number') {
+    const parsed = Number(current)
+    updateVariableValue(name, Number.isFinite(parsed) ? parsed : 0)
+    return
+  }
+  if (type === 'boolean') {
+    updateVariableValue(name, current === true || current === 'true')
+    return
+  }
+  updateVariableValue(name, current == null ? '' : String(current))
+}
+
+const aiPromptTemplate = computed(() => {
+  if (typeof config.value.prompt_template === 'string') return config.value.prompt_template
+  if (typeof config.value.prompt === 'string') return config.value.prompt
+  return ''
+})
+
+function updateAIPromptTemplate(value: string) {
+  // `prompt` is a supported legacy alias. Save the canonical key and remove
+  // the alias so clearing the field cannot leave a hidden prompt behind.
+  const { prompt: _legacyPrompt, ...rest } = props.node.config || {}
+  void _legacyPrompt
+  emit('update:node', {
+    ...props.node,
+    config: { ...rest, prompt_template: value },
+  })
+}
+
 // Timing schedule
 const defaultSchedule = [
   { day: 'monday', enabled: true, start_time: '09:00', end_time: '17:00' },
@@ -220,6 +331,8 @@ const typeLabel: Record<string, string> = {
   api_call: 'API Call',
   condition: 'Condition',
   timing: 'Timing',
+  set_variable: 'Set variable',
+  ai_response: 'AI response',
   transfer: 'Transfer',
   end: 'End',
   goto_flow: 'Go to Flow',
@@ -478,6 +591,153 @@ const typeLabel: Record<string, string> = {
           class="min-h-[50px] text-xs"
         />
         <p class="text-[10px] text-muted-foreground">Sent on 2xx response after mappings are applied.</p>
+      </div>
+    </template>
+
+    <!-- set_variable -->
+    <template v-if="node.type === 'set_variable'">
+      <fieldset class="space-y-3 rounded-lg border bg-muted/20 p-3">
+        <legend class="sr-only">Variable assignments</legend>
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-medium">Variable assignments</p>
+            <p class="mt-1 text-[10px] leading-4 text-muted-foreground">
+              Strings support session placeholders such as <code v-text="'{{customer_name}}'" />.
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            class="h-7 shrink-0 text-xs"
+            aria-label="Add variable assignment"
+            @click="addVariableAssignment"
+          >
+            <Plus class="h-3 w-3" /> Add
+          </Button>
+        </div>
+
+        <div
+          v-for="([name, value], idx) in variableAssignments"
+          :key="`${name}-${idx}`"
+          class="space-y-2 rounded-md border bg-background p-2.5"
+          role="group"
+          :aria-label="`Variable assignment ${idx + 1}`"
+        >
+          <div class="grid grid-cols-[minmax(0,1fr)_7rem_auto] items-end gap-2">
+            <div class="min-w-0 space-y-1">
+              <Label :for="`variable-name-${idx}`" class="text-[10px] uppercase tracking-wide text-muted-foreground">
+                Name
+              </Label>
+              <Input
+                :id="`variable-name-${idx}`"
+                :model-value="name"
+                placeholder="customer_tier"
+                class="h-8 min-w-0 font-mono text-xs"
+                autocomplete="off"
+                @blur="renameVariableAssignment(name, $event)"
+                @keydown.enter.prevent="($event.target as HTMLInputElement).blur()"
+              />
+            </div>
+            <div class="space-y-1">
+              <Label class="text-[10px] uppercase tracking-wide text-muted-foreground">Type</Label>
+              <Select
+                :model-value="variableValueType(value)"
+                @update:model-value="(next: any) => updateVariableType(name, next)"
+              >
+                <SelectTrigger class="h-8 text-xs" :aria-label="`Type for ${name || `assignment ${idx + 1}`}`">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="text">Text</SelectItem>
+                  <SelectItem value="number">Number</SelectItem>
+                  <SelectItem value="boolean">Boolean</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              class="h-8 w-8"
+              :aria-label="`Remove variable ${name || idx + 1}`"
+              @click="removeVariableAssignment(name)"
+            >
+              <Trash2 class="h-3.5 w-3.5 text-destructive" />
+            </Button>
+          </div>
+
+          <div class="space-y-1">
+            <Label :for="`variable-value-${idx}`" class="text-[10px] uppercase tracking-wide text-muted-foreground">
+              Value
+            </Label>
+            <Textarea
+              v-if="variableValueType(value) === 'text'"
+              :id="`variable-value-${idx}`"
+              :model-value="String(value ?? '')"
+              placeholder="premium or Hello {{customer_name}}"
+              class="min-h-[58px] resize-y font-mono text-xs"
+              @update:model-value="(next: string) => updateVariableValue(name, next)"
+            />
+            <Input
+              v-else-if="variableValueType(value) === 'number'"
+              :id="`variable-value-${idx}`"
+              type="number"
+              :model-value="String(value)"
+              class="h-8 font-mono text-xs"
+              @update:model-value="(next: string | number) => updateVariableValue(name, Number(next))"
+            />
+            <Select
+              v-else
+              :model-value="value ? 'true' : 'false'"
+              @update:model-value="(next: any) => updateVariableValue(name, next === 'true')"
+            >
+              <SelectTrigger :id="`variable-value-${idx}`" class="h-8 text-xs" :aria-label="`Value for ${name || `assignment ${idx + 1}`}`">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="true">True</SelectItem>
+                <SelectItem value="false">False</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        <div
+          v-if="assignmentRenameError || setVariableErrors.length"
+          class="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+          role="alert"
+        >
+          <p v-if="assignmentRenameError">{{ assignmentRenameError }}</p>
+          <p v-for="error in setVariableErrors" :key="error">{{ error }}</p>
+        </div>
+      </fieldset>
+    </template>
+
+    <!-- ai_response -->
+    <template v-if="node.type === 'ai_response'">
+      <div class="rounded-lg border border-purple-500/20 bg-purple-500/5 p-3">
+        <p class="text-xs font-medium text-foreground">Workspace AI response</p>
+        <p class="mt-1 text-[10px] leading-4 text-muted-foreground">
+          Uses the chatbot AI provider already configured for this workspace. If AI is disabled or unavailable at runtime, the flow continues without sending an AI message.
+        </p>
+      </div>
+      <div class="space-y-1.5">
+        <Label for="ai-prompt-template" class="text-xs">Prompt template (optional)</Label>
+        <Textarea
+          id="ai-prompt-template"
+          :model-value="aiPromptTemplate"
+          aria-describedby="ai-prompt-template-help"
+          placeholder="Answer this question for {{customer_name}}: {{topic}}"
+          class="min-h-[96px] resize-y font-mono text-xs"
+          @update:model-value="(value: string) => updateAIPromptTemplate(value)"
+        />
+        <p id="ai-prompt-template-help" class="text-[10px] leading-4 text-muted-foreground">
+          Leave blank to send the latest inbound customer message to AI. Templates can reference current session variables.
+        </p>
+      </div>
+      <div class="rounded-md border bg-muted/30 px-3 py-2 text-[10px] leading-4 text-muted-foreground" role="status">
+        Preview never calls the AI provider. It shows the rendered prompt source so testing cannot consume credits or send generated content.
       </div>
     </template>
 

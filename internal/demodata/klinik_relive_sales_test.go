@@ -1,13 +1,17 @@
 package demodata
 
 import (
+	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestBuildKlinikReliveSalesFixtures(t *testing.T) {
@@ -263,11 +267,11 @@ func TestCompareForbiddenState(t *testing.T) {
 	t.Parallel()
 
 	before := map[string]invariantValue{
-		"outbox_jobs":      {Count: 4, Digest: "one"},
+		"outbox_jobs":       {Count: 4, Digest: "one"},
 		"whatsapp_accounts": {Count: 1, Digest: "two"},
 	}
 	unchanged := map[string]invariantValue{
-		"outbox_jobs":      {Count: 4, Digest: "one"},
+		"outbox_jobs":       {Count: 4, Digest: "one"},
 		"whatsapp_accounts": {Count: 1, Digest: "two"},
 	}
 	if err := compareForbiddenState(before, unchanged); err != nil {
@@ -275,11 +279,50 @@ func TestCompareForbiddenState(t *testing.T) {
 	}
 
 	changed := map[string]invariantValue{
-		"outbox_jobs":      {Count: 5, Digest: "changed"},
+		"outbox_jobs":       {Count: 5, Digest: "changed"},
 		"whatsapp_accounts": {Count: 1, Digest: "two"},
 	}
 	if err := compareForbiddenState(before, changed); err == nil {
 		t.Fatal("compareForbiddenState() accepted changed queue state")
+	}
+}
+
+func TestSeedKlinikReliveSalesRejectsWrongTenantBeforeOpeningTransaction(t *testing.T) {
+	// The tenant identity guard runs before any database operation. A non-nil
+	// zero-value handle makes that ordering part of the regression contract
+	// without sharing the integration-test database across Go package workers.
+	db := &gorm.DB{}
+
+	_, err := SeedKlinikReliveSales(context.Background(), db, SeedOptions{
+		OrganizationID:   uuid.New(),
+		OrganizationName: KlinikReliveOrganizationName,
+		Apply:            true,
+	})
+	require.ErrorContains(t, err, "organization ID must exactly equal "+KlinikReliveOrganizationID)
+
+	_, err = SeedKlinikReliveSales(context.Background(), db, SeedOptions{
+		OrganizationID:   expectedOrganizationID,
+		OrganizationName: "Similar but unsafe tenant name",
+		Apply:            true,
+	})
+	require.ErrorContains(t, err, `organization name must exactly equal "Klinik Relive"`)
+}
+
+func TestFixtureReplayBuildIsIdempotentAndOperationalRowsStayInactive(t *testing.T) {
+	t.Parallel()
+
+	refs := testFixtureReferences()
+	now := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	first, err := BuildKlinikReliveSalesFixtures(now, refs)
+	require.NoError(t, err)
+	second, err := BuildKlinikReliveSalesFixtures(now, refs)
+	require.NoError(t, err)
+	require.True(t, reflect.DeepEqual(first, second), "same fixture inputs must produce the same replay payload")
+	for _, row := range second.CannedResponses {
+		require.False(t, row.IsActive)
+	}
+	for _, row := range second.IVRFlows {
+		require.False(t, row.IsActive)
 	}
 }
 
@@ -298,9 +341,9 @@ func testFixtureReferences() FixtureReferences {
 	}
 	return FixtureReferences{
 		OrganizationID: expectedOrganizationID,
-		OwnerID:       deterministicUUID("test-owner"),
-		TeamID:        deterministicUUID("test-team"),
-		Contacts:      contacts,
-		AgentIDs:      agents,
+		OwnerID:        deterministicUUID("test-owner"),
+		TeamID:         deterministicUUID("test-team"),
+		Contacts:       contacts,
+		AgentIDs:       agents,
 	}
 }

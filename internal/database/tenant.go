@@ -13,7 +13,7 @@ import (
 
 const (
 	tenantSetting           = "app.current_organization_id"
-	tenantRLSRoutingVersion = 2
+	tenantRLSRoutingVersion = 3
 )
 
 var (
@@ -30,8 +30,6 @@ var (
 // custom_roles, API keys, SSO providers, teams and custom-action redirect
 // tokens) intentionally remain protected by the existing authorization layer:
 // they are needed to authenticate a request before a tenant transaction exists.
-// Calling tables are also kept out until the long-lived WebRTC manager has its
-// own tenant-scoped database lifecycle.
 var DirectTenantTables = []string{
 	"agent_transfers",
 	"ai_contexts",
@@ -54,6 +52,9 @@ var DirectTenantTables = []string{
 	"breach_incidents",
 	"bulk_message_campaigns",
 	"canned_responses",
+	"call_logs",
+	"call_permissions",
+	"call_transfers",
 	"catalog_products",
 	"catalogs",
 	"channel_accounts",
@@ -87,6 +88,7 @@ var DirectTenantTables = []string{
 	"inbox_conversations",
 	"invoice_lines",
 	"invoices",
+	"ivr_flows",
 	"keyword_rules",
 	"legal_holds",
 	"message_events",
@@ -127,19 +129,14 @@ var DirectTenantTables = []string{
 }
 
 // DirectTenantTableExemptions lists migrated models that carry an
-// organization_id but must be queried before a tenant transaction exists, or
-// that still have a deliberately separate long-lived runtime lifecycle. The
+// organization_id but must be queried before a tenant transaction exists. The
 // coverage test requires every new organization-scoped migration to be either
 // protected above or explicitly reviewed here with a reason.
 var DirectTenantTableExemptions = map[string]string{
 	"api_keys":               "API key lookup authenticates the request before tenant context exists",
 	"billing_webhook_events": "billing webhook ingestion resolves the tenant from a provider event",
-	"call_logs":              "calling uses a separate long-lived WebRTC database lifecycle",
-	"call_permissions":       "calling uses a separate long-lived WebRTC database lifecycle",
-	"call_transfers":         "calling uses a separate long-lived WebRTC database lifecycle",
 	"custom_actions":         "redirect-token lookup occurs before tenant context exists",
 	"custom_roles":           "role lookup is required to authorize and establish tenant context",
-	"ivr_flows":              "calling uses a separate long-lived WebRTC database lifecycle",
 	"sso_providers":          "SSO discovery occurs before tenant context exists",
 	"teams":                  "team membership participates in authorization before tenant context exists",
 	"user_organizations":     "membership lookup establishes tenant context",

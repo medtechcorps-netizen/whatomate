@@ -24,10 +24,7 @@ async function fetchAllPages<T>(
     const items = unwrapListResponse<T>(response, key)
     collected.push(...items)
     const total = listTotal(response)
-    if (
-      items.length < PRODUCT_PAGE_LIMIT ||
-      (total !== null && collected.length >= total)
-    ) {
+    if (items.length < PRODUCT_PAGE_LIMIT || (total !== null && collected.length >= total)) {
       return collected
     }
   }
@@ -134,8 +131,7 @@ export interface PrivacyRequest {
   id: string
   request_number?: string
   contact_id?: string
-  request_type:
-    | 'access' | 'portability' | 'correction' | 'restriction' | 'erasure'
+  request_type: 'access' | 'portability' | 'correction' | 'restriction' | 'erasure'
   status: string
   verification_status?: string
   due_at?: string
@@ -151,8 +147,7 @@ export interface SupportCase {
   description: string
   severity: 'low' | 'normal' | 'high' | 'critical'
   category?: string
-  status:
-    | 'open' | 'investigating' | 'waiting' | 'waiting_customer' | 'waiting_internal' | 'resolved' | 'closed'
+  status: 'open' | 'investigating' | 'waiting' | 'waiting_customer' | 'waiting_internal' | 'resolved' | 'closed'
   assigned_user_id?: string
   resolution?: string
   created_at: string
@@ -178,6 +173,9 @@ export interface PipelineStage {
   display_order: number
   kind: 'open' | 'won' | 'lost'
   probability: number
+  sla_hours: number
+  is_active: boolean
+  version: number
 }
 
 export interface Pipeline {
@@ -186,6 +184,8 @@ export interface Pipeline {
   description?: string
   is_default: boolean
   is_active: boolean
+  display_order?: number
+  version?: number
   stages: PipelineStage[]
 }
 
@@ -279,6 +279,44 @@ export interface BookingResource {
   version: number
 }
 
+export interface AvailabilityRule {
+  id: string
+  resource_id: string
+  weekday: number
+  start_local_time: string
+  end_local_time: string
+  effective_from?: string
+  effective_until?: string
+  effective_from_date?: string
+  effective_until_date?: string
+  is_active: boolean
+  version: number
+}
+
+export interface AvailabilityRuleInput {
+  weekday: number
+  start_local_time: string
+  end_local_time: string
+  effective_from?: string | null
+  effective_until?: string | null
+  is_active: boolean
+}
+
+export interface ResourceTimeOff {
+  id: string
+  resource_id: string
+  starts_at: string
+  ends_at: string
+  reason?: string
+  version: number
+}
+
+export interface ResourceTimeOffInput {
+  starts_at: string
+  ends_at: string
+  reason?: string
+}
+
 export interface BookingEvent {
   id: string
   service_id: string
@@ -298,8 +336,7 @@ export interface Booking {
   id: string
   event_id: string
   contact_id: string
-  status:
-    | 'reserved' | 'confirmed' | 'waitlisted' | 'checked_in' | 'completed' | 'no_show' | 'cancelled'
+  status: 'reserved' | 'confirmed' | 'waitlisted' | 'checked_in' | 'completed' | 'no_show' | 'cancelled'
   quantity: number
   source: string
   notes?: string
@@ -338,8 +375,7 @@ export interface ContactPackage {
   contact_id: string
   package_definition_id: string
   invoice_id?: string
-  status:
-    | 'pending' | 'active' | 'exhausted' | 'expired' | 'cancelled' | 'refunded'
+  status: 'pending' | 'active' | 'exhausted' | 'expired' | 'cancelled' | 'refunded'
   starts_at?: string
   expires_at?: string
   purchase_amount_minor: number
@@ -507,9 +543,7 @@ export interface CopilotRun {
   created_at: string
 }
 
-export type ChannelType =
-  | 'whatsapp' | 'instagram' | 'messenger' | 'threads'
-  | 'email' | 'webchat' | 'tiktok'
+export type ChannelType = 'whatsapp' | 'instagram' | 'messenger' | 'threads' | 'email' | 'webchat' | 'tiktok'
 
 export interface ChannelAccount {
   id: string
@@ -577,7 +611,8 @@ export const organizationSubscriptionService = {
   set: (organizationId: string, data: SetOrganizationSubscriptionRequest) =>
     api.put<APIEnvelope<SubscriptionSummary>>(
       `/admin/organizations/${encodeURIComponent(organizationId)}/subscription`,
-      data,),
+      data,
+    ),
 }
 
 export const onboardingService = {
@@ -618,28 +653,61 @@ export const supportService = {
 export const crmService = {
   pipelines: () => api.get('/crm/pipelines'),
   createPipeline: (data: Partial<Pipeline>) => api.post('/crm/pipelines', data),
+  createPipelineStage: (pipelineId: string, data: Partial<PipelineStage>) =>
+    api.post(`/crm/pipelines/${pipelineId}/stages`, data),
+  updatePipelineStage: (pipelineId: string, stageId: string, data: Partial<PipelineStage>) =>
+    api.put(`/crm/pipelines/${pipelineId}/stages/${stageId}`, data),
+  deletePipelineStage: (pipelineId: string, stageId: string) =>
+    api.delete(`/crm/pipelines/${pipelineId}/stages/${stageId}`),
   leads: (params?: Record<string, string | number | boolean>) => api.get('/crm/leads', { params }),
   allLeads: (params?: Record<string, string | number | boolean>) =>
-    fetchAllPages<CRMLead>('leads', (page, limit) =>
-      api.get('/crm/leads', { params: { ...params, page, limit } }),
-    ),
+    fetchAllPages<CRMLead>('leads', (page, limit) => api.get('/crm/leads', { params: { ...params, page, limit } })),
   createLead: (data: Partial<CRMLead>) => api.post('/crm/leads', data),
-  updateLead: (id: string, data: Partial<CRMLead>) => api.put(`/crm/leads/${id}`, data),
+  updateLead: (
+    id: string,
+    data: Partial<CRMLead> & {
+      version: number
+      clear_next_action_at?: boolean
+      clear_expected_close_date?: boolean
+    },
+  ) => api.put(`/crm/leads/${id}`, data),
   moveLead: (id: string, stageId: string, version: number) =>
     api.put(`/crm/leads/${id}/move`, { stage_id: stageId, version }),
+  archiveLead: (
+    id: string,
+    data: {
+      version: number
+      reason?: string
+      idempotency_key?: string
+      metadata?: Record<string, unknown>
+    },
+  ) => api.put(`/crm/leads/${id}/archive`, data),
+  reopenLead: (
+    id: string,
+    data: {
+      version: number
+      reason?: string
+      idempotency_key?: string
+      metadata?: Record<string, unknown>
+    },
+  ) => api.put(`/crm/leads/${id}/reopen`, data),
   tasks: (params?: Record<string, string | number | boolean>) => api.get('/tasks', { params }),
   allTasks: (params?: Record<string, string | number | boolean>) =>
-    fetchAllPages<FollowUpTask>('tasks', (page, limit) =>
-      api.get('/tasks', { params: { ...params, page, limit } }),
-    ),
+    fetchAllPages<FollowUpTask>('tasks', (page, limit) => api.get('/tasks', { params: { ...params, page, limit } })),
   createTask: (data: Partial<FollowUpTask>) => api.post('/tasks', data),
-  updateTask: (id: string, data: Partial<FollowUpTask>) => api.put(`/tasks/${id}`, data),
+  updateTask: (
+    id: string,
+    data: Partial<FollowUpTask> & {
+      version: number
+      clear_due_at?: boolean
+    },
+  ) => api.put(`/tasks/${id}`, data),
   completeTask: (id: string, version: number) => api.put(`/tasks/${id}/complete`, { version }),
+  reopenTask: (id: string, version: number) => api.put(`/tasks/${id}/reopen`, { version }),
 }
 
 export const customerWorkspaceService = {
-  get: (contactId: string) =>
-    api.get(`/contacts/${encodeURIComponent(contactId)}/workspace`),
+  get: (contactId: string) => api.get(`/contacts/${encodeURIComponent(contactId)}/workspace`),
 }
 
 export const bookingService = {
@@ -657,6 +725,44 @@ export const bookingService = {
     ),
   createResource: (data: Partial<BookingResource>) => api.post('/booking/resources', data),
   updateResource: (id: string, data: Partial<BookingResource>) => api.put(`/booking/resources/${id}`, data),
+  availabilityRules: (resourceId: string, params?: { page?: number; limit?: number }) =>
+    api.get(`/booking/resources/${encodeURIComponent(resourceId)}/availability-rules`, { params }),
+  allAvailabilityRules: (resourceId: string) =>
+    fetchAllPages<AvailabilityRule>('availability_rules', (page, limit) =>
+      api.get(`/booking/resources/${encodeURIComponent(resourceId)}/availability-rules`, {
+        params: { page, limit },
+      }),
+    ),
+  createAvailabilityRule: (resourceId: string, data: AvailabilityRuleInput) =>
+    api.post(`/booking/resources/${encodeURIComponent(resourceId)}/availability-rules`, data),
+  updateAvailabilityRule: (resourceId: string, ruleId: string, data: AvailabilityRuleInput & { version: number }) =>
+    api.put(
+      `/booking/resources/${encodeURIComponent(resourceId)}/availability-rules/${encodeURIComponent(ruleId)}`,
+      data,
+    ),
+  deleteAvailabilityRule: (resourceId: string, ruleId: string, version: number) =>
+    api.delete(
+      `/booking/resources/${encodeURIComponent(resourceId)}/availability-rules/${encodeURIComponent(ruleId)}`,
+      { data: { version } },
+    ),
+  timeOff: (resourceId: string, params?: { page?: number; limit?: number }) =>
+    api.get(`/booking/resources/${encodeURIComponent(resourceId)}/time-off`, {
+      params,
+    }),
+  allTimeOff: (resourceId: string) =>
+    fetchAllPages<ResourceTimeOff>('time_off', (page, limit) =>
+      api.get(`/booking/resources/${encodeURIComponent(resourceId)}/time-off`, {
+        params: { page, limit },
+      }),
+    ),
+  createTimeOff: (resourceId: string, data: ResourceTimeOffInput) =>
+    api.post(`/booking/resources/${encodeURIComponent(resourceId)}/time-off`, data),
+  updateTimeOff: (resourceId: string, timeOffId: string, data: ResourceTimeOffInput & { version: number }) =>
+    api.put(`/booking/resources/${encodeURIComponent(resourceId)}/time-off/${encodeURIComponent(timeOffId)}`, data),
+  deleteTimeOff: (resourceId: string, timeOffId: string, version: number) =>
+    api.delete(`/booking/resources/${encodeURIComponent(resourceId)}/time-off/${encodeURIComponent(timeOffId)}`, {
+      data: { version },
+    }),
   events: (params?: Record<string, string | number>) => api.get('/booking/events', { params }),
   allEvents: (params?: Record<string, string | number>) =>
     fetchAllPages<BookingEvent>('events', (page, limit) =>
@@ -671,12 +777,10 @@ export const bookingService = {
   ) => api.post('/booking/events', data),
   bookings: (params?: Record<string, string | number>) => api.get('/bookings', { params }),
   allBookings: (params?: Record<string, string | number>) =>
-    fetchAllPages<Booking>('bookings', (page, limit) =>
-      api.get('/bookings', { params: { ...params, page, limit } }),
-    ),
+    fetchAllPages<Booking>('bookings', (page, limit) => api.get('/bookings', { params: { ...params, page, limit } })),
   createBooking: (eventId: string, data: Record<string, unknown>) =>
     api.post(`/booking/events/${eventId}/bookings`, data),
-  transitionBooking: (id: string, transition: string, data?: Record<string, unknown>,) =>
+  transitionBooking: (id: string, transition: string, data?: Record<string, unknown>) =>
     api.post(`/bookings/${id}/${encodeURIComponent(transition)}`, data ?? {}),
 }
 
@@ -684,18 +788,14 @@ export const commerceService = {
   summary: () => api.get('/commerce/summary'),
   packages: () => api.get('/packages'),
   allPackages: () =>
-    fetchAllPages<PackageDefinition>('packages', (page, limit) =>
-      api.get('/packages', { params: { page, limit } }),
-    ),
+    fetchAllPages<PackageDefinition>('packages', (page, limit) => api.get('/packages', { params: { page, limit } })),
   createPackage: (data: Partial<PackageDefinition>) => api.post('/packages', data),
-  contactPackages: (params?: Record<string, string | number>) =>
-    api.get('/contact-packages', { params }),
+  contactPackages: (params?: Record<string, string | number>) => api.get('/contact-packages', { params }),
   allContactPackages: (params?: Record<string, string | number>) =>
     fetchAllPages<ContactPackage>('contact_packages', (page, limit) =>
       api.get('/contact-packages', { params: { ...params, page, limit } }),
     ),
-  createContactPackage: (data: Record<string, unknown>) =>
-    api.post('/contact-packages', data),
+  createContactPackage: (data: Record<string, unknown>) => api.post('/contact-packages', data),
   sellPackage: (data: Record<string, unknown>) => api.post('/package-sales', data),
   invoices: (params?: Record<string, string | number>) => api.get('/invoices', { params }),
   allInvoices: (params?: Record<string, string | number>) =>
@@ -708,14 +808,12 @@ export const commerceService = {
   recordManualPayment: (invoiceId: string, data: Record<string, unknown>) =>
     api.post(`/invoices/${invoiceId}/manual-payments`, data),
   payments: (params?: Record<string, string | number>) => api.get('/payments', { params }),
-  allPayments: <T = Record<string, unknown>>(params?: Record<string, string | number>,) =>
-    fetchAllPages<T>('payments', (page, limit) =>
-      api.get('/payments', { params: { ...params, page, limit } }),
-    ),
+  allPayments: <T = Record<string, unknown>>(params?: Record<string, string | number>) =>
+    fetchAllPages<T>('payments', (page, limit) => api.get('/payments', { params: { ...params, page, limit } })),
 }
 
 export const copilotService = {
-  run: (contactId: string, taskType: CopilotRun['task_type'], data?: Record<string, unknown>,) =>
+  run: (contactId: string, taskType: CopilotRun['task_type'], data?: Record<string, unknown>) =>
     api.post(`/contacts/${contactId}/copilot/${taskType}`, data ?? {}),
   runs: (params?: { contact_id?: string; page?: number; limit?: number }) => api.get('/copilot/runs', { params }),
   feedback: (runId: string, data: Record<string, unknown>) => api.post(`/copilot/runs/${runId}/feedback`, data),
@@ -736,6 +834,5 @@ export const channelsService = {
     api.get(`/conversations/${id}/messages`, { params }),
   send: (id: string, data: Record<string, unknown>) => api.post(`/conversations/${id}/messages`, data),
   markRead: (id: string) => api.post(`/conversations/${id}/read`),
-  setAIState: (id: string, paused: boolean) =>
-    api.put(`/conversations/${id}/ai`, { paused }),
+  setAIState: (id: string, paused: boolean) => api.put(`/conversations/${id}/ai`, { paused }),
 }

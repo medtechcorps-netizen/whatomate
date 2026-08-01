@@ -16,6 +16,17 @@ import (
 
 // --- Helper functions ---
 
+// currentMonthTestTime keeps relative test timestamps inside the current UTC
+// month so the default analytics period remains deterministic at month rollover.
+func currentMonthTestTime(now time.Time, offset time.Duration) time.Time {
+	candidate := now.Add(offset)
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	if candidate.Before(monthStart) {
+		return monthStart
+	}
+	return candidate
+}
+
 // createTestMessage creates a message in the database for analytics testing.
 func createTestMessage(t *testing.T, app *handlers.App, orgID, contactID uuid.UUID, direction models.Direction, createdAt time.Time) *models.Message {
 	t.Helper()
@@ -137,10 +148,10 @@ func TestApp_GetDashboardStats_Success(t *testing.T) {
 	// Create test data within the current month
 	contact := testutil.CreateTestContact(t, app.DB, org.ID)
 	now := time.Now().UTC()
-	createTestMessage(t, app, org.ID, contact.ID, models.DirectionIncoming, now.Add(-1*time.Hour))
-	createTestMessage(t, app, org.ID, contact.ID, models.DirectionOutgoing, now.Add(-30*time.Minute))
-	createTestChatbotSession(t, app, org.ID, contact.ID, now.Add(-2*time.Hour))
-	createAnalyticsTestCampaign(t, app, org.ID, user.ID, "completed", now.Add(-3*time.Hour))
+	createTestMessage(t, app, org.ID, contact.ID, models.DirectionIncoming, currentMonthTestTime(now, -1*time.Hour))
+	createTestMessage(t, app, org.ID, contact.ID, models.DirectionOutgoing, currentMonthTestTime(now, -30*time.Minute))
+	createTestChatbotSession(t, app, org.ID, contact.ID, currentMonthTestTime(now, -2*time.Hour))
+	createAnalyticsTestCampaign(t, app, org.ID, user.ID, "completed", currentMonthTestTime(now, -3*time.Hour))
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -290,14 +301,14 @@ func TestApp_GetAgentAnalytics_Success(t *testing.T) {
 
 	contact := testutil.CreateTestContact(t, app.DB, org.ID)
 	now := time.Now().UTC()
-	resumedAt := now.Add(-30 * time.Minute)
+	resumedAt := currentMonthTestTime(now, -30*time.Minute)
 
 	createTestAgentTransfer(t, app, org.ID, contact.ID, &user.ID,
 		models.TransferStatusResumed, models.TransferSourceManual,
-		now.Add(-2*time.Hour), &resumedAt)
+		currentMonthTestTime(now, -2*time.Hour), &resumedAt)
 	createTestAgentTransfer(t, app, org.ID, contact.ID, &user.ID,
 		models.TransferStatusActive, models.TransferSourceFlow,
-		now.Add(-1*time.Hour), nil)
+		currentMonthTestTime(now, -1*time.Hour), nil)
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -370,11 +381,11 @@ func TestApp_GetAgentAnalytics_AgentSeesOwnStats(t *testing.T) {
 
 	contact := testutil.CreateTestContact(t, app.DB, org.ID)
 	now := time.Now().UTC()
-	resumedAt := now.Add(-10 * time.Minute)
+	resumedAt := currentMonthTestTime(now, -10*time.Minute)
 
 	createTestAgentTransfer(t, app, org.ID, contact.ID, &user.ID,
 		models.TransferStatusResumed, models.TransferSourceManual,
-		now.Add(-1*time.Hour), &resumedAt)
+		currentMonthTestTime(now, -1*time.Hour), &resumedAt)
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -416,11 +427,11 @@ func TestApp_GetAgentDetails_Success(t *testing.T) {
 
 	contact := testutil.CreateTestContact(t, app.DB, org.ID)
 	now := time.Now().UTC()
-	resumedAt := now.Add(-15 * time.Minute)
+	resumedAt := currentMonthTestTime(now, -15*time.Minute)
 
 	createTestAgentTransfer(t, app, org.ID, contact.ID, &agentUser.ID,
 		models.TransferStatusResumed, models.TransferSourceManual,
-		now.Add(-1*time.Hour), &resumedAt)
+		currentMonthTestTime(now, -1*time.Hour), &resumedAt)
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, adminUser.ID)
@@ -544,14 +555,14 @@ func TestApp_GetAgentComparison_Success(t *testing.T) {
 
 	contact := testutil.CreateTestContact(t, app.DB, org.ID)
 	now := time.Now().UTC()
-	resumedAt := now.Add(-20 * time.Minute)
+	resumedAt := currentMonthTestTime(now, -20*time.Minute)
 
 	createTestAgentTransfer(t, app, org.ID, contact.ID, &agent1.ID,
 		models.TransferStatusResumed, models.TransferSourceManual,
-		now.Add(-2*time.Hour), &resumedAt)
+		currentMonthTestTime(now, -2*time.Hour), &resumedAt)
 	createTestAgentTransfer(t, app, org.ID, contact.ID, &agent2.ID,
 		models.TransferStatusResumed, models.TransferSourceFlow,
-		now.Add(-1*time.Hour), &resumedAt)
+		currentMonthTestTime(now, -1*time.Hour), &resumedAt)
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, adminUser.ID)

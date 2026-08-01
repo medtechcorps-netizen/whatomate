@@ -13,6 +13,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
+	"gorm.io/gorm"
 )
 
 // initiateTransfer starts the transfer flow: puts caller on hold, notifies agents via WebSocket.
@@ -70,16 +71,18 @@ func (m *Manager) initiateTransfer(session *CallSession, waAccount string, teamT
 		transfer.IVRPath = models.JSONB{"steps": ivrPath}
 	}
 
-	if err := m.db.Create(&transfer).Error; err != nil {
+	if err := m.createCallTransfer(session.OrganizationID, &transfer); err != nil {
 		m.log.Error("Failed to create call transfer", "error", err, "call_id", session.ID)
 		player.Stop()
 		return
 	}
 
 	// Update call log status
-	m.db.Model(&models.CallLog{}).
-		Where("id = ?", session.CallLogID).
-		Update("status", models.CallStatusTransferring)
+	if err := m.updateCallLog(session.OrganizationID, session.CallLogID, map[string]any{
+		"status": models.CallStatusTransferring,
+	}); err != nil {
+		m.log.Error("Failed to mark call as transferring", "error", err, "call_id", session.ID)
+	}
 
 	// Fire on_waiting callback
 	session.mu.Lock()
@@ -109,13 +112,23 @@ func (m *Manager) initiateTransfer(session *CallSession, waAccount string, teamT
 			"call_id", session.ID, "agent_id", assignedAgentID)
 	case session.ContactID != uuid.Nil:
 		var contact models.Contact
-		if m.db.Select("assigned_user_id").Where("id = ?", session.ContactID).First(&contact).Error == nil && contact.AssignedUserID != nil {
-			var agent models.User
-			if m.db.Where("id = ? AND is_available = ?", contact.AssignedUserID, true).First(&agent).Error == nil {
-				assignedAgentID = contact.AssignedUserID
-				m.log.Info("Routing call to assigned agent (relationship manager)",
-					"call_id", session.ID, "agent_id", assignedAgentID, "contact_id", session.ContactID)
+		_ = m.withTenantDB(session.OrganizationID, func(db *gorm.DB) error {
+			if err := db.Select("assigned_user_id").
+				Where("id = ? AND organization_id = ?", session.ContactID, session.OrganizationID).
+				First(&contact).Error; err != nil || contact.AssignedUserID == nil {
+				return err
 			}
+			var agent models.User
+			if err := db.Where("id = ? AND is_available = ?", contact.AssignedUserID, true).
+				First(&agent).Error; err != nil {
+				return err
+			}
+			assignedAgentID = contact.AssignedUserID
+			return nil
+		})
+		if assignedAgentID != nil {
+			m.log.Info("Routing call to assigned agent (relationship manager)",
+				"call_id", session.ID, "agent_id", assignedAgentID, "contact_id", session.ContactID)
 		}
 	}
 
@@ -367,15 +380,17 @@ func (m *Manager) InitiateAgentTransfer(callLogID, initiatingAgentID uuid.UUID, 
 		transfer.AgentID = targetAgentID
 	}
 
-	if err := m.db.Create(&transfer).Error; err != nil {
+	if err := m.createCallTransfer(session.OrganizationID, &transfer); err != nil {
 		player.Stop()
 		return fmt.Errorf("failed to create call transfer: %w", err)
 	}
 
 	// Update call log status
-	m.db.Model(&models.CallLog{}).
-		Where("id = ?", session.CallLogID).
-		Update("status", models.CallStatusTransferring)
+	if err := m.updateCallLog(session.OrganizationID, session.CallLogID, map[string]any{
+		"status": models.CallStatusTransferring,
+	}); err != nil {
+		m.log.Error("Failed to mark agent transfer on call log", "error", err, "call_id", session.ID)
+	}
 
 	// Update session state
 	session.mu.Lock()
@@ -657,19 +672,25 @@ func (m *Manager) completeTransferConnection(session *CallSession, transferID, a
 	// forwarding audio immediately without waiting for I/O.
 	go func() {
 		now := time.Now()
-		m.db.Model(&models.CallTransfer{}).
-			Where("id = ?", transferID).
-			Updates(map[string]any{
-				"status":       models.CallTransferStatusConnected,
-				"agent_id":     agentID,
-				"connected_at": now,
-			})
+		if err := m.withTenantDB(session.OrganizationID, func(db *gorm.DB) error {
+			if err := db.Model(&models.CallTransfer{}).
+				Where("id = ? AND organization_id = ?", transferID, session.OrganizationID).
+				Updates(map[string]any{
+					"status":       models.CallTransferStatusConnected,
+					"agent_id":     agentID,
+					"connected_at": now,
+				}).Error; err != nil {
+				return err
+			}
 
-		// Also set agent_id on the CallLog so the webhook "ended" handler
-		// knows an agent was connected and doesn't mark the call as "missed".
-		m.db.Model(&models.CallLog{}).
-			Where("id = ?", session.CallLogID).
-			Update("agent_id", agentID)
+			// Also set agent_id on the CallLog so the webhook "ended" handler
+			// knows an agent was connected and doesn't mark the call as "missed".
+			return db.Model(&models.CallLog{}).
+				Where("id = ? AND organization_id = ?", session.CallLogID, session.OrganizationID).
+				Update("agent_id", agentID).Error
+		}); err != nil {
+			m.log.Error("Failed to persist connected transfer", "error", err, "transfer_id", transferID)
+		}
 
 		// Fire on_connect callback
 		session.mu.Lock()
@@ -677,9 +698,9 @@ func (m *Manager) completeTransferConnection(session *CallSession, transferID, a
 		session.mu.Unlock()
 		if cbConnect != nil && cbConnect.OnConnect != nil {
 			var updatedTransfer models.CallTransfer
-			if m.db.First(&updatedTransfer, transferID).Error == nil {
+			if m.findCallTransfer(session.OrganizationID, transferID, &updatedTransfer) == nil {
 				vars := buildTransferVars(&updatedTransfer)
-				m.addAgentVars(vars, agentID)
+				m.addAgentVars(session.OrganizationID, vars, agentID)
 				m.fireTransferCallback(session, cbConnect.OnConnect, vars)
 			}
 		}
@@ -757,7 +778,7 @@ func (m *Manager) EndTransfer(transferID uuid.UUID) {
 	// Calculate durations and update DB
 	now := time.Now()
 	var transfer models.CallTransfer
-	if err := m.db.First(&transfer, transferID).Error; err != nil {
+	if err := m.findCallTransfer(session.OrganizationID, transferID, &transfer); err != nil {
 		m.log.Error("Failed to find transfer for completion", "error", err, "transfer_id", transferID)
 		return
 	}
@@ -770,12 +791,14 @@ func (m *Manager) EndTransfer(transferID uuid.UUID) {
 		holdDuration = int(now.Sub(transfer.TransferredAt).Seconds())
 	}
 
-	m.db.Model(&transfer).Updates(map[string]any{
+	if err := m.updateCallTransfer(session.OrganizationID, transfer.ID, map[string]any{
 		"status":        models.CallTransferStatusCompleted,
 		"completed_at":  now,
 		"hold_duration": holdDuration,
 		"talk_duration": talkDuration,
-	})
+	}); err != nil {
+		m.log.Error("Failed to persist completed transfer", "error", err, "transfer_id", transferID)
+	}
 
 	// Broadcast completed event
 	m.broadcastEvent(session.OrganizationID, websocket.TypeCallTransferCompleted, map[string]any{
@@ -870,7 +893,15 @@ func (m *Manager) runTransferRotation(session *CallSession, transfer models.Call
 		}
 
 		// Try to assign the next agent
-		agentID := m.assigner.AssignToTeam(teamID, orgID, triedAgents, assignment.CallLoadCounter)
+		var agentID *uuid.UUID
+		if err := m.withTenantDB(orgID, func(db *gorm.DB) error {
+			agentID = m.assigner.WithDB(db).
+				AssignToTeam(teamID, orgID, triedAgents, assignment.CallLoadCounter)
+			return nil
+		}); err != nil {
+			m.log.Error("Failed to assign call transfer", "error", err, "transfer_id", transfer.ID)
+			break
+		}
 		if agentID == nil {
 			// No more agents available — break to fallback
 			break
@@ -892,10 +923,12 @@ func (m *Manager) runTransferRotation(session *CallSession, transfer models.Call
 		for i, id := range triedAgents {
 			triedIDs[i] = id.String()
 		}
-		m.db.Model(&models.CallTransfer{}).Where("id = ?", transfer.ID).Updates(map[string]any{
+		if err := m.updateCallTransfer(orgID, transfer.ID, map[string]any{
 			"agent_id":        agentID,
 			"tried_agent_ids": triedIDs,
-		})
+		}); err != nil {
+			m.log.Error("Failed to persist call rotation assignment", "error", err, "transfer_id", transfer.ID)
+		}
 
 		// Notify this specific agent
 		agentPayload := make(map[string]any)
@@ -930,8 +963,9 @@ func (m *Manager) runTransferRotation(session *CallSession, transfer models.Call
 				},
 			})
 			// Clear agent_id so next iteration sets the new one
-			m.db.Model(&models.CallTransfer{}).Where("id = ?", transfer.ID).
-				Update("agent_id", nil)
+			if err := m.updateCallTransfer(orgID, transfer.ID, map[string]any{"agent_id": nil}); err != nil {
+				m.log.Error("Failed to clear timed-out transfer agent", "error", err, "transfer_id", transfer.ID)
+			}
 			continue
 
 		case <-accepted:
@@ -950,8 +984,9 @@ func (m *Manager) runTransferRotation(session *CallSession, transfer models.Call
 				},
 			})
 			// Clear agent_id before fallback
-			m.db.Model(&models.CallTransfer{}).Where("id = ?", transfer.ID).
-				Update("agent_id", nil)
+			if err := m.updateCallTransfer(orgID, transfer.ID, map[string]any{"agent_id": nil}); err != nil {
+				m.log.Error("Failed to clear transfer agent at deadline", "error", err, "transfer_id", transfer.ID)
+			}
 		}
 		break // Exit loop on totalCtx.Done
 	}
@@ -978,8 +1013,9 @@ func (m *Manager) runTransferRotation(session *CallSession, transfer models.Call
 	}
 
 	// Clear agent_id so any team member can accept
-	m.db.Model(&models.CallTransfer{}).Where("id = ?", transfer.ID).
-		Update("agent_id", nil)
+	if err := m.updateCallTransfer(orgID, transfer.ID, map[string]any{"agent_id": nil}); err != nil {
+		m.log.Error("Failed to clear transfer agent for fallback", "error", err, "transfer_id", transfer.ID)
+	}
 
 	fallbackPayload := make(map[string]any)
 	maps.Copy(fallbackPayload, basePayload)
@@ -1034,17 +1070,23 @@ func (m *Manager) handleTransferNoAnswer(session *CallSession, transferID uuid.U
 	session.mu.Unlock()
 
 	now := time.Now()
-	m.db.Model(&models.CallTransfer{}).
-		Where("id = ?", transferID).
-		Updates(map[string]any{
-			"status":       models.CallTransferStatusNoAnswer,
-			"completed_at": now,
-		})
+	if err := m.withTenantDB(session.OrganizationID, func(db *gorm.DB) error {
+		if err := db.Model(&models.CallTransfer{}).
+			Where("id = ? AND organization_id = ?", transferID, session.OrganizationID).
+			Updates(map[string]any{
+				"status":       models.CallTransferStatusNoAnswer,
+				"completed_at": now,
+			}).Error; err != nil {
+			return err
+		}
 
-	// Mark call as disconnected by system (transfer timeout)
-	m.db.Model(&models.CallLog{}).
-		Where("id = ?", session.CallLogID).
-		Update("disconnected_by", models.DisconnectedBySystem)
+		// Mark call as disconnected by system (transfer timeout).
+		return db.Model(&models.CallLog{}).
+			Where("id = ? AND organization_id = ?", session.CallLogID, session.OrganizationID).
+			Update("disconnected_by", models.DisconnectedBySystem).Error
+	}); err != nil {
+		m.log.Error("Failed to persist unanswered transfer", "error", err, "transfer_id", transferID)
+	}
 
 	// Stop hold music and save RTP seq for post-transfer IVR player
 	session.mu.Lock()
@@ -1099,17 +1141,23 @@ func (m *Manager) HandleCallerHangupDuringTransfer(session *CallSession) {
 	}
 
 	now := time.Now()
-	m.db.Model(&models.CallTransfer{}).
-		Where("id = ?", transferID).
-		Updates(map[string]any{
-			"status":       models.CallTransferStatusAbandoned,
-			"completed_at": now,
-		})
+	if err := m.withTenantDB(session.OrganizationID, func(db *gorm.DB) error {
+		if err := db.Model(&models.CallTransfer{}).
+			Where("id = ? AND organization_id = ?", transferID, session.OrganizationID).
+			Updates(map[string]any{
+				"status":       models.CallTransferStatusAbandoned,
+				"completed_at": now,
+			}).Error; err != nil {
+			return err
+		}
 
-	// Mark call as disconnected by client (caller hung up during transfer)
-	m.db.Model(&models.CallLog{}).
-		Where("id = ?", session.CallLogID).
-		Update("disconnected_by", models.DisconnectedByClient)
+		// Mark call as disconnected by client (caller hung up during transfer).
+		return db.Model(&models.CallLog{}).
+			Where("id = ? AND organization_id = ?", session.CallLogID, session.OrganizationID).
+			Update("disconnected_by", models.DisconnectedByClient).Error
+	}); err != nil {
+		m.log.Error("Failed to persist abandoned transfer", "error", err, "transfer_id", transferID)
+	}
 
 	// Stop hold music, cancel timeout, and signal rotation goroutine
 	session.mu.Lock()
@@ -1269,9 +1317,11 @@ func buildTransferVars(transfer *models.CallTransfer) map[string]string {
 }
 
 // addAgentVars loads agent details from DB and adds them to the vars map.
-func (m *Manager) addAgentVars(vars map[string]string, agentID uuid.UUID) {
+func (m *Manager) addAgentVars(organizationID uuid.UUID, vars map[string]string, agentID uuid.UUID) {
 	var user models.User
-	if err := m.db.Select("id, full_name, email").Where("id = ?", agentID).First(&user).Error; err == nil {
+	if err := m.withTenantDB(organizationID, func(db *gorm.DB) error {
+		return db.Select("id, full_name, email").Where("id = ?", agentID).First(&user).Error
+	}); err == nil {
 		vars["agent_id"] = user.ID.String()
 		vars["agent_email"] = user.Email
 		vars["agent_name"] = user.FullName

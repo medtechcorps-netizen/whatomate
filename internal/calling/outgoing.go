@@ -36,7 +36,7 @@ func (m *Manager) InitiateOutgoingCall(
 		AgentID:         &agentID,
 		StartedAt:       &now,
 	}
-	if err := m.db.Create(&callLog).Error; err != nil {
+	if err := m.createCallLog(orgID, &callLog); err != nil {
 		return uuid.Nil, "", fmt.Errorf("failed to create call log: %w", err)
 	}
 
@@ -201,7 +201,7 @@ func (m *Manager) InitiateOutgoingCall(
 		_ = agentPC.Close()
 		_ = waPC.Close()
 		// Update call log as failed
-		m.db.Model(&callLog).Updates(map[string]any{
+		_ = m.updateCallLog(orgID, callLog.ID, map[string]any{
 			"status":          models.CallStatusFailed,
 			"error_message":   err.Error(),
 			"ended_at":        time.Now(),
@@ -211,7 +211,12 @@ func (m *Manager) InitiateOutgoingCall(
 	}
 
 	// Update call log with WhatsApp call ID
-	m.db.Model(&callLog).Update("whatsapp_call_id", callID)
+	if err := m.updateCallLog(orgID, callLog.ID, map[string]any{"whatsapp_call_id": callID}); err != nil {
+		// Preserve the active media session after Meta accepted the call. The
+		// webhook can still correlate it by the in-memory call ID and later
+		// database writes may recover after a transient failure.
+		m.log.Error("Failed to persist WhatsApp call ID", "error", err, "call_id", callID, "call_log_id", callLog.ID)
+	}
 
 	// 12. Complete session setup
 	session.ID = callID
@@ -305,9 +310,11 @@ func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 			session.mu.Unlock()
 		}
 
-		m.db.Model(&models.CallLog{}).
-			Where("id = ?", session.CallLogID).
-			Update("status", models.CallStatusRinging)
+		if err := m.updateCallLog(session.OrganizationID, session.CallLogID, map[string]any{
+			"status": models.CallStatusRinging,
+		}); err != nil {
+			m.log.Error("Failed to persist outgoing ringing status", "error", err, "call_id", callID)
+		}
 
 		m.broadcastEvent(session.OrganizationID, websocket.TypeOutgoingCallRinging, map[string]any{
 			"call_log_id":   session.CallLogID.String(),
@@ -326,12 +333,12 @@ func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 		session.Status = models.CallStatusAnswered
 		session.mu.Unlock()
 
-		m.db.Model(&models.CallLog{}).
-			Where("id = ?", session.CallLogID).
-			Updates(map[string]any{
-				"status":      models.CallStatusAnswered,
-				"answered_at": now,
-			})
+		if err := m.updateCallLog(session.OrganizationID, session.CallLogID, map[string]any{
+			"status":      models.CallStatusAnswered,
+			"answered_at": now,
+		}); err != nil {
+			m.log.Error("Failed to persist outgoing answered status", "error", err, "call_id", callID)
+		}
 
 		m.broadcastEvent(session.OrganizationID, websocket.TypeOutgoingCallAnswered, map[string]any{
 			"call_log_id":   session.CallLogID.String(),
@@ -342,13 +349,13 @@ func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 		})
 
 	case "rejected":
-		m.db.Model(&models.CallLog{}).
-			Where("id = ?", session.CallLogID).
-			Updates(map[string]any{
-				"status":          models.CallStatusRejected,
-				"ended_at":        now,
-				"disconnected_by": models.DisconnectedByClient,
-			})
+		if err := m.updateCallLog(session.OrganizationID, session.CallLogID, map[string]any{
+			"status":          models.CallStatusRejected,
+			"ended_at":        now,
+			"disconnected_by": models.DisconnectedByClient,
+		}); err != nil {
+			m.log.Error("Failed to persist outgoing rejection", "error", err, "call_id", callID)
+		}
 
 		m.broadcastEvent(session.OrganizationID, websocket.TypeOutgoingCallRejected, map[string]any{
 			"call_log_id":   session.CallLogID.String(),
@@ -378,7 +385,7 @@ func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 		// Calculate duration
 		var callLog models.CallLog
 		disconnectedBy := "client"
-		if err := m.db.Where("id = ?", session.CallLogID).First(&callLog).Error; err == nil {
+		if err := m.findCallLog(session.OrganizationID, session.CallLogID, &callLog); err == nil {
 			updates := map[string]any{
 				"status":   models.CallStatusCompleted,
 				"ended_at": now,
@@ -390,7 +397,9 @@ func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 			} else {
 				disconnectedBy = string(callLog.DisconnectedBy)
 			}
-			m.db.Model(&callLog).Updates(updates)
+			if err := m.updateCallLog(session.OrganizationID, callLog.ID, updates); err != nil {
+				m.log.Error("Failed to persist outgoing completion", "error", err, "call_id", callID)
+			}
 		}
 
 		m.broadcastEvent(session.OrganizationID, websocket.TypeOutgoingCallEnded, map[string]any{
@@ -434,13 +443,15 @@ func (m *Manager) HangupOutgoingCall(callLogID, agentID uuid.UUID) error {
 
 		now := time.Now()
 		var callLog models.CallLog
-		if err := m.db.Where("id = ?", callLogID).First(&callLog).Error; err == nil {
-			m.db.Model(&callLog).Updates(map[string]any{
+		if err := m.findCallLog(session.OrganizationID, callLogID, &callLog); err == nil {
+			if err := m.updateCallLog(session.OrganizationID, callLog.ID, map[string]any{
 				"status":          models.CallStatusCompleted,
 				"ended_at":        now,
 				"duration":        durationSince(callLog.AnsweredAt, now),
 				"disconnected_by": models.DisconnectedByAgent,
-			})
+			}); err != nil {
+				m.log.Error("Failed to persist agent hangup", "error", err, "call_log_id", callLogID)
+			}
 		}
 
 		m.broadcastEvent(session.OrganizationID, websocket.TypeOutgoingCallEnded, map[string]any{
@@ -513,12 +524,12 @@ func (m *Manager) HangupOutgoingCall(callLogID, agentID uuid.UUID) error {
 	session.mu.Unlock()
 
 	// 5. Update call log
-	m.db.Model(&models.CallLog{}).
-		Where("id = ?", callLogID).
-		Updates(map[string]any{
-			"disconnected_by": models.DisconnectedByAgent,
-			"ivr_flow_id":     ivrFlow.ID,
-		})
+	if err := m.updateCallLog(session.OrganizationID, callLogID, map[string]any{
+		"disconnected_by": models.DisconnectedByAgent,
+		"ivr_flow_id":     ivrFlow.ID,
+	}); err != nil {
+		m.log.Error("Failed to persist post-call IVR", "error", err, "call_log_id", callLogID)
+	}
 
 	// 6. Broadcast event with ivr_active flag
 	m.broadcastEvent(session.OrganizationID, websocket.TypeOutgoingCallEnded, map[string]any{
@@ -538,12 +549,14 @@ func (m *Manager) HangupOutgoingCall(callLogID, agentID uuid.UUID) error {
 
 		now := time.Now()
 		var callLog models.CallLog
-		if err := m.db.Where("id = ?", callLogID).First(&callLog).Error; err == nil {
-			m.db.Model(&callLog).Updates(map[string]any{
+		if err := m.findCallLog(session.OrganizationID, callLogID, &callLog); err == nil {
+			if err := m.updateCallLog(session.OrganizationID, callLog.ID, map[string]any{
 				"status":   models.CallStatusCompleted,
 				"ended_at": now,
 				"duration": durationSince(callLog.AnsweredAt, now),
-			})
+			}); err != nil {
+				m.log.Error("Failed to persist post-call IVR completion", "error", err, "call_log_id", callLogID)
+			}
 		}
 
 		m.cleanupSession(session.ID)

@@ -18,7 +18,7 @@ test.describe('Chatbot Flow Builder - Palette', () => {
 
   test('palette shows the action-node tiles', async () => {
     await expect(builder.paletteToolbar).toBeVisible()
-    for (const label of ['Text', 'Buttons', 'API', 'Transfer', 'Condition', 'Timing', 'End']) {
+    for (const label of ['Text', 'Buttons', 'API', 'Transfer', 'Condition', 'Timing', 'Set variable', 'AI response', 'End']) {
       await expect(builder.paletteToolbar.getByRole('button', { name: label, exact: true })).toBeVisible()
     }
   })
@@ -159,5 +159,18 @@ test.describe('Chatbot Flow Builder - Other node types', () => {
   test('Condition node exposes the expression textarea', async () => {
     await builder.addNode('Condition')
     await expect(builder.page.getByText(/^Expression$/i).first()).toBeVisible()
+  })
+
+  test('Set variable node exposes typed assignments', async () => {
+    await builder.addNode('Set variable')
+    await expect(builder.page.getByText('Variable assignments')).toBeVisible()
+    await expect(builder.page.getByLabel('Name')).toHaveValue('variable_1')
+    await expect(builder.page.getByLabel('Value')).toBeVisible()
+  })
+
+  test('AI response node exposes the supported prompt template', async () => {
+    await builder.addNode('AI response')
+    await expect(builder.page.getByLabel('Prompt template (optional)')).toBeVisible()
+    await expect(builder.page.getByText(/Uses the chatbot AI provider already configured/i)).toBeVisible()
   })
 })

@@ -283,7 +283,16 @@ export function useFlowGraphSimulation(
         addMessage('system', `[goto_flow] would jump to flow ${node.config?.flow_id || '?'}`)
         return '__end__'
       case 'ai_response':
-        addMessage('system', '[ai_response] simulated — backend AI is not invoked in preview')
+        {
+          const template = stringField(node, 'prompt_template', 'prompt')
+          const promptSource = template
+            ? `rendered prompt "${interpolate(template, state.variables)}"`
+            : 'the latest inbound customer message'
+          addMessage(
+            'system',
+            `AI response preview would use ${promptSource}. Model calls are disabled in preview.`,
+          )
+        }
         return 'default'
       case 'webhook':
         addMessage('system', '[webhook] simulated — request not sent in preview')

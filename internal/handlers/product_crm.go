@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -115,6 +116,15 @@ type MoveCRMLeadRequest struct {
 	Version  int64        `json:"version"`
 	Reason   string       `json:"reason,omitempty"`
 	Metadata models.JSONB `json:"metadata,omitempty"`
+}
+
+// CRMLeadLifecycleRequest drives explicit archive and reopen transitions.
+// Status is deliberately absent: reopen derives it from the current stage.
+type CRMLeadLifecycleRequest struct {
+	Version        int64        `json:"version"`
+	Reason         string       `json:"reason,omitempty"`
+	IdempotencyKey string       `json:"idempotency_key,omitempty"`
+	Metadata       models.JSONB `json:"metadata,omitempty"`
 }
 
 // CreateFollowUpTaskRequest creates a user-owned follow-up task.
@@ -796,6 +806,20 @@ func (a *App) ListCRMLeads(r *fastglue.Request) error {
 			query = query.Where("owner_user_id = ?", userID)
 		}
 	}
+	if raw := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("include_archived"))); raw != "" {
+		includeArchived, parseErr := strconv.ParseBool(raw)
+		if parseErr != nil {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusBadRequest,
+				"include_archived must be true or false",
+				nil,
+				"",
+			)
+		}
+		if !includeArchived {
+			query = query.Where("status <> ?", models.CRMLeadStatusArchived)
+		}
+	}
 	if raw := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("status"))); raw != "" {
 		status := models.CRMLeadStatus(raw)
 		if !validCRMLeadStatus(status) {
@@ -917,7 +941,8 @@ func (a *App) CreateCRMLead(r *fastglue.Request) error {
 	}
 
 	var lead models.CRMLead
-	err = a.DB.Transaction(func(tx *gorm.DB) error {
+	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		idempotentCandidate := false
 		if req.IdempotencyKey != "" {
 			err := tx.Where(
 				"organization_id = ? AND idempotency_key = ?",
@@ -925,15 +950,48 @@ func (a *App) CreateCRMLead(r *fastglue.Request) error {
 				req.IdempotencyKey,
 			).First(&lead).Error
 			if err == nil {
-				return validateProductCRMReplay(
+				if replayErr := validateProductCRMReplay(
 					lead.RequestFingerprint,
 					requestFingerprint,
 					"CRM lead",
-				)
+				); replayErr == nil {
+					return nil
+				}
+				// The request may name a merged alias while the stored request
+				// was normalized to its canonical contact (or vice versa). Resolve
+				// the contact below before deciding this is a payload collision.
+				idempotentCandidate = true
 			}
-			if !errors.Is(err, gorm.ErrRecordNotFound) {
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 				return err
 			}
+		}
+
+		canonicalContact, err := contactutil.ResolveCanonicalContactForUpdate(
+			tx,
+			orgID,
+			req.ContactID,
+		)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return newProductCRMClientError(
+				fasthttp.StatusBadRequest,
+				"contact_id does not belong to the organization",
+			)
+		}
+		if err != nil {
+			return err
+		}
+		req.ContactID = canonicalContact.ID
+		requestFingerprint, err = productCRMRequestFingerprint(req)
+		if err != nil {
+			return err
+		}
+		if idempotentCandidate {
+			return validateProductCRMReplay(
+				lead.RequestFingerprint,
+				requestFingerprint,
+				"CRM lead",
+			)
 		}
 
 		pipeline, stage, refErr := validateCRMLeadCreateReferences(tx, orgID, &req)
@@ -1113,6 +1171,12 @@ func (a *App) UpdateCRMLead(r *fastglue.Request) error {
 				"CRM lead was modified; refresh and retry",
 			)
 		}
+		if lead.Status == models.CRMLeadStatusArchived {
+			return newProductCRMClientError(
+				fasthttp.StatusConflict,
+				"Archived CRM leads must be reopened before editing",
+			)
+		}
 		if req.LostReason != nil && lead.Status != models.CRMLeadStatusLost {
 			return newProductCRMClientError(
 				fasthttp.StatusBadRequest,
@@ -1277,6 +1341,12 @@ func (a *App) MoveCRMLead(r *fastglue.Request) error {
 				"CRM lead was modified; refresh and retry",
 			)
 		}
+		if lead.Status == models.CRMLeadStatusArchived {
+			return newProductCRMClientError(
+				fasthttp.StatusConflict,
+				"Archived CRM leads must be reopened before moving stages",
+			)
+		}
 		if lead.StageID == req.StageID {
 			return newProductCRMClientError(
 				fasthttp.StatusConflict,
@@ -1401,6 +1471,213 @@ func (a *App) MoveCRMLead(r *fastglue.Request) error {
 
 	if err := a.loadCRMLead(&updated, orgID, true); err != nil {
 		a.Log.Error("Failed to reload moved CRM lead", "error", err, "lead_id", leadID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load CRM lead", nil, "")
+	}
+	return r.SendEnvelope(crmLeadToResponse(&updated))
+}
+
+// ArchiveCRMLead removes a lead from active workflows without deleting its
+// commercial or stage history.
+func (a *App) ArchiveCRMLead(r *fastglue.Request) error {
+	return a.transitionCRMLeadLifecycle(r, "archive")
+}
+
+// ReopenCRMLead restores an archived lead to the lifecycle status implied by
+// its current stage. Historical won/lost timestamps remain untouched.
+func (a *App) ReopenCRMLead(r *fastglue.Request) error {
+	return a.transitionCRMLeadLifecycle(r, "reopen")
+}
+
+func (a *App) transitionCRMLeadLifecycle(
+	r *fastglue.Request,
+	action string,
+) error {
+	orgID, userID, err := a.requireAuth(r, models.ResourceCRMLeads, models.ActionWrite)
+	if err != nil {
+		return nil
+	}
+	leadID, err := parsePathUUID(r, "id", "lead")
+	if err != nil {
+		return nil
+	}
+
+	var req CRMLeadLifecycleRequest
+	if err := a.decodeRequest(r, &req); err != nil {
+		return nil
+	}
+	if err := validateCRMLeadLifecycleRequest(&req); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+	requestFingerprint, err := productCRMRequestFingerprint(req)
+	if err != nil {
+		a.Log.Error("Failed to fingerprint CRM lead lifecycle request", "error", err)
+		return r.SendErrorEnvelope(
+			fasthttp.StatusInternalServerError,
+			"Failed to "+action+" CRM lead",
+			nil,
+			"",
+		)
+	}
+
+	var updated models.CRMLead
+	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		var lead models.CRMLead
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", leadID, orgID).
+			First(&lead).Error; err != nil {
+			return newProductCRMClientError(fasthttp.StatusNotFound, "CRM lead not found")
+		}
+
+		replayed, err := crmLeadLifecycleReplay(
+			tx,
+			orgID,
+			&lead,
+			action,
+			&req,
+			requestFingerprint,
+		)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			updated = lead
+			return nil
+		}
+		if lead.Version != req.Version {
+			return newProductCRMClientError(
+				fasthttp.StatusConflict,
+				"CRM lead was modified; refresh and retry",
+			)
+		}
+
+		previousStatus := lead.Status
+		targetStatus := models.CRMLeadStatusArchived
+		switch action {
+		case "archive":
+			if lead.Status == models.CRMLeadStatusArchived {
+				return newProductCRMClientError(
+					fasthttp.StatusConflict,
+					"CRM lead is already archived",
+				)
+			}
+		case "reopen":
+			if lead.Status != models.CRMLeadStatusArchived {
+				return newProductCRMClientError(
+					fasthttp.StatusConflict,
+					"Only an archived CRM lead can be reopened",
+				)
+			}
+			var stage models.CRMPipelineStage
+			if err := tx.Select("kind").Where(
+				"id = ? AND organization_id = ? AND pipeline_id = ?",
+				lead.StageID,
+				orgID,
+				lead.PipelineID,
+			).First(&stage).Error; err != nil {
+				return newProductCRMClientError(
+					fasthttp.StatusConflict,
+					"CRM lead stage is unavailable; it cannot be reopened",
+				)
+			}
+			targetStatus, _, _ = crmLeadStateForStage(stage.Kind, time.Now().UTC())
+		default:
+			return errors.New("unsupported CRM lead lifecycle action")
+		}
+
+		oldSnapshot := crmLeadAuditSnapshot(&lead)
+		now := time.Now().UTC()
+		newVersion := lead.Version + 1
+		result := tx.Model(&models.CRMLead{}).
+			Where("id = ? AND organization_id = ? AND version = ?", lead.ID, orgID, req.Version).
+			Updates(map[string]any{
+				"status":           targetStatus,
+				"last_activity_at": now,
+				"updated_by_id":    userID,
+				"version":          newVersion,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return newProductCRMClientError(
+				fasthttp.StatusConflict,
+				"CRM lead was modified; refresh and retry",
+			)
+		}
+
+		activityKey := crmLeadLifecycleActivityKey(
+			lead.ID,
+			action,
+			req.IdempotencyKey,
+			newVersion,
+		)
+		title := "Journey archived"
+		if action == "reopen" {
+			title = "Journey reopened"
+		}
+		if _, err := recordCustomerActivity(tx, orgID, customerActivityInput{
+			ContactID:        lead.ContactID,
+			LeadID:           &lead.ID,
+			EventType:        models.CustomerActivityCRMLeadUpdated,
+			Category:         models.CustomerActivityCategoryCRM,
+			Title:            title,
+			Summary:          lead.Title,
+			ActorType:        models.CustomerActivityActorUser,
+			ActorUserID:      &userID,
+			SourceObjectType: productCRMLeadResource,
+			SourceObjectID:   &lead.ID,
+			OccurredAt:       now,
+			Metadata: models.JSONB{
+				"action":              action,
+				"pipeline_id":         lead.PipelineID.String(),
+				"stage_id":            lead.StageID.String(),
+				"previous_status":     string(previousStatus),
+				"status":              string(targetStatus),
+				"version":             newVersion,
+				"request_version":     req.Version,
+				"reason":              req.Reason,
+				"request_metadata":    req.Metadata,
+				"request_fingerprint": requestFingerprint,
+			},
+			WebhookData: models.JSONB{
+				"lifecycle_action": action,
+			},
+			IdempotencyKey: activityKey,
+		}); err != nil {
+			return err
+		}
+
+		if err := tx.Where("id = ? AND organization_id = ?", lead.ID, orgID).
+			First(&updated).Error; err != nil {
+			return err
+		}
+		return audit.LogAudit(
+			tx,
+			orgID,
+			userID,
+			audit.GetUserName(tx, userID),
+			productCRMLeadResource,
+			lead.ID,
+			models.AuditActionUpdated,
+			oldSnapshot,
+			crmLeadAuditSnapshot(&updated),
+			map[string]any{
+				"field":     "lifecycle_transition_reason",
+				"old_value": nil,
+				"new_value": req.Reason,
+			},
+		)
+	})
+	if err != nil {
+		return a.sendProductCRMWriteError(r, action+" CRM lead", err)
+	}
+	if err := a.loadCRMLead(&updated, orgID, false); err != nil {
+		a.Log.Error(
+			"Failed to reload CRM lead after lifecycle transition",
+			"error", err,
+			"lead_id", leadID,
+			"action", action,
+		)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load CRM lead", nil, "")
 	}
 	return r.SendEnvelope(crmLeadToResponse(&updated))
@@ -2347,6 +2624,92 @@ func validateMoveCRMLeadRequest(req *MoveCRMLeadRequest) error {
 		req.Metadata = models.JSONB{}
 	}
 	return nil
+}
+
+func validateCRMLeadLifecycleRequest(req *CRMLeadLifecycleRequest) error {
+	req.Reason = strings.TrimSpace(req.Reason)
+	req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
+	if req.Version < 1 {
+		return errors.New("version must be at least 1")
+	}
+	if err := productCRMOptionalString("reason", req.Reason, 2000); err != nil {
+		return err
+	}
+	if err := productCRMOptionalString("idempotency_key", req.IdempotencyKey, 255); err != nil {
+		return err
+	}
+	if req.Metadata == nil {
+		req.Metadata = models.JSONB{}
+	}
+	return nil
+}
+
+func crmLeadLifecycleActivityKey(
+	leadID uuid.UUID,
+	action, idempotencyKey string,
+	newVersion int64,
+) string {
+	if idempotencyKey != "" {
+		digest := sha256.Sum256([]byte(idempotencyKey))
+		return fmt.Sprintf("crm-lead-%s:%s:%x", action, leadID, digest)
+	}
+	return fmt.Sprintf("crm-lead-%s:%s:%d", action, leadID, newVersion)
+}
+
+func crmLeadLifecycleReplay(
+	tx *gorm.DB,
+	orgID uuid.UUID,
+	lead *models.CRMLead,
+	action string,
+	req *CRMLeadLifecycleRequest,
+	requestFingerprint string,
+) (bool, error) {
+	if req.IdempotencyKey == "" {
+		return false, nil
+	}
+	activityKey := crmLeadLifecycleActivityKey(
+		lead.ID,
+		action,
+		req.IdempotencyKey,
+		0,
+	)
+	var event models.CustomerActivityEvent
+	err := tx.Where(
+		`organization_id = ?
+		 AND idempotency_key = ?
+		 AND lead_id = ?
+		 AND event_type = ?
+		 AND source_object_type = ?
+		 AND source_object_id = ?`,
+		orgID,
+		activityKey,
+		lead.ID,
+		models.CustomerActivityCRMLeadUpdated,
+		productCRMLeadResource,
+		lead.ID,
+	).First(&event).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	storedFingerprint, _ := event.Metadata["request_fingerprint"].(string)
+	if storedFingerprint != requestFingerprint {
+		return false, newProductCRMClientError(
+			fasthttp.StatusConflict,
+			"Idempotency key was already used with a different CRM lead lifecycle request",
+		)
+	}
+	storedVersion, versionOK := careJSONInt64(event.Metadata, "version")
+	storedStatus := models.CRMLeadStatus(careJSONString(event.Metadata, "status"))
+	if !versionOK || storedVersion != lead.Version || storedStatus != lead.Status {
+		return false, newProductCRMClientError(
+			fasthttp.StatusConflict,
+			"CRM lead was modified after the lifecycle request; refresh and retry",
+		)
+	}
+	return true, nil
 }
 
 func hasCRMLeadUpdate(req *UpdateCRMLeadRequest) bool {

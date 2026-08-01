@@ -2,6 +2,8 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import draggable from 'vuedraggable'
 import {
+  Archive,
+  ArrowLeft,
   ArrowRight,
   CalendarClock,
   Check,
@@ -9,26 +11,24 @@ import {
   Filter,
   GripVertical,
   Loader2,
+  Pencil,
   Plus,
   RefreshCw,
   Route,
+  Settings2,
   UserRound,
 } from 'lucide-vue-next'
 import PageHeader from '@/components/shared/PageHeader.vue'
 import ContactPicker from '@/components/shared/ContactPicker.vue'
+import LeadEditDialog from '@/components/crm/LeadEditDialog.vue'
+import PipelineSettingsDialog from '@/components/crm/PipelineSettingsDialog.vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import { getErrorMessage, unwrapListResponse } from '@/lib/api-utils'
-import {
-  crmService,
-  type CRMLead,
-  type FollowUpTask,
-  type Pipeline,
-  type PipelineStage,
-} from '@/services/productSuite'
+import { crmService, type CRMLead, type FollowUpTask, type Pipeline, type PipelineStage } from '@/services/productSuite'
 
 type BoardColumn = PipelineStage & { leads: CRMLead[] }
 
@@ -41,6 +41,11 @@ const selectedPipelineId = ref('')
 const columns = ref<BoardColumn[]>([])
 const tasks = ref<FollowUpTask[]>([])
 const showCreate = ref(false)
+const pipelineSettingsOpen = ref(false)
+const leadEditorOpen = ref(false)
+const editingLead = ref<CRMLead | null>(null)
+const movingLeadId = ref('')
+const showArchived = ref(false)
 const newLead = reactive({
   title: '',
   contact_id: '',
@@ -50,22 +55,25 @@ const newLead = reactive({
 const canReadTasks = computed(() => authStore.hasPermission('tasks', 'read'))
 const canWriteTasks = computed(() => authStore.hasPermission('tasks', 'write'))
 const canWriteLeads = computed(() => authStore.hasPermission('crm.leads', 'write'))
+const canWritePipelines = computed(() => authStore.hasPermission('crm.pipelines', 'write'))
+const canDeletePipelineStages = computed(() => authStore.hasPermission('crm.pipelines', 'delete'))
 const canReadContacts = computed(() => authStore.hasPermission('contacts', 'read'))
 const canCreateLeads = computed(() => canWriteLeads.value && canReadContacts.value)
 
 const selectedPipeline = computed(() => pipelines.value.find((pipeline) => pipeline.id === selectedPipelineId.value))
 const openLeadCount = computed(() =>
-  columns.value.reduce(
-    (total, column) => total + column.leads.filter((lead) => lead.status === 'open').length,
-    0,
-  ),
+  columns.value.reduce((total, column) => total + column.leads.filter((lead) => lead.status === 'open').length, 0),
 )
+const visibleLeadCount = computed(() => columns.value.reduce((total, column) => total + column.leads.length, 0))
 const openValues = computed(() =>
   currencyTotals(columns.value.flatMap((column) => column.leads).filter((lead) => lead.status === 'open')),
 )
+const visibleValues = computed(() => currencyTotals(columns.value.flatMap((column) => column.leads)))
 const overdueTasks = computed(() => {
   const now = Date.now()
-  return tasks.value.filter((task) => task.status !== 'completed' && task.due_at && new Date(task.due_at).getTime() < now)
+  return tasks.value.filter(
+    (task) => task.status !== 'completed' && task.due_at && new Date(task.due_at).getTime() < now,
+  )
 })
 
 function rebuildBoard(leads: CRMLead[]) {
@@ -83,9 +91,7 @@ async function load() {
   try {
     const [pipelineResponse, taskResponse] = await Promise.all([
       crmService.pipelines(),
-      canReadTasks.value
-        ? crmService.allTasks({ status: 'open' })
-        : Promise.resolve(null),
+      canReadTasks.value ? crmService.allTasks({ status: 'open' }) : Promise.resolve(null),
     ])
     pipelines.value = unwrapListResponse<Pipeline>(pipelineResponse, 'pipelines')
     tasks.value = taskResponse ?? []
@@ -106,8 +112,26 @@ async function loadLeads() {
     columns.value = []
     return
   }
-  const leads = await crmService.allLeads({ pipeline_id: selectedPipelineId.value })
+  const leads = await crmService.allLeads(
+    showArchived.value
+      ? { pipeline_id: selectedPipelineId.value, status: 'archived' }
+      : { pipeline_id: selectedPipelineId.value, include_archived: false },
+  )
   rebuildBoard(leads)
+}
+
+async function toggleArchived() {
+  showArchived.value = !showArchived.value
+  showCreate.value = false
+  loading.value = true
+  try {
+    await loadLeads()
+  } catch (error) {
+    showArchived.value = !showArchived.value
+    toast.error('Pipeline could not be loaded', getErrorMessage(error))
+  } finally {
+    loading.value = false
+  }
 }
 
 async function changePipeline() {
@@ -123,18 +147,75 @@ async function handleMove(event: any, stage: BoardColumn) {
   const lead = event?.added?.element as CRMLead | undefined
   if (!lead || lead.stage_id === stage.id) return
 
+  await moveLeadToStage(lead, stage)
+}
+
+async function moveLeadToStage(lead: CRMLead, stage: Pick<PipelineStage, 'id' | 'name'>, refreshBoard = false) {
+  if (showArchived.value || lead.status === 'archived' || lead.stage_id === stage.id || movingLeadId.value) return
   const previousStage = lead.stage_id
   lead.stage_id = stage.id
+  movingLeadId.value = lead.id
   try {
     const response = await crmService.moveLead(lead.id, stage.id, lead.version)
     const updated = response.data?.data ?? response.data
     lead.version = updated?.version ?? lead.version + 1
     lead.status = updated?.status ?? lead.status
     toast.success(`Moved to ${stage.name}`)
+    if (refreshBoard) {
+      try {
+        await loadLeads()
+      } catch (refreshError) {
+        toast.error('Pipeline could not be refreshed', getErrorMessage(refreshError))
+      }
+    }
   } catch (error) {
     lead.stage_id = previousStage
     toast.error('Lead was not moved', getErrorMessage(error))
     await loadLeads()
+  } finally {
+    movingLeadId.value = ''
+  }
+}
+
+function adjacentStage(lead: CRMLead, direction: -1 | 1) {
+  const index = columns.value.findIndex((column) => column.id === lead.stage_id)
+  return columns.value[index + direction]
+}
+
+function moveLeadByOffset(lead: CRMLead, direction: -1 | 1) {
+  const stage = adjacentStage(lead, direction)
+  if (stage) void moveLeadToStage(lead, stage, true)
+}
+
+function openLeadEditor(lead: CRMLead) {
+  editingLead.value = lead
+  leadEditorOpen.value = true
+}
+
+async function handleLeadSaved(action: 'updated' | 'archived' | 'reopened' = 'updated') {
+  const messages = {
+    updated: 'Lead updated',
+    archived: 'Lead archived',
+    reopened: 'Lead reopened',
+  }
+  toast.success(messages[action])
+  await loadLeads()
+}
+
+async function refreshPipelineConfiguration(preferredPipelineId?: string) {
+  try {
+    const response = await crmService.pipelines()
+    pipelines.value = unwrapListResponse<Pipeline>(response, 'pipelines')
+    if (preferredPipelineId && pipelines.value.some((item) => item.id === preferredPipelineId)) {
+      selectedPipelineId.value = preferredPipelineId
+    }
+    if (!pipelines.value.some((item) => item.id === selectedPipelineId.value)) {
+      selectedPipelineId.value = pipelines.value.find((item) => item.is_default)?.id ?? pipelines.value[0]?.id ?? ''
+    }
+    await loadLeads()
+    toast.success('Pipeline configuration saved')
+  } catch (error) {
+    toast.error('Pipeline could not be refreshed', getErrorMessage(error))
   }
 }
 
@@ -202,9 +283,12 @@ function formatMoneyTotals(totals: Array<[string, number]>) {
 
 function formatDue(value?: string) {
   if (!value) return 'No due date'
-  return new Intl.DateTimeFormat('en-MY', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }).format(
-    new Date(value),
-  )
+  return new Intl.DateTimeFormat('en-MY', {
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(value))
 }
 
 onMounted(load)
@@ -222,6 +306,7 @@ onMounted(load)
         <div class="flex items-center gap-2">
           <select
             v-model="selectedPipelineId"
+            aria-label="Pipeline"
             class="h-9 rounded-md border border-white/10 bg-white/[0.04] px-3 text-sm text-white outline-none light:border-slate-400 light:bg-slate-50 light:text-slate-950"
             @change="changePipeline"
           >
@@ -232,7 +317,27 @@ onMounted(load)
           <Button variant="outline" size="icon" title="Refresh pipeline" @click="load">
             <RefreshCw class="h-4 w-4" />
           </Button>
-          <Button v-if="canCreateLeads" class="bg-cyan-400 text-black hover:bg-cyan-300" @click="showCreate = !showCreate">
+          <Button
+            v-if="canWriteLeads"
+            variant="outline"
+            class="gap-2"
+            :aria-pressed="showArchived"
+            :aria-label="showArchived ? 'Show active leads' : 'Show archived leads'"
+            :title="showArchived ? 'Show active leads' : 'Show archived leads'"
+            @click="toggleArchived"
+          >
+            <Archive class="h-4 w-4" />
+            <span class="hidden sm:inline">{{ showArchived ? 'Active leads' : 'Archived' }}</span>
+          </Button>
+          <Button v-if="canWritePipelines" variant="outline" class="gap-2" @click="pipelineSettingsOpen = true">
+            <Settings2 class="h-4 w-4" />
+            <span class="hidden sm:inline">Configure</span>
+          </Button>
+          <Button
+            v-if="canCreateLeads && !showArchived"
+            class="bg-cyan-400 text-black hover:bg-cyan-300"
+            @click="showCreate = !showCreate"
+          >
             <Plus class="mr-2 h-4 w-4" />
             New lead
           </Button>
@@ -245,29 +350,46 @@ onMounted(load)
     </div>
 
     <div v-else class="flex min-h-0 flex-1 flex-col">
-      <div class="grid grid-cols-2 gap-px border-b border-white/[0.08] bg-white/[0.08] light:border-slate-300 light:bg-slate-300 md:grid-cols-4">
+      <div
+        class="grid grid-cols-2 gap-px border-b border-white/[0.08] bg-white/[0.08] light:border-slate-300 light:bg-slate-300 md:grid-cols-4"
+      >
         <div class="bg-[#0d0f10] px-5 py-3 light:bg-slate-50">
-          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-slate-600">Open leads</p>
-          <p class="mt-1 text-xl font-semibold text-white light:text-slate-950">{{ openLeadCount }}</p>
+          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-slate-600">
+            {{ showArchived ? 'Archived leads' : 'Open leads' }}
+          </p>
+          <p class="mt-1 text-xl font-semibold text-white light:text-slate-950">
+            {{ showArchived ? visibleLeadCount : openLeadCount }}
+          </p>
         </div>
         <div class="bg-[#0d0f10] px-5 py-3 light:bg-slate-50">
-          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-slate-600">Pipeline value</p>
-          <p class="mt-1 text-base font-semibold text-white light:text-slate-950">{{ formatMoneyTotals(openValues) }}</p>
+          <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-slate-600">
+            {{ showArchived ? 'Archived value' : 'Pipeline value' }}
+          </p>
+          <p class="mt-1 text-base font-semibold text-white light:text-slate-950">
+            {{ formatMoneyTotals(showArchived ? visibleValues : openValues) }}
+          </p>
         </div>
         <div class="bg-[#0d0f10] px-5 py-3 light:bg-slate-50">
           <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-slate-600">Open follow-ups</p>
-          <p class="mt-1 text-xl font-semibold text-white light:text-slate-950">{{ tasks.filter((task) => task.status !== 'completed').length }}</p>
+          <p class="mt-1 text-xl font-semibold text-white light:text-slate-950">
+            {{ tasks.filter((task) => task.status !== 'completed').length }}
+          </p>
         </div>
         <div class="bg-[#0d0f10] px-5 py-3 light:bg-slate-50">
           <p class="text-[10px] uppercase tracking-[0.18em] text-white/35 light:text-slate-600">Overdue</p>
-          <p class="mt-1 text-xl font-semibold" :class="overdueTasks.length ? 'text-amber-300 light:text-amber-700' : 'text-emerald-300 light:text-emerald-700'">
+          <p
+            class="mt-1 text-xl font-semibold"
+            :class="
+              overdueTasks.length ? 'text-amber-300 light:text-amber-700' : 'text-emerald-300 light:text-emerald-700'
+            "
+          >
             {{ overdueTasks.length }}
           </p>
         </div>
       </div>
 
       <div
-      v-if="showCreate && canCreateLeads"
+        v-if="showCreate && canCreateLeads"
         class="grid gap-3 border-b border-cyan-400/20 bg-cyan-400/[0.045] px-5 py-4 md:grid-cols-[1.2fr_1fr_.65fr_.45fr_auto]"
       >
         <Input v-model="newLead.title" placeholder="Lead title" />
@@ -299,9 +421,13 @@ onMounted(load)
                 <div class="flex items-center justify-between">
                   <div class="flex items-center gap-2">
                     <span class="h-2.5 w-2.5 rounded-full" :style="{ backgroundColor: column.color || '#67e8f9' }" />
-                    <h3 class="text-sm font-semibold text-white light:text-slate-950">{{ column.name }}</h3>
+                    <h3 class="text-sm font-semibold text-white light:text-slate-950">
+                      {{ column.name }}
+                    </h3>
                   </div>
-                  <Badge variant="secondary" class="h-5 min-w-5 justify-center px-1.5 text-[10px]">{{ column.leads.length }}</Badge>
+                  <Badge variant="secondary" class="h-5 min-w-5 justify-center px-1.5 text-[10px]">{{
+                    column.leads.length
+                  }}</Badge>
                 </div>
                 <div class="mt-2 flex items-center justify-between text-[11px] text-white/35 light:text-slate-600">
                   <span>{{ column.probability }}% probability</span>
@@ -313,7 +439,7 @@ onMounted(load)
                 v-model="column.leads"
                 item-key="id"
                 group="pipeline-leads"
-                :disabled="!canWriteLeads"
+                :disabled="showArchived || !canWriteLeads || Boolean(movingLeadId)"
                 class="min-h-28 flex-1 space-y-2 overflow-y-auto p-2.5"
                 ghost-class="opacity-30"
                 drag-class="rotate-1"
@@ -321,27 +447,85 @@ onMounted(load)
               >
                 <template #item="{ element: lead }">
                   <article
-                    class="cursor-grab rounded-xl border border-white/[0.07] bg-[#121416] p-3.5 shadow-lg shadow-black/10 transition hover:border-cyan-300/20 active:cursor-grabbing light:border-slate-300 light:bg-white light:hover:border-cyan-600/40"
+                    class="rounded-xl border border-white/[0.07] bg-[#121416] p-3.5 shadow-lg shadow-black/10 transition hover:border-cyan-300/20 light:border-slate-300 light:bg-white light:hover:border-cyan-600/40"
+                    :class="canWriteLeads && !showArchived ? 'cursor-grab active:cursor-grabbing' : ''"
                   >
                     <div class="flex items-start gap-2">
                       <GripVertical class="mt-0.5 h-4 w-4 shrink-0 text-white/20 light:text-slate-500" />
                       <div class="min-w-0 flex-1">
-                        <p class="line-clamp-2 text-sm font-medium leading-5 text-white light:text-slate-950">{{ lead.title }}</p>
+                        <p class="line-clamp-2 text-sm font-medium leading-5 text-white light:text-slate-950">
+                          {{ lead.title }}
+                        </p>
                         <div class="mt-2 flex items-center gap-1.5 text-[11px] text-white/40 light:text-slate-600">
                           <UserRound class="h-3 w-3" />
-                          <span class="truncate">{{ lead.contact?.profile_name || lead.contact?.phone_number || 'Contact' }}</span>
+                          <span class="truncate">{{
+                            lead.contact?.profile_name || lead.contact?.phone_number || 'Contact'
+                          }}</span>
                         </div>
                       </div>
+                      <Button
+                        v-if="canWriteLeads"
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        class="-mr-1 -mt-1 h-8 w-8 shrink-0 text-white/35 hover:text-cyan-200 light:text-slate-500 light:hover:text-cyan-700"
+                        :aria-label="`Edit ${lead.title}`"
+                        @click="openLeadEditor(lead)"
+                      >
+                        <Pencil class="h-3.5 w-3.5" />
+                      </Button>
                     </div>
-                    <div class="mt-3 flex items-center justify-between border-t border-white/[0.06] pt-2.5 light:border-slate-300">
+                    <div
+                      class="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.06] pt-2.5 light:border-slate-300"
+                    >
                       <span class="flex items-center gap-1 text-xs font-medium text-emerald-300 light:text-emerald-700">
                         <CircleDollarSign class="h-3.5 w-3.5" />
                         {{ formatMoney(lead.value_minor, lead.currency) }}
                       </span>
-                      <span v-if="lead.next_action_at" class="flex items-center gap-1 text-[10px] text-white/35 light:text-slate-600">
+                      <span
+                        v-if="lead.next_action_at"
+                        class="flex items-center gap-1 text-[10px] text-white/35 light:text-slate-600"
+                      >
                         <CalendarClock class="h-3 w-3" />
                         {{ formatDue(lead.next_action_at) }}
                       </span>
+                    </div>
+                    <div
+                      v-if="canWriteLeads && !showArchived"
+                      class="mt-2 flex items-center justify-between gap-2 border-t border-white/[0.05] pt-2 light:border-slate-200"
+                    >
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        class="h-7 gap-1 px-2 text-[10px] text-white/40 light:text-slate-600"
+                        :disabled="!adjacentStage(lead, -1) || movingLeadId === lead.id"
+                        :aria-label="
+                          adjacentStage(lead, -1)
+                            ? `Move ${lead.title} to ${adjacentStage(lead, -1)?.name}`
+                            : `${lead.title} is in the first stage`
+                        "
+                        @click="moveLeadByOffset(lead, -1)"
+                      >
+                        <ArrowLeft class="h-3 w-3" />
+                        Previous
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        class="h-7 gap-1 px-2 text-[10px] text-white/40 light:text-slate-600"
+                        :disabled="!adjacentStage(lead, 1) || movingLeadId === lead.id"
+                        :aria-label="
+                          adjacentStage(lead, 1)
+                            ? `Move ${lead.title} to ${adjacentStage(lead, 1)?.name}`
+                            : `${lead.title} is in the last stage`
+                        "
+                        @click="moveLeadByOffset(lead, 1)"
+                      >
+                        Next
+                        <ArrowRight class="h-3 w-3" />
+                      </Button>
                     </div>
                   </article>
                 </template>
@@ -350,10 +534,14 @@ onMounted(load)
           </div>
         </div>
 
-        <aside class="hidden overflow-y-auto border-l border-white/[0.08] bg-[#0b0c0d] p-4 light:border-slate-300 light:bg-slate-50 xl:block">
+        <aside
+          class="hidden overflow-y-auto border-l border-white/[0.08] bg-[#0b0c0d] p-4 light:border-slate-300 light:bg-slate-50 xl:block"
+        >
           <div class="mb-4 flex items-center justify-between">
             <div>
-              <p class="text-xs font-semibold uppercase tracking-[0.16em] text-white/45 light:text-slate-600">Follow-up rail</p>
+              <p class="text-xs font-semibold uppercase tracking-[0.16em] text-white/45 light:text-slate-600">
+                Follow-up rail
+              </p>
               <h3 class="mt-1 font-semibold text-white light:text-slate-950">What needs attention</h3>
             </div>
             <Filter class="h-4 w-4 text-white/30 light:text-slate-500" />
@@ -374,7 +562,9 @@ onMounted(load)
                   <Check class="h-3 w-3" />
                 </button>
                 <div class="min-w-0">
-                  <p class="text-xs font-medium leading-5 text-white light:text-slate-950">{{ task.title }}</p>
+                  <p class="text-xs font-medium leading-5 text-white light:text-slate-950">
+                    {{ task.title }}
+                  </p>
                   <p
                     class="mt-1 text-[10px]"
                     :class="
@@ -388,7 +578,10 @@ onMounted(load)
                 </div>
               </div>
             </article>
-            <div v-if="!tasks.some((item) => item.status !== 'completed')" class="rounded-xl bg-emerald-400/[0.06] p-5 text-center">
+            <div
+              v-if="!tasks.some((item) => item.status !== 'completed')"
+              class="rounded-xl bg-emerald-400/[0.06] p-5 text-center"
+            >
               <Check class="mx-auto h-5 w-5 text-emerald-300 light:text-emerald-700" />
               <p class="mt-2 text-xs text-emerald-300 light:text-emerald-700">Follow-up queue is clear</p>
             </div>
@@ -402,5 +595,13 @@ onMounted(load)
         </aside>
       </div>
     </div>
+
+    <PipelineSettingsDialog
+      v-model="pipelineSettingsOpen"
+      :pipeline="selectedPipeline"
+      :can-delete-stages="canDeletePipelineStages"
+      @saved="refreshPipelineConfiguration"
+    />
+    <LeadEditDialog v-model="leadEditorOpen" :lead="editingLead" @saved="handleLeadSaved" />
   </div>
 </template>
