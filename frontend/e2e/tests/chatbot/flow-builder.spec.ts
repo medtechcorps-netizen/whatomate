@@ -163,9 +163,10 @@ test.describe('Chatbot Flow Builder - Other node types', () => {
 
   test('Set variable node exposes typed assignments', async () => {
     await builder.addNode('Set variable')
-    await expect(builder.page.getByText('Variable assignments')).toBeVisible()
-    await expect(builder.page.getByLabel('Name')).toHaveValue('variable_1')
-    await expect(builder.page.getByLabel('Value')).toBeVisible()
+    const assignments = builder.page.getByRole('group', { name: 'Variable assignments' })
+    await expect(assignments).toBeVisible()
+    await expect(assignments.getByLabel('Name')).toHaveValue('variable_1')
+    await expect(assignments.getByLabel('Value')).toBeVisible()
   })
 
   test('AI response node exposes the supported prompt template', async () => {
