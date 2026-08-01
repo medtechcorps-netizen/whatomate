@@ -17,6 +17,17 @@ const deletableOrganization = {
   created_at: '2026-07-21T08:00:00Z',
 }
 
+function workspaceFixture(index: number) {
+  const suffix = String(index).padStart(3, '0')
+  return {
+    ...organization,
+    id: `aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, '0')}`,
+    name: `Workspace ${suffix}`,
+    slug: `workspace-${suffix}`,
+    created_at: `2026-07-${String((index % 28) + 1).padStart(2, '0')}T08:00:00Z`,
+  }
+}
+
 const reseller = {
   id: organization.reseller_id,
   name: 'Omnitech Partner',
@@ -184,11 +195,15 @@ async function installWorkspaceSession(
       },
     }),
   )
-  await page.route(/\/api\/organizations(?:\?.*)?$/, (route) =>
-    route.fulfill({
+  await page.route(/\/api\/organizations(?:\?.*)?$/, async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.fallback()
+      return
+    }
+    await route.fulfill({
       json: { data: { organizations: portfolioOrganizations } },
-    }),
-  )
+    })
+  })
   await page.route(/\/api\/product\/entitlements(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: {
@@ -215,11 +230,15 @@ async function mockPartnerPortfolio(
   initialProvider = 'manual',
   initialStatus = 'active',
   portfolioOrganizations: (typeof organization)[] = [organization],
+  maxOrganizations = reseller.max_organizations,
 ) {
   const currentOrganizations = [...portfolioOrganizations]
   await installWorkspaceSession(page, user, currentOrganizations)
 
   let deletedOrganizationId = ''
+  let createdOrganizationId = ''
+  const usagePages: number[] = []
+  const usageRequests: Array<{ page: number; limit: number }> = []
   const initialPlan =
     plans.find((plan) =>
       plan.prices.some((price) => price.id === initialPlanPriceId),
@@ -238,38 +257,99 @@ async function mockPartnerPortfolio(
   }
   let assignment: Record<string, unknown> | null = null
   let catalogRequests = 0
+  let subscriptionGetRequests = 0
   let delayNextSubscription = false
 
+  await page.route(/\/api\/organizations(?:\?.*)?$/, async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.fallback()
+      return
+    }
+    const request = route.request().postDataJSON() as {
+      name: string
+      reseller_id: string
+    }
+    createdOrganizationId = `99999999-0000-4000-8000-${String(currentOrganizations.length + 1).padStart(12, '0')}`
+    const createdOrganization = {
+      ...organization,
+      id: createdOrganizationId,
+      reseller_id: request.reseller_id,
+      name: request.name,
+      slug: request.name
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, ''),
+      created_at: '2026-08-01T08:00:00Z',
+    }
+    currentOrganizations.push(createdOrganization)
+    await route.fulfill({ json: { data: createdOrganization } })
+  })
   await page.route(/\/api\/resellers(?:\?.*)?$/, (route) =>
-    route.fulfill({ json: { data: { resellers: [reseller] } } }),
+    route.fulfill({
+      json: {
+        data: {
+          resellers: [
+            {
+              ...reseller,
+              max_organizations: maxOrganizations,
+              organization_count: currentOrganizations.length,
+            },
+          ],
+        },
+      },
+    }),
   )
   await page.route(
     new RegExp(`/api/resellers/${reseller.id}/usage(?:\\?.*)?$`),
-    (route) =>
-      route.fulfill({
+    async (route) => {
+      const requestUrl = new URL(route.request().url())
+      const requestedPage = Number(requestUrl.searchParams.get('page') || '1')
+      const requestedLimit = Number(requestUrl.searchParams.get('limit') || '50')
+      const pageNumber = Number.isInteger(requestedPage)
+        ? Math.max(1, requestedPage)
+        : 1
+      const pageLimit = Number.isInteger(requestedLimit)
+        ? Math.min(100, Math.max(1, requestedLimit))
+        : 50
+      const orderedOrganizations = [...currentOrganizations].sort(
+        (left, right) =>
+          left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
+      )
+      const pageStart = (pageNumber - 1) * pageLimit
+      usagePages.push(pageNumber)
+      usageRequests.push({ page: pageNumber, limit: pageLimit })
+      await route.fulfill({
         json: {
           data: {
             reseller_id: reseller.id,
             plan: reseller.plan,
-            max_organizations: reseller.max_organizations,
-            organizations: currentOrganizations,
-            organization_count: currentOrganizations.length,
+            max_organizations: maxOrganizations,
+            organizations: orderedOrganizations
+              .slice(pageStart, pageStart + pageLimit)
+              .map((item) => ({
+                ...item,
+                subscription: license,
+              })),
+            page: pageNumber,
+            limit: pageLimit,
+            total: orderedOrganizations.length,
+            organization_count: orderedOrganizations.length,
             user_count: 4,
             whatsapp_accounts: 1,
             contacts: 12,
             messages: 48,
           },
         },
-      }),
+      })
+    },
   )
   await page.route(
     new RegExp(`/api/resellers/${reseller.id}/members(?:\\?.*)?$`),
     (route) => route.fulfill({ json: { data: { members: [] } } }),
   )
   await page.route(
-    new RegExp(
-      `/api/admin/organizations/${organization.id}/product/plans(?:\\?.*)?$`,
-    ),
+    new RegExp(`/api/admin/organizations/[^/]+/product/plans(?:\\?.*)?$`),
     (route) => {
       catalogRequests += 1
       return route.fulfill({ json: { data: { plans } } })
@@ -294,9 +374,12 @@ async function mockPartnerPortfolio(
             ? { trial_ends_at: '2026-08-18T08:00:00Z' }
             : {}),
         }
-      } else if (delayNextSubscription) {
-        delayNextSubscription = false
-        await new Promise((resolve) => setTimeout(resolve, 800))
+      } else {
+        subscriptionGetRequests += 1
+        if (delayNextSubscription) {
+          delayNextSubscription = false
+          await new Promise((resolve) => setTimeout(resolve, 800))
+        }
       }
       await route.fulfill({ json: { data: license } })
     },
@@ -327,8 +410,12 @@ async function mockPartnerPortfolio(
   return {
     assignment: () => assignment,
     catalogRequests: () => catalogRequests,
+    subscriptionGetRequests: () => subscriptionGetRequests,
+    createdOrganizationId: () => createdOrganizationId,
     deletedOrganizationId: () => deletedOrganizationId,
     organizations: () => currentOrganizations,
+    usagePages: () => [...usagePages],
+    usageRequests: () => [...usageRequests],
     delayNextSubscription: () => {
       delayNextSubscription = true
     },
@@ -354,6 +441,7 @@ test.describe('Partner Console workspace licensing', () => {
     await expect(page.getByTestId('workspace-license-plan')).toHaveValue(
       `${growthPlan.id}::${growthPlan.prices[1].id}`,
     )
+    expect(state.subscriptionGetRequests()).toBe(0)
 
     await page
       .getByTestId('workspace-license-plan')
@@ -513,7 +601,9 @@ test.describe('Partner Console workspace licensing', () => {
     await page.goto('/resellers')
 
     await page
-      .getByRole('button', { name: `Delete ${deletableOrganization.name}` })
+      .getByTestId('workspace-license-row')
+      .filter({ hasText: deletableOrganization.name })
+      .getByTestId('workspace-delete-row')
       .click()
     await expect(
       page.getByRole('dialog', {
@@ -546,6 +636,133 @@ test.describe('Partner Console workspace licensing', () => {
     await expect(
       page.getByRole('option', { name: deletableOrganization.name }),
     ).toHaveCount(0)
+  })
+
+  test('finds a deep-linked workspace across pages and recovers after deleting the last page', async ({
+    page,
+  }) => {
+    const portfolioOrganizations = Array.from({ length: 51 }, (_, index) =>
+      workspaceFixture(index + 1),
+    )
+    const targetOrganization = portfolioOrganizations[50]
+    const state = await mockPartnerPortfolio(
+      page,
+      [growthPlan],
+      platformOwner,
+      growthPlan.prices[1].id,
+      'manual',
+      'active',
+      portfolioOrganizations,
+      100,
+    )
+
+    await page.goto(
+      `/resellers?organization_id=${targetOrganization.id}`,
+    )
+
+    const pagination = page.getByTestId('workspace-pagination')
+    await expect(pagination).toContainText('Showing 51–51 of 51 workspaces')
+    await expect(pagination).toContainText('Page 2 of 2')
+    await expect(page.getByTestId('workspace-license-row')).toHaveCount(1)
+    await expect(page.getByTestId('workspace-license-row')).toContainText(
+      targetOrganization.name,
+    )
+    await expect(page.getByTestId('workspace-license-panel')).toContainText(
+      targetOrganization.name,
+    )
+    await expect(
+      page.getByRole('button', { name: 'Previous workspace page' }),
+    ).toBeEnabled()
+    await expect(
+      page.getByRole('button', { name: 'Next workspace page' }),
+    ).toBeDisabled()
+    expect(state.usageRequests()).toEqual(
+      expect.arrayContaining([
+        { page: 1, limit: 50 },
+        { page: 2, limit: 50 },
+      ]),
+    )
+
+    await page
+      .getByRole('button', { name: 'Previous workspace page' })
+      .click()
+    await expect(pagination).toContainText('Showing 1–50 of 51 workspaces')
+    await expect(pagination).toContainText('Page 1 of 2')
+    await expect(page.getByTestId('workspace-license-row')).toHaveCount(50)
+
+    await page.getByRole('button', { name: 'Next workspace page' }).click()
+    await expect(pagination).toContainText('Showing 51–51 of 51 workspaces')
+    await page
+      .getByTestId('workspace-license-row')
+      .filter({ hasText: targetOrganization.name })
+      .getByTestId('workspace-delete-row')
+      .click()
+    await page
+      .getByTestId('workspace-delete-confirmation')
+      .fill(targetOrganization.name)
+    await page.getByTestId('workspace-delete-submit').click()
+
+    await expect.poll(state.deletedOrganizationId).toBe(targetOrganization.id)
+    await expect(pagination).toContainText('Showing 1–50 of 50 workspaces')
+    await expect(pagination).toContainText('Page 1 of 1')
+    await expect(page.getByTestId('workspace-license-row')).toHaveCount(50)
+    await expect(
+      page.getByRole('button', { name: 'Previous workspace page' }),
+    ).toBeDisabled()
+    await expect(
+      page.getByRole('button', { name: 'Next workspace page' }),
+    ).toBeDisabled()
+    expect(state.organizations()).toHaveLength(50)
+    expect(state.usagePages()).toEqual(
+      expect.arrayContaining([1, 2]),
+    )
+  })
+
+  test('opens the page containing a newly provisioned workspace', async ({
+    page,
+  }) => {
+    const portfolioOrganizations = Array.from({ length: 50 }, (_, index) =>
+      workspaceFixture(index + 1),
+    )
+    const state = await mockPartnerPortfolio(
+      page,
+      [growthPlan],
+      platformOwner,
+      growthPlan.prices[1].id,
+      'manual',
+      'active',
+      portfolioOrganizations,
+      100,
+    )
+    await page.goto('/resellers')
+
+    const pagination = page.getByTestId('workspace-pagination')
+    await expect(pagination).toContainText('Showing 1–50 of 50 workspaces')
+    await page.getByRole('button', { name: 'New workspace' }).click()
+    const createDialog = page.getByRole('dialog', {
+      name: 'Provision customer workspace',
+    })
+    await createDialog.getByLabel('Business name').fill('Workspace 999')
+    await createDialog
+      .getByRole('button', { name: 'Provision workspace' })
+      .click()
+
+    await expect.poll(state.createdOrganizationId).not.toBe('')
+    const createdOrganizationId = state.createdOrganizationId()
+    await expect(page).toHaveURL(
+      new RegExp(`organization_id=${createdOrganizationId}`),
+    )
+    await expect(pagination).toContainText('Showing 51–51 of 51 workspaces')
+    await expect(pagination).toContainText('Page 2 of 2')
+    await expect(page.getByTestId('workspace-license-row')).toHaveCount(1)
+    await expect(page.getByTestId('workspace-license-row')).toContainText(
+      'Workspace 999',
+    )
+    await expect(page.getByTestId('workspace-license-panel')).toContainText(
+      'Workspace 999',
+    )
+    expect(state.organizations()).toHaveLength(51)
+    expect(state.usagePages()).toContain(2)
   })
 
   test('keeps a legacy pilot price visible while selecting its paid replacement', async ({

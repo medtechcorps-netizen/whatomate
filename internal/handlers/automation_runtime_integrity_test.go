@@ -466,6 +466,84 @@ func TestAutomationProcessor_ConcurrentWorkersCreateOneDurableTask(t *testing.T)
 	require.Equal(t, models.OutboxEventStatusPublished, outbox.Status)
 }
 
+func TestAutomationProcessor_ReclaimsStaleActionLeaseWithoutDuplicatingTask(t *testing.T) {
+	app, org, user := newAutomationDatabaseTestApp(t)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	createActiveAutomationPolicyForTest(
+		t,
+		app.DB,
+		org.ID,
+		user.ID,
+		"Stale action lease",
+		automationTestGraph(
+			string(models.CustomerActivityContactCreated),
+			"Lease-safe follow-up",
+		),
+	)
+	createAutomationActivityForTest(
+		t,
+		app.DB,
+		org.ID,
+		contact.ID,
+		models.CustomerActivityContactCreated,
+	)
+
+	processor := NewAutomationPolicyProcessor(app, time.Second)
+	receipt, err := processor.claimReceipt(context.Background(), org.ID)
+	require.NoError(t, err)
+	require.NotNil(t, receipt)
+	require.NoError(t, processor.processReceipt(context.Background(), org.ID, receipt))
+
+	var job models.ScheduledJob
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND kind = ?",
+		org.ID,
+		automationCreateTaskJobKind,
+	).First(&job).Error)
+	stale := time.Now().UTC().Add(-processor.lease - time.Minute)
+	require.NoError(t, app.DB.Model(&models.ScheduledJob{}).Where(
+		"id = ? AND organization_id = ?",
+		job.ID,
+		org.ID,
+	).Updates(map[string]any{
+		"status":    models.ScheduledJobStatusProcessing,
+		"attempts":  1,
+		"locked_at": stale,
+		"locked_by": "crashed-worker",
+		"run_at":    stale,
+	}).Error)
+
+	reclaimed, err := processor.claimActionJob(context.Background(), org.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed)
+	require.Equal(t, job.ID, reclaimed.ID)
+	require.Equal(t, 2, reclaimed.Attempts)
+	require.NotEqual(t, "crashed-worker", reclaimed.LockedBy)
+	require.NoError(t, processor.processActionJob(context.Background(), org.ID, reclaimed))
+	// A later poll is a replay boundary: completed jobs and steps must remain
+	// terminal and the task idempotency key must not be inserted twice.
+	require.NoError(t, processor.RunOnce(context.Background()))
+
+	var taskCount int64
+	require.NoError(t, app.DB.Model(&models.FollowUpTask{}).Where(
+		"organization_id = ? AND source = ?",
+		org.ID,
+		automationTaskSource,
+	).Count(&taskCount).Error)
+	require.EqualValues(t, 1, taskCount)
+	require.NoError(t, app.DB.First(&job, "id = ?", job.ID).Error)
+	require.Equal(t, models.ScheduledJobStatusCompleted, job.Status)
+	require.Equal(t, 2, job.Attempts)
+	var step models.AutomationExecutionStep
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND idempotency_key = ?",
+		org.ID,
+		job.IdempotencyKey,
+	).First(&step).Error)
+	require.Equal(t, models.AutomationExecutionStepStatusCompleted, step.Status)
+	require.NotNil(t, step.TaskID)
+}
+
 func TestAutomationProcessor_VisualPolicyWinsLegacyCareOwnershipRace(t *testing.T) {
 	app, org, user := newAutomationDatabaseTestApp(t)
 	entitlementUpdate := app.DB.Exec(

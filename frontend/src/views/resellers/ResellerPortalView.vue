@@ -3,6 +3,8 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Building2,
+  ChevronLeft,
+  ChevronRight,
   CreditCard,
   Check,
   Gauge,
@@ -27,6 +29,7 @@ import {
   type Reseller,
   type ResellerMember,
   type ResellerUsage,
+  type ResellerUsageOrganization,
 } from '@/services/api'
 import {
   organizationSubscriptionService,
@@ -67,9 +70,13 @@ const activeOrganizationId = computed(() =>
 const resellers = ref<Reseller[]>([])
 const selectedId = ref('')
 const usage = ref<ResellerUsage | null>(null)
+const WORKSPACE_PAGE_LIMIT = 50
+const MAX_WORKSPACE_DISCOVERY_PAGES = 100
+const usagePage = ref(1)
 const members = ref<ResellerMember[]>([])
 const loading = ref(true)
 const detailLoading = ref(false)
+let detailRequestId = 0
 const activeTab = ref('portfolio')
 
 interface PlanPriceOption {
@@ -102,6 +109,18 @@ const selectedOrganizationLicense = computed(() =>
     ? (organizationLicenses.value[selectedOrganizationId.value] ?? null)
     : null,
 )
+const usageTotalPages = computed(() =>
+  Math.max(1, Math.ceil((usage.value?.total ?? 0) / (usage.value?.limit || WORKSPACE_PAGE_LIMIT))),
+)
+const usageRange = computed(() => {
+  const total = usage.value?.total ?? 0
+  const count = usage.value?.organizations.length ?? 0
+  if (!total || !count) return { start: 0, end: 0, total }
+  const page = usage.value?.page || usagePage.value
+  const limit = usage.value?.limit || WORKSPACE_PAGE_LIMIT
+  const start = (page - 1) * limit + 1
+  return { start, end: Math.min(total, start + count - 1), total }
+})
 const catalogPlanPriceOptions = computed<PlanPriceOption[]>(() =>
   plans.value.flatMap((plan) =>
     plan.prices
@@ -382,18 +401,12 @@ async function refreshOrganizationLicense(
   }
 }
 
-async function loadOrganizationLicenses(organizations: Organization[]) {
+function hydrateOrganizationLicenses(organizations: ResellerUsageOrganization[]) {
   const organizationIds = new Set(organizations.map((item) => item.id))
   organizationLicenses.value = Object.fromEntries(
-    Object.entries(organizationLicenses.value).filter(([id]) =>
-      organizationIds.has(id),
-    ),
+    organizations.map((item) => [item.id, item.subscription]),
   )
-  organizationLicenseErrors.value = Object.fromEntries(
-    Object.entries(organizationLicenseErrors.value).filter(([id]) =>
-      organizationIds.has(id),
-    ),
-  )
+  organizationLicenseErrors.value = {}
   organizationLicenseLoading.value = {}
   if (!organizations.length) {
     selectedOrganizationId.value = ''
@@ -402,12 +415,10 @@ async function loadOrganizationLicenses(organizations: Organization[]) {
   if (!organizationIds.has(selectedOrganizationId.value)) {
     selectedOrganizationId.value = organizations[0].id
   }
-  await Promise.all(
-    organizations.map((item) => refreshOrganizationLicense(item.id, true)),
-  )
+  hydrateLicenseForm()
 }
 
-async function loadResellers(preferredId?: string) {
+async function loadResellers(preferredId?: string, reloadSelectedIfUnchanged = true) {
   loading.value = true
   try {
     const response = await resellersService.list()
@@ -444,7 +455,14 @@ async function loadResellers(preferredId?: string) {
               resellers.value.some((item) => item.id === selectedId.value)
             ? selectedId.value
             : resellers.value[0]?.id || ''
+    const unchanged = targetId === selectedId.value
     selectedId.value = targetId
+    if (targetId && unchanged && reloadSelectedIfUnchanged) {
+      await loadSelected({
+        page: usagePage.value,
+        requestedOrganizationId: requestedOrganizationId() || undefined,
+      })
+    }
   } catch (error) {
     toast.error(getErrorMessage(error, 'Unable to load partner portfolios'))
   } finally {
@@ -452,9 +470,53 @@ async function loadResellers(preferredId?: string) {
   }
 }
 
-async function loadSelected() {
+function normalizeUsagePage(nextUsage: ResellerUsage, requestedPage: number): ResellerUsage {
+  return {
+    ...nextUsage,
+    page: nextUsage.page || requestedPage,
+    limit: nextUsage.limit || WORKSPACE_PAGE_LIMIT,
+    total: nextUsage.total ?? nextUsage.organization_count,
+  }
+}
+
+async function fetchUsagePage(resellerId: string, page: number) {
+  const response = await resellersService.usage(resellerId, {
+    page,
+    limit: WORKSPACE_PAGE_LIMIT,
+  })
+  return normalizeUsagePage(unwrapItemResponse<ResellerUsage>(response), page)
+}
+
+async function findOrganizationUsagePage(
+  resellerId: string,
+  organizationId: string,
+  initialUsage: ResellerUsage,
+  requestId: number,
+) {
+  if (initialUsage.organizations.some((item) => item.id === organizationId)) {
+    return initialUsage
+  }
+
+  const totalPages = Math.min(
+    MAX_WORKSPACE_DISCOVERY_PAGES,
+    Math.max(1, Math.ceil(initialUsage.total / initialUsage.limit)),
+  )
+  for (let page = 1; page <= totalPages; page += 1) {
+    if (page === initialUsage.page) continue
+    const candidate = await fetchUsagePage(resellerId, page)
+    if (requestId !== detailRequestId || resellerId !== selectedId.value) return null
+    if (candidate.organizations.some((item) => item.id === organizationId)) {
+      return candidate
+    }
+  }
+  return initialUsage
+}
+
+async function loadSelected(options: { page?: number; requestedOrganizationId?: string } = {}) {
   if (!selectedId.value) {
+    detailRequestId += 1
     usage.value = null
+    usagePage.value = 1
     members.value = []
     selectedOrganizationId.value = ''
     organizationLicenses.value = {}
@@ -462,25 +524,66 @@ async function loadSelected() {
     organizationLicenseLoading.value = {}
     return
   }
+  const resellerId = selectedId.value
+  const requestId = ++detailRequestId
+  const requestedPage = Math.max(1, options.page ?? usagePage.value)
   detailLoading.value = true
   try {
-    const [usageResponse, memberResponse] = await Promise.all([
-      resellersService.usage(selectedId.value),
-      resellersService.members(selectedId.value),
+    const [initialUsage, memberResponse] = await Promise.all([
+      fetchUsagePage(resellerId, requestedPage),
+      resellersService.members(resellerId),
     ])
-    const nextUsage = unwrapItemResponse<ResellerUsage>(usageResponse)
+    if (requestId !== detailRequestId || resellerId !== selectedId.value) return
+
+    let nextUsage = initialUsage
+    const lastPage = Math.max(1, Math.ceil(nextUsage.total / nextUsage.limit))
+    if (nextUsage.total > 0 && !nextUsage.organizations.length && nextUsage.page > lastPage) {
+      nextUsage = await fetchUsagePage(resellerId, lastPage)
+    }
+    if (options.requestedOrganizationId) {
+      const locatedUsage = await findOrganizationUsagePage(
+        resellerId,
+        options.requestedOrganizationId,
+        nextUsage,
+        requestId,
+      )
+      if (!locatedUsage) return
+      nextUsage = locatedUsage
+    }
+    if (requestId !== detailRequestId || resellerId !== selectedId.value) return
+
     usage.value = nextUsage
+    usagePage.value = nextUsage.page
     members.value = unwrapListResponse<ResellerMember>(memberResponse, 'members',)
     hydrateBrandForm(selected.value)
-    await loadOrganizationLicenses(nextUsage.organizations)
+    if (
+      options.requestedOrganizationId &&
+      nextUsage.organizations.some((item) => item.id === options.requestedOrganizationId)
+    ) {
+      selectedOrganizationId.value = options.requestedOrganizationId
+    }
+    hydrateOrganizationLicenses(nextUsage.organizations)
   } catch (error) {
-    toast.error(getErrorMessage(error, 'Unable to load portfolio details'))
+    if (requestId === detailRequestId) {
+      toast.error(getErrorMessage(error, 'Unable to load portfolio details'))
+    }
   } finally {
-    detailLoading.value = false
+    if (requestId === detailRequestId) detailLoading.value = false
   }
 }
 
-watch(selectedId, loadSelected)
+async function changeUsagePage(page: number) {
+  if (detailLoading.value || page < 1 || page > usageTotalPages.value || page === usagePage.value) return
+  await loadSelected({ page })
+}
+
+watch(selectedId, () => {
+  usagePage.value = 1
+  void loadSelected({
+    page: 1,
+    requestedOrganizationId: requestedOrganizationId() || undefined,
+  })
+})
 watch(selectedOrganizationId, () => {
   organizationDeleteOpen.value = false
   hydrateLicenseForm()
@@ -549,14 +652,23 @@ async function createOrganization() {
   }
   organizationSubmitting.value = true
   try {
-    await organizationsService.create({
+    const response = await organizationsService.create({
       name: organizationName.value.trim(),
       reseller_id: selected.value.id,
     })
+    const createdOrganization = unwrapItemResponse<Organization>(response)
     organizationOpen.value = false
     organizationName.value = ''
     toast.success('Customer workspace provisioned')
-    await Promise.all([loadSelected(), loadResellers(selected.value.id)])
+    await loadResellers(selected.value.id, false)
+    await loadSelected({
+      page: 1,
+      requestedOrganizationId: createdOrganization.id,
+    })
+    await router.replace({
+      path: '/resellers',
+      query: { organization_id: createdOrganization.id },
+    })
   } catch (error) {
     toast.error(getErrorMessage(error, 'Unable to create customer workspace'))
   } finally {
@@ -586,7 +698,7 @@ async function deleteOrganization() {
     selectedOrganizationId.value = ''
     await loadSelected()
     await Promise.all([
-      loadResellers(resellerId),
+      loadResellers(resellerId, false),
       organizationsStore.fetchOrganizations(),
     ])
     await router.replace({
@@ -1009,6 +1121,47 @@ function formatNumber(value?: number) {
                       </tbody>
                     </table>
                   </div>
+                  <nav
+                    v-if="usage"
+                    data-testid="workspace-pagination"
+                    aria-label="Customer workspace pages"
+                    class="flex flex-col gap-3 border-t border-white/[0.07] px-6 py-3 light:border-gray-200 sm:flex-row sm:items-center sm:justify-between"
+                  >
+                    <p class="text-xs text-white/40 light:text-gray-600" aria-live="polite">
+                      Showing
+                      <span class="font-medium text-white/70 light:text-gray-800">
+                        {{ usageRange.start }}&ndash;{{ usageRange.end }}
+                      </span>
+                      of {{ usageRange.total }} workspaces
+                    </p>
+                    <div class="flex items-center gap-2">
+                      <span class="text-[11px] text-white/35 light:text-gray-500">
+                        Page {{ usagePage }} of {{ usageTotalPages }}
+                      </span>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        class="h-8 w-8"
+                        aria-label="Previous workspace page"
+                        :disabled="detailLoading || usagePage <= 1"
+                        @click="changeUsagePage(usagePage - 1)"
+                      >
+                        <ChevronLeft class="h-4 w-4" />
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        class="h-8 w-8"
+                        aria-label="Next workspace page"
+                        :disabled="detailLoading || usagePage >= usageTotalPages"
+                        @click="changeUsagePage(usagePage + 1)"
+                      >
+                        <ChevronRight class="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </nav>
                 </CardContent>
               </Card>
 

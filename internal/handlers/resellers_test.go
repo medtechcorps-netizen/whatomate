@@ -2,7 +2,9 @@ package handlers_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/handlers"
@@ -11,7 +13,268 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
+	"github.com/zerodha/fastglue"
 )
+
+type resellerUsageTestData struct {
+	ResellerID    uuid.UUID `json:"reseller_id"`
+	Organizations []struct {
+		handlers.OrganizationResponse
+		Subscription handlers.ProductSubscriptionResponse `json:"subscription"`
+	} `json:"organizations"`
+	Page              int   `json:"page"`
+	Limit             int   `json:"limit"`
+	Total             int64 `json:"total"`
+	OrganizationCount int64 `json:"organization_count"`
+	UserCount         int64 `json:"user_count"`
+	WhatsAppAccounts  int64 `json:"whatsapp_accounts"`
+	Contacts          int64 `json:"contacts"`
+	Messages          int64 `json:"messages"`
+}
+
+func parseResellerUsageTestData(
+	t *testing.T,
+	request *fastglue.Request,
+) resellerUsageTestData {
+	t.Helper()
+	var response struct {
+		Data resellerUsageTestData `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(request), &response))
+	return response.Data
+}
+
+func TestResellerUsageIncludesBulkOrganizationSubscriptions(t *testing.T) {
+	app := newTestApp(t)
+	baseOrganization := testutil.CreateTestOrganization(t, app.DB)
+	platformOwner := testutil.CreateTestUser(
+		t,
+		app.DB,
+		baseOrganization.ID,
+		testutil.WithSuperAdmin(),
+	)
+	reseller := testutil.CreateTestReseller(t, app.DB)
+	licensedOrganization := testutil.CreateTestOrganizationForReseller(t, app.DB, reseller.ID)
+	unlicensedOrganization := testutil.CreateTestOrganizationForReseller(t, app.DB, reseller.ID)
+	require.NoError(t, app.DB.Model(unlicensedOrganization).Updates(map[string]any{
+		"name": "A Unlicensed Workspace",
+		"slug": "a-unlicensed-" + uuid.NewString()[:8],
+	}).Error)
+	require.NoError(t, app.DB.Model(licensedOrganization).Updates(map[string]any{
+		"name": "B Licensed Workspace",
+		"slug": "b-licensed-" + uuid.NewString()[:8],
+	}).Error)
+	plan := createCatalogPlan(
+		t,
+		app,
+		&reseller.ID,
+		"portfolio-growth-"+uuid.NewString()[:8],
+		"Portfolio Growth",
+		models.CommercialPlanStatusActive,
+	)
+	billingAccount := models.BillingAccount{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  licensedOrganization.ID,
+		ResellerID:      &reseller.ID,
+		Provider:        models.BillingProviderManual,
+		Status:          models.BillingAccountStatusActive,
+		DefaultCurrency: "MYR",
+		BillingProfile:  models.JSONB{},
+		ProviderData:    models.JSONB{},
+		Metadata:        models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(&billingAccount).Error)
+	now := time.Now().UTC()
+	periodEnd := now.AddDate(0, 1, 0)
+	subscription := models.Subscription{
+		BaseModel:            models.BaseModel{ID: uuid.New()},
+		OrganizationID:       licensedOrganization.ID,
+		BillingAccountID:     billingAccount.ID,
+		PlanID:               plan.ID,
+		Provider:             models.BillingProviderManual,
+		Status:               models.SubscriptionStatusActive,
+		Quantity:             1,
+		CollectionMethod:     "manual",
+		EntitlementsSnapshot: models.JSONB{"crm.enabled": true},
+		ProviderData:         models.JSONB{},
+		CurrentPeriodStart:   &now,
+		CurrentPeriodEnd:     &periodEnd,
+		CreatedByID:          &platformOwner.ID,
+	}
+	require.NoError(t, app.DB.Create(&subscription).Error)
+
+	loadPage := func(page string) resellerUsageTestData {
+		t.Helper()
+		request := testutil.NewGETRequest(t)
+		testutil.SetFullAuthContext(
+			request,
+			baseOrganization.ID,
+			platformOwner.ID,
+			platformOwner.RoleID,
+			true,
+		)
+		testutil.SetPathParam(request, "id", reseller.ID.String())
+		testutil.SetQueryParam(request, "page", page)
+		testutil.SetQueryParam(request, "limit", "1")
+		require.NoError(t, app.GetResellerUsage(request))
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+		return parseResellerUsageTestData(t, request)
+	}
+
+	unlicensedPage := loadPage("1")
+	require.Equal(t, 1, unlicensedPage.Page)
+	require.Equal(t, 1, unlicensedPage.Limit)
+	require.EqualValues(t, 2, unlicensedPage.Total)
+	require.EqualValues(t, 2, unlicensedPage.OrganizationCount)
+	require.Len(t, unlicensedPage.Organizations, 1)
+	assert.Equal(t, unlicensedOrganization.ID, unlicensedPage.Organizations[0].ID)
+	assert.Equal(t, "unlicensed", unlicensedPage.Organizations[0].Subscription.Status)
+
+	licensedPage := loadPage("2")
+	require.Equal(t, 2, licensedPage.Page)
+	require.Equal(t, 1, licensedPage.Limit)
+	require.EqualValues(t, 2, licensedPage.Total)
+	require.EqualValues(t, 2, licensedPage.OrganizationCount)
+	require.Len(t, licensedPage.Organizations, 1)
+	assert.Equal(t, licensedOrganization.ID, licensedPage.Organizations[0].ID)
+	require.NotNil(t, licensedPage.Organizations[0].Subscription.PlanID)
+	assert.Equal(t, plan.ID, *licensedPage.Organizations[0].Subscription.PlanID)
+	assert.Equal(t, "Portfolio Growth", licensedPage.Organizations[0].Subscription.PlanName)
+}
+
+func TestResellerUsagePaginatesOrganizationsButKeepsPortfolioTotals(t *testing.T) {
+	app := newTestApp(t)
+	baseOrganization := testutil.CreateTestOrganization(t, app.DB)
+	platformOwner := testutil.CreateTestUser(
+		t,
+		app.DB,
+		baseOrganization.ID,
+		testutil.WithSuperAdmin(),
+	)
+	reseller := testutil.CreateTestReseller(t, app.DB)
+	organizations := make([]*models.Organization, 0, 51)
+	for index := 0; index < 51; index++ {
+		organization := testutil.CreateTestOrganizationForReseller(t, app.DB, reseller.ID)
+		name := fmt.Sprintf("Customer Workspace %03d", index)
+		slug := fmt.Sprintf("customer-workspace-%03d-%s", index, uuid.NewString()[:8])
+		require.NoError(t, app.DB.Model(organization).Updates(map[string]any{
+			"name": name,
+			"slug": slug,
+		}).Error)
+		organization.Name = name
+		organization.Slug = slug
+		organizations = append(organizations, organization)
+	}
+
+	testutil.CreateTestWhatsAppAccount(t, app.DB, organizations[0].ID)
+	firstContact := testutil.CreateTestContact(t, app.DB, organizations[0].ID)
+	for index := 0; index < 2; index++ {
+		createTestMessage(
+			t,
+			app,
+			organizations[0].ID,
+			firstContact.ID,
+			models.DirectionIncoming,
+			time.Now().UTC(),
+		)
+	}
+	testutil.CreateTestUser(t, app.DB, organizations[0].ID)
+
+	for index := 0; index < 2; index++ {
+		testutil.CreateTestWhatsAppAccount(t, app.DB, organizations[50].ID)
+	}
+	lastContacts := []*models.Contact{
+		testutil.CreateTestContact(t, app.DB, organizations[50].ID),
+		testutil.CreateTestContact(t, app.DB, organizations[50].ID),
+	}
+	for index := 0; index < 3; index++ {
+		createTestMessage(
+			t,
+			app,
+			organizations[50].ID,
+			lastContacts[index%len(lastContacts)].ID,
+			models.DirectionIncoming,
+			time.Now().UTC(),
+		)
+	}
+	testutil.CreateTestUser(t, app.DB, organizations[50].ID)
+
+	// A neighboring reseller has data too; none of it may enter this portfolio's
+	// organization list or aggregate counters.
+	otherReseller := testutil.CreateTestReseller(t, app.DB)
+	otherOrganization := testutil.CreateTestOrganizationForReseller(
+		t,
+		app.DB,
+		otherReseller.ID,
+	)
+	testutil.CreateTestWhatsAppAccount(t, app.DB, otherOrganization.ID)
+	otherContact := testutil.CreateTestContact(t, app.DB, otherOrganization.ID)
+	createTestMessage(
+		t,
+		app,
+		otherOrganization.ID,
+		otherContact.ID,
+		models.DirectionIncoming,
+		time.Now().UTC(),
+	)
+	testutil.CreateTestUser(t, app.DB, otherOrganization.ID)
+
+	loadUsage := func(query map[string]string) resellerUsageTestData {
+		t.Helper()
+		request := testutil.NewGETRequest(t)
+		testutil.SetFullAuthContext(
+			request,
+			baseOrganization.ID,
+			platformOwner.ID,
+			platformOwner.RoleID,
+			true,
+		)
+		testutil.SetPathParam(request, "id", reseller.ID.String())
+		for key, value := range query {
+			testutil.SetQueryParam(request, key, value)
+		}
+		require.NoError(t, app.GetResellerUsage(request))
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+		return parseResellerUsageTestData(t, request)
+	}
+	assertPortfolioTotals := func(usage resellerUsageTestData) {
+		t.Helper()
+		assert.Equal(t, reseller.ID, usage.ResellerID)
+		assert.EqualValues(t, 51, usage.Total)
+		assert.EqualValues(t, 51, usage.OrganizationCount)
+		assert.EqualValues(t, 2, usage.UserCount)
+		assert.EqualValues(t, 3, usage.WhatsAppAccounts)
+		assert.EqualValues(t, 3, usage.Contacts)
+		assert.EqualValues(t, 5, usage.Messages)
+	}
+
+	defaultPage := loadUsage(nil)
+	assertPortfolioTotals(defaultPage)
+	assert.Equal(t, 1, defaultPage.Page)
+	assert.Equal(t, 50, defaultPage.Limit)
+	require.Len(t, defaultPage.Organizations, 50)
+	assert.Equal(t, organizations[0].ID, defaultPage.Organizations[0].ID)
+	assert.Equal(t, organizations[49].ID, defaultPage.Organizations[49].ID)
+
+	secondPage := loadUsage(map[string]string{"page": "2", "limit": "50"})
+	assertPortfolioTotals(secondPage)
+	assert.Equal(t, 2, secondPage.Page)
+	assert.Equal(t, 50, secondPage.Limit)
+	require.Len(t, secondPage.Organizations, 1)
+	assert.Equal(t, organizations[50].ID, secondPage.Organizations[0].ID)
+
+	maximumLimitEmptyPage := loadUsage(map[string]string{"page": "99", "limit": "100"})
+	assertPortfolioTotals(maximumLimitEmptyPage)
+	assert.Equal(t, 99, maximumLimitEmptyPage.Page)
+	assert.Equal(t, 100, maximumLimitEmptyPage.Limit)
+	assert.Empty(t, maximumLimitEmptyPage.Organizations)
+
+	invalidBounds := loadUsage(map[string]string{"page": "0", "limit": "101"})
+	assertPortfolioTotals(invalidBounds)
+	assert.Equal(t, 1, invalidBounds.Page)
+	assert.Equal(t, 50, invalidBounds.Limit)
+	require.Len(t, invalidBounds.Organizations, 50)
+}
 
 func createResellerAdminRole(t *testing.T, app *handlers.App, orgID uuid.UUID) *models.CustomRole {
 	t.Helper()
@@ -83,6 +346,12 @@ func TestResellerPortfolioIsolationAndRevocation(t *testing.T) {
 	testutil.SetPathParam(getOtherRequest, "id", resellerB.ID.String())
 	require.NoError(t, app.GetReseller(getOtherRequest))
 	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(getOtherRequest))
+
+	otherUsageRequest := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(otherUsageRequest, orgA.ID, userA.ID)
+	testutil.SetPathParam(otherUsageRequest, "id", resellerB.ID.String())
+	require.NoError(t, app.GetResellerUsage(otherUsageRequest))
+	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(otherUsageRequest))
 
 	listOrganizationsRequest := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(listOrganizationsRequest, orgA.ID, userA.ID)

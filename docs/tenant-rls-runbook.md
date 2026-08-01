@@ -19,11 +19,14 @@ and the staging isolation checks below pass.
 - Server and worker startup fail closed if the configured runtime connection
   is the owner, a superuser, has `BYPASSRLS`, or is missing a policy.
 
-Identity/control-plane tables and the long-lived WhatsApp Calling subsystem
-retain their existing application-level organization checks in this first
-phase. The RLS policy set covers contacts, messages, WhatsApp accounts,
-templates, campaigns, chatbot data, transfers, audit logs, catalogs,
-conversation notes, webhooks, tags, and dashboard data.
+Identity/control-plane tables retain their existing application-level
+organization checks because they participate in authentication and tenant
+selection. The RLS policy set covers contacts, messages, WhatsApp accounts,
+templates, campaigns, chatbot data, WhatsApp call logs, call permissions,
+call transfers, IVR flows, audit logs, catalogs, conversation notes, webhooks,
+tags, and dashboard data. The in-memory WebRTC manager does not hold a database
+transaction for the lifetime of a call: each asynchronous database operation
+uses a short transaction with transaction-local tenant context.
 
 ## Required secrets and variables
 
@@ -73,7 +76,11 @@ between clients.
 
    Do not include `-migrate`.
 
-4. Before starting the new service revision, run:
+4. Drain active WhatsApp calls and stop every old web revision before applying
+   this policy set. Older WebRTC managers do not establish transaction-local
+   tenant context, so they cannot safely run after calling-table RLS is enabled.
+
+5. Before starting the new service revision, run:
 
    ```text
    ./rereply rls-migrate -config config.toml
@@ -85,21 +92,21 @@ between clients.
    an old resolver body causes startup to fail closed instead of silently
    leaving new queue states undiscoverable.
 
-5. Start the service and confirm the log contains:
+6. Start the service and confirm the log contains:
 
    ```text
    PostgreSQL tenant RLS verified
    ```
 
-6. Start a worker revision with the same restricted runtime URL and confirm
+7. Start a worker revision with the same restricted runtime URL and confirm
    the same verification log.
-7. Run the automated isolation test:
+8. Run the automated isolation test:
 
    ```bash
    go test -v ./internal/database -run '^TestTenantRLS_'
    ```
 
-8. Create two disposable staging organizations and verify:
+9. Create two disposable staging organizations and verify:
 
    - Organization A cannot list, open, update, or delete Organization B's
      contacts or messages.
@@ -109,9 +116,11 @@ between clients.
    - A template status webhook updates only accounts belonging to its WABA.
    - A campaign worker creates messages and contacts only in the job's
      organization.
+   - Calling and IVR operations cannot read, insert, update, or delete another
+     organization's call logs, call permissions, call transfers, or IVR flows.
    - Logging out and back in does not retain a previous organization context.
 
-9. Observe database errors, HTTP 5xx rate, webhook failures, queue depth, and
+10. Observe database errors, HTTP 5xx rate, webhook failures, queue depth, and
    PostgreSQL connection usage for at least one normal business cycle.
 
 ## Production rollout

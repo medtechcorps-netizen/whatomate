@@ -74,7 +74,7 @@ func (a *App) InitiateOutgoingCall(r *fastglue.Request) error {
 
 // HangupOutgoingCall handles POST /api/calls/outgoing/{id}/hangup
 func (a *App) HangupOutgoingCall(r *fastglue.Request) error {
-	_, userID, err := a.requireAuth(r, models.ResourceOutgoingCalls, models.ActionWrite)
+	orgID, userID, err := a.requireAuth(r, models.ResourceOutgoingCalls, models.ActionWrite)
 	if err != nil {
 		return nil
 	}
@@ -86,6 +86,15 @@ func (a *App) HangupOutgoingCall(r *fastglue.Request) error {
 
 	if a.CallManager == nil {
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Calling is not enabled", nil, "")
+	}
+
+	// The WebRTC session map is process-local and is not protected by database
+	// RLS. Verify ownership through the tenant transaction before terminating a
+	// session selected by caller-supplied UUID.
+	var callLog models.CallLog
+	if err := a.DB.Select("id").Where("id = ? AND organization_id = ?", callLogID, orgID).
+		First(&callLog).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Call log not found", nil, "")
 	}
 
 	if err := a.CallManager.HangupOutgoingCall(callLogID, userID); err != nil {

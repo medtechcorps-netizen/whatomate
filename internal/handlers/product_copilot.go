@@ -55,6 +55,10 @@ type copilotRunResponse struct {
 	ExpiresAt        *time.Time              `json:"expires_at,omitempty"`
 }
 
+func copilotRunExpired(run *models.CopilotRun, now time.Time) bool {
+	return run != nil && run.ExpiresAt != nil && !run.ExpiresAt.After(now)
+}
+
 // RunContactCopilot invokes Qwen for one human-requested, grounded CRM task.
 // It deliberately never sends a message; the returned draft must be reviewed
 // and sent through an explicit messaging action.
@@ -174,10 +178,19 @@ func (a *App) RunContactCopilot(r *fastglue.Request) error {
 	userPrompt := buildCopilotTaskPrompt(task, request)
 	inputDigest := sha256.Sum256([]byte(string(task) + "\x00" + userPrompt + "\x00" + contextText))
 	inputHash := hex.EncodeToString(inputDigest[:])
+	now := time.Now().UTC()
 	var existing models.CopilotRun
 	if err := a.DB.
 		Where("organization_id = ? AND idempotency_key = ?", orgID, idempotencyKey).
 		First(&existing).Error; err == nil {
+		if copilotRunExpired(&existing, now) {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusGone,
+				"Copilot run has expired; retry with a new idempotency key",
+				nil,
+				"",
+			)
+		}
 		if existing.ContactID != contactID ||
 			existing.TaskType != task ||
 			existing.InputHash != inputHash {
@@ -193,7 +206,6 @@ func (a *App) RunContactCopilot(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to start Copilot", nil, "")
 	}
 
-	now := time.Now().UTC()
 	retentionDays := settings.retentionDays
 	expiresAt := now.Add(time.Duration(retentionDays) * 24 * time.Hour)
 	run := models.CopilotRun{
@@ -221,6 +233,14 @@ func (a *App) RunContactCopilot(r *fastglue.Request) error {
 			if lookupErr := a.DB.
 				Where("organization_id = ? AND idempotency_key = ?", orgID, idempotencyKey).
 				First(&existing).Error; lookupErr == nil {
+				if copilotRunExpired(&existing, time.Now().UTC()) {
+					return r.SendErrorEnvelope(
+						fasthttp.StatusGone,
+						"Copilot run has expired; retry with a new idempotency key",
+						nil,
+						"",
+					)
+				}
 				if existing.ContactID != contactID ||
 					existing.TaskType != task ||
 					existing.InputHash != inputHash {
@@ -300,7 +320,8 @@ func (a *App) ListCopilotRuns(r *fastglue.Request) error {
 		return nil
 	}
 	pg := parsePagination(r)
-	query := a.DB.Model(&models.CopilotRun{}).Where("organization_id = ?", orgID)
+	query := a.DB.Model(&models.CopilotRun{}).
+		Where("organization_id = ? AND (expires_at IS NULL OR expires_at > ?)", orgID, time.Now().UTC())
 	if raw := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("contact_id"))); raw != "" {
 		contactID, parseErr := uuid.Parse(raw)
 		if parseErr != nil {
@@ -363,7 +384,14 @@ func (a *App) CreateCopilotFeedback(r *fastglue.Request) error {
 	}
 
 	var run models.CopilotRun
-	if err := a.DB.Where("id = ? AND organization_id = ?", runID, orgID).First(&run).Error; err != nil {
+	if err := a.DB.
+		Where(
+			"id = ? AND organization_id = ? AND (expires_at IS NULL OR expires_at > ?)",
+			runID,
+			orgID,
+			time.Now().UTC(),
+		).
+		First(&run).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Copilot run not found", nil, "")
 	}
 	if request.FinalMessageID != nil {

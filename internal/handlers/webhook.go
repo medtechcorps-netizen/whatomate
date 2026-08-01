@@ -254,7 +254,7 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 						"call_id", status.ID,
 						"status", status.Status,
 					)
-					a.processCallStatusWebhook(status)
+					a.processCallStatusWebhook(phoneNumberID, status)
 				}
 				continue
 			}

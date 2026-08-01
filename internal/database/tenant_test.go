@@ -320,6 +320,94 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	require.NoError(t, adminDB.Create(&stepA).Error)
 	require.NoError(t, adminDB.Create(&stepB).Error)
 
+	ivrA := models.IVRFlow{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgA.ID,
+		WhatsAppAccount: accountA.Name,
+		Name:            "Alpha call start",
+		IsActive:        true,
+		Menu:            models.JSONB{"version": 2, "nodes": []any{}},
+	}
+	ivrB := models.IVRFlow{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgB.ID,
+		WhatsAppAccount: accountB.Name,
+		Name:            "Beta call start",
+		IsActive:        true,
+		Menu:            models.JSONB{"version": 2, "nodes": []any{}},
+	}
+	require.NoError(t, adminDB.Create(&ivrA).Error)
+	require.NoError(t, adminDB.Create(&ivrB).Error)
+
+	callLogA := models.CallLog{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgA.ID,
+		WhatsAppAccount: accountA.Name,
+		ContactID:       contactA.ID,
+		WhatsAppCallID:  "rls-call-alpha-" + uuid.NewString(),
+		CallerPhone:     contactA.PhoneNumber,
+		Direction:       models.CallDirectionIncoming,
+		Status:          models.CallStatusRinging,
+		IVRFlowID:       &ivrA.ID,
+	}
+	callLogB := models.CallLog{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgB.ID,
+		WhatsAppAccount: accountB.Name,
+		ContactID:       contactB.ID,
+		WhatsAppCallID:  "rls-call-beta-" + uuid.NewString(),
+		CallerPhone:     contactB.PhoneNumber,
+		Direction:       models.CallDirectionIncoming,
+		Status:          models.CallStatusRinging,
+		IVRFlowID:       &ivrB.ID,
+	}
+	require.NoError(t, adminDB.Create(&callLogA).Error)
+	require.NoError(t, adminDB.Create(&callLogB).Error)
+
+	permissionA := models.CallPermission{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgA.ID,
+		ContactID:       contactA.ID,
+		WhatsAppAccount: accountA.Name,
+		Status:          models.CallPermissionPending,
+		MessageID:       "permission-alpha-" + uuid.NewString(),
+	}
+	permissionB := models.CallPermission{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgB.ID,
+		ContactID:       contactB.ID,
+		WhatsAppAccount: accountB.Name,
+		Status:          models.CallPermissionPending,
+		MessageID:       "permission-beta-" + uuid.NewString(),
+	}
+	require.NoError(t, adminDB.Create(&permissionA).Error)
+	require.NoError(t, adminDB.Create(&permissionB).Error)
+
+	transferA := models.CallTransfer{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgA.ID,
+		CallLogID:       callLogA.ID,
+		WhatsAppCallID:  callLogA.WhatsAppCallID,
+		CallerPhone:     contactA.PhoneNumber,
+		ContactID:       contactA.ID,
+		WhatsAppAccount: accountA.Name,
+		Status:          models.CallTransferStatusWaiting,
+		TransferredAt:   time.Now().UTC(),
+	}
+	transferB := models.CallTransfer{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  orgB.ID,
+		CallLogID:       callLogB.ID,
+		WhatsAppCallID:  callLogB.WhatsAppCallID,
+		CallerPhone:     contactB.PhoneNumber,
+		ContactID:       contactB.ID,
+		WhatsAppAccount: accountB.Name,
+		Status:          models.CallTransferStatusWaiting,
+		TransferredAt:   time.Now().UTC(),
+	}
+	require.NoError(t, adminDB.Create(&transferA).Error)
+	require.NoError(t, adminDB.Create(&transferB).Error)
+
 	require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
 
 	asRuntime := func(fn func(*gorm.DB) error) error {
@@ -409,6 +497,149 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 			}
 			return nil
 		}))
+	})
+
+	t.Run("calling and IVR reads only return the active clinic", func(t *testing.T) {
+		require.NoError(t, asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+			checks := []struct {
+				name  string
+				model any
+				want  uuid.UUID
+			}{
+				{name: "call_logs", model: &models.CallLog{}, want: callLogA.ID},
+				{name: "call_permissions", model: &models.CallPermission{}, want: permissionA.ID},
+				{name: "call_transfers", model: &models.CallTransfer{}, want: transferA.ID},
+				{name: "ivr_flows", model: &models.IVRFlow{}, want: ivrA.ID},
+			}
+			for _, check := range checks {
+				var ids []uuid.UUID
+				if err := tenantDB.Model(check.model).Order("id").Pluck("id", &ids).Error; err != nil {
+					return fmt.Errorf("read %s: %w", check.name, err)
+				}
+				if len(ids) != 1 || ids[0] != check.want {
+					return fmt.Errorf("%s exposed IDs %v, expected only %s", check.name, ids, check.want)
+				}
+			}
+			return nil
+		}))
+	})
+
+	t.Run("calling and IVR tables fail closed without tenant context", func(t *testing.T) {
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			for name, model := range map[string]any{
+				"call_logs":        &models.CallLog{},
+				"call_permissions": &models.CallPermission{},
+				"call_transfers":   &models.CallTransfer{},
+				"ivr_flows":        &models.IVRFlow{},
+			} {
+				var count int64
+				if err := runtimeDB.Model(model).Count(&count).Error; err != nil {
+					return fmt.Errorf("count %s: %w", name, err)
+				}
+				if count != 0 {
+					return fmt.Errorf("unscoped %s query exposed %d rows", name, count)
+				}
+			}
+			return nil
+		}))
+	})
+
+	t.Run("calling and IVR cross-clinic mutations are rejected", func(t *testing.T) {
+		type mutationCheck struct {
+			name        string
+			model       any
+			ownID       uuid.UUID
+			foreignID   uuid.UUID
+			updateField string
+			updateValue any
+			forbidden   func() any
+		}
+		checks := []mutationCheck{
+			{
+				name: "call_logs", model: &models.CallLog{}, ownID: callLogA.ID, foreignID: callLogB.ID,
+				updateField: "error_message", updateValue: "must remain beta-only",
+				forbidden: func() any {
+					return &models.CallLog{
+						BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgB.ID,
+						WhatsAppAccount: accountB.Name, ContactID: contactB.ID,
+						WhatsAppCallID: "forbidden-call-" + uuid.NewString(), CallerPhone: contactB.PhoneNumber,
+						Direction: models.CallDirectionIncoming, Status: models.CallStatusRinging,
+					}
+				},
+			},
+			{
+				name: "call_permissions", model: &models.CallPermission{}, ownID: permissionA.ID, foreignID: permissionB.ID,
+				updateField: "message_id", updateValue: "must-remain-beta-only",
+				forbidden: func() any {
+					return &models.CallPermission{
+						BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgB.ID,
+						ContactID: contactB.ID, WhatsAppAccount: accountB.Name,
+						Status: models.CallPermissionPending, MessageID: "forbidden-permission-" + uuid.NewString(),
+					}
+				},
+			},
+			{
+				name: "call_transfers", model: &models.CallTransfer{}, ownID: transferA.ID, foreignID: transferB.ID,
+				updateField: "hold_duration", updateValue: 99,
+				forbidden: func() any {
+					return &models.CallTransfer{
+						BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgB.ID,
+						CallLogID: callLogB.ID, WhatsAppCallID: callLogB.WhatsAppCallID,
+						CallerPhone: contactB.PhoneNumber, ContactID: contactB.ID,
+						WhatsAppAccount: accountB.Name, Status: models.CallTransferStatusWaiting,
+						TransferredAt: time.Now().UTC(),
+					}
+				},
+			},
+			{
+				name: "ivr_flows", model: &models.IVRFlow{}, ownID: ivrA.ID, foreignID: ivrB.ID,
+				updateField: "description", updateValue: "must remain beta-only",
+				forbidden: func() any {
+					return &models.IVRFlow{
+						BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgB.ID,
+						WhatsAppAccount: accountB.Name, Name: "Forbidden Beta IVR",
+						IsActive: false, Menu: models.JSONB{"version": 2, "nodes": []any{}},
+					}
+				},
+			},
+		}
+
+		for _, check := range checks {
+			check := check
+			t.Run(check.name, func(t *testing.T) {
+				insertErr := asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+					return tenantDB.Create(check.forbidden()).Error
+				})
+				require.Error(t, insertErr)
+				require.Contains(t, insertErr.Error(), "row-level security")
+
+				moveErr := asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+					return tenantDB.Model(check.model).
+						Where("id = ?", check.ownID).
+						Update("organization_id", orgB.ID).Error
+				})
+				require.Error(t, moveErr)
+				require.Contains(t, moveErr.Error(), "row-level security")
+
+				var updatedRows int64
+				require.NoError(t, asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+					result := tenantDB.Model(check.model).
+						Where("id = ?", check.foreignID).
+						Update(check.updateField, check.updateValue)
+					updatedRows = result.RowsAffected
+					return result.Error
+				}))
+				require.Zero(t, updatedRows)
+
+				var deletedRows int64
+				require.NoError(t, asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+					result := tenantDB.Unscoped().Delete(check.model, "id = ?", check.foreignID)
+					deletedRows = result.RowsAffected
+					return result.Error
+				}))
+				require.Zero(t, deletedRows)
+			})
+		}
 	})
 
 	t.Run("explicit lookup of another clinic is invisible", func(t *testing.T) {

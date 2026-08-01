@@ -114,16 +114,24 @@ After assignment, sign in as a normal tenant administrator and verify
 expired, canceled, paused, incomplete, missing, or past-due subscription
 outside an explicit unexpired grace window must not unlock a feature.
 
-### Partner portfolio performance follow-up
+### Partner portfolio performance
 
-The Partner Console currently obtains each organization's safe subscription
-summary from the target-scoped admin endpoint, so a portfolio refresh performs
-one subscription request per organization. Do not fold tenant subscription
-rows into the existing reseller usage query without an explicit control-plane
-authorization and RLS review. A future bounded, paginated bulk license-summary
-endpoint should replace this request pattern before very large portfolios are
-supported; track portfolio request count and latency until that endpoint is
-available.
+`GET /api/resellers/{id}/usage` returns each authorized organization's safe
+subscription summary as a bounded page. `page` defaults to 1, `limit` defaults
+to 50 and is capped at 100, and ordering is stable by organization name and ID.
+The response includes `page`, `limit`, and `total`; `organization_count` and the
+user, account, contact, and message totals continue to describe the full
+authorized portfolio. Subscription summaries are resolved only for the
+organizations returned on the current page, inside each organization's tenant
+context. The Partner Console consumes those summaries directly, exposes
+accessible page controls, and performs bounded page discovery for a deep-linked
+workspace. It must not reintroduce one browser request per organization.
+
+Aggregate usage still requires one RLS-scoped database statement per tenant.
+That preserves isolation but leaves aggregate latency proportional to portfolio
+size. Load-test the endpoint at the approved reseller ceiling and introduce
+tenant-maintained snapshots or rollups before supporting portfolios where that
+cost exceeds the latency budget.
 
 ## Privacy and support
 
@@ -131,13 +139,15 @@ Retention policies are tenant-configurable by data category. Consent is stored
 as an append-only event stream with a current state projection. Data-subject
 requests have a verified, audited status workflow.
 
-In this release, retention policies are a registry and operating schedule, not
-an automated deletion or anonymization engine. Access, portability, correction,
+General retention policies are still a registry and operating schedule, not a
+complete deletion or anonymization engine. Access, portability, correction,
 restriction, and erasure fulfillment is performed through an approved external
 or manual process. Record the evidence in the request resolution before marking
-the request complete. Do not represent a configured retention period as proof
-that customer data has been purged; add a reviewed execution worker and
-deletion-evidence records before making that claim.
+the request complete. Copilot artifacts are the exception: their dedicated
+tenant-scoped processor permanently removes expired runs and linked feedback.
+Do not represent any other configured retention period as proof that customer
+data has been purged until that resource has a reviewed execution worker and
+deletion-evidence records.
 
 Support cases do not grant tenant access. Temporary support access requires a
 separate, time-limited grant. Recovery checkpoints describe known restore
@@ -149,6 +159,40 @@ Lead stage changes, follow-up tasks, bookings, credit consumption, invoices,
 and payment state changes use optimistic versions or database locks where
 concurrent updates could lose data. Invoice totals are calculated by the
 server in minor currency units.
+
+Lead archival is an explicit reversible lifecycle transition, not a delete or
+an arbitrary status edit. `PUT /api/crm/leads/{id}/archive` and
+`PUT /api/crm/leads/{id}/reopen` require the version the operator reviewed and
+may carry a reason plus an idempotency key. Archive/reopen commits the lead,
+customer activity, webhook outbox event, and audit record together. Archived
+leads cannot be edited or moved until reopened; reopen derives the status from
+the current stage and preserves historical won/lost timestamps. The active
+board requests `include_archived=false`, while its archived view requests the
+explicit `archived` status and exposes the reversible action.
+
+Recurring availability and time off are tenant-scoped booking settings under
+`/api/booking/resources/{resource_id}/availability-rules` and
+`/api/booking/resources/{resource_id}/time-off`. Mutations are versioned and
+audited. Active weekly windows use the booking resource's validated IANA
+timezone, optional effective dates are inclusive resource-local calendar
+dates, and overlapping active windows are rejected. Once any active rule
+exists for a resource, a scheduled event must fit wholly inside one effective
+window. Multi-day, overnight, nonexistent, ambiguous, or DST-offset-crossing
+wall-clock schedules are rejected rather than guessed. Ambiguity checks derive
+candidates from the IANA zone's actual nearby offsets, including fractional and
+historical multi-hour rollbacks. A resource with no active rules remains
+unrestricted for backward compatibility.
+
+Time-off ranges are absolute instants. They cannot overlap another time-off
+range or an existing non-cancelled event, and event create/update continues to
+enforce time off independently of whether recurring hours are configured.
+
+The chatbot flow palette exposes the backend-supported `set_variable` and
+`ai_response` nodes. Variable assignments are typed and validated; duplicate
+or empty names block saving. AI response nodes store the canonical optional
+`prompt_template` field, fall back to the workspace AI configuration, and show
+only a non-executing rendered preview in the builder. This chatbot graph is
+separate from the task-first CRM Automation Studio authority boundary.
 
 Package credits use an append-only ledger. Correct a credit error with a new
 ledger entry rather than editing historical entries.
@@ -165,9 +209,11 @@ Copilot is human-in-the-loop:
 A user must review and perform the downstream action. Feedback may link a
 separately sent message to the Copilot run for audit purposes.
 
-`expires_at` on a Copilot run is the operator's purge deadline in this release;
-it does not itself delete the record. Schedule and evidence a tenant-scoped
-purge job before representing Copilot retention as automatic.
+`expires_at` is enforced at both access and storage boundaries. Expired runs
+are excluded from history, cannot accept feedback or be replayed through an
+idempotency key, and are permanently removed with linked feedback by the
+tenant-scoped Copilot retention processor. The processor runs immediately at
+startup and hourly thereafter in bounded, idempotent batches.
 
 The DashScope API key is encrypted at rest with the application encryption key.
 Rotate any key that has appeared in chat, logs, screenshots, or support

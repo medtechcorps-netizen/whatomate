@@ -75,6 +75,22 @@ func (a *App) processCallWebhook(phoneNumberID string, call any) {
 	// Check if this call_id belongs to an existing outgoing session
 	if a.CallManager != nil {
 		session := a.CallManager.GetSession(ce.ID)
+		if session != nil {
+			requestOrgID, accountErr := a.resolveCallWebhookOrganizationID(phoneNumberID)
+			if accountErr != nil {
+				a.Log.Warn("Rejected call webhook with unresolved tenant",
+					"call_id", ce.ID, "phone_id", phoneNumberID, "error", accountErr)
+				return
+			}
+			if session.OrganizationID != requestOrgID {
+				a.Log.Warn("Rejected call webhook session from another tenant",
+					"call_id", ce.ID,
+					"session_organization_id", session.OrganizationID,
+					"request_organization_id", requestOrgID,
+				)
+				return
+			}
+		}
 		if session != nil && session.Direction == models.CallDirectionOutgoing {
 			sdp := ""
 			if ce.Session != nil {
@@ -88,7 +104,13 @@ func (a *App) processCallWebhook(phoneNumberID string, call any) {
 	// Handle business-initiated events when session is already cleaned up
 	// (e.g., terminate webhook arrives after PeerConnection closed)
 	if ce.Direction == "BUSINESS_INITIATED" {
-		a.handleOrphanedOutgoingCallEvent(ce.ID, ce.Event, ce.Duration)
+		requestOrgID, accountErr := a.resolveCallWebhookOrganizationID(phoneNumberID)
+		if accountErr != nil {
+			a.Log.Warn("Rejected orphaned outgoing call webhook with unresolved tenant",
+				"call_id", ce.ID, "phone_id", phoneNumberID, "error", accountErr)
+			return
+		}
+		a.handleOrphanedOutgoingCallEvent(requestOrgID, ce.ID, ce.Event, ce.Duration)
 		return
 	}
 
@@ -286,6 +308,21 @@ func (a *App) processCallWebhook(phoneNumberID string, call any) {
 	}
 }
 
+// resolveCallWebhookOrganizationID returns the tenant established by the RLS
+// wrapper, or resolves it from the webhook phone number when RLS is disabled.
+// Call IDs are not tenant credentials and must never be used on their own to
+// authorize an in-memory session or database record mutation.
+func (a *App) resolveCallWebhookOrganizationID(phoneNumberID string) (uuid.UUID, error) {
+	if a.tenantOrgID != uuid.Nil {
+		return a.tenantOrgID, nil
+	}
+	account, err := a.getWhatsAppAccountCached(phoneNumberID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return account.OrganizationID, nil
+}
+
 // getOrCreateCallLog finds an existing CallLog by WhatsApp call ID, or creates one
 // if it doesn't exist. This handles cases where WhatsApp skips the "ringing" event
 // and sends "connect" as the first event.
@@ -326,10 +363,16 @@ func (a *App) getOrCreateCallLog(account *models.WhatsAppAccount, contact *model
 // handleOrphanedOutgoingCallEvent handles business-initiated call webhooks
 // when the session has already been cleaned up (e.g., terminate arrives after
 // PeerConnection closed). Updates the call log and broadcasts WebSocket events.
-func (a *App) handleOrphanedOutgoingCallEvent(callID, event string, duration int) {
+func (a *App) handleOrphanedOutgoingCallEvent(organizationID uuid.UUID, callID, event string, duration int) {
+	if organizationID == uuid.Nil {
+		a.Log.Warn("Rejected orphaned outgoing call event without tenant", "call_id", callID, "event", event)
+		return
+	}
+
 	// Find the call log by WhatsApp call ID
 	var callLog models.CallLog
-	if err := a.DB.Where("whatsapp_call_id = ?", callID).First(&callLog).Error; err != nil {
+	if err := a.DB.Where("whatsapp_call_id = ? AND organization_id = ?", callID, organizationID).
+		First(&callLog).Error; err != nil {
 		a.Log.Debug("No call log found for orphaned outgoing event", "call_id", callID, "event", event)
 		return
 	}
@@ -354,7 +397,9 @@ func (a *App) handleOrphanedOutgoingCallEvent(callID, event string, duration int
 		if callLog.DisconnectedBy == "" {
 			updates["disconnected_by"] = models.DisconnectedByClient
 		}
-		a.DB.Model(&callLog).Updates(updates)
+		a.DB.Model(&models.CallLog{}).
+			Where("id = ? AND organization_id = ?", callLog.ID, organizationID).
+			Updates(updates)
 
 		a.broadcastCallEvent(callLog.OrganizationID, websocket.TypeOutgoingCallEnded, map[string]any{
 			"call_log_id": callLog.ID.String(),
@@ -372,7 +417,18 @@ func (a *App) handleOrphanedOutgoingCallEvent(callID, event string, duration int
 
 // processCallStatusWebhook handles business-initiated call status webhooks
 // (RINGING, ACCEPTED, REJECTED) that arrive in the statuses array under field="calls".
-func (a *App) processCallStatusWebhook(status WebhookStatus) {
+func (a *App) processCallStatusWebhook(phoneNumberID string, status WebhookStatus) {
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+			scoped.processCallStatusWebhook(phoneNumberID, status)
+			return nil
+		}); err != nil {
+			a.Log.Error("Failed to scope call status webhook to tenant",
+				"error", err, "phone_id", phoneNumberID, "call_id", status.ID)
+		}
+		return
+	}
+
 	if a.CallManager == nil {
 		return
 	}
@@ -388,6 +444,32 @@ func (a *App) processCallStatusWebhook(status WebhookStatus) {
 		event = "rejected"
 	default:
 		a.Log.Warn("Unknown call status", "status", status.Status, "call_id", status.ID)
+		return
+	}
+
+	session := a.CallManager.GetSession(status.ID)
+	if session == nil {
+		a.Log.Debug("Ignoring call status webhook for unknown session", "call_id", status.ID, "status", status.Status)
+		return
+	}
+	if session.Direction != models.CallDirectionOutgoing {
+		a.Log.Warn("Rejected outgoing call status for non-outgoing session",
+			"call_id", status.ID, "direction", session.Direction)
+		return
+	}
+
+	requestOrgID, err := a.resolveCallWebhookOrganizationID(phoneNumberID)
+	if err != nil {
+		a.Log.Warn("Rejected call status webhook with unresolved tenant",
+			"call_id", status.ID, "phone_id", phoneNumberID, "error", err)
+		return
+	}
+	if session.OrganizationID != requestOrgID {
+		a.Log.Warn("Rejected call status webhook session from another tenant",
+			"call_id", status.ID,
+			"session_organization_id", session.OrganizationID,
+			"request_organization_id", requestOrgID,
+		)
 		return
 	}
 

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"math"
+	"sync"
 	"testing"
 	"time"
 
@@ -285,6 +286,266 @@ func TestBookingCommercePostgresCapacityAndCreditLedger(t *testing.T) {
 	assert.Equal(t, int64(3), ledgerCount)
 }
 
+func TestCreateBookingConcurrentRequestsCannotOversubscribeFinalCapacity(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	org := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+	enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+	contacts := []*models.Contact{
+		testutil.CreateTestContact(t, db, org.ID),
+		testutil.CreateTestContact(t, db, org.ID),
+	}
+	event := createCapacityRaceBookingEvent(t, db, org.ID, user.ID, 1)
+
+	requests := make([]*fastglue.Request, len(contacts))
+	for i, contact := range contacts {
+		requests[i] = testutil.NewJSONRequest(t, CreateBookingRequest{
+			EventID:        event.ID,
+			ContactID:      contact.ID,
+			Status:         models.BookingStatusReserved,
+			Quantity:       1,
+			Source:         models.BookingSourceAgent,
+			IdempotencyKey: "capacity-race-" + uuid.NewString(),
+		})
+		testutil.SetAuthContext(requests[i], org.ID, user.ID)
+		testutil.SetPathParam(requests[i], "id", event.ID.String())
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, len(requests))
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			errs[index] = app.CreateBooking(requests[index])
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+	require.ElementsMatch(t, []int{
+		fasthttp.StatusOK,
+		fasthttp.StatusConflict,
+	}, []int{
+		testutil.GetResponseStatusCode(requests[0]),
+		testutil.GetResponseStatusCode(requests[1]),
+	})
+	occupied, err := bookingEventOccupiedQuantity(db, org.ID, event.ID, uuid.Nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, occupied)
+	var bookingCount int64
+	require.NoError(t, db.Model(&models.Booking{}).Where(
+		"organization_id = ? AND event_id = ?",
+		org.ID,
+		event.ID,
+	).Count(&bookingCount).Error)
+	require.EqualValues(t, 1, bookingCount)
+	require.NoError(t, db.Where("id = ? AND organization_id = ?", event.ID, org.ID).
+		First(&event).Error)
+	require.EqualValues(t, 2, event.Version)
+}
+
+func TestTransitionBookingConcurrentWaitlistPromotionsRespectCapacity(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	org := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+	enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+	event := createCapacityRaceBookingEvent(t, db, org.ID, user.ID, 1)
+	bookings := make([]models.Booking, 2)
+	for i := range bookings {
+		contact := testutil.CreateTestContact(t, db, org.ID)
+		bookings[i] = models.Booking{
+			BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+			EventID: event.ID, ContactID: contact.ID,
+			Status: models.BookingStatusWaitlisted, Quantity: 1,
+			Source:         models.BookingSourceAgent,
+			IdempotencyKey: "waitlist-promotion-" + uuid.NewString(),
+			Metadata:       models.JSONB{}, Version: 1,
+		}
+		require.NoError(t, db.Create(&bookings[i]).Error)
+	}
+
+	requests := make([]*fastglue.Request, len(bookings))
+	for i := range bookings {
+		requests[i] = testutil.NewJSONRequest(t, TransitionBookingRequest{
+			Version: 1,
+			Status:  models.BookingStatusConfirmed,
+		})
+		testutil.SetAuthContext(requests[i], org.ID, user.ID)
+		testutil.SetPathParam(requests[i], "id", bookings[i].ID.String())
+		testutil.SetPathParam(requests[i], "transition", "confirm")
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, len(requests))
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			errs[index] = app.TransitionBooking(requests[index])
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+	require.ElementsMatch(t, []int{
+		fasthttp.StatusOK,
+		fasthttp.StatusConflict,
+	}, []int{
+		testutil.GetResponseStatusCode(requests[0]),
+		testutil.GetResponseStatusCode(requests[1]),
+	})
+	var confirmed, waitlisted int64
+	require.NoError(t, db.Model(&models.Booking{}).Where(
+		"organization_id = ? AND event_id = ? AND status = ?",
+		org.ID,
+		event.ID,
+		models.BookingStatusConfirmed,
+	).Count(&confirmed).Error)
+	require.NoError(t, db.Model(&models.Booking{}).Where(
+		"organization_id = ? AND event_id = ? AND status = ?",
+		org.ID,
+		event.ID,
+		models.BookingStatusWaitlisted,
+	).Count(&waitlisted).Error)
+	require.EqualValues(t, 1, confirmed)
+	require.EqualValues(t, 1, waitlisted)
+}
+
+func TestCreateBookingConcurrentRequestsCannotDoubleReservePackageCredit(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	org := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+	enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+	contact := testutil.CreateTestContact(t, db, org.ID)
+	firstEvent := createCapacityRaceBookingEvent(t, db, org.ID, user.ID, 1)
+	secondResource := models.BookingResource{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		Name: "Second credit-race room " + uuid.NewString()[:8],
+		Kind: models.BookingResourceKindRoom, Timezone: "Asia/Kuala_Lumpur",
+		IsActive: true, Metadata: models.JSONB{}, Version: 1,
+		CreatedByID: &user.ID, UpdatedByID: &user.ID,
+	}
+	require.NoError(t, db.Create(&secondResource).Error)
+	secondStart := firstEvent.StartsAt.Add(time.Hour)
+	secondEvent := models.BookingEvent{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		ServiceID: firstEvent.ServiceID, ResourceID: secondResource.ID,
+		StartsAt: secondStart, EndsAt: secondStart.Add(30 * time.Minute),
+		Capacity: 1, Status: models.BookingEventStatusScheduled,
+		Metadata: models.JSONB{}, Version: 1,
+		CreatedByID: &user.ID, UpdatedByID: &user.ID,
+	}
+	require.NoError(t, db.Create(&secondEvent).Error)
+
+	definition := models.PackageDefinition{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		Name: "Single credit " + uuid.NewString()[:8], PriceMinor: 100,
+		Currency: "MYR", ValidityDays: 30, IsActive: true,
+		Metadata: models.JSONB{}, Version: 1,
+		CreatedByID: &user.ID, UpdatedByID: &user.ID,
+	}
+	require.NoError(t, db.Create(&definition).Error)
+	entitlement := models.PackageEntitlement{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		PackageDefinitionID: definition.ID, BookingServiceID: firstEvent.ServiceID,
+		Credits: 1, Version: 1,
+	}
+	require.NoError(t, db.Create(&entitlement).Error)
+	now := time.Now().UTC()
+	contactPackage := models.ContactPackage{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		ContactID: contact.ID, PackageDefinitionID: definition.ID,
+		Status: models.ContactPackageStatusActive, StartsAt: &now,
+		ExpiresAt:           bookingCommerceTimePointer(now.AddDate(0, 0, 30)),
+		PurchaseAmountMinor: definition.PriceMinor, Currency: definition.Currency,
+		IdempotencyKey: "single-credit-" + uuid.NewString(),
+		Metadata:       models.JSONB{}, Version: 1,
+		CreatedByID: &user.ID, UpdatedByID: &user.ID,
+	}
+	require.NoError(t, db.Create(&contactPackage).Error)
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		return grantContactPackageCredits(
+			tx,
+			org.ID,
+			&contactPackage,
+			user.ID,
+			now,
+			"single-credit-grant",
+		)
+	}))
+
+	events := []models.BookingEvent{firstEvent, secondEvent}
+	requests := make([]*fastglue.Request, len(events))
+	for i := range events {
+		requests[i] = testutil.NewJSONRequest(t, CreateBookingRequest{
+			EventID: events[i].ID, ContactID: contact.ID,
+			Status: models.BookingStatusReserved, Quantity: 1,
+			Source: models.BookingSourceAgent, ContactPackageID: &contactPackage.ID,
+			IdempotencyKey: "credit-race-booking-" + uuid.NewString(),
+		})
+		testutil.SetAuthContext(requests[i], org.ID, user.ID)
+		testutil.SetPathParam(requests[i], "id", events[i].ID.String())
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, len(requests))
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			errs[index] = app.CreateBooking(requests[index])
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+	require.ElementsMatch(t, []int{
+		fasthttp.StatusOK,
+		fasthttp.StatusConflict,
+	}, []int{
+		testutil.GetResponseStatusCode(requests[0]),
+		testutil.GetResponseStatusCode(requests[1]),
+	})
+	var balance models.CreditBalance
+	require.NoError(t, db.Where(
+		"organization_id = ? AND contact_package_id = ? AND package_entitlement_id = ?",
+		org.ID,
+		contactPackage.ID,
+		entitlement.ID,
+	).First(&balance).Error)
+	require.Equal(t, 1, balance.Granted)
+	require.Zero(t, balance.Available)
+	require.Equal(t, 1, balance.Reserved)
+	require.Zero(t, balance.Consumed)
+	var reservationCount int64
+	require.NoError(t, db.Model(&models.CreditLedgerEntry{}).Where(
+		"organization_id = ? AND contact_package_id = ? AND type = ?",
+		org.ID,
+		contactPackage.ID,
+		models.CreditLedgerEntryTypeReserve,
+	).Count(&reservationCount).Error)
+	require.EqualValues(t, 1, reservationCount)
+}
+
 func TestBookingCommercePostgresManualPaymentAtomicIdempotency(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	app := &App{DB: db, Log: testutil.NopLogger()}
@@ -365,6 +626,89 @@ func TestBookingCommercePostgresManualPaymentAtomicIdempotency(t *testing.T) {
 		Where("organization_id = ? AND invoice_id = ?", org.ID, invoice.ID).
 		Count(&transactionCount).Error)
 	assert.Equal(t, int64(2), transactionCount)
+}
+
+func TestRecordManualInvoicePaymentConcurrentDuplicateReferenceCommitsOnce(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	org := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+	enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "commerce.enabled")
+	account := models.PaymentProviderAccount{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		Name: "Manual race account", Provider: "manual",
+		ExternalAccountID: "manual-race-" + uuid.NewString(),
+		Environment:       models.PaymentEnvironmentLive, PublicConfig: models.JSONB{},
+		IsActive: true, Metadata: models.JSONB{}, Version: 1,
+		CreatedByID: &user.ID, UpdatedByID: &user.ID,
+	}
+	require.NoError(t, db.Create(&account).Error)
+
+	invoices := make([]models.CommerceInvoice, 2)
+	for i := range invoices {
+		contact := testutil.CreateTestContact(t, db, org.ID)
+		invoices[i] = models.CommerceInvoice{
+			BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+			ContactID: contact.ID, InvoiceNumber: "INV-RACE-" + uuid.NewString()[:8],
+			IdempotencyKey: "invoice-race-" + uuid.NewString(),
+			Status:         models.CommerceInvoiceStatusOpen, Currency: "MYR",
+			SubtotalMinor: 50, TotalMinor: 50, DueMinor: 50,
+			Metadata: models.JSONB{}, Version: 1,
+		}
+		require.NoError(t, db.Create(&invoices[i]).Error)
+	}
+
+	references := []string{"BANK-RACE-001", "bank-race-001"}
+	requests := make([]*fastglue.Request, len(invoices))
+	for i := range invoices {
+		requests[i] = testutil.NewJSONRequest(t, RecordManualInvoicePaymentRequest{
+			Version: 1, ProviderAccountID: &account.ID,
+			AmountMinor: 50, Currency: "MYR", Reference: references[i],
+			IdempotencyKey: "payment-race-" + uuid.NewString(), ConfirmManual: true,
+		})
+		testutil.SetAuthContext(requests[i], org.ID, user.ID)
+		testutil.SetPathParam(requests[i], "id", invoices[i].ID.String())
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, len(requests))
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			errs[index] = app.RecordManualInvoicePayment(requests[index])
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+	require.ElementsMatch(t, []int{
+		fasthttp.StatusOK,
+		fasthttp.StatusConflict,
+	}, []int{
+		testutil.GetResponseStatusCode(requests[0]),
+		testutil.GetResponseStatusCode(requests[1]),
+	})
+	var paymentCount int64
+	require.NoError(t, db.Model(&models.PaymentTransaction{}).Where(
+		"organization_id = ? AND provider_account_id = ? AND LOWER(provider_transaction_id) = LOWER(?)",
+		org.ID,
+		account.ID,
+		references[0],
+	).Count(&paymentCount).Error)
+	require.EqualValues(t, 1, paymentCount)
+	var paidTotal int64
+	require.NoError(t, db.Model(&models.CommerceInvoice{}).Where(
+		"organization_id = ? AND id IN ?",
+		org.ID,
+		[]uuid.UUID{invoices[0].ID, invoices[1].ID},
+	).Select("COALESCE(SUM(paid_minor), 0)").Scan(&paidTotal).Error)
+	require.EqualValues(t, 50, paidTotal)
 }
 
 func TestSellContactPackageTransactionIsAtomicAndIdempotent(t *testing.T) {
@@ -496,6 +840,43 @@ func int64Pointer(value int64) *int64 {
 
 func bookingCommerceTimePointer(value time.Time) *time.Time {
 	return &value
+}
+
+func createCapacityRaceBookingEvent(
+	t *testing.T,
+	db *gorm.DB,
+	orgID, userID uuid.UUID,
+	capacity int,
+) models.BookingEvent {
+	t.Helper()
+	service := models.BookingService{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID,
+		Name: "Capacity race service " + uuid.NewString()[:8],
+		Kind: models.BookingServiceKindAppointment, DurationMinutes: 30,
+		DefaultCapacity: capacity, Currency: "MYR", IsActive: true,
+		Metadata: models.JSONB{}, Version: 1,
+		CreatedByID: &userID, UpdatedByID: &userID,
+	}
+	require.NoError(t, db.Create(&service).Error)
+	resource := models.BookingResource{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID,
+		Name: "Capacity race room " + uuid.NewString()[:8],
+		Kind: models.BookingResourceKindRoom, Timezone: "Asia/Kuala_Lumpur",
+		IsActive: true, Metadata: models.JSONB{}, Version: 1,
+		CreatedByID: &userID, UpdatedByID: &userID,
+	}
+	require.NoError(t, db.Create(&resource).Error)
+	startsAt := time.Now().UTC().Add(time.Hour)
+	event := models.BookingEvent{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID,
+		ServiceID: service.ID, ResourceID: resource.ID,
+		StartsAt: startsAt, EndsAt: startsAt.Add(30 * time.Minute),
+		Capacity: capacity, Status: models.BookingEventStatusScheduled,
+		Metadata: models.JSONB{}, Version: 1,
+		CreatedByID: &userID, UpdatedByID: &userID,
+	}
+	require.NoError(t, db.Create(&event).Error)
+	return event
 }
 
 func enableBookingCommerceTestEntitlement(

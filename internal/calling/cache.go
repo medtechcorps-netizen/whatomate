@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
+	"gorm.io/gorm"
 )
 
 const (
@@ -18,22 +19,26 @@ const (
 	callingCacheTTL        = 6 * time.Hour
 )
 
-// getIVRFlowCached returns an IVR flow by ID, reading from Redis first.
-func (m *Manager) getIVRFlowCached(flowID uuid.UUID) *models.IVRFlow {
+// getIVRFlowCached returns an IVR flow by ID, reading from Redis first. Tenant
+// identity is part of the cache key and validated in the payload so Redis can
+// never become a bypass of the database policy.
+func (m *Manager) getIVRFlowCached(orgID, flowID uuid.UUID) *models.IVRFlow {
 	ctx := context.Background()
-	key := ivrFlowCachePrefix + flowID.String()
+	key := ivrFlowCachePrefix + orgID.String() + ":" + flowID.String()
 
 	// Try cache
 	if cached, err := m.redis.Get(ctx, key).Result(); err == nil && cached != "" {
 		var flow models.IVRFlow
-		if json.Unmarshal([]byte(cached), &flow) == nil {
+		if json.Unmarshal([]byte(cached), &flow) == nil && flow.OrganizationID == orgID {
 			return &flow
 		}
 	}
 
 	// Cache miss — DB
 	var flow models.IVRFlow
-	if err := m.db.First(&flow, flowID).Error; err != nil {
+	if err := m.withTenantDB(orgID, func(db *gorm.DB) error {
+		return db.Where("id = ? AND organization_id = ?", flowID, orgID).First(&flow).Error
+	}); err != nil {
 		return nil
 	}
 
@@ -56,7 +61,8 @@ func (m *Manager) getIVRFlowByConfigCached(orgID uuid.UUID, accountName, configT
 			return nil // cached miss
 		}
 		var flow models.IVRFlow
-		if json.Unmarshal([]byte(cached), &flow) == nil {
+		if json.Unmarshal([]byte(cached), &flow) == nil && flow.OrganizationID == orgID &&
+			flow.WhatsAppAccount == accountName {
 			return &flow
 		}
 	}
@@ -73,7 +79,9 @@ func (m *Manager) getIVRFlowByConfigCached(orgID uuid.UUID, accountName, configT
 		return nil
 	}
 
-	if err := m.db.Where(query, orgID, accountName, true, true).First(&flow).Error; err != nil {
+	if err := m.withTenantDB(orgID, func(db *gorm.DB) error {
+		return db.Where(query, orgID, accountName, true, true).First(&flow).Error
+	}); err != nil {
 		// Cache the miss so we don't hit DB again
 		m.redis.Set(ctx, key, "null", callingCacheTTL)
 		return nil
@@ -162,7 +170,7 @@ func (m *Manager) GetIVRFlowByConfig(orgID uuid.UUID, accountName, configType st
 func (m *Manager) InvalidateIVRFlowCache(flowID uuid.UUID, orgID uuid.UUID, accountName string) {
 	ctx := context.Background()
 	// Invalidate by-ID cache
-	m.redis.Del(ctx, ivrFlowCachePrefix+flowID.String())
+	m.redis.Del(ctx, ivrFlowCachePrefix+orgID.String()+":"+flowID.String())
 	// Invalidate config-based caches for this org+account
 	m.redis.Del(ctx, fmt.Sprintf("%s%s:%s:call_start", ivrFlowCfgCachePrefix, orgID.String(), accountName))
 	m.redis.Del(ctx, fmt.Sprintf("%s%s:%s:outgoing_end", ivrFlowCfgCachePrefix, orgID.String(), accountName))

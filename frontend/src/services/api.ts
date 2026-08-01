@@ -791,11 +791,34 @@ export interface ResellerMember {
   created_at: string
 }
 
+export interface ResellerOrganizationSubscription {
+  id?: string
+  plan_id?: string
+  plan_price_id?: string
+  plan_code: string
+  plan_name?: string
+  status: string
+  provider: string
+  trial_ends_at?: string
+  current_period_start?: string
+  current_period_end?: string
+  grace_until?: string
+  cancel_at_period_end?: boolean
+  cancel_at?: string
+}
+
+export interface ResellerUsageOrganization extends Organization {
+  subscription: ResellerOrganizationSubscription
+}
+
 export interface ResellerUsage {
   reseller_id: string
   plan: string
   max_organizations: number
-  organizations: Organization[]
+  organizations: ResellerUsageOrganization[]
+  page: number
+  limit: number
+  total: number
   organization_count: number
   user_count: number
   whatsapp_accounts: number
@@ -818,7 +841,8 @@ export const resellersService = {
     'name' | 'brand_name' | 'logo_url' | 'primary_color' | 'accent_color' |
     'support_email' | 'custom_domain' | 'status' | 'plan' | 'max_organizations'
   >>) => api.put<Reseller>(`/resellers/${id}`, data),
-  usage: (id: string) => api.get<ResellerUsage>(`/resellers/${id}/usage`),
+  usage: (id: string, params?: { page?: number; limit?: number }) =>
+    api.get<ResellerUsage>(`/resellers/${id}/usage`, { params }),
   members: (id: string) => api.get<{ members: ResellerMember[] }>(`/resellers/${id}/members`),
   addMember: (id: string, data: { email: string; role: ResellerMember['role'] }) =>
     api.post(`/resellers/${id}/members`, data),
