@@ -109,9 +109,14 @@ test.describe('WhatsApp Accounts - Detail Page CRUD', () => {
     }
   })
 
-  test('should show webhook config on existing account', async ({ page, request }) => {
+  test('should direct Meta credential management to Integration Center', async ({ page, request }) => {
     await gotoSeededAdminAccount(page, request)
-    await expect(page.getByText('Webhook Configuration')).toBeVisible()
+
+    await expect(page.getByTestId('meta-integration-management-notice')).toBeVisible()
+
+    const integrationLink = page.getByTestId('meta-integration-management-link')
+    await expect(integrationLink).toBeVisible()
+    await expect(integrationLink).toHaveAttribute('href', '/settings/integrations')
   })
 
   test('should have test connection button', async ({ page, request }) => {
