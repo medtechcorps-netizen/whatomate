@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -17,9 +19,9 @@ const businessProfileHTTPTimeout = 30 * time.Second
 
 // GetBusinessProfile returns the business profile for a WhatsApp account
 func (a *App) GetBusinessProfile(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceAccounts, models.ActionRead)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	id, err := parsePathUUID(r, "id", "account")
@@ -46,9 +48,9 @@ func (a *App) GetBusinessProfile(r *fastglue.Request) error {
 
 // UpdateBusinessProfile updates the business profile for a WhatsApp account
 func (a *App) UpdateBusinessProfile(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	id, err := parsePathUUID(r, "id", "account")
@@ -87,9 +89,9 @@ func (a *App) UpdateBusinessProfile(r *fastglue.Request) error {
 
 // UpdateProfilePicture handles the profile picture upload
 func (a *App) UpdateProfilePicture(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	id, err := parsePathUUID(r, "id", "account")
@@ -100,6 +102,13 @@ func (a *App) UpdateProfilePicture(r *fastglue.Request) error {
 	account, err := a.resolveWhatsAppAccountByID(r, id, orgID)
 	if err != nil {
 		return nil
+	}
+	waAccount, err := a.toWhatsAppAccountWithMetaApp(account)
+	if err != nil {
+		if errors.Is(err, errMetaAppIDNotConfigured) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Configure the Meta App ID in Settings > Integrations first", nil, "")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Meta integration credentials are unavailable", nil, "")
 	}
 
 	// 1. Get the file from request
@@ -127,8 +136,6 @@ func (a *App) UpdateProfilePicture(r *fastglue.Request) error {
 	// Use a longer timeout for upload — profile pictures can be a few MB.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*businessProfileHTTPTimeout)
 	defer cancel()
-	waAccount := a.toWhatsAppAccount(account)
-
 	// Upload to Meta to get handle
 	handle, err := a.WhatsApp.UploadProfilePicture(ctx, waAccount, fileContent, fileHeader.Header.Get("Content-Type"))
 	if err != nil {

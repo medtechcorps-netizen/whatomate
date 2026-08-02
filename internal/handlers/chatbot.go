@@ -3,16 +3,24 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+)
+
+var (
+	errQwenCredentialManagedCentrally = errors.New("qwen credentials are managed in Settings > Integrations")
+	errQwenConfigManagedCentrally     = errors.New("qwen provider and model are managed in Settings > Integrations")
+	errChatbotCredentialStoreMissing  = errors.New("chatbot credential encryption is not configured")
 )
 
 // ChatbotSettingsResponse represents the response for chatbot settings
@@ -442,7 +450,7 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 	providerConfigurationTouched := req.AIProvider != nil ||
 		req.AIAPIKey != nil ||
 		req.AIModel != nil
-	aiAPIKeyChanged := req.AIAPIKey != nil && *req.AIAPIKey != ""
+	aiAPIKeyChanged := req.AIAPIKey != nil && strings.TrimSpace(*req.AIAPIKey) != ""
 	if !a.HasPermission(
 		userID,
 		models.ResourceSettingsChatbot,
@@ -545,6 +553,26 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		oldHours = chatbotHoursSnapshot(&settings)
 		oldSLA = chatbotSLASnapshot(&settings)
 		oldAI = chatbotAISnapshot(&settings)
+		if aiAPIKeyChanged || req.AIProvider != nil || req.AIModel != nil {
+			effectiveAI := settings.AI
+			if req.AIProvider != nil {
+				effectiveAI.Provider = *req.AIProvider
+			}
+			if err := channelapi.ApplyCentralQwenSettings(tx, orgID, &effectiveAI); err != nil &&
+				!errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if effectiveAI.Provider == models.AIProviderQwen &&
+				(req.AIProvider != nil || req.AIModel != nil) {
+				return errQwenConfigManagedCentrally
+			}
+			if effectiveAI.Provider == models.AIProviderQwen && aiAPIKeyChanged {
+				return errQwenCredentialManagedCentrally
+			}
+			if aiAPIKeyChanged && strings.TrimSpace(encryptionKey) == "" {
+				return errChatbotCredentialStoreMissing
+			}
+		}
 		applyChatbotSettingsRequest(&settings, &req)
 
 		if err := appcrypto.EncryptFields(encryptionKey, &settings.AI.APIKey); err != nil {
@@ -597,8 +625,6 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 				})
 			}
 			// AI configuration and its compliance record commit atomically.
-			// In particular, an API-key rotation must fail closed if its masked
-			// audit marker cannot be persisted.
 			if err := audit.LogAudit(
 				tx,
 				orgID,
@@ -616,6 +642,15 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		}
 		return nil
 	}); err != nil {
+		if errors.Is(err, errQwenCredentialManagedCentrally) {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+		}
+		if errors.Is(err, errQwenConfigManagedCentrally) {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+		}
+		if errors.Is(err, errChatbotCredentialStoreMissing) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "AI credential storage is unavailable", nil, "")
+		}
 		a.Log.Error("Failed to save settings", "error", err)
 		return r.SendErrorEnvelope(
 			fasthttp.StatusInternalServerError,
@@ -1029,6 +1064,27 @@ func (a *App) CreateChatbotFlow(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Name is required", nil, "")
 	}
 
+	protectedCompletionConfig, err := a.protectChatbotAPIConfig(
+		models.JSONB(req.CompletionConfig),
+		nil,
+	)
+	if err != nil {
+		if errors.Is(err, errOutboundHeaderEncryptionUnavailable) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Chatbot credential storage is unavailable", nil, "")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+	if err := validateChatbotCompletionAction(req.OnCompleteAction, protectedCompletionConfig); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+	protectedGraph, err := a.protectChatbotFlowGraph(models.JSONB(req.Graph), nil)
+	if err != nil {
+		if errors.Is(err, errOutboundHeaderEncryptionUnavailable) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Chatbot credential storage is unavailable", nil, "")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+
 	flow := models.ChatbotFlow{
 		BaseModel:         models.BaseModel{ID: uuid.New()},
 		OrganizationID:    orgID,
@@ -1038,9 +1094,9 @@ func (a *App) CreateChatbotFlow(r *fastglue.Request) error {
 		InitialMessage:    req.InitialMessage,
 		CompletionMessage: req.CompletionMessage,
 		OnCompleteAction:  req.OnCompleteAction,
-		CompletionConfig:  models.JSONB(req.CompletionConfig),
+		CompletionConfig:  protectedCompletionConfig,
 		PanelConfig:       models.JSONB(req.PanelConfig),
-		Graph:             models.JSONB(req.Graph),
+		Graph:             protectedGraph,
 		IsEnabled:         req.Enabled,
 		CreatedByID:       &userID,
 		UpdatedByID:       &userID,
@@ -1054,8 +1110,9 @@ func (a *App) CreateChatbotFlow(r *fastglue.Request) error {
 	// Invalidate cache
 	a.InvalidateChatbotFlowsCache(orgID)
 
+	safeFlow := redactChatbotFlow(flow)
 	a.logAudit(orgID, userID,
-		"chatbot_flow", flow.ID, models.AuditActionCreated, nil, &flow)
+		"chatbot_flow", flow.ID, models.AuditActionCreated, nil, &safeFlow)
 
 	return r.SendEnvelope(map[string]any{
 		"id":      flow.ID.String(),
@@ -1086,7 +1143,7 @@ func (a *App) GetChatbotFlow(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Flow not found", nil, "")
 	}
 
-	return r.SendEnvelope(flow)
+	return r.SendEnvelope(redactChatbotFlow(flow))
 }
 
 // UpdateChatbotFlow updates a chatbot flow
@@ -1148,16 +1205,49 @@ func (a *App) UpdateChatbotFlow(r *fastglue.Request) error {
 		flow.OnCompleteAction = *req.OnCompleteAction
 	}
 	if req.CompletionConfig != nil {
-		flow.CompletionConfig = models.JSONB(req.CompletionConfig)
+		protected, protectErr := a.protectChatbotAPIConfig(
+			models.JSONB(req.CompletionConfig),
+			flow.CompletionConfig,
+		)
+		if protectErr != nil {
+			if errors.Is(protectErr, errOutboundHeaderEncryptionUnavailable) {
+				return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Chatbot credential storage is unavailable", nil, "")
+			}
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, protectErr.Error(), nil, "")
+		}
+		flow.CompletionConfig = protected
 	}
 	if req.PanelConfig != nil {
 		flow.PanelConfig = models.JSONB(req.PanelConfig)
 	}
 	if req.Graph != nil {
-		flow.Graph = models.JSONB(req.Graph)
+		protected, protectErr := a.protectChatbotFlowGraph(models.JSONB(req.Graph), flow.Graph)
+		if protectErr != nil {
+			if errors.Is(protectErr, errOutboundHeaderEncryptionUnavailable) {
+				return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Chatbot credential storage is unavailable", nil, "")
+			}
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, protectErr.Error(), nil, "")
+		}
+		flow.Graph = protected
 	}
 	if req.Enabled != nil {
 		flow.IsEnabled = *req.Enabled
+	}
+	// Validate the effective configuration, not only the fields present in this
+	// PATCH-like request. This also migrates legacy plaintext headers whenever a
+	// webhook flow is edited, even when completion_config itself was omitted.
+	if strings.EqualFold(strings.TrimSpace(flow.OnCompleteAction), "webhook") {
+		protected, protectErr := a.protectChatbotAPIConfig(flow.CompletionConfig, flow.CompletionConfig)
+		if protectErr != nil {
+			if errors.Is(protectErr, errOutboundHeaderEncryptionUnavailable) {
+				return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Chatbot credential storage is unavailable", nil, "")
+			}
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, protectErr.Error(), nil, "")
+		}
+		flow.CompletionConfig = protected
+	}
+	if err := validateChatbotCompletionAction(flow.OnCompleteAction, flow.CompletionConfig); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 	flow.UpdatedByID = &userID
 
@@ -1168,8 +1258,10 @@ func (a *App) UpdateChatbotFlow(r *fastglue.Request) error {
 
 	a.InvalidateChatbotFlowsCache(orgID)
 
+	safeOldFlow := redactChatbotFlow(oldFlow)
+	safeFlow := redactChatbotFlow(*flow)
 	a.logAudit(orgID, userID,
-		"chatbot_flow", flow.ID, models.AuditActionUpdated, &oldFlow, flow)
+		"chatbot_flow", flow.ID, models.AuditActionUpdated, &safeOldFlow, &safeFlow)
 
 	return r.SendEnvelope(map[string]any{
 		"message": "Flow updated successfully",
@@ -1223,8 +1315,9 @@ func (a *App) DeleteChatbotFlow(r *fastglue.Request) error {
 	// Invalidate cache
 	a.InvalidateChatbotFlowsCache(orgID)
 
+	safeFlowForAudit := redactChatbotFlow(flowForAudit)
 	a.logAudit(orgID, userID,
-		"chatbot_flow", id, models.AuditActionDeleted, &flowForAudit, nil)
+		"chatbot_flow", id, models.AuditActionDeleted, &safeFlowForAudit, nil)
 
 	return r.SendEnvelope(map[string]any{
 		"message": "Flow deleted successfully",
@@ -1233,9 +1326,12 @@ func (a *App) DeleteChatbotFlow(r *fastglue.Request) error {
 
 // ListAIContexts lists all AI contexts
 func (a *App) ListAIContexts(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	if !a.HasPermission(userID, models.ResourceChatbotAI, models.ActionRead, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Permission denied", nil, "")
 	}
 
 	pg := parsePagination(r)
@@ -1267,7 +1363,7 @@ func (a *App) ListAIContexts(r *fastglue.Request) error {
 			ContextType:     ctx.ContextType,
 			TriggerKeywords: ctx.TriggerKeywords,
 			StaticContent:   ctx.StaticContent,
-			ApiConfig:       ctx.ApiConfig,
+			ApiConfig:       redactChatbotAPIConfig(ctx.ApiConfig),
 			Enabled:         ctx.IsEnabled,
 			Priority:        ctx.Priority,
 			CreatedAt:       ctx.CreatedAt.Format(time.RFC3339),
@@ -1291,6 +1387,9 @@ func (a *App) CreateAIContext(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
+	if !a.HasPermission(userID, models.ResourceChatbotAI, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Permission denied", nil, "")
+	}
 
 	var req struct {
 		Name            string             `json:"name"`
@@ -1312,6 +1411,16 @@ func (a *App) CreateAIContext(r *fastglue.Request) error {
 	if req.ContextType == "" {
 		req.ContextType = models.ContextTypeStatic
 	}
+	protectedAPIConfig, err := a.protectChatbotAPIConfig(req.ApiConfig, nil)
+	if err != nil {
+		if errors.Is(err, errOutboundHeaderEncryptionUnavailable) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Chatbot credential storage is unavailable", nil, "")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+	if err := validateAIContextOutboundConfig(req.ContextType, protectedAPIConfig); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
 
 	ctx := models.AIContext{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
@@ -1320,7 +1429,7 @@ func (a *App) CreateAIContext(r *fastglue.Request) error {
 		ContextType:     req.ContextType,
 		TriggerKeywords: req.TriggerKeywords,
 		StaticContent:   req.StaticContent,
-		ApiConfig:       req.ApiConfig,
+		ApiConfig:       protectedAPIConfig,
 		Priority:        req.Priority,
 		IsEnabled:       req.Enabled,
 		CreatedByID:     &userID,
@@ -1335,7 +1444,9 @@ func (a *App) CreateAIContext(r *fastglue.Request) error {
 	// Invalidate cache
 	a.InvalidateAIContextsCache(orgID)
 
-	a.logAudit(orgID, userID, "ai_context", ctx.ID, models.AuditActionCreated, nil, &ctx)
+	safeCtx := ctx
+	safeCtx.ApiConfig = redactChatbotAPIConfig(ctx.ApiConfig)
+	a.logAudit(orgID, userID, "ai_context", ctx.ID, models.AuditActionCreated, nil, &safeCtx)
 
 	return r.SendEnvelope(map[string]any{
 		"id":      ctx.ID.String(),
@@ -1345,9 +1456,12 @@ func (a *App) CreateAIContext(r *fastglue.Request) error {
 
 // GetAIContext gets a single AI context
 func (a *App) GetAIContext(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	if !a.HasPermission(userID, models.ResourceChatbotAI, models.ActionRead, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Permission denied", nil, "")
 	}
 
 	id, err := parsePathUUID(r, "id", "context")
@@ -1368,7 +1482,7 @@ func (a *App) GetAIContext(r *fastglue.Request) error {
 		ContextType:     aiCtx.ContextType,
 		TriggerKeywords: aiCtx.TriggerKeywords,
 		StaticContent:   aiCtx.StaticContent,
-		ApiConfig:       aiCtx.ApiConfig,
+		ApiConfig:       redactChatbotAPIConfig(aiCtx.ApiConfig),
 		Enabled:         aiCtx.IsEnabled,
 		Priority:        aiCtx.Priority,
 		CreatedAt:       aiCtx.CreatedAt.Format(time.RFC3339),
@@ -1389,6 +1503,9 @@ func (a *App) UpdateAIContext(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	if !a.HasPermission(userID, models.ResourceChatbotAI, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Permission denied", nil, "")
 	}
 
 	id, err := parsePathUUID(r, "id", "context")
@@ -1431,13 +1548,36 @@ func (a *App) UpdateAIContext(r *fastglue.Request) error {
 		aiCtx.StaticContent = *req.StaticContent
 	}
 	if req.ApiConfig != nil {
-		aiCtx.ApiConfig = *req.ApiConfig
+		protected, protectErr := a.protectChatbotAPIConfig(*req.ApiConfig, aiCtx.ApiConfig)
+		if protectErr != nil {
+			if errors.Is(protectErr, errOutboundHeaderEncryptionUnavailable) {
+				return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Chatbot credential storage is unavailable", nil, "")
+			}
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, protectErr.Error(), nil, "")
+		}
+		aiCtx.ApiConfig = protected
 	}
 	if req.Priority != nil {
 		aiCtx.Priority = *req.Priority
 	}
 	if req.Enabled != nil {
 		aiCtx.IsEnabled = *req.Enabled
+	}
+	// Revalidate the full effective API configuration on every partial update.
+	// This closes the static-to-API transition gap and upgrades any legacy
+	// plaintext headers without requiring api_config to be resubmitted.
+	if aiCtx.ContextType == models.ContextTypeAPI {
+		protected, protectErr := a.protectChatbotAPIConfig(aiCtx.ApiConfig, aiCtx.ApiConfig)
+		if protectErr != nil {
+			if errors.Is(protectErr, errOutboundHeaderEncryptionUnavailable) {
+				return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Chatbot credential storage is unavailable", nil, "")
+			}
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, protectErr.Error(), nil, "")
+		}
+		aiCtx.ApiConfig = protected
+	}
+	if err := validateAIContextOutboundConfig(aiCtx.ContextType, aiCtx.ApiConfig); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 	aiCtx.UpdatedByID = &userID
 
@@ -1449,7 +1589,11 @@ func (a *App) UpdateAIContext(r *fastglue.Request) error {
 	// Invalidate cache
 	a.InvalidateAIContextsCache(orgID)
 
-	a.logAudit(orgID, userID, "ai_context", aiCtx.ID, models.AuditActionUpdated, &oldCtx, aiCtx)
+	safeOldCtx := oldCtx
+	safeOldCtx.ApiConfig = redactChatbotAPIConfig(oldCtx.ApiConfig)
+	safeCtx := *aiCtx
+	safeCtx.ApiConfig = redactChatbotAPIConfig(aiCtx.ApiConfig)
+	a.logAudit(orgID, userID, "ai_context", aiCtx.ID, models.AuditActionUpdated, &safeOldCtx, &safeCtx)
 
 	return r.SendEnvelope(map[string]any{
 		"message": "AI context updated successfully",
@@ -1461,6 +1605,9 @@ func (a *App) DeleteAIContext(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	if !a.HasPermission(userID, models.ResourceChatbotAI, models.ActionDelete, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Permission denied", nil, "")
 	}
 
 	id, err := parsePathUUID(r, "id", "context")
@@ -1482,7 +1629,9 @@ func (a *App) DeleteAIContext(r *fastglue.Request) error {
 	// Invalidate cache
 	a.InvalidateAIContextsCache(orgID)
 
-	a.logAudit(orgID, userID, "ai_context", id, models.AuditActionDeleted, &aiCtx, nil)
+	safeCtx := aiCtx
+	safeCtx.ApiConfig = redactChatbotAPIConfig(aiCtx.ApiConfig)
+	a.logAudit(orgID, userID, "ai_context", id, models.AuditActionDeleted, &safeCtx, nil)
 
 	return r.SendEnvelope(map[string]any{
 		"message": "AI context deleted successfully",

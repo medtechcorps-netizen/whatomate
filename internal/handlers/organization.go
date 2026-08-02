@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
-	"github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
@@ -22,20 +21,11 @@ import (
 // map suitable for audit diffing. Reading from a nil JSONB map returns the
 // zero value (nil), which is treated as "unset" by the audit comparator.
 func generalSettingsSnapshot(name string, settings models.JSONB) map[string]any {
-	hasSecret := false
-	if settings != nil {
-		if v, ok := settings["meta_app_secret_encrypted"].(string); ok && v != "" {
-			hasSecret = true
-		}
-	}
 	return map[string]any{
-		"name":                name,
-		"timezone":            settings["timezone"],
-		"date_format":         settings["date_format"],
-		"mask_phone_numbers":  settings["mask_phone_numbers"],
-		"meta_app_id":         settings["meta_app_id"],
-		"meta_config_id":      settings["meta_config_id"],
-		"has_meta_app_secret": hasSecret,
+		"name":               name,
+		"timezone":           settings["timezone"],
+		"date_format":        settings["date_format"],
+		"mask_phone_numbers": settings["mask_phone_numbers"],
 	}
 }
 
@@ -61,9 +51,6 @@ type OrganizationSettings struct {
 	TransferTimeoutSecs int    `json:"transfer_timeout_secs"`
 	HoldMusicFile       string `json:"hold_music_file"`
 	RingbackFile        string `json:"ringback_file"`
-	MetaAppID           string `json:"meta_app_id"`
-	MetaConfigID        string `json:"meta_config_id"`
-	HasMetaAppSecret    bool   `json:"has_meta_app_secret"`
 }
 
 // GetOrganizationSettings returns the organization settings
@@ -119,15 +106,6 @@ func (a *App) GetOrganizationSettings(r *fastglue.Request) error {
 		if v, ok := org.Settings["ringback_file"].(string); ok && v != "" {
 			settings.RingbackFile = v
 		}
-		if v, ok := org.Settings["meta_app_id"].(string); ok && v != "" {
-			settings.MetaAppID = v
-		}
-		if v, ok := org.Settings["meta_config_id"].(string); ok && v != "" {
-			settings.MetaConfigID = v
-		}
-		if v, ok := org.Settings["meta_app_secret_encrypted"].(string); ok && v != "" {
-			settings.HasMetaAppSecret = true
-		}
 	}
 
 	responseSettings := map[string]any{
@@ -147,16 +125,6 @@ func (a *App) GetOrganizationSettings(r *fastglue.Request) error {
 		responseSettings["hold_music_file"] = settings.HoldMusicFile
 		responseSettings["ringback_file"] = settings.RingbackFile
 	}
-	// Meta application credentials are platform-sensitive workspace settings.
-	// Requiring both permissions keeps operational account management available
-	// to managers without exposing the shared application configuration.
-	if a.HasPermission(userID, models.ResourceSettingsGeneral, models.ActionWrite, orgID) &&
-		a.HasPermission(userID, models.ResourceAccounts, models.ActionWrite, orgID) {
-		responseSettings["meta_app_id"] = settings.MetaAppID
-		responseSettings["meta_config_id"] = settings.MetaConfigID
-		responseSettings["has_meta_app_secret"] = settings.HasMetaAppSecret
-	}
-
 	return r.SendEnvelope(map[string]any{
 		"settings": responseSettings,
 		"name":     org.Name,
@@ -198,18 +166,22 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 		req.TransferTimeoutSecs != nil || req.HoldMusicFile != nil ||
 		req.RingbackFile != nil
 
-	if generalFieldsTouched || metaAppCredsTouched {
+	if metaAppCredsTouched {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Meta app credentials are managed in Settings > Integrations",
+			nil,
+			"",
+		)
+	}
+
+	if generalFieldsTouched {
 		if err := a.requirePermission(
 			r,
 			userID,
 			models.ResourceSettingsGeneral,
 			models.ActionWrite,
 		); err != nil {
-			return nil
-		}
-	}
-	if metaAppCredsTouched {
-		if err := a.requirePermission(r, userID, models.ResourceAccounts, models.ActionWrite); err != nil {
 			return nil
 		}
 	}
@@ -227,91 +199,84 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "No settings fields provided", nil, "")
 	}
 
-	var org models.Organization
-	if err := a.DB.Where("id = ?", orgID).First(&org).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
-	}
-
-	// Snapshot before mutation so we can compute per-tab diffs.
-	oldGeneral := generalSettingsSnapshot(org.Name, org.Settings)
-	oldCalling := callingSettingsSnapshot(org.Settings)
-
 	// Track which tabs received updates so we only audit the relevant ones.
-	generalTouched := req.MaskPhoneNumbers != nil || req.Timezone != nil || req.DateFormat != nil || (req.Name != nil && *req.Name != "") || metaAppCredsTouched
+	generalTouched := req.MaskPhoneNumbers != nil || req.Timezone != nil || req.DateFormat != nil || (req.Name != nil && *req.Name != "")
 
-	// Update settings
-	if org.Settings == nil {
-		org.Settings = models.JSONB{}
-	}
-
-	if req.MaskPhoneNumbers != nil {
-		org.Settings["mask_phone_numbers"] = *req.MaskPhoneNumbers
-	}
-	if req.Timezone != nil {
-		org.Settings["timezone"] = *req.Timezone
-	}
-	if req.DateFormat != nil {
-		org.Settings["date_format"] = *req.DateFormat
-	}
-	if req.CallingEnabled != nil {
-		org.Settings["calling_enabled"] = *req.CallingEnabled
-	}
-	if req.MaxCallDuration != nil && *req.MaxCallDuration > 0 {
-		org.Settings["max_call_duration"] = *req.MaxCallDuration
-	}
-	if req.TransferTimeoutSecs != nil && *req.TransferTimeoutSecs > 0 {
-		org.Settings["transfer_timeout_secs"] = *req.TransferTimeoutSecs
-	}
-	if req.HoldMusicFile != nil {
-		org.Settings["hold_music_file"] = *req.HoldMusicFile
-	}
-	if req.RingbackFile != nil {
-		org.Settings["ringback_file"] = *req.RingbackFile
-	}
-	if req.MetaAppID != nil {
-		org.Settings["meta_app_id"] = *req.MetaAppID
-	}
-	if req.MetaConfigID != nil {
-		org.Settings["meta_config_id"] = *req.MetaConfigID
-	}
-	if req.ClearMetaAppSecret != nil && *req.ClearMetaAppSecret {
-		delete(org.Settings, "meta_app_secret_encrypted")
-	} else if req.MetaAppSecret != nil && *req.MetaAppSecret != "" {
-		encSecret, errEnc := crypto.Encrypt(*req.MetaAppSecret, a.Config.App.EncryptionKey)
-		if errEnc != nil {
-			a.Log.Error("Failed to encrypt meta app secret", "error", errEnc)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update settings", nil, "")
+	// Organization.Settings is shared by General, Calling and Integration
+	// Center. Serialize every read-modify-write on the organization row so an
+	// older JSONB snapshot can never overwrite a concurrently saved credential.
+	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		var org models.Organization
+		if queryErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", orgID).
+			First(&org).Error; queryErr != nil {
+			return queryErr
 		}
-		org.Settings["meta_app_secret_encrypted"] = encSecret
-	}
-	if req.Name != nil && *req.Name != "" {
-		org.Name = *req.Name
-	}
 
-	if err := a.DB.Save(&org).Error; err != nil {
+		oldGeneral := generalSettingsSnapshot(org.Name, org.Settings)
+		oldCalling := callingSettingsSnapshot(org.Settings)
+		if org.Settings == nil {
+			org.Settings = models.JSONB{}
+		}
+		if req.MaskPhoneNumbers != nil {
+			org.Settings["mask_phone_numbers"] = *req.MaskPhoneNumbers
+		}
+		if req.Timezone != nil {
+			org.Settings["timezone"] = *req.Timezone
+		}
+		if req.DateFormat != nil {
+			org.Settings["date_format"] = *req.DateFormat
+		}
+		if req.CallingEnabled != nil {
+			org.Settings["calling_enabled"] = *req.CallingEnabled
+		}
+		if req.MaxCallDuration != nil && *req.MaxCallDuration > 0 {
+			org.Settings["max_call_duration"] = *req.MaxCallDuration
+		}
+		if req.TransferTimeoutSecs != nil && *req.TransferTimeoutSecs > 0 {
+			org.Settings["transfer_timeout_secs"] = *req.TransferTimeoutSecs
+		}
+		if req.HoldMusicFile != nil {
+			org.Settings["hold_music_file"] = *req.HoldMusicFile
+		}
+		if req.RingbackFile != nil {
+			org.Settings["ringback_file"] = *req.RingbackFile
+		}
+		if req.Name != nil && *req.Name != "" {
+			org.Name = *req.Name
+		}
+		if saveErr := tx.Save(&org).Error; saveErr != nil {
+			return saveErr
+		}
+
+		// Keep settings and their audit entries in the same serialized transaction.
+		userName := audit.GetUserName(tx, userID)
+		if generalTouched {
+			newGeneral := generalSettingsSnapshot(org.Name, org.Settings)
+			if auditErr := audit.LogAudit(tx, orgID, userID, userName,
+				models.ResourceSettingsGeneral, orgID, models.AuditActionUpdated, oldGeneral, newGeneral); auditErr != nil {
+				a.Log.Warn("Failed to record general settings audit entry", "error", auditErr)
+			}
+		}
+		if callingTouched {
+			newCalling := callingSettingsSnapshot(org.Settings)
+			if auditErr := audit.LogAudit(tx, orgID, userID, userName,
+				models.ResourceSettingsCalling, orgID, models.AuditActionUpdated, oldCalling, newCalling); auditErr != nil {
+				a.Log.Warn("Failed to record calling settings audit entry", "error", auditErr)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
+		}
 		a.Log.Error("Failed to update settings", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update settings", nil, "")
 	}
 
 	if callingTouched && a.CallManager != nil {
 		a.CallManager.InvalidateOrgCallingSettingsCache(orgID)
-	}
-
-	// Emit per-tab audit entries. LogAudit is a no-op when there are zero changes.
-	userName := audit.GetUserName(a.DB, userID)
-	if generalTouched {
-		newGeneral := generalSettingsSnapshot(org.Name, org.Settings)
-		if err := audit.LogAudit(a.DB, orgID, userID, userName,
-			models.ResourceSettingsGeneral, orgID, models.AuditActionUpdated, oldGeneral, newGeneral); err != nil {
-			a.Log.Warn("Failed to record general settings audit entry", "error", err)
-		}
-	}
-	if callingTouched {
-		newCalling := callingSettingsSnapshot(org.Settings)
-		if err := audit.LogAudit(a.DB, orgID, userID, userName,
-			models.ResourceSettingsCalling, orgID, models.AuditActionUpdated, oldCalling, newCalling); err != nil {
-			a.Log.Warn("Failed to record calling settings audit entry", "error", err)
-		}
 	}
 
 	return r.SendEnvelope(map[string]any{

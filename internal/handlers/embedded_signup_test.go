@@ -21,6 +21,11 @@ import (
 
 // --- ExchangeToken Tests ---
 
+const (
+	embeddedSignupTestAppID     = "synthetic-embedded-signup-app"
+	embeddedSignupTestAppSecret = "synthetic-embedded-signup-secret"
+)
+
 func TestApp_ExchangeToken_Success_AutoRegistration(t *testing.T) {
 	t.Parallel()
 
@@ -41,6 +46,22 @@ func TestApp_ExchangeToken_Success_AutoRegistration(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"access_token": "EAABwzLixnjYBO1234567890",
+			})
+		case strings.Contains(path, "/debug_token"):
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"app_id":                 embeddedSignupTestAppID,
+					"is_valid":               true,
+					"scopes":                 []string{"business_management", "whatsapp_business_management", "whatsapp_business_messaging"},
+					"expires_at":             time.Now().UTC().Add(2 * time.Hour).Unix(),
+					"data_access_expires_at": time.Now().UTC().Add(time.Hour).Unix(),
+				},
+			})
+		case strings.Contains(path, wabaID) && strings.HasSuffix(path, "/phone_numbers"):
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]string{{"id": phoneID}},
 			})
 		case strings.Contains(path, phoneID):
 			if strings.HasSuffix(path, "/register") {
@@ -66,6 +87,9 @@ func TestApp_ExchangeToken_Success_AutoRegistration(t *testing.T) {
 	defer metaServer.Close()
 
 	// Override WhatsApp client to use test server
+	app.Config.WhatsApp.AppID = embeddedSignupTestAppID
+	app.Config.WhatsApp.AppSecret = embeddedSignupTestAppSecret
+	app.Config.WhatsApp.APIVersion = "v21.0"
 	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
 
 	req := testutil.NewJSONRequest(t, map[string]interface{}{
@@ -133,6 +157,22 @@ func TestApp_ExchangeToken_Success_PendingRegistration(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"access_token": "test_token",
 			})
+		case strings.Contains(path, "/debug_token"):
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"app_id":                 embeddedSignupTestAppID,
+					"is_valid":               true,
+					"scopes":                 []string{"business_management", "whatsapp_business_management", "whatsapp_business_messaging"},
+					"expires_at":             time.Now().UTC().Add(2 * time.Hour).Unix(),
+					"data_access_expires_at": time.Now().UTC().Add(time.Hour).Unix(),
+				},
+			})
+		case strings.Contains(path, wabaID) && strings.HasSuffix(path, "/phone_numbers"):
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]string{{"id": phoneID}},
+			})
 		case strings.Contains(path, phoneID):
 			if strings.HasSuffix(path, "/register") {
 				// Registration fails - PIN already exists
@@ -168,6 +208,9 @@ func TestApp_ExchangeToken_Success_PendingRegistration(t *testing.T) {
 	}))
 	defer metaServer.Close()
 
+	app.Config.WhatsApp.AppID = embeddedSignupTestAppID
+	app.Config.WhatsApp.AppSecret = embeddedSignupTestAppSecret
+	app.Config.WhatsApp.APIVersion = "v21.0"
 	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
 
 	req := testutil.NewJSONRequest(t, map[string]interface{}{
@@ -221,6 +264,9 @@ func TestApp_ExchangeToken_InvalidCode(t *testing.T) {
 	}))
 	defer metaServer.Close()
 
+	app.Config.WhatsApp.AppID = embeddedSignupTestAppID
+	app.Config.WhatsApp.AppSecret = embeddedSignupTestAppSecret
+	app.Config.WhatsApp.APIVersion = "v21.0"
 	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
 
 	req := testutil.NewJSONRequest(t, map[string]interface{}{
@@ -235,7 +281,7 @@ func TestApp_ExchangeToken_InvalidCode(t *testing.T) {
 	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
 
 	body := string(testutil.GetResponseBody(req))
-	assert.Contains(t, body, "Invalid authorization code")
+	assert.Contains(t, body, "Meta authorization code exchange failed")
 }
 
 func TestApp_ExchangeToken_Success_CodeOnly_Discovery(t *testing.T) {
@@ -260,8 +306,15 @@ func TestApp_ExchangeToken_Success_CodeOnly_Discovery(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"data": whatsapp.TokenDebugInfo{
-					AppID:   "test_app",
+					AppID:   embeddedSignupTestAppID,
 					IsValid: true,
+					Scopes: []string{
+						"business_management",
+						"whatsapp_business_management",
+						"whatsapp_business_messaging",
+					},
+					ExpiresAt:           time.Now().UTC().Add(2 * time.Hour).Unix(),
+					DataAccessExpiresAt: time.Now().UTC().Add(time.Hour).Unix(),
 					GranularScopes: []struct {
 						Scope     string   `json:"scope"`
 						TargetIds []string `json:"target_ids,omitempty"`
@@ -306,12 +359,21 @@ func TestApp_ExchangeToken_Success_CodeOnly_Discovery(t *testing.T) {
 				"verified_name":        "Discovered Phone",
 				"display_phone_number": "+1999999999",
 			})
+		case strings.Contains(path, wabaID):
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"id":   wabaID,
+				"name": "Discovered WABA",
+			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer metaServer.Close()
 
+	app.Config.WhatsApp.AppID = embeddedSignupTestAppID
+	app.Config.WhatsApp.AppSecret = embeddedSignupTestAppSecret
+	app.Config.WhatsApp.APIVersion = "v21.0"
 	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
 
 	// Omit phone_id and waba_id
@@ -354,6 +416,31 @@ func TestApp_ExchangeToken_MissingFields(t *testing.T) {
 	err := app.ExchangeToken(req)
 	require.NoError(t, err)
 	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+}
+
+func TestApp_ExchangeToken_RejectsDuplicateAccountWebhookVerifyToken(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
+
+	req := testutil.NewJSONRequest(t, map[string]interface{}{
+		"code":                 "synthetic-embedded-signup-code",
+		"phone_id":             "duplicate-token-phone-id",
+		"waba_id":              "duplicate-token-waba-id",
+		"webhook_verify_token": "must-be-configured-centrally",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.ExchangeToken(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "managed in Settings > Integrations")
+
+	var accountCount int64
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+		Where("organization_id = ? AND phone_id = ?", org.ID, "duplicate-token-phone-id").
+		Count(&accountCount).Error)
+	assert.Zero(t, accountCount)
 }
 
 func TestApp_ExchangeToken_Unauthorized(t *testing.T) {

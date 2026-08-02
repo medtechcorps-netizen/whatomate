@@ -279,7 +279,7 @@ func (a *App) SaveFlowToMeta(r *fastglue.Request) error {
 	}
 
 	// Create WhatsApp API client
-	waClient := whatsapp.New(a.Log)
+	waClient := a.whatsAppClient()
 	waAccount := a.toWhatsAppAccount(account)
 
 	a.Log.Info("SaveFlowToMeta: Account details",
@@ -391,7 +391,7 @@ func (a *App) PublishFlow(r *fastglue.Request) error {
 	}
 
 	// Create WhatsApp API client
-	waClient := whatsapp.New(a.Log)
+	waClient := a.whatsAppClient()
 	waAccount := a.toWhatsAppAccount(account)
 
 	ctx := context.Background()
@@ -459,7 +459,7 @@ func (a *App) DeprecateFlow(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "WhatsApp account not found", nil, "")
 		}
 
-		waClient := whatsapp.New(a.Log)
+		waClient := a.whatsAppClient()
 		waAccount := a.toWhatsAppAccount(account)
 
 		ctx := context.Background()
@@ -557,7 +557,7 @@ func (a *App) SyncFlows(r *fastglue.Request) error {
 	}
 
 	// Create WhatsApp API client
-	waClient := whatsapp.New(a.Log)
+	waClient := a.whatsAppClient()
 	waAccount := a.toWhatsAppAccount(account)
 
 	ctx := context.Background()

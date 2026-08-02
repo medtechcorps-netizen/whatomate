@@ -142,6 +142,7 @@ func TestProcessNormalizedChannelEventPersistsMetaServiceWindowFromProviderTime(
 		t.Run(string(channel), func(t *testing.T) {
 			db := testutil.SetupTestDB(t)
 			org := testutil.CreateTestOrganization(t, db)
+			createCentralQwenTestSettings(t, db, org.ID)
 			account := createRelayPolicyTestAccount(t, db, org.ID, channel)
 			settings := &models.ChatbotSettings{
 				BaseModel:      models.BaseModel{ID: uuid.New()},

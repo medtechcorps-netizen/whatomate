@@ -44,6 +44,7 @@ type channelAIReplySnapshot struct {
 	UserText            string
 	Messages            []qwenapi.Message
 	APIKey              string
+	BaseURL             string
 	MaxTokens           int
 }
 
@@ -293,6 +294,9 @@ func (w *Worker) processChannelAIReplyJob(
 	baseURL := qwenapi.DefaultBaseURL
 	if w.Config != nil && w.Config.AI.QwenBaseURL != "" {
 		baseURL = w.Config.AI.QwenBaseURL
+	}
+	if strings.TrimSpace(check.Snapshot.BaseURL) != "" {
+		baseURL = check.Snapshot.BaseURL
 	}
 	response, err := qwenapi.Generate(ctx, w.QwenHTTP, qwenapi.Options{
 		APIKey:      check.Snapshot.APIKey,
@@ -579,6 +583,10 @@ func (w *Worker) checkChannelAIReplyEligibility(
 	if w.Config != nil {
 		encryptionKey = w.Config.App.EncryptionKey
 	}
+	if appcrypto.IsEncrypted(settings.AI.APIKey) && strings.TrimSpace(encryptionKey) == "" {
+		check.CancelReason = "channel_ai_credentials_invalid"
+		return check, nil
+	}
 	apiKey, decryptErr := appcrypto.Decrypt(settings.AI.APIKey, encryptionKey)
 	if decryptErr != nil || strings.TrimSpace(apiKey) == "" {
 		check.CancelReason = "channel_ai_credentials_invalid"
@@ -683,6 +691,7 @@ func (w *Worker) checkChannelAIReplyEligibility(
 	check.Snapshot.Settings = settings
 	check.Snapshot.UserText = userText
 	check.Snapshot.APIKey = apiKey
+	check.Snapshot.BaseURL = settings.AI.BaseURL
 	check.Snapshot.MaxTokens = maxTokens
 	if buildPrompt {
 		messages, promptErr := buildChannelAIReplyMessages(

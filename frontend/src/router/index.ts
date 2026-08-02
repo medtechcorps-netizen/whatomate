@@ -300,6 +300,12 @@ const router = createRouter({
           meta: { permission: 'settings.general' }
         },
         {
+          path: 'settings/integrations',
+          name: 'settings-integrations',
+          component: () => import('@/views/settings/IntegrationsView.vue'),
+          meta: { permission: 'settings.integrations' }
+        },
+        {
           path: 'settings/chatbot',
           name: 'chatbot-settings',
           component: () => import('@/views/settings/ChatbotSettingsView.vue'),
@@ -532,6 +538,7 @@ const navigationOrder: NavigationCandidate[] = [
   ]},
   { path: '/settings', permission: 'settings.general', childPaths: [
     { path: '/settings', permission: 'settings.general' },
+    { path: '/settings/integrations', permission: 'settings.integrations' },
     { path: '/settings/chatbot', permission: 'settings.chatbot' },
     { path: '/settings/accounts', permission: 'accounts' },
     { path: '/settings/canned-responses', permission: 'canned_responses' },

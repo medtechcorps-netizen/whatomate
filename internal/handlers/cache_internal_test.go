@@ -128,6 +128,21 @@ func TestGetWhatsAppAccountCached_NotFoundReturnsError(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestWhatsAppAccountCacheNeverSerializesLegacyWebhookVerifyToken(t *testing.T) {
+	t.Parallel()
+
+	cacheData := whatsAppAccountCache{
+		WhatsAppAccount: models.WhatsAppAccount{
+			WebhookVerifyToken: "synthetic-legacy-verify-token",
+		},
+		AccessToken: "encrypted-access-token",
+	}
+	encoded, err := json.Marshal(cacheData)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "webhook_verify_token")
+	assert.NotContains(t, string(encoded), "synthetic-legacy-verify-token")
+}
+
 func TestInvalidateWhatsAppAccountCache_DeletesKey(t *testing.T) {
 	app := cacheTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
@@ -154,7 +169,7 @@ func TestInvalidateWhatsAppAccountCache_DeletesKey(t *testing.T) {
 
 func TestDecryptAccountSecrets_DecryptsEncryptedValues(t *testing.T) {
 	app := cacheTestApp(t)
-	app.Config.App.EncryptionKey = "this-is-a-32-character-test-key-XX"
+	app.Config.App.EncryptionKey = "this-is-a-32-character-test-key-XX" // gitleaks:allow -- synthetic unit-test key
 
 	encTok, err := crypto.Encrypt("plain-token", app.Config.App.EncryptionKey)
 	require.NoError(t, err)
@@ -169,13 +184,47 @@ func TestDecryptAccountSecrets_DecryptsEncryptedValues(t *testing.T) {
 
 func TestDecryptAccountSecrets_LeavesLegacyPlaintextUnchanged(t *testing.T) {
 	app := cacheTestApp(t)
-	app.Config.App.EncryptionKey = "this-is-a-32-character-test-key-XX"
+	app.Config.App.EncryptionKey = "this-is-a-32-character-test-key-XX" // gitleaks:allow -- synthetic unit-test key
 
 	// No "enc:" prefix → legacy value, returned as-is.
 	acc := &models.WhatsAppAccount{AccessToken: "legacy-plain", AppSecret: "legacy-secret"}
 	app.decryptAccountSecrets(acc)
 	assert.Equal(t, "legacy-plain", acc.AccessToken)
 	assert.Equal(t, "legacy-secret", acc.AppSecret)
+}
+
+func TestPrepareWhatsAppAccountForRuntimeRejectsExpiredOrUndecryptableToken(t *testing.T) {
+	t.Parallel()
+
+	t.Run("expired", func(t *testing.T) {
+		expiresAt := time.Now().UTC().Add(-time.Minute)
+		app := &App{Config: &config.Config{}}
+		err := app.prepareWhatsAppAccountForRuntime(&models.WhatsAppAccount{
+			AccessToken:          "legacy-token",
+			AccessTokenExpiresAt: &expiresAt,
+		})
+		require.ErrorContains(t, err, "expired")
+	})
+
+	t.Run("encrypted token without server key", func(t *testing.T) {
+		encrypted, err := crypto.Encrypt("tenant-token", "test-runtime-account-key")
+		require.NoError(t, err)
+		app := &App{Config: &config.Config{}}
+		err = app.prepareWhatsAppAccountForRuntime(&models.WhatsAppAccount{
+			AccessToken: encrypted,
+		})
+		require.ErrorContains(t, err, "could not be decrypted")
+	})
+
+	t.Run("valid encrypted token", func(t *testing.T) {
+		const encryptionKey = "test-runtime-account-key"
+		encrypted, err := crypto.Encrypt("tenant-token", encryptionKey)
+		require.NoError(t, err)
+		app := &App{Config: &config.Config{App: config.AppConfig{EncryptionKey: encryptionKey}}}
+		account := &models.WhatsAppAccount{AccessToken: encrypted}
+		require.NoError(t, app.prepareWhatsAppAccountForRuntime(account))
+		assert.Equal(t, "tenant-token", account.AccessToken)
+	})
 }
 
 // --- getWebhooksCached ---

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,6 +57,21 @@ type App struct {
 	// chatbot sends a stable WAMID-derived action key without sharing mutable
 	// execution state across concurrent webhook jobs.
 	inboundContinuation *inboundContinuationExecution
+}
+
+// whatsAppClient returns the application's shared client when available. The
+// fallback keeps independently constructed Apps (primarily focused tests) on
+// the configured Graph API base URL instead of silently reverting to Meta.
+func (a *App) whatsAppClient() *whatsapp.Client {
+	if a.WhatsApp != nil {
+		return a.WhatsApp
+	}
+	if a.Config != nil {
+		if baseURL := strings.TrimSpace(a.Config.WhatsApp.BaseURL); baseURL != "" {
+			return whatsapp.NewWithBaseURL(a.Log, strings.TrimRight(baseURL, "/"))
+		}
+	}
+	return whatsapp.New(a.Log)
 }
 
 // WaitForBackgroundTasks blocks until all background goroutines complete.
@@ -184,26 +200,31 @@ func (a *App) ReadyCheck(r *fastglue.Request) error {
 
 // GetEmbeddedSignupConfig returns public configuration values for the embedded signup flow
 func (a *App) GetEmbeddedSignupConfig(r *fastglue.Request) error {
+	type EmbeddedSignupConfig struct {
+		WhatsAppAppID      string `json:"whatsapp_app_id,omitempty"`
+		WhatsAppConfigID   string `json:"whatsapp_config_id,omitempty"`
+		WhatsAppAPIVersion string `json:"whatsapp_api_version,omitempty"`
+		HasAppSecret       bool   `json:"has_app_secret"`
+	}
+
 	orgID, err := a.getOrgID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
-	appID, _, configID, err := a.resolveMetaAppCreds(orgID)
+	appID, appSecret, configID, err := a.resolveMetaAppCreds(orgID)
 	if err != nil {
+		if errors.Is(err, errMetaIntegrationDisabled) {
+			return r.SendEnvelope(EmbeddedSignupConfig{HasAppSecret: false})
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resolve credentials", nil, "")
-	}
-
-	type EmbeddedSignupConfig struct {
-		WhatsAppAppID      string `json:"whatsapp_app_id,omitempty"`
-		WhatsAppConfigID   string `json:"whatsapp_config_id,omitempty"`
-		WhatsAppAPIVersion string `json:"whatsapp_api_version,omitempty"`
 	}
 
 	config := EmbeddedSignupConfig{
 		WhatsAppAppID:      appID,
 		WhatsAppConfigID:   configID,
-		WhatsAppAPIVersion: a.Config.WhatsApp.APIVersion,
+		WhatsAppAPIVersion: a.metaAPIVersion(),
+		HasAppSecret:       strings.TrimSpace(appSecret) != "",
 	}
 
 	return r.SendEnvelope(config)

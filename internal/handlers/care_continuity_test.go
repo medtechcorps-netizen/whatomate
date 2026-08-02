@@ -610,12 +610,15 @@ func TestCareContinuityProcessor_WebhookFailureHonorsMaxAttempts(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer server.Close()
-	app.HTTPClient = server.Client()
+	const webhookURL = "https://care-webhook.example.com/contact-updated"
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://care-webhook.example.com": server,
+	})
 	webhook := models.Webhook{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: organization.ID,
 		Name:           "Failing care webhook",
-		URL:            server.URL,
+		URL:            webhookURL,
 		Events:         models.StringArray{string(models.WebhookEventContactUpdated)},
 		Headers:        models.JSONB{},
 		IsActive:       true,

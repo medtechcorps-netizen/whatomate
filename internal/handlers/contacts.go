@@ -753,7 +753,9 @@ func (a *App) resolveWhatsAppAccount(orgID uuid.UUID, accountName string) (*mode
 		if err := a.DB.Where("name = ? AND organization_id = ?", accountName, orgID).First(&account).Error; err != nil {
 			return nil, fmt.Errorf("WhatsApp account not found")
 		}
-		a.decryptAccountSecrets(&account)
+		if err := a.prepareWhatsAppAccountForRuntime(&account); err != nil {
+			return nil, err
+		}
 		return &account, nil
 	}
 
@@ -764,7 +766,9 @@ func (a *App) resolveWhatsAppAccount(orgID uuid.UUID, accountName string) (*mode
 			return nil, fmt.Errorf("no WhatsApp account configured")
 		}
 	}
-	a.decryptAccountSecrets(&account)
+	if err := a.prepareWhatsAppAccountForRuntime(&account); err != nil {
+		return nil, err
+	}
 	return &account, nil
 }
 

@@ -299,18 +299,19 @@ func (CustomAction) TableName() string {
 // WhatsAppAccount represents a WhatsApp Business Account
 type WhatsAppAccount struct {
 	BaseModel
-	OrganizationID     uuid.UUID `gorm:"type:uuid;index;not null" json:"organization_id"`
-	Name               string    `gorm:"size:100;uniqueIndex:idx_wa_org_name;not null" json:"name"` // Unique per org, used as reference
-	AppID              string    `gorm:"size:100" json:"app_id"`                                    // Meta App ID
-	PhoneID            string    `gorm:"size:100;not null" json:"phone_id"`
-	BusinessID         string    `gorm:"size:100;not null" json:"business_id"`
-	AccessToken        string    `gorm:"type:text;not null" json:"-"` // encrypted
-	AppSecret          string    `gorm:"size:255" json:"-"`           // Meta App Secret for webhook signature verification
-	WebhookVerifyToken string    `gorm:"size:255" json:"webhook_verify_token"`
-	APIVersion         string    `gorm:"size:20;default:'v21.0'" json:"api_version"`
-	IsDefaultIncoming  bool      `gorm:"default:false" json:"is_default_incoming"`
-	IsDefaultOutgoing  bool      `gorm:"default:false" json:"is_default_outgoing"`
-	AutoReadReceipt    bool      `gorm:"default:false" json:"auto_read_receipt"`
+	OrganizationID       uuid.UUID  `gorm:"type:uuid;index;not null" json:"organization_id"`
+	Name                 string     `gorm:"size:100;uniqueIndex:idx_wa_org_name;not null" json:"name"` // Unique per org, used as reference
+	AppID                string     `gorm:"size:100" json:"app_id"`                                    // Meta App ID
+	PhoneID              string     `gorm:"size:100;not null" json:"phone_id"`
+	BusinessID           string     `gorm:"size:100;not null" json:"business_id"`
+	AccessToken          string     `gorm:"type:text;not null" json:"-"` // encrypted
+	AccessTokenExpiresAt *time.Time `json:"access_token_expires_at,omitempty"`
+	AppSecret            string     `gorm:"size:255" json:"-"` // Meta App Secret for webhook signature verification
+	WebhookVerifyToken   string     `gorm:"size:255" json:"-"` // legacy DB-only callback compatibility; never serialize
+	APIVersion           string     `gorm:"size:20;default:'v21.0'" json:"api_version"`
+	IsDefaultIncoming    bool       `gorm:"default:false" json:"is_default_incoming"`
+	IsDefaultOutgoing    bool       `gorm:"default:false" json:"is_default_outgoing"`
+	AutoReadReceipt      bool       `gorm:"default:false" json:"auto_read_receipt"`
 	// BusinessCallingEnabled gates outbound voice_call interactive buttons.
 	// Set to true only after Meta enrolls this number in the WhatsApp Business
 	// Calling API. Used by the canned-response editor to disable the Call

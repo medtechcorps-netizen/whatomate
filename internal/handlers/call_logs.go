@@ -94,6 +94,9 @@ func (a *App) ListCallLogs(r *fastglue.Request) error {
 			}
 		}
 	}
+	for index := range callLogs {
+		callLogs[index].IVRFlow = redactIVRFlowPointerForResponse(callLogs[index].IVRFlow)
+	}
 
 	return r.SendEnvelope(listEnvelope("call_logs", callLogs, total, pg))
 }
@@ -128,6 +131,7 @@ func (a *App) GetCallLog(r *fastglue.Request) error {
 			callLog.Contact.ProfileName = utils.MaskIfPhoneNumber(callLog.Contact.ProfileName)
 		}
 	}
+	callLog.IVRFlow = redactIVRFlowPointerForResponse(callLog.IVRFlow)
 
 	// Fetch associated call transfers for this call log
 	var transfers []models.CallTransfer

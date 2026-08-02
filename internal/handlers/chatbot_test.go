@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -33,6 +34,32 @@ func getChatbotFlowPermissions(t *testing.T, app *handlers.App) []models.Permiss
 	}
 	require.NotEmpty(t, flowPerms, "expected flows.chatbot permissions in default set")
 	return flowPerms
+}
+
+func createAIContextUser(
+	t *testing.T,
+	app *handlers.App,
+	organizationID uuid.UUID,
+	actions ...string,
+) *models.User {
+	t.Helper()
+	permissionKeys := make([]string, 0, len(actions))
+	for _, action := range actions {
+		permissionKeys = append(permissionKeys, models.ResourceChatbotAI+":"+action)
+	}
+	role := testutil.CreateTestRoleWithKeys(
+		t,
+		app.DB,
+		organizationID,
+		"ai-context-user",
+		permissionKeys,
+	)
+	return testutil.CreateTestUser(
+		t,
+		app.DB,
+		organizationID,
+		testutil.WithRoleID(&role.ID),
+	)
 }
 
 func createChatbotSettingsWriter(
@@ -1204,6 +1231,33 @@ func TestApp_CreateChatbotFlow(t *testing.T) {
 		assert.Equal(t, "Onboarding Flow", flow.Name)
 		assert.True(t, flow.IsEnabled)
 	})
+
+	t.Run("webhook requires a completion URL", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		perms := getChatbotFlowPermissions(t, app)
+		role := testutil.CreateTestRole(t, app.DB, org.ID, "flow-admin", perms)
+		user := testutil.CreateTestUser(t, app.DB, org.ID,
+			testutil.WithEmail(testutil.UniqueEmail("create-flow-webhook-url")),
+			testutil.WithRoleID(&role.ID),
+		)
+
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"name":               "Incomplete webhook flow",
+			"on_complete_action": "webhook",
+			"completion_config":  map[string]any{},
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		require.NoError(t, app.CreateChatbotFlow(req))
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "completion webhook URL is required")
+
+		var count int64
+		require.NoError(t, app.DB.Model(&models.ChatbotFlow{}).
+			Where("organization_id = ? AND name = ?", org.ID, "Incomplete webhook flow").
+			Count(&count).Error)
+		assert.Zero(t, count)
+	})
 }
 
 // =============================================================================
@@ -1311,6 +1365,56 @@ func TestApp_UpdateChatbotFlow(t *testing.T) {
 		assert.Equal(t, updatedDesc, updated.Description)
 		assert.False(t, updated.IsEnabled)
 	})
+
+	t.Run("partial action change requires an effective completion URL", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		perms := getChatbotFlowPermissions(t, app)
+		role := testutil.CreateTestRole(t, app.DB, org.ID, "flow-admin", perms)
+		user := testutil.CreateTestUser(t, app.DB, org.ID,
+			testutil.WithEmail(testutil.UniqueEmail("update-flow-webhook-url")),
+			testutil.WithRoleID(&role.ID),
+		)
+		flow := createTestChatbotFlow(t, app, org.ID, "No webhook config")
+
+		req := testutil.NewJSONRequest(t, map[string]any{"on_complete_action": "webhook"})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetPathParam(req, "id", flow.ID.String())
+
+		require.NoError(t, app.UpdateChatbotFlow(req))
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "completion webhook URL is required")
+
+		var unchanged models.ChatbotFlow
+		require.NoError(t, app.DB.First(&unchanged, "id = ?", flow.ID).Error)
+		assert.NotEqual(t, "webhook", unchanged.OnCompleteAction)
+	})
+
+	t.Run("unrelated partial update rejects an invalid effective webhook", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		perms := getChatbotFlowPermissions(t, app)
+		role := testutil.CreateTestRole(t, app.DB, org.ID, "flow-admin", perms)
+		user := testutil.CreateTestUser(t, app.DB, org.ID,
+			testutil.WithEmail(testutil.UniqueEmail("update-invalid-webhook")),
+			testutil.WithRoleID(&role.ID),
+		)
+		flow := createTestChatbotFlow(t, app, org.ID, "Legacy invalid webhook")
+		require.NoError(t, app.DB.Model(flow).Updates(map[string]any{
+			"on_complete_action": "webhook",
+			"completion_config":  models.JSONB{},
+		}).Error)
+
+		req := testutil.NewJSONRequest(t, map[string]any{"name": "Must not persist"})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetPathParam(req, "id", flow.ID.String())
+
+		require.NoError(t, app.UpdateChatbotFlow(req))
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "completion webhook URL is required")
+
+		var unchanged models.ChatbotFlow
+		require.NoError(t, app.DB.First(&unchanged, "id = ?", flow.ID).Error)
+		assert.Equal(t, "Legacy invalid webhook", unchanged.Name)
+	})
 }
 
 // =============================================================================
@@ -1384,7 +1488,7 @@ func TestApp_ListAIContexts(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionRead)
 
 		createTestAIContext(t, app, org.ID, "FAQ Context")
 		createTestAIContext(t, app, org.ID, "Product Context")
@@ -1409,7 +1513,7 @@ func TestApp_ListAIContexts(t *testing.T) {
 	t.Run("empty list", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionRead)
 
 		req := testutil.NewGETRequest(t)
 		testutil.SetAuthContext(req, org.ID, user.ID)
@@ -1439,7 +1543,7 @@ func TestApp_CreateAIContext(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"name":             "Product FAQ",
@@ -1489,7 +1593,7 @@ func TestApp_GetAIContext(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionRead)
 		ctx := createTestAIContext(t, app, org.ID, "FAQ Context")
 
 		req := testutil.NewGETRequest(t)
@@ -1513,7 +1617,7 @@ func TestApp_GetAIContext(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionRead)
 
 		req := testutil.NewGETRequest(t)
 		testutil.SetAuthContext(req, org.ID, user.ID)
@@ -1535,7 +1639,7 @@ func TestApp_DeleteAIContext(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionDelete)
 		ctx := createTestAIContext(t, app, org.ID, "To Delete Context")
 
 		req := testutil.NewGETRequest(t)
@@ -1564,7 +1668,7 @@ func TestApp_DeleteAIContext(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionDelete)
 
 		req := testutil.NewGETRequest(t)
 		testutil.SetAuthContext(req, org.ID, user.ID)
@@ -2519,7 +2623,7 @@ func TestApp_CreateAIContext_Additional(t *testing.T) {
 	t.Run("validation error missing name", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"context_type":     "static",
@@ -2536,7 +2640,7 @@ func TestApp_CreateAIContext_Additional(t *testing.T) {
 	t.Run("defaults context_type to static when omitted", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"name":             "Defaulted Context",
@@ -2569,12 +2673,13 @@ func TestApp_CreateAIContext_Additional(t *testing.T) {
 	t.Run("create API context type", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"name":             "API Context",
 			"context_type":     "api",
 			"trigger_keywords": []string{"live_data"},
+			"api_config":       map[string]any{"url": "https://example.com/context"},
 			"priority":         50,
 			"enabled":          true,
 		})
@@ -2601,10 +2706,32 @@ func TestApp_CreateAIContext_Additional(t *testing.T) {
 		assert.Equal(t, 50, ctx.Priority)
 	})
 
+	t.Run("create API context requires URL", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
+
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"name":         "Incomplete API Context",
+			"context_type": "api",
+			"api_config":   map[string]any{},
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		require.NoError(t, app.CreateAIContext(req))
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "API context URL is required")
+
+		var count int64
+		require.NoError(t, app.DB.Model(&models.AIContext{}).
+			Where("organization_id = ? AND name = ?", org.ID, "Incomplete API Context").
+			Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
 	t.Run("persist api_config for API context", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"name":         "API Context With Config",
@@ -2642,7 +2769,12 @@ func TestApp_CreateAIContext_Additional(t *testing.T) {
 		assert.Equal(t, "data.context", ctx.ApiConfig["response_path"])
 		headers, ok := ctx.ApiConfig["headers"].(map[string]any)
 		require.True(t, ok)
-		assert.Equal(t, "Bearer token", headers["Authorization"])
+		storedAuthorization, ok := headers["Authorization"].(string)
+		require.True(t, ok)
+		assert.True(t, appcrypto.IsEncrypted(storedAuthorization))
+		decrypted, err := appcrypto.Decrypt(storedAuthorization, app.Config.App.EncryptionKey)
+		require.NoError(t, err)
+		assert.Equal(t, "Bearer token", decrypted)
 	})
 }
 
@@ -2656,7 +2788,7 @@ func TestApp_UpdateAIContext(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
 		aiCtx := createTestAIContext(t, app, org.ID, "Original Context")
 
 		req := testutil.NewJSONRequest(t, map[string]any{
@@ -2695,7 +2827,7 @@ func TestApp_UpdateAIContext(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"name": "Ghost Context",
@@ -2711,7 +2843,7 @@ func TestApp_UpdateAIContext(t *testing.T) {
 	t.Run("partial update only changes provided fields", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
 		aiCtx := createTestAIContext(t, app, org.ID, "Partial Update Ctx")
 
 		// Only update the name
@@ -2735,10 +2867,10 @@ func TestApp_UpdateAIContext(t *testing.T) {
 		assert.True(t, updated.IsEnabled)
 	})
 
-	t.Run("change context_type from static to api", func(t *testing.T) {
+	t.Run("change context_type from static to api requires URL", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
 		aiCtx := createTestAIContext(t, app, org.ID, "Type Change Ctx")
 
 		req := testutil.NewJSONRequest(t, map[string]any{
@@ -2749,17 +2881,39 @@ func TestApp_UpdateAIContext(t *testing.T) {
 
 		err := app.UpdateAIContext(req)
 		require.NoError(t, err)
-		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "API context URL is required")
 
 		var updated models.AIContext
 		require.NoError(t, app.DB.First(&updated, "id = ?", aiCtx.ID).Error)
-		assert.Equal(t, models.ContextTypeAPI, updated.ContextType)
+		assert.Equal(t, models.ContextTypeStatic, updated.ContextType)
+	})
+
+	t.Run("unrelated partial update rejects an invalid effective API context", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
+		aiCtx := createTestAIContext(t, app, org.ID, "Legacy invalid API context")
+		require.NoError(t, app.DB.Model(aiCtx).Updates(map[string]any{
+			"context_type": models.ContextTypeAPI,
+			"api_config":   models.JSONB{},
+		}).Error)
+
+		req := testutil.NewJSONRequest(t, map[string]any{"name": "Must not persist"})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetPathParam(req, "id", aiCtx.ID.String())
+
+		require.NoError(t, app.UpdateAIContext(req))
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "API context URL is required")
+
+		var unchanged models.AIContext
+		require.NoError(t, app.DB.First(&unchanged, "id = ?", aiCtx.ID).Error)
+		assert.Equal(t, "Legacy invalid API context", unchanged.Name)
 	})
 
 	t.Run("update api_config for API context", func(t *testing.T) {
 		app := newTestApp(t)
 		org := testutil.CreateTestOrganization(t, app.DB)
-		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		user := createAIContextUser(t, app, org.ID, models.ActionWrite)
 		aiCtx := createTestAIContext(t, app, org.ID, "API Config Update Ctx")
 
 		req := testutil.NewJSONRequest(t, map[string]any{
@@ -2799,13 +2953,11 @@ func TestApp_ListAIContexts_OrgIsolation(t *testing.T) {
 		app := newTestApp(t)
 
 		org1 := testutil.CreateTestOrganization(t, app.DB)
-		user1 := testutil.CreateTestUser(t, app.DB, org1.ID)
+		user1 := createAIContextUser(t, app, org1.ID, models.ActionRead)
 		createTestAIContext(t, app, org1.ID, "Org1 Context")
 
 		org2 := testutil.CreateTestOrganization(t, app.DB)
-		user2 := testutil.CreateTestUser(t, app.DB, org2.ID,
-			testutil.WithEmail(testutil.UniqueEmail("org2-ai")),
-		)
+		user2 := createAIContextUser(t, app, org2.ID, models.ActionRead)
 		createTestAIContext(t, app, org2.ID, "Org2 Context")
 
 		req := testutil.NewGETRequest(t)
@@ -3216,9 +3368,7 @@ func TestApp_DeleteAIContext_CrossOrg(t *testing.T) {
 		aiCtx := createTestAIContext(t, app, org1.ID, "Org1 AI Context")
 
 		org2 := testutil.CreateTestOrganization(t, app.DB)
-		user2 := testutil.CreateTestUser(t, app.DB, org2.ID,
-			testutil.WithEmail(testutil.UniqueEmail("org2-delai")),
-		)
+		user2 := createAIContextUser(t, app, org2.ID, models.ActionDelete)
 
 		req := testutil.NewGETRequest(t)
 		testutil.SetAuthContext(req, org2.ID, user2.ID)
@@ -3308,9 +3458,7 @@ func TestApp_GetAIContext_CrossOrg(t *testing.T) {
 		aiCtx := createTestAIContext(t, app, org1.ID, "Org1 Secret Context")
 
 		org2 := testutil.CreateTestOrganization(t, app.DB)
-		user2 := testutil.CreateTestUser(t, app.DB, org2.ID,
-			testutil.WithEmail(testutil.UniqueEmail("org2-getai")),
-		)
+		user2 := createAIContextUser(t, app, org2.ID, models.ActionRead)
 
 		req := testutil.NewGETRequest(t)
 		testutil.SetAuthContext(req, org2.ID, user2.ID)

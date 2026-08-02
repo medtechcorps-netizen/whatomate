@@ -31,7 +31,7 @@ export async function login(page: Page, user: TestUser) {
   await page.goto('/login', { waitUntil: 'domcontentloaded' })
   await page.locator('input[name="email"], input[type="email"]').fill(user.email)
   await page.locator('input[name="password"], input[type="password"]').fill(user.password)
-  await page.locator('button[type="submit"]').click()
+  await page.getByTestId('password-sign-in').click()
   // Wait for redirect away from login page (could be dashboard, chat, analytics, etc.)
   await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 10000 })
 }

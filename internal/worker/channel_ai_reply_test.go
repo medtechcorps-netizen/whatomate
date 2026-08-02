@@ -452,7 +452,17 @@ func TestResolveChannelAIReplySettingsUsesSafeFallbackPrecedence(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	org := testutil.CreateTestOrganization(t, db)
 	now := time.Now().UTC()
-	olderQwen := createChannelAIReplySettings(
+	require.NoError(t, db.Create(&models.CopilotSettings{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		IsEnabled:       true,
+		Provider:        models.AIProviderQwen,
+		Model:           "qwen-test",
+		APIKeyEncrypted: "central-qwen-key",
+		MaxTokens:       500,
+		Temperature:     0.2,
+	}).Error)
+	_ = createChannelAIReplySettings(
 		t,
 		db,
 		org.ID,
@@ -461,7 +471,7 @@ func TestResolveChannelAIReplySettingsUsesSafeFallbackPrecedence(t *testing.T) {
 		true,
 		now.Add(-time.Hour),
 	)
-	newerQwen := createChannelAIReplySettings(
+	_ = createChannelAIReplySettings(
 		t,
 		db,
 		org.ID,
@@ -490,9 +500,22 @@ func TestResolveChannelAIReplySettingsUsesSafeFallbackPrecedence(t *testing.T) {
 	)
 
 	resolved, err := resolveChannelAIReplySettings(db, org.ID, "social-profile")
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	assert.Equal(t, uuid.Nil, resolved.ID, "another account's Qwen profile must never be a credential fallback")
+
+	global := createChannelAIReplySettings(
+		t,
+		db,
+		org.ID,
+		"",
+		models.AIProviderQwen,
+		true,
+		now.Add(250*time.Minute),
+	)
+	resolved, err = resolveChannelAIReplySettings(db, org.ID, "social-profile")
 	require.NoError(t, err)
-	assert.Equal(t, newerQwen.ID, resolved.ID)
-	assert.NotEqual(t, olderQwen.ID, resolved.ID)
+	assert.Equal(t, global.ID, resolved.ID)
+	assert.Equal(t, "central-qwen-key", resolved.AI.APIKey)
 
 	explicitDisabled := createChannelAIReplySettings(
 		t,
@@ -520,6 +543,10 @@ func TestChannelAIReplyPromptUsesResolvedProfileContextAndTenantScope(t *testing
 		Where("id = ?", fixture.Settings.ID).
 		Update("whats_app_account", profileName).Error)
 	fixture.Settings.WhatsAppAccount = profileName
+	require.NoError(t, db.Model(&models.ChannelAccount{}).
+		Where("id = ?", fixture.Account.ID).
+		Update("name", profileName).Error)
+	fixture.Account.Name = profileName
 	aiContext := models.AIContext{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
 		OrganizationID:  fixture.Organization.ID,
@@ -574,6 +601,16 @@ func createChannelAIReplyWorkerFixture(
 ) *channelAIReplyFixture {
 	t.Helper()
 	organization := testutil.CreateTestOrganization(t, db)
+	require.NoError(t, db.Create(&models.CopilotSettings{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  organization.ID,
+		IsEnabled:       true,
+		Provider:        models.AIProviderQwen,
+		Model:           "qwen-test",
+		APIKeyEncrypted: "test-qwen-key",
+		MaxTokens:       500,
+		Temperature:     0.2,
+	}).Error)
 	account := &models.ChannelAccount{
 		BaseModel:         models.BaseModel{ID: uuid.New()},
 		OrganizationID:    organization.ID,

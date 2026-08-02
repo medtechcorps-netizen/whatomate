@@ -245,20 +245,28 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 		}
 	}
 
+	if a.Config == nil || strings.TrimSpace(a.Config.App.EncryptionKey) == "" {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Channel credential storage is unavailable",
+			nil,
+			"",
+		)
+	}
 	inboundSecret, err := generateChannelSecret()
 	if err != nil {
 		a.Log.Error("Failed to generate channel webhook secret", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create channel account", nil, "")
 	}
 	encryptedInbound, err := appcrypto.Encrypt(inboundSecret, a.Config.App.EncryptionKey)
-	if err != nil {
+	if err != nil || !appcrypto.IsEncrypted(encryptedInbound) {
 		a.Log.Error("Failed to encrypt channel webhook secret", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create channel account", nil, "")
 	}
 	credentialBlob := models.JSONB{"inbound_secret": encryptedInbound}
 	if request.OutboundSecret != "" {
 		encryptedOutbound, encryptErr := appcrypto.Encrypt(request.OutboundSecret, a.Config.App.EncryptionKey)
-		if encryptErr != nil {
+		if encryptErr != nil || !appcrypto.IsEncrypted(encryptedOutbound) {
 			a.Log.Error("Failed to encrypt channel outbound secret", "error", encryptErr)
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create channel account", nil, "")
 		}
@@ -1004,16 +1012,14 @@ func additionalChannelCreationEntitlement(channel models.Channel) (string, bool)
 }
 
 func validateChannelCreationPolicy(request ChannelAccountRequest) error {
-	if request.Channel != models.ChannelThreads {
+	switch request.Channel {
+	case models.ChannelThreads:
+		return errors.New("threads is preparation-only until an approved adapter is installed; channel accounts cannot be created yet")
+	case models.ChannelTikTok:
+		return errors.New("tiktok is preparation-only until an approved messaging adapter is installed; channel accounts cannot be created yet")
+	default:
 		return nil
 	}
-	if request.Provider != channelapi.RelayProvider {
-		return errors.New("threads public engagement accounts require the signed relay provider")
-	}
-	if request.IsDefaultOutgoing {
-		return errors.New("threads public engagement supports replies and mentions only; direct messages and default outbound are not supported")
-	}
-	return nil
 }
 
 func threadsPublicEngagementConfig(config models.JSONB) models.JSONB {
@@ -1326,5 +1332,8 @@ func requestContext(r *fastglue.Request) context.Context {
 	if r == nil || r.RequestCtx == nil {
 		return context.Background()
 	}
-	return r.RequestCtx
+	// fasthttp's RequestCtx only becomes cancellable after it is attached to a
+	// server. Keep request values while giving downstream timeouts a safe parent
+	// for direct handler calls (including tests and other in-process callers).
+	return context.WithoutCancel(r.RequestCtx)
 }

@@ -3,12 +3,81 @@ package testutil
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 )
+
+// NewHTTPSRewriteClient returns an HTTP client that accepts public-looking
+// HTTPS origins in application fixtures but sends those requests only to the
+// corresponding local test servers. Unmapped destinations fail closed, which
+// prevents a fixture typo from making a real provider or Internet request.
+//
+// The map keys must be origins such as "https://hooks.example.com". Request
+// paths and query strings are preserved when the destination is rewritten.
+func NewHTTPSRewriteClient(t *testing.T, routes map[string]*httptest.Server) *http.Client {
+	t.Helper()
+
+	rewrites := make(map[string]httpsRewriteTarget, len(routes))
+	for publicOrigin, server := range routes {
+		require.NotNil(t, server, "rewrite target server must not be nil")
+
+		publicURL, err := url.Parse(publicOrigin)
+		require.NoError(t, err, "invalid public test origin")
+		require.Equal(t, "https", publicURL.Scheme, "public test origin must use HTTPS")
+		require.NotEmpty(t, publicURL.Host, "public test origin must have a host")
+		require.Empty(t, publicURL.Path, "public test origin must not have a path")
+		require.Empty(t, publicURL.RawQuery, "public test origin must not have a query")
+
+		targetURL, err := url.Parse(server.URL)
+		require.NoError(t, err, "invalid local test server URL")
+		baseTransport := server.Client().Transport
+		if baseTransport == nil {
+			baseTransport = http.DefaultTransport
+		}
+		rewrites[strings.ToLower(publicURL.Scheme+"://"+publicURL.Host)] = httpsRewriteTarget{
+			url:       targetURL,
+			transport: baseTransport,
+		}
+	}
+
+	return &http.Client{
+		Transport: &httpsRewriteTransport{rewrites: rewrites},
+		Timeout:   5 * time.Second,
+	}
+}
+
+type httpsRewriteTransport struct {
+	rewrites map[string]httpsRewriteTarget
+}
+
+type httpsRewriteTarget struct {
+	url       *url.URL
+	transport http.RoundTripper
+}
+
+func (transport *httpsRewriteTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	origin := strings.ToLower(request.URL.Scheme + "://" + request.URL.Host)
+	target, ok := transport.rewrites[origin]
+	if !ok {
+		return nil, fmt.Errorf("test HTTP destination %q is not mapped", origin)
+	}
+
+	rewritten := request.Clone(request.Context())
+	rewrittenURL := *request.URL
+	rewrittenURL.Scheme = target.url.Scheme
+	rewrittenURL.Host = target.url.Host
+	rewritten.URL = &rewrittenURL
+	rewritten.Host = ""
+	return target.transport.RoundTrip(rewritten)
+}
 
 // NewJSONRequest creates a fastglue request with a JSON body for testing.
 func NewJSONRequest(t *testing.T, body any) *fastglue.Request {

@@ -71,6 +71,8 @@ jobs:
           name = "ReReply"
           environment = "test"
           debug = true
+          # CI-only deterministic fixture key for this disposable test database.
+          encryption_key = "synthetic-e2e-key-not-for-production" # gitleaks:allow
 
           [server]
           host = "0.0.0.0"
@@ -106,6 +108,9 @@ jobs:
           [storage]
           type = "local"
           local_path = "./uploads"
+
+          [whatsapp]
+          base_url = "http://127.0.0.1:9"
           EOF
 
       # Build frontend FIRST so it can be embedded in the backend
@@ -157,6 +162,7 @@ jobs:
         env:
           BASE_URL: http://localhost:8080
           TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/whatomate_test
+          E2E_SEED_WHATSAPP_ACCOUNTS: "1"
           CI: true
 
       - name: Upload Playwright report

@@ -235,40 +235,20 @@ test.describe('Threads public engagement channel', () => {
     await expect(page.getByTestId('threads-public-engagement-adapter')).toHaveCount(0)
   })
 
-  test('shows beta public-only guidance and creates a relay account when entitled', async ({ page }) => {
+  test('shows the unavailable adapter and does not offer relay account creation when entitled', async ({ page }) => {
     const state = await mockChannels(page, { threadsEnabled: true })
     await page.goto('/inbox')
 
     await page.getByRole('button', { name: 'Connect', exact: true }).click()
     const channelSelect = page.getByTestId('channel-connect-type')
-    await expect(channelSelect.locator('option[value="threads"]')).toHaveText(
-      'Threads public replies',
+    await expect(channelSelect.locator('option[value="threads"]')).toHaveCount(0)
+    await expect(page.getByTestId('threads-public-engagement-adapter')).toContainText(
+      'Adapter unavailable; account creation disabled',
     )
-    await channelSelect.selectOption('threads')
-
-    const notice = page.getByTestId('threads-public-engagement-notice')
-    await expect(notice).toContainText('Beta: public engagement only')
-    await expect(notice).toContainText('Direct messages and standalone posts are not supported')
-    await expect(notice).toContainText('remains pending')
-
-    await page.getByPlaceholder('Connection name').fill('ReAlign Threads beta')
-    await page.getByPlaceholder('External account ID').fill('realign-threads')
-    await page.getByPlaceholder('HTTPS signed-relay URL').fill(
-      'https://relay.example.test/threads',
-    )
-    await page.getByTestId('channel-connect-submit').click()
-
-    await expect.poll(state.createdAccount).toMatchObject({
-      channel: 'threads',
-      provider: 'relay',
-      name: 'ReAlign Threads beta',
-      external_account_id: 'realign-threads',
-      config: { relay_url: 'https://relay.example.test/threads' },
-    })
-    expect(state.createdAccount()).not.toHaveProperty('is_default_outgoing', true)
+    expect(state.createdAccount()).toBeNull()
   })
 
-  test('sends only against the selected public reply or mention target', async ({ page }) => {
+  test('keeps existing Threads conversations read-only while the adapter is unavailable', async ({ page }) => {
     const state = await mockChannels(page, {
       threadsEnabled: true,
       accounts: [threadsAccount],
@@ -278,18 +258,13 @@ test.describe('Threads public engagement channel', () => {
 
     await page.getByRole('button', { name: /Alya Public/ }).click()
     const notice = page.getByTestId('threads-public-reply-composer-notice')
-    await expect(notice).toContainText('selected reply or mention is the required target')
-    await expect(notice).toContainText('direct messages and standalone posts are not supported')
+    await expect(notice).toContainText('an approved public-engagement adapter is not installed')
+    await expect(notice).toContainText('replies, direct messages and standalone posts are disabled')
 
-    await page.getByPlaceholder('Write a public Threads reply...').fill(
-      'Yes, Pilates can help.',
-    )
-    await page.getByRole('button', { name: 'Send public Threads reply', exact: true }).click()
-
-    await expect.poll(state.sentMessage).toMatchObject({
-      purpose: 'service',
-      reply_to_external_id: threadsConversation.external_conversation_id,
-      parts: [{ type: 'text', text: 'Yes, Pilates can help.' }],
-    })
+    await expect(
+      page.getByPlaceholder('Threads replies are unavailable — adapter not installed'),
+    ).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Threads reply unavailable' })).toBeDisabled()
+    expect(state.sentMessage()).toBeNull()
   })
 })

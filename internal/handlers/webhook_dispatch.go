@@ -7,11 +7,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 )
 
@@ -156,7 +159,6 @@ func (a *App) sendWebhook(ctx context.Context, webhook models.Webhook, eventType
 
 		if err := a.sendWebhookRequest(ctx, webhook, jsonData); err != nil {
 			a.Log.Warn("webhook delivery failed",
-				"error", err,
 				"webhook_id", webhook.ID,
 				"attempt", attempt+1,
 				"max_retries", maxRetries,
@@ -168,7 +170,7 @@ func (a *App) sendWebhook(ctx context.Context, webhook models.Webhook, eventType
 		a.Log.Debug("webhook delivered",
 			"webhook_id", webhook.ID,
 			"event", eventType,
-			"url", webhook.URL,
+			"origin", redactURLForLog(webhook.URL),
 		)
 		return
 	}
@@ -176,39 +178,57 @@ func (a *App) sendWebhook(ctx context.Context, webhook models.Webhook, eventType
 	a.Log.Error("webhook delivery failed after all retries",
 		"webhook_id", webhook.ID,
 		"event", eventType,
-		"url", webhook.URL,
+		"origin", redactURLForLog(webhook.URL),
 	)
 }
 
 func (a *App) sendWebhookRequest(ctx context.Context, webhook models.Webhook, jsonData []byte) error {
+	if err := validateEventWebhookURL(webhook.URL); err != nil {
+		return errors.New("stored webhook URL is not allowed")
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", webhook.URL, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return err
+		return errors.New("stored webhook URL could not be used")
 	}
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "ReReply-Webhook/1.0")
 
-	// Add custom headers from webhook config
-	if webhook.Headers != nil {
-		for key, value := range webhook.Headers {
-			if strValue, ok := value.(string); ok {
-				req.Header.Set(key, strValue)
-			}
-		}
+	// Credentials are decrypted only at the network boundary. Legacy plaintext
+	// headers remain supported during migration.
+	customHeaders, err := a.resolveOutboundHeaders(webhook.Headers)
+	if err != nil {
+		return err
+	}
+	for key, value := range customHeaders {
+		req.Header.Set(key, value)
 	}
 
 	// Add HMAC signature if secret is configured
 	if webhook.Secret != "" {
-		signature := computeHMACSignature(jsonData, webhook.Secret)
+		secret, err := a.decryptWebhookSecret(webhook.Secret)
+		if err != nil {
+			return err
+		}
+		signature := computeHMACSignature(jsonData, secret)
 		req.Header.Set("X-Webhook-Signature", signature)
 	}
 
-	// Send request
-	resp, err := a.HTTPClient.Do(req)
+	// Webhook headers can contain tenant credentials, and the signature is valid
+	// only for this exact destination. Never replay either across redirects.
+	if a == nil || a.HTTPClient == nil {
+		return errors.New("outbound HTTP client is not configured")
+	}
+	client := a.HTTPClient
+	redirectSafeClient := *client
+	redirectSafeClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	resp, err := redirectSafeClient.Do(req)
 	if err != nil {
-		return err
+		return errors.New("webhook request failed")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -218,6 +238,25 @@ func (a *App) sendWebhookRequest(ctx context.Context, webhook models.Webhook, js
 	}
 
 	return nil
+}
+
+func (a *App) decryptWebhookSecret(stored string) (string, error) {
+	stored = strings.TrimSpace(stored)
+	if stored == "" {
+		return "", nil
+	}
+	encryptionKey := ""
+	if a != nil && a.Config != nil {
+		encryptionKey = a.Config.App.EncryptionKey
+	}
+	if appcrypto.IsEncrypted(stored) && strings.TrimSpace(encryptionKey) == "" {
+		return "", errors.New("webhook credential encryption key is unavailable")
+	}
+	secret, err := appcrypto.Decrypt(stored, encryptionKey)
+	if err != nil || strings.TrimSpace(secret) == "" {
+		return "", errors.New("webhook credential could not be decrypted")
+	}
+	return secret, nil
 }
 
 func computeHMACSignature(data []byte, secret string) string {

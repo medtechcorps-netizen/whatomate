@@ -3,6 +3,7 @@ package calling
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"sync"
@@ -146,10 +147,14 @@ type Manager struct {
 	s3       *storage.S3Client // nil when recording is disabled
 	redis    *redis.Client
 	assigner *assignment.Assigner
+	// httpClient is the application's shared client. Production injects the
+	// SSRF-safe transport; callback execution fails closed when it is absent.
+	httpClient    *http.Client
+	encryptionKey string
 }
 
 // NewManager creates a new call session manager
-func NewManager(cfg *config.CallingConfig, s3Client *storage.S3Client, db *gorm.DB, rd *redis.Client, waClient *whatsapp.Client, wsHub *websocket.Hub, assigner *assignment.Assigner, log logf.Logger) *Manager {
+func NewManager(cfg *config.CallingConfig, s3Client *storage.S3Client, db *gorm.DB, rd *redis.Client, waClient *whatsapp.Client, wsHub *websocket.Hub, assigner *assignment.Assigner, httpClient *http.Client, encryptionKey string, log logf.Logger) *Manager {
 	// Apply defaults for server-level config
 	if cfg.AudioDir == "" {
 		cfg.AudioDir = "./audio"
@@ -169,15 +174,17 @@ func NewManager(cfg *config.CallingConfig, s3Client *storage.S3Client, db *gorm.
 	}
 
 	return &Manager{
-		sessions: make(map[string]*CallSession),
-		log:      log,
-		whatsapp: waClient,
-		db:       db,
-		redis:    rd,
-		wsHub:    wsHub,
-		config:   cfg,
-		s3:       s3Client,
-		assigner: assigner,
+		sessions:      make(map[string]*CallSession),
+		log:           log,
+		whatsapp:      waClient,
+		db:            db,
+		redis:         rd,
+		wsHub:         wsHub,
+		config:        cfg,
+		s3:            s3Client,
+		assigner:      assigner,
+		httpClient:    httpClient,
+		encryptionKey: encryptionKey,
 	}
 }
 
@@ -335,6 +342,20 @@ func (m *Manager) GetSessionByCallLogID(callLogID uuid.UUID) *CallSession {
 	for _, s := range m.sessions {
 		if s.CallLogID == callLogID {
 			return s
+		}
+	}
+	return nil
+}
+
+// getSessionByOrganizationAndCallLogID returns an active call session only
+// when both its tenant and call-log identifiers match. Mutating operations must
+// use this tenant-scoped lookup instead of trusting a globally supplied UUID.
+func (m *Manager) getSessionByOrganizationAndCallLogID(organizationID, callLogID uuid.UUID) *CallSession {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, session := range m.sessions {
+		if session.OrganizationID == organizationID && session.CallLogID == callLogID {
+			return session
 		}
 	}
 	return nil

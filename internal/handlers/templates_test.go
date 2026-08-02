@@ -1,9 +1,12 @@
 package handlers_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -17,6 +20,68 @@ import (
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 )
+
+func TestApp_UploadTemplateMedia_UsesCentralMetaAppIDForEmptyLegacyAccount(t *testing.T) {
+	var requestedPaths []string
+	var requestedAuthorization []string
+	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPaths = append(requestedPaths, r.URL.Path)
+		requestedAuthorization = append(requestedAuthorization, r.Header.Get("Authorization"))
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/managed-meta-app-id/uploads"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "central-upload-session"})
+		case strings.HasSuffix(r.URL.Path, "/central-upload-session"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"h": "central-media-handle"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer metaServer.Close()
+
+	app := newTestApp(t)
+	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	account.AppID = ""
+	account.AppSecret = ""
+	require.NoError(t, app.DB.Save(account).Error)
+	setManagedMetaIntegration(t, app, org, "central-template-secret", true)
+
+	var requestBody bytes.Buffer
+	writer := multipart.NewWriter(&requestBody)
+	require.NoError(t, writer.WriteField("account", account.Name))
+	filePart, err := writer.CreateFormFile("file", "sample.jpg")
+	require.NoError(t, err)
+	_, err = filePart.Write([]byte("sample-image-bytes"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	req := testutil.NewRequest(t)
+	req.RequestCtx.Request.Header.SetMethod("POST")
+	req.RequestCtx.Request.Header.SetContentType(writer.FormDataContentType())
+	req.RequestCtx.Request.SetBody(requestBody.Bytes())
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.UploadTemplateMedia(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Contains(t, string(testutil.GetResponseBody(req)), "central-media-handle")
+	require.Len(t, requestedPaths, 2)
+	assert.Contains(t, requestedPaths[0], "/managed-meta-app-id/uploads")
+	assert.Equal(t, "OAuth test-token", requestedAuthorization[1], "central resolution must retain the account access token")
+}
+
+func TestApp_UploadTemplateMedia_RequiresTemplateWritePermission(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "template-upload-reader", []string{"templates:read"})
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+	req := testutil.NewRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.UploadTemplateMedia(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusForbidden, "Insufficient permissions")
+}
 
 // --- ExtParamNames Tests (existing) ---
 

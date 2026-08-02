@@ -788,6 +788,26 @@ func (a *App) toWhatsAppAccount(account *models.WhatsAppAccount) *whatsapp.Accou
 	return account.ToWAAccount()
 }
 
+// toWhatsAppAccountWithMetaApp overlays the effective organization-level App
+// ID for endpoints that require it (resumable uploads). It never mutates or
+// persists the source account, so central credential changes take effect
+// immediately without copying app credentials into account rows.
+func (a *App) toWhatsAppAccountWithMetaApp(account *models.WhatsAppAccount) (*whatsapp.Account, error) {
+	if account == nil {
+		return nil, errors.New("WhatsApp account is required")
+	}
+	appID, _, _, err := a.resolveEffectiveMetaAppCreds(account)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(appID) == "" {
+		return nil, errMetaAppIDNotConfigured
+	}
+	result := account.ToWAAccount()
+	result.AppID = strings.TrimSpace(appID)
+	return result, nil
+}
+
 // createOutgoingMessage creates a Message model from the request
 func (a *App) createOutgoingMessage(req OutgoingMessageRequest, opts MessageSendOptions) *models.Message {
 	msg := &models.Message{
@@ -1168,6 +1188,81 @@ type SendTemplateMessageRequest struct {
 	HeaderParams map[string]string `json:"header_params"`
 }
 
+const (
+	templateHeaderMediaMaxBytes = 16 << 20
+	templateHeaderMediaTimeout  = 30 * time.Second
+)
+
+var (
+	errTemplateHeaderMediaInvalidURL        = errors.New("template header media URL is invalid")
+	errTemplateHeaderMediaClientUnavailable = errors.New("template header media HTTP client is unavailable")
+	errTemplateHeaderMediaDownloadFailed    = errors.New("template header media download failed")
+	errTemplateHeaderMediaUnexpectedStatus  = errors.New("template header media URL did not return HTTP 200")
+	errTemplateHeaderMediaTooLarge          = errors.New("template header media exceeds the 16 MiB limit")
+)
+
+func readTemplateHeaderMedia(reader io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, templateHeaderMediaMaxBytes+1))
+	if err != nil {
+		return nil, errTemplateHeaderMediaDownloadFailed
+	}
+	if len(data) > templateHeaderMediaMaxBytes {
+		return nil, errTemplateHeaderMediaTooLarge
+	}
+	return data, nil
+}
+
+func (a *App) downloadTemplateHeaderMedia(parentCtx context.Context, rawURL string) ([]byte, string, error) {
+	mediaURL := strings.TrimSpace(rawURL)
+	if err := validateWebhookRuntimeURL(mediaURL); err != nil {
+		return nil, "", errTemplateHeaderMediaInvalidURL
+	}
+	if a == nil || a.HTTPClient == nil || a.HTTPClient.Transport == nil {
+		return nil, "", errTemplateHeaderMediaClientUnavailable
+	}
+
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	downloadCtx, cancel := context.WithTimeout(parentCtx, templateHeaderMediaTimeout)
+	defer cancel()
+
+	request, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, mediaURL, nil)
+	if err != nil {
+		return nil, "", errTemplateHeaderMediaInvalidURL
+	}
+
+	// Preserve the injected SSRF-safe transport and connection pool while
+	// preventing a validated public URL from redirecting to a different target.
+	client := *a.HTTPClient
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, "", errTemplateHeaderMediaDownloadFailed
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode != http.StatusOK {
+		return nil, "", errTemplateHeaderMediaUnexpectedStatus
+	}
+	if response.ContentLength > templateHeaderMediaMaxBytes {
+		return nil, "", errTemplateHeaderMediaTooLarge
+	}
+
+	data, err := readTemplateHeaderMedia(response.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	mimeType := response.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	return data, mimeType, nil
+}
+
 // SendTemplateMessage sends a template message to a contact or phone number.
 // Accepts either JSON body or multipart/form-data (when a header media file is included).
 func (a *App) SendTemplateMessage(r *fastglue.Request) error {
@@ -1224,13 +1319,19 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 		// Read header media file
 		if files := form.File["header_file"]; len(files) > 0 {
 			fh := files[0]
+			if fh.Size > templateHeaderMediaMaxBytes {
+				return r.SendErrorEnvelope(fasthttp.StatusRequestEntityTooLarge, "Header file is too large. Maximum size is 16 MiB", nil, "")
+			}
 			f, err := fh.Open()
 			if err != nil {
 				return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Failed to read header file", nil, "")
 			}
 			defer f.Close() //nolint:errcheck
-			headerFileData, err = io.ReadAll(f)
+			headerFileData, err = readTemplateHeaderMedia(f)
 			if err != nil {
+				if errors.Is(err, errTemplateHeaderMediaTooLarge) {
+					return r.SendErrorEnvelope(fasthttp.StatusRequestEntityTooLarge, "Header file is too large. Maximum size is 16 MiB", nil, "")
+				}
 				a.Log.Error("Failed to read header file", "error", err)
 				return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to read header file", nil, "")
 			}
@@ -1394,28 +1495,28 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 	var headerMediaID string
 	var headerMediaData []byte
 	var headerMimeType string
+	headerMediaURL := strings.TrimSpace(req.HeaderMediaURL)
 	if template.HeaderType == "IMAGE" || template.HeaderType == "VIDEO" || template.HeaderType == "DOCUMENT" {
 		if req.HeaderMediaID != "" {
 			// Option 1: Pre-uploaded WhatsApp media ID — use directly (no local preview)
 			headerMediaID = req.HeaderMediaID
-		} else if req.HeaderMediaURL != "" {
+		} else if headerMediaURL != "" {
 			// Option 2: Download from URL, then upload to WhatsApp
-			resp, err := http.Get(req.HeaderMediaURL)
+			headerMediaData, headerMimeType, err = a.downloadTemplateHeaderMedia(requestContext(r), headerMediaURL)
 			if err != nil {
-				return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Failed to download header media from URL", nil, "")
-			}
-			defer resp.Body.Close() //nolint:errcheck
-			if resp.StatusCode != http.StatusOK {
-				return r.SendErrorEnvelope(fasthttp.StatusBadRequest, fmt.Sprintf("Header media URL returned status %d", resp.StatusCode), nil, "")
-			}
-			headerMediaData, err = io.ReadAll(resp.Body)
-			if err != nil {
-				a.Log.Error("Failed to read header media from URL", "error", err)
-				return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to read header media from URL", nil, "")
-			}
-			headerMimeType = resp.Header.Get("Content-Type")
-			if headerMimeType == "" {
-				headerMimeType = "application/octet-stream"
+				switch {
+				case errors.Is(err, errTemplateHeaderMediaInvalidURL):
+					return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid header media URL", nil, "")
+				case errors.Is(err, errTemplateHeaderMediaClientUnavailable):
+					return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Header media download is unavailable", nil, "")
+				case errors.Is(err, errTemplateHeaderMediaUnexpectedStatus):
+					return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Header media URL must return HTTP 200", nil, "")
+				case errors.Is(err, errTemplateHeaderMediaTooLarge):
+					return r.SendErrorEnvelope(fasthttp.StatusRequestEntityTooLarge, "Header media is too large. Maximum size is 16 MiB", nil, "")
+				default:
+					a.Log.Error("Failed to download template header media", "error", err)
+					return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Failed to download header media", nil, "")
+				}
 			}
 		} else if len(headerFileData) > 0 {
 			// Option 3: Multipart file upload

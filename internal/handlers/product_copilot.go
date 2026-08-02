@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -457,75 +458,40 @@ type resolvedCopilotSettings struct {
 }
 
 func (a *App) resolveCopilotQwenSettings(orgID uuid.UUID, account string) (*resolvedCopilotSettings, error) {
-	var dedicated models.CopilotSettings
-	err := a.DB.
-		Where(
-			"organization_id = ? AND is_enabled = ? AND (whats_app_account = ? OR whats_app_account = '')",
-			orgID,
-			true,
-			account,
-		).
-		Order(gorm.Expr("CASE WHEN whats_app_account = ? THEN 0 ELSE 1 END", account)).
-		First(&dedicated).Error
-	if err == nil {
-		if dedicated.Provider != "" && dedicated.Provider != models.AIProviderQwen {
-			return nil, gorm.ErrRecordNotFound
-		}
-		apiKey := a.decryptStoredSecret(dedicated.APIKeyEncrypted)
-		if apiKey == "" {
-			return nil, gorm.ErrRecordNotFound
-		}
-		maxTokens := dedicated.MaxTokens
-		if maxTokens < 64 || maxTokens > 4000 {
-			maxTokens = 700
-		}
-		model := strings.TrimSpace(dedicated.Model)
-		if model == "" {
-			model = "qwen3.7-plus"
-		}
-		retentionDays := dedicated.RetentionDays
-		if retentionDays < 1 || retentionDays > 365 {
-			retentionDays = 30
-		}
-		return &resolvedCopilotSettings{
-			chatbot: &models.ChatbotSettings{AI: models.AIConfig{
-				Enabled:      true,
-				Provider:     models.AIProviderQwen,
-				APIKey:       apiKey,
-				Model:        model,
-				MaxTokens:    maxTokens,
-				Temperature:  clampCopilotTemperature(dedicated.Temperature),
-				SystemPrompt: dedicated.SystemPrompt,
-			}},
-			retentionDays: retentionDays,
-		}, nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, err
-	}
-
-	var chatbot models.ChatbotSettings
-	err = a.DB.
-		Where("organization_id = ? AND ai_enabled = ? AND ai_provider = ? AND (whats_app_account = ? OR whats_app_account = '')",
-			orgID, true, models.AIProviderQwen, account).
-		Order(gorm.Expr("CASE WHEN whats_app_account = ? THEN 0 ELSE 1 END", account)).
-		First(&chatbot).Error
+	_ = account // Qwen credentials are organization-wide by design.
+	dedicated, baseURL, err := channelapi.ResolveCentralQwenSettings(a.DB, orgID)
 	if err != nil {
 		return nil, err
 	}
-	chatbot.AI.APIKey = a.decryptStoredSecret(chatbot.AI.APIKey)
-	if chatbot.AI.APIKey == "" {
+	apiKey := a.decryptStoredSecret(dedicated.APIKeyEncrypted)
+	if apiKey == "" {
 		return nil, gorm.ErrRecordNotFound
 	}
-	if strings.TrimSpace(chatbot.AI.Model) == "" {
-		chatbot.AI.Model = "qwen3.7-plus"
+	model := strings.TrimSpace(dedicated.Model)
+	if model == "" {
+		model = "qwen3.7-plus"
 	}
-	if chatbot.AI.MaxTokens < 64 || chatbot.AI.MaxTokens > 4000 {
-		chatbot.AI.MaxTokens = 700
+	maxTokens := dedicated.MaxTokens
+	if maxTokens < 64 || maxTokens > 4000 {
+		maxTokens = 700
 	}
-	chatbot.AI.Temperature = clampCopilotTemperature(chatbot.AI.Temperature)
-	chatbot.AI.IncludeHistory = false
-	return &resolvedCopilotSettings{chatbot: &chatbot, retentionDays: 30}, nil
+	retentionDays := dedicated.RetentionDays
+	if retentionDays < 1 || retentionDays > 365 {
+		retentionDays = 30
+	}
+	return &resolvedCopilotSettings{
+		chatbot: &models.ChatbotSettings{AI: models.AIConfig{
+			Enabled:      true,
+			Provider:     models.AIProviderQwen,
+			APIKey:       apiKey,
+			BaseURL:      baseURL,
+			Model:        model,
+			MaxTokens:    maxTokens,
+			Temperature:  clampCopilotTemperature(dedicated.Temperature),
+			SystemPrompt: dedicated.SystemPrompt,
+		}},
+		retentionDays: retentionDays,
+	}, nil
 }
 
 func buildCopilotContext(contact *models.Contact, messages []models.Message, contexts []models.AIContext) string {

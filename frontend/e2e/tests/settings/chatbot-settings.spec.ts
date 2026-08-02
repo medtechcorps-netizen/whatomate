@@ -255,8 +255,10 @@ test.describe('AI Tab', () => {
     if (state === 'unchecked') {
       await toggle.click()
     }
-    await expect(page.getByText('ReReply AI', { exact: true })).toBeVisible()
-    await expect(page.getByText(/securely managed by ReReply/i)).toBeVisible()
+    const providerAuthority = page.getByTestId('chatbot-ai-provider-authority')
+    await expect(providerAuthority.getByText('Qwen Copilot', { exact: true })).toBeVisible()
+    await expect(providerAuthority).toContainText(/owned by the Integration Center/i)
+    await expect(page.getByTestId('chatbot-open-qwen-integration')).toBeVisible()
   })
 
   test('should keep provider credentials out of customer settings', async ({ page }) => {
@@ -268,7 +270,8 @@ test.describe('AI Tab', () => {
     await expect(page.locator('label').filter({ hasText: /^AI Provider$/ })).toHaveCount(0)
     await expect(page.locator('label').filter({ hasText: /^Model$/ })).toHaveCount(0)
     await expect(page.locator('label').filter({ hasText: /^API Key$/ })).toHaveCount(0)
-    await expect(page.getByText(/Qwen|Alibaba Cloud/i)).toHaveCount(0)
+    await expect(page.getByTestId('chatbot-ai-provider-authority')).toContainText('Qwen Copilot')
+    await expect(page.getByTestId('chatbot-open-qwen-integration')).toBeVisible()
   })
 
   test('should have system prompt field', async ({ page }) => {
@@ -280,14 +283,21 @@ test.describe('AI Tab', () => {
     await expect(page.getByText('System Prompt')).toBeVisible()
   })
 
-  test('should use provider-neutral AI branding', async ({ page }) => {
+  test('should show centralized Qwen authority to integration admins', async ({ page }) => {
     const toggle = page.locator('button[role="switch"]').first()
     const state = await toggle.getAttribute('data-state')
     if (state === 'unchecked') {
       await toggle.click()
     }
-    await expect(page.getByText('ReReply AI', { exact: true })).toBeVisible()
-    await expect(page.getByText(/Qwen|Alibaba Cloud/i)).toHaveCount(0)
+    const providerAuthority = page.getByTestId('chatbot-ai-provider-authority')
+    await expect(providerAuthority.getByText('Qwen Copilot', { exact: true })).toBeVisible()
+    await expect(providerAuthority).toContainText(/Provider, model, endpoint/i)
+    await expect(providerAuthority).toContainText(/write-only API key/i)
+    await expect(providerAuthority).toContainText(/Integration Center/i)
+    await expect(page.getByTestId('chatbot-open-qwen-integration')).toBeVisible()
+    await expect(page.locator('label').filter({ hasText: /^AI Provider$/ })).toHaveCount(0)
+    await expect(page.locator('label').filter({ hasText: /^Model$/ })).toHaveCount(0)
+    await expect(page.locator('label').filter({ hasText: /^API Key$/ })).toHaveCount(0)
   })
 
   test('should save AI settings', async () => {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
@@ -34,11 +35,13 @@ func TestClient_ExchangeCodeForToken(t *testing.T) {
 			apiVersion: "v21.0",
 			serverResponse: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
 				// Verify request
-				assert.Equal(t, http.MethodGet, r.Method)
+				assert.Equal(t, http.MethodPost, r.Method)
 				assert.Contains(t, r.URL.Path, "/oauth/access_token")
-				assert.Contains(t, r.URL.RawQuery, "client_id=123456")
-				assert.Contains(t, r.URL.RawQuery, "client_secret=secret123")
-				assert.Contains(t, r.URL.RawQuery, "code=test_auth_code_123")
+				require.NoError(t, r.ParseForm())
+				assert.Equal(t, "123456", r.PostForm.Get("client_id"))
+				assert.Equal(t, "secret123", r.PostForm.Get("client_secret"))
+				assert.Equal(t, "test_auth_code_123", r.PostForm.Get("code"))
+				assert.Empty(t, r.URL.RawQuery)
 
 				// Return success
 				w.WriteHeader(http.StatusOK)
@@ -151,6 +154,38 @@ func TestClient_ExchangeCodeForToken(t *testing.T) {
 			assert.Equal(t, tt.wantToken, token)
 		})
 	}
+}
+
+func TestClient_ExchangeCodeForTokenDoesNotReplayCredentialsAcrossRedirect(t *testing.T) {
+	t.Parallel()
+
+	var destinationRequests atomic.Int32
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		destinationRequests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer destination.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		require.NoError(t, r.ParseForm())
+		assert.Equal(t, "synthetic-app-secret", r.PostForm.Get("client_secret"))
+		assert.Equal(t, "synthetic-authorization-code", r.PostForm.Get("code"))
+		http.Redirect(w, r, destination.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), redirector.URL)
+	_, err := client.ExchangeCodeForToken(
+		testutil.TestContext(t),
+		"synthetic-authorization-code",
+		"synthetic-app-id",
+		"synthetic-app-secret",
+		"v21.0",
+	)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "status 307")
+	assert.Zero(t, destinationRequests.Load(), "authorization code and app secret must not be replayed")
 }
 
 func TestClient_GetPhoneNumberInfo(t *testing.T) {

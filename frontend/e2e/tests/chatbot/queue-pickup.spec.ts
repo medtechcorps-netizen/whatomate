@@ -307,7 +307,7 @@ test.describe('Pick from queue — admin assign flow', () => {
     await page.goto('/login')
     await page.locator('input[type="email"]').fill(SUPER_ADMIN.email)
     await page.locator('input[type="password"]').fill(SUPER_ADMIN.password)
-    await page.locator('button[type="submit"]').click()
+    await page.getByTestId('password-sign-in').click()
     await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 10_000 })
 
     await gotoTransfersAndWaitLoad(page)
@@ -654,7 +654,7 @@ test.describe('Admin reassign and unassign flows', () => {
     await page.goto('/login')
     await page.locator('input[type="email"]').fill(SUPER_ADMIN.email)
     await page.locator('input[type="password"]').fill(SUPER_ADMIN.password)
-    await page.locator('button[type="submit"]').click()
+    await page.getByTestId('password-sign-in').click()
     await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 10_000 })
   }
 
@@ -816,7 +816,7 @@ test.describe('Queue tab team filter', () => {
     await page.goto('/login')
     await page.locator('input[type="email"]').fill(SUPER_ADMIN.email)
     await page.locator('input[type="password"]').fill(SUPER_ADMIN.password)
-    await page.locator('button[type="submit"]').click()
+    await page.getByTestId('password-sign-in').click()
     await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 10_000 })
 
     await gotoTransfersAndWaitLoad(page)

@@ -52,17 +52,25 @@ export async function navigateToFirstItem(page: Page): Promise<string | null> {
   // Wait for table to load
   await page.waitForTimeout(1000)
 
-  // Find links in table body that contain a UUID pattern (not /new)
-  const dataLinks = page.locator('tbody tr a').filter({
-    hasNot: page.locator('text=Add'),
-  })
+  // Empty-state actions also render inside the table body. Select only a
+  // canonical UUID detail route so links such as /settings/integrations and
+  // /new can never be mistaken for a data row.
+  const detailLinks = page.locator('tbody tr a[href]')
+  const detailPathPattern = /\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/?$/i
 
-  const count = await dataLinks.count()
-  if (count === 0) return null
+  let href: string | null = null
+  for (let index = 0; index < await detailLinks.count(); index += 1) {
+    const candidate = await detailLinks.nth(index).getAttribute('href')
+    if (!candidate) continue
 
-  // Check if the first link href contains a UUID (not /new)
-  const href = await dataLinks.first().getAttribute('href')
-  if (!href || href.includes('/new')) return null
+    const pathname = new URL(candidate, page.url()).pathname
+    if (detailPathPattern.test(pathname)) {
+      href = candidate
+      break
+    }
+  }
+
+  if (!href) return null
 
   await page.goto(href)
   await page.waitForLoadState('networkidle')

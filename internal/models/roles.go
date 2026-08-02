@@ -54,6 +54,7 @@ const (
 	ResourceSettingsSSO          = "settings.sso"
 	ResourceSettingsCalling      = "settings.calling"
 	ResourceSettingsNotification = "settings.notification"
+	ResourceSettingsIntegrations = "settings.integrations"
 	// Chatbot sub-resources — used only as audit_log resource_type values
 	// for per-tab activity feeds, not checked by the permission system.
 	ResourceSettingsChatbotMessages = "settings.chatbot.messages"
@@ -150,6 +151,8 @@ func DefaultPermissions() []Permission {
 		{Resource: ResourceSettingsSSO, Action: ActionWrite, Description: "Edit SSO settings"},
 		{Resource: ResourceSettingsCalling, Action: ActionRead, Description: "View calling settings"},
 		{Resource: ResourceSettingsCalling, Action: ActionWrite, Description: "Edit calling settings"},
+		{Resource: ResourceSettingsIntegrations, Action: ActionRead, Description: "View provider integrations"},
+		{Resource: ResourceSettingsIntegrations, Action: ActionWrite, Description: "Configure provider integrations"},
 
 		// Accounts
 		{Resource: ResourceAccounts, Action: ActionRead, Description: "View WhatsApp accounts"},

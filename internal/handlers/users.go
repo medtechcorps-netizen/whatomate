@@ -424,7 +424,7 @@ func (a *App) UpdateUser(r *fastglue.Request) error {
 
 	var req UserRequest
 	if err := r.Decode(&req, "json"); err != nil {
-		a.Log.Error("UpdateUser: Failed to decode request", "error", err, "body", string(r.RequestCtx.PostBody()))
+		a.Log.Error("UpdateUser: Failed to decode request", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid request body", nil, "")
 	}
 

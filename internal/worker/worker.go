@@ -57,11 +57,20 @@ func New(cfg *config.Config, db *gorm.DB, rdb *redis.Client, log logf.Logger) (*
 		DB:        db,
 		Redis:     rdb,
 		Log:       log,
-		WhatsApp:  whatsapp.New(log),
+		WhatsApp:  newWhatsAppClient(cfg, log),
 		QwenHTTP:  &http.Client{Timeout: 30 * time.Second},
 		Consumer:  consumer,
 		Publisher: publisher,
 	}, nil
+}
+
+func newWhatsAppClient(cfg *config.Config, log logf.Logger) *whatsapp.Client {
+	if cfg != nil {
+		if baseURL := strings.TrimSpace(cfg.WhatsApp.BaseURL); baseURL != "" {
+			return whatsapp.NewWithBaseURL(log, strings.TrimRight(baseURL, "/"))
+		}
+	}
+	return whatsapp.New(log)
 }
 
 // Run starts the worker and processes jobs until context is cancelled

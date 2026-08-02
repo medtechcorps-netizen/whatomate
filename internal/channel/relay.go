@@ -491,6 +491,9 @@ func (a *RelayAdapter) credentialValue(account *models.ChannelAccount, key strin
 		if !ok || strings.TrimSpace(value) == "" {
 			continue
 		}
+		if appcrypto.IsEncrypted(value) && strings.TrimSpace(a.encryptionKey) == "" {
+			return "", errors.New("relay credential encryption key is unavailable")
+		}
 		decrypted, err := appcrypto.Decrypt(value, a.encryptionKey)
 		if err != nil {
 			return "", fmt.Errorf("decrypt relay credential: %w", err)
@@ -686,18 +689,11 @@ func (a *RelayAdapter) safeHTTPClient(allowLocalhost bool) (*http.Client, error)
 	transport.DialTLS = nil //nolint:staticcheck // Clear any cloned legacy hook so HTTPS uses the guarded DialContext.
 	client.Transport = transport
 
-	previousCheck := a.client.CheckRedirect
-	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
-		if len(via) >= 10 {
-			return errors.New("relay redirect limit exceeded")
-		}
-		if _, err := validateRelayURL(request.URL.String(), allowLocalhost); err != nil {
-			return err
-		}
-		if previousCheck != nil {
-			return previousCheck(request, via)
-		}
-		return nil
+	// Every relay request carries a tenant HMAC signature. Do not replay that
+	// signature or payload to a redirect target, even when the target itself is
+	// otherwise network-safe. Operators must configure the final relay URL.
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 	return &client, nil
 }

@@ -43,6 +43,57 @@ func testWorker(t *testing.T) *Worker {
 	return w
 }
 
+func TestNewWhatsAppClientUsesConfiguredBaseURL(t *testing.T) {
+	t.Parallel()
+
+	type observedRequest struct {
+		path          string
+		authorization string
+	}
+	observed := make(chan observedRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observed <- observedRequest{
+			path:          r.URL.Path,
+			authorization: r.Header.Get("Authorization"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"messages":[{"id":"wamid.local-only"}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	cfg := &config.Config{
+		WhatsApp: config.WhatsAppConfig{BaseURL: "  " + server.URL + "/  "},
+	}
+	client := newWhatsAppClient(cfg, testutil.NopLogger())
+
+	messageID, err := client.SendTextMessage(
+		context.Background(),
+		&whatsapp.Account{
+			PhoneID:     "test-phone-id",
+			APIVersion:  "v99.0",
+			AccessToken: "synthetic-local-token",
+		},
+		whatsapp.Recipient{Phone: "15550000000"},
+		"local routing check",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "wamid.local-only", messageID)
+
+	request := <-observed
+	assert.Equal(t, "/v99.0/test-phone-id/messages", request.path)
+	assert.Equal(t, "Bearer synthetic-local-token", request.authorization)
+}
+
+func TestNewWhatsAppClientAcceptsNilConfig(t *testing.T) {
+	t.Parallel()
+
+	assert.NotPanics(t, func() {
+		client := newWhatsAppClient(nil, testutil.NopLogger())
+		require.NotNil(t, client)
+		require.NotNil(t, client.HTTPClient)
+	})
+}
+
 func TestWorkerPublishHeartbeatCreatesFreshLease(t *testing.T) {
 	rdb := testutil.SetupTestRedis(t)
 	if rdb == nil {

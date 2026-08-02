@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -643,9 +644,9 @@ func convertFromJSONBArray(arr models.JSONBArray) []any {
 // UploadTemplateMedia uploads a media file for use as template header sample
 // Returns a file handle that can be used in template creation
 func (a *App) UploadTemplateMedia(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceTemplates, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	// Get account name from form or query
@@ -663,9 +664,12 @@ func (a *App) UploadTemplateMedia(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "WhatsApp account not found", nil, "")
 	}
 
-	// Check if account has app_id configured
-	if account.AppID == "" {
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "WhatsApp account does not have app_id configured. Please update the account settings.", nil, "")
+	waAccount, err := a.toWhatsAppAccountWithMetaApp(account)
+	if err != nil {
+		if errors.Is(err, errMetaAppIDNotConfigured) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Configure the Meta App ID in Settings > Integrations first", nil, "")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Meta integration credentials are unavailable", nil, "")
 	}
 
 	// Get the uploaded file
@@ -706,9 +710,6 @@ func (a *App) UploadTemplateMedia(r *fastglue.Request) error {
 			mimeType = "application/octet-stream"
 		}
 	}
-
-	// Create whatsapp account with AppID
-	waAccount := a.toWhatsAppAccount(account)
 
 	// Perform resumable upload to get handle
 	ctx := context.Background()

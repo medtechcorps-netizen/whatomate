@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
@@ -22,6 +24,7 @@ import (
 	"golang.org/x/oauth2/github"
 	"golang.org/x/oauth2/google"
 	"golang.org/x/oauth2/microsoft"
+	"gorm.io/gorm"
 )
 
 // OAuth provider configurations (endpoints are hardcoded, only need client credentials)
@@ -105,18 +108,41 @@ var providerDisplayNames = map[string]string{
 
 // GetPublicSSOProviders returns enabled SSO providers for login page (public, no auth)
 func (a *App) GetPublicSSOProviders(r *fastglue.Request) error {
-	// Get all enabled SSO providers (deduplicated by provider type)
 	var providers []models.SSOProvider
-	if err := a.DB.Where("is_enabled = ?", true).Find(&providers).Error; err != nil {
+	organization, validSelector := normalizeSSOOrganizationSelector(
+		string(r.RequestCtx.QueryArgs().Peek("organization")),
+	)
+	if !validSelector {
+		r.RequestCtx.Response.Header.Set("Cache-Control", "no-store")
+		return r.SendEnvelope([]SSOProviderPublic{})
+	}
+
+	query := a.DB.Model(&models.SSOProvider{}).
+		Where("sso_providers.is_enabled = ?", true).
+		Order("sso_providers.provider ASC")
+	if organization != "" {
+		// The caller must already know the workspace slug. Do not return the
+		// organization name, UUID, slug, client ID, or any provider settings.
+		query = query.
+			Joins("JOIN organizations ON organizations.id = sso_providers.organization_id").
+			Where("organizations.deleted_at IS NULL AND LOWER(organizations.slug) = ?", organization)
+	}
+	if err := query.Find(&providers).Error; err != nil {
 		a.Log.Error("Failed to fetch SSO providers", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to fetch providers", nil, "")
 	}
 
-	// Deduplicate by provider type (in case multiple orgs have same provider)
-	seen := make(map[string]bool)
+	// A provider-only legacy login can be started safely only when exactly one
+	// enabled configuration exists. Scoped discovery also suppresses corrupt
+	// duplicate rows so the UI never advertises a choice initialization rejects.
+	providerCounts := make(map[string]int, len(providers))
+	for _, provider := range providers {
+		providerCounts[provider.Provider]++
+	}
+	seen := make(map[string]bool, len(providerCounts))
 	result := make([]SSOProviderPublic, 0)
 	for _, p := range providers {
-		if seen[p.Provider] {
+		if seen[p.Provider] || providerCounts[p.Provider] != 1 {
 			continue
 		}
 		seen[p.Provider] = true
@@ -130,6 +156,9 @@ func (a *App) GetPublicSSOProviders(r *fastglue.Request) error {
 		})
 	}
 
+	// Tenant-specific authentication discovery must not be retained by shared
+	// browser or proxy caches.
+	r.RequestCtx.Response.Header.Set("Cache-Control", "no-store")
 	return r.SendEnvelope(result)
 }
 
@@ -144,10 +173,40 @@ func (a *App) InitSSO(r *fastglue.Request) error {
 		}
 	}
 
-	// Get first enabled SSO provider config for this provider type
-	var ssoConfig models.SSOProvider
-	if err := a.DB.Where("provider = ? AND is_enabled = ?", provider, true).First(&ssoConfig).Error; err != nil {
+	organization, validSelector := normalizeSSOOrganizationSelector(
+		string(r.RequestCtx.QueryArgs().Peek("organization")),
+	)
+	if !validSelector {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "SSO provider not configured or disabled", nil, "")
+	}
+
+	// An organization-aware request resolves only within the caller-supplied
+	// workspace slug. The legacy provider-only route remains available, but it
+	// is safe only when exactly one organization has enabled that provider.
+	var candidates []models.SSOProvider
+	query := a.DB.Model(&models.SSOProvider{}).
+		Where("sso_providers.provider = ? AND sso_providers.is_enabled = ?", provider, true).
+		Order("sso_providers.organization_id ASC").
+		Limit(2)
+	if organization != "" {
+		query = query.
+			Joins("JOIN organizations ON organizations.id = sso_providers.organization_id").
+			Where("organizations.deleted_at IS NULL AND LOWER(organizations.slug) = ?", organization)
+	}
+	if err := query.Find(&candidates).Error; err != nil || len(candidates) == 0 {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "SSO provider not configured or disabled", nil, "")
+	}
+	if len(candidates) != 1 {
+		if organization != "" {
+			// Treat corrupt duplicate rows like a missing configuration on the
+			// public route; never guess which tenant credential should be used.
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "SSO provider not configured or disabled", nil, "")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Select an organization before starting SSO", nil, "")
+	}
+	ssoConfig := candidates[0]
+	if a.Redis == nil {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "SSO state storage is unavailable", nil, "")
 	}
 
 	// Generate state token
@@ -173,7 +232,11 @@ func (a *App) InitSSO(r *fastglue.Request) error {
 	}
 
 	// Build OAuth config
-	oauthConfig := a.buildOAuthConfig(provider, &ssoConfig, r)
+	oauthConfig, err := a.buildOAuthConfig(provider, &ssoConfig, r)
+	if err != nil {
+		a.Log.Error("Failed to build SSO OAuth configuration", "error", err, "provider", provider)
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "SSO provider credentials are unavailable", nil, "")
+	}
 
 	// Redirect to provider
 	authURL := oauthConfig.AuthCodeURL(nonce, oauth2.AccessTypeOffline)
@@ -197,6 +260,10 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 
 	if code == "" || stateNonce == "" {
 		a.redirectWithError(r, "Invalid callback parameters")
+		return nil
+	}
+	if a.Redis == nil {
+		a.redirectWithError(r, "SSO state storage is unavailable")
 		return nil
 	}
 
@@ -235,14 +302,26 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 
 	// Get SSO provider config
 	var ssoConfig models.SSOProvider
-	if err := a.DB.Where("organization_id = ? AND provider = ?", orgID, provider).First(&ssoConfig).Error; err != nil {
+	if err := a.DB.Where(
+		"organization_id = ? AND provider = ? AND is_enabled = ?",
+		orgID,
+		provider,
+		true,
+	).First(&ssoConfig).Error; err != nil {
 		a.redirectWithError(r, "SSO provider not configured")
 		return nil
 	}
 
 	// Build OAuth config and exchange code for token
-	oauthConfig := a.buildOAuthConfig(provider, &ssoConfig, r)
-	token, err := oauthConfig.Exchange(context.Background(), code)
+	oauthConfig, err := a.buildOAuthConfig(provider, &ssoConfig, r)
+	if err != nil {
+		a.Log.Error("Failed to build SSO OAuth configuration", "error", err, "provider", provider)
+		a.redirectWithError(r, "SSO provider credentials are unavailable")
+		return nil
+	}
+	exchangeClient := oauthHTTPClientWithoutRedirects(a.HTTPClient)
+	exchangeContext := context.WithValue(context.Background(), oauth2.HTTPClient, exchangeClient)
+	token, err := oauthConfig.Exchange(exchangeContext, code)
 	if err != nil {
 		a.Log.Error("Failed to exchange OAuth code", "error", err, "provider", provider)
 		a.redirectWithError(r, "Failed to authenticate with provider")
@@ -333,6 +412,19 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 
 		a.Log.Info("Created SSO user", "user_id", user.ID, "email", user.Email, "provider", provider)
 	} else {
+		var membershipCount int64
+		if user.OrganizationID == orgID {
+			membershipCount = 1
+		} else if err := a.DB.Model(&models.UserOrganization{}).
+			Where("user_id = ? AND organization_id = ?", user.ID, orgID).
+			Count(&membershipCount).Error; err != nil {
+			a.redirectWithError(r, "Failed to verify organization membership")
+			return nil
+		}
+		if membershipCount == 0 {
+			a.redirectWithError(r, "User is not a member of this organization")
+			return nil
+		}
 		// User exists - update SSO info if not set
 		if user.SSOProvider == "" {
 			user.SSOProvider = provider
@@ -375,9 +467,9 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 
 // GetSSOSettings returns all SSO provider configs for the organization (admin only)
 func (a *App) GetSSOSettings(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceSettingsSSO, models.ActionRead)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	var providers []models.SSOProvider
@@ -408,9 +500,9 @@ func (a *App) GetSSOSettings(r *fastglue.Request) error {
 
 // UpdateSSOProvider creates or updates an SSO provider config (admin only)
 func (a *App) UpdateSSOProvider(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, userID, err := a.requireAuth(r, models.ResourceSettingsSSO, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	provider := r.RequestCtx.UserValue("provider").(string)
@@ -438,25 +530,44 @@ func (a *App) UpdateSSOProvider(r *fastglue.Request) error {
 		if req.AuthURL == "" || req.TokenURL == "" || req.UserInfoURL == "" {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Custom provider requires auth_url, token_url, and user_info_url", nil, "")
 		}
+		for field, endpoint := range map[string]string{
+			"auth_url": req.AuthURL, "token_url": req.TokenURL, "user_info_url": req.UserInfoURL,
+		} {
+			if err := validateSSOEndpoint(endpoint); err != nil {
+				return r.SendErrorEnvelope(fasthttp.StatusBadRequest, field+" must be a public HTTPS URL", nil, "")
+			}
+		}
+	}
+	if strings.TrimSpace(req.ClientID) == "" {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "client_id is required", nil, "")
 	}
 
 	// Find or create SSO provider config
 	var ssoConfig models.SSOProvider
 	err = a.DB.Where("organization_id = ? AND provider = ?", orgID, provider).First(&ssoConfig).Error
 
-	if err != nil {
+	isNew := errors.Is(err, gorm.ErrRecordNotFound)
+	if err != nil && !isNew {
+		a.Log.Error("Failed to load SSO provider", "error", err, "provider", provider)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save SSO settings", nil, "")
+	}
+	if isNew {
 		// Create new
 		ssoConfig = models.SSOProvider{
 			OrganizationID: orgID,
 			Provider:       provider,
 		}
 	}
+	oldSnapshot := ssoProviderAuditSnapshot(&ssoConfig)
 
 	// Update fields
 	ssoConfig.ClientID = req.ClientID
 	if req.ClientSecret != "" {
+		if a.Config == nil || strings.TrimSpace(a.Config.App.EncryptionKey) == "" {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "SSO credential storage is unavailable", nil, "")
+		}
 		enc, err := appcrypto.Encrypt(req.ClientSecret, a.Config.App.EncryptionKey)
-		if err != nil {
+		if err != nil || !appcrypto.IsEncrypted(enc) {
 			a.Log.Error("Failed to encrypt SSO client secret", "error", err)
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save SSO configuration", nil, "")
 		}
@@ -472,11 +583,19 @@ func (a *App) UpdateSSOProvider(r *fastglue.Request) error {
 	ssoConfig.AuthURL = req.AuthURL
 	ssoConfig.TokenURL = req.TokenURL
 	ssoConfig.UserInfoURL = req.UserInfoURL
+	if ssoConfig.IsEnabled && strings.TrimSpace(ssoConfig.ClientSecret) == "" {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "client_secret is required before enabling SSO", nil, "")
+	}
 
 	if err := a.DB.Save(&ssoConfig).Error; err != nil {
 		a.Log.Error("Failed to save SSO provider", "error", err, "provider", provider)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save SSO settings", nil, "")
 	}
+	action := models.AuditActionUpdated
+	if isNew {
+		action = models.AuditActionCreated
+	}
+	a.logAudit(orgID, userID, models.ResourceSettingsSSO, ssoConfig.ID, action, oldSnapshot, ssoProviderAuditSnapshot(&ssoConfig))
 
 	return r.SendEnvelope(SSOProviderResponse{
 		Provider:        ssoConfig.Provider,
@@ -497,40 +616,57 @@ func (a *App) UpdateSSOProvider(r *fastglue.Request) error {
 // doesn't ignore deleted_at — a soft-deleted row would block re-creating the
 // same provider until the row is purged.
 func (a *App) DeleteSSOProvider(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, userID, err := a.requireAuth(r, models.ResourceSettingsSSO, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	provider := r.RequestCtx.UserValue("provider").(string)
 
-	result := a.DB.Unscoped().Where("organization_id = ? AND provider = ?", orgID, provider).Delete(&models.SSOProvider{})
+	var existing models.SSOProvider
+	if err := a.DB.Where("organization_id = ? AND provider = ?", orgID, provider).First(&existing).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "SSO provider not found", nil, "")
+	}
+	result := a.DB.Unscoped().Where("id = ? AND organization_id = ?", existing.ID, orgID).Delete(&models.SSOProvider{})
 	if result.Error != nil {
 		a.Log.Error("Failed to delete SSO provider", "error", result.Error, "provider", provider)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete SSO provider", nil, "")
 	}
 
-	if result.RowsAffected == 0 {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "SSO provider not found", nil, "")
-	}
+	a.logAudit(orgID, userID, models.ResourceSettingsSSO, existing.ID, models.AuditActionDeleted, ssoProviderAuditSnapshot(&existing), nil)
 
 	return r.SendEnvelope(map[string]string{"message": "SSO provider deleted"})
 }
 
 // Helper functions
 
-func (a *App) buildOAuthConfig(provider string, ssoConfig *models.SSOProvider, r *fastglue.Request) *oauth2.Config {
+func (a *App) buildOAuthConfig(provider string, ssoConfig *models.SSOProvider, r *fastglue.Request) (*oauth2.Config, error) {
+	if ssoConfig == nil || strings.TrimSpace(ssoConfig.ClientID) == "" {
+		return nil, fmt.Errorf("SSO provider client ID is missing")
+	}
 	var endpoint oauth2.Endpoint
 	var scopes []string
 
 	if provider == "custom" {
+		if err := validateSSOEndpoint(ssoConfig.AuthURL); err != nil {
+			return nil, fmt.Errorf("invalid custom SSO authorization endpoint: %w", err)
+		}
+		if err := validateSSOEndpoint(ssoConfig.TokenURL); err != nil {
+			return nil, fmt.Errorf("invalid custom SSO token endpoint: %w", err)
+		}
+		if err := validateSSOEndpoint(ssoConfig.UserInfoURL); err != nil {
+			return nil, fmt.Errorf("invalid custom SSO user-info endpoint: %w", err)
+		}
 		endpoint = oauth2.Endpoint{
 			AuthURL:  ssoConfig.AuthURL,
 			TokenURL: ssoConfig.TokenURL,
 		}
 		scopes = []string{"openid", "email", "profile"}
 	} else {
-		providerCfg := oauthProviders[provider]
+		providerCfg, ok := oauthProviders[provider]
+		if !ok {
+			return nil, fmt.Errorf("unsupported SSO provider")
+		}
 		endpoint = providerCfg.Endpoint
 		scopes = providerCfg.Scopes
 	}
@@ -545,10 +681,20 @@ func (a *App) buildOAuthConfig(provider string, ssoConfig *models.SSOProvider, r
 	callbackURL := fmt.Sprintf("%s://%s%s/api/auth/sso/%s/callback", scheme, host, basePath, provider)
 
 	// Decrypt SSO client secret
-	decryptedSecret, err := appcrypto.Decrypt(ssoConfig.ClientSecret, a.Config.App.EncryptionKey)
+	encryptionKey := ""
+	if a.Config != nil {
+		encryptionKey = a.Config.App.EncryptionKey
+	}
+	if appcrypto.IsEncrypted(ssoConfig.ClientSecret) && strings.TrimSpace(encryptionKey) == "" {
+		return nil, fmt.Errorf("SSO credential encryption key is unavailable")
+	}
+	decryptedSecret, err := appcrypto.Decrypt(ssoConfig.ClientSecret, encryptionKey)
 	if err != nil {
 		a.Log.Error("Failed to decrypt SSO client secret", "error", err)
-		return nil
+		return nil, err
+	}
+	if strings.TrimSpace(decryptedSecret) == "" {
+		return nil, fmt.Errorf("SSO client secret is missing")
 	}
 
 	return &oauth2.Config{
@@ -557,7 +703,7 @@ func (a *App) buildOAuthConfig(provider string, ssoConfig *models.SSOProvider, r
 		Endpoint:     endpoint,
 		Scopes:       scopes,
 		RedirectURL:  callbackURL,
-	}
+	}, nil
 }
 
 // UserInfo represents normalized user info from OAuth providers
@@ -586,7 +732,7 @@ func (a *App) fetchUserInfo(provider string, ssoConfig *models.SSOProvider, toke
 		req.Header.Set("Accept", "application/vnd.github+json")
 	}
 
-	resp, err := a.HTTPClient.Do(req)
+	resp, err := oauthHTTPClientWithoutRedirects(a.HTTPClient).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -667,7 +813,7 @@ func (a *App) fetchGitHubEmail(token *oauth2.Token) (string, error) {
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	req.Header.Set("Accept", "application/vnd.github+json")
 
-	resp, err := a.HTTPClient.Do(req)
+	resp, err := oauthHTTPClientWithoutRedirects(a.HTTPClient).Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -741,4 +887,67 @@ func getString(data map[string]any, key string) string {
 		}
 	}
 	return ""
+}
+
+func normalizeSSOOrganizationSelector(raw string) (string, bool) {
+	selector := strings.ToLower(strings.TrimSpace(raw))
+	if selector == "" {
+		return "", true
+	}
+	if len(selector) > 100 || selector[0] == '-' || selector[len(selector)-1] == '-' {
+		return "", false
+	}
+	for index := 0; index < len(selector); index++ {
+		character := selector[index]
+		if (character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') ||
+			character == '-' {
+			continue
+		}
+		return "", false
+	}
+	return selector, true
+}
+
+func oauthHTTPClientWithoutRedirects(client *http.Client) *http.Client {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	requestClient := *client
+	requestClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &requestClient
+}
+
+func validateSSOEndpoint(rawURL string) error {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" {
+		return fmt.Errorf("invalid SSO endpoint")
+	}
+	// Validate the host and scheme with the same production policy as signed
+	// relays. Queries are retained for OIDC providers that require a fixed
+	// tenant parameter, but never influence the SSRF host decision.
+	hostOnly := *parsed
+	hostOnly.RawQuery = ""
+	hostOnly.ForceQuery = false
+	return channelapi.ValidateRelayEndpoint(hostOnly.String())
+}
+
+func ssoProviderAuditSnapshot(provider *models.SSOProvider) map[string]any {
+	if provider == nil {
+		return nil
+	}
+	return map[string]any{
+		"provider":          provider.Provider,
+		"client_id":         provider.ClientID,
+		"credentials_set":   strings.TrimSpace(provider.ClientSecret) != "",
+		"is_enabled":        provider.IsEnabled,
+		"allow_auto_create": provider.AllowAutoCreate,
+		"default_role":      provider.DefaultRoleName,
+		"allowed_domains":   provider.AllowedDomains,
+		"auth_url":          provider.AuthURL,
+		"token_url":         provider.TokenURL,
+		"user_info_url":     provider.UserInfoURL,
+	}
 }

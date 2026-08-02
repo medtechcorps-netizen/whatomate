@@ -1,23 +1,41 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import { useI18n } from 'vue-i18n'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import { Separator } from '@/components/ui/separator'
-import { Switch } from '@/components/ui/switch'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { PageHeader, AuditLogPanel } from '@/components/shared'
-import LanguageSwitcher from '@/components/LanguageSwitcher.vue'
-import { toast } from 'vue-sonner'
-import { Settings, Bell, Loader2, Globe, Phone, Upload, Play, Pause, Music } from 'lucide-vue-next'
-import { usersService, organizationService } from '@/services/api'
-import { useAuthStore } from '@/stores/auth'
+import { ref, computed, onMounted } from "vue";
+import { useI18n } from "vue-i18n";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { PageHeader, AuditLogPanel } from "@/components/shared";
+import LanguageSwitcher from "@/components/LanguageSwitcher.vue";
+import { toast } from "vue-sonner";
+import {
+  Settings,
+  Bell,
+  Loader2,
+  Globe,
+  Phone,
+  Upload,
+  Play,
+  Pause,
+  Music,
+  PlugZap,
+  ArrowRight,
+} from "lucide-vue-next";
+import { usersService, organizationService } from "@/services/api";
+import { useAuthStore } from "@/stores/auth";
 
-const { t } = useI18n()
-const authStore = useAuthStore()
+const { t } = useI18n();
+const authStore = useAuthStore();
 
 // The active org may be overridden by the X-Organization-ID header
 // (localStorage.selected_organization_id) when a super admin switches orgs.
@@ -25,270 +43,233 @@ const authStore = useAuthStore()
 // too — otherwise the activity log panel would query the user's default org
 // instead of the currently-active one.
 const orgID = computed(
-  () => localStorage.getItem('selected_organization_id') || authStore.organizationId,
-)
-const userID = computed(() => authStore.user?.id || '')
-const canWriteGeneral = computed(() => authStore.hasPermission('settings.general', 'write'))
-const canReadCalling = computed(() => authStore.hasPermission('settings.calling', 'read'))
-const canWriteCalling = computed(() => authStore.hasPermission('settings.calling', 'write'))
-const canWriteAccounts = computed(() => authStore.hasPermission('accounts', 'write'))
-const canManageMetaApp = computed(() => canWriteGeneral.value && canWriteAccounts.value)
-const canReadAuditLogs = computed(() => authStore.hasPermission('audit_logs', 'read'))
+  () =>
+    localStorage.getItem("selected_organization_id") ||
+    authStore.organizationId,
+);
+const userID = computed(() => authStore.user?.id || "");
+const canWriteGeneral = computed(() =>
+  authStore.hasPermission("settings.general", "write"),
+);
+const canReadCalling = computed(() =>
+  authStore.hasPermission("settings.calling", "read"),
+);
+const canWriteCalling = computed(() =>
+  authStore.hasPermission("settings.calling", "write"),
+);
+const canReadIntegrations = computed(() =>
+  authStore.hasPermission("settings.integrations", "read"),
+);
+const canReadAuditLogs = computed(() =>
+  authStore.hasPermission("audit_logs", "read"),
+);
 
-const isSubmitting = ref(false)
-const isLoading = ref(true)
+const isSubmitting = ref(false);
+const isLoading = ref(true);
 
 // General Settings
 const generalSettings = ref({
-  organization_name: 'My Organization',
-  default_timezone: 'UTC',
-  date_format: 'YYYY-MM-DD',
+  organization_name: "My Organization",
+  default_timezone: "UTC",
+  date_format: "YYYY-MM-DD",
   mask_phone_numbers: false,
-  meta_app_id: '',
-  meta_config_id: '',
-  meta_app_secret: '',
-  has_meta_app_secret: false
-})
+});
 
 // Notification Settings
 const notificationSettings = ref({
   email_notifications: true,
   new_message_alerts: true,
-  campaign_updates: true
-})
+  campaign_updates: true,
+});
 
 // Calling Settings
 const callingSettings = ref({
   calling_enabled: false,
   max_call_duration: 300,
   transfer_timeout_secs: 120,
-  hold_music_file: '',
-  ringback_file: ''
-})
+  hold_music_file: "",
+  ringback_file: "",
+});
 
-const isUploadingHoldMusic = ref(false)
-const isUploadingRingback = ref(false)
-const holdMusicInput = ref<HTMLInputElement | null>(null)
-const ringbackInput = ref<HTMLInputElement | null>(null)
-const holdMusicAudio = ref<HTMLAudioElement | null>(null)
-const ringbackAudio = ref<HTMLAudioElement | null>(null)
-const playingHoldMusic = ref(false)
-const playingRingback = ref(false)
+const isUploadingHoldMusic = ref(false);
+const isUploadingRingback = ref(false);
+const holdMusicInput = ref<HTMLInputElement | null>(null);
+const ringbackInput = ref<HTMLInputElement | null>(null);
+const holdMusicAudio = ref<HTMLAudioElement | null>(null);
+const ringbackAudio = ref<HTMLAudioElement | null>(null);
+const playingHoldMusic = ref(false);
+const playingRingback = ref(false);
 
 // Bump these keys to force the AuditLogPanel to remount and refetch after a save.
 // The backend writes audit entries asynchronously in a goroutine, so we delay
 // the remount slightly to give the write time to hit the DB before refetching.
-const generalLogKey = ref(0)
-const notificationLogKey = ref(0)
-const callingLogKey = ref(0)
+const generalLogKey = ref(0);
+const notificationLogKey = ref(0);
+const callingLogKey = ref(0);
 
 function refreshActivityLog(key: typeof generalLogKey) {
-  setTimeout(() => { key.value++ }, 500)
+  setTimeout(() => {
+    key.value++;
+  }, 500);
 }
 
 onMounted(async () => {
   try {
     const [orgResponse, userResponse] = await Promise.all([
       organizationService.getSettings(),
-      usersService.me()
-    ])
+      usersService.me(),
+    ]);
 
     // Organization settings
-    const orgData = orgResponse.data.data || orgResponse.data
+    const orgData = orgResponse.data.data || orgResponse.data;
     if (orgData) {
       generalSettings.value = {
-        organization_name: orgData.name || 'My Organization',
-        default_timezone: orgData.settings?.timezone || 'UTC',
-        date_format: orgData.settings?.date_format || 'YYYY-MM-DD',
+        organization_name: orgData.name || "My Organization",
+        default_timezone: orgData.settings?.timezone || "UTC",
+        date_format: orgData.settings?.date_format || "YYYY-MM-DD",
         mask_phone_numbers: orgData.settings?.mask_phone_numbers || false,
-        meta_app_id: orgData.settings?.meta_app_id || '',
-        meta_config_id: orgData.settings?.meta_config_id || '',
-        meta_app_secret: '',
-        has_meta_app_secret: orgData.settings?.has_meta_app_secret || false
-      }
+      };
       callingSettings.value = {
         calling_enabled: orgData.settings?.calling_enabled || false,
         max_call_duration: orgData.settings?.max_call_duration || 300,
         transfer_timeout_secs: orgData.settings?.transfer_timeout_secs || 120,
-        hold_music_file: orgData.settings?.hold_music_file || '',
-        ringback_file: orgData.settings?.ringback_file || ''
-      }
+        hold_music_file: orgData.settings?.hold_music_file || "",
+        ringback_file: orgData.settings?.ringback_file || "",
+      };
     }
 
     // User notification settings
-    const user = userResponse.data.data || userResponse.data
+    const user = userResponse.data.data || userResponse.data;
     if (user.settings) {
       notificationSettings.value = {
         email_notifications: user.settings.email_notifications ?? true,
         new_message_alerts: user.settings.new_message_alerts ?? true,
-        campaign_updates: user.settings.campaign_updates ?? true
-      }
+        campaign_updates: user.settings.campaign_updates ?? true,
+      };
     }
   } catch (error) {
-    console.error('Failed to load settings:', error)
+    console.error("Failed to load settings:", error);
   } finally {
-    isLoading.value = false
+    isLoading.value = false;
   }
-})
+});
 
 async function saveGeneralSettings() {
-  if (!canWriteGeneral.value) return
-  isSubmitting.value = true
+  if (!canWriteGeneral.value) return;
+  isSubmitting.value = true;
   try {
     await organizationService.updateSettings({
       name: generalSettings.value.organization_name,
       timezone: generalSettings.value.default_timezone,
       date_format: generalSettings.value.date_format,
-      mask_phone_numbers: generalSettings.value.mask_phone_numbers
-    })
-    toast.success(t('settings.generalSaved'))
-    refreshActivityLog(generalLogKey)
+      mask_phone_numbers: generalSettings.value.mask_phone_numbers,
+    });
+    toast.success(t("settings.generalSaved"));
+    refreshActivityLog(generalLogKey);
   } catch (error) {
-    toast.error(t('common.failedSave', { resource: t('resources.settings') }))
+    toast.error(t("common.failedSave", { resource: t("resources.settings") }));
   } finally {
-    isSubmitting.value = false
-  }
-}
-
-async function refreshMetaAppSecretStatus() {
-  if (!canManageMetaApp.value) return
-  generalSettings.value.meta_app_secret = ''
-  const orgResponse = await organizationService.getSettings()
-  const orgData = orgResponse.data.data || orgResponse.data
-  if (orgData) {
-    generalSettings.value.meta_app_id = orgData.settings?.meta_app_id || ''
-    generalSettings.value.meta_config_id = orgData.settings?.meta_config_id || ''
-    generalSettings.value.has_meta_app_secret = orgData.settings?.has_meta_app_secret || false
-  }
-}
-
-async function saveMetaAppCredentials() {
-  if (!canManageMetaApp.value) return
-  isSubmitting.value = true
-  try {
-    const payload: {
-      meta_app_id: string
-      meta_config_id: string
-      meta_app_secret?: string
-    } = {
-      meta_app_id: generalSettings.value.meta_app_id,
-      meta_config_id: generalSettings.value.meta_config_id
-    }
-    if (generalSettings.value.meta_app_secret) {
-      payload.meta_app_secret = generalSettings.value.meta_app_secret
-    }
-    await organizationService.updateSettings(payload)
-    await refreshMetaAppSecretStatus()
-    toast.success(t('settings.metaAppCredentialsSaved'))
-    refreshActivityLog(generalLogKey)
-  } catch (error) {
-    toast.error(t('common.failedSave', { resource: t('settings.metaAppCredentials') }))
-  } finally {
-    isSubmitting.value = false
-  }
-}
-
-async function clearMetaAppSecret() {
-  if (!canManageMetaApp.value) return
-  isSubmitting.value = true
-  try {
-    await organizationService.updateSettings({ clear_meta_app_secret: true })
-    await refreshMetaAppSecretStatus()
-    toast.success(t('settings.metaAppSecretRemoved'))
-    refreshActivityLog(generalLogKey)
-  } catch (error) {
-    toast.error(t('common.failedSave', { resource: t('settings.metaAppCredentials') }))
-  } finally {
-    isSubmitting.value = false
+    isSubmitting.value = false;
   }
 }
 
 async function saveNotificationSettings() {
-  isSubmitting.value = true
+  isSubmitting.value = true;
   try {
     await usersService.updateSettings({
       email_notifications: notificationSettings.value.email_notifications,
       new_message_alerts: notificationSettings.value.new_message_alerts,
-      campaign_updates: notificationSettings.value.campaign_updates
-    })
-    toast.success(t('settings.notificationsSaved'))
-    refreshActivityLog(notificationLogKey)
+      campaign_updates: notificationSettings.value.campaign_updates,
+    });
+    toast.success(t("settings.notificationsSaved"));
+    refreshActivityLog(notificationLogKey);
   } catch (error) {
-    toast.error(t('common.failedSave', { resource: t('resources.notificationSettings') }))
+    toast.error(
+      t("common.failedSave", { resource: t("resources.notificationSettings") }),
+    );
   } finally {
-    isSubmitting.value = false
+    isSubmitting.value = false;
   }
 }
 
 async function saveCallingSettings() {
-  if (!canWriteCalling.value) return
-  isSubmitting.value = true
+  if (!canWriteCalling.value) return;
+  isSubmitting.value = true;
   try {
     await organizationService.updateSettings({
       calling_enabled: callingSettings.value.calling_enabled,
       max_call_duration: callingSettings.value.max_call_duration,
-      transfer_timeout_secs: callingSettings.value.transfer_timeout_secs
-    })
-    toast.success(t('settings.callingSaved'))
-    refreshActivityLog(callingLogKey)
+      transfer_timeout_secs: callingSettings.value.transfer_timeout_secs,
+    });
+    toast.success(t("settings.callingSaved"));
+    refreshActivityLog(callingLogKey);
   } catch (error) {
-    toast.error(t('common.failedSave', { resource: t('resources.settings') }))
+    toast.error(t("common.failedSave", { resource: t("resources.settings") }));
   } finally {
-    isSubmitting.value = false
+    isSubmitting.value = false;
   }
 }
 
-async function uploadAudio(type: 'hold_music' | 'ringback', event: Event) {
-  if (!canWriteCalling.value) return
-  const input = event.target as HTMLInputElement
-  const file = input?.files?.[0]
-  if (!file) return
+async function uploadAudio(type: "hold_music" | "ringback", event: Event) {
+  if (!canWriteCalling.value) return;
+  const input = event.target as HTMLInputElement;
+  const file = input?.files?.[0];
+  if (!file) return;
 
-  const isHold = type === 'hold_music'
-  if (isHold) isUploadingHoldMusic.value = true
-  else isUploadingRingback.value = true
+  const isHold = type === "hold_music";
+  if (isHold) isUploadingHoldMusic.value = true;
+  else isUploadingRingback.value = true;
 
   try {
-    const response = await organizationService.uploadOrgAudio(file, type)
-    const data = response.data.data || response.data
-    if (isHold) callingSettings.value.hold_music_file = data.filename
-    else callingSettings.value.ringback_file = data.filename
-    toast.success(t('settings.audioUploaded'))
+    const response = await organizationService.uploadOrgAudio(file, type);
+    const data = response.data.data || response.data;
+    if (isHold) callingSettings.value.hold_music_file = data.filename;
+    else callingSettings.value.ringback_file = data.filename;
+    toast.success(t("settings.audioUploaded"));
   } catch (error) {
-    toast.error(t('settings.audioUploadFailed'))
+    toast.error(t("settings.audioUploadFailed"));
   } finally {
-    if (isHold) isUploadingHoldMusic.value = false
-    else isUploadingRingback.value = false
-    input.value = ''
+    if (isHold) isUploadingHoldMusic.value = false;
+    else isUploadingRingback.value = false;
+    input.value = "";
   }
 }
 
-function togglePlayAudio(type: 'hold_music' | 'ringback') {
-  const isHold = type === 'hold_music'
-  const filename = isHold ? callingSettings.value.hold_music_file : callingSettings.value.ringback_file
-  if (!filename) return
+function togglePlayAudio(type: "hold_music" | "ringback") {
+  const isHold = type === "hold_music";
+  const filename = isHold
+    ? callingSettings.value.hold_music_file
+    : callingSettings.value.ringback_file;
+  if (!filename) return;
 
-  const audioRef = isHold ? holdMusicAudio : ringbackAudio
-  const playingRef = isHold ? playingHoldMusic : playingRingback
+  const audioRef = isHold ? holdMusicAudio : ringbackAudio;
+  const playingRef = isHold ? playingHoldMusic : playingRingback;
 
   if (playingRef.value && audioRef.value) {
-    audioRef.value.pause()
-    audioRef.value.currentTime = 0
-    playingRef.value = false
-    return
+    audioRef.value.pause();
+    audioRef.value.currentTime = 0;
+    playingRef.value = false;
+    return;
   }
 
-  const audio = new Audio(`/api/ivr-flows/audio/${filename}`)
-  audioRef.value = audio
-  playingRef.value = true
-  audio.play()
-  audio.onended = () => { playingRef.value = false }
+  const audio = new Audio(`/api/ivr-flows/audio/${filename}`);
+  audioRef.value = audio;
+  playingRef.value = true;
+  audio.play();
+  audio.onended = () => {
+    playingRef.value = false;
+  };
 }
 </script>
 
 <template>
   <div class="flex flex-col h-full bg-[#0a0a0b] light:bg-gray-50">
-    <PageHeader :title="$t('settings.title')" :subtitle="$t('settings.subtitle')" :icon="Settings" icon-gradient="bg-gradient-to-br from-gray-500 to-gray-600 shadow-gray-500/20" />
+    <PageHeader
+      :title="$t('settings.title')"
+      :subtitle="$t('settings.subtitle')"
+      :icon="Settings"
+      icon-gradient="bg-gradient-to-br from-gray-500 to-gray-600 shadow-gray-500/20"
+    />
     <ScrollArea class="flex-1">
       <div class="p-6 space-y-4 max-w-4xl mx-auto">
         <Tabs default-value="general" class="w-full">
@@ -296,30 +277,52 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
             class="grid w-full mb-6 bg-white/[0.04] border border-white/[0.08] light:bg-gray-100 light:border-gray-200"
             :class="canReadCalling ? 'grid-cols-3' : 'grid-cols-2'"
           >
-            <TabsTrigger value="general" class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500">
+            <TabsTrigger
+              value="general"
+              class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500"
+            >
               <Settings class="h-4 w-4 mr-2" />
-              {{ $t('settings.general') }}
+              {{ $t("settings.general") }}
             </TabsTrigger>
-            <TabsTrigger value="notifications" class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500">
+            <TabsTrigger
+              value="notifications"
+              class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500"
+            >
               <Bell class="h-4 w-4 mr-2" />
-              {{ $t('settings.notifications') }}
+              {{ $t("settings.notifications") }}
             </TabsTrigger>
-            <TabsTrigger v-if="canReadCalling" value="calling" class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500">
+            <TabsTrigger
+              v-if="canReadCalling"
+              value="calling"
+              class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500"
+            >
               <Phone class="h-4 w-4 mr-2" />
-              {{ $t('settings.calling') }}
+              {{ $t("settings.calling") }}
             </TabsTrigger>
           </TabsList>
 
           <!-- General Settings Tab -->
           <TabsContent value="general">
-            <div class="rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200">
+            <div
+              class="rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200"
+            >
               <div class="p-6 pb-3">
-                <h3 class="text-lg font-semibold text-white light:text-gray-900">{{ $t('settings.generalSettings') }}</h3>
-                <p class="text-sm text-white/40 light:text-gray-500">{{ $t('settings.generalSettingsDesc') }}</p>
+                <h3
+                  class="text-lg font-semibold text-white light:text-gray-900"
+                >
+                  {{ $t("settings.generalSettings") }}
+                </h3>
+                <p class="text-sm text-white/40 light:text-gray-500">
+                  {{ $t("settings.generalSettingsDesc") }}
+                </p>
               </div>
               <div class="p-6 pt-3 space-y-4">
                 <div class="space-y-2">
-                  <Label for="org_name" class="text-white/70 light:text-gray-700">{{ $t('settings.organizationName') }}</Label>
+                  <Label
+                    for="org_name"
+                    class="text-white/70 light:text-gray-700"
+                    >{{ $t("settings.organizationName") }}</Label
+                  >
                   <Input
                     id="org_name"
                     v-model="generalSettings.organization_name"
@@ -329,30 +332,88 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                 </div>
                 <div class="grid grid-cols-2 gap-4">
                   <div class="space-y-2">
-                    <Label for="timezone" class="text-white/70 light:text-gray-700">{{ $t('settings.defaultTimezone') }}</Label>
-                    <Select v-model="generalSettings.default_timezone" :disabled="!canWriteGeneral">
-                      <SelectTrigger class="bg-white/[0.04] border-white/[0.1] text-white/70 light:bg-white light:border-gray-200 light:text-gray-700">
-                        <SelectValue :placeholder="$t('settings.selectTimezone')" />
+                    <Label
+                      for="timezone"
+                      class="text-white/70 light:text-gray-700"
+                      >{{ $t("settings.defaultTimezone") }}</Label
+                    >
+                    <Select
+                      v-model="generalSettings.default_timezone"
+                      :disabled="!canWriteGeneral"
+                    >
+                      <SelectTrigger
+                        class="bg-white/[0.04] border-white/[0.1] text-white/70 light:bg-white light:border-gray-200 light:text-gray-700"
+                      >
+                        <SelectValue
+                          :placeholder="$t('settings.selectTimezone')"
+                        />
                       </SelectTrigger>
-                      <SelectContent class="bg-[#141414] border-white/[0.08] light:bg-white light:border-gray-200">
-                        <SelectItem value="UTC" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">UTC</SelectItem>
-                        <SelectItem value="America/New_York" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">Eastern Time</SelectItem>
-                        <SelectItem value="America/Los_Angeles" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">Pacific Time</SelectItem>
-                        <SelectItem value="Europe/London" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">London</SelectItem>
-                        <SelectItem value="Asia/Tokyo" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">Tokyo</SelectItem>
+                      <SelectContent
+                        class="bg-[#141414] border-white/[0.08] light:bg-white light:border-gray-200"
+                      >
+                        <SelectItem
+                          value="UTC"
+                          class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100"
+                          >UTC</SelectItem
+                        >
+                        <SelectItem
+                          value="America/New_York"
+                          class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100"
+                          >Eastern Time</SelectItem
+                        >
+                        <SelectItem
+                          value="America/Los_Angeles"
+                          class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100"
+                          >Pacific Time</SelectItem
+                        >
+                        <SelectItem
+                          value="Europe/London"
+                          class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100"
+                          >London</SelectItem
+                        >
+                        <SelectItem
+                          value="Asia/Tokyo"
+                          class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100"
+                          >Tokyo</SelectItem
+                        >
                       </SelectContent>
                     </Select>
                   </div>
                   <div class="space-y-2">
-                    <Label for="date_format" class="text-white/70 light:text-gray-700">{{ $t('settings.dateFormat') }}</Label>
-                    <Select v-model="generalSettings.date_format" :disabled="!canWriteGeneral">
-                      <SelectTrigger class="bg-white/[0.04] border-white/[0.1] text-white/70 light:bg-white light:border-gray-200 light:text-gray-700">
-                        <SelectValue :placeholder="$t('settings.selectFormat')" />
+                    <Label
+                      for="date_format"
+                      class="text-white/70 light:text-gray-700"
+                      >{{ $t("settings.dateFormat") }}</Label
+                    >
+                    <Select
+                      v-model="generalSettings.date_format"
+                      :disabled="!canWriteGeneral"
+                    >
+                      <SelectTrigger
+                        class="bg-white/[0.04] border-white/[0.1] text-white/70 light:bg-white light:border-gray-200 light:text-gray-700"
+                      >
+                        <SelectValue
+                          :placeholder="$t('settings.selectFormat')"
+                        />
                       </SelectTrigger>
-                      <SelectContent class="bg-[#141414] border-white/[0.08] light:bg-white light:border-gray-200">
-                        <SelectItem value="YYYY-MM-DD" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">YYYY-MM-DD</SelectItem>
-                        <SelectItem value="DD/MM/YYYY" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">DD/MM/YYYY</SelectItem>
-                        <SelectItem value="MM/DD/YYYY" class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100">MM/DD/YYYY</SelectItem>
+                      <SelectContent
+                        class="bg-[#141414] border-white/[0.08] light:bg-white light:border-gray-200"
+                      >
+                        <SelectItem
+                          value="YYYY-MM-DD"
+                          class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100"
+                          >YYYY-MM-DD</SelectItem
+                        >
+                        <SelectItem
+                          value="DD/MM/YYYY"
+                          class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100"
+                          >DD/MM/YYYY</SelectItem
+                        >
+                        <SelectItem
+                          value="MM/DD/YYYY"
+                          class="text-white/70 focus:bg-white/[0.08] focus:text-white light:text-gray-700 light:focus:bg-gray-100"
+                          >MM/DD/YYYY</SelectItem
+                        >
                       </SelectContent>
                     </Select>
                   </div>
@@ -360,162 +421,210 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                 <div class="space-y-2">
                   <Label class="text-white/70 light:text-gray-700">
                     <Globe class="h-4 w-4 inline mr-1" />
-                    {{ $t('settings.language') }}
+                    {{ $t("settings.language") }}
                   </Label>
                   <LanguageSwitcher class="max-w-xs" />
-                  <p class="text-xs text-white/40 light:text-gray-500">{{ $t('settings.languageDesc') }}</p>
+                  <p class="text-xs text-white/40 light:text-gray-500">
+                    {{ $t("settings.languageDesc") }}
+                  </p>
                 </div>
                 <Separator class="bg-white/[0.08] light:bg-gray-200" />
                 <div class="flex items-center justify-between">
                   <div>
-                    <p class="font-medium text-white light:text-gray-900">{{ $t('settings.maskPhoneNumbers') }}</p>
-                    <p class="text-sm text-white/40 light:text-gray-500">{{ $t('settings.maskPhoneNumbersDesc') }}</p>
+                    <p class="font-medium text-white light:text-gray-900">
+                      {{ $t("settings.maskPhoneNumbers") }}
+                    </p>
+                    <p class="text-sm text-white/40 light:text-gray-500">
+                      {{ $t("settings.maskPhoneNumbersDesc") }}
+                    </p>
                   </div>
                   <Switch
                     :checked="generalSettings.mask_phone_numbers"
                     :disabled="!canWriteGeneral"
-                    @update:checked="generalSettings.mask_phone_numbers = $event"
+                    @update:checked="
+                      generalSettings.mask_phone_numbers = $event
+                    "
                   />
                 </div>
                 <div class="flex justify-end">
-                  <p v-if="!canWriteGeneral" class="text-xs text-white/40 light:text-gray-500">
+                  <p
+                    v-if="!canWriteGeneral"
+                    class="text-xs text-white/40 light:text-gray-500"
+                  >
                     Workspace details are read-only for your role.
                   </p>
-                  <Button v-else variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveGeneralSettings" :disabled="isSubmitting">
-                    <Loader2 v-if="isSubmitting" class="mr-2 h-4 w-4 animate-spin" />
-                    {{ $t('settings.save') }}
+                  <Button
+                    v-else
+                    variant="outline"
+                    size="sm"
+                    class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50"
+                    @click="saveGeneralSettings"
+                    :disabled="isSubmitting"
+                  >
+                    <Loader2
+                      v-if="isSubmitting"
+                      class="mr-2 h-4 w-4 animate-spin"
+                    />
+                    {{ $t("settings.save") }}
                   </Button>
                 </div>
               </div>
             </div>
 
-            <!-- Shared Meta application credentials are admin-only workspace settings. -->
-            <div v-if="canManageMetaApp" class="mt-6 rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200">
-              <div class="p-6 pb-3">
-                <h3 class="text-lg font-semibold text-white light:text-gray-900">{{ $t('settings.metaAppCredentials') }}</h3>
-                <p class="text-sm text-white/40 light:text-gray-500">{{ $t('settings.metaAppCredentialsDesc') }}</p>
+            <RouterLink
+              v-if="canReadIntegrations"
+              to="/settings/integrations"
+              class="mt-6 flex items-center gap-4 rounded-xl border border-white/[0.08] bg-white/[0.02] p-5 text-inherit transition-colors hover:border-[#cbd49a]/20 hover:bg-white/[0.04] light:border-gray-200 light:bg-white light:hover:border-[#697046]/30 light:hover:bg-gray-50"
+            >
+              <div
+                class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[#59613b] to-[#89925c] text-white shadow-lg shadow-[#697046]/20"
+              >
+                <PlugZap class="h-4 w-4" />
               </div>
-              <div class="p-6 pt-3 space-y-4">
-                <div class="grid grid-cols-2 gap-4">
-                  <div class="space-y-2">
-                    <Label for="meta_app_id" class="text-white/70 light:text-gray-700">{{ $t('settings.metaAppId') }}</Label>
-                    <Input
-                      id="meta_app_id"
-                      name="rereply-meta-app-id"
-                      autocomplete="off"
-                      v-model="generalSettings.meta_app_id"
-                      placeholder="e.g. 123456789012345"
-                    />
-                  </div>
-                  <div class="space-y-2">
-                    <Label for="meta_config_id" class="text-white/70 light:text-gray-700">{{ $t('settings.metaConfigId') }}</Label>
-                    <Input
-                      id="meta_config_id"
-                      name="rereply-meta-config-id"
-                      autocomplete="off"
-                      v-model="generalSettings.meta_config_id"
-                      placeholder="e.g. 987654321098765"
-                    />
-                  </div>
-                </div>
-                <div class="space-y-2">
-                  <Label for="meta_app_secret" class="text-white/70 light:text-gray-700">{{ $t('settings.metaAppSecret') }}</Label>
-                  <Input
-                    id="meta_app_secret"
-                    name="rereply-meta-app-secret"
-                    type="password"
-                    autocomplete="new-password"
-                    v-model="generalSettings.meta_app_secret"
-                    :placeholder="generalSettings.has_meta_app_secret ? '••••••••••••' : 'Enter Meta App Secret'"
-                  />
-                </div>
-                <div class="flex justify-end gap-2">
-                  <Button
-                    v-if="generalSettings.has_meta_app_secret"
-                    variant="destructive"
-                    size="sm"
-                    @click="clearMetaAppSecret"
-                    :disabled="isSubmitting"
-                  >
-                    {{ $t('settings.removeMetaAppSecret') }}
-                  </Button>
-                  <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveMetaAppCredentials" :disabled="isSubmitting">
-                    <Loader2 v-if="isSubmitting" class="mr-2 h-4 w-4 animate-spin" />
-                    {{ $t('settings.save') }}
-                  </Button>
-                </div>
+              <div class="min-w-0 flex-1">
+                <h3
+                  class="text-sm font-semibold text-white light:text-gray-900"
+                >
+                  Integrations & credentials
+                </h3>
+                <p
+                  class="mt-0.5 text-xs leading-5 text-white/40 light:text-gray-500"
+                >
+                  Central readiness overview for every channel. Live Meta and
+                  Qwen credentials are managed here; Email and Webchat relay
+                  connections remain in the Omnichannel Inbox, while Threads and
+                  TikTok are preparation-only.
+                </p>
               </div>
-            </div>
+              <ArrowRight
+                class="h-4 w-4 shrink-0 text-white/30 light:text-gray-400"
+              />
+            </RouterLink>
             <div v-if="orgID && canReadAuditLogs" class="mt-4">
-              <AuditLogPanel :key="generalLogKey" resource-type="settings.general" :resource-id="orgID" />
+              <AuditLogPanel
+                :key="generalLogKey"
+                resource-type="settings.general"
+                :resource-id="orgID"
+              />
             </div>
           </TabsContent>
 
           <!-- Notification Settings Tab -->
           <TabsContent value="notifications">
-            <div class="rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200">
+            <div
+              class="rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200"
+            >
               <div class="p-6 pb-3">
-                <h3 class="text-lg font-semibold text-white light:text-gray-900">{{ $t('settings.notifications') }}</h3>
-                <p class="text-sm text-white/40 light:text-gray-500">{{ $t('settings.notificationsDesc') }}</p>
+                <h3
+                  class="text-lg font-semibold text-white light:text-gray-900"
+                >
+                  {{ $t("settings.notifications") }}
+                </h3>
+                <p class="text-sm text-white/40 light:text-gray-500">
+                  {{ $t("settings.notificationsDesc") }}
+                </p>
               </div>
               <div class="p-6 pt-3 space-y-4">
                 <div class="flex items-center justify-between">
                   <div>
-                    <p class="font-medium text-white light:text-gray-900">{{ $t('settings.emailNotifications') }}</p>
-                    <p class="text-sm text-white/40 light:text-gray-500">{{ $t('settings.emailNotificationsDesc') }}</p>
+                    <p class="font-medium text-white light:text-gray-900">
+                      {{ $t("settings.emailNotifications") }}
+                    </p>
+                    <p class="text-sm text-white/40 light:text-gray-500">
+                      {{ $t("settings.emailNotificationsDesc") }}
+                    </p>
                   </div>
                   <Switch
                     :checked="notificationSettings.email_notifications"
-                    @update:checked="notificationSettings.email_notifications = $event"
+                    @update:checked="
+                      notificationSettings.email_notifications = $event
+                    "
                   />
                 </div>
                 <Separator class="bg-white/[0.08] light:bg-gray-200" />
                 <div class="flex items-center justify-between">
                   <div>
-                    <p class="font-medium text-white light:text-gray-900">{{ $t('settings.newMessageAlerts') }}</p>
-                    <p class="text-sm text-white/40 light:text-gray-500">{{ $t('settings.newMessageAlertsDesc') }}</p>
+                    <p class="font-medium text-white light:text-gray-900">
+                      {{ $t("settings.newMessageAlerts") }}
+                    </p>
+                    <p class="text-sm text-white/40 light:text-gray-500">
+                      {{ $t("settings.newMessageAlertsDesc") }}
+                    </p>
                   </div>
                   <Switch
                     :checked="notificationSettings.new_message_alerts"
-                    @update:checked="notificationSettings.new_message_alerts = $event"
+                    @update:checked="
+                      notificationSettings.new_message_alerts = $event
+                    "
                   />
                 </div>
                 <Separator class="bg-white/[0.08] light:bg-gray-200" />
                 <div class="flex items-center justify-between">
                   <div>
-                    <p class="font-medium text-white light:text-gray-900">{{ $t('settings.campaignUpdates') }}</p>
-                    <p class="text-sm text-white/40 light:text-gray-500">{{ $t('settings.campaignUpdatesDesc') }}</p>
+                    <p class="font-medium text-white light:text-gray-900">
+                      {{ $t("settings.campaignUpdates") }}
+                    </p>
+                    <p class="text-sm text-white/40 light:text-gray-500">
+                      {{ $t("settings.campaignUpdatesDesc") }}
+                    </p>
                   </div>
                   <Switch
                     :checked="notificationSettings.campaign_updates"
-                    @update:checked="notificationSettings.campaign_updates = $event"
+                    @update:checked="
+                      notificationSettings.campaign_updates = $event
+                    "
                   />
                 </div>
                 <div class="flex justify-end pt-4">
-                  <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveNotificationSettings" :disabled="isSubmitting">
-                    <Loader2 v-if="isSubmitting" class="mr-2 h-4 w-4 animate-spin" />
-                    {{ $t('settings.save') }}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50"
+                    @click="saveNotificationSettings"
+                    :disabled="isSubmitting"
+                  >
+                    <Loader2
+                      v-if="isSubmitting"
+                      class="mr-2 h-4 w-4 animate-spin"
+                    />
+                    {{ $t("settings.save") }}
                   </Button>
                 </div>
               </div>
             </div>
             <div v-if="userID && canReadAuditLogs" class="mt-4">
-              <AuditLogPanel :key="notificationLogKey" resource-type="settings.notification" :resource-id="userID" />
+              <AuditLogPanel
+                :key="notificationLogKey"
+                resource-type="settings.notification"
+                :resource-id="userID"
+              />
             </div>
           </TabsContent>
 
           <!-- Calling Settings Tab -->
           <TabsContent v-if="canReadCalling" value="calling">
-            <div class="rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200">
+            <div
+              class="rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200"
+            >
               <div class="p-6 pb-3">
-                <h3 class="text-lg font-semibold text-white light:text-gray-900">{{ $t('settings.callingSettings') }}</h3>
-                <p class="text-sm text-white/40 light:text-gray-500">{{ $t('settings.callingSettingsDesc') }}</p>
+                <h3
+                  class="text-lg font-semibold text-white light:text-gray-900"
+                >
+                  {{ $t("settings.callingSettings") }}
+                </h3>
+                <p class="text-sm text-white/40 light:text-gray-500">
+                  {{ $t("settings.callingSettingsDesc") }}
+                </p>
               </div>
               <div class="p-6 pt-3 space-y-4">
                 <div class="flex items-center justify-between">
                   <div>
-                    <p class="font-medium text-white light:text-gray-900">{{ $t('settings.callingEnabled') }}</p>
-                    <p class="text-sm text-white/40 light:text-gray-500">{{ $t('settings.callingEnabledDesc') }}</p>
+                    <p class="font-medium text-white light:text-gray-900">
+                      {{ $t("settings.callingEnabled") }}
+                    </p>
+                    <p class="text-sm text-white/40 light:text-gray-500">
+                      {{ $t("settings.callingEnabledDesc") }}
+                    </p>
                   </div>
                   <Switch
                     :checked="callingSettings.calling_enabled"
@@ -524,9 +633,19 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                   />
                 </div>
                 <Separator class="bg-white/[0.08] light:bg-gray-200" />
-                <div class="grid grid-cols-2 gap-4" :class="{ 'opacity-50 pointer-events-none': !callingSettings.calling_enabled || !canWriteCalling }">
+                <div
+                  class="grid grid-cols-2 gap-4"
+                  :class="{
+                    'opacity-50 pointer-events-none':
+                      !callingSettings.calling_enabled || !canWriteCalling,
+                  }"
+                >
                   <div class="space-y-2">
-                    <Label for="max_call_duration" class="text-white/70 light:text-gray-700">{{ $t('settings.maxCallDuration') }}</Label>
+                    <Label
+                      for="max_call_duration"
+                      class="text-white/70 light:text-gray-700"
+                      >{{ $t("settings.maxCallDuration") }}</Label
+                    >
                     <Input
                       id="max_call_duration"
                       type="number"
@@ -535,10 +654,16 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                       :max="3600"
                       :disabled="!canWriteCalling"
                     />
-                    <p class="text-xs text-white/40 light:text-gray-500">{{ $t('settings.maxCallDurationDesc') }}</p>
+                    <p class="text-xs text-white/40 light:text-gray-500">
+                      {{ $t("settings.maxCallDurationDesc") }}
+                    </p>
                   </div>
                   <div class="space-y-2">
-                    <Label for="transfer_timeout" class="text-white/70 light:text-gray-700">{{ $t('settings.transferTimeout') }}</Label>
+                    <Label
+                      for="transfer_timeout"
+                      class="text-white/70 light:text-gray-700"
+                      >{{ $t("settings.transferTimeout") }}</Label
+                    >
                     <Input
                       id="transfer_timeout"
                       type="number"
@@ -547,22 +672,38 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                       :max="600"
                       :disabled="!canWriteCalling"
                     />
-                    <p class="text-xs text-white/40 light:text-gray-500">{{ $t('settings.transferTimeoutDesc') }}</p>
+                    <p class="text-xs text-white/40 light:text-gray-500">
+                      {{ $t("settings.transferTimeoutDesc") }}
+                    </p>
                   </div>
                 </div>
                 <Separator class="bg-white/[0.08] light:bg-gray-200" />
                 <!-- Hold Music Upload -->
-                <div class="space-y-3" :class="{ 'opacity-50 pointer-events-none': !callingSettings.calling_enabled || !canWriteCalling }">
+                <div
+                  class="space-y-3"
+                  :class="{
+                    'opacity-50 pointer-events-none':
+                      !callingSettings.calling_enabled || !canWriteCalling,
+                  }"
+                >
                   <div>
-                    <Label class="text-white/70 light:text-gray-700 flex items-center gap-2">
+                    <Label
+                      class="text-white/70 light:text-gray-700 flex items-center gap-2"
+                    >
                       <Music class="h-4 w-4" />
-                      {{ $t('settings.holdMusic') }}
+                      {{ $t("settings.holdMusic") }}
                     </Label>
-                    <p class="text-xs text-white/40 light:text-gray-500 mt-1">{{ $t('settings.holdMusicDesc') }}</p>
+                    <p class="text-xs text-white/40 light:text-gray-500 mt-1">
+                      {{ $t("settings.holdMusicDesc") }}
+                    </p>
                   </div>
                   <div class="flex items-center gap-3">
                     <span class="text-sm text-white/50 light:text-gray-500">
-                      {{ callingSettings.hold_music_file ? `${$t('settings.currentFile')}: ${callingSettings.hold_music_file}` : $t('settings.noFileUploaded') }}
+                      {{
+                        callingSettings.hold_music_file
+                          ? `${$t("settings.currentFile")}: ${callingSettings.hold_music_file}`
+                          : $t("settings.noFileUploaded")
+                      }}
                     </span>
                     <Button
                       v-if="callingSettings.hold_music_file"
@@ -576,27 +717,59 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                     </Button>
                   </div>
                   <div class="flex items-center gap-2">
-                    <input ref="holdMusicInput" type="file" accept=".ogg,.opus,.mp3,.wav" class="hidden" :disabled="!canWriteCalling" @change="uploadAudio('hold_music', $event)" />
-                    <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="holdMusicInput?.click()" :disabled="isUploadingHoldMusic || !canWriteCalling">
-                      <Loader2 v-if="isUploadingHoldMusic" class="mr-2 h-4 w-4 animate-spin" />
+                    <input
+                      ref="holdMusicInput"
+                      type="file"
+                      accept=".ogg,.opus,.mp3,.wav"
+                      class="hidden"
+                      :disabled="!canWriteCalling"
+                      @change="uploadAudio('hold_music', $event)"
+                    />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50"
+                      @click="holdMusicInput?.click()"
+                      :disabled="isUploadingHoldMusic || !canWriteCalling"
+                    >
+                      <Loader2
+                        v-if="isUploadingHoldMusic"
+                        class="mr-2 h-4 w-4 animate-spin"
+                      />
                       <Upload v-else class="mr-2 h-4 w-4" />
-                      {{ $t('settings.uploadAudio') }}
+                      {{ $t("settings.uploadAudio") }}
                     </Button>
-                    <span class="text-xs text-white/30 light:text-gray-400">.ogg, .opus, .mp3, .wav (max 5MB)</span>
+                    <span class="text-xs text-white/30 light:text-gray-400"
+                      >.ogg, .opus, .mp3, .wav (max 5MB)</span
+                    >
                   </div>
                 </div>
                 <!-- Ringback Tone Upload -->
-                <div class="space-y-3" :class="{ 'opacity-50 pointer-events-none': !callingSettings.calling_enabled || !canWriteCalling }">
+                <div
+                  class="space-y-3"
+                  :class="{
+                    'opacity-50 pointer-events-none':
+                      !callingSettings.calling_enabled || !canWriteCalling,
+                  }"
+                >
                   <div>
-                    <Label class="text-white/70 light:text-gray-700 flex items-center gap-2">
+                    <Label
+                      class="text-white/70 light:text-gray-700 flex items-center gap-2"
+                    >
                       <Phone class="h-4 w-4" />
-                      {{ $t('settings.ringbackTone') }}
+                      {{ $t("settings.ringbackTone") }}
                     </Label>
-                    <p class="text-xs text-white/40 light:text-gray-500 mt-1">{{ $t('settings.ringbackToneDesc') }}</p>
+                    <p class="text-xs text-white/40 light:text-gray-500 mt-1">
+                      {{ $t("settings.ringbackToneDesc") }}
+                    </p>
                   </div>
                   <div class="flex items-center gap-3">
                     <span class="text-sm text-white/50 light:text-gray-500">
-                      {{ callingSettings.ringback_file ? `${$t('settings.currentFile')}: ${callingSettings.ringback_file}` : $t('settings.noFileUploaded') }}
+                      {{
+                        callingSettings.ringback_file
+                          ? `${$t("settings.currentFile")}: ${callingSettings.ringback_file}`
+                          : $t("settings.noFileUploaded")
+                      }}
                     </span>
                     <Button
                       v-if="callingSettings.ringback_file"
@@ -610,28 +783,63 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
                     </Button>
                   </div>
                   <div class="flex items-center gap-2">
-                    <input ref="ringbackInput" type="file" accept=".ogg,.opus,.mp3,.wav" class="hidden" :disabled="!canWriteCalling" @change="uploadAudio('ringback', $event)" />
-                    <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="ringbackInput?.click()" :disabled="isUploadingRingback || !canWriteCalling">
-                      <Loader2 v-if="isUploadingRingback" class="mr-2 h-4 w-4 animate-spin" />
+                    <input
+                      ref="ringbackInput"
+                      type="file"
+                      accept=".ogg,.opus,.mp3,.wav"
+                      class="hidden"
+                      :disabled="!canWriteCalling"
+                      @change="uploadAudio('ringback', $event)"
+                    />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50"
+                      @click="ringbackInput?.click()"
+                      :disabled="isUploadingRingback || !canWriteCalling"
+                    >
+                      <Loader2
+                        v-if="isUploadingRingback"
+                        class="mr-2 h-4 w-4 animate-spin"
+                      />
                       <Upload v-else class="mr-2 h-4 w-4" />
-                      {{ $t('settings.uploadAudio') }}
+                      {{ $t("settings.uploadAudio") }}
                     </Button>
-                    <span class="text-xs text-white/30 light:text-gray-400">.ogg, .opus, .mp3, .wav (max 5MB)</span>
+                    <span class="text-xs text-white/30 light:text-gray-400"
+                      >.ogg, .opus, .mp3, .wav (max 5MB)</span
+                    >
                   </div>
                 </div>
                 <div class="flex justify-end pt-4">
-                  <p v-if="!canWriteCalling" class="text-xs text-white/40 light:text-gray-500">
+                  <p
+                    v-if="!canWriteCalling"
+                    class="text-xs text-white/40 light:text-gray-500"
+                  >
                     Calling settings are read-only for your role.
                   </p>
-                  <Button v-else variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveCallingSettings" :disabled="isSubmitting">
-                    <Loader2 v-if="isSubmitting" class="mr-2 h-4 w-4 animate-spin" />
-                    {{ $t('settings.save') }}
+                  <Button
+                    v-else
+                    variant="outline"
+                    size="sm"
+                    class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50"
+                    @click="saveCallingSettings"
+                    :disabled="isSubmitting"
+                  >
+                    <Loader2
+                      v-if="isSubmitting"
+                      class="mr-2 h-4 w-4 animate-spin"
+                    />
+                    {{ $t("settings.save") }}
                   </Button>
                 </div>
               </div>
             </div>
             <div v-if="orgID && canReadAuditLogs" class="mt-4">
-              <AuditLogPanel :key="callingLogKey" resource-type="settings.calling" :resource-id="orgID" />
+              <AuditLogPanel
+                :key="callingLogKey"
+                resource-type="settings.calling"
+                :resource-id="orgID"
+              />
             </div>
           </TabsContent>
         </Tabs>

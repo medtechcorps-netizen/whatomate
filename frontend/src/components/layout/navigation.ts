@@ -29,7 +29,8 @@ import {
   CalendarDays,
   Package,
   LockKeyhole,
-  LifeBuoy
+  LifeBuoy,
+  PlugZap
 } from 'lucide-vue-next'
 import type { Component } from 'vue'
 
@@ -255,7 +256,7 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: '',
-    permissions: ['settings.general', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
+    permissions: ['settings.general', 'settings.integrations', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
     pinBottom: true,
     items: [
       {
@@ -263,10 +264,11 @@ export const navigationSections: NavSection[] = [
         path: '/settings',
         icon: Settings,
         permission: 'settings.general',
-        childPermissions: ['settings.general', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
+        childPermissions: ['settings.general', 'settings.integrations', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
         exact: true,
         children: [
           { name: 'nav.general', path: '/settings', icon: Settings, permission: 'settings.general', exact: true },
+          { name: 'nav.integrations', path: '/settings/integrations', icon: PlugZap, permission: 'settings.integrations' },
           { name: 'nav.users', path: '/settings/users', icon: Users, permission: 'users' },
           { name: 'nav.roles', path: '/settings/roles', icon: Shield, permission: 'roles' },
           { name: 'nav.apiKeys', path: '/settings/api-keys', icon: Key, permission: 'api_keys' },

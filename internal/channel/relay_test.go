@@ -266,11 +266,19 @@ func TestRelayAdapterBlocksHostnameResolvingToPrivateAddress(t *testing.T) {
 	assert.ErrorIs(t, err, ErrRelayURLInvalid)
 }
 
-func TestRelayAdapterValidatesEveryRedirect(t *testing.T) {
+func TestRelayAdapterDoesNotReplaySignedRequestAcrossRedirect(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Redirect(w, &http.Request{}, "https://10.0.0.8/private", http.StatusFound)
+	var destinationRequests atomic.Int32
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		destinationRequests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer destination.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.NotEmpty(t, r.Header.Get(RelaySignatureHeader))
+		http.Redirect(w, r, destination.URL, http.StatusTemporaryRedirect)
 	}))
 	defer server.Close()
 
@@ -285,7 +293,8 @@ func TestRelayAdapterValidatesEveryRedirect(t *testing.T) {
 		Parts:          []MessagePart{{Type: models.MessagePartTypeText, Text: "Hello"}},
 	})
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrRelayURLInvalid)
+	assert.Contains(t, err.Error(), "HTTP 307")
+	assert.Zero(t, destinationRequests.Load(), "signed relay payload must not be replayed")
 }
 
 func TestRelayHTTPErrorDoesNotExposeResponseBody(t *testing.T) {

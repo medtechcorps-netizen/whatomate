@@ -76,13 +76,17 @@ func TestApp_DispatchWebhook_CompletesSuccessfully(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
+	const webhookURL = "https://webhook.example.com/success"
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://webhook.example.com": server,
+	})
 
 	// Create webhook
 	webhook := &models.Webhook{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: org.ID,
 		Name:           "test-webhook",
-		URL:            server.URL,
+		URL:            webhookURL,
 		Events:         models.StringArray{"message.incoming"},
 		IsActive:       true,
 	}
@@ -137,6 +141,10 @@ func TestApp_DispatchWebhook_ConcurrencyLimit(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
+	const webhookURL = "https://webhook.example.com/concurrency"
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://webhook.example.com": server,
+	})
 
 	// Create 15 webhooks (more than the max concurrent limit of 10)
 	for i := 0; i < 15; i++ {
@@ -144,7 +152,7 @@ func TestApp_DispatchWebhook_ConcurrencyLimit(t *testing.T) {
 			BaseModel:      models.BaseModel{ID: uuid.New()},
 			OrganizationID: org.ID,
 			Name:           "test-webhook-" + uuid.New().String()[:8],
-			URL:            server.URL,
+			URL:            webhookURL,
 			Events:         models.StringArray{"message.incoming"},
 			IsActive:       true,
 		}
@@ -224,13 +232,17 @@ func TestApp_DispatchWebhook_InactiveWebhook(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
+	const webhookURL = "https://webhook.example.com/inactive"
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://webhook.example.com": server,
+	})
 
 	// Create webhook (GORM default:true sets IsActive=true)
 	webhook := &models.Webhook{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: org.ID,
 		Name:           "test-inactive-webhook",
-		URL:            server.URL,
+		URL:            webhookURL,
 		Events:         models.StringArray{"message.incoming"},
 	}
 	require.NoError(t, app.DB.Create(webhook).Error)
@@ -276,13 +288,17 @@ func TestApp_DispatchWebhook_EventFiltering(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
+	const webhookURL = "https://webhook.example.com/filtering"
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://webhook.example.com": server,
+	})
 
 	// Create webhook that only listens to message.outgoing
 	webhook := &models.Webhook{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: org.ID,
 		Name:           "test-filtering-webhook",
-		URL:            server.URL,
+		URL:            webhookURL,
 		Events:         models.StringArray{"message.outgoing"}, // Not message.incoming
 		IsActive:       true,
 	}
@@ -324,12 +340,16 @@ func TestApp_DispatchWebhook_RetryOnFailure(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
+	const webhookURL = "https://webhook.example.com/retry"
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://webhook.example.com": server,
+	})
 
 	webhook := &models.Webhook{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: org.ID,
 		Name:           "test-retry-webhook",
-		URL:            server.URL,
+		URL:            webhookURL,
 		Events:         models.StringArray{"message.incoming"},
 		IsActive:       true,
 	}
@@ -363,7 +383,7 @@ func TestApp_DispatchWebhook_HTTPTimeout(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestStarted.Store(true)
-		// Delay longer than HTTP client timeout (10s)
+		// Delay longer than the deliberately short synthetic client timeout.
 		select {
 		case <-r.Context().Done():
 			// Request was cancelled
@@ -373,12 +393,17 @@ func TestApp_DispatchWebhook_HTTPTimeout(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	const webhookURL = "https://webhook.example.com/timeout"
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://webhook.example.com": server,
+	})
+	app.HTTPClient.Timeout = 50 * time.Millisecond
 
 	webhook := &models.Webhook{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: org.ID,
 		Name:           "test-timeout-webhook",
-		URL:            server.URL,
+		URL:            webhookURL,
 		Events:         models.StringArray{"message.incoming"},
 		IsActive:       true,
 	}
@@ -386,7 +411,7 @@ func TestApp_DispatchWebhook_HTTPTimeout(t *testing.T) {
 
 	app.DispatchWebhook(org.ID, models.WebhookEventMessageIncoming, map[string]string{"test": "data"})
 
-	// Wait with timeout (the HTTP client has 10s timeout, with 3 retries = ~30s max)
+	// Wait with a generous cap for the retry backoff sequence.
 	done := make(chan struct{})
 	go func() {
 		app.WaitForBackgroundTasks()
@@ -435,13 +460,21 @@ func TestApp_DispatchWebhook_MultipleEvents(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer outgoingServer.Close()
+	const (
+		incomingWebhookURL = "https://incoming-webhook.example.com/events"
+		outgoingWebhookURL = "https://outgoing-webhook.example.com/events"
+	)
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://incoming-webhook.example.com": incomingServer,
+		"https://outgoing-webhook.example.com": outgoingServer,
+	})
 
 	// Create webhooks for different events
 	webhook1 := &models.Webhook{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: org.ID,
 		Name:           "test-incoming-webhook",
-		URL:            incomingServer.URL,
+		URL:            incomingWebhookURL,
 		Events:         models.StringArray{"message.incoming"},
 		IsActive:       true,
 	}
@@ -451,7 +484,7 @@ func TestApp_DispatchWebhook_MultipleEvents(t *testing.T) {
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: org.ID,
 		Name:           "test-outgoing-webhook",
-		URL:            outgoingServer.URL,
+		URL:            outgoingWebhookURL,
 		Events:         models.StringArray{"message.outgoing"},
 		IsActive:       true,
 	}
