@@ -1,9 +1,29 @@
-import { test, expect } from '@playwright/test'
-import { loginAsAdmin, navigateToFirstItem, expectMetadataVisible, expectActivityLogVisible, expectDeleteFromForm, ApiHelper } from '../../helpers'
+import { test, expect, type APIRequestContext, type Page } from '@playwright/test'
+import { loginAsAdmin, expectMetadataVisible, expectActivityLogVisible, expectDeleteFromForm, ApiHelper } from '../../helpers'
 import { AccountsPage } from '../../pages'
 import { createTestScope, loginAsSuperAdmin, SUPER_ADMIN } from '../../framework'
 
 const scope = createTestScope('accounts')
+
+async function seedAdminAccount(request: APIRequestContext) {
+  const api = new ApiHelper(request)
+  await api.loginAsAdmin()
+  const fixtureKey = scope.name().toLowerCase()
+
+  return api.createWhatsAppAccount({
+    name: fixtureKey,
+    phone_id: `phone-${fixtureKey}`,
+    business_id: `biz-${fixtureKey}`,
+    access_token: 'e2e-local-fixture-token',
+  })
+}
+
+async function gotoSeededAdminAccount(page: Page, request: APIRequestContext) {
+  const account = await seedAdminAccount(request)
+  await page.goto(`/settings/accounts/${account.id}`)
+  await page.waitForLoadState('networkidle')
+  return account
+}
 
 test.describe('WhatsApp Accounts - List View', () => {
   let accountsPage: AccountsPage
@@ -43,12 +63,16 @@ test.describe('WhatsApp Accounts - List View', () => {
     await accountsPage.cancelDelete()
   })
 
-  test('should load detail page from list', async ({ page }) => {
-    const href = await navigateToFirstItem(page)
-    if (href) {
-      expect(page.url()).toMatch(/\/settings\/accounts\/[a-f0-9-]+/)
-      await expect(page.getByText('Account Details')).toBeVisible()
-    }
+  test('should load detail page from list', async ({ page, request }) => {
+    const account = await seedAdminAccount(request)
+    await accountsPage.goto()
+
+    const accountLink = page.locator(`tbody a[href="/settings/accounts/${account.id}"]`).first()
+    await expect(accountLink).toBeVisible({ timeout: 15000 })
+    await accountLink.click()
+
+    await expect(page).toHaveURL(new RegExp(`/settings/accounts/${account.id}$`))
+    await expect(page.getByText('Account Details')).toBeVisible()
   })
 })
 
@@ -85,87 +109,43 @@ test.describe('WhatsApp Accounts - Detail Page CRUD', () => {
     }
   })
 
-  test('should show webhook config on existing account', async ({ page }) => {
-    await page.goto('/settings/accounts')
-    await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expect(page.getByText('Webhook Configuration')).toBeVisible()
-    }
+  test('should show webhook config on existing account', async ({ page, request }) => {
+    await gotoSeededAdminAccount(page, request)
+    await expect(page.getByText('Webhook Configuration')).toBeVisible()
   })
 
-  test('should have test connection button', async ({ page }) => {
-    await page.goto('/settings/accounts')
-    await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expect(page.getByRole('button', { name: /Test/i })).toBeVisible()
-    }
+  test('should have test connection button', async ({ page, request }) => {
+    await gotoSeededAdminAccount(page, request)
+    await expect(page.getByRole('button', { name: /Test/i })).toBeVisible()
   })
 
-  test('should have subscribe button', async ({ page }) => {
-    await page.goto('/settings/accounts')
-    await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expect(page.getByRole('button', { name: /Subscribe/i })).toBeVisible()
-    }
+  test('should have subscribe button', async ({ page, request }) => {
+    await gotoSeededAdminAccount(page, request)
+    await expect(page.getByRole('button', { name: /Subscribe/i })).toBeVisible()
   })
 
-  test('should have business profile button', async ({ page }) => {
-    await page.goto('/settings/accounts')
-    await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expect(page.getByRole('button', { name: /Profile/i })).toBeVisible()
-    }
+  test('should have business profile button', async ({ page, request }) => {
+    await gotoSeededAdminAccount(page, request)
+    await expect(page.getByRole('button', { name: /Profile/i })).toBeVisible()
   })
 
-  test('should delete from detail page', async ({ page }) => {
-    await page.goto('/settings/accounts')
-    await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expectDeleteFromForm(page, '/settings/accounts')
-    }
+  test('should delete from detail page', async ({ page, request }) => {
+    await gotoSeededAdminAccount(page, request)
+    await expectDeleteFromForm(page, '/settings/accounts')
   })
 
-  test('should show metadata', async ({ page }) => {
-    await page.goto('/settings/accounts')
-    await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expectMetadataVisible(page)
-    }
+  test('should show metadata', async ({ page, request }) => {
+    await gotoSeededAdminAccount(page, request)
+    await expectMetadataVisible(page)
   })
 
-  test('should show activity log', async ({ page }) => {
-    await page.goto('/settings/accounts')
-    await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expectActivityLogVisible(page)
-    }
+  test('should show activity log', async ({ page, request }) => {
+    await gotoSeededAdminAccount(page, request)
+    await expectActivityLogVisible(page)
   })
 
   test('should show setup guide', async ({ page, request }) => {
-    // Seed our own account so we don't race with parallel workers that
-    // create-then-delete accounts (e.g. audit-trail.spec). navigateToFirstItem
-    // grabs the first row's href, but if another worker deletes that account
-    // before goto lands, the detail page renders the "not found" error state
-    // and Setup Guide never appears.
-    const api = new ApiHelper(request)
-    await api.login(SUPER_ADMIN.email, SUPER_ADMIN.password)
-    const acc = await api.createWhatsAppAccount({
-      name: scope.name('setup-guide').toLowerCase().replace(/\s/g, '-'),
-      phone_id: `phone-setup-${Date.now()}`,
-      business_id: `biz-setup-${Date.now()}`,
-      access_token: 'test-token-e2e',
-    })
-
-    await page.goto(`/settings/accounts/${acc.id}`)
-    await page.waitForLoadState('networkidle')
-
+    await gotoSeededAdminAccount(page, request)
     await expect(page.getByText('Setup Guide')).toBeVisible({ timeout: 15000 })
   })
 

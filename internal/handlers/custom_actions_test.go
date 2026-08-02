@@ -818,8 +818,11 @@ func TestApp_ExecuteCustomAction(t *testing.T) {
 		}))
 		defer server.Close()
 
-		server.Client().Timeout = 5 * time.Second
-		app := newTestApp(t, withHTTPClient(server.Client()))
+		const webhookURL = "https://custom-action.example.com/success"
+		client := testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+			"https://custom-action.example.com": server,
+		})
+		app := newTestApp(t, withHTTPClient(client))
 		org := testutil.CreateTestOrganization(t, app.DB)
 		user := createAdminUser(t, app, org.ID)
 		contact := testutil.CreateTestContact(t, app.DB, org.ID)
@@ -828,7 +831,7 @@ func TestApp_ExecuteCustomAction(t *testing.T) {
 
 		action := createTestCustomAction(t, app, org.ID, "CRM Webhook", models.ActionTypeWebhook,
 			map[string]any{
-				"url": server.URL, "method": "POST",
+				"url": webhookURL, "method": "POST",
 				"headers": map[string]any{"Authorization": encryptedAuthorization},
 			}, true, 0)
 
@@ -1097,14 +1100,17 @@ func TestApp_ExecuteCustomAction(t *testing.T) {
 		}))
 		defer server.Close()
 
-		server.Client().Timeout = 5 * time.Second
-		app := newTestApp(t, withHTTPClient(server.Client()))
+		const webhookURL = "https://custom-action.example.com/server-error"
+		client := testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+			"https://custom-action.example.com": server,
+		})
+		app := newTestApp(t, withHTTPClient(client))
 		org := testutil.CreateTestOrganization(t, app.DB)
 		user := createAdminUser(t, app, org.ID)
 		contact := testutil.CreateTestContact(t, app.DB, org.ID)
 
 		action := createTestCustomAction(t, app, org.ID, "Failing Webhook", models.ActionTypeWebhook,
-			map[string]any{"url": server.URL, "method": "POST"}, true, 0)
+			map[string]any{"url": webhookURL, "method": "POST"}, true, 0)
 
 		req := testutil.NewJSONRequest(t, map[string]any{
 			"contact_id": contact.ID.String(),
@@ -1139,8 +1145,11 @@ func TestApp_ExecuteCustomAction(t *testing.T) {
 		}))
 		defer server.Close()
 
-		server.Client().Timeout = 5 * time.Second
-		app := newTestApp(t, withHTTPClient(server.Client()))
+		const webhookOrigin = "https://custom-action.example.com"
+		client := testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+			webhookOrigin: server,
+		})
+		app := newTestApp(t, withHTTPClient(client))
 		org := testutil.CreateTestOrganization(t, app.DB)
 		user := createAdminUser(t, app, org.ID)
 		contact := testutil.CreateTestContact(t, app.DB, org.ID)
@@ -1148,7 +1157,7 @@ func TestApp_ExecuteCustomAction(t *testing.T) {
 		// Use a URL with variable template
 		action := createTestCustomAction(t, app, org.ID, "Variable Webhook", models.ActionTypeWebhook,
 			map[string]any{
-				"url":    server.URL + "/contact/{{contact.id}}",
+				"url":    webhookOrigin + "/contact/{{contact.id}}",
 				"method": "GET",
 			}, true, 0)
 
@@ -1503,20 +1512,25 @@ func TestApp_ExecuteCustomAction_DoesNotForwardAuthorizationAcrossRedirect(t *te
 	}))
 	defer redirectTarget.Close()
 
+	const redirectTargetURL = "https://redirect-target.example.com/result"
 	redirectSource := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "Bearer endpoint-secret", r.Header.Get("Authorization"))
-		http.Redirect(w, r, redirectTarget.URL, http.StatusTemporaryRedirect)
+		http.Redirect(w, r, redirectTargetURL, http.StatusTemporaryRedirect)
 	}))
 	defer redirectSource.Close()
 
-	redirectSource.Client().Timeout = 5 * time.Second
-	app := newTestApp(t, withHTTPClient(redirectSource.Client()))
+	const redirectSourceURL = "https://redirect-source.example.com/start"
+	client := testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://redirect-source.example.com": redirectSource,
+		"https://redirect-target.example.com": redirectTarget,
+	})
+	app := newTestApp(t, withHTTPClient(client))
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := createAdminUser(t, app, org.ID)
 	contact := testutil.CreateTestContact(t, app.DB, org.ID)
 	action := createTestCustomAction(t, app, org.ID, "No redirect credential replay", models.ActionTypeWebhook,
 		map[string]any{
-			"url": redirectSource.URL, "method": "POST",
+			"url": redirectSourceURL, "method": "POST",
 			"headers": map[string]any{"Authorization": "Bearer endpoint-secret"},
 		}, true, 0)
 

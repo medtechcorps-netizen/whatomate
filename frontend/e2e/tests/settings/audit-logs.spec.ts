@@ -104,15 +104,24 @@ test.describe('Audit Logs', () => {
     )
     expect(auditResp.ok()).toBe(true)
     const auditBody = await auditResp.json()
-    const auditLogId = auditBody.data?.audit_logs?.[0]?.id
+    const updateLog = auditBody.data?.audit_logs?.[0]
+    const auditLogId = updateLog?.id
     expect(auditLogId, 'audit log entry for the webhook update should exist').toBeTruthy()
+    expect(updateLog?.changes).toEqual(expect.arrayContaining([{
+      field: 'url',
+      old_value: '[redacted]',
+      new_value: '[changed]',
+    }]))
+    expect(JSON.stringify(updateLog)).not.toContain(newUrl)
 
     await page.goto(`/settings/audit-logs/${auditLogId}`)
     await page.waitForLoadState('networkidle')
 
     await expect(page.getByText(/Changes/i).first()).toBeVisible()
     await expect(page.getByText(/Url/i).first()).toBeVisible()
-    await expect(page.getByText(newUrl).first()).toBeVisible()
+    await expect(page.getByText('[redacted]', { exact: true })).toBeVisible()
+    await expect(page.getByText('[changed]', { exact: true })).toBeVisible()
+    await expect(page.locator('body')).not.toContainText(newUrl)
     await expect(page.getByText(/^Updated$/).first()).toBeVisible()
   })
 

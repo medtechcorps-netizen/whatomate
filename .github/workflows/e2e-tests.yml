@@ -71,6 +71,8 @@ jobs:
           name = "ReReply"
           environment = "test"
           debug = true
+          # CI-only deterministic fixture key for this disposable test database.
+          encryption_key = "synthetic-e2e-key-not-for-production" # gitleaks:allow
 
           [server]
           host = "0.0.0.0"

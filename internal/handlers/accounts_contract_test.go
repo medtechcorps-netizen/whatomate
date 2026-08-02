@@ -98,7 +98,19 @@ func newWhatsAppContractMeta(t *testing.T, phoneID, wabaID string) *whatsappCont
 		meta.mu.Unlock()
 
 		switch {
-		case r.URL.Path == "/oauth/access_token":
+		case strings.HasSuffix(r.URL.Path, "/oauth/access_token"):
+			if r.Method != http.MethodPost || r.URL.RawQuery != "" ||
+				!strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+				http.Error(w, "invalid synthetic token exchange contract", http.StatusBadRequest)
+				return
+			}
+			if err := r.ParseForm(); err != nil ||
+				r.Form.Get("client_id") != "synthetic-meta-app" ||
+				r.Form.Get("client_secret") != "synthetic-meta-app-secret" ||
+				strings.TrimSpace(r.Form.Get("code")) == "" {
+				http.Error(w, "invalid synthetic token exchange form", http.StatusBadRequest)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "synthetic-embedded-token"})
 		case r.URL.Path == "/debug_token":
 			_ = json.NewEncoder(w).Encode(map[string]any{

@@ -122,7 +122,7 @@ func TestApp_WebhookVerify_WorkspaceCentralTokenIsAuthoritative(t *testing.T) {
 	require.NoError(t, app.DB.Create(&models.WhatsAppAccount{
 		BaseModel:          models.BaseModel{ID: uuid.New()},
 		OrganizationID:     org.ID,
-		Name:               "legacy-token-account",
+		Name:               "central-token-account-" + uuid.NewString()[:8],
 		PhoneID:            "central-token-phone-id",
 		BusinessID:         "central-token-business-id",
 		AccessToken:        "encrypted-access-token-placeholder",

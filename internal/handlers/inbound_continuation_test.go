@@ -962,12 +962,16 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 			},
 		))
 		t.Cleanup(apiServer.Close)
+		const apiURL = "https://customer-api.example.com/lookup"
+		app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+			"https://customer-api.example.com": apiServer,
+		})
 
 		node := &ChatNode{
 			ID:   "lookup-customer",
 			Type: ChatNodeAPICall,
 			Config: map[string]any{
-				"url":    apiServer.URL,
+				"url":    apiURL,
 				"method": http.MethodPost,
 				"headers": map[string]any{
 					"Authorization": "Bearer must-not-enter-ledger",
@@ -1049,7 +1053,7 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 		).First(&action).Error)
 		encoded, err := json.Marshal(action.Payload)
 		require.NoError(t, err)
-		assert.NotContains(t, string(encoded), apiServer.URL)
+		assert.NotContains(t, string(encoded), apiURL)
 		assert.NotContains(t, string(encoded), "must-not-enter-ledger")
 	})
 
@@ -1062,12 +1066,16 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 			},
 		))
 		t.Cleanup(webhookServer.Close)
+		const webhookURL = "https://crm-webhook.example.com/notify"
+		app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+			"https://crm-webhook.example.com": webhookServer,
+		})
 
 		node := &ChatNode{
 			ID:   "notify-crm",
 			Type: ChatNodeWebhook,
 			Config: map[string]any{
-				"url":    webhookServer.URL,
+				"url":    webhookURL,
 				"method": http.MethodPost,
 				"body":   `{"secret":"webhook-body-must-not-enter-ledger"}`,
 			},
@@ -1114,7 +1122,7 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 		).First(&action).Error)
 		encoded, err := json.Marshal(action.Payload)
 		require.NoError(t, err)
-		assert.NotContains(t, string(encoded), webhookServer.URL)
+		assert.NotContains(t, string(encoded), webhookURL)
 		assert.NotContains(
 			t,
 			string(encoded),

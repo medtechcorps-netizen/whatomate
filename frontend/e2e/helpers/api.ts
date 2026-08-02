@@ -436,8 +436,8 @@ export class ApiHelper {
 
       // Account creation now validates ownership with Meta before persisting.
       // E2E feature tests only need a local account fixture, so seed one
-      // directly and store a deliberately unusable token. The CI backend also
-      // points whatsapp.base_url at localhost to make provider egress impossible.
+      // directly and store a synthetic local-only token. The CI backend points
+      // whatsapp.base_url at localhost so send-path tests cannot reach Meta.
       const organization = await this.getCurrentOrg()
       const client = new Client({ connectionString: databaseURL })
       await client.connect()
@@ -456,7 +456,7 @@ export class ApiHelper {
             data.name,
             data.phone_id,
             data.business_id,
-            'enc:e2e-fixture-invalid-do-not-dispatch',
+            'e2e-fixture-local-only-token',
           ],
         )
         return {

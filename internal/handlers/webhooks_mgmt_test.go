@@ -533,6 +533,47 @@ func TestApp_UpdateWebhook_PartialUpdate(t *testing.T) {
 	assert.ElementsMatch(t, []string{"message.incoming"}, resp.Data.Events)
 }
 
+func TestApp_UpdateWebhook_AuditsSameOriginURLChangeWithoutSensitiveRoute(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
+	oldURL := "https://hooks.example.com/tenant/old-private-token"
+	newURL := "https://hooks.example.com/tenant/new-private-token"
+	wh := createTestWebhook(t, app, org.ID, "Route Change", oldURL, []string{"message.incoming"})
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"url": newURL,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", wh.ID.String())
+
+	require.NoError(t, app.UpdateWebhook(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var entry models.AuditLog
+	require.NoError(t, app.DB.
+		Where("organization_id = ? AND resource_type = ? AND resource_id = ? AND action = ?",
+			org.ID, "webhook", wh.ID, models.AuditActionUpdated).
+		Order("created_at DESC").
+		First(&entry).Error)
+	require.Len(t, entry.Changes, 1)
+
+	change, ok := entry.Changes[0].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "url", change["field"])
+	assert.Equal(t, "[redacted]", change["old_value"])
+	assert.Equal(t, "[changed]", change["new_value"])
+
+	encodedChanges, err := json.Marshal(entry.Changes)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encodedChanges), oldURL)
+	assert.NotContains(t, string(encodedChanges), newURL)
+	assert.NotContains(t, string(encodedChanges), "old-private-token")
+	assert.NotContains(t, string(encodedChanges), "new-private-token")
+}
+
 func TestApp_UpdateWebhook_PreservesOmittedActiveStateAndCanClearSecret(t *testing.T) {
 	t.Parallel()
 
@@ -756,11 +797,14 @@ func TestApp_TestWebhook_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	server.Client().Timeout = 5 * time.Second
-	app := newTestApp(t, withHTTPClient(server.Client()))
+	const webhookURL = "https://webhook-test.example.com/success"
+	client := testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://webhook-test.example.com": server,
+	})
+	app := newTestApp(t, withHTTPClient(client))
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
-	wh := createTestWebhook(t, app, org.ID, "Test Hook", server.URL, []string{"message.incoming"})
+	wh := createTestWebhook(t, app, org.ID, "Test Hook", webhookURL, []string{"message.incoming"})
 	encryptedAuthorization, encryptErr := appcrypto.Encrypt("Bearer runtime-secret", app.Config.App.EncryptionKey)
 	require.NoError(t, encryptErr)
 	wh.Headers["Authorization"] = encryptedAuthorization
@@ -811,11 +855,14 @@ func TestApp_TestWebhook_ServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	server.Client().Timeout = 5 * time.Second
-	app := newTestApp(t, withHTTPClient(server.Client()))
+	const webhookURL = "https://webhook-test.example.com/server-error"
+	client := testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://webhook-test.example.com": server,
+	})
+	app := newTestApp(t, withHTTPClient(client))
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
-	wh := createTestWebhook(t, app, org.ID, "Failing Hook", server.URL, []string{"message.incoming"})
+	wh := createTestWebhook(t, app, org.ID, "Failing Hook", webhookURL, []string{"message.incoming"})
 
 	req := testutil.NewJSONRequest(t, nil)
 	testutil.SetAuthContext(req, org.ID, user.ID)

@@ -59,6 +59,21 @@ type App struct {
 	inboundContinuation *inboundContinuationExecution
 }
 
+// whatsAppClient returns the application's shared client when available. The
+// fallback keeps independently constructed Apps (primarily focused tests) on
+// the configured Graph API base URL instead of silently reverting to Meta.
+func (a *App) whatsAppClient() *whatsapp.Client {
+	if a.WhatsApp != nil {
+		return a.WhatsApp
+	}
+	if a.Config != nil {
+		if baseURL := strings.TrimSpace(a.Config.WhatsApp.BaseURL); baseURL != "" {
+			return whatsapp.NewWithBaseURL(a.Log, strings.TrimRight(baseURL, "/"))
+		}
+	}
+	return whatsapp.New(a.Log)
+}
+
 // WaitForBackgroundTasks blocks until all background goroutines complete.
 // Call this during graceful shutdown to ensure all async work finishes.
 func (a *App) WaitForBackgroundTasks() {

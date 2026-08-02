@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -53,12 +54,10 @@ func validateWebhookRuntimeURL(rawURL string) error {
 		return fmt.Errorf("URL must not point to internal addresses")
 	}
 
-	// Block private/loopback IP literals (e.g. http://127.0.0.1, http://[::1])
-	if ip := net.ParseIP(hostname); ip != nil {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-			ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-			return fmt.Errorf("URL must not point to internal addresses")
-		}
+	// net.ParseIP does not understand IPv6 zone identifiers. Parse with netip
+	// so scoped literals such as [fe80::1%eth0] cannot bypass the literal check.
+	if address, parseErr := netip.ParseAddr(hostname); parseErr == nil && forbiddenOutboundAddress(address) {
+		return fmt.Errorf("URL must not point to internal addresses")
 	}
 
 	return nil
@@ -132,19 +131,33 @@ func SSRFSafeDialer() func(ctx context.Context, network, addr string) (net.Conn,
 		}
 
 		for _, ipStr := range ips {
-			ip := net.ParseIP(ipStr)
-			if ip == nil {
-				continue
+			address, parseErr := netip.ParseAddr(ipStr)
+			if parseErr != nil {
+				return nil, fmt.Errorf("resolved address could not be validated")
 			}
-			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-				ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			if forbiddenOutboundAddress(address) {
 				return nil, fmt.Errorf("connection to private address %s is not allowed", ipStr)
 			}
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("hostname did not resolve to an address")
 		}
 
 		// Connect to first resolved IP
 		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
 	}
+}
+
+func forbiddenOutboundAddress(address netip.Addr) bool {
+	// Zone-qualified addresses are meaningful only on a specific local
+	// interface and must never be valid tenant-authored outbound targets.
+	if !address.IsValid() || address.Zone() != "" {
+		return true
+	}
+	address = address.Unmap()
+	return address.IsLoopback() || address.IsPrivate() ||
+		address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() ||
+		address.IsUnspecified()
 }
 
 // WebhookRequest represents the request body for creating/updating a webhook
@@ -376,6 +389,7 @@ func (a *App) UpdateWebhook(r *fastglue.Request) error {
 		return nil
 	}
 
+	oldURL := webhook.URL
 	oldSnap := webhookAuditSnapshot(webhook)
 
 	var req WebhookRequest
@@ -443,8 +457,10 @@ func (a *App) UpdateWebhook(r *fastglue.Request) error {
 	// Invalidate cache
 	a.InvalidateWebhooksCache(orgID)
 
+	newSnap := webhookAuditSnapshot(webhook)
 	a.logAudit(orgID, userID,
-		"webhook", webhook.ID, models.AuditActionUpdated, oldSnap, webhookAuditSnapshot(webhook))
+		"webhook", webhook.ID, models.AuditActionUpdated, oldSnap, newSnap,
+		webhookURLAuditChange(oldURL, webhook.URL, oldSnap, newSnap)...)
 
 	return r.SendEnvelope(webhookToResponse(*webhook))
 }
@@ -542,6 +558,21 @@ func webhookAuditSnapshot(wh *models.Webhook) map[string]any {
 		"events":     events,
 		"is_active":  wh.IsActive,
 	}
+}
+
+// webhookURLAuditChange records route-only endpoint updates without persisting
+// tenant-authored paths, queries, or opaque routing material in the audit log.
+// Origin changes are already represented by webhookAuditSnapshot.
+func webhookURLAuditChange(oldURL, newURL string, oldSnap, newSnap map[string]any) []map[string]any {
+	if oldURL == newURL || oldSnap["url_origin"] != newSnap["url_origin"] {
+		return nil
+	}
+
+	return []map[string]any{{
+		"field":     "url",
+		"old_value": "[redacted]",
+		"new_value": "[changed]",
+	}}
 }
 
 func webhookToResponse(wh models.Webhook) WebhookResponse {

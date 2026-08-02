@@ -86,7 +86,7 @@ test.describe('Campaign recipients — TEXT header parameter', () => {
 
   test('manual entry parses header column into header_params and body values into template_params', async ({ page, request }) => {
     const api = new ApiHelper(request)
-    await api.login('admin@rereply.app', 'admin')
+    await api.loginAsAdmin()
 
     // Seed a draft campaign for this template via the API.
     const createResp = await api.post('/api/campaigns', {
@@ -150,7 +150,7 @@ test.describe('Campaign recipients — TEXT header parameter', () => {
 
   test('manual entry surfaces a column-count error when the header value is omitted', async ({ page, request }) => {
     const api = new ApiHelper(request)
-    await api.login('admin@rereply.app', 'admin')
+    await api.loginAsAdmin()
 
     const createResp = await api.post('/api/campaigns', {
       name: scope.name('campaign-bad'),
@@ -185,7 +185,7 @@ test.describe('Campaign recipients — TEXT header parameter', () => {
 
   test('Download sample CSV produces a header row that includes the "header" column', async ({ page, request }) => {
     const api = new ApiHelper(request)
-    await api.login('admin@rereply.app', 'admin')
+    await api.loginAsAdmin()
 
     const createResp = await api.post('/api/campaigns', {
       name: scope.name('campaign-csv'),
