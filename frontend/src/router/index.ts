@@ -526,7 +526,6 @@ const navigationOrder: NavigationCandidate[] = [
   { path: '/commerce', anyPermissions: ['packages', 'payments'], entitlement: 'commerce.enabled' },
   { path: '/copilot', permission: 'copilot', entitlement: 'copilot.enabled' },
   { path: '/chatbot', permission: 'settings.chatbot', childPaths: [
-    { path: '/chatbot', permission: 'settings.chatbot' },
     { path: '/chatbot/keywords', permission: 'chatbot.keywords' },
     { path: '/chatbot/flows', permission: 'flows.chatbot' },
     { path: '/chatbot/ai', permission: 'chatbot.ai' }
@@ -539,12 +538,10 @@ const navigationOrder: NavigationCandidate[] = [
   { path: '/flows', permission: 'flows.whatsapp' },
   { path: '/campaigns', permission: 'campaigns' },
   { path: '/calling/logs', permission: 'call_logs', childPaths: [
-    { path: '/calling/logs', permission: 'call_logs' },
     { path: '/calling/ivr-flows', permission: 'ivr_flows' },
     { path: '/calling/transfers', permission: 'call_transfers' }
   ]},
   { path: '/settings', permission: 'settings.general', childPaths: [
-    { path: '/settings', permission: 'settings.general' },
     { path: '/settings/integrations', permission: 'settings.integrations' },
     { path: '/settings/chatbot', permission: 'settings.chatbot' },
     { path: '/settings/accounts', permission: 'accounts' },
@@ -558,6 +555,7 @@ const navigationOrder: NavigationCandidate[] = [
     { path: '/settings/webhooks', permission: 'webhooks' },
     { path: '/settings/custom-actions', permission: 'custom_actions' },
     { path: '/settings/sso', permission: 'settings.sso' },
+    { path: '/settings/audit-logs', permission: 'audit_logs' },
     { path: '/settings/privacy', permission: 'privacy.settings' },
     { path: '/settings/privacy', permission: 'privacy.requests' },
     { path: '/settings/support', permission: 'support' }

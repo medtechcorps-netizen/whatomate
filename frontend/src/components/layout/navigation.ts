@@ -51,8 +51,6 @@ export interface NavItem {
 export interface NavSection {
   label: string
   items: NavItem[]
-  /** Permissions needed to show section — at least one must pass */
-  permissions: string[]
   /** Pin to bottom of sidebar */
   pinBottom?: boolean
 }
@@ -60,7 +58,6 @@ export interface NavSection {
 export const navigationSections: NavSection[] = [
   {
     label: 'nav.sectionPartner',
-    permissions: ['resellers'],
     items: [
       {
         name: 'nav.resellerConsole',
@@ -72,7 +69,6 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: 'nav.sectionMain',
-    permissions: ['onboarding', 'analytics', 'conversations', 'chat', 'contacts', 'tags', 'teams'],
     items: [
       {
         name: 'nav.launchpad',
@@ -122,7 +118,6 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: 'nav.sectionGrowth',
-    permissions: ['crm.leads', 'crm.automations', 'tasks', 'bookings', 'packages', 'payments', 'copilot'],
     items: [
       {
         name: 'nav.pipeline',
@@ -165,8 +160,7 @@ export const navigationSections: NavSection[] = [
         name: 'nav.commerce',
         path: '/commerce',
         icon: Package,
-        permission: 'packages',
-        childPermissions: ['packages', 'payments'],
+        anyPermissions: ['packages', 'payments'],
         entitlement: 'commerce.enabled'
       },
       {
@@ -180,7 +174,6 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: 'nav.sectionMessaging',
-    permissions: ['accounts', 'settings.chatbot', 'chatbot.keywords', 'flows.chatbot', 'chatbot.ai', 'transfers', 'campaigns', 'templates', 'flows.whatsapp', 'canned_responses'],
     items: [
       {
         name: 'nav.accounts',
@@ -195,9 +188,8 @@ export const navigationSections: NavSection[] = [
         permission: 'settings.chatbot',
         childPermissions: ['settings.chatbot', 'chatbot.keywords', 'flows.chatbot', 'chatbot.ai', 'transfers'],
         children: [
-          { name: 'nav.overview', path: '/chatbot', icon: Bot, permission: 'settings.chatbot' },
           { name: 'nav.keywords', path: '/chatbot/keywords', icon: Key, permission: 'chatbot.keywords' },
-          { name: 'nav.flows', path: '/chatbot/flows', icon: Workflow, permission: 'flows.chatbot' },
+          { name: 'nav.chatbotFlows', path: '/chatbot/flows', icon: Workflow, permission: 'flows.chatbot' },
           { name: 'nav.aiContexts', path: '/chatbot/ai', icon: Sparkles, permission: 'chatbot.ai' },
           { name: 'nav.transfers', path: '/chatbot/transfers', icon: UserX, permission: 'transfers' }
         ]
@@ -221,7 +213,7 @@ export const navigationSections: NavSection[] = [
         permission: 'canned_responses'
       },
       {
-        name: 'nav.flows',
+        name: 'nav.whatsappFlows',
         path: '/flows',
         icon: Workflow,
         permission: 'flows.whatsapp'
@@ -230,7 +222,6 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: 'nav.sectionCalling',
-    permissions: ['call_logs', 'ivr_flows', 'call_transfers'],
     items: [
       { name: 'nav.callLogs', path: '/calling/logs', icon: PhoneCall, permission: 'call_logs' },
       { name: 'nav.ivrFlows', path: '/calling/ivr-flows', icon: Workflow, permission: 'ivr_flows' },
@@ -239,7 +230,6 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: 'nav.sectionAnalytics',
-    permissions: ['analytics.agents', 'analytics'],
     items: [
       {
         name: 'nav.agentAnalytics',
@@ -263,7 +253,6 @@ export const navigationSections: NavSection[] = [
   },
   {
     label: '',
-    permissions: ['settings.general', 'settings.integrations', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
     pinBottom: true,
     items: [
       {
@@ -274,7 +263,6 @@ export const navigationSections: NavSection[] = [
         childPermissions: ['settings.general', 'settings.integrations', 'users', 'roles', 'api_keys', 'webhooks', 'custom_actions', 'settings.sso', 'audit_logs', 'privacy.settings', 'privacy.requests', 'support'],
         exact: true,
         children: [
-          { name: 'nav.general', path: '/settings', icon: Settings, permission: 'settings.general', exact: true },
           { name: 'nav.integrations', path: '/settings/integrations', icon: PlugZap, permission: 'settings.integrations' },
           { name: 'nav.users', path: '/settings/users', icon: Users, permission: 'users' },
           { name: 'nav.roles', path: '/settings/roles', icon: Shield, permission: 'roles' },
@@ -295,6 +283,3 @@ export const navigationSections: NavSection[] = [
     ]
   }
 ]
-
-// Flat list for backward compatibility (used by AppLayout computed)
-export const navigationItems: NavItem[] = navigationSections.flatMap(s => s.items)

@@ -270,6 +270,8 @@
     "overview": "Overview",
     "keywords": "Keywords",
     "flows": "Flows",
+    "chatbotFlows": "Chatbot Flows",
+    "whatsappFlows": "WhatsApp Flows",
     "aiContexts": "AI Contexts",
     "transfers": "Transfers",
     "agentAnalytics": "Agent Analytics",

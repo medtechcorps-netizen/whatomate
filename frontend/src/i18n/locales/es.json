@@ -230,6 +230,8 @@
     "overview": "Resumen",
     "keywords": "Palabras clave",
     "flows": "Flujos",
+    "chatbotFlows": "Flujos del chatbot",
+    "whatsappFlows": "Flujos de WhatsApp",
     "aiContexts": "Contextos IA",
     "transfers": "Transferencias",
     "agentAnalytics": "Analíticas de agentes",

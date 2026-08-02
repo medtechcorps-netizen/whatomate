@@ -138,7 +138,7 @@ async function confirmDeleteFlow() {
       :icon="Workflow"
       icon-gradient="bg-gradient-to-br from-purple-500 to-pink-600 shadow-purple-500/20"
       back-link="/chatbot"
-      :breadcrumbs="[{ label: $t('chatbotFlows.backToChatbot'), href: '/chatbot' }, { label: $t('nav.flows') }]"
+      :breadcrumbs="[{ label: $t('chatbotFlows.backToChatbot'), href: '/chatbot' }, { label: $t('nav.chatbotFlows') }]"
     >
       <template #actions>
         <Button variant="outline" size="sm" @click="createFlow">
