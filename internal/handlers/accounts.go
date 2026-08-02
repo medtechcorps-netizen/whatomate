@@ -22,11 +22,11 @@ import (
 )
 
 var (
-	errMetaIntegrationDisabled        = errors.New("Meta integration is disabled")
+	errMetaIntegrationDisabled        = errors.New("meta integration is disabled")
 	errAccountEncryptionUnavailable   = errors.New("account credential encryption is unavailable")
-	errMetaAppIDNotConfigured         = errors.New("Meta App ID is not configured")
-	errMetaAppSecretNotConfigured     = errors.New("Meta App Secret is not configured")
-	errMetaTokenValidationUnavailable = errors.New("Meta access token validation is unavailable")
+	errMetaAppIDNotConfigured         = errors.New("meta app ID is not configured")
+	errMetaAppSecretNotConfigured     = errors.New("meta app secret is not configured")
+	errMetaTokenValidationUnavailable = errors.New("meta access token validation is unavailable")
 )
 
 // AccountRequest represents the request body for creating/updating an account
@@ -814,15 +814,15 @@ func (a *App) resolveMetaAppCreds(orgID uuid.UUID) (string, string, string, erro
 		if v, ok := org.Settings["meta_app_secret_encrypted"].(string); ok && v != "" {
 			if crypto.IsEncrypted(v) &&
 				strings.TrimSpace(encryptionKey) == "" {
-				return "", "", "", errors.New("Meta credential encryption key is not configured")
+				return "", "", "", errors.New("meta credential encryption key is not configured")
 			}
 			decrypted, err := crypto.Decrypt(v, encryptionKey)
 			if err != nil {
 				a.Log.Error("Failed to decrypt meta app secret from organization settings", "error", err)
-				return "", "", "", errors.New("Meta credential could not be decrypted")
+				return "", "", "", errors.New("meta credential could not be decrypted")
 			}
 			if strings.TrimSpace(decrypted) == "" {
-				return "", "", "", errors.New("Meta credential is empty")
+				return "", "", "", errors.New("meta credential is empty")
 			}
 			appSecret = decrypted
 		}
@@ -1209,10 +1209,10 @@ func validateMetaEmbeddedSignupToken(
 	now time.Time,
 ) (*time.Time, error) {
 	if info == nil || !info.IsValid {
-		return nil, errors.New("Meta returned an invalid embedded signup token")
+		return nil, errors.New("meta returned an invalid embedded signup token")
 	}
 	if strings.TrimSpace(info.AppID) == "" || strings.TrimSpace(info.AppID) != strings.TrimSpace(expectedAppID) {
-		return nil, errors.New("The embedded signup token was issued to a different Meta app")
+		return nil, errors.New("the embedded signup token was issued to a different Meta app")
 	}
 	scopes := make(map[string]struct{}, len(info.Scopes)+len(info.GranularScopes))
 	for _, scope := range info.Scopes {
@@ -1227,7 +1227,7 @@ func validateMetaEmbeddedSignupToken(
 		"whatsapp_business_messaging",
 	} {
 		if _, ok := scopes[required]; !ok {
-			return nil, fmt.Errorf("The embedded signup token is missing the required %s permission", required)
+			return nil, fmt.Errorf("the embedded signup token is missing the required %s permission", required)
 		}
 	}
 
@@ -1238,7 +1238,7 @@ func validateMetaEmbeddedSignupToken(
 		}
 		candidate := time.Unix(unixSeconds, 0).UTC()
 		if !candidate.After(now.UTC()) {
-			return nil, errors.New("The embedded signup token or its data access has expired")
+			return nil, errors.New("the embedded signup token or its data access has expired")
 		}
 		if earliest == nil || candidate.Before(*earliest) {
 			value := candidate

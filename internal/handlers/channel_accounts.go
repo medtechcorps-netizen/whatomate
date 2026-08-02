@@ -1014,9 +1014,9 @@ func additionalChannelCreationEntitlement(channel models.Channel) (string, bool)
 func validateChannelCreationPolicy(request ChannelAccountRequest) error {
 	switch request.Channel {
 	case models.ChannelThreads:
-		return errors.New("Threads is preparation-only until an approved adapter is installed; channel accounts cannot be created yet")
+		return errors.New("threads is preparation-only until an approved adapter is installed; channel accounts cannot be created yet")
 	case models.ChannelTikTok:
-		return errors.New("TikTok is preparation-only until an approved messaging adapter is installed; channel accounts cannot be created yet")
+		return errors.New("tiktok is preparation-only until an approved messaging adapter is installed; channel accounts cannot be created yet")
 	default:
 		return nil
 	}

@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/config"
@@ -43,51 +42,6 @@ func integrationTestUser(t *testing.T, app *App, orgID uuid.UUID, keys ...string
 	t.Helper()
 	role := testutil.CreateTestRoleWithKeys(t, app.DB, orgID, "integration-admin", keys)
 	return testutil.CreateTestUser(t, app.DB, orgID, testutil.WithRoleID(&role.ID))
-}
-
-func enableValidManualTokenPreflightForIntegrationTest(t *testing.T, app *App) {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/debug_token":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"data": map[string]any{
-					"app_id":   "manual-test-meta-app",
-					"is_valid": true,
-					"scopes": []string{
-						"business_management",
-						"whatsapp_business_management",
-						"whatsapp_business_messaging",
-					},
-					"expires_at":             time.Now().UTC().Add(2 * time.Hour).Unix(),
-					"data_access_expires_at": time.Now().UTC().Add(time.Hour).Unix(),
-				},
-			})
-		case strings.HasSuffix(r.URL.Path, "/writer-created-business-id/subscribed_apps"):
-			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
-		case strings.HasSuffix(r.URL.Path, "/writer-created-business-id/phone_numbers"):
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"data": []map[string]string{{"id": "writer-created-phone-id"}},
-			})
-		case strings.HasSuffix(r.URL.Path, "/writer-created-business-id"):
-			_ = json.NewEncoder(w).Encode(map[string]string{"id": "writer-created-business-id", "name": "Synthetic Business"})
-		case strings.HasSuffix(r.URL.Path, "/writer-created-phone-id"):
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"display_phone_number":     "+60123456789",
-				"verified_name":            "Synthetic Clinic",
-				"code_verification_status": "VERIFIED",
-				"account_mode":             "LIVE",
-				"quality_rating":           "GREEN",
-			})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(server.Close)
-	app.Config.WhatsApp.AppID = "manual-test-meta-app"
-	app.Config.WhatsApp.AppSecret = "manual-test-meta-app-secret"
-	app.Config.WhatsApp.BaseURL = server.URL
-	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, server.URL)
 }
 
 func TestIntegrationCenterMetaUsesRuntimeSettingsAndNeverReturnsSecret(t *testing.T) {

@@ -936,27 +936,27 @@ func (a *App) validateEnabledIntegration(provider string, organization *models.O
 			workspaceManaged,
 		)
 		if strings.TrimSpace(appID) == "" || strings.TrimSpace(configID) == "" || !hasSecret || !webhookCredential.Configured {
-			return errors.New("Meta App ID, Config ID, App Secret, and Webhook Verify Token are required before enabling")
+			return errors.New("meta app ID, config ID, app secret, and webhook verify token are required before enabling")
 		}
 	case integrationProviderQwen:
 		var settings models.CopilotSettings
 		if err := tx.Where("organization_id = ? AND whats_app_account = ''", orgID).
 			Order("updated_at DESC, id ASC").First(&settings).Error; err != nil {
-			return errors.New("Qwen API key and model are required before enabling")
+			return errors.New("qwen API key and model are required before enabling")
 		}
 		if strings.TrimSpace(settings.APIKeyEncrypted) == "" || strings.TrimSpace(settings.Model) == "" {
-			return errors.New("Qwen API key and model are required before enabling")
+			return errors.New("qwen API key and model are required before enabling")
 		}
 		if strings.TrimSpace(a.qwenBaseURLForRow(row)) == "" {
-			return errors.New("Qwen endpoint region is invalid")
+			return errors.New("qwen endpoint region is invalid")
 		}
 	case integrationProviderThreads:
 		if stringJSONValue(row.Config, "app_id") == "" || stringJSONValue(row.Config, "redirect_uri") == "" || !encryptedCredentialFlag(row, "app_secret").Configured {
-			return errors.New("Threads App ID, redirect URI, and App Secret are required before enabling")
+			return errors.New("threads app ID, redirect URI, and app secret are required before enabling")
 		}
 	case integrationProviderTikTok:
 		if stringJSONValue(row.Config, "client_id") == "" || stringJSONValue(row.Config, "redirect_uri") == "" || !encryptedCredentialFlag(row, "client_secret").Configured {
-			return errors.New("TikTok Client ID, redirect URI, and Client Secret are required before enabling")
+			return errors.New("tiktok client ID, redirect URI, and client secret are required before enabling")
 		}
 	}
 	return nil
@@ -1006,7 +1006,7 @@ func validateIntegrationConfig(provider string, input models.JSONB) (models.JSON
 	if input == nil {
 		return models.JSONB{}, nil
 	}
-	allowed := map[string]bool{}
+	var allowed map[string]bool
 	switch provider {
 	case integrationProviderMeta:
 		allowed = map[string]bool{"app_id": true, "config_id": true}
@@ -1017,7 +1017,7 @@ func validateIntegrationConfig(provider string, input models.JSONB) (models.JSON
 	case integrationProviderQwen:
 		allowed = map[string]bool{"model": true, "max_tokens": true, "temperature": true, "endpoint_region": true}
 	default:
-		return nil, errors.New("Unsupported integration provider")
+		return nil, errors.New("unsupported integration provider")
 	}
 	result := models.JSONB{}
 	for key, value := range input {
@@ -1152,7 +1152,7 @@ func integrationProviderFromRequest(r *fastglue.Request, allowReadOnly bool) (st
 		}
 		return provider, nil
 	default:
-		return "", errors.New("Unsupported integration provider")
+		return "", errors.New("unsupported integration provider")
 	}
 }
 
@@ -1477,18 +1477,18 @@ func (a *App) testMetaApplication(r *fastglue.Request, appID, appSecret string) 
 	requestClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	response, err := requestClient.Do(request)
 	if err != nil {
-		return errors.New("Meta validation request failed")
+		return errors.New("meta validation request failed")
 	}
 	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 64*1024+1))
 	if err != nil || len(body) > 64*1024 || response.StatusCode < 200 || response.StatusCode >= 300 {
-		return errors.New("Meta rejected application credentials")
+		return errors.New("meta rejected application credentials")
 	}
 	var payload struct {
 		AccessToken string `json:"access_token"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil || strings.TrimSpace(payload.AccessToken) == "" {
-		return errors.New("Meta validation response was invalid")
+		return errors.New("meta validation response was invalid")
 	}
 	return nil
 }

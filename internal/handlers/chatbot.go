@@ -18,8 +18,8 @@ import (
 )
 
 var (
-	errQwenCredentialManagedCentrally = errors.New("Qwen credentials are managed in Settings > Integrations")
-	errQwenConfigManagedCentrally     = errors.New("Qwen provider and model are managed in Settings > Integrations")
+	errQwenCredentialManagedCentrally = errors.New("qwen credentials are managed in Settings > Integrations")
+	errQwenConfigManagedCentrally     = errors.New("qwen provider and model are managed in Settings > Integrations")
 	errChatbotCredentialStoreMissing  = errors.New("chatbot credential encryption is not configured")
 )
 
