@@ -1263,19 +1263,25 @@ func (m *Manager) fireTransferCallback(session *CallSession, hook *TransferHTTPC
 	go func() {
 		url := interpolateTemplate(hook.URL, vars)
 		body := interpolateTemplate(hook.BodyTemplate, vars)
-		headers := make(map[string]string)
-		for k, v := range hook.Headers {
-			headers[k] = interpolateTemplate(v, vars)
+		// Keep ciphertext in the session and decrypt only inside the dispatch
+		// goroutine immediately before interpolation and send.
+		headers, err := ResolveIVRCallbackHeaders(hook.Headers, m.encryptionKey)
+		if err != nil {
+			m.log.Error("Transfer callback headers could not be resolved", "error", err, "call_id", session.ID)
+			return
+		}
+		for key, value := range headers {
+			headers[key] = interpolateTemplate(value, vars)
 		}
 		method := hook.Method
 		if method == "" {
 			method = "POST"
 		}
-		result, err := executeHTTPCallback(url, method, headers, body, 10*time.Second)
+		result, err := executeHTTPCallback(m.httpClient, url, method, headers, body, 10*time.Second)
 		if err != nil {
-			m.log.Error("Transfer callback failed", "error", err, "call_id", session.ID, "hook_url", url)
+			m.log.Error("Transfer callback failed", "call_id", session.ID)
 		} else {
-			m.log.Info("Transfer callback completed", "call_id", session.ID, "hook_url", url, "status", result.StatusCode)
+			m.log.Info("Transfer callback completed", "call_id", session.ID, "status", result.StatusCode)
 		}
 	}()
 }

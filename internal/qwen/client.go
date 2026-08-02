@@ -13,11 +13,31 @@ import (
 )
 
 const (
-	DefaultBaseURL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-	DefaultModel   = "qwen3.7-plus"
+	DefaultBaseURL  = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+	DefaultModel    = "qwen3.7-plus"
+	RegionSingapore = "singapore"
+	RegionUS        = "us"
+	RegionBeijing   = "china_beijing"
 
 	maxResponseBytes = 4 << 20
 )
+
+// BaseURLForRegion maps the only tenant-selectable Qwen endpoint regions to
+// Alibaba Cloud's official shared OpenAI-compatible endpoints. Arbitrary URLs
+// are intentionally not accepted because every request carries a tenant API
+// key and customer conversation content.
+func BaseURLForRegion(region string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(region)) {
+	case RegionSingapore:
+		return DefaultBaseURL, nil
+	case RegionUS:
+		return "https://dashscope-us.aliyuncs.com/compatible-mode/v1", nil
+	case RegionBeijing:
+		return "https://dashscope.aliyuncs.com/compatible-mode/v1", nil
+	default:
+		return "", errors.New("unsupported Qwen endpoint region")
+	}
+}
 
 // Message is one OpenAI-compatible chat-completion turn.
 type Message struct {

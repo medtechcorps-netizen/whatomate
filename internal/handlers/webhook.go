@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
+	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/valyala/fasthttp"
@@ -26,37 +28,138 @@ func (a *App) WebhookVerify(r *fastglue.Request) error {
 	mode := string(r.RequestCtx.QueryArgs().Peek("hub.mode"))
 	token := string(r.RequestCtx.QueryArgs().Peek("hub.verify_token"))
 	challenge := string(r.RequestCtx.QueryArgs().Peek("hub.challenge"))
+	workspaceSelector := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek(metaWebhookCallbackWorkspaceQueryKey)))
 
-	if mode != "subscribe" {
+	if mode != "subscribe" || token == "" || challenge == "" {
 		a.Log.Warn("Webhook verification failed - invalid mode", "mode", mode)
 		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Verification failed", nil, "")
 	}
 
-	// First check against global config token
-	if token == a.Config.WhatsApp.WebhookVerifyToken && token != "" {
-		a.Log.Info("Webhook verified successfully (global token)")
+	// Workspace-managed credentials are encrypted with randomized nonces, so
+	// the public callback includes a non-secret workspace selector. The selector
+	// establishes the tenant boundary before any credential is loaded.
+	if workspaceSelector != "" {
+		organizationID, err := uuid.Parse(workspaceSelector)
+		if err == nil {
+			managedToken, authoritative, resolveErr := a.resolveMetaWebhookVerifyToken(organizationID)
+			if resolveErr == nil && authoritative && constantTimeWebhookTokenEqual(token, managedToken) {
+				a.Log.Info("Webhook verified successfully (workspace credential)", "organization_id", organizationID)
+				r.RequestCtx.SetStatusCode(fasthttp.StatusOK)
+				r.RequestCtx.SetBodyString(challenge)
+				return nil
+			}
+			if resolveErr == nil && !authoritative && a.verifyLegacyWebhookTokenForOrganization(organizationID, token) {
+				a.Log.Info("Webhook verified successfully (legacy account fallback)", "organization_id", organizationID)
+				r.RequestCtx.SetStatusCode(fasthttp.StatusOK)
+				r.RequestCtx.SetBodyString(challenge)
+				return nil
+			}
+		}
+		a.Log.Warn("Webhook verification failed - workspace credential mismatch")
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Verification failed", nil, "")
+	}
+
+	// Preserve the historical platform-wide callback while deployments migrate
+	// to workspace-specific URLs. This is configuration fallback only; the
+	// credential is never returned by an API.
+	if a != nil && a.Config != nil && constantTimeWebhookTokenEqual(token, a.Config.WhatsApp.WebhookVerifyToken) {
+		a.Log.Info("Webhook verified successfully (platform fallback)")
 		r.RequestCtx.SetStatusCode(fasthttp.StatusOK)
 		r.RequestCtx.SetBodyString(challenge)
 		return nil
 	}
 
-	// Then check against tokens stored in WhatsApp accounts
+	// Legacy callbacks have no selector. Resolve their tenant using the existing
+	// account column, then verify inside that tenant. Once a central workspace
+	// credential exists (or Meta is disabled), it is authoritative and the
+	// account token can no longer authorize this callback.
 	organizationID, resolveErr := a.resolveWebhookOrganization(token)
-	var account models.WhatsAppAccount
 	if resolveErr == nil {
-		resolveErr = a.WithTenantApp(organizationID, func(scoped *App) error {
-			return scoped.DB.Where("webhook_verify_token = ?", token).First(&account).Error
-		})
-	}
-	if resolveErr == nil {
-		a.Log.Info("Webhook verified successfully (account token)", "account", account.Name)
-		r.RequestCtx.SetStatusCode(fasthttp.StatusOK)
-		r.RequestCtx.SetBodyString(challenge)
-		return nil
+		_, authoritative, managedErr := a.resolveMetaWebhookVerifyToken(organizationID)
+		if managedErr == nil && !authoritative && a.verifyLegacyWebhookTokenForOrganization(organizationID, token) {
+			a.Log.Info("Webhook verified successfully (legacy account fallback)", "organization_id", organizationID)
+			r.RequestCtx.SetStatusCode(fasthttp.StatusOK)
+			r.RequestCtx.SetBodyString(challenge)
+			return nil
+		}
 	}
 
 	a.Log.Warn("Webhook verification failed - token not found")
 	return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Verification failed", nil, "")
+}
+
+func constantTimeWebhookTokenEqual(left, right string) bool {
+	if left == "" || right == "" || len(left) != len(right) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
+}
+
+// resolveMetaWebhookVerifyToken returns the effective workspace/platform
+// credential and whether it is authoritative over legacy account-column
+// values. A disabled managed integration and an undecryptable central value
+// both fail closed without revealing credential state to the public caller.
+func (a *App) resolveMetaWebhookVerifyToken(orgID uuid.UUID) (token string, authoritative bool, err error) {
+	if orgID == uuid.Nil {
+		return "", false, gorm.ErrRecordNotFound
+	}
+	err = a.WithTenantApp(orgID, func(scoped *App) error {
+		var organization models.Organization
+		if queryErr := scoped.DB.Where("id = ?", orgID).First(&organization).Error; queryErr != nil {
+			return queryErr
+		}
+
+		var integration models.ProviderIntegration
+		rowErr := scoped.DB.Select("enabled").
+			Where("organization_id = ? AND provider = ?", orgID, integrationProviderMeta).
+			First(&integration).Error
+		if rowErr == nil && !integration.Enabled {
+			authoritative = true
+			return errMetaIntegrationDisabled
+		}
+		if rowErr != nil && !errors.Is(rowErr, gorm.ErrRecordNotFound) {
+			return rowErr
+		}
+
+		workspaceManaged := metaWorkspaceAppManaged(&organization)
+		if workspaceManaged && organization.Settings != nil {
+			stored, _ := organization.Settings[metaWebhookVerifyTokenSetting].(string)
+			stored = strings.TrimSpace(stored)
+			if stored != "" {
+				authoritative = true
+				if !appcrypto.IsEncrypted(stored) || !scoped.hasIntegrationEncryptionKey() {
+					return errors.New("managed Meta webhook credential is unavailable")
+				}
+				decrypted, decryptErr := appcrypto.Decrypt(stored, scoped.integrationEncryptionKey())
+				if decryptErr != nil || strings.TrimSpace(decrypted) == "" {
+					return errors.New("managed Meta webhook credential is unavailable")
+				}
+				token = strings.TrimSpace(decrypted)
+				return nil
+			}
+		}
+
+		if !workspaceManaged && scoped.Config != nil && strings.TrimSpace(scoped.Config.WhatsApp.WebhookVerifyToken) != "" {
+			authoritative = true
+			token = strings.TrimSpace(scoped.Config.WhatsApp.WebhookVerifyToken)
+		}
+		return nil
+	})
+	return token, authoritative, err
+}
+
+func (a *App) verifyLegacyWebhookTokenForOrganization(orgID uuid.UUID, token string) bool {
+	if orgID == uuid.Nil || token == "" {
+		return false
+	}
+	var count int64
+	err := a.WithTenantApp(orgID, func(scoped *App) error {
+		return scoped.DB.Model(&models.WhatsAppAccount{}).
+			Where("organization_id = ? AND webhook_verify_token = ?", orgID, token).
+			Limit(1).
+			Count(&count).Error
+	})
+	return err == nil && count > 0
 }
 
 // WebhookStatusError represents an error in a status update
@@ -689,9 +792,11 @@ func (a *App) processTemplateStatusUpdate(wabaID, event, templateName, templateL
 	}
 }
 
-// verifyMetaWebhookPayload checks the configured platform secret first. When a
-// platform secret is unavailable, every change that would be dispatched must
-// resolve to an account (or WABA) whose app secret validates the entire body.
+// verifyMetaWebhookPayload verifies every dispatch target with its current
+// organization-level Meta credential. A managed Integration Center row is
+// authoritative; legacy account secrets are consulted only for organizations
+// that have never created such a row. The platform secret remains available
+// for payloads without any tenant/account target.
 //
 // It is not sufficient for any one referenced account to validate: a caller
 // with one tenant's app secret could otherwise append forged changes for a
@@ -701,10 +806,8 @@ func (a *App) verifyMetaWebhookPayload(body, signature []byte, payload *WebhookP
 		return false
 	}
 
-	if a.Config != nil && a.Config.WhatsApp.AppSecret != "" &&
-		verifyWebhookSignature(body, signature, []byte(a.Config.WhatsApp.AppSecret)) {
-		return true
-	}
+	globalVerified := a.Config != nil && a.Config.WhatsApp.AppSecret != "" &&
+		verifyWebhookSignature(body, signature, []byte(a.Config.WhatsApp.AppSecret))
 
 	verifiedAnyTarget := false
 	verifiedPhoneIDs := make(map[string]bool)
@@ -717,9 +820,12 @@ func (a *App) verifyMetaWebhookPayload(body, signature []byte, payload *WebhookP
 				verified, checked := verifiedPhoneIDs[phoneNumberID]
 				if !checked {
 					account, err := a.getWhatsAppAccountCached(phoneNumberID)
-					verified = err == nil &&
-						account.AppSecret != "" &&
-						verifyWebhookSignature(body, signature, []byte(account.AppSecret))
+					if err == nil {
+						_, effectiveSecret, _, resolveErr := a.resolveEffectiveMetaAppCreds(account)
+						verified = resolveErr == nil &&
+							strings.TrimSpace(effectiveSecret) != "" &&
+							verifyWebhookSignature(body, signature, []byte(effectiveSecret))
+					}
 					verifiedPhoneIDs[phoneNumberID] = verified
 				}
 				if !verified {
@@ -743,7 +849,12 @@ func (a *App) verifyMetaWebhookPayload(body, signature []byte, payload *WebhookP
 		}
 	}
 
-	return verifiedAnyTarget
+	// Payloads without a tenant/account target (for example an empty control
+	// envelope) can only be authenticated by the platform-level secret.
+	if !verifiedAnyTarget {
+		return globalVerified
+	}
+	return true
 }
 
 // verifyMetaWABAPayload validates all accounts that a WABA-only event would
@@ -763,21 +874,34 @@ func (a *App) verifyMetaWABAPayload(body, signature []byte, wabaID string) bool 
 			if err := scoped.DB.Where("business_id = ?", wabaID).Find(&accounts).Error; err != nil {
 				return err
 			}
-			encryptionKey := ""
-			if scoped.Config != nil {
-				encryptionKey = scoped.Config.App.EncryptionKey
+			if len(accounts) == 0 {
+				return nil
 			}
+
+			managed, err := scoped.metaIntegrationManaged(organizationID)
+			if err != nil {
+				return err
+			}
+			if managed {
+				_, effectiveSecret, _, err := scoped.resolveEffectiveMetaAppCredsScoped(&accounts[0])
+				if err != nil || strings.TrimSpace(effectiveSecret) == "" ||
+					!verifyWebhookSignature(body, signature, []byte(effectiveSecret)) {
+					return nil
+				}
+				tenantVerified = true
+				verifiedAccounts += len(accounts)
+				return nil
+			}
+
 			for i := range accounts {
-				accounts[i].DecryptSecrets(encryptionKey)
-				if accounts[i].AppSecret == "" ||
-					!verifyWebhookSignature(body, signature, []byte(accounts[i].AppSecret)) {
+				_, effectiveSecret, _, err := scoped.resolveEffectiveMetaAppCredsScoped(&accounts[i])
+				if err != nil || strings.TrimSpace(effectiveSecret) == "" ||
+					!verifyWebhookSignature(body, signature, []byte(effectiveSecret)) {
 					return nil
 				}
 			}
-			if len(accounts) > 0 {
-				tenantVerified = true
-				verifiedAccounts += len(accounts)
-			}
+			tenantVerified = true
+			verifiedAccounts += len(accounts)
 			return nil
 		}); err != nil || !tenantVerified {
 			return false

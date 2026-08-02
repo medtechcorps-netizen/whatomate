@@ -1,9 +1,9 @@
 package handlers
 
 import (
-	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +14,23 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func graphExternalAPIClient(
+	handler func(*http.Request) (int, string, error),
+) *http.Client {
+	return &http.Client{Transport: chatbotRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		status, body, err := handler(req)
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})}
+}
 
 // newGraphTestFixtures sets up the common state used across graph-runner tests:
 // app, org, account, contact, and an active session. Caller adds the flow.
@@ -562,15 +579,10 @@ func newAPICallFlow(t *testing.T, app *App, org *models.Organization, account *m
 // This is the path the converter uses to collapse v1 api_fetch (which
 // bundled fetch + send) onto a single v2 api_call node.
 func TestRunChatGraph_APICall_MessageTemplateSendsAfter2xx(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]any{"id": "cust-42"},
-		})
-	}))
-	defer server.Close()
-
 	app, org, account, contact, session := newGraphTestFixtures(t)
+	app.HTTPClient = graphExternalAPIClient(func(_ *http.Request) (int, string, error) {
+		return http.StatusOK, `{"data":{"id":"cust-42"}}`, nil
+	})
 	flow := &models.ChatbotFlow{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
 		OrganizationID:  org.ID,
@@ -582,7 +594,7 @@ func TestRunChatGraph_APICall_MessageTemplateSendsAfter2xx(t *testing.T) {
 			"entry_node": "api",
 			"nodes": []any{
 				map[string]any{"id": "api", "type": "api_call", "label": "fetch", "config": map[string]any{
-					"url":              server.URL,
+					"url":              "https://api.example.test/customer",
 					"method":           "GET",
 					"response_mapping": map[string]any{"customer_id": "data.id"},
 					"message_template": "Hello {{customer_id}}!",
@@ -616,16 +628,11 @@ func TestRunChatGraph_APICall_MessageTemplateSendsAfter2xx(t *testing.T) {
 // TestRunChatGraph_APICall_2xxRoutesAndMapsResponse verifies the 2xx
 // branch fires AND response_mapping pulls fields into SessionData.
 func TestRunChatGraph_APICall_2xxRoutesAndMapsResponse(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]any{"id": "cust-42", "status": "active"},
-		})
-	}))
-	defer server.Close()
-
 	app, org, account, contact, session := newGraphTestFixtures(t)
-	flow := newAPICallFlow(t, app, org, account, server.URL, map[string]any{
+	app.HTTPClient = graphExternalAPIClient(func(_ *http.Request) (int, string, error) {
+		return http.StatusOK, `{"data":{"id":"cust-42","status":"active"}}`, nil
+	})
+	flow := newAPICallFlow(t, app, org, account, "https://api.example.test/customer", map[string]any{
 		"customer_id": "data.id",
 		"status":      "data.status",
 	})
@@ -646,13 +653,11 @@ func TestRunChatGraph_APICall_2xxRoutesAndMapsResponse(t *testing.T) {
 // TestRunChatGraph_APICall_Non2xxRoutesToErrorBranch verifies the
 // http:non2xx outcome.
 func TestRunChatGraph_APICall_Non2xxRoutesToErrorBranch(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
 	app, org, account, contact, session := newGraphTestFixtures(t)
-	flow := newAPICallFlow(t, app, org, account, server.URL, nil)
+	app.HTTPClient = graphExternalAPIClient(func(_ *http.Request) (int, string, error) {
+		return http.StatusInternalServerError, `{}`, nil
+	})
+	flow := newAPICallFlow(t, app, org, account, "https://api.example.test/customer", nil)
 
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
@@ -669,12 +674,11 @@ func TestRunChatGraph_APICall_Non2xxRoutesToErrorBranch(t *testing.T) {
 // connection failure (server closed) maps to http:non2xx rather than
 // returning an error up to the dispatcher.
 func TestRunChatGraph_APICall_NetworkErrorRoutesNon2xx(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
-	url := server.URL
-	server.Close() // shut it down so the request fails
-
 	app, org, account, contact, session := newGraphTestFixtures(t)
-	flow := newAPICallFlow(t, app, org, account, url, nil)
+	app.HTTPClient = graphExternalAPIClient(func(_ *http.Request) (int, string, error) {
+		return 0, "", errors.New("synthetic network failure")
+	})
+	flow := newAPICallFlow(t, app, org, account, "https://api.example.test/customer", nil)
 
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
@@ -1160,14 +1164,12 @@ func newWebhookFlow(t *testing.T, app *App, org *models.Organization, account *m
 
 func TestRunChatGraph_Webhook_SuccessAdvances(t *testing.T) {
 	called := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
 	app, org, account, contact, session := newGraphTestFixtures(t)
-	flow := newWebhookFlow(t, app, org, account, server.URL)
+	app.HTTPClient = graphExternalAPIClient(func(_ *http.Request) (int, string, error) {
+		called = true
+		return http.StatusOK, `{}`, nil
+	})
+	flow := newWebhookFlow(t, app, org, account, "https://hooks.example.test/chatbot")
 
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
@@ -1180,13 +1182,11 @@ func TestRunChatGraph_Webhook_SuccessAdvances(t *testing.T) {
 }
 
 func TestRunChatGraph_Webhook_Non2xxStillAdvances(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
 	app, org, account, contact, session := newGraphTestFixtures(t)
-	flow := newWebhookFlow(t, app, org, account, server.URL)
+	app.HTTPClient = graphExternalAPIClient(func(_ *http.Request) (int, string, error) {
+		return http.StatusInternalServerError, `{}`, nil
+	})
+	flow := newWebhookFlow(t, app, org, account, "https://hooks.example.test/chatbot")
 
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
@@ -1194,16 +1194,75 @@ func TestRunChatGraph_Webhook_Non2xxStillAdvances(t *testing.T) {
 }
 
 func TestRunChatGraph_Webhook_NetworkErrorStillAdvances(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
-	url := server.URL
-	server.Close()
-
 	app, org, account, contact, session := newGraphTestFixtures(t)
-	flow := newWebhookFlow(t, app, org, account, url)
+	app.HTTPClient = graphExternalAPIClient(func(_ *http.Request) (int, string, error) {
+		return 0, "", errors.New("synthetic network failure")
+	})
+	flow := newWebhookFlow(t, app, org, account, "https://hooks.example.test/chatbot")
 
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 	assert.Equal(t, models.SessionStatusCompleted, session.Status)
+}
+
+func completionWebhookFlow(config models.JSONB) *models.ChatbotFlow {
+	return &models.ChatbotFlow{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		Name:             "completion-webhook-flow",
+		IsEnabled:        true,
+		OnCompleteAction: "webhook",
+		CompletionConfig: config,
+		Graph: models.JSONB{
+			"version":    2,
+			"entry_node": "end",
+			"nodes": []any{
+				map[string]any{"id": "end", "type": "end", "config": map[string]any{}},
+			},
+			"edges": []any{},
+		},
+	}
+}
+
+// Completion callbacks are best-effort notifications. A failed callback must
+// never leave the customer trapped in an active chatbot session.
+func TestRunChatGraph_CompletionWebhookFailureStillCompletesSession(t *testing.T) {
+	app, org, account, contact, session := newGraphTestFixtures(t)
+	app.HTTPClient = graphExternalAPIClient(func(_ *http.Request) (int, string, error) {
+		return 0, "", errors.New("synthetic completion network failure")
+	})
+	flow := completionWebhookFlow(models.JSONB{
+		"url":    "https://hooks.example.test/chatbot-completed",
+		"method": "POST",
+	})
+	flow.OrganizationID = org.ID
+	flow.WhatsAppAccount = account.Name
+
+	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
+	require.NoError(t, app.DB.First(session, session.ID).Error)
+	assert.Equal(t, models.SessionStatusCompleted, session.Status)
+	assert.NotNil(t, session.CompletedAt)
+}
+
+func TestRunChatGraph_CompletionWebhookUnsafeURLFailsClosedAndCompletes(t *testing.T) {
+	called := false
+	app, org, account, contact, session := newGraphTestFixtures(t)
+	app.HTTPClient = graphExternalAPIClient(func(_ *http.Request) (int, string, error) {
+		called = true
+		return http.StatusNoContent, "", nil
+	})
+	// This represents a legacy row predating save-time validation. Runtime
+	// validation must still reject it before the injected transport is called.
+	flow := completionWebhookFlow(models.JSONB{
+		"url": "https://127.0.0.1/private",
+	})
+	flow.OrganizationID = org.ID
+	flow.WhatsAppAccount = account.Name
+
+	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
+	require.NoError(t, app.DB.First(session, session.ID).Error)
+	assert.False(t, called)
+	assert.Equal(t, models.SessionStatusCompleted, session.Status)
+	assert.NotNil(t, session.CompletedAt)
 }
 
 // newGotoTargetFlow builds a one-node graph (message → end-by-no-edge)

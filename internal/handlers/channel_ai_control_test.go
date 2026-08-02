@@ -17,6 +17,7 @@ import (
 func TestChannelAIEnqueueSerializesBeforeSettingsCancellation(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	org := testutil.CreateTestOrganization(t, db)
+	createCentralQwenTestSettings(t, db, org.ID)
 	conversation := createAIControlConversation(t, db, org.ID)
 	var account models.ChannelAccount
 	require.NoError(t, db.First(

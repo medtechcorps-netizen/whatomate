@@ -140,7 +140,7 @@ func (c *Client) UpdateFlowJSON(ctx context.Context, account *Account, flowID st
 
 	c.Log.Info("Updating flow JSON", "flow_id", flowID)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.doHTTP(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
@@ -303,7 +303,7 @@ func (c *Client) GetFlowAssets(ctx context.Context, account *Account, flowID str
 	}
 	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.doHTTP(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to download flow JSON: %w", err)
 	}
@@ -315,7 +315,7 @@ func (c *Client) GetFlowAssets(ctx context.Context, account *Account, flowID str
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		c.Log.Error("Failed to download flow JSON", "status", resp.StatusCode, "body", string(flowJSONBody))
+		c.Log.Error("Failed to download flow JSON", "status", resp.StatusCode)
 		return nil, fmt.Errorf("failed to download flow JSON: status %d", resp.StatusCode)
 	}
 

@@ -788,6 +788,26 @@ func (a *App) toWhatsAppAccount(account *models.WhatsAppAccount) *whatsapp.Accou
 	return account.ToWAAccount()
 }
 
+// toWhatsAppAccountWithMetaApp overlays the effective organization-level App
+// ID for endpoints that require it (resumable uploads). It never mutates or
+// persists the source account, so central credential changes take effect
+// immediately without copying app credentials into account rows.
+func (a *App) toWhatsAppAccountWithMetaApp(account *models.WhatsAppAccount) (*whatsapp.Account, error) {
+	if account == nil {
+		return nil, errors.New("WhatsApp account is required")
+	}
+	appID, _, _, err := a.resolveEffectiveMetaAppCreds(account)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(appID) == "" {
+		return nil, errMetaAppIDNotConfigured
+	}
+	result := account.ToWAAccount()
+	result.AppID = strings.TrimSpace(appID)
+	return result, nil
+}
+
 // createOutgoingMessage creates a Message model from the request
 func (a *App) createOutgoingMessage(req OutgoingMessageRequest, opts MessageSendOptions) *models.Message {
 	msg := &models.Message{

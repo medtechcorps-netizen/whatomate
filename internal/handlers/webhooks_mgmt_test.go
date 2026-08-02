@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -41,7 +42,7 @@ func TestApp_ListWebhooks_Success(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	wh1 := createTestWebhook(t, app, org.ID, "Webhook A", "https://example.com/a", []string{"message.incoming"})
 	wh2 := createTestWebhook(t, app, org.ID, "Webhook B", "https://example.com/b", []string{"message.sent", "contact.created"})
@@ -76,7 +77,7 @@ func TestApp_ListWebhooks_Empty(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -101,8 +102,8 @@ func TestApp_ListWebhooks_OrgIsolation(t *testing.T) {
 	app := newTestApp(t)
 	org1 := testutil.CreateTestOrganization(t, app.DB)
 	org2 := testutil.CreateTestOrganization(t, app.DB)
-	user1 := testutil.CreateTestUser(t, app.DB, org1.ID)
-	user2 := testutil.CreateTestUser(t, app.DB, org2.ID)
+	user1 := testutil.CreateTestUser(t, app.DB, org1.ID, testutil.WithSuperAdmin())
+	user2 := testutil.CreateTestUser(t, app.DB, org2.ID, testutil.WithSuperAdmin())
 
 	createTestWebhook(t, app, org1.ID, "Org1 Hook", "https://example.com/org1", []string{"message.incoming"})
 	createTestWebhook(t, app, org1.ID, "Org1 Hook 2", "https://example.com/org1b", []string{"message.sent"})
@@ -159,7 +160,7 @@ func TestApp_GetWebhook_Success(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 	wh := createTestWebhook(t, app, org.ID, "My Hook", "https://example.com/hook", []string{"message.incoming", "message.sent"})
 
 	req := testutil.NewGETRequest(t)
@@ -181,7 +182,7 @@ func TestApp_GetWebhook_Success(t *testing.T) {
 	assert.ElementsMatch(t, []string{"message.incoming", "message.sent"}, resp.Data.Events)
 	assert.True(t, resp.Data.IsActive)
 	assert.True(t, resp.Data.HasSecret) // webhook has a secret
-	assert.Equal(t, "value", resp.Data.Headers["X-Custom"])
+	assert.Equal(t, "********", resp.Data.Headers["X-Custom"])
 }
 
 func TestApp_GetWebhook_NotFound(t *testing.T) {
@@ -189,7 +190,7 @@ func TestApp_GetWebhook_NotFound(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -205,7 +206,7 @@ func TestApp_GetWebhook_InvalidID(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -222,7 +223,7 @@ func TestApp_GetWebhook_CrossOrgIsolation(t *testing.T) {
 	app := newTestApp(t)
 	org1 := testutil.CreateTestOrganization(t, app.DB)
 	org2 := testutil.CreateTestOrganization(t, app.DB)
-	user2 := testutil.CreateTestUser(t, app.DB, org2.ID)
+	user2 := testutil.CreateTestUser(t, app.DB, org2.ID, testutil.WithSuperAdmin())
 
 	wh := createTestWebhook(t, app, org1.ID, "Org1 Only", "https://example.com/private", []string{"message.incoming"})
 
@@ -243,7 +244,7 @@ func TestApp_CreateWebhook_Success(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":      "Production Hook",
@@ -267,7 +268,7 @@ func TestApp_CreateWebhook_Success(t *testing.T) {
 	assert.Equal(t, "Production Hook", resp.Data.Name)
 	assert.Equal(t, "https://api.example.com/webhook", resp.Data.URL)
 	assert.ElementsMatch(t, []string{"message.incoming", "contact.created"}, resp.Data.Events)
-	assert.Equal(t, "Bearer tok123", resp.Data.Headers["Authorization"])
+	assert.Equal(t, "********", resp.Data.Headers["Authorization"])
 	assert.True(t, resp.Data.IsActive)
 	assert.True(t, resp.Data.HasSecret)
 	assert.NotEqual(t, uuid.Nil, resp.Data.ID)
@@ -277,7 +278,95 @@ func TestApp_CreateWebhook_Success(t *testing.T) {
 	require.NoError(t, app.DB.Where("id = ?", resp.Data.ID).First(&dbWebhook).Error)
 	assert.Equal(t, "Production Hook", dbWebhook.Name)
 	assert.Equal(t, org.ID, dbWebhook.OrganizationID)
-	assert.Equal(t, "my-secret", dbWebhook.Secret)
+	storedAuthorization, ok := dbWebhook.Headers["Authorization"].(string)
+	require.True(t, ok)
+	assert.True(t, appcrypto.IsEncrypted(storedAuthorization))
+	assert.NotContains(t, storedAuthorization, "tok123")
+	decryptedAuthorization, err := appcrypto.Decrypt(storedAuthorization, app.Config.App.EncryptionKey)
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer tok123", decryptedAuthorization)
+	assert.True(t, appcrypto.IsEncrypted(dbWebhook.Secret))
+	decryptedSecret, err := appcrypto.Decrypt(
+		dbWebhook.Secret,
+		app.Config.App.EncryptionKey,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "my-secret", decryptedSecret)
+}
+
+func TestApp_CreateWebhook_WithoutSecretRemainsUnsigned(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"name":   "Unsigned Hook",
+		"url":    "https://api.example.com/webhook",
+		"events": []string{"message.incoming"},
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.CreateWebhook(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var response struct {
+		Data handlers.WebhookResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &response))
+	assert.False(t, response.Data.HasSecret)
+
+	var stored models.Webhook
+	require.NoError(t, app.DB.Where("id = ?", response.Data.ID).First(&stored).Error)
+	assert.Empty(t, stored.Secret)
+}
+
+func TestApp_CreateWebhook_AllowsExplicitlyInactiveState(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"name":      "Paused Hook",
+		"url":       "https://api.example.com/paused",
+		"events":    []string{"message.incoming"},
+		"is_active": false,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.CreateWebhook(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	var response struct {
+		Data handlers.WebhookResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &response))
+	assert.False(t, response.Data.IsActive)
+
+	var stored models.Webhook
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", response.Data.ID, org.ID).First(&stored).Error)
+	assert.False(t, stored.IsActive, "explicitly inactive webhook must remain inactive after persistence")
+}
+
+func TestApp_CreateWebhook_RejectsHTTP(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"name":   "Insecure Hook",
+		"url":    "http://api.example.com/webhook",
+		"events": []string{"message.incoming"},
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.CreateWebhook(req))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+	var count int64
+	require.NoError(t, app.DB.Model(&models.Webhook{}).Where("organization_id = ?", org.ID).Count(&count).Error)
+	assert.Zero(t, count)
 }
 
 func TestApp_CreateWebhook_MissingName(t *testing.T) {
@@ -285,7 +374,7 @@ func TestApp_CreateWebhook_MissingName(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"url":    "https://example.com/hook",
@@ -303,7 +392,7 @@ func TestApp_CreateWebhook_MissingURL(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":   "My Hook",
@@ -321,7 +410,7 @@ func TestApp_CreateWebhook_MissingEvents(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name": "My Hook",
@@ -339,7 +428,7 @@ func TestApp_CreateWebhook_EmptyEvents(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":   "My Hook",
@@ -377,7 +466,7 @@ func TestApp_UpdateWebhook_Success(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 	wh := createTestWebhook(t, app, org.ID, "Old Name", "https://old.example.com", []string{"message.incoming"})
 
 	req := testutil.NewJSONRequest(t, map[string]any{
@@ -403,7 +492,7 @@ func TestApp_UpdateWebhook_Success(t *testing.T) {
 	assert.Equal(t, "Updated Name", resp.Data.Name)
 	assert.Equal(t, "https://new.example.com/hook", resp.Data.URL)
 	assert.ElementsMatch(t, []string{"message.sent", "contact.created"}, resp.Data.Events)
-	assert.Equal(t, "new-value", resp.Data.Headers["X-New-Header"])
+	assert.Equal(t, "********", resp.Data.Headers["X-New-Header"])
 	assert.True(t, resp.Data.IsActive)
 
 	// Verify persisted
@@ -418,7 +507,7 @@ func TestApp_UpdateWebhook_PartialUpdate(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 	wh := createTestWebhook(t, app, org.ID, "Original", "https://original.example.com", []string{"message.incoming"})
 
 	// Only update the name
@@ -444,12 +533,90 @@ func TestApp_UpdateWebhook_PartialUpdate(t *testing.T) {
 	assert.ElementsMatch(t, []string{"message.incoming"}, resp.Data.Events)
 }
 
+func TestApp_UpdateWebhook_PreservesOmittedActiveStateAndCanClearSecret(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
+	wh := createTestWebhook(t, app, org.ID, "Paused Signed Hook", "https://api.example.com/paused", []string{"message.incoming"})
+	require.NoError(t, app.DB.Model(wh).Update("is_active", false).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"name":         "Still Paused Unsigned Hook",
+		"clear_secret": true,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", wh.ID.String())
+
+	require.NoError(t, app.UpdateWebhook(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	var response struct {
+		Data handlers.WebhookResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &response))
+	assert.False(t, response.Data.IsActive)
+	assert.False(t, response.Data.HasSecret)
+
+	var stored models.Webhook
+	require.NoError(t, app.DB.Where("id = ?", wh.ID).First(&stored).Error)
+	assert.False(t, stored.IsActive)
+	assert.Empty(t, stored.Secret)
+}
+
+func TestApp_UpdateWebhook_PreservesMaskedCredentialAndDeletesRemovedHeaders(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
+	wh := createTestWebhook(t, app, org.ID, "Legacy Headers", "https://api.example.com/hook", []string{"message.incoming"})
+	wh.Headers = models.JSONB{
+		"Authorization": "Bearer legacy-secret",
+		"X-Tenant":      "old-tenant",
+		"X-Remove":      "remove-me",
+	}
+	require.NoError(t, app.DB.Model(wh).Update("headers", wh.Headers).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"headers": map[string]string{
+			"authorization": "********",
+			"X-Tenant":      "new-tenant",
+		},
+		"is_active": true,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", wh.ID.String())
+
+	require.NoError(t, app.UpdateWebhook(req))
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	var response struct {
+		Data handlers.WebhookResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &response))
+	assert.Equal(t, "********", response.Data.Headers["authorization"])
+	assert.Equal(t, "********", response.Data.Headers["X-Tenant"])
+	_, responseRetainedRemoved := response.Data.Headers["X-Remove"]
+	assert.False(t, responseRetainedRemoved)
+
+	var stored models.Webhook
+	require.NoError(t, app.DB.Where("id = ?", wh.ID).First(&stored).Error)
+	storedAuthorization, ok := stored.Headers["authorization"].(string)
+	require.True(t, ok)
+	assert.True(t, appcrypto.IsEncrypted(storedAuthorization))
+	decryptedAuthorization, err := appcrypto.Decrypt(storedAuthorization, app.Config.App.EncryptionKey)
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer legacy-secret", decryptedAuthorization)
+	_, retainedRemoved := stored.Headers["X-Remove"]
+	assert.False(t, retainedRemoved, "removing a header key must delete it from storage")
+}
+
 func TestApp_UpdateWebhook_NotFound(t *testing.T) {
 	t.Parallel()
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":      "Updated",
@@ -468,7 +635,7 @@ func TestApp_UpdateWebhook_InvalidID(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":      "Updated",
@@ -489,7 +656,7 @@ func TestApp_DeleteWebhook_Success(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 	wh := createTestWebhook(t, app, org.ID, "To Delete", "https://example.com/delete", []string{"message.incoming"})
 
 	req := testutil.NewGETRequest(t)
@@ -520,7 +687,7 @@ func TestApp_DeleteWebhook_NotFound(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -536,7 +703,7 @@ func TestApp_DeleteWebhook_InvalidID(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -553,7 +720,7 @@ func TestApp_DeleteWebhook_CrossOrgIsolation(t *testing.T) {
 	app := newTestApp(t)
 	org1 := testutil.CreateTestOrganization(t, app.DB)
 	org2 := testutil.CreateTestOrganization(t, app.DB)
-	user2 := testutil.CreateTestUser(t, app.DB, org2.ID)
+	user2 := testutil.CreateTestUser(t, app.DB, org2.ID, testutil.WithSuperAdmin())
 
 	wh := createTestWebhook(t, app, org1.ID, "Org1 Hook", "https://example.com/org1", []string{"message.incoming"})
 
@@ -580,7 +747,7 @@ func TestApp_TestWebhook_Success(t *testing.T) {
 	// Start a mock HTTP server that accepts webhook posts
 	var receivedBody []byte
 	var receivedHeaders http.Header
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedHeaders = r.Header.Clone()
 		buf := make([]byte, r.ContentLength)
 		_, _ = r.Body.Read(buf)
@@ -589,10 +756,15 @@ func TestApp_TestWebhook_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	app := newTestApp(t, withHTTPClient(&http.Client{Timeout: 5 * time.Second}))
+	server.Client().Timeout = 5 * time.Second
+	app := newTestApp(t, withHTTPClient(server.Client()))
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 	wh := createTestWebhook(t, app, org.ID, "Test Hook", server.URL, []string{"message.incoming"})
+	encryptedAuthorization, encryptErr := appcrypto.Encrypt("Bearer runtime-secret", app.Config.App.EncryptionKey)
+	require.NoError(t, encryptErr)
+	wh.Headers["Authorization"] = encryptedAuthorization
+	require.NoError(t, app.DB.Model(wh).Update("headers", wh.Headers).Error)
 
 	req := testutil.NewJSONRequest(t, nil)
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -617,6 +789,7 @@ func TestApp_TestWebhook_Success(t *testing.T) {
 	assert.Equal(t, "ReReply-Webhook/1.0", receivedHeaders.Get("User-Agent"))
 	// Custom header from webhook config
 	assert.Equal(t, "value", receivedHeaders.Get("X-Custom"))
+	assert.Equal(t, "Bearer runtime-secret", receivedHeaders.Get("Authorization"))
 	// HMAC signature should be set since webhook has a secret
 	assert.NotEmpty(t, receivedHeaders.Get("X-Webhook-Signature"))
 
@@ -632,15 +805,16 @@ func TestApp_TestWebhook_ServerError(t *testing.T) {
 	t.Parallel()
 
 	// Mock server that returns 500
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprint(w, "Internal Server Error")
 	}))
 	defer server.Close()
 
-	app := newTestApp(t, withHTTPClient(&http.Client{Timeout: 5 * time.Second}))
+	server.Client().Timeout = 5 * time.Second
+	app := newTestApp(t, withHTTPClient(server.Client()))
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 	wh := createTestWebhook(t, app, org.ID, "Failing Hook", server.URL, []string{"message.incoming"})
 
 	req := testutil.NewJSONRequest(t, nil)
@@ -657,7 +831,7 @@ func TestApp_TestWebhook_NotFound(t *testing.T) {
 
 	app := newTestApp(t, withHTTPClient(&http.Client{Timeout: 5 * time.Second}))
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewJSONRequest(t, nil)
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -688,7 +862,7 @@ func TestWebhookToResponse_HasSecretTrue(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	// Create a webhook with a secret
 	wh := createTestWebhook(t, app, org.ID, "Secret Hook", "https://example.com/secret", []string{"message.incoming"})
@@ -713,7 +887,7 @@ func TestWebhookToResponse_HasSecretFalse(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithSuperAdmin())
 
 	// Create a webhook without a secret
 	wh := &models.Webhook{

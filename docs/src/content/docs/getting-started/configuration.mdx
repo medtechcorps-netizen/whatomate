@@ -107,7 +107,7 @@ full_name = "Admin"
 ```
 
 <Aside type="note">
-  WhatsApp Cloud API credentials and AI provider API keys (OpenAI, Anthropic, Google) are configured **per organization** through the UI under **Settings → Accounts** — they are not in `config.toml`.
+  Workspace Meta app credentials and AI provider keys are configured **per organization** under **Settings → Integrations**. WhatsApp account identifiers and access tokens are configured under **Settings → Accounts**.
 </Aside>
 
 ## Sections in detail
@@ -285,18 +285,20 @@ Schema is generated from GORM struct tags in `internal/models/`; there are no SQ
 
 ## WhatsApp API Configuration
 
-WhatsApp Cloud API credentials are **not** in `config.toml`. Configure them per organization in the UI:
+For a workspace-owned Meta app, configure application credentials once per organization:
 
-1. Navigate to **Settings → Accounts**
-2. Click **Add Account**
-3. Enter:
+1. Navigate to **Settings → Integrations → WhatsApp & Meta** as a workspace administrator.
+2. Enter the **Meta App ID**, **Embedded Signup Config ID**, write-only **App Secret**, and write-only **Webhook Verify Token**.
+3. Copy the exact webhook callback shown by Integration Center into Meta for Developers.
+4. Navigate to **Settings → Accounts**, click **Add Account**, and enter only the account-owned values:
    - **Phone Number ID** — from Meta Business Suite
    - **Business Account ID** — from Meta Business Suite
    - **Access Token** — generated in Meta for Developers
-   - **Webhook Verify Token** — your custom verification token
+
+A deployment using the shared platform Meta app shows the platform app and webhook token as read-only. Workspace administrators still add each account's Phone Number ID, Business Account ID, and access token.
 
 <Aside type="caution">
-  Access tokens are encrypted at rest using `app.encryption_key`. If you haven't set that, tokens are stored in plaintext.
+  App secrets, webhook verify tokens, and account access tokens are write-only and encrypted at rest using `app.encryption_key`. ReReply rejects new credential writes when server-side encryption is unavailable.
 </Aside>
 
 ## Building

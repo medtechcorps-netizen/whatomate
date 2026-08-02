@@ -210,9 +210,6 @@ func (c *Client) GetAnalytics(ctx context.Context, account *Account, analyticsTy
 		return nil, fmt.Errorf("failed to fetch %s: %w", analyticsType, err)
 	}
 
-	// Log raw response for debugging
-	c.Log.Debug("Meta analytics raw response", "type", analyticsType, "response", string(respBody))
-
 	// Template analytics uses a different endpoint that returns data directly (not nested under template_analytics)
 	if analyticsType == AnalyticsTypeTemplate {
 		return c.parseTemplateAnalyticsResponse(ctx, account, respBody)

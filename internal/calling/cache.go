@@ -29,9 +29,14 @@ func (m *Manager) getIVRFlowCached(orgID, flowID uuid.UUID) *models.IVRFlow {
 	// Try cache
 	if cached, err := m.redis.Get(ctx, key).Result(); err == nil && cached != "" {
 		var flow models.IVRFlow
-		if json.Unmarshal([]byte(cached), &flow) == nil && flow.OrganizationID == orgID {
+		if json.Unmarshal([]byte(cached), &flow) == nil &&
+			flow.OrganizationID == orgID &&
+			IVRCallbackHeadersAreEncrypted(flow.Menu) {
 			return &flow
 		}
+		// Reject and evict any stale pre-vault cache containing plaintext or
+		// malformed callback headers.
+		m.redis.Del(ctx, key)
 	}
 
 	// Cache miss — DB
@@ -43,7 +48,7 @@ func (m *Manager) getIVRFlowCached(orgID, flowID uuid.UUID) *models.IVRFlow {
 	}
 
 	// Store
-	if data, err := json.Marshal(flow); err == nil {
+	if data, ok := m.ivrFlowCachePayload(flow); ok {
 		m.redis.Set(ctx, key, string(data), callingCacheTTL)
 	}
 	return &flow
@@ -62,9 +67,10 @@ func (m *Manager) getIVRFlowByConfigCached(orgID uuid.UUID, accountName, configT
 		}
 		var flow models.IVRFlow
 		if json.Unmarshal([]byte(cached), &flow) == nil && flow.OrganizationID == orgID &&
-			flow.WhatsAppAccount == accountName {
+			flow.WhatsAppAccount == accountName && IVRCallbackHeadersAreEncrypted(flow.Menu) {
 			return &flow
 		}
+		m.redis.Del(ctx, key)
 	}
 
 	// Cache miss — DB
@@ -87,10 +93,26 @@ func (m *Manager) getIVRFlowByConfigCached(orgID uuid.UUID, accountName, configT
 		return nil
 	}
 
-	if data, err := json.Marshal(flow); err == nil {
+	if data, ok := m.ivrFlowCachePayload(flow); ok {
 		m.redis.Set(ctx, key, string(data), callingCacheTTL)
 	}
 	return &flow
+}
+
+// ivrFlowCachePayload builds a cache-only copy. Legacy plaintext remains
+// usable from the database at runtime, but it is never copied into Redis. When
+// no encryption key is available, a legacy flow is simply left uncached.
+func (m *Manager) ivrFlowCachePayload(flow models.IVRFlow) ([]byte, bool) {
+	menu, err := EncryptIVRCallbackHeadersForCache(flow.Menu, m.encryptionKey)
+	if err != nil {
+		return nil, false
+	}
+	flow.Menu = menu
+	data, err := json.Marshal(flow)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
 }
 
 // cachedOrgSettings is the JSON-serializable subset of org settings used for calling.

@@ -11,10 +11,12 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/calling"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // IVRFlowRequest represents the request body for creating/updating an IVR flow
@@ -52,6 +54,9 @@ func (a *App) ListIVRFlows(r *fastglue.Request) error {
 		a.Log.Error("Failed to fetch IVR flows", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to fetch IVR flows", nil, "")
 	}
+	for index := range flows {
+		flows[index] = redactIVRFlowForResponse(flows[index])
+	}
 
 	return r.SendEnvelope(listEnvelope("ivr_flows", flows, total, pg))
 }
@@ -73,7 +78,7 @@ func (a *App) GetIVRFlow(r *fastglue.Request) error {
 		return nil
 	}
 
-	return r.SendEnvelope(flow)
+	return r.SendEnvelope(redactIVRFlowForResponse(*flow))
 }
 
 // CreateIVRFlow creates a new IVR flow
@@ -95,25 +100,17 @@ func (a *App) CreateIVRFlow(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "WhatsApp account is required", nil, "")
 	}
 
-	// If marking this as call start, unset others for the same account
-	if req.IsCallStart {
-		a.DB.Model(&models.IVRFlow{}).
-			Where("organization_id = ? AND whatsapp_account = ? AND is_call_start = ?", orgID, req.WhatsAppAccount, true).
-			Update("is_call_start", false)
-	}
-
-	// If marking this as outgoing end, unset others for the same account
-	if req.IsOutgoingEnd {
-		a.DB.Model(&models.IVRFlow{}).
-			Where("organization_id = ? AND whatsapp_account = ? AND is_outgoing_end = ?", orgID, req.WhatsAppAccount, true).
-			Update("is_outgoing_end", false)
-	}
-
-	// Validate and generate TTS for v2 flow graph
+	// Validate all request-controlled flow data before changing the existing
+	// call-start/outgoing-end routing selection.
 	if req.Menu != nil {
 		if err := validateFlowGraph(req.Menu); err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid flow graph: "+err.Error(), nil, "")
 		}
+		protectedMenu, err := calling.ProtectIVRCallbackHeaders(req.Menu, nil, a.ivrEncryptionKey())
+		if err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid IVR callback headers: "+err.Error(), nil, "")
+		}
+		req.Menu = protectedMenu
 		if a.TTS == nil {
 			if menuHasGreetingText(req.Menu) {
 				return r.SendErrorEnvelope(fasthttp.StatusBadRequest,
@@ -126,6 +123,20 @@ func (a *App) CreateIVRFlow(r *fastglue.Request) error {
 					"Text-to-speech generation failed: "+err.Error(), nil, "")
 			}
 		}
+	}
+
+	// If marking this as call start, unset others for the same account
+	if req.IsCallStart {
+		a.DB.Model(&models.IVRFlow{}).
+			Where("organization_id = ? AND whatsapp_account = ? AND is_call_start = ?", orgID, req.WhatsAppAccount, true).
+			Update("is_call_start", false)
+	}
+
+	// If marking this as outgoing end, unset others for the same account
+	if req.IsOutgoingEnd {
+		a.DB.Model(&models.IVRFlow{}).
+			Where("organization_id = ? AND whatsapp_account = ? AND is_outgoing_end = ?", orgID, req.WhatsAppAccount, true).
+			Update("is_outgoing_end", false)
 	}
 
 	flow := models.IVRFlow{
@@ -152,10 +163,11 @@ func (a *App) CreateIVRFlow(r *fastglue.Request) error {
 		a.CallManager.InvalidateIVRFlowCache(flow.ID, flow.OrganizationID, flow.WhatsAppAccount)
 	}
 
+	auditFlow := redactIVRFlowForResponse(flow)
 	a.logAudit(orgID, userID,
-		"ivr_flow", flow.ID, models.AuditActionCreated, nil, &flow)
+		ivrFlowAuditResourceType, flow.ID, models.AuditActionCreated, nil, &auditFlow)
 
-	return r.SendEnvelope(flow)
+	return r.SendEnvelope(auditFlow)
 }
 
 // UpdateIVRFlow updates an existing IVR flow
@@ -182,6 +194,31 @@ func (a *App) UpdateIVRFlow(r *fastglue.Request) error {
 		return nil
 	}
 
+	// Validate all request-controlled flow data before changing the existing
+	// call-start/outgoing-end routing selection.
+	if req.Menu != nil {
+		if err := validateFlowGraph(req.Menu); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid flow graph: "+err.Error(), nil, "")
+		}
+		protectedMenu, err := calling.ProtectIVRCallbackHeaders(req.Menu, flow.Menu, a.ivrEncryptionKey())
+		if err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid IVR callback headers: "+err.Error(), nil, "")
+		}
+		req.Menu = protectedMenu
+		if a.TTS == nil {
+			if menuHasGreetingText(req.Menu) {
+				return r.SendErrorEnvelope(fasthttp.StatusBadRequest,
+					"Text-to-speech is not configured on this server. Please upload audio files instead.", nil, "")
+			}
+		} else {
+			if err := a.generateIVRAudio(req.Menu); err != nil {
+				a.Log.Error("TTS generation failed", "error", err)
+				return r.SendErrorEnvelope(fasthttp.StatusBadRequest,
+					"Text-to-speech generation failed: "+err.Error(), nil, "")
+			}
+		}
+	}
+
 	// If marking this as call start, unset others for the same account
 	if req.IsCallStart && !flow.IsCallStart {
 		a.DB.Model(&models.IVRFlow{}).
@@ -196,25 +233,6 @@ func (a *App) UpdateIVRFlow(r *fastglue.Request) error {
 			Where("organization_id = ? AND whatsapp_account = ? AND is_outgoing_end = ? AND id != ?",
 				orgID, flow.WhatsAppAccount, true, flowID).
 			Update("is_outgoing_end", false)
-	}
-
-	// Validate and generate TTS for v2 flow graph
-	if req.Menu != nil {
-		if err := validateFlowGraph(req.Menu); err != nil {
-			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid flow graph: "+err.Error(), nil, "")
-		}
-		if a.TTS == nil {
-			if menuHasGreetingText(req.Menu) {
-				return r.SendErrorEnvelope(fasthttp.StatusBadRequest,
-					"Text-to-speech is not configured on this server. Please upload audio files instead.", nil, "")
-			}
-		} else {
-			if err := a.generateIVRAudio(req.Menu); err != nil {
-				a.Log.Error("TTS generation failed", "error", err)
-				return r.SendErrorEnvelope(fasthttp.StatusBadRequest,
-					"Text-to-speech generation failed: "+err.Error(), nil, "")
-			}
-		}
 	}
 
 	// Only update fields that were actually provided (non-zero) to support
@@ -251,19 +269,24 @@ func (a *App) UpdateIVRFlow(r *fastglue.Request) error {
 	a.DB.Preload("CreatedBy").Preload("UpdatedBy").First(flow, flowID)
 
 	if a.CallManager != nil {
+		if oldFlow.WhatsAppAccount != flow.WhatsAppAccount {
+			a.CallManager.InvalidateIVRFlowCache(flow.ID, flow.OrganizationID, oldFlow.WhatsAppAccount)
+		}
 		a.CallManager.InvalidateIVRFlowCache(flow.ID, flow.OrganizationID, flow.WhatsAppAccount)
 	}
 
 	// Compare IVR menu nodes for audit
 	var extraChanges []map[string]any
+	auditOldFlow := redactIVRFlowForResponse(oldFlow)
+	auditFlow := redactIVRFlowForResponse(*flow)
 	if req.Menu != nil {
-		extraChanges = diffIVRMenuNodes(a.DB, oldFlow.Menu, req.Menu)
+		extraChanges = diffIVRMenuNodes(a.DB, auditOldFlow.Menu, auditFlow.Menu)
 	}
 
 	a.logAudit(orgID, userID,
-		"ivr_flow", flow.ID, models.AuditActionUpdated, &oldFlow, flow, extraChanges...)
+		ivrFlowAuditResourceType, flow.ID, models.AuditActionUpdated, &auditOldFlow, &auditFlow, extraChanges...)
 
-	return r.SendEnvelope(flow)
+	return r.SendEnvelope(auditFlow)
 }
 
 // diffIVRMenuNodes compares old and new IVR menu JSONB to find node-level changes
@@ -440,8 +463,9 @@ func (a *App) DeleteIVRFlow(r *fastglue.Request) error {
 		a.CallManager.InvalidateIVRFlowCache(flow.ID, flow.OrganizationID, flow.WhatsAppAccount)
 	}
 
+	auditFlow := redactIVRFlowForResponse(*flow)
 	a.logAudit(orgID, userID,
-		"ivr_flow", flow.ID, models.AuditActionDeleted, flow, nil)
+		ivrFlowAuditResourceType, flow.ID, models.AuditActionDeleted, &auditFlow, nil)
 
 	return r.SendEnvelope(map[string]string{"message": "IVR flow deleted"})
 }
@@ -697,18 +721,25 @@ func (a *App) UploadOrgAudio(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to transcode audio to Opus format", nil, "")
 	}
 
-	// Update org settings with the new filename
-	var org models.Organization
-	if err := a.DB.Where("id = ?", orgID).First(&org).Error; err != nil {
-		a.Log.Error("Failed to load organization for audio update", "error", err, "org_id", orgID)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load organization", nil, "")
-	}
-	if org.Settings == nil {
-		org.Settings = models.JSONB{}
-	}
 	settingsKey := audioType + "_file"
-	org.Settings[settingsKey] = filename
-	if err := a.DB.Save(&org).Error; err != nil {
+	// Serialize this JSONB update with Integration Center and General/Calling
+	// settings writes so the audio filename cannot restore a stale credential
+	// snapshot after waiting on another transaction.
+	if err := a.DB.Transaction(func(tx *gorm.DB) error {
+		var org models.Organization
+		if queryErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", orgID).
+			First(&org).Error; queryErr != nil {
+			return queryErr
+		}
+		if org.Settings == nil {
+			org.Settings = models.JSONB{}
+		}
+		org.Settings[settingsKey] = filename
+		return tx.Model(&models.Organization{}).
+			Where("id = ?", orgID).
+			Update("settings", org.Settings).Error
+	}); err != nil {
 		a.Log.Error("Failed to update organization audio settings", "error", err, "org_id", orgID, "audio_type", audioType)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update organization settings", nil, "")
 	}
@@ -896,6 +927,9 @@ func validateFlowGraph(menu models.JSONB) error {
 		nodeIDs[id] = true
 
 		nodeType, _ := nodeMap["type"].(string)
+		if err := validateIVRCallbackNode(id, nodeType, nodeMap["config"]); err != nil {
+			return err
+		}
 		if terminalTypes[nodeType] {
 			terminalNodes[id] = true
 		}
@@ -932,4 +966,103 @@ func validateFlowGraph(menu models.JSONB) error {
 	}
 
 	return nil
+}
+
+func validateIVRCallbackNode(nodeID, nodeType string, rawConfig any) error {
+	config, configOK := ivrConfigMap(rawConfig)
+	switch nodeType {
+	case string(calling.IVRNodeHTTPCallback):
+		if !configOK {
+			return fmt.Errorf("node %q HTTP callback config must be an object", nodeID)
+		}
+		if err := validateIVRCallbackTimeout(nodeID, config); err != nil {
+			return err
+		}
+		method, _ := config["method"].(string)
+		if strings.TrimSpace(method) == "" {
+			method = "GET"
+		}
+		if err := calling.ValidateHTTPCallbackMethod(method); err != nil {
+			return fmt.Errorf("node %q: %w", nodeID, err)
+		}
+		callbackURL, ok := config["url"].(string)
+		if !ok || strings.TrimSpace(callbackURL) == "" {
+			return fmt.Errorf("node %q HTTP callback URL is required", nodeID)
+		}
+		if err := calling.ValidateHTTPCallbackTemplateURL(callbackURL); err != nil {
+			return fmt.Errorf("node %q: %w", nodeID, err)
+		}
+	case string(calling.IVRNodeTransfer):
+		if !configOK {
+			return nil
+		}
+		for _, event := range []string{"on_waiting", "on_connect"} {
+			rawCallback, exists := config[event]
+			if !exists || rawCallback == nil {
+				continue
+			}
+			callback, ok := ivrConfigMap(rawCallback)
+			if !ok {
+				return fmt.Errorf("node %q transfer callback %s must be an object", nodeID, event)
+			}
+			callbackURL, _ := callback["url"].(string)
+			if strings.TrimSpace(callbackURL) == "" {
+				continue
+			}
+			method, _ := callback["method"].(string)
+			if strings.TrimSpace(method) == "" {
+				method = "POST"
+			}
+			if err := calling.ValidateHTTPCallbackMethod(method); err != nil {
+				return fmt.Errorf("node %q transfer callback %s: %w", nodeID, event, err)
+			}
+			if err := calling.ValidateHTTPCallbackTemplateURL(callbackURL); err != nil {
+				return fmt.Errorf("node %q transfer callback %s: %w", nodeID, event, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateIVRCallbackTimeout(nodeID string, config map[string]any) error {
+	rawTimeout, configured := config["timeout_seconds"]
+	if !configured {
+		return nil
+	}
+
+	var timeout int64
+	switch value := rawTimeout.(type) {
+	case int:
+		timeout = int64(value)
+	case int64:
+		timeout = value
+	case float64:
+		if value != float64(int64(value)) {
+			return fmt.Errorf("node %q HTTP callback timeout_seconds must be a whole number from 1 to 30", nodeID)
+		}
+		timeout = int64(value)
+	case json.Number:
+		parsed, err := value.Int64()
+		if err != nil {
+			return fmt.Errorf("node %q HTTP callback timeout_seconds must be a whole number from 1 to 30", nodeID)
+		}
+		timeout = parsed
+	default:
+		return fmt.Errorf("node %q HTTP callback timeout_seconds must be a whole number from 1 to 30", nodeID)
+	}
+	if timeout < 1 || timeout > 30 {
+		return fmt.Errorf("node %q HTTP callback timeout_seconds must be between 1 and 30", nodeID)
+	}
+	return nil
+}
+
+func ivrConfigMap(value any) (map[string]any, bool) {
+	switch config := value.(type) {
+	case map[string]any:
+		return config, true
+	case models.JSONB:
+		return map[string]any(config), true
+	default:
+		return nil, false
+	}
 }

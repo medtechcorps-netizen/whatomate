@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/calling"
@@ -12,6 +13,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // --- GetOrganizationSettings Tests ---
@@ -121,13 +124,14 @@ func TestApp_GetOrganizationSettings_RedactsPrivilegedSections(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	org.Settings = models.JSONB{
-		"timezone":                  "Asia/Kuala_Lumpur",
-		"calling_enabled":           true,
-		"meta_app_id":               "sensitive-app-id",
-		"meta_config_id":            "sensitive-config-id",
-		"meta_app_secret_encrypted": "encrypted-secret",
-		"max_call_duration":         float64(600),
-		"transfer_timeout_secs":     float64(60),
+		"timezone":                            "Asia/Kuala_Lumpur",
+		"calling_enabled":                     true,
+		"meta_app_id":                         "sensitive-app-id",
+		"meta_config_id":                      "sensitive-config-id",
+		"meta_app_secret_encrypted":           "encrypted-secret",
+		"meta_webhook_verify_token_encrypted": "encrypted-webhook-verify-token",
+		"max_call_duration":                   float64(600),
+		"transfer_timeout_secs":               float64(60),
 	}
 	require.NoError(t, app.DB.Save(org).Error)
 	role := testutil.CreateTestRoleWithKeys(
@@ -156,6 +160,8 @@ func TestApp_GetOrganizationSettings_RedactsPrivilegedSections(t *testing.T) {
 	assert.NotContains(t, response.Data.Settings, "meta_app_id")
 	assert.NotContains(t, response.Data.Settings, "meta_config_id")
 	assert.NotContains(t, response.Data.Settings, "has_meta_app_secret")
+	assert.NotContains(t, response.Data.Settings, "meta_webhook_verify_token_encrypted")
+	assert.NotContains(t, string(testutil.GetResponseBody(req)), "encrypted-webhook-verify-token")
 }
 
 // --- UpdateOrganizationSettings Tests ---
@@ -237,6 +243,88 @@ func TestApp_UpdateOrganizationSettings_PartialUpdate(t *testing.T) {
 	assert.Equal(t, false, updatedOrg.Settings["mask_phone_numbers"])
 	assert.Equal(t, "Europe/London", updatedOrg.Settings["timezone"])
 	assert.Equal(t, "YYYY-MM-DD", updatedOrg.Settings["date_format"])
+}
+
+func TestApp_UpdateOrganizationSettings_SerializesSharedSettingsWrites(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID,
+		testutil.WithEmail(testutil.UniqueEmail("serialized-settings")),
+		testutil.WithSuperAdmin(),
+	)
+
+	// Hold the same row lock used by Integration Center while the general
+	// settings request starts. A correct implementation waits for this commit,
+	// reloads the row and merges its field instead of saving a stale JSONB copy.
+	tx := app.DB.Begin()
+	require.NoError(t, tx.Error)
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback().Error
+		}
+	}()
+
+	var locked models.Organization
+	require.NoError(t, tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ?", org.ID).
+		First(&locked).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"timezone": "Asia/Kuala_Lumpur",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	backendPID := make(chan int, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- app.DB.Connection(func(connection *gorm.DB) error {
+			session := connection.Session(&gorm.Session{NewDB: true})
+			var pid int
+			if err := session.Raw("SELECT pg_backend_pid()").Scan(&pid).Error; err != nil {
+				backendPID <- 0
+				return err
+			}
+			backendPID <- pid
+			connectionApp := &handlers.App{
+				Config:      app.Config,
+				DB:          session,
+				Redis:       app.Redis,
+				Log:         app.Log,
+				HTTPClient:  app.HTTPClient,
+				CallManager: app.CallManager,
+			}
+			return connectionApp.UpdateOrganizationSettings(req)
+		})
+	}()
+
+	pid := <-backendPID
+	require.Positive(t, pid)
+	testutil.RequirePostgresBackendWaitingForLock(t, app.DB, pid)
+	if locked.Settings == nil {
+		locked.Settings = models.JSONB{}
+	}
+	locked.Settings["meta_app_id"] = "central-app-id-after-lock"
+	require.NoError(t, tx.Model(&models.Organization{}).
+		Where("id = ?", org.ID).
+		Update("settings", locked.Settings).Error)
+	require.NoError(t, tx.Commit().Error)
+	committed = true
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("settings update did not resume after the row lock was released")
+	}
+	require.Equal(t, fasthttp.StatusOK, req.RequestCtx.Response.StatusCode())
+
+	var updated models.Organization
+	require.NoError(t, app.DB.First(&updated, "id = ?", org.ID).Error)
+	require.Equal(t, "central-app-id-after-lock", updated.Settings["meta_app_id"])
+	require.Equal(t, "Asia/Kuala_Lumpur", updated.Settings["timezone"])
 }
 
 func TestApp_UpdateOrganizationSettings_Unauthorized(t *testing.T) {
@@ -336,7 +424,7 @@ func TestApp_UpdateOrganizationSettings_CallingPermissionIsIndependent(t *testin
 	assert.Equal(t, true, persisted.Settings["calling_enabled"])
 }
 
-func TestApp_UpdateOrganizationSettings_MetaCredentialsRequireGeneralAndAccountsWrite(t *testing.T) {
+func TestApp_UpdateOrganizationSettings_RejectsMetaCredentialWrites(t *testing.T) {
 	t.Parallel()
 
 	app := newTestApp(t)
@@ -354,7 +442,7 @@ func TestApp_UpdateOrganizationSettings_MetaCredentialsRequireGeneralAndAccounts
 	testutil.SetAuthContext(req, org.ID, user.ID)
 
 	require.NoError(t, app.UpdateOrganizationSettings(req))
-	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "managed in Settings > Integrations")
 
 	var persisted models.Organization
 	require.NoError(t, app.DB.Where("id = ?", org.ID).First(&persisted).Error)
@@ -386,7 +474,7 @@ func TestApp_UpdateOrganizationSettings_EmptyNameIgnored(t *testing.T) {
 	assert.Equal(t, originalName, updatedOrg.Name)
 }
 
-func TestApp_UpdateOrganizationSettings_ClearsMetaAppSecret(t *testing.T) {
+func TestApp_UpdateOrganizationSettings_RejectsLegacyMetaSecretClear(t *testing.T) {
 	t.Parallel()
 
 	app := newTestApp(t)
@@ -412,13 +500,12 @@ func TestApp_UpdateOrganizationSettings_ClearsMetaAppSecret(t *testing.T) {
 
 	err := app.UpdateOrganizationSettings(req)
 	require.NoError(t, err)
-	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "managed in Settings > Integrations")
 
 	var updatedOrg models.Organization
 	require.NoError(t, app.DB.Where("id = ?", org.ID).First(&updatedOrg).Error)
 	assert.Equal(t, "123456789012345", updatedOrg.Settings["meta_app_id"])
-	_, exists := updatedOrg.Settings["meta_app_secret_encrypted"]
-	assert.False(t, exists)
+	assert.Equal(t, "accidental-secret", updatedOrg.Settings["meta_app_secret_encrypted"])
 }
 
 func TestApp_UpdateOrganizationSettings_InvalidJSON(t *testing.T) {

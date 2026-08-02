@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/zerodha/logf"
@@ -67,6 +70,21 @@ func (c *Client) getBaseURL() string {
 	return BaseURL
 }
 
+// doHTTP prevents Meta credentials, authorization codes and signed payloads
+// from being replayed to an HTTP redirect target. The Graph API endpoints used
+// by this client are final destinations; callers must explicitly re-resolve a
+// new trusted URL instead of following a provider response automatically.
+func (c *Client) doHTTP(req *http.Request) (*http.Response, error) {
+	if c == nil || c.HTTPClient == nil {
+		return nil, errors.New("WhatsApp HTTP client is not configured")
+	}
+	requestClient := *c.HTTPClient
+	requestClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return requestClient.Do(req)
+}
+
 // doRequest performs an HTTP request to the Meta API
 func (c *Client) doRequest(ctx context.Context, method, url string, body any, accessToken string) ([]byte, error) {
 	var reqBody io.Reader
@@ -86,7 +104,7 @@ func (c *Client) doRequest(ctx context.Context, method, url string, body any, ac
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.doHTTP(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -276,7 +294,7 @@ func (c *Client) DownloadMedia(ctx context.Context, mediaURL string, accessToken
 	// Meta requires Bearer token for media download
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.doHTTP(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to download media: %w", err)
 	}
@@ -328,7 +346,7 @@ func (c *Client) UploadMedia(ctx context.Context, account *Account, data []byte,
 	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
 	req.Header.Set("Content-Type", fmt.Sprintf("multipart/form-data; boundary=%s", boundary))
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.doHTTP(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to upload media: %w", err)
 	}
@@ -487,7 +505,7 @@ func (c *Client) ResumableUpload(ctx context.Context, account *Account, data []b
 	req.Header.Set("file_offset", "0")
 	req.Header.Set("Content-Type", "application/octet-stream")
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.doHTTP(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to upload file data: %w", err)
 	}
@@ -595,16 +613,21 @@ type TokenExchangeResponse struct {
 
 // ExchangeCodeForToken exchanges a Facebook authorization code for a permanent access token
 func (c *Client) ExchangeCodeForToken(ctx context.Context, code, appID, appSecret, apiVersion string) (string, error) {
-	url := fmt.Sprintf("%s/%s/oauth/access_token?client_id=%s&client_secret=%s&code=%s",
-		c.getBaseURL(), apiVersion, appID, appSecret, code)
+	endpoint := fmt.Sprintf("%s/%s/oauth/access_token", c.getBaseURL(), apiVersion)
+	form := url.Values{
+		"client_id":     []string{appID},
+		"client_secret": []string{appSecret},
+		"code":          []string{code},
+	}
 
-	// OAuth endpoint doesn't require Authorization header, so we make a direct request
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// Keep credentials out of the request URL and intermediary access logs.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("failed to create token exchange request: %w", err)
 	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.doHTTP(req)
 	if err != nil {
 		return "", fmt.Errorf("token exchange request failed: %w", err)
 	}
@@ -701,7 +724,7 @@ type TokenDebugInfo struct {
 
 // GetTokenDebugInfo retrieves information about an access token
 func (c *Client) GetTokenDebugInfo(ctx context.Context, inputToken, accessToken string) (*TokenDebugInfo, error) {
-	url := fmt.Sprintf("%s/debug_token?input_token=%s", c.getBaseURL(), inputToken)
+	url := fmt.Sprintf("%s/debug_token?input_token=%s", c.getBaseURL(), url.QueryEscape(inputToken))
 
 	// debug_token requires an app access token or a user access token
 	respBody, err := c.doRequest(ctx, http.MethodGet, url, nil, accessToken)

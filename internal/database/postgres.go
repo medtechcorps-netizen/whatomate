@@ -200,6 +200,7 @@ func GetMigrationModels() []MigrationModel {
 		{"CopilotFeedback", &models.CopilotFeedback{}},
 
 		// Provider-neutral omnichannel inbox
+		{"ProviderIntegration", &models.ProviderIntegration{}},
 		{"ChannelAccount", &models.ChannelAccount{}},
 		{"ChannelCredential", &models.ChannelCredential{}},
 		{"ContactIdentity", &models.ContactIdentity{}},

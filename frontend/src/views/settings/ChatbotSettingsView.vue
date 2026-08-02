@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, watch } from 'vue'
+import { RouterLink } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -14,7 +15,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 import { PageHeader, AuditLogPanel } from '@/components/shared'
 import { toast } from 'vue-sonner'
-import { Bot, Loader2, Brain, Plus, X, Clock, AlertTriangle, UserPlus, MessageSquare, Users } from 'lucide-vue-next'
+import { ArrowUpRight, Bot, Loader2, Brain, Plus, X, Clock, AlertTriangle, UserPlus, MessageSquare, Users } from 'lucide-vue-next'
 import { chatbotService } from '@/services/api'
 import { useUsersStore } from '@/stores/users'
 import { useAuthStore } from '@/stores/auth'
@@ -22,6 +23,9 @@ import { useAuthStore } from '@/stores/auth'
 const { t } = useI18n()
 const usersStore = useUsersStore()
 const authStore = useAuthStore()
+const canReadIntegrations = computed(() =>
+  authStore.hasPermission('settings.integrations', 'read'),
+)
 
 // The active org may be overridden by the X-Organization-ID header
 // (localStorage.selected_organization_id) when a super admin switches orgs.
@@ -875,22 +879,44 @@ function removeEscalationUser(userId: string) {
                   />
                 </div>
 
+                <div
+                  data-testid="chatbot-ai-provider-authority"
+                  class="rounded-xl border border-emerald-400/15 bg-emerald-400/[0.04] p-4"
+                >
+                  <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <p class="font-medium">
+                        {{ canReadIntegrations ? 'Qwen Copilot' : 'ReReply AI' }}
+                      </p>
+                      <p class="mt-1 text-sm leading-5 text-muted-foreground">
+                        <template v-if="canReadIntegrations">
+                          Provider, model, endpoint and the write-only API key are owned by the
+                          Integration Center. This tab controls only the chatbot automation prompt
+                          and output cap.
+                        </template>
+                        <template v-else>
+                          The AI provider and its credentials are managed by a workspace
+                          administrator. This tab controls only chatbot automation behavior.
+                        </template>
+                      </p>
+                    </div>
+                    <RouterLink v-if="canReadIntegrations" to="/settings/integrations" class="shrink-0">
+                      <Button variant="outline" size="sm" data-testid="chatbot-open-qwen-integration">
+                        Open Integration Center
+                        <ArrowUpRight class="ml-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                      </Button>
+                    </RouterLink>
+                    <span
+                      v-else
+                      class="w-fit shrink-0 rounded-full border border-emerald-400/20 bg-emerald-400/[0.08] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-emerald-300 light:text-emerald-700"
+                    >
+                      Admin managed
+                    </span>
+                  </div>
+                </div>
+
                 <div v-if="isAIEnabled" class="space-y-4 pt-2">
                   <Separator />
-
-                  <div class="rounded-xl border border-emerald-400/15 bg-emerald-400/[0.04] p-4">
-                    <div class="flex items-center justify-between gap-4">
-                      <div>
-                        <p class="font-medium">ReReply AI</p>
-                        <p class="mt-1 text-sm text-muted-foreground">
-                          The AI service and its credentials are securely managed by ReReply.
-                        </p>
-                      </div>
-                      <span class="rounded-full border border-emerald-400/20 bg-emerald-400/[0.08] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-emerald-300 light:text-emerald-700">
-                        Managed
-                      </span>
-                    </div>
-                  </div>
 
                   <div class="space-y-2">
                     <Label>{{ $t('chatbotSettings.maxTokens') }}</Label>

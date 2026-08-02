@@ -9,6 +9,34 @@ import { Aside } from '@astrojs/starlight/components';
 
 Accounts represent your WhatsApp Business API connections. Each account is linked to a phone number registered with Meta's WhatsApp Business Platform.
 
+<Aside type="note">
+  Meta App ID, Embedded Signup Config ID, App Secret, and the webhook verify token are workspace-level settings. An administrator configures them once in **Settings → Integrations**; account requests must not send those fields.
+</Aside>
+
+## Configure the Meta integration
+
+Workspace-owned Meta apps use the admin-only Integration Center API. Secrets are write-only: responses contain configuration state, never credential values.
+
+```bash
+PUT /api/integrations/meta
+```
+
+```json
+{
+  "enabled": true,
+  "config": {
+    "app_id": "123456789012345",
+    "config_id": "987654321098765"
+  },
+  "credentials": {
+    "app_secret": "your_meta_app_secret",
+    "webhook_verify_token": "your_strong_workspace_verify_token"
+  }
+}
+```
+
+Use `GET /api/integrations` to retrieve the exact public callback from `config.webhook_callback_path` and to check each credential's `configured` flag. A shared platform Meta app instead reports `management_mode: "platform"`; its webhook verify token is deployment-managed and read-only to the workspace.
+
 ## List Accounts
 
 Retrieve all connected WhatsApp accounts.
@@ -23,13 +51,13 @@ GET /api/accounts
 {
   "status": "success",
   "data": {
-    "items": [
+    "accounts": [
       {
         "id": "uuid",
         "name": "Main Business",
-        "phone_number": "+1234567890",
-        "phone_number_id": "123456789",
-        "business_account_id": "987654321",
+        "phone_id": "123456789",
+        "business_id": "987654321",
+        "has_access_token": true,
         "status": "active",
         "created_at": "2024-01-01T00:00:00Z"
       }
@@ -54,14 +82,10 @@ GET /api/accounts/{id}
   "data": {
     "id": "uuid",
     "name": "Main Business",
-    "phone_number": "+1234567890",
-    "phone_number_id": "123456789",
-    "business_account_id": "987654321",
-    "access_token": "EAAxxxx...",
-    "webhook_verify_token": "your_verify_token",
+    "phone_id": "123456789",
+    "business_id": "987654321",
+    "has_access_token": true,
     "status": "active",
-    "quality_rating": "GREEN",
-    "messaging_limit": "TIER_1K",
     "created_at": "2024-01-01T00:00:00Z"
   }
 }
@@ -80,10 +104,9 @@ POST /api/accounts
 ```json
 {
   "name": "Support Line",
-  "phone_number_id": "123456789",
-  "business_account_id": "987654321",
-  "access_token": "EAAxxxx...",
-  "webhook_verify_token": "your_custom_verify_token"
+  "phone_id": "123456789",
+  "business_id": "987654321",
+  "access_token": "EAAxxxx..."
 }
 ```
 
@@ -95,7 +118,10 @@ POST /api/accounts
   "data": {
     "id": "uuid",
     "name": "Support Line",
-    "status": "pending",
+    "phone_id": "123456789",
+    "business_id": "987654321",
+    "has_access_token": true,
+    "status": "active",
     "created_at": "2024-01-01T00:00:00Z"
   }
 }
@@ -117,6 +143,8 @@ PUT /api/accounts/{id}
   "access_token": "EAAyyyy..."
 }
 ```
+
+Sending `app_id`, `app_secret`, or `webhook_verify_token` to the create, update, or Embedded Signup account endpoints is rejected. Existing legacy account-column values are retained only as a non-destructive callback fallback and are never returned by the Accounts API.
 
 ## Delete Account
 

@@ -356,6 +356,31 @@ func TestApp_ExchangeToken_MissingFields(t *testing.T) {
 	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
 }
 
+func TestApp_ExchangeToken_RejectsDuplicateAccountWebhookVerifyToken(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
+
+	req := testutil.NewJSONRequest(t, map[string]interface{}{
+		"code":                 "synthetic-embedded-signup-code",
+		"phone_id":             "duplicate-token-phone-id",
+		"waba_id":              "duplicate-token-waba-id",
+		"webhook_verify_token": "must-be-configured-centrally",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.ExchangeToken(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "managed in Settings > Integrations")
+
+	var accountCount int64
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+		Where("organization_id = ? AND phone_id = ?", org.ID, "duplicate-token-phone-id").
+		Count(&accountCount).Error)
+	assert.Zero(t, accountCount)
+}
+
 func TestApp_ExchangeToken_Unauthorized(t *testing.T) {
 	t.Parallel()
 

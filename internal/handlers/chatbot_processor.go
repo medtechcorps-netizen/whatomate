@@ -32,15 +32,9 @@ func redactURLForLog(raw string) string {
 		return parsed.Path
 	}
 
-	return parsed.Scheme + "://" + parsed.Host + parsed.Path
-}
-
-func truncateLogValue(value string, maxLen int) string {
-	if len(value) <= maxLen {
-		return value
-	}
-
-	return value[:maxLen] + "...(truncated)"
+	// Tenant-authored paths can themselves contain credentials. Log only the
+	// origin; query, fragment, userinfo, and path are deliberately excluded.
+	return parsed.Scheme + "://" + parsed.Host
 }
 
 // IncomingTextMessage represents a text, interactive, or media message from the webhook
@@ -998,16 +992,26 @@ func (a *App) exitFlow(session *models.ChatbotSession) {
 // replaceVar is called to substitute variables in the URL, body, and header values.
 // Returns the response body and status code.
 func (a *App) executeConfiguredAPI(apiConfig models.JSONB, replaceVar func(string) string) ([]byte, int, error) {
+	requestClient, err := a.chatbotRequestClient()
+	if err != nil {
+		return nil, 0, err
+	}
 	apiURL, ok := apiConfig["url"].(string)
 	if !ok || apiURL == "" {
 		return nil, 0, fmt.Errorf("API URL is required")
 	}
+	if replaceVar == nil {
+		replaceVar = func(value string) string { return value }
+	}
 	apiURL = replaceVar(apiURL)
+	if err := validateWebhookRuntimeURL(apiURL); err != nil {
+		return nil, 0, errors.New("configured API URL is not allowed")
+	}
 	logURL := redactURLForLog(apiURL)
 
-	method := "GET"
-	if m, ok := apiConfig["method"].(string); ok && m != "" {
-		method = strings.ToUpper(m)
+	method, err := configuredChatbotMethod(map[string]any(apiConfig))
+	if err != nil {
+		return nil, 0, errors.New("configured API method is not allowed")
 	}
 
 	var bodyReader io.Reader
@@ -1017,34 +1021,46 @@ func (a *App) executeConfiguredAPI(apiConfig models.JSONB, replaceVar func(strin
 
 	req, err := http.NewRequest(method, apiURL, bodyReader)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to create request: %w", err)
+		return nil, 0, errors.New("failed to create configured API request")
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	if headers, ok := apiConfig["headers"].(map[string]any); ok {
-		for key, value := range headers {
-			if strVal, ok := value.(string); ok {
-				req.Header.Set(key, replaceVar(strVal))
-			}
+	resolvedHeaders, err := a.resolveChatbotHeaders(apiConfig["headers"])
+	if err != nil {
+		return nil, 0, fmt.Errorf("configured API headers are unavailable: %w", err)
+	}
+	seenHeaderNames := make(map[string]struct{}, len(resolvedHeaders))
+	for key, value := range resolvedHeaders {
+		renderedValue := replaceVar(value)
+		if !validChatbotHeaderName(key) || !validChatbotHeaderValue(renderedValue) {
+			return nil, 0, errors.New("configured API headers are invalid")
 		}
+		normalizedName := strings.ToLower(key)
+		if _, duplicate := seenHeaderNames[normalizedName]; duplicate {
+			return nil, 0, errors.New("configured API headers are invalid")
+		}
+		seenHeaderNames[normalizedName] = struct{}{}
+		req.Header.Set(key, renderedValue)
 	}
 
 	a.Log.Info("Executing configured API request", "method", method, "url", logURL)
 
-	resp, err := a.HTTPClient.Do(req)
+	resp, err := requestClient.Do(req)
 	if err != nil {
-		a.Log.Error("Configured API request failed", "method", method, "url", logURL, "error", err)
-		return nil, 0, fmt.Errorf("API request failed: %w", err)
+		// net/http errors may embed the full tenant-authored URL. Do not log or
+		// return them because paths and query strings can carry credentials.
+		a.Log.Error("Configured API request failed", "method", method, "url", logURL)
+		return nil, 0, errors.New("configured API request failed")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	limitReader := io.LimitReader(resp.Body, 1024*1024)
 	body, err := io.ReadAll(limitReader)
 	if err != nil {
-		a.Log.Error("Failed to read configured API response", "method", method, "url", logURL, "status_code", resp.StatusCode, "error", err)
-		return nil, 0, fmt.Errorf("failed to read response: %w", err)
+		a.Log.Error("Failed to read configured API response", "method", method, "url", logURL, "status_code", resp.StatusCode)
+		return nil, 0, errors.New("failed to read configured API response")
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -1053,7 +1069,6 @@ func (a *App) executeConfiguredAPI(apiConfig models.JSONB, replaceVar func(strin
 			"method", method,
 			"url", logURL,
 			"status_code", resp.StatusCode,
-			"response_preview", truncateLogValue(string(body), 300),
 		)
 	} else {
 		a.Log.Info(
@@ -1351,6 +1366,9 @@ func (a *App) generateQwenResponse(settings *models.ChatbotSettings, session *mo
 	baseURL := qwenapi.DefaultBaseURL
 	if a.Config != nil && a.Config.AI.QwenBaseURL != "" {
 		baseURL = a.Config.AI.QwenBaseURL
+	}
+	if strings.TrimSpace(settings.AI.BaseURL) != "" {
+		baseURL = settings.AI.BaseURL
 	}
 	return qwenapi.Generate(context.Background(), a.HTTPClient, qwenapi.Options{
 		APIKey:      settings.AI.APIKey,

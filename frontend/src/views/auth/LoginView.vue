@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
@@ -9,7 +9,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { toast } from 'vue-sonner'
-import { ArrowRight, CheckCircle2, Loader2 } from 'lucide-vue-next'
+import { ArrowRight, Building2, CheckCircle2, Loader2, Search } from 'lucide-vue-next'
 import ReReplyLogo from '@/components/brand/ReReplyLogo.vue'
 
 const { t } = useI18n()
@@ -27,6 +27,9 @@ const email = ref('')
 const password = ref('')
 const isLoading = ref(false)
 const ssoProviders = ref<SSOProvider[]>([])
+const organization = ref('')
+const isSSODiscovering = ref(false)
+const hasDiscoveredSSO = ref(false)
 
 // SSO provider icons (using simple SVG paths)
 const providerIcons: Record<string, string> = {
@@ -46,6 +49,38 @@ const providerColors: Record<string, string> = {
   custom: 'hover:bg-purple-950 border-purple-800 light:hover:bg-purple-50 light:border-purple-200'
 }
 
+const discoverSSOProviders = async () => {
+  const selector = organization.value.trim().toLowerCase()
+  if (!selector) {
+    ssoProviders.value = []
+    hasDiscoveredSSO.value = false
+    toast.error(t('auth.workspaceCodeRequired'))
+    return
+  }
+
+  isSSODiscovering.value = true
+  try {
+    const response = await api.get('/auth/sso/providers', {
+      params: { organization: selector }
+    })
+    ssoProviders.value = response.data.data || []
+    hasDiscoveredSSO.value = true
+  } catch {
+    ssoProviders.value = []
+    hasDiscoveredSSO.value = false
+    toast.error(t('auth.ssoDiscoveryFailed'))
+  } finally {
+    isSSODiscovering.value = false
+  }
+}
+
+watch(organization, () => {
+  if (!isSSODiscovering.value) {
+    ssoProviders.value = []
+    hasDiscoveredSSO.value = false
+  }
+})
+
 onMounted(async () => {
   // Check for SSO error in query params
   const ssoError = route.query.sso_error as string
@@ -55,12 +90,12 @@ onMounted(async () => {
     router.replace({ query: { ...route.query, sso_error: undefined } })
   }
 
-  // Fetch enabled SSO providers
-  try {
-    const response = await api.get('/auth/sso/providers')
-    ssoProviders.value = response.data.data || []
-  } catch {
-    ssoProviders.value = []
+  const queryOrganization = Array.isArray(route.query.organization)
+    ? route.query.organization[0]
+    : route.query.organization
+  if (typeof queryOrganization === 'string' && queryOrganization.trim()) {
+    organization.value = queryOrganization
+    await discoverSSOProviders()
   }
 })
 
@@ -87,8 +122,13 @@ const handleLogin = async () => {
 }
 
 const initiateSSO = (provider: string) => {
+  const selector = organization.value.trim().toLowerCase()
+  if (!selector) {
+    toast.error(t('auth.workspaceCodeRequired'))
+    return
+  }
   const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')
-  window.location.href = `${basePath}/api/auth/sso/${provider}/init`
+  window.location.href = `${basePath}/api/auth/sso/${encodeURIComponent(provider)}/init?organization=${encodeURIComponent(selector)}`
 }
 </script>
 
@@ -167,7 +207,7 @@ const initiateSSO = (provider: string) => {
               </div>
             </form>
 
-            <div v-if="ssoProviders.length > 0" class="mt-5 space-y-3">
+            <div class="mt-5 space-y-3">
               <div class="relative my-5">
                 <Separator class="bg-white/[0.08] light:bg-[#697046]/15" />
                 <span class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-[#171912] px-2 text-xs text-white/35 light:bg-[#f8f7f0] light:text-[#697046]/60">
@@ -175,12 +215,60 @@ const initiateSSO = (provider: string) => {
                 </span>
               </div>
 
+              <form class="space-y-3" data-testid="sso-workspace-discovery" @submit.prevent="discoverSSOProviders">
+                <div class="space-y-2">
+                  <Label for="sso-organization" class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.13em] text-white/55 light:text-[#565a43]">
+                    <Building2 class="h-3.5 w-3.5 text-[#cbd49a] light:text-[#697046]" />
+                    {{ $t('auth.workspaceCode') }}
+                  </Label>
+                  <div class="flex gap-2">
+                    <Input
+                      id="sso-organization"
+                      v-model="organization"
+                      name="organization"
+                      type="text"
+                      :placeholder="$t('auth.workspaceCodePlaceholder')"
+                      :disabled="isSSODiscovering"
+                      autocomplete="off"
+                      autocapitalize="none"
+                      spellcheck="false"
+                      class="h-11 min-w-0 flex-1 rounded-xl border-white/[0.1] bg-black/20 px-4 text-white placeholder:text-white/25 focus-visible:border-[#cbd49a]/55 focus-visible:ring-[#cbd49a]/20 light:border-[#697046]/20 light:bg-white/80 light:text-[#25281b] light:placeholder:text-[#697046]/40"
+                      data-testid="sso-workspace-code"
+                    />
+                    <Button
+                      type="submit"
+                      variant="outline"
+                      class="h-11 shrink-0 rounded-xl border-[#cbd49a]/25 bg-[#cbd49a]/[0.06] px-3 text-[#dce3ae] hover:bg-[#cbd49a]/[0.12] hover:text-[#f2f5d8] light:border-[#697046]/25 light:bg-[#697046]/[0.05] light:text-[#596039] light:hover:bg-[#697046]/10"
+                      :disabled="isSSODiscovering || !organization.trim()"
+                      data-testid="sso-discover-button"
+                    >
+                      <Loader2 v-if="isSSODiscovering" class="h-4 w-4 animate-spin" />
+                      <Search v-else class="h-4 w-4" />
+                      <span class="sr-only">{{ $t('auth.findSignInMethods') }}</span>
+                    </Button>
+                  </div>
+                  <p class="text-xs leading-5 text-white/35 light:text-[#666a53]">
+                    {{ $t('auth.workspaceCodeHint') }}
+                  </p>
+                </div>
+              </form>
+
+              <p
+                v-if="hasDiscoveredSSO && ssoProviders.length === 0"
+                class="rounded-xl border border-white/[0.08] bg-black/10 px-3 py-2.5 text-xs leading-5 text-white/45 light:border-[#697046]/15 light:bg-[#697046]/[0.04] light:text-[#666a53]"
+                data-testid="sso-no-providers"
+              >
+                {{ $t('auth.noWorkspaceSSO') }}
+              </p>
+
               <Button
                 v-for="provider in ssoProviders"
                 :key="provider.provider"
                 variant="outline"
                 class="w-full justify-start gap-3 transition-colors bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-[#697046]/15 light:text-[#4e5233] light:hover:bg-[#697046]/5"
                 :class="providerColors[provider.provider] || providerColors.custom"
+                type="button"
+                :data-testid="`sso-provider-${provider.provider}`"
                 @click="initiateSSO(provider.provider)"
               >
                 <svg class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">

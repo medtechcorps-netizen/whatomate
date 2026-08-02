@@ -416,7 +416,7 @@ func runServer(args []string) {
 	app.Assigner = assigner
 
 	// Initialize CallManager (per-org calling_enabled DB setting controls access)
-	app.CallManager = calling.NewManager(&cfg.Calling, s3Client, db, rdb, waClient, wsHub, assigner, lo)
+	app.CallManager = calling.NewManager(&cfg.Calling, s3Client, db, rdb, waClient, wsHub, assigner, httpClient, cfg.App.EncryptionKey, lo)
 	app.S3Client = s3Client
 	lo.Info("Call manager initialized")
 
@@ -760,9 +760,11 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/api/auth/ws-token", app.GetWSToken)
 
 	// SSO routes (public, optionally rate-limited)
-	g.GET("/api/auth/sso/providers", app.GetPublicSSOProviders)
 	if cfg.RateLimit.Enabled {
 		window := time.Duration(cfg.RateLimit.WindowSeconds) * time.Second
+		g.GET("/api/auth/sso/providers", withRateLimit(app.GetPublicSSOProviders, middleware.RateLimitOpts{
+			Redis: rdb, Log: lo, Max: cfg.RateLimit.SSOMaxAttempts, Window: window, KeyPrefix: "sso_discovery", TrustProxy: cfg.RateLimit.TrustProxy,
+		}))
 		g.GET("/api/auth/sso/{provider}/init", withRateLimit(app.InitSSO, middleware.RateLimitOpts{
 			Redis: rdb, Log: lo, Max: cfg.RateLimit.SSOMaxAttempts, Window: window, KeyPrefix: "sso_init", TrustProxy: cfg.RateLimit.TrustProxy,
 		}))
@@ -770,6 +772,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 			Redis: rdb, Log: lo, Max: cfg.RateLimit.SSOMaxAttempts, Window: window, KeyPrefix: "sso_callback", TrustProxy: cfg.RateLimit.TrustProxy,
 		}))
 	} else {
+		g.GET("/api/auth/sso/providers", app.GetPublicSSOProviders)
 		g.GET("/api/auth/sso/{provider}/init", app.InitSSO)
 		g.GET("/api/auth/sso/{provider}/callback", app.CallbackSSO)
 	}
@@ -958,6 +961,15 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/api/accounts/{id}/business_profile", tenant((*handlers.App).GetBusinessProfile))
 	g.PUT("/api/accounts/{id}/business_profile", tenant((*handlers.App).UpdateBusinessProfile))
 	g.POST("/api/accounts/{id}/business_profile/photo", tenant((*handlers.App).UpdateProfilePicture))
+
+	// Admin Integration Center. Provider tests perform network I/O between two
+	// short tenant phases and therefore must not hold the route tenant
+	// transaction open while waiting on an external service.
+	g.GET("/api/integrations", tenant((*handlers.App).GetIntegrations))
+	g.PUT("/api/integrations/{provider}", tenant((*handlers.App).UpdateIntegration))
+	g.DELETE("/api/integrations/{provider}/credentials", tenant((*handlers.App).DeleteIntegrationCredentials))
+	g.POST("/api/integrations/{provider}/connect", tenant((*handlers.App).ConnectIntegration))
+	g.POST("/api/integrations/{provider}/test", app.TestIntegration)
 
 	// Provider-neutral channel accounts and shared inbox.
 	g.GET("/api/channel-accounts", tenant((*handlers.App).ListChannelAccounts))

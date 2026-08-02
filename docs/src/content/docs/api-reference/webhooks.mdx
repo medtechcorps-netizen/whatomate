@@ -11,12 +11,12 @@ Whatomate receives webhooks from Meta's WhatsApp Business API and processes them
 
 ## Meta Webhook Configuration
 
-Whatomate exposes webhook endpoints that you configure in your Meta App settings:
+ReReply publishes the exact callback in **Settings → Integrations → WhatsApp & Meta**. Use that value rather than constructing a callback manually. A shared platform app uses `/api/webhook`; a workspace-owned app includes a public tenant selector such as `/api/webhook?workspace={organization_id}`.
 
 ### Verification Endpoint
 
 ```bash
-GET /api/webhook
+GET /api/webhook[?workspace={organization_id}]
 ```
 
 Meta sends a verification request when setting up webhooks:
@@ -24,13 +24,13 @@ Meta sends a verification request when setting up webhooks:
 | Parameter | Description |
 |-----------|-------------|
 | `hub.mode` | Always "subscribe" |
-| `hub.verify_token` | Your configured verify token |
+| `hub.verify_token` | The write-only token configured in Integration Center (or the deployment-managed platform token) |
 | `hub.challenge` | Challenge string to return |
 
 ### Event Endpoint
 
 ```bash
-POST /api/webhook
+POST /api/webhook[?workspace={organization_id}]
 ```
 
 All WhatsApp events are sent to this endpoint.

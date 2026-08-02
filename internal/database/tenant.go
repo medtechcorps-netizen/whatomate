@@ -108,6 +108,7 @@ var DirectTenantTables = []string{
 	"privacy_jobs",
 	"privacy_request_events",
 	"privacy_requests",
+	"provider_integrations",
 	"provisioning_runs",
 	"recovery_checkpoints",
 	"resource_time_off",

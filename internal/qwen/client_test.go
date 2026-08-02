@@ -19,6 +19,26 @@ func (fn testRoundTripper) RoundTrip(request *http.Request) (*http.Response, err
 	return fn(request)
 }
 
+func TestBaseURLForRegionUsesOnlyOfficialEndpoints(t *testing.T) {
+	t.Parallel()
+	tests := map[string]string{
+		RegionSingapore: DefaultBaseURL,
+		RegionUS:        "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+		RegionBeijing:   "https://dashscope.aliyuncs.com/compatible-mode/v1",
+	}
+	for region, expected := range tests {
+		region, expected := region, expected
+		t.Run(region, func(t *testing.T) {
+			t.Parallel()
+			actual, err := BaseURLForRegion(region)
+			require.NoError(t, err)
+			assert.Equal(t, expected, actual)
+		})
+	}
+	_, err := BaseURLForRegion("https://attacker.example.test/v1")
+	require.Error(t, err)
+}
+
 func TestGenerateSendsAuthenticatedTextCompletionPayload(t *testing.T) {
 	var receivedBody string
 	client := &http.Client{Transport: testRoundTripper(

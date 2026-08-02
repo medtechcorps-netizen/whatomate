@@ -127,8 +127,7 @@ func (a *App) runChatGraph(
 				appendChatPath(session, node, "skipped")
 				next := graph.ResolveEdge(node.ID, "default")
 				if next == "" {
-					session.Status = models.SessionStatusCompleted
-					return a.persistChatSession(session)
+					return a.completeChatbotFlow(flow, session)
 				}
 				session.CurrentStep = next
 				continue
@@ -158,6 +157,9 @@ func (a *App) runChatGraph(
 
 		if res.yield {
 			// Stay at this node; next inbound resumes here.
+			if session.Status == models.SessionStatusCompleted {
+				return a.completeChatbotFlow(flow, session)
+			}
 			return a.persistChatSession(session)
 		}
 
@@ -189,14 +191,114 @@ func (a *App) runChatGraph(
 		next := graph.ResolveEdge(node.ID, res.outcome)
 		if next == "" {
 			// No matching edge → terminal.
-			session.Status = models.SessionStatusCompleted
-			return a.persistChatSession(session)
+			return a.completeChatbotFlow(flow, session)
 		}
 		session.CurrentStep = next
 	}
 
 	_ = a.persistChatSession(session)
 	return errChatGraphRunaway
+}
+
+// completeChatbotFlow applies terminal session state and makes the optional
+// completion webhook as a best-effort, single-attempt notification. Remote,
+// validation, credential, and checkpoint failures never strand a customer in
+// an active flow: the session is still persisted as completed. The outbound
+// path itself remains fail closed, so an unsafe or undecryptable destination
+// is never contacted.
+func (a *App) completeChatbotFlow(
+	flow *models.ChatbotFlow,
+	session *models.ChatbotSession,
+) error {
+	if session == nil {
+		return errors.New("chatbot completion session is unavailable")
+	}
+	session.Status = models.SessionStatusCompleted
+	if err := a.executeChatbotCompletionWebhook(flow, session); err != nil {
+		// Do not include the error: HTTP-library errors and tenant-authored
+		// configuration can contain credential material. Flow/session IDs are
+		// sufficient to correlate with the durable action ledger.
+		flowID := uuid.Nil
+		if flow != nil {
+			flowID = flow.ID
+		}
+		a.Log.Warn(
+			"chatbot completion webhook did not succeed; session will still complete",
+			"flow", flowID,
+			"session", session.ID,
+		)
+	}
+	return a.persistChatSession(session)
+}
+
+// executeChatbotCompletionWebhook executes a flow-level completion callback
+// through the same validated, decrypt-at-dispatch request path as graph API
+// and webhook nodes. The durable action stores only delivery metadata; URL,
+// headers, and body are deliberately excluded.
+func (a *App) executeChatbotCompletionWebhook(
+	flow *models.ChatbotFlow,
+	session *models.ChatbotSession,
+) error {
+	if flow == nil || !strings.EqualFold(strings.TrimSpace(flow.OnCompleteAction), "webhook") {
+		return nil
+	}
+	if session == nil {
+		return errors.New("chatbot completion session is unavailable")
+	}
+
+	restoreActionScope := a.pushInboundContinuationActionScope(
+		fmt.Sprintf("chat-graph:%s:completion", flow.ID),
+	)
+	defer restoreActionScope()
+
+	claim, err := a.claimInboundContinuationAction(
+		context.Background(),
+		"graph_completion_webhook",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if !claim.Execute {
+		return nil
+	}
+
+	if session.SessionData == nil {
+		session.SessionData = models.JSONB{}
+	}
+	session.SessionData["phone_number"] = session.PhoneNumber
+	replaceVar := func(value string) string {
+		return processTemplate(value, session.SessionData)
+	}
+	_, statusCode, requestErr := a.executeConfiguredAPI(
+		flow.CompletionConfig,
+		replaceVar,
+	)
+
+	succeeded := requestErr == nil && statusCode >= 200 && statusCode < 300
+	result := models.JSONB{
+		"attempted": true,
+		"succeeded": succeeded,
+	}
+	if statusCode > 0 {
+		result["status_code"] = statusCode
+	}
+	resolveErr := a.resolveInboundContinuationAction(
+		context.Background(),
+		claim,
+		inboundActionStateResolved,
+		result,
+	)
+	if resolveErr != nil {
+		return fmt.Errorf("resolve chatbot completion webhook checkpoint: %w", resolveErr)
+	}
+	if requestErr != nil {
+		return errors.New("chatbot completion webhook request failed")
+	}
+	if !succeeded {
+		return fmt.Errorf("chatbot completion webhook returned status %d", statusCode)
+	}
+	return nil
 }
 
 // executeChatNode dispatches by node type. Phase 1 implements only

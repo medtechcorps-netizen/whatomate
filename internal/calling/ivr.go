@@ -404,24 +404,32 @@ func (m *Manager) executeHTTPCallback(session *CallSession, node *IVRNode, ctx *
 	}
 	bodyTemplate, _ := node.Config["body_template"].(string)
 	timeoutSecs := getConfigInt(node.Config, "timeout_seconds", 10)
+	if timeoutSecs < 1 || timeoutSecs > 30 {
+		// Legacy rows may predate save-time validation. Keep runtime bounded
+		// instead of allowing zero/negative values to disable the timeout or a
+		// very large value to hold a call worker indefinitely.
+		timeoutSecs = 10
+	}
 	responseStoreAs, _ := node.Config["response_store_as"].(string)
 
-	// Build headers map
-	headersRaw, _ := node.Config["headers"].(map[string]any)
-	headers := make(map[string]string, len(headersRaw))
-	for k, v := range headersRaw {
-		if s, ok := v.(string); ok {
-			headers[k] = interpolateTemplate(s, ctx.Variables)
-		}
+	// Decrypt callback credentials only at the final outbound boundary, just
+	// before template interpolation and dispatch.
+	headers, err := ResolveIVRCallbackHeaders(node.Config["headers"], m.encryptionKey)
+	if err != nil {
+		m.log.Error("HTTP callback headers could not be resolved", "error", err, "call_id", session.ID)
+		return "http:non2xx"
+	}
+	for key, value := range headers {
+		headers[key] = interpolateTemplate(value, ctx.Variables)
 	}
 
 	// Interpolate URL and body
 	url = interpolateTemplate(url, ctx.Variables)
 	body := interpolateTemplate(bodyTemplate, ctx.Variables)
 
-	result, err := executeHTTPCallback(url, method, headers, body, time.Duration(timeoutSecs)*time.Second)
+	result, err := executeHTTPCallback(m.httpClient, url, method, headers, body, time.Duration(timeoutSecs)*time.Second)
 	if err != nil {
-		m.log.Error("HTTP callback failed", "error", err, "call_id", session.ID, "url", url)
+		m.log.Error("HTTP callback failed", "call_id", session.ID)
 		return "http:non2xx"
 	}
 
@@ -429,7 +437,7 @@ func (m *Manager) executeHTTPCallback(session *CallSession, node *IVRNode, ctx *
 		ctx.Variables[responseStoreAs] = result.Body
 	}
 
-	m.log.Info("HTTP callback completed", "call_id", session.ID, "url", url, "status", result.StatusCode)
+	m.log.Info("HTTP callback completed", "call_id", session.ID, "status", result.StatusCode)
 
 	if result.StatusCode >= 200 && result.StatusCode < 300 {
 		return "http:2xx"

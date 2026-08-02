@@ -145,7 +145,7 @@ const supportedChannels: Array<{
     icon: AtSign,
     provider: 'relay',
     gated: true,
-    connectable: true,
+    connectable: false,
     entitlement: threadsPublicEngagementEntitlement,
   },
   { key: 'email', label: 'Email', icon: Mail, provider: 'relay', gated: true, connectable: true },
@@ -182,23 +182,12 @@ const canControlConversationAI = computed(
     selectedAccount.value?.config?.ai_reply_enabled === true,
 )
 
-const hasThreadsPublicReplyTarget = computed(() => {
-  if (selectedConversation.value?.channel !== 'threads') return true
-  const engagementType =
-    typeof selectedConversation.value.metadata?.engagement_type === 'string'
-      ? selectedConversation.value.metadata.engagement_type.trim().toLowerCase()
-      : ''
-  return (
-    Boolean(selectedConversation.value.external_conversation_id?.trim()) &&
-    ['reply', 'mention'].includes(engagementType)
-  )
-})
 const canSendText = computed(() =>
   canManageConversations.value &&
+  !['threads', 'tiktok'].includes(selectedConversation.value?.channel ?? '') &&
   selectedAccount.value?.status === 'active' &&
   selectedAccount.value?.config?.outbound_enabled === true &&
-  selectedAccount.value?.capabilities?.text !== false &&
-  hasThreadsPublicReplyTarget.value,
+  selectedAccount.value?.capabilities?.text !== false,
 )
 const activeCount = computed(() => accounts.value.filter(accountReadyForOutbound).length)
 const attentionCount = computed(() =>
@@ -401,13 +390,6 @@ async function sendMessage() {
   const conversation = selectedConversation.value
   const messageText = composer.value.trim()
   if (!conversation || !messageText) return
-  if (
-    conversation.channel === 'threads' &&
-    !hasThreadsPublicReplyTarget.value
-  ) {
-    toast.warning('Select an existing public Threads reply or mention before replying')
-    return
-  }
   if (!canSendText.value) return
   const viewSequence = conversationViewSequence
   sending.value = true
@@ -416,9 +398,6 @@ async function sendMessage() {
       idempotency_key: crypto.randomUUID(),
       purpose: 'service',
       parts: [{ type: 'text', text: messageText }],
-    }
-    if (conversation.channel === 'threads') {
-      payload.reply_to_external_id = conversation.external_conversation_id
     }
     const response = await channelsService.send(conversation.id, payload)
     if (!isCurrentConversationView(viewSequence, conversation.id)) return
@@ -743,21 +722,6 @@ onBeforeUnmount(() => {
       >
         Create
       </Button>
-      <div
-        v-if="newAccount.channel === 'threads'"
-        data-testid="threads-public-engagement-notice"
-        class="flex items-start gap-3 rounded-xl border border-amber-300/20 bg-amber-300/[0.06] px-4 py-3 md:col-span-2 xl:col-span-5"
-      >
-        <AtSign class="mt-0.5 h-4 w-4 shrink-0 text-amber-200 light:text-amber-700" />
-        <div>
-          <p class="text-xs font-semibold text-amber-50 light:text-amber-900">Beta: public engagement only</p>
-          <p class="mt-1 text-xs leading-5 text-amber-50/60 light:text-amber-800">
-            This connection is limited to existing public Threads replies and mentions. Direct
-            messages and standalone posts are not supported. It remains pending until an approved
-            compatible Threads relay adapter is installed and passes Test.
-          </p>
-        </div>
-      </div>
     </div>
 
     <div
@@ -989,7 +953,7 @@ onBeforeUnmount(() => {
             <p class="mt-0.5 text-[9px] text-white/25 light:text-slate-500">
               {{
                 channel.key === 'threads'
-                  ? 'Beta public replies + mentions; no DMs'
+                  ? 'Adapter unavailable; account creation disabled'
                   : channel.connectable
                     ? 'Signed relay'
                     : channel.gated
@@ -1197,12 +1161,24 @@ onBeforeUnmount(() => {
             </div>
             <div v-else class="space-y-2">
               <div
-                v-if="selectedConversation.channel === 'threads'"
-                data-testid="threads-public-reply-composer-notice"
+                v-if="['threads', 'tiktok'].includes(selectedConversation.channel)"
+                :data-testid="
+                  selectedConversation.channel === 'threads'
+                    ? 'threads-public-reply-composer-notice'
+                    : 'tiktok-reply-composer-notice'
+                "
                 class="rounded-xl border border-amber-300/15 bg-amber-300/[0.04] px-3 py-2 text-[11px] leading-5 text-amber-100/65 light:text-amber-800"
               >
-                Beta public-only composer: the selected reply or mention is the required target.
-                Threads direct messages and standalone posts are not supported.
+                <template v-if="selectedConversation.channel === 'threads'">
+                  Threads is read-only because an approved public-engagement adapter is not
+                  installed. Existing conversations remain visible, but replies, direct messages
+                  and standalone posts are disabled.
+                </template>
+                <template v-else>
+                  TikTok is read-only because Business Messaging approval and an approved adapter
+                  are not available. Existing conversations remain visible, but replies are
+                  disabled.
+                </template>
               </div>
               <div class="flex items-end gap-3">
               <textarea
@@ -1211,12 +1187,12 @@ onBeforeUnmount(() => {
                 class="min-h-11 flex-1 resize-none rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm text-white outline-none placeholder:text-white/20 focus:border-sky-300/35 light:border-slate-400 light:bg-white light:text-slate-950 light:placeholder:text-slate-500"
                 :disabled="!canSendText"
                 :placeholder="
-                  selectedConversation.channel === 'threads' && !hasThreadsPublicReplyTarget
-                    ? 'Select an existing public reply or mention'
+                  selectedConversation.channel === 'threads'
+                    ? 'Threads replies are unavailable — adapter not installed'
+                    : selectedConversation.channel === 'tiktok'
+                      ? 'TikTok replies are unavailable — approval required'
                     : canSendText
-                      ? selectedConversation.channel === 'threads'
-                        ? 'Write a public Threads reply...'
-                        : 'Write a reply...'
+                      ? 'Write a reply...'
                       : selectedAccount?.config?.outbound_enabled !== true
                         ? 'Outbound delivery requires explicit approval'
                         : 'This adapter does not support text replies'
@@ -1229,7 +1205,9 @@ onBeforeUnmount(() => {
                 :disabled="sending || !composer.trim() || !canSendText"
                 :aria-label="
                   selectedConversation.channel === 'threads'
-                    ? 'Send public Threads reply'
+                    ? 'Threads reply unavailable'
+                    : selectedConversation.channel === 'tiktok'
+                      ? 'TikTok reply unavailable'
                     : 'Send reply'
                 "
                 @click="sendMessage"

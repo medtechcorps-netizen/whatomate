@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/config"
+	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -19,6 +20,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 )
+
+const ssoTestEncryptionKey = "sso-test-encryption-key-long-enough"
 
 // fakeOAuthProvider stands up an httptest server that simulates a "custom" OIDC
 // provider — auth, token, and userinfo endpoints. Tests can override email/name
@@ -31,6 +34,20 @@ type fakeOAuthProvider struct {
 
 	// State capture for assertions.
 	LastTokenCode string
+}
+
+const fakeOAuthPublicBaseURL = "https://sso-provider.example.test"
+
+type fakeOAuthTransport struct {
+	serverURL string
+}
+
+func (transport *fakeOAuthTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	testRequest := request.Clone(request.Context())
+	testRequest.URL.Scheme = "http"
+	testRequest.URL.Host = strings.TrimPrefix(transport.serverURL, "http://")
+	testRequest.Host = ""
+	return http.DefaultTransport.RoundTrip(testRequest)
 }
 
 func newFakeOAuth(t *testing.T) *fakeOAuthProvider {
@@ -69,17 +86,17 @@ func newFakeOAuth(t *testing.T) *fakeOAuthProvider {
 	return f
 }
 
-func (f *fakeOAuthProvider) AuthURL() string     { return f.server.URL + "/auth" }
-func (f *fakeOAuthProvider) TokenURL() string    { return f.server.URL + "/token" }
-func (f *fakeOAuthProvider) UserInfoURL() string { return f.server.URL + "/userinfo" }
+func (f *fakeOAuthProvider) AuthURL() string     { return fakeOAuthPublicBaseURL + "/auth" }
+func (f *fakeOAuthProvider) TokenURL() string    { return fakeOAuthPublicBaseURL + "/token" }
+func (f *fakeOAuthProvider) UserInfoURL() string { return fakeOAuthPublicBaseURL + "/userinfo" }
 
-// newSSOApp returns an app suitable for SSO tests — config with empty encryption
-// key (so client secret stored as plaintext) and a real HTTP client.
+// newSSOApp returns an app suitable for SSO tests with credential encryption
+// configured. Individual fake providers install their own local-only transport.
 func newSSOApp(t *testing.T) *handlers.App {
 	t.Helper()
 	app := newTestApp(t)
 	app.Config = &config.Config{
-		App:    config.AppConfig{Environment: "development"},
+		App:    config.AppConfig{Environment: "development", EncryptionKey: ssoTestEncryptionKey},
 		JWT:    config.JWTConfig{Secret: testutil.TestJWTSecret, AccessExpiryMins: 15, RefreshExpiryDays: 7},
 		Server: config.ServerConfig{},
 	}
@@ -88,12 +105,15 @@ func newSSOApp(t *testing.T) *handlers.App {
 
 func createCustomSSOProvider(t *testing.T, app *handlers.App, orgID uuid.UUID, fake *fakeOAuthProvider, opts ...func(*models.SSOProvider)) *models.SSOProvider {
 	t.Helper()
+	clientSecret, err := appcrypto.Encrypt("client-secret-1", app.Config.App.EncryptionKey)
+	require.NoError(t, err)
+	app.HTTPClient = &http.Client{Transport: &fakeOAuthTransport{serverURL: fake.server.URL}}
 	p := &models.SSOProvider{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
 		OrganizationID:  orgID,
 		Provider:        "custom",
 		ClientID:        "client-id-1",
-		ClientSecret:    "client-secret-1",
+		ClientSecret:    clientSecret,
 		IsEnabled:       true,
 		AllowAutoCreate: true,
 		DefaultRoleName: "agent",
@@ -110,7 +130,7 @@ func createCustomSSOProvider(t *testing.T, app *handlers.App, orgID uuid.UUID, f
 
 // --- GetPublicSSOProviders ---
 
-func TestApp_GetPublicSSOProviders_DedupsByType(t *testing.T) {
+func TestApp_GetPublicSSOProviders_LegacyListIncludesOnlyUnambiguousTypes(t *testing.T) {
 	app := newSSOApp(t)
 	org1 := testutil.CreateTestOrganization(t, app.DB)
 	org2 := testutil.CreateTestOrganization(t, app.DB)
@@ -142,10 +162,65 @@ func TestApp_GetPublicSSOProviders_DedupsByType(t *testing.T) {
 	for _, p := range resp.Data {
 		got[p.Provider] = true
 	}
-	assert.True(t, got["google"])
+	assert.False(t, got["google"], "ambiguous provider must require organization-scoped discovery")
 	assert.True(t, got["github"])
 	assert.False(t, got["microsoft"], "disabled provider must not be exposed")
-	assert.Len(t, resp.Data, 2, "two providers across 3 enabled rows")
+	assert.Len(t, resp.Data, 1, "only the single-tenant provider is safe for legacy discovery")
+}
+
+func TestApp_GetPublicSSOProviders_OrganizationScopedWithoutTenantDisclosure(t *testing.T) {
+	app := newSSOApp(t)
+	orgA := testutil.CreateTestOrganization(t, app.DB)
+	orgB := testutil.CreateTestOrganization(t, app.DB)
+	records := []models.SSOProvider{
+		{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgA.ID, Provider: "google", ClientID: "org-a-client-id", ClientSecret: "org-a-secret", IsEnabled: true},
+		{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgA.ID, Provider: "github", ClientID: "disabled-client", ClientSecret: "disabled-secret", IsEnabled: false},
+		{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgB.ID, Provider: "microsoft", ClientID: "org-b-client-id", ClientSecret: "org-b-secret", IsEnabled: true},
+	}
+	for index := range records {
+		require.NoError(t, app.DB.Create(&records[index]).Error)
+	}
+
+	req := testutil.NewGETRequest(t)
+	req.RequestCtx.QueryArgs().Set("organization", strings.ToUpper(orgA.Slug))
+	require.NoError(t, app.GetPublicSSOProviders(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Equal(t, "no-store", string(req.RequestCtx.Response.Header.Peek("Cache-Control")))
+
+	var resp struct {
+		Data []handlers.SSOProviderPublic `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &resp))
+	require.Equal(t, []handlers.SSOProviderPublic{{Provider: "google", Name: "Google"}}, resp.Data)
+
+	raw := string(testutil.GetResponseBody(req))
+	for _, sensitive := range []string{
+		orgA.ID.String(), orgA.Slug, orgA.Name,
+		"org-a-client-id", "org-a-secret", "disabled-client", "disabled-secret",
+		orgB.ID.String(), orgB.Slug, orgB.Name, "org-b-client-id", "org-b-secret",
+	} {
+		assert.NotContains(t, raw, sensitive)
+	}
+}
+
+func TestApp_GetPublicSSOProviders_UnknownAndUnconfiguredOrganizationsAreIndistinguishable(t *testing.T) {
+	app := newSSOApp(t)
+	emptyOrg := testutil.CreateTestOrganization(t, app.DB)
+
+	discover := func(selector string) []byte {
+		req := testutil.NewGETRequest(t)
+		req.RequestCtx.QueryArgs().Set("organization", selector)
+		require.NoError(t, app.GetPublicSSOProviders(req))
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+		return append([]byte(nil), testutil.GetResponseBody(req)...)
+	}
+
+	unknownBody := discover("unknown-" + uuid.NewString())
+	emptyBody := discover(emptyOrg.Slug)
+	invalidBody := discover("../not-a-workspace")
+	assert.JSONEq(t, string(emptyBody), string(unknownBody))
+	assert.JSONEq(t, string(emptyBody), string(invalidBody))
+	assert.NotContains(t, string(unknownBody), "organization")
 }
 
 // --- GetSSOSettings (admin) ---
@@ -153,13 +228,14 @@ func TestApp_GetPublicSSOProviders_DedupsByType(t *testing.T) {
 func TestApp_GetSSOSettings_HidesSecretButReportsHasSecret(t *testing.T) {
 	app := newSSOApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := createAdminUser(t, app, org.ID)
 	require.NoError(t, app.DB.Create(&models.SSOProvider{
 		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID, Provider: "google",
 		ClientID: "id", ClientSecret: "the-secret", IsEnabled: true,
 	}).Error)
 
 	req := testutil.NewGETRequest(t)
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, admin.ID)
 
 	require.NoError(t, app.GetSSOSettings(req))
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
@@ -176,18 +252,51 @@ func TestApp_GetSSOSettings_HidesSecretButReportsHasSecret(t *testing.T) {
 	assert.NotContains(t, raw, "the-secret", "client secret must never appear in admin response")
 }
 
+func TestApp_SSOSettingsRequireGranularPermissions(t *testing.T) {
+	app := newSSOApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "no-sso-access", nil)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+
+	getReq := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(getReq, org.ID, user.ID)
+	require.NoError(t, app.GetSSOSettings(getReq))
+	testutil.AssertErrorResponse(t, getReq, fasthttp.StatusForbidden, "Insufficient permissions")
+
+	updateReq := testutil.NewJSONRequest(t, map[string]any{
+		"client_id":     "must-not-be-saved",
+		"client_secret": "must-not-be-saved",
+		"is_enabled":    true,
+	})
+	testutil.SetAuthContext(updateReq, org.ID, user.ID)
+	testutil.SetPathParam(updateReq, "provider", "google")
+	require.NoError(t, app.UpdateSSOProvider(updateReq))
+	testutil.AssertErrorResponse(t, updateReq, fasthttp.StatusForbidden, "Insufficient permissions")
+
+	deleteReq := testutil.NewRequest(t)
+	testutil.SetAuthContext(deleteReq, org.ID, user.ID)
+	testutil.SetPathParam(deleteReq, "provider", "google")
+	require.NoError(t, app.DeleteSSOProvider(deleteReq))
+	testutil.AssertErrorResponse(t, deleteReq, fasthttp.StatusForbidden, "Insufficient permissions")
+
+	var count int64
+	require.NoError(t, app.DB.Model(&models.SSOProvider{}).Where("organization_id = ?", org.ID).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
 // --- UpdateSSOProvider ---
 
 func TestApp_UpdateSSOProvider_CreateCustomRequiresURLs(t *testing.T) {
 	app := newSSOApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"client_id":     "id",
 		"client_secret": "secret",
 		"is_enabled":    true,
 	})
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, admin.ID)
 	testutil.SetPathParam(req, "provider", "custom")
 
 	require.NoError(t, app.UpdateSSOProvider(req))
@@ -197,12 +306,13 @@ func TestApp_UpdateSSOProvider_CreateCustomRequiresURLs(t *testing.T) {
 func TestApp_UpdateSSOProvider_InvalidProviderRejected(t *testing.T) {
 	app := newSSOApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"client_id":     "id",
 		"client_secret": "s",
 	})
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, admin.ID)
 	testutil.SetPathParam(req, "provider", "okta") // not in allowlist
 
 	require.NoError(t, app.UpdateSSOProvider(req))
@@ -211,15 +321,15 @@ func TestApp_UpdateSSOProvider_InvalidProviderRejected(t *testing.T) {
 
 func TestApp_UpdateSSOProvider_EncryptsClientSecret(t *testing.T) {
 	app := newSSOApp(t)
-	app.Config.App.EncryptionKey = "this-is-a-32-character-test-key-XX"
 	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"client_id":     "id",
 		"client_secret": "PLAIN-SSO-SECRET",
 		"is_enabled":    true,
 	})
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, admin.ID)
 	testutil.SetPathParam(req, "provider", "google")
 
 	require.NoError(t, app.UpdateSSOProvider(req))
@@ -231,9 +341,70 @@ func TestApp_UpdateSSOProvider_EncryptsClientSecret(t *testing.T) {
 	assert.True(t, strings.HasPrefix(stored.ClientSecret, "enc:"), "stored secret should carry the enc: prefix")
 }
 
+func TestApp_UpdateSSOProvider_FailsClosedWithoutEncryptionKey(t *testing.T) {
+	app := newSSOApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := createAdminUser(t, app, org.ID)
+	app.Config.App.EncryptionKey = ""
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"client_id":     "client-id",
+		"client_secret": "must-never-be-plaintext",
+		"is_enabled":    true,
+	})
+	testutil.SetAuthContext(req, org.ID, admin.ID)
+	testutil.SetPathParam(req, "provider", "google")
+
+	require.NoError(t, app.UpdateSSOProvider(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusServiceUnavailable, "SSO credential storage is unavailable")
+
+	var count int64
+	require.NoError(t, app.DB.Model(&models.SSOProvider{}).
+		Where("organization_id = ? AND provider = ?", org.ID, "google").Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestApp_UpdateSSOProvider_CustomEndpointsRequirePublicHTTPS(t *testing.T) {
+	app := newSSOApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := createAdminUser(t, app, org.ID)
+
+	tests := []struct {
+		name string
+		base string
+	}{
+		{name: "insecure private HTTP", base: "http://127.0.0.1"},
+		{name: "URL credentials", base: "https://user:password@example.com"},
+		{name: "private HTTPS literal", base: "https://127.0.0.1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := testutil.NewJSONRequest(t, map[string]any{
+				"client_id":     "client-id",
+				"client_secret": "client-secret",
+				"is_enabled":    true,
+				"auth_url":      test.base + "/auth",
+				"token_url":     test.base + "/token",
+				"user_info_url": test.base + "/userinfo",
+			})
+			testutil.SetAuthContext(req, org.ID, admin.ID)
+			testutil.SetPathParam(req, "provider", "custom")
+
+			require.NoError(t, app.UpdateSSOProvider(req))
+			testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "must be a public HTTPS URL")
+
+			var count int64
+			require.NoError(t, app.DB.Model(&models.SSOProvider{}).
+				Where("organization_id = ? AND provider = ?", org.ID, "custom").Count(&count).Error)
+			assert.Zero(t, count)
+		})
+	}
+}
+
 func TestApp_UpdateSSOProvider_OmittingSecretLeavesUnchanged(t *testing.T) {
 	app := newSSOApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := createAdminUser(t, app, org.ID)
 	// Pre-existing.
 	original := &models.SSOProvider{
 		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID, Provider: "google",
@@ -246,7 +417,7 @@ func TestApp_UpdateSSOProvider_OmittingSecretLeavesUnchanged(t *testing.T) {
 		"client_id":  "new-id",
 		"is_enabled": true,
 	})
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, admin.ID)
 	testutil.SetPathParam(req, "provider", "google")
 
 	require.NoError(t, app.UpdateSSOProvider(req))
@@ -263,13 +434,14 @@ func TestApp_UpdateSSOProvider_OmittingSecretLeavesUnchanged(t *testing.T) {
 func TestApp_DeleteSSOProvider_Success(t *testing.T) {
 	app := newSSOApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := createAdminUser(t, app, org.ID)
 	require.NoError(t, app.DB.Create(&models.SSOProvider{
 		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID, Provider: "google",
 		ClientID: "id", ClientSecret: "s", IsEnabled: true,
 	}).Error)
 
 	req := testutil.NewRequest(t)
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, admin.ID)
 	testutil.SetPathParam(req, "provider", "google")
 
 	require.NoError(t, app.DeleteSSOProvider(req))
@@ -283,9 +455,10 @@ func TestApp_DeleteSSOProvider_Success(t *testing.T) {
 func TestApp_DeleteSSOProvider_NotFound(t *testing.T) {
 	app := newSSOApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewRequest(t)
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, admin.ID)
 	testutil.SetPathParam(req, "provider", "google")
 
 	require.NoError(t, app.DeleteSSOProvider(req))
@@ -296,6 +469,7 @@ func TestApp_DeleteSSOProvider_CrossOrgIsolation(t *testing.T) {
 	app := newSSOApp(t)
 	orgA := testutil.CreateTestOrganization(t, app.DB)
 	orgB := testutil.CreateTestOrganization(t, app.DB)
+	adminB := createAdminUser(t, app, orgB.ID)
 	rec := &models.SSOProvider{
 		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgA.ID, Provider: "google",
 		ClientID: "id", ClientSecret: "s", IsEnabled: true,
@@ -303,7 +477,7 @@ func TestApp_DeleteSSOProvider_CrossOrgIsolation(t *testing.T) {
 	require.NoError(t, app.DB.Create(rec).Error)
 
 	req := testutil.NewRequest(t)
-	testutil.SetAuthContext(req, orgB.ID, uuid.New())
+	testutil.SetAuthContext(req, orgB.ID, adminB.ID)
 	testutil.SetPathParam(req, "provider", "google")
 
 	require.NoError(t, app.DeleteSSOProvider(req))
@@ -340,6 +514,28 @@ func TestApp_InitSSO_NoConfigReturns404(t *testing.T) {
 	testutil.AssertErrorResponse(t, req, fasthttp.StatusNotFound, "not configured")
 }
 
+func TestApp_InitSSO_EncryptedCredentialWithoutKeyFailsClosed(t *testing.T) {
+	app := newSSOApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	ciphertext, err := appcrypto.Encrypt("client-secret", app.Config.App.EncryptionKey)
+	require.NoError(t, err)
+	require.NoError(t, app.DB.Create(&models.SSOProvider{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Provider:       "facebook",
+		ClientID:       "client-id",
+		ClientSecret:   ciphertext,
+		IsEnabled:      true,
+	}).Error)
+	app.Config.App.EncryptionKey = ""
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetPathParam(req, "provider", "facebook")
+	require.NoError(t, app.InitSSO(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusServiceUnavailable, "SSO provider credentials are unavailable")
+	assert.Empty(t, req.RequestCtx.Response.Header.Peek("Location"))
+}
+
 func TestApp_InitSSO_StoresStateInRedisAndRedirects(t *testing.T) {
 	app := newSSOApp(t)
 	fake := newFakeOAuth(t)
@@ -369,6 +565,66 @@ func TestApp_InitSSO_StoresStateInRedisAndRedirects(t *testing.T) {
 	assert.Equal(t, "custom", stored.Provider)
 	assert.Equal(t, org.ID.String(), stored.OrgID)
 	assert.True(t, stored.ExpiresAt.After(time.Now()))
+}
+
+func TestApp_InitSSO_OrganizationSelectorBindsTheCorrectTenant(t *testing.T) {
+	app := newSSOApp(t)
+	orgA := testutil.CreateTestOrganization(t, app.DB)
+	orgB := testutil.CreateTestOrganization(t, app.DB)
+	clientSecret, err := appcrypto.Encrypt("synthetic-sso-secret", app.Config.App.EncryptionKey)
+	require.NoError(t, err)
+	for _, orgID := range []uuid.UUID{orgA.ID, orgB.ID} {
+		require.NoError(t, app.DB.Create(&models.SSOProvider{
+			BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID, Provider: "facebook",
+			ClientID: "synthetic-client-id", ClientSecret: clientSecret, IsEnabled: true,
+		}).Error)
+	}
+
+	req := testutil.NewGETRequest(t)
+	req.RequestCtx.Request.SetRequestURI("https://app.example.test/api/auth/sso/facebook/init")
+	req.RequestCtx.Request.SetHost("app.example.test")
+	req.RequestCtx.QueryArgs().Set("organization", strings.ToUpper(orgB.Slug))
+	testutil.SetPathParam(req, "provider", "facebook")
+	require.NoError(t, app.InitSSO(req))
+	require.Equal(t, fasthttp.StatusTemporaryRedirect, testutil.GetResponseStatusCode(req))
+
+	location, err := url.Parse(string(req.RequestCtx.Response.Header.Peek("Location")))
+	require.NoError(t, err)
+	nonce := location.Query().Get("state")
+	require.NotEmpty(t, nonce)
+	stateJSON, err := app.Redis.Get(context.Background(), "sso:state:"+nonce).Bytes()
+	require.NoError(t, err)
+	var state handlers.SSOState
+	require.NoError(t, json.Unmarshal(stateJSON, &state))
+	assert.Equal(t, orgB.ID.String(), state.OrgID)
+	assert.Equal(t, "facebook", state.Provider)
+
+	// The provider-only legacy route remains available only when unambiguous.
+	legacyReq := testutil.NewGETRequest(t)
+	testutil.SetPathParam(legacyReq, "provider", "facebook")
+	require.NoError(t, app.InitSSO(legacyReq))
+	testutil.AssertErrorResponse(t, legacyReq, fasthttp.StatusConflict, "Select an organization")
+}
+
+func TestApp_InitSSO_UnknownAndUnconfiguredOrganizationsAreIndistinguishable(t *testing.T) {
+	app := newSSOApp(t)
+	emptyOrg := testutil.CreateTestOrganization(t, app.DB)
+
+	start := func(selector string) []byte {
+		req := testutil.NewGETRequest(t)
+		req.RequestCtx.QueryArgs().Set("organization", selector)
+		testutil.SetPathParam(req, "provider", "github")
+		require.NoError(t, app.InitSSO(req))
+		require.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(req))
+		assert.Empty(t, req.RequestCtx.Response.Header.Peek("Location"))
+		return append([]byte(nil), testutil.GetResponseBody(req)...)
+	}
+
+	unknownBody := start("unknown-" + uuid.NewString())
+	emptyBody := start(emptyOrg.Slug)
+	invalidBody := start("../not-a-workspace")
+	assert.JSONEq(t, string(emptyBody), string(unknownBody))
+	assert.JSONEq(t, string(emptyBody), string(invalidBody))
 }
 
 // --- CallbackSSO: state validation ---

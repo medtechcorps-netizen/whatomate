@@ -3,11 +3,14 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/access"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
@@ -28,7 +31,7 @@ const (
 	tagsCacheTTL            = 6 * time.Hour
 
 	// Cache key prefixes
-	settingsCachePrefix        = "chatbot:settings:"
+	settingsCachePrefix        = "chatbot:settings:v2:"
 	flowsCachePrefix           = "chatbot:flows:"
 	keywordRulesCachePrefix    = "chatbot:keywords:"
 	whatsappAccountCachePrefix = "whatsapp:account:"
@@ -43,7 +46,16 @@ const (
 // chatbotSettingsCache is used for caching since AI.APIKey has json:"-" tag
 type chatbotSettingsCache struct {
 	models.ChatbotSettings
-	AIAPIKey string `json:"ai_api_key_cache"`
+	AIAPIKey  string `json:"ai_api_key_cache"`
+	AIBaseURL string `json:"ai_base_url_cache,omitempty"`
+}
+
+// webhookCache preserves the encrypted HMAC secret across JSON caching. The
+// model hides Secret from normal JSON by design, so caching Webhook directly
+// would silently stop signing deliveries after the first cache hit.
+type webhookCache struct {
+	models.Webhook
+	Secret string `json:"secret_cache"`
 }
 
 // getChatbotSettingsCached retrieves chatbot settings from cache or database
@@ -59,6 +71,7 @@ func (a *App) getChatbotSettingsCached(orgID uuid.UUID, whatsAppAccount string) 
 			if err := json.Unmarshal([]byte(cached), &cacheData); err == nil {
 				// Restore the API key from the cache wrapper
 				cacheData.AI.APIKey = a.decryptStoredSecret(cacheData.AIAPIKey)
+				cacheData.AI.BaseURL = cacheData.AIBaseURL
 				return &cacheData.ChatbotSettings, nil
 			}
 		}
@@ -74,11 +87,24 @@ func (a *App) getChatbotSettingsCached(orgID uuid.UUID, whatsAppAccount string) 
 	if result.Error != nil {
 		return nil, result.Error
 	}
+	if settings.AI.Provider == "" || settings.AI.Provider == models.AIProviderQwen {
+		if err := channelapi.ApplyCentralQwenSettings(a.DB, orgID, &settings.AI); err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, err
+			}
+			// Chatbot greetings, keyword rules, and fallbacks remain available,
+			// but Qwen fails closed until the central integration is enabled.
+			settings.AI.Enabled = false
+			settings.AI.APIKey = ""
+			settings.AI.BaseURL = ""
+		}
+	}
 
 	// Cache the result (include AI APIKey explicitly since it has json:"-" tag)
 	cacheData := chatbotSettingsCache{
 		ChatbotSettings: settings,
 		AIAPIKey:        settings.AI.APIKey,
+		AIBaseURL:       settings.AI.BaseURL,
 	}
 	if data, err := json.Marshal(cacheData); err == nil && a.Redis != nil {
 		a.Redis.Set(ctx, cacheKey, data, settingsCacheTTL)
@@ -92,6 +118,9 @@ func (a *App) decryptStoredSecret(value string) string {
 	encryptionKey := ""
 	if a != nil && a.Config != nil {
 		encryptionKey = a.Config.App.EncryptionKey
+	}
+	if appcrypto.IsEncrypted(value) && strings.TrimSpace(encryptionKey) == "" {
+		return ""
 	}
 	decrypted, err := appcrypto.Decrypt(value, encryptionKey)
 	if err != nil {
@@ -111,8 +140,20 @@ func (a *App) getChatbotFlowsCached(orgID uuid.UUID) ([]models.ChatbotFlow, erro
 		if err == nil && cached != "" {
 			var flows []models.ChatbotFlow
 			if err := json.Unmarshal([]byte(cached), &flows); err == nil {
-				return flows, nil
+				cacheSafe := true
+				for _, flow := range flows {
+					if !chatbotFlowCacheSafe(flow) {
+						cacheSafe = false
+						break
+					}
+				}
+				if cacheSafe {
+					return flows, nil
+				}
 			}
+			// Invalid cache payloads and legacy plaintext configurations are
+			// purged before falling back to the database.
+			a.Redis.Del(ctx, cacheKey)
 		}
 	}
 
@@ -123,9 +164,19 @@ func (a *App) getChatbotFlowsCached(orgID uuid.UUID) ([]models.ChatbotFlow, erro
 		return nil, err
 	}
 
-	// Cache the result
-	if data, err := json.Marshal(flows); err == nil && a.Redis != nil {
-		a.Redis.Set(ctx, cacheKey, data, flowsCacheTTL)
+	// Never copy legacy plaintext header values into Redis. They remain
+	// readable from the database until an ordinary edit migrates them.
+	cacheSafe := true
+	for _, flow := range flows {
+		if !chatbotFlowCacheSafe(flow) {
+			cacheSafe = false
+			break
+		}
+	}
+	if cacheSafe {
+		if data, err := json.Marshal(flows); err == nil && a.Redis != nil {
+			a.Redis.Set(ctx, cacheKey, data, flowsCacheTTL)
+		}
 	}
 
 	return flows, nil
@@ -262,7 +313,9 @@ func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount,
 				cacheData.WhatsAppAccount.AccessToken = cacheData.AccessToken
 				cacheData.WhatsAppAccount.AppSecret = cacheData.AppSecret
 				cacheData.WhatsAppAccount.Pin = cacheData.Pin
-				a.decryptAccountSecrets(&cacheData.WhatsAppAccount)
+				if err := a.prepareWhatsAppAccountForRuntime(&cacheData.WhatsAppAccount); err != nil {
+					return nil, err
+				}
 				return &cacheData.WhatsAppAccount, nil
 			}
 		}
@@ -285,9 +338,29 @@ func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount,
 		a.Redis.Set(ctx, cacheKey, data, whatsappAccountCacheTTL)
 	}
 
-	// Decrypt secrets before returning
-	a.decryptAccountSecrets(&account)
+	// Decrypt secrets and reject credentials that cannot safely be used.
+	if err := a.prepareWhatsAppAccountForRuntime(&account); err != nil {
+		return nil, err
+	}
 	return &account, nil
+}
+
+func (a *App) prepareWhatsAppAccountForRuntime(account *models.WhatsAppAccount) error {
+	if account == nil {
+		return errors.New("WhatsApp account is unavailable")
+	}
+	if account.AccessTokenExpiresAt != nil &&
+		!account.AccessTokenExpiresAt.After(time.Now().UTC()) {
+		return errors.New("WhatsApp account access token has expired")
+	}
+	a.decryptAccountSecrets(account)
+	if strings.TrimSpace(account.AccessToken) == "" {
+		return errors.New("WhatsApp account access token is missing")
+	}
+	if appcrypto.IsEncrypted(account.AccessToken) {
+		return errors.New("WhatsApp account access token could not be decrypted")
+	}
+	return nil
 }
 
 // decryptAccountSecrets decrypts the encrypted secrets on a WhatsApp account.
@@ -319,8 +392,13 @@ func (a *App) getWebhooksCached(orgID uuid.UUID) ([]models.Webhook, error) {
 	if a.Redis != nil {
 		cached, err := a.Redis.Get(ctx, cacheKey).Result()
 		if err == nil && cached != "" {
-			var webhooks []models.Webhook
-			if err := json.Unmarshal([]byte(cached), &webhooks); err == nil {
+			var cachedWebhooks []webhookCache
+			if err := json.Unmarshal([]byte(cached), &cachedWebhooks); err == nil {
+				webhooks := make([]models.Webhook, len(cachedWebhooks))
+				for index := range cachedWebhooks {
+					webhooks[index] = cachedWebhooks[index].Webhook
+					webhooks[index].Secret = cachedWebhooks[index].Secret
+				}
 				return webhooks, nil
 			}
 		}
@@ -333,7 +411,11 @@ func (a *App) getWebhooksCached(orgID uuid.UUID) ([]models.Webhook, error) {
 	}
 
 	// Cache the result
-	if data, err := json.Marshal(webhooks); err == nil && a.Redis != nil {
+	cachedWebhooks := make([]webhookCache, len(webhooks))
+	for index := range webhooks {
+		cachedWebhooks[index] = webhookCache{Webhook: webhooks[index], Secret: webhooks[index].Secret}
+	}
+	if data, err := json.Marshal(cachedWebhooks); err == nil && a.Redis != nil {
 		a.Redis.Set(ctx, cacheKey, data, webhooksCacheTTL)
 	}
 
@@ -397,8 +479,20 @@ func (a *App) getAIContextsCached(orgID uuid.UUID, whatsAppAccount string) ([]mo
 		if err == nil && cached != "" {
 			var contexts []models.AIContext
 			if err := json.Unmarshal([]byte(cached), &contexts); err == nil {
-				return contexts, nil
+				cacheSafe := true
+				for _, aiContext := range contexts {
+					if !chatbotOutboundConfigsCacheSafe(aiContext.ApiConfig) {
+						cacheSafe = false
+						break
+					}
+				}
+				if cacheSafe {
+					return contexts, nil
+				}
 			}
+			// Invalid cache payloads and legacy plaintext configurations are
+			// purged before falling back to the database.
+			a.Redis.Del(ctx, cacheKey)
 		}
 	}
 
@@ -426,9 +520,19 @@ func (a *App) getAIContextsCached(orgID uuid.UUID, whatsAppAccount string) ([]mo
 	// Merge: account-specific first, then global
 	contexts = append(accountContexts, globalContexts...)
 
-	// Cache the result
-	if data, err := json.Marshal(contexts); err == nil && a.Redis != nil {
-		a.Redis.Set(ctx, cacheKey, data, aiContextsCacheTTL)
+	// Legacy plaintext headers execute directly from the database, but are
+	// not copied into Redis before they have been migrated by an edit.
+	cacheSafe := true
+	for _, aiContext := range contexts {
+		if !chatbotOutboundConfigsCacheSafe(aiContext.ApiConfig) {
+			cacheSafe = false
+			break
+		}
+	}
+	if cacheSafe {
+		if data, err := json.Marshal(contexts); err == nil && a.Redis != nil {
+			a.Redis.Set(ctx, cacheKey, data, aiContextsCacheTTL)
+		}
 	}
 
 	return contexts, nil

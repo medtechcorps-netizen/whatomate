@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -78,9 +80,9 @@ type redirectToken struct {
 
 // ListCustomActions returns all custom actions for the organization
 func (a *App) ListCustomActions(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceCustomActions, models.ActionRead)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	pg := parsePagination(r)
@@ -114,9 +116,9 @@ func (a *App) ListCustomActions(r *fastglue.Request) error {
 
 // GetCustomAction returns a single custom action by ID
 func (a *App) GetCustomAction(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceCustomActions, models.ActionRead)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	actionID, err := parsePathUUID(r, "id", "action")
@@ -134,9 +136,9 @@ func (a *App) GetCustomAction(r *fastglue.Request) error {
 
 // CreateCustomAction creates a new custom action
 func (a *App) CreateCustomAction(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceCustomActions, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	var req CustomActionRequest
@@ -159,13 +161,26 @@ func (a *App) CreateCustomAction(r *fastglue.Request) error {
 	if err := validateActionConfig(req.ActionType, req.Config); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
+	config := models.JSONB(req.Config)
+	if req.ActionType == models.ActionTypeWebhook {
+		config, err = a.protectWebhookActionConfig(req.Config, nil)
+		if err != nil {
+			if errors.Is(err, errOutboundHeaderEncryptionUnavailable) {
+				return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Custom action credential storage is unavailable", nil, "")
+			}
+			if errors.Is(err, errOutboundHeaderMaskWithoutExisting) {
+				return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Masked header values can only preserve an existing credential", nil, "")
+			}
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Webhook headers must contain string values", nil, "")
+		}
+	}
 
 	action := models.CustomAction{
 		OrganizationID: orgID,
 		Name:           req.Name,
 		Icon:           req.Icon,
 		ActionType:     req.ActionType,
-		Config:         models.JSONB(req.Config),
+		Config:         config,
 		IsActive:       req.IsActive,
 		DisplayOrder:   req.DisplayOrder,
 	}
@@ -181,9 +196,9 @@ func (a *App) CreateCustomAction(r *fastglue.Request) error {
 
 // UpdateCustomAction updates an existing custom action
 func (a *App) UpdateCustomAction(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceCustomActions, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	actionID, err := parsePathUUID(r, "id", "action")
@@ -223,7 +238,20 @@ func (a *App) UpdateCustomAction(r *fastglue.Request) error {
 		if err := validateActionConfig(actionType, req.Config); err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 		}
-		configJSON, _ := json.Marshal(req.Config)
+		config := models.JSONB(req.Config)
+		if actionType == models.ActionTypeWebhook {
+			config, err = a.protectWebhookActionConfig(req.Config, action.Config)
+			if err != nil {
+				if errors.Is(err, errOutboundHeaderEncryptionUnavailable) {
+					return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Custom action credential storage is unavailable", nil, "")
+				}
+				if errors.Is(err, errOutboundHeaderMaskWithoutExisting) {
+					return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Masked header values can only preserve an existing credential", nil, "")
+				}
+				return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Webhook headers must contain string values", nil, "")
+			}
+		}
+		configJSON, _ := json.Marshal(config)
 		updates["config"] = configJSON
 	}
 	updates["is_active"] = req.IsActive
@@ -243,9 +271,9 @@ func (a *App) UpdateCustomAction(r *fastglue.Request) error {
 
 // DeleteCustomAction deletes a custom action
 func (a *App) DeleteCustomAction(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceCustomActions, models.ActionDelete)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	actionID, err := parsePathUUID(r, "id", "action")
@@ -268,9 +296,9 @@ func (a *App) DeleteCustomAction(r *fastglue.Request) error {
 
 // ExecuteCustomAction executes a custom action with the given context
 func (a *App) ExecuteCustomAction(r *fastglue.Request) error {
-	orgID, userID, err := a.getOrgAndUserID(r)
+	orgID, userID, err := a.requireAuth(r, models.ResourceCustomActions, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	actionID, err := parsePathUUID(r, "id", "action")
@@ -329,7 +357,9 @@ func (a *App) ExecuteCustomAction(r *fastglue.Request) error {
 	}
 
 	if err != nil {
-		a.Log.Error("Failed to execute custom action", "error", err, "action_id", actionID)
+		// HTTP-library errors may contain a fully rendered tenant URL. Keep them
+		// out of logs because query variables can hold customer credentials.
+		a.Log.Error("Failed to execute custom action", "action_id", actionID)
 		return r.SendEnvelope(ActionResult{
 			Success: false,
 			Message: "Action execution failed",
@@ -366,6 +396,12 @@ func (a *App) CustomActionRedirect(r *fastglue.Request) error {
 	delete(redirectTokens, token)
 	redirectTokenMutex.Unlock()
 
+	// Validate again at the final redirect boundary. This protects old in-memory
+	// entries and prevents an unsafe scheme from ever reaching Location.
+	if err := validateCustomActionRedirectURL(rt.URL); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Redirect target is not allowed", nil, "")
+	}
+
 	// Redirect to the actual URL
 	r.RequestCtx.Redirect(rt.URL, fasthttp.StatusFound)
 	return nil
@@ -379,21 +415,31 @@ func (a *App) executeWebhookAction(action models.CustomAction, context map[strin
 		return nil, err
 	}
 	var config struct {
-		URL     string            `json:"url"`
-		Method  string            `json:"method"`
-		Headers map[string]string `json:"headers"`
-		Body    string            `json:"body"`
+		URL    string `json:"url"`
+		Method string `json:"method"`
+		Body   string `json:"body"`
 	}
 	if err := json.Unmarshal(configBytes, &config); err != nil {
 		return nil, err
 	}
 
 	// Replace variables in URL
+	if err := validateWebhookURL(config.URL); err != nil {
+		return nil, errors.New("stored webhook URL is not allowed")
+	}
 	url := replaceVariables(config.URL, context)
+	if err := validateWebhookRuntimeURL(url); err != nil {
+		return nil, errors.New("rendered webhook URL is not allowed")
+	}
 
-	// Replace variables in headers
+	storedHeaders, err := a.resolveOutboundHeaders(action.Config["headers"])
+	if err != nil {
+		return nil, err
+	}
+
+	// Replace variables in headers after decryption.
 	headers := make(map[string]string)
-	for k, v := range config.Headers {
+	for k, v := range storedHeaders {
 		headers[k] = replaceVariables(v, context)
 	}
 
@@ -412,6 +458,7 @@ func (a *App) executeWebhookAction(action models.CustomAction, context map[strin
 	if method == "" {
 		method = "POST"
 	}
+	method = strings.ToUpper(strings.TrimSpace(method))
 
 	req, err := http.NewRequest(method, url, bytes.NewBufferString(body))
 	if err != nil {
@@ -423,7 +470,15 @@ func (a *App) executeWebhookAction(action models.CustomAction, context map[strin
 		req.Header.Set(k, v)
 	}
 
-	resp, err := a.HTTPClient.Do(req)
+	if a == nil || a.HTTPClient == nil {
+		return nil, errors.New("outbound HTTP client is not configured")
+	}
+	client := a.HTTPClient
+	requestClient := *client
+	requestClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := requestClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -466,19 +521,10 @@ func (a *App) executeURLAction(action models.CustomAction, context map[string]an
 
 	// Replace variables in URL
 	finalURL := replaceVariables(config.URL, context)
-
-	// Generate a random token
-	tokenBytes := make([]byte, 16)
-	_, _ = rand.Read(tokenBytes)
-	token := hex.EncodeToString(tokenBytes)
-
-	// Store the redirect token (expires in 30 seconds)
-	redirectTokenMutex.Lock()
-	redirectTokens[token] = redirectToken{
-		URL:       finalURL,
-		ExpiresAt: time.Now().Add(30 * time.Second),
+	token, err := storeCustomActionRedirect(finalURL)
+	if err != nil {
+		return nil, err
 	}
-	redirectTokenMutex.Unlock()
 
 	// Return the redirect URL
 	redirectURL := "/api/custom-actions/redirect/" + token
@@ -551,16 +597,11 @@ func (a *App) executeJavaScriptAction(action models.CustomAction, context map[st
 			if clip, ok := jsResult["clipboard"].(string); ok {
 				result.Clipboard = clip
 			}
-			if url, ok := jsResult["url"].(string); ok {
-				tokenBytes := make([]byte, 16)
-				_, _ = rand.Read(tokenBytes)
-				token := hex.EncodeToString(tokenBytes)
-				redirectTokenMutex.Lock()
-				redirectTokens[token] = redirectToken{
-					URL:       url,
-					ExpiresAt: time.Now().Add(30 * time.Second),
+			if targetURL, ok := jsResult["url"].(string); ok {
+				token, err := storeCustomActionRedirect(targetURL)
+				if err != nil {
+					return nil, err
 				}
-				redirectTokenMutex.Unlock()
 				result.RedirectURL = "/api/custom-actions/redirect/" + token
 			}
 			if msg, ok := jsResult["message"].(string); ok {
@@ -570,6 +611,59 @@ func (a *App) executeJavaScriptAction(action models.CustomAction, context map[st
 	}
 
 	return result, nil
+}
+
+// validateCustomActionRedirectURL permits only HTTPS destinations and explicit
+// application-relative paths. Browser-executable, protocol-relative, credential-
+// bearing and header-injection targets are rejected.
+func validateCustomActionRedirectURL(rawURL string) error {
+	target := strings.TrimSpace(rawURL)
+	if target == "" {
+		return errors.New("redirect URL is required")
+	}
+	lowerTarget := strings.ToLower(target)
+	if target != rawURL || strings.Contains(target, "\\") ||
+		strings.ContainsAny(target, "\r\n\x00") ||
+		strings.Contains(lowerTarget, "%0d") || strings.Contains(lowerTarget, "%0a") || strings.Contains(lowerTarget, "%00") {
+		return errors.New("redirect URL contains unsafe characters")
+	}
+
+	parsed, err := url.Parse(target)
+	if err != nil || parsed.Opaque != "" || parsed.User != nil {
+		return errors.New("redirect URL is invalid")
+	}
+
+	if parsed.IsAbs() {
+		if !strings.EqualFold(parsed.Scheme, "https") || parsed.Host == "" {
+			return errors.New("redirect URL must use HTTPS")
+		}
+		return nil
+	}
+
+	if strings.HasPrefix(target, "/") && !strings.HasPrefix(target, "//") && parsed.Host == "" {
+		return nil
+	}
+	return errors.New("redirect URL must be HTTPS or application-relative")
+}
+
+func storeCustomActionRedirect(targetURL string) (string, error) {
+	if err := validateCustomActionRedirectURL(targetURL); err != nil {
+		return "", err
+	}
+
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", errors.New("failed to create redirect token")
+	}
+	token := hex.EncodeToString(tokenBytes)
+
+	redirectTokenMutex.Lock()
+	redirectTokens[token] = redirectToken{
+		URL:       targetURL,
+		ExpiresAt: time.Now().Add(30 * time.Second),
+	}
+	redirectTokenMutex.Unlock()
+	return token, nil
 }
 
 // buildActionContext builds the context object for variable replacement
@@ -639,14 +733,35 @@ func validateActionConfig(actionType models.ActionType, config map[string]any) e
 		if !ok {
 			return &ValidationError{Field: "config.url", Message: "URL is required for webhook actions"}
 		}
-		if urlStr, ok := urlVal.(string); ok {
-			if err := validateWebhookURL(urlStr); err != nil {
-				return &ValidationError{Field: "config.url", Message: err.Error()}
+		urlStr, ok := urlVal.(string)
+		if !ok {
+			return &ValidationError{Field: "config.url", Message: "URL must be a string for webhook actions"}
+		}
+		if err := validateWebhookURL(urlStr); err != nil {
+			return &ValidationError{Field: "config.url", Message: err.Error()}
+		}
+		if rawMethod, exists := config["method"]; exists {
+			method, ok := rawMethod.(string)
+			if !ok {
+				return &ValidationError{Field: "config.method", Message: "Method must be a string for webhook actions"}
+			}
+			switch strings.ToUpper(strings.TrimSpace(method)) {
+			case "", http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			default:
+				return &ValidationError{Field: "config.method", Message: "Method must be GET, POST, PUT, PATCH, or DELETE"}
 			}
 		}
 	case models.ActionTypeURL:
-		if _, ok := config["url"]; !ok {
+		rawURL, ok := config["url"]
+		if !ok {
 			return &ValidationError{Field: "config.url", Message: "URL is required for URL actions"}
+		}
+		redirectURL, ok := rawURL.(string)
+		if !ok || strings.TrimSpace(redirectURL) == "" {
+			return &ValidationError{Field: "config.url", Message: "URL must be a non-empty string for URL actions"}
+		}
+		if err := validateCustomActionRedirectURL(redirectURL); err != nil {
+			return &ValidationError{Field: "config.url", Message: "URL must be HTTPS or an application-relative path"}
 		}
 	case models.ActionTypeJavascript:
 		if _, ok := config["code"]; !ok {
@@ -658,8 +773,7 @@ func validateActionConfig(actionType models.ActionType, config map[string]any) e
 
 // customActionToResponse converts a CustomAction model to response
 func customActionToResponse(action models.CustomAction) CustomActionResponse {
-	// Config is already a map[string]any, just use it directly
-	config := map[string]any(action.Config)
+	config := redactCustomActionConfig(action.Config)
 
 	return CustomActionResponse{
 		ID:           action.ID,

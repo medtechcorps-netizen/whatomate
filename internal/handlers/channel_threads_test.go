@@ -24,26 +24,29 @@ func TestThreadsChannelCreationRequiresAdditionalEntitlement(t *testing.T) {
 	assert.Empty(t, key)
 }
 
-func TestThreadsChannelCreationIsRelayOnlyAndNeverDefaultOutbound(t *testing.T) {
+func TestUnsupportedChannelCreationFailsClosedUntilAdaptersExist(t *testing.T) {
 	t.Parallel()
 
-	valid := ChannelAccountRequest{
+	threads := ChannelAccountRequest{
 		Channel:  models.ChannelThreads,
 		Provider: channelapi.RelayProvider,
 	}
-	require.NoError(t, validateChannelCreationPolicy(valid))
-
-	directProvider := valid
-	directProvider.Provider = "meta"
-	err := validateChannelCreationPolicy(directProvider)
+	err := validateChannelCreationPolicy(threads)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "signed relay provider")
+	assert.Contains(t, err.Error(), "preparation-only")
 
-	defaultOutbound := valid
-	defaultOutbound.IsDefaultOutgoing = true
-	err = validateChannelCreationPolicy(defaultOutbound)
+	tiktok := ChannelAccountRequest{
+		Channel:  models.ChannelTikTok,
+		Provider: channelapi.RelayProvider,
+	}
+	err = validateChannelCreationPolicy(tiktok)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "direct messages")
+	assert.Contains(t, err.Error(), "preparation-only")
+
+	require.NoError(t, validateChannelCreationPolicy(ChannelAccountRequest{
+		Channel:  models.ChannelWebChat,
+		Provider: channelapi.RelayProvider,
+	}))
 }
 
 func TestThreadsChannelMetadataStaysPublicEngagementOnly(t *testing.T) {

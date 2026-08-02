@@ -98,9 +98,10 @@ func TestApp_GetBusinessProfile_Success(t *testing.T) {
 	app := newAppForProfile(t, meta.server.URL)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	acc := mkAccountForProfile(t, app.DB, org.ID)
+	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewGETRequest(t)
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.GetBusinessProfile(req))
@@ -118,9 +119,10 @@ func TestApp_GetBusinessProfile_AccountNotFound(t *testing.T) {
 	meta := newFakeProfileServer(t)
 	app := newAppForProfile(t, meta.server.URL)
 	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewGETRequest(t)
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetPathParam(req, "id", uuid.New().String())
 
 	require.NoError(t, app.GetBusinessProfile(req))
@@ -133,9 +135,10 @@ func TestApp_GetBusinessProfile_CrossOrgIsolation(t *testing.T) {
 	orgA := testutil.CreateTestOrganization(t, app.DB)
 	orgB := testutil.CreateTestOrganization(t, app.DB)
 	acc := mkAccountForProfile(t, app.DB, orgA.ID)
+	userB := createAdminUser(t, app, orgB.ID)
 
 	req := testutil.NewGETRequest(t)
-	testutil.SetAuthContext(req, orgB.ID, uuid.New())
+	testutil.SetAuthContext(req, orgB.ID, userB.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.GetBusinessProfile(req))
@@ -152,9 +155,10 @@ func TestApp_GetBusinessProfile_MetaAPIErrorBubbles(t *testing.T) {
 	app := newAppForProfile(t, meta.server.URL)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	acc := mkAccountForProfile(t, app.DB, org.ID)
+	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewGETRequest(t)
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.GetBusinessProfile(req))
@@ -179,6 +183,7 @@ func TestApp_UpdateBusinessProfile_Success(t *testing.T) {
 	app := newAppForProfile(t, meta.server.URL)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	acc := mkAccountForProfile(t, app.DB, org.ID)
+	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"about":       "new about",
@@ -188,7 +193,7 @@ func TestApp_UpdateBusinessProfile_Success(t *testing.T) {
 		"websites":    []string{"https://new.example.com"},
 		"address":     "2 New Rd",
 	})
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.UpdateBusinessProfile(req))
@@ -219,9 +224,10 @@ func TestApp_UpdateBusinessProfile_RefetchFailureStillReportsSuccess(t *testing.
 	app := newAppForProfile(t, meta.server.URL)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	acc := mkAccountForProfile(t, app.DB, org.ID)
+	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{"about": "x"})
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.UpdateBusinessProfile(req))
@@ -244,9 +250,10 @@ func TestApp_UpdateBusinessProfile_MetaUpdateFails(t *testing.T) {
 	app := newAppForProfile(t, meta.server.URL)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	acc := mkAccountForProfile(t, app.DB, org.ID)
+	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{"email": "bad"})
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.UpdateBusinessProfile(req))
@@ -259,9 +266,10 @@ func TestApp_UpdateBusinessProfile_CrossOrgIsolation(t *testing.T) {
 	orgA := testutil.CreateTestOrganization(t, app.DB)
 	orgB := testutil.CreateTestOrganization(t, app.DB)
 	acc := mkAccountForProfile(t, app.DB, orgA.ID)
+	userB := createAdminUser(t, app, orgB.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{"about": "should-not-apply"})
-	testutil.SetAuthContext(req, orgB.ID, uuid.New())
+	testutil.SetAuthContext(req, orgB.ID, userB.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.UpdateBusinessProfile(req))
@@ -274,14 +282,51 @@ func TestApp_UpdateBusinessProfile_InvalidJSONBody(t *testing.T) {
 	app := newAppForProfile(t, meta.server.URL)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	acc := mkAccountForProfile(t, app.DB, org.ID)
+	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewRequest(t)
 	req.RequestCtx.Request.Header.SetContentType("application/json")
 	req.RequestCtx.Request.Header.SetMethod("PUT")
 	req.RequestCtx.Request.SetBody([]byte("not json"))
-	testutil.SetAuthContext(req, org.ID, uuid.New())
+	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.UpdateBusinessProfile(req))
 	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+}
+
+func TestApp_BusinessProfileRequiresAccountPermissions(t *testing.T) {
+	meta := newFakeProfileServer(t)
+	app := newAppForProfile(t, meta.server.URL)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	acc := mkAccountForProfile(t, app.DB, org.ID)
+	noAccessRole := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "profile-no-access", nil)
+	noAccess := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&noAccessRole.ID))
+	readerRole := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "profile-reader", []string{"accounts:read"})
+	reader := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&readerRole.ID))
+
+	getForbidden := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(getForbidden, org.ID, noAccess.ID)
+	testutil.SetPathParam(getForbidden, "id", acc.ID.String())
+	require.NoError(t, app.GetBusinessProfile(getForbidden))
+	testutil.AssertErrorResponse(t, getForbidden, fasthttp.StatusForbidden, "Insufficient permissions")
+
+	getAllowed := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(getAllowed, org.ID, reader.ID)
+	testutil.SetPathParam(getAllowed, "id", acc.ID.String())
+	require.NoError(t, app.GetBusinessProfile(getAllowed))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(getAllowed))
+
+	updateForbidden := testutil.NewJSONRequest(t, map[string]any{"about": "must not reach Meta"})
+	testutil.SetAuthContext(updateForbidden, org.ID, reader.ID)
+	testutil.SetPathParam(updateForbidden, "id", acc.ID.String())
+	require.NoError(t, app.UpdateBusinessProfile(updateForbidden))
+	testutil.AssertErrorResponse(t, updateForbidden, fasthttp.StatusForbidden, "Insufficient permissions")
+	assert.Nil(t, meta.LastBody)
+
+	photoForbidden := testutil.NewRequest(t)
+	testutil.SetAuthContext(photoForbidden, org.ID, reader.ID)
+	testutil.SetPathParam(photoForbidden, "id", acc.ID.String())
+	require.NoError(t, app.UpdateProfilePicture(photoForbidden))
+	testutil.AssertErrorResponse(t, photoForbidden, fasthttp.StatusForbidden, "Insufficient permissions")
 }

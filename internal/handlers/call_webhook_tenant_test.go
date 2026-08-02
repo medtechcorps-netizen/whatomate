@@ -27,7 +27,7 @@ func TestProcessCallStatusWebhookRejectsCrossTenantSession(t *testing.T) {
 			callLog := createOutgoingCallWebhookTestLog(t, db, sessionOrg.ID, contact, "status-cross-tenant")
 
 			manager := calling.NewManager(
-				&config.CallingConfig{}, nil, db, nil, nil, nil, nil, testutil.NopLogger(),
+				&config.CallingConfig{}, nil, db, nil, nil, nil, nil, nil, "", testutil.NopLogger(),
 			)
 			session := &calling.CallSession{
 				ID:             callLog.WhatsAppCallID,

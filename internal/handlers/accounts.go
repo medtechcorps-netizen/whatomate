@@ -3,12 +3,14 @@ package handlers
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/crypto"
@@ -16,17 +18,26 @@ import (
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
+)
+
+var (
+	errMetaIntegrationDisabled        = errors.New("Meta integration is disabled")
+	errAccountEncryptionUnavailable   = errors.New("account credential encryption is unavailable")
+	errMetaAppIDNotConfigured         = errors.New("Meta App ID is not configured")
+	errMetaAppSecretNotConfigured     = errors.New("Meta App Secret is not configured")
+	errMetaTokenValidationUnavailable = errors.New("Meta access token validation is unavailable")
 )
 
 // AccountRequest represents the request body for creating/updating an account
 type AccountRequest struct {
 	Name                   string `json:"name" validate:"required"`
-	AppID                  string `json:"app_id"`
+	AppID                  string `json:"app_id"` // Deprecated: managed in the Integration Center.
 	PhoneID                string `json:"phone_id" validate:"required"`
 	BusinessID             string `json:"business_id" validate:"required"`
 	AccessToken            string `json:"access_token" validate:"required"`
-	AppSecret              string `json:"app_secret"` // Meta App Secret for webhook signature verification
-	WebhookVerifyToken     string `json:"webhook_verify_token"`
+	AppSecret              string `json:"app_secret"`           // Deprecated: managed in the Integration Center.
+	WebhookVerifyToken     string `json:"webhook_verify_token"` // Deprecated: managed in the Integration Center.
 	APIVersion             string `json:"api_version"`
 	IsDefaultIncoming      bool   `json:"is_default_incoming"`
 	IsDefaultOutgoing      bool   `json:"is_default_outgoing"`
@@ -38,10 +49,8 @@ type AccountRequest struct {
 type AccountResponse struct {
 	ID                     uuid.UUID  `json:"id"`
 	Name                   string     `json:"name"`
-	AppID                  string     `json:"app_id"`
 	PhoneID                string     `json:"phone_id"`
 	BusinessID             string     `json:"business_id"`
-	WebhookVerifyToken     string     `json:"webhook_verify_token"`
 	APIVersion             string     `json:"api_version"`
 	IsDefaultIncoming      bool       `json:"is_default_incoming"`
 	IsDefaultOutgoing      bool       `json:"is_default_outgoing"`
@@ -49,7 +58,7 @@ type AccountResponse struct {
 	BusinessCallingEnabled bool       `json:"business_calling_enabled"`
 	Status                 string     `json:"status"`
 	HasAccessToken         bool       `json:"has_access_token"`
-	HasAppSecret           bool       `json:"has_app_secret"`
+	AccessTokenExpiresAt   *time.Time `json:"access_token_expires_at,omitempty"`
 	PhoneNumber            string     `json:"phone_number,omitempty"`
 	DisplayName            string     `json:"display_name,omitempty"`
 	CreatedByID            *uuid.UUID `json:"created_by_id,omitempty"`
@@ -58,6 +67,7 @@ type AccountResponse struct {
 	UpdatedByName          string     `json:"updated_by_name,omitempty"`
 	CreatedAt              string     `json:"created_at"`
 	UpdatedAt              string     `json:"updated_at"`
+	Warning                string     `json:"warning,omitempty"`
 }
 
 // ListAccounts returns all WhatsApp accounts for the organization
@@ -100,40 +110,79 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 	if req.Name == "" || req.PhoneID == "" || req.BusinessID == "" || req.AccessToken == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Name, phone_id, business_id, and access_token are required", nil, "")
 	}
-
-	// Generate webhook verify token if not provided
-	webhookVerifyToken := req.WebhookVerifyToken
-	if webhookVerifyToken == "" {
-		webhookVerifyToken = generateVerifyToken()
+	if strings.TrimSpace(req.AppID) != "" || strings.TrimSpace(req.AppSecret) != "" {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Meta App ID and App Secret are managed in Settings > Integrations",
+			nil,
+			"",
+		)
+	}
+	if strings.TrimSpace(req.WebhookVerifyToken) != "" {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Meta Webhook Verify Token is managed in Settings > Integrations",
+			nil,
+			"",
+		)
+	}
+	if !a.hasIntegrationEncryptionKey() {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
 	}
 
-	// Set default API version
+	validationCtx, cancelValidation := context.WithTimeout(requestContext(r), 30*time.Second)
+	defer cancelValidation()
+	_, tokenExpiresAt, err := a.debugAndValidateMetaAccessToken(
+		validationCtx,
+		orgID,
+		req.AccessToken,
+	)
+	if err != nil {
+		return a.sendMetaTokenPreflightError(r, err)
+	}
+
+	// Set the effective API version before validating the account tuple. Meta's
+	// phone, WABA, and membership lookups must all succeed with this token before
+	// any row can be presented as usable.
 	apiVersion := req.APIVersion
 	if apiVersion == "" {
 		apiVersion = a.defaultAPIVersion()
+	}
+	if _, err := a.validateWhatsAppAccountContract(
+		validationCtx,
+		req.PhoneID,
+		req.BusinessID,
+		req.AccessToken,
+		apiVersion,
+	); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 
 	account := models.WhatsAppAccount{
 		OrganizationID:         orgID,
 		Name:                   req.Name,
-		AppID:                  req.AppID,
 		PhoneID:                req.PhoneID,
 		BusinessID:             req.BusinessID,
 		AccessToken:            req.AccessToken,
-		AppSecret:              req.AppSecret,
-		WebhookVerifyToken:     webhookVerifyToken,
+		AccessTokenExpiresAt:   tokenExpiresAt,
 		APIVersion:             apiVersion,
 		IsDefaultIncoming:      req.IsDefaultIncoming,
 		IsDefaultOutgoing:      req.IsDefaultOutgoing,
 		AutoReadReceipt:        req.AutoReadReceipt,
 		BusinessCallingEnabled: req.BusinessCallingEnabled,
-		Status:                 "active",
+		Status:                 "pending_subscription",
 		CreatedByID:            &userID,
 		UpdatedByID:            &userID,
 	}
+	// Keep a request-scoped plaintext copy solely for the provider call. The
+	// persisted model is encrypted before it reaches the database.
+	subscriptionAccount := a.toWhatsAppAccount(&account)
 
 	if err := a.encryptAccountSecrets(&account); err != nil {
 		a.Log.Error("Failed to encrypt account secrets", "error", err)
+		if errors.Is(err, errAccountEncryptionUnavailable) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create account", nil, "")
 	}
 
@@ -154,11 +203,30 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create account", nil, "")
 	}
 
-	a.DB.Preload("CreatedBy").Preload("UpdatedBy").First(&account, "id = ?", account.ID)
+	subscriptionErr, statusErr := a.subscribeAndPersistWhatsAppStatus(
+		validationCtx,
+		orgID,
+		&account,
+		subscriptionAccount,
+		"active",
+		"subscription_failed",
+	)
+	if statusErr != nil {
+		a.Log.Error("Failed to persist WhatsApp subscription readiness", "error", statusErr, "account_id", account.ID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Account saved, but webhook subscription status could not be recorded", nil, "")
+	}
+
+	a.DB.Preload("CreatedBy").Preload("UpdatedBy").
+		Where("id = ? AND organization_id = ?", account.ID, orgID).
+		First(&account)
 	a.logAudit(orgID, userID,
 		"account", account.ID, models.AuditActionCreated, nil, &account)
 
-	return r.SendEnvelope(accountToResponse(account))
+	response := accountToResponse(account)
+	if subscriptionErr != nil {
+		response.Warning = "Webhook subscription failed; use the account Subscribe action after checking Meta permissions"
+	}
+	return r.SendEnvelope(response)
 }
 
 // GetAccount returns a single WhatsApp account
@@ -205,13 +273,85 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 	if err := a.decodeRequest(r, &req); err != nil {
 		return nil
 	}
+	if strings.TrimSpace(req.AppID) != "" || strings.TrimSpace(req.AppSecret) != "" {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Meta App ID and App Secret are managed in Settings > Integrations",
+			nil,
+			"",
+		)
+	}
+	if strings.TrimSpace(req.WebhookVerifyToken) != "" {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Meta Webhook Verify Token is managed in Settings > Integrations",
+			nil,
+			"",
+		)
+	}
+
+	var tokenExpiresAt *time.Time
+	if req.AccessToken != "" {
+		if !a.hasIntegrationEncryptionKey() {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+		}
+		validationCtx, cancelValidation := context.WithTimeout(requestContext(r), 20*time.Second)
+		defer cancelValidation()
+		_, tokenExpiresAt, err = a.debugAndValidateMetaAccessToken(
+			validationCtx,
+			orgID,
+			req.AccessToken,
+		)
+		if err != nil {
+			return a.sendMetaTokenPreflightError(r, err)
+		}
+	}
+
+	effectivePhoneID := account.PhoneID
+	if req.PhoneID != "" {
+		effectivePhoneID = req.PhoneID
+	}
+	effectiveBusinessID := account.BusinessID
+	if req.BusinessID != "" {
+		effectiveBusinessID = req.BusinessID
+	}
+	effectiveAccessToken := account.AccessToken
+	if req.AccessToken != "" {
+		effectiveAccessToken = req.AccessToken
+	}
+	effectiveAPIVersion := account.APIVersion
+	if req.APIVersion != "" {
+		effectiveAPIVersion = req.APIVersion
+	}
+	if effectiveAPIVersion == "" {
+		effectiveAPIVersion = a.defaultAPIVersion()
+	}
+	accountContractChanged := effectivePhoneID != account.PhoneID ||
+		effectiveBusinessID != account.BusinessID ||
+		req.AccessToken != "" ||
+		effectiveAPIVersion != account.APIVersion
+	var subscriptionCtx context.Context
+	var cancelSubscription context.CancelFunc
+	if accountContractChanged {
+		if !a.hasIntegrationEncryptionKey() {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+		}
+		subscriptionCtx, cancelSubscription = context.WithTimeout(requestContext(r), 30*time.Second)
+		defer cancelSubscription()
+		if _, err := a.validateWhatsAppAccountContract(
+			subscriptionCtx,
+			effectivePhoneID,
+			effectiveBusinessID,
+			effectiveAccessToken,
+			effectiveAPIVersion,
+		); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+		}
+	}
 
 	// Update fields if provided
 	if req.Name != "" {
 		account.Name = req.Name
-	}
-	if req.AppID != "" {
-		account.AppID = req.AppID
 	}
 	if req.PhoneID != "" {
 		account.PhoneID = req.PhoneID
@@ -220,30 +360,15 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		account.BusinessID = req.BusinessID
 	}
 	tokenChanged := false
-	secretChanged := false
 	if req.AccessToken != "" {
-		enc, err := crypto.Encrypt(req.AccessToken, a.Config.App.EncryptionKey)
-		if err != nil {
-			a.Log.Error("Failed to encrypt access token", "error", err)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
-		}
-		account.AccessToken = enc
+		account.AccessToken = req.AccessToken
+		account.AccessTokenExpiresAt = tokenExpiresAt
 		tokenChanged = true
-	}
-	if req.AppSecret != "" {
-		enc, err := crypto.Encrypt(req.AppSecret, a.Config.App.EncryptionKey)
-		if err != nil {
-			a.Log.Error("Failed to encrypt app secret", "error", err)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
-		}
-		account.AppSecret = enc
-		secretChanged = true
-	}
-	if req.WebhookVerifyToken != "" {
-		account.WebhookVerifyToken = req.WebhookVerifyToken
 	}
 	if req.APIVersion != "" {
 		account.APIVersion = req.APIVersion
+	} else if account.APIVersion == "" {
+		account.APIVersion = effectiveAPIVersion
 	}
 	account.AutoReadReceipt = req.AutoReadReceipt
 	account.BusinessCallingEnabled = req.BusinessCallingEnabled
@@ -262,16 +387,54 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 	account.IsDefaultIncoming = req.IsDefaultIncoming
 	account.IsDefaultOutgoing = req.IsDefaultOutgoing
 	account.UpdatedByID = &userID
+	var subscriptionAccount *whatsapp.Account
+	if accountContractChanged {
+		account.Status = "pending_subscription"
+		subscriptionAccount = a.toWhatsAppAccount(account)
+	}
+
+	// resolveWhatsAppAccountByID returns decrypted legacy secrets. Re-encrypt
+	// every secret before saving so an unrelated account edit can never write an
+	// access token, legacy app secret, or PIN back in plaintext.
+	if err := a.encryptAccountSecrets(account); err != nil {
+		a.Log.Error("Failed to encrypt account secrets", "error", err)
+		if errors.Is(err, errAccountEncryptionUnavailable) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
+	}
 
 	if err := a.DB.Save(account).Error; err != nil {
 		a.Log.Error("Failed to update account", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
 	}
 
+	var subscriptionErr error
+	if accountContractChanged {
+		var statusErr error
+		subscriptionErr, statusErr = a.subscribeAndPersistWhatsAppStatus(
+			subscriptionCtx,
+			orgID,
+			account,
+			subscriptionAccount,
+			"active",
+			"subscription_failed",
+		)
+		if statusErr != nil {
+			a.Log.Error("Failed to persist WhatsApp subscription readiness", "error", statusErr, "account_id", account.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Account updated, but webhook subscription status could not be recorded", nil, "")
+		}
+	}
+
 	// Invalidate cache
+	if oldAccount.PhoneID != account.PhoneID {
+		a.InvalidateWhatsAppAccountCache(oldAccount.PhoneID)
+	}
 	a.InvalidateWhatsAppAccountCache(account.PhoneID)
 
-	a.DB.Preload("CreatedBy").Preload("UpdatedBy").First(account, "id = ?", account.ID)
+	a.DB.Preload("CreatedBy").Preload("UpdatedBy").
+		Where("id = ? AND organization_id = ?", account.ID, orgID).
+		First(account)
 
 	var sensitiveChanges []map[string]any
 	if tokenChanged {
@@ -279,15 +442,14 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 			"field": "access_token", "old_value": "********", "new_value": "********",
 		})
 	}
-	if secretChanged {
-		sensitiveChanges = append(sensitiveChanges, map[string]any{
-			"field": "app_secret", "old_value": "********", "new_value": "********",
-		})
-	}
 	a.logAudit(orgID, userID,
 		"account", account.ID, models.AuditActionUpdated, &oldAccount, account, sensitiveChanges...)
 
-	return r.SendEnvelope(accountToResponse(*account))
+	response := accountToResponse(*account)
+	if subscriptionErr != nil {
+		response.Warning = "Webhook subscription failed; use the account Subscribe action after checking Meta permissions"
+	}
+	return r.SendEnvelope(response)
 }
 
 // DeleteAccount deletes a WhatsApp account
@@ -325,9 +487,9 @@ func (a *App) DeleteAccount(r *fastglue.Request) error {
 // TestAccountConnection tests the WhatsApp API connection
 // This validates both PhoneID and BusinessID to ensure all credentials are correct
 func (a *App) TestAccountConnection(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceAccounts, models.ActionRead)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	id, err := parsePathUUID(r, "id", "account")
@@ -456,10 +618,8 @@ func accountToResponse(acc models.WhatsAppAccount) AccountResponse {
 	resp := AccountResponse{
 		ID:                     acc.ID,
 		Name:                   acc.Name,
-		AppID:                  acc.AppID,
 		PhoneID:                acc.PhoneID,
 		BusinessID:             acc.BusinessID,
-		WebhookVerifyToken:     acc.WebhookVerifyToken,
 		APIVersion:             acc.APIVersion,
 		IsDefaultIncoming:      acc.IsDefaultIncoming,
 		IsDefaultOutgoing:      acc.IsDefaultOutgoing,
@@ -467,7 +627,7 @@ func accountToResponse(acc models.WhatsAppAccount) AccountResponse {
 		BusinessCallingEnabled: acc.BusinessCallingEnabled,
 		Status:                 acc.Status,
 		HasAccessToken:         acc.AccessToken != "",
-		HasAppSecret:           acc.AppSecret != "",
+		AccessTokenExpiresAt:   acc.AccessTokenExpiresAt,
 		CreatedByID:            acc.CreatedByID,
 		UpdatedByID:            acc.UpdatedByID,
 		CreatedAt:              acc.CreatedAt.Format("2006-01-02T15:04:05Z"),
@@ -482,29 +642,91 @@ func accountToResponse(acc models.WhatsAppAccount) AccountResponse {
 	return resp
 }
 
-func generateVerifyToken() string {
-	bytes := make([]byte, 32)
-	_, _ = rand.Read(bytes)
-	return hex.EncodeToString(bytes)
-}
-
 // validateAccountCredentials validates WhatsApp account credentials with Meta API
 func (a *App) validateAccountCredentials(phoneID, businessID, accessToken, apiVersion string) error {
 	ctx := context.Background()
-	_, err := a.WhatsApp.ValidateCredentials(ctx, phoneID, businessID, accessToken, apiVersion)
+	_, err := a.validateWhatsAppAccountContract(ctx, phoneID, businessID, accessToken, apiVersion)
 	if err != nil {
 		return err
 	}
-	a.Log.Info("Account credentials validated successfully", "phone_id", phoneID, "business_id", businessID)
 	return nil
+}
+
+// validateWhatsAppAccountContract verifies the complete provider-side tuple:
+// the token can read the phone and WABA, and the exact Phone ID is listed under
+// the supplied WABA. It deliberately does not log or return the access token.
+func (a *App) validateWhatsAppAccountContract(
+	ctx context.Context,
+	phoneID, businessID, accessToken, apiVersion string,
+) (*whatsapp.CredentialsValidationResult, error) {
+	if a.WhatsApp == nil {
+		return nil, errors.New("WhatsApp account validation is unavailable")
+	}
+	result, err := a.WhatsApp.ValidateCredentials(
+		ctx,
+		strings.TrimSpace(phoneID),
+		strings.TrimSpace(businessID),
+		accessToken,
+		strings.TrimSpace(apiVersion),
+	)
+	if err != nil {
+		a.Log.Warn(
+			"WhatsApp account contract validation failed",
+			"phone_id", strings.TrimSpace(phoneID),
+			"business_id", strings.TrimSpace(businessID),
+		)
+		return nil, fmt.Errorf("WhatsApp account validation failed: %w", err)
+	}
+	a.Log.Info(
+		"WhatsApp account contract validated successfully",
+		"phone_id", strings.TrimSpace(phoneID),
+		"business_id", strings.TrimSpace(businessID),
+	)
+	return result, nil
+}
+
+// subscribeAndPersistWhatsAppStatus subscribes a row that has already been
+// saved in a non-ready state, then records the true provider outcome. The
+// runtimeAccount contains request-scoped plaintext credentials; account is the
+// encrypted-at-rest model and is never used for the provider call.
+func (a *App) subscribeAndPersistWhatsAppStatus(
+	ctx context.Context,
+	orgID uuid.UUID,
+	account *models.WhatsAppAccount,
+	runtimeAccount *whatsapp.Account,
+	successStatus, failureStatus string,
+) (subscriptionErr, persistenceErr error) {
+	if a.WhatsApp == nil || runtimeAccount == nil {
+		subscriptionErr = errors.New("WhatsApp webhook subscription is unavailable")
+	} else {
+		subscriptionErr = a.WhatsApp.SubscribeApp(ctx, runtimeAccount)
+	}
+
+	status := successStatus
+	if subscriptionErr != nil {
+		status = failureStatus
+		a.Log.Warn(
+			"WhatsApp webhook subscription failed",
+			"account_id", account.ID,
+			"business_id", account.BusinessID,
+		)
+	}
+	if err := a.DB.Model(&models.WhatsAppAccount{}).
+		Where("id = ? AND organization_id = ?", account.ID, orgID).
+		Update("status", status).Error; err != nil {
+		return subscriptionErr, err
+	}
+	account.Status = status
+	a.InvalidateWhatsAppAccountCache(account.PhoneID)
+	return subscriptionErr, nil
 }
 
 // SubscribeApp subscribes the app to webhooks for the WhatsApp Business Account.
 // This is required after phone number registration to receive incoming messages from Meta.
 func (a *App) SubscribeApp(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	id, err := parsePathUUID(r, "id", "account")
@@ -518,9 +740,17 @@ func (a *App) SubscribeApp(r *fastglue.Request) error {
 	}
 
 	// Subscribe the app to webhooks
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(requestContext(r), 30*time.Second)
+	defer cancel()
 	if err := a.WhatsApp.SubscribeApp(ctx, a.toWhatsAppAccount(account)); err != nil {
-		a.Log.Error("Failed to subscribe app to webhooks", "error", err, "account", account.Name)
+		a.Log.Warn("Failed to subscribe app to webhooks", "account_id", account.ID)
+		if statusErr := a.DB.Model(&models.WhatsAppAccount{}).
+			Where("id = ? AND organization_id = ?", account.ID, orgID).
+			Update("status", "subscription_failed").Error; statusErr != nil {
+			a.Log.Error("Failed to record webhook subscription failure", "error", statusErr, "account_id", account.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Webhook subscription failed and its status could not be recorded", nil, "")
+		}
+		a.InvalidateWhatsAppAccountCache(account.PhoneID)
 		return r.SendEnvelope(map[string]any{
 			"success": false,
 			"error":   "Failed to subscribe app to webhooks. Check your credentials.",
@@ -528,6 +758,15 @@ func (a *App) SubscribeApp(r *fastglue.Request) error {
 	}
 
 	a.Log.Info("App subscribed to webhooks successfully", "account", account.Name, "business_id", account.BusinessID)
+	if account.Status == "subscription_failed" || account.Status == "pending_subscription" {
+		if err := a.DB.Model(&models.WhatsAppAccount{}).
+			Where("id = ? AND organization_id = ?", account.ID, orgID).
+			Update("status", "active").Error; err != nil {
+			a.Log.Error("Failed to restore account readiness after subscription", "error", err, "account", account.Name)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Subscription succeeded but account readiness could not be saved", nil, "")
+		}
+		a.InvalidateWhatsAppAccountCache(account.PhoneID)
+	}
 	return r.SendEnvelope(map[string]any{
 		"success": true,
 		"message": "App subscribed to webhooks successfully. You should now receive incoming messages.",
@@ -537,14 +776,33 @@ func (a *App) SubscribeApp(r *fastglue.Request) error {
 // resolveMetaAppCreds resolves Meta app ID, App Secret, and Config ID for an organization,
 // preferring organization-specific settings and falling back to global config defaults.
 func (a *App) resolveMetaAppCreds(orgID uuid.UUID) (string, string, string, error) {
+	// Once an Integration Center row exists, its disabled state is
+	// authoritative. Legacy organizations without a row retain the existing
+	// global/workspace fallback until an administrator manages this provider in
+	// the new center.
+	var integration models.ProviderIntegration
+	if err := a.DB.Select("enabled").
+		Where("organization_id = ? AND provider = ?", orgID, integrationProviderMeta).
+		First(&integration).Error; err == nil {
+		if !integration.Enabled {
+			return "", "", "", errMetaIntegrationDisabled
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", "", "", err
+	}
+
 	var org models.Organization
 	if err := a.DB.Where("id = ?", orgID).First(&org).Error; err != nil {
 		return "", "", "", err
 	}
 
-	appID := a.Config.WhatsApp.AppID
-	appSecret := a.Config.WhatsApp.AppSecret
-	configID := a.Config.WhatsApp.ConfigID
+	var appID, appSecret, configID, encryptionKey string
+	if a.Config != nil {
+		appID = a.Config.WhatsApp.AppID
+		appSecret = a.Config.WhatsApp.AppSecret
+		configID = a.Config.WhatsApp.ConfigID
+		encryptionKey = a.Config.App.EncryptionKey
+	}
 
 	if org.Settings != nil {
 		if v, ok := org.Settings["meta_app_id"].(string); ok && v != "" {
@@ -554,16 +812,92 @@ func (a *App) resolveMetaAppCreds(orgID uuid.UUID) (string, string, string, erro
 			configID = v
 		}
 		if v, ok := org.Settings["meta_app_secret_encrypted"].(string); ok && v != "" {
-			decrypted, err := crypto.Decrypt(v, a.Config.App.EncryptionKey)
-			if err == nil && decrypted != "" {
-				appSecret = decrypted
-			} else if err != nil {
-				a.Log.Error("Failed to decrypt meta app secret from organization settings", "error", err)
+			if crypto.IsEncrypted(v) &&
+				strings.TrimSpace(encryptionKey) == "" {
+				return "", "", "", errors.New("Meta credential encryption key is not configured")
 			}
+			decrypted, err := crypto.Decrypt(v, encryptionKey)
+			if err != nil {
+				a.Log.Error("Failed to decrypt meta app secret from organization settings", "error", err)
+				return "", "", "", errors.New("Meta credential could not be decrypted")
+			}
+			if strings.TrimSpace(decrypted) == "" {
+				return "", "", "", errors.New("Meta credential is empty")
+			}
+			appSecret = decrypted
 		}
 	}
 
 	return appID, appSecret, configID, nil
+}
+
+// resolveEffectiveMetaAppCreds resolves the live organization-level Meta app
+// credentials for an account. Once an Integration Center row exists, that row
+// is authoritative (including disabled or incomplete states) and legacy
+// account columns are never consulted. Organizations that have never opted in
+// retain a read-only fallback to their existing account values.
+func (a *App) resolveEffectiveMetaAppCreds(account *models.WhatsAppAccount) (appID, appSecret, configID string, err error) {
+	if account == nil || account.OrganizationID == uuid.Nil {
+		return "", "", "", errors.New("WhatsApp account organization is required")
+	}
+	if a.rlsEnabled() && (!a.hasTenantScope() || a.tenantOrgID != account.OrganizationID) {
+		err = a.WithTenantApp(account.OrganizationID, func(scoped *App) error {
+			var scopedErr error
+			appID, appSecret, configID, scopedErr = scoped.resolveEffectiveMetaAppCredsScoped(account)
+			return scopedErr
+		})
+		return appID, appSecret, configID, err
+	}
+	return a.resolveEffectiveMetaAppCredsScoped(account)
+}
+
+func (a *App) resolveEffectiveMetaAppCredsScoped(account *models.WhatsAppAccount) (appID, appSecret, configID string, err error) {
+	appID, appSecret, configID, err = a.resolveMetaAppCreds(account.OrganizationID)
+	if err != nil {
+		return "", "", "", err
+	}
+	managed, err := a.metaIntegrationManaged(account.OrganizationID)
+	if err != nil {
+		return "", "", "", err
+	}
+	if managed {
+		return appID, appSecret, configID, nil
+	}
+
+	if strings.TrimSpace(appID) == "" {
+		appID = strings.TrimSpace(account.AppID)
+	}
+	if strings.TrimSpace(appSecret) == "" {
+		appSecret, err = a.decryptLegacyMetaAccountSecret(account.AppSecret)
+		if err != nil {
+			return "", "", "", err
+		}
+	}
+	return appID, appSecret, configID, nil
+}
+
+func (a *App) metaIntegrationManaged(orgID uuid.UUID) (bool, error) {
+	var count int64
+	err := a.DB.Model(&models.ProviderIntegration{}).
+		Where("organization_id = ? AND provider = ?", orgID, integrationProviderMeta).
+		Count(&count).Error
+	return count > 0, err
+}
+
+func (a *App) decryptLegacyMetaAccountSecret(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || !crypto.IsEncrypted(value) {
+		return value, nil
+	}
+	key := a.integrationEncryptionKey()
+	if strings.TrimSpace(key) == "" {
+		return "", errAccountEncryptionUnavailable
+	}
+	decrypted, err := crypto.Decrypt(value, key)
+	if err != nil {
+		return "", errors.New("legacy Meta app credential could not be decrypted")
+	}
+	return strings.TrimSpace(decrypted), nil
 }
 
 // ExchangeToken exchanges the temporary code for a permanent access token and creates the account
@@ -592,32 +926,47 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	if req.Code == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Code is required", nil, "")
 	}
+	if strings.TrimSpace(req.WebhookVerifyToken) != "" {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Meta Webhook Verify Token is managed in Settings > Integrations",
+			nil,
+			"",
+		)
+	}
+	if !a.hasIntegrationEncryptionKey() {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+	}
 
 	// 1. Resolve Meta credentials for this org
 	appID, appSecret, _, err := a.resolveMetaAppCreds(orgID)
 	if err != nil {
+		if errors.Is(err, errMetaIntegrationDisabled) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Meta integration is disabled", nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resolve credentials", nil, "")
 	}
 
 	// 2. Exchange code for user access token using WhatsApp service
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(requestContext(r), 60*time.Second)
+	defer cancel()
 	a.Log.Info("Exchanging code for access token")
 
 	accessToken, err := a.WhatsApp.ExchangeCodeForToken(ctx, req.Code,
 		appID, appSecret, a.Config.WhatsApp.APIVersion)
 	if err != nil {
-		a.Log.Error("Failed to exchange token", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+		a.Log.Warn("Meta authorization code exchange was rejected")
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Meta authorization code exchange failed", nil, "")
 	}
 
 	// DISCOVERY: If IDs are missing, try to find them using the token
-	phoneID, wabaID, name, err := a.discoverWABAAndPhone(ctx, orgID, accessToken, req.PhoneID, req.WABAID, req.Name)
+	phoneID, wabaID, name, tokenExpiresAt, err := a.discoverWABAAndPhone(ctx, orgID, accessToken, req.PhoneID, req.WABAID, req.Name)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 
 	// 3. We can now create/update the account
-	account, phoneInfo, existingAccount, oldAccount, err := a.createOrUpdateAccount(ctx, orgID, phoneID, wabaID, name, req.WebhookVerifyToken, accessToken, appSecret)
+	account, phoneInfo, existingAccount, oldAccount, err := a.createOrUpdateAccount(ctx, orgID, phoneID, wabaID, name, accessToken, tokenExpiresAt)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, err.Error(), nil, "")
 	}
@@ -629,21 +978,48 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	}
 	regErr := a.attemptAutoRegistration(ctx, account, phoneInfo, accessToken, priorStatus)
 
-	// 5. Subscribe app to WABA webhooks
-	if err := a.WhatsApp.SubscribeApp(ctx, a.toWhatsAppAccount(account)); err != nil {
-		a.Log.Error("Failed to subscribe app to WABA", "error", err)
+	// 5. Persist the account in a non-ready state before attempting the remote
+	// subscription. This ensures a successful provider-side subscription always
+	// has a local row that can be reconciled or retried.
+	registrationStatus := account.Status
+	subscriptionSuccessStatus := registrationStatus
+	subscriptionFailureStatus := registrationStatus
+	if regErr == nil && registrationStatus == "active" {
+		account.Status = "pending_subscription"
+		subscriptionSuccessStatus = "active"
+		subscriptionFailureStatus = "subscription_failed"
 	}
+	subscriptionAccount := a.toWhatsAppAccount(account)
 
 	// 6. Encrypt credentials at rest
 	plaintextPin := account.Pin
 	if err := a.encryptAccountSecrets(account); err != nil {
 		a.Log.Error("Failed to encrypt account secrets", "error", err)
+		if errors.Is(err, errAccountEncryptionUnavailable) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, err.Error(), nil, "")
 	}
 
 	if err := a.DB.Save(account).Error; err != nil {
 		a.Log.Error("Failed to save account", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save account", nil, "")
+	}
+
+	// 7. Subscribe and persist the true readiness outcome. Registration failures
+	// remain pending_registration; otherwise subscription success/failure is
+	// represented as active/subscription_failed.
+	subscriptionErr, statusErr := a.subscribeAndPersistWhatsAppStatus(
+		ctx,
+		orgID,
+		account,
+		subscriptionAccount,
+		subscriptionSuccessStatus,
+		subscriptionFailureStatus,
+	)
+	if statusErr != nil {
+		a.Log.Error("Failed to persist embedded signup subscription readiness", "error", statusErr, "account_id", account.ID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Account saved, but webhook subscription status could not be recorded", nil, "")
 	}
 
 	// Invalidate cache
@@ -655,7 +1031,9 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 		"status", account.Status)
 
 	// Audit Logging
-	a.DB.Preload("CreatedBy").Preload("UpdatedBy").First(account, "id = ?", account.ID)
+	a.DB.Preload("CreatedBy").Preload("UpdatedBy").
+		Where("id = ? AND organization_id = ?", account.ID, orgID).
+		First(account)
 	auditAction := models.AuditActionCreated
 	var auditOld any = nil
 	if existingAccount {
@@ -672,69 +1050,65 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	if account.Status == "active" && plaintextPin != "" {
 		out["pin"] = plaintextPin
 	}
+	warnings := make([]string, 0, 2)
 	if regErr != nil {
-		out["warning"] = "Registration failed: " + regErr.Error()
+		warnings = append(warnings, "Registration failed: "+regErr.Error())
+	}
+	if subscriptionErr != nil {
+		warnings = append(warnings, "Webhook subscription failed; use the account Subscribe action after checking Meta permissions")
+	}
+	if len(warnings) > 0 {
+		out["warning"] = strings.Join(warnings, "; ")
 	}
 
 	return r.SendEnvelope(out)
 }
 
-func (a *App) discoverWABAAndPhone(ctx context.Context, orgID uuid.UUID, accessToken, phoneID, wabaID, name string) (string, string, string, error) {
-	if phoneID != "" && wabaID != "" {
-		return phoneID, wabaID, name, nil
-	}
+func (a *App) discoverWABAAndPhone(ctx context.Context, orgID uuid.UUID, accessToken, phoneID, wabaID, name string) (string, string, string, *time.Time, error) {
+	a.Log.Info("Validating embedded signup token via debug_token")
 
-	a.Log.Info("Missing PhoneID/WABAID, attempting discovery via debug_token")
-
-	// 1. Resolve Meta credentials for this org
-	appID, appSecret, _, err := a.resolveMetaAppCreds(orgID)
+	debugInfo, tokenExpiresAt, err := a.debugAndValidateMetaAccessToken(ctx, orgID, accessToken)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", nil, err
 	}
-
-	appAccessToken := fmt.Sprintf("%s|%s", appID, appSecret)
-
-	debugInfo, err := a.WhatsApp.GetTokenDebugInfo(ctx, accessToken, appAccessToken)
-	if err != nil {
-		a.Log.Error("Failed to debug token", "error", err)
-		return "", "", "", fmt.Errorf("failed to validate token details: %w", err)
-	}
-
-	// 2. Find WABA ID from Granular Scopes
-	var discoveredWABAID string
-	for _, scope := range debugInfo.GranularScopes {
-		if scope.Scope == "whatsapp_business_management" {
-			if len(scope.TargetIds) > 0 {
-				discoveredWABAID = scope.TargetIds[0]
-				break
+	if wabaID == "" {
+		// 2. Find WABA ID from Granular Scopes only when Embedded Signup did
+		// not already provide one. A supplied ID is still validated below.
+		var discoveredWABAID string
+		for _, scope := range debugInfo.GranularScopes {
+			if scope.Scope == "whatsapp_business_management" {
+				if len(scope.TargetIds) > 0 {
+					discoveredWABAID = scope.TargetIds[0]
+					break
+				}
 			}
 		}
-	}
 
-	if discoveredWABAID == "" {
-		a.Log.Warn("No WABA ID found in granular scopes, falling back to /me/accounts strategy")
-		sharedInfo, err := a.WhatsApp.GetSharedWABA(ctx, accessToken)
-		if err == nil && len(sharedInfo.Data) > 0 {
-			discoveredWABAID = sharedInfo.Data[0].ID
+		if discoveredWABAID == "" {
+			a.Log.Warn("No WABA ID found in granular scopes, falling back to /me/accounts strategy")
+			sharedInfo, err := a.WhatsApp.GetSharedWABA(ctx, accessToken)
+			if err == nil && len(sharedInfo.Data) > 0 {
+				discoveredWABAID = sharedInfo.Data[0].ID
+			}
 		}
-	}
 
-	if discoveredWABAID == "" {
-		return "", "", "", fmt.Errorf("could not discover WhatsApp Business Account ID from token")
-	}
+		if discoveredWABAID == "" {
+			return "", "", "", nil, fmt.Errorf("could not discover WhatsApp Business Account ID from token")
+		}
 
-	wabaID = discoveredWABAID
-	a.Log.Info("Discovered WABA ID", "waba_id", wabaID)
+		wabaID = discoveredWABAID
+		a.Log.Info("Discovered WABA ID", "waba_id", wabaID)
+	}
 
 	if phoneID == "" {
 		phonesResp, err := a.WhatsApp.GetWABAPhoneNumbers(ctx, wabaID, accessToken)
 		if err != nil {
 			a.Log.Error("Failed to fetch phone numbers from Meta", "error", err)
-			return "", "", "", fmt.Errorf("failed to fetch phone numbers from WABA: %w", err)
+			return "", "", "", nil, fmt.Errorf("failed to fetch phone numbers from WABA: %w", err)
 		}
 
 		if len(phonesResp.Data) == 0 {
-			return "", "", "", fmt.Errorf("no phone numbers found in this WhatsApp Business Account")
+			return "", "", "", nil, fmt.Errorf("no phone numbers found in this WhatsApp Business Account")
 		}
 
 		if len(phonesResp.Data) > 1 {
@@ -748,10 +1122,133 @@ func (a *App) discoverWABAAndPhone(ctx context.Context, orgID uuid.UUID, accessT
 		a.Log.Info("Discovered Phone ID", "phone_id", phoneID)
 	}
 
-	return phoneID, wabaID, name, nil
+	// Even when the browser supplied both IDs, verify the token can read each
+	// object and that Meta lists this exact Phone ID under this exact WABA.
+	// This prevents Embedded Signup payloads from bypassing the same contract
+	// enforced by manual account creation and credential updates.
+	if _, err := a.validateWhatsAppAccountContract(
+		ctx,
+		phoneID,
+		wabaID,
+		accessToken,
+		a.defaultAPIVersion(),
+	); err != nil {
+		return "", "", "", nil, err
+	}
+
+	return phoneID, wabaID, name, tokenExpiresAt, nil
 }
 
-func (a *App) createOrUpdateAccount(ctx context.Context, orgID uuid.UUID, phoneID, wabaID, name, webhookVerifyToken, accessToken, appSecret string) (*models.WhatsAppAccount, *whatsapp.PhoneNumberInfo, bool, *models.WhatsAppAccount, error) {
+func (a *App) debugAndValidateMetaAccessToken(
+	ctx context.Context,
+	orgID uuid.UUID,
+	accessToken string,
+) (*whatsapp.TokenDebugInfo, *time.Time, error) {
+	appID, appSecret, _, err := a.resolveMetaAppCreds(orgID)
+	if err != nil {
+		if errors.Is(err, errMetaIntegrationDisabled) {
+			return nil, nil, err
+		}
+		a.Log.Error("Failed to resolve Meta integration for access token validation")
+		return nil, nil, errMetaTokenValidationUnavailable
+	}
+	if strings.TrimSpace(appID) == "" {
+		return nil, nil, errMetaAppIDNotConfigured
+	}
+	if strings.TrimSpace(appSecret) == "" {
+		return nil, nil, errMetaAppSecretNotConfigured
+	}
+	if a.WhatsApp == nil {
+		return nil, nil, errMetaTokenValidationUnavailable
+	}
+
+	debugInfo, err := a.WhatsApp.GetTokenDebugInfo(
+		ctx,
+		accessToken,
+		fmt.Sprintf("%s|%s", appID, appSecret),
+	)
+	if err != nil {
+		// GetTokenDebugInfo must place input_token in Meta's required query
+		// parameter. Transport errors can echo that URL, so never attach the raw
+		// error to logs or client responses.
+		a.Log.Warn("Meta access token validation request failed")
+		return nil, nil, errMetaTokenValidationUnavailable
+	}
+	tokenExpiresAt, err := validateMetaEmbeddedSignupToken(
+		debugInfo,
+		appID,
+		time.Now().UTC(),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return debugInfo, tokenExpiresAt, nil
+}
+
+func (a *App) sendMetaTokenPreflightError(r *fastglue.Request, err error) error {
+	switch {
+	case errors.Is(err, errMetaIntegrationDisabled):
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Meta integration is disabled", nil, "")
+	case errors.Is(err, errMetaAppIDNotConfigured),
+		errors.Is(err, errMetaAppSecretNotConfigured),
+		errors.Is(err, errMetaTokenValidationUnavailable):
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Meta access token validation is unavailable; check Settings > Integrations",
+			nil,
+			"",
+		)
+	default:
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+}
+
+func validateMetaEmbeddedSignupToken(
+	info *whatsapp.TokenDebugInfo,
+	expectedAppID string,
+	now time.Time,
+) (*time.Time, error) {
+	if info == nil || !info.IsValid {
+		return nil, errors.New("Meta returned an invalid embedded signup token")
+	}
+	if strings.TrimSpace(info.AppID) == "" || strings.TrimSpace(info.AppID) != strings.TrimSpace(expectedAppID) {
+		return nil, errors.New("The embedded signup token was issued to a different Meta app")
+	}
+	scopes := make(map[string]struct{}, len(info.Scopes)+len(info.GranularScopes))
+	for _, scope := range info.Scopes {
+		scopes[strings.TrimSpace(scope)] = struct{}{}
+	}
+	for _, scope := range info.GranularScopes {
+		scopes[strings.TrimSpace(scope.Scope)] = struct{}{}
+	}
+	for _, required := range []string{
+		"business_management",
+		"whatsapp_business_management",
+		"whatsapp_business_messaging",
+	} {
+		if _, ok := scopes[required]; !ok {
+			return nil, fmt.Errorf("The embedded signup token is missing the required %s permission", required)
+		}
+	}
+
+	var earliest *time.Time
+	for _, unixSeconds := range []int64{info.ExpiresAt, info.DataAccessExpiresAt} {
+		if unixSeconds <= 0 {
+			continue
+		}
+		candidate := time.Unix(unixSeconds, 0).UTC()
+		if !candidate.After(now.UTC()) {
+			return nil, errors.New("The embedded signup token or its data access has expired")
+		}
+		if earliest == nil || candidate.Before(*earliest) {
+			value := candidate
+			earliest = &value
+		}
+	}
+	return earliest, nil
+}
+
+func (a *App) createOrUpdateAccount(ctx context.Context, orgID uuid.UUID, phoneID, wabaID, name, accessToken string, tokenExpiresAt *time.Time) (*models.WhatsAppAccount, *whatsapp.PhoneNumberInfo, bool, *models.WhatsAppAccount, error) {
 	var account models.WhatsAppAccount
 	var existingAccount bool
 	var oldAccount *models.WhatsAppAccount
@@ -786,15 +1283,6 @@ func (a *App) createOrUpdateAccount(ctx context.Context, orgID uuid.UUID, phoneI
 		}
 	}
 
-	// Generate verify token if needed
-	if webhookVerifyToken == "" {
-		if existingAccount {
-			webhookVerifyToken = account.WebhookVerifyToken
-		} else {
-			webhookVerifyToken = generateVerifyToken()
-		}
-	}
-
 	var isSMB bool
 	if phoneInfo != nil {
 		if phoneInfo.IsOnBizApp || phoneInfo.PlatformType == "SMB" || phoneInfo.PlatformType == "SMB_CLOUD_API" {
@@ -807,18 +1295,15 @@ func (a *App) createOrUpdateAccount(ctx context.Context, orgID uuid.UUID, phoneI
 	account.PhoneID = phoneID
 	account.BusinessID = wabaID
 	account.AccessToken = accessToken
-	account.AppSecret = appSecret
-	account.WebhookVerifyToken = webhookVerifyToken
+	account.AccessTokenExpiresAt = tokenExpiresAt
 	if !existingAccount {
 		account.Status = "pending_registration"
 	}
 	account.IsSMB = isSMB
 
-	// Only fill account.AppID / APIVersion if empty
-	if account.AppID == "" {
-		appID, _, _, _ := a.resolveMetaAppCreds(orgID)
-		account.AppID = appID
-	}
+	// App ID and App Secret remain organization-level Integration Center
+	// settings. Existing legacy values are left untouched, while new Embedded
+	// Signup rows deliberately keep both account columns empty.
 	if account.APIVersion == "" {
 		account.APIVersion = a.defaultAPIVersion()
 	}
@@ -900,7 +1385,8 @@ func (a *App) RegisterPhoneNumber(r *fastglue.Request) error {
 		}
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(requestContext(r), 30*time.Second)
+	defer cancel()
 
 	// Check if this is an SMB phone — SMB numbers are already registered
 	// via the Business App and don't support the two-step registration API.
@@ -922,6 +1408,9 @@ func (a *App) RegisterPhoneNumber(r *fastglue.Request) error {
 	// Encrypt secrets before saving
 	if err := a.encryptAccountSecrets(account); err != nil {
 		a.Log.Error("Failed to encrypt account secrets", "error", err)
+		if errors.Is(err, errAccountEncryptionUnavailable) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, err.Error(), nil, "")
 	}
 
@@ -964,6 +1453,17 @@ func (a *App) defaultAPIVersion() string {
 }
 
 func (a *App) encryptAccountSecrets(account *models.WhatsAppAccount) error {
-	return crypto.EncryptFields(a.Config.App.EncryptionKey,
+	if account == nil {
+		return errors.New("account is required")
+	}
+	encryptionKey := a.integrationEncryptionKey()
+	if strings.TrimSpace(encryptionKey) == "" {
+		for _, value := range []string{account.AccessToken, account.AppSecret, account.Pin} {
+			if strings.TrimSpace(value) != "" && !crypto.IsEncrypted(value) {
+				return errAccountEncryptionUnavailable
+			}
+		}
+	}
+	return crypto.EncryptFields(encryptionKey,
 		&account.AccessToken, &account.AppSecret, &account.Pin)
 }

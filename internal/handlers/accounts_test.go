@@ -143,6 +143,8 @@ func TestApp_CreateAccount_Success(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
+	meta := enableValidManualAccountTokenPreflight(t, app)
+	allowMetaAccountRelationship(meta, "123456789")
 	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
@@ -168,8 +170,9 @@ func TestApp_CreateAccount_Success(t *testing.T) {
 	assert.Equal(t, "active", resp.Data.Status)
 	assert.Equal(t, "v21.0", resp.Data.APIVersion) // default version
 	assert.True(t, resp.Data.HasAccessToken)
-	assert.NotEmpty(t, resp.Data.WebhookVerifyToken) // auto-generated
+	assert.NotNil(t, resp.Data.AccessTokenExpiresAt)
 	assert.NotEqual(t, uuid.Nil, resp.Data.ID)
+	assert.NotContains(t, string(testutil.GetResponseBody(req)), "webhook_verify_token")
 }
 
 func TestApp_CreateAccount_WithOptionalFields(t *testing.T) {
@@ -177,20 +180,19 @@ func TestApp_CreateAccount_WithOptionalFields(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
+	meta := enableValidManualAccountTokenPreflight(t, app)
+	allowMetaAccountRelationship(meta, "111222333")
 	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"name":                 "Full Account",
-		"phone_id":             "111222333",
-		"business_id":          "444555666",
-		"access_token":         "my-token",
-		"app_id":               "my-app-id",
-		"app_secret":           "my-app-secret",
-		"webhook_verify_token": "custom-verify-token",
-		"api_version":          "v19.0",
-		"is_default_incoming":  true,
-		"is_default_outgoing":  true,
-		"auto_read_receipt":    true,
+		"name":                "Full Account",
+		"phone_id":            "111222333",
+		"business_id":         "444555666",
+		"access_token":        "my-token",
+		"api_version":         "v19.0",
+		"is_default_incoming": true,
+		"is_default_outgoing": true,
+		"auto_read_receipt":   true,
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 
@@ -204,14 +206,45 @@ func TestApp_CreateAccount_WithOptionalFields(t *testing.T) {
 	err = json.Unmarshal(testutil.GetResponseBody(req), &resp)
 	require.NoError(t, err)
 	assert.Equal(t, "Full Account", resp.Data.Name)
-	assert.Equal(t, "my-app-id", resp.Data.AppID)
-	assert.Equal(t, "custom-verify-token", resp.Data.WebhookVerifyToken)
 	assert.Equal(t, "v19.0", resp.Data.APIVersion)
 	assert.True(t, resp.Data.IsDefaultIncoming)
 	assert.True(t, resp.Data.IsDefaultOutgoing)
 	assert.True(t, resp.Data.AutoReadReceipt)
 	assert.True(t, resp.Data.HasAccessToken)
-	assert.True(t, resp.Data.HasAppSecret)
+
+	var raw struct {
+		Data map[string]any `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &raw))
+	assert.NotContains(t, raw.Data, "app_id")
+	assert.NotContains(t, raw.Data, "has_app_secret")
+}
+
+func TestApp_CreateAccount_RejectsAppCredentialsManagedByIntegrationCenter(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
+
+	for _, field := range []string{"app_id", "app_secret", "webhook_verify_token"} {
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"name":         "Deprecated credentials " + field,
+			"phone_id":     "phone-" + field,
+			"business_id":  "business-" + field,
+			"access_token": "test-access-token",
+			field:          "must-not-be-stored",
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		require.NoError(t, app.CreateAccount(req))
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "managed in Settings > Integrations")
+	}
+
+	var count int64
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+		Where("organization_id = ?", org.ID).Count(&count).Error)
+	assert.Zero(t, count)
 }
 
 func TestApp_CreateAccount_ValidationErrors(t *testing.T) {
@@ -388,6 +421,8 @@ func TestApp_UpdateAccount_Success(t *testing.T) {
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
+	meta := enableValidManualAccountTokenPreflight(t, app)
+	allowMetaAccountRelationship(meta, "new-phone-id")
 	user := createAdminUser(t, app, org.ID)
 	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
 
@@ -426,6 +461,7 @@ func TestApp_UpdateAccount_Success(t *testing.T) {
 	assert.Equal(t, "new-phone-id", updated.PhoneID)
 	updated.DecryptSecrets(app.Config.App.EncryptionKey)
 	assert.Equal(t, "new-access-token", updated.AccessToken)
+	assert.NotNil(t, updated.AccessTokenExpiresAt)
 }
 
 func TestApp_UpdateAccount_PartialUpdate(t *testing.T) {
@@ -457,6 +493,33 @@ func TestApp_UpdateAccount_PartialUpdate(t *testing.T) {
 	assert.Equal(t, account.PhoneID, resp.Data.PhoneID)
 	assert.Equal(t, account.BusinessID, resp.Data.BusinessID)
 	assert.Equal(t, account.APIVersion, resp.Data.APIVersion)
+}
+
+func TestApp_UpdateAccount_RejectsAppCredentialsAndPreservesLegacyValues(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	account.AppID = "legacy-app-id"
+	account.AppSecret = "legacy-app-secret"
+	require.NoError(t, app.DB.Save(account).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"app_id":     "replacement-app-id",
+		"app_secret": "replacement-app-secret",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", account.ID.String())
+
+	require.NoError(t, app.UpdateAccount(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "managed in Settings > Integrations")
+
+	var persisted models.WhatsAppAccount
+	require.NoError(t, app.DB.First(&persisted, "id = ?", account.ID).Error)
+	assert.Equal(t, "legacy-app-id", persisted.AppID)
+	assert.Equal(t, "legacy-app-secret", persisted.AppSecret)
 }
 
 func TestApp_UpdateAccount_NotFound(t *testing.T) {

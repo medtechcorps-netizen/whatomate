@@ -419,8 +419,8 @@ func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 // If a post-call IVR flow (is_outgoing_end) is configured for the session's
 // WhatsApp account, the agent side is torn down but the WhatsApp leg stays
 // open so the contact can hear the IVR.
-func (m *Manager) HangupOutgoingCall(callLogID, agentID uuid.UUID) error {
-	session := m.GetSessionByCallLogID(callLogID)
+func (m *Manager) HangupOutgoingCall(organizationID, callLogID, agentID uuid.UUID) error {
+	session := m.getSessionByOrganizationAndCallLogID(organizationID, callLogID)
 	if session == nil {
 		return fmt.Errorf("session not found for call log %s", callLogID)
 	}

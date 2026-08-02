@@ -23,6 +23,9 @@ type AuditLogResponse struct {
 }
 
 func auditChangesForResponse(resourceType string, changes models.JSONBArray) models.JSONBArray {
+	if resourceType == ivrFlowAuditResourceType {
+		return redactIVRAuditChanges(changes)
+	}
 	if resourceType != models.ResourceSettingsChatbotAI {
 		return changes
 	}
