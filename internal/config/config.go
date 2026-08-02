@@ -16,19 +16,33 @@ import (
 
 // Config holds all configuration for the application
 type Config struct {
-	App          AppConfig          `koanf:"app"`
-	Server       ServerConfig       `koanf:"server"`
-	Database     DatabaseConfig     `koanf:"database"`
-	Redis        RedisConfig        `koanf:"redis"`
-	JWT          JWTConfig          `koanf:"jwt"`
-	WhatsApp     WhatsAppConfig     `koanf:"whatsapp"`
-	AI           AIConfig           `koanf:"ai"`
-	Storage      StorageConfig      `koanf:"storage"`
-	DefaultAdmin DefaultAdminConfig `koanf:"default_admin"`
-	RateLimit    RateLimitConfig    `koanf:"rate_limit"`
-	Cookie       CookieConfig       `koanf:"cookie"`
-	Calling      CallingConfig      `koanf:"calling"`
-	TTS          TTSConfig          `koanf:"tts"`
+	App                 AppConfig                 `koanf:"app"`
+	Server              ServerConfig              `koanf:"server"`
+	Database            DatabaseConfig            `koanf:"database"`
+	Redis               RedisConfig               `koanf:"redis"`
+	JWT                 JWTConfig                 `koanf:"jwt"`
+	WhatsApp            WhatsAppConfig            `koanf:"whatsapp"`
+	AI                  AIConfig                  `koanf:"ai"`
+	Storage             StorageConfig             `koanf:"storage"`
+	DefaultAdmin        DefaultAdminConfig        `koanf:"default_admin"`
+	RateLimit           RateLimitConfig           `koanf:"rate_limit"`
+	Cookie              CookieConfig              `koanf:"cookie"`
+	Calling             CallingConfig             `koanf:"calling"`
+	TTS                 TTSConfig                 `koanf:"tts"`
+	GoogleSearchConsole GoogleSearchConsoleConfig `koanf:"google_search_console"`
+}
+
+// GoogleSearchConsoleConfig contains deployment-managed OAuth credentials.
+// Tenants authorize access but never supply or receive these platform secrets.
+// AuthURL, TokenURL, and APIBaseURL are configurable for isolated tests and
+// private proxies; production deployments should use the defaults.
+type GoogleSearchConsoleConfig struct {
+	ClientID     string `koanf:"client_id"`
+	ClientSecret string `koanf:"client_secret"`
+	RedirectURL  string `koanf:"redirect_url"`
+	AuthURL      string `koanf:"auth_url"`
+	TokenURL     string `koanf:"token_url"`
+	APIBaseURL   string `koanf:"api_base_url"`
 }
 
 type TTSConfig struct {
@@ -286,6 +300,15 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.AI.QwenBaseURL == "" {
 		cfg.AI.QwenBaseURL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+	}
+	if cfg.GoogleSearchConsole.AuthURL == "" {
+		cfg.GoogleSearchConsole.AuthURL = "https://accounts.google.com/o/oauth2/auth"
+	}
+	if cfg.GoogleSearchConsole.TokenURL == "" {
+		cfg.GoogleSearchConsole.TokenURL = "https://oauth2.googleapis.com/token"
+	}
+	if cfg.GoogleSearchConsole.APIBaseURL == "" {
+		cfg.GoogleSearchConsole.APIBaseURL = "https://www.googleapis.com/webmasters/v3"
 	}
 	if cfg.Storage.Type == "" {
 		cfg.Storage.Type = "local"

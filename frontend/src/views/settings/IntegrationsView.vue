@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import {
   Activity,
   AtSign,
@@ -18,6 +18,7 @@ import {
   Music2,
   RefreshCw,
   Save,
+  Search,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -51,6 +52,7 @@ import { ConfirmDialog, PageHeader } from "@/components/shared";
 import IntegrationProviderCard, {
   type ProviderCardDefinition,
 } from "@/components/integrations/IntegrationProviderCard.vue";
+import GoogleSearchConsoleDialog from "@/components/integrations/GoogleSearchConsoleDialog.vue";
 import {
   integrationReadiness as buildIntegrationReadiness,
   type IntegrationReadinessState,
@@ -328,6 +330,27 @@ const definitions: Record<IntegrationProvider, IntegrationDefinition> = {
       },
     ],
   },
+  google_search_console: {
+    provider: "google_search_console",
+    name: "Google Search Console",
+    eyebrow: "Search intelligence",
+    description:
+      "Measure how verified website properties perform across Google Search surfaces.",
+    icon: Search,
+    accent: "#4285f4",
+    glow: "linear-gradient(145deg, #173f6d, #2c67a2)",
+    capabilities: [
+      "Google clicks",
+      "Impressions & CTR",
+      "Queries & pages",
+      "Average position",
+    ],
+    resourceLabel: "Properties",
+    credentialSummary: "Google OAuth",
+    connectLabel: "Connect Google",
+    fields: [],
+    secrets: [],
+  },
   email: {
     provider: "email",
     name: "Email",
@@ -367,11 +390,13 @@ const providerOrder: IntegrationProvider[] = [
   "threads",
   "tiktok",
   "qwen",
+  "google_search_console",
   "email",
   "webchat",
 ];
 
 const router = useRouter();
+const route = useRoute();
 const authStore = useAuthStore();
 const integrations = ref<IntegrationState[]>([]);
 const isLoading = ref(true);
@@ -379,6 +404,7 @@ const loadError = ref("");
 const isRefreshing = ref(false);
 const selectedProvider = ref<IntegrationProvider | null>(null);
 const isDialogOpen = ref(false);
+const isSearchConsoleDialogOpen = ref(false);
 const isRemoveOpen = ref(false);
 const activeAction = ref<"save" | "test" | "connect" | "remove" | null>(null);
 const configDraft = reactive<Record<string, string>>({});
@@ -548,6 +574,10 @@ function openConfiguration(provider: IntegrationProvider) {
     return;
 
   selectedProvider.value = provider;
+  if (provider === "google_search_console") {
+    isSearchConsoleDialogOpen.value = true;
+    return;
+  }
   enabledDraft.value = integration.enabled;
   Object.keys(configDraft).forEach((key) => delete configDraft[key]);
   Object.keys(secretDraft).forEach((key) => delete secretDraft[key]);
@@ -860,7 +890,32 @@ watch(isDialogOpen, (open) => {
   }
 });
 
-onMounted(() => loadIntegrations());
+async function handleSearchConsoleOAuthReturn() {
+  const rawOutcome = route.query.google_search_console;
+  if (rawOutcome == null) return;
+  const outcome = Array.isArray(rawOutcome) ? rawOutcome[0] : rawOutcome;
+
+  const nextQuery = { ...route.query };
+  delete nextQuery.google_search_console;
+  await router.replace({ query: nextQuery });
+
+  if (outcome === "connected") {
+    toast.success("Google Search Console connected");
+    selectedProvider.value = "google_search_console";
+    isSearchConsoleDialogOpen.value = true;
+  } else if (outcome === "cancelled") {
+    toast.info("Google authorization was cancelled. No changes were made.");
+  } else if (outcome === "error") {
+    toast.error(
+      "Google authorization was not completed. Try connecting again.",
+    );
+  }
+}
+
+onMounted(async () => {
+  await loadIntegrations();
+  await handleSearchConsoleOAuthReturn();
+});
 </script>
 
 <template>
@@ -994,7 +1049,7 @@ onMounted(() => loadIntegrations());
           aria-label="Loading integrations"
         >
           <div
-            v-for="index in 6"
+            v-for="index in 7"
             :key="index"
             class="rounded-2xl border border-white/[0.08] p-5 light:border-gray-200 light:bg-white"
           >
@@ -1564,6 +1619,15 @@ onMounted(() => loadIntegrations());
         </DialogFooter>
       </DialogContent>
     </Dialog>
+
+    <GoogleSearchConsoleDialog
+      v-if="selectedIntegration?.provider === 'google_search_console'"
+      v-model:open="isSearchConsoleDialogOpen"
+      :integration="selectedIntegration"
+      :can-write="canWrite"
+      :can-view-analytics="authStore.hasPermission('analytics', 'read')"
+      @refresh="loadIntegrations({ quiet: true })"
+    />
 
     <ConfirmDialog
       v-model:open="isRemoveOpen"

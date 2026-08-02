@@ -294,6 +294,12 @@ const router = createRouter({
           meta: { permission: 'analytics' }
         },
         {
+          path: 'analytics/search-visibility',
+          name: 'search-visibility',
+          component: () => import('@/views/analytics/SearchVisibilityView.vue'),
+          meta: { permission: 'analytics' }
+        },
+        {
           path: 'settings',
           name: 'settings',
           component: () => import('@/views/settings/SettingsView.vue'),
@@ -528,6 +534,7 @@ const navigationOrder: NavigationCandidate[] = [
   { path: '/chatbot/transfers', permission: 'transfers' },
   { path: '/analytics/agents', permission: 'analytics.agents' },
   { path: '/analytics/meta-insights', permission: 'analytics' },
+  { path: '/analytics/search-visibility', permission: 'analytics' },
   { path: '/templates', permission: 'templates' },
   { path: '/flows', permission: 'flows.whatsapp' },
   { path: '/campaigns', permission: 'campaigns' },

@@ -5,6 +5,7 @@ export type IntegrationProvider =
   | "threads"
   | "tiktok"
   | "qwen"
+  | "google_search_console"
   | "email"
   | "webchat";
 

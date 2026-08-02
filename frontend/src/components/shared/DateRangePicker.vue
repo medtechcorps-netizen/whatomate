@@ -19,6 +19,8 @@ defineProps<{
   customDateRange: any
   isDatePickerOpen: boolean
   formatDateRangeDisplay: string
+  maxValue?: any
+  todayLabel?: string
 }>()
 
 const emit = defineEmits<{
@@ -41,7 +43,7 @@ const isCompactCalendar = useMediaQuery('(max-width: 639px)')
       <SelectValue :placeholder="t('dateRange.selectRange', 'Date Range')" />
     </SelectTrigger>
     <SelectContent>
-      <SelectItem value="today">{{ t('dateRange.today', 'Today') }}</SelectItem>
+      <SelectItem value="today">{{ todayLabel || t('dateRange.today', 'Today') }}</SelectItem>
       <SelectItem value="7days">{{ t('dateRange.last7Days', 'Last 7 Days') }}</SelectItem>
       <SelectItem value="30days">{{ t('dateRange.last30Days', 'Last 30 Days') }}</SelectItem>
       <SelectItem value="this_month">{{ t('dateRange.thisMonth', 'This Month') }}</SelectItem>
@@ -63,6 +65,7 @@ const isCompactCalendar = useMediaQuery('(max-width: 639px)')
       <div class="space-y-4">
         <RangeCalendar
           :model-value="customDateRange"
+          :max-value="maxValue"
           @update:model-value="emit('update:customDateRange', $event)"
           :number-of-months="isCompactCalendar ? 1 : 2"
         />

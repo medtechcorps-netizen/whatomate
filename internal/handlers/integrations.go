@@ -27,12 +27,13 @@ import (
 )
 
 const (
-	integrationProviderMeta    = "meta"
-	integrationProviderThreads = "threads"
-	integrationProviderTikTok  = "tiktok"
-	integrationProviderQwen    = "qwen"
-	integrationProviderEmail   = "email"
-	integrationProviderWebchat = "webchat"
+	integrationProviderMeta                = "meta"
+	integrationProviderThreads             = "threads"
+	integrationProviderTikTok              = "tiktok"
+	integrationProviderQwen                = "qwen"
+	integrationProviderGoogleSearchConsole = "google_search_console"
+	integrationProviderEmail               = "email"
+	integrationProviderWebchat             = "webchat"
 
 	integrationStatusNotConfigured   = "not_configured"
 	integrationStatusConfigured      = "configured"
@@ -42,6 +43,7 @@ const (
 	integrationStatusApprovalNeeded  = "approval_required"
 	integrationStatusAdapterMissing  = "adapter_unavailable"
 	integrationValidationFailedCode  = "provider_validation_failed"
+	integrationAnalyticsFailedCode   = "provider_analytics_failed"
 	integrationValidationSuccessCode = ""
 
 	metaAppSecretSetting                 = "meta_app_secret_encrypted"
@@ -187,6 +189,14 @@ func (a *App) DeleteIntegrationCredentials(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
+	if provider == integrationProviderGoogleSearchConsole {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusConflict,
+			"Use the Google Search Console disconnect action to remove this workspace's stored authorization safely",
+			nil,
+			"",
+		)
+	}
 	disabled := false
 	request := updateIntegrationRequest{
 		Enabled:          &disabled,
@@ -209,7 +219,7 @@ func (a *App) DeleteIntegrationCredentials(r *fastglue.Request) error {
 // existing Embedded Signup path is currently available; unavailable adapters
 // fail closed rather than issuing an OAuth URL that cannot complete.
 func (a *App) ConnectIntegration(r *fastglue.Request) error {
-	orgID, _, err := a.requireAuth(
+	orgID, userID, err := a.requireAuth(
 		r,
 		models.ResourceSettingsIntegrations,
 		models.ActionWrite,
@@ -226,6 +236,8 @@ func (a *App) ConnectIntegration(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to prepare the integration", nil, "")
 	}
 	switch provider {
+	case integrationProviderGoogleSearchConsole:
+		return a.startGoogleSearchConsoleOAuth(r, orgID, userID)
 	case integrationProviderMeta:
 		if !integration.Enabled {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Enable the Meta integration first", nil, "")
@@ -327,6 +339,9 @@ func (a *App) TestIntegration(r *fastglue.Request) error {
 			"message":  "TikTok Business Messaging approval and an approved adapter are required",
 		})
 	}
+	if provider == integrationProviderGoogleSearchConsole {
+		return a.testGoogleSearchConsole(r, orgID, userID)
+	}
 	if provider != integrationProviderMeta && provider != integrationProviderQwen {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Testing is not supported for this integration", nil, "")
 	}
@@ -388,6 +403,7 @@ func (a *App) integrationResponses(orgID uuid.UUID) ([]IntegrationResponse, erro
 		integrationProviderThreads,
 		integrationProviderTikTok,
 		integrationProviderQwen,
+		integrationProviderGoogleSearchConsole,
 		integrationProviderEmail,
 		integrationProviderWebchat,
 	}
@@ -568,6 +584,55 @@ func (a *App) composeIntegrationResponse(provider string, sources *integrationSo
 			"message.list.send",
 			"message.list.manage",
 		}
+	case integrationProviderGoogleSearchConsole:
+		credential := encryptedCredentialFlag(row, googleSearchConsoleRefreshTokenCredential)
+		platformConfigured := a.googleSearchConsolePlatformConfigured()
+		response.Config = models.JSONB{
+			"platform_configured":     platformConfigured,
+			"property_count":          response.Connection.AccountCount,
+			"selected_property_count": response.Connection.ActiveCount,
+		}
+		response.Credentials[googleSearchConsoleRefreshTokenCredential] = credential
+		response.Configured = credential.Configured
+		if credential.Configured && a.hasIntegrationEncryptionKey() && platformConfigured {
+			_, decryptErr := a.decryptGoogleSearchConsoleRefreshToken(row)
+			response.credentialUsable = decryptErr == nil
+		}
+		response.Config["operations_available"] = response.credentialUsable
+		if row != nil && row.LastErrorMessage != "" {
+			response.Connection.LastError = row.LastErrorMessage
+		}
+		response.OAuth = integrationOAuthResponse{
+			Supported: true,
+			Available: a.googleSearchConsoleOAuthAvailable(),
+			Mode:      "oauth",
+		}
+		response.TestSupported = true
+		response.RequiredScopes = []string{googleSearchConsoleReadOnlyScope}
+		response.Status = integrationOperationalStatus(response, row)
+		blockingProviderError := row != nil && row.LastErrorCode != "" && row.LastErrorCode != integrationAnalyticsFailedCode
+		if blockingProviderError {
+			response.Status = integrationStatusDegraded
+		} else if response.credentialUsable {
+			response.Status = integrationStatusConnected
+		}
+		if response.Configured && response.Connection.ActiveCount == 0 {
+			response.Message = "Select at least one verified website property to enable Search Visibility analytics."
+		}
+		if !platformConfigured {
+			if response.Configured {
+				response.Status = integrationStatusDegraded
+			}
+			response.Message = "Google Search Console OAuth is not configured on this server."
+		} else if !a.hasIntegrationEncryptionKey() {
+			if response.Configured {
+				response.Status = integrationStatusDegraded
+			}
+			response.Message = "Server-side credential encryption is unavailable."
+		} else if response.Configured && !response.credentialUsable {
+			response.Status = integrationStatusDegraded
+			response.Message = "The stored Google authorization is unavailable to this server. Reauthorize Google Search Console."
+		}
 	case integrationProviderEmail, integrationProviderWebchat:
 		response.ReadOnly = true
 		response.Enabled = response.Connection.AccountCount > 0
@@ -609,12 +674,13 @@ func connectionOnlyStatus(connection integrationConnectionResponse) string {
 
 func (a *App) integrationConnectionSummaries(orgID uuid.UUID) (map[string]integrationConnectionResponse, error) {
 	result := map[string]integrationConnectionResponse{
-		integrationProviderMeta:    {},
-		integrationProviderThreads: {},
-		integrationProviderTikTok:  {},
-		integrationProviderQwen:    {},
-		integrationProviderEmail:   {},
-		integrationProviderWebchat: {},
+		integrationProviderMeta:                {},
+		integrationProviderThreads:             {},
+		integrationProviderTikTok:              {},
+		integrationProviderQwen:                {},
+		integrationProviderGoogleSearchConsole: {},
+		integrationProviderEmail:               {},
+		integrationProviderWebchat:             {},
 	}
 	var whatsAppAccounts []models.WhatsAppAccount
 	if err := a.DB.Where("organization_id = ?", orgID).Find(&whatsAppAccounts).Error; err != nil {
@@ -630,6 +696,24 @@ func (a *App) integrationConnectionSummaries(orgID uuid.UUID) (map[string]integr
 		}
 	}
 	result[integrationProviderMeta] = meta
+
+	var googlePropertyCount int64
+	if err := a.DB.Model(&models.GoogleSearchConsoleProperty{}).
+		Where("organization_id = ? AND available = ?", orgID, true).
+		Count(&googlePropertyCount).Error; err != nil {
+		return nil, err
+	}
+	var selectedGooglePropertyCount int64
+	if err := a.DB.Model(&models.GoogleSearchConsoleProperty{}).
+		Where("organization_id = ? AND available = ? AND selected = ?", orgID, true, true).
+		Count(&selectedGooglePropertyCount).Error; err != nil {
+		return nil, err
+	}
+	googleConnection := result[integrationProviderGoogleSearchConsole]
+	googleConnection.AccountCount = int(googlePropertyCount)
+	googleConnection.ActiveCount = int(selectedGooglePropertyCount)
+	googleConnection.PendingCount = int(googlePropertyCount - selectedGooglePropertyCount)
+	result[integrationProviderGoogleSearchConsole] = googleConnection
 
 	var accounts []models.ChannelAccount
 	if err := a.DB.Where("organization_id = ?", orgID).Find(&accounts).Error; err != nil {
@@ -676,6 +760,9 @@ func newestTime(current, candidate *time.Time) *time.Time {
 func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, request updateIntegrationRequest) error {
 	if provider == integrationProviderEmail || provider == integrationProviderWebchat {
 		return &integrationClientError{status: fasthttp.StatusBadRequest, message: "This integration is managed from the Omnichannel Inbox"}
+	}
+	if provider == integrationProviderGoogleSearchConsole {
+		return &integrationClientError{status: fasthttp.StatusBadRequest, message: "Use Connect Google or Disconnect for Google Search Console"}
 	}
 	if request.Enabled != nil && *request.Enabled &&
 		(provider == integrationProviderThreads || provider == integrationProviderTikTok) {
@@ -1144,7 +1231,7 @@ func integrationCredentialNames(provider string) []string {
 func integrationProviderFromRequest(r *fastglue.Request, allowReadOnly bool) (string, error) {
 	provider := strings.ToLower(strings.TrimSpace(stringPathValue(r, "provider")))
 	switch provider {
-	case integrationProviderMeta, integrationProviderThreads, integrationProviderTikTok, integrationProviderQwen:
+	case integrationProviderMeta, integrationProviderThreads, integrationProviderTikTok, integrationProviderQwen, integrationProviderGoogleSearchConsole:
 		return provider, nil
 	case integrationProviderEmail, integrationProviderWebchat:
 		if allowReadOnly {
@@ -1166,6 +1253,8 @@ func integrationDisplayName(provider string) string {
 		return "TikTok Business"
 	case integrationProviderQwen:
 		return "Qwen Copilot"
+	case integrationProviderGoogleSearchConsole:
+		return "Google Search Console"
 	case integrationProviderEmail:
 		return "Email"
 	case integrationProviderWebchat:

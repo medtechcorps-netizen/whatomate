@@ -30,7 +30,8 @@ import {
   Package,
   LockKeyhole,
   LifeBuoy,
-  PlugZap
+  PlugZap,
+  Search
 } from 'lucide-vue-next'
 import type { Component } from 'vue'
 
@@ -250,6 +251,12 @@ export const navigationSections: NavSection[] = [
         name: 'nav.metaInsights',
         path: '/analytics/meta-insights',
         icon: LineChart,
+        permission: 'analytics'
+      },
+      {
+        name: 'nav.searchVisibility',
+        path: '/analytics/search-visibility',
+        icon: Search,
         permission: 'analytics'
       },
     ]

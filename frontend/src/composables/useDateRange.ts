@@ -13,10 +13,14 @@ interface UseDateRangeOptions {
   defaultPreset?: TimeRangePreset
   /** localStorage key for persisting selection. If omitted, no persistence. */
   storageKey?: string
+  /** Move the latest selectable/reportable day behind today (for delayed data sources). */
+  endOffsetDays?: number
+  /** Anchor the reporting day to UTC before applying endOffsetDays. */
+  anchorToUTCDate?: boolean
 }
 
 export function useDateRange(options: UseDateRangeOptions = {}) {
-  const { defaultPreset = 'this_month', storageKey } = options
+  const { defaultPreset = 'this_month', storageKey, endOffsetDays = 0, anchorToUTCDate = false } = options
 
   // Load saved state from localStorage if configured
   const loadSaved = (): { range: TimeRangePreset; customRange: any } => {
@@ -56,8 +60,16 @@ export function useDateRange(options: UseDateRangeOptions = {}) {
     return `${year}-${month}-${day}`
   }
 
+  function reportingAnchor(): Date {
+    const current = new Date()
+    const year = anchorToUTCDate ? current.getUTCFullYear() : current.getFullYear()
+    const month = anchorToUTCDate ? current.getUTCMonth() : current.getMonth()
+    const day = anchorToUTCDate ? current.getUTCDate() : current.getDate()
+    return new Date(year, month, day - Math.max(0, endOffsetDays))
+  }
+
   const dateRange = computed<DateRangeResult>(() => {
-    const now = new Date()
+    const now = reportingAnchor()
     let from: Date
     let to: Date = now
 
@@ -82,6 +94,8 @@ export function useDateRange(options: UseDateRangeOptions = {}) {
         if (customDateRange.value.start && customDateRange.value.end) {
           from = new Date(customDateRange.value.start.year, customDateRange.value.start.month - 1, customDateRange.value.start.day)
           to = new Date(customDateRange.value.end.year, customDateRange.value.end.month - 1, customDateRange.value.end.day)
+          if (to > now) to = new Date(now)
+          if (from > to) from = new Date(to)
         } else {
           from = new Date(now.getFullYear(), now.getMonth(), 1)
           to = new Date(now.getFullYear(), now.getMonth(), now.getDate())
@@ -97,9 +111,9 @@ export function useDateRange(options: UseDateRangeOptions = {}) {
 
   const formatDateRangeDisplay = computed(() => {
     if (selectedRange.value === 'custom' && customDateRange.value.start && customDateRange.value.end) {
-      const s = customDateRange.value.start
-      const e = customDateRange.value.end
-      return `${s.month}/${s.day}/${s.year} - ${e.month}/${e.day}/${e.year}`
+      const [startYear, startMonth, startDay] = dateRange.value.from.split('-').map(Number)
+      const [endYear, endMonth, endDay] = dateRange.value.to.split('-').map(Number)
+      return `${startMonth}/${startDay}/${startYear} - ${endMonth}/${endDay}/${endYear}`
     }
     return ''
   })

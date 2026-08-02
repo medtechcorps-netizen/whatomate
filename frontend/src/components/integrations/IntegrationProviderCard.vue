@@ -34,6 +34,8 @@ export interface ProviderCardDefinition {
   readOnly?: boolean;
   managePath?: string;
   manageLabel?: string;
+  resourceLabel?: string;
+  credentialSummary?: string;
 }
 
 const props = defineProps<{
@@ -257,7 +259,7 @@ function formatRelative(value?: string) {
           class="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-white/30 light:text-gray-400"
         >
           <Activity class="h-3 w-3" aria-hidden="true" />
-          Accounts
+          {{ definition.resourceLabel || "Accounts" }}
         </div>
         <p class="mt-1 text-sm font-semibold text-white/80 light:text-gray-800">
           {{ integration.connection.active_count }} /
@@ -368,7 +370,9 @@ function formatRelative(value?: string) {
             `${configuredCredentialCount}/${credentialCount} secrets stored`
           }}
         </template>
-        <template v-else> Managed channel </template>
+        <template v-else>
+          {{ definition.credentialSummary || "Managed channel" }}
+        </template>
       </span>
 
       <RouterLink

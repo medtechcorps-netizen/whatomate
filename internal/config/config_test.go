@@ -45,6 +45,9 @@ func TestLoad_AppliesDefaultsForMissingFields(t *testing.T) {
 	assert.Equal(t, "v24.0", cfg.WhatsApp.APIVersion)
 	assert.Equal(t, "https://graph.facebook.com", cfg.WhatsApp.BaseURL)
 	assert.Equal(t, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", cfg.AI.QwenBaseURL)
+	assert.Equal(t, "https://accounts.google.com/o/oauth2/auth", cfg.GoogleSearchConsole.AuthURL)
+	assert.Equal(t, "https://oauth2.googleapis.com/token", cfg.GoogleSearchConsole.TokenURL)
+	assert.Equal(t, "https://www.googleapis.com/webmasters/v3", cfg.GoogleSearchConsole.APIBaseURL)
 	assert.Equal(t, "local", cfg.Storage.Type)
 	assert.Equal(t, "./uploads", cfg.Storage.LocalPath)
 	assert.Equal(t, "admin@rereply.app", cfg.DefaultAdmin.Email)
@@ -113,6 +116,9 @@ func TestLoad_EnvVarsOverrideFile(t *testing.T) {
 	t.Setenv("WHATOMATE_DATABASE__RLS_ENABLED", "true")
 	t.Setenv("WHATOMATE_REDIS__URL", "rediss://private-cache/0")
 	t.Setenv("WHATOMATE_SERVER__PORT", "1234")
+	t.Setenv("WHATOMATE_GOOGLE_SEARCH_CONSOLE__CLIENT_ID", "gsc-client")
+	t.Setenv("WHATOMATE_GOOGLE_SEARCH_CONSOLE__CLIENT_SECRET", "gsc-secret")
+	t.Setenv("WHATOMATE_GOOGLE_SEARCH_CONSOLE__REDIRECT_URL", "https://app.example.test/api/integrations/google_search_console/callback")
 
 	cfg, err := config.Load(writeConfig(t, `
 [database]
@@ -129,6 +135,9 @@ port = 8080
 	assert.True(t, cfg.Database.RLSEnabled)
 	assert.Equal(t, "rediss://private-cache/0", cfg.Redis.URL)
 	assert.Equal(t, 1234, cfg.Server.Port, "WHATOMATE_SERVER__PORT must override file")
+	assert.Equal(t, "gsc-client", cfg.GoogleSearchConsole.ClientID)
+	assert.Equal(t, "gsc-secret", cfg.GoogleSearchConsole.ClientSecret)
+	assert.Equal(t, "https://app.example.test/api/integrations/google_search_console/callback", cfg.GoogleSearchConsole.RedirectURL)
 }
 
 func TestLoad_EmptyConfigPathStillLoadsDefaults(t *testing.T) {
