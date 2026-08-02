@@ -458,7 +458,11 @@ func (a *App) redirectGoogleSearchConsoleCallback(r *fastglue.Request, status st
 	}
 	destination := basePath + "/settings/integrations?google_search_console=" + url.QueryEscape(status)
 	r.RequestCtx.Response.Header.Set("Cache-Control", "no-store")
-	r.RequestCtx.Redirect(destination, fasthttp.StatusSeeOther)
+	// Keep the callback target relative so an untrusted or absent Host header
+	// cannot influence the redirect origin. RequestCtx.Redirect normalizes a
+	// relative target into an absolute URL using the inbound request host.
+	r.RequestCtx.Response.Header.Set("Location", destination)
+	r.RequestCtx.Response.SetStatusCode(fasthttp.StatusSeeOther)
 }
 
 // ListGoogleSearchConsoleProperties returns only currently verified/supported

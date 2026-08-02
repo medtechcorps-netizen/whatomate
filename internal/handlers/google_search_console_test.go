@@ -176,7 +176,38 @@ func TestGoogleSearchConsoleCallbackRedirectSanitizesBasePath(t *testing.T) {
 	location := string(request.RequestCtx.Response.Header.Peek("Location"))
 	assert.NotContains(t, location, `\`)
 	assert.NotRegexp(t, `^//`, location)
-	assert.Contains(t, location, "/evil.example/settings/integrations?google_search_console=connected")
+	assert.Equal(t, "/evil.example/settings/integrations?google_search_console=connected", location)
+}
+
+func TestGoogleSearchConsoleCallbackRedirectIsRelativeAndHostIndependent(t *testing.T) {
+	t.Parallel()
+	app := &App{Config: &config.Config{Server: config.ServerConfig{BasePath: "/crm/"}}}
+
+	tests := []struct {
+		name string
+		host string
+	}{
+		{name: "empty_host"},
+		{name: "untrusted_host", host: "attacker.example"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			request := testutil.NewGETRequest(t)
+			request.RequestCtx.Request.Header.SetHost(test.host)
+
+			app.redirectGoogleSearchConsoleCallback(request, "connected")
+
+			assert.Equal(t, http.StatusSeeOther, testutil.GetResponseStatusCode(request))
+			assert.Equal(t, "no-store", string(request.RequestCtx.Response.Header.Peek("Cache-Control")))
+			assert.Equal(
+				t,
+				"/crm/settings/integrations?google_search_console=connected",
+				string(request.RequestCtx.Response.Header.Peek("Location")),
+			)
+		})
+	}
 }
 
 func TestGoogleSearchConsoleIntegrationResponsePreservesHealthAndDecryptability(t *testing.T) {
