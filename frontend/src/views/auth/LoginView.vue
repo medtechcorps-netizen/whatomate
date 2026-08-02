@@ -195,6 +195,7 @@ const initiateSSO = (provider: string) => {
                 </div>
                 <Button
                   type="submit"
+                  data-testid="password-sign-in"
                   class="group h-12 w-full rounded-xl bg-[#697046] text-white shadow-lg shadow-[#697046]/20 transition-all hover:-translate-y-0.5 hover:bg-[#77804f] hover:shadow-xl hover:shadow-[#697046]/25"
                   :disabled="isLoading"
                 >

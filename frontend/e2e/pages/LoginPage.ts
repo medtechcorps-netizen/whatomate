@@ -12,7 +12,7 @@ export class LoginPage extends BasePage {
     super(page)
     this.emailInput = page.locator('input[name="email"], input[type="email"]')
     this.passwordInput = page.locator('input[name="password"], input[type="password"]')
-    this.submitButton = page.locator('button[type="submit"]')
+    this.submitButton = page.getByTestId('password-sign-in')
     this.errorMessage = page.locator('[role="alert"], .error-message, [data-error]')
     this.registerLink = page.locator('a').filter({ hasText: /Register|Sign up/i })
   }

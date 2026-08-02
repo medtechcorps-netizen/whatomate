@@ -543,6 +543,10 @@ func TestChannelAIReplyPromptUsesResolvedProfileContextAndTenantScope(t *testing
 		Where("id = ?", fixture.Settings.ID).
 		Update("whats_app_account", profileName).Error)
 	fixture.Settings.WhatsAppAccount = profileName
+	require.NoError(t, db.Model(&models.ChannelAccount{}).
+		Where("id = ?", fixture.Account.ID).
+		Update("name", profileName).Error)
+	fixture.Account.Name = profileName
 	aiContext := models.AIContext{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
 		OrganizationID:  fixture.Organization.ID,

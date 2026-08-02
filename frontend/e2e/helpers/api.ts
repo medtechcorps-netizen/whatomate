@@ -1,6 +1,9 @@
 import { APIRequestContext } from '@playwright/test'
+import { randomUUID } from 'node:crypto'
+import { Client } from 'pg'
 
 const BASE_URL = process.env.BASE_URL || 'http://localhost:8080'
+const SEED_WHATSAPP_ACCOUNTS = process.env.E2E_SEED_WHATSAPP_ACCOUNTS === '1'
 
 export interface Permission {
   id: string
@@ -425,6 +428,46 @@ export class ApiHelper {
     business_id: string
     access_token: string
   }): Promise<any> {
+    if (SEED_WHATSAPP_ACCOUNTS) {
+      const databaseURL = process.env.TEST_DATABASE_URL
+      if (!databaseURL) {
+        throw new Error('TEST_DATABASE_URL is required to seed E2E WhatsApp accounts')
+      }
+
+      // Account creation now validates ownership with Meta before persisting.
+      // E2E feature tests only need a local account fixture, so seed one
+      // directly and store a deliberately unusable token. The CI backend also
+      // points whatsapp.base_url at localhost to make provider egress impossible.
+      const organization = await this.getCurrentOrg()
+      const client = new Client({ connectionString: databaseURL })
+      await client.connect()
+      try {
+        const id = randomUUID()
+        const result = await client.query(
+          `INSERT INTO whatsapp_accounts (
+             id, organization_id, name, phone_id, business_id, access_token,
+             api_version, status, created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, 'v21.0', 'active', NOW(), NOW())
+           RETURNING id, name, phone_id, business_id, api_version, status,
+                     created_at, updated_at`,
+          [
+            id,
+            organization.id,
+            data.name,
+            data.phone_id,
+            data.business_id,
+            'enc:e2e-fixture-invalid-do-not-dispatch',
+          ],
+        )
+        return {
+          ...result.rows[0],
+          has_access_token: true,
+        }
+      } finally {
+        await client.end()
+      }
+    }
+
     const response = await this.request.post(`${BASE_URL}/api/accounts`, {
       headers: this.csrfHeaders,
       data

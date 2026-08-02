@@ -18,7 +18,7 @@ test.describe('Organization Switching (Super Admin)', () => {
 // Try admin@rereply.app first
     await page.locator('input[type="email"]').fill(ADMIN_EMAIL)
     await page.locator('input[type="password"]').fill(ADMIN_PASSWORD)
-    await page.locator('button[type="submit"]').click()
+    await page.getByTestId('password-sign-in').click()
 
     // Wait for either redirect or error
     await page.waitForTimeout(2000)
@@ -27,7 +27,7 @@ test.describe('Organization Switching (Super Admin)', () => {
     if (page.url().includes('/login')) {
       await page.locator('input[type="email"]').fill(FALLBACK_ADMIN_EMAIL)
       await page.locator('input[type="password"]').fill(FALLBACK_ADMIN_PASSWORD)
-      await page.locator('button[type="submit"]').click()
+      await page.getByTestId('password-sign-in').click()
       await page.waitForTimeout(2000)
     }
 
@@ -55,14 +55,14 @@ test.describe('Organization Switching (Super Admin)', () => {
     await page.goto('/login')
     await page.locator('input[type="email"]').fill(ADMIN_EMAIL)
     await page.locator('input[type="password"]').fill(ADMIN_PASSWORD)
-    await page.locator('button[type="submit"]').click()
+    await page.getByTestId('password-sign-in').click()
     await page.waitForTimeout(2000)
 
     // If still on login page, try fallback
     if (page.url().includes('/login')) {
       await page.locator('input[type="email"]').fill(FALLBACK_ADMIN_EMAIL)
       await page.locator('input[type="password"]').fill(FALLBACK_ADMIN_PASSWORD)
-      await page.locator('button[type="submit"]').click()
+      await page.getByTestId('password-sign-in').click()
       await page.waitForTimeout(2000)
     }
 
@@ -88,7 +88,7 @@ test.describe('Organization Switching (Super Admin)', () => {
     await page.goto('/login')
     await page.locator('input[type="email"]').fill('agent@test.com')
     await page.locator('input[type="password"]').fill('password')
-    await page.locator('button[type="submit"]').click()
+    await page.getByTestId('password-sign-in').click()
     await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 10000 })
 
     // Regular user should NOT see organization switcher
@@ -104,7 +104,7 @@ test.describe('Create Organization via Sidebar', () => {
     await page.goto('/login')
     await page.locator('input[type="email"]').fill(ADMIN_EMAIL)
     await page.locator('input[type="password"]').fill(ADMIN_PASSWORD)
-    await page.locator('button[type="submit"]').click()
+    await page.getByTestId('password-sign-in').click()
 
     // Wait for redirect or error toast
     try {
@@ -116,7 +116,7 @@ test.describe('Create Organization via Sidebar', () => {
 
     await page.locator('input[type="email"]').fill(FALLBACK_ADMIN_EMAIL)
     await page.locator('input[type="password"]').fill(FALLBACK_ADMIN_PASSWORD)
-    await page.locator('button[type="submit"]').click()
+    await page.getByTestId('password-sign-in').click()
 
     try {
       await page.waitForURL((url: URL) => !url.pathname.includes('/login'), { timeout: 10000 })

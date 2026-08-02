@@ -1332,5 +1332,8 @@ func requestContext(r *fastglue.Request) context.Context {
 	if r == nil || r.RequestCtx == nil {
 		return context.Background()
 	}
-	return r.RequestCtx
+	// fasthttp's RequestCtx only becomes cancellable after it is attached to a
+	// server. Keep request values while giving downstream timeouts a safe parent
+	// for direct handler calls (including tests and other in-process callers).
+	return context.WithoutCancel(r.RequestCtx)
 }
