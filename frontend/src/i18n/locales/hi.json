@@ -230,6 +230,8 @@
     "overview": "अवलोकन",
     "keywords": "कीवर्ड",
     "flows": "फ्लो",
+    "chatbotFlows": "चैटबॉट फ़्लो",
+    "whatsappFlows": "WhatsApp फ़्लो",
     "aiContexts": "AI संदर्भ",
     "transfers": "ट्रांसफर",
     "agentAnalytics": "एजेंट एनालिटिक्स",

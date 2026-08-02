@@ -78,6 +78,17 @@ config_id = ""  # WhatsApp Config ID for frontend login
 # https://<workspace-id>.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
 qwen_base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
+# Google Search Console uses one deployment-managed OAuth application. Each
+# workspace authorizes it separately; client_secret is never entered in the UI.
+# redirect_url must exactly match an authorized redirect URI in Google Cloud.
+[google_search_console]
+client_id = ""
+client_secret = ""
+redirect_url = "https://app.example.com/api/integrations/google_search_console/callback"
+# auth_url = "https://accounts.google.com/o/oauth2/auth"
+# token_url = "https://oauth2.googleapis.com/token"
+# api_base_url = "https://www.googleapis.com/webmasters/v3"
+
 # Auth cookie settings (tokens are stored in httpOnly cookies)
 [cookie]
 domain = ""    # Cookie domain (e.g., ".example.com"). Empty = current host only.

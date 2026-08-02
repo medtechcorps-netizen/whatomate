@@ -777,6 +777,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		g.GET("/api/auth/sso/{provider}/callback", app.CallbackSSO)
 	}
 
+	// Public OAuth callback. Tenant and initiating admin identities are carried
+	// only in a one-time Redis state and are re-authorized by the handler.
+	g.GET("/api/integrations/google_search_console/callback", app.CallbackGoogleSearchConsole)
+
 	// Webhook routes (public - for Meta)
 	g.GET("/api/webhook", app.WebhookVerify)
 	g.POST("/api/webhook", app.WebhookHandler)
@@ -807,6 +811,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		}
 		// Skip auth for SSO routes (they handle their own auth via state tokens)
 		if len(path) >= 13 && path[:13] == "/api/auth/sso" {
+			return r
+		}
+		if path == "/api/integrations/google_search_console/callback" {
 			return r
 		}
 		// Skip auth for custom action redirects (uses one-time token)
@@ -970,6 +977,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.DELETE("/api/integrations/{provider}/credentials", tenant((*handlers.App).DeleteIntegrationCredentials))
 	g.POST("/api/integrations/{provider}/connect", tenant((*handlers.App).ConnectIntegration))
 	g.POST("/api/integrations/{provider}/test", app.TestIntegration)
+	g.GET("/api/integrations/google_search_console/properties", tenant((*handlers.App).ListGoogleSearchConsoleProperties))
+	g.PUT("/api/integrations/google_search_console/properties", tenant((*handlers.App).UpdateGoogleSearchConsoleProperties))
+	g.POST("/api/integrations/google_search_console/properties/refresh", app.RefreshGoogleSearchConsoleProperties)
+	g.DELETE("/api/integrations/google_search_console/connection", app.DisconnectGoogleSearchConsole)
 
 	// Provider-neutral channel accounts and shared inbox.
 	g.GET("/api/channel-accounts", tenant((*handlers.App).ListChannelAccounts))
@@ -1264,6 +1275,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/api/analytics/meta", tenant((*handlers.App).GetMetaAnalytics))
 	g.GET("/api/analytics/meta/accounts", tenant((*handlers.App).ListMetaAccountsForAnalytics))
 	g.POST("/api/analytics/meta/refresh", tenant((*handlers.App).RefreshMetaAnalyticsCache))
+	// Search Console calls Google live and manages its own short tenant phases.
+	g.GET("/api/analytics/search-visibility/setup", tenant((*handlers.App).GetGoogleSearchVisibilitySetup))
+	g.GET("/api/analytics/search-visibility", app.GetGoogleSearchVisibility)
 
 	// Widgets (customizable analytics)
 	g.GET("/api/widgets", tenant((*handlers.App).ListWidgets))

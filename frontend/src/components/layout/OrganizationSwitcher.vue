@@ -50,6 +50,12 @@ const currentOrgId = computed(() => {
   return authStore.user?.organization_id || ''
 })
 
+const currentOrgName = computed(() =>
+  orgList.value.find(org => org.id === currentOrgId.value)?.name
+    || organizationsStore.selectedOrganization?.name
+    || 'All Organizations'
+)
+
 onMounted(async () => {
   // Fetch user's org memberships for all authenticated users
   await organizationsStore.fetchMyOrganizations()
@@ -176,16 +182,16 @@ const refreshOrgs = async () => {
       </div>
     </div>
 
-    <!-- Collapsed view - just show icon with selected org initial -->
+    <!-- Collapsed view is informational; switching remains available when expanded. -->
     <div v-else class="flex justify-center">
-      <Button
-        variant="ghost"
-        size="icon"
-        class="h-8 w-8"
-        :title="organizationsStore.selectedOrganization?.name || 'All Organizations'"
+      <div
+        class="flex h-8 w-8 items-center justify-center text-muted-foreground"
+        role="img"
+        :aria-label="currentOrgName"
+        :title="currentOrgName"
       >
         <Building2 class="h-4 w-4" />
-      </Button>
+      </div>
     </div>
   </div>
 

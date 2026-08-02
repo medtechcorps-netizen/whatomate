@@ -195,6 +195,33 @@ function integrationFixture(): MockIntegration[] {
       test_supported: true,
     },
     {
+      provider: "google_search_console",
+      display_name: "Google Search Console",
+      status: "connected",
+      enabled: true,
+      configured: true,
+      read_only: false,
+      config: {
+        platform_configured: true,
+        operations_available: true,
+        property_count: 2,
+        selected_property_count: 1,
+      },
+      credentials: {
+        refresh_token: {
+          configured: true,
+          updated_at: "2026-07-30T03:00:00Z",
+          source: "workspace",
+        },
+      },
+      connection: connection(2, 1),
+      oauth: { supported: true, available: true, mode: "oauth" },
+      test_supported: true,
+      message:
+        "One verified website property is available in Search Visibility.",
+      required_scopes: ["https://www.googleapis.com/auth/webmasters.readonly"],
+    },
+    {
       provider: "email",
       display_name: "Email",
       status: "connected",
@@ -235,6 +262,26 @@ async function installIntegrationMocks(
   options: { platformMeta?: boolean } = {},
 ) {
   const integrations = integrationFixture();
+  const googleProperties = [
+    {
+      id: "88888888-8888-4888-8888-888888888881",
+      site_url: "sc-domain:klinikrelive.com",
+      display_name: "klinikrelive.com",
+      property_type: "domain",
+      permission_level: "siteOwner",
+      selected: true,
+      last_synced_at: "2026-07-30T03:00:00Z",
+    },
+    {
+      id: "88888888-8888-4888-8888-888888888882",
+      site_url: "https://www.klinikrelive.com/services/",
+      display_name: "https://www.klinikrelive.com/services/",
+      property_type: "url_prefix",
+      permission_level: "siteFullUser",
+      selected: false,
+      last_synced_at: "2026-07-30T03:00:00Z",
+    },
+  ];
   if (options.platformMeta) {
     const meta = integrations.find((item) => item.provider === "meta")!;
     meta.config.management_mode = "platform";
@@ -247,6 +294,9 @@ async function installIntegrationMocks(
     updates: [] as Array<Record<string, unknown>>,
     qwenUpdates: [] as Array<Record<string, unknown>>,
     credentialClears: [] as string[],
+    googlePropertyUpdates: [] as string[][],
+    googleDisconnects: 0,
+    googleDisconnectMethods: [] as string[],
   };
 
   await page.addInitScript((storedUser) => {
@@ -351,6 +401,87 @@ async function installIntegrationMocks(
     }
     await route.fulfill({ json: { data: qwen } });
   });
+  await page.route(
+    /\/api\/integrations\/google_search_console\/properties(?:\?.*)?$/,
+    async (route) => {
+      if (route.request().method() === "PUT") {
+        const body = route.request().postDataJSON() as {
+          property_ids?: string[];
+        };
+        const selectedIDs = body.property_ids ?? [];
+        traffic.googlePropertyUpdates.push(selectedIDs);
+        for (const property of googleProperties) {
+          property.selected = selectedIDs.includes(property.id);
+        }
+        const google = integrations.find(
+          (item) => item.provider === "google_search_console",
+        )!;
+        google.connection.active_count = selectedIDs.length;
+        google.config.selected_property_count = selectedIDs.length;
+      }
+      await route.fulfill({
+        json: {
+          data: {
+            properties: googleProperties,
+            selected_count: googleProperties.filter(
+              (property) => property.selected,
+            ).length,
+          },
+        },
+      });
+    },
+  );
+  await page.route(
+    /\/api\/integrations\/google_search_console\/properties\/refresh(?:\?.*)?$/,
+    (route) =>
+      route.fulfill({
+        json: {
+          data: {
+            properties: googleProperties,
+            selected_count: googleProperties.filter(
+              (property) => property.selected,
+            ).length,
+          },
+        },
+      }),
+  );
+  await page.route(
+    /\/api\/integrations\/google_search_console\/connection(?:\?.*)?$/,
+    async (route) => {
+      traffic.googleDisconnectMethods.push(route.request().method());
+      if (route.request().method() !== "DELETE") {
+        await route.fulfill({
+          status: 405,
+          json: { error: "Method not allowed" },
+        });
+        return;
+      }
+      traffic.googleDisconnects += 1;
+      const google = integrations.find(
+        (item) => item.provider === "google_search_console",
+      )!;
+      google.status = "not_configured";
+      google.enabled = false;
+      google.configured = false;
+      google.credentials.refresh_token = { configured: false };
+      google.connection = connection();
+      await route.fulfill({ json: { data: google } });
+    },
+  );
+  await page.route(
+    /\/api\/integrations\/google_search_console\/test(?:\?.*)?$/,
+    (route) =>
+      route.fulfill({
+        json: {
+          data: {
+            provider: "google_search_console",
+            success: true,
+            status: "connected",
+            message: "Connection test succeeded",
+          },
+        },
+      }),
+  );
   await page.route(/\/api\/integrations(?:\?.*)?$/, (route) => {
     traffic.listReads += 1;
     return route.fulfill({ json: { data: { integrations } } });
@@ -371,6 +502,7 @@ test("admin sees every provider and saving a blank secret preserves it", async (
     "threads",
     "tiktok",
     "qwen",
+    "google_search_console",
     "email",
     "webchat",
   ]) {
@@ -416,6 +548,80 @@ test("admin sees every provider and saving a blank secret preserves it", async (
   expect(traffic.updates[0]).not.toHaveProperty("credentials");
   await expect(secretInput).toHaveValue("");
   await expect(webhookTokenInput).toHaveValue("");
+});
+
+test("Google Search Console selects verified properties and disconnects through the safe endpoint", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page);
+  await page.goto("/settings/integrations");
+
+  await expect(
+    page.getByTestId("integration-card-google_search_console"),
+  ).toBeVisible();
+
+  const providerOrder = await page
+    .locator('[data-testid^="integration-card-"]')
+    .evaluateAll((cards) =>
+      cards.map((card) => card.getAttribute("data-testid")),
+    );
+  expect(providerOrder.indexOf("integration-card-google_search_console")).toBe(
+    providerOrder.indexOf("integration-card-qwen") + 1,
+  );
+
+  await page
+    .getByTestId("integration-card-google_search_console")
+    .getByRole("button", { name: "Configure" })
+    .click();
+  const dialog = page.getByTestId("integration-dialog-google_search_console");
+  await expect(dialog).toBeVisible();
+  await expect(
+    dialog.getByText("klinikrelive.com", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByText("Domain property", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByText(/does not report website visits or sessions/i),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("link", { name: /Open dashboard/ }),
+  ).toHaveCount(0);
+
+  const propertyCheckboxes = dialog.getByRole("checkbox");
+  await expect(propertyCheckboxes).toHaveCount(2);
+  await propertyCheckboxes.nth(1).click();
+  await dialog.getByTestId("gsc-save-properties").click();
+  await expect.poll(() => traffic.googlePropertyUpdates.length).toBe(1);
+  expect(traffic.googlePropertyUpdates[0]).toEqual([
+    "88888888-8888-4888-8888-888888888881",
+    "88888888-8888-4888-8888-888888888882",
+  ]);
+
+  await dialog.getByRole("button", { name: "Disconnect", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Disconnect Google", exact: true })
+    .click();
+  await expect.poll(() => traffic.googleDisconnects).toBe(1);
+  expect(traffic.googleDisconnectMethods).toEqual(["DELETE"]);
+  await expect(dialog).toHaveCount(0);
+});
+
+test("Google OAuth callback opens property setup and removes the one-time URL marker", async ({
+  page,
+}) => {
+  await installIntegrationMocks(page);
+  await page.goto(
+    "/settings/integrations?google_search_console=connected&keep=1",
+  );
+
+  await expect(
+    page.getByTestId("integration-dialog-google_search_console"),
+  ).toBeVisible();
+  await expect(page).toHaveURL(/\/settings\/integrations\?keep=1$/);
+  await expect(
+    page.getByText("Google Search Console connected", { exact: true }),
+  ).toBeVisible();
 });
 
 test("workspace webhook token is submitted write-only and cleared from the form after save", async ({

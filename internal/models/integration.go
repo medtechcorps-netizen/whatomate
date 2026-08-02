@@ -38,3 +38,30 @@ type ProviderIntegration struct {
 func (ProviderIntegration) TableName() string {
 	return "provider_integrations"
 }
+
+// GoogleSearchConsoleProperty is a verified website property discovered through
+// the Google Search Console API. OAuth credentials remain on the parent
+// ProviderIntegration; this child contains no secret material.
+//
+// Available is refreshed from sites.list. Selected is an explicit tenant-admin
+// choice and is required before analytics can be queried from the CRM.
+type GoogleSearchConsoleProperty struct {
+	BaseModel
+	OrganizationID  uuid.UUID  `gorm:"type:uuid;not null;index;uniqueIndex:idx_gsc_properties_org_site_hash,priority:1" json:"organization_id"`
+	IntegrationID   uuid.UUID  `gorm:"type:uuid;not null;index" json:"integration_id"`
+	SiteURL         string     `gorm:"size:2048;not null" json:"site_url"`
+	SiteURLHash     string     `gorm:"size:64;not null;uniqueIndex:idx_gsc_properties_org_site_hash,priority:2" json:"-"`
+	DisplayName     string     `gorm:"size:2048;not null" json:"display_name"`
+	PropertyType    string     `gorm:"size:32;not null" json:"property_type"`
+	PermissionLevel string     `gorm:"size:40;not null" json:"permission_level"`
+	Available       bool       `gorm:"not null;default:true;index" json:"available"`
+	Selected        bool       `gorm:"not null;default:false;index" json:"selected"`
+	LastSyncedAt    *time.Time `json:"last_synced_at,omitempty"`
+
+	Organization *Organization        `gorm:"foreignKey:OrganizationID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"-"`
+	Integration  *ProviderIntegration `gorm:"foreignKey:IntegrationID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"-"`
+}
+
+func (GoogleSearchConsoleProperty) TableName() string {
+	return "google_search_console_properties"
+}

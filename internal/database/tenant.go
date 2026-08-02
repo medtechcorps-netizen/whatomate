@@ -13,7 +13,7 @@ import (
 
 const (
 	tenantSetting           = "app.current_organization_id"
-	tenantRLSRoutingVersion = 3
+	tenantRLSRoutingVersion = 4
 )
 
 var (
@@ -84,6 +84,7 @@ var DirectTenantTables = []string{
 	"crm_stage_history",
 	"entitlement_overrides",
 	"follow_up_tasks",
+	"google_search_console_properties",
 	"inbound_events",
 	"inbox_conversations",
 	"invoice_lines",

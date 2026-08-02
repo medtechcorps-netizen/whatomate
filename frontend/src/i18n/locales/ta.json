@@ -230,6 +230,8 @@
     "overview": "கண்ணோட்டம்",
     "keywords": "முக்கியவார்த்தைகள்",
     "flows": "பாய்வுகள்",
+    "chatbotFlows": "சேட்பாட் பாய்வுகள்",
+    "whatsappFlows": "WhatsApp பாய்வுகள்",
     "aiContexts": "AI சூழல்கள்",
     "transfers": "மாற்றுகைகள்",
     "agentAnalytics": "முகவர் பகுப்பாய்வு",

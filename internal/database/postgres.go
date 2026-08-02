@@ -201,6 +201,7 @@ func GetMigrationModels() []MigrationModel {
 
 		// Provider-neutral omnichannel inbox
 		{"ProviderIntegration", &models.ProviderIntegration{}},
+		{"GoogleSearchConsoleProperty", &models.GoogleSearchConsoleProperty{}},
 		{"ChannelAccount", &models.ChannelAccount{}},
 		{"ChannelCredential", &models.ChannelCredential{}},
 		{"ContactIdentity", &models.ContactIdentity{}},

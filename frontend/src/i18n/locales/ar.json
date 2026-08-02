@@ -261,6 +261,8 @@
     "overview": "نظرة عامة",
     "keywords": "كلمات مفتاحية",
     "flows": "التدفقات",
+    "chatbotFlows": "تدفقات روبوت الدردشة",
+    "whatsappFlows": "تدفقات واتساب",
     "aiContexts": "سياقات الذكاء الاصطناعي",
     "transfers": "التحويلات",
     "agentAnalytics": "تحليلات الوكلاء",

@@ -430,6 +430,68 @@ const builders: Record<
         "Provider model, endpoint and API key belong here. Chatbot-specific enablement, prompt and output cap remain under Chatbot Settings.",
     },
   ],
+  google_search_console: (integration) => {
+    const propertyCount = Number(integration.config?.property_count ?? 0);
+    const selectedPropertyCount = Number(
+      integration.config?.selected_property_count ??
+        integration.connection?.active_count ??
+        0,
+    );
+    const isConnected = integration.status === "connected";
+    const hasAuthorization = Boolean(
+      integration.configured ||
+      integration.credentials?.refresh_token?.configured,
+    );
+
+    return [
+      {
+        key: "google_oauth",
+        label: "Google authorization",
+        state: isConnected
+          ? "ready"
+          : hasAuthorization
+            ? "blocked"
+            : integration.oauth.available
+              ? "missing"
+              : "blocked",
+        detail: isConnected
+          ? "Read-only Search Console access is authorized for this workspace."
+          : hasAuthorization
+            ? integration.message ||
+              "The stored Google authorization needs attention. Reauthorize the workspace connection."
+            : integration.oauth.available
+              ? "Connect a Google account with access to at least one verified Search Console property."
+              : "Google OAuth is not configured on this deployment. Ask a platform administrator to enable it.",
+      },
+      {
+        key: "verified_properties",
+        label: "Verified properties",
+        state: !hasAuthorization
+          ? "missing"
+          : !isConnected
+            ? "blocked"
+            : selectedPropertyCount > 0
+              ? "ready"
+              : "missing",
+        detail: !hasAuthorization
+          ? "Authorize Google before selecting properties."
+          : !isConnected
+            ? "Restore the Google authorization before using the selected properties."
+            : selectedPropertyCount > 0
+              ? `${selectedPropertyCount} of ${propertyCount} available properties are selected for analytics.`
+              : "Select at least one verified property to start Search Visibility reporting.",
+      },
+      {
+        key: "search_metrics",
+        label: "Search performance metrics",
+        state: selectedPropertyCount > 0 ? "managed" : "missing",
+        detail:
+          selectedPropertyCount > 0
+            ? "Google clicks, impressions, CTR and average position are available in Search Visibility. Website sessions require a separate Google Analytics integration."
+            : "Select a property to enable Google Search performance reporting.",
+      },
+    ];
+  },
   email: (integration) => [
     connectionRequirement(
       integration,
