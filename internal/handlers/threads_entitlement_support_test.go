@@ -14,7 +14,30 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
 )
+
+func ensureThreadsSupportCatalogPlan(
+	t *testing.T,
+	app *handlers.App,
+	code, name string,
+) models.Plan {
+	t.Helper()
+	var plan models.Plan
+	err := app.DB.Where("reseller_id IS NULL AND code = ?", code).First(&plan).Error
+	if err == nil {
+		return plan
+	}
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	return createCatalogPlan(
+		t,
+		app,
+		nil,
+		code,
+		name,
+		models.CommercialPlanStatusActive,
+	)
+}
 
 func createThreadsSupportSubscription(
 	t *testing.T,
@@ -160,21 +183,17 @@ func TestEnableOrganizationThreadsPublicEngagementCommercialGuards(t *testing.T)
 		testutil.WithSuperAdmin(),
 	)
 	now := time.Now().UTC()
-	growthPlan := createCatalogPlan(
+	growthPlan := ensureThreadsSupportCatalogPlan(
 		t,
 		app,
-		nil,
 		"rereply-growth",
 		"ReReply Growth",
-		models.CommercialPlanStatusActive,
 	)
-	starterPlan := createCatalogPlan(
+	starterPlan := ensureThreadsSupportCatalogPlan(
 		t,
 		app,
-		nil,
 		"rereply-starter",
 		"ReReply Starter",
-		models.CommercialPlanStatusActive,
 	)
 
 	tests := []struct {
@@ -352,13 +371,11 @@ func TestEnableOrganizationThreadsPublicEngagementSuccessIsTargetedAuditedAndIde
 	)
 	targetOrg := testutil.CreateTestOrganization(t, app.DB)
 	otherOrg := testutil.CreateTestOrganization(t, app.DB)
-	growthPlan := createCatalogPlan(
+	growthPlan := ensureThreadsSupportCatalogPlan(
 		t,
 		app,
-		nil,
 		"rereply-growth",
 		"ReReply Growth",
-		models.CommercialPlanStatusActive,
 	)
 	createThreadsSupportSubscription(
 		t,
