@@ -106,7 +106,7 @@ func newThreadsSupportRequest(
 	if selectedOrgID != owner.OrganizationID {
 		testutil.SetHeader(request, "X-Organization-ID", selectedOrgID.String())
 	}
-	testutil.SetPathParam(request, "organization_id", targetOrgID.String())
+	testutil.SetPathParam(request, "target_organization_id", targetOrgID.String())
 	return request
 }
 

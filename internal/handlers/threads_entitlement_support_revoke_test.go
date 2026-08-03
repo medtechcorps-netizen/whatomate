@@ -41,7 +41,14 @@ func createThreadsSupportOverride(
 		StartsAt:       startsAt,
 		CreatedByID:    creatorID,
 	}
+	shouldBeInactive := !active
 	require.NoError(t, app.DB.Create(&override).Error)
+	if shouldBeInactive {
+		require.NoError(t, app.DB.Model(&models.EntitlementOverride{}).
+			Where("id = ?", override.ID).
+			Update("is_active", false).Error)
+		override.IsActive = false
+	}
 	return override
 }
 
@@ -84,7 +91,7 @@ func callThreadsSupportStatus(
 	if selectedOrgID != owner.OrganizationID {
 		testutil.SetHeader(request, "X-Organization-ID", selectedOrgID.String())
 	}
-	testutil.SetPathParam(request, "organization_id", targetOrgID.String())
+	testutil.SetPathParam(request, "target_organization_id", targetOrgID.String())
 	require.NoError(t, app.GetOrganizationThreadsPublicEngagementSupportStatus(request))
 	return request
 }
@@ -137,12 +144,12 @@ func TestRevokeOrganizationThreadsPublicEngagementSupportAuthorizationAndRequest
 		"override_id": uuid.New(),
 		"reason":      "support-ticket-2",
 	})
-	testutil.SetPathParam(unauthorized, "organization_id", targetOrg.ID.String())
+	testutil.SetPathParam(unauthorized, "target_organization_id", targetOrg.ID.String())
 	require.NoError(t, app.RevokeOrganizationThreadsPublicEngagementSupport(unauthorized))
 	testutil.AssertErrorResponse(t, unauthorized, fasthttp.StatusUnauthorized, "Unauthorized")
 
 	unauthorizedStatus := testutil.NewGETRequest(t)
-	testutil.SetPathParam(unauthorizedStatus, "organization_id", targetOrg.ID.String())
+	testutil.SetPathParam(unauthorizedStatus, "target_organization_id", targetOrg.ID.String())
 	require.NoError(t, app.GetOrganizationThreadsPublicEngagementSupportStatus(unauthorizedStatus))
 	testutil.AssertErrorResponse(
 		t,

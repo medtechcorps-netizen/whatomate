@@ -82,7 +82,7 @@ func (a *App) GetOrganizationThreadsPublicEngagementSupportStatus(r *fastglue.Re
 		)
 	}
 
-	targetOrgID, err := productCommercialTargetOrganizationID(r)
+	targetOrgID, err := threadsSupportTargetOrganizationID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,
@@ -176,7 +176,7 @@ func (a *App) RevokeOrganizationThreadsPublicEngagementSupport(r *fastglue.Reque
 		)
 	}
 
-	targetOrgID, err := productCommercialTargetOrganizationID(r)
+	targetOrgID, err := threadsSupportTargetOrganizationID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,

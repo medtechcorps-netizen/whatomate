@@ -81,7 +81,7 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 		)
 	}
 
-	targetOrgID, err := productCommercialTargetOrganizationID(r)
+	targetOrgID, err := threadsSupportTargetOrganizationID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,
@@ -290,6 +290,20 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 	}
 
 	return r.SendEnvelope(response)
+}
+
+func threadsSupportTargetOrganizationID(r *fastglue.Request) (uuid.UUID, error) {
+	switch value := r.RequestCtx.UserValue("target_organization_id").(type) {
+	case uuid.UUID:
+		if value != uuid.Nil {
+			return value, nil
+		}
+	case string:
+		if parsed, err := uuid.Parse(value); err == nil && parsed != uuid.Nil {
+			return parsed, nil
+		}
+	}
+	return uuid.Nil, errors.New("invalid target organization ID")
 }
 
 func (a *App) verifyThreadsSupportEnabledInTransaction(
