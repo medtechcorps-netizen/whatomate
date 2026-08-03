@@ -241,6 +241,23 @@ func TestMetaRelayCapabilitiesAreTextOnlyAndWindowCannotBeDisabled(t *testing.T)
 	}
 }
 
+func TestEmailRelayCapabilitiesMatchTextReplyTransport(t *testing.T) {
+	t.Parallel()
+
+	adapter := NewRelayAdapter(models.ChannelEmail, nil, relayTestEncryptionKey)
+	account := relayTestAccount(t, "https://relay.example.test/events")
+	account.Channel = models.ChannelEmail
+
+	capabilities := adapter.Capabilities(account)
+	assert.True(t, capabilities.Text)
+	assert.True(t, capabilities.Replies)
+	assert.False(t, capabilities.Media)
+	assert.False(t, capabilities.MultipleAttachments)
+	assert.False(t, capabilities.ReadReceipts)
+	assert.False(t, capabilities.Typing)
+	assert.False(t, capabilities.SubjectAndCC)
+}
+
 func TestMetaInboundServiceWindowOpensAndExpires(t *testing.T) {
 	t.Parallel()
 

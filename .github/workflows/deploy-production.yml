@@ -82,6 +82,7 @@ jobs:
           set -euo pipefail
           app_id="54bc0d92-73e9-4f8b-86cd-c3fd96e06beb"
           repository="https://github.com/medtechcorps-netizen/whatomate.git"
+          service_name="omnitech-web"
           rls_key="WHATOMATE_DATABASE__RLS_ENABLED"
           app_spec="$(
             doctl apps spec get \
@@ -89,10 +90,16 @@ jobs:
               --format json
           )"
 
-          if jq -e --arg repository "${repository}" --arg rls_key "${rls_key}" '
-            [.services[]?, .workers[]?]
-            | map(select(.git.repo_clone_url == $repository)) as $runtime
-            | ($runtime | length) > 0
+          if jq -e \
+            --arg repository "${repository}" \
+            --arg service_name "${service_name}" \
+            --arg rls_key "${rls_key}" '
+            (.services // [])
+            | map(select(
+                .name == $service_name
+                and .git.repo_clone_url == $repository
+              )) as $runtime
+            | ($runtime | length) == 1
               and all(
                 $runtime[];
                 any(.envs[]?; .key == $rls_key and .value == "true")
@@ -102,7 +109,10 @@ jobs:
             exit 0
           fi
 
-          jq --arg repository "${repository}" --arg rls_key "${rls_key}" '
+          jq \
+            --arg repository "${repository}" \
+            --arg service_name "${service_name}" \
+            --arg rls_key "${rls_key}" '
             def enable_rls:
               .envs = (
                 ((.envs // []) | map(select(.key != $rls_key)))
@@ -115,18 +125,26 @@ jobs:
               );
             .services = (
               (.services // [])
-              | map(if .git.repo_clone_url == $repository then enable_rls else . end)
+              | map(
+                  if .name == $service_name
+                    and .git.repo_clone_url == $repository
+                  then enable_rls
+                  else .
+                  end
+                )
             )
-            | .workers = (
-                (.workers // [])
-                | map(if .git.repo_clone_url == $repository then enable_rls else . end)
-              )
           ' <<<"${app_spec}" > production-app-spec.json
 
-          jq -e --arg repository "${repository}" --arg rls_key "${rls_key}" '
-            [.services[]?, .workers[]?]
-            | map(select(.git.repo_clone_url == $repository)) as $runtime
-            | ($runtime | length) > 0
+          jq -e \
+            --arg repository "${repository}" \
+            --arg service_name "${service_name}" \
+            --arg rls_key "${rls_key}" '
+            (.services // [])
+            | map(select(
+                .name == $service_name
+                and .git.repo_clone_url == $repository
+              )) as $runtime
+            | ($runtime | length) == 1
               and all(
                 $runtime[];
                 any(.envs[]?; .key == $rls_key and .value == "true")
@@ -160,9 +178,12 @@ jobs:
               and any(.envs[]?; .key == "WHATOMATE_DATABASE__RUNTIME_ROLE")
             )
             and (
-              [.services[]?, .workers[]?]
-              | map(select(.git.repo_clone_url == "https://github.com/medtechcorps-netizen/whatomate.git")) as $runtime
-              | ($runtime | length) > 0
+              (.services // [])
+              | map(select(
+                  .name == "omnitech-web"
+                  and .git.repo_clone_url == "https://github.com/medtechcorps-netizen/whatomate.git"
+                )) as $runtime
+              | ($runtime | length) == 1
                 and all(
                   $runtime[];
                   any(
@@ -191,3 +212,20 @@ jobs:
             --retry-all-errors \
             --retry-delay 5 \
             https://app.rereply.app/ready
+
+      - name: Verify Gmail relay readiness
+        run: |
+          app_id="54bc0d92-73e9-4f8b-86cd-c3fd96e06beb"
+          if ! doctl apps spec get "${app_id}" --format json \
+            | jq -e 'any(.services[]?; .name == "gmail-relay")' >/dev/null; then
+            echo "gmail-relay is not provisioned yet; skipping its readiness check"
+            exit 0
+          fi
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 12 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            https://app.rereply.app/gmail-relay/readyz

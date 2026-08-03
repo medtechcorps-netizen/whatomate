@@ -189,6 +189,9 @@ jobs:
       - name: Build Meta relay container
         run: docker build -f docker/meta-relay.Dockerfile -t rereply-meta-relay:ci .
 
+      - name: Build Gmail relay container
+        run: docker build -f docker/gmail-relay.Dockerfile -t rereply-gmail-relay:ci .
+
       - name: Scan production container
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
@@ -202,6 +205,15 @@ jobs:
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: rereply-meta-relay:ci
+          format: table
+          exit-code: "1"
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+
+      - name: Scan Gmail relay container
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: rereply-gmail-relay:ci
           format: table
           exit-code: "1"
           vuln-type: os,library
