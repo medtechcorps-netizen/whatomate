@@ -1754,7 +1754,7 @@ onMounted(async () => {
                       v-model="threadsSupportReason"
                       :rows="2"
                       maxlength="2000"
-                      required
+                      aria-required="true"
                       placeholder="Ticket, approval, or operational reason"
                       :disabled="activeAction !== null"
                       class="min-h-[72px] resize-none bg-black/15 light:bg-white"
@@ -1796,7 +1796,7 @@ onMounted(async () => {
                       v-model="threadsSupportRevokeReason"
                       :rows="2"
                       maxlength="2000"
-                      required
+                      aria-required="true"
                       placeholder="Ticket, approval, or operational reason"
                       :disabled="activeAction !== null"
                       class="min-h-[72px] resize-none bg-black/15 light:bg-white"
