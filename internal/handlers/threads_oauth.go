@@ -330,7 +330,13 @@ func (a *App) loadThreadsIntegrationSnapshot(orgID uuid.UUID, requireEnabled boo
 	if err != nil || strings.TrimSpace(secret) == "" {
 		return threadsIntegrationSnapshot{}, errThreadsOAuthNotConfigured
 	}
-	fingerprint := sha256.Sum256([]byte(strings.Join([]string{row.ID.String(), appID, redirectURI, encryptedSecret}, "\x00")))
+	fingerprint := sha256.Sum256([]byte(strings.Join([]string{
+		row.ID.String(),
+		appID,
+		redirectURI,
+		encryptedSecret,
+		row.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	}, "\x00")))
 	return threadsIntegrationSnapshot{
 		IntegrationID:      row.ID,
 		AppID:              appID,

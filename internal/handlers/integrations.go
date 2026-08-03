@@ -1013,6 +1013,15 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 }
 
 func disconnectThreadsChannelAccounts(tx *gorm.DB, orgID, userID uuid.UUID, now time.Time) error {
+	return disconnectThreadsChannelAccountsWithActor(tx, orgID, &userID, now)
+}
+
+func disconnectThreadsChannelAccountsWithActor(
+	tx *gorm.DB,
+	orgID uuid.UUID,
+	userID *uuid.UUID,
+	now time.Time,
+) error {
 	var accounts []models.ChannelAccount
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where(
@@ -1024,7 +1033,21 @@ func disconnectThreadsChannelAccounts(tx *gorm.DB, orgID, userID uuid.UUID, now 
 		Find(&accounts).Error; err != nil {
 		return err
 	}
+	return disconnectLockedThreadsChannelAccounts(tx, orgID, userID, now, accounts, nil)
+}
 
+// disconnectLockedThreadsChannelAccounts applies the disconnect fence to an
+// already locked account set. A nil credentialKinds slice revokes every kind;
+// lifecycle callbacks pass OAuth explicitly so unrelated future credentials
+// are left alone.
+func disconnectLockedThreadsChannelAccounts(
+	tx *gorm.DB,
+	orgID uuid.UUID,
+	userID *uuid.UUID,
+	now time.Time,
+	accounts []models.ChannelAccount,
+	credentialKinds []models.ChannelCredentialKind,
+) error {
 	accountIDs := make([]uuid.UUID, 0, len(accounts))
 	for index := range accounts {
 		account := &accounts[index]
@@ -1036,7 +1059,7 @@ func disconnectThreadsChannelAccounts(tx *gorm.DB, orgID, userID uuid.UUID, now 
 		account.Status = models.ChannelAccountStatusDisconnected
 		account.IsDefaultIncoming = false
 		account.IsDefaultOutgoing = false
-		account.UpdatedByID = &userID
+		account.UpdatedByID = userID
 		if err := tx.Save(account).Error; err != nil {
 			return err
 		}
@@ -1092,7 +1115,7 @@ func disconnectThreadsChannelAccounts(tx *gorm.DB, orgID, userID uuid.UUID, now 
 		}
 	}
 
-	return tx.Model(&models.ChannelCredential{}).
+	credentialQuery := tx.Model(&models.ChannelCredential{}).
 		Where(
 			"organization_id = ? AND channel_account_id IN ? AND status IN ?",
 			orgID,
@@ -1101,13 +1124,16 @@ func disconnectThreadsChannelAccounts(tx *gorm.DB, orgID, userID uuid.UUID, now 
 				models.ChannelCredentialStatusActive,
 				models.ChannelCredentialStatusExpiring,
 			},
-		).
-		Updates(map[string]any{
-			"status":     models.ChannelCredentialStatusRevoked,
-			"revoked_at": now,
-			"rotated_at": now,
-			"updated_at": now,
-		}).Error
+		)
+	if len(credentialKinds) > 0 {
+		credentialQuery = credentialQuery.Where("kind IN ?", credentialKinds)
+	}
+	return credentialQuery.Updates(map[string]any{
+		"status":     models.ChannelCredentialStatusRevoked,
+		"revoked_at": now,
+		"rotated_at": now,
+		"updated_at": now,
+	}).Error
 }
 
 func lockOrCreateIntegrationRow(tx *gorm.DB, orgID, userID uuid.UUID, provider string) (*models.ProviderIntegration, bool, error) {

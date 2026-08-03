@@ -791,6 +791,18 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// only in a one-time Redis state and are re-authorized by the handler.
 	g.GET("/api/integrations/google_search_console/callback", app.CallbackGoogleSearchConsole)
 	g.GET("/api/integrations/threads/callback", app.CallbackThreads)
+	g.POST(
+		"/api/integrations/threads/{organization_id}/deauthorize",
+		app.DeauthorizeThreads,
+	)
+	g.POST(
+		"/api/integrations/threads/{organization_id}/data-deletion",
+		app.DeleteThreadsUserData,
+	)
+	g.GET(
+		"/api/integrations/threads/{organization_id}/data-deletion/status/{confirmation_code}",
+		app.ThreadsDataDeletionStatus,
+	)
 
 	// Webhook routes (public - for Meta)
 	g.GET("/api/webhook", app.WebhookVerify)
@@ -830,6 +842,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		}
 		if path == "/api/integrations/google_search_console/callback" ||
 			path == "/api/integrations/threads/callback" {
+			return r
+		}
+		if isPublicThreadsLifecyclePath(path) {
 			return r
 		}
 		// Skip auth for custom action redirects (uses one-time token)
@@ -918,6 +933,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.PUT(
 		"/api/admin/organizations/{organization_id}/subscription",
 		app.SetOrganizationSubscription,
+	)
+	g.POST(
+		"/api/admin/organizations/{organization_id}/entitlements/threads-public-engagement/enable",
+		app.EnableOrganizationThreadsPublicEngagement,
 	)
 
 	// Commercial, onboarding, privacy, and support tenant surfaces.
@@ -1406,6 +1425,42 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	} else {
 		lo.Info("Frontend not embedded, API-only mode")
 	}
+}
+
+func isPublicThreadsLifecyclePath(path string) bool {
+	const prefix = "/api/integrations/threads/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, prefix), "/")
+	if len(parts) < 2 {
+		return false
+	}
+	organizationID, err := uuid.Parse(parts[0])
+	if err != nil || organizationID == uuid.Nil {
+		return false
+	}
+	if len(parts) == 2 {
+		return parts[1] == "deauthorize" || parts[1] == "data-deletion"
+	}
+	return len(parts) == 4 &&
+		parts[1] == "data-deletion" &&
+		parts[2] == "status" &&
+		isPublicThreadsConfirmationCode(parts[3])
+}
+
+func isPublicThreadsConfirmationCode(value string) bool {
+	if len(value) != len("THDEL")+32 || !strings.HasPrefix(value, "THDEL") {
+		return false
+	}
+	for _, character := range value[len("THDEL"):] {
+		if (character < '0' || character > '9') &&
+			(character < 'a' || character > 'f') &&
+			(character < 'A' || character > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 // withRateLimit wraps a handler with the rate limit middleware.

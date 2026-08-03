@@ -89,6 +89,22 @@ export interface SetOrganizationSubscriptionRequest {
   manual_reference: string
 }
 
+export interface EnableThreadsPublicEngagementRequest {
+  reason: string
+}
+
+export interface EnableThreadsPublicEngagementResponse {
+  organization_id: string
+  entitlement_key: 'threads.public_engagement.enabled'
+  override_id: string
+  source: 'support'
+  starts_at: string
+  created: boolean
+  effective_enabled: boolean
+  plan_code: string
+  subscription_status: string
+}
+
 export interface OnboardingStep {
   key: string
   label: string
@@ -611,6 +627,14 @@ export const organizationSubscriptionService = {
   set: (organizationId: string, data: SetOrganizationSubscriptionRequest) =>
     api.put<APIEnvelope<SubscriptionSummary>>(
       `/admin/organizations/${encodeURIComponent(organizationId)}/subscription`,
+      data,
+    ),
+}
+
+export const organizationEntitlementSupportService = {
+  enableThreadsPublicEngagement: (organizationId: string, data: EnableThreadsPublicEngagementRequest) =>
+    api.post<APIEnvelope<EnableThreadsPublicEngagementResponse>>(
+      `/admin/organizations/${encodeURIComponent(organizationId)}/entitlements/threads-public-engagement/enable`,
       data,
     ),
 }
