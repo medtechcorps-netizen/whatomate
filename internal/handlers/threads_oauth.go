@@ -27,7 +27,7 @@ import (
 
 const (
 	threadsAuthorizationURL            = "https://threads.com/oauth/authorize"
-	threadsGraphBaseURL                = "https://graph.threads.com"
+	threadsGraphBaseURL                = "https://graph.threads.net"
 	threadsOAuthStatePrefix            = "integration:threads:oauth:state:"
 	threadsOAuthStateTTL               = 10 * time.Minute
 	threadsOAuthHTTPTimeout            = 30 * time.Second

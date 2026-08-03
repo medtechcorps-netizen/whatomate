@@ -23,7 +23,7 @@ import (
 
 const (
 	ThreadsProvider            = "threads"
-	defaultThreadsAPIBaseURL   = "https://graph.threads.com/v1.0"
+	defaultThreadsAPIBaseURL   = "https://graph.threads.net/v1.0"
 	defaultThreadsHTTPTimeout  = 30 * time.Second
 	defaultThreadsResponseSize = int64(1 << 20)
 	maxThreadsTextRunes        = 500
