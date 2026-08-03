@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const organizationId = "81111111-1111-4111-8111-111111111111";
+const selectedOrganizationId = "81222222-2222-4222-8222-222222222222";
 
 const permission = (resource: string, action = "read") => ({
   id: `${resource}-${action}`,
@@ -275,10 +276,23 @@ async function installIntegrationMocks(
     threadsEntitlementEnabled?: boolean;
     entitlementUnavailable?: boolean;
     failEntitlementRefreshAfterGrant?: boolean;
+    failEntitlementRefreshAfterRevoke?: boolean;
+    entitlementRemainsEnabledAfterRevoke?: boolean;
+    supportOverrideActive?: boolean;
+    supportStatusUnavailable?: boolean;
+    supportStatusOrganizationId?: string;
+    failSupportStatusRefreshAfterGrant?: boolean;
+    failSupportStatusRefreshAfterRevoke?: boolean;
+    revokeConflict?: boolean;
+    selectedOrganizationId?: string;
   } = {},
 ) {
   const integrations = integrationFixture();
   let threadsEntitlementEnabled = options.threadsEntitlementEnabled ?? true;
+  let threadsSupportOverrideActive = options.supportOverrideActive ?? false;
+  let threadsSupportOverrideId = "8aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const entitlementTargetOrganizationId =
+    options.selectedOrganizationId ?? organizationId;
   const googleProperties = [
     {
       id: "88888888-8888-4888-8888-888888888881",
@@ -313,6 +327,18 @@ async function installIntegrationMocks(
       method: string;
       url: string;
       body: Record<string, unknown>;
+      organizationHeader?: string;
+    }>,
+    threadsEntitlementRevocationRequests: [] as Array<{
+      method: string;
+      url: string;
+      body: Record<string, unknown>;
+      organizationHeader?: string;
+    }>,
+    threadsSupportStatusRequests: [] as Array<{
+      method: string;
+      url: string;
+      organizationHeader?: string;
     }>,
     updates: [] as Array<Record<string, unknown>>,
     threadsUpdates: [] as Array<Record<string, unknown>>,
@@ -325,10 +351,22 @@ async function installIntegrationMocks(
     googleDisconnectMethods: [] as string[],
   };
 
-  await page.addInitScript((storedUser) => {
-    window.localStorage.setItem("user", JSON.stringify(storedUser));
-    window.localStorage.setItem("locale", "en");
-  }, user);
+  await page.addInitScript(
+    ({ storedUser, activeOrganizationId }) => {
+      window.localStorage.setItem("user", JSON.stringify(storedUser));
+      window.localStorage.setItem("locale", "en");
+      if (activeOrganizationId) {
+        window.localStorage.setItem(
+          "selected_organization_id",
+          activeOrganizationId,
+        );
+      }
+    },
+    {
+      storedUser: user,
+      activeOrganizationId: options.selectedOrganizationId,
+    },
+  );
 
   // Register the catch-all first. Playwright gives the later, specific routes
   // priority, keeping unrelated layout requests deterministic.
@@ -343,7 +381,9 @@ async function installIntegrationMocks(
     if (
       options.entitlementUnavailable ||
       (options.failEntitlementRefreshAfterGrant &&
-        traffic.threadsEntitlementRequests.length > 0)
+        traffic.threadsEntitlementRequests.length > 0) ||
+      (options.failEntitlementRefreshAfterRevoke &&
+        traffic.threadsEntitlementRevocationRequests.length > 0)
     ) {
       await route.fulfill({
         status: 503,
@@ -366,7 +406,51 @@ async function installIntegrationMocks(
   });
   await page.route(
     new RegExp(
-      `/api/admin/organizations/${organizationId}/entitlements/threads-public-engagement/enable(?:\\?.*)?$`,
+      `/api/admin/organizations/${entitlementTargetOrganizationId}/entitlements/threads-public-engagement/support-status(?:\\?.*)?$`,
+    ),
+    async (route) => {
+      const request = route.request();
+      traffic.threadsSupportStatusRequests.push({
+        method: request.method(),
+        url: request.url(),
+        organizationHeader: request.headers()["x-organization-id"],
+      });
+      if (
+        options.supportStatusUnavailable ||
+        (options.failSupportStatusRefreshAfterGrant &&
+          traffic.threadsEntitlementRequests.length > 0) ||
+        (options.failSupportStatusRefreshAfterRevoke &&
+          traffic.threadsEntitlementRevocationRequests.length > 0)
+      ) {
+        await route.fulfill({
+          status: 503,
+          json: { error: "Support override status temporarily unavailable" },
+        });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          data: {
+            organization_id:
+              options.supportStatusOrganizationId ??
+              entitlementTargetOrganizationId,
+            entitlement_key: "threads.public_engagement.enabled",
+            active: threadsSupportOverrideActive,
+            ...(threadsSupportOverrideActive
+              ? {
+                  override_id: threadsSupportOverrideId,
+                  source: "support",
+                  starts_at: "2026-08-03T09:00:00Z",
+                }
+              : {}),
+          },
+        },
+      });
+    },
+  );
+  await page.route(
+    new RegExp(
+      `/api/admin/organizations/${entitlementTargetOrganizationId}/entitlements/threads-public-engagement/enable(?:\\?.*)?$`,
     ),
     async (route) => {
       const request = route.request();
@@ -375,20 +459,64 @@ async function installIntegrationMocks(
         method: request.method(),
         url: request.url(),
         body,
+        organizationHeader: request.headers()["x-organization-id"],
       });
       threadsEntitlementEnabled = true;
+      threadsSupportOverrideActive = true;
       await route.fulfill({
         json: {
           data: {
-            organization_id: organizationId,
+            organization_id: entitlementTargetOrganizationId,
             entitlement_key: "threads.public_engagement.enabled",
-            override_id: "8aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            override_id: threadsSupportOverrideId,
             source: "support",
             starts_at: "2026-08-03T09:00:00Z",
             created: true,
             effective_enabled: true,
             plan_code: "rereply-growth",
             subscription_status: "trialing",
+          },
+        },
+      });
+    },
+  );
+  await page.route(
+    new RegExp(
+      `/api/admin/organizations/${entitlementTargetOrganizationId}/entitlements/threads-public-engagement/revoke-support(?:\\?.*)?$`,
+    ),
+    async (route) => {
+      const request = route.request();
+      const body = request.postDataJSON() as Record<string, unknown>;
+      traffic.threadsEntitlementRevocationRequests.push({
+        method: request.method(),
+        url: request.url(),
+        body,
+        organizationHeader: request.headers()["x-organization-id"],
+      });
+      if (
+        options.revokeConflict &&
+        traffic.threadsEntitlementRevocationRequests.length === 1
+      ) {
+        threadsSupportOverrideId = "8bbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        await route.fulfill({
+          status: 409,
+          json: { error: "The active support grant changed" },
+        });
+        return;
+      }
+      threadsSupportOverrideActive = false;
+      threadsEntitlementEnabled =
+        options.entitlementRemainsEnabledAfterRevoke ?? false;
+      await route.fulfill({
+        json: {
+          data: {
+            organization_id: entitlementTargetOrganizationId,
+            entitlement_key: "threads.public_engagement.enabled",
+            override_id: threadsSupportOverrideId,
+            source: "support",
+            revoked_at: "2026-08-03T10:00:00Z",
+            revoked: true,
+            effective_enabled: threadsEntitlementEnabled,
           },
         },
       });
@@ -898,11 +1026,87 @@ test("Threads entitlement support action is hidden from workspace admins while a
   await expect(page.locator("#integration-enabled")).toBeDisabled();
 });
 
+test("platform owner sees plan-only Threads access without a support revocation action", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, superAdminUser, {
+    threadsEntitlementEnabled: true,
+    supportOverrideActive: false,
+    selectedOrganizationId,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  await expect
+    .poll(() => traffic.threadsSupportStatusRequests.length)
+    .toBe(1);
+  const statusRequest = traffic.threadsSupportStatusRequests[0];
+  expect(statusRequest.method).toBe("GET");
+  expect(new URL(statusRequest.url).pathname).toBe(
+    `/api/admin/organizations/${selectedOrganizationId}/entitlements/threads-public-engagement/support-status`,
+  );
+  expect(statusRequest.organizationHeader).toBe(selectedOrganizationId);
+  await expect(
+    page.getByTestId("threads-entitlement-no-support-override"),
+  ).toBeVisible();
+  await expect(page.getByTestId("threads-entitlement-enable")).toHaveCount(0);
+  await expect(page.getByTestId("threads-entitlement-revoke")).toHaveCount(0);
+  await expect(page.locator("#integration-enabled")).toBeEnabled();
+});
+
+test("Threads support actions fail closed when support status is unavailable", async ({
+  page,
+}) => {
+  await installIntegrationMocks(page, superAdminUser, {
+    threadsEntitlementEnabled: false,
+    supportStatusUnavailable: true,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  await expect(
+    page.getByTestId("threads-entitlement-support-unavailable"),
+  ).toBeVisible();
+  await expect(page.getByTestId("threads-entitlement-enable")).toHaveCount(0);
+  await expect(page.getByTestId("threads-entitlement-revoke")).toHaveCount(0);
+  await expect(page.locator("#integration-enabled")).toBeDisabled();
+});
+
+test("Threads support actions fail closed on a stale workspace status response", async ({
+  page,
+}) => {
+  await installIntegrationMocks(page, superAdminUser, {
+    threadsEntitlementEnabled: true,
+    supportOverrideActive: true,
+    supportStatusOrganizationId: organizationId,
+    selectedOrganizationId,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  await expect(
+    page.getByTestId("threads-entitlement-support-unavailable"),
+  ).toBeVisible();
+  await expect(page.getByTestId("threads-entitlement-enable")).toHaveCount(0);
+  await expect(page.getByTestId("threads-entitlement-revoke")).toHaveCount(0);
+  await expect(page.locator("#integration-enabled")).toBeEnabled();
+});
+
 test("platform owner grants the exact Threads entitlement with an audited reason and refreshes state", async ({
   page,
 }) => {
   const traffic = await installIntegrationMocks(page, superAdminUser, {
     threadsEntitlementEnabled: false,
+    selectedOrganizationId,
   });
   await page.goto("/settings/integrations");
   await page
@@ -927,19 +1131,221 @@ test("platform owner grants the exact Threads entitlement with an audited reason
   const request = traffic.threadsEntitlementRequests[0];
   expect(request.method).toBe("POST");
   expect(new URL(request.url).pathname).toBe(
-    `/api/admin/organizations/${organizationId}/entitlements/threads-public-engagement/enable`,
+    `/api/admin/organizations/${selectedOrganizationId}/entitlements/threads-public-engagement/enable`,
   );
+  expect(request.organizationHeader).toBe(selectedOrganizationId);
   expect(request.body).toEqual({
     reason: "SR-2041 approved by platform support",
   });
+  await expect
+    .poll(() => traffic.threadsSupportStatusRequests.length)
+    .toBeGreaterThanOrEqual(2);
+  expect(
+    traffic.threadsSupportStatusRequests.every(
+      (statusRequest) =>
+        statusRequest.method === "GET" &&
+        new URL(statusRequest.url).pathname ===
+          `/api/admin/organizations/${selectedOrganizationId}/entitlements/threads-public-engagement/support-status` &&
+        statusRequest.organizationHeader === selectedOrganizationId,
+    ),
+  ).toBe(true);
   await expect.poll(() => traffic.entitlementReads).toBeGreaterThanOrEqual(2);
   await expect.poll(() => traffic.listReads).toBeGreaterThanOrEqual(2);
-  await expect(support).toHaveCount(0);
+  await expect(support).toBeVisible();
+  await expect(page.getByTestId("threads-entitlement-enable")).toHaveCount(0);
+  await expect(page.getByTestId("threads-entitlement-revoke")).toBeVisible();
   await expect(page.locator("#integration-enabled")).toBeEnabled();
   await expect(
     page.getByText("Threads public engagement entitlement enabled", {
       exact: true,
     }),
+  ).toBeVisible();
+});
+
+test("platform owner revokes the selected workspace support entitlement with an audited reason", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, superAdminUser, {
+    threadsEntitlementEnabled: true,
+    supportOverrideActive: true,
+    selectedOrganizationId,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  const support = page.getByTestId("threads-entitlement-support");
+  const reason = page.locator("#threads-entitlement-support-revoke-reason");
+  const revoke = page.getByTestId("threads-entitlement-revoke");
+  await expect(support).toBeVisible();
+  await expect(page.getByTestId("threads-entitlement-enable")).toHaveCount(0);
+  await expect(reason).toBeVisible();
+  await expect(revoke).toBeDisabled();
+  await reason.fill("   ");
+  await expect(revoke).toBeDisabled();
+  await reason.fill("  SR-2043 customer offboarding approved  ");
+  await expect(revoke).toBeEnabled();
+  await expect(page.locator("#integration-enabled")).toBeEnabled();
+  await revoke.click();
+
+  await expect
+    .poll(() => traffic.threadsEntitlementRevocationRequests.length)
+    .toBe(1);
+  const request = traffic.threadsEntitlementRevocationRequests[0];
+  expect(request.method).toBe("POST");
+  expect(new URL(request.url).pathname).toBe(
+    `/api/admin/organizations/${selectedOrganizationId}/entitlements/threads-public-engagement/revoke-support`,
+  );
+  expect(request.organizationHeader).toBe(selectedOrganizationId);
+  expect(request.body).toEqual({
+    override_id: "8aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    reason: "SR-2043 customer offboarding approved",
+  });
+  await expect
+    .poll(() => traffic.threadsSupportStatusRequests.length)
+    .toBeGreaterThanOrEqual(2);
+  expect(
+    traffic.threadsSupportStatusRequests.every(
+      (statusRequest) =>
+        statusRequest.method === "GET" &&
+        new URL(statusRequest.url).pathname ===
+          `/api/admin/organizations/${selectedOrganizationId}/entitlements/threads-public-engagement/support-status` &&
+        statusRequest.organizationHeader === selectedOrganizationId,
+    ),
+  ).toBe(true);
+  await expect.poll(() => traffic.entitlementReads).toBeGreaterThanOrEqual(2);
+  await expect.poll(() => traffic.listReads).toBeGreaterThanOrEqual(2);
+  await expect(page.getByTestId("threads-entitlement-revoke")).toHaveCount(0);
+  await expect(page.getByTestId("threads-entitlement-enable")).toBeVisible();
+  await expect(page.locator("#integration-enabled")).toBeDisabled();
+  await expect(
+    page.getByText("Threads support entitlement revoked", { exact: true }),
+  ).toBeVisible();
+});
+
+test("a revoke conflict refreshes the changed support grant and requires a new reason", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, superAdminUser, {
+    threadsEntitlementEnabled: true,
+    supportOverrideActive: true,
+    revokeConflict: true,
+    selectedOrganizationId,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  const reason = page.locator("#threads-entitlement-support-revoke-reason");
+  await reason.fill("SR-2046 revoke the reviewed grant");
+  await page.getByTestId("threads-entitlement-revoke").click();
+
+  await expect
+    .poll(() => traffic.threadsEntitlementRevocationRequests.length)
+    .toBe(1);
+  expect(traffic.threadsEntitlementRevocationRequests[0].body).toEqual({
+    override_id: "8aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    reason: "SR-2046 revoke the reviewed grant",
+  });
+  await expect
+    .poll(() => traffic.threadsSupportStatusRequests.length)
+    .toBeGreaterThanOrEqual(2);
+  await expect(reason).toHaveValue("");
+  await expect(page.getByTestId("threads-entitlement-revoke")).toBeDisabled();
+  await expect(
+    page.getByText(
+      "The active support grant changed. Its status was refreshed; review it before entering a new revocation reason.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+
+  await reason.fill("SR-2047 revoke the refreshed grant");
+  await page.getByTestId("threads-entitlement-revoke").click();
+  await expect
+    .poll(() => traffic.threadsEntitlementRevocationRequests.length)
+    .toBe(2);
+  expect(traffic.threadsEntitlementRevocationRequests[1].body).toEqual({
+    override_id: "8bbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    reason: "SR-2047 revoke the refreshed grant",
+  });
+});
+
+test("support revocation preserves public engagement granted by another entitlement", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, superAdminUser, {
+    threadsEntitlementEnabled: true,
+    supportOverrideActive: true,
+    entitlementRemainsEnabledAfterRevoke: true,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  const reason = page.locator("#threads-entitlement-support-revoke-reason");
+  await reason.fill("SR-2045 remove support override only");
+  await page.getByTestId("threads-entitlement-revoke").click();
+
+  await expect
+    .poll(() => traffic.threadsEntitlementRevocationRequests.length)
+    .toBe(1);
+  await expect.poll(() => traffic.entitlementReads).toBeGreaterThanOrEqual(2);
+  await expect.poll(() => traffic.listReads).toBeGreaterThanOrEqual(2);
+  await expect(page.getByTestId("threads-entitlement-revoke")).toHaveCount(0);
+  await expect(
+    page.getByTestId("threads-entitlement-no-support-override"),
+  ).toBeVisible();
+  await expect(page.locator("#integration-enabled")).toBeEnabled();
+  await expect(reason).toHaveCount(0);
+  await expect(
+    page.getByText(
+      "Threads support entitlement revoked; public engagement remains enabled by another entitlement.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+});
+
+test("Threads activation fails closed when the post-revoke entitlement refresh fails", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, superAdminUser, {
+    threadsEntitlementEnabled: true,
+    supportOverrideActive: true,
+    failEntitlementRefreshAfterRevoke: true,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  await page
+    .locator("#threads-entitlement-support-revoke-reason")
+    .fill("SR-2044 verify fail-closed revocation");
+  await page.getByTestId("threads-entitlement-revoke").click();
+
+  await expect
+    .poll(() => traffic.threadsEntitlementRevocationRequests.length)
+    .toBe(1);
+  await expect.poll(() => traffic.entitlementReads).toBeGreaterThanOrEqual(2);
+  await expect.poll(() => traffic.listReads).toBeGreaterThanOrEqual(2);
+  await expect(page.getByTestId("threads-entitlement-enable")).toHaveCount(0);
+  await expect(page.getByTestId("threads-entitlement-revoke")).toHaveCount(0);
+  await expect(
+    page.getByTestId("threads-entitlement-support-unavailable"),
+  ).toBeVisible();
+  await expect(page.locator("#integration-enabled")).toBeDisabled();
+  await expect(
+    page.getByText(
+      "The support entitlement was revoked, but its status could not be refreshed. Threads activation remains locked.",
+      { exact: true },
+    ),
   ).toBeVisible();
 });
 
