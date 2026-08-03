@@ -50,7 +50,7 @@ type ForwardWorker struct {
 
 func NewForwardWorker(config *Config, store InboundQueueStore, options ...ForwardWorkerOption) (*ForwardWorker, error) {
 	if config == nil || store == nil {
-		return nil, errors.New("Gmail forward worker configuration is incomplete")
+		return nil, errors.New("gmail forward worker configuration is incomplete")
 	}
 	client := &http.Client{
 		Timeout: config.ForwardTimeout,

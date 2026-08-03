@@ -75,7 +75,7 @@ func NewServer(
 	options ...ServerOption,
 ) (*Server, error) {
 	if config == nil || state == nil || oauth == nil || gmail == nil || outbound == nil {
-		return nil, errors.New("Gmail relay server configuration is incomplete")
+		return nil, errors.New("gmail relay server configuration is incomplete")
 	}
 	server := &Server{
 		config:   config,
@@ -408,7 +408,7 @@ func validateGmailOutbound(message channelapi.OutboundMessage) error {
 		return errors.New("idempotency key is required")
 	}
 	if strings.TrimSpace(message.Conversation.ExternalID) == "" || len(message.Conversation.ExternalID) > 255 {
-		return errors.New("Gmail thread ID is required")
+		return errors.New("gmail thread ID is required")
 	}
 	if len(message.Parts) != 1 || message.Parts[0].Type != models.MessagePartTypeText ||
 		strings.TrimSpace(message.Parts[0].Text) == "" || utf8.RuneCountInString(message.Parts[0].Text) > 10_000 {

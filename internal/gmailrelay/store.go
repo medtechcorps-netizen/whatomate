@@ -19,9 +19,9 @@ const OAuthStateTTL = 10 * time.Minute
 var (
 	// ErrOAuthStateNotFound covers an absent, expired, or already-consumed state.
 	// Callers deliberately receive the same error for all three cases.
-	ErrOAuthStateNotFound   = errors.New("OAuth state is invalid or expired")
-	ErrOAuthStateCollision  = errors.New("OAuth state already exists")
-	ErrRefreshTokenNotFound = errors.New("Gmail refresh token is not configured")
+	ErrOAuthStateNotFound   = errors.New("oauth state is invalid or expired")
+	ErrOAuthStateCollision  = errors.New("oauth state already exists")
+	ErrRefreshTokenNotFound = errors.New("gmail refresh token is not configured")
 )
 
 // OAuthState is short-lived callback state. The code verifier is secret and
@@ -95,24 +95,24 @@ type RedisStore struct {
 // NewRedisStore constructs a Redis-backed store from the mandatory Redis URL.
 func NewRedisStore(config *Config) (*RedisStore, error) {
 	if config == nil {
-		return nil, errors.New("Gmail relay config is required")
+		return nil, errors.New("gmail relay config is required")
 	}
 	options, err := redis.ParseURL(config.RedisURL)
 	if err != nil {
-		return nil, errors.New("Redis configuration is invalid")
+		return nil, errors.New("redis configuration is invalid")
 	}
 	return newRedisStore(config, &goRedisBackend{client: redis.NewClient(options)})
 }
 
 func newRedisStore(config *Config, backend redisBackend) (*RedisStore, error) {
 	if config == nil || backend == nil {
-		return nil, errors.New("Gmail relay Redis store configuration is incomplete")
+		return nil, errors.New("gmail relay Redis store configuration is incomplete")
 	}
 	if strings.TrimSpace(config.RedisPrefix) == "" || len(config.EncryptionKey) < minimumEncryptionKeyLen {
-		return nil, errors.New("Gmail relay Redis store security configuration is incomplete")
+		return nil, errors.New("gmail relay Redis store security configuration is incomplete")
 	}
 	if err := validateMailbox(config.Mailbox); err != nil {
-		return nil, errors.New("Gmail relay Redis store mailbox is invalid")
+		return nil, errors.New("gmail relay Redis store mailbox is invalid")
 	}
 	digest := sha256.Sum256([]byte(config.Mailbox))
 	return &RedisStore{
@@ -125,7 +125,7 @@ func newRedisStore(config *Config, backend redisBackend) (*RedisStore, error) {
 
 func (s *RedisStore) Ping(ctx context.Context) error {
 	if s == nil || s.backend == nil {
-		return errors.New("Redis is not configured")
+		return errors.New("redis is not configured")
 	}
 	if err := s.backend.Ping(ctx); err != nil {
 		return fmt.Errorf("ping Redis: %w", err)
@@ -142,10 +142,10 @@ func (s *RedisStore) Close() error {
 
 func (s *RedisStore) SaveOAuthState(ctx context.Context, state OAuthState) error {
 	if s == nil || s.backend == nil {
-		return errors.New("Redis is not configured")
+		return errors.New("redis is not configured")
 	}
 	if !validOAuthOpaqueValue(state.Nonce) || !validOAuthOpaqueValue(state.CodeVerifier) || state.ExpiresAt.IsZero() {
-		return errors.New("OAuth state is invalid")
+		return errors.New("oauth state is invalid")
 	}
 	payload, err := json.Marshal(state)
 	if err != nil {
@@ -188,11 +188,11 @@ func (s *RedisStore) ConsumeOAuthState(ctx context.Context, nonce string) (OAuth
 // boundary. Access tokens and Google profile data are never persisted here.
 func (s *RedisStore) SaveRefreshToken(ctx context.Context, refreshToken string) error {
 	if s == nil || s.backend == nil {
-		return errors.New("Redis is not configured")
+		return errors.New("redis is not configured")
 	}
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
-		return errors.New("Gmail refresh token is empty")
+		return errors.New("gmail refresh token is empty")
 	}
 	encrypted, err := appcrypto.Encrypt(refreshToken, s.encryptionKey)
 	if err != nil || !appcrypto.IsEncrypted(encrypted) {
@@ -206,7 +206,7 @@ func (s *RedisStore) SaveRefreshToken(ctx context.Context, refreshToken string) 
 
 func (s *RedisStore) LoadRefreshToken(ctx context.Context) (string, error) {
 	if s == nil || s.backend == nil {
-		return "", errors.New("Redis is not configured")
+		return "", errors.New("redis is not configured")
 	}
 	encrypted, err := s.backend.Get(ctx, s.refreshTokenKey())
 	if errors.Is(err, redis.Nil) {
@@ -229,7 +229,7 @@ func (s *RedisStore) LoadRefreshToken(ctx context.Context) (string, error) {
 // other Gmail relay mailbox or OAuth grant.
 func (s *RedisStore) DeleteRefreshToken(ctx context.Context) error {
 	if s == nil || s.backend == nil {
-		return errors.New("Redis is not configured")
+		return errors.New("redis is not configured")
 	}
 	if err := s.backend.Del(ctx, s.refreshTokenKey()); err != nil {
 		return fmt.Errorf("delete Gmail refresh token: %w", err)

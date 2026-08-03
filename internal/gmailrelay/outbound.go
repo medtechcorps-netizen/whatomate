@@ -124,7 +124,7 @@ func findSentMessage(
 	}
 	for _, found := range result.Messages {
 		if found.ThreadID == expectedThreadID {
-			return GmailSendResponse{ID: found.ID, ThreadID: found.ThreadID}, nil
+			return GmailSendResponse(found), nil
 		}
 	}
 	if len(result.Messages) > 0 {
@@ -145,7 +145,7 @@ func resolveThreadReplyContext(
 		return threadReplyContext{}, err
 	}
 	if strings.TrimSpace(thread.ID) != threadID {
-		return threadReplyContext{}, errors.New("Gmail returned a different thread")
+		return threadReplyContext{}, errors.New("gmail returned a different thread")
 	}
 
 	type parsedThreadMessage struct {
@@ -166,7 +166,7 @@ func resolveThreadReplyContext(
 		parsedMessages = append(parsedMessages, parsedThreadMessage{raw: raw, parsed: parsed, internal: internal})
 	}
 	if len(parsedMessages) == 0 {
-		return threadReplyContext{}, errors.New("Gmail thread has no readable messages")
+		return threadReplyContext{}, errors.New("gmail thread has no readable messages")
 	}
 	sort.SliceStable(parsedMessages, func(i, j int) bool {
 		if parsedMessages[i].internal == parsedMessages[j].internal {
@@ -189,7 +189,7 @@ func resolveThreadReplyContext(
 		}
 	}
 	if strings.TrimSpace(target.parsed.MessageID) == "" {
-		return threadReplyContext{}, errors.New("Gmail reply target has no RFC Message-ID")
+		return threadReplyContext{}, errors.New("gmail reply target has no RFC Message-ID")
 	}
 
 	var latestCustomer *parsedThreadMessage
@@ -200,7 +200,7 @@ func resolveThreadReplyContext(
 		}
 	}
 	if latestCustomer == nil {
-		return threadReplyContext{}, errors.New("Gmail thread has no customer sender")
+		return threadReplyContext{}, errors.New("gmail thread has no customer sender")
 	}
 	recipient := latestCustomer.parsed.ReplyRecipient()
 	requested, err := normalizeRecipient(message.Recipient)
@@ -221,7 +221,7 @@ func resolveThreadReplyContext(
 		}
 	}
 	if subject == "" {
-		return threadReplyContext{}, errors.New("Gmail thread has no subject")
+		return threadReplyContext{}, errors.New("gmail thread has no subject")
 	}
 	references := append([]string(nil), target.parsed.References...)
 	references = append(references, target.parsed.MessageID)

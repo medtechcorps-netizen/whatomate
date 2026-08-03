@@ -523,37 +523,37 @@ func BuildGmailReply(options ReplyOptions) ([]byte, error) {
 	}
 	from, err := formatMailbox(options.From)
 	if err != nil {
-		return nil, fmt.Errorf("From: %w", err)
+		return nil, fmt.Errorf("from: %w", err)
 	}
 	to, err := formatMailboxList(options.To)
 	if err != nil {
-		return nil, fmt.Errorf("To: %w", err)
+		return nil, fmt.Errorf("to: %w", err)
 	}
 	if to == "" {
 		return nil, errors.New("at least one To recipient is required")
 	}
 	cc, err := formatMailboxList(options.Cc)
 	if err != nil {
-		return nil, fmt.Errorf("Cc: %w", err)
+		return nil, fmt.Errorf("cc: %w", err)
 	}
 
 	messageID := strings.TrimSpace(options.MessageID)
 	if messageID == "" {
 		messageID, err = DeterministicMessageID(options.IdempotencyKey, options.MessageIDDomain)
 		if err != nil {
-			return nil, fmt.Errorf("Message-ID: %w", err)
+			return nil, fmt.Errorf("message-ID: %w", err)
 		}
 	}
 	messageID, err = canonicalMessageID(messageID)
 	if err != nil {
-		return nil, fmt.Errorf("Message-ID: %w", err)
+		return nil, fmt.Errorf("message-ID: %w", err)
 	}
 
 	inReplyTo := ""
 	if strings.TrimSpace(options.InReplyTo) != "" {
 		inReplyTo, err = canonicalMessageID(options.InReplyTo)
 		if err != nil {
-			return nil, fmt.Errorf("In-Reply-To: %w", err)
+			return nil, fmt.Errorf("in-reply-to: %w", err)
 		}
 	}
 	references := make([]string, 0, len(options.References)+1)
@@ -561,7 +561,7 @@ func BuildGmailReply(options ReplyOptions) ([]byte, error) {
 	for _, raw := range options.References {
 		id, referenceErr := canonicalMessageID(raw)
 		if referenceErr != nil {
-			return nil, fmt.Errorf("References: %w", referenceErr)
+			return nil, fmt.Errorf("references: %w", referenceErr)
 		}
 		if _, exists := seenReferences[id]; !exists {
 			references = append(references, id)

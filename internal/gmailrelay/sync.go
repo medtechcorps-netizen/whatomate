@@ -60,7 +60,7 @@ func NewSyncer(
 	options ...SyncerOption,
 ) (*Syncer, error) {
 	if config == nil || gmail == nil || state == nil || queue == nil {
-		return nil, errors.New("Gmail syncer configuration is incomplete")
+		return nil, errors.New("gmail syncer configuration is incomplete")
 	}
 	syncer := &Syncer{
 		config: config,
@@ -148,7 +148,7 @@ func (s *Syncer) processOnceWithLease(ctx context.Context, leaseToken string) er
 func (s *Syncer) maintainSyncLease(ctx context.Context, leaseToken string, leaseTTL time.Duration) error {
 	interval := leaseTTL / 3
 	if interval <= 0 {
-		return errors.New("Gmail sync lease renewal interval is invalid")
+		return errors.New("gmail sync lease renewal interval is invalid")
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -262,7 +262,7 @@ func (s *Syncer) recoverStaleCursor(ctx context.Context, leaseToken string) erro
 			break
 		}
 		if pageNumber == maxRecoveryPages-1 {
-			return errors.New("Gmail recovery result exceeds safety limit")
+			return errors.New("gmail recovery result exceeds safety limit")
 		}
 	}
 	if err := s.processMessageRefs(ctx, mapValues(seen)); err != nil {

@@ -56,8 +56,8 @@ return 1
 `)
 
 var (
-	ErrSyncLeaseLost           = errors.New("Gmail sync lease was lost")
-	ErrHistoryCursorRegression = errors.New("Gmail history cursor would regress")
+	ErrSyncLeaseLost           = errors.New("gmail sync lease was lost")
+	ErrHistoryCursorRegression = errors.New("gmail history cursor would regress")
 )
 
 type syncLeaseReleaser interface {
@@ -112,7 +112,7 @@ func (b *goRedisBackend) CommitSuccessfulSync(
 
 func (s *RedisStore) GetHistoryCursor(ctx context.Context) (string, error) {
 	if s == nil || s.backend == nil {
-		return "", errors.New("Redis is not configured")
+		return "", errors.New("redis is not configured")
 	}
 	value, err := s.backend.Get(ctx, s.syncKey("cursor"))
 	if errors.Is(err, redis.Nil) {
@@ -126,7 +126,7 @@ func (s *RedisStore) GetHistoryCursor(ctx context.Context) (string, error) {
 
 func (s *RedisStore) SetHistoryCursor(ctx context.Context, cursor string) error {
 	if s == nil || s.backend == nil || strings.TrimSpace(cursor) == "" {
-		return errors.New("Gmail history cursor is invalid")
+		return errors.New("gmail history cursor is invalid")
 	}
 	if err := s.backend.Set(ctx, s.syncKey("cursor"), strings.TrimSpace(cursor), 0); err != nil {
 		return fmt.Errorf("store Gmail history cursor: %w", err)
@@ -136,7 +136,7 @@ func (s *RedisStore) SetHistoryCursor(ctx context.Context, cursor string) error 
 
 func (s *RedisStore) GetLastSuccessfulSync(ctx context.Context) (time.Time, error) {
 	if s == nil || s.backend == nil {
-		return time.Time{}, errors.New("Redis is not configured")
+		return time.Time{}, errors.New("redis is not configured")
 	}
 	value, err := s.backend.Get(ctx, s.syncKey("last_success"))
 	if errors.Is(err, redis.Nil) {
@@ -154,7 +154,7 @@ func (s *RedisStore) GetLastSuccessfulSync(ctx context.Context) (time.Time, erro
 
 func (s *RedisStore) MarkSuccessfulSync(ctx context.Context, at time.Time) error {
 	if s == nil || s.backend == nil || at.IsZero() {
-		return errors.New("Gmail sync time is invalid")
+		return errors.New("gmail sync time is invalid")
 	}
 	if err := s.backend.Set(ctx, s.syncKey("last_success"), at.UTC().Format(time.RFC3339Nano), 0); err != nil {
 		return fmt.Errorf("store Gmail sync time: %w", err)
@@ -166,7 +166,7 @@ func (s *RedisStore) MarkSuccessfulSync(ctx context.Context, at time.Time) error
 // lease release both verify the opaque holder token atomically.
 func (s *RedisStore) TryAcquireSyncLease(ctx context.Context, token string, ttl time.Duration) (bool, error) {
 	if s == nil || s.backend == nil || strings.TrimSpace(token) == "" || ttl <= 0 {
-		return false, errors.New("Gmail sync lease is invalid")
+		return false, errors.New("gmail sync lease is invalid")
 	}
 	acquired, err := s.backend.SetNX(ctx, s.syncKey("lease"), token, ttl)
 	if err != nil {
@@ -179,11 +179,11 @@ func (s *RedisStore) TryAcquireSyncLease(ctx context.Context, token string, ttl 
 // never extend a newer worker's lease after its own token has expired.
 func (s *RedisStore) RenewSyncLease(ctx context.Context, token string, ttl time.Duration) (bool, error) {
 	if s == nil || s.backend == nil || strings.TrimSpace(token) == "" || ttl <= 0 {
-		return false, errors.New("Gmail sync lease is invalid")
+		return false, errors.New("gmail sync lease is invalid")
 	}
 	renewer, ok := s.backend.(syncLeaseRenewer)
 	if !ok {
-		return false, errors.New("Redis backend does not support Gmail sync lease renewal")
+		return false, errors.New("redis backend does not support Gmail sync lease renewal")
 	}
 	renewed, err := renewer.CompareAndExpire(ctx, s.syncKey("lease"), token, ttl)
 	if err != nil {
@@ -199,11 +199,11 @@ func (s *RedisStore) CommitSuccessfulSync(ctx context.Context, leaseToken, curso
 	leaseToken = strings.TrimSpace(leaseToken)
 	cursor = strings.TrimSpace(cursor)
 	if s == nil || s.backend == nil || leaseToken == "" || !validHistoryCursor(cursor) || at.IsZero() {
-		return errors.New("Gmail sync commit is invalid")
+		return errors.New("gmail sync commit is invalid")
 	}
 	committer, ok := s.backend.(syncCommitBackend)
 	if !ok {
-		return errors.New("Redis backend does not support fenced Gmail sync commits")
+		return errors.New("redis backend does not support fenced Gmail sync commits")
 	}
 	result, err := committer.CommitSuccessfulSync(
 		ctx,
@@ -231,7 +231,7 @@ func (s *RedisStore) CommitSuccessfulSync(ctx context.Context, leaseToken, curso
 
 func (s *RedisStore) ReleaseSyncLease(ctx context.Context, token string) error {
 	if s == nil || s.backend == nil || strings.TrimSpace(token) == "" {
-		return errors.New("Gmail sync lease is invalid")
+		return errors.New("gmail sync lease is invalid")
 	}
 	releaser, ok := s.backend.(syncLeaseReleaser)
 	if !ok {

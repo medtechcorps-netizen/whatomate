@@ -23,9 +23,9 @@ const (
 )
 
 var (
-	ErrAuthorizationDenied = errors.New("Google authorization was cancelled")
+	ErrAuthorizationDenied = errors.New("google authorization was cancelled")
 	ErrMailboxMismatch     = errors.New("authorized Google account does not match the configured mailbox")
-	ErrRefreshTokenMissing = errors.New("Google did not issue a refresh token")
+	ErrRefreshTokenMissing = errors.New("google did not issue a refresh token")
 )
 
 // OAuthStart is safe to return to the browser. The PKCE verifier remains only
@@ -67,13 +67,13 @@ type OAuthService struct {
 // production; RedisStore is the supported implementation.
 func NewOAuthService(config *Config, store OAuthStore, client *http.Client) (*OAuthService, error) {
 	if config == nil {
-		return nil, errors.New("Gmail relay config is required")
+		return nil, errors.New("gmail relay config is required")
 	}
 	if err := config.validate(); err != nil {
 		return nil, err
 	}
 	if store == nil {
-		return nil, errors.New("Gmail OAuth store is required")
+		return nil, errors.New("gmail OAuth store is required")
 	}
 	if client == nil {
 		client = http.DefaultClient
@@ -99,7 +99,7 @@ func NewOAuthService(config *Config, store OAuthStore, client *http.Client) (*OA
 // authorization request using PKCE S256 and offline access.
 func (s *OAuthService) Begin(ctx context.Context) (OAuthStart, error) {
 	if s == nil || s.config == nil || s.store == nil {
-		return OAuthStart{}, errors.New("Gmail OAuth service is unavailable")
+		return OAuthStart{}, errors.New("gmail OAuth service is unavailable")
 	}
 	nonce, err := randomOAuthValue(32)
 	if err != nil {
@@ -129,7 +129,7 @@ func (s *OAuthService) Begin(ctx context.Context) (OAuthStart, error) {
 // persists the refresh token.
 func (s *OAuthService) CompleteCallback(ctx context.Context, callback OAuthCallback) (OAuthResult, error) {
 	if s == nil || s.config == nil || s.store == nil {
-		return OAuthResult{}, errors.New("Gmail OAuth service is unavailable")
+		return OAuthResult{}, errors.New("gmail OAuth service is unavailable")
 	}
 	stateNonce := strings.TrimSpace(callback.State)
 	if !validOAuthOpaqueValue(stateNonce) {
@@ -149,7 +149,7 @@ func (s *OAuthService) CompleteCallback(ctx context.Context, callback OAuthCallb
 	}
 	code := strings.TrimSpace(callback.Code)
 	if code == "" || len(code) > 8192 {
-		return OAuthResult{}, errors.New("Google authorization code is invalid")
+		return OAuthResult{}, errors.New("google authorization code is invalid")
 	}
 
 	exchangeContext := context.WithValue(ctx, oauth2.HTTPClient, s.client)
@@ -191,7 +191,7 @@ func (s *OAuthService) Complete(ctx context.Context, state, code string) (OAuthR
 // through the same encrypted boundary.
 func (s *OAuthService) AccessToken(ctx context.Context) (string, error) {
 	if s == nil || s.config == nil || s.store == nil {
-		return "", errors.New("Gmail OAuth service is unavailable")
+		return "", errors.New("gmail OAuth service is unavailable")
 	}
 	// Serialize refreshes so a poll, health probe, and outbound send cannot
 	// stampede Google's token endpoint. A one-minute margin prevents handing a
@@ -245,15 +245,15 @@ func (s *OAuthService) fetchProfile(ctx context.Context, token *oauth2.Token) (g
 	if err != nil {
 		return gmailProfile{}, errors.New("fetch Gmail profile")
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxOAuthResponseBytes))
-		return gmailProfile{}, fmt.Errorf("Gmail profile returned HTTP %d", response.StatusCode)
+		return gmailProfile{}, fmt.Errorf("gmail profile returned HTTP %d", response.StatusCode)
 	}
 	var profile gmailProfile
 	decoder := json.NewDecoder(io.LimitReader(response.Body, maxOAuthResponseBytes))
 	if err := decoder.Decode(&profile); err != nil || strings.TrimSpace(profile.EmailAddress) == "" {
-		return gmailProfile{}, errors.New("Gmail profile response is invalid")
+		return gmailProfile{}, errors.New("gmail profile response is invalid")
 	}
 	return profile, nil
 }

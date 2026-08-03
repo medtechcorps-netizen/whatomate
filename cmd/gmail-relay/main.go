@@ -49,10 +49,10 @@ func run(logger *slog.Logger) error {
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelStartup()
 	if err := stateStore.Ping(startupCtx); err != nil {
-		return errors.New("Gmail OAuth durability boundary is unavailable")
+		return errors.New("gmail OAuth durability boundary is unavailable")
 	}
 	if err := queueStore.Ping(startupCtx); err != nil {
-		return errors.New("Gmail message durability boundary is unavailable")
+		return errors.New("gmail message durability boundary is unavailable")
 	}
 
 	oauth, err := gmailrelay.NewOAuthService(config, stateStore, nil)

@@ -98,10 +98,10 @@ type GmailClient struct {
 
 func NewGmailClient(config *Config, tokens AccessTokenProvider, client *http.Client) (*GmailClient, error) {
 	if config == nil || tokens == nil {
-		return nil, errors.New("Gmail client configuration is incomplete")
+		return nil, errors.New("gmail client configuration is incomplete")
 	}
 	if err := validateEndpoint(config.GmailAPIBaseURL, true); err != nil {
-		return nil, errors.New("Gmail API base URL is invalid")
+		return nil, errors.New("gmail API base URL is invalid")
 	}
 	if client == nil {
 		client = http.DefaultClient
@@ -130,14 +130,14 @@ func (c *GmailClient) Profile(ctx context.Context) (GmailProfile, error) {
 		return GmailProfile{}, err
 	}
 	if strings.TrimSpace(profile.EmailAddress) == "" || strings.TrimSpace(profile.HistoryID) == "" {
-		return GmailProfile{}, errors.New("Gmail profile response is incomplete")
+		return GmailProfile{}, errors.New("gmail profile response is incomplete")
 	}
 	return profile, nil
 }
 
 func (c *GmailClient) History(ctx context.Context, startHistoryID, pageToken string) (GmailHistoryPage, error) {
 	if strings.TrimSpace(startHistoryID) == "" {
-		return GmailHistoryPage{}, errors.New("Gmail history cursor is required")
+		return GmailHistoryPage{}, errors.New("gmail history cursor is required")
 	}
 	query := url.Values{
 		"startHistoryId": {startHistoryID},
@@ -156,7 +156,7 @@ func (c *GmailClient) History(ctx context.Context, startHistoryID, pageToken str
 func (c *GmailClient) GetMessage(ctx context.Context, messageID string) (GmailRESTMessage, error) {
 	messageID = strings.TrimSpace(messageID)
 	if messageID == "" {
-		return GmailRESTMessage{}, errors.New("Gmail message ID is required")
+		return GmailRESTMessage{}, errors.New("gmail message ID is required")
 	}
 	query := url.Values{
 		"format": {"full"},
@@ -177,7 +177,7 @@ func (c *GmailClient) GetMessage(ctx context.Context, messageID string) (GmailRE
 func (c *GmailClient) GetThread(ctx context.Context, threadID string) (GmailThread, error) {
 	threadID = strings.TrimSpace(threadID)
 	if threadID == "" {
-		return GmailThread{}, errors.New("Gmail thread ID is required")
+		return GmailThread{}, errors.New("gmail thread ID is required")
 	}
 	query := url.Values{
 		"format": {"metadata"},
@@ -215,7 +215,7 @@ func (c *GmailClient) SearchMessagePage(
 ) (GmailMessageList, error) {
 	queryValue = strings.TrimSpace(queryValue)
 	if queryValue == "" {
-		return GmailMessageList{}, errors.New("Gmail search query is required")
+		return GmailMessageList{}, errors.New("gmail search query is required")
 	}
 	if maxResults <= 0 || maxResults > 100 {
 		maxResults = 10
@@ -235,7 +235,7 @@ func (c *GmailClient) SearchMessagePage(
 func (c *GmailClient) SendRaw(ctx context.Context, threadID string, raw []byte) (GmailSendResponse, error) {
 	threadID = strings.TrimSpace(threadID)
 	if threadID == "" || len(raw) == 0 {
-		return GmailSendResponse{}, errors.New("Gmail send request is incomplete")
+		return GmailSendResponse{}, errors.New("gmail send request is incomplete")
 	}
 	payload := struct {
 		Raw      string `json:"raw"`
@@ -250,7 +250,7 @@ func (c *GmailClient) SendRaw(ctx context.Context, threadID string, raw []byte) 
 		return GmailSendResponse{}, err
 	}
 	if strings.TrimSpace(result.ID) == "" || strings.TrimSpace(result.ThreadID) == "" {
-		return GmailSendResponse{}, errors.New("Gmail send response is incomplete")
+		return GmailSendResponse{}, errors.New("gmail send response is incomplete")
 	}
 	return result, nil
 }
@@ -265,11 +265,11 @@ func (c *GmailClient) doJSON(
 	operation string,
 ) error {
 	if c == nil || c.tokens == nil || c.client == nil {
-		return errors.New("Gmail client is unavailable")
+		return errors.New("gmail client is unavailable")
 	}
 	token, err := c.tokens.AccessToken(ctx)
 	if err != nil || strings.TrimSpace(token) == "" {
-		return errors.New("Gmail authorization is unavailable")
+		return errors.New("gmail authorization is unavailable")
 	}
 
 	var body io.Reader

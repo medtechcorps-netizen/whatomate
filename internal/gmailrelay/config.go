@@ -146,7 +146,7 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 
 func (c *Config) validate() error {
 	if c == nil {
-		return errors.New("Gmail relay configuration is required")
+		return errors.New("gmail relay configuration is required")
 	}
 	if c.RedisURL == "" {
 		return errors.New("environment variable GMAIL_RELAY_REDIS_URL is required; OAuth state and tokens have no in-memory fallback")
@@ -176,7 +176,7 @@ func (c *Config) validate() error {
 		return errors.New("environment variable GMAIL_RELAY_GOOGLE_CLIENT_SECRET is required")
 	}
 	if len(c.GoogleClientID) > 1024 || len(c.GoogleClientSecret) > 8192 {
-		return errors.New("Google OAuth credentials are invalid")
+		return errors.New("google OAuth credentials are invalid")
 	}
 	if err := validateEndpoint(c.GoogleRedirectURL, true); err != nil {
 		return fmt.Errorf("environment variable GMAIL_RELAY_GOOGLE_REDIRECT_URL is invalid: %w", err)
@@ -203,24 +203,24 @@ func (c *Config) validate() error {
 		}
 	}
 	if pairedValues != 0 && pairedValues != 3 {
-		return errors.New("ReReply webhook URL and both relay signing secrets must be configured together")
+		return errors.New("rereply webhook URL and both relay signing secrets must be configured together")
 	}
 	if pairedValues == 3 {
 		if err := validateEndpoint(c.ReReplyWebhookURL, true); err != nil {
 			return fmt.Errorf("environment variable GMAIL_RELAY_REREPLY_WEBHOOK_URL is invalid: %w", err)
 		}
 		if len(c.ReReplyInboundSecret) < 32 || len(c.ReReplyOutboundSecret) < 32 {
-			return errors.New("ReReply relay signing secrets must each contain at least 32 bytes")
+			return errors.New("rereply relay signing secrets must each contain at least 32 bytes")
 		}
 	}
 	if c.HTTPTimeout <= 0 {
-		return errors.New("Gmail relay HTTP timeout must be positive")
+		return errors.New("gmail relay HTTP timeout must be positive")
 	}
 	if c.GmailPollInterval <= 0 || c.QueuePollInterval <= 0 || c.ForwardTimeout <= 0 ||
 		c.ProcessingLease <= c.ForwardTimeout+5*time.Second || c.InboundRetention <= 0 ||
 		c.OutboundRetention <= 0 || c.MaxAttempts <= 0 || c.WorkerConcurrency <= 0 ||
 		c.WorkerConcurrency > 32 {
-		return errors.New("Gmail relay worker configuration is invalid")
+		return errors.New("gmail relay worker configuration is invalid")
 	}
 	return nil
 }
@@ -289,5 +289,5 @@ func validateEndpoint(raw string, allowLocalHTTP bool) error {
 			return nil
 		}
 	}
-	return errors.New("HTTPS is required")
+	return errors.New("secure HTTPS endpoint is required")
 }
