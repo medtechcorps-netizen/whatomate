@@ -143,7 +143,7 @@ func TestListAssignableProductPlansIsOwnerOnlyAndTargetScoped(t *testing.T) {
 
 	request := testutil.NewGETRequest(t)
 	testutil.SetFullAuthContext(request, controlOrg.ID, owner.ID, owner.RoleID, true)
-	testutil.SetPathParam(request, "organization_id", targetOrg.ID.String())
+	testutil.SetPathParam(request, "target_organization_id", targetOrg.ID.String())
 	require.NoError(t, app.ListAssignableProductPlans(request))
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
 
@@ -189,7 +189,7 @@ func TestListAssignableProductPlansIsOwnerOnlyAndTargetScoped(t *testing.T) {
 	}).Error)
 	forbidden := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(forbidden, targetOrg.ID, resellerAdmin.ID)
-	testutil.SetPathParam(forbidden, "organization_id", targetOrg.ID.String())
+	testutil.SetPathParam(forbidden, "target_organization_id", targetOrg.ID.String())
 	require.NoError(t, app.ListAssignableProductPlans(forbidden))
 	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(forbidden))
 }
@@ -231,7 +231,7 @@ func TestSetOrganizationSubscriptionIsOwnerOnlyAndRequiresReference(t *testing.T
 
 	forbidden := testutil.NewJSONRequest(t, payload)
 	testutil.SetAuthContext(forbidden, targetOrg.ID, resellerAdmin.ID)
-	testutil.SetPathParam(forbidden, "organization_id", targetOrg.ID.String())
+	testutil.SetPathParam(forbidden, "target_organization_id", targetOrg.ID.String())
 	require.NoError(t, app.SetOrganizationSubscription(forbidden))
 	testutil.AssertErrorResponse(
 		t,
@@ -249,7 +249,7 @@ func TestSetOrganizationSubscriptionIsOwnerOnlyAndRequiresReference(t *testing.T
 		owner.RoleID,
 		true,
 	)
-	testutil.SetPathParam(missingReference, "organization_id", targetOrg.ID.String())
+	testutil.SetPathParam(missingReference, "target_organization_id", targetOrg.ID.String())
 	require.NoError(t, app.SetOrganizationSubscription(missingReference))
 	testutil.AssertErrorResponse(
 		t,
@@ -262,6 +262,7 @@ func TestSetOrganizationSubscriptionIsOwnerOnlyAndRequiresReference(t *testing.T
 func TestSetOrganizationSubscriptionAuditsSanitizedManualReference(t *testing.T) {
 	app := newTestApp(t)
 	controlOrg := testutil.CreateTestOrganization(t, app.DB)
+	activeOrg := testutil.CreateTestOrganization(t, app.DB)
 	owner := testutil.CreateTestUser(
 		t,
 		app.DB,
@@ -304,7 +305,8 @@ func TestSetOrganizationSubscriptionAuditsSanitizedManualReference(t *testing.T)
 			owner.RoleID,
 			true,
 		)
-		testutil.SetPathParam(request, "organization_id", targetOrg.ID.String())
+		testutil.SetHeader(request, "X-Organization-ID", activeOrg.ID.String())
+		testutil.SetPathParam(request, "target_organization_id", targetOrg.ID.String())
 		require.NoError(t, app.SetOrganizationSubscription(request))
 		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
 	}
@@ -316,6 +318,11 @@ func TestSetOrganizationSubscriptionAuditsSanitizedManualReference(t *testing.T)
 	require.NoError(t, app.DB.Where("organization_id = ?", targetOrg.ID).
 		First(&subscription).Error)
 	assert.Equal(t, "contract-2026-002", subscription.ProviderData["manual_reference"])
+	var nonTargetSubscriptionCount int64
+	require.NoError(t, app.DB.Model(&models.Subscription{}).
+		Where("organization_id IN ?", []uuid.UUID{controlOrg.ID, activeOrg.ID}).
+		Count(&nonTargetSubscriptionCount).Error)
+	assert.Zero(t, nonTargetSubscriptionCount)
 
 	var auditLog models.AuditLog
 	require.NoError(t, app.DB.Where(
@@ -327,22 +334,59 @@ func TestSetOrganizationSubscriptionAuditsSanitizedManualReference(t *testing.T)
 	).First(&auditLog).Error)
 
 	var referenceChange map[string]any
+	var licensorChange map[string]any
 	for _, rawChange := range auditLog.Changes {
 		change, ok := rawChange.(map[string]any)
-		if ok && change["field"] == "manual_reference" {
+		if !ok {
+			continue
+		}
+		switch change["field"] {
+		case "manual_reference":
 			referenceChange = change
-			break
+		case "licensed_by_workspace":
+			licensorChange = change
 		}
 	}
 	require.NotNil(t, referenceChange)
 	assert.Equal(t, "contract-2026-001", referenceChange["old_value"])
 	assert.Equal(t, "contract-2026-002", referenceChange["new_value"])
+	require.NotNil(t, licensorChange)
+	assert.Equal(t, activeOrg.ID.String(), licensorChange["new_value"])
 	for _, rawChange := range auditLog.Changes {
 		change, ok := rawChange.(map[string]any)
 		if ok {
 			assert.NotEqual(t, "provider_data", change["field"])
 		}
 	}
+}
+
+func TestOrganizationCommercialRoutesRejectLegacyOrganizationContextAsTarget(t *testing.T) {
+	app := newTestApp(t)
+	controlOrg := testutil.CreateTestOrganization(t, app.DB)
+	owner := testutil.CreateTestUser(
+		t,
+		app.DB,
+		controlOrg.ID,
+		testutil.WithEmail(testutil.UniqueEmail("legacy-target-owner")),
+		testutil.WithSuperAdmin(),
+	)
+
+	request := testutil.NewGETRequest(t)
+	testutil.SetFullAuthContext(
+		request,
+		controlOrg.ID,
+		owner.ID,
+		owner.RoleID,
+		true,
+	)
+	testutil.SetPathParam(request, "id", uuid.NewString())
+	require.NoError(t, app.ListAssignableProductPlans(request))
+	testutil.AssertErrorResponse(
+		t,
+		request,
+		fasthttp.StatusBadRequest,
+		"Invalid organization ID",
+	)
 }
 
 func TestSetOrganizationSubscriptionRefreshesSnapshotWhenRelicensingSamePlan(t *testing.T) {
@@ -399,7 +443,7 @@ func TestSetOrganizationSubscriptionRefreshesSnapshotWhenRelicensingSamePlan(t *
 			owner.RoleID,
 			true,
 		)
-		testutil.SetPathParam(request, "organization_id", targetOrg.ID.String())
+		testutil.SetPathParam(request, "target_organization_id", targetOrg.ID.String())
 		require.NoError(t, app.SetOrganizationSubscription(request))
 		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
 	}

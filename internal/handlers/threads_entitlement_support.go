@@ -66,7 +66,7 @@ type threadsSupportAuditSnapshot struct {
 // organization. It cannot disable an entitlement or mutate arbitrary keys.
 //
 // Recommended route:
-// POST /api/admin/organizations/{organization_id}/entitlements/threads-public-engagement/enable
+// POST /api/admin/organizations/{target_organization_id}/entitlements/threads-public-engagement/enable
 func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) error {
 	selectedOrgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
@@ -81,7 +81,7 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 		)
 	}
 
-	targetOrgID, err := threadsSupportTargetOrganizationID(r)
+	targetOrgID, err := targetOrganizationID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,
@@ -290,20 +290,6 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 	}
 
 	return r.SendEnvelope(response)
-}
-
-func threadsSupportTargetOrganizationID(r *fastglue.Request) (uuid.UUID, error) {
-	switch value := r.RequestCtx.UserValue("target_organization_id").(type) {
-	case uuid.UUID:
-		if value != uuid.Nil {
-			return value, nil
-		}
-	case string:
-		if parsed, err := uuid.Parse(value); err == nil && parsed != uuid.Nil {
-			return parsed, nil
-		}
-	}
-	return uuid.Nil, errors.New("invalid target organization ID")
 }
 
 func (a *App) verifyThreadsSupportEnabledInTransaction(

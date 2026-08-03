@@ -67,7 +67,7 @@ type threadsSupportRevocationAuditSnapshot struct {
 // GetOrganizationThreadsPublicEngagementSupportStatus returns the immutable
 // identity of the one support grant that the revoke endpoint may target.
 //
-// GET /api/admin/organizations/{organization_id}/entitlements/threads-public-engagement/support-status
+// GET /api/admin/organizations/{target_organization_id}/entitlements/threads-public-engagement/support-status
 func (a *App) GetOrganizationThreadsPublicEngagementSupportStatus(r *fastglue.Request) error {
 	selectedOrgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
@@ -82,7 +82,7 @@ func (a *App) GetOrganizationThreadsPublicEngagementSupportStatus(r *fastglue.Re
 		)
 	}
 
-	targetOrgID, err := threadsSupportTargetOrganizationID(r)
+	targetOrgID, err := targetOrganizationID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,
@@ -161,7 +161,7 @@ func (a *App) GetOrganizationThreadsPublicEngagementSupportStatus(r *fastglue.Re
 // It cannot revoke plan entitlements, overrides from another source, or a
 // scheduled override.
 //
-// POST /api/admin/organizations/{organization_id}/entitlements/threads-public-engagement/revoke-support
+// POST /api/admin/organizations/{target_organization_id}/entitlements/threads-public-engagement/revoke-support
 func (a *App) RevokeOrganizationThreadsPublicEngagementSupport(r *fastglue.Request) error {
 	selectedOrgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
@@ -176,7 +176,7 @@ func (a *App) RevokeOrganizationThreadsPublicEngagementSupport(r *fastglue.Reque
 		)
 	}
 
-	targetOrgID, err := threadsSupportTargetOrganizationID(r)
+	targetOrgID, err := targetOrganizationID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,

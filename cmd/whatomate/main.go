@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -447,6 +448,9 @@ func runServer(args []string) {
 
 	// Setup routes
 	setupRoutes(g, app, lo, cfg.Server.BasePath, rdb, cfg)
+	if err := validateRouteContextKeyIsolation(g.Router.List()); err != nil {
+		lo.Fatal("Route parameter conflicts with request context", "error", err)
+	}
 
 	// Create server with CORS wrapper
 	server := &fasthttp.Server{
@@ -792,15 +796,15 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/api/integrations/google_search_console/callback", app.CallbackGoogleSearchConsole)
 	g.GET("/api/integrations/threads/callback", app.CallbackThreads)
 	g.POST(
-		"/api/integrations/threads/{organization_id}/deauthorize",
+		"/api/integrations/threads/{target_organization_id}/deauthorize",
 		app.DeauthorizeThreads,
 	)
 	g.POST(
-		"/api/integrations/threads/{organization_id}/data-deletion",
+		"/api/integrations/threads/{target_organization_id}/data-deletion",
 		app.DeleteThreadsUserData,
 	)
 	g.GET(
-		"/api/integrations/threads/{organization_id}/data-deletion/status/{confirmation_code}",
+		"/api/integrations/threads/{target_organization_id}/data-deletion/status/{confirmation_code}",
 		app.ThreadsDataDeletionStatus,
 	)
 
@@ -923,15 +927,15 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST("/api/admin/product/plans", app.CreateProductPlan)
 	g.PUT("/api/admin/product/plans/{id}", app.UpdateProductPlan)
 	g.GET(
-		"/api/admin/organizations/{organization_id}/product/plans",
+		"/api/admin/organizations/{target_organization_id}/product/plans",
 		app.ListAssignableProductPlans,
 	)
 	g.GET(
-		"/api/admin/organizations/{organization_id}/subscription",
+		"/api/admin/organizations/{target_organization_id}/subscription",
 		app.GetOrganizationSubscription,
 	)
 	g.PUT(
-		"/api/admin/organizations/{organization_id}/subscription",
+		"/api/admin/organizations/{target_organization_id}/subscription",
 		app.SetOrganizationSubscription,
 	)
 	g.POST(
@@ -1433,6 +1437,48 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	} else {
 		lo.Info("Frontend not embedded, API-only mode")
 	}
+}
+
+func validateRouteContextKeyIsolation(routes map[string][]string) error {
+	reserved := map[string]struct{}{
+		middleware.ContextKeyUserID:          {},
+		middleware.ContextKeyOrganizationID:  {},
+		middleware.ContextKeyEmail:           {},
+		middleware.ContextKeyRoleID:          {},
+		middleware.ContextKeyIsSuperAdmin:    {},
+		middleware.ContextKeyIsResellerAdmin: {},
+		middleware.ContextKeyUser:            {},
+		middleware.ContextKeyOrganization:    {},
+		"request_start":                      {},
+	}
+
+	var collisions []string
+	for method, paths := range routes {
+		for _, path := range paths {
+			remaining := path
+			for {
+				start := strings.IndexByte(remaining, '{')
+				if start < 0 {
+					break
+				}
+				remaining = remaining[start+1:]
+				end := strings.IndexByte(remaining, '}')
+				if end < 0 {
+					break
+				}
+				parameter := strings.SplitN(remaining[:end], ":", 2)[0]
+				if _, collides := reserved[parameter]; collides {
+					collisions = append(collisions, method+" "+path+" {"+parameter+"}")
+				}
+				remaining = remaining[end+1:]
+			}
+		}
+	}
+	if len(collisions) == 0 {
+		return nil
+	}
+	sort.Strings(collisions)
+	return fmt.Errorf("route parameters reuse middleware context keys: %s", strings.Join(collisions, ", "))
 }
 
 func isPublicThreadsLifecyclePath(path string) bool {
