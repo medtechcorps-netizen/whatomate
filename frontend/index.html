@@ -7,10 +7,98 @@
     <meta name="description" content="ReReply - WhatsApp customer conversations, CRM, and automation">
     <meta name="theme-color" content="#10120d">
     <title>ReReply</title>
+    <style>
+      html,
+      body {
+        min-height: 100%;
+        margin: 0;
+      }
+
+      .app-fallback {
+        box-sizing: border-box;
+        display: grid;
+        min-height: 100vh;
+        place-items: center;
+        padding: 32px;
+        color: #eff0e8;
+        background:
+          radial-gradient(circle at 78% 12%, rgba(111, 121, 67, 0.18), transparent 30rem),
+          #0a0d08;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+      }
+
+      .app-fallback__content {
+        width: min(100%, 720px);
+        padding: clamp(28px, 6vw, 56px);
+        border: 1px solid rgba(203, 212, 154, 0.18);
+        border-radius: 28px;
+        background: rgba(17, 22, 15, 0.86);
+        box-shadow: 0 36px 100px rgba(0, 0, 0, 0.42);
+      }
+
+      .app-fallback__brand {
+        margin: 0 0 28px;
+        color: #cbd49a;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+      }
+
+      .app-fallback h1 {
+        margin: 0;
+        color: #f4f5ec;
+        font-family: Georgia, 'Times New Roman', serif;
+        font-size: clamp(48px, 10vw, 82px);
+        font-weight: 500;
+        line-height: 0.95;
+        letter-spacing: -0.055em;
+      }
+
+      .app-fallback__purpose {
+        max-width: 640px;
+        margin: 28px 0 0;
+        color: rgba(239, 240, 232, 0.68);
+        font-size: 16px;
+        line-height: 1.8;
+      }
+
+      .app-fallback nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 30px;
+      }
+
+      .app-fallback a {
+        padding: 10px 15px;
+        border: 1px solid rgba(203, 212, 154, 0.2);
+        border-radius: 999px;
+        color: #dfe5b6;
+        font-size: 13px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+    </style>
     <script src="/theme-init.js"></script>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <main class="app-fallback" aria-labelledby="fallback-title">
+        <section class="app-fallback__content">
+          <p class="app-fallback__brand">Customer operations, composed</p>
+          <h1 id="fallback-title">ReReply</h1>
+          <p class="app-fallback__purpose">
+            ReReply is a customer relationship management platform for organising customer conversations, CRM records, follow-up workflows, bookings and team handovers. Authorised teams can also connect verified website properties for read-only Google Search Console reporting on search performance.
+          </p>
+          <nav aria-label="Public information">
+            <a href="/about">About ReReply</a>
+            <a href="/privacy">Privacy Policy</a>
+            <a href="/terms">Terms of Service</a>
+          </nav>
+        </section>
+      </main>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
