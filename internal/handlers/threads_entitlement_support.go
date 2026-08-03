@@ -239,7 +239,7 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 			true,
 		)
 		if !response.EffectiveEnabled {
-			return errors.New("Threads public engagement entitlement did not become effective")
+			return errors.New("threads public engagement entitlement did not become effective")
 		}
 
 		return audit.LogAudit(
@@ -282,7 +282,7 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 		}
 		if !decision.Allowed || !decision.Overridden {
 			return errors.New(
-				"Threads public engagement entitlement did not become effective",
+				"threads public engagement entitlement did not become effective",
 			)
 		}
 		response.EffectiveEnabled = true
