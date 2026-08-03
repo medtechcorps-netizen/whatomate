@@ -935,8 +935,16 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		app.SetOrganizationSubscription,
 	)
 	g.POST(
-		"/api/admin/organizations/{organization_id}/entitlements/threads-public-engagement/enable",
+		"/api/admin/organizations/{target_organization_id}/entitlements/threads-public-engagement/enable",
 		app.EnableOrganizationThreadsPublicEngagement,
+	)
+	g.GET(
+		"/api/admin/organizations/{target_organization_id}/entitlements/threads-public-engagement/support-status",
+		app.GetOrganizationThreadsPublicEngagementSupportStatus,
+	)
+	g.POST(
+		"/api/admin/organizations/{target_organization_id}/entitlements/threads-public-engagement/revoke-support",
+		app.RevokeOrganizationThreadsPublicEngagementSupport,
 	)
 
 	// Commercial, onboarding, privacy, and support tenant surfaces.

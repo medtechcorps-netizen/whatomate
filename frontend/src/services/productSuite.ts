@@ -105,6 +105,30 @@ export interface EnableThreadsPublicEngagementResponse {
   subscription_status: string
 }
 
+export interface RevokeThreadsPublicEngagementSupportRequest {
+  override_id: string
+  reason: string
+}
+
+export interface ThreadsPublicEngagementSupportStatusResponse {
+  organization_id: string
+  entitlement_key: 'threads.public_engagement.enabled'
+  active: boolean
+  override_id?: string
+  source?: 'support'
+  starts_at?: string
+}
+
+export interface RevokeThreadsPublicEngagementSupportResponse {
+  organization_id: string
+  entitlement_key: 'threads.public_engagement.enabled'
+  override_id: string
+  source: 'support'
+  revoked_at: string
+  revoked: boolean
+  effective_enabled: boolean
+}
+
 export interface OnboardingStep {
   key: string
   label: string
@@ -632,9 +656,21 @@ export const organizationSubscriptionService = {
 }
 
 export const organizationEntitlementSupportService = {
+  getThreadsPublicEngagementSupportStatus: (organizationId: string) =>
+    api.get<APIEnvelope<ThreadsPublicEngagementSupportStatusResponse>>(
+      `/admin/organizations/${encodeURIComponent(organizationId)}/entitlements/threads-public-engagement/support-status`,
+    ),
   enableThreadsPublicEngagement: (organizationId: string, data: EnableThreadsPublicEngagementRequest) =>
     api.post<APIEnvelope<EnableThreadsPublicEngagementResponse>>(
       `/admin/organizations/${encodeURIComponent(organizationId)}/entitlements/threads-public-engagement/enable`,
+      data,
+    ),
+  revokeThreadsPublicEngagementSupport: (
+    organizationId: string,
+    data: RevokeThreadsPublicEngagementSupportRequest,
+  ) =>
+    api.post<APIEnvelope<RevokeThreadsPublicEngagementSupportResponse>>(
+      `/admin/organizations/${encodeURIComponent(organizationId)}/entitlements/threads-public-engagement/revoke-support`,
       data,
     ),
 }

@@ -68,7 +68,7 @@ type threadsSupportAuditSnapshot struct {
 // Recommended route:
 // POST /api/admin/organizations/{organization_id}/entitlements/threads-public-engagement/enable
 func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) error {
-	_, userID, err := a.getOrgAndUserID(r)
+	selectedOrgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
@@ -81,11 +81,19 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 		)
 	}
 
-	targetOrgID, err := productCommercialTargetOrganizationID(r)
+	targetOrgID, err := threadsSupportTargetOrganizationID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,
 			"Invalid organization ID",
+			nil,
+			"",
+		)
+	}
+	if selectedOrgID != targetOrgID {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusConflict,
+			"Selected organization does not match target organization",
 			nil,
 			"",
 		)
@@ -208,7 +216,12 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 					&subscription,
 					false,
 				)
-				return nil
+				return a.verifyThreadsSupportEnabledInTransaction(
+					tx,
+					userID,
+					targetOrgID,
+					&response,
+				)
 			}
 			return newProductCommercialClientError(
 				fasthttp.StatusConflict,
@@ -242,7 +255,7 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 			return errors.New("threads public engagement entitlement did not become effective")
 		}
 
-		return audit.LogAudit(
+		if err := audit.LogAudit(
 			tx,
 			targetOrgID,
 			userID,
@@ -258,6 +271,14 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 				Reason:         override.Reason,
 				StartsAt:       override.StartsAt,
 			},
+		); err != nil {
+			return err
+		}
+		return a.verifyThreadsSupportEnabledInTransaction(
+			tx,
+			userID,
+			targetOrgID,
+			&response,
 		)
 	})
 	if err != nil {
@@ -268,34 +289,43 @@ func (a *App) EnableOrganizationThreadsPublicEngagement(r *fastglue.Request) err
 		)
 	}
 
-	// Resolve again through the product authorization path after commit. This
-	// confirms the durable decision seen by feature middleware, not merely the
-	// value of the row written in this transaction.
-	err = a.WithTenantApp(targetOrgID, func(scoped *App) error {
-		decision, resolveErr := scoped.EvaluateProductEntitlement(
-			userID,
-			targetOrgID,
-			channelapi.ThreadsPublicEngagementEntitlementKey,
-		)
-		if resolveErr != nil {
-			return resolveErr
+	return r.SendEnvelope(response)
+}
+
+func threadsSupportTargetOrganizationID(r *fastglue.Request) (uuid.UUID, error) {
+	switch value := r.RequestCtx.UserValue("target_organization_id").(type) {
+	case uuid.UUID:
+		if value != uuid.Nil {
+			return value, nil
 		}
-		if !decision.Allowed || !decision.Overridden {
-			return errors.New(
-				"threads public engagement entitlement did not become effective",
-			)
+	case string:
+		if parsed, err := uuid.Parse(value); err == nil && parsed != uuid.Nil {
+			return parsed, nil
 		}
-		response.EffectiveEnabled = true
-		return nil
-	})
+	}
+	return uuid.Nil, errors.New("invalid target organization ID")
+}
+
+func (a *App) verifyThreadsSupportEnabledInTransaction(
+	tx *gorm.DB,
+	userID, organizationID uuid.UUID,
+	response *EnableThreadsPublicEngagementResponse,
+) error {
+	decision, err := a.rootApp().scopedApp(tx, organizationID).EvaluateProductEntitlement(
+		userID,
+		organizationID,
+		channelapi.ThreadsPublicEngagementEntitlementKey,
+	)
 	if err != nil {
-		return a.sendProductCommercialError(
-			r,
-			"verify Threads public engagement entitlement",
-			err,
+		return err
+	}
+	if !decision.Allowed || !decision.Overridden {
+		return errors.New(
+			"threads public engagement entitlement did not become effective",
 		)
 	}
-	return r.SendEnvelope(response)
+	response.EffectiveEnabled = true
+	return nil
 }
 
 func threadsSupportSubscriptionIsUnexpired(
@@ -318,7 +348,7 @@ func threadsSupportSubscriptionIsUnexpired(
 
 func decodeStrictThreadsSupportRequest(
 	r *fastglue.Request,
-	req *EnableThreadsPublicEngagementRequest,
+	req any,
 ) error {
 	decoder := json.NewDecoder(bytes.NewReader(r.RequestCtx.PostBody()))
 	decoder.DisallowUnknownFields()

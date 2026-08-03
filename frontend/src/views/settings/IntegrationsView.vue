@@ -64,8 +64,12 @@ import {
   type IntegrationState,
   type IntegrationStatus,
 } from "@/services/integrations";
-import { organizationEntitlementSupportService } from "@/services/productSuite";
+import {
+  organizationEntitlementSupportService,
+  type ThreadsPublicEngagementSupportStatusResponse,
+} from "@/services/productSuite";
 import { useAuthStore } from "@/stores/auth";
+import { useOrganizationsStore } from "@/stores/organizations";
 
 const THREADS_PUBLIC_ENGAGEMENT_ENTITLEMENT =
   "threads.public_engagement.enabled";
@@ -410,6 +414,7 @@ const providerOrder: IntegrationProvider[] = [
 const router = useRouter();
 const route = useRoute();
 const authStore = useAuthStore();
+const organizationsStore = useOrganizationsStore();
 const integrations = ref<IntegrationState[]>([]);
 const isLoading = ref(true);
 const loadError = ref("");
@@ -425,6 +430,15 @@ const configDraft = reactive<Record<string, string>>({});
 const secretDraft = reactive<Record<string, string>>({});
 const enabledDraft = ref(false);
 const threadsSupportReason = ref("");
+const threadsSupportRevokeReason = ref("");
+const threadsSupportStatus = ref<ThreadsPublicEngagementSupportStatusResponse | null>(
+  null,
+);
+const threadsSupportStatusState = ref<
+  "idle" | "loading" | "ready" | "error"
+>("idle");
+const threadsSupportStatusTargetOrganizationId = ref("");
+let threadsSupportStatusRequestID = 0;
 const canWrite = computed(() =>
   authStore.hasPermission("settings.integrations", "write"),
 );
@@ -443,6 +457,17 @@ const selectedReadiness = computed(() =>
 const threadsPublicEngagementEnabled = computed(() =>
   authStore.hasProductEntitlement(THREADS_PUBLIC_ENGAGEMENT_ENTITLEMENT),
 );
+const threadsEntitlementsAvailable = computed(
+  () =>
+    authStore.productEntitlementsLoaded &&
+    authStore.productEntitlementMode !== "unavailable",
+);
+const threadsSupportTargetOrganizationId = computed(() =>
+  (authStore.user?.is_super_admin
+    ? organizationsStore.selectedOrgId || authStore.organizationId
+    : authStore.organizationId
+  ).trim(),
+);
 const isThreadsEntitlementLocked = computed(
   () =>
     selectedIntegration.value?.provider === "threads" &&
@@ -452,15 +477,79 @@ const isThreadsEntitlementLocked = computed(
 const showThreadsEntitlementSupport = computed(
   () =>
     selectedIntegration.value?.provider === "threads" &&
-    Boolean(authStore.user?.is_super_admin) &&
-    authStore.productEntitlementsLoaded &&
+    Boolean(authStore.user?.is_super_admin),
+);
+const isThreadsSupportStatusCurrent = computed(
+  () =>
+    threadsSupportStatusState.value === "ready" &&
+    Boolean(threadsSupportStatus.value) &&
+    Boolean(threadsSupportTargetOrganizationId.value) &&
+    threadsSupportStatusTargetOrganizationId.value ===
+      threadsSupportTargetOrganizationId.value &&
+    threadsSupportStatus.value?.organization_id ===
+      threadsSupportTargetOrganizationId.value,
+);
+const activeThreadsSupportOverride = computed(() => {
+  const status = threadsSupportStatus.value;
+  if (
+    !isThreadsSupportStatusCurrent.value ||
+    !status?.active ||
+    status.source !== "support" ||
+    !status.override_id?.trim()
+  ) {
+    return null;
+  }
+  return status;
+});
+const isThreadsSupportStatusInconsistent = computed(
+  () =>
+    isThreadsSupportStatusCurrent.value &&
+    Boolean(threadsSupportStatus.value?.active) &&
+    (!threadsEntitlementsAvailable.value ||
+      !threadsPublicEngagementEnabled.value),
+);
+const isThreadsSupportStatusUnavailable = computed(
+  () =>
+    threadsSupportStatusState.value === "error" ||
+    !threadsEntitlementsAvailable.value ||
+    isThreadsSupportStatusInconsistent.value,
+);
+const showThreadsEntitlementEnableSupport = computed(
+  () =>
+    showThreadsEntitlementSupport.value &&
+    isThreadsSupportStatusCurrent.value &&
+    !isThreadsSupportStatusUnavailable.value &&
+    !threadsSupportStatus.value?.active &&
     !threadsPublicEngagementEnabled.value,
+);
+const showThreadsEntitlementRevokeSupport = computed(
+  () =>
+    showThreadsEntitlementSupport.value &&
+    isThreadsSupportStatusCurrent.value &&
+    !isThreadsSupportStatusUnavailable.value &&
+    threadsPublicEngagementEnabled.value &&
+    Boolean(activeThreadsSupportOverride.value),
+);
+const showThreadsEntitlementWithoutSupportOverride = computed(
+  () =>
+    showThreadsEntitlementSupport.value &&
+    isThreadsSupportStatusCurrent.value &&
+    !isThreadsSupportStatusUnavailable.value &&
+    threadsPublicEngagementEnabled.value &&
+    !threadsSupportStatus.value?.active,
 );
 const canEnableThreadsEntitlement = computed(
   () =>
-    showThreadsEntitlementSupport.value &&
-    Boolean(authStore.organizationId) &&
+    showThreadsEntitlementEnableSupport.value &&
+    Boolean(threadsSupportTargetOrganizationId.value) &&
     threadsSupportReason.value.trim().length > 0 &&
+    activeAction.value === null,
+);
+const canRevokeThreadsEntitlementSupport = computed(
+  () =>
+    showThreadsEntitlementRevokeSupport.value &&
+    Boolean(threadsSupportTargetOrganizationId.value) &&
+    threadsSupportRevokeReason.value.trim().length > 0 &&
     activeAction.value === null,
 );
 const isActivationLocked = computed(() => {
@@ -579,6 +668,98 @@ function getErrorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
+function resetThreadsSupportStatus() {
+  threadsSupportStatusRequestID += 1;
+  threadsSupportStatus.value = null;
+  threadsSupportStatusState.value = "idle";
+  threadsSupportStatusTargetOrganizationId.value = "";
+}
+
+function invalidateThreadsSupportStatus(organizationID: string) {
+  threadsSupportStatusRequestID += 1;
+  threadsSupportStatus.value = null;
+  threadsSupportStatusState.value = "error";
+  threadsSupportStatusTargetOrganizationId.value = organizationID;
+}
+
+function isValidThreadsSupportStatus(
+  value: unknown,
+  organizationID: string,
+): value is ThreadsPublicEngagementSupportStatusResponse {
+  if (!value || typeof value !== "object") return false;
+  const status = value as Record<string, unknown>;
+  if (
+    status.organization_id !== organizationID ||
+    status.entitlement_key !== THREADS_PUBLIC_ENGAGEMENT_ENTITLEMENT ||
+    typeof status.active !== "boolean"
+  ) {
+    return false;
+  }
+  if (status.source !== undefined && status.source !== "support") return false;
+  if (
+    status.active &&
+    (status.source !== "support" ||
+      typeof status.override_id !== "string" ||
+      !status.override_id.trim())
+  ) {
+    return false;
+  }
+  return true;
+}
+
+async function refreshThreadsSupportStatus(
+  organizationID = threadsSupportTargetOrganizationId.value,
+): Promise<boolean> {
+  if (
+    !organizationID ||
+    !authStore.user?.is_super_admin ||
+    selectedProvider.value !== "threads" ||
+    !isDialogOpen.value ||
+    threadsSupportTargetOrganizationId.value !== organizationID
+  ) {
+    resetThreadsSupportStatus();
+    return false;
+  }
+
+  const requestID = ++threadsSupportStatusRequestID;
+  threadsSupportStatus.value = null;
+  threadsSupportStatusState.value = "loading";
+  threadsSupportStatusTargetOrganizationId.value = organizationID;
+
+  try {
+    const response =
+      await organizationEntitlementSupportService.getThreadsPublicEngagementSupportStatus(
+        organizationID,
+      );
+    if (
+      requestID !== threadsSupportStatusRequestID ||
+      threadsSupportTargetOrganizationId.value !== organizationID ||
+      selectedProvider.value !== "threads" ||
+      !isDialogOpen.value
+    ) {
+      return false;
+    }
+
+    const status = response.data?.data;
+    if (!isValidThreadsSupportStatus(status, organizationID)) {
+      invalidateThreadsSupportStatus(organizationID);
+      return false;
+    }
+
+    threadsSupportStatus.value = status;
+    threadsSupportStatusState.value = "ready";
+    return true;
+  } catch {
+    if (
+      requestID === threadsSupportStatusRequestID &&
+      threadsSupportTargetOrganizationId.value === organizationID
+    ) {
+      invalidateThreadsSupportStatus(organizationID);
+    }
+    return false;
+  }
+}
+
 async function loadIntegrations(options: { quiet?: boolean } = {}) {
   if (options.quiet) isRefreshing.value = true;
   else isLoading.value = true;
@@ -637,6 +818,11 @@ function openConfiguration(provider: IntegrationProvider) {
     secretDraft[field.key] = "";
   });
   isDialogOpen.value = true;
+  if (provider === "threads") {
+    void refreshThreadsSupportStatus();
+  } else {
+    resetThreadsSupportStatus();
+  }
 }
 
 function publicWebhookCallbackURL(path: string) {
@@ -744,7 +930,7 @@ async function saveConfiguration() {
 }
 
 async function enableThreadsPublicEngagement() {
-  const organizationID = authStore.organizationId.trim();
+  const organizationID = threadsSupportTargetOrganizationId.value;
   const reason = threadsSupportReason.value.trim();
   if (!canEnableThreadsEntitlement.value || !organizationID || !reason) return;
 
@@ -759,9 +945,10 @@ async function enableThreadsPublicEngagement() {
       throw new Error("Threads public engagement did not become effective");
     }
 
-    const [entitlementsRefreshed] = await Promise.all([
+    const [entitlementsRefreshed, , supportStatusRefreshed] = await Promise.all([
       authStore.fetchProductEntitlements(),
       loadIntegrations({ quiet: true }),
+      refreshThreadsSupportStatus(organizationID),
     ]);
     if (
       !entitlementsRefreshed ||
@@ -769,6 +956,19 @@ async function enableThreadsPublicEngagement() {
     ) {
       toast.error(
         "The entitlement was enabled, but its status could not be refreshed. The Enabled switch remains locked.",
+      );
+      return;
+    }
+
+    const activeSupportOverride = activeThreadsSupportOverride.value;
+    if (
+      !supportStatusRefreshed ||
+      !activeSupportOverride ||
+      activeSupportOverride.override_id !== response.data.data.override_id
+    ) {
+      invalidateThreadsSupportStatus(organizationID);
+      toast.error(
+        "The entitlement was enabled, but the active support override could not be verified. Support actions remain locked.",
       );
       return;
     }
@@ -784,6 +984,99 @@ async function enableThreadsPublicEngagement() {
       getErrorMessage(
         error,
         "Could not enable Threads public engagement entitlement.",
+      ),
+    );
+  } finally {
+    activeAction.value = null;
+  }
+}
+
+async function revokeThreadsPublicEngagementSupport() {
+  const organizationID = threadsSupportTargetOrganizationId.value;
+  const reason = threadsSupportRevokeReason.value.trim();
+  const supportOverride = activeThreadsSupportOverride.value;
+  const overrideID = supportOverride?.override_id?.trim() ?? "";
+  if (
+    !canRevokeThreadsEntitlementSupport.value ||
+    !organizationID ||
+    !reason ||
+    !overrideID ||
+    supportOverride?.organization_id !== organizationID ||
+    threadsSupportStatusTargetOrganizationId.value !== organizationID
+  )
+    return;
+
+  activeAction.value = "entitlement";
+  try {
+    const response =
+      await organizationEntitlementSupportService.revokeThreadsPublicEngagementSupport(
+        organizationID,
+        { override_id: overrideID, reason },
+      );
+
+    const [entitlementsRefreshed, , supportStatusRefreshed] = await Promise.all([
+      authStore.fetchProductEntitlements(),
+      loadIntegrations({ quiet: true }),
+      refreshThreadsSupportStatus(organizationID),
+    ]);
+    if (
+      !supportStatusRefreshed ||
+      !isThreadsSupportStatusCurrent.value ||
+      threadsSupportStatus.value?.active
+    ) {
+      invalidateThreadsSupportStatus(organizationID);
+      toast.error(
+        "The support entitlement was revoked, but the updated support override status could not be verified. Support actions remain locked.",
+      );
+      return;
+    }
+
+    threadsSupportRevokeReason.value = "";
+    if (!entitlementsRefreshed) {
+      toast.error(
+        "The support entitlement was revoked, but its status could not be refreshed. Threads activation remains locked.",
+      );
+      return;
+    }
+
+    if (
+      authStore.hasProductEntitlement(THREADS_PUBLIC_ENGAGEMENT_ENTITLEMENT)
+    ) {
+      toast.info(
+        "Threads support entitlement revoked; public engagement remains enabled by another entitlement.",
+      );
+      return;
+    }
+    toast.success(
+      response.data.data.revoked
+        ? "Threads support entitlement revoked"
+        : "Threads support entitlement was already revoked",
+    );
+  } catch (error) {
+    const responseStatus =
+      typeof error === "object" && error !== null
+        ? (error as { response?: { status?: number } }).response?.status
+        : undefined;
+    if (responseStatus === 409) {
+      threadsSupportRevokeReason.value = "";
+      const supportStatusRefreshed =
+        await refreshThreadsSupportStatus(organizationID);
+      if (!supportStatusRefreshed) {
+        invalidateThreadsSupportStatus(organizationID);
+        toast.error(
+          "The active support grant changed and its replacement could not be verified. Support actions remain locked.",
+        );
+        return;
+      }
+      toast.error(
+        "The active support grant changed. Its status was refreshed; review it before entering a new revocation reason.",
+      );
+      return;
+    }
+    toast.error(
+      getErrorMessage(
+        error,
+        "Could not revoke the Threads support entitlement.",
       ),
     );
   } finally {
@@ -991,7 +1284,21 @@ watch(isDialogOpen, (open) => {
       secretDraft[key] = "";
     });
     threadsSupportReason.value = "";
+    threadsSupportRevokeReason.value = "";
+    resetThreadsSupportStatus();
   }
+});
+
+watch(threadsSupportTargetOrganizationId, (organizationID, previousID) => {
+  if (
+    organizationID === previousID ||
+    !isDialogOpen.value ||
+    selectedProvider.value !== "threads"
+  ) {
+    return;
+  }
+  resetThreadsSupportStatus();
+  void refreshThreadsSupportStatus(organizationID);
 });
 
 async function handleSearchConsoleOAuthReturn() {
@@ -1390,13 +1697,52 @@ onMounted(async () => {
                     </Badge>
                   </div>
                   <p
+                    v-if="
+                      threadsSupportStatusState === 'idle' ||
+                      threadsSupportStatusState === 'loading'
+                    "
+                    data-testid="threads-entitlement-support-loading"
+                    class="mt-1 text-xs leading-5 text-white/45 light:text-gray-600"
+                  >
+                    Checking this workspace for an active support override…
+                  </p>
+                  <p
+                    v-else-if="isThreadsSupportStatusUnavailable"
+                    data-testid="threads-entitlement-support-unavailable"
+                    class="mt-1 text-xs leading-5 text-amber-200/80 light:text-amber-800"
+                  >
+                    Support override status could not be verified for this
+                    workspace. Grant and revoke actions are locked.
+                  </p>
+                  <p
+                    v-else-if="showThreadsEntitlementEnableSupport"
                     class="mt-1 text-xs leading-5 text-white/45 light:text-gray-600"
                   >
                     Public engagement is not enabled for this workspace. Add an
                     audited reason to grant the reviewed Threads capability.
                   </p>
+                  <p
+                    v-else-if="showThreadsEntitlementRevokeSupport"
+                    class="mt-1 text-xs leading-5 text-white/45 light:text-gray-600"
+                  >
+                    An active platform support override exists for this
+                    workspace. Revoking removes only this override; plan and
+                    other entitlements remain intact.
+                  </p>
+                  <p
+                    v-else-if="showThreadsEntitlementWithoutSupportOverride"
+                    data-testid="threads-entitlement-no-support-override"
+                    class="mt-1 text-xs leading-5 text-white/45 light:text-gray-600"
+                  >
+                    Public engagement is enabled by the workspace plan or
+                    another entitlement. No active platform support override
+                    exists for this workspace.
+                  </p>
 
-                  <div class="mt-3 space-y-1.5">
+                  <div
+                    v-if="showThreadsEntitlementEnableSupport"
+                    class="mt-3 space-y-1.5"
+                  >
                     <Label
                       for="threads-entitlement-support-reason"
                       class="text-xs text-white/70 light:text-gray-700"
@@ -1431,6 +1777,49 @@ onMounted(async () => {
                       >
                         <ShieldCheck class="h-3.5 w-3.5" aria-hidden="true" />
                         Enable public engagement
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div
+                    v-if="showThreadsEntitlementRevokeSupport"
+                    class="mt-3 space-y-1.5"
+                  >
+                    <Label
+                      for="threads-entitlement-support-revoke-reason"
+                      class="text-xs text-white/70 light:text-gray-700"
+                    >
+                      Revocation reason
+                    </Label>
+                    <Textarea
+                      id="threads-entitlement-support-revoke-reason"
+                      v-model="threadsSupportRevokeReason"
+                      :rows="2"
+                      maxlength="2000"
+                      required
+                      placeholder="Ticket, approval, or operational reason"
+                      :disabled="activeAction !== null"
+                      class="min-h-[72px] resize-none bg-black/15 light:bg-white"
+                    />
+                    <div
+                      class="flex flex-col gap-3 pt-1 sm:flex-row sm:items-center sm:justify-between"
+                    >
+                      <p
+                        class="text-[11px] leading-4 text-white/35 light:text-gray-500"
+                      >
+                        Required and recorded in the entitlement audit log.
+                      </p>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="destructive"
+                        data-testid="threads-entitlement-revoke"
+                        :loading="activeAction === 'entitlement'"
+                        :disabled="!canRevokeThreadsEntitlementSupport"
+                        @click="revokeThreadsPublicEngagementSupport"
+                      >
+                        <Trash2 class="h-3.5 w-3.5" aria-hidden="true" />
+                        Revoke support entitlement
                       </Button>
                     </div>
                   </div>

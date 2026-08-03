@@ -89,7 +89,7 @@ func createThreadsSupportSubscription(
 
 func newThreadsSupportRequest(
 	t *testing.T,
-	controlOrgID uuid.UUID,
+	selectedOrgID uuid.UUID,
 	owner *models.User,
 	targetOrgID uuid.UUID,
 	payload map[string]any,
@@ -98,12 +98,15 @@ func newThreadsSupportRequest(
 	request := testutil.NewJSONRequest(t, payload)
 	testutil.SetFullAuthContext(
 		request,
-		controlOrgID,
+		owner.OrganizationID,
 		owner.ID,
 		owner.RoleID,
 		owner.IsSuperAdmin,
 	)
-	testutil.SetPathParam(request, "organization_id", targetOrgID.String())
+	if selectedOrgID != owner.OrganizationID {
+		testutil.SetHeader(request, "X-Organization-ID", selectedOrgID.String())
+	}
+	testutil.SetPathParam(request, "target_organization_id", targetOrgID.String())
 	return request
 }
 
@@ -127,7 +130,7 @@ func TestEnableOrganizationThreadsPublicEngagementAuthorizationAndRequestGuards(
 
 	forbidden := newThreadsSupportRequest(
 		t,
-		controlOrg.ID,
+		targetOrg.ID,
 		nonOwner,
 		targetOrg.ID,
 		map[string]any{"reason": "support-ticket-1"},
@@ -138,6 +141,21 @@ func TestEnableOrganizationThreadsPublicEngagementAuthorizationAndRequestGuards(
 		forbidden,
 		fasthttp.StatusForbidden,
 		"Platform owner access required",
+	)
+
+	mismatchedTarget := newThreadsSupportRequest(
+		t,
+		controlOrg.ID,
+		owner,
+		targetOrg.ID,
+		map[string]any{"reason": "support-ticket-1"},
+	)
+	require.NoError(t, app.EnableOrganizationThreadsPublicEngagement(mismatchedTarget))
+	testutil.AssertErrorResponse(
+		t,
+		mismatchedTarget,
+		fasthttp.StatusConflict,
+		"Selected organization does not match target organization",
 	)
 
 	for name, payload := range map[string]map[string]any{
@@ -155,7 +173,7 @@ func TestEnableOrganizationThreadsPublicEngagementAuthorizationAndRequestGuards(
 		t.Run(name, func(t *testing.T) {
 			request := newThreadsSupportRequest(
 				t,
-				controlOrg.ID,
+				targetOrg.ID,
 				owner,
 				targetOrg.ID,
 				payload,
@@ -251,7 +269,7 @@ func TestEnableOrganizationThreadsPublicEngagementCommercialGuards(t *testing.T)
 			)
 			request := newThreadsSupportRequest(
 				t,
-				controlOrg.ID,
+				targetOrg.ID,
 				owner,
 				targetOrg.ID,
 				map[string]any{"reason": "support-guard-check"},
@@ -292,7 +310,7 @@ func TestEnableOrganizationThreadsPublicEngagementCommercialGuards(t *testing.T)
 
 		request := newThreadsSupportRequest(
 			t,
-			controlOrg.ID,
+			targetOrg.ID,
 			owner,
 			targetOrg.ID,
 			map[string]any{"reason": "support-guard-check"},
@@ -332,7 +350,7 @@ func TestEnableOrganizationThreadsPublicEngagementCommercialGuards(t *testing.T)
 
 		request := newThreadsSupportRequest(
 			t,
-			controlOrg.ID,
+			targetOrg.ID,
 			owner,
 			targetOrg.ID,
 			map[string]any{"reason": "support-guard-check"},
@@ -391,7 +409,7 @@ func TestEnableOrganizationThreadsPublicEngagementSuccessIsTargetedAuditedAndIde
 		t.Helper()
 		request := newThreadsSupportRequest(
 			t,
-			controlOrg.ID,
+			targetOrg.ID,
 			owner,
 			targetOrg.ID,
 			map[string]any{"reason": "  support-ticket-threads-001  "},
