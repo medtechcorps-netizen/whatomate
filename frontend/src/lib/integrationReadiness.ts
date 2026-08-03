@@ -54,6 +54,37 @@ function configRequirement(
   };
 }
 
+function httpsRedirectRequirement(
+  integration: IntegrationState,
+  key: string,
+  label: string,
+): IntegrationReadinessItem {
+  const value = String(integration.config?.[key] ?? "").trim();
+  if (!value) {
+    return {
+      key,
+      label,
+      state: "missing",
+      detail: "Add the exact HTTPS callback registered with the provider.",
+    };
+  }
+  if (!/^https:\/\/[^\s]+$/i.test(value)) {
+    return {
+      key,
+      label,
+      state: "blocked",
+      detail:
+        "The callback must be an absolute HTTPS URL and must exactly match the provider configuration.",
+    };
+  }
+  return {
+    key,
+    label,
+    state: "ready",
+    detail: `Register this exact callback with the provider: ${value}`,
+  };
+}
+
 function secretRequirement(
   integration: IntegrationState,
   key: string,
@@ -314,34 +345,55 @@ const builders: Record<
       integration,
       "app_id",
       "Threads application ID",
-      "The future OAuth application is identified.",
-      "Add the Threads App ID from Meta for Developers.",
-      "prepared",
+      "A dedicated Threads OAuth application is bound to this workspace and profile.",
+      "Add a dedicated Threads App ID from Meta for Developers; App IDs cannot be shared between ReReply workspaces.",
     ),
-    configRequirement(
-      integration,
-      "redirect_uri",
-      "OAuth redirect URI",
-      "Stored for preparation only; it is not a live ReReply callback.",
-      "Record the future redirect URI required by Meta. ReReply does not expose a live Threads callback until an approved adapter is installed.",
-      "prepared",
-    ),
+    httpsRedirectRequirement(integration, "redirect_uri", "OAuth redirect URI"),
     secretRequirement(
       integration,
       "app_secret",
       "Server-side app secret",
-      "Add the Threads App Secret for future server-side token exchange.",
-      "Stored write-only for pre-approval preparation; it does not create a live connection.",
-      "prepared",
+      "Add the Threads App Secret for server-side token exchange.",
+    ),
+    secretRequirement(
+      integration,
+      "webhook_verify_token",
+      "Webhook verify token",
+      "Enter the same strong secret of at least 16 characters in the Meta Threads Webhooks callback setup.",
     ),
     reviewRequirement(
       integration,
       "app_review_status",
       "Meta App Review",
       "Meta",
-      "prepared",
     ),
-    adapterRequirement(integration, "Threads public engagement"),
+    {
+      key: "oauth_authorization",
+      label: "Threads authorization",
+      state:
+        integration.oauth.supported && integration.oauth.available
+          ? "ready"
+          : "blocked",
+      detail:
+        integration.oauth.supported && integration.oauth.available
+          ? "OAuth authorization is available for a Threads account."
+          : integration.message ||
+            "Threads OAuth is unavailable until the server-side integration is configured.",
+    },
+    activationRequirement(integration),
+    connectionRequirement(
+      integration,
+      "Connected Threads account",
+      "Authorize the ReAlign Kajang Threads account.",
+    ),
+    healthRequirement(integration),
+    {
+      key: "public_engagement_policy",
+      label: "Public-engagement safety policy",
+      state: "managed",
+      detail:
+        "Replies require an existing public reply or mention target. Threads direct messages and standalone posts remain unavailable.",
+    },
   ],
   tiktok: (integration) => [
     configRequirement(

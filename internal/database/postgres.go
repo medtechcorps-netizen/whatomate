@@ -224,6 +224,23 @@ func AutoMigrate(db *gorm.DB) error {
 			return err
 		}
 	}
+	return BackfillProviderIntegrationBindings(db)
+}
+
+// BackfillProviderIntegrationBindings upgrades prepared Threads integrations
+// created before the dedicated-app column existed. The unique index on
+// threads_app_id makes an unsafe historical duplicate fail the deployment
+// instead of silently routing one Meta app to multiple workspaces.
+func BackfillProviderIntegrationBindings(db *gorm.DB) error {
+	if err := db.Exec(`
+		UPDATE provider_integrations
+		SET threads_app_id = NULLIF(BTRIM(config->>'app_id'), '')
+		WHERE provider = 'threads'
+		  AND threads_app_id IS NULL
+		  AND NULLIF(BTRIM(config->>'app_id'), '') IS NOT NULL
+	`).Error; err != nil {
+		return fmt.Errorf("backfill dedicated Threads app bindings: %w", err)
+	}
 	return nil
 }
 
@@ -235,8 +252,8 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 	migrationModels := GetMigrationModels()
 	indexes := getIndexes()
 
-	// Total steps: models + indexes + default admin check
-	totalSteps := len(migrationModels) + len(indexes) + 1
+	// Total steps: models + provider binding backfill + indexes + default admin check
+	totalSteps := len(migrationModels) + len(indexes) + 2
 	currentStep := 0
 	barWidth := 40
 
@@ -261,6 +278,13 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 		}
 		currentStep++
 	}
+
+	printProgress(currentStep, totalSteps)
+	if err := BackfillProviderIntegrationBindings(silentDB); err != nil {
+		fmt.Printf("\n  \033[31mProvider binding backfill failed\033[0m\n\n")
+		return err
+	}
+	currentStep++
 
 	// Create indexes
 	for _, idx := range indexes {

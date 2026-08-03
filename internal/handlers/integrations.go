@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	qwenapi "github.com/shridarpatil/whatomate/internal/qwen"
@@ -175,7 +176,8 @@ func (a *App) UpdateIntegration(r *fastglue.Request) error {
 }
 
 // DeleteIntegrationCredentials is an explicit clear-all operation for one
-// provider. It does not delete account history or rotate any credential.
+// provider. It preserves account history and revokes provider credentials when
+// the provider owns durable channel accounts.
 func (a *App) DeleteIntegrationCredentials(r *fastglue.Request) error {
 	orgID, userID, err := a.requireAuth(
 		r,
@@ -215,9 +217,7 @@ func (a *App) DeleteIntegrationCredentials(r *fastglue.Request) error {
 	return r.SendEnvelope(integration)
 }
 
-// ConnectIntegration returns the next honest connection action. Only Meta's
-// existing Embedded Signup path is currently available; unavailable adapters
-// fail closed rather than issuing an OAuth URL that cannot complete.
+// ConnectIntegration returns the next provider connection action.
 func (a *App) ConnectIntegration(r *fastglue.Request) error {
 	orgID, userID, err := a.requireAuth(
 		r,
@@ -276,12 +276,7 @@ func (a *App) ConnectIntegration(r *fastglue.Request) error {
 			"message":  "Qwen uses the configured server-side API key and does not require OAuth",
 		})
 	case integrationProviderThreads:
-		return r.SendErrorEnvelope(
-			fasthttp.StatusConflict,
-			"The approved Threads public-engagement adapter is not installed yet",
-			nil,
-			"",
-		)
+		return a.startThreadsOAuth(r, orgID, userID)
 	case integrationProviderTikTok:
 		return r.SendErrorEnvelope(
 			fasthttp.StatusConflict,
@@ -322,14 +317,6 @@ func (a *App) TestIntegration(r *fastglue.Request) error {
 	provider, err := integrationProviderFromRequest(r, false)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
-	}
-	if provider == integrationProviderThreads {
-		return r.SendEnvelope(map[string]any{
-			"provider": provider,
-			"success":  false,
-			"status":   integrationStatusAdapterMissing,
-			"message":  "No approved Threads relay adapter is installed",
-		})
 	}
 	if provider == integrationProviderTikTok {
 		return r.SendEnvelope(map[string]any{
@@ -546,23 +533,30 @@ func (a *App) composeIntegrationResponse(provider string, sources *integrationSo
 			response.Message = "The stored integration credential is unavailable to this server."
 		}
 	case integrationProviderThreads:
-		response.Enabled = false
+		response.Enabled = row != nil && row.Enabled
 		response.Config = safeIntegrationConfig(provider, integrationRowConfig(row))
 		response.Credentials["app_secret"] = encryptedCredentialFlag(row, "app_secret")
+		response.Credentials["webhook_verify_token"] = encryptedCredentialFlag(row, "webhook_verify_token")
 		response.Configured = stringJSONValue(response.Config, "app_id") != "" &&
 			stringJSONValue(response.Config, "redirect_uri") != "" &&
-			response.Credentials["app_secret"].Configured
-		response.OAuth = integrationOAuthResponse{Supported: true, Available: false, Mode: "oauth"}
-		response.TestSupported = false
-		response.Status = integrationStatusAdapterMissing
-		response.Message = "Threads public replies and mentions remain disabled until an approved adapter is installed. Direct messages are not supported."
-		response.RequiredScopes = []string{
-			"threads_basic",
-			"threads_read_replies",
-			"threads_manage_replies",
-			"threads_content_publish",
-			"threads_manage_mentions",
+			response.Credentials["app_secret"].Configured &&
+			response.Credentials["webhook_verify_token"].Configured
+		response.credentialUsable = row != nil &&
+			a.storedIntegrationCredentialUsable(stringJSONValue(row.CredentialData, "app_secret")) &&
+			a.storedIntegrationCredentialUsable(stringJSONValue(row.CredentialData, "webhook_verify_token"))
+		response.OAuth = integrationOAuthResponse{
+			Supported: true,
+			Available: response.Configured && response.credentialUsable && a.threadsOAuthAvailable(),
+			Mode:      "oauth",
 		}
+		response.TestSupported = false
+		response.Status = integrationOperationalStatus(response, row)
+		response.Message = "Public replies and mentions only. Direct messages and standalone posts are not supported."
+		if response.Configured && !response.credentialUsable {
+			response.Status = integrationStatusDegraded
+			response.Message = "The stored Threads app or webhook credential is unavailable to this server."
+		}
+		response.RequiredScopes = append([]string(nil), threadsRequiredScopes...)
 	case integrationProviderTikTok:
 		response.Enabled = false
 		response.Config = safeIntegrationConfig(provider, integrationRowConfig(row))
@@ -764,8 +758,7 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 	if provider == integrationProviderGoogleSearchConsole {
 		return &integrationClientError{status: fasthttp.StatusBadRequest, message: "Use Connect Google or Disconnect for Google Search Console"}
 	}
-	if request.Enabled != nil && *request.Enabled &&
-		(provider == integrationProviderThreads || provider == integrationProviderTikTok) {
+	if request.Enabled != nil && *request.Enabled && provider == integrationProviderTikTok {
 		return &integrationClientError{
 			status:  fasthttp.StatusConflict,
 			message: "This provider cannot be enabled until its approved adapter is installed",
@@ -799,6 +792,12 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 		oldSnapshot := integrationAuditSnapshot(provider, &organization, row, nil)
 		credentialsChanged := false
 		configChanged := len(config) > 0
+		oldThreadsAppID := ""
+		if provider == integrationProviderThreads {
+			oldThreadsAppID = strings.TrimSpace(stringJSONValue(row.Config, "app_id"))
+		}
+		_, threadsAppSecretCleared := clearSet["app_secret"]
+		threadsAppSecretReplaced := strings.TrimSpace(credentialValues["app_secret"]) != ""
 
 		switch provider {
 		case integrationProviderMeta:
@@ -914,6 +913,14 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 			for key, value := range config {
 				row.Config[key] = value
 			}
+			if provider == integrationProviderThreads {
+				appID := stringJSONValue(row.Config, "app_id")
+				if appID == "" {
+					row.ThreadsAppID = nil
+				} else {
+					row.ThreadsAppID = &appID
+				}
+			}
 			if row.CredentialData == nil {
 				row.CredentialData = models.JSONB{}
 			}
@@ -934,17 +941,28 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 		if request.Enabled != nil {
 			row.Enabled = *request.Enabled
 		}
-		if provider == integrationProviderThreads || provider == integrationProviderTikTok {
+		if provider == integrationProviderTikTok {
 			row.Enabled = false
 		}
 		if isNew && request.Enabled == nil {
 			row.Enabled = false
 		}
+		threadsAuthorizationChanged := provider == integrationProviderThreads &&
+			(oldThreadsAppID != strings.TrimSpace(stringJSONValue(row.Config, "app_id")) ||
+				threadsAppSecretCleared || threadsAppSecretReplaced)
+		if provider == integrationProviderThreads &&
+			((request.Enabled != nil && !*request.Enabled) || threadsAuthorizationChanged) {
+			if err := disconnectThreadsChannelAccounts(tx, orgID, userID, time.Now().UTC()); err != nil {
+				return err
+			}
+		}
 		if credentialsChanged {
 			now := time.Now().UTC()
 			row.CredentialsUpdatedAt = &now
 		}
-		if credentialsChanged || configChanged {
+		threadsExplicitlyDisabled := provider == integrationProviderThreads &&
+			request.Enabled != nil && !*request.Enabled
+		if credentialsChanged || configChanged || threadsExplicitlyDisabled {
 			row.LastTestedAt = nil
 			row.LastSuccessfulAt = nil
 			row.LastErrorCode = ""
@@ -962,6 +980,12 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 			}
 		}
 		if err := tx.Save(row).Error; err != nil {
+			if provider == integrationProviderThreads && isUniqueViolation(err) {
+				return &integrationClientError{
+					status:  fasthttp.StatusConflict,
+					message: "This Threads App ID is already bound to another ReReply workspace",
+				}
+			}
 			return err
 		}
 		newSnapshot := integrationAuditSnapshot(provider, &organization, row, tx)
@@ -986,6 +1010,104 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 			sensitive...,
 		)
 	})
+}
+
+func disconnectThreadsChannelAccounts(tx *gorm.DB, orgID, userID uuid.UUID, now time.Time) error {
+	var accounts []models.ChannelAccount
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"organization_id = ? AND channel = ? AND provider = ?",
+			orgID,
+			models.ChannelThreads,
+			channelapi.ThreadsProvider,
+		).
+		Find(&accounts).Error; err != nil {
+		return err
+	}
+
+	accountIDs := make([]uuid.UUID, 0, len(accounts))
+	for index := range accounts {
+		account := &accounts[index]
+		accountIDs = append(accountIDs, account.ID)
+		if account.Config == nil {
+			account.Config = models.JSONB{}
+		}
+		account.Config["outbound_enabled"] = false
+		account.Status = models.ChannelAccountStatusDisconnected
+		account.IsDefaultIncoming = false
+		account.IsDefaultOutgoing = false
+		account.UpdatedByID = &userID
+		if err := tx.Save(account).Error; err != nil {
+			return err
+		}
+	}
+	if len(accountIDs) == 0 {
+		return nil
+	}
+	queuedStatuses := []models.OutboxJobStatus{
+		models.OutboxJobStatusPending,
+		models.OutboxJobStatusRetrying,
+		models.OutboxJobStatusProcessing,
+	}
+	var cancelledJobs []models.OutboxJob
+	if err := tx.Model(&cancelledJobs).
+		Clauses(clause.Returning{Columns: []clause.Column{{Name: "message_id"}}}).
+		Where(
+			"organization_id = ? AND channel_account_id IN ? AND status IN ?",
+			orgID,
+			accountIDs,
+			queuedStatuses,
+		).
+		Updates(map[string]any{
+			"status":          models.OutboxJobStatusCancelled,
+			"failed_at":       now,
+			"last_error_code": "threads_disconnected",
+			"last_error":      "Threads integration disconnected before delivery",
+			"locked_at":       nil,
+			"locked_by":       "",
+			"updated_at":      now,
+		}).Error; err != nil {
+		return err
+	}
+	messageIDs := make([]uuid.UUID, 0, len(cancelledJobs))
+	for index := range cancelledJobs {
+		if cancelledJobs[index].MessageID != nil {
+			messageIDs = append(messageIDs, *cancelledJobs[index].MessageID)
+		}
+	}
+	if len(messageIDs) > 0 {
+		if err := tx.Model(&models.Message{}).
+			Where(
+				"organization_id = ? AND id IN ? AND status = ?",
+				orgID,
+				messageIDs,
+				models.MessageStatusPending,
+			).
+			Updates(map[string]any{
+				"status":        models.MessageStatusFailed,
+				"error_message": "Threads integration disconnected before delivery",
+				"updated_at":    now,
+			}).Error; err != nil {
+			return err
+		}
+	}
+
+	return tx.Model(&models.ChannelCredential{}).
+		Where(
+			"organization_id = ? AND channel_account_id IN ? AND status IN ?",
+			orgID,
+			accountIDs,
+			[]models.ChannelCredentialStatus{
+				models.ChannelCredentialStatusActive,
+				models.ChannelCredentialStatusExpiring,
+			},
+		).
+		Updates(map[string]any{
+			"status":     models.ChannelCredentialStatusRevoked,
+			"revoked_at": now,
+			"rotated_at": now,
+			"updated_at": now,
+		}).Error
 }
 
 func lockOrCreateIntegrationRow(tx *gorm.DB, orgID, userID uuid.UUID, provider string) (*models.ProviderIntegration, bool, error) {
@@ -1038,8 +1160,10 @@ func (a *App) validateEnabledIntegration(provider string, organization *models.O
 			return errors.New("qwen endpoint region is invalid")
 		}
 	case integrationProviderThreads:
-		if stringJSONValue(row.Config, "app_id") == "" || stringJSONValue(row.Config, "redirect_uri") == "" || !encryptedCredentialFlag(row, "app_secret").Configured {
-			return errors.New("threads app ID, redirect URI, and app secret are required before enabling")
+		if stringJSONValue(row.Config, "app_id") == "" || stringJSONValue(row.Config, "redirect_uri") == "" ||
+			!encryptedCredentialFlag(row, "app_secret").Configured ||
+			!encryptedCredentialFlag(row, "webhook_verify_token").Configured {
+			return errors.New("threads app ID, redirect URI, app secret, and webhook verify token are required before enabling")
 		}
 	case integrationProviderTikTok:
 		if stringJSONValue(row.Config, "client_id") == "" || stringJSONValue(row.Config, "redirect_uri") == "" || !encryptedCredentialFlag(row, "client_secret").Configured {
@@ -1118,6 +1242,9 @@ func validateIntegrationConfig(provider string, input models.JSONB) (models.JSON
 			if !ok || len(text) > 255 || (text != "" && !integrationIdentifierPattern.MatchString(text)) {
 				return nil, fmt.Errorf("config.%s is invalid", key)
 			}
+			if provider == integrationProviderThreads && key == "app_id" && text != "" && !validThreadsOAuthID(text) {
+				return nil, errors.New("config.app_id must be a numeric Threads App ID")
+			}
 			result[key] = text
 		case "redirect_uri":
 			text, ok := value.(string)
@@ -1182,6 +1309,9 @@ func validateIntegrationCredentials(provider string, values map[string]string, c
 		if len(value) < 8 || len(value) > 8192 {
 			return nil, nil, fmt.Errorf("credentials.%s has an invalid length", name)
 		}
+		if provider == integrationProviderThreads && name == "webhook_verify_token" && len(value) < 16 {
+			return nil, nil, errors.New("credentials.webhook_verify_token must be at least 16 characters")
+		}
 		result[name] = value
 	}
 	clearSet := map[string]struct{}{}
@@ -1218,7 +1348,7 @@ func integrationCredentialNames(provider string) []string {
 	case integrationProviderMeta:
 		return []string{"app_secret", "webhook_verify_token"}
 	case integrationProviderThreads:
-		return []string{"app_secret"}
+		return []string{"app_secret", "webhook_verify_token"}
 	case integrationProviderTikTok:
 		return []string{"client_secret"}
 	case integrationProviderQwen:
