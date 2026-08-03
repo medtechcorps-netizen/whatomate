@@ -1225,6 +1225,42 @@ test("platform owner revokes the selected workspace support entitlement with an 
   ).toBeVisible();
 });
 
+test("saving enabled Threads configuration is not blocked by an empty support revocation reason", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, superAdminUser, {
+    threadsEntitlementEnabled: true,
+    supportOverrideActive: true,
+    selectedOrganizationId,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  const revokeReason = page.locator(
+    "#threads-entitlement-support-revoke-reason",
+  );
+  await expect(page.getByTestId("threads-entitlement-support")).toBeVisible();
+  await expect(revokeReason).toBeVisible();
+  await expect(revokeReason).toHaveValue("");
+  await expect(revokeReason).toHaveAttribute("aria-required", "true");
+  await expect(revokeReason).not.toHaveAttribute("required", "");
+  await expect(page.getByTestId("threads-entitlement-revoke")).toBeDisabled();
+  await expect(page.locator("#integration-enabled")).toHaveAttribute(
+    "data-state",
+    "checked",
+  );
+
+  await page.getByTestId("integration-save-threads").click();
+
+  await expect.poll(() => traffic.threadsUpdates.length).toBe(1);
+  expect(traffic.threadsUpdates[0].enabled).toBe(true);
+  await expect(revokeReason).toHaveValue("");
+  await expect(page.getByTestId("threads-entitlement-revoke")).toBeDisabled();
+});
+
 test("a revoke conflict refreshes the changed support grant and requires a new reason", async ({
   page,
 }) => {
