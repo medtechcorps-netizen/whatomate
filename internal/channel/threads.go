@@ -30,9 +30,9 @@ const (
 )
 
 var (
-	ErrThreadsWebhookUnsupported   = errors.New("Threads webhook operation is not configured")
-	ErrThreadsOperationUnsupported = errors.New("Threads direct messages, standalone posts, media, and read receipts are not supported")
-	ErrThreadsCredentialMissing    = errors.New("Threads OAuth credential is not configured")
+	ErrThreadsWebhookUnsupported   = errors.New("threads webhook operation is not configured")
+	ErrThreadsOperationUnsupported = errors.New("threads direct messages, standalone posts, media, and read receipts are not supported")
+	ErrThreadsCredentialMissing    = errors.New("threads OAuth credential is not configured")
 )
 
 var requiredThreadsScopes = [...]string{
