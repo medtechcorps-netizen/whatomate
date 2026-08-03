@@ -88,8 +88,24 @@ const privacySections: LegalSection[] = [
     ]
   },
   {
+    id: 'google-search-console',
+    title: '5. Google Search Console and Google API data',
+    paragraphs: [
+      'When an authorised Customer Organisation user connects Google Search Console, ReReply uses the Google account selected by that user to discover website properties the account can access. The user then chooses which verified properties ReReply may display. ReReply requests only the read-only Google Search Console permission and cannot edit a website, change Search Console settings or publish content.',
+      'For selected properties, ReReply may access property identifiers and permission levels together with search-performance data such as clicks, impressions, click-through rate (CTR), average position, search queries and pages. ReReply uses this data only to provide search-visibility reporting inside the requesting Customer Organisation’s workspace.',
+      'OAuth refresh tokens are encrypted at rest. Connected-property metadata and integration configuration are kept in protected, tenant-isolated systems, and data is encrypted in transit. Search-performance reports are requested from Google when an authorised user opens the report; ReReply does not use Google Search Console data for advertising, profiling unrelated to the requested feature or training general-purpose AI models.',
+      'ReReply retains the encrypted OAuth credential and selected-property configuration while the integration remains connected or as needed to provide and secure the service. An authorised workspace user may disconnect Google Search Console in ReReply, which deletes ReReply’s stored OAuth credential and disables the selected properties. The user may also revoke ReReply through their Google Account permissions. Limited audit and backup records may remain for the periods described in the Retention and deletion section below.'
+    ],
+    bullets: [
+      'We do not sell Google user data.',
+      'We do not share Google user data with another Customer Organisation or with third parties except service providers acting for ReReply under appropriate confidentiality and security obligations, or where disclosure is legally required.',
+      'Our use and transfer of information received from Google APIs complies with the Google API Services User Data Policy, including the Limited Use requirements.'
+    ],
+    callout: 'You control the connection: choose verified properties, disconnect in ReReply, or revoke access in your Google Account.'
+  },
+  {
     id: 'ai',
-    title: '5. AI-assisted features',
+    title: '6. AI-assisted features',
     paragraphs: [
       'Customer Organisations may enable AI-assisted drafting, classification, chatbot or workflow features. When enabled, relevant prompts, message excerpts or configured knowledge may be sent to the selected AI provider, including Qwen through Alibaba Cloud DashScope where configured, solely to perform the requested feature and subject to the applicable provider terms and deployment configuration.',
       'AI output may be incomplete or inaccurate and must be reviewed by an authorised person before it is relied upon for patient care, clinical decisions, legal advice, financial decisions or other high-impact uses.'
@@ -97,7 +113,7 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'health',
-    title: '6. Health and sensitive information',
+    title: '7. Health and sensitive information',
     paragraphs: [
       'Some Customer Organisations may use ReReply in healthcare, wellness or pharmacy settings. They determine whether sensitive or health-related information may be collected and are responsible for obtaining appropriate consent, limiting access and complying with professional and legal duties.',
       'ReReply is a communication and workflow platform. It is not an emergency service, diagnostic tool or substitute for advice from a qualified healthcare professional.'
@@ -105,7 +121,7 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'sharing',
-    title: '7. When information is shared',
+    title: '8. When information is shared',
     bullets: [
       'With authorised users and service providers of the relevant Customer Organisation.',
       'With infrastructure, communications, storage, security, analytics and AI providers that support the service under appropriate obligations.',
@@ -119,7 +135,7 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'retention',
-    title: '8. Retention and deletion',
+    title: '9. Retention and deletion',
     paragraphs: [
       'We retain information for as long as needed to provide the service, fulfil Customer Organisation instructions, protect the platform and meet legal or contractual obligations. Retention periods vary by data category, organisation configuration and applicable law.',
       'When data is deleted from active systems, limited copies may remain temporarily in protected backups until they age out under the applicable backup-rotation schedule. We may retain minimal records necessary for security, fraud prevention, legal compliance, billing disputes and proof that a privacy request was completed.'
@@ -127,14 +143,14 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'transfers',
-    title: '9. International processing',
+    title: '10. International processing',
     paragraphs: [
       'ReReply and its service providers may process information in Malaysia or other countries where our infrastructure and connected providers operate. Where required, we use contractual, organisational or technical safeguards for cross-border transfers. Customer Organisations remain responsible for assessing transfers created by the integrations they choose to enable.'
     ]
   },
   {
     id: 'security',
-    title: '10. Security',
+    title: '11. Security',
     paragraphs: [
       'We use administrative, technical and organisational safeguards designed to protect information, including access controls, tenant-aware authorisation, encrypted network transport, audit logging, restricted production access and service monitoring. No internet service can guarantee absolute security.',
       'Users must protect their credentials, use strong authentication and promptly notify us of suspected unauthorised access.'
@@ -142,7 +158,7 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'rights',
-    title: '11. Your choices and rights',
+    title: '12. Your choices and rights',
     paragraphs: [
       'Depending on applicable law, you may have rights to request access, correction, deletion, restriction, portability or objection, or to withdraw consent. If your information was collected by a Customer Organisation using ReReply, contact that organisation first because it controls the relevant record. We will support valid instructions from the organisation.',
       'You may also follow our Data Deletion Instructions. We may need to verify your identity and relationship to the relevant organisation before acting.'
@@ -150,14 +166,14 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'children',
-    title: '12. Children',
+    title: '13. Children',
     paragraphs: [
       'ReReply is intended for business users and is not directed to children. A Customer Organisation that handles a child’s data is responsible for obtaining any required parent or guardian authorisation and applying appropriate safeguards.'
     ]
   },
   {
     id: 'updates',
-    title: '13. Updates and contact',
+    title: '14. Updates and contact',
     paragraphs: [
       'We may update this policy when the service, law or our processing practices change. We will post the revised version here and update the effective date.',
       'For privacy questions, contact Medtech Softwarehouse at medtechcorps@gmail.com. For records controlled by a clinic, pharmacy, wellness provider or other Customer Organisation, you should also contact that organisation directly.'
@@ -394,8 +410,8 @@ const documents: Record<DocumentKey, LegalDocument> = {
     eyebrow: 'Trust centre',
     title: 'Privacy Policy',
     summary: 'How ReReply protects and processes account, CRM and conversation data across separate customer organisations.',
-    updated: 'Effective 28 July 2026',
-    readingTime: '10 minute read',
+    updated: 'Effective 3 August 2026',
+    readingTime: '12 minute read',
     icon: ShieldCheck,
     sections: privacySections
   },
@@ -453,15 +469,15 @@ onBeforeUnmount(() => {
 
     <header class="sticky top-0 z-40 border-b border-white/[0.07] bg-[#0c0f0a]/85 backdrop-blur-2xl">
       <div class="mx-auto flex h-[72px] max-w-[1180px] items-center justify-between px-5 sm:px-8">
-        <RouterLink to="/login" aria-label="ReReply sign in">
+        <RouterLink to="/about" aria-label="ReReply home">
           <ReReplyLogo size="md" tone="light" tagline />
         </RouterLink>
         <RouterLink
-          to="/login"
+          to="/about"
           class="group inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-semibold uppercase tracking-[0.13em] text-[#dfe5b6] transition hover:border-[#cbd49a]/35 hover:bg-[#cbd49a]/[0.08]"
         >
           <ArrowLeft class="h-3.5 w-3.5 transition-transform group-hover:-translate-x-0.5" />
-          Return to sign in
+          About ReReply
         </RouterLink>
       </div>
     </header>
@@ -595,6 +611,7 @@ onBeforeUnmount(() => {
           <p class="mt-3">Conversations, aligned. Data, respected.</p>
         </div>
         <nav aria-label="Legal" class="flex flex-wrap gap-x-5 gap-y-2">
+          <RouterLink to="/about" class="text-white/45 transition hover:text-[#cbd49a]">About</RouterLink>
           <RouterLink to="/privacy" class="text-white/45 transition hover:text-[#cbd49a]">Privacy</RouterLink>
           <RouterLink to="/terms" class="text-white/45 transition hover:text-[#cbd49a]">Terms</RouterLink>
           <RouterLink to="/data-deletion" class="text-white/45 transition hover:text-[#cbd49a]">Data deletion</RouterLink>
