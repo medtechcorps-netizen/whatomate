@@ -76,6 +76,10 @@ var errChannelIdempotencyCollision = errors.New(
 	"idempotency key was already used for a different conversation or message payload",
 )
 
+var errChannelAccountUnavailableAtEnqueue = errors.New(
+	"channel account became unavailable before the message was queued",
+)
+
 func (a *App) ListInboxConversations(r *fastglue.Request) error {
 	orgID, userID, err := a.requireAuth(r, models.ResourceConversations, models.ActionRead)
 	if err != nil {
@@ -531,6 +535,15 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 	}
 
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockChannelAccountForMessageEnqueue(
+			tx,
+			orgID,
+			conversation.ChannelAccountID,
+			conversation.Channel,
+			now,
+		); err != nil {
+			return err
+		}
 		// A reply can only target a message in the same tenant conversation.
 		if request.ReplyToMessageID != nil {
 			var count int64
@@ -596,6 +609,14 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errChannelAccountUnavailableAtEnqueue) {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusConflict,
+				"Channel account is no longer available for outbound delivery",
+				nil,
+				"",
+			)
+		}
 		if strings.Contains(err.Error(), "reply message") {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 		}
@@ -641,6 +662,52 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 		"outbox_job": outbox,
 		"idempotent": false,
 	})
+}
+
+func lockChannelAccountForMessageEnqueue(
+	tx *gorm.DB,
+	orgID, accountID uuid.UUID,
+	channel models.Channel,
+	now time.Time,
+) error {
+	// Serialize enqueue with account disconnect and credential rotation. If
+	// disconnect commits first, this observes the disabled account and creates
+	// no message/job. If enqueue commits first, disconnect's cancellation scan
+	// necessarily sees the new job.
+	var account models.ChannelAccount
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id", "organization_id", "channel", "provider", "status", "config").
+		Where("id = ? AND organization_id = ?", accountID, orgID).
+		First(&account).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errChannelAccountUnavailableAtEnqueue
+		}
+		return err
+	}
+	if account.Status != models.ChannelAccountStatusActive ||
+		account.Channel != channel ||
+		!boolConfigValue(account.Config, "outbound_enabled") {
+		return errChannelAccountUnavailableAtEnqueue
+	}
+	var usableCredentialCount int64
+	if err := tx.Model(&models.ChannelCredential{}).
+		Where(
+			"organization_id = ? AND channel_account_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+			orgID,
+			account.ID,
+			[]models.ChannelCredentialStatus{
+				models.ChannelCredentialStatusActive,
+				models.ChannelCredentialStatusExpiring,
+			},
+			now,
+		).
+		Count(&usableCredentialCount).Error; err != nil {
+		return err
+	}
+	if usableCredentialCount != 1 {
+		return errChannelAccountUnavailableAtEnqueue
+	}
+	return nil
 }
 
 func (a *App) MarkInboxConversationRead(r *fastglue.Request) error {
@@ -932,8 +999,8 @@ func validateThreadsPublicReplyTarget(
 		return errors.New("threads public replies require an existing reply or mention target")
 	}
 	if conversation.ChannelAccount == nil ||
-		!strings.EqualFold(conversation.ChannelAccount.Provider, channelapi.RelayProvider) {
-		return errors.New("threads public replies require a compatible signed provider relay")
+		!strings.EqualFold(conversation.ChannelAccount.Provider, channelapi.ThreadsProvider) {
+		return errors.New("threads public replies require an OAuth-managed Threads account")
 	}
 	if stringConfigValue(conversation.ChannelAccount.Config, "engagement_mode") != threadsPublicEngagementMode {
 		return errors.New("threads channel is not configured for public replies and mentions")

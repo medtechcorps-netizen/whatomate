@@ -26,6 +26,7 @@ import (
 
 var ErrChannelAdapterUnavailable = errors.New("channel provider adapter is not available")
 var ErrLegacyMetaAccountManaged = errors.New("legacy Meta channel accounts are managed by WhatsApp setup")
+var ErrThreadsAccountManaged = errors.New("threads accounts using OAuth are managed in Settings > Integrations")
 var ErrChannelAccountChangedDuringValidation = errors.New("channel account changed during validation")
 var ErrChannelAccountValidationSuperseded = errors.New("channel account validation was superseded")
 
@@ -393,6 +394,9 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		if account.Provider == channelapi.LegacyMetaProvider {
 			return ErrLegacyMetaAccountManaged
 		}
+		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
+			return ErrThreadsAccountManaged
+		}
 		oldAccount := *account
 		// Channel account JSONB values are maps. Keep detached audit snapshots
 		// so in-place delivery/AI toggles cannot mutate both old and new values.
@@ -579,6 +583,9 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel account not found", nil, "")
 		}
 		if errors.Is(err, ErrLegacyMetaAccountManaged) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
+		}
+		if errors.Is(err, ErrThreadsAccountManaged) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
@@ -923,6 +930,9 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 		if account.Provider == channelapi.LegacyMetaProvider {
 			return ErrLegacyMetaAccountManaged
 		}
+		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
+			return ErrThreadsAccountManaged
+		}
 		if err := cancelChannelAIReplyJobsForAccountTx(
 			tx,
 			orgID,
@@ -959,6 +969,9 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 		if errors.Is(err, ErrLegacyMetaAccountManaged) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
+		if errors.Is(err, ErrThreadsAccountManaged) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete channel account", nil, "")
 	}
 	return r.SendEnvelope(map[string]string{"message": "Channel account deleted successfully"})
@@ -969,10 +982,18 @@ func (a *App) channelAdapter(account *models.ChannelAccount) (channelapi.Adapter
 		return nil, ErrChannelAdapterUnavailable
 	}
 	if account.Channel == models.ChannelThreads {
-		return nil, fmt.Errorf(
-			"%w: Threads public replies are beta and no approved Threads relay adapter is installed",
-			ErrChannelAdapterUnavailable,
-		)
+		if !strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
+			return nil, fmt.Errorf("%w: Threads account is not OAuth-managed", ErrChannelAdapterUnavailable)
+		}
+		appSecret, verifyToken, err := a.threadsWebhookCredentials(account.OrganizationID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: Threads app credentials are unavailable", ErrChannelAdapterUnavailable)
+		}
+		encryptionKey := ""
+		if a.Config != nil {
+			encryptionKey = a.Config.App.EncryptionKey
+		}
+		return channelapi.NewThreadsWebhookAdapter(a.HTTPClient, encryptionKey, appSecret, verifyToken), nil
 	}
 	if account.Channel == models.ChannelTikTok {
 		return nil, fmt.Errorf("%w: TikTok connections are not yet approved", ErrChannelAdapterUnavailable)
@@ -1014,7 +1035,7 @@ func additionalChannelCreationEntitlement(channel models.Channel) (string, bool)
 func validateChannelCreationPolicy(request ChannelAccountRequest) error {
 	switch request.Channel {
 	case models.ChannelThreads:
-		return errors.New("threads is preparation-only until an approved adapter is installed; channel accounts cannot be created yet")
+		return errors.New("threads accounts are OAuth-managed from Settings > Integrations and cannot be created manually")
 	case models.ChannelTikTok:
 		return errors.New("tiktok is preparation-only until an approved messaging adapter is installed; channel accounts cannot be created yet")
 	default:
@@ -1026,8 +1047,8 @@ func threadsPublicEngagementConfig(config models.JSONB) models.JSONB {
 	config = cloneJSONB(config)
 	config["engagement_mode"] = threadsPublicEngagementMode
 	config["direct_messages_supported"] = false
-	config["beta"] = true
-	config["activation_available"] = false
+	config["beta"] = false
+	config["activation_available"] = true
 	return config
 }
 
@@ -1035,8 +1056,8 @@ func threadsPublicEngagementCapabilities(capabilities models.JSONB) models.JSONB
 	capabilities = cloneJSONB(capabilities)
 	capabilities["business_initiation"] = false
 	capabilities["direct_messages"] = false
-	capabilities["public_replies"] = false
-	capabilities["mentions"] = false
+	capabilities["public_replies"] = true
+	capabilities["mentions"] = true
 	capabilities["reply_target_required"] = true
 	return capabilities
 }

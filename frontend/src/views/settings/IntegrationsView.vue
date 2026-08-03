@@ -175,30 +175,30 @@ const definitions: Record<IntegrationProvider, IntegrationDefinition> = {
     glow: "linear-gradient(145deg, #242424, #565656)",
     capabilities: ["Replies", "Mentions", "Public engagement"],
     connectLabel: "Connect Threads",
-    preparationOnly: true,
     unavailableCopy:
-      "Threads remains fail-closed until the relay adapter and Meta review are approved.",
+      "Public replies and mentions only. Threads direct messages and standalone posts are not supported.",
     fields: [
       {
         key: "app_id",
         label: "Threads App ID",
         description:
-          "The Meta application configured with the Threads API use case.",
+          "Use a dedicated Meta Threads application. One App ID binds to one ReReply workspace and one Threads profile.",
         placeholder: "123456789012345",
       },
       {
         key: "redirect_uri",
-        label: "Future OAuth redirect URI",
+        label: "OAuth redirect URI",
         description:
-          "Preparation record only. ReReply does not expose a Threads callback until an approved adapter is installed.",
-        placeholder: "https://future-approved-callback.example.com/threads",
+          "Register this exact callback URL in the Threads application in Meta for Developers.",
+        placeholder:
+          "https://app.example.com/api/integrations/threads/callback",
         kind: "url",
       },
       {
         key: "app_review_status",
         label: "Meta app review",
         description:
-          "Track the provider approval state before enabling live traffic.",
+          "Record the review state for the required Threads public-engagement permissions.",
         kind: "select",
         options: reviewOptions,
       },
@@ -210,6 +210,13 @@ const definitions: Record<IntegrationProvider, IntegrationDefinition> = {
         description:
           "Write-only and encrypted. Existing values can never be revealed.",
         placeholder: "Enter a new app secret",
+      },
+      {
+        key: "webhook_verify_token",
+        label: "Webhook verify token",
+        description:
+          "Enter the same strong secret (at least 16 characters) in the Meta Threads Webhooks callback setup.",
+        placeholder: "Enter a new webhook verify token",
       },
     ],
   },
@@ -430,8 +437,7 @@ const isActivationLocked = computed(() => {
   if (!integration) return false;
   return (
     ["approval_required", "adapter_unavailable"].includes(integration.status) ||
-    (["threads", "tiktok"].includes(integration.provider) &&
-      !integration.oauth.available)
+    (integration.provider === "tiktok" && !integration.oauth.available)
   );
 });
 const orderedIntegrations = computed(() =>
@@ -620,6 +626,17 @@ async function copyWebhookCallback() {
     toast.success("Meta webhook callback copied");
   } catch {
     toast.error("Could not copy the webhook callback");
+  }
+}
+
+async function copyThreadsOAuthCallback() {
+  const callback = configDraft.redirect_uri ?? "";
+  if (!callback.trim()) return;
+  try {
+    await navigator.clipboard.writeText(callback);
+    toast.success("Threads OAuth callback copied");
+  } catch {
+    toast.error("Could not copy the Threads OAuth callback");
   }
 }
 
@@ -912,9 +929,32 @@ async function handleSearchConsoleOAuthReturn() {
   }
 }
 
+async function handleThreadsOAuthReturn() {
+  const rawOutcome = route.query.threads;
+  if (rawOutcome == null) return;
+  const outcome = Array.isArray(rawOutcome) ? rawOutcome[0] : rawOutcome;
+
+  const nextQuery = { ...route.query };
+  delete nextQuery.threads;
+  await router.replace({ query: nextQuery });
+
+  if (outcome === "connected") {
+    await loadIntegrations({ quiet: true });
+    toast.success("Threads connected");
+    openConfiguration("threads");
+  } else if (outcome === "cancelled") {
+    toast.info("Threads authorization was cancelled. No changes were made.");
+  } else if (outcome === "error") {
+    toast.error(
+      "Threads authorization was not completed. Try connecting again.",
+    );
+  }
+}
+
 onMounted(async () => {
   await loadIntegrations();
   await handleSearchConsoleOAuthReturn();
+  await handleThreadsOAuthReturn();
 });
 </script>
 
@@ -1350,6 +1390,20 @@ onMounted(async () => {
                       data-testid="meta-webhook-callback-copy"
                       aria-label="Copy Meta webhook callback"
                       @click="copyWebhookCallback"
+                    >
+                      <Copy class="h-4 w-4" aria-hidden="true" />
+                    </Button>
+                    <Button
+                      v-if="
+                        selectedIntegration.provider === 'threads' &&
+                        field.key === 'redirect_uri'
+                      "
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      data-testid="threads-oauth-callback-copy"
+                      aria-label="Copy Threads OAuth callback"
+                      @click="copyThreadsOAuthCallback"
                     >
                       <Copy class="h-4 w-4" aria-hidden="true" />
                     </Button>

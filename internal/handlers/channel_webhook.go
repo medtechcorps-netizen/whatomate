@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,63 @@ import (
 const (
 	rawInboundProcessingLease = 2 * time.Minute
 )
+
+var errThreadsWebhookBindingInactive = errors.New("threads webhook binding is no longer active")
+
+// VerifyChannelWebhook handles Meta's GET subscription challenge for an
+// OAuth-managed channel callback URL.
+func (a *App) VerifyChannelWebhook(r *fastglue.Request) error {
+	channelAccountID, err := uuid.Parse(strings.TrimSpace(pathString(r, "channel_account_id")))
+	if err != nil || channelAccountID == uuid.Nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+	}
+	orgID, err := resolveChannelWebhookOrganization(a.DB, channelAccountID, a.rlsEnabled())
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+	}
+	var account models.ChannelAccount
+	var adapter channelapi.Adapter
+	err = a.WithTenantApp(orgID, func(scoped *App) error {
+		loaded, loadErr := loadChannelAccount(scoped.DB, orgID, channelAccountID, false)
+		if loadErr != nil {
+			return loadErr
+		}
+		account = *loaded
+		if account.Channel == models.ChannelThreads {
+			if loadErr = validateThreadsWebhookAccountBinding(
+				scoped.DB,
+				&account,
+				strings.TrimSpace(fmt.Sprint(account.Metadata["app_id"])),
+			); loadErr != nil {
+				return loadErr
+			}
+		}
+		adapter, loadErr = scoped.channelAdapter(&account)
+		return loadErr
+	})
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+	}
+	verifier, ok := adapter.(interface{ VerifyChallenge(string) error })
+	if !ok || strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("hub.mode"))) != "subscribe" {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Webhook verification failed", nil, "")
+	}
+	challenge := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("hub.challenge")))
+	if challenge == "" || len(challenge) > 64 {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Webhook verification failed", nil, "")
+	}
+	if _, err := strconv.ParseInt(challenge, 10, 64); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Webhook verification failed", nil, "")
+	}
+	if err := verifier.VerifyChallenge(string(r.RequestCtx.QueryArgs().Peek("hub.verify_token"))); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Webhook verification failed", nil, "")
+	}
+	r.RequestCtx.Response.Header.SetContentType("text/plain; charset=utf-8")
+	r.RequestCtx.Response.Header.Set("Cache-Control", "no-store")
+	r.RequestCtx.Response.SetStatusCode(fasthttp.StatusOK)
+	r.RequestCtx.Response.SetBodyString(challenge)
+	return nil
+}
 
 // RelayChannelWebhook handles the public route:
 // /api/webhooks/channels/{channel_account_id}.
@@ -102,8 +160,24 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid webhook signature", nil, "")
 	}
 	hint, err := adapter.RouteHint(headers, body)
-	if err != nil || hint.ExternalAccountID != account.ExternalAccountID {
+	if err != nil || (account.Channel != models.ChannelThreads && hint.ExternalAccountID != account.ExternalAccountID) {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Webhook route does not match payload", nil, "")
+	}
+	threadsPayloadAppID := ""
+	if account.Channel == models.ChannelThreads {
+		threadsPayloadAppID = strings.TrimSpace(fmt.Sprint(hint.Metadata["app_id"]))
+		if err := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
+			return validateThreadsWebhookAccountBinding(tx, &account, threadsPayloadAppID)
+		}); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Webhook route does not match the dedicated Threads app", nil, "")
+		}
+	}
+	if validator, ok := adapter.(interface {
+		ValidateWebhookAccount(*models.ChannelAccount, []byte) error
+	}); ok {
+		if err := validator.ValidateWebhookAccount(&account, body); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Webhook route does not match payload", nil, "")
+		}
 	}
 
 	rawHash := sha256.Sum256(body)
@@ -124,10 +198,28 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 	shouldProcess := false
 	retry := false
 	if err := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
+		if account.Channel == models.ChannelThreads {
+			currentAccount, bindingErr := lockThreadsWebhookPersistenceBinding(
+				tx,
+				orgID,
+				account.ID,
+				threadsPayloadAppID,
+				account.ExternalAccountID,
+				time.Now().UTC(),
+			)
+			if bindingErr != nil {
+				return bindingErr
+			}
+			account = *currentAccount
+			rawEvent.ChannelAccountID = account.ID
+		}
 		var claimErr error
 		shouldProcess, retry, claimErr = persistOrClaimRawInboundEvent(tx, &rawEvent)
 		return claimErr
 	}); err != nil {
+		if errors.Is(err, errThreadsWebhookBindingInactive) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+		}
 		a.Log.Error("Failed to persist channel webhook", "error", err, "organization_id", orgID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to accept webhook", nil, "")
 	}
@@ -217,6 +309,41 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 			"reason":    "omnichannel_not_entitled",
 		})
 	}
+	if account.Channel == models.ChannelThreads {
+		threadsEntitled := false
+		threadsEntitlementErr := a.WithTenantApp(orgID, func(scoped *App) error {
+			decision, evaluateErr := scoped.EvaluateProductEntitlement(
+				uuid.Nil,
+				orgID,
+				channelapi.ThreadsPublicEngagementEntitlementKey,
+			)
+			if evaluateErr == nil {
+				threadsEntitled = decision.Allowed
+			}
+			return evaluateErr
+		})
+		if threadsEntitlementErr != nil {
+			markInboundEventFailed(a.DB, orgID, rawEvent.ID, "threads_entitlement_check_failed", threadsEntitlementErr)
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Threads entitlement could not be evaluated", nil, "")
+		}
+		if !threadsEntitled {
+			if err := markInboundEventIgnored(
+				a.DB,
+				orgID,
+				rawEvent.ID,
+				"threads_not_entitled",
+				"Verified Threads webhook quarantined because public engagement is not entitled",
+			); err != nil {
+				return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Webhook could not be safely discarded", nil, "")
+			}
+			return r.SendEnvelope(map[string]any{
+				"accepted":  true,
+				"duplicate": false,
+				"discarded": true,
+				"reason":    "threads_not_entitled",
+			})
+		}
+	}
 
 	events, normalizeErr := adapter.NormalizeWebhook(requestContext(r), &account, body)
 	if normalizeErr != nil {
@@ -292,6 +419,156 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		"retry":       retry,
 		"event_count": len(events),
 	})
+}
+
+func validateThreadsWebhookAccountBinding(
+	tx *gorm.DB,
+	account *models.ChannelAccount,
+	payloadAppID string,
+) error {
+	if tx == nil || account == nil || account.OrganizationID == uuid.Nil || account.ID == uuid.Nil ||
+		account.Channel != models.ChannelThreads ||
+		!strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
+		return errors.New("threads webhook account binding is invalid")
+	}
+	payloadAppID = strings.TrimSpace(payloadAppID)
+	accountAppID := strings.TrimSpace(fmt.Sprint(account.Metadata["app_id"]))
+	if payloadAppID == "" || accountAppID == "" || payloadAppID != accountAppID {
+		return errors.New("threads webhook app does not match the connected account")
+	}
+
+	var integration models.ProviderIntegration
+	if err := tx.Where(
+		"organization_id = ? AND provider = ? AND enabled = ?",
+		account.OrganizationID,
+		integrationProviderThreads,
+		true,
+	).First(&integration).Error; err != nil {
+		return err
+	}
+	if integration.ThreadsAppID == nil || strings.TrimSpace(*integration.ThreadsAppID) != payloadAppID {
+		return errors.New("threads webhook app is not bound to this workspace")
+	}
+
+	var accountCount int64
+	if err := tx.Model(&models.ChannelAccount{}).
+		Where(
+			"organization_id = ? AND channel = ? AND provider = ?",
+			account.OrganizationID,
+			models.ChannelThreads,
+			channelapi.ThreadsProvider,
+		).
+		Count(&accountCount).Error; err != nil {
+		return err
+	}
+	if accountCount != 1 {
+		return errors.New("threads app must be bound to exactly one channel account")
+	}
+	return nil
+}
+
+// lockThreadsWebhookPersistenceBinding is the final authorization boundary
+// before a signed Threads payload becomes durable. Integration mutations take
+// locks in integration -> account -> credential order, so using the same order
+// here makes disconnect, app rotation, OAuth rotation, and webhook acceptance
+// linearizable without holding a database lock during signature verification.
+func lockThreadsWebhookPersistenceBinding(
+	tx *gorm.DB,
+	organizationID, accountID uuid.UUID,
+	payloadAppID, expectedExternalAccountID string,
+	now time.Time,
+) (*models.ChannelAccount, error) {
+	if tx == nil || organizationID == uuid.Nil || accountID == uuid.Nil {
+		return nil, errThreadsWebhookBindingInactive
+	}
+	payloadAppID = strings.TrimSpace(payloadAppID)
+	expectedExternalAccountID = strings.TrimSpace(expectedExternalAccountID)
+	if payloadAppID == "" || expectedExternalAccountID == "" {
+		return nil, errThreadsWebhookBindingInactive
+	}
+
+	var integration models.ProviderIntegration
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"organization_id = ? AND provider = ? AND enabled = ?",
+			organizationID,
+			integrationProviderThreads,
+			true,
+		).
+		First(&integration).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errThreadsWebhookBindingInactive
+		}
+		return nil, err
+	}
+	configuredAppID := stringConfigValue(integration.Config, "app_id")
+	if integration.ThreadsAppID == nil || configuredAppID != payloadAppID ||
+		strings.TrimSpace(*integration.ThreadsAppID) != payloadAppID {
+		return nil, errThreadsWebhookBindingInactive
+	}
+
+	var account models.ChannelAccount
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"id = ? AND organization_id = ? AND channel = ? AND provider = ? AND status IN ?",
+			accountID,
+			organizationID,
+			models.ChannelThreads,
+			channelapi.ThreadsProvider,
+			[]models.ChannelAccountStatus{
+				models.ChannelAccountStatusPending,
+				models.ChannelAccountStatusActive,
+				models.ChannelAccountStatusDegraded,
+			},
+		).
+		First(&account).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errThreadsWebhookBindingInactive
+		}
+		return nil, err
+	}
+	if strings.TrimSpace(account.ExternalAccountID) != expectedExternalAccountID ||
+		stringConfigValue(account.Metadata, "app_id") != payloadAppID {
+		return nil, errThreadsWebhookBindingInactive
+	}
+
+	var accountCount int64
+	if err := tx.Model(&models.ChannelAccount{}).
+		Where(
+			"organization_id = ? AND channel = ? AND provider = ?",
+			organizationID,
+			models.ChannelThreads,
+			channelapi.ThreadsProvider,
+		).
+		Count(&accountCount).Error; err != nil {
+		return nil, err
+	}
+	if accountCount != 1 {
+		return nil, errThreadsWebhookBindingInactive
+	}
+
+	var credentials []models.ChannelCredential
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"organization_id = ? AND channel_account_id = ? AND kind = ? AND status IN ? AND expires_at IS NOT NULL AND expires_at > ?",
+			organizationID,
+			account.ID,
+			models.ChannelCredentialKindOAuth,
+			[]models.ChannelCredentialStatus{
+				models.ChannelCredentialStatusActive,
+				models.ChannelCredentialStatusExpiring,
+			},
+			now.UTC(),
+		).
+		Order("version DESC, id ASC").
+		Find(&credentials).Error; err != nil {
+		return nil, err
+	}
+	if len(credentials) != 1 || stringConfigValue(credentials[0].Metadata, "app_id") != payloadAppID {
+		return nil, errThreadsWebhookBindingInactive
+	}
+	account.Credentials = credentials
+	return &account, nil
 }
 
 func rawInboundEventLeaseActive(status models.InboundEventStatus) bool {

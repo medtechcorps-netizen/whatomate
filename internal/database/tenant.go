@@ -13,7 +13,7 @@ import (
 
 const (
 	tenantSetting           = "app.current_organization_id"
-	tenantRLSRoutingVersion = 4
+	tenantRLSRoutingVersion = 5
 )
 
 var (
@@ -458,6 +458,7 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		"public.rereply_resolve_channel_org(uuid)",
 		"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamp with time zone)",
 		"public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamp with time zone)",
+		"public.rereply_ready_threads_credential_orgs(uuid,integer,timestamp with time zone)",
 		"public.rereply_rls_routing_version()",
 	} {
 		var allowed bool
@@ -628,6 +629,37 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		   ORDER BY (organization_id > p_after) DESC, organization_id
 		   LIMIT LEAST(GREATEST(p_limit, 1), 100)
 		 $function$`,
+		`CREATE OR REPLACE FUNCTION public.rereply_ready_threads_credential_orgs(
+		   p_after uuid,
+		   p_limit integer,
+		   p_refresh_before timestamptz
+		 )
+		 RETURNS SETOF uuid
+		 LANGUAGE sql
+		 SECURITY DEFINER
+		 SET search_path = pg_catalog, public
+		 AS $function$
+		   WITH ready AS (
+		     SELECT DISTINCT credentials.organization_id
+		     FROM public.channel_credentials AS credentials
+		     JOIN public.channel_accounts AS accounts
+		       ON accounts.id = credentials.channel_account_id
+		      AND accounts.organization_id = credentials.organization_id
+		     WHERE credentials.deleted_at IS NULL
+		       AND credentials.kind = 'oauth'
+		       AND credentials.status IN ('active', 'expiring')
+		       AND credentials.expires_at IS NOT NULL
+		       AND credentials.expires_at <= p_refresh_before
+		       AND accounts.deleted_at IS NULL
+		       AND accounts.channel = 'threads'
+		       AND accounts.provider = 'threads'
+		       AND accounts.status = 'active'
+		   )
+		   SELECT organization_id
+		   FROM ready
+		   ORDER BY (organization_id > p_after) DESC, organization_id
+		   LIMIT LEAST(GREATEST(p_limit, 1), 100)
+		 $function$`,
 		fmt.Sprintf(
 			`CREATE OR REPLACE FUNCTION public.rereply_rls_routing_version()
 			 RETURNS integer
@@ -646,6 +678,7 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_channel_org(uuid) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamptz) FROM PUBLIC",
+		"REVOKE ALL ON FUNCTION public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_rls_routing_version() FROM PUBLIC",
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_whatsapp_org(text) TO %s", runtimeRole),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_webhook_org(text) TO %s", runtimeRole),
@@ -657,6 +690,10 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		),
 		fmt.Sprintf(
 			"GRANT EXECUTE ON FUNCTION public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamptz) TO %s",
+			runtimeRole,
+		),
+		fmt.Sprintf(
+			"GRANT EXECUTE ON FUNCTION public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz) TO %s",
 			runtimeRole,
 		),
 		fmt.Sprintf(
@@ -707,6 +744,7 @@ func RemoveTenantRLS(db *gorm.DB) error {
 			"public.rereply_resolve_channel_org(text,text,text)",
 			"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz)",
 			"public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamptz)",
+			"public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz)",
 			"public.rereply_rls_routing_version()",
 		} {
 			if err := tx.Exec("DROP FUNCTION IF EXISTS " + signature).Error; err != nil {

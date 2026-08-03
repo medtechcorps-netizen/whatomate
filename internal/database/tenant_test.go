@@ -251,6 +251,32 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	}
 	require.NoError(t, adminDB.Create(&channelA).Error)
 	require.NoError(t, adminDB.Create(&channelB).Error)
+	threadsChannelB := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    orgB.ID,
+		Channel:           models.ChannelThreads,
+		Provider:          "threads",
+		Name:              "Beta Threads",
+		ExternalAccountID: "threads-" + uuid.NewString(),
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{"outbound_enabled": true},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, adminDB.Create(&threadsChannelB).Error)
+	threadsExpiry := time.Now().UTC().Add(24 * time.Hour)
+	require.NoError(t, adminDB.Create(&models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   orgB.ID,
+		ChannelAccountID: threadsChannelB.ID,
+		Kind:             models.ChannelCredentialKindOAuth,
+		Version:          1,
+		CredentialBlob:   models.JSONB{"access_token": "rls-test-token"},
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "test",
+		ExpiresAt:        &threadsExpiry,
+		Metadata:         models.JSONB{},
+	}).Error)
 	conversationB := models.InboxConversation{
 		BaseModel:              models.BaseModel{ID: uuid.New()},
 		OrganizationID:         orgB.ID,
@@ -451,6 +477,31 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 
 		// Restore the current resolver set for the remaining isolation checks.
 		require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+		}))
+	})
+
+	t.Run("runtime startup rejects missing Threads credential resolver grant", func(t *testing.T) {
+		require.NoError(t, adminDB.Exec(fmt.Sprintf(
+			"REVOKE ALL ON FUNCTION public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz) FROM %s",
+			runtimeRole,
+		)).Error)
+		restored := false
+		defer func() {
+			if !restored {
+				require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
+			}
+		}()
+		err := asRuntime(func(runtimeDB *gorm.DB) error {
+			return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "rereply_ready_threads_credential_orgs")
+
+		// Restore the resolver grant for the remaining isolation checks.
+		require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
+		restored = true
 		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
 			return database.VerifyTenantRLS(runtimeDB, runtimeRole)
 		}))
@@ -835,6 +886,30 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		require.Contains(t, organizationIDs, orgB.ID)
 	})
 
+	t.Run("Threads credential resolver returns tenant IDs without exposing credentials", func(t *testing.T) {
+		var organizationIDs []uuid.UUID
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			if err := runtimeDB.Raw(
+				"SELECT * FROM public.rereply_ready_threads_credential_orgs(?, ?, ?)",
+				uuid.Nil,
+				20,
+				time.Now().UTC().Add(7*24*time.Hour),
+			).Scan(&organizationIDs).Error; err != nil {
+				return err
+			}
+
+			var visibleCredentials int64
+			if err := runtimeDB.Model(&models.ChannelCredential{}).Count(&visibleCredentials).Error; err != nil {
+				return err
+			}
+			if visibleCredentials != 0 {
+				return fmt.Errorf("unscoped credential query exposed %d rows", visibleCredentials)
+			}
+			return nil
+		}))
+		require.Contains(t, organizationIDs, orgB.ID)
+	})
+
 	t.Run("transaction-local tenant state does not leak to the pool", func(t *testing.T) {
 		require.NoError(t, asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
 			var count int64
@@ -852,6 +927,21 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 			return runtimeDB.Model(&models.Contact{}).Count(&count).Error
 		}))
 		require.Zero(t, count)
+	})
+
+	t.Run("RLS rollback drops the Threads credential resolver", func(t *testing.T) {
+		require.NoError(t, database.RemoveTenantRLS(adminDB))
+		var resolverExists bool
+		require.NoError(t, adminDB.Raw(`
+			SELECT to_regprocedure(
+			  'public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz)'
+			) IS NOT NULL
+		`).Scan(&resolverExists).Error)
+		require.False(t, resolverExists)
+
+		// Restore RLS so final data-integrity assertions and cleanup run under
+		// the same schema state as the rest of this test.
+		require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
 	})
 
 	// Verify that the rejected mutations did not change either clinic's data.

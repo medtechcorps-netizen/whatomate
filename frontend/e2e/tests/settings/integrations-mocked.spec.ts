@@ -122,8 +122,8 @@ function integrationFixture(): MockIntegration[] {
     {
       provider: "threads",
       display_name: "Threads",
-      status: "adapter_unavailable",
-      enabled: false,
+      status: "configured",
+      enabled: true,
       configured: true,
       read_only: false,
       config: {
@@ -134,16 +134,19 @@ function integrationFixture(): MockIntegration[] {
       },
       credentials: {
         app_secret: { configured: true, source: "workspace" },
+        webhook_verify_token: { configured: true, source: "workspace" },
       },
       connection: connection(),
-      oauth: { supported: true, available: false, mode: "oauth" },
+      oauth: { supported: true, available: true, mode: "oauth" },
       test_supported: false,
       message:
-        "Threads public replies and mentions remain disabled until an approved adapter is installed. Direct messages are not supported.",
+        "Public replies and mentions only. Threads direct messages and standalone posts are not supported.",
       required_scopes: [
         "threads_basic",
         "threads_read_replies",
         "threads_manage_replies",
+        "threads_content_publish",
+        "threads_manage_mentions",
       ],
     },
     {
@@ -292,6 +295,8 @@ async function installIntegrationMocks(
   const traffic = {
     listReads: 0,
     updates: [] as Array<Record<string, unknown>>,
+    threadsUpdates: [] as Array<Record<string, unknown>>,
+    threadsConnects: 0,
     qwenUpdates: [] as Array<Record<string, unknown>>,
     credentialClears: [] as string[],
     googlePropertyUpdates: [] as string[][],
@@ -384,6 +389,45 @@ async function installIntegrationMocks(
     }
     await route.fulfill({ json: { data: meta } });
   });
+  await page.route(
+    /\/api\/integrations\/threads\/connect(?:\?.*)?$/,
+    async (route) => {
+      traffic.threadsConnects += 1;
+      await route.fulfill({
+        json: {
+          data: {
+            provider: "threads",
+            ready: true,
+            mode: "oauth",
+            authorization_url: "/mock-threads-oauth?state=server-issued",
+          },
+        },
+      });
+    },
+  );
+  await page.route(/\/api\/integrations\/threads(?:\?.*)?$/, async (route) => {
+    if (route.request().method() !== "PUT") {
+      await route.fallback();
+      return;
+    }
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    traffic.threadsUpdates.push(body);
+    const threads = integrations.find((item) => item.provider === "threads")!;
+    if (typeof body.enabled === "boolean") threads.enabled = body.enabled;
+    if (body.config && typeof body.config === "object") {
+      threads.config = {
+        ...threads.config,
+        ...(body.config as Record<string, unknown>),
+      };
+    }
+    await route.fulfill({ json: { data: threads } });
+  });
+  await page.route("**/mock-threads-oauth**", (route) =>
+    route.fulfill({
+      contentType: "text/html",
+      body: "<html><body>Threads authorization</body></html>",
+    }),
+  );
   await page.route(/\/api\/integrations\/qwen(?:\?.*)?$/, async (route) => {
     if (route.request().method() !== "PUT") {
       await route.fallback();
@@ -738,33 +782,95 @@ test("Qwen region selection is wired to the allowlisted backend config without r
   ).toBeUndefined();
 });
 
-test("unavailable adapters are visibly fail-closed and cannot be enabled or connected", async ({
+test("Threads exposes the exact stored callback and starts live OAuth authorization", async ({
   page,
 }) => {
-  await installIntegrationMocks(page);
+  const traffic = await installIntegrationMocks(page);
   await page.goto("/settings/integrations");
 
   const threadsCard = page.getByTestId("integration-card-threads");
-  await expect(threadsCard).toContainText("Adapter pending");
-  await expect(threadsCard).toContainText(
-    "disabled until an approved adapter is installed",
-  );
+  await expect(threadsCard).toContainText("Ready to connect");
+  await expect(threadsCard).toContainText("Public replies and mentions");
   await threadsCard.getByRole("button", { name: "Configure" }).click();
 
   const dialog = page.getByTestId("integration-dialog-threads");
   await expect(dialog).toContainText(
-    "disabled until an approved adapter is installed",
+    "Threads direct messages and standalone posts are not supported",
   );
-  await expect(page.getByTestId("integration-preparation-only")).toBeVisible();
-  await expect(page.locator("#integration-enabled")).toBeDisabled();
-  await expect(page.getByTestId("integration-connect-threads")).toHaveCount(0);
-  await expect(page.getByTestId("integration-test-threads")).toHaveCount(0);
+  await expect(page.getByTestId("integration-preparation-only")).toHaveCount(0);
+  await expect(page.locator("#integration-enabled")).toBeEnabled();
+  const redirectInput = page.locator("#threads-redirect_uri");
+  await expect(redirectInput).toHaveValue(
+    "https://app.example.test/api/integrations/threads/callback",
+  );
+  await expect(redirectInput).toBeEditable();
+  await expect(page.getByTestId("threads-oauth-callback-copy")).toBeVisible();
+  const webhookTokenInput = page.locator("#threads-webhook_verify_token");
+  await expect(webhookTokenInput).toHaveAttribute("type", "password");
+  await expect(webhookTokenInput).toHaveValue("");
+  await expect(webhookTokenInput).toHaveAttribute(
+    "placeholder",
+    /Stored securely/,
+  );
   await expect(
-    page.getByTestId("integration-dialog-readiness-threads-approved_adapter"),
-  ).toContainText("Blocked");
+    page.getByTestId("integration-dialog-readiness-threads-redirect_uri"),
+  ).toContainText("https://app.example.test/api/integrations/threads/callback");
   await expect(
-    page.getByTestId("integration-dialog-readiness-threads-approved_adapter"),
-  ).toContainText("Direct messages are not supported");
+    page.getByTestId(
+      "integration-dialog-readiness-threads-oauth_authorization",
+    ),
+  ).toContainText("Ready");
+  await expect(
+    page.getByTestId(
+      "integration-dialog-readiness-threads-webhook_verify_token",
+    ),
+  ).toContainText("Ready");
+  await expect(
+    page.getByTestId(
+      "integration-dialog-readiness-threads-public_engagement_policy",
+    ),
+  ).toContainText(/direct messages and standalone posts remain unavailable/i);
+
+  await webhookTokenInput.fill("synthetic-threads-webhook-verify-token");
+  await page.getByTestId("integration-save-threads").click();
+  await expect.poll(() => traffic.threadsUpdates.length).toBe(1);
+  expect(traffic.threadsUpdates[0]).toMatchObject({
+    enabled: true,
+    config: {
+      app_id: "234567890123456",
+      redirect_uri:
+        "https://app.example.test/api/integrations/threads/callback",
+      app_review_status: "approved",
+    },
+    credentials: {
+      webhook_verify_token: "synthetic-threads-webhook-verify-token",
+    },
+  });
+  expect(
+    (traffic.threadsUpdates[0].credentials as Record<string, unknown>)
+      .app_secret,
+  ).toBeUndefined();
+  await expect(webhookTokenInput).toHaveValue("");
+  await expect(dialog).not.toContainText(
+    "synthetic-threads-webhook-verify-token",
+  );
+
+  await page.getByTestId("integration-connect-threads").click();
+  await expect.poll(() => traffic.threadsConnects).toBe(1);
+  await expect(page).toHaveURL(/\/mock-threads-oauth\?state=server-issued$/);
+});
+
+test("Threads OAuth callback opens the provider and removes its one-time URL marker", async ({
+  page,
+}) => {
+  await installIntegrationMocks(page);
+  await page.goto("/settings/integrations?threads=connected&keep=1");
+
+  await expect(page.getByTestId("integration-dialog-threads")).toBeVisible();
+  await expect(page).toHaveURL(/\/settings\/integrations\?keep=1$/);
+  await expect(
+    page.getByText("Threads connected", { exact: true }),
+  ).toBeVisible();
 });
 
 test("provider preflight assigns callbacks, subscriptions, and relay credentials to the correct owner", async ({
@@ -807,8 +913,8 @@ test("provider preflight assigns callbacks, subscriptions, and relay credentials
   await expect(page.getByTestId("integration-dialog-meta")).toHaveCount(0);
 
   await expect(
-    page.getByTestId("integration-readiness-threads-approved_adapter"),
-  ).toContainText("Blocked");
+    page.getByTestId("integration-readiness-threads-oauth_authorization"),
+  ).toContainText("Ready");
   await expect(
     page.getByTestId("integration-readiness-tiktok-approved_adapter"),
   ).toContainText("Blocked");

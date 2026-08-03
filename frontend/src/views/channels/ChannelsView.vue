@@ -38,6 +38,10 @@ import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import { getErrorMessage, unwrapItemResponse, unwrapListResponse } from '@/lib/api-utils'
+import {
+  threadsPublicEngagementAccountReady,
+  threadsPublicEngagementTarget,
+} from '@/lib/threadsPublicEngagement'
 import { wsService } from '@/services/websocket'
 import {
   channelsService,
@@ -143,7 +147,7 @@ const supportedChannels: Array<{
     key: 'threads',
     label: 'Threads public replies',
     icon: AtSign,
-    provider: 'relay',
+    provider: 'threads',
     gated: true,
     connectable: false,
     entitlement: threadsPublicEngagementEntitlement,
@@ -182,13 +186,26 @@ const canControlConversationAI = computed(
     selectedAccount.value?.config?.ai_reply_enabled === true,
 )
 
-const canSendText = computed(() =>
-  canManageConversations.value &&
-  !['threads', 'tiktok'].includes(selectedConversation.value?.channel ?? '') &&
-  selectedAccount.value?.status === 'active' &&
-  selectedAccount.value?.config?.outbound_enabled === true &&
-  selectedAccount.value?.capabilities?.text !== false,
+const selectedThreadsTarget = computed(() =>
+  threadsPublicEngagementTarget(selectedConversation.value),
 )
+const threadsPublicReplyReady = computed(() =>
+  threadsPublicEngagementAccountReady(
+    selectedAccount.value,
+    selectedThreadsTarget.value,
+  ),
+)
+const canSendText = computed(() => {
+  const conversation = selectedConversation.value
+  if (!canManageConversations.value || !conversation) return false
+  if (conversation.channel === 'tiktok') return false
+  if (conversation.channel === 'threads') return threadsPublicReplyReady.value
+  return (
+    selectedAccount.value?.status === 'active' &&
+    selectedAccount.value?.config?.outbound_enabled === true &&
+    selectedAccount.value?.capabilities?.text !== false
+  )
+})
 const activeCount = computed(() => accounts.value.filter(accountReadyForOutbound).length)
 const attentionCount = computed(() =>
   accounts.value.filter(
@@ -390,6 +407,16 @@ async function sendMessage() {
   const conversation = selectedConversation.value
   const messageText = composer.value.trim()
   if (!conversation || !messageText) return
+  const threadsTarget =
+    conversation.channel === 'threads'
+      ? threadsPublicEngagementTarget(conversation)
+      : null
+  if (conversation.channel === 'threads' && !threadsTarget) {
+    toast.warning(
+      'Select an existing public Threads reply or mention before replying.',
+    )
+    return
+  }
   if (!canSendText.value) return
   const viewSequence = conversationViewSequence
   sending.value = true
@@ -398,6 +425,9 @@ async function sendMessage() {
       idempotency_key: crypto.randomUUID(),
       purpose: 'service',
       parts: [{ type: 'text', text: messageText }],
+    }
+    if (threadsTarget) {
+      payload.reply_to_external_id = threadsTarget.externalId
     }
     const response = await channelsService.send(conversation.id, payload)
     if (!isCurrentConversationView(viewSequence, conversation.id)) return
@@ -839,8 +869,18 @@ onBeforeUnmount(() => {
             <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
             Test
           </Button>
+          <RouterLink
+            v-if="(canManageAccounts || canDeleteAccounts) && account.provider === 'threads'"
+            to="/settings/integrations"
+            data-testid="threads-manage-in-integrations"
+          >
+            <Button variant="outline" size="sm" class="h-8">
+              <Settings2 class="mr-1.5 h-3.5 w-3.5" />
+              Integrations
+            </Button>
+          </RouterLink>
           <Button
-            v-if="(canManageAccounts || canDeleteAccounts) && account.provider !== 'meta_legacy'"
+            v-else-if="(canManageAccounts || canDeleteAccounts) && account.provider !== 'meta_legacy'"
             variant="outline"
             size="sm"
             class="h-8"
@@ -922,8 +962,18 @@ onBeforeUnmount(() => {
             >
               <RefreshCw class="h-3.5 w-3.5" />
             </button>
+            <RouterLink
+              v-if="(canManageAccounts || canDeleteAccounts) && account.provider === 'threads'"
+              to="/settings/integrations"
+              data-testid="threads-manage-in-integrations"
+              class="rounded-lg p-1.5 text-white/25 transition hover:bg-white/[0.05] hover:text-sky-300 light:text-slate-500 light:hover:text-sky-700"
+              :aria-label="`Manage ${account.name} in Integrations`"
+              @click.stop
+            >
+              <Settings2 class="h-3.5 w-3.5" />
+            </RouterLink>
             <button
-              v-if="(canManageAccounts || canDeleteAccounts) && account.provider !== 'meta_legacy'"
+              v-else-if="(canManageAccounts || canDeleteAccounts) && account.provider !== 'meta_legacy'"
               type="button"
               class="rounded-lg p-1.5 text-white/25 transition hover:bg-white/[0.05] hover:text-sky-300 light:text-slate-500 light:hover:text-sky-700"
               :aria-label="`Manage ${account.name}`"
@@ -953,7 +1003,7 @@ onBeforeUnmount(() => {
             <p class="mt-0.5 text-[9px] text-white/25 light:text-slate-500">
               {{
                 channel.key === 'threads'
-                  ? 'Adapter unavailable; account creation disabled'
+                  ? 'OAuth managed in Settings → Integrations'
                   : channel.connectable
                     ? 'Signed relay'
                     : channel.gated
@@ -1167,12 +1217,27 @@ onBeforeUnmount(() => {
                     ? 'threads-public-reply-composer-notice'
                     : 'tiktok-reply-composer-notice'
                 "
-                class="rounded-xl border border-amber-300/15 bg-amber-300/[0.04] px-3 py-2 text-[11px] leading-5 text-amber-100/65 light:text-amber-800"
+                :class="[
+                  'rounded-xl border px-3 py-2 text-[11px] leading-5',
+                  selectedConversation.channel === 'threads' && threadsPublicReplyReady
+                    ? 'border-emerald-300/15 bg-emerald-300/[0.04] text-emerald-100/65 light:text-emerald-800'
+                    : 'border-amber-300/15 bg-amber-300/[0.04] text-amber-100/65 light:text-amber-800',
+                ]"
               >
                 <template v-if="selectedConversation.channel === 'threads'">
-                  Threads is read-only because an approved public-engagement adapter is not
-                  installed. Existing conversations remain visible, but replies, direct messages
-                  and standalone posts are disabled.
+                  <template v-if="threadsPublicReplyReady">
+                    This reply will be published to the selected public Threads
+                    {{ selectedThreadsTarget?.engagementType }}. Direct messages and standalone
+                    posts are not supported.
+                  </template>
+                  <template v-else-if="!selectedThreadsTarget">
+                    Select an existing public Threads reply or mention before replying. Direct
+                    messages and standalone posts are not supported.
+                  </template>
+                  <template v-else>
+                    This Threads connection is not ready for public replies. Direct messages and
+                    standalone posts are not supported.
+                  </template>
                 </template>
                 <template v-else>
                   TikTok is read-only because Business Messaging approval and an approved adapter
@@ -1188,7 +1253,11 @@ onBeforeUnmount(() => {
                 :disabled="!canSendText"
                 :placeholder="
                   selectedConversation.channel === 'threads'
-                    ? 'Threads replies are unavailable — adapter not installed'
+                    ? threadsPublicReplyReady
+                      ? 'Write a public Threads reply...'
+                      : selectedThreadsTarget
+                        ? 'Threads public replies are unavailable for this connection'
+                        : 'Select an existing public Threads reply or mention'
                     : selectedConversation.channel === 'tiktok'
                       ? 'TikTok replies are unavailable — approval required'
                     : canSendText
@@ -1205,7 +1274,9 @@ onBeforeUnmount(() => {
                 :disabled="sending || !composer.trim() || !canSendText"
                 :aria-label="
                   selectedConversation.channel === 'threads'
-                    ? 'Threads reply unavailable'
+                    ? threadsPublicReplyReady
+                      ? 'Send public Threads reply'
+                      : 'Threads reply unavailable'
                     : selectedConversation.channel === 'tiktok'
                       ? 'TikTok reply unavailable'
                     : 'Send reply'
