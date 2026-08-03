@@ -58,6 +58,14 @@ const viewOnlyUser = {
   },
 };
 
+const superAdminUser = {
+  ...adminUser,
+  id: "89999999-9999-4999-8999-999999999999",
+  email: "platform-owner@example.test",
+  full_name: "Platform Owner",
+  is_super_admin: true,
+};
+
 const connection = (accountCount = 0, activeCount = 0) => ({
   account_count: accountCount,
   active_count: activeCount,
@@ -262,9 +270,15 @@ type TestUser = typeof adminUser;
 async function installIntegrationMocks(
   page: Page,
   user: TestUser = adminUser,
-  options: { platformMeta?: boolean } = {},
+  options: {
+    platformMeta?: boolean;
+    threadsEntitlementEnabled?: boolean;
+    entitlementUnavailable?: boolean;
+    failEntitlementRefreshAfterGrant?: boolean;
+  } = {},
 ) {
   const integrations = integrationFixture();
+  let threadsEntitlementEnabled = options.threadsEntitlementEnabled ?? true;
   const googleProperties = [
     {
       id: "88888888-8888-4888-8888-888888888881",
@@ -294,8 +308,15 @@ async function installIntegrationMocks(
   }
   const traffic = {
     listReads: 0,
+    entitlementReads: 0,
+    threadsEntitlementRequests: [] as Array<{
+      method: string;
+      url: string;
+      body: Record<string, unknown>;
+    }>,
     updates: [] as Array<Record<string, unknown>>,
     threadsUpdates: [] as Array<Record<string, unknown>>,
+    threadsEnabledAfterUpdates: [] as boolean[],
     threadsConnects: 0,
     qwenUpdates: [] as Array<Record<string, unknown>>,
     credentialClears: [] as string[],
@@ -317,16 +338,61 @@ async function installIntegrationMocks(
   await page.route(/\/api\/me(?:\?.*)?$/, (route) =>
     route.fulfill({ json: { data: user } }),
   );
-  await page.route(/\/api\/product\/entitlements(?:\?.*)?$/, (route) =>
-    route.fulfill({
+  await page.route(/\/api\/product\/entitlements(?:\?.*)?$/, async (route) => {
+    traffic.entitlementReads += 1;
+    if (
+      options.entitlementUnavailable ||
+      (options.failEntitlementRefreshAfterGrant &&
+        traffic.threadsEntitlementRequests.length > 0)
+    ) {
+      await route.fulfill({
+        status: 503,
+        json: { error: "Entitlements temporarily unavailable" },
+      });
+      return;
+    }
+    await route.fulfill({
       json: {
         data: {
           mode: "licensed",
           plan_code: "rereply-growth",
-          entitlements: {},
+          entitlements: {
+            "omnichannel.enabled": true,
+            "threads.public_engagement.enabled": threadsEntitlementEnabled,
+          },
         },
       },
-    }),
+    });
+  });
+  await page.route(
+    new RegExp(
+      `/api/admin/organizations/${organizationId}/entitlements/threads-public-engagement/enable(?:\\?.*)?$`,
+    ),
+    async (route) => {
+      const request = route.request();
+      const body = request.postDataJSON() as Record<string, unknown>;
+      traffic.threadsEntitlementRequests.push({
+        method: request.method(),
+        url: request.url(),
+        body,
+      });
+      threadsEntitlementEnabled = true;
+      await route.fulfill({
+        json: {
+          data: {
+            organization_id: organizationId,
+            entitlement_key: "threads.public_engagement.enabled",
+            override_id: "8aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            source: "support",
+            starts_at: "2026-08-03T09:00:00Z",
+            created: true,
+            effective_enabled: true,
+            plan_code: "rereply-growth",
+            subscription_status: "trialing",
+          },
+        },
+      });
+    },
   );
   await page.route(/\/api\/auth\/ws-token(?:\?.*)?$/, (route) =>
     route.fulfill({ json: { data: { token: "" } } }),
@@ -420,6 +486,7 @@ async function installIntegrationMocks(
         ...(body.config as Record<string, unknown>),
       };
     }
+    traffic.threadsEnabledAfterUpdates.push(threads.enabled);
     await route.fulfill({ json: { data: threads } });
   });
   await page.route("**/mock-threads-oauth**", (route) =>
@@ -780,6 +847,131 @@ test("Qwen region selection is wired to the allowlisted backend config without r
   expect(
     (traffic.qwenUpdates[0].config as Record<string, unknown>).base_url,
   ).toBeUndefined();
+});
+
+test("Threads credential save preserves a live enabled integration during an entitlement outage", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, adminUser, {
+    entitlementUnavailable: true,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  const enabledSwitch = page.locator("#integration-enabled");
+  await expect(enabledSwitch).toBeDisabled();
+  await expect(enabledSwitch).toHaveAttribute("data-state", "checked");
+  await page
+    .locator("#threads-webhook_verify_token")
+    .fill("synthetic-threads-outage-webhook-token");
+  await page.getByTestId("integration-save-threads").click();
+
+  await expect.poll(() => traffic.threadsUpdates.length).toBe(1);
+  expect(traffic.threadsUpdates[0]).not.toHaveProperty("enabled");
+  expect(traffic.threadsUpdates[0]).toMatchObject({
+    credentials: {
+      webhook_verify_token: "synthetic-threads-outage-webhook-token",
+    },
+  });
+  expect(traffic.threadsEnabledAfterUpdates).toEqual([true]);
+  await expect(enabledSwitch).toHaveAttribute("data-state", "checked");
+});
+
+test("Threads entitlement support action is hidden from workspace admins while activation stays locked", async ({
+  page,
+}) => {
+  await installIntegrationMocks(page, adminUser, {
+    threadsEntitlementEnabled: false,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  const dialog = page.getByTestId("integration-dialog-threads");
+  await expect(dialog).toBeVisible();
+  await expect(page.getByTestId("threads-entitlement-support")).toHaveCount(0);
+  await expect(page.locator("#integration-enabled")).toBeDisabled();
+});
+
+test("platform owner grants the exact Threads entitlement with an audited reason and refreshes state", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, superAdminUser, {
+    threadsEntitlementEnabled: false,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  const support = page.getByTestId("threads-entitlement-support");
+  const reason = page.locator("#threads-entitlement-support-reason");
+  const enable = page.getByTestId("threads-entitlement-enable");
+  await expect(support).toBeVisible();
+  await expect(reason).toBeVisible();
+  await expect(enable).toBeDisabled();
+  await reason.fill("   ");
+  await expect(enable).toBeDisabled();
+  await reason.fill("  SR-2041 approved by platform support  ");
+  await expect(enable).toBeEnabled();
+  await expect(page.locator("#integration-enabled")).toBeDisabled();
+  await enable.click();
+
+  await expect.poll(() => traffic.threadsEntitlementRequests.length).toBe(1);
+  const request = traffic.threadsEntitlementRequests[0];
+  expect(request.method).toBe("POST");
+  expect(new URL(request.url).pathname).toBe(
+    `/api/admin/organizations/${organizationId}/entitlements/threads-public-engagement/enable`,
+  );
+  expect(request.body).toEqual({
+    reason: "SR-2041 approved by platform support",
+  });
+  await expect.poll(() => traffic.entitlementReads).toBeGreaterThanOrEqual(2);
+  await expect.poll(() => traffic.listReads).toBeGreaterThanOrEqual(2);
+  await expect(support).toHaveCount(0);
+  await expect(page.locator("#integration-enabled")).toBeEnabled();
+  await expect(
+    page.getByText("Threads public engagement entitlement enabled", {
+      exact: true,
+    }),
+  ).toBeVisible();
+});
+
+test("Threads Enabled switch remains locked when the post-grant entitlement refresh fails", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, superAdminUser, {
+    threadsEntitlementEnabled: false,
+    failEntitlementRefreshAfterGrant: true,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  await page
+    .locator("#threads-entitlement-support-reason")
+    .fill("SR-2042 entitlement refresh verification");
+  await page.getByTestId("threads-entitlement-enable").click();
+
+  await expect.poll(() => traffic.threadsEntitlementRequests.length).toBe(1);
+  await expect.poll(() => traffic.entitlementReads).toBeGreaterThanOrEqual(2);
+  await expect.poll(() => traffic.listReads).toBeGreaterThanOrEqual(2);
+  await expect(page.getByTestId("threads-entitlement-support")).toBeVisible();
+  await expect(page.locator("#integration-enabled")).toBeDisabled();
+  await expect(
+    page.getByText(
+      "The entitlement was enabled, but its status could not be refreshed. The Enabled switch remains locked.",
+      { exact: true },
+    ),
+  ).toBeVisible();
 });
 
 test("Threads exposes the exact stored callback and starts live OAuth authorization", async ({

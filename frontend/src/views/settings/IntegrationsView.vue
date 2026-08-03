@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { ConfirmDialog, PageHeader } from "@/components/shared";
 import IntegrationProviderCard, {
   type ProviderCardDefinition,
@@ -63,7 +64,11 @@ import {
   type IntegrationState,
   type IntegrationStatus,
 } from "@/services/integrations";
+import { organizationEntitlementSupportService } from "@/services/productSuite";
 import { useAuthStore } from "@/stores/auth";
+
+const THREADS_PUBLIC_ENGAGEMENT_ENTITLEMENT =
+  "threads.public_engagement.enabled";
 
 interface FieldOption {
   value: string;
@@ -413,10 +418,13 @@ const selectedProvider = ref<IntegrationProvider | null>(null);
 const isDialogOpen = ref(false);
 const isSearchConsoleDialogOpen = ref(false);
 const isRemoveOpen = ref(false);
-const activeAction = ref<"save" | "test" | "connect" | "remove" | null>(null);
+const activeAction = ref<
+  "save" | "test" | "connect" | "remove" | "entitlement" | null
+>(null);
 const configDraft = reactive<Record<string, string>>({});
 const secretDraft = reactive<Record<string, string>>({});
 const enabledDraft = ref(false);
+const threadsSupportReason = ref("");
 const canWrite = computed(() =>
   authStore.hasPermission("settings.integrations", "write"),
 );
@@ -432,10 +440,34 @@ const selectedReadiness = computed(() =>
     ? buildIntegrationReadiness(selectedIntegration.value)
     : [],
 );
+const threadsPublicEngagementEnabled = computed(() =>
+  authStore.hasProductEntitlement(THREADS_PUBLIC_ENGAGEMENT_ENTITLEMENT),
+);
+const isThreadsEntitlementLocked = computed(
+  () =>
+    selectedIntegration.value?.provider === "threads" &&
+    (!authStore.productEntitlementsLoaded ||
+      !threadsPublicEngagementEnabled.value),
+);
+const showThreadsEntitlementSupport = computed(
+  () =>
+    selectedIntegration.value?.provider === "threads" &&
+    Boolean(authStore.user?.is_super_admin) &&
+    authStore.productEntitlementsLoaded &&
+    !threadsPublicEngagementEnabled.value,
+);
+const canEnableThreadsEntitlement = computed(
+  () =>
+    showThreadsEntitlementSupport.value &&
+    Boolean(authStore.organizationId) &&
+    threadsSupportReason.value.trim().length > 0 &&
+    activeAction.value === null,
+);
 const isActivationLocked = computed(() => {
   const integration = selectedIntegration.value;
   if (!integration) return false;
   return (
+    isThreadsEntitlementLocked.value ||
     ["approval_required", "adapter_unavailable"].includes(integration.status) ||
     (integration.provider === "tiktok" && !integration.oauth.available)
   );
@@ -687,8 +719,14 @@ async function saveConfiguration() {
         .map((field) => [field.key, (secretDraft[field.key] ?? "").trim()])
         .filter(([, value]) => value !== ""),
     );
+    const preserveThreadsEnabledState =
+      integration.provider === "threads" && isThreadsEntitlementLocked.value;
     const response = await integrationsService.update(integration.provider, {
-      enabled: isActivationLocked.value ? false : enabledDraft.value,
+      ...(preserveThreadsEnabledState
+        ? {}
+        : {
+            enabled: isActivationLocked.value ? false : enabledDraft.value,
+          }),
       config,
       ...(Object.keys(credentials).length ? { credentials } : {}),
     });
@@ -700,6 +738,54 @@ async function saveConfiguration() {
     toast.success(`${definition.name} configuration saved`);
   } catch (error) {
     toast.error(getErrorMessage(error, `Could not save ${definition.name}.`));
+  } finally {
+    activeAction.value = null;
+  }
+}
+
+async function enableThreadsPublicEngagement() {
+  const organizationID = authStore.organizationId.trim();
+  const reason = threadsSupportReason.value.trim();
+  if (!canEnableThreadsEntitlement.value || !organizationID || !reason) return;
+
+  activeAction.value = "entitlement";
+  try {
+    const response =
+      await organizationEntitlementSupportService.enableThreadsPublicEngagement(
+        organizationID,
+        { reason },
+      );
+    if (!response.data.data.effective_enabled) {
+      throw new Error("Threads public engagement did not become effective");
+    }
+
+    const [entitlementsRefreshed] = await Promise.all([
+      authStore.fetchProductEntitlements(),
+      loadIntegrations({ quiet: true }),
+    ]);
+    if (
+      !entitlementsRefreshed ||
+      !authStore.hasProductEntitlement(THREADS_PUBLIC_ENGAGEMENT_ENTITLEMENT)
+    ) {
+      toast.error(
+        "The entitlement was enabled, but its status could not be refreshed. The Enabled switch remains locked.",
+      );
+      return;
+    }
+
+    threadsSupportReason.value = "";
+    toast.success(
+      response.data.data.created
+        ? "Threads public engagement entitlement enabled"
+        : "Threads public engagement entitlement is already enabled",
+    );
+  } catch (error) {
+    toast.error(
+      getErrorMessage(
+        error,
+        "Could not enable Threads public engagement entitlement.",
+      ),
+    );
   } finally {
     activeAction.value = null;
   }
@@ -904,6 +990,7 @@ watch(isDialogOpen, (open) => {
     Object.keys(secretDraft).forEach((key) => {
       secretDraft[key] = "";
     });
+    threadsSupportReason.value = "";
   }
 });
 
@@ -952,7 +1039,10 @@ async function handleThreadsOAuthReturn() {
 }
 
 onMounted(async () => {
-  await loadIntegrations();
+  await Promise.all([
+    loadIntegrations(),
+    authStore.ensureProductEntitlements(),
+  ]);
   await handleSearchConsoleOAuthReturn();
   await handleThreadsOAuthReturn();
 });
@@ -1274,6 +1364,79 @@ onMounted(async () => {
                 }}</span>
               </div>
             </div>
+
+            <section
+              v-if="showThreadsEntitlementSupport"
+              data-testid="threads-entitlement-support"
+              class="rounded-xl border border-[#cbd49a]/20 bg-[#cbd49a]/[0.055] px-4 py-4 light:border-[#697046]/25 light:bg-[#f5f6ed]"
+              aria-labelledby="threads-entitlement-support-title"
+            >
+              <div class="flex items-start gap-3">
+                <div
+                  class="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#cbd49a]/20 bg-black/15 text-[#dce5aa] light:bg-white light:text-[#59613b]"
+                >
+                  <ShieldCheck class="h-4 w-4" aria-hidden="true" />
+                </div>
+                <div class="min-w-0 flex-1">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <h3
+                      id="threads-entitlement-support-title"
+                      class="text-sm font-semibold text-white light:text-gray-900"
+                    >
+                      Platform support entitlement
+                    </h3>
+                    <Badge variant="secondary" class="text-[9px]">
+                      Platform owner
+                    </Badge>
+                  </div>
+                  <p
+                    class="mt-1 text-xs leading-5 text-white/45 light:text-gray-600"
+                  >
+                    Public engagement is not enabled for this workspace. Add an
+                    audited reason to grant the reviewed Threads capability.
+                  </p>
+
+                  <div class="mt-3 space-y-1.5">
+                    <Label
+                      for="threads-entitlement-support-reason"
+                      class="text-xs text-white/70 light:text-gray-700"
+                    >
+                      Support reason
+                    </Label>
+                    <Textarea
+                      id="threads-entitlement-support-reason"
+                      v-model="threadsSupportReason"
+                      :rows="2"
+                      maxlength="2000"
+                      required
+                      placeholder="Ticket, approval, or operational reason"
+                      :disabled="activeAction !== null"
+                      class="min-h-[72px] resize-none bg-black/15 light:bg-white"
+                    />
+                    <div
+                      class="flex flex-col gap-3 pt-1 sm:flex-row sm:items-center sm:justify-between"
+                    >
+                      <p
+                        class="text-[11px] leading-4 text-white/35 light:text-gray-500"
+                      >
+                        Required and recorded in the entitlement audit log.
+                      </p>
+                      <Button
+                        type="button"
+                        size="sm"
+                        data-testid="threads-entitlement-enable"
+                        :loading="activeAction === 'entitlement'"
+                        :disabled="!canEnableThreadsEntitlement"
+                        @click="enableThreadsPublicEngagement"
+                      >
+                        <ShieldCheck class="h-3.5 w-3.5" aria-hidden="true" />
+                        Enable public engagement
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
 
             <section aria-labelledby="application-config-title">
               <div class="mb-4 flex items-center justify-between gap-3">
