@@ -312,7 +312,7 @@ func TestChannelOutboxThreadsEntitlementIsRechecked(t *testing.T) {
 	))
 	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
 	assert.Equal(t, models.OutboxJobStatusFailed, job.Status)
-	assert.Contains(t, job.LastError, "Threads public engagement entitlement")
+	assert.Contains(t, job.LastError, "threads public engagement entitlement")
 	require.NoError(t, db.First(message, "id = ?", message.ID).Error)
 	assert.Equal(t, models.MessageStatusFailed, message.Status)
 }
@@ -364,7 +364,7 @@ func TestChannelOutboxRejectsMismatchedThreadsAppBinding(t *testing.T) {
 	))
 	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
 	assert.Equal(t, models.OutboxJobStatusFailed, job.Status)
-	assert.Contains(t, job.LastError, "Threads app binding")
+	assert.Contains(t, job.LastError, "threads app binding")
 	require.NoError(t, db.First(message, "id = ?", message.ID).Error)
 	assert.Equal(t, models.MessageStatusFailed, message.Status)
 }
