@@ -20,6 +20,11 @@ import (
 
 const threadsTestEncryptionKey = "threads-test-encryption-key"
 
+func TestThreadsAdapterUsesOfficialGraphHost(t *testing.T) {
+	adapter := NewThreadsAdapter(http.DefaultClient, threadsTestEncryptionKey)
+	assert.Equal(t, "https://graph.threads.net/v1.0", adapter.apiBaseURL)
+}
+
 func TestThreadsAdapterPublishesExactTargetTextReply(t *testing.T) {
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
