@@ -69,6 +69,20 @@ func (f *fakeRedisBackend) GetDel(_ context.Context, key string) (string, error)
 	return value, nil
 }
 
+func (f *fakeRedisBackend) CompareAndSet(
+	_ context.Context,
+	key, currentValue, replacementValue string,
+) (bool, error) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	if f.values[key] != currentValue {
+		return false, nil
+	}
+	f.values[key] = replacementValue
+	f.expirations[key] = 0
+	return true, nil
+}
+
 func (f *fakeRedisBackend) Del(_ context.Context, key string) error {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
@@ -184,17 +198,65 @@ func TestRedisStoreFailsClosedForPlaintextOrWrongKey(t *testing.T) {
 	}
 }
 
-func TestRedisStoreDeleteRefreshTokenIsMailboxLocal(t *testing.T) {
+func TestRedisStoreReplacesOnlyTheStillCurrentRefreshToken(t *testing.T) {
 	store, backend, _ := testRedisStore(t)
+	ctx := context.Background()
+	if err := store.SaveRefreshToken(ctx, "current-refresh-token"); err != nil {
+		t.Fatalf("save refresh token: %v", err)
+	}
+	stored := backend.values[store.refreshTokenKey()]
+	replaced, err := store.ReplaceRefreshToken(ctx, "current-refresh-token", "current-refresh-token")
+	if err != nil || !replaced {
+		t.Fatalf("compare unchanged token: replaced=%t err=%v", replaced, err)
+	}
+	if backend.values[store.refreshTokenKey()] != stored {
+		t.Fatal("unchanged refresh token was unnecessarily re-encrypted")
+	}
+	replaced, err = store.ReplaceRefreshToken(ctx, "wrong-refresh-token", "replacement-refresh-token")
+	if err != nil || replaced {
+		t.Fatalf("replace mismatched token: replaced=%t err=%v", replaced, err)
+	}
+	value, err := store.LoadRefreshToken(ctx)
+	if err != nil || value != "current-refresh-token" {
+		t.Fatalf("mismatch changed token: value=%q err=%v", value, err)
+	}
+	replaced, err = store.ReplaceRefreshToken(ctx, "current-refresh-token", "replacement-refresh-token")
+	if err != nil || !replaced {
+		t.Fatalf("replace current token: replaced=%t err=%v", replaced, err)
+	}
+	value, err = store.LoadRefreshToken(ctx)
+	if err != nil || value != "replacement-refresh-token" {
+		t.Fatalf("replacement token: value=%q err=%v", value, err)
+	}
+	if err := store.DeleteRefreshToken(ctx); err != nil {
+		t.Fatalf("delete refresh token: %v", err)
+	}
+	replaced, err = store.ReplaceRefreshToken(ctx, "replacement-refresh-token", "must-not-reappear")
+	if err != nil || replaced {
+		t.Fatalf("replace deleted token: replaced=%t err=%v", replaced, err)
+	}
+	if _, err := store.LoadRefreshToken(ctx); !errors.Is(err, ErrRefreshTokenNotFound) {
+		t.Fatalf("deleted token was recreated: %v", err)
+	}
+}
+
+func TestRedisStoreDeleteRefreshTokenIsMailboxLocal(t *testing.T) {
+	store, backend, config := testRedisStore(t)
+	otherConfig := *config
+	otherConfig.Mailbox = "other@gmail.com"
+	otherStore, err := newRedisStore(&otherConfig, backend)
+	if err != nil {
+		t.Fatalf("build other mailbox store: %v", err)
+	}
 	backend.values[store.refreshTokenKey()] = "value"
-	backend.values[store.prefix+"other"] = "keep"
+	backend.values[otherStore.refreshTokenKey()] = "keep"
 	if err := store.DeleteRefreshToken(context.Background()); err != nil {
 		t.Fatalf("delete refresh token: %v", err)
 	}
 	if _, exists := backend.values[store.refreshTokenKey()]; exists {
 		t.Fatal("refresh token was not deleted")
 	}
-	if backend.values[store.prefix+"other"] != "keep" {
-		t.Fatal("delete affected unrelated relay data")
+	if backend.values[otherStore.refreshTokenKey()] != "keep" {
+		t.Fatal("delete affected another mailbox's refresh token")
 	}
 }

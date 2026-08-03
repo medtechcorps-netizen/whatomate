@@ -55,8 +55,8 @@ const privacySections: LegalSection[] = [
     bullets: [
       'Account data, such as names, work email addresses, roles, authentication records and organisation membership.',
       'Customer and contact data, such as names, telephone numbers, profile details, tags, notes, lead stages, appointments and service preferences.',
-      'Conversation data, including WhatsApp messages, attachments, templates, delivery events and agent notes.',
-      'Business configuration, including WhatsApp Business Account identifiers, phone-number identifiers, webhook settings and connected-channel metadata.',
+      'Conversation data, including WhatsApp and email messages, attachments, templates, delivery events and agent notes.',
+      'Business configuration, including WhatsApp Business Account identifiers, phone-number identifiers, connected Google mailbox metadata, webhook settings and other connected-channel metadata.',
       'Technical and security data, such as IP addresses, device and browser information, access logs, audit events and error diagnostics.',
       'Commercial and support data, including subscription records, invoices, service requests and correspondence with us.',
       'Information submitted to optional automation or AI-assisted features when a Customer Organisation enables them.'
@@ -104,8 +104,26 @@ const privacySections: LegalSection[] = [
     callout: 'You control the connection: choose verified properties, disconnect in ReReply, or revoke access in your Google Account.'
   },
   {
+    id: 'google-gmail',
+    title: '6. Gmail and Google API data',
+    paragraphs: [
+      'With permission from the Customer Organisation and Google account holder, a trusted ReReply operator connects one specifically configured Gmail or Google Workspace mailbox for that relay deployment. ReReply requests Gmail read-only and send permissions. The read-only permission is used to identify new inbox messages and display the conversation in ReReply’s unified workspace. ReReply may process the Gmail message and thread identifiers, sender and recipient addresses, subject, date and plain-text message content. Sent, draft, spam and trash messages are excluded, message content is limited to 10,000 characters, and attachment files are not downloaded or exposed.',
+      'The Gmail send permission is used only when an authorised ReReply user writes and approves a reply. ReReply validates the recipient against the existing Gmail thread and sends the text reply into that thread. ReReply does not use these permissions to modify or delete Gmail content, create bulk campaigns, download attachments or send a standalone message to an unrelated recipient.',
+      'OAuth refresh tokens are encrypted at rest, access tokens are short-lived and are not persisted, and data is encrypted in transit. Production relay and CRM storage use managed PostgreSQL and Valkey services with infrastructure encryption at rest, TLS-protected connections and network access restricted to the ReReply application. Gmail message content is transferred through a dedicated relay into the requesting Customer Organisation’s tenant-isolated ReReply workspace. Operational logs omit message bodies, OAuth tokens and provider response bodies. A queued relay body is removed after successful delivery or dead-lettering; delivery and idempotency markers are retained for seven days by default. Conversation content retained in ReReply remains workspace conversation history until the Customer Organisation instructs ReReply to delete it or another lawful retention requirement applies, as described in the Retention and deletion section below.',
+      'ReReply retains the encrypted Gmail OAuth credential only while the mailbox remains connected or as needed to provide and secure the service. An authorised organisation administrator may ask ReReply to disconnect the mailbox and delete the stored credential. The Google account holder may also revoke ReReply through Google Account permissions. Disconnecting stops future Gmail processing but does not automatically delete conversation records already retained under the Customer Organisation’s lawful instructions.'
+    ],
+    bullets: [
+      'We use Gmail data only to provide and secure the user-visible email conversation and reply features requested by the Customer Organisation.',
+      'We do not sell Gmail or other Google user data, use it for advertising or unrelated profiling, make credit decisions with it, or use it to train general-purpose AI models.',
+      'Gmail message content is not sent to ReReply’s optional automatic AI reply features.',
+      'We do not share Gmail data with another Customer Organisation or with third parties except service providers acting for ReReply under appropriate confidentiality and security obligations, or where disclosure is legally required.',
+      'Our use and transfer of information received from Google APIs complies with the Google API Services User Data Policy, including the Limited Use requirements.'
+    ],
+    callout: 'Gmail access is limited to one explicitly authorised mailbox: read new inbox conversations, send approved replies, disconnect or revoke whenever needed.'
+  },
+  {
     id: 'ai',
-    title: '6. AI-assisted features',
+    title: '7. AI-assisted features',
     paragraphs: [
       'Customer Organisations may enable AI-assisted drafting, classification, chatbot or workflow features. When enabled, relevant prompts, message excerpts or configured knowledge may be sent to the selected AI provider, including Qwen through Alibaba Cloud DashScope where configured, solely to perform the requested feature and subject to the applicable provider terms and deployment configuration.',
       'AI output may be incomplete or inaccurate and must be reviewed by an authorised person before it is relied upon for patient care, clinical decisions, legal advice, financial decisions or other high-impact uses.'
@@ -113,7 +131,7 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'health',
-    title: '7. Health and sensitive information',
+    title: '8. Health and sensitive information',
     paragraphs: [
       'Some Customer Organisations may use ReReply in healthcare, wellness or pharmacy settings. They determine whether sensitive or health-related information may be collected and are responsible for obtaining appropriate consent, limiting access and complying with professional and legal duties.',
       'ReReply is a communication and workflow platform. It is not an emergency service, diagnostic tool or substitute for advice from a qualified healthcare professional.'
@@ -121,11 +139,11 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'sharing',
-    title: '8. When information is shared',
+    title: '9. When information is shared',
     bullets: [
       'With authorised users and service providers of the relevant Customer Organisation.',
       'With infrastructure, communications, storage, security, analytics and AI providers that support the service under appropriate obligations.',
-      'With Meta, WhatsApp and other connected-channel providers when a Customer Organisation enables an integration.',
+      'With Google, Meta, WhatsApp and other connected-channel providers when a Customer Organisation enables an integration.',
       'With professional advisers, regulators or authorities where reasonably necessary or legally required.',
       'In connection with a legitimate corporate transaction, subject to appropriate confidentiality and data-protection safeguards.'
     ],
@@ -135,7 +153,7 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'retention',
-    title: '9. Retention and deletion',
+    title: '10. Retention and deletion',
     paragraphs: [
       'We retain information for as long as needed to provide the service, fulfil Customer Organisation instructions, protect the platform and meet legal or contractual obligations. Retention periods vary by data category, organisation configuration and applicable law.',
       'When data is deleted from active systems, limited copies may remain temporarily in protected backups until they age out under the applicable backup-rotation schedule. We may retain minimal records necessary for security, fraud prevention, legal compliance, billing disputes and proof that a privacy request was completed.'
@@ -143,14 +161,14 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'transfers',
-    title: '10. International processing',
+    title: '11. International processing',
     paragraphs: [
       'ReReply and its service providers may process information in Malaysia or other countries where our infrastructure and connected providers operate. Where required, we use contractual, organisational or technical safeguards for cross-border transfers. Customer Organisations remain responsible for assessing transfers created by the integrations they choose to enable.'
     ]
   },
   {
     id: 'security',
-    title: '11. Security',
+    title: '12. Security',
     paragraphs: [
       'We use administrative, technical and organisational safeguards designed to protect information, including access controls, tenant-aware authorisation, encrypted network transport, audit logging, restricted production access and service monitoring. No internet service can guarantee absolute security.',
       'Users must protect their credentials, use strong authentication and promptly notify us of suspected unauthorised access.'
@@ -158,7 +176,7 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'rights',
-    title: '12. Your choices and rights',
+    title: '13. Your choices and rights',
     paragraphs: [
       'Depending on applicable law, you may have rights to request access, correction, deletion, restriction, portability or objection, or to withdraw consent. If your information was collected by a Customer Organisation using ReReply, contact that organisation first because it controls the relevant record. We will support valid instructions from the organisation.',
       'You may also follow our Data Deletion Instructions. We may need to verify your identity and relationship to the relevant organisation before acting.'
@@ -166,14 +184,14 @@ const privacySections: LegalSection[] = [
   },
   {
     id: 'children',
-    title: '13. Children',
+    title: '14. Children',
     paragraphs: [
       'ReReply is intended for business users and is not directed to children. A Customer Organisation that handles a child’s data is responsible for obtaining any required parent or guardian authorisation and applying appropriate safeguards.'
     ]
   },
   {
     id: 'updates',
-    title: '14. Updates and contact',
+    title: '15. Updates and contact',
     paragraphs: [
       'We may update this policy when the service, law or our processing practices change. We will post the revised version here and update the effective date.',
       'For privacy questions, contact Medtech Softwarehouse at medtechcorps@gmail.com. For records controlled by a clinic, pharmacy, wellness provider or other Customer Organisation, you should also contact that organisation directly.'
@@ -376,7 +394,7 @@ const deletionSections: LegalSection[] = [
       'Eligible contact, CRM, appointment, note and conversation records controlled by the relevant Customer Organisation.',
       'Attachments and media stored by ReReply, where they are not subject to a valid retention requirement.',
       'Optional AI or automation inputs stored in ReReply-controlled systems, where applicable.',
-      'Connected-channel credentials under ReReply’s control when an authorised organisation closes the integration.'
+      'Connected-channel credentials under ReReply’s control when an authorised organisation closes the integration, including an encrypted Google OAuth credential for a disconnected Gmail or Search Console connection.'
     ]
   },
   {
@@ -389,9 +407,9 @@ const deletionSections: LegalSection[] = [
   },
   {
     id: 'third-parties',
-    title: 'WhatsApp, Meta and other third parties',
+    title: 'Google, WhatsApp, Meta and other third parties',
     paragraphs: [
-      'A ReReply deletion request removes eligible data controlled by ReReply or the relevant Customer Organisation. It does not delete your WhatsApp account, Facebook account or information independently held by Meta, WhatsApp, a telecommunications provider or another connected service.',
+      'A ReReply deletion request removes eligible data controlled by ReReply or the relevant Customer Organisation. It does not delete your Google, Gmail, WhatsApp or Facebook account, or information independently held by Google, Meta, WhatsApp, a telecommunications provider or another connected service.',
       'To delete information held by a third party, use that provider’s account and privacy controls. Disconnecting a ReReply integration stops future processing but may not erase records that the provider is independently required or permitted to retain.'
     ]
   },
@@ -411,7 +429,7 @@ const documents: Record<DocumentKey, LegalDocument> = {
     title: 'Privacy Policy',
     summary: 'How ReReply protects and processes account, CRM and conversation data across separate customer organisations.',
     updated: 'Effective 3 August 2026',
-    readingTime: '12 minute read',
+    readingTime: '15 minute read',
     icon: ShieldCheck,
     sections: privacySections
   },
@@ -428,7 +446,7 @@ const documents: Record<DocumentKey, LegalDocument> = {
     eyebrow: 'Privacy request',
     title: 'Data Deletion Instructions',
     summary: 'A clear process for requesting deletion of eligible ReReply account, CRM and conversation data.',
-    updated: 'Effective 28 July 2026',
+    updated: 'Effective 3 August 2026',
     readingTime: '5 minute read',
     icon: Trash2,
     sections: deletionSections

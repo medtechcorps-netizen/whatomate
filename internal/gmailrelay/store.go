@@ -24,6 +24,14 @@ var (
 	ErrRefreshTokenNotFound = errors.New("gmail refresh token is not configured")
 )
 
+var replaceRefreshTokenScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+	return 0
+end
+redis.call("SET", KEYS[1], ARGV[2])
+return 1
+`)
+
 // OAuthState is short-lived callback state. The code verifier is secret and
 // must never be returned to a browser or written to logs.
 type OAuthState struct {
@@ -39,6 +47,8 @@ type OAuthStore interface {
 	ConsumeOAuthState(ctx context.Context, nonce string) (OAuthState, error)
 	SaveRefreshToken(ctx context.Context, refreshToken string) error
 	LoadRefreshToken(ctx context.Context) (string, error)
+	ReplaceRefreshToken(ctx context.Context, currentToken, replacementToken string) (bool, error)
+	DeleteRefreshToken(ctx context.Context) error
 }
 
 type redisBackend interface {
@@ -47,6 +57,7 @@ type redisBackend interface {
 	SetNX(ctx context.Context, key, value string, expiration time.Duration) (bool, error)
 	Get(ctx context.Context, key string) (string, error)
 	GetDel(ctx context.Context, key string) (string, error)
+	CompareAndSet(ctx context.Context, key, currentValue, replacementValue string) (bool, error)
 	Del(ctx context.Context, key string) error
 	Close() error
 }
@@ -73,6 +84,20 @@ func (b *goRedisBackend) Get(ctx context.Context, key string) (string, error) {
 
 func (b *goRedisBackend) GetDel(ctx context.Context, key string) (string, error) {
 	return b.client.GetDel(ctx, key).Result()
+}
+
+func (b *goRedisBackend) CompareAndSet(
+	ctx context.Context,
+	key, currentValue, replacementValue string,
+) (bool, error) {
+	result, err := replaceRefreshTokenScript.Run(
+		ctx,
+		b.client,
+		[]string{key},
+		currentValue,
+		replacementValue,
+	).Int()
+	return result == 1, err
 }
 
 func (b *goRedisBackend) Del(ctx context.Context, key string) error {
@@ -223,6 +248,53 @@ func (s *RedisStore) LoadRefreshToken(ctx context.Context) (string, error) {
 		return "", errors.New("decrypt Gmail refresh token")
 	}
 	return refreshToken, nil
+}
+
+// ReplaceRefreshToken atomically updates only the exact credential that was
+// used to obtain a provider token. A concurrent disconnect or reconnect changes
+// or deletes the encrypted Redis value, so a stale refresh cannot recreate or
+// overwrite the authorization.
+func (s *RedisStore) ReplaceRefreshToken(
+	ctx context.Context,
+	currentToken, replacementToken string,
+) (bool, error) {
+	if s == nil || s.backend == nil {
+		return false, errors.New("redis is not configured")
+	}
+	currentToken = strings.TrimSpace(currentToken)
+	replacementToken = strings.TrimSpace(replacementToken)
+	if currentToken == "" || replacementToken == "" {
+		return false, errors.New("gmail refresh token replacement is invalid")
+	}
+	stored, err := s.backend.Get(ctx, s.refreshTokenKey())
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load Gmail refresh token for replacement: %w", err)
+	}
+	if !appcrypto.IsEncrypted(stored) {
+		return false, errors.New("stored Gmail refresh token is not encrypted")
+	}
+	plaintext, err := appcrypto.Decrypt(stored, s.encryptionKey)
+	if err != nil || strings.TrimSpace(plaintext) == "" {
+		return false, errors.New("decrypt Gmail refresh token for replacement")
+	}
+	if plaintext != currentToken {
+		return false, nil
+	}
+	replacement := stored
+	if replacementToken != currentToken {
+		replacement, err = appcrypto.Encrypt(replacementToken, s.encryptionKey)
+		if err != nil || !appcrypto.IsEncrypted(replacement) {
+			return false, errors.New("encrypt replacement Gmail refresh token")
+		}
+	}
+	replaced, err := s.backend.CompareAndSet(ctx, s.refreshTokenKey(), stored, replacement)
+	if err != nil {
+		return false, fmt.Errorf("replace Gmail refresh token: %w", err)
+	}
+	return replaced, nil
 }
 
 // DeleteRefreshToken disconnects the configured mailbox without affecting any

@@ -18,6 +18,7 @@ prefix removed before the request reaches the service.
 | Purpose | Address |
 | --- | --- |
 | Google OAuth redirect URI | `https://app.rereply.app/gmail-relay/oauth/google/callback` |
+| Operator OAuth disconnect | `https://app.rereply.app/gmail-relay/oauth/google/disconnect` |
 | ReReply relay URL | `https://app.rereply.app/gmail-relay/v1/accounts/email/realignphysiolates%40gmail.com` |
 | Process liveness | `https://app.rereply.app/gmail-relay/livez` |
 | Service readiness | `https://app.rereply.app/gmail-relay/readyz` |
@@ -186,6 +187,40 @@ browser.
 
 If the wrong Google account is selected, the callback fails without storing
 its refresh token. Start a new flow; OAuth state is single-use.
+
+### Disconnect the mailbox
+
+An authorized operator can remove ReReply's locally stored Gmail credential
+without exposing it or accepting a mailbox identifier from the request. Send an
+empty `POST` with the same setup key used to start OAuth:
+
+```sh
+curl --fail --silent --show-error \
+  --request POST \
+  --header "X-ReReply-Setup-Key: $GMAIL_RELAY_SETUP_KEY" \
+  https://app.rereply.app/gmail-relay/oauth/google/disconnect
+```
+
+A successful, idempotent request returns only:
+
+```json
+{"mailbox":"realignphysiolates@gmail.com","disconnected":true}
+```
+
+The relay derives the credential key from its configured mailbox, deletes that
+mailbox's encrypted refresh token, and clears the process's cached access token.
+Every replica checks the shared credential before reusing a process-local access
+token, so the deletion is observed on its next Gmail operation. The endpoint
+cannot select or delete another mailbox. Synchronization, the signed account
+health check, and outbound delivery then fail closed until the operator
+completes OAuth again. `/livez` and `/readyz` continue to report process and
+Redis/Valkey health; they do not claim that Gmail remains authorized.
+
+This endpoint removes ReReply's credential; it does not call Google's token
+revocation endpoint, delete Gmail messages, or delete conversation history
+already stored in ReReply. The Google Account owner can separately revoke the
+ReReply grant from Google Account permissions. Follow the applicable ReReply
+retention or verified deletion process for stored CRM conversation data.
 
 ## Pair the ReReply connection
 
