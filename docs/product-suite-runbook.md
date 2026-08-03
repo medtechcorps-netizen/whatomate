@@ -88,9 +88,9 @@ Reseller-specific plans may still be created through
 `POST /api/admin/product/plans`. They must use unique plan and price codes.
 
 As a platform superadmin, load the target-specific assignable catalog through
-`GET /api/admin/organizations/{organization_id}/product/plans`, select the
+`GET /api/admin/organizations/{target_organization_id}/product/plans`, select the
 exact plan and price IDs, and assign the plan through
-`PUT /api/admin/organizations/{organization_id}/subscription`. The approval or
+`PUT /api/admin/organizations/{target_organization_id}/subscription`. The approval or
 contract reference is mandatory:
 
 ```json
@@ -104,7 +104,7 @@ contract reference is mandatory:
 ```
 
 Reseller owners and administrators may inspect
-`GET /api/admin/organizations/{organization_id}/subscription` for organizations
+`GET /api/admin/organizations/{target_organization_id}/subscription` for organizations
 in their own portfolio, but a reseller identity must receive `403 Forbidden`
 from both the private assignable-catalog endpoint and the subscription mutation
 endpoint.

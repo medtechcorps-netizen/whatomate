@@ -1135,7 +1135,7 @@ func (a *App) ListAssignableProductPlans(r *fastglue.Request) error {
 			"",
 		)
 	}
-	targetOrgID, err := productCommercialTargetOrganizationID(r)
+	targetOrgID, err := targetOrganizationID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid organization ID", nil, "")
 	}
@@ -4472,22 +4472,6 @@ func (a *App) UpdateProductPlan(r *fastglue.Request) error {
 	return r.SendEnvelope(response)
 }
 
-func productCommercialTargetOrganizationID(r *fastglue.Request) (uuid.UUID, error) {
-	for _, key := range []string{"organization_id", "id"} {
-		switch value := r.RequestCtx.UserValue(key).(type) {
-		case uuid.UUID:
-			if value != uuid.Nil {
-				return value, nil
-			}
-		case string:
-			if parsed, err := uuid.Parse(value); err == nil {
-				return parsed, nil
-			}
-		}
-	}
-	return uuid.Nil, errors.New("invalid organization ID")
-}
-
 func (a *App) productCommercialCanManageOrganization(
 	userID uuid.UUID,
 	organization *models.Organization,
@@ -4660,7 +4644,7 @@ func (a *App) SetOrganizationSubscription(r *fastglue.Request) error {
 			"",
 		)
 	}
-	targetOrgID, err := productCommercialTargetOrganizationID(r)
+	targetOrgID, err := targetOrganizationID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid organization ID", nil, "")
 	}
@@ -4913,7 +4897,7 @@ func (a *App) GetOrganizationSubscription(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
-	targetOrgID, err := productCommercialTargetOrganizationID(r)
+	targetOrgID, err := targetOrganizationID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid organization ID", nil, "")
 	}

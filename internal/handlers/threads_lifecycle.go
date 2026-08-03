@@ -296,8 +296,8 @@ func parseThreadsLifecycleRequest(r *fastglue.Request) (uuid.UUID, string, error
 }
 
 func parseThreadsLifecycleOrganization(r *fastglue.Request) (uuid.UUID, error) {
-	orgID, err := uuid.Parse(strings.TrimSpace(stringPathValue(r, "organization_id")))
-	if err != nil || orgID == uuid.Nil {
+	orgID, err := targetOrganizationID(r)
+	if err != nil {
 		return uuid.Nil, errThreadsLifecycleMalformed
 	}
 	return orgID, nil

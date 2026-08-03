@@ -475,7 +475,7 @@ func TestThreadsDataDeletionStatusEscapesReasonAndHidesSubject(t *testing.T) {
 	require.NoError(t, fixture.App.DB.Create(&request).Error)
 
 	statusRequest := testutil.NewGETRequest(t)
-	testutil.SetPathParam(statusRequest, "organization_id", fixture.Organization.ID.String())
+	testutil.SetPathParam(statusRequest, "target_organization_id", fixture.Organization.ID.String())
 	testutil.SetPathParam(statusRequest, "confirmation_code", request.RequestNumber)
 	require.NoError(t, fixture.App.ThreadsDataDeletionStatus(statusRequest))
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(statusRequest))
@@ -488,7 +488,7 @@ func TestThreadsDataDeletionStatusEscapesReasonAndHidesSubject(t *testing.T) {
 	assert.NotEmpty(t, statusRequest.RequestCtx.Response.Header.Peek("Content-Security-Policy"))
 
 	unknown := testutil.NewGETRequest(t)
-	testutil.SetPathParam(unknown, "organization_id", fixture.Organization.ID.String())
+	testutil.SetPathParam(unknown, "target_organization_id", fixture.Organization.ID.String())
 	testutil.SetPathParam(unknown, "confirmation_code", "THDELFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF")
 	require.NoError(t, fixture.App.ThreadsDataDeletionStatus(unknown))
 	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(unknown))
@@ -672,7 +672,7 @@ func newThreadsLifecyclePOSTRequest(
 	request.RequestCtx.Request.SetBodyString(url.Values{
 		"signed_request": {signedRequest},
 	}.Encode())
-	testutil.SetPathParam(request, "organization_id", orgID.String())
+	testutil.SetPathParam(request, "target_organization_id", orgID.String())
 	return request
 }
 
