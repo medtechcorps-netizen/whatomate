@@ -23,9 +23,10 @@ const (
 )
 
 var (
-	ErrAuthorizationDenied = errors.New("google authorization was cancelled")
-	ErrMailboxMismatch     = errors.New("authorized Google account does not match the configured mailbox")
-	ErrRefreshTokenMissing = errors.New("google did not issue a refresh token")
+	ErrAuthorizationDenied  = errors.New("google authorization was cancelled")
+	ErrMailboxMismatch      = errors.New("authorized Google account does not match the configured mailbox")
+	ErrRefreshTokenMissing  = errors.New("google did not issue a refresh token")
+	ErrAuthorizationChanged = errors.New("gmail authorization changed while refreshing")
 )
 
 // OAuthStart is safe to return to the browser. The PKCE verifier remains only
@@ -46,6 +47,14 @@ type OAuthCallback struct {
 // OAuthResult intentionally excludes both access and refresh tokens.
 type OAuthResult struct {
 	Mailbox string `json:"mailbox"`
+}
+
+// OAuthDisconnectResult is safe to return to the operator. It confirms the
+// exact configured mailbox whose locally stored authorization was removed and
+// contains no OAuth credential or provider response.
+type OAuthDisconnectResult struct {
+	Mailbox      string `json:"mailbox"`
+	Disconnected bool   `json:"disconnected"`
 }
 
 type gmailProfile struct {
@@ -172,18 +181,36 @@ func (s *OAuthService) CompleteCallback(ctx context.Context, callback OAuthCallb
 	if strings.TrimSpace(profile.EmailAddress) != s.config.Mailbox {
 		return OAuthResult{}, ErrMailboxMismatch
 	}
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
 	if err := s.store.SaveRefreshToken(ctx, refreshToken); err != nil {
 		return OAuthResult{}, err
 	}
-	s.tokenMu.Lock()
 	s.cachedToken = token
-	s.tokenMu.Unlock()
 	return OAuthResult{Mailbox: s.config.Mailbox}, nil
 }
 
 // Complete is the common success-callback shorthand.
 func (s *OAuthService) Complete(ctx context.Context, state, code string) (OAuthResult, error) {
 	return s.CompleteCallback(ctx, OAuthCallback{State: state, Code: code})
+}
+
+// Disconnect removes the configured mailbox's persisted refresh token and
+// clears any short-lived access token cached by this process. The store key is
+// derived from Config.Mailbox, so callers cannot select or affect another
+// mailbox. Deletion is idempotent.
+func (s *OAuthService) Disconnect(ctx context.Context) (OAuthDisconnectResult, error) {
+	if s == nil || s.config == nil || s.store == nil {
+		return OAuthDisconnectResult{}, errors.New("gmail OAuth service is unavailable")
+	}
+
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	s.cachedToken = nil
+	if err := s.store.DeleteRefreshToken(ctx); err != nil {
+		return OAuthDisconnectResult{}, err
+	}
+	return OAuthDisconnectResult{Mailbox: s.config.Mailbox, Disconnected: true}, nil
 }
 
 // AccessToken refreshes an access token from the encrypted token store without
@@ -198,33 +225,47 @@ func (s *OAuthService) AccessToken(ctx context.Context) (string, error) {
 	// token to an operation that could expire while the request is in flight.
 	s.tokenMu.Lock()
 	defer s.tokenMu.Unlock()
-	if s.cachedToken != nil && strings.TrimSpace(s.cachedToken.AccessToken) != "" &&
+
+	// Redis is the cross-replica source of truth. Always check it before using a
+	// process-local access token so a disconnect handled by another replica is
+	// observed on the next Gmail operation.
+	refreshToken, err := s.store.LoadRefreshToken(ctx)
+	if err != nil {
+		s.cachedToken = nil
+		return "", err
+	}
+	if s.cachedToken != nil && s.cachedToken.RefreshToken == refreshToken &&
+		strings.TrimSpace(s.cachedToken.AccessToken) != "" &&
 		s.cachedToken.Expiry.After(s.now().UTC().Add(time.Minute)) {
 		return s.cachedToken.AccessToken, nil
 	}
-
-	refreshToken, err := s.store.LoadRefreshToken(ctx)
-	if err != nil {
-		return "", err
-	}
 	tokenContext := context.WithValue(ctx, oauth2.HTTPClient, s.client)
 	seed := &oauth2.Token{RefreshToken: refreshToken}
-	if s.cachedToken != nil {
+	if s.cachedToken != nil && s.cachedToken.RefreshToken == refreshToken {
 		cachedCopy := *s.cachedToken
 		seed = &cachedCopy
-		// Redis is the source of truth after reconnecting the mailbox. Never
-		// let a replica retain a superseded cached refresh token.
-		seed.RefreshToken = refreshToken
 	}
 	token, err := s.oauthConfig().TokenSource(tokenContext, seed).Token()
 	if err != nil || strings.TrimSpace(token.AccessToken) == "" {
 		return "", errors.New("refresh Gmail access token")
 	}
-	if rotated := strings.TrimSpace(token.RefreshToken); rotated != "" && rotated != refreshToken {
-		if err := s.store.SaveRefreshToken(ctx, rotated); err != nil {
-			return "", err
-		}
+	replacementToken := strings.TrimSpace(token.RefreshToken)
+	if replacementToken == "" {
+		replacementToken = refreshToken
 	}
+	replaced, err := s.store.ReplaceRefreshToken(ctx, refreshToken, replacementToken)
+	if err != nil {
+		return "", err
+	}
+	if !replaced {
+		s.cachedToken = nil
+		return "", ErrAuthorizationChanged
+	}
+	refreshToken = replacementToken
+	// Google commonly omits refresh_token when it does not rotate the grant.
+	// Keep the shared-store value on the cache entry so cross-replica equality
+	// checks do not force an unnecessary refresh for every Gmail request.
+	token.RefreshToken = refreshToken
 	s.cachedToken = token
 	return token.AccessToken, nil
 }

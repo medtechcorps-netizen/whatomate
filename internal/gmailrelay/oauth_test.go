@@ -20,6 +20,12 @@ type fakeOAuthStore struct {
 	states       map[string]OAuthState
 	savedTokens  []string
 	refreshToken string
+	deleteCalls  int
+	deleteErr    error
+	replaceCalls int
+	replaceErr   error
+	saveStarted  chan struct{}
+	allowSave    chan struct{}
 }
 
 func newFakeOAuthStore() *fakeOAuthStore {
@@ -48,6 +54,12 @@ func (f *fakeOAuthStore) ConsumeOAuthState(_ context.Context, nonce string) (OAu
 }
 
 func (f *fakeOAuthStore) SaveRefreshToken(_ context.Context, refreshToken string) error {
+	if f.saveStarted != nil {
+		close(f.saveStarted)
+	}
+	if f.allowSave != nil {
+		<-f.allowSave
+	}
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	f.refreshToken = refreshToken
@@ -62,6 +74,34 @@ func (f *fakeOAuthStore) LoadRefreshToken(context.Context) (string, error) {
 		return "", ErrRefreshTokenNotFound
 	}
 	return f.refreshToken, nil
+}
+
+func (f *fakeOAuthStore) ReplaceRefreshToken(
+	_ context.Context,
+	currentToken, replacementToken string,
+) (bool, error) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	f.replaceCalls++
+	if f.replaceErr != nil {
+		return false, f.replaceErr
+	}
+	if f.refreshToken == "" || f.refreshToken != currentToken {
+		return false, nil
+	}
+	f.refreshToken = replacementToken
+	return true, nil
+}
+
+func (f *fakeOAuthStore) DeleteRefreshToken(context.Context) error {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	f.deleteCalls++
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.refreshToken = ""
+	return nil
 }
 
 func newTestOAuthService(t *testing.T, serverURL string, store *fakeOAuthStore, client *http.Client) *OAuthService {
@@ -318,5 +358,273 @@ func TestAccessTokenUsesStoredRefreshTokenAndPersistsRotation(t *testing.T) {
 	}
 	if accessToken != "new-access" || store.refreshToken != "rotated-refresh" {
 		t.Fatalf("unexpected token result access=%q refresh=%q", accessToken, store.refreshToken)
+	}
+}
+
+func TestAccessTokenRetainsStoredRefreshTokenWhenGoogleDoesNotRotate(t *testing.T) {
+	var tokenMutex sync.Mutex
+	tokenCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/token" {
+			http.NotFound(response, request)
+			return
+		}
+		tokenMutex.Lock()
+		tokenCalls++
+		tokenMutex.Unlock()
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"access_token":"stable-access-token","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	store := newFakeOAuthStore()
+	store.refreshToken = "stable-refresh-token"
+	service := newTestOAuthService(t, server.URL, store, server.Client())
+	first, err := service.AccessToken(context.Background())
+	if err != nil {
+		t.Fatalf("first access token: %v", err)
+	}
+	second, err := service.AccessToken(context.Background())
+	if err != nil {
+		t.Fatalf("cached access token: %v", err)
+	}
+	tokenMutex.Lock()
+	calls := tokenCalls
+	tokenMutex.Unlock()
+	if first != "stable-access-token" || second != first || calls != 1 {
+		t.Fatalf("stable token result: first=%q second=%q calls=%d", first, second, calls)
+	}
+	if service.cachedToken == nil || service.cachedToken.RefreshToken != "stable-refresh-token" {
+		t.Fatalf("cached token lost shared refresh identity: %#v", service.cachedToken)
+	}
+}
+
+func TestAccessTokenRechecksSharedCredentialBeforeUsingProcessCache(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.refreshToken = "shared-refresh-token"
+	service := newTestOAuthService(t, "", store, nil)
+	service.cachedToken = &oauth2.Token{
+		AccessToken:  "cached-access-token",
+		RefreshToken: "shared-refresh-token",
+		Expiry:       time.Now().UTC().Add(time.Hour),
+	}
+
+	accessToken, err := service.AccessToken(context.Background())
+	if err != nil || accessToken != "cached-access-token" {
+		t.Fatalf("use valid cache: access=%q err=%v", accessToken, err)
+	}
+	store.mutex.Lock()
+	store.refreshToken = ""
+	store.mutex.Unlock()
+	if _, err := service.AccessToken(context.Background()); !errors.Is(err, ErrRefreshTokenNotFound) {
+		t.Fatalf("cross-replica credential deletion was not observed: %v", err)
+	}
+	if service.cachedToken != nil {
+		t.Fatal("missing shared credential did not invalidate process cache")
+	}
+}
+
+func TestAccessTokenRefreshesWhenSharedCredentialChanges(t *testing.T) {
+	var tokenMutex sync.Mutex
+	tokenCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/token" {
+			http.NotFound(response, request)
+			return
+		}
+		tokenMutex.Lock()
+		tokenCalls++
+		tokenMutex.Unlock()
+		if err := request.ParseForm(); err != nil {
+			t.Errorf("parse refresh form: %v", err)
+		}
+		if request.Form.Get("refresh_token") != "replacement-refresh-token" {
+			t.Errorf("refresh token = %q", request.Form.Get("refresh_token"))
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"access_token":"replacement-access-token","refresh_token":"replacement-refresh-token","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	store := newFakeOAuthStore()
+	store.refreshToken = "replacement-refresh-token"
+	service := newTestOAuthService(t, server.URL, store, server.Client())
+	service.cachedToken = &oauth2.Token{
+		AccessToken:  "superseded-access-token",
+		RefreshToken: "superseded-refresh-token",
+		Expiry:       time.Now().UTC().Add(time.Hour),
+	}
+
+	accessToken, err := service.AccessToken(context.Background())
+	if err != nil {
+		t.Fatalf("refresh replacement credential: %v", err)
+	}
+	tokenMutex.Lock()
+	calls := tokenCalls
+	tokenMutex.Unlock()
+	if accessToken != "replacement-access-token" || calls != 1 {
+		t.Fatalf("replacement token result: access=%q calls=%d", accessToken, calls)
+	}
+}
+
+func TestAccessTokenCannotRestoreCredentialDeletedByAnotherReplica(t *testing.T) {
+	refreshStarted := make(chan struct{})
+	allowRefresh := make(chan struct{})
+	releasedRefresh := false
+	defer func() {
+		if !releasedRefresh {
+			close(allowRefresh)
+		}
+	}()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/token" {
+			http.NotFound(response, request)
+			return
+		}
+		close(refreshStarted)
+		<-allowRefresh
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"access_token":"new-access","refresh_token":"rotated-refresh","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	store := newFakeOAuthStore()
+	store.refreshToken = "current-refresh"
+	refreshingReplica := newTestOAuthService(t, server.URL, store, server.Client())
+	disconnectingReplica := newTestOAuthService(t, server.URL, store, server.Client())
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, refreshErr := refreshingReplica.AccessToken(context.Background())
+		refreshDone <- refreshErr
+	}()
+	<-refreshStarted
+	if _, err := disconnectingReplica.Disconnect(context.Background()); err != nil {
+		t.Fatalf("disconnect other replica: %v", err)
+	}
+	close(allowRefresh)
+	releasedRefresh = true
+	if err := <-refreshDone; !errors.Is(err, ErrAuthorizationChanged) {
+		t.Fatalf("stale refresh result = %v, want authorization changed", err)
+	}
+	store.mutex.Lock()
+	refreshToken := store.refreshToken
+	store.mutex.Unlock()
+	if refreshToken != "" || refreshingReplica.cachedToken != nil {
+		t.Fatalf("stale refresh restored authorization: refresh=%q cached=%#v", refreshToken, refreshingReplica.cachedToken)
+	}
+}
+
+func TestOAuthDisconnectDeletesConfiguredCredentialAndClearsCachedAccessToken(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.refreshToken = "stored-refresh-token"
+	service := newTestOAuthService(t, "", store, nil)
+	service.cachedToken = &oauth2.Token{
+		AccessToken: "short-lived-access-token",
+		Expiry:      time.Now().UTC().Add(time.Hour),
+	}
+
+	result, err := service.Disconnect(context.Background())
+	if err != nil {
+		t.Fatalf("disconnect OAuth: %v", err)
+	}
+	if !result.Disconnected || result.Mailbox != service.config.Mailbox {
+		t.Fatalf("disconnect result = %#v", result)
+	}
+	if service.cachedToken != nil {
+		t.Fatal("disconnect left a cached access token")
+	}
+	secondResult, err := service.Disconnect(context.Background())
+	if err != nil || !secondResult.Disconnected || secondResult.Mailbox != result.Mailbox {
+		t.Fatalf("idempotent disconnect: result=%#v err=%v", secondResult, err)
+	}
+	store.mutex.Lock()
+	deleteCalls := store.deleteCalls
+	refreshToken := store.refreshToken
+	store.mutex.Unlock()
+	if deleteCalls != 2 || refreshToken != "" {
+		t.Fatalf("disconnect store state: calls=%d refresh=%q", deleteCalls, refreshToken)
+	}
+	if _, err := service.AccessToken(context.Background()); !errors.Is(err, ErrRefreshTokenNotFound) {
+		t.Fatalf("access token remained usable after disconnect: %v", err)
+	}
+}
+
+func TestOAuthDisconnectClearsCachedAccessTokenWhenStoreDeletionFails(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.refreshToken = "stored-refresh-token"
+	store.deleteErr = errors.New("redis unavailable")
+	service := newTestOAuthService(t, "", store, nil)
+	service.cachedToken = &oauth2.Token{
+		AccessToken: "short-lived-access-token",
+		Expiry:      time.Now().UTC().Add(time.Hour),
+	}
+
+	if _, err := service.Disconnect(context.Background()); err == nil {
+		t.Fatal("disconnect succeeded despite store deletion failure")
+	}
+	if service.cachedToken != nil {
+		t.Fatal("failed disconnect left a cached access token")
+	}
+}
+
+func TestOAuthCallbackPersistenceIsSerializedAgainstDisconnect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/token":
+			_, _ = response.Write([]byte(`{"access_token":"access","refresh_token":"refresh","token_type":"Bearer","expires_in":3600}`))
+		case "/gmail/v1/users/me/profile":
+			_, _ = response.Write([]byte(`{"emailAddress":"realignphysiolates@gmail.com"}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	store := newFakeOAuthStore()
+	store.saveStarted = make(chan struct{})
+	store.allowSave = make(chan struct{})
+	releasedSave := false
+	defer func() {
+		if !releasedSave {
+			close(store.allowSave)
+		}
+	}()
+	service := newTestOAuthService(t, server.URL, store, server.Client())
+	start, err := service.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin OAuth: %v", err)
+	}
+	parsed, _ := url.Parse(start.AuthorizationURL)
+	callbackDone := make(chan error, 1)
+	go func() {
+		_, completeErr := service.Complete(context.Background(), parsed.Query().Get("state"), "code")
+		callbackDone <- completeErr
+	}()
+	<-store.saveStarted
+
+	disconnectDone := make(chan error, 1)
+	go func() {
+		_, disconnectErr := service.Disconnect(context.Background())
+		disconnectDone <- disconnectErr
+	}()
+	select {
+	case disconnectErr := <-disconnectDone:
+		t.Fatalf("disconnect returned before callback persistence completed: %v", disconnectErr)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(store.allowSave)
+	releasedSave = true
+	if err := <-callbackDone; err != nil {
+		t.Fatalf("complete OAuth: %v", err)
+	}
+	if err := <-disconnectDone; err != nil {
+		t.Fatalf("disconnect OAuth: %v", err)
+	}
+	store.mutex.Lock()
+	refreshToken := store.refreshToken
+	store.mutex.Unlock()
+	if refreshToken != "" || service.cachedToken != nil {
+		t.Fatalf("disconnect did not win after callback: refresh=%q cached=%#v", refreshToken, service.cachedToken)
 	}
 }

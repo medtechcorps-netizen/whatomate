@@ -29,6 +29,7 @@ const (
 type OAuthFlow interface {
 	Begin(context.Context) (OAuthStart, error)
 	CompleteCallback(context.Context, OAuthCallback) (OAuthResult, error)
+	Disconnect(context.Context) (OAuthDisconnectResult, error)
 }
 
 type ServerStateStore interface {
@@ -97,6 +98,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /livez", s.handleLive)
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("POST /oauth/google/start", s.handleOAuthStart)
+	mux.HandleFunc("POST /oauth/google/disconnect", s.handleOAuthDisconnect)
 	mux.HandleFunc("GET /oauth/google/callback", s.handleOAuthCallback)
 	mux.HandleFunc("HEAD /v1/accounts/email/{externalID}", s.handleAccountHealth)
 	mux.HandleFunc("POST /v1/accounts/email/{externalID}", s.handleOutbound)
@@ -130,6 +132,25 @@ func (s *Server) handleOAuthStart(w http.ResponseWriter, request *http.Request) 
 		return
 	}
 	writeRelayJSON(w, http.StatusOK, start)
+}
+
+func (s *Server) handleOAuthDisconnect(w http.ResponseWriter, request *http.Request) {
+	if !constantTimeSecretEqual(request.Header.Get(SetupKeyHeader), s.config.SetupKey) {
+		writeRelayError(w, http.StatusUnauthorized, "setup_authentication_required")
+		return
+	}
+	if request.ContentLength != 0 || len(request.TransferEncoding) != 0 {
+		writeRelayError(w, http.StatusBadRequest, "invalid_request_body")
+		return
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), s.config.HTTPTimeout)
+	defer cancel()
+	result, err := s.oauth.Disconnect(ctx)
+	if err != nil {
+		writeRelayError(w, http.StatusServiceUnavailable, "oauth_disconnect_failed")
+		return
+	}
+	writeRelayJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleOAuthCallback(w http.ResponseWriter, request *http.Request) {

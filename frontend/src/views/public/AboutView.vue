@@ -9,6 +9,7 @@ import {
   Check,
   ChevronRight,
   Eye,
+  Mail,
   MessageCircleMore,
   Search,
   ShieldCheck,
@@ -31,7 +32,7 @@ watchEffect(() => {
     document.head.appendChild(descriptionTag);
   }
   descriptionTag.content =
-    "ReReply brings customer conversations, CRM workflows, bookings, automation and read-only search visibility into one tenant-aware workspace.";
+    "ReReply brings WhatsApp and Gmail customer conversations, CRM workflows, bookings, automation and read-only search visibility into one tenant-aware workspace.";
 });
 
 onBeforeUnmount(() => {
@@ -464,6 +465,22 @@ const searchSignals = [
             </article>
 
             <div class="grid gap-5">
+              <article
+                class="rounded-[26px] border border-white/[0.08] bg-black/15 p-6"
+              >
+                <Mail class="h-5 w-5 text-[#cbd49a]" />
+                <h3
+                  class="mt-7 text-lg font-semibold tracking-[-0.025em] text-[#eff0e8]"
+                >
+                  Gmail and Google Workspace
+                </h3>
+                <p class="mt-2 text-sm leading-6 text-white/43">
+                  Bring new inbox messages into the unified workspace and send
+                  user-written replies back to the existing Gmail thread.
+                  ReReply does not modify or delete mailbox content.
+                </p>
+              </article>
+
               <article
                 class="rounded-[26px] border border-white/[0.08] bg-black/15 p-6"
               >

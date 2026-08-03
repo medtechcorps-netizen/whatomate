@@ -36,9 +36,12 @@ func (s *serverTestState) GetLastSuccessfulSync(context.Context) (time.Time, err
 }
 
 type serverTestOAuth struct {
-	start      OAuthStart
-	startErr   error
-	beginCalls int
+	start            OAuthStart
+	startErr         error
+	beginCalls       int
+	disconnectResult OAuthDisconnectResult
+	disconnectErr    error
+	disconnectCalls  int
 }
 
 func (f *serverTestOAuth) Begin(context.Context) (OAuthStart, error) {
@@ -48,6 +51,11 @@ func (f *serverTestOAuth) Begin(context.Context) (OAuthStart, error) {
 
 func (f *serverTestOAuth) CompleteCallback(context.Context, OAuthCallback) (OAuthResult, error) {
 	return OAuthResult{Mailbox: serverTestMailbox}, nil
+}
+
+func (f *serverTestOAuth) Disconnect(context.Context) (OAuthDisconnectResult, error) {
+	f.disconnectCalls++
+	return f.disconnectResult, f.disconnectErr
 }
 
 type serverTestGmail struct {
@@ -242,10 +250,13 @@ func newServerTestHarness(t *testing.T) *serverTestHarness {
 		GmailPollInterval:     time.Minute,
 	}
 	state := &serverTestState{lastSync: time.Date(2026, time.August, 3, 1, 0, 0, 0, time.UTC)}
-	oauth := &serverTestOAuth{start: OAuthStart{
-		AuthorizationURL: "https://accounts.google.com/o/oauth2/v2/auth?client_id=public-client-id&state=opaque-state",
-		ExpiresAt:        time.Date(2026, time.August, 3, 1, 10, 0, 0, time.UTC),
-	}}
+	oauth := &serverTestOAuth{
+		start: OAuthStart{
+			AuthorizationURL: "https://accounts.google.com/o/oauth2/v2/auth?client_id=public-client-id&state=opaque-state",
+			ExpiresAt:        time.Date(2026, time.August, 3, 1, 10, 0, 0, time.UTC),
+		},
+		disconnectResult: OAuthDisconnectResult{Mailbox: serverTestMailbox, Disconnected: true},
+	}
 	gmail := &serverTestGmail{
 		profile:      GmailProfile{EmailAddress: serverTestMailbox, HistoryID: "101"},
 		thread:       serverTestThread(),
@@ -419,6 +430,91 @@ func TestServerOAuthStartRequiresSetupKeyAndDoesNotLeakSecrets(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "authorization_url") ||
 		!strings.Contains(response.Body.String(), "public-client-id") {
 		t.Fatalf("OAuth start response did not contain the public authorization URL: %s", response.Body.String())
+	}
+}
+
+func TestServerOAuthDisconnectRequiresSetupKeyAndReturnsOnlySafeConfirmation(t *testing.T) {
+	harness := newServerTestHarness(t)
+	path := "/oauth/google/disconnect"
+
+	unauthorized := serverTestRequest(harness.handler, http.MethodPost, path, nil, "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("missing setup-key status = %d, want %d", unauthorized.Code, http.StatusUnauthorized)
+	}
+	if harness.oauth.disconnectCalls != 0 {
+		t.Fatalf("Disconnect() calls after missing setup key = %d, want 0", harness.oauth.disconnectCalls)
+	}
+	withMailboxBody := httptest.NewRequest(
+		http.MethodPost,
+		path,
+		strings.NewReader(`{"mailbox":"other@gmail.com"}`),
+	)
+	withMailboxBody.Header.Set(SetupKeyHeader, serverTestSetupKey)
+	invalidResponse := httptest.NewRecorder()
+	harness.handler.ServeHTTP(invalidResponse, withMailboxBody)
+	if invalidResponse.Code != http.StatusBadRequest || harness.oauth.disconnectCalls != 0 {
+		t.Fatalf(
+			"mailbox-bearing request = %d with %d calls; want 400 with 0 calls",
+			invalidResponse.Code,
+			harness.oauth.disconnectCalls,
+		)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	request.Header.Set(SetupKeyHeader, serverTestSetupKey)
+	response := httptest.NewRecorder()
+	harness.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("valid setup-key status = %d, want %d; body = %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	if harness.oauth.disconnectCalls != 1 {
+		t.Fatalf("Disconnect() calls = %d, want 1", harness.oauth.disconnectCalls)
+	}
+	var result OAuthDisconnectResult
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode disconnect response: %v", err)
+	}
+	if !result.Disconnected || result.Mailbox != serverTestMailbox {
+		t.Fatalf("disconnect response = %#v", result)
+	}
+	for _, secret := range []string{
+		harness.config.GoogleClientSecret,
+		harness.config.EncryptionKey,
+		harness.config.SetupKey,
+		harness.config.ReReplyInboundSecret,
+		harness.config.ReReplyOutboundSecret,
+	} {
+		if strings.Contains(response.Body.String(), secret) {
+			t.Fatalf("OAuth disconnect response leaked configured secret %q", secret)
+		}
+	}
+	for header, expected := range map[string]string{
+		"Cache-Control":           "no-store",
+		"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+		"Referrer-Policy":         "no-referrer",
+		"X-Content-Type-Options":  "nosniff",
+		"X-Frame-Options":         "DENY",
+	} {
+		if value := response.Header().Get(header); value != expected {
+			t.Fatalf("disconnect %s = %q, want %q", header, value, expected)
+		}
+	}
+}
+
+func TestServerOAuthDisconnectFailureIsGenericAndDoesNotLeakProviderDetails(t *testing.T) {
+	harness := newServerTestHarness(t)
+	harness.oauth.disconnectErr = errors.New("failed to delete refresh token secret-provider-detail")
+	request := httptest.NewRequest(http.MethodPost, "/oauth/google/disconnect", nil)
+	request.Header.Set(SetupKeyHeader, serverTestSetupKey)
+	response := httptest.NewRecorder()
+	harness.handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), "oauth_disconnect_failed") {
+		t.Fatalf("disconnect failure response = %d %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "secret-provider-detail") {
+		t.Fatalf("disconnect failure leaked internal details: %s", response.Body.String())
 	}
 }
 
