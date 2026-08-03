@@ -31,3 +31,17 @@ for (const legalPage of legalPages) {
     )
   })
 }
+
+test('Privacy Policy discloses the Google Search Console data lifecycle', async ({ page }) => {
+  await page.goto('/privacy')
+
+  const googleSection = page.locator('#google-search-console')
+  await expect(
+    googleSection.getByRole('heading', { name: '5. Google Search Console and Google API data' })
+  ).toBeVisible()
+  await expect(googleSection).toContainText('clicks, impressions, click-through rate (CTR), average position')
+  await expect(googleSection).toContainText('encrypted at rest')
+  await expect(googleSection).toContainText('disconnect Google Search Console')
+  await expect(googleSection).toContainText('Google API Services User Data Policy')
+  await expect(googleSection).toContainText('Limited Use requirements')
+})

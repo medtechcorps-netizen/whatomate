@@ -40,6 +40,13 @@ const router = createRouter({
       meta: { requiresAuth: false }
     },
     {
+      path: '/about',
+      alias: '/integrations',
+      name: 'about',
+      component: () => import('@/views/public/AboutView.vue'),
+      meta: { requiresAuth: false }
+    },
+    {
       path: '/privacy',
       name: 'privacy-policy',
       component: () => import('@/views/legal/LegalDocumentView.vue'),
