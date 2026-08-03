@@ -54,7 +54,7 @@ type threadsCredentialRefreshOutcome struct {
 // blocked behind a remote request.
 func (w *Worker) RunThreadsCredentialRefresh(ctx context.Context) error {
 	if w == nil || w.DB == nil {
-		return errors.New("Threads credential refresh worker requires a database")
+		return errors.New("threads credential refresh worker requires a database")
 	}
 	ticker := time.NewTicker(defaultThreadsCredentialRefreshInterval)
 	defer ticker.Stop()
@@ -79,7 +79,7 @@ func (w *Worker) RunThreadsCredentialRefresh(ctx context.Context) error {
 
 func (w *Worker) ProcessThreadsCredentialRefreshBatch(ctx context.Context, limit int) (int, error) {
 	if w == nil || w.DB == nil {
-		return 0, errors.New("Threads credential refresh worker requires a database")
+		return 0, errors.New("threads credential refresh worker requires a database")
 	}
 	if limit <= 0 || limit > 100 {
 		limit = defaultThreadsCredentialRefreshBatchSize
@@ -182,7 +182,7 @@ func (w *Worker) refreshThreadsCredentialWithProvider(
 	refresh threadsCredentialRefreshFunc,
 ) (bool, error) {
 	if refresh == nil {
-		return false, errors.New("Threads credential refresh provider is required")
+		return false, errors.New("threads credential refresh provider is required")
 	}
 	claim, processed, err := w.claimThreadsCredentialRefresh(orgID, refreshBefore, time.Now().UTC())
 	if err != nil || claim == nil {
@@ -324,7 +324,7 @@ func (w *Worker) finalizeThreadsCredentialRefresh(
 	now time.Time,
 ) (bool, error) {
 	if claim == nil {
-		return false, errors.New("Threads credential refresh claim is required")
+		return false, errors.New("threads credential refresh claim is required")
 	}
 	applied := false
 	err := database.WithTenantReadCommitted(w.DB, claim.OrganizationID, func(tx *gorm.DB) error {
@@ -512,7 +512,7 @@ func validateThreadsCredentialRefreshResult(
 ) error {
 	if len(result.CredentialBlob) == 0 || strings.TrimSpace(result.KeyVersion) == "" ||
 		result.ExpiresAt == nil || !result.ExpiresAt.After(now) {
-		return errors.New("Threads credential refresh returned invalid durable state")
+		return errors.New("threads credential refresh returned invalid durable state")
 	}
 	return nil
 }
@@ -562,7 +562,7 @@ func markThreadsRefreshFailure(
 	permanent bool,
 ) error {
 	if account == nil {
-		return errors.New("Threads account is required")
+		return errors.New("threads account is required")
 	}
 	account.LastHealthCheckAt = &now
 	account.LastErrorAt = &now

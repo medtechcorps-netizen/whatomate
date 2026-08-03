@@ -26,7 +26,7 @@ import (
 
 var ErrChannelAdapterUnavailable = errors.New("channel provider adapter is not available")
 var ErrLegacyMetaAccountManaged = errors.New("legacy Meta channel accounts are managed by WhatsApp setup")
-var ErrThreadsAccountManaged = errors.New("OAuth-managed Threads accounts are managed in Settings > Integrations")
+var ErrThreadsAccountManaged = errors.New("threads accounts using OAuth are managed in Settings > Integrations")
 var ErrChannelAccountChangedDuringValidation = errors.New("channel account changed during validation")
 var ErrChannelAccountValidationSuperseded = errors.New("channel account validation was superseded")
 

@@ -36,9 +36,9 @@ const (
 
 var (
 	threadsRequiredScopes        = channelapi.RequiredThreadsScopes()
-	errThreadsOAuthForbidden     = errors.New("Threads authorization is no longer permitted")
-	errThreadsOAuthStale         = errors.New("Threads integration settings changed during authorization")
-	errThreadsOAuthNotConfigured = errors.New("Threads integration is not configured")
+	errThreadsOAuthForbidden     = errors.New("threads authorization is no longer permitted")
+	errThreadsOAuthStale         = errors.New("threads integration settings changed during authorization")
+	errThreadsOAuthNotConfigured = errors.New("threads integration is not configured")
 	errThreadsOAuthAccountBound  = errors.New("the dedicated Threads app is already bound to another Threads profile")
 )
 
@@ -89,13 +89,13 @@ func (id *threadsID) UnmarshalJSON(value []byte) error {
 		}
 		text = strings.TrimSpace(text)
 		if !validThreadsOAuthID(text) {
-			return errors.New("Threads ID is invalid")
+			return errors.New("threads ID is invalid")
 		}
 		*id = threadsID(text)
 		return nil
 	}
 	if !validThreadsOAuthID(trimmed) {
-		return errors.New("Threads ID is invalid")
+		return errors.New("threads ID is invalid")
 	}
 	*id = threadsID(trimmed)
 	return nil
@@ -400,7 +400,7 @@ func (a *App) exchangeThreadsAuthorizationCode(
 	var response threadsTokenResponse
 	err := a.doThreadsOAuthJSON(ctx, http.MethodPost, threadsGraphBaseURL+"/oauth/access_token", values, "", &response)
 	if err != nil || strings.TrimSpace(response.AccessToken) == "" || strings.TrimSpace(string(response.UserID)) == "" {
-		return threadsTokenResponse{}, errors.New("Threads code exchange failed")
+		return threadsTokenResponse{}, errors.New("threads code exchange failed")
 	}
 	return response, nil
 }
@@ -417,7 +417,7 @@ func (a *App) exchangeThreadsLongLivedToken(
 	var response threadsTokenResponse
 	err := a.doThreadsOAuthJSON(ctx, http.MethodGet, threadsGraphBaseURL+"/access_token", values, "", &response)
 	if err != nil || strings.TrimSpace(response.AccessToken) == "" {
-		return threadsTokenResponse{}, errors.New("Threads long-lived token exchange failed")
+		return threadsTokenResponse{}, errors.New("threads long-lived token exchange failed")
 	}
 	return response, nil
 }
@@ -439,7 +439,7 @@ func (a *App) doThreadsOAuthJSON(
 ) error {
 	target, err := url.Parse(endpoint)
 	if err != nil || target.Scheme != "https" || target.Host == "" {
-		return errors.New("Threads endpoint is invalid")
+		return errors.New("threads endpoint is invalid")
 	}
 	var body io.Reader
 	if method == http.MethodPost {
@@ -463,22 +463,22 @@ func (a *App) doThreadsOAuthJSON(
 	client.Timeout = threadsOAuthHTTPTimeout
 	response, err := client.Do(request)
 	if err != nil {
-		return errors.New("Threads request failed")
+		return errors.New("threads request failed")
 	}
 	defer func() { _ = response.Body.Close() }()
 	payload, err := io.ReadAll(io.LimitReader(response.Body, threadsOAuthMaxResponseBytes+1))
 	if err != nil || int64(len(payload)) > threadsOAuthMaxResponseBytes {
-		return errors.New("Threads response was invalid")
+		return errors.New("threads response was invalid")
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("Threads returned HTTP %d", response.StatusCode)
+		return fmt.Errorf("threads returned HTTP %d", response.StatusCode)
 	}
 	if destination == nil {
 		return nil
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	if err := decoder.Decode(destination); err != nil {
-		return errors.New("Threads response was invalid")
+		return errors.New("threads response was invalid")
 	}
 	return nil
 }

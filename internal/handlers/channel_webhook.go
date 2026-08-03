@@ -27,7 +27,7 @@ const (
 	rawInboundProcessingLease = 2 * time.Minute
 )
 
-var errThreadsWebhookBindingInactive = errors.New("Threads webhook binding is no longer active")
+var errThreadsWebhookBindingInactive = errors.New("threads webhook binding is no longer active")
 
 // VerifyChannelWebhook handles Meta's GET subscription challenge for an
 // OAuth-managed channel callback URL.
@@ -429,12 +429,12 @@ func validateThreadsWebhookAccountBinding(
 	if tx == nil || account == nil || account.OrganizationID == uuid.Nil || account.ID == uuid.Nil ||
 		account.Channel != models.ChannelThreads ||
 		!strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
-		return errors.New("Threads webhook account binding is invalid")
+		return errors.New("threads webhook account binding is invalid")
 	}
 	payloadAppID = strings.TrimSpace(payloadAppID)
 	accountAppID := strings.TrimSpace(fmt.Sprint(account.Metadata["app_id"]))
 	if payloadAppID == "" || accountAppID == "" || payloadAppID != accountAppID {
-		return errors.New("Threads webhook app does not match the connected account")
+		return errors.New("threads webhook app does not match the connected account")
 	}
 
 	var integration models.ProviderIntegration
@@ -447,7 +447,7 @@ func validateThreadsWebhookAccountBinding(
 		return err
 	}
 	if integration.ThreadsAppID == nil || strings.TrimSpace(*integration.ThreadsAppID) != payloadAppID {
-		return errors.New("Threads webhook app is not bound to this workspace")
+		return errors.New("threads webhook app is not bound to this workspace")
 	}
 
 	var accountCount int64
@@ -462,7 +462,7 @@ func validateThreadsWebhookAccountBinding(
 		return err
 	}
 	if accountCount != 1 {
-		return errors.New("Threads app must be bound to exactly one channel account")
+		return errors.New("threads app must be bound to exactly one channel account")
 	}
 	return nil
 }

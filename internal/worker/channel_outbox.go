@@ -26,8 +26,8 @@ const (
 
 var (
 	errChannelOutboxUnlicensed        = errors.New("omnichannel entitlement is not active")
-	errChannelOutboxThreadsUnlicensed = errors.New("Threads public engagement entitlement is not active")
-	errChannelOutboxThreadsBinding    = errors.New("Threads app binding is not active")
+	errChannelOutboxThreadsUnlicensed = errors.New("threads public engagement entitlement is not active")
+	errChannelOutboxThreadsBinding    = errors.New("threads app binding is not active")
 	errChannelOutboxConsent           = errors.New("contact consent does not permit delivery")
 	errChannelOutboxAIPolicy          = errors.New("automatic AI reply is no longer eligible")
 )

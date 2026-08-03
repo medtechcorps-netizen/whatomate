@@ -116,15 +116,15 @@ func (a *ThreadsAdapter) Capabilities(_ *models.ChannelAccount) Capabilities {
 func (a *ThreadsAdapter) RouteHint(_ http.Header, body []byte) (WebhookRouteHint, error) {
 	events, err := decodeThreadsWebhookEnvelopes(body)
 	if err != nil || len(events) == 0 {
-		return WebhookRouteHint{}, errors.New("Threads webhook payload is invalid")
+		return WebhookRouteHint{}, errors.New("threads webhook payload is invalid")
 	}
 	appID := strings.TrimSpace(events[0].AppID)
 	if appID == "" {
-		return WebhookRouteHint{}, errors.New("Threads webhook app ID is missing")
+		return WebhookRouteHint{}, errors.New("threads webhook app ID is missing")
 	}
 	for index := 1; index < len(events); index++ {
 		if strings.TrimSpace(events[index].AppID) != appID {
-			return WebhookRouteHint{}, errors.New("Threads webhook batch contains multiple apps")
+			return WebhookRouteHint{}, errors.New("threads webhook batch contains multiple apps")
 		}
 	}
 	return WebhookRouteHint{
@@ -141,16 +141,16 @@ func (a *ThreadsAdapter) VerifyWebhook(_ *models.ChannelAccount, headers http.He
 	secret := strings.TrimSpace(a.webhookAppSecret)
 	provided := strings.TrimSpace(headers.Get("X-Hub-Signature-256"))
 	if secret == "" || provided == "" || !strings.HasPrefix(provided, "sha256=") {
-		return errors.New("Threads webhook signature is missing")
+		return errors.New("threads webhook signature is missing")
 	}
 	providedDigest, err := hex.DecodeString(strings.TrimPrefix(provided, "sha256="))
 	if err != nil || len(providedDigest) != sha256.Size {
-		return errors.New("Threads webhook signature is invalid")
+		return errors.New("threads webhook signature is invalid")
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write(body)
 	if !hmac.Equal(providedDigest, mac.Sum(nil)) {
-		return errors.New("Threads webhook signature is invalid")
+		return errors.New("threads webhook signature is invalid")
 	}
 	return nil
 }
@@ -160,7 +160,7 @@ func (a *ThreadsAdapter) VerifyChallenge(provided string) error {
 	expected := []byte(strings.TrimSpace(a.webhookVerifyToken))
 	actual := []byte(strings.TrimSpace(provided))
 	if len(expected) < 16 || len(expected) != len(actual) || !hmac.Equal(expected, actual) {
-		return errors.New("Threads webhook verify token is invalid")
+		return errors.New("threads webhook verify token is invalid")
 	}
 	return nil
 }
@@ -284,30 +284,30 @@ func validatedThreadsWebhookEnvelopes(
 		return nil, err
 	}
 	if len(envelopes) > 1000 {
-		return nil, errors.New("Threads webhook batch is too large")
+		return nil, errors.New("threads webhook batch is too large")
 	}
 	expectedAppID := threadsString(account.Metadata, "app_id")
 	if expectedAppID == "" {
-		return nil, errors.New("Threads account app binding is missing")
+		return nil, errors.New("threads account app binding is missing")
 	}
 	accountExternalID := strings.TrimSpace(account.ExternalAccountID)
 	if accountExternalID == "" {
-		return nil, errors.New("Threads connected account identity is missing")
+		return nil, errors.New("threads connected account identity is missing")
 	}
 	for index := range envelopes {
 		envelope := &envelopes[index]
 		if !hmac.Equal([]byte(expectedAppID), []byte(strings.TrimSpace(envelope.AppID))) {
-			return nil, errors.New("Threads webhook app does not match the connected account")
+			return nil, errors.New("threads webhook app does not match the connected account")
 		}
 		switch strings.ToLower(strings.TrimSpace(envelope.Values.Field)) {
 		case "replies":
 			rootOwnerID := strings.TrimSpace(string(envelope.Values.Value.RootPost.OwnerID))
 			if rootOwnerID != accountExternalID {
-				return nil, errors.New("Threads reply root post belongs to a different connected account")
+				return nil, errors.New("threads reply root post belongs to a different connected account")
 			}
 		case "mentions":
 			if strings.TrimSpace(string(envelope.TargetID)) != accountExternalID {
-				return nil, errors.New("Threads mention targets a different connected account")
+				return nil, errors.New("threads mention targets a different connected account")
 			}
 		}
 	}
@@ -821,13 +821,13 @@ func (id *threadsWebhookID) UnmarshalJSON(value []byte) error {
 		}
 		text = strings.TrimSpace(text)
 		if !validThreadsNumericID(text) {
-			return errors.New("Threads webhook ID is invalid")
+			return errors.New("threads webhook ID is invalid")
 		}
 		*id = threadsWebhookID(text)
 		return nil
 	}
 	if !validThreadsNumericID(trimmed) {
-		return errors.New("Threads webhook ID is invalid")
+		return errors.New("threads webhook ID is invalid")
 	}
 	*id = threadsWebhookID(trimmed)
 	return nil
@@ -848,22 +848,22 @@ func validThreadsNumericID(value string) bool {
 func decodeThreadsWebhookEnvelopes(body []byte) ([]threadsWebhookEnvelope, error) {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
-		return nil, errors.New("Threads webhook body is empty")
+		return nil, errors.New("threads webhook body is empty")
 	}
 	var envelopes []threadsWebhookEnvelope
 	if trimmed[0] == '[' {
 		if err := json.Unmarshal(trimmed, &envelopes); err != nil {
-			return nil, errors.New("Threads webhook body is invalid")
+			return nil, errors.New("threads webhook body is invalid")
 		}
 	} else {
 		var envelope threadsWebhookEnvelope
 		if err := json.Unmarshal(trimmed, &envelope); err != nil {
-			return nil, errors.New("Threads webhook body is invalid")
+			return nil, errors.New("threads webhook body is invalid")
 		}
 		envelopes = []threadsWebhookEnvelope{envelope}
 	}
 	if len(envelopes) == 0 {
-		return nil, errors.New("Threads webhook contains no events")
+		return nil, errors.New("threads webhook contains no events")
 	}
 	return envelopes, nil
 }
