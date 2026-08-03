@@ -259,6 +259,7 @@ type CredentialRefreshResult struct {
 	KeyVersion     string       `json:"key_version,omitempty"`
 	ExpiresAt      *time.Time   `json:"expires_at,omitempty"`
 	RefreshedAt    time.Time    `json:"refreshed_at"`
+	Metadata       models.JSONB `json:"metadata,omitempty"`
 }
 
 // Adapter translates one provider into the canonical channel contract.
@@ -279,6 +280,24 @@ type Adapter interface {
 	ValidateAccount(ctx context.Context, account *models.ChannelAccount) (AccountValidationResult, error)
 	Subscribe(ctx context.Context, account *models.ChannelAccount) error
 	RefreshCredentials(ctx context.Context, account *models.ChannelAccount) (CredentialRefreshResult, error)
+}
+
+// PreparedSender separates provider-side preparation from the externally
+// visible publish operation. The caller must durably persist the opaque state
+// returned by PrepareSend before invoking PublishPrepared. This lets an outbox
+// safely retry preparation while fencing publication against duplicate sends.
+type PreparedSender interface {
+	PrepareSend(
+		ctx context.Context,
+		account *models.ChannelAccount,
+		message OutboundMessage,
+	) (models.JSONB, error)
+	PublishPrepared(
+		ctx context.Context,
+		account *models.ChannelAccount,
+		message OutboundMessage,
+		providerState models.JSONB,
+	) (SendResult, error)
 }
 
 var (

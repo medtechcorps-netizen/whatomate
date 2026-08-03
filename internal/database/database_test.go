@@ -20,6 +20,27 @@ func cleanAll(t *testing.T, db *gorm.DB) {
 	testutil.TruncateTables(db)
 }
 
+func TestBackfillProviderIntegrationBindingsRestoresLegacyThreadsAppID(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+	organization := testutil.CreateTestOrganization(t, db)
+	legacy := models.ProviderIntegration{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: organization.ID,
+		Provider:       "threads",
+		Enabled:        false,
+		Config:         models.JSONB{"app_id": "1553429782494481"},
+		CredentialData: models.JSONB{},
+	}
+	require.NoError(t, db.Create(&legacy).Error)
+	require.Nil(t, legacy.ThreadsAppID)
+
+	require.NoError(t, database.BackfillProviderIntegrationBindings(db))
+	require.NoError(t, db.First(&legacy, "id = ?", legacy.ID).Error)
+	require.NotNil(t, legacy.ThreadsAppID)
+	assert.Equal(t, "1553429782494481", *legacy.ThreadsAppID)
+}
+
 // --- SeedPermissionsAndRoles ---
 
 func TestSeedPermissionsAndRoles_CreatesAllDefaultPermissions(t *testing.T) {

@@ -9,12 +9,14 @@ import (
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func TestChannelOutboxBackoffIsBounded(t *testing.T) {
@@ -23,6 +25,31 @@ func TestChannelOutboxBackoffIsBounded(t *testing.T) {
 	assert.Equal(t, 2*time.Second, channelOutboxBackoff(1))
 	assert.Equal(t, 4*time.Second, channelOutboxBackoff(2))
 	assert.Equal(t, time.Hour, channelOutboxBackoff(20))
+}
+
+func TestChannelOutboxDurableEntitlementSemantics(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	expired := now.Add(-time.Minute)
+	future := now.Add(time.Minute)
+	assert.False(t, channelOutboxSubscriptionPermitsEntitlement(
+		&models.Subscription{
+			Status:           models.SubscriptionStatusActive,
+			CurrentPeriodEnd: &expired,
+		},
+		now,
+	))
+	assert.True(t, channelOutboxSubscriptionPermitsEntitlement(
+		&models.Subscription{
+			Status:           models.SubscriptionStatusActive,
+			CurrentPeriodEnd: &future,
+		},
+		now,
+	))
+	assert.True(t, channelOutboxEntitlementAllows(models.JSONB{"enabled": true}))
+	assert.False(t, channelOutboxEntitlementAllows("disabled"))
+	assert.False(t, channelOutboxEntitlementAllows(nil))
 }
 
 func TestRetryableChannelErrorUsesProviderClassification(t *testing.T) {
@@ -257,6 +284,355 @@ func TestChannelOutboxUnlicensedTenantIsDeadLettered(t *testing.T) {
 
 	_ = account
 	_ = conversation
+}
+
+func TestChannelOutboxThreadsEntitlementIsRechecked(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	account, _, message, job := createChannelOutboxTestFixture(
+		t,
+		db,
+		org.ID,
+		"threads-entitlement-worker",
+	)
+	require.NoError(t, db.Model(&models.ChannelAccount{}).
+		Where("id = ? AND organization_id = ?", account.ID, org.ID).
+		Updates(map[string]any{
+			"channel":  models.ChannelThreads,
+			"provider": channelapi.ThreadsProvider,
+		}).Error)
+	enableChannelAIReplyOmnichannel(t, db, org.ID)
+
+	worker := &Worker{DB: db, Log: testutil.NopLogger()}
+	require.NoError(t, worker.deliverChannelOutboxJob(
+		context.Background(),
+		org.ID,
+		job.ID,
+		job.LockedBy,
+	))
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusFailed, job.Status)
+	assert.Contains(t, job.LastError, "Threads public engagement entitlement")
+	require.NoError(t, db.First(message, "id = ?", message.ID).Error)
+	assert.Equal(t, models.MessageStatusFailed, message.Status)
+}
+
+func TestChannelOutboxRejectsMismatchedThreadsAppBinding(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	account, _, message, job := createChannelOutboxTestFixture(
+		t,
+		db,
+		org.ID,
+		"threads-binding-worker",
+	)
+	const configuredAppID = "1234567890123456"
+	const staleAppID = "9999999999999999"
+	require.NoError(t, db.Model(&models.ChannelAccount{}).
+		Where("id = ? AND organization_id = ?", account.ID, org.ID).
+		Updates(map[string]any{
+			"channel":  models.ChannelThreads,
+			"provider": channelapi.ThreadsProvider,
+			"metadata": models.JSONB{"app_id": staleAppID},
+		}).Error)
+	require.NoError(t, db.Model(&models.ChannelCredential{}).
+		Where("organization_id = ? AND channel_account_id = ?", org.ID, account.ID).
+		Update("metadata", models.JSONB{"app_id": configuredAppID}).Error)
+	appID := configuredAppID
+	require.NoError(t, db.Create(&models.ProviderIntegration{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Provider:       channelapi.ThreadsProvider,
+		ThreadsAppID:   &appID,
+		Enabled:        true,
+		Config:         models.JSONB{"app_id": configuredAppID},
+		CredentialData: models.JSONB{},
+	}).Error)
+	enableChannelAIReplyOmnichannel(t, db, org.ID)
+	var subscription models.Subscription
+	require.NoError(t, db.Where("organization_id = ?", org.ID).First(&subscription).Error)
+	subscription.EntitlementsSnapshot[channelapi.ThreadsPublicEngagementEntitlementKey] = true
+	require.NoError(t, db.Model(&subscription).
+		Update("entitlements_snapshot", subscription.EntitlementsSnapshot).Error)
+
+	worker := &Worker{DB: db, Log: testutil.NopLogger()}
+	require.NoError(t, worker.deliverChannelOutboxJob(
+		context.Background(),
+		org.ID,
+		job.ID,
+		job.LockedBy,
+	))
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusFailed, job.Status)
+	assert.Contains(t, job.LastError, "Threads app binding")
+	require.NoError(t, db.First(message, "id = ?", message.ID).Error)
+	assert.Equal(t, models.MessageStatusFailed, message.Status)
+}
+
+func TestPreparedChannelOutboxPersistsStateBeforeSinglePublishAttempt(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	account, _, message, job := createChannelOutboxTestFixture(
+		t,
+		db,
+		org.ID,
+		"prepared-publish-worker",
+	)
+	providerState := models.JSONB{"container_id": "container-123"}
+	sender := &preparedChannelOutboxTestSender{
+		prepareState: providerState,
+		publish: func(
+			_ context.Context,
+			_ *models.ChannelAccount,
+			_ channelapi.OutboundMessage,
+			state models.JSONB,
+		) (channelapi.SendResult, error) {
+			var persisted models.OutboxJob
+			require.NoError(t, db.First(&persisted, "id = ?", job.ID).Error)
+			assert.Equal(t, models.OutboxJobStatusDispatching, persisted.Status)
+			assert.Equal(t, providerState, persisted.ProviderState)
+			assert.Equal(t, providerState, state)
+			return channelapi.SendResult{}, &channelapi.ProviderError{
+				Operation: "publish_prepared",
+				Provider:  channelapi.ThreadsProvider,
+				Code:      "upstream_timeout",
+				Message:   "publish response was not received",
+				Retryable: true,
+			}
+		},
+	}
+	worker := &Worker{DB: db, Log: testutil.NopLogger()}
+
+	require.NoError(t, worker.deliverPreparedChannelOutboxJob(
+		context.Background(),
+		org.ID,
+		job,
+		account,
+		job.LockedBy,
+		channelapi.OutboundMessage{},
+		sender,
+	))
+	assert.Equal(t, 1, sender.prepareCalls)
+	assert.Equal(t, 1, sender.publishCalls)
+
+	var persisted models.OutboxJob
+	require.NoError(t, db.First(&persisted, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusFailed, persisted.Status)
+	assert.Equal(t, 1, persisted.AttemptCount)
+	assert.Equal(t, providerState, persisted.ProviderState)
+	require.NoError(t, db.First(message, "id = ?", message.ID).Error)
+	assert.Equal(t, models.MessageStatusFailed, message.Status)
+
+	// The terminal row cannot cross the dispatch fence again, even if a caller
+	// accidentally attempts to process the same in-memory job a second time.
+	require.Error(t, worker.deliverPreparedChannelOutboxJob(
+		context.Background(),
+		org.ID,
+		job,
+		account,
+		job.LockedBy,
+		channelapi.OutboundMessage{},
+		sender,
+	))
+	assert.Equal(t, 1, sender.prepareCalls)
+	assert.Equal(t, 1, sender.publishCalls)
+}
+
+func TestPreparedChannelOutboxResumesPersistedPreparation(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	account, _, message, job := createChannelOutboxTestFixture(
+		t,
+		db,
+		org.ID,
+		"prepared-resume-worker",
+	)
+	providerState := models.JSONB{"container_id": "container-resumed"}
+	require.NoError(t, db.Model(&models.OutboxJob{}).
+		Where("id = ? AND organization_id = ?", job.ID, org.ID).
+		Update("provider_state", providerState).Error)
+	job.ProviderState = providerState
+	sender := &preparedChannelOutboxTestSender{
+		prepareState: models.JSONB{"container_id": "must-not-be-created"},
+		publish: func(
+			_ context.Context,
+			_ *models.ChannelAccount,
+			_ channelapi.OutboundMessage,
+			state models.JSONB,
+		) (channelapi.SendResult, error) {
+			assert.Equal(t, providerState, state)
+			return channelapi.SendResult{
+				ProviderMessageIDs: []string{"threads-message-123"},
+			}, nil
+		},
+	}
+	worker := &Worker{DB: db, Log: testutil.NopLogger()}
+
+	require.NoError(t, worker.deliverPreparedChannelOutboxJob(
+		context.Background(),
+		org.ID,
+		job,
+		account,
+		job.LockedBy,
+		channelapi.OutboundMessage{},
+		sender,
+	))
+	assert.Zero(t, sender.prepareCalls)
+	assert.Equal(t, 1, sender.publishCalls)
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusSent, job.Status)
+	require.NoError(t, db.First(message, "id = ?", message.ID).Error)
+	assert.Equal(t, models.MessageStatusSent, message.Status)
+}
+
+func TestThreadsDispatchFenceWaitsForDisconnectAndDoesNotPublish(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	account, _, _, job := createChannelOutboxTestFixture(
+		t,
+		db,
+		org.ID,
+		"threads-disconnect-fence-worker",
+	)
+	configureThreadsDispatchFenceFixture(t, db, org.ID, account, job, "current-token")
+
+	disconnectTx := db.Begin()
+	require.NoError(t, disconnectTx.Error)
+	t.Cleanup(func() { _ = disconnectTx.Rollback().Error })
+	var disconnecting models.ChannelAccount
+	require.NoError(t, disconnectTx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND organization_id = ?", account.ID, org.ID).
+		First(&disconnecting).Error)
+	disconnecting.Config = cloneChannelOutboxTestJSONB(disconnecting.Config)
+	disconnecting.Config["outbound_enabled"] = false
+	disconnecting.Status = models.ChannelAccountStatusDisconnected
+	require.NoError(t, disconnectTx.Save(&disconnecting).Error)
+
+	fencePID := make(chan int, 1)
+	fenceDone := make(chan error, 1)
+	go func() {
+		fenceDone <- db.Connection(func(connection *gorm.DB) error {
+			var backendPID int
+			if err := connection.Raw("SELECT pg_backend_pid()").
+				Scan(&backendPID).Error; err != nil {
+				fencePID <- 0
+				return err
+			}
+			fencePID <- backendPID
+			worker := &Worker{DB: connection, Log: testutil.NopLogger()}
+			_, err := worker.markChannelOutboxDispatching(
+				org.ID,
+				job.ID,
+				account.ID,
+				job.LockedBy,
+			)
+			return err
+		})
+	}()
+	backendPID := <-fencePID
+	require.Positive(t, backendPID)
+	testutil.RequirePostgresBackendWaitingForLock(t, db, backendPID)
+
+	now := time.Now().UTC()
+	require.NoError(t, disconnectTx.Model(&models.OutboxJob{}).
+		Where(
+			"id = ? AND organization_id = ? AND status = ?",
+			job.ID,
+			org.ID,
+			models.OutboxJobStatusProcessing,
+		).
+		Updates(map[string]any{
+			"status":     models.OutboxJobStatusCancelled,
+			"failed_at":  now,
+			"locked_at":  nil,
+			"locked_by":  "",
+			"updated_at": now,
+		}).Error)
+	require.NoError(t, disconnectTx.Commit().Error)
+
+	select {
+	case err := <-fenceDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no longer active")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "Threads dispatch fence did not resume after disconnect committed")
+	}
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusCancelled, job.Status)
+}
+
+func TestThreadsDispatchFencePublishesWithCurrentCredentialSnapshot(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	account, _, _, job := createChannelOutboxTestFixture(
+		t,
+		db,
+		org.ID,
+		"threads-current-credential-worker",
+	)
+	credential := configureThreadsDispatchFenceFixture(
+		t,
+		db,
+		org.ID,
+		account,
+		job,
+		"current-token",
+	)
+	account.Credentials = []models.ChannelCredential{{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		CredentialBlob: models.JSONB{"access_token": "stale-in-memory-token"},
+		Status:         models.ChannelCredentialStatusRevoked,
+	}}
+	sender := &preparedChannelOutboxTestSender{
+		prepareState: models.JSONB{"container_id": "must-not-be-created"},
+		publish: func(
+			_ context.Context,
+			fenced *models.ChannelAccount,
+			_ channelapi.OutboundMessage,
+			_ models.JSONB,
+		) (channelapi.SendResult, error) {
+			require.Len(t, fenced.Credentials, 1)
+			assert.Equal(t, credential.ID, fenced.Credentials[0].ID)
+			assert.Equal(
+				t,
+				"current-token",
+				fenced.Credentials[0].CredentialBlob["access_token"],
+			)
+			return channelapi.SendResult{
+				ProviderMessageIDs: []string{"threads-current-credential-message"},
+			}, nil
+		},
+	}
+	worker := &Worker{DB: db, Log: testutil.NopLogger()}
+	require.NoError(t, worker.deliverPreparedChannelOutboxJob(
+		context.Background(),
+		org.ID,
+		job,
+		account,
+		job.LockedBy,
+		channelapi.OutboundMessage{},
+		sender,
+	))
+	assert.Zero(t, sender.prepareCalls)
+	assert.Equal(t, 1, sender.publishCalls)
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusSent, job.Status)
+}
+
+func TestChannelOutboxResolvesThreadsAdapter(t *testing.T) {
+	worker := &Worker{
+		Config: &config.Config{
+			App: config.AppConfig{EncryptionKey: "test-threads-encryption-key"},
+		},
+	}
+	adapter, err := worker.channelOutboxAdapter(&models.ChannelAccount{
+		Channel:  models.ChannelThreads,
+		Provider: channelapi.ThreadsProvider,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, models.ChannelThreads, adapter.Channel())
+	assert.Equal(t, channelapi.ThreadsProvider, adapter.Provider())
+	assert.Implements(t, (*channelapi.PreparedSender)(nil), adapter)
 }
 
 func TestChannelOutboxReclaimsStaleLeaseAndProtectsCompletion(t *testing.T) {
@@ -880,6 +1256,110 @@ func createChannelOutboxTestFixture(
 	return account, conversation, message, job
 }
 
+func configureThreadsDispatchFenceFixture(
+	t *testing.T,
+	db *gorm.DB,
+	orgID uuid.UUID,
+	account *models.ChannelAccount,
+	job *models.OutboxJob,
+	accessToken string,
+) models.ChannelCredential {
+	t.Helper()
+	appID := strings.ReplaceAll(uuid.NewString(), "-", "")
+	require.NoError(t, db.Model(&models.ChannelAccount{}).
+		Where("id = ? AND organization_id = ?", account.ID, orgID).
+		Updates(map[string]any{
+			"channel":  models.ChannelThreads,
+			"provider": channelapi.ThreadsProvider,
+			"status":   models.ChannelAccountStatusActive,
+			"config":   models.JSONB{"outbound_enabled": true},
+			"metadata": models.JSONB{"app_id": appID},
+		}).Error)
+	account.Channel = models.ChannelThreads
+	account.Provider = channelapi.ThreadsProvider
+	account.Status = models.ChannelAccountStatusActive
+	account.Config = models.JSONB{"outbound_enabled": true}
+	account.Metadata = models.JSONB{"app_id": appID}
+
+	expiresAt := time.Now().UTC().Add(30 * 24 * time.Hour)
+	credential := models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   orgID,
+		ChannelAccountID: account.ID,
+		Kind:             models.ChannelCredentialKindOAuth,
+		Version:          1,
+		CredentialBlob:   models.JSONB{"access_token": accessToken},
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "test:v1",
+		ExpiresAt:        &expiresAt,
+		Metadata:         models.JSONB{"app_id": appID},
+	}
+	require.NoError(t, db.Create(&credential).Error)
+	require.NoError(t, db.Create(&models.ProviderIntegration{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgID,
+		Provider:       channelapi.ThreadsProvider,
+		ThreadsAppID:   &appID,
+		Enabled:        true,
+		Config:         models.JSONB{"app_id": appID},
+		CredentialData: models.JSONB{},
+	}).Error)
+	enableChannelAIReplyOmnichannel(t, db, orgID)
+	var subscription models.Subscription
+	require.NoError(t, db.Where("organization_id = ?", orgID).
+		First(&subscription).Error)
+	subscription.EntitlementsSnapshot[channelapi.ThreadsPublicEngagementEntitlementKey] = true
+	require.NoError(t, db.Model(&subscription).
+		Update("entitlements_snapshot", subscription.EntitlementsSnapshot).Error)
+
+	providerState := models.JSONB{"container_id": "container-" + uuid.NewString()}
+	require.NoError(t, db.Model(&models.OutboxJob{}).
+		Where("id = ? AND organization_id = ?", job.ID, orgID).
+		Update("provider_state", providerState).Error)
+	job.ProviderState = providerState
+	return credential
+}
+
+func cloneChannelOutboxTestJSONB(value models.JSONB) models.JSONB {
+	cloned := make(models.JSONB, len(value))
+	for key, entry := range value {
+		cloned[key] = entry
+	}
+	return cloned
+}
+
 func timePointerForWorkerTest(value time.Time) *time.Time {
 	return &value
+}
+
+type preparedChannelOutboxTestSender struct {
+	prepareState models.JSONB
+	prepareErr   error
+	publish      func(
+		context.Context,
+		*models.ChannelAccount,
+		channelapi.OutboundMessage,
+		models.JSONB,
+	) (channelapi.SendResult, error)
+	prepareCalls int
+	publishCalls int
+}
+
+func (s *preparedChannelOutboxTestSender) PrepareSend(
+	_ context.Context,
+	_ *models.ChannelAccount,
+	_ channelapi.OutboundMessage,
+) (models.JSONB, error) {
+	s.prepareCalls++
+	return s.prepareState, s.prepareErr
+}
+
+func (s *preparedChannelOutboxTestSender) PublishPrepared(
+	ctx context.Context,
+	account *models.ChannelAccount,
+	message channelapi.OutboundMessage,
+	providerState models.JSONB,
+) (channelapi.SendResult, error) {
+	s.publishCalls++
+	return s.publish(ctx, account, message, providerState)
 }

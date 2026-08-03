@@ -19,18 +19,20 @@ const platformOwner = {
 const threadsAccount = {
   id: '72222222-2222-4222-8222-222222222222',
   channel: 'threads',
-  provider: 'relay',
-  name: 'ReAlign Threads beta',
+  provider: 'threads',
+  name: 'ReAlign Kajang Threads',
   external_account_id: 'realign-threads',
   status: 'active',
   capabilities: {
     text: true,
     replies: true,
+    public_replies: true,
+    reply_target_required: true,
+    mentions: true,
     business_initiation: false,
     direct_messages: false,
   },
   config: {
-    relay_url: 'https://relay.example.test/threads',
     outbound_enabled: true,
     engagement_mode: 'public_replies_mentions',
     direct_messages_supported: false,
@@ -235,7 +237,7 @@ test.describe('Threads public engagement channel', () => {
     await expect(page.getByTestId('threads-public-engagement-adapter')).toHaveCount(0)
   })
 
-  test('shows the unavailable adapter and does not offer relay account creation when entitled', async ({ page }) => {
+  test('routes account authorization through Integrations instead of generic channel creation', async ({ page }) => {
     const state = await mockChannels(page, { threadsEnabled: true })
     await page.goto('/inbox')
 
@@ -243,12 +245,12 @@ test.describe('Threads public engagement channel', () => {
     const channelSelect = page.getByTestId('channel-connect-type')
     await expect(channelSelect.locator('option[value="threads"]')).toHaveCount(0)
     await expect(page.getByTestId('threads-public-engagement-adapter')).toContainText(
-      'Adapter unavailable; account creation disabled',
+      'OAuth managed in Settings → Integrations',
     )
     expect(state.createdAccount()).toBeNull()
   })
 
-  test('keeps existing Threads conversations read-only while the adapter is unavailable', async ({ page }) => {
+  test('sends a public reply to the exact selected Threads mention target', async ({ page }) => {
     const state = await mockChannels(page, {
       threadsEnabled: true,
       accounts: [threadsAccount],
@@ -256,15 +258,56 @@ test.describe('Threads public engagement channel', () => {
     })
     await page.goto('/inbox')
 
+    await expect(page.getByTestId('threads-manage-in-integrations').first()).toHaveAttribute(
+      'href',
+      '/settings/integrations',
+    )
     await page.getByRole('button', { name: /Alya Public/ }).click()
     const notice = page.getByTestId('threads-public-reply-composer-notice')
-    await expect(notice).toContainText('an approved public-engagement adapter is not installed')
-    await expect(notice).toContainText('replies, direct messages and standalone posts are disabled')
+    await expect(notice).toContainText('selected public Threads mention')
+    await expect(notice).toContainText(
+      'Direct messages and standalone posts are not supported',
+    )
 
+    const composer = page.getByPlaceholder('Write a public Threads reply...')
+    await expect(composer).toBeEnabled()
+    await composer.fill('Yes, Pilates can help.')
+    await page.getByRole('button', { name: 'Send public Threads reply' }).click()
+
+    await expect.poll(state.sentMessage).toMatchObject({
+      purpose: 'service',
+      reply_to_external_id: 'threads-public-mention-987',
+      parts: [{ type: 'text', text: 'Yes, Pilates can help.' }],
+    })
+  })
+
+  test('keeps direct-message-shaped Threads conversations fail-closed', async ({ page }) => {
+    const state = await mockChannels(page, {
+      threadsEnabled: true,
+      accounts: [threadsAccount],
+      conversations: [
+        {
+          ...threadsConversation,
+          metadata: { engagement_type: 'direct_message' },
+        },
+      ],
+    })
+    await page.goto('/inbox')
+
+    await page.getByRole('button', { name: /Alya Public/ }).click()
+    const notice = page.getByTestId('threads-public-reply-composer-notice')
+    await expect(notice).toContainText(
+      'Select an existing public Threads reply or mention before replying',
+    )
+    await expect(notice).toContainText(
+      'Direct messages and standalone posts are not supported',
+    )
     await expect(
-      page.getByPlaceholder('Threads replies are unavailable — adapter not installed'),
+      page.getByPlaceholder('Select an existing public Threads reply or mention'),
     ).toBeDisabled()
-    await expect(page.getByRole('button', { name: 'Threads reply unavailable' })).toBeDisabled()
+    await expect(
+      page.getByRole('button', { name: 'Threads reply unavailable' }),
+    ).toBeDisabled()
     expect(state.sentMessage()).toBeNull()
   })
 })

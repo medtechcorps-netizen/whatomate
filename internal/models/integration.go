@@ -18,6 +18,7 @@ type ProviderIntegration struct {
 	BaseModel
 	OrganizationID       uuid.UUID  `gorm:"type:uuid;not null;index;uniqueIndex:idx_provider_integrations_org_provider,priority:1" json:"organization_id"`
 	Provider             string     `gorm:"size:32;not null;uniqueIndex:idx_provider_integrations_org_provider,priority:2" json:"provider"`
+	ThreadsAppID         *string    `gorm:"size:255;uniqueIndex:idx_provider_integrations_threads_app" json:"-"`
 	Enabled              bool       `gorm:"not null;default:false" json:"enabled"`
 	Config               JSONB      `gorm:"type:jsonb;not null;default:'{}'" json:"config"`
 	CredentialData       JSONB      `gorm:"type:jsonb;not null;default:'{}'" json:"-"`

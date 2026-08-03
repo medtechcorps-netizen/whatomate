@@ -443,6 +443,7 @@ type OutboxJob struct {
 	FailedAt         *time.Time               `json:"failed_at,omitempty"`
 	LastErrorCode    string                   `gorm:"size:100" json:"last_error_code,omitempty"`
 	LastError        string                   `gorm:"type:text" json:"last_error,omitempty"`
+	ProviderState    JSONB                    `gorm:"type:jsonb;not null;default:'{}'" json:"-"`
 	Payload          JSONB                    `gorm:"type:jsonb;not null;default:'{}'" json:"payload"`
 
 	Organization   *Organization      `gorm:"foreignKey:OrganizationID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"organization,omitempty"`

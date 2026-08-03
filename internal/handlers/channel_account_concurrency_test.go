@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type channelAccountConcurrencyFixture struct {
@@ -19,6 +21,73 @@ type channelAccountConcurrencyFixture struct {
 	Organization *models.Organization
 	User         *models.User
 	Account      *models.ChannelAccount
+}
+
+func TestChannelMessageEnqueueWaitsForDisconnectAndFailsClosed(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	conversation := createAIControlConversation(t, db, organization.ID)
+	require.NoError(t, db.Create(&models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   organization.ID,
+		ChannelAccountID: conversation.ChannelAccountID,
+		Kind:             models.ChannelCredentialKindPrimary,
+		Version:          1,
+		CredentialBlob:   models.JSONB{"test": "credential"},
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "test:v1",
+		Metadata:         models.JSONB{},
+	}).Error)
+
+	disconnectTx := db.Begin()
+	require.NoError(t, disconnectTx.Error)
+	t.Cleanup(func() { _ = disconnectTx.Rollback().Error })
+	var account models.ChannelAccount
+	require.NoError(t, disconnectTx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"id = ? AND organization_id = ?",
+			conversation.ChannelAccountID,
+			organization.ID,
+		).
+		First(&account).Error)
+	account.Status = models.ChannelAccountStatusDisconnected
+	account.Config["outbound_enabled"] = false
+	require.NoError(t, disconnectTx.Save(&account).Error)
+
+	enqueuePID := make(chan int, 1)
+	enqueueDone := make(chan error, 1)
+	go func() {
+		enqueueDone <- db.Connection(func(connection *gorm.DB) error {
+			session := connection.Session(&gorm.Session{NewDB: true})
+			var backendPID int
+			if err := session.Raw("SELECT pg_backend_pid()").Scan(&backendPID).Error; err != nil {
+				enqueuePID <- 0
+				return err
+			}
+			enqueuePID <- backendPID
+			return session.Transaction(func(tx *gorm.DB) error {
+				return lockChannelAccountForMessageEnqueue(
+					tx,
+					organization.ID,
+					conversation.ChannelAccountID,
+					conversation.Channel,
+					time.Now().UTC(),
+				)
+			})
+		})
+	}()
+
+	backendPID := <-enqueuePID
+	require.Positive(t, backendPID)
+	testutil.RequirePostgresBackendWaitingForLock(t, db, backendPID)
+	require.NoError(t, disconnectTx.Commit().Error)
+
+	select {
+	case err := <-enqueueDone:
+		assert.True(t, errors.Is(err, errChannelAccountUnavailableAtEnqueue), err)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "message enqueue did not resume after disconnect committed")
+	}
 }
 
 func TestChannelAIEnqueueSerializesBeforeAccountDisableCancellation(t *testing.T) {

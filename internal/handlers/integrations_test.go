@@ -7,8 +7,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -17,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
+	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
 )
 
@@ -419,23 +422,13 @@ func TestIntegrationCenterQwenDeleteIsAuthoritativeOverLegacyFallback(t *testing
 	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
 
-func TestIntegrationCenterUnavailableProvidersCannotBeEnabled(t *testing.T) {
+func TestIntegrationCenterApprovalGatedProvidersCannotBeEnabled(t *testing.T) {
 	for _, testCase := range []struct {
 		provider    string
 		config      map[string]any
 		credentials map[string]any
 		status      string
 	}{
-		{
-			provider: integrationProviderThreads,
-			config: map[string]any{
-				"app_id":            "threads-app-123",
-				"redirect_uri":      "https://app.example.test/oauth/threads",
-				"app_review_status": "pending",
-			},
-			credentials: map[string]any{"app_secret": "threads-secret"},
-			status:      integrationStatusAdapterMissing,
-		},
 		{
 			provider: integrationProviderTikTok,
 			config: map[string]any{
@@ -483,6 +476,500 @@ func TestIntegrationCenterUnavailableProvidersCannotBeEnabled(t *testing.T) {
 			assert.Equal(t, testCase.status, response.Status)
 		})
 	}
+}
+
+func TestIntegrationCenterThreadsCanBeEnabledForOAuth(t *testing.T) {
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := integrationTestUser(t, app, org.ID, "settings.integrations:read", "settings.integrations:write")
+	request := testutil.NewJSONRequest(t, map[string]any{
+		"enabled": true,
+		"config": map[string]any{
+			"app_id":            "1234567890123457",
+			"redirect_uri":      "https://app.example.test/api/integrations/threads/callback",
+			"app_review_status": "approved",
+		},
+		"credentials": map[string]any{
+			"app_secret":           "threads-app-secret",
+			"webhook_verify_token": "threads-webhook-verify-token",
+		},
+	})
+	testutil.SetAuthContext(request, org.ID, admin.ID)
+	testutil.SetPathParam(request, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(request))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+
+	var row models.ProviderIntegration
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND provider = ?",
+		org.ID,
+		integrationProviderThreads,
+	).First(&row).Error)
+	assert.True(t, row.Enabled)
+	assert.True(t, appcrypto.IsEncrypted(stringJSONValue(row.CredentialData, "app_secret")))
+	assert.True(t, appcrypto.IsEncrypted(stringJSONValue(row.CredentialData, "webhook_verify_token")))
+
+	var response IntegrationResponse
+	testutil.ParseEnvelopeResponse(t, request, &response)
+	assert.True(t, response.Enabled)
+	assert.True(t, response.Configured)
+	assert.Equal(t, integrationStatusConfigured, response.Status)
+	assert.True(t, response.OAuth.Supported)
+	assert.False(t, response.OAuth.Available, "Redis is intentionally absent in this unit test")
+	assert.NotContains(t, string(testutil.GetResponseBody(request)), "threads-app-secret")
+	assert.NotContains(t, string(testutil.GetResponseBody(request)), "threads-webhook-verify-token")
+}
+
+func TestIntegrationCenterThreadsAppIDCannotBeSharedAcrossWorkspaces(t *testing.T) {
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	orgA := testutil.CreateTestOrganization(t, app.DB)
+	orgB := testutil.CreateTestOrganization(t, app.DB)
+	adminA := integrationTestUser(t, app, orgA.ID, "settings.integrations:read", "settings.integrations:write")
+	adminB := integrationTestUser(t, app, orgB.ID, "settings.integrations:read", "settings.integrations:write")
+	requestFor := func(orgID, userID uuid.UUID) *fastglue.Request {
+		request := testutil.NewJSONRequest(t, map[string]any{
+			"enabled": true,
+			"config": map[string]any{
+				"app_id":       "1234567890123458",
+				"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
+			},
+			"credentials": map[string]any{
+				"app_secret":           "threads-app-secret",
+				"webhook_verify_token": "threads-webhook-verify-token",
+			},
+		})
+		testutil.SetAuthContext(request, orgID, userID)
+		testutil.SetPathParam(request, "provider", integrationProviderThreads)
+		return request
+	}
+
+	first := requestFor(orgA.ID, adminA.ID)
+	require.NoError(t, app.UpdateIntegration(first))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(first))
+	second := requestFor(orgB.ID, adminB.ID)
+	require.NoError(t, app.UpdateIntegration(second))
+	testutil.AssertErrorResponse(
+		t,
+		second,
+		fasthttp.StatusConflict,
+		"already bound to another ReReply workspace",
+	)
+}
+
+func TestIntegrationCenterThreadsDeleteDisconnectsAccountsAndRevokesOAuthCredentials(t *testing.T) {
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := integrationTestUser(
+		t,
+		app,
+		org.ID,
+		"settings.integrations:read",
+		"settings.integrations:write",
+		models.ResourceChannelAccounts+":"+models.ActionDelete,
+	)
+	enableBookingCommerceTestEntitlement(t, app.DB, org.ID, admin.ID, "omnichannel.enabled")
+	appSecret, err := appcrypto.Encrypt("threads-app-secret", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	verifyToken, err := appcrypto.Encrypt("threads-webhook-verify-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	accessToken, err := appcrypto.Encrypt("threads-long-lived-access-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+
+	integration := models.ProviderIntegration{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Provider:       integrationProviderThreads,
+		Enabled:        true,
+		Config: models.JSONB{
+			"app_id":       "1234567890123459",
+			"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
+		},
+		CredentialData: models.JSONB{
+			"app_secret":           appSecret,
+			"webhook_verify_token": verifyToken,
+		},
+		CreatedByID: &admin.ID,
+		UpdatedByID: &admin.ID,
+	}
+	require.NoError(t, app.DB.Create(&integration).Error)
+	account := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    org.ID,
+		Channel:           models.ChannelThreads,
+		Provider:          integrationProviderThreads,
+		Name:              "Threads @clinic_account",
+		ExternalAccountID: "9876543210987654",
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{"text": true, "replies": true},
+		Config:            models.JSONB{"outbound_enabled": true},
+		Metadata:          models.JSONB{},
+		IsDefaultIncoming: true,
+		CreatedByID:       &admin.ID,
+		UpdatedByID:       &admin.ID,
+	}
+	require.NoError(t, app.DB.Create(&account).Error)
+	credential := models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   org.ID,
+		ChannelAccountID: account.ID,
+		Kind:             models.ChannelCredentialKindOAuth,
+		Version:          1,
+		CredentialBlob:   models.JSONB{"access_token": accessToken},
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "app:v1",
+		Metadata:         models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(&credential).Error)
+	contact := models.Contact{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		PhoneNumber:     "thr-" + uuid.NewString(),
+		WhatsAppAccount: account.Name,
+		Tags:            models.JSONBArray{},
+		Metadata:        models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(&contact).Error)
+	conversation := models.InboxConversation{
+		BaseModel:              models.BaseModel{ID: uuid.New()},
+		OrganizationID:         org.ID,
+		ChannelAccountID:       account.ID,
+		ContactID:              contact.ID,
+		Channel:                models.ChannelThreads,
+		ExternalConversationID: "threads-target-" + uuid.NewString(),
+		Status:                 models.InboxConversationStatusOpen,
+		OpenedAt:               time.Now().UTC(),
+		Config:                 models.JSONB{},
+		Metadata:               models.JSONB{"engagement_type": "mention"},
+	}
+	require.NoError(t, app.DB.Create(&conversation).Error)
+	message := models.Message{
+		BaseModel:           models.BaseModel{ID: uuid.New()},
+		OrganizationID:      org.ID,
+		WhatsAppAccount:     account.Name,
+		ContactID:           contact.ID,
+		ConversationID:      conversation.ExternalConversationID,
+		InboxConversationID: &conversation.ID,
+		Direction:           models.DirectionOutgoing,
+		MessageType:         models.MessageTypeText,
+		Content:             "Queued reply",
+		Status:              models.MessageStatusPending,
+		Metadata:            models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(&message).Error)
+	now := time.Now().UTC()
+	queuedJob := models.OutboxJob{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   org.ID,
+		ChannelAccountID: account.ID,
+		ConversationID:   conversation.ID,
+		MessageID:        &message.ID,
+		IdempotencyKey:   "threads-manual:" + uuid.NewString(),
+		PayloadDigest:    "threads-disconnect-test",
+		Purpose:          models.ChannelPreferencePurposeService,
+		Status:           models.OutboxJobStatusProcessing,
+		AvailableAt:      now,
+		LockedAt:         &now,
+		LockedBy:         "test-worker",
+		MaxAttempts:      8,
+		ProviderState:    models.JSONB{},
+		Payload:          models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(&queuedJob).Error)
+	dispatchingMessage := message
+	dispatchingMessage.ID = uuid.New()
+	dispatchingMessage.Content = "Already fenced reply"
+	require.NoError(t, app.DB.Create(&dispatchingMessage).Error)
+	dispatchingJob := queuedJob
+	dispatchingJob.ID = uuid.New()
+	dispatchingJob.MessageID = &dispatchingMessage.ID
+	dispatchingJob.IdempotencyKey = "threads-dispatching:" + uuid.NewString()
+	dispatchingJob.Status = models.OutboxJobStatusDispatching
+	dispatchingJob.ProviderState = models.JSONB{"creation_id": "already-fenced"}
+	require.NoError(t, app.DB.Create(&dispatchingJob).Error)
+	directDelete := testutil.NewRequest(t)
+	testutil.SetAuthContext(directDelete, org.ID, admin.ID)
+	testutil.SetPathParam(directDelete, "id", account.ID.String())
+	require.NoError(t, app.DeleteChannelAccount(directDelete))
+	testutil.AssertErrorResponse(
+		t,
+		directDelete,
+		fasthttp.StatusConflict,
+		"managed in Settings > Integrations",
+	)
+
+	request := testutil.NewRequest(t)
+	testutil.SetAuthContext(request, org.ID, admin.ID)
+	testutil.SetPathParam(request, "provider", integrationProviderThreads)
+	require.NoError(t, app.DeleteIntegrationCredentials(request))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+
+	require.NoError(t, app.DB.First(&integration, "id = ?", integration.ID).Error)
+	assert.False(t, integration.Enabled)
+	assert.Empty(t, integration.CredentialData)
+	require.NoError(t, app.DB.First(&account, "id = ?", account.ID).Error)
+	assert.Equal(t, models.ChannelAccountStatusDisconnected, account.Status)
+	assert.Equal(t, false, account.Config["outbound_enabled"])
+	assert.False(t, account.IsDefaultIncoming)
+	assert.False(t, account.IsDefaultOutgoing)
+	require.NoError(t, app.DB.First(&credential, "id = ?", credential.ID).Error)
+	assert.Equal(t, models.ChannelCredentialStatusRevoked, credential.Status)
+	assert.NotNil(t, credential.RevokedAt)
+	assert.NotNil(t, credential.RotatedAt)
+	var cancelledJob models.OutboxJob
+	require.NoError(t, app.DB.First(&cancelledJob, "id = ?", queuedJob.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusCancelled, cancelledJob.Status)
+	assert.Empty(t, cancelledJob.LockedBy)
+	assert.Nil(t, cancelledJob.LockedAt)
+	assert.Equal(t, "threads_disconnected", cancelledJob.LastErrorCode)
+	require.NoError(t, app.DB.First(&message, "id = ?", message.ID).Error)
+	assert.Equal(t, models.MessageStatusFailed, message.Status)
+	require.NoError(t, app.DB.First(&dispatchingJob, "id = ?", dispatchingJob.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusDispatching, dispatchingJob.Status)
+	require.NoError(t, app.DB.First(&dispatchingMessage, "id = ?", dispatchingMessage.ID).Error)
+	assert.Equal(t, models.MessageStatusPending, dispatchingMessage.Status)
+}
+
+func TestIntegrationCenterThreadsAppChangeRevokesOldAuthorizationAndReenableIsNotConnected(t *testing.T) {
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := integrationTestUser(
+		t,
+		app,
+		org.ID,
+		"settings.integrations:read",
+		"settings.integrations:write",
+	)
+	const oldAppID = "1442429782494481"
+	const newAppID = "1442429782494482"
+	appSecret, err := appcrypto.Encrypt("threads-old-app-secret", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	verifyToken, err := appcrypto.Encrypt("threads-old-webhook-verify-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	accessToken, err := appcrypto.Encrypt("threads-old-access-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	lastSuccessfulAt := time.Now().UTC().Add(-time.Minute)
+	oldBinding := oldAppID
+	integration := models.ProviderIntegration{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Provider:       integrationProviderThreads,
+		ThreadsAppID:   &oldBinding,
+		Enabled:        true,
+		Config: models.JSONB{
+			"app_id":       oldAppID,
+			"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
+		},
+		CredentialData: models.JSONB{
+			"app_secret":           appSecret,
+			"webhook_verify_token": verifyToken,
+		},
+		LastSuccessfulAt: &lastSuccessfulAt,
+		CreatedByID:      &admin.ID,
+		UpdatedByID:      &admin.ID,
+	}
+	require.NoError(t, app.DB.Create(&integration).Error)
+	account := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    org.ID,
+		Channel:           models.ChannelThreads,
+		Provider:          channelapi.ThreadsProvider,
+		Name:              "Threads @clinic_account",
+		ExternalAccountID: "9876543210987654",
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{"text": true, "replies": true},
+		Config:            models.JSONB{"outbound_enabled": true},
+		Metadata:          models.JSONB{"app_id": oldAppID},
+		CreatedByID:       &admin.ID,
+		UpdatedByID:       &admin.ID,
+	}
+	require.NoError(t, app.DB.Create(&account).Error)
+	credential := models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   org.ID,
+		ChannelAccountID: account.ID,
+		Kind:             models.ChannelCredentialKindOAuth,
+		Version:          1,
+		CredentialBlob:   models.JSONB{"access_token": accessToken},
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "app:v1",
+		Metadata:         models.JSONB{"app_id": oldAppID},
+	}
+	require.NoError(t, app.DB.Create(&credential).Error)
+
+	change := testutil.NewJSONRequest(t, map[string]any{
+		"enabled": true,
+		"config": map[string]any{
+			"app_id": newAppID,
+		},
+	})
+	testutil.SetAuthContext(change, org.ID, admin.ID)
+	testutil.SetPathParam(change, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(change))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(change))
+
+	var changedIntegration models.ProviderIntegration
+	require.NoError(t, app.DB.First(&changedIntegration, "id = ?", integration.ID).Error)
+	require.NotNil(t, changedIntegration.ThreadsAppID)
+	assert.Equal(t, newAppID, *changedIntegration.ThreadsAppID)
+	assert.Nil(t, changedIntegration.LastSuccessfulAt)
+	require.NoError(t, app.DB.First(&account, "id = ?", account.ID).Error)
+	assert.Equal(t, models.ChannelAccountStatusDisconnected, account.Status)
+	assert.Equal(t, false, account.Config["outbound_enabled"])
+	require.NoError(t, app.DB.First(&credential, "id = ?", credential.ID).Error)
+	assert.Equal(t, models.ChannelCredentialStatusRevoked, credential.Status)
+	var changedResponse IntegrationResponse
+	testutil.ParseEnvelopeResponse(t, change, &changedResponse)
+	assert.Equal(t, integrationStatusConfigured, changedResponse.Status)
+
+	account.Status = models.ChannelAccountStatusActive
+	account.Config["outbound_enabled"] = true
+	account.Metadata["app_id"] = newAppID
+	require.NoError(t, app.DB.Save(&account).Error)
+	require.NoError(t, app.DB.Model(&models.ChannelCredential{}).
+		Where("id = ?", credential.ID).
+		Updates(map[string]any{
+			"status":     models.ChannelCredentialStatusActive,
+			"revoked_at": nil,
+			"rotated_at": nil,
+			"metadata":   models.JSONB{"app_id": newAppID},
+		}).Error)
+	rotateSecret := testutil.NewJSONRequest(t, map[string]any{
+		"enabled": true,
+		"credentials": map[string]any{
+			"app_secret": "threads-replacement-app-secret",
+		},
+	})
+	testutil.SetAuthContext(rotateSecret, org.ID, admin.ID)
+	testutil.SetPathParam(rotateSecret, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(rotateSecret))
+	require.NoError(t, app.DB.First(&account, "id = ?", account.ID).Error)
+	assert.Equal(t, models.ChannelAccountStatusDisconnected, account.Status)
+	require.NoError(t, app.DB.First(&credential, "id = ?", credential.ID).Error)
+	assert.Equal(t, models.ChannelCredentialStatusRevoked, credential.Status)
+
+	// A plain disable must also clear old health success so re-enabling app
+	// configuration cannot masquerade as a connected OAuth account.
+	require.NoError(t, app.DB.Model(&models.ProviderIntegration{}).
+		Where("id = ?", integration.ID).
+		Update("last_successful_at", lastSuccessfulAt).Error)
+	disabled := false
+	disable := testutil.NewJSONRequest(t, map[string]any{"enabled": disabled})
+	testutil.SetAuthContext(disable, org.ID, admin.ID)
+	testutil.SetPathParam(disable, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(disable))
+
+	enabled := true
+	reenable := testutil.NewJSONRequest(t, map[string]any{"enabled": enabled})
+	testutil.SetAuthContext(reenable, org.ID, admin.ID)
+	testutil.SetPathParam(reenable, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(reenable))
+	var reenabledResponse IntegrationResponse
+	testutil.ParseEnvelopeResponse(t, reenable, &reenabledResponse)
+	assert.Equal(t, integrationStatusConfigured, reenabledResponse.Status)
+	var reenabledIntegration models.ProviderIntegration
+	require.NoError(t, app.DB.First(&reenabledIntegration, "id = ?", integration.ID).Error)
+	assert.Nil(t, reenabledIntegration.LastSuccessfulAt)
+}
+
+func TestPersistThreadsConnectionRestoresHistoricalSoftDeletedMatchingAccount(t *testing.T) {
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := integrationTestUser(
+		t,
+		app,
+		org.ID,
+		"settings.integrations:read",
+		"settings.integrations:write",
+	)
+	const appID = "1664429782494481"
+	appSecret, err := appcrypto.Encrypt("threads-restore-app-secret", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	verifyToken, err := appcrypto.Encrypt("threads-restore-verify-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	binding := appID
+	integration := models.ProviderIntegration{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Provider:       integrationProviderThreads,
+		ThreadsAppID:   &binding,
+		Enabled:        true,
+		Config: models.JSONB{
+			"app_id":       appID,
+			"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
+		},
+		CredentialData: models.JSONB{
+			"app_secret":           appSecret,
+			"webhook_verify_token": verifyToken,
+		},
+		CreatedByID: &admin.ID,
+		UpdatedByID: &admin.ID,
+	}
+	require.NoError(t, app.DB.Create(&integration).Error)
+	historical := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    org.ID,
+		Channel:           models.ChannelThreads,
+		Provider:          channelapi.ThreadsProvider,
+		Name:              "Historical Threads",
+		ExternalAccountID: "9876543210987654",
+		Status:            models.ChannelAccountStatusDisconnected,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{"outbound_enabled": false},
+		Metadata:          models.JSONB{"app_id": appID},
+		CreatedByID:       &admin.ID,
+		UpdatedByID:       &admin.ID,
+	}
+	require.NoError(t, app.DB.Create(&historical).Error)
+	require.NoError(t, app.DB.Delete(&historical).Error)
+	snapshot, err := app.loadThreadsIntegrationSnapshot(org.ID, true)
+	require.NoError(t, err)
+	encryptedToken, err := appcrypto.Encrypt("restored-threads-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	expiresAt := time.Now().UTC().Add(30 * 24 * time.Hour)
+	require.NoError(t, app.persistThreadsConnection(
+		org.ID,
+		admin.ID,
+		integration.ID,
+		snapshot.Fingerprint,
+		threadsProfile{
+			ID:       threadsID(historical.ExternalAccountID),
+			Username: "clinic_account",
+			Name:     "ReAlign Kajang",
+		},
+		encryptedToken,
+		int64((30*24*time.Hour).Seconds()),
+		channelapi.ThreadsPermissionSnapshot{
+			UserID:    historical.ExternalAccountID,
+			Scopes:    channelapi.RequiredThreadsScopes(),
+			ExpiresAt: &expiresAt,
+			CheckedAt: time.Now().UTC(),
+		},
+	))
+
+	var restored models.ChannelAccount
+	require.NoError(t, app.DB.Where("id = ?", historical.ID).First(&restored).Error)
+	assert.Equal(t, historical.ID, restored.ID)
+	assert.Equal(t, models.ChannelAccountStatusActive, restored.Status)
+	assert.False(t, restored.DeletedAt.Valid)
+	var accountCount int64
+	require.NoError(t, app.DB.Unscoped().Model(&models.ChannelAccount{}).
+		Where(
+			"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+			org.ID,
+			models.ChannelThreads,
+			channelapi.ThreadsProvider,
+			historical.ExternalAccountID,
+		).
+		Count(&accountCount).Error)
+	assert.EqualValues(t, 1, accountCount)
+	var credential models.ChannelCredential
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND channel_account_id = ? AND status = ?",
+		org.ID,
+		restored.ID,
+		models.ChannelCredentialStatusActive,
+	).First(&credential).Error)
+	assert.Equal(t, appID, credential.Metadata["app_id"])
 }
 
 func TestIntegrationCenterStrictValidationAndPermissions(t *testing.T) {
@@ -607,6 +1094,15 @@ func TestIntegrationRedirectURIRejectsValuesOver2048Characters(t *testing.T) {
 		"redirect_uri": "https://example.test/callback/" + strings.Repeat("a", 2049),
 	})
 	require.EqualError(t, err, "config.redirect_uri must be an HTTPS URL without credentials or a fragment")
+}
+
+func TestThreadsWebhookVerifyTokenRequiresSixteenCharacters(t *testing.T) {
+	_, _, err := validateIntegrationCredentials(
+		integrationProviderThreads,
+		map[string]string{"webhook_verify_token": "too-short"},
+		nil,
+	)
+	require.EqualError(t, err, "credentials.webhook_verify_token must be at least 16 characters")
 }
 
 func TestAccountCredentialEncryptionFailsClosedWithoutServerKey(t *testing.T) {

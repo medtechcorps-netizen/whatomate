@@ -536,6 +536,12 @@ func runServer(args []string) {
 					lo.Error("Channel AI reply worker error", "error", err, "worker_num", workerNum)
 				}
 			}()
+			go func() {
+				lo.Info("Threads credential refresh worker started", "worker_num", workerNum)
+				if err := w.RunThreadsCredentialRefresh(workerCtx); err != nil && err != context.Canceled {
+					lo.Error("Threads credential refresh worker error", "error", err, "worker_num", workerNum)
+				}
+			}()
 		}
 		lo.Info("Embedded workers started", "count", *numWorkers)
 	} else {
@@ -669,7 +675,7 @@ func runWorker(args []string) {
 
 	// Create and run workers
 	workers := make([]*worker.Worker, *workerCount)
-	errCh := make(chan error, *workerCount*3)
+	errCh := make(chan error, *workerCount*4)
 
 	for i := 0; i < *workerCount; i++ {
 		w, err := worker.New(cfg, db, rdb, lo)
@@ -689,6 +695,10 @@ func runWorker(args []string) {
 		go func(workerNum int) {
 			lo.Info("Channel AI reply worker started", "worker_num", workerNum)
 			errCh <- w.RunChannelAIReplies(ctx)
+		}(i + 1)
+		go func(workerNum int) {
+			lo.Info("Threads credential refresh worker started", "worker_num", workerNum)
+			errCh <- w.RunThreadsCredentialRefresh(ctx)
 		}(i + 1)
 	}
 
@@ -780,6 +790,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// Public OAuth callback. Tenant and initiating admin identities are carried
 	// only in a one-time Redis state and are re-authorized by the handler.
 	g.GET("/api/integrations/google_search_console/callback", app.CallbackGoogleSearchConsole)
+	g.GET("/api/integrations/threads/callback", app.CallbackThreads)
 
 	// Webhook routes (public - for Meta)
 	g.GET("/api/webhook", app.WebhookVerify)
@@ -787,6 +798,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST(
 		"/api/webhooks/channels/{channel_account_id}",
 		app.RelayChannelWebhook,
+	)
+	g.GET(
+		"/api/webhooks/channels/{channel_account_id}",
+		app.VerifyChannelWebhook,
 	)
 
 	// WebSocket route (auth via message-based flow after upgrade)
@@ -813,7 +828,8 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		if len(path) >= 13 && path[:13] == "/api/auth/sso" {
 			return r
 		}
-		if path == "/api/integrations/google_search_console/callback" {
+		if path == "/api/integrations/google_search_console/callback" ||
+			path == "/api/integrations/threads/callback" {
 			return r
 		}
 		// Skip auth for custom action redirects (uses one-time token)

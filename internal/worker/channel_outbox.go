@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -24,9 +25,11 @@ const (
 )
 
 var (
-	errChannelOutboxUnlicensed = errors.New("omnichannel entitlement is not active")
-	errChannelOutboxConsent    = errors.New("contact consent does not permit delivery")
-	errChannelOutboxAIPolicy   = errors.New("automatic AI reply is no longer eligible")
+	errChannelOutboxUnlicensed        = errors.New("omnichannel entitlement is not active")
+	errChannelOutboxThreadsUnlicensed = errors.New("Threads public engagement entitlement is not active")
+	errChannelOutboxThreadsBinding    = errors.New("Threads app binding is not active")
+	errChannelOutboxConsent           = errors.New("contact consent does not permit delivery")
+	errChannelOutboxAIPolicy          = errors.New("automatic AI reply is no longer eligible")
 )
 
 // RunChannelOutbox runs the durable provider-neutral delivery loop until the
@@ -314,6 +317,23 @@ func (w *Worker) deliverChannelOutboxJob(
 			First(&account).Error; err != nil {
 			return err
 		}
+		if account.Channel == models.ChannelThreads {
+			threadsEntitled, err := hasDurableChannelOutboxEntitlement(
+				tx,
+				orgID,
+				channelapi.ThreadsPublicEngagementEntitlementKey,
+				now,
+			)
+			if err != nil {
+				return fmt.Errorf("evaluate Threads public engagement entitlement: %w", err)
+			}
+			if !threadsEntitled {
+				return errChannelOutboxThreadsUnlicensed
+			}
+			if err := validateThreadsChannelOutboxBinding(tx, orgID, &account); err != nil {
+				return err
+			}
+		}
 		if err := tx.
 			Where(
 				"id = ? AND organization_id = ? AND channel_account_id = ?",
@@ -347,7 +367,9 @@ func (w *Worker) deliverChannelOutboxJob(
 		return nil
 	})
 	if loadErr != nil {
-		if job.ID != uuid.Nil && errors.Is(loadErr, errChannelOutboxUnlicensed) {
+		if job.ID != uuid.Nil && (errors.Is(loadErr, errChannelOutboxUnlicensed) ||
+			errors.Is(loadErr, errChannelOutboxThreadsUnlicensed) ||
+			errors.Is(loadErr, errChannelOutboxThreadsBinding)) {
 			return w.failChannelOutboxJob(orgID, &job, workerID, loadErr, false)
 		}
 		if job.ID != uuid.Nil && errors.Is(loadErr, errChannelOutboxConsent) {
@@ -382,6 +404,17 @@ func (w *Worker) deliverChannelOutboxJob(
 	); err != nil {
 		return w.failChannelOutboxJob(orgID, &job, workerID, err, false)
 	}
+	if preparedSender, ok := adapter.(channelapi.PreparedSender); ok {
+		return w.deliverPreparedChannelOutboxJob(
+			ctx,
+			orgID,
+			&job,
+			&account,
+			workerID,
+			outbound,
+			preparedSender,
+		)
+	}
 	if isChannelAIReplyOutbox(&job, outbound) {
 		if err := w.recheckChannelAIOutboxDispatch(
 			orgID,
@@ -412,6 +445,270 @@ func (w *Worker) deliverChannelOutboxJob(
 		)
 	}
 	return w.completeChannelOutboxJob(orgID, &job, &account, workerID, result)
+}
+
+func validateThreadsChannelOutboxBinding(
+	tx *gorm.DB,
+	orgID uuid.UUID,
+	account *models.ChannelAccount,
+) error {
+	if tx == nil || account == nil || account.Channel != models.ChannelThreads ||
+		account.Provider != channelapi.ThreadsProvider {
+		return errChannelOutboxThreadsBinding
+	}
+	var integration models.ProviderIntegration
+	if err := tx.Where(
+		"organization_id = ? AND provider = ? AND enabled = ?",
+		orgID,
+		channelapi.ThreadsProvider,
+		true,
+	).First(&integration).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errChannelOutboxThreadsBinding
+		}
+		return fmt.Errorf("load Threads app binding: %w", err)
+	}
+	integrationAppID := strings.TrimSpace(channelOutboxText(integration.Config["app_id"]))
+	accountAppID := strings.TrimSpace(channelOutboxText(account.Metadata["app_id"]))
+	if integration.ThreadsAppID == nil || integrationAppID == "" || accountAppID == "" ||
+		strings.TrimSpace(*integration.ThreadsAppID) != integrationAppID ||
+		accountAppID != integrationAppID || len(account.Credentials) == 0 {
+		return errChannelOutboxThreadsBinding
+	}
+	credentialAppID := strings.TrimSpace(channelOutboxText(account.Credentials[0].Metadata["app_id"]))
+	if credentialAppID == "" || credentialAppID != integrationAppID {
+		return errChannelOutboxThreadsBinding
+	}
+	return nil
+}
+
+func channelOutboxText(value any) string {
+	if value == nil {
+		return ""
+	}
+	text, _ := value.(string)
+	return text
+}
+
+func (w *Worker) deliverPreparedChannelOutboxJob(
+	ctx context.Context,
+	orgID uuid.UUID,
+	job *models.OutboxJob,
+	account *models.ChannelAccount,
+	workerID string,
+	outbound channelapi.OutboundMessage,
+	sender channelapi.PreparedSender,
+) error {
+	if len(job.ProviderState) == 0 {
+		providerState, prepareErr := sender.PrepareSend(ctx, account, outbound)
+		if prepareErr != nil {
+			return w.failChannelOutboxJob(
+				orgID,
+				job,
+				workerID,
+				prepareErr,
+				retryableChannelError(prepareErr),
+			)
+		}
+		if len(providerState) == 0 {
+			return w.failChannelOutboxJob(
+				orgID,
+				job,
+				workerID,
+				&channelapi.ProviderError{
+					Operation: "prepare_send",
+					Provider:  account.Provider,
+					Code:      "prepared_state_missing",
+					Message:   "provider preparation completed without durable state",
+					Retryable: false,
+				},
+				false,
+			)
+		}
+		if err := w.persistChannelOutboxProviderState(
+			orgID,
+			job.ID,
+			workerID,
+			providerState,
+		); err != nil {
+			return err
+		}
+		job.ProviderState = providerState
+	}
+
+	if isChannelAIReplyOutbox(job, outbound) {
+		if err := w.recheckChannelAIOutboxDispatch(
+			orgID,
+			job.ID,
+			workerID,
+		); err != nil {
+			return w.cancelChannelAIOutboxJob(orgID, job, workerID, err)
+		}
+	} else {
+		fencedAccount, err := w.markChannelOutboxDispatching(
+			orgID,
+			job.ID,
+			account.ID,
+			workerID,
+		)
+		if err != nil {
+			return err
+		}
+		account = fencedAccount
+	}
+	job.Status = models.OutboxJobStatusDispatching
+
+	result, publishErr := sender.PublishPrepared(
+		ctx,
+		account,
+		outbound,
+		job.ProviderState,
+	)
+	if publishErr != nil {
+		// Publication is the externally visible step. Any transport error can
+		// mean that the provider committed even though its response was lost,
+		// so retrying here would risk creating a duplicate Threads reply.
+		return w.failChannelOutboxJob(orgID, job, workerID, publishErr, false)
+	}
+	if len(result.ProviderMessageIDs) == 0 {
+		return w.failChannelOutboxJob(
+			orgID,
+			job,
+			workerID,
+			errors.New("provider published the prepared request without a message ID"),
+			false,
+		)
+	}
+	return w.completeChannelOutboxJob(orgID, job, account, workerID, result)
+}
+
+func (w *Worker) persistChannelOutboxProviderState(
+	orgID, jobID uuid.UUID,
+	workerID string,
+	providerState models.JSONB,
+) error {
+	if len(providerState) == 0 {
+		return errors.New("channel outbox provider state is required")
+	}
+	return database.WithTenant(w.DB, orgID, func(tx *gorm.DB) error {
+		now := time.Now().UTC()
+		result := tx.Model(&models.OutboxJob{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ? AND locked_by = ?",
+				jobID,
+				orgID,
+				models.OutboxJobStatusProcessing,
+				workerID,
+			).
+			Updates(map[string]any{
+				"provider_state": providerState,
+				"locked_at":      now,
+				"updated_at":     now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("channel outbox preparation persistence lost its lease")
+		}
+		return nil
+	})
+}
+
+func (w *Worker) markChannelOutboxDispatching(
+	orgID, jobID, accountID uuid.UUID,
+	workerID string,
+) (*models.ChannelAccount, error) {
+	var fencedAccount models.ChannelAccount
+	err := database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
+		now := time.Now().UTC()
+		// Disconnect, OAuth rotation, refresh finalization, and dispatch all
+		// serialize on the account row before touching credentials or the job.
+		// Whichever transaction obtains this lock first owns the delivery fence.
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", accountID, orgID).
+			First(&fencedAccount).Error; err != nil {
+			return err
+		}
+		if fencedAccount.Status != models.ChannelAccountStatusActive ||
+			!channelOutboxBool(fencedAccount.Config, "outbound_enabled") {
+			return errors.New("channel account is no longer active for outbound delivery")
+		}
+
+		if fencedAccount.Channel == models.ChannelThreads {
+			if !strings.EqualFold(fencedAccount.Provider, channelapi.ThreadsProvider) {
+				return errChannelOutboxThreadsBinding
+			}
+			entitled, err := channelapi.HasDurableOmnichannelEntitlement(tx, orgID, now)
+			if err != nil {
+				return fmt.Errorf("evaluate omnichannel entitlement at dispatch fence: %w", err)
+			}
+			if !entitled {
+				return errChannelOutboxUnlicensed
+			}
+			threadsEntitled, err := hasDurableChannelOutboxEntitlement(
+				tx,
+				orgID,
+				channelapi.ThreadsPublicEngagementEntitlementKey,
+				now,
+			)
+			if err != nil {
+				return fmt.Errorf("evaluate Threads entitlement at dispatch fence: %w", err)
+			}
+			if !threadsEntitled {
+				return errChannelOutboxThreadsUnlicensed
+			}
+			if err := tx.Where(
+				"organization_id = ? AND channel_account_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+				orgID,
+				fencedAccount.ID,
+				[]models.ChannelCredentialStatus{
+					models.ChannelCredentialStatusActive,
+					models.ChannelCredentialStatusExpiring,
+				},
+				now,
+			).
+				Order("version DESC").
+				Order("id ASC").
+				Find(&fencedAccount.Credentials).Error; err != nil {
+				return err
+			}
+			if len(fencedAccount.Credentials) != 1 ||
+				fencedAccount.Credentials[0].Kind != models.ChannelCredentialKindOAuth {
+				return errChannelOutboxThreadsBinding
+			}
+			if err := validateThreadsChannelOutboxBinding(tx, orgID, &fencedAccount); err != nil {
+				return err
+			}
+		}
+
+		result := tx.Model(&models.OutboxJob{}).
+			Where(
+				"id = ? AND organization_id = ? AND channel_account_id = ? AND status = ? AND locked_by = ?",
+				jobID,
+				orgID,
+				fencedAccount.ID,
+				models.OutboxJobStatusProcessing,
+				workerID,
+			).
+			Where("provider_state IS NOT NULL AND provider_state <> '{}'::jsonb").
+			Updates(map[string]any{
+				"status":     models.OutboxJobStatusDispatching,
+				"locked_at":  now,
+				"updated_at": now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("channel outbox dispatch fence lost its lease")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &fencedAccount, nil
 }
 
 func isChannelAIReplyOutbox(
@@ -947,7 +1244,11 @@ func (w *Worker) channelOutboxAdapter(account *models.ChannelAccount) (channelap
 			Retryable: false,
 		}
 	}
-	if !strings.EqualFold(account.Provider, channelapi.RelayProvider) {
+	isThreads := account.Channel == models.ChannelThreads &&
+		strings.EqualFold(account.Provider, channelapi.ThreadsProvider)
+	isRelay := account.Channel != models.ChannelThreads &&
+		strings.EqualFold(account.Provider, channelapi.RelayProvider)
+	if !isThreads && !isRelay {
 		return nil, &channelapi.ProviderError{
 			Operation: "resolve_adapter",
 			Provider:  account.Provider,
@@ -969,11 +1270,145 @@ func (w *Worker) channelOutboxAdapter(account *models.ChannelAccount) (channelap
 			Retryable: true,
 		}
 	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	if isThreads {
+		return channelapi.NewThreadsAdapter(client, encryptionKey), nil
+	}
 	return channelapi.NewRelayAdapter(
 		account.Channel,
-		&http.Client{Timeout: 30 * time.Second},
+		client,
 		encryptionKey,
 	), nil
+}
+
+// hasDurableChannelOutboxEntitlement mirrors the durable commercial check used
+// by the request path, but accepts the product key needed by provider-specific
+// outbox jobs. The subscription must itself be current; an override cannot
+// reopen an expired subscription.
+func hasDurableChannelOutboxEntitlement(
+	db *gorm.DB,
+	organizationID uuid.UUID,
+	key string,
+	now time.Time,
+) (bool, error) {
+	if db == nil {
+		return false, errors.New("database is required")
+	}
+	if organizationID == uuid.Nil {
+		return false, errors.New("organization ID is required")
+	}
+	if strings.TrimSpace(key) == "" {
+		return false, errors.New("entitlement key is required")
+	}
+	now = now.UTC()
+
+	var subscription models.Subscription
+	err := db.
+		Where("organization_id = ?", organizationID).
+		Order("created_at DESC").
+		First(&subscription).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !channelOutboxSubscriptionPermitsEntitlement(&subscription, now) {
+		return false, nil
+	}
+
+	value, exists := subscription.EntitlementsSnapshot[key]
+	allowed := exists && channelOutboxEntitlementAllows(value)
+
+	var override models.EntitlementOverride
+	err = db.
+		Where(
+			"organization_id = ? AND key = ? AND is_active = ? AND starts_at <= ? AND (expires_at IS NULL OR expires_at > ?)",
+			organizationID,
+			key,
+			true,
+			now,
+			now,
+		).
+		Order("starts_at DESC, created_at DESC").
+		First(&override).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return allowed, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return channelOutboxEntitlementAllows(
+		channelOutboxEntitlementOverrideValue(override.Value),
+	), nil
+}
+
+func channelOutboxSubscriptionPermitsEntitlement(
+	subscription *models.Subscription,
+	now time.Time,
+) bool {
+	if subscription == nil {
+		return false
+	}
+	switch subscription.Status {
+	case models.SubscriptionStatusActive:
+		return (subscription.CurrentPeriodEnd != nil && subscription.CurrentPeriodEnd.After(now)) ||
+			(subscription.GraceUntil != nil && subscription.GraceUntil.After(now))
+	case models.SubscriptionStatusTrialing:
+		return subscription.TrialEndsAt != nil && subscription.TrialEndsAt.After(now)
+	case models.SubscriptionStatusPastDue:
+		return subscription.GraceUntil != nil && subscription.GraceUntil.After(now)
+	default:
+		return false
+	}
+}
+
+func channelOutboxEntitlementOverrideValue(value models.JSONB) any {
+	if len(value) == 1 {
+		if scalar, ok := value["value"]; ok {
+			return scalar
+		}
+	}
+	return value
+}
+
+func channelOutboxEntitlementAllows(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case int:
+		return typed > 0
+	case int32:
+		return typed > 0
+	case int64:
+		return typed > 0
+	case float32:
+		return !math.IsNaN(float64(typed)) && typed > 0
+	case float64:
+		return !math.IsNaN(typed) && typed > 0
+	case json.Number:
+		number, err := typed.Float64()
+		return err == nil && !math.IsNaN(number) && number > 0
+	case string:
+		normalized := strings.ToLower(strings.TrimSpace(typed))
+		return normalized != "" &&
+			normalized != "0" &&
+			normalized != "false" &&
+			normalized != "disabled" &&
+			normalized != "none"
+	case models.JSONB:
+		if nested, ok := typed["value"]; ok {
+			return channelOutboxEntitlementAllows(nested)
+		}
+		if enabled, ok := typed["enabled"]; ok {
+			return channelOutboxEntitlementAllows(enabled)
+		}
+		return len(typed) > 0
+	case map[string]any:
+		return channelOutboxEntitlementAllows(models.JSONB(typed))
+	default:
+		return value != nil
+	}
 }
 
 func decodeChannelOutboxPayload(payload models.JSONB, destination any) error {
