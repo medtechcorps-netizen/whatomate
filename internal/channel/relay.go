@@ -128,6 +128,11 @@ func defaultRelayCapabilities(channel models.Channel) Capabilities {
 		// Meta relay accounts start text-only. Additional capabilities require
 		// an explicit, reviewed account configuration.
 		return Capabilities{Text: true, ServiceWindow: true}
+	case models.ChannelEmail:
+		// The signed Gmail relay starts with reply-only text support. Email
+		// media, read receipts, typing, CC, and new-message composition must
+		// not be advertised until the relay implements them end to end.
+		return Capabilities{Text: true, Replies: true}
 	default:
 		return Capabilities{
 			Text:         true,

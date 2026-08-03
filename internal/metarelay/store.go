@@ -12,6 +12,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+const outboundProcessingStaleAfter = 2 * time.Minute
+
 var (
 	acceptInboundScript = redis.NewScript(`
 if redis.call("EXISTS", KEYS[1]) == 1 then
@@ -115,6 +117,19 @@ if decoded["digest"] ~= ARGV[1] or decoded["state"] ~= "processing" then
 	return 0
 end
 redis.call("DEL", KEYS[1])
+return 1
+`)
+
+	resolveAmbiguousOutboundScript = redis.NewScript(`
+local current = redis.call("GET", KEYS[1])
+if not current then
+	return 0
+end
+local decoded = cjson.decode(current)
+if decoded["digest"] ~= ARGV[1] or decoded["state"] ~= "ambiguous" then
+	return -1
+end
+redis.call("SET", KEYS[1], ARGV[2], "EX", ARGV[3])
 return 1
 `)
 )
@@ -362,6 +377,17 @@ func (s *RedisStore) ClaimOutbound(ctx context.Context, key, digest string, now 
 	case "ambiguous":
 		return OutboundClaim{State: OutboundClaimAmbiguous}, nil
 	case "processing":
+		if record.StartedAt > 0 &&
+			now.UTC().Sub(time.UnixMilli(record.StartedAt)) >= outboundProcessingStaleAfter {
+			// A crashed process must not leave a claim in flight for the full
+			// retention window. Move it to ambiguous rather than acquiring it:
+			// provider-specific reconciliation can settle a prior success without
+			// ever repeating the side effect blindly.
+			if err := s.MarkOutboundAmbiguous(ctx, key, digest); err != nil {
+				return OutboundClaim{}, err
+			}
+			return OutboundClaim{State: OutboundClaimAmbiguous}, nil
+		}
 		return OutboundClaim{State: OutboundClaimInFlight}, nil
 	default:
 		return OutboundClaim{}, errors.New("outbound idempotency record has an invalid state")
@@ -439,6 +465,41 @@ func (s *RedisStore) MarkOutboundAmbiguous(ctx context.Context, key, digest stri
 	).Int()
 	if err != nil {
 		return fmt.Errorf("mark outbound delivery ambiguous: %w", err)
+	}
+	if updated != 1 {
+		return ErrOutboundStoreFailure
+	}
+	return nil
+}
+
+// ResolveOutboundAmbiguous completes an ambiguous provider call only after a
+// provider-specific reconciliation has found the deterministic message. It
+// never reopens an ambiguous claim for another side effect.
+func (s *RedisStore) ResolveOutboundAmbiguous(
+	ctx context.Context,
+	key, digest string,
+	status int,
+	result []byte,
+) error {
+	record, err := json.Marshal(outboundRecord{
+		Digest: digest,
+		State:  "completed",
+		Status: status,
+		Result: append(json.RawMessage(nil), result...),
+	})
+	if err != nil {
+		return fmt.Errorf("encode reconciled outbound result: %w", err)
+	}
+	updated, err := resolveAmbiguousOutboundScript.Run(
+		ctx,
+		s.client,
+		[]string{s.outboundKey(key)},
+		digest,
+		record,
+		durationSeconds(s.outboundRetention),
+	).Int()
+	if err != nil {
+		return fmt.Errorf("resolve ambiguous outbound delivery: %w", err)
 	}
 	if updated != 1 {
 		return ErrOutboundStoreFailure

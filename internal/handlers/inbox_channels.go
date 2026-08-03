@@ -459,6 +459,10 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 
 	now := time.Now().UTC()
 	messageID := uuid.New()
+	outboundSubject := strings.TrimSpace(request.Subject)
+	if outboundSubject == "" && conversation.Channel == models.ChannelEmail {
+		outboundSubject = strings.TrimSpace(conversation.Subject)
+	}
 	outbound := channelapi.OutboundMessage{
 		OrganizationID: orgID,
 		MessageID:      messageID,
@@ -467,7 +471,7 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 		Conversation: channelapi.ConversationRef{
 			ID:         conversation.ID,
 			ExternalID: conversation.ExternalConversationID,
-			Subject:    request.Subject,
+			Subject:    outboundSubject,
 		},
 		Recipient: channelapi.Participant{
 			ID:          conversation.ContactID,
@@ -477,7 +481,7 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 			Role:        models.ConversationParticipantRoleCustomer,
 		},
 		CC:                  request.CC,
-		Subject:             request.Subject,
+		Subject:             outboundSubject,
 		Parts:               request.Parts,
 		ReplyToExternalID:   request.ReplyToExternalID,
 		ServiceWindowEndsAt: conversation.ServiceWindowEndsAt,
