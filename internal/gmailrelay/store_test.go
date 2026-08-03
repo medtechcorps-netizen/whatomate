@@ -199,12 +199,20 @@ func TestRedisStoreFailsClosedForPlaintextOrWrongKey(t *testing.T) {
 }
 
 func TestRedisStoreReplacesOnlyTheStillCurrentRefreshToken(t *testing.T) {
-	store, _, _ := testRedisStore(t)
+	store, backend, _ := testRedisStore(t)
 	ctx := context.Background()
 	if err := store.SaveRefreshToken(ctx, "current-refresh-token"); err != nil {
 		t.Fatalf("save refresh token: %v", err)
 	}
-	replaced, err := store.ReplaceRefreshToken(ctx, "wrong-refresh-token", "replacement-refresh-token")
+	stored := backend.values[store.refreshTokenKey()]
+	replaced, err := store.ReplaceRefreshToken(ctx, "current-refresh-token", "current-refresh-token")
+	if err != nil || !replaced {
+		t.Fatalf("compare unchanged token: replaced=%t err=%v", replaced, err)
+	}
+	if backend.values[store.refreshTokenKey()] != stored {
+		t.Fatal("unchanged refresh token was unnecessarily re-encrypted")
+	}
+	replaced, err = store.ReplaceRefreshToken(ctx, "wrong-refresh-token", "replacement-refresh-token")
 	if err != nil || replaced {
 		t.Fatalf("replace mismatched token: replaced=%t err=%v", replaced, err)
 	}

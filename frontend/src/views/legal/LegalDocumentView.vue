@@ -446,7 +446,7 @@ const documents: Record<DocumentKey, LegalDocument> = {
     eyebrow: 'Privacy request',
     title: 'Data Deletion Instructions',
     summary: 'A clear process for requesting deletion of eligible ReReply account, CRM and conversation data.',
-    updated: 'Effective 28 July 2026',
+    updated: 'Effective 3 August 2026',
     readingTime: '5 minute read',
     icon: Trash2,
     sections: deletionSections

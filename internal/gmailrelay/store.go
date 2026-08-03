@@ -283,9 +283,12 @@ func (s *RedisStore) ReplaceRefreshToken(
 	if plaintext != currentToken {
 		return false, nil
 	}
-	replacement, err := appcrypto.Encrypt(replacementToken, s.encryptionKey)
-	if err != nil || !appcrypto.IsEncrypted(replacement) {
-		return false, errors.New("encrypt replacement Gmail refresh token")
+	replacement := stored
+	if replacementToken != currentToken {
+		replacement, err = appcrypto.Encrypt(replacementToken, s.encryptionKey)
+		if err != nil || !appcrypto.IsEncrypted(replacement) {
+			return false, errors.New("encrypt replacement Gmail refresh token")
+		}
 	}
 	replaced, err := s.backend.CompareAndSet(ctx, s.refreshTokenKey(), stored, replacement)
 	if err != nil {
