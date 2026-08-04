@@ -79,21 +79,23 @@ type integrationOAuthResponse struct {
 // IntegrationResponse is deliberately composed from safe fields rather than
 // serializing persistence models. Credential values never enter this type.
 type IntegrationResponse struct {
-	Provider         string                                   `json:"provider"`
-	DisplayName      string                                   `json:"display_name"`
-	Status           string                                   `json:"status"`
-	Enabled          bool                                     `json:"enabled"`
-	Configured       bool                                     `json:"configured"`
-	ReadOnly         bool                                     `json:"read_only"`
-	Config           models.JSONB                             `json:"config"`
-	Credentials      map[string]integrationCredentialResponse `json:"credentials"`
-	Connection       integrationConnectionResponse            `json:"connection"`
-	OAuth            integrationOAuthResponse                 `json:"oauth"`
-	TestSupported    bool                                     `json:"test_supported"`
-	Message          string                                   `json:"message,omitempty"`
-	RequiredScopes   []string                                 `json:"required_scopes,omitempty"`
-	LastTestedAt     *time.Time                               `json:"last_tested_at,omitempty"`
-	credentialUsable bool
+	Provider           string                                   `json:"provider"`
+	DisplayName        string                                   `json:"display_name"`
+	Status             string                                   `json:"status"`
+	Enabled            bool                                     `json:"enabled"`
+	Configured         bool                                     `json:"configured"`
+	ReadOnly           bool                                     `json:"read_only"`
+	Config             models.JSONB                             `json:"config"`
+	Credentials        map[string]integrationCredentialResponse `json:"credentials"`
+	Connection         integrationConnectionResponse            `json:"connection"`
+	ChannelConnections map[string]integrationConnectionResponse `json:"channel_connections,omitempty"`
+	IntendedChannels   *[]string                                `json:"intended_channels,omitempty"`
+	OAuth              integrationOAuthResponse                 `json:"oauth"`
+	TestSupported      bool                                     `json:"test_supported"`
+	Message            string                                   `json:"message,omitempty"`
+	RequiredScopes     []string                                 `json:"required_scopes,omitempty"`
+	LastTestedAt       *time.Time                               `json:"last_tested_at,omitempty"`
+	credentialUsable   bool
 }
 
 type updateIntegrationRequest struct {
@@ -115,6 +117,8 @@ type integrationSources struct {
 	rows                   map[string]*models.ProviderIntegration
 	copilot                *models.CopilotSettings
 	connections            map[string]integrationConnectionResponse
+	channelConnections     map[string]integrationConnectionResponse
+	intendedChannels       *[]string
 	metaLegacyWebhookToken bool
 }
 
@@ -432,9 +436,21 @@ func (a *App) loadIntegrationSources(orgID uuid.UUID) (*integrationSources, erro
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
 	}
-	connections, err := a.integrationConnectionSummaries(orgID)
+	connections, channelConnections, err := a.integrationConnectionSummaries(orgID)
 	if err != nil {
 		return nil, err
+	}
+	intended, declared, err := productCommercialWorkspaceIntendedChannels(a.DB, orgID)
+	if err != nil {
+		return nil, err
+	}
+	var intendedChannels *[]string
+	if declared {
+		values := make([]string, len(intended))
+		for index := range intended {
+			values[index] = string(intended[index])
+		}
+		intendedChannels = &values
 	}
 	var legacyWebhookTokenCount int64
 	if err := a.DB.Model(&models.WhatsAppAccount{}).
@@ -447,6 +463,8 @@ func (a *App) loadIntegrationSources(orgID uuid.UUID) (*integrationSources, erro
 		rows:                   rows,
 		copilot:                copilot,
 		connections:            connections,
+		channelConnections:     channelConnections,
+		intendedChannels:       intendedChannels,
 		metaLegacyWebhookToken: legacyWebhookTokenCount > 0,
 	}, nil
 }
@@ -454,13 +472,14 @@ func (a *App) loadIntegrationSources(orgID uuid.UUID) (*integrationSources, erro
 func (a *App) composeIntegrationResponse(provider string, sources *integrationSources) IntegrationResponse {
 	row := sources.rows[provider]
 	response := IntegrationResponse{
-		Provider:    provider,
-		DisplayName: integrationDisplayName(provider),
-		Status:      integrationStatusNotConfigured,
-		Config:      models.JSONB{},
-		Credentials: map[string]integrationCredentialResponse{},
-		Connection:  sources.connections[provider],
-		OAuth:       integrationOAuthResponse{},
+		Provider:         provider,
+		DisplayName:      integrationDisplayName(provider),
+		Status:           integrationStatusNotConfigured,
+		Config:           models.JSONB{},
+		Credentials:      map[string]integrationCredentialResponse{},
+		Connection:       sources.connections[provider],
+		IntendedChannels: sources.intendedChannels,
+		OAuth:            integrationOAuthResponse{},
 	}
 	if row != nil {
 		response.Enabled = row.Enabled
@@ -469,6 +488,11 @@ func (a *App) composeIntegrationResponse(provider string, sources *integrationSo
 
 	switch provider {
 	case integrationProviderMeta:
+		response.ChannelConnections = map[string]integrationConnectionResponse{
+			string(models.ChannelWhatsApp):  sources.channelConnections[string(models.ChannelWhatsApp)],
+			string(models.ChannelInstagram): sources.channelConnections[string(models.ChannelInstagram)],
+			string(models.ChannelMessenger): sources.channelConnections[string(models.ChannelMessenger)],
+		}
 		workspaceManaged := metaWorkspaceAppManaged(&sources.organization)
 		appID, configID, secretConfigured, secretSource := a.metaIntegrationValues(&sources.organization)
 		webhookCredential, webhookCredentialUsable := a.metaWebhookIntegrationCredential(
@@ -666,7 +690,13 @@ func connectionOnlyStatus(connection integrationConnectionResponse) string {
 	return integrationStatusConnected
 }
 
-func (a *App) integrationConnectionSummaries(orgID uuid.UUID) (map[string]integrationConnectionResponse, error) {
+func (a *App) integrationConnectionSummaries(
+	orgID uuid.UUID,
+) (
+	map[string]integrationConnectionResponse,
+	map[string]integrationConnectionResponse,
+	error,
+) {
 	result := map[string]integrationConnectionResponse{
 		integrationProviderMeta:                {},
 		integrationProviderThreads:             {},
@@ -676,32 +706,45 @@ func (a *App) integrationConnectionSummaries(orgID uuid.UUID) (map[string]integr
 		integrationProviderEmail:               {},
 		integrationProviderWebchat:             {},
 	}
+	byChannel := map[string]integrationConnectionResponse{
+		string(models.ChannelWhatsApp):  {},
+		string(models.ChannelInstagram): {},
+		string(models.ChannelMessenger): {},
+		string(models.ChannelThreads):   {},
+		string(models.ChannelEmail):     {},
+		string(models.ChannelWebChat):   {},
+	}
 	var whatsAppAccounts []models.WhatsAppAccount
 	if err := a.DB.Where("organization_id = ?", orgID).Find(&whatsAppAccounts).Error; err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	meta := result[integrationProviderMeta]
+	whatsApp := byChannel[string(models.ChannelWhatsApp)]
 	for index := range whatsAppAccounts {
 		meta.AccountCount++
+		whatsApp.AccountCount++
 		if strings.EqualFold(whatsAppAccounts[index].Status, "active") {
 			meta.ActiveCount++
+			whatsApp.ActiveCount++
 		} else {
 			meta.PendingCount++
+			whatsApp.PendingCount++
 		}
 	}
 	result[integrationProviderMeta] = meta
+	byChannel[string(models.ChannelWhatsApp)] = whatsApp
 
 	var googlePropertyCount int64
 	if err := a.DB.Model(&models.GoogleSearchConsoleProperty{}).
 		Where("organization_id = ? AND available = ?", orgID, true).
 		Count(&googlePropertyCount).Error; err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var selectedGooglePropertyCount int64
 	if err := a.DB.Model(&models.GoogleSearchConsoleProperty{}).
 		Where("organization_id = ? AND available = ? AND selected = ?", orgID, true, true).
 		Count(&selectedGooglePropertyCount).Error; err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	googleConnection := result[integrationProviderGoogleSearchConsole]
 	googleConnection.AccountCount = int(googlePropertyCount)
@@ -711,10 +754,21 @@ func (a *App) integrationConnectionSummaries(orgID uuid.UUID) (map[string]integr
 
 	var accounts []models.ChannelAccount
 	if err := a.DB.Where("organization_id = ?", orgID).Find(&accounts).Error; err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for index := range accounts {
 		account := &accounts[index]
+		// WhatsApp meta_legacy rows mirror the established WhatsApp account and
+		// must not be counted as a second channel or provider connection.
+		if account.Provider == channelapi.LegacyMetaProvider {
+			continue
+		}
+		channelKey := string(account.Channel)
+		channelConnection, exists := byChannel[channelKey]
+		if exists {
+			channelConnection = summarizeChannelAccountConnection(channelConnection, account)
+			byChannel[channelKey] = channelConnection
+		}
 		provider := string(account.Channel)
 		if account.Channel == models.ChannelInstagram || account.Channel == models.ChannelMessenger {
 			provider = integrationProviderMeta
@@ -723,21 +777,29 @@ func (a *App) integrationConnectionSummaries(orgID uuid.UUID) (map[string]integr
 		if !exists {
 			continue
 		}
-		connection.AccountCount++
-		if account.Status == models.ChannelAccountStatusActive {
-			connection.ActiveCount++
-		} else {
-			connection.PendingCount++
-		}
-		connection.LastHealthCheckAt = newestTime(connection.LastHealthCheckAt, account.LastHealthCheckAt)
-		connection.LastInboundAt = newestTime(connection.LastInboundAt, account.LastInboundAt)
-		connection.LastOutboundAt = newestTime(connection.LastOutboundAt, account.LastOutboundAt)
-		if account.LastError != "" {
-			connection.LastError = "Connection needs attention"
-		}
+		connection = summarizeChannelAccountConnection(connection, account)
 		result[provider] = connection
 	}
-	return result, nil
+	return result, byChannel, nil
+}
+
+func summarizeChannelAccountConnection(
+	connection integrationConnectionResponse,
+	account *models.ChannelAccount,
+) integrationConnectionResponse {
+	connection.AccountCount++
+	if account.Status == models.ChannelAccountStatusActive {
+		connection.ActiveCount++
+	} else {
+		connection.PendingCount++
+	}
+	connection.LastHealthCheckAt = newestTime(connection.LastHealthCheckAt, account.LastHealthCheckAt)
+	connection.LastInboundAt = newestTime(connection.LastInboundAt, account.LastInboundAt)
+	connection.LastOutboundAt = newestTime(connection.LastOutboundAt, account.LastOutboundAt)
+	if account.LastError != "" {
+		connection.LastError = "Connection needs attention"
+	}
+	return connection
 }
 
 func newestTime(current, candidate *time.Time) *time.Time {

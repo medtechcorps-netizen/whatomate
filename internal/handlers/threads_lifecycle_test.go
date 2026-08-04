@@ -566,7 +566,7 @@ func newThreadsLifecycleFixture(t *testing.T, withAccounts bool) threadsLifecycl
 		organization.ID,
 		admin.ID,
 		appID,
-		threadsLifecycleTestUserID,
+		appID+"1",
 		"Threads @target-secret-username",
 	)
 	fixture.TargetOAuth = createThreadsLifecycleCredential(
@@ -591,7 +591,7 @@ func newThreadsLifecycleFixture(t *testing.T, withAccounts bool) threadsLifecycl
 		organization.ID,
 		admin.ID,
 		appID,
-		"7766554433221100",
+		appID+"2",
 		"Threads @other-account",
 	)
 	fixture.OtherOAuth = createThreadsLifecycleCredential(

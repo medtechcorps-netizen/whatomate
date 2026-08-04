@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -181,13 +182,14 @@ type OnboardingStepResponse struct {
 
 // OnboardingResponse is a safe projection of OrganizationOnboarding.
 type OnboardingResponse struct {
-	ID              *uuid.UUID               `json:"id,omitempty"`
-	Vertical        string                   `json:"vertical"`
-	Status          models.OnboardingStatus  `json:"status"`
-	CurrentStep     string                   `json:"current_step,omitempty"`
-	ProgressPercent int                      `json:"progress_percent"`
-	Steps           []OnboardingStepResponse `json:"steps"`
-	Profile         models.JSONB             `json:"profile"`
+	ID                *uuid.UUID               `json:"id,omitempty"`
+	Vertical          string                   `json:"vertical"`
+	Status            models.OnboardingStatus  `json:"status"`
+	ProvisioningState string                   `json:"provisioning_state"`
+	CurrentStep       string                   `json:"current_step,omitempty"`
+	ProgressPercent   int                      `json:"progress_percent"`
+	Steps             []OnboardingStepResponse `json:"steps"`
+	Profile           models.JSONB             `json:"profile"`
 }
 
 // UpdateOnboardingProfileRequest replaces the business profile used by provisioning.
@@ -406,6 +408,15 @@ type builtInWorkspaceTemplate struct {
 
 var productBuiltInWorkspaceTemplates = productCommercialBuildBuiltInTemplates()
 
+var productCommercialIntendedChannelOrder = []models.Channel{
+	models.ChannelWhatsApp,
+	models.ChannelInstagram,
+	models.ChannelMessenger,
+	models.ChannelThreads,
+	models.ChannelEmail,
+	models.ChannelWebChat,
+}
+
 type productOnboardingStepDefinition struct {
 	key         string
 	label       string
@@ -418,8 +429,15 @@ var productOnboardingStepDefinitions = []productOnboardingStepDefinition{
 	{
 		key:         "workspace_profile",
 		label:       "Confirm your workspace profile",
-		description: "Add the business identity, vertical and operating timezone.",
+		description: "Add the business identity, operating timezone and channels required at launch.",
 		actionPath:  "/launchpad#workspace-profile",
+	},
+	{
+		key:         "license_assigned",
+		label:       "Assign the workspace license",
+		description: "Activate the intended commercial plan for this exact workspace.",
+		inferred:    true,
+		actionPath:  "/upgrade-workspace",
 	},
 	{
 		key:         "vertical_template",
@@ -429,8 +447,8 @@ var productOnboardingStepDefinitions = []productOnboardingStepDefinition{
 	},
 	{
 		key:         "channel_connected",
-		label:       "Connect a customer channel",
-		description: "Activate WhatsApp or another approved channel.",
+		label:       "Connect every intended customer channel",
+		description: "Authorize and test every channel selected in the workspace profile.",
 		inferred:    true,
 		actionPath:  "/inbox",
 	},
@@ -1272,7 +1290,80 @@ func productCommercialValidateProfile(profile models.JSONB) error {
 		}
 		profile["vertical"] = vertical
 	}
+	if rawChannels, declared := profile["intended_channels"]; declared {
+		channels, err := productCommercialNormalizeIntendedChannels(rawChannels)
+		if err != nil {
+			return err
+		}
+		if len(channels) == 0 {
+			return errors.New("intended_channels must contain at least one supported channel")
+		}
+		normalized := make([]string, len(channels))
+		for index := range channels {
+			normalized[index] = string(channels[index])
+		}
+		profile["intended_channels"] = normalized
+	}
 	return nil
+}
+
+func productCommercialNormalizeIntendedChannels(value any) ([]models.Channel, error) {
+	var values []string
+	switch typed := value.(type) {
+	case []string:
+		values = append(values, typed...)
+	case []any:
+		values = make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				return nil, errors.New("intended_channels must contain only channel names")
+			}
+			values = append(values, text)
+		}
+	case nil:
+		return []models.Channel{}, nil
+	default:
+		return nil, errors.New("intended_channels must be an array of channel names")
+	}
+
+	requested := make(map[models.Channel]struct{}, len(values))
+	for _, value := range values {
+		channel := models.Channel(strings.ToLower(strings.TrimSpace(value)))
+		supported := false
+		for _, candidate := range productCommercialIntendedChannelOrder {
+			if channel == candidate {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			return nil, fmt.Errorf("unsupported intended channel %q", value)
+		}
+		requested[channel] = struct{}{}
+	}
+
+	channels := make([]models.Channel, 0, len(requested))
+	for _, channel := range productCommercialIntendedChannelOrder {
+		if _, exists := requested[channel]; exists {
+			channels = append(channels, channel)
+		}
+	}
+	return channels, nil
+}
+
+func productCommercialIntendedChannels(
+	profile models.JSONB,
+) ([]models.Channel, bool, error) {
+	if profile == nil {
+		return nil, false, nil
+	}
+	value, declared := profile["intended_channels"]
+	if !declared {
+		return nil, false, nil
+	}
+	channels, err := productCommercialNormalizeIntendedChannels(value)
+	return channels, true, err
 }
 
 func productCommercialProfileComplete(profile models.JSONB) bool {
@@ -1290,6 +1381,9 @@ func productCommercialProfileComplete(profile models.JSONB) bool {
 	}
 	timezone := strings.TrimSpace(productCommercialString(profile["timezone"]))
 	if businessName == "" || timezone == "" {
+		return false
+	}
+	if channels, declared, err := productCommercialIntendedChannels(profile); err != nil || (declared && len(channels) == 0) {
 		return false
 	}
 	_, err := time.LoadLocation(timezone)
@@ -1391,17 +1485,113 @@ func productCommercialLoadOrCreateOnboarding(
 	return &onboarding, nil
 }
 
+func productCommercialReadyChannels(
+	db *gorm.DB,
+	orgID uuid.UUID,
+) (map[models.Channel]bool, error) {
+	ready := make(map[models.Channel]bool, len(productCommercialIntendedChannelOrder))
+	if db.Migrator().HasTable("whatsapp_accounts") {
+		var whatsAppCount int64
+		if err := db.Table("whatsapp_accounts").
+			Where("organization_id = ? AND status = ? AND deleted_at IS NULL", orgID, "active").
+			Count(&whatsAppCount).Error; err != nil {
+			return nil, err
+		}
+		ready[models.ChannelWhatsApp] = whatsAppCount > 0
+	}
+	if db.Migrator().HasTable("channel_accounts") {
+		var rows []struct {
+			Channel models.Channel `gorm:"column:channel"`
+		}
+		if err := db.Table("channel_accounts").
+			Select("DISTINCT channel").
+			Where(
+				"organization_id = ? AND status = ? AND deleted_at IS NULL AND provider <> ? AND LOWER(COALESCE(config->>'outbound_enabled', 'false')) = 'true' AND last_health_check_at IS NOT NULL AND COALESCE(last_error, '') = ''",
+				orgID,
+				models.ChannelAccountStatusActive,
+				"meta_legacy",
+			).
+			Scan(&rows).Error; err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			ready[row.Channel] = true
+		}
+	}
+	return ready, nil
+}
+
+func productCommercialWorkspaceIntendedChannels(
+	db *gorm.DB,
+	orgID uuid.UUID,
+) ([]models.Channel, bool, error) {
+	var onboarding models.OrganizationOnboarding
+	err := db.Select("input").
+		Where("organization_id = ?", orgID).
+		First(&onboarding).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return productCommercialIntendedChannels(onboarding.Input)
+}
+
+func productCommercialChannelLabel(channel models.Channel) string {
+	switch channel {
+	case models.ChannelWhatsApp:
+		return "WhatsApp"
+	case models.ChannelInstagram:
+		return "Instagram"
+	case models.ChannelMessenger:
+		return "Messenger"
+	case models.ChannelThreads:
+		return "Threads"
+	case models.ChannelEmail:
+		return "email"
+	case models.ChannelWebChat:
+		return "web chat"
+	default:
+		return string(channel)
+	}
+}
+
 func productCommercialOnboardingSignals(
 	db *gorm.DB,
 	orgID uuid.UUID,
 	onboarding *models.OrganizationOnboarding,
 ) (map[string]bool, error) {
 	signals := map[string]bool{}
+	var onboardingProfile models.JSONB
 	if onboarding != nil {
+		onboardingProfile = onboarding.Input
 		signals["workspace_profile"] =
 			productCommercialJSONBool(onboarding.Checklist, "workspace_profile") &&
 				productCommercialProfileComplete(onboarding.Input)
 		signals["go_live"] = productCommercialJSONBool(onboarding.Checklist, "go_live")
+	}
+	intendedChannels, declared, err := productCommercialIntendedChannels(onboardingProfile)
+	if err != nil {
+		return nil, err
+	}
+
+	var subscription models.Subscription
+	if err := productCommercialLoadCurrentSubscription(db, orgID, &subscription); err == nil {
+		licenseReady, licenseErr := productCommercialLicenseReadyForChannels(
+			db,
+			orgID,
+			&subscription,
+			intendedChannels,
+			declared,
+			time.Now().UTC(),
+		)
+		if licenseErr != nil {
+			return nil, licenseErr
+		}
+		signals["license_assigned"] = licenseReady
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
 	}
 
 	var templateCount int64
@@ -1416,29 +1606,27 @@ func productCommercialOnboardingSignals(
 	}
 	signals["vertical_template"] = templateCount > 0
 
-	var connectedChannels int64
-	if db.Migrator().HasTable("whatsapp_accounts") {
-		if err := db.Table("whatsapp_accounts").
-			Where("organization_id = ? AND status = ? AND deleted_at IS NULL", orgID, "active").
-			Count(&connectedChannels).Error; err != nil {
-			return nil, err
+	readyChannels, err := productCommercialReadyChannels(db, orgID)
+	if err != nil {
+		return nil, err
+	}
+	if declared {
+		allReady := len(intendedChannels) > 0
+		for _, channel := range intendedChannels {
+			if !readyChannels[channel] {
+				allReady = false
+				break
+			}
+		}
+		signals["channel_connected"] = allReady
+	} else {
+		for _, connected := range readyChannels {
+			if connected {
+				signals["channel_connected"] = true
+				break
+			}
 		}
 	}
-	if db.Migrator().HasTable("channel_accounts") {
-		var additionalChannels int64
-		if err := db.Table("channel_accounts").
-			Where(
-				"organization_id = ? AND status = ? AND deleted_at IS NULL AND provider <> ? AND LOWER(COALESCE(config->>'outbound_enabled', 'false')) = 'true'",
-				orgID,
-				"active",
-				"meta_legacy",
-			).
-			Count(&additionalChannels).Error; err != nil {
-			return nil, err
-		}
-		connectedChannels += additionalChannels
-	}
-	signals["channel_connected"] = connectedChannels > 0
 
 	var userCount int64
 	if err := db.Table("users").
@@ -1463,6 +1651,73 @@ func productCommercialOnboardingSignals(
 	}
 	signals["privacy_baseline"] = retentionCount > 0
 	return signals, nil
+}
+
+func productCommercialLicenseReadyForChannels(
+	db *gorm.DB,
+	orgID uuid.UUID,
+	subscription *models.Subscription,
+	intendedChannels []models.Channel,
+	declared bool,
+	now time.Time,
+) (bool, error) {
+	if !productCommercialSubscriptionPermitsFeatures(subscription, now) {
+		return false, nil
+	}
+	// Preserve the historical onboarding behavior for existing workspaces that
+	// predate intended-channel declarations. New workspaces declare the list
+	// explicitly and therefore fail closed until at least one channel is chosen.
+	if !declared {
+		return true, nil
+	}
+	if len(intendedChannels) == 0 {
+		return false, nil
+	}
+
+	omnichannelAllowed, err := productCommercialSubscriptionAllowsEntitlement(
+		db,
+		orgID,
+		subscription,
+		channelapi.OmnichannelEntitlementKey,
+		now,
+	)
+	if err != nil || !omnichannelAllowed {
+		return false, err
+	}
+	for _, channel := range intendedChannels {
+		if channel != models.ChannelThreads {
+			continue
+		}
+		return productCommercialSubscriptionAllowsEntitlement(
+			db,
+			orgID,
+			subscription,
+			channelapi.ThreadsPublicEngagementEntitlementKey,
+			now,
+		)
+	}
+	return true, nil
+}
+
+func productCommercialSubscriptionAllowsEntitlement(
+	db *gorm.DB,
+	orgID uuid.UUID,
+	subscription *models.Subscription,
+	key string,
+	now time.Time,
+) (bool, error) {
+	if !productCommercialSubscriptionPermitsFeatures(subscription, now) {
+		return false, nil
+	}
+	allowed := productCommercialEntitlementAllows(subscription.EntitlementsSnapshot[key])
+	override, err := productCommercialActiveOverride(db, orgID, key, now)
+	if err != nil {
+		return false, err
+	}
+	if override != nil {
+		allowed = productCommercialEntitlementAllows(override.Value)
+	}
+	return allowed, nil
 }
 
 func productCommercialBuildOnboardingResponse(
@@ -1517,6 +1772,21 @@ func productCommercialBuildOnboardingResponse(
 			response.Status = models.OnboardingStatusInProgress
 		}
 	}
+	response.ProvisioningState = "onboarding_required"
+	completedByKey := make(map[string]bool, len(response.Steps))
+	for _, step := range response.Steps {
+		completedByKey[step.Key] = step.Completed
+	}
+	switch {
+	case response.Status == models.OnboardingStatusReady:
+		response.ProvisioningState = "ready"
+	case !completedByKey["workspace_profile"]:
+		response.ProvisioningState = "profile_required"
+	case !completedByKey["license_assigned"]:
+		response.ProvisioningState = "license_required"
+	case !completedByKey["channel_connected"]:
+		response.ProvisioningState = "authorization_required"
+	}
 	return response, nil
 }
 
@@ -1528,12 +1798,15 @@ func productCommercialPersistOnboardingProgress(
 	onboarding.Status = response.Status
 	onboarding.CurrentStep = response.CurrentStep
 	onboarding.ProgressPercent = response.ProgressPercent
+	onboarding.Metadata = productCommercialJSONCopy(onboarding.Metadata)
+	onboarding.Metadata["provisioning_state"] = response.ProvisioningState
 	updates := map[string]any{
 		"status":              onboarding.Status,
 		"current_step":        onboarding.CurrentStep,
 		"progress_percent":    onboarding.ProgressPercent,
 		"checklist":           onboarding.Checklist,
 		"input":               onboarding.Input,
+		"metadata":            onboarding.Metadata,
 		"template_id":         onboarding.TemplateID,
 		"template_version_id": onboarding.TemplateVersionID,
 	}
@@ -3106,11 +3379,16 @@ func (a *App) GetTenantSupportHealth(r *fastglue.Request) error {
 	}
 
 	var channelCount int64
+	var nonLegacyChannelCount int64
+	var nonWhatsAppChannelCount int64
 	var staleChannelCount int64
 	var errorChannelCount int64
 	var retryingOutboxCount int64
 	var failedOutboxCount int64
 	var staleOutboxCount int64
+	var intendedChannels []models.Channel
+	var missingIntendedChannels []string
+	intendedChannelsDeclared := false
 	channelFailed := false
 	if a.DB.Migrator().HasTable("whatsapp_accounts") {
 		if err := a.DB.Table("whatsapp_accounts").
@@ -3121,7 +3399,6 @@ func (a *App) GetTenantSupportHealth(r *fastglue.Request) error {
 		}
 	}
 	if a.DB.Migrator().HasTable("channel_accounts") {
-		var otherChannelCount int64
 		if err := a.DB.Table("channel_accounts").
 			Where(
 				"organization_id = ? AND status = ? AND deleted_at IS NULL AND provider <> ? AND LOWER(COALESCE(config->>'outbound_enabled', 'false')) = 'true'",
@@ -3129,11 +3406,23 @@ func (a *App) GetTenantSupportHealth(r *fastglue.Request) error {
 				"active",
 				"meta_legacy",
 			).
-			Count(&otherChannelCount).Error; err != nil {
+			Count(&nonLegacyChannelCount).Error; err != nil {
 			a.Log.Error("Tenant health channel check failed", "error", err, "organization_id", orgID)
 			channelFailed = true
 		}
-		channelCount += otherChannelCount
+		channelCount += nonLegacyChannelCount
+		if err := a.DB.Table("channel_accounts").
+			Where(
+				"organization_id = ? AND status = ? AND deleted_at IS NULL AND provider <> ? AND channel <> ? AND LOWER(COALESCE(config->>'outbound_enabled', 'false')) = 'true'",
+				orgID,
+				"active",
+				"meta_legacy",
+				models.ChannelWhatsApp,
+			).
+			Count(&nonWhatsAppChannelCount).Error; err != nil {
+			a.Log.Error("Tenant health non-WhatsApp channel check failed", "error", err, "organization_id", orgID)
+			channelFailed = true
+		}
 		readyRelay := a.DB.Table("channel_accounts").Where(
 			"organization_id = ? AND status = ? AND deleted_at IS NULL AND provider <> ? AND LOWER(COALESCE(config->>'outbound_enabled', 'false')) = 'true'",
 			orgID,
@@ -3189,6 +3478,51 @@ func (a *App) GetTenantSupportHealth(r *fastglue.Request) error {
 			channelFailed = true
 		}
 	}
+	if a.DB.Migrator().HasTable("organization_onboardings") {
+		var intendedErr error
+		intendedChannels, intendedChannelsDeclared, intendedErr =
+			productCommercialWorkspaceIntendedChannels(a.DB, orgID)
+		if intendedErr != nil {
+			a.Log.Error(
+				"Tenant health intended channel check failed",
+				"error", intendedErr,
+				"organization_id", orgID,
+			)
+			channelFailed = true
+		} else if intendedChannelsDeclared && len(intendedChannels) > 0 {
+			readyChannels, readyErr := productCommercialReadyChannels(a.DB, orgID)
+			if readyErr != nil {
+				a.Log.Error(
+					"Tenant health intended channel readiness failed",
+					"error", readyErr,
+					"organization_id", orgID,
+				)
+				channelFailed = true
+			} else {
+				for _, channel := range intendedChannels {
+					if !readyChannels[channel] {
+						missingIntendedChannels = append(
+							missingIntendedChannels,
+							productCommercialChannelLabel(channel),
+						)
+					}
+				}
+			}
+		}
+	}
+	omnichannelEnabled, entitlementErr := a.HasProductEntitlement(
+		uuid.Nil,
+		orgID,
+		"omnichannel.enabled",
+	)
+	if entitlementErr != nil {
+		a.Log.Error(
+			"Tenant health omnichannel entitlement check failed",
+			"error", entitlementErr,
+			"organization_id", orgID,
+		)
+		channelFailed = true
+	}
 	switch {
 	case channelFailed:
 		checks = append(checks, TenantHealthCheckResponse{
@@ -3208,13 +3542,6 @@ func (a *App) GetTenantSupportHealth(r *fastglue.Request) error {
 				failedOutboxCount,
 			),
 		})
-	case channelCount == 0:
-		checks = append(checks, TenantHealthCheckResponse{
-			Key:    "channels",
-			Label:  "Customer channels",
-			Status: "not_configured",
-			Detail: "No active customer channel is connected.",
-		})
 	case staleChannelCount > 0 || retryingOutboxCount > 0 || staleOutboxCount > 0:
 		checks = append(checks, TenantHealthCheckResponse{
 			Key:    "channels",
@@ -3226,6 +3553,37 @@ func (a *App) GetTenantSupportHealth(r *fastglue.Request) error {
 				retryingOutboxCount,
 				staleOutboxCount,
 			),
+		})
+	case intendedChannelsDeclared && len(intendedChannels) == 0:
+		checks = append(checks, TenantHealthCheckResponse{
+			Key:    "channels",
+			Label:  "Customer channels",
+			Status: "warn",
+			Detail: "Select at least one intended launch channel in the workspace profile, then authorize and test it.",
+		})
+	case len(missingIntendedChannels) > 0:
+		checks = append(checks, TenantHealthCheckResponse{
+			Key:    "channels",
+			Label:  "Customer channels",
+			Status: "warn",
+			Detail: fmt.Sprintf(
+				"Intended launch channels are not ready: %s. Authorize and test each one before go-live.",
+				strings.Join(missingIntendedChannels, ", "),
+			),
+		})
+	case channelCount == 0:
+		checks = append(checks, TenantHealthCheckResponse{
+			Key:    "channels",
+			Label:  "Customer channels",
+			Status: "not_configured",
+			Detail: "No active customer channel is connected.",
+		})
+	case !intendedChannelsDeclared && omnichannelEnabled && nonWhatsAppChannelCount == 0:
+		checks = append(checks, TenantHealthCheckResponse{
+			Key:    "channels",
+			Label:  "Customer channels",
+			Status: "warn",
+			Detail: "WhatsApp is active, but this omnichannel workspace has no tested Instagram, Messenger, Threads, email, or web chat connection.",
 		})
 	default:
 		checks = append(checks, TenantHealthCheckResponse{

@@ -44,7 +44,7 @@ func TestThreadsWebhookBindingRequiresDedicatedAppAndSingleAccount(t *testing.T)
 		Channel:           models.ChannelThreads,
 		Provider:          channelapi.ThreadsProvider,
 		Name:              "Threads binding test",
-		ExternalAccountID: "9876543210987654",
+		ExternalAccountID: appID + "1",
 		Status:            models.ChannelAccountStatusActive,
 		Capabilities:      models.JSONB{},
 		Config:            models.JSONB{},
@@ -334,7 +334,7 @@ func newThreadsWebhookPersistenceFixture(
 		Channel:           models.ChannelThreads,
 		Provider:          channelapi.ThreadsProvider,
 		Name:              "Threads webhook persistence " + appID,
-		ExternalAccountID: "1883576863615439",
+		ExternalAccountID: appID + "1",
 		Status:            models.ChannelAccountStatusActive,
 		Capabilities:      models.JSONB{"text": true, "replies": true},
 		Config: models.JSONB{

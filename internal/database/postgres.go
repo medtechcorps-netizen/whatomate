@@ -465,6 +465,15 @@ func getIndexes() []string {
 		`CREATE INDEX IF NOT EXISTS idx_inbox_conversations_org_queue ON inbox_conversations(organization_id, status, priority DESC, last_message_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_inbound_events_processing ON inbound_events(status, next_attempt_at, received_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_outbox_jobs_processing ON outbox_jobs(status, available_at, priority DESC)`,
+		// Provider identities routed outside a tenant-specific webhook path must
+		// have exactly one workspace owner. Existing duplicates intentionally
+		// fail migration so an operator chooses the correct owner explicitly.
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_accounts_global_routable_identity
+			ON channel_accounts(channel, provider, external_account_id)
+			WHERE deleted_at IS NULL AND (
+				(channel IN ('instagram', 'messenger') AND provider = 'relay') OR
+				(channel = 'threads' AND provider = 'threads')
+			)`,
 		// Domain invariants that GORM's string-backed enums cannot express.
 		`DO $$ BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_booking_events_window') THEN

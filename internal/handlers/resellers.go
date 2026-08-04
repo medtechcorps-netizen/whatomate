@@ -243,6 +243,33 @@ func (a *App) createTenantOrganization(
 		return nil, fmt.Errorf("create chatbot settings: %w", err)
 	}
 
+	// A new tenant is an isolated workspace, not an inherited provider
+	// connection. Persist an explicit onboarding state immediately so the UI
+	// can guide licensing and tenant-specific channel authorization without
+	// creating placeholder integrations or copying another organization's
+	// credentials.
+	now := time.Now().UTC()
+	onboarding := models.OrganizationOnboarding{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		ResellerID:      &resellerID,
+		Status:          models.OnboardingStatusInProgress,
+		CurrentStep:     productOnboardingStepDefinitions[0].key,
+		ProgressPercent: 0,
+		Checklist:       models.JSONB{},
+		Input: models.JSONB{
+			"business_name":     org.Name,
+			"intended_channels": []string{},
+		},
+		Metadata:      models.JSONB{"provisioning_state": "profile_required"},
+		RequestedByID: &creatorID,
+		OwnerUserID:   &creatorID,
+		StartedAt:     &now,
+	}
+	if err := tx.Create(&onboarding).Error; err != nil {
+		return nil, fmt.Errorf("create organization onboarding: %w", err)
+	}
+
 	var adminRole models.CustomRole
 	if err := tx.Where(
 		"organization_id = ? AND name = ? AND is_system = ?",

@@ -90,6 +90,8 @@ interface MockIntegration {
     }
   >;
   connection: ReturnType<typeof connection>;
+  channel_connections?: Record<string, ReturnType<typeof connection>>;
+  intended_channels?: string[];
   oauth: { supported: boolean; available: boolean; mode?: string };
   test_supported: boolean;
   message?: string;
@@ -125,6 +127,12 @@ function integrationFixture(): MockIntegration[] {
         },
       },
       connection: connection(2, 2),
+      channel_connections: {
+        whatsapp: connection(1, 1),
+        instagram: connection(1, 1),
+        messenger: connection(),
+      },
+      intended_channels: ["whatsapp", "instagram", "messenger"],
       oauth: { supported: true, available: true, mode: "embedded_signup" },
       test_supported: true,
     },
@@ -1521,7 +1529,16 @@ test("provider preflight assigns callbacks, subscriptions, and relay credentials
   ).toContainText("Per-account webhook subscription");
   await expect(
     page.getByTestId("integration-readiness-meta-meta_relay_credentials"),
-  ).toContainText("Instagram & Messenger relay credentials");
+  ).toContainText("Meta relay registration");
+  await expect(
+    page.getByTestId("integration-readiness-meta-active_whatsapp_connection"),
+  ).toContainText("Ready");
+  await expect(
+    page.getByTestId("integration-readiness-meta-active_instagram_connection"),
+  ).toContainText("Ready");
+  await expect(
+    page.getByTestId("integration-readiness-meta-active_messenger_connection"),
+  ).toContainText("Missing");
 
   await page
     .getByTestId("integration-card-meta")
@@ -1542,7 +1559,7 @@ test("provider preflight assigns callbacks, subscriptions, and relay credentials
     page.getByTestId(
       "integration-dialog-readiness-meta-meta_relay_credentials",
     ),
-  ).toContainText("do not reuse the central WhatsApp app secret");
+  ).toContainText("Another workspace's tokens");
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("integration-dialog-meta")).toHaveCount(0);
 

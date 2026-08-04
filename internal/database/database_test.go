@@ -508,6 +508,42 @@ func TestCreateIndexesEnforcesProductTenantAndLedgerIntegrity(t *testing.T) {
 	assert.Contains(t, err.Error(), "fk_inbox_conversations_account_tenant")
 }
 
+func TestCreateIndexesEnforcesOneWorkspaceOwnerForRoutableProviderIdentity(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+	require.NoError(t, database.CreateIndexes(db))
+	orgA := testutil.CreateTestOrganization(t, db)
+	orgB := testutil.CreateTestOrganization(t, db)
+
+	account := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    orgA.ID,
+		Channel:           models.ChannelInstagram,
+		Provider:          "relay",
+		Name:              "Tenant A Instagram",
+		ExternalAccountID: "shared-instagram-identity",
+		Status:            models.ChannelAccountStatusPending,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, db.Create(&account).Error)
+
+	conflict := account
+	conflict.ID = uuid.New()
+	conflict.OrganizationID = orgB.ID
+	conflict.Name = "Tenant B Instagram"
+	conflict.CreatedAt = time.Time{}
+	conflict.UpdatedAt = time.Time{}
+	require.Error(t, db.Create(&conflict).Error)
+
+	require.NoError(t, db.Delete(&account).Error)
+	conflict.ID = uuid.New()
+	conflict.CreatedAt = time.Time{}
+	conflict.UpdatedAt = time.Time{}
+	require.NoError(t, db.Create(&conflict).Error)
+}
+
 // --- CreateDefaultAdmin ---
 
 func TestCreateDefaultAdmin_CreatesOrgAndUser(t *testing.T) {

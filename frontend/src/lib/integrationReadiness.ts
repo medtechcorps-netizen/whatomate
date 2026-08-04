@@ -1,4 +1,5 @@
 import type {
+  IntegrationChannel,
   IntegrationProvider,
   IntegrationState,
 } from "@/services/integrations";
@@ -225,6 +226,98 @@ function connectionRequirement(
   };
 }
 
+function channelConnectionRequirement(
+  integration: IntegrationState,
+  channel: IntegrationChannel,
+  label: string,
+  emptyDetail: string,
+): IntegrationReadinessItem {
+  const explicitConnections = integration.channel_connections;
+  const connection =
+    explicitConnections?.[channel] ??
+    (channel === "whatsapp" && !explicitConnections
+      ? integration.connection
+      : { account_count: 0, active_count: 0, pending_count: 0 });
+  const key = `active_${channel}_connection`;
+  if (connection.last_error) {
+    return {
+      key,
+      label,
+      state: "blocked",
+      detail: `${label} needs attention. Resolve the reported connection error and run Test again before go-live.`,
+    };
+  }
+  if (
+    connection.active_count > 0 &&
+    ((connection.pending_count ?? 0) > 0 ||
+      connection.active_count < connection.account_count)
+  ) {
+    return {
+      key,
+      label,
+      state: "blocked",
+      detail: `${connection.active_count} of ${connection.account_count} ${channel} connections are active for this workspace; resolve the remaining connection before go-live.`,
+    };
+  }
+  if (connection.active_count > 0) {
+    return {
+      key,
+      label,
+      state: "ready",
+      detail: `${connection.active_count} of ${connection.account_count} ${channel} connections are active for this workspace.`,
+    };
+  }
+  if (connection.account_count > 0) {
+    return {
+      key,
+      label,
+      state: "blocked",
+      detail: `${connection.account_count} ${channel} connections exist for this workspace, but none are active. Open the Omnichannel Inbox and resolve their health or authorization state.`,
+    };
+  }
+  return {
+    key,
+    label,
+    state: "missing",
+    detail: emptyDetail,
+  };
+}
+
+function metaChannelConnectionRequirements(
+  integration: IntegrationState,
+): IntegrationReadinessItem[] {
+  const requirements: Array<{
+    channel: Extract<IntegrationChannel, "whatsapp" | "instagram" | "messenger">;
+    label: string;
+    emptyDetail: string;
+  }> = [
+    {
+      channel: "whatsapp",
+      label: "WhatsApp connection",
+      emptyDetail:
+        "Connect this workspace's WhatsApp Business account through WhatsApp Accounts or Embedded Signup.",
+    },
+    {
+      channel: "instagram",
+      label: "Instagram connection",
+      emptyDetail:
+        "Create this workspace's Instagram signed-relay connection, register the same external account ID and secrets in the Meta relay runtime, then run Test.",
+    },
+    {
+      channel: "messenger",
+      label: "Messenger connection",
+      emptyDetail:
+        "Create this workspace's Messenger signed-relay connection, register the same Page ID and secrets in the Meta relay runtime, then run Test.",
+    },
+  ];
+  const intended = integration.intended_channels;
+  return requirements
+    .filter(({ channel }) => !intended || intended.includes(channel))
+    .map(({ channel, label, emptyDetail }) =>
+      channelConnectionRequirement(integration, channel, label, emptyDetail),
+    );
+}
+
 function healthRequirement(
   integration: IntegrationState,
 ): IntegrationReadinessItem {
@@ -311,11 +404,7 @@ const builders: Record<
         : "The server has not published a Meta webhook callback.",
     },
     activationRequirement(integration),
-    connectionRequirement(
-      integration,
-      "Active Meta channel connection",
-      "Enable Meta, then connect WhatsApp with Embedded Signup or configure an approved Meta relay channel.",
-    ),
+    ...metaChannelConnectionRequirements(integration),
     {
       key: "account_webhook",
       label: "Per-account webhook subscription",
@@ -327,10 +416,10 @@ const builders: Record<
     },
     {
       key: "meta_relay_credentials",
-      label: "Instagram & Messenger relay credentials",
+      label: "Meta relay registration",
       state: "managed",
       detail:
-        "Instagram and Messenger do not reuse the central WhatsApp app secret. Their operator-managed app secret, verify token and signed relay belong to each channel connection in the Omnichannel Inbox.",
+        "Every Instagram and Messenger account needs its own tenant channel record plus a matching operator-managed relay mapping. Another workspace's tokens, Page IDs and signing secrets cannot satisfy this workspace.",
     },
     {
       key: "business_calling",
@@ -384,7 +473,7 @@ const builders: Record<
     connectionRequirement(
       integration,
       "Connected Threads account",
-      "Authorize the ReAlign Kajang Threads account.",
+      "Authorize this workspace's Threads account.",
     ),
     healthRequirement(integration),
     {

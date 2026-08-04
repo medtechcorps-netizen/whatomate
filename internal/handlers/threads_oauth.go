@@ -67,6 +67,47 @@ type threadsTokenResponse struct {
 	ExpiresIn   int64     `json:"expires_in"`
 }
 
+type threadsOAuthProviderError struct {
+	StatusCode int
+	Code       int
+	Subcode    int
+	Type       string
+	TraceID    string
+	RequestID  string
+}
+
+func (e *threadsOAuthProviderError) Error() string {
+	if e == nil {
+		return "threads provider request failed"
+	}
+	parts := []string{fmt.Sprintf("HTTP %d", e.StatusCode)}
+	if e.Code != 0 {
+		parts = append(parts, fmt.Sprintf("code %d", e.Code))
+	}
+	if e.Subcode != 0 {
+		parts = append(parts, fmt.Sprintf("subcode %d", e.Subcode))
+	}
+	if e.Type != "" {
+		parts = append(parts, "type "+e.Type)
+	}
+	if e.TraceID != "" {
+		parts = append(parts, "trace "+e.TraceID)
+	}
+	if e.RequestID != "" {
+		parts = append(parts, "request "+e.RequestID)
+	}
+	return "threads provider request failed (" + strings.Join(parts, ", ") + ")"
+}
+
+type threadsGraphErrorEnvelope struct {
+	Error struct {
+		Type         string `json:"type"`
+		Code         int    `json:"code"`
+		ErrorSubcode int    `json:"error_subcode"`
+		FBTraceID    string `json:"fbtrace_id"`
+	} `json:"error"`
+}
+
 type threadsProfile struct {
 	ID                threadsID `json:"id"`
 	Username          string    `json:"username"`
@@ -239,13 +280,13 @@ func (a *App) CallbackThreads(r *fastglue.Request) error {
 	defer exchangeCancel()
 	shortToken, err := a.exchangeThreadsAuthorizationCode(exchangeCtx, snapshot, code)
 	if err != nil {
-		a.Log.Error("Threads OAuth code exchange failed", "organization_id", orgID)
+		a.Log.Error("Threads OAuth code exchange failed", "error", err, "organization_id", orgID)
 		a.redirectThreadsCallback(r, "error")
 		return nil
 	}
 	longToken, err := a.exchangeThreadsLongLivedToken(exchangeCtx, snapshot.AppSecret, shortToken.AccessToken)
 	if err != nil {
-		a.Log.Error("Threads long-lived token exchange failed", "organization_id", orgID)
+		a.Log.Error("Threads long-lived token exchange failed", "error", err, "organization_id", orgID)
 		a.redirectThreadsCallback(r, "error")
 		return nil
 	}
@@ -405,7 +446,10 @@ func (a *App) exchangeThreadsAuthorizationCode(
 	}
 	var response threadsTokenResponse
 	err := a.doThreadsOAuthJSON(ctx, http.MethodPost, threadsGraphBaseURL+"/oauth/access_token", values, "", &response)
-	if err != nil || strings.TrimSpace(response.AccessToken) == "" || strings.TrimSpace(string(response.UserID)) == "" {
+	if err != nil {
+		return threadsTokenResponse{}, fmt.Errorf("threads code exchange: %w", err)
+	}
+	if strings.TrimSpace(response.AccessToken) == "" || strings.TrimSpace(string(response.UserID)) == "" {
 		return threadsTokenResponse{}, errors.New("threads code exchange failed")
 	}
 	return response, nil
@@ -422,7 +466,10 @@ func (a *App) exchangeThreadsLongLivedToken(
 	}
 	var response threadsTokenResponse
 	err := a.doThreadsOAuthJSON(ctx, http.MethodGet, threadsGraphBaseURL+"/access_token", values, "", &response)
-	if err != nil || strings.TrimSpace(response.AccessToken) == "" {
+	if err != nil {
+		return threadsTokenResponse{}, fmt.Errorf("threads long-lived token exchange: %w", err)
+	}
+	if strings.TrimSpace(response.AccessToken) == "" {
 		return threadsTokenResponse{}, errors.New("threads long-lived token exchange failed")
 	}
 	return response, nil
@@ -455,7 +502,7 @@ func (a *App) doThreadsOAuthJSON(
 	}
 	request, err := http.NewRequestWithContext(ctx, method, target.String(), body)
 	if err != nil {
-		return err
+		return errors.New("threads request could not be prepared")
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", "ReReply-Threads-OAuth/1.0")
@@ -477,7 +524,20 @@ func (a *App) doThreadsOAuthJSON(
 		return errors.New("threads response was invalid")
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("threads returned HTTP %d", response.StatusCode)
+		var envelope threadsGraphErrorEnvelope
+		_ = json.Unmarshal(payload, &envelope)
+		traceID := safeThreadsOAuthDiagnostic(envelope.Error.FBTraceID)
+		if traceID == "" {
+			traceID = safeThreadsOAuthDiagnostic(response.Header.Get("X-FB-Trace-ID"))
+		}
+		return &threadsOAuthProviderError{
+			StatusCode: response.StatusCode,
+			Code:       envelope.Error.Code,
+			Subcode:    envelope.Error.ErrorSubcode,
+			Type:       safeThreadsOAuthDiagnostic(envelope.Error.Type),
+			TraceID:    traceID,
+			RequestID:  safeThreadsOAuthDiagnostic(response.Header.Get("X-FB-Request-ID")),
+		}
 	}
 	if destination == nil {
 		return nil
@@ -487,6 +547,23 @@ func (a *App) doThreadsOAuthJSON(
 		return errors.New("threads response was invalid")
 	}
 	return nil
+}
+
+func safeThreadsOAuthDiagnostic(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return ""
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			strings.ContainsRune("_.:-", character) {
+			continue
+		}
+		return ""
+	}
+	return value
 }
 
 func (a *App) persistThreadsConnection(
