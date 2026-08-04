@@ -1790,16 +1790,16 @@ func (a *App) validateEmbeddedSignupSelection(
 			}
 		}
 		if len(coexistenceCandidates) == 0 {
-			return "", "", "", nil, false, errors.New("Meta did not return a WhatsApp Business App phone number for this WABA")
+			return "", "", "", nil, false, errors.New("meta did not return a WhatsApp Business App phone number for this WABA")
 		}
 		if len(coexistenceCandidates) > 1 {
-			return "", "", "", nil, false, errors.New("Meta returned multiple WhatsApp Business App phone numbers for this WABA; reconnect using a WABA with one coexistence number")
+			return "", "", "", nil, false, errors.New("meta returned multiple WhatsApp Business App phone numbers for this WABA; reconnect using a WABA with one coexistence number")
 		}
 
 		phone := phonesResp.Data[coexistenceCandidates[0]]
 		phoneID = strings.TrimSpace(phone.ID)
 		if phoneID == "" {
-			return "", "", "", nil, false, errors.New("Meta returned a coexistence phone number without an ID")
+			return "", "", "", nil, false, errors.New("meta returned a coexistence phone number without an ID")
 		}
 		if name == "" && (phone.VerifiedName != "" || phone.DisplayPhoneNumber != "") {
 			name = strings.TrimSpace(fmt.Sprintf("%s (%s)", phone.VerifiedName, phone.DisplayPhoneNumber))
@@ -1825,7 +1825,7 @@ func (a *App) validateEmbeddedSignupSelection(
 	}
 	if skipRegistration && (!validation.IsOnBizApp ||
 		!strings.EqualFold(strings.TrimSpace(validation.PlatformType), "CLOUD_API")) {
-		return "", "", "", nil, false, errors.New("Meta did not confirm that the selected phone is an active WhatsApp Business App coexistence number")
+		return "", "", "", nil, false, errors.New("meta did not confirm that the selected phone is an active WhatsApp Business App coexistence number")
 	}
 
 	return phoneID, wabaID, name, tokenExpiresAt, skipRegistration, nil
