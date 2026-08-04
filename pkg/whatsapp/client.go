@@ -850,14 +850,14 @@ func (c *Client) GetWABAPhoneNumbersVersion(ctx context.Context, wabaID, accessT
 		}
 		nextAfter := strings.TrimSpace(pageResponse.Paging.Cursors.After)
 		if nextAfter == "" {
-			return nil, errors.New("Meta phone-number pagination omitted the next cursor")
+			return nil, errors.New("meta phone-number pagination omitted the next cursor")
 		}
 		if _, exists := seenCursors[nextAfter]; exists {
-			return nil, errors.New("Meta phone-number pagination repeated a cursor")
+			return nil, errors.New("meta phone-number pagination repeated a cursor")
 		}
 		seenCursors[nextAfter] = struct{}{}
 		after = nextAfter
 	}
 
-	return nil, fmt.Errorf("Meta phone-number pagination exceeded %d pages", maxPages)
+	return nil, fmt.Errorf("meta phone-number pagination exceeded %d pages", maxPages)
 }
