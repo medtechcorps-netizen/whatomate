@@ -273,7 +273,7 @@ func TestRawWebhookCrashGapLeaseRecovery(t *testing.T) {
 	}
 }
 
-func TestChannelWebhookResolverUsesGloballyUniqueAccountID(t *testing.T) {
+func TestChannelWebhookResolverUsesChannelAccountIDAcrossOrganizations(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	orgA := testutil.CreateTestOrganization(t, db)
 	orgB := testutil.CreateTestOrganization(t, db)
@@ -293,6 +293,7 @@ func TestChannelWebhookResolverUsesGloballyUniqueAccountID(t *testing.T) {
 	accountB := *accountA
 	accountB.BaseModel = models.BaseModel{ID: uuid.New()}
 	accountB.OrganizationID = orgB.ID
+	accountB.ExternalAccountID = "provider-id-" + uuid.NewString()
 	require.NoError(t, db.Create(accountA).Error)
 	require.NoError(t, db.Create(&accountB).Error)
 

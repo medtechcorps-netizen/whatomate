@@ -678,6 +678,7 @@ func TestIntegrationCenterThreadsDeleteDisconnectsAccountsAndRevokesOAuthCredent
 		"settings.integrations:write",
 		models.ResourceChannelAccounts+":"+models.ActionDelete,
 	)
+	const appID = "1234567890123459"
 	enableBookingCommerceTestEntitlement(t, app.DB, org.ID, admin.ID, "omnichannel.enabled")
 	appSecret, err := appcrypto.Encrypt("threads-app-secret", integrationTestEncryptionKey)
 	require.NoError(t, err)
@@ -692,7 +693,7 @@ func TestIntegrationCenterThreadsDeleteDisconnectsAccountsAndRevokesOAuthCredent
 		Provider:       integrationProviderThreads,
 		Enabled:        true,
 		Config: models.JSONB{
-			"app_id":       "1234567890123459",
+			"app_id":       appID,
 			"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
 		},
 		CredentialData: models.JSONB{
@@ -709,7 +710,7 @@ func TestIntegrationCenterThreadsDeleteDisconnectsAccountsAndRevokesOAuthCredent
 		Channel:           models.ChannelThreads,
 		Provider:          integrationProviderThreads,
 		Name:              "Threads @clinic_account",
-		ExternalAccountID: "9876543210987654",
+		ExternalAccountID: appID + "1",
 		Status:            models.ChannelAccountStatusActive,
 		Capabilities:      models.JSONB{"text": true, "replies": true},
 		Config:            models.JSONB{"outbound_enabled": true},
@@ -885,7 +886,7 @@ func TestIntegrationCenterThreadsAppChangeRevokesOldAuthorizationAndReenableIsNo
 		Channel:           models.ChannelThreads,
 		Provider:          channelapi.ThreadsProvider,
 		Name:              "Threads @clinic_account",
-		ExternalAccountID: "9876543210987654",
+		ExternalAccountID: oldAppID + "1",
 		Status:            models.ChannelAccountStatusActive,
 		Capabilities:      models.JSONB{"text": true, "replies": true},
 		Config:            models.JSONB{"outbound_enabled": true},
@@ -1022,7 +1023,7 @@ func TestPersistThreadsConnectionRestoresHistoricalSoftDeletedMatchingAccount(t 
 		Channel:           models.ChannelThreads,
 		Provider:          channelapi.ThreadsProvider,
 		Name:              "Historical Threads",
-		ExternalAccountID: "9876543210987654",
+		ExternalAccountID: appID + "1",
 		Status:            models.ChannelAccountStatusDisconnected,
 		Capabilities:      models.JSONB{},
 		Config:            models.JSONB{"outbound_enabled": false},
