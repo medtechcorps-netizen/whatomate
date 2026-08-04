@@ -1,6 +1,7 @@
 package middleware_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -484,8 +485,29 @@ func TestSecurityHeaders(t *testing.T) {
 	assert.Equal(t, "DENY", string(headers.Peek("X-Frame-Options")))
 	assert.Equal(t, "strict-origin-when-cross-origin", string(headers.Peek("Referrer-Policy")))
 	assert.Equal(t, "max-age=31536000; includeSubDomains", string(headers.Peek("Strict-Transport-Security")))
-	assert.Contains(t, string(headers.Peek("Content-Security-Policy")), "default-src 'self'")
-	assert.Contains(t, string(headers.Peek("Content-Security-Policy")), "frame-ancestors 'none'")
+	csp := string(headers.Peek("Content-Security-Policy"))
+	directives := make(map[string]string)
+	for directive := range strings.SplitSeq(csp, ";") {
+		directive = strings.TrimSpace(directive)
+		if directive == "" {
+			continue
+		}
+		name, value, _ := strings.Cut(directive, " ")
+		directives[name] = strings.TrimSpace(value)
+	}
+
+	assert.Equal(t, "'self'", directives["default-src"])
+	assert.Equal(t, "'none'", directives["object-src"])
+	assert.Equal(t, "'none'", directives["frame-ancestors"])
+	assert.Equal(t, "'self'", directives["form-action"])
+	assert.Equal(t, "'self' https://connect.facebook.net", directives["script-src"])
+	assert.Equal(t, "https://www.facebook.com https://staticxx.facebook.com", directives["frame-src"])
+	assert.NotContains(t, strings.Fields(directives["script-src"]), "https:")
+	assert.NotContains(t, strings.Fields(directives["frame-src"]), "https:")
+	assert.NotContains(t, directives["script-src"], "*")
+	assert.NotContains(t, directives["frame-src"], "*")
+	assert.NotContains(t, directives["script-src"], "'unsafe-inline'")
+	assert.NotContains(t, directives["script-src"], "'unsafe-eval'")
 }
 
 func TestJWTClaims(t *testing.T) {
