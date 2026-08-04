@@ -449,7 +449,6 @@ func TestIntegrationCenterPublishesExactProviderScopeContracts(t *testing.T) {
 		{
 			provider: integrationProviderMeta,
 			scopes: []string{
-				"business_management",
 				"whatsapp_business_management",
 				"whatsapp_business_messaging",
 			},

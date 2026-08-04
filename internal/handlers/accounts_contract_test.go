@@ -118,7 +118,6 @@ func newWhatsAppContractMeta(t *testing.T, phoneID, wabaID string) *whatsappCont
 					"app_id":   "synthetic-meta-app",
 					"is_valid": true,
 					"scopes": []string{
-						"business_management",
 						"whatsapp_business_management",
 						"whatsapp_business_messaging",
 					},

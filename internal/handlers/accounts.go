@@ -1222,7 +1222,6 @@ func validateMetaEmbeddedSignupToken(
 		scopes[strings.TrimSpace(scope.Scope)] = struct{}{}
 	}
 	for _, required := range []string{
-		"business_management",
 		"whatsapp_business_management",
 		"whatsapp_business_messaging",
 	} {

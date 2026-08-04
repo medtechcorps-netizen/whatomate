@@ -522,7 +522,6 @@ func (a *App) composeIntegrationResponse(provider string, sources *integrationSo
 		response.OAuth = integrationOAuthResponse{Supported: true, Available: response.Configured && response.credentialUsable, Mode: "embedded_signup"}
 		response.TestSupported = true
 		response.RequiredScopes = []string{
-			"business_management",
 			"whatsapp_business_management",
 			"whatsapp_business_messaging",
 		}
