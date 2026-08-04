@@ -740,11 +740,11 @@ test.describe('Partner Console workspace licensing', () => {
     await expect(pagination).toContainText('Showing 1–50 of 50 workspaces')
     await page.getByRole('button', { name: 'New workspace' }).click()
     const createDialog = page.getByRole('dialog', {
-      name: 'Provision customer workspace',
+      name: 'Create customer workspace',
     })
     await createDialog.getByLabel('Business name').fill('Workspace 999')
     await createDialog
-      .getByRole('button', { name: 'Provision workspace' })
+      .getByRole('button', { name: 'Create workspace' })
       .click()
 
     await expect.poll(state.createdOrganizationId).not.toBe('')
