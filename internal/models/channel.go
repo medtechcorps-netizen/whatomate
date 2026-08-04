@@ -156,11 +156,11 @@ const (
 // mailbox, phone number, or web-chat installation.
 type ChannelAccount struct {
 	BaseModel
-	OrganizationID    uuid.UUID            `gorm:"type:uuid;not null;index;uniqueIndex:idx_channel_accounts_org_name,priority:1;uniqueIndex:idx_channel_accounts_external,priority:1;index:idx_channel_accounts_org_channel,priority:1;index:idx_channel_accounts_org_status,priority:1" json:"organization_id"`
-	Channel           Channel              `gorm:"size:32;not null;uniqueIndex:idx_channel_accounts_external,priority:2;index:idx_channel_accounts_org_channel,priority:2" json:"channel"`
-	Provider          string               `gorm:"size:100;not null;uniqueIndex:idx_channel_accounts_external,priority:3;index" json:"provider"`
-	Name              string               `gorm:"size:120;not null;uniqueIndex:idx_channel_accounts_org_name,priority:2" json:"name"`
-	ExternalAccountID string               `gorm:"size:255;not null;uniqueIndex:idx_channel_accounts_external,priority:4" json:"external_account_id"`
+	OrganizationID    uuid.UUID            `gorm:"type:uuid;not null;index;index:idx_channel_accounts_org_channel,priority:1;index:idx_channel_accounts_org_status,priority:1" json:"organization_id"`
+	Channel           Channel              `gorm:"size:32;not null;index:idx_channel_accounts_org_channel,priority:2" json:"channel"`
+	Provider          string               `gorm:"size:100;not null;index" json:"provider"`
+	Name              string               `gorm:"size:120;not null" json:"name"`
+	ExternalAccountID string               `gorm:"size:255;not null" json:"external_account_id"`
 	Status            ChannelAccountStatus `gorm:"size:24;not null;default:'pending';index:idx_channel_accounts_org_status,priority:2" json:"status"`
 	Capabilities      JSONB                `gorm:"type:jsonb;not null;default:'{}'" json:"capabilities"`
 	Config            JSONB                `gorm:"type:jsonb;not null;default:'{}'" json:"config"`

@@ -544,6 +544,35 @@ func TestCreateIndexesEnforcesOneWorkspaceOwnerForRoutableProviderIdentity(t *te
 	require.NoError(t, db.Create(&conflict).Error)
 }
 
+func TestCreateIndexesAllowsDisconnectedChannelAccountToBeReconnected(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+	require.NoError(t, database.CreateIndexes(db))
+	org := testutil.CreateTestOrganization(t, db)
+
+	account := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    org.ID,
+		Channel:           models.ChannelInstagram,
+		Provider:          "relay",
+		Name:              "Clinic Instagram",
+		ExternalAccountID: "clinic-instagram-identity",
+		Status:            models.ChannelAccountStatusPending,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, db.Create(&account).Error)
+	require.NoError(t, db.Delete(&account).Error)
+
+	replacement := account
+	replacement.ID = uuid.New()
+	replacement.CreatedAt = time.Time{}
+	replacement.UpdatedAt = time.Time{}
+	replacement.DeletedAt = gorm.DeletedAt{}
+	require.NoError(t, db.Create(&replacement).Error)
+}
+
 // --- CreateDefaultAdmin ---
 
 func TestCreateDefaultAdmin_CreatesOrgAndUser(t *testing.T) {

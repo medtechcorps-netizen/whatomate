@@ -474,6 +474,17 @@ func getIndexes() []string {
 				(channel IN ('instagram', 'messenger') AND provider = 'relay') OR
 				(channel = 'threads' AND provider = 'threads')
 			)`,
+		// GORM's model-level unique indexes include soft-deleted rows. Install the
+		// active-row replacements before removing the legacy indexes so uniqueness
+		// remains enforced while allowing soft-deleted accounts to be reconnected.
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_accounts_org_name_active
+			ON channel_accounts(organization_id, name)
+			WHERE deleted_at IS NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_accounts_org_external_active
+			ON channel_accounts(organization_id, channel, provider, external_account_id)
+			WHERE deleted_at IS NULL`,
+		`DROP INDEX IF EXISTS idx_channel_accounts_org_name`,
+		`DROP INDEX IF EXISTS idx_channel_accounts_external`,
 		// Domain invariants that GORM's string-backed enums cannot express.
 		`DO $$ BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_booking_events_window') THEN
