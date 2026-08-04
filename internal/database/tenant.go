@@ -13,7 +13,7 @@ import (
 
 const (
 	tenantSetting           = "app.current_organization_id"
-	tenantRLSRoutingVersion = 5
+	tenantRLSRoutingVersion = 6
 )
 
 var (
@@ -528,10 +528,12 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		 SECURITY DEFINER
 		 SET search_path = pg_catalog, public
 		 AS $function$
-		   SELECT organization_id
+		   SELECT CASE
+		     WHEN COUNT(*) = 1 THEN MIN(organization_id::text)::uuid
+		     ELSE NULL::uuid
+		   END
 		   FROM public.whatsapp_accounts
 		   WHERE phone_id = p_phone_id AND deleted_at IS NULL
-		   LIMIT 1
 		 $function$`,
 		`CREATE OR REPLACE FUNCTION public.rereply_resolve_webhook_org(p_verify_token text)
 		 RETURNS uuid

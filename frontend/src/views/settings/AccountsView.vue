@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from "vue";
+import { ref, computed, onBeforeUnmount, onMounted, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   Card,
@@ -36,6 +36,13 @@ import { useAuthStore } from "@/stores/auth";
 import { toast } from "vue-sonner";
 import { getErrorMessage } from "@/lib/api-utils";
 import { formatDate } from "@/lib/utils";
+import {
+  createMetaEmbeddedSignupSession,
+  META_EMBEDDED_SIGNUP_COEXISTENCE_FINISH,
+  META_EMBEDDED_SIGNUP_FINISH,
+  type MetaEmbeddedSignupAbortReason,
+  type MetaEmbeddedSignupSession,
+} from "@/lib/metaEmbeddedSignup";
 import {
   Plus,
   Pencil,
@@ -86,17 +93,32 @@ const whatsappConfig = ref<{
   api_version: string;
   has_app_secret: boolean;
 } | null>(null);
+const whatsappConfigOrganizationId = ref<string | null>(null);
 const isFBSDKLoaded = ref(false);
+const initializedFacebookAppId = ref<string | null>(null);
 const isConnectingFB = ref(false);
 const showOnboardingDialog = ref(false);
+let isFacebookSDKLoading = false;
+let activeEmbeddedSignupSession: MetaEmbeddedSignupSession | null = null;
+let activeEmbeddedSignupOrganizationId: string | null = null;
+let activeEmbeddedSignupExchange: {
+  organizationId: string;
+  detached: boolean;
+} | null = null;
+const embeddedSignupRestartBlocked = ref(false);
+let accountsRequestSequence = 0;
 
 const canWrite = computed(() => authStore.hasPermission("accounts", "write"));
 const canDelete = computed(() => authStore.hasPermission("accounts", "delete"));
 const canReadIntegrations = computed(() =>
   authStore.hasPermission("settings.integrations", "read"),
 );
+const activeOrganizationId = computed(
+  () => organizationsStore.selectedOrgId || authStore.organizationId || null,
+);
 const isMetaIntegrationReady = computed(() =>
   Boolean(
+    whatsappConfigOrganizationId.value === activeOrganizationId.value &&
     whatsappConfig.value?.app_id &&
     whatsappConfig.value?.config_id &&
     whatsappConfig.value?.has_app_secret,
@@ -136,40 +158,113 @@ const columns = computed<Column<WhatsAppAccount>[]>(() => [
   { key: "actions", label: t("common.actions"), align: "right" },
 ]);
 
-watch(
-  () => organizationsStore.selectedOrgId,
-  () => {
-    fetchAccounts();
-    fetchWhatsAppConfig();
-  },
-);
+watch(activeOrganizationId, (organizationId) => {
+  if (
+    activeEmbeddedSignupOrganizationId &&
+    organizationId !== activeEmbeddedSignupOrganizationId
+  ) {
+    cancelPendingEmbeddedSignup(true);
+  }
+  if (
+    activeEmbeddedSignupExchange &&
+    organizationId !== activeEmbeddedSignupExchange.organizationId
+  ) {
+    activeEmbeddedSignupExchange.detached = true;
+    activeEmbeddedSignupExchange = null;
+    isConnectingFB.value = false;
+  }
+  whatsappConfig.value = null;
+  whatsappConfigOrganizationId.value = null;
+  fetchAccounts();
+  fetchWhatsAppConfig();
+});
 onMounted(async () => {
   await Promise.all([fetchAccounts(), fetchWhatsAppConfig()]);
 });
+onBeforeUnmount(() => {
+  cancelPendingEmbeddedSignup(false);
+  if (activeEmbeddedSignupExchange) {
+    activeEmbeddedSignupExchange.detached = true;
+    activeEmbeddedSignupExchange = null;
+  }
+});
+
+function isEmbeddedSignupOrganizationCurrent(organizationId: string) {
+  return activeOrganizationId.value === organizationId;
+}
+
+function cancelPendingEmbeddedSignup(notifyOrganizationChange: boolean) {
+  const shouldNotify = notifyOrganizationChange && isConnectingFB.value;
+  if (notifyOrganizationChange && activeEmbeddedSignupSession) {
+    embeddedSignupRestartBlocked.value = true;
+  }
+  activeEmbeddedSignupSession?.cancel();
+  activeEmbeddedSignupSession = null;
+  activeEmbeddedSignupOrganizationId = null;
+  if (!activeEmbeddedSignupExchange) {
+    isConnectingFB.value = false;
+  }
+
+  if (shouldNotify) {
+    toast.error(
+      "WhatsApp signup was cancelled because the active workspace changed.",
+    );
+  }
+}
 
 async function fetchAccounts() {
+  const organizationId = activeOrganizationId.value;
+  const requestSequence = ++accountsRequestSequence;
   isLoading.value = true;
   fetchError.value = false;
   try {
-    const response = await api.get("/accounts");
+    const response = await api.get("/accounts", {
+      headers: organizationId
+        ? { "X-Organization-ID": organizationId }
+        : undefined,
+    });
+    if (
+      requestSequence !== accountsRequestSequence ||
+      activeOrganizationId.value !== organizationId
+    ) {
+      return;
+    }
     accounts.value = response.data.data?.accounts || [];
   } catch {
+    if (
+      requestSequence !== accountsRequestSequence ||
+      activeOrganizationId.value !== organizationId
+    ) {
+      return;
+    }
     fetchError.value = true;
     toast.error(t("common.failedLoad", { resource: t("resources.accounts") }));
   } finally {
-    isLoading.value = false;
+    if (requestSequence === accountsRequestSequence) {
+      isLoading.value = false;
+    }
   }
 }
 
 async function fetchWhatsAppConfig() {
+  const organizationId = activeOrganizationId.value;
+  whatsappConfig.value = null;
+  whatsappConfigOrganizationId.value = null;
   try {
-    const response = await api.get("/embedded-signup/config");
+    const response = await api.get("/embedded-signup/config", {
+      headers: organizationId
+        ? { "X-Organization-ID": organizationId }
+        : undefined,
+    });
+    if (activeOrganizationId.value !== organizationId) return;
+
     whatsappConfig.value = {
       app_id: response.data.data.whatsapp_app_id,
       config_id: response.data.data.whatsapp_config_id,
       api_version: response.data.data.whatsapp_api_version || "v21.0",
       has_app_secret: response.data.data.has_app_secret === true,
     };
+    whatsappConfigOrganizationId.value = organizationId;
     if (isMetaIntegrationReady.value) {
       loadFacebookSDK();
     }
@@ -179,25 +274,89 @@ async function fetchWhatsAppConfig() {
 }
 
 function loadFacebookSDK() {
-  if (isFBSDKLoaded.value || !whatsappConfig.value?.app_id) return;
+  const appId = whatsappConfig.value?.app_id;
+  if (!appId) return;
 
+  const initializeForCurrentApp = () => {
+    const currentConfig = whatsappConfig.value;
+    if (!currentConfig?.app_id || !window.FB?.init) return;
+
+    window.FB.init({
+      appId: currentConfig.app_id,
+      cookie: true,
+      xfbml: true,
+      version: currentConfig.api_version,
+    });
+    initializedFacebookAppId.value = currentConfig.app_id;
+    isFBSDKLoaded.value = true;
+  };
+
+  if (window.FB?.init) {
+    isFacebookSDKLoading = false;
+    if (initializedFacebookAppId.value !== appId) {
+      initializeForCurrentApp();
+    }
+    return;
+  }
+
+  const existingScript = document.querySelector<HTMLScriptElement>(
+    'script[src="https://connect.facebook.net/en_US/sdk.js"]',
+  );
+  if (existingScript) {
+    if (isFacebookSDKLoading) return;
+    isFacebookSDKLoading = true;
+    existingScript.addEventListener(
+      "load",
+      () => {
+        isFacebookSDKLoading = false;
+        initializeForCurrentApp();
+      },
+      { once: true },
+    );
+    return;
+  }
+
+  isFacebookSDKLoading = true;
   const script = document.createElement("script");
   script.src = "https://connect.facebook.net/en_US/sdk.js";
   script.async = true;
   script.defer = true;
   script.onload = () => {
-    window.FB.init({
-      appId: whatsappConfig.value!.app_id,
-      cookie: true,
-      xfbml: true,
-      version: whatsappConfig.value!.api_version,
-    });
-    isFBSDKLoaded.value = true;
+    isFacebookSDKLoading = false;
+    initializeForCurrentApp();
+  };
+  script.onerror = () => {
+    isFacebookSDKLoading = false;
+    isFBSDKLoaded.value = false;
+    script.remove();
   };
   document.body.appendChild(script);
 }
 
 function launchWhatsAppSignup(isCoexistence: boolean = true) {
+  const signupOrganizationId = activeOrganizationId.value;
+  if (!signupOrganizationId) {
+    toast.error("Select a workspace before connecting WhatsApp.");
+    return;
+  }
+  if (embeddedSignupRestartBlocked.value) {
+    toast.error(
+      "Reload this page before starting WhatsApp signup in another workspace.",
+    );
+    return;
+  }
+  if (activeEmbeddedSignupSession || activeEmbeddedSignupExchange) {
+    toast.error("A WhatsApp connection is already in progress.");
+    return;
+  }
+
+  if (whatsappConfigOrganizationId.value !== signupOrganizationId) {
+    toast.error(
+      "The Meta configuration for this workspace is still loading. Please wait.",
+    );
+    return;
+  }
+
   if (!isMetaIntegrationReady.value) {
     toast.error(
       "Complete the Meta App ID, Config ID and App Secret in Integrations first.",
@@ -205,7 +364,10 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
     return;
   }
 
-  if (!isFBSDKLoaded.value) {
+  if (
+    !isFBSDKLoaded.value ||
+    initializedFacebookAppId.value !== whatsappConfig.value?.app_id
+  ) {
     toast.error("Facebook SDK not loaded yet. Please wait...");
     return;
   }
@@ -229,7 +391,6 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
       setup: {},
       featureType: "whatsapp_business_app_onboarding",
       sessionInfoVersion: "3",
-      version: "v3",
     };
   } else {
     loginOptions.extras = {
@@ -237,44 +398,106 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
     };
   }
 
-  window.FB.login((response: any) => {
-    if (response.authResponse) {
-      const code = response.authResponse.code;
-      const phoneNumberId = response.authResponse.phone_number_id;
-      const wabaId = response.authResponse.waba_id;
+  let session: MetaEmbeddedSignupSession;
+  const handleAbort = (
+    reason: MetaEmbeddedSignupAbortReason,
+    detail?: string,
+  ) => {
+    if (reason === "cancelled") {
+      toast.error(
+        detail
+          ? `WhatsApp signup was cancelled at ${detail}.`
+          : "Facebook login was cancelled",
+      );
+    } else {
+      toast.error(detail || "Facebook signup failed");
+    }
+    isConnectingFB.value = false;
+  };
 
-      if (!code) {
-        toast.error(
-          "Incomplete data from Facebook: missing authorization code",
-        );
-        isConnectingFB.value = false;
+  session = createMetaEmbeddedSignupSession({
+    expectedSignupEvent: isCoexistence
+      ? META_EMBEDDED_SIGNUP_COEXISTENCE_FINISH
+      : META_EMBEDDED_SIGNUP_FINISH,
+    onComplete: ({ code, phoneNumberId, wabaId, signupEvent }) => {
+      if (!isEmbeddedSignupOrganizationCurrent(signupOrganizationId)) {
+        cancelPendingEmbeddedSignup(true);
         return;
       }
-
-      exchangeCodeForToken(code, phoneNumberId, wabaId);
-    } else if (response.error) {
-      toast.error(
-        `Facebook error: ${response.error.message || "Unknown error"}`,
+      exchangeCodeForToken(
+        code,
+        signupOrganizationId,
+        phoneNumberId,
+        wabaId,
+        signupEvent,
       );
-      isConnectingFB.value = false;
-    } else {
-      toast.error("Facebook login was cancelled");
-      isConnectingFB.value = false;
-    }
-  }, loginOptions);
+    },
+    onAbort: handleAbort,
+    isContextCurrent: () =>
+      isEmbeddedSignupOrganizationCurrent(signupOrganizationId),
+    onContextChanged: () => {
+      embeddedSignupRestartBlocked.value = true;
+      cancelPendingEmbeddedSignup(true);
+    },
+    onSettled: () => {
+      window.removeEventListener("message", session.handleMessage);
+      if (activeEmbeddedSignupSession === session) {
+        activeEmbeddedSignupSession = null;
+        activeEmbeddedSignupOrganizationId = null;
+      }
+    },
+  });
+  activeEmbeddedSignupSession = session;
+  activeEmbeddedSignupOrganizationId = signupOrganizationId;
+  window.addEventListener("message", session.handleMessage);
+
+  try {
+    window.FB.login(session.handleLoginResponse, loginOptions);
+  } catch {
+    session.cancel();
+    toast.error("Unable to start Facebook login. Please try again.");
+    isConnectingFB.value = false;
+  }
 }
 
 async function exchangeCodeForToken(
   code: string,
-  phoneNumberId: string,
+  organizationId: string,
+  phoneNumberId: string | undefined,
   wabaId: string,
+  signupEvent: string,
 ) {
+  if (!isEmbeddedSignupOrganizationCurrent(organizationId)) {
+    cancelPendingEmbeddedSignup(true);
+    return;
+  }
+
+  const exchange = {
+    organizationId,
+    detached: false,
+  };
+  activeEmbeddedSignupExchange = exchange;
+
   try {
-    const response = await api.post("/accounts/exchange-token", {
-      code,
-      phone_id: phoneNumberId,
-      waba_id: wabaId,
-    });
+    const response = await api.post(
+      "/accounts/exchange-token",
+      {
+        code,
+        phone_id: phoneNumberId,
+        waba_id: wabaId,
+        signup_event: signupEvent,
+      },
+      {
+        headers: { "X-Organization-ID": organizationId },
+      },
+    );
+
+    if (
+      exchange.detached ||
+      !isEmbeddedSignupOrganizationCurrent(organizationId)
+    ) {
+      return;
+    }
 
     const account = response.data.data.account;
     const pin = response.data.data.pin;
@@ -292,9 +515,18 @@ async function exchangeCodeForToken(
 
     await fetchAccounts();
   } catch (error: any) {
+    if (
+      exchange.detached ||
+      !isEmbeddedSignupOrganizationCurrent(organizationId)
+    ) {
+      return;
+    }
     toast.error(getErrorMessage(error, "Failed to connect WhatsApp account"));
   } finally {
-    isConnectingFB.value = false;
+    if (activeEmbeddedSignupExchange === exchange) {
+      activeEmbeddedSignupExchange = null;
+      isConnectingFB.value = false;
+    }
   }
 }
 

@@ -90,14 +90,14 @@ func TestGetWhatsAppAccountCached_CacheMissPopulatesCache(t *testing.T) {
 	require.NotEmpty(t, cached)
 }
 
-func TestGetWhatsAppAccountCached_CacheHitSkipsDB(t *testing.T) {
+func TestGetWhatsAppAccountCached_CacheHitUsesMatchingOwnerEntry(t *testing.T) {
 	app := cacheTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	phoneID := "phone-" + uuid.New().String()[:8]
 	acc := makeAccount(t, app, org.ID, phoneID, "real-tok", "real-secret")
 
-	// Plant a fake cache entry with a different name → if the function reads from
-	// cache, we'll see "from-cache"; if it falls through to DB we'll see acc.Name.
+	// Plant a fake cache entry with a different name. Ownership still resolves
+	// from the database first, but the full account should come from Redis.
 	cacheData := whatsAppAccountCache{
 		WhatsAppAccount: models.WhatsAppAccount{
 			BaseModel:      models.BaseModel{ID: acc.ID},
@@ -115,11 +115,43 @@ func TestGetWhatsAppAccountCached_CacheHitSkipsDB(t *testing.T) {
 
 	got, err := app.getWhatsAppAccountCached(phoneID)
 	require.NoError(t, err)
-	assert.Equal(t, "from-cache", got.Name, "cache hit must short-circuit the DB read")
+	assert.Equal(t, "from-cache", got.Name, "a matching-owner cache entry must be reused")
 	assert.Equal(t, "cached-tok", got.AccessToken,
 		"cached AccessToken must be restored on the WhatsAppAccount even though it has json:\"-\"")
 	assert.Equal(t, "cached-secret", got.AppSecret,
 		"cached AppSecret must be restored")
+}
+
+func TestGetWhatsAppAccountCached_NonRLSRejectsFormerOwnerCacheAfterTransfer(t *testing.T) {
+	app := cacheTestApp(t)
+	formerOrg := testutil.CreateTestOrganization(t, app.DB)
+	currentOrg := testutil.CreateTestOrganization(t, app.DB)
+	phoneID := "phone-transfer-" + uuid.New().String()[:8]
+	formerAccount := makeAccount(t, app, formerOrg.ID, phoneID, "former-token", "former-secret")
+
+	// Populate Redis with the former owner's account, then transfer the phone by
+	// soft-deleting that row and creating the new active claim without explicitly
+	// invalidating the cache. This simulates a stale entry surviving a handoff.
+	got, err := app.getWhatsAppAccountCached(phoneID)
+	require.NoError(t, err)
+	require.Equal(t, formerAccount.ID, got.ID)
+	require.NoError(t, app.DB.Delete(formerAccount).Error)
+	currentAccount := makeAccount(t, app, currentOrg.ID, phoneID, "current-token", "current-secret")
+
+	got, err = app.getWhatsAppAccountCached(phoneID)
+	require.NoError(t, err)
+	assert.Equal(t, currentAccount.ID, got.ID)
+	assert.Equal(t, currentOrg.ID, got.OrganizationID)
+	assert.Equal(t, "current-token", got.AccessToken)
+	assert.Equal(t, "current-secret", got.AppSecret)
+
+	cacheKey := fmt.Sprintf("%s%s", whatsappAccountCachePrefix, phoneID)
+	cached, err := app.Redis.Get(context.Background(), cacheKey).Result()
+	require.NoError(t, err)
+	var cacheData whatsAppAccountCache
+	require.NoError(t, json.Unmarshal([]byte(cached), &cacheData))
+	assert.Equal(t, currentAccount.ID, cacheData.ID)
+	assert.Equal(t, currentOrg.ID, cacheData.OrganizationID)
 }
 
 func TestGetWhatsAppAccountCached_NotFoundReturnsError(t *testing.T) {

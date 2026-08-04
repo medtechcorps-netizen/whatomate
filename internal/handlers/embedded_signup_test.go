@@ -1,16 +1,19 @@
 package handlers_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -36,6 +39,10 @@ func TestApp_ExchangeToken_Success_AutoRegistration(t *testing.T) {
 	// Use unique IDs to prevent conflicts with parallel tests
 	phoneID := fmt.Sprintf("123456789%d", time.Now().UnixNano()%1000000)
 	wabaID := fmt.Sprintf("987654321%d", time.Now().UnixNano()%1000000)
+	cacheKey := "whatsapp:account:v2:" + phoneID
+	require.NoError(t, app.Redis.Set(context.Background(), cacheKey, "stale-former-owner-entry", time.Hour).Err())
+	var durableClaimObservedAtRegistration atomic.Bool
+	var staleCacheObservedAtRegistration atomic.Bool
 
 	// Mock Meta API server
 	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,6 +72,16 @@ func TestApp_ExchangeToken_Success_AutoRegistration(t *testing.T) {
 			})
 		case strings.Contains(path, phoneID):
 			if strings.HasSuffix(path, "/register") {
+				var claimCount int64
+				if err := app.DB.Model(&models.WhatsAppAccount{}).
+					Where("phone_id = ? AND organization_id = ?", phoneID, org.ID).
+					Count(&claimCount).Error; err == nil && claimCount == 1 {
+					durableClaimObservedAtRegistration.Store(true)
+				}
+				exists, err := app.Redis.Exists(context.Background(), cacheKey).Result()
+				if err != nil || exists != 0 {
+					staleCacheObservedAtRegistration.Store(true)
+				}
 				// Registration
 				w.WriteHeader(http.StatusOK)
 				_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -102,6 +119,10 @@ func TestApp_ExchangeToken_Success_AutoRegistration(t *testing.T) {
 	err := app.ExchangeToken(req)
 	require.NoError(t, err)
 	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.True(t, durableClaimObservedAtRegistration.Load(),
+		"the ownership claim must be committed before registration starts")
+	assert.False(t, staleCacheObservedAtRegistration.Load(),
+		"the former-owner cache entry must be invalidated before registration starts")
 
 	var resp struct {
 		Data map[string]interface{} `json:"data"`
@@ -235,6 +256,171 @@ func TestApp_ExchangeToken_Success_PendingRegistration(t *testing.T) {
 	assert.Nil(t, resp.Data["pin"]) // No PIN when pending
 }
 
+func TestApp_ExchangeToken_ReconnectMetaRejectionRetainsPriorPIN(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
+	phoneID := "reconnect-phone-" + uuid.NewString()
+	wabaID := "reconnect-waba-" + uuid.NewString()
+	const priorPIN = "112233"
+	encryptedPIN, err := crypto.Encrypt(priorPIN, app.Config.App.EncryptionKey)
+	require.NoError(t, err)
+	require.NoError(t, app.DB.Create(&models.WhatsAppAccount{
+		OrganizationID: org.ID,
+		Name:           "Existing reconnect account " + uuid.NewString(),
+		PhoneID:        phoneID,
+		BusinessID:     wabaID,
+		AccessToken:    "old-token",
+		APIVersion:     "v21.0",
+		Status:         "active",
+		Pin:            encryptedPIN,
+	}).Error)
+
+	var subscribeCalls atomic.Int32
+	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/oauth/access_token"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "new-token"})
+		case strings.HasSuffix(path, "/debug_token"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"app_id": embeddedSignupTestAppID, "is_valid": true,
+				"scopes":                 []string{"business_management", "whatsapp_business_management", "whatsapp_business_messaging"},
+				"expires_at":             time.Now().UTC().Add(2 * time.Hour).Unix(),
+				"data_access_expires_at": time.Now().UTC().Add(time.Hour).Unix(),
+			}})
+		case strings.HasSuffix(path, "/"+phoneID+"/register"):
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+				"message": "Two-step verification is already enabled", "code": 33,
+			}})
+		case strings.HasSuffix(path, "/"+wabaID+"/subscribed_apps"):
+			subscribeCalls.Add(1)
+		case strings.HasSuffix(path, "/"+wabaID+"/phone_numbers"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": phoneID}}})
+		case strings.HasSuffix(path, "/"+phoneID):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": phoneID, "verified_name": "Reconnect Phone",
+				"display_phone_number": "+60444444444", "code_verification_status": "VERIFIED",
+				"platform_type": "CLOUD_API",
+			})
+		case strings.HasSuffix(path, "/"+wabaID):
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": wabaID, "name": "Reconnect WABA"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer metaServer.Close()
+
+	app.Config.WhatsApp.AppID = embeddedSignupTestAppID
+	app.Config.WhatsApp.AppSecret = embeddedSignupTestAppSecret
+	app.Config.WhatsApp.APIVersion = "v21.0"
+	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code": "reconnect-code", "phone_id": phoneID, "waba_id": wabaID,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	require.NoError(t, app.ExchangeToken(req))
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Zero(t, subscribeCalls.Load(), "subscription must not run after registration rejection")
+
+	var response struct {
+		Data map[string]any `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &response))
+	assert.NotContains(t, response.Data, "pin")
+	assert.Contains(t, response.Data["warning"], "Registration failed")
+
+	var persisted models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&persisted).Error)
+	persisted.DecryptSecrets(app.Config.App.EncryptionKey)
+	assert.Equal(t, "active", persisted.Status)
+	assert.Equal(t, priorPIN, persisted.Pin)
+}
+
+func TestApp_ExchangeToken_RejectsConcurrentReconnectBeforeMetaMutation(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
+	phoneID := "concurrent-reconnect-phone-" + uuid.NewString()
+	wabaID := "concurrent-reconnect-waba-" + uuid.NewString()
+	attemptID := uuid.New()
+	attemptStartedAt := time.Now().UTC()
+	record := models.WhatsAppAccount{
+		OrganizationID:             org.ID,
+		Name:                       "Reconnect already running " + uuid.NewString(),
+		PhoneID:                    phoneID,
+		BusinessID:                 wabaID,
+		AccessToken:                "existing-token",
+		APIVersion:                 "v21.0",
+		Status:                     "pending_registration",
+		ConnectionAttemptID:        &attemptID,
+		ConnectionAttemptStartedAt: &attemptStartedAt,
+	}
+	require.NoError(t, app.DB.Create(&record).Error)
+
+	var registerCalls atomic.Int32
+	var subscribeCalls atomic.Int32
+	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/oauth/access_token"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "new-token"})
+		case strings.HasSuffix(path, "/debug_token"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"app_id": embeddedSignupTestAppID, "is_valid": true,
+				"scopes":                 []string{"business_management", "whatsapp_business_management", "whatsapp_business_messaging"},
+				"expires_at":             time.Now().UTC().Add(2 * time.Hour).Unix(),
+				"data_access_expires_at": time.Now().UTC().Add(time.Hour).Unix(),
+			}})
+		case strings.HasSuffix(path, "/"+phoneID+"/register"):
+			registerCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		case strings.HasSuffix(path, "/"+wabaID+"/subscribed_apps"):
+			subscribeCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		case strings.HasSuffix(path, "/"+wabaID+"/phone_numbers"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": phoneID}}})
+		case strings.HasSuffix(path, "/"+phoneID):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": phoneID, "verified_name": "Concurrent Reconnect",
+				"display_phone_number": "+60555555555", "code_verification_status": "VERIFIED",
+				"platform_type": "CLOUD_API",
+			})
+		case strings.HasSuffix(path, "/"+wabaID):
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": wabaID, "name": "Concurrent Reconnect WABA"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer metaServer.Close()
+
+	app.Config.WhatsApp.AppID = embeddedSignupTestAppID
+	app.Config.WhatsApp.AppSecret = embeddedSignupTestAppSecret
+	app.Config.WhatsApp.APIVersion = "v21.0"
+	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code": "concurrent-reconnect-code", "phone_id": phoneID, "waba_id": wabaID,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	require.NoError(t, app.ExchangeToken(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "already in progress")
+	assert.Zero(t, registerCalls.Load())
+	assert.Zero(t, subscribeCalls.Load())
+
+	var persisted models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", record.ID).First(&persisted).Error)
+	require.NotNil(t, persisted.ConnectionAttemptID)
+	assert.Equal(t, attemptID, *persisted.ConnectionAttemptID)
+	assert.Equal(t, "existing-token", persisted.AccessToken)
+}
+
 func TestApp_ExchangeToken_InvalidCode(t *testing.T) {
 	t.Parallel()
 
@@ -284,120 +470,42 @@ func TestApp_ExchangeToken_InvalidCode(t *testing.T) {
 	assert.Contains(t, body, "Meta authorization code exchange failed")
 }
 
-func TestApp_ExchangeToken_Success_CodeOnly_Discovery(t *testing.T) {
+func TestApp_ExchangeToken_RejectsClassicSignupWithoutExactAssetsBeforeCodeExchange(t *testing.T) {
 	t.Parallel()
 
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := createAdminUser(t, app, org.ID)
-
-	phoneID := fmt.Sprintf("333456789%d", time.Now().UnixNano()%1000000)
-	wabaID := fmt.Sprintf("777654321%d", time.Now().UnixNano()%1000000)
-
+	var oauthCalls atomic.Int32
 	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		switch {
-		case strings.Contains(path, "/oauth/access_token"):
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"access_token": "discovery_token",
-			})
-		case strings.Contains(path, "/debug_token"):
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"data": whatsapp.TokenDebugInfo{
-					AppID:   embeddedSignupTestAppID,
-					IsValid: true,
-					Scopes: []string{
-						"business_management",
-						"whatsapp_business_management",
-						"whatsapp_business_messaging",
-					},
-					ExpiresAt:           time.Now().UTC().Add(2 * time.Hour).Unix(),
-					DataAccessExpiresAt: time.Now().UTC().Add(time.Hour).Unix(),
-					GranularScopes: []struct {
-						Scope     string   `json:"scope"`
-						TargetIds []string `json:"target_ids,omitempty"`
-					}{
-						{
-							Scope:     "whatsapp_business_management",
-							TargetIds: []string{wabaID},
-						},
-					},
-				},
-			})
-		case strings.Contains(path, wabaID) && strings.Contains(path, "/phone_numbers"):
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(whatsapp.WABAPhoneNumbersResponse{
-				Data: []struct {
-					ID                 string `json:"id"`
-					DisplayPhoneNumber string `json:"display_phone_number"`
-					VerifiedName       string `json:"verified_name"`
-					QualityRating      string `json:"quality_rating"`
-				}{
-					{
-						ID:                 phoneID,
-						DisplayPhoneNumber: "+1999999999",
-						VerifiedName:       "Discovered Phone",
-						QualityRating:      "GREEN",
-					},
-				},
-			})
-		case strings.Contains(path, "/me/accounts"):
-			// Fallback mock (should not be reached if debug_token works)
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(whatsapp.SharedWABAResponse{})
-		case strings.Contains(path, phoneID) && strings.Contains(path, "/register"):
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
-		case strings.Contains(path, wabaID) && strings.Contains(path, "/subscribed_apps"):
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
-		case strings.Contains(path, phoneID): // Phone Info
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"verified_name":        "Discovered Phone",
-				"display_phone_number": "+1999999999",
-			})
-		case strings.Contains(path, wabaID):
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"id":   wabaID,
-				"name": "Discovered WABA",
-			})
-		default:
-			w.WriteHeader(http.StatusNotFound)
+		if strings.Contains(r.URL.Path, "/oauth/access_token") {
+			oauthCalls.Add(1)
 		}
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer metaServer.Close()
 
-	app.Config.WhatsApp.AppID = embeddedSignupTestAppID
-	app.Config.WhatsApp.AppSecret = embeddedSignupTestAppSecret
-	app.Config.WhatsApp.APIVersion = "v21.0"
 	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
 
-	// Omit phone_id and waba_id
-	req := testutil.NewJSONRequest(t, map[string]interface{}{
-		"code": "test_code_only",
-	})
-	testutil.SetAuthContext(req, org.ID, user.ID)
-
-	err := app.ExchangeToken(req)
-	require.NoError(t, err)
-	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
-
-	var resp struct {
-		Data map[string]interface{} `json:"data"`
+	tests := []struct {
+		name string
+		body map[string]any
+	}{
+		{name: "code only", body: map[string]any{"code": "code-only"}},
+		{name: "missing phone", body: map[string]any{"code": "code", "waba_id": "waba"}},
+		{name: "missing WABA", body: map[string]any{"code": "code", "phone_id": "phone"}},
+		{name: "whitespace IDs", body: map[string]any{"code": "code", "phone_id": "  ", "waba_id": "\t"}},
 	}
-	err = json.Unmarshal(testutil.GetResponseBody(req), &resp)
-	require.NoError(t, err)
 
-	accountMap, ok := resp.Data["account"].(map[string]interface{})
-	require.True(t, ok)
-	assert.Equal(t, "active", accountMap["status"])
-	assert.Equal(t, phoneID, accountMap["phone_id"])
-	assert.Equal(t, wabaID, accountMap["business_id"])
-	assert.Equal(t, "v21.0", accountMap["api_version"])
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := testutil.NewJSONRequest(t, tc.body)
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			require.NoError(t, app.ExchangeToken(req))
+			assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+		})
+	}
+	assert.Zero(t, oauthCalls.Load(), "invalid asset payloads must not consume the short-lived code")
 }
 
 func TestApp_ExchangeToken_MissingFields(t *testing.T) {
@@ -416,6 +524,175 @@ func TestApp_ExchangeToken_MissingFields(t *testing.T) {
 	err := app.ExchangeToken(req)
 	require.NoError(t, err)
 	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+}
+
+func TestApp_ExchangeToken_CoexistenceSelectsVerifiedBusinessAppPhoneAcrossPages(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
+	phoneID := "coexistence-phone-" + uuid.NewString()
+	otherPhoneID := "cloud-phone-" + uuid.NewString()
+	wabaID := "coexistence-waba-" + uuid.NewString()
+	var registerCalls atomic.Int32
+	var subscribeCalls atomic.Int32
+
+	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/oauth/access_token"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "coexistence-token"})
+		case strings.HasSuffix(path, "/debug_token"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"app_id": embeddedSignupTestAppID, "is_valid": true,
+				"scopes":                 []string{"business_management", "whatsapp_business_management", "whatsapp_business_messaging"},
+				"expires_at":             time.Now().UTC().Add(2 * time.Hour).Unix(),
+				"data_access_expires_at": time.Now().UTC().Add(time.Hour).Unix(),
+			}})
+		case strings.HasSuffix(path, "/"+phoneID+"/register"):
+			registerCalls.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		case strings.HasSuffix(path, "/"+wabaID+"/subscribed_apps"):
+			subscribeCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		case strings.HasSuffix(path, "/"+wabaID+"/phone_numbers"):
+			assert.Contains(t, r.URL.Query().Get("fields"), "is_on_biz_app")
+			assert.Contains(t, r.URL.Query().Get("fields"), "platform_type")
+			if r.URL.Query().Get("after") == "page-2" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{
+					"id": phoneID, "display_phone_number": "+60111111111",
+					"verified_name": "Coexistence Clinic", "is_on_biz_app": true,
+					"platform_type": "CLOUD_API",
+				}}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{{
+					"id": otherPhoneID, "display_phone_number": "+60222222222",
+					"verified_name": "Cloud Only", "is_on_biz_app": false,
+					"platform_type": "CLOUD_API",
+				}},
+				"paging": map[string]any{
+					"cursors": map[string]string{"after": "page-2"},
+					"next":    "https://graph.facebook.com/next",
+				},
+			})
+		case strings.HasSuffix(path, "/"+phoneID):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": phoneID, "verified_name": "Coexistence Clinic",
+				"display_phone_number": "+60111111111", "is_on_biz_app": true,
+				"platform_type": "CLOUD_API", "code_verification_status": "VERIFIED",
+			})
+		case strings.HasSuffix(path, "/"+wabaID):
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": wabaID, "name": "Coexistence WABA"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer metaServer.Close()
+
+	app.Config.WhatsApp.AppID = embeddedSignupTestAppID
+	app.Config.WhatsApp.AppSecret = embeddedSignupTestAppSecret
+	app.Config.WhatsApp.APIVersion = "v21.0"
+	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code":         "coexistence-code",
+		"waba_id":      wabaID,
+		"signup_event": "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	require.NoError(t, app.ExchangeToken(req))
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var response struct {
+		Data struct {
+			Account handlers.AccountResponse `json:"account"`
+			Pin     string                   `json:"pin"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &response))
+	assert.Equal(t, phoneID, response.Data.Account.PhoneID)
+	assert.Equal(t, "active", response.Data.Account.Status)
+	assert.Empty(t, response.Data.Pin)
+	assert.Zero(t, registerCalls.Load())
+	assert.Equal(t, int32(1), subscribeCalls.Load())
+
+	var persisted models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&persisted).Error)
+	assert.True(t, persisted.IsSMB)
+}
+
+func TestApp_ExchangeToken_RejectsCrossWorkspacePhoneClaimBeforeMetaMutation(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	ownerOrg := testutil.CreateTestOrganization(t, app.DB)
+	claimantOrg := testutil.CreateTestOrganization(t, app.DB)
+	claimant := createAdminUser(t, app, claimantOrg.ID)
+	phoneID := "owned-phone-" + uuid.NewString()
+	wabaID := "owned-waba-" + uuid.NewString()
+	require.NoError(t, app.DB.Create(&models.WhatsAppAccount{
+		OrganizationID: ownerOrg.ID,
+		Name:           "Existing phone owner " + uuid.NewString(),
+		PhoneID:        phoneID,
+		BusinessID:     wabaID,
+		AccessToken:    "existing-token",
+		APIVersion:     "v21.0",
+		Status:         "active",
+	}).Error)
+
+	var registerCalls atomic.Int32
+	var subscribeCalls atomic.Int32
+	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/oauth/access_token"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "claim-token"})
+		case strings.HasSuffix(path, "/debug_token"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"app_id": embeddedSignupTestAppID, "is_valid": true,
+				"scopes":                 []string{"business_management", "whatsapp_business_management", "whatsapp_business_messaging"},
+				"expires_at":             time.Now().UTC().Add(2 * time.Hour).Unix(),
+				"data_access_expires_at": time.Now().UTC().Add(time.Hour).Unix(),
+			}})
+		case strings.HasSuffix(path, "/"+phoneID+"/register"):
+			registerCalls.Add(1)
+		case strings.HasSuffix(path, "/"+wabaID+"/subscribed_apps"):
+			subscribeCalls.Add(1)
+		case strings.HasSuffix(path, "/"+wabaID+"/phone_numbers"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": phoneID}}})
+		case strings.HasSuffix(path, "/"+phoneID):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": phoneID, "verified_name": "Owned Phone", "display_phone_number": "+60333333333",
+				"code_verification_status": "VERIFIED", "platform_type": "CLOUD_API",
+			})
+		case strings.HasSuffix(path, "/"+wabaID):
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": wabaID, "name": "Owned WABA"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer metaServer.Close()
+
+	app.Config.WhatsApp.AppID = embeddedSignupTestAppID
+	app.Config.WhatsApp.AppSecret = embeddedSignupTestAppSecret
+	app.Config.WhatsApp.APIVersion = "v21.0"
+	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code": "claim-code", "phone_id": phoneID, "waba_id": wabaID,
+	})
+	testutil.SetAuthContext(req, claimantOrg.ID, claimant.ID)
+	require.NoError(t, app.ExchangeToken(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "already connected")
+	assert.Zero(t, registerCalls.Load())
+	assert.Zero(t, subscribeCalls.Load())
+
+	var activeCount int64
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where("phone_id = ?", phoneID).Count(&activeCount).Error)
+	assert.Equal(t, int64(1), activeCount)
 }
 
 func TestApp_ExchangeToken_RejectsDuplicateAccountWebhookVerifyToken(t *testing.T) {
@@ -468,29 +745,38 @@ func TestApp_RegisterPhoneNumber_Success_WithPIN(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := createAdminUser(t, app, org.ID)
+	phoneID := "register-with-pin-" + uuid.NewString()
 
 	// Create account with pending_registration status
 	account := &models.WhatsAppAccount{
 		OrganizationID: org.ID,
 		Name:           "Test Account - RegisterPhone WithPIN",
-		PhoneID:        "123456789",
+		PhoneID:        phoneID,
 		BusinessID:     "987654321",
 		AccessToken:    "test_token",
 		APIVersion:     "v21.0",
 		Status:         "pending_registration",
 	}
 	require.NoError(t, app.DB.Create(account).Error)
+	var pendingVisibleAtMeta atomic.Bool
 
 	// Mock Meta API server
 	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/register") {
 			// Registration call
-			assert.Equal(t, "/v21.0/123456789/register", r.URL.Path)
+			assert.Equal(t, "/v21.0/"+phoneID+"/register", r.URL.Path)
 			assert.Equal(t, "Bearer test_token", r.Header.Get("Authorization"))
 
 			var body map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			assert.Equal(t, "654321", body["pin"])
+			var pending models.WhatsAppAccount
+			if err := app.DB.First(&pending, "id = ? AND organization_id = ?", account.ID, org.ID).Error; err == nil && pending.Status == "pending_registration" {
+				pending.DecryptSecrets(app.Config.App.EncryptionKey)
+				if pending.Pin == "654321" {
+					pendingVisibleAtMeta.Store(true)
+				}
+			}
 
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -498,7 +784,7 @@ func TestApp_RegisterPhoneNumber_Success_WithPIN(t *testing.T) {
 			// GetPhoneNumberInfo call — return non-SMB phone info
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]string{
-				"id":            "123456789",
+				"id":            phoneID,
 				"platform_type": "CLOUD_API",
 			})
 		}
@@ -532,6 +818,7 @@ func TestApp_RegisterPhoneNumber_Success_WithPIN(t *testing.T) {
 	assert.True(t, crypto.IsEncrypted(updated.Pin))
 	updated.DecryptSecrets(app.Config.App.EncryptionKey)
 	assert.Equal(t, "654321", updated.Pin)
+	assert.True(t, pendingVisibleAtMeta.Load(), "pending registration and exact PIN must be committed before the Meta call")
 
 	// Verify audit log exists
 	time.Sleep(50 * time.Millisecond)
@@ -546,11 +833,12 @@ func TestApp_RegisterPhoneNumber_Success_GeneratedPIN(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := createAdminUser(t, app, org.ID)
+	phoneID := "register-generated-pin-" + uuid.NewString()
 
 	account := &models.WhatsAppAccount{
 		OrganizationID: org.ID,
 		Name:           "Test Account - GeneratedPIN",
-		PhoneID:        "123456789",
+		PhoneID:        phoneID,
 		BusinessID:     "987654321",
 		AccessToken:    "test_token",
 		APIVersion:     "v21.0",
@@ -571,7 +859,7 @@ func TestApp_RegisterPhoneNumber_Success_GeneratedPIN(t *testing.T) {
 			// GetPhoneNumberInfo call — return non-SMB phone info
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]string{
-				"id":            "123456789",
+				"id":            phoneID,
 				"platform_type": "CLOUD_API",
 			})
 		}
@@ -619,11 +907,12 @@ func TestApp_RegisterPhoneNumber_RegistrationFailed(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := createAdminUser(t, app, org.ID)
+	phoneID := "register-failure-" + uuid.NewString()
 
 	account := &models.WhatsAppAccount{
 		OrganizationID: org.ID,
 		Name:           "Test Account - RegFailed",
-		PhoneID:        "123456789",
+		PhoneID:        phoneID,
 		BusinessID:     "987654321",
 		AccessToken:    "test_token",
 		APIVersion:     "v21.0",
@@ -717,12 +1006,13 @@ func TestApp_RegisterPhoneNumber_CrossOrgIsolation(t *testing.T) {
 	org1 := testutil.CreateTestOrganization(t, app.DB)
 	org2 := testutil.CreateTestOrganization(t, app.DB)
 	user2 := createAdminUser(t, app, org2.ID)
+	phoneID := "register-cross-org-" + uuid.NewString()
 
 	// Create account in org1
 	account := &models.WhatsAppAccount{
 		OrganizationID: org1.ID,
 		Name:           "Test Account - CrossOrg Isolation",
-		PhoneID:        "123456789",
+		PhoneID:        phoneID,
 		BusinessID:     "987654321",
 		AccessToken:    "test_token",
 		APIVersion:     "v21.0",

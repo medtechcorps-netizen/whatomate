@@ -95,7 +95,7 @@ func TestApp_WebhookVerify_AccountTokenSucceeds(t *testing.T) {
 		BaseModel:          models.BaseModel{ID: uuid.New()},
 		OrganizationID:     org.ID,
 		Name:               "wbk-acc",
-		PhoneID:            "phone-1",
+		PhoneID:            "account-token-phone-" + uuid.NewString(),
 		BusinessID:         "biz-1",
 		AccessToken:        "tok",
 		WebhookVerifyToken: "per-account-token",

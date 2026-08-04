@@ -244,6 +244,44 @@ func TestCreateAccountValidatesRelationshipPersistsPendingThenActivates(t *testi
 	assert.True(t, appcrypto.IsEncrypted(stored.AccessToken))
 }
 
+func TestCreateAccountMetaStateSurvivesOuterRequestRollback(t *testing.T) {
+	phoneID := "contract-phone-independent-" + uuid.NewString()
+	wabaID := "contract-waba-independent-" + uuid.NewString()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+
+	var sawCommittedPending bool
+	meta.onSubscribe = func() {
+		var account models.WhatsAppAccount
+		if err := app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&account).Error; err == nil {
+			sawCommittedPending = account.Status == "pending_subscription" &&
+				appcrypto.IsEncrypted(account.AccessToken)
+		}
+	}
+
+	outer := app.DB.Begin()
+	require.NoError(t, outer.Error)
+	scoped := app.scopedApp(outer, org.ID)
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"name":         "Independent Contract",
+		"phone_id":     phoneID,
+		"business_id":  wabaID,
+		"access_token": "synthetic-independent-token",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	require.NoError(t, scoped.CreateAccount(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	require.NoError(t, outer.Rollback().Error)
+
+	assert.True(t, sawCommittedPending, "Meta must see a pending row committed outside the request transaction")
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&stored).Error)
+	assert.Equal(t, "active", stored.Status, "provider outcome must survive an unrelated request rollback")
+	assert.True(t, appcrypto.IsEncrypted(stored.AccessToken))
+}
+
 func TestCreateAccountRejectsPhoneWABAMismatchBeforePersistence(t *testing.T) {
 	phoneID := "contract-phone-mismatch"
 	wabaID := "contract-waba-mismatch"

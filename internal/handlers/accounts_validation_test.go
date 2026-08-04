@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,6 +161,7 @@ func newAppWithMeta(t *testing.T, meta *fakeMetaServer) *handlers.App {
 // (encryption is a no-op when EncryptionKey == "").
 func createTestAccountForValidation(t *testing.T, db *gorm.DB, orgID uuid.UUID, phoneID, businessID string) *models.WhatsAppAccount {
 	t.Helper()
+	phoneID += "-" + uuid.NewString()
 	acc := &models.WhatsAppAccount{
 		BaseModel:          models.BaseModel{ID: uuid.New()},
 		OrganizationID:     orgID,
@@ -195,7 +197,7 @@ func TestApp_TestAccountConnection_Success(t *testing.T) {
 	admin := createAccountValidationAdmin(t, app, org.ID)
 	// Default phone-numbers list is empty — override so the ID matches.
 	meta.listFn = func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"phone-1"}]}`))
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": acc.PhoneID}}})
 	}
 
 	req := testutil.NewGETRequest(t)
@@ -227,7 +229,7 @@ func TestApp_TestAccountConnection_FallbackToWABA(t *testing.T) {
 	admin := createAccountValidationAdmin(t, app, org.ID)
 
 	meta.listFn = func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"phone-1"}]}`))
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": acc.PhoneID}}})
 	}
 	// Return null/empty for both messaging_limit_tier and whatsapp_business_manager_messaging_limit from phone query
 	meta.phoneFn = func(w http.ResponseWriter, r *http.Request) {
@@ -264,7 +266,7 @@ func TestApp_TestAccountConnection_SandboxFlagged(t *testing.T) {
 		_, _ = w.Write([]byte(`{"display_phone_number":"+1555000","verified_name":"Test","account_mode":"SANDBOX","code_verification_status":"VERIFIED","quality_rating":"GREEN"}`))
 	}
 	meta.listFn = func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"phone-1"}]}`))
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": acc.PhoneID}}})
 	}
 
 	req := testutil.NewGETRequest(t)
@@ -372,6 +374,14 @@ func TestApp_SubscribeApp_Success(t *testing.T) {
 	org := testutil.CreateTestOrganization(t, app.DB)
 	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-1", "biz-1")
 	admin := createAccountValidationAdmin(t, app, org.ID)
+	var pendingVisibleAtMeta atomic.Bool
+	meta.subFn = func(w http.ResponseWriter, _ *http.Request) {
+		var pending models.WhatsAppAccount
+		if err := app.DB.First(&pending, "id = ? AND organization_id = ?", acc.ID, org.ID).Error; err == nil && pending.Status == "pending_subscription" {
+			pendingVisibleAtMeta.Store(true)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	}
 
 	req := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(req, org.ID, admin.ID)
@@ -388,6 +398,7 @@ func TestApp_SubscribeApp_Success(t *testing.T) {
 	var stored models.WhatsAppAccount
 	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", acc.ID, org.ID).First(&stored).Error)
 	assert.Equal(t, "active", stored.Status)
+	assert.True(t, pendingVisibleAtMeta.Load(), "pending subscription state must be committed before Meta is called")
 	// Verify Meta was actually called on the subscribe endpoint.
 	assert.Greater(t, meta.hits["/v18.0/biz-1/subscribed_apps"], 0, "expected POST to subscribed_apps endpoint")
 }
@@ -415,6 +426,9 @@ func TestApp_SubscribeApp_MetaFails(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &resp))
 	assert.Equal(t, false, resp.Data["success"])
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.First(&stored, "id = ? AND organization_id = ?", acc.ID, org.ID).Error)
+	assert.Equal(t, "subscription_failed", stored.Status)
 }
 
 func TestApp_SubscribeApp_AccountNotFound(t *testing.T) {
@@ -510,12 +524,13 @@ func TestApp_CreateAccount_DefaultAPIVersionAppliedWhenMissing(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	meta := enableValidManualAccountTokenPreflight(t, app)
-	allowMetaAccountRelationship(meta, "p")
+	phoneID := "default-version-" + uuid.NewString()
+	allowMetaAccountRelationship(meta, phoneID)
 	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":         "no-api-ver",
-		"phone_id":     "p",
+		"phone_id":     phoneID,
 		"business_id":  "b",
 		"access_token": "tok",
 	})
@@ -533,12 +548,13 @@ func TestApp_CreateAccount_DoesNotCreateDuplicateAccountVerifyToken(t *testing.T
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	meta := enableValidManualAccountTokenPreflight(t, app)
-	allowMetaAccountRelationship(meta, "p")
+	phoneID := "central-verify-token-" + uuid.NewString()
+	allowMetaAccountRelationship(meta, phoneID)
 	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":         "auto-vt",
-		"phone_id":     "p",
+		"phone_id":     phoneID,
 		"business_id":  "b",
 		"access_token": "tok",
 	})

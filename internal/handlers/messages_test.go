@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,9 +54,9 @@ func newMockWhatsAppServer() *mockWhatsAppServer {
 
 		// Handle different endpoints
 		switch {
-		case r.URL.Path == "/v18.0/phone-123/messages" && r.Method == http.MethodPost:
+		case strings.HasPrefix(r.URL.Path, "/v18.0/") && strings.HasSuffix(r.URL.Path, "/messages") && r.Method == http.MethodPost:
 			m.handleMessages(w, r)
-		case r.URL.Path == "/v18.0/phone-123/media" && r.Method == http.MethodPost:
+		case strings.HasPrefix(r.URL.Path, "/v18.0/") && strings.HasSuffix(r.URL.Path, "/media") && r.Method == http.MethodPost:
 			m.handleMediaUpload(w, r)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -144,7 +145,7 @@ func createTestAccount(t *testing.T, app *handlers.App, orgID uuid.UUID) *models
 		BaseModel:          models.BaseModel{ID: uuid.New()},
 		OrganizationID:     orgID,
 		Name:               "test-account-" + uuid.New().String()[:8],
-		PhoneID:            "phone-123",
+		PhoneID:            "phone-" + uuid.NewString(),
 		BusinessID:         "business-123",
 		AccessToken:        "test-token",
 		WebhookVerifyToken: "webhook-token",

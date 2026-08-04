@@ -155,14 +155,21 @@ func (a *App) resolveWhatsAppOrganization(phoneID string) (uuid.UUID, error) {
 			return uuid.Nil, fmt.Errorf("parse WhatsApp tenant: %w", err)
 		}
 	} else {
-		var account models.WhatsAppAccount
+		var accounts []models.WhatsAppAccount
 		if err := root.DB.
 			Select("organization_id").
 			Where("phone_id = ?", phoneID).
-			First(&account).Error; err != nil {
+			Limit(2).
+			Find(&accounts).Error; err != nil {
 			return uuid.Nil, err
 		}
-		organizationID = account.OrganizationID
+		if len(accounts) == 0 {
+			return uuid.Nil, gorm.ErrRecordNotFound
+		}
+		if len(accounts) != 1 {
+			return uuid.Nil, errors.New("ambiguous WhatsApp phone ownership")
+		}
+		organizationID = accounts[0].OrganizationID
 	}
 	if organizationID == uuid.Nil {
 		return uuid.Nil, gorm.ErrRecordNotFound
