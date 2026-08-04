@@ -14,7 +14,6 @@ func validEmbeddedSignupToken(now time.Time) *whatsapp.TokenDebugInfo {
 		AppID:   "meta-app-123",
 		IsValid: true,
 		Scopes: []string{
-			"business_management",
 			"whatsapp_business_management",
 			"whatsapp_business_messaging",
 		},
@@ -23,7 +22,7 @@ func validEmbeddedSignupToken(now time.Time) *whatsapp.TokenDebugInfo {
 	}
 }
 
-func TestValidateMetaEmbeddedSignupTokenRequiresAppScopesAndTracksEarliestExpiry(t *testing.T) {
+func TestValidateMetaEmbeddedSignupTokenRequiresWhatsAppScopesAndTracksEarliestExpiry(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
 	info := validEmbeddedSignupToken(now)
@@ -34,7 +33,6 @@ func TestValidateMetaEmbeddedSignupTokenRequiresAppScopesAndTracksEarliestExpiry
 	assert.Equal(t, now.Add(time.Hour), *expiresAt)
 
 	for _, missing := range []string{
-		"business_management",
 		"whatsapp_business_management",
 		"whatsapp_business_messaging",
 	} {

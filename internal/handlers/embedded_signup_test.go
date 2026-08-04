@@ -53,7 +53,7 @@ func TestApp_ExchangeToken_Success_AutoRegistration(t *testing.T) {
 				"data": map[string]any{
 					"app_id":                 embeddedSignupTestAppID,
 					"is_valid":               true,
-					"scopes":                 []string{"business_management", "whatsapp_business_management", "whatsapp_business_messaging"},
+					"scopes":                 []string{"whatsapp_business_management", "whatsapp_business_messaging"},
 					"expires_at":             time.Now().UTC().Add(2 * time.Hour).Unix(),
 					"data_access_expires_at": time.Now().UTC().Add(time.Hour).Unix(),
 				},
@@ -163,7 +163,7 @@ func TestApp_ExchangeToken_Success_PendingRegistration(t *testing.T) {
 				"data": map[string]any{
 					"app_id":                 embeddedSignupTestAppID,
 					"is_valid":               true,
-					"scopes":                 []string{"business_management", "whatsapp_business_management", "whatsapp_business_messaging"},
+					"scopes":                 []string{"whatsapp_business_management", "whatsapp_business_messaging"},
 					"expires_at":             time.Now().UTC().Add(2 * time.Hour).Unix(),
 					"data_access_expires_at": time.Now().UTC().Add(time.Hour).Unix(),
 				},
@@ -309,7 +309,6 @@ func TestApp_ExchangeToken_Success_CodeOnly_Discovery(t *testing.T) {
 					AppID:   embeddedSignupTestAppID,
 					IsValid: true,
 					Scopes: []string{
-						"business_management",
 						"whatsapp_business_management",
 						"whatsapp_business_messaging",
 					},

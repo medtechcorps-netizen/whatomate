@@ -56,7 +56,6 @@ func newFakeMetaServer(t *testing.T) *fakeMetaServer {
 					"app_id":   "manual-test-meta-app",
 					"is_valid": true,
 					"scopes": []string{
-						"business_management",
 						"whatsapp_business_management",
 						"whatsapp_business_messaging",
 					},
@@ -594,7 +593,6 @@ func TestApp_CreateAccountRejectsManualTokenMissingRequiredScopeBeforeSave(t *te
 				"app_id":   "manual-test-meta-app",
 				"is_valid": true,
 				"scopes": []string{
-					"business_management",
 					"whatsapp_business_management",
 				},
 				"expires_at": time.Now().UTC().Add(time.Hour).Unix(),
@@ -635,7 +633,6 @@ func TestApp_UpdateAccountRejectsInvalidManualTokenWithoutChangingAccount(t *tes
 				"app_id":   "different-meta-app",
 				"is_valid": true,
 				"scopes": []string{
-					"business_management",
 					"whatsapp_business_management",
 					"whatsapp_business_messaging",
 				},

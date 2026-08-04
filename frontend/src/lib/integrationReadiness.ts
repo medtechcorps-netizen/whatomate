@@ -391,7 +391,7 @@ const builders: Record<
       label: "Meta permissions & App Review",
       state: "managed",
       detail:
-        "Verify business_management, whatsapp_business_management and whatsapp_business_messaging access in Meta before onboarding customers.",
+        "Verify whatsapp_business_management and whatsapp_business_messaging access in Meta before onboarding customers.",
     },
     {
       key: "callback_endpoint",
