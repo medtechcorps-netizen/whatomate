@@ -53,6 +53,25 @@ func TestApp_CreateOrganization_Success(t *testing.T) {
 	assert.NotEmpty(t, resp.Data.Slug)
 	assert.NotEqual(t, uuid.Nil, resp.Data.ID)
 	assert.NotEmpty(t, resp.Data.CreatedAt)
+
+	var onboarding models.OrganizationOnboarding
+	require.NoError(t, app.DB.Where("organization_id = ?", resp.Data.ID).First(&onboarding).Error)
+	assert.Equal(t, models.OnboardingStatusInProgress, onboarding.Status)
+	assert.Equal(t, "workspace_profile", onboarding.CurrentStep)
+	assert.Equal(t, "New Test Organization", onboarding.Input["business_name"])
+	assert.Empty(t, onboarding.Input["intended_channels"])
+	assert.Equal(t, "profile_required", onboarding.Metadata["provisioning_state"])
+
+	var integrationCount, channelCount, subscriptionCount int64
+	require.NoError(t, app.DB.Model(&models.ProviderIntegration{}).
+		Where("organization_id = ?", resp.Data.ID).Count(&integrationCount).Error)
+	require.NoError(t, app.DB.Model(&models.ChannelAccount{}).
+		Where("organization_id = ?", resp.Data.ID).Count(&channelCount).Error)
+	require.NoError(t, app.DB.Model(&models.Subscription{}).
+		Where("organization_id = ?", resp.Data.ID).Count(&subscriptionCount).Error)
+	assert.Zero(t, integrationCount, "provider authorization must remain tenant-specific")
+	assert.Zero(t, channelCount, "new workspaces must not inherit another tenant's channels")
+	assert.Zero(t, subscriptionCount, "commercial licensing remains an explicit control-plane action")
 }
 
 func TestApp_CreateOrganization_EmptyName(t *testing.T) {

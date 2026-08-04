@@ -402,6 +402,222 @@ func TestGetTenantSupportHealthIncludesOperationalSignals(t *testing.T) {
 	}
 }
 
+func TestTenantSupportHealthWarnsWhenOmnichannelHasOnlyWhatsApp(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithSuperAdmin())
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	enableBookingCommerceTestEntitlement(
+		t,
+		db,
+		organization.ID,
+		user.ID,
+		"omnichannel.enabled",
+	)
+	testutil.CreateTestWhatsAppAccount(t, db, organization.ID)
+
+	request := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(request, organization.ID, user.ID)
+	require.NoError(t, app.GetTenantSupportHealth(request))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+
+	var response TenantSupportHealthResponse
+	testutil.ParseEnvelopeResponse(t, request, &response)
+	var channelHealth *TenantHealthCheckResponse
+	for index := range response.Checks {
+		if response.Checks[index].Key == "channels" {
+			channelHealth = &response.Checks[index]
+			break
+		}
+	}
+	require.NotNil(t, channelHealth)
+	assert.Equal(t, "warn", channelHealth.Status)
+	assert.Contains(t, channelHealth.Detail, "omnichannel workspace")
+	assert.Contains(t, channelHealth.Detail, "Instagram")
+	assert.Contains(t, channelHealth.Detail, "Messenger")
+}
+
+func TestTenantSupportHealthPrioritizesDeliveryIncidentOverChannelSetupWarning(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithSuperAdmin())
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	enableBookingCommerceTestEntitlement(
+		t,
+		db,
+		organization.ID,
+		user.ID,
+		"omnichannel.enabled",
+	)
+	whatsApp := testutil.CreateTestWhatsAppAccount(t, db, organization.ID)
+	contact := testutil.CreateTestContact(t, db, organization.ID)
+	now := time.Now().UTC()
+	account := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    organization.ID,
+		Channel:           models.ChannelWhatsApp,
+		Provider:          "meta_legacy",
+		Name:              "WhatsApp inbox mirror",
+		ExternalAccountID: whatsApp.PhoneID,
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, db.Create(&account).Error)
+	conversation := models.InboxConversation{
+		BaseModel:              models.BaseModel{ID: uuid.New()},
+		OrganizationID:         organization.ID,
+		ChannelAccountID:       account.ID,
+		ContactID:              contact.ID,
+		Channel:                models.ChannelWhatsApp,
+		ExternalConversationID: "health-priority-conversation",
+		Status:                 models.InboxConversationStatusOpen,
+		OpenedAt:               now,
+		Config:                 models.JSONB{},
+		Metadata:               models.JSONB{},
+	}
+	require.NoError(t, db.Create(&conversation).Error)
+	job := models.OutboxJob{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   organization.ID,
+		ChannelAccountID: account.ID,
+		ConversationID:   conversation.ID,
+		IdempotencyKey:   "health-priority:" + uuid.NewString(),
+		PayloadDigest:    "health-priority",
+		Purpose:          models.ChannelPreferencePurposeService,
+		Status:           models.OutboxJobStatusRetrying,
+		AvailableAt:      now.Add(-time.Hour),
+		MaxAttempts:      8,
+		ProviderState:    models.JSONB{},
+		Payload:          models.JSONB{},
+	}
+	require.NoError(t, db.Create(&job).Error)
+
+	request := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(request, organization.ID, user.ID)
+	require.NoError(t, app.GetTenantSupportHealth(request))
+
+	var response TenantSupportHealthResponse
+	testutil.ParseEnvelopeResponse(t, request, &response)
+	for index := range response.Checks {
+		if response.Checks[index].Key == "channels" {
+			assert.Equal(t, "warn", response.Checks[index].Status)
+			assert.Contains(t, response.Checks[index].Detail, "outbound job(s) are retrying")
+			assert.NotContains(t, response.Checks[index].Detail, "no tested Instagram")
+			return
+		}
+	}
+	t.Fatal("channels health check not returned")
+}
+
+func TestTenantSupportHealthCountsActiveNonLegacyWhatsAppChannel(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithSuperAdmin())
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	now := time.Now().UTC()
+	account := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    organization.ID,
+		Channel:           models.ChannelWhatsApp,
+		Provider:          "relay",
+		Name:              "Direct WhatsApp",
+		ExternalAccountID: "direct-whatsapp",
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{"outbound_enabled": true},
+		Metadata:          models.JSONB{},
+		LastHealthCheckAt: &now,
+	}
+	require.NoError(t, db.Create(&account).Error)
+
+	request := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(request, organization.ID, user.ID)
+	require.NoError(t, app.GetTenantSupportHealth(request))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+
+	var response TenantSupportHealthResponse
+	testutil.ParseEnvelopeResponse(t, request, &response)
+	for index := range response.Checks {
+		if response.Checks[index].Key == "channels" {
+			assert.Equal(t, "pass", response.Checks[index].Status)
+			assert.NotContains(t, response.Checks[index].Detail, "No active")
+			return
+		}
+	}
+	t.Fatal("channels health check not returned")
+}
+
+func TestTenantSupportHealthExplainsEmptyIntendedChannelPolicy(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithSuperAdmin())
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	require.NoError(t, db.Create(&models.OrganizationOnboarding{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: organization.ID,
+		Status:         models.OnboardingStatusInProgress,
+		Checklist:      models.JSONB{},
+		Input: models.JSONB{
+			"business_name":     "Future clinic",
+			"timezone":          "Asia/Kuala_Lumpur",
+			"intended_channels": []string{},
+		},
+		Metadata: models.JSONB{},
+	}).Error)
+
+	request := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(request, organization.ID, user.ID)
+	require.NoError(t, app.GetTenantSupportHealth(request))
+
+	var response TenantSupportHealthResponse
+	testutil.ParseEnvelopeResponse(t, request, &response)
+	for index := range response.Checks {
+		if response.Checks[index].Key == "channels" {
+			assert.Equal(t, "warn", response.Checks[index].Status)
+			assert.Contains(t, response.Checks[index].Detail, "Select at least one intended launch channel")
+			return
+		}
+	}
+	t.Fatal("channels health check not returned")
+}
+
+func TestTenantSupportHealthNamesMissingIntendedChannelsWithoutActiveAccounts(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithSuperAdmin())
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	require.NoError(t, db.Create(&models.OrganizationOnboarding{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: organization.ID,
+		Status:         models.OnboardingStatusInProgress,
+		Checklist:      models.JSONB{},
+		Input: models.JSONB{
+			"business_name":     "Future clinic",
+			"timezone":          "Asia/Kuala_Lumpur",
+			"intended_channels": []string{"instagram", "messenger"},
+		},
+		Metadata: models.JSONB{},
+	}).Error)
+
+	request := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(request, organization.ID, user.ID)
+	require.NoError(t, app.GetTenantSupportHealth(request))
+
+	var response TenantSupportHealthResponse
+	testutil.ParseEnvelopeResponse(t, request, &response)
+	for index := range response.Checks {
+		if response.Checks[index].Key == "channels" {
+			assert.Equal(t, "warn", response.Checks[index].Status)
+			assert.Contains(t, response.Checks[index].Detail, "Instagram")
+			assert.Contains(t, response.Checks[index].Detail, "Messenger")
+			return
+		}
+	}
+	t.Fatal("channels health check not returned")
+}
+
 func TestProductCommercialProfileRejectsCredentials(t *testing.T) {
 	t.Parallel()
 
@@ -740,6 +956,7 @@ func TestProductCommercialOnboardingStepPolicy(t *testing.T) {
 
 	assert.True(t, productCommercialManualOnboardingStep("workspace_profile"))
 	assert.True(t, productCommercialManualOnboardingStep("go_live"))
+	assert.False(t, productCommercialManualOnboardingStep("license_assigned"))
 	assert.False(t, productCommercialManualOnboardingStep("channel_connected"))
 	assert.False(t, productCommercialManualOnboardingStep("privacy_baseline"))
 	assert.False(t, productCommercialManualOnboardingStep("made_up"))
@@ -757,6 +974,136 @@ func TestProductCommercialProfileCompletionRequiresIdentityAndTimezone(t *testin
 		"business": map[string]any{"name": "ReAlign"},
 		"timezone": "Asia/Kuala_Lumpur",
 	}))
+	assert.False(t, productCommercialProfileComplete(models.JSONB{
+		"business":          map[string]any{"name": "New clinic"},
+		"timezone":          "Asia/Kuala_Lumpur",
+		"intended_channels": []string{},
+	}))
+	assert.True(t, productCommercialProfileComplete(models.JSONB{
+		"business":          map[string]any{"name": "New clinic"},
+		"timezone":          "Asia/Kuala_Lumpur",
+		"intended_channels": []any{"messenger", "whatsapp"},
+	}))
+}
+
+func TestProductCommercialIntendedChannelsAreValidatedAndNormalized(t *testing.T) {
+	t.Parallel()
+
+	profile := models.JSONB{
+		"intended_channels": []any{" Messenger ", "whatsapp", "messenger"},
+	}
+	require.NoError(t, productCommercialValidateProfile(profile))
+	assert.Equal(t, []string{"whatsapp", "messenger"}, profile["intended_channels"])
+
+	assert.Error(t, productCommercialValidateProfile(models.JSONB{
+		"intended_channels": []any{},
+	}))
+	assert.Error(t, productCommercialValidateProfile(models.JSONB{
+		"intended_channels": []any{"facebook"},
+	}))
+}
+
+func TestProductCommercialOnboardingRequiresLicenseAndEveryIntendedChannel(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithSuperAdmin())
+	onboarding := models.OrganizationOnboarding{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: organization.ID,
+		Status:         models.OnboardingStatusInProgress,
+		Checklist:      models.JSONB{},
+		Input: models.JSONB{
+			"business_name":     "Future clinic",
+			"timezone":          "Asia/Kuala_Lumpur",
+			"intended_channels": []string{"whatsapp", "instagram"},
+		},
+		Metadata: models.JSONB{},
+	}
+	require.NoError(t, db.Create(&onboarding).Error)
+	testutil.CreateTestWhatsAppAccount(t, db, organization.ID)
+
+	signals, err := productCommercialOnboardingSignals(db, organization.ID, &onboarding)
+	require.NoError(t, err)
+	assert.False(t, signals["license_assigned"])
+	assert.False(t, signals["channel_connected"])
+
+	enableBookingCommerceTestEntitlement(
+		t,
+		db,
+		organization.ID,
+		user.ID,
+		"omnichannel.enabled",
+	)
+	instagram := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    organization.ID,
+		Channel:           models.ChannelInstagram,
+		Provider:          "relay",
+		Name:              "Future clinic Instagram",
+		ExternalAccountID: "future-clinic-instagram",
+		Status:            models.ChannelAccountStatusPending,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{"outbound_enabled": false},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, db.Create(&instagram).Error)
+
+	signals, err = productCommercialOnboardingSignals(db, organization.ID, &onboarding)
+	require.NoError(t, err)
+	assert.True(t, signals["license_assigned"])
+	assert.False(t, signals["channel_connected"])
+
+	now := time.Now().UTC()
+	instagram.Status = models.ChannelAccountStatusActive
+	instagram.Config["outbound_enabled"] = true
+	instagram.LastHealthCheckAt = &now
+	require.NoError(t, db.Save(&instagram).Error)
+
+	signals, err = productCommercialOnboardingSignals(db, organization.ID, &onboarding)
+	require.NoError(t, err)
+	assert.True(t, signals["channel_connected"])
+}
+
+func TestProductCommercialOnboardingRequiresThreadsEntitlement(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithSuperAdmin())
+	onboarding := models.OrganizationOnboarding{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: organization.ID,
+		Status:         models.OnboardingStatusInProgress,
+		Checklist:      models.JSONB{},
+		Input: models.JSONB{
+			"business_name":     "Threads clinic",
+			"timezone":          "Asia/Kuala_Lumpur",
+			"intended_channels": []string{"threads"},
+		},
+		Metadata: models.JSONB{},
+	}
+	require.NoError(t, db.Create(&onboarding).Error)
+	enableBookingCommerceTestEntitlement(
+		t,
+		db,
+		organization.ID,
+		user.ID,
+		"omnichannel.enabled",
+	)
+
+	signals, err := productCommercialOnboardingSignals(db, organization.ID, &onboarding)
+	require.NoError(t, err)
+	assert.False(t, signals["license_assigned"], "omnichannel alone must not license Threads")
+
+	var subscription models.Subscription
+	require.NoError(t, productCommercialLoadCurrentSubscription(db, organization.ID, &subscription))
+	subscription.EntitlementsSnapshot["threads.public_engagement.enabled"] = true
+	require.NoError(t, db.Model(&subscription).Update(
+		"entitlements_snapshot",
+		subscription.EntitlementsSnapshot,
+	).Error)
+
+	signals, err = productCommercialOnboardingSignals(db, organization.ID, &onboarding)
+	require.NoError(t, err)
+	assert.True(t, signals["license_assigned"])
 }
 
 func TestProductCommercialHealthAggregation(t *testing.T) {

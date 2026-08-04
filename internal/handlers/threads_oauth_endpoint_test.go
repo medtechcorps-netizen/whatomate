@@ -46,3 +46,35 @@ func TestThreadsOAuthTokenExchangesUseOfficialGraphHost(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"/oauth/access_token", "/access_token"}, paths)
 }
+
+func TestThreadsOAuthProviderErrorKeepsSafeDiagnosticsWithoutSecrets(t *testing.T) {
+	app := &App{HTTPClient: &http.Client{Transport: threadsOAuthEndpointRoundTripFunc(
+		func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header: http.Header{
+					"X-Fb-Request-Id": []string{"request-123"},
+				},
+				Body: io.NopCloser(strings.NewReader(
+					`{"error":{"message":"invalid provider-secret-token","type":"OAuthException","code":190,"error_subcode":463,"fbtrace_id":"trace-456"}}`,
+				)),
+			}, nil
+		},
+	)}}
+
+	_, err := app.exchangeThreadsLongLivedToken(
+		context.Background(),
+		"provider-app-secret",
+		"provider-secret-token",
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "HTTP 400")
+	assert.Contains(t, err.Error(), "code 190")
+	assert.Contains(t, err.Error(), "subcode 463")
+	assert.Contains(t, err.Error(), "type OAuthException")
+	assert.Contains(t, err.Error(), "trace trace-456")
+	assert.Contains(t, err.Error(), "request request-123")
+	assert.NotContains(t, err.Error(), "provider-secret-token")
+	assert.NotContains(t, err.Error(), "provider-app-secret")
+	assert.NotContains(t, err.Error(), "invalid")
+}

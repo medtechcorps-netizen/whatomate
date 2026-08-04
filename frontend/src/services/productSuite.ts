@@ -142,6 +142,7 @@ export interface OnboardingSummary {
   id?: string
   vertical: string
   status: string
+  provisioning_state: string
   current_step?: string
   progress_percent: number
   steps: OnboardingStep[]

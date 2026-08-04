@@ -232,6 +232,69 @@ The normalized inbox supports WhatsApp, Instagram, Messenger, email, web chat,
 and future providers through signed adapters. “Supported by the data model” is
 not the same as “live in production.”
 
+An active `omnichannel.enabled` entitlement unlocks the module; it does not
+copy or create provider accounts. Every organization owns its channel rows,
+OAuth grants, external account identifiers and encrypted credentials. Never
+reuse another organization's access token, Page ID, mailbox, webhook secret or
+Threads authorization.
+
+### New-workspace channel gate
+
+Treat workspace creation, commercial licensing and provider connection as
+three separate states. A newly created workspace starts onboarding with
+`profile_required` and no placeholder provider or channel rows. After the
+workspace profile and intended channels are saved, it advances through the
+license and tenant-specific authorization gates.
+
+| Channel | Tenant record required | External/runtime requirement |
+| --- | --- | --- |
+| WhatsApp | Active WhatsApp account and its `meta_legacy` inbox mirror | WABA ownership, access token and webhook subscription |
+| Instagram | Tested `instagram` + `relay` channel account | Matching Meta relay mapping, Instagram account ID, token and HMAC secrets |
+| Messenger | Tested `messenger` + `relay` channel account | Matching Meta relay mapping, Page ID, page token and HMAC secrets |
+| Threads | Active `threads` channel account created by workspace OAuth | Dedicated Threads app, entitlement, reviewed scopes and workspace authorization |
+| Email/web chat | Tested signed-relay channel account | Matching mailbox/site relay and HMAC secrets |
+
+`GET /api/integrations` reports WhatsApp, Instagram and Messenger separately in
+`channel_connections`. The aggregate Meta count is inventory only and must
+never be used as proof that every Meta channel is connected.
+
+Instagram/Messenger relay identities and OAuth-managed Threads profile IDs have
+one global workspace owner. The database migration installs
+`uq_channel_accounts_global_routable_identity`; a historical duplicate fails
+migration for explicit operator reconciliation instead of choosing a tenant or
+copying credentials automatically.
+
+Before go-live for every future organization:
+
+1. Assign the intended plan to the exact target organization and verify the
+   effective `omnichannel.enabled` entitlement. If Threads is intended, also
+   require `threads.public_engagement.enabled` before starting OAuth.
+2. Record which channels the organization intends to use; do not infer them
+   from another tenant. Save them under **Launchpad → Workspace profile**.
+3. Complete the tenant row and the external/runtime registration for each
+   intended channel. For Instagram and Messenger, both sides must use the same
+   channel and external account ID.
+4. Run the account health test and require an active connection for every
+   intended channel. Launchpad and support health remain incomplete while any
+   declared channel is missing, degraded, or untested.
+5. Verify one inbound event and one permitted outbound response with a
+   non-customer test identity, then review retry/dead-letter telemetry.
+6. Complete Threads separately; Threads authorization never follows from a
+   WhatsApp, Instagram or Messenger connection.
+
+Launchpad enforces this policy: `license_assigned` requires a feature-permitting
+subscription for the declared channels (including the additional Threads
+entitlement when applicable), and `channel_connected` is complete only when the declared
+WhatsApp account is active and every other declared channel is active,
+outbound-approved, free of a recorded error, and has a health-check timestamp.
+Go-live approval cannot bypass either inferred step.
+
+The environment-only Meta relay registry still requires an operator change for
+each Instagram or Messenger account. Until that registry is replaced by an
+encrypted dynamic tenant registry, update the relay mapping and secret
+references in the same controlled change as the pending ReReply connection,
+deploy, run Test, and only then approve outbound delivery.
+
 Legacy Meta WhatsApp is mirrored into the normalized inbox without changing its
 delivery path. The migration creates a credential-free `meta_legacy` shadow
 account and links each existing `messages` row to a stable conversation derived
@@ -259,7 +322,10 @@ verified webhook for a tenant without a durable omnichannel entitlement is
 accepted without domain dispatch, and its raw headers and payload are
 discarded after an audit marker is recorded.
 
-For every channel account:
+For every signed-relay account (Instagram, Messenger, email, or web chat), use
+the checklist below. Legacy WhatsApp uses its established account flow and
+Threads uses the dedicated OAuth lifecycle in the next section; do not create
+either one as a generic relay account.
 
 1. Implement and verify the
    [ReReply signed-relay contract v1](./relay-integration-v1.md), including its
@@ -279,8 +345,8 @@ For every channel account:
 
 Threads is a separate `threads` channel and is fail-closed behind both
 `omnichannel.enabled` and `threads.public_engagement.enabled`. It accepts only
-the signed `relay` provider. The feature is for public replies and mentions,
-not messaging:
+the OAuth-managed `threads` provider. A generic signed-relay Threads account is
+rejected. The feature is for public replies and mentions, not messaging:
 
 - every inbound conversation must carry a provider-owned public target in
   `external_conversation_id`;
@@ -295,7 +361,7 @@ DM inbox, and do not translate a public reply into a private message. Threads
 may offer messaging in its consumer product, but this ReReply integration does
 not implement a Threads DM endpoint or permission.
 
-Use least-privilege Threads OAuth access for a future approved relay:
+Use least-privilege Threads OAuth access for the reviewed dedicated app:
 
 - `threads_basic` for the connected Threads identity;
 - `threads_read_replies` to read replies to the connected account's posts;
@@ -312,12 +378,24 @@ and [`/me/mentions` request](https://www.postman.com/meta/threads/request/342036
 Verify the granted token scopes in Meta's access-token debugger before any
 provider test.
 
-This release does not contain an approved concrete Threads relay adapter.
-Creating an entitled connection records a pending beta account, while **Test
-and activation deliberately fail closed**. Do not override the pending status
-or enable outbound delivery. Ship and review a Threads-specific adapter,
-provider-scope validation, sandbox evidence, and end-to-end reply-target tests
-before changing this gate.
+Threads onboarding is workspace-specific:
+
+1. Assign `omnichannel.enabled`, then grant the reviewed
+   `threads.public_engagement.enabled` support entitlement to the exact target
+   organization.
+2. Configure a dedicated Threads App ID, HTTPS redirect URI, encrypted App
+   Secret, webhook verify token, reviewed scopes, and approved App Review
+   status. A Threads App ID cannot be shared by ReReply workspaces.
+3. Complete OAuth from that workspace. The callback exchanges and validates
+   the short- and long-lived tokens, verifies scopes, discovers the profile,
+   encrypts the credential, and only then persists an active `threads` account.
+   A failed stage leaves no active account.
+4. Run Test, verify a signed inbound reply or mention and one permitted public
+   reply, and confirm that token/permission health is current before go-live.
+
+OAuth failure logs may include only safe provider diagnostics (HTTP status,
+Graph error code/type, request ID, and trace ID). Never log tokens, app secrets,
+provider error messages, or raw response bodies.
 
 TikTok remains disabled until the selected TikTok API product and business
 account have been approved for the intended messaging use case.

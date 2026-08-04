@@ -39,6 +39,14 @@ export interface IntegrationConnectionState {
   last_error?: string;
 }
 
+export type IntegrationChannel =
+  | "whatsapp"
+  | "instagram"
+  | "messenger"
+  | "threads"
+  | "email"
+  | "webchat";
+
 export interface IntegrationOAuthState {
   supported: boolean;
   available: boolean;
@@ -56,6 +64,10 @@ export interface IntegrationState {
   config: Record<string, unknown>;
   credentials: Record<string, IntegrationCredentialState>;
   connection: IntegrationConnectionState;
+  channel_connections?: Partial<
+    Record<IntegrationChannel, IntegrationConnectionState>
+  >;
+  intended_channels?: IntegrationChannel[];
   oauth: IntegrationOAuthState;
   test_supported: boolean;
   message?: string;

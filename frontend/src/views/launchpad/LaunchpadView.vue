@@ -43,10 +43,19 @@ const health = ref<TenantHealth | null>(null)
 const templates = ref<WorkspaceTemplateSummary[]>([])
 const privacyRequests = ref<PrivacyRequest[]>([])
 const supportCases = ref<SupportCase[]>([])
+const launchChannelOptions = [
+  { value: 'whatsapp', label: 'WhatsApp' },
+  { value: 'instagram', label: 'Instagram' },
+  { value: 'messenger', label: 'Messenger' },
+  { value: 'threads', label: 'Threads' },
+  { value: 'email', label: 'Email' },
+  { value: 'webchat', label: 'Web chat' },
+]
 const profileDraft = ref({
   business_name: '',
   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Kuala_Lumpur',
   vertical: 'general',
+  intended_channels: [] as string[],
 })
 const canManageOnboarding = computed(() => authStore.hasPermission('onboarding', 'write'))
 const canReadBilling = computed(() => authStore.hasPermission('billing', 'read'))
@@ -94,6 +103,12 @@ async function load() {
     const business = profile.business && typeof profile.business === 'object'
       ? profile.business as Record<string, unknown>
       : {}
+    const intendedChannels = Array.isArray(profile.intended_channels)
+      ? profile.intended_channels.filter(
+          (channel): channel is string =>
+            typeof channel === 'string' && launchChannelOptions.some((option) => option.value === channel),
+        )
+      : ['whatsapp']
     profileDraft.value = {
       business_name:
         typeof profile.business_name === 'string'
@@ -108,7 +123,8 @@ async function load() {
       vertical:
         typeof profile.vertical === 'string'
           ? profile.vertical
-          : onboarding.value?.vertical || 'general',
+            : onboarding.value?.vertical || 'general',
+      intended_channels: intendedChannels,
     }
   } catch (error) {
     toast.error('Launchpad could not be loaded', getErrorMessage(error))
@@ -132,6 +148,10 @@ async function saveWorkspaceProfile() {
     toast.warning('Business name and operating timezone are required')
     return
   }
+  if (profileDraft.value.intended_channels.length === 0) {
+    toast.warning('Select at least one channel required at launch')
+    return
+  }
   try {
     const existing = onboarding.value?.profile ?? {}
     const existingBusiness =
@@ -147,6 +167,7 @@ async function saveWorkspaceProfile() {
       },
       timezone: profileDraft.value.timezone.trim(),
       vertical: profileDraft.value.vertical,
+      intended_channels: [...profileDraft.value.intended_channels],
     })
     toast.success('Workspace profile saved')
     await load()
@@ -226,7 +247,7 @@ onMounted(load)
             <Progress :model-value="onboarding?.progress_percent ?? 0" class="h-2 bg-white/10" />
             <div class="mt-4 flex items-center justify-between text-xs text-white/45">
               <span class="capitalize">{{ onboarding?.vertical || 'Select a vertical' }}</span>
-              <span class="capitalize">{{ onboarding?.status || 'Not started' }}</span>
+              <span class="capitalize">{{ (onboarding?.provisioning_state || onboarding?.status || 'not_started').replace(/_/g, ' ') }}</span>
             </div>
           </div>
         </div>
@@ -268,10 +289,34 @@ onMounted(load)
             <option value="wellness">Wellness</option>
             <option value="general">General</option>
           </select>
+          <fieldset class="space-y-2 md:col-span-4">
+            <legend class="text-xs font-medium text-white/70 light:text-gray-700">
+              Channels required at launch
+            </legend>
+            <p class="text-[11px] leading-4 text-white/40 light:text-gray-500">
+              Onboarding stays incomplete until every selected channel has its own authorization and a passing health test.
+            </p>
+            <div class="flex flex-wrap gap-2">
+              <label
+                v-for="option in launchChannelOptions"
+                :key="option.value"
+                class="flex cursor-pointer items-center gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-white/70 light:border-gray-200 light:bg-gray-50 light:text-gray-700"
+              >
+                <input
+                  v-model="profileDraft.intended_channels"
+                  type="checkbox"
+                  :value="option.value"
+                  :disabled="!canManageOnboarding"
+                  class="h-4 w-4 accent-amber-300"
+                />
+                {{ option.label }}
+              </label>
+            </div>
+          </fieldset>
           <Button
             v-if="canManageOnboarding"
             type="submit"
-            class="bg-amber-300 text-black hover:bg-amber-200"
+            class="bg-amber-300 text-black hover:bg-amber-200 md:col-span-4 md:justify-self-end"
           >
             Save profile
           </Button>

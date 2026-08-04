@@ -659,7 +659,10 @@ async function createOrganization() {
     const createdOrganization = unwrapItemResponse<Organization>(response)
     organizationOpen.value = false
     organizationName.value = ''
-    toast.success('Customer workspace provisioned')
+    toast.success('Workspace created', {
+      description:
+        'Assign a license, authorize each intended provider, and test every channel before go-live.',
+    })
     await loadResellers(selected.value.id, false)
     await loadSelected({
       page: 1,
@@ -1707,9 +1710,9 @@ function formatNumber(value?: number) {
 
     <Dialog v-model:open="organizationOpen">
       <DialogContent>
-        <DialogHeader><DialogTitle>Provision customer workspace</DialogTitle><DialogDescription>The new business receives its own CRM tenant, roles, settings and RLS boundary.</DialogDescription></DialogHeader>
+        <DialogHeader><DialogTitle>Create customer workspace</DialogTitle><DialogDescription>The new business receives an isolated CRM tenant, roles, settings and RLS boundary. Provider accounts and credentials are never copied: assign a license, authorize each intended channel and complete health tests before go-live.</DialogDescription></DialogHeader>
         <div class="space-y-2 py-3"><Label for="organization-name">Business name</Label><Input id="organization-name" v-model="organizationName" placeholder="Serenity Wellness Clinic" @keyup.enter="createOrganization" /></div>
-        <DialogFooter><Button variant="outline" @click="organizationOpen = false">Cancel</Button><Button :loading="organizationSubmitting" @click="createOrganization">Provision workspace</Button></DialogFooter>
+        <DialogFooter><Button variant="outline" @click="organizationOpen = false">Cancel</Button><Button :loading="organizationSubmitting" @click="createOrganization">Create workspace</Button></DialogFooter>
       </DialogContent>
     </Dialog>
 

@@ -133,6 +133,117 @@ func TestIntegrationCenterMetaUsesRuntimeSettingsAndNeverReturnsSecret(t *testin
 	assert.True(t, publicConfig.HasAppSecret)
 }
 
+func TestIntegrationCenterReportsMetaConnectionsPerChannelAndTenant(t *testing.T) {
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	otherOrg := testutil.CreateTestOrganization(t, app.DB)
+	require.NoError(t, app.DB.Create(&models.OrganizationOnboarding{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Status:         models.OnboardingStatusInProgress,
+		Checklist:      models.JSONB{},
+		Input: models.JSONB{
+			"intended_channels": []string{"whatsapp", "instagram"},
+		},
+		Metadata: models.JSONB{},
+	}).Error)
+	admin := integrationTestUser(
+		t,
+		app,
+		org.ID,
+		models.ResourceSettingsIntegrations+":"+models.ActionRead,
+	)
+	testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+
+	for _, account := range []models.ChannelAccount{
+		{
+			BaseModel:         models.BaseModel{ID: uuid.New()},
+			OrganizationID:    org.ID,
+			Channel:           models.ChannelWhatsApp,
+			Provider:          channelapi.LegacyMetaProvider,
+			Name:              "Target WhatsApp mirror",
+			ExternalAccountID: "target-whatsapp-legacy",
+			Status:            models.ChannelAccountStatusActive,
+			Capabilities:      models.JSONB{},
+			Config:            models.JSONB{},
+			Metadata:          models.JSONB{},
+		},
+		{
+			BaseModel:         models.BaseModel{ID: uuid.New()},
+			OrganizationID:    org.ID,
+			Channel:           models.ChannelInstagram,
+			Provider:          channelapi.RelayProvider,
+			Name:              "Target Instagram",
+			ExternalAccountID: "target-instagram",
+			Status:            models.ChannelAccountStatusActive,
+			Capabilities:      models.JSONB{},
+			Config:            models.JSONB{"outbound_enabled": true},
+			Metadata:          models.JSONB{},
+		},
+		{
+			BaseModel:         models.BaseModel{ID: uuid.New()},
+			OrganizationID:    org.ID,
+			Channel:           models.ChannelMessenger,
+			Provider:          channelapi.RelayProvider,
+			Name:              "Target Messenger",
+			ExternalAccountID: "target-messenger",
+			Status:            models.ChannelAccountStatusPending,
+			Capabilities:      models.JSONB{},
+			Config:            models.JSONB{},
+			Metadata:          models.JSONB{},
+		},
+		{
+			BaseModel:         models.BaseModel{ID: uuid.New()},
+			OrganizationID:    otherOrg.ID,
+			Channel:           models.ChannelMessenger,
+			Provider:          channelapi.RelayProvider,
+			Name:              "Other Messenger",
+			ExternalAccountID: "other-messenger",
+			Status:            models.ChannelAccountStatusActive,
+			Capabilities:      models.JSONB{},
+			Config:            models.JSONB{"outbound_enabled": true},
+			Metadata:          models.JSONB{},
+		},
+	} {
+		account := account
+		require.NoError(t, app.DB.Create(&account).Error)
+	}
+
+	request := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(request, org.ID, admin.ID)
+	require.NoError(t, app.GetIntegrations(request))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+
+	var catalog struct {
+		Integrations []IntegrationResponse `json:"integrations"`
+	}
+	testutil.ParseEnvelopeResponse(t, request, &catalog)
+	var meta *IntegrationResponse
+	for index := range catalog.Integrations {
+		if catalog.Integrations[index].Provider == integrationProviderMeta {
+			meta = &catalog.Integrations[index]
+			break
+		}
+	}
+	require.NotNil(t, meta)
+	require.NotNil(t, meta.IntendedChannels)
+	assert.Equal(t, []string{"whatsapp", "instagram"}, *meta.IntendedChannels)
+	assert.Equal(t, 3, meta.Connection.AccountCount)
+	assert.Equal(t, 2, meta.Connection.ActiveCount)
+	assert.Equal(t, 1, meta.Connection.PendingCount)
+
+	whatsApp := meta.ChannelConnections[string(models.ChannelWhatsApp)]
+	assert.Equal(t, 1, whatsApp.AccountCount)
+	assert.Equal(t, 1, whatsApp.ActiveCount)
+	instagram := meta.ChannelConnections[string(models.ChannelInstagram)]
+	assert.Equal(t, 1, instagram.AccountCount)
+	assert.Equal(t, 1, instagram.ActiveCount)
+	messenger := meta.ChannelConnections[string(models.ChannelMessenger)]
+	assert.Equal(t, 1, messenger.AccountCount)
+	assert.Zero(t, messenger.ActiveCount)
+	assert.Equal(t, 1, messenger.PendingCount)
+}
+
 func TestIntegrationCenterBlankSecretPreservesAndDeleteDisablesMeta(t *testing.T) {
 	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
 	org := testutil.CreateTestOrganization(t, app.DB)
