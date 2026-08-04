@@ -252,8 +252,9 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 	migrationModels := GetMigrationModels()
 	indexes := getIndexes()
 
-	// Total steps: models + provider binding backfill + indexes + default admin check
-	totalSteps := len(migrationModels) + len(indexes) + 2
+	// Total steps: models + provider binding backfill + WhatsApp ownership
+	// invariant + indexes + default admin check.
+	totalSteps := len(migrationModels) + len(indexes) + 3
 	currentStep := 0
 	barWidth := 40
 
@@ -282,6 +283,13 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 	printProgress(currentStep, totalSteps)
 	if err := BackfillProviderIntegrationBindings(silentDB); err != nil {
 		fmt.Printf("\n  \033[31mProvider binding backfill failed\033[0m\n\n")
+		return err
+	}
+	currentStep++
+
+	printProgress(currentStep, totalSteps)
+	if err := EnsureGlobalWhatsAppPhoneIDUniqueness(silentDB); err != nil {
+		fmt.Printf("\n  \033[31mWhatsApp phone ownership migration failed\033[0m\n\n")
 		return err
 	}
 	currentStep++
@@ -510,6 +518,9 @@ func getIndexes() []string {
 
 // CreateIndexes creates additional indexes not handled by GORM tags
 func CreateIndexes(db *gorm.DB) error {
+	if err := EnsureGlobalWhatsAppPhoneIDUniqueness(db); err != nil {
+		return err
+	}
 	for _, idx := range getIndexes() {
 		if err := db.Exec(idx).Error; err != nil {
 			return fmt.Errorf("failed to create index: %w", err)

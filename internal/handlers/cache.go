@@ -34,7 +34,7 @@ const (
 	settingsCachePrefix        = "chatbot:settings:v2:"
 	flowsCachePrefix           = "chatbot:flows:"
 	keywordRulesCachePrefix    = "chatbot:keywords:"
-	whatsappAccountCachePrefix = "whatsapp:account:"
+	whatsappAccountCachePrefix = "whatsapp:account:v2:"
 	webhooksCachePrefix        = "webhooks:"
 	slaSettingsCacheKey        = "chatbot:sla_enabled_settings"
 	aiContextsCachePrefix      = "chatbot:ai_contexts:"
@@ -289,18 +289,36 @@ type whatsAppAccountCache struct {
 	Pin         string `json:"pin"`
 }
 
-// getWhatsAppAccountCached retrieves WhatsApp account by phone_id from cache or database
+// getWhatsAppAccountCached retrieves a WhatsApp account by phone ID. Calls
+// without an existing tenant scope resolve the current database owner before
+// consulting Redis so a cache entry from a former owner cannot cross tenants.
 func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount, error) {
-	if a.rlsEnabled() && !a.hasTenantScope() {
+	phoneID = strings.TrimSpace(phoneID)
+	if !a.hasTenantScope() {
+		organizationID, err := a.resolveWhatsAppOrganization(phoneID)
+		if err != nil {
+			return nil, err
+		}
+		if !a.rlsEnabled() {
+			return a.getWhatsAppAccountCachedForOrganization(phoneID, organizationID)
+		}
+
 		var account *models.WhatsAppAccount
-		err := a.withPhoneTenant(phoneID, func(scoped *App) error {
+		err = a.WithTenantApp(organizationID, func(scoped *App) error {
 			var scopedErr error
-			account, scopedErr = scoped.getWhatsAppAccountCached(phoneID)
+			account, scopedErr = scoped.getWhatsAppAccountCachedForOrganization(phoneID, organizationID)
 			return scopedErr
 		})
 		return account, err
 	}
 
+	return a.getWhatsAppAccountCachedForOrganization(phoneID, a.tenantOrgID)
+}
+
+func (a *App) getWhatsAppAccountCachedForOrganization(
+	phoneID string,
+	organizationID uuid.UUID,
+) (*models.WhatsAppAccount, error) {
 	ctx := context.Background()
 	cacheKey := fmt.Sprintf("%s%s", whatsappAccountCachePrefix, phoneID)
 
@@ -309,7 +327,10 @@ func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount,
 		cached, err := a.Redis.Get(ctx, cacheKey).Result()
 		if err == nil && cached != "" {
 			var cacheData whatsAppAccountCache
-			if err := json.Unmarshal([]byte(cached), &cacheData); err == nil {
+			if err := json.Unmarshal([]byte(cached), &cacheData); err == nil &&
+				cacheData.OrganizationID == organizationID &&
+				cacheData.PhoneID == phoneID &&
+				!cacheData.DeletedAt.Valid {
 				cacheData.WhatsAppAccount.AccessToken = cacheData.AccessToken
 				cacheData.WhatsAppAccount.AppSecret = cacheData.AppSecret
 				cacheData.WhatsAppAccount.Pin = cacheData.Pin
@@ -318,12 +339,16 @@ func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount,
 				}
 				return &cacheData.WhatsAppAccount, nil
 			}
+			// Malformed, deleted, or former-owner entries are unsafe to reuse.
+			a.Redis.Del(ctx, cacheKey)
 		}
 	}
 
 	// Cache miss - fetch from database
 	var account models.WhatsAppAccount
-	if err := a.DB.Where("phone_id = ?", phoneID).First(&account).Error; err != nil {
+	if err := a.DB.
+		Where("phone_id = ? AND organization_id = ?", phoneID, organizationID).
+		First(&account).Error; err != nil {
 		return nil, err
 	}
 

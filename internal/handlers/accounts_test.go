@@ -2,6 +2,8 @@ package handlers_test
 
 import (
 	"encoding/json"
+	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -146,6 +148,14 @@ func TestApp_CreateAccount_Success(t *testing.T) {
 	meta := enableValidManualAccountTokenPreflight(t, app)
 	allowMetaAccountRelationship(meta, "123456789")
 	user := createAdminUser(t, app, org.ID)
+	var pendingVisibleAtMeta atomic.Bool
+	meta.subFn = func(w http.ResponseWriter, _ *http.Request) {
+		var pending models.WhatsAppAccount
+		if err := app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, "123456789").First(&pending).Error; err == nil && pending.Status == "pending_subscription" {
+			pendingVisibleAtMeta.Store(true)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	}
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":         "My WhatsApp Account",
@@ -173,6 +183,10 @@ func TestApp_CreateAccount_Success(t *testing.T) {
 	assert.NotNil(t, resp.Data.AccessTokenExpiresAt)
 	assert.NotEqual(t, uuid.Nil, resp.Data.ID)
 	assert.NotContains(t, string(testutil.GetResponseBody(req)), "webhook_verify_token")
+	assert.True(t, pendingVisibleAtMeta.Load(), "pending subscription row must be committed before the Meta call")
+	var persisted models.WhatsAppAccount
+	require.NoError(t, app.DB.First(&persisted, "id = ?", resp.Data.ID).Error)
+	assert.Equal(t, "active", persisted.Status)
 }
 
 func TestApp_CreateAccount_WithOptionalFields(t *testing.T) {
@@ -425,6 +439,15 @@ func TestApp_UpdateAccount_Success(t *testing.T) {
 	allowMetaAccountRelationship(meta, "new-phone-id")
 	user := createAdminUser(t, app, org.ID)
 	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	var pendingVisibleAtMeta atomic.Bool
+	meta.subFn = func(w http.ResponseWriter, _ *http.Request) {
+		var pending models.WhatsAppAccount
+		if err := app.DB.First(&pending, "id = ? AND organization_id = ?", account.ID, org.ID).Error; err == nil &&
+			pending.Status == "pending_subscription" && pending.PhoneID == "new-phone-id" {
+			pendingVisibleAtMeta.Store(true)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	}
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":              "Updated Account Name",
@@ -462,6 +485,8 @@ func TestApp_UpdateAccount_Success(t *testing.T) {
 	updated.DecryptSecrets(app.Config.App.EncryptionKey)
 	assert.Equal(t, "new-access-token", updated.AccessToken)
 	assert.NotNil(t, updated.AccessTokenExpiresAt)
+	assert.Equal(t, "active", updated.Status)
+	assert.True(t, pendingVisibleAtMeta.Load(), "updated pending contract must be committed before the Meta call")
 }
 
 func TestApp_UpdateAccount_PartialUpdate(t *testing.T) {

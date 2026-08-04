@@ -45,6 +45,21 @@ type MetaAPIError struct {
 	} `json:"error"`
 }
 
+// MetaAPIRequestError identifies a definitive non-success response received
+// from Meta. Callers can distinguish it from transport errors, where the remote
+// outcome may be unknown, without changing the existing user-facing message.
+type MetaAPIRequestError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *MetaAPIRequestError) Error() string {
+	if e == nil {
+		return "Meta API request failed"
+	}
+	return e.Message
+}
+
 // ParseError attempts to parse respBody as a Meta API error. If successful,
 // it returns a formatted error including code, message, details, and user message.
 // If parsing fails, it returns a generic error with the status code and raw body.
@@ -58,9 +73,12 @@ func ParseMetaAPIError(statusCode int, respBody []byte) error {
 		if apiErr.Error.ErrorUserMsg != "" {
 			errMsg += " - " + apiErr.Error.ErrorUserMsg
 		}
-		return fmt.Errorf("%s", errMsg)
+		return &MetaAPIRequestError{StatusCode: statusCode, Message: errMsg}
 	}
-	return fmt.Errorf("API returned status %d: %s", statusCode, string(respBody))
+	return &MetaAPIRequestError{
+		StatusCode: statusCode,
+		Message:    fmt.Sprintf("API returned status %d: %s", statusCode, string(respBody)),
+	}
 }
 
 // TemplateResponse represents response from template submission

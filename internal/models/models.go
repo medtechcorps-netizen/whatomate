@@ -316,12 +316,18 @@ type WhatsAppAccount struct {
 	// Set to true only after Meta enrolls this number in the WhatsApp Business
 	// Calling API. Used by the canned-response editor to disable the Call
 	// button option, and by the send path to refuse voice_call sends.
-	BusinessCallingEnabled bool       `gorm:"default:false" json:"business_calling_enabled"`
-	IsSMB                  bool       `gorm:"default:false" json:"is_smb"`
-	Status                 string     `gorm:"size:20;default:'active'" json:"status"`
-	Pin                    string     `gorm:"size:255" json:"-"` // 6-digit 2FA PIN (encrypted)
-	CreatedByID            *uuid.UUID `gorm:"type:uuid" json:"created_by_id,omitempty"`
-	UpdatedByID            *uuid.UUID `gorm:"type:uuid" json:"updated_by_id,omitempty"`
+	BusinessCallingEnabled bool   `gorm:"default:false" json:"business_calling_enabled"`
+	IsSMB                  bool   `gorm:"default:false" json:"is_smb"`
+	Status                 string `gorm:"size:20;default:'active'" json:"status"`
+	Pin                    string `gorm:"size:255" json:"-"` // 6-digit 2FA PIN (encrypted)
+	// ConnectionAttemptID and ConnectionAttemptStartedAt form a short-lived
+	// lease for Meta-side registration/subscription work. Every durable state
+	// transition is tied to the same attempt so a superseded request cannot
+	// overwrite a newer reconnect result.
+	ConnectionAttemptID        *uuid.UUID `gorm:"type:uuid;index" json:"-"`
+	ConnectionAttemptStartedAt *time.Time `json:"-"`
+	CreatedByID                *uuid.UUID `gorm:"type:uuid" json:"created_by_id,omitempty"`
+	UpdatedByID                *uuid.UUID `gorm:"type:uuid" json:"updated_by_id,omitempty"`
 
 	// Relations
 	Organization *Organization `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`

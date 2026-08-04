@@ -1,6 +1,7 @@
 package database_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -18,6 +19,92 @@ import (
 func cleanAll(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	testutil.TruncateTables(db)
+}
+
+func TestGlobalWhatsAppPhoneOwnershipAllowsOnlyOneActiveWorkspace(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+	owner := testutil.CreateTestOrganization(t, db)
+	claimant := testutil.CreateTestOrganization(t, db)
+	phoneID := "global-owner-" + uuid.NewString()
+
+	first := models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: owner.ID,
+		Name:           "First owner " + uuid.NewString(),
+		PhoneID:        phoneID,
+		BusinessID:     "waba-" + uuid.NewString(),
+		AccessToken:    "token",
+		APIVersion:     "v21.0",
+		Status:         "active",
+	}
+	require.NoError(t, db.Create(&first).Error)
+
+	second := models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: claimant.ID,
+		Name:           "Second owner " + uuid.NewString(),
+		PhoneID:        phoneID,
+		BusinessID:     "waba-" + uuid.NewString(),
+		AccessToken:    "token",
+		APIVersion:     "v21.0",
+		Status:         "active",
+	}
+	err := db.Create(&second).Error
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), database.GlobalWhatsAppPhoneIDIndex)
+
+	require.NoError(t, db.Delete(&first).Error)
+	require.NoError(t, db.Create(&second).Error, "a soft-deleted connection must release the phone for transfer")
+	require.NoError(t, database.EnsureGlobalWhatsAppPhoneIDUniqueness(db), "the migration must be idempotent")
+
+	var indexDefinition string
+	require.NoError(t, db.Raw(`
+		SELECT indexdef
+		FROM pg_catalog.pg_indexes
+		WHERE schemaname = 'public' AND indexname = ?
+	`, database.GlobalWhatsAppPhoneIDIndex).Scan(&indexDefinition).Error)
+	assert.Contains(t, indexDefinition, "UNIQUE INDEX")
+	assert.Contains(t, indexDefinition, "(phone_id)")
+	assert.Contains(t, indexDefinition, "WHERE (deleted_at IS NULL)")
+}
+
+func TestGlobalWhatsAppPhoneOwnershipMigrationRefusesLegacyDuplicates(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+	errRollback := errors.New("rollback duplicate migration fixture")
+
+	err := db.Transaction(func(tx *gorm.DB) error {
+		require.NoError(t, tx.Exec("DROP INDEX public."+database.GlobalWhatsAppPhoneIDIndex).Error)
+		firstOrg := testutil.CreateTestOrganization(t, tx)
+		secondOrg := testutil.CreateTestOrganization(t, tx)
+		phoneID := "legacy-duplicate-" + uuid.NewString()
+		for index, organizationID := range []uuid.UUID{firstOrg.ID, secondOrg.ID} {
+			require.NoError(t, tx.Create(&models.WhatsAppAccount{
+				BaseModel:      models.BaseModel{ID: uuid.New()},
+				OrganizationID: organizationID,
+				Name:           "Legacy duplicate owner " + uuid.NewString(),
+				PhoneID:        phoneID,
+				BusinessID:     "waba-" + uuid.NewString(),
+				AccessToken:    "token",
+				APIVersion:     "v21.0",
+				Status:         "active",
+			}).Error, "insert legacy duplicate %d", index)
+		}
+
+		migrationErr := database.EnsureGlobalWhatsAppPhoneIDUniqueness(tx)
+		require.Error(t, migrationErr)
+		assert.Contains(t, migrationErr.Error(), "resolve duplicate active phone IDs first")
+
+		var installedIndex *string
+		require.NoError(t, tx.Raw(
+			"SELECT to_regclass(?)::text",
+			"public."+database.GlobalWhatsAppPhoneIDIndex,
+		).Scan(&installedIndex).Error)
+		assert.Nil(t, installedIndex, "unsafe index must not be installed after the preflight fails")
+		return errRollback
+	})
+	require.ErrorIs(t, err, errRollback)
 }
 
 func TestBackfillProviderIntegrationBindingsRestoresLegacyThreadsAppID(t *testing.T) {

@@ -156,6 +156,8 @@ type CredentialsValidationResult struct {
 	VerifiedName           string
 	AccountMode            string
 	IsTestNumber           bool
+	IsOnBizApp             bool
+	PlatformType           string
 	QualityRating          string
 	CodeVerificationStatus string
 	Warning                string
@@ -206,20 +208,12 @@ func (c *Client) ValidateCredentials(ctx context.Context, phoneID, businessID, a
 		return nil, fmt.Errorf("invalid business_id: %w", err)
 	}
 
-	// 3. Verify phone belongs to business account
-	phonesURL := fmt.Sprintf("%s/%s/%s/phone_numbers", c.getBaseURL(), apiVersion, businessID)
-	phonesBody, err := c.doRequest(ctx, http.MethodGet, phonesURL, nil, accessToken)
+	// 3. Verify phone belongs to the business account across every page. A WABA
+	// can contain more than one page of numbers, so a first-page-only check can
+	// reject a valid Embedded Signup selection.
+	phonesResult, err := c.GetWABAPhoneNumbersVersion(ctx, businessID, accessToken, apiVersion)
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify phone-business relationship: %w", err)
-	}
-
-	var phonesResult struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(phonesBody, &phonesResult); err != nil {
-		return nil, fmt.Errorf("failed to parse phone numbers list: %w", err)
 	}
 
 	phoneFound := false
@@ -238,6 +232,8 @@ func (c *Client) ValidateCredentials(ctx context.Context, phoneID, businessID, a
 		VerifiedName:           phoneResult.VerifiedName,
 		AccountMode:            phoneResult.AccountMode,
 		IsTestNumber:           isTestNumber,
+		IsOnBizApp:             phoneResult.IsOnBizApp,
+		PlatformType:           phoneResult.PlatformType,
 		QualityRating:          phoneResult.QualityRating,
 		CodeVerificationStatus: phoneResult.CodeVerificationStatus,
 		Warning:                warning,
@@ -785,22 +781,83 @@ type WABAPhoneNumbersResponse struct {
 		DisplayPhoneNumber string `json:"display_phone_number"`
 		VerifiedName       string `json:"verified_name"`
 		QualityRating      string `json:"quality_rating"`
+		IsOnBizApp         bool   `json:"is_on_biz_app"`
+		PlatformType       string `json:"platform_type"`
 	} `json:"data"`
+	Paging struct {
+		Cursors struct {
+			After string `json:"after"`
+		} `json:"cursors"`
+		Next string `json:"next"`
+	} `json:"paging"`
 }
 
 // GetWABAPhoneNumbers retrieves all phone numbers associated with a WABA
 func (c *Client) GetWABAPhoneNumbers(ctx context.Context, wabaID, accessToken string) (*WABAPhoneNumbersResponse, error) {
-	url := fmt.Sprintf("%s/%s/phone_numbers?fields=id,display_phone_number,verified_name,quality_rating", c.getBaseURL(), wabaID)
+	return c.GetWABAPhoneNumbersVersion(ctx, wabaID, accessToken, "")
+}
 
-	respBody, err := c.doRequest(ctx, http.MethodGet, url, nil, accessToken)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get WABA phone numbers: %w", err)
+// GetWABAPhoneNumbersVersion retrieves every page of numbers under a WABA
+// using an explicit Graph API version when one is available.
+func (c *Client) GetWABAPhoneNumbersVersion(ctx context.Context, wabaID, accessToken, apiVersion string) (*WABAPhoneNumbersResponse, error) {
+	wabaID = strings.TrimSpace(wabaID)
+	if wabaID == "" {
+		return nil, errors.New("WABA ID is required")
 	}
 
-	var resp WABAPhoneNumbersResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse WABA phone numbers response: %w", err)
+	const maxPages = 100
+	result := &WABAPhoneNumbersResponse{}
+	after := ""
+	seenCursors := make(map[string]struct{})
+	seenPhones := make(map[string]struct{})
+
+	for page := 0; page < maxPages; page++ {
+		query := url.Values{}
+		query.Set("fields", "id,display_phone_number,verified_name,quality_rating,is_on_biz_app,platform_type")
+		query.Set("limit", "100")
+		if after != "" {
+			query.Set("after", after)
+		}
+		path := url.PathEscape(wabaID) + "/phone_numbers"
+		if version := strings.TrimSpace(apiVersion); version != "" {
+			path = url.PathEscape(version) + "/" + path
+		}
+		endpoint := fmt.Sprintf("%s/%s?%s", c.getBaseURL(), path, query.Encode())
+
+		respBody, err := c.doRequest(ctx, http.MethodGet, endpoint, nil, accessToken)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get WABA phone numbers: %w", err)
+		}
+
+		var pageResponse WABAPhoneNumbersResponse
+		if err := json.Unmarshal(respBody, &pageResponse); err != nil {
+			return nil, fmt.Errorf("failed to parse WABA phone numbers response: %w", err)
+		}
+		for _, phone := range pageResponse.Data {
+			phone.ID = strings.TrimSpace(phone.ID)
+			if phone.ID == "" {
+				continue
+			}
+			if _, exists := seenPhones[phone.ID]; exists {
+				continue
+			}
+			seenPhones[phone.ID] = struct{}{}
+			result.Data = append(result.Data, phone)
+		}
+
+		if strings.TrimSpace(pageResponse.Paging.Next) == "" {
+			return result, nil
+		}
+		nextAfter := strings.TrimSpace(pageResponse.Paging.Cursors.After)
+		if nextAfter == "" {
+			return nil, errors.New("meta phone-number pagination omitted the next cursor")
+		}
+		if _, exists := seenCursors[nextAfter]; exists {
+			return nil, errors.New("meta phone-number pagination repeated a cursor")
+		}
+		seenCursors[nextAfter] = struct{}{}
+		after = nextAfter
 	}
 
-	return &resp, nil
+	return nil, fmt.Errorf("meta phone-number pagination exceeded %d pages", maxPages)
 }

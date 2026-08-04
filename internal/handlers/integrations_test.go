@@ -1225,7 +1225,7 @@ func TestAccountCredentialEncryptionFailsClosedWithoutServerKey(t *testing.T) {
 	assert.Equal(t, "plaintext-access-token", account.AccessToken)
 }
 
-func TestAccountMutationDoesNotPersistNewSecretsWithoutServerKey(t *testing.T) {
+func TestAccountMutationFailsClosedForNewSecretsAndAllowsSafeEditsWithoutServerKey(t *testing.T) {
 	app := newIntegrationHandlerTestApp(t, "")
 	org := testutil.CreateTestOrganization(t, app.DB)
 	writer := integrationTestUser(t, app, org.ID, "accounts:read", "accounts:write")
@@ -1251,19 +1251,39 @@ func TestAccountMutationDoesNotPersistNewSecretsWithoutServerKey(t *testing.T) {
 		PhoneID:        "no-key-existing-phone",
 		BusinessID:     "no-key-existing-business",
 		AccessToken:    "legacy-plaintext-access-token",
+		AppSecret:      "legacy-plaintext-app-secret",
+		Pin:            "123456",
 		APIVersion:     "v21.0",
 		Status:         "active",
 	}
 	require.NoError(t, app.DB.Create(existing).Error)
-	update := testutil.NewJSONRequest(t, map[string]any{"name": "must-not-be-saved"})
-	testutil.SetAuthContext(update, org.ID, writer.ID)
-	testutil.SetPathParam(update, "id", existing.ID.String())
-	require.NoError(t, app.UpdateAccount(update))
-	testutil.AssertErrorResponse(t, update, fasthttp.StatusServiceUnavailable, "credential storage is unavailable")
+	profileUpdate := testutil.NewJSONRequest(t, map[string]any{"name": "safe-profile-edit"})
+	testutil.SetAuthContext(profileUpdate, org.ID, writer.ID)
+	testutil.SetPathParam(profileUpdate, "id", existing.ID.String())
+	require.NoError(t, app.UpdateAccount(profileUpdate))
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(profileUpdate))
+
 	var persisted models.WhatsAppAccount
 	require.NoError(t, app.DB.First(&persisted, "id = ?", existing.ID).Error)
-	assert.Equal(t, "no-key-existing", persisted.Name)
+	assert.Equal(t, "safe-profile-edit", persisted.Name)
 	assert.Equal(t, "legacy-plaintext-access-token", persisted.AccessToken)
+	assert.Equal(t, "legacy-plaintext-app-secret", persisted.AppSecret)
+	assert.Equal(t, "123456", persisted.Pin)
+
+	credentialUpdate := testutil.NewJSONRequest(t, map[string]any{
+		"name":         "must-not-be-saved",
+		"access_token": "replacement-must-not-be-persisted",
+	})
+	testutil.SetAuthContext(credentialUpdate, org.ID, writer.ID)
+	testutil.SetPathParam(credentialUpdate, "id", existing.ID.String())
+	require.NoError(t, app.UpdateAccount(credentialUpdate))
+	testutil.AssertErrorResponse(t, credentialUpdate, fasthttp.StatusServiceUnavailable, "credential storage is unavailable")
+
+	require.NoError(t, app.DB.First(&persisted, "id = ?", existing.ID).Error)
+	assert.Equal(t, "safe-profile-edit", persisted.Name)
+	assert.Equal(t, "legacy-plaintext-access-token", persisted.AccessToken)
+	assert.Equal(t, "legacy-plaintext-app-secret", persisted.AppSecret)
+	assert.Equal(t, "123456", persisted.Pin)
 }
 
 func TestEffectiveMetaCredentialsPreferManagedCenterAndKeepLegacyFallback(t *testing.T) {
