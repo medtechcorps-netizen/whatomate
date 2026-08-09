@@ -491,7 +491,7 @@ func (w *Worker) metaRelayOutboundAccountAtSend(
 	orgID, accountID uuid.UUID,
 ) (*models.ChannelAccount, error) {
 	if w == nil || w.DB == nil || w.Config == nil {
-		return nil, errors.New("Meta outbound delivery configuration is unavailable")
+		return nil, errors.New("meta outbound delivery configuration is unavailable")
 	}
 	var account models.ChannelAccount
 	err := database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
@@ -521,7 +521,7 @@ func (w *Worker) markMetaRelayOutboxDispatching(
 	workerID string,
 ) (*models.ChannelAccount, error) {
 	if w == nil || w.DB == nil || w.Config == nil {
-		return nil, errors.New("Meta outbound delivery configuration is unavailable")
+		return nil, errors.New("meta outbound delivery configuration is unavailable")
 	}
 	var account models.ChannelAccount
 	err := database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
@@ -555,7 +555,7 @@ func (w *Worker) markMetaRelayOutboxDispatching(
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
-			return errors.New("Meta relay dispatch fence lost its lease")
+			return errors.New("meta relay dispatch fence lost its lease")
 		}
 		return nil
 	})
@@ -572,7 +572,7 @@ func (w *Worker) loadMetaRelayOutboundAccountForUpdate(
 ) (models.ChannelAccount, error) {
 	var account models.ChannelAccount
 	if tx == nil {
-		return account, errors.New("Meta outbound delivery transaction is unavailable")
+		return account, errors.New("meta outbound delivery transaction is unavailable")
 	}
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Preload("Credentials", func(credentials *gorm.DB) *gorm.DB {

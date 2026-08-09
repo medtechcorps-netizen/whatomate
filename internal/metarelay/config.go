@@ -222,7 +222,7 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 		"Instagram verify token": c.InstagramLoginVerifyToken,
 	} {
 		if c.ReReplyProviderProofSecret == value {
-			return fmt.Errorf("Meta provider proof secret must be distinct from %s", label)
+			return fmt.Errorf("meta provider proof secret must be distinct from %s", label)
 		}
 	}
 	if !graphVersionPattern.MatchString(c.GraphAPIVersion) {
@@ -443,7 +443,7 @@ func validateGovernanceReviewTime(prefix, reviewedAt string, now time.Time) erro
 
 func (c *Config) validateCurrentGovernance(account *AccountConfig, now time.Time) error {
 	if c == nil || account == nil {
-		return errors.New("Meta governance configuration is unavailable")
+		return errors.New("meta governance configuration is unavailable")
 	}
 	switch account.webhookApp() {
 	case WebhookAppMessenger:
@@ -459,7 +459,7 @@ func (c *Config) validateCurrentGovernance(account *AccountConfig, now time.Time
 			now,
 		)
 	default:
-		return errors.New("Meta governance application binding is invalid")
+		return errors.New("meta governance application binding is invalid")
 	}
 }
 
@@ -539,7 +539,7 @@ func validateReReplyBaseURL(raw string, allowInsecure bool) (*url.URL, error) {
 		(parsed.Path != "" && parsed.Path != "/") {
 		return nil, errors.New("must be an absolute origin without path, credentials, query, or fragment")
 	}
-	if parsed.Scheme != "https" && !(allowInsecure && parsed.Scheme == "http") {
+	if parsed.Scheme != "https" && (!allowInsecure || parsed.Scheme != "http") {
 		return nil, errors.New("https is required")
 	}
 	parsed.Path = ""

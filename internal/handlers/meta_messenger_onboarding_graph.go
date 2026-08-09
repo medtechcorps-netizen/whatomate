@@ -212,7 +212,7 @@ func (a *App) exchangeMetaMessengerAuthorizationCode(
 		return response, err
 	}
 	if strings.TrimSpace(response.AccessToken) == "" {
-		return response, errors.New("Meta authorization code exchange returned no access token")
+		return response, errors.New("meta authorization code exchange returned no access token")
 	}
 	return response, nil
 }
@@ -237,12 +237,12 @@ func (a *App) inspectMetaMessengerToken(
 	data := response.Data
 	now := time.Now().UTC()
 	if !data.IsValid || strings.TrimSpace(data.AppID) != settings.AppID {
-		return metaMessengerTokenInspection{}, errors.New("Meta token is invalid or belongs to a different app")
+		return metaMessengerTokenInspection{}, errors.New("meta token is invalid or belongs to a different app")
 	}
 	tokenKind := strings.ToUpper(strings.TrimSpace(data.Type))
 	if requireUserScopes && tokenKind != metaMessengerTokenKindUser &&
 		tokenKind != metaMessengerTokenKindSystemUser {
-		return metaMessengerTokenInspection{}, errors.New("Meta authorization did not return a supported user or Business Integration System User token")
+		return metaMessengerTokenInspection{}, errors.New("meta authorization did not return a supported user or Business Integration System User token")
 	}
 	toExpiry := func(unixSeconds int64) (*time.Time, error) {
 		if unixSeconds <= 0 {
@@ -250,7 +250,7 @@ func (a *App) inspectMetaMessengerToken(
 		}
 		value := time.Unix(unixSeconds, 0).UTC()
 		if !value.After(now) {
-			return nil, errors.New("Meta token or data access has expired")
+			return nil, errors.New("meta token or data access has expired")
 		}
 		return &value, nil
 	}
@@ -291,7 +291,7 @@ func (a *App) inspectMetaMessengerToken(
 	if requireUserScopes {
 		if missing := missingMetaMessengerScopes(granted); len(missing) > 0 {
 			return metaMessengerTokenInspection{}, fmt.Errorf(
-				"Meta authorization is missing required permissions: %s",
+				"meta authorization is missing required permissions: %s",
 				strings.Join(missing, ", "),
 			)
 		}
@@ -306,7 +306,7 @@ func (a *App) inspectMetaMessengerToken(
 		userID = strings.TrimSpace(data.ProfileID)
 	}
 	if requireUserScopes && !validCanonicalMetaID(userID) {
-		return metaMessengerTokenInspection{}, errors.New("Meta user token identity is missing or invalid")
+		return metaMessengerTokenInspection{}, errors.New("meta user token identity is missing or invalid")
 	}
 	return metaMessengerTokenInspection{
 		AppID:                strings.TrimSpace(data.AppID),
@@ -403,11 +403,7 @@ func (a *App) discoverMetaMessengerInventory(
 			continue
 		}
 		business.PermittedRoles = normalizedMetaMessengerValues(business.PermittedRoles)
-		businesses = append(businesses, metaMessengerBusinessSummary{
-			ID:             business.ID,
-			Name:           business.Name,
-			PermittedRoles: business.PermittedRoles,
-		})
+		businesses = append(businesses, metaMessengerBusinessSummary(business))
 		ownedPages, fetchErr := fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
 			a,
 			ctx,
@@ -462,7 +458,7 @@ func (a *App) discoverMetaMessengerInventory(
 			if candidate.Selectable {
 				encryptedToken, fetchErr = appcrypto.Encrypt(access.AccessToken, a.integrationEncryptionKey())
 				if fetchErr != nil || !appcrypto.IsEncrypted(encryptedToken) {
-					return platform, nil, nil, errors.New("Meta Page token could not be protected")
+					return platform, nil, nil, errors.New("meta Page token could not be protected")
 				}
 			}
 			storedPages = append(storedPages, metaMessengerStoredPage{
@@ -537,7 +533,7 @@ func (a *App) fetchMetaMessengerPlatformIdentity(
 	case metaMessengerTokenKindSystemUser:
 		fields = "id,client_business_id"
 	default:
-		return metaMessengerPlatformUser{}, errors.New("Meta authorization token kind is unsupported")
+		return metaMessengerPlatformUser{}, errors.New("meta authorization token kind is unsupported")
 	}
 	var profile struct {
 		ID               string `json:"id"`
@@ -556,20 +552,20 @@ func (a *App) fetchMetaMessengerPlatformIdentity(
 		ClientBusinessID: strings.TrimSpace(profile.ClientBusinessID),
 	}
 	if platform.UserID == "" || (inspection.UserID != "" && platform.UserID != inspection.UserID) {
-		return platform, errors.New("Meta authorization identity did not match the inspected token")
+		return platform, errors.New("meta authorization identity did not match the inspected token")
 	}
 	switch platform.TokenKind {
 	case metaMessengerTokenKindUser:
 		platform.ClientBusinessID = ""
 	case metaMessengerTokenKindSystemUser:
 		if !validCanonicalMetaID(platform.ClientBusinessID) {
-			return platform, errors.New("Business Integration System User client_business_id is missing or invalid")
+			return platform, errors.New("business Integration System User client_business_id is missing or invalid")
 		}
 		if platform.Name == "" {
 			platform.Name = "Business Integration System User"
 		}
 	default:
-		return platform, errors.New("Meta authorization token kind is unsupported")
+		return platform, errors.New("meta authorization token kind is unsupported")
 	}
 	return platform, nil
 }
@@ -637,7 +633,7 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		if candidate.Selectable {
 			encryptedToken, err = appcrypto.Encrypt(page.AccessToken, a.integrationEncryptionKey())
 			if err != nil || !appcrypto.IsEncrypted(encryptedToken) {
-				return nil, nil, errors.New("Meta Page token could not be protected")
+				return nil, nil, errors.New("meta Page token could not be protected")
 			}
 		}
 		pages = append(pages, metaMessengerStoredPage{
@@ -833,7 +829,7 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 		a.integrationEncryptionKey(),
 	)
 	if err != nil || !appcrypto.IsEncrypted(encryptedPageToken) {
-		return metaMessengerStoredPage{}, errors.New("Meta Page token could not be protected")
+		return metaMessengerStoredPage{}, errors.New("meta Page token could not be protected")
 	}
 	selected.PageName = firstNonemptyMetaMessengerValue(
 		ownedName,
@@ -855,7 +851,7 @@ func fetchMetaMessengerGraphList[T any](
 	maximum int,
 ) ([]T, error) {
 	if maximum <= 0 {
-		return nil, errors.New("Meta inventory limit is invalid")
+		return nil, errors.New("meta inventory limit is invalid")
 	}
 	values := cloneURLValues(baseValues)
 	values.Set("limit", fmt.Sprintf("%d", metaMessengerGraphPageLimit))
@@ -873,7 +869,7 @@ func fetchMetaMessengerGraphList[T any](
 			return nil, err
 		}
 		if len(result)+len(page.Data) > maximum {
-			return nil, errors.New("Meta inventory exceeded the safe discovery limit")
+			return nil, errors.New("meta inventory exceeded the safe discovery limit")
 		}
 		result = append(result, page.Data...)
 		if strings.TrimSpace(page.Paging.Next) == "" {
@@ -881,11 +877,11 @@ func fetchMetaMessengerGraphList[T any](
 		}
 		after := strings.TrimSpace(page.Paging.Cursors.After)
 		if after == "" || len(after) > 2048 {
-			return nil, errors.New("Meta inventory pagination was invalid")
+			return nil, errors.New("meta inventory pagination was invalid")
 		}
 		values.Set("after", after)
 	}
-	return nil, errors.New("Meta inventory exceeded the safe pagination limit")
+	return nil, errors.New("meta inventory exceeded the safe pagination limit")
 }
 
 func cloneURLValues(values url.Values) url.Values {
@@ -954,7 +950,7 @@ func (a *App) bindMetaMessengerPageToken(
 		return inspection, "", err
 	}
 	if strings.TrimSpace(binding.ID) != strings.TrimSpace(pageID) {
-		return inspection, "", errors.New("Meta Page token is bound to a different Page")
+		return inspection, "", errors.New("meta Page token is bound to a different Page")
 	}
 	return inspection, strings.TrimSpace(binding.Name), nil
 }
@@ -973,7 +969,7 @@ func (a *App) subscribeMetaMessengerPage(
 		return err
 	}
 	if !subscribed.Success {
-		return errors.New("Meta did not confirm the messages webhook subscription")
+		return errors.New("meta did not confirm the messages webhook subscription")
 	}
 	var subscriptions struct {
 		Data []struct {
@@ -1022,7 +1018,7 @@ func (a *App) doMetaMessengerGraphJSON(
 	}
 	request, err := http.NewRequestWithContext(ctx, method, target.String(), body)
 	if err != nil {
-		return errors.New("Meta request could not be prepared")
+		return errors.New("meta request could not be prepared")
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", "ReReply-Meta-Messenger-Onboarding/1.0")
@@ -1036,12 +1032,12 @@ func (a *App) doMetaMessengerGraphJSON(
 	client.Timeout = metaMessengerGraphHTTPTimeout
 	response, err := client.Do(request)
 	if err != nil {
-		return errors.New("Meta provider request failed")
+		return errors.New("meta provider request failed")
 	}
 	defer func() { _ = response.Body.Close() }()
 	payload, err := io.ReadAll(io.LimitReader(response.Body, metaMessengerGraphMaxResponse+1))
 	if err != nil || int64(len(payload)) > metaMessengerGraphMaxResponse {
-		return errors.New("Meta provider response was invalid")
+		return errors.New("meta provider response was invalid")
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		var envelope metaMessengerGraphErrorEnvelope
@@ -1064,11 +1060,11 @@ func (a *App) doMetaMessengerGraphJSON(
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	if err := decoder.Decode(destination); err != nil {
-		return errors.New("Meta provider response was invalid")
+		return errors.New("meta provider response was invalid")
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return errors.New("Meta provider response was invalid")
+		return errors.New("meta provider response was invalid")
 	}
 	return nil
 }
@@ -1080,13 +1076,13 @@ func (a *App) metaMessengerGraphEndpoint(endpoint string) (*url.URL, error) {
 	}
 	base, err := url.Parse(strings.TrimSpace(settings.GraphBaseURL))
 	if err != nil || base.Hostname() == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
-		return nil, errors.New("Meta Graph endpoint is invalid")
+		return nil, errors.New("meta Graph endpoint is invalid")
 	}
 	production := a.Config != nil && strings.EqualFold(strings.TrimSpace(a.Config.App.Environment), "production")
 	if production && (settings.GraphBaseURL != metaMessengerProductionGraphOrigin ||
 		base.Scheme != "https" || base.Host != "graph.facebook.com" ||
 		base.Path != "" || base.RawPath != "") {
-		return nil, errors.New("Meta Graph endpoint is invalid")
+		return nil, errors.New("meta Graph endpoint is invalid")
 	}
 	if !strings.EqualFold(base.Scheme, "https") {
 		host := strings.Trim(base.Hostname(), "[]")
@@ -1094,7 +1090,7 @@ func (a *App) metaMessengerGraphEndpoint(endpoint string) (*url.URL, error) {
 		developmentLoopback := a.Config != nil && !production &&
 			strings.EqualFold(base.Scheme, "http") && ip != nil && ip.IsLoopback()
 		if !developmentLoopback {
-			return nil, errors.New("Meta Graph endpoint is invalid")
+			return nil, errors.New("meta Graph endpoint is invalid")
 		}
 	}
 	base.Path = strings.TrimRight(base.Path, "/") + "/" +

@@ -58,7 +58,7 @@ func Resolve(settings config.MetaRelayConfig, environment string, account *model
 	if account == nil ||
 		(account.Channel != models.ChannelMessenger && account.Channel != models.ChannelInstagram) ||
 		!strings.EqualFold(strings.TrimSpace(account.Provider), "relay") {
-		return Binding{}, errors.New("Meta relay account is required")
+		return Binding{}, errors.New("meta relay account is required")
 	}
 	if len([]byte(settings.ProviderProofSecret)) < minimumProviderProofBytes ||
 		strings.TrimSpace(settings.ProviderProofSecret) != settings.ProviderProofSecret {
@@ -143,23 +143,23 @@ func ValidateOutbound(
 		return Binding{}, err
 	}
 	if account.Config == nil || configString(account.Config, "identity_confirmed_id") != account.ExternalAccountID {
-		return Binding{}, errors.New("Meta account identity is not confirmed for outbound delivery")
+		return Binding{}, errors.New("meta account identity is not confirmed for outbound delivery")
 	}
 	if account.Metadata == nil ||
 		configString(account.Metadata, channelapi.MetaProviderProofMetadataKey) != channelapi.MetaProviderProofVersion {
-		return Binding{}, errors.New("Meta account has not completed the current provider-proof Test")
+		return Binding{}, errors.New("meta account has not completed the current provider-proof Test")
 	}
 	if account.Status != models.ChannelAccountStatusActive ||
 		account.LastHealthCheckAt == nil ||
 		account.LastErrorAt != nil ||
 		strings.TrimSpace(account.LastError) != "" {
-		return Binding{}, errors.New("Meta account does not have a successful current health check")
+		return Binding{}, errors.New("meta account does not have a successful current health check")
 	}
 	if account.LastInboundAt == nil || !account.LastInboundAt.After(*account.LastHealthCheckAt) {
-		return Binding{}, errors.New("Meta account has no provider-proven customer message after its latest health check")
+		return Binding{}, errors.New("meta account has no provider-proven customer message after its latest health check")
 	}
 	if !configBool(account.Config, "outbound_enabled") {
-		return Binding{}, errors.New("Meta outbound delivery is not enabled")
+		return Binding{}, errors.New("meta outbound delivery is not enabled")
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -176,7 +176,7 @@ func ValidateOutbound(
 			requiredKind,
 			now,
 		) != 1 {
-		return Binding{}, errors.New("Meta account must have exactly one current relay webhook credential")
+		return Binding{}, errors.New("meta account must have exactly one current relay webhook credential")
 	}
 	return binding, nil
 }

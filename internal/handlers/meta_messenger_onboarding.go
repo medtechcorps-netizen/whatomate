@@ -686,7 +686,7 @@ func (a *App) persistMetaMessengerPendingAccount(
 
 	root := a.rootApp()
 	if root == nil || root.DB == nil {
-		return nil, errors.New("Messenger onboarding database is unavailable")
+		return nil, errors.New("messenger onboarding database is unavailable")
 	}
 	var account *models.ChannelAccount
 	var webhookCredential models.ChannelCredential
@@ -840,7 +840,7 @@ func applyMetaMessengerPendingAccount(
 	settings configpkg.MetaMessengerOnboardingConfig,
 ) error {
 	if account == nil || account.ID == uuid.Nil {
-		return errors.New("Messenger account identity is invalid")
+		return errors.New("messenger account identity is invalid")
 	}
 	relayURL, err := metaMessengerRelayURL(settings.TrustedRelayBaseURL, page.PageID)
 	if err != nil {
@@ -998,11 +998,11 @@ func (a *App) ensureMetaMessengerWebhookCredentialTx(
 	}
 	encryptedInbound, err := appcrypto.Encrypt(inboundSecret, a.integrationEncryptionKey())
 	if err != nil || !appcrypto.IsEncrypted(encryptedInbound) {
-		return models.ChannelCredential{}, false, errors.New("Messenger inbound credential could not be protected")
+		return models.ChannelCredential{}, false, errors.New("messenger inbound credential could not be protected")
 	}
 	encryptedOutbound, err := appcrypto.Encrypt(outboundSecret, a.integrationEncryptionKey())
 	if err != nil || !appcrypto.IsEncrypted(encryptedOutbound) {
-		return models.ChannelCredential{}, false, errors.New("Messenger outbound credential could not be protected")
+		return models.ChannelCredential{}, false, errors.New("messenger outbound credential could not be protected")
 	}
 	credential := models.ChannelCredential{
 		BaseModel:        models.BaseModel{ID: uuid.New()},

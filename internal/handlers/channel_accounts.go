@@ -732,7 +732,7 @@ func managedMetaMessengerProtectedFieldsChanged(request UpdateChannelAccountRequ
 
 func validateMetaRelayOutboundSecret(secret string) error {
 	if len([]byte(secret)) < 32 || strings.TrimSpace(secret) != secret {
-		return errors.New("Meta relay outbound_secret must contain at least 32 UTF-8 bytes without surrounding whitespace")
+		return errors.New("meta relay outbound_secret must contain at least 32 UTF-8 bytes without surrounding whitespace")
 	}
 	return nil
 }

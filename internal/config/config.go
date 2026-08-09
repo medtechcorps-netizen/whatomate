@@ -401,7 +401,7 @@ func validateMetaMessengerRelayConsistency(
 		return errors.New("WHATOMATE_META_RELAY__BASE_URL is required and must be valid when Messenger onboarding is enabled")
 	}
 	if onboardingBase != protectedBase {
-		return errors.New("Messenger onboarding trusted relay base must match WHATOMATE_META_RELAY__BASE_URL")
+		return errors.New("messenger onboarding trusted relay base must match WHATOMATE_META_RELAY__BASE_URL")
 	}
 	return nil
 }

@@ -56,10 +56,10 @@ var (
 	ErrRelaySecretMissing            = errors.New("relay signing secret is not configured")
 	ErrRelaySignatureMissing         = errors.New("relay signature is missing")
 	ErrRelaySignatureInvalid         = errors.New("relay signature is invalid")
-	ErrRelayMetaProviderProofMissing = errors.New("Meta relay provider proof is missing")
-	ErrRelayMetaProviderProofInvalid = errors.New("Meta relay provider proof is invalid")
-	ErrRelayMetaProviderProofSecret  = errors.New("Meta relay provider proof secret is not configured securely")
-	ErrRelayMetaTrustedBinding       = errors.New("Meta relay trusted Business binding is not configured")
+	ErrRelayMetaProviderProofMissing = errors.New("meta relay provider proof is missing")
+	ErrRelayMetaProviderProofInvalid = errors.New("meta relay provider proof is invalid")
+	ErrRelayMetaProviderProofSecret  = errors.New("meta relay provider proof secret is not configured securely")
+	ErrRelayMetaTrustedBinding       = errors.New("meta relay trusted Business binding is not configured")
 	ErrRelayOutboundDisabled         = errors.New("relay outbound delivery is not approved")
 	ErrRelayURLInvalid               = errors.New("relay URL is invalid")
 	ErrCredentialRefreshUnsupported  = errors.New("relay credentials cannot be refreshed automatically")
@@ -562,7 +562,7 @@ func validateMetaRelayReadinessHeaders(
 		strings.TrimSpace(headers.Get(RelayChannelAccountHeader)) != account.ID.String() ||
 		strings.TrimSpace(headers.Get(RelayOrganizationHeader)) != account.OrganizationID.String() ||
 		strings.TrimSpace(headers.Get(RelayMetaBusinessHeader)) != expectedMetaBusinessID {
-		return errors.New("Meta relay production mapping or readiness attestation is missing or mismatched")
+		return errors.New("meta relay production mapping or readiness attestation is missing or mismatched")
 	}
 	expectedProof := SignMetaProviderReadinessProof(
 		providerProofSecret,
@@ -576,7 +576,7 @@ func validateMetaRelayReadinessHeaders(
 		headers.Get(RelayMetaProviderProofHeader),
 		expectedProof,
 	) {
-		return errors.New("Meta relay provider readiness proof is missing or mismatched")
+		return errors.New("meta relay provider readiness proof is missing or mismatched")
 	}
 	return nil
 }
