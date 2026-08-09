@@ -1579,7 +1579,7 @@ func configureMetaRelayDispatchFenceFixture(
 	account *models.ChannelAccount,
 ) *Worker {
 	t.Helper()
-	externalID := "7" + strings.ReplaceAll(uuid.NewString(), "-", "")[:14]
+	externalID := testutil.UniqueNumericID(t, "7")
 	relayBaseURL := "https://app.rereply.app/meta-relay"
 	relayURL := relayBaseURL + "/v1/accounts/messenger/" + externalID
 	healthAt := time.Now().UTC().Add(-time.Minute)
