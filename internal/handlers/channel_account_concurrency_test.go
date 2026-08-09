@@ -872,7 +872,7 @@ func newChannelAccountConcurrencyFixture(
 		organization.ID,
 		user.ID,
 	)
-	externalAccountID := "17841400000000000"
+	externalAccountID := testutil.UniqueNumericID(t, "7")
 	healthCheckedAt := time.Now().UTC().Add(-2 * time.Minute)
 	lastInboundAt := healthCheckedAt.Add(time.Minute)
 	account := &models.ChannelAccount{

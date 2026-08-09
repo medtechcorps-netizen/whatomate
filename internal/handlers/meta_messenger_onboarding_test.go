@@ -557,7 +557,7 @@ func TestMetaMessengerPendingSelectionResumesWithoutDuplicatingRelaySecrets(t *t
 	)
 	enableBookingCommerceTestEntitlement(t, app.DB, org.ID, admin.ID, "omnichannel.enabled")
 
-	for index, testCase := range []struct {
+	for _, testCase := range []struct {
 		name             string
 		state            string
 		tokenKind        string
@@ -568,7 +568,7 @@ func TestMetaMessengerPendingSelectionResumesWithoutDuplicatingRelaySecrets(t *t
 		{name: "awaiting relay registry", state: metaMessengerAwaitingRegistryState, tokenKind: metaMessengerTokenKindUser},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			pageID := fmt.Sprintf("7000000000001%02d", index)
+			pageID := testutil.UniqueNumericID(t, "7")
 			firstPage := newMetaMessengerPersistencePage(t, pageID, "first-page-token")
 			firstInspection := newMetaMessengerAuthorizationInspection(testCase.tokenKind)
 			first, err := app.persistMetaMessengerPendingAccount(
@@ -655,7 +655,8 @@ func TestMetaMessengerResumeStopsAfterProtectedInventoryRecognition(t *testing.T
 	org := testutil.CreateTestOrganization(t, app.DB)
 	admin := integrationTestUser(t, app, org.ID, models.ResourceChannelAccounts+":"+models.ActionWrite)
 	enableBookingCommerceTestEntitlement(t, app.DB, org.ID, admin.ID, "omnichannel.enabled")
-	page := newMetaMessengerPersistencePage(t, metaMessengerTestPageID, "first-page-token")
+	pageID := testutil.UniqueNumericID(t, "7")
+	page := newMetaMessengerPersistencePage(t, pageID, "first-page-token")
 	authorization := newMetaMessengerAuthorizationInspection(metaMessengerTokenKindUser)
 	account, err := app.persistMetaMessengerPendingAccount(
 		newMetaMessengerPersistenceRequest(t, org.ID, admin.ID),
@@ -669,7 +670,7 @@ func TestMetaMessengerResumeStopsAfterProtectedInventoryRecognition(t *testing.T
 	require.NoError(t, err)
 	app.Config.MetaRelay.ExpectedAccountsJSON = trustedMetaMessengerInventoryJSON(org.ID, account.ID, page.PageID)
 
-	retryPage := newMetaMessengerPersistencePage(t, metaMessengerTestPageID, "must-not-be-stored")
+	retryPage := newMetaMessengerPersistencePage(t, pageID, "must-not-be-stored")
 	_, err = app.persistMetaMessengerPendingAccount(
 		newMetaMessengerPersistenceRequest(t, org.ID, admin.ID),
 		org.ID,
@@ -695,7 +696,8 @@ func TestMetaMessengerGlobalPageUniquenessBlocksAnotherWorkspace(t *testing.T) {
 	adminB := integrationTestUser(t, app, orgB.ID, models.ResourceChannelAccounts+":"+models.ActionWrite)
 	enableBookingCommerceTestEntitlement(t, app.DB, orgA.ID, adminA.ID, "omnichannel.enabled")
 	enableBookingCommerceTestEntitlement(t, app.DB, orgB.ID, adminB.ID, "omnichannel.enabled")
-	page := newMetaMessengerPersistencePage(t, metaMessengerTestPageID, "workspace-a-page-token")
+	pageID := testutil.UniqueNumericID(t, "7")
+	page := newMetaMessengerPersistencePage(t, pageID, "workspace-a-page-token")
 	authorization := newMetaMessengerAuthorizationInspection(metaMessengerTokenKindUser)
 	_, err := app.persistMetaMessengerPendingAccount(
 		newMetaMessengerPersistenceRequest(t, orgA.ID, adminA.ID),
@@ -708,7 +710,7 @@ func TestMetaMessengerGlobalPageUniquenessBlocksAnotherWorkspace(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	page = newMetaMessengerPersistencePage(t, metaMessengerTestPageID, "workspace-b-page-token")
+	page = newMetaMessengerPersistencePage(t, pageID, "workspace-b-page-token")
 	_, err = app.persistMetaMessengerPendingAccount(
 		newMetaMessengerPersistenceRequest(t, orgB.ID, adminB.ID),
 		orgB.ID,
@@ -721,7 +723,7 @@ func TestMetaMessengerGlobalPageUniquenessBlocksAnotherWorkspace(t *testing.T) {
 	require.Error(t, err)
 	var count int64
 	require.NoError(t, app.DB.Model(&models.ChannelAccount{}).
-		Where("channel = ? AND provider = ? AND external_account_id = ?", models.ChannelMessenger, "relay", metaMessengerTestPageID).
+		Where("channel = ? AND provider = ? AND external_account_id = ?", models.ChannelMessenger, "relay", pageID).
 		Count(&count).Error)
 	assert.EqualValues(t, 1, count)
 }

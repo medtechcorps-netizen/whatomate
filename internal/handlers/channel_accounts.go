@@ -1219,10 +1219,18 @@ func (a *App) channelAdapter(account *models.ChannelAccount) (channelapi.Adapter
 	}
 	if strings.EqualFold(account.Provider, channelapi.RelayProvider) {
 		encryptionKey := ""
+		allowLocalhostDevelopment := false
 		if a.Config != nil {
 			encryptionKey = a.Config.App.EncryptionKey
+			allowLocalhostDevelopment = strings.EqualFold(
+				strings.TrimSpace(a.Config.App.Environment),
+				"development",
+			)
 		}
 		adapter := channelapi.NewRelayAdapter(account.Channel, a.HTTPClient, encryptionKey)
+		if allowLocalhostDevelopment {
+			adapter.WithLocalhostDevelopment()
+		}
 		if isMetaRelayChannelAccount(account) {
 			binding, err := a.trustedMetaRelayBinding(account)
 			if err != nil {

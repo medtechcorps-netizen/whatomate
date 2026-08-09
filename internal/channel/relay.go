@@ -107,6 +107,16 @@ func (a *RelayAdapter) WithMetaProviderProofSecret(secret string) *RelayAdapter 
 	return a
 }
 
+// WithLocalhostDevelopment explicitly permits loopback relay endpoints for a
+// process-owned development environment. Tenant-controlled channel
+// configuration must never select this option.
+func (a *RelayAdapter) WithLocalhostDevelopment() *RelayAdapter {
+	if a != nil {
+		a.allowLocalhostDev = true
+	}
+	return a
+}
+
 // SignMetaProviderInboundProof signs the exact canonical body using a domain
 // that cannot be confused with an account-scoped webhook signature or a
 // readiness proof.
