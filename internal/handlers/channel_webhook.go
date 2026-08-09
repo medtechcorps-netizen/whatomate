@@ -363,8 +363,15 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 			return err
 		}
 		account = *currentAccount
+		var latestNewInboundAnchor time.Time
 		for i := range events {
-			if err := processNormalizedChannelEvent(tx, &account, &events[i], rawEvent.ReceivedAt); err != nil {
+			if err := processNormalizedChannelEvent(
+				tx,
+				&account,
+				&events[i],
+				rawEvent.ReceivedAt,
+				&latestNewInboundAnchor,
+			); err != nil {
 				return fmt.Errorf("process normalized event %d: %w", i, err)
 			}
 		}
@@ -378,10 +385,14 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 			}).Error; err != nil {
 			return err
 		}
+		if latestNewInboundAnchor.IsZero() ||
+			(account.LastInboundAt != nil && !latestNewInboundAnchor.After(*account.LastInboundAt)) {
+			return nil
+		}
 		return tx.Model(&models.ChannelAccount{}).
 			Where("id = ? AND organization_id = ?", account.ID, orgID).
 			Updates(map[string]any{
-				"last_inbound_at": now,
+				"last_inbound_at": latestNewInboundAnchor,
 				"updated_at":      now,
 			}).Error
 	})
@@ -659,6 +670,7 @@ func processNormalizedChannelEvent(
 	account *models.ChannelAccount,
 	event *channelapi.InboundEvent,
 	acceptedAt time.Time,
+	latestNewInboundAnchor ...*time.Time,
 ) error {
 	if acceptedAt.IsZero() {
 		acceptedAt = time.Now().UTC()
@@ -699,7 +711,12 @@ func processNormalizedChannelEvent(
 
 	switch event.Type {
 	case channelapi.NormalizedEventTypeMessage:
-		err = persistInboundChannelMessage(tx, account, event, event.Message, acceptedAt)
+		var createdAnchor time.Time
+		err = persistInboundChannelMessage(tx, account, event, event.Message, acceptedAt, &createdAnchor)
+		if err == nil && !createdAnchor.IsZero() && len(latestNewInboundAnchor) > 0 && latestNewInboundAnchor[0] != nil &&
+			(latestNewInboundAnchor[0].IsZero() || createdAnchor.After(*latestNewInboundAnchor[0])) {
+			*latestNewInboundAnchor[0] = createdAnchor
+		}
 	case channelapi.NormalizedEventTypeMessageStatus:
 		err = persistChannelMessageStatus(tx, account, event, event.MessageStatus)
 	case channelapi.NormalizedEventTypeRead:
@@ -729,7 +746,11 @@ func persistInboundChannelMessage(
 	event *channelapi.InboundEvent,
 	inbound *channelapi.InboundMessage,
 	acceptedAt time.Time,
+	createdAnchor *time.Time,
 ) error {
+	if createdAnchor != nil {
+		*createdAnchor = time.Time{}
+	}
 	if inbound == nil {
 		return errors.New("normalized message payload is missing")
 	}
@@ -740,6 +761,9 @@ func persistInboundChannelMessage(
 	}
 	if inbound.Sender.Role != models.ConversationParticipantRoleCustomer {
 		return errors.New("normalized inbound message sender role must be customer")
+	}
+	if len(inbound.Parts) == 0 {
+		return errors.New("normalized inbound message must contain at least one message part")
 	}
 	if acceptedAt.IsZero() {
 		acceptedAt = time.Now().UTC()
@@ -809,6 +833,9 @@ func persistInboundChannelMessage(
 	}
 	if err := tx.Create(&message).Error; err != nil {
 		return err
+	}
+	if createdAnchor != nil {
+		*createdAnchor = serviceWindowOpenedAt
 	}
 	parts := persistentMessageParts(account.OrganizationID, conversation.ID, message.ID, inbound.Parts)
 	if len(parts) > 0 {
@@ -1308,9 +1335,12 @@ func resolveChannelWebhookOrganization(
 	if !rlsEnabled {
 		var account models.ChannelAccount
 		if err := db.Model(&models.ChannelAccount{}).
-			Select("organization_id").
+			Select("channel_accounts.organization_id").
+			Joins(
+				"INNER JOIN organizations ON organizations.id = channel_accounts.organization_id AND organizations.deleted_at IS NULL",
+			).
 			Where(
-				"id = ? AND status IN ?",
+				"channel_accounts.id = ? AND channel_accounts.status IN ?",
 				channelAccountID,
 				[]models.ChannelAccountStatus{
 					models.ChannelAccountStatusPending,

@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/database"
+	"github.com/shridarpatil/whatomate/internal/metatrust"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -430,6 +431,35 @@ func (w *Worker) deliverChannelOutboxJob(
 		}
 		job.Status = models.OutboxJobStatusDispatching
 	}
+	if isMetaRelayOutboxAccount(&account) {
+		var freshAccount *models.ChannelAccount
+		var gateErr error
+		if job.Status == models.OutboxJobStatusDispatching {
+			// AI replies cross their policy dispatch fence above. A dispatching
+			// job has already won the cancellation race, but the current Meta
+			// account, credential, inventory, and proof state must still pass.
+			freshAccount, gateErr = w.metaRelayOutboundAccountAtSend(orgID, account.ID)
+		} else {
+			// Ordinary relay messages atomically validate the current account and
+			// cross the durable dispatch fence before the provider request starts.
+			// Disconnect/revocation transactions serialize on the same account row.
+			freshAccount, gateErr = w.markMetaRelayOutboxDispatching(
+				orgID,
+				job.ID,
+				account.ID,
+				workerID,
+			)
+		}
+		if gateErr != nil {
+			return w.failChannelOutboxJob(orgID, &job, workerID, gateErr, false)
+		}
+		job.Status = models.OutboxJobStatusDispatching
+		account = *freshAccount
+		adapter, gateErr = w.channelOutboxAdapter(&account)
+		if gateErr != nil {
+			return w.failChannelOutboxJob(orgID, &job, workerID, gateErr, false)
+		}
+	}
 
 	result, sendErr := adapter.Send(ctx, &account, outbound)
 	if sendErr != nil {
@@ -445,6 +475,132 @@ func (w *Worker) deliverChannelOutboxJob(
 		)
 	}
 	return w.completeChannelOutboxJob(orgID, &job, &account, workerID, result)
+}
+
+func isMetaRelayOutboxAccount(account *models.ChannelAccount) bool {
+	return account != nil &&
+		(account.Channel == models.ChannelMessenger || account.Channel == models.ChannelInstagram) &&
+		strings.EqualFold(strings.TrimSpace(account.Provider), channelapi.RelayProvider)
+}
+
+// metaRelayOutboundAccountAtSend reloads and locks the current account state
+// immediately before the provider call. This prevents a queued or legacy
+// outbound_enabled row from bypassing recertification, protected inventory,
+// exact identity, credential, health, or post-Test inbound proof checks.
+func (w *Worker) metaRelayOutboundAccountAtSend(
+	orgID, accountID uuid.UUID,
+) (*models.ChannelAccount, error) {
+	if w == nil || w.DB == nil || w.Config == nil {
+		return nil, errors.New("Meta outbound delivery configuration is unavailable")
+	}
+	var account models.ChannelAccount
+	err := database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
+		var loadErr error
+		account, loadErr = w.loadMetaRelayOutboundAccountForUpdate(
+			tx,
+			orgID,
+			accountID,
+			time.Now().UTC(),
+		)
+		return loadErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &account, nil
+}
+
+// markMetaRelayOutboxDispatching is the ordinary Meta relay delivery fence.
+// It serializes account disconnect, credential rotation, and provider dispatch
+// on the account row, validates all current runtime trust evidence, then records
+// dispatching in the same transaction. Once that compare-and-swap commits, the
+// provider attempt has won the race; later policy changes apply to subsequent
+// messages and cannot recall an already-starting network request.
+func (w *Worker) markMetaRelayOutboxDispatching(
+	orgID, jobID, accountID uuid.UUID,
+	workerID string,
+) (*models.ChannelAccount, error) {
+	if w == nil || w.DB == nil || w.Config == nil {
+		return nil, errors.New("Meta outbound delivery configuration is unavailable")
+	}
+	var account models.ChannelAccount
+	err := database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
+		now := time.Now().UTC()
+		var loadErr error
+		account, loadErr = w.loadMetaRelayOutboundAccountForUpdate(
+			tx,
+			orgID,
+			accountID,
+			now,
+		)
+		if loadErr != nil {
+			return loadErr
+		}
+
+		result := tx.Model(&models.OutboxJob{}).
+			Where(
+				"id = ? AND organization_id = ? AND channel_account_id = ? AND status = ? AND locked_by = ?",
+				jobID,
+				orgID,
+				account.ID,
+				models.OutboxJobStatusProcessing,
+				workerID,
+			).
+			Updates(map[string]any{
+				"status":     models.OutboxJobStatusDispatching,
+				"locked_at":  now,
+				"updated_at": now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("Meta relay dispatch fence lost its lease")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &account, nil
+}
+
+func (w *Worker) loadMetaRelayOutboundAccountForUpdate(
+	tx *gorm.DB,
+	orgID, accountID uuid.UUID,
+	now time.Time,
+) (models.ChannelAccount, error) {
+	var account models.ChannelAccount
+	if tx == nil {
+		return account, errors.New("Meta outbound delivery transaction is unavailable")
+	}
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Preload("Credentials", func(credentials *gorm.DB) *gorm.DB {
+			return credentials.
+				Where(
+					"organization_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+					orgID,
+					[]models.ChannelCredentialStatus{
+						models.ChannelCredentialStatusActive,
+						models.ChannelCredentialStatusExpiring,
+					},
+					now,
+				).
+				Order("version DESC, id ASC")
+		}).
+		Where("id = ? AND organization_id = ?", accountID, orgID).
+		First(&account).Error; err != nil {
+		return account, err
+	}
+	if _, err := metatrust.ValidateOutbound(
+		w.Config.MetaRelay,
+		w.Config.App.Environment,
+		&account,
+		now,
+	); err != nil {
+		return account, err
+	}
+	return account, nil
 }
 
 func validateThreadsChannelOutboxBinding(
@@ -1257,10 +1413,16 @@ func (w *Worker) channelOutboxAdapter(account *models.ChannelAccount) (channelap
 			Retryable: false,
 		}
 	}
-	encryptionKey := ""
-	if w.Config != nil {
-		encryptionKey = w.Config.App.EncryptionKey
+	if w == nil || w.Config == nil {
+		return nil, &channelapi.ProviderError{
+			Operation: "resolve_adapter",
+			Provider:  account.Provider,
+			Code:      "application_config_unavailable",
+			Message:   "application configuration is unavailable",
+			Retryable: false,
+		}
 	}
+	encryptionKey := w.Config.App.EncryptionKey
 	if encryptionKey == "" {
 		return nil, &channelapi.ProviderError{
 			Operation: "resolve_adapter",
@@ -1274,11 +1436,32 @@ func (w *Worker) channelOutboxAdapter(account *models.ChannelAccount) (channelap
 	if isThreads {
 		return channelapi.NewThreadsAdapter(client, encryptionKey), nil
 	}
-	return channelapi.NewRelayAdapter(
+	adapter := channelapi.NewRelayAdapter(
 		account.Channel,
 		client,
 		encryptionKey,
-	), nil
+	)
+	if account.Channel == models.ChannelMessenger || account.Channel == models.ChannelInstagram {
+		binding, err := metatrust.ValidateOutbound(
+			w.Config.MetaRelay,
+			w.Config.App.Environment,
+			account,
+			time.Now().UTC(),
+		)
+		if err != nil {
+			return nil, &channelapi.ProviderError{
+				Operation: "resolve_adapter",
+				Provider:  account.Provider,
+				Code:      "meta_relay_trust_mismatch",
+				Message:   "trusted Meta relay binding is unavailable",
+				Retryable: false,
+				Cause:     err,
+			}
+		}
+		adapter.WithExpectedMetaBusinessID(binding.MetaBusinessID)
+		adapter.WithMetaProviderProofSecret(w.Config.MetaRelay.ProviderProofSecret)
+	}
+	return adapter, nil
 }
 
 // hasDurableChannelOutboxEntitlement mirrors the durable commercial check used

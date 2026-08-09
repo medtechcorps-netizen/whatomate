@@ -8,7 +8,69 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 )
+
+func TestAccountHealthEnforcesGovernanceFreshnessAtRuntimeBoundary(t *testing.T) {
+	config := newTestConfig(t)
+	account, _ := config.accountByKey("messenger-page")
+	fixedNow := time.Now().UTC().Truncate(time.Second)
+	config.MessengerReviewedAt = fixedNow.Add(-maxGovernanceReviewAge).Format(time.RFC3339)
+
+	var graphCalls atomic.Int32
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		graphCalls.Add(1)
+		switch request.URL.Path {
+		case "/v25.0/me":
+			_, _ = w.Write([]byte(`{"id":"100000000000010"}`))
+		case "/v25.0/100000000000010/subscribed_apps":
+			_, _ = w.Write([]byte(`{"data":[{"id":"100000000000001","subscribed_fields":["messages"]}]}`))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer graph.Close()
+
+	server, err := NewServer(
+		config,
+		newMemoryServerStore(),
+		withGraphBases(graph.URL, "http://instagram.invalid"),
+	)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	server.now = func() time.Time { return fixedNow }
+	requestHealth := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(
+			http.MethodHead,
+			"/v1/accounts/messenger/"+account.ExternalAccountID,
+			nil,
+		)
+		request.Header.Set(ReReplySignatureHeader, signBody(account.reReplyOutboundSecret, nil))
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		return response
+	}
+
+	if response := requestHealth(); response.Code != http.StatusNoContent {
+		t.Fatalf("exact 90-day boundary returned %d: %s", response.Code, response.Body.String())
+	}
+	if graphCalls.Load() != 2 {
+		t.Fatalf("Graph calls at boundary = %d, want 2", graphCalls.Load())
+	}
+
+	server.now = func() time.Time { return fixedNow.Add(time.Nanosecond) }
+	response := requestHealth()
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), "governance_review_stale") {
+		t.Fatalf("expired runtime governance returned %d: %s", response.Code, response.Body.String())
+	}
+	if graphCalls.Load() != 2 {
+		t.Fatalf("Graph was called after governance expiry; calls=%d", graphCalls.Load())
+	}
+}
 
 func TestAccountHealthValidatesRedisTokenAccountAndGraphHost(t *testing.T) {
 	config := newTestConfig(t)
@@ -18,22 +80,29 @@ func TestAccountHealthValidatesRedisTokenAccountAndGraphHost(t *testing.T) {
 
 	facebook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		facebookCalls.Add(1)
-		if request.URL.Path != "/v25.0/me" {
-			t.Errorf("Facebook Graph path = %q", request.URL.Path)
-		}
-		switch request.Header.Get("Authorization") {
-		case "Bearer messenger-access-token":
+		switch {
+		case request.URL.Path == "/v25.0/me" && request.Header.Get("Authorization") == "Bearer messenger-access-token":
 			if request.URL.Query().Get("fields") != "id" {
 				t.Errorf("Messenger fields = %q", request.URL.Query().Get("fields"))
 			}
-			_, _ = w.Write([]byte(`{"id":"page-1"}`))
-		case "Bearer instagram-page-access-token":
+			_, _ = w.Write([]byte(`{"id":"100000000000010"}`))
+		case request.URL.Path == "/v25.0/100000000000010/subscribed_apps" && request.Header.Get("Authorization") == "Bearer messenger-access-token":
+			if request.URL.Query().Get("fields") != "id,subscribed_fields" {
+				t.Errorf("Messenger subscription fields = %q", request.URL.Query().Get("fields"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"100000000000001","subscribed_fields":["messages"]}]}`))
+		case request.URL.Path == "/v25.0/me" && request.Header.Get("Authorization") == "Bearer instagram-page-access-token":
 			if request.URL.Query().Get("fields") != "id,instagram_business_account{id}" {
 				t.Errorf("Facebook Login Instagram fields = %q", request.URL.Query().Get("fields"))
 			}
 			_, _ = w.Write([]byte(
-				`{"id":"facebook-page-1","instagram_business_account":{"id":"ig-page-1"}}`,
+				`{"id":"facebook-page-1","instagram_business_account":{"id":"17841400000000002"}}`,
 			))
+		case request.URL.Path == "/v25.0/17841400000000002/subscribed_apps" && request.Header.Get("Authorization") == "Bearer instagram-page-access-token":
+			if request.URL.Query().Get("fields") != "id,subscribed_fields" {
+				t.Errorf("Facebook Login Instagram subscription fields = %q", request.URL.Query().Get("fields"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"100000000000001","subscribed_fields":["messages"]}]}`))
 		default:
 			http.Error(w, "expired token", http.StatusUnauthorized)
 		}
@@ -42,17 +111,24 @@ func TestAccountHealthValidatesRedisTokenAccountAndGraphHost(t *testing.T) {
 
 	instagram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		instagramCalls.Add(1)
-		if request.URL.Path != "/v25.0/me" {
-			t.Errorf("Instagram Graph path = %q", request.URL.Path)
-		}
-		if request.URL.Query().Get("fields") != "user_id" {
-			t.Errorf("Instagram Login fields = %q", request.URL.Query().Get("fields"))
-		}
 		if request.Header.Get("Authorization") != "Bearer instagram-direct-access-token" {
 			http.Error(w, "expired token", http.StatusUnauthorized)
 			return
 		}
-		_, _ = w.Write([]byte(`{"user_id":"ig-direct-1"}`))
+		switch request.URL.Path {
+		case "/v25.0/me":
+			if request.URL.Query().Get("fields") != "user_id" {
+				t.Errorf("Instagram Login fields = %q", request.URL.Query().Get("fields"))
+			}
+			_, _ = w.Write([]byte(`{"user_id":"17841400000000001"}`))
+		case "/v25.0/17841400000000001/subscribed_apps":
+			if request.URL.Query().Get("fields") != "id,subscribed_fields" {
+				t.Errorf("Instagram Login subscription fields = %q", request.URL.Query().Get("fields"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"100000000000002","subscribed_fields":["messages"]}]}`))
+		default:
+			http.Error(w, "unknown path", http.StatusNotFound)
+		}
 	}))
 	defer instagram.Close()
 
@@ -63,6 +139,21 @@ func TestAccountHealthValidatesRedisTokenAccountAndGraphHost(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("new server: %v", err)
+	}
+	expectedKeyID, err := channelapi.MetaProviderProofKeyID(
+		config.ReReplyProviderProofSecret,
+	)
+	if err != nil {
+		t.Fatalf("provider proof key ID: %v", err)
+	}
+	readyResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(
+		readyResponse,
+		httptest.NewRequest(http.MethodGet, "/readyz", nil),
+	)
+	if readyResponse.Code != http.StatusNoContent ||
+		readyResponse.Header().Get(channelapi.RelayMetaProviderProofKeyIDHeader) != expectedKeyID {
+		t.Fatalf("relay readiness key ID is missing: %#v", readyResponse.Header())
 	}
 	for _, account := range config.Accounts {
 		request := httptest.NewRequest(
@@ -84,12 +175,33 @@ func TestAccountHealthValidatesRedisTokenAccountAndGraphHost(t *testing.T) {
 				response.Body.String(),
 			)
 		}
+		if response.Header().Get("Cache-Control") != "no-store, private" {
+			t.Fatalf("%s health response is cacheable: %#v", account.Key, response.Header())
+		}
+		if response.Header().Get(channelapi.RelayReadinessHeader) != channelapi.RelayReadinessVersion ||
+			response.Header().Get(channelapi.RelayChannelHeader) != string(account.Channel) ||
+			response.Header().Get(channelapi.RelayExternalAccountHeader) != account.ExternalAccountID ||
+			response.Header().Get(channelapi.RelayChannelAccountHeader) != account.reReplyChannelAccountID ||
+			response.Header().Get(channelapi.RelayOrganizationHeader) != account.OrganizationID ||
+			response.Header().Get(channelapi.RelayMetaBusinessHeader) != account.MetaBusinessID ||
+			response.Header().Get(channelapi.RelayMetaProviderProofKeyIDHeader) != expectedKeyID ||
+			response.Header().Get(channelapi.RelayMetaProviderProofHeader) !=
+				channelapi.SignMetaProviderReadinessProof(
+					config.ReReplyProviderProofSecret,
+					account.Channel,
+					account.ExternalAccountID,
+					account.reReplyChannelAccountID,
+					account.OrganizationID,
+					account.MetaBusinessID,
+				) {
+			t.Fatalf("%s health readiness headers are incomplete: %#v", account.Key, response.Header())
+		}
 	}
-	if facebookCalls.Load() != 2 {
-		t.Fatalf("Facebook Graph calls = %d, want 2", facebookCalls.Load())
+	if facebookCalls.Load() != 4 {
+		t.Fatalf("Facebook Graph calls = %d, want 4", facebookCalls.Load())
 	}
-	if instagramCalls.Load() != 1 {
-		t.Fatalf("Instagram Graph calls = %d, want 1", instagramCalls.Load())
+	if instagramCalls.Load() != 2 {
+		t.Fatalf("Instagram Graph calls = %d, want 2", instagramCalls.Load())
 	}
 }
 
@@ -170,6 +282,83 @@ func TestAccountHealthFailsClosedWithoutLeakingProviderData(t *testing.T) {
 	}
 }
 
+func TestAccountHealthRequiresExactAppMessagesSubscription(t *testing.T) {
+	config := newTestConfig(t)
+	account, _ := config.accountByKey("messenger-page")
+
+	for _, testCase := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{
+			name:   "wrong app",
+			status: http.StatusOK,
+			body:   `{"data":[{"id":"some-other-app","subscribed_fields":["messages"]}]}`,
+		},
+		{
+			name:   "messages field missing",
+			status: http.StatusOK,
+			body:   `{"data":[{"id":"100000000000001","subscribed_fields":["messaging_feedback"]}]}`,
+		},
+		{
+			name:   "provider rejected subscription query",
+			status: http.StatusForbidden,
+			body:   `{"error":{"message":"private provider detail"}}`,
+		},
+		{
+			name:   "malformed subscription response",
+			status: http.StatusOK,
+			body:   `{"data":`,
+		},
+		{
+			name:   "trailing subscription response",
+			status: http.StatusOK,
+			body:   `{"data":[{"id":"100000000000001","subscribed_fields":["messages"]}]} {}`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/v25.0/me" {
+					_, _ = w.Write([]byte(`{"id":"100000000000010"}`))
+					return
+				}
+				w.WriteHeader(testCase.status)
+				_, _ = w.Write([]byte(testCase.body))
+			}))
+			defer provider.Close()
+
+			server, err := NewServer(
+				config,
+				newMemoryServerStore(),
+				withGraphBases(provider.URL, "http://instagram.invalid"),
+			)
+			if err != nil {
+				t.Fatalf("new server: %v", err)
+			}
+			request := httptest.NewRequest(
+				http.MethodHead,
+				"/v1/accounts/messenger/"+account.ExternalAccountID,
+				nil,
+			)
+			request.Header.Set(
+				ReReplySignatureHeader,
+				signBody(account.reReplyOutboundSecret, nil),
+			)
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
+			if response.Code != http.StatusServiceUnavailable ||
+				!strings.Contains(response.Body.String(), "account_unhealthy") {
+				t.Fatalf("got %d (%s), want generic 503", response.Code, response.Body.String())
+			}
+			if response.Header().Get(channelapi.RelayReadinessHeader) != "" ||
+				strings.Contains(response.Body.String(), "private provider detail") {
+				t.Fatalf("failed health leaked readiness or provider detail: %#v %s", response.Header(), response.Body.String())
+			}
+		})
+	}
+}
+
 func TestAccountHealthRequiresRedisAndDoesNotProbeGraphWhenUnavailable(t *testing.T) {
 	config := newTestConfig(t)
 	account, _ := config.accountByKey("messenger-page")
@@ -178,7 +367,7 @@ func TestAccountHealthRequiresRedisAndDoesNotProbeGraphWhenUnavailable(t *testin
 	var graphCalls atomic.Int32
 	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		graphCalls.Add(1)
-		_, _ = w.Write([]byte(`{"id":"page-1"}`))
+		_, _ = w.Write([]byte(`{"id":"100000000000010"}`))
 	}))
 	defer graph.Close()
 

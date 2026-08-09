@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -27,6 +28,8 @@ import (
 var ErrChannelAdapterUnavailable = errors.New("channel provider adapter is not available")
 var ErrLegacyMetaAccountManaged = errors.New("legacy Meta channel accounts are managed by WhatsApp setup")
 var ErrThreadsAccountManaged = errors.New("threads accounts using OAuth are managed in Settings > Integrations")
+var ErrManagedMetaMessengerAccount = errors.New("OAuth-managed Messenger routing and credentials must be changed through managed onboarding")
+var ErrManagedMetaMessengerDeprovision = errors.New("OAuth-managed Messenger accounts require provider deprovisioning before local deletion")
 var ErrChannelAccountChangedDuringValidation = errors.New("channel account changed during validation")
 var ErrChannelAccountValidationSuperseded = errors.New("channel account validation was superseded")
 
@@ -62,30 +65,31 @@ type UpdateChannelAccountRequest struct {
 }
 
 type ChannelAccountResponse struct {
-	ID                uuid.UUID                   `json:"id"`
-	OrganizationID    uuid.UUID                   `json:"organization_id"`
-	Channel           models.Channel              `json:"channel"`
-	Provider          string                      `json:"provider"`
-	Name              string                      `json:"name"`
-	ExternalAccountID string                      `json:"external_account_id"`
-	Status            models.ChannelAccountStatus `json:"status"`
-	Capabilities      models.JSONB                `json:"capabilities"`
-	Config            models.JSONB                `json:"config"`
-	IsDefaultIncoming bool                        `json:"is_default_incoming"`
-	IsDefaultOutgoing bool                        `json:"is_default_outgoing"`
-	HasCredentials    bool                        `json:"has_credentials"`
-	ConnectedAt       *time.Time                  `json:"connected_at,omitempty"`
-	LastHealthCheckAt *time.Time                  `json:"last_health_check_at,omitempty"`
-	LastInboundAt     *time.Time                  `json:"last_inbound_at,omitempty"`
-	LastOutboundAt    *time.Time                  `json:"last_outbound_at,omitempty"`
-	LastErrorAt       *time.Time                  `json:"last_error_at,omitempty"`
-	LastError         string                      `json:"last_error,omitempty"`
-	OutboxPending     int64                       `json:"outbox_pending"`
-	OutboxFailed      int64                       `json:"outbox_failed"`
-	CreatedByID       *uuid.UUID                  `json:"created_by_id,omitempty"`
-	UpdatedByID       *uuid.UUID                  `json:"updated_by_id,omitempty"`
-	CreatedAt         time.Time                   `json:"created_at"`
-	UpdatedAt         time.Time                   `json:"updated_at"`
+	ID                       uuid.UUID                   `json:"id"`
+	OrganizationID           uuid.UUID                   `json:"organization_id"`
+	Channel                  models.Channel              `json:"channel"`
+	Provider                 string                      `json:"provider"`
+	Name                     string                      `json:"name"`
+	ExternalAccountID        string                      `json:"external_account_id"`
+	Status                   models.ChannelAccountStatus `json:"status"`
+	Capabilities             models.JSONB                `json:"capabilities"`
+	Config                   models.JSONB                `json:"config"`
+	IsDefaultIncoming        bool                        `json:"is_default_incoming"`
+	IsDefaultOutgoing        bool                        `json:"is_default_outgoing"`
+	HasCredentials           bool                        `json:"has_credentials"`
+	ConnectedAt              *time.Time                  `json:"connected_at,omitempty"`
+	LastHealthCheckAt        *time.Time                  `json:"last_health_check_at,omitempty"`
+	LastInboundAt            *time.Time                  `json:"last_inbound_at,omitempty"`
+	LastOutboundAt           *time.Time                  `json:"last_outbound_at,omitempty"`
+	LastErrorAt              *time.Time                  `json:"last_error_at,omitempty"`
+	LastError                string                      `json:"last_error,omitempty"`
+	MetaProviderProofVersion string                      `json:"meta_provider_proof_version,omitempty"`
+	OutboxPending            int64                       `json:"outbox_pending"`
+	OutboxFailed             int64                       `json:"outbox_failed"`
+	CreatedByID              *uuid.UUID                  `json:"created_by_id,omitempty"`
+	UpdatedByID              *uuid.UUID                  `json:"updated_by_id,omitempty"`
+	CreatedAt                time.Time                   `json:"created_at"`
+	UpdatedAt                time.Time                   `json:"updated_at"`
 }
 
 type CreateChannelAccountResponse struct {
@@ -118,7 +122,7 @@ func (a *App) ListChannelAccounts(r *fastglue.Request) error {
 
 	response := make([]ChannelAccountResponse, len(accounts))
 	for i := range accounts {
-		response[i] = channelAccountToResponse(&accounts[i])
+		response[i] = channelAccountToResponse(&accounts[i], a)
 	}
 	type outboxCount struct {
 		ChannelAccountID uuid.UUID
@@ -201,6 +205,14 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 	if err := validateChannelCreationPolicy(request); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
+	if a.managedMessengerManualCreationBlocked(request) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Messenger relay accounts must be connected through managed Messenger onboarding",
+			nil,
+			"",
+		)
+	}
 	if utf8.RuneCountInString(request.Name) > 100 || !channelExternalAccountIdentifier.MatchString(request.ExternalAccountID) {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid channel account name or external account identifier", nil, "")
 	}
@@ -212,6 +224,13 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 	}
 	if request.Provider == channelapi.RelayProvider {
 		if err := validateRelayAccountConfig(request.Config); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+		}
+	}
+	if request.OutboundSecret != "" &&
+		request.Provider == channelapi.RelayProvider &&
+		(request.Channel == models.ChannelMessenger || request.Channel == models.ChannelInstagram) {
+		if err := validateMetaRelayOutboundSecret(request.OutboundSecret); err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 		}
 	}
@@ -310,6 +329,9 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 	}
 
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
+			return err
+		}
 		if request.IsDefaultIncoming {
 			if err := tx.Model(&models.ChannelAccount{}).
 				Where("organization_id = ? AND is_default_incoming = ?", orgID, true).
@@ -355,7 +377,7 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 	account.Credentials = []models.ChannelCredential{credential}
 
 	return r.SendEnvelope(CreateChannelAccountResponse{
-		Account:       channelAccountToResponse(&account),
+		Account:       channelAccountToResponse(&account, a),
 		InboundSecret: inboundSecret,
 		WebhookPath: fmt.Sprintf(
 			"/api/webhooks/channels/%s",
@@ -397,15 +419,25 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
 			return ErrThreadsAccountManaged
 		}
+		if isManagedMetaMessengerAccount(account) && managedMetaMessengerProtectedFieldsChanged(request) {
+			return ErrManagedMetaMessengerAccount
+		}
 		oldAccount := *account
 		// Channel account JSONB values are maps. Keep detached audit snapshots
 		// so in-place delivery/AI toggles cannot mutate both old and new values.
 		oldAccount.Config = cloneJSONB(account.Config)
 		oldAccount.Capabilities = cloneJSONB(account.Capabilities)
 		oldAccount.Metadata = cloneJSONB(account.Metadata)
+		oldOutboundEnabled := boolConfigValue(oldAccount.Config, "outbound_enabled")
+		oldAIReplyEnabled := boolConfigValue(oldAccount.Config, "ai_reply_enabled")
 		credentialChanged := false
 		requiresRetest := false
 		profileKeyChanged := false
+		if request.OutboundSecret != "" && isMetaRelayChannelAccount(account) {
+			if err := validateMetaRelayOutboundSecret(request.OutboundSecret); err != nil {
+				return err
+			}
+		}
 
 		if request.Name != nil {
 			name := strings.TrimSpace(*request.Name)
@@ -431,6 +463,10 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 				}
 				nextRelayURL, _ := account.Config["relay_url"].(string)
 				requiresRetest = strings.TrimSpace(previousRelayURL) != strings.TrimSpace(nextRelayURL)
+				if isMetaRelayChannelAccount(account) &&
+					!reflect.DeepEqual(oldAccount.Config, account.Config) {
+					requiresRetest = true
+				}
 			}
 		}
 		if request.Capabilities != nil {
@@ -438,15 +474,49 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			if account.Channel == models.ChannelThreads {
 				account.Capabilities = threadsPublicEngagementCapabilities(account.Capabilities)
 			}
+			if isMetaRelayChannelAccount(account) &&
+				!reflect.DeepEqual(oldAccount.Capabilities, account.Capabilities) {
+				requiresRetest = true
+			}
 		}
 		if request.OutboundEnabled != nil {
 			if *request.OutboundEnabled && account.Status != models.ChannelAccountStatusActive {
 				return errors.New("test and activate the channel account before enabling outbound delivery")
 			}
+			if *request.OutboundEnabled && isMetaRelayChannelAccount(account) {
+				// A settings form may echo the account's current true value while
+				// changing a validation input. Accept that edit, but the retest path
+				// below must atomically force delivery back off. Only a real
+				// disabled->enabled transition can release outbound delivery.
+				if !requiresRetest && request.OutboundSecret == "" && !oldOutboundEnabled {
+					if _, err := a.trustedMetaRelayBinding(account); err != nil {
+						return err
+					}
+					if err := validateMetaRelayOutboundApproval(account); err != nil {
+						return err
+					}
+				}
+			}
 			account.Config["outbound_enabled"] = *request.OutboundEnabled
 		}
-		if err := applyChannelAIReplyOptIn(account, request.AIReplyEnabled); err != nil {
-			return err
+		metaForcesAIDisabled := isMetaRelayChannelAccount(account) &&
+			(requiresRetest || request.OutboundSecret != "" ||
+				(request.OutboundEnabled != nil && !*request.OutboundEnabled))
+		if request.AIReplyEnabled != nil && *request.AIReplyEnabled &&
+			isMetaRelayChannelAccount(account) && !metaForcesAIDisabled && !oldAIReplyEnabled {
+			if _, err := a.trustedMetaRelayBinding(account); err != nil {
+				return err
+			}
+			if err := validateMetaRelayOutboundApproval(account); err != nil {
+				return err
+			}
+		}
+		if metaForcesAIDisabled {
+			account.Config["ai_reply_enabled"] = false
+		} else {
+			if err := applyChannelAIReplyOptIn(account, request.AIReplyEnabled); err != nil {
+				return err
+			}
 		}
 		if request.IsDefaultIncoming != nil {
 			if *request.IsDefaultIncoming {
@@ -538,6 +608,7 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 				"status":               account.Status,
 				"capabilities":         account.Capabilities,
 				"config":               account.Config,
+				"metadata":             account.Metadata,
 				"is_default_incoming":  account.IsDefaultIncoming,
 				"is_default_outgoing":  account.IsDefaultOutgoing,
 				"last_health_check_at": account.LastHealthCheckAt,
@@ -575,7 +646,7 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		); err != nil {
 			return err
 		}
-		response = channelAccountToResponse(account)
+		response = channelAccountToResponse(account, a)
 		return nil
 	})
 	if err != nil {
@@ -586,6 +657,9 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
 		if errors.Is(err, ErrThreadsAccountManaged) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
+		}
+		if errors.Is(err, ErrManagedMetaMessengerAccount) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
@@ -605,6 +679,97 @@ func disableChannelDeliveryForRetest(account *models.ChannelAccount) {
 	// AI approval too. A successful retest and outbound approval must not
 	// silently reactivate automatic replies without a fresh opt-in.
 	account.Config["ai_reply_enabled"] = false
+	if account.Metadata != nil {
+		delete(account.Metadata, channelapi.MetaProviderProofMetadataKey)
+	}
+}
+
+func invalidateMetaRelayTestEvidence(account *models.ChannelAccount) bool {
+	if !isMetaRelayChannelAccount(account) {
+		return false
+	}
+	disableChannelDeliveryForRetest(account)
+	account.LastHealthCheckAt = nil
+	return true
+}
+
+func isMetaRelayChannelAccount(account *models.ChannelAccount) bool {
+	if account == nil ||
+		!strings.EqualFold(strings.TrimSpace(account.Provider), channelapi.RelayProvider) {
+		return false
+	}
+	return account.Channel == models.ChannelInstagram ||
+		account.Channel == models.ChannelMessenger
+}
+
+func isManagedMetaMessengerAccount(account *models.ChannelAccount) bool {
+	return account != nil &&
+		account.Channel == models.ChannelMessenger &&
+		strings.EqualFold(strings.TrimSpace(account.Provider), channelapi.RelayProvider) &&
+		stringConfigValue(account.Metadata, "management_mode") == metaMessengerManagementMode
+}
+
+func (a *App) managedMessengerManualCreationBlocked(
+	request ChannelAccountRequest,
+) bool {
+	if request.Channel != models.ChannelMessenger ||
+		!strings.EqualFold(strings.TrimSpace(request.Provider), channelapi.RelayProvider) ||
+		a == nil || a.Config == nil {
+		return false
+	}
+	return a.Config.MetaMessengerOnboarding.Enabled ||
+		strings.EqualFold(strings.TrimSpace(a.Config.App.Environment), "production")
+}
+
+// Managed onboarding owns relay routing, capabilities, and both credential
+// families. The generic settings endpoint may still change display/default
+// fields and the separately guarded outbound/AI approvals, but it must never
+// desynchronize these server-provisioned values from the protected relay.
+func managedMetaMessengerProtectedFieldsChanged(request UpdateChannelAccountRequest) bool {
+	return request.Config != nil || request.Capabilities != nil ||
+		strings.TrimSpace(request.OutboundSecret) != ""
+}
+
+func validateMetaRelayOutboundSecret(secret string) error {
+	if len([]byte(secret)) < 32 || strings.TrimSpace(secret) != secret {
+		return errors.New("Meta relay outbound_secret must contain at least 32 UTF-8 bytes without surrounding whitespace")
+	}
+	return nil
+}
+
+// validateMetaRelayOutboundApproval is the server-side release gate for Meta
+// delivery. A successful signed relay health check proves the configured asset
+// mapping, while a later inbound DM proves that Meta is actually delivering
+// messages to this exact tenant after that check. Historical inbound traffic
+// from an older configuration must never approve the current mapping.
+func validateMetaRelayOutboundApproval(account *models.ChannelAccount) error {
+	if !isMetaRelayChannelAccount(account) {
+		return nil
+	}
+	confirmedID, confirmed := account.Config["identity_confirmed_id"].(string)
+	if !confirmed || confirmedID != account.ExternalAccountID {
+		return errors.New("confirm the exact Meta account identity before enabling outbound delivery")
+	}
+	if channelapi.CurrentCredentialCountOfKind(
+		account.Credentials,
+		models.ChannelCredentialKindWebhook,
+		time.Now().UTC(),
+	) != 1 ||
+		account.Status != models.ChannelAccountStatusActive ||
+		account.LastHealthCheckAt == nil ||
+		account.LastErrorAt != nil ||
+		strings.TrimSpace(account.LastError) != "" {
+		return errors.New("run a successful current account test before enabling Meta outbound delivery")
+	}
+	if account.LastInboundAt == nil ||
+		!account.LastInboundAt.After(*account.LastHealthCheckAt) {
+		return errors.New("send a fresh inbound Meta DM after the latest account test before enabling outbound delivery")
+	}
+	if account.Metadata == nil ||
+		strings.TrimSpace(fmt.Sprint(account.Metadata[channelapi.MetaProviderProofMetadataKey])) != channelapi.MetaProviderProofVersion {
+		return errors.New("run the current provider-proof account Test before enabling Meta outbound delivery")
+	}
+	return nil
 }
 
 func applyChannelAIReplyOptIn(
@@ -669,18 +834,56 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			if adapterErr != nil {
 				return nil
 			}
+			reservationOldAccount := *account
+			reservationOldAccount.Config = cloneJSONB(account.Config)
+			reservationOldAccount.Capabilities = cloneJSONB(account.Capabilities)
+			reservationOldAccount.Metadata = cloneJSONB(account.Metadata)
 			metadata := cloneJSONB(account.Metadata)
 			metadata[channelAccountHealthValidationTokenKey] = validationToken
+			account.Metadata = metadata
+			metaEvidenceInvalidated := invalidateMetaRelayTestEvidence(account)
+			updates := map[string]any{"metadata": metadata}
+			if metaEvidenceInvalidated {
+				validationStartedAt := time.Now().UTC()
+				account.UpdatedByID = &userID
+				account.UpdatedAt = validationStartedAt
+				updates["config"] = account.Config
+				updates["last_health_check_at"] = nil
+				updates["updated_by_id"] = userID
+				updates["updated_at"] = validationStartedAt
+			}
 			reserved := tx.Model(&models.ChannelAccount{}).
 				Where("id = ? AND organization_id = ?", account.ID, orgID).
-				UpdateColumn("metadata", metadata)
+				Updates(updates)
 			if reserved.Error != nil {
 				return reserved.Error
 			}
 			if reserved.RowsAffected != 1 {
 				return gorm.ErrRecordNotFound
 			}
-			account.Metadata = metadata
+			if metaEvidenceInvalidated {
+				if err := cancelChannelAIReplyJobsForAccountTx(
+					tx,
+					orgID,
+					account.ID,
+					"channel_account_retest_required",
+				); err != nil {
+					return err
+				}
+				if err := audit.LogAudit(
+					tx,
+					orgID,
+					userID,
+					audit.GetUserName(tx, userID),
+					"channel_account",
+					account.ID,
+					models.AuditActionUpdated,
+					&reservationOldAccount,
+					account,
+				); err != nil {
+					return err
+				}
+			}
 			return nil
 		},
 	); err != nil {
@@ -754,6 +957,7 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			oldAccount.Config = cloneJSONB(currentAccount.Config)
 			oldAccount.Capabilities = cloneJSONB(currentAccount.Capabilities)
 			oldAccount.Metadata = cloneJSONB(currentAccount.Metadata)
+			invalidateMetaRelayTestEvidence(currentAccount)
 			currentAccount.LastHealthCheckAt = &now
 			if validationErr != nil || !result.Valid {
 				currentAccount.LastErrorAt = &now
@@ -767,6 +971,13 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 				}
 			} else {
 				currentAccount.Status = models.ChannelAccountStatusActive
+				if isMetaRelayChannelAccount(currentAccount) {
+					if currentAccount.Metadata == nil {
+						currentAccount.Metadata = models.JSONB{}
+					}
+					currentAccount.Metadata[channelapi.MetaProviderProofMetadataKey] =
+						channelapi.MetaProviderProofVersion
+				}
 				currentAccount.Capabilities = capabilitiesToJSONB(result.Capabilities)
 				if currentAccount.Channel == models.ChannelThreads {
 					currentAccount.Capabilities = threadsPublicEngagementCapabilities(
@@ -801,6 +1012,8 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 				Updates(map[string]any{
 					"status":               account.Status,
 					"capabilities":         account.Capabilities,
+					"config":               account.Config,
+					"metadata":             account.Metadata,
 					"last_health_check_at": account.LastHealthCheckAt,
 					"last_error":           account.LastError,
 					"last_error_at":        account.LastErrorAt,
@@ -933,6 +1146,9 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
 			return ErrThreadsAccountManaged
 		}
+		if isManagedMetaMessengerAccount(account) {
+			return ErrManagedMetaMessengerDeprovision
+		}
 		if err := cancelChannelAIReplyJobsForAccountTx(
 			tx,
 			orgID,
@@ -972,6 +1188,9 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 		if errors.Is(err, ErrThreadsAccountManaged) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
+		if errors.Is(err, ErrManagedMetaMessengerDeprovision) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete channel account", nil, "")
 	}
 	return r.SendEnvelope(map[string]string{"message": "Channel account deleted successfully"})
@@ -1003,7 +1222,16 @@ func (a *App) channelAdapter(account *models.ChannelAccount) (channelapi.Adapter
 		if a.Config != nil {
 			encryptionKey = a.Config.App.EncryptionKey
 		}
-		return channelapi.NewRelayAdapter(account.Channel, a.HTTPClient, encryptionKey), nil
+		adapter := channelapi.NewRelayAdapter(account.Channel, a.HTTPClient, encryptionKey)
+		if isMetaRelayChannelAccount(account) {
+			binding, err := a.trustedMetaRelayBinding(account)
+			if err != nil {
+				return nil, fmt.Errorf("%w: trusted Meta relay binding is unavailable", ErrChannelAdapterUnavailable)
+			}
+			adapter.WithExpectedMetaBusinessID(binding.MetaBusinessID)
+			adapter.WithMetaProviderProofSecret(a.Config.MetaRelay.ProviderProofSecret)
+		}
+		return adapter, nil
 	}
 	return nil, fmt.Errorf("%w: channel=%s provider=%s", ErrChannelAdapterUnavailable, account.Channel, account.Provider)
 }
@@ -1090,31 +1318,50 @@ func loadChannelAccount(db *gorm.DB, orgID, accountID uuid.UUID, credentials boo
 	return &account, nil
 }
 
-func channelAccountToResponse(account *models.ChannelAccount) ChannelAccountResponse {
-	return ChannelAccountResponse{
-		ID:                account.ID,
-		OrganizationID:    account.OrganizationID,
-		Channel:           account.Channel,
-		Provider:          account.Provider,
-		Name:              account.Name,
-		ExternalAccountID: account.ExternalAccountID,
-		Status:            account.Status,
-		Capabilities:      cloneJSONB(account.Capabilities),
-		Config:            sanitizeChannelConfig(account.Config),
-		IsDefaultIncoming: account.IsDefaultIncoming,
-		IsDefaultOutgoing: account.IsDefaultOutgoing,
-		HasCredentials:    currentChannelCredential(account) != nil,
-		ConnectedAt:       account.ConnectedAt,
-		LastHealthCheckAt: account.LastHealthCheckAt,
-		LastInboundAt:     account.LastInboundAt,
-		LastOutboundAt:    account.LastOutboundAt,
-		LastErrorAt:       account.LastErrorAt,
-		LastError:         account.LastError,
-		CreatedByID:       account.CreatedByID,
-		UpdatedByID:       account.UpdatedByID,
-		CreatedAt:         account.CreatedAt,
-		UpdatedAt:         account.UpdatedAt,
+func channelAccountToResponse(
+	account *models.ChannelAccount,
+	applications ...*App,
+) ChannelAccountResponse {
+	metaProviderProofVersion, _ := account.Metadata[channelapi.MetaProviderProofMetadataKey].(string)
+	response := ChannelAccountResponse{
+		ID:                       account.ID,
+		OrganizationID:           account.OrganizationID,
+		Channel:                  account.Channel,
+		Provider:                 account.Provider,
+		Name:                     account.Name,
+		ExternalAccountID:        account.ExternalAccountID,
+		Status:                   account.Status,
+		Capabilities:             cloneJSONB(account.Capabilities),
+		Config:                   sanitizeChannelConfig(account.Config),
+		IsDefaultIncoming:        account.IsDefaultIncoming,
+		IsDefaultOutgoing:        account.IsDefaultOutgoing,
+		HasCredentials:           channelAccountHasRequiredCredential(account, time.Now().UTC()),
+		ConnectedAt:              account.ConnectedAt,
+		LastHealthCheckAt:        account.LastHealthCheckAt,
+		LastInboundAt:            account.LastInboundAt,
+		LastOutboundAt:           account.LastOutboundAt,
+		LastErrorAt:              account.LastErrorAt,
+		LastError:                account.LastError,
+		MetaProviderProofVersion: strings.TrimSpace(metaProviderProofVersion),
+		CreatedByID:              account.CreatedByID,
+		UpdatedByID:              account.UpdatedByID,
+		CreatedAt:                account.CreatedAt,
+		UpdatedAt:                account.UpdatedAt,
 	}
+	if isManagedMetaMessengerAccount(account) {
+		// These fields are operational facts owned by the current protected
+		// inventory. Persisted Config/Metadata booleans are never authoritative:
+		// a stale or tenant-spoofed value must not enable Test or activation.
+		response.Config["registry_recognized"] = false
+		response.Config["onboarding_state"] = metaMessengerAwaitingRegistryState
+		if len(applications) == 1 && applications[0] != nil {
+			if _, err := applications[0].trustedMetaRelayBinding(account); err == nil {
+				response.Config["registry_recognized"] = true
+				response.Config["onboarding_state"] = "relay_registry_recognized"
+			}
+		}
+	}
+	return response
 }
 
 func generateChannelSecret() (string, error) {
@@ -1137,6 +1384,26 @@ func currentChannelCredential(account *models.ChannelAccount) *models.ChannelCre
 		}
 	}
 	return nil
+}
+
+func channelAccountHasRequiredCredential(
+	account *models.ChannelAccount,
+	now time.Time,
+) bool {
+	if account == nil {
+		return false
+	}
+	if kind, providerRequiresKind := channelapi.ProviderRequiredCredentialKind(
+		account.Channel,
+		account.Provider,
+	); providerRequiresKind {
+		return channelapi.CurrentCredentialCountOfKind(
+			account.Credentials,
+			kind,
+			now,
+		) == 1
+	}
+	return currentChannelCredential(account) != nil
 }
 
 func cloneJSONB(value models.JSONB) models.JSONB {

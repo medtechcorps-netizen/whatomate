@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 )
 
 type WorkerOption func(*Worker)
@@ -223,6 +225,10 @@ func (w *Worker) forwardToReReply(
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("User-Agent", "ReReply-Meta-Relay/1.0")
 	request.Header.Set(ReReplySignatureHeader, signBody(account.reReplyInboundSecret, body))
+	request.Header.Set(
+		channelapi.RelayMetaProviderProofHeader,
+		channelapi.SignMetaProviderInboundProof(w.config.ReReplyProviderProofSecret, body),
+	)
 
 	response, err := w.client.Do(request)
 	if err != nil {

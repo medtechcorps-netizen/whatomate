@@ -1,0 +1,62 @@
+name: Meta Relay Production Monitor
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: meta-relay-production-monitor
+  cancel-in-progress: false
+
+jobs:
+  signed-account-preflight:
+    name: Signed account and subscription preflight
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Checkout protected revision
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Verify every protected Meta account
+        env:
+          META_RELAY_EXPECTED_ACCOUNTS_JSON: ${{ vars.META_RELAY_EXPECTED_ACCOUNTS_JSON }}
+          META_RELAY_PREFLIGHT_SECRETS_JSON: ${{ secrets.META_RELAY_PREFLIGHT_SECRETS_JSON }}
+        run: |
+          set -euo pipefail
+          app_id="54bc0d92-73e9-4f8b-86cd-c3fd96e06beb"
+          app_spec="$(doctl apps spec get "${app_id}" --format json)"
+
+          if ! jq -e 'any(.services[]?; .name == "meta-relay")' <<<"${app_spec}" >/dev/null; then
+            if [[ -n "${META_RELAY_EXPECTED_ACCOUNTS_JSON}" ]]; then
+              echo "::error::Protected Meta relay inventory exists, but the deployed meta-relay service is missing."
+              exit 1
+            fi
+            echo "meta-relay is not provisioned and no protected inventory exists; skipping monitor"
+            exit 0
+          fi
+          if [[ -z "${META_RELAY_EXPECTED_ACCOUNTS_JSON}" ]]; then
+            echo "::error::Production variable META_RELAY_EXPECTED_ACCOUNTS_JSON is required when meta-relay is provisioned."
+            exit 1
+          fi
+          if [[ -z "${META_RELAY_PREFLIGHT_SECRETS_JSON}" ]]; then
+            echo "::error::Production secret META_RELAY_PREFLIGHT_SECRETS_JSON is required when meta-relay is provisioned."
+            exit 1
+          fi
+
+          python3 scripts/meta_relay_preflight.py <<<"${app_spec}"

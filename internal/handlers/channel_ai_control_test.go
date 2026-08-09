@@ -344,6 +344,34 @@ func TestChannelAIRetestClearsOutboundAndExplicitOptIn(t *testing.T) {
 	assert.Equal(t, false, account.Config["ai_reply_enabled"])
 }
 
+func TestMetaRelayTestInvalidationClearsDeliveryAndHealthEvidence(t *testing.T) {
+	checkedAt := time.Now().UTC()
+	account := &models.ChannelAccount{
+		Channel:           models.ChannelMessenger,
+		Provider:          channelapi.RelayProvider,
+		LastHealthCheckAt: &checkedAt,
+		Config: models.JSONB{
+			"outbound_enabled": true,
+			"ai_reply_enabled": true,
+		},
+	}
+
+	assert.True(t, invalidateMetaRelayTestEvidence(account))
+	assert.Nil(t, account.LastHealthCheckAt)
+	assert.Equal(t, false, account.Config["outbound_enabled"])
+	assert.Equal(t, false, account.Config["ai_reply_enabled"])
+
+	nonMeta := &models.ChannelAccount{
+		Channel:           models.ChannelEmail,
+		Provider:          channelapi.RelayProvider,
+		LastHealthCheckAt: &checkedAt,
+		Config:            models.JSONB{"outbound_enabled": true},
+	}
+	assert.False(t, invalidateMetaRelayTestEvidence(nonMeta))
+	assert.NotNil(t, nonMeta.LastHealthCheckAt)
+	assert.Equal(t, true, nonMeta.Config["outbound_enabled"])
+}
+
 func TestChannelAIAccountDisableCancelsJobsBeforeLaterEnable(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	org := testutil.CreateTestOrganization(t, db)

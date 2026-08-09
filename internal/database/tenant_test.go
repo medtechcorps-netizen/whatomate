@@ -1,6 +1,7 @@
 package database_test
 
 import (
+	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -836,6 +837,33 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		resolved, err := uuid.Parse(resolvedText)
 		require.NoError(t, err)
 		require.Equal(t, orgB.ID, resolved)
+	})
+
+	t.Run("omnichannel webhook router rejects an archived organization", func(t *testing.T) {
+		archivedOrganization := testutil.CreateTestOrganization(t, adminDB)
+		archivedChannel := models.ChannelAccount{
+			BaseModel:         models.BaseModel{ID: uuid.New()},
+			OrganizationID:    archivedOrganization.ID,
+			Channel:           models.ChannelMessenger,
+			Provider:          "relay",
+			Name:              "Archived Messenger",
+			ExternalAccountID: "archived-" + uuid.NewString(),
+			Status:            models.ChannelAccountStatusActive,
+			Capabilities:      models.JSONB{},
+			Config:            models.JSONB{},
+			Metadata:          models.JSONB{},
+		}
+		require.NoError(t, adminDB.Create(&archivedChannel).Error)
+		require.NoError(t, adminDB.Delete(archivedOrganization).Error)
+
+		var resolved sql.NullString
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Raw(
+				"SELECT public.rereply_resolve_channel_org(?)::text",
+				archivedChannel.ID,
+			).Scan(&resolved).Error
+		}))
+		require.False(t, resolved.Valid)
 	})
 
 	t.Run("outbox resolver returns ready tenants without exposing jobs", func(t *testing.T) {

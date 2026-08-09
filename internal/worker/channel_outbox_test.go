@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -633,6 +634,257 @@ func TestChannelOutboxResolvesThreadsAdapter(t *testing.T) {
 	assert.Equal(t, models.ChannelThreads, adapter.Channel())
 	assert.Equal(t, channelapi.ThreadsProvider, adapter.Provider())
 	assert.Implements(t, (*channelapi.PreparedSender)(nil), adapter)
+}
+
+func TestChannelOutboxMetaRelayRequiresProtectedBinding(t *testing.T) {
+	account := &models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.MustParse("00000000-0000-4000-8000-000000000001")},
+		OrganizationID:    uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"),
+		Channel:           models.ChannelMessenger,
+		Provider:          channelapi.RelayProvider,
+		ExternalAccountID: "700000000000099",
+		Config: models.JSONB{
+			"relay_url":             "https://app.rereply.app/meta-relay/v1/accounts/messenger/700000000000099",
+			"identity_confirmed_id": "700000000000099",
+			"outbound_enabled":      true,
+		},
+		Status:            models.ChannelAccountStatusActive,
+		LastHealthCheckAt: timePointerForWorkerTest(time.Now().UTC().Add(-time.Minute)),
+		LastInboundAt:     timePointerForWorkerTest(time.Now().UTC()),
+		Metadata: models.JSONB{
+			channelapi.MetaProviderProofMetadataKey: channelapi.MetaProviderProofVersion,
+		},
+		Credentials: []models.ChannelCredential{{
+			Kind:   models.ChannelCredentialKindWebhook,
+			Status: models.ChannelCredentialStatusActive,
+		}},
+	}
+	worker := &Worker{Config: &config.Config{
+		App: config.AppConfig{Environment: "production", EncryptionKey: "test-meta-relay-key"},
+		MetaRelay: config.MetaRelayConfig{
+			BaseURL:             "https://app.rereply.app/meta-relay",
+			ProviderProofSecret: "worker-meta-provider-proof-secret-at-least-32-bytes",
+			ExpectedAccountsJSON: `{"accounts":[{
+                "organization_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+                "meta_business_id":"300000000000099",
+                "channel":"messenger",
+                "external_account_id":"700000000000099",
+                "rereply_account_id":"00000000-0000-4000-8000-000000000001"
+            }]}`,
+		},
+	}}
+
+	adapter, err := worker.channelOutboxAdapter(account)
+	require.NoError(t, err)
+	assert.Equal(t, models.ChannelMessenger, adapter.Channel())
+
+	account.Config["relay_url"] = "https://attacker.example/v1/accounts/messenger/700000000000099"
+	_, err = worker.channelOutboxAdapter(account)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "trusted Meta relay binding")
+}
+
+func TestChannelOutboxMetaSendGateRejectsLegacyEvidenceWithoutProofMarker(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	accountID := uuid.New()
+	externalID := "700000000000099"
+	healthAt := time.Now().UTC().Add(-time.Minute)
+	inboundAt := healthAt.Add(time.Second)
+	relayURL := "https://app.rereply.app/meta-relay/v1/accounts/messenger/" + externalID
+	account := &models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: accountID},
+		OrganizationID:    org.ID,
+		Channel:           models.ChannelMessenger,
+		Provider:          channelapi.RelayProvider,
+		Name:              "legacy-enabled-meta",
+		ExternalAccountID: externalID,
+		Status:            models.ChannelAccountStatusActive,
+		Config: models.JSONB{
+			"relay_url":             relayURL,
+			"identity_confirmed_id": externalID,
+			"outbound_enabled":      true,
+		},
+		Metadata:          models.JSONB{},
+		LastHealthCheckAt: &healthAt,
+		LastInboundAt:     &inboundAt,
+	}
+	require.NoError(t, db.Create(account).Error)
+	require.NoError(t, db.Create(&models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   org.ID,
+		ChannelAccountID: account.ID,
+		Kind:             models.ChannelCredentialKindWebhook,
+		Version:          1,
+		CredentialBlob:   models.JSONB{"inbound_secret": "tenant-secret"},
+		Status:           models.ChannelCredentialStatusActive,
+		Metadata:         models.JSONB{},
+	}).Error)
+	worker := &Worker{
+		DB:  db,
+		Log: testutil.NopLogger(),
+		Config: &config.Config{
+			App: config.AppConfig{
+				Environment:   "production",
+				EncryptionKey: "worker-test-encryption-key",
+			},
+			MetaRelay: config.MetaRelayConfig{
+				BaseURL:             "https://app.rereply.app/meta-relay",
+				ProviderProofSecret: "worker-meta-provider-proof-secret-at-least-32-bytes",
+				ExpectedAccountsJSON: fmt.Sprintf(`{"accounts":[{
+					"organization_id":%q,
+					"meta_business_id":"300000000000099",
+					"channel":"messenger",
+					"external_account_id":%q,
+					"rereply_account_id":%q
+				}]}`, org.ID.String(), externalID, account.ID.String()),
+			},
+		},
+	}
+
+	_, err := worker.metaRelayOutboundAccountAtSend(org.ID, account.ID)
+	require.ErrorContains(t, err, "current provider-proof Test")
+
+	require.NoError(t, db.Model(&models.ChannelAccount{}).
+		Where("id = ? AND organization_id = ?", account.ID, org.ID).
+		Update("metadata", models.JSONB{
+			channelapi.MetaProviderProofMetadataKey: channelapi.MetaProviderProofVersion,
+		}).Error)
+	verified, err := worker.metaRelayOutboundAccountAtSend(org.ID, account.ID)
+	require.NoError(t, err)
+	assert.Equal(t, channelapi.MetaProviderProofVersion, verified.Metadata[channelapi.MetaProviderProofMetadataKey])
+}
+
+func TestMetaRelayDispatchFenceWaitsForDisconnectAndDoesNotCross(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	account, _, _, job := createChannelOutboxTestFixture(
+		t,
+		db,
+		org.ID,
+		"meta-disconnect-fence-worker",
+	)
+	worker := configureMetaRelayDispatchFenceFixture(t, db, org.ID, account)
+
+	disconnectTx := db.Begin()
+	require.NoError(t, disconnectTx.Error)
+	t.Cleanup(func() { _ = disconnectTx.Rollback().Error })
+	var disconnecting models.ChannelAccount
+	require.NoError(t, disconnectTx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND organization_id = ?", account.ID, org.ID).
+		First(&disconnecting).Error)
+	disconnecting.Config = cloneChannelOutboxTestJSONB(disconnecting.Config)
+	disconnecting.Config["outbound_enabled"] = false
+	disconnecting.Status = models.ChannelAccountStatusDisconnected
+	require.NoError(t, disconnectTx.Save(&disconnecting).Error)
+
+	fencePID := make(chan int, 1)
+	fenceDone := make(chan error, 1)
+	go func() {
+		fenceDone <- db.Connection(func(connection *gorm.DB) error {
+			var backendPID int
+			if err := connection.Raw("SELECT pg_backend_pid()").
+				Scan(&backendPID).Error; err != nil {
+				fencePID <- 0
+				return err
+			}
+			fencePID <- backendPID
+			fencedWorker := *worker
+			fencedWorker.DB = connection
+			_, err := fencedWorker.markMetaRelayOutboxDispatching(
+				org.ID,
+				job.ID,
+				account.ID,
+				job.LockedBy,
+			)
+			return err
+		})
+	}()
+	backendPID := <-fencePID
+	require.Positive(t, backendPID)
+	testutil.RequirePostgresBackendWaitingForLock(t, db, backendPID)
+
+	now := time.Now().UTC()
+	require.NoError(t, disconnectTx.Model(&models.OutboxJob{}).
+		Where(
+			"id = ? AND organization_id = ? AND status = ?",
+			job.ID,
+			org.ID,
+			models.OutboxJobStatusProcessing,
+		).
+		Updates(map[string]any{
+			"status":     models.OutboxJobStatusCancelled,
+			"failed_at":  now,
+			"locked_at":  nil,
+			"locked_by":  "",
+			"updated_at": now,
+		}).Error)
+	require.NoError(t, disconnectTx.Commit().Error)
+
+	select {
+	case err := <-fenceDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "successful current health check")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "Meta relay dispatch fence did not resume after disconnect committed")
+	}
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusCancelled, job.Status)
+}
+
+func TestMetaRelayDispatchFenceAllowsOAuthAlongsideOneWebhookCredential(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	account, _, _, job := createChannelOutboxTestFixture(
+		t,
+		db,
+		org.ID,
+		"meta-current-credential-worker",
+	)
+	worker := configureMetaRelayDispatchFenceFixture(t, db, org.ID, account)
+	require.NoError(t, db.Create(&models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   org.ID,
+		ChannelAccountID: account.ID,
+		Kind:             models.ChannelCredentialKindOAuth,
+		Version:          1,
+		CredentialBlob:   models.JSONB{"access_token": "encrypted-oauth-token"},
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "test:v1",
+		Metadata:         models.JSONB{},
+	}).Error)
+
+	fenced, err := worker.markMetaRelayOutboxDispatching(
+		org.ID,
+		job.ID,
+		account.ID,
+		job.LockedBy,
+	)
+	require.NoError(t, err)
+	require.Len(t, fenced.Credentials, 2)
+	assert.Equal(t, 1, channelapi.CurrentCredentialCountOfKind(
+		fenced.Credentials,
+		models.ChannelCredentialKindWebhook,
+		time.Now().UTC(),
+	))
+	assert.Equal(t, 1, channelapi.CurrentCredentialCountOfKind(
+		fenced.Credentials,
+		models.ChannelCredentialKindOAuth,
+		time.Now().UTC(),
+	))
+
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusDispatching, job.Status)
+}
+
+func TestChannelOutboxAdapterFailsClosedWithoutWorkerConfig(t *testing.T) {
+	worker := &Worker{}
+	_, err := worker.channelOutboxAdapter(&models.ChannelAccount{
+		Channel:  models.ChannelMessenger,
+		Provider: channelapi.RelayProvider,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "application configuration is unavailable")
 }
 
 func TestChannelOutboxReclaimsStaleLeaseAndProtectsCompletion(t *testing.T) {
@@ -1318,6 +1570,92 @@ func configureThreadsDispatchFenceFixture(
 		Update("provider_state", providerState).Error)
 	job.ProviderState = providerState
 	return credential
+}
+
+func configureMetaRelayDispatchFenceFixture(
+	t *testing.T,
+	db *gorm.DB,
+	orgID uuid.UUID,
+	account *models.ChannelAccount,
+) *Worker {
+	t.Helper()
+	externalID := "7" + strings.ReplaceAll(uuid.NewString(), "-", "")[:14]
+	relayBaseURL := "https://app.rereply.app/meta-relay"
+	relayURL := relayBaseURL + "/v1/accounts/messenger/" + externalID
+	healthAt := time.Now().UTC().Add(-time.Minute)
+	inboundAt := healthAt.Add(time.Second)
+	require.NoError(t, db.Model(&models.ChannelAccount{}).
+		Where("id = ? AND organization_id = ?", account.ID, orgID).
+		Updates(map[string]any{
+			"channel":             models.ChannelMessenger,
+			"provider":            channelapi.RelayProvider,
+			"external_account_id": externalID,
+			"status":              models.ChannelAccountStatusActive,
+			"config": models.JSONB{
+				"relay_url":             relayURL,
+				"identity_confirmed_id": externalID,
+				"outbound_enabled":      true,
+			},
+			"metadata": models.JSONB{
+				channelapi.MetaProviderProofMetadataKey: channelapi.MetaProviderProofVersion,
+			},
+			"last_health_check_at": healthAt,
+			"last_inbound_at":      inboundAt,
+			"last_error":           "",
+			"last_error_at":        nil,
+		}).Error)
+	account.Channel = models.ChannelMessenger
+	account.Provider = channelapi.RelayProvider
+	account.ExternalAccountID = externalID
+	account.Status = models.ChannelAccountStatusActive
+	account.Config = models.JSONB{
+		"relay_url":             relayURL,
+		"identity_confirmed_id": externalID,
+		"outbound_enabled":      true,
+	}
+	account.Metadata = models.JSONB{
+		channelapi.MetaProviderProofMetadataKey: channelapi.MetaProviderProofVersion,
+	}
+	account.LastHealthCheckAt = &healthAt
+	account.LastInboundAt = &inboundAt
+
+	credential := models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   orgID,
+		ChannelAccountID: account.ID,
+		Kind:             models.ChannelCredentialKindWebhook,
+		Version:          1,
+		CredentialBlob: models.JSONB{
+			"inbound_secret":  "test-inbound-secret",
+			"outbound_secret": "test-outbound-secret",
+		},
+		Status:     models.ChannelCredentialStatusActive,
+		KeyVersion: "test:v1",
+		Metadata:   models.JSONB{},
+	}
+	require.NoError(t, db.Create(&credential).Error)
+
+	return &Worker{
+		DB:  db,
+		Log: testutil.NopLogger(),
+		Config: &config.Config{
+			App: config.AppConfig{
+				Environment:   "production",
+				EncryptionKey: "worker-test-encryption-key",
+			},
+			MetaRelay: config.MetaRelayConfig{
+				BaseURL:             relayBaseURL,
+				ProviderProofSecret: "worker-meta-provider-proof-secret-at-least-32-bytes",
+				ExpectedAccountsJSON: fmt.Sprintf(`{"accounts":[{
+					"organization_id":%q,
+					"meta_business_id":"300000000000099",
+					"channel":"messenger",
+					"external_account_id":%q,
+					"rereply_account_id":%q
+				}]}`, orgID.String(), externalID, account.ID.String()),
+			},
+		},
+	}
 }
 
 func cloneChannelOutboxTestJSONB(value models.JSONB) models.JSONB {

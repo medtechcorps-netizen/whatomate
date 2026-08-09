@@ -61,6 +61,8 @@ const (
 // environment variables and are never accepted inside the JSON mapping.
 type AccountConfig struct {
 	Key                      string           `json:"key"`
+	OrganizationID           string           `json:"organization_id"`
+	MetaBusinessID           string           `json:"meta_business_id"`
 	Channel                  models.Channel   `json:"channel"`
 	ExternalAccountID        string           `json:"external_account_id"`
 	InstagramAPIMode         InstagramAPIMode `json:"instagram_api_mode,omitempty"`
@@ -71,27 +73,48 @@ type AccountConfig struct {
 	accessToken              string
 	reReplyInboundSecret     string
 	reReplyOutboundSecret    string
+	reReplyChannelAccountID  string
 }
 
 // Config is intentionally environment-only. Production does not have a flag
 // that permits plaintext HTTP provider or ReReply endpoints.
 type Config struct {
-	ListenAddr                string
-	RedisURL                  string
-	RedisPrefix               string
-	MessengerAppSecret        string
-	MessengerVerifyToken      string
-	InstagramLoginAppSecret   string
-	InstagramLoginVerifyToken string
-	GraphAPIVersion           string
-	Accounts                  []AccountConfig
-	InboundRetention          time.Duration
-	OutboundRetention         time.Duration
-	ProcessingLease           time.Duration
-	ForwardTimeout            time.Duration
-	PollInterval              time.Duration
-	WorkerConcurrency         int
-	MaxAttempts               int
+	ListenAddr                  string
+	RedisURL                    string
+	RedisPrefix                 string
+	ReReplyBaseURL              string
+	ReReplyProviderProofSecret  string
+	MessengerAppSecret          string
+	MessengerAppID              string
+	MessengerAppMode            string
+	MessengerAppOwnerBusinessID string
+	MessengerTechProviderStatus string
+	MessengerAppReviewStatus    string
+	MessengerAppPermissions     []string
+	MessengerReviewedBy         string
+	MessengerReviewedAt         string
+	MessengerReviewEvidence     string
+	MessengerVerifyToken        string
+	InstagramLoginAppSecret     string
+	InstagramLoginAppID         string
+	InstagramAppMode            string
+	InstagramAppOwnerBusinessID string
+	InstagramTechProviderStatus string
+	InstagramAppReviewStatus    string
+	InstagramAppPermissions     []string
+	InstagramReviewedBy         string
+	InstagramReviewedAt         string
+	InstagramReviewEvidence     string
+	InstagramLoginVerifyToken   string
+	GraphAPIVersion             string
+	Accounts                    []AccountConfig
+	InboundRetention            time.Duration
+	OutboundRetention           time.Duration
+	ProcessingLease             time.Duration
+	ForwardTimeout              time.Duration
+	PollInterval                time.Duration
+	WorkerConcurrency           int
+	MaxAttempts                 int
 
 	// allowInsecureTestEndpoints can only be set by package tests/options. It
 	// is deliberately not sourced from an environment variable.
@@ -127,6 +150,26 @@ func (a *AccountConfig) webhookApp() WebhookApp {
 		return WebhookAppInstagramLogin
 	}
 	return WebhookAppMessenger
+}
+
+func (c *Config) appID(webhookApp WebhookApp) string {
+	if c == nil {
+		return ""
+	}
+	if webhookApp == WebhookAppInstagramLogin {
+		return c.InstagramLoginAppID
+	}
+	return c.MessengerAppID
+}
+
+func (c *Config) appReviewPermissions(webhookApp WebhookApp) []string {
+	if c == nil {
+		return nil
+	}
+	if webhookApp == WebhookAppInstagramLogin {
+		return c.InstagramAppPermissions
+	}
+	return c.MessengerAppPermissions
 }
 
 // InboundJob is the durable unit forwarded to one ReReply channel webhook.

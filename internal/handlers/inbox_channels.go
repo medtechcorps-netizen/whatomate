@@ -178,7 +178,7 @@ func (a *App) ListInboxConversations(r *fastglue.Request) error {
 
 	response := make([]InboxConversationResponse, len(conversations))
 	for i := range conversations {
-		response[i] = inboxConversationToResponse(&conversations[i])
+		response[i] = inboxConversationToResponse(&conversations[i], a)
 	}
 	return r.SendEnvelope(listEnvelope("conversations", response, total, pagination))
 }
@@ -352,8 +352,21 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 	if !boolConfigValue(conversation.ChannelAccount.Config, "outbound_enabled") {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Outbound delivery is not approved for this channel account", nil, "")
 	}
-	if currentChannelCredential(conversation.ChannelAccount) == nil {
+	if !channelAccountHasRequiredCredential(conversation.ChannelAccount, time.Now().UTC()) {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Channel account credentials are unavailable", nil, "")
+	}
+	if isMetaRelayChannelAccount(conversation.ChannelAccount) {
+		if _, err := a.trustedMetaRelayOutboundBinding(
+			conversation.ChannelAccount,
+			time.Now().UTC(),
+		); err != nil {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusConflict,
+				"Meta outbound delivery requires a current Test and a provider-proven inbound DM",
+				nil,
+				"",
+			)
+		}
 	}
 	adapter, err := a.channelAdapter(conversation.ChannelAccount)
 	if err != nil {
@@ -535,14 +548,20 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 	}
 
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
-		if err := lockChannelAccountForMessageEnqueue(
+		lockedAccount, err := lockChannelAccountForMessageEnqueue(
 			tx,
 			orgID,
 			conversation.ChannelAccountID,
 			conversation.Channel,
 			now,
-		); err != nil {
+		)
+		if err != nil {
 			return err
+		}
+		if isMetaRelayChannelAccount(lockedAccount) {
+			if _, err := a.trustedMetaRelayOutboundBinding(lockedAccount, now); err != nil {
+				return errChannelAccountUnavailableAtEnqueue
+			}
 		}
 		// A reply can only target a message in the same tenant conversation.
 		if request.ReplyToMessageID != nil {
@@ -669,28 +688,26 @@ func lockChannelAccountForMessageEnqueue(
 	orgID, accountID uuid.UUID,
 	channel models.Channel,
 	now time.Time,
-) error {
+) (*models.ChannelAccount, error) {
 	// Serialize enqueue with account disconnect and credential rotation. If
 	// disconnect commits first, this observes the disabled account and creates
 	// no message/job. If enqueue commits first, disconnect's cancellation scan
 	// necessarily sees the new job.
 	var account models.ChannelAccount
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Select("id", "organization_id", "channel", "provider", "status", "config").
 		Where("id = ? AND organization_id = ?", accountID, orgID).
 		First(&account).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return errChannelAccountUnavailableAtEnqueue
+			return nil, errChannelAccountUnavailableAtEnqueue
 		}
-		return err
+		return nil, err
 	}
 	if account.Status != models.ChannelAccountStatusActive ||
 		account.Channel != channel ||
 		!boolConfigValue(account.Config, "outbound_enabled") {
-		return errChannelAccountUnavailableAtEnqueue
+		return nil, errChannelAccountUnavailableAtEnqueue
 	}
-	var usableCredentialCount int64
-	if err := tx.Model(&models.ChannelCredential{}).
+	if err := tx.
 		Where(
 			"organization_id = ? AND channel_account_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
 			orgID,
@@ -701,13 +718,25 @@ func lockChannelAccountForMessageEnqueue(
 			},
 			now,
 		).
-		Count(&usableCredentialCount).Error; err != nil {
-		return err
+		Order("version DESC, id ASC").
+		Find(&account.Credentials).Error; err != nil {
+		return nil, err
 	}
-	if usableCredentialCount != 1 {
-		return errChannelAccountUnavailableAtEnqueue
+	if requiredKind, providerRequiresKind := channelapi.ProviderRequiredCredentialKind(
+		account.Channel,
+		account.Provider,
+	); providerRequiresKind {
+		if channelapi.CurrentCredentialCountOfKind(
+			account.Credentials,
+			requiredKind,
+			now,
+		) != 1 {
+			return nil, errChannelAccountUnavailableAtEnqueue
+		}
+	} else if len(account.Credentials) != 1 {
+		return nil, errChannelAccountUnavailableAtEnqueue
 	}
-	return nil
+	return &account, nil
 }
 
 func (a *App) MarkInboxConversationRead(r *fastglue.Request) error {
@@ -870,10 +899,13 @@ func loadInboxConversation(db *gorm.DB, orgID, conversationID uuid.UUID, credent
 	return &conversation, nil
 }
 
-func inboxConversationToResponse(conversation *models.InboxConversation) InboxConversationResponse {
+func inboxConversationToResponse(
+	conversation *models.InboxConversation,
+	applications ...*App,
+) InboxConversationResponse {
 	var account *ChannelAccountResponse
 	if conversation.ChannelAccount != nil {
-		value := channelAccountToResponse(conversation.ChannelAccount)
+		value := channelAccountToResponse(conversation.ChannelAccount, applications...)
 		account = &value
 	}
 	return InboxConversationResponse{

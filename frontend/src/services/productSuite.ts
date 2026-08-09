@@ -602,6 +602,7 @@ export interface ChannelAccount {
   last_outbound_at?: string
   last_error_at?: string
   last_error?: string
+  meta_provider_proof_version?: string
   outbox_pending: number
   outbox_failed: number
 }

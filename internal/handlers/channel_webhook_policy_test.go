@@ -1,17 +1,101 @@
 package handlers
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 	"gorm.io/gorm"
 )
+
+func TestMetaWebhookTenantHMACAloneCannotCreateAcceptedOrFreshInbound(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	accountID := uuid.New()
+	externalID := "17841400000000001"
+	const tenantInboundSecret = "tenant-visible-inbound-secret"
+	const providerProofSecret = "handler-provider-proof-secret-at-least-32-bytes"
+	relayURL := "https://relay.example.test/meta/v1/accounts/instagram/" + externalID
+	account := &models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: accountID},
+		OrganizationID:    org.ID,
+		Channel:           models.ChannelInstagram,
+		Provider:          channelapi.RelayProvider,
+		Name:              "provider-proof-webhook",
+		ExternalAccountID: externalID,
+		Status:            models.ChannelAccountStatusActive,
+		Config:            models.JSONB{"relay_url": relayURL},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, db.Create(account).Error)
+	require.NoError(t, db.Create(&models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   org.ID,
+		ChannelAccountID: account.ID,
+		Kind:             models.ChannelCredentialKindWebhook,
+		Version:          1,
+		CredentialBlob: models.JSONB{
+			"inbound_secret": tenantInboundSecret,
+		},
+		Status:   models.ChannelCredentialStatusActive,
+		Metadata: models.JSONB{},
+	}).Error)
+	app := &App{
+		DB:  db,
+		Log: testutil.NopLogger(),
+		Config: &config.Config{
+			App: config.AppConfig{
+				Environment:   "production",
+				EncryptionKey: "handler-test-encryption-key",
+			},
+			MetaRelay: config.MetaRelayConfig{
+				BaseURL:             "https://relay.example.test/meta",
+				ProviderProofSecret: providerProofSecret,
+				ExpectedAccountsJSON: fmt.Sprintf(`{"accounts":[{
+					"organization_id":%q,
+					"meta_business_id":"200000000000001",
+					"channel":"instagram",
+					"external_account_id":%q,
+					"rereply_account_id":%q
+				}]}`, org.ID.String(), externalID, account.ID.String()),
+			},
+		},
+	}
+	request := testutil.NewJSONRequest(t, map[string]any{
+		"external_account_id": externalID,
+		"events":              []any{},
+	})
+	request.RequestCtx.Request.Header.SetMethod(fasthttp.MethodPost)
+	testutil.SetPathParam(request, "channel_account_id", account.ID.String())
+	body := request.RequestCtx.PostBody()
+	mac := hmac.New(sha256.New, []byte(tenantInboundSecret))
+	_, _ = mac.Write(body)
+	request.RequestCtx.Request.Header.Set(
+		channelapi.RelaySignatureHeader,
+		"sha256="+hex.EncodeToString(mac.Sum(nil)),
+	)
+
+	require.NoError(t, app.RelayChannelWebhook(request))
+	require.Equal(t, fasthttp.StatusUnauthorized, testutil.GetResponseStatusCode(request))
+
+	var acceptedEvents int64
+	require.NoError(t, db.Model(&models.InboundEvent{}).
+		Where("organization_id = ? AND channel_account_id = ?", org.ID, account.ID).
+		Count(&acceptedEvents).Error)
+	require.Zero(t, acceptedEvents)
+	require.NoError(t, db.First(account, "id = ?", account.ID).Error)
+	require.Nil(t, account.LastInboundAt)
+}
 
 func TestProcessNormalizedChannelEventRetainsLatestMetaServiceWindowOutOfOrder(t *testing.T) {
 	db := testutil.SetupTestDB(t)
@@ -51,6 +135,74 @@ func TestProcessNormalizedChannelEventRetainsLatestMetaServiceWindowOutOfOrder(t
 		conversation.ServiceWindowEndsAt.UTC(),
 		"a delayed older event must not shorten the newer service window",
 	)
+}
+
+func TestProcessNormalizedChannelEventAdvancesAccountAnchorOnlyForNewCustomerMessage(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	account := createRelayPolicyTestAccount(t, db, org.ID, models.ChannelMessenger)
+	acceptedAt := time.Date(2026, time.July, 28, 8, 0, 0, 0, time.UTC)
+	providerTime := acceptedAt.Add(-2 * time.Hour)
+	event := validPolicyInboundEvent(providerTime)
+
+	var anchor time.Time
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		return processNormalizedChannelEvent(tx, account, &event, acceptedAt, &anchor)
+	}))
+	require.Equal(t, providerTime, anchor)
+
+	anchor = time.Time{}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		return processNormalizedChannelEvent(tx, account, &event, acceptedAt, &anchor)
+	}))
+	require.True(t, anchor.IsZero(), "duplicate canonical event must not advance account freshness")
+
+	sameMessageNewCanonical := event
+	sameMessageNewCanonical.DedupeKey = "different-dedupe-" + uuid.NewString()
+	sameMessageNewCanonical.ProviderEventID = "different-event-" + uuid.NewString()
+	anchor = time.Time{}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		return processNormalizedChannelEvent(
+			tx,
+			account,
+			&sameMessageNewCanonical,
+			acceptedAt,
+			&anchor,
+		)
+	}))
+	require.True(t, anchor.IsZero(), "duplicate external_message_id must not advance account freshness")
+
+	status := channelapi.InboundEvent{
+		DedupeKey:       "status-" + uuid.NewString(),
+		ProviderEventID: "status-event-" + uuid.NewString(),
+		Type:            channelapi.NormalizedEventTypeMessageStatus,
+		OccurredAt:      acceptedAt,
+		MessageStatus: &channelapi.MessageStatusUpdate{
+			ExternalMessageID: event.Message.ExternalMessageID,
+			Type:              models.MessageEventTypeDelivered,
+			OccurredAt:        acceptedAt,
+		},
+	}
+	anchor = time.Time{}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		return processNormalizedChannelEvent(tx, account, &status, acceptedAt, &anchor)
+	}))
+	require.True(t, anchor.IsZero(), "status/read/reaction events must not advance account freshness")
+
+	emptyMessage := validPolicyInboundEvent(providerTime)
+	emptyMessage.Message.Parts = nil
+	anchor = time.Time{}
+	err := db.Transaction(func(tx *gorm.DB) error {
+		return processNormalizedChannelEvent(tx, account, &emptyMessage, acceptedAt, &anchor)
+	})
+	require.ErrorContains(t, err, "at least one message part")
+	require.True(t, anchor.IsZero(), "empty message must not advance account freshness")
+
+	var messageCount int64
+	require.NoError(t, db.Model(&models.Message{}).
+		Where("organization_id = ?", org.ID).
+		Count(&messageCount).Error)
+	require.EqualValues(t, 1, messageCount)
 }
 
 func TestMonotonicServiceWindowEndsAtSerializesCompetingPostgresUpdates(t *testing.T) {

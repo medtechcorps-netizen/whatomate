@@ -16,12 +16,12 @@ func TestNormalizeInboundTextAndIgnoresEchoes(t *testing.T) {
 	raw := []byte(`{
 	  "object": "page",
 	  "entry": [{
-	    "id": "page-1",
+	    "id": "100000000000010",
 	    "time": 1770000000,
 	    "messaging": [
 	      {
 	        "sender": {"id": "customer-1"},
-	        "recipient": {"id": "page-1"},
+	        "recipient": {"id": "100000000000010"},
 	        "timestamp": 1770000000123,
 	        "message": {
 	          "mid": "mid-1",
@@ -30,14 +30,14 @@ func TestNormalizeInboundTextAndIgnoresEchoes(t *testing.T) {
 	        }
 	      },
 	      {
-	        "sender": {"id": "page-1"},
+	        "sender": {"id": "100000000000010"},
 	        "recipient": {"id": "customer-1"},
 	        "timestamp": 1770000001123,
 	        "message": {"mid": "echo-mid", "text": "echo", "is_echo": true}
 	      },
 	      {
 	        "sender": {"id": "customer-1"},
-	        "recipient": {"id": "page-1"},
+	        "recipient": {"id": "100000000000010"},
 	        "timestamp": 1770000002123,
 	        "message": {"mid": "attachment-mid"}
 	      }
@@ -59,7 +59,7 @@ func TestNormalizeInboundTextAndIgnoresEchoes(t *testing.T) {
 	if err := json.Unmarshal(jobs[0].Body, &envelope); err != nil {
 		t.Fatalf("decode canonical envelope: %v", err)
 	}
-	if envelope.ExternalAccountID != "page-1" || len(envelope.Events) != 1 {
+	if envelope.ExternalAccountID != "100000000000010" || len(envelope.Events) != 1 {
 		t.Fatalf("unexpected canonical envelope: %+v", envelope)
 	}
 	event := envelope.Events[0]
@@ -80,10 +80,10 @@ func TestNormalizeInboundKnownEchoOnlyIsNoOp(t *testing.T) {
 	raw := []byte(`{
 	  "object": "instagram",
 	  "entry": [{
-	    "id": "ig-direct-1",
+	    "id": "17841400000000001",
 	    "time": 1770000000,
 	    "messaging": [{
-	      "sender": {"id": "ig-direct-1"},
+	      "sender": {"id": "17841400000000001"},
 	      "recipient": {"id": "customer-1"},
 	      "timestamp": 1770000000123,
 	      "message": {"mid": "echo-mid", "text": "echo", "is_self": true}
@@ -112,7 +112,7 @@ func TestNormalizeInboundRejectsUnknownAndWrongWebhookApp(t *testing.T) {
 
 	instagramDirect := []byte(`{
 	  "object": "instagram",
-	  "entry": [{"id": "ig-direct-1", "time": 1770000000, "messaging": []}]
+	  "entry": [{"id": "17841400000000001", "time": 1770000000, "messaging": []}]
 	}`)
 	if _, err := NormalizeInbound(
 		config,
@@ -131,7 +131,7 @@ func TestNormalizeInboundRejectsUnknownAndWrongWebhookApp(t *testing.T) {
 
 	instagramPage := []byte(`{
 	  "object": "instagram",
-	  "entry": [{"id": "ig-page-1", "time": 1770000000, "messaging": []}]
+	  "entry": [{"id": "17841400000000002", "time": 1770000000, "messaging": []}]
 	}`)
 	if _, err := NormalizeInbound(
 		config,
@@ -154,7 +154,7 @@ func TestNormalizeInboundRejectsMismatchedRecipient(t *testing.T) {
 	raw := []byte(`{
 	  "object": "page",
 	  "entry": [{
-	    "id": "page-1",
+	    "id": "100000000000010",
 	    "time": 1770000000,
 	    "messaging": [{
 	      "sender": {"id": "customer-1"},
@@ -300,7 +300,7 @@ func testMetaTextWebhookBody(t *testing.T, count int, text string) []byte {
 	for index := range messaging {
 		messaging[index] = metaMessaging{
 			Sender:    metaIdentity{ID: "customer-1"},
-			Recipient: metaIdentity{ID: "page-1"},
+			Recipient: metaIdentity{ID: "100000000000010"},
 			Timestamp: 1770000000123 + int64(index),
 			Message: &metaMessage{
 				MID:  fmt.Sprintf("mid-%04d", index),
@@ -311,7 +311,7 @@ func testMetaTextWebhookBody(t *testing.T, count int, text string) []byte {
 	raw, err := json.Marshal(metaWebhook{
 		Object: "page",
 		Entry: []metaEntry{{
-			ID:        "page-1",
+			ID:        "100000000000010",
 			Time:      1770000000,
 			Messaging: messaging,
 		}},

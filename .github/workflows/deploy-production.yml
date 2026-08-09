@@ -72,10 +72,39 @@ jobs:
           echo "Timed out waiting for protected-main checks."
           exit 1
 
+      - name: Checkout protected revision
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Install doctl
         uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Verify protected Meta relay inventory before deployment
+        env:
+          META_RELAY_EXPECTED_ACCOUNTS_JSON: ${{ vars.META_RELAY_EXPECTED_ACCOUNTS_JSON }}
+        run: |
+          set -euo pipefail
+          app_id="54bc0d92-73e9-4f8b-86cd-c3fd96e06beb"
+          app_spec="$(doctl apps spec get "${app_id}" --format json)"
+          if ! jq -e 'any(.services[]?; .name == "meta-relay")' <<<"${app_spec}" >/dev/null; then
+            if [[ -n "${META_RELAY_EXPECTED_ACCOUNTS_JSON}" ]]; then
+              echo "::error::Protected Meta relay inventory exists, but the meta-relay service is missing."
+              exit 1
+            fi
+            echo "meta-relay is not provisioned and no protected inventory exists; skipping structural preflight"
+            exit 0
+          fi
+          if [[ -z "${META_RELAY_EXPECTED_ACCOUNTS_JSON}" ]]; then
+            echo "::error::Production variable META_RELAY_EXPECTED_ACCOUNTS_JSON is required when meta-relay is provisioned."
+            exit 1
+          fi
+          python3 scripts/meta_relay_preflight.py --validate-only <<<"${app_spec}"
 
       - name: Ensure production runtime RLS scope
         run: |
@@ -212,6 +241,50 @@ jobs:
             --retry-all-errors \
             --retry-delay 5 \
             https://app.rereply.app/ready
+
+      - name: Verify Meta relay readiness
+        run: |
+          set -euo pipefail
+          app_id="54bc0d92-73e9-4f8b-86cd-c3fd96e06beb"
+          if ! doctl apps spec get "${app_id}" --format json \
+            | jq -e 'any(.services[]?; .name == "meta-relay")' >/dev/null; then
+            echo "meta-relay is not provisioned yet; skipping its readiness check"
+            exit 0
+          fi
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 12 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            https://app.rereply.app/meta-relay/readyz
+
+      - name: Verify Meta relay mappings and account bindings
+        env:
+          META_RELAY_EXPECTED_ACCOUNTS_JSON: ${{ vars.META_RELAY_EXPECTED_ACCOUNTS_JSON }}
+          META_RELAY_PREFLIGHT_SECRETS_JSON: ${{ secrets.META_RELAY_PREFLIGHT_SECRETS_JSON }}
+        run: |
+          set -euo pipefail
+          app_id="54bc0d92-73e9-4f8b-86cd-c3fd96e06beb"
+          app_spec="$(doctl apps spec get "${app_id}" --format json)"
+          if ! jq -e 'any(.services[]?; .name == "meta-relay")' <<<"${app_spec}" >/dev/null; then
+            if [[ -n "${META_RELAY_EXPECTED_ACCOUNTS_JSON}" ]]; then
+              echo "::error::Protected Meta relay inventory exists, but the deployed meta-relay service is missing."
+              exit 1
+            fi
+            echo "meta-relay is not provisioned yet; skipping its account preflight"
+            exit 0
+          fi
+          if [[ -z "${META_RELAY_EXPECTED_ACCOUNTS_JSON}" ]]; then
+            echo "::error::Production variable META_RELAY_EXPECTED_ACCOUNTS_JSON is required when meta-relay is provisioned."
+            exit 1
+          fi
+          if [[ -z "${META_RELAY_PREFLIGHT_SECRETS_JSON}" ]]; then
+            echo "::error::Production secret META_RELAY_PREFLIGHT_SECRETS_JSON is required when meta-relay is provisioned."
+            exit 1
+          fi
+          python3 scripts/meta_relay_preflight.py <<<"${app_spec}"
 
       - name: Verify Gmail relay readiness
         run: |

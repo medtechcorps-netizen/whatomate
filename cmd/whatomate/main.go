@@ -1024,6 +1024,21 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.DELETE("/api/integrations/{provider}/credentials", tenant((*handlers.App).DeleteIntegrationCredentials))
 	g.POST("/api/integrations/{provider}/connect", tenant((*handlers.App).ConnectIntegration))
 	g.POST("/api/integrations/{provider}/test", app.TestIntegration)
+	// Facebook Login for Business returns the authorization code to the
+	// authenticated browser SDK. All three managed Messenger onboarding phases
+	// remain authenticated; there is deliberately no public OAuth callback.
+	g.POST(
+		"/api/integrations/meta/messenger/onboarding/start",
+		app.StartMetaMessengerOnboarding,
+	)
+	g.POST(
+		"/api/integrations/meta/messenger/onboarding/exchange",
+		app.ExchangeMetaMessengerOnboarding,
+	)
+	g.POST(
+		"/api/integrations/meta/messenger/onboarding/select",
+		app.SelectMetaMessengerOnboarding,
+	)
 	g.GET("/api/integrations/google_search_console/properties", tenant((*handlers.App).ListGoogleSearchConsoleProperties))
 	g.PUT("/api/integrations/google_search_console/properties", tenant((*handlers.App).UpdateGoogleSearchConsoleProperties))
 	g.POST("/api/integrations/google_search_console/properties/refresh", app.RefreshGoogleSearchConsoleProperties)

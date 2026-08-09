@@ -566,11 +566,14 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		 SECURITY DEFINER
 		 SET search_path = pg_catalog, public
 		 AS $function$
-		   SELECT organization_id
-		   FROM public.channel_accounts
-		   WHERE id = p_channel_account_id
-		     AND status IN ('pending', 'active', 'degraded')
-		     AND deleted_at IS NULL
+		   SELECT channel_account.organization_id
+		   FROM public.channel_accounts AS channel_account
+		   INNER JOIN public.organizations AS organization
+		     ON organization.id = channel_account.organization_id
+		    AND organization.deleted_at IS NULL
+		   WHERE channel_account.id = p_channel_account_id
+		     AND channel_account.status IN ('pending', 'active', 'degraded')
+		     AND channel_account.deleted_at IS NULL
 		 $function$`,
 		`CREATE OR REPLACE FUNCTION public.rereply_ready_channel_outbox_orgs(
 		   p_after uuid,

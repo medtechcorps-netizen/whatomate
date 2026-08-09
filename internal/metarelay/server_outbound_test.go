@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 )
 
 func performOutbound(
@@ -28,9 +30,96 @@ func performOutbound(
 		ReReplySignatureHeader,
 		signBody(account.reReplyOutboundSecret, body),
 	)
+	request.Header.Set(
+		channelapi.RelayMetaProviderProofHeader,
+		channelapi.SignMetaProviderOutboundProof(testMetaProviderProofSecret, body),
+	)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
+}
+
+func TestOutboundRejectsTenantHMACWithoutDeploymentProviderProof(t *testing.T) {
+	config := newTestConfig(t)
+	account, _ := config.accountByKey("messenger-page")
+	store := newMemoryServerStore()
+	var graphCalls atomic.Int32
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		graphCalls.Add(1)
+		_, _ = w.Write([]byte(`{"recipient_id":"customer-1","message_id":"must-not-send"}`))
+	}))
+	defer graph.Close()
+	server, err := NewServer(
+		config,
+		store,
+		withGraphBases(graph.URL, "http://instagram.invalid"),
+	)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	body := outboundEnvelopeBody(t, account, "tenant-hmac-only", "must not send")
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/accounts/messenger/"+account.ExternalAccountID,
+		bytes.NewReader(body),
+	)
+	request.Header.Set(ReReplySignatureHeader, signBody(account.reReplyOutboundSecret, body))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized ||
+		!strings.Contains(response.Body.String(), "invalid_provider_proof") {
+		t.Fatalf("tenant-only HMAC returned %d: %s", response.Code, response.Body.String())
+	}
+	if graphCalls.Load() != 0 || len(store.outbound) != 0 {
+		t.Fatalf("tenant-only HMAC crossed the provider/idempotency gate: Graph=%d claims=%d", graphCalls.Load(), len(store.outbound))
+	}
+}
+
+func TestOutboundEnforcesGovernanceFreshnessAtRuntimeBoundary(t *testing.T) {
+	config := newTestConfig(t)
+	account, _ := config.accountByKey("messenger-page")
+	fixedNow := time.Now().UTC().Truncate(time.Second)
+	config.MessengerReviewedAt = fixedNow.Add(-maxGovernanceReviewAge).Format(time.RFC3339)
+
+	var graphCalls atomic.Int32
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		graphCalls.Add(1)
+		_, _ = w.Write([]byte(`{"recipient_id":"customer-1","message_id":"governance-mid"}`))
+	}))
+	defer graph.Close()
+	server, err := NewServer(
+		config,
+		newMemoryServerStore(),
+		withGraphBases(graph.URL, "http://instagram.invalid"),
+	)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	server.now = func() time.Time { return fixedNow }
+	boundary := performOutbound(
+		t,
+		server.Handler(),
+		account,
+		outboundEnvelopeBody(t, account, "governance-boundary", "hello"),
+	)
+	if boundary.Code != http.StatusOK || graphCalls.Load() != 1 {
+		t.Fatalf("boundary send returned %d, Graph calls=%d", boundary.Code, graphCalls.Load())
+	}
+
+	server.now = func() time.Time { return fixedNow.Add(time.Nanosecond) }
+	expired := performOutbound(
+		t,
+		server.Handler(),
+		account,
+		outboundEnvelopeBody(t, account, "governance-expired", "hello"),
+	)
+	if expired.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(expired.Body.String(), "governance_review_stale") {
+		t.Fatalf("expired send returned %d: %s", expired.Code, expired.Body.String())
+	}
+	if graphCalls.Load() != 1 {
+		t.Fatalf("Graph was called after governance expiry; calls=%d", graphCalls.Load())
+	}
 }
 
 func TestOutboundGraphHostIsBoundToAccountMode(t *testing.T) {
@@ -42,11 +131,11 @@ func TestOutboundGraphHostIsBoundToAccountMode(t *testing.T) {
 	facebook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		facebookCalls.Add(1)
 		switch request.URL.Path {
-		case "/v25.0/page-1/messages":
+		case "/v25.0/100000000000010/messages":
 			if request.Header.Get("Authorization") != "Bearer messenger-access-token" {
 				t.Errorf("wrong Messenger authorization header")
 			}
-		case "/v25.0/ig-page-1/messages":
+		case "/v25.0/17841400000000002/messages":
 			if request.Header.Get("Authorization") != "Bearer instagram-page-access-token" {
 				t.Errorf("wrong Facebook Login Instagram authorization header")
 			}
@@ -60,7 +149,7 @@ func TestOutboundGraphHostIsBoundToAccountMode(t *testing.T) {
 
 	instagram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		instagramCalls.Add(1)
-		if request.URL.Path != "/v25.0/ig-direct-1/messages" {
+		if request.URL.Path != "/v25.0/17841400000000001/messages" {
 			t.Errorf("unexpected Instagram Graph path %q", request.URL.Path)
 		}
 		if request.Header.Get("Authorization") != "Bearer instagram-direct-access-token" {
@@ -354,6 +443,10 @@ func TestOutboundClaimSurvivesCallerCancellation(t *testing.T) {
 		ReReplySignatureHeader,
 		signBody(account.reReplyOutboundSecret, body),
 	)
+	request.Header.Set(
+		channelapi.RelayMetaProviderProofHeader,
+		channelapi.SignMetaProviderOutboundProof(testMetaProviderProofSecret, body),
+	)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 
@@ -503,6 +596,10 @@ func TestOutboundDeliveryAndSettlementSurviveCallerCancellation(t *testing.T) {
 			request.Header.Set(
 				ReReplySignatureHeader,
 				signBody(account.reReplyOutboundSecret, body),
+			)
+			request.Header.Set(
+				channelapi.RelayMetaProviderProofHeader,
+				channelapi.SignMetaProviderOutboundProof(testMetaProviderProofSecret, body),
 			)
 			response := httptest.NewRecorder()
 			server.Handler().ServeHTTP(response, request)

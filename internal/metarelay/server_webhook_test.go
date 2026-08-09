@@ -78,8 +78,8 @@ func TestWebhookRoutesRejectCrossAppCredentials(t *testing.T) {
 		http.StatusForbidden,
 	)
 
-	pageBody := []byte(`{"object":"page","entry":[{"id":"page-1","time":1770000000,"messaging":[]}]}`)
-	instagramBody := []byte(`{"object":"instagram","entry":[{"id":"ig-direct-1","time":1770000000,"messaging":[]}]}`)
+	pageBody := []byte(`{"object":"page","entry":[{"id":"100000000000010","time":1770000000,"messaging":[]}]}`)
+	instagramBody := []byte(`{"object":"instagram","entry":[{"id":"17841400000000001","time":1770000000,"messaging":[]}]}`)
 	assertWebhookStatus := func(path, secret string, body []byte, want int) {
 		t.Helper()
 		request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
@@ -152,11 +152,11 @@ func TestWebhookAcceptanceIsIdempotent(t *testing.T) {
 	body := []byte(`{
 	  "object":"page",
 	  "entry":[{
-	    "id":"page-1",
+	    "id":"100000000000010",
 	    "time":1770000000,
 	    "messaging":[{
 	      "sender":{"id":"customer-1"},
-	      "recipient":{"id":"page-1"},
+	      "recipient":{"id":"100000000000010"},
 	      "timestamp":1770000000123,
 	      "message":{"mid":"mid-1","text":"hello"}
 	    }]

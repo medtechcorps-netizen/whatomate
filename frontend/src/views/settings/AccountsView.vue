@@ -181,11 +181,10 @@ async function fetchWhatsAppConfig() {
 function loadFacebookSDK() {
   if (isFBSDKLoaded.value || !whatsappConfig.value?.app_id) return;
 
-  const script = document.createElement("script");
-  script.src = "https://connect.facebook.net/en_US/sdk.js";
-  script.async = true;
-  script.defer = true;
-  script.onload = () => {
+  const initializeSDK = () => {
+    // Messenger onboarding and WhatsApp Embedded Signup share the singleton
+    // Facebook SDK. Reuse the loaded script, then initialize immediately before
+    // this route's flow with its backend-issued deployment configuration.
     window.FB.init({
       appId: whatsappConfig.value!.app_id,
       cookie: true,
@@ -194,6 +193,24 @@ function loadFacebookSDK() {
     });
     isFBSDKLoaded.value = true;
   };
+
+  if (window.FB) {
+    initializeSDK();
+    return;
+  }
+
+  const existingScript = document.getElementById("facebook-jssdk");
+  if (existingScript) {
+    existingScript.addEventListener("load", initializeSDK, { once: true });
+    return;
+  }
+
+  const script = document.createElement("script");
+  script.id = "facebook-jssdk";
+  script.src = "https://connect.facebook.net/en_US/sdk.js";
+  script.async = true;
+  script.defer = true;
+  script.addEventListener("load", initializeSDK, { once: true });
   document.body.appendChild(script);
 }
 

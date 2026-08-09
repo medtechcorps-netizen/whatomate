@@ -139,6 +139,14 @@ func (s *Server) handleReady(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "not_ready")
 		return
 	}
+	keyID, err := channelapi.MetaProviderProofKeyID(
+		s.config.ReReplyProviderProofSecret,
+	)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready")
+		return
+	}
+	w.Header().Set(channelapi.RelayMetaProviderProofKeyIDHeader, keyID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -238,6 +246,10 @@ func (s *Server) webhookCredentials(webhookApp WebhookApp) (string, string, bool
 }
 
 func (s *Server) handleAccountHealth(w http.ResponseWriter, request *http.Request) {
+	// A successful response contains account-specific readiness attestations.
+	// Never permit an intermediary to replay them after a token, subscription,
+	// or protected mapping has been revoked.
+	w.Header().Set("Cache-Control", "no-store, private")
 	account, ok := s.accountFromPath(request)
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown_account")
@@ -247,6 +259,11 @@ func (s *Server) handleAccountHealth(w http.ResponseWriter, request *http.Reques
 		len(request.TransferEncoding) != 0 ||
 		!verifySignedBody(account.reReplyOutboundSecret, request.Header.Get(ReReplySignatureHeader), nil) {
 		writeError(w, http.StatusUnauthorized, "invalid_signature")
+		return
+	}
+	if err := s.config.validateCurrentGovernance(account, s.now().UTC()); err != nil {
+		s.logger.Warn("Meta app governance review is no longer current", "account", account.Key)
+		writeError(w, http.StatusServiceUnavailable, "governance_review_stale")
 		return
 	}
 	ctx, cancel := context.WithTimeout(request.Context(), accountHealthTimeout)
@@ -263,6 +280,36 @@ func (s *Server) handleAccountHealth(w http.ResponseWriter, request *http.Reques
 		writeError(w, http.StatusServiceUnavailable, "account_unhealthy")
 		return
 	}
+	if err := s.validateWebhookSubscription(ctx, account); err != nil {
+		s.logger.Warn("Meta account webhook subscription check failed", "account", account.Key)
+		writeError(w, http.StatusServiceUnavailable, "account_unhealthy")
+		return
+	}
+	keyID, err := channelapi.MetaProviderProofKeyID(
+		s.config.ReReplyProviderProofSecret,
+	)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready")
+		return
+	}
+	w.Header().Set(channelapi.RelayReadinessHeader, channelapi.RelayReadinessVersion)
+	w.Header().Set(channelapi.RelayChannelHeader, string(account.Channel))
+	w.Header().Set(channelapi.RelayExternalAccountHeader, account.ExternalAccountID)
+	w.Header().Set(channelapi.RelayChannelAccountHeader, account.reReplyChannelAccountID)
+	w.Header().Set(channelapi.RelayOrganizationHeader, account.OrganizationID)
+	w.Header().Set(channelapi.RelayMetaBusinessHeader, account.MetaBusinessID)
+	w.Header().Set(channelapi.RelayMetaProviderProofKeyIDHeader, keyID)
+	w.Header().Set(
+		channelapi.RelayMetaProviderProofHeader,
+		channelapi.SignMetaProviderReadinessProof(
+			s.config.ReReplyProviderProofSecret,
+			account.Channel,
+			account.ExternalAccountID,
+			account.reReplyChannelAccountID,
+			account.OrganizationID,
+			account.MetaBusinessID,
+		),
+	)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -351,6 +398,75 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 	return nil
 }
 
+type graphSubscriptionsResponse struct {
+	Data []struct {
+		ID               string   `json:"id"`
+		SubscribedFields []string `json:"subscribed_fields"`
+	} `json:"data"`
+}
+
+// validateWebhookSubscription proves that the exact app configured for the
+// account's webhook route is currently installed on the exact Page or
+// Instagram professional account and subscribed to the messages field. App
+// callback verification alone is not enough: Meta also requires this
+// per-asset subscription before customer messages are delivered.
+func (s *Server) validateWebhookSubscription(ctx context.Context, account *AccountConfig) error {
+	base, err := s.graphBase(account)
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf(
+		"%s/%s/%s/subscribed_apps",
+		strings.TrimRight(base, "/"),
+		url.PathEscape(s.config.GraphAPIVersion),
+		url.PathEscape(account.ExternalAccountID),
+	)
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return errors.New("invalid Graph subscription endpoint")
+	}
+	query := parsed.Query()
+	query.Set("fields", "id,subscribed_fields")
+	parsed.RawQuery = query.Encode()
+
+	providerRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return errors.New("invalid Graph subscription request")
+	}
+	providerRequest.Header.Set("Authorization", "Bearer "+account.accessToken)
+	providerRequest.Header.Set("Accept", "application/json")
+	providerRequest.Header.Set("User-Agent", "ReReply-Meta-Relay/1.0")
+
+	response, err := s.client.Do(providerRequest)
+	if err != nil {
+		return errors.New("graph subscription transport failure")
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+		_ = response.Body.Close()
+	}()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return errors.New("graph rejected subscription health request")
+	}
+	var subscriptions graphSubscriptionsResponse
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
+	if err := decoder.Decode(&subscriptions); err != nil || rejectTrailingJSON(decoder) != nil {
+		return errors.New("graph subscription response is invalid")
+	}
+	expectedAppID := strings.TrimSpace(s.config.appID(account.webhookApp()))
+	for _, subscription := range subscriptions.Data {
+		if strings.TrimSpace(subscription.ID) != expectedAppID {
+			continue
+		}
+		for _, field := range subscription.SubscribedFields {
+			if strings.EqualFold(strings.TrimSpace(field), "messages") {
+				return nil
+			}
+		}
+	}
+	return errors.New("required messages webhook subscription is missing")
+}
+
 func (s *Server) handleReReplyOutbound(w http.ResponseWriter, request *http.Request) {
 	account, ok := s.accountFromPath(request)
 	if !ok {
@@ -364,6 +480,18 @@ func (s *Server) handleReReplyOutbound(w http.ResponseWriter, request *http.Requ
 	}
 	if !verifySignedBody(account.reReplyOutboundSecret, request.Header.Get(ReReplySignatureHeader), raw) {
 		writeError(w, http.StatusUnauthorized, "invalid_signature")
+		return
+	}
+	if !constantTimeEqual(
+		strings.TrimSpace(request.Header.Get(channelapi.RelayMetaProviderProofHeader)),
+		channelapi.SignMetaProviderOutboundProof(s.config.ReReplyProviderProofSecret, raw),
+	) {
+		writeError(w, http.StatusUnauthorized, "invalid_provider_proof")
+		return
+	}
+	if err := s.config.validateCurrentGovernance(account, s.now().UTC()); err != nil {
+		s.logger.Warn("Blocked Meta outbound after governance review expired", "account", account.Key)
+		writeError(w, http.StatusServiceUnavailable, "governance_review_stale")
 		return
 	}
 
@@ -528,6 +656,13 @@ func (s *Server) sendGraph(
 	account *AccountConfig,
 	message channelapi.OutboundMessage,
 ) graphResult {
+	if err := s.config.validateCurrentGovernance(account, s.now().UTC()); err != nil {
+		return graphResult{
+			status:    http.StatusServiceUnavailable,
+			body:      errorJSON("governance_review_stale"),
+			retryable: true,
+		}
+	}
 	payload := map[string]any{
 		"recipient": map[string]string{"id": message.Recipient.ExternalID},
 		"message":   map[string]any{"text": message.Parts[0].Text},
