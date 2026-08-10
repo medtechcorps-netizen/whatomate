@@ -607,6 +607,20 @@ export interface ChannelAccount {
   outbox_failed: number
 }
 
+export interface MetaMessengerReviewPagePost {
+  id: string
+  message?: string
+  created_time: string
+  permalink_url: string
+}
+
+export interface MetaMessengerReviewPagePosts {
+  page_id: string
+  page_name: string
+  posts: MetaMessengerReviewPagePost[]
+  fetched_at: string
+}
+
 export interface InboxConversation {
   id: string
   channel_account_id: string
@@ -886,6 +900,8 @@ export const channelsService = {
   createAccount: (data: Record<string, unknown>) => api.post('/channel-accounts', data),
   updateAccount: (id: string, data: Record<string, unknown>) => api.put(`/channel-accounts/${id}`, data),
   testAccount: (id: string) => api.post(`/channel-accounts/${id}/test`),
+  reviewPagePosts: (id: string) =>
+    api.get<APIEnvelope<MetaMessengerReviewPagePosts>>(`/channel-accounts/${encodeURIComponent(id)}/meta-page-posts`),
   disconnectAccount: (id: string) => api.delete(`/channel-accounts/${id}`),
   conversations: (params?: Record<string, string | number | boolean>) => api.get('/conversations', { params }),
   allConversations: (params?: Record<string, string | number | boolean>) =>

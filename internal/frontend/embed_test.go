@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -31,7 +32,11 @@ func TestEmbeddedFrontendServesRouteSpecificRawLegalFallbacks(t *testing.T) {
 			title:     "Privacy Policy",
 			effective: "Effective 3 August 2026",
 			contains: []string{
-				"Medtech Healthcare",
+				"Medtech Healthcare Sdn Bhd",
+				"DigitalOcean as a cloud infrastructure service provider and data processor",
+				"current ReReply staging deployment uses DigitalOcean",
+				"Singapore (SGP) region",
+				"DigitalOcean is not necessarily the only service provider",
 				"The Customer Organisation is the data controller",
 				"ReReply does not sell personal data",
 				"Retention, deletion and your rights",
@@ -45,7 +50,7 @@ func TestEmbeddedFrontendServesRouteSpecificRawLegalFallbacks(t *testing.T) {
 			title:     "Terms of Service",
 			effective: "Effective 28 July 2026",
 			contains: []string{
-				"Medtech Healthcare",
+				"Medtech Healthcare Sdn Bhd",
 				"Messaging and channel rules",
 				"These Terms are governed by the laws of Malaysia",
 				"Customers retain ownership of data",
@@ -59,6 +64,7 @@ func TestEmbeddedFrontendServesRouteSpecificRawLegalFallbacks(t *testing.T) {
 			title:     "Data Deletion Instructions",
 			effective: "Effective 3 August 2026",
 			contains: []string{
+				"Medtech Healthcare Sdn Bhd",
 				"ReReply Data Deletion Request",
 				"acknowledge requests within seven calendar days",
 				"encrypted or access-restricted backups",
@@ -87,6 +93,11 @@ func TestEmbeddedFrontendServesRouteSpecificRawLegalFallbacks(t *testing.T) {
 					assert.Contains(t, body, marker)
 				}
 				assert.NotContains(t, body, "Medtech Softwarehouse")
+				assert.Equal(t,
+					strings.Count(body, "Medtech Healthcare"),
+					strings.Count(body, "Medtech Healthcare Sdn Bhd"),
+					"every Medtech Healthcare reference must use the registered legal entity name",
+				)
 				assert.NotContains(t, body, testCase.notContain)
 				assert.Contains(t, body, `<script type="module"`)
 			}

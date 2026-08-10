@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { AlertCircle, CheckCircle2 } from "lucide-vue-next";
 import { Input } from "@/components/ui/input";
 import {
   isManagedMessengerAccount,
+  messengerReviewRelayReady,
   messengerRelayRegistryRecognized,
   metaAccountReadiness,
   type MetaAccountReadinessState,
@@ -34,6 +35,8 @@ const readiness = computed(() =>
     },
   }),
 );
+const reviewReady = computed(() => messengerReviewRelayReady(props.account));
+const productionDetailsOpen = ref(false);
 
 const selectedIdentityLabel = computed(() =>
   props.account.channel === "messenger"
@@ -69,9 +72,64 @@ function readinessStateClasses(state: MetaAccountReadinessState) {
   <section
     data-testid="meta-account-readiness"
     class="mt-5 overflow-hidden rounded-2xl border border-white/[0.08] bg-[#0b0d0e] light:border-slate-200 light:bg-slate-50"
-    aria-labelledby="meta-account-readiness-title"
+    :aria-labelledby="
+      reviewReady
+        ? 'meta-app-review-ready-title'
+        : 'meta-account-readiness-title'
+    "
   >
     <div
+      v-if="reviewReady"
+      data-testid="meta-app-review-ready"
+      class="border-b border-emerald-300/15 bg-[linear-gradient(120deg,rgba(52,211,153,0.1),transparent_64%)] p-4 light:border-emerald-200 light:bg-emerald-50"
+    >
+      <div class="flex items-start gap-3">
+        <CheckCircle2
+          class="mt-0.5 h-5 w-5 shrink-0 text-emerald-300 light:text-emerald-700"
+        />
+        <div>
+          <p
+            class="text-[10px] font-bold uppercase tracking-[0.22em] text-emerald-300 light:text-emerald-800"
+          >
+            Meta reviewer connection
+          </p>
+          <h3
+            id="meta-app-review-ready-title"
+            class="mt-1 text-sm font-semibold text-white light:text-slate-950"
+          >
+            Staging App Review ready — inbound only
+          </h3>
+          <p
+            class="mt-1.5 text-[10px] leading-4 text-white/45 light:text-slate-600"
+          >
+            Webhook subscription and the exact Facebook Page authorization are
+            ready for Meta's staging review. Outbound delivery, connection Test,
+            automatic AI replies, and production registry recognition remain
+            disabled.
+          </p>
+          <p
+            class="mt-2 break-all font-mono text-[10px] text-emerald-200 light:text-emerald-800"
+          >
+            {{ account.name }} · Page ID {{ account.external_account_id }}
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <button
+      v-if="reviewReady"
+      type="button"
+      data-testid="meta-production-readiness-toggle"
+      class="w-full border-b border-white/[0.06] px-4 py-3 text-left text-[10px] font-semibold text-white/50 transition hover:bg-white/[0.025] hover:text-white/70 light:border-slate-200 light:text-slate-700 light:hover:bg-slate-100"
+      :aria-expanded="productionDetailsOpen"
+      @click="productionDetailsOpen = !productionDetailsOpen"
+    >
+      {{ productionDetailsOpen ? "Hide" : "Show" }} production go-live checks
+      (not required for staging App Review)
+    </button>
+    <div
+      v-show="!reviewReady || productionDetailsOpen"
+      data-testid="meta-production-readiness-details"
       class="border-b border-white/[0.07] bg-[linear-gradient(120deg,rgba(251,191,36,0.09),transparent_58%)] p-4 light:border-slate-200"
     >
       <div class="flex flex-wrap items-start justify-between gap-3">
@@ -202,7 +260,10 @@ function readinessStateClasses(state: MetaAccountReadinessState) {
       </label>
     </div>
 
-    <ol class="divide-y divide-white/[0.06] light:divide-slate-200">
+    <ol
+      v-show="!reviewReady || productionDetailsOpen"
+      class="divide-y divide-white/[0.06] light:divide-slate-200"
+    >
       <li
         v-for="(item, index) in readiness.items"
         :key="item.key"
@@ -237,7 +298,10 @@ function readinessStateClasses(state: MetaAccountReadinessState) {
     </ol>
 
     <div
-      v-if="readiness.hasLegacyOutboundApproval"
+      v-if="
+        readiness.hasLegacyOutboundApproval &&
+        (!reviewReady || productionDetailsOpen)
+      "
       class="border-t border-red-300/15 bg-red-300/[0.055] px-4 py-3 text-[10px] leading-4 text-red-100 light:border-red-200 light:bg-red-50 light:text-red-800"
       role="alert"
     >

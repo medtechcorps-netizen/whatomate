@@ -1,5 +1,8 @@
 import { expect, test } from "@playwright/test";
 
+const legalEntity = "Medtech Healthcare Sdn Bhd";
+const legacyLegalEntity = /Medtech Healthcare(?! Sdn Bhd)|Medtech Softwarehouse/;
+
 test("raw app response identifies ReReply and explains its purpose without JavaScript", async ({
   request,
 }) => {
@@ -28,7 +31,11 @@ const rawLegalPages = [
     title: "Privacy Policy",
     section: "scope",
     markers: [
-      "Medtech Healthcare",
+      legalEntity,
+      "DigitalOcean as a cloud infrastructure service provider and data processor",
+      "current ReReply staging deployment uses DigitalOcean",
+      "Singapore (SGP) region",
+      "DigitalOcean is not necessarily the only service provider",
       "The Customer Organisation is the data controller",
       "ReReply does not sell personal data",
       "Retention, deletion and your rights",
@@ -41,7 +48,7 @@ const rawLegalPages = [
     title: "Terms of Service",
     section: "agreement",
     markers: [
-      "Medtech Healthcare",
+      legalEntity,
       "Messaging and channel rules",
       "Customers retain ownership of data",
       "These Terms are governed by the laws of Malaysia",
@@ -54,6 +61,7 @@ const rawLegalPages = [
     title: "Data Deletion Instructions",
     section: "before",
     markers: [
+      legalEntity,
       "ReReply Data Deletion Request",
       "acknowledge requests within seven calendar days",
       "encrypted or access-restricted backups",
@@ -79,7 +87,7 @@ for (const legalPage of rawLegalPages) {
     expect(html).toContain(`<title>${legalPage.title} · ReReply</title>`);
     expect(html).toContain(`href="${legalPage.path}#${legalPage.section}"`);
     expect(html).toContain("mailto:medtechcorps@gmail.com");
-    expect(html).not.toContain("Medtech Softwarehouse");
+    expect(html).not.toMatch(legacyLegalEntity);
     for (const marker of legalPage.markers) {
       expect(html).toContain(marker);
     }

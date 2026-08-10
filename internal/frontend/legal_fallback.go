@@ -66,7 +66,7 @@ var legalFallbackDocuments = map[string]legalFallbackDocument{
 				ID:    "scope",
 				Title: "Scope and our role",
 				Paragraphs: []string{
-					"This Privacy Policy explains how ReReply, provided by Medtech Healthcare, handles personal data through the ReReply website, applications, APIs and support services.",
+					"This Privacy Policy explains how ReReply, provided by Medtech Healthcare Sdn Bhd, handles personal data through the ReReply website, applications, APIs and support services.",
 					"A clinic, pharmacy, wellness provider or other business using ReReply (a Customer Organisation) normally decides why and how its contact, patient, lead and conversation data is used. The Customer Organisation is the data controller and ReReply acts as its service provider or data processor. ReReply may act as controller for account administration, billing, platform security, service analytics and its own business communications.",
 				},
 			},
@@ -95,6 +95,7 @@ var legalFallbackDocuments = map[string]legalFallbackDocument{
 				ID:    "sharing-and-security",
 				Title: "Sharing and security",
 				Paragraphs: []string{
+					"Medtech Healthcare Sdn Bhd uses DigitalOcean as a cloud infrastructure service provider and data processor for ReReply hosting, storage, security, backups and service operation. The current ReReply staging deployment uses DigitalOcean's Singapore (SGP) region. DigitalOcean is not necessarily the only service provider, and this does not mean that every production system or connected provider processes data only in Singapore.",
 					"Information may be shared with authorised users and service providers of the relevant Customer Organisation, infrastructure and communications providers supporting ReReply, connected-channel providers when enabled, and advisers or authorities where reasonably necessary or legally required. One Customer Organisation's CRM or conversation data is not shared with another without an authorised supported workflow.",
 					"Safeguards include tenant-aware access controls, encrypted network transport, protected credentials, audit logging, restricted production access and service monitoring. No internet service can guarantee absolute security, and users must protect their credentials and report suspected unauthorised access.",
 				},
@@ -105,7 +106,7 @@ var legalFallbackDocuments = map[string]legalFallbackDocument{
 				Paragraphs: []string{
 					"Information is retained only as needed to provide and secure the service, follow lawful Customer Organisation instructions, and meet legal or contractual obligations. Data removed from active systems may remain temporarily in protected backups until normal rotation completes; limited security, billing, dispute and compliance records may be retained where necessary.",
 					"Depending on applicable law, you may request access, correction, deletion, restriction, portability or objection, or withdraw consent. Contact the Customer Organisation first when it controls the record. You may also follow ReReply's Data Deletion Instructions. Identity and authority may need to be verified before action is taken.",
-					"Privacy questions may be sent to Medtech Healthcare at medtechcorps@gmail.com.",
+					"Privacy questions may be sent to Medtech Healthcare Sdn Bhd at medtechcorps@gmail.com.",
 				},
 			},
 		},
@@ -122,7 +123,7 @@ var legalFallbackDocuments = map[string]legalFallbackDocument{
 				ID:    "agreement",
 				Title: "Agreement and the service",
 				Paragraphs: []string{
-					"These Terms govern access to ReReply, a multi-tenant communication, CRM and automation platform provided by Medtech Healthcare. By creating an account, accepting an order or using ReReply, you accept these Terms for yourself and, where applicable, your organisation.",
+					"These Terms govern access to ReReply, a multi-tenant communication, CRM and automation platform provided by Medtech Healthcare Sdn Bhd. By creating an account, accepting an order or using ReReply, you accept these Terms for yourself and, where applicable, your organisation.",
 					"Available communications, CRM, workflow, campaign, booking, reporting and optional AI-assisted features depend on the subscription, organisation configuration, region and third-party provider eligibility. A signed order, reseller agreement or data-processing agreement controls where it expressly conflicts with these Terms.",
 				},
 			},
@@ -186,7 +187,7 @@ var legalFallbackDocuments = map[string]legalFallbackDocument{
 				Title: "Before you submit a request",
 				Paragraphs: []string{
 					"ReReply stores information for separate clinics, pharmacies, wellness providers and other Customer Organisations. If your request concerns a conversation, appointment or CRM record, contact the organisation you interacted with first because it normally controls and can identify that record.",
-					"You may also request deletion directly from ReReply. ReReply will route a verified request to the appropriate Customer Organisation or act on its lawful instructions. Never send a password, WhatsApp verification code, two-step verification PIN or full medical history.",
+					"You may also request deletion directly from Medtech Healthcare Sdn Bhd, the provider of ReReply. ReReply will route a verified request to the appropriate Customer Organisation or act on its lawful instructions. Never send a password, WhatsApp verification code, two-step verification PIN or full medical history.",
 				},
 			},
 			{

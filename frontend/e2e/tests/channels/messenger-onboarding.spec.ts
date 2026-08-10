@@ -54,6 +54,7 @@ async function mockMessengerWorkspace(
   let connectedAccount: Record<string, unknown> | null = null;
   let startCalls = 0;
   let manualCreateCalls = 0;
+  let pagePostCalls = 0;
   let exchangePayload: unknown = null;
   let selectPayload: unknown = null;
 
@@ -131,6 +132,36 @@ async function mockMessengerWorkspace(
       },
     });
   });
+  await page.route(
+    new RegExp(`/api/channel-accounts/${accountId}/meta-page-posts(?:\\?.*)?$`),
+    (route) => {
+      pagePostCalls += 1;
+      if (!connectedAccount || !options.reviewReady) {
+        return route.fulfill({
+          status: 404,
+          json: { message: "Messenger review Page preview not found" },
+        });
+      }
+      return route.fulfill({
+        json: {
+          data: {
+            page_id: ownedPage.page_id,
+            page_name: ownedPage.page_name,
+            posts: [
+              {
+                id: `${ownedPage.page_id}_post-1`,
+                message: "Klinik Insan reviewer-visible Page post",
+                created_time: "2026-08-11T09:30:00Z",
+                permalink_url:
+                  "https://www.facebook.com/klinikinsan/posts/review-1",
+              },
+            ],
+            fetched_at: "2026-08-11T09:31:00Z",
+          },
+        },
+      });
+    },
+  );
   await page.route(
     /\/api\/integrations\/meta\/messenger\/onboarding\/start$/,
     async (route) => {
@@ -233,6 +264,7 @@ async function mockMessengerWorkspace(
   return {
     startCalls: () => startCalls,
     manualCreateCalls: () => manualCreateCalls,
+    pagePostCalls: () => pagePostCalls,
     exchangePayload: () => exchangePayload,
     selectPayload: () => selectPayload,
   };
@@ -383,11 +415,11 @@ test("accepts an inbound-only staging review result without unlocking production
     .getByRole("complementary")
     .filter({ hasText: "Available adapters" });
   await expect(
-    connectionsSidebar.getByText(
-      "Staging review relay ready - inbound only | 1/5 checks",
-      { exact: true },
-    ),
+    connectionsSidebar.getByText("Staging App Review ready - inbound only", {
+      exact: true,
+    }),
   ).toBeVisible();
+  await expect(connectionsSidebar.getByText("1/5 checks")).toHaveCount(0);
   await expect(
     connectionsSidebar.getByRole("button", {
       name: "Test Klinik Insan Ampang is unavailable until the protected runtime relay registry recognizes this Facebook authorization.",
@@ -397,6 +429,59 @@ test("accepts an inbound-only staging review result without unlocking production
   await expect(
     connectionsSidebar.getByRole("button", { name: "Approve outbound" }),
   ).toHaveCount(0);
+  expect(calls.pagePostCalls()).toBe(0);
+
+  await connectionsSidebar
+    .getByRole("button", {
+      name: "Manage Klinik Insan Ampang",
+      exact: true,
+    })
+    .click();
+  await expect(page.getByTestId("meta-app-review-ready")).toContainText(
+    "Staging App Review ready — inbound only",
+  );
+  await expect(page.getByTestId("meta-app-review-ready")).toContainText(
+    "Outbound delivery, connection Test, automatic AI replies, and production registry recognition remain disabled",
+  );
+  const productionReadiness = page.getByTestId(
+    "meta-production-readiness-details",
+  );
+  const productionReadinessToggle = page.getByTestId(
+    "meta-production-readiness-toggle",
+  );
+  await expect(productionReadinessToggle).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+  await expect(productionReadiness).toBeHidden();
+  await productionReadinessToggle.click();
+  await expect(productionReadinessToggle).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
+  await expect(productionReadiness).toContainText(
+    "Five go-live checks before outbound",
+  );
+  await productionReadinessToggle.click();
+  await expect(productionReadiness).toBeHidden();
+  const pagePostPreview = page.getByTestId("meta-page-post-preview");
+  await expect(pagePostPreview).toContainText("pages_read_engagement");
+  await expect(pagePostPreview).toContainText(
+    "cannot publish, edit, or delete Page content",
+  );
+  expect(calls.pagePostCalls()).toBe(0);
+  await page.getByTestId("meta-page-post-preview-load").click();
+  await expect.poll(calls.pagePostCalls).toBe(1);
+  await expect(pagePostPreview).toContainText(
+    "Klinik Insan reviewer-visible Page post",
+  );
+  await expect(pagePostPreview).toContainText(`Page ID ${ownedPage.page_id}`);
+  await expect(
+    pagePostPreview.getByRole("link", { name: "View on Facebook" }),
+  ).toHaveAttribute(
+    "href",
+    "https://www.facebook.com/klinikinsan/posts/review-1",
+  );
   expect(calls.selectPayload()).toEqual({
     session_id: "session-1",
     business_id: ownedPage.business_id,

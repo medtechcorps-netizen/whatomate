@@ -1065,6 +1065,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// transaction-spanning Tenant adapter or the outer connection can deadlock
 	// while the phases wait for another pool connection.
 	g.POST("/api/channel-accounts/{id}/test", app.TestChannelAccount)
+	// The staging App Review Page-post preview likewise performs one short
+	// tenant read followed by a provider call. Its handler owns both phases and
+	// fails closed unless the path names the deployment-pinned review account.
+	g.GET("/api/channel-accounts/{id}/meta-page-posts", app.GetMetaMessengerReviewPagePosts)
 	g.GET("/api/conversations", tenant((*handlers.App).ListInboxConversations))
 	g.GET(
 		"/api/conversations/{id}/messages",

@@ -33,6 +33,7 @@ import {
 } from "lucide-vue-next";
 import PageHeader from "@/components/shared/PageHeader.vue";
 import MetaAccountReadinessPanel from "@/components/channels/MetaAccountReadinessPanel.vue";
+import MetaPagePostPreview from "@/components/channels/MetaPagePostPreview.vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -352,11 +353,12 @@ const attentionCount = computed(
       (account) =>
         ["degraded", "suspended"].includes(account.status) ||
         account.outbox_failed > 0 ||
-        (isMetaRelayAccount(account) &&
-          !metaAccountReadiness(account).preflightReady) ||
-        (account.provider === "relay" &&
-          account.status === "active" &&
-          account.config?.outbound_enabled !== true),
+        (!messengerReviewRelayReady(account) &&
+          ((isMetaRelayAccount(account) &&
+            !metaAccountReadiness(account).preflightReady) ||
+            (account.provider === "relay" &&
+              account.status === "active" &&
+              account.config?.outbound_enabled !== true))),
     ).length,
 );
 
@@ -433,7 +435,7 @@ function accountProofNeedsReview(account: ChannelAccount) {
 
 function accountStatusLabel(account: ChannelAccount) {
   if (messengerReviewRelayReady(account)) {
-    return "Staging review relay ready - inbound only";
+    return "Staging App Review ready - inbound only";
   }
   if (messengerAwaitingRelayRegistry(account)) return "Awaiting relay registry";
   if (accountReadyForOutbound(account)) {
@@ -2120,14 +2122,20 @@ onBeforeUnmount(() => {
               <span
                 class="mt-0.5 block text-[10px]"
                 :class="
-                  accountReadyForOutbound(account) &&
-                  !accountProofNeedsReview(account)
+                  messengerReviewRelayReady(account) ||
+                  (accountReadyForOutbound(account) &&
+                    !accountProofNeedsReview(account))
                     ? 'text-emerald-300 light:text-emerald-700'
                     : 'text-amber-300 light:text-amber-700'
                 "
               >
                 {{ accountStatusLabel(account) }}
-                <span v-if="isMetaRelayAccount(account)">
+                <span
+                  v-if="
+                    isMetaRelayAccount(account) &&
+                    !messengerReviewRelayReady(account)
+                  "
+                >
                   | {{ metaAccountReadiness(account).completedCount }}/{{
                     metaAccountReadiness(account).requiredCount
                   }}
@@ -2198,7 +2206,9 @@ onBeforeUnmount(() => {
           </RouterLink>
           <Button
             v-else-if="
-              (canManageAccounts || canDeleteAccounts) &&
+              (canManageAccounts ||
+                canDeleteAccounts ||
+                messengerReviewRelayReady(account)) &&
               account.provider !== 'meta_legacy'
             "
             variant="outline"
@@ -2271,14 +2281,20 @@ onBeforeUnmount(() => {
               <p
                 class="mt-1 text-[9px]"
                 :class="
-                  accountReadyForOutbound(account) &&
-                  !accountProofNeedsReview(account)
+                  messengerReviewRelayReady(account) ||
+                  (accountReadyForOutbound(account) &&
+                    !accountProofNeedsReview(account))
                     ? 'text-emerald-300 light:text-emerald-700'
                     : 'text-amber-300 light:text-amber-700'
                 "
               >
                 {{ accountStatusLabel(account) }}
-                <span v-if="isMetaRelayAccount(account)">
+                <span
+                  v-if="
+                    isMetaRelayAccount(account) &&
+                    !messengerReviewRelayReady(account)
+                  "
+                >
                   | {{ metaAccountReadiness(account).completedCount }}/{{
                     metaAccountReadiness(account).requiredCount
                   }}
@@ -2352,7 +2368,9 @@ onBeforeUnmount(() => {
             </RouterLink>
             <button
               v-else-if="
-                (canManageAccounts || canDeleteAccounts) &&
+                (canManageAccounts ||
+                  canDeleteAccounts ||
+                  messengerReviewRelayReady(account)) &&
                 account.provider !== 'meta_legacy'
               "
               type="button"
@@ -2881,7 +2899,14 @@ onBeforeUnmount(() => {
             >
               {{ settingsAccount.name }}
             </h2>
-            <p class="mt-1 text-xs text-white/40 light:text-gray-500">
+            <p
+              v-if="messengerReviewRelayReady(settingsAccount)"
+              class="mt-1 text-xs text-white/40 light:text-gray-500"
+            >
+              Review the exact inbound-only staging connection and its
+              read-only Meta permission evidence. Outbound and AI remain off.
+            </p>
+            <p v-else class="mt-1 text-xs text-white/40 light:text-gray-500">
               Repair the relay, rotate its outbound signing credential, or stop
               delivery.
             </p>
@@ -2903,6 +2928,11 @@ onBeforeUnmount(() => {
           @update:identity-confirmation="
             accountSettingsDraft.identity_confirmation = $event
           "
+        />
+
+        <MetaPagePostPreview
+          v-if="messengerReviewRelayReady(settingsAccount)"
+          :account="settingsAccount"
         />
 
         <div v-if="canManageAccounts" class="mt-5 space-y-4">
