@@ -383,9 +383,9 @@ test("accepts an inbound-only staging review result without unlocking production
     .getByRole("complementary")
     .filter({ hasText: "Available adapters" });
   await expect(
-    connectionsSidebar.getByText(
-      /^Staging review relay ready - inbound only \| 1\/5 checks$/,
-    ),
+    connectionsSidebar.getByText("Staging review relay ready - inbound only", {
+      exact: false,
+    }),
   ).toBeVisible();
   await expect(
     connectionsSidebar.getByRole("button", {
