@@ -372,7 +372,7 @@ func normalizeMetaMessengerReviewPagePosts(
 	posts []metaMessengerReviewPagePost,
 ) ([]metaMessengerReviewPagePost, error) {
 	if len(posts) > metaMessengerReviewPagePostLimit {
-		return nil, errors.New("Meta returned too many review Page posts")
+		return nil, errors.New("meta returned too many review Page posts")
 	}
 	normalized := make([]metaMessengerReviewPagePost, 0, len(posts))
 	for _, post := range posts {
@@ -383,7 +383,7 @@ func normalizeMetaMessengerReviewPagePosts(
 		if post.ID == "" || len(post.ID) > 512 || len(post.Message) > 1<<20 ||
 			!validMetaMessengerReviewPostTime(post.CreatedTime) ||
 			!validMetaMessengerReviewPostPermalink(post.PermalinkURL) {
-			return nil, errors.New("Meta returned a malformed review Page post")
+			return nil, errors.New("meta returned a malformed review Page post")
 		}
 		normalized = append(normalized, post)
 	}
