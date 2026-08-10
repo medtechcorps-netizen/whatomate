@@ -114,20 +114,25 @@ type:
 - `SYSTEM_USER` (the Business Integration System User mode used by the
   provider-owned FLfB configuration): request
   `/me?fields=id,client_business_id`, treat that
-  single `client_business_id` as the canonical Business, and discover only its
-  `/owned_pages` and `/client_pages`.
+  single `client_business_id` as the canonical Business, read actual Page
+  assignment, tasks, and Page tokens from
+  `/{system-user-id}/assigned_pages`, and intersect those results with the
+  canonical Business's `/owned_pages` and `/client_pages`.
 
 The BISU branch never calls `/me/businesses` and never lets a client Business
 or a browser value substitute for `client_business_id`.
 
-A Page is selectable only when the authoritative owned-Page result supplies a
-Page access token and proves the `MESSAGING` task. In the `USER` branch its
-numeric ID must also be present in `/me/accounts`; the `SYSTEM_USER` branch
-uses the exact `client_business_id/owned_pages` result. A client-access-only,
-task-ineligible, tokenless, granular-scope-restricted, or otherwise unverified
-Page can be displayed for diagnosis but is never selectable. Page names,
-usernames, profile URLs, and organization display names are not ownership
-evidence.
+A Page is selectable only when the same numeric Page ID has both current
+authority and current ownership. In the `USER` branch, `/me/accounts` supplies
+the actual tasks and Page token and the canonical Business's `/owned_pages`
+supplies ownership. In the `SYSTEM_USER` branch,
+`/{system-user-id}/assigned_pages` supplies the actual assigned tasks and Page
+token and `/{client_business_id}/owned_pages` supplies ownership. Meta's
+`permitted_tasks` values describe assignable capabilities and never satisfy
+authorization. A client-access-only, unassigned, task-ineligible, tokenless,
+granular-scope-restricted, or otherwise unverified Page can be displayed for
+diagnosis but is never selectable. Page names, usernames, profile URLs, and
+organization display names are not ownership evidence.
 
 The user confirms the exact platform user, ReReply workspace, Meta Business
 ID, and Page ID. The browser then calls:

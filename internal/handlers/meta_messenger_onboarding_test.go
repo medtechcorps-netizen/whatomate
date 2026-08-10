@@ -159,7 +159,8 @@ func TestMetaMessengerDiscoveryIntersectsAccessWithOwnedPages(t *testing.T) {
 				{"id":"700000000000004","name":"No Messaging Task"}
 			]}`))
 		case "/v25.0/200000000000001/client_pages":
-			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000002","name":"Client Clinic","permitted_tasks":["MESSAGING"]}]}`))
+			assert.Equal(t, "id,name", request.URL.Query().Get("fields"))
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000002","name":"Client Clinic","permitted_tasks":["PROFILE_PLUS_MESSAGING"]}]}`))
 		default:
 			http.Error(writer, "unexpected", http.StatusNotFound)
 		}
@@ -202,6 +203,7 @@ func TestMetaMessengerDiscoveryIntersectsAccessWithOwnedPages(t *testing.T) {
 	assert.False(t, client.Selectable)
 	assert.Equal(t, metaMessengerOwnershipClient, client.Ownership)
 	assert.Equal(t, metaMessengerDisabledClient, client.DisabledReason)
+	assert.Equal(t, []string{"MESSAGING"}, client.Tasks)
 	assert.Empty(t, client.EncryptedPageToken)
 	unverified := byID["700000000000003"]
 	assert.False(t, unverified.Selectable)
@@ -221,14 +223,25 @@ func TestMetaMessengerSystemUserDiscoveryPinsClientBusinessWithoutUserEdges(t *t
 		case "/v25.0/me":
 			assert.Equal(t, "id,client_business_id", request.URL.Query().Get("fields"))
 			_, _ = writer.Write([]byte(`{"id":"900000000000001","client_business_id":"200000000000001"}`))
-		case "/v25.0/200000000000001/owned_pages":
-			assert.Equal(t, "id,name,tasks,permitted_tasks,access_token", request.URL.Query().Get("fields"))
+		case "/v25.0/900000000000001/assigned_pages":
+			assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
 			_, _ = writer.Write([]byte(`{"data":[
-				{"id":"700000000000001","name":"Owned Clinic","permitted_tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"system-page-token"},
-				{"id":"700000000000004","name":"Limited Clinic","tasks":["CREATE_CONTENT"],"access_token":"limited-token"}
+				{"id":"700000000000001","name":"Owned Clinic","tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"system-page-token"},
+				{"id":"700000000000002","name":"Assigned Client Clinic","tasks":["MESSAGING"],"access_token":"client-page-token"},
+				{"id":"700000000000004","name":"Limited Clinic","tasks":["CREATE_CONTENT"],"permitted_tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"limited-token"},
+				{"id":"700000000000005","name":"Unverified Assigned Clinic","tasks":["MESSAGING"],"access_token":"unverified-token"},
+				{"id":"700000000000006","name":"Tokenless Assigned Clinic","tasks":["MESSAGING"]}
+			]}`))
+		case "/v25.0/200000000000001/owned_pages":
+			assert.Equal(t, "id,name", request.URL.Query().Get("fields"))
+			_, _ = writer.Write([]byte(`{"data":[
+				{"id":"700000000000001","name":"Owned Clinic"},
+				{"id":"700000000000004","name":"Limited Clinic","permitted_tasks":["PROFILE_PLUS_MESSAGING"]},
+				{"id":"700000000000006","name":"Tokenless Assigned Clinic"},
+				{"id":"700000000000007","name":"Unassigned Owned Clinic"}
 			]}`))
 		case "/v25.0/200000000000001/client_pages":
-			assert.Equal(t, "id,name,tasks,permitted_tasks", request.URL.Query().Get("fields"))
+			assert.Equal(t, "id,name", request.URL.Query().Get("fields"))
 			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000002","name":"Client Clinic","permitted_tasks":["MESSAGING"]}]}`))
 		default:
 			t.Fatalf("system-user discovery unexpectedly requested %s", request.URL.Path)
@@ -256,7 +269,7 @@ func TestMetaMessengerSystemUserDiscoveryPinsClientBusinessWithoutUserEdges(t *t
 		ID:   metaMessengerTestBusinessID,
 		Name: "Business Portfolio " + metaMessengerTestBusinessID,
 	}}, businesses)
-	require.Len(t, pages, 3)
+	require.Len(t, pages, 5)
 	byID := make(map[string]metaMessengerStoredPage, len(pages))
 	for _, page := range pages {
 		byID[page.PageID] = page
@@ -264,7 +277,19 @@ func TestMetaMessengerSystemUserDiscoveryPinsClientBusinessWithoutUserEdges(t *t
 	assert.True(t, byID[metaMessengerTestPageID].Selectable)
 	assert.True(t, appcrypto.IsEncrypted(byID[metaMessengerTestPageID].EncryptedPageToken))
 	assert.Equal(t, metaMessengerDisabledTask, byID["700000000000004"].DisabledReason)
+	assert.False(t, byID["700000000000004"].Selectable)
+	assert.Empty(t, byID["700000000000004"].EncryptedPageToken)
 	assert.Equal(t, metaMessengerDisabledClient, byID["700000000000002"].DisabledReason)
+	assert.Equal(t, []string{"MESSAGING"}, byID["700000000000002"].Tasks)
+	assert.False(t, byID["700000000000002"].Selectable)
+	assert.Empty(t, byID["700000000000002"].EncryptedPageToken)
+	assert.NotContains(t, byID, "700000000000005")
+	assert.Equal(t, metaMessengerDisabledTokenMissing, byID["700000000000006"].DisabledReason)
+	assert.False(t, byID["700000000000006"].Selectable)
+	assert.Empty(t, byID["700000000000006"].EncryptedPageToken)
+	assert.Equal(t, metaMessengerDisabledAssignment, byID["700000000000007"].DisabledReason)
+	assert.False(t, byID["700000000000007"].Selectable)
+	assert.Empty(t, byID["700000000000007"].EncryptedPageToken)
 }
 
 func TestMetaMessengerHasMessagingTaskAcceptsOnlyKnownMessagingTasks(t *testing.T) {
@@ -410,9 +435,16 @@ func TestMetaMessengerSelectionFreshlyRevalidatesAccessAndOwnedPages(t *testing.
 func TestMetaMessengerSystemUserSelectionRevalidatesDirectOwnedPage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		assert.Equal(t, "/v25.0/"+metaMessengerTestBusinessID+"/owned_pages", request.URL.Path)
-		assert.Equal(t, "id,name,tasks,permitted_tasks,access_token", request.URL.Query().Get("fields"))
-		_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"BISU Clinic","permitted_tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"fresh-system-page-token"}]}`))
+		switch request.URL.Path {
+		case "/v25.0/" + metaMessengerTestUserID + "/assigned_pages":
+			assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned BISU Clinic","tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"fresh-system-page-token"}]}`))
+		case "/v25.0/" + metaMessengerTestBusinessID + "/owned_pages":
+			assert.Equal(t, "id,name", request.URL.Query().Get("fields"))
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Owned BISU Clinic"}]}`))
+		default:
+			t.Fatalf("unexpected system-user revalidation path %s", request.URL.Path)
+		}
 	}))
 	defer server.Close()
 	app := newMetaMessengerGraphTestApp(t, server)
@@ -430,15 +462,122 @@ func TestMetaMessengerSystemUserSelectionRevalidatesDirectOwnedPage(t *testing.T
 		"system-user-token",
 		metaMessengerTokenInspection{
 			Type:      metaMessengerTokenKindSystemUser,
+			UserID:    metaMessengerTestUserID,
 			CheckedAt: time.Now().UTC(),
 		},
 		selected,
 	)
 	require.NoError(t, err)
+	assert.Equal(t, "Owned BISU Clinic", fresh.PageName)
 	assert.Equal(t, []string{"PROFILE_PLUS_MESSAGING"}, fresh.Tasks)
 	plaintext, decryptErr := appcrypto.Decrypt(fresh.EncryptedPageToken, metaMessengerTestEncryptionKey)
 	require.NoError(t, decryptErr)
 	assert.Equal(t, "fresh-system-page-token", plaintext)
+}
+
+func TestMetaMessengerSystemUserSelectionRequiresCurrentAssignmentOwnershipAndToken(t *testing.T) {
+	testCases := []struct {
+		name                 string
+		assignedPages        string
+		ownedPages           string
+		granularScopeTargets map[string]map[string]struct{}
+	}{
+		{
+			name:          "assignment removed",
+			assignedPages: `{"data":[]}`,
+			ownedPages:    `{"data":[{"id":"700000000000001","name":"Owned BISU Clinic"}]}`,
+		},
+		{
+			name:          "ownership removed",
+			assignedPages: `{"data":[{"id":"700000000000001","name":"Assigned BISU Clinic","tasks":["MESSAGING"],"access_token":"fresh-system-page-token"}]}`,
+			ownedPages:    `{"data":[]}`,
+		},
+		{
+			name:          "assigned token missing",
+			assignedPages: `{"data":[{"id":"700000000000001","name":"Assigned BISU Clinic","tasks":["MESSAGING"]}]}`,
+			ownedPages:    `{"data":[{"id":"700000000000001","name":"Owned BISU Clinic"}]}`,
+		},
+		{
+			name:          "granular Page target removed",
+			assignedPages: `{"data":[{"id":"700000000000001","name":"Assigned BISU Clinic","tasks":["MESSAGING"],"access_token":"fresh-system-page-token"}]}`,
+			ownedPages:    `{"data":[{"id":"700000000000001","name":"Owned BISU Clinic"}]}`,
+			granularScopeTargets: map[string]map[string]struct{}{
+				"pages_messaging": {"700000000000099": {}},
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				switch request.URL.Path {
+				case "/v25.0/" + metaMessengerTestUserID + "/assigned_pages":
+					_, _ = writer.Write([]byte(testCase.assignedPages))
+				case "/v25.0/" + metaMessengerTestBusinessID + "/owned_pages":
+					_, _ = writer.Write([]byte(testCase.ownedPages))
+				default:
+					t.Fatalf("unexpected system-user revalidation path %s", request.URL.Path)
+				}
+			}))
+			defer server.Close()
+			app := newMetaMessengerGraphTestApp(t, server)
+			selected := metaMessengerStoredPage{
+				metaMessengerPageSummary: metaMessengerPageSummary{
+					BusinessID: metaMessengerTestBusinessID,
+					PageID:     metaMessengerTestPageID,
+					Ownership:  metaMessengerOwnershipOwned,
+					Selectable: true,
+				},
+			}
+
+			_, err := app.revalidateMetaMessengerOwnedPage(
+				context.Background(),
+				"system-user-token",
+				metaMessengerTokenInspection{
+					Type:                 metaMessengerTokenKindSystemUser,
+					UserID:               metaMessengerTestUserID,
+					GranularScopeTargets: testCase.granularScopeTargets,
+				},
+				selected,
+			)
+			assert.ErrorIs(t, err, errMetaMessengerSelectionInvalid)
+		})
+	}
+}
+
+func TestMetaMessengerSystemUserSelectionRejectsAssignableButUngrantedMessagingTask(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v25.0/" + metaMessengerTestUserID + "/assigned_pages":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned BISU Clinic","tasks":["CREATE_CONTENT"],"permitted_tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"fresh-system-page-token"}]}`))
+		case "/v25.0/" + metaMessengerTestBusinessID + "/owned_pages":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Owned BISU Clinic","permitted_tasks":["PROFILE_PLUS_MESSAGING"]}]}`))
+		default:
+			t.Fatalf("unexpected system-user revalidation path %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	app := newMetaMessengerGraphTestApp(t, server)
+	selected := metaMessengerStoredPage{
+		metaMessengerPageSummary: metaMessengerPageSummary{
+			BusinessID: metaMessengerTestBusinessID,
+			PageID:     metaMessengerTestPageID,
+			Ownership:  metaMessengerOwnershipOwned,
+			Selectable: true,
+		},
+	}
+
+	_, err := app.revalidateMetaMessengerOwnedPage(
+		context.Background(),
+		"system-user-token",
+		metaMessengerTokenInspection{
+			Type:   metaMessengerTokenKindSystemUser,
+			UserID: metaMessengerTestUserID,
+		},
+		selected,
+	)
+	assert.ErrorIs(t, err, errMetaMessengerSelectionInvalid)
 }
 
 func TestMetaMessengerSubscriptionRequiresExactConfiguredAppAndMessages(t *testing.T) {

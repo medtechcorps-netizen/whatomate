@@ -30,6 +30,7 @@ const (
 	metaMessengerOwnershipUnverified   = "unverified"
 	metaMessengerDisabledClient        = "client_access_only"
 	metaMessengerDisabledUnverified    = "ownership_not_verified"
+	metaMessengerDisabledAssignment    = "system_user_assignment_missing"
 	metaMessengerDisabledTokenMissing  = "page_token_missing"
 	metaMessengerDisabledTarget        = "permission_target_mismatch"
 	metaMessengerDisabledTask          = "messaging_task_missing"
@@ -134,11 +135,8 @@ type metaMessengerGraphBusiness struct {
 }
 
 type metaMessengerGraphBusinessPage struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Tasks          []string `json:"tasks"`
-	PermittedTasks []string `json:"permitted_tasks"`
-	AccessToken    string   `json:"access_token"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type metaMessengerGraphPaging struct {
@@ -419,7 +417,7 @@ func (a *App) discoverMetaMessengerInventory(
 			a,
 			ctx,
 			url.PathEscape(business.ID)+"/client_pages",
-			url.Values{"fields": {"id,name,permitted_tasks"}},
+			url.Values{"fields": {"id,name"}},
 			userToken,
 			metaMessengerGraphMaxPageAssets,
 		)
@@ -485,7 +483,7 @@ func (a *App) discoverMetaMessengerInventory(
 					Ownership:      metaMessengerOwnershipClient,
 					Selectable:     false,
 					DisabledReason: metaMessengerDisabledClient,
-					Tasks:          normalizedMetaMessengerValues(append(access.Tasks, page.PermittedTasks...)),
+					Tasks:          access.Tasks,
 				},
 			})
 		}
@@ -577,11 +575,22 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 	platform metaMessengerPlatformUser,
 ) ([]metaMessengerBusinessSummary, []metaMessengerStoredPage, error) {
 	businessID := platform.ClientBusinessID
+	assignedPages, err := fetchMetaMessengerGraphList[metaMessengerGraphPageAccess](
+		a,
+		ctx,
+		url.PathEscape(platform.UserID)+"/assigned_pages",
+		url.Values{"fields": {"id,name,tasks,access_token"}},
+		accessToken,
+		metaMessengerGraphMaxPageAssets,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
 	ownedPages, err := fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
 		a,
 		ctx,
 		url.PathEscape(businessID)+"/owned_pages",
-		url.Values{"fields": {"id,name,tasks,permitted_tasks,access_token"}},
+		url.Values{"fields": {"id,name"}},
 		accessToken,
 		metaMessengerGraphMaxPageAssets,
 	)
@@ -592,15 +601,30 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		a,
 		ctx,
 		url.PathEscape(businessID)+"/client_pages",
-		url.Values{"fields": {"id,name,tasks,permitted_tasks"}},
+		url.Values{"fields": {"id,name"}},
 		accessToken,
 		metaMessengerGraphMaxPageAssets,
 	)
 	if err != nil {
 		return nil, nil, err
 	}
+	// assigned_pages is the authority edge for this BISU: its tasks are the
+	// roles actually granted to the system user. Business Page
+	// permitted_tasks describe assignable capabilities and must never satisfy
+	// the Messenger authorization check.
 	businessName := "Business Portfolio " + businessID
 	pages := make([]metaMessengerStoredPage, 0, len(ownedPages)+len(clientPages))
+	assignedByPage := make(map[string]metaMessengerGraphPageAccess, len(assignedPages))
+	for _, page := range assignedPages {
+		page.ID = strings.TrimSpace(page.ID)
+		if !validCanonicalMetaID(page.ID) {
+			continue
+		}
+		page.Name = strings.TrimSpace(page.Name)
+		page.Tasks = normalizedMetaMessengerValues(page.Tasks)
+		page.AccessToken = strings.TrimSpace(page.AccessToken)
+		assignedByPage[page.ID] = page
+	}
 	ownedIDs := make(map[string]struct{}, len(ownedPages))
 	for _, page := range ownedPages {
 		page.ID = strings.TrimSpace(page.ID)
@@ -608,21 +632,23 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 			continue
 		}
 		ownedIDs[page.ID] = struct{}{}
-		tasks := normalizedMetaMessengerValues(append(page.Tasks, page.PermittedTasks...))
-		page.AccessToken = strings.TrimSpace(page.AccessToken)
+		access, assigned := assignedByPage[page.ID]
 		candidate := metaMessengerPageSummary{
 			BusinessID:   businessID,
 			BusinessName: businessName,
 			PageID:       page.ID,
-			PageName:     strings.TrimSpace(page.Name),
+			PageName:     firstNonemptyMetaMessengerValue(strings.TrimSpace(page.Name), access.Name),
 			Ownership:    metaMessengerOwnershipOwned,
 			Selectable:   true,
-			Tasks:        tasks,
+			Tasks:        access.Tasks,
 		}
-		if page.AccessToken == "" {
+		if !assigned {
+			candidate.Selectable = false
+			candidate.DisabledReason = metaMessengerDisabledAssignment
+		} else if access.AccessToken == "" {
 			candidate.Selectable = false
 			candidate.DisabledReason = metaMessengerDisabledTokenMissing
-		} else if !metaMessengerHasMessagingTask(tasks) {
+		} else if !metaMessengerHasMessagingTask(access.Tasks) {
 			candidate.Selectable = false
 			candidate.DisabledReason = metaMessengerDisabledTask
 		} else if !metaMessengerCandidateTargetsAllowed(inspection, businessID, page.ID) {
@@ -631,7 +657,7 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		}
 		encryptedToken := ""
 		if candidate.Selectable {
-			encryptedToken, err = appcrypto.Encrypt(page.AccessToken, a.integrationEncryptionKey())
+			encryptedToken, err = appcrypto.Encrypt(access.AccessToken, a.integrationEncryptionKey())
 			if err != nil || !appcrypto.IsEncrypted(encryptedToken) {
 				return nil, nil, errors.New("meta Page token could not be protected")
 			}
@@ -650,16 +676,17 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		if _, owned := ownedIDs[page.ID]; owned {
 			continue
 		}
+		access := assignedByPage[page.ID]
 		pages = append(pages, metaMessengerStoredPage{
 			metaMessengerPageSummary: metaMessengerPageSummary{
 				BusinessID:     businessID,
 				BusinessName:   businessName,
 				PageID:         page.ID,
-				PageName:       strings.TrimSpace(page.Name),
+				PageName:       firstNonemptyMetaMessengerValue(strings.TrimSpace(page.Name), access.Name),
 				Ownership:      metaMessengerOwnershipClient,
 				Selectable:     false,
 				DisabledReason: metaMessengerDisabledClient,
-				Tasks:          normalizedMetaMessengerValues(append(page.Tasks, page.PermittedTasks...)),
+				Tasks:          access.Tasks,
 			},
 		})
 	}
@@ -724,7 +751,8 @@ func metaMessengerCandidateTargetsAllowed(
 // point of selection. The earlier inventory is only a UI snapshot: it cannot
 // authorize persistence after the user's Page task or Business ownership has
 // changed. The Page token used below is also replaced with the fresh token
-// returned by this exact /me/accounts intersection.
+// returned by the token holder's actual Page-authority edge: /me/accounts for
+// a USER or /{system-user-id}/assigned_pages for a SYSTEM_USER.
 func (a *App) revalidateMetaMessengerOwnedPage(
 	ctx context.Context,
 	userToken string,
@@ -784,11 +812,33 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
 		}
 	case metaMessengerTokenKindSystemUser:
+		pageAccess, err := fetchMetaMessengerGraphList[metaMessengerGraphPageAccess](
+			a,
+			ctx,
+			url.PathEscape(inspection.UserID)+"/assigned_pages",
+			url.Values{"fields": {"id,name,tasks,access_token"}},
+			userToken,
+			metaMessengerGraphMaxPageAssets,
+		)
+		if err != nil {
+			return metaMessengerStoredPage{}, err
+		}
+		foundAccess := false
+		for index := range pageAccess {
+			if strings.TrimSpace(pageAccess[index].ID) == selected.PageID {
+				accessible = pageAccess[index]
+				foundAccess = true
+				break
+			}
+		}
+		if !foundAccess {
+			return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+		}
 		ownedPages, err := fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
 			a,
 			ctx,
 			url.PathEscape(selected.BusinessID)+"/owned_pages",
-			url.Values{"fields": {"id,name,tasks,permitted_tasks,access_token"}},
+			url.Values{"fields": {"id,name"}},
 			userToken,
 			metaMessengerGraphMaxPageAssets,
 		)
@@ -798,13 +848,7 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 		foundOwned := false
 		for _, page := range ownedPages {
 			if strings.TrimSpace(page.ID) == selected.PageID {
-				accessible = metaMessengerGraphPageAccess{
-					ID:          strings.TrimSpace(page.ID),
-					Name:        strings.TrimSpace(page.Name),
-					Tasks:       normalizedMetaMessengerValues(append(page.Tasks, page.PermittedTasks...)),
-					AccessToken: strings.TrimSpace(page.AccessToken),
-				}
-				ownedName = accessible.Name
+				ownedName = strings.TrimSpace(page.Name)
 				foundOwned = true
 				break
 			}
