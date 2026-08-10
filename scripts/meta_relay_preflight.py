@@ -43,6 +43,15 @@ REREPLY_RELAY_BASE_ENV = "WHATOMATE_META_RELAY__BASE_URL"
 REREPLY_EXPECTED_ACCOUNTS_ENV = "WHATOMATE_META_RELAY__EXPECTED_ACCOUNTS_JSON"
 RELAY_PROVIDER_PROOF_SECRET_ENV = "META_RELAY_REREPLY_PROVIDER_PROOF_SECRET"
 REREPLY_PROVIDER_PROOF_SECRET_ENV = "WHATOMATE_META_RELAY__PROVIDER_PROOF_SECRET"
+REVIEW_RELAY_WEB_ENV_PREFIX = "WHATOMATE_META_MESSENGER_REVIEW_RELAY__"
+REVIEW_RELAY_ENV_PREFIX = "META_RELAY_REVIEW_"
+RELAY_RUNTIME_MODE_ENV = "META_RELAY_RUNTIME_MODE"
+# Reject the abandoned alias too, so an older candidate spec cannot silently
+# retain review behavior after the runtime moved to RELAY_RUNTIME_MODE_ENV.
+RELAY_MODE_ENV = "META_RELAY_MODE"
+RELAY_MODE_ENVS = frozenset({RELAY_RUNTIME_MODE_ENV, RELAY_MODE_ENV})
+STAGING_MESSENGER_REVIEW_MODE = "staging_messenger_review"
+RUNTIME_COMPONENT_COLLECTIONS = ("services", "workers", "jobs")
 RELAY_FIXED_SECRET_ENVS = frozenset(
     {
         "META_RELAY_REDIS_URL",
@@ -234,6 +243,57 @@ def deployed_environment(spec: dict[str, Any], service_name: str) -> dict[str, s
             )
         deployed[key] = value if isinstance(value, str) else ""
     return deployed
+
+
+def production_review_runtime_errors(spec: dict[str, Any]) -> list[str]:
+    """Reject staging-only Messenger review wiring in production specs.
+
+    Review configuration is forbidden by key presence, not by its value. This
+    prevents an apparently inert ``ENABLED=false`` declaration from carrying
+    staging-only broker or credential-provisioning wiring into production.
+    The normal Meta App Review governance variables do not use either reserved
+    prefix and remain valid production evidence.
+    """
+
+    errors: list[str] = []
+    for collection_name in RUNTIME_COMPONENT_COLLECTIONS:
+        components = spec.get(collection_name)
+        if not isinstance(components, list):
+            continue
+        for component_index, component in enumerate(components):
+            if not isinstance(component, dict):
+                continue
+            component_name = component.get("name")
+            if not isinstance(component_name, str) or not component_name:
+                component_name = f"{collection_name}[{component_index}]"
+            envs = component.get("envs")
+            if not isinstance(envs, list):
+                continue
+            for item in envs:
+                if not isinstance(item, dict):
+                    continue
+                key = item.get("key")
+                if not isinstance(key, str):
+                    continue
+                if key.startswith(REVIEW_RELAY_WEB_ENV_PREFIX) or key.startswith(
+                    REVIEW_RELAY_ENV_PREFIX
+                ):
+                    errors.append(
+                        f"production {collection_name[:-1]} {component_name!r} "
+                        f"must not declare staging-only Messenger review environment variable {key}"
+                    )
+                    continue
+                value = item.get("value")
+                if (
+                    key in RELAY_MODE_ENVS
+                    and isinstance(value, str)
+                    and value.strip().lower() == STAGING_MESSENGER_REVIEW_MODE
+                ):
+                    errors.append(
+                        f"production {collection_name[:-1]} {component_name!r} "
+                        f"must not use {key}={STAGING_MESSENGER_REVIEW_MODE}"
+                    )
+    return errors
 
 
 def service_secret_presence_errors(
@@ -1070,6 +1130,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate deployed mappings without performing signed account-binding probes",
     )
+    parser.add_argument(
+        "--reject-review-runtime-only",
+        action="store_true",
+        help="Only reject staging review runtime wiring; does not require a production relay inventory",
+    )
     return parser
 
 
@@ -1082,14 +1147,31 @@ def main(argv: list[str] | None = None) -> int:
             with open(args.app_spec, encoding="utf-8") as stream:
                 spec = load_app_spec(stream)
 
+        review_runtime_failures = production_review_runtime_errors(spec)
+        if args.reject_review_runtime_only:
+            if review_runtime_failures:
+                for failure in review_runtime_failures:
+                    print(f"[FAIL] {failure}", file=sys.stderr)
+                print(
+                    "Production staging-review runtime check failed with "
+                    f"{len(review_runtime_failures)} issue(s).",
+                    file=sys.stderr,
+                )
+                return 1
+            print("Production staging-review runtime check passed.")
+            return 0
+
         expected_raw = load_json_environment(args.expected_env, dict)
         expected_apps, expected = normalize_expected_inventory(expected_raw)
         environment = deployed_environment(spec, args.service)
         actual = normalize_accounts(
             deployed_accounts(environment, args.service), expected=False
         )
-        failures = provider_proof_secret_presence_errors(
-            spec, args.service, args.rereply_service
+        failures = review_runtime_failures
+        failures.extend(
+            provider_proof_secret_presence_errors(
+                spec, args.service, args.rereply_service
+            )
         )
         failures.extend(relay_runtime_secret_presence_errors(spec, args.service, actual))
         failures.extend(compare_app_bindings(environment, expected_apps))

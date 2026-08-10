@@ -48,6 +48,9 @@ func enqueueChannelAIReply(
 		account.Channel != models.ChannelMessenger {
 		return nil
 	}
+	if channel.IsStagingMessengerReviewMarked(account) {
+		return nil
+	}
 	if account.Provider != channel.RelayProvider ||
 		account.Status != models.ChannelAccountStatusActive ||
 		!boolConfigValue(account.Config, "outbound_enabled") ||

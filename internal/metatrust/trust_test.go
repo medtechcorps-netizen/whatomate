@@ -181,6 +181,36 @@ func TestValidateOutboundRequiresExactlyOneRelayWebhookAndAllowsOAuth(t *testing
 	})
 }
 
+func TestValidateOutboundRejectsStagingReviewMarkerEvenIfProductionEvidenceIsCorruptlyPresent(t *testing.T) {
+	account := trustedTestAccount()
+	checkedAt := time.Now().UTC().Add(-time.Minute)
+	inboundAt := checkedAt.Add(time.Second)
+	account.Status = models.ChannelAccountStatusActive
+	account.Config["identity_confirmed_id"] = account.ExternalAccountID
+	account.Config["outbound_enabled"] = true
+	account.Metadata = models.JSONB{
+		"management_mode":                       "meta_messenger_oauth",
+		"review_relay_mode":                     "staging_messenger_review_v1",
+		"review_generation":                     uuid.NewString(),
+		"meta_business_id":                      trustBusinessID,
+		"ownership_evidence_version":            "owned_pages_v1",
+		"ownership_verified_at":                 checkedAt.Format(time.RFC3339Nano),
+		"meta_app_id":                           trustMessengerAppID,
+		"meta_app_owner_business_id":            trustMessengerAppOwner,
+		channelapi.MetaProviderProofMetadataKey: channelapi.MetaProviderProofVersion,
+	}
+	account.LastHealthCheckAt = &checkedAt
+	account.LastInboundAt = &inboundAt
+	account.Credentials = []models.ChannelCredential{{
+		Kind: models.ChannelCredentialKindWebhook, Status: models.ChannelCredentialStatusActive,
+	}}
+
+	_, err := ValidateOutbound(trustedTestSettings(), "production", account, time.Now().UTC())
+	if err == nil || !strings.Contains(err.Error(), "inbound-only") {
+		t.Fatalf("expected staging review egress rejection, got %v", err)
+	}
+}
+
 func trustedTestAccount() *models.ChannelAccount {
 	return &models.ChannelAccount{
 		BaseModel:         models.BaseModel{ID: uuid.MustParse(trustAccountID)},

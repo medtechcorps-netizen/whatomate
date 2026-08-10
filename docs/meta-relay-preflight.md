@@ -8,6 +8,12 @@ production deployment therefore runs `scripts/meta_relay_preflight.py` twice:
 protected-main deployment, then signed live binding probes after service
 readiness.
 
+The temporary [staging-only Messenger review relay](meta-messenger-review-relay.md)
+is outside this production transport. Production preflight rejects every
+reserved review-runtime key by presence, including an apparently disabled or
+empty declaration; remove the staging wiring instead of carrying it into a
+production spec.
+
 ## Protected source and runtime copies
 
 The gate compares the protected inventory with every deployment-held copy:

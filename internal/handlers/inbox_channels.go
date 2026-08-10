@@ -337,6 +337,15 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 	if err := validateThreadsPublicReplyTarget(conversation, &request); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
+	if a.configuredMetaMessengerReviewAccount(conversation.ChannelAccount) ||
+		channelapi.IsStagingMessengerReviewMarked(conversation.ChannelAccount) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusConflict,
+			"This staging Messenger review connection is inbound-only",
+			nil,
+			"",
+		)
+	}
 	if conversation.ChannelAccount == nil ||
 		conversation.ChannelAccount.Status != models.ChannelAccountStatusActive {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Channel account is not active", nil, "")
@@ -705,6 +714,9 @@ func lockChannelAccountForMessageEnqueue(
 	if account.Status != models.ChannelAccountStatusActive ||
 		account.Channel != channel ||
 		!boolConfigValue(account.Config, "outbound_enabled") {
+		return nil, errChannelAccountUnavailableAtEnqueue
+	}
+	if channelapi.IsStagingMessengerReviewMarked(&account) {
 		return nil, errChannelAccountUnavailableAtEnqueue
 	}
 	if err := tx.

@@ -30,6 +30,7 @@ var ErrLegacyMetaAccountManaged = errors.New("legacy Meta channel accounts are m
 var ErrThreadsAccountManaged = errors.New("threads accounts using OAuth are managed in Settings > Integrations")
 var ErrManagedMetaMessengerAccount = errors.New("OAuth-managed Messenger routing and credentials must be changed through managed onboarding")
 var ErrManagedMetaMessengerDeprovision = errors.New("OAuth-managed Messenger accounts require provider deprovisioning before local deletion")
+var ErrMetaMessengerReviewInboundOnly = errors.New("staging Messenger review accounts are inbound-only and can only be changed through review deprovisioning")
 var ErrChannelAccountChangedDuringValidation = errors.New("channel account changed during validation")
 var ErrChannelAccountValidationSuperseded = errors.New("channel account validation was superseded")
 
@@ -419,6 +420,10 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
 			return ErrThreadsAccountManaged
 		}
+		if a.configuredMetaMessengerReviewAccount(account) ||
+			channelapi.IsStagingMessengerReviewMarked(account) {
+			return ErrMetaMessengerReviewInboundOnly
+		}
 		if isManagedMetaMessengerAccount(account) && managedMetaMessengerProtectedFieldsChanged(request) {
 			return ErrManagedMetaMessengerAccount
 		}
@@ -662,6 +667,9 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		if errors.Is(err, ErrManagedMetaMessengerAccount) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
+		if errors.Is(err, ErrMetaMessengerReviewInboundOnly) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 	return r.SendEnvelope(response)
@@ -827,6 +835,10 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 				return err
 			}
 			account = currentAccount
+			if a.configuredMetaMessengerReviewAccount(account) ||
+				channelapi.IsStagingMessengerReviewMarked(account) {
+				return ErrMetaMessengerReviewInboundOnly
+			}
 			if account.Provider == channelapi.LegacyMetaProvider {
 				return nil
 			}
@@ -887,6 +899,9 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			return nil
 		},
 	); err != nil {
+		if errors.Is(err, ErrMetaMessengerReviewInboundOnly) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
+		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel account not found", nil, "")
 		}
@@ -1146,6 +1161,10 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
 			return ErrThreadsAccountManaged
 		}
+		if a.configuredMetaMessengerReviewAccount(account) ||
+			channelapi.IsStagingMessengerReviewMarked(account) {
+			return ErrMetaMessengerReviewInboundOnly
+		}
 		if isManagedMetaMessengerAccount(account) {
 			return ErrManagedMetaMessengerDeprovision
 		}
@@ -1186,6 +1205,9 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
 		if errors.Is(err, ErrThreadsAccountManaged) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
+		}
+		if errors.Is(err, ErrMetaMessengerReviewInboundOnly) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
 		if errors.Is(err, ErrManagedMetaMessengerDeprovision) {
@@ -1232,6 +1254,20 @@ func (a *App) channelAdapter(account *models.ChannelAccount) (channelapi.Adapter
 			adapter.WithLocalhostDevelopment()
 		}
 		if isMetaRelayChannelAccount(account) {
+			if a.configuredMetaMessengerReviewAccount(account) ||
+				metaMessengerReviewAccountMarker(account) {
+				if !a.readyMetaMessengerReviewAccount(account) {
+					return nil, fmt.Errorf("%w: staging review binding is unavailable", ErrChannelAdapterUnavailable)
+				}
+				settings, tuple, err := a.metaMessengerReviewSettings(time.Now().UTC())
+				if err != nil {
+					return nil, fmt.Errorf("%w: staging review binding is unavailable", ErrChannelAdapterUnavailable)
+				}
+				adapter.WithExpectedMetaBusinessID(tuple.MetaBusinessID)
+				adapter.WithMetaProviderProofSecret(settings.ProviderProofSecret)
+				adapter.WithInboundOnly()
+				return adapter, nil
+			}
 			binding, err := a.trustedMetaRelayBinding(account)
 			if err != nil {
 				return nil, fmt.Errorf("%w: trusted Meta relay binding is unavailable", ErrChannelAdapterUnavailable)
@@ -1362,6 +1398,20 @@ func channelAccountToResponse(
 		// a stale or tenant-spoofed value must not enable Test or activation.
 		response.Config["registry_recognized"] = false
 		response.Config["onboarding_state"] = metaMessengerAwaitingRegistryState
+		reviewBound := metaMessengerReviewAccountMarker(account)
+		if len(applications) == 1 && applications[0] != nil {
+			reviewBound = reviewBound || applications[0].configuredMetaMessengerReviewAccount(account)
+		}
+		if reviewBound {
+			response.Config["review_only"] = true
+			response.Config["onboarding_state"] = "review_relay_unavailable"
+			if (metaMessengerReviewAccountMarker(account) && boolConfigValue(account.Metadata, "review_ready")) ||
+				(len(applications) == 1 && applications[0] != nil &&
+					applications[0].readyMetaMessengerReviewAccount(account)) {
+				response.Config["onboarding_state"] = metaMessengerReviewReadyState
+			}
+			return response
+		}
 		if len(applications) == 1 && applications[0] != nil {
 			if _, err := applications[0].trustedMetaRelayBinding(account); err == nil {
 				response.Config["registry_recognized"] = true

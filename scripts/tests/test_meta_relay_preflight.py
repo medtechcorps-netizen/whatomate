@@ -247,6 +247,170 @@ class MetaRelayPreflightTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("Meta relay preflight passed", output.getvalue())
 
+    def test_production_preflight_allows_normal_app_review_governance(self):
+        spec = app_spec()
+        spec["services"][0]["envs"].extend(
+            (
+                {
+                    "key": preflight.RELAY_RUNTIME_MODE_ENV,
+                    "value": "production",
+                    "type": "GENERAL",
+                },
+                {
+                    "key": preflight.RELAY_MODE_ENV,
+                    "value": "live",
+                    "type": "GENERAL",
+                },
+            )
+        )
+
+        errors = preflight.production_review_runtime_errors(spec)
+
+        self.assertEqual(errors, [])
+
+    def test_production_preflight_rejects_review_environment_by_key_presence(self):
+        cases = (
+            (
+                "meta-relay",
+                preflight.REVIEW_RELAY_ENV_PREFIX + "ENABLED",
+                "false",
+            ),
+            (
+                "meta-relay",
+                "META_RELAY_REVIEW_BROKER_URL",
+                "",
+            ),
+            (
+                "omnitech-web",
+                preflight.REVIEW_RELAY_WEB_ENV_PREFIX + "ENABLED",
+                "false",
+            ),
+            (
+                "omnitech-web",
+                preflight.REVIEW_RELAY_WEB_ENV_PREFIX + "BROKER_KEY",
+                "EV[opaque-review-broker-key]",
+            ),
+        )
+        for service_name, env_name, value in cases:
+            with self.subTest(service=service_name, env=env_name, value=value):
+                spec = app_spec()
+                service = next(
+                    item
+                    for item in spec["services"]
+                    if item["name"] == service_name
+                )
+                service["envs"].append(
+                    {"key": env_name, "value": value, "type": "GENERAL"}
+                )
+
+                errors = preflight.production_review_runtime_errors(spec)
+
+                self.assertEqual(len(errors), 1)
+                self.assertIn(env_name, errors[0])
+                if value:
+                    self.assertNotIn(value, errors[0])
+
+    def test_production_preflight_rejects_staging_review_mode_on_any_runtime(self):
+        for collection_name in preflight.RUNTIME_COMPONENT_COLLECTIONS:
+            with self.subTest(collection=collection_name):
+                spec = app_spec()
+                if collection_name != "services":
+                    spec[collection_name] = [
+                        {
+                            "name": "review-runtime",
+                            "envs": [],
+                        }
+                    ]
+                    component = spec[collection_name][0]
+                else:
+                    component = spec["services"][0]
+                component["envs"].append(
+                    {
+                        "key": preflight.RELAY_RUNTIME_MODE_ENV,
+                        "value": preflight.STAGING_MESSENGER_REVIEW_MODE,
+                        "type": "GENERAL",
+                    }
+                )
+
+                errors = preflight.production_review_runtime_errors(spec)
+
+                self.assertEqual(len(errors), 1)
+                self.assertIn(preflight.RELAY_RUNTIME_MODE_ENV, errors[0])
+                self.assertIn(preflight.STAGING_MESSENGER_REVIEW_MODE, errors[0])
+
+    def test_production_preflight_rejects_abandoned_review_mode_alias(self):
+        spec = app_spec()
+        spec["services"][0]["envs"].append(
+            {
+                "key": preflight.RELAY_MODE_ENV,
+                "value": preflight.STAGING_MESSENGER_REVIEW_MODE,
+                "type": "GENERAL",
+            }
+        )
+
+        errors = preflight.production_review_runtime_errors(spec)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn(preflight.RELAY_MODE_ENV, errors[0])
+
+    def test_validate_only_cli_rejects_disabled_review_wiring(self):
+        spec = app_spec()
+        spec["services"][1]["envs"].append(
+            {
+                "key": preflight.REVIEW_RELAY_WEB_ENV_PREFIX + "ENABLED",
+                "value": "false",
+                "type": "GENERAL",
+            }
+        )
+        environment = {
+            preflight.EXPECTED_ENV: json.dumps(expected_inventory()),
+        }
+        with (
+            mock.patch.dict(os.environ, environment, clear=False),
+            mock.patch("sys.stdin", io.StringIO(json.dumps(spec))),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as error_output,
+        ):
+            result = preflight.main(["--validate-only"])
+
+        self.assertEqual(result, 1)
+        self.assertIn(
+            preflight.REVIEW_RELAY_WEB_ENV_PREFIX + "ENABLED",
+            error_output.getvalue(),
+        )
+
+    def test_review_runtime_only_cli_does_not_require_meta_relay_inventory(self):
+        clean_spec = {"services": [{"name": "omnitech-web", "envs": []}]}
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("sys.stdin", io.StringIO(json.dumps(clean_spec))),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            result = preflight.main(["--reject-review-runtime-only"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("runtime check passed", output.getvalue())
+
+        review_spec = json.loads(json.dumps(clean_spec))
+        review_spec["services"][0]["envs"].append(
+            {
+                "key": preflight.REVIEW_RELAY_WEB_ENV_PREFIX + "ENABLED",
+                "value": "false",
+                "type": "GENERAL",
+            }
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("sys.stdin", io.StringIO(json.dumps(review_spec))),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as error_output,
+        ):
+            result = preflight.main(["--reject-review-runtime-only"])
+
+        self.assertEqual(result, 1)
+        self.assertIn(
+            preflight.REVIEW_RELAY_WEB_ENV_PREFIX + "ENABLED",
+            error_output.getvalue(),
+        )
+
     def test_validate_only_cli_rejects_missing_referenced_runtime_secret(self):
         spec = app_spec()
         env_name = expected_account()["access_token_env"]

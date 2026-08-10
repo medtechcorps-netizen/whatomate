@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/metareview"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -585,4 +586,57 @@ func TestRelayAdapterCredentialRefreshIsExplicitlyUnsupported(t *testing.T) {
 	adapter := NewRelayAdapter(models.ChannelSMS, nil, relayTestEncryptionKey)
 	_, err := adapter.RefreshCredentials(context.Background(), relayTestAccount(t, "https://relay.example.test"))
 	assert.True(t, errors.Is(err, ErrCredentialRefreshUnsupported))
+}
+
+func TestRelayAdapterInboundOnlyRejectsEveryEgressAndControlOperation(t *testing.T) {
+	t.Parallel()
+
+	account := relayTestAccount(t, "https://relay.example.test/v1/accounts/messenger/700000000000001")
+	account.Channel = models.ChannelMessenger
+	account.Config["outbound_enabled"] = true
+	adapter := NewRelayAdapter(models.ChannelMessenger, nil, relayTestEncryptionKey).
+		WithInboundOnly()
+
+	_, err := adapter.Send(context.Background(), account, OutboundMessage{
+		IdempotencyKey: "review-send-must-fail",
+		Parts:          []MessagePart{{Type: models.MessagePartTypeText, Text: "blocked"}},
+	})
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	assert.ErrorIs(t, adapter.MarkRead(context.Background(), account, ConversationRef{}, []string{"mid"}), ErrRelayInboundOnly)
+	_, err = adapter.FetchMedia(context.Background(), account, MediaRef{URL: "https://relay.example.test/media"})
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	_, err = adapter.ValidateAccount(context.Background(), account)
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	assert.ErrorIs(t, adapter.Subscribe(context.Background(), account), ErrRelayInboundOnly)
+	_, err = adapter.RefreshCredentials(context.Background(), account)
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+}
+
+func TestRelayAdapterReviewMarkerRejectsEveryEgressWithoutAdapterOptIn(t *testing.T) {
+	t.Parallel()
+
+	account := relayTestAccount(t, "https://relay.example.test/v1/accounts/messenger/700000000000001")
+	account.Channel = models.ChannelMessenger
+	account.Config["outbound_enabled"] = true
+	account.Metadata = models.JSONB{
+		"management_mode":   metaMessengerOAuthManagementMode,
+		"review_relay_mode": metareview.Marker,
+	}
+	adapter := NewRelayAdapter(models.ChannelMessenger, nil, relayTestEncryptionKey)
+
+	_, err := adapter.Send(context.Background(), account, OutboundMessage{
+		IdempotencyKey: "review-marker-send-must-fail",
+		Parts:          []MessagePart{{Type: models.MessagePartTypeText, Text: "blocked"}},
+	})
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	assert.ErrorIs(t, adapter.MarkRead(context.Background(), account, ConversationRef{}, []string{"mid"}), ErrRelayInboundOnly)
+	_, err = adapter.FetchMedia(context.Background(), account, MediaRef{URL: "https://relay.example.test/media"})
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	_, err = adapter.ValidateAccount(context.Background(), account)
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	assert.ErrorIs(t, adapter.Subscribe(context.Background(), account), ErrRelayInboundOnly)
+	_, err = adapter.RefreshCredentials(context.Background(), account)
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	_, err = adapter.outboundSecret(account)
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
 }

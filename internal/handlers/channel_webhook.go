@@ -95,6 +95,18 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
 	}
 	body := r.RequestCtx.PostBody()
+	headers := relayHTTPHeaders(r)
+	if reserved, preauthErr := a.preauthorizeMetaMessengerReviewWebhook(
+		channelAccountID,
+		headers,
+		body,
+		time.Now().UTC(),
+	); reserved && preauthErr != nil {
+		// Do not reveal whether the pinned account exists in tenant storage or
+		// which deployment proof field failed. Most importantly, return before
+		// tenant resolution, RLS setup, or credential loading.
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+	}
 	if len(body) == 0 || len(body) > channelapi.RelayWebhookMaxBodyBytes {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid webhook body", nil, "")
 	}
@@ -148,7 +160,6 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
 	}
 
-	headers := relayHTTPHeaders(r)
 	if err := adapter.VerifyWebhook(&account, headers, body); err != nil {
 		a.Log.Warn(
 			"Rejected channel webhook signature",
@@ -198,6 +209,21 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 	shouldProcess := false
 	retry := false
 	if err := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
+		if a.configuredMetaMessengerReviewAccount(&account) ||
+			metaMessengerReviewAccountMarker(&account) {
+			currentAccount, bindingErr := a.lockMetaMessengerReviewWebhookPersistenceBinding(
+				tx,
+				orgID,
+				account.ID,
+				headers,
+				body,
+			)
+			if bindingErr != nil {
+				return bindingErr
+			}
+			account = *currentAccount
+			rawEvent.ChannelAccountID = account.ID
+		}
 		if account.Channel == models.ChannelThreads {
 			currentAccount, bindingErr := lockThreadsWebhookPersistenceBinding(
 				tx,
@@ -217,6 +243,9 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		shouldProcess, retry, claimErr = persistOrClaimRawInboundEvent(tx, &rawEvent)
 		return claimErr
 	}); err != nil {
+		if errors.Is(err, errMetaMessengerReviewWebhookInactive) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+		}
 		if errors.Is(err, errThreadsWebhookBindingInactive) {
 			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
 		}
@@ -358,9 +387,26 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
 			return err
 		}
-		currentAccount, err := loadChannelAccount(tx, orgID, account.ID, false)
-		if err != nil {
-			return err
+		var currentAccount *models.ChannelAccount
+		if a.configuredMetaMessengerReviewAccount(&account) ||
+			metaMessengerReviewAccountMarker(&account) {
+			var bindingErr error
+			currentAccount, bindingErr = a.lockMetaMessengerReviewWebhookPersistenceBinding(
+				tx,
+				orgID,
+				account.ID,
+				headers,
+				body,
+			)
+			if bindingErr != nil {
+				return bindingErr
+			}
+		} else {
+			var loadErr error
+			currentAccount, loadErr = loadChannelAccount(tx, orgID, account.ID, false)
+			if loadErr != nil {
+				return loadErr
+			}
 		}
 		account = *currentAccount
 		var latestNewInboundAnchor time.Time
@@ -398,6 +444,9 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 	})
 	if processErr != nil {
 		markInboundEventFailed(a.DB, orgID, rawEvent.ID, "processing_failed", processErr)
+		if errors.Is(processErr, errMetaMessengerReviewWebhookInactive) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+		}
 		a.Log.Error(
 			"Failed to process channel webhook",
 			"error",

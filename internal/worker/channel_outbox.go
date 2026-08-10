@@ -393,6 +393,11 @@ func (w *Worker) deliverChannelOutboxJob(
 		err := errors.New("channel account is not approved for outbound delivery")
 		return w.failChannelOutboxJob(orgID, &job, workerID, err, false)
 	}
+	if configuredMetaMessengerReviewAccount(w.Config, &account) ||
+		channelapi.IsStagingMessengerReviewMarked(&account) {
+		err := errors.New("staging Messenger review account is inbound-only")
+		return w.failChannelOutboxJob(orgID, &job, workerID, err, false)
+	}
 	adapter, err := w.channelOutboxAdapter(&account)
 	if err != nil {
 		return w.failChannelOutboxJob(orgID, &job, workerID, err, retryableChannelError(err))
@@ -591,6 +596,10 @@ func (w *Worker) loadMetaRelayOutboundAccountForUpdate(
 		Where("id = ? AND organization_id = ?", accountID, orgID).
 		First(&account).Error; err != nil {
 		return account, err
+	}
+	if configuredMetaMessengerReviewAccount(w.Config, &account) ||
+		channelapi.IsStagingMessengerReviewMarked(&account) {
+		return account, errors.New("staging Messenger review account is inbound-only")
 	}
 	if _, err := metatrust.ValidateOutbound(
 		w.Config.MetaRelay,

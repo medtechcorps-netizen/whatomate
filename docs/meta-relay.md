@@ -15,6 +15,11 @@ Use the reusable
 cross-workspace differences and onboard future organizations without relying
 on display names or outbound-only tests.
 
+Meta App Review uses a separate, deliberately inbound-only runtime documented
+in the [staging-only Messenger review relay runbook](meta-messenger-review-relay.md).
+That mode is not a production relay profile and cannot share a process or
+deployment configuration with the protected production account registry.
+
 ## Webhook applications and routes
 
 Configure two distinct Meta applications and do not reuse either an app secret

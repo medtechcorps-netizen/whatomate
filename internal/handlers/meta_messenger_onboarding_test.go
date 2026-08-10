@@ -558,12 +558,13 @@ func TestMetaMessengerPendingSelectionResumesWithoutDuplicatingRelaySecrets(t *t
 	enableBookingCommerceTestEntitlement(t, app.DB, org.ID, admin.ID, "omnichannel.enabled")
 
 	for _, testCase := range []struct {
-		name             string
-		state            string
-		tokenKind        string
-		clientBusinessID string
+		name              string
+		state             string
+		tokenKind         string
+		clientBusinessID  string
+		expireActiveLease bool
 	}{
-		{name: "verifying subscription", state: metaMessengerVerifyingSubscription, tokenKind: metaMessengerTokenKindUser},
+		{name: "expired verifying subscription", state: metaMessengerVerifyingSubscription, tokenKind: metaMessengerTokenKindUser, expireActiveLease: true},
 		{name: "subscription failed", state: metaMessengerSubscriptionFailed, tokenKind: metaMessengerTokenKindSystemUser, clientBusinessID: metaMessengerTestBusinessID},
 		{name: "awaiting relay registry", state: metaMessengerAwaitingRegistryState, tokenKind: metaMessengerTokenKindUser},
 	} {
@@ -594,6 +595,15 @@ func TestMetaMessengerPendingSelectionResumesWithoutDuplicatingRelaySecrets(t *t
 			}
 			require.Len(t, first.Credentials, 2)
 			firstWebhook := credentialByKind(t, first.Credentials, models.ChannelCredentialKindWebhook)
+			if testCase.expireActiveLease {
+				first.Metadata = cloneJSONB(first.Metadata)
+				first.Metadata[metaMessengerSubscriptionOperationExpiresKey] = time.Now().UTC().
+					Add(-time.Minute).
+					Format(time.RFC3339Nano)
+				require.NoError(t, app.DB.Model(&models.ChannelAccount{}).
+					Where("id = ? AND organization_id = ?", first.ID, org.ID).
+					Update("metadata", first.Metadata).Error)
+			}
 
 			secondPage := newMetaMessengerPersistencePage(t, pageID, "second-page-token")
 			secondInspection := newMetaMessengerAuthorizationInspection(testCase.tokenKind)
@@ -648,6 +658,79 @@ func TestMetaMessengerPendingSelectionResumesWithoutDuplicatingRelaySecrets(t *t
 			assert.Equal(t, "second-page-token", plaintext)
 		})
 	}
+}
+
+func TestMetaMessengerPendingSelectionRejectsActiveLeaseWhenReviewFlagIsFalse(t *testing.T) {
+	app := newMetaMessengerPersistenceTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := integrationTestUser(
+		t,
+		app,
+		org.ID,
+		models.ResourceChannelAccounts+":"+models.ActionWrite,
+	)
+	enableBookingCommerceTestEntitlement(t, app.DB, org.ID, admin.ID, "omnichannel.enabled")
+	pageID := testutil.UniqueNumericID(t, "7")
+	firstPage := newMetaMessengerPersistencePage(t, pageID, "first-page-token")
+	authorization := newMetaMessengerAuthorizationInspection(metaMessengerTokenKindUser)
+	first, err := app.persistMetaMessengerPendingAccount(
+		newMetaMessengerPersistenceRequest(t, org.ID, admin.ID),
+		org.ID,
+		admin.ID,
+		firstPage,
+		metaMessengerTokenInspection{CheckedAt: authorization.CheckedAt},
+		authorization,
+		"",
+	)
+	require.NoError(t, err)
+	originalOperation, err := metaMessengerSubscriptionOperationFromAccount(first)
+	require.NoError(t, err)
+	require.Equal(t, metaMessengerSubscriptionSubscribePending, originalOperation.State)
+	require.True(t, originalOperation.ExpiresAt.After(time.Now().UTC()))
+	originalOAuth := credentialByKind(t, first.Credentials, models.ChannelCredentialKindOAuth)
+
+	first.Config = cloneJSONB(first.Config)
+	first.Config["review_only"] = false
+	require.NoError(t, app.DB.Model(&models.ChannelAccount{}).
+		Where("id = ? AND organization_id = ?", first.ID, org.ID).
+		Update("config", first.Config).Error)
+
+	secondPage := newMetaMessengerPersistencePage(t, pageID, "must-not-be-stored")
+	_, err = app.persistMetaMessengerPendingAccount(
+		newMetaMessengerPersistenceRequest(t, org.ID, admin.ID),
+		org.ID,
+		admin.ID,
+		secondPage,
+		metaMessengerTokenInspection{CheckedAt: time.Now().UTC()},
+		newMetaMessengerAuthorizationInspection(metaMessengerTokenKindUser),
+		"",
+	)
+	require.ErrorIs(t, err, errMetaMessengerPageBound)
+
+	var persisted models.ChannelAccount
+	require.NoError(t, app.DB.First(&persisted, "id = ? AND organization_id = ?", first.ID, org.ID).Error)
+	currentOperation, err := metaMessengerSubscriptionOperationFromAccount(&persisted)
+	require.NoError(t, err)
+	assert.Equal(t, originalOperation, currentOperation)
+	assert.Equal(t, false, persisted.Config["review_only"])
+
+	var oauth []models.ChannelCredential
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND channel_account_id = ? AND kind = ?",
+		org.ID,
+		first.ID,
+		models.ChannelCredentialKindOAuth,
+	).Order("version").Find(&oauth).Error)
+	require.Len(t, oauth, 1)
+	assert.Equal(t, originalOAuth.ID, oauth[0].ID)
+	assert.Equal(t, originalOAuth.Version, oauth[0].Version)
+	assert.Equal(t, originalOAuth.Status, oauth[0].Status)
+	assert.Equal(t, originalOAuth.CredentialBlob, oauth[0].CredentialBlob)
+	encryptedToken, ok := oauth[0].CredentialBlob["access_token"].(string)
+	require.True(t, ok)
+	plaintext, decryptErr := appcrypto.Decrypt(encryptedToken, integrationTestEncryptionKey)
+	require.NoError(t, decryptErr)
+	assert.Equal(t, "first-page-token", plaintext)
 }
 
 func TestMetaMessengerResumeStopsAfterProtectedInventoryRecognition(t *testing.T) {

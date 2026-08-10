@@ -138,6 +138,9 @@ func ValidateOutbound(
 	account *models.ChannelAccount,
 	now time.Time,
 ) (Binding, error) {
+	if channelapi.IsStagingMessengerReviewMarked(account) {
+		return Binding{}, errors.New("staging Messenger review binding is inbound-only")
+	}
 	binding, err := Resolve(settings, environment, account)
 	if err != nil {
 		return Binding{}, err

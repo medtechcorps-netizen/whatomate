@@ -959,6 +959,11 @@ func (a *App) subscribeMetaMessengerPage(
 	ctx context.Context,
 	pageID, pageToken string,
 ) error {
+	if a != nil && a.Config != nil && a.Config.MetaMessengerReviewRelay.Enabled {
+		if _, _, err := a.metaMessengerReviewSettings(time.Now().UTC()); err != nil {
+			return errMetaMessengerReviewUnavailable
+		}
+	}
 	var subscribed struct {
 		Success bool `json:"success"`
 	}
@@ -997,6 +1002,78 @@ func (a *App) subscribeMetaMessengerPage(
 		}
 	}
 	return errors.New("the configured Meta app messages webhook subscription could not be verified")
+}
+
+func (a *App) unsubscribeMetaMessengerPage(
+	ctx context.Context,
+	pageID, pageToken string,
+) error {
+	if !validCanonicalMetaID(pageID) || strings.TrimSpace(pageToken) == "" {
+		return errors.New("meta Page unsubscribe binding is invalid")
+	}
+	endpoint := url.PathEscape(strings.TrimSpace(pageID)) + "/subscribed_apps"
+	var unsubscribed struct {
+		Success bool `json:"success"`
+	}
+	deleteCtx, cancelDelete := context.WithTimeout(ctx, 15*time.Second)
+	deleteErr := a.doMetaMessengerGraphJSON(
+		deleteCtx,
+		http.MethodDelete,
+		endpoint,
+		url.Values{},
+		pageToken,
+		&unsubscribed,
+	)
+	cancelDelete()
+	if deleteErr == nil && !unsubscribed.Success {
+		deleteErr = errors.New("meta did not confirm the messages webhook removal")
+	}
+
+	// DELETE can time out after Meta has committed it. A separate GET resolves
+	// that ambiguity and is also the idempotency check for duplicate cleanup.
+	getCtx, cancelGet := context.WithTimeout(ctx, 15*time.Second)
+	present, getErr := a.metaMessengerPageHasConfiguredAppSubscription(
+		getCtx,
+		endpoint,
+		pageToken,
+	)
+	cancelGet()
+	if getErr == nil && !present {
+		return nil
+	}
+	if getErr != nil {
+		return errors.Join(deleteErr, getErr)
+	}
+	if deleteErr != nil {
+		return errors.Join(deleteErr, errors.New("the configured Meta app is still subscribed"))
+	}
+	return errors.New("the configured Meta app is still subscribed")
+}
+
+func (a *App) metaMessengerPageHasConfiguredAppSubscription(
+	ctx context.Context,
+	endpoint, pageToken string,
+) (bool, error) {
+	settings, err := a.metaMessengerOnboardingSettings()
+	if err != nil {
+		return false, err
+	}
+	var subscriptions struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := a.doMetaMessengerGraphJSON(ctx, http.MethodGet, endpoint, url.Values{
+		"fields": {"id"},
+	}, pageToken, &subscriptions); err != nil {
+		return false, err
+	}
+	for _, subscription := range subscriptions.Data {
+		if strings.TrimSpace(subscription.ID) == settings.AppID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (a *App) doMetaMessengerGraphJSON(
@@ -1079,7 +1156,9 @@ func (a *App) metaMessengerGraphEndpoint(endpoint string) (*url.URL, error) {
 		return nil, errors.New("meta Graph endpoint is invalid")
 	}
 	production := a.Config != nil && strings.EqualFold(strings.TrimSpace(a.Config.App.Environment), "production")
-	if production && (settings.GraphBaseURL != metaMessengerProductionGraphOrigin ||
+	stagingReview := a.Config != nil && a.Config.App.Environment == "staging" &&
+		a.Config.MetaMessengerReviewRelay.Enabled
+	if (production || stagingReview) && (settings.GraphBaseURL != metaMessengerProductionGraphOrigin ||
 		base.Scheme != "https" || base.Host != "graph.facebook.com" ||
 		base.Path != "" || base.RawPath != "") {
 		return nil, errors.New("meta Graph endpoint is invalid")

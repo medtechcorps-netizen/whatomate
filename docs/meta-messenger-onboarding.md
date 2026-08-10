@@ -10,6 +10,12 @@ The feature is disabled by default. Enabling it replaces manual creation of
 It does not publish the Meta app, submit App Review, add an account to the
 protected relay registry, or enable outbound messaging.
 
+For the single-Page, inbound-only staging path used while an app is under Meta
+review, follow the
+[staging-only Messenger review relay runbook](meta-messenger-review-relay.md).
+Its pending review account must never be treated as a connected production
+account or promoted by changing flags in place.
+
 ## Production prerequisites
 
 This repository does not yet contain the privileged operator job that copies a

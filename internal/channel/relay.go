@@ -61,6 +61,7 @@ var (
 	ErrRelayMetaProviderProofSecret  = errors.New("meta relay provider proof secret is not configured securely")
 	ErrRelayMetaTrustedBinding       = errors.New("meta relay trusted Business binding is not configured")
 	ErrRelayOutboundDisabled         = errors.New("relay outbound delivery is not approved")
+	ErrRelayInboundOnly              = errors.New("relay is restricted to inbound review traffic")
 	ErrRelayURLInvalid               = errors.New("relay URL is invalid")
 	ErrCredentialRefreshUnsupported  = errors.New("relay credentials cannot be refreshed automatically")
 	errRelayOutgoingEcho             = errors.New("relay outgoing message echo")
@@ -86,6 +87,9 @@ type RelayAdapter struct {
 	// It is an internal process-level switch used by package tests/local
 	// development only; production handlers leave it false.
 	allowLocalhostDev bool
+	// inboundOnly is a process-owned defense-in-depth fuse for review relays.
+	// It is never read from tenant-controlled account configuration.
+	inboundOnly bool
 }
 
 // WithExpectedMetaBusinessID binds Meta readiness validation to protected,
@@ -115,6 +119,21 @@ func (a *RelayAdapter) WithLocalhostDevelopment() *RelayAdapter {
 		a.allowLocalhostDev = true
 	}
 	return a
+}
+
+// WithInboundOnly removes every adapter operation that could contact the
+// relay or provider on behalf of ReReply. Webhook verification, routing, and
+// normalization remain available so a staging review asset can demonstrate
+// receipt without acquiring an outbound capability.
+func (a *RelayAdapter) WithInboundOnly() *RelayAdapter {
+	if a != nil {
+		a.inboundOnly = true
+	}
+	return a
+}
+
+func (a *RelayAdapter) inboundOnlyForAccount(account *models.ChannelAccount) bool {
+	return (a != nil && a.inboundOnly) || IsStagingMessengerReviewMarked(account)
 }
 
 // SignMetaProviderInboundProof signs the exact canonical body using a domain
@@ -392,6 +411,9 @@ func (a *RelayAdapter) NormalizeWebhook(_ context.Context, account *models.Chann
 }
 
 func (a *RelayAdapter) Send(ctx context.Context, account *models.ChannelAccount, message OutboundMessage) (SendResult, error) {
+	if a.inboundOnlyForAccount(account) {
+		return SendResult{}, ErrRelayInboundOnly
+	}
 	if account == nil || !boolConfig(account.Config, "outbound_enabled") {
 		return SendResult{}, ErrRelayOutboundDisabled
 	}
@@ -420,6 +442,9 @@ func (a *RelayAdapter) Send(ctx context.Context, account *models.ChannelAccount,
 }
 
 func (a *RelayAdapter) MarkRead(ctx context.Context, account *models.ChannelAccount, conversation ConversationRef, externalMessageIDs []string) error {
+	if a.inboundOnlyForAccount(account) {
+		return ErrRelayInboundOnly
+	}
 	if account == nil || !boolConfig(account.Config, "outbound_enabled") {
 		return ErrRelayOutboundDisabled
 	}
@@ -433,6 +458,9 @@ func (a *RelayAdapter) MarkRead(ctx context.Context, account *models.ChannelAcco
 }
 
 func (a *RelayAdapter) FetchMedia(ctx context.Context, account *models.ChannelAccount, ref MediaRef) (FetchedMedia, error) {
+	if a.inboundOnlyForAccount(account) {
+		return FetchedMedia{}, ErrRelayInboundOnly
+	}
 	if account == nil {
 		return FetchedMedia{}, errors.New("relay account is required")
 	}
@@ -488,6 +516,9 @@ func (a *RelayAdapter) ValidateAccount(ctx context.Context, account *models.Chan
 	}
 	if account == nil {
 		return result, errors.New("relay account is required")
+	}
+	if a.inboundOnlyForAccount(account) {
+		return result, ErrRelayInboundOnly
 	}
 	if err := a.validateMetaDeploymentTrust(); err != nil {
 		return result, err
@@ -604,6 +635,9 @@ func isCanonicalMetaBusinessID(value string) bool {
 }
 
 func (a *RelayAdapter) Subscribe(ctx context.Context, account *models.ChannelAccount) error {
+	if a.inboundOnlyForAccount(account) {
+		return ErrRelayInboundOnly
+	}
 	if account == nil || !boolConfig(account.Config, "outbound_enabled") {
 		return ErrRelayOutboundDisabled
 	}
@@ -613,7 +647,10 @@ func (a *RelayAdapter) Subscribe(ctx context.Context, account *models.ChannelAcc
 	}, nil)
 }
 
-func (a *RelayAdapter) RefreshCredentials(_ context.Context, _ *models.ChannelAccount) (CredentialRefreshResult, error) {
+func (a *RelayAdapter) RefreshCredentials(_ context.Context, account *models.ChannelAccount) (CredentialRefreshResult, error) {
+	if a.inboundOnlyForAccount(account) {
+		return CredentialRefreshResult{}, ErrRelayInboundOnly
+	}
 	return CredentialRefreshResult{}, ErrCredentialRefreshUnsupported
 }
 
@@ -630,6 +667,9 @@ type relayOutboundEnvelope struct {
 }
 
 func (a *RelayAdapter) post(ctx context.Context, account *models.ChannelAccount, eventType string, data any, response any) error {
+	if a.inboundOnlyForAccount(account) {
+		return ErrRelayInboundOnly
+	}
 	if err := a.validateMetaDeploymentTrust(); err != nil {
 		return err
 	}
@@ -697,6 +737,9 @@ func (a *RelayAdapter) post(ctx context.Context, account *models.ChannelAccount,
 }
 
 func (a *RelayAdapter) outboundSecret(account *models.ChannelAccount) (string, error) {
+	if a.inboundOnlyForAccount(account) {
+		return "", ErrRelayInboundOnly
+	}
 	if secret, err := a.credentialValue(account, "outbound_secret"); err == nil && secret != "" {
 		return secret, nil
 	}

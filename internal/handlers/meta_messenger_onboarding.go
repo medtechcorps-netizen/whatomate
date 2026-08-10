@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -21,6 +22,7 @@ import (
 	configpkg "github.com/shridarpatil/whatomate/internal/config"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/database"
+	"github.com/shridarpatil/whatomate/internal/metareview"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -37,9 +39,39 @@ const (
 	metaMessengerAwaitingRegistryState  = "awaiting_relay_registry"
 	metaMessengerVerifyingSubscription  = "verifying_subscription"
 	metaMessengerSubscriptionFailed     = "subscription_failed"
+	metaMessengerReviewReadyState       = "review_relay_ready"
 	metaMessengerManagementMode         = "meta_messenger_oauth"
 	metaMessengerMaxAuthorizationCode   = 8192
 	metaMessengerMaxOpaqueState         = 256
+
+	metaMessengerSubscriptionDesiredStateKey       = "meta_subscription_desired_state"
+	metaMessengerSubscriptionOperationIDKey        = "meta_subscription_operation_id"
+	metaMessengerSubscriptionOperationStateKey     = "meta_subscription_operation_state"
+	metaMessengerSubscriptionOperationExpiresKey   = "meta_subscription_operation_expires_at"
+	metaMessengerSubscriptionOAuthCredentialIDKey  = "meta_subscription_oauth_credential_id"
+	metaMessengerSubscriptionOAuthVersionKey       = "meta_subscription_oauth_version"
+	metaMessengerSubscriptionRemoteStateKey        = "meta_subscription_remote_state"
+	metaMessengerSubscriptionRemoteConfirmedAtKey  = "meta_subscription_remote_confirmed_at"
+	metaMessengerSubscriptionFencedOperationIDKey  = "meta_subscription_fenced_operation_id"
+	metaMessengerSubscriptionFencedOperationEndKey = "meta_subscription_fenced_operation_expires_at"
+	metaMessengerSubscriptionFencedAckKey          = "meta_subscription_fenced_operation_acknowledged"
+	metaMessengerSubscriptionFencedAckAtKey        = "meta_subscription_fenced_operation_acknowledged_at"
+
+	metaMessengerSubscriptionDesiredSubscribed    = "subscribed"
+	metaMessengerSubscriptionDesiredUnsubscribed  = "unsubscribed"
+	metaMessengerSubscriptionRemoteUnknown        = "unknown"
+	metaMessengerSubscriptionRemoteSubscribed     = "subscribed"
+	metaMessengerSubscriptionRemoteUnsubscribed   = "unsubscribed"
+	metaMessengerSubscriptionSubscribePending     = "subscribe_pending"
+	metaMessengerSubscriptionSubscribeComplete    = "subscribe_complete"
+	metaMessengerSubscriptionSubscribeFailed      = "subscribe_failed"
+	metaMessengerSubscriptionUnsubscribePending   = "unsubscribe_pending"
+	metaMessengerSubscriptionUnsubscribeConfirmed = "unsubscribe_confirmed"
+
+	// This lease is deliberately longer than the maximum provider operation.
+	// Deprovisioning will not erase the recovery token or delete the tombstone
+	// while an older subscribe request could still be completing at Meta.
+	metaMessengerSubscriptionOperationLease = metaMessengerProviderOperationLimit + 30*time.Second
 )
 
 var (
@@ -48,7 +80,17 @@ var (
 	errMetaMessengerPageBound          = errors.New("the Meta Page is already bound to a workspace")
 	errMetaMessengerBusinessBound      = errors.New("the workspace is already bound to another Meta Business Portfolio")
 	errMetaMessengerLegacyBinding      = errors.New("an existing Meta relay account must be migrated to an explicit Business binding first")
+	errMetaMessengerSubscriptionFence  = errors.New("the Messenger subscription operation is no longer current")
 )
+
+type metaMessengerSubscriptionOperation struct {
+	ID                uuid.UUID
+	OAuthCredentialID uuid.UUID
+	OAuthVersion      int
+	DesiredState      string
+	State             string
+	ExpiresAt         time.Time
+}
 
 type metaMessengerWorkspaceSummary struct {
 	OrganizationID   string `json:"organization_id"`
@@ -144,7 +186,7 @@ func (a *App) StartMetaMessengerOnboarding(r *fastglue.Request) error {
 		OrganizationID:    orgID.String(),
 		UserID:            userID.String(),
 		Nonce:             nonce,
-		ConfigFingerprint: metaMessengerOnboardingFingerprint(settings),
+		ConfigFingerprint: a.metaMessengerOnboardingRuntimeFingerprint(settings),
 		ExpiresAt:         now.Add(metaMessengerOnboardingStateTTL),
 	}
 	payload, err := json.Marshal(state)
@@ -219,7 +261,7 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 	}
 	if !metaMessengerOpaqueValuesEqual(
 		state.ConfigFingerprint,
-		metaMessengerOnboardingFingerprint(settings),
+		a.metaMessengerOnboardingRuntimeFingerprint(settings),
 	) {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Messenger onboarding settings changed; start again", nil, "")
 	}
@@ -244,6 +286,18 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 	if err != nil {
 		a.Log.Warn("Messenger Page ownership discovery failed", "organization_id", orgID)
 		return r.SendErrorEnvelope(fasthttp.StatusBadGateway, "Meta Page ownership could not be verified", nil, "")
+	}
+	if businesses, pages, err = a.filterMetaMessengerReviewInventory(
+		orgID,
+		businesses,
+		pages,
+	); err != nil {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"The configured review Business and Page were not authorized",
+			nil,
+			"",
+		)
 	}
 
 	now := time.Now().UTC()
@@ -275,7 +329,7 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 		OrganizationID:     orgID.String(),
 		UserID:             userID.String(),
 		SessionID:          sessionID,
-		ConfigFingerprint:  metaMessengerOnboardingFingerprint(settings),
+		ConfigFingerprint:  a.metaMessengerOnboardingRuntimeFingerprint(settings),
 		Workspace:          workspace,
 		Platform:           platform,
 		Businesses:         businesses,
@@ -338,6 +392,12 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 		!validCanonicalMetaID(request.BusinessID) || !validCanonicalMetaID(request.PageID) {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "session_id, business_id, and page_id are required", nil, "")
 	}
+	if _, reviewTuple, reviewErr := a.metaMessengerReviewSettings(time.Now().UTC()); reviewErr == nil &&
+		(orgID.String() != reviewTuple.OrganizationID ||
+			request.BusinessID != reviewTuple.MetaBusinessID ||
+			request.PageID != reviewTuple.PageID) {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "The selected Page is not available for this review deployment", nil, "")
+	}
 	sessionJSON, err := a.Redis.GetDel(
 		requestContext(r),
 		metaMessengerSelectionStateKey(orgID, userID, request.SessionID),
@@ -357,7 +417,7 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 	}
 	if !metaMessengerOpaqueValuesEqual(
 		session.ConfigFingerprint,
-		metaMessengerOnboardingFingerprint(settings),
+		a.metaMessengerOnboardingRuntimeFingerprint(settings),
 	) {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Messenger onboarding settings changed; start again", nil, "")
 	}
@@ -440,16 +500,35 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, "The Messenger Page could not be staged for this workspace", nil, "")
 		}
 	}
+	operation, err := metaMessengerSubscriptionOperationFromAccount(account)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "The Messenger subscription operation could not be fenced", nil, "")
+	}
+	stagedAccountID := account.ID
 
 	if err := a.subscribeMetaMessengerPage(ctx, request.PageID, pageToken); err != nil {
 		a.Log.Warn("Messenger Page subscription verification failed", "organization_id", orgID, "page_id", request.PageID)
-		_, _ = a.finalizeMetaMessengerPendingAccount(
+		cleanupErr := a.compensateMetaMessengerSubscribe(
+			requestContext(r),
+			orgID,
+			stagedAccountID,
+			operation,
+			request.PageID,
+			pageToken,
+		)
+		remoteState := metaMessengerSubscriptionRemoteUnknown
+		if cleanupErr == nil {
+			remoteState = metaMessengerSubscriptionRemoteUnsubscribed
+		}
+		_, _ = a.finalizeMetaMessengerPendingAccountOperation(
 			orgID,
 			userID,
 			account.ID,
+			operation,
 			metaMessengerSubscriptionFailed,
 			false,
 			"Meta messages webhook subscription could not be verified",
+			remoteState,
 		)
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadGateway,
@@ -458,22 +537,39 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 			"",
 		)
 	}
-	account, err = a.finalizeMetaMessengerPendingAccount(
+	account, err = a.finalizeMetaMessengerPendingAccountOperation(
 		orgID,
 		userID,
-		account.ID,
+		stagedAccountID,
+		operation,
 		metaMessengerAwaitingRegistryState,
 		true,
 		"",
+		metaMessengerSubscriptionRemoteSubscribed,
 	)
 	if err != nil {
+		compensationErr := a.compensateMetaMessengerSubscribe(
+			requestContext(r),
+			orgID,
+			stagedAccountID,
+			operation,
+			request.PageID,
+			pageToken,
+		)
+		if compensationErr != nil {
+			a.Log.Error("Failed to compensate stale Messenger subscription", "error", compensationErr, "organization_id", orgID, "page_id", request.PageID)
+		}
 		a.Log.Error("Failed to finalize Messenger Page staging", "error", err, "organization_id", orgID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "The Page subscription was verified but local staging could not be finalized", nil, "")
+	}
+	onboardingState := metaMessengerAwaitingRegistryState
+	if metaMessengerReviewAccountMarker(account) {
+		onboardingState = metaMessengerReviewReadyState
 	}
 	setMetaMessengerNoStoreHeaders(r)
 	return r.SendEnvelope(selectMetaMessengerOnboardingResponse{
 		Account:              channelAccountToResponse(account),
-		OnboardingState:      metaMessengerAwaitingRegistryState,
+		OnboardingState:      onboardingState,
 		SubscriptionVerified: true,
 		RegistryRecognized:   false,
 	})
@@ -505,12 +601,26 @@ func (a *App) metaMessengerOnboardingSettings() (configpkg.MetaMessengerOnboardi
 	if err != nil {
 		return configpkg.MetaMessengerOnboardingConfig{}, errMetaMessengerOnboardingDisabled
 	}
-	canonicalProtectedRelay, err := configpkg.CanonicalMetaRelayBaseURL(
-		a.Config.MetaRelay.BaseURL,
-		a.Config.App.Environment,
-	)
-	if err != nil || canonicalOnboardingRelay != canonicalProtectedRelay {
-		return configpkg.MetaMessengerOnboardingConfig{}, errMetaMessengerOnboardingDisabled
+	if a.Config.MetaMessengerReviewRelay.Enabled {
+		if a.Config.App.Environment != "staging" ||
+			a.Config.MetaMessengerReviewRelay.Mode != metareview.Mode {
+			return configpkg.MetaMessengerOnboardingConfig{}, errMetaMessengerOnboardingDisabled
+		}
+		canonicalReviewRelay, err := configpkg.CanonicalMetaRelayBaseURL(
+			a.Config.MetaMessengerReviewRelay.RelayBaseURL,
+			a.Config.App.Environment,
+		)
+		if err != nil || canonicalOnboardingRelay != canonicalReviewRelay {
+			return configpkg.MetaMessengerOnboardingConfig{}, errMetaMessengerOnboardingDisabled
+		}
+	} else {
+		canonicalProtectedRelay, err := configpkg.CanonicalMetaRelayBaseURL(
+			a.Config.MetaRelay.BaseURL,
+			a.Config.App.Environment,
+		)
+		if err != nil || canonicalOnboardingRelay != canonicalProtectedRelay {
+			return configpkg.MetaMessengerOnboardingConfig{}, errMetaMessengerOnboardingDisabled
+		}
 	}
 	settings.TrustedRelayBaseURL = canonicalOnboardingRelay
 	return settings, nil
@@ -525,6 +635,32 @@ func metaMessengerOnboardingFingerprint(settings configpkg.MetaMessengerOnboardi
 		settings.GraphAPIVersion,
 		settings.GraphBaseURL,
 		settings.TrustedRelayBaseURL,
+	}, "\x00")))
+	return hex.EncodeToString(digest[:])
+}
+
+func (a *App) metaMessengerOnboardingRuntimeFingerprint(
+	settings configpkg.MetaMessengerOnboardingConfig,
+) string {
+	base := metaMessengerOnboardingFingerprint(settings)
+	if a == nil || a.Config == nil || !a.Config.MetaMessengerReviewRelay.Enabled {
+		return base
+	}
+	review := a.Config.MetaMessengerReviewRelay
+	digest := sha256.Sum256([]byte(strings.Join([]string{
+		base,
+		review.Mode,
+		review.OrganizationID,
+		review.MetaBusinessID,
+		review.PageID,
+		review.ChannelAccountID,
+		review.Generation,
+		review.ExpiresAt,
+		review.RelayBaseURL,
+		review.ReReplyBaseURL,
+		review.BrokerAuthSecret,
+		review.BrokerWrapSecret,
+		review.ProviderProofSecret,
 	}, "\x00")))
 	return hex.EncodeToString(digest[:])
 }
@@ -614,6 +750,18 @@ func (a *App) requireMetaMessengerOnboardingAuth(
 		_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 		return uuid.Nil, uuid.Nil, "", errEnvelopeSent
 	}
+	if a != nil && a.Config != nil && a.Config.MetaMessengerReviewRelay.Enabled {
+		if a.Config.App.Environment != "staging" ||
+			a.Config.MetaMessengerReviewRelay.Mode != metareview.Mode ||
+			orgID.String() != a.Config.MetaMessengerReviewRelay.OrganizationID {
+			_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Messenger review onboarding is restricted to its configured workspace", nil, "")
+			return uuid.Nil, uuid.Nil, "", errEnvelopeSent
+		}
+		if _, _, reviewErr := a.metaMessengerReviewSettings(time.Now().UTC()); reviewErr != nil {
+			_ = r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Messenger review onboarding authority is unavailable or expired", nil, "")
+			return uuid.Nil, uuid.Nil, "", errEnvelopeSent
+		}
+	}
 	root := a.rootApp()
 	if root == nil || root.DB == nil {
 		_ = r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Messenger onboarding authorization is unavailable", nil, "")
@@ -656,6 +804,22 @@ func (a *App) persistMetaMessengerPendingAccount(
 	settings, err := a.metaMessengerOnboardingSettings()
 	if err != nil {
 		return nil, err
+	}
+	reviewAccountID := uuid.Nil
+	if a.Config != nil && a.Config.MetaMessengerReviewRelay.Enabled {
+		_, reviewTuple, reviewErr := a.metaMessengerReviewSettings(time.Now().UTC())
+		if reviewErr != nil {
+			return nil, errMetaMessengerOnboardingDisabled
+		}
+		if orgID.String() != reviewTuple.OrganizationID ||
+			page.BusinessID != reviewTuple.MetaBusinessID ||
+			page.PageID != reviewTuple.PageID {
+			return nil, errMetaMessengerSelectionInvalid
+		}
+		reviewAccountID, err = uuid.Parse(reviewTuple.ChannelAccountID)
+		if err != nil || reviewAccountID == uuid.Nil {
+			return nil, errMetaMessengerSelectionInvalid
+		}
 	}
 	authorizationInspection.Type = strings.ToUpper(strings.TrimSpace(authorizationInspection.Type))
 	clientBusinessID = strings.TrimSpace(clientBusinessID)
@@ -724,12 +888,19 @@ func (a *App) persistMetaMessengerPendingAccount(
 		isNew := exactIndex < 0
 		var oldAccount *models.ChannelAccount
 		if isNew {
+			accountID := uuid.New()
+			if reviewAccountID != uuid.Nil {
+				accountID = reviewAccountID
+			}
 			account = &models.ChannelAccount{
-				BaseModel:      models.BaseModel{ID: uuid.New()},
+				BaseModel:      models.BaseModel{ID: accountID},
 				OrganizationID: orgID,
 				CreatedByID:    &userID,
 			}
 		} else {
+			if reviewAccountID != uuid.Nil && existing[exactIndex].ID != reviewAccountID {
+				return errMetaMessengerPageBound
+			}
 			if !metaMessengerPendingResumeAllowed(&existing[exactIndex]) {
 				return errMetaMessengerPageBound
 			}
@@ -759,6 +930,9 @@ func (a *App) persistMetaMessengerPendingAccount(
 		); err != nil {
 			return err
 		}
+		if reviewAccountID != uuid.Nil {
+			account.Config["review_only"] = true
+		}
 		// This insert is the cross-tenant staging gate. PostgreSQL enforces
 		// uq_channel_accounts_global_routable_identity globally even when RLS
 		// intentionally hides another tenant's row from the early count above.
@@ -776,6 +950,7 @@ func (a *App) persistMetaMessengerPendingAccount(
 			tx,
 			orgID,
 			account.ID,
+			reviewAccountID != uuid.Nil,
 		)
 		if err != nil {
 			return err
@@ -790,6 +965,30 @@ func (a *App) persistMetaMessengerPendingAccount(
 			tokenExpiry,
 		)
 		if err != nil {
+			return err
+		}
+		if reviewAccountID != uuid.Nil {
+			if err := scrubSupersededMetaMessengerReviewCredentialsTx(
+				tx,
+				orgID,
+				account.ID,
+				webhookCredential.ID,
+				oauthCredential.ID,
+				time.Now().UTC(),
+			); err != nil {
+				return err
+			}
+		}
+		operation := newMetaMessengerSubscriptionOperation(oauthCredential, time.Now().UTC())
+		account.Metadata = cloneJSONB(account.Metadata)
+		writeMetaMessengerSubscriptionOperation(account.Metadata, operation)
+		account.Metadata[metaMessengerSubscriptionRemoteStateKey] = metaMessengerSubscriptionRemoteUnknown
+		delete(account.Metadata, metaMessengerSubscriptionRemoteConfirmedAtKey)
+		delete(account.Metadata, metaMessengerSubscriptionFencedOperationIDKey)
+		delete(account.Metadata, metaMessengerSubscriptionFencedOperationEndKey)
+		delete(account.Metadata, metaMessengerSubscriptionFencedAckKey)
+		delete(account.Metadata, metaMessengerSubscriptionFencedAckAtKey)
+		if err := tx.Save(account).Error; err != nil {
 			return err
 		}
 		var priorSecret any
@@ -934,6 +1133,23 @@ func metaMessengerPendingResumeAllowed(account *models.ChannelAccount) bool {
 		stringConfigValue(account.Metadata, "management_mode") != metaMessengerManagementMode {
 		return false
 	}
+	operation, operationErr := metaMessengerSubscriptionOperationFromAccount(account)
+	if operationErr == nil &&
+		operation.DesiredState == metaMessengerSubscriptionDesiredSubscribed &&
+		operation.State == metaMessengerSubscriptionSubscribePending &&
+		operation.ExpiresAt.After(time.Now().UTC()) {
+		return false
+	}
+	// Review rows have no safe legacy operation state. Keep the existing
+	// fail-closed behavior for malformed review metadata, while ordinary managed
+	// rows without lifecycle metadata remain eligible for the legacy recovery
+	// path once no valid active operation is present.
+	if operationErr != nil && boolConfigValue(account.Config, "review_only") {
+		return false
+	}
+	if metaMessengerReviewAccountMarker(account) || boolConfigValue(account.Metadata, "review_ready") {
+		return false
+	}
 	registryRecognized, ok := account.Metadata["registry_recognized"].(bool)
 	if !ok || registryRecognized {
 		return false
@@ -951,6 +1167,7 @@ func metaMessengerPendingResumeAllowed(account *models.ChannelAccount) bool {
 func (a *App) ensureMetaMessengerWebhookCredentialTx(
 	tx *gorm.DB,
 	orgID, accountID uuid.UUID,
+	inboundOnly bool,
 ) (models.ChannelCredential, bool, error) {
 	var credentials []models.ChannelCredential
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -971,7 +1188,7 @@ func (a *App) ensureMetaMessengerWebhookCredentialTx(
 		if credentials[index].Version > maximumVersion {
 			maximumVersion = credentials[index].Version
 		}
-		if keepIndex < 0 && a.metaMessengerWebhookCredentialValid(&credentials[index], now) {
+		if keepIndex < 0 && a.metaMessengerWebhookCredentialValid(&credentials[index], now, inboundOnly) {
 			keepIndex = index
 		}
 	}
@@ -989,20 +1206,24 @@ func (a *App) ensureMetaMessengerWebhookCredentialTx(
 	if err != nil {
 		return models.ChannelCredential{}, false, err
 	}
-	outboundSecret, err := generateChannelSecret()
-	if err != nil {
-		return models.ChannelCredential{}, false, err
-	}
-	if metaMessengerOpaqueValuesEqual(inboundSecret, outboundSecret) {
-		return models.ChannelCredential{}, false, errors.New("generated Messenger relay credentials collided")
-	}
 	encryptedInbound, err := appcrypto.Encrypt(inboundSecret, a.integrationEncryptionKey())
 	if err != nil || !appcrypto.IsEncrypted(encryptedInbound) {
 		return models.ChannelCredential{}, false, errors.New("messenger inbound credential could not be protected")
 	}
-	encryptedOutbound, err := appcrypto.Encrypt(outboundSecret, a.integrationEncryptionKey())
-	if err != nil || !appcrypto.IsEncrypted(encryptedOutbound) {
-		return models.ChannelCredential{}, false, errors.New("messenger outbound credential could not be protected")
+	credentialBlob := models.JSONB{"inbound_secret": encryptedInbound}
+	if !inboundOnly {
+		outboundSecret, err := generateChannelSecret()
+		if err != nil {
+			return models.ChannelCredential{}, false, err
+		}
+		if metaMessengerOpaqueValuesEqual(inboundSecret, outboundSecret) {
+			return models.ChannelCredential{}, false, errors.New("generated Messenger relay credentials collided")
+		}
+		encryptedOutbound, err := appcrypto.Encrypt(outboundSecret, a.integrationEncryptionKey())
+		if err != nil || !appcrypto.IsEncrypted(encryptedOutbound) {
+			return models.ChannelCredential{}, false, errors.New("messenger outbound credential could not be protected")
+		}
+		credentialBlob["outbound_secret"] = encryptedOutbound
 	}
 	credential := models.ChannelCredential{
 		BaseModel:        models.BaseModel{ID: uuid.New()},
@@ -1010,13 +1231,10 @@ func (a *App) ensureMetaMessengerWebhookCredentialTx(
 		ChannelAccountID: accountID,
 		Kind:             models.ChannelCredentialKindWebhook,
 		Version:          maximumVersion + 1,
-		CredentialBlob: models.JSONB{
-			"inbound_secret":  encryptedInbound,
-			"outbound_secret": encryptedOutbound,
-		},
-		Status:     models.ChannelCredentialStatusActive,
-		KeyVersion: "app:v1",
-		Metadata:   models.JSONB{"management_mode": metaMessengerManagementMode},
+		CredentialBlob:   credentialBlob,
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "app:v1",
+		Metadata:         models.JSONB{"management_mode": metaMessengerManagementMode},
 	}
 	if err := tx.Create(&credential).Error; err != nil {
 		return models.ChannelCredential{}, false, err
@@ -1027,6 +1245,7 @@ func (a *App) ensureMetaMessengerWebhookCredentialTx(
 func (a *App) metaMessengerWebhookCredentialValid(
 	credential *models.ChannelCredential,
 	now time.Time,
+	inboundOnly bool,
 ) bool {
 	if credential == nil || credential.Kind != models.ChannelCredentialKindWebhook ||
 		(credential.Status != models.ChannelCredentialStatusActive &&
@@ -1035,13 +1254,22 @@ func (a *App) metaMessengerWebhookCredentialValid(
 		return false
 	}
 	inbound, inboundOK := credential.CredentialBlob["inbound_secret"].(string)
-	outbound, outboundOK := credential.CredentialBlob["outbound_secret"].(string)
-	if !inboundOK || !outboundOK || !appcrypto.IsEncrypted(inbound) || !appcrypto.IsEncrypted(outbound) {
+	if !inboundOK || !appcrypto.IsEncrypted(inbound) {
 		return false
 	}
 	inboundPlaintext, inboundErr := appcrypto.Decrypt(inbound, a.integrationEncryptionKey())
+	if inboundErr != nil || inboundPlaintext == "" {
+		return false
+	}
+	outbound, outboundOK := credential.CredentialBlob["outbound_secret"].(string)
+	if inboundOnly {
+		return !outboundOK || strings.TrimSpace(outbound) == ""
+	}
+	if !outboundOK || !appcrypto.IsEncrypted(outbound) {
+		return false
+	}
 	outboundPlaintext, outboundErr := appcrypto.Decrypt(outbound, a.integrationEncryptionKey())
-	return inboundErr == nil && outboundErr == nil && inboundPlaintext != "" && outboundPlaintext != "" &&
+	return outboundErr == nil && outboundPlaintext != "" &&
 		!metaMessengerOpaqueValuesEqual(inboundPlaintext, outboundPlaintext)
 }
 
@@ -1129,6 +1357,200 @@ func rotateMetaMessengerOAuthCredentialTx(
 	return credential, nil
 }
 
+// scrubSupersededMetaMessengerReviewCredentialsTx makes review conversion
+// irreversible from an egress perspective. No historical webhook row is
+// allowed to retain an outbound HMAC, and only the exact current OAuth row
+// keeps a Page token for bounded cleanup recovery.
+func scrubSupersededMetaMessengerReviewCredentialsTx(
+	tx *gorm.DB,
+	organizationID, accountID, currentWebhookID, currentOAuthID uuid.UUID,
+	now time.Time,
+) error {
+	if tx == nil || organizationID == uuid.Nil || accountID == uuid.Nil ||
+		currentWebhookID == uuid.Nil || currentOAuthID == uuid.Nil || now.IsZero() {
+		return errors.New("review credential scrub binding is invalid")
+	}
+	for _, target := range []struct {
+		kind   models.ChannelCredentialKind
+		keepID uuid.UUID
+	}{
+		{kind: models.ChannelCredentialKindWebhook, keepID: currentWebhookID},
+		{kind: models.ChannelCredentialKindOAuth, keepID: currentOAuthID},
+	} {
+		if err := tx.Model(&models.ChannelCredential{}).
+			Where(
+				"organization_id = ? AND channel_account_id = ? AND kind = ? AND id <> ?",
+				organizationID,
+				accountID,
+				target.kind,
+				target.keepID,
+			).
+			Updates(map[string]any{
+				"status":          models.ChannelCredentialStatusRevoked,
+				"credential_blob": models.JSONB{},
+				"revoked_at":      now,
+				"rotated_at":      now,
+				"updated_at":      now,
+			}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func newMetaMessengerSubscriptionOperation(
+	oauth models.ChannelCredential,
+	now time.Time,
+) metaMessengerSubscriptionOperation {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return metaMessengerSubscriptionOperation{
+		ID:                uuid.New(),
+		OAuthCredentialID: oauth.ID,
+		OAuthVersion:      oauth.Version,
+		DesiredState:      metaMessengerSubscriptionDesiredSubscribed,
+		State:             metaMessengerSubscriptionSubscribePending,
+		ExpiresAt:         now.UTC().Add(metaMessengerSubscriptionOperationLease),
+	}
+}
+
+func writeMetaMessengerSubscriptionOperation(
+	metadata models.JSONB,
+	operation metaMessengerSubscriptionOperation,
+) {
+	if metadata == nil {
+		return
+	}
+	metadata[metaMessengerSubscriptionDesiredStateKey] = operation.DesiredState
+	metadata[metaMessengerSubscriptionOperationIDKey] = operation.ID.String()
+	metadata[metaMessengerSubscriptionOperationStateKey] = operation.State
+	metadata[metaMessengerSubscriptionOperationExpiresKey] = operation.ExpiresAt.UTC().Format(time.RFC3339Nano)
+	metadata[metaMessengerSubscriptionOAuthCredentialIDKey] = operation.OAuthCredentialID.String()
+	metadata[metaMessengerSubscriptionOAuthVersionKey] = strconv.Itoa(operation.OAuthVersion)
+}
+
+func metaMessengerSubscriptionOperationFromAccount(
+	account *models.ChannelAccount,
+) (metaMessengerSubscriptionOperation, error) {
+	var operation metaMessengerSubscriptionOperation
+	if account == nil || account.Metadata == nil {
+		return operation, errMetaMessengerSubscriptionFence
+	}
+	operationID := stringConfigValue(account.Metadata, metaMessengerSubscriptionOperationIDKey)
+	oauthID := stringConfigValue(account.Metadata, metaMessengerSubscriptionOAuthCredentialIDKey)
+	versionText := stringConfigValue(account.Metadata, metaMessengerSubscriptionOAuthVersionKey)
+	expiresText := stringConfigValue(account.Metadata, metaMessengerSubscriptionOperationExpiresKey)
+	var err error
+	operation.ID, err = uuid.Parse(operationID)
+	if err != nil || operation.ID == uuid.Nil || operation.ID.String() != operationID {
+		return metaMessengerSubscriptionOperation{}, errMetaMessengerSubscriptionFence
+	}
+	operation.OAuthCredentialID, err = uuid.Parse(oauthID)
+	if err != nil || operation.OAuthCredentialID == uuid.Nil || operation.OAuthCredentialID.String() != oauthID {
+		return metaMessengerSubscriptionOperation{}, errMetaMessengerSubscriptionFence
+	}
+	operation.OAuthVersion, err = strconv.Atoi(versionText)
+	if err != nil || operation.OAuthVersion <= 0 || strconv.Itoa(operation.OAuthVersion) != versionText {
+		return metaMessengerSubscriptionOperation{}, errMetaMessengerSubscriptionFence
+	}
+	operation.ExpiresAt, err = time.Parse(time.RFC3339Nano, expiresText)
+	if err != nil || operation.ExpiresAt.IsZero() {
+		return metaMessengerSubscriptionOperation{}, errMetaMessengerSubscriptionFence
+	}
+	operation.DesiredState = stringConfigValue(account.Metadata, metaMessengerSubscriptionDesiredStateKey)
+	operation.State = stringConfigValue(account.Metadata, metaMessengerSubscriptionOperationStateKey)
+	return operation, nil
+}
+
+func metaMessengerSubscriptionOperationMatches(
+	current, expected metaMessengerSubscriptionOperation,
+) bool {
+	return current.ID != uuid.Nil && current.ID == expected.ID &&
+		current.OAuthCredentialID != uuid.Nil && current.OAuthCredentialID == expected.OAuthCredentialID &&
+		current.OAuthVersion > 0 && current.OAuthVersion == expected.OAuthVersion &&
+		current.DesiredState == expected.DesiredState
+}
+
+// compensateMetaMessengerSubscribe is the second half of the lifecycle CAS.
+// A provider-side subscribe that can no longer finalize locally is always
+// followed by an idempotent unsubscribe/absence check. The acknowledgement is
+// persisted against the fenced operation so deprovisioning knows when it is
+// safe to erase the only recovery token.
+func (a *App) compensateMetaMessengerSubscribe(
+	ctx context.Context,
+	organizationID, accountID uuid.UUID,
+	expected metaMessengerSubscriptionOperation,
+	pageID, pageToken string,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	cleanupErr := a.unsubscribeMetaMessengerPage(cleanupCtx, pageID, pageToken)
+	persistErr := a.recordMetaMessengerSubscribeCompensation(
+		organizationID,
+		accountID,
+		expected,
+		cleanupErr == nil,
+	)
+	return errors.Join(cleanupErr, persistErr)
+}
+
+func (a *App) recordMetaMessengerSubscribeCompensation(
+	organizationID, accountID uuid.UUID,
+	expected metaMessengerSubscriptionOperation,
+	cleanupConfirmed bool,
+) error {
+	root := a.rootApp()
+	if root == nil || root.DB == nil || organizationID == uuid.Nil ||
+		accountID == uuid.Nil || expected.ID == uuid.Nil {
+		return errMetaMessengerSubscriptionFence
+	}
+	return database.WithTenantReadCommitted(root.DB, organizationID, func(tx *gorm.DB) error {
+		var account models.ChannelAccount
+		if err := tx.Unscoped().Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", accountID, organizationID).
+			First(&account).Error; err != nil {
+			return err
+		}
+		account.Metadata = cloneJSONB(account.Metadata)
+		desiredState := stringConfigValue(account.Metadata, metaMessengerSubscriptionDesiredStateKey)
+		currentOperationID := stringConfigValue(account.Metadata, metaMessengerSubscriptionOperationIDKey)
+		fencedOperationID := stringConfigValue(account.Metadata, metaMessengerSubscriptionFencedOperationIDKey)
+		expectedID := expected.ID.String()
+		if desiredState == metaMessengerSubscriptionDesiredUnsubscribed && fencedOperationID == expectedID {
+			account.Metadata[metaMessengerSubscriptionFencedAckKey] = cleanupConfirmed
+			if cleanupConfirmed {
+				now := time.Now().UTC()
+				account.Metadata[metaMessengerSubscriptionFencedAckAtKey] = now.Format(time.RFC3339Nano)
+				account.Metadata[metaMessengerSubscriptionRemoteStateKey] = metaMessengerSubscriptionRemoteUnsubscribed
+				account.Metadata[metaMessengerSubscriptionRemoteConfirmedAtKey] = now.Format(time.RFC3339Nano)
+			} else {
+				account.Metadata[metaMessengerSubscriptionRemoteStateKey] = metaMessengerSubscriptionRemoteUnknown
+				delete(account.Metadata, metaMessengerSubscriptionRemoteConfirmedAtKey)
+				account.Config = cloneJSONB(account.Config)
+				account.Config["onboarding_state"] = "review_remote_cleanup_pending"
+				account.Metadata["onboarding_state"] = "review_remote_cleanup_pending"
+			}
+		} else if desiredState == metaMessengerSubscriptionDesiredSubscribed && currentOperationID == expectedID {
+			account.Metadata[metaMessengerSubscriptionOperationStateKey] = metaMessengerSubscriptionSubscribeFailed
+			if cleanupConfirmed {
+				now := time.Now().UTC()
+				account.Metadata[metaMessengerSubscriptionRemoteStateKey] = metaMessengerSubscriptionRemoteUnsubscribed
+				account.Metadata[metaMessengerSubscriptionRemoteConfirmedAtKey] = now.Format(time.RFC3339Nano)
+			} else {
+				account.Metadata[metaMessengerSubscriptionRemoteStateKey] = metaMessengerSubscriptionRemoteUnknown
+				delete(account.Metadata, metaMessengerSubscriptionRemoteConfirmedAtKey)
+			}
+		} else {
+			return errMetaMessengerSubscriptionFence
+		}
+		return tx.Unscoped().Save(&account).Error
+	})
+}
+
 func (a *App) finalizeMetaMessengerPendingAccount(
 	orgID, userID, accountID uuid.UUID,
 	state string,
@@ -1136,27 +1558,131 @@ func (a *App) finalizeMetaMessengerPendingAccount(
 	lastError string,
 ) (*models.ChannelAccount, error) {
 	root := a.rootApp()
+	if root == nil || root.DB == nil {
+		return nil, errors.New("messenger onboarding database is unavailable")
+	}
+	var operation metaMessengerSubscriptionOperation
+	err := database.WithTenantReadCommitted(root.DB, orgID, func(tx *gorm.DB) error {
+		current, err := loadChannelAccount(tx, orgID, accountID, true)
+		if err != nil {
+			return err
+		}
+		operation, err = metaMessengerSubscriptionOperationFromAccount(current)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	remoteState := metaMessengerSubscriptionRemoteUnknown
+	if subscriptionVerified {
+		remoteState = metaMessengerSubscriptionRemoteSubscribed
+	}
+	return a.finalizeMetaMessengerPendingAccountOperation(
+		orgID,
+		userID,
+		accountID,
+		operation,
+		state,
+		subscriptionVerified,
+		lastError,
+		remoteState,
+	)
+}
+
+func (a *App) finalizeMetaMessengerPendingAccountOperation(
+	orgID, userID, accountID uuid.UUID,
+	expected metaMessengerSubscriptionOperation,
+	state string,
+	subscriptionVerified bool,
+	lastError, remoteState string,
+) (*models.ChannelAccount, error) {
+	root := a.rootApp()
+	if root == nil || root.DB == nil || expected.ID == uuid.Nil ||
+		expected.OAuthCredentialID == uuid.Nil || expected.OAuthVersion <= 0 ||
+		expected.DesiredState != metaMessengerSubscriptionDesiredSubscribed {
+		return nil, errMetaMessengerSubscriptionFence
+	}
 	var account *models.ChannelAccount
 	err := database.WithTenantReadCommitted(root.DB, orgID, func(tx *gorm.DB) error {
 		current, err := loadChannelAccount(tx, orgID, accountID, true)
 		if err != nil {
 			return err
 		}
+		operation, err := metaMessengerSubscriptionOperationFromAccount(current)
+		if err != nil || !metaMessengerSubscriptionOperationMatches(operation, expected) ||
+			operation.DesiredState != metaMessengerSubscriptionDesiredSubscribed {
+			return errMetaMessengerSubscriptionFence
+		}
+		var oauth models.ChannelCredential
+		if err := tx.Where(
+			"id = ? AND organization_id = ? AND channel_account_id = ? AND kind = ? AND version = ? AND status IN ?",
+			expected.OAuthCredentialID,
+			orgID,
+			accountID,
+			models.ChannelCredentialKindOAuth,
+			expected.OAuthVersion,
+			[]models.ChannelCredentialStatus{
+				models.ChannelCredentialStatusActive,
+				models.ChannelCredentialStatusExpiring,
+			},
+		).First(&oauth).Error; err != nil ||
+			stringConfigValue(oauth.Metadata, "app_id") != stringConfigValue(current.Metadata, "meta_app_id") ||
+			stringConfigValue(oauth.Metadata, "page_id") != current.ExternalAccountID ||
+			stringConfigValue(oauth.Metadata, "meta_business_id") != stringConfigValue(current.Metadata, "meta_business_id") {
+			return errMetaMessengerSubscriptionFence
+		}
 		old := *current
 		old.Config = cloneJSONB(current.Config)
 		old.Metadata = cloneJSONB(current.Metadata)
 		old.Capabilities = cloneJSONB(current.Capabilities)
+		reviewConfigured := root.configuredMetaMessengerReviewAccount(current)
+		if reviewConfigured && subscriptionVerified {
+			state = metaMessengerReviewReadyState
+		}
 		current.Status = models.ChannelAccountStatusPending
 		current.Config = cloneJSONB(current.Config)
 		current.Config["onboarding_state"] = state
 		current.Config["registry_recognized"] = false
 		current.Config["outbound_enabled"] = false
 		current.Config["ai_reply_enabled"] = false
+		current.IsDefaultOutgoing = false
 		current.Metadata = cloneJSONB(current.Metadata)
 		current.Metadata["onboarding_state"] = state
 		current.Metadata["subscription_verified"] = subscriptionVerified
 		current.Metadata["registry_recognized"] = false
 		now := time.Now().UTC()
+		if subscriptionVerified {
+			current.Metadata[metaMessengerSubscriptionOperationStateKey] = metaMessengerSubscriptionSubscribeComplete
+			current.Metadata[metaMessengerSubscriptionRemoteStateKey] = metaMessengerSubscriptionRemoteSubscribed
+			current.Metadata[metaMessengerSubscriptionRemoteConfirmedAtKey] = now.Format(time.RFC3339Nano)
+		} else {
+			current.Metadata[metaMessengerSubscriptionOperationStateKey] = metaMessengerSubscriptionSubscribeFailed
+			if remoteState != metaMessengerSubscriptionRemoteUnsubscribed {
+				remoteState = metaMessengerSubscriptionRemoteUnknown
+			}
+			current.Metadata[metaMessengerSubscriptionRemoteStateKey] = remoteState
+			if remoteState == metaMessengerSubscriptionRemoteUnsubscribed {
+				current.Metadata[metaMessengerSubscriptionRemoteConfirmedAtKey] = now.Format(time.RFC3339Nano)
+			} else {
+				delete(current.Metadata, metaMessengerSubscriptionRemoteConfirmedAtKey)
+			}
+		}
+		if reviewConfigured {
+			current.Config["review_only"] = true
+			current.Metadata["review_ready"] = subscriptionVerified
+			if subscriptionVerified {
+				review := root.Config.MetaMessengerReviewRelay
+				current.Metadata["review_relay_mode"] = metareview.Marker
+				current.Metadata["review_generation"] = review.Generation
+				current.Metadata["review_expires_at"] = review.ExpiresAt
+				current.Metadata["review_ready_at"] = now.Format(time.RFC3339Nano)
+			} else {
+				delete(current.Metadata, "review_relay_mode")
+				delete(current.Metadata, "review_generation")
+				delete(current.Metadata, "review_expires_at")
+				delete(current.Metadata, "review_ready_at")
+			}
+		}
 		if subscriptionVerified {
 			current.Metadata["subscription_verified_at"] = now.Format(time.RFC3339Nano)
 			current.LastError = ""

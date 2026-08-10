@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -27,6 +29,8 @@ const (
 	defaultPollInterval      = 500 * time.Millisecond
 	defaultWorkerConcurrency = 4
 	defaultMaxAttempts       = 12
+	defaultReviewCacheTTL    = 2 * time.Second
+	maximumReviewCacheTTL    = 10 * time.Second
 	queueSettlementTimeout   = 5 * time.Second
 	leaseSafetyMargin        = time.Second
 	maxWorkerConcurrency     = 64
@@ -53,47 +57,64 @@ func LoadConfig() (*Config, error) {
 
 func loadConfig(getenv func(string) string) (*Config, error) {
 	config := &Config{
-		ListenAddr:                  strings.TrimSpace(getenv("META_RELAY_LISTEN_ADDR")),
-		RedisURL:                    strings.TrimSpace(getenv("META_RELAY_REDIS_URL")),
-		RedisPrefix:                 strings.TrimSpace(getenv("META_RELAY_REDIS_PREFIX")),
-		ReReplyBaseURL:              strings.TrimSpace(getenv("META_RELAY_REREPLY_BASE_URL")),
-		ReReplyProviderProofSecret:  getenv("META_RELAY_REREPLY_PROVIDER_PROOF_SECRET"),
-		MessengerAppSecret:          getenv("META_RELAY_MESSENGER_APP_SECRET"),
-		MessengerAppID:              strings.TrimSpace(getenv("META_RELAY_MESSENGER_APP_ID")),
-		MessengerAppMode:            strings.ToLower(strings.TrimSpace(getenv("META_RELAY_MESSENGER_APP_MODE"))),
-		MessengerAppOwnerBusinessID: strings.TrimSpace(getenv("META_RELAY_MESSENGER_APP_OWNER_BUSINESS_ID")),
-		MessengerTechProviderStatus: strings.TrimSpace(getenv("META_RELAY_MESSENGER_TECH_PROVIDER_STATUS")),
-		MessengerAppReviewStatus:    strings.ToLower(strings.TrimSpace(getenv("META_RELAY_MESSENGER_APP_REVIEW_STATUS"))),
-		MessengerAppPermissions:     commaSeparatedValues(getenv("META_RELAY_MESSENGER_APP_REVIEW_PERMISSIONS")),
-		MessengerReviewedBy:         strings.TrimSpace(getenv("META_RELAY_MESSENGER_REVIEWED_BY")),
-		MessengerReviewedAt:         strings.TrimSpace(getenv("META_RELAY_MESSENGER_REVIEWED_AT")),
-		MessengerReviewEvidence:     strings.TrimSpace(getenv("META_RELAY_MESSENGER_REVIEW_EVIDENCE")),
-		MessengerVerifyToken:        getenv("META_RELAY_MESSENGER_VERIFY_TOKEN"),
-		InstagramLoginAppSecret:     getenv("META_RELAY_INSTAGRAM_APP_SECRET"),
-		InstagramLoginAppID:         strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_APP_ID")),
-		InstagramAppMode:            strings.ToLower(strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_APP_MODE"))),
-		InstagramAppOwnerBusinessID: strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_APP_OWNER_BUSINESS_ID")),
-		InstagramTechProviderStatus: strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_TECH_PROVIDER_STATUS")),
-		InstagramAppReviewStatus:    strings.ToLower(strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_APP_REVIEW_STATUS"))),
-		InstagramAppPermissions:     commaSeparatedValues(getenv("META_RELAY_INSTAGRAM_APP_REVIEW_PERMISSIONS")),
-		InstagramReviewedBy:         strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_REVIEWED_BY")),
-		InstagramReviewedAt:         strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_REVIEWED_AT")),
-		InstagramReviewEvidence:     strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_REVIEW_EVIDENCE")),
-		InstagramLoginVerifyToken:   getenv("META_RELAY_INSTAGRAM_VERIFY_TOKEN"),
-		GraphAPIVersion:             strings.TrimSpace(getenv("META_RELAY_GRAPH_API_VERSION")),
-		InboundRetention:            defaultInboundRetention,
-		OutboundRetention:           defaultOutboundRetention,
-		ProcessingLease:             defaultProcessingLease,
-		ForwardTimeout:              defaultForwardTimeout,
-		PollInterval:                defaultPollInterval,
-		WorkerConcurrency:           defaultWorkerConcurrency,
-		MaxAttempts:                 defaultMaxAttempts,
+		RuntimeMode:                  RuntimeMode(strings.ToLower(strings.TrimSpace(getenv("META_RELAY_RUNTIME_MODE")))),
+		DeploymentEnvironment:        strings.ToLower(strings.TrimSpace(getenv("META_RELAY_DEPLOYMENT_ENVIRONMENT"))),
+		ListenAddr:                   strings.TrimSpace(getenv("META_RELAY_LISTEN_ADDR")),
+		RedisURL:                     strings.TrimSpace(getenv("META_RELAY_REDIS_URL")),
+		RedisPrefix:                  strings.TrimSpace(getenv("META_RELAY_REDIS_PREFIX")),
+		ReReplyBaseURL:               strings.TrimSpace(getenv("META_RELAY_REREPLY_BASE_URL")),
+		ReReplyProviderProofSecret:   getenv("META_RELAY_REREPLY_PROVIDER_PROOF_SECRET"),
+		MessengerAppSecret:           getenv("META_RELAY_MESSENGER_APP_SECRET"),
+		MessengerAppID:               strings.TrimSpace(getenv("META_RELAY_MESSENGER_APP_ID")),
+		MessengerAppMode:             strings.ToLower(strings.TrimSpace(getenv("META_RELAY_MESSENGER_APP_MODE"))),
+		MessengerAppOwnerBusinessID:  strings.TrimSpace(getenv("META_RELAY_MESSENGER_APP_OWNER_BUSINESS_ID")),
+		MessengerTechProviderStatus:  strings.TrimSpace(getenv("META_RELAY_MESSENGER_TECH_PROVIDER_STATUS")),
+		MessengerAppReviewStatus:     strings.ToLower(strings.TrimSpace(getenv("META_RELAY_MESSENGER_APP_REVIEW_STATUS"))),
+		MessengerAppPermissions:      commaSeparatedValues(getenv("META_RELAY_MESSENGER_APP_REVIEW_PERMISSIONS")),
+		MessengerReviewedBy:          strings.TrimSpace(getenv("META_RELAY_MESSENGER_REVIEWED_BY")),
+		MessengerReviewedAt:          strings.TrimSpace(getenv("META_RELAY_MESSENGER_REVIEWED_AT")),
+		MessengerReviewEvidence:      strings.TrimSpace(getenv("META_RELAY_MESSENGER_REVIEW_EVIDENCE")),
+		MessengerVerifyToken:         getenv("META_RELAY_MESSENGER_VERIFY_TOKEN"),
+		InstagramLoginAppSecret:      getenv("META_RELAY_INSTAGRAM_APP_SECRET"),
+		InstagramLoginAppID:          strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_APP_ID")),
+		InstagramAppMode:             strings.ToLower(strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_APP_MODE"))),
+		InstagramAppOwnerBusinessID:  strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_APP_OWNER_BUSINESS_ID")),
+		InstagramTechProviderStatus:  strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_TECH_PROVIDER_STATUS")),
+		InstagramAppReviewStatus:     strings.ToLower(strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_APP_REVIEW_STATUS"))),
+		InstagramAppPermissions:      commaSeparatedValues(getenv("META_RELAY_INSTAGRAM_APP_REVIEW_PERMISSIONS")),
+		InstagramReviewedBy:          strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_REVIEWED_BY")),
+		InstagramReviewedAt:          strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_REVIEWED_AT")),
+		InstagramReviewEvidence:      strings.TrimSpace(getenv("META_RELAY_INSTAGRAM_REVIEW_EVIDENCE")),
+		InstagramLoginVerifyToken:    getenv("META_RELAY_INSTAGRAM_VERIFY_TOKEN"),
+		GraphAPIVersion:              strings.TrimSpace(getenv("META_RELAY_GRAPH_API_VERSION")),
+		InboundRetention:             defaultInboundRetention,
+		OutboundRetention:            defaultOutboundRetention,
+		ProcessingLease:              defaultProcessingLease,
+		ForwardTimeout:               defaultForwardTimeout,
+		PollInterval:                 defaultPollInterval,
+		WorkerConcurrency:            defaultWorkerConcurrency,
+		MaxAttempts:                  defaultMaxAttempts,
+		ReviewOrganizationID:         strings.TrimSpace(getenv("META_RELAY_REVIEW_ORGANIZATION_ID")),
+		ReviewMetaBusinessID:         strings.TrimSpace(getenv("META_RELAY_REVIEW_META_BUSINESS_ID")),
+		ReviewPageID:                 strings.TrimSpace(getenv("META_RELAY_REVIEW_PAGE_ID")),
+		ReviewChannelAccountID:       strings.TrimSpace(getenv("META_RELAY_REVIEW_CHANNEL_ACCOUNT_ID")),
+		ReviewGeneration:             strings.TrimSpace(getenv("META_RELAY_REVIEW_GENERATION")),
+		ReviewExpiresAt:              strings.TrimSpace(getenv("META_RELAY_REVIEW_EXPIRES_AT")),
+		ReviewBrokerAuthSecret:       getenv("META_RELAY_REVIEW_BROKER_AUTH_SECRET"),
+		ReviewBundleEncryptionSecret: getenv("META_RELAY_REVIEW_BROKER_WRAP_SECRET"),
+		ReviewBindingCacheTTL:        defaultReviewCacheTTL,
+	}
+	if config.RuntimeMode == "" {
+		config.RuntimeMode = RuntimeModeProduction
 	}
 	if config.ListenAddr == "" {
 		config.ListenAddr = defaultListenAddr
 	}
-	if config.RedisPrefix == "" {
+	if config.RedisPrefix == "" && !config.stagingMessengerReview() {
 		config.RedisPrefix = defaultRedisPrefix
+	}
+	if config.RedisPrefix == "" && config.stagingMessengerReview() {
+		config.RedisPrefix = "rereply:meta-relay:review:" + config.ReviewGeneration + ":"
 	}
 
 	var err error
@@ -118,18 +139,28 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 	if config.MaxAttempts, err = envPositiveInt(getenv, "META_RELAY_MAX_ATTEMPTS", config.MaxAttempts); err != nil {
 		return nil, err
 	}
+	if config.ReviewBindingCacheTTL, err = envDuration(
+		getenv,
+		"META_RELAY_REVIEW_BINDING_CACHE_TTL",
+		config.ReviewBindingCacheTTL,
+	); err != nil {
+		return nil, err
+	}
 
 	rawAccounts := strings.TrimSpace(getenv("META_RELAY_ACCOUNTS_JSON"))
 	if rawAccounts == "" {
-		return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is required")
-	}
-	decoder := json.NewDecoder(strings.NewReader(rawAccounts))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&config.Accounts); err != nil {
-		return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is invalid")
-	}
-	if err := rejectTrailingJSON(decoder); err != nil {
-		return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is invalid")
+		if !config.stagingMessengerReview() {
+			return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is required")
+		}
+	} else {
+		decoder := json.NewDecoder(strings.NewReader(rawAccounts))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&config.Accounts); err != nil {
+			return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is invalid")
+		}
+		if err := rejectTrailingJSON(decoder); err != nil {
+			return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is invalid")
+		}
 	}
 	if err := config.validateAndIndex(getenv); err != nil {
 		return nil, err
@@ -138,6 +169,17 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 }
 
 func (c *Config) validateAndIndex(getenv func(string) string) error {
+	switch c.RuntimeMode {
+	case "", RuntimeModeProduction:
+		return c.validateProductionAndIndex(getenv)
+	case RuntimeModeStagingMessengerReview:
+		return c.validateStagingMessengerReview(getenv)
+	default:
+		return errors.New("environment variable META_RELAY_RUNTIME_MODE is invalid")
+	}
+}
+
+func (c *Config) validateProductionAndIndex(getenv func(string) string) error {
 	if strings.TrimSpace(c.RedisURL) == "" {
 		return errors.New("environment variable META_RELAY_REDIS_URL is required; durable acceptance has no in-memory fallback")
 	}
@@ -374,6 +416,212 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 		}
 		c.byKey[account.Key] = account
 		c.byExternal[externalKey] = account
+	}
+	return nil
+}
+
+func (c *Config) validateStagingMessengerReview(_ func(string) string) error {
+	if c.DeploymentEnvironment != "staging" {
+		return errors.New("environment variable META_RELAY_DEPLOYMENT_ENVIRONMENT must be staging in Messenger review mode")
+	}
+	if strings.TrimSpace(c.RedisURL) == "" {
+		return errors.New("environment variable META_RELAY_REDIS_URL is required; durable acceptance has no in-memory fallback")
+	}
+	if _, err := redis.ParseURL(c.RedisURL); err != nil {
+		return errors.New("environment variable META_RELAY_REDIS_URL is invalid")
+	}
+	if err := validateReviewRedisURL(c.RedisURL); err != nil {
+		return fmt.Errorf("environment variable META_RELAY_REDIS_URL: %w", err)
+	}
+	if err := validateReviewRootSecret(
+		"environment variable META_RELAY_MESSENGER_APP_SECRET",
+		c.MessengerAppSecret,
+	); err != nil {
+		return err
+	}
+	if !metaAppIDPattern.MatchString(c.MessengerAppID) {
+		return errors.New("environment variable META_RELAY_MESSENGER_APP_ID must be a valid numeric Meta app ID")
+	}
+	if c.MessengerAppMode != "development" {
+		return errors.New("environment variable META_RELAY_MESSENGER_APP_MODE must be development in Messenger review mode")
+	}
+	if !metaBusinessIDPattern.MatchString(c.MessengerAppOwnerBusinessID) {
+		return errors.New("environment variable META_RELAY_MESSENGER_APP_OWNER_BUSINESS_ID must be a valid numeric Meta Business Portfolio ID")
+	}
+	if c.MessengerTechProviderStatus != "verified" {
+		return errors.New("environment variable META_RELAY_MESSENGER_TECH_PROVIDER_STATUS must be verified")
+	}
+	switch c.MessengerAppReviewStatus {
+	case "not_submitted", "pending", "in_review":
+	case "approved":
+		return errors.New("environment variable META_RELAY_MESSENGER_APP_REVIEW_STATUS must not claim approval in Messenger review mode")
+	default:
+		return errors.New("environment variable META_RELAY_MESSENGER_APP_REVIEW_STATUS must truthfully be not_submitted, pending, or in_review")
+	}
+	if len(c.MessengerAppPermissions) != 0 ||
+		c.MessengerReviewedBy != "" ||
+		c.MessengerReviewedAt != "" ||
+		c.MessengerReviewEvidence != "" {
+		return errors.New("Messenger review mode must not contain approved permission or App Review evidence assertions")
+	}
+	if err := validateReviewRootSecret(
+		"environment variable META_RELAY_MESSENGER_VERIFY_TOKEN",
+		c.MessengerVerifyToken,
+	); err != nil {
+		return err
+	}
+	if c.InstagramLoginAppSecret != "" ||
+		c.InstagramLoginAppID != "" ||
+		c.InstagramAppMode != "" ||
+		c.InstagramAppOwnerBusinessID != "" ||
+		c.InstagramTechProviderStatus != "" ||
+		c.InstagramAppReviewStatus != "" ||
+		len(c.InstagramAppPermissions) != 0 ||
+		c.InstagramReviewedBy != "" ||
+		c.InstagramReviewedAt != "" ||
+		c.InstagramReviewEvidence != "" ||
+		c.InstagramLoginVerifyToken != "" {
+		return errors.New("Instagram configuration is forbidden in Messenger review mode")
+	}
+	if len(c.Accounts) != 0 {
+		return errors.New("META_RELAY_ACCOUNTS_JSON is forbidden in Messenger review mode; the binding must come from the review broker")
+	}
+	organizationID, err := canonicalOrganizationID(c.ReviewOrganizationID)
+	if err != nil {
+		return fmt.Errorf("environment variable META_RELAY_REVIEW_ORGANIZATION_ID: %w", err)
+	}
+	c.ReviewOrganizationID = organizationID
+	if !metaBusinessIDPattern.MatchString(c.ReviewMetaBusinessID) {
+		return errors.New("environment variable META_RELAY_REVIEW_META_BUSINESS_ID must be a valid numeric Meta Business Portfolio ID")
+	}
+	if !metaBusinessIDPattern.MatchString(c.ReviewPageID) {
+		return errors.New("environment variable META_RELAY_REVIEW_PAGE_ID must be a valid numeric Meta Page ID")
+	}
+	channelAccountID, err := canonicalOrganizationID(c.ReviewChannelAccountID)
+	if err != nil {
+		return fmt.Errorf("environment variable META_RELAY_REVIEW_CHANNEL_ACCOUNT_ID: %w", err)
+	}
+	c.ReviewChannelAccountID = channelAccountID
+	generation, err := canonicalOrganizationID(c.ReviewGeneration)
+	if err != nil {
+		return fmt.Errorf("environment variable META_RELAY_REVIEW_GENERATION: %w", err)
+	}
+	c.ReviewGeneration = generation
+	if err := validateReviewAuthorityExpiry(c.ReviewExpiresAt, time.Now().UTC()); err != nil {
+		return fmt.Errorf("environment variable META_RELAY_REVIEW_EXPIRES_AT: %w", err)
+	}
+	expectedRedisPrefix := "rereply:meta-relay:review:" + c.ReviewGeneration + ":"
+	if c.RedisPrefix != expectedRedisPrefix {
+		return fmt.Errorf("environment variable META_RELAY_REDIS_PREFIX must exactly isolate the review generation as %q", expectedRedisPrefix)
+	}
+	if err := validateReviewRootSecret(
+		"environment variable META_RELAY_REREPLY_PROVIDER_PROOF_SECRET",
+		c.ReReplyProviderProofSecret,
+	); err != nil {
+		return err
+	}
+	if err := validateReviewRootSecret(
+		"environment variable META_RELAY_REVIEW_BROKER_AUTH_SECRET",
+		c.ReviewBrokerAuthSecret,
+	); err != nil {
+		return err
+	}
+	if err := validateReviewRootSecret(
+		"environment variable META_RELAY_REVIEW_BROKER_WRAP_SECRET",
+		c.ReviewBundleEncryptionSecret,
+	); err != nil {
+		return err
+	}
+	secrets := []struct {
+		label string
+		value string
+	}{
+		{label: "review provider proof secret", value: c.ReReplyProviderProofSecret},
+		{label: "review broker authentication secret", value: c.ReviewBrokerAuthSecret},
+		{label: "review bundle encryption secret", value: c.ReviewBundleEncryptionSecret},
+		{label: "Messenger app secret", value: c.MessengerAppSecret},
+		{label: "Messenger verify token", value: c.MessengerVerifyToken},
+	}
+	for index, secret := range secrets {
+		for prior := 0; prior < index; prior++ {
+			if secret.value == secrets[prior].value {
+				return fmt.Errorf("%s must be distinct from %s", secret.label, secrets[prior].label)
+			}
+		}
+	}
+	if c.InboundRetention <= 0 ||
+		c.OutboundRetention <= 0 ||
+		c.ProcessingLease <= 0 ||
+		c.ForwardTimeout <= 0 ||
+		c.PollInterval <= 0 ||
+		c.WorkerConcurrency <= 0 ||
+		c.MaxAttempts <= 0 {
+		return errors.New("relay durations and max attempts must be positive")
+	}
+	if c.WorkerConcurrency > maxWorkerConcurrency {
+		return fmt.Errorf("environment variable META_RELAY_WORKER_CONCURRENCY must not exceed %d", maxWorkerConcurrency)
+	}
+	if c.ProcessingLease < c.ForwardTimeout+queueSettlementTimeout+leaseSafetyMargin {
+		return errors.New("environment variable META_RELAY_PROCESSING_LEASE must cover forward timeout and queue settlement")
+	}
+	if c.ReviewBindingCacheTTL <= 0 || c.ReviewBindingCacheTTL > maximumReviewCacheTTL {
+		return fmt.Errorf("environment variable META_RELAY_REVIEW_BINDING_CACHE_TTL must be positive and not exceed %s", maximumReviewCacheTTL)
+	}
+	if _, err := validateReReplyBaseURL(c.ReReplyBaseURL, c.allowInsecureTestEndpoints); err != nil {
+		return fmt.Errorf("environment variable META_RELAY_REREPLY_BASE_URL: %w", err)
+	}
+
+	// Review bindings are fetched just in time. Leaving both production indexes
+	// empty makes a static account lookup fail closed even if a production-only
+	// handler is accidentally invoked.
+	c.byExternal = make(map[string]*AccountConfig)
+	c.byKey = make(map[string]*AccountConfig)
+	return nil
+}
+
+func validateReviewRedisURL(raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return errors.New("is invalid")
+	}
+	if parsed.Scheme == "rediss" || parsed.Scheme == "unix" {
+		return nil
+	}
+	if parsed.Scheme != "redis" {
+		return errors.New("must use rediss TLS outside loopback")
+	}
+	hostname := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if hostname == "localhost" {
+		return nil
+	}
+	if address := net.ParseIP(hostname); address != nil && address.IsLoopback() {
+		return nil
+	}
+	return errors.New("must use rediss TLS outside loopback")
+}
+
+func validateReviewAuthorityExpiry(raw string, now time.Time) error {
+	if !strings.HasSuffix(raw, "Z") {
+		return errors.New("must be a canonical UTC RFC3339 timestamp")
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil || expiresAt.Format(time.RFC3339Nano) != raw {
+		return errors.New("must be a canonical UTC RFC3339 timestamp")
+	}
+	if !expiresAt.After(now.UTC()) {
+		return errors.New("must be in the future")
+	}
+	return nil
+}
+
+func validateReviewRootSecret(name, value string) error {
+	if len([]byte(value)) < minimumHMACSecretBytes ||
+		strings.IndexFunc(value, unicode.IsSpace) >= 0 {
+		return fmt.Errorf(
+			"%s must contain at least %d bytes and no whitespace",
+			name,
+			minimumHMACSecretBytes,
+		)
 	}
 	return nil
 }

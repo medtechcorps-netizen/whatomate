@@ -92,6 +92,7 @@ jobs:
           set -euo pipefail
           app_id="54bc0d92-73e9-4f8b-86cd-c3fd96e06beb"
           app_spec="$(doctl apps spec get "${app_id}" --format json)"
+          python3 scripts/meta_relay_preflight.py --reject-review-runtime-only <<<"${app_spec}"
           if ! jq -e 'any(.services[]?; .name == "meta-relay")' <<<"${app_spec}" >/dev/null; then
             if [[ -n "${META_RELAY_EXPECTED_ACCOUNTS_JSON}" ]]; then
               echo "::error::Protected Meta relay inventory exists, but the meta-relay service is missing."
