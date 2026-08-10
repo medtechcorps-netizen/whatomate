@@ -146,7 +146,7 @@ func TestMetaMessengerDiscoveryIntersectsAccessWithOwnedPages(t *testing.T) {
 			_, _ = writer.Write([]byte(`{"id":"900000000000001","name":"Platform Admin"}`))
 		case "/v25.0/me/accounts":
 			_, _ = writer.Write([]byte(`{"data":[
-				{"id":"700000000000001","name":"Owned Clinic","tasks":["MESSAGING"],"access_token":"owned-page-token"},
+				{"id":"700000000000001","name":"Owned Clinic","tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"owned-page-token"},
 				{"id":"700000000000002","name":"Client Clinic","tasks":["MESSAGING"],"access_token":"client-page-token"},
 				{"id":"700000000000003","name":"Unverified Clinic","tasks":["MESSAGING"],"access_token":"unverified-page-token"},
 				{"id":"700000000000004","name":"No Messaging Task","tasks":["CREATE_CONTENT"],"access_token":"limited-page-token"}
@@ -224,7 +224,7 @@ func TestMetaMessengerSystemUserDiscoveryPinsClientBusinessWithoutUserEdges(t *t
 		case "/v25.0/200000000000001/owned_pages":
 			assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
 			_, _ = writer.Write([]byte(`{"data":[
-				{"id":"700000000000001","name":"Owned Clinic","tasks":["MESSAGING"],"access_token":"system-page-token"},
+				{"id":"700000000000001","name":"Owned Clinic","tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"system-page-token"},
 				{"id":"700000000000004","name":"Limited Clinic","tasks":["CREATE_CONTENT"],"access_token":"limited-token"}
 			]}`))
 		case "/v25.0/200000000000001/client_pages":
@@ -265,6 +265,25 @@ func TestMetaMessengerSystemUserDiscoveryPinsClientBusinessWithoutUserEdges(t *t
 	assert.True(t, appcrypto.IsEncrypted(byID[metaMessengerTestPageID].EncryptedPageToken))
 	assert.Equal(t, metaMessengerDisabledTask, byID["700000000000004"].DisabledReason)
 	assert.Equal(t, metaMessengerDisabledClient, byID["700000000000002"].DisabledReason)
+}
+
+func TestMetaMessengerHasMessagingTaskAcceptsOnlyKnownMessagingTasks(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		tasks []string
+		want  bool
+	}{
+		{name: "legacy task", tasks: []string{"MESSAGING"}, want: true},
+		{name: "new Pages experience task", tasks: []string{"PROFILE_PLUS_MESSAGING"}, want: true},
+		{name: "normalizes case and whitespace", tasks: []string{" profile_plus_messaging "}, want: true},
+		{name: "unrelated profile task", tasks: []string{"PROFILE_PLUS_CREATE_CONTENT"}},
+		{name: "suffix match is rejected", tasks: []string{"NOT_PROFILE_PLUS_MESSAGING"}},
+		{name: "empty task list"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			assert.Equal(t, testCase.want, metaMessengerHasMessagingTask(testCase.tasks))
+		})
+	}
 }
 
 func TestSelectMetaMessengerOwnedPageRejectsClientAndMissingEvidence(t *testing.T) {
@@ -320,6 +339,11 @@ func TestMetaMessengerSelectionFreshlyRevalidatesAccessAndOwnedPages(t *testing.
 			name:       "fresh exact intersection",
 			ownedPages: `{"data":[{"id":"700000000000001","name":"Fresh Owned Clinic"}]}`,
 			tasks:      `"MESSAGING"`,
+		},
+		{
+			name:       "fresh New Pages Experience messaging task",
+			ownedPages: `{"data":[{"id":"700000000000001","name":"Fresh Owned Clinic"}]}`,
+			tasks:      `"PROFILE_PLUS_MESSAGING"`,
 		},
 		{
 			name:       "ownership removed after inventory",
@@ -388,7 +412,7 @@ func TestMetaMessengerSystemUserSelectionRevalidatesDirectOwnedPage(t *testing.T
 		writer.Header().Set("Content-Type", "application/json")
 		assert.Equal(t, "/v25.0/"+metaMessengerTestBusinessID+"/owned_pages", request.URL.Path)
 		assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
-		_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"BISU Clinic","tasks":["MESSAGING"],"access_token":"fresh-system-page-token"}]}`))
+		_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"BISU Clinic","tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"fresh-system-page-token"}]}`))
 	}))
 	defer server.Close()
 	app := newMetaMessengerGraphTestApp(t, server)
@@ -411,7 +435,7 @@ func TestMetaMessengerSystemUserSelectionRevalidatesDirectOwnedPage(t *testing.T
 		selected,
 	)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"MESSAGING"}, fresh.Tasks)
+	assert.Equal(t, []string{"PROFILE_PLUS_MESSAGING"}, fresh.Tasks)
 	plaintext, decryptErr := appcrypto.Decrypt(fresh.EncryptedPageToken, metaMessengerTestEncryptionKey)
 	require.NoError(t, decryptErr)
 	assert.Equal(t, "fresh-system-page-token", plaintext)

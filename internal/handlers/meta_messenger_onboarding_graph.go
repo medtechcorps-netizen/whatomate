@@ -697,7 +697,8 @@ func sortMetaMessengerInventory(
 
 func metaMessengerHasMessagingTask(tasks []string) bool {
 	for _, task := range tasks {
-		if strings.EqualFold(strings.TrimSpace(task), "MESSAGING") {
+		switch strings.ToUpper(strings.TrimSpace(task)) {
+		case "MESSAGING", "PROFILE_PLUS_MESSAGING":
 			return true
 		}
 	}
