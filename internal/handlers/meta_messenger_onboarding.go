@@ -292,6 +292,11 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 		businesses,
 		pages,
 	); err != nil {
+		a.Log.Warn(
+			"Messenger review inventory rejected",
+			"organization_id", orgID,
+			"reason", err,
+		)
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,
 			"The configured review Business and Page were not authorized",

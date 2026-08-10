@@ -222,9 +222,9 @@ func TestMetaMessengerSystemUserDiscoveryPinsClientBusinessWithoutUserEdges(t *t
 			assert.Equal(t, "id,client_business_id", request.URL.Query().Get("fields"))
 			_, _ = writer.Write([]byte(`{"id":"900000000000001","client_business_id":"200000000000001"}`))
 		case "/v25.0/200000000000001/owned_pages":
-			assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
+			assert.Equal(t, "id,name,tasks,permitted_tasks,access_token", request.URL.Query().Get("fields"))
 			_, _ = writer.Write([]byte(`{"data":[
-				{"id":"700000000000001","name":"Owned Clinic","tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"system-page-token"},
+				{"id":"700000000000001","name":"Owned Clinic","permitted_tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"system-page-token"},
 				{"id":"700000000000004","name":"Limited Clinic","tasks":["CREATE_CONTENT"],"access_token":"limited-token"}
 			]}`))
 		case "/v25.0/200000000000001/client_pages":
@@ -411,8 +411,8 @@ func TestMetaMessengerSystemUserSelectionRevalidatesDirectOwnedPage(t *testing.T
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		assert.Equal(t, "/v25.0/"+metaMessengerTestBusinessID+"/owned_pages", request.URL.Path)
-		assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
-		_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"BISU Clinic","tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"fresh-system-page-token"}]}`))
+		assert.Equal(t, "id,name,tasks,permitted_tasks,access_token", request.URL.Query().Get("fields"))
+		_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"BISU Clinic","permitted_tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"fresh-system-page-token"}]}`))
 	}))
 	defer server.Close()
 	app := newMetaMessengerGraphTestApp(t, server)

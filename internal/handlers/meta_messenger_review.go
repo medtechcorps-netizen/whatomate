@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -765,10 +766,26 @@ func (a *App) filterMetaMessengerReviewInventory(
 			break
 		}
 	}
-	if selectedBusiness == nil || selectedPage == nil ||
-		selectedPage.Ownership != metaMessengerOwnershipOwned ||
-		!selectedPage.Selectable || !metaMessengerHasMessagingTask(selectedPage.Tasks) {
-		return nil, nil, errMetaMessengerReviewUnavailable
+	if selectedBusiness == nil {
+		return nil, nil, fmt.Errorf("%w: configured business missing", errMetaMessengerReviewUnavailable)
+	}
+	if selectedPage == nil {
+		return nil, nil, fmt.Errorf("%w: configured Page missing", errMetaMessengerReviewUnavailable)
+	}
+	if selectedPage.Ownership != metaMessengerOwnershipOwned {
+		return nil, nil, fmt.Errorf("%w: configured Page is not business-owned", errMetaMessengerReviewUnavailable)
+	}
+	if !selectedPage.Selectable {
+		reason := strings.TrimSpace(selectedPage.DisabledReason)
+		switch reason {
+		case metaMessengerDisabledTokenMissing, metaMessengerDisabledTarget, metaMessengerDisabledTask:
+		default:
+			reason = "page_not_selectable"
+		}
+		return nil, nil, fmt.Errorf("%w: %s", errMetaMessengerReviewUnavailable, reason)
+	}
+	if !metaMessengerHasMessagingTask(selectedPage.Tasks) {
+		return nil, nil, fmt.Errorf("%w: %s", errMetaMessengerReviewUnavailable, metaMessengerDisabledTask)
 	}
 	return []metaMessengerBusinessSummary{*selectedBusiness}, []metaMessengerStoredPage{*selectedPage}, nil
 }

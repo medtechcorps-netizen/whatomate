@@ -581,7 +581,7 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		a,
 		ctx,
 		url.PathEscape(businessID)+"/owned_pages",
-		url.Values{"fields": {"id,name,tasks,access_token"}},
+		url.Values{"fields": {"id,name,tasks,permitted_tasks,access_token"}},
 		accessToken,
 		metaMessengerGraphMaxPageAssets,
 	)
@@ -788,7 +788,7 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			a,
 			ctx,
 			url.PathEscape(selected.BusinessID)+"/owned_pages",
-			url.Values{"fields": {"id,name,tasks,access_token"}},
+			url.Values{"fields": {"id,name,tasks,permitted_tasks,access_token"}},
 			userToken,
 			metaMessengerGraphMaxPageAssets,
 		)
