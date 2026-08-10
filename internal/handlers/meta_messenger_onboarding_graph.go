@@ -60,8 +60,8 @@ type metaMessengerTokenResponse struct {
 }
 
 type metaMessengerGranularScope struct {
-	Scope     string   `json:"scope"`
-	TargetIDs []string `json:"target_ids"`
+	Scope     string    `json:"scope"`
+	TargetIDs *[]string `json:"target_ids"`
 }
 
 type metaMessengerTokenDebugResponse struct {
@@ -275,15 +275,22 @@ func (a *App) inspectMetaMessengerToken(
 			continue
 		}
 		granted[scope] = struct{}{}
-		targets := make(map[string]struct{}, len(granular.TargetIDs))
-		for _, targetID := range granular.TargetIDs {
+		// Meta's Debug Token contract makes target_ids optional: when the
+		// permission applies to all targets, target_ids is not shown. Preserve
+		// the distinction between an omitted/null field and a present array.
+		// https://developers.facebook.com/docs/graph-api/reference/debug_token/
+		if granular.TargetIDs == nil {
+			continue
+		}
+		targets := make(map[string]struct{}, len(*granular.TargetIDs))
+		for _, targetID := range *granular.TargetIDs {
 			targetID = strings.TrimSpace(targetID)
 			if targetID != "" {
 				targets[targetID] = struct{}{}
 			}
 		}
-		// An explicit granular scope with no targets authorizes no asset. Only
-		// the complete absence of a granular entry is treated as unrestricted.
+		// A present but empty/invalid array is not the documented applies-to-all
+		// representation, so retain an explicit empty restriction fail-closed.
 		granularTargets[scope] = targets
 	}
 	if requireUserScopes {
@@ -736,6 +743,14 @@ func metaMessengerCandidateTargetsAllowed(
 	inspection metaMessengerTokenInspection,
 	businessID, pageID string,
 ) bool {
+	// A SYSTEM_USER is bounded by the freshly inspected client_business_id
+	// and the exact intersection of its assigned_pages (including the actual
+	// task and Page token) with that Business's owned_pages. Meta may omit
+	// target_ids from debug_token for this token kind, so those optional IDs
+	// must not override the authoritative BISU edges.
+	if strings.EqualFold(strings.TrimSpace(inspection.Type), metaMessengerTokenKindSystemUser) {
+		return true
+	}
 	if !inspection.targetAllowed("business_management", businessID) {
 		return false
 	}

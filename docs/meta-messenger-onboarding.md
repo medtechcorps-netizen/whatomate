@@ -129,10 +129,19 @@ supplies ownership. In the `SYSTEM_USER` branch,
 `/{system-user-id}/assigned_pages` supplies the actual assigned tasks and Page
 token and `/{client_business_id}/owned_pages` supplies ownership. Meta's
 `permitted_tasks` values describe assignable capabilities and never satisfy
-authorization. A client-access-only, unassigned, task-ineligible, tokenless,
-granular-scope-restricted, or otherwise unverified Page can be displayed for
-diagnosis but is never selectable. Page names, usernames, profile URLs, and
-organization display names are not ownership evidence.
+authorization. Meta's [Debug Token
+reference](https://developers.facebook.com/docs/graph-api/reference/debug_token/)
+defines `target_ids` as optional and says targets are not shown when a
+permission applies to all. The parser preserves that field-presence boundary:
+for `USER` tokens, an omitted or `null` `target_ids` applies to all, a present
+nonempty list is enforced against the exact Business or Page ID, and a present
+empty or mismatched list is fail-closed. For `SYSTEM_USER` tokens, granular
+target lists do not replace or override the stronger exact
+`client_business_id` + `assigned_pages` + `owned_pages` intersection. A
+client-access-only, unassigned, task-ineligible, tokenless,
+granular-scope-restricted `USER` Page, or otherwise unverified Page can be
+displayed for diagnosis but is never selectable. Page names, usernames,
+profile URLs, and organization display names are not ownership evidence.
 
 The user confirms the exact platform user, ReReply workspace, Meta Business
 ID, and Page ID. The browser then calls:
@@ -142,10 +151,14 @@ POST /api/integrations/meta/messenger/onboarding/select
 ```
 
 The selection session is one-time. Immediately before persistence, the server
-revalidates the token type, identity, permissions, Business, ownership,
-`MESSAGING` task, granular targets, and Page token using the same authoritative
-branch. It then validates the Page-token identity and verifies that the
-configured app is subscribed to the Page's `messages` field.
+revalidates the token type, identity, required permissions, Business,
+ownership, `MESSAGING` task, and Page token using the same authoritative
+branch. `USER` selection repeats granular target checks. `SYSTEM_USER`
+selection repeats the exact `client_business_id`, current `assigned_pages`
+task/token, and current `owned_pages` intersection without requiring optional
+`debug_token.target_ids`. It then validates the Page-token identity and
+verifies that the configured app is subscribed to the Page's `messages`
+field.
 
 Authorization codes and access tokens never enter API responses or logs. The
 short-lived selection session contains only encrypted token material and is

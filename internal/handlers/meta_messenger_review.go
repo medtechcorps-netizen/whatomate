@@ -778,7 +778,8 @@ func (a *App) filterMetaMessengerReviewInventory(
 	if !selectedPage.Selectable {
 		reason := strings.TrimSpace(selectedPage.DisabledReason)
 		switch reason {
-		case metaMessengerDisabledTokenMissing, metaMessengerDisabledTarget, metaMessengerDisabledTask:
+		case metaMessengerDisabledAssignment, metaMessengerDisabledTokenMissing,
+			metaMessengerDisabledTarget, metaMessengerDisabledTask:
 		default:
 			reason = "page_not_selectable"
 		}

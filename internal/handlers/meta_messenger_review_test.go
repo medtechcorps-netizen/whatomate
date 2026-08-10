@@ -484,6 +484,12 @@ func TestMetaMessengerReviewInventoryAllowsOnlyPinnedOwnedMessagingPage(t *testi
 	pages[1].Selectable = false
 	_, _, err = fixture.app.filterMetaMessengerReviewInventory(fixture.orgID, businesses, pages)
 	require.ErrorIs(t, err, errMetaMessengerReviewUnavailable)
+	assert.NotContains(t, err.Error(), metaMessengerDisabledAssignment)
+
+	pages[1].DisabledReason = metaMessengerDisabledAssignment
+	_, _, err = fixture.app.filterMetaMessengerReviewInventory(fixture.orgID, businesses, pages)
+	require.ErrorIs(t, err, errMetaMessengerReviewUnavailable)
+	assert.Contains(t, err.Error(), metaMessengerDisabledAssignment)
 }
 
 func TestMetaMessengerReviewCredentialBrokerRequiresOneExactCredentialPair(t *testing.T) {

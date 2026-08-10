@@ -113,6 +113,65 @@ func TestMetaMessengerTokenInspectionAcceptsUserAndBusinessIntegrationSystemUser
 	}
 }
 
+func TestMetaMessengerUserGranularTargetsPreserveDebugTokenPresence(t *testing.T) {
+	for _, testCase := range []struct {
+		name            string
+		granularScope   string
+		wantPageAllowed bool
+	}{
+		{
+			name:            "omitted target_ids applies to all",
+			granularScope:   `{"scope":"pages_messaging"}`,
+			wantPageAllowed: true,
+		},
+		{
+			name:            "null target_ids applies to all",
+			granularScope:   `{"scope":"pages_messaging","target_ids":null}`,
+			wantPageAllowed: true,
+		},
+		{
+			name:          "present empty target_ids fails closed",
+			granularScope: `{"scope":"pages_messaging","target_ids":[]}`,
+		},
+		{
+			name:          "nonempty wrong target is denied",
+			granularScope: `{"scope":"pages_messaging","target_ids":["700000000000099"]}`,
+		},
+		{
+			name:            "exact target is allowed",
+			granularScope:   `{"scope":"pages_messaging","target_ids":["` + metaMessengerTestPageID + `"]}`,
+			wantPageAllowed: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			scopesJSON, err := json.Marshal(metaMessengerRequiredScopes)
+			require.NoError(t, err)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				assert.Equal(t, "/v25.0/debug_token", request.URL.Path)
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = writer.Write([]byte(`{"data":{"app_id":"` + metaMessengerTestAppID +
+					`","type":"USER","is_valid":true,"user_id":"` +
+					metaMessengerTestUserID + `","scopes":` + string(scopesJSON) +
+					`,"granular_scopes":[` + testCase.granularScope + `]}}`))
+			}))
+			defer server.Close()
+			app := newMetaMessengerGraphTestApp(t, server)
+
+			inspection, err := app.inspectMetaMessengerToken(
+				context.Background(),
+				"authorization-token",
+				true,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, testCase.wantPageAllowed, metaMessengerCandidateTargetsAllowed(
+				inspection,
+				metaMessengerTestBusinessID,
+				metaMessengerTestPageID,
+			))
+		})
+	}
+}
+
 func TestMetaMessengerPublicStartContractContainsNoSecretScopeOrRedirect(t *testing.T) {
 	var response startMetaMessengerOnboardingResponse
 	response.Provider = "meta"
@@ -433,54 +492,77 @@ func TestMetaMessengerSelectionFreshlyRevalidatesAccessAndOwnedPages(t *testing.
 }
 
 func TestMetaMessengerSystemUserSelectionRevalidatesDirectOwnedPage(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		writer.Header().Set("Content-Type", "application/json")
-		switch request.URL.Path {
-		case "/v25.0/" + metaMessengerTestUserID + "/assigned_pages":
-			assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
-			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned BISU Clinic","tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"fresh-system-page-token"}]}`))
-		case "/v25.0/" + metaMessengerTestBusinessID + "/owned_pages":
-			assert.Equal(t, "id,name", request.URL.Query().Get("fields"))
-			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Owned BISU Clinic"}]}`))
-		default:
-			t.Fatalf("unexpected system-user revalidation path %s", request.URL.Path)
-		}
-	}))
-	defer server.Close()
-	app := newMetaMessengerGraphTestApp(t, server)
-	selected := metaMessengerStoredPage{
-		metaMessengerPageSummary: metaMessengerPageSummary{
-			BusinessID: metaMessengerTestBusinessID,
-			PageID:     metaMessengerTestPageID,
-			Ownership:  metaMessengerOwnershipOwned,
-			Selectable: true,
+	for _, testCase := range []struct {
+		name                 string
+		granularScopeTargets map[string]map[string]struct{}
+	}{
+		{name: "granular targets omitted"},
+		{
+			name: "granular targets explicitly empty",
+			granularScopeTargets: map[string]map[string]struct{}{
+				"business_management": {},
+				"pages_messaging":     {},
+			},
 		},
-		OwnershipVerifiedAt: time.Now().UTC().Add(-time.Minute),
+		{
+			name: "granular targets do not match authoritative edges",
+			granularScopeTargets: map[string]map[string]struct{}{
+				"business_management": {"200000000000099": {}},
+				"pages_messaging":     {"700000000000099": {}},
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				switch request.URL.Path {
+				case "/v25.0/" + metaMessengerTestUserID + "/assigned_pages":
+					assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
+					_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned BISU Clinic","tasks":["PROFILE_PLUS_MESSAGING"],"access_token":"fresh-system-page-token"}]}`))
+				case "/v25.0/" + metaMessengerTestBusinessID + "/owned_pages":
+					assert.Equal(t, "id,name", request.URL.Query().Get("fields"))
+					_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Owned BISU Clinic"}]}`))
+				default:
+					t.Fatalf("unexpected system-user revalidation path %s", request.URL.Path)
+				}
+			}))
+			defer server.Close()
+			app := newMetaMessengerGraphTestApp(t, server)
+			selected := metaMessengerStoredPage{
+				metaMessengerPageSummary: metaMessengerPageSummary{
+					BusinessID: metaMessengerTestBusinessID,
+					PageID:     metaMessengerTestPageID,
+					Ownership:  metaMessengerOwnershipOwned,
+					Selectable: true,
+				},
+				OwnershipVerifiedAt: time.Now().UTC().Add(-time.Minute),
+			}
+			fresh, err := app.revalidateMetaMessengerOwnedPage(
+				context.Background(),
+				"system-user-token",
+				metaMessengerTokenInspection{
+					Type:                 metaMessengerTokenKindSystemUser,
+					UserID:               metaMessengerTestUserID,
+					GranularScopeTargets: testCase.granularScopeTargets,
+					CheckedAt:            time.Now().UTC(),
+				},
+				selected,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, "Owned BISU Clinic", fresh.PageName)
+			assert.Equal(t, []string{"PROFILE_PLUS_MESSAGING"}, fresh.Tasks)
+			plaintext, decryptErr := appcrypto.Decrypt(fresh.EncryptedPageToken, metaMessengerTestEncryptionKey)
+			require.NoError(t, decryptErr)
+			assert.Equal(t, "fresh-system-page-token", plaintext)
+		})
 	}
-	fresh, err := app.revalidateMetaMessengerOwnedPage(
-		context.Background(),
-		"system-user-token",
-		metaMessengerTokenInspection{
-			Type:      metaMessengerTokenKindSystemUser,
-			UserID:    metaMessengerTestUserID,
-			CheckedAt: time.Now().UTC(),
-		},
-		selected,
-	)
-	require.NoError(t, err)
-	assert.Equal(t, "Owned BISU Clinic", fresh.PageName)
-	assert.Equal(t, []string{"PROFILE_PLUS_MESSAGING"}, fresh.Tasks)
-	plaintext, decryptErr := appcrypto.Decrypt(fresh.EncryptedPageToken, metaMessengerTestEncryptionKey)
-	require.NoError(t, decryptErr)
-	assert.Equal(t, "fresh-system-page-token", plaintext)
 }
 
 func TestMetaMessengerSystemUserSelectionRequiresCurrentAssignmentOwnershipAndToken(t *testing.T) {
 	testCases := []struct {
-		name                 string
-		assignedPages        string
-		ownedPages           string
-		granularScopeTargets map[string]map[string]struct{}
+		name          string
+		assignedPages string
+		ownedPages    string
 	}{
 		{
 			name:          "assignment removed",
@@ -496,14 +578,6 @@ func TestMetaMessengerSystemUserSelectionRequiresCurrentAssignmentOwnershipAndTo
 			name:          "assigned token missing",
 			assignedPages: `{"data":[{"id":"700000000000001","name":"Assigned BISU Clinic","tasks":["MESSAGING"]}]}`,
 			ownedPages:    `{"data":[{"id":"700000000000001","name":"Owned BISU Clinic"}]}`,
-		},
-		{
-			name:          "granular Page target removed",
-			assignedPages: `{"data":[{"id":"700000000000001","name":"Assigned BISU Clinic","tasks":["MESSAGING"],"access_token":"fresh-system-page-token"}]}`,
-			ownedPages:    `{"data":[{"id":"700000000000001","name":"Owned BISU Clinic"}]}`,
-			granularScopeTargets: map[string]map[string]struct{}{
-				"pages_messaging": {"700000000000099": {}},
-			},
 		},
 	}
 	for _, testCase := range testCases {
@@ -534,9 +608,8 @@ func TestMetaMessengerSystemUserSelectionRequiresCurrentAssignmentOwnershipAndTo
 				context.Background(),
 				"system-user-token",
 				metaMessengerTokenInspection{
-					Type:                 metaMessengerTokenKindSystemUser,
-					UserID:               metaMessengerTestUserID,
-					GranularScopeTargets: testCase.granularScopeTargets,
+					Type:   metaMessengerTokenKindSystemUser,
+					UserID: metaMessengerTestUserID,
 				},
 				selected,
 			)
@@ -648,14 +721,48 @@ func TestMissingMetaMessengerScopesNamesEachRequiredPermission(t *testing.T) {
 	}
 }
 
-func TestMetaMessengerExplicitEmptyGranularTargetsFailClosed(t *testing.T) {
-	inspection := metaMessengerTokenInspection{
-		GranularScopeTargets: map[string]map[string]struct{}{
-			"pages_messaging": {},
+func TestMetaMessengerUserExplicitGranularRestrictionsRemainFailClosed(t *testing.T) {
+	for _, testCase := range []struct {
+		name                 string
+		granularScopeTargets map[string]map[string]struct{}
+	}{
+		{
+			name: "empty Business targets",
+			granularScopeTargets: map[string]map[string]struct{}{
+				"business_management": {},
+			},
 		},
+		{
+			name: "mismatched Business target",
+			granularScopeTargets: map[string]map[string]struct{}{
+				"business_management": {"200000000000099": {}},
+			},
+		},
+		{
+			name: "empty Page targets",
+			granularScopeTargets: map[string]map[string]struct{}{
+				"pages_messaging": {},
+			},
+		},
+		{
+			name: "mismatched Page target",
+			granularScopeTargets: map[string]map[string]struct{}{
+				"pages_messaging": {"700000000000099": {}},
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			inspection := metaMessengerTokenInspection{
+				Type:                 metaMessengerTokenKindUser,
+				GranularScopeTargets: testCase.granularScopeTargets,
+			}
+			assert.False(t, metaMessengerCandidateTargetsAllowed(
+				inspection,
+				metaMessengerTestBusinessID,
+				metaMessengerTestPageID,
+			))
+		})
 	}
-	assert.False(t, inspection.targetAllowed("pages_messaging", metaMessengerTestPageID))
-	assert.True(t, inspection.targetAllowed("pages_show_list", metaMessengerTestPageID))
 }
 
 func TestMetaMessengerProviderErrorNeverIncludesProviderMessageOrSecrets(t *testing.T) {
