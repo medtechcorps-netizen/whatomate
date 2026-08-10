@@ -380,12 +380,12 @@ test("accepts an inbound-only staging review result without unlocking production
     0,
   );
   const connectionsSidebar = page
-    .locator("aside")
+    .getByRole("complementary")
     .filter({ hasText: "Available adapters" });
   await expect(
-    connectionsSidebar.getByText("Staging review relay ready - inbound only", {
-      exact: true,
-    }),
+    connectionsSidebar.getByText(
+      /^Staging review relay ready - inbound only \| 1\/5 checks$/,
+    ),
   ).toBeVisible();
   await expect(
     connectionsSidebar.getByRole("button", {
