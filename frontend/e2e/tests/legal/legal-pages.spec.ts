@@ -29,6 +29,11 @@ for (const legalPage of legalPages) {
       'href',
       /mailto:medtechcorps@gmail\.com/
     )
+
+    if (legalPage.path === '/privacy' || legalPage.path === '/terms') {
+      await expect(page.locator('main')).toContainText('Medtech Healthcare')
+      await expect(page.locator('main')).not.toContainText('Medtech Softwarehouse')
+    }
   })
 }
 

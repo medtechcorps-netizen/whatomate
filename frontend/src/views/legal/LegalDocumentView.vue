@@ -45,7 +45,7 @@ const privacySections: LegalSection[] = [
     id: 'scope',
     title: '1. Scope and our role',
     paragraphs: [
-      'This Privacy Policy explains how ReReply, provided by Medtech Softwarehouse (“ReReply”, “we”, “us” or “our”), handles personal data through the ReReply website, applications, APIs and related support services.',
+      'This Privacy Policy explains how ReReply, provided by Medtech Healthcare (“ReReply”, “we”, “us” or “our”), handles personal data through the ReReply website, applications, APIs and related support services.',
       'ReReply is a multi-tenant customer communication and CRM platform. The business or organisation that subscribes to ReReply (“Customer Organisation”) normally decides why and how its contact, patient, lead and conversation data is used. For that data, the Customer Organisation is the data controller and ReReply acts as its service provider or data processor. We may act as controller for account administration, billing, platform security, service analytics and our own business communications.'
     ]
   },
@@ -194,7 +194,7 @@ const privacySections: LegalSection[] = [
     title: '15. Updates and contact',
     paragraphs: [
       'We may update this policy when the service, law or our processing practices change. We will post the revised version here and update the effective date.',
-      'For privacy questions, contact Medtech Softwarehouse at medtechcorps@gmail.com. For records controlled by a clinic, pharmacy, wellness provider or other Customer Organisation, you should also contact that organisation directly.'
+      'For privacy questions, contact Medtech Healthcare at medtechcorps@gmail.com. For records controlled by a clinic, pharmacy, wellness provider or other Customer Organisation, you should also contact that organisation directly.'
     ]
   }
 ]
@@ -204,7 +204,7 @@ const termsSections: LegalSection[] = [
     id: 'agreement',
     title: '1. Agreement and eligibility',
     paragraphs: [
-      'These Terms of Service (“Terms”) govern access to ReReply, a multi-tenant communication, CRM and automation platform provided by Medtech Softwarehouse. By creating an account, accepting an order or using ReReply, you agree to these Terms on behalf of yourself and, where applicable, your organisation.',
+      'These Terms of Service (“Terms”) govern access to ReReply, a multi-tenant communication, CRM and automation platform provided by Medtech Healthcare. By creating an account, accepting an order or using ReReply, you agree to these Terms on behalf of yourself and, where applicable, your organisation.',
       'You must be legally able to enter into this agreement and authorised to bind the organisation you represent. If a separate signed order, reseller agreement or data-processing agreement conflicts with these Terms, the signed agreement controls for that conflict.'
     ]
   },

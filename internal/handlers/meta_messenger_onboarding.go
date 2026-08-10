@@ -316,8 +316,8 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 
 // SelectMetaMessengerOnboarding consumes the ownership inventory, revalidates
 // the Page token, persists a disabled pending account, and proves the exact
-// Medtech app is subscribed to the Page's messages field. Protected relay
-// inventory remains a separate operator-controlled activation gate.
+// configured provider app is subscribed to the Page's messages field.
+// Protected relay inventory remains a separate operator-controlled activation gate.
 func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 	orgID, userID, _, err := a.requireMetaMessengerOnboardingAuth(r)
 	if err != nil {

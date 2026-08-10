@@ -31,6 +31,7 @@ func TestEmbeddedFrontendServesRouteSpecificRawLegalFallbacks(t *testing.T) {
 			title:     "Privacy Policy",
 			effective: "Effective 3 August 2026",
 			contains: []string{
+				"Medtech Healthcare",
 				"The Customer Organisation is the data controller",
 				"ReReply does not sell personal data",
 				"Retention, deletion and your rights",
@@ -44,6 +45,7 @@ func TestEmbeddedFrontendServesRouteSpecificRawLegalFallbacks(t *testing.T) {
 			title:     "Terms of Service",
 			effective: "Effective 28 July 2026",
 			contains: []string{
+				"Medtech Healthcare",
 				"Messaging and channel rules",
 				"These Terms are governed by the laws of Malaysia",
 				"Customers retain ownership of data",
@@ -84,6 +86,7 @@ func TestEmbeddedFrontendServesRouteSpecificRawLegalFallbacks(t *testing.T) {
 				for _, marker := range testCase.contains {
 					assert.Contains(t, body, marker)
 				}
+				assert.NotContains(t, body, "Medtech Softwarehouse")
 				assert.NotContains(t, body, testCase.notContain)
 				assert.Contains(t, body, `<script type="module"`)
 			}

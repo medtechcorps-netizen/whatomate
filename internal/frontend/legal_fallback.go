@@ -66,7 +66,7 @@ var legalFallbackDocuments = map[string]legalFallbackDocument{
 				ID:    "scope",
 				Title: "Scope and our role",
 				Paragraphs: []string{
-					"This Privacy Policy explains how ReReply, provided by Medtech Softwarehouse, handles personal data through the ReReply website, applications, APIs and support services.",
+					"This Privacy Policy explains how ReReply, provided by Medtech Healthcare, handles personal data through the ReReply website, applications, APIs and support services.",
 					"A clinic, pharmacy, wellness provider or other business using ReReply (a Customer Organisation) normally decides why and how its contact, patient, lead and conversation data is used. The Customer Organisation is the data controller and ReReply acts as its service provider or data processor. ReReply may act as controller for account administration, billing, platform security, service analytics and its own business communications.",
 				},
 			},
@@ -105,7 +105,7 @@ var legalFallbackDocuments = map[string]legalFallbackDocument{
 				Paragraphs: []string{
 					"Information is retained only as needed to provide and secure the service, follow lawful Customer Organisation instructions, and meet legal or contractual obligations. Data removed from active systems may remain temporarily in protected backups until normal rotation completes; limited security, billing, dispute and compliance records may be retained where necessary.",
 					"Depending on applicable law, you may request access, correction, deletion, restriction, portability or objection, or withdraw consent. Contact the Customer Organisation first when it controls the record. You may also follow ReReply's Data Deletion Instructions. Identity and authority may need to be verified before action is taken.",
-					"Privacy questions may be sent to Medtech Softwarehouse at medtechcorps@gmail.com.",
+					"Privacy questions may be sent to Medtech Healthcare at medtechcorps@gmail.com.",
 				},
 			},
 		},
@@ -122,7 +122,7 @@ var legalFallbackDocuments = map[string]legalFallbackDocument{
 				ID:    "agreement",
 				Title: "Agreement and the service",
 				Paragraphs: []string{
-					"These Terms govern access to ReReply, a multi-tenant communication, CRM and automation platform provided by Medtech Softwarehouse. By creating an account, accepting an order or using ReReply, you accept these Terms for yourself and, where applicable, your organisation.",
+					"These Terms govern access to ReReply, a multi-tenant communication, CRM and automation platform provided by Medtech Healthcare. By creating an account, accepting an order or using ReReply, you accept these Terms for yourself and, where applicable, your organisation.",
 					"Available communications, CRM, workflow, campaign, booking, reporting and optional AI-assisted features depend on the subscription, organisation configuration, region and third-party provider eligibility. A signed order, reseller agreement or data-processing agreement controls where it expressly conflicts with these Terms.",
 				},
 			},

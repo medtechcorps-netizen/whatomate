@@ -417,7 +417,7 @@ func TestMetaMessengerSystemUserSelectionRevalidatesDirectOwnedPage(t *testing.T
 	assert.Equal(t, "fresh-system-page-token", plaintext)
 }
 
-func TestMetaMessengerSubscriptionRequiresExactMedtechAppAndMessages(t *testing.T) {
+func TestMetaMessengerSubscriptionRequiresExactConfiguredAppAndMessages(t *testing.T) {
 	for _, testCase := range []struct {
 		name         string
 		subscription string

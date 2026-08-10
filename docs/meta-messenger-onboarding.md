@@ -105,8 +105,9 @@ type:
 
 - `USER`: request `/me?fields=id,name`, then discover `/me/accounts`,
   `/me/businesses`, and each Business `/owned_pages` and `/client_pages`;
-- `SYSTEM_USER` (the Business Integration System User mode used by the Medtech
-  FLfB configuration): request `/me?fields=id,client_business_id`, treat that
+- `SYSTEM_USER` (the Business Integration System User mode used by the
+  provider-owned FLfB configuration): request
+  `/me?fields=id,client_business_id`, treat that
   single `client_business_id` as the canonical Business, and discover only its
   `/owned_pages` and `/client_pages`.
 

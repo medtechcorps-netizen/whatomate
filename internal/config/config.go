@@ -48,7 +48,7 @@ const (
 
 // MetaMessengerOnboardingConfig controls the managed Facebook Login for
 // Business flow used to stage Messenger Page accounts. It is deliberately
-// separate from MetaRelayConfig: the Medtech app owner is not evidence that a
+// separate from MetaRelayConfig: the provider app owner is not evidence that a
 // tenant owns a Page, and relay inventory remains a protected deployment fact.
 // AppSecret is server-only and must never be returned by an HTTP handler.
 type MetaMessengerOnboardingConfig struct {

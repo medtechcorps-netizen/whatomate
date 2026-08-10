@@ -996,7 +996,7 @@ func (a *App) subscribeMetaMessengerPage(
 			}
 		}
 	}
-	return errors.New("the Medtech app messages webhook subscription could not be verified")
+	return errors.New("the configured Meta app messages webhook subscription could not be verified")
 }
 
 func (a *App) doMetaMessengerGraphJSON(

@@ -10,9 +10,9 @@ The observed ReAlign Kajang behaviour proves that its effective runtime path
 can route provider webhooks into the intended ReReply workspace. The Klinik
 Insan screenshots prove only that test messages were sent successfully in
 Facebook and Instagram. They do **not** prove that the intended Klinik Insan
-Page or Instagram account was authorized to the Medtech app, subscribed to the
-correct webhook, registered in the protected relay inventory, or routed to a
-Klinik Insan ReReply account.
+Page or Instagram account was authorized to the configured provider-owned app,
+subscribed to the correct webhook, registered in the protected relay inventory,
+or routed to a Klinik Insan ReReply account.
 
 The Klinik Insan test also exposed a high-risk ambiguity: more than one Meta
 Page used a similar Klinik Insan name. Sending to the other Page changed which

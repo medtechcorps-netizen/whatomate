@@ -28,6 +28,7 @@ const rawLegalPages = [
     title: "Privacy Policy",
     section: "scope",
     markers: [
+      "Medtech Healthcare",
       "The Customer Organisation is the data controller",
       "ReReply does not sell personal data",
       "Retention, deletion and your rights",
@@ -40,6 +41,7 @@ const rawLegalPages = [
     title: "Terms of Service",
     section: "agreement",
     markers: [
+      "Medtech Healthcare",
       "Messaging and channel rules",
       "Customers retain ownership of data",
       "These Terms are governed by the laws of Malaysia",
@@ -77,6 +79,7 @@ for (const legalPage of rawLegalPages) {
     expect(html).toContain(`<title>${legalPage.title} · ReReply</title>`);
     expect(html).toContain(`href="${legalPage.path}#${legalPage.section}"`);
     expect(html).toContain("mailto:medtechcorps@gmail.com");
+    expect(html).not.toContain("Medtech Softwarehouse");
     for (const marker of legalPage.markers) {
       expect(html).toContain(marker);
     }
