@@ -8,6 +8,7 @@ import {
   isMetaRelayAccount,
   META_RECERTIFICATION_SEQUENCE,
   messengerAwaitingRelayRegistry,
+  messengerReviewRelayReady,
   messengerRelayRegistryRecognized,
   metaAccountSettingsRequireRetest,
   metaAccountTestActionLabel,
@@ -220,6 +221,33 @@ describe("metaAccountReadiness", () => {
     expect(
       readiness.items.find((item) => item.key === "relay_mapping")?.detail,
     ).toContain("Test and outbound approval remain unavailable");
+  });
+
+  it("recognizes review readiness without granting production registry or outbound readiness", () => {
+    const reviewReady = account({
+      config: {
+        onboarding_state: "review_relay_ready",
+        review_only: true,
+        registry_recognized: false,
+        outbound_enabled: false,
+        ai_reply_enabled: false,
+        identity_confirmed_id: "700000000000001",
+      },
+    });
+
+    expect(messengerReviewRelayReady(reviewReady)).toBe(true);
+    expect(messengerRelayRegistryRecognized(reviewReady)).toBe(false);
+    expect(metaAccountReadiness(reviewReady).preflightReady).toBe(false);
+    expect(
+      messengerReviewRelayReady(
+        account({
+          config: {
+            ...reviewReady.config,
+            outbound_enabled: true,
+          },
+        }),
+      ),
+    ).toBe(false);
   });
 
   it("keeps legacy Messenger and Instagram readiness unchanged", () => {

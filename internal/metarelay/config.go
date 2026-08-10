@@ -462,7 +462,7 @@ func (c *Config) validateStagingMessengerReview(_ func(string) string) error {
 		c.MessengerReviewedBy != "" ||
 		c.MessengerReviewedAt != "" ||
 		c.MessengerReviewEvidence != "" {
-		return errors.New("Messenger review mode must not contain approved permission or App Review evidence assertions")
+		return errors.New("messenger review mode must not contain approved permission or App Review evidence assertions")
 	}
 	if err := validateReviewRootSecret(
 		"environment variable META_RELAY_MESSENGER_VERIFY_TOKEN",

@@ -459,7 +459,7 @@ func validateMetaMessengerReviewRelayConfig(
 		return errors.New("WHATOMATE_META_MESSENGER_REVIEW_RELAY__ENABLED must be true when review relay configuration is present")
 	}
 	if app.Environment != "staging" {
-		return errors.New("Meta Messenger review relay configuration is permitted only when WHATOMATE_APP__ENVIRONMENT is exactly staging")
+		return errors.New("meta Messenger review relay configuration is permitted only when WHATOMATE_APP__ENVIRONMENT is exactly staging")
 	}
 	if review.Mode != metareview.Mode {
 		return errors.New("WHATOMATE_META_MESSENGER_REVIEW_RELAY__MODE must be exactly staging_messenger_review")
@@ -482,7 +482,7 @@ func validateMetaMessengerReviewRelayConfig(
 		ExpiresAt:        review.ExpiresAt,
 	}
 	if err := tuple.Validate(time.Now().UTC()); err != nil {
-		return errors.New("Meta Messenger review relay authority must contain canonical, non-zero IDs and a future UTC RFC3339 expiry")
+		return errors.New("meta Messenger review relay authority must contain canonical, non-zero IDs and a future UTC RFC3339 expiry")
 	}
 	canonicalRelayBase, err := CanonicalMetaRelayBaseURL(review.RelayBaseURL, app.Environment)
 	if err != nil || canonicalRelayBase != review.RelayBaseURL ||

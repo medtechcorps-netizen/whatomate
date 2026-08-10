@@ -48,6 +48,7 @@ async function mockMessengerWorkspace(
     featureDisabled?: boolean;
     preparationDelayMs?: number;
     expiryByCallMs?: number[];
+    reviewReady?: boolean;
   } = {},
 ) {
   let connectedAccount: Record<string, unknown> | null = null;
@@ -193,6 +194,9 @@ async function mockMessengerWorkspace(
     /\/api\/integrations\/meta\/messenger\/onboarding\/select$/,
     async (route) => {
       selectPayload = route.request().postDataJSON();
+      const onboardingState = options.reviewReady
+        ? "review_relay_ready"
+        : "awaiting_relay_registry";
       connectedAccount = {
         id: accountId,
         channel: "messenger",
@@ -202,10 +206,12 @@ async function mockMessengerWorkspace(
         status: "pending",
         capabilities: { text: true, replies: true },
         config: {
-          onboarding_state: "awaiting_relay_registry",
+          onboarding_state: onboardingState,
           registry_recognized: false,
           identity_confirmed_id: ownedPage.page_id,
           outbound_enabled: false,
+          ai_reply_enabled: false,
+          ...(options.reviewReady ? { review_only: true } : {}),
         },
         has_credentials: true,
         outbox_pending: 0,
@@ -215,7 +221,7 @@ async function mockMessengerWorkspace(
         json: {
           data: {
             account: connectedAccount,
-            onboarding_state: "awaiting_relay_registry",
+            onboarding_state: onboardingState,
             subscription_verified: true,
             registry_recognized: false,
           },
@@ -350,6 +356,52 @@ test("connects an owned Messenger Page through the backend-gated Facebook code f
       exact: true,
     }),
   ).toBeDisabled();
+});
+
+test("accepts an inbound-only staging review result without unlocking production controls", async ({
+  page,
+}) => {
+  const calls = await mockMessengerWorkspace(page, { reviewReady: true });
+  await page.setViewportSize({ width: 1600, height: 1000 });
+  await page.goto("/inbox");
+
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await page.getByTestId("channel-connect-type").selectOption("messenger");
+  const continueButton = page.getByTestId("messenger-onboarding-continue");
+  await expect(continueButton).toBeEnabled();
+  await continueButton.click();
+  await expect(
+    page.getByTestId("messenger-onboarding-inventory"),
+  ).toBeVisible();
+  await page.getByTestId(`messenger-page-${ownedPage.page_id}`).click();
+  await page.getByTestId("messenger-onboarding-select").click();
+
+  await expect(page.getByTestId("messenger-onboarding-inventory")).toHaveCount(
+    0,
+  );
+  const connectionsSidebar = page
+    .locator("aside")
+    .filter({ hasText: "Available adapters" });
+  await expect(
+    connectionsSidebar.getByText("Staging review relay ready - inbound only", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    connectionsSidebar.getByRole("button", {
+      name: "Test Klinik Insan Ampang is unavailable until the protected runtime relay registry recognizes this Facebook authorization.",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  await expect(
+    connectionsSidebar.getByRole("button", { name: "Approve outbound" }),
+  ).toHaveCount(0);
+  expect(calls.selectPayload()).toEqual({
+    session_id: "session-1",
+    business_id: ownedPage.business_id,
+    page_id: ownedPage.page_id,
+  });
+  expect(calls.manualCreateCalls()).toBe(0);
 });
 
 test("fails closed before Facebook Login when the backend feature gate is disabled", async ({

@@ -5,6 +5,7 @@ export const facebookLoginForBusinessMode =
   "facebook_login_for_business" as const;
 export const awaitingMessengerRelayRegistryState =
   "awaiting_relay_registry" as const;
+export const messengerReviewRelayReadyState = "review_relay_ready" as const;
 export const facebookSDKLoadTimeoutMs = 15_000;
 // Backend discovery/selection has a 90-second provider deadline because it can
 // traverse several Business portfolios. Keep the browser request alive beyond
@@ -68,9 +69,49 @@ export interface MessengerOnboardingInventory {
 
 export interface MessengerOnboardingSelection {
   account: ChannelAccount;
-  onboarding_state: typeof awaitingMessengerRelayRegistryState;
+  onboarding_state:
+    | typeof awaitingMessengerRelayRegistryState
+    | typeof messengerReviewRelayReadyState;
   subscription_verified: boolean;
   registry_recognized: false;
+}
+
+/**
+ * Accepts the normal pending-registry response and the deliberately narrower
+ * staging review response. A review response is safe only when every browser-
+ * visible fail-closed marker agrees that this is a pending, inbound-only relay
+ * account. This must never reinterpret review readiness as production registry
+ * recognition or outbound approval.
+ */
+export function messengerOnboardingSelectionIsSafe(
+  selection: MessengerOnboardingSelection,
+) {
+  const account = selection.account;
+  if (
+    !account?.id ||
+    selection.subscription_verified !== true ||
+    selection.registry_recognized !== false
+  ) {
+    return false;
+  }
+
+  if (selection.onboarding_state === awaitingMessengerRelayRegistryState) {
+    return true;
+  }
+  if (selection.onboarding_state !== messengerReviewRelayReadyState) {
+    return false;
+  }
+
+  return (
+    account.channel === "messenger" &&
+    account.provider === "relay" &&
+    account.status === "pending" &&
+    account.config?.onboarding_state === messengerReviewRelayReadyState &&
+    account.config?.review_only === true &&
+    account.config?.registry_recognized === false &&
+    account.config?.outbound_enabled === false &&
+    account.config?.ai_reply_enabled === false
+  );
 }
 
 export interface FacebookLoginForBusinessResponse {

@@ -2,18 +2,23 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  awaitingMessengerRelayRegistryState,
   facebookSDKLoadTimeoutMs,
   facebookLoginForBusinessOptions,
+  messengerOnboardingSelectionIsSafe,
   metaMessengerProviderRequestTimeoutMs,
   messengerPageDisabledReason,
   messengerPageSelectable,
   messengerPageSelectionKey,
   messengerPlatformDisplayName,
+  messengerReviewRelayReadyState,
   prepareMessengerFacebookLogin,
   type FacebookLoginForBusinessSDK,
+  type MessengerOnboardingSelection,
   type MessengerOnboardingPage,
   type MessengerOnboardingPublicConfig,
 } from "@/services/metaMessengerOnboarding";
+import type { ChannelAccount } from "@/services/productSuite";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -44,6 +49,44 @@ function page(
   };
 }
 
+function reviewAccount(
+  configOverrides: Record<string, unknown> = {},
+  accountOverrides: Partial<ChannelAccount> = {},
+): ChannelAccount {
+  return {
+    id: "review-account-1",
+    channel: "messenger",
+    provider: "relay",
+    name: "Klinik Insan Ampang",
+    external_account_id: "page-1",
+    status: "pending",
+    capabilities: { text: true },
+    config: {
+      onboarding_state: messengerReviewRelayReadyState,
+      review_only: true,
+      registry_recognized: false,
+      outbound_enabled: false,
+      ai_reply_enabled: false,
+      ...configOverrides,
+    },
+    has_credentials: true,
+    outbox_pending: 0,
+    outbox_failed: 0,
+    ...accountOverrides,
+  };
+}
+
+function reviewSelection(
+  account = reviewAccount(),
+): MessengerOnboardingSelection {
+  return {
+    account,
+    onboarding_state: messengerReviewRelayReadyState,
+    subscription_verified: true,
+    registry_recognized: false,
+  };
+}
+
 describe("Messenger Facebook Login for Business", () => {
   it("keeps provider requests alive beyond the backend's 90-second deadline", () => {
     expect(metaMessengerProviderRequestTimeoutMs).toBeGreaterThan(90_000);
@@ -58,6 +101,53 @@ describe("Messenger Facebook Login for Business", () => {
       override_default_response_type: true,
     });
     expect(options).not.toHaveProperty("scope");
+  });
+
+  it("accepts review readiness only with every inbound-only safety marker", () => {
+    expect(messengerOnboardingSelectionIsSafe(reviewSelection())).toBe(true);
+    expect(
+      messengerOnboardingSelectionIsSafe(
+        reviewSelection(reviewAccount({ outbound_enabled: true })),
+      ),
+    ).toBe(false);
+    expect(
+      messengerOnboardingSelectionIsSafe(
+        reviewSelection(reviewAccount({ ai_reply_enabled: true })),
+      ),
+    ).toBe(false);
+    expect(
+      messengerOnboardingSelectionIsSafe(
+        reviewSelection(reviewAccount({ registry_recognized: true })),
+      ),
+    ).toBe(false);
+    expect(
+      messengerOnboardingSelectionIsSafe(
+        reviewSelection(reviewAccount({ review_only: false })),
+      ),
+    ).toBe(false);
+    expect(
+      messengerOnboardingSelectionIsSafe(
+        reviewSelection(reviewAccount({}, { status: "active" })),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps the normal subscribed account in the pending-registry contract", () => {
+    const account = reviewAccount(
+      {
+        onboarding_state: awaitingMessengerRelayRegistryState,
+        review_only: false,
+      },
+      { id: "normal-account-1" },
+    );
+    expect(
+      messengerOnboardingSelectionIsSafe({
+        account,
+        onboarding_state: awaitingMessengerRelayRegistryState,
+        subscription_verified: true,
+        registry_recognized: false,
+      }),
+    ).toBe(true);
   });
 
   it("opens Facebook synchronously after preparation without another await", async () => {

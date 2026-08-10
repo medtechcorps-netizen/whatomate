@@ -61,6 +61,18 @@ export function messengerRelayRegistryRecognized(account: ChannelAccount) {
   );
 }
 
+export function messengerReviewRelayReady(account: ChannelAccount) {
+  return (
+    isManagedMessengerAccount(account) &&
+    configString(account, "onboarding_state") === "review_relay_ready" &&
+    account.config?.review_only === true &&
+    account.config?.registry_recognized === false &&
+    account.config?.outbound_enabled === false &&
+    account.config?.ai_reply_enabled === false &&
+    account.status === "pending"
+  );
+}
+
 export function messengerAwaitingRelayRegistry(account: ChannelAccount) {
   return (
     isManagedMessengerAccount(account) &&

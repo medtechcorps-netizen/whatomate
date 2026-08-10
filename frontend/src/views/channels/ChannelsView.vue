@@ -61,6 +61,7 @@ import {
   isMetaRelayAccount,
   META_RECERTIFICATION_SEQUENCE,
   messengerAwaitingRelayRegistry,
+  messengerReviewRelayReady,
   messengerRelayRegistryRecognized,
   metaAccountSettingsRequireRetest,
   metaAccountTestActionLabel,
@@ -69,11 +70,12 @@ import {
 } from "@/lib/channelAccountReadiness";
 import { wsService } from "@/services/websocket";
 import {
-  awaitingMessengerRelayRegistryState,
+  messengerOnboardingSelectionIsSafe,
   messengerPageDisabledReason,
   messengerPageSelectable,
   messengerPageSelectionKey,
   messengerPlatformDisplayName,
+  messengerReviewRelayReadyState,
   metaMessengerOnboardingService,
   prepareMessengerFacebookLogin,
   type FacebookLoginForBusinessResponse,
@@ -430,6 +432,9 @@ function accountProofNeedsReview(account: ChannelAccount) {
 }
 
 function accountStatusLabel(account: ChannelAccount) {
+  if (messengerReviewRelayReady(account)) {
+    return "Staging review relay ready - inbound only";
+  }
   if (messengerAwaitingRelayRegistry(account)) return "Awaiting relay registry";
   if (accountReadyForOutbound(account)) {
     return accountProofNeedsReview(account)
@@ -1019,19 +1024,22 @@ async function connectSelectedMessengerPage() {
     });
     const selection =
       unwrapItemResponse<MessengerOnboardingSelection>(selectResponse);
-    if (
-      !selection.account?.id ||
-      selection.onboarding_state !== awaitingMessengerRelayRegistryState ||
-      selection.registry_recognized !== false
-    ) {
+    if (!messengerOnboardingSelectionIsSafe(selection)) {
       throw new Error("Messenger onboarding returned an unsafe registry state");
     }
+
+    const reviewOnly =
+      selection.onboarding_state === messengerReviewRelayReadyState;
 
     showConnect.value = false;
     resetMessengerOnboarding();
     toast.success(
-      "Facebook Page authorization saved",
-      "Test and outbound approval stay locked until the protected runtime relay registry recognizes this connection.",
+      reviewOnly
+        ? "Staging Messenger review relay ready"
+        : "Facebook Page authorization saved",
+      reviewOnly
+        ? "Inbound review traffic is ready. Production registry recognition, Test, outbound delivery and AI replies remain locked."
+        : "Test and outbound approval stay locked until the protected runtime relay registry recognizes this connection.",
     );
     await load();
   } catch (error) {
