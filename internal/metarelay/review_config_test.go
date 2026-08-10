@@ -119,7 +119,7 @@ func TestLoadReviewConfigRejectsInstagramAndStaticAccounts(t *testing.T) {
 			mutate: func(environment map[string]string) {
 				environment["META_RELAY_INSTAGRAM_APP_ID"] = "100000000000002"
 			},
-			want: "Instagram configuration is forbidden",
+			want: "instagram configuration is forbidden",
 		},
 		{
 			name: "static account inventory",

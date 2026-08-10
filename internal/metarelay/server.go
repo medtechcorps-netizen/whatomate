@@ -111,10 +111,10 @@ func NewServer(config *Config, store ServerStore, options ...ServerOption) (*Ser
 	}
 	if config.stagingMessengerReview() {
 		if config.DeploymentEnvironment != "staging" {
-			return nil, errors.New("Messenger review relay is staging-only")
+			return nil, errors.New("messenger review relay is staging-only")
 		}
 		if server.reviewResolver == nil {
-			return nil, errors.New("Messenger review binding resolver is required")
+			return nil, errors.New("messenger review binding resolver is required")
 		}
 	}
 	return server, nil
@@ -417,7 +417,7 @@ type graphBindingResponse struct {
 
 func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfig) error {
 	if s.config.stagingMessengerReview() {
-		return errors.New("Messenger review mode is inbound-only")
+		return errors.New("messenger review mode is inbound-only")
 	}
 	base, err := s.graphBase(account)
 	if err != nil {
@@ -509,7 +509,7 @@ type graphSubscriptionsResponse struct {
 // per-asset subscription before customer messages are delivered.
 func (s *Server) validateWebhookSubscription(ctx context.Context, account *AccountConfig) error {
 	if s.config.stagingMessengerReview() {
-		return errors.New("Messenger review mode is inbound-only")
+		return errors.New("messenger review mode is inbound-only")
 	}
 	base, err := s.graphBase(account)
 	if err != nil {

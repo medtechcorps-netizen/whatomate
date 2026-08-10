@@ -956,6 +956,7 @@ func (a *RelayAdapter) safeHTTPClient(allowLocalhost bool) (*http.Client, error)
 	transport.Proxy = nil
 	transport.DialContext = a.safeDialContext(allowLocalhost)
 	transport.DialTLSContext = nil
+	//lint:ignore SA1019 Clear any cloned legacy hook so HTTPS uses the guarded DialContext.
 	transport.DialTLS = nil //nolint:staticcheck // Clear any cloned legacy hook so HTTPS uses the guarded DialContext.
 	client.Transport = transport
 

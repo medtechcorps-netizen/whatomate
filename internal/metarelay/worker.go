@@ -73,10 +73,10 @@ func NewWorker(config *Config, store QueueStore, options ...WorkerOption) (*Work
 	}
 	if config.stagingMessengerReview() {
 		if config.DeploymentEnvironment != "staging" {
-			return nil, errors.New("Messenger review relay is staging-only")
+			return nil, errors.New("messenger review relay is staging-only")
 		}
 		if worker.reviewResolver == nil {
-			return nil, errors.New("Messenger review binding resolver is required")
+			return nil, errors.New("messenger review binding resolver is required")
 		}
 		// Review callbacks contain a dynamically provisioned credential. Always
 		// use the dial-time public-endpoint transport in this runtime, even if a

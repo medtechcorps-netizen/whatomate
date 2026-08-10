@@ -70,14 +70,14 @@ const (
 )
 
 var (
-	ErrInvalidRootSecret  = errors.New("Meta review broker root secret is invalid")
-	ErrInvalidRequest     = errors.New("Meta review provision request is invalid")
-	ErrRequestExpired     = errors.New("Meta review provision request is outside the allowed time window")
-	ErrInvalidSignature   = errors.New("Meta review provision signature is invalid")
-	ErrInvalidResponse    = errors.New("Meta review provision response is invalid")
-	ErrInvalidBundle      = errors.New("Meta review credential bundle is invalid")
-	ErrInvalidProof       = errors.New("Meta review inbound proof is invalid")
-	ErrInvalidProofSecret = errors.New("Meta review provider-proof secret is invalid")
+	ErrInvalidRootSecret  = errors.New("meta review broker root secret is invalid")
+	ErrInvalidRequest     = errors.New("meta review provision request is invalid")
+	ErrRequestExpired     = errors.New("meta review provision request is outside the allowed time window")
+	ErrInvalidSignature   = errors.New("meta review provision signature is invalid")
+	ErrInvalidResponse    = errors.New("meta review provision response is invalid")
+	ErrInvalidBundle      = errors.New("meta review credential bundle is invalid")
+	ErrInvalidProof       = errors.New("meta review inbound proof is invalid")
+	ErrInvalidProofSecret = errors.New("meta review provider-proof secret is invalid")
 )
 
 // ProvisionTuple is deployment-owned authority. Every field must match on the
@@ -211,7 +211,7 @@ func sharedSecretKeyID(secret, domain string) (string, error) {
 func NewNonce() (string, error) {
 	value := make([]byte, nonceBytes)
 	if _, err := io.ReadFull(rand.Reader, value); err != nil {
-		return "", errors.New("Meta review provision nonce could not be generated")
+		return "", errors.New("meta review provision nonce could not be generated")
 	}
 	return base64.RawURLEncoding.EncodeToString(value), nil
 }

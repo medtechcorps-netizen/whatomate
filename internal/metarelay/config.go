@@ -481,7 +481,7 @@ func (c *Config) validateStagingMessengerReview(_ func(string) string) error {
 		c.InstagramReviewedAt != "" ||
 		c.InstagramReviewEvidence != "" ||
 		c.InstagramLoginVerifyToken != "" {
-		return errors.New("Instagram configuration is forbidden in Messenger review mode")
+		return errors.New("instagram configuration is forbidden in Messenger review mode")
 	}
 	if len(c.Accounts) != 0 {
 		return errors.New("META_RELAY_ACCOUNTS_JSON is forbidden in Messenger review mode; the binding must come from the review broker")
