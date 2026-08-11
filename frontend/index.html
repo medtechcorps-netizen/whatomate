@@ -4,9 +4,13 @@
     <meta charset="UTF-8">
     <link rel="icon" type="image/png" href="/brand/rereply-mark.png">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- REREPLY_DESCRIPTION_START -->
     <meta name="description" content="ReReply - WhatsApp and Gmail customer conversations, CRM, automation, and Google Search Console reporting">
+    <!-- REREPLY_DESCRIPTION_END -->
     <meta name="theme-color" content="#10120d">
+    <!-- REREPLY_TITLE_START -->
     <title>ReReply</title>
+    <!-- REREPLY_TITLE_END -->
     <style>
       html,
       body {
@@ -79,11 +83,66 @@
         font-weight: 600;
         text-decoration: none;
       }
+
+      .app-fallback--legal {
+        place-items: start center;
+      }
+
+      .app-fallback--legal .app-fallback__content {
+        box-sizing: border-box;
+        width: min(100%, 920px);
+      }
+
+      .app-fallback__meta {
+        margin: 16px 0 0;
+        color: rgba(203, 212, 154, 0.7);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .app-fallback__legal-body {
+        margin-top: 40px;
+      }
+
+      .app-fallback__legal-body section {
+        padding: 28px 0;
+        border-top: 1px solid rgba(203, 212, 154, 0.13);
+        scroll-margin-top: 24px;
+      }
+
+      .app-fallback__legal-body h2 {
+        margin: 0;
+        color: #f0f1e8;
+        font-family: Georgia, 'Times New Roman', serif;
+        font-size: clamp(24px, 4vw, 32px);
+        font-weight: 500;
+        line-height: 1.15;
+      }
+
+      .app-fallback__legal-body p,
+      .app-fallback__legal-body li {
+        color: rgba(239, 240, 232, 0.68);
+        font-size: 15px;
+        line-height: 1.75;
+      }
+
+      .app-fallback__legal-body ul {
+        margin: 18px 0 0;
+        padding-left: 22px;
+      }
+
+      .app-fallback__legal-footer {
+        padding-top: 30px;
+        border-top: 1px solid rgba(203, 212, 154, 0.18);
+      }
     </style>
     <script src="/theme-init.js"></script>
   </head>
   <body>
     <div id="app">
+      <!-- REREPLY_FALLBACK_START -->
       <main class="app-fallback" aria-labelledby="fallback-title">
         <section class="app-fallback__content">
           <p class="app-fallback__brand">Customer operations, composed</p>
@@ -98,6 +157,7 @@
           </nav>
         </section>
       </main>
+      <!-- REREPLY_FALLBACK_END -->
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
