@@ -79,8 +79,8 @@ var legalFallbackDocuments = map[string]legalFallbackDocument{
 				Bullets: []string{
 					"Account identity, work contact details, roles, authentication records and organisation membership.",
 					"Customer and CRM details such as names, telephone numbers, profile information, tags, notes, lead stages, appointments and service preferences.",
-					"WhatsApp and email conversations, attachments, templates, delivery events and authorised agent notes.",
-					"Connected-channel identifiers and settings, technical and security logs, subscription and support records, and information submitted to optional automation or AI-assisted features.",
+					"WhatsApp, Facebook Messenger, Instagram and email conversations, attachments, templates, delivery events and authorised agent notes.",
+					"Connected-channel identifiers and settings, including Meta sender and message identifiers, Facebook Page and Instagram account identifiers, timestamps, technical and security logs, subscription and support records, and information submitted to optional automation or AI-assisted features.",
 				},
 			},
 			{

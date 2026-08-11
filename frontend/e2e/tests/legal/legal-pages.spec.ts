@@ -75,3 +75,12 @@ test('Privacy Policy identifies DigitalOcean without overstating processor or re
   await expect(sharingSection).toContainText('DigitalOcean is not necessarily the only service provider')
   await expect(page.locator('#ai')).toContainText('Qwen through Alibaba Cloud DashScope where configured')
 })
+
+test('Privacy Policy expressly discloses Meta conversations and identifiers', async ({ page }) => {
+  await page.goto('/privacy')
+
+  const dataSection = page.locator('#data')
+  await expect(dataSection).toContainText('Facebook Messenger, Instagram and email messages')
+  await expect(dataSection).toContainText('Meta sender and message identifiers')
+  await expect(dataSection).toContainText('Facebook Page and Instagram account identifiers')
+})
