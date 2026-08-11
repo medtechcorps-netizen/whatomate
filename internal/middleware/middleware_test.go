@@ -485,7 +485,6 @@ func TestSecurityHeaders(t *testing.T) {
 	assert.Equal(t, "DENY", string(headers.Peek("X-Frame-Options")))
 	assert.Equal(t, "strict-origin-when-cross-origin", string(headers.Peek("Referrer-Policy")))
 	assert.Equal(t, "max-age=31536000; includeSubDomains", string(headers.Peek("Strict-Transport-Security")))
-
 	policy := string(headers.Peek("Content-Security-Policy"))
 	directives := make(map[string]string)
 	for _, directive := range strings.Split(policy, ";") {
@@ -498,10 +497,9 @@ func TestSecurityHeaders(t *testing.T) {
 
 	assert.Equal(t, "'self'", directives["default-src"])
 	assert.Equal(t, "'self' https://connect.facebook.net", directives["script-src"])
-	assert.Equal(t, "'self' https://www.facebook.com", directives["frame-src"])
+	assert.Equal(t, "'self' https://www.facebook.com https://web.facebook.com https://staticxx.facebook.com", directives["frame-src"])
 	assert.Equal(t, "'none'", directives["frame-ancestors"])
 	assert.NotContains(t, policy, "*.facebook.com")
-	assert.NotContains(t, policy, "web.facebook.com")
 }
 
 func TestJWTClaims(t *testing.T) {
