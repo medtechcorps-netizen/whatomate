@@ -55,8 +55,8 @@ const privacySections: LegalSection[] = [
     bullets: [
       'Account data, such as names, work email addresses, roles, authentication records and organisation membership.',
       'Customer and contact data, such as names, telephone numbers, profile details, tags, notes, lead stages, appointments and service preferences.',
-      'Conversation data, including WhatsApp and email messages, attachments, templates, delivery events and agent notes.',
-      'Business configuration, including WhatsApp Business Account identifiers, phone-number identifiers, connected Google mailbox metadata, webhook settings and other connected-channel metadata.',
+      'Conversation data, including WhatsApp, Facebook Messenger, Instagram and email messages, attachments, templates, delivery events and agent notes.',
+      'Business and channel configuration, including Meta sender and message identifiers, Facebook Page and Instagram account identifiers, timestamps, WhatsApp Business Account and phone-number identifiers, connected Google mailbox metadata, webhook settings and routing metadata.',
       'Technical and security data, such as IP addresses, device and browser information, access logs, audit events and error diagnostics.',
       'Commercial and support data, including subscription records, invoices, service requests and correspondence with us.',
       'Information submitted to optional automation or AI-assisted features when a Customer Organisation enables them.'
