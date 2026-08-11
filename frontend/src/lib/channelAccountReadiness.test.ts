@@ -6,6 +6,7 @@ import {
   confirmMetaAccountTest,
   isManagedMessengerAccount,
   isMetaRelayAccount,
+  isStagingMessengerReviewAccount,
   META_RECERTIFICATION_SEQUENCE,
   messengerAwaitingRelayRegistry,
   messengerReviewRelayReady,
@@ -244,6 +245,113 @@ describe("metaAccountReadiness", () => {
           config: {
             ...reviewReady.config,
             outbound_enabled: true,
+          },
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("exposes dedicated deprovisioning only for a server-projected staging review account", () => {
+    const reviewAccount = account({
+      config: {
+        onboarding_state: "review_relay_ready",
+        review_only: true,
+      },
+    });
+
+    expect(isStagingMessengerReviewAccount(reviewAccount)).toBe(true);
+    expect(
+      isStagingMessengerReviewAccount(
+        account({
+          config: {
+            onboarding_state: "review_relay_unavailable",
+            review_only: true,
+          },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isStagingMessengerReviewAccount(
+        account({
+          status: "disconnected",
+          config: {
+            onboarding_state: "review_deprovisioning",
+            review_only: true,
+          },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isStagingMessengerReviewAccount(
+        account({
+          status: "disconnected",
+          config: {
+            onboarding_state: "review_remote_cleanup_pending",
+            review_only: true,
+          },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isStagingMessengerReviewAccount(
+        account({
+          status: "disconnected",
+          config: {
+            onboarding_state: "review_deprovisioned",
+            review_only: true,
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isStagingMessengerReviewAccount(
+        account({
+          config: {
+            onboarding_state: "awaiting_relay_registry",
+            review_only: true,
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isStagingMessengerReviewAccount(
+        account({
+          config: {
+            onboarding_state: "review_relay_ready",
+            review_only: false,
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isStagingMessengerReviewAccount(
+        account({
+          channel: "instagram",
+          config: {
+            onboarding_state: "review_relay_ready",
+            review_only: true,
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isStagingMessengerReviewAccount(
+        account({
+          external_account_id: "",
+          config: {
+            onboarding_state: "review_relay_ready",
+            review_only: true,
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isStagingMessengerReviewAccount(
+        account({
+          external_account_id: undefined,
+          config: {
+            onboarding_state: "review_relay_ready",
+            review_only: true,
           },
         }),
       ),

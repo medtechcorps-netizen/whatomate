@@ -263,7 +263,19 @@ func (a *App) beginMetaMessengerReviewDeprovision(
 	}
 	err := database.WithTenantReadCommitted(a.DB, organizationID, func(tx *gorm.DB) error {
 		scoped := a.scopedApp(tx, organizationID)
-		_, _, authErr = scoped.requireAuth(r, models.ResourceChannelAccounts, models.ActionDelete)
+		// Cleanup authority must survive a missing or lapsed commercial
+		// entitlement. The dedicated review connection can still hold a live
+		// Meta subscription and OAuth credential after product access ends, so
+		// deprovisioning checks authenticated tenant membership and the explicit
+		// channel delete permission without reopening the omnichannel feature
+		// gate. All deployment-pin, account-lock, and provider fences below remain
+		// unchanged.
+		authErr = scoped.requirePermission(
+			r,
+			userID,
+			models.ResourceChannelAccounts,
+			models.ActionDelete,
+		)
 		if authErr != nil {
 			return nil
 		}

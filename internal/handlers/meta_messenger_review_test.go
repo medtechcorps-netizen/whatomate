@@ -881,6 +881,166 @@ func TestMetaMessengerReviewDeprovisionRejectsOAuthFromDifferentBusinessBeforeQu
 	assert.NotNil(t, persistedWebhook.RevokedAt)
 }
 
+func TestMetaMessengerReviewDeprovisionSurvivesMissingOrLapsedEntitlement(t *testing.T) {
+	for _, testCase := range []struct {
+		name                 string
+		configureEntitlement func(*testing.T, *gorm.DB, uuid.UUID, uuid.UUID)
+	}{
+		{name: "absent"},
+		{
+			name: "lapsed",
+			configureEntitlement: func(t *testing.T, db *gorm.DB, orgID, userID uuid.UUID) {
+				t.Helper()
+				enableBookingCommerceTestEntitlement(
+					t,
+					db,
+					orgID,
+					userID,
+					"omnichannel.enabled",
+				)
+				require.NoError(t, db.Model(&models.Subscription{}).
+					Where("organization_id = ?", orgID).
+					Update("status", models.SubscriptionStatusExpired).Error)
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			fixture := newReviewHandlerFixture(t)
+			fixture.app.DB = db
+			organization := &models.Organization{
+				BaseModel: models.BaseModel{ID: fixture.orgID},
+				Name:      "Review cleanup entitlement organization",
+				Slug:      "review-cleanup-entitlement-" + uuid.NewString(),
+			}
+			require.NoError(t, db.Create(organization).Error)
+			admin := integrationTestUser(
+				t,
+				fixture.app,
+				fixture.orgID,
+				models.ResourceChannelAccounts+":"+models.ActionDelete,
+			)
+			if testCase.configureEntitlement != nil {
+				testCase.configureEntitlement(t, db, fixture.orgID, admin.ID)
+			}
+
+			account := fixture.readyAccount(t)
+			account.CreatedByID = &admin.ID
+			account.UpdatedByID = &admin.ID
+			require.NoError(t, db.Create(&account).Error)
+			webhook, oauth := createReviewHandlerCredentials(t, db, fixture, 1)
+
+			var deleteCalls atomic.Int32
+			var getCalls atomic.Int32
+			fixture.app.HTTPClient = reviewPagePostsGraphClient(t, func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				switch request.Method {
+				case http.MethodDelete:
+					deleteCalls.Add(1)
+					_, _ = writer.Write([]byte(`{"success":true}`))
+				case http.MethodGet:
+					getCalls.Add(1)
+					_, _ = writer.Write([]byte(`{"data":[]}`))
+				default:
+					writer.WriteHeader(http.StatusMethodNotAllowed)
+				}
+			})
+
+			request := testutil.NewRequest(t)
+			request.RequestCtx.Request.Header.SetMethod(fasthttp.MethodDelete)
+			testutil.SetAuthContext(request, fixture.orgID, admin.ID)
+			testutil.SetPathParam(request, "id", fixture.accountID.String())
+			require.NoError(t, fixture.app.DeprovisionMetaMessengerReviewAccount(request))
+			require.Equal(
+				t,
+				fasthttp.StatusOK,
+				testutil.GetResponseStatusCode(request),
+				string(testutil.GetResponseBody(request)),
+			)
+			assert.EqualValues(t, 1, deleteCalls.Load())
+			assert.EqualValues(t, 1, getCalls.Load())
+
+			var tombstone models.ChannelAccount
+			require.NoError(t, db.Unscoped().First(&tombstone, "id = ?", fixture.accountID).Error)
+			assert.True(t, tombstone.DeletedAt.Valid)
+			assert.Equal(t, "review_deprovisioned", stringConfigValue(tombstone.Metadata, "onboarding_state"))
+			for _, credentialID := range []uuid.UUID{webhook.ID, oauth.ID} {
+				var credential models.ChannelCredential
+				require.NoError(t, db.First(&credential, "id = ?", credentialID).Error)
+				assert.Equal(t, models.ChannelCredentialStatusRevoked, credential.Status)
+				assert.Empty(t, credential.CredentialBlob)
+			}
+			var deletedAuditCount int64
+			require.NoError(t, db.Model(&models.AuditLog{}).
+				Where(
+					"organization_id = ? AND resource_id = ? AND user_id = ? AND action = ?",
+					fixture.orgID,
+					fixture.accountID,
+					admin.ID,
+					models.AuditActionDeleted,
+				).
+				Count(&deletedAuditCount).Error)
+			assert.EqualValues(t, 1, deletedAuditCount)
+		})
+	}
+}
+
+func TestMetaMessengerReviewDeprovisionWithoutDeletePermissionDoesNotMutate(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	fixture := newReviewHandlerFixture(t)
+	fixture.app.DB = db
+	organization := &models.Organization{
+		BaseModel: models.BaseModel{ID: fixture.orgID},
+		Name:      "Review cleanup permission organization",
+		Slug:      "review-cleanup-permission-" + uuid.NewString(),
+	}
+	require.NoError(t, db.Create(organization).Error)
+	user := integrationTestUser(t, fixture.app, fixture.orgID)
+	account := fixture.readyAccount(t)
+	account.CreatedByID = &user.ID
+	account.UpdatedByID = &user.ID
+	require.NoError(t, db.Create(&account).Error)
+	webhook, oauth := createReviewHandlerCredentials(t, db, fixture, 1)
+
+	var graphCalls atomic.Int32
+	fixture.app.HTTPClient = reviewPagePostsGraphClient(t, func(writer http.ResponseWriter, _ *http.Request) {
+		graphCalls.Add(1)
+		writer.WriteHeader(http.StatusInternalServerError)
+	})
+
+	request := testutil.NewRequest(t)
+	request.RequestCtx.Request.Header.SetMethod(fasthttp.MethodDelete)
+	testutil.SetAuthContext(request, fixture.orgID, user.ID)
+	testutil.SetPathParam(request, "id", fixture.accountID.String())
+	require.NoError(t, fixture.app.DeprovisionMetaMessengerReviewAccount(request))
+	testutil.AssertErrorResponse(
+		t,
+		request,
+		fasthttp.StatusForbidden,
+		"Insufficient permissions",
+	)
+	assert.Zero(t, graphCalls.Load())
+
+	var persistedAccount models.ChannelAccount
+	require.NoError(t, db.First(&persistedAccount, "id = ?", fixture.accountID).Error)
+	assert.Equal(t, models.ChannelAccountStatusPending, persistedAccount.Status)
+	assert.True(t, boolConfigValue(persistedAccount.Metadata, "review_ready"))
+	assert.True(t, boolConfigValue(persistedAccount.Metadata, "subscription_verified"))
+	assert.False(t, persistedAccount.DeletedAt.Valid)
+	for _, expected := range []models.ChannelCredential{webhook, oauth} {
+		var credential models.ChannelCredential
+		require.NoError(t, db.First(&credential, "id = ?", expected.ID).Error)
+		assert.Equal(t, models.ChannelCredentialStatusActive, credential.Status)
+		assert.Equal(t, expected.CredentialBlob, credential.CredentialBlob)
+		assert.Nil(t, credential.RevokedAt)
+	}
+	var auditCount int64
+	require.NoError(t, db.Model(&models.AuditLog{}).
+		Where("organization_id = ? AND resource_id = ?", fixture.orgID, fixture.accountID).
+		Count(&auditCount).Error)
+	assert.Zero(t, auditCount)
+}
+
 func createReviewHandlerCredentials(
 	t *testing.T,
 	db *gorm.DB,

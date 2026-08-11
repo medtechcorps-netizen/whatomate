@@ -1,5 +1,6 @@
 import { api } from '@/services/api'
 import { unwrapListResponse } from '@/lib/api-utils'
+import { META_REVIEW_DEPROVISION_TIMEOUT_MS } from '@/lib/metaReviewDeprovision'
 import type { AxiosResponse } from 'axios'
 
 const PRODUCT_PAGE_LIMIT = 100
@@ -621,6 +622,10 @@ export interface MetaMessengerReviewPagePosts {
   fetched_at: string
 }
 
+export interface MetaMessengerReviewDeprovisionResponse {
+  message: string
+}
+
 export interface MetaMessengerReviewReplyConstraints {
   text_only: true
   max_length: number
@@ -958,6 +963,11 @@ export const channelsService = {
     api.post<APIEnvelope<MetaMessengerReviewReplyResponse>>(
       `/conversations/${encodeURIComponent(conversationId)}/meta-review-reply`,
       data,
+    ),
+  deprovisionMetaMessengerReviewAccount: (id: string) =>
+    api.delete<APIEnvelope<MetaMessengerReviewDeprovisionResponse>>(
+      `/integrations/meta/messenger/review/${encodeURIComponent(id)}`,
+      { timeout: META_REVIEW_DEPROVISION_TIMEOUT_MS },
     ),
   disconnectAccount: (id: string) => api.delete(`/channel-accounts/${id}`),
   conversations: (params?: Record<string, string | number | boolean>) => api.get('/conversations', { params }),

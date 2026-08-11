@@ -53,6 +53,26 @@ export function isManagedMessengerAccount(account: ChannelAccount) {
   );
 }
 
+/**
+ * Limits the browser deprovision control to the staging App Review account
+ * identified by the server-owned review projection. The dedicated DELETE
+ * handler remains authoritative and rechecks the full immutable deployment
+ * tuple before it changes any state.
+ */
+export function isStagingMessengerReviewAccount(account: ChannelAccount) {
+  const onboardingState = configString(account, "onboarding_state");
+  return (
+    account.channel === "messenger" &&
+    account.provider === "relay" &&
+    account.config?.review_only === true &&
+    (account.external_account_id?.trim() ?? "") !== "" &&
+    (onboardingState === "review_relay_ready" ||
+      onboardingState === "review_relay_unavailable" ||
+      onboardingState === "review_deprovisioning" ||
+      onboardingState === "review_remote_cleanup_pending")
+  );
+}
+
 export function messengerRelayRegistryRecognized(account: ChannelAccount) {
   if (!isManagedMessengerAccount(account)) return true;
   return (

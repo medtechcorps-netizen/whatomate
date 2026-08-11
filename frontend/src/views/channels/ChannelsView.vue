@@ -45,6 +45,15 @@ import {
   SheetDescription,
   SheetTitle,
 } from "@/components/ui/sheet";
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import CustomerRevenueWorkspace from "@/components/chat/CustomerRevenueWorkspace.vue";
 import { useAppToast } from "@/composables/useAppToast";
 import { useAuthStore } from "@/stores/auth";
@@ -62,6 +71,7 @@ import {
   confirmMetaAccountTest,
   isManagedMessengerAccount,
   isMetaRelayAccount,
+  isStagingMessengerReviewAccount,
   META_RECERTIFICATION_SEQUENCE,
   messengerAwaitingRelayRegistry,
   messengerReviewRelayReady,
@@ -76,6 +86,10 @@ import {
   isExplicitlyIneligibleMetaReviewReply,
   type AttestedMetaReviewReplyEligibility,
 } from "@/lib/metaReviewReply";
+import {
+  classifyMetaReviewDeprovisionFailure,
+  type MetaReviewDeprovisionFailureKind,
+} from "@/lib/metaReviewDeprovision";
 import { wsService } from "@/services/websocket";
 import {
   messengerOnboardingSelectionIsSafe,
@@ -177,6 +191,17 @@ const preparedMessengerFacebookLogin =
 const selectedMessengerPageKey = ref("");
 const messengerOnboardingError = ref("");
 const settingsAccount = ref<ChannelAccount | null>(null);
+const reviewDeprovisionDialogOpen = ref(false);
+const reviewDeprovisionTarget = ref<ChannelAccount | null>(null);
+const reviewDeprovisionConnectionName = ref("");
+const reviewDeprovisionPageID = ref("");
+const reviewDeprovisioning = ref(false);
+const reviewDeprovisionRechecking = ref(false);
+const reviewDeprovisionFailure = ref<{
+  kind: MetaReviewDeprovisionFailureKind;
+  message: string;
+} | null>(null);
+const reviewDeprovisionOperatorFailures = reactive(new Map<string, string>());
 const conversationPage = ref(1);
 const conversationTotal = ref(0);
 const messageTotal = ref(0);
@@ -196,6 +221,14 @@ const canDeleteAccounts = computed(() =>
 const canManageConversations = computed(() =>
   authStore.hasPermission("conversations", "write"),
 );
+const reviewDeprovisionConfirmationMatches = computed(() => {
+  const account = reviewDeprovisionTarget.value;
+  if (!account?.external_account_id) return false;
+  return (
+    reviewDeprovisionConnectionName.value === account.name &&
+    reviewDeprovisionPageID.value === account.external_account_id
+  );
+});
 const threadsPublicEngagementEntitlement = "threads.public_engagement.enabled";
 const absoluteWebhookURL = computed(() => {
   if (!createdConnection.value) return "";
@@ -1423,6 +1456,215 @@ async function disableOutbound() {
     await load();
   } catch (error) {
     toast.error("Outbound delivery was not disabled", getErrorMessage(error));
+  }
+}
+
+function openReviewDeprovisionDialog() {
+  const account = settingsAccount.value;
+  if (
+    !account ||
+    !canDeleteAccounts.value ||
+    !isStagingMessengerReviewAccount(account)
+  ) {
+    return;
+  }
+  reviewDeprovisionTarget.value = account;
+  reviewDeprovisionConnectionName.value = "";
+  reviewDeprovisionPageID.value = "";
+  const operatorFailure = reviewDeprovisionOperatorFailures.get(account.id);
+  reviewDeprovisionFailure.value = operatorFailure
+    ? { kind: "operator_required", message: operatorFailure }
+    : null;
+  reviewDeprovisionDialogOpen.value = true;
+}
+
+function closeReviewDeprovisionDialog() {
+  if (reviewDeprovisioning.value || reviewDeprovisionRechecking.value) return;
+  reviewDeprovisionDialogOpen.value = false;
+  reviewDeprovisionTarget.value = null;
+  reviewDeprovisionConnectionName.value = "";
+  reviewDeprovisionPageID.value = "";
+  reviewDeprovisionFailure.value = null;
+}
+
+function setReviewDeprovisionDialogOpen(open: boolean) {
+  if (open) {
+    reviewDeprovisionDialogOpen.value = true;
+    return;
+  }
+  closeReviewDeprovisionDialog();
+}
+
+function reviewDeprovisionErrorStatus(error: unknown) {
+  if (typeof error !== "object" || error === null || !("response" in error)) {
+    return null;
+  }
+  const response = (error as { response?: { status?: unknown } }).response;
+  return typeof response?.status === "number" ? response.status : null;
+}
+
+async function refreshAccountsAfterReviewDeprovision(accountID: string) {
+  const response = await channelsService.accounts();
+  const refreshedAccounts = unwrapListResponse<ChannelAccount>(
+    response,
+    "accounts",
+  );
+  accounts.value = refreshedAccounts;
+  const refreshedTarget = refreshedAccounts.find(
+    (account) => account.id === accountID,
+  );
+  if (!refreshedTarget) return undefined;
+  if (settingsAccount.value?.id === accountID) {
+    settingsAccount.value = refreshedTarget;
+  }
+  if (reviewDeprovisionTarget.value?.id === accountID) {
+    reviewDeprovisionTarget.value = refreshedTarget;
+  }
+  return refreshedTarget;
+}
+
+async function recheckReviewDeprovisionAfterOperatorRepair() {
+  const account = reviewDeprovisionTarget.value;
+  if (
+    !account ||
+    reviewDeprovisioning.value ||
+    reviewDeprovisionRechecking.value ||
+    reviewDeprovisionFailure.value?.kind !== "operator_required"
+  ) {
+    return;
+  }
+  reviewDeprovisionRechecking.value = true;
+  try {
+    const refreshedAccount =
+      await refreshAccountsAfterReviewDeprovision(account.id);
+    if (
+      !refreshedAccount ||
+      !isStagingMessengerReviewAccount(refreshedAccount)
+    ) {
+      toast.warning(
+        "Exact review connection was not confirmed",
+        "No operator block was cleared and no DELETE request was sent. Reload the inbox after checking the audited repair.",
+      );
+      return;
+    }
+    reviewDeprovisionOperatorFailures.delete(account.id);
+    reviewDeprovisionFailure.value = null;
+    toast.success(
+      "Review connection re-checked",
+      "The exact staging review account still exists. The dedicated endpoint will revalidate the operator repair before any cleanup is retried.",
+    );
+  } catch (error) {
+    toast.warning(
+      "Review connection could not be re-checked",
+      `${getErrorMessage(error)} No DELETE request was sent.`,
+    );
+  } finally {
+    reviewDeprovisionRechecking.value = false;
+  }
+}
+
+async function deprovisionReviewAccount() {
+  const account = reviewDeprovisionTarget.value;
+  if (
+    !account ||
+    reviewDeprovisioning.value ||
+    reviewDeprovisionRechecking.value ||
+    !canDeleteAccounts.value ||
+    !isStagingMessengerReviewAccount(account) ||
+    reviewDeprovisionFailure.value?.kind === "operator_required" ||
+    !reviewDeprovisionConfirmationMatches.value
+  ) {
+    return;
+  }
+
+  reviewDeprovisioning.value = true;
+  reviewDeprovisionFailure.value = null;
+  let succeeded = false;
+  let failureKind: MetaReviewDeprovisionFailureKind | null = null;
+  try {
+    const response =
+      await channelsService.deprovisionMetaMessengerReviewAccount(account.id);
+    if (response.status !== 200) {
+      throw new Error(
+        `Unexpected review deprovision response (${response.status})`,
+      );
+    }
+    reviewDeprovisionOperatorFailures.delete(account.id);
+    succeeded = true;
+    if (selectedConversation.value?.channel_account_id === account.id) {
+      closeMobileConversation();
+    }
+    toast.success(
+      "Staging Messenger review connection deprovisioned",
+      "Inbound authority, the Page subscription and stored credentials were removed through the audited review lifecycle.",
+    );
+  } catch (error) {
+    const message = getErrorMessage(
+      error,
+      "The audited review deprovision request did not complete.",
+    );
+    const status = reviewDeprovisionErrorStatus(error);
+    failureKind = classifyMetaReviewDeprovisionFailure(status, message);
+    reviewDeprovisionFailure.value = {
+      kind: failureKind,
+      message,
+    };
+    if (failureKind === "operator_required") {
+      reviewDeprovisionOperatorFailures.set(account.id, message);
+      toast.error(
+        "Audited operator reconciliation required",
+        `${message} This control remains disabled until an authorized operator repairs the blocking condition and completes audited reconciliation.`,
+      );
+    } else if (failureKind === "retryable") {
+      toast.warning(
+        "Deprovisioning requires another attempt",
+        `${message} The connection remains fail-closed; retry this same audited control after the dependency recovers.`,
+      );
+    } else if (failureKind === "failed") {
+      toast.error(
+        "Review connection was not deprovisioned",
+        `${message} No generic account deletion was attempted.`,
+      );
+    }
+  } finally {
+    let accountsRefreshed = false;
+    let refreshedAccount: ChannelAccount | undefined;
+    let refreshErrorMessage = "";
+    try {
+      refreshedAccount =
+        await refreshAccountsAfterReviewDeprovision(account.id);
+      accountsRefreshed = true;
+    } catch (refreshError) {
+      refreshErrorMessage = getErrorMessage(refreshError);
+    }
+    if (failureKind === "ambiguous") {
+      if (accountsRefreshed && !refreshedAccount) {
+        reviewDeprovisionOperatorFailures.delete(account.id);
+        reviewDeprovisionFailure.value = null;
+        succeeded = true;
+        if (selectedConversation.value?.channel_account_id === account.id) {
+          closeMobileConversation();
+        }
+        toast.success(
+          "Staging Messenger review connection deprovisioned",
+          "The DELETE response was interrupted, but the refreshed account list confirms that the exact review connection was removed.",
+        );
+      } else {
+        toast.warning(
+          "Deprovisioning result is unconfirmed",
+          accountsRefreshed
+            ? "The exact review connection is still listed and remains fail-closed. Retry only this same dedicated cleanup control."
+            : `${refreshErrorMessage || "The account list could not be refreshed."} Retry only this same dedicated cleanup control after connectivity recovers.`,
+        );
+      }
+    } else if (refreshErrorMessage) {
+      toast.warning("Connection list could not be refreshed", refreshErrorMessage);
+    }
+    reviewDeprovisioning.value = false;
+    if (succeeded) {
+      settingsAccount.value = null;
+      closeReviewDeprovisionDialog();
+    }
   }
 }
 
@@ -3225,24 +3467,37 @@ onBeforeUnmount(() => {
             class="mt-1 text-[11px] leading-5 text-white/40 light:text-gray-500"
           >
             {{
-              settingsAccount && isManagedMessengerAccount(settingsAccount)
+              settingsAccount &&
+              isStagingMessengerReviewAccount(settingsAccount)
+                ? "Runs the audited staging cleanup: quarantine locally, remove the exact Page subscription from Meta, erase review credentials, then remove this connection. CRM history is retained."
+                : settingsAccount && isManagedMessengerAccount(settingsAccount)
                 ? "Operator deprovisioning is required so the protected relay registry, Meta subscription and authorization are removed before the local connection."
                 : "Stops new traffic and removes the connection. CRM history is retained."
             }}
           </p>
           <Button
+            v-if="
+              settingsAccount &&
+              isStagingMessengerReviewAccount(settingsAccount)
+            "
             type="button"
             variant="destructive"
             class="mt-3"
-            :disabled="
-              Boolean(
-                settingsAccount && isManagedMessengerAccount(settingsAccount),
-              )
-            "
+            data-testid="meta-review-deprovision-open"
+            @click="openReviewDeprovisionDialog"
+          >
+            Deprovision staging review connection
+          </Button>
+          <Button
+            v-else
+            type="button"
+            variant="destructive"
+            class="mt-3"
+            :disabled="Boolean(isManagedMessengerAccount(settingsAccount))"
             @click="disconnectAccount"
           >
             {{
-              settingsAccount && isManagedMessengerAccount(settingsAccount)
+              isManagedMessengerAccount(settingsAccount)
                 ? "Operator deprovisioning required"
                 : "Disconnect connection"
             }}
@@ -3250,5 +3505,187 @@ onBeforeUnmount(() => {
         </div>
       </form>
     </div>
+
+    <AlertDialog
+      :open="reviewDeprovisionDialogOpen"
+      @update:open="setReviewDeprovisionDialogOpen"
+    >
+      <AlertDialogContent
+        data-testid="meta-review-deprovision-dialog"
+        class="max-w-xl overflow-hidden border-red-400/25 bg-[#111416] p-0 light:bg-white"
+      >
+        <div
+          class="border-b border-red-300/15 bg-[linear-gradient(135deg,rgba(127,29,29,0.2),rgba(17,20,22,0.95))] px-6 py-5 light:bg-red-50"
+        >
+          <AlertDialogHeader>
+            <div class="mb-1 flex items-center gap-2 text-red-200 light:text-red-700">
+              <span
+                class="flex h-8 w-8 items-center justify-center rounded-full border border-red-300/20 bg-red-400/10"
+              >
+                <AlertCircle class="h-4 w-4" />
+              </span>
+              <span class="text-[10px] font-semibold uppercase tracking-[0.2em]"
+                >Audited staging cleanup</span
+              >
+            </div>
+            <AlertDialogTitle class="text-white light:text-slate-950">
+              Deprovision this Messenger review connection?
+            </AlertDialogTitle>
+            <AlertDialogDescription
+              class="text-xs leading-5 text-white/55 light:text-slate-600"
+            >
+              This immediately fences new inbound and outbound work, removes
+              the exact Page subscription from Meta, erases stored review
+              credentials, and removes the local connection. Existing CRM
+              history remains.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+        </div>
+
+        <div v-if="reviewDeprovisionTarget" class="space-y-4 px-6 pb-2">
+          <div
+            class="grid gap-3 rounded-xl border border-white/10 bg-black/20 p-4 text-xs light:border-slate-200 light:bg-slate-50 sm:grid-cols-2"
+          >
+            <div>
+              <p
+                class="text-[10px] font-semibold uppercase tracking-[0.16em] text-white/35 light:text-slate-500"
+              >
+                Connection
+              </p>
+              <p class="mt-1 font-medium text-white light:text-slate-900">
+                {{ reviewDeprovisionTarget.name }}
+              </p>
+            </div>
+            <div>
+              <p
+                class="text-[10px] font-semibold uppercase tracking-[0.16em] text-white/35 light:text-slate-500"
+              >
+                Facebook Page ID
+              </p>
+              <p
+                class="mt-1 break-all font-mono font-medium text-white light:text-slate-900"
+              >
+                {{ reviewDeprovisionTarget.external_account_id }}
+              </p>
+            </div>
+          </div>
+
+          <p class="text-xs leading-5 text-white/50 light:text-slate-600">
+            Confirm both immutable identifiers exactly. This control never
+            falls back to generic account deletion.
+          </p>
+
+          <label class="block">
+            <span class="text-xs font-medium text-white/70 light:text-slate-700"
+              >Type the connection name</span
+            >
+            <Input
+              v-model="reviewDeprovisionConnectionName"
+              data-testid="meta-review-deprovision-name"
+              class="mt-1.5"
+              type="text"
+              autocomplete="off"
+              :spellcheck="false"
+              :placeholder="reviewDeprovisionTarget.name"
+              :disabled="reviewDeprovisioning || reviewDeprovisionRechecking"
+            />
+          </label>
+
+          <label class="block">
+            <span class="text-xs font-medium text-white/70 light:text-slate-700"
+              >Type the Facebook Page ID</span
+            >
+            <Input
+              v-model="reviewDeprovisionPageID"
+              data-testid="meta-review-deprovision-page-id"
+              class="mt-1.5 font-mono"
+              type="text"
+              inputmode="numeric"
+              autocomplete="off"
+              :spellcheck="false"
+              :placeholder="reviewDeprovisionTarget.external_account_id"
+              :disabled="reviewDeprovisioning || reviewDeprovisionRechecking"
+            />
+          </label>
+
+          <div
+            v-if="reviewDeprovisionFailure"
+            role="alert"
+            data-testid="meta-review-deprovision-error"
+            class="rounded-xl border p-3 text-xs leading-5"
+            :class="
+              ['retryable', 'ambiguous'].includes(
+                reviewDeprovisionFailure.kind,
+              )
+                ? 'border-amber-300/25 bg-amber-300/[0.06] text-amber-100 light:border-amber-300 light:bg-amber-50 light:text-amber-900'
+                : 'border-red-300/25 bg-red-300/[0.06] text-red-100 light:border-red-300 light:bg-red-50 light:text-red-900'
+            "
+          >
+            <p class="font-semibold">
+              {{
+                reviewDeprovisionFailure.kind === "retryable"
+                  ? "Cleanup is fail-closed and needs a retry"
+                  : reviewDeprovisionFailure.kind === "operator_required"
+                    ? "Audited operator reconciliation is required"
+                    : reviewDeprovisionFailure.kind === "ambiguous"
+                      ? "The request outcome is unconfirmed"
+                      : "Deprovisioning was not confirmed"
+              }}
+            </p>
+            <p class="mt-1">{{ reviewDeprovisionFailure.message }}</p>
+            <Button
+              v-if="reviewDeprovisionFailure.kind === 'operator_required'"
+              type="button"
+              variant="outline"
+              size="sm"
+              class="mt-3"
+              data-testid="meta-review-deprovision-recheck"
+              :disabled="reviewDeprovisioning || reviewDeprovisionRechecking"
+              @click="recheckReviewDeprovisionAfterOperatorRepair"
+            >
+              <RefreshCw
+                class="mr-2 h-3.5 w-3.5"
+                :class="{ 'animate-spin': reviewDeprovisionRechecking }"
+              />
+              {{
+                reviewDeprovisionRechecking
+                  ? "Re-checking..."
+                  : "Re-check after operator repair"
+              }}
+            </Button>
+          </div>
+        </div>
+
+        <AlertDialogFooter class="px-6 pb-6 pt-2">
+          <AlertDialogCancel
+            :disabled="reviewDeprovisioning || reviewDeprovisionRechecking"
+          >
+            Cancel
+          </AlertDialogCancel>
+          <Button
+            type="button"
+            variant="destructive"
+            data-testid="meta-review-deprovision-confirm"
+            :disabled="
+              reviewDeprovisioning ||
+              reviewDeprovisionRechecking ||
+              reviewDeprovisionFailure?.kind === 'operator_required' ||
+              !reviewDeprovisionConfirmationMatches
+            "
+            @click="deprovisionReviewAccount"
+          >
+            <Loader2
+              v-if="reviewDeprovisioning"
+              class="mr-2 h-4 w-4 animate-spin"
+            />
+            {{
+              reviewDeprovisioning
+                ? "Deprovisioning..."
+                : "Deprovision exact Page"
+            }}
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   </div>
 </template>
