@@ -55,6 +55,32 @@ func TestLoadConfigAcceptsOnlyDynamicMessengerReviewBinding(t *testing.T) {
 	}
 }
 
+func TestLoadReviewConfigAcceptsDevelopmentOrLiveWithUnapprovedReviewState(t *testing.T) {
+	for _, appMode := range []string{"development", "live"} {
+		for _, reviewStatus := range []string{"not_submitted", "pending", "in_review"} {
+			t.Run(appMode+"_"+reviewStatus, func(t *testing.T) {
+				environment := validReviewConfigEnvironment()
+				environment["META_RELAY_MESSENGER_APP_MODE"] = appMode
+				environment["META_RELAY_MESSENGER_APP_REVIEW_STATUS"] = reviewStatus
+
+				config, err := loadTestEnvironment(environment)
+				if err != nil {
+					t.Fatalf("load review config: %v", err)
+				}
+				if config.MessengerAppMode != appMode || config.MessengerAppReviewStatus != reviewStatus {
+					t.Fatalf(
+						"loaded app governance = %q/%q, want %q/%q",
+						config.MessengerAppMode,
+						config.MessengerAppReviewStatus,
+						appMode,
+						reviewStatus,
+					)
+				}
+			})
+		}
+	}
+}
+
 func TestLoadReviewConfigRejectsProductionAndFalseGovernanceAssertions(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string
@@ -69,11 +95,11 @@ func TestLoadReviewConfigRejectsProductionAndFalseGovernanceAssertions(t *testin
 			want: "must be staging",
 		},
 		{
-			name: "live app assertion",
+			name: "invalid app mode",
 			mutate: func(environment map[string]string) {
-				environment["META_RELAY_MESSENGER_APP_MODE"] = "live"
+				environment["META_RELAY_MESSENGER_APP_MODE"] = "production"
 			},
-			want: "must be development",
+			want: "must be development or live",
 		},
 		{
 			name: "approved app review assertion",

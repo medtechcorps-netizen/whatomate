@@ -11,8 +11,10 @@
 The review relay is an intentionally narrow companion to
 [Managed Messenger onboarding](meta-messenger-onboarding.md). It lets one
 deployment-pinned staging workspace receive Messenger text events while the
-Messenger app is still in Development mode and its App Review status is
-truthfully `not_submitted`, `pending`, or `in_review`.
+Messenger app is truthfully in Development mode or Live/Published mode and its
+App Review status is truthfully `not_submitted`, `pending`, or `in_review`.
+Live/Published mode permits the app-role review transport; it is not evidence
+of App Review approval, Advanced Access, or production readiness.
 
 The exact runtime mode is:
 
@@ -285,7 +287,7 @@ META_RELAY_REREPLY_PROVIDER_PROOF_SECRET=<same provider-proof secret>
 
 META_RELAY_MESSENGER_APP_SECRET=<Messenger app secret>
 META_RELAY_MESSENGER_APP_ID=<same numeric Messenger app ID>
-META_RELAY_MESSENGER_APP_MODE=development
+META_RELAY_MESSENGER_APP_MODE=<development|live>
 META_RELAY_MESSENGER_APP_OWNER_BUSINESS_ID=<Tech Provider Business ID>
 META_RELAY_MESSENGER_TECH_PROVIDER_STATUS=verified
 META_RELAY_MESSENGER_APP_REVIEW_STATUS=<not_submitted|pending|in_review>
@@ -365,8 +367,10 @@ never produces a falsely ready binding.
    non-production ReReply deployment, Redis, database, domain, Messenger app,
    Business, and Page.
 2. Record the exact Tech Provider app owner separately from the Page-owning
-   Business. Confirm that the app really is in Development mode and that its
-   App Review state is one of the accepted unapproved values.
+   Business. Confirm that the app really is in the declared Development or
+   Live/Published mode and that its App Review state is one of the accepted
+   unapproved values. A Live declaration is transport availability for the
+   app-role reviewer only; it must not be recorded as approval evidence.
 3. Generate the future expiry, the fixed ChannelAccount UUID, a new generation
    UUID, and three independent high-entropy broker/proof secrets. Keep an
    operator record of identifiers only; keep secret values in the secret
@@ -391,9 +395,10 @@ never produces a falsely ready binding.
    `review_relay_ready`, `review_only=true`, `registry_recognized=false`, and
    disabled outbound/AI/default-outgoing state. Then require `GET /reviewz` to
    return `204`; this is the exact dynamic-binding readiness check.
-10. Send a new text DM from an account permitted by the Development-mode App
-    Review setup. Confirm that the event appears only in the intended staging
-    workspace and opens a 24-hour customer-service window.
+10. Send a new text DM from the single app-role tester permitted by the review
+    setup. Confirm that the event appears only in the intended staging
+    workspace and opens a 24-hour customer-service window. Live/Published mode
+    does not authorize ordinary customer traffic without approved access.
 11. Sign in as the exact configured reviewer. Confirm that the dedicated
     review-reply eligibility check names the exact Page and recipient. Enter
     one plain-text response, acknowledge the manual-send warning, and submit it

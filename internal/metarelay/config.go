@@ -442,8 +442,10 @@ func (c *Config) validateStagingMessengerReview(_ func(string) string) error {
 	if !metaAppIDPattern.MatchString(c.MessengerAppID) {
 		return errors.New("environment variable META_RELAY_MESSENGER_APP_ID must be a valid numeric Meta app ID")
 	}
-	if c.MessengerAppMode != "development" {
-		return errors.New("environment variable META_RELAY_MESSENGER_APP_MODE must be development in Messenger review mode")
+	switch c.MessengerAppMode {
+	case "development", "live":
+	default:
+		return errors.New("environment variable META_RELAY_MESSENGER_APP_MODE must be development or live in Messenger review mode")
 	}
 	if !metaBusinessIDPattern.MatchString(c.MessengerAppOwnerBusinessID) {
 		return errors.New("environment variable META_RELAY_MESSENGER_APP_OWNER_BUSINESS_ID must be a valid numeric Meta Business Portfolio ID")
