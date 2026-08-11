@@ -1,10 +1,12 @@
 # Staging-only Messenger App Review relay
 
 > **Not production-ready:** this runtime exists only to demonstrate one
-> inbound Messenger Page during Meta App Review. It is not a production
-> transport, a general tenant connection path, an Instagram integration, an
-> outbound messaging path, or evidence that the Meta app has been approved.
-> Never deploy it to a production environment.
+> Messenger Page during Meta App Review. It is not a production transport, a
+> general tenant connection path, an Instagram integration, or evidence that
+> the Meta app has been approved. The relay remains inbound-only. ReReply may
+> expose one separately fenced, human-initiated, text-only review reply while
+> the customer-service window is open; this does not enable ordinary outbound
+> delivery. Never deploy this mode to a production environment.
 
 The review relay is an intentionally narrow companion to
 [Managed Messenger onboarding](meta-messenger-onboarding.md). It lets one
@@ -51,6 +53,10 @@ The review account remains deliberately unconnected:
 - it is never recognized as a production protected-registry account; and
 - generic update, Test, delete, send, mark-read, media-fetch, subscribe,
   credential-refresh, outbox, and AI-reply paths reject the binding.
+
+The only outbound exception is the dedicated App Review reply endpoint
+described below. It does not change any of these account fields, cannot use the
+generic composer or worker, and never grants the relay an outbound credential.
 
 ## Security boundary
 
@@ -99,6 +105,76 @@ Instagram webhook routes, account-health `HEAD`, and relay outbound `POST`
 routes are not registered. A foreign Page ID in an otherwise valid Meta
 payload is rejected before it enters the queue.
 
+## Reviewer-only manual reply
+
+Meta App Review may require a reviewer to demonstrate an app-to-user
+Messenger response. ReReply provides a separate, staging-only exception for
+that evidence without weakening the inbound relay or the normal outbound
+fuses:
+
+```text
+GET  /api/conversations/{conversation_id}/meta-review-reply
+POST /api/conversations/{conversation_id}/meta-review-reply
+```
+
+The GET endpoint returns a short-lived server attestation only when all of the
+following remain true:
+
+- the authenticated principal is the exact deployment-pinned reviewer user
+  with the exact deployment-pinned reviewer role; that role's complete
+  permission set is exactly `channel_accounts:read`, `contacts:read`, and
+  `conversations:read`, with no write or administrative permissions;
+- authentication is an interactive user session, not an API key;
+- the deployment, organization, Business, Page, app, account, generation, and
+  authority expiry match exactly;
+- the managed account remains `pending`, review-ready, subscribed, not
+  connected, not default-outgoing, and has outbound and AI explicitly false;
+- exactly one current encrypted Page OAuth credential matches the configured
+  app, Business, Page, account, and generation;
+- the conversation belongs to that exact account and its customer PSID comes
+  from the server-side contact identity, never from the browser;
+- a verified inbound customer text exists and the Meta 24-hour
+  customer-service window is still open; and
+- service-purpose consent remains allowed.
+
+The POST endpoint accepts only the issued attestation, a canonical client
+request nonce, one nonblank plain-text body of at most 2,000 characters, and
+an explicit `manual_confirmation=true`. The durable one-attempt key, Page ID,
+recipient PSID, purpose, credential, and Graph route are server-derived. It cannot send media,
+templates, tags, reactions, read receipts, AI output, automated replies, or a
+business-initiated message outside the service window.
+
+Before Graph is called, ReReply locks and revalidates the exact account,
+conversation, consent, OAuth credential ID/version/ciphertext, generation, and
+attestation. It then writes a durable single-attempt dispatch record. A
+matching replay returns the stored result; a different body for the same
+verified inbound message is rejected even when the browser supplies a new
+nonce. Transport ambiguity, timeout, an invalid response, or an
+unsettled provider result is terminal and is never retried automatically.
+Only the safe provider message identifier and settlement state are retained;
+provider response bodies and credentials are not logged or returned.
+
+One absolute delivery deadline is established before the durable dispatch
+begins and remains in force through locked revalidation, credential decryption,
+and the Graph request. It is the earliest of the short transport cap,
+attestation expiry, 24-hour service-window end, review-authority expiry, and
+persisted provider deadline. If it expires at any point before transport, the
+attempt settles locally and no Graph request is started.
+
+Deprovisioning takes the same account lock. If it wins first, a review reply
+makes no provider request. If a reply has already crossed the durable dispatch
+fence, deprovisioning returns a retryable draining response and keeps the
+credential until that one attempt settles. Generic outbox workers and relay
+outbound routes remain unable to deliver the review message.
+
+The review dispatch fence is permanent, not lease-expiring. A crashed or
+otherwise unsettled `review_dispatching` record must never be cleared merely
+because time passed: it blocks credential revocation and deprovisioning until
+the provider outcome is deterministically settled or a separately authorized,
+audited operator reconciliation records the outcome. Generic worker discovery,
+claim, and stale-recovery paths exclude both the dedicated status and the
+review idempotency namespace.
+
 `/reviewz` is registered only in the staging review runtime. It bypasses the
 short ingress cache and returns a generic `503` unless Redis, broker
 authentication, the exact tuple, current credential, callback, expiry, and
@@ -142,6 +218,9 @@ WHATOMATE_META_MESSENGER_REVIEW_RELAY__PAGE_ID=<Messenger Page ID>
 WHATOMATE_META_MESSENGER_REVIEW_RELAY__CHANNEL_ACCOUNT_ID=<pre-generated account UUID>
 WHATOMATE_META_MESSENGER_REVIEW_RELAY__GENERATION=<new review-generation UUID>
 WHATOMATE_META_MESSENGER_REVIEW_RELAY__EXPIRES_AT=<future canonical UTC RFC3339 timestamp>
+WHATOMATE_META_MESSENGER_REVIEW_RELAY__REVIEWER_OUTBOUND_ENABLED=false
+WHATOMATE_META_MESSENGER_REVIEW_RELAY__REVIEWER_USER_ID=<dedicated reviewer user UUID>
+WHATOMATE_META_MESSENGER_REVIEW_RELAY__REVIEWER_ROLE_ID=<least-privilege reviewer role UUID>
 WHATOMATE_META_MESSENGER_REVIEW_RELAY__RELAY_BASE_URL=<same canonical relay base URL>
 WHATOMATE_META_MESSENGER_REVIEW_RELAY__REREPLY_BASE_URL=<public ReReply staging origin>
 WHATOMATE_META_MESSENGER_REVIEW_RELAY__BROKER_AUTH_SECRET=<secret>
@@ -171,6 +250,26 @@ WHATOMATE_META_RELAY__PROVIDER_PROOF_SECRET
 
 Review mode and the normal protected production relay configuration cannot be
 enabled in the same ReReply process.
+
+### Mandatory two-deployment reviewer-outbound rollout
+
+Never enable reviewer outbound in the first rolling deployment that introduces
+the dispatch/deprovision fences. An older web instance does not understand the
+new permanent review-dispatch state and could otherwise deprovision the Page
+while a new instance is sending.
+
+1. Deploy the fence-aware build with
+   `REVIEWER_OUTBOUND_ENABLED=false`. The reviewer user and role pins may remain
+   absent in this first deployment.
+2. Wait for the deployment to become fully `ACTIVE`. Verify the exact expected
+   source commit for every web, worker, relay, and migration component; verify
+   all previous web and worker instances have terminated; then verify normal
+   health and review readiness.
+3. In a second deployment, set the exact reviewer user and role UUID pins and
+   change `REVIEWER_OUTBOUND_ENABLED=true`.
+4. Do not roll back to a fence-unaware build while a review send is
+   `review_dispatching` or its outcome is unresolved. First settle or reconcile
+   the attempt through the audited operator procedure.
 
 ## Review relay staging configuration
 
@@ -294,13 +393,17 @@ never produces a falsely ready binding.
    return `204`; this is the exact dynamic-binding readiness check.
 10. Send a new text DM from an account permitted by the Development-mode App
     Review setup. Confirm that the event appears only in the intended staging
-    workspace. Do not use successful outbound delivery as a test: outbound is
-    intentionally impossible.
-11. Confirm the relay has not registered Instagram, account-health, or
+    workspace and opens a 24-hour customer-service window.
+11. Sign in as the exact configured reviewer. Confirm that the dedicated
+    review-reply eligibility check names the exact Page and recipient. Enter
+    one plain-text response, acknowledge the manual-send warning, and submit it
+    once. Confirm that the same sender receives it in Messenger. Ordinary
+    outbound, media, AI, mark-read, and default routing must remain disabled.
+12. Confirm the relay has not registered Instagram, account-health, or
     outbound routes and that application logs contain no request signatures,
     nonces, credential bundles, Page tokens, webhook HMACs, or provider-proof
     values.
-12. Before the authority expires, run the dedicated deprovision flow below.
+13. Before the authority expires, run the dedicated deprovision flow below.
     Do not leave an expired review row or Meta subscription for later cleanup.
 
 Changing any review authority or secret changes the onboarding session
@@ -327,6 +430,12 @@ The dedicated sequence is quarantine-first:
    `disconnected`, clears default routing, disables outbound and AI, changes
    state to `review_deprovisioning`, revokes and erases the webhook credential,
    and cancels queued AI and outbox work.
+   If a dedicated review reply has already crossed its durable dispatch fence,
+   this step returns a retryable draining response before quarantine or
+   credential erasure. Retry only after the recorded provider attempt reaches a
+   deterministic terminal settlement. A crashed or unsettled permanent fence
+   never clears by elapsed time and requires a separately authorized, audited
+   operator reconciliation before deprovisioning can continue.
 3. Only after that local fence commits, ReReply uses the still-encrypted Page
    token to delete the exact Page's `subscribed_apps` binding from Meta.
    A separate `GET /subscribed_apps` absence check resolves a timed-out or

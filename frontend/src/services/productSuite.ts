@@ -621,6 +621,57 @@ export interface MetaMessengerReviewPagePosts {
   fetched_at: string
 }
 
+export interface MetaMessengerReviewReplyConstraints {
+  text_only: true
+  max_length: number
+  manual_confirmation_required: true
+  ai_disabled: true
+  mark_read_disabled: true
+}
+
+export interface MetaMessengerReviewReplyEligibility {
+  eligible: boolean
+  reason_code: string
+  reason?: string
+  attestation_id?: string
+  expires_at?: string
+  page_id?: string
+  recipient_label?: string
+  constraints: MetaMessengerReviewReplyConstraints
+}
+
+export interface MetaMessengerReviewReplyRequest {
+  attestation_id: string
+  idempotency_key: string
+  text: string
+  manual_confirmation: true
+}
+
+export interface MetaMessengerReviewReplyMessage {
+  id: string
+  direction: 'incoming' | 'outgoing'
+  message_type: string
+  content: string
+  status: string
+  created_at: string
+}
+
+export interface MetaMessengerReviewReplyResponse {
+  message: MetaMessengerReviewReplyMessage
+  parts?: Array<{
+    type: string
+    text?: string
+    caption?: string
+  }>
+  audit: {
+    id: string
+    sent_at: string
+    page_id: string
+    recipient_label: string
+  }
+  idempotent?: boolean
+}
+
 export interface InboxConversation {
   id: string
   channel_account_id: string
@@ -681,10 +732,7 @@ export const organizationEntitlementSupportService = {
       `/admin/organizations/${encodeURIComponent(organizationId)}/entitlements/threads-public-engagement/enable`,
       data,
     ),
-  revokeThreadsPublicEngagementSupport: (
-    organizationId: string,
-    data: RevokeThreadsPublicEngagementSupportRequest,
-  ) =>
+  revokeThreadsPublicEngagementSupport: (organizationId: string, data: RevokeThreadsPublicEngagementSupportRequest) =>
     api.post<APIEnvelope<RevokeThreadsPublicEngagementSupportResponse>>(
       `/admin/organizations/${encodeURIComponent(organizationId)}/entitlements/threads-public-engagement/revoke-support`,
       data,
@@ -902,6 +950,15 @@ export const channelsService = {
   testAccount: (id: string) => api.post(`/channel-accounts/${id}/test`),
   reviewPagePosts: (id: string) =>
     api.get<APIEnvelope<MetaMessengerReviewPagePosts>>(`/channel-accounts/${encodeURIComponent(id)}/meta-page-posts`),
+  metaReviewReplyEligibility: (conversationId: string) =>
+    api.get<APIEnvelope<MetaMessengerReviewReplyEligibility>>(
+      `/conversations/${encodeURIComponent(conversationId)}/meta-review-reply`,
+    ),
+  sendMetaReviewReply: (conversationId: string, data: MetaMessengerReviewReplyRequest) =>
+    api.post<APIEnvelope<MetaMessengerReviewReplyResponse>>(
+      `/conversations/${encodeURIComponent(conversationId)}/meta-review-reply`,
+      data,
+    ),
   disconnectAccount: (id: string) => api.delete(`/channel-accounts/${id}`),
   conversations: (params?: Record<string, string | number | boolean>) => api.get('/conversations', { params }),
   allConversations: (params?: Record<string, string | number | boolean>) =>

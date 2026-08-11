@@ -8,12 +8,13 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/models"
 	"gorm.io/gorm"
 )
 
 const (
 	tenantSetting           = "app.current_organization_id"
-	tenantRLSRoutingVersion = 5
+	tenantRLSRoutingVersion = 6
 )
 
 var (
@@ -575,7 +576,7 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		     AND channel_account.status IN ('pending', 'active', 'degraded')
 		     AND channel_account.deleted_at IS NULL
 		 $function$`,
-		`CREATE OR REPLACE FUNCTION public.rereply_ready_channel_outbox_orgs(
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION public.rereply_ready_channel_outbox_orgs(
 		   p_after uuid,
 		   p_limit integer,
 		   p_stale_before timestamptz
@@ -590,6 +591,8 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		     FROM public.outbox_jobs
 		     WHERE deleted_at IS NULL
 		       AND available_at <= clock_timestamp()
+		       AND idempotency_key NOT LIKE '%s%%'
+		       AND COALESCE(provider_state->>'review_mode', '') <> '%s'
 		       AND (
 		         status IN ('pending', 'retrying')
 		         OR (
@@ -603,6 +606,9 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		   ORDER BY (organization_id > p_after) DESC, organization_id
 		   LIMIT LEAST(GREATEST(p_limit, 1), 100)
 		 $function$`,
+			models.StagingMessengerReviewIdempotencyKeyPrefix,
+			models.StagingMessengerReviewManualReplyMode,
+		),
 		`CREATE OR REPLACE FUNCTION public.rereply_ready_channel_ai_reply_orgs(
 		   p_after uuid,
 		   p_limit integer,

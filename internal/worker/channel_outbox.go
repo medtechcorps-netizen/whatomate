@@ -135,6 +135,8 @@ func (w *Worker) listReadyChannelOutboxOrganizations(
 			FROM outbox_jobs
 			WHERE deleted_at IS NULL
 			  AND available_at <= ?
+			  AND idempotency_key NOT LIKE ?
+			  AND COALESCE(provider_state->>'review_mode', '') <> ?
 			  AND (
 			    status IN (?, ?)
 			    OR (
@@ -149,6 +151,8 @@ func (w *Worker) listReadyChannelOutboxOrganizations(
 		LIMIT ?
 	`,
 		now,
+		models.StagingMessengerReviewIdempotencyKeyPrefix+"%",
+		models.StagingMessengerReviewManualReplyMode,
 		models.OutboxJobStatusPending,
 		models.OutboxJobStatusRetrying,
 		models.OutboxJobStatusProcessing,
@@ -179,6 +183,8 @@ func (w *Worker) claimChannelOutboxJob(orgID uuid.UUID, workerID string) (uuid.U
 			WHERE organization_id = ?
 			  AND deleted_at IS NULL
 			  AND available_at <= ?
+			  AND idempotency_key NOT LIKE ?
+			  AND COALESCE(provider_state->>'review_mode', '') <> ?
 			  AND (
 			    status IN (?, ?)
 			    OR (status IN (?, ?) AND (locked_at IS NULL OR locked_at < ?))
@@ -189,6 +195,8 @@ func (w *Worker) claimChannelOutboxJob(orgID uuid.UUID, workerID string) (uuid.U
 		`,
 			orgID,
 			now,
+			models.StagingMessengerReviewIdempotencyKeyPrefix+"%",
+			models.StagingMessengerReviewManualReplyMode,
 			models.OutboxJobStatusPending,
 			models.OutboxJobStatusRetrying,
 			models.OutboxJobStatusProcessing,

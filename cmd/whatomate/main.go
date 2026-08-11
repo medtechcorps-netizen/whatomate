@@ -1074,6 +1074,25 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		"/api/conversations/{id}/messages",
 		tenant((*handlers.App).GetInboxConversationMessages),
 	)
+	// Messenger App Review has one separately authorized, staging-only manual
+	// RESPONSE path. Do not register it at all outside the exact review runtime.
+	// Its handler owns the account/OAuth/conversation locks and never falls back
+	// to the ordinary relay outbox or production behavior.
+	if cfg != nil && cfg.App.Environment == "staging" &&
+		cfg.MetaMessengerReviewRelay.Enabled &&
+		cfg.MetaMessengerReviewRelay.ReviewerOutboundEnabled &&
+		cfg.MetaMessengerReviewRelay.Mode == metareview.Mode &&
+		cfg.MetaMessengerReviewRelay.ReviewerUserID != "" &&
+		cfg.MetaMessengerReviewRelay.ReviewerRoleID != "" {
+		g.GET(
+			"/api/conversations/{id}/meta-review-reply",
+			app.GetMetaMessengerReviewReply,
+		)
+		g.POST(
+			"/api/conversations/{id}/meta-review-reply",
+			app.SendMetaMessengerReviewReply,
+		)
+	}
 	g.POST(
 		"/api/conversations/{id}/messages",
 		tenant((*handlers.App).SendInboxConversationMessage),

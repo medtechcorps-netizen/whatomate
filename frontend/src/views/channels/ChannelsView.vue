@@ -19,6 +19,7 @@ import {
   Inbox,
   Instagram,
   Loader2,
+  LockKeyhole,
   Mail,
   MessageCircle,
   PauseCircle,
@@ -34,6 +35,7 @@ import {
 import PageHeader from "@/components/shared/PageHeader.vue";
 import MetaAccountReadinessPanel from "@/components/channels/MetaAccountReadinessPanel.vue";
 import MetaPagePostPreview from "@/components/channels/MetaPagePostPreview.vue";
+import MetaReviewReplyComposer from "@/components/channels/MetaReviewReplyComposer.vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -69,6 +71,11 @@ import {
   metaAccountTestStopsDelivery,
   metaAccountReadiness,
 } from "@/lib/channelAccountReadiness";
+import {
+  attestedMetaReviewReplyEligibility,
+  isExplicitlyIneligibleMetaReviewReply,
+  type AttestedMetaReviewReplyEligibility,
+} from "@/lib/metaReviewReply";
 import { wsService } from "@/services/websocket";
 import {
   messengerOnboardingSelectionIsSafe,
@@ -91,6 +98,8 @@ import {
   type ChannelAccount,
   type ChannelType,
   type InboxConversation,
+  type MetaMessengerReviewReplyEligibility,
+  type MetaMessengerReviewReplyResponse,
 } from "@/services/productSuite";
 
 interface InboxMessage {
@@ -128,6 +137,14 @@ type MessengerOnboardingPhase =
   | "reviewing"
   | "connecting";
 
+type MetaReviewReplyState =
+  | "idle"
+  | "checking"
+  | "eligible"
+  | "locked"
+  | "not_applicable"
+  | "unavailable";
+
 const toast = useAppToast();
 const authStore = useAuthStore();
 const loading = ref(true);
@@ -136,6 +153,9 @@ const loadingMore = ref(false);
 const loadingOlderMessages = ref(false);
 const sending = ref(false);
 const aiStateUpdating = ref(false);
+const metaReviewReplyState = ref<MetaReviewReplyState>("idle");
+const metaReviewReplyEligibility =
+  ref<AttestedMetaReviewReplyEligibility | null>(null);
 const showConnect = ref(false);
 const accounts = ref<ChannelAccount[]>([]);
 const conversations = ref<InboxConversation[]>([]);
@@ -589,18 +609,37 @@ function scheduleChannelRefresh() {
 
 async function selectConversation(conversation: InboxConversation) {
   const viewSequence = ++conversationViewSequence;
+  const account = accounts.value.find(
+    (item) => item.id === conversation.channel_account_id,
+  );
+  const reviewOnlyMessenger = Boolean(
+    account && messengerReviewRelayReady(account),
+  );
   selectedConversation.value = conversation;
   messages.value = [];
   messageTotal.value = 0;
   loadingOlderMessages.value = false;
   sending.value = false;
   aiStateUpdating.value = false;
+  metaReviewReplyState.value = reviewOnlyMessenger
+    ? "checking"
+    : "not_applicable";
+  metaReviewReplyEligibility.value = null;
   if (isWorkspaceRail.value) isWorkspaceOpen.value = true;
   loadingMessages.value = true;
   try {
-    const response = await channelsService.messages(conversation.id, {
-      limit: 100,
-    });
+    const [response, reviewEligibilityResult] = await Promise.all([
+      channelsService.messages(conversation.id, { limit: 100 }),
+      reviewOnlyMessenger
+        ? channelsService
+            .metaReviewReplyEligibility(conversation.id)
+            .then((eligibilityResponse) => ({
+              response: eligibilityResponse,
+              failed: false as const,
+            }))
+            .catch(() => ({ response: null, failed: true as const }))
+        : Promise.resolve({ response: null, failed: false as const }),
+    ]);
     if (!isCurrentConversationView(viewSequence, conversation.id)) return;
     messages.value = unwrapListResponse<InboxMessageEnvelope>(
       response,
@@ -609,12 +648,48 @@ async function selectConversation(conversation: InboxConversation) {
       .map(normalizeMessage)
       .reverse();
     messageTotal.value = totalFromResponse(response);
-    if (conversation.unread_count > 0 && canManageConversations.value) {
+
+    if (
+      reviewOnlyMessenger &&
+      !reviewEligibilityResult.failed &&
+      reviewEligibilityResult.response
+    ) {
+      const rawEligibility =
+        unwrapItemResponse<MetaMessengerReviewReplyEligibility>(
+          reviewEligibilityResult.response,
+        );
+      const attestedEligibility = attestedMetaReviewReplyEligibility(
+        rawEligibility,
+        account?.external_account_id,
+      );
+      if (attestedEligibility) {
+        metaReviewReplyEligibility.value = attestedEligibility;
+        metaReviewReplyState.value = "eligible";
+      } else if (isExplicitlyIneligibleMetaReviewReply(rawEligibility)) {
+        metaReviewReplyState.value = "locked";
+      } else {
+        metaReviewReplyState.value = "unavailable";
+      }
+    } else if (reviewOnlyMessenger) {
+      metaReviewReplyState.value = "unavailable";
+    } else {
+      metaReviewReplyState.value = "not_applicable";
+    }
+
+    if (
+      !reviewOnlyMessenger &&
+      conversation.unread_count > 0 &&
+      canManageConversations.value
+    ) {
       await channelsService.markRead(conversation.id);
       conversation.unread_count = 0;
     }
   } catch (error) {
     if (isCurrentConversationView(viewSequence, conversation.id)) {
+      metaReviewReplyState.value = reviewOnlyMessenger
+        ? "unavailable"
+        : "not_applicable";
+      metaReviewReplyEligibility.value = null;
       toast.error("Messages could not be loaded", getErrorMessage(error));
     }
   } finally {
@@ -635,6 +710,8 @@ function closeMobileConversation() {
   loadingOlderMessages.value = false;
   sending.value = false;
   aiStateUpdating.value = false;
+  metaReviewReplyState.value = "idle";
+  metaReviewReplyEligibility.value = null;
 }
 
 async function loadOlderMessages() {
@@ -716,6 +793,26 @@ async function sendMessage() {
       sending.value = false;
     }
   }
+}
+
+function handleMetaReviewReplySent(response: MetaMessengerReviewReplyResponse) {
+  const eligibility = metaReviewReplyEligibility.value;
+  const conversation = selectedConversation.value;
+  if (
+    !eligibility ||
+    !conversation ||
+    response.audit.page_id !== eligibility.page_id ||
+    response.audit.recipient_label !== eligibility.recipient_label
+  ) {
+    return;
+  }
+
+  if (!messages.value.some((message) => message.id === response.message.id)) {
+    messages.value.push(normalizeMessage(response));
+    messageTotal.value += 1;
+  }
+  conversation.last_message_preview = response.message.content;
+  conversation.last_message_at = response.message.created_at;
 }
 
 function updateLocalConversationAIState(
@@ -2722,7 +2819,62 @@ onBeforeUnmount(() => {
                 >
               </RouterLink>
             </div>
-            <div v-else class="space-y-2">
+            <MetaReviewReplyComposer
+              v-else-if="
+                metaReviewReplyState === 'eligible' &&
+                metaReviewReplyEligibility
+              "
+              :conversation-id="selectedConversation.id"
+              :eligibility="metaReviewReplyEligibility"
+              @sent="handleMetaReviewReplySent"
+            />
+            <div
+              v-else-if="
+                metaReviewReplyState === 'checking' ||
+                metaReviewReplyState === 'unavailable' ||
+                metaReviewReplyState === 'locked'
+              "
+              data-testid="meta-review-reply-verification-state"
+              class="flex items-start gap-3 rounded-xl border border-white/[0.08] bg-white/[0.025] px-4 py-3 light:border-slate-300 light:bg-white"
+              role="status"
+            >
+              <Loader2
+                v-if="metaReviewReplyState === 'checking'"
+                class="mt-0.5 h-4 w-4 shrink-0 animate-spin text-sky-300"
+              />
+              <LockKeyhole
+                v-else
+                class="mt-0.5 h-4 w-4 shrink-0 text-amber-200 light:text-amber-800"
+              />
+              <div>
+                <p
+                  class="text-xs font-semibold text-white/70 light:text-slate-900"
+                >
+                  {{
+                    metaReviewReplyState === "checking"
+                      ? "Verifying reply controls"
+                      : metaReviewReplyState === "locked"
+                        ? "Review reply locked"
+                        : "Reply controls unavailable"
+                  }}
+                </p>
+                <p
+                  class="mt-1 text-[10px] leading-4 text-white/35 light:text-slate-600"
+                >
+                  {{
+                    metaReviewReplyState === "checking"
+                      ? "ReReply is asking the server whether this exact conversation has a short-lived App Review attestation."
+                      : metaReviewReplyState === "locked"
+                        ? "The server confirmed this staging conversation is not currently eligible. No generic reply, AI action, or mark-read action is available."
+                        : "The server did not return a valid eligibility decision. No generic or review reply is available; refresh before taking any action."
+                  }}
+                </p>
+              </div>
+            </div>
+            <div
+              v-else-if="metaReviewReplyState === 'not_applicable'"
+              class="space-y-2"
+            >
               <div
                 v-if="
                   ['threads', 'tiktok'].includes(selectedConversation.channel)
@@ -2903,8 +3055,8 @@ onBeforeUnmount(() => {
               v-if="messengerReviewRelayReady(settingsAccount)"
               class="mt-1 text-xs text-white/40 light:text-gray-500"
             >
-              Review the exact inbound-only staging connection and its
-              read-only Meta permission evidence. Outbound and AI remain off.
+              Review the exact inbound-only staging connection and its read-only
+              Meta permission evidence. Outbound and AI remain off.
             </p>
             <p v-else class="mt-1 text-xs text-white/40 light:text-gray-500">
               Repair the relay, rotate its outbound signing credential, or stop

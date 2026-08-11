@@ -183,6 +183,14 @@ func (a *App) DeprovisionMetaMessengerReviewAccount(r *fastglue.Request) error {
 		return nil
 	}
 	if err != nil {
+		if errors.Is(err, errMetaMessengerReviewReplyDrainPending) {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusServiceUnavailable,
+				"An earlier Messenger review reply remains permanently fenced; audited operator reconciliation is required before deprovisioning",
+				nil,
+				"",
+			)
+		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Review connection not found", nil, "")
 		}
@@ -270,6 +278,18 @@ func (a *App) beginMetaMessengerReviewDeprovision(
 		}
 		if !scoped.configuredMetaMessengerReviewAccount(&account) {
 			return gorm.ErrRecordNotFound
+		}
+		activeReviewSend, err := hasProtectedMetaMessengerReviewDispatchTx(
+			tx,
+			organizationID,
+			accountID,
+			time.Now().UTC(),
+		)
+		if err != nil {
+			return err
+		}
+		if activeReviewSend {
+			return errMetaMessengerReviewReplyDrainPending
 		}
 		if account.DeletedAt.Valid &&
 			stringConfigValue(account.Metadata, metaMessengerSubscriptionDesiredStateKey) == metaMessengerSubscriptionDesiredUnsubscribed &&

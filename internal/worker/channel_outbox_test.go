@@ -147,6 +147,68 @@ func TestListReadyChannelOutboxOrganizationsWithoutRLS(t *testing.T) {
 	assert.Contains(t, organizationIDs, org.ID)
 }
 
+func TestChannelOutboxWorkerNeverDiscoversOrClaimsProtectedReviewJobs(t *testing.T) {
+	testCases := []struct {
+		name           string
+		status         models.OutboxJobStatus
+		idempotencyKey string
+		providerState  models.JSONB
+	}{
+		{
+			name:           "dedicated status",
+			status:         models.OutboxJobStatusReviewDispatching,
+			idempotencyKey: "ordinary-key",
+			providerState:  models.JSONB{},
+		},
+		{
+			name:           "server key prefix despite corrupt generic status",
+			status:         models.OutboxJobStatusPending,
+			idempotencyKey: models.StagingMessengerReviewIdempotencyKeyPrefix + uuid.NewString(),
+			providerState:  models.JSONB{},
+		},
+		{
+			name:           "provider marker despite corrupt generic status",
+			status:         models.OutboxJobStatusDispatching,
+			idempotencyKey: "ordinary-key",
+			providerState: models.JSONB{
+				"review_mode": models.StagingMessengerReviewManualReplyMode,
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			org := testutil.CreateTestOrganization(t, db)
+			_, _, _, job := createChannelOutboxTestFixture(t, db, org.ID, "review-worker-must-skip")
+			stale := time.Now().UTC().Add(-defaultChannelOutboxLease - time.Minute)
+			require.NoError(t, db.Model(&models.OutboxJob{}).
+				Where("id = ? AND organization_id = ?", job.ID, org.ID).
+				Updates(map[string]any{
+					"status":          testCase.status,
+					"idempotency_key": testCase.idempotencyKey,
+					"provider_state":  testCase.providerState,
+					"available_at":    stale,
+					"locked_at":       stale,
+				}).Error)
+
+			worker := &Worker{DB: db, Log: testutil.NopLogger()}
+			organizationIDs, err := worker.listReadyChannelOutboxOrganizations(
+				defaultChannelOutboxBatchSize,
+				time.Now().UTC(),
+				time.Now().UTC().Add(-defaultChannelOutboxLease),
+			)
+			require.NoError(t, err)
+			assert.NotContains(t, organizationIDs, org.ID)
+			claimedID, claimed, err := worker.claimChannelOutboxJob(org.ID, "must-not-claim-review")
+			require.NoError(t, err)
+			assert.False(t, claimed)
+			assert.Equal(t, uuid.Nil, claimedID)
+			require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+			assert.Equal(t, testCase.status, job.Status)
+		})
+	}
+}
+
 func TestChannelOutboxRetryThenDeadLettersAtMaxAttempts(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	org := testutil.CreateTestOrganization(t, db)

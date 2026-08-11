@@ -26,6 +26,17 @@ func TestValidateMetaMessengerReviewRelayConfigAcceptsExactStagingAuthority(t *t
 	require.NoError(t, validateMetaMessengerReviewRelayConfig(review, onboarding, relay, app))
 }
 
+func TestValidateMetaMessengerReviewRelayConfigAllowsOutboundPinsToRemainAbsentWhileDisabled(t *testing.T) {
+	review, onboarding, relay, app := validMetaMessengerReviewRelayConfig()
+	review.ReviewerOutboundEnabled = false
+	review.ReviewerUserID = ""
+	review.ReviewerRoleID = ""
+	require.NoError(t, validateMetaMessengerReviewRelayConfig(review, onboarding, relay, app))
+
+	review.ReviewerUserID = uuid.NewString()
+	require.Error(t, validateMetaMessengerReviewRelayConfig(review, onboarding, relay, app))
+}
+
 func TestValidateMetaMessengerReviewRelayConfigFailsClosed(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -54,6 +65,22 @@ func TestValidateMetaMessengerReviewRelayConfigFailsClosed(t *testing.T) {
 		}},
 		{name: "missing generation", mutate: func(review *MetaMessengerReviewRelayConfig, _ *MetaMessengerOnboardingConfig, _ *MetaRelayConfig, _ *AppConfig) {
 			review.Generation = ""
+		}},
+		{name: "missing reviewer user", mutate: func(review *MetaMessengerReviewRelayConfig, _ *MetaMessengerOnboardingConfig, _ *MetaRelayConfig, _ *AppConfig) {
+			review.ReviewerUserID = ""
+		}},
+		{name: "outbound enabled without reviewer pins", mutate: func(review *MetaMessengerReviewRelayConfig, _ *MetaMessengerOnboardingConfig, _ *MetaRelayConfig, _ *AppConfig) {
+			review.ReviewerUserID = ""
+			review.ReviewerRoleID = ""
+		}},
+		{name: "invalid reviewer user", mutate: func(review *MetaMessengerReviewRelayConfig, _ *MetaMessengerOnboardingConfig, _ *MetaRelayConfig, _ *AppConfig) {
+			review.ReviewerUserID = "not-a-uuid"
+		}},
+		{name: "missing reviewer role", mutate: func(review *MetaMessengerReviewRelayConfig, _ *MetaMessengerOnboardingConfig, _ *MetaRelayConfig, _ *AppConfig) {
+			review.ReviewerRoleID = ""
+		}},
+		{name: "reviewer IDs reused", mutate: func(review *MetaMessengerReviewRelayConfig, _ *MetaMessengerOnboardingConfig, _ *MetaRelayConfig, _ *AppConfig) {
+			review.ReviewerRoleID = review.ReviewerUserID
 		}},
 		{name: "leading zero Page", mutate: func(review *MetaMessengerReviewRelayConfig, _ *MetaMessengerOnboardingConfig, _ *MetaRelayConfig, _ *AppConfig) {
 			review.PageID = "012345"
@@ -113,28 +140,31 @@ func TestValidateMetaMessengerReviewRelayConfigFailsClosed(t *testing.T) {
 func TestLoadMapsMetaMessengerReviewRelayEnvironment(t *testing.T) {
 	review, _, _, _ := validMetaMessengerReviewRelayConfig()
 	environment := map[string]string{
-		"WHATOMATE_APP__ENVIRONMENT":                                   "staging",
-		"WHATOMATE_APP__ENCRYPTION_KEY":                                reviewConfigEncryptionSecret,
-		"WHATOMATE_META_RELAY__BASE_URL":                               "",
-		"WHATOMATE_META_RELAY__EXPECTED_ACCOUNTS_JSON":                 "",
-		"WHATOMATE_META_RELAY__PROVIDER_PROOF_SECRET":                  "",
-		"WHATOMATE_META_MESSENGER_ONBOARDING__ENABLED":                 "true",
-		"WHATOMATE_META_MESSENGER_ONBOARDING__APP_ID":                  "1035383549213572",
-		"WHATOMATE_META_MESSENGER_ONBOARDING__APP_SECRET":              reviewConfigAppSecret,
-		"WHATOMATE_META_MESSENGER_ONBOARDING__TRUSTED_RELAY_BASE_URL":  review.RelayBaseURL,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__ENABLED":               "true",
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__MODE":                  metareview.Mode,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__ORGANIZATION_ID":       review.OrganizationID,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__META_BUSINESS_ID":      review.MetaBusinessID,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__PAGE_ID":               review.PageID,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__CHANNEL_ACCOUNT_ID":    review.ChannelAccountID,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__GENERATION":            review.Generation,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__EXPIRES_AT":            review.ExpiresAt,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__RELAY_BASE_URL":        review.RelayBaseURL,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__REREPLY_BASE_URL":      review.ReReplyBaseURL,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__BROKER_AUTH_SECRET":    reviewConfigAuthSecret,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__BROKER_WRAP_SECRET":    reviewConfigWrapSecret,
-		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__PROVIDER_PROOF_SECRET": reviewConfigProofSecret,
+		"WHATOMATE_APP__ENVIRONMENT":                                       "staging",
+		"WHATOMATE_APP__ENCRYPTION_KEY":                                    reviewConfigEncryptionSecret,
+		"WHATOMATE_META_RELAY__BASE_URL":                                   "",
+		"WHATOMATE_META_RELAY__EXPECTED_ACCOUNTS_JSON":                     "",
+		"WHATOMATE_META_RELAY__PROVIDER_PROOF_SECRET":                      "",
+		"WHATOMATE_META_MESSENGER_ONBOARDING__ENABLED":                     "true",
+		"WHATOMATE_META_MESSENGER_ONBOARDING__APP_ID":                      "1035383549213572",
+		"WHATOMATE_META_MESSENGER_ONBOARDING__APP_SECRET":                  reviewConfigAppSecret,
+		"WHATOMATE_META_MESSENGER_ONBOARDING__TRUSTED_RELAY_BASE_URL":      review.RelayBaseURL,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__ENABLED":                   "true",
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__MODE":                      metareview.Mode,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__ORGANIZATION_ID":           review.OrganizationID,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__META_BUSINESS_ID":          review.MetaBusinessID,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__PAGE_ID":                   review.PageID,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__CHANNEL_ACCOUNT_ID":        review.ChannelAccountID,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__REVIEWER_OUTBOUND_ENABLED": "true",
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__REVIEWER_USER_ID":          review.ReviewerUserID,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__REVIEWER_ROLE_ID":          review.ReviewerRoleID,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__GENERATION":                review.Generation,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__EXPIRES_AT":                review.ExpiresAt,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__RELAY_BASE_URL":            review.RelayBaseURL,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__REREPLY_BASE_URL":          review.ReReplyBaseURL,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__BROKER_AUTH_SECRET":        reviewConfigAuthSecret,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__BROKER_WRAP_SECRET":        reviewConfigWrapSecret,
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__PROVIDER_PROOF_SECRET":     reviewConfigProofSecret,
 	}
 	for key, value := range environment {
 		t.Setenv(key, value)
@@ -163,19 +193,22 @@ func validMetaMessengerReviewRelayConfig() (
 ) {
 	relayBase := "https://review-relay.example.test/meta"
 	review := MetaMessengerReviewRelayConfig{
-		Enabled:             true,
-		Mode:                metareview.Mode,
-		OrganizationID:      "c73f761f-5154-4fe1-9a13-06bae570277a",
-		MetaBusinessID:      "3852210034910979",
-		PageID:              "1038752885977372",
-		ChannelAccountID:    "88dadf4a-7ea5-4b42-9a8c-174b3db4a73c",
-		Generation:          "9bd97a61-4388-4430-8076-1f60c76e44d7",
-		ExpiresAt:           time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano),
-		RelayBaseURL:        relayBase,
-		ReReplyBaseURL:      "https://staging-rereply.example.test",
-		BrokerAuthSecret:    reviewConfigAuthSecret,
-		BrokerWrapSecret:    reviewConfigWrapSecret,
-		ProviderProofSecret: reviewConfigProofSecret,
+		Enabled:                 true,
+		Mode:                    metareview.Mode,
+		OrganizationID:          "c73f761f-5154-4fe1-9a13-06bae570277a",
+		MetaBusinessID:          "3852210034910979",
+		PageID:                  "1038752885977372",
+		ChannelAccountID:        "88dadf4a-7ea5-4b42-9a8c-174b3db4a73c",
+		ReviewerOutboundEnabled: true,
+		ReviewerUserID:          "b47cf99e-ec09-4538-9b43-0e4de35df224",
+		ReviewerRoleID:          "6060ab53-cda0-4da6-bf81-0bd258e88c4e",
+		Generation:              "9bd97a61-4388-4430-8076-1f60c76e44d7",
+		ExpiresAt:               time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano),
+		RelayBaseURL:            relayBase,
+		ReReplyBaseURL:          "https://staging-rereply.example.test",
+		BrokerAuthSecret:        reviewConfigAuthSecret,
+		BrokerWrapSecret:        reviewConfigWrapSecret,
+		ProviderProofSecret:     reviewConfigProofSecret,
 	}
 	onboarding := MetaMessengerOnboardingConfig{
 		Enabled:             true,

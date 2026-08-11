@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/google/uuid"
 	"github.com/knadh/koanf/parsers/toml"
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
@@ -72,19 +73,22 @@ type MetaMessengerOnboardingConfig struct {
 // for one inbound-only App Review binding. It is never tenant selectable and
 // none of its three secrets may be exposed through HTTP responses or logs.
 type MetaMessengerReviewRelayConfig struct {
-	Enabled             bool   `koanf:"enabled"`
-	Mode                string `koanf:"mode"`
-	OrganizationID      string `koanf:"organization_id"`
-	MetaBusinessID      string `koanf:"meta_business_id"`
-	PageID              string `koanf:"page_id"`
-	ChannelAccountID    string `koanf:"channel_account_id"`
-	Generation          string `koanf:"generation"`
-	ExpiresAt           string `koanf:"expires_at"`
-	RelayBaseURL        string `koanf:"relay_base_url"`
-	ReReplyBaseURL      string `koanf:"rereply_base_url"`
-	BrokerAuthSecret    string `koanf:"broker_auth_secret"`
-	BrokerWrapSecret    string `koanf:"broker_wrap_secret"`
-	ProviderProofSecret string `koanf:"provider_proof_secret"`
+	Enabled                 bool   `koanf:"enabled"`
+	Mode                    string `koanf:"mode"`
+	OrganizationID          string `koanf:"organization_id"`
+	MetaBusinessID          string `koanf:"meta_business_id"`
+	PageID                  string `koanf:"page_id"`
+	ChannelAccountID        string `koanf:"channel_account_id"`
+	ReviewerOutboundEnabled bool   `koanf:"reviewer_outbound_enabled"`
+	ReviewerUserID          string `koanf:"reviewer_user_id"`
+	ReviewerRoleID          string `koanf:"reviewer_role_id"`
+	Generation              string `koanf:"generation"`
+	ExpiresAt               string `koanf:"expires_at"`
+	RelayBaseURL            string `koanf:"relay_base_url"`
+	ReReplyBaseURL          string `koanf:"rereply_base_url"`
+	BrokerAuthSecret        string `koanf:"broker_auth_secret"`
+	BrokerWrapSecret        string `koanf:"broker_wrap_secret"`
+	ProviderProofSecret     string `koanf:"provider_proof_secret"`
 }
 
 // MetaRelayConfig is deployment-controlled trust material for Meta relay
@@ -449,6 +453,7 @@ func validateMetaMessengerReviewRelayConfig(
 ) error {
 	configured := review.Enabled || review.Mode != "" || review.OrganizationID != "" ||
 		review.MetaBusinessID != "" || review.PageID != "" || review.ChannelAccountID != "" ||
+		review.ReviewerOutboundEnabled || review.ReviewerUserID != "" || review.ReviewerRoleID != "" ||
 		review.Generation != "" || review.ExpiresAt != "" || review.RelayBaseURL != "" ||
 		review.ReReplyBaseURL != "" || review.BrokerAuthSecret != "" ||
 		review.BrokerWrapSecret != "" || review.ProviderProofSecret != ""
@@ -483,6 +488,32 @@ func validateMetaMessengerReviewRelayConfig(
 	}
 	if err := tuple.Validate(time.Now().UTC()); err != nil {
 		return errors.New("meta Messenger review relay authority must contain canonical, non-zero IDs and a future UTC RFC3339 expiry")
+	}
+	if (review.ReviewerUserID == "") != (review.ReviewerRoleID == "") {
+		return errors.New("reviewer user and role IDs must either both be absent or both be configured")
+	}
+	if review.ReviewerOutboundEnabled && review.ReviewerUserID == "" {
+		return errors.New("reviewer user and role IDs are required when reviewer outbound is enabled")
+	}
+	if review.ReviewerUserID != "" {
+		for name, value := range map[string]string{
+			"WHATOMATE_META_MESSENGER_REVIEW_RELAY__REVIEWER_USER_ID": review.ReviewerUserID,
+			"WHATOMATE_META_MESSENGER_REVIEW_RELAY__REVIEWER_ROLE_ID": review.ReviewerRoleID,
+		} {
+			parsed, err := uuid.Parse(value)
+			if err != nil || parsed == uuid.Nil || parsed.String() != value {
+				return fmt.Errorf("%s must be a canonical, non-zero UUID", name)
+			}
+		}
+	}
+	if review.ReviewerUserID != "" && (review.ReviewerUserID == review.ReviewerRoleID ||
+		review.ReviewerUserID == review.OrganizationID ||
+		review.ReviewerRoleID == review.OrganizationID ||
+		review.ReviewerUserID == review.ChannelAccountID ||
+		review.ReviewerRoleID == review.ChannelAccountID ||
+		review.ReviewerUserID == review.Generation ||
+		review.ReviewerRoleID == review.Generation) {
+		return errors.New("reviewer user and role IDs must be distinct from each other and the review authority IDs")
 	}
 	canonicalRelayBase, err := CanonicalMetaRelayBaseURL(review.RelayBaseURL, app.Environment)
 	if err != nil || canonicalRelayBase != review.RelayBaseURL ||
