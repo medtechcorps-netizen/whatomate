@@ -106,7 +106,7 @@ func SecurityHeaders() fastglue.FastMiddleware {
 		h.Set("Permissions-Policy", "camera=(), microphone=(self), geolocation=()")
 		h.Set("X-XSS-Protection", "0") // Disabled per OWASP recommendation (use CSP instead)
 		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		h.Set("Content-Security-Policy", "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; media-src 'self' blob: https:; worker-src 'self' blob:; upgrade-insecure-requests")
+		h.Set("Content-Security-Policy", "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' https://connect.facebook.net; frame-src 'self' https://www.facebook.com https://web.facebook.com https://staticxx.facebook.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; media-src 'self' blob: https:; worker-src 'self' blob:; upgrade-insecure-requests")
 		return r
 	}
 }

@@ -484,8 +484,11 @@ func TestSecurityHeaders(t *testing.T) {
 	assert.Equal(t, "DENY", string(headers.Peek("X-Frame-Options")))
 	assert.Equal(t, "strict-origin-when-cross-origin", string(headers.Peek("Referrer-Policy")))
 	assert.Equal(t, "max-age=31536000; includeSubDomains", string(headers.Peek("Strict-Transport-Security")))
-	assert.Contains(t, string(headers.Peek("Content-Security-Policy")), "default-src 'self'")
-	assert.Contains(t, string(headers.Peek("Content-Security-Policy")), "frame-ancestors 'none'")
+	csp := string(headers.Peek("Content-Security-Policy"))
+	assert.Contains(t, csp, "default-src 'self'")
+	assert.Contains(t, csp, "frame-ancestors 'none'")
+	assert.Contains(t, csp, "script-src 'self' https://connect.facebook.net")
+	assert.Contains(t, csp, "frame-src 'self' https://www.facebook.com https://web.facebook.com https://staticxx.facebook.com")
 }
 
 func TestJWTClaims(t *testing.T) {
