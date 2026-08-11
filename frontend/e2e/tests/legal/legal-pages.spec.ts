@@ -1,5 +1,8 @@
 import { expect, test } from '@playwright/test'
 
+const legalEntity = 'Medtech Healthcare Sdn Bhd'
+const legacyLegalEntity = /Medtech Healthcare(?! Sdn Bhd)|Medtech Softwarehouse/
+
 const legalPages = [
   {
     path: '/privacy',
@@ -29,6 +32,9 @@ for (const legalPage of legalPages) {
       'href',
       /mailto:medtechcorps@gmail\.com/
     )
+
+    await expect(page.locator('main')).toContainText(legalEntity)
+    await expect(page.locator('main')).not.toContainText(legacyLegalEntity)
   })
 }
 
@@ -44,4 +50,19 @@ test('Privacy Policy discloses the Google Search Console data lifecycle', async 
   await expect(googleSection).toContainText('disconnect Google Search Console')
   await expect(googleSection).toContainText('Google API Services User Data Policy')
   await expect(googleSection).toContainText('Limited Use requirements')
+})
+
+test('Privacy Policy identifies DigitalOcean without overstating processor or region scope', async ({ page }) => {
+  await page.goto('/privacy')
+
+  const sharingSection = page.locator('#sharing')
+  await expect(sharingSection).toContainText(
+    'Medtech Healthcare Sdn Bhd uses DigitalOcean as a cloud infrastructure service provider and data processor'
+  )
+  await expect(sharingSection).toContainText('hosting, storage, security, backups and service operation')
+  await expect(sharingSection).toContainText(
+    "current ReReply staging deployment uses DigitalOcean's Singapore (SGP) region"
+  )
+  await expect(sharingSection).toContainText('DigitalOcean is not necessarily the only service provider')
+  await expect(page.locator('#ai')).toContainText('Qwen through Alibaba Cloud DashScope where configured')
 })

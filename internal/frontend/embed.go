@@ -34,26 +34,35 @@ var mimeTypes = map[string]string{
 //go:embed all:dist
 var distFS embed.FS
 
-// cachedIndexHTML stores the modified index.html with injected base path
-var cachedIndexHTML []byte
-
 // Handler returns a fasthttp handler that serves the embedded frontend files
 // basePath should be empty string for root deployment or "/subpath" for subdirectory
 // If frontend is not embedded, returns a handler that shows a helpful message
 func Handler(basePath string) fasthttp.RequestHandler {
-	// Normalize base path
-	basePath = strings.TrimSuffix(basePath, "/")
-
 	// Get the dist subdirectory
 	distSubFS, err := fs.Sub(distFS, "dist")
 	if err != nil {
 		return notEmbeddedHandler("Frontend not embedded: " + err.Error())
 	}
 
+	httpHandler, err := newHTTPHandler(distSubFS, basePath)
+	if err != nil {
+		return notEmbeddedHandler("Frontend not embedded: " + err.Error())
+	}
+
+	// Convert to fasthttp handler.
+	return fasthttpadaptor.NewFastHTTPHandler(httpHandler)
+}
+
+// newHTTPHandler builds the embedded SPA handler around an arbitrary filesystem.
+// Keeping this seam in net/http makes the exact production fallback behavior
+// testable without copying generated frontend assets into the source tree.
+func newHTTPHandler(distSubFS fs.FS, basePath string) (http.Handler, error) {
+	basePath = normalizedPublicBasePath(basePath)
+
 	// Read and modify index.html to inject base path
 	indexContent, err := fs.ReadFile(distSubFS, "index.html")
 	if err != nil {
-		return notEmbeddedHandler("Frontend not embedded: index.html not found. Run 'make build-prod' to embed frontend.")
+		return nil, fmt.Errorf("index.html not found. Run 'make build-prod' to embed frontend: %w", err)
 	}
 
 	// Inject base tag right after <head> so it's processed before any relative URLs
@@ -67,7 +76,11 @@ func Handler(basePath string) fasthttp.RequestHandler {
 
 	// Inject base path script before </head>
 	basePathScript := fmt.Sprintf(`<script>window.__BASE_PATH__ = "%s";</script></head>`, basePath)
-	cachedIndexHTML = []byte(strings.Replace(modifiedHTML, "</head>", basePathScript, 1))
+	preparedIndexHTML := []byte(strings.Replace(modifiedHTML, "</head>", basePathScript, 1))
+	legalIndexHTML, err := legalFallbackIndexVariants(preparedIndexHTML, basePath)
+	if err != nil {
+		return nil, err
+	}
 
 	// Create file server
 	fileServer := http.FileServer(http.FS(distSubFS))
@@ -147,7 +160,11 @@ func Handler(basePath string) fasthttp.RequestHandler {
 		// For root or non-existent files (SPA routes), serve modified index.html
 		if path == "/" || (!strings.HasPrefix(path, "/api") && !strings.Contains(path, ".")) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write(cachedIndexHTML)
+			indexHTML := preparedIndexHTML
+			if route := legalFallbackRoute(path, basePath); route != "" {
+				indexHTML = legalIndexHTML[route]
+			}
+			_, _ = w.Write(indexHTML)
 			return
 		}
 
@@ -155,8 +172,7 @@ func Handler(basePath string) fasthttp.RequestHandler {
 		fileServer.ServeHTTP(w, r)
 	})
 
-	// Convert to fasthttp handler
-	return fasthttpadaptor.NewFastHTTPHandler(spaHandler)
+	return spaHandler, nil
 }
 
 // IsEmbedded returns true if the frontend dist folder is embedded

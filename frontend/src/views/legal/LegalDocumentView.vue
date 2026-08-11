@@ -45,7 +45,7 @@ const privacySections: LegalSection[] = [
     id: 'scope',
     title: '1. Scope and our role',
     paragraphs: [
-      'This Privacy Policy explains how ReReply, provided by Medtech Softwarehouse (“ReReply”, “we”, “us” or “our”), handles personal data through the ReReply website, applications, APIs and related support services.',
+      'This Privacy Policy explains how ReReply, provided by Medtech Healthcare Sdn Bhd (“ReReply”, “we”, “us” or “our”), handles personal data through the ReReply website, applications, APIs and related support services.',
       'ReReply is a multi-tenant customer communication and CRM platform. The business or organisation that subscribes to ReReply (“Customer Organisation”) normally decides why and how its contact, patient, lead and conversation data is used. For that data, the Customer Organisation is the data controller and ReReply acts as its service provider or data processor. We may act as controller for account administration, billing, platform security, service analytics and our own business communications.'
     ]
   },
@@ -148,6 +148,7 @@ const privacySections: LegalSection[] = [
       'In connection with a legitimate corporate transaction, subject to appropriate confidentiality and data-protection safeguards.'
     ],
     paragraphs: [
+      'Medtech Healthcare Sdn Bhd uses DigitalOcean as a cloud infrastructure service provider and data processor for ReReply hosting, storage, security, backups and service operation. The current ReReply staging deployment uses DigitalOcean\'s Singapore (SGP) region. DigitalOcean is not necessarily the only service provider, and this does not mean that every production system or connected provider processes data only in Singapore.',
       'We do not sell personal data. We do not share one Customer Organisation’s CRM or conversation data with another Customer Organisation unless the relevant organisation expressly authorises a supported transfer or shared workflow.'
     ]
   },
@@ -194,7 +195,7 @@ const privacySections: LegalSection[] = [
     title: '15. Updates and contact',
     paragraphs: [
       'We may update this policy when the service, law or our processing practices change. We will post the revised version here and update the effective date.',
-      'For privacy questions, contact Medtech Softwarehouse at medtechcorps@gmail.com. For records controlled by a clinic, pharmacy, wellness provider or other Customer Organisation, you should also contact that organisation directly.'
+      'For privacy questions, contact Medtech Healthcare Sdn Bhd at medtechcorps@gmail.com. For records controlled by a clinic, pharmacy, wellness provider or other Customer Organisation, you should also contact that organisation directly.'
     ]
   }
 ]
@@ -204,7 +205,7 @@ const termsSections: LegalSection[] = [
     id: 'agreement',
     title: '1. Agreement and eligibility',
     paragraphs: [
-      'These Terms of Service (“Terms”) govern access to ReReply, a multi-tenant communication, CRM and automation platform provided by Medtech Softwarehouse. By creating an account, accepting an order or using ReReply, you agree to these Terms on behalf of yourself and, where applicable, your organisation.',
+      'These Terms of Service (“Terms”) govern access to ReReply, a multi-tenant communication, CRM and automation platform provided by Medtech Healthcare Sdn Bhd. By creating an account, accepting an order or using ReReply, you agree to these Terms on behalf of yourself and, where applicable, your organisation.',
       'You must be legally able to enter into this agreement and authorised to bind the organisation you represent. If a separate signed order, reseller agreement or data-processing agreement conflicts with these Terms, the signed agreement controls for that conflict.'
     ]
   },
@@ -349,7 +350,7 @@ const deletionSections: LegalSection[] = [
     title: 'Before you submit a request',
     paragraphs: [
       'ReReply stores information on behalf of separate clinics, pharmacies, wellness providers and other Customer Organisations. If your request concerns a conversation, appointment or CRM record, contact the organisation you interacted with first. It is normally the data controller and can identify the relevant record.',
-      'You may also send a request directly to ReReply. We will route a verified request to the appropriate Customer Organisation or act on its lawful instructions.'
+      'You may also send a request directly to Medtech Healthcare Sdn Bhd, the provider of ReReply. We will route a verified request to the appropriate Customer Organisation or act on its lawful instructions.'
     ],
     callout: 'Never send us your password, WhatsApp verification code, two-step verification PIN or full medical history.'
   },
