@@ -823,17 +823,25 @@ func TestEvaluateTimingSchedule(t *testing.T) {
 
 	// Empty schedule.
 	assert.Equal(t, "out_of_hours", evaluateTimingSchedule(now, nil, nil))
+
+	// The schedule follows the effective clock location, not the UTC date.
+	// At this instant Kuala Lumpur is already Tuesday while UTC is Monday.
+	kualaLumpur, err := time.LoadLocation("Asia/Kuala_Lumpur")
+	require.NoError(t, err)
+	localTuesday := time.Date(2026, 3, 3, 0, 30, 0, 0, kualaLumpur)
+	require.Equal(t, time.Monday, localTuesday.UTC().Weekday())
+	tuesdaySchedule := []any{
+		map[string]any{"day": "tuesday", "enabled": true, "start_time": "00:00", "end_time": "01:00"},
+	}
+	assert.Equal(t, "in_hours", evaluateTimingSchedule(localTuesday, tuesdaySchedule, nil))
 }
 
 // TestRunChatGraph_Timing_RoutesByCurrentTime exercises the full executor
-// against a schedule that's guaranteed to cover "now" for the in_hours
-// case, and a fully-disabled schedule for the out_of_hours case.
+// against an all-week schedule so a date boundary between clock reads cannot
+// change the selected route.
 func TestRunChatGraph_Timing_RoutesByCurrentTime(t *testing.T) {
 	app, org, account, contact, session := newGraphTestFixtures(t)
 
-	// Today's weekday, 00:00-23:59 — always in hours regardless of when
-	// the test runs.
-	today := strings.ToLower(time.Now().Weekday().String())
 	flow := &models.ChatbotFlow{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
 		OrganizationID:  org.ID,
@@ -846,7 +854,13 @@ func TestRunChatGraph_Timing_RoutesByCurrentTime(t *testing.T) {
 			"nodes": []any{
 				map[string]any{"id": "t1", "type": "timing", "label": "biz hours", "config": map[string]any{
 					"schedule": []any{
-						map[string]any{"day": today, "enabled": true, "start_time": "00:00", "end_time": "23:59"},
+						map[string]any{"day": "monday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
+						map[string]any{"day": "tuesday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
+						map[string]any{"day": "wednesday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
+						map[string]any{"day": "thursday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
+						map[string]any{"day": "friday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
+						map[string]any{"day": "saturday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
+						map[string]any{"day": "sunday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
 					},
 				}},
 				map[string]any{"id": "open", "type": "message", "config": map[string]any{"message": "We're open."}},
