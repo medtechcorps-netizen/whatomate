@@ -315,7 +315,7 @@ func TestMetaMessengerReviewReplySettlementReloadsStayInsideTenantTransaction(t 
 				return
 			}
 			unscopedSettlementReads.Add(1)
-			db.AddError(errors.New("test blocked settlement reload outside tenant transaction"))
+			_ = db.AddError(errors.New("test blocked settlement reload outside tenant transaction"))
 		},
 	))
 	t.Cleanup(func() {
