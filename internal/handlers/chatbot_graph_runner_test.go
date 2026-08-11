@@ -836,10 +836,10 @@ func TestEvaluateTimingSchedule(t *testing.T) {
 	assert.Equal(t, "in_hours", evaluateTimingSchedule(localTuesday, tuesdaySchedule, nil))
 }
 
-// TestRunChatGraph_Timing_RoutesByCurrentTime exercises the full executor
-// against an all-week schedule so a date boundary between clock reads cannot
-// change the selected route.
-func TestRunChatGraph_Timing_RoutesByCurrentTime(t *testing.T) {
+// TestRunChatGraph_Timing_RoutesOutOfHours exercises the full executor with a
+// clock-independent disabled schedule. Fixed-clock in-hours decisions are
+// covered by TestEvaluateTimingSchedule.
+func TestRunChatGraph_Timing_RoutesOutOfHours(t *testing.T) {
 	app, org, account, contact, session := newGraphTestFixtures(t)
 
 	flow := &models.ChatbotFlow{
@@ -854,13 +854,13 @@ func TestRunChatGraph_Timing_RoutesByCurrentTime(t *testing.T) {
 			"nodes": []any{
 				map[string]any{"id": "t1", "type": "timing", "label": "biz hours", "config": map[string]any{
 					"schedule": []any{
-						map[string]any{"day": "monday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
-						map[string]any{"day": "tuesday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
-						map[string]any{"day": "wednesday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
-						map[string]any{"day": "thursday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
-						map[string]any{"day": "friday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
-						map[string]any{"day": "saturday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
-						map[string]any{"day": "sunday", "enabled": true, "start_time": "00:00", "end_time": "23:59"},
+						map[string]any{"day": "monday", "enabled": false},
+						map[string]any{"day": "tuesday", "enabled": false},
+						map[string]any{"day": "wednesday", "enabled": false},
+						map[string]any{"day": "thursday", "enabled": false},
+						map[string]any{"day": "friday", "enabled": false},
+						map[string]any{"day": "saturday", "enabled": false},
+						map[string]any{"day": "sunday", "enabled": false},
 					},
 				}},
 				map[string]any{"id": "open", "type": "message", "config": map[string]any{"message": "We're open."}},
@@ -882,8 +882,8 @@ func TestRunChatGraph_Timing_RoutesByCurrentTime(t *testing.T) {
 
 	path := chatGraphPath(t, session)
 	require.GreaterOrEqual(t, len(path), 2)
-	assert.Equal(t, "in_hours", path[0]["outcome"])
-	assert.Equal(t, "open", path[1]["node"])
+	assert.Equal(t, "out_of_hours", path[0]["outcome"])
+	assert.Equal(t, "closed", path[1]["node"])
 }
 
 // newSetVariableFlow builds a two-node graph (set_variable → end) whose
