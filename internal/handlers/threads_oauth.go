@@ -575,6 +575,9 @@ func (a *App) persistThreadsConnection(
 	permissions channelapi.ThreadsPermissionSnapshot,
 ) error {
 	return a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
+			return err
+		}
 		txApp := a.scopedApp(tx, orgID)
 		if !txApp.HasPermission(userID, models.ResourceSettingsIntegrations, models.ActionWrite, orgID) {
 			return errThreadsOAuthForbidden

@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	configpkg "github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -33,6 +35,7 @@ func TestChannelAccountResponseRedactsCredentialsAndRestrictedConfig(t *testing.
 		},
 		Capabilities: models.JSONB{"text": true},
 		Credentials: []models.ChannelCredential{{
+			Kind:   models.ChannelCredentialKindWebhook,
 			Status: models.ChannelCredentialStatusActive,
 			CredentialBlob: models.JSONB{
 				"inbound_secret": "must-not-leak",
@@ -52,6 +55,75 @@ func TestChannelAccountResponseRedactsCredentialsAndRestrictedConfig(t *testing.
 	assert.NotContains(t, string(encoded), "must-not-leak")
 	assert.NotContains(t, string(encoded), "allow_localhost_dev")
 	assert.NotContains(t, string(encoded), "nested-must-not-leak")
+}
+
+func TestManagedMessengerResponseDerivesRegistryRecognitionFromProtectedInventory(t *testing.T) {
+	t.Parallel()
+
+	const (
+		accountID      = "00000000-0000-4000-8000-000000000091"
+		organizationID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa91"
+		businessID     = "300000000000091"
+		pageID         = "700000000000091"
+		appID          = "100000000000091"
+		appOwnerID     = "300000000000001"
+		relayBaseURL   = "https://app.rereply.app/meta-relay"
+	)
+	verifiedAt := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	account := &models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.MustParse(accountID)},
+		OrganizationID:    uuid.MustParse(organizationID),
+		Channel:           models.ChannelMessenger,
+		Provider:          channelapi.RelayProvider,
+		ExternalAccountID: pageID,
+		Config: models.JSONB{
+			"relay_url":           relayBaseURL + "/v1/accounts/messenger/" + pageID,
+			"registry_recognized": false,
+			"onboarding_state":    metaMessengerAwaitingRegistryState,
+		},
+		Metadata: models.JSONB{
+			"management_mode":            metaMessengerManagementMode,
+			"meta_business_id":           businessID,
+			"ownership_evidence_version": "owned_pages_v1",
+			"ownership_verified_at":      verifiedAt,
+			"meta_app_id":                appID,
+			"meta_app_owner_business_id": appOwnerID,
+			// Persisted registry flags are intentionally opposite to the protected
+			// match and must have no influence on the response.
+			"registry_recognized": false,
+		},
+	}
+	app := &App{Config: &configpkg.Config{
+		App: configpkg.AppConfig{Environment: "production"},
+		MetaRelay: configpkg.MetaRelayConfig{
+			BaseURL:             relayBaseURL,
+			ProviderProofSecret: "response-provider-proof-secret-at-least-32-bytes",
+			ExpectedAccountsJSON: fmt.Sprintf(`{
+  "messenger_app":{"app_id":%q,"owner_business_id":%q},
+  "accounts":[{
+    "organization_id":%q,
+    "meta_business_id":%q,
+    "channel":"messenger",
+    "external_account_id":%q,
+    "rereply_account_id":%q
+  }]
+}`, appID, appOwnerID, organizationID, businessID, pageID, accountID),
+		},
+	}}
+
+	recognized := channelAccountToResponse(account, app)
+	assert.Equal(t, true, recognized.Config["registry_recognized"])
+	assert.Equal(t, "relay_registry_recognized", recognized.Config["onboarding_state"])
+	assert.Equal(t, false, account.Config["registry_recognized"], "response derivation must not mutate persistence")
+
+	account.Config["registry_recognized"] = true
+	account.Config["onboarding_state"] = "relay_registry_recognized"
+	account.Metadata["registry_recognized"] = true
+	account.Metadata["meta_app_id"] = "100000000000099"
+	spoofed := channelAccountToResponse(account, app)
+	assert.Equal(t, false, spoofed.Config["registry_recognized"])
+	assert.Equal(t, metaMessengerAwaitingRegistryState, spoofed.Config["onboarding_state"])
+	assert.Equal(t, true, account.Config["registry_recognized"], "spoof rejection must not rewrite stored data")
 }
 
 func TestChannelIdentifiersAreAllowlisted(t *testing.T) {
@@ -302,6 +374,13 @@ func TestChannelWebhookResolverUsesChannelAccountIDAcrossOrganizations(t *testin
 	resolvedB, err := resolveChannelWebhookOrganization(db, accountB.ID, false)
 	require.NoError(t, err)
 	assert.Equal(t, orgA.ID, resolvedA)
+	assert.Equal(t, orgB.ID, resolvedB)
+
+	require.NoError(t, db.Delete(orgA).Error)
+	_, err = resolveChannelWebhookOrganization(db, accountA.ID, false)
+	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	resolvedB, err = resolveChannelWebhookOrganization(db, accountB.ID, false)
+	require.NoError(t, err)
 	assert.Equal(t, orgB.ID, resolvedB)
 }
 

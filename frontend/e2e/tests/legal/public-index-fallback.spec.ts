@@ -14,10 +14,10 @@ test("raw app response identifies ReReply and explains its purpose without JavaS
   const html = await response.text();
   expect(html).toMatch(/<h1[^>]*>\s*ReReply\s*<\/h1>/);
   expect(html).toContain("customer relationship management platform");
-  expect(html).toContain(
-    "customer conversations, CRM records, follow-up workflows",
+  expect(html).toMatch(
+    /customer conversations,\s+CRM records,\s+follow-up workflows/,
   );
-  expect(html).toContain("read-only Google Search Console reporting");
+  expect(html).toMatch(/read-only Google Search\s+Console reporting/);
   expect(html).toContain("verified website properties");
   expect(html).toMatch(/<a[^>]+href="\/about"[^>]*>About ReReply<\/a>/);
   expect(html).toMatch(/<a[^>]+href="\/privacy"[^>]*>Privacy Policy<\/a>/);
@@ -97,7 +97,9 @@ for (const legalPage of rawLegalPages) {
     expect(html).not.toContain(legalPage.absent);
 
     // APIRequestContext returns the server response without executing the
-    // module, so substantive content here proves it is present before Vue runs.
+    // module. Vite may place its deferred module tag in <head>, so tag order is
+    // not a useful signal; the substantive fallback itself must be in the raw
+    // response while the Vue entry point remains present for normal browsers.
     expect(html).toContain('<script type="module"');
   });
 }

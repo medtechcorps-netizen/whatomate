@@ -2,12 +2,15 @@ package metarelay
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 )
 
 type fakeQueueStore struct {
@@ -21,6 +24,41 @@ type fakeQueueStore struct {
 	completed    []string
 	retried      []string
 	dead         []string
+}
+
+func TestWorkerForwardsAccountAndDeploymentProofsOverExactBody(t *testing.T) {
+	config := newTestConfig(t)
+	account, _ := config.accountByKey("messenger-page")
+	body := []byte(`{"external_account_id":"100000000000010","events":[]}`)
+	rereply := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		received, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Errorf("read forwarded body: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if string(received) != string(body) {
+			t.Errorf("forwarded body changed: %s", received)
+		}
+		if request.Header.Get(ReReplySignatureHeader) != signBody(account.reReplyInboundSecret, body) {
+			t.Error("missing account-scoped inbound HMAC")
+		}
+		if request.Header.Get(channelapi.RelayMetaProviderProofHeader) !=
+			channelapi.SignMetaProviderInboundProof(config.ReReplyProviderProofSecret, body) {
+			t.Error("missing deployment-held provider proof")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer rereply.Close()
+	account.ReReplyWebhookURL = rereply.URL
+	worker, err := NewWorker(config, &fakeQueueStore{})
+	if err != nil {
+		t.Fatalf("new worker: %v", err)
+	}
+	outcome := worker.forwardToReReply(context.Background(), account, body)
+	if !outcome.success {
+		t.Fatalf("forward failed: %+v", outcome)
+	}
 }
 
 func (s *fakeQueueStore) ClaimInbound(
@@ -114,7 +152,7 @@ func TestWorkerClaimsOnlyImmediateConcurrencyAndStartsJobsTogether(t *testing.T)
 		store.jobs = append(store.jobs, InboundJob{
 			ID:         string(rune('a' + index)),
 			AccountKey: account.Key,
-			Body:       []byte(`{"external_account_id":"page-1","events":[]}`),
+			Body:       []byte(`{"external_account_id":"100000000000010","events":[]}`),
 		})
 	}
 	worker, err := NewWorker(config, store)
@@ -199,7 +237,7 @@ func TestWorkerRetriesTransientReReplyFailureAndDeadLettersPermanentFailure(t *t
 			store := &fakeQueueStore{jobs: []InboundJob{{
 				ID:         "job-1",
 				AccountKey: account.Key,
-				Body:       []byte(`{"external_account_id":"page-1","events":[]}`),
+				Body:       []byte(`{"external_account_id":"100000000000010","events":[]}`),
 			}}}
 			worker, err := NewWorker(config, store)
 			if err != nil {

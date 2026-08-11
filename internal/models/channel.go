@@ -123,16 +123,27 @@ const (
 type OutboxJobStatus string
 
 const (
+	// StagingMessengerReviewManualReplyMode and its idempotency prefix identify
+	// the dedicated reviewer-only one-shot Messenger operation. They are shared
+	// by the handler, deprovision fence, outbox worker, and RLS resolver so a
+	// rolling deployment cannot accidentally reclaim the protected job.
+	StagingMessengerReviewManualReplyMode      = "staging_messenger_review_manual_reply_v1"
+	StagingMessengerReviewIdempotencyKeyPrefix = "meta-review:"
+
 	OutboxJobStatusPending    OutboxJobStatus = "pending"
 	OutboxJobStatusProcessing OutboxJobStatus = "processing"
 	// Dispatching is a delivery fence: policy-cancellation transactions may
 	// cancel processing work, but a job that atomically reached dispatching
 	// has won the race and is allowed to make its single provider attempt.
 	OutboxJobStatusDispatching OutboxJobStatus = "dispatching"
-	OutboxJobStatusRetrying    OutboxJobStatus = "retrying"
-	OutboxJobStatusSent        OutboxJobStatus = "sent"
-	OutboxJobStatusFailed      OutboxJobStatus = "failed"
-	OutboxJobStatusCancelled   OutboxJobStatus = "cancelled"
+	// ReviewDispatching is deliberately outside the generic worker's claim
+	// status set. It is a permanent one-shot provider fence until the dedicated
+	// staging reviewer handler deterministically settles it.
+	OutboxJobStatusReviewDispatching OutboxJobStatus = "review_dispatching"
+	OutboxJobStatusRetrying          OutboxJobStatus = "retrying"
+	OutboxJobStatusSent              OutboxJobStatus = "sent"
+	OutboxJobStatusFailed            OutboxJobStatus = "failed"
+	OutboxJobStatusCancelled         OutboxJobStatus = "cancelled"
 )
 
 type ChannelPreferenceStatus string

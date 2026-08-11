@@ -22,6 +22,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/demodata"
 	"github.com/shridarpatil/whatomate/internal/frontend"
 	"github.com/shridarpatil/whatomate/internal/handlers"
+	"github.com/shridarpatil/whatomate/internal/metareview"
 	"github.com/shridarpatil/whatomate/internal/middleware"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/storage"
@@ -815,6 +816,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		"/api/webhooks/channels/{channel_account_id}",
 		app.RelayChannelWebhook,
 	)
+	// Staging review relay credential broker. Authentication is a dedicated,
+	// replay-protected server-to-server HMAC; browser JWTs are never accepted.
+	g.POST(metareview.ProvisionPath, app.ProvisionMetaMessengerReviewCredential)
 	g.GET(
 		"/api/webhooks/channels/{channel_account_id}",
 		app.VerifyChannelWebhook,
@@ -838,6 +842,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 			return r
 		}
 		if strings.HasPrefix(path, "/api/webhooks/channels/") {
+			return r
+		}
+		if path == metareview.ProvisionPath {
 			return r
 		}
 		// Skip auth for SSO routes (they handle their own auth via state tokens)
@@ -1024,6 +1031,25 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.DELETE("/api/integrations/{provider}/credentials", tenant((*handlers.App).DeleteIntegrationCredentials))
 	g.POST("/api/integrations/{provider}/connect", tenant((*handlers.App).ConnectIntegration))
 	g.POST("/api/integrations/{provider}/test", app.TestIntegration)
+	// Facebook Login for Business returns the authorization code to the
+	// authenticated browser SDK. All three managed Messenger onboarding phases
+	// remain authenticated; there is deliberately no public OAuth callback.
+	g.POST(
+		"/api/integrations/meta/messenger/onboarding/start",
+		app.StartMetaMessengerOnboarding,
+	)
+	g.POST(
+		"/api/integrations/meta/messenger/onboarding/exchange",
+		app.ExchangeMetaMessengerOnboarding,
+	)
+	g.POST(
+		"/api/integrations/meta/messenger/onboarding/select",
+		app.SelectMetaMessengerOnboarding,
+	)
+	g.DELETE(
+		"/api/integrations/meta/messenger/review/{id}",
+		app.DeprovisionMetaMessengerReviewAccount,
+	)
 	g.GET("/api/integrations/google_search_console/properties", tenant((*handlers.App).ListGoogleSearchConsoleProperties))
 	g.PUT("/api/integrations/google_search_console/properties", tenant((*handlers.App).UpdateGoogleSearchConsoleProperties))
 	g.POST("/api/integrations/google_search_console/properties/refresh", app.RefreshGoogleSearchConsoleProperties)
@@ -1039,11 +1065,34 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// transaction-spanning Tenant adapter or the outer connection can deadlock
 	// while the phases wait for another pool connection.
 	g.POST("/api/channel-accounts/{id}/test", app.TestChannelAccount)
+	// The staging App Review Page-post preview likewise performs one short
+	// tenant read followed by a provider call. Its handler owns both phases and
+	// fails closed unless the path names the deployment-pinned review account.
+	g.GET("/api/channel-accounts/{id}/meta-page-posts", app.GetMetaMessengerReviewPagePosts)
 	g.GET("/api/conversations", tenant((*handlers.App).ListInboxConversations))
 	g.GET(
 		"/api/conversations/{id}/messages",
 		tenant((*handlers.App).GetInboxConversationMessages),
 	)
+	// Messenger App Review has one separately authorized, staging-only manual
+	// RESPONSE path. Do not register it at all outside the exact review runtime.
+	// Its handler owns the account/OAuth/conversation locks and never falls back
+	// to the ordinary relay outbox or production behavior.
+	if cfg != nil && cfg.App.Environment == "staging" &&
+		cfg.MetaMessengerReviewRelay.Enabled &&
+		cfg.MetaMessengerReviewRelay.ReviewerOutboundEnabled &&
+		cfg.MetaMessengerReviewRelay.Mode == metareview.Mode &&
+		cfg.MetaMessengerReviewRelay.ReviewerUserID != "" &&
+		cfg.MetaMessengerReviewRelay.ReviewerRoleID != "" {
+		g.GET(
+			"/api/conversations/{id}/meta-review-reply",
+			app.GetMetaMessengerReviewReply,
+		)
+		g.POST(
+			"/api/conversations/{id}/meta-review-reply",
+			app.SendMetaMessengerReviewReply,
+		)
+	}
 	g.POST(
 		"/api/conversations/{id}/messages",
 		tenant((*handlers.App).SendInboxConversationMessage),

@@ -1,6 +1,7 @@
 package database_test
 
 import (
+	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -838,6 +839,33 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		require.Equal(t, orgB.ID, resolved)
 	})
 
+	t.Run("omnichannel webhook router rejects an archived organization", func(t *testing.T) {
+		archivedOrganization := testutil.CreateTestOrganization(t, adminDB)
+		archivedChannel := models.ChannelAccount{
+			BaseModel:         models.BaseModel{ID: uuid.New()},
+			OrganizationID:    archivedOrganization.ID,
+			Channel:           models.ChannelMessenger,
+			Provider:          "relay",
+			Name:              "Archived Messenger",
+			ExternalAccountID: "archived-" + uuid.NewString(),
+			Status:            models.ChannelAccountStatusActive,
+			Capabilities:      models.JSONB{},
+			Config:            models.JSONB{},
+			Metadata:          models.JSONB{},
+		}
+		require.NoError(t, adminDB.Create(&archivedChannel).Error)
+		require.NoError(t, adminDB.Delete(archivedOrganization).Error)
+
+		var resolved sql.NullString
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Raw(
+				"SELECT public.rereply_resolve_channel_org(?)::text",
+				archivedChannel.ID,
+			).Scan(&resolved).Error
+		}))
+		require.False(t, resolved.Valid)
+	})
+
 	t.Run("outbox resolver returns ready tenants without exposing jobs", func(t *testing.T) {
 		var organizationIDs []uuid.UUID
 		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
@@ -860,6 +888,42 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 			return nil
 		}))
 		require.Contains(t, organizationIDs, orgB.ID)
+
+		require.NoError(t, adminDB.Model(&models.OutboxJob{}).
+			Where("id = ? AND organization_id = ?", outboxB.ID, orgB.ID).
+			Updates(map[string]any{
+				"idempotency_key": models.StagingMessengerReviewIdempotencyKeyPrefix + uuid.NewString(),
+				"provider_state":  models.JSONB{},
+			}).Error)
+		organizationIDs = nil
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Raw(
+				"SELECT * FROM public.rereply_ready_channel_outbox_orgs(?, ?, ?)",
+				uuid.Nil,
+				20,
+				time.Now().UTC().Add(-2*time.Minute),
+			).Scan(&organizationIDs).Error
+		}))
+		require.NotContains(t, organizationIDs, orgB.ID)
+
+		require.NoError(t, adminDB.Model(&models.OutboxJob{}).
+			Where("id = ? AND organization_id = ?", outboxB.ID, orgB.ID).
+			Updates(map[string]any{
+				"idempotency_key": outboxB.IdempotencyKey,
+				"provider_state": models.JSONB{
+					"review_mode": models.StagingMessengerReviewManualReplyMode,
+				},
+			}).Error)
+		organizationIDs = nil
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Raw(
+				"SELECT * FROM public.rereply_ready_channel_outbox_orgs(?, ?, ?)",
+				uuid.Nil,
+				20,
+				time.Now().UTC().Add(-2*time.Minute),
+			).Scan(&organizationIDs).Error
+		}))
+		require.NotContains(t, organizationIDs, orgB.ID)
 	})
 
 	t.Run("AI reply resolver returns tenant IDs without exposing scheduled jobs", func(t *testing.T) {

@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -24,7 +26,15 @@ func TestReadyCheckRequiresFreshWorkerHeartbeat(t *testing.T) {
 		_ = rdb.Del(ctx, queue.WorkerHeartbeatKey).Err()
 	})
 
-	app := &App{DB: db, Redis: rdb, Log: testutil.NopLogger()}
+	const providerProofSecret = "readiness-provider-proof-secret-at-least-32-bytes"
+	app := &App{
+		DB:    db,
+		Redis: rdb,
+		Log:   testutil.NopLogger(),
+		Config: &config.Config{MetaRelay: config.MetaRelayConfig{
+			ProviderProofSecret: providerProofSecret,
+		}},
+	}
 
 	missing := testutil.NewGETRequest(t)
 	require.NoError(t, app.ReadyCheck(missing))
@@ -60,4 +70,11 @@ func TestReadyCheckRequiresFreshWorkerHeartbeat(t *testing.T) {
 	ready := testutil.NewGETRequest(t)
 	require.NoError(t, app.ReadyCheck(ready))
 	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(ready))
+	wantKeyID, err := channelapi.MetaProviderProofKeyID(providerProofSecret)
+	require.NoError(t, err)
+	assert.Equal(
+		t,
+		wantKeyID,
+		string(ready.RequestCtx.Response.Header.Peek(channelapi.RelayMetaProviderProofKeyIDHeader)),
+	)
 }

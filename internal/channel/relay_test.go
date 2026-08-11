@@ -8,22 +8,51 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/metareview"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const relayTestEncryptionKey = "relay-test-encryption-key-at-least-32-bytes"
+const relayTestProviderProofSecret = "relay-test-provider-proof-secret-at-least-32-bytes"
+
+func TestMetaProviderProofKeyIDIsDomainSeparatedAndValidated(t *testing.T) {
+	keyID, err := MetaProviderProofKeyID(relayTestProviderProofSecret)
+	require.NoError(t, err)
+	assert.Regexp(t, `^sha256=[0-9a-f]{64}$`, keyID)
+	assert.NotEqual(
+		t,
+		SignMetaProviderInboundProof(relayTestProviderProofSecret, nil),
+		keyID,
+	)
+	assert.NotEqual(
+		t,
+		SignMetaProviderOutboundProof(relayTestProviderProofSecret, nil),
+		keyID,
+	)
+
+	_, err = MetaProviderProofKeyID("too-short")
+	require.ErrorIs(t, err, ErrRelayMetaProviderProofSecret)
+	_, err = MetaProviderProofKeyID(relayTestProviderProofSecret + " ")
+	require.ErrorIs(t, err, ErrRelayMetaProviderProofSecret)
+}
+
+const relayTestMetaBusinessID = "200000000000001"
 
 func TestRelayAdapterVerifyWebhookFailsClosed(t *testing.T) {
 	t.Parallel()
 
-	adapter := NewRelayAdapter(models.ChannelInstagram, nil, relayTestEncryptionKey)
+	adapter := NewRelayAdapter(models.ChannelInstagram, nil, relayTestEncryptionKey).
+		WithExpectedMetaBusinessID(relayTestMetaBusinessID).
+		WithMetaProviderProofSecret(relayTestProviderProofSecret)
 	account := relayTestAccount(t, "https://relay.example.test/events")
 	body := []byte(`{"external_account_id":"page-123","events":[]}`)
 
@@ -35,7 +64,30 @@ func TestRelayAdapterVerifyWebhookFailsClosed(t *testing.T) {
 
 	validHeaders := http.Header{}
 	validHeaders.Set(RelaySignatureHeader, signRelayBody("inbound-secret", body))
+	validHeaders.Set(
+		RelayMetaProviderProofHeader,
+		SignMetaProviderInboundProof(relayTestProviderProofSecret, body),
+	)
 	require.NoError(t, adapter.VerifyWebhook(account, validHeaders, body))
+
+	tenantSignatureOnly := validHeaders.Clone()
+	tenantSignatureOnly.Del(RelayMetaProviderProofHeader)
+	assert.ErrorIs(
+		t,
+		adapter.VerifyWebhook(account, tenantSignatureOnly, body),
+		ErrRelayMetaProviderProofMissing,
+	)
+
+	wrongProviderProof := validHeaders.Clone()
+	wrongProviderProof.Set(
+		RelayMetaProviderProofHeader,
+		SignMetaProviderInboundProof("different-provider-proof-secret-at-least-32-bytes", body),
+	)
+	assert.ErrorIs(
+		t,
+		adapter.VerifyWebhook(account, wrongProviderProof, body),
+		ErrRelayMetaProviderProofInvalid,
+	)
 
 	tampered := append([]byte(nil), body...)
 	tampered[len(tampered)-2] = 'x'
@@ -104,6 +156,188 @@ func TestRelayAdapterRouteAndNormalizeWebhook(t *testing.T) {
 	_, err = adapter.NormalizeWebhook(context.Background(), account, duplicateBody)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "duplicates dedupe_key")
+}
+
+func TestRelayAdapterRequiresExactMetaProductionReadinessAttestation(t *testing.T) {
+	t.Parallel()
+
+	accountID := uuid.MustParse("00000000-0000-4000-8000-000000000123")
+	organizationID := uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1")
+	for _, testCase := range []struct {
+		name   string
+		mutate func(http.Header)
+		valid  bool
+	}{
+		{name: "exact mapping", valid: true},
+		{
+			name: "missing readiness version",
+			mutate: func(headers http.Header) {
+				headers.Del(RelayReadinessHeader)
+			},
+		},
+		{
+			name: "obsolete readiness version",
+			mutate: func(headers http.Header) {
+				headers.Set(RelayReadinessHeader, "v1")
+			},
+		},
+		{
+			name: "wrong external asset",
+			mutate: func(headers http.Header) {
+				headers.Set(RelayExternalAccountHeader, "some-other-page")
+			},
+		},
+		{
+			name: "wrong tenant channel account mapping",
+			mutate: func(headers http.Header) {
+				headers.Set(RelayChannelAccountHeader, uuid.NewString())
+			},
+		},
+		{
+			name: "wrong organization mapping",
+			mutate: func(headers http.Header) {
+				headers.Set(RelayOrganizationHeader, uuid.NewString())
+			},
+		},
+		{
+			name: "missing organization mapping",
+			mutate: func(headers http.Header) {
+				headers.Del(RelayOrganizationHeader)
+			},
+		},
+		{
+			name: "missing Meta Business ownership",
+			mutate: func(headers http.Header) {
+				headers.Del(RelayMetaBusinessHeader)
+			},
+		},
+		{
+			name: "non-numeric Meta Business ownership",
+			mutate: func(headers http.Header) {
+				headers.Set(RelayMetaBusinessHeader, "not-numeric")
+			},
+		},
+		{
+			name: "wrong numeric Meta Business ownership",
+			mutate: func(headers http.Header) {
+				headers.Set(RelayMetaBusinessHeader, "200000000000002")
+			},
+		},
+		{
+			name: "missing deployment provider proof",
+			mutate: func(headers http.Header) {
+				headers.Del(RelayMetaProviderProofHeader)
+			},
+		},
+		{
+			name: "wrong deployment provider proof",
+			mutate: func(headers http.Header) {
+				headers.Set(
+					RelayMetaProviderProofHeader,
+					SignMetaProviderReadinessProof(
+						"wrong-provider-proof-secret-at-least-32-bytes",
+						models.ChannelInstagram,
+						"page-123",
+						accountID.String(),
+						organizationID.String(),
+						relayTestMetaBusinessID,
+					),
+				)
+			},
+		},
+	} {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				assert.Equal(t, http.MethodHead, request.Method)
+				assert.Equal(t, signRelayBody("outbound-secret", nil), request.Header.Get(RelaySignatureHeader))
+				headers := w.Header()
+				headers.Set(RelayReadinessHeader, RelayReadinessVersion)
+				headers.Set(RelayChannelHeader, string(models.ChannelInstagram))
+				headers.Set(RelayExternalAccountHeader, "page-123")
+				headers.Set(RelayChannelAccountHeader, accountID.String())
+				headers.Set(RelayOrganizationHeader, organizationID.String())
+				headers.Set(RelayMetaBusinessHeader, "200000000000001")
+				headers.Set(
+					RelayMetaProviderProofHeader,
+					SignMetaProviderReadinessProof(
+						relayTestProviderProofSecret,
+						models.ChannelInstagram,
+						"page-123",
+						accountID.String(),
+						organizationID.String(),
+						relayTestMetaBusinessID,
+					),
+				)
+				if testCase.mutate != nil {
+					testCase.mutate(headers)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+
+			adapter := NewRelayAdapter(models.ChannelInstagram, server.Client(), relayTestEncryptionKey).
+				WithExpectedMetaBusinessID(relayTestMetaBusinessID).
+				WithMetaProviderProofSecret(relayTestProviderProofSecret)
+			adapter.allowLocalhostDev = true
+			account := relayTestAccount(t, server.URL)
+			account.ID = accountID
+			account.OrganizationID = organizationID
+			result, err := adapter.ValidateAccount(context.Background(), account)
+			if testCase.valid {
+				require.NoError(t, err)
+				assert.True(t, result.Valid)
+				return
+			}
+			require.Error(t, err)
+			assert.False(t, result.Valid)
+			assert.Contains(t, strings.ToLower(err.Error()), "readiness")
+		})
+	}
+}
+
+func TestRelayAdapterMetaReadinessFailsClosedWithoutTrustedBusinessExpectation(t *testing.T) {
+	t.Parallel()
+
+	accountID := uuid.MustParse("00000000-0000-4000-8000-000000000123")
+	organizationID := uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(RelayReadinessHeader, RelayReadinessVersion)
+		w.Header().Set(RelayChannelHeader, string(models.ChannelInstagram))
+		w.Header().Set(RelayExternalAccountHeader, "page-123")
+		w.Header().Set(RelayChannelAccountHeader, accountID.String())
+		w.Header().Set(RelayOrganizationHeader, organizationID.String())
+		w.Header().Set(RelayMetaBusinessHeader, "200000000000001")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	adapter := NewRelayAdapter(models.ChannelInstagram, server.Client(), relayTestEncryptionKey)
+	adapter.allowLocalhostDev = true
+	account := relayTestAccount(t, server.URL)
+	account.ID = accountID
+	account.OrganizationID = organizationID
+	result, err := adapter.ValidateAccount(context.Background(), account)
+	require.Error(t, err)
+	assert.False(t, result.Valid)
+}
+
+func TestRelayAdapterNonMetaHealthContractRemainsBackwardCompatible(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer server.Close()
+
+	adapter := NewRelayAdapter(models.ChannelWebChat, server.Client(), relayTestEncryptionKey)
+	adapter.allowLocalhostDev = true
+	account := relayTestAccount(t, server.URL)
+	account.Channel = models.ChannelWebChat
+	result, err := adapter.ValidateAccount(context.Background(), account)
+	require.NoError(t, err)
+	assert.True(t, result.Valid)
 }
 
 func TestRelayAdapterSendSignsRequest(t *testing.T) {
@@ -352,4 +586,57 @@ func TestRelayAdapterCredentialRefreshIsExplicitlyUnsupported(t *testing.T) {
 	adapter := NewRelayAdapter(models.ChannelSMS, nil, relayTestEncryptionKey)
 	_, err := adapter.RefreshCredentials(context.Background(), relayTestAccount(t, "https://relay.example.test"))
 	assert.True(t, errors.Is(err, ErrCredentialRefreshUnsupported))
+}
+
+func TestRelayAdapterInboundOnlyRejectsEveryEgressAndControlOperation(t *testing.T) {
+	t.Parallel()
+
+	account := relayTestAccount(t, "https://relay.example.test/v1/accounts/messenger/700000000000001")
+	account.Channel = models.ChannelMessenger
+	account.Config["outbound_enabled"] = true
+	adapter := NewRelayAdapter(models.ChannelMessenger, nil, relayTestEncryptionKey).
+		WithInboundOnly()
+
+	_, err := adapter.Send(context.Background(), account, OutboundMessage{
+		IdempotencyKey: "review-send-must-fail",
+		Parts:          []MessagePart{{Type: models.MessagePartTypeText, Text: "blocked"}},
+	})
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	assert.ErrorIs(t, adapter.MarkRead(context.Background(), account, ConversationRef{}, []string{"mid"}), ErrRelayInboundOnly)
+	_, err = adapter.FetchMedia(context.Background(), account, MediaRef{URL: "https://relay.example.test/media"})
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	_, err = adapter.ValidateAccount(context.Background(), account)
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	assert.ErrorIs(t, adapter.Subscribe(context.Background(), account), ErrRelayInboundOnly)
+	_, err = adapter.RefreshCredentials(context.Background(), account)
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+}
+
+func TestRelayAdapterReviewMarkerRejectsEveryEgressWithoutAdapterOptIn(t *testing.T) {
+	t.Parallel()
+
+	account := relayTestAccount(t, "https://relay.example.test/v1/accounts/messenger/700000000000001")
+	account.Channel = models.ChannelMessenger
+	account.Config["outbound_enabled"] = true
+	account.Metadata = models.JSONB{
+		"management_mode":   metaMessengerOAuthManagementMode,
+		"review_relay_mode": metareview.Marker,
+	}
+	adapter := NewRelayAdapter(models.ChannelMessenger, nil, relayTestEncryptionKey)
+
+	_, err := adapter.Send(context.Background(), account, OutboundMessage{
+		IdempotencyKey: "review-marker-send-must-fail",
+		Parts:          []MessagePart{{Type: models.MessagePartTypeText, Text: "blocked"}},
+	})
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	assert.ErrorIs(t, adapter.MarkRead(context.Background(), account, ConversationRef{}, []string{"mid"}), ErrRelayInboundOnly)
+	_, err = adapter.FetchMedia(context.Background(), account, MediaRef{URL: "https://relay.example.test/media"})
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	_, err = adapter.ValidateAccount(context.Background(), account)
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	assert.ErrorIs(t, adapter.Subscribe(context.Background(), account), ErrRelayInboundOnly)
+	_, err = adapter.RefreshCredentials(context.Background(), account)
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
+	_, err = adapter.outboundSecret(account)
+	assert.ErrorIs(t, err, ErrRelayInboundOnly)
 }

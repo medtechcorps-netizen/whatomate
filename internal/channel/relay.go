@@ -17,17 +17,32 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 )
 
 const (
-	RelayProvider              = "relay"
-	RelaySignatureHeader       = "X-ReReply-Signature-256"
-	relaySignaturePrefix       = "sha256="
-	defaultRelayBodyLimit      = int64(1 << 20)
-	maxRelayReplyContextRunes  = 512
-	maxRelayMessageContextSize = 64 << 10
+	RelayProvider                     = "relay"
+	RelaySignatureHeader              = "X-ReReply-Signature-256"
+	RelayMetaProviderProofHeader      = "X-ReReply-Meta-Provider-Proof-256"
+	RelayMetaProviderProofKeyIDHeader = "X-ReReply-Meta-Provider-Proof-Key-ID"
+	MetaProviderProofMetadataKey      = "meta_provider_proof_version"
+	MetaProviderProofVersion          = "v1"
+	RelayReadinessHeader              = "X-ReReply-Relay-Readiness"
+	RelayChannelHeader                = "X-ReReply-Channel"
+	RelayExternalAccountHeader        = "X-ReReply-External-Account-ID"
+	RelayChannelAccountHeader         = "X-ReReply-Channel-Account-ID"
+	RelayOrganizationHeader           = "X-ReReply-Organization-ID"
+	RelayMetaBusinessHeader           = "X-ReReply-Meta-Business-ID"
+	RelayReadinessVersion             = "v2"
+	relaySignaturePrefix              = "sha256="
+	metaProviderProofDomain           = "rereply-meta-provider-proof:v1"
+	metaProviderProofKeyIDDomain      = "rereply-meta-provider-proof-key-id:v1"
+	minimumProviderProofBytes         = 32
+	defaultRelayBodyLimit             = int64(1 << 20)
+	maxRelayReplyContextRunes         = 512
+	maxRelayMessageContextSize        = 64 << 10
 
 	// RelayWebhookMaxBodyBytes is the public ReReply webhook request limit.
 	// Relay implementations that batch canonical events must stay below
@@ -38,13 +53,18 @@ const (
 )
 
 var (
-	ErrRelaySecretMissing           = errors.New("relay signing secret is not configured")
-	ErrRelaySignatureMissing        = errors.New("relay signature is missing")
-	ErrRelaySignatureInvalid        = errors.New("relay signature is invalid")
-	ErrRelayOutboundDisabled        = errors.New("relay outbound delivery is not approved")
-	ErrRelayURLInvalid              = errors.New("relay URL is invalid")
-	ErrCredentialRefreshUnsupported = errors.New("relay credentials cannot be refreshed automatically")
-	errRelayOutgoingEcho            = errors.New("relay outgoing message echo")
+	ErrRelaySecretMissing            = errors.New("relay signing secret is not configured")
+	ErrRelaySignatureMissing         = errors.New("relay signature is missing")
+	ErrRelaySignatureInvalid         = errors.New("relay signature is invalid")
+	ErrRelayMetaProviderProofMissing = errors.New("meta relay provider proof is missing")
+	ErrRelayMetaProviderProofInvalid = errors.New("meta relay provider proof is invalid")
+	ErrRelayMetaProviderProofSecret  = errors.New("meta relay provider proof secret is not configured securely")
+	ErrRelayMetaTrustedBinding       = errors.New("meta relay trusted Business binding is not configured")
+	ErrRelayOutboundDisabled         = errors.New("relay outbound delivery is not approved")
+	ErrRelayInboundOnly              = errors.New("relay is restricted to inbound review traffic")
+	ErrRelayURLInvalid               = errors.New("relay URL is invalid")
+	ErrCredentialRefreshUnsupported  = errors.New("relay credentials cannot be refreshed automatically")
+	errRelayOutgoingEcho             = errors.New("relay outgoing message echo")
 )
 
 // RelayAdapter implements a generic HMAC-signed HTTPS bridge for channels that
@@ -55,10 +75,143 @@ type RelayAdapter struct {
 	encryptionKey string
 	now           func() time.Time
 	lookupIP      func(context.Context, string) ([]net.IPAddr, error)
+	// expectedMetaBusinessID is supplied only by the application process's
+	// protected Meta relay inventory. A tenant URL or readiness response cannot
+	// choose this value.
+	expectedMetaBusinessID string
+	// metaProviderProofSecret is deployment-held and never tenant supplied. It
+	// proves that canonical Meta traffic and readiness came from the configured
+	// relay even though tenant administrators know the account-scoped HMAC.
+	metaProviderProofSecret string
 	// allowLocalhostDev is deliberately not sourced from ChannelAccount.Config.
 	// It is an internal process-level switch used by package tests/local
 	// development only; production handlers leave it false.
 	allowLocalhostDev bool
+	// inboundOnly is a process-owned defense-in-depth fuse for review relays.
+	// It is never read from tenant-controlled account configuration.
+	inboundOnly bool
+}
+
+// WithExpectedMetaBusinessID binds Meta readiness validation to protected,
+// application-held ownership state. Meta relay adapters fail closed when this
+// expectation is absent; generic relay channels remain backward compatible.
+func (a *RelayAdapter) WithExpectedMetaBusinessID(metaBusinessID string) *RelayAdapter {
+	if a != nil {
+		a.expectedMetaBusinessID = strings.TrimSpace(metaBusinessID)
+	}
+	return a
+}
+
+// WithMetaProviderProofSecret installs the deployment-held Meta relay proof
+// key. Generic relay channels do not require it and remain backward compatible.
+func (a *RelayAdapter) WithMetaProviderProofSecret(secret string) *RelayAdapter {
+	if a != nil {
+		a.metaProviderProofSecret = secret
+	}
+	return a
+}
+
+// WithLocalhostDevelopment explicitly permits loopback relay endpoints for a
+// process-owned development environment. Tenant-controlled channel
+// configuration must never select this option.
+func (a *RelayAdapter) WithLocalhostDevelopment() *RelayAdapter {
+	if a != nil {
+		a.allowLocalhostDev = true
+	}
+	return a
+}
+
+// WithInboundOnly removes every adapter operation that could contact the
+// relay or provider on behalf of ReReply. Webhook verification, routing, and
+// normalization remain available so a staging review asset can demonstrate
+// receipt without acquiring an outbound capability.
+func (a *RelayAdapter) WithInboundOnly() *RelayAdapter {
+	if a != nil {
+		a.inboundOnly = true
+	}
+	return a
+}
+
+func (a *RelayAdapter) inboundOnlyForAccount(account *models.ChannelAccount) bool {
+	return (a != nil && a.inboundOnly) || IsStagingMessengerReviewMarked(account)
+}
+
+// SignMetaProviderInboundProof signs the exact canonical body using a domain
+// that cannot be confused with an account-scoped webhook signature or a
+// readiness proof.
+func SignMetaProviderInboundProof(secret string, body []byte) string {
+	prefix := []byte(metaProviderProofDomain + "\ninbound\n")
+	payload := make([]byte, 0, len(prefix)+len(body))
+	payload = append(payload, prefix...)
+	payload = append(payload, body...)
+	return signRelayBody(secret, payload)
+}
+
+// SignMetaProviderOutboundProof authenticates ReReply itself to the Meta
+// relay, preventing a tenant-held account HMAC from bypassing ReReply's send
+// approval gate by calling the relay directly.
+func SignMetaProviderOutboundProof(secret string, body []byte) string {
+	prefix := []byte(metaProviderProofDomain + "\noutbound\n")
+	payload := make([]byte, 0, len(prefix)+len(body))
+	payload = append(payload, prefix...)
+	payload = append(payload, body...)
+	return signRelayBody(secret, payload)
+}
+
+// SignMetaProviderReadinessProof binds a proof to one exact protected mapping.
+// Mapping fields are already constrained to newline-free canonical values by
+// the application and relay startup validators.
+func SignMetaProviderReadinessProof(
+	secret string,
+	channel models.Channel,
+	externalAccountID, channelAccountID, organizationID, metaBusinessID string,
+) string {
+	payload := strings.Join([]string{
+		metaProviderProofDomain,
+		"readiness",
+		string(channel),
+		externalAccountID,
+		channelAccountID,
+		organizationID,
+		metaBusinessID,
+	}, "\n")
+	return signRelayBody(secret, []byte(payload))
+}
+
+// MetaProviderProofKeyID returns a non-secret, domain-separated fingerprint of
+// the deployment-held provider-proof key. ReReply and the relay expose this on
+// readiness responses so deployment monitoring can detect a one-sided secret
+// rotation without retrieving either runtime's secret value.
+func MetaProviderProofKeyID(secret string) (string, error) {
+	if len([]byte(secret)) < minimumProviderProofBytes || strings.TrimSpace(secret) != secret {
+		return "", ErrRelayMetaProviderProofSecret
+	}
+	return signRelayBody(secret, []byte(metaProviderProofKeyIDDomain)), nil
+}
+
+func constantTimeRelaySignatureEqual(provided, expected string) bool {
+	providedBytes := []byte(strings.TrimSpace(provided))
+	expectedBytes := []byte(expected)
+	return len(providedBytes) == len(expectedBytes) && hmac.Equal(providedBytes, expectedBytes)
+}
+
+func (a *RelayAdapter) requiresMetaProviderProof() bool {
+	return a != nil &&
+		(a.channel == models.ChannelInstagram || a.channel == models.ChannelMessenger)
+}
+
+func (a *RelayAdapter) validateMetaDeploymentTrust() error {
+	if !a.requiresMetaProviderProof() {
+		return nil
+	}
+	if !isCanonicalMetaBusinessID(a.expectedMetaBusinessID) {
+		return ErrRelayMetaTrustedBinding
+	}
+	secret := a.metaProviderProofSecret
+	if len([]byte(secret)) < minimumProviderProofBytes || strings.TrimSpace(secret) != secret {
+		return ErrRelayMetaProviderProofSecret
+	}
+	return nil
 }
 
 func NewRelayAdapter(channel models.Channel, client *http.Client, encryptionKey string) *RelayAdapter {
@@ -181,6 +334,19 @@ func (a *RelayAdapter) VerifyWebhook(account *models.ChannelAccount, headers htt
 	if !hmac.Equal(provided, mac.Sum(nil)) {
 		return ErrRelaySignatureInvalid
 	}
+	if a.requiresMetaProviderProof() {
+		if err := a.validateMetaDeploymentTrust(); err != nil {
+			return err
+		}
+		proof := strings.TrimSpace(headers.Get(RelayMetaProviderProofHeader))
+		if proof == "" {
+			return ErrRelayMetaProviderProofMissing
+		}
+		expected := SignMetaProviderInboundProof(a.metaProviderProofSecret, body)
+		if !constantTimeRelaySignatureEqual(proof, expected) {
+			return ErrRelayMetaProviderProofInvalid
+		}
+	}
 	return nil
 }
 
@@ -245,6 +411,9 @@ func (a *RelayAdapter) NormalizeWebhook(_ context.Context, account *models.Chann
 }
 
 func (a *RelayAdapter) Send(ctx context.Context, account *models.ChannelAccount, message OutboundMessage) (SendResult, error) {
+	if a.inboundOnlyForAccount(account) {
+		return SendResult{}, ErrRelayInboundOnly
+	}
 	if account == nil || !boolConfig(account.Config, "outbound_enabled") {
 		return SendResult{}, ErrRelayOutboundDisabled
 	}
@@ -273,6 +442,9 @@ func (a *RelayAdapter) Send(ctx context.Context, account *models.ChannelAccount,
 }
 
 func (a *RelayAdapter) MarkRead(ctx context.Context, account *models.ChannelAccount, conversation ConversationRef, externalMessageIDs []string) error {
+	if a.inboundOnlyForAccount(account) {
+		return ErrRelayInboundOnly
+	}
 	if account == nil || !boolConfig(account.Config, "outbound_enabled") {
 		return ErrRelayOutboundDisabled
 	}
@@ -286,6 +458,9 @@ func (a *RelayAdapter) MarkRead(ctx context.Context, account *models.ChannelAcco
 }
 
 func (a *RelayAdapter) FetchMedia(ctx context.Context, account *models.ChannelAccount, ref MediaRef) (FetchedMedia, error) {
+	if a.inboundOnlyForAccount(account) {
+		return FetchedMedia{}, ErrRelayInboundOnly
+	}
 	if account == nil {
 		return FetchedMedia{}, errors.New("relay account is required")
 	}
@@ -342,6 +517,12 @@ func (a *RelayAdapter) ValidateAccount(ctx context.Context, account *models.Chan
 	if account == nil {
 		return result, errors.New("relay account is required")
 	}
+	if a.inboundOnlyForAccount(account) {
+		return result, ErrRelayInboundOnly
+	}
+	if err := a.validateMetaDeploymentTrust(); err != nil {
+		return result, err
+	}
 	if _, err := a.credentialValue(account, "inbound_secret"); err != nil {
 		return result, err
 	}
@@ -386,12 +567,77 @@ func (a *RelayAdapter) ValidateAccount(ctx context.Context, account *models.Chan
 		resp.StatusCode != http.StatusMethodNotAllowed {
 		return result, relayHTTPError("validate_account", resp)
 	}
+	if a.channel == models.ChannelInstagram || a.channel == models.ChannelMessenger {
+		if err := validateMetaRelayReadinessHeaders(
+			resp.Header,
+			account,
+			a.expectedMetaBusinessID,
+			a.metaProviderProofSecret,
+		); err != nil {
+			return result, err
+		}
+	}
 	result.Valid = true
 	result.Status = string(models.ChannelAccountStatusActive)
 	return result, nil
 }
 
+// validateMetaRelayReadinessHeaders binds a successful Meta relay health
+// response to the exact tenant ChannelAccount and provider asset being tested.
+// A generic 2xx/405 endpoint is not sufficient for Messenger or Instagram:
+// only the production mapping that owns the account-scoped outbound secret may
+// attest this tuple after checking its provider-side readiness.
+func validateMetaRelayReadinessHeaders(
+	headers http.Header,
+	account *models.ChannelAccount,
+	expectedMetaBusinessID string,
+	providerProofSecret string,
+) error {
+	if account == nil ||
+		account.ID == uuid.Nil ||
+		account.OrganizationID == uuid.Nil ||
+		!isCanonicalMetaBusinessID(expectedMetaBusinessID) ||
+		strings.TrimSpace(headers.Get(RelayReadinessHeader)) != RelayReadinessVersion ||
+		!strings.EqualFold(strings.TrimSpace(headers.Get(RelayChannelHeader)), string(account.Channel)) ||
+		strings.TrimSpace(headers.Get(RelayExternalAccountHeader)) != strings.TrimSpace(account.ExternalAccountID) ||
+		strings.TrimSpace(headers.Get(RelayChannelAccountHeader)) != account.ID.String() ||
+		strings.TrimSpace(headers.Get(RelayOrganizationHeader)) != account.OrganizationID.String() ||
+		strings.TrimSpace(headers.Get(RelayMetaBusinessHeader)) != expectedMetaBusinessID {
+		return errors.New("meta relay production mapping or readiness attestation is missing or mismatched")
+	}
+	expectedProof := SignMetaProviderReadinessProof(
+		providerProofSecret,
+		account.Channel,
+		strings.TrimSpace(account.ExternalAccountID),
+		account.ID.String(),
+		account.OrganizationID.String(),
+		expectedMetaBusinessID,
+	)
+	if !constantTimeRelaySignatureEqual(
+		headers.Get(RelayMetaProviderProofHeader),
+		expectedProof,
+	) {
+		return errors.New("meta relay provider readiness proof is missing or mismatched")
+	}
+	return nil
+}
+
+func isCanonicalMetaBusinessID(value string) bool {
+	if value == "" || len(value) > 32 || value[0] == '0' {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func (a *RelayAdapter) Subscribe(ctx context.Context, account *models.ChannelAccount) error {
+	if a.inboundOnlyForAccount(account) {
+		return ErrRelayInboundOnly
+	}
 	if account == nil || !boolConfig(account.Config, "outbound_enabled") {
 		return ErrRelayOutboundDisabled
 	}
@@ -401,7 +647,10 @@ func (a *RelayAdapter) Subscribe(ctx context.Context, account *models.ChannelAcc
 	}, nil)
 }
 
-func (a *RelayAdapter) RefreshCredentials(_ context.Context, _ *models.ChannelAccount) (CredentialRefreshResult, error) {
+func (a *RelayAdapter) RefreshCredentials(_ context.Context, account *models.ChannelAccount) (CredentialRefreshResult, error) {
+	if a.inboundOnlyForAccount(account) {
+		return CredentialRefreshResult{}, ErrRelayInboundOnly
+	}
 	return CredentialRefreshResult{}, ErrCredentialRefreshUnsupported
 }
 
@@ -418,6 +667,12 @@ type relayOutboundEnvelope struct {
 }
 
 func (a *RelayAdapter) post(ctx context.Context, account *models.ChannelAccount, eventType string, data any, response any) error {
+	if a.inboundOnlyForAccount(account) {
+		return ErrRelayInboundOnly
+	}
+	if err := a.validateMetaDeploymentTrust(); err != nil {
+		return err
+	}
 	rawURL := stringConfig(account.Config, "relay_url")
 	target, err := validateRelayURL(rawURL, a.allowLocalhostDev)
 	if err != nil {
@@ -444,6 +699,12 @@ func (a *RelayAdapter) post(ctx context.Context, account *models.ChannelAccount,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "ReReply-Relay/1.0")
 	req.Header.Set(RelaySignatureHeader, signRelayBody(secret, payload))
+	if a.requiresMetaProviderProof() {
+		req.Header.Set(
+			RelayMetaProviderProofHeader,
+			SignMetaProviderOutboundProof(a.metaProviderProofSecret, payload),
+		)
+	}
 
 	client, err := a.safeHTTPClient(a.allowLocalhostDev)
 	if err != nil {
@@ -476,6 +737,9 @@ func (a *RelayAdapter) post(ctx context.Context, account *models.ChannelAccount,
 }
 
 func (a *RelayAdapter) outboundSecret(account *models.ChannelAccount) (string, error) {
+	if a.inboundOnlyForAccount(account) {
+		return "", ErrRelayInboundOnly
+	}
 	if secret, err := a.credentialValue(account, "outbound_secret"); err == nil && secret != "" {
 		return secret, nil
 	}
@@ -489,7 +753,8 @@ func (a *RelayAdapter) credentialValue(account *models.ChannelAccount, key strin
 	now := a.now().UTC()
 	for _, index := range CredentialIndexesByPriority(account.Credentials) {
 		credential := &account.Credentials[index]
-		if !CredentialIsCurrent(credential, now) {
+		if credential.Kind != models.ChannelCredentialKindWebhook ||
+			!CredentialIsCurrent(credential, now) {
 			continue
 		}
 		value, ok := credential.CredentialBlob[key].(string)
@@ -691,6 +956,7 @@ func (a *RelayAdapter) safeHTTPClient(allowLocalhost bool) (*http.Client, error)
 	transport.Proxy = nil
 	transport.DialContext = a.safeDialContext(allowLocalhost)
 	transport.DialTLSContext = nil
+	//lint:ignore SA1019 Clear any cloned legacy hook so HTTPS uses the guarded DialContext.
 	transport.DialTLS = nil //nolint:staticcheck // Clear any cloned legacy hook so HTTPS uses the guarded DialContext.
 	client.Transport = transport
 

@@ -11,6 +11,9 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/metareview"
 )
 
 type WorkerOption func(*Worker)
@@ -27,6 +30,14 @@ func WithWorkerLogger(logger *slog.Logger) WorkerOption {
 	return func(worker *Worker) {
 		if logger != nil {
 			worker.logger = logger
+		}
+	}
+}
+
+func WithWorkerReviewBindingResolver(resolver ReviewBindingResolver) WorkerOption {
+	return func(worker *Worker) {
+		if resolver != nil {
+			worker.reviewResolver = resolver
 		}
 	}
 }
@@ -59,6 +70,21 @@ func NewWorker(config *Config, store QueueStore, options ...WorkerOption) (*Work
 	}
 	for _, option := range options {
 		option(worker)
+	}
+	if config.stagingMessengerReview() {
+		if config.DeploymentEnvironment != "staging" {
+			return nil, errors.New("messenger review relay is staging-only")
+		}
+		if worker.reviewResolver == nil {
+			return nil, errors.New("messenger review binding resolver is required")
+		}
+		// Review callbacks contain a dynamically provisioned credential. Always
+		// use the dial-time public-endpoint transport in this runtime, even if a
+		// generic production HTTP client option was supplied by a caller.
+		worker.client = newReviewEndpointHTTPClient(
+			config.ForwardTimeout,
+			config.allowInsecureTestEndpoints,
+		)
 	}
 	return worker, nil
 }
@@ -120,6 +146,9 @@ func (w *Worker) ProcessOnce(ctx context.Context) error {
 }
 
 func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
+	if w.config.stagingMessengerReview() {
+		return w.processReviewJob(ctx, job)
+	}
 	account, ok := w.config.accountByKey(job.AccountKey)
 	if !ok {
 		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
@@ -130,6 +159,45 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 	forwardCtx, cancelForward := context.WithTimeout(ctx, w.config.ForwardTimeout)
 	outcome := w.forwardToReReply(forwardCtx, account, job.Body)
 	cancelForward()
+	return w.settleForwardOutcome(ctx, job, account, outcome)
+}
+
+func (w *Worker) processReviewJob(ctx context.Context, job InboundJob) error {
+	if job.AccountKey != w.config.ReviewChannelAccountID ||
+		job.ReviewGeneration != w.config.ReviewGeneration ||
+		job.ReviewCredentialID == "" || job.ReviewCredentialVersion <= 0 {
+		return w.deadReviewJob(ctx, job, "review_binding_changed")
+	}
+	forwardCtx, cancelForward := context.WithTimeout(ctx, w.config.ForwardTimeout)
+	binding, err := w.reviewResolver.ResolveReviewBinding(forwardCtx)
+	if err != nil {
+		cancelForward()
+		if reviewBindingUnavailable(err) {
+			return w.retryReviewJob(ctx, job, "review_binding_unavailable")
+		}
+		return w.deadReviewJob(ctx, job, "review_binding_rejected")
+	}
+	if err := validateReviewBinding(w.config, binding, w.now().UTC()); err != nil ||
+		!reviewBindingMatchesJob(binding, job) {
+		cancelForward()
+		return w.deadReviewJob(ctx, job, "review_binding_changed")
+	}
+	account, err := binding.account()
+	if err != nil {
+		cancelForward()
+		return w.deadReviewJob(ctx, job, "review_binding_rejected")
+	}
+	outcome := w.forwardReviewToReReply(forwardCtx, account, job.Body, binding)
+	cancelForward()
+	return w.settleForwardOutcome(ctx, job, account, outcome)
+}
+
+func (w *Worker) settleForwardOutcome(
+	ctx context.Context,
+	job InboundJob,
+	account *AccountConfig,
+	outcome forwardOutcome,
+) error {
 
 	settleCtx, cancelSettle := context.WithTimeout(ctx, queueSettlementTimeout)
 	defer cancelSettle()
@@ -199,6 +267,35 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 	return nil
 }
 
+func (w *Worker) deadReviewJob(ctx context.Context, job InboundJob, reason string) error {
+	settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+	defer cancel()
+	return w.store.DeadInbound(settleCtx, job.ID, reason)
+}
+
+func (w *Worker) retryReviewJob(ctx context.Context, job InboundJob, reason string) error {
+	settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+	defer cancel()
+	attempts, dead, err := w.store.RetryInbound(
+		settleCtx,
+		job.ID,
+		w.now().UTC().Add(retryBackoff(job.Attempts+1)),
+		w.config.MaxAttempts,
+		reason,
+	)
+	if err != nil {
+		return err
+	}
+	if dead {
+		w.logger.Error(
+			"Meta review event exhausted retry budget",
+			"job_id", job.ID,
+			"attempts", attempts,
+		)
+	}
+	return nil
+}
+
 type forwardOutcome struct {
 	success    bool
 	retryable  bool
@@ -210,6 +307,24 @@ func (w *Worker) forwardToReReply(
 	ctx context.Context,
 	account *AccountConfig,
 	body []byte,
+) forwardOutcome {
+	return w.forwardToReReplyWithReview(ctx, account, body, nil)
+}
+
+func (w *Worker) forwardReviewToReReply(
+	ctx context.Context,
+	account *AccountConfig,
+	body []byte,
+	binding ReviewBinding,
+) forwardOutcome {
+	return w.forwardToReReplyWithReview(ctx, account, body, &binding)
+}
+
+func (w *Worker) forwardToReReplyWithReview(
+	ctx context.Context,
+	account *AccountConfig,
+	body []byte,
+	reviewBinding *ReviewBinding,
 ) forwardOutcome {
 	request, err := http.NewRequestWithContext(
 		ctx,
@@ -223,6 +338,29 @@ func (w *Worker) forwardToReReply(
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("User-Agent", "ReReply-Meta-Relay/1.0")
 	request.Header.Set(ReReplySignatureHeader, signBody(account.reReplyInboundSecret, body))
+	request.Header.Set(
+		channelapi.RelayMetaProviderProofHeader,
+		channelapi.SignMetaProviderInboundProof(w.config.ReReplyProviderProofSecret, body),
+	)
+	if reviewBinding != nil {
+		proof, proofErr := metareview.SignInboundProof(
+			w.config.ReReplyProviderProofSecret,
+			reviewBinding.Tuple,
+			reviewBinding.CredentialID,
+			reviewBinding.CredentialVersion,
+			body,
+		)
+		if proofErr != nil {
+			return forwardOutcome{}
+		}
+		request.Header.Set(metareview.GenerationHeader, reviewBinding.Tuple.Generation)
+		request.Header.Set(metareview.CredentialIDHeader, reviewBinding.CredentialID)
+		request.Header.Set(
+			metareview.CredentialVersionHeader,
+			strconv.Itoa(reviewBinding.CredentialVersion),
+		)
+		request.Header.Set(metareview.ReviewProofHeader, proof)
+	}
 
 	response, err := w.client.Do(request)
 	if err != nil {
@@ -257,5 +395,8 @@ func retryBackoff(attempt int) time.Duration {
 }
 
 func (w *Worker) String() string {
+	if w.config.stagingMessengerReview() {
+		return "Meta relay worker (staging Messenger review, inbound only)"
+	}
 	return fmt.Sprintf("Meta relay worker (%d account mappings)", len(w.config.Accounts))
 }

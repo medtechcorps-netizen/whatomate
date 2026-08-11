@@ -58,5 +58,9 @@ audio/
 # Test results
 test-results/
 
+# Python tooling
+__pycache__/
+*.py[cod]
+
 # Docker 
 docker/.env

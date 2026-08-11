@@ -40,6 +40,32 @@ Calculate the HMAC over the exact raw HTTP body bytes:
 hex(HMAC-SHA256(secret, raw_body))
 ```
 
+Meta relay traffic has a second, deployment-held proof in
+`X-ReReply-Meta-Provider-Proof-256`. The relay reads
+`META_RELAY_REREPLY_PROVIDER_PROOF_SECRET`; ReReply reads the same value from
+`WHATOMATE_META_RELAY__PROVIDER_PROOF_SECRET`. The proof is domain-separated
+for canonical inbound POST bodies and readiness-v2 HEAD mappings. Both runtime
+environment entries must be DigitalOcean `SECRET` values of at least 32 UTF-8
+bytes with no surrounding whitespace. Rotate them together; there is no
+previous-key grace period. Never put this value in account JSON, tenant config,
+the channel API, logs, or `META_RELAY_PREFLIGHT_SECRETS_JSON`.
+
+Both runtimes also emit
+`X-ReReply-Meta-Provider-Proof-Key-ID`, a domain-separated HMAC fingerprint of
+that key, on their readiness responses. Deployment preflight compares ReReply
+`/ready` with each relay account probe so a one-sided rotation fails without
+exporting or logging the secret.
+
+An old/new mismatch fails readiness and causes ReReply to reject inbound Meta
+events. The relay retains those jobs under its configured retry/dead-letter
+policy; do not enable outbound or AI until both runtime services use the new
+key.
+
+CI sees only opaque secret declarations and cannot compare their bytes. After
+every rotation, run the proof-backed ReReply Test for every mapped account, then
+require a fresh external-customer text DM and administrator approval before
+delivery is re-enabled.
+
 Do not parse and re-serialize JSON before verification. For `HEAD` health probes
 and signed media `GET` requests, sign the empty byte sequence. Compare signatures
 in constant time.
@@ -47,6 +73,17 @@ in constant time.
 Inbound requests are signed by the relay with the inbound secret. Requests from
 ReReply to the relay are signed with the outbound secret (or inbound-secret
 fallback described above).
+
+For Meta relay mappings, every account-scoped inbound and outbound HMAC value
+must contain at least 32 UTF-8 bytes with no surrounding whitespace and be
+unique across both directions and all accounts.
+
+Each Meta mapping's `access_token_env`, `rereply_inbound_secret_env`, and
+`rereply_outbound_secret_env` references must resolve to exactly one non-empty
+DigitalOcean `SECRET` on the relay service. The structural preflight validates
+presence and type before app-spec mutation without reading or logging the
+values. The relay's Redis URL, app secrets, verify tokens, and deployment-held
+provider proof are subject to the same `SECRET` requirement.
 
 ## Relay health probe
 
@@ -56,6 +93,49 @@ otherwise to `relay_url`.
 - HMAC header: signature of an empty body.
 - Accepted response: any `2xx`, or `405 Method Not Allowed`.
 - A network failure or any other status leaves the account degraded or pending.
+
+Messenger and Instagram have a stricter production profile. A `2xx` response
+must include all of these exact headers; `405` is not accepted for those two
+channels:
+
+```text
+X-ReReply-Relay-Readiness: v2
+X-ReReply-Channel: messenger|instagram
+X-ReReply-External-Account-ID: <exact provider asset ID>
+X-ReReply-Channel-Account-ID: <exact ReReply channel account UUID>
+X-ReReply-Organization-ID: <exact ReReply organization UUID>
+X-ReReply-Meta-Business-ID: <numeric reviewed asset-owner Business Portfolio ID>
+X-ReReply-Meta-Provider-Proof-256: sha256=<deployment-provider-proof>
+```
+
+The Meta relay emits them only after verifying Redis, the token-to-asset Graph
+binding, the exact app's per-asset `messages` webhook subscription, the exact
+ReReply organization/channel-account mapping, and separate verified Tech
+Provider and approved App Review gates. ReReply compares the organization UUID
+as well as the channel-account, provider asset, and numeric Meta Business tuple
+against its deployment-held inventory. Deployment preflight proves that runtime
+copy matches the protected GitHub ownership inventory. Deploy the relay and
+strict ReReply validator together as a compatible release, then require the
+signed-header account preflight to pass before Test or outbound approval.
+
+Messenger runtime delivery requires Advanced Access for `pages_messaging` and
+`pages_manage_metadata`. The protected production inventory has a stricter
+future-organization profile: it also requires `pages_show_list`,
+`pages_read_engagement`, and `business_management`. The deployment workflow
+runs that structural comparison before changing DigitalOcean, then retains the
+signed live account probes after the release is ready.
+
+ReReply accepts Meta readiness only from its deployment-held
+`WHATOMATE_META_RELAY__BASE_URL` and resolves the expected organization, asset,
+channel-account, and Meta Business tuple from
+`WHATOMATE_META_RELAY__EXPECTED_ACCOUNTS_JSON`. The relay independently pins
+the ReReply origin with `META_RELAY_REREPLY_BASE_URL`. Tenant-provided relay or
+health URLs cannot replace either production trust anchor.
+
+For a Meta ChannelAccount, `relay_url` must be exactly
+`{WHATOMATE_META_RELAY__BASE_URL}/v1/accounts/{channel}/{external_account_id}`.
+`health_url` must be absent or exactly the same URL. ReReply rejects any other
+host, path, channel, or asset before sending the signed health request.
 
 Changing the relay URL or outbound secret automatically disables outbound
 delivery and returns the account to pending. Test it again, then explicitly

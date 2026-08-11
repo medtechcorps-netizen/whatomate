@@ -1,5 +1,6 @@
 import { api } from '@/services/api'
 import { unwrapListResponse } from '@/lib/api-utils'
+import { META_REVIEW_DEPROVISION_TIMEOUT_MS } from '@/lib/metaReviewDeprovision'
 import type { AxiosResponse } from 'axios'
 
 const PRODUCT_PAGE_LIMIT = 100
@@ -602,8 +603,78 @@ export interface ChannelAccount {
   last_outbound_at?: string
   last_error_at?: string
   last_error?: string
+  meta_provider_proof_version?: string
   outbox_pending: number
   outbox_failed: number
+}
+
+export interface MetaMessengerReviewPagePost {
+  id: string
+  message?: string
+  created_time: string
+  permalink_url: string
+}
+
+export interface MetaMessengerReviewPagePosts {
+  page_id: string
+  page_name: string
+  posts: MetaMessengerReviewPagePost[]
+  fetched_at: string
+}
+
+export interface MetaMessengerReviewDeprovisionResponse {
+  message: string
+}
+
+export interface MetaMessengerReviewReplyConstraints {
+  text_only: true
+  max_length: number
+  manual_confirmation_required: true
+  ai_disabled: true
+  mark_read_disabled: true
+}
+
+export interface MetaMessengerReviewReplyEligibility {
+  eligible: boolean
+  reason_code: string
+  reason?: string
+  attestation_id?: string
+  expires_at?: string
+  page_id?: string
+  recipient_label?: string
+  constraints: MetaMessengerReviewReplyConstraints
+}
+
+export interface MetaMessengerReviewReplyRequest {
+  attestation_id: string
+  idempotency_key: string
+  text: string
+  manual_confirmation: true
+}
+
+export interface MetaMessengerReviewReplyMessage {
+  id: string
+  direction: 'incoming' | 'outgoing'
+  message_type: string
+  content: string
+  status: string
+  created_at: string
+}
+
+export interface MetaMessengerReviewReplyResponse {
+  message: MetaMessengerReviewReplyMessage
+  parts?: Array<{
+    type: string
+    text?: string
+    caption?: string
+  }>
+  audit: {
+    id: string
+    sent_at: string
+    page_id: string
+    recipient_label: string
+  }
+  idempotent?: boolean
 }
 
 export interface InboxConversation {
@@ -666,10 +737,7 @@ export const organizationEntitlementSupportService = {
       `/admin/organizations/${encodeURIComponent(organizationId)}/entitlements/threads-public-engagement/enable`,
       data,
     ),
-  revokeThreadsPublicEngagementSupport: (
-    organizationId: string,
-    data: RevokeThreadsPublicEngagementSupportRequest,
-  ) =>
+  revokeThreadsPublicEngagementSupport: (organizationId: string, data: RevokeThreadsPublicEngagementSupportRequest) =>
     api.post<APIEnvelope<RevokeThreadsPublicEngagementSupportResponse>>(
       `/admin/organizations/${encodeURIComponent(organizationId)}/entitlements/threads-public-engagement/revoke-support`,
       data,
@@ -885,6 +953,22 @@ export const channelsService = {
   createAccount: (data: Record<string, unknown>) => api.post('/channel-accounts', data),
   updateAccount: (id: string, data: Record<string, unknown>) => api.put(`/channel-accounts/${id}`, data),
   testAccount: (id: string) => api.post(`/channel-accounts/${id}/test`),
+  reviewPagePosts: (id: string) =>
+    api.get<APIEnvelope<MetaMessengerReviewPagePosts>>(`/channel-accounts/${encodeURIComponent(id)}/meta-page-posts`),
+  metaReviewReplyEligibility: (conversationId: string) =>
+    api.get<APIEnvelope<MetaMessengerReviewReplyEligibility>>(
+      `/conversations/${encodeURIComponent(conversationId)}/meta-review-reply`,
+    ),
+  sendMetaReviewReply: (conversationId: string, data: MetaMessengerReviewReplyRequest) =>
+    api.post<APIEnvelope<MetaMessengerReviewReplyResponse>>(
+      `/conversations/${encodeURIComponent(conversationId)}/meta-review-reply`,
+      data,
+    ),
+  deprovisionMetaMessengerReviewAccount: (id: string) =>
+    api.delete<APIEnvelope<MetaMessengerReviewDeprovisionResponse>>(
+      `/integrations/meta/messenger/review/${encodeURIComponent(id)}`,
+      { timeout: META_REVIEW_DEPROVISION_TIMEOUT_MS },
+    ),
   disconnectAccount: (id: string) => api.delete(`/channel-accounts/${id}`),
   conversations: (params?: Record<string, string | number | boolean>) => api.get('/conversations', { params }),
   allConversations: (params?: Record<string, string | number | boolean>) =>

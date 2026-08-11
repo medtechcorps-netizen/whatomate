@@ -239,3 +239,115 @@ func TestLoad_EnvMapsS3CompatibleStorage(t *testing.T) {
 	assert.Equal(t, "https://storage.railway.app", cfg.Storage.S3Endpoint)
 	assert.True(t, cfg.Storage.S3UsePathStyle)
 }
+
+func TestLoad_EnvMapsMetaRelayTrustConfig(t *testing.T) {
+	const expectedAccounts = `{"accounts":[{"rereply_account_id":"00000000-0000-4000-8000-000000000001"}]}`
+	const proofSecret = "deployment-meta-provider-proof-secret-at-least-32-bytes"
+	t.Setenv("WHATOMATE_META_RELAY__BASE_URL", "https://relay.example.test/meta")
+	t.Setenv("WHATOMATE_META_RELAY__EXPECTED_ACCOUNTS_JSON", expectedAccounts)
+	t.Setenv("WHATOMATE_META_RELAY__PROVIDER_PROOF_SECRET", proofSecret)
+
+	cfg, err := config.Load("")
+	require.NoError(t, err)
+	assert.Equal(t, "https://relay.example.test/meta", cfg.MetaRelay.BaseURL)
+	assert.Equal(t, expectedAccounts, cfg.MetaRelay.ExpectedAccountsJSON)
+	assert.Equal(t, proofSecret, cfg.MetaRelay.ProviderProofSecret)
+}
+
+func TestLoad_MetaRelayTrustConfigFailsClosedWhenPartial(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		base  string
+		proof string
+		want  string
+	}{
+		{
+			name:  "missing base URL",
+			proof: "deployment-meta-provider-proof-secret-at-least-32-bytes",
+			want:  "BASE_URL",
+		},
+		{
+			name: "missing provider proof",
+			base: "https://relay.example.test/meta",
+			want: "PROVIDER_PROOF_SECRET",
+		},
+		{
+			name:  "short provider proof",
+			base:  "https://relay.example.test/meta",
+			proof: "too-short",
+			want:  "at least 32 bytes",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("WHATOMATE_META_RELAY__BASE_URL", testCase.base)
+			t.Setenv("WHATOMATE_META_RELAY__EXPECTED_ACCOUNTS_JSON", `{"accounts":[]}`)
+			t.Setenv("WHATOMATE_META_RELAY__PROVIDER_PROOF_SECRET", testCase.proof)
+			_, err := config.Load("")
+			require.ErrorContains(t, err, testCase.want)
+		})
+	}
+}
+
+func TestLoad_EnvMapsManagedMetaMessengerOnboarding(t *testing.T) {
+	setMetaMessengerRelayTestEnv(t, "https://relay.example.test/meta")
+	t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__ENABLED", "true")
+	t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__APP_ID", "100000000000001")
+	t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__CONFIG_ID", "1720929458946813")
+	t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__OWNER_BUSINESS_ID", "2018290039073161")
+	t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__APP_SECRET", "server-only-meta-app-secret")
+	t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__GRAPH_API_VERSION", "v25.0")
+	t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__GRAPH_BASE_URL", "https://graph.facebook.com")
+	t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__TRUSTED_RELAY_BASE_URL", "https://relay.example.test/meta")
+
+	cfg, err := config.Load("")
+	require.NoError(t, err)
+
+	assert.True(t, cfg.MetaMessengerOnboarding.Enabled)
+	assert.Equal(t, "100000000000001", cfg.MetaMessengerOnboarding.AppID)
+	assert.Equal(t, "1720929458946813", cfg.MetaMessengerOnboarding.ConfigID)
+	assert.Equal(t, "2018290039073161", cfg.MetaMessengerOnboarding.OwnerBusinessID)
+	assert.Equal(t, "server-only-meta-app-secret", cfg.MetaMessengerOnboarding.AppSecret)
+	assert.Equal(t, "v25.0", cfg.MetaMessengerOnboarding.GraphAPIVersion)
+	assert.Equal(t, "https://graph.facebook.com", cfg.MetaMessengerOnboarding.GraphBaseURL)
+	assert.Equal(t, "https://relay.example.test/meta", cfg.MetaMessengerOnboarding.TrustedRelayBaseURL)
+}
+
+func TestLoad_ManagedMetaMessengerOnboardingFailsClosedWhenEnabledButPartial(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		appID         string
+		appSecret     string
+		trustedRelay  string
+		wantErrorText string
+	}{
+		{
+			name:          "missing app ID",
+			appSecret:     "server-only-meta-app-secret",
+			trustedRelay:  "https://relay.example.test/meta",
+			wantErrorText: "APP_ID",
+		},
+		{
+			name:          "missing app secret",
+			appID:         "100000000000001",
+			trustedRelay:  "https://relay.example.test/meta",
+			wantErrorText: "APP_SECRET",
+		},
+		{
+			name:          "missing trusted relay",
+			appID:         "100000000000001",
+			appSecret:     "server-only-meta-app-secret",
+			wantErrorText: "TRUSTED_RELAY_BASE_URL",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			setMetaMessengerRelayTestEnv(t, "https://relay.example.test/meta")
+			t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__ENABLED", "true")
+			t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__APP_ID", testCase.appID)
+			t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__APP_SECRET", testCase.appSecret)
+			t.Setenv("WHATOMATE_META_MESSENGER_ONBOARDING__TRUSTED_RELAY_BASE_URL", testCase.trustedRelay)
+
+			_, err := config.Load("")
+			require.ErrorContains(t, err, testCase.wantErrorText)
+		})
+	}
+}

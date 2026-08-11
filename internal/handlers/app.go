@@ -13,6 +13,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/access"
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/calling"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/storage"
@@ -190,6 +191,16 @@ func (a *App) ReadyCheck(r *fastglue.Request) error {
 			nil,
 			"",
 		)
+	}
+	if a.Config != nil {
+		if keyID, keyErr := channelapi.MetaProviderProofKeyID(
+			a.Config.MetaRelay.ProviderProofSecret,
+		); keyErr == nil {
+			r.RequestCtx.Response.Header.Set(
+				channelapi.RelayMetaProviderProofKeyIDHeader,
+				keyID,
+			)
+		}
 	}
 
 	return r.SendEnvelope(map[string]string{

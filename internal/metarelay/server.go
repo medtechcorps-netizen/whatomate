@@ -26,6 +26,7 @@ const (
 	defaultFacebookGraphBase  = "https://graph.facebook.com"
 	defaultInstagramGraphBase = "https://graph.instagram.com"
 	accountHealthTimeout      = 5 * time.Second
+	reviewReadinessTimeout    = 2 * time.Second
 	defaultOutboundTimeout    = 15 * time.Second
 	defaultSettlementTimeout  = 5 * time.Second
 )
@@ -55,6 +56,14 @@ func WithServerLogger(logger *slog.Logger) ServerOption {
 	return func(server *Server) {
 		if logger != nil {
 			server.logger = logger
+		}
+	}
+}
+
+func WithServerReviewBindingResolver(resolver ReviewBindingResolver) ServerOption {
+	return func(server *Server) {
+		if resolver != nil {
+			server.reviewResolver = resolver
 		}
 	}
 }
@@ -100,6 +109,14 @@ func NewServer(config *Config, store ServerStore, options ...ServerOption) (*Ser
 	if server.outboundTimeout <= 0 || server.settlementTimeout <= 0 {
 		return nil, errors.New("outbound relay timeouts must be positive")
 	}
+	if config.stagingMessengerReview() {
+		if config.DeploymentEnvironment != "staging" {
+			return nil, errors.New("messenger review relay is staging-only")
+		}
+		if server.reviewResolver == nil {
+			return nil, errors.New("messenger review binding resolver is required")
+		}
+	}
 	return server, nil
 }
 
@@ -115,6 +132,14 @@ func (s *Server) Handler() http.Handler {
 		"POST /v1/meta/messenger/webhook",
 		s.metaWebhookHandler(WebhookAppMessenger),
 	)
+	if s.config.stagingMessengerReview() {
+		// Keep /readyz as service-level readiness so a first review deployment
+		// can become healthy before onboarding creates the broker binding.
+		// Operators and review automation use /reviewz for the exact dynamic
+		// binding attestation.
+		mux.HandleFunc("GET /reviewz", s.handleReviewReady)
+		return securityHeaders(mux)
+	}
 	mux.HandleFunc(
 		"GET /v1/meta/instagram/webhook",
 		s.metaVerificationHandler(WebhookAppInstagramLogin),
@@ -128,22 +153,88 @@ func (s *Server) Handler() http.Handler {
 	return securityHeaders(mux)
 }
 
-func (s *Server) handleLive(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleReviewReady(w http.ResponseWriter, request *http.Request) {
+	if !s.config.stagingMessengerReview() || request.Method != http.MethodGet {
+		writeError(w, http.StatusNotFound, "unknown_route")
+		return
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), reviewReadinessTimeout)
+	defer cancel()
+
+	if err := s.store.Ping(ctx); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready")
+		return
+	}
+	binding, err := resolveFreshReviewBinding(ctx, s.reviewResolver)
+	if err != nil || validateReviewBinding(s.config, binding, s.now().UTC()) != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready")
+		return
+	}
+	if _, err := binding.account(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready")
+		return
+	}
+	keyID, err := channelapi.MetaProviderProofKeyID(
+		s.config.ReReplyProviderProofSecret,
+	)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready")
+		return
+	}
+	w.Header().Set(channelapi.RelayMetaProviderProofKeyIDHeader, keyID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type freshReviewBindingResolver interface {
+	resolveReviewBindingFresh(ctx context.Context) (ReviewBinding, error)
+}
+
+func resolveFreshReviewBinding(
+	ctx context.Context,
+	resolver ReviewBindingResolver,
+) (ReviewBinding, error) {
+	if fresh, ok := resolver.(freshReviewBindingResolver); ok {
+		return fresh.resolveReviewBindingFresh(ctx)
+	}
+	return resolver.ResolveReviewBinding(ctx)
+}
+
+func (s *Server) handleLive(w http.ResponseWriter, request *http.Request) {
+	if s.config.stagingMessengerReview() && request.Method != http.MethodGet {
+		writeError(w, http.StatusNotFound, "unknown_route")
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, request *http.Request) {
+	if s.config.stagingMessengerReview() && request.Method != http.MethodGet {
+		writeError(w, http.StatusNotFound, "unknown_route")
+		return
+	}
 	ctx, cancel := context.WithTimeout(request.Context(), 2*time.Second)
 	defer cancel()
 	if err := s.store.Ping(ctx); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "not_ready")
 		return
 	}
+	keyID, err := channelapi.MetaProviderProofKeyID(
+		s.config.ReReplyProviderProofSecret,
+	)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready")
+		return
+	}
+	w.Header().Set(channelapi.RelayMetaProviderProofKeyIDHeader, keyID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) metaVerificationHandler(webhookApp WebhookApp) http.HandlerFunc {
 	return func(w http.ResponseWriter, request *http.Request) {
+		if s.config.stagingMessengerReview() && request.Method != http.MethodGet {
+			writeError(w, http.StatusNotFound, "unknown_webhook")
+			return
+		}
 		s.handleMetaVerification(w, request, webhookApp)
 	}
 }
@@ -195,6 +286,10 @@ func (s *Server) handleMetaWebhook(
 		writeError(w, http.StatusUnauthorized, "invalid_signature")
 		return
 	}
+	if s.config.stagingMessengerReview() {
+		s.handleReviewMetaWebhook(w, request, webhookApp, raw)
+		return
+	}
 	jobs, err := NormalizeInbound(s.config, webhookApp, raw)
 	if err != nil {
 		switch {
@@ -231,6 +326,9 @@ func (s *Server) webhookCredentials(webhookApp WebhookApp) (string, string, bool
 	case WebhookAppMessenger:
 		return s.config.MessengerAppSecret, s.config.MessengerVerifyToken, true
 	case WebhookAppInstagramLogin:
+		if s.config.stagingMessengerReview() {
+			return "", "", false
+		}
 		return s.config.InstagramLoginAppSecret, s.config.InstagramLoginVerifyToken, true
 	default:
 		return "", "", false
@@ -238,6 +336,14 @@ func (s *Server) webhookCredentials(webhookApp WebhookApp) (string, string, bool
 }
 
 func (s *Server) handleAccountHealth(w http.ResponseWriter, request *http.Request) {
+	if s.config.stagingMessengerReview() {
+		writeError(w, http.StatusNotFound, "review_mode_inbound_only")
+		return
+	}
+	// A successful response contains account-specific readiness attestations.
+	// Never permit an intermediary to replay them after a token, subscription,
+	// or protected mapping has been revoked.
+	w.Header().Set("Cache-Control", "no-store, private")
 	account, ok := s.accountFromPath(request)
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown_account")
@@ -247,6 +353,11 @@ func (s *Server) handleAccountHealth(w http.ResponseWriter, request *http.Reques
 		len(request.TransferEncoding) != 0 ||
 		!verifySignedBody(account.reReplyOutboundSecret, request.Header.Get(ReReplySignatureHeader), nil) {
 		writeError(w, http.StatusUnauthorized, "invalid_signature")
+		return
+	}
+	if err := s.config.validateCurrentGovernance(account, s.now().UTC()); err != nil {
+		s.logger.Warn("Meta app governance review is no longer current", "account", account.Key)
+		writeError(w, http.StatusServiceUnavailable, "governance_review_stale")
 		return
 	}
 	ctx, cancel := context.WithTimeout(request.Context(), accountHealthTimeout)
@@ -263,6 +374,36 @@ func (s *Server) handleAccountHealth(w http.ResponseWriter, request *http.Reques
 		writeError(w, http.StatusServiceUnavailable, "account_unhealthy")
 		return
 	}
+	if err := s.validateWebhookSubscription(ctx, account); err != nil {
+		s.logger.Warn("Meta account webhook subscription check failed", "account", account.Key)
+		writeError(w, http.StatusServiceUnavailable, "account_unhealthy")
+		return
+	}
+	keyID, err := channelapi.MetaProviderProofKeyID(
+		s.config.ReReplyProviderProofSecret,
+	)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready")
+		return
+	}
+	w.Header().Set(channelapi.RelayReadinessHeader, channelapi.RelayReadinessVersion)
+	w.Header().Set(channelapi.RelayChannelHeader, string(account.Channel))
+	w.Header().Set(channelapi.RelayExternalAccountHeader, account.ExternalAccountID)
+	w.Header().Set(channelapi.RelayChannelAccountHeader, account.reReplyChannelAccountID)
+	w.Header().Set(channelapi.RelayOrganizationHeader, account.OrganizationID)
+	w.Header().Set(channelapi.RelayMetaBusinessHeader, account.MetaBusinessID)
+	w.Header().Set(channelapi.RelayMetaProviderProofKeyIDHeader, keyID)
+	w.Header().Set(
+		channelapi.RelayMetaProviderProofHeader,
+		channelapi.SignMetaProviderReadinessProof(
+			s.config.ReReplyProviderProofSecret,
+			account.Channel,
+			account.ExternalAccountID,
+			account.reReplyChannelAccountID,
+			account.OrganizationID,
+			account.MetaBusinessID,
+		),
+	)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -275,6 +416,9 @@ type graphBindingResponse struct {
 }
 
 func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfig) error {
+	if s.config.stagingMessengerReview() {
+		return errors.New("messenger review mode is inbound-only")
+	}
 	base, err := s.graphBase(account)
 	if err != nil {
 		return err
@@ -351,7 +495,83 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 	return nil
 }
 
+type graphSubscriptionsResponse struct {
+	Data []struct {
+		ID               string   `json:"id"`
+		SubscribedFields []string `json:"subscribed_fields"`
+	} `json:"data"`
+}
+
+// validateWebhookSubscription proves that the exact app configured for the
+// account's webhook route is currently installed on the exact Page or
+// Instagram professional account and subscribed to the messages field. App
+// callback verification alone is not enough: Meta also requires this
+// per-asset subscription before customer messages are delivered.
+func (s *Server) validateWebhookSubscription(ctx context.Context, account *AccountConfig) error {
+	if s.config.stagingMessengerReview() {
+		return errors.New("messenger review mode is inbound-only")
+	}
+	base, err := s.graphBase(account)
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf(
+		"%s/%s/%s/subscribed_apps",
+		strings.TrimRight(base, "/"),
+		url.PathEscape(s.config.GraphAPIVersion),
+		url.PathEscape(account.ExternalAccountID),
+	)
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return errors.New("invalid Graph subscription endpoint")
+	}
+	query := parsed.Query()
+	query.Set("fields", "id,subscribed_fields")
+	parsed.RawQuery = query.Encode()
+
+	providerRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return errors.New("invalid Graph subscription request")
+	}
+	providerRequest.Header.Set("Authorization", "Bearer "+account.accessToken)
+	providerRequest.Header.Set("Accept", "application/json")
+	providerRequest.Header.Set("User-Agent", "ReReply-Meta-Relay/1.0")
+
+	response, err := s.client.Do(providerRequest)
+	if err != nil {
+		return errors.New("graph subscription transport failure")
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+		_ = response.Body.Close()
+	}()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return errors.New("graph rejected subscription health request")
+	}
+	var subscriptions graphSubscriptionsResponse
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
+	if err := decoder.Decode(&subscriptions); err != nil || rejectTrailingJSON(decoder) != nil {
+		return errors.New("graph subscription response is invalid")
+	}
+	expectedAppID := strings.TrimSpace(s.config.appID(account.webhookApp()))
+	for _, subscription := range subscriptions.Data {
+		if strings.TrimSpace(subscription.ID) != expectedAppID {
+			continue
+		}
+		for _, field := range subscription.SubscribedFields {
+			if strings.EqualFold(strings.TrimSpace(field), "messages") {
+				return nil
+			}
+		}
+	}
+	return errors.New("required messages webhook subscription is missing")
+}
+
 func (s *Server) handleReReplyOutbound(w http.ResponseWriter, request *http.Request) {
+	if s.config.stagingMessengerReview() {
+		writeError(w, http.StatusNotFound, "review_mode_inbound_only")
+		return
+	}
 	account, ok := s.accountFromPath(request)
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown_account")
@@ -364,6 +584,18 @@ func (s *Server) handleReReplyOutbound(w http.ResponseWriter, request *http.Requ
 	}
 	if !verifySignedBody(account.reReplyOutboundSecret, request.Header.Get(ReReplySignatureHeader), raw) {
 		writeError(w, http.StatusUnauthorized, "invalid_signature")
+		return
+	}
+	if !constantTimeEqual(
+		strings.TrimSpace(request.Header.Get(channelapi.RelayMetaProviderProofHeader)),
+		channelapi.SignMetaProviderOutboundProof(s.config.ReReplyProviderProofSecret, raw),
+	) {
+		writeError(w, http.StatusUnauthorized, "invalid_provider_proof")
+		return
+	}
+	if err := s.config.validateCurrentGovernance(account, s.now().UTC()); err != nil {
+		s.logger.Warn("Blocked Meta outbound after governance review expired", "account", account.Key)
+		writeError(w, http.StatusServiceUnavailable, "governance_review_stale")
 		return
 	}
 
@@ -528,6 +760,19 @@ func (s *Server) sendGraph(
 	account *AccountConfig,
 	message channelapi.OutboundMessage,
 ) graphResult {
+	if s.config.stagingMessengerReview() {
+		return graphResult{
+			status: http.StatusNotFound,
+			body:   errorJSON("review_mode_inbound_only"),
+		}
+	}
+	if err := s.config.validateCurrentGovernance(account, s.now().UTC()); err != nil {
+		return graphResult{
+			status:    http.StatusServiceUnavailable,
+			body:      errorJSON("governance_review_stale"),
+			retryable: true,
+		}
+	}
 	payload := map[string]any{
 		"recipient": map[string]string{"id": message.Recipient.ExternalID},
 		"message":   map[string]any{"text": message.Parts[0].Text},

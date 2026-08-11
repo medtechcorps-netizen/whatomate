@@ -2,11 +2,15 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	configpkg "github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -66,13 +70,14 @@ func TestChannelMessageEnqueueWaitsForDisconnectAndFailsClosed(t *testing.T) {
 			}
 			enqueuePID <- backendPID
 			return session.Transaction(func(tx *gorm.DB) error {
-				return lockChannelAccountForMessageEnqueue(
+				_, err := lockChannelAccountForMessageEnqueue(
 					tx,
 					organization.ID,
 					conversation.ChannelAccountID,
 					conversation.Channel,
 					time.Now().UTC(),
 				)
+				return err
 			})
 		})
 	}()
@@ -88,6 +93,98 @@ func TestChannelMessageEnqueueWaitsForDisconnectAndFailsClosed(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		require.Fail(t, "message enqueue did not resume after disconnect committed")
 	}
+}
+
+func TestManagedMessengerEnqueueAllowsOAuthAlongsideOneRelayWebhook(t *testing.T) {
+	fixture := newChannelAccountConcurrencyFixture(t, false)
+	fixture.Account.Channel = models.ChannelMessenger
+	fixture.Account.Metadata["management_mode"] = metaMessengerManagementMode
+	require.NoError(t, fixture.App.DB.Model(&models.ChannelAccount{}).
+		Where("id = ? AND organization_id = ?", fixture.Account.ID, fixture.Organization.ID).
+		Updates(map[string]any{
+			"channel":  models.ChannelMessenger,
+			"metadata": fixture.Account.Metadata,
+		}).Error)
+
+	oauth := models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   fixture.Organization.ID,
+		ChannelAccountID: fixture.Account.ID,
+		Kind:             models.ChannelCredentialKindOAuth,
+		Version:          1,
+		CredentialBlob:   models.JSONB{"access_token": "encrypted-oauth-token"},
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "test:v1",
+		Metadata:         models.JSONB{},
+	}
+	require.NoError(t, fixture.App.DB.Create(&oauth).Error)
+
+	var locked *models.ChannelAccount
+	require.NoError(t, fixture.App.DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		locked, err = lockChannelAccountForMessageEnqueue(
+			tx,
+			fixture.Organization.ID,
+			fixture.Account.ID,
+			models.ChannelMessenger,
+			time.Now().UTC(),
+		)
+		return err
+	}))
+	require.Len(t, locked.Credentials, 2)
+	assert.Equal(
+		t,
+		1,
+		channelapi.CurrentCredentialCountOfKind(
+			locked.Credentials,
+			models.ChannelCredentialKindWebhook,
+			time.Now().UTC(),
+		),
+	)
+
+	duplicateWebhook := models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   fixture.Organization.ID,
+		ChannelAccountID: fixture.Account.ID,
+		Kind:             models.ChannelCredentialKindWebhook,
+		Version:          2,
+		CredentialBlob:   models.JSONB{"outbound_secret": "ambiguous"},
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "test:v1",
+		Metadata:         models.JSONB{},
+	}
+	require.NoError(t, fixture.App.DB.Create(&duplicateWebhook).Error)
+	err := fixture.App.DB.Transaction(func(tx *gorm.DB) error {
+		_, lockErr := lockChannelAccountForMessageEnqueue(
+			tx,
+			fixture.Organization.ID,
+			fixture.Account.ID,
+			models.ChannelMessenger,
+			time.Now().UTC(),
+		)
+		return lockErr
+	})
+	assert.ErrorIs(t, err, errChannelAccountUnavailableAtEnqueue)
+
+	require.NoError(t, fixture.App.DB.Model(&models.ChannelCredential{}).
+		Where(
+			"organization_id = ? AND channel_account_id = ? AND kind = ?",
+			fixture.Organization.ID,
+			fixture.Account.ID,
+			models.ChannelCredentialKindWebhook,
+		).
+		Update("status", models.ChannelCredentialStatusRevoked).Error)
+	err = fixture.App.DB.Transaction(func(tx *gorm.DB) error {
+		_, lockErr := lockChannelAccountForMessageEnqueue(
+			tx,
+			fixture.Organization.ID,
+			fixture.Account.ID,
+			models.ChannelMessenger,
+			time.Now().UTC(),
+		)
+		return lockErr
+	})
+	assert.ErrorIs(t, err, errChannelAccountUnavailableAtEnqueue)
 }
 
 func TestChannelAIEnqueueSerializesBeforeAccountDisableCancellation(t *testing.T) {
@@ -359,6 +456,285 @@ func TestUpdateChannelAccountRenameAndRetestCancelPriorAIJobs(t *testing.T) {
 	)
 }
 
+func TestUpdateMetaRelayOutboundRejectsInboundOlderThanLatestHealthCheck(t *testing.T) {
+	fixture := newChannelAccountConcurrencyFixture(t, false)
+	healthCheckedAt := time.Now().UTC()
+	staleInboundAt := healthCheckedAt.Add(-time.Second)
+	config := cloneJSONB(fixture.Account.Config)
+	config["outbound_enabled"] = false
+	require.NoError(t, fixture.App.DB.Model(&models.ChannelAccount{}).
+		Where("id = ? AND organization_id = ?", fixture.Account.ID, fixture.Organization.ID).
+		Updates(map[string]any{
+			"config":               config,
+			"status":               models.ChannelAccountStatusActive,
+			"last_health_check_at": healthCheckedAt,
+			"last_inbound_at":      staleInboundAt,
+			"last_error":           "",
+			"last_error_at":        nil,
+		}).Error)
+
+	request := testutil.NewJSONRequest(t, map[string]any{"outbound_enabled": true})
+	request.RequestCtx.Request.Header.SetMethod(fasthttp.MethodPut)
+	testutil.SetFullAuthContext(
+		request,
+		fixture.Organization.ID,
+		fixture.User.ID,
+		fixture.User.RoleID,
+		true,
+	)
+	testutil.SetPathParam(request, "id", fixture.Account.ID.String())
+	require.NoError(t, fixture.App.UpdateChannelAccount(request))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(request))
+	assert.Contains(t, string(testutil.GetResponseBody(request)), "fresh inbound Meta DM")
+
+	var persisted models.ChannelAccount
+	require.NoError(t, fixture.App.DB.First(&persisted, "id = ?", fixture.Account.ID).Error)
+	assert.Equal(t, false, persisted.Config["outbound_enabled"])
+}
+
+func TestValidateMetaRelayOutboundApproval(t *testing.T) {
+	checkedAt := time.Now().UTC().Add(-time.Minute)
+	inboundAt := checkedAt.Add(time.Nanosecond)
+	newReadyAccount := func() *models.ChannelAccount {
+		externalID := "17841400000000000"
+		return &models.ChannelAccount{
+			Channel:           models.ChannelInstagram,
+			Provider:          channelapi.RelayProvider,
+			ExternalAccountID: externalID,
+			Status:            models.ChannelAccountStatusActive,
+			Config:            models.JSONB{"identity_confirmed_id": externalID},
+			Metadata: models.JSONB{
+				channelapi.MetaProviderProofMetadataKey: channelapi.MetaProviderProofVersion,
+			},
+			LastHealthCheckAt: &checkedAt,
+			LastInboundAt:     &inboundAt,
+			Credentials: []models.ChannelCredential{{
+				BaseModel: models.BaseModel{ID: uuid.New()},
+				Kind:      models.ChannelCredentialKindWebhook,
+				Version:   1,
+				Status:    models.ChannelCredentialStatusActive,
+			}},
+		}
+	}
+
+	t.Run("accepts inbound after the health check", func(t *testing.T) {
+		require.NoError(t, validateMetaRelayOutboundApproval(newReadyAccount()))
+	})
+
+	t.Run("allows OAuth alongside the relay webhook", func(t *testing.T) {
+		account := newReadyAccount()
+		account.Credentials = append(account.Credentials, models.ChannelCredential{
+			Kind:   models.ChannelCredentialKindOAuth,
+			Status: models.ChannelCredentialStatusActive,
+		})
+		require.NoError(t, validateMetaRelayOutboundApproval(account))
+	})
+
+	t.Run("rejects duplicate relay webhooks", func(t *testing.T) {
+		account := newReadyAccount()
+		account.Credentials = append(account.Credentials, models.ChannelCredential{
+			Kind:   models.ChannelCredentialKindWebhook,
+			Status: models.ChannelCredentialStatusActive,
+		})
+		assert.ErrorContains(t, validateMetaRelayOutboundApproval(account), "successful current account test")
+	})
+
+	t.Run("requires exact identity", func(t *testing.T) {
+		account := newReadyAccount()
+		account.Config["identity_confirmed_id"] = " " + account.ExternalAccountID
+		assert.ErrorContains(t, validateMetaRelayOutboundApproval(account), "exact Meta account identity")
+	})
+
+	t.Run("requires successful health evidence", func(t *testing.T) {
+		account := newReadyAccount()
+		account.LastHealthCheckAt = nil
+		assert.ErrorContains(t, validateMetaRelayOutboundApproval(account), "successful current account test")
+	})
+
+	t.Run("requires a current credential", func(t *testing.T) {
+		account := newReadyAccount()
+		account.Credentials = nil
+		assert.ErrorContains(t, validateMetaRelayOutboundApproval(account), "successful current account test")
+	})
+
+	t.Run("rejects historical inbound", func(t *testing.T) {
+		account := newReadyAccount()
+		staleInbound := checkedAt.Add(-time.Nanosecond)
+		account.LastInboundAt = &staleInbound
+		assert.ErrorContains(t, validateMetaRelayOutboundApproval(account), "fresh inbound Meta DM")
+	})
+
+	t.Run("rejects inbound exactly at the health check boundary", func(t *testing.T) {
+		account := newReadyAccount()
+		account.LastInboundAt = account.LastHealthCheckAt
+		assert.ErrorContains(t, validateMetaRelayOutboundApproval(account), "fresh inbound Meta DM")
+	})
+
+	t.Run("does not change non-Meta behavior", func(t *testing.T) {
+		account := &models.ChannelAccount{
+			Channel:  models.ChannelEmail,
+			Provider: channelapi.RelayProvider,
+		}
+		require.NoError(t, validateMetaRelayOutboundApproval(account))
+	})
+}
+
+func TestValidateMetaRelayOutboundSecretRequiresStrongExactBytes(t *testing.T) {
+	require.NoError(t, validateMetaRelayOutboundSecret(
+		"meta-outbound-secret-material-at-least-32-bytes",
+	))
+	require.ErrorContains(t, validateMetaRelayOutboundSecret("short"), "at least 32")
+	require.ErrorContains(
+		t,
+		validateMetaRelayOutboundSecret(" meta-outbound-secret-material-at-least-32-bytes"),
+		"without surrounding whitespace",
+	)
+	// The contract is bytes, not rune count. Sixteen two-byte UTF-8 runes are
+	// accepted because they provide 32 bytes of key material.
+	require.NoError(t, validateMetaRelayOutboundSecret("éééééééééééééééé"))
+}
+
+func TestSuccessfulMetaAccountTestPersistsCurrentProviderProofMarker(t *testing.T) {
+	fixture := newChannelAccountConcurrencyFixture(t, true)
+	const providerProofSecret = "handler-meta-provider-proof-secret-at-least-32-bytes"
+	const metaBusinessID = "200000000000001"
+
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set(channelapi.RelayReadinessHeader, channelapi.RelayReadinessVersion)
+		w.Header().Set(channelapi.RelayChannelHeader, string(fixture.Account.Channel))
+		w.Header().Set(channelapi.RelayExternalAccountHeader, fixture.Account.ExternalAccountID)
+		w.Header().Set(channelapi.RelayChannelAccountHeader, fixture.Account.ID.String())
+		w.Header().Set(channelapi.RelayOrganizationHeader, fixture.Organization.ID.String())
+		w.Header().Set(channelapi.RelayMetaBusinessHeader, metaBusinessID)
+		w.Header().Set(
+			channelapi.RelayMetaProviderProofHeader,
+			channelapi.SignMetaProviderReadinessProof(
+				providerProofSecret,
+				fixture.Account.Channel,
+				fixture.Account.ExternalAccountID,
+				fixture.Account.ID.String(),
+				fixture.Organization.ID.String(),
+				metaBusinessID,
+			),
+		)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer relay.Close()
+	relayURL := relay.URL + "/v1/accounts/instagram/" + fixture.Account.ExternalAccountID
+	config := cloneJSONB(fixture.Account.Config)
+	config["relay_url"] = relayURL
+	require.NoError(t, fixture.App.DB.Model(&models.ChannelAccount{}).
+		Where("id = ? AND organization_id = ?", fixture.Account.ID, fixture.Organization.ID).
+		Updates(map[string]any{"config": config, "metadata": models.JSONB{}}).Error)
+	require.NoError(t, fixture.App.DB.Model(&models.ChannelCredential{}).
+		Where("organization_id = ? AND channel_account_id = ?", fixture.Organization.ID, fixture.Account.ID).
+		Update("credential_blob", models.JSONB{
+			"inbound_secret":  "tenant-inbound-secret",
+			"outbound_secret": "tenant-outbound-secret",
+		}).Error)
+	fixture.App.HTTPClient = relay.Client()
+	fixture.App.Config.App.Environment = "development"
+	fixture.App.Config.MetaRelay = configpkg.MetaRelayConfig{
+		BaseURL:             relay.URL,
+		ProviderProofSecret: providerProofSecret,
+		ExpectedAccountsJSON: fmt.Sprintf(`{"accounts":[{
+			"organization_id":%q,
+			"meta_business_id":%q,
+			"channel":"instagram",
+			"external_account_id":%q,
+			"rereply_account_id":%q
+		}]}`, fixture.Organization.ID.String(), metaBusinessID, fixture.Account.ExternalAccountID, fixture.Account.ID.String()),
+	}
+
+	request := testutil.NewJSONRequest(t, map[string]any{})
+	request.RequestCtx.Request.Header.SetMethod(fasthttp.MethodPost)
+	testutil.SetFullAuthContext(
+		request,
+		fixture.Organization.ID,
+		fixture.User.ID,
+		fixture.User.RoleID,
+		true,
+	)
+	testutil.SetPathParam(request, "id", fixture.Account.ID.String())
+	require.NoError(t, fixture.App.TestChannelAccount(request))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request), string(testutil.GetResponseBody(request)))
+
+	var persisted models.ChannelAccount
+	require.NoError(t, fixture.App.DB.First(&persisted, "id = ?", fixture.Account.ID).Error)
+	require.Equal(
+		t,
+		channelapi.MetaProviderProofVersion,
+		persisted.Metadata[channelapi.MetaProviderProofMetadataKey],
+	)
+	require.Equal(t, false, persisted.Config["outbound_enabled"])
+	require.Equal(t, false, persisted.Config["ai_reply_enabled"])
+	require.NotNil(t, persisted.LastHealthCheckAt)
+}
+
+func TestMetaRelayConfigChangeInvalidatesSuccessfulHealth(t *testing.T) {
+	fixture := newChannelAccountConcurrencyFixture(t, true)
+
+	updateChannelAccountForConcurrencyTest(
+		t,
+		fixture,
+		map[string]any{
+			"config": map[string]any{
+				"relay_url":             fixture.Account.Config["relay_url"],
+				"identity_confirmed_id": "different-meta-asset",
+				"display_option":        fixture.Account.Config["display_option"],
+			},
+		},
+	)
+
+	var account models.ChannelAccount
+	require.NoError(t, fixture.App.DB.First(&account, "id = ?", fixture.Account.ID).Error)
+	assert.Equal(t, models.ChannelAccountStatusPending, account.Status)
+	assert.Nil(t, account.LastHealthCheckAt)
+	assert.Equal(t, false, account.Config["outbound_enabled"])
+	assert.Equal(t, false, account.Config["ai_reply_enabled"])
+	assert.NotContains(t, account.Metadata, channelapi.MetaProviderProofMetadataKey)
+}
+
+func TestMetaRelayConfigChangeAcceptsEchoedEnabledFlagsAndForcesDeliveryOff(t *testing.T) {
+	fixture := newChannelAccountConcurrencyFixture(t, true)
+
+	updateChannelAccountForConcurrencyTest(
+		t,
+		fixture,
+		map[string]any{
+			"config": map[string]any{
+				"relay_url":             fixture.Account.Config["relay_url"],
+				"identity_confirmed_id": "different-meta-asset",
+				"display_option":        fixture.Account.Config["display_option"],
+			},
+			"outbound_enabled": true,
+			"ai_reply_enabled": true,
+		},
+	)
+
+	var account models.ChannelAccount
+	require.NoError(t, fixture.App.DB.First(&account, "id = ?", fixture.Account.ID).Error)
+	assert.Equal(t, models.ChannelAccountStatusPending, account.Status)
+	assert.Nil(t, account.LastHealthCheckAt)
+	assert.Equal(t, false, account.Config["outbound_enabled"])
+	assert.Equal(t, false, account.Config["ai_reply_enabled"])
+	assert.NotContains(t, account.Metadata, channelapi.MetaProviderProofMetadataKey)
+}
+
+func TestMetaRelayOutboundDisableForcesEchoedAIFlagOff(t *testing.T) {
+	fixture := newChannelAccountConcurrencyFixture(t, true)
+
+	updateChannelAccountForConcurrencyTest(t, fixture, map[string]any{
+		"outbound_enabled": false,
+		"ai_reply_enabled": true,
+	})
+
+	var account models.ChannelAccount
+	require.NoError(t, fixture.App.DB.First(&account, "id = ?", fixture.Account.ID).Error)
+	assert.Equal(t, false, account.Config["outbound_enabled"])
+	assert.Equal(t, false, account.Config["ai_reply_enabled"])
+}
+
 func TestChannelAccountValidationFingerprintDetectsStaleInputs(t *testing.T) {
 	account := &models.ChannelAccount{
 		BaseModel:         models.BaseModel{ID: uuid.New()},
@@ -496,24 +872,58 @@ func newChannelAccountConcurrencyFixture(
 		organization.ID,
 		user.ID,
 	)
+	externalAccountID := testutil.UniqueNumericID(t, "7")
+	healthCheckedAt := time.Now().UTC().Add(-2 * time.Minute)
+	lastInboundAt := healthCheckedAt.Add(time.Minute)
 	account := &models.ChannelAccount{
 		BaseModel:         models.BaseModel{ID: uuid.New()},
 		OrganizationID:    organization.ID,
 		Channel:           models.ChannelInstagram,
 		Provider:          channelapi.RelayProvider,
 		Name:              "concurrency-" + uuid.NewString(),
-		ExternalAccountID: "external-" + uuid.NewString(),
+		ExternalAccountID: externalAccountID,
 		Status:            models.ChannelAccountStatusActive,
 		Capabilities:      models.JSONB{"text": true},
 		Config: models.JSONB{
-			"relay_url":        "https://relay-original.example.com/meta",
-			"outbound_enabled": true,
-			"ai_reply_enabled": aiReplyEnabled,
-			"display_option":   "preserved",
+			"relay_url":             "https://relay-original.example.com/meta/v1/accounts/instagram/" + externalAccountID,
+			"outbound_enabled":      true,
+			"ai_reply_enabled":      aiReplyEnabled,
+			"display_option":        "preserved",
+			"identity_confirmed_id": externalAccountID,
 		},
-		Metadata: models.JSONB{},
+		Metadata: models.JSONB{
+			channelapi.MetaProviderProofMetadataKey: channelapi.MetaProviderProofVersion,
+		},
+		LastHealthCheckAt: &healthCheckedAt,
+		LastInboundAt:     &lastInboundAt,
 	}
 	require.NoError(t, db.Create(account).Error)
+	credential := models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   organization.ID,
+		ChannelAccountID: account.ID,
+		Kind:             models.ChannelCredentialKindWebhook,
+		Version:          1,
+		CredentialBlob:   models.JSONB{"test": "credential"},
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "test:v1",
+		Metadata:         models.JSONB{},
+	}
+	require.NoError(t, db.Create(&credential).Error)
+	account.Credentials = []models.ChannelCredential{credential}
+	app.Config = &configpkg.Config{
+		MetaRelay: configpkg.MetaRelayConfig{
+			BaseURL:             "https://relay-original.example.com/meta",
+			ProviderProofSecret: "handler-meta-provider-proof-secret-at-least-32-bytes",
+			ExpectedAccountsJSON: fmt.Sprintf(`{"accounts":[{
+                "organization_id":%q,
+                "meta_business_id":"200000000000001",
+                "channel":"instagram",
+                "external_account_id":%q,
+                "rereply_account_id":%q
+            }]}`, organization.ID.String(), externalAccountID, account.ID.String()),
+		},
+	}
 	return channelAccountConcurrencyFixture{
 		App:          app,
 		Organization: organization,

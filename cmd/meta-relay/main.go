@@ -49,19 +49,34 @@ func run(logger *slog.Logger) error {
 		return errors.New("redis durability boundary is unavailable")
 	}
 
-	server, err := metarelay.NewServer(
-		config,
-		store,
-		metarelay.WithServerLogger(logger),
-	)
+	serverOptions := []metarelay.ServerOption{metarelay.WithServerLogger(logger)}
+	workerOptions := []metarelay.WorkerOption{metarelay.WithWorkerLogger(logger)}
+	if config.RuntimeMode == metarelay.RuntimeModeStagingMessengerReview {
+		ingressBroker, brokerErr := metarelay.NewReviewBrokerClient(
+			config,
+			config.ReviewBindingCacheTTL,
+		)
+		if brokerErr != nil {
+			return brokerErr
+		}
+		workerBroker, brokerErr := metarelay.NewReviewBrokerClient(config, 0)
+		if brokerErr != nil {
+			return brokerErr
+		}
+		serverOptions = append(
+			serverOptions,
+			metarelay.WithServerReviewBindingResolver(ingressBroker),
+		)
+		workerOptions = append(
+			workerOptions,
+			metarelay.WithWorkerReviewBindingResolver(workerBroker),
+		)
+	}
+	server, err := metarelay.NewServer(config, store, serverOptions...)
 	if err != nil {
 		return err
 	}
-	worker, err := metarelay.NewWorker(
-		config,
-		store,
-		metarelay.WithWorkerLogger(logger),
-	)
+	worker, err := metarelay.NewWorker(config, store, workerOptions...)
 	if err != nil {
 		return err
 	}

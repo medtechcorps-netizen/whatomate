@@ -1,6 +1,7 @@
 package middleware_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -484,11 +485,21 @@ func TestSecurityHeaders(t *testing.T) {
 	assert.Equal(t, "DENY", string(headers.Peek("X-Frame-Options")))
 	assert.Equal(t, "strict-origin-when-cross-origin", string(headers.Peek("Referrer-Policy")))
 	assert.Equal(t, "max-age=31536000; includeSubDomains", string(headers.Peek("Strict-Transport-Security")))
-	csp := string(headers.Peek("Content-Security-Policy"))
-	assert.Contains(t, csp, "default-src 'self'")
-	assert.Contains(t, csp, "frame-ancestors 'none'")
-	assert.Contains(t, csp, "script-src 'self' https://connect.facebook.net")
-	assert.Contains(t, csp, "frame-src 'self' https://www.facebook.com https://web.facebook.com https://staticxx.facebook.com")
+	policy := string(headers.Peek("Content-Security-Policy"))
+	directives := make(map[string]string)
+	for _, directive := range strings.Split(policy, ";") {
+		fields := strings.Fields(directive)
+		if len(fields) == 0 {
+			continue
+		}
+		directives[fields[0]] = strings.Join(fields[1:], " ")
+	}
+
+	assert.Equal(t, "'self'", directives["default-src"])
+	assert.Equal(t, "'self' https://connect.facebook.net", directives["script-src"])
+	assert.Equal(t, "'self' https://www.facebook.com https://web.facebook.com https://staticxx.facebook.com", directives["frame-src"])
+	assert.Equal(t, "'none'", directives["frame-ancestors"])
+	assert.NotContains(t, policy, "*.facebook.com")
 }
 
 func TestJWTClaims(t *testing.T) {

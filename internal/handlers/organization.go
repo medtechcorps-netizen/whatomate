@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
@@ -637,6 +638,35 @@ func (a *App) DeleteOrganization(r *fastglue.Request) error {
 				"closed_at": now,
 			}).Error; err != nil {
 			return err
+		}
+
+		// Provider-routable Meta bindings must be removed through their audited
+		// lifecycle before the tenant disappears. Soft-deleting only the
+		// organization would leave the public channel resolver, encrypted
+		// credentials, and global provider-identity reservation live. The
+		// organization row lock acquired above is also the creation fence shared
+		// by each of these protected connection flows.
+		var protectedBindingCount int64
+		if err := tx.Model(&models.ChannelAccount{}).
+			Where(
+				`organization_id = ? AND (
+					(channel IN ? AND LOWER(TRIM(provider)) = ?) OR
+					(channel = ? AND LOWER(TRIM(provider)) = ?)
+				)`,
+				targetOrgID,
+				[]models.Channel{models.ChannelMessenger, models.ChannelInstagram},
+				channelapi.RelayProvider,
+				models.ChannelThreads,
+				channelapi.ThreadsProvider,
+			).
+			Count(&protectedBindingCount).Error; err != nil {
+			return err
+		}
+		if protectedBindingCount > 0 {
+			return &organizationDeleteClientError{
+				status:  fasthttp.StatusConflict,
+				message: "Audited deprovision is required for Messenger, Instagram, or Threads channel bindings before deleting this organization",
+			}
 		}
 
 		if err := audit.LogAudit(

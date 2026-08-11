@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	appwebsocket "github.com/shridarpatil/whatomate/internal/websocket"
@@ -95,6 +96,18 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
 	}
 	body := r.RequestCtx.PostBody()
+	headers := relayHTTPHeaders(r)
+	if reserved, preauthErr := a.preauthorizeMetaMessengerReviewWebhook(
+		channelAccountID,
+		headers,
+		body,
+		time.Now().UTC(),
+	); reserved && preauthErr != nil {
+		// Do not reveal whether the pinned account exists in tenant storage or
+		// which deployment proof field failed. Most importantly, return before
+		// tenant resolution, RLS setup, or credential loading.
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+	}
 	if len(body) == 0 || len(body) > channelapi.RelayWebhookMaxBodyBytes {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid webhook body", nil, "")
 	}
@@ -148,7 +161,6 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
 	}
 
-	headers := relayHTTPHeaders(r)
 	if err := adapter.VerifyWebhook(&account, headers, body); err != nil {
 		a.Log.Warn(
 			"Rejected channel webhook signature",
@@ -198,6 +210,21 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 	shouldProcess := false
 	retry := false
 	if err := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
+		if a.configuredMetaMessengerReviewAccount(&account) ||
+			metaMessengerReviewAccountMarker(&account) {
+			currentAccount, bindingErr := a.lockMetaMessengerReviewWebhookPersistenceBinding(
+				tx,
+				orgID,
+				account.ID,
+				headers,
+				body,
+			)
+			if bindingErr != nil {
+				return bindingErr
+			}
+			account = *currentAccount
+			rawEvent.ChannelAccountID = account.ID
+		}
 		if account.Channel == models.ChannelThreads {
 			currentAccount, bindingErr := lockThreadsWebhookPersistenceBinding(
 				tx,
@@ -217,6 +244,9 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		shouldProcess, retry, claimErr = persistOrClaimRawInboundEvent(tx, &rawEvent)
 		return claimErr
 	}); err != nil {
+		if errors.Is(err, errMetaMessengerReviewWebhookInactive) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+		}
 		if errors.Is(err, errThreadsWebhookBindingInactive) {
 			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
 		}
@@ -358,13 +388,37 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
 			return err
 		}
-		currentAccount, err := loadChannelAccount(tx, orgID, account.ID, false)
-		if err != nil {
-			return err
+		var currentAccount *models.ChannelAccount
+		if a.configuredMetaMessengerReviewAccount(&account) ||
+			metaMessengerReviewAccountMarker(&account) {
+			var bindingErr error
+			currentAccount, bindingErr = a.lockMetaMessengerReviewWebhookPersistenceBinding(
+				tx,
+				orgID,
+				account.ID,
+				headers,
+				body,
+			)
+			if bindingErr != nil {
+				return bindingErr
+			}
+		} else {
+			var loadErr error
+			currentAccount, loadErr = loadChannelAccount(tx, orgID, account.ID, false)
+			if loadErr != nil {
+				return loadErr
+			}
 		}
 		account = *currentAccount
+		var latestNewInboundAnchor time.Time
 		for i := range events {
-			if err := processNormalizedChannelEvent(tx, &account, &events[i], rawEvent.ReceivedAt); err != nil {
+			if err := processNormalizedChannelEvent(
+				tx,
+				&account,
+				&events[i],
+				rawEvent.ReceivedAt,
+				&latestNewInboundAnchor,
+			); err != nil {
 				return fmt.Errorf("process normalized event %d: %w", i, err)
 			}
 		}
@@ -378,15 +432,22 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 			}).Error; err != nil {
 			return err
 		}
+		if latestNewInboundAnchor.IsZero() ||
+			(account.LastInboundAt != nil && !latestNewInboundAnchor.After(*account.LastInboundAt)) {
+			return nil
+		}
 		return tx.Model(&models.ChannelAccount{}).
 			Where("id = ? AND organization_id = ?", account.ID, orgID).
 			Updates(map[string]any{
-				"last_inbound_at": now,
+				"last_inbound_at": latestNewInboundAnchor,
 				"updated_at":      now,
 			}).Error
 	})
 	if processErr != nil {
 		markInboundEventFailed(a.DB, orgID, rawEvent.ID, "processing_failed", processErr)
+		if errors.Is(processErr, errMetaMessengerReviewWebhookInactive) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+		}
 		a.Log.Error(
 			"Failed to process channel webhook",
 			"error",
@@ -659,6 +720,7 @@ func processNormalizedChannelEvent(
 	account *models.ChannelAccount,
 	event *channelapi.InboundEvent,
 	acceptedAt time.Time,
+	latestNewInboundAnchor ...*time.Time,
 ) error {
 	if acceptedAt.IsZero() {
 		acceptedAt = time.Now().UTC()
@@ -699,7 +761,12 @@ func processNormalizedChannelEvent(
 
 	switch event.Type {
 	case channelapi.NormalizedEventTypeMessage:
-		err = persistInboundChannelMessage(tx, account, event, event.Message, acceptedAt)
+		var createdAnchor time.Time
+		err = persistInboundChannelMessage(tx, account, event, event.Message, acceptedAt, &createdAnchor)
+		if err == nil && !createdAnchor.IsZero() && len(latestNewInboundAnchor) > 0 && latestNewInboundAnchor[0] != nil &&
+			(latestNewInboundAnchor[0].IsZero() || createdAnchor.After(*latestNewInboundAnchor[0])) {
+			*latestNewInboundAnchor[0] = createdAnchor
+		}
 	case channelapi.NormalizedEventTypeMessageStatus:
 		err = persistChannelMessageStatus(tx, account, event, event.MessageStatus)
 	case channelapi.NormalizedEventTypeRead:
@@ -729,7 +796,11 @@ func persistInboundChannelMessage(
 	event *channelapi.InboundEvent,
 	inbound *channelapi.InboundMessage,
 	acceptedAt time.Time,
+	createdAnchor *time.Time,
 ) error {
+	if createdAnchor != nil {
+		*createdAnchor = time.Time{}
+	}
 	if inbound == nil {
 		return errors.New("normalized message payload is missing")
 	}
@@ -740,6 +811,9 @@ func persistInboundChannelMessage(
 	}
 	if inbound.Sender.Role != models.ConversationParticipantRoleCustomer {
 		return errors.New("normalized inbound message sender role must be customer")
+	}
+	if len(inbound.Parts) == 0 {
+		return errors.New("normalized inbound message must contain at least one message part")
 	}
 	if acceptedAt.IsZero() {
 		acceptedAt = time.Now().UTC()
@@ -809,6 +883,9 @@ func persistInboundChannelMessage(
 	}
 	if err := tx.Create(&message).Error; err != nil {
 		return err
+	}
+	if createdAnchor != nil {
+		*createdAnchor = serviceWindowOpenedAt
 	}
 	parts := persistentMessageParts(account.OrganizationID, conversation.ID, message.ID, inbound.Parts)
 	if len(parts) > 0 {
@@ -988,22 +1065,31 @@ func findOrCreateChannelIdentity(
 		}
 	}
 
-	address := legacyContactAddress(participant)
-	contact := models.Contact{
-		OrganizationID:  orgID,
-		PhoneNumber:     address,
-		ProfileName:     truncateChannelRunes(participant.DisplayName, 255),
-		WhatsAppAccount: account.Name,
-		LastMessageAt:   &seenAt,
-		LastInboundAt:   &seenAt,
-		IsRead:          false,
-		Tags:            models.JSONBArray{},
-		Metadata: models.JSONB{
-			"channel":  account.Channel,
-			"provider": account.Provider,
-		},
-	}
-	if err := tx.Create(&contact).Error; err != nil {
+	contact, err := findRenewedMessengerLineageContact(
+		tx,
+		account,
+		participant.ExternalID,
+	)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		address := legacyContactAddress(participant)
+		contact = &models.Contact{
+			OrganizationID:  orgID,
+			PhoneNumber:     address,
+			ProfileName:     truncateChannelRunes(participant.DisplayName, 255),
+			WhatsAppAccount: account.Name,
+			LastMessageAt:   &seenAt,
+			LastInboundAt:   &seenAt,
+			IsRead:          false,
+			Tags:            models.JSONBArray{},
+			Metadata: models.JSONB{
+				"channel":  account.Channel,
+				"provider": account.Provider,
+			},
+		}
+		if err := tx.Create(contact).Error; err != nil {
+			return nil, nil, err
+		}
+	} else if err != nil {
 		return nil, nil, err
 	}
 	identity = models.ContactIdentity{
@@ -1023,7 +1109,66 @@ func findOrCreateChannelIdentity(
 	if err := tx.Create(&identity).Error; err != nil {
 		return nil, nil, err
 	}
-	return &identity, &contact, nil
+	return &identity, contact, nil
+}
+
+// findRenewedMessengerLineageContact preserves the CRM contact when an exact
+// Messenger Page is reconnected after its previous channel account was
+// tombstoned. A PSID by itself is not a safe contact key: the prior identity
+// must belong to the same tenant, channel, provider, and provider account.
+func findRenewedMessengerLineageContact(
+	tx *gorm.DB,
+	account *models.ChannelAccount,
+	externalID string,
+) (*models.Contact, error) {
+	if account == nil ||
+		strings.TrimSpace(account.ExternalAccountID) == "" ||
+		strings.TrimSpace(externalID) == "" ||
+		account.Channel != models.ChannelMessenger ||
+		account.Provider != channelapi.RelayProvider {
+		return nil, gorm.ErrRecordNotFound
+	}
+
+	type lineageContact struct {
+		ContactID uuid.UUID `gorm:"column:contact_id"`
+	}
+	var candidates []lineageContact
+	if err := tx.Model(&models.ContactIdentity{}).
+		Select("DISTINCT contact_identities.contact_id").
+		Joins(`JOIN channel_accounts AS lineage_accounts
+			ON lineage_accounts.id = contact_identities.channel_account_id
+			AND lineage_accounts.organization_id = contact_identities.organization_id`).
+		Where(
+			`contact_identities.organization_id = ?
+				AND contact_identities.channel = ?
+				AND contact_identities.external_id = ?
+				AND lineage_accounts.organization_id = ?
+				AND lineage_accounts.channel = ?
+				AND lineage_accounts.provider = ?
+				AND lineage_accounts.external_account_id = ?
+				AND lineage_accounts.deleted_at IS NOT NULL`,
+			account.OrganizationID,
+			account.Channel,
+			externalID,
+			account.OrganizationID,
+			account.Channel,
+			account.Provider,
+			account.ExternalAccountID,
+		).
+		Find(&candidates).Error; err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+	if len(candidates) != 1 || candidates[0].ContactID == uuid.Nil {
+		return nil, errors.New("renewed Messenger identity lineage maps to multiple contacts")
+	}
+	return contactutil.ResolveCanonicalContactForUpdate(
+		tx,
+		account.OrganizationID,
+		candidates[0].ContactID,
+	)
 }
 
 func findOrCreateInboxConversation(
@@ -1308,9 +1453,12 @@ func resolveChannelWebhookOrganization(
 	if !rlsEnabled {
 		var account models.ChannelAccount
 		if err := db.Model(&models.ChannelAccount{}).
-			Select("organization_id").
+			Select("channel_accounts.organization_id").
+			Joins(
+				"INNER JOIN organizations ON organizations.id = channel_accounts.organization_id AND organizations.deleted_at IS NULL",
+			).
 			Where(
-				"id = ? AND status IN ?",
+				"channel_accounts.id = ? AND channel_accounts.status IN ?",
 				channelAccountID,
 				[]models.ChannelAccountStatus{
 					models.ChannelAccountStatusPending,

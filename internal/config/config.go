@@ -3,33 +3,104 @@ package config
 import (
 	"crypto/hmac"
 	"crypto/sha1" //nolint:gosec // SHA-1 is mandated by the coturn TURN REST API (RFC draft)
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	pathpkg "path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/google/uuid"
 	"github.com/knadh/koanf/parsers/toml"
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+	"github.com/shridarpatil/whatomate/internal/metareview"
 )
 
 // Config holds all configuration for the application
 type Config struct {
-	App                 AppConfig                 `koanf:"app"`
-	Server              ServerConfig              `koanf:"server"`
-	Database            DatabaseConfig            `koanf:"database"`
-	Redis               RedisConfig               `koanf:"redis"`
-	JWT                 JWTConfig                 `koanf:"jwt"`
-	WhatsApp            WhatsAppConfig            `koanf:"whatsapp"`
-	AI                  AIConfig                  `koanf:"ai"`
-	Storage             StorageConfig             `koanf:"storage"`
-	DefaultAdmin        DefaultAdminConfig        `koanf:"default_admin"`
-	RateLimit           RateLimitConfig           `koanf:"rate_limit"`
-	Cookie              CookieConfig              `koanf:"cookie"`
-	Calling             CallingConfig             `koanf:"calling"`
-	TTS                 TTSConfig                 `koanf:"tts"`
-	GoogleSearchConsole GoogleSearchConsoleConfig `koanf:"google_search_console"`
+	App                      AppConfig                      `koanf:"app"`
+	Server                   ServerConfig                   `koanf:"server"`
+	Database                 DatabaseConfig                 `koanf:"database"`
+	Redis                    RedisConfig                    `koanf:"redis"`
+	JWT                      JWTConfig                      `koanf:"jwt"`
+	WhatsApp                 WhatsAppConfig                 `koanf:"whatsapp"`
+	AI                       AIConfig                       `koanf:"ai"`
+	Storage                  StorageConfig                  `koanf:"storage"`
+	DefaultAdmin             DefaultAdminConfig             `koanf:"default_admin"`
+	RateLimit                RateLimitConfig                `koanf:"rate_limit"`
+	Cookie                   CookieConfig                   `koanf:"cookie"`
+	Calling                  CallingConfig                  `koanf:"calling"`
+	TTS                      TTSConfig                      `koanf:"tts"`
+	GoogleSearchConsole      GoogleSearchConsoleConfig      `koanf:"google_search_console"`
+	MetaRelay                MetaRelayConfig                `koanf:"meta_relay"`
+	MetaMessengerOnboarding  MetaMessengerOnboardingConfig  `koanf:"meta_messenger_onboarding"`
+	MetaMessengerReviewRelay MetaMessengerReviewRelayConfig `koanf:"meta_messenger_review_relay"`
+}
+
+const (
+	defaultMetaMessengerConfigID        = "1720929458946813"
+	defaultMetaMessengerOwnerBusinessID = "2018290039073161"
+	defaultMetaMessengerGraphAPIVersion = "v25.0"
+	defaultMetaMessengerGraphBaseURL    = "https://graph.facebook.com"
+)
+
+// MetaMessengerOnboardingConfig controls the managed Facebook Login for
+// Business flow used to stage Messenger Page accounts. It is deliberately
+// separate from MetaRelayConfig: the provider app owner is not evidence that a
+// tenant owns a Page, and relay inventory remains a protected deployment fact.
+// AppSecret is server-only and must never be returned by an HTTP handler.
+type MetaMessengerOnboardingConfig struct {
+	Enabled             bool   `koanf:"enabled"`
+	AppID               string `koanf:"app_id"`
+	ConfigID            string `koanf:"config_id"`
+	OwnerBusinessID     string `koanf:"owner_business_id"`
+	AppSecret           string `koanf:"app_secret"`
+	GraphAPIVersion     string `koanf:"graph_api_version"`
+	GraphBaseURL        string `koanf:"graph_base_url"`
+	TrustedRelayBaseURL string `koanf:"trusted_relay_base_url"`
+}
+
+// MetaMessengerReviewRelayConfig is a deployment-owned, staging-only grant
+// for one inbound-only App Review binding. It is never tenant selectable and
+// none of its three secrets may be exposed through HTTP responses or logs.
+type MetaMessengerReviewRelayConfig struct {
+	Enabled                 bool   `koanf:"enabled"`
+	Mode                    string `koanf:"mode"`
+	OrganizationID          string `koanf:"organization_id"`
+	MetaBusinessID          string `koanf:"meta_business_id"`
+	PageID                  string `koanf:"page_id"`
+	ChannelAccountID        string `koanf:"channel_account_id"`
+	ReviewerOutboundEnabled bool   `koanf:"reviewer_outbound_enabled"`
+	ReviewerUserID          string `koanf:"reviewer_user_id"`
+	ReviewerRoleID          string `koanf:"reviewer_role_id"`
+	Generation              string `koanf:"generation"`
+	ExpiresAt               string `koanf:"expires_at"`
+	RelayBaseURL            string `koanf:"relay_base_url"`
+	ReReplyBaseURL          string `koanf:"rereply_base_url"`
+	BrokerAuthSecret        string `koanf:"broker_auth_secret"`
+	BrokerWrapSecret        string `koanf:"broker_wrap_secret"`
+	ProviderProofSecret     string `koanf:"provider_proof_secret"`
+}
+
+// MetaRelayConfig is deployment-controlled trust material for Meta relay
+// accounts. Tenant-supplied ChannelAccount URLs are never sufficient to choose
+// a Meta readiness issuer: they must match this origin and protected inventory.
+type MetaRelayConfig struct {
+	BaseURL              string `koanf:"base_url"`
+	ExpectedAccountsJSON string `koanf:"expected_accounts_json"`
+	// ProviderProofSecret is deployment-held trust material shared only by
+	// ReReply and the Meta relay. It must never be copied into tenant account
+	// config or returned by the channel-account API.
+	ProviderProofSecret string `koanf:"provider_proof_secret"`
 }
 
 // GoogleSearchConsoleConfig contains deployment-managed OAuth credentials.
@@ -239,6 +310,30 @@ func Load(configPath string) (*Config, error) {
 	if err := k.Unmarshal("", &cfg); err != nil {
 		return nil, err
 	}
+	setMetaMessengerOnboardingDefaults(&cfg.MetaMessengerOnboarding)
+	if err := validateMetaMessengerOnboardingConfig(cfg.MetaMessengerOnboarding, cfg.App.Environment); err != nil {
+		return nil, err
+	}
+	if err := validateMetaMessengerReviewRelayConfig(
+		cfg.MetaMessengerReviewRelay,
+		cfg.MetaMessengerOnboarding,
+		cfg.MetaRelay,
+		cfg.App,
+	); err != nil {
+		return nil, err
+	}
+	if !cfg.MetaMessengerReviewRelay.Enabled {
+		if err := validateMetaRelayDeploymentConfig(cfg.MetaRelay); err != nil {
+			return nil, err
+		}
+		if err := validateMetaMessengerRelayConsistency(
+			cfg.MetaMessengerOnboarding,
+			cfg.MetaRelay,
+			cfg.App.Environment,
+		); err != nil {
+			return nil, err
+		}
+	}
 
 	// Set defaults
 	setDefaults(&cfg)
@@ -246,7 +341,340 @@ func Load(configPath string) (*Config, error) {
 	return &cfg, nil
 }
 
+func validateMetaRelayDeploymentConfig(meta MetaRelayConfig) error {
+	configured := strings.TrimSpace(meta.BaseURL) != "" ||
+		strings.TrimSpace(meta.ExpectedAccountsJSON) != "" ||
+		meta.ProviderProofSecret != ""
+	if !configured {
+		return nil
+	}
+	if strings.TrimSpace(meta.BaseURL) == "" {
+		return errors.New("WHATOMATE_META_RELAY__BASE_URL is required when Meta relay is configured")
+	}
+	if strings.TrimSpace(meta.ExpectedAccountsJSON) == "" {
+		return errors.New("WHATOMATE_META_RELAY__EXPECTED_ACCOUNTS_JSON is required when Meta relay is configured")
+	}
+	if len([]byte(meta.ProviderProofSecret)) < 32 ||
+		strings.TrimSpace(meta.ProviderProofSecret) != meta.ProviderProofSecret {
+		return errors.New("WHATOMATE_META_RELAY__PROVIDER_PROOF_SECRET must contain at least 32 bytes without surrounding whitespace")
+	}
+	return nil
+}
+
+func setMetaMessengerOnboardingDefaults(meta *MetaMessengerOnboardingConfig) {
+	if meta == nil {
+		return
+	}
+	if strings.TrimSpace(meta.ConfigID) == "" {
+		meta.ConfigID = defaultMetaMessengerConfigID
+	}
+	if strings.TrimSpace(meta.OwnerBusinessID) == "" {
+		meta.OwnerBusinessID = defaultMetaMessengerOwnerBusinessID
+	}
+	if strings.TrimSpace(meta.GraphAPIVersion) == "" {
+		meta.GraphAPIVersion = defaultMetaMessengerGraphAPIVersion
+	}
+	if strings.TrimSpace(meta.GraphBaseURL) == "" {
+		meta.GraphBaseURL = defaultMetaMessengerGraphBaseURL
+	}
+}
+
+var metaMessengerGraphVersionPattern = regexp.MustCompile(`^v[1-9][0-9]*\.[0-9]+$`)
+
+func validateMetaMessengerOnboardingConfig(meta MetaMessengerOnboardingConfig, environment string) error {
+	if appID := strings.TrimSpace(meta.AppID); appID != "" && !numericMetaID(appID) {
+		return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__APP_ID must be a canonical numeric Meta app ID")
+	}
+	if !numericMetaID(strings.TrimSpace(meta.ConfigID)) {
+		return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__CONFIG_ID must be a canonical numeric Facebook Login for Business configuration ID")
+	}
+	if !numericMetaID(strings.TrimSpace(meta.OwnerBusinessID)) {
+		return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__OWNER_BUSINESS_ID must be a canonical numeric Meta Business Portfolio ID")
+	}
+	if !metaMessengerGraphVersionPattern.MatchString(strings.TrimSpace(meta.GraphAPIVersion)) {
+		return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__GRAPH_API_VERSION must be explicit, for example v25.0")
+	}
+	if err := validateMetaMessengerBaseURL(meta.GraphBaseURL, environment, true); err != nil {
+		return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__GRAPH_BASE_URL must be an absolute HTTPS URL without credentials, query, or fragment")
+	}
+	if relayBase := strings.TrimSpace(meta.TrustedRelayBaseURL); relayBase != "" {
+		if err := validateMetaMessengerBaseURL(relayBase, environment, false); err != nil {
+			return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__TRUSTED_RELAY_BASE_URL must be an absolute HTTPS URL without credentials, query, or fragment")
+		}
+	}
+	if meta.AppSecret != "" && strings.TrimSpace(meta.AppSecret) != meta.AppSecret {
+		return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__APP_SECRET must not contain surrounding whitespace")
+	}
+	if !meta.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(meta.AppID) == "" {
+		return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__APP_ID is required when Messenger onboarding is enabled")
+	}
+	if meta.AppSecret == "" {
+		return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__APP_SECRET is required when Messenger onboarding is enabled")
+	}
+	if strings.TrimSpace(meta.TrustedRelayBaseURL) == "" {
+		return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__TRUSTED_RELAY_BASE_URL is required when Messenger onboarding is enabled")
+	}
+	if strings.EqualFold(strings.TrimSpace(environment), "production") {
+		return errors.New("managed Messenger onboarding is staging-only until relay secret provisioning and recurring Meta ownership revalidation are available")
+	}
+	return nil
+}
+
+func validateMetaMessengerRelayConsistency(
+	onboarding MetaMessengerOnboardingConfig,
+	relay MetaRelayConfig,
+	environment string,
+) error {
+	if !onboarding.Enabled {
+		return nil
+	}
+	onboardingBase, err := CanonicalMetaRelayBaseURL(onboarding.TrustedRelayBaseURL, environment)
+	if err != nil {
+		return errors.New("WHATOMATE_META_MESSENGER_ONBOARDING__TRUSTED_RELAY_BASE_URL is invalid")
+	}
+	protectedBase, err := CanonicalMetaRelayBaseURL(relay.BaseURL, environment)
+	if err != nil {
+		return errors.New("WHATOMATE_META_RELAY__BASE_URL is required and must be valid when Messenger onboarding is enabled")
+	}
+	if onboardingBase != protectedBase {
+		return errors.New("messenger onboarding trusted relay base must match WHATOMATE_META_RELAY__BASE_URL")
+	}
+	return nil
+}
+
+func validateMetaMessengerReviewRelayConfig(
+	review MetaMessengerReviewRelayConfig,
+	onboarding MetaMessengerOnboardingConfig,
+	relay MetaRelayConfig,
+	app AppConfig,
+) error {
+	configured := review.Enabled || review.Mode != "" || review.OrganizationID != "" ||
+		review.MetaBusinessID != "" || review.PageID != "" || review.ChannelAccountID != "" ||
+		review.ReviewerOutboundEnabled || review.ReviewerUserID != "" || review.ReviewerRoleID != "" ||
+		review.Generation != "" || review.ExpiresAt != "" || review.RelayBaseURL != "" ||
+		review.ReReplyBaseURL != "" || review.BrokerAuthSecret != "" ||
+		review.BrokerWrapSecret != "" || review.ProviderProofSecret != ""
+	if !configured {
+		return nil
+	}
+	if !review.Enabled {
+		return errors.New("WHATOMATE_META_MESSENGER_REVIEW_RELAY__ENABLED must be true when review relay configuration is present")
+	}
+	if app.Environment != "staging" {
+		return errors.New("meta Messenger review relay configuration is permitted only when WHATOMATE_APP__ENVIRONMENT is exactly staging")
+	}
+	if review.Mode != metareview.Mode {
+		return errors.New("WHATOMATE_META_MESSENGER_REVIEW_RELAY__MODE must be exactly staging_messenger_review")
+	}
+	if !onboarding.Enabled {
+		return errors.New("managed Messenger onboarding must be enabled for the staging review relay")
+	}
+	if relay.BaseURL != "" ||
+		relay.ExpectedAccountsJSON != "" ||
+		relay.ProviderProofSecret != "" {
+		return errors.New("staging Messenger review relay configuration cannot be combined with production Meta relay trust configuration")
+	}
+	tuple := metareview.ProvisionTuple{
+		OrganizationID:   review.OrganizationID,
+		MetaBusinessID:   review.MetaBusinessID,
+		PageID:           review.PageID,
+		MetaAppID:        onboarding.AppID,
+		ChannelAccountID: review.ChannelAccountID,
+		Generation:       review.Generation,
+		ExpiresAt:        review.ExpiresAt,
+	}
+	if err := tuple.Validate(time.Now().UTC()); err != nil {
+		return errors.New("meta Messenger review relay authority must contain canonical, non-zero IDs and a future UTC RFC3339 expiry")
+	}
+	if (review.ReviewerUserID == "") != (review.ReviewerRoleID == "") {
+		return errors.New("reviewer user and role IDs must either both be absent or both be configured")
+	}
+	if review.ReviewerOutboundEnabled && review.ReviewerUserID == "" {
+		return errors.New("reviewer user and role IDs are required when reviewer outbound is enabled")
+	}
+	if review.ReviewerUserID != "" {
+		for name, value := range map[string]string{
+			"WHATOMATE_META_MESSENGER_REVIEW_RELAY__REVIEWER_USER_ID": review.ReviewerUserID,
+			"WHATOMATE_META_MESSENGER_REVIEW_RELAY__REVIEWER_ROLE_ID": review.ReviewerRoleID,
+		} {
+			parsed, err := uuid.Parse(value)
+			if err != nil || parsed == uuid.Nil || parsed.String() != value {
+				return fmt.Errorf("%s must be a canonical, non-zero UUID", name)
+			}
+		}
+	}
+	if review.ReviewerUserID != "" && (review.ReviewerUserID == review.ReviewerRoleID ||
+		review.ReviewerUserID == review.OrganizationID ||
+		review.ReviewerRoleID == review.OrganizationID ||
+		review.ReviewerUserID == review.ChannelAccountID ||
+		review.ReviewerRoleID == review.ChannelAccountID ||
+		review.ReviewerUserID == review.Generation ||
+		review.ReviewerRoleID == review.Generation) {
+		return errors.New("reviewer user and role IDs must be distinct from each other and the review authority IDs")
+	}
+	canonicalRelayBase, err := CanonicalMetaRelayBaseURL(review.RelayBaseURL, app.Environment)
+	if err != nil || canonicalRelayBase != review.RelayBaseURL ||
+		!validPublicHTTPSBase(review.RelayBaseURL, false) {
+		return errors.New("WHATOMATE_META_MESSENGER_REVIEW_RELAY__RELAY_BASE_URL must be an exact canonical public HTTPS relay base URL")
+	}
+	canonicalOnboardingBase, err := CanonicalMetaRelayBaseURL(onboarding.TrustedRelayBaseURL, app.Environment)
+	if err != nil || canonicalRelayBase != canonicalOnboardingBase {
+		return errors.New("review relay base URL must exactly match Messenger onboarding trusted relay base URL")
+	}
+	if !validPublicHTTPSOrigin(review.ReReplyBaseURL) {
+		return errors.New("WHATOMATE_META_MESSENGER_REVIEW_RELAY__REREPLY_BASE_URL must be an exact public HTTPS origin without a path, credentials, query, or fragment")
+	}
+	secretNames := []string{
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__BROKER_AUTH_SECRET",
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__BROKER_WRAP_SECRET",
+		"WHATOMATE_META_MESSENGER_REVIEW_RELAY__PROVIDER_PROOF_SECRET",
+		"WHATOMATE_META_MESSENGER_ONBOARDING__APP_SECRET",
+		"WHATOMATE_APP__ENCRYPTION_KEY",
+	}
+	secrets := []string{
+		review.BrokerAuthSecret,
+		review.BrokerWrapSecret,
+		review.ProviderProofSecret,
+		onboarding.AppSecret,
+		app.EncryptionKey,
+	}
+	for index, secret := range secrets {
+		if !validDeploymentSecret(secret) {
+			return fmt.Errorf("%s must contain at least 32 bytes without whitespace", secretNames[index])
+		}
+	}
+	if !deploymentSecretsDistinct(secrets...) {
+		return errors.New("review broker auth, bundle wrap, provider proof, Meta app, and application encryption secrets must all be distinct")
+	}
+	return nil
+}
+
+func validPublicHTTPSOrigin(raw string) bool {
+	return validPublicHTTPSBase(raw, true)
+}
+
+func validPublicHTTPSBase(raw string, requireOrigin bool) bool {
+	if raw == "" || raw != strings.TrimSpace(raw) {
+		return false
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
+		parsed.Host != strings.ToLower(parsed.Host) || parsed.Hostname() == "" ||
+		parsed.User != nil || parsed.RawPath != "" ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" ||
+		parsed.Opaque != "" || parsed.String() != raw {
+		return false
+	}
+	if requireOrigin && parsed.Path != "" {
+		return false
+	}
+	hostname := strings.ToLower(parsed.Hostname())
+	if hostname == "localhost" || strings.HasSuffix(hostname, ".localhost") ||
+		net.ParseIP(hostname) != nil || !strings.Contains(hostname, ".") {
+		return false
+	}
+	return true
+}
+
+func validDeploymentSecret(secret string) bool {
+	if len([]byte(secret)) < 32 {
+		return false
+	}
+	for _, character := range secret {
+		if unicode.IsSpace(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func deploymentSecretsDistinct(secrets ...string) bool {
+	for left := range secrets {
+		for right := left + 1; right < len(secrets); right++ {
+			if constantTimeOpaqueEqual(secrets[left], secrets[right]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func constantTimeOpaqueEqual(left, right string) bool {
+	leftDigest := sha256.Sum256([]byte(left))
+	rightDigest := sha256.Sum256([]byte(right))
+	return subtle.ConstantTimeCompare(leftDigest[:], rightDigest[:]) == 1
+}
+
+// CanonicalMetaRelayBaseURL returns the exact deployment-controlled relay base
+// used by both managed onboarding and runtime trust. Keeping this normalization
+// shared prevents a Page from being staged against a relay origin/path that the
+// protected inventory can never recognize.
+func CanonicalMetaRelayBaseURL(rawURL, environment string) (string, error) {
+	if err := validateMetaMessengerBaseURL(rawURL, environment, false); err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.RawPath != "" || strings.Contains(parsed.Path, "//") {
+		return "", errors.New("invalid relay base URL")
+	}
+	cleanPath := pathpkg.Clean("/" + strings.TrimPrefix(parsed.Path, "/"))
+	if cleanPath == "/" {
+		cleanPath = ""
+	}
+	if parsed.Path != cleanPath && parsed.Path != cleanPath+"/" {
+		return "", errors.New("relay base URL path is not canonical")
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = cleanPath
+	return parsed.String(), nil
+}
+
+func validateMetaMessengerBaseURL(rawURL, environment string, graphEndpoint bool) error {
+	trimmedURL := strings.TrimSpace(rawURL)
+	parsed, err := url.Parse(trimmedURL)
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("invalid URL")
+	}
+	if graphEndpoint && strings.EqualFold(strings.TrimSpace(environment), "production") {
+		if rawURL != trimmedURL || trimmedURL != defaultMetaMessengerGraphBaseURL ||
+			parsed.Path != "" || parsed.RawPath != "" ||
+			parsed.Scheme != "https" || parsed.Host != "graph.facebook.com" {
+			return errors.New("production Graph origin is not pinned")
+		}
+		return nil
+	}
+	if strings.EqualFold(parsed.Scheme, "https") {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(environment), "production") || !strings.EqualFold(parsed.Scheme, "http") {
+		return errors.New("HTTPS is required")
+	}
+	host := strings.Trim(parsed.Hostname(), "[]")
+	ip := net.ParseIP(host)
+	if !graphEndpoint || (ip == nil || !ip.IsLoopback()) {
+		return errors.New("only a loopback Graph test endpoint may use HTTP")
+	}
+	return nil
+}
+
+func numericMetaID(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func setDefaults(cfg *Config) {
+	setMetaMessengerOnboardingDefaults(&cfg.MetaMessengerOnboarding)
 	if cfg.App.Name == "" {
 		cfg.App.Name = "ReReply"
 	}

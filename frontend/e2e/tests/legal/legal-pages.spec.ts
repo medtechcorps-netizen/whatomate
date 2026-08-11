@@ -38,6 +38,15 @@ for (const legalPage of legalPages) {
   })
 }
 
+test('policy table-of-contents links stay on the active legal document', async ({ page }) => {
+  await page.goto('/privacy')
+
+  await expect(page.getByRole('link', { name: '1. Scope and our role' })).toHaveAttribute(
+    'href',
+    '/privacy#scope'
+  )
+})
+
 test('Privacy Policy discloses the Google Search Console data lifecycle', async ({ page }) => {
   await page.goto('/privacy')
 

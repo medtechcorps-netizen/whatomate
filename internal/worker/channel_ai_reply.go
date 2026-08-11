@@ -427,6 +427,11 @@ func (w *Worker) checkChannelAIReplyEligibility(
 		check.CancelReason = "channel_account_binding_mismatch"
 		return check, nil
 	}
+	if configuredMetaMessengerReviewAccount(w.Config, &account) ||
+		channelapi.IsStagingMessengerReviewMarked(&account) {
+		check.CancelReason = "staging_review_inbound_only"
+		return check, nil
+	}
 	if account.Status != models.ChannelAccountStatusActive ||
 		!channelOutboxBool(account.Config, "outbound_enabled") {
 		check.CancelReason = "channel_account_outbound_disabled"
