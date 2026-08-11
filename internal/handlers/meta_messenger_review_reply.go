@@ -1708,23 +1708,23 @@ func (a *App) settleMetaMessengerReviewReply(
 		); err != nil {
 			return err
 		}
+		if err := tx.Where(
+			"id = ? AND organization_id = ?",
+			attempt.Outbox.ID,
+			organizationID,
+		).First(&attempt.Outbox).Error; err != nil {
+			return err
+		}
+		if err := tx.Where(
+			"id = ? AND organization_id = ?",
+			attempt.Message.ID,
+			organizationID,
+		).First(&attempt.Message).Error; err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
-		return attempt, err
-	}
-	if err := root.DB.Where(
-		"id = ? AND organization_id = ?",
-		attempt.Outbox.ID,
-		organizationID,
-	).First(&attempt.Outbox).Error; err != nil {
-		return attempt, err
-	}
-	if err := root.DB.Where(
-		"id = ? AND organization_id = ?",
-		attempt.Message.ID,
-		organizationID,
-	).First(&attempt.Message).Error; err != nil {
 		return attempt, err
 	}
 	return attempt, nil

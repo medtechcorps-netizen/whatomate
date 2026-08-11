@@ -3,9 +3,11 @@ package handlers
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +23,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 const (
@@ -287,6 +291,151 @@ func TestMetaMessengerReviewReplySendsOneExactTextResponseWithoutLeakingSecrets(
 		assert.NotContains(t, reviewReplyJSON(t, auditEntry.Changes), reviewReplyRecipient)
 		assert.NotContains(t, reviewReplyJSON(t, auditEntry.Changes), reviewPagePostsPlaintextToken)
 	}
+}
+
+func TestMetaMessengerReviewReplySettlementReloadsStayInsideTenantTransaction(t *testing.T) {
+	fixture := newReviewReplyFixture(t)
+	fixture.app.HTTPClient = reviewPagePostsGraphClient(t, func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"recipient_id":"` + reviewReplyRecipient + `","message_id":"mid.review.tenant.reload"}`))
+	})
+	eligibility := reviewReplyEligibility(t, fixture, reviewReplySessionA)
+	require.True(t, eligibility.Eligible)
+
+	callbackName := "test:meta-review-reply-tenant-reload-" + uuid.NewString()
+	var unscopedSettlementReads atomic.Int32
+	require.NoError(t, fixture.app.DB.Callback().Query().Before("gorm:query").Register(
+		callbackName,
+		func(db *gorm.DB) {
+			if db == nil || db.Statement == nil ||
+				(db.Statement.Table != "outbox_jobs" && db.Statement.Table != "messages") {
+				return
+			}
+			if _, insideTransaction := db.Statement.ConnPool.(*sql.Tx); insideTransaction {
+				return
+			}
+			unscopedSettlementReads.Add(1)
+			db.AddError(errors.New("test blocked settlement reload outside tenant transaction"))
+		},
+	))
+	t.Cleanup(func() {
+		require.NoError(t, fixture.app.DB.Callback().Query().Remove(callbackName))
+	})
+
+	request := reviewReplySendRequest(
+		t,
+		fixture,
+		fixture.user.ID,
+		reviewReplySessionA,
+		eligibility.AttestationID,
+		uuid.NewString(),
+		reviewReplyText,
+	)
+	require.NoError(t, fixture.app.SendMetaMessengerReviewReply(request))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request), string(testutil.GetResponseBody(request)))
+	assert.Zero(t, unscopedSettlementReads.Load())
+
+	var response metaMessengerReviewReplyResponse
+	testutil.ParseEnvelopeResponse(t, request, &response)
+	assert.Equal(t, models.MessageStatusSent, response.Message.Status)
+	assert.Equal(t, "mid.review.tenant.reload", response.Message.WhatsAppMessageID)
+}
+
+func TestMetaMessengerReviewReplyReturnsSentUnderRestrictedTenantRLS(t *testing.T) {
+	fixture := newReviewReplyFixture(t)
+	adminDB := fixture.app.DB
+	runtimeRole := "review_reply_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	require.NoError(t, adminDB.Exec(
+		"CREATE ROLE "+runtimeRole+" NOSUPERUSER NOBYPASSRLS NOLOGIN",
+	).Error)
+	t.Cleanup(func() {
+		require.NoError(t, database.RemoveTenantRLS(adminDB))
+		require.NoError(t, adminDB.Exec("DROP OWNED BY "+runtimeRole).Error)
+		require.NoError(t, adminDB.Exec("DROP ROLE "+runtimeRole).Error)
+	})
+	require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
+
+	runtimeDB, err := gorm.Open(postgres.Open(os.Getenv("TEST_DATABASE_URL")), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	runtimeSQLDB, err := runtimeDB.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, runtimeSQLDB.Close())
+	})
+	fixture.app.Config.Database.RLSEnabled = true
+	fixture.app.Config.Database.RuntimeRole = runtimeRole
+
+	var graphCalls atomic.Int32
+	fixture.app.HTTPClient = reviewPagePostsGraphClient(t, func(writer http.ResponseWriter, _ *http.Request) {
+		graphCalls.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"recipient_id":"` + reviewReplyRecipient + `","message_id":"mid.review.rls.sent"}`))
+	})
+	require.NoError(t, runtimeDB.Connection(func(runtimeConn *gorm.DB) error {
+		if err := runtimeConn.Exec("SET ROLE " + runtimeRole).Error; err != nil {
+			return err
+		}
+		defer func() {
+			_ = runtimeConn.Exec("RESET ROLE").Error
+		}()
+		fixture.app.DB = runtimeConn
+
+		eligibility := reviewReplyEligibility(t, fixture, reviewReplySessionA)
+		require.True(t, eligibility.Eligible)
+		request := reviewReplySendRequest(
+			t,
+			fixture,
+			fixture.user.ID,
+			reviewReplySessionA,
+			eligibility.AttestationID,
+			uuid.NewString(),
+			reviewReplyText,
+		)
+		require.NoError(t, fixture.app.SendMetaMessengerReviewReply(request))
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request), string(testutil.GetResponseBody(request)))
+		assert.EqualValues(t, 1, graphCalls.Load())
+		var response metaMessengerReviewReplyResponse
+		testutil.ParseEnvelopeResponse(t, request, &response)
+		assert.Equal(t, models.MessageStatusSent, response.Message.Status)
+		assert.Equal(t, "mid.review.rls.sent", response.Message.WhatsAppMessageID)
+
+		var unscopedVisible int64
+		require.NoError(t, runtimeConn.Session(&gorm.Session{NewDB: true}).Model(&models.OutboxJob{}).Where(
+			"id = ?",
+			response.Audit.ID,
+		).Count(&unscopedVisible).Error)
+		assert.Zero(t, unscopedVisible)
+
+		var settledOutbox models.OutboxJob
+		var settledMessage models.Message
+		require.NoError(t, database.WithTenant(runtimeConn, fixture.orgID, func(tx *gorm.DB) error {
+			if err := tx.Session(&gorm.Session{NewDB: true}).Where(
+				"id = ?",
+				response.Audit.ID,
+			).First(&settledOutbox).Error; err != nil {
+				return err
+			}
+			return tx.Session(&gorm.Session{NewDB: true}).Where(
+				"id = ?",
+				response.Message.ID,
+			).First(&settledMessage).Error
+		}))
+		assert.Equal(t, models.OutboxJobStatusSent, settledOutbox.Status)
+		assert.Equal(t, models.MessageStatusSent, settledMessage.Status)
+		assert.Equal(t, "mid.review.rls.sent", settledMessage.WhatsAppMessageID)
+
+		var foreignVisible int64
+		require.NoError(t, database.WithTenant(runtimeConn, uuid.New(), func(tx *gorm.DB) error {
+			return tx.Session(&gorm.Session{NewDB: true}).Model(&models.OutboxJob{}).Where(
+				"id = ?",
+				response.Audit.ID,
+			).Count(&foreignVisible).Error
+		}))
+		assert.Zero(t, foreignVisible)
+		return nil
+	}))
 }
 
 func TestMetaMessengerReviewReplyServerIdempotencyIgnoresNewBrowserNonces(t *testing.T) {
