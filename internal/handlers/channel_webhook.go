@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	appwebsocket "github.com/shridarpatil/whatomate/internal/websocket"
@@ -1064,22 +1065,31 @@ func findOrCreateChannelIdentity(
 		}
 	}
 
-	address := legacyContactAddress(participant)
-	contact := models.Contact{
-		OrganizationID:  orgID,
-		PhoneNumber:     address,
-		ProfileName:     truncateChannelRunes(participant.DisplayName, 255),
-		WhatsAppAccount: account.Name,
-		LastMessageAt:   &seenAt,
-		LastInboundAt:   &seenAt,
-		IsRead:          false,
-		Tags:            models.JSONBArray{},
-		Metadata: models.JSONB{
-			"channel":  account.Channel,
-			"provider": account.Provider,
-		},
-	}
-	if err := tx.Create(&contact).Error; err != nil {
+	contact, err := findRenewedMessengerLineageContact(
+		tx,
+		account,
+		participant.ExternalID,
+	)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		address := legacyContactAddress(participant)
+		contact = &models.Contact{
+			OrganizationID:  orgID,
+			PhoneNumber:     address,
+			ProfileName:     truncateChannelRunes(participant.DisplayName, 255),
+			WhatsAppAccount: account.Name,
+			LastMessageAt:   &seenAt,
+			LastInboundAt:   &seenAt,
+			IsRead:          false,
+			Tags:            models.JSONBArray{},
+			Metadata: models.JSONB{
+				"channel":  account.Channel,
+				"provider": account.Provider,
+			},
+		}
+		if err := tx.Create(contact).Error; err != nil {
+			return nil, nil, err
+		}
+	} else if err != nil {
 		return nil, nil, err
 	}
 	identity = models.ContactIdentity{
@@ -1099,7 +1109,66 @@ func findOrCreateChannelIdentity(
 	if err := tx.Create(&identity).Error; err != nil {
 		return nil, nil, err
 	}
-	return &identity, &contact, nil
+	return &identity, contact, nil
+}
+
+// findRenewedMessengerLineageContact preserves the CRM contact when an exact
+// Messenger Page is reconnected after its previous channel account was
+// tombstoned. A PSID by itself is not a safe contact key: the prior identity
+// must belong to the same tenant, channel, provider, and provider account.
+func findRenewedMessengerLineageContact(
+	tx *gorm.DB,
+	account *models.ChannelAccount,
+	externalID string,
+) (*models.Contact, error) {
+	if account == nil ||
+		strings.TrimSpace(account.ExternalAccountID) == "" ||
+		strings.TrimSpace(externalID) == "" ||
+		account.Channel != models.ChannelMessenger ||
+		account.Provider != channelapi.RelayProvider {
+		return nil, gorm.ErrRecordNotFound
+	}
+
+	type lineageContact struct {
+		ContactID uuid.UUID `gorm:"column:contact_id"`
+	}
+	var candidates []lineageContact
+	if err := tx.Model(&models.ContactIdentity{}).
+		Select("DISTINCT contact_identities.contact_id").
+		Joins(`JOIN channel_accounts AS lineage_accounts
+			ON lineage_accounts.id = contact_identities.channel_account_id
+			AND lineage_accounts.organization_id = contact_identities.organization_id`).
+		Where(
+			`contact_identities.organization_id = ?
+				AND contact_identities.channel = ?
+				AND contact_identities.external_id = ?
+				AND lineage_accounts.organization_id = ?
+				AND lineage_accounts.channel = ?
+				AND lineage_accounts.provider = ?
+				AND lineage_accounts.external_account_id = ?
+				AND lineage_accounts.deleted_at IS NOT NULL`,
+			account.OrganizationID,
+			account.Channel,
+			externalID,
+			account.OrganizationID,
+			account.Channel,
+			account.Provider,
+			account.ExternalAccountID,
+		).
+		Find(&candidates).Error; err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+	if len(candidates) != 1 || candidates[0].ContactID == uuid.Nil {
+		return nil, errors.New("renewed Messenger identity lineage maps to multiple contacts")
+	}
+	return contactutil.ResolveCanonicalContactForUpdate(
+		tx,
+		account.OrganizationID,
+		candidates[0].ContactID,
+	)
 }
 
 func findOrCreateInboxConversation(

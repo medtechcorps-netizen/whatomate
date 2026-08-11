@@ -507,6 +507,305 @@ func TestProcessNormalizedChannelEventRejectsOutgoingEchoBeforePersistence(t *te
 	require.Zero(t, replyJobCount, "outgoing echo must never schedule a reply")
 }
 
+func TestProcessNormalizedChannelEventReusesContactAcrossMessengerAccountRenewal(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	pageID := "page-" + uuid.NewString()
+	psid := "psid-" + uuid.NewString()
+	acceptedAt := time.Date(2026, time.August, 12, 6, 0, 0, 0, time.UTC)
+
+	oldAccount := createRelayPolicyTestAccount(t, db, org.ID, models.ChannelMessenger)
+	require.NoError(t, db.Model(oldAccount).Update("external_account_id", pageID).Error)
+	oldAccount.ExternalAccountID = pageID
+
+	first := validPolicyInboundEvent(acceptedAt.Add(-time.Minute))
+	first.Message.Sender.ExternalID = psid
+	first.Message.Sender.Address = psid
+	first.Message.Conversation.ExternalID = psid
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		return processNormalizedChannelEvent(tx, oldAccount, &first, acceptedAt)
+	}))
+
+	var oldIdentity models.ContactIdentity
+	require.NoError(t, db.Where(
+		"organization_id = ? AND channel_account_id = ? AND external_id = ?",
+		org.ID,
+		oldAccount.ID,
+		psid,
+	).First(&oldIdentity).Error)
+	require.NoError(t, db.Model(oldAccount).Updates(map[string]any{
+		"status": models.ChannelAccountStatusDisconnected,
+		"metadata": models.JSONB{
+			"onboarding_state": "review_deprovisioned",
+		},
+	}).Error)
+	require.NoError(t, db.Delete(oldAccount).Error)
+
+	newAccount := createRelayPolicyTestAccount(t, db, org.ID, models.ChannelMessenger)
+	require.NoError(t, db.Model(newAccount).Update("external_account_id", pageID).Error)
+	newAccount.ExternalAccountID = pageID
+
+	second := validPolicyInboundEvent(acceptedAt)
+	second.Message.Sender.ExternalID = psid
+	second.Message.Sender.Address = psid
+	second.Message.Conversation.ExternalID = psid
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		return processNormalizedChannelEvent(tx, newAccount, &second, acceptedAt)
+	}))
+
+	var contacts []models.Contact
+	require.NoError(t, db.Where("organization_id = ?", org.ID).Find(&contacts).Error)
+	require.Len(t, contacts, 1, "renewing the same Page must not duplicate its PSID contact")
+	require.Equal(t, oldIdentity.ContactID, contacts[0].ID)
+
+	var identityCount int64
+	require.NoError(t, db.Model(&models.ContactIdentity{}).Where(
+		"organization_id = ? AND external_id = ?",
+		org.ID,
+		psid,
+	).Count(&identityCount).Error)
+	require.EqualValues(t, 2, identityCount)
+
+	var renewedIdentity models.ContactIdentity
+	require.NoError(t, db.Where(
+		"organization_id = ? AND channel_account_id = ? AND external_id = ?",
+		org.ID,
+		newAccount.ID,
+		psid,
+	).First(&renewedIdentity).Error)
+	require.Equal(t, oldIdentity.ContactID, renewedIdentity.ContactID)
+
+	var conversations []models.InboxConversation
+	require.NoError(t, db.Where(
+		"organization_id = ? AND contact_id = ?",
+		org.ID,
+		oldIdentity.ContactID,
+	).Find(&conversations).Error)
+	require.Len(t, conversations, 2)
+	conversationAccounts := map[uuid.UUID]bool{}
+	conversationIDs := map[uuid.UUID]bool{}
+	for _, conversation := range conversations {
+		conversationAccounts[conversation.ChannelAccountID] = true
+		conversationIDs[conversation.ID] = true
+		require.Equal(t, psid, conversation.ExternalConversationID)
+	}
+	require.True(t, conversationAccounts[oldAccount.ID])
+	require.True(t, conversationAccounts[newAccount.ID])
+
+	var messages []models.Message
+	require.NoError(t, db.Where(
+		"organization_id = ? AND contact_id = ?",
+		org.ID,
+		oldIdentity.ContactID,
+	).Find(&messages).Error)
+	require.Len(t, messages, 2)
+	for _, message := range messages {
+		require.NotNil(t, message.InboxConversationID)
+		require.True(t, conversationIDs[*message.InboxConversationID])
+	}
+}
+
+func TestFindRenewedMessengerLineageContactRequiresExactTenantAndPage(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	otherOrg := testutil.CreateTestOrganization(t, db)
+	pageID := "page-" + uuid.NewString()
+	psid := "psid-" + uuid.NewString()
+	_, lineageContact := createTombstonedMessengerLineage(
+		t,
+		db,
+		org.ID,
+		pageID,
+		psid,
+		"lineage-"+uuid.NewString(),
+	)
+
+	for _, testCase := range []struct {
+		name       string
+		account    *models.ChannelAccount
+		externalID string
+	}{
+		{
+			name: "different Page",
+			account: &models.ChannelAccount{
+				OrganizationID:    org.ID,
+				Channel:           models.ChannelMessenger,
+				Provider:          channelapi.RelayProvider,
+				ExternalAccountID: "other-page-" + uuid.NewString(),
+			},
+			externalID: psid,
+		},
+		{
+			name: "different tenant",
+			account: &models.ChannelAccount{
+				OrganizationID:    otherOrg.ID,
+				Channel:           models.ChannelMessenger,
+				Provider:          channelapi.RelayProvider,
+				ExternalAccountID: pageID,
+			},
+			externalID: psid,
+		},
+		{
+			name: "blank Page ID",
+			account: &models.ChannelAccount{
+				OrganizationID: org.ID,
+				Channel:        models.ChannelMessenger,
+				Provider:       channelapi.RelayProvider,
+			},
+			externalID: psid,
+		},
+		{
+			name: "blank PSID",
+			account: &models.ChannelAccount{
+				OrganizationID:    org.ID,
+				Channel:           models.ChannelMessenger,
+				Provider:          channelapi.RelayProvider,
+				ExternalAccountID: pageID,
+			},
+			externalID: " ",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+				contact, err := findRenewedMessengerLineageContact(
+					tx,
+					testCase.account,
+					testCase.externalID,
+				)
+				require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+				require.Nil(t, contact)
+				return nil
+			}))
+		})
+	}
+
+	var stored models.Contact
+	require.NoError(t, db.Where(
+		"id = ? AND organization_id = ?",
+		lineageContact.ID,
+		org.ID,
+	).First(&stored).Error)
+}
+
+func TestProcessNormalizedChannelEventFailsClosedOnAmbiguousMessengerRenewalLineage(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	pageID := "page-" + uuid.NewString()
+	psid := "psid-" + uuid.NewString()
+	createTombstonedMessengerLineage(
+		t,
+		db,
+		org.ID,
+		pageID,
+		psid,
+		"lineage-a-"+uuid.NewString(),
+	)
+	createTombstonedMessengerLineage(
+		t,
+		db,
+		org.ID,
+		pageID,
+		psid,
+		"lineage-b-"+uuid.NewString(),
+	)
+
+	newAccount := createRelayPolicyTestAccount(t, db, org.ID, models.ChannelMessenger)
+	require.NoError(t, db.Model(newAccount).Update("external_account_id", pageID).Error)
+	newAccount.ExternalAccountID = pageID
+	acceptedAt := time.Date(2026, time.August, 12, 7, 0, 0, 0, time.UTC)
+	event := validPolicyInboundEvent(acceptedAt)
+	event.Message.Sender.ExternalID = psid
+	event.Message.Sender.Address = psid
+	event.Message.Conversation.ExternalID = psid
+
+	err := db.Transaction(func(tx *gorm.DB) error {
+		return processNormalizedChannelEvent(tx, newAccount, &event, acceptedAt)
+	})
+	require.ErrorContains(t, err, "lineage maps to multiple contacts")
+
+	var currentIdentityCount int64
+	require.NoError(t, db.Model(&models.ContactIdentity{}).Where(
+		"organization_id = ? AND channel_account_id = ?",
+		org.ID,
+		newAccount.ID,
+	).Count(&currentIdentityCount).Error)
+	require.Zero(t, currentIdentityCount)
+
+	var conversationCount int64
+	require.NoError(t, db.Model(&models.InboxConversation{}).Where(
+		"organization_id = ? AND channel_account_id = ?",
+		org.ID,
+		newAccount.ID,
+	).Count(&conversationCount).Error)
+	require.Zero(t, conversationCount)
+
+	var messageCount int64
+	require.NoError(t, db.Model(&models.Message{}).Where(
+		"organization_id = ?",
+		org.ID,
+	).Count(&messageCount).Error)
+	require.Zero(t, messageCount)
+
+	var inboundEventCount int64
+	require.NoError(t, db.Model(&models.InboundEvent{}).Where(
+		"organization_id = ? AND channel_account_id = ?",
+		org.ID,
+		newAccount.ID,
+	).Count(&inboundEventCount).Error)
+	require.Zero(t, inboundEventCount)
+}
+
+func createTombstonedMessengerLineage(
+	t *testing.T,
+	db *gorm.DB,
+	organizationID uuid.UUID,
+	pageID string,
+	psid string,
+	contactAddress string,
+) (*models.ChannelAccount, *models.Contact) {
+	t.Helper()
+
+	account := createRelayPolicyTestAccount(t, db, organizationID, models.ChannelMessenger)
+	require.NoError(t, db.Model(account).Update("external_account_id", pageID).Error)
+	account.ExternalAccountID = pageID
+	contact := &models.Contact{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  organizationID,
+		PhoneNumber:     contactAddress,
+		ProfileName:     "Lineage contact",
+		WhatsAppAccount: account.Name,
+		Tags:            models.JSONBArray{},
+		Metadata: models.JSONB{
+			"channel":  models.ChannelMessenger,
+			"provider": channelapi.RelayProvider,
+		},
+	}
+	require.NoError(t, db.Create(contact).Error)
+	now := time.Now().UTC()
+	require.NoError(t, db.Create(&models.ContactIdentity{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   organizationID,
+		ContactID:        contact.ID,
+		ChannelAccountID: account.ID,
+		Channel:          models.ChannelMessenger,
+		ExternalID:       psid,
+		Address:          contactAddress,
+		DisplayName:      contact.ProfileName,
+		IsPrimary:        true,
+		FirstSeenAt:      &now,
+		LastSeenAt:       &now,
+		Metadata:         models.JSONB{},
+	}).Error)
+	require.NoError(t, db.Model(account).Updates(map[string]any{
+		"status": models.ChannelAccountStatusDisconnected,
+		"metadata": models.JSONB{
+			"onboarding_state": "review_deprovisioned",
+		},
+	}).Error)
+	require.NoError(t, db.Delete(account).Error)
+	return account, contact
+}
+
 func createRelayPolicyTestAccount(
 	t *testing.T,
 	db *gorm.DB,
