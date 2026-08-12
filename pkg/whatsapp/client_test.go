@@ -173,6 +173,92 @@ func TestClient_SendTextMessage(t *testing.T) {
 	}
 }
 
+func TestClient_ConfigurePhoneWebhookOverride_UsesPhoneEndpointAndVerifiesReadback(t *testing.T) {
+	t.Parallel()
+
+	const callbackURL = "https://app.rereply.app/api/webhook"
+	const verifyToken = "test-verify-token"
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		assert.Equal(t, "/v21.0/123456789", r.URL.Path)
+		assert.Equal(t, "Bearer test-access-token", r.Header.Get("Authorization"))
+
+		switch r.Method {
+		case http.MethodPost:
+			assert.Empty(t, r.URL.RawQuery)
+			var body map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			configuration, ok := body["webhook_configuration"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, callbackURL, configuration["override_callback_uri"])
+			assert.Equal(t, verifyToken, configuration["verify_token"])
+			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		case http.MethodGet:
+			assert.Equal(t, "webhook_configuration", r.URL.Query().Get("fields"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"webhook_configuration": map[string]string{"phone_number": callbackURL},
+			})
+		default:
+			t.Fatalf("unexpected request method %s", r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+	err := client.ConfigurePhoneWebhookOverride(
+		testutil.TestContext(t),
+		testAccount(server.URL),
+		callbackURL,
+		verifyToken,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 2, requests)
+}
+
+func TestClient_ConfigurePhoneWebhookOverride_FailsClosedOnInvalidOrUnverifiedInput(t *testing.T) {
+	t.Parallel()
+
+	const callbackURL = "https://app.rereply.app/api/webhook"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"webhook_configuration": map[string]string{"phone_number": "https://unexpected.example/api/webhook"},
+		})
+	}))
+	defer server.Close()
+
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+	ctx := testutil.TestContext(t)
+
+	invalidPhone := testAccount(server.URL)
+	invalidPhone.PhoneID = "123/override"
+	err := client.ConfigurePhoneWebhookOverride(ctx, invalidPhone, callbackURL, "verify-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid WhatsApp phone ID")
+
+	invalidVersion := testAccount(server.URL)
+	invalidVersion.APIVersion = "v21.0/anything"
+	err = client.ConfigurePhoneWebhookOverride(ctx, invalidVersion, callbackURL, "verify-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid WhatsApp API version")
+
+	err = client.ConfigurePhoneWebhookOverride(ctx, testAccount(server.URL), callbackURL, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "verify token")
+
+	err = client.ConfigurePhoneWebhookOverride(ctx, testAccount(server.URL), "http://not-https.example/api/webhook", "verify-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid webhook callback URL")
+
+	err = client.ConfigurePhoneWebhookOverride(ctx, testAccount(server.URL), callbackURL, "verify-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "did not report the expected callback")
+}
+
 func TestClient_GetMediaURL(t *testing.T) {
 	t.Parallel()
 

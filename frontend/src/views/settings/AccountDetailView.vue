@@ -105,6 +105,8 @@ const deleteDialogOpen = ref(false);
 const testResult = ref<TestResult | null>(null);
 const testingConnection = ref(false);
 const subscribing = ref(false);
+const webhookOverrideDialogOpen = ref(false);
+const configuringWebhookOverride = ref(false);
 const isProfileDialogOpen = ref(false);
 
 const { showLeaveDialog, confirmLeave, cancelLeave } =
@@ -114,6 +116,11 @@ const canWrite = computed(() => authStore.hasPermission("accounts", "write"));
 const canDelete = computed(() => authStore.hasPermission("accounts", "delete"));
 const canReadIntegrations = computed(() =>
   authStore.hasPermission("settings.integrations", "read"),
+);
+const canConfigureWebhook = computed(
+  () =>
+    authStore.hasPermission("accounts", "write") &&
+    authStore.hasPermission("settings.integrations", "write"),
 );
 
 const accessTokenExpiry = computed(() => {
@@ -327,6 +334,44 @@ async function subscribeApp() {
   }
 }
 
+async function configureWebhookOverride() {
+  if (!account.value) return;
+  configuringWebhookOverride.value = true;
+  try {
+    const response = await api.post(
+      `/accounts/${account.value.id}/webhook-override`,
+    );
+    if (response.data.data?.success === false) {
+      toast.error(
+        t(
+          "accounts.webhookOverrideFailed",
+          "ReReply webhook configuration failed",
+        ),
+      );
+      return;
+    }
+    webhookOverrideDialogOpen.value = false;
+    toast.success(
+      t(
+        "accounts.webhookOverrideSuccess",
+        "Phone-specific ReReply webhook configured and verified",
+      ),
+    );
+  } catch (e) {
+    toast.error(
+      getErrorMessage(
+        e,
+        t(
+          "accounts.webhookOverrideFailed",
+          "ReReply webhook configuration failed",
+        ),
+      ),
+    );
+  } finally {
+    configuringWebhookOverride.value = false;
+  }
+}
+
 onMounted(async () => {
   if (isNew.value) {
     isLoading.value = false;
@@ -376,6 +421,30 @@ onMounted(async () => {
             <Loader2 v-if="subscribing" class="h-4 w-4 animate-spin mr-1" />
             <Bell v-else class="h-4 w-4 mr-1" />
             {{ $t("accounts.subscribe", "Subscribe") }}
+          </Button>
+          <Button
+            v-if="
+              canConfigureWebhook &&
+              !isNew &&
+              account &&
+              account.status === 'active'
+            "
+            variant="outline"
+            size="sm"
+            :disabled="configuringWebhookOverride"
+            @click="webhookOverrideDialogOpen = true"
+          >
+            <Loader2
+              v-if="configuringWebhookOverride"
+              class="h-4 w-4 animate-spin mr-1"
+            />
+            <Bell v-else class="h-4 w-4 mr-1" />
+            {{
+              $t(
+                "accounts.configureRereplyWebhook",
+                "Configure ReReply webhook",
+              )
+            }}
           </Button>
           <Button
             v-if="canWrite && !isNew && account"
@@ -867,6 +936,50 @@ onMounted(async () => {
           <AlertDialogAction @click="deleteAccount">{{
             $t("common.delete")
           }}</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+
+    <!-- Phone-specific Meta callback confirmation. No credential is exposed. -->
+    <AlertDialog v-model:open="webhookOverrideDialogOpen">
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{{
+            $t(
+              "accounts.configureRereplyWebhook",
+              "Configure ReReply webhook",
+            )
+          }}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {{
+              $t(
+                "accounts.configureRereplyWebhookConfirm",
+                "This configures Meta to send inbound events for only this WhatsApp phone account to ReReply. It does not change any other phone number, WhatsApp Business Account, or the app-level webhook.",
+              )
+            }}
+          </AlertDialogDescription>
+          <p class="text-sm text-muted-foreground">
+            {{ account?.name }} - {{ account?.phone_id }}
+          </p>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel :disabled="configuringWebhookOverride">
+            {{ $t("common.cancel") }}
+          </AlertDialogCancel>
+          <AlertDialogAction
+            :disabled="configuringWebhookOverride"
+            @click.prevent="configureWebhookOverride"
+          >
+            <Loader2
+              v-if="configuringWebhookOverride"
+              class="h-4 w-4 animate-spin mr-1"
+            />
+            {{
+              configuringWebhookOverride
+                ? $t("common.saving", "Configuring...")
+                : $t("accounts.configureRereplyWebhookAction", "Configure")
+            }}
+          </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>

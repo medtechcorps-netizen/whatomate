@@ -60,6 +60,27 @@ const accountWriter = {
   },
 };
 
+const accountIntegrationWriter = {
+  ...accountWriter,
+  id: "97999999-9999-4999-8999-999999999999",
+  email: "account-integration-writer@example.test",
+  full_name: "Account Integration Writer",
+  role: {
+    ...accountWriter.role,
+    id: "98000000-0000-4000-8000-000000000000",
+    name: "account-integration-writer",
+    description: "Account and integration write access",
+    permissions: [
+      ...accountWriter.role.permissions,
+      {
+        id: "settings-integrations-write",
+        resource: "settings.integrations",
+        action: "write",
+      },
+    ],
+  },
+};
+
 const accountRecord = {
   id: accountId,
   name: "Klinik Relive WhatsApp",
@@ -180,6 +201,53 @@ test("account users with integration read access can open the central Meta setti
   await expect(
     page.getByTestId("meta-integration-management-link"),
   ).toHaveAttribute("href", "/settings/integrations");
+});
+
+test("account writers without integration write cannot configure a phone webhook", async ({
+  page,
+}) => {
+  const mutatingRequests = await installAccountReaderMocks(page, accountWriter);
+  await page.goto(`/settings/accounts/${accountId}`);
+
+  await expect(
+    page.getByRole("button", {
+      name: "Configure ReReply webhook",
+      exact: true,
+    }),
+  ).toHaveCount(0);
+  expect(mutatingRequests).toEqual([]);
+});
+
+test("authorized account and integration writers configure only after confirmation", async ({
+  page,
+}) => {
+  const mutatingRequests = await installAccountReaderMocks(
+    page,
+    accountIntegrationWriter,
+  );
+  await page.goto(`/settings/accounts/${accountId}`);
+
+  const action = page.getByRole("button", {
+    name: "Configure ReReply webhook",
+    exact: true,
+  });
+  await expect(action).toBeVisible();
+  expect(mutatingRequests).toEqual([]);
+
+  await action.click();
+  await expect(
+    page.getByText(
+      "This configures Meta to send inbound events for only this WhatsApp phone account to ReReply. It does not change any other phone number, WhatsApp Business Account, or the app-level webhook.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  expect(mutatingRequests).toEqual([]);
+
+  await page.getByRole("button", { name: "Configure", exact: true }).click();
+  await expect.poll(() => mutatingRequests).toHaveLength(1);
+  expect(mutatingRequests[0]).toMatch(
+    new RegExp(`^POST .*/api/accounts/${accountId}/webhook-override$`),
+  );
 });
 
 test("the WhatsApp account list no longer exposes an App ID column", async ({
