@@ -449,6 +449,8 @@ watch(() => form.value.category, (newCat, oldCat) => {
 })
 
 async function save() {
+  if (!canWrite.value) return
+
   if (!form.value.name.trim()) {
     toast.error(t('templates.nameRequired', 'Template name is required'))
     return
@@ -559,6 +561,7 @@ function onHeaderMediaFileChange(event: Event) {
 }
 
 async function uploadHeaderMedia() {
+  if (!canWrite.value) return
   if (!headerMediaFile.value) return
   if (!form.value.whatsapp_account) {
     toast.error(t('templates.selectAccountFirst', 'Select an account first'))
@@ -579,7 +582,7 @@ async function uploadHeaderMedia() {
 }
 
 async function deleteTemplate() {
-  if (!template.value) return
+  if (!canDelete.value || !template.value) return
   try {
     await api.delete(`/templates/${template.value.id}`)
     toast.success(t('templates.deleted', 'Template deleted'))
@@ -591,13 +594,13 @@ async function deleteTemplate() {
 }
 
 const canPublish = computed(() => {
-  if (!template.value || isNew.value) return false
+  if (!canWrite.value || !template.value || isNew.value) return false
   const status = template.value.status?.toUpperCase()
   return status === 'DRAFT' || status === 'REJECTED'
 })
 
 async function confirmPublish() {
-  if (!template.value) return
+  if (!canWrite.value || !template.value) return
   isPublishing.value = true
   try {
     const response = await api.post(`/templates/${template.value.id}/publish`)

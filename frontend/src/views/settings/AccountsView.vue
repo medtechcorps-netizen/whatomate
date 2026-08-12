@@ -277,17 +277,16 @@ async function exchangeCodeForToken(
     });
 
     const account = response.data.data.account;
-    const pin = response.data.data.pin;
+    const twoFactorConfigured = Boolean(response.data.data.pin);
 
     if (account.status === "pending_registration") {
       toast.warning("Account created. Phone registration required.");
     } else if (account.status === "active") {
-      toast.success("WhatsApp account connected successfully!");
-      if (pin) {
-        toast.info(`Your 2FA PIN: ${pin}. Please save it securely.`, {
-          duration: 10000,
-        });
-      }
+      toast.success(
+        twoFactorConfigured
+          ? "WhatsApp account connected and two-step verification configured successfully!"
+          : "WhatsApp account connected successfully!",
+      );
     }
 
     await fetchAccounts();

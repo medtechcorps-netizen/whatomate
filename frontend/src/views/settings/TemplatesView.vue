@@ -11,6 +11,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { PageHeader, SearchInput, DataTable, IconButton, DeleteConfirmDialog, ErrorState, type Column } from '@/components/shared'
 import { api, templatesService } from '@/services/api'
 import { useOrganizationsStore } from '@/stores/organizations'
+import { useAuthStore } from '@/stores/auth'
 import { toast } from 'vue-sonner'
 import { Plus, RefreshCw, FileText, Pencil, Trash2, Loader2, MessageSquare, Image, FileIcon, Video } from 'lucide-vue-next'
 import { getErrorMessage } from '@/lib/api-utils'
@@ -46,6 +47,7 @@ interface Template {
 }
 
 const organizationsStore = useOrganizationsStore()
+const authStore = useAuthStore()
 
 const templates = ref<Template[]>([])
 const accounts = ref<WhatsAppAccount[]>([])
@@ -53,6 +55,9 @@ const isLoading = ref(true)
 const error = ref<string | null>(null)
 const isSyncing = ref(false)
 const selectedAccount = ref<string>(localStorage.getItem('templates_selected_account') || 'all')
+const canWrite = computed(() => authStore.hasPermission('templates', 'write'))
+const canDelete = computed(() => authStore.hasPermission('templates', 'delete'))
+const canSync = computed(() => authStore.hasPermission('templates', 'sync'))
 
 // Delete dialog state
 const deleteDialogOpen = ref(false)
@@ -210,6 +215,8 @@ async function fetchTemplates() {
 }
 
 async function syncTemplates() {
+  if (!canSync.value) return
+
   if (!selectedAccount.value || selectedAccount.value === 'all') {
     toast.error(t('templates.selectAccountFirst'))
     return
@@ -230,12 +237,13 @@ async function syncTemplates() {
 }
 
 function openDeleteDialog(template: Template) {
+  if (!canDelete.value) return
   templateToDelete.value = template
   deleteDialogOpen.value = true
 }
 
 async function confirmDeleteTemplate() {
-  if (!templateToDelete.value) return
+  if (!canDelete.value || !templateToDelete.value) return
 
   isDeleting.value = true
   try {
@@ -298,12 +306,12 @@ function getHeaderIcon(type: string) {
   <div class="flex flex-col h-full bg-[#0a0a0b] light:bg-gray-50">
     <PageHeader :title="$t('templates.title')" :subtitle="$t('templates.subtitle')" :icon="FileText" icon-gradient="bg-gradient-to-br from-blue-500 to-cyan-600 shadow-blue-500/20">
       <template #actions>
-        <Button variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !selectedAccount || selectedAccount === 'all'">
+        <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !selectedAccount || selectedAccount === 'all'">
           <Loader2 v-if="isSyncing" class="h-4 w-4 mr-2 animate-spin" />
           <RefreshCw v-else class="h-4 w-4 mr-2" />
           {{ $t('templates.syncFromMeta') }}
         </Button>
-        <RouterLink to="/templates/new">
+        <RouterLink v-if="canWrite" to="/templates/new">
           <Button variant="outline" size="sm">
             <Plus class="h-4 w-4 mr-2" />
             {{ $t('templates.createTemplate') }}
@@ -406,6 +414,7 @@ function getHeaderIcon(type: string) {
                       />
                     </RouterLink>
                     <IconButton
+                      v-if="canDelete"
                       :icon="Trash2"
                       :label="$t('common.delete')"
                       class="h-8 w-8 text-destructive"
@@ -415,11 +424,11 @@ function getHeaderIcon(type: string) {
                 </template>
                 <template #empty-action>
                   <div class="flex items-center justify-center gap-2">
-                    <Button variant="outline" size="sm" @click="syncTemplates" :disabled="!selectedAccount || selectedAccount === 'all'">
+                    <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="!selectedAccount || selectedAccount === 'all'">
                       <RefreshCw class="h-4 w-4 mr-2" />
                       {{ $t('templates.syncFromMeta') }}
                     </Button>
-                    <RouterLink to="/templates/new">
+                    <RouterLink v-if="canWrite" to="/templates/new">
                       <Button variant="outline" size="sm">
                         <Plus class="h-4 w-4 mr-2" />
                         {{ $t('templates.createTemplate') }}

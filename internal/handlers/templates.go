@@ -60,9 +60,9 @@ type TemplateResponse struct {
 
 // ListTemplates returns all templates for the organization
 func (a *App) ListTemplates(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceTemplates, models.ActionRead)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	pg := parsePagination(r)
@@ -108,9 +108,9 @@ func (a *App) ListTemplates(r *fastglue.Request) error {
 
 // CreateTemplate creates a new message template
 func (a *App) CreateTemplate(r *fastglue.Request) error {
-	orgID, userID, err := a.getOrgAndUserID(r)
+	orgID, userID, err := a.requireAuth(r, models.ResourceTemplates, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	var req TemplateRequest
@@ -198,9 +198,9 @@ func (a *App) CreateTemplate(r *fastglue.Request) error {
 
 // GetTemplate returns a single template
 func (a *App) GetTemplate(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceTemplates, models.ActionRead)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	id, err := parsePathUUID(r, "id", "template")
@@ -227,9 +227,9 @@ func (a *App) GetTemplate(r *fastglue.Request) error {
 
 // UpdateTemplate updates a message template
 func (a *App) UpdateTemplate(r *fastglue.Request) error {
-	orgID, userID, err := a.getOrgAndUserID(r)
+	orgID, userID, err := a.requireAuth(r, models.ResourceTemplates, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	id, err := parsePathUUID(r, "id", "template")
@@ -323,9 +323,9 @@ func (a *App) UpdateTemplate(r *fastglue.Request) error {
 
 // DeleteTemplate deletes a message template
 func (a *App) DeleteTemplate(r *fastglue.Request) error {
-	orgID, userID, err := a.getOrgAndUserID(r)
+	orgID, userID, err := a.requireAuth(r, models.ResourceTemplates, models.ActionDelete)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	id, err := parsePathUUID(r, "id", "template")
@@ -359,9 +359,9 @@ func (a *App) DeleteTemplate(r *fastglue.Request) error {
 
 // SubmitTemplate submits a template to Meta for approval
 func (a *App) SubmitTemplate(r *fastglue.Request) error {
-	orgID, userID, err := a.getOrgAndUserID(r)
+	orgID, userID, err := a.requireAuth(r, models.ResourceTemplates, models.ActionWrite)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	id, err := parsePathUUID(r, "id", "template")
@@ -456,9 +456,9 @@ func (a *App) submitTemplateToMeta(account *models.WhatsAppAccount, template *mo
 
 // SyncTemplates syncs templates from Meta API
 func (a *App) SyncTemplates(r *fastglue.Request) error {
-	orgID, err := a.getOrgID(r)
+	orgID, _, err := a.requireAuth(r, models.ResourceTemplates, models.ActionSync)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
 	}
 
 	// Get account name from query or body
