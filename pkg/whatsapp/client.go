@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,6 +21,14 @@ const (
 	DefaultTimeout = 30 * time.Second
 	// BaseURL for Meta Graph API
 	BaseURL = "https://graph.facebook.com"
+)
+
+var (
+	// Meta Graph object IDs are decimal strings. Validate provider-controlled
+	// account fields before they are interpolated into a URL path so a malformed
+	// stored value cannot alter the Graph endpoint being called.
+	graphObjectIDPattern   = regexp.MustCompile(`^[0-9]{1,32}$`)
+	graphAPIVersionPattern = regexp.MustCompile(`^v[0-9]{1,3}\.[0-9]{1,3}$`)
 )
 
 // Client is the WhatsApp Cloud API client
@@ -602,6 +611,111 @@ func (c *Client) SubscribeApp(ctx context.Context, account *Account) error {
 	}
 
 	c.Log.Info("App subscribed to webhooks", "business_id", account.BusinessID)
+	return nil
+}
+
+// ConfigurePhoneWebhookOverride configures an alternate webhook callback for
+// exactly one WhatsApp phone number. It deliberately targets account.PhoneID,
+// never the WABA or app-level callback. Meta must read back the exact callback
+// from webhook_configuration.phone_number before this function returns success.
+//
+// Callers must supply credentials from a trusted server-side account record;
+// this method does not log or return either secret.
+func (c *Client) ConfigurePhoneWebhookOverride(
+	ctx context.Context,
+	account *Account,
+	callbackURL string,
+	verifyToken string,
+) error {
+	endpoint, err := c.phoneGraphEndpoint(account)
+	if err != nil {
+		return err
+	}
+	if err := validateWebhookOverrideInputs(callbackURL, verifyToken); err != nil {
+		return err
+	}
+
+	type webhookConfiguration struct {
+		OverrideCallbackURI string `json:"override_callback_uri"`
+		VerifyToken         string `json:"verify_token"`
+	}
+	type setOverrideRequest struct {
+		WebhookConfiguration webhookConfiguration `json:"webhook_configuration"`
+	}
+	type setOverrideResponse struct {
+		Success *bool `json:"success"`
+	}
+
+	responseBody, err := c.doRequest(ctx, http.MethodPost, endpoint, setOverrideRequest{
+		WebhookConfiguration: webhookConfiguration{
+			OverrideCallbackURI: callbackURL,
+			VerifyToken:         verifyToken,
+		},
+	}, account.AccessToken)
+	if err != nil {
+		return fmt.Errorf("failed to set phone webhook override: %w", err)
+	}
+
+	// Meta normally returns {"success":true}. A missing success field is allowed
+	// so the required readback remains authoritative, but an explicit false is
+	// never treated as a successful configuration.
+	var setResponse setOverrideResponse
+	if err := json.Unmarshal(responseBody, &setResponse); err == nil &&
+		setResponse.Success != nil && !*setResponse.Success {
+		return fmt.Errorf("meta did not accept the phone webhook override")
+	}
+
+	type readbackResponse struct {
+		WebhookConfiguration struct {
+			PhoneNumber string `json:"phone_number"`
+		} `json:"webhook_configuration"`
+	}
+	readbackBody, err := c.doRequest(
+		ctx,
+		http.MethodGet,
+		endpoint+"?fields=webhook_configuration",
+		nil,
+		account.AccessToken,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to verify phone webhook override: %w", err)
+	}
+
+	var readback readbackResponse
+	if err := json.Unmarshal(readbackBody, &readback); err != nil {
+		return fmt.Errorf("failed to parse phone webhook override verification: %w", err)
+	}
+	if readback.WebhookConfiguration.PhoneNumber != callbackURL {
+		return fmt.Errorf("phone webhook override verification did not report the expected callback")
+	}
+
+	return nil
+}
+
+func (c *Client) phoneGraphEndpoint(account *Account) (string, error) {
+	if account == nil {
+		return "", fmt.Errorf("WhatsApp account is required")
+	}
+	phoneID := strings.TrimSpace(account.PhoneID)
+	apiVersion := strings.TrimSpace(account.APIVersion)
+	if !graphObjectIDPattern.MatchString(phoneID) {
+		return "", fmt.Errorf("invalid WhatsApp phone ID")
+	}
+	if !graphAPIVersionPattern.MatchString(apiVersion) {
+		return "", fmt.Errorf("invalid WhatsApp API version")
+	}
+	return fmt.Sprintf("%s/%s/%s", strings.TrimRight(c.getBaseURL(), "/"), apiVersion, url.PathEscape(phoneID)), nil
+}
+
+func validateWebhookOverrideInputs(callbackURL, verifyToken string) error {
+	if strings.TrimSpace(verifyToken) == "" {
+		return fmt.Errorf("webhook verify token is required")
+	}
+	parsedCallback, err := url.Parse(callbackURL)
+	if err != nil || parsedCallback.Scheme != "https" || parsedCallback.Host == "" ||
+		parsedCallback.User != nil || parsedCallback.Fragment != "" {
+		return fmt.Errorf("invalid webhook callback URL")
+	}
 	return nil
 }
 

@@ -1012,6 +1012,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST("/api/accounts/{id}/register", tenant((*handlers.App).RegisterPhoneNumber)) // Embedded signup manual/2fa registration
 	g.POST("/api/accounts/{id}/test", tenant((*handlers.App).TestAccountConnection))
 	g.POST("/api/accounts/{id}/subscribe", tenant((*handlers.App).SubscribeApp))
+	// Meta synchronously verifies the callback during this network call. The
+	// handler uses short tenant phases around it, so do not wrap it in the
+	// transaction-spanning tenant adapter.
+	g.POST("/api/accounts/{id}/webhook-override", app.ConfigurePhoneWebhookOverride)
 	g.GET("/api/accounts/{id}/business_profile", tenant((*handlers.App).GetBusinessProfile))
 	g.PUT("/api/accounts/{id}/business_profile", tenant((*handlers.App).UpdateBusinessProfile))
 	g.POST("/api/accounts/{id}/business_profile/photo", tenant((*handlers.App).UpdateProfilePicture))

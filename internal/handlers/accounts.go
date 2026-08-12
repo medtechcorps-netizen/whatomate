@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/audit"
 	"github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
@@ -22,12 +23,19 @@ import (
 )
 
 var (
-	errMetaIntegrationDisabled        = errors.New("meta integration is disabled")
-	errAccountEncryptionUnavailable   = errors.New("account credential encryption is unavailable")
-	errMetaAppIDNotConfigured         = errors.New("meta app ID is not configured")
-	errMetaAppSecretNotConfigured     = errors.New("meta app secret is not configured")
-	errMetaTokenValidationUnavailable = errors.New("meta access token validation is unavailable")
+	errMetaIntegrationDisabled                    = errors.New("meta integration is disabled")
+	errAccountEncryptionUnavailable               = errors.New("account credential encryption is unavailable")
+	errMetaAppIDNotConfigured                     = errors.New("meta app ID is not configured")
+	errMetaAppSecretNotConfigured                 = errors.New("meta app secret is not configured")
+	errMetaTokenValidationUnavailable             = errors.New("meta access token validation is unavailable")
+	errPhoneWebhookOverrideAccountInactive        = errors.New("phone webhook override account is inactive")
+	errPhoneWebhookOverrideCredentialsUnavailable = errors.New("phone webhook override credentials are unavailable")
 )
+
+// canonicalPhoneWebhookOrigin is intentionally a fixed production origin.
+// Never derive this from Host, Origin, or X-Forwarded-* request values: those
+// headers are caller-controlled and can route Meta webhooks to an attacker.
+const canonicalPhoneWebhookOrigin = "https://app.rereply.app"
 
 // AccountRequest represents the request body for creating/updating an account
 type AccountRequest struct {
@@ -770,6 +778,139 @@ func (a *App) SubscribeApp(r *fastglue.Request) error {
 	return r.SendEnvelope(map[string]any{
 		"success": true,
 		"message": "App subscribed to webhooks successfully. You should now receive incoming messages.",
+	})
+}
+
+// ConfigurePhoneWebhookOverride configures Meta's alternate callback for one
+// stored WhatsApp phone number. The endpoint has no body so callers cannot
+// choose a callback, token, phone ID, WABA, or Graph API version.
+func (a *App) ConfigurePhoneWebhookOverride(r *fastglue.Request) error {
+	orgID, userID, err := a.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
+	if err != nil {
+		return nil
+	}
+	// Rerouting inbound provider events changes a workspace-wide security
+	// boundary. Accounts write alone is intentionally insufficient.
+	if err := a.requirePermission(r, userID, models.ResourceSettingsIntegrations, models.ActionWrite); err != nil {
+		return nil
+	}
+
+	id, err := parsePathUUID(r, "id", "account")
+	if err != nil {
+		return nil
+	}
+	if a.WhatsApp == nil {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "WhatsApp integration is unavailable", nil, "")
+	}
+
+	// Meta verifies the configured callback synchronously. Do not retain a
+	// tenant transaction while Meta performs that verification, otherwise the
+	// inbound GET may be blocked behind this request's database connection.
+	// Load only the provider inputs in a short, committed tenant phase.
+	type overrideSnapshot struct {
+		accountID        uuid.UUID
+		credentials      *whatsapp.Account
+		workspaceManaged bool
+	}
+	var snapshot overrideSnapshot
+	err = a.WithTenantApp(orgID, func(scoped *App) error {
+		var account models.WhatsAppAccount
+		if err := scoped.DB.Where("id = ? AND organization_id = ?", id, orgID).First(&account).Error; err != nil {
+			return err
+		}
+		if strings.TrimSpace(account.Status) != "active" {
+			return errPhoneWebhookOverrideAccountInactive
+		}
+		accessToken, err := crypto.Decrypt(account.AccessToken, scoped.integrationEncryptionKey())
+		if err != nil || strings.TrimSpace(accessToken) == "" || crypto.IsEncrypted(accessToken) {
+			return errPhoneWebhookOverrideCredentialsUnavailable
+		}
+		var organization models.Organization
+		if err := scoped.DB.Select("id", "settings").Where("id = ?", orgID).First(&organization).Error; err != nil {
+			return err
+		}
+		snapshot = overrideSnapshot{
+			accountID: account.ID,
+			credentials: &whatsapp.Account{
+				PhoneID:     account.PhoneID,
+				APIVersion:  account.APIVersion,
+				AccessToken: accessToken,
+			},
+			workspaceManaged: metaWorkspaceAppManaged(&organization),
+		}
+		return nil
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Account not found", nil, "")
+		case errors.Is(err, errPhoneWebhookOverrideAccountInactive):
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account must be active before configuring its webhook", nil, "")
+		case errors.Is(err, errPhoneWebhookOverrideCredentialsUnavailable):
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account credentials are unavailable", nil, "")
+		default:
+			a.Log.Error("Failed to prepare phone webhook override", "error", err, "account_id", id, "organization_id", orgID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to prepare phone webhook override", nil, "")
+		}
+	}
+
+	// New Embedded Signup accounts intentionally do not copy the webhook token
+	// into a phone-account row. Resolve the authoritative Integration Center or
+	// platform credential in a separate short tenant phase instead. This action
+	// must never fall back to a legacy account token: a workspace-managed callback
+	// must be verified with that workspace's central token.
+	verifyToken, authoritative, err := a.resolveMetaWebhookVerifyToken(orgID)
+	if err != nil {
+		if errors.Is(err, errMetaIntegrationDisabled) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Meta integration must be enabled before configuring its webhook", nil, "")
+		}
+		a.Log.Error("Failed to resolve phone webhook verification", "error", err, "account_id", snapshot.accountID, "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Meta webhook verification is unavailable", nil, "")
+	}
+	if !authoritative || strings.TrimSpace(verifyToken) == "" {
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account webhook verification is not configured", nil, "")
+	}
+	callbackURL := canonicalPhoneWebhookOrigin + metaWebhookCallbackPath(orgID, snapshot.workspaceManaged)
+
+	ctx, cancel := context.WithTimeout(requestContext(r), 30*time.Second)
+	defer cancel()
+	if err := a.WhatsApp.ConfigurePhoneWebhookOverride(
+		ctx,
+		snapshot.credentials,
+		callbackURL,
+		verifyToken,
+	); err != nil {
+		a.Log.Warn("Failed to configure phone webhook override", "account_id", snapshot.accountID, "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusBadGateway, "Meta could not verify the phone webhook override", nil, "")
+	}
+
+	// Record the external mutation in a separate short tenant phase. Neither
+	// token is included in the audit data, response, or logs.
+	if err := a.WithTenantApp(orgID, func(scoped *App) error {
+		return audit.LogAudit(
+			scoped.DB,
+			orgID,
+			userID,
+			audit.GetUserName(scoped.DB, userID),
+			"account",
+			snapshot.accountID,
+			models.AuditActionUpdated,
+			nil,
+			nil,
+			map[string]any{
+				"field":     "phone_webhook_override",
+				"old_value": "not recorded",
+				"new_value": "configured",
+			},
+		)
+	}); err != nil {
+		a.Log.Error("Failed to audit phone webhook override", "error", err, "account_id", snapshot.accountID, "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Phone webhook override was configured but could not be audited", nil, "")
+	}
+
+	return r.SendEnvelope(map[string]any{
+		"success": true,
+		"message": "Phone-specific webhook override configured and verified.",
 	})
 }
 

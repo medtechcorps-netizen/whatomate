@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/config"
+	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
@@ -179,6 +180,15 @@ func createAccountValidationAdmin(t *testing.T, app *handlers.App, orgID uuid.UU
 	role := testutil.CreateTestRoleWithKeys(t, app.DB, orgID, "account-validation", []string{
 		"accounts:read",
 		"accounts:write",
+	})
+	return testutil.CreateTestUser(t, app.DB, orgID, testutil.WithRoleID(&role.ID))
+}
+
+func createWebhookOverrideAdmin(t *testing.T, app *handlers.App, orgID uuid.UUID) *models.User {
+	t.Helper()
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, orgID, "phone-webhook-override", []string{
+		"accounts:write",
+		"settings.integrations:write",
 	})
 	return testutil.CreateTestUser(t, app.DB, orgID, testutil.WithRoleID(&role.ID))
 }
@@ -444,6 +454,201 @@ func TestApp_SubscribeApp_CrossOrgIsolation(t *testing.T) {
 
 	require.NoError(t, app.SubscribeApp(req))
 	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(req))
+}
+
+// --- ConfigurePhoneWebhookOverride ---
+
+func TestApp_ConfigurePhoneWebhookOverride_Success(t *testing.T) {
+	meta := newFakeMetaServer(t)
+	app := newAppWithMeta(t, meta)
+	app.Config.App.EncryptionKey = "this-is-a-32-character-test-key-XX"
+	org := testutil.CreateTestOrganization(t, app.DB)
+	acc := createTestAccountForValidation(t, app.DB, org.ID, "123456789", "biz-1")
+	acc.WebhookVerifyToken = ""
+	require.NoError(t, app.DB.Save(acc).Error)
+	admin := createWebhookOverrideAdmin(t, app, org.ID)
+	workspaceVerifyToken := "workspace-verify-token"
+	encryptedVerifyToken, err := appcrypto.Encrypt(workspaceVerifyToken, app.Config.App.EncryptionKey)
+	require.NoError(t, err)
+	org.Settings = models.JSONB{
+		"meta_app_id":                         "workspace-meta-app",
+		"meta_webhook_verify_token_encrypted": encryptedVerifyToken,
+	}
+	require.NoError(t, app.DB.Model(&models.Organization{}).Where("id = ?", org.ID).Update("settings", org.Settings).Error)
+	expectedCallback := "https://app.rereply.app/api/webhook?workspace=" + org.ID.String()
+
+	var providerRequest struct {
+		callbackURL string
+		verifyToken string
+	}
+	var providerRequestErr error
+	var providerRequestMu sync.Mutex
+
+	meta.phoneFn = func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			var payload struct {
+				WebhookConfiguration struct {
+					OverrideCallbackURI string `json:"override_callback_uri"`
+					VerifyToken         string `json:"verify_token"`
+				} `json:"webhook_configuration"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				providerRequestMu.Lock()
+				providerRequestErr = err
+				providerRequestMu.Unlock()
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			providerRequestMu.Lock()
+			providerRequest.callbackURL = payload.WebhookConfiguration.OverrideCallbackURI
+			providerRequest.verifyToken = payload.WebhookConfiguration.VerifyToken
+			providerRequestMu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		case http.MethodGet:
+			assert.Equal(t, "webhook_configuration", r.URL.Query().Get("fields"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"webhook_configuration": map[string]string{
+					"phone_number": expectedCallback,
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, admin.ID)
+	testutil.SetPathParam(req, "id", acc.ID.String())
+
+	require.NoError(t, app.ConfigurePhoneWebhookOverride(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var response struct {
+		Data map[string]any `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &response))
+	assert.Equal(t, true, response.Data["success"])
+	assert.Equal(t, "Phone-specific webhook override configured and verified.", response.Data["message"])
+	providerRequestMu.Lock()
+	assert.NoError(t, providerRequestErr)
+	assert.Equal(t, expectedCallback, providerRequest.callbackURL)
+	assert.Equal(t, workspaceVerifyToken, providerRequest.verifyToken)
+	providerRequestMu.Unlock()
+
+	meta.mu.Lock()
+	requests := meta.hits["/v18.0/123456789"]
+	meta.mu.Unlock()
+	assert.Equal(t, 2, requests, "Meta must receive a set call and an authoritative readback")
+
+	var auditEntry models.AuditLog
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND resource_type = ? AND resource_id = ? AND action = ?",
+		org.ID,
+		"account",
+		acc.ID,
+		models.AuditActionUpdated,
+	).Order("created_at DESC").First(&auditEntry).Error)
+	auditJSON, err := json.Marshal(auditEntry)
+	require.NoError(t, err)
+	assert.NotContains(t, string(auditJSON), "plain-test-token")
+	assert.NotContains(t, string(auditJSON), "verify-token")
+	assert.NotContains(t, string(auditJSON), workspaceVerifyToken)
+}
+
+func TestApp_ConfigurePhoneWebhookOverride_RejectsUnauthorizedAndInvalidAccounts(t *testing.T) {
+	tests := []struct {
+		name        string
+		configure   func(*models.WhatsAppAccount)
+		userKeys    []string
+		expected    int
+		expectedMsg string
+	}{
+		{
+			name:        "settings permission required",
+			userKeys:    []string{"accounts:write"},
+			expected:    fasthttp.StatusForbidden,
+			expectedMsg: "Insufficient permissions",
+		},
+		{
+			name: "account must be active",
+			configure: func(acc *models.WhatsAppAccount) {
+				acc.Status = "inactive"
+			},
+			userKeys:    []string{"accounts:write", "settings.integrations:write"},
+			expected:    fasthttp.StatusConflict,
+			expectedMsg: "WhatsApp account must be active",
+		},
+		{
+			name:        "central verify token required despite legacy account token",
+			userKeys:    []string{"accounts:write", "settings.integrations:write"},
+			expected:    fasthttp.StatusConflict,
+			expectedMsg: "webhook verification is not configured",
+		},
+		{
+			name: "access token required",
+			configure: func(acc *models.WhatsAppAccount) {
+				acc.AccessToken = ""
+			},
+			userKeys:    []string{"accounts:write", "settings.integrations:write"},
+			expected:    fasthttp.StatusConflict,
+			expectedMsg: "credentials are unavailable",
+		},
+		{
+			name: "encrypted access token requires server decryption key",
+			configure: func(acc *models.WhatsAppAccount) {
+				acc.AccessToken = "enc:unreadable-without-server-key"
+			},
+			userKeys:    []string{"accounts:write", "settings.integrations:write"},
+			expected:    fasthttp.StatusConflict,
+			expectedMsg: "credentials are unavailable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := newFakeMetaServer(t)
+			app := newAppWithMeta(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			acc := createTestAccountForValidation(t, app.DB, org.ID, "123456789", "biz-1")
+			if tt.configure != nil {
+				tt.configure(acc)
+				require.NoError(t, app.DB.Save(acc).Error)
+			}
+			user := integrationTestUserForAccountValidation(t, app, org.ID, tt.userKeys)
+
+			req := testutil.NewGETRequest(t)
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			testutil.SetPathParam(req, "id", acc.ID.String())
+
+			require.NoError(t, app.ConfigurePhoneWebhookOverride(req))
+			testutil.AssertErrorResponse(t, req, tt.expected, tt.expectedMsg)
+			meta.mu.Lock()
+			requests := meta.hits["/v18.0/123456789"]
+			meta.mu.Unlock()
+			assert.Zero(t, requests, "invalid requests must not call Meta")
+		})
+	}
+}
+
+func TestApp_ConfigurePhoneWebhookOverride_CrossOrgIsolation(t *testing.T) {
+	meta := newFakeMetaServer(t)
+	app := newAppWithMeta(t, meta)
+	ownerOrg := testutil.CreateTestOrganization(t, app.DB)
+	requesterOrg := testutil.CreateTestOrganization(t, app.DB)
+	acc := createTestAccountForValidation(t, app.DB, ownerOrg.ID, "123456789", "biz-1")
+	admin := createWebhookOverrideAdmin(t, app, requesterOrg.ID)
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, requesterOrg.ID, admin.ID)
+	testutil.SetPathParam(req, "id", acc.ID.String())
+
+	require.NoError(t, app.ConfigurePhoneWebhookOverride(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusNotFound, "Account not found")
+	meta.mu.Lock()
+	requests := meta.hits["/v18.0/123456789"]
+	meta.mu.Unlock()
+	assert.Zero(t, requests, "another workspace must not configure the phone callback")
 }
 
 func TestApp_AccountValidationActionsRequirePermissions(t *testing.T) {
