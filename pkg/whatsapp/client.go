@@ -662,7 +662,7 @@ func (c *Client) ConfigurePhoneWebhookOverride(
 	var setResponse setOverrideResponse
 	if err := json.Unmarshal(responseBody, &setResponse); err == nil &&
 		setResponse.Success != nil && !*setResponse.Success {
-		return fmt.Errorf("Meta did not accept the phone webhook override")
+		return fmt.Errorf("meta did not accept the phone webhook override")
 	}
 
 	type readbackResponse struct {
