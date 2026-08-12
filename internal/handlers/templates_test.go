@@ -83,6 +83,116 @@ func TestApp_UploadTemplateMedia_RequiresTemplateWritePermission(t *testing.T) {
 	testutil.AssertErrorResponse(t, req, fasthttp.StatusForbidden, "Insufficient permissions")
 }
 
+func TestApp_TemplateHandlers_RequireExpectedPermissions(t *testing.T) {
+	tests := []struct {
+		name          string
+		requiredKey   string
+		invokeHandler func(*handlers.App, *fastglue.Request) error
+	}{
+		{
+			name:        "list requires read",
+			requiredKey: "templates:read",
+			invokeHandler: func(app *handlers.App, req *fastglue.Request) error {
+				return app.ListTemplates(req)
+			},
+		},
+		{
+			name:        "get requires read",
+			requiredKey: "templates:read",
+			invokeHandler: func(app *handlers.App, req *fastglue.Request) error {
+				return app.GetTemplate(req)
+			},
+		},
+		{
+			name:        "create requires write",
+			requiredKey: "templates:write",
+			invokeHandler: func(app *handlers.App, req *fastglue.Request) error {
+				return app.CreateTemplate(req)
+			},
+		},
+		{
+			name:        "update requires write",
+			requiredKey: "templates:write",
+			invokeHandler: func(app *handlers.App, req *fastglue.Request) error {
+				return app.UpdateTemplate(req)
+			},
+		},
+		{
+			name:        "submit requires write",
+			requiredKey: "templates:write",
+			invokeHandler: func(app *handlers.App, req *fastglue.Request) error {
+				return app.SubmitTemplate(req)
+			},
+		},
+		{
+			name:        "upload requires write",
+			requiredKey: "templates:write",
+			invokeHandler: func(app *handlers.App, req *fastglue.Request) error {
+				return app.UploadTemplateMedia(req)
+			},
+		},
+		{
+			name:        "delete requires delete",
+			requiredKey: "templates:delete",
+			invokeHandler: func(app *handlers.App, req *fastglue.Request) error {
+				return app.DeleteTemplate(req)
+			},
+		},
+		{
+			name:        "sync requires sync",
+			requiredKey: "templates:sync",
+			invokeHandler: func(app *handlers.App, req *fastglue.Request) error {
+				return app.SyncTemplates(req)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := newTestApp(t)
+			org := testutil.CreateTestOrganization(t, app.DB)
+
+			allowedRole := testutil.CreateTestRoleWithKeys(
+				t,
+				app.DB,
+				org.ID,
+				"allowed-template-handler",
+				[]string{tt.requiredKey},
+			)
+			allowedUser := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&allowedRole.ID))
+			allowedReq := testutil.NewRequest(t)
+			testutil.SetAuthContext(allowedReq, org.ID, allowedUser.ID)
+
+			require.NoError(t, tt.invokeHandler(app, allowedReq))
+			assert.NotEqual(
+				t,
+				fasthttp.StatusForbidden,
+				testutil.GetResponseStatusCode(allowedReq),
+				"the exact required permission should pass the authorization gate",
+			)
+
+			deniedRole := testutil.CreateTestRoleWithKeys(
+				t,
+				app.DB,
+				org.ID,
+				"denied-template-handler",
+				[]string{"accounts:read"},
+			)
+			deniedUser := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&deniedRole.ID))
+			deniedReq := testutil.NewRequest(t)
+			testutil.SetAuthContext(deniedReq, org.ID, deniedUser.ID)
+
+			require.NoError(t, tt.invokeHandler(app, deniedReq))
+			testutil.AssertErrorResponse(
+				t,
+				deniedReq,
+				fasthttp.StatusForbidden,
+				"Insufficient permissions",
+			)
+		})
+	}
+}
+
 // --- ExtParamNames Tests (existing) ---
 
 func TestExtParamNames_PositionalParams(t *testing.T) {
