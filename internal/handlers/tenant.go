@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/database"
@@ -128,11 +129,34 @@ func (a *App) WithTenantApp(organizationID uuid.UUID, fn func(*App) error) error
 	})
 }
 
+// WithCommittedTenantApp runs one short database phase and commits it before
+// returning. It is used when provider I/O must happen between durable tenant
+// state transitions. Unlike WithTenantApp, it also opens a real transaction
+// when PostgreSQL RLS is disabled.
+func (a *App) WithCommittedTenantApp(organizationID uuid.UUID, fn func(*App) error) error {
+	if a == nil || fn == nil {
+		return errors.New("tenant app callback is required")
+	}
+	if organizationID == uuid.Nil {
+		return database.ErrMissingTenant
+	}
+	root := a.rootApp()
+	if a.rlsEnabled() {
+		return database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
+			return fn(root.scopedApp(tx, organizationID))
+		})
+	}
+	return root.DB.Transaction(func(tx *gorm.DB) error {
+		return fn(root.scopedApp(tx, organizationID))
+	})
+}
+
 func (a *App) hasTenantScope() bool {
 	return a != nil && a.tenantOrgID != uuid.Nil
 }
 
 func (a *App) resolveWhatsAppOrganization(phoneID string) (uuid.UUID, error) {
+	phoneID = strings.TrimSpace(phoneID)
 	if phoneID == "" {
 		return uuid.Nil, database.ErrMissingTenant
 	}
@@ -158,7 +182,7 @@ func (a *App) resolveWhatsAppOrganization(phoneID string) (uuid.UUID, error) {
 		var account models.WhatsAppAccount
 		if err := root.DB.
 			Select("organization_id").
-			Where("phone_id = ?", phoneID).
+			Where("BTRIM(phone_id) = BTRIM(?)", phoneID).
 			First(&account).Error; err != nil {
 			return uuid.Nil, err
 		}

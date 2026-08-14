@@ -12,7 +12,10 @@ import (
 )
 
 const (
-	tenantSetting           = "app.current_organization_id"
+	tenantSetting = "app.current_organization_id"
+	// Keep version 5 for binary rollback compatibility. The normalized
+	// WhatsApp resolver is backward-compatible, while the new binary verifies
+	// its global uniqueness index independently before serving traffic.
 	tenantRLSRoutingVersion = 5
 )
 
@@ -451,6 +454,35 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		}
 	}
 
+	var whatsappPhoneRoutingIndexValid bool
+	if err := db.Raw(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_catalog.pg_index AS index_state
+			JOIN pg_catalog.pg_class AS index_relation
+			  ON index_relation.oid = index_state.indexrelid
+			JOIN pg_catalog.pg_class AS table_relation
+			  ON table_relation.oid = index_state.indrelid
+			JOIN pg_catalog.pg_namespace AS table_namespace
+			  ON table_namespace.oid = table_relation.relnamespace
+			WHERE table_namespace.nspname = 'public'
+			  AND table_relation.relname = 'whatsapp_accounts'
+			  AND index_relation.relname = 'uq_whatsapp_accounts_live_phone_id'
+			  AND index_state.indisunique
+			  AND index_state.indisvalid
+			  AND index_state.indisready
+			  AND index_state.indnkeyatts = 1
+			  AND index_state.indnatts = 1
+			  AND pg_catalog.pg_get_expr(index_state.indexprs, index_state.indrelid) = 'btrim((phone_id)::text)'
+			  AND pg_catalog.pg_get_expr(index_state.indpred, index_state.indrelid) = '(deleted_at IS NULL)'
+		)
+	`).Scan(&whatsappPhoneRoutingIndexValid).Error; err != nil {
+		return fmt.Errorf("inspect WhatsApp Phone ID routing index: %w", err)
+	}
+	if !whatsappPhoneRoutingIndexValid {
+		return errors.New("WhatsApp Phone ID routing index is missing or invalid")
+	}
+
 	for _, signature := range []string{
 		"public.rereply_resolve_whatsapp_org(text)",
 		"public.rereply_resolve_webhook_org(text)",
@@ -530,8 +562,8 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		 AS $function$
 		   SELECT organization_id
 		   FROM public.whatsapp_accounts
-		   WHERE phone_id = p_phone_id AND deleted_at IS NULL
-		   LIMIT 1
+		   WHERE BTRIM(phone_id) = BTRIM(p_phone_id)
+		     AND deleted_at IS NULL
 		 $function$`,
 		`CREATE OR REPLACE FUNCTION public.rereply_resolve_webhook_org(p_verify_token text)
 		 RETURNS uuid

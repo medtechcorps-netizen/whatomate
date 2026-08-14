@@ -14,6 +14,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/calling"
 	"github.com/shridarpatil/whatomate/internal/config"
+	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/storage"
 	"github.com/shridarpatil/whatomate/internal/tts"
@@ -127,6 +128,57 @@ func (a *App) getOrgID(r *fastglue.Request) (uuid.UUID, error) {
 	return defaultOrgID, nil
 }
 
+var (
+	errExplicitOrganizationRequired    = errors.New("explicit organization header is required")
+	errExplicitOrganizationInvalid     = errors.New("explicit organization header is invalid")
+	errExplicitOrganizationUnavailable = errors.New("explicit organization is unavailable")
+)
+
+// getExplicitOrgID resolves the exact workspace pinned by a sensitive client
+// flow. Unlike getOrgID, it never falls back to the JWT/default organization
+// when the header is missing, malformed, or inaccessible.
+func (a *App) getExplicitOrgID(r *fastglue.Request) (uuid.UUID, error) {
+	raw := strings.TrimSpace(string(r.RequestCtx.Request.Header.Peek("X-Organization-ID")))
+	if raw == "" {
+		return uuid.Nil, errExplicitOrganizationRequired
+	}
+	requested, err := uuid.Parse(raw)
+	if err != nil || requested == uuid.Nil {
+		return uuid.Nil, errExplicitOrganizationInvalid
+	}
+	resolved, err := a.getOrgID(r)
+	if err != nil || resolved != requested {
+		return uuid.Nil, errExplicitOrganizationUnavailable
+	}
+	// getOrgID proves access, but a stale membership (or a super-admin lookup
+	// using Table) can outlive a soft-deleted workspace. Re-resolve the exact
+	// organization through the normal soft-delete scope on the root control
+	// plane before any provider request or tenant write.
+	var activeOrganization models.Organization
+	root := a.rootApp()
+	if root == nil || root.DB == nil ||
+		root.DB.Select("id").Where("id = ?", requested).First(&activeOrganization).Error != nil {
+		return uuid.Nil, errExplicitOrganizationUnavailable
+	}
+	return requested, nil
+}
+
+// requireExplicitOrganization writes a stable client response for exact
+// workspace binding failures without disclosing whether another workspace
+// exists or which access check failed.
+func (a *App) requireExplicitOrganization(r *fastglue.Request) (uuid.UUID, error) {
+	organizationID, err := a.getExplicitOrgID(r)
+	if err == nil {
+		return organizationID, nil
+	}
+	if errors.Is(err, errExplicitOrganizationRequired) || errors.Is(err, errExplicitOrganizationInvalid) {
+		_ = r.SendErrorEnvelope(fasthttp.StatusBadRequest, "X-Organization-ID must identify the selected organization", nil, "")
+	} else {
+		_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+	}
+	return uuid.Nil, errEnvelopeSent
+}
+
 // HealthCheck returns server health status
 func (a *App) HealthCheck(r *fastglue.Request) error {
 	return r.SendEnvelope(map[string]string{
@@ -201,26 +253,35 @@ func (a *App) ReadyCheck(r *fastglue.Request) error {
 // GetEmbeddedSignupConfig returns public configuration values for the embedded signup flow
 func (a *App) GetEmbeddedSignupConfig(r *fastglue.Request) error {
 	type EmbeddedSignupConfig struct {
-		WhatsAppAppID      string `json:"whatsapp_app_id,omitempty"`
-		WhatsAppConfigID   string `json:"whatsapp_config_id,omitempty"`
-		WhatsAppAPIVersion string `json:"whatsapp_api_version,omitempty"`
-		HasAppSecret       bool   `json:"has_app_secret"`
+		OrganizationID     uuid.UUID `json:"organization_id"`
+		WhatsAppAppID      string    `json:"whatsapp_app_id,omitempty"`
+		WhatsAppConfigID   string    `json:"whatsapp_config_id,omitempty"`
+		WhatsAppAPIVersion string    `json:"whatsapp_api_version,omitempty"`
+		HasAppSecret       bool      `json:"has_app_secret"`
 	}
 
-	orgID, err := a.getOrgID(r)
+	selectedOrgID, err := a.requireExplicitOrganization(r)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return nil
+	}
+	orgID, _, err := a.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
+	if err != nil {
+		return nil
+	}
+	if orgID != selectedOrgID {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
 	}
 
 	appID, appSecret, configID, err := a.resolveMetaAppCreds(orgID)
 	if err != nil {
 		if errors.Is(err, errMetaIntegrationDisabled) {
-			return r.SendEnvelope(EmbeddedSignupConfig{HasAppSecret: false})
+			return r.SendEnvelope(EmbeddedSignupConfig{OrganizationID: orgID, HasAppSecret: false})
 		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resolve credentials", nil, "")
 	}
 
 	config := EmbeddedSignupConfig{
+		OrganizationID:     orgID,
 		WhatsAppAppID:      appID,
 		WhatsAppConfigID:   configID,
 		WhatsAppAPIVersion: a.metaAPIVersion(),

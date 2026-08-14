@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,9 +56,9 @@ func newMockWhatsAppServer() *mockWhatsAppServer {
 
 		// Handle different endpoints
 		switch {
-		case r.URL.Path == "/v18.0/phone-123/messages" && r.Method == http.MethodPost:
+		case strings.HasPrefix(r.URL.Path, "/v18.0/") && strings.HasSuffix(r.URL.Path, "/messages") && r.Method == http.MethodPost:
 			m.handleMessages(w, r)
-		case r.URL.Path == "/v18.0/phone-123/media" && r.Method == http.MethodPost:
+		case strings.HasPrefix(r.URL.Path, "/v18.0/") && strings.HasSuffix(r.URL.Path, "/media") && r.Method == http.MethodPost:
 			m.handleMediaUpload(w, r)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -136,16 +139,19 @@ func newMsgTestApp(t *testing.T, mockServer *mockWhatsAppServer) *handlers.App {
 	return newTestApp(t, withWhatsApp(waClient))
 }
 
+var messageTestPhoneSequence atomic.Uint64
+
 // createTestAccount creates a test WhatsApp account in the database.
 func createTestAccount(t *testing.T, app *handlers.App, orgID uuid.UUID) *models.WhatsAppAccount {
 	t.Helper()
+	phoneID := strconv.FormatUint(9_000_000_000_000_000_000+messageTestPhoneSequence.Add(1), 10)
 
 	account := &models.WhatsAppAccount{
 		BaseModel:          models.BaseModel{ID: uuid.New()},
 		OrganizationID:     orgID,
 		Name:               "test-account-" + uuid.New().String()[:8],
-		PhoneID:            "phone-123",
-		BusinessID:         "business-123",
+		PhoneID:            phoneID,
+		BusinessID:         "8000000000000000000",
 		AccessToken:        "test-token",
 		WebhookVerifyToken: "webhook-token",
 		APIVersion:         "v18.0",

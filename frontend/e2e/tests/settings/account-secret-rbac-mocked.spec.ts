@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const organizationId = "91111111-1111-4111-8111-111111111111";
+const otherOrganizationId = "90000000-0000-4000-8000-000000000001";
 const accountId = "92222222-2222-4222-8222-222222222222";
 
 const accountReader = {
@@ -97,8 +98,13 @@ const accountRecord = {
   updated_at: "2026-07-29T08:30:00Z",
 };
 
-async function installAccountReaderMocks(page: Page, user = accountReader) {
+async function installAccountReaderMocks(
+  page: Page,
+  user = accountReader,
+  accountStatus = accountRecord.status,
+) {
   const mutatingRequests: string[] = [];
+  const resolvedAccount = { ...accountRecord, status: accountStatus };
 
   await page.addInitScript((user) => {
     window.localStorage.setItem("user", JSON.stringify(user));
@@ -131,14 +137,14 @@ async function installAccountReaderMocks(page: Page, user = accountReader) {
     route.fulfill({ json: { data: { token: "" } } }),
   );
   await page.route(/\/api\/accounts(?:\?.*)?$/, (route) =>
-    route.fulfill({ json: { data: { accounts: [accountRecord] } } }),
+    route.fulfill({ json: { data: { accounts: [resolvedAccount] } } }),
   );
   await page.route(
     new RegExp(`/api/accounts/${accountId}(?:\\?.*)?$`),
     (route) =>
       route.fulfill({
         json: {
-          data: accountRecord,
+          data: resolvedAccount,
         },
       }),
   );
@@ -186,6 +192,286 @@ test("account readers never receive duplicate webhook credential controls", asyn
     page.getByRole("button", { name: "Delete", exact: true }),
   ).toHaveCount(0);
   expect(mutatingRequests).toEqual([]);
+});
+
+test("account readers cannot register a phone awaiting recovery", async ({
+  page,
+}) => {
+  const mutatingRequests = await installAccountReaderMocks(
+    page,
+    accountReader,
+    "pending_registration",
+  );
+  await page.goto(`/settings/accounts/${accountId}`);
+
+  await expect(
+    page.getByRole("button", { name: "Register phone", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Subscribe", exact: true }),
+  ).toHaveCount(0);
+  expect(mutatingRequests).toEqual([]);
+});
+
+test("account writers confirm recovery once without sending or rendering a PIN", async ({
+  page,
+}) => {
+  await installAccountReaderMocks(
+    page,
+    accountWriter,
+    "pending_registration",
+  );
+
+  let accountStatus = "pending_registration";
+  const registrationRequests: Array<{
+    body: string | null;
+    organizationId: string | undefined;
+  }> = [];
+  let releaseRegistration: (() => void) | undefined;
+  const registrationGate = new Promise<void>((resolve) => {
+    releaseRegistration = resolve;
+  });
+
+  await page.route(
+    new RegExp(`/api/accounts/${accountId}(?:\\?.*)?$`),
+    (route) =>
+      route.fulfill({
+        json: { data: { ...accountRecord, status: accountStatus } },
+      }),
+  );
+  await page.route(
+    new RegExp(`/api/accounts/${accountId}/register(?:\\?.*)?$`),
+    async (route) => {
+      registrationRequests.push({
+        body: route.request().postData(),
+        organizationId:
+          route.request().headers()["x-organization-id"],
+      });
+      await registrationGate;
+      accountStatus = "pending_subscription";
+      await route.fulfill({
+        json: {
+          data: {
+            success: true,
+            // A stale server shape must still never become UI content.
+            pin: "483920",
+          },
+        },
+      });
+    },
+  );
+
+  await page.goto(`/settings/accounts/${accountId}`);
+
+  const openRegistration = page.getByRole("button", {
+    name: "Register phone",
+    exact: true,
+  });
+  await expect(openRegistration).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Subscribe", exact: true }),
+  ).toHaveCount(0);
+
+  await openRegistration.click();
+  const confirmation = page.getByRole("alertdialog");
+  await expect(confirmation).toContainText("Klinik Relive WhatsApp");
+  expect(registrationRequests).toHaveLength(0);
+
+  const confirmRegistration = confirmation.getByTestId(
+    "confirm-phone-registration",
+  );
+  await confirmRegistration.click();
+  await expect(confirmRegistration).toBeDisabled();
+  await expect(confirmRegistration).toContainText("Registering...");
+  await expect.poll(() => registrationRequests).toHaveLength(1);
+
+  releaseRegistration?.();
+
+  await expect(
+    page.locator("[data-sonner-toast]").filter({
+      hasText: "Phone registration completed successfully.",
+    }),
+  ).toBeVisible();
+  expect(registrationRequests).toEqual([
+    { body: null, organizationId },
+  ]);
+  await expect(openRegistration).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Subscribe", exact: true }),
+  ).toBeVisible();
+  await expect(page.locator("body")).not.toContainText("483920");
+});
+
+test("phone recovery failure stays generic and does not expose provider details", async ({
+  page,
+}) => {
+  await installAccountReaderMocks(
+    page,
+    accountWriter,
+    "pending_registration",
+  );
+  let registrationRequests = 0;
+  await page.route(
+    new RegExp(`/api/accounts/${accountId}/register(?:\\?.*)?$`),
+    async (route) => {
+      registrationRequests += 1;
+      await route.fulfill({
+        status: 400,
+        json: { message: "Provider rejected two-step PIN 654321" },
+      });
+    },
+  );
+
+  await page.goto(`/settings/accounts/${accountId}`);
+  await page
+    .getByRole("button", { name: "Register phone", exact: true })
+    .click();
+  await page
+    .getByRole("alertdialog")
+    .getByRole("button", { name: "Register phone", exact: true })
+    .click();
+
+  await expect(
+    page.locator("[data-sonner-toast]").filter({
+      hasText: "Phone registration could not be completed. Please try again.",
+    }),
+  ).toBeVisible();
+  expect(registrationRequests).toBe(1);
+  await expect(page.locator("body")).not.toContainText("654321");
+  await expect(page.locator("body")).not.toContainText(
+    "Provider rejected two-step PIN",
+  );
+});
+
+test("subscribe is available only for subscription recovery states", async ({
+  page,
+}) => {
+  await installAccountReaderMocks(page, accountWriter, "pending_subscription");
+  let accountStatus = "pending_subscription";
+  const subscriptionOrganizationIds: Array<string | undefined> = [];
+  await page.route(
+    new RegExp(`/api/accounts/${accountId}(?:\\?.*)?$`),
+    (route) =>
+      route.fulfill({
+        json: { data: { ...accountRecord, status: accountStatus } },
+      }),
+  );
+  await page.route(
+    new RegExp(`/api/accounts/${accountId}/subscribe(?:\\?.*)?$`),
+    async (route) => {
+      subscriptionOrganizationIds.push(
+        route.request().headers()["x-organization-id"],
+      );
+      accountStatus = "active";
+      await route.fulfill({ json: { data: { success: true } } });
+    },
+  );
+
+  await page.goto(`/settings/accounts/${accountId}`);
+  const subscribe = page.getByRole("button", {
+    name: "Subscribe",
+    exact: true,
+  });
+  await expect(subscribe).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Register phone", exact: true }),
+  ).toHaveCount(0);
+
+  await subscribe.click();
+  await expect.poll(() => subscriptionOrganizationIds).toEqual([
+    organizationId,
+  ]);
+  await expect(subscribe).toHaveCount(0);
+
+  accountStatus = "subscription_failed";
+  await page.reload();
+  await expect(subscribe).toBeVisible();
+
+  accountStatus = "active";
+  await page.reload();
+  await expect(subscribe).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Register phone", exact: true }),
+  ).toHaveCount(0);
+});
+
+test("stale or missing workspace context cannot trigger recovery mutations", async ({
+  page,
+}) => {
+  await installAccountReaderMocks(
+    page,
+    accountWriter,
+    "pending_registration",
+  );
+  let accountStatus = "pending_registration";
+  const recoveryRequests: string[] = [];
+
+  await page.route(
+    new RegExp(`/api/accounts/${accountId}(?:\\?.*)?$`),
+    (route) =>
+      route.fulfill({
+        json: { data: { ...accountRecord, status: accountStatus } },
+      }),
+  );
+  await page.route(
+    new RegExp(`/api/accounts/${accountId}/(?:register|subscribe)(?:\\?.*)?$`),
+    async (route) => {
+      recoveryRequests.push(route.request().url());
+      await route.fulfill({ json: { data: { success: true } } });
+    },
+  );
+
+  const setClientOrganizationContext = async (
+    selectedOrganizationId: string | null,
+    authOrganizationId: string,
+  ) =>
+    page.evaluate(
+      ({ selectedOrganizationId, authOrganizationId }) => {
+        const app = (document.querySelector("#app") as any)?.__vue_app__;
+        const pinia = app?.config.globalProperties.$pinia;
+        const organizations = pinia?._s.get("organizations");
+        const auth = pinia?._s.get("auth");
+        organizations?.selectOrganization(selectedOrganizationId);
+        if (auth?.user) {
+          auth.user = { ...auth.user, organization_id: authOrganizationId };
+        }
+      },
+      { selectedOrganizationId, authOrganizationId },
+    );
+
+  await page.goto(`/settings/accounts/${accountId}`);
+  const registerButton = page.getByRole("button", {
+    name: "Register phone",
+    exact: true,
+  });
+  await expect(registerButton).toBeVisible();
+  const staleRegisterButton = await registerButton.elementHandle();
+
+  await setClientOrganizationContext(otherOrganizationId, organizationId);
+  await expect(registerButton).toHaveCount(0);
+  await staleRegisterButton?.evaluate((element) =>
+    (element as HTMLButtonElement).click(),
+  );
+  await page.waitForTimeout(100);
+  expect(recoveryRequests).toEqual([]);
+
+  await setClientOrganizationContext(null, organizationId);
+  accountStatus = "pending_subscription";
+  await page.reload();
+  const subscribeButton = page.getByRole("button", {
+    name: "Subscribe",
+    exact: true,
+  });
+  await expect(subscribeButton).toBeVisible();
+  const staleSubscribeButton = await subscribeButton.elementHandle();
+
+  await setClientOrganizationContext(null, "");
+  await expect(subscribeButton).toHaveCount(0);
+  await staleSubscribeButton?.evaluate((element) =>
+    (element as HTMLButtonElement).click(),
+  );
+  await page.waitForTimeout(100);
+  expect(recoveryRequests).toEqual([]);
 });
 
 test("account users with integration read access can open the central Meta settings", async ({

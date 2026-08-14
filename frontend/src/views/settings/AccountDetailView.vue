@@ -3,6 +3,7 @@ import { ref, computed, onMounted, watch, nextTick } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 import { useAuthStore } from "@/stores/auth";
+import { useOrganizationsStore } from "@/stores/organizations";
 import { api } from "@/services/api";
 import { toast } from "vue-sonner";
 import { getErrorMessage } from "@/lib/api-utils";
@@ -93,10 +94,12 @@ const route = useRoute();
 const router = useRouter();
 const { t } = useI18n();
 const authStore = useAuthStore();
+const organizationsStore = useOrganizationsStore();
 
 const accountId = computed(() => route.params.id as string);
 const isNew = computed(() => accountId.value === "new");
 const account = ref<WhatsAppAccount | null>(null);
+const loadedAccountOrganizationId = ref<string | null>(null);
 const isLoading = ref(true);
 const isNotFound = ref(false);
 const isSaving = ref(false);
@@ -104,6 +107,8 @@ const hasChanges = ref(false);
 const deleteDialogOpen = ref(false);
 const testResult = ref<TestResult | null>(null);
 const testingConnection = ref(false);
+const registrationDialogOpen = ref(false);
+const registeringPhone = ref(false);
 const subscribing = ref(false);
 const webhookOverrideDialogOpen = ref(false);
 const configuringWebhookOverride = ref(false);
@@ -114,6 +119,34 @@ const { showLeaveDialog, confirmLeave, cancelLeave } =
 
 const canWrite = computed(() => authStore.hasPermission("accounts", "write"));
 const canDelete = computed(() => authStore.hasPermission("accounts", "delete"));
+const activeOrganizationId = computed(
+  () => organizationsStore.selectedOrgId || authStore.organizationId || null,
+);
+const hasCurrentAccountOrganization = computed(
+  () =>
+    Boolean(loadedAccountOrganizationId.value) &&
+    loadedAccountOrganizationId.value === activeOrganizationId.value,
+);
+const canRegisterPhone = computed(
+  () =>
+    canWrite.value &&
+    !isNew.value &&
+    hasCurrentAccountOrganization.value &&
+    account.value?.status === "pending_registration",
+);
+const canSubscribe = computed(
+  () =>
+    canWrite.value &&
+    !isNew.value &&
+    hasCurrentAccountOrganization.value &&
+    (account.value?.status === "pending_subscription" ||
+      account.value?.status === "subscription_failed"),
+);
+const registrationConfirmationMessage = computed(
+  () =>
+    `Confirm phone registration for ${account.value?.name || "this account"}. ` +
+    "ReReply will securely complete registration without displaying the two-step verification PIN.",
+);
 const canReadIntegrations = computed(() =>
   authStore.hasPermission("settings.integrations", "read"),
 );
@@ -183,17 +216,31 @@ watch(
 );
 
 async function loadAccount() {
+  const organizationId = activeOrganizationId.value;
   isLoading.value = true;
   isNotFound.value = false;
+  loadedAccountOrganizationId.value = null;
+  if (!organizationId) {
+    isNotFound.value = true;
+    isLoading.value = false;
+    return;
+  }
+
   try {
-    const response = await api.get(`/accounts/${accountId.value}`);
+    const response = await api.get(`/accounts/${accountId.value}`, {
+      headers: { "X-Organization-ID": organizationId },
+    });
+    if (activeOrganizationId.value !== organizationId) return;
+
     const data = response.data.data || response.data;
     account.value = data;
+    loadedAccountOrganizationId.value = organizationId;
     syncForm();
     nextTick(() => {
       hasChanges.value = false;
     });
   } catch {
+    if (activeOrganizationId.value !== organizationId) return;
     isNotFound.value = true;
   } finally {
     isLoading.value = false;
@@ -316,10 +363,20 @@ async function testConnection() {
 }
 
 async function subscribeApp() {
-  if (!account.value) return;
+  if (!account.value || !canSubscribe.value) return;
+  const id = account.value.id;
+  const organizationId = loadedAccountOrganizationId.value;
+  if (!organizationId || activeOrganizationId.value !== organizationId) {
+    return;
+  }
+
   subscribing.value = true;
   try {
-    const response = await api.post(`/accounts/${account.value.id}/subscribe`);
+    const response = await api.post(
+      `/accounts/${account.value.id}/subscribe`,
+      undefined,
+      { headers: { "X-Organization-ID": organizationId } },
+    );
     if (response.data.data?.success) {
       toast.success(t("accounts.subscribeSuccess", "Subscribed successfully"));
     } else {
@@ -330,7 +387,57 @@ async function subscribeApp() {
       getErrorMessage(e, t("accounts.subscribeError", "Subscribe error")),
     );
   } finally {
+    if (
+      activeOrganizationId.value === organizationId &&
+      loadedAccountOrganizationId.value === organizationId &&
+      account.value?.id === id
+    ) {
+      await loadAccount();
+    }
     subscribing.value = false;
+  }
+}
+
+async function registerPhone() {
+  if (
+    !account.value ||
+    account.value.status !== "pending_registration" ||
+    !canRegisterPhone.value ||
+    registeringPhone.value
+  ) {
+    return;
+  }
+
+  const id = account.value.id;
+  const organizationId = loadedAccountOrganizationId.value;
+  if (!organizationId || activeOrganizationId.value !== organizationId) {
+    return;
+  }
+
+  registeringPhone.value = true;
+  try {
+    // The server owns PIN generation and storage. Never request, accept, or
+    // display a PIN in this recovery flow.
+    await api.post(`/accounts/${id}/register`, undefined, {
+      headers: { "X-Organization-ID": organizationId },
+    });
+    registrationDialogOpen.value = false;
+    await loadAccount();
+    toast.success(
+      t(
+        "accounts.phoneRegistrationSuccess",
+        "Phone registration completed successfully.",
+      ),
+    );
+  } catch {
+    toast.error(
+      t(
+        "accounts.phoneRegistrationFailed",
+        "Phone registration could not be completed. Please try again.",
+      ),
+    );
+  } finally {
+    registeringPhone.value = false;
   }
 }
 
@@ -412,7 +519,21 @@ onMounted(async () => {
             {{ $t("accounts.test", "Test") }}
           </Button>
           <Button
-            v-if="canWrite && !isNew && account"
+            v-if="canRegisterPhone"
+            variant="outline"
+            size="sm"
+            :disabled="registeringPhone"
+            @click="registrationDialogOpen = true"
+          >
+            <Loader2
+              v-if="registeringPhone"
+              class="h-4 w-4 animate-spin mr-1"
+            />
+            <Phone v-else class="h-4 w-4 mr-1" />
+            {{ $t("accounts.registerPhone", "Register phone") }}
+          </Button>
+          <Button
+            v-if="canSubscribe"
             variant="outline"
             size="sm"
             :disabled="subscribing"
@@ -936,6 +1057,40 @@ onMounted(async () => {
           <AlertDialogAction @click="deleteAccount">{{
             $t("common.delete")
           }}</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+
+    <!-- Phone registration confirmation. The server owns the PIN. -->
+    <AlertDialog v-model:open="registrationDialogOpen">
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{{
+            $t("accounts.registerPhone", "Register phone")
+          }}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {{ registrationConfirmationMessage }}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel :disabled="registeringPhone">
+            {{ $t("common.cancel") }}
+          </AlertDialogCancel>
+          <AlertDialogAction
+            data-testid="confirm-phone-registration"
+            :disabled="registeringPhone"
+            @click.prevent="registerPhone"
+          >
+            <Loader2
+              v-if="registeringPhone"
+              class="h-4 w-4 animate-spin mr-1"
+            />
+            {{
+              registeringPhone
+                ? $t("accounts.registeringPhone", "Registering...")
+                : $t("accounts.confirmRegisterPhone", "Register phone")
+            }}
+          </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>

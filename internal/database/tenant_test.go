@@ -482,6 +482,38 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		}))
 	})
 
+	t.Run("runtime startup rejects a missing WhatsApp Phone ID routing index", func(t *testing.T) {
+		restored := false
+		defer func() {
+			if !restored {
+				require.NoError(t, adminDB.Exec(`
+					CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_accounts_live_phone_id
+					ON whatsapp_accounts(BTRIM(phone_id))
+					WHERE deleted_at IS NULL
+				`).Error)
+			}
+		}()
+
+		require.NoError(t, adminDB.Exec(
+			"DROP INDEX public.uq_whatsapp_accounts_live_phone_id",
+		).Error)
+		err := asRuntime(func(runtimeDB *gorm.DB) error {
+			return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "Phone ID routing index")
+
+		require.NoError(t, adminDB.Exec(`
+			CREATE UNIQUE INDEX uq_whatsapp_accounts_live_phone_id
+			ON whatsapp_accounts(BTRIM(phone_id))
+			WHERE deleted_at IS NULL
+		`).Error)
+		restored = true
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+		}))
+	})
+
 	t.Run("runtime startup rejects missing Threads credential resolver grant", func(t *testing.T) {
 		require.NoError(t, adminDB.Exec(fmt.Sprintf(
 			"REVOKE ALL ON FUNCTION public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz) FROM %s",
@@ -795,7 +827,7 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
 			if err := runtimeDB.Raw(
 				"SELECT public.rereply_resolve_whatsapp_org(?)::text",
-				accountB.PhoneID,
+				"  "+accountB.PhoneID+"  ",
 			).Scan(&resolvedText).Error; err != nil {
 				return err
 			}

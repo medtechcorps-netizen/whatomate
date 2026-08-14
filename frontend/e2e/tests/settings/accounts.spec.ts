@@ -124,9 +124,9 @@ test.describe('WhatsApp Accounts - Detail Page CRUD', () => {
     await expect(page.getByRole('button', { name: /Test/i })).toBeVisible()
   })
 
-  test('should have subscribe button', async ({ page, request }) => {
+  test('should hide subscribe button for an active account', async ({ page, request }) => {
     await gotoSeededAdminAccount(page, request)
-    await expect(page.getByRole('button', { name: /Subscribe/i })).toBeVisible()
+    await expect(page.getByRole('button', { name: /Subscribe/i })).toHaveCount(0)
   })
 
   test('should have business profile button', async ({ page, request }) => {

@@ -82,6 +82,11 @@ watch(() => authStore.user?.is_super_admin, async (superAdmin) => {
 const handleOrgChange = async (value: string | number | bigint | Record<string, any> | null) => {
   if (!value || typeof value !== 'string') return
 
+  if (organizationsStore.organizationSwitchBlocker) {
+    toast.error(organizationsStore.organizationSwitchBlocker.message)
+    return
+  }
+
   if (isSuperAdmin.value) {
     // Super admins: set localStorage header and reload
     organizationsStore.selectOrganization(value)
@@ -153,6 +158,7 @@ const refreshOrgs = async () => {
       <Select
         v-if="orgList.length > 0"
         :model-value="currentOrgId"
+        :disabled="Boolean(organizationsStore.organizationSwitchBlocker)"
         @update:model-value="handleOrgChange"
       >
         <SelectTrigger class="h-8 text-[13px]">

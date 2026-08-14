@@ -422,14 +422,14 @@ func TestApp_UpdateAccount_Success(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	meta := enableValidManualAccountTokenPreflight(t, app)
-	allowMetaAccountRelationship(meta, "new-phone-id")
+	allowMetaAccountRelationship(meta, "100000000000705")
 	user := createAdminUser(t, app, org.ID)
 	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":              "Updated Account Name",
-		"phone_id":          "new-phone-id",
-		"business_id":       "new-business-id",
+		"phone_id":          "100000000000705",
+		"business_id":       "200000000000705",
 		"access_token":      "new-access-token",
 		"api_version":       "v20.0",
 		"auto_read_receipt": true,
@@ -448,8 +448,8 @@ func TestApp_UpdateAccount_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, account.ID, resp.Data.ID)
 	assert.Equal(t, "Updated Account Name", resp.Data.Name)
-	assert.Equal(t, "new-phone-id", resp.Data.PhoneID)
-	assert.Equal(t, "new-business-id", resp.Data.BusinessID)
+	assert.Equal(t, "100000000000705", resp.Data.PhoneID)
+	assert.Equal(t, "200000000000705", resp.Data.BusinessID)
 	assert.Equal(t, "v20.0", resp.Data.APIVersion)
 	assert.True(t, resp.Data.AutoReadReceipt)
 	assert.True(t, resp.Data.HasAccessToken)
@@ -458,7 +458,7 @@ func TestApp_UpdateAccount_Success(t *testing.T) {
 	var updated models.WhatsAppAccount
 	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&updated).Error)
 	assert.Equal(t, "Updated Account Name", updated.Name)
-	assert.Equal(t, "new-phone-id", updated.PhoneID)
+	assert.Equal(t, "100000000000705", updated.PhoneID)
 	updated.DecryptSecrets(app.Config.App.EncryptionKey)
 	assert.Equal(t, "new-access-token", updated.AccessToken)
 	assert.NotNil(t, updated.AccessTokenExpiresAt)

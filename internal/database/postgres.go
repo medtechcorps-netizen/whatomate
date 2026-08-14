@@ -403,7 +403,31 @@ func getIndexes() []string {
 			WHERE status = 'active' AND deleted_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_transfers_agent_active ON agent_transfers(agent_id, status) WHERE status = 'active'`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_transfers_team ON agent_transfers(team_id, status) WHERE team_id IS NOT NULL`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_accounts_org_phone ON whatsapp_accounts(organization_id, phone_id)`,
+		// A WhatsApp Phone Number ID is a global webhook-routing identity, not a
+		// tenant-local label. Refuse to guess an owner when legacy live rows
+		// collide after normalization; operators must resolve those assignments
+		// explicitly before retrying the migration.
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM whatsapp_accounts
+				WHERE deleted_at IS NULL
+				GROUP BY BTRIM(phone_id)
+				HAVING COUNT(*) > 1
+			) THEN
+				RAISE EXCEPTION 'cannot enforce unique live WhatsApp Phone IDs; resolve duplicate assignments before retrying';
+			END IF;
+		END $$`,
+		// The duplicate preflight above makes this normalization lossless. Store
+		// the canonical identity before adding the expression index so the prior
+		// exact-match resolver remains usable during a one-click binary rollback.
+		`UPDATE whatsapp_accounts
+			SET phone_id = BTRIM(phone_id)
+			WHERE phone_id <> BTRIM(phone_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_whatsapp_accounts_live_phone_id
+			ON whatsapp_accounts(BTRIM(phone_id))
+			WHERE deleted_at IS NULL`,
+		`DROP INDEX IF EXISTS idx_whatsapp_accounts_org_phone`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_account_name_lang ON templates(whats_app_account, name, language)`,
 		`CREATE INDEX IF NOT EXISTS idx_keyword_rules_account ON keyword_rules(whats_app_account, is_enabled, priority DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_chatbot_flows_account ON chatbot_flows(whats_app_account, is_enabled)`,

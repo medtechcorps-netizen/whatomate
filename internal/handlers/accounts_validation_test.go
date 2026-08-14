@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -199,12 +200,12 @@ func TestApp_TestAccountConnection_Success(t *testing.T) {
 	meta := newFakeMetaServer(t)
 	app := newAppWithMeta(t, meta)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-1", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, org.ID, "610000000000001", "620000000000001")
 	require.NoError(t, app.DB.Model(acc).Update("status", "pending_subscription").Error)
 	admin := createAccountValidationAdmin(t, app, org.ID)
 	// Default phone-numbers list is empty — override so the ID matches.
 	meta.listFn = func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"phone-1"}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"id":"610000000000001"}]}`))
 	}
 
 	req := testutil.NewGETRequest(t)
@@ -232,11 +233,11 @@ func TestApp_TestAccountConnection_FallbackToWABA(t *testing.T) {
 	meta := newFakeMetaServer(t)
 	app := newAppWithMeta(t, meta)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-1", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, org.ID, "610000000000002", "620000000000002")
 	admin := createAccountValidationAdmin(t, app, org.ID)
 
 	meta.listFn = func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"phone-1"}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"id":"610000000000002"}]}`))
 	}
 	// Return null/empty for both messaging_limit_tier and whatsapp_business_manager_messaging_limit from phone query
 	meta.phoneFn = func(w http.ResponseWriter, r *http.Request) {
@@ -266,14 +267,14 @@ func TestApp_TestAccountConnection_SandboxFlagged(t *testing.T) {
 	meta := newFakeMetaServer(t)
 	app := newAppWithMeta(t, meta)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-1", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, org.ID, "610000000000003", "620000000000003")
 	admin := createAccountValidationAdmin(t, app, org.ID)
 
 	meta.phoneFn = func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"display_phone_number":"+1555000","verified_name":"Test","account_mode":"SANDBOX","code_verification_status":"VERIFIED","quality_rating":"GREEN"}`))
 	}
 	meta.listFn = func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"phone-1"}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"id":"610000000000003"}]}`))
 	}
 
 	req := testutil.NewGETRequest(t)
@@ -296,7 +297,7 @@ func TestApp_TestAccountConnection_NotVerifiedRejected(t *testing.T) {
 	meta := newFakeMetaServer(t)
 	app := newAppWithMeta(t, meta)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-1", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, org.ID, "610000000000004", "620000000000004")
 	admin := createAccountValidationAdmin(t, app, org.ID)
 
 	meta.phoneFn = func(w http.ResponseWriter, r *http.Request) {
@@ -321,12 +322,12 @@ func TestApp_TestAccountConnection_PhoneNotInBusiness(t *testing.T) {
 	meta := newFakeMetaServer(t)
 	app := newAppWithMeta(t, meta)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-mine", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, org.ID, "610000000000005", "620000000000005")
 	admin := createAccountValidationAdmin(t, app, org.ID)
 
 	// list returns a different phone ID — should fail relationship check.
 	meta.listFn = func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"phone-someone-else"}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"id":"610000000009999"}]}`))
 	}
 
 	req := testutil.NewGETRequest(t)
@@ -362,7 +363,7 @@ func TestApp_TestAccountConnection_CrossOrgIsolation(t *testing.T) {
 	app := newAppWithMeta(t, meta)
 	orgA := testutil.CreateTestOrganization(t, app.DB)
 	orgB := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, orgA.ID, "phone-1", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, orgA.ID, "610000000000006", "620000000000006")
 	adminB := createAccountValidationAdmin(t, app, orgB.ID)
 
 	req := testutil.NewGETRequest(t)
@@ -379,11 +380,18 @@ func TestApp_SubscribeApp_Success(t *testing.T) {
 	meta := newFakeMetaServer(t)
 	app := newAppWithMeta(t, meta)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-1", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-sub-success", "biz-sub-success")
 	admin := createAccountValidationAdmin(t, app, org.ID)
+	app.Config.App.EncryptionKey = "subscription-recovery-test-key-long-enough"
+	encryptedToken, err := appcrypto.Encrypt(acc.AccessToken, app.Config.App.EncryptionKey)
+	require.NoError(t, err)
+	require.NoError(t, app.DB.Model(acc).Updates(map[string]any{
+		"access_token": encryptedToken,
+		"status":       "pending_subscription",
+	}).Error)
 
 	req := testutil.NewGETRequest(t)
-	testutil.SetAuthContext(req, org.ID, admin.ID)
+	setEmbeddedSignupAuth(req, org.ID, admin.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.SubscribeApp(req))
@@ -398,7 +406,7 @@ func TestApp_SubscribeApp_Success(t *testing.T) {
 	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", acc.ID, org.ID).First(&stored).Error)
 	assert.Equal(t, "active", stored.Status)
 	// Verify Meta was actually called on the subscribe endpoint.
-	assert.Greater(t, meta.hits["/v18.0/biz-1/subscribed_apps"], 0, "expected POST to subscribed_apps endpoint")
+	assert.Greater(t, meta.hits["/v18.0/biz-sub-success/subscribed_apps"], 0, "expected POST to subscribed_apps endpoint")
 }
 
 func TestApp_SubscribeApp_MetaFails(t *testing.T) {
@@ -409,11 +417,18 @@ func TestApp_SubscribeApp_MetaFails(t *testing.T) {
 	}
 	app := newAppWithMeta(t, meta)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-1", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-sub-fail", "biz-sub-fail")
 	admin := createAccountValidationAdmin(t, app, org.ID)
+	app.Config.App.EncryptionKey = "subscription-recovery-test-key-long-enough"
+	encryptedToken, err := appcrypto.Encrypt(acc.AccessToken, app.Config.App.EncryptionKey)
+	require.NoError(t, err)
+	require.NoError(t, app.DB.Model(acc).Updates(map[string]any{
+		"access_token": encryptedToken,
+		"status":       "pending_subscription",
+	}).Error)
 
 	req := testutil.NewGETRequest(t)
-	testutil.SetAuthContext(req, org.ID, admin.ID)
+	setEmbeddedSignupAuth(req, org.ID, admin.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.SubscribeApp(req))
@@ -433,7 +448,7 @@ func TestApp_SubscribeApp_AccountNotFound(t *testing.T) {
 	admin := createAccountValidationAdmin(t, app, org.ID)
 
 	req := testutil.NewGETRequest(t)
-	testutil.SetAuthContext(req, org.ID, admin.ID)
+	setEmbeddedSignupAuth(req, org.ID, admin.ID)
 	testutil.SetPathParam(req, "id", uuid.New().String())
 
 	require.NoError(t, app.SubscribeApp(req))
@@ -445,11 +460,11 @@ func TestApp_SubscribeApp_CrossOrgIsolation(t *testing.T) {
 	app := newAppWithMeta(t, meta)
 	orgA := testutil.CreateTestOrganization(t, app.DB)
 	orgB := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, orgA.ID, "phone-1", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, orgA.ID, "phone-sub-cross", "biz-sub-cross")
 	adminB := createAccountValidationAdmin(t, app, orgB.ID)
 
 	req := testutil.NewGETRequest(t)
-	testutil.SetAuthContext(req, orgB.ID, adminB.ID)
+	setEmbeddedSignupAuth(req, orgB.ID, adminB.ID)
 	testutil.SetPathParam(req, "id", acc.ID.String())
 
 	require.NoError(t, app.SubscribeApp(req))
@@ -463,7 +478,7 @@ func TestApp_ConfigurePhoneWebhookOverride_Success(t *testing.T) {
 	app := newAppWithMeta(t, meta)
 	app.Config.App.EncryptionKey = "this-is-a-32-character-test-key-XX"
 	org := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, org.ID, "123456789", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, org.ID, "630000000000001", "640000000000001")
 	acc.WebhookVerifyToken = ""
 	require.NoError(t, app.DB.Save(acc).Error)
 	admin := createWebhookOverrideAdmin(t, app, org.ID)
@@ -537,7 +552,7 @@ func TestApp_ConfigurePhoneWebhookOverride_Success(t *testing.T) {
 	providerRequestMu.Unlock()
 
 	meta.mu.Lock()
-	requests := meta.hits["/v18.0/123456789"]
+	requests := meta.hits["/v18.0/"+acc.PhoneID]
 	meta.mu.Unlock()
 	assert.Equal(t, 2, requests, "Meta must receive a set call and an authoritative readback")
 
@@ -605,12 +620,14 @@ func TestApp_ConfigurePhoneWebhookOverride_RejectsUnauthorizedAndInvalidAccounts
 		},
 	}
 
-	for _, tt := range tests {
+	for index, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			meta := newFakeMetaServer(t)
 			app := newAppWithMeta(t, meta)
 			org := testutil.CreateTestOrganization(t, app.DB)
-			acc := createTestAccountForValidation(t, app.DB, org.ID, "123456789", "biz-1")
+			phoneID := strconv.FormatInt(630000000000100+int64(index), 10)
+			businessID := strconv.FormatInt(640000000000100+int64(index), 10)
+			acc := createTestAccountForValidation(t, app.DB, org.ID, phoneID, businessID)
 			if tt.configure != nil {
 				tt.configure(acc)
 				require.NoError(t, app.DB.Save(acc).Error)
@@ -624,7 +641,7 @@ func TestApp_ConfigurePhoneWebhookOverride_RejectsUnauthorizedAndInvalidAccounts
 			require.NoError(t, app.ConfigurePhoneWebhookOverride(req))
 			testutil.AssertErrorResponse(t, req, tt.expected, tt.expectedMsg)
 			meta.mu.Lock()
-			requests := meta.hits["/v18.0/123456789"]
+			requests := meta.hits["/v18.0/"+phoneID]
 			meta.mu.Unlock()
 			assert.Zero(t, requests, "invalid requests must not call Meta")
 		})
@@ -636,7 +653,7 @@ func TestApp_ConfigurePhoneWebhookOverride_CrossOrgIsolation(t *testing.T) {
 	app := newAppWithMeta(t, meta)
 	ownerOrg := testutil.CreateTestOrganization(t, app.DB)
 	requesterOrg := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, ownerOrg.ID, "123456789", "biz-1")
+	acc := createTestAccountForValidation(t, app.DB, ownerOrg.ID, "630000000000201", "640000000000201")
 	admin := createWebhookOverrideAdmin(t, app, requesterOrg.ID)
 
 	req := testutil.NewGETRequest(t)
@@ -646,7 +663,7 @@ func TestApp_ConfigurePhoneWebhookOverride_CrossOrgIsolation(t *testing.T) {
 	require.NoError(t, app.ConfigurePhoneWebhookOverride(req))
 	testutil.AssertErrorResponse(t, req, fasthttp.StatusNotFound, "Account not found")
 	meta.mu.Lock()
-	requests := meta.hits["/v18.0/123456789"]
+	requests := meta.hits["/v18.0/"+acc.PhoneID]
 	meta.mu.Unlock()
 	assert.Zero(t, requests, "another workspace must not configure the phone callback")
 }
@@ -655,7 +672,7 @@ func TestApp_AccountValidationActionsRequirePermissions(t *testing.T) {
 	meta := newFakeMetaServer(t)
 	app := newAppWithMeta(t, meta)
 	org := testutil.CreateTestOrganization(t, app.DB)
-	acc := createTestAccountForValidation(t, app.DB, org.ID, "phone-permission", "biz-permission")
+	acc := createTestAccountForValidation(t, app.DB, org.ID, "630000000000202", "640000000000202")
 
 	noAccess := integrationTestUserForAccountValidation(t, app, org.ID, nil)
 	testReq := testutil.NewGETRequest(t)
@@ -666,11 +683,11 @@ func TestApp_AccountValidationActionsRequirePermissions(t *testing.T) {
 
 	reader := integrationTestUserForAccountValidation(t, app, org.ID, []string{"accounts:read"})
 	subscribeReq := testutil.NewGETRequest(t)
-	testutil.SetAuthContext(subscribeReq, org.ID, reader.ID)
+	setEmbeddedSignupAuth(subscribeReq, org.ID, reader.ID)
 	testutil.SetPathParam(subscribeReq, "id", acc.ID.String())
 	require.NoError(t, app.SubscribeApp(subscribeReq))
 	testutil.AssertErrorResponse(t, subscribeReq, fasthttp.StatusForbidden, "Insufficient permissions")
-	assert.Zero(t, meta.hits["/v18.0/biz-permission/subscribed_apps"])
+	assert.Zero(t, meta.hits["/v18.0/"+acc.BusinessID+"/subscribed_apps"])
 }
 
 func integrationTestUserForAccountValidation(t *testing.T, app *handlers.App, orgID uuid.UUID, keys []string) *models.User {
@@ -690,13 +707,13 @@ func TestApp_CreateAccount_AccessTokenEncryptedAtRest(t *testing.T) {
 	}
 	org := testutil.CreateTestOrganization(t, app.DB)
 	meta := enableValidManualAccountTokenPreflight(t, app)
-	allowMetaAccountRelationship(meta, "phone-z")
+	allowMetaAccountRelationship(meta, "100000000000701")
 	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":         "secure",
-		"phone_id":     "phone-z",
-		"business_id":  "biz-z",
+		"phone_id":     "100000000000701",
+		"business_id":  "200000000000701",
 		"access_token": "PLAIN-TOKEN",
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -705,7 +722,7 @@ func TestApp_CreateAccount_AccessTokenEncryptedAtRest(t *testing.T) {
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
 
 	var stored models.WhatsAppAccount
-	require.NoError(t, app.DB.Where("phone_id = ?", "phone-z").First(&stored).Error)
+	require.NoError(t, app.DB.Where("phone_id = ?", "100000000000701").First(&stored).Error)
 	assert.NotEqual(t, "PLAIN-TOKEN", stored.AccessToken, "access token must be encrypted at rest")
 	assert.True(t, strings.HasPrefix(stored.AccessToken, "enc:"), "stored token should carry the enc: prefix")
 }
@@ -714,13 +731,13 @@ func TestApp_CreateAccount_DefaultAPIVersionAppliedWhenMissing(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	meta := enableValidManualAccountTokenPreflight(t, app)
-	allowMetaAccountRelationship(meta, "p")
+	allowMetaAccountRelationship(meta, "100000000000702")
 	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":         "no-api-ver",
-		"phone_id":     "p",
-		"business_id":  "b",
+		"phone_id":     "100000000000702",
+		"business_id":  "200000000000702",
 		"access_token": "tok",
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -737,13 +754,13 @@ func TestApp_CreateAccount_DoesNotCreateDuplicateAccountVerifyToken(t *testing.T
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	meta := enableValidManualAccountTokenPreflight(t, app)
-	allowMetaAccountRelationship(meta, "p")
+	allowMetaAccountRelationship(meta, "100000000000703")
 	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":         "auto-vt",
-		"phone_id":     "p",
-		"business_id":  "b",
+		"phone_id":     "100000000000703",
+		"business_id":  "200000000000703",
 		"access_token": "tok",
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
@@ -760,17 +777,17 @@ func TestApp_CreateAccount_DefaultIncomingFlipsExisting(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	meta := enableValidManualAccountTokenPreflight(t, app)
-	allowMetaAccountRelationship(meta, "p2")
+	allowMetaAccountRelationship(meta, "100000000000704")
 	user := createAdminUser(t, app, org.ID)
 
 	// Existing default incoming.
-	existing := createTestAccountForValidation(t, app.DB, org.ID, "p1", "b1")
+	existing := createTestAccountForValidation(t, app.DB, org.ID, "630000000000203", "640000000000203")
 	require.NoError(t, app.DB.Model(existing).Update("is_default_incoming", true).Error)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":                "new-default",
-		"phone_id":            "p2",
-		"business_id":         "b2",
+		"phone_id":            "100000000000704",
+		"business_id":         "200000000000704",
 		"access_token":        "tok",
 		"is_default_incoming": true,
 	})

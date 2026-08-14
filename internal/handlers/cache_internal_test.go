@@ -122,10 +122,55 @@ func TestGetWhatsAppAccountCached_CacheHitSkipsDB(t *testing.T) {
 		"cached AppSecret must be restored")
 }
 
+func TestGetWhatsAppAccountCached_ScopedTenantRejectsPriorOwnerCache(t *testing.T) {
+	app := cacheTestApp(t)
+	priorOrg := testutil.CreateTestOrganization(t, app.DB)
+	currentOrg := testutil.CreateTestOrganization(t, app.DB)
+	phoneID := "phone-transfer-" + uuid.New().String()[:8]
+	prior := makeAccount(t, app, priorOrg.ID, "  "+phoneID+"  ", "prior-owner-token", "prior-secret")
+	require.NoError(t, app.DB.Delete(prior).Error)
+	current := makeAccount(t, app, currentOrg.ID, phoneID, "current-owner-token", "current-secret")
+
+	stale := whatsAppAccountCache{
+		WhatsAppAccount: models.WhatsAppAccount{
+			BaseModel:      models.BaseModel{ID: prior.ID},
+			OrganizationID: priorOrg.ID,
+			Name:           prior.Name,
+			PhoneID:        "  " + phoneID + "  ",
+		},
+		AccessToken: "prior-owner-token",
+		AppSecret:   "prior-secret",
+	}
+	encoded, err := json.Marshal(stale)
+	require.NoError(t, err)
+	cacheKey := fmt.Sprintf("%s%s", whatsappAccountCachePrefix, phoneID)
+	require.NoError(t, app.Redis.Set(context.Background(), cacheKey, encoded, time.Hour).Err())
+
+	scoped := app.scopedApp(app.DB, currentOrg.ID)
+	got, err := scoped.getWhatsAppAccountCached("  " + phoneID + "  ")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, current.ID, got.ID)
+	assert.Equal(t, currentOrg.ID, got.OrganizationID)
+	assert.Equal(t, "current-owner-token", got.AccessToken)
+	assert.NotEqual(t, "prior-owner-token", got.AccessToken)
+}
+
 func TestGetWhatsAppAccountCached_NotFoundReturnsError(t *testing.T) {
 	app := cacheTestApp(t)
 	_, err := app.getWhatsAppAccountCached("phone-does-not-exist-" + uuid.New().String()[:8])
 	require.Error(t, err)
+}
+
+func TestResolveWhatsAppOrganization_NonRLSNormalizesPhoneID(t *testing.T) {
+	app := cacheTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	phoneID := "phone-resolver-" + uuid.New().String()[:8]
+	makeAccount(t, app, org.ID, "  "+phoneID+"  ", "resolver-token", "resolver-secret")
+
+	resolved, err := app.resolveWhatsAppOrganization("  " + phoneID + "  ")
+	require.NoError(t, err)
+	assert.Equal(t, org.ID, resolved)
 }
 
 func TestWhatsAppAccountCacheNeverSerializesLegacyWebhookVerifyToken(t *testing.T) {
