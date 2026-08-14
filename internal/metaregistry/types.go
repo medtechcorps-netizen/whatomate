@@ -27,9 +27,9 @@ const (
 
 var (
 	ErrInvalidRequest = errors.New("invalid Meta registry request")
-	ErrNotFound       = errors.New("Meta registry binding not found")
-	ErrUnavailable    = errors.New("Meta registry unavailable")
-	ErrStaleBinding   = errors.New("Meta registry binding is stale")
+	ErrNotFound       = errors.New("meta registry binding not found")
+	ErrUnavailable    = errors.New("meta registry unavailable")
+	ErrStaleBinding   = errors.New("meta registry binding is stale")
 )
 
 // ResolveRequest contains only the globally routable Meta asset identity. The

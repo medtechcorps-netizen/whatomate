@@ -185,7 +185,7 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 	}
 	if registryConfigured && (c.RegistryCacheTTL <= 0 || c.RegistryCacheTTL > time.Minute ||
 		c.RegistryTimeout <= 0 || c.RegistryTimeout > 10*time.Second) {
-		return errors.New("Meta registry cache and timeout durations are outside safe bounds")
+		return errors.New("meta registry cache and timeout durations are outside safe bounds")
 	}
 	if c.WorkerConcurrency > maxWorkerConcurrency {
 		return fmt.Errorf("environment variable META_RELAY_WORKER_CONCURRENCY must not exceed %d", maxWorkerConcurrency)
