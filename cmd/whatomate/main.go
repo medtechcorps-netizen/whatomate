@@ -1015,6 +1015,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// tenant phases. Do not retain the request-long tenant transaction while
 	// Meta handles the non-idempotent /register mutation.
 	g.POST("/api/accounts/{id}/register", app.RegisterPhoneNumber)
+	// Ambiguous registration reconciliation performs read-only Meta validation
+	// between tenant phases, then a strictly fenced local status transition.
+	g.POST("/api/accounts/{id}/reconcile-registration", app.ReconcilePhoneRegistration)
 	g.POST("/api/accounts/{id}/test", tenant((*handlers.App).TestAccountConnection))
 	// Subscription recovery also uses short committed phases around Meta I/O.
 	g.POST("/api/accounts/{id}/subscribe", app.SubscribeApp)

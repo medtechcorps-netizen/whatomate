@@ -766,12 +766,97 @@ func TestClient_GraphIdentifiersRejectPathOrQueryInjectionBeforeHTTP(t *testing.
 				return err
 			},
 		},
+		{
+			name: "subscription app query injection",
+			call: func() error {
+				_, err := client.IsAppSubscribed(ctx, "220000000000501", "1717?access_token=evil", "token", "v21.0")
+				return err
+			},
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			require.Error(t, testCase.call())
 			assert.Zero(t, calls)
 		})
 	}
+}
+
+func TestClient_IsAppSubscribedUsesReadOnlyTrustedPagination(t *testing.T) {
+	t.Parallel()
+
+	const (
+		wabaID = "220000000000601"
+		appID  = "990000000000001"
+		token  = "subscription-read-token"
+	)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v21.0/"+wabaID+"/subscribed_apps", r.URL.Path)
+		assert.Equal(t, "Bearer "+token, r.Header.Get("Authorization"))
+		assert.Equal(t, "100", r.URL.Query().Get("limit"))
+		switch calls {
+		case 1:
+			assert.Empty(t, r.URL.Query().Get("after"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{{
+					"whatsapp_business_api_data": map[string]string{"id": "990000000000000"},
+				}},
+				"paging": map[string]any{
+					"cursors": map[string]string{"after": "safe-cursor"},
+					"next":    "https://attacker.invalid/steal-token",
+				},
+			})
+		case 2:
+			assert.Equal(t, "safe-cursor", r.URL.Query().Get("after"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{{
+					"whatsapp_business_api_data": map[string]string{"id": appID},
+				}},
+			})
+		default:
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+	subscribed, err := client.IsAppSubscribed(
+		testutil.TestContext(t),
+		wabaID,
+		appID,
+		token,
+		"v21.0",
+	)
+	require.NoError(t, err)
+	assert.True(t, subscribed)
+	assert.Equal(t, 2, calls)
+}
+
+func TestClient_IsAppSubscribedFailsClosedOnMalformedProviderData(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{
+				"whatsapp_business_api_data": map[string]string{"id": "not-a-graph-id"},
+			}},
+		})
+	}))
+	defer server.Close()
+
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+	subscribed, err := client.IsAppSubscribed(
+		testutil.TestContext(t),
+		"220000000000602",
+		"990000000000001",
+		"subscription-read-token",
+		"v21.0",
+	)
+	require.ErrorContains(t, err, "invalid subscribed app_id")
+	assert.False(t, subscribed)
 }
 
 func TestIsDefiniteProviderRejectionClassifiesNonIdempotentFailuresConservatively(t *testing.T) {
