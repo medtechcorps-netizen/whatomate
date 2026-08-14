@@ -251,6 +251,19 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	}
 	require.NoError(t, adminDB.Create(&channelA).Error)
 	require.NoError(t, adminDB.Create(&channelB).Error)
+	metaChannelB := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    orgB.ID,
+		Channel:           models.ChannelMessenger,
+		Provider:          "relay",
+		Name:              "Beta Messenger registry",
+		ExternalAccountID: "page-beta-" + uuid.NewString(),
+		Status:            models.ChannelAccountStatusDegraded,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{"meta_registry_managed": true},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, adminDB.Create(&metaChannelB).Error)
 	threadsChannelB := models.ChannelAccount{
 		BaseModel:         models.BaseModel{ID: uuid.New()},
 		OrganizationID:    orgB.ID,
@@ -862,6 +875,29 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 			}
 			if visibleAccounts != 0 {
 				return fmt.Errorf("unscoped channel account query exposed %d rows", visibleAccounts)
+			}
+			return nil
+		}))
+		resolved, err := uuid.Parse(resolvedText)
+		require.NoError(t, err)
+		require.Equal(t, orgB.ID, resolved)
+	})
+
+	t.Run("Meta registry router resolves degraded owner without bypassing RLS", func(t *testing.T) {
+		var resolvedText string
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			if err := runtimeDB.Raw(
+				"SELECT public.rereply_resolve_meta_channel_org(?, ?)::text",
+				"messenger", metaChannelB.ExternalAccountID,
+			).Scan(&resolvedText).Error; err != nil {
+				return err
+			}
+			var visibleAccounts int64
+			if err := runtimeDB.Model(&models.ChannelAccount{}).Count(&visibleAccounts).Error; err != nil {
+				return err
+			}
+			if visibleAccounts != 0 {
+				return fmt.Errorf("unscoped Meta account query exposed %d rows", visibleAccounts)
 			}
 			return nil
 		}))

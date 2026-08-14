@@ -8,6 +8,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/stretchr/testify/require"
 )
 
 type fakeQueueStore struct {
@@ -20,7 +23,9 @@ type fakeQueueStore struct {
 	claimLease   time.Duration
 	completed    []string
 	retried      []string
+	parked       []string
 	dead         []string
+	deadReasons  []string
 }
 
 func (s *fakeQueueStore) ClaimInbound(
@@ -69,14 +74,90 @@ func (s *fakeQueueStore) RetryInbound(
 	return 1, false, nil
 }
 
+func (s *fakeQueueStore) ParkInbound(_ context.Context, jobID string, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.parked = append(s.parked, jobID)
+	return nil
+}
+
 func (s *fakeQueueStore) DeadInbound(
 	_ context.Context,
-	jobID, _ string,
+	jobID, reason string,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dead = append(s.dead, jobID)
+	s.deadReasons = append(s.deadReasons, reason)
 	return nil
+}
+
+type fixedRegistryResolver struct {
+	account *AccountConfig
+	err     error
+}
+
+func (resolver fixedRegistryResolver) Resolve(context.Context, models.Channel, string, bool) (*AccountConfig, error) {
+	if resolver.err != nil {
+		return nil, resolver.err
+	}
+	copy := *resolver.account
+	return &copy, nil
+}
+
+func TestWorkerParksStaleRegistryBindingWithoutConsumingRetryBudget(t *testing.T) {
+	config := newTestConfig(t)
+	store := &fakeQueueStore{jobs: []InboundJob{{
+		ID: "stale-job", AccountKey: "registry.account", Channel: models.ChannelMessenger,
+		ExternalAccountID: "page-stale", RegistryFence: "oauth:1:webhook:1",
+		Body: []byte(`{"external_account_id":"page-stale","events":[]}`),
+	}}}
+	worker, err := NewWorker(config, store)
+	require.NoError(t, err)
+	worker.registry = fixedRegistryResolver{err: ErrRegistryStale}
+	require.NoError(t, worker.ProcessOnce(context.Background()))
+	require.Equal(t, []string{"stale-job"}, store.parked)
+	require.Empty(t, store.retried)
+	require.Empty(t, store.dead)
+}
+
+func TestWorkerParksUnknownFutureQueueVersion(t *testing.T) {
+	config := newTestConfig(t)
+	store := &fakeQueueStore{jobs: []InboundJob{{
+		SchemaVersion: InboundJobSchemaVersion + 1,
+		ID:            "future-job", AccountKey: "registry.future", Body: []byte(`{}`),
+	}}}
+	worker, err := NewWorker(config, store)
+	require.NoError(t, err)
+	require.NoError(t, worker.ProcessOnce(context.Background()))
+	require.Equal(t, []string{"future-job"}, store.parked)
+	require.Empty(t, store.dead)
+}
+
+func TestWorkerNeverFallsBackToStaticAccountWhenDynamicVersionFenceChanges(t *testing.T) {
+	config := newTestConfig(t)
+	static, _ := config.accountByKey("messenger-page")
+	dynamic := *static
+	dynamic.registryManaged = true
+	dynamic.registryCredentialID = "oauth-id"
+	dynamic.registryCredentialVersion = 2
+	dynamic.registryWebhookID = "webhook-id"
+	dynamic.registryWebhookVersion = 3
+	// A deliberately colliding key proves RegistryFence prevents the static
+	// map from becoming a cross-account fallback.
+	dynamic.Key = static.Key
+	store := &fakeQueueStore{jobs: []InboundJob{{
+		ID: "dynamic-job", AccountKey: static.Key, Channel: models.ChannelMessenger,
+		ExternalAccountID: dynamic.ExternalAccountID,
+		RegistryFence:     "oauth-id:1:webhook-id:3", Body: []byte(`{"events":[]}`),
+	}}}
+	worker, err := NewWorker(config, store)
+	require.NoError(t, err)
+	worker.registry = fixedRegistryResolver{account: &dynamic}
+	require.NoError(t, worker.ProcessOnce(context.Background()))
+	require.Equal(t, []string{"dynamic-job"}, store.dead)
+	require.Equal(t, []string{"registry_binding_version_changed"}, store.deadReasons)
+	require.Empty(t, store.completed)
 }
 
 func TestWorkerClaimsOnlyImmediateConcurrencyAndStartsJobsTogether(t *testing.T) {
@@ -167,6 +248,18 @@ func TestWorkerRejectsUnsafeLeaseOrConcurrency(t *testing.T) {
 	config.ProcessingLease = config.ForwardTimeout + queueSettlementTimeout
 	if _, err := NewWorker(config, &fakeQueueStore{}); err == nil {
 		t.Fatal("unsafe processing lease was accepted")
+	}
+
+	config = newTestConfig(t)
+	config.RegistryURL = "https://registry.example.test/internal/meta-registry/v1/resolve"
+	config.RegistrySecret = registryClientTestSecret
+	config.RegistryTimeout = 10 * time.Second
+	config.RegistryCacheTTL = time.Second
+	config.registryLifecycleTestMode = true
+	config.ProcessingLease = config.ForwardTimeout + queueSettlementTimeout +
+		leaseSafetyMargin + config.RegistryTimeout - time.Millisecond
+	if _, err := NewWorker(config, &fakeQueueStore{}); err == nil {
+		t.Fatal("processing lease that omits part of registry lookup was accepted")
 	}
 
 	config = newTestConfig(t)

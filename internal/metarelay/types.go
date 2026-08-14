@@ -42,6 +42,10 @@ var (
 // exclusively to the separate Instagram app.
 type WebhookApp string
 
+const RelayServiceTokenHeader = "X-ReReply-Relay-Service-Token"
+
+const InboundJobSchemaVersion = 2
+
 const (
 	WebhookAppMessenger      WebhookApp = "messenger"
 	WebhookAppInstagramLogin WebhookApp = "instagram_login"
@@ -60,17 +64,23 @@ const (
 // ReReply relay ChannelAccount. Secret values are resolved from the named
 // environment variables and are never accepted inside the JSON mapping.
 type AccountConfig struct {
-	Key                      string           `json:"key"`
-	Channel                  models.Channel   `json:"channel"`
-	ExternalAccountID        string           `json:"external_account_id"`
-	InstagramAPIMode         InstagramAPIMode `json:"instagram_api_mode,omitempty"`
-	ReReplyWebhookURL        string           `json:"rereply_webhook_url"`
-	AccessTokenEnv           string           `json:"access_token_env"`
-	ReReplyInboundSecretEnv  string           `json:"rereply_inbound_secret_env"`
-	ReReplyOutboundSecretEnv string           `json:"rereply_outbound_secret_env"`
-	accessToken              string
-	reReplyInboundSecret     string
-	reReplyOutboundSecret    string
+	Key                       string           `json:"key"`
+	Channel                   models.Channel   `json:"channel"`
+	ExternalAccountID         string           `json:"external_account_id"`
+	InstagramAPIMode          InstagramAPIMode `json:"instagram_api_mode,omitempty"`
+	ReReplyWebhookURL         string           `json:"rereply_webhook_url"`
+	AccessTokenEnv            string           `json:"access_token_env"`
+	ReReplyInboundSecretEnv   string           `json:"rereply_inbound_secret_env"`
+	ReReplyOutboundSecretEnv  string           `json:"rereply_outbound_secret_env"`
+	accessToken               string
+	reReplyInboundSecret      string
+	reReplyOutboundSecret     string
+	registryCredentialID      string
+	registryCredentialVersion int
+	registryWebhookID         string
+	registryWebhookVersion    int
+	registryLeaseExpiresAt    time.Time
+	registryManaged           bool
 }
 
 // Config is intentionally environment-only. Production does not have a flag
@@ -92,12 +102,21 @@ type Config struct {
 	PollInterval              time.Duration
 	WorkerConcurrency         int
 	MaxAttempts               int
+	RegistryURL               string
+	RegistrySecret            string
+	RegistryEdgeSecret        string
+	RegistryCacheTTL          time.Duration
+	RegistryTimeout           time.Duration
 
 	// allowInsecureTestEndpoints can only be set by package tests/options. It
 	// is deliberately not sourced from an environment variable.
 	allowInsecureTestEndpoints bool
-	byExternal                 map[string]*AccountConfig
-	byKey                      map[string]*AccountConfig
+	// registryLifecycleTestMode is package-private so no deployment setting can
+	// enable the incomplete split-A lifecycle. Tests may exercise the protocol
+	// while production LoadConfig remains static-only.
+	registryLifecycleTestMode bool
+	byExternal                map[string]*AccountConfig
+	byKey                     map[string]*AccountConfig
 }
 
 func accountIndexKey(channel models.Channel, externalID string) string {
@@ -132,10 +151,14 @@ func (a *AccountConfig) webhookApp() WebhookApp {
 // InboundJob is the durable unit forwarded to one ReReply channel webhook.
 // Body is the exact canonical JSON signed and sent to ReReply.
 type InboundJob struct {
-	ID         string `json:"id"`
-	AccountKey string `json:"account_key"`
-	Body       []byte `json:"body"`
-	Attempts   int    `json:"-"`
+	SchemaVersion     int            `json:"schema_version,omitempty"`
+	ID                string         `json:"id"`
+	AccountKey        string         `json:"account_key"`
+	Channel           models.Channel `json:"channel,omitempty"`
+	ExternalAccountID string         `json:"external_account_id,omitempty"`
+	RegistryFence     string         `json:"registry_fence,omitempty"`
+	Body              []byte         `json:"body"`
+	Attempts          int            `json:"-"`
 }
 
 type AcceptanceStore interface {
@@ -148,6 +171,7 @@ type QueueStore interface {
 	RequeueExpired(ctx context.Context, now time.Time, limit int) (int, error)
 	CompleteInbound(ctx context.Context, jobID string) error
 	RetryInbound(ctx context.Context, jobID string, next time.Time, maxAttempts int, reason string) (attempts int, dead bool, err error)
+	ParkInbound(ctx context.Context, jobID string, next time.Time) error
 	DeadInbound(ctx context.Context, jobID, reason string) error
 }
 
@@ -208,12 +232,14 @@ type Server struct {
 	instagramGraphBase string
 	outboundTimeout    time.Duration
 	settlementTimeout  time.Duration
+	registry           RegistryResolver
 }
 
 type Worker struct {
-	config *Config
-	store  QueueStore
-	client *http.Client
-	logger *slog.Logger
-	now    func() time.Time
+	config   *Config
+	store    QueueStore
+	client   *http.Client
+	logger   *slog.Logger
+	now      func() time.Time
+	registry RegistryResolver
 }

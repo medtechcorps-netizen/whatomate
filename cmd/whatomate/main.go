@@ -743,6 +743,12 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/health", app.HealthCheck)
 	g.GET("/ready", app.ReadyCheck)
 
+	// Private Meta relay control plane. These routes intentionally bypass user
+	// auth and enforce their own replay-safe service authentication.
+	g.POST("/internal/meta-registry/v1/resolve", app.ResolveMetaRegistryBinding)
+	g.POST("/internal/meta-registry/v1/revoke", app.RevokeMetaRegistryBinding)
+	g.POST("/internal/meta-registry/v1/revalidation", app.RecordMetaRegistryRevalidation)
+
 	g.GET("/api/embedded-signup/config", tenant((*handlers.App).GetEmbeddedSignupConfig))
 
 	// Auth routes (public, optionally rate-limited)

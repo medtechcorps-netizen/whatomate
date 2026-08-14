@@ -48,11 +48,59 @@ func TestLoad_AppliesDefaultsForMissingFields(t *testing.T) {
 	assert.Equal(t, "https://accounts.google.com/o/oauth2/auth", cfg.GoogleSearchConsole.AuthURL)
 	assert.Equal(t, "https://oauth2.googleapis.com/token", cfg.GoogleSearchConsole.TokenURL)
 	assert.Equal(t, "https://www.googleapis.com/webmasters/v3", cfg.GoogleSearchConsole.APIBaseURL)
+	assert.Equal(t, 30, cfg.MetaRegistry.LeaseSeconds)
+	assert.Equal(t, 1440, cfg.MetaRegistry.OwnershipMaxAgeMins)
+	assert.Equal(t, 300, cfg.MetaRegistry.ReplayWindowSeconds)
 	assert.Equal(t, "local", cfg.Storage.Type)
 	assert.Equal(t, "./uploads", cfg.Storage.LocalPath)
 	assert.Equal(t, "admin@rereply.app", cfg.DefaultAdmin.Email)
 	assert.Equal(t, "admin", cfg.DefaultAdmin.Password)
 	assert.Equal(t, "ReReply Administrator", cfg.DefaultAdmin.FullName)
+}
+
+func TestLoad_RejectsWeakMetaRegistryServiceConfiguration(t *testing.T) {
+	_, err := config.Load(writeConfig(t, `
+[meta_registry]
+service_secret = "too-short"
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least 32 bytes")
+
+	_, err = config.Load(writeConfig(t, `
+[meta_registry]
+lease_seconds = 301
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "outside safe bounds")
+
+	_, err = config.Load(writeConfig(t, `
+[meta_registry]
+replay_window_seconds = 299
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "outside safe bounds")
+
+	_, err = config.Load(writeConfig(t, `
+[meta_registry]
+service_secret = "synthetic-meta-registry-service-secret-at-least-32-bytes"
+relay_edge_secret = "synthetic-meta-registry-edge-secret-at-least-32-bytes"
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not production-enableable")
+}
+
+func TestLoad_ProductionStaticConfigurationRemainsRegistryFree(t *testing.T) {
+	cfg, err := config.Load(writeConfig(t, `
+[app]
+environment = "production"
+
+[database]
+host = "db.example.test"
+`))
+	require.NoError(t, err)
+	assert.Empty(t, cfg.MetaRegistry.ServiceSecret)
+	assert.Empty(t, cfg.MetaRegistry.RelayEdgeSecret)
+	assert.Equal(t, 300, cfg.MetaRegistry.ReplayWindowSeconds)
 }
 
 func TestLoad_FileValuesOverrideDefaults(t *testing.T) {

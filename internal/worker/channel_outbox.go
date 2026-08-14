@@ -1278,7 +1278,7 @@ func (w *Worker) channelOutboxAdapter(account *models.ChannelAccount) (channelap
 		account.Channel,
 		client,
 		encryptionKey,
-	), nil
+	).WithServiceToken(w.Config.MetaRegistry.RelayEdgeSecret), nil
 }
 
 // hasDurableChannelOutboxEntitlement mirrors the durable commercial check used

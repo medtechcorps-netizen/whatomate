@@ -13,9 +13,9 @@ import (
 
 const (
 	tenantSetting = "app.current_organization_id"
-	// Keep version 5 for binary rollback compatibility. The normalized
-	// WhatsApp resolver is backward-compatible, while the new binary verifies
-	// its global uniqueness index independently before serving traffic.
+	// Keep version 5 for binary rollback compatibility. Additional optional
+	// resolvers are verified by name so an older binary can still roll back
+	// after the migration without rejecting the unchanged core contract.
 	tenantRLSRoutingVersion = 5
 )
 
@@ -488,6 +488,7 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		"public.rereply_resolve_webhook_org(text)",
 		"public.rereply_resolve_waba_orgs(text)",
 		"public.rereply_resolve_channel_org(uuid)",
+		"public.rereply_resolve_meta_channel_org(text,text)",
 		"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamp with time zone)",
 		"public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamp with time zone)",
 		"public.rereply_ready_threads_credential_orgs(uuid,integer,timestamp with time zone)",
@@ -604,6 +605,26 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		     AND status IN ('pending', 'active', 'degraded')
 		     AND deleted_at IS NULL
 		 $function$`,
+		`CREATE OR REPLACE FUNCTION public.rereply_resolve_meta_channel_org(
+		   p_channel text,
+		   p_external_account_id text
+		 )
+		 RETURNS uuid
+		 LANGUAGE sql
+		 STABLE
+		 SECURITY DEFINER
+		 SET search_path = pg_catalog, public
+		 AS $function$
+		   SELECT organization_id
+		   FROM public.channel_accounts
+		   WHERE channel::text = lower(btrim(p_channel))
+		     AND provider = 'relay'
+		     AND external_account_id = btrim(p_external_account_id)
+		     AND channel::text IN ('messenger', 'instagram')
+		     AND status IN ('active', 'degraded')
+		     AND deleted_at IS NULL
+		   LIMIT 1
+		 $function$`,
 		`CREATE OR REPLACE FUNCTION public.rereply_ready_channel_outbox_orgs(
 		   p_after uuid,
 		   p_limit integer,
@@ -708,6 +729,7 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_webhook_org(text) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_waba_orgs(text) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_resolve_channel_org(uuid) FROM PUBLIC",
+		"REVOKE ALL ON FUNCTION public.rereply_resolve_meta_channel_org(text,text) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamptz) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz) FROM PUBLIC",
@@ -716,6 +738,7 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_webhook_org(text) TO %s", runtimeRole),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_waba_orgs(text) TO %s", runtimeRole),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_channel_org(uuid) TO %s", runtimeRole),
+		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_meta_channel_org(text,text) TO %s", runtimeRole),
 		fmt.Sprintf(
 			"GRANT EXECUTE ON FUNCTION public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz) TO %s",
 			runtimeRole,
@@ -774,6 +797,7 @@ func RemoveTenantRLS(db *gorm.DB) error {
 			"public.rereply_resolve_waba_orgs(text)",
 			"public.rereply_resolve_channel_org(uuid)",
 			"public.rereply_resolve_channel_org(text,text,text)",
+			"public.rereply_resolve_meta_channel_org(text,text)",
 			"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz)",
 			"public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamptz)",
 			"public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz)",

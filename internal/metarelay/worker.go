@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -41,8 +42,11 @@ func NewWorker(config *Config, store QueueStore, options ...WorkerOption) (*Work
 	if config.WorkerConcurrency <= 0 || config.WorkerConcurrency > maxWorkerConcurrency {
 		return nil, errors.New("worker concurrency is invalid")
 	}
-	if config.ForwardTimeout <= 0 ||
-		config.ProcessingLease < config.ForwardTimeout+queueSettlementTimeout+leaseSafetyMargin {
+	requiredLease := config.ForwardTimeout + queueSettlementTimeout + leaseSafetyMargin
+	if strings.TrimSpace(config.RegistryURL) != "" {
+		requiredLease += config.RegistryTimeout
+	}
+	if config.ForwardTimeout <= 0 || config.ProcessingLease < requiredLease {
 		return nil, errors.New("processing lease does not safely cover a forwarding attempt")
 	}
 	worker := &Worker{
@@ -60,6 +64,11 @@ func NewWorker(config *Config, store QueueStore, options ...WorkerOption) (*Work
 	for _, option := range options {
 		option(worker)
 	}
+	registry, err := NewRegistryClient(config, nil)
+	if err != nil {
+		return nil, err
+	}
+	worker.registry = registry
 	return worker, nil
 }
 
@@ -120,11 +129,46 @@ func (w *Worker) ProcessOnce(ctx context.Context) error {
 }
 
 func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
-	account, ok := w.config.accountByKey(job.AccountKey)
+	// Version 0/1 are legacy static jobs and remain readable for rollback
+	// compatibility. A future producer version is parked, never destroyed by a
+	// worker that does not understand its routing/fence semantics.
+	if job.SchemaVersion > InboundJobSchemaVersion {
+		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+		defer cancel()
+		return w.store.ParkInbound(settleCtx, job.ID, w.now().UTC().Add(time.Minute))
+	}
+	var account *AccountConfig
+	ok := false
+	deadReason := "unknown_account"
+	if job.RegistryFence == "" {
+		account, ok = w.config.accountByKey(job.AccountKey)
+	}
+	if !ok && w.registry != nil && job.Channel != "" && job.ExternalAccountID != "" {
+		resolved, resolveErr := w.registry.Resolve(ctx, job.Channel, job.ExternalAccountID, false)
+		if resolveErr == nil && registryFence(resolved) == job.RegistryFence && job.RegistryFence != "" {
+			account, ok = resolved, true
+		} else if resolveErr == nil {
+			deadReason = "registry_binding_version_changed"
+		} else if errors.Is(resolveErr, ErrRegistryStale) {
+			settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+			defer cancel()
+			return w.store.ParkInbound(
+				settleCtx, job.ID, w.now().UTC().Add(time.Minute),
+			)
+		} else if errors.Is(resolveErr, ErrRegistryUnavailable) {
+			settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+			defer cancel()
+			_, _, retryErr := w.store.RetryInbound(
+				settleCtx, job.ID, w.now().UTC().Add(retryBackoff(job.Attempts+1)),
+				w.config.MaxAttempts, "registry_unavailable",
+			)
+			return retryErr
+		}
+	}
 	if !ok {
 		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
 		defer cancel()
-		return w.store.DeadInbound(settleCtx, job.ID, "unknown_account")
+		return w.store.DeadInbound(settleCtx, job.ID, deadReason)
 	}
 
 	forwardCtx, cancelForward := context.WithTimeout(ctx, w.config.ForwardTimeout)
@@ -257,5 +301,9 @@ func retryBackoff(attempt int) time.Duration {
 }
 
 func (w *Worker) String() string {
-	return fmt.Sprintf("Meta relay worker (%d account mappings)", len(w.config.Accounts))
+	mode := "static"
+	if w.registry != nil {
+		mode = "static+dynamic"
+	}
+	return fmt.Sprintf("Meta relay worker (%d static account mappings, %s)", len(w.config.Accounts), mode)
 }

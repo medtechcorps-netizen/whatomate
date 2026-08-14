@@ -147,3 +147,22 @@ func TestLoadConfigErrorsDoNotExposeCredentialValues(t *testing.T) {
 		t.Fatalf("accounts config error exposed source data: %q", err)
 	}
 }
+
+func TestLoadConfigRejectsDynamicRegistryUntilLifecycleRelease(t *testing.T) {
+	environment := validConfigEnvironment()
+	delete(environment, "META_RELAY_ACCOUNTS_JSON")
+	environment["META_RELAY_REGISTRY_URL"] = "https://app.example.test/internal/meta-registry/v1/resolve"
+	environment["META_RELAY_REGISTRY_SECRET"] = "synthetic-registry-config-secret-at-least-32-bytes"
+	environment["META_RELAY_REGISTRY_EDGE_SECRET"] = "synthetic-registry-edge-secret-at-least-32-bytes"
+	if _, err := loadTestEnvironment(environment); err == nil || !strings.Contains(err.Error(), "not production-enableable") {
+		t.Fatalf("expected dynamic-only lifecycle gate, got %v", err)
+	}
+
+	environment = validConfigEnvironment()
+	environment["META_RELAY_REGISTRY_URL"] = "https://app.example.test/internal/meta-registry/v1/resolve"
+	environment["META_RELAY_REGISTRY_SECRET"] = "synthetic-registry-config-secret-at-least-32-bytes"
+	environment["META_RELAY_REGISTRY_EDGE_SECRET"] = "synthetic-registry-edge-secret-at-least-32-bytes"
+	if _, err := loadTestEnvironment(environment); err == nil || !strings.Contains(err.Error(), "not production-enableable") {
+		t.Fatalf("expected mixed static/dynamic lifecycle gate, got %v", err)
+	}
+}

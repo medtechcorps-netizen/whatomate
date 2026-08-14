@@ -26,6 +26,8 @@ const (
 	defaultPollInterval      = 500 * time.Millisecond
 	defaultWorkerConcurrency = 4
 	defaultMaxAttempts       = 12
+	defaultRegistryCacheTTL  = 10 * time.Second
+	defaultRegistryTimeout   = 3 * time.Second
 	queueSettlementTimeout   = 5 * time.Second
 	leaseSafetyMargin        = time.Second
 	maxWorkerConcurrency     = 64
@@ -59,6 +61,11 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 		PollInterval:              defaultPollInterval,
 		WorkerConcurrency:         defaultWorkerConcurrency,
 		MaxAttempts:               defaultMaxAttempts,
+		RegistryURL:               strings.TrimSpace(getenv("META_RELAY_REGISTRY_URL")),
+		RegistrySecret:            getenv("META_RELAY_REGISTRY_SECRET"),
+		RegistryEdgeSecret:        getenv("META_RELAY_REGISTRY_EDGE_SECRET"),
+		RegistryCacheTTL:          defaultRegistryCacheTTL,
+		RegistryTimeout:           defaultRegistryTimeout,
 	}
 	if config.ListenAddr == "" {
 		config.ListenAddr = defaultListenAddr
@@ -89,18 +96,23 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 	if config.MaxAttempts, err = envPositiveInt(getenv, "META_RELAY_MAX_ATTEMPTS", config.MaxAttempts); err != nil {
 		return nil, err
 	}
+	if config.RegistryCacheTTL, err = envDuration(getenv, "META_RELAY_REGISTRY_CACHE_TTL", config.RegistryCacheTTL); err != nil {
+		return nil, err
+	}
+	if config.RegistryTimeout, err = envDuration(getenv, "META_RELAY_REGISTRY_TIMEOUT", config.RegistryTimeout); err != nil {
+		return nil, err
+	}
 
 	rawAccounts := strings.TrimSpace(getenv("META_RELAY_ACCOUNTS_JSON"))
-	if rawAccounts == "" {
-		return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is required")
-	}
-	decoder := json.NewDecoder(strings.NewReader(rawAccounts))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&config.Accounts); err != nil {
-		return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is invalid")
-	}
-	if err := rejectTrailingJSON(decoder); err != nil {
-		return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is invalid")
+	if rawAccounts != "" {
+		decoder := json.NewDecoder(strings.NewReader(rawAccounts))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&config.Accounts); err != nil {
+			return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is invalid")
+		}
+		if err := rejectTrailingJSON(decoder); err != nil {
+			return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is invalid")
+		}
 	}
 	if err := config.validateAndIndex(getenv); err != nil {
 		return nil, err
@@ -136,8 +148,31 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 	if !graphVersionPattern.MatchString(c.GraphAPIVersion) {
 		return errors.New("environment variable META_RELAY_GRAPH_API_VERSION must be explicit, for example v25.0")
 	}
-	if len(c.Accounts) == 0 {
-		return errors.New("at least one Meta account mapping is required")
+	registryConfigured := strings.TrimSpace(c.RegistryURL) != "" ||
+		strings.TrimSpace(c.RegistrySecret) != "" || strings.TrimSpace(c.RegistryEdgeSecret) != ""
+	if registryConfigured {
+		if !c.registryLifecycleTestMode {
+			return errors.New("dynamic Meta registry lifecycle is not production-enableable in this foundation release")
+		}
+		if err := validateEndpoint(c.RegistryURL, c.allowInsecureTestEndpoints); err != nil {
+			return fmt.Errorf("environment variable META_RELAY_REGISTRY_URL: %w", err)
+		}
+		parsedRegistryURL, _ := url.Parse(c.RegistryURL)
+		if parsedRegistryURL.Path != "/internal/meta-registry/v1/resolve" ||
+			parsedRegistryURL.EscapedPath() != "/internal/meta-registry/v1/resolve" ||
+			parsedRegistryURL.RawPath != "" || parsedRegistryURL.RawQuery != "" ||
+			parsedRegistryURL.ForceQuery || parsedRegistryURL.Opaque != "" {
+			return errors.New("environment variable META_RELAY_REGISTRY_URL must be the exact resolve endpoint without a query")
+		}
+		if len(c.RegistrySecret) < 32 {
+			return errors.New("environment variable META_RELAY_REGISTRY_SECRET must contain at least 32 bytes")
+		}
+		if len(c.RegistryEdgeSecret) < 32 {
+			return errors.New("environment variable META_RELAY_REGISTRY_EDGE_SECRET must contain at least 32 bytes")
+		}
+	}
+	if len(c.Accounts) == 0 && !registryConfigured {
+		return errors.New("at least one static Meta account mapping or dynamic registry is required")
 	}
 	if c.InboundRetention <= 0 ||
 		c.OutboundRetention <= 0 ||
@@ -148,11 +183,19 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 		c.MaxAttempts <= 0 {
 		return errors.New("relay durations and max attempts must be positive")
 	}
+	if registryConfigured && (c.RegistryCacheTTL <= 0 || c.RegistryCacheTTL > time.Minute ||
+		c.RegistryTimeout <= 0 || c.RegistryTimeout > 10*time.Second) {
+		return errors.New("Meta registry cache and timeout durations are outside safe bounds")
+	}
 	if c.WorkerConcurrency > maxWorkerConcurrency {
 		return fmt.Errorf("environment variable META_RELAY_WORKER_CONCURRENCY must not exceed %d", maxWorkerConcurrency)
 	}
-	if c.ProcessingLease < c.ForwardTimeout+queueSettlementTimeout+leaseSafetyMargin {
-		return errors.New("environment variable META_RELAY_PROCESSING_LEASE must cover forward timeout and queue settlement")
+	requiredProcessingLease := c.ForwardTimeout + queueSettlementTimeout + leaseSafetyMargin
+	if registryConfigured {
+		requiredProcessingLease += c.RegistryTimeout
+	}
+	if c.ProcessingLease < requiredProcessingLease {
+		return errors.New("environment variable META_RELAY_PROCESSING_LEASE must cover registry lookup, forward timeout, and queue settlement")
 	}
 
 	c.byExternal = make(map[string]*AccountConfig, len(c.Accounts))

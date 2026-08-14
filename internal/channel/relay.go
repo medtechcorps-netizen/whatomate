@@ -24,6 +24,7 @@ import (
 const (
 	RelayProvider              = "relay"
 	RelaySignatureHeader       = "X-ReReply-Signature-256"
+	RelayServiceTokenHeader    = "X-ReReply-Relay-Service-Token"
 	relaySignaturePrefix       = "sha256="
 	defaultRelayBodyLimit      = int64(1 << 20)
 	maxRelayReplyContextRunes  = 512
@@ -53,12 +54,23 @@ type RelayAdapter struct {
 	channel       models.Channel
 	client        *http.Client
 	encryptionKey string
+	serviceToken  string
 	now           func() time.Time
 	lookupIP      func(context.Context, string) ([]net.IPAddr, error)
 	// allowLocalhostDev is deliberately not sourced from ChannelAccount.Config.
 	// It is an internal process-level switch used by package tests/local
 	// development only; production handlers leave it false.
 	allowLocalhostDev bool
+}
+
+// WithServiceToken adds the deployment-owned outer credential used by a
+// dynamic relay before it performs any registry lookup. The per-account HMAC
+// remains the inner authorization boundary after resolution.
+func (a *RelayAdapter) WithServiceToken(token string) *RelayAdapter {
+	if a != nil {
+		a.serviceToken = strings.TrimSpace(token)
+	}
+	return a
 }
 
 func NewRelayAdapter(channel models.Channel, client *http.Client, encryptionKey string) *RelayAdapter {
@@ -304,6 +316,9 @@ func (a *RelayAdapter) FetchMedia(ctx context.Context, account *models.ChannelAc
 		return FetchedMedia{}, err
 	}
 	req.Header.Set(RelaySignatureHeader, signRelayBody(secret, nil))
+	if a.serviceToken != "" {
+		req.Header.Set(RelayServiceTokenHeader, a.serviceToken)
+	}
 	req.Header.Set("User-Agent", "ReReply-Relay/1.0")
 
 	client, err := a.safeHTTPClient(allowLocalhost)
@@ -444,6 +459,9 @@ func (a *RelayAdapter) post(ctx context.Context, account *models.ChannelAccount,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "ReReply-Relay/1.0")
 	req.Header.Set(RelaySignatureHeader, signRelayBody(secret, payload))
+	if a.serviceToken != "" {
+		req.Header.Set(RelayServiceTokenHeader, a.serviceToken)
+	}
 
 	client, err := a.safeHTTPClient(a.allowLocalhostDev)
 	if err != nil {

@@ -18,6 +18,7 @@ import (
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/database"
+	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -27,6 +28,7 @@ import (
 var ErrChannelAdapterUnavailable = errors.New("channel provider adapter is not available")
 var ErrLegacyMetaAccountManaged = errors.New("legacy Meta channel accounts are managed by WhatsApp setup")
 var ErrThreadsAccountManaged = errors.New("threads accounts using OAuth are managed in Settings > Integrations")
+var ErrMetaRegistryAccountManaged = errors.New("OAuth-managed Meta account routing and credentials are managed by Meta onboarding")
 var ErrChannelAccountChangedDuringValidation = errors.New("channel account changed during validation")
 var ErrChannelAccountValidationSuperseded = errors.New("channel account validation was superseded")
 
@@ -36,6 +38,7 @@ var channelExternalAccountIdentifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-
 const (
 	threadsPublicEngagementMode            = "public_replies_mentions"
 	channelAccountHealthValidationTokenKey = "health_validation_token"
+	metaRegistryHealthApprovalMaxAge       = 15 * time.Minute
 )
 
 type ChannelAccountRequest struct {
@@ -194,6 +197,14 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,
 			"meta_legacy is reserved for the managed WhatsApp inbox bridge",
+			nil,
+			"",
+		)
+	}
+	if hasReservedMetaRegistryMarker(request.Config) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"OAuth-managed Meta accounts must be created through Meta onboarding",
 			nil,
 			"",
 		)
@@ -381,6 +392,14 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 	if request.Config != nil && unsafeConfigKey(*request.Config) != "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Config contains a restricted credential or network-policy key", nil, "")
 	}
+	if request.Config != nil && hasReservedMetaRegistryMarker(*request.Config) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Meta onboarding control markers cannot be changed through the generic channel API",
+			nil,
+			"",
+		)
+	}
 
 	var response ChannelAccountResponse
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
@@ -396,6 +415,10 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		}
 		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
 			return ErrThreadsAccountManaged
+		}
+		if metaRegistryControlPlaneConfig(account.Config) &&
+			(request.Config != nil || request.Capabilities != nil || request.OutboundSecret != "") {
+			return ErrMetaRegistryAccountManaged
 		}
 		oldAccount := *account
 		// Channel account JSONB values are maps. Keep detached audit snapshots
@@ -443,7 +466,18 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			if *request.OutboundEnabled && account.Status != models.ChannelAccountStatusActive {
 				return errors.New("test and activate the channel account before enabling outbound delivery")
 			}
+			if *request.OutboundEnabled && metaRegistryControlPlaneConfig(account.Config) {
+				if err := requireFreshMetaRegistryHealthApproval(account, time.Now().UTC()); err != nil {
+					return err
+				}
+			}
 			account.Config["outbound_enabled"] = *request.OutboundEnabled
+		}
+		if request.AIReplyEnabled != nil && *request.AIReplyEnabled &&
+			metaRegistryControlPlaneConfig(account.Config) {
+			if err := requireFreshMetaRegistryHealthApproval(account, time.Now().UTC()); err != nil {
+				return err
+			}
 		}
 		if err := applyChannelAIReplyOptIn(account, request.AIReplyEnabled); err != nil {
 			return err
@@ -586,6 +620,9 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
 		if errors.Is(err, ErrThreadsAccountManaged) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
+		}
+		if errors.Is(err, ErrMetaRegistryAccountManaged) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
@@ -933,6 +970,9 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
 			return ErrThreadsAccountManaged
 		}
+		if metaRegistryControlPlaneConfig(account.Config) {
+			return ErrMetaRegistryAccountManaged
+		}
 		if err := cancelChannelAIReplyJobsForAccountTx(
 			tx,
 			orgID,
@@ -972,6 +1012,9 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 		if errors.Is(err, ErrThreadsAccountManaged) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
 		}
+		if errors.Is(err, ErrMetaRegistryAccountManaged) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, err.Error(), nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete channel account", nil, "")
 	}
 	return r.SendEnvelope(map[string]string{"message": "Channel account deleted successfully"})
@@ -1003,7 +1046,12 @@ func (a *App) channelAdapter(account *models.ChannelAccount) (channelapi.Adapter
 		if a.Config != nil {
 			encryptionKey = a.Config.App.EncryptionKey
 		}
-		return channelapi.NewRelayAdapter(account.Channel, a.HTTPClient, encryptionKey), nil
+		edgeSecret := ""
+		if a.Config != nil {
+			edgeSecret = a.Config.MetaRegistry.RelayEdgeSecret
+		}
+		return channelapi.NewRelayAdapter(account.Channel, a.HTTPClient, encryptionKey).
+			WithServiceToken(edgeSecret), nil
 	}
 	return nil, fmt.Errorf("%w: channel=%s provider=%s", ErrChannelAdapterUnavailable, account.Channel, account.Provider)
 }
@@ -1327,6 +1375,36 @@ func stringConfigValue(config models.JSONB, key string) string {
 func boolConfigValue(config models.JSONB, key string) bool {
 	value, _ := config[key].(bool)
 	return value
+}
+
+func metaRegistryControlPlaneConfig(config models.JSONB) bool {
+	return boolConfigValue(config, "meta_registry_managed") ||
+		stringConfigValue(config, "meta_management_mode") == metaregistry.ManagementModePlatformOAuth
+}
+
+func hasReservedMetaRegistryMarker(config models.JSONB) bool {
+	for key := range config {
+		normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "-", "_"))
+		if strings.HasPrefix(normalized, "meta_registry_") ||
+			strings.HasPrefix(normalized, "meta_management_") ||
+			strings.HasPrefix(normalized, "meta_activation_") {
+			return true
+		}
+	}
+	return false
+}
+
+func requireFreshMetaRegistryHealthApproval(account *models.ChannelAccount, now time.Time) error {
+	if account == nil || account.Status != models.ChannelAccountStatusActive ||
+		account.LastHealthCheckAt == nil || strings.TrimSpace(account.LastError) != "" ||
+		stringConfigValue(account.Metadata, "meta_ownership_state") != metaregistry.OwnershipVerified {
+		return errors.New("run a successful Meta relay health test before approving outbound delivery")
+	}
+	checkedAt := account.LastHealthCheckAt.UTC()
+	if checkedAt.After(now.Add(time.Minute)) || now.Sub(checkedAt) > metaRegistryHealthApprovalMaxAge {
+		return errors.New("the successful Meta relay health test is no longer fresh; run it again before approving outbound delivery")
+	}
+	return nil
 }
 
 func capabilitiesToJSONB(capabilities channelapi.Capabilities) models.JSONB {

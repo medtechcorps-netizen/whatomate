@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha1" //nolint:gosec // SHA-1 is mandated by the coturn TURN REST API (RFC draft)
 	"encoding/base64"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+	"github.com/shridarpatil/whatomate/internal/metaregistry"
 )
 
 // Config holds all configuration for the application
@@ -30,6 +32,17 @@ type Config struct {
 	Calling             CallingConfig             `koanf:"calling"`
 	TTS                 TTSConfig                 `koanf:"tts"`
 	GoogleSearchConsole GoogleSearchConsoleConfig `koanf:"google_search_console"`
+	MetaRegistry        MetaRegistryConfig        `koanf:"meta_registry"`
+}
+
+// MetaRegistryConfig protects the private broker used by the isolated Meta
+// relay. ServiceSecret is deployment-managed and never tenant configurable.
+type MetaRegistryConfig struct {
+	ServiceSecret       string `koanf:"service_secret"`
+	RelayEdgeSecret     string `koanf:"relay_edge_secret"`
+	LeaseSeconds        int    `koanf:"lease_seconds"`
+	OwnershipMaxAgeMins int    `koanf:"ownership_max_age_mins"`
+	ReplayWindowSeconds int    `koanf:"replay_window_seconds"`
 }
 
 // GoogleSearchConsoleConfig contains deployment-managed OAuth credentials.
@@ -242,8 +255,40 @@ func Load(configPath string) (*Config, error) {
 
 	// Set defaults
 	setDefaults(&cfg)
+	if err := validateMetaRegistryConfig(cfg.MetaRegistry); err != nil {
+		return nil, err
+	}
 
 	return &cfg, nil
+}
+
+func validateMetaRegistryConfig(config MetaRegistryConfig) error {
+	serviceSecret := strings.TrimSpace(config.ServiceSecret)
+	edgeSecret := strings.TrimSpace(config.RelayEdgeSecret)
+	if serviceSecret != "" && len(serviceSecret) < 32 {
+		return errors.New("meta registry service secret must contain at least 32 bytes")
+	}
+	if edgeSecret != "" && len(edgeSecret) < 32 {
+		return errors.New("meta registry relay edge secret must contain at least 32 bytes")
+	}
+	if (serviceSecret == "") != (edgeSecret == "") {
+		return errors.New("meta registry service and relay edge secrets must be configured together")
+	}
+	if config.LeaseSeconds < 5 || config.LeaseSeconds > 300 ||
+		config.OwnershipMaxAgeMins < 1 || config.OwnershipMaxAgeMins > 7*24*60 ||
+		time.Duration(config.ReplayWindowSeconds)*time.Second < metaregistry.ReplayWindowFloor ||
+		config.ReplayWindowSeconds > 600 {
+		return errors.New("meta registry timing configuration is outside safe bounds")
+	}
+	// Split A is deliberately not production-enableable. The broker contract
+	// can be reviewed and exercised in package tests, but accepting deployment
+	// credentials before OAuth completion/reconnect/disconnect, scheduled Graph
+	// revalidation, signed deauthorization, and rollout draining are all wired
+	// would create a deceptively partial lifecycle.
+	if serviceSecret != "" {
+		return errors.New("meta registry lifecycle is not production-enableable in this foundation release")
+	}
+	return nil
 }
 
 func setDefaults(cfg *Config) {
@@ -252,6 +297,15 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.App.Environment == "" {
 		cfg.App.Environment = "development"
+	}
+	if cfg.MetaRegistry.LeaseSeconds == 0 {
+		cfg.MetaRegistry.LeaseSeconds = 30
+	}
+	if cfg.MetaRegistry.OwnershipMaxAgeMins == 0 {
+		cfg.MetaRegistry.OwnershipMaxAgeMins = 24 * 60
+	}
+	if cfg.MetaRegistry.ReplayWindowSeconds == 0 {
+		cfg.MetaRegistry.ReplayWindowSeconds = 5 * 60
 	}
 	if cfg.Server.Host == "" {
 		cfg.Server.Host = "0.0.0.0"

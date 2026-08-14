@@ -117,6 +117,7 @@ func TestRelayAdapterSendSignsRequest(t *testing.T) {
 		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		assert.Equal(t, signRelayBody("outbound-secret", body), r.Header.Get(RelaySignatureHeader))
+		assert.Equal(t, "outer-service-token", r.Header.Get(RelayServiceTokenHeader))
 		require.NoError(t, json.Unmarshal(body, &received))
 		assert.Equal(t, "message", received.Type)
 		data, ok := received.Data.(map[string]any)
@@ -131,7 +132,8 @@ func TestRelayAdapterSendSignsRequest(t *testing.T) {
 	}))
 	defer server.Close()
 
-	adapter := NewRelayAdapter(models.ChannelWebChat, server.Client(), relayTestEncryptionKey)
+	adapter := NewRelayAdapter(models.ChannelWebChat, server.Client(), relayTestEncryptionKey).
+		WithServiceToken("outer-service-token")
 	adapter.allowLocalhostDev = true
 	account := relayTestAccount(t, server.URL)
 	account.Channel = models.ChannelWebChat
