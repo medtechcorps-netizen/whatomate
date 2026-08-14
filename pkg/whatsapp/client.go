@@ -616,6 +616,94 @@ type SubscribeAppResponse struct {
 	Success bool `json:"success"`
 }
 
+const maxWABASubscriptionPages = 100
+
+// IsAppSubscribed performs a read-only check of the WABA subscribed_apps edge.
+// Meta returns the app identity at data[].whatsapp_business_api_data.id. Paging
+// cursors are used only to reconstruct URLs against the configured Graph base;
+// provider-supplied paging.next URLs are never followed.
+func (c *Client) IsAppSubscribed(
+	ctx context.Context,
+	wabaID, appID, accessToken, apiVersion string,
+) (bool, error) {
+	var err error
+	wabaID, err = normalizeGraphObjectID(wabaID, "business_id")
+	if err != nil {
+		return false, err
+	}
+	appID, err = normalizeGraphObjectID(appID, "app_id")
+	if err != nil {
+		return false, err
+	}
+	apiVersion, err = normalizeGraphAPIVersion(apiVersion)
+	if err != nil {
+		return false, err
+	}
+
+	type subscriptionPage struct {
+		Data []struct {
+			WhatsAppBusinessAPIData struct {
+				ID string `json:"id"`
+			} `json:"whatsapp_business_api_data"`
+		} `json:"data"`
+		Paging struct {
+			Cursors struct {
+				After string `json:"after"`
+			} `json:"cursors"`
+			Next string `json:"next"`
+		} `json:"paging"`
+	}
+
+	baseEndpoint := fmt.Sprintf(
+		"%s/%s/%s/subscribed_apps",
+		strings.TrimRight(c.getBaseURL(), "/"),
+		url.PathEscape(apiVersion),
+		url.PathEscape(wabaID),
+	)
+	seenCursors := make(map[string]struct{})
+	after := ""
+	for pageNumber := 0; pageNumber < maxWABASubscriptionPages; pageNumber++ {
+		query := url.Values{}
+		query.Set("limit", "100")
+		if after != "" {
+			query.Set("after", after)
+		}
+		pageURL := baseEndpoint + "?" + query.Encode()
+		body, err := c.doRequest(ctx, http.MethodGet, pageURL, nil, accessToken)
+		if err != nil {
+			return false, fmt.Errorf("failed to read WABA app subscriptions: %w", err)
+		}
+		var page subscriptionPage
+		if err := json.Unmarshal(body, &page); err != nil {
+			return false, fmt.Errorf("failed to parse WABA app subscriptions: %w", err)
+		}
+		for _, subscription := range page.Data {
+			subscribedAppID, normalizeErr := normalizeGraphObjectID(
+				subscription.WhatsAppBusinessAPIData.ID,
+				"subscribed app_id returned by Meta",
+			)
+			if normalizeErr != nil {
+				return false, normalizeErr
+			}
+			if subscribedAppID == appID {
+				return true, nil
+			}
+		}
+		if strings.TrimSpace(page.Paging.Next) == "" {
+			return false, nil
+		}
+		after = strings.TrimSpace(page.Paging.Cursors.After)
+		if after == "" {
+			return false, errors.New("meta app-subscription pagination omitted its continuation cursor")
+		}
+		if _, repeated := seenCursors[after]; repeated {
+			return false, errors.New("meta app-subscription pagination repeated a continuation cursor")
+		}
+		seenCursors[after] = struct{}{}
+	}
+	return false, fmt.Errorf("meta app-subscription pagination exceeded %d pages", maxWABASubscriptionPages)
+}
+
 // SubscribeApp subscribes the app to webhooks for the WhatsApp Business Account.
 // This is required after phone number registration to receive incoming messages.
 // Calls POST /{api_version}/{waba_id}/subscribed_apps

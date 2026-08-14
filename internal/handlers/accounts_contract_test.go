@@ -22,9 +22,16 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var contractGraphIDSequence atomic.Uint64
+
+const (
+	contractMetaAppID     = "990000000000001"
+	contractMetaAppSecret = "synthetic-meta-app-secret"
+)
 
 func contractGraphIDs() (string, string) {
 	sequence := contractGraphIDSequence.Add(1)
@@ -94,9 +101,12 @@ type whatsappContractMeta struct {
 	subscriptionStatus int
 	phoneIsOnBizApp    bool
 	phonePlatformType  string
+	permanentToken     bool
+	subscribedAppIDs   []string
 	tokensByCode       map[string]string
 	hits               map[string]int
 	onSubscribe        func()
+	onSubscriptionRead func()
 	onRegister         func(map[string]string)
 	onPhoneInfo        func(*http.Request)
 }
@@ -112,11 +122,13 @@ func newWhatsAppContractMeta(t *testing.T, phoneID, wabaID string) *whatsappCont
 		registrationStatus: http.StatusOK,
 		subscriptionStatus: http.StatusOK,
 		phonePlatformType:  "CLOUD_API",
+		subscribedAppIDs:   []string{contractMetaAppID},
 		hits:               make(map[string]int),
 	}
 	meta.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		meta.mu.Lock()
 		meta.hits[r.URL.Path]++
+		meta.hits[r.Method+" "+r.URL.Path]++
 		meta.mu.Unlock()
 
 		switch {
@@ -127,8 +139,8 @@ func newWhatsAppContractMeta(t *testing.T, phoneID, wabaID string) *whatsappCont
 				return
 			}
 			if err := r.ParseForm(); err != nil ||
-				r.Form.Get("client_id") != "synthetic-meta-app" ||
-				r.Form.Get("client_secret") != "synthetic-meta-app-secret" ||
+				r.Form.Get("client_id") != contractMetaAppID ||
+				r.Form.Get("client_secret") != contractMetaAppSecret ||
 				strings.TrimSpace(r.Form.Get("code")) == "" {
 				http.Error(w, "invalid synthetic token exchange form", http.StatusBadRequest)
 				return
@@ -139,29 +151,49 @@ func newWhatsAppContractMeta(t *testing.T, phoneID, wabaID string) *whatsappCont
 			}
 			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": token})
 		case r.URL.Path == "/debug_token":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"data": map[string]any{
-					"app_id":   "synthetic-meta-app",
-					"is_valid": true,
-					"scopes": []string{
-						"whatsapp_business_management",
-						"whatsapp_business_messaging",
-					},
-					"granular_scopes": []map[string]any{
-						{
-							"scope":      "whatsapp_business_management",
-							"target_ids": meta.granularTargetIDs,
-						},
-						{
-							"scope":      "whatsapp_business_messaging",
-							"target_ids": meta.messagingTargetIDs,
-						},
-					},
-					"expires_at":             time.Now().UTC().Add(2 * time.Hour).Unix(),
-					"data_access_expires_at": time.Now().UTC().Add(time.Hour).Unix(),
+			debugData := map[string]any{
+				"app_id":   contractMetaAppID,
+				"is_valid": true,
+				"scopes": []string{
+					"whatsapp_business_management",
+					"whatsapp_business_messaging",
 				},
+				"granular_scopes": []map[string]any{
+					{
+						"scope":      "whatsapp_business_management",
+						"target_ids": meta.granularTargetIDs,
+					},
+					{
+						"scope":      "whatsapp_business_messaging",
+						"target_ids": meta.messagingTargetIDs,
+					},
+				},
+			}
+			if !meta.permanentToken {
+				debugData["expires_at"] = time.Now().UTC().Add(2 * time.Hour).Unix()
+				debugData["data_access_expires_at"] = time.Now().UTC().Add(time.Hour).Unix()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": debugData,
 			})
 		case strings.HasSuffix(r.URL.Path, "/"+meta.wabaID+"/subscribed_apps"):
+			if r.Method == http.MethodGet {
+				if meta.onSubscriptionRead != nil {
+					meta.onSubscriptionRead()
+				}
+				data := make([]map[string]any, 0, len(meta.subscribedAppIDs))
+				for _, appID := range meta.subscribedAppIDs {
+					data = append(data, map[string]any{
+						"whatsapp_business_api_data": map[string]string{"id": appID},
+					})
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+				return
+			}
+			if r.Method != http.MethodPost {
+				http.Error(w, "invalid synthetic subscription method", http.StatusMethodNotAllowed)
+				return
+			}
 			if meta.onSubscribe != nil {
 				meta.onSubscribe()
 			}
@@ -237,7 +269,10 @@ func (m *whatsappContractMeta) totalHits() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var total int
-	for _, count := range m.hits {
+	for key, count := range m.hits {
+		if strings.Contains(key, " ") {
+			continue
+		}
 		total += count
 	}
 	return total
@@ -249,11 +284,17 @@ func (m *whatsappContractMeta) pathHits(path string) int {
 	return m.hits[path]
 }
 
+func (m *whatsappContractMeta) methodHits(method, path string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.hits[method+" "+path]
+}
+
 func newWhatsAppContractApp(t *testing.T, meta *whatsappContractMeta) *App {
 	t.Helper()
 	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
-	app.Config.WhatsApp.AppID = "synthetic-meta-app"
-	app.Config.WhatsApp.AppSecret = "synthetic-meta-app-secret"
+	app.Config.WhatsApp.AppID = contractMetaAppID
+	app.Config.WhatsApp.AppSecret = contractMetaAppSecret
 	app.Config.WhatsApp.APIVersion = "v21.0"
 	app.Config.WhatsApp.BaseURL = meta.server.URL
 	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, meta.server.URL)
@@ -306,7 +347,8 @@ func TestCreateAccountValidatesRelationshipPersistsPendingThenActivates(t *testi
 	assert.NotContains(t, string(testutil.GetResponseBody(req)), "synthetic-valid-token")
 	assert.True(t, sawPendingEncrypted, "subscription must see an existing encrypted pending row")
 	assert.Equal(t, 1, meta.hit("/v21.0/"+wabaID+"/phone_numbers"))
-	assert.Equal(t, 1, meta.hit("/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Zero(t, meta.methodHits(http.MethodGet, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Equal(t, 1, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
 
 	var stored models.WhatsAppAccount
 	require.NoError(t, app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&stored).Error)
@@ -501,10 +543,9 @@ func TestUpdateAccountPendingRecoveryNonContractEditPreservesClaimCiphertexts(t 
 	assert.Equal(t, pinCiphertext, stored.Pin)
 }
 
-func TestUpdateAccountActiveStalePUTCannotOverwriteEmbeddedSignupClaim(t *testing.T) {
+func TestUpdateAccountActiveStalePUTCannotOverwriteEmbeddedSignupTokenRefresh(t *testing.T) {
 	phoneID, wabaID := contractGraphIDs()
 	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
-	meta.registrationStatus = http.StatusInternalServerError
 	meta.tokensByCode = map[string]string{
 		"claim-during-put": "synthetic-exchange-claim-token",
 	}
@@ -576,11 +617,10 @@ func TestUpdateAccountActiveStalePUTCannotOverwriteEmbeddedSignupClaim(t *testin
 
 	var claimed models.WhatsAppAccount
 	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&claimed).Error)
-	require.Equal(t, "pending_registration", claimed.Status)
+	require.Equal(t, "active", claimed.Status)
 	require.NotEqual(t, oldToken, claimed.AccessToken)
-	require.NotEqual(t, oldPIN, claimed.Pin)
+	require.Equal(t, oldPIN, claimed.Pin)
 	claimTokenCiphertext := claimed.AccessToken
-	claimPINCiphertext := claimed.Pin
 
 	close(releaseValidation)
 	require.NoError(t, <-updateDone)
@@ -588,11 +628,13 @@ func TestUpdateAccountActiveStalePUTCannotOverwriteEmbeddedSignupClaim(t *testin
 
 	var final models.WhatsAppAccount
 	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&final).Error)
-	assert.Equal(t, "pending_registration", final.Status)
+	assert.Equal(t, "active", final.Status)
 	assert.Equal(t, "Active Before Stale PUT", final.Name)
 	assert.Equal(t, claimTokenCiphertext, final.AccessToken)
-	assert.Equal(t, claimPINCiphertext, final.Pin)
-	assert.Zero(t, meta.hit("/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Equal(t, oldPIN, final.Pin)
+	assert.Zero(t, meta.hit("/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 1, meta.methodHits(http.MethodGet, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
 }
 
 func TestRegisterRecoveryConcurrentContractPUTCannotSkipToActive(t *testing.T) {
@@ -1240,25 +1282,24 @@ func TestEmbeddedSignupReusesAuthoritativeSMBValidationWithoutRegistration(t *te
 func TestEmbeddedSignupActiveReconnectPreservesStableNameAndOperationalFlags(t *testing.T) {
 	phoneID, wabaID := contractGraphIDs()
 	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.permanentToken = true
 	app := newWhatsAppContractApp(t, meta)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := contractWriter(t, app, org.ID)
-	var observedRegistrationPIN string
-	meta.onRegister = func(body map[string]string) {
-		observedRegistrationPIN = body["pin"]
-	}
 	oldToken, err := appcrypto.Encrypt("synthetic-old-reconnect-token", integrationTestEncryptionKey)
 	require.NoError(t, err)
 	oldPIN, err := appcrypto.Encrypt("123456", integrationTestEncryptionKey)
 	require.NoError(t, err)
+	oldExpiry := time.Now().UTC().Add(30 * time.Minute).Truncate(time.Second)
 	existing := &models.WhatsAppAccount{
 		BaseModel:              models.BaseModel{ID: uuid.New()},
 		OrganizationID:         org.ID,
 		Name:                   "Stable Clinic Routing Name",
-		PhoneID:                "  " + phoneID + "  ",
-		BusinessID:             "old-business-id",
+		PhoneID:                phoneID,
+		BusinessID:             wabaID,
 		AccessToken:            oldToken,
-		APIVersion:             "v20.0",
+		AccessTokenExpiresAt:   &oldExpiry,
+		APIVersion:             "v21.0",
 		Status:                 "active",
 		Pin:                    oldPIN,
 		IsDefaultIncoming:      true,
@@ -1289,16 +1330,184 @@ func TestEmbeddedSignupActiveReconnectPreservesStableNameAndOperationalFlags(t *
 	assert.True(t, stored.AutoReadReceipt)
 	assert.True(t, stored.BusinessCallingEnabled)
 	assert.Equal(t, "active", stored.Status)
-	require.Len(t, observedRegistrationPIN, 6)
+	assert.Equal(t, oldPIN, stored.Pin, "token refresh must preserve the accepted PIN ciphertext")
+	assert.Nil(t, stored.AccessTokenExpiresAt, "a permanent replacement token must remove the old expiry")
+	assert.Equal(t, 0, meta.hit("/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 1, meta.methodHits(http.MethodGet, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Equal(t, 0, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
 	decrypted := stored
 	decrypted.DecryptSecrets(integrationTestEncryptionKey)
-	assert.Equal(t, observedRegistrationPIN, decrypted.Pin, "successful registration must retain the accepted candidate PIN")
+	assert.Equal(t, "synthetic-embedded-token", decrypted.AccessToken)
+	assert.Equal(t, "123456", decrypted.Pin)
 }
 
-func TestEmbeddedSignupActiveReconnectDefiniteRejectionRestoresPriorStatusAndPIN(t *testing.T) {
+func TestEmbeddedSignupActiveReconnectFailsClosedWhenCurrentAppIsNotSubscribed(t *testing.T) {
 	phoneID, wabaID := contractGraphIDs()
 	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
-	meta.registrationStatus = http.StatusBadRequest
+	meta.permanentToken = true
+	meta.subscribedAppIDs = []string{"990000000000002"}
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-old-unbound-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	oldPIN, err := appcrypto.Encrypt("729164", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	existing := &models.WhatsAppAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    org.ID,
+		Name:              "Stable Unbound Clinic",
+		PhoneID:           phoneID,
+		BusinessID:        wabaID,
+		AccessToken:       oldToken,
+		APIVersion:        "v21.0",
+		Status:            "active",
+		Pin:               oldPIN,
+		AutoReadReceipt:   true,
+		IsDefaultIncoming: true,
+		IsDefaultOutgoing: true,
+	}
+	require.NoError(t, app.DB.Create(existing).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code":     "synthetic-unbound-reconnect-code",
+		"phone_id": phoneID,
+		"waba_id":  wabaID,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ExchangeToken(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "not subscribed")
+
+	assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 1, meta.methodHits(http.MethodGet, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", existing.ID).First(&stored).Error)
+	assert.Equal(t, "active", stored.Status)
+	assert.Equal(t, oldToken, stored.AccessToken)
+	assert.Equal(t, oldPIN, stored.Pin)
+	assert.Equal(t, existing.Name, stored.Name)
+	assert.True(t, stored.AutoReadReceipt)
+	assert.True(t, stored.IsDefaultIncoming)
+	assert.True(t, stored.IsDefaultOutgoing)
+}
+
+func TestEmbeddedSignupActiveReconnectFencesConcurrentIntegrationCenterChange(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.permanentToken = true
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-old-config-race-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	oldPIN, err := appcrypto.Encrypt("284517", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	existing := &models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Stable Config Race Clinic",
+		PhoneID:        phoneID,
+		BusinessID:     wabaID,
+		AccessToken:    oldToken,
+		APIVersion:     "v21.0",
+		Status:         "active",
+		Pin:            oldPIN,
+	}
+	require.NoError(t, app.DB.Create(existing).Error)
+
+	subscriptionReadEntered := make(chan struct{})
+	allowSubscriptionRead := make(chan struct{})
+	meta.onSubscriptionRead = func() {
+		close(subscriptionReadEntered)
+		<-allowSubscriptionRead
+	}
+	configLocked := make(chan struct{})
+	releaseConfig := make(chan struct{})
+	t.Cleanup(func() {
+		for _, ch := range []chan struct{}{allowSubscriptionRead, releaseConfig} {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
+	})
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code":     "synthetic-config-race-reconnect-code",
+		"phone_id": phoneID,
+		"waba_id":  wabaID,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	exchangeDone := make(chan error, 1)
+	go func() { exchangeDone <- app.ExchangeToken(req) }()
+	select {
+	case <-subscriptionReadEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("active reconnect did not reach subscription proof")
+	}
+
+	configDone := make(chan error, 1)
+	go func() {
+		configDone <- app.DB.Transaction(func(tx *gorm.DB) error {
+			var lockedOrganization models.Organization
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ?", org.ID).
+				First(&lockedOrganization).Error; err != nil {
+				return err
+			}
+			var integration models.ProviderIntegration
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("organization_id = ? AND provider = ?", org.ID, integrationProviderMeta).
+				First(&integration).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if lockedOrganization.Settings == nil {
+				lockedOrganization.Settings = models.JSONB{}
+			}
+			lockedOrganization.Settings["meta_app_id"] = "990000000000099"
+			if err := tx.Model(&models.Organization{}).
+				Where("id = ?", org.ID).
+				Update("settings", lockedOrganization.Settings).Error; err != nil {
+				return err
+			}
+			close(configLocked)
+			<-releaseConfig
+			return nil
+		})
+	}()
+	select {
+	case <-configLocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent Integration Center update did not acquire its contract locks")
+	}
+	close(allowSubscriptionRead)
+	select {
+	case err := <-exchangeDone:
+		t.Fatalf("reconnect bypassed the Integration Center lock fence: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(releaseConfig)
+	require.NoError(t, <-configDone)
+	require.NoError(t, <-exchangeDone)
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "settings changed")
+
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", existing.ID).First(&stored).Error)
+	assert.Equal(t, "active", stored.Status)
+	assert.Equal(t, oldToken, stored.AccessToken)
+	assert.Equal(t, oldPIN, stored.Pin)
+	assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 1, meta.methodHits(http.MethodGet, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+}
+
+func TestEmbeddedSignupActiveReconnectDifferentWABARejectsBeforeMutation(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
 	app := newWhatsAppContractApp(t, meta)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := contractWriter(t, app, org.ID)
@@ -1332,8 +1541,8 @@ func TestEmbeddedSignupActiveReconnectDefiniteRejectionRestoresPriorStatusAndPIN
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
 	require.NoError(t, app.ExchangeToken(req))
-	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
-	assert.Contains(t, string(testutil.GetResponseBody(req)), "Registration could not be confirmed")
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "already connected")
+	assert.Equal(t, 0, meta.hit("/v21.0/"+phoneID+"/register"))
 	assert.Equal(t, 0, meta.hit("/v21.0/"+wabaID+"/subscribed_apps"))
 
 	var stored models.WhatsAppAccount
@@ -1344,24 +1553,14 @@ func TestEmbeddedSignupActiveReconnectDefiniteRejectionRestoresPriorStatusAndPIN
 	assert.True(t, stored.IsDefaultOutgoing)
 	assert.True(t, stored.AutoReadReceipt)
 	assert.True(t, stored.BusinessCallingEnabled)
-	assert.True(t, appcrypto.IsEncrypted(stored.AccessToken))
-	assert.True(t, appcrypto.IsEncrypted(stored.Pin))
-	decrypted := stored
-	decrypted.DecryptSecrets(integrationTestEncryptionKey)
-	assert.Equal(t, "synthetic-embedded-token", decrypted.AccessToken)
-	assert.Equal(t, "654321", decrypted.Pin, "a definite rejection must restore the last PIN Meta accepted")
+	assert.Equal(t, oldToken, stored.AccessToken)
+	assert.Equal(t, oldPIN, stored.Pin)
 }
 
-func TestEmbeddedSignupActiveReconnectTimeoutKeepsCandidatePending(t *testing.T) {
+func TestEmbeddedSignupActiveReconnectDifferentAPIRejectsBeforeMutation(t *testing.T) {
 	phoneID, wabaID := contractGraphIDs()
 	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
-	pinObserved := make(chan string, 1)
-	meta.onRegister = func(body map[string]string) {
-		pinObserved <- body["pin"]
-		time.Sleep(300 * time.Millisecond)
-	}
 	app := newWhatsAppContractApp(t, meta)
-	app.WhatsApp.HTTPClient.Timeout = 100 * time.Millisecond
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := contractWriter(t, app, org.ID)
 	oldToken, err := appcrypto.Encrypt("synthetic-old-timeout-token", integrationTestEncryptionKey)
@@ -1373,9 +1572,9 @@ func TestEmbeddedSignupActiveReconnectTimeoutKeepsCandidatePending(t *testing.T)
 		OrganizationID: org.ID,
 		Name:           "Stable Timeout Clinic",
 		PhoneID:        phoneID,
-		BusinessID:     "old-timeout-waba",
+		BusinessID:     wabaID,
 		AccessToken:    oldToken,
-		APIVersion:     "v21.0",
+		APIVersion:     "v20.0",
 		Status:         "active",
 		Pin:            oldPIN,
 	}
@@ -1389,24 +1588,462 @@ func TestEmbeddedSignupActiveReconnectTimeoutKeepsCandidatePending(t *testing.T)
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
 	require.NoError(t, app.ExchangeToken(req))
-	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "already connected")
+	assert.Equal(t, 0, meta.hit("/v21.0/"+phoneID+"/register"))
 	assert.Equal(t, 0, meta.hit("/v21.0/"+wabaID+"/subscribed_apps"))
-
-	var candidatePIN string
-	select {
-	case candidatePIN = <-pinObserved:
-	case <-time.After(time.Second):
-		t.Fatal("registration request did not carry the candidate PIN")
-	}
-	require.Len(t, candidatePIN, 6)
 	var stored models.WhatsAppAccount
 	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", existing.ID, org.ID).First(&stored).Error)
-	assert.Equal(t, "pending_registration", stored.Status, "an ambiguous timeout must remain pending reconciliation")
+	assert.Equal(t, "active", stored.Status)
 	assert.Equal(t, "Stable Timeout Clinic", stored.Name)
-	decrypted := stored
-	decrypted.DecryptSecrets(integrationTestEncryptionKey)
-	assert.Equal(t, "synthetic-embedded-token", decrypted.AccessToken)
-	assert.Equal(t, candidatePIN, decrypted.Pin, "the possibly accepted candidate PIN must remain recoverable")
+	assert.Equal(t, oldToken, stored.AccessToken)
+	assert.Equal(t, oldPIN, stored.Pin)
+}
+
+func createRegistrationReconciliationFixture(
+	t *testing.T,
+	app *App,
+	orgID uuid.UUID,
+	phoneID, wabaID string,
+	pendingSince time.Time,
+	withEvidence bool,
+) (*models.WhatsAppAccount, *models.Message) {
+	t.Helper()
+	accessToken, err := appcrypto.Encrypt("synthetic-permanent-pending-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	pin, err := appcrypto.Encrypt("820641", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	account := &models.WhatsAppAccount{
+		BaseModel: models.BaseModel{
+			ID:        uuid.New(),
+			CreatedAt: pendingSince.Add(-time.Hour),
+			UpdatedAt: pendingSince,
+		},
+		OrganizationID:         orgID,
+		Name:                   "Pending Reconciliation Clinic " + phoneID,
+		PhoneID:                phoneID,
+		BusinessID:             wabaID,
+		AccessToken:            accessToken,
+		APIVersion:             "v21.0",
+		Status:                 "pending_registration",
+		Pin:                    pin,
+		IsDefaultIncoming:      true,
+		IsDefaultOutgoing:      true,
+		AutoReadReceipt:        true,
+		BusinessCallingEnabled: true,
+	}
+	require.NoError(t, app.DB.Create(account).Error)
+	if !withEvidence {
+		return account, nil
+	}
+	return account, createRegistrationInboundEvidence(
+		t,
+		app,
+		account,
+		pendingSince.Add(time.Minute),
+	)
+}
+
+func createRegistrationInboundEvidence(
+	t *testing.T,
+	app *App,
+	account *models.WhatsAppAccount,
+	evidenceAt time.Time,
+) *models.Message {
+	t.Helper()
+	unique := uuid.NewString()
+	contact := &models.Contact{
+		BaseModel:       models.BaseModel{ID: uuid.New(), CreatedAt: evidenceAt, UpdatedAt: evidenceAt},
+		OrganizationID:  account.OrganizationID,
+		PhoneNumber:     "6011" + strings.ReplaceAll(unique[:12], "-", ""),
+		ProfileName:     "Reconciliation Evidence Sender",
+		WhatsAppAccount: account.Name,
+	}
+	require.NoError(t, app.DB.Create(contact).Error)
+	message := &models.Message{
+		BaseModel:         models.BaseModel{ID: uuid.New(), CreatedAt: evidenceAt, UpdatedAt: evidenceAt},
+		OrganizationID:    account.OrganizationID,
+		WhatsAppAccount:   account.Name,
+		ContactID:         contact.ID,
+		WhatsAppMessageID: "wamid.reconciliation." + unique,
+		Direction:         models.DirectionIncoming,
+		MessageType:       models.MessageTypeText,
+		Content:           "registration evidence",
+		Status:            models.MessageStatusReceived,
+	}
+	require.NoError(t, app.DB.Create(message).Error)
+	job := &models.ScheduledJob{
+		BaseModel:      models.BaseModel{ID: uuid.New(), CreatedAt: evidenceAt, UpdatedAt: evidenceAt},
+		OrganizationID: account.OrganizationID,
+		Kind:           inboundContinuationJobKind,
+		AggregateType:  "message",
+		AggregateID:    &message.ID,
+		RunAt:          evidenceAt,
+		Status:         models.ScheduledJobStatusCompleted,
+		IdempotencyKey: "registration-reconciliation-evidence:" + message.ID.String(),
+		Payload: models.JSONB{
+			"phone_number_id": account.PhoneID,
+		},
+		Version: 1,
+	}
+	require.NoError(t, app.DB.Create(job).Error)
+	return message
+}
+
+func TestReconcilePhoneRegistrationActivatesFromExactRecentInboundEvidenceWithoutMetaMutation(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.permanentToken = true
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	pendingSince := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Millisecond)
+	account, evidence := createRegistrationReconciliationFixture(
+		t, app, org.ID, phoneID, wabaID, pendingSince, true,
+	)
+	original := *account
+
+	req := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(req, "id", account.ID.String())
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ReconcilePhoneRegistration(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.NotContains(t, string(testutil.GetResponseBody(req)), evidence.WhatsAppMessageID,
+		"provider message identifiers belong in the internal audit trail, not the client response")
+	assert.Equal(t, 0, meta.hit("/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 1, meta.methodHits(http.MethodGet, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Equal(t, 0, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+	assert.Equal(t, "active", stored.Status)
+	assert.Equal(t, original.ID, stored.ID)
+	assert.Equal(t, original.Name, stored.Name)
+	assert.Equal(t, original.PhoneID, stored.PhoneID)
+	assert.Equal(t, original.BusinessID, stored.BusinessID)
+	assert.Equal(t, original.APIVersion, stored.APIVersion)
+	assert.Equal(t, original.AccessToken, stored.AccessToken)
+	assert.Equal(t, original.Pin, stored.Pin)
+	assert.Equal(t, original.IsDefaultIncoming, stored.IsDefaultIncoming)
+	assert.Equal(t, original.IsDefaultOutgoing, stored.IsDefaultOutgoing)
+	assert.Equal(t, original.AutoReadReceipt, stored.AutoReadReceipt)
+	assert.Equal(t, original.BusinessCallingEnabled, stored.BusinessCallingEnabled)
+
+	var auditEntry models.AuditLog
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND resource_type = ? AND resource_id = ? AND action = ?",
+		org.ID,
+		"account",
+		account.ID,
+		models.AuditActionUpdated,
+	).Order("created_at DESC").First(&auditEntry).Error)
+	assert.Contains(t, fmt.Sprint(auditEntry.Changes), "registration_reconciliation_evidence")
+	assert.Contains(t, fmt.Sprint(auditEntry.Changes), evidence.WhatsAppMessageID)
+}
+
+func TestReconcilePhoneRegistrationFailsClosedWithoutPostPendingInboundEvidence(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.permanentToken = true
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	account, _ := createRegistrationReconciliationFixture(
+		t,
+		app,
+		org.ID,
+		phoneID,
+		wabaID,
+		time.Now().UTC().Add(-10*time.Minute).Truncate(time.Millisecond),
+		false,
+	)
+
+	req := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(req, "id", account.ID.String())
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ReconcilePhoneRegistration(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "No recent inbound WhatsApp evidence")
+	assert.Equal(t, 0, meta.hit("/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 1, meta.methodHits(http.MethodGet, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Equal(t, 0, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+	assert.Equal(t, "pending_registration", stored.Status)
+	assert.Equal(t, account.AccessToken, stored.AccessToken)
+	assert.Equal(t, account.Pin, stored.Pin)
+}
+
+func TestReconcilePhoneRegistrationRequiresEvidenceAfterLatestAmbiguousRegisterRetry(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.permanentToken = true
+	meta.registrationStatus = http.StatusBadGateway
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	pendingSince := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Microsecond)
+	account, oldEvidence := createRegistrationReconciliationFixture(
+		t, app, org.ID, phoneID, wabaID, pendingSince, true,
+	)
+
+	retryReq := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(retryReq, "id", account.ID.String())
+	testutil.SetAuthContext(retryReq, org.ID, user.ID)
+	testutil.SetHeader(retryReq, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.RegisterPhoneNumber(retryReq))
+	testutil.AssertErrorResponse(t, retryReq, fasthttp.StatusBadGateway, "remains pending registration")
+
+	var afterRetry models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&afterRetry).Error)
+	assert.Equal(t, "pending_registration", afterRetry.Status)
+	assert.True(t, afterRetry.UpdatedAt.After(oldEvidence.CreatedAt), "retry must advance the evidence watermark")
+
+	staleEvidenceReq := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(staleEvidenceReq, "id", account.ID.String())
+	testutil.SetAuthContext(staleEvidenceReq, org.ID, user.ID)
+	testutil.SetHeader(staleEvidenceReq, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ReconcilePhoneRegistration(staleEvidenceReq))
+	testutil.AssertErrorResponse(t, staleEvidenceReq, fasthttp.StatusConflict, "No recent inbound WhatsApp evidence")
+
+	postRetryAt := time.Now().UTC()
+	if !postRetryAt.After(afterRetry.UpdatedAt) {
+		postRetryAt = afterRetry.UpdatedAt.Add(time.Microsecond)
+	}
+	newEvidence := createRegistrationInboundEvidence(t, app, &afterRetry, postRetryAt)
+	freshEvidenceReq := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(freshEvidenceReq, "id", account.ID.String())
+	testutil.SetAuthContext(freshEvidenceReq, org.ID, user.ID)
+	testutil.SetHeader(freshEvidenceReq, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ReconcilePhoneRegistration(freshEvidenceReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(freshEvidenceReq))
+	assert.NotContains(t, string(testutil.GetResponseBody(freshEvidenceReq)), newEvidence.WhatsAppMessageID,
+		"provider message identifiers belong in the internal audit trail, not the client response")
+
+	var active models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&active).Error)
+	assert.Equal(t, "active", active.Status)
+	assert.Equal(t, 1, meta.methodHits(http.MethodPost, "/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 2, meta.methodHits(http.MethodGet, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+}
+
+func TestRegisterPhoneNumberWatermarkIsStrictlyMonotonicAcrossClockSkew(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.registrationStatus = http.StatusBadGateway
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	futureWatermark := time.Now().UTC().Add(10 * time.Minute).Truncate(time.Microsecond)
+	account, _ := createRegistrationReconciliationFixture(
+		t, app, org.ID, phoneID, wabaID, futureWatermark, false,
+	)
+	var before models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&before).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(req, "id", account.ID.String())
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.RegisterPhoneNumber(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusBadGateway, "remains pending registration")
+
+	var after models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&after).Error)
+	assert.Equal(t, "pending_registration", after.Status)
+	assert.True(t, after.UpdatedAt.After(before.UpdatedAt))
+	assert.Equal(t, before.UpdatedAt.Add(time.Microsecond), after.UpdatedAt)
+}
+
+func TestConcurrentRegistrationRetriesOnlyNewestWatermarkCanFinalize(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	account, _ := createRegistrationReconciliationFixture(
+		t, app, org.ID, phoneID, wabaID, time.Now().UTC().Add(-time.Minute), false,
+	)
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var registerCalls atomic.Int32
+	meta.onRegister = func(map[string]string) {
+		if registerCalls.Add(1) == 1 {
+			close(firstEntered)
+			<-releaseFirst
+		}
+	}
+	t.Cleanup(func() {
+		select {
+		case <-releaseFirst:
+		default:
+			close(releaseFirst)
+		}
+	})
+
+	newRetryRequest := func() *fastglue.Request {
+		req := testutil.NewJSONRequest(t, map[string]any{})
+		testutil.SetPathParam(req, "id", account.ID.String())
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+		return req
+	}
+	firstReq := newRetryRequest()
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- app.RegisterPhoneNumber(firstReq) }()
+	select {
+	case <-firstEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first registration retry did not reach Meta")
+	}
+
+	secondReq := newRetryRequest()
+	require.NoError(t, app.RegisterPhoneNumber(secondReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(secondReq))
+	close(releaseFirst)
+	require.NoError(t, <-firstDone)
+	testutil.AssertErrorResponse(t, firstReq, fasthttp.StatusConflict, "replaced by a newer request")
+
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&stored).Error)
+	assert.Equal(t, "pending_subscription", stored.Status)
+	assert.Equal(t, int32(2), registerCalls.Load())
+}
+
+func TestRegistrationReconciliationFailsClosedWhileRetryHasOnlyOlderEvidence(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.permanentToken = true
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	account, _ := createRegistrationReconciliationFixture(
+		t, app, org.ID, phoneID, wabaID, time.Now().UTC().Add(-10*time.Minute), true,
+	)
+	registerEntered := make(chan struct{})
+	releaseRegister := make(chan struct{})
+	meta.onRegister = func(map[string]string) {
+		close(registerEntered)
+		<-releaseRegister
+	}
+	t.Cleanup(func() {
+		select {
+		case <-releaseRegister:
+		default:
+			close(releaseRegister)
+		}
+	})
+
+	retryReq := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(retryReq, "id", account.ID.String())
+	testutil.SetAuthContext(retryReq, org.ID, user.ID)
+	testutil.SetHeader(retryReq, "X-Organization-ID", org.ID.String())
+	retryDone := make(chan error, 1)
+	go func() { retryDone <- app.RegisterPhoneNumber(retryReq) }()
+	select {
+	case <-registerEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("registration retry did not reach Meta")
+	}
+
+	reconcileReq := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(reconcileReq, "id", account.ID.String())
+	testutil.SetAuthContext(reconcileReq, org.ID, user.ID)
+	testutil.SetHeader(reconcileReq, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ReconcilePhoneRegistration(reconcileReq))
+	testutil.AssertErrorResponse(t, reconcileReq, fasthttp.StatusConflict, "No recent inbound WhatsApp evidence")
+
+	close(releaseRegister)
+	require.NoError(t, <-retryDone)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(retryReq))
+}
+
+func TestRegistrationRetrySupersedesReconciliationSnapshotBeforeActivation(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.permanentToken = true
+	meta.registrationStatus = http.StatusBadGateway
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	account, _ := createRegistrationReconciliationFixture(
+		t, app, org.ID, phoneID, wabaID, time.Now().UTC().Add(-10*time.Minute), true,
+	)
+
+	subscriptionReadEntered := make(chan struct{})
+	releaseSubscriptionRead := make(chan struct{})
+	meta.onSubscriptionRead = func() {
+		close(subscriptionReadEntered)
+		<-releaseSubscriptionRead
+	}
+	t.Cleanup(func() {
+		select {
+		case <-releaseSubscriptionRead:
+		default:
+			close(releaseSubscriptionRead)
+		}
+	})
+
+	reconcileReq := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(reconcileReq, "id", account.ID.String())
+	testutil.SetAuthContext(reconcileReq, org.ID, user.ID)
+	testutil.SetHeader(reconcileReq, "X-Organization-ID", org.ID.String())
+	reconcileDone := make(chan error, 1)
+	go func() { reconcileDone <- app.ReconcilePhoneRegistration(reconcileReq) }()
+	select {
+	case <-subscriptionReadEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("registration reconciliation did not reach app-subscription proof")
+	}
+
+	retryReq := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(retryReq, "id", account.ID.String())
+	testutil.SetAuthContext(retryReq, org.ID, user.ID)
+	testutil.SetHeader(retryReq, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.RegisterPhoneNumber(retryReq))
+	testutil.AssertErrorResponse(t, retryReq, fasthttp.StatusBadGateway, "remains pending registration")
+
+	close(releaseSubscriptionRead)
+	require.NoError(t, <-reconcileDone)
+	testutil.AssertErrorResponse(t, reconcileReq, fasthttp.StatusConflict, "changed; reload and retry")
+
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&stored).Error)
+	assert.Equal(t, "pending_registration", stored.Status)
+	assert.True(t, stored.UpdatedAt.After(account.UpdatedAt))
+	assert.Equal(t, 1, meta.methodHits(http.MethodPost, "/v21.0/"+phoneID+"/register"))
+	assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+}
+
+func TestReconcilePhoneRegistrationFailsClosedWhenCurrentAppIsNotSubscribed(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.permanentToken = true
+	meta.subscribedAppIDs = []string{"990000000000002"}
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	account, _ := createRegistrationReconciliationFixture(
+		t, app, org.ID, phoneID, wabaID, time.Now().UTC().Add(-10*time.Minute), true,
+	)
+
+	req := testutil.NewJSONRequest(t, map[string]any{})
+	testutil.SetPathParam(req, "id", account.ID.String())
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ReconcilePhoneRegistration(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "not subscribed")
+
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&stored).Error)
+	assert.Equal(t, "pending_registration", stored.Status)
+	assert.Equal(t, account.AccessToken, stored.AccessToken)
+	assert.Equal(t, account.Pin, stored.Pin)
+	assert.Equal(t, 1, meta.methodHits(http.MethodGet, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
 }
 
 func TestEmbeddedSignupSoftDeletedReconnectRestoresAndNormalizesAccount(t *testing.T) {

@@ -7,6 +7,7 @@ import { useOrganizationsStore } from "@/stores/organizations";
 import { api } from "@/services/api";
 import { toast } from "vue-sonner";
 import { getErrorMessage } from "@/lib/api-utils";
+import { canOfferRegistrationReconciliation } from "@/lib/registrationReconciliation";
 import {
   getQualityBadgeClass,
   getQualityRatingLabel,
@@ -51,6 +52,7 @@ import {
   Check,
   ExternalLink,
   KeyRound,
+  ShieldCheck,
   X,
 } from "lucide-vue-next";
 
@@ -109,6 +111,8 @@ const testResult = ref<TestResult | null>(null);
 const testingConnection = ref(false);
 const registrationDialogOpen = ref(false);
 const registeringPhone = ref(false);
+const reconciliationDialogOpen = ref(false);
+const reconcilingRegistration = ref(false);
 const subscribing = ref(false);
 const webhookOverrideDialogOpen = ref(false);
 const configuringWebhookOverride = ref(false);
@@ -133,6 +137,15 @@ const canRegisterPhone = computed(
     !isNew.value &&
     hasCurrentAccountOrganization.value &&
     account.value?.status === "pending_registration",
+);
+const canReconcileRegistration = computed(() =>
+  canOfferRegistrationReconciliation({
+    canWrite: canWrite.value,
+    isNew: isNew.value,
+    activeOrganizationId: activeOrganizationId.value,
+    loadedOrganizationId: loadedAccountOrganizationId.value,
+    status: account.value?.status,
+  }),
 );
 const canSubscribe = computed(
   () =>
@@ -441,6 +454,47 @@ async function registerPhone() {
   }
 }
 
+async function reconcileRegistration() {
+  if (
+    !account.value ||
+    !canReconcileRegistration.value ||
+    reconcilingRegistration.value
+  ) {
+    return;
+  }
+
+  const id = account.value.id;
+  const organizationId = loadedAccountOrganizationId.value;
+  if (!organizationId || activeOrganizationId.value !== organizationId) return;
+
+  reconcilingRegistration.value = true;
+  try {
+    await api.post(`/accounts/${id}/reconcile-registration`, undefined, {
+      headers: { "X-Organization-ID": organizationId },
+    });
+    reconciliationDialogOpen.value = false;
+    await loadAccount();
+    toast.success(
+      t(
+        "accounts.registrationReconciled",
+        "Registration reconciled safely from recent inbound evidence.",
+      ),
+    );
+  } catch (error) {
+    toast.error(
+      getErrorMessage(
+        error,
+        t(
+          "accounts.registrationReconciliationFailed",
+          "Registration could not be reconciled safely.",
+        ),
+      ),
+    );
+  } finally {
+    reconcilingRegistration.value = false;
+  }
+}
+
 async function configureWebhookOverride() {
   if (!account.value) return;
   configuringWebhookOverride.value = true;
@@ -531,6 +585,20 @@ onMounted(async () => {
             />
             <Phone v-else class="h-4 w-4 mr-1" />
             {{ $t("accounts.registerPhone", "Register phone") }}
+          </Button>
+          <Button
+            v-if="canReconcileRegistration"
+            variant="outline"
+            size="sm"
+            :disabled="reconcilingRegistration"
+            @click="reconciliationDialogOpen = true"
+          >
+            <Loader2
+              v-if="reconcilingRegistration"
+              class="h-4 w-4 animate-spin mr-1"
+            />
+            <ShieldCheck v-else class="h-4 w-4 mr-1" />
+            {{ $t("accounts.reconcileRegistration", "Reconcile from inbound") }}
           </Button>
           <Button
             v-if="canSubscribe"
@@ -1061,6 +1129,51 @@ onMounted(async () => {
       </AlertDialogContent>
     </AlertDialog>
 
+    <!-- Status-only recovery for an ambiguous provider registration outcome. -->
+    <AlertDialog v-model:open="reconciliationDialogOpen">
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{{
+            $t("accounts.reconcileRegistration", "Reconcile registration")
+          }}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {{
+              $t(
+                "accounts.reconcileRegistrationConfirm",
+                "ReReply will validate the stored Meta token and activate this account only if a recent inbound WhatsApp message proves that this exact phone continued working after the latest registration attempt. This does not call Meta registration again or change the token, PIN, or account settings.",
+              )
+            }}
+          </AlertDialogDescription>
+          <p class="text-sm text-muted-foreground">
+            {{ account?.name }} - {{ account?.phone_id }}
+          </p>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel :disabled="reconcilingRegistration">
+            {{ $t("common.cancel") }}
+          </AlertDialogCancel>
+          <AlertDialogAction
+            data-testid="confirm-registration-reconciliation"
+            :disabled="reconcilingRegistration"
+            @click.prevent="reconcileRegistration"
+          >
+            <Loader2
+              v-if="reconcilingRegistration"
+              class="h-4 w-4 animate-spin mr-1"
+            />
+            {{
+              reconcilingRegistration
+                ? $t("common.saving", "Reconciling...")
+                : $t(
+                    "accounts.confirmReconcileRegistration",
+                    "Reconcile safely",
+                  )
+            }}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+
     <!-- Phone registration confirmation. The server owns the PIN. -->
     <AlertDialog v-model:open="registrationDialogOpen">
       <AlertDialogContent>
@@ -1100,10 +1213,7 @@ onMounted(async () => {
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>{{
-            $t(
-              "accounts.configureRereplyWebhook",
-              "Configure ReReply webhook",
-            )
+            $t("accounts.configureRereplyWebhook", "Configure ReReply webhook")
           }}</AlertDialogTitle>
           <AlertDialogDescription>
             {{
