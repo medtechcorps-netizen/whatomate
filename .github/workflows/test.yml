@@ -37,7 +37,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.12"
+          go-version: "1.26.6"
           cache: true
 
       - name: Run PostgreSQL tenant isolation tests
@@ -80,7 +80,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.12"
+          go-version: "1.26.6"
           cache: true
 
       - name: Download dependencies
@@ -129,7 +129,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.12"
+          go-version: "1.26.6"
           cache: true
 
       - name: Run golangci-lint
@@ -146,7 +146,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.12"
+          go-version: "1.26.6"
           cache: true
 
       - name: Build
@@ -162,7 +162,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.12"
+          go-version: "1.26.6"
           cache: true
 
       - name: Scan Go dependencies and code

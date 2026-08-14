@@ -1005,13 +1005,19 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// Accounts
 	g.GET("/api/accounts", tenant((*handlers.App).ListAccounts))
 	g.POST("/api/accounts", tenant((*handlers.App).CreateAccount))
-	g.POST("/api/accounts/exchange-token", tenant((*handlers.App).ExchangeToken)) // Embedded signup
+	// Embedded Signup performs provider I/O between short committed tenant
+	// phases, so it must not be wrapped in one request-long tenant transaction.
+	g.POST("/api/accounts/exchange-token", app.ExchangeToken)
 	g.GET("/api/accounts/{id}", tenant((*handlers.App).GetAccount))
 	g.PUT("/api/accounts/{id}", tenant((*handlers.App).UpdateAccount))
 	g.DELETE("/api/accounts/{id}", tenant((*handlers.App).DeleteAccount))
-	g.POST("/api/accounts/{id}/register", tenant((*handlers.App).RegisterPhoneNumber)) // Embedded signup manual/2fa registration
+	// Registration recovery performs provider I/O between two short committed
+	// tenant phases. Do not retain the request-long tenant transaction while
+	// Meta handles the non-idempotent /register mutation.
+	g.POST("/api/accounts/{id}/register", app.RegisterPhoneNumber)
 	g.POST("/api/accounts/{id}/test", tenant((*handlers.App).TestAccountConnection))
-	g.POST("/api/accounts/{id}/subscribe", tenant((*handlers.App).SubscribeApp))
+	// Subscription recovery also uses short committed phases around Meta I/O.
+	g.POST("/api/accounts/{id}/subscribe", app.SubscribeApp)
 	// Meta synchronously verifies the callback during this network call. The
 	// handler uses short tenant phases around it, so do not wrap it in the
 	// transaction-spanning tenant adapter.

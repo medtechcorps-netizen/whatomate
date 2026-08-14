@@ -224,7 +224,7 @@ func TestClient_GetPhoneNumberInfo(t *testing.T) {
 		},
 		{
 			name:    "phone not found",
-			phoneID: "nonexistent",
+			phoneID: "999999999",
 			serverResponse: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusNotFound)
 				_ = json.NewEncoder(w).Encode(whatsapp.MetaAPIError{
@@ -359,6 +359,28 @@ func TestClient_RegisterPhoneNumber(t *testing.T) {
 			},
 			wantErr:         true,
 			wantErrContains: "Two-step verification is already enabled",
+		},
+		{
+			name:    "success false is not confirmation",
+			phoneID: "123456789",
+			pin:     "123456",
+			serverResponse: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]bool{"success": false})
+			},
+			wantErr:         true,
+			wantErrContains: "could not be confirmed",
+		},
+		{
+			name:    "malformed success body is not confirmation",
+			phoneID: "123456789",
+			pin:     "123456",
+			serverResponse: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"unexpected":"response"}`))
+			},
+			wantErr:         true,
+			wantErrContains: "could not be confirmed",
 		},
 		{
 			name:    "invalid PIN format",

@@ -31,6 +31,22 @@ var (
 	graphAPIVersionPattern = regexp.MustCompile(`^v[0-9]{1,3}\.[0-9]{1,3}$`)
 )
 
+func normalizeGraphObjectID(value, label string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !graphObjectIDPattern.MatchString(value) {
+		return "", fmt.Errorf("invalid %s", label)
+	}
+	return value, nil
+}
+
+func normalizeGraphAPIVersion(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !graphAPIVersionPattern.MatchString(value) {
+		return "", errors.New("invalid WhatsApp API version")
+	}
+	return value, nil
+}
+
 // Client is the WhatsApp Cloud API client
 type Client struct {
 	HTTPClient *http.Client
@@ -168,12 +184,28 @@ type CredentialsValidationResult struct {
 	QualityRating          string
 	CodeVerificationStatus string
 	Warning                string
+	IsOnBizApp             bool
+	PlatformType           string
+	IsSMB                  bool
 }
 
 // ValidateCredentials validates WhatsApp account credentials with Meta API
 // It checks the phone number endpoint, business account endpoint, and verifies
 // that the phone number belongs to the specified business account
 func (c *Client) ValidateCredentials(ctx context.Context, phoneID, businessID, accessToken, apiVersion string) (*CredentialsValidationResult, error) {
+	var err error
+	phoneID, err = normalizeGraphObjectID(phoneID, "phone_id")
+	if err != nil {
+		return nil, err
+	}
+	businessID, err = normalizeGraphObjectID(businessID, "business_id")
+	if err != nil {
+		return nil, err
+	}
+	apiVersion, err = normalizeGraphAPIVersion(apiVersion)
+	if err != nil {
+		return nil, err
+	}
 	// 1. Validate PhoneID
 	phoneURL := fmt.Sprintf("%s/%s/%s?fields=display_phone_number,verified_name,code_verification_status,account_mode,quality_rating,is_on_biz_app,platform_type",
 		c.getBaseURL(), apiVersion, phoneID)
@@ -215,20 +247,11 @@ func (c *Client) ValidateCredentials(ctx context.Context, phoneID, businessID, a
 		return nil, fmt.Errorf("invalid business_id: %w", err)
 	}
 
-	// 3. Verify phone belongs to business account
-	phonesURL := fmt.Sprintf("%s/%s/%s/phone_numbers", c.getBaseURL(), apiVersion, businessID)
-	phonesBody, err := c.doRequest(ctx, http.MethodGet, phonesURL, nil, accessToken)
+	// 3. Verify phone belongs to business account. The edge is paginated; an
+	// exact phone can be on any page.
+	phonesResult, err := c.GetWABAPhoneNumbers(ctx, businessID, accessToken, apiVersion)
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify phone-business relationship: %w", err)
-	}
-
-	var phonesResult struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(phonesBody, &phonesResult); err != nil {
-		return nil, fmt.Errorf("failed to parse phone numbers list: %w", err)
 	}
 
 	phoneFound := false
@@ -250,6 +273,9 @@ func (c *Client) ValidateCredentials(ctx context.Context, phoneID, businessID, a
 		QualityRating:          phoneResult.QualityRating,
 		CodeVerificationStatus: phoneResult.CodeVerificationStatus,
 		Warning:                warning,
+		IsOnBizApp:             phoneResult.IsOnBizApp,
+		PlatformType:           phoneResult.PlatformType,
+		IsSMB:                  isSMB,
 	}, nil
 }
 
@@ -727,6 +753,11 @@ type TokenExchangeResponse struct {
 
 // ExchangeCodeForToken exchanges a Facebook authorization code for a permanent access token
 func (c *Client) ExchangeCodeForToken(ctx context.Context, code, appID, appSecret, apiVersion string) (string, error) {
+	var err error
+	apiVersion, err = normalizeGraphAPIVersion(apiVersion)
+	if err != nil {
+		return "", err
+	}
 	endpoint := fmt.Sprintf("%s/%s/oauth/access_token", c.getBaseURL(), apiVersion)
 	form := url.Values{
 		"client_id":     []string{appID},
@@ -785,6 +816,15 @@ type PhoneNumberInfo struct {
 
 // GetPhoneNumberInfo retrieves information about a phone number
 func (c *Client) GetPhoneNumberInfo(ctx context.Context, phoneID, accessToken, apiVersion string) (*PhoneNumberInfo, error) {
+	var err error
+	phoneID, err = normalizeGraphObjectID(phoneID, "phone_id")
+	if err != nil {
+		return nil, err
+	}
+	apiVersion, err = normalizeGraphAPIVersion(apiVersion)
+	if err != nil {
+		return nil, err
+	}
 	url := fmt.Sprintf("%s/%s/%s?fields=verified_name,display_phone_number,quality_rating,is_on_biz_app,platform_type",
 		c.getBaseURL(), apiVersion, phoneID)
 
@@ -803,6 +843,15 @@ func (c *Client) GetPhoneNumberInfo(ctx context.Context, phoneID, accessToken, a
 
 // RegisterPhoneNumber registers a phone number with Two-Step Verification PIN
 func (c *Client) RegisterPhoneNumber(ctx context.Context, phoneID, pin, accessToken, apiVersion string) error {
+	var err error
+	phoneID, err = normalizeGraphObjectID(phoneID, "phone_id")
+	if err != nil {
+		return err
+	}
+	apiVersion, err = normalizeGraphAPIVersion(apiVersion)
+	if err != nil {
+		return err
+	}
 	url := fmt.Sprintf("%s/%s/%s/register", c.getBaseURL(), apiVersion, phoneID)
 
 	payload := map[string]string{
@@ -810,9 +859,17 @@ func (c *Client) RegisterPhoneNumber(ctx context.Context, phoneID, pin, accessTo
 		"pin":               pin,
 	}
 
-	_, err := c.doRequest(ctx, http.MethodPost, url, payload, accessToken)
+	respBody, err := c.doRequest(ctx, http.MethodPost, url, payload, accessToken)
 	if err != nil {
 		return fmt.Errorf("phone registration failed: %w", err)
+	}
+	var registrationResponse struct {
+		Success bool `json:"success"`
+	}
+	if err := json.Unmarshal(respBody, &registrationResponse); err != nil || !registrationResponse.Success {
+		// A 200 without an explicit success acknowledgement is ambiguous. Do
+		// not expose the provider body and do not let callers advance local state.
+		return errors.New("phone registration response could not be confirmed")
 	}
 
 	c.Log.Info("Phone number registered successfully", "phone_id", phoneID)
@@ -856,7 +913,8 @@ func (c *Client) GetTokenDebugInfo(ctx context.Context, inputToken, accessToken 
 	return &resp.Data, nil
 }
 
-// SharedWABAResponse represents the response structure for shared WABA request
+// SharedWABAResponse represents the legacy /me/accounts response shape.
+// Deprecated: /me/accounts returns Facebook Pages, not WhatsApp Business Accounts.
 type SharedWABAResponse struct {
 	Data []struct {
 		ID    string `json:"id"`
@@ -871,12 +929,11 @@ type SharedWABAResponse struct {
 	} `json:"data"`
 }
 
-// GetSharedWABA discovers the WABA and Phone Number shared with the app
-// This is useful when the embedded signup only returns a code and we need to find the connected account
+// GetSharedWABA queries the legacy /me/accounts edge.
+// Deprecated: /me/accounts returns Facebook Pages and must not be used for
+// WhatsApp Embedded Signup asset discovery. Consume the WA_EMBEDDED_SIGNUP
+// browser event, or use whatsapp_business_management granular scope targets.
 func (c *Client) GetSharedWABA(ctx context.Context, accessToken string) (*SharedWABAResponse, error) {
-	// Query /me/accounts to find the WABA and its phone numbers
-	// granular_scopes might be needed to filter this if the user has many accounts,
-	// but for embedded signup, usually only the shared account is accessible or relevant.
 	url := fmt.Sprintf("%s/me/accounts?fields=id,name,phone_numbers{id,display_phone_number,verified_name}", c.getBaseURL())
 
 	respBody, err := c.doRequest(ctx, http.MethodGet, url, nil, accessToken)
@@ -892,29 +949,97 @@ func (c *Client) GetSharedWABA(ctx context.Context, accessToken string) (*Shared
 	return &resp, nil
 }
 
-// WABAPhoneNumbersResponse represents the response containing phone numbers for a WABA
-type WABAPhoneNumbersResponse struct {
-	Data []struct {
-		ID                 string `json:"id"`
-		DisplayPhoneNumber string `json:"display_phone_number"`
-		VerifiedName       string `json:"verified_name"`
-		QualityRating      string `json:"quality_rating"`
-	} `json:"data"`
+const maxWABAPhonePages = 100
+
+// WABAPhoneNumber represents one phone returned by a WABA phone_numbers edge.
+type WABAPhoneNumber struct {
+	ID                 string `json:"id"`
+	DisplayPhoneNumber string `json:"display_phone_number"`
+	VerifiedName       string `json:"verified_name"`
+	QualityRating      string `json:"quality_rating"`
 }
 
-// GetWABAPhoneNumbers retrieves all phone numbers associated with a WABA
-func (c *Client) GetWABAPhoneNumbers(ctx context.Context, wabaID, accessToken string) (*WABAPhoneNumbersResponse, error) {
-	url := fmt.Sprintf("%s/%s/phone_numbers?fields=id,display_phone_number,verified_name,quality_rating", c.getBaseURL(), wabaID)
+// WABAPhoneNumbersResponse represents all deduplicated phone numbers for a WABA.
+type WABAPhoneNumbersResponse struct {
+	Data []WABAPhoneNumber `json:"data"`
+}
 
-	respBody, err := c.doRequest(ctx, http.MethodGet, url, nil, accessToken)
+// GetWABAPhoneNumbers retrieves every page of phone numbers associated with a
+// WABA. Pagination URLs are always reconstructed against the configured Graph
+// base; provider-supplied paging.next URLs are never followed.
+func (c *Client) GetWABAPhoneNumbers(ctx context.Context, wabaID, accessToken, apiVersion string) (*WABAPhoneNumbersResponse, error) {
+	type phonePage struct {
+		Data   []WABAPhoneNumber `json:"data"`
+		Paging struct {
+			Cursors struct {
+				After string `json:"after"`
+			} `json:"cursors"`
+			Next string `json:"next"`
+		} `json:"paging"`
+	}
+
+	var err error
+	wabaID, err = normalizeGraphObjectID(wabaID, "business_id")
 	if err != nil {
-		return nil, fmt.Errorf("failed to get WABA phone numbers: %w", err)
+		return nil, err
+	}
+	apiVersion, err = normalizeGraphAPIVersion(apiVersion)
+	if err != nil {
+		return nil, err
 	}
 
-	var resp WABAPhoneNumbersResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse WABA phone numbers response: %w", err)
+	baseEndpoint := fmt.Sprintf(
+		"%s/%s/%s/phone_numbers",
+		strings.TrimRight(c.getBaseURL(), "/"),
+		url.PathEscape(apiVersion),
+		url.PathEscape(wabaID),
+	)
+	result := &WABAPhoneNumbersResponse{Data: make([]WABAPhoneNumber, 0)}
+	seenIDs := make(map[string]struct{})
+	seenCursors := make(map[string]struct{})
+	after := ""
+
+	for pageNumber := 0; pageNumber < maxWABAPhonePages; pageNumber++ {
+		query := url.Values{}
+		query.Set("fields", "id,display_phone_number,verified_name,quality_rating")
+		query.Set("limit", "100")
+		if after != "" {
+			query.Set("after", after)
+		}
+		pageURL := baseEndpoint + "?" + query.Encode()
+
+		respBody, err := c.doRequest(ctx, http.MethodGet, pageURL, nil, accessToken)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get WABA phone numbers: %w", err)
+		}
+		var page phonePage
+		if err := json.Unmarshal(respBody, &page); err != nil {
+			return nil, fmt.Errorf("failed to parse WABA phone numbers response: %w", err)
+		}
+		for _, phone := range page.Data {
+			phone.ID, err = normalizeGraphObjectID(phone.ID, "phone_id returned by Meta")
+			if err != nil {
+				return nil, err
+			}
+			if _, exists := seenIDs[phone.ID]; exists {
+				continue
+			}
+			seenIDs[phone.ID] = struct{}{}
+			result.Data = append(result.Data, phone)
+		}
+
+		if strings.TrimSpace(page.Paging.Next) == "" {
+			return result, nil
+		}
+		after = strings.TrimSpace(page.Paging.Cursors.After)
+		if after == "" {
+			return nil, errors.New("meta phone-number pagination omitted its continuation cursor")
+		}
+		if _, repeated := seenCursors[after]; repeated {
+			return nil, errors.New("meta phone-number pagination repeated a continuation cursor")
+		}
+		seenCursors[after] = struct{}{}
 	}
 
-	return &resp, nil
+	return nil, fmt.Errorf("meta phone-number pagination exceeded %d pages", maxWABAPhonePages)
 }

@@ -56,6 +56,7 @@ func TestIntegrationCenterMetaUsesRuntimeSettingsAndNeverReturnsSecret(t *testin
 		org.ID,
 		models.ResourceSettingsIntegrations+":"+models.ActionRead,
 		models.ResourceSettingsIntegrations+":"+models.ActionWrite,
+		models.ResourceAccounts+":"+models.ActionWrite,
 	)
 	secret := "META-INTEGRATION-SECRET-DO-NOT-RETURN"
 	verifyToken := "META-WEBHOOK-VERIFY-TOKEN-DO-NOT-RETURN"
@@ -121,13 +122,16 @@ func TestIntegrationCenterMetaUsesRuntimeSettingsAndNeverReturnsSecret(t *testin
 
 	configReq := testutil.NewGETRequest(t)
 	testutil.SetAuthContext(configReq, org.ID, admin.ID)
+	testutil.SetHeader(configReq, "X-Organization-ID", org.ID.String())
 	require.NoError(t, app.GetEmbeddedSignupConfig(configReq))
 	var publicConfig struct {
-		WhatsAppAppID    string `json:"whatsapp_app_id"`
-		WhatsAppConfigID string `json:"whatsapp_config_id"`
-		HasAppSecret     bool   `json:"has_app_secret"`
+		OrganizationID   uuid.UUID `json:"organization_id"`
+		WhatsAppAppID    string    `json:"whatsapp_app_id"`
+		WhatsAppConfigID string    `json:"whatsapp_config_id"`
+		HasAppSecret     bool      `json:"has_app_secret"`
 	}
 	testutil.ParseEnvelopeResponse(t, configReq, &publicConfig)
+	assert.Equal(t, org.ID, publicConfig.OrganizationID)
 	assert.Equal(t, "123456789", publicConfig.WhatsAppAppID)
 	assert.Equal(t, "987654321", publicConfig.WhatsAppConfigID)
 	assert.True(t, publicConfig.HasAppSecret)
@@ -1224,7 +1228,7 @@ func TestAccountCredentialEncryptionFailsClosedWithoutServerKey(t *testing.T) {
 	assert.Equal(t, "plaintext-access-token", account.AccessToken)
 }
 
-func TestAccountMutationDoesNotPersistNewSecretsWithoutServerKey(t *testing.T) {
+func TestAccountSecretWritesFailClosedWithoutServerKeyAndNonSecretUpdatePreservesLegacyToken(t *testing.T) {
 	app := newIntegrationHandlerTestApp(t, "")
 	org := testutil.CreateTestOrganization(t, app.DB)
 	writer := integrationTestUser(t, app, org.ID, "accounts:read", "accounts:write")
@@ -1254,14 +1258,24 @@ func TestAccountMutationDoesNotPersistNewSecretsWithoutServerKey(t *testing.T) {
 		Status:         "active",
 	}
 	require.NoError(t, app.DB.Create(existing).Error)
-	update := testutil.NewJSONRequest(t, map[string]any{"name": "must-not-be-saved"})
+	update := testutil.NewJSONRequest(t, map[string]any{"name": "safe-name-update"})
 	testutil.SetAuthContext(update, org.ID, writer.ID)
 	testutil.SetPathParam(update, "id", existing.ID.String())
 	require.NoError(t, app.UpdateAccount(update))
-	testutil.AssertErrorResponse(t, update, fasthttp.StatusServiceUnavailable, "credential storage is unavailable")
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(update))
 	var persisted models.WhatsAppAccount
 	require.NoError(t, app.DB.First(&persisted, "id = ?", existing.ID).Error)
-	assert.Equal(t, "no-key-existing", persisted.Name)
+	assert.Equal(t, "safe-name-update", persisted.Name)
+	assert.Equal(t, "legacy-plaintext-access-token", persisted.AccessToken)
+
+	tokenUpdate := testutil.NewJSONRequest(t, map[string]any{"access_token": "replacement-must-not-be-persisted"})
+	testutil.SetAuthContext(tokenUpdate, org.ID, writer.ID)
+	testutil.SetPathParam(tokenUpdate, "id", existing.ID.String())
+	require.NoError(t, app.UpdateAccount(tokenUpdate))
+	testutil.AssertErrorResponse(t, tokenUpdate, fasthttp.StatusServiceUnavailable, "credential storage is unavailable")
+
+	require.NoError(t, app.DB.First(&persisted, "id = ?", existing.ID).Error)
+	assert.Equal(t, "safe-name-update", persisted.Name)
 	assert.Equal(t, "legacy-plaintext-access-token", persisted.AccessToken)
 }
 

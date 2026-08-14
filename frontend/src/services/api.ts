@@ -3,6 +3,7 @@ import axios, {
   type AxiosError,
   type InternalAxiosRequestConfig,
 } from "axios";
+import { resolveOrganizationHeader } from "@/lib/organizationHeaders";
 
 // Get base path from server-injected config or fallback
 const basePath = ((window as any).__BASE_PATH__ ?? "").replace(/\/$/, "");
@@ -64,8 +65,12 @@ api.interceptors.request.use(
     }
     // Add organization override header for org switching
     const selectedOrgId = localStorage.getItem("selected_organization_id");
-    if (selectedOrgId) {
-      config.headers["X-Organization-ID"] = selectedOrgId;
+    const organizationId = resolveOrganizationHeader(
+      config.headers.get("X-Organization-ID"),
+      selectedOrgId,
+    );
+    if (organizationId) {
+      config.headers.set("X-Organization-ID", organizationId);
     }
     return config;
   },

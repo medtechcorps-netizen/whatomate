@@ -2,7 +2,9 @@ package whatsapp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -45,12 +47,69 @@ type MetaAPIError struct {
 	} `json:"error"`
 }
 
+// MetaHTTPError proves that Meta returned an HTTP response. Callers that
+// reconcile non-idempotent mutations can distinguish a definite 4xx rejection
+// from an ambiguous transport failure or server-side 5xx response.
+type MetaHTTPError struct {
+	StatusCode     int
+	MetaCode       int
+	IsTransient    bool
+	TransientKnown bool
+	ParsedMeta     bool
+	cause          error
+}
+
+func (e *MetaHTTPError) Error() string {
+	if e == nil || e.cause == nil {
+		return "Meta API request failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *MetaHTTPError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// IsDefiniteProviderRejection reports only responses that prove Meta rejected
+// the request. Transport errors and 5xx responses remain ambiguous because the
+// provider may have applied a mutation before the connection failed.
+func IsDefiniteProviderRejection(err error) bool {
+	var httpErr *MetaHTTPError
+	if !errors.As(err, &httpErr) ||
+		!httpErr.ParsedMeta ||
+		!httpErr.TransientKnown ||
+		httpErr.IsTransient ||
+		httpErr.MetaCode <= 0 ||
+		httpErr.StatusCode < 400 ||
+		httpErr.StatusCode >= 500 {
+		return false
+	}
+	switch httpErr.StatusCode {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
+		return false
+	}
+	switch httpErr.MetaCode {
+	case 1, 2, 4, 17, 341:
+		return false
+	}
+	return true
+}
+
 // ParseError attempts to parse respBody as a Meta API error. If successful,
 // it returns a formatted error including code, message, details, and user message.
 // If parsing fails, it returns a generic error with the status code and raw body.
 func ParseMetaAPIError(statusCode int, respBody []byte) error {
 	var apiErr MetaAPIError
 	if err := json.Unmarshal(respBody, &apiErr); err == nil && apiErr.Error.Message != "" {
+		var transient struct {
+			Error struct {
+				IsTransient *bool `json:"is_transient"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(respBody, &transient)
 		errMsg := fmt.Sprintf("API error %d: %s", apiErr.Error.Code, apiErr.Error.Message)
 		if apiErr.Error.ErrorData.Details != "" {
 			errMsg += " - Details: " + apiErr.Error.ErrorData.Details
@@ -58,9 +117,19 @@ func ParseMetaAPIError(statusCode int, respBody []byte) error {
 		if apiErr.Error.ErrorUserMsg != "" {
 			errMsg += " - " + apiErr.Error.ErrorUserMsg
 		}
-		return fmt.Errorf("%s", errMsg)
+		return &MetaHTTPError{
+			StatusCode:     statusCode,
+			MetaCode:       apiErr.Error.Code,
+			IsTransient:    transient.Error.IsTransient != nil && *transient.Error.IsTransient,
+			TransientKnown: transient.Error.IsTransient != nil,
+			ParsedMeta:     true,
+			cause:          errors.New(errMsg),
+		}
 	}
-	return fmt.Errorf("API returned status %d: %s", statusCode, string(respBody))
+	return &MetaHTTPError{
+		StatusCode: statusCode,
+		cause:      fmt.Errorf("API returned status %d: %s", statusCode, string(respBody)),
+	}
 }
 
 // TemplateResponse represents response from template submission

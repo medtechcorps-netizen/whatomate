@@ -2,6 +2,8 @@ package whatsapp_test
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -548,6 +550,265 @@ func TestClient_SendDocumentMessage(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, "wamid.doc123", msgID)
+}
+
+func TestClient_GetWABAPhoneNumbersPaginatesWithTrustedCursorAndDeduplicates(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		assert.Equal(t, "/v21.0/220000000000101/phone_numbers", r.URL.Path)
+		assert.Equal(t, "Bearer pagination-token", r.Header.Get("Authorization"))
+		assert.Equal(t, "100", r.URL.Query().Get("limit"))
+		assert.Equal(t, "id,display_phone_number,verified_name,quality_rating", r.URL.Query().Get("fields"))
+		switch calls {
+		case 1:
+			assert.Empty(t, r.URL.Query().Get("after"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]string{{"id": "110000000000101", "verified_name": "One"}},
+				"paging": map[string]any{
+					"cursors": map[string]string{"after": "cursor one&next=https://attacker.invalid"},
+					"next":    "https://attacker.invalid/steal?access_token=must-not-leak",
+				},
+			})
+		case 2:
+			assert.Equal(t, "cursor one&next=https://attacker.invalid", r.URL.Query().Get("after"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]string{
+					{"id": " 110000000000101 ", "verified_name": "Duplicate"},
+					{"id": "110000000000102", "verified_name": "Two"},
+				},
+			})
+		default:
+			t.Fatalf("unexpected pagination request %d", calls)
+		}
+	}))
+	defer server.Close()
+
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+	result, err := client.GetWABAPhoneNumbers(
+		testutil.TestContext(t),
+		"220000000000101",
+		"pagination-token",
+		"v21.0",
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Data, 2)
+	assert.Equal(t, "110000000000101", result.Data[0].ID)
+	assert.Equal(t, "110000000000102", result.Data[1].ID)
+	assert.Equal(t, 2, calls)
+}
+
+func TestClient_ValidateCredentialsFindsSelectedPhoneOnSecondPage(t *testing.T) {
+	t.Parallel()
+
+	var phonePageCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v21.0/110000000000201":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"display_phone_number":     "+60123456789",
+				"verified_name":            "Selected Clinic",
+				"code_verification_status": "VERIFIED",
+				"account_mode":             "LIVE",
+				"quality_rating":           "GREEN",
+				"platform_type":            "CLOUD_API",
+			})
+		case "/v21.0/220000000000201":
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "220000000000201", "name": "Selected WABA"})
+		case "/v21.0/220000000000201/phone_numbers":
+			phonePageCalls++
+			if phonePageCalls == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"data": []map[string]string{{"id": "110000000000202"}},
+					"paging": map[string]any{
+						"cursors": map[string]string{"after": "second-page"},
+						"next":    "https://graph.facebook.com/ignored",
+					},
+				})
+				return
+			}
+			assert.Equal(t, "second-page", r.URL.Query().Get("after"))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]string{{"id": "110000000000201"}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+	result, err := client.ValidateCredentials(
+		testutil.TestContext(t),
+		"110000000000201",
+		"220000000000201",
+		"selected-token",
+		"v21.0",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "Selected Clinic", result.VerifiedName)
+	assert.Equal(t, 2, phonePageCalls)
+}
+
+func TestClient_GetWABAPhoneNumbersFailsClosedOnInvalidOrUnboundedPagination(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name          string
+		response      func(int, *http.Request) map[string]any
+		wantError     string
+		wantCallCount int
+	}{
+		{
+			name: "missing cursor",
+			response: func(_ int, _ *http.Request) map[string]any {
+				return map[string]any{
+					"data":   []map[string]string{{"id": "110000000000301"}},
+					"paging": map[string]any{"next": "https://graph.facebook.com/next"},
+				}
+			},
+			wantError:     "omitted its continuation cursor",
+			wantCallCount: 1,
+		},
+		{
+			name: "repeated cursor",
+			response: func(_ int, _ *http.Request) map[string]any {
+				return map[string]any{
+					"data": []map[string]string{{"id": "110000000000301"}},
+					"paging": map[string]any{
+						"cursors": map[string]string{"after": "same-cursor"},
+						"next":    "https://graph.facebook.com/next",
+					},
+				}
+			},
+			wantError:     "repeated a continuation cursor",
+			wantCallCount: 2,
+		},
+		{
+			name: "page cap",
+			response: func(call int, _ *http.Request) map[string]any {
+				return map[string]any{
+					"data": []map[string]string{{"id": fmt.Sprintf("110000000%06d", call)}},
+					"paging": map[string]any{
+						"cursors": map[string]string{"after": fmt.Sprintf("cursor-%d", call)},
+						"next":    "https://graph.facebook.com/next",
+					},
+				}
+			},
+			wantError:     "exceeded 100 pages",
+			wantCallCount: 100,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				_ = json.NewEncoder(w).Encode(testCase.response(calls, r))
+			}))
+			defer server.Close()
+			client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+			_, err := client.GetWABAPhoneNumbers(
+				testutil.TestContext(t),
+				"220000000000301",
+				"bounded-token",
+				"v21.0",
+			)
+			require.ErrorContains(t, err, testCase.wantError)
+			assert.Equal(t, testCase.wantCallCount, calls)
+		})
+	}
+}
+
+func TestClient_GraphIdentifiersRejectPathOrQueryInjectionBeforeHTTP(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		http.Error(w, "must not be reached", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+	ctx := testutil.TestContext(t)
+
+	for _, testCase := range []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "phone path injection",
+			call: func() error {
+				_, err := client.ValidateCredentials(ctx, "110/evil", "220000000000501", "token", "v21.0")
+				return err
+			},
+		},
+		{
+			name: "WABA query injection",
+			call: func() error {
+				_, err := client.ValidateCredentials(ctx, "110000000000501", "220?fields=secrets", "token", "v21.0")
+				return err
+			},
+		},
+		{
+			name: "API version injection",
+			call: func() error {
+				_, err := client.ValidateCredentials(ctx, "110000000000501", "220000000000501", "token", "v21.0/evil")
+				return err
+			},
+		},
+		{
+			name: "provider WABA path injection",
+			call: func() error {
+				_, err := client.GetWABAPhoneNumbers(ctx, "220000000000501/phone_numbers", "token", "v21.0")
+				return err
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			require.Error(t, testCase.call())
+			assert.Zero(t, calls)
+		})
+	}
+}
+
+func TestIsDefiniteProviderRejectionClassifiesNonIdempotentFailuresConservatively(t *testing.T) {
+	t.Parallel()
+
+	definite := whatsapp.ParseMetaAPIError(http.StatusBadRequest, []byte(`{
+		"error":{"message":"PIN rejected","code":33,"is_transient":false}
+	}`))
+	assert.True(t, whatsapp.IsDefiniteProviderRejection(fmt.Errorf("register: %w", definite)))
+
+	for _, ambiguous := range []error{
+		whatsapp.ParseMetaAPIError(http.StatusBadRequest, []byte(`{
+			"error":{"message":"transience omitted","code":33}
+		}`)),
+		whatsapp.ParseMetaAPIError(http.StatusBadRequest, []byte(`{
+			"error":{"message":"temporary provider condition","code":33,"is_transient":true}
+		}`)),
+		whatsapp.ParseMetaAPIError(http.StatusRequestTimeout, []byte(`{
+			"error":{"message":"provider timeout","code":33,"is_transient":false}
+		}`)),
+		whatsapp.ParseMetaAPIError(http.StatusTooEarly, []byte(`{
+			"error":{"message":"too early","code":33,"is_transient":false}
+		}`)),
+		whatsapp.ParseMetaAPIError(http.StatusTooManyRequests, []byte(`{
+			"error":{"message":"rate limited","code":33,"is_transient":false}
+		}`)),
+		whatsapp.ParseMetaAPIError(http.StatusBadRequest, []byte(`not-json`)),
+		whatsapp.ParseMetaAPIError(http.StatusInternalServerError, []byte(`{
+			"error":{"message":"server failed","code":33,"is_transient":false}
+		}`)),
+		whatsapp.ParseMetaAPIError(http.StatusBadRequest, []byte(`{
+			"error":{"message":"temporary Meta code","code":2,"is_transient":false}
+		}`)),
+		errors.New("transport timeout"),
+	} {
+		assert.False(t, whatsapp.IsDefiniteProviderRejection(ambiguous), ambiguous.Error())
+	}
 }
 
 // testServerTransport redirects all requests to the test server

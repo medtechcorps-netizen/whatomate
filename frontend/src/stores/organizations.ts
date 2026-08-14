@@ -16,6 +16,10 @@ export const useOrganizationsStore = defineStore('organizations', () => {
   const selectedOrgId = ref<string | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
+  const organizationSwitchBlocker = ref<{
+    owner: string
+    message: string
+  } | null>(null)
 
   const selectedOrganization = computed(() => {
     if (!selectedOrgId.value) return null
@@ -64,6 +68,16 @@ export const useOrganizationsStore = defineStore('organizations', () => {
     }
   }
 
+  function blockOrganizationSwitch(owner: string, message: string) {
+    organizationSwitchBlocker.value = { owner, message }
+  }
+
+  function unblockOrganizationSwitch(owner: string) {
+    if (organizationSwitchBlocker.value?.owner === owner) {
+      organizationSwitchBlocker.value = null
+    }
+  }
+
   async function addMember(data: { email: string; role_id?: string }): Promise<void> {
     try {
       await organizationsService.addMember(data)
@@ -89,12 +103,15 @@ export const useOrganizationsStore = defineStore('organizations', () => {
     isMultiOrg,
     selectedOrgId,
     selectedOrganization,
+    organizationSwitchBlocker,
     loading,
     error,
     init,
     fetchOrganizations,
     fetchMyOrganizations,
     selectOrganization,
+    blockOrganizationSwitch,
+    unblockOrganizationSwitch,
     addMember,
     createInvitation
   }

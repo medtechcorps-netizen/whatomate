@@ -291,6 +291,10 @@ type whatsAppAccountCache struct {
 
 // getWhatsAppAccountCached retrieves WhatsApp account by phone_id from cache or database
 func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount, error) {
+	phoneID = strings.TrimSpace(phoneID)
+	if phoneID == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
 	if a.rlsEnabled() && !a.hasTenantScope() {
 		var account *models.WhatsAppAccount
 		err := a.withPhoneTenant(phoneID, func(scoped *App) error {
@@ -310,22 +314,39 @@ func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount,
 		if err == nil && cached != "" {
 			var cacheData whatsAppAccountCache
 			if err := json.Unmarshal([]byte(cached), &cacheData); err == nil {
-				cacheData.WhatsAppAccount.AccessToken = cacheData.AccessToken
-				cacheData.WhatsAppAccount.AppSecret = cacheData.AppSecret
-				cacheData.WhatsAppAccount.Pin = cacheData.Pin
-				if err := a.prepareWhatsAppAccountForRuntime(&cacheData.WhatsAppAccount); err != nil {
-					return nil, err
+				cacheMatchesRequest := strings.TrimSpace(cacheData.PhoneID) == phoneID
+				if a.hasTenantScope() {
+					cacheMatchesRequest = cacheMatchesRequest &&
+						cacheData.OrganizationID == a.tenantOrgID
 				}
-				return &cacheData.WhatsAppAccount, nil
+				if !cacheMatchesRequest {
+					// A global phone key can outlive a soft-delete/reclaim. Never
+					// consume another tenant's cached credentials from a scoped app.
+					a.Redis.Del(ctx, cacheKey)
+				} else {
+					cacheData.WhatsAppAccount.AccessToken = cacheData.AccessToken
+					cacheData.WhatsAppAccount.AppSecret = cacheData.AppSecret
+					cacheData.WhatsAppAccount.Pin = cacheData.Pin
+					cacheData.PhoneID = phoneID
+					if err := a.prepareWhatsAppAccountForRuntime(&cacheData.WhatsAppAccount); err != nil {
+						return nil, err
+					}
+					return &cacheData.WhatsAppAccount, nil
+				}
 			}
 		}
 	}
 
 	// Cache miss - fetch from database
 	var account models.WhatsAppAccount
-	if err := a.DB.Where("phone_id = ?", phoneID).First(&account).Error; err != nil {
+	query := a.DB.Where("BTRIM(phone_id) = BTRIM(?)", phoneID)
+	if a.hasTenantScope() {
+		query = query.Where("organization_id = ?", a.tenantOrgID)
+	}
+	if err := query.First(&account).Error; err != nil {
 		return nil, err
 	}
+	account.PhoneID = strings.TrimSpace(account.PhoneID)
 
 	// Cache the result (include AccessToken, AppSecret, and Pin explicitly since they have json:"-")
 	cacheData := whatsAppAccountCache{
@@ -378,9 +399,17 @@ func (a *App) InvalidateWhatsAppAccountCache(phoneID string) {
 	if a.Redis == nil {
 		return
 	}
+	rawPhoneID := phoneID
+	phoneID = strings.TrimSpace(phoneID)
+	if phoneID == "" {
+		return
+	}
 	ctx := context.Background()
-	cacheKey := fmt.Sprintf("%s%s", whatsappAccountCachePrefix, phoneID)
-	a.Redis.Del(ctx, cacheKey)
+	keys := []string{fmt.Sprintf("%s%s", whatsappAccountCachePrefix, phoneID)}
+	if rawPhoneID != phoneID {
+		keys = append(keys, fmt.Sprintf("%s%s", whatsappAccountCachePrefix, rawPhoneID))
+	}
+	a.Redis.Del(ctx, keys...)
 }
 
 // getWebhooksCached retrieves active webhooks for an organization from cache or database

@@ -20,6 +20,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var (
@@ -28,6 +29,16 @@ var (
 	errMetaAppIDNotConfigured                     = errors.New("meta app ID is not configured")
 	errMetaAppSecretNotConfigured                 = errors.New("meta app secret is not configured")
 	errMetaTokenValidationUnavailable             = errors.New("meta access token validation is unavailable")
+	errWhatsAppPhoneAlreadyClaimed                = errors.New("WhatsApp phone is already claimed")
+	errEmbeddedSignupClaimSuperseded              = errors.New("embedded signup claim was superseded")
+	errEmbeddedSignupConfigurationChanged         = errors.New("embedded signup configuration changed")
+	errEmbeddedSignupClaimInProgress              = errors.New("embedded signup claim is already in progress")
+	errRegistrationRecoveryStatus                 = errors.New("account is not pending registration")
+	errRegistrationRecoveryCredentials            = errors.New("registration recovery credentials are unavailable")
+	errRegistrationRecoverySuperseded             = errors.New("registration recovery was superseded")
+	errSubscriptionRecoveryStatus                 = errors.New("account is not pending subscription")
+	errSubscriptionRecoveryCredentials            = errors.New("subscription recovery credentials are unavailable")
+	errSubscriptionRecoverySuperseded             = errors.New("subscription recovery was superseded")
 	errPhoneWebhookOverrideAccountInactive        = errors.New("phone webhook override account is inactive")
 	errPhoneWebhookOverrideCredentialsUnavailable = errors.New("phone webhook override credentials are unavailable")
 )
@@ -113,6 +124,10 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 	if err := a.decodeRequest(r, &req); err != nil {
 		return nil
 	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.PhoneID = strings.TrimSpace(req.PhoneID)
+	req.BusinessID = strings.TrimSpace(req.BusinessID)
+	req.APIVersion = strings.TrimSpace(req.APIVersion)
 
 	// Validate required fields
 	if req.Name == "" || req.PhoneID == "" || req.BusinessID == "" || req.AccessToken == "" {
@@ -154,7 +169,7 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 	// any row can be presented as usable.
 	apiVersion := req.APIVersion
 	if apiVersion == "" {
-		apiVersion = a.defaultAPIVersion()
+		apiVersion = strings.TrimSpace(a.defaultAPIVersion())
 	}
 	if _, err := a.validateWhatsAppAccountContract(
 		validationCtx,
@@ -216,10 +231,14 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 		orgID,
 		&account,
 		subscriptionAccount,
+		account.AccessToken,
 		"active",
 		"subscription_failed",
 	)
 	if statusErr != nil {
+		if errors.Is(statusErr, errEmbeddedSignupClaimSuperseded) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account was replaced by a newer request", nil, "")
+		}
 		a.Log.Error("Failed to persist WhatsApp subscription readiness", "error", statusErr, "account_id", account.ID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Account saved, but webhook subscription status could not be recorded", nil, "")
 	}
@@ -270,17 +289,25 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		return nil
 	}
 
-	account, err := a.resolveWhatsAppAccountByID(r, id, orgID)
+	account, err := findByIDAndOrg[models.WhatsAppAccount](a.DB, r, id, orgID, "Account")
 	if err != nil {
 		return nil
 	}
-
+	originalAccessTokenCiphertext := account.AccessToken
+	originalPINCiphertext := account.Pin
+	originalStatus := strings.TrimSpace(account.Status)
+	originalUpdatedAt := account.UpdatedAt
+	a.decryptAccountSecrets(account)
 	oldAccount := *account // value copy for audit
 
 	var req AccountRequest
 	if err := a.decodeRequest(r, &req); err != nil {
 		return nil
 	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.PhoneID = strings.TrimSpace(req.PhoneID)
+	req.BusinessID = strings.TrimSpace(req.BusinessID)
+	req.APIVersion = strings.TrimSpace(req.APIVersion)
 	if strings.TrimSpace(req.AppID) != "" || strings.TrimSpace(req.AppSecret) != "" {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,
@@ -296,6 +323,100 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 			nil,
 			"",
 		)
+	}
+
+	currentPhoneID := strings.TrimSpace(account.PhoneID)
+	effectivePhoneID := currentPhoneID
+	if req.PhoneID != "" {
+		effectivePhoneID = req.PhoneID
+	}
+	currentBusinessID := strings.TrimSpace(account.BusinessID)
+	effectiveBusinessID := currentBusinessID
+	if req.BusinessID != "" {
+		effectiveBusinessID = req.BusinessID
+	}
+	effectiveAccessToken := account.AccessToken
+	if req.AccessToken != "" {
+		effectiveAccessToken = req.AccessToken
+	}
+	currentAPIVersion := strings.TrimSpace(account.APIVersion)
+	effectiveAPIVersion := currentAPIVersion
+	if req.APIVersion != "" {
+		effectiveAPIVersion = req.APIVersion
+	}
+	if effectiveAPIVersion == "" {
+		effectiveAPIVersion = strings.TrimSpace(a.defaultAPIVersion())
+	}
+	accountContractChanged := effectivePhoneID != currentPhoneID ||
+		effectiveBusinessID != currentBusinessID ||
+		req.AccessToken != "" ||
+		effectiveAPIVersion != currentAPIVersion
+	accountStatus := originalStatus
+	if accountContractChanged && embeddedSignupRecoveryLockedStatus(accountStatus) {
+		// Registration/subscription recovery owns this provider tuple. A normal
+		// PUT must never skip /register, replace its durable token/PIN claim, or
+		// race the fenced recovery status transition.
+		return r.SendErrorEnvelope(
+			fasthttp.StatusConflict,
+			"Finish WhatsApp registration and subscription recovery before changing account credentials",
+			nil,
+			"",
+		)
+	}
+
+	// Non-contract edits remain available while onboarding is pending, but use
+	// a partial status-fenced update so they cannot write decrypted secrets or
+	// a stale recovery status back over a concurrent Register/Subscribe action.
+	if embeddedSignupRecoveryLockedStatus(accountStatus) {
+		updatedName := strings.TrimSpace(account.Name)
+		if req.Name != "" {
+			updatedName = req.Name
+		}
+		result := a.DB.Model(&models.WhatsAppAccount{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ? AND updated_at = ? AND access_token = ? AND pin = ?",
+				account.ID,
+				orgID,
+				accountStatus,
+				originalUpdatedAt,
+				originalAccessTokenCiphertext,
+				originalPINCiphertext,
+			).
+			Updates(map[string]any{
+				"name":                     updatedName,
+				"auto_read_receipt":        req.AutoReadReceipt,
+				"business_calling_enabled": req.BusinessCallingEnabled,
+				"is_default_incoming":      req.IsDefaultIncoming,
+				"is_default_outgoing":      req.IsDefaultOutgoing,
+				"updated_by_id":            userID,
+			})
+		if result.Error != nil {
+			a.Log.Error("Failed to update pending WhatsApp account", "account_id", account.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
+		}
+		if result.RowsAffected != 1 {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account recovery changed; reload and try again", nil, "")
+		}
+		if req.IsDefaultIncoming && !account.IsDefaultIncoming {
+			a.DB.Model(&models.WhatsAppAccount{}).
+				Where("organization_id = ? AND id <> ? AND is_default_incoming = ?", orgID, account.ID, true).
+				Update("is_default_incoming", false)
+		}
+		if req.IsDefaultOutgoing && !account.IsDefaultOutgoing {
+			a.DB.Model(&models.WhatsAppAccount{}).
+				Where("organization_id = ? AND id <> ? AND is_default_outgoing = ?", orgID, account.ID, true).
+				Update("is_default_outgoing", false)
+		}
+		a.InvalidateWhatsAppAccountCache(account.PhoneID)
+		var updated models.WhatsAppAccount
+		if err := a.DB.Preload("CreatedBy").Preload("UpdatedBy").
+			Where("id = ? AND organization_id = ?", account.ID, orgID).
+			First(&updated).Error; err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to reload account", nil, "")
+		}
+		a.logAudit(orgID, userID,
+			"account", updated.ID, models.AuditActionUpdated, &oldAccount, &updated)
+		return r.SendEnvelope(accountToResponse(updated))
 	}
 
 	var tokenExpiresAt *time.Time
@@ -314,30 +435,6 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 			return a.sendMetaTokenPreflightError(r, err)
 		}
 	}
-
-	effectivePhoneID := account.PhoneID
-	if req.PhoneID != "" {
-		effectivePhoneID = req.PhoneID
-	}
-	effectiveBusinessID := account.BusinessID
-	if req.BusinessID != "" {
-		effectiveBusinessID = req.BusinessID
-	}
-	effectiveAccessToken := account.AccessToken
-	if req.AccessToken != "" {
-		effectiveAccessToken = req.AccessToken
-	}
-	effectiveAPIVersion := account.APIVersion
-	if req.APIVersion != "" {
-		effectiveAPIVersion = req.APIVersion
-	}
-	if effectiveAPIVersion == "" {
-		effectiveAPIVersion = a.defaultAPIVersion()
-	}
-	accountContractChanged := effectivePhoneID != account.PhoneID ||
-		effectiveBusinessID != account.BusinessID ||
-		req.AccessToken != "" ||
-		effectiveAPIVersion != account.APIVersion
 	var subscriptionCtx context.Context
 	var cancelSubscription context.CancelFunc
 	if accountContractChanged {
@@ -358,40 +455,22 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 	}
 
 	// Update fields if provided
+	account.Name = strings.TrimSpace(account.Name)
 	if req.Name != "" {
 		account.Name = req.Name
 	}
-	if req.PhoneID != "" {
-		account.PhoneID = req.PhoneID
-	}
-	if req.BusinessID != "" {
-		account.BusinessID = req.BusinessID
-	}
+	account.PhoneID = effectivePhoneID
+	account.BusinessID = effectiveBusinessID
 	tokenChanged := false
 	if req.AccessToken != "" {
 		account.AccessToken = req.AccessToken
 		account.AccessTokenExpiresAt = tokenExpiresAt
 		tokenChanged = true
 	}
-	if req.APIVersion != "" {
-		account.APIVersion = req.APIVersion
-	} else if account.APIVersion == "" {
-		account.APIVersion = effectiveAPIVersion
-	}
+	account.APIVersion = effectiveAPIVersion
 	account.AutoReadReceipt = req.AutoReadReceipt
 	account.BusinessCallingEnabled = req.BusinessCallingEnabled
 
-	// Handle default flags
-	if req.IsDefaultIncoming && !account.IsDefaultIncoming {
-		a.DB.Model(&models.WhatsAppAccount{}).
-			Where("organization_id = ? AND is_default_incoming = ?", orgID, true).
-			Update("is_default_incoming", false)
-	}
-	if req.IsDefaultOutgoing && !account.IsDefaultOutgoing {
-		a.DB.Model(&models.WhatsAppAccount{}).
-			Where("organization_id = ? AND is_default_outgoing = ?", orgID, true).
-			Update("is_default_outgoing", false)
-	}
 	account.IsDefaultIncoming = req.IsDefaultIncoming
 	account.IsDefaultOutgoing = req.IsDefaultOutgoing
 	account.UpdatedByID = &userID
@@ -401,20 +480,58 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		subscriptionAccount = a.toWhatsAppAccount(account)
 	}
 
-	// resolveWhatsAppAccountByID returns decrypted legacy secrets. Re-encrypt
-	// every secret before saving so an unrelated account edit can never write an
-	// access token, legacy app secret, or PIN back in plaintext.
-	if err := a.encryptAccountSecrets(account); err != nil {
-		a.Log.Error("Failed to encrypt account secrets", "error", err)
-		if errors.Is(err, errAccountEncryptionUnavailable) {
-			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+	updates := map[string]any{
+		"name":                     account.Name,
+		"phone_id":                 account.PhoneID,
+		"business_id":              account.BusinessID,
+		"api_version":              account.APIVersion,
+		"auto_read_receipt":        account.AutoReadReceipt,
+		"business_calling_enabled": account.BusinessCallingEnabled,
+		"is_default_incoming":      account.IsDefaultIncoming,
+		"is_default_outgoing":      account.IsDefaultOutgoing,
+		"updated_by_id":            userID,
+	}
+	expectedSubscriptionAccessTokenCiphertext := originalAccessTokenCiphertext
+	if tokenChanged {
+		encryptedAccessToken, encryptErr := crypto.Encrypt(account.AccessToken, a.integrationEncryptionKey())
+		if encryptErr != nil {
+			a.Log.Error("Failed to encrypt account access token", "account_id", account.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
 		}
+		updates["access_token"] = encryptedAccessToken
+		updates["access_token_expires_at"] = tokenExpiresAt
+		expectedSubscriptionAccessTokenCiphertext = encryptedAccessToken
+	}
+	if accountContractChanged {
+		updates["status"] = "pending_subscription"
+	}
+	result := a.DB.Model(&models.WhatsAppAccount{}).
+		Where(
+			"id = ? AND organization_id = ? AND status = ? AND updated_at = ? AND access_token = ? AND pin = ?",
+			account.ID,
+			orgID,
+			originalStatus,
+			originalUpdatedAt,
+			originalAccessTokenCiphertext,
+			originalPINCiphertext,
+		).
+		Updates(updates)
+	if result.Error != nil {
+		a.Log.Error("Failed to update account", "error", result.Error)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
 	}
-
-	if err := a.DB.Save(account).Error; err != nil {
-		a.Log.Error("Failed to update account", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
+	if result.RowsAffected != 1 {
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account changed; reload and try again", nil, "")
+	}
+	if req.IsDefaultIncoming && !oldAccount.IsDefaultIncoming {
+		a.DB.Model(&models.WhatsAppAccount{}).
+			Where("organization_id = ? AND id <> ? AND is_default_incoming = ?", orgID, account.ID, true).
+			Update("is_default_incoming", false)
+	}
+	if req.IsDefaultOutgoing && !oldAccount.IsDefaultOutgoing {
+		a.DB.Model(&models.WhatsAppAccount{}).
+			Where("organization_id = ? AND id <> ? AND is_default_outgoing = ?", orgID, account.ID, true).
+			Update("is_default_outgoing", false)
 	}
 
 	var subscriptionErr error
@@ -425,10 +542,14 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 			orgID,
 			account,
 			subscriptionAccount,
+			expectedSubscriptionAccessTokenCiphertext,
 			"active",
 			"subscription_failed",
 		)
 		if statusErr != nil {
+			if errors.Is(statusErr, errEmbeddedSignupClaimSuperseded) {
+				return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account was replaced by a newer request", nil, "")
+			}
 			a.Log.Error("Failed to persist WhatsApp subscription readiness", "error", statusErr, "account_id", account.ID)
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Account updated, but webhook subscription status could not be recorded", nil, "")
 		}
@@ -478,9 +599,25 @@ func (a *App) DeleteAccount(r *fastglue.Request) error {
 		return nil
 	}
 
-	if err := a.DB.Delete(account).Error; err != nil {
-		a.Log.Error("Failed to delete account", "error", err)
+	deleteResult := a.DB.
+		Where(
+			"id = ? AND organization_id = ? AND status NOT IN ?",
+			account.ID,
+			orgID,
+			[]string{"pending_registration", "pending_subscription"},
+		).
+		Delete(&models.WhatsAppAccount{})
+	if deleteResult.Error != nil {
+		a.Log.Error("Failed to delete account", "error", deleteResult.Error)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete account", nil, "")
+	}
+	if deleteResult.RowsAffected != 1 {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusConflict,
+			"Finish WhatsApp registration and subscription recovery before deleting this account",
+			nil,
+			"",
+		)
 	}
 
 	// Invalidate cache
@@ -702,6 +839,7 @@ func (a *App) subscribeAndPersistWhatsAppStatus(
 	orgID uuid.UUID,
 	account *models.WhatsAppAccount,
 	runtimeAccount *whatsapp.Account,
+	expectedAccessTokenCiphertext string,
 	successStatus, failureStatus string,
 ) (subscriptionErr, persistenceErr error) {
 	if a.WhatsApp == nil || runtimeAccount == nil {
@@ -719,10 +857,26 @@ func (a *App) subscribeAndPersistWhatsAppStatus(
 			"business_id", account.BusinessID,
 		)
 	}
-	if err := a.DB.Model(&models.WhatsAppAccount{}).
-		Where("id = ? AND organization_id = ?", account.ID, orgID).
-		Update("status", status).Error; err != nil {
-		return subscriptionErr, err
+	// A manual Create/Update request may be waiting on Meta while the row is
+	// deleted and reclaimed by Embedded Signup. Finalize only the exact durable
+	// provider tuple and encrypted token that this Subscribe call observed.
+	result := a.DB.Model(&models.WhatsAppAccount{}).
+		Where(
+			"id = ? AND organization_id = ? AND status = ? AND access_token = ? AND phone_id = ? AND business_id = ? AND api_version = ?",
+			account.ID,
+			orgID,
+			"pending_subscription",
+			expectedAccessTokenCiphertext,
+			account.PhoneID,
+			account.BusinessID,
+			account.APIVersion,
+		).
+		Update("status", status)
+	if result.Error != nil {
+		return subscriptionErr, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return subscriptionErr, errEmbeddedSignupClaimSuperseded
 	}
 	account.Status = status
 	a.InvalidateWhatsAppAccountCache(account.PhoneID)
@@ -732,7 +886,7 @@ func (a *App) subscribeAndPersistWhatsAppStatus(
 // SubscribeApp subscribes the app to webhooks for the WhatsApp Business Account.
 // This is required after phone number registration to receive incoming messages from Meta.
 func (a *App) SubscribeApp(r *fastglue.Request) error {
-	orgID, _, err := a.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
+	orgID, err := a.requireExplicitOrganization(r)
 	if err != nil {
 		return nil
 	}
@@ -742,41 +896,149 @@ func (a *App) SubscribeApp(r *fastglue.Request) error {
 		return nil
 	}
 
-	account, err := a.resolveWhatsAppAccountByID(r, id, orgID)
-	if err != nil {
+	type subscriptionRecoverySnapshot struct {
+		accountID             uuid.UUID
+		phoneID               string
+		businessID            string
+		apiVersion            string
+		accessToken           string
+		accessTokenCiphertext string
+		expectedStatus        string
+	}
+	var snapshot subscriptionRecoverySnapshot
+	err = a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		resolvedOrgID, _, authErr := scoped.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
+		if authErr != nil {
+			return authErr
+		}
+		if resolvedOrgID != orgID {
+			_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+			return errEnvelopeSent
+		}
+
+		var account models.WhatsAppAccount
+		if loadErr := scoped.DB.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", id, orgID).
+			First(&account).Error; loadErr != nil {
+			return loadErr
+		}
+		expectedStatus := strings.TrimSpace(account.Status)
+		if expectedStatus != "pending_subscription" && expectedStatus != "subscription_failed" {
+			return errSubscriptionRecoveryStatus
+		}
+		encryptionKey := strings.TrimSpace(scoped.integrationEncryptionKey())
+		if encryptionKey == "" {
+			return errAccountEncryptionUnavailable
+		}
+		accessToken, decryptErr := crypto.Decrypt(account.AccessToken, encryptionKey)
+		if decryptErr != nil || strings.TrimSpace(accessToken) == "" || crypto.IsEncrypted(accessToken) {
+			return errSubscriptionRecoveryCredentials
+		}
+		accessTokenCiphertext := account.AccessToken
+		if !crypto.IsEncrypted(accessTokenCiphertext) {
+			accessTokenCiphertext, decryptErr = crypto.Encrypt(accessToken, encryptionKey)
+			if decryptErr != nil {
+				return decryptErr
+			}
+			result := scoped.DB.Model(&models.WhatsAppAccount{}).
+				Where("id = ? AND organization_id = ? AND status = ?", account.ID, orgID, expectedStatus).
+				Update("access_token", accessTokenCiphertext)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errSubscriptionRecoverySuperseded
+			}
+		}
+
+		snapshot = subscriptionRecoverySnapshot{
+			accountID:             account.ID,
+			phoneID:               strings.TrimSpace(account.PhoneID),
+			businessID:            strings.TrimSpace(account.BusinessID),
+			apiVersion:            strings.TrimSpace(account.APIVersion),
+			accessToken:           strings.TrimSpace(accessToken),
+			accessTokenCiphertext: accessTokenCiphertext,
+			expectedStatus:        expectedStatus,
+		}
+		return nil
+	})
+	if errors.Is(err, errEnvelopeSent) {
 		return nil
 	}
+	if err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Account not found", nil, "")
+		case errors.Is(err, errSubscriptionRecoveryStatus):
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account is not pending webhook subscription", nil, "")
+		case errors.Is(err, errSubscriptionRecoveryCredentials):
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp subscription recovery is unavailable for this account", nil, "")
+		case errors.Is(err, errSubscriptionRecoverySuperseded):
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp subscription recovery changed; reload and try again", nil, "")
+		case errors.Is(err, errAccountEncryptionUnavailable):
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+		default:
+			a.Log.Error("Failed to prepare WhatsApp subscription recovery", "account_id", id, "organization_id", orgID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to prepare WhatsApp subscription recovery", nil, "")
+		}
+	}
+	if a.WhatsApp == nil {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "WhatsApp subscription recovery is unavailable", nil, "")
+	}
 
-	// Subscribe the app to webhooks
+	// Meta runs outside a tenant transaction. The exact expected status and
+	// token ciphertext fence the committed result against concurrent reconnects.
 	ctx, cancel := context.WithTimeout(requestContext(r), 30*time.Second)
 	defer cancel()
-	if err := a.WhatsApp.SubscribeApp(ctx, a.toWhatsAppAccount(account)); err != nil {
-		a.Log.Warn("Failed to subscribe app to webhooks", "account_id", account.ID)
-		if statusErr := a.DB.Model(&models.WhatsAppAccount{}).
-			Where("id = ? AND organization_id = ?", account.ID, orgID).
-			Update("status", "subscription_failed").Error; statusErr != nil {
-			a.Log.Error("Failed to record webhook subscription failure", "error", statusErr, "account_id", account.ID)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Webhook subscription failed and its status could not be recorded", nil, "")
+	subscriptionErr := a.WhatsApp.SubscribeApp(ctx, &whatsapp.Account{
+		PhoneID:     snapshot.phoneID,
+		BusinessID:  snapshot.businessID,
+		APIVersion:  snapshot.apiVersion,
+		AccessToken: snapshot.accessToken,
+	})
+	nextStatus := "active"
+	if subscriptionErr != nil {
+		nextStatus = "subscription_failed"
+		a.Log.Warn("WhatsApp subscription recovery was not confirmed", "account_id", snapshot.accountID)
+	}
+	err = a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		result := scoped.DB.Model(&models.WhatsAppAccount{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ? AND access_token = ?",
+				snapshot.accountID,
+				orgID,
+				snapshot.expectedStatus,
+				snapshot.accessTokenCiphertext,
+			).
+			Update("status", nextStatus)
+		if result.Error != nil {
+			return result.Error
 		}
-		a.InvalidateWhatsAppAccountCache(account.PhoneID)
+		if result.RowsAffected != 1 {
+			return errSubscriptionRecoverySuperseded
+		}
+		return nil
+	})
+	a.InvalidateWhatsAppAccountCache(snapshot.phoneID)
+	if err != nil {
+		if errors.Is(err, errSubscriptionRecoverySuperseded) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp subscription recovery was replaced by a newer request", nil, "")
+		}
+		a.Log.Error("Failed to persist WhatsApp subscription recovery status", "account_id", snapshot.accountID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Webhook subscription status could not be saved", nil, "")
+	}
+	if subscriptionErr != nil {
 		return r.SendEnvelope(map[string]any{
 			"success": false,
+			"status":  "subscription_failed",
 			"error":   "Failed to subscribe app to webhooks. Check your credentials.",
 		})
 	}
 
-	a.Log.Info("App subscribed to webhooks successfully", "account", account.Name, "business_id", account.BusinessID)
-	if account.Status == "subscription_failed" || account.Status == "pending_subscription" {
-		if err := a.DB.Model(&models.WhatsAppAccount{}).
-			Where("id = ? AND organization_id = ?", account.ID, orgID).
-			Update("status", "active").Error; err != nil {
-			a.Log.Error("Failed to restore account readiness after subscription", "error", err, "account", account.Name)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Subscription succeeded but account readiness could not be saved", nil, "")
-		}
-		a.InvalidateWhatsAppAccountCache(account.PhoneID)
-	}
+	a.Log.Info("App subscribed to webhooks successfully", "account_id", snapshot.accountID, "business_id", snapshot.businessID)
 	return r.SendEnvelope(map[string]any{
 		"success": true,
+		"status":  "active",
 		"message": "App subscribed to webhooks successfully. You should now receive incoming messages.",
 	})
 }
@@ -1041,11 +1303,63 @@ func (a *App) decryptLegacyMetaAccountSecret(value string) (string, error) {
 	return strings.TrimSpace(decrypted), nil
 }
 
-// ExchangeToken exchanges the temporary code for a permanent access token and creates the account
+type embeddedSignupMetaSnapshot struct {
+	appID      string
+	appSecret  string
+	configID   string
+	apiVersion string
+}
+
+type embeddedSignupClaim struct {
+	account            *models.WhatsAppAccount
+	existing           bool
+	old                *models.WhatsAppAccount
+	priorStatus        string
+	priorPINCiphertext string
+}
+
+// ExchangeToken exchanges a temporary code and advances one exact workspace
+// through committed onboarding phases. Provider mutations never run before an
+// encrypted local phone claim has committed.
 func (a *App) ExchangeToken(r *fastglue.Request) error {
-	orgID, userID, err := a.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
+	orgID, err := a.requireExplicitOrganization(r)
 	if err != nil {
 		return nil
+	}
+
+	var userID uuid.UUID
+	var metaSnapshot embeddedSignupMetaSnapshot
+	err = a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		resolvedOrgID, resolvedUserID, authErr := scoped.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
+		if authErr != nil {
+			return authErr
+		}
+		if resolvedOrgID != orgID {
+			_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+			return errEnvelopeSent
+		}
+		appID, appSecret, configID, resolveErr := scoped.resolveMetaAppCreds(orgID)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		userID = resolvedUserID
+		metaSnapshot = embeddedSignupMetaSnapshot{
+			appID:      strings.TrimSpace(appID),
+			appSecret:  strings.TrimSpace(appSecret),
+			configID:   strings.TrimSpace(configID),
+			apiVersion: scoped.metaAPIVersion(),
+		}
+		return nil
+	})
+	if errors.Is(err, errEnvelopeSent) {
+		return nil
+	}
+	if err != nil {
+		if errors.Is(err, errMetaIntegrationDisabled) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Meta integration is disabled", nil, "")
+		}
+		a.Log.Error("Failed to prepare embedded signup credentials", "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resolve credentials", nil, "")
 	}
 
 	var req struct {
@@ -1064,7 +1378,7 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 		"waba_id", req.WABAID,
 		"organization_id", orgID)
 
-	if req.Code == "" {
+	if strings.TrimSpace(req.Code) == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Code is required", nil, "")
 	}
 	if strings.TrimSpace(req.WebhookVerifyToken) != "" {
@@ -1078,92 +1392,152 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	if !a.hasIntegrationEncryptionKey() {
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
 	}
-
-	// 1. Resolve Meta credentials for this org
-	appID, appSecret, _, err := a.resolveMetaAppCreds(orgID)
-	if err != nil {
-		if errors.Is(err, errMetaIntegrationDisabled) {
-			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Meta integration is disabled", nil, "")
-		}
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resolve credentials", nil, "")
+	if a.WhatsApp == nil || metaSnapshot.appID == "" || metaSnapshot.appSecret == "" || metaSnapshot.apiVersion == "" {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Meta Embedded Signup is unavailable", nil, "")
 	}
 
-	// 2. Exchange code for user access token using WhatsApp service
+	// Provider read-only phase: exchange, validate the issuing app/scopes, and
+	// prove the exact WABA/phone relationship before claiming anything.
 	ctx, cancel := context.WithTimeout(requestContext(r), 60*time.Second)
 	defer cancel()
 	a.Log.Info("Exchanging code for access token")
 
-	accessToken, err := a.WhatsApp.ExchangeCodeForToken(ctx, req.Code,
-		appID, appSecret, a.Config.WhatsApp.APIVersion)
+	accessToken, err := a.WhatsApp.ExchangeCodeForToken(
+		ctx,
+		strings.TrimSpace(req.Code),
+		metaSnapshot.appID,
+		metaSnapshot.appSecret,
+		metaSnapshot.apiVersion,
+	)
 	if err != nil {
 		a.Log.Warn("Meta authorization code exchange was rejected")
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Meta authorization code exchange failed", nil, "")
 	}
 
-	// DISCOVERY: If IDs are missing, try to find them using the token
-	phoneID, wabaID, name, tokenExpiresAt, err := a.discoverWABAAndPhone(ctx, orgID, accessToken, req.PhoneID, req.WABAID, req.Name)
+	phoneID, wabaID, name, tokenExpiresAt, phoneInfo, err := a.discoverWABAAndPhone(
+		ctx,
+		accessToken,
+		req.PhoneID,
+		req.WABAID,
+		req.Name,
+		metaSnapshot,
+	)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 
-	// 3. We can now create/update the account
-	account, phoneInfo, existingAccount, oldAccount, err := a.createOrUpdateAccount(ctx, orgID, phoneID, wabaID, name, accessToken, tokenExpiresAt)
-	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, err.Error(), nil, "")
-	}
-
-	// 4. Attempt Auto-Registration
-	var priorStatus string
-	if oldAccount != nil {
-		priorStatus = oldAccount.Status
-	}
-	regErr := a.attemptAutoRegistration(ctx, account, phoneInfo, accessToken, priorStatus)
-
-	// 5. Persist the account in a non-ready state before attempting the remote
-	// subscription. This ensures a successful provider-side subscription always
-	// has a local row that can be reconciled or retried.
-	registrationStatus := account.Status
-	subscriptionSuccessStatus := registrationStatus
-	subscriptionFailureStatus := registrationStatus
-	if regErr == nil && registrationStatus == "active" {
-		account.Status = "pending_subscription"
-		subscriptionSuccessStatus = "active"
-		subscriptionFailureStatus = "subscription_failed"
-	}
-	subscriptionAccount := a.toWhatsAppAccount(account)
-
-	// 6. Encrypt credentials at rest
-	plaintextPin := account.Pin
-	if err := a.encryptAccountSecrets(account); err != nil {
-		a.Log.Error("Failed to encrypt account secrets", "error", err)
-		if errors.Is(err, errAccountEncryptionUnavailable) {
-			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+	// Generate the exact non-SMB registration PIN before the local claim is
+	// committed. The claim encrypts it before any Meta mutation, so an
+	// externally successful registration remains recoverable even if a later
+	// status write or process restart fails.
+	registrationPIN := ""
+	if !embeddedSignupPhoneIsSMB(phoneInfo) {
+		registrationPIN, err = generateNumericPIN(6)
+		if err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to prepare WhatsApp account", nil, "")
 		}
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, err.Error(), nil, "")
 	}
 
-	if err := a.DB.Save(account).Error; err != nil {
-		a.Log.Error("Failed to save account", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save account", nil, "")
-	}
-
-	// 7. Subscribe and persist the true readiness outcome. Registration failures
-	// remain pending_registration; otherwise subscription success/failure is
-	// represented as active/subscription_failed.
-	subscriptionErr, statusErr := a.subscribeAndPersistWhatsAppStatus(
-		ctx,
+	claim, err := a.claimEmbeddedSignupAccount(
 		orgID,
-		account,
-		subscriptionAccount,
-		subscriptionSuccessStatus,
-		subscriptionFailureStatus,
+		userID,
+		phoneID,
+		wabaID,
+		name,
+		accessToken,
+		tokenExpiresAt,
+		metaSnapshot.apiVersion,
+		phoneInfo,
+		registrationPIN,
+		metaSnapshot,
 	)
-	if statusErr != nil {
-		a.Log.Error("Failed to persist embedded signup subscription readiness", "error", statusErr, "account_id", account.ID)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Account saved, but webhook subscription status could not be recorded", nil, "")
+	if err != nil {
+		switch {
+		case errors.Is(err, errWhatsAppPhoneAlreadyClaimed):
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "This WhatsApp phone number is already connected", nil, "")
+		case errors.Is(err, errEmbeddedSignupConfigurationChanged), errors.Is(err, errMetaIntegrationDisabled):
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Meta integration settings changed; restart the connection", nil, "")
+		case errors.Is(err, errEmbeddedSignupClaimInProgress):
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "A WhatsApp connection for this number is already pending reconciliation", nil, "")
+		}
+		a.Log.Error("Failed to persist embedded signup phone claim", "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save WhatsApp account", nil, "")
+	}
+	account := claim.account
+	claimCiphertext := account.AccessToken
+	// The global phone-keyed cache may still contain the pre-claim credentials,
+	// status, or tenant association. Evict it immediately after the durable
+	// claim, before Meta can emit registration/subscription webhooks.
+	a.InvalidateWhatsAppAccountCache(account.PhoneID)
+	if account.IsSMB {
+		registrationPIN = ""
 	}
 
-	// Invalidate cache
+	// Provider mutation phase 1. The committed pending_registration row above
+	// owns the phone and its encrypted PIN before Meta registration can change
+	// external state.
+	regErr := a.attemptEmbeddedSignupRegistration(ctx, account, accessToken, registrationPIN)
+	registrationStatus := "pending_registration"
+	var registrationPINOverride *string
+	if regErr == nil {
+		registrationStatus = "pending_subscription"
+	} else if claim.priorStatus != "" && whatsapp.IsDefiniteProviderRejection(regErr) {
+		// A live account can remain usable when Meta definitively rejects a
+		// redundant re-registration attempt. Restore its prior readiness and
+		// previously accepted PIN while retaining the refreshed validated token.
+		registrationStatus = claim.priorStatus
+		priorPINCiphertext := claim.priorPINCiphertext
+		registrationPINOverride = &priorPINCiphertext
+	}
+	account, err = a.persistEmbeddedSignupStatus(
+		orgID,
+		account.ID,
+		claimCiphertext,
+		"pending_registration",
+		registrationStatus,
+		registrationPINOverride,
+	)
+	if err != nil {
+		if errors.Is(err, errEmbeddedSignupClaimSuperseded) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp connection was replaced by a newer request", nil, "")
+		}
+		a.Log.Error("Failed to persist embedded signup registration state", "account_id", account.ID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "WhatsApp account was claimed, but registration status could not be saved", nil, "")
+	}
+
+	var subscriptionErr error
+	if regErr == nil {
+		// Provider mutation phase 2. pending_subscription is already committed,
+		// so a successful subscription always has a durable reconciliation row.
+		runtimeAccount := &whatsapp.Account{
+			PhoneID:     phoneID,
+			BusinessID:  wabaID,
+			APIVersion:  metaSnapshot.apiVersion,
+			AccessToken: accessToken,
+		}
+		subscriptionErr = a.WhatsApp.SubscribeApp(ctx, runtimeAccount)
+		finalStatus := "active"
+		if subscriptionErr != nil {
+			finalStatus = "subscription_failed"
+			a.Log.Warn("WhatsApp webhook subscription failed", "account_id", account.ID, "business_id", wabaID)
+		}
+		account, err = a.persistEmbeddedSignupStatus(
+			orgID,
+			account.ID,
+			claimCiphertext,
+			"pending_subscription",
+			finalStatus,
+			nil,
+		)
+		if err != nil {
+			if errors.Is(err, errEmbeddedSignupClaimSuperseded) {
+				return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp connection was replaced by a newer request", nil, "")
+			}
+			a.Log.Error("Failed to persist embedded signup subscription state", "account_id", account.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "WhatsApp account was saved, but subscription status could not be recorded", nil, "")
+		}
+	}
+
 	a.InvalidateWhatsAppAccountCache(account.PhoneID)
 
 	a.Log.Info("WhatsApp account connected via embedded signup successfully",
@@ -1171,29 +1545,30 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 		"phone_id", account.PhoneID,
 		"status", account.Status)
 
-	// Audit Logging
-	a.DB.Preload("CreatedBy").Preload("UpdatedBy").
-		Where("id = ? AND organization_id = ?", account.ID, orgID).
-		First(account)
-	auditAction := models.AuditActionCreated
-	var auditOld any = nil
-	if existingAccount {
-		auditAction = models.AuditActionUpdated
-		auditOld = oldAccount
+	if auditErr := a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		if err := scoped.DB.Preload("CreatedBy").Preload("UpdatedBy").
+			Where("id = ? AND organization_id = ?", account.ID, orgID).
+			First(account).Error; err != nil {
+			return err
+		}
+		auditAction := models.AuditActionCreated
+		var auditOld any
+		if claim.existing {
+			auditAction = models.AuditActionUpdated
+			auditOld = claim.old
+		}
+		scoped.logAudit(orgID, userID, "account", account.ID, auditAction, auditOld, account)
+		return nil
+	}); auditErr != nil {
+		a.Log.Error("Failed to reload or audit embedded signup account", "account_id", account.ID)
 	}
-	a.logAudit(orgID, userID,
-		"account", account.ID, auditAction, auditOld, account)
 
-	// Construction of response map (reusing accountToResponse)
 	out := map[string]any{
 		"account": accountToResponse(*account),
 	}
-	if account.Status == "active" && plaintextPin != "" {
-		out["pin"] = plaintextPin
-	}
 	warnings := make([]string, 0, 2)
 	if regErr != nil {
-		warnings = append(warnings, "Registration failed: "+regErr.Error())
+		warnings = append(warnings, "Registration could not be confirmed; keep this account pending and reconcile it before retrying")
 	}
 	if subscriptionErr != nil {
 		warnings = append(warnings, "Webhook subscription failed; use the account Subscribe action after checking Meta permissions")
@@ -1205,60 +1580,294 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	return r.SendEnvelope(out)
 }
 
-func (a *App) discoverWABAAndPhone(ctx context.Context, orgID uuid.UUID, accessToken, phoneID, wabaID, name string) (string, string, string, *time.Time, error) {
-	a.Log.Info("Validating embedded signup token via debug_token")
-
-	debugInfo, tokenExpiresAt, err := a.debugAndValidateMetaAccessToken(ctx, orgID, accessToken)
-	if err != nil {
-		return "", "", "", nil, err
+func embeddedSignupAccountName(name, phoneID string, phoneInfo *whatsapp.PhoneNumberInfo) (string, error) {
+	name = strings.TrimSpace(name)
+	if name != "" {
+		return name, nil
 	}
-	if wabaID == "" {
-		// 2. Find WABA ID from Granular Scopes only when Embedded Signup did
-		// not already provide one. A supplied ID is still validated below.
-		var discoveredWABAID string
-		for _, scope := range debugInfo.GranularScopes {
-			if scope.Scope == "whatsapp_business_management" {
-				if len(scope.TargetIds) > 0 {
-					discoveredWABAID = scope.TargetIds[0]
-					break
+	if phoneInfo != nil && strings.TrimSpace(phoneInfo.VerifiedName) != "" {
+		suffix, err := generateNumericPIN(4)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s %s", strings.TrimSpace(phoneInfo.VerifiedName), suffix), nil
+	}
+	suffix := strings.TrimSpace(phoneID)
+	if len(suffix) > 4 {
+		suffix = suffix[len(suffix)-4:]
+	}
+	return "WhatsApp Account " + suffix, nil
+}
+
+func embeddedSignupPhoneIsSMB(phoneInfo *whatsapp.PhoneNumberInfo) bool {
+	return phoneInfo != nil &&
+		(phoneInfo.IsOnBizApp || phoneInfo.PlatformType == "SMB" || phoneInfo.PlatformType == "SMB_CLOUD_API")
+}
+
+func embeddedSignupPhoneClaimUniqueViolation(err error) bool {
+	if err == nil || !isUniqueViolation(err) {
+		return false
+	}
+	// Only the global routing identity constraint is a phone-claim conflict.
+	// A tenant-local name collision must not be mislabeled as another tenant
+	// owning the phone number.
+	return strings.Contains(
+		strings.ToLower(err.Error()),
+		"uq_whatsapp_accounts_live_phone_id",
+	)
+}
+
+func (a *App) claimEmbeddedSignupAccount(
+	orgID, userID uuid.UUID,
+	phoneID, wabaID, name, accessToken string,
+	tokenExpiresAt *time.Time,
+	apiVersion string,
+	phoneInfo *whatsapp.PhoneNumberInfo,
+	registrationPIN string,
+	metaSnapshot embeddedSignupMetaSnapshot,
+) (*embeddedSignupClaim, error) {
+	phoneID = strings.TrimSpace(phoneID)
+	wabaID = strings.TrimSpace(wabaID)
+	name = strings.TrimSpace(name)
+	registrationPIN = strings.TrimSpace(registrationPIN)
+	if phoneID == "" || wabaID == "" || strings.TrimSpace(accessToken) == "" {
+		return nil, errors.New("embedded signup account claim is incomplete")
+	}
+
+	claim := &embeddedSignupClaim{}
+	err := a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		// Fence the read-only Meta validation phase against a concurrent
+		// Integration Center credential or API-version change. No local claim
+		// and no provider mutation may proceed with a stale app snapshot.
+		currentAppID, currentAppSecret, currentConfigID, resolveErr := scoped.resolveMetaAppCreds(orgID)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if strings.TrimSpace(currentAppID) != metaSnapshot.appID ||
+			strings.TrimSpace(currentAppSecret) != metaSnapshot.appSecret ||
+			strings.TrimSpace(currentConfigID) != metaSnapshot.configID ||
+			scoped.metaAPIVersion() != metaSnapshot.apiVersion {
+			return errEmbeddedSignupConfigurationChanged
+		}
+
+		var account models.WhatsAppAccount
+		lookupErr := scoped.DB.Unscoped().
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("organization_id = ? AND BTRIM(phone_id) = BTRIM(?)", orgID, phoneID).
+			Order("CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END, updated_at DESC, created_at DESC, id DESC").
+			First(&account).Error
+		initializeOperationalFields := false
+		switch {
+		case lookupErr == nil:
+			if !account.DeletedAt.Valid &&
+				(account.Status == "pending_registration" || account.Status == "pending_subscription") {
+				return errEmbeddedSignupClaimInProgress
+			}
+			claim.existing = true
+			old := account
+			claim.old = &old
+			initializeOperationalFields = account.DeletedAt.Valid
+			if !account.DeletedAt.Valid {
+				claim.priorStatus = strings.TrimSpace(account.Status)
+				claim.priorPINCiphertext = account.Pin
+				if strings.TrimSpace(claim.priorPINCiphertext) != "" && !crypto.IsEncrypted(claim.priorPINCiphertext) {
+					var encryptErr error
+					claim.priorPINCiphertext, encryptErr = crypto.Encrypt(
+						claim.priorPINCiphertext,
+						scoped.integrationEncryptionKey(),
+					)
+					if encryptErr != nil || !crypto.IsEncrypted(claim.priorPINCiphertext) {
+						return errAccountEncryptionUnavailable
+					}
 				}
 			}
+		case errors.Is(lookupErr, gorm.ErrRecordNotFound):
+			account.ID = uuid.New()
+			account.CreatedByID = &userID
+			initializeOperationalFields = true
+		default:
+			return lookupErr
 		}
 
-		if discoveredWABAID == "" {
-			a.Log.Warn("No WABA ID found in granular scopes, falling back to /me/accounts strategy")
-			sharedInfo, err := a.WhatsApp.GetSharedWABA(ctx, accessToken)
-			if err == nil && len(sharedInfo.Data) > 0 {
-				discoveredWABAID = sharedInfo.Data[0].ID
+		if !claim.existing || strings.TrimSpace(account.Name) == "" {
+			preparedName, nameErr := embeddedSignupAccountName(name, phoneID, phoneInfo)
+			if nameErr != nil {
+				return nameErr
+			}
+			account.Name = preparedName
+		}
+		if initializeOperationalFields {
+			account.IsDefaultIncoming = false
+			account.IsDefaultOutgoing = false
+			account.AutoReadReceipt = false
+			account.BusinessCallingEnabled = false
+			account.IsSMB = embeddedSignupPhoneIsSMB(phoneInfo)
+		} else if phoneInfo != nil {
+			// IsSMB is provider classification, not a user-controlled routing
+			// preference. Refresh it only when Meta returned current phone info.
+			account.IsSMB = embeddedSignupPhoneIsSMB(phoneInfo)
+		}
+
+		account.OrganizationID = orgID
+		account.PhoneID = phoneID
+		account.BusinessID = wabaID
+		account.AccessToken = accessToken
+		account.AccessTokenExpiresAt = tokenExpiresAt
+		account.APIVersion = strings.TrimSpace(apiVersion)
+		account.Status = "pending_registration"
+		account.Pin = registrationPIN
+		if account.IsSMB {
+			account.Pin = ""
+		}
+		account.UpdatedByID = &userID
+		account.DeletedAt = gorm.DeletedAt{}
+
+		if err := scoped.encryptAccountSecrets(&account); err != nil {
+			return err
+		}
+		var saveErr error
+		if claim.existing {
+			saveErr = scoped.DB.Unscoped().Save(&account).Error
+		} else {
+			saveErr = scoped.DB.Create(&account).Error
+		}
+		if saveErr != nil {
+			if embeddedSignupPhoneClaimUniqueViolation(saveErr) {
+				return errWhatsAppPhoneAlreadyClaimed
+			}
+			return saveErr
+		}
+		claim.account = &account
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claim, nil
+}
+
+func (a *App) persistEmbeddedSignupStatus(
+	orgID, accountID uuid.UUID,
+	claimCiphertext, expectedStatus, nextStatus string,
+	pinCiphertextOverride *string,
+) (*models.WhatsAppAccount, error) {
+	var account models.WhatsAppAccount
+	err := a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		updates := map[string]any{"status": nextStatus}
+		if pinCiphertextOverride != nil {
+			pinCiphertext := strings.TrimSpace(*pinCiphertextOverride)
+			if pinCiphertext != "" && !crypto.IsEncrypted(pinCiphertext) {
+				return errAccountEncryptionUnavailable
+			}
+			updates["pin"] = pinCiphertext
+		}
+		result := scoped.DB.Model(&models.WhatsAppAccount{}).
+			Where(
+				"id = ? AND organization_id = ? AND access_token = ? AND status = ?",
+				accountID,
+				orgID,
+				claimCiphertext,
+				expectedStatus,
+			).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errEmbeddedSignupClaimSuperseded
+		}
+		return scoped.DB.Where("id = ? AND organization_id = ?", accountID, orgID).First(&account).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &account, nil
+}
+
+func (a *App) discoverWABAAndPhone(
+	ctx context.Context,
+	accessToken, phoneID, wabaID, name string,
+	metaSnapshot embeddedSignupMetaSnapshot,
+) (string, string, string, *time.Time, *whatsapp.PhoneNumberInfo, error) {
+	a.Log.Info("Validating embedded signup token via debug_token")
+
+	debugInfo, tokenExpiresAt, err := a.debugAndValidateMetaAccessTokenWithCredentials(
+		ctx,
+		accessToken,
+		metaSnapshot.appID,
+		metaSnapshot.appSecret,
+	)
+	if err != nil {
+		return "", "", "", nil, nil, err
+	}
+	discoveredWABAIDs := make(map[string]struct{})
+	messagingTargetIDs := make(map[string]struct{})
+	for _, scope := range debugInfo.GranularScopes {
+		scopeName := strings.TrimSpace(scope.Scope)
+		if scopeName != "whatsapp_business_management" && scopeName != "whatsapp_business_messaging" {
+			continue
+		}
+		for _, targetID := range scope.TargetIds {
+			targetID = strings.TrimSpace(targetID)
+			if targetID == "" {
+				continue
+			}
+			if scopeName == "whatsapp_business_management" {
+				discoveredWABAIDs[targetID] = struct{}{}
+			} else {
+				messagingTargetIDs[targetID] = struct{}{}
 			}
 		}
-
-		if discoveredWABAID == "" {
-			return "", "", "", nil, fmt.Errorf("could not discover WhatsApp Business Account ID from token")
-		}
-
-		wabaID = discoveredWABAID
-		a.Log.Info("Discovered WABA ID", "waba_id", wabaID)
 	}
 
+	wabaID = strings.TrimSpace(wabaID)
+	if wabaID == "" {
+		// Find the WABA ID from the token's WhatsApp granular scope only when
+		// Embedded Signup did not already provide one. The Graph /me/accounts
+		// edge returns Facebook Pages, not WhatsApp Business Accounts, so it is
+		// not a safe discovery fallback.
+		switch len(discoveredWABAIDs) {
+		case 0:
+			return "", "", "", nil, nil, fmt.Errorf("embedded signup did not provide a WhatsApp Business Account ID; reconnect and complete the WhatsApp account selection")
+		case 1:
+			for discoveredWABAID := range discoveredWABAIDs {
+				wabaID = discoveredWABAID
+			}
+		default:
+			return "", "", "", nil, nil, fmt.Errorf("embedded signup token grants access to multiple WhatsApp Business Accounts; reconnect and select exactly one account")
+		}
+
+		a.Log.Info("Discovered WABA ID", "waba_id", wabaID)
+	} else if _, granted := discoveredWABAIDs[wabaID]; !granted {
+		return "", "", "", nil, nil, errors.New("the selected WhatsApp Business Account is not granted by the embedded signup token")
+	}
+	if len(messagingTargetIDs) > 0 {
+		if _, granted := messagingTargetIDs[wabaID]; !granted {
+			return "", "", "", nil, nil, errors.New("the selected WhatsApp Business Account is not granted for messaging by the embedded signup token")
+		}
+	}
+
+	phoneID = strings.TrimSpace(phoneID)
 	if phoneID == "" {
-		phonesResp, err := a.WhatsApp.GetWABAPhoneNumbers(ctx, wabaID, accessToken)
+		phonesResp, err := a.WhatsApp.GetWABAPhoneNumbers(ctx, wabaID, accessToken, metaSnapshot.apiVersion)
 		if err != nil {
 			a.Log.Error("Failed to fetch phone numbers from Meta", "error", err)
-			return "", "", "", nil, fmt.Errorf("failed to fetch phone numbers from WABA: %w", err)
+			return "", "", "", nil, nil, fmt.Errorf("failed to fetch phone numbers from WABA: %w", err)
 		}
 
 		if len(phonesResp.Data) == 0 {
-			return "", "", "", nil, fmt.Errorf("no phone numbers found in this WhatsApp Business Account")
+			return "", "", "", nil, nil, fmt.Errorf("no phone numbers found in this WhatsApp Business Account")
 		}
 
 		if len(phonesResp.Data) > 1 {
-			a.Log.Warn("Multiple phone numbers discovered in WABA; picking the first one", "count", len(phonesResp.Data))
+			return "", "", "", nil, nil, fmt.Errorf("multiple phone numbers found in this WhatsApp Business Account; reconnect and select exactly one phone number")
 		}
 
-		// User selects only ONE account in the flow, so we take the first one found.
 		phone := phonesResp.Data[0]
-		phoneID = phone.ID
+		phoneID = strings.TrimSpace(phone.ID)
+		if phoneID == "" {
+			return "", "", "", nil, nil, fmt.Errorf("meta returned a phone number without an ID")
+		}
 		name = fmt.Sprintf("%s (%s)", phone.VerifiedName, phone.DisplayPhoneNumber)
 		a.Log.Info("Discovered Phone ID", "phone_id", phoneID)
 	}
@@ -1267,17 +1876,25 @@ func (a *App) discoverWABAAndPhone(ctx context.Context, orgID uuid.UUID, accessT
 	// object and that Meta lists this exact Phone ID under this exact WABA.
 	// This prevents Embedded Signup payloads from bypassing the same contract
 	// enforced by manual account creation and credential updates.
-	if _, err := a.validateWhatsAppAccountContract(
+	validation, err := a.validateWhatsAppAccountContract(
 		ctx,
 		phoneID,
 		wabaID,
 		accessToken,
-		a.defaultAPIVersion(),
-	); err != nil {
-		return "", "", "", nil, err
+		metaSnapshot.apiVersion,
+	)
+	if err != nil {
+		return "", "", "", nil, nil, err
 	}
 
-	return phoneID, wabaID, name, tokenExpiresAt, nil
+	phoneInfo := &whatsapp.PhoneNumberInfo{
+		VerifiedName:       validation.VerifiedName,
+		DisplayPhoneNumber: validation.PhoneNumber,
+		QualityRating:      validation.QualityRating,
+		IsOnBizApp:         validation.IsOnBizApp,
+		PlatformType:       validation.PlatformType,
+	}
+	return phoneID, wabaID, name, tokenExpiresAt, phoneInfo, nil
 }
 
 func (a *App) debugAndValidateMetaAccessToken(
@@ -1293,10 +1910,19 @@ func (a *App) debugAndValidateMetaAccessToken(
 		a.Log.Error("Failed to resolve Meta integration for access token validation")
 		return nil, nil, errMetaTokenValidationUnavailable
 	}
-	if strings.TrimSpace(appID) == "" {
+	return a.debugAndValidateMetaAccessTokenWithCredentials(ctx, accessToken, appID, appSecret)
+}
+
+func (a *App) debugAndValidateMetaAccessTokenWithCredentials(
+	ctx context.Context,
+	accessToken, appID, appSecret string,
+) (*whatsapp.TokenDebugInfo, *time.Time, error) {
+	appID = strings.TrimSpace(appID)
+	appSecret = strings.TrimSpace(appSecret)
+	if appID == "" {
 		return nil, nil, errMetaAppIDNotConfigured
 	}
-	if strings.TrimSpace(appSecret) == "" {
+	if appSecret == "" {
 		return nil, nil, errMetaAppSecretNotConfigured
 	}
 	if a.WhatsApp == nil {
@@ -1457,43 +2083,38 @@ func (a *App) createOrUpdateAccount(ctx context.Context, orgID uuid.UUID, phoneI
 	return &account, phoneInfo, existingAccount, oldAccount, nil
 }
 
-func (a *App) attemptAutoRegistration(ctx context.Context, account *models.WhatsAppAccount, phoneInfo *whatsapp.PhoneNumberInfo, accessToken, priorStatus string) error {
+func (a *App) attemptEmbeddedSignupRegistration(
+	ctx context.Context,
+	account *models.WhatsAppAccount,
+	accessToken, registrationPIN string,
+) error {
 	if account.IsSMB {
-		account.Status = "active"
-		account.Pin = ""
-		a.Log.Info("SMB account detected via Meta API, skipped registration, setting to active", "phone_id", account.PhoneID)
+		a.Log.Info("SMB account detected via Meta API; registration call skipped", "phone_id", account.PhoneID)
 		return nil
 	}
-
-	generatedPin, err := generateNumericPIN(6)
-	if err != nil {
-		return fmt.Errorf("failed to generate secure random PIN: %w", err)
+	if len(registrationPIN) != 6 {
+		return errors.New("embedded signup registration PIN is unavailable")
 	}
 
 	a.Log.Info("Attempting phone number auto-registration", "phone_id", account.PhoneID)
-	regErr := a.WhatsApp.RegisterPhoneNumber(ctx, account.PhoneID, generatedPin, accessToken, account.APIVersion)
+	regErr := a.WhatsApp.RegisterPhoneNumber(ctx, account.PhoneID, registrationPIN, accessToken, account.APIVersion)
 
 	if regErr == nil {
-		account.Status = "active"
-		account.Pin = generatedPin
 		a.Log.Info("Phone number auto-registration successful", "phone_id", account.PhoneID)
 	} else {
 		a.Log.Warn("Phone number auto-registration failed",
-			"error", regErr,
-			"phone_id", account.PhoneID)
-		if priorStatus != "" {
-			account.Status = priorStatus
-		} else {
-			account.Status = "pending_registration"
-		}
+			"phone_id", account.PhoneID,
+			"definite_provider_rejection", whatsapp.IsDefiniteProviderRejection(regErr))
 	}
 
 	return regErr
 }
 
-// RegisterPhoneNumber registers the phone number with Two-Step Verification
+// RegisterPhoneNumber reconciles a durable Embedded Signup registration claim.
+// The exact PIN was encrypted and committed before the original Meta mutation;
+// this endpoint only reuses that candidate and never accepts or reveals a PIN.
 func (a *App) RegisterPhoneNumber(r *fastglue.Request) error {
-	orgID, userID, err := a.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
+	orgID, err := a.requireExplicitOrganization(r)
 	if err != nil {
 		return nil
 	}
@@ -1503,74 +2124,218 @@ func (a *App) RegisterPhoneNumber(r *fastglue.Request) error {
 		return nil
 	}
 
-	var req struct {
-		Pin string `json:"pin"` // Optional custom PIN
+	// An empty JSON object is tolerated for older clients, but caller-selected
+	// PINs or any other recovery inputs are deliberately unsupported.
+	if body := strings.TrimSpace(string(r.RequestCtx.PostBody())); body != "" && body != "null" {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(body), &fields); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid request body", nil, "")
+		}
+		if len(fields) != 0 {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Registration recovery does not accept request fields", nil, "")
+		}
 	}
-	_ = r.Decode(&req, "json")
+	type registrationRecoverySnapshot struct {
+		accountID             uuid.UUID
+		phoneID               string
+		apiVersion            string
+		accessToken           string
+		accessTokenCiphertext string
+		pin                   string
+		pinCiphertext         string
+		oldAccount            models.WhatsAppAccount
+	}
+	var snapshot registrationRecoverySnapshot
+	var userID uuid.UUID
 
-	account, err := a.resolveWhatsAppAccountByID(r, id, orgID)
-	if err != nil {
+	err = a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		resolvedOrgID, resolvedUserID, authErr := scoped.requireAuth(r, models.ResourceAccounts, models.ActionWrite)
+		if authErr != nil {
+			return authErr
+		}
+		if resolvedOrgID != orgID {
+			_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+			return errEnvelopeSent
+		}
+		userID = resolvedUserID
+
+		var account models.WhatsAppAccount
+		if loadErr := scoped.DB.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", id, orgID).
+			First(&account).Error; loadErr != nil {
+			return loadErr
+		}
+		if strings.TrimSpace(account.Status) != "pending_registration" || account.IsSMB {
+			return errRegistrationRecoveryStatus
+		}
+
+		encryptionKey := strings.TrimSpace(scoped.integrationEncryptionKey())
+		if encryptionKey == "" {
+			return errAccountEncryptionUnavailable
+		}
+		accessToken, decryptErr := crypto.Decrypt(account.AccessToken, encryptionKey)
+		if decryptErr != nil || strings.TrimSpace(accessToken) == "" || crypto.IsEncrypted(accessToken) {
+			return errRegistrationRecoveryCredentials
+		}
+		pin, decryptErr := crypto.Decrypt(account.Pin, encryptionKey)
+		if decryptErr != nil || !isSixDigitPIN(pin) {
+			return errRegistrationRecoveryCredentials
+		}
+
+		// Normalize any legacy plaintext claim to encrypted storage and commit it
+		// before Meta sees the candidate. No candidate is ever generated here.
+		accessTokenCiphertext := account.AccessToken
+		pinCiphertext := account.Pin
+		if !crypto.IsEncrypted(accessTokenCiphertext) || !crypto.IsEncrypted(pinCiphertext) {
+			accessTokenCiphertext, decryptErr = crypto.Encrypt(accessToken, encryptionKey)
+			if decryptErr != nil {
+				return decryptErr
+			}
+			pinCiphertext, decryptErr = crypto.Encrypt(pin, encryptionKey)
+			if decryptErr != nil {
+				return decryptErr
+			}
+			if updateErr := scoped.DB.Model(&models.WhatsAppAccount{}).
+				Where("id = ? AND organization_id = ? AND status = ?", account.ID, orgID, "pending_registration").
+				Updates(map[string]any{
+					"access_token": accessTokenCiphertext,
+					"pin":          pinCiphertext,
+				}).Error; updateErr != nil {
+				return updateErr
+			}
+			account.AccessToken = accessTokenCiphertext
+			account.Pin = pinCiphertext
+		}
+
+		snapshot = registrationRecoverySnapshot{
+			accountID:             account.ID,
+			phoneID:               strings.TrimSpace(account.PhoneID),
+			apiVersion:            strings.TrimSpace(account.APIVersion),
+			accessToken:           strings.TrimSpace(accessToken),
+			accessTokenCiphertext: accessTokenCiphertext,
+			pin:                   pin,
+			pinCiphertext:         pinCiphertext,
+			oldAccount:            account,
+		}
+		return nil
+	})
+	if errors.Is(err, errEnvelopeSent) {
 		return nil
 	}
-
-	oldAccount := *account
-
-	// If PIN is not provided, generate a random one
-	pin := req.Pin
-	if pin == "" {
-		var err error
-		pin, err = generateNumericPIN(6)
-		if err != nil {
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate secure random PIN", nil, "")
+	if err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Account not found", nil, "")
+		case errors.Is(err, errRegistrationRecoveryStatus):
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account is not pending phone registration", nil, "")
+		case errors.Is(err, errRegistrationRecoveryCredentials):
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp registration recovery is unavailable for this account", nil, "")
+		case errors.Is(err, errAccountEncryptionUnavailable):
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+		default:
+			a.Log.Error("Failed to prepare WhatsApp registration recovery", "account_id", id, "organization_id", orgID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to prepare WhatsApp registration recovery", nil, "")
 		}
 	}
+	if a.WhatsApp == nil {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "WhatsApp registration recovery is unavailable", nil, "")
+	}
 
+	// The non-idempotent provider mutation runs without a database transaction.
+	// Any failure remains ambiguous and deliberately leaves the durable claim,
+	// encrypted candidate, and pending status unchanged for another safe retry.
+	a.InvalidateWhatsAppAccountCache(snapshot.phoneID)
 	ctx, cancel := context.WithTimeout(requestContext(r), 30*time.Second)
 	defer cancel()
+	if regErr := a.WhatsApp.RegisterPhoneNumber(
+		ctx,
+		snapshot.phoneID,
+		snapshot.pin,
+		snapshot.accessToken,
+		snapshot.apiVersion,
+	); regErr != nil {
+		a.Log.Warn("WhatsApp registration recovery was not confirmed", "account_id", snapshot.accountID)
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadGateway,
+			"WhatsApp registration could not be confirmed; the account remains pending registration",
+			nil,
+			"",
+		)
+	}
 
-	// Check if this is an SMB phone — SMB numbers are already registered
-	// via the Business App and don't support the two-step registration API.
-	if account.IsSMB {
-		a.Log.Info("Manual registration: SMB account detected, skipping registration", "phone_id", account.PhoneID)
-		pin = ""
-	} else {
-		// Call Meta Register endpoint using WhatsApp service
-		if err := a.WhatsApp.RegisterPhoneNumber(ctx, account.PhoneID, pin, account.AccessToken, account.APIVersion); err != nil {
-			a.Log.Error("Manual registration failed", "error", err)
-			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	var updated models.WhatsAppAccount
+	err = a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		result := scoped.DB.Model(&models.WhatsAppAccount{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ? AND access_token = ? AND pin = ?",
+				snapshot.accountID,
+				orgID,
+				"pending_registration",
+				snapshot.accessTokenCiphertext,
+				snapshot.pinCiphertext,
+			).
+			Updates(map[string]any{
+				"status":        "pending_subscription",
+				"updated_by_id": userID,
+			})
+		if result.Error != nil {
+			return result.Error
 		}
-	}
-
-	// Success
-	account.Status = "active"
-	account.Pin = pin
-
-	// Encrypt secrets before saving
-	if err := a.encryptAccountSecrets(account); err != nil {
-		a.Log.Error("Failed to encrypt account secrets", "error", err)
-		if errors.Is(err, errAccountEncryptionUnavailable) {
-			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Account credential storage is unavailable", nil, "")
+		if result.RowsAffected != 1 {
+			return errRegistrationRecoverySuperseded
 		}
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, err.Error(), nil, "")
-	}
-
-	if err := a.DB.Save(account).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account status", nil, "")
-	}
-
-	// Invalidate cache
-	a.InvalidateWhatsAppAccountCache(account.PhoneID)
-
-	// Log audit!
-	a.DB.Preload("CreatedBy").Preload("UpdatedBy").First(account, "id = ?", account.ID)
-	a.logAudit(orgID, userID,
-		"account", account.ID, models.AuditActionUpdated, &oldAccount, account)
-
-	return r.SendEnvelope(map[string]interface{}{
-		"success": true,
-		"message": "Phone number registered successfully",
-		"pin":     pin,
+		if loadErr := scoped.DB.Preload("CreatedBy").Preload("UpdatedBy").
+			Where("id = ? AND organization_id = ?", snapshot.accountID, orgID).
+			First(&updated).Error; loadErr != nil {
+			return loadErr
+		}
+		scoped.logAudit(
+			orgID,
+			userID,
+			"account",
+			updated.ID,
+			models.AuditActionUpdated,
+			&snapshot.oldAccount,
+			&updated,
+		)
+		return nil
 	})
+	a.InvalidateWhatsAppAccountCache(snapshot.phoneID)
+	if err != nil {
+		if errors.Is(err, errRegistrationRecoverySuperseded) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp registration recovery was replaced by a newer request", nil, "")
+		}
+		a.Log.Error("Failed to persist WhatsApp registration recovery status", "account_id", snapshot.accountID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Registration succeeded but its status could not be saved", nil, "")
+	}
+
+	return r.SendEnvelope(map[string]any{
+		"success": true,
+		"message": "Phone registration confirmed. Subscribe the account to finish setup.",
+		"status":  "pending_subscription",
+		"account": accountToResponse(updated),
+	})
+}
+
+func isSixDigitPIN(pin string) bool {
+	if len(pin) != 6 {
+		return false
+	}
+	for _, digit := range pin {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func embeddedSignupRecoveryLockedStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "pending_registration", "pending_subscription", "subscription_failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func generateNumericPIN(length int) (string, error) {
