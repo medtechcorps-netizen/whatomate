@@ -76,6 +76,17 @@ redis.call("ZADD", KEYS[2], ARGV[2], ARGV[1])
 return attempts
 `)
 
+	parkInboundScript = redis.NewScript(`
+if redis.call("EXISTS", KEYS[3]) == 0 then
+	redis.call("ZREM", KEYS[1], ARGV[1])
+	redis.call("ZREM", KEYS[2], ARGV[1])
+	return 0
+end
+redis.call("ZREM", KEYS[1], ARGV[1])
+redis.call("ZADD", KEYS[2], ARGV[2], ARGV[1])
+return 1
+`)
+
 	deadInboundScript = redis.NewScript(`
 redis.call("ZREM", KEYS[1], ARGV[1])
 redis.call("ZREM", KEYS[2], ARGV[1])
@@ -315,6 +326,27 @@ func (s *RedisStore) RetryInbound(
 		return -result, true, nil
 	}
 	return result, false, nil
+}
+
+// ParkInbound releases a claimed job back to the due queue without consuming
+// its delivery retry budget. It is reserved for a recoverable control-plane
+// quarantine such as stale ownership; revoked/missing bindings are still sent
+// directly to the dead-letter path.
+func (s *RedisStore) ParkInbound(ctx context.Context, jobID string, next time.Time) error {
+	if _, err := parkInboundScript.Run(
+		ctx,
+		s.client,
+		[]string{
+			s.prefix + "inbound:processing",
+			s.prefix + "inbound:due",
+			s.inboundJobKey(jobID),
+		},
+		jobID,
+		next.UTC().UnixMilli(),
+	).Result(); err != nil {
+		return fmt.Errorf("park inbound job: %w", err)
+	}
+	return nil
 }
 
 func (s *RedisStore) DeadInbound(ctx context.Context, jobID, reason string) error {

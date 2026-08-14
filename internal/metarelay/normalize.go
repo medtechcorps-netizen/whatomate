@@ -2,9 +2,11 @@ package metarelay
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -71,6 +73,19 @@ func normalizeInboundWithLimit(
 	raw []byte,
 	maxCanonicalBodyBytes int,
 ) ([]InboundJob, error) {
+	return normalizeInboundResolvedWithLimit(
+		context.Background(), config, nil, webhookApp, raw, maxCanonicalBodyBytes,
+	)
+}
+
+func normalizeInboundResolvedWithLimit(
+	ctx context.Context,
+	config *Config,
+	resolver RegistryResolver,
+	webhookApp WebhookApp,
+	raw []byte,
+	maxCanonicalBodyBytes int,
+) ([]InboundJob, error) {
 	if config == nil {
 		return nil, errorsWrap(ErrInvalidMetaPayload, "configuration is missing")
 	}
@@ -102,12 +117,23 @@ func normalizeInboundWithLimit(
 	}
 
 	eventsByAccount := make(map[string][]channelapi.InboundEvent)
+	resolvedAccounts := make(map[string]*AccountConfig)
 	accountOrder := make([]string, 0, len(payload.Entry))
 	seenAccount := make(map[string]bool)
 
 	for entryIndex, entry := range payload.Entry {
 		entry.ID = strings.TrimSpace(entry.ID)
 		account, ok := config.account(channel, entry.ID)
+		if !ok && resolver != nil {
+			resolved, resolveErr := resolver.Resolve(ctx, channel, entry.ID, true)
+			if resolveErr == nil {
+				account, ok = resolved, true
+			} else if errors.Is(resolveErr, ErrRegistryStale) {
+				return nil, fmt.Errorf("%w: registry binding", ErrRegistryStale)
+			} else if errors.Is(resolveErr, ErrRegistryUnavailable) {
+				return nil, fmt.Errorf("%w: registry lookup", ErrRegistryUnavailable)
+			}
+		}
 		if !ok {
 			return nil, fmt.Errorf("%w: object=%s entry=%q", ErrUnknownAccount, payload.Object, entry.ID)
 		}
@@ -119,6 +145,12 @@ func normalizeInboundWithLimit(
 				entry.ID,
 			)
 		}
+		if prior := resolvedAccounts[account.Key]; prior != nil &&
+			(prior.Channel != account.Channel || prior.ExternalAccountID != account.ExternalAccountID ||
+				registryFence(prior) != registryFence(account)) {
+			return nil, fmt.Errorf("%w: account key collision", ErrInvalidMetaPayload)
+		}
+		resolvedAccounts[account.Key] = account
 		if !seenAccount[account.Key] {
 			accountOrder = append(accountOrder, account.Key)
 			seenAccount[account.Key] = true
@@ -205,8 +237,8 @@ func normalizeInboundWithLimit(
 		if len(events) == 0 {
 			continue
 		}
-		account, ok := config.accountByKey(accountKey)
-		if !ok {
+		account := resolvedAccounts[accountKey]
+		if account == nil {
 			return nil, fmt.Errorf("%w: account mapping changed during normalization", ErrUnknownAccount)
 		}
 		accountJobs, err := canonicalInboundJobs(
@@ -267,9 +299,13 @@ func canonicalInboundJobs(
 		}
 		body = append(body, suffix...)
 		jobs = append(jobs, InboundJob{
-			ID:         digestHex(bytes.Join([][]byte{[]byte(account.Key), body}, []byte{'\n'})),
-			AccountKey: account.Key,
-			Body:       body,
+			SchemaVersion:     InboundJobSchemaVersion,
+			ID:                digestHex(bytes.Join([][]byte{[]byte(account.Key), body}, []byte{'\n'})),
+			AccountKey:        account.Key,
+			Channel:           account.Channel,
+			ExternalAccountID: account.ExternalAccountID,
+			RegistryFence:     registryFence(account),
+			Body:              body,
 		})
 		eventBodies = eventBodies[:0]
 		currentSize = baseSize

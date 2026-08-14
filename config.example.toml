@@ -162,6 +162,17 @@ udp_port_max = 10100          # WebRTC UDP port range end
 # secret = "your-coturn-static-auth-secret"
 # credential_ttl = 86400
 
+# Private Meta relay registry protocol defaults. Split A is deliberately
+# static-only: setting service_secret/relay_edge_secret makes startup fail until
+# the complete OAuth/reconnect/disconnect/revalidation/deauthorization lifecycle
+# ships. Do not add either secret to production yet.
+[meta_registry]
+lease_seconds = 30
+ownership_max_age_mins = 1440
+replay_window_seconds = 300
+# service_secret = "reserved-for-lifecycle-release"
+# relay_edge_secret = "reserved-separate-outer-service-credential"
+
 # Default admin credentials (only used during initial setup when no users exist)
 [default_admin]
 email = "admin@rereply.app"

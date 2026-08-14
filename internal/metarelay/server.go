@@ -97,6 +97,11 @@ func NewServer(config *Config, store ServerStore, options ...ServerOption) (*Ser
 	for _, option := range options {
 		option(server)
 	}
+	registry, err := NewRegistryClient(config, nil)
+	if err != nil {
+		return nil, err
+	}
+	server.registry = registry
 	if server.outboundTimeout <= 0 || server.settlementTimeout <= 0 {
 		return nil, errors.New("outbound relay timeouts must be positive")
 	}
@@ -195,7 +200,15 @@ func (s *Server) handleMetaWebhook(
 		writeError(w, http.StatusUnauthorized, "invalid_signature")
 		return
 	}
-	jobs, err := NormalizeInbound(s.config, webhookApp, raw)
+	// Meta expects acknowledgement within five seconds. Registry resolution
+	// and durable acceptance share one four-second budget rather than each
+	// receiving an independent timeout.
+	ctx, cancel := context.WithTimeout(request.Context(), 4*time.Second)
+	defer cancel()
+	jobs, err := normalizeInboundResolvedWithLimit(
+		ctx, s.config, s.registry, webhookApp, raw,
+		channelapi.RelayCanonicalWebhookMaxBodyBytes,
+	)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrUnknownAccount), errors.Is(err, ErrWebhookAppMismatch):
@@ -204,17 +217,18 @@ func (s *Server) handleMetaWebhook(
 			writeError(w, http.StatusUnprocessableEntity, "unsupported_object")
 		case errors.Is(err, ErrCanonicalJobTooLarge):
 			writeError(w, http.StatusRequestEntityTooLarge, "canonical_payload_too_large")
+		case errors.Is(err, ErrRegistryUnavailable):
+			writeError(w, http.StatusServiceUnavailable, "registry_unavailable")
+		case errors.Is(err, ErrRegistryStale):
+			writeError(w, http.StatusServiceUnavailable, "registry_binding_stale")
 		default:
 			writeError(w, http.StatusBadRequest, "invalid_payload")
 		}
 		return
 	}
 
-	// Meta requires acknowledgement within five seconds. We reserve one second
-	// for parsing/network overhead and only acknowledge after this atomic Redis
-	// operation has durably stored all canonical jobs (or the no-op marker).
-	ctx, cancel := context.WithTimeout(request.Context(), 4*time.Second)
-	defer cancel()
+	// Acknowledge only after this atomic Redis operation has durably stored all
+	// canonical jobs (or the no-op marker) inside the shared deadline.
 	acceptanceID := digestHex(raw)
 	if _, err := s.store.AcceptInbound(ctx, acceptanceID, jobs); err != nil {
 		s.logger.Error("Meta delivery was not durably accepted", "component", "inbound_accept")
@@ -238,8 +252,20 @@ func (s *Server) webhookCredentials(webhookApp WebhookApp) (string, string, bool
 }
 
 func (s *Server) handleAccountHealth(w http.ResponseWriter, request *http.Request) {
-	account, ok := s.accountFromPath(request)
-	if !ok {
+	account, err := s.accountFromPath(request, false)
+	if err != nil {
+		if errors.Is(err, ErrRegistryStale) {
+			writeError(w, http.StatusServiceUnavailable, "registry_binding_stale")
+			return
+		}
+		if errors.Is(err, ErrRegistryUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, "registry_unavailable")
+			return
+		}
+		if errors.Is(err, ErrRegistryUnauthorized) {
+			writeError(w, http.StatusUnauthorized, "service_authentication_required")
+			return
+		}
 		writeError(w, http.StatusNotFound, "unknown_account")
 		return
 	}
@@ -352,8 +378,20 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 }
 
 func (s *Server) handleReReplyOutbound(w http.ResponseWriter, request *http.Request) {
-	account, ok := s.accountFromPath(request)
-	if !ok {
+	account, err := s.accountFromPath(request, false)
+	if err != nil {
+		if errors.Is(err, ErrRegistryStale) {
+			writeError(w, http.StatusServiceUnavailable, "registry_binding_stale")
+			return
+		}
+		if errors.Is(err, ErrRegistryUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, "registry_unavailable")
+			return
+		}
+		if errors.Is(err, ErrRegistryUnauthorized) {
+			writeError(w, http.StatusUnauthorized, "service_authentication_required")
+			return
+		}
 		writeError(w, http.StatusNotFound, "unknown_account")
 		return
 	}
@@ -509,10 +547,22 @@ func (s *Server) markOutboundAmbiguous(
 	return s.store.MarkOutboundAmbiguous(settleCtx, key, digest)
 }
 
-func (s *Server) accountFromPath(request *http.Request) (*AccountConfig, bool) {
+func (s *Server) accountFromPath(request *http.Request, allowCache bool) (*AccountConfig, error) {
 	channel := models.Channel(strings.ToLower(strings.TrimSpace(request.PathValue("channel"))))
 	externalID := strings.TrimSpace(request.PathValue("externalID"))
-	return s.config.account(channel, externalID)
+	if account, ok := s.config.account(channel, externalID); ok {
+		return account, nil
+	}
+	if s.registry == nil {
+		return nil, ErrRegistryNotFound
+	}
+	if len(s.config.RegistryEdgeSecret) < 32 || !constantTimeEqual(
+		request.Header.Get(RelayServiceTokenHeader),
+		s.config.RegistryEdgeSecret,
+	) {
+		return nil, ErrRegistryUnauthorized
+	}
+	return s.registry.Resolve(request.Context(), channel, externalID, allowCache)
 }
 
 type graphResult struct {
