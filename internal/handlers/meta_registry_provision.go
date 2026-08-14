@@ -49,7 +49,7 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 	if a == nil || a.DB == nil || a.Config == nil || a.tenantOrgID == uuid.Nil ||
 		input.OrganizationID != a.tenantOrgID || input.UserID == uuid.Nil ||
 		strings.TrimSpace(a.Config.App.EncryptionKey) == "" {
-		return metaRegistryProvisionResult{}, errors.New("Meta registry tenant scope is unavailable")
+		return metaRegistryProvisionResult{}, errors.New("meta registry tenant scope is unavailable")
 	}
 	input.Name = strings.TrimSpace(input.Name)
 	input.ExternalAccountID = strings.TrimSpace(input.ExternalAccountID)
@@ -119,7 +119,7 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 	encrypt := func(value string) (string, error) {
 		ciphertext, encryptErr := appcrypto.Encrypt(value, a.Config.App.EncryptionKey)
 		if encryptErr != nil || !appcrypto.IsEncrypted(ciphertext) {
-			return "", errors.New("Meta registry credential encryption failed")
+			return "", errors.New("meta registry credential encryption failed")
 		}
 		return ciphertext, nil
 	}

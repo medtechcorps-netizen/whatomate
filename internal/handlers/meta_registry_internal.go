@@ -300,7 +300,7 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 	parsed, err := url.Parse(webhookURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
 		parsed.Fragment != "" || parsed.RawQuery != "" {
-		return metaregistry.Binding{}, errors.New("Meta registry webhook URL is invalid")
+		return metaregistry.Binding{}, errors.New("meta registry webhook URL is invalid")
 	}
 	lease := time.Duration(a.Config.MetaRegistry.LeaseSeconds) * time.Second
 	if lease < 5*time.Second || lease > 5*time.Minute {
@@ -383,7 +383,8 @@ func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, ou
 		metadata["meta_ownership_reason"] = request.Reason
 	}
 	newStatus := account.Status
-	if outcome == metaregistry.OwnershipRevoked {
+	switch outcome {
+	case metaregistry.OwnershipRevoked:
 		metadata["meta_deauthorized_at"] = request.CheckedAt.Format(time.RFC3339Nano)
 		newStatus = models.ChannelAccountStatusDisconnected
 		for i := range credentials {
@@ -399,9 +400,9 @@ func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, ou
 				return false, metaregistry.ErrNotFound
 			}
 		}
-	} else if outcome == metaregistry.OwnershipStale {
+	case metaregistry.OwnershipStale:
 		newStatus = models.ChannelAccountStatusDegraded
-	} else if outcome == metaregistry.OwnershipVerified {
+	case metaregistry.OwnershipVerified:
 		newStatus = models.ChannelAccountStatusActive
 	}
 	updates := map[string]any{"metadata": metadata, "status": newStatus}

@@ -59,7 +59,7 @@ func NewRegistryClient(config *Config, client *http.Client) (*RegistryClient, er
 	if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" ||
 		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Opaque != "" || parsed.RawPath != "" ||
 		parsed.Path != metaregistry.ResolvePath || parsed.EscapedPath() != metaregistry.ResolvePath ||
-		(parsed.Scheme != "https" && !(config.allowInsecureTestEndpoints && parsed.Scheme == "http")) {
+		(parsed.Scheme != "https" && (!config.allowInsecureTestEndpoints || parsed.Scheme != "http")) {
 		return nil, ErrRegistryUnavailable
 	}
 	if client == nil {
