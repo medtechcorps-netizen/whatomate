@@ -1033,13 +1033,13 @@ func (c *Client) GetWABAPhoneNumbers(ctx context.Context, wabaID, accessToken, a
 		}
 		after = strings.TrimSpace(page.Paging.Cursors.After)
 		if after == "" {
-			return nil, errors.New("Meta phone-number pagination omitted its continuation cursor")
+			return nil, errors.New("meta phone-number pagination omitted its continuation cursor")
 		}
 		if _, repeated := seenCursors[after]; repeated {
-			return nil, errors.New("Meta phone-number pagination repeated a continuation cursor")
+			return nil, errors.New("meta phone-number pagination repeated a continuation cursor")
 		}
 		seenCursors[after] = struct{}{}
 	}
 
-	return nil, fmt.Errorf("Meta phone-number pagination exceeded %d pages", maxWABAPhonePages)
+	return nil, fmt.Errorf("meta phone-number pagination exceeded %d pages", maxWABAPhonePages)
 }

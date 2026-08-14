@@ -314,10 +314,10 @@ func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount,
 		if err == nil && cached != "" {
 			var cacheData whatsAppAccountCache
 			if err := json.Unmarshal([]byte(cached), &cacheData); err == nil {
-				cacheMatchesRequest := strings.TrimSpace(cacheData.WhatsAppAccount.PhoneID) == phoneID
+				cacheMatchesRequest := strings.TrimSpace(cacheData.PhoneID) == phoneID
 				if a.hasTenantScope() {
 					cacheMatchesRequest = cacheMatchesRequest &&
-						cacheData.WhatsAppAccount.OrganizationID == a.tenantOrgID
+						cacheData.OrganizationID == a.tenantOrgID
 				}
 				if !cacheMatchesRequest {
 					// A global phone key can outlive a soft-delete/reclaim. Never
@@ -327,7 +327,7 @@ func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount,
 					cacheData.WhatsAppAccount.AccessToken = cacheData.AccessToken
 					cacheData.WhatsAppAccount.AppSecret = cacheData.AppSecret
 					cacheData.WhatsAppAccount.Pin = cacheData.Pin
-					cacheData.WhatsAppAccount.PhoneID = phoneID
+					cacheData.PhoneID = phoneID
 					if err := a.prepareWhatsAppAccountForRuntime(&cacheData.WhatsAppAccount); err != nil {
 						return nil, err
 					}

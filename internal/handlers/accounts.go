@@ -1682,7 +1682,7 @@ func (a *App) claimEmbeddedSignupAccount(
 				}
 			}
 		case errors.Is(lookupErr, gorm.ErrRecordNotFound):
-			account.BaseModel.ID = uuid.New()
+			account.ID = uuid.New()
 			account.CreatedByID = &userID
 			initializeOperationalFields = true
 		default:
@@ -1866,7 +1866,7 @@ func (a *App) discoverWABAAndPhone(
 		phone := phonesResp.Data[0]
 		phoneID = strings.TrimSpace(phone.ID)
 		if phoneID == "" {
-			return "", "", "", nil, nil, fmt.Errorf("Meta returned a phone number without an ID")
+			return "", "", "", nil, nil, fmt.Errorf("meta returned a phone number without an ID")
 		}
 		name = fmt.Sprintf("%s (%s)", phone.VerifiedName, phone.DisplayPhoneNumber)
 		a.Log.Info("Discovered Phone ID", "phone_id", phoneID)
