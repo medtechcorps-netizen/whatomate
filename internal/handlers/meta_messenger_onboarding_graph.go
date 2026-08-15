@@ -231,7 +231,11 @@ func (a *App) inspectMetaMessengerToken(
 	}
 	var response metaMessengerTokenDebugResponse
 	appAccessToken := settings.AppID + "|" + settings.AppSecret
-	err = a.doMetaMessengerGraphJSON(ctx, http.MethodPost, "debug_token", url.Values{
+	// Meta exposes debug_token as a read-only GET edge and requires the token
+	// being inspected in input_token. Keep the app access token in the
+	// Authorization header; doMetaMessengerGraphJSON also discards transport
+	// errors that could echo the required query string.
+	err = a.doMetaMessengerGraphJSON(ctx, http.MethodGet, "debug_token", url.Values{
 		"input_token": {strings.TrimSpace(accessToken)},
 	}, appAccessToken, &response)
 	if err != nil {
