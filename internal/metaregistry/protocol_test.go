@@ -49,8 +49,9 @@ func TestBindingValidationRequiresShortLivedCompleteLease(t *testing.T) {
 	binding := Binding{
 		SchemaVersion: SchemaVersion, LeaseID: uuid.New(), LeaseExpiresAt: now.Add(time.Minute),
 		OrganizationID: uuid.New(), ChannelAccountID: uuid.New(), Channel: models.ChannelMessenger,
-		ExternalAccountID: "page-1", ReReplyWebhookURL: "https://app.example.test/api/webhooks/channels/a",
-		AccessToken: "token", InboundSecret: "inbound", OutboundSecret: "outbound",
+		ExternalAccountID: "page-1", PlatformAppID: "123456",
+		ReReplyWebhookURL: "https://app.example.test/api/webhooks/channels/a",
+		AccessToken:       "token", InboundSecret: "inbound", OutboundSecret: "outbound",
 		CredentialID: uuid.New(), CredentialVersion: 2, OwnershipCheckedAt: now,
 		WebhookCredentialID: uuid.New(), WebhookCredentialVersion: 3,
 	}

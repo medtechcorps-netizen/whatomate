@@ -3,6 +3,9 @@ package metarelay
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +13,59 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 )
+
+func TestDynamicMessengerOutboundUsesAppSecretProofWithoutChangingStaticCompatibility(t *testing.T) {
+	config := newTestConfig(t)
+	static, _ := config.accountByKey("messenger-page")
+	dynamic := *static
+	dynamic.registryManaged = true
+	config.ManagedMessengerAppSecret = "managed-messenger-app-secret-at-least-32-bytes"
+
+	mac := hmac.New(sha256.New, []byte(config.ManagedMessengerAppSecret))
+	_, _ = mac.Write([]byte(dynamic.accessToken))
+	wantProof := hex.EncodeToString(mac.Sum(nil))
+	var graphCalls atomic.Int32
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		call := graphCalls.Add(1)
+		if got := request.URL.Query().Get("appsecret_proof"); (call == 1 && got != wantProof) || (call == 2 && got != "") {
+			t.Errorf("call %d appsecret_proof = %q", call, got)
+		}
+		if strings.Contains(request.URL.String(), dynamic.accessToken) ||
+			strings.Contains(request.URL.String(), config.ManagedMessengerAppSecret) {
+			t.Errorf("dynamic outbound URL exposed a credential: %s", request.URL.String())
+		}
+		if request.Header.Get("Authorization") != "Bearer "+dynamic.accessToken {
+			t.Error("dynamic outbound did not use the exact Page token")
+		}
+		_, _ = w.Write([]byte(`{"recipient_id":"customer-1","message_id":"dynamic-mid"}`))
+	}))
+	defer graph.Close()
+	server, err := NewServer(config, newMemoryServerStore(), withGraphBases(graph.URL, "http://instagram.invalid"))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	result := server.sendGraph(t.Context(), &dynamic, channelapi.OutboundMessage{
+		Recipient: channelapi.Participant{ExternalID: "customer-1"},
+		Parts:     []channelapi.MessagePart{{Type: "text", Text: "hello"}},
+	})
+	if result.status != http.StatusOK {
+		t.Fatalf("dynamic outbound status = %d (%s)", result.status, result.body)
+	}
+
+	staticResult := server.sendGraph(t.Context(), static, channelapi.OutboundMessage{
+		Recipient: channelapi.Participant{ExternalID: "customer-1"},
+		Parts:     []channelapi.MessagePart{{Type: "text", Text: "hello"}},
+	})
+	if staticResult.status != http.StatusOK {
+		t.Fatalf("static outbound status = %d (%s)", staticResult.status, staticResult.body)
+	}
+	if graphCalls.Load() != 2 {
+		t.Fatalf("Graph calls = %d, want 2", graphCalls.Load())
+	}
+}
 
 func performOutbound(
 	t *testing.T,

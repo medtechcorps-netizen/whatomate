@@ -96,6 +96,18 @@ async function mockChannels(
   await page.route(/\/api\/organizations(?:\?.*)?$/, route =>
     route.fulfill({ json: { data: { organizations: [organization] } } }),
   )
+  await page.route(
+    /\/api\/integrations\/meta\/messenger\/onboarding\/status(?:\?.*)?$/,
+    route =>
+      route.fulfill({
+        json: {
+          data: {
+            organization_id: organization.id,
+            enabled: false,
+          },
+        },
+      }),
+  )
   await page.route(/\/api\/product\/entitlements(?:\?.*)?$/, route =>
     route.fulfill({
       json: {

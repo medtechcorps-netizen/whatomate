@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
 )
 
@@ -119,6 +120,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc(
 		"POST /v1/meta/messenger/webhook",
 		s.metaWebhookHandler(WebhookAppMessenger),
+	)
+	mux.HandleFunc(
+		"GET /v1/meta/messenger/managed-webhook",
+		s.metaVerificationHandler(WebhookAppManagedMessenger),
+	)
+	mux.HandleFunc(
+		"POST /v1/meta/messenger/managed-webhook",
+		s.metaWebhookHandler(WebhookAppManagedMessenger),
 	)
 	mux.HandleFunc(
 		"GET /v1/meta/instagram/webhook",
@@ -244,6 +253,11 @@ func (s *Server) webhookCredentials(webhookApp WebhookApp) (string, string, bool
 	switch webhookApp {
 	case WebhookAppMessenger:
 		return s.config.MessengerAppSecret, s.config.MessengerVerifyToken, true
+	case WebhookAppManagedMessenger:
+		if !s.config.RegistryEnabled {
+			return "", "", false
+		}
+		return s.config.ManagedMessengerAppSecret, s.config.ManagedMessengerVerifyToken, true
 	case WebhookAppInstagramLogin:
 		return s.config.InstagramLoginAppSecret, s.config.InstagramLoginVerifyToken, true
 	default:
@@ -252,7 +266,7 @@ func (s *Server) webhookCredentials(webhookApp WebhookApp) (string, string, bool
 }
 
 func (s *Server) handleAccountHealth(w http.ResponseWriter, request *http.Request) {
-	account, err := s.accountFromPath(request, false)
+	account, err := s.accountFromPath(request, metaregistry.ResolvePurposeHealth, false)
 	if err != nil {
 		if errors.Is(err, ErrRegistryStale) {
 			writeError(w, http.StatusServiceUnavailable, "registry_binding_stale")
@@ -325,6 +339,9 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 	}
 	query := parsed.Query()
 	query.Set("fields", fields)
+	if account.registryManaged && account.Channel == models.ChannelMessenger {
+		query.Set("appsecret_proof", metaAccessTokenProof(account.accessToken, s.config.ManagedMessengerAppSecret))
+	}
 	parsed.RawQuery = query.Encode()
 
 	providerRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
@@ -360,6 +377,9 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 		if strings.TrimSpace(binding.ID) != account.ExternalAccountID {
 			return errors.New("graph token is bound to a different Page")
 		}
+		if account.registryManaged {
+			return s.validateMessengerAppSubscription(ctx, account)
+		}
 	case account.Channel == models.ChannelInstagram &&
 		account.InstagramAPIMode == InstagramAPIModeInstagramLogin:
 		if strings.TrimSpace(binding.UserID) != account.ExternalAccountID {
@@ -377,8 +397,75 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 	return nil
 }
 
+func (s *Server) validateMessengerAppSubscription(ctx context.Context, account *AccountConfig) error {
+	if account == nil || strings.TrimSpace(account.PlatformAppID) == "" ||
+		account.PlatformAppID != strings.TrimSpace(s.config.ManagedMessengerAppID) {
+		return errors.New("messenger platform app binding is invalid")
+	}
+	endpoint := fmt.Sprintf(
+		"%s/%s/%s/subscribed_apps",
+		strings.TrimRight(s.facebookGraphBase, "/"),
+		url.PathEscape(s.config.GraphAPIVersion),
+		url.PathEscape(account.ExternalAccountID),
+	)
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return errors.New("invalid Graph subscription health endpoint")
+	}
+	query := parsed.Query()
+	query.Set("fields", "id,subscribed_fields")
+	query.Set("appsecret_proof", metaAccessTokenProof(account.accessToken, s.config.ManagedMessengerAppSecret))
+	parsed.RawQuery = query.Encode()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return errors.New("invalid Graph subscription health request")
+	}
+	request.Header.Set("Authorization", "Bearer "+account.accessToken)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", "ReReply-Meta-Relay/1.0")
+	response, err := s.client.Do(request)
+	if err != nil {
+		return errors.New("graph subscription health transport failure")
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+		_ = response.Body.Close()
+	}()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return errors.New("graph rejected subscription health request")
+	}
+	var result struct {
+		Data []struct {
+			ID               string   `json:"id"`
+			SubscribedFields []string `json:"subscribed_fields"`
+		} `json:"data"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
+	if decoder.Decode(&result) != nil || rejectTrailingJSON(decoder) != nil {
+		return errors.New("graph subscription health response is invalid")
+	}
+	for _, subscription := range result.Data {
+		if strings.TrimSpace(subscription.ID) != account.PlatformAppID {
+			continue
+		}
+		for _, field := range subscription.SubscribedFields {
+			if strings.EqualFold(strings.TrimSpace(field), "messages") {
+				return nil
+			}
+		}
+	}
+	return errors.New("messenger platform app is not subscribed to messages")
+}
+
+func metaAccessTokenProof(accessToken, appSecret string) string {
+	mac := hmac.New(sha256.New, []byte(appSecret))
+	_, _ = mac.Write([]byte(accessToken))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func (s *Server) handleReReplyOutbound(w http.ResponseWriter, request *http.Request) {
-	account, err := s.accountFromPath(request, false)
+	account, err := s.accountFromPath(request, metaregistry.ResolvePurposeOutbound, false)
 	if err != nil {
 		if errors.Is(err, ErrRegistryStale) {
 			writeError(w, http.StatusServiceUnavailable, "registry_binding_stale")
@@ -547,7 +634,7 @@ func (s *Server) markOutboundAmbiguous(
 	return s.store.MarkOutboundAmbiguous(settleCtx, key, digest)
 }
 
-func (s *Server) accountFromPath(request *http.Request, allowCache bool) (*AccountConfig, error) {
+func (s *Server) accountFromPath(request *http.Request, purpose string, allowCache bool) (*AccountConfig, error) {
 	channel := models.Channel(strings.ToLower(strings.TrimSpace(request.PathValue("channel"))))
 	externalID := strings.TrimSpace(request.PathValue("externalID"))
 	if account, ok := s.config.account(channel, externalID); ok {
@@ -562,7 +649,7 @@ func (s *Server) accountFromPath(request *http.Request, allowCache bool) (*Accou
 	) {
 		return nil, ErrRegistryUnauthorized
 	}
-	return s.registry.Resolve(request.Context(), channel, externalID, allowCache)
+	return s.registry.Resolve(request.Context(), channel, externalID, purpose, allowCache)
 }
 
 type graphResult struct {
@@ -611,6 +698,16 @@ func (s *Server) sendGraph(
 		url.PathEscape(s.config.GraphAPIVersion),
 		url.PathEscape(account.ExternalAccountID),
 	)
+	if account.registryManaged && account.Channel == models.ChannelMessenger {
+		parsed, parseErr := url.Parse(endpoint)
+		if parseErr != nil {
+			return graphResult{status: http.StatusInternalServerError, body: errorJSON("provider_request_failed")}
+		}
+		query := parsed.Query()
+		query.Set("appsecret_proof", metaAccessTokenProof(account.accessToken, s.config.ManagedMessengerAppSecret))
+		parsed.RawQuery = query.Encode()
+		endpoint = parsed.String()
+	}
 	providerRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return graphResult{

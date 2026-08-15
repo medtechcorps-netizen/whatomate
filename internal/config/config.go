@@ -5,6 +5,8 @@ import (
 	"crypto/sha1" //nolint:gosec // SHA-1 is mandated by the coturn TURN REST API (RFC draft)
 	"encoding/base64"
 	"errors"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -33,16 +35,39 @@ type Config struct {
 	TTS                 TTSConfig                 `koanf:"tts"`
 	GoogleSearchConsole GoogleSearchConsoleConfig `koanf:"google_search_console"`
 	MetaRegistry        MetaRegistryConfig        `koanf:"meta_registry"`
+	MetaMessenger       MetaMessengerConfig       `koanf:"meta_messenger_onboarding"`
 }
 
 // MetaRegistryConfig protects the private broker used by the isolated Meta
 // relay. ServiceSecret is deployment-managed and never tenant configurable.
 type MetaRegistryConfig struct {
+	Enabled             bool   `koanf:"enabled"`
 	ServiceSecret       string `koanf:"service_secret"`
 	RelayEdgeSecret     string `koanf:"relay_edge_secret"`
 	LeaseSeconds        int    `koanf:"lease_seconds"`
 	OwnershipMaxAgeMins int    `koanf:"ownership_max_age_mins"`
 	ReplayWindowSeconds int    `koanf:"replay_window_seconds"`
+	QueueReaderVersion  int    `koanf:"queue_reader_version"`
+}
+
+// MetaMessengerConfig is the deployment-owned platform-app configuration for
+// Facebook Login for Business. It is deliberately default-off and contains no
+// tenant-selectable app credentials.
+type MetaMessengerConfig struct {
+	Enabled                   bool   `koanf:"enabled"`
+	AppID                     string `koanf:"app_id"`
+	ConfigID                  string `koanf:"config_id"`
+	AppSecret                 string `koanf:"app_secret"`
+	GraphAPIVersion           string `koanf:"graph_api_version"`
+	GraphBaseURL              string `koanf:"graph_base_url"`
+	ReReplyBaseURL            string `koanf:"rereply_base_url"`
+	RelayBaseURL              string `koanf:"relay_base_url"`
+	HealthApprovalMaxAgeMins  int    `koanf:"health_approval_max_age_mins"`
+	RevalidationLeadMins      int    `koanf:"revalidation_lead_mins"`
+	SchedulerIntervalSeconds  int    `koanf:"scheduler_interval_seconds"`
+	AllowedOrganizationIDs    string `koanf:"allowed_organization_ids"`
+	AllowAllOrganizations     bool   `koanf:"allow_all_organizations"`
+	AllowDevelopmentUserToken bool   `koanf:"allow_development_user_token"`
 }
 
 // GoogleSearchConsoleConfig contains deployment-managed OAuth credentials.
@@ -255,14 +280,17 @@ func Load(configPath string) (*Config, error) {
 
 	// Set defaults
 	setDefaults(&cfg)
-	if err := validateMetaRegistryConfig(cfg.MetaRegistry); err != nil {
+	if err := validateMetaRegistryConfig(cfg.MetaRegistry, cfg.MetaMessenger, cfg.App); err != nil {
+		return nil, err
+	}
+	if err := validateMetaMessengerConfig(cfg.MetaMessenger, cfg.MetaRegistry, cfg.App.Environment, cfg.Server); err != nil {
 		return nil, err
 	}
 
 	return &cfg, nil
 }
 
-func validateMetaRegistryConfig(config MetaRegistryConfig) error {
+func validateMetaRegistryConfig(config MetaRegistryConfig, messenger MetaMessengerConfig, app AppConfig) error {
 	serviceSecret := strings.TrimSpace(config.ServiceSecret)
 	edgeSecret := strings.TrimSpace(config.RelayEdgeSecret)
 	if serviceSecret != "" && len(serviceSecret) < 32 {
@@ -280,13 +308,156 @@ func validateMetaRegistryConfig(config MetaRegistryConfig) error {
 		config.ReplayWindowSeconds > 600 {
 		return errors.New("meta registry timing configuration is outside safe bounds")
 	}
-	// Split A is deliberately not production-enableable. The broker contract
-	// can be reviewed and exercised in package tests, but accepting deployment
-	// credentials before OAuth completion/reconnect/disconnect, scheduled Graph
-	// revalidation, signed deauthorization, and rollout draining are all wired
-	// would create a deceptively partial lifecycle.
-	if serviceSecret != "" {
-		return errors.New("meta registry lifecycle is not production-enableable in this foundation release")
+	configured := serviceSecret != "" || edgeSecret != "" || config.Enabled
+	if !config.Enabled && configured {
+		return errors.New("meta registry must be explicitly enabled when service credentials are configured")
+	}
+	if config.Enabled {
+		if serviceSecret == "" || edgeSecret == "" {
+			return errors.New("meta registry service and relay edge secrets are required when enabled")
+		}
+		if !messenger.Enabled {
+			return errors.New("meta registry cannot be enabled before the Messenger lifecycle is enabled")
+		}
+		if config.QueueReaderVersion != 2 {
+			return errors.New("meta registry requires queue reader schema version 2 before producers are enabled")
+		}
+		if strings.TrimSpace(app.EncryptionKey) == "" {
+			return errors.New("app encryption key is required when the Meta registry is enabled")
+		}
+	}
+	return nil
+}
+
+var metaGraphVersionPattern = regexp.MustCompile(`^v[1-9][0-9]*\.[0-9]+$`)
+
+func validateMetaMessengerConfig(
+	config MetaMessengerConfig,
+	registry MetaRegistryConfig,
+	environment string,
+	server ServerConfig,
+) error {
+	if !config.Enabled {
+		if config.AppID != "" || config.ConfigID != "" || config.AppSecret != "" ||
+			config.ReReplyBaseURL != "" || config.RelayBaseURL != "" ||
+			strings.TrimSpace(config.AllowedOrganizationIDs) != "" || config.AllowAllOrganizations ||
+			config.AllowDevelopmentUserToken {
+			return errors.New("messenger onboarding must be explicitly enabled when platform credentials or endpoints are configured")
+		}
+		return nil
+	}
+	if !registry.Enabled {
+		return errors.New("messenger onboarding requires the encrypted Meta registry lifecycle")
+	}
+	if server.WriteTimeout < 120 {
+		return errors.New("messenger onboarding requires server.write_timeout of at least 120 seconds")
+	}
+	allowedOrganizations, err := canonicalMetaMessengerOrganizationAllowlist(config.AllowedOrganizationIDs)
+	if err != nil {
+		return err
+	}
+	if config.AllowAllOrganizations == (len(allowedOrganizations) > 0) {
+		return errors.New("messenger onboarding requires exactly one of an organization allowlist or allow_all_organizations")
+	}
+	production := strings.EqualFold(strings.TrimSpace(environment), "production")
+	if config.AllowAllOrganizations && !production {
+		return errors.New("messenger onboarding allow_all_organizations is reserved for an explicit production release")
+	}
+	if config.AllowDevelopmentUserToken && (production || config.AllowAllOrganizations) {
+		return errors.New("messenger onboarding USER tokens are permitted only for an allowlisted non-production pilot")
+	}
+	if !canonicalNumericMetaID(config.AppID) || !canonicalNumericMetaID(config.ConfigID) {
+		return errors.New("messenger onboarding app_id and config_id must be canonical numeric Meta IDs")
+	}
+	if len(config.AppSecret) < 32 || strings.TrimSpace(config.AppSecret) != config.AppSecret {
+		return errors.New("messenger onboarding app_secret must contain at least 32 bytes without surrounding whitespace")
+	}
+	if !metaGraphVersionPattern.MatchString(strings.TrimSpace(config.GraphAPIVersion)) {
+		return errors.New("messenger onboarding graph_api_version must be explicit, for example v25.0")
+	}
+	if err := validateMetaLifecycleBaseURL(config.GraphBaseURL, production, true); err != nil {
+		return errors.New("messenger onboarding graph_base_url must be an approved absolute HTTPS origin")
+	}
+	if err := validateMetaLifecycleBaseURL(config.ReReplyBaseURL, production, false); err != nil {
+		return errors.New("messenger onboarding rereply_base_url must be an absolute HTTPS base URL")
+	}
+	if err := validateMetaLifecycleBaseURL(config.RelayBaseURL, production, false); err != nil {
+		return errors.New("messenger onboarding relay_base_url must be an absolute HTTPS base URL")
+	}
+	if config.HealthApprovalMaxAgeMins < 1 || config.HealthApprovalMaxAgeMins > 60 ||
+		config.RevalidationLeadMins < 5 || config.RevalidationLeadMins >= registry.OwnershipMaxAgeMins ||
+		config.SchedulerIntervalSeconds < 10 || config.SchedulerIntervalSeconds > 300 {
+		return errors.New("messenger onboarding lifecycle timing configuration is outside safe bounds")
+	}
+	return nil
+}
+
+func canonicalMetaMessengerOrganizationAllowlist(raw string) ([]string, error) {
+	seen := make(map[string]struct{})
+	values := make([]string, 0)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if !canonicalUUID(item) {
+			return nil, errors.New("messenger onboarding allowed_organization_ids must contain canonical UUIDs")
+		}
+		if _, exists := seen[item]; exists {
+			return nil, errors.New("messenger onboarding allowed_organization_ids contains a duplicate UUID")
+		}
+		seen[item] = struct{}{}
+		values = append(values, item)
+	}
+	return values, nil
+}
+
+func canonicalUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for index, character := range value {
+		switch index {
+		case 8, 13, 18, 23:
+			if character != '-' {
+				return false
+			}
+		default:
+			if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func canonicalNumericMetaID(value string) bool {
+	if value == "" || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func validateMetaLifecycleBaseURL(raw string, production, graph bool) error {
+	trimmed := strings.TrimSpace(raw)
+	parsed, err := url.Parse(trimmed)
+	if err != nil || trimmed == "" || parsed.Scheme != "https" || parsed.Host == "" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" ||
+		parsed.ForceQuery || parsed.Opaque != "" {
+		return errors.New("invalid URL")
+	}
+	if graph {
+		if parsed.Path != "" && parsed.Path != "/" {
+			return errors.New("graph URL must be an origin")
+		}
+		if production && (trimmed != "https://graph.facebook.com" || parsed.Host != "graph.facebook.com") {
+			return errors.New("production Graph origin is not pinned")
+		}
 	}
 	return nil
 }
@@ -306,6 +477,21 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.MetaRegistry.ReplayWindowSeconds == 0 {
 		cfg.MetaRegistry.ReplayWindowSeconds = 5 * 60
+	}
+	if cfg.MetaMessenger.GraphAPIVersion == "" {
+		cfg.MetaMessenger.GraphAPIVersion = "v25.0"
+	}
+	if cfg.MetaMessenger.GraphBaseURL == "" {
+		cfg.MetaMessenger.GraphBaseURL = "https://graph.facebook.com"
+	}
+	if cfg.MetaMessenger.HealthApprovalMaxAgeMins == 0 {
+		cfg.MetaMessenger.HealthApprovalMaxAgeMins = 15
+	}
+	if cfg.MetaMessenger.RevalidationLeadMins == 0 {
+		cfg.MetaMessenger.RevalidationLeadMins = 60
+	}
+	if cfg.MetaMessenger.SchedulerIntervalSeconds == 0 {
+		cfg.MetaMessenger.SchedulerIntervalSeconds = 60
 	}
 	if cfg.Server.Host == "" {
 		cfg.Server.Host = "0.0.0.0"

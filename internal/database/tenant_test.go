@@ -251,6 +251,8 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	}
 	require.NoError(t, adminDB.Create(&channelA).Error)
 	require.NoError(t, adminDB.Create(&channelB).Error)
+	metaPlatformAppID := "100000000000001"
+	metaAuthorizingUserID := "900000000000001"
 	metaChannelB := models.ChannelAccount{
 		BaseModel:         models.BaseModel{ID: uuid.New()},
 		OrganizationID:    orgB.ID,
@@ -260,8 +262,15 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		ExternalAccountID: "page-beta-" + uuid.NewString(),
 		Status:            models.ChannelAccountStatusDegraded,
 		Capabilities:      models.JSONB{},
-		Config:            models.JSONB{"meta_registry_managed": true},
-		Metadata:          models.JSONB{},
+		Config: models.JSONB{
+			"meta_registry_managed": true,
+			"meta_management_mode":  "platform_oauth",
+		},
+		Metadata: models.JSONB{
+			"meta_platform_app_id":      metaPlatformAppID,
+			"meta_authorizing_user_id":  metaAuthorizingUserID,
+			"meta_ownership_checked_at": time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano),
+		},
 	}
 	require.NoError(t, adminDB.Create(&metaChannelB).Error)
 	threadsChannelB := models.ChannelAccount{
@@ -466,6 +475,44 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	t.Run("runtime startup verification accepts only the restricted role", func(t *testing.T) {
 		require.Error(t, database.VerifyTenantRLS(adminDB, runtimeRole))
 		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+		}))
+	})
+
+	t.Run("optional lifecycle resolvers preserve version five binary rollback", func(t *testing.T) {
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			// This is the exact routing-function tail of VerifyTenantRLS at
+			// foundation production SHA 91c75ae. Running it after the Lifecycle B
+			// migration proves that binary's v5 startup contract still accepts the
+			// additive resolver set (before any managed account/job exists).
+			for _, signature := range []string{
+				"public.rereply_resolve_whatsapp_org(text)",
+				"public.rereply_resolve_webhook_org(text)",
+				"public.rereply_resolve_waba_orgs(text)",
+				"public.rereply_resolve_channel_org(uuid)",
+				"public.rereply_resolve_meta_channel_org(text,text)",
+				"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamp with time zone)",
+				"public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamp with time zone)",
+				"public.rereply_ready_threads_credential_orgs(uuid,integer,timestamp with time zone)",
+				"public.rereply_rls_routing_version()",
+			} {
+				var allowed bool
+				if err := runtimeDB.Raw(
+					"SELECT has_function_privilege(current_user, ?, 'EXECUTE')", signature,
+				).Scan(&allowed).Error; err != nil {
+					return err
+				}
+				require.True(t, allowed, "91c75ae routing contract %s", signature)
+			}
+			var routingVersion int
+			if err := runtimeDB.Raw(
+				"SELECT public.rereply_rls_routing_version()",
+			).Scan(&routingVersion).Error; err != nil {
+				return err
+			}
+			require.Equal(t, 5, routingVersion)
+			// The current verifier additionally checks the new lifecycle resolver
+			// signatures while retaining that previous v5 contract.
 			return database.VerifyTenantRLS(runtimeDB, runtimeRole)
 		}))
 	})
@@ -906,6 +953,158 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		require.Equal(t, orgB.ID, resolved)
 	})
 
+	t.Run("Meta lifecycle resolver pages due tenants without exposing accounts", func(t *testing.T) {
+		var organizationIDs []uuid.UUID
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			if err := runtimeDB.Raw(
+				"SELECT * FROM public.rereply_ready_meta_lifecycle_orgs(?, ?, ?)",
+				uuid.Nil,
+				20,
+				time.Now().UTC().Add(-24*time.Hour),
+			).Scan(&organizationIDs).Error; err != nil {
+				return err
+			}
+			var visibleAccounts int64
+			if err := runtimeDB.Model(&models.ChannelAccount{}).Count(&visibleAccounts).Error; err != nil {
+				return err
+			}
+			if visibleAccounts != 0 {
+				return fmt.Errorf("unscoped lifecycle query exposed %d channel accounts", visibleAccounts)
+			}
+			return nil
+		}))
+		require.Equal(t, []uuid.UUID{orgB.ID}, organizationIDs)
+
+		organizationIDs = nil
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Raw(
+				"SELECT * FROM public.rereply_ready_meta_lifecycle_orgs(?, ?, ?)",
+				orgB.ID,
+				20,
+				time.Now().UTC(),
+			).Scan(&organizationIDs).Error
+		}))
+		require.Empty(t, organizationIDs)
+	})
+
+	t.Run("Meta deauthorization lookup is exact and does not bypass tenant RLS", func(t *testing.T) {
+		type deauthTarget struct {
+			OrganizationID uuid.UUID `gorm:"column:organization_id"`
+			AccountID      uuid.UUID `gorm:"column:account_id"`
+		}
+		var targets []deauthTarget
+		var visibleAccounts int64
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			if err := runtimeDB.Raw(
+				"SELECT * FROM public.rereply_meta_deauth_targets(?, ?)",
+				metaPlatformAppID,
+				metaAuthorizingUserID,
+			).Scan(&targets).Error; err != nil {
+				return err
+			}
+			return runtimeDB.Model(&models.ChannelAccount{}).Count(&visibleAccounts).Error
+		}))
+		require.Equal(t, []deauthTarget{{OrganizationID: orgB.ID, AccountID: metaChannelB.ID}}, targets)
+		require.Zero(t, visibleAccounts)
+
+		targets = nil
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Raw(
+				"SELECT * FROM public.rereply_meta_deauth_target_page(?, ?, ?, ?)",
+				metaPlatformAppID,
+				metaAuthorizingUserID,
+				uuid.Nil,
+				100,
+			).Scan(&targets).Error
+		}))
+		require.Equal(t, []deauthTarget{{OrganizationID: orgB.ID, AccountID: metaChannelB.ID}}, targets)
+		targets = nil
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Raw(
+				"SELECT * FROM public.rereply_meta_deauth_target_page(?, ?, ?, ?)",
+				metaPlatformAppID,
+				metaAuthorizingUserID,
+				metaChannelB.ID,
+				100,
+			).Scan(&targets).Error
+		}))
+		require.Empty(t, targets)
+
+		targets = nil
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Raw(
+				"SELECT * FROM public.rereply_meta_deauth_targets(?, ?)",
+				"999999999999999",
+				metaAuthorizingUserID,
+			).Scan(&targets).Error
+		}))
+		require.Empty(t, targets)
+	})
+
+	t.Run("Meta lifecycle and deauthorization resolver limits are NULL-safe and hard-capped", func(t *testing.T) {
+		const fixtureCount = 105
+		boundedAppID := "888888888888888"
+		boundedUserID := "777777777777777"
+		due := time.Now().UTC().Add(-48 * time.Hour)
+		organizations := make([]models.Organization, 0, fixtureCount)
+		accounts := make([]models.ChannelAccount, 0, fixtureCount)
+		for index := 0; index < fixtureCount; index++ {
+			organizationID := uuid.New()
+			organizations = append(organizations, models.Organization{
+				BaseModel: models.BaseModel{ID: organizationID},
+				Name:      fmt.Sprintf("Bounded resolver %03d", index),
+				Slug:      fmt.Sprintf("bounded-resolver-%s", uuid.NewString()[:8]),
+			})
+			accounts = append(accounts, models.ChannelAccount{
+				BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: organizationID,
+				Channel: models.ChannelMessenger, Provider: "relay", Name: fmt.Sprintf("Bounded Page %03d", index),
+				ExternalAccountID: fmt.Sprintf("880000000%06d", index), Status: models.ChannelAccountStatusActive,
+				Config: models.JSONB{"meta_management_mode": "platform_oauth"},
+				Metadata: models.JSONB{
+					"meta_platform_app_id": boundedAppID, "meta_authorizing_user_id": boundedUserID,
+					"meta_ownership_checked_at": due.Format(time.RFC3339Nano),
+				},
+			})
+		}
+		require.NoError(t, adminDB.CreateInBatches(&organizations, 50).Error)
+		require.NoError(t, adminDB.CreateInBatches(&accounts, 50).Error)
+
+		for _, limit := range []any{nil, 0, -100, 1000000} {
+			var ready []uuid.UUID
+			require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+				return runtimeDB.Raw(
+					"SELECT * FROM public.rereply_ready_meta_lifecycle_orgs(?, CAST(? AS integer), ?)",
+					uuid.Nil, limit, time.Now().UTC(),
+				).Scan(&ready).Error
+			}))
+			require.LessOrEqual(t, len(ready), 100, "lifecycle limit %v", limit)
+
+			type deauthTarget struct {
+				OrganizationID uuid.UUID `gorm:"column:organization_id"`
+				AccountID      uuid.UUID `gorm:"column:account_id"`
+			}
+			var targets []deauthTarget
+			require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+				return runtimeDB.Raw(
+					"SELECT * FROM public.rereply_meta_deauth_target_page(?, ?, ?, CAST(? AS integer))",
+					boundedAppID, boundedUserID, uuid.Nil, limit,
+				).Scan(&targets).Error
+			}))
+			require.LessOrEqual(t, len(targets), 100, "deauthorization limit %v", limit)
+		}
+
+		var compatibilityTargets []struct {
+			OrganizationID uuid.UUID `gorm:"column:organization_id"`
+			AccountID      uuid.UUID `gorm:"column:account_id"`
+		}
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Raw(
+				"SELECT * FROM public.rereply_meta_deauth_targets(?, ?)", boundedAppID, boundedUserID,
+			).Scan(&compatibilityTargets).Error
+		}))
+		require.Len(t, compatibilityTargets, 100, "the v5 rollback shim must remain hard-capped")
+	})
+
 	t.Run("outbox resolver returns ready tenants without exposing jobs", func(t *testing.T) {
 		var organizationIDs []uuid.UUID
 		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
@@ -997,15 +1196,20 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		require.Zero(t, count)
 	})
 
-	t.Run("RLS rollback drops the Threads credential resolver", func(t *testing.T) {
+	t.Run("RLS rollback drops lifecycle resolver functions", func(t *testing.T) {
 		require.NoError(t, database.RemoveTenantRLS(adminDB))
-		var resolverExists bool
-		require.NoError(t, adminDB.Raw(`
-			SELECT to_regprocedure(
-			  'public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz)'
-			) IS NOT NULL
-		`).Scan(&resolverExists).Error)
-		require.False(t, resolverExists)
+		for _, signature := range []string{
+			"public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz)",
+			"public.rereply_ready_meta_lifecycle_orgs(uuid,integer,timestamptz)",
+			"public.rereply_meta_deauth_targets(text,text)",
+			"public.rereply_meta_deauth_target_page(text,text,uuid,integer)",
+		} {
+			var resolverExists bool
+			require.NoError(t, adminDB.Raw(
+				"SELECT to_regprocedure(?) IS NOT NULL", signature,
+			).Scan(&resolverExists).Error)
+			require.False(t, resolverExists, signature)
+		}
 
 		// Restore RLS so final data-integrity assertions and cleanup run under
 		// the same schema state as the rest of this test.

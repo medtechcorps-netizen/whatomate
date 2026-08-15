@@ -204,6 +204,7 @@ func GetMigrationModels() []MigrationModel {
 		{"GoogleSearchConsoleProperty", &models.GoogleSearchConsoleProperty{}},
 		{"ChannelAccount", &models.ChannelAccount{}},
 		{"ChannelCredential", &models.ChannelCredential{}},
+		{"MetaDeauthorizationEvent", &models.MetaDeauthorizationEvent{}},
 		{"ContactIdentity", &models.ContactIdentity{}},
 		{"InboxConversation", &models.InboxConversation{}},
 		{"ConversationParticipant", &models.ConversationParticipant{}},

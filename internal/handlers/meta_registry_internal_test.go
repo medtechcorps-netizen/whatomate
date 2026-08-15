@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -85,18 +86,21 @@ func TestLoadMetaRegistryBindingIsTenantScopedEncryptedAndVersioned(t *testing.T
 	now := time.Now().UTC()
 	binding, err := scopedA.loadMetaRegistryBinding(metaregistry.ResolveRequest{
 		Channel: models.ChannelMessenger, ExternalAccountID: fixtureA.account.ExternalAccountID,
+		Purpose: metaregistry.ResolvePurposeInbound,
 	}, now)
 	require.NoError(t, err)
 	assert.Equal(t, orgA.ID, binding.OrganizationID)
 	assert.Equal(t, fixtureA.oauth.ID, binding.CredentialID)
 	assert.Equal(t, fixtureA.oauth.Version, binding.CredentialVersion)
 	assert.Equal(t, fixtureA.webhook.ID, binding.WebhookCredentialID)
+	assert.Equal(t, "123", binding.PlatformAppID)
 	assert.Equal(t, "provider-token-page-a", binding.AccessToken)
 	assert.Equal(t, "inbound-page-a", binding.InboundSecret)
 	assert.Equal(t, "outbound-page-a", binding.OutboundSecret)
 
 	_, err = scopedA.loadMetaRegistryBinding(metaregistry.ResolveRequest{
 		Channel: models.ChannelMessenger, ExternalAccountID: fixtureB.account.ExternalAccountID,
+		Purpose: metaregistry.ResolvePurposeInbound,
 	}, now)
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
@@ -150,22 +154,160 @@ func TestMetaRegistryBindingFailsClosedWithoutPlatformAppOrScopes(t *testing.T) 
 	fixture := createMetaRegistryFixture(t, db, org.ID, models.ChannelMessenger, "page-scope")
 	scoped := metaRegistryTestApp(db, org.ID)
 	now := time.Now().UTC()
+	binding, err := scoped.loadMetaRegistryBinding(metaregistry.ResolveRequest{
+		Channel: models.ChannelMessenger, ExternalAccountID: fixture.account.ExternalAccountID,
+		Purpose: metaregistry.ResolvePurposeHealth,
+	}, now)
+	require.NoError(t, err)
+	assert.Equal(t, "123", binding.PlatformAppID)
 
 	metadata := cloneJSONB(fixture.account.Metadata)
 	metadata["meta_webhook_app"] = "clinic_specific_app"
 	require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).Update("metadata", metadata).Error)
-	_, err := scoped.loadMetaRegistryBinding(metaregistry.ResolveRequest{
+	_, err = scoped.loadMetaRegistryBinding(metaregistry.ResolveRequest{
 		Channel: models.ChannelMessenger, ExternalAccountID: fixture.account.ExternalAccountID,
+		Purpose: metaregistry.ResolvePurposeInbound,
 	}, now)
 	require.ErrorIs(t, err, metaregistry.ErrNotFound)
 
-	metadata["meta_webhook_app"] = "messenger"
-	metadata["meta_granted_scopes"] = []string{"pages_messaging"}
-	require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).Update("metadata", metadata).Error)
-	_, err = scoped.loadMetaRegistryBinding(metaregistry.ResolveRequest{
+	for _, missing := range []string{"pages_messaging", "pages_manage_metadata"} {
+		metadata = cloneJSONB(fixture.account.Metadata)
+		metadata["meta_granted_scopes"] = slices.DeleteFunc(
+			append([]string(nil), metaMessengerRequiredScopes...),
+			func(scope string) bool { return scope == missing },
+		)
+		require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).Update("metadata", metadata).Error)
+		_, err = scoped.loadMetaRegistryBinding(metaregistry.ResolveRequest{
+			Channel: models.ChannelMessenger, ExternalAccountID: fixture.account.ExternalAccountID,
+			Purpose: metaregistry.ResolvePurposeHealth,
+		}, now)
+		require.ErrorIs(t, err, metaregistry.ErrNotFound, missing)
+	}
+}
+
+func TestMetaRegistryPendingBindingIsHealthOnlyUntilExplicitApproval(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	fixture := createMetaRegistryFixture(t, db, org.ID, models.ChannelMessenger, "page-pending")
+	require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).
+		Update("status", models.ChannelAccountStatusPending).Error)
+	scoped := metaRegistryTestApp(db, org.ID)
+	now := time.Now().UTC()
+	_, err := scoped.loadMetaRegistryBinding(metaregistry.ResolveRequest{
 		Channel: models.ChannelMessenger, ExternalAccountID: fixture.account.ExternalAccountID,
+		Purpose: metaregistry.ResolvePurposeInbound,
 	}, now)
-	require.ErrorIs(t, err, metaregistry.ErrNotFound)
+	require.ErrorIs(t, err, metaregistry.ErrStaleBinding)
+	binding, err := scoped.loadMetaRegistryBinding(metaregistry.ResolveRequest{
+		Channel: models.ChannelMessenger, ExternalAccountID: fixture.account.ExternalAccountID,
+		Purpose: metaregistry.ResolvePurposeHealth,
+	}, now)
+	require.NoError(t, err)
+	assert.Equal(t, fixture.oauth.Version, binding.CredentialVersion)
+}
+
+func TestManagedMessengerActivationRequiresFreshHealthAndCredentialFences(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	fixture := createMetaRegistryFixture(t, db, organization.ID, models.ChannelMessenger, "page-activation")
+	app := metaRegistryTestApp(db, organization.ID)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	staleHealth := now.Add(-16 * time.Minute)
+	metadata := cloneJSONB(fixture.account.Metadata)
+	metadata["meta_subscription_state"] = "verified"
+	metadata["meta_activation_state"] = "awaiting_admin_approval"
+	metadata["meta_health_checked_at"] = staleHealth.Format(time.RFC3339Nano)
+	metadata["meta_health_oauth_credential_id"] = fixture.oauth.ID.String()
+	metadata["meta_health_oauth_version"] = fixture.oauth.Version
+	metadata["meta_health_webhook_credential_id"] = fixture.webhook.ID.String()
+	metadata["meta_health_webhook_version"] = fixture.webhook.Version
+	configJSON := cloneJSONB(fixture.account.Config)
+	configJSON["outbound_enabled"] = false
+	configJSON["ai_reply_enabled"] = false
+	require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).Updates(map[string]any{
+		"status": models.ChannelAccountStatusPending, "config": configJSON, "metadata": metadata,
+		"last_health_check_at": staleHealth, "last_error": "",
+	}).Error)
+	subscriptionApproval := metaMessengerSubscriptionApproval{
+		PageID: fixture.account.ExternalAccountID, CheckedAt: now,
+		OAuthCredentialID: fixture.oauth.ID, OAuthCredentialVersion: fixture.oauth.Version,
+		WebhookCredentialID: fixture.webhook.ID, WebhookCredentialVersion: fixture.webhook.Version,
+	}
+
+	_, err := app.activateMetaMessengerAccount(
+		organization.ID, fixture.userID, fixture.account.ID, now, subscriptionApproval,
+	)
+	require.Error(t, err)
+	var pending models.ChannelAccount
+	require.NoError(t, db.First(&pending, "id = ?", fixture.account.ID).Error)
+	assert.Equal(t, models.ChannelAccountStatusPending, pending.Status)
+	assert.False(t, boolConfigValue(pending.Config, "outbound_enabled"))
+	assert.False(t, boolConfigValue(pending.Config, "ai_reply_enabled"))
+
+	freshHealth := now.Add(-time.Minute)
+	metadata["meta_health_checked_at"] = freshHealth.Format(time.RFC3339Nano)
+	metadata["meta_ownership_checked_at"] = freshHealth.Format(time.RFC3339Nano)
+	require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).Updates(map[string]any{
+		"metadata": metadata, "last_health_check_at": freshHealth,
+	}).Error)
+	activated, err := app.activateMetaMessengerAccount(
+		organization.ID, fixture.userID, fixture.account.ID, now, subscriptionApproval,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, models.ChannelAccountStatusActive, activated.Status)
+	assert.True(t, boolConfigValue(activated.Config, "outbound_enabled"))
+	assert.False(t, boolConfigValue(activated.Config, "ai_reply_enabled"))
+	assert.NotNil(t, activated.ConnectedAt)
+	assert.Equal(t, "active", stringConfigValue(activated.Metadata, "meta_activation_state"))
+}
+
+func TestManagedMessengerProductionRejectsCarriedDevelopmentUserToken(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	fixture := createMetaRegistryFixture(t, db, organization.ID, models.ChannelMessenger, "page-user-token")
+	app := metaRegistryTestApp(db, organization.ID)
+	app.Config.App.Environment = "production"
+	app.Config.MetaMessenger.AllowDevelopmentUserToken = false
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	metadata := cloneJSONB(fixture.account.Metadata)
+	metadata[metaMessengerAuthorizationTokenKindKey] = metaMessengerTokenKindUser
+	metadata["meta_subscription_state"] = "verified"
+	metadata["meta_activation_state"] = "awaiting_admin_approval"
+	metadata["meta_health_checked_at"] = now.Format(time.RFC3339Nano)
+	metadata["meta_health_oauth_credential_id"] = fixture.oauth.ID.String()
+	metadata["meta_health_oauth_version"] = fixture.oauth.Version
+	metadata["meta_health_webhook_credential_id"] = fixture.webhook.ID.String()
+	metadata["meta_health_webhook_version"] = fixture.webhook.Version
+	configJSON := cloneJSONB(fixture.account.Config)
+	configJSON["outbound_enabled"] = false
+	configJSON["ai_reply_enabled"] = false
+	require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).Updates(map[string]any{
+		"status": models.ChannelAccountStatusPending, "config": configJSON, "metadata": metadata,
+		"last_health_check_at": now, "last_error": "",
+	}).Error)
+
+	_, err := app.loadMetaRegistryBinding(metaregistry.ResolveRequest{
+		Channel: models.ChannelMessenger, ExternalAccountID: fixture.account.ExternalAccountID,
+		Purpose: metaregistry.ResolvePurposeHealth,
+	}, now)
+	require.ErrorIs(t, err, metaregistry.ErrNotFound, "production must issue no registry lease for a USER token")
+	_, err = app.activateMetaMessengerAccount(
+		organization.ID,
+		fixture.userID,
+		fixture.account.ID,
+		now,
+		metaMessengerSubscriptionApproval{
+			PageID: fixture.account.ExternalAccountID, CheckedAt: now,
+			OAuthCredentialID: fixture.oauth.ID, OAuthCredentialVersion: fixture.oauth.Version,
+			WebhookCredentialID: fixture.webhook.ID, WebhookCredentialVersion: fixture.webhook.Version,
+		},
+	)
+	require.Error(t, err, "production approval must fail before enabling outbound")
+	snapshot, err := app.loadMetaMessengerRevalidationSnapshot(organization.ID, fixture.account.ID, now)
+	require.NoError(t, err)
+	outcome, reason := app.checkMetaMessengerOwnership(t.Context(), snapshot)
+	assert.Equal(t, metaregistry.OwnershipStale, outcome)
+	assert.Equal(t, "authorization_token_kind_not_allowed", reason)
 }
 
 func TestProvisionMetaRegistryBindingCreatesEncryptedAuditedTenantRecord(t *testing.T) {
@@ -174,24 +316,34 @@ func TestProvisionMetaRegistryBindingCreatesEncryptedAuditedTenantRecord(t *test
 	user := testutil.CreateTestUser(t, db, org.ID)
 	root := &App{
 		DB: db, Log: testutil.NopLogger(),
-		Config: &config.Config{App: config.AppConfig{EncryptionKey: metaRegistryTestEncryptionKey}},
+		Config: &config.Config{
+			App: config.AppConfig{EncryptionKey: metaRegistryTestEncryptionKey},
+			MetaRegistry: config.MetaRegistryConfig{
+				LeaseSeconds: 30, OwnershipMaxAgeMins: 24 * 60,
+			},
+			MetaMessenger: config.MetaMessengerConfig{
+				AppID: "123", AllowedOrganizationIDs: org.ID.String(),
+			},
+		},
 	}
 	var result metaRegistryProvisionResult
 	err := root.WithCommittedTenantApp(org.ID, func(scoped *App) error {
 		var provisionErr error
 		result, provisionErr = scoped.provisionMetaRegistryBinding(metaRegistryProvisionInput{
 			OrganizationID: org.ID, UserID: user.ID, Channel: models.ChannelMessenger,
-			Name: "Synthetic Clinic Messenger", ExternalAccountID: "page-provisioned",
-			WebhookApp: "messenger", MetaBusinessID: "business-1", AuthorizingMetaUserID: "user-1",
-			GrantedScopes: []string{"pages_manage_metadata", "pages_read_engagement", "pages_messaging"},
-			AccessToken:   "plaintext-provider-token", OwnershipCheckedAt: time.Now().UTC(),
-			ReReplyBaseURL: "https://app.example.test", RelayBaseURL: "https://app.example.test/meta-relay",
+			Name: "Synthetic Clinic Messenger", ExternalAccountID: "780000000000113",
+			WebhookApp: "messenger", PlatformAppID: "123", MetaBusinessID: "280000000000113", AuthorizingMetaUserID: "980000000000113",
+			AuthorizationTokenKind: metaMessengerTokenKindSystemUser,
+			GrantedScopes:          append([]string(nil), metaMessengerRequiredScopes...),
+			AccessToken:            "plaintext-provider-token", AuthorityToken: "plaintext-authority-token",
+			OwnershipCheckedAt: time.Now().UTC(),
+			ReReplyBaseURL:     "https://app.example.test", RelayBaseURL: "https://app.example.test/meta-relay",
 		})
 		return provisionErr
 	})
 	require.NoError(t, err)
 	assert.Equal(t, org.ID, result.Account.OrganizationID)
-	assert.Equal(t, models.ChannelAccountStatusActive, result.Account.Status)
+	assert.Equal(t, models.ChannelAccountStatusPending, result.Account.Status)
 	assert.False(t, boolConfigValue(result.Account.Config, "outbound_enabled"), "outbound still requires an explicit post-health approval")
 
 	var credentials []models.ChannelCredential
@@ -247,7 +399,7 @@ func TestMetaRegistryRevalidationIsMonotonicAndCanRecoverDegradedAccount(t *test
 	require.True(t, applied)
 	var account models.ChannelAccount
 	require.NoError(t, db.Where("id = ?", fixture.account.ID).First(&account).Error)
-	require.Equal(t, models.ChannelAccountStatusActive, account.Status)
+	require.Equal(t, models.ChannelAccountStatusPending, account.Status)
 	require.Equal(t, metaregistry.OwnershipVerified, stringConfigValue(account.Metadata, "meta_ownership_state"))
 }
 
@@ -334,16 +486,55 @@ func TestGenericChannelUpdateRejectsReservedMetaMarkerEvenWhenFalse(t *testing.T
 	require.False(t, exists)
 }
 
+func TestGenericChannelCreateRejectsManualMessengerRelayBypass(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	role := testutil.CreateTestRoleWithKeys(
+		t, db, organization.ID, "manual-messenger-channel-writer",
+		[]string{models.ResourceChannelAccounts + ":" + models.ActionWrite},
+	)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithRoleID(&role.ID))
+	enableChannelAccountConcurrencyEntitlement(t, db, organization.ID, user.ID)
+	app := &App{
+		DB: db, Log: testutil.NopLogger(),
+		Config: &config.Config{App: config.AppConfig{EncryptionKey: metaRegistryTestEncryptionKey}},
+	}
+	request := testutil.NewJSONRequest(t, map[string]any{
+		"channel":             "messenger",
+		"provider":            channelapi.RelayProvider,
+		"name":                "Manual Messenger bypass",
+		"external_account_id": "manual-page-123",
+		"config": map[string]any{
+			"relay_url": "https://relay.example.test/meta",
+		},
+	})
+	testutil.SetAuthContext(request, organization.ID, user.ID)
+	require.NoError(t, app.CreateChannelAccount(request))
+	testutil.AssertErrorResponse(t, request, fasthttp.StatusBadRequest, "managed Meta onboarding")
+
+	for name, model := range map[string]any{
+		"account":    &models.ChannelAccount{},
+		"credential": &models.ChannelCredential{},
+		"audit":      &models.AuditLog{},
+	} {
+		var count int64
+		require.NoError(t, db.Model(model).Where("organization_id = ?", organization.ID).Count(&count).Error)
+		assert.Zero(t, count, "manual Messenger rejection must create no %s side effect", name)
+	}
+}
+
 func createMetaRegistryFixture(t *testing.T, db *gorm.DB, orgID uuid.UUID, channel models.Channel, externalID string) metaRegistryFixture {
 	t.Helper()
 	user := testutil.CreateTestUser(t, db, orgID)
 	now := time.Now().UTC()
 	mode := ""
 	webhookApp := "messenger"
-	scopes := []string{"pages_manage_metadata", "pages_read_engagement", "pages_messaging"}
+	platformAppID := "123"
+	scopes := append([]string(nil), metaMessengerRequiredScopes...)
 	if channel == models.ChannelInstagram {
 		mode = "instagram_login"
 		webhookApp = "instagram_login"
+		platformAppID = "456"
 		scopes = []string{"instagram_business_basic", "instagram_business_manage_messages"}
 	}
 	account := models.ChannelAccount{
@@ -357,12 +548,15 @@ func createMetaRegistryFixture(t *testing.T, db *gorm.DB, orgID uuid.UUID, chann
 			"rereply_webhook_url": "https://app.example.test/api/webhooks/channels/" + uuid.NewString(),
 		},
 		Metadata: models.JSONB{
-			"meta_ownership_state":      metaregistry.OwnershipVerified,
-			"meta_ownership_checked_at": now.Format(time.RFC3339Nano),
-			"meta_webhook_app":          webhookApp,
-			"meta_business_id":          "business-" + externalID,
-			"meta_authorizing_user_id":  "user-" + externalID,
-			"meta_granted_scopes":       scopes,
+			"meta_ownership_state":                 metaregistry.OwnershipVerified,
+			"meta_ownership_checked_at":            now.Format(time.RFC3339Nano),
+			metaMessengerAuthorizationGrantedAtKey: now.Add(-time.Minute).Format(time.RFC3339Nano),
+			metaMessengerAuthorizationTokenKindKey: metaMessengerTokenKindSystemUser,
+			"meta_webhook_app":                     webhookApp,
+			"meta_platform_app_id":                 platformAppID,
+			"meta_business_id":                     "business-" + externalID,
+			"meta_authorizing_user_id":             "user-" + externalID,
+			"meta_granted_scopes":                  scopes,
 		},
 		CreatedByID: &user.ID, UpdatedByID: &user.ID,
 	}
@@ -375,8 +569,11 @@ func createMetaRegistryFixture(t *testing.T, db *gorm.DB, orgID uuid.UUID, chann
 	oauth := models.ChannelCredential{
 		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID, ChannelAccountID: account.ID,
 		Kind: models.ChannelCredentialKindOAuth, Version: 2,
-		CredentialBlob: models.JSONB{"access_token": encrypt("provider-token-" + externalID)},
-		Status:         models.ChannelCredentialStatusActive, KeyVersion: "app:v1", Metadata: models.JSONB{},
+		CredentialBlob: models.JSONB{
+			"access_token":    encrypt("provider-token-" + externalID),
+			"authority_token": encrypt("authority-token-" + externalID),
+		},
+		Status: models.ChannelCredentialStatusActive, KeyVersion: "app:v1", Metadata: models.JSONB{},
 	}
 	webhook := models.ChannelCredential{
 		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID, ChannelAccountID: account.ID,
@@ -398,6 +595,10 @@ func metaRegistryTestApp(db *gorm.DB, organizationID uuid.UUID) *App {
 		Config: &config.Config{
 			App:          config.AppConfig{EncryptionKey: metaRegistryTestEncryptionKey},
 			MetaRegistry: config.MetaRegistryConfig{LeaseSeconds: 30, OwnershipMaxAgeMins: 24 * 60},
+			MetaMessenger: config.MetaMessengerConfig{
+				AppID: "123", HealthApprovalMaxAgeMins: 15,
+				AllowedOrganizationIDs: organizationID.String(),
+			},
 		},
 	}
 }

@@ -97,7 +97,7 @@ type fixedRegistryResolver struct {
 	err     error
 }
 
-func (resolver fixedRegistryResolver) Resolve(context.Context, models.Channel, string, bool) (*AccountConfig, error) {
+func (resolver fixedRegistryResolver) Resolve(context.Context, models.Channel, string, string, bool) (*AccountConfig, error) {
 	if resolver.err != nil {
 		return nil, resolver.err
 	}
@@ -255,7 +255,7 @@ func TestWorkerRejectsUnsafeLeaseOrConcurrency(t *testing.T) {
 	config.RegistrySecret = registryClientTestSecret
 	config.RegistryTimeout = 10 * time.Second
 	config.RegistryCacheTTL = time.Second
-	config.registryLifecycleTestMode = true
+	config.RegistryEnabled = true
 	config.ProcessingLease = config.ForwardTimeout + queueSettlementTimeout +
 		leaseSafetyMargin + config.RegistryTimeout - time.Millisecond
 	if _, err := NewWorker(config, &fakeQueueStore{}); err == nil {

@@ -1,92 +1,140 @@
-# Meta self-service control plane foundation
+# Managed Meta self-service control plane
 
-This split-A foundation defines how a later lifecycle release can remove
-per-clinic relay environment edits and deployments. It is deliberately
-impossible to enable in production today: both ReReply and the relay reject
-dynamic registry credentials during startup. Existing static mappings remain
-the only supported production path.
+Lifecycle B provides a default-off, self-service Messenger onboarding path on
+top of the encrypted Meta registry. It does not enable Instagram onboarding;
+Instagram Login stays rejected at startup until it has the same OAuth,
+ownership, subscription, deauthorization, and recovery lifecycle.
 
-## Trust boundaries
+Existing static relay mappings are a separate compatibility boundary. Do not
+change their webhook routes, app secrets, Page tokens, or environment mapping
+while rolling out managed Messenger. Static Page tokens can have a different
+application identity from the legacy webhook signer, so the managed lifecycle
+must never infer or reuse that identity.
 
-1. ReReply's approved Messenger parent app and separate Instagram Login app
-   remain deployment-owned. Their app secrets and verify tokens stay on the
-   relay.
-2. A clinic authorizes assets through those platform apps. The future OAuth
-   completion handler must verify the token, scopes, Page/professional-account
-   ownership, and selected Business before marking a binding active.
-3. ReReply stores the asset as a tenant-owned `channel_accounts` row. Provider
-   access tokens use an encrypted, versioned OAuth `channel_credentials` row;
-   ReReply inbound/outbound HMAC values use a separate encrypted, versioned
-   webhook credential row.
-4. The isolated relay obtains only a short binding lease through the private
-   signed broker. It has no database credential and no application encryption
-   key.
+## Deployment-owned trust boundaries
 
-## Required persisted state
+- ReReply owns one dedicated managed Messenger platform application. Clinics
+  authorize Pages through that application and never enter an app secret.
+- The ReReply web service performs Facebook Login for Business, validates the
+  returned BISU/SYSTEM_USER token, and stores provider tokens only in encrypted,
+  versioned OAuth credentials.
+- The relay has a distinct managed Messenger app ID, app secret, verify token,
+  and webhook route. Every registry binding carries the non-secret platform app
+  ID; the relay rejects a binding that does not exactly match its configured ID.
+- The relay has no database credential or application encryption key. It obtains
+  a short signed lease from the private registry broker after outer service
+  authentication and per-request replay protection.
+- Tenant routing stays inside a tenant transaction/RLS boundary. The globally
+  unique Page claim prevents two workspaces from subscribing the same Page.
 
-The OAuth completion transaction must set these non-secret values:
+## Enablement gates
 
-- `channel_accounts.provider = relay`;
-- `config.meta_registry_managed = true`;
-- `config.meta_management_mode = platform_oauth`;
-- `config.rereply_webhook_url` to the exact account webhook;
-- `config.instagram_api_mode` to `instagram_login` or `facebook_login` for
-  Instagram (and omit it for Messenger);
-- `metadata.meta_ownership_state = verified`;
-- `metadata.meta_ownership_checked_at` as UTC RFC3339Nano; and
-- the provider app key, verified scopes, Business ID, and authorizing Meta user
-  as non-secret metadata needed for later revalidation/deauthorization.
+Keep both `[meta_registry].enabled` and
+`[meta_messenger_onboarding].enabled` false until all gates below are proven:
 
-The transaction must create both credentials, write a redacted audit event,
-and rely on `uq_channel_accounts_global_routable_identity` to prevent the same
-Meta asset from being owned by two workspaces.
+1. Deploy queue reader schema 2 to every relay replica and confirm old workers
+   are gone before allowing a dynamic producer.
+2. Set `server.write_timeout` to at least 120 seconds. Browser provider actions
+   use the same 120-second class of deadline; the provider phase itself is
+   bounded to 90 seconds.
+3. Configure the web encryption key, separate registry service and edge
+   secrets, and an exact private registry resolve URL.
+4. Configure a dedicated managed Messenger app at both services. Prove the app
+   ID and secret cryptographically; do not infer them from a callback URL or
+   reuse either legacy static secret.
+5. Configure the Meta callback as
+   `https://app.rereply.app/meta-relay/v1/meta/messenger/managed-webhook` and use
+   the exact deployment value of `META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN`.
+   The ingress removes `/meta-relay`, leaving the relay's internal
+   `/v1/meta/messenger/managed-webhook` route.
+6. Configure Meta's deauthorization callback as
+   `https://app.rereply.app/api/integrations/meta/messenger/deauthorize`.
+   Meta's data-deletion callback is a separate compliance endpoint and must not
+   be treated as deauthorization.
+7. During the pilot, set `allowed_organization_ids` to exactly one canonical
+   organization UUID and keep `allow_all_organizations=false`. Do not put a
+   clinic name, Page ID, token, or app credential in configuration or docs.
 
-The generic channel API reserves these managed markers regardless of the value
-a caller tries to inject. It cannot create a managed Meta row, replace its
-routing/capability configuration, rotate its credentials, or delete it. Normal
-profile/default changes remain available. Outbound approval and AI opt-in also
-require a successful relay+Graph health result no older than 15 minutes;
-disconnect and credential changes must go through the version-fenced Meta
-lifecycle.
+The allowlist is a runtime boundary, not only an enrollment list. Removing the
+pilot UUID immediately prevents inbound, outbound, worker, and health leases;
+the lifecycle sweep then quarantines the managed account, disables outbound and
+AI, and makes no Graph call. `allow_all_organizations` is reserved for an
+explicit external release after the Meta app is Live and required permissions
+have Advanced Access.
 
-## Remaining product work
+## Messenger onboarding and activation
 
-- Merge or reimplement the reviewed Messenger Facebook Login for Business flow
-  against this production registry instead of stopping at
-  `awaiting_relay_registry`.
-- Add the equivalent Instagram Login OAuth flow and token exchange.
-- Add a scheduled Graph revalidator for ownership, required scopes, expiry,
-  subscribed-app state, and token binding. It should call the version-fenced
-  internal revalidation transition.
-- Add provider-signed deauthorization callbacks on the relay. After validating
-  the platform app signature, the relay calls the version-fenced internal
-  revoke transition.
-- Add onboarding UI, safe reconnect/rotation, disconnect confirmation, and
-  health explanations. No flow may accept a clinic app secret or bypass the
-  platform app boundary.
+1. The browser captures the active organization and sends an explicit
+   `X-Organization-ID` on status, start, callback, select, reconnect, reconcile,
+   approve, and disconnect calls. OAuth state and selection sessions are bound
+   to that organization and user.
+2. Facebook Login for Business returns an authorization code. ReReply exchanges
+   it server-side and requires a durable SYSTEM_USER/BISU token in production.
+3. ReReply validates the exact minimum flow permissions plus the Business/Page
+   discovery permission used by the implementation, exact Page ownership, and
+   both Page tasks required for messaging and `subscribed_apps` management.
+4. ReReply commits a globally unique pending Page claim, encrypted credential
+   versions, and a subscription-operation fence before any Meta subscription
+   mutation. A losing workspace makes zero Meta calls.
+5. After Meta confirms the exact managed app is subscribed to `messages`, the
+   account remains pending with outbound and AI disabled.
+6. A fresh relay/Graph health check revalidates the Page token and exact
+   `subscribed_apps` state. An administrator must then explicitly approve the
+   exact credential versions before the account becomes active.
 
-All items above are release blockers, not optional follow-ups. Lifecycle B must
-also provide a real backend caller for OAuth completion/reconnect/disconnect,
-keep a new account outbound-disabled until a fresh relay+Graph health test and
-explicit administrator approval, revalidate ownership/scopes/token binding and
-`subscribed_apps` before the ownership age expires, and verify provider-signed
-deauthorization before revoking both credential versions. Only after those
-tests pass may a code change remove the two startup gates.
+All managed Graph calls include `appsecret_proof`. Legacy static sends remain
+unchanged because their Page tokens can be issued by a different app.
 
-The unexported provisioning helper in split A is therefore a persistence
-contract and test fixture, not an activation endpoint. Lifecycle B must own the
-real pending -> health-verified -> explicitly approved -> active transition;
-it must not expose the helper directly or treat its provisional active row as
-customer-ready. The private broker must also receive service-edge rate limits
-before its production gate is removed.
+## Operation fences and recovery
 
-The later rollout must deploy registry-aware queue readers everywhere before
-enabling its producer. Dynamic jobs use a credential fence and queue schema 2;
-old workers must be drained before enablement and may not be reintroduced until
-no registry-fenced jobs remain.
+Select, reconnect, disconnect, and reconciliation serialize on a durable
+operation ID plus OAuth/webhook credential versions. Disconnect disables
+outbound and AI before the provider call. A transport timeout or process crash
+leaves the account non-routable and fenced; elapsed time alone never clears an
+ambiguous provider mutation.
 
-`origin/codex/meta-channel-safe-reconnect` is useful reference code for the
-Messenger authorization and review evidence flow, but it is not a drop-in
-production registry: its documented production endpoint still requires an
-operator-maintained relay registry, its dynamic broker is staging-review-only,
-and it has no Instagram OAuth implementation.
+The managed account UI exposes a derived, non-secret recovery flag and a
+`Reconcile Meta subscription` action. Reconciliation performs a fresh exact
+`subscribed_apps` read, repeats only the committed desired operation, and
+finalizes under the original generation fence. Browser APIs never expose raw
+account metadata, operation IDs, provider IDs, tokens, or event digests.
+
+## Revalidation and deauthorization
+
+The lifecycle scheduler runs before the ownership maximum age. It validates
+the authorizing token kind/app, required permissions, exact Page ownership and
+tasks, Page token binding, and exact managed-app `messages` subscription. Stale
+authority is quarantined and queued work is parked; revoked authority is
+disconnected and dead-lettered under the existing version fences.
+
+Meta deauthorization signed requests are HMAC-verified before the authenticated
+digest rate gate. A bounded, non-secret global journal records the verified
+event digest, app/user correlation, issued time, and processing state so partial
+tenant failures and provider retries remain idempotent. Completed events are
+retained for 30 days and unresolved events for 90 days, then removed in bounded
+batches. The journal stores no raw signed request or token and is not serialized
+to browser, audit, or log surfaces.
+
+A delayed event cannot revoke a newer reconnect generation. Same-second events
+are treated as ambiguous: ReReply immediately quarantines the account and
+requires exact current-authority reconciliation. Target processing is bounded
+and attempts every matching tenant before returning a retryable failure.
+
+## Reader-first rollout and rollback
+
+Use this order:
+
+1. Apply the RLS-compatible migration while managed lifecycle remains off.
+2. Deploy reader schema 2 everywhere and verify the exact new application SHA.
+3. Configure the separate managed app and callbacks, then enable the private
+   registry with the one-organization allowlist.
+4. Onboard and activate one pilot Page only after health and explicit approval.
+
+Before the first managed binding or schema-2 dynamic job exists, the default-off
+migration remains compatible with rollback to the foundation binary. After the
+first managed binding or job exists, rolling back to an old binary is
+prohibited: it cannot honor lifecycle fences and can reopen manual Messenger
+creation. For a later rollback, first disable managed intake, remove the runtime
+allowlist, reconcile every ambiguous subscription, and drain or park every
+registry-fenced job with a reader-v2 worker. Roll back only after proving no
+managed binding or dynamic job remains usable by the old binary.

@@ -37,6 +37,7 @@ var (
 	envNamePattern      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	graphVersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+$`)
 	accountKeyPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	metaAppIDPattern    = regexp.MustCompile(`^[0-9]+$`)
 )
 
 // LoadConfig loads and validates the relay's environment-only configuration.
@@ -46,26 +47,44 @@ func LoadConfig() (*Config, error) {
 
 func loadConfig(getenv func(string) string) (*Config, error) {
 	config := &Config{
-		ListenAddr:                strings.TrimSpace(getenv("META_RELAY_LISTEN_ADDR")),
-		RedisURL:                  strings.TrimSpace(getenv("META_RELAY_REDIS_URL")),
-		RedisPrefix:               strings.TrimSpace(getenv("META_RELAY_REDIS_PREFIX")),
-		MessengerAppSecret:        getenv("META_RELAY_MESSENGER_APP_SECRET"),
-		MessengerVerifyToken:      getenv("META_RELAY_MESSENGER_VERIFY_TOKEN"),
-		InstagramLoginAppSecret:   getenv("META_RELAY_INSTAGRAM_APP_SECRET"),
-		InstagramLoginVerifyToken: getenv("META_RELAY_INSTAGRAM_VERIFY_TOKEN"),
-		GraphAPIVersion:           strings.TrimSpace(getenv("META_RELAY_GRAPH_API_VERSION")),
-		InboundRetention:          defaultInboundRetention,
-		OutboundRetention:         defaultOutboundRetention,
-		ProcessingLease:           defaultProcessingLease,
-		ForwardTimeout:            defaultForwardTimeout,
-		PollInterval:              defaultPollInterval,
-		WorkerConcurrency:         defaultWorkerConcurrency,
-		MaxAttempts:               defaultMaxAttempts,
-		RegistryURL:               strings.TrimSpace(getenv("META_RELAY_REGISTRY_URL")),
-		RegistrySecret:            getenv("META_RELAY_REGISTRY_SECRET"),
-		RegistryEdgeSecret:        getenv("META_RELAY_REGISTRY_EDGE_SECRET"),
-		RegistryCacheTTL:          defaultRegistryCacheTTL,
-		RegistryTimeout:           defaultRegistryTimeout,
+		ListenAddr:                  strings.TrimSpace(getenv("META_RELAY_LISTEN_ADDR")),
+		RedisURL:                    strings.TrimSpace(getenv("META_RELAY_REDIS_URL")),
+		RedisPrefix:                 strings.TrimSpace(getenv("META_RELAY_REDIS_PREFIX")),
+		MessengerAppSecret:          getenv("META_RELAY_MESSENGER_APP_SECRET"),
+		MessengerVerifyToken:        getenv("META_RELAY_MESSENGER_VERIFY_TOKEN"),
+		ManagedMessengerAppID:       strings.TrimSpace(getenv("META_RELAY_MANAGED_MESSENGER_APP_ID")),
+		ManagedMessengerAppSecret:   getenv("META_RELAY_MANAGED_MESSENGER_APP_SECRET"),
+		ManagedMessengerVerifyToken: getenv("META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN"),
+		InstagramLoginAppSecret:     getenv("META_RELAY_INSTAGRAM_APP_SECRET"),
+		InstagramLoginVerifyToken:   getenv("META_RELAY_INSTAGRAM_VERIFY_TOKEN"),
+		GraphAPIVersion:             strings.TrimSpace(getenv("META_RELAY_GRAPH_API_VERSION")),
+		InboundRetention:            defaultInboundRetention,
+		OutboundRetention:           defaultOutboundRetention,
+		ProcessingLease:             defaultProcessingLease,
+		ForwardTimeout:              defaultForwardTimeout,
+		PollInterval:                defaultPollInterval,
+		WorkerConcurrency:           defaultWorkerConcurrency,
+		MaxAttempts:                 defaultMaxAttempts,
+		RegistryEnabled:             false,
+		RegistryURL:                 strings.TrimSpace(getenv("META_RELAY_REGISTRY_URL")),
+		RegistrySecret:              getenv("META_RELAY_REGISTRY_SECRET"),
+		RegistryEdgeSecret:          getenv("META_RELAY_REGISTRY_EDGE_SECRET"),
+		RegistryCacheTTL:            defaultRegistryCacheTTL,
+		RegistryTimeout:             defaultRegistryTimeout,
+	}
+	if value := strings.TrimSpace(getenv("META_RELAY_REGISTRY_ENABLED")); value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, errors.New("environment variable META_RELAY_REGISTRY_ENABLED must be true or false")
+		}
+		config.RegistryEnabled = parsed
+	}
+	if value := strings.TrimSpace(getenv("META_RELAY_DYNAMIC_QUEUE_READER_VERSION")); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 {
+			return nil, errors.New("environment variable META_RELAY_DYNAMIC_QUEUE_READER_VERSION must be a non-negative integer")
+		}
+		config.RegistryQueueReader = parsed
 	}
 	if config.ListenAddr == "" {
 		config.ListenAddr = defaultListenAddr
@@ -149,10 +168,33 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 		return errors.New("environment variable META_RELAY_GRAPH_API_VERSION must be explicit, for example v25.0")
 	}
 	registryConfigured := strings.TrimSpace(c.RegistryURL) != "" ||
-		strings.TrimSpace(c.RegistrySecret) != "" || strings.TrimSpace(c.RegistryEdgeSecret) != ""
+		strings.TrimSpace(c.RegistrySecret) != "" || strings.TrimSpace(c.RegistryEdgeSecret) != "" ||
+		strings.TrimSpace(c.ManagedMessengerAppID) != "" ||
+		strings.TrimSpace(c.ManagedMessengerAppSecret) != "" ||
+		strings.TrimSpace(c.ManagedMessengerVerifyToken) != ""
+	if registryConfigured != c.RegistryEnabled {
+		return errors.New("dynamic Meta registry URL and credentials must be configured exactly when META_RELAY_REGISTRY_ENABLED=true")
+	}
 	if registryConfigured {
-		if !c.registryLifecycleTestMode {
-			return errors.New("dynamic Meta registry lifecycle is not production-enableable in this foundation release")
+		if !metaAppIDPattern.MatchString(c.ManagedMessengerAppID) {
+			return errors.New("environment variable META_RELAY_MANAGED_MESSENGER_APP_ID is required when the dynamic registry is enabled")
+		}
+		if len(c.ManagedMessengerAppSecret) < 32 {
+			return errors.New("environment variable META_RELAY_MANAGED_MESSENGER_APP_SECRET must contain at least 32 bytes")
+		}
+		if strings.TrimSpace(c.ManagedMessengerVerifyToken) == "" {
+			return errors.New("environment variable META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN is required")
+		}
+		if c.ManagedMessengerAppSecret == c.MessengerAppSecret ||
+			c.ManagedMessengerAppSecret == c.InstagramLoginAppSecret {
+			return errors.New("managed Messenger and legacy Meta app secrets must be distinct")
+		}
+		if c.ManagedMessengerVerifyToken == c.MessengerVerifyToken ||
+			c.ManagedMessengerVerifyToken == c.InstagramLoginVerifyToken {
+			return errors.New("managed Messenger and legacy Meta verify tokens must be distinct")
+		}
+		if c.RegistryQueueReader != InboundJobSchemaVersion {
+			return fmt.Errorf("META_RELAY_DYNAMIC_QUEUE_READER_VERSION must be %d before dynamic producers are enabled", InboundJobSchemaVersion)
 		}
 		if err := validateEndpoint(c.RegistryURL, c.allowInsecureTestEndpoints); err != nil {
 			return fmt.Errorf("environment variable META_RELAY_REGISTRY_URL: %w", err)

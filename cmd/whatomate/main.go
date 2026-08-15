@@ -507,6 +507,18 @@ func runServer(args []string) {
 	go inboundProcessor.Start(inboundCtx)
 	lo.Info("Inbound continuation processor started")
 
+	var metaLifecycleCancel context.CancelFunc
+	if cfg.MetaMessenger.Enabled {
+		var metaLifecycleCtx context.Context
+		metaLifecycleCtx, metaLifecycleCancel = context.WithCancel(context.Background())
+		go func() {
+			lo.Info("Messenger ownership lifecycle processor started")
+			if err := app.RunMetaMessengerLifecycle(metaLifecycleCtx); err != nil && err != context.Canceled {
+				lo.Error("Messenger ownership lifecycle processor stopped", "error", err)
+			}
+		}()
+	}
+
 	// Start embedded workers
 	var workers []*worker.Worker
 	var workerCancel context.CancelFunc
@@ -563,6 +575,12 @@ func runServer(args []string) {
 	lo.Info("Stopping campaign stats subscriber...")
 	app.StopCampaignStatsSubscriber()
 	lo.Info("Campaign stats subscriber stopped")
+
+	if metaLifecycleCancel != nil {
+		lo.Info("Stopping Messenger ownership lifecycle processor...")
+		metaLifecycleCancel()
+		lo.Info("Messenger ownership lifecycle processor stopped")
+	}
 
 	// Stop inbound continuation recovery.
 	lo.Info("Stopping inbound continuation processor...")
@@ -805,6 +823,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		"/api/integrations/threads/{target_organization_id}/deauthorize",
 		app.DeauthorizeThreads,
 	)
+	g.POST("/api/integrations/meta/messenger/deauthorize", app.DeauthorizeMetaMessenger)
 	g.POST(
 		"/api/integrations/threads/{target_organization_id}/data-deletion",
 		app.DeleteThreadsUserData,
@@ -855,6 +874,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 			return r
 		}
 		if isPublicThreadsLifecyclePath(path) {
+			return r
+		}
+		if path == "/api/integrations/meta/messenger/deauthorize" {
 			return r
 		}
 		// Skip auth for custom action redirects (uses one-time token)
@@ -1047,6 +1069,11 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.PUT("/api/integrations/google_search_console/properties", tenant((*handlers.App).UpdateGoogleSearchConsoleProperties))
 	g.POST("/api/integrations/google_search_console/properties/refresh", app.RefreshGoogleSearchConsoleProperties)
 	g.DELETE("/api/integrations/google_search_console/connection", app.DisconnectGoogleSearchConsole)
+	g.POST("/api/integrations/meta/messenger/onboarding/start", app.StartMetaMessengerOnboarding)
+	g.GET("/api/integrations/meta/messenger/onboarding/status", app.GetMetaMessengerOnboardingStatus)
+	g.POST("/api/integrations/meta/messenger/onboarding/callback", app.ExchangeMetaMessengerOnboarding)
+	g.POST("/api/integrations/meta/messenger/onboarding/exchange", app.ExchangeMetaMessengerOnboarding)
+	g.POST("/api/integrations/meta/messenger/onboarding/select", app.SelectMetaMessengerOnboarding)
 
 	// Provider-neutral channel accounts and shared inbox.
 	g.GET("/api/channel-accounts", tenant((*handlers.App).ListChannelAccounts))
@@ -1058,6 +1085,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// transaction-spanning Tenant adapter or the outer connection can deadlock
 	// while the phases wait for another pool connection.
 	g.POST("/api/channel-accounts/{id}/test", app.TestChannelAccount)
+	g.POST("/api/channel-accounts/{id}/meta-messenger/reconnect", app.ReconnectMetaMessengerOnboarding)
+	g.POST("/api/channel-accounts/{id}/meta-messenger/reconcile", app.ReconcileMetaMessengerSubscription)
+	g.POST("/api/channel-accounts/{id}/meta-messenger/disconnect", app.DisconnectMetaMessenger)
+	g.POST("/api/channel-accounts/{id}/meta-messenger/approve", app.ApproveMetaMessengerActivation)
 	g.GET("/api/conversations", tenant((*handlers.App).ListInboxConversations))
 	g.GET(
 		"/api/conversations/{id}/messages",

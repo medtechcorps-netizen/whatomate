@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	configpkg "github.com/shridarpatil/whatomate/internal/config"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -215,7 +216,7 @@ func (a *App) resolveMetaRegistryOrganization(request metaregistry.ResolveReques
 		Select("organization_id").
 		Where("channel = ? AND provider = ? AND external_account_id = ? AND status IN ?",
 			request.Channel, channelapi.RelayProvider, request.ExternalAccountID,
-			[]models.ChannelAccountStatus{models.ChannelAccountStatusActive, models.ChannelAccountStatusDegraded}).
+			[]models.ChannelAccountStatus{models.ChannelAccountStatusPending, models.ChannelAccountStatusActive, models.ChannelAccountStatusDegraded}).
 		Take(&organizationID).Error; err != nil {
 		return uuid.Nil, err
 	}
@@ -251,9 +252,29 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 	}).Where(
 		"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ? AND status IN ?",
 		a.tenantOrgID, request.Channel, channelapi.RelayProvider, request.ExternalAccountID,
-		[]models.ChannelAccountStatus{models.ChannelAccountStatusActive, models.ChannelAccountStatusDegraded},
+		[]models.ChannelAccountStatus{models.ChannelAccountStatusPending, models.ChannelAccountStatusActive, models.ChannelAccountStatusDegraded},
 	).First(&account).Error; err != nil {
 		return metaregistry.Binding{}, err
+	}
+	if account.Channel == models.ChannelMessenger &&
+		!a.metaMessengerOrganizationAllowed(account.OrganizationID) {
+		// The deployment allowlist is also the pilot runtime kill switch. A
+		// removed workspace cannot receive a lease or decrypt credentials for
+		// inbound, outbound, worker, or health traffic.
+		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
+	}
+	if account.Channel == models.ChannelMessenger &&
+		stringConfigValue(account.Metadata, metaMessengerSubscriptionDesiredStateKey) ==
+			metaMessengerSubscriptionDesiredUnsubscribed &&
+		stringConfigValue(account.Metadata, metaMessengerSubscriptionOperationStateKey) !=
+			metaMessengerSubscriptionUnsubscribeConfirmed {
+		// A disconnect claim becomes non-routable before the provider DELETE.
+		// Health, inbound, and outbound all stay parked while the remote result
+		// is pending or ambiguous; only exact reconciliation can clear it.
+		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
+	}
+	if account.Status == models.ChannelAccountStatusPending && request.Purpose != metaregistry.ResolvePurposeHealth {
+		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
 	}
 	if account.Status == models.ChannelAccountStatusDegraded {
 		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
@@ -265,6 +286,13 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 		return metaregistry.Binding{}, metaregistry.ErrNotFound
 	}
 	if err := validateMetaRegistryPlatformBinding(&account); err != nil {
+		return metaregistry.Binding{}, metaregistry.ErrNotFound
+	}
+	if !metaMessengerAuthorizationTokenAllowed(a.Config, account.Metadata) {
+		return metaregistry.Binding{}, metaregistry.ErrNotFound
+	}
+	if account.Channel == models.ChannelMessenger && (a.Config == nil ||
+		stringConfigValue(account.Metadata, "meta_platform_app_id") != strings.TrimSpace(a.Config.MetaMessenger.AppID)) {
 		return metaregistry.Binding{}, metaregistry.ErrNotFound
 	}
 	checkedAt, err := time.Parse(time.RFC3339Nano, stringConfigValue(account.Metadata, "meta_ownership_checked_at"))
@@ -310,6 +338,7 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 		SchemaVersion: metaregistry.SchemaVersion, LeaseID: uuid.New(), LeaseExpiresAt: now.Add(lease),
 		OrganizationID: account.OrganizationID, ChannelAccountID: account.ID,
 		Channel: account.Channel, ExternalAccountID: account.ExternalAccountID,
+		PlatformAppID:     stringConfigValue(account.Metadata, "meta_platform_app_id"),
 		InstagramAPIMode:  stringConfigValue(account.Config, "instagram_api_mode"),
 		ReReplyWebhookURL: webhookURL, AccessToken: accessToken,
 		InboundSecret: inboundSecret, OutboundSecret: outboundSecret,
@@ -321,6 +350,18 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 		return metaregistry.Binding{}, err
 	}
 	return binding, nil
+}
+
+func metaMessengerAuthorizationTokenAllowed(config *configpkg.Config, metadata models.JSONB) bool {
+	kind := strings.ToUpper(strings.TrimSpace(stringConfigValue(metadata, metaMessengerAuthorizationTokenKindKey)))
+	if kind == metaMessengerTokenKindSystemUser {
+		return true
+	}
+	if kind != metaMessengerTokenKindUser || config == nil ||
+		!config.MetaMessenger.AllowDevelopmentUserToken || config.MetaMessenger.AllowAllOrganizations {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(config.App.Environment), "production")
 }
 
 func currentMetaRegistryCredential(credentials []models.ChannelCredential, kind models.ChannelCredentialKind, now time.Time) *models.ChannelCredential {
@@ -383,10 +424,13 @@ func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, ou
 		metadata["meta_ownership_reason"] = request.Reason
 	}
 	newStatus := account.Status
+	accountConfig := cloneJSONB(account.Config)
 	switch outcome {
 	case metaregistry.OwnershipRevoked:
 		metadata["meta_deauthorized_at"] = request.CheckedAt.Format(time.RFC3339Nano)
 		newStatus = models.ChannelAccountStatusDisconnected
+		accountConfig["outbound_enabled"] = false
+		accountConfig["ai_reply_enabled"] = false
 		for i := range credentials {
 			result := a.DB.Model(&models.ChannelCredential{}).
 				Where("id = ? AND organization_id = ? AND version = ? AND status IN ?",
@@ -402,10 +446,16 @@ func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, ou
 		}
 	case metaregistry.OwnershipStale:
 		newStatus = models.ChannelAccountStatusDegraded
+		accountConfig["outbound_enabled"] = false
+		accountConfig["ai_reply_enabled"] = false
 	case metaregistry.OwnershipVerified:
-		newStatus = models.ChannelAccountStatusActive
+		if account.Status == models.ChannelAccountStatusDegraded {
+			newStatus = models.ChannelAccountStatusPending
+			accountConfig["outbound_enabled"] = false
+			accountConfig["ai_reply_enabled"] = false
+		}
 	}
-	updates := map[string]any{"metadata": metadata, "status": newStatus}
+	updates := map[string]any{"metadata": metadata, "status": newStatus, "config": accountConfig}
 	if result := a.DB.Model(&models.ChannelAccount{}).
 		Where("id = ? AND organization_id = ?", account.ID, a.tenantOrgID).
 		Updates(updates); result.Error != nil || result.RowsAffected != 1 {
@@ -445,7 +495,7 @@ func validateMetaRegistryPlatformBinding(account *models.ChannelAccount) error {
 	}
 	mode := stringConfigValue(account.Config, "instagram_api_mode")
 	wantApp := "messenger"
-	requiredScopes := []string{"pages_manage_metadata", "pages_read_engagement", "pages_messaging"}
+	requiredScopes := metaMessengerRequiredScopes
 	if account.Channel == models.ChannelInstagram {
 		switch mode {
 		case "instagram_login":
@@ -460,6 +510,7 @@ func validateMetaRegistryPlatformBinding(account *models.ChannelAccount) error {
 		return metaregistry.ErrNotFound
 	}
 	if stringConfigValue(account.Metadata, "meta_webhook_app") != wantApp ||
+		stringConfigValue(account.Metadata, "meta_platform_app_id") == "" ||
 		stringConfigValue(account.Metadata, "meta_business_id") == "" ||
 		stringConfigValue(account.Metadata, "meta_authorizing_user_id") == "" {
 		return metaregistry.ErrNotFound

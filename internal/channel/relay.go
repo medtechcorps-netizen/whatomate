@@ -379,6 +379,9 @@ func (a *RelayAdapter) ValidateAccount(ctx context.Context, account *models.Chan
 		return result, err
 	}
 	req.Header.Set(RelaySignatureHeader, signRelayBody(secret, nil))
+	if a.serviceToken != "" {
+		req.Header.Set(RelayServiceTokenHeader, a.serviceToken)
+	}
 	req.Header.Set("User-Agent", "ReReply-Relay/1.0")
 	client, err := a.safeHTTPClient(a.allowLocalhostDev)
 	if err != nil {

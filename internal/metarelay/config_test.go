@@ -148,21 +148,42 @@ func TestLoadConfigErrorsDoNotExposeCredentialValues(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRejectsDynamicRegistryUntilLifecycleRelease(t *testing.T) {
+func TestLoadConfigRequiresExplicitDynamicRegistryAndReaderFence(t *testing.T) {
 	environment := validConfigEnvironment()
 	delete(environment, "META_RELAY_ACCOUNTS_JSON")
 	environment["META_RELAY_REGISTRY_URL"] = "https://app.example.test/internal/meta-registry/v1/resolve"
 	environment["META_RELAY_REGISTRY_SECRET"] = "synthetic-registry-config-secret-at-least-32-bytes"
 	environment["META_RELAY_REGISTRY_EDGE_SECRET"] = "synthetic-registry-edge-secret-at-least-32-bytes"
-	if _, err := loadTestEnvironment(environment); err == nil || !strings.Contains(err.Error(), "not production-enableable") {
-		t.Fatalf("expected dynamic-only lifecycle gate, got %v", err)
+	environment["META_RELAY_MANAGED_MESSENGER_APP_ID"] = "123456"
+	environment["META_RELAY_MANAGED_MESSENGER_APP_SECRET"] = "managed-messenger-app-secret-at-least-32-bytes"
+	environment["META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN"] = "managed-messenger-verify-token"
+	if _, err := loadTestEnvironment(environment); err == nil || !strings.Contains(err.Error(), "exactly when") {
+		t.Fatalf("expected explicit registry gate, got %v", err)
 	}
 
 	environment = validConfigEnvironment()
 	environment["META_RELAY_REGISTRY_URL"] = "https://app.example.test/internal/meta-registry/v1/resolve"
 	environment["META_RELAY_REGISTRY_SECRET"] = "synthetic-registry-config-secret-at-least-32-bytes"
 	environment["META_RELAY_REGISTRY_EDGE_SECRET"] = "synthetic-registry-edge-secret-at-least-32-bytes"
-	if _, err := loadTestEnvironment(environment); err == nil || !strings.Contains(err.Error(), "not production-enableable") {
-		t.Fatalf("expected mixed static/dynamic lifecycle gate, got %v", err)
+	environment["META_RELAY_MANAGED_MESSENGER_APP_ID"] = "123456"
+	environment["META_RELAY_MANAGED_MESSENGER_APP_SECRET"] = "managed-messenger-app-secret-at-least-32-bytes"
+	environment["META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN"] = "managed-messenger-verify-token"
+	environment["META_RELAY_REGISTRY_ENABLED"] = "true"
+	if _, err := loadTestEnvironment(environment); err == nil || !strings.Contains(err.Error(), "READER_VERSION") {
+		t.Fatalf("expected reader version gate, got %v", err)
+	}
+
+	environment["META_RELAY_DYNAMIC_QUEUE_READER_VERSION"] = "2"
+	config, err := loadTestEnvironment(environment)
+	if err != nil {
+		t.Fatalf("expected explicitly fenced mixed static/dynamic config, got %v", err)
+	}
+	if !config.RegistryEnabled || config.RegistryQueueReader != InboundJobSchemaVersion {
+		t.Fatalf("dynamic registry fence was not retained: %#v", config)
+	}
+
+	delete(environment, "META_RELAY_MANAGED_MESSENGER_APP_ID")
+	if _, err := loadTestEnvironment(environment); err == nil || !strings.Contains(err.Error(), "MANAGED_MESSENGER_APP_ID") {
+		t.Fatalf("expected exact dynamic Messenger app identity, got %v", err)
 	}
 }

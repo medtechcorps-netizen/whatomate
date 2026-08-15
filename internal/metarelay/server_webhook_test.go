@@ -142,6 +142,65 @@ func TestWebhookRoutesRejectCrossAppCredentials(t *testing.T) {
 	}
 }
 
+func TestManagedMessengerWebhookUsesDistinctDynamicCredentialsAndKeepsStaticRouteCompatible(t *testing.T) {
+	config := newTestConfig(t)
+	config.RegistryEnabled = true
+	config.RegistryURL = "https://app.example.test/internal/meta-registry/v1/resolve"
+	config.RegistrySecret = "registry-service-secret-at-least-32-bytes"
+	config.RegistryEdgeSecret = "registry-edge-secret-at-least-32-bytes"
+	config.ManagedMessengerAppID = "123456"
+	config.ManagedMessengerAppSecret = "managed-messenger-app-secret-at-least-32-bytes"
+	config.ManagedMessengerVerifyToken = "managed-messenger-verify-token"
+	static, _ := config.accountByKey("messenger-page")
+	dynamic := *static
+	dynamic.Key = "managed-page"
+	dynamic.ExternalAccountID = "managed-page-1"
+	dynamic.PlatformAppID = config.ManagedMessengerAppID
+	dynamic.registryManaged = true
+	store := newMemoryServerStore()
+	server, err := NewServer(config, store)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	server.registry = fixedRegistryResolver{account: &dynamic}
+	handler := server.Handler()
+
+	assertVerification := func(path, token string, want int) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet,
+			path+"?hub.mode=subscribe&hub.challenge=challenge&hub.verify_token="+token, nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != want {
+			t.Fatalf("%s verification returned %d (%s), want %d", path, response.Code, response.Body.String(), want)
+		}
+	}
+	assertVerification("/v1/meta/messenger/managed-webhook", config.ManagedMessengerVerifyToken, http.StatusOK)
+	assertVerification("/v1/meta/messenger/managed-webhook", config.MessengerVerifyToken, http.StatusForbidden)
+	assertVerification("/v1/meta/messenger/webhook", config.ManagedMessengerVerifyToken, http.StatusForbidden)
+
+	managedBody := []byte(`{"object":"page","entry":[{"id":"managed-page-1","time":1770000000,"messaging":[]}]}`)
+	staticBody := []byte(`{"object":"page","entry":[{"id":"page-1","time":1770000000,"messaging":[]}]}`)
+	assertWebhook := func(path, secret string, body []byte, want int) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+		request.Header.Set(MetaSignatureHeader, signBody(secret, body))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != want {
+			t.Fatalf("%s returned %d (%s), want %d", path, response.Code, response.Body.String(), want)
+		}
+	}
+	assertWebhook("/v1/meta/messenger/managed-webhook", config.MessengerAppSecret, managedBody, http.StatusUnauthorized)
+	assertWebhook("/v1/meta/messenger/webhook", config.ManagedMessengerAppSecret, staticBody, http.StatusUnauthorized)
+	assertWebhook("/v1/meta/messenger/managed-webhook", config.ManagedMessengerAppSecret, staticBody, http.StatusNotFound)
+	assertWebhook("/v1/meta/messenger/managed-webhook", config.ManagedMessengerAppSecret, managedBody, http.StatusOK)
+	assertWebhook("/v1/meta/messenger/webhook", config.MessengerAppSecret, staticBody, http.StatusOK)
+	if store.acceptCalls != 2 {
+		t.Fatalf("durable accept called %d times, want managed+legacy only", store.acceptCalls)
+	}
+}
+
 func TestWebhookAcceptanceIsIdempotent(t *testing.T) {
 	config := newTestConfig(t)
 	store := newMemoryServerStore()
