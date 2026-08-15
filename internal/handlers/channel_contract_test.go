@@ -65,6 +65,7 @@ func TestManagedMessengerResponseExposesOnlyDerivedReconciliationState(t *testin
 		},
 		Metadata: models.JSONB{
 			metaMessengerSubscriptionOperationStateKey:    metaMessengerSubscriptionSubscribeFailed,
+			metaMessengerSubscriptionDesiredStateKey:      metaMessengerSubscriptionDesiredSubscribed,
 			metaMessengerSubscriptionFencedOperationIDKey: "operation-id-must-not-leak",
 			"meta_authorizing_user_id":                    "authorizer-must-not-leak",
 			"meta_deauthorization_event_digest":           "digest-must-not-leak",
@@ -73,6 +74,7 @@ func TestManagedMessengerResponseExposesOnlyDerivedReconciliationState(t *testin
 
 	response := channelAccountToResponse(account)
 	assert.True(t, response.MetaSubscriptionReconciliationRequired)
+	assert.Equal(t, metaMessengerSubscriptionDesiredSubscribed, response.MetaSubscriptionReconciliationDesired)
 
 	encoded, err := json.Marshal(response)
 	require.NoError(t, err)
@@ -84,6 +86,10 @@ func TestManagedMessengerResponseExposesOnlyDerivedReconciliationState(t *testin
 
 	account.Channel = models.ChannelInstagram
 	assert.False(t, channelAccountToResponse(account).MetaSubscriptionReconciliationRequired)
+	account.Config["instagram_api_mode"] = "instagram_login"
+	instagramResponse := channelAccountToResponse(account)
+	assert.True(t, instagramResponse.MetaSubscriptionReconciliationRequired)
+	assert.Equal(t, metaMessengerSubscriptionDesiredSubscribed, instagramResponse.MetaSubscriptionReconciliationDesired)
 }
 
 func TestChannelIdentifiersAreAllowlisted(t *testing.T) {

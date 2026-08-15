@@ -1615,6 +1615,9 @@ func (a *App) finalizeMetaMessengerDisconnect(
 	accountID uuid.UUID,
 	confirmedAt time.Time,
 ) error {
+	if err := lockChannelAIOrganizationScopeTx(a.DB, organizationID); err != nil {
+		return err
+	}
 	account, _, err := a.lockMetaMessengerSubscriptionOperation(
 		organizationID,
 		accountID,

@@ -108,6 +108,16 @@ async function mockChannels(
         },
       }),
   )
+  await page.route(
+    /\/api\/integrations\/meta\/instagram\/onboarding\/status(?:\?.*)?$/,
+    route =>
+      route.fulfill({
+        status: 404,
+        json: {
+          message: 'Managed Instagram onboarding is not available for this workspace',
+        },
+      }),
+  )
   await page.route(/\/api\/product\/entitlements(?:\?.*)?$/, route =>
     route.fulfill({
       json: {

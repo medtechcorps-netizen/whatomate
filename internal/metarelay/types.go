@@ -50,6 +50,7 @@ const (
 	WebhookAppMessenger        WebhookApp = "messenger"
 	WebhookAppManagedMessenger WebhookApp = "managed_messenger"
 	WebhookAppInstagramLogin   WebhookApp = "instagram_login"
+	WebhookAppManagedInstagram WebhookApp = "managed_instagram_login"
 )
 
 // InstagramAPIMode is an explicit, immutable binding between an Instagram
@@ -96,6 +97,9 @@ type Config struct {
 	ManagedMessengerAppID       string
 	ManagedMessengerAppSecret   string
 	ManagedMessengerVerifyToken string
+	ManagedInstagramAppID       string
+	ManagedInstagramAppSecret   string
+	ManagedInstagramVerifyToken string
 	InstagramLoginAppSecret     string
 	InstagramLoginVerifyToken   string
 	GraphAPIVersion             string
@@ -145,6 +149,10 @@ func (c *Config) accountByKey(key string) (*AccountConfig, bool) {
 func (a *AccountConfig) webhookApp() WebhookApp {
 	if a != nil && a.Channel == models.ChannelMessenger && a.registryManaged {
 		return WebhookAppManagedMessenger
+	}
+	if a != nil && a.Channel == models.ChannelInstagram && a.registryManaged &&
+		a.InstagramAPIMode == InstagramAPIModeInstagramLogin {
+		return WebhookAppManagedInstagram
 	}
 	if a != nil &&
 		a.Channel == models.ChannelInstagram &&

@@ -1,6 +1,7 @@
 package metarelay
 
 import (
+	"crypto/hmac"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,6 +56,9 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 		ManagedMessengerAppID:       strings.TrimSpace(getenv("META_RELAY_MANAGED_MESSENGER_APP_ID")),
 		ManagedMessengerAppSecret:   getenv("META_RELAY_MANAGED_MESSENGER_APP_SECRET"),
 		ManagedMessengerVerifyToken: getenv("META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN"),
+		ManagedInstagramAppID:       strings.TrimSpace(getenv("META_RELAY_MANAGED_INSTAGRAM_APP_ID")),
+		ManagedInstagramAppSecret:   getenv("META_RELAY_MANAGED_INSTAGRAM_APP_SECRET"),
+		ManagedInstagramVerifyToken: getenv("META_RELAY_MANAGED_INSTAGRAM_VERIFY_TOKEN"),
 		InstagramLoginAppSecret:     getenv("META_RELAY_INSTAGRAM_APP_SECRET"),
 		InstagramLoginVerifyToken:   getenv("META_RELAY_INSTAGRAM_VERIFY_TOKEN"),
 		GraphAPIVersion:             strings.TrimSpace(getenv("META_RELAY_GRAPH_API_VERSION")),
@@ -158,40 +162,70 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 	if strings.TrimSpace(c.InstagramLoginVerifyToken) == "" {
 		return errors.New("environment variable META_RELAY_INSTAGRAM_VERIFY_TOKEN is required")
 	}
-	if c.MessengerAppSecret == c.InstagramLoginAppSecret {
+	// Preserve the pre-registry route-isolation contract. These two static
+	// webhook applications have always required distinct authenticators,
+	// regardless of whether any managed application is configured.
+	if constantTimeRelayCredentialEqual(c.MessengerAppSecret, c.InstagramLoginAppSecret) {
 		return errors.New("messenger and Instagram app secrets must be distinct")
 	}
-	if c.MessengerVerifyToken == c.InstagramLoginVerifyToken {
+	if constantTimeRelayCredentialEqual(c.MessengerVerifyToken, c.InstagramLoginVerifyToken) {
 		return errors.New("messenger and Instagram verify tokens must be distinct")
 	}
 	if !graphVersionPattern.MatchString(c.GraphAPIVersion) {
 		return errors.New("environment variable META_RELAY_GRAPH_API_VERSION must be explicit, for example v25.0")
 	}
-	registryConfigured := strings.TrimSpace(c.RegistryURL) != "" ||
-		strings.TrimSpace(c.RegistrySecret) != "" || strings.TrimSpace(c.RegistryEdgeSecret) != "" ||
-		strings.TrimSpace(c.ManagedMessengerAppID) != "" ||
+	managedMessengerConfigured := strings.TrimSpace(c.ManagedMessengerAppID) != "" ||
 		strings.TrimSpace(c.ManagedMessengerAppSecret) != "" ||
 		strings.TrimSpace(c.ManagedMessengerVerifyToken) != ""
+	managedInstagramConfigured := strings.TrimSpace(c.ManagedInstagramAppID) != "" ||
+		strings.TrimSpace(c.ManagedInstagramAppSecret) != "" ||
+		strings.TrimSpace(c.ManagedInstagramVerifyToken) != ""
+	registryConfigured := strings.TrimSpace(c.RegistryURL) != "" ||
+		strings.TrimSpace(c.RegistrySecret) != "" || strings.TrimSpace(c.RegistryEdgeSecret) != "" ||
+		managedMessengerConfigured || managedInstagramConfigured
 	if registryConfigured != c.RegistryEnabled {
 		return errors.New("dynamic Meta registry URL and credentials must be configured exactly when META_RELAY_REGISTRY_ENABLED=true")
 	}
 	if registryConfigured {
-		if !metaAppIDPattern.MatchString(c.ManagedMessengerAppID) {
-			return errors.New("environment variable META_RELAY_MANAGED_MESSENGER_APP_ID is required when the dynamic registry is enabled")
+		if !managedMessengerConfigured && !managedInstagramConfigured {
+			return errors.New("at least one managed Meta application is required when the dynamic registry is enabled")
 		}
-		if len(c.ManagedMessengerAppSecret) < 32 {
-			return errors.New("environment variable META_RELAY_MANAGED_MESSENGER_APP_SECRET must contain at least 32 bytes")
+		if managedMessengerConfigured {
+			if !metaAppIDPattern.MatchString(c.ManagedMessengerAppID) {
+				return errors.New("environment variable META_RELAY_MANAGED_MESSENGER_APP_ID is required when managed Messenger is configured")
+			}
+			if len(c.ManagedMessengerAppSecret) < 32 {
+				return errors.New("environment variable META_RELAY_MANAGED_MESSENGER_APP_SECRET must contain at least 32 bytes")
+			}
+			if strings.TrimSpace(c.ManagedMessengerVerifyToken) == "" {
+				return errors.New("environment variable META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN is required")
+			}
 		}
-		if strings.TrimSpace(c.ManagedMessengerVerifyToken) == "" {
-			return errors.New("environment variable META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN is required")
+		if managedInstagramConfigured {
+			if !metaAppIDPattern.MatchString(c.ManagedInstagramAppID) {
+				return errors.New("environment variable META_RELAY_MANAGED_INSTAGRAM_APP_ID is required when managed Instagram is configured")
+			}
+			if len(c.ManagedInstagramAppSecret) < 32 {
+				return errors.New("environment variable META_RELAY_MANAGED_INSTAGRAM_APP_SECRET must contain at least 32 bytes")
+			}
+			if strings.TrimSpace(c.ManagedInstagramVerifyToken) == "" {
+				return errors.New("environment variable META_RELAY_MANAGED_INSTAGRAM_VERIFY_TOKEN is required")
+			}
 		}
-		if c.ManagedMessengerAppSecret == c.MessengerAppSecret ||
-			c.ManagedMessengerAppSecret == c.InstagramLoginAppSecret {
-			return errors.New("managed Messenger and legacy Meta app secrets must be distinct")
+		if managedRelayCredentialConflict(
+			[]string{c.MessengerAppSecret, c.InstagramLoginAppSecret},
+			[]string{c.ManagedMessengerAppSecret, c.ManagedInstagramAppSecret},
+		) || managedRelayCredentialConflict(
+			[]string{c.MessengerVerifyToken, c.InstagramLoginVerifyToken},
+			[]string{c.ManagedMessengerVerifyToken, c.ManagedInstagramVerifyToken},
+		) {
+			return errors.New("legacy and managed Meta applications must use distinct secrets and verify tokens")
 		}
-		if c.ManagedMessengerVerifyToken == c.MessengerVerifyToken ||
-			c.ManagedMessengerVerifyToken == c.InstagramLoginVerifyToken {
-			return errors.New("managed Messenger and legacy Meta verify tokens must be distinct")
+		if managedMessengerConfigured && managedInstagramConfigured &&
+			(c.ManagedMessengerAppID == c.ManagedInstagramAppID ||
+				constantTimeRelayCredentialEqual(c.ManagedMessengerAppSecret, c.ManagedInstagramAppSecret) ||
+				constantTimeRelayCredentialEqual(c.ManagedMessengerVerifyToken, c.ManagedInstagramVerifyToken)) {
+			return errors.New("managed Messenger and Instagram applications must use distinct app IDs, app secrets, and verify tokens")
 		}
 		if c.RegistryQueueReader != InboundJobSchemaVersion {
 			return fmt.Errorf("META_RELAY_DYNAMIC_QUEUE_READER_VERSION must be %d before dynamic producers are enabled", InboundJobSchemaVersion)
@@ -295,6 +329,24 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 		c.byExternal[externalKey] = account
 	}
 	return nil
+}
+
+func managedRelayCredentialConflict(legacy, managed []string) bool {
+	for _, value := range managed {
+		if value == "" {
+			continue
+		}
+		for _, legacyValue := range legacy {
+			if constantTimeRelayCredentialEqual(value, legacyValue) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func constantTimeRelayCredentialEqual(left, right string) bool {
+	return left != "" && right != "" && hmac.Equal([]byte(left), []byte(right))
 }
 
 func validateEndpoint(raw string, allowInsecure bool) error {

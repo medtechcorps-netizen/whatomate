@@ -36,6 +36,7 @@ type Config struct {
 	GoogleSearchConsole GoogleSearchConsoleConfig `koanf:"google_search_console"`
 	MetaRegistry        MetaRegistryConfig        `koanf:"meta_registry"`
 	MetaMessenger       MetaMessengerConfig       `koanf:"meta_messenger_onboarding"`
+	MetaInstagram       MetaInstagramConfig       `koanf:"meta_instagram_onboarding"`
 	ThreadsAppReview    ThreadsAppReviewConfig    `koanf:"threads_app_review"`
 }
 
@@ -80,6 +81,32 @@ type MetaMessengerConfig struct {
 	AllowedOrganizationIDs    string `koanf:"allowed_organization_ids"`
 	AllowAllOrganizations     bool   `koanf:"allow_all_organizations"`
 	AllowDevelopmentUserToken bool   `koanf:"allow_development_user_token"`
+}
+
+// MetaInstagramConfig is the deployment-owned Instagram Login application
+// used only by the managed Instagram lifecycle. It is intentionally separate
+// from the relay's legacy/static Instagram application and is released to one
+// explicit workspace at a time.
+type MetaInstagramConfig struct {
+	Enabled                       bool   `koanf:"enabled"`
+	QuarantineOnly                bool   `koanf:"quarantine_only"`
+	AppID                         string `koanf:"app_id"`
+	AppSecret                     string `koanf:"app_secret"`
+	AppReviewStatus               string `koanf:"app_review_status"`
+	GraphAPIVersion               string `koanf:"graph_api_version"`
+	AuthorizationBaseURL          string `koanf:"authorization_base_url"`
+	TokenBaseURL                  string `koanf:"token_base_url"`
+	GraphBaseURL                  string `koanf:"graph_base_url"`
+	ReReplyBaseURL                string `koanf:"rereply_base_url"`
+	RelayBaseURL                  string `koanf:"relay_base_url"`
+	HealthApprovalMaxAgeMins      int    `koanf:"health_approval_max_age_mins"`
+	RevalidationLeadMins          int    `koanf:"revalidation_lead_mins"`
+	TokenRefreshLeadHours         int    `koanf:"token_refresh_lead_hours"`
+	SchedulerIntervalSeconds      int    `koanf:"scheduler_interval_seconds"`
+	AllowedOrganizationID         string `koanf:"allowed_organization_id"`
+	DevelopmentTestProfileID      string `koanf:"development_test_profile_id"`
+	DevelopmentTestOAuthSubjectID string `koanf:"development_test_oauth_subject_id"`
+	DevelopmentAppRole            string `koanf:"development_app_role"`
 }
 
 // GoogleSearchConsoleConfig contains deployment-managed OAuth credentials.
@@ -292,10 +319,24 @@ func Load(configPath string) (*Config, error) {
 
 	// Set defaults
 	setDefaults(&cfg)
-	if err := validateMetaRegistryConfig(cfg.MetaRegistry, cfg.MetaMessenger, cfg.App); err != nil {
+	if err := validateMetaRegistryConfig(
+		cfg.MetaRegistry,
+		cfg.MetaMessenger,
+		cfg.MetaInstagram,
+		cfg.App,
+	); err != nil {
 		return nil, err
 	}
 	if err := validateMetaMessengerConfig(cfg.MetaMessenger, cfg.MetaRegistry, cfg.App.Environment, cfg.Server); err != nil {
+		return nil, err
+	}
+	if err := validateMetaInstagramConfig(
+		cfg.MetaInstagram,
+		cfg.MetaMessenger,
+		cfg.MetaRegistry,
+		cfg.App.Environment,
+		cfg.Server,
+	); err != nil {
 		return nil, err
 	}
 	if err := validateThreadsAppReviewConfig(cfg.ThreadsAppReview, cfg.App.Environment); err != nil {
@@ -330,7 +371,12 @@ func validateThreadsAppReviewConfig(config ThreadsAppReviewConfig, environment s
 	return nil
 }
 
-func validateMetaRegistryConfig(config MetaRegistryConfig, messenger MetaMessengerConfig, app AppConfig) error {
+func validateMetaRegistryConfig(
+	config MetaRegistryConfig,
+	messenger MetaMessengerConfig,
+	instagram MetaInstagramConfig,
+	app AppConfig,
+) error {
 	serviceSecret := strings.TrimSpace(config.ServiceSecret)
 	edgeSecret := strings.TrimSpace(config.RelayEdgeSecret)
 	if serviceSecret != "" && len(serviceSecret) < 32 {
@@ -356,8 +402,8 @@ func validateMetaRegistryConfig(config MetaRegistryConfig, messenger MetaMesseng
 		if serviceSecret == "" || edgeSecret == "" {
 			return errors.New("meta registry service and relay edge secrets are required when enabled")
 		}
-		if !messenger.Enabled {
-			return errors.New("meta registry cannot be enabled before the Messenger lifecycle is enabled")
+		if !messenger.Enabled && !instagram.Enabled {
+			return errors.New("meta registry cannot be enabled before a managed Meta lifecycle is enabled")
 		}
 		if config.QueueReaderVersion != 2 {
 			return errors.New("meta registry requires queue reader schema version 2 before producers are enabled")
@@ -365,6 +411,150 @@ func validateMetaRegistryConfig(config MetaRegistryConfig, messenger MetaMesseng
 		if strings.TrimSpace(app.EncryptionKey) == "" {
 			return errors.New("app encryption key is required when the Meta registry is enabled")
 		}
+	}
+	return nil
+}
+
+func validateMetaInstagramConfig(
+	config MetaInstagramConfig,
+	messenger MetaMessengerConfig,
+	registry MetaRegistryConfig,
+	environment string,
+	server ServerConfig,
+) error {
+	configured := config.AppID != "" || config.AppSecret != "" ||
+		config.QuarantineOnly ||
+		strings.TrimSpace(config.AppReviewStatus) != "" ||
+		config.ReReplyBaseURL != "" || config.RelayBaseURL != "" ||
+		strings.TrimSpace(config.AllowedOrganizationID) != "" ||
+		strings.TrimSpace(config.DevelopmentTestProfileID) != "" ||
+		strings.TrimSpace(config.DevelopmentTestOAuthSubjectID) != "" ||
+		strings.TrimSpace(config.DevelopmentAppRole) != ""
+	if !config.Enabled {
+		if configured {
+			return errors.New("instagram onboarding must be explicitly enabled when platform credentials, review state, endpoints, or an organization allowlist are configured")
+		}
+		return nil
+	}
+	if !registry.Enabled {
+		return errors.New("instagram onboarding requires the encrypted Meta registry lifecycle")
+	}
+	normalizedEnvironment := strings.ToLower(strings.TrimSpace(environment))
+	switch normalizedEnvironment {
+	case "development", "staging", "production":
+	default:
+		return errors.New("instagram onboarding environment must be development, staging, or production")
+	}
+	if server.WriteTimeout < 120 {
+		return errors.New("instagram onboarding requires server.write_timeout of at least 120 seconds")
+	}
+	organizationID := strings.TrimSpace(config.AllowedOrganizationID)
+	if !canonicalUUID(organizationID) {
+		return errors.New("instagram onboarding allowed_organization_id must contain exactly one canonical UUID")
+	}
+	if !canonicalNumericMetaID(config.AppID) {
+		return errors.New("instagram onboarding app_id must be a canonical numeric Meta ID")
+	}
+	if len(config.AppSecret) < 32 || strings.TrimSpace(config.AppSecret) != config.AppSecret {
+		return errors.New("instagram onboarding app_secret must contain at least 32 bytes without surrounding whitespace")
+	}
+	if messenger.Enabled && (strings.TrimSpace(messenger.AppID) == strings.TrimSpace(config.AppID) ||
+		subtleConstantTimeConfigEqual(messenger.AppSecret, config.AppSecret)) {
+		return errors.New("managed Messenger and Instagram applications must use distinct IDs and secrets")
+	}
+	reviewStatus := strings.ToLower(strings.TrimSpace(config.AppReviewStatus))
+	switch reviewStatus {
+	case "not_submitted", "pending", "approved", "rejected":
+	default:
+		return errors.New("instagram onboarding app_review_status must be not_submitted, pending, approved, or rejected")
+	}
+	production := normalizedEnvironment == "production"
+	developmentProfileID := strings.TrimSpace(config.DevelopmentTestProfileID)
+	developmentOAuthSubjectID := strings.TrimSpace(config.DevelopmentTestOAuthSubjectID)
+	developmentRole := strings.ToLower(strings.TrimSpace(config.DevelopmentAppRole))
+	if production && (developmentProfileID != "" || developmentOAuthSubjectID != "" || developmentRole != "") {
+		return errors.New("instagram onboarding development profile, OAuth subject, and app-role overrides are forbidden in production")
+	}
+	if config.QuarantineOnly {
+		if developmentProfileID != "" || developmentOAuthSubjectID != "" || developmentRole != "" {
+			return errors.New("instagram quarantine-only mode cannot retain development profile, OAuth subject, or app-role overrides")
+		}
+	} else if production {
+		if reviewStatus != "approved" {
+			return errors.New("instagram onboarding requires approved app review in production unless quarantine_only is enabled")
+		}
+	} else if reviewStatus != "approved" {
+		if !canonicalNumericMetaID(developmentProfileID) {
+			return errors.New("nonproduction Instagram testing requires one canonical development_test_profile_id")
+		}
+		if !canonicalNumericMetaID(developmentOAuthSubjectID) {
+			return errors.New("nonproduction Instagram testing requires one canonical development_test_oauth_subject_id")
+		}
+		switch developmentRole {
+		case "administrator", "developer", "tester":
+		default:
+			return errors.New("nonproduction Instagram testing requires an exact administrator, developer, or tester app role")
+		}
+	} else if developmentProfileID != "" || developmentOAuthSubjectID != "" || developmentRole != "" {
+		return errors.New("approved Instagram releases cannot retain development profile, OAuth subject, or app-role overrides")
+	}
+	if !metaGraphVersionPattern.MatchString(strings.TrimSpace(config.GraphAPIVersion)) {
+		return errors.New("instagram onboarding graph_api_version must be explicit, for example v25.0")
+	}
+	if err := validateMetaLifecyclePinnedOrigin(
+		config.AuthorizationBaseURL,
+		production,
+		"www.instagram.com",
+	); err != nil {
+		return errors.New("instagram onboarding authorization_base_url must be the approved Instagram HTTPS origin")
+	}
+	if err := validateMetaLifecyclePinnedOrigin(config.TokenBaseURL, production, "api.instagram.com"); err != nil {
+		return errors.New("instagram onboarding token_base_url must be the approved Instagram HTTPS origin")
+	}
+	if err := validateMetaLifecyclePinnedOrigin(config.GraphBaseURL, production, "graph.instagram.com"); err != nil {
+		return errors.New("instagram onboarding graph_base_url must be the approved Instagram Graph HTTPS origin")
+	}
+	if err := validateMetaLifecycleBaseURL(config.ReReplyBaseURL, production, false); err != nil {
+		return errors.New("instagram onboarding rereply_base_url must be an absolute HTTPS base URL")
+	}
+	if production && config.ReReplyBaseURL != "https://app.rereply.app" {
+		return errors.New("instagram onboarding production rereply_base_url must be exactly https://app.rereply.app")
+	}
+	if err := validateMetaLifecycleBaseURL(config.RelayBaseURL, production, false); err != nil {
+		return errors.New("instagram onboarding relay_base_url must be an absolute HTTPS base URL")
+	}
+	if production && config.RelayBaseURL != "https://app.rereply.app/meta-relay" {
+		return errors.New("instagram onboarding production relay_base_url must be exactly https://app.rereply.app/meta-relay")
+	}
+	if config.HealthApprovalMaxAgeMins < 1 || config.HealthApprovalMaxAgeMins > 60 ||
+		config.RevalidationLeadMins < 5 || config.RevalidationLeadMins >= registry.OwnershipMaxAgeMins ||
+		config.TokenRefreshLeadHours < 24 || config.TokenRefreshLeadHours > 30*24 ||
+		config.SchedulerIntervalSeconds < 10 || config.SchedulerIntervalSeconds > 300 {
+		return errors.New("instagram onboarding lifecycle timing configuration is outside safe bounds")
+	}
+	return nil
+}
+
+func subtleConstantTimeConfigEqual(left, right string) bool {
+	if left == "" || right == "" || len(left) != len(right) {
+		return false
+	}
+	return hmac.Equal([]byte(left), []byte(right))
+}
+
+func validateMetaLifecyclePinnedOrigin(raw string, production bool, productionHost string) error {
+	trimmed := strings.TrimSpace(raw)
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil ||
+		parsed.Fragment != "" || parsed.RawQuery != "" || parsed.Path != "" || parsed.RawPath != "" ||
+		parsed.ForceQuery || parsed.Opaque != "" {
+		return errors.New("URL must be an origin")
+	}
+	if parsed.Scheme != "https" {
+		return errors.New("URL must use HTTPS")
+	}
+	if production && (parsed.Host != productionHost || parsed.Hostname() != productionHost) {
+		return errors.New("production origin is not pinned")
 	}
 	return nil
 }
@@ -532,6 +722,30 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.MetaMessenger.SchedulerIntervalSeconds == 0 {
 		cfg.MetaMessenger.SchedulerIntervalSeconds = 60
+	}
+	if cfg.MetaInstagram.GraphAPIVersion == "" {
+		cfg.MetaInstagram.GraphAPIVersion = "v25.0"
+	}
+	if cfg.MetaInstagram.AuthorizationBaseURL == "" {
+		cfg.MetaInstagram.AuthorizationBaseURL = "https://www.instagram.com"
+	}
+	if cfg.MetaInstagram.TokenBaseURL == "" {
+		cfg.MetaInstagram.TokenBaseURL = "https://api.instagram.com"
+	}
+	if cfg.MetaInstagram.GraphBaseURL == "" {
+		cfg.MetaInstagram.GraphBaseURL = "https://graph.instagram.com"
+	}
+	if cfg.MetaInstagram.HealthApprovalMaxAgeMins == 0 {
+		cfg.MetaInstagram.HealthApprovalMaxAgeMins = 15
+	}
+	if cfg.MetaInstagram.RevalidationLeadMins == 0 {
+		cfg.MetaInstagram.RevalidationLeadMins = 60
+	}
+	if cfg.MetaInstagram.TokenRefreshLeadHours == 0 {
+		cfg.MetaInstagram.TokenRefreshLeadHours = 7 * 24
+	}
+	if cfg.MetaInstagram.SchedulerIntervalSeconds == 0 {
+		cfg.MetaInstagram.SchedulerIntervalSeconds = 60
 	}
 	if cfg.Server.Host == "" {
 		cfg.Server.Host = "0.0.0.0"

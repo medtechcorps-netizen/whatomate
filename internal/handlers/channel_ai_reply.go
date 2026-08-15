@@ -150,6 +150,80 @@ func cancelChannelAIReplyJobsForAccountTx(
 	)
 }
 
+// cancelManagedMetaQueuedWorkForAccountTx is the authorization-generation
+// fence for managed Meta accounts. A queued manual or AI reply created under
+// credential generation N must not be replayed with generation N+1. Pending,
+// retrying, and processing jobs are cancelled atomically with the lifecycle
+// mutation. Scheduled `generating` and outbox `dispatching` are intentionally
+// excluded because those worker compare-and-swaps are their respective Qwen
+// and delivery provider-attempt points of no return; both paths re-fence before
+// writing their next durable artifact.
+func cancelManagedMetaQueuedWorkForAccountTx(
+	tx *gorm.DB,
+	organizationID, channelAccountID uuid.UUID,
+	reason string,
+) error {
+	if tx == nil || organizationID == uuid.Nil || channelAccountID == uuid.Nil {
+		return errors.New("tenant managed Meta account transaction is required")
+	}
+	if err := cancelChannelAIScheduledJobsTx(
+		tx,
+		organizationID,
+		"payload ->> 'channel_account_id' = ?",
+		channelAccountID.String(),
+		reason,
+	); err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	var cancelledJobs []models.OutboxJob
+	if err := tx.Model(&cancelledJobs).
+		Clauses(clause.Returning{Columns: []clause.Column{{Name: "message_id"}}}).
+		Where(
+			"organization_id = ? AND channel_account_id = ? AND status IN ?",
+			organizationID,
+			channelAccountID,
+			[]models.OutboxJobStatus{
+				models.OutboxJobStatusPending,
+				models.OutboxJobStatusRetrying,
+				models.OutboxJobStatusProcessing,
+			},
+		).
+		Updates(map[string]any{
+			"status":          models.OutboxJobStatusCancelled,
+			"failed_at":       now,
+			"last_error_code": "managed_meta_generation_cancelled",
+			"last_error":      strings.TrimSpace(reason),
+			"locked_at":       nil,
+			"locked_by":       "",
+			"updated_at":      now,
+		}).Error; err != nil {
+		return err
+	}
+	messageIDs := make([]uuid.UUID, 0, len(cancelledJobs))
+	for index := range cancelledJobs {
+		if cancelledJobs[index].MessageID != nil {
+			messageIDs = append(messageIDs, *cancelledJobs[index].MessageID)
+		}
+	}
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	return tx.Model(&models.Message{}).
+		Where(
+			"organization_id = ? AND id IN ? AND status = ?",
+			organizationID,
+			messageIDs,
+			models.MessageStatusPending,
+		).
+		Updates(map[string]any{
+			"status":        models.MessageStatusFailed,
+			"error_message": "Managed Meta authorization changed before delivery",
+			"updated_at":    now,
+		}).Error
+}
+
 func cancelChannelAIScheduledJobsForConversationTx(
 	tx *gorm.DB,
 	organizationID, conversationID uuid.UUID,

@@ -42,6 +42,7 @@ func TestChannelMessageEnqueueWaitsForDisconnectAndFailsClosed(t *testing.T) {
 	disconnectTx := db.Begin()
 	require.NoError(t, disconnectTx.Error)
 	t.Cleanup(func() { _ = disconnectTx.Rollback().Error })
+	require.NoError(t, lockChannelAIOrganizationScopeTx(disconnectTx, organization.ID))
 	var account models.ChannelAccount
 	require.NoError(t, disconnectTx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where(
@@ -66,12 +67,16 @@ func TestChannelMessageEnqueueWaitsForDisconnectAndFailsClosed(t *testing.T) {
 			}
 			enqueuePID <- backendPID
 			return session.Transaction(func(tx *gorm.DB) error {
+				if err := lockChannelAIOrganizationScopeTx(tx, organization.ID); err != nil {
+					return err
+				}
 				return lockChannelAccountForMessageEnqueue(
 					tx,
 					organization.ID,
 					conversation.ChannelAccountID,
 					conversation.Channel,
 					time.Now().UTC(),
+					nil,
 				)
 			})
 		})

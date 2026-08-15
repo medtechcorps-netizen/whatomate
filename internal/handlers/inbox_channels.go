@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/audit"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/database"
+	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -535,12 +537,21 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 	}
 
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		// The tenant organization row is the shared linearization point for
+		// channel enqueue and managed-Meta lifecycle mutations. Acquire it before
+		// the account row so disconnect/quarantine and enqueue have one stable
+		// winner and never invert their lock order.
+		if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
+			return err
+		}
+		enqueueFenceAt := time.Now().UTC()
 		if err := lockChannelAccountForMessageEnqueue(
 			tx,
 			orgID,
 			conversation.ChannelAccountID,
 			conversation.Channel,
-			now,
+			enqueueFenceAt,
+			a,
 		); err != nil {
 			return err
 		}
@@ -669,6 +680,7 @@ func lockChannelAccountForMessageEnqueue(
 	orgID, accountID uuid.UUID,
 	channel models.Channel,
 	now time.Time,
+	app *App,
 ) error {
 	// Serialize enqueue with account disconnect and credential rotation. If
 	// disconnect commits first, this observes the disabled account and creates
@@ -676,7 +688,10 @@ func lockChannelAccountForMessageEnqueue(
 	// necessarily sees the new job.
 	var account models.ChannelAccount
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Select("id", "organization_id", "channel", "provider", "status", "config").
+		Select(
+			"id", "organization_id", "channel", "provider", "external_account_id",
+			"status", "config", "metadata",
+		).
 		Where("id = ? AND organization_id = ?", accountID, orgID).
 		First(&account).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -689,8 +704,8 @@ func lockChannelAccountForMessageEnqueue(
 		!boolConfigValue(account.Config, "outbound_enabled") {
 		return errChannelAccountUnavailableAtEnqueue
 	}
-	var usableCredentialCount int64
-	if err := tx.Model(&models.ChannelCredential{}).
+	var credentials []models.ChannelCredential
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where(
 			"organization_id = ? AND channel_account_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
 			orgID,
@@ -701,11 +716,50 @@ func lockChannelAccountForMessageEnqueue(
 			},
 			now,
 		).
-		Count(&usableCredentialCount).Error; err != nil {
+		Order("version DESC").
+		Order("id ASC").
+		Find(&credentials).Error; err != nil {
 		return err
 	}
-	if usableCredentialCount != 1 {
+	managedMetaIntent := managedMetaControlPlaneIntent(&account)
+	if !managedMetaIntent {
+		// Legacy/static accounts retain their original one-current-credential
+		// contract. Managed Meta is the sole two-credential exception.
+		if len(credentials) != 1 {
+			return errChannelAccountUnavailableAtEnqueue
+		}
+		return nil
+	}
+	if !boolConfigValue(account.Config, "meta_registry_managed") ||
+		stringConfigValue(account.Config, "meta_management_mode") !=
+			metaregistry.ManagementModePlatformOAuth {
 		return errChannelAccountUnavailableAtEnqueue
+	}
+	oauth := currentMetaRegistryCredential(credentials, models.ChannelCredentialKindOAuth, now)
+	webhook := currentMetaRegistryCredential(credentials, models.ChannelCredentialKindWebhook, now)
+	if len(credentials) != 2 || oauth == nil || webhook == nil || oauth.ID == webhook.ID {
+		return errChannelAccountUnavailableAtEnqueue
+	}
+	if account.Channel == models.ChannelInstagram &&
+		!metaInstagramCredentialPairGenerationValid(oauth, webhook, now) {
+		return errChannelAccountUnavailableAtEnqueue
+	}
+	if stringConfigValue(account.Metadata, "meta_ownership_state") != metaregistry.OwnershipVerified ||
+		stringConfigValue(account.Metadata, "meta_deauthorized_at") != "" ||
+		stringConfigValue(account.Metadata, metaMessengerSubscriptionDesiredStateKey) !=
+			metaMessengerSubscriptionDesiredSubscribed ||
+		stringConfigValue(account.Metadata, metaMessengerSubscriptionOperationStateKey) !=
+			metaMessengerSubscriptionSubscribeComplete ||
+		stringConfigValue(account.Metadata, metaMessengerSubscriptionRemoteStateKey) !=
+			metaMessengerSubscriptionRemoteSubscribed {
+		return errChannelAccountUnavailableAtEnqueue
+	}
+	if account.Channel == models.ChannelInstagram {
+		if app == nil || app.metaInstagramManagedURLBindingReason(&account) != "" ||
+			app.metaInstagramReleaseGuardReason(account, orgID) != "" ||
+			!metaInstagramSubscribedOperationMatchesCredentials(account.Metadata, *oauth, *webhook) {
+			return errChannelAccountUnavailableAtEnqueue
+		}
 	}
 	return nil
 }
@@ -803,9 +857,17 @@ func (a *App) MarkInboxConversationRead(r *fastglue.Request) error {
 	if len(request.ExternalMessageIDs) > 0 &&
 		conversation.ChannelAccount != nil &&
 		conversation.ChannelAccount.Status == models.ChannelAccountStatusActive {
-		if adapter, adapterErr := a.channelAdapter(conversation.ChannelAccount); adapterErr == nil &&
+		var markErr error
+		if managedInstagramReadReceiptRequiresFence(conversation.ChannelAccount) {
+			providerSynced, markErr = a.markManagedInstagramConversationRead(
+				requestContext(r),
+				orgID,
+				conversation,
+				request.ExternalMessageIDs,
+			)
+		} else if adapter, adapterErr := a.channelAdapter(conversation.ChannelAccount); adapterErr == nil &&
 			adapter.Capabilities(conversation.ChannelAccount).ReadReceipts {
-			if markErr := adapter.MarkRead(
+			markErr = adapter.MarkRead(
 				requestContext(r),
 				conversation.ChannelAccount,
 				channelapi.ConversationRef{
@@ -813,19 +875,19 @@ func (a *App) MarkInboxConversationRead(r *fastglue.Request) error {
 					ExternalID: conversation.ExternalConversationID,
 				},
 				request.ExternalMessageIDs,
-			); markErr == nil {
-				providerSynced = true
-			} else {
-				a.Log.Warn(
-					"Failed to sync conversation read receipt",
-					"error",
-					markErr,
-					"organization_id",
-					orgID,
-					"conversation_id",
-					conversation.ID,
-				)
-			}
+			)
+			providerSynced = markErr == nil
+		}
+		if markErr != nil {
+			a.Log.Warn(
+				"Failed to sync conversation read receipt",
+				"error",
+				markErr,
+				"organization_id",
+				orgID,
+				"conversation_id",
+				conversation.ID,
+			)
 		}
 	}
 
@@ -834,6 +896,108 @@ func (a *App) MarkInboxConversationRead(r *fastglue.Request) error {
 		"provider_synced":     providerSynced,
 		"legacy_state_synced": legacyStateSynced,
 	})
+}
+
+func managedInstagramReadReceiptRequiresFence(account *models.ChannelAccount) bool {
+	if account == nil || account.Channel != models.ChannelInstagram ||
+		account.Provider != channelapi.RelayProvider {
+		return false
+	}
+	// Include partially downgraded managed rows in the fenced path. A lifecycle
+	// mutation must not be able to escape the late check merely by clearing one
+	// of the two control-plane config markers before this request reloads it.
+	return managedInstagramControlPlaneIntent(account)
+}
+
+// markManagedInstagramConversationRead holds the same organizations.id mutex
+// used by lifecycle cancellation from the fresh-account check through the
+// relay call. There is no durable read-receipt dispatch row on which to CAS, so
+// retaining the mutex across MarkRead is what gives the provider attempt and a
+// concurrent lifecycle downgrade a deterministic winner. The local
+// ConversationRead has already committed before this optional provider sync.
+func (a *App) markManagedInstagramConversationRead(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	conversation *models.InboxConversation,
+	externalMessageIDs []string,
+) (bool, error) {
+	if a == nil || a.DB == nil || conversation == nil ||
+		conversation.ChannelAccountID == uuid.Nil || len(externalMessageIDs) == 0 {
+		return false, errChannelAccountUnavailableAtEnqueue
+	}
+
+	providerSynced := false
+	err := database.WithTenantReadCommitted(
+		a.rootApp().DB,
+		organizationID,
+		func(tx *gorm.DB) error {
+			// Lock order is organization -> account -> credentials, exactly as
+			// enqueue and lifecycle control-plane transactions require.
+			if err := lockChannelAIOrganizationScopeTx(tx, organizationID); err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			if err := lockChannelAccountForMessageEnqueue(
+				tx,
+				organizationID,
+				conversation.ChannelAccountID,
+				models.ChannelInstagram,
+				now,
+				a,
+			); err != nil {
+				return err
+			}
+
+			var account models.ChannelAccount
+			if err := tx.Where(
+				"id = ? AND organization_id = ?",
+				conversation.ChannelAccountID,
+				organizationID,
+			).First(&account).Error; err != nil {
+				return err
+			}
+			if !managedInstagramReadReceiptRequiresFence(&account) {
+				return errChannelAccountUnavailableAtEnqueue
+			}
+			if err := tx.Where(
+				"organization_id = ? AND channel_account_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+				organizationID,
+				account.ID,
+				[]models.ChannelCredentialStatus{
+					models.ChannelCredentialStatusActive,
+					models.ChannelCredentialStatusExpiring,
+				},
+				now,
+			).
+				Order("version DESC").
+				Order("id ASC").
+				Find(&account.Credentials).Error; err != nil {
+				return err
+			}
+
+			adapter, err := a.channelAdapter(&account)
+			if err != nil {
+				return err
+			}
+			if !adapter.Capabilities(&account).ReadReceipts {
+				return nil
+			}
+			if err := adapter.MarkRead(
+				ctx,
+				&account,
+				channelapi.ConversationRef{
+					ID:         conversation.ID,
+					ExternalID: conversation.ExternalConversationID,
+				},
+				externalMessageIDs,
+			); err != nil {
+				return err
+			}
+			providerSynced = true
+			return nil
+		},
+	)
+	return providerSynced, err
 }
 
 func loadInboxConversation(db *gorm.DB, orgID, conversationID uuid.UUID, credentials bool) (*models.InboxConversation, error) {

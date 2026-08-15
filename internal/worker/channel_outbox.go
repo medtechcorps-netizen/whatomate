@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
+	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/threadsreview"
 	"gorm.io/gorm"
@@ -32,7 +34,10 @@ var (
 	errChannelOutboxThreadsBinding    = errors.New("threads app binding is not active")
 	errChannelOutboxConsent           = errors.New("contact consent does not permit delivery")
 	errChannelOutboxAIPolicy          = errors.New("automatic AI reply is no longer eligible")
+	errChannelOutboxManagedMetaFence  = errors.New("managed Meta delivery authorization is no longer current")
 )
+
+const managedInstagramChannelOutboxProviderOperationLimit = 90 * time.Second
 
 // RunChannelOutbox runs the durable provider-neutral delivery loop until the
 // context is cancelled. It is intended to be started alongside Worker.Run.
@@ -418,11 +423,13 @@ func (w *Worker) deliverChannelOutboxJob(
 		)
 	}
 	if isChannelAIReplyOutbox(&job, outbound) {
-		if err := w.recheckChannelAIOutboxDispatch(
+		fencedAccount, err := w.recheckChannelAIOutboxDispatchWithAccount(
 			orgID,
 			job.ID,
 			workerID,
-		); err != nil {
+			&account,
+		)
+		if err != nil {
 			return w.cancelChannelAIOutboxJob(
 				orgID,
 				&job,
@@ -430,17 +437,47 @@ func (w *Worker) deliverChannelOutboxJob(
 				err,
 			)
 		}
+		account = *fencedAccount
+		job.Status = models.OutboxJobStatusDispatching
+	} else if isManagedMetaChannelOutboxAccount(&account) {
+		// This is the provider-attempt boundary for ordinary managed-Meta
+		// messages. Re-read the runtime binding and exact credential generation
+		// under the shared organization mutex, then atomically cross processing
+		// to dispatching immediately before the network call.
+		fencedAccount, fenceErr := w.markManagedMetaChannelOutboxDispatching(
+			orgID,
+			job.ID,
+			workerID,
+			&account,
+		)
+		if fenceErr != nil {
+			return w.failManagedMetaChannelOutboxFence(
+				orgID,
+				&job,
+				workerID,
+				fenceErr,
+			)
+		}
+		account = *fencedAccount
 		job.Status = models.OutboxJobStatusDispatching
 	}
 
 	result, sendErr := adapter.Send(ctx, &account, outbound)
 	if sendErr != nil {
-		return w.failChannelOutboxJob(orgID, &job, workerID, sendErr, retryableChannelError(sendErr))
-	}
-	if len(result.ProviderMessageIDs) == 0 {
-		return w.failChannelOutboxJob(
+		return w.failChannelOutboxProviderAttempt(
 			orgID,
 			&job,
+			&account,
+			workerID,
+			sendErr,
+			retryableChannelError(sendErr),
+		)
+	}
+	if len(result.ProviderMessageIDs) == 0 {
+		return w.failChannelOutboxProviderAttempt(
+			orgID,
+			&job,
+			&account,
 			workerID,
 			errors.New("provider accepted the request without a message ID"),
 			true,
@@ -492,6 +529,571 @@ func validateThreadsChannelOutboxBinding(
 		return errChannelOutboxThreadsBinding
 	}
 	return nil
+}
+
+type managedMetaCredentialGeneration struct {
+	OAuthID               uuid.UUID
+	OAuthVersion          int
+	OAuthCreatedAt        time.Time
+	OAuthExpiresAt        time.Time
+	OAuthHasExpiry        bool
+	OAuthOrganizationID   uuid.UUID
+	OAuthAccountID        uuid.UUID
+	WebhookID             uuid.UUID
+	WebhookVersion        int
+	WebhookCreatedAt      time.Time
+	WebhookOrganizationID uuid.UUID
+	WebhookAccountID      uuid.UUID
+}
+
+// isManagedMetaChannelOutboxAccount detects reserved managed intent. Either
+// marker is enough to enter the fail-closed fence; only
+// exactManagedMetaChannelOutboxBinding may authorize provider dispatch.
+func isManagedMetaChannelOutboxAccount(account *models.ChannelAccount) bool {
+	if account == nil || account.Provider != channelapi.RelayProvider ||
+		(account.Channel != models.ChannelInstagram && account.Channel != models.ChannelMessenger) {
+		return false
+	}
+	if channelOutboxBool(account.Config, "meta_registry_managed") ||
+		channelOutboxText(account.Config["meta_management_mode"]) ==
+			metaregistry.ManagementModePlatformOAuth {
+		return true
+	}
+	if account.Channel != models.ChannelInstagram ||
+		!managedMetaCanonicalNumericID(channelOutboxText(account.Metadata["meta_platform_app_id"])) ||
+		!managedMetaCanonicalNumericID(account.ExternalAccountID) {
+		return false
+	}
+	identityResidue := channelOutboxText(account.Config["instagram_api_mode"]) == "instagram_login" &&
+		channelOutboxText(account.Metadata["meta_webhook_app"]) == "instagram_login"
+	subscriptionResidue := channelOutboxText(
+		account.Metadata["meta_subscription_operation_id"],
+	) != ""
+	managedURLResidue := strings.HasSuffix(
+		channelOutboxText(account.Config["rereply_webhook_url"]),
+		"/api/webhooks/channels/"+account.ID.String(),
+	) && strings.HasSuffix(
+		channelOutboxText(account.Config["relay_url"]),
+		"/v1/accounts/instagram/"+account.ExternalAccountID,
+	)
+	return identityResidue || subscriptionResidue || managedURLResidue
+}
+
+func managedMetaCanonicalNumericID(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func exactManagedMetaChannelOutboxBinding(account *models.ChannelAccount) bool {
+	return isManagedMetaChannelOutboxAccount(account) &&
+		channelOutboxBool(account.Config, "meta_registry_managed") &&
+		channelOutboxText(account.Config["meta_management_mode"]) ==
+			metaregistry.ManagementModePlatformOAuth
+}
+
+func managedMetaCurrentCredentialGeneration(
+	credentials []models.ChannelCredential,
+	now time.Time,
+) (managedMetaCredentialGeneration, bool) {
+	var generation managedMetaCredentialGeneration
+	current := 0
+	for index := range credentials {
+		credential := &credentials[index]
+		if !channelapi.CredentialIsCurrent(credential, now) {
+			continue
+		}
+		current++
+		switch credential.Kind {
+		case models.ChannelCredentialKindOAuth:
+			if generation.OAuthID != uuid.Nil {
+				return managedMetaCredentialGeneration{}, false
+			}
+			generation.OAuthID = credential.ID
+			generation.OAuthVersion = credential.Version
+			generation.OAuthCreatedAt = credential.CreatedAt
+			generation.OAuthOrganizationID = credential.OrganizationID
+			generation.OAuthAccountID = credential.ChannelAccountID
+			if credential.ExpiresAt != nil {
+				generation.OAuthHasExpiry = true
+				generation.OAuthExpiresAt = credential.ExpiresAt.UTC()
+			}
+		case models.ChannelCredentialKindWebhook:
+			if generation.WebhookID != uuid.Nil {
+				return managedMetaCredentialGeneration{}, false
+			}
+			generation.WebhookID = credential.ID
+			generation.WebhookVersion = credential.Version
+			generation.WebhookCreatedAt = credential.CreatedAt
+			generation.WebhookOrganizationID = credential.OrganizationID
+			generation.WebhookAccountID = credential.ChannelAccountID
+		default:
+			return managedMetaCredentialGeneration{}, false
+		}
+	}
+	return generation, current == 2 && generation.OAuthID != uuid.Nil &&
+		generation.OAuthVersion > 0 && generation.WebhookID != uuid.Nil &&
+		generation.WebhookVersion > 0
+}
+
+func sameManagedMetaCredentialGeneration(
+	left, right managedMetaCredentialGeneration,
+) bool {
+	return left.OAuthID == right.OAuthID && left.OAuthVersion == right.OAuthVersion &&
+		left.WebhookID == right.WebhookID && left.WebhookVersion == right.WebhookVersion
+}
+
+func managedInstagramCredentialGenerationValid(
+	generation managedMetaCredentialGeneration,
+	organizationID, accountID uuid.UUID,
+	now time.Time,
+) bool {
+	return generation.OAuthID != uuid.Nil && generation.OAuthVersion > 0 &&
+		generation.WebhookID != uuid.Nil && generation.WebhookVersion > 0 &&
+		generation.OAuthID != generation.WebhookID &&
+		generation.OAuthOrganizationID == organizationID &&
+		generation.WebhookOrganizationID == organizationID &&
+		generation.OAuthAccountID == accountID && generation.WebhookAccountID == accountID &&
+		!generation.OAuthCreatedAt.IsZero() &&
+		!generation.OAuthCreatedAt.After(now.Add(time.Minute)) &&
+		!generation.WebhookCreatedAt.IsZero() &&
+		!generation.WebhookCreatedAt.After(now.Add(time.Minute)) &&
+		generation.OAuthHasExpiry && generation.OAuthExpiresAt.After(
+		now.Add(managedInstagramChannelOutboxProviderOperationLimit),
+	)
+}
+
+// markManagedMetaChannelOutboxDispatching is the last local authorization
+// check before an ordinary relay adapter may send. Its first lock is the exact
+// organizations.id FOR UPDATE mutex used by
+// handlers.lockChannelAIOrganizationScopeTx. Lifecycle changes and dispatch
+// therefore have a deterministic winner with lock order organization -> job ->
+// account -> credentials.
+func (w *Worker) markManagedMetaChannelOutboxDispatching(
+	orgID, jobID uuid.UUID,
+	workerID string,
+	expectedAccount *models.ChannelAccount,
+) (*models.ChannelAccount, error) {
+	if w == nil || w.DB == nil || expectedAccount == nil || orgID == uuid.Nil ||
+		jobID == uuid.Nil || strings.TrimSpace(workerID) == "" {
+		return nil, errChannelOutboxManagedMetaFence
+	}
+	expectedAt := time.Now().UTC()
+	expectedGeneration, ok := managedMetaCurrentCredentialGeneration(
+		expectedAccount.Credentials,
+		expectedAt,
+	)
+	if !ok || !isManagedMetaChannelOutboxAccount(expectedAccount) {
+		return nil, errChannelOutboxManagedMetaFence
+	}
+	if expectedAccount.Channel == models.ChannelInstagram &&
+		!managedInstagramCredentialGenerationValid(
+			expectedGeneration, orgID, expectedAccount.ID, expectedAt,
+		) {
+		return nil, errChannelOutboxManagedMetaFence
+	}
+
+	var fencedAccount models.ChannelAccount
+	err := database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
+		if err := lockChannelOutboxOrganizationScopeTx(tx, orgID); err != nil {
+			return err
+		}
+		var job models.OutboxJob
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "organization_id", "channel_account_id", "status", "locked_by").
+			Where(
+				"id = ? AND organization_id = ? AND channel_account_id = ? AND status = ? AND locked_by = ?",
+				jobID,
+				orgID,
+				expectedAccount.ID,
+				models.OutboxJobStatusProcessing,
+				workerID,
+			).
+			First(&job).Error; err != nil {
+			return fmt.Errorf("%w: delivery job lease changed", errChannelOutboxManagedMetaFence)
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", expectedAccount.ID, orgID).
+			First(&fencedAccount).Error; err != nil {
+			return fmt.Errorf("%w: channel account is unavailable", errChannelOutboxManagedMetaFence)
+		}
+		if fencedAccount.Channel != expectedAccount.Channel ||
+			fencedAccount.Provider != expectedAccount.Provider ||
+			fencedAccount.ExternalAccountID != expectedAccount.ExternalAccountID {
+			return fmt.Errorf("%w: channel account binding changed", errChannelOutboxManagedMetaFence)
+		}
+		now := time.Now().UTC()
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(
+				"organization_id = ? AND channel_account_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+				orgID,
+				fencedAccount.ID,
+				[]models.ChannelCredentialStatus{
+					models.ChannelCredentialStatusActive,
+					models.ChannelCredentialStatusExpiring,
+				},
+				now,
+			).
+			Order("version DESC").
+			Order("id ASC").
+			Find(&fencedAccount.Credentials).Error; err != nil {
+			return err
+		}
+		currentGeneration, ok := managedMetaCurrentCredentialGeneration(
+			fencedAccount.Credentials,
+			now,
+		)
+		if !ok || !sameManagedMetaCredentialGeneration(expectedGeneration, currentGeneration) ||
+			!w.managedMetaChannelOutboxRuntimeAllowed(&fencedAccount, currentGeneration, now) {
+			return errChannelOutboxManagedMetaFence
+		}
+		result := tx.Model(&models.OutboxJob{}).
+			Where(
+				"id = ? AND organization_id = ? AND channel_account_id = ? AND status = ? AND locked_by = ?",
+				job.ID,
+				orgID,
+				fencedAccount.ID,
+				models.OutboxJobStatusProcessing,
+				workerID,
+			).
+			Updates(map[string]any{
+				"status":     models.OutboxJobStatusDispatching,
+				"locked_at":  now,
+				"updated_at": now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: delivery fence lost its lease", errChannelOutboxManagedMetaFence)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &fencedAccount, nil
+}
+
+func lockChannelOutboxOrganizationScopeTx(tx *gorm.DB, organizationID uuid.UUID) error {
+	if tx == nil || organizationID == uuid.Nil {
+		return errors.New("tenant organization outbox transaction is required")
+	}
+	var organization models.Organization
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id").
+		Where("id = ?", organizationID).
+		First(&organization).Error
+}
+
+func (w *Worker) failManagedMetaChannelOutboxFence(
+	orgID uuid.UUID,
+	job *models.OutboxJob,
+	workerID string,
+	fenceErr error,
+) error {
+	settleErr := w.failChannelOutboxJob(orgID, job, workerID, fenceErr, false)
+	if settleErr == nil {
+		return nil
+	}
+	// A lifecycle transaction that won the organization mutex also cancels the
+	// processing row and clears its lease. In that expected race the failed CAS
+	// is already durably settled; do not turn it into a noisy worker retry.
+	var status models.OutboxJobStatus
+	lookupErr := database.WithTenant(w.DB, orgID, func(tx *gorm.DB) error {
+		return tx.Model(&models.OutboxJob{}).
+			Where("id = ? AND organization_id = ?", job.ID, orgID).
+			Pluck("status", &status).Error
+	})
+	if lookupErr == nil && (status == models.OutboxJobStatusCancelled ||
+		status == models.OutboxJobStatusFailed) {
+		return nil
+	}
+	return settleErr
+}
+
+func (w *Worker) managedMetaChannelOutboxRuntimeAllowed(
+	account *models.ChannelAccount,
+	generation managedMetaCredentialGeneration,
+	now time.Time,
+) bool {
+	if w == nil || w.Config == nil || !w.Config.MetaRegistry.Enabled ||
+		!exactManagedMetaChannelOutboxBinding(account) ||
+		account.Status != models.ChannelAccountStatusActive ||
+		!channelOutboxBool(account.Config, "outbound_enabled") ||
+		channelOutboxText(account.Metadata["meta_ownership_state"]) != metaregistry.OwnershipVerified ||
+		channelOutboxText(account.Metadata["meta_deauthorized_at"]) != "" ||
+		channelOutboxText(account.Metadata["meta_subscription_desired_state"]) != "subscribed" ||
+		channelOutboxText(account.Metadata["meta_subscription_operation_state"]) != "subscribe_complete" ||
+		channelOutboxText(account.Metadata["meta_subscription_remote_state"]) != "subscribed" {
+		return false
+	}
+	checkedAt, err := time.Parse(
+		time.RFC3339Nano,
+		channelOutboxText(account.Metadata["meta_ownership_checked_at"]),
+	)
+	if err != nil {
+		return false
+	}
+	maxAge := time.Duration(w.Config.MetaRegistry.OwnershipMaxAgeMins) * time.Minute
+	if maxAge <= 0 || maxAge > 7*24*time.Hour {
+		maxAge = 24 * time.Hour
+	}
+	if checkedAt.After(now.Add(time.Minute)) || now.Sub(checkedAt) > maxAge {
+		return false
+	}
+
+	switch account.Channel {
+	case models.ChannelInstagram:
+		return w.managedInstagramChannelOutboxRuntimeAllowed(account, generation, now)
+	case models.ChannelMessenger:
+		return w.managedMessengerChannelOutboxRuntimeAllowed(account)
+	default:
+		return false
+	}
+}
+
+func (w *Worker) managedInstagramChannelOutboxRuntimeAllowed(
+	account *models.ChannelAccount,
+	generation managedMetaCredentialGeneration,
+	now time.Time,
+) bool {
+	settings := w.Config.MetaInstagram
+	authorizedAt, authorizedAtErr := time.Parse(
+		time.RFC3339Nano,
+		channelOutboxText(account.Metadata["meta_authorized_at"]),
+	)
+	if !settings.Enabled || settings.QuarantineOnly ||
+		strings.TrimSpace(settings.AllowedOrganizationID) != account.OrganizationID.String() ||
+		!managedMetaCanonicalID(strings.TrimSpace(settings.AppID)) ||
+		!managedMetaCanonicalID(account.ExternalAccountID) ||
+		channelOutboxText(account.Config["instagram_api_mode"]) != "instagram_login" ||
+		channelOutboxText(account.Metadata["meta_platform_app_id"]) != strings.TrimSpace(settings.AppID) ||
+		channelOutboxText(account.Metadata["meta_webhook_app"]) != "instagram_login" ||
+		!managedMetaCanonicalID(channelOutboxText(account.Metadata["meta_authorizing_user_id"])) ||
+		channelOutboxText(account.Metadata["meta_oauth_subject_id"]) !=
+			channelOutboxText(account.Metadata["meta_authorizing_user_id"]) ||
+		channelOutboxText(account.Metadata["meta_authority_asset_id"]) != account.ExternalAccountID ||
+		strings.ToUpper(channelOutboxText(account.Metadata["meta_authorization_token_kind"])) != "USER" ||
+		authorizedAtErr != nil || authorizedAt.IsZero() || authorizedAt.After(now.Add(time.Minute)) ||
+		!managedInstagramCredentialGenerationValid(
+			generation, account.OrganizationID, account.ID, now,
+		) ||
+		!managedInstagramChannelOutboxURLsAllowed(settings, account) ||
+		channelOutboxText(account.Metadata["meta_data_deletion_pending_digest"]) != "" ||
+		channelOutboxText(account.Metadata["meta_data_deletion_pending_issued_at"]) != "" ||
+		channelOutboxText(account.Metadata["meta_deauthorization_pending_digest"]) != "" ||
+		channelOutboxText(account.Metadata["meta_deauthorization_pending_issued_at"]) != "" ||
+		!channelOutboxScopesInclude(
+			account.Metadata["meta_granted_scopes"],
+			"instagram_business_basic",
+			"instagram_business_manage_messages",
+		) ||
+		!managedInstagramSubscriptionGenerationMatches(account.Metadata, generation) {
+		return false
+	}
+
+	reviewStatus := strings.ToLower(strings.TrimSpace(settings.AppReviewStatus))
+	mode := channelOutboxText(account.Metadata["meta_release_evidence_mode"])
+	if reviewStatus == "approved" {
+		return mode == "app_review_approved" &&
+			channelOutboxText(account.Metadata["meta_release_review_status"]) == "approved"
+	}
+	if strings.EqualFold(strings.TrimSpace(w.Config.App.Environment), "production") ||
+		mode != "development_app_role" ||
+		!managedInstagramDevelopmentRoleAllowed(settings.DevelopmentAppRole) {
+		return false
+	}
+	profileID := strings.TrimSpace(settings.DevelopmentTestProfileID)
+	oauthSubjectID := strings.TrimSpace(settings.DevelopmentTestOAuthSubjectID)
+	return managedMetaCanonicalID(profileID) && managedMetaCanonicalID(oauthSubjectID) &&
+		account.ExternalAccountID == profileID &&
+		channelOutboxText(account.Metadata["meta_authorizing_user_id"]) == oauthSubjectID &&
+		channelOutboxText(account.Metadata["meta_release_profile_id"]) == profileID &&
+		channelOutboxText(account.Metadata["meta_release_oauth_subject_id"]) == oauthSubjectID &&
+		channelOutboxText(account.Metadata["meta_release_app_role"]) ==
+			strings.ToLower(strings.TrimSpace(settings.DevelopmentAppRole)) &&
+		channelOutboxText(account.Metadata["meta_release_review_status"]) == reviewStatus
+}
+
+func managedInstagramChannelOutboxURLsAllowed(
+	settings config.MetaInstagramConfig,
+	account *models.ChannelAccount,
+) bool {
+	if account == nil || account.ID == uuid.Nil || !managedMetaCanonicalID(account.ExternalAccountID) {
+		return false
+	}
+	expectedWebhook, ok := managedInstagramDerivedChannelURL(
+		settings.ReReplyBaseURL,
+		"api", "webhooks", "channels", account.ID.String(),
+	)
+	if !ok {
+		return false
+	}
+	expectedRelay, ok := managedInstagramDerivedChannelURL(
+		settings.RelayBaseURL,
+		"v1", "accounts", string(models.ChannelInstagram), account.ExternalAccountID,
+	)
+	if !ok {
+		return false
+	}
+	webhook, webhookOK := account.Config["rereply_webhook_url"].(string)
+	relay, relayOK := account.Config["relay_url"].(string)
+	return webhookOK && relayOK && managedInstagramExactChannelURL(webhook, expectedWebhook) &&
+		managedInstagramExactChannelURL(relay, expectedRelay)
+}
+
+func managedInstagramDerivedChannelURL(base string, segments ...string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(base))
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil ||
+		parsed.Fragment != "" || parsed.RawQuery != "" || parsed.RawPath != "" || parsed.ForceQuery ||
+		parsed.Opaque != "" {
+		return "", false
+	}
+	joined, err := url.JoinPath(parsed.String(), segments...)
+	if err != nil {
+		return "", false
+	}
+	return joined, true
+}
+
+func managedInstagramExactChannelURL(actual, expected string) bool {
+	if actual == "" || actual != expected {
+		return false
+	}
+	parsed, err := url.Parse(actual)
+	return err == nil && parsed.Scheme == "https" && parsed.Hostname() != "" &&
+		parsed.User == nil && parsed.Fragment == "" && parsed.RawQuery == "" &&
+		parsed.RawPath == "" && !parsed.ForceQuery && parsed.Opaque == ""
+}
+
+func (w *Worker) managedMessengerChannelOutboxRuntimeAllowed(
+	account *models.ChannelAccount,
+) bool {
+	settings := w.Config.MetaMessenger
+	if !settings.Enabled || !managedMetaCanonicalID(strings.TrimSpace(settings.AppID)) ||
+		channelOutboxText(account.Metadata["meta_platform_app_id"]) != strings.TrimSpace(settings.AppID) ||
+		channelOutboxText(account.Metadata["meta_webhook_app"]) != "messenger" ||
+		channelOutboxText(account.Metadata["meta_authorizing_user_id"]) == "" ||
+		channelOutboxText(account.Metadata["meta_business_id"]) == "" ||
+		!channelOutboxScopesInclude(
+			account.Metadata["meta_granted_scopes"],
+			"public_profile",
+			"pages_show_list",
+			"pages_messaging",
+			"pages_manage_metadata",
+			"business_management",
+		) {
+		return false
+	}
+	allowedOrganization := settings.AllowAllOrganizations
+	if !allowedOrganization {
+		for _, configured := range strings.Split(settings.AllowedOrganizationIDs, ",") {
+			if strings.TrimSpace(configured) == account.OrganizationID.String() {
+				allowedOrganization = true
+				break
+			}
+		}
+	}
+	if !allowedOrganization {
+		return false
+	}
+	tokenKind := strings.ToUpper(channelOutboxText(account.Metadata["meta_authorization_token_kind"]))
+	if tokenKind == "SYSTEM_USER" {
+		return true
+	}
+	return tokenKind == "USER" && settings.AllowDevelopmentUserToken &&
+		!settings.AllowAllOrganizations &&
+		!strings.EqualFold(strings.TrimSpace(w.Config.App.Environment), "production")
+}
+
+func managedInstagramSubscriptionGenerationMatches(
+	metadata models.JSONB,
+	generation managedMetaCredentialGeneration,
+) bool {
+	operationID, operationErr := uuid.Parse(channelOutboxText(metadata["meta_subscription_operation_id"]))
+	oauthID, oauthErr := uuid.Parse(channelOutboxText(metadata["meta_subscription_oauth_credential_id"]))
+	webhookID, webhookErr := uuid.Parse(channelOutboxText(metadata["meta_subscription_webhook_credential_id"]))
+	_, expiresErr := time.Parse(
+		time.RFC3339Nano,
+		channelOutboxText(metadata["meta_subscription_operation_expires_at"]),
+	)
+	return operationErr == nil && operationID != uuid.Nil && oauthErr == nil && webhookErr == nil &&
+		oauthID == generation.OAuthID &&
+		channelOutboxInt(metadata["meta_subscription_oauth_version"]) == generation.OAuthVersion &&
+		webhookID == generation.WebhookID &&
+		channelOutboxInt(metadata["meta_subscription_webhook_version"]) == generation.WebhookVersion &&
+		expiresErr == nil
+}
+
+func channelOutboxScopesInclude(value any, required ...string) bool {
+	granted := make(map[string]bool)
+	switch values := value.(type) {
+	case []string:
+		for _, scope := range values {
+			granted[strings.TrimSpace(scope)] = true
+		}
+	case []any:
+		for _, raw := range values {
+			scope, _ := raw.(string)
+			granted[strings.TrimSpace(scope)] = true
+		}
+	default:
+		return false
+	}
+	for _, scope := range required {
+		if !granted[scope] {
+			return false
+		}
+	}
+	return true
+}
+
+func channelOutboxInt(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int32:
+		return int(typed)
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return int(parsed)
+	default:
+		return 0
+	}
+}
+
+func managedInstagramDevelopmentRoleAllowed(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "administrator", "developer", "tester":
+		return true
+	default:
+		return false
+	}
+}
+
+func managedMetaCanonicalID(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func channelOutboxText(value any) string {
@@ -549,13 +1151,16 @@ func (w *Worker) deliverPreparedChannelOutboxJob(
 	}
 
 	if isChannelAIReplyOutbox(job, outbound) {
-		if err := w.recheckChannelAIOutboxDispatch(
+		fencedAccount, err := w.recheckChannelAIOutboxDispatchWithAccount(
 			orgID,
 			job.ID,
 			workerID,
-		); err != nil {
+			account,
+		)
+		if err != nil {
 			return w.cancelChannelAIOutboxJob(orgID, job, workerID, err)
 		}
+		account = fencedAccount
 	} else {
 		fencedAccount, err := w.markChannelOutboxDispatching(
 			orgID,
@@ -580,12 +1185,20 @@ func (w *Worker) deliverPreparedChannelOutboxJob(
 		// Publication is the externally visible step. Any transport error can
 		// mean that the provider committed even though its response was lost,
 		// so retrying here would risk creating a duplicate Threads reply.
-		return w.failChannelOutboxJob(orgID, job, workerID, publishErr, false)
-	}
-	if len(result.ProviderMessageIDs) == 0 {
-		return w.failChannelOutboxJob(
+		return w.failChannelOutboxProviderAttempt(
 			orgID,
 			job,
+			account,
+			workerID,
+			publishErr,
+			false,
+		)
+	}
+	if len(result.ProviderMessageIDs) == 0 {
+		return w.failChannelOutboxProviderAttempt(
+			orgID,
+			job,
+			account,
 			workerID,
 			errors.New("provider published the prepared request without a message ID"),
 			false,
@@ -745,10 +1358,53 @@ func isChannelAIReplyOutbox(
 func (w *Worker) recheckChannelAIOutboxDispatch(
 	orgID, jobID uuid.UUID,
 	workerID string,
+	expectedAccounts ...*models.ChannelAccount,
 ) error {
-	return database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
+	_, err := w.recheckChannelAIOutboxDispatchWithAccount(
+		orgID,
+		jobID,
+		workerID,
+		expectedAccounts...,
+	)
+	return err
+}
+
+func (w *Worker) recheckChannelAIOutboxDispatchWithAccount(
+	orgID, jobID uuid.UUID,
+	workerID string,
+	expectedAccounts ...*models.ChannelAccount,
+) (*models.ChannelAccount, error) {
+	var expectedAccount *models.ChannelAccount
+	if len(expectedAccounts) > 0 {
+		expectedAccount = expectedAccounts[0]
+	}
+	expectedManaged := isManagedMetaChannelOutboxAccount(expectedAccount)
+	var expectedGeneration managedMetaCredentialGeneration
+	if expectedManaged {
+		var ok bool
+		expectedAt := time.Now().UTC()
+		expectedGeneration, ok = managedMetaCurrentCredentialGeneration(
+			expectedAccount.Credentials,
+			expectedAt,
+		)
+		if !ok || (expectedAccount.Channel == models.ChannelInstagram &&
+			!managedInstagramCredentialGenerationValid(
+				expectedGeneration, orgID, expectedAccount.ID, expectedAt,
+			)) {
+			return nil, fmt.Errorf("%w: managed Meta credential generation is invalid", errChannelOutboxAIPolicy)
+		}
+	}
+	var fencedAccount models.ChannelAccount
+	err := database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
+		// Use the same organizations.id transaction mutex as the control plane
+		// before taking the job/account locks. This makes a committed lifecycle
+		// cancellation deterministically beat the dispatch CAS when it owns the
+		// tenant mutex first.
+		if err := lockChannelOutboxOrganizationScopeTx(tx, orgID); err != nil {
+			return err
+		}
 		var job models.OutboxJob
-		if err := tx.Where(
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
 			"id = ? AND organization_id = ? AND status = ? AND locked_by = ?",
 			jobID,
 			orgID,
@@ -762,7 +1418,7 @@ func (w *Worker) recheckChannelAIOutboxDispatch(
 		}
 
 		var account models.ChannelAccount
-		if err := tx.Select("id", "organization_id", "channel", "provider", "status", "config").
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where(
 				"id = ? AND organization_id = ?",
 				job.ChannelAccountID,
@@ -778,6 +1434,43 @@ func (w *Worker) recheckChannelAIOutboxDispatch(
 			!channelOutboxBool(account.Config, "outbound_enabled") ||
 			!channelOutboxBool(account.Config, "ai_reply_enabled") {
 			return fmt.Errorf("%w: account AI delivery is disabled", errChannelOutboxAIPolicy)
+		}
+		freshManaged := isManagedMetaChannelOutboxAccount(&account)
+		if expectedManaged || freshManaged {
+			if !freshManaged || (expectedAccount != nil && (!expectedManaged ||
+				expectedAccount.ID != account.ID ||
+				expectedAccount.Channel != account.Channel ||
+				expectedAccount.ExternalAccountID != account.ExternalAccountID)) {
+				return fmt.Errorf("%w: managed Meta account binding changed", errChannelOutboxAIPolicy)
+			}
+			now := time.Now().UTC()
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where(
+					"organization_id = ? AND channel_account_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+					orgID,
+					account.ID,
+					[]models.ChannelCredentialStatus{
+						models.ChannelCredentialStatusActive,
+						models.ChannelCredentialStatusExpiring,
+					},
+					now,
+				).
+				Order("version DESC").
+				Order("id ASC").
+				Find(&account.Credentials).Error; err != nil {
+				return err
+			}
+			currentGeneration, ok := managedMetaCurrentCredentialGeneration(
+				account.Credentials,
+				now,
+			)
+			if expectedAccount == nil {
+				expectedGeneration = currentGeneration
+			}
+			if !ok || !sameManagedMetaCredentialGeneration(expectedGeneration, currentGeneration) ||
+				!w.managedMetaChannelOutboxRuntimeAllowed(&account, currentGeneration, now) {
+				return fmt.Errorf("%w: %v", errChannelOutboxAIPolicy, errChannelOutboxManagedMetaFence)
+			}
 		}
 
 		var conversation models.InboxConversation
@@ -1013,8 +1706,19 @@ func (w *Worker) recheckChannelAIOutboxDispatch(
 				errChannelOutboxAIPolicy,
 			)
 		}
+		if freshManaged || expectedAccount == nil {
+			fencedAccount = account
+		} else {
+			// Legacy/static AI delivery keeps the fully preloaded credential
+			// snapshot; only managed Meta needs the freshly locked pair above.
+			fencedAccount = *expectedAccount
+		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &fencedAccount, nil
 }
 
 func (w *Worker) cancelChannelAIOutboxJob(
@@ -1152,6 +1856,126 @@ func (w *Worker) completeChannelOutboxJob(
 	})
 }
 
+// failChannelOutboxProviderAttempt terminally settles every managed Instagram
+// error after the dispatching CAS. A transport error or an accepted response
+// without a message ID is ambiguous: the provider may already have delivered
+// generation N. Retrying under N (or a later reconnect generation N+1) would
+// risk a duplicate or an authorization replay. Static Instagram and all
+// Messenger jobs retain the ordinary retry policy.
+func (w *Worker) failChannelOutboxProviderAttempt(
+	orgID uuid.UUID,
+	job *models.OutboxJob,
+	account *models.ChannelAccount,
+	workerID string,
+	deliveryErr error,
+	retryable bool,
+) error {
+	managedInstagramDispatch := job != nil && account != nil &&
+		job.Status == models.OutboxJobStatusDispatching &&
+		account.Channel == models.ChannelInstagram &&
+		isManagedMetaChannelOutboxAccount(account)
+	if !managedInstagramDispatch {
+		return w.failChannelOutboxJob(
+			orgID,
+			job,
+			workerID,
+			deliveryErr,
+			retryable,
+		)
+	}
+
+	ambiguousErr := &channelapi.ProviderError{
+		Operation: "send",
+		Provider:  account.Provider,
+		Code:      "managed_instagram_delivery_state_ambiguous",
+		Message: "Managed Instagram provider delivery state is ambiguous; automatic retry is disabled: " +
+			channelOutboxErrorMessage(deliveryErr),
+		Retryable: false,
+		Cause:     deliveryErr,
+	}
+	attempt := job.AttemptCount + 1
+	persistErr := database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
+		// Serialize the terminal provider outcome with reconnect/rotation. The
+		// winner cannot leave a retryable row for a later credential generation.
+		if err := lockChannelOutboxOrganizationScopeTx(tx, orgID); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		errorMessage := channelOutboxErrorMessage(ambiguousErr)
+		result := tx.Model(&models.OutboxJob{}).
+			Where(
+				"id = ? AND organization_id = ? AND channel_account_id = ? AND status = ? AND locked_by = ?",
+				job.ID,
+				orgID,
+				account.ID,
+				models.OutboxJobStatusDispatching,
+				workerID,
+			).
+			Updates(map[string]any{
+				"status":          models.OutboxJobStatusFailed,
+				"attempt_count":   attempt,
+				"last_attempt_at": now,
+				"failed_at":       now,
+				"last_error_code": ambiguousErr.Code,
+				"last_error":      errorMessage,
+				"locked_at":       nil,
+				"locked_by":       "",
+				"updated_at":      now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			var current models.OutboxJob
+			if err := tx.Select("status").
+				Where("id = ? AND organization_id = ?", job.ID, orgID).
+				First(&current).Error; err != nil {
+				return err
+			}
+			if current.Status == models.OutboxJobStatusFailed ||
+				current.Status == models.OutboxJobStatusCancelled {
+				return nil
+			}
+			return errors.New("managed Instagram provider failure settlement lost its lease")
+		}
+		if job.MessageID != nil {
+			if err := tx.Model(&models.Message{}).
+				Where("id = ? AND organization_id = ?", *job.MessageID, orgID).
+				Updates(map[string]any{
+					"status":        models.MessageStatusFailed,
+					"error_message": errorMessage,
+					"updated_at":    now,
+				}).Error; err != nil {
+				return err
+			}
+		}
+		messageEvent := models.MessageEvent{
+			OrganizationID:   orgID,
+			ChannelAccountID: job.ChannelAccountID,
+			ConversationID:   job.ConversationID,
+			MessageID:        job.MessageID,
+			ProviderEventID:  fmt.Sprintf("outbox:%s:failed:%d", job.ID, attempt),
+			Type:             models.MessageEventTypeFailed,
+			OccurredAt:       now,
+			ErrorCode:        ambiguousErr.Code,
+			ErrorMessage:     errorMessage,
+			Payload:          models.JSONB{"provider_state_ambiguous": true},
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{
+				{Name: "organization_id"},
+				{Name: "channel_account_id"},
+				{Name: "provider_event_id"},
+			},
+			DoNothing: true,
+		}).Create(&messageEvent).Error
+	})
+	if persistErr != nil {
+		return errors.Join(ambiguousErr, persistErr)
+	}
+	return nil
+}
+
 func (w *Worker) failChannelOutboxJob(
 	orgID uuid.UUID,
 	job *models.OutboxJob,
@@ -1248,6 +2072,9 @@ func (w *Worker) failChannelOutboxJob(
 }
 
 func (w *Worker) channelOutboxAdapter(account *models.ChannelAccount) (channelapi.Adapter, error) {
+	if w != nil && w.channelAdapterFactory != nil {
+		return w.channelAdapterFactory(account)
+	}
 	if account == nil || account.Channel == models.ChannelTikTok {
 		return nil, &channelapi.ProviderError{
 			Operation: "resolve_adapter",

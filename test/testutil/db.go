@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -36,6 +37,18 @@ func SetupTestDB(t *testing.T) *gorm.DB {
 	// Initialize database and run migrations only once
 	testDBOnce.Do(func() {
 		var err error
+		// Several migration regressions deliberately replace an old table shape
+		// in the same package process. Disable pgx's implicit named-statement
+		// cache so the recreated relation cannot retain the former result type.
+		// describe_exec keeps normal extended-protocol value encoding (including
+		// JSONB), unlike simple protocol. Production DB configuration is unchanged.
+		if parsed, parseErr := url.Parse(dsn); parseErr == nil && parsed.Scheme != "" {
+			query := parsed.Query()
+			query.Set("statement_cache_capacity", "0")
+			query.Set("default_query_exec_mode", "describe_exec")
+			parsed.RawQuery = query.Encode()
+			dsn = parsed.String()
+		}
 		testDB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{
 			Logger: logger.Default.LogMode(logger.Silent),
 		})
@@ -136,6 +149,12 @@ func runMigrations(db *gorm.DB) error {
 	// Retain the legacy step table in tests while the graph backfill path still
 	// exercises it. Production intentionally no longer creates this table.
 	modelsToMigrate = append(modelsToMigrate, &models.ChatbotFlowStep{})
+	// Mirror the production pre-AutoMigrate ownership upgrade. A shared local
+	// test database may retain the unreleased nullable journal shape after an
+	// interrupted earlier process.
+	if err := database.PrepareMetaInstagramDeletionJournalTenant(db); err != nil {
+		return err
+	}
 	if err := db.AutoMigrate(modelsToMigrate...); err != nil {
 		return err
 	}

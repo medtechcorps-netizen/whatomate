@@ -597,6 +597,7 @@ export interface ChannelAccount {
   config: Record<string, unknown>
   has_credentials: boolean
   meta_subscription_reconciliation_required: boolean
+  meta_subscription_reconciliation_desired_state?: 'subscribed' | 'unsubscribed'
   token_expires_at?: string
   last_health_check_at?: string
   last_inbound_at?: string

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/models"
 )
 
 func TestDynamicMessengerOutboundUsesAppSecretProofWithoutChangingStaticCompatibility(t *testing.T) {
@@ -22,6 +23,8 @@ func TestDynamicMessengerOutboundUsesAppSecretProofWithoutChangingStaticCompatib
 	static, _ := config.accountByKey("messenger-page")
 	dynamic := *static
 	dynamic.registryManaged = true
+	config.ManagedMessengerAppID = "123456"
+	dynamic.PlatformAppID = config.ManagedMessengerAppID
 	config.ManagedMessengerAppSecret = "managed-messenger-app-secret-at-least-32-bytes"
 
 	mac := hmac.New(sha256.New, []byte(config.ManagedMessengerAppSecret))
@@ -64,6 +67,109 @@ func TestDynamicMessengerOutboundUsesAppSecretProofWithoutChangingStaticCompatib
 	}
 	if graphCalls.Load() != 2 {
 		t.Fatalf("Graph calls = %d, want 2", graphCalls.Load())
+	}
+}
+
+func TestDynamicInstagramOutboundUsesManagedProofWithoutChangingStaticCompatibility(t *testing.T) {
+	config := newTestConfig(t)
+	static, _ := config.accountByKey("instagram-direct")
+	dynamic := *static
+	dynamic.registryManaged = true
+	config.ManagedInstagramAppID = "789012"
+	config.ManagedInstagramAppSecret = "managed-instagram-app-secret-at-least-32-bytes"
+	dynamic.PlatformAppID = config.ManagedInstagramAppID
+
+	mac := hmac.New(sha256.New, []byte(config.ManagedInstagramAppSecret))
+	_, _ = mac.Write([]byte(dynamic.accessToken))
+	wantProof := hex.EncodeToString(mac.Sum(nil))
+	var graphCalls atomic.Int32
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		call := graphCalls.Add(1)
+		proof := request.URL.Query().Get("appsecret_proof")
+		if (call == 1 && proof != wantProof) || (call == 2 && proof != "") {
+			t.Errorf("call %d appsecret_proof = %q", call, proof)
+		}
+		if request.Header.Get("Authorization") != "Bearer "+dynamic.accessToken {
+			t.Error("Instagram outbound did not use the exact profile token")
+		}
+		_, _ = w.Write([]byte(`{"recipient_id":"customer-1","message_id":"instagram-mid"}`))
+	}))
+	defer graph.Close()
+	server, err := NewServer(config, newMemoryServerStore(), withGraphBases("http://facebook.invalid", graph.URL))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	message := channelapi.OutboundMessage{
+		Recipient: channelapi.Participant{ExternalID: "customer-1"},
+		Parts:     []channelapi.MessagePart{{Type: "text", Text: "hello"}},
+	}
+	if result := server.sendGraph(t.Context(), &dynamic, message); result.status != http.StatusOK {
+		t.Fatalf("dynamic Instagram outbound status = %d (%s)", result.status, result.body)
+	}
+	if result := server.sendGraph(t.Context(), static, message); result.status != http.StatusOK {
+		t.Fatalf("static Instagram outbound status = %d (%s)", result.status, result.body)
+	}
+	if graphCalls.Load() != 2 {
+		t.Fatalf("Instagram Graph calls = %d, want 2", graphCalls.Load())
+	}
+}
+
+func TestInstagramOutboundTextLimitIsUTF8BytesBeforeProvider(t *testing.T) {
+	config := newTestConfig(t)
+	account, _ := config.accountByKey("instagram-direct")
+	var graphCalls atomic.Int32
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		graphCalls.Add(1)
+		_, _ = w.Write([]byte(`{"recipient_id":"customer-1","message_id":"instagram-byte-mid"}`))
+	}))
+	defer graph.Close()
+	server, err := NewServer(
+		config,
+		newMemoryServerStore(),
+		withGraphBases("http://facebook.invalid", graph.URL),
+	)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		text      string
+		wantCode  int
+		wantCalls int32
+	}{
+		{name: "exact 1000 ASCII bytes", text: strings.Repeat("a", 1000), wantCode: http.StatusOK, wantCalls: 1},
+		{name: "1001 ASCII bytes", text: strings.Repeat("a", 1001), wantCode: http.StatusUnprocessableEntity, wantCalls: 1},
+		{name: "exact 1000 multibyte bytes", text: strings.Repeat("é", 500), wantCode: http.StatusOK, wantCalls: 2},
+		{name: "few runes but 1002 bytes", text: strings.Repeat("界", 334), wantCode: http.StatusUnprocessableEntity, wantCalls: 2},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := outboundEnvelopeBody(t, account, "byte-limit-"+string(rune('a'+index)), test.text)
+			response := performOutbound(t, server.Handler(), account, body)
+			if response.Code != test.wantCode {
+				t.Fatalf("status = %d (%s), want %d", response.Code, response.Body.String(), test.wantCode)
+			}
+			if graphCalls.Load() != test.wantCalls {
+				t.Fatalf("provider calls = %d, want %d", graphCalls.Load(), test.wantCalls)
+			}
+		})
+	}
+}
+
+func TestInstagramByteLimitDoesNotChangeMessengerRuneLimit(t *testing.T) {
+	message := channelapi.OutboundMessage{
+		IdempotencyKey: "synthetic-messenger-multibyte",
+		Recipient:      channelapi.Participant{ExternalID: "customer-1"},
+		Parts: []channelapi.MessagePart{{
+			Type: "text", Text: strings.Repeat("界", 1000),
+		}},
+	}
+	if err := validateOutboundMessage(models.ChannelMessenger, message); err != nil {
+		t.Fatalf("Messenger's existing 2,000-rune contract changed: %v", err)
+	}
+	if err := validateOutboundMessage(models.ChannelInstagram, message); err == nil {
+		t.Fatal("Instagram accepted a multibyte payload over 1,000 UTF-8 bytes")
 	}
 }
 

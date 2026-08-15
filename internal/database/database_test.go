@@ -1,6 +1,8 @@
 package database_test
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,6 +41,107 @@ func TestBackfillProviderIntegrationBindingsRestoresLegacyThreadsAppID(t *testin
 	require.NoError(t, db.First(&legacy, "id = ?", legacy.ID).Error)
 	require.NotNil(t, legacy.ThreadsAppID)
 	assert.Equal(t, "1553429782494481", *legacy.ThreadsAppID)
+}
+
+func TestPrepareMetaInstagramDeletionJournalTenantUpgradesExactGlobalSchema(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+	require.NoError(t, database.RemoveTenantRLS(db))
+	require.NoError(t, db.Migrator().DropTable(&models.MetaInstagramDataDeletionEvent{}))
+	require.NoError(t, db.Exec(`
+		CREATE TABLE meta_instagram_data_deletion_events (
+			digest varchar(64) PRIMARY KEY,
+			platform_app_id varchar(64) NOT NULL,
+			authorizing_user_id varchar(64) NOT NULL,
+			issued_at timestamptz NOT NULL,
+			verified_at timestamptz NOT NULL,
+			state varchar(24) NOT NULL DEFAULT 'verified',
+			privacy_request_id uuid,
+			request_number varchar(64),
+			last_attempt_at timestamptz,
+			completed_at timestamptz
+		)
+	`).Error)
+
+	runtimeRole := "rereply_journal_upgrade_" + strings.ReplaceAll(uuid.NewString()[:8], "-", "")
+	t.Cleanup(func() {
+		_ = database.RemoveTenantRLS(db)
+		_ = db.Exec("DROP OWNED BY " + runtimeRole).Error
+		_ = db.Exec("DROP ROLE IF EXISTS " + runtimeRole).Error
+		_ = db.Migrator().DropTable(&models.MetaInstagramDataDeletionEvent{})
+		_ = db.AutoMigrate(&models.MetaInstagramDataDeletionEvent{})
+	})
+
+	organization := testutil.CreateTestOrganization(t, db)
+	now := time.Now().UTC()
+	privacyRequest := models.PrivacyRequest{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: organization.ID,
+		RequestNumber: "IGDEL" + strings.ToUpper(strings.ReplaceAll(uuid.NewString(), "-", "")),
+		Type:          models.PrivacyRequestTypeDeletion, Status: models.PrivacyRequestStatusInProgress,
+		SubjectType: "instagram_profile", SubjectKey: "620000000000010",
+		ReceivedChannel: "instagram", RequesterProfile: models.JSONB{}, RequestDetails: models.JSONB{},
+		VerificationMethod: "meta_instagram_signed_request", ReceivedAt: now, DueAt: now.Add(30 * 24 * time.Hour),
+	}
+	require.NoError(t, db.Create(&privacyRequest).Error)
+	linkedDigest := strings.Repeat("a", 64)
+	unresolvedDigest := strings.Repeat("b", 64)
+	require.NoError(t, db.Exec(`
+		INSERT INTO meta_instagram_data_deletion_events
+			(digest, platform_app_id, authorizing_user_id, issued_at, verified_at,
+			 state, privacy_request_id, request_number, completed_at)
+		VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?),
+		       (?, ?, ?, ?, ?, 'verified', NULL, '', NULL)
+	`,
+		linkedDigest, "610000000000010", "620000000000010", now.Add(-time.Minute), now,
+		privacyRequest.ID, privacyRequest.RequestNumber, now,
+		unresolvedDigest, "610000000000010", "620000000000011", now.Add(-time.Minute), now,
+	).Error)
+
+	require.NoError(t, database.PrepareMetaInstagramDeletionJournalTenant(db))
+	require.NoError(t, database.AutoMigrate(db))
+
+	var nullable string
+	require.NoError(t, db.Raw(`
+		SELECT is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name = 'meta_instagram_data_deletion_events'
+		  AND column_name = 'organization_id'
+	`).Scan(&nullable).Error)
+	require.Equal(t, "NO", nullable)
+	var linked models.MetaInstagramDataDeletionEvent
+	require.NoError(t, db.First(&linked, "digest = ?", linkedDigest).Error)
+	require.Equal(t, organization.ID, linked.OrganizationID)
+	var unresolvedCount int64
+	require.NoError(t, db.Model(&models.MetaInstagramDataDeletionEvent{}).
+		Where("digest = ?", unresolvedDigest).Count(&unresolvedCount).Error)
+	require.Zero(t, unresolvedCount)
+
+	require.NoError(t, db.Exec(fmt.Sprintf(
+		"CREATE ROLE %s NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS",
+		runtimeRole,
+	)).Error)
+	require.NoError(t, database.ApplyTenantRLS(db, runtimeRole))
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SET LOCAL ROLE " + runtimeRole).Error; err != nil {
+			return err
+		}
+		var unscopedCount int64
+		if err := tx.Model(&models.MetaInstagramDataDeletionEvent{}).
+			Count(&unscopedCount).Error; err != nil {
+			return err
+		}
+		require.Zero(t, unscopedCount)
+		return database.WithTenant(tx, organization.ID, func(tenantDB *gorm.DB) error {
+			var tenantDigests []string
+			if err := tenantDB.Model(&models.MetaInstagramDataDeletionEvent{}).
+				Pluck("digest", &tenantDigests).Error; err != nil {
+				return err
+			}
+			require.Equal(t, []string{linkedDigest}, tenantDigests)
+			return nil
+		})
+	}))
 }
 
 // --- SeedPermissionsAndRoles ---

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strconv"
 	"testing"
@@ -106,10 +107,10 @@ func TestLoadMetaRegistryBindingIsTenantScopedEncryptedAndVersioned(t *testing.T
 }
 
 func TestMetaRegistryRevocationUsesTwoCredentialCASAndRedactedAudit(t *testing.T) {
-	db := testutil.SetupTestDB(t)
-	org := testutil.CreateTestOrganization(t, db)
-	fixture := createMetaRegistryFixture(t, db, org.ID, models.ChannelInstagram, "ig-1")
-	scoped := metaRegistryTestApp(db, org.ID)
+	fixture := newMetaInstagramLifecycleFixture(t)
+	db := fixture.db
+	org := fixture.org
+	scoped := fixture.app.scopedApp(db, org.ID)
 
 	request := metaregistry.MutationRequest{
 		ChannelAccountID: fixture.account.ID,
@@ -405,12 +406,14 @@ func TestMetaRegistryRevalidationIsMonotonicAndCanRecoverDegradedAccount(t *test
 
 func TestGenericChannelAPIProtectsManagedMetaRoutingButAllowsSafeProfileToggle(t *testing.T) {
 	fixture := newChannelAccountConcurrencyFixture(t, false)
+	fixture.Account.Channel = models.ChannelMessenger
 	fixture.Account.Config["meta_registry_managed"] = true
 	fixture.Account.Config["meta_management_mode"] = metaregistry.ManagementModePlatformOAuth
 	fixture.Account.Metadata["meta_ownership_state"] = metaregistry.OwnershipVerified
 	require.NoError(t, fixture.App.DB.Model(&models.ChannelAccount{}).
 		Where("id = ?", fixture.Account.ID).Updates(map[string]any{
-		"config": fixture.Account.Config, "metadata": fixture.Account.Metadata,
+		"channel": fixture.Account.Channel, "config": fixture.Account.Config,
+		"metadata": fixture.Account.Metadata,
 	}).Error)
 
 	unsafeUpdate := testutil.NewJSONRequest(t, map[string]any{
@@ -521,6 +524,86 @@ func TestGenericChannelCreateRejectsManualMessengerRelayBypass(t *testing.T) {
 		require.NoError(t, db.Model(model).Where("organization_id = ?", organization.ID).Count(&count).Error)
 		assert.Zero(t, count, "manual Messenger rejection must create no %s side effect", name)
 	}
+}
+
+func TestGenericChannelCreateGatesManagedInstagramPilotButPreservesOffPilotStatic(t *testing.T) {
+	for _, quarantineOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pilot quarantine=%t", quarantineOnly), func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			organization := testutil.CreateTestOrganization(t, db)
+			role := testutil.CreateTestRoleWithKeys(
+				t, db, organization.ID, "manual-instagram-pilot-writer-"+uuid.NewString(),
+				[]string{models.ResourceChannelAccounts + ":" + models.ActionWrite},
+			)
+			user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithRoleID(&role.ID))
+			enableBookingCommerceTestEntitlement(
+				t, db, organization.ID, user.ID, "omnichannel.enabled",
+			)
+			app := &App{
+				DB: db, Log: testutil.NopLogger(),
+				Config: &config.Config{
+					App: config.AppConfig{EncryptionKey: metaRegistryTestEncryptionKey},
+					MetaInstagram: config.MetaInstagramConfig{
+						Enabled: true, QuarantineOnly: quarantineOnly,
+						AllowedOrganizationID: organization.ID.String(),
+					},
+				},
+			}
+			request := testutil.NewJSONRequest(t, map[string]any{
+				"channel": models.ChannelInstagram, "provider": channelapi.RelayProvider,
+				"name": "Synthetic pilot static bypass", "external_account_id": "700000000009981",
+				"config": map[string]any{"relay_url": "https://relay.example.com/instagram"},
+			})
+			testutil.SetAuthContext(request, organization.ID, user.ID)
+			require.NoError(t, app.CreateChannelAccount(request))
+			testutil.AssertErrorResponse(t, request, fasthttp.StatusConflict, "managed Meta onboarding")
+			for name, model := range map[string]any{
+				"account": &models.ChannelAccount{}, "credential": &models.ChannelCredential{}, "audit": &models.AuditLog{},
+			} {
+				var count int64
+				require.NoError(t, db.Model(model).Where("organization_id = ?", organization.ID).Count(&count).Error)
+				assert.Zero(t, count, "pilot rejection must create no %s side effect", name)
+			}
+		})
+	}
+
+	t.Run("off-pilot static Instagram remains compatible", func(t *testing.T) {
+		db := testutil.SetupTestDB(t)
+		pilot := testutil.CreateTestOrganization(t, db)
+		offPilot := testutil.CreateTestOrganization(t, db)
+		role := testutil.CreateTestRoleWithKeys(
+			t, db, offPilot.ID, "manual-instagram-off-pilot-writer-"+uuid.NewString(),
+			[]string{models.ResourceChannelAccounts + ":" + models.ActionWrite},
+		)
+		user := testutil.CreateTestUser(t, db, offPilot.ID, testutil.WithRoleID(&role.ID))
+		enableBookingCommerceTestEntitlement(
+			t, db, offPilot.ID, user.ID, "omnichannel.enabled",
+		)
+		app := &App{
+			DB: db, Log: testutil.NopLogger(),
+			Config: &config.Config{
+				App: config.AppConfig{EncryptionKey: metaRegistryTestEncryptionKey},
+				MetaInstagram: config.MetaInstagramConfig{
+					Enabled: true, AllowedOrganizationID: pilot.ID.String(),
+				},
+			},
+		}
+		request := testutil.NewJSONRequest(t, map[string]any{
+			"channel": models.ChannelInstagram, "provider": channelapi.RelayProvider,
+			"name": "Synthetic off-pilot static Instagram", "external_account_id": "700000000009982",
+			"config": map[string]any{"relay_url": "https://relay.example.com/instagram"},
+		})
+		testutil.SetAuthContext(request, offPilot.ID, user.ID)
+		require.NoError(t, app.CreateChannelAccount(request))
+		assert.Equal(t, fasthttp.StatusOK, request.RequestCtx.Response.StatusCode())
+		var accounts, credentials, audits int64
+		require.NoError(t, db.Model(&models.ChannelAccount{}).Where("organization_id = ?", offPilot.ID).Count(&accounts).Error)
+		require.NoError(t, db.Model(&models.ChannelCredential{}).Where("organization_id = ?", offPilot.ID).Count(&credentials).Error)
+		require.NoError(t, db.Model(&models.AuditLog{}).Where("organization_id = ?", offPilot.ID).Count(&audits).Error)
+		assert.Equal(t, int64(1), accounts)
+		assert.Equal(t, int64(1), credentials)
+		assert.Equal(t, int64(1), audits)
+	})
 }
 
 func createMetaRegistryFixture(t *testing.T, db *gorm.DB, orgID uuid.UUID, channel models.Channel, externalID string) metaRegistryFixture {

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,6 +204,291 @@ allowed_organization_ids = "11111111-1111-4111-8111-111111111111"
 `))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "write_timeout")
+}
+
+func TestLoad_ManagedInstagramProductionRequiresServerOwnedApprovalEvidence(t *testing.T) {
+	base := `
+[app]
+environment = "production"
+encryption_key = "synthetic-encryption-key-at-least-32-bytes"
+
+[server]
+write_timeout = 120
+
+[meta_registry]
+enabled = true
+service_secret = "synthetic-registry-service-secret-at-least-32-bytes"
+relay_edge_secret = "synthetic-registry-edge-secret-at-least-32-bytes"
+queue_reader_version = 2
+
+[meta_instagram_onboarding]
+enabled = true
+app_id = "111122223333444"
+app_secret = "synthetic-instagram-secret-at-least-32-bytes"
+rereply_base_url = "https://app.rereply.app"
+relay_base_url = "https://app.rereply.app/meta-relay"
+allowed_organization_id = "11111111-1111-4111-8111-111111111111"
+`
+	_, err := config.Load(writeConfig(t, base+`
+app_review_status = "pending"
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "approved app review")
+
+	quarantineCfg, err := config.Load(writeConfig(t, base+`
+app_review_status = "rejected"
+quarantine_only = true
+`))
+	require.NoError(t, err)
+	assert.True(t, quarantineCfg.MetaInstagram.QuarantineOnly)
+
+	_, err = config.Load(writeConfig(t, base+`
+app_review_status = "rejected"
+quarantine_only = true
+development_test_profile_id = "555566667777888"
+development_test_oauth_subject_id = "666677778888999"
+development_app_role = "tester"
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "forbidden in production")
+
+	_, err = config.Load(writeConfig(t, base+`
+app_review_status = "approved"
+development_test_profile_id = "555566667777888"
+development_test_oauth_subject_id = "666677778888999"
+development_app_role = "tester"
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "forbidden in production")
+
+	cfg, err := config.Load(writeConfig(t, base+`
+app_review_status = "approved"
+`))
+	require.NoError(t, err)
+	assert.True(t, cfg.MetaInstagram.Enabled)
+	assert.Equal(t, "approved", cfg.MetaInstagram.AppReviewStatus)
+	assert.Empty(t, cfg.MetaInstagram.DevelopmentTestProfileID)
+
+	for name, replacement := range map[string]string{
+		"alternate host":        `rereply_base_url = "https://other.example.test"`,
+		"deceptive host suffix": `rereply_base_url = "https://app.rereply.app.evil.example"`,
+		"userinfo":              `rereply_base_url = "https://user@app.rereply.app"`,
+		"query":                 `rereply_base_url = "https://app.rereply.app?next=elsewhere"`,
+		"fragment":              `rereply_base_url = "https://app.rereply.app#elsewhere"`,
+		"relay path suffix":     `relay_base_url = "https://app.rereply.app/meta-relay.evil"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := base + "\napp_review_status = \"approved\"\n"
+			if strings.HasPrefix(replacement, "rereply_base_url") {
+				candidate = strings.Replace(
+					candidate, `rereply_base_url = "https://app.rereply.app"`, replacement, 1,
+				)
+			} else {
+				candidate = strings.Replace(
+					candidate, `relay_base_url = "https://app.rereply.app/meta-relay"`, replacement, 1,
+				)
+			}
+			_, loadErr := config.Load(writeConfig(t, candidate))
+			require.Error(t, loadErr)
+		})
+	}
+}
+
+func TestLoad_ManagedInstagramProviderOriginsRejectAdversarialURLs(t *testing.T) {
+	base := `
+[app]
+environment = "production"
+encryption_key = "synthetic-encryption-key-at-least-32-bytes"
+
+[server]
+write_timeout = 120
+
+[meta_registry]
+enabled = true
+service_secret = "synthetic-registry-service-secret-at-least-32-bytes"
+relay_edge_secret = "synthetic-registry-edge-secret-at-least-32-bytes"
+queue_reader_version = 2
+
+[meta_instagram_onboarding]
+enabled = true
+app_id = "111122223333444"
+app_secret = "synthetic-instagram-secret-at-least-32-bytes"
+app_review_status = "approved"
+authorization_base_url = "https://www.instagram.com"
+token_base_url = "https://api.instagram.com"
+graph_base_url = "https://graph.instagram.com"
+rereply_base_url = "https://app.rereply.app"
+relay_base_url = "https://app.rereply.app/meta-relay"
+allowed_organization_id = "11111111-1111-4111-8111-111111111111"
+`
+	_, err := config.Load(writeConfig(t, base))
+	require.NoError(t, err)
+
+	providers := []struct {
+		name      string
+		field     string
+		origin    string
+		errorText string
+	}{
+		{
+			name: "authorization", field: "authorization_base_url",
+			origin: "https://www.instagram.com", errorText: "authorization_base_url",
+		},
+		{
+			name: "token", field: "token_base_url",
+			origin: "https://api.instagram.com", errorText: "token_base_url",
+		},
+		{
+			name: "graph", field: "graph_base_url",
+			origin: "https://graph.instagram.com", errorText: "graph_base_url",
+		},
+	}
+	attacks := []struct {
+		name  string
+		value func(string) string
+	}{
+		{name: "bare query", value: func(origin string) string { return origin + "?" }},
+		{name: "query", value: func(origin string) string { return origin + "?next=elsewhere" }},
+		{name: "path", value: func(origin string) string { return origin + "/oauth" }},
+		{name: "root path", value: func(origin string) string { return origin + "/" }},
+		{name: "host suffix", value: func(origin string) string { return origin + ".evil.example" }},
+		{name: "userinfo", value: func(origin string) string {
+			return strings.Replace(origin, "https://", "https://user@", 1)
+		}},
+		{name: "fragment", value: func(origin string) string { return origin + "#elsewhere" }},
+		{name: "opaque", value: func(origin string) string {
+			return strings.Replace(origin, "https://", "https:", 1)
+		}},
+	}
+
+	for _, provider := range providers {
+		for _, attack := range attacks {
+			t.Run(provider.name+"/"+attack.name, func(t *testing.T) {
+				validLine := provider.field + ` = "` + provider.origin + `"`
+				invalidLine := provider.field + ` = "` + attack.value(provider.origin) + `"`
+				candidate := strings.Replace(base, validLine, invalidLine, 1)
+				_, loadErr := config.Load(writeConfig(t, candidate))
+				require.Error(t, loadErr)
+				assert.Contains(t, loadErr.Error(), provider.errorText)
+			})
+		}
+	}
+}
+
+func TestLoad_ManagedInstagramDevelopmentBootstrapIsExactAndNonproductionOnly(t *testing.T) {
+	base := `
+[app]
+environment = "development"
+encryption_key = "synthetic-encryption-key-at-least-32-bytes"
+
+[server]
+write_timeout = 120
+
+[meta_registry]
+enabled = true
+service_secret = "synthetic-registry-service-secret-at-least-32-bytes"
+relay_edge_secret = "synthetic-registry-edge-secret-at-least-32-bytes"
+queue_reader_version = 2
+
+[meta_instagram_onboarding]
+enabled = true
+app_id = "111122223333444"
+app_secret = "synthetic-instagram-secret-at-least-32-bytes"
+app_review_status = "not_submitted"
+rereply_base_url = "https://app.example.test"
+relay_base_url = "https://relay.example.test"
+allowed_organization_id = "11111111-1111-4111-8111-111111111111"
+`
+	_, err := config.Load(writeConfig(t, base))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "development_test_profile_id")
+
+	_, err = config.Load(writeConfig(t, base+`
+development_test_profile_id = "555566667777888"
+development_test_oauth_subject_id = "666677778888999"
+development_app_role = "workspace_admin"
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exact administrator, developer, or tester")
+
+	cfg, err := config.Load(writeConfig(t, base+`
+development_test_profile_id = "555566667777888"
+development_test_oauth_subject_id = "666677778888999"
+development_app_role = "tester"
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "555566667777888", cfg.MetaInstagram.DevelopmentTestProfileID)
+	assert.Equal(t, "666677778888999", cfg.MetaInstagram.DevelopmentTestOAuthSubjectID)
+	assert.Equal(t, "tester", cfg.MetaInstagram.DevelopmentAppRole)
+
+	for _, environment := range []string{"prod", "qa"} {
+		t.Run("unknown environment "+environment, func(t *testing.T) {
+			candidate := strings.Replace(
+				base,
+				`environment = "development"`,
+				`environment = "`+environment+`"`,
+				1,
+			) + `
+development_test_profile_id = "555566667777888"
+development_test_oauth_subject_id = "666677778888999"
+development_app_role = "tester"
+`
+			_, loadErr := config.Load(writeConfig(t, candidate))
+			require.Error(t, loadErr)
+			assert.Contains(t, loadErr.Error(), "environment must be development, staging, or production")
+		})
+	}
+}
+
+func TestLoad_ManagedInstagramAppMustRemainDistinctFromManagedMessenger(t *testing.T) {
+	base := `
+[app]
+environment = "development"
+encryption_key = "synthetic-encryption-key-at-least-32-bytes"
+
+[server]
+write_timeout = 120
+
+[meta_registry]
+enabled = true
+service_secret = "synthetic-registry-service-secret-at-least-32-bytes"
+relay_edge_secret = "synthetic-registry-edge-secret-at-least-32-bytes"
+queue_reader_version = 2
+
+[meta_messenger_onboarding]
+enabled = true
+app_id = "111122223333444"
+config_id = "444433332222111"
+app_secret = "synthetic-shared-app-secret-at-least-32-bytes"
+rereply_base_url = "https://app.example.test"
+relay_base_url = "https://relay.example.test"
+allowed_organization_ids = "11111111-1111-4111-8111-111111111111"
+allow_development_user_token = true
+
+[meta_instagram_onboarding]
+enabled = true
+app_id = "111122223333444"
+app_secret = "synthetic-instagram-secret-at-least-32-bytes"
+app_review_status = "not_submitted"
+rereply_base_url = "https://app.example.test"
+relay_base_url = "https://relay.example.test"
+allowed_organization_id = "11111111-1111-4111-8111-111111111111"
+development_test_profile_id = "555566667777888"
+development_test_oauth_subject_id = "666677778888999"
+development_app_role = "developer"
+`
+	_, err := config.Load(writeConfig(t, base))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "distinct IDs and secrets")
+
+	_, err = config.Load(writeConfig(t, strings.Replace(
+		base,
+		"app_id = \"111122223333444\"\napp_secret = \"synthetic-instagram-secret-at-least-32-bytes\"",
+		"app_id = \"999900001111222\"\napp_secret = \"synthetic-shared-app-secret-at-least-32-bytes\"",
+		1,
+	)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "distinct IDs and secrets")
 }
 
 func TestLoad_FileValuesOverrideDefaults(t *testing.T) {

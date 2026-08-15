@@ -49,9 +49,11 @@ type channelAIReplySnapshot struct {
 }
 
 type channelAIReplyCheck struct {
-	Snapshot      channelAIReplySnapshot
-	CancelReason  string
-	AlreadyQueued bool
+	Snapshot         channelAIReplySnapshot
+	CancelReason     string
+	AlreadyQueued    bool
+	ManagedInstagram bool
+	AlreadySettled   bool
 }
 
 // RunChannelAIReplies runs the durable Qwen reply loop until cancellation.
@@ -168,9 +170,9 @@ func (w *Worker) listReadyChannelAIReplyOrganizations(
 			  AND kind = ?
 			  AND run_at <= ?
 			  AND (
-			    status = ?
-			    OR (
 			      status = ?
+			    OR (
+			      status IN (?, ?)
 			      AND (locked_at IS NULL OR locked_at < ?)
 			    )
 			  )
@@ -184,6 +186,7 @@ func (w *Worker) listReadyChannelAIReplyOrganizations(
 		now,
 		models.ScheduledJobStatusPending,
 		models.ScheduledJobStatusProcessing,
+		models.ScheduledJobStatusGenerating,
 		staleBefore,
 		cursor,
 		limit,
@@ -203,19 +206,20 @@ func (w *Worker) claimChannelAIReplyJob(
 		now := time.Now().UTC()
 		staleBefore := now.Add(-defaultChannelAIReplyLease)
 		var candidate struct {
-			ID uuid.UUID
+			ID     uuid.UUID
+			Status models.ScheduledJobStatus
 		}
 		if err := tx.Raw(`
-			SELECT id
+			SELECT id, status
 			FROM scheduled_jobs
 			WHERE organization_id = ?
 			  AND deleted_at IS NULL
 			  AND kind = ?
 			  AND run_at <= ?
 			  AND (
-			    status = ?
-			    OR (
 			      status = ?
+			    OR (
+			      status IN (?, ?)
 			      AND (locked_at IS NULL OR locked_at < ?)
 			    )
 			  )
@@ -228,11 +232,40 @@ func (w *Worker) claimChannelAIReplyJob(
 			now,
 			models.ScheduledJobStatusPending,
 			models.ScheduledJobStatusProcessing,
+			models.ScheduledJobStatusGenerating,
 			staleBefore,
 		).Scan(&candidate).Error; err != nil {
 			return err
 		}
 		if candidate.ID == uuid.Nil {
+			return nil
+		}
+		if candidate.Status == models.ScheduledJobStatusGenerating {
+			// `generating` means customer text may already have reached Qwen.
+			// Without a provider idempotency contract it is unsafe to replay that
+			// request after a crash or lease loss under any credential generation.
+			// Discover the stale row so it cannot stick forever, but terminally
+			// settle the ambiguity instead of reclaiming it to processing.
+			result := tx.Model(&models.ScheduledJob{}).
+				Where(
+					"id = ? AND organization_id = ? AND kind = ? AND status = ? AND (locked_at IS NULL OR locked_at < ?)",
+					candidate.ID,
+					organizationID,
+					models.ScheduledJobKindChannelAIReply,
+					models.ScheduledJobStatusGenerating,
+					staleBefore,
+				).
+				Updates(map[string]any{
+					"status":       models.ScheduledJobStatusCancelled,
+					"completed_at": now,
+					"last_error":   "managed_instagram_generation_ambiguous_after_lease_loss",
+					"locked_at":    nil,
+					"locked_by":    "",
+					"updated_at":   now,
+				})
+			if result.Error != nil {
+				return result.Error
+			}
 			return nil
 		}
 		result := tx.Model(&models.ScheduledJob{}).
@@ -268,9 +301,16 @@ func (w *Worker) processChannelAIReplyJob(
 	organizationID, jobID uuid.UUID,
 	workerID string,
 ) error {
-	check, err := w.loadChannelAIReplyCheck(organizationID, jobID, workerID, true)
+	check, err := w.authorizeChannelAIReplyGeneration(
+		organizationID,
+		jobID,
+		workerID,
+	)
 	if err != nil {
 		return err
+	}
+	if check.AlreadySettled {
+		return nil
 	}
 	if check.AlreadyQueued {
 		return w.settleChannelAIReplyJob(
@@ -323,45 +363,204 @@ func (w *Worker) processChannelAIReplyJob(
 			err,
 		)
 	}
-	return w.finalizeChannelAIReply(
-		organizationID,
-		jobID,
-		workerID,
-		response,
-	)
+	if check.ManagedInstagram {
+		return w.finalizeChannelAIReply(
+			organizationID,
+			jobID,
+			workerID,
+			response,
+			&check.Snapshot.Account,
+		)
+	}
+	return w.finalizeChannelAIReply(organizationID, jobID, workerID, response)
 }
 
-func (w *Worker) loadChannelAIReplyCheck(
+// authorizeChannelAIReplyGeneration is the last authorization boundary before
+// customer text may leave the process for Qwen. Managed Instagram uses the
+// same organizations.id mutex as lifecycle writers and takes locks in the
+// fixed order organization -> scheduled job -> account -> credentials. A
+// lifecycle downgrade that commits first therefore cancels the processing job
+// before this transaction can cross the durable generating CAS.
+func (w *Worker) authorizeChannelAIReplyGeneration(
 	organizationID, jobID uuid.UUID,
 	workerID string,
-	buildPrompt bool,
 ) (channelAIReplyCheck, error) {
 	var check channelAIReplyCheck
-	err := database.WithTenant(w.DB, organizationID, func(tx *gorm.DB) error {
+	err := database.WithTenantReadCommitted(w.DB, organizationID, func(tx *gorm.DB) error {
+		if err := lockChannelOutboxOrganizationScopeTx(tx, organizationID); err != nil {
+			return err
+		}
 		var job models.ScheduledJob
-		if err := tx.Where(
-			"id = ? AND organization_id = ? AND kind = ? AND status = ? AND locked_by = ?",
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+			"id = ? AND organization_id = ? AND kind = ?",
 			jobID,
 			organizationID,
 			models.ScheduledJobKindChannelAIReply,
-			models.ScheduledJobStatusProcessing,
-			workerID,
 		).First(&job).Error; err != nil {
+			return err
+		}
+		if job.Status != models.ScheduledJobStatusProcessing || job.LockedBy != workerID {
+			switch job.Status {
+			case models.ScheduledJobStatusCompleted,
+				models.ScheduledJobStatusFailed,
+				models.ScheduledJobStatusCancelled:
+				check.AlreadySettled = true
+				return nil
+			default:
+				return errors.New("channel AI reply generation lost its lease")
+			}
+		}
+
+		lockedAccount, managedInstagram, err := lockChannelAIReplyGenerationBindingTx(
+			tx,
+			organizationID,
+			&job,
+		)
+		if err != nil {
 			return err
 		}
 		resolved, err := w.checkChannelAIReplyEligibility(
 			tx,
 			organizationID,
 			&job,
-			buildPrompt,
+			true,
 		)
 		if err != nil {
 			return err
 		}
 		check = resolved
+		if !managedInstagram {
+			return nil
+		}
+		check.ManagedInstagram = true
+
+		settleManaged := func(status models.ScheduledJobStatus, reason string) error {
+			if err := settleChannelAIReplyJobTx(
+				tx,
+				organizationID,
+				job.ID,
+				workerID,
+				status,
+				reason,
+			); err != nil {
+				return err
+			}
+			check.AlreadySettled = true
+			return nil
+		}
+		if check.AlreadyQueued {
+			return settleManaged(models.ScheduledJobStatusCompleted, "")
+		}
+		if check.CancelReason != "" {
+			return settleManaged(models.ScheduledJobStatusCancelled, check.CancelReason)
+		}
+		if lockedAccount == nil ||
+			lockedAccount.ID != check.Snapshot.Account.ID ||
+			lockedAccount.OrganizationID != organizationID ||
+			!w.managedInstagramChannelAIGenerationAllowed(
+				lockedAccount,
+				time.Now().UTC(),
+			) {
+			check.CancelReason = "managed_instagram_generation_not_authorized"
+			return settleManaged(
+				models.ScheduledJobStatusCancelled,
+				check.CancelReason,
+			)
+		}
+
+		now := time.Now().UTC()
+		result := tx.Model(&models.ScheduledJob{}).
+			Where(
+				"id = ? AND organization_id = ? AND kind = ? AND status = ? AND locked_by = ?",
+				job.ID,
+				organizationID,
+				models.ScheduledJobKindChannelAIReply,
+				models.ScheduledJobStatusProcessing,
+				workerID,
+			).
+			Updates(map[string]any{
+				"status":     models.ScheduledJobStatusGenerating,
+				"locked_at":  now,
+				"updated_at": now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("channel AI reply generation fence lost its lease")
+		}
+		check.Snapshot.Job.Status = models.ScheduledJobStatusGenerating
+		check.Snapshot.Job.LockedAt = &now
+		check.Snapshot.Account.Credentials = lockedAccount.Credentials
 		return nil
 	})
 	return check, err
+}
+
+// lockChannelAIReplyGenerationBindingTx locks the account referenced by the
+// scheduled payload. For managed Instagram intent (either marker, or durable
+// platform/subscription/URL residue after both markers were stripped), it also
+// locks every credential that could form the current generation.
+func lockChannelAIReplyGenerationBindingTx(
+	tx *gorm.DB,
+	organizationID uuid.UUID,
+	job *models.ScheduledJob,
+) (*models.ChannelAccount, bool, error) {
+	if tx == nil || organizationID == uuid.Nil || job == nil {
+		return nil, false, errors.New("channel AI reply generation transaction is required")
+	}
+	var payload models.ChannelAIReplyJobPayload
+	if err := decodeChannelAIReplyJSON(job.Payload, &payload); err != nil ||
+		payload.ChannelAccountID == uuid.Nil {
+		return nil, false, nil
+	}
+	var account models.ChannelAccount
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"id = ? AND organization_id = ?",
+		payload.ChannelAccountID,
+		organizationID,
+	).First(&account).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	managedInstagram := account.Channel == models.ChannelInstagram &&
+		isManagedMetaChannelOutboxAccount(&account)
+	if !managedInstagram {
+		return &account, false, nil
+	}
+	now := time.Now().UTC()
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"organization_id = ? AND channel_account_id = ? AND status IN ? AND (expires_at IS NULL OR expires_at > ?)",
+		organizationID,
+		account.ID,
+		[]models.ChannelCredentialStatus{
+			models.ChannelCredentialStatusActive,
+			models.ChannelCredentialStatusExpiring,
+		},
+		now,
+	).Order("version DESC").Order("id ASC").Find(&account.Credentials).Error; err != nil {
+		return nil, false, err
+	}
+	return &account, true, nil
+}
+
+func (w *Worker) managedInstagramChannelAIGenerationAllowed(
+	account *models.ChannelAccount,
+	now time.Time,
+) bool {
+	if account == nil || account.Channel != models.ChannelInstagram ||
+		!isManagedMetaChannelOutboxAccount(account) {
+		return false
+	}
+	generation, ok := managedMetaCurrentCredentialGeneration(account.Credentials, now)
+	return ok && managedInstagramCredentialGenerationValid(
+		generation,
+		account.OrganizationID,
+		account.ID,
+		now,
+	) && w.managedMetaChannelOutboxRuntimeAllowed(account, generation, now)
 }
 
 func (w *Worker) checkChannelAIReplyEligibility(
@@ -842,19 +1041,38 @@ func resolveChannelAIReplySettings(
 func (w *Worker) finalizeChannelAIReply(
 	organizationID, jobID uuid.UUID,
 	workerID, response string,
+	expectedManagedAccounts ...*models.ChannelAccount,
 ) error {
-	return database.WithTenant(w.DB, organizationID, func(tx *gorm.DB) error {
+	var expectedManagedAccount *models.ChannelAccount
+	if len(expectedManagedAccounts) > 0 {
+		expectedManagedAccount = expectedManagedAccounts[0]
+	}
+	return database.WithTenantReadCommitted(w.DB, organizationID, func(tx *gorm.DB) error {
+		if err := lockChannelOutboxOrganizationScopeTx(tx, organizationID); err != nil {
+			return err
+		}
 		var job models.ScheduledJob
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where(
-				"id = ? AND organization_id = ? AND kind = ? AND status = ? AND locked_by = ?",
+				"id = ? AND organization_id = ? AND kind = ? AND status IN ? AND locked_by = ?",
 				jobID,
 				organizationID,
 				models.ScheduledJobKindChannelAIReply,
-				models.ScheduledJobStatusProcessing,
+				[]models.ScheduledJobStatus{
+					models.ScheduledJobStatusProcessing,
+					models.ScheduledJobStatusGenerating,
+				},
 				workerID,
 			).
 			First(&job).Error; err != nil {
+			return err
+		}
+		lockedAccount, freshManagedInstagram, err := lockChannelAIReplyGenerationBindingTx(
+			tx,
+			organizationID,
+			&job,
+		)
+		if err != nil {
 			return err
 		}
 		check, err := w.checkChannelAIReplyEligibility(
@@ -885,6 +1103,49 @@ func (w *Worker) finalizeChannelAIReply(
 				models.ScheduledJobStatusCancelled,
 				check.CancelReason,
 			)
+		}
+		managedGeneration := job.Status == models.ScheduledJobStatusGenerating
+		if managedGeneration || freshManagedInstagram {
+			var expectedGeneration, currentGeneration managedMetaCredentialGeneration
+			expectedGenerationOK := false
+			currentGenerationOK := false
+			if expectedManagedAccount != nil {
+				expectedGeneration, expectedGenerationOK = managedMetaCurrentCredentialGeneration(
+					expectedManagedAccount.Credentials,
+					time.Now().UTC(),
+				)
+			}
+			if lockedAccount != nil {
+				currentGeneration, currentGenerationOK = managedMetaCurrentCredentialGeneration(
+					lockedAccount.Credentials,
+					time.Now().UTC(),
+				)
+			}
+			if !managedGeneration || !freshManagedInstagram || lockedAccount == nil ||
+				expectedManagedAccount == nil || !expectedGenerationOK || !currentGenerationOK ||
+				expectedManagedAccount.ID != lockedAccount.ID ||
+				expectedManagedAccount.OrganizationID != lockedAccount.OrganizationID ||
+				expectedManagedAccount.Channel != lockedAccount.Channel ||
+				expectedManagedAccount.Provider != lockedAccount.Provider ||
+				expectedManagedAccount.ExternalAccountID != lockedAccount.ExternalAccountID ||
+				channelOutboxText(expectedManagedAccount.Metadata["meta_platform_app_id"]) !=
+					channelOutboxText(lockedAccount.Metadata["meta_platform_app_id"]) ||
+				!sameManagedMetaCredentialGeneration(expectedGeneration, currentGeneration) ||
+				lockedAccount.ID != check.Snapshot.Account.ID ||
+				!w.managedInstagramChannelAIGenerationAllowed(
+					lockedAccount,
+					time.Now().UTC(),
+				) {
+				return settleChannelAIReplyJobTx(
+					tx,
+					organizationID,
+					job.ID,
+					workerID,
+					models.ScheduledJobStatusCancelled,
+					"managed_instagram_generation_not_authorized",
+				)
+			}
+			check.Snapshot.Account.Credentials = lockedAccount.Credentials
 		}
 
 		snapshot := check.Snapshot
@@ -1046,11 +1307,14 @@ func settleChannelAIReplyJobTx(
 	now := time.Now().UTC()
 	result := tx.Model(&models.ScheduledJob{}).
 		Where(
-			"id = ? AND organization_id = ? AND kind = ? AND status = ? AND locked_by = ?",
+			"id = ? AND organization_id = ? AND kind = ? AND status IN ? AND locked_by = ?",
 			jobID,
 			organizationID,
 			models.ScheduledJobKindChannelAIReply,
-			models.ScheduledJobStatusProcessing,
+			[]models.ScheduledJobStatus{
+				models.ScheduledJobStatusProcessing,
+				models.ScheduledJobStatusGenerating,
+			},
 			workerID,
 		).
 		Updates(map[string]any{
@@ -1083,7 +1347,8 @@ func (w *Worker) failChannelAIReplyJob(
 	if maxAttempts <= 0 {
 		maxAttempts = 5
 	}
-	deadLetter := job.Attempts >= maxAttempts
+	providerAttemptAmbiguous := job.Status == models.ScheduledJobStatusGenerating
+	deadLetter := providerAttemptAmbiguous || job.Attempts >= maxAttempts
 	nextStatus := models.ScheduledJobStatusPending
 	if deadLetter {
 		nextStatus = models.ScheduledJobStatusFailed
@@ -1098,6 +1363,9 @@ func (w *Worker) failChannelAIReplyJob(
 			"locked_by":  "",
 			"updated_at": now,
 		}
+		if providerAttemptAmbiguous {
+			updates["last_error"] = "managed_instagram_generation_ambiguous_after_qwen_error: " + errorMessage
+		}
 		if deadLetter {
 			updates["completed_at"] = now
 		} else {
@@ -1109,7 +1377,7 @@ func (w *Worker) failChannelAIReplyJob(
 				job.ID,
 				organizationID,
 				models.ScheduledJobKindChannelAIReply,
-				models.ScheduledJobStatusProcessing,
+				job.Status,
 				workerID,
 			).
 			Updates(updates)

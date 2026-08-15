@@ -13,6 +13,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/access"
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/calling"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
@@ -58,6 +59,10 @@ type App struct {
 	// chatbot sends a stable WAMID-derived action key without sharing mutable
 	// execution state across concurrent webhook jobs.
 	inboundContinuation *inboundContinuationExecution
+	// channelAdapterFactory is an internal deterministic test seam for provider
+	// calls that must race a committed control-plane mutation. Production leaves
+	// it nil and always uses the concrete adapters below.
+	channelAdapterFactory func(*models.ChannelAccount) (channelapi.Adapter, error)
 }
 
 // whatsAppClient returns the application's shared client when available. The

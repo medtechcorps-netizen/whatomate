@@ -205,6 +205,7 @@ func GetMigrationModels() []MigrationModel {
 		{"ChannelAccount", &models.ChannelAccount{}},
 		{"ChannelCredential", &models.ChannelCredential{}},
 		{"MetaDeauthorizationEvent", &models.MetaDeauthorizationEvent{}},
+		{"MetaInstagramDataDeletionEvent", &models.MetaInstagramDataDeletionEvent{}},
 		{"ContactIdentity", &models.ContactIdentity{}},
 		{"InboxConversation", &models.InboxConversation{}},
 		{"ConversationParticipant", &models.ConversationParticipant{}},
@@ -221,11 +222,59 @@ func GetMigrationModels() []MigrationModel {
 func AutoMigrate(db *gorm.DB) error {
 	migrationModels := GetMigrationModels()
 	for _, m := range migrationModels {
+		if m.Name == "MetaInstagramDataDeletionEvent" {
+			if err := PrepareMetaInstagramDeletionJournalTenant(db); err != nil {
+				return err
+			}
+		}
 		if err := db.AutoMigrate(m.Model); err != nil {
 			return err
 		}
 	}
 	return BackfillProviderIntegrationBindings(db)
+}
+
+// PrepareMetaInstagramDeletionJournalTenant safely upgrades the unreleased
+// global journal shape to tenant ownership before AutoMigrate makes
+// organization_id NOT NULL. Completed rows can be recovered from their
+// tenant-owned privacy request. An unresolved row without that durable link
+// has no trustworthy tenant evidence, so it is removed rather than assigned
+// across a tenant boundary; an authentic callback replay recreates it inside
+// the deployment-configured tenant.
+func PrepareMetaInstagramDeletionJournalTenant(db *gorm.DB) error {
+	if db == nil || !db.Migrator().HasTable(&models.MetaInstagramDataDeletionEvent{}) {
+		return nil
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		// The first unreleased journal schema had no tenant column at all. Add it
+		// nullable before examining rows; AutoMigrate enforces NOT NULL only after
+		// every retained row has trustworthy tenant evidence.
+		if err := tx.Exec(`
+			ALTER TABLE meta_instagram_data_deletion_events
+			ADD COLUMN IF NOT EXISTS organization_id uuid
+		`).Error; err != nil {
+			return fmt.Errorf("add Instagram deletion journal tenant column: %w", err)
+		}
+		if tx.Migrator().HasTable(&models.PrivacyRequest{}) &&
+			tx.Migrator().HasColumn(&models.MetaInstagramDataDeletionEvent{}, "privacy_request_id") {
+			if err := tx.Exec(`
+				UPDATE meta_instagram_data_deletion_events AS event
+				SET organization_id = request.organization_id
+				FROM privacy_requests AS request
+				WHERE event.organization_id IS NULL
+				  AND event.privacy_request_id = request.id
+			`).Error; err != nil {
+				return fmt.Errorf("backfill Instagram deletion journal tenant: %w", err)
+			}
+		}
+		if err := tx.Exec(`
+			DELETE FROM meta_instagram_data_deletion_events
+			WHERE organization_id IS NULL
+		`).Error; err != nil {
+			return fmt.Errorf("remove unowned Instagram deletion journal rows: %w", err)
+		}
+		return nil
+	})
 }
 
 // BackfillProviderIntegrationBindings upgrades prepared Threads integrations
@@ -273,6 +322,12 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 	// Migrate models
 	for _, m := range migrationModels {
 		printProgress(currentStep, totalSteps)
+		if m.Name == "MetaInstagramDataDeletionEvent" {
+			if err := PrepareMetaInstagramDeletionJournalTenant(silentDB); err != nil {
+				fmt.Printf("\n  \033[31mInstagram deletion journal tenant migration failed\033[0m\n\n")
+				return err
+			}
+		}
 		if err := silentDB.AutoMigrate(m.Model); err != nil {
 			fmt.Printf("\n  \033[31m✗ Migration failed: %s\033[0m\n\n", m.Name)
 			return fmt.Errorf("failed to migrate %s: %w", m.Name, err)

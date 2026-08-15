@@ -14,7 +14,8 @@ or a verify token:
 | --- | --- | --- |
 | Legacy Messenger parent app(s) | `GET`/`POST /v1/meta/messenger/webhook` | Existing static Messenger Pages and Instagram accounts using `facebook_login` |
 | Managed Messenger platform app | `GET`/`POST /v1/meta/messenger/managed-webhook` | Registry-managed Messenger Pages only |
-| Separate Instagram Login app | `GET`/`POST /v1/meta/instagram/webhook` | Instagram accounts using `instagram_login` only |
+| Existing static Instagram Login app | `GET`/`POST /v1/meta/instagram/webhook` | Existing static Instagram Login mappings only |
+| Managed Instagram Login platform app | `GET`/`POST /v1/meta/instagram/managed-webhook` | Registry-managed Instagram professional profiles only |
 
 The shared legacy route `/v1/meta/webhook` does not exist. Each POST route
 validates `X-Hub-Signature-256` only with that route's app secret. Each GET
@@ -57,6 +58,9 @@ All deployments require:
 | `META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN` | Distinct verify token for the managed Messenger callback. Required only when the dynamic registry is enabled. |
 | `META_RELAY_INSTAGRAM_APP_SECRET` | App secret for the separate Instagram Login app webhook route. |
 | `META_RELAY_INSTAGRAM_VERIFY_TOKEN` | Verify token for the Instagram Login app callback. |
+| `META_RELAY_MANAGED_INSTAGRAM_APP_ID` | Exact platform-app ID for registry-managed Instagram Login bindings. |
+| `META_RELAY_MANAGED_INSTAGRAM_APP_SECRET` | Distinct managed Instagram app secret for its webhook route and `appsecret_proof`. |
+| `META_RELAY_MANAGED_INSTAGRAM_VERIFY_TOKEN` | Distinct verify token for the managed Instagram callback. |
 | `META_RELAY_GRAPH_API_VERSION` | Explicit version such as `v25.0`; update deliberately when Meta support changes. |
 | `META_RELAY_ACCOUNTS_JSON` | Optional static fallback account mappings. It contains environment-variable names, never secret values. Existing mappings continue to take precedence during migration. |
 | `META_RELAY_REGISTRY_ENABLED` | Explicit dynamic-registry gate. Defaults to `false`. |
@@ -66,9 +70,11 @@ All deployments require:
 | `META_RELAY_DYNAMIC_QUEUE_READER_VERSION` | Must be `2` on every relay reader before dynamic producers are enabled. |
 
 The legacy Messenger and Instagram webhook credentials must always be
-configured. When dynamic registry support is enabled, all three managed
-Messenger values are also required and must differ from every legacy secret
-and verify token.
+configured and their app secrets and verify tokens remain distinct from each
+other. When a managed product is enabled, its app ID, secret, and verify token
+are required and must also differ from every static or other managed app
+credential. A managed Instagram app ID may never equal the managed Messenger
+app ID.
 
 Optional tuning:
 
@@ -91,6 +97,17 @@ enablement. The dynamic registry stays default-off and fails startup unless its
 URL, both service credentials, exact managed app binding, and queue reader v2
 gate are complete and mutually consistent.
 
+That precedence is also a managed-Instagram cutover invariant. Before any
+managed OAuth callback or `/subscribed_apps` mutation, inspect the effective
+`META_RELAY_ACCOUNTS_JSON` on every replica and prove the intended profile ID
+is absent. A database channel deletion does not remove an environment mapping;
+leaving the profile there routes outbound through the old static token and
+prevents the managed webhook app from owning ingress. The current four static
+production mappings remain unchanged for this rollout, so the pilot profile
+must not overlap them. A future overlapping migration requires a separate
+drain: block static intake, drain/settle old static work, remove the exact
+mapping from every replica, roll all replicas, then start managed OAuth.
+
 ## Dynamic control plane
 
 > **Production gate:** keep the dynamic registry and Messenger lifecycle off
@@ -98,13 +115,13 @@ gate are complete and mutually consistent.
 > relay replica is a queue-v2 reader, and the ReReply deployment has its exact
 > pilot organization allowlist configured. An empty allowlist fails closed.
 
-Dynamic Messenger accounts use ReReply's platform-owned managed Messenger
-application. Instagram self-service remains disabled until its equivalent
-lifecycle is implemented. A clinic authorizes its Page; it does not supply a
-clinic-specific app secret. This is required because each webhook request is
-signed by the application that owns the subscription, while the relay exposes
-one isolated managed Messenger route in addition to the untouched legacy
-routes.
+Dynamic Messenger and Instagram accounts use separate platform-owned
+applications. A workspace authorizes its Page or professional profile; it does
+not supply an app secret. Each webhook request is signed by the application
+that owns the subscription, so each managed product has an isolated route in
+addition to the untouched static routes. See
+[Managed Instagram Login lifecycle](meta-instagram-managed-lifecycle.md) for
+the release-evidence and activation contract.
 
 The ReReply API remains the only process with the PostgreSQL credential and
 application encryption key. The relay never receives either. Instead it calls
@@ -125,10 +142,13 @@ lease only when all of the following remain true:
 - the ReReply webhook target is absolute HTTPS.
 
 Ingress may cache that lease for a few seconds. Queue forwarding, account
-health, and outbound sends re-resolve without cache. Each queued dynamic job
-stores both credential-version fences; a rotation, deauthorization, ownership
-failure, or tenant reassignment prevents the old job from being delivered with
-new authority. Registry responses and credentials must never be logged,
+health, and outbound sends re-resolve without cache. Relay queue schema 2
+stores both credential-version fences. ReReply-managed outbox jobs do not
+carry those relay fields, so every managed credential-generation change
+transactionally cancels all pending, retrying, and processing outbox work
+before it can resolve a newer lease. A job that already reached `dispatching`
+retains the provider-attempt win. Together these fences prevent old work from
+being delivered with new authority. Registry responses and credentials must never be logged,
 persisted by the relay, exposed to browser APIs, or copied into audit rows.
 
 A stale ownership binding is distinct from a revoked or missing binding. New
@@ -155,17 +175,27 @@ amplifying into broker, database, and decryption work.
 ## Reader-first rollout and rollback
 
 The current four production mappings stay in `META_RELAY_ACCOUNTS_JSON`; no
-database import or environment change is part of this patch. Queue schema 0/1
-static jobs remain readable, new static jobs carry schema 2, and an unknown
-future schema is parked instead of destroyed. Before the later lifecycle
-release enables a dynamic producer, every relay replica must first run a
-dynamic-aware schema-v2 reader and the old-worker queue must be drained. Enable
-the managed lifecycle only after the exact intended web and relay SHA is
-running everywhere. Once the first managed binding or managed queue job exists,
-rolling back to an old binary is prohibited because it cannot honor lifecycle
-fences and can reopen legacy manual Messenger creation. Before any later
-rollback, disable intake, reconcile managed subscription operations, and drain
-or safely park all managed jobs with the new reader.
+database import or environment change is part of this patch, and the managed
+pilot must be a different profile. Queue schema 0/1 static jobs remain
+readable, new static jobs carry schema 2, and an unknown future schema is
+parked instead of destroyed. Before the later lifecycle release enables a
+dynamic producer, every relay replica must first run a dynamic-aware schema-v2
+reader and the old-worker queue must be drained. Enable the managed lifecycle
+only after the exact intended web and relay SHA is running everywhere. Once
+the first managed binding or managed queue job exists, rolling back to an old
+binary is prohibited because it cannot honor lifecycle fences and can reopen
+legacy manual Messenger creation. Before any later rollback, disable intake,
+deploy the new binary with `quarantine_only=true`, require every API and worker
+replica to complete the synchronous pre-serve/pre-claim tenant quarantine and
+queue-cancellation barrier, and fail startup if that commit cannot complete.
+Do not wait for an asynchronous lifecycle sweep; reconcile
+unsubscribe/disconnect operations, and drain or safely park all managed jobs
+with the new reader. If reverting the profile to static, add its mapping only
+after those fences settle and deploy the mapping consistently to every
+replica; static lookup immediately regains precedence. Keep a compatible
+data-deletion callback and status responder online for every retained
+confirmation code; an old web binary cannot fulfill that obligation merely
+because it ignores the additive table.
 
 ## Account and token binding
 

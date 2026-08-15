@@ -37,6 +37,7 @@ const (
 	metaDeauthorizationPendingIssuedKey    = "meta_deauthorization_pending_issued_at"
 	metaDeauthorizationResolvedDigestKey   = "meta_deauthorization_resolved_digest"
 	metaDeauthorizationResolvedStateKey    = "meta_deauthorization_resolved_state"
+	metaDeauthorizationResolvedAtKey       = "meta_deauthorization_resolved_at"
 )
 
 var errMetaDeauthorizationEventStale = errors.New("deauthorization event is stale")
@@ -131,7 +132,10 @@ func (a *App) DeauthorizeMetaMessenger(r *fastglue.Request) error {
 	eventIssuedAt := time.Unix(payload.IssuedAt, 0).UTC()
 	checkedAt := time.Now().UTC()
 	applied, err := processMetaDeauthorizationTargets(targets, func(target metaDeauthorizationTarget) (bool, error) {
-		return a.revokeMetaDeauthorizationTarget(target, eventIssuedAt, digest, checkedAt)
+		return a.revokeMetaDeauthorizationTargetForBinding(
+			target, models.ChannelMessenger, a.Config.MetaMessenger.AppID, payload.UserID,
+			eventIssuedAt, digest, checkedAt,
+		)
 	})
 	if err != nil {
 		a.Log.Warn("Messenger deauthorization did not revoke every target")
@@ -155,8 +159,23 @@ func (a *App) loadOrCreateMetaDeauthorizationEvent(
 	payload metaMessengerSignedRequestPayload,
 	now time.Time,
 ) (models.MetaDeauthorizationEvent, error) {
+	if a == nil || a.DB == nil {
+		return models.MetaDeauthorizationEvent{}, errMetaDeauthorizationEventStale
+	}
+	return loadOrCreateMetaDeauthorizationEventDB(
+		a.rootApp().DB, digest, appID, payload, now,
+	)
+}
+
+func loadOrCreateMetaDeauthorizationEventDB(
+	db *gorm.DB,
+	digest string,
+	appID string,
+	payload metaMessengerSignedRequestPayload,
+	now time.Time,
+) (models.MetaDeauthorizationEvent, error) {
 	var event models.MetaDeauthorizationEvent
-	if a == nil || a.DB == nil || len(strings.TrimSpace(digest)) != sha256.Size*2 ||
+	if db == nil || len(strings.TrimSpace(digest)) != sha256.Size*2 ||
 		!validCanonicalMetaID(appID) || !validCanonicalMetaID(payload.UserID) || payload.IssuedAt <= 0 {
 		return event, errMetaDeauthorizationEventStale
 	}
@@ -165,8 +184,7 @@ func (a *App) loadOrCreateMetaDeauthorizationEvent(
 	if issuedAt.After(now.Add(2 * time.Minute)) {
 		return event, errMetaDeauthorizationEventStale
 	}
-	root := a.rootApp()
-	err := root.DB.Where("digest = ?", digest).First(&event).Error
+	err := db.Where("digest = ?", digest).First(&event).Error
 	if err == nil {
 		if event.PlatformAppID != appID || event.AuthorizingUserID != payload.UserID ||
 			!event.IssuedAt.UTC().Equal(issuedAt) {
@@ -192,10 +210,10 @@ func (a *App) loadOrCreateMetaDeauthorizationEvent(
 		Digest: digest, PlatformAppID: appID, AuthorizingUserID: payload.UserID,
 		IssuedAt: issuedAt, VerifiedAt: now, State: "verified", LastAttemptAt: &now,
 	}
-	if err := root.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&event).Error; err != nil {
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&event).Error; err != nil {
 		return models.MetaDeauthorizationEvent{}, err
 	}
-	if err := root.DB.Where("digest = ?", digest).First(&event).Error; err != nil {
+	if err := db.Where("digest = ?", digest).First(&event).Error; err != nil {
 		return models.MetaDeauthorizationEvent{}, err
 	}
 	if event.PlatformAppID != appID || event.AuthorizingUserID != payload.UserID ||
@@ -374,17 +392,51 @@ func (a *App) revokeMetaDeauthorizationTarget(
 	eventDigest string,
 	checkedAt time.Time,
 ) (bool, error) {
+	return a.revokeMetaDeauthorizationTargetForBinding(
+		target, "", "", "", eventIssuedAt, eventDigest, checkedAt,
+	)
+}
+
+// revokeMetaDeauthorizationTargetForBinding closes the lookup/mutation race
+// for public callbacks. The legacy wrapper above remains for the existing
+// Messenger lifecycle tests, while both HTTP handlers supply the exact
+// channel, app, and authorizing identity that signed the request.
+func (a *App) revokeMetaDeauthorizationTargetForBinding(
+	target metaDeauthorizationTarget,
+	expectedChannel models.Channel,
+	expectedAppID, expectedUserID string,
+	eventIssuedAt time.Time,
+	eventDigest string,
+	checkedAt time.Time,
+) (bool, error) {
 	var changed bool
 	var ambiguous bool
 	err := a.WithCommittedTenantApp(target.OrganizationID, func(scoped *App) error {
+		if err := lockChannelAIOrganizationScopeTx(scoped.DB, target.OrganizationID); err != nil {
+			return err
+		}
 		var account models.ChannelAccount
-		if err := scoped.DB.Preload("Credentials", func(db *gorm.DB) *gorm.DB { return db.Order("version DESC") }).
+		if err := scoped.DB.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Preload("Credentials", func(db *gorm.DB) *gorm.DB { return db.Order("version DESC") }).
 			Where("id = ? AND organization_id = ?", target.AccountID, target.OrganizationID).
 			First(&account).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil
 			}
 			return err
+		}
+		if expectedChannel != "" {
+			if (expectedChannel != models.ChannelMessenger && expectedChannel != models.ChannelInstagram) ||
+				account.Channel != expectedChannel || account.Provider != channelapi.RelayProvider ||
+				!metaRegistryControlPlaneConfig(account.Config) ||
+				stringConfigValue(account.Metadata, "meta_platform_app_id") != strings.TrimSpace(expectedAppID) ||
+				stringConfigValue(account.Metadata, "meta_authorizing_user_id") != strings.TrimSpace(expectedUserID) {
+				return metaregistry.ErrNotFound
+			}
+			if expectedChannel == models.ChannelInstagram &&
+				!exactManagedInstagramCallbackBinding(&account, expectedAppID, expectedUserID) {
+				return metaregistry.ErrNotFound
+			}
 		}
 		oauth := currentMetaRegistryCredential(account.Credentials, models.ChannelCredentialKindOAuth, checkedAt)
 		webhook := currentMetaRegistryCredential(account.Credentials, models.ChannelCredentialKindWebhook, checkedAt)
@@ -415,21 +467,10 @@ func (a *App) revokeMetaDeauthorizationTarget(
 			}
 			return errors.New("deauthorization target has no revocable credential fence")
 		}
-		authorizedAt, parseErr := time.Parse(
-			time.RFC3339Nano,
-			stringConfigValue(account.Metadata, metaMessengerAuthorizationGrantedAtKey),
-		)
-		if parseErr != nil || eventIssuedAt.IsZero() || strings.TrimSpace(eventDigest) == "" {
-			return errors.New("deauthorization target has no authorization generation fence")
+		if eventIssuedAt.IsZero() || strings.TrimSpace(eventDigest) == "" {
+			return errors.New("deauthorization event has no signed generation fence")
 		}
-		authorizedSecond := authorizedAt.UTC().Truncate(time.Second)
-		credentialSecond := oauth.CreatedAt.UTC().Truncate(time.Second)
-		if eventIssuedAt.Before(authorizedSecond) ||
-			(!oauth.CreatedAt.IsZero() && eventIssuedAt.Before(credentialSecond)) {
-			return nil
-		}
-		if eventIssuedAt.Equal(authorizedSecond) ||
-			(!oauth.CreatedAt.IsZero() && eventIssuedAt.Equal(credentialSecond)) {
+		quarantineAmbiguousGeneration := func(reason string) error {
 			if stringConfigValue(account.Metadata, metaDeauthorizationResolvedDigestKey) == eventDigest &&
 				stringConfigValue(account.Metadata, metaDeauthorizationResolvedStateKey) == "current_authorization_verified" {
 				return nil
@@ -438,7 +479,7 @@ func (a *App) revokeMetaDeauthorizationTarget(
 			metadata[metaDeauthorizationPendingDigestKey] = eventDigest
 			metadata[metaDeauthorizationPendingIssuedKey] = eventIssuedAt.UTC().Format(time.RFC3339)
 			metadata["meta_ownership_state"] = metaregistry.OwnershipStale
-			metadata["meta_ownership_reason"] = "deauthorization_generation_ambiguous"
+			metadata["meta_ownership_reason"] = reason
 			metadata["meta_activation_state"] = "deauthorization_reconciliation_required"
 			config := cloneJSONB(account.Config)
 			config["outbound_enabled"] = false
@@ -456,8 +497,31 @@ func (a *App) revokeMetaDeauthorizationTarget(
 			if result.RowsAffected != 1 {
 				return metaregistry.ErrNotFound
 			}
+			if err := cancelManagedMetaQueuedWorkForAccountTx(
+				scoped.DB, target.OrganizationID, account.ID,
+				"managed_meta_deauthorization_reconciliation",
+			); err != nil {
+				return err
+			}
 			ambiguous = true
 			return nil
+		}
+		authorizedAt, parseErr := time.Parse(
+			time.RFC3339Nano,
+			stringConfigValue(account.Metadata, metaMessengerAuthorizationGrantedAtKey),
+		)
+		if parseErr != nil || authorizedAt.IsZero() {
+			return quarantineAmbiguousGeneration("deauthorization_generation_fence_missing")
+		}
+		authorizedSecond := authorizedAt.UTC().Truncate(time.Second)
+		credentialSecond := oauth.CreatedAt.UTC().Truncate(time.Second)
+		if !oauth.CreatedAt.IsZero() && eventIssuedAt.Before(authorizedSecond) &&
+			eventIssuedAt.Before(credentialSecond) {
+			return nil
+		}
+		if oauth.CreatedAt.IsZero() || !eventIssuedAt.After(authorizedSecond) ||
+			!eventIssuedAt.After(credentialSecond) {
+			return quarantineAmbiguousGeneration("deauthorization_generation_ambiguous")
 		}
 		mutationTime := checkedAt
 		if previous, parseErr := time.Parse(time.RFC3339Nano, stringConfigValue(account.Metadata, "meta_ownership_checked_at")); parseErr == nil &&
@@ -474,6 +538,11 @@ func (a *App) revokeMetaDeauthorizationTarget(
 		if mutationErr != nil || !changed {
 			return mutationErr
 		}
+		if err := cancelManagedMetaQueuedWorkForAccountTx(
+			scoped.DB, target.OrganizationID, account.ID, "managed_meta_deauthorization",
+		); err != nil {
+			return err
+		}
 		if err := scoped.DB.Where("id = ? AND organization_id = ?", account.ID, target.OrganizationID).
 			First(&account).Error; err != nil {
 			return err
@@ -489,6 +558,27 @@ func (a *App) revokeMetaDeauthorizationTarget(
 		return false, errors.New("deauthorization event generation is ambiguous and quarantined")
 	}
 	return changed, err
+}
+
+func metaDeauthorizationReconciliationPending(metadata models.JSONB) bool {
+	return stringConfigValue(metadata, metaDeauthorizationPendingDigestKey) != "" ||
+		stringConfigValue(metadata, metaDeauthorizationPendingIssuedKey) != ""
+}
+
+func parsePendingMetaDeauthorizationFence(
+	metadata models.JSONB,
+) (string, time.Time, bool, error) {
+	digest := stringConfigValue(metadata, metaDeauthorizationPendingDigestKey)
+	issued := stringConfigValue(metadata, metaDeauthorizationPendingIssuedKey)
+	if digest == "" && issued == "" {
+		return "", time.Time{}, false, nil
+	}
+	decoded, decodeErr := hex.DecodeString(digest)
+	issuedAt, timeErr := time.Parse(time.RFC3339, issued)
+	if decodeErr != nil || len(decoded) != sha256.Size || timeErr != nil || issuedAt.IsZero() {
+		return "", time.Time{}, true, errMetaMessengerSubscriptionFence
+	}
+	return digest, issuedAt.UTC(), true, nil
 }
 
 func verifyMetaMessengerSignedRequest(
@@ -560,13 +650,27 @@ return n
 func (a *App) resolveAllMetaDeauthorizationTargets(
 	appID, userID string,
 ) ([]metaDeauthorizationTarget, error) {
+	return a.resolveAllMetaDeauthorizationTargetsForChannel(
+		models.ChannelMessenger, appID, userID,
+	)
+}
+
+func (a *App) resolveAllMetaDeauthorizationTargetsForChannel(
+	channel models.Channel,
+	appID, userID string,
+) ([]metaDeauthorizationTarget, error) {
+	if channel != models.ChannelMessenger {
+		return nil, errors.New("deauthorization target channel is invalid")
+	}
 	if !validCanonicalMetaID(appID) || !validCanonicalMetaID(userID) {
 		return nil, errors.New("deauthorization target identity is invalid")
 	}
 	targets := make([]metaDeauthorizationTarget, 0)
 	after := uuid.Nil
 	for {
-		page, err := a.resolveMetaDeauthorizationTargetPage(appID, userID, after, metaDeauthorizationTargetPageSize)
+		page, err := a.resolveMetaDeauthorizationTargetPageForChannel(
+			channel, appID, userID, after, metaDeauthorizationTargetPageSize,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -584,11 +688,15 @@ func (a *App) resolveAllMetaDeauthorizationTargets(
 	}
 }
 
-func (a *App) resolveMetaDeauthorizationTargetPage(
+func (a *App) resolveMetaDeauthorizationTargetPageForChannel(
+	channel models.Channel,
 	appID, userID string,
 	after uuid.UUID,
 	limit int,
 ) ([]metaDeauthorizationTarget, error) {
+	if channel != models.ChannelMessenger {
+		return nil, errors.New("deauthorization target channel is invalid")
+	}
 	if limit < 1 || limit > metaDeauthorizationTargetPageSize {
 		return nil, errors.New("deauthorization target page size is invalid")
 	}
@@ -603,17 +711,23 @@ func (a *App) resolveMetaDeauthorizationTargetPage(
 		}
 		return targets, nil
 	}
-	if err := root.DB.Model(&models.ChannelAccount{}).
+	query := root.DB.Model(&models.ChannelAccount{}).
 		Select("organization_id, id AS account_id").
 		Where("channel = ? AND provider = ? AND status IN ? AND metadata ->> 'meta_platform_app_id' = ? AND metadata ->> 'meta_authorizing_user_id' = ?",
-			models.ChannelMessenger, channelapi.RelayProvider,
+			channel, channelapi.RelayProvider,
 			[]models.ChannelAccountStatus{
 				models.ChannelAccountStatusPending,
 				models.ChannelAccountStatusActive,
 				models.ChannelAccountStatusDegraded,
 				models.ChannelAccountStatusDisconnected,
-			},
-			appID, userID).
+			}, appID, userID)
+	if channel == models.ChannelInstagram {
+		query = query.Where(
+			"config ->> 'meta_management_mode' = ? AND config ->> 'instagram_api_mode' = ?",
+			metaregistry.ManagementModePlatformOAuth, "instagram_login",
+		)
+	}
+	if err := query.
 		Where("id > ?", after).
 		Order("id").
 		Limit(limit).Scan(&targets).Error; err != nil {

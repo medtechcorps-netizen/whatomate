@@ -346,6 +346,17 @@ func runServer(args []string) {
 			legacyMetaStats.Linked,
 		)
 	}
+	// Quarantine-only is an emergency authorization barrier. It must commit the
+	// exact tenant downgrade and queue cancellation before any HTTP listener,
+	// embedded worker, lifecycle goroutine, or provider-capable processor starts.
+	if err := handlers.ReconcileMetaInstagramQuarantineStartup(
+		context.Background(), db, cfg,
+	); err != nil {
+		lo.Fatal("Managed Instagram quarantine startup barrier failed", "error", err)
+	}
+	if cfg.MetaInstagram.Enabled && cfg.MetaInstagram.QuarantineOnly {
+		lo.Info("Managed Instagram quarantine startup barrier committed")
+	}
 
 	// Connect to Redis
 	rdb, err := database.NewRedis(&cfg.Redis)
@@ -518,6 +529,17 @@ func runServer(args []string) {
 			}
 		}()
 	}
+	var metaInstagramLifecycleCancel context.CancelFunc
+	if cfg.MetaInstagram.Enabled {
+		var metaInstagramLifecycleCtx context.Context
+		metaInstagramLifecycleCtx, metaInstagramLifecycleCancel = context.WithCancel(context.Background())
+		go func() {
+			lo.Info("Instagram ownership lifecycle processor started")
+			if err := app.RunMetaInstagramLifecycle(metaInstagramLifecycleCtx); err != nil && err != context.Canceled {
+				lo.Error("Instagram ownership lifecycle processor stopped", "error", err)
+			}
+		}()
+	}
 
 	// Start embedded workers
 	var workers []*worker.Worker
@@ -580,6 +602,11 @@ func runServer(args []string) {
 		lo.Info("Stopping Messenger ownership lifecycle processor...")
 		metaLifecycleCancel()
 		lo.Info("Messenger ownership lifecycle processor stopped")
+	}
+	if metaInstagramLifecycleCancel != nil {
+		lo.Info("Stopping Instagram ownership lifecycle processor...")
+		metaInstagramLifecycleCancel()
+		lo.Info("Instagram ownership lifecycle processor stopped")
 	}
 
 	// Stop inbound continuation recovery.
@@ -678,6 +705,16 @@ func runWorker(args []string) {
 			lo.Fatal("PostgreSQL tenant RLS verification failed", "error", err)
 		}
 		lo.Info("PostgreSQL tenant RLS verified", "runtime_role", cfg.Database.RuntimeRole)
+	}
+	// Worker-only deployments must cross the same synchronous database barrier
+	// before constructing a worker or claiming any queued delivery/generation.
+	if err := handlers.ReconcileMetaInstagramQuarantineStartup(
+		context.Background(), db, cfg,
+	); err != nil {
+		lo.Fatal("Managed Instagram quarantine startup barrier failed", "error", err)
+	}
+	if cfg.MetaInstagram.Enabled && cfg.MetaInstagram.QuarantineOnly {
+		lo.Info("Managed Instagram quarantine startup barrier committed")
 	}
 
 	// Connect to Redis
@@ -824,6 +861,13 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		app.DeauthorizeThreads,
 	)
 	g.POST("/api/integrations/meta/messenger/deauthorize", app.DeauthorizeMetaMessenger)
+	g.GET("/api/integrations/meta/instagram/callback", app.CallbackMetaInstagram)
+	g.POST("/api/integrations/meta/instagram/deauthorize", app.DeauthorizeMetaInstagram)
+	g.POST("/api/integrations/meta/instagram/data-deletion", app.DeleteMetaInstagramUserData)
+	g.GET(
+		"/api/integrations/meta/instagram/data-deletion/status/{confirmation_code}",
+		app.MetaInstagramDataDeletionStatus,
+	)
 	g.POST(
 		"/api/integrations/threads/{target_organization_id}/data-deletion",
 		app.DeleteThreadsUserData,
@@ -877,6 +921,12 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 			return r
 		}
 		if path == "/api/integrations/meta/messenger/deauthorize" {
+			return r
+		}
+		if path == "/api/integrations/meta/instagram/callback" ||
+			path == "/api/integrations/meta/instagram/deauthorize" ||
+			path == "/api/integrations/meta/instagram/data-deletion" ||
+			strings.HasPrefix(path, "/api/integrations/meta/instagram/data-deletion/status/") {
 			return r
 		}
 		// Skip auth for custom action redirects (uses one-time token)
@@ -1078,6 +1128,8 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST("/api/integrations/meta/messenger/onboarding/callback", app.ExchangeMetaMessengerOnboarding)
 	g.POST("/api/integrations/meta/messenger/onboarding/exchange", app.ExchangeMetaMessengerOnboarding)
 	g.POST("/api/integrations/meta/messenger/onboarding/select", app.SelectMetaMessengerOnboarding)
+	g.POST("/api/integrations/meta/instagram/onboarding/start", app.StartMetaInstagramOnboarding)
+	g.GET("/api/integrations/meta/instagram/onboarding/status", app.GetMetaInstagramOnboardingStatus)
 
 	// Provider-neutral channel accounts and shared inbox.
 	g.GET("/api/channel-accounts", tenant((*handlers.App).ListChannelAccounts))
@@ -1093,6 +1145,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST("/api/channel-accounts/{id}/meta-messenger/reconcile", app.ReconcileMetaMessengerSubscription)
 	g.POST("/api/channel-accounts/{id}/meta-messenger/disconnect", app.DisconnectMetaMessenger)
 	g.POST("/api/channel-accounts/{id}/meta-messenger/approve", app.ApproveMetaMessengerActivation)
+	g.POST("/api/channel-accounts/{id}/meta-instagram/reconnect", app.ReconnectMetaInstagramOnboarding)
+	g.POST("/api/channel-accounts/{id}/meta-instagram/reconcile", app.ReconcileMetaInstagramSubscription)
+	g.POST("/api/channel-accounts/{id}/meta-instagram/disconnect", app.DisconnectMetaInstagram)
+	g.POST("/api/channel-accounts/{id}/meta-instagram/approve", app.ApproveMetaInstagramActivation)
 	g.GET("/api/conversations", tenant((*handlers.App).ListInboxConversations))
 	g.GET(
 		"/api/conversations/{id}/messages",

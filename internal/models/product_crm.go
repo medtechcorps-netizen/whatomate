@@ -12,6 +12,11 @@ type ScheduledJobStatus string
 const (
 	ScheduledJobStatusPending    ScheduledJobStatus = "pending"
 	ScheduledJobStatusProcessing ScheduledJobStatus = "processing"
+	// ScheduledJobStatusGenerating is the durable point at which a managed
+	// Instagram reply has crossed its exact authorization fence and may send
+	// customer text to Qwen. Lifecycle cancellation intentionally excludes this
+	// state; finalization rechecks the binding before persisting a reply.
+	ScheduledJobStatusGenerating ScheduledJobStatus = "generating"
 	ScheduledJobStatusCompleted  ScheduledJobStatus = "completed"
 	ScheduledJobStatusFailed     ScheduledJobStatus = "failed"
 	ScheduledJobStatusCancelled  ScheduledJobStatus = "cancelled"
