@@ -86,7 +86,82 @@ service_secret = "synthetic-meta-registry-service-secret-at-least-32-bytes"
 relay_edge_secret = "synthetic-meta-registry-edge-secret-at-least-32-bytes"
 `))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not production-enableable")
+	assert.Contains(t, err.Error(), "explicitly enabled")
+}
+
+func TestLoad_AllowsCompleteDefaultOffMessengerLifecycleOnlyWithReaderFence(t *testing.T) {
+	cfg, err := config.Load(writeConfig(t, `
+[app]
+encryption_key = "synthetic-encryption-key-at-least-32-bytes"
+
+[server]
+write_timeout = 120
+
+[meta_registry]
+enabled = true
+service_secret = "synthetic-meta-registry-service-secret-at-least-32-bytes"
+relay_edge_secret = "synthetic-meta-registry-edge-secret-at-least-32-bytes"
+queue_reader_version = 2
+
+[meta_messenger_onboarding]
+enabled = true
+app_id = "123456789012345"
+config_id = "987654321098765"
+app_secret = "synthetic-meta-app-secret-at-least-32-bytes"
+rereply_base_url = "https://app.example.test"
+relay_base_url = "https://relay.example.test"
+allowed_organization_ids = "11111111-1111-4111-8111-111111111111"
+`))
+	require.NoError(t, err)
+	assert.True(t, cfg.MetaRegistry.Enabled)
+	assert.True(t, cfg.MetaMessenger.Enabled)
+	assert.Equal(t, 2, cfg.MetaRegistry.QueueReaderVersion)
+}
+
+func TestLoad_MessengerPilotReleaseRequiresUnambiguousCanonicalOrganizationGate(t *testing.T) {
+	base := `
+[app]
+encryption_key = "synthetic-encryption-key-at-least-32-bytes"
+
+[server]
+write_timeout = 120
+
+[meta_registry]
+enabled = true
+service_secret = "synthetic-meta-registry-service-secret-at-least-32-bytes"
+relay_edge_secret = "synthetic-meta-registry-edge-secret-at-least-32-bytes"
+queue_reader_version = 2
+
+[meta_messenger_onboarding]
+enabled = true
+app_id = "123456789012345"
+config_id = "987654321098765"
+app_secret = "synthetic-meta-app-secret-at-least-32-bytes"
+rereply_base_url = "https://app.example.test"
+relay_base_url = "https://relay.example.test"
+`
+	_, err := config.Load(writeConfig(t, base))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exactly one")
+
+	_, err = config.Load(writeConfig(t, base+`
+allowed_organization_ids = "NOT-A-UUID"
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "canonical UUIDs")
+
+	_, err = config.Load(writeConfig(t, base+`
+allowed_organization_ids = "11111111-1111-4111-8111-111111111111"
+allow_all_organizations = true
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exactly one")
+
+	_, err = config.Load(writeConfig(t, base+`
+allow_all_organizations = true
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "production release")
 }
 
 func TestLoad_ProductionStaticConfigurationRemainsRegistryFree(t *testing.T) {
@@ -101,6 +176,33 @@ host = "db.example.test"
 	assert.Empty(t, cfg.MetaRegistry.ServiceSecret)
 	assert.Empty(t, cfg.MetaRegistry.RelayEdgeSecret)
 	assert.Equal(t, 300, cfg.MetaRegistry.ReplayWindowSeconds)
+}
+
+func TestLoad_MessengerLifecycleRejectsServerDeadlineBelowProviderBudget(t *testing.T) {
+	_, err := config.Load(writeConfig(t, `
+[app]
+encryption_key = "synthetic-encryption-key-at-least-32-bytes"
+
+[server]
+write_timeout = 119
+
+[meta_registry]
+enabled = true
+service_secret = "synthetic-meta-registry-service-secret-at-least-32-bytes"
+relay_edge_secret = "synthetic-meta-registry-edge-secret-at-least-32-bytes"
+queue_reader_version = 2
+
+[meta_messenger_onboarding]
+enabled = true
+app_id = "123456789012345"
+config_id = "987654321098765"
+app_secret = "synthetic-meta-app-secret-at-least-32-bytes"
+rereply_base_url = "https://app.example.test"
+relay_base_url = "https://relay.example.test"
+allowed_organization_ids = "11111111-1111-4111-8111-111111111111"
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "write_timeout")
 }
 
 func TestLoad_FileValuesOverrideDefaults(t *testing.T) {

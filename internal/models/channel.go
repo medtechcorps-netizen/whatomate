@@ -213,6 +213,26 @@ func (ChannelCredential) TableName() string {
 	return "channel_credentials"
 }
 
+// MetaDeauthorizationEvent is the non-secret durable journal for Meta's
+// signed deauthorization callback. It deliberately stores only the digest and
+// canonical provider identifiers, never the signed_request or any access
+// token. The callback is global, so this journal is not tenant-scoped; target
+// mutations remain inside exact tenant transactions.
+type MetaDeauthorizationEvent struct {
+	Digest            string     `gorm:"size:64;primaryKey" json:"-"`
+	PlatformAppID     string     `gorm:"size:64;not null;index" json:"-"`
+	AuthorizingUserID string     `gorm:"size:64;not null;index" json:"-"`
+	IssuedAt          time.Time  `gorm:"not null" json:"-"`
+	VerifiedAt        time.Time  `gorm:"not null" json:"-"`
+	State             string     `gorm:"size:24;not null;default:'verified';index" json:"-"`
+	LastAttemptAt     *time.Time `json:"-"`
+	CompletedAt       *time.Time `json:"-"`
+}
+
+func (MetaDeauthorizationEvent) TableName() string {
+	return "meta_deauthorization_events"
+}
+
 // ContactIdentity maps an internal CRM contact to one provider identity.
 type ContactIdentity struct {
 	BaseModel

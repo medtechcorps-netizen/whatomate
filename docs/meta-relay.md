@@ -7,18 +7,26 @@ boundary.
 
 ## Webhook applications and routes
 
-Configure two distinct Meta applications and do not reuse either an app secret
+Configure distinct Meta applications and do not reuse an app secret
 or a verify token:
 
 | Meta application | Callback route | Accepted accounts |
 | --- | --- | --- |
-| Messenger parent app | `GET`/`POST /v1/meta/messenger/webhook` | Messenger Pages and Instagram accounts using `facebook_login` |
+| Legacy Messenger parent app(s) | `GET`/`POST /v1/meta/messenger/webhook` | Existing static Messenger Pages and Instagram accounts using `facebook_login` |
+| Managed Messenger platform app | `GET`/`POST /v1/meta/messenger/managed-webhook` | Registry-managed Messenger Pages only |
 | Separate Instagram Login app | `GET`/`POST /v1/meta/instagram/webhook` | Instagram accounts using `instagram_login` only |
 
 The shared legacy route `/v1/meta/webhook` does not exist. Each POST route
 validates `X-Hub-Signature-256` only with that route's app secret. Each GET
 route validates only that route's verify token. A correctly signed payload is
 still rejected if its account is bound to the other application.
+
+Behind the production `/meta-relay` ingress prefix, configure Meta's managed
+Messenger callback as
+`https://app.rereply.app/meta-relay/v1/meta/messenger/managed-webhook`. Keep
+the legacy callback route unchanged. The managed route must use its own exact
+app ID, app secret, and verify token; none of these values may be inferred from
+the mixed legacy static mappings.
 
 Additional routes:
 
@@ -44,16 +52,23 @@ All deployments require:
 | `META_RELAY_REDIS_URL` | Redis URL. There is no in-memory durability fallback. |
 | `META_RELAY_MESSENGER_APP_SECRET` | App secret for the Messenger parent app webhook route. |
 | `META_RELAY_MESSENGER_VERIFY_TOKEN` | Verify token for the Messenger parent app callback. |
+| `META_RELAY_MANAGED_MESSENGER_APP_ID` | Exact platform-app ID for registry-managed Messenger bindings. Required only when the dynamic registry is enabled. |
+| `META_RELAY_MANAGED_MESSENGER_APP_SECRET` | Distinct app secret for the managed Messenger callback and `appsecret_proof`. Required only when the dynamic registry is enabled. |
+| `META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN` | Distinct verify token for the managed Messenger callback. Required only when the dynamic registry is enabled. |
 | `META_RELAY_INSTAGRAM_APP_SECRET` | App secret for the separate Instagram Login app webhook route. |
 | `META_RELAY_INSTAGRAM_VERIFY_TOKEN` | Verify token for the Instagram Login app callback. |
 | `META_RELAY_GRAPH_API_VERSION` | Explicit version such as `v25.0`; update deliberately when Meta support changes. |
 | `META_RELAY_ACCOUNTS_JSON` | Optional static fallback account mappings. It contains environment-variable names, never secret values. Existing mappings continue to take precedence during migration. |
-| `META_RELAY_REGISTRY_URL` | Reserved exact dynamic broker endpoint. Split A rejects it at production startup. |
-| `META_RELAY_REGISTRY_SECRET` | Reserved broker service-authentication secret (minimum 32 bytes). |
-| `META_RELAY_REGISTRY_EDGE_SECRET` | Reserved, separate outer credential checked before dynamic public-route lookup (minimum 32 bytes). |
+| `META_RELAY_REGISTRY_ENABLED` | Explicit dynamic-registry gate. Defaults to `false`. |
+| `META_RELAY_REGISTRY_URL` | Exact private dynamic broker endpoint. |
+| `META_RELAY_REGISTRY_SECRET` | Broker service-authentication secret (minimum 32 bytes). |
+| `META_RELAY_REGISTRY_EDGE_SECRET` | Separate outer credential checked before dynamic public-route lookup (minimum 32 bytes). |
+| `META_RELAY_DYNAMIC_QUEUE_READER_VERSION` | Must be `2` on every relay reader before dynamic producers are enabled. |
 
-The four webhook credential values must all be configured. The two app secrets
-must differ, and the two verify tokens must differ.
+The legacy Messenger and Instagram webhook credentials must always be
+configured. When dynamic registry support is enabled, all three managed
+Messenger values are also required and must differ from every legacy secret
+and verify token.
 
 Optional tuning:
 
@@ -71,24 +86,25 @@ Optional tuning:
 | `META_RELAY_REGISTRY_CACHE_TTL` | `10s` | Maximum ingress-only dynamic binding cache; cannot exceed one minute or the broker lease. |
 | `META_RELAY_REGISTRY_TIMEOUT` | `3s` | Dynamic broker request timeout; cannot exceed ten seconds. |
 
-This foundation release requires at least one static mapping. Supplying any
-dynamic registry variable fails startup by design. Static mappings are checked
-first in the reviewed protocol code, but dynamic enablement remains sealed
-until the lifecycle release described below.
+Static mappings remain checked first and are not modified by managed
+enablement. The dynamic registry stays default-off and fails startup unless its
+URL, both service credentials, exact managed app binding, and queue reader v2
+gate are complete and mutually consistent.
 
 ## Dynamic control plane
 
-> **Production gate:** this section documents the reviewed split-A protocol,
-> not an enablement procedure. Both ReReply config loading and relay config
-> loading reject dynamic credentials. There is no environment override or
-> production flag for bypassing that gate.
+> **Production gate:** keep the dynamic registry and Messenger lifecycle off
+> until the managed app identity has been cryptographically verified, every
+> relay replica is a queue-v2 reader, and the ReReply deployment has its exact
+> pilot organization allowlist configured. An empty allowlist fails closed.
 
-Dynamic Messenger and Instagram accounts use ReReply's platform-owned Meta
-applications. A clinic authorizes its Page or professional Instagram account;
-it does not supply a clinic-specific app secret. This is required because each
-webhook request is signed by the application that owns the subscription, while
-the relay intentionally exposes only one Messenger parent-app route and one
-Instagram Login app route.
+Dynamic Messenger accounts use ReReply's platform-owned managed Messenger
+application. Instagram self-service remains disabled until its equivalent
+lifecycle is implemented. A clinic authorizes its Page; it does not supply a
+clinic-specific app secret. This is required because each webhook request is
+signed by the application that owns the subscription, while the relay exposes
+one isolated managed Messenger route in addition to the untouched legacy
+routes.
 
 The ReReply API remains the only process with the PostgreSQL credential and
 application encryption key. The relay never receives either. Instead it calls
@@ -136,16 +152,20 @@ service credential before account resolution. The per-account body HMAC is
 still verified after resolution. This prevents unauthenticated requests from
 amplifying into broker, database, and decryption work.
 
-## Split-A rollout and rollback
+## Reader-first rollout and rollback
 
 The current four production mappings stay in `META_RELAY_ACCOUNTS_JSON`; no
 database import or environment change is part of this patch. Queue schema 0/1
 static jobs remain readable, new static jobs carry schema 2, and an unknown
 future schema is parked instead of destroyed. Before the later lifecycle
 release enables a dynamic producer, every relay replica must first run a
-dynamic-aware reader and the old-worker queue must be drained. Rolling back to
-an old worker while registry-fenced jobs exist is prohibited; disable the
-producer, drain or park those jobs with the new reader, and only then roll back.
+dynamic-aware schema-v2 reader and the old-worker queue must be drained. Enable
+the managed lifecycle only after the exact intended web and relay SHA is
+running everywhere. Once the first managed binding or managed queue job exists,
+rolling back to an old binary is prohibited because it cannot honor lifecycle
+fences and can reopen legacy manual Messenger creation. Before any later
+rollback, disable intake, reconcile managed subscription operations, and drain
+or safely park all managed jobs with the new reader.
 
 ## Account and token binding
 
@@ -212,6 +232,13 @@ mode-bound Graph host using the token only in the `Authorization` header:
 Expired tokens, provider errors, malformed responses, wrong accounts, and
 wrong token families all fail health with a generic response. Tokens and
 provider response bodies are never logged or returned.
+
+Registry-managed Messenger Graph health, subscription checks, and outbound
+sends include `appsecret_proof` made with the distinct managed app secret and
+require the binding's exact managed platform-app ID. The static compatibility
+path intentionally does not add that proof: legacy Page tokens may have been
+issued by different clinic-era apps and must not be silently rebound or broken
+by this rollout.
 
 ## Delivery safety
 

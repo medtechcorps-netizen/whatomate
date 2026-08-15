@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useMediaQuery } from '@vueuse/core'
+import { onBeforeRouteLeave } from 'vue-router'
 import {
   AtSign,
   Bot,
@@ -37,12 +38,20 @@ import {
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
+import { useOrganizationsStore } from '@/stores/organizations'
 import { getErrorMessage, unwrapItemResponse, unwrapListResponse } from '@/lib/api-utils'
 import {
   threadsPublicEngagementAccountReady,
   threadsPublicEngagementTarget,
 } from '@/lib/threadsPublicEngagement'
 import { wsService } from '@/services/websocket'
+import {
+  metaMessengerOnboarding,
+  MetaMessengerAuthorizationCancelledError,
+  MetaMessengerOrganizationChangedError,
+  type MetaMessengerPage,
+  type MetaMessengerSelection,
+} from '@/services/metaMessengerOnboarding'
 import {
   channelsService,
   type ChannelAccount,
@@ -76,6 +85,7 @@ interface CreatedConnection {
 
 const toast = useAppToast()
 const authStore = useAuthStore()
+const organizationsStore = useOrganizationsStore()
 const loading = ref(true)
 const loadingMessages = ref(false)
 const loadingMore = ref(false)
@@ -93,6 +103,13 @@ const channelFilter = ref<ChannelType | 'all'>('all')
 const search = ref('')
 const composer = ref('')
 const createdConnection = ref<CreatedConnection | null>(null)
+const metaMessengerSelection = ref<MetaMessengerSelection | null>(null)
+const selectedMetaMessengerPageKey = ref('')
+const metaMessengerBusy = ref(false)
+const metaMessengerReconnectName = ref('')
+const metaMessengerOnboardingReady = ref(false)
+const metaMessengerSelectionOrganizationId = ref('')
+const metaMessengerAuthorizationController = ref<AbortController | null>(null)
 const settingsAccount = ref<ChannelAccount | null>(null)
 const conversationPage = ref(1)
 const conversationTotal = ref(0)
@@ -105,6 +122,13 @@ const newAccount = reactive({
 })
 const canManageAccounts = computed(() => authStore.hasPermission('channel_accounts', 'write'))
 const canDeleteAccounts = computed(() => authStore.hasPermission('channel_accounts', 'delete'))
+const canManageIntegrations = computed(() => authStore.hasPermission('settings.integrations', 'write'))
+const canManageMetaMessenger = computed(
+  () => canManageAccounts.value && canManageIntegrations.value,
+)
+const canReconcileMetaMessenger = computed(
+  () => canManageMetaMessenger.value && canDeleteAccounts.value,
+)
 const canManageConversations = computed(() => authStore.hasPermission('conversations', 'write'))
 const threadsPublicEngagementEntitlement = 'threads.public_engagement.enabled'
 const absoluteWebhookURL = computed(() => {
@@ -123,6 +147,18 @@ let syncDebounceTimer: number | null = null
 let filterDebounceTimer: number | null = null
 let refreshInFlight = false
 let conversationViewSequence = 0
+let metaMessengerContextVersion = 0
+let metaMessengerStatusSequence = 0
+const metaMessengerSwitchLockOwner = 'meta-messenger-onboarding'
+const metaMessengerSwitchLockMessage =
+  'Finish or cancel the Messenger connection before switching workspaces.'
+
+const activeOrganizationId = computed(
+  () => organizationsStore.selectedOrgId || authStore.organizationId || null,
+)
+const metaMessengerWorkspaceLocked = computed(
+  () => metaMessengerBusy.value || metaMessengerSelection.value !== null,
+)
 
 function isCurrentConversationView(sequence: number, conversationId: string) {
   return (
@@ -224,6 +260,36 @@ function accountReadyForOutbound(account: ChannelAccount) {
   return account.config?.outbound_enabled === true
 }
 
+function isManagedMetaMessenger(account: ChannelAccount) {
+  return (
+    account.channel === 'messenger' &&
+    account.provider === 'relay' &&
+    (account.config?.meta_registry_managed === true ||
+      account.config?.meta_management_mode === 'platform_oauth')
+  )
+}
+
+function metaMessengerPageKey(page: MetaMessengerPage) {
+  return `${page.business_id ?? ''}:${page.page_id}`
+}
+
+const selectedMetaMessengerPage = computed(() =>
+  metaMessengerSelection.value?.pages.find(
+    page => metaMessengerPageKey(page) === selectedMetaMessengerPageKey.value,
+  ),
+)
+
+function accountConnectionLabel(account: ChannelAccount) {
+  if (isManagedMetaMessenger(account) && account.status === 'pending') {
+    return account.last_health_check_at && !account.last_error
+      ? 'Awaiting admin approval'
+      : 'Test connection to continue'
+  }
+  if (accountReadyForOutbound(account)) return 'Outbound ready'
+  if (account.status === 'active') return 'Awaiting outbound approval'
+  return account.status
+}
+
 function channelMeta(channel: ChannelType) {
   return supportedChannels.find((item) => item.key === channel) ?? supportedChannels[0]
 }
@@ -266,6 +332,10 @@ async function load(silent = false, append = false) {
       channelsService.conversations(conversationParams),
     ])
     accounts.value = unwrapListResponse<ChannelAccount>(accountResponse, 'accounts')
+    if (settingsAccount.value) {
+      settingsAccount.value =
+        accounts.value.find(account => account.id === settingsAccount.value?.id) ?? null
+    }
     const incoming = unwrapListResponse<InboxConversation>(conversationResponse, 'conversations')
     conversationTotal.value = totalFromResponse(conversationResponse)
     if (append) {
@@ -492,6 +562,10 @@ async function toggleConversationAI() {
 }
 
 async function connectAccount() {
+  if (newAccount.channel === 'messenger') {
+    toast.warning('Messenger must be connected through managed Facebook authorization')
+    return
+  }
   if (
     !newAccount.name.trim() ||
     !newAccount.external_account_id.trim() ||
@@ -525,6 +599,184 @@ async function connectAccount() {
     await load()
   } catch (error) {
     toast.error('Connection was not created', getErrorMessage(error))
+  }
+}
+
+function isMetaMessengerContextCurrent(organizationId: string, version: number) {
+  return (
+    organizationId.length > 0 &&
+    activeOrganizationId.value === organizationId &&
+    metaMessengerContextVersion === version
+  )
+}
+
+function metaMessengerNeedsSubscriptionReconciliation(account: ChannelAccount) {
+  return (
+    isManagedMetaMessenger(account) &&
+    account.meta_subscription_reconciliation_required
+  )
+}
+
+function setMetaMessengerSelection(
+  selection: MetaMessengerSelection,
+  organizationId: string,
+  reconnectName = '',
+) {
+  if (selection.workspace.organization_id !== organizationId) {
+    throw new MetaMessengerOrganizationChangedError()
+  }
+  metaMessengerSelection.value = selection
+  metaMessengerSelectionOrganizationId.value = organizationId
+  metaMessengerReconnectName.value = reconnectName
+  const firstSelectable = selection.pages.find(page => page.selectable && page.business_id)
+  selectedMetaMessengerPageKey.value = firstSelectable
+    ? metaMessengerPageKey(firstSelectable)
+    : ''
+}
+
+async function connectMetaMessenger() {
+  if (
+    !canManageMetaMessenger.value ||
+    !metaMessengerOnboardingReady.value ||
+    metaMessengerBusy.value
+  ) return
+  const organizationId = activeOrganizationId.value
+  if (!organizationId) {
+    toast.error('Select a workspace before connecting Messenger')
+    return
+  }
+  const contextVersion = metaMessengerContextVersion
+  const controller = new AbortController()
+  metaMessengerAuthorizationController.value?.abort()
+  metaMessengerAuthorizationController.value = controller
+  metaMessengerBusy.value = true
+  try {
+    const selection = await metaMessengerOnboarding.begin(
+      organizationId,
+      () => isMetaMessengerContextCurrent(organizationId, contextVersion),
+      controller.signal,
+    )
+    if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) return
+    setMetaMessengerSelection(selection, organizationId)
+    showConnect.value = false
+  } catch (error) {
+    if (
+      isMetaMessengerContextCurrent(organizationId, contextVersion) &&
+      !(error instanceof MetaMessengerAuthorizationCancelledError) &&
+      !(error instanceof MetaMessengerOrganizationChangedError)
+    ) {
+      toast.error('Messenger authorization did not finish', getErrorMessage(error))
+    }
+  } finally {
+    if (metaMessengerAuthorizationController.value === controller) {
+      metaMessengerAuthorizationController.value = null
+    }
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      metaMessengerBusy.value = false
+    }
+  }
+}
+
+async function reconnectMetaMessenger(account: ChannelAccount) {
+  if (
+    !canManageMetaMessenger.value ||
+    !metaMessengerOnboardingReady.value ||
+    !isManagedMetaMessenger(account) ||
+    metaMessengerBusy.value
+  ) return
+  const organizationId = activeOrganizationId.value
+  if (!organizationId) return
+  const contextVersion = metaMessengerContextVersion
+  const controller = new AbortController()
+  metaMessengerAuthorizationController.value?.abort()
+  metaMessengerAuthorizationController.value = controller
+  metaMessengerBusy.value = true
+  try {
+    const selection = await metaMessengerOnboarding.reconnect(
+      account.id,
+      organizationId,
+      () => isMetaMessengerContextCurrent(organizationId, contextVersion),
+      controller.signal,
+    )
+    if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) return
+    setMetaMessengerSelection(selection, organizationId, account.name)
+    settingsAccount.value = null
+  } catch (error) {
+    if (
+      isMetaMessengerContextCurrent(organizationId, contextVersion) &&
+      !(error instanceof MetaMessengerAuthorizationCancelledError) &&
+      !(error instanceof MetaMessengerOrganizationChangedError)
+    ) {
+      toast.error('Messenger reconnect did not finish', getErrorMessage(error))
+    }
+  } finally {
+    if (metaMessengerAuthorizationController.value === controller) {
+      metaMessengerAuthorizationController.value = null
+    }
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      metaMessengerBusy.value = false
+    }
+  }
+}
+
+function cancelMetaMessengerAuthorization() {
+  if (!metaMessengerAuthorizationController.value) return
+  metaMessengerAuthorizationController.value.abort()
+  metaMessengerAuthorizationController.value = null
+  metaMessengerContextVersion += 1
+  metaMessengerBusy.value = false
+  closeMetaMessengerSelection()
+  toast.error('Messenger authorization was cancelled')
+}
+
+function closeMetaMessengerSelection() {
+  metaMessengerSelection.value = null
+  metaMessengerSelectionOrganizationId.value = ''
+  selectedMetaMessengerPageKey.value = ''
+  metaMessengerReconnectName.value = ''
+}
+
+async function confirmMetaMessengerPage() {
+  const selection = metaMessengerSelection.value
+  const page = selectedMetaMessengerPage.value
+  if (
+    !canManageMetaMessenger.value ||
+    !metaMessengerOnboardingReady.value ||
+    !selection ||
+    !page?.business_id ||
+    !page.selectable ||
+    metaMessengerBusy.value
+  ) return
+  const organizationId = metaMessengerSelectionOrganizationId.value
+  const contextVersion = metaMessengerContextVersion
+  if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+    closeMetaMessengerSelection()
+    return
+  }
+  metaMessengerBusy.value = true
+  try {
+    await metaMessengerOnboarding.select(
+      organizationId,
+      selection.session_id,
+      page.business_id,
+      page.page_id,
+    )
+    if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) return
+    const reconnected = Boolean(metaMessengerReconnectName.value)
+    closeMetaMessengerSelection()
+    toast.success(
+      reconnected ? 'Messenger credentials reconnected' : 'Messenger Page connected safely',
+      'Run Test, review the result, then approve activation. Outbound and AI remain off until then.',
+    )
+    await load()
+  } catch (error) {
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      toast.error('Messenger Page was not connected', getErrorMessage(error))
+    }
+  } finally {
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      metaMessengerBusy.value = false
+    }
   }
 }
 
@@ -574,6 +826,70 @@ async function approveOutbound(account: ChannelAccount) {
   }
 }
 
+async function approveMetaMessenger(account: ChannelAccount) {
+  if (
+    !canManageMetaMessenger.value ||
+    !metaMessengerOnboardingReady.value ||
+    !isManagedMetaMessenger(account) ||
+    metaMessengerBusy.value
+  ) return
+  const organizationId = activeOrganizationId.value
+  if (!organizationId) return
+  const contextVersion = metaMessengerContextVersion
+  metaMessengerBusy.value = true
+  try {
+    await metaMessengerOnboarding.approve(account.id, organizationId)
+    if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) return
+    toast.success(
+      `${account.name} activated`,
+      'Agent replies are enabled. Automatic AI replies remain off until you opt in.',
+    )
+    await load()
+  } catch (error) {
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      toast.error('Messenger activation was not approved', getErrorMessage(error))
+    }
+  } finally {
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      metaMessengerBusy.value = false
+    }
+  }
+}
+
+async function reconcileMetaMessenger(account: ChannelAccount) {
+  if (
+    !canReconcileMetaMessenger.value ||
+    !metaMessengerOnboardingReady.value ||
+    !metaMessengerNeedsSubscriptionReconciliation(account) ||
+    metaMessengerBusy.value
+  ) return
+  const organizationId = activeOrganizationId.value
+  if (!organizationId) return
+  const contextVersion = metaMessengerContextVersion
+  if (!window.confirm(
+    `Reconcile ${account.name}? ReReply will repeat only the already-recorded Meta subscription operation and verify its exact result.`,
+  )) return
+  metaMessengerBusy.value = true
+  try {
+    await metaMessengerOnboarding.reconcile(account.id, organizationId)
+    if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) return
+    settingsAccount.value = null
+    toast.success(
+      'Messenger subscription reconciled',
+      'The recorded operation was verified. Run Test and approve activation if the account is pending.',
+    )
+    await load()
+  } catch (error) {
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      toast.error('Messenger subscription was not reconciled', getErrorMessage(error))
+    }
+  } finally {
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      metaMessengerBusy.value = false
+    }
+  }
+}
+
 function openAccountSettings(account: ChannelAccount) {
   settingsAccount.value = account
   accountSettingsDraft.name = account.name
@@ -586,7 +902,12 @@ function openAccountSettings(account: ChannelAccount) {
 async function saveAccountSettings() {
   const account = settingsAccount.value
   if (!account || !canManageAccounts.value || !accountSettingsDraft.name.trim()) return
-  if (account.provider === 'relay' && !accountSettingsDraft.relay_url.trim()) {
+  const managedMessenger = isManagedMetaMessenger(account)
+  if (
+    account.provider === 'relay' &&
+    !managedMessenger &&
+    !accountSettingsDraft.relay_url.trim()
+  ) {
     toast.warning('A signed-relay URL is required')
     return
   }
@@ -594,13 +915,13 @@ async function saveAccountSettings() {
     const update: Record<string, unknown> = {
       name: accountSettingsDraft.name.trim(),
     }
-    if (account.provider === 'relay') {
+    if (account.provider === 'relay' && !managedMessenger) {
       update.config = {
         ...account.config,
         relay_url: accountSettingsDraft.relay_url.trim(),
       }
     }
-    if (accountSettingsDraft.outbound_secret.trim()) {
+    if (!managedMessenger && accountSettingsDraft.outbound_secret.trim()) {
       update.outbound_secret = accountSettingsDraft.outbound_secret
     }
     if (['instagram', 'messenger'].includes(account.channel)) {
@@ -631,13 +952,35 @@ async function disableOutbound() {
 
 async function disconnectAccount() {
   const account = settingsAccount.value
-  if (!account || !canDeleteAccounts.value) return
+  if (!account || !canDeleteAccounts.value || metaMessengerBusy.value) return
+  if (isManagedMetaMessenger(account) && !canManageIntegrations.value) return
+  const organizationId = activeOrganizationId.value
+  const contextVersion = metaMessengerContextVersion
+  if (!organizationId) return
   const confirmed = window.confirm(
-    `Disconnect ${account.name}? New inbound and outbound traffic for this relay will stop. Existing CRM history remains.`,
+    isManagedMetaMessenger(account)
+      ? `Disconnect ${account.name}? ReReply will unsubscribe this exact Facebook Page and revoke both credential versions. Existing CRM history remains.`
+      : `Disconnect ${account.name}? New inbound and outbound traffic for this relay will stop. Existing CRM history remains.`,
   )
   if (!confirmed) return
+  if (isManagedMetaMessenger(account)) metaMessengerBusy.value = true
   try {
-    await channelsService.disconnectAccount(account.id)
+    if (isManagedMetaMessenger(account)) {
+      if (!metaMessengerOnboardingReady.value) {
+        throw new Error('Managed Messenger lifecycle is unavailable')
+      }
+      if (!account.external_account_id) {
+        throw new Error('The managed Messenger Page ID is missing')
+      }
+      await metaMessengerOnboarding.disconnect(
+        account.id,
+        account.external_account_id,
+        organizationId,
+      )
+    } else {
+      await channelsService.disconnectAccount(account.id)
+    }
+    if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) return
     settingsAccount.value = null
     if (selectedConversation.value?.channel_account_id === account.id) {
       closeMobileConversation()
@@ -645,7 +988,16 @@ async function disconnectAccount() {
     toast.success('Channel disconnected')
     await load()
   } catch (error) {
-    toast.error('Channel was not disconnected', getErrorMessage(error))
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      toast.error('Channel was not disconnected', getErrorMessage(error))
+    }
+  } finally {
+    if (
+      isManagedMetaMessenger(account) &&
+      isMetaMessengerContextCurrent(organizationId, contextVersion)
+    ) {
+      metaMessengerBusy.value = false
+    }
   }
 }
 
@@ -659,12 +1011,67 @@ function formatTime(value?: string) {
   return new Intl.DateTimeFormat('en-MY', { day: 'numeric', month: 'short' }).format(date)
 }
 
+async function loadMetaMessengerOnboardingStatus() {
+  const organizationId = activeOrganizationId.value
+  const requestSequence = ++metaMessengerStatusSequence
+  metaMessengerOnboardingReady.value = false
+  if (!organizationId) return
+  try {
+    const enabled = await metaMessengerOnboarding.status(organizationId)
+    if (
+      requestSequence === metaMessengerStatusSequence &&
+      activeOrganizationId.value === organizationId
+    ) {
+      metaMessengerOnboardingReady.value = enabled
+    }
+  } catch {
+    if (
+      requestSequence === metaMessengerStatusSequence &&
+      activeOrganizationId.value === organizationId
+    ) {
+      metaMessengerOnboardingReady.value = false
+    }
+  }
+}
+
 onMounted(() => {
+  window.addEventListener('beforeunload', guardMetaMessengerNavigation)
   void load()
+  void loadMetaMessengerOnboardingStatus()
   stopChannelSync = wsService.onChannelSync(scheduleChannelRefresh)
   pollTimer = window.setInterval(() => {
     if (document.visibilityState === 'visible') void load(true)
   }, 30000)
+})
+
+watch(metaMessengerWorkspaceLocked, locked => {
+  if (locked) {
+    organizationsStore.blockOrganizationSwitch(
+      metaMessengerSwitchLockOwner,
+      metaMessengerSwitchLockMessage,
+    )
+  } else {
+    organizationsStore.unblockOrganizationSwitch(metaMessengerSwitchLockOwner)
+  }
+})
+
+watch(activeOrganizationId, (organizationId, previousOrganizationId) => {
+  metaMessengerAuthorizationController.value?.abort()
+  metaMessengerAuthorizationController.value = null
+  metaMessengerContextVersion += 1
+  metaMessengerStatusSequence += 1
+  const detached = Boolean(
+    previousOrganizationId &&
+    previousOrganizationId !== organizationId &&
+    (metaMessengerBusy.value || metaMessengerSelection.value),
+  )
+  metaMessengerBusy.value = false
+  metaMessengerOnboardingReady.value = false
+  closeMetaMessengerSelection()
+  if (detached) {
+    toast.error('Messenger onboarding was detached because the active workspace changed')
+  }
+  void loadMetaMessengerOnboardingStatus()
 })
 
 watch([search, channelFilter], () => {
@@ -687,12 +1094,32 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  metaMessengerAuthorizationController.value?.abort()
+  metaMessengerAuthorizationController.value = null
   conversationViewSequence += 1
+  metaMessengerContextVersion += 1
+  metaMessengerStatusSequence += 1
+  metaMessengerBusy.value = false
+  closeMetaMessengerSelection()
+  window.removeEventListener('beforeunload', guardMetaMessengerNavigation)
+  organizationsStore.unblockOrganizationSwitch(metaMessengerSwitchLockOwner)
   stopChannelSync?.()
   if (pollTimer !== null) window.clearInterval(pollTimer)
   if (syncDebounceTimer !== null) window.clearTimeout(syncDebounceTimer)
   if (filterDebounceTimer !== null) window.clearTimeout(filterDebounceTimer)
 })
+
+onBeforeRouteLeave(() => {
+  if (!metaMessengerWorkspaceLocked.value) return true
+  toast.error(metaMessengerSwitchLockMessage)
+  return false
+})
+
+function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
+  if (!metaMessengerWorkspaceLocked.value) return
+  event.preventDefault()
+  event.returnValue = ''
+}
 </script>
 
 <template>
@@ -742,16 +1169,66 @@ onBeforeUnmount(() => {
           {{ channel.label }}
         </option>
       </select>
-      <Input v-model="newAccount.name" placeholder="Connection name" />
-      <Input v-model="newAccount.external_account_id" placeholder="External account ID" />
-      <Input v-model="newAccount.relay_url" type="url" placeholder="HTTPS signed-relay URL" />
-      <Button
-        data-testid="channel-connect-submit"
-        class="bg-sky-400 text-black hover:bg-sky-300"
-        @click="connectAccount"
-      >
-        Create
-      </Button>
+      <template v-if="newAccount.channel === 'messenger'">
+        <template v-if="metaMessengerOnboardingReady && canManageMetaMessenger">
+          <div class="md:col-span-1 xl:col-span-3">
+            <p class="text-sm font-medium text-white light:text-slate-950">Connect a Facebook Page</p>
+            <p class="mt-1 text-xs leading-5 text-white/45 light:text-slate-600">
+              Sign in with Facebook, choose an owned Page, then test and approve it before any message can be sent.
+            </p>
+          </div>
+          <div class="flex gap-2">
+            <Button
+              data-testid="messenger-connect-facebook"
+              class="bg-[#1877f2] text-white hover:bg-[#166fe5]"
+              :disabled="metaMessengerBusy"
+              @click="connectMetaMessenger"
+            >
+              <Loader2 v-if="metaMessengerBusy" class="mr-2 h-4 w-4 animate-spin" />
+              <Facebook v-else class="mr-2 h-4 w-4" />
+              Continue with Facebook
+            </Button>
+            <Button
+              v-if="metaMessengerAuthorizationController"
+              type="button"
+              variant="outline"
+              data-testid="messenger-cancel-facebook"
+              @click="cancelMetaMessengerAuthorization"
+            >
+              Cancel
+            </Button>
+          </div>
+        </template>
+        <div
+          v-else
+          data-testid="messenger-onboarding-unavailable"
+          class="md:col-span-1 xl:col-span-4"
+        >
+          <p class="text-sm font-medium text-white light:text-slate-950">
+            Messenger connection is not available for this workspace
+          </p>
+          <p class="mt-1 text-xs leading-5 text-white/45 light:text-slate-600">
+            {{
+              metaMessengerOnboardingReady
+                ? 'You need both channel and integration administrator permission to connect Facebook.'
+                : 'An administrator must enable managed Facebook authorization for this workspace.'
+            }}
+            Manual Page IDs and relay URLs cannot be used.
+          </p>
+        </div>
+      </template>
+      <template v-else>
+        <Input v-model="newAccount.name" placeholder="Connection name" />
+        <Input v-model="newAccount.external_account_id" placeholder="External account ID" />
+        <Input v-model="newAccount.relay_url" type="url" placeholder="HTTPS signed-relay URL" />
+        <Button
+          data-testid="channel-connect-submit"
+          class="bg-sky-400 text-black hover:bg-sky-300"
+          @click="connectAccount"
+        >
+          Create
+        </Button>
+      </template>
     </div>
 
     <div
@@ -833,13 +1310,7 @@ onBeforeUnmount(() => {
                 class="mt-0.5 block text-[10px]"
                 :class="accountReadyForOutbound(account) ? 'text-emerald-300 light:text-emerald-700' : 'text-amber-300 light:text-amber-700'"
               >
-                {{
-                  accountReadyForOutbound(account)
-                    ? 'Outbound ready'
-                    : account.status === 'active'
-                      ? 'Awaiting outbound approval'
-                      : account.status
-                }}
+                {{ accountConnectionLabel(account) }}
                 <span v-if="account.outbox_pending"> · {{ account.outbox_pending }} queued</span>
                 <span v-if="account.outbox_failed" class="text-red-300 light:text-red-700"> · {{ account.outbox_failed }} failed</span>
               </span>
@@ -849,6 +1320,7 @@ onBeforeUnmount(() => {
             v-if="
               canManageAccounts &&
               account.provider === 'relay' &&
+              !isManagedMetaMessenger(account) &&
               account.status === 'active' &&
               account.config?.outbound_enabled !== true
             "
@@ -859,7 +1331,25 @@ onBeforeUnmount(() => {
             Approve outbound
           </Button>
           <Button
-            v-if="canManageAccounts"
+            v-if="
+              canManageAccounts &&
+              canManageIntegrations &&
+              metaMessengerOnboardingReady &&
+              isManagedMetaMessenger(account) &&
+              account.status === 'pending' &&
+              Boolean(account.last_health_check_at) &&
+              !account.last_error
+            "
+            data-testid="messenger-approve-activation"
+            size="sm"
+            class="h-8 bg-emerald-300 text-black hover:bg-emerald-200"
+            :disabled="metaMessengerBusy"
+            @click="approveMetaMessenger(account)"
+          >
+            Approve activation
+          </Button>
+          <Button
+            v-if="canManageAccounts && (!isManagedMetaMessenger(account) || metaMessengerOnboardingReady)"
             variant="outline"
             size="sm"
             class="h-8"
@@ -926,13 +1416,7 @@ onBeforeUnmount(() => {
                 class="mt-1 text-[9px]"
                 :class="accountReadyForOutbound(account) ? 'text-emerald-300 light:text-emerald-700' : 'text-amber-300 light:text-amber-700'"
               >
-                {{
-                  accountReadyForOutbound(account)
-                    ? 'Outbound ready'
-                    : account.status === 'active'
-                      ? 'Awaiting outbound approval'
-                      : account.status
-                }}
+                {{ accountConnectionLabel(account) }}
                 <span v-if="account.outbox_pending"> · {{ account.outbox_pending }} queued</span>
                 <span v-if="account.outbox_failed" class="text-red-300 light:text-red-700"> · {{ account.outbox_failed }} failed</span>
               </p>
@@ -944,6 +1428,7 @@ onBeforeUnmount(() => {
               v-if="
                 canManageAccounts &&
                 account.provider === 'relay' &&
+                !isManagedMetaMessenger(account) &&
                 account.status === 'active' &&
                 account.config?.outbound_enabled !== true
               "
@@ -954,7 +1439,25 @@ onBeforeUnmount(() => {
               Approve
             </button>
             <button
-              v-if="canManageAccounts"
+              v-if="
+                canManageAccounts &&
+                canManageIntegrations &&
+                metaMessengerOnboardingReady &&
+                isManagedMetaMessenger(account) &&
+                account.status === 'pending' &&
+                Boolean(account.last_health_check_at) &&
+                !account.last_error
+              "
+              type="button"
+              data-testid="messenger-approve-activation-rail"
+              class="rounded-lg bg-emerald-300/10 px-2 py-1 text-[9px] font-semibold text-emerald-200 transition hover:bg-emerald-300/15"
+              :disabled="metaMessengerBusy"
+              @click.stop="approveMetaMessenger(account)"
+            >
+              Activate
+            </button>
+            <button
+              v-if="canManageAccounts && (!isManagedMetaMessenger(account) || metaMessengerOnboardingReady)"
               type="button"
               class="rounded-lg p-1.5 text-white/25 transition hover:bg-white/[0.05] hover:text-sky-300 light:text-slate-500 light:hover:text-sky-700"
               :aria-label="`Test ${account.name}`"
@@ -1004,7 +1507,9 @@ onBeforeUnmount(() => {
               {{
                 channel.key === 'threads'
                   ? 'OAuth managed in Settings → Integrations'
-                  : channel.connectable
+                  : channel.key === 'messenger' && metaMessengerOnboardingReady
+                    ? 'Facebook Login for Business'
+                    : channel.connectable
                     ? 'Signed relay'
                     : channel.gated
                       ? 'Approval gated'
@@ -1338,6 +1843,89 @@ onBeforeUnmount(() => {
     </Sheet>
 
     <div
+      v-if="metaMessengerSelection"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="messenger-page-title"
+      @click.self="closeMetaMessengerSelection"
+    >
+      <div class="w-full max-w-lg rounded-2xl border border-[#1877f2]/25 bg-[#111416] p-5 shadow-2xl light:border-blue-200 light:bg-white">
+        <div class="flex items-start justify-between gap-4">
+          <div>
+            <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-[#65a2ff]">
+              Facebook Login for Business
+            </p>
+            <h2 id="messenger-page-title" class="mt-1 text-lg font-semibold text-white light:text-gray-900">
+              {{
+                metaMessengerReconnectName
+                  ? `Reconnect ${metaMessengerReconnectName}`
+                  : 'Choose one Facebook Page'
+              }}
+            </h2>
+            <p class="mt-1 text-xs leading-5 text-white/45 light:text-gray-600">
+              Only Pages freshly verified as owned by your Business Portfolio and assigned for messaging can be connected.
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            :disabled="metaMessengerBusy"
+            @click="closeMetaMessengerSelection"
+          >
+            Close
+          </Button>
+        </div>
+
+        <label class="mt-5 block">
+          <span class="text-xs font-medium text-white/65 light:text-gray-700">Owned Page</span>
+          <select
+            v-model="selectedMetaMessengerPageKey"
+            data-testid="messenger-page-select"
+            class="mt-1.5 h-11 w-full rounded-md border border-white/10 bg-[#0d0f10] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
+          >
+            <option value="" disabled>Select a Page</option>
+            <option
+              v-for="page in metaMessengerSelection.pages"
+              :key="metaMessengerPageKey(page)"
+              :value="metaMessengerPageKey(page)"
+              :disabled="!page.selectable || !page.business_id"
+            >
+              {{ page.page_name }} · {{ page.business_name || page.business_id || 'No Business Portfolio' }}{{
+                page.selectable ? '' : ` · ${page.disabled_reason || 'Not eligible'}`
+              }}
+            </option>
+          </select>
+        </label>
+
+        <div class="mt-4 rounded-xl border border-amber-300/15 bg-amber-300/[0.04] p-3 text-[11px] leading-5 text-amber-50/70 light:border-amber-200 light:bg-amber-50 light:text-amber-900">
+          The account stays pending with outbound and AI replies off until Test succeeds and an administrator explicitly approves activation.
+        </div>
+        <div class="mt-5 flex justify-end gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            :disabled="metaMessengerBusy"
+            @click="closeMetaMessengerSelection"
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            data-testid="messenger-page-confirm"
+            class="bg-[#1877f2] text-white hover:bg-[#166fe5]"
+            :disabled="!selectedMetaMessengerPage || metaMessengerBusy"
+            @click="confirmMetaMessengerPage"
+          >
+            <Loader2 v-if="metaMessengerBusy" class="mr-2 h-4 w-4 animate-spin" />
+            Connect this Page
+          </Button>
+        </div>
+      </div>
+    </div>
+
+    <div
       v-if="settingsAccount"
       class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
       role="dialog"
@@ -1356,18 +1944,32 @@ onBeforeUnmount(() => {
               {{ settingsAccount.name }}
             </h2>
             <p class="mt-1 text-xs text-white/40 light:text-gray-500">
-              Repair the relay, rotate its outbound signing credential, or stop delivery.
+              {{
+                isManagedMetaMessenger(settingsAccount)
+                  ? `Facebook-managed Page ${settingsAccount.external_account_id ?? ''}. Reconnect, test, approve, or disconnect it here.`
+                  : 'Repair the relay, rotate its outbound signing credential, or stop delivery.'
+              }}
             </p>
           </div>
           <Button type="button" variant="outline" size="sm" @click="settingsAccount = null">Close</Button>
         </div>
 
-        <div v-if="canManageAccounts" class="mt-5 space-y-4">
+        <div
+          v-if="
+            canManageAccounts &&
+            (!isManagedMetaMessenger(settingsAccount) ||
+              (metaMessengerOnboardingReady && canManageIntegrations))
+          "
+          class="mt-5 space-y-4"
+        >
           <label class="block">
             <span class="text-xs font-medium text-white/60 light:text-gray-600">Connection name</span>
             <Input v-model="accountSettingsDraft.name" class="mt-1.5" required maxlength="100" />
           </label>
-          <label v-if="settingsAccount.provider === 'relay'" class="block">
+          <label
+            v-if="settingsAccount.provider === 'relay' && !isManagedMetaMessenger(settingsAccount)"
+            class="block"
+          >
             <span class="text-xs font-medium text-white/60 light:text-gray-600">HTTPS relay URL</span>
             <Input v-model="accountSettingsDraft.relay_url" class="mt-1.5" required type="url" />
           </label>
@@ -1397,7 +1999,10 @@ onBeforeUnmount(() => {
               </span>
             </span>
           </label>
-          <label v-if="settingsAccount.provider === 'relay'" class="block">
+          <label
+            v-if="settingsAccount.provider === 'relay' && !isManagedMetaMessenger(settingsAccount)"
+            class="block"
+          >
             <span class="text-xs font-medium text-white/60 light:text-gray-600">Rotate outbound signing secret</span>
             <Input
               v-model="accountSettingsDraft.outbound_secret"
@@ -1413,6 +2018,85 @@ onBeforeUnmount(() => {
           <div class="flex flex-wrap gap-2">
             <Button type="submit" class="bg-sky-300 text-black hover:bg-sky-200">Save changes</Button>
             <Button
+              v-if="
+                canReconcileMetaMessenger &&
+                metaMessengerOnboardingReady &&
+                metaMessengerNeedsSubscriptionReconciliation(settingsAccount)
+              "
+              type="button"
+              variant="outline"
+              data-testid="messenger-reconcile-subscription"
+              :disabled="metaMessengerBusy"
+              @click="reconcileMetaMessenger(settingsAccount)"
+            >
+              <RefreshCw class="mr-2 h-4 w-4" />
+              Reconcile Meta subscription
+            </Button>
+            <Button
+              v-if="
+                canManageIntegrations &&
+                metaMessengerOnboardingReady &&
+                isManagedMetaMessenger(settingsAccount)
+              "
+              type="button"
+              variant="outline"
+              :disabled="metaMessengerBusy"
+              @click="reconnectMetaMessenger(settingsAccount)"
+            >
+              <Facebook class="mr-2 h-4 w-4" />
+              Reconnect Facebook
+            </Button>
+            <Button
+              v-if="metaMessengerAuthorizationController"
+              type="button"
+              variant="outline"
+              data-testid="messenger-cancel-facebook"
+              @click="cancelMetaMessengerAuthorization"
+            >
+              Cancel Facebook authorization
+            </Button>
+            <Button
+              v-if="metaMessengerOnboardingReady && isManagedMetaMessenger(settingsAccount)"
+              type="button"
+              variant="outline"
+              :disabled="metaMessengerBusy"
+              @click="testAccount(settingsAccount)"
+            >
+              <RefreshCw class="mr-2 h-4 w-4" />
+              Test connection
+            </Button>
+            <Button
+              v-if="
+                isManagedMetaMessenger(settingsAccount) &&
+                canManageIntegrations &&
+                metaMessengerOnboardingReady &&
+                settingsAccount.status === 'pending' &&
+                Boolean(settingsAccount.last_health_check_at) &&
+                !settingsAccount.last_error
+              "
+              type="button"
+              class="bg-emerald-300 text-black hover:bg-emerald-200"
+              :disabled="metaMessengerBusy"
+              @click="approveMetaMessenger(settingsAccount)"
+            >
+              Approve activation
+            </Button>
+            <Button
+              v-if="
+                isManagedMetaMessenger(settingsAccount) &&
+                canManageIntegrations &&
+                metaMessengerOnboardingReady &&
+                settingsAccount.status === 'active' &&
+                settingsAccount.config?.outbound_enabled !== true
+              "
+              type="button"
+              class="bg-emerald-300 text-black hover:bg-emerald-200"
+              :disabled="metaMessengerBusy"
+              @click="approveOutbound(settingsAccount)"
+            >
+              Re-enable outbound
+            </Button>
+            <Button
               v-if="settingsAccount.config?.outbound_enabled === true"
               type="button"
               variant="outline"
@@ -1424,12 +2108,22 @@ onBeforeUnmount(() => {
         </div>
 
         <div
-          v-if="canDeleteAccounts"
+          v-if="
+            canDeleteAccounts &&
+            (!isManagedMetaMessenger(settingsAccount) ||
+              (metaMessengerOnboardingReady && canManageIntegrations))
+          "
           class="mt-5 border-t border-red-300/15 pt-5 light:border-red-200"
         >
-          <p class="text-xs font-semibold text-red-200 light:text-red-700">Disconnect relay</p>
+          <p class="text-xs font-semibold text-red-200 light:text-red-700">
+            {{ isManagedMetaMessenger(settingsAccount) ? 'Disconnect Facebook Page' : 'Disconnect relay' }}
+          </p>
           <p class="mt-1 text-[11px] leading-5 text-white/40 light:text-gray-500">
-            Stops new traffic and removes the connection. CRM history is retained.
+            {{
+              isManagedMetaMessenger(settingsAccount)
+                ? 'Unsubscribes the exact Page, revokes both ReReply credential versions, and keeps CRM history.'
+                : 'Stops new traffic and removes the connection. CRM history is retained.'
+            }}
           </p>
           <Button type="button" variant="destructive" class="mt-3" @click="disconnectAccount">
             Disconnect connection

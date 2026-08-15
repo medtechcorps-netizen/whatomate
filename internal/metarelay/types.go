@@ -47,8 +47,9 @@ const RelayServiceTokenHeader = "X-ReReply-Relay-Service-Token"
 const InboundJobSchemaVersion = 2
 
 const (
-	WebhookAppMessenger      WebhookApp = "messenger"
-	WebhookAppInstagramLogin WebhookApp = "instagram_login"
+	WebhookAppMessenger        WebhookApp = "messenger"
+	WebhookAppManagedMessenger WebhookApp = "managed_messenger"
+	WebhookAppInstagramLogin   WebhookApp = "instagram_login"
 )
 
 // InstagramAPIMode is an explicit, immutable binding between an Instagram
@@ -69,6 +70,7 @@ type AccountConfig struct {
 	ExternalAccountID         string           `json:"external_account_id"`
 	InstagramAPIMode          InstagramAPIMode `json:"instagram_api_mode,omitempty"`
 	ReReplyWebhookURL         string           `json:"rereply_webhook_url"`
+	PlatformAppID             string           `json:"-"`
 	AccessTokenEnv            string           `json:"access_token_env"`
 	ReReplyInboundSecretEnv   string           `json:"rereply_inbound_secret_env"`
 	ReReplyOutboundSecretEnv  string           `json:"rereply_outbound_secret_env"`
@@ -86,37 +88,38 @@ type AccountConfig struct {
 // Config is intentionally environment-only. Production does not have a flag
 // that permits plaintext HTTP provider or ReReply endpoints.
 type Config struct {
-	ListenAddr                string
-	RedisURL                  string
-	RedisPrefix               string
-	MessengerAppSecret        string
-	MessengerVerifyToken      string
-	InstagramLoginAppSecret   string
-	InstagramLoginVerifyToken string
-	GraphAPIVersion           string
-	Accounts                  []AccountConfig
-	InboundRetention          time.Duration
-	OutboundRetention         time.Duration
-	ProcessingLease           time.Duration
-	ForwardTimeout            time.Duration
-	PollInterval              time.Duration
-	WorkerConcurrency         int
-	MaxAttempts               int
-	RegistryURL               string
-	RegistrySecret            string
-	RegistryEdgeSecret        string
-	RegistryCacheTTL          time.Duration
-	RegistryTimeout           time.Duration
+	ListenAddr                  string
+	RedisURL                    string
+	RedisPrefix                 string
+	MessengerAppSecret          string
+	MessengerVerifyToken        string
+	ManagedMessengerAppID       string
+	ManagedMessengerAppSecret   string
+	ManagedMessengerVerifyToken string
+	InstagramLoginAppSecret     string
+	InstagramLoginVerifyToken   string
+	GraphAPIVersion             string
+	Accounts                    []AccountConfig
+	InboundRetention            time.Duration
+	OutboundRetention           time.Duration
+	ProcessingLease             time.Duration
+	ForwardTimeout              time.Duration
+	PollInterval                time.Duration
+	WorkerConcurrency           int
+	MaxAttempts                 int
+	RegistryEnabled             bool
+	RegistryQueueReader         int
+	RegistryURL                 string
+	RegistrySecret              string
+	RegistryEdgeSecret          string
+	RegistryCacheTTL            time.Duration
+	RegistryTimeout             time.Duration
 
 	// allowInsecureTestEndpoints can only be set by package tests/options. It
 	// is deliberately not sourced from an environment variable.
 	allowInsecureTestEndpoints bool
-	// registryLifecycleTestMode is package-private so no deployment setting can
-	// enable the incomplete split-A lifecycle. Tests may exercise the protocol
-	// while production LoadConfig remains static-only.
-	registryLifecycleTestMode bool
-	byExternal                map[string]*AccountConfig
-	byKey                     map[string]*AccountConfig
+	byExternal                 map[string]*AccountConfig
+	byKey                      map[string]*AccountConfig
 }
 
 func accountIndexKey(channel models.Channel, externalID string) string {
@@ -140,6 +143,9 @@ func (c *Config) accountByKey(key string) (*AccountConfig, bool) {
 }
 
 func (a *AccountConfig) webhookApp() WebhookApp {
+	if a != nil && a.Channel == models.ChannelMessenger && a.registryManaged {
+		return WebhookAppManagedMessenger
+	}
 	if a != nil &&
 		a.Channel == models.ChannelInstagram &&
 		a.InstagramAPIMode == InstagramAPIModeInstagramLogin {

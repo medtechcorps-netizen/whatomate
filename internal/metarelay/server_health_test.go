@@ -2,6 +2,9 @@ package metarelay
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +12,56 @@ import (
 	"sync/atomic"
 	"testing"
 )
+
+func TestDynamicMessengerHealthRequiresExactPlatformAppMessagesSubscription(t *testing.T) {
+	config := newTestConfig(t)
+	config.ManagedMessengerAppID = "123456"
+	config.ManagedMessengerAppSecret = "managed-messenger-app-secret-at-least-32-bytes"
+	static, _ := config.accountByKey("messenger-page")
+	account := *static
+	account.registryManaged = true
+	account.PlatformAppID = config.ManagedMessengerAppID
+
+	proofMAC := hmac.New(sha256.New, []byte(config.ManagedMessengerAppSecret))
+	_, _ = proofMAC.Write([]byte(account.accessToken))
+	wantProof := hex.EncodeToString(proofMAC.Sum(nil))
+	fields := "feed"
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+account.accessToken {
+			t.Errorf("missing Page access token")
+		}
+		if request.URL.Query().Get("appsecret_proof") != wantProof {
+			t.Errorf("appsecret_proof = %q", request.URL.Query().Get("appsecret_proof"))
+		}
+		switch request.URL.Path {
+		case "/v25.0/me":
+			_, _ = w.Write([]byte(`{"id":"page-1"}`))
+		case "/v25.0/page-1/subscribed_apps":
+			if request.URL.Query().Get("fields") != "id,subscribed_fields" {
+				t.Errorf("subscription fields = %q", request.URL.Query().Get("fields"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"123456","subscribed_fields":["` + fields + `"]}]}`))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer graph.Close()
+	server, err := NewServer(config, newMemoryServerStore(), withGraphBases(graph.URL, "http://instagram.invalid"))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := server.validateGraphBinding(t.Context(), &account); err == nil {
+		t.Fatal("expected non-messages subscription to fail health")
+	}
+	fields = "messages"
+	if err := server.validateGraphBinding(t.Context(), &account); err != nil {
+		t.Fatalf("expected exact messages subscription health: %v", err)
+	}
+	account.PlatformAppID = "different-app"
+	if err := server.validateGraphBinding(t.Context(), &account); err == nil {
+		t.Fatal("expected relay/web platform app mismatch to fail closed")
+	}
+}
 
 func TestAccountHealthValidatesRedisTokenAccountAndGraphHost(t *testing.T) {
 	config := newTestConfig(t)

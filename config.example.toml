@@ -14,7 +14,9 @@ encryption_key = ""  # AES-256 key for encrypting secrets at rest (32+ chars, re
 host = "0.0.0.0"
 port = 8080
 read_timeout = 30
-write_timeout = 30
+# Managed Messenger provider operations have a 90-second server budget. Keep
+# this at 120 seconds or higher before enabling [meta_messenger_onboarding].
+write_timeout = 120
 base_path = ""  # Set to "/subpath" if behind nginx proxy pass
 allowed_origins = ""  # Comma-separated CORS origins (e.g., "https://app.example.com,https://admin.example.com"). Empty = allow all (dev only).
 
@@ -162,16 +164,38 @@ udp_port_max = 10100          # WebRTC UDP port range end
 # secret = "your-coturn-static-auth-secret"
 # credential_ttl = 86400
 
-# Private Meta relay registry protocol defaults. Split A is deliberately
-# static-only: setting service_secret/relay_edge_secret makes startup fail until
-# the complete OAuth/reconnect/disconnect/revalidation/deauthorization lifecycle
-# ships. Do not add either secret to production yet.
+# Private Meta relay registry. Keep this disabled until every relay replica is
+# running queue reader schema 2 and the separate managed Messenger application
+# has been configured and cryptographically verified at both services.
 [meta_registry]
+enabled = false
 lease_seconds = 30
 ownership_max_age_mins = 1440
 replay_window_seconds = 300
-# service_secret = "reserved-for-lifecycle-release"
-# relay_edge_secret = "reserved-separate-outer-service-credential"
+queue_reader_version = 0  # Set to 2 only after the reader-first deployment is complete.
+# service_secret = "deployment-managed-secret-at-least-32-bytes"
+# relay_edge_secret = "different-edge-secret-at-least-32-bytes"
+
+# Facebook Login for Business managed Messenger lifecycle. This section and
+# [meta_registry] are default-off together. During the pilot, configure exactly
+# one canonical workspace UUID in allowed_organization_ids. Removing that UUID
+# is a runtime kill switch: leases stop and the scheduler quarantines the
+# managed account without calling Graph.
+[meta_messenger_onboarding]
+enabled = false
+app_id = ""
+config_id = ""
+app_secret = ""
+graph_api_version = "v25.0"
+graph_base_url = "https://graph.facebook.com"
+rereply_base_url = ""
+relay_base_url = ""
+health_approval_max_age_mins = 15
+revalidation_lead_mins = 60
+scheduler_interval_seconds = 60
+allowed_organization_ids = ""  # Pilot: one canonical UUID; never a clinic name.
+allow_all_organizations = false # External release only after Live + Advanced Access evidence.
+allow_development_user_token = false # Non-production testing only; production requires BISU/SYSTEM_USER.
 
 # Default admin credentials (only used during initial setup when no users exist)
 [default_admin]

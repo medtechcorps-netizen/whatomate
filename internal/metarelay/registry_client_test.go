@@ -21,7 +21,7 @@ const registryClientTestSecret = "synthetic-registry-client-service-secret-32-by
 
 type panicRegistryResolver struct{}
 
-func (panicRegistryResolver) Resolve(context.Context, models.Channel, string, bool) (*AccountConfig, error) {
+func (panicRegistryResolver) Resolve(context.Context, models.Channel, string, string, bool) (*AccountConfig, error) {
 	panic("registry lookup occurred before outer service authentication")
 }
 
@@ -42,7 +42,7 @@ func TestRegistryClientAuthenticatesResponseCachesOnlyWithinLeaseAndSupportsUnca
 		binding := metaregistry.Binding{
 			SchemaVersion: metaregistry.SchemaVersion, LeaseID: uuid.New(), LeaseExpiresAt: now.Add(30 * time.Second),
 			OrganizationID: uuid.New(), ChannelAccountID: uuid.MustParse("f9e915c1-0b31-48e4-8380-cd9eef312276"),
-			Channel: models.ChannelMessenger, ExternalAccountID: "page-1",
+			Channel: models.ChannelMessenger, ExternalAccountID: "page-1", PlatformAppID: "123456",
 			ReReplyWebhookURL: "https://app.example.test/api/webhooks/channels/account",
 			AccessToken:       "token", InboundSecret: "inbound", OutboundSecret: "outbound",
 			CredentialID:             uuid.MustParse("d34fa16d-8dad-41d8-a145-8246e2cc6ccc"),
@@ -62,24 +62,29 @@ func TestRegistryClientAuthenticatesResponseCachesOnlyWithinLeaseAndSupportsUnca
 
 	client, err := NewRegistryClient(&Config{
 		RegistryURL: server.URL + metaregistry.ResolvePath, RegistrySecret: registryClientTestSecret,
-		RegistryCacheTTL: 10 * time.Second, RegistryTimeout: time.Second,
-		allowInsecureTestEndpoints: true, registryLifecycleTestMode: true,
+		ManagedMessengerAppID: "123456",
+		RegistryCacheTTL:      10 * time.Second, RegistryTimeout: time.Second,
+		allowInsecureTestEndpoints: true, RegistryEnabled: true,
 	}, server.Client())
 	require.NoError(t, err)
 	client.now = func() time.Time { return now }
 
-	first, err := client.Resolve(t.Context(), models.ChannelMessenger, "page-1", true)
+	first, err := client.Resolve(t.Context(), models.ChannelMessenger, "page-1", metaregistry.ResolvePurposeInbound, true)
 	require.NoError(t, err)
-	second, err := client.Resolve(t.Context(), models.ChannelMessenger, "page-1", true)
+	second, err := client.Resolve(t.Context(), models.ChannelMessenger, "page-1", metaregistry.ResolvePurposeInbound, true)
 	require.NoError(t, err)
 	assert.Equal(t, int32(1), calls.Load())
 	assert.Equal(t, registryFence(first), registryFence(second))
 
 	credentialVersion.Store(5)
-	uncached, err := client.Resolve(t.Context(), models.ChannelMessenger, "page-1", false)
+	uncached, err := client.Resolve(t.Context(), models.ChannelMessenger, "page-1", metaregistry.ResolvePurposeInbound, false)
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), calls.Load())
 	assert.NotEqual(t, registryFence(first), registryFence(uncached))
+
+	client.managedMessengerAppID = "654321"
+	_, err = client.Resolve(t.Context(), models.ChannelMessenger, "page-1", metaregistry.ResolvePurposeInbound, false)
+	require.ErrorIs(t, err, ErrRegistryUnavailable)
 }
 
 func TestRegistryClientFailsClosedOnUnsignedOrMismatchedBinding(t *testing.T) {
@@ -91,11 +96,12 @@ func TestRegistryClientFailsClosedOnUnsignedOrMismatchedBinding(t *testing.T) {
 	defer server.Close()
 	client, err := NewRegistryClient(&Config{
 		RegistryURL: server.URL + metaregistry.ResolvePath, RegistrySecret: registryClientTestSecret,
-		RegistryCacheTTL: time.Second, RegistryTimeout: time.Second,
-		allowInsecureTestEndpoints: true, registryLifecycleTestMode: true,
+		ManagedMessengerAppID: "123456",
+		RegistryCacheTTL:      time.Second, RegistryTimeout: time.Second,
+		allowInsecureTestEndpoints: true, RegistryEnabled: true,
 	}, server.Client())
 	require.NoError(t, err)
-	_, err = client.Resolve(t.Context(), models.ChannelInstagram, "ig-1", false)
+	_, err = client.Resolve(t.Context(), models.ChannelInstagram, "ig-1", metaregistry.ResolvePurposeInbound, false)
 	require.ErrorIs(t, err, ErrRegistryUnavailable)
 }
 
@@ -111,11 +117,12 @@ func TestRegistryClientDistinguishesSignedStaleBinding(t *testing.T) {
 	defer server.Close()
 	client, err := NewRegistryClient(&Config{
 		RegistryURL: server.URL + metaregistry.ResolvePath, RegistrySecret: registryClientTestSecret,
-		RegistryCacheTTL: time.Second, RegistryTimeout: time.Second,
-		allowInsecureTestEndpoints: true, registryLifecycleTestMode: true,
+		ManagedMessengerAppID: "123456",
+		RegistryCacheTTL:      time.Second, RegistryTimeout: time.Second,
+		allowInsecureTestEndpoints: true, RegistryEnabled: true,
 	}, server.Client())
 	require.NoError(t, err)
-	_, err = client.Resolve(t.Context(), models.ChannelMessenger, "page-stale", false)
+	_, err = client.Resolve(t.Context(), models.ChannelMessenger, "page-stale", metaregistry.ResolvePurposeInbound, false)
 	require.ErrorIs(t, err, ErrRegistryStale)
 }
 
@@ -128,8 +135,9 @@ func TestRegistryClientRejectsNonExactOrProductionInsecureEndpoint(t *testing.T)
 	} {
 		client, err := NewRegistryClient(&Config{
 			RegistryURL: endpoint, RegistrySecret: registryClientTestSecret,
-			RegistryCacheTTL: time.Second, RegistryTimeout: time.Second,
-			registryLifecycleTestMode: true,
+			ManagedMessengerAppID: "123456",
+			RegistryCacheTTL:      time.Second, RegistryTimeout: time.Second,
+			RegistryEnabled: true,
 		}, nil)
 		require.Error(t, err, endpoint)
 		require.Nil(t, client, endpoint)
@@ -143,7 +151,7 @@ func TestDynamicPublicRouteRequiresOuterServiceCredentialBeforeRegistryLookup(t 
 	request := httptest.NewRequest(http.MethodHead, "/v1/accounts/messenger/page-dynamic", nil)
 	request.SetPathValue("channel", "messenger")
 	request.SetPathValue("externalID", "page-dynamic")
-	_, err := server.accountFromPath(request, false)
+	_, err := server.accountFromPath(request, metaregistry.ResolvePurposeOutbound, false)
 	require.ErrorIs(t, err, ErrRegistryUnauthorized)
 
 	// Static fallback remains first and does not acquire the new dynamic edge
@@ -153,7 +161,7 @@ func TestDynamicPublicRouteRequiresOuterServiceCredentialBeforeRegistryLookup(t 
 	staticRequest := httptest.NewRequest(http.MethodHead, "/v1/accounts/messenger/page-1", nil)
 	staticRequest.SetPathValue("channel", "messenger")
 	staticRequest.SetPathValue("externalID", "page-1")
-	resolved, err := server.accountFromPath(staticRequest, false)
+	resolved, err := server.accountFromPath(staticRequest, metaregistry.ResolvePurposeOutbound, false)
 	require.NoError(t, err)
 	require.Same(t, static, resolved)
 }

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/shridarpatil/whatomate/internal/metaregistry"
 )
 
 type WorkerOption func(*Worker)
@@ -144,7 +146,7 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 		account, ok = w.config.accountByKey(job.AccountKey)
 	}
 	if !ok && w.registry != nil && job.Channel != "" && job.ExternalAccountID != "" {
-		resolved, resolveErr := w.registry.Resolve(ctx, job.Channel, job.ExternalAccountID, false)
+		resolved, resolveErr := w.registry.Resolve(ctx, job.Channel, job.ExternalAccountID, metaregistry.ResolvePurposeWorker, false)
 		if resolveErr == nil && registryFence(resolved) == job.RegistryFence && job.RegistryFence != "" {
 			account, ok = resolved, true
 		} else if resolveErr == nil {

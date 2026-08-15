@@ -22,6 +22,11 @@ const (
 	OwnershipStale    = "stale"
 	OwnershipRevoked  = "revoked"
 
+	ResolvePurposeInbound  = "inbound"
+	ResolvePurposeHealth   = "health"
+	ResolvePurposeOutbound = "outbound"
+	ResolvePurposeWorker   = "worker"
+
 	ManagementModePlatformOAuth = "platform_oauth"
 )
 
@@ -38,6 +43,7 @@ var (
 type ResolveRequest struct {
 	Channel           models.Channel `json:"channel"`
 	ExternalAccountID string         `json:"external_account_id"`
+	Purpose           string         `json:"purpose"`
 }
 
 // Binding is a short-lived secret-bearing lease. It must never be logged,
@@ -50,6 +56,7 @@ type Binding struct {
 	ChannelAccountID         uuid.UUID      `json:"channel_account_id"`
 	Channel                  models.Channel `json:"channel"`
 	ExternalAccountID        string         `json:"external_account_id"`
+	PlatformAppID            string         `json:"platform_app_id,omitempty"`
 	InstagramAPIMode         string         `json:"instagram_api_mode,omitempty"`
 	ReReplyWebhookURL        string         `json:"rereply_webhook_url"`
 	AccessToken              string         `json:"access_token"`
@@ -80,10 +87,16 @@ type MutationResponse struct {
 func NormalizeResolveRequest(request ResolveRequest) (ResolveRequest, error) {
 	request.Channel = models.Channel(strings.ToLower(strings.TrimSpace(string(request.Channel))))
 	request.ExternalAccountID = strings.TrimSpace(request.ExternalAccountID)
+	request.Purpose = strings.ToLower(strings.TrimSpace(request.Purpose))
 	if request.Channel != models.ChannelMessenger && request.Channel != models.ChannelInstagram {
 		return ResolveRequest{}, ErrInvalidRequest
 	}
 	if request.ExternalAccountID == "" || len(request.ExternalAccountID) > 255 {
+		return ResolveRequest{}, ErrInvalidRequest
+	}
+	switch request.Purpose {
+	case ResolvePurposeInbound, ResolvePurposeHealth, ResolvePurposeOutbound, ResolvePurposeWorker:
+	default:
 		return ResolveRequest{}, ErrInvalidRequest
 	}
 	return request, nil
@@ -98,6 +111,7 @@ func (binding Binding) Validate(now time.Time) error {
 	}
 	request, err := NormalizeResolveRequest(ResolveRequest{
 		Channel: binding.Channel, ExternalAccountID: binding.ExternalAccountID,
+		Purpose: ResolvePurposeInbound,
 	})
 	if err != nil || request.Channel != binding.Channel ||
 		strings.TrimSpace(binding.ReReplyWebhookURL) == "" ||
@@ -107,12 +121,21 @@ func (binding Binding) Validate(now time.Time) error {
 		binding.OwnershipCheckedAt.IsZero() {
 		return ErrInvalidRequest
 	}
-	if binding.Channel == models.ChannelInstagram {
+	switch binding.Channel {
+	case models.ChannelMessenger:
+		if strings.TrimSpace(binding.PlatformAppID) == "" {
+			return ErrInvalidRequest
+		}
+	case models.ChannelInstagram:
 		mode := strings.TrimSpace(binding.InstagramAPIMode)
 		if mode != "instagram_login" && mode != "facebook_login" {
 			return ErrInvalidRequest
 		}
-	} else if strings.TrimSpace(binding.InstagramAPIMode) != "" {
+	}
+	if binding.Channel != models.ChannelMessenger && strings.TrimSpace(binding.PlatformAppID) != "" {
+		return ErrInvalidRequest
+	}
+	if binding.Channel != models.ChannelInstagram && strings.TrimSpace(binding.InstagramAPIMode) != "" {
 		return ErrInvalidRequest
 	}
 	if !binding.LeaseExpiresAt.After(now.UTC()) {

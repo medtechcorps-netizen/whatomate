@@ -492,6 +492,9 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamp with time zone)",
 		"public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamp with time zone)",
 		"public.rereply_ready_threads_credential_orgs(uuid,integer,timestamp with time zone)",
+		"public.rereply_ready_meta_lifecycle_orgs(uuid,integer,timestamp with time zone)",
+		"public.rereply_meta_deauth_targets(text,text)",
+		"public.rereply_meta_deauth_target_page(text,text,uuid,integer)",
 		"public.rereply_rls_routing_version()",
 	} {
 		var allowed bool
@@ -621,7 +624,7 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		     AND provider = 'relay'
 		     AND external_account_id = btrim(p_external_account_id)
 		     AND channel::text IN ('messenger', 'instagram')
-		     AND status IN ('active', 'degraded')
+		     AND status IN ('pending', 'active', 'degraded')
 		     AND deleted_at IS NULL
 		   LIMIT 1
 		 $function$`,
@@ -713,6 +716,84 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		   ORDER BY (organization_id > p_after) DESC, organization_id
 		   LIMIT LEAST(GREATEST(p_limit, 1), 100)
 		 $function$`,
+		`CREATE OR REPLACE FUNCTION public.rereply_ready_meta_lifecycle_orgs(
+		   p_after uuid,
+		   p_limit integer,
+		   p_due_before timestamptz
+		 )
+		 RETURNS SETOF uuid
+		 LANGUAGE sql
+		 SECURITY DEFINER
+		 SET search_path = pg_catalog, public
+		 AS $function$
+		   WITH ready AS (
+		     SELECT DISTINCT organization_id
+		     FROM public.channel_accounts
+		     WHERE deleted_at IS NULL
+		       AND channel = 'messenger'
+		       AND provider = 'relay'
+		       AND status IN ('pending', 'active', 'degraded')
+		       AND config ->> 'meta_management_mode' = 'platform_oauth'
+		       AND (
+		         metadata ->> 'meta_deauthorization_pending_digest' IS NOT NULL
+		         OR COALESCE(
+		           (metadata ->> 'meta_ownership_checked_at')::timestamptz,
+		           '-infinity'::timestamptz
+		         ) <= p_due_before
+		       )
+		   )
+		   SELECT organization_id
+		   FROM ready
+		   WHERE organization_id > p_after
+		   ORDER BY organization_id
+		   LIMIT LEAST(GREATEST(COALESCE(p_limit, 1), 1), 100)
+		 $function$`,
+		`CREATE OR REPLACE FUNCTION public.rereply_meta_deauth_target_page(
+		   p_app_id text,
+		   p_authorizing_user_id text,
+		   p_after uuid,
+		   p_limit integer
+		 )
+		 RETURNS TABLE(organization_id uuid, account_id uuid)
+		 LANGUAGE sql
+		 STABLE
+		 SECURITY DEFINER
+		 SET search_path = pg_catalog, public
+		 AS $function$
+		   SELECT accounts.organization_id, accounts.id
+		   FROM public.channel_accounts AS accounts
+		   WHERE accounts.deleted_at IS NULL
+		     AND accounts.channel = 'messenger'
+		     AND accounts.provider = 'relay'
+		     AND accounts.status IN ('pending', 'active', 'degraded', 'disconnected')
+		     AND accounts.config ->> 'meta_management_mode' = 'platform_oauth'
+		     AND accounts.metadata ->> 'meta_platform_app_id' = btrim(p_app_id)
+		     AND accounts.metadata ->> 'meta_authorizing_user_id' = btrim(p_authorizing_user_id)
+		     AND accounts.id > p_after
+		   ORDER BY accounts.id
+		   LIMIT LEAST(GREATEST(COALESCE(p_limit, 1), 1), 100)
+		 $function$`,
+		// Temporary PR #52 binary-rollback shim. The legacy signature remains
+		// runtime-only and hard-capped by the safe pager; remove it after the
+		// production rollback window closes.
+		`CREATE OR REPLACE FUNCTION public.rereply_meta_deauth_targets(
+		   p_app_id text,
+		   p_authorizing_user_id text
+		 )
+		 RETURNS TABLE(organization_id uuid, account_id uuid)
+		 LANGUAGE sql
+		 STABLE
+		 SECURITY DEFINER
+		 SET search_path = pg_catalog, public
+		 AS $function$
+		   SELECT organization_id, account_id
+		   FROM public.rereply_meta_deauth_target_page(
+		     p_app_id,
+		     p_authorizing_user_id,
+		     '00000000-0000-0000-0000-000000000000'::uuid,
+		     100
+		   )
+		 $function$`,
 		fmt.Sprintf(
 			`CREATE OR REPLACE FUNCTION public.rereply_rls_routing_version()
 			 RETURNS integer
@@ -733,6 +814,9 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		"REVOKE ALL ON FUNCTION public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamptz) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz) FROM PUBLIC",
+		"REVOKE ALL ON FUNCTION public.rereply_ready_meta_lifecycle_orgs(uuid,integer,timestamptz) FROM PUBLIC",
+		"REVOKE ALL ON FUNCTION public.rereply_meta_deauth_targets(text,text) FROM PUBLIC",
+		"REVOKE ALL ON FUNCTION public.rereply_meta_deauth_target_page(text,text,uuid,integer) FROM PUBLIC",
 		"REVOKE ALL ON FUNCTION public.rereply_rls_routing_version() FROM PUBLIC",
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_whatsapp_org(text) TO %s", runtimeRole),
 		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_resolve_webhook_org(text) TO %s", runtimeRole),
@@ -751,6 +835,12 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 			"GRANT EXECUTE ON FUNCTION public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz) TO %s",
 			runtimeRole,
 		),
+		fmt.Sprintf(
+			"GRANT EXECUTE ON FUNCTION public.rereply_ready_meta_lifecycle_orgs(uuid,integer,timestamptz) TO %s",
+			runtimeRole,
+		),
+		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_meta_deauth_targets(text,text) TO %s", runtimeRole),
+		fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.rereply_meta_deauth_target_page(text,text,uuid,integer) TO %s", runtimeRole),
 		fmt.Sprintf(
 			"GRANT EXECUTE ON FUNCTION public.rereply_rls_routing_version() TO %s",
 			runtimeRole,
@@ -801,6 +891,9 @@ func RemoveTenantRLS(db *gorm.DB) error {
 			"public.rereply_ready_channel_outbox_orgs(uuid,integer,timestamptz)",
 			"public.rereply_ready_channel_ai_reply_orgs(uuid,integer,timestamptz)",
 			"public.rereply_ready_threads_credential_orgs(uuid,integer,timestamptz)",
+			"public.rereply_ready_meta_lifecycle_orgs(uuid,integer,timestamptz)",
+			"public.rereply_meta_deauth_targets(text,text)",
+			"public.rereply_meta_deauth_target_page(text,text,uuid,integer)",
 			"public.rereply_rls_routing_version()",
 		} {
 			if err := tx.Exec("DROP FUNCTION IF EXISTS " + signature).Error; err != nil {

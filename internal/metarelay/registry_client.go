@@ -27,7 +27,7 @@ var (
 )
 
 type RegistryResolver interface {
-	Resolve(ctx context.Context, channel models.Channel, externalID string, allowCache bool) (*AccountConfig, error)
+	Resolve(ctx context.Context, channel models.Channel, externalID, purpose string, allowCache bool) (*AccountConfig, error)
 }
 
 type registryCacheEntry struct {
@@ -36,23 +36,27 @@ type registryCacheEntry struct {
 }
 
 type RegistryClient struct {
-	endpoint string
-	secret   string
-	client   *http.Client
-	cacheTTL time.Duration
-	now      func() time.Time
-	mu       sync.Mutex
-	cache    map[string]registryCacheEntry
+	endpoint              string
+	secret                string
+	client                *http.Client
+	cacheTTL              time.Duration
+	managedMessengerAppID string
+	now                   func() time.Time
+	mu                    sync.Mutex
+	cache                 map[string]registryCacheEntry
 }
 
 func NewRegistryClient(config *Config, client *http.Client) (*RegistryClient, error) {
 	if config == nil || strings.TrimSpace(config.RegistryURL) == "" {
 		return nil, nil
 	}
-	if !config.registryLifecycleTestMode {
+	if !config.RegistryEnabled {
 		return nil, ErrRegistryUnavailable
 	}
 	if len(config.RegistrySecret) < 32 {
+		return nil, ErrRegistryUnavailable
+	}
+	if strings.TrimSpace(config.ManagedMessengerAppID) == "" {
 		return nil, ErrRegistryUnavailable
 	}
 	parsed, err := url.Parse(strings.TrimSpace(config.RegistryURL))
@@ -70,19 +74,20 @@ func NewRegistryClient(config *Config, client *http.Client) (*RegistryClient, er
 	}
 	return &RegistryClient{
 		endpoint: strings.TrimSpace(config.RegistryURL), secret: config.RegistrySecret,
-		client: client, cacheTTL: config.RegistryCacheTTL, now: time.Now,
+		client: client, cacheTTL: config.RegistryCacheTTL,
+		managedMessengerAppID: strings.TrimSpace(config.ManagedMessengerAppID), now: time.Now,
 		cache: make(map[string]registryCacheEntry),
 	}, nil
 }
 
-func (client *RegistryClient) Resolve(ctx context.Context, channel models.Channel, externalID string, allowCache bool) (*AccountConfig, error) {
+func (client *RegistryClient) Resolve(ctx context.Context, channel models.Channel, externalID, purpose string, allowCache bool) (*AccountConfig, error) {
 	requestValue, err := metaregistry.NormalizeResolveRequest(metaregistry.ResolveRequest{
-		Channel: channel, ExternalAccountID: externalID,
+		Channel: channel, ExternalAccountID: externalID, Purpose: purpose,
 	})
 	if err != nil {
 		return nil, ErrRegistryNotFound
 	}
-	key := accountIndexKey(requestValue.Channel, requestValue.ExternalAccountID)
+	key := accountIndexKey(requestValue.Channel, requestValue.ExternalAccountID) + "\x00" + requestValue.Purpose
 	now := client.now().UTC()
 	if allowCache {
 		client.mu.Lock()
@@ -142,7 +147,8 @@ func (client *RegistryClient) Resolve(ctx context.Context, channel models.Channe
 	decoder := json.NewDecoder(bytes.NewReader(responseBody))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&binding) != nil || rejectTrailingJSON(decoder) != nil || binding.Validate(now) != nil ||
-		binding.Channel != requestValue.Channel || binding.ExternalAccountID != requestValue.ExternalAccountID {
+		binding.Channel != requestValue.Channel || binding.ExternalAccountID != requestValue.ExternalAccountID ||
+		(binding.Channel == models.ChannelMessenger && binding.PlatformAppID != client.managedMessengerAppID) {
 		return nil, ErrRegistryUnavailable
 	}
 	account := accountConfigFromBinding(binding)
@@ -160,6 +166,7 @@ func accountConfigFromBinding(binding metaregistry.Binding) AccountConfig {
 	return AccountConfig{
 		Key:     "registry." + binding.ChannelAccountID.String(),
 		Channel: binding.Channel, ExternalAccountID: binding.ExternalAccountID,
+		PlatformAppID:     binding.PlatformAppID,
 		InstagramAPIMode:  InstagramAPIMode(binding.InstagramAPIMode),
 		ReReplyWebhookURL: binding.ReReplyWebhookURL,
 		accessToken:       binding.AccessToken, reReplyInboundSecret: binding.InboundSecret,

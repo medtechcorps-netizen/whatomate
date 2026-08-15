@@ -65,30 +65,31 @@ type UpdateChannelAccountRequest struct {
 }
 
 type ChannelAccountResponse struct {
-	ID                uuid.UUID                   `json:"id"`
-	OrganizationID    uuid.UUID                   `json:"organization_id"`
-	Channel           models.Channel              `json:"channel"`
-	Provider          string                      `json:"provider"`
-	Name              string                      `json:"name"`
-	ExternalAccountID string                      `json:"external_account_id"`
-	Status            models.ChannelAccountStatus `json:"status"`
-	Capabilities      models.JSONB                `json:"capabilities"`
-	Config            models.JSONB                `json:"config"`
-	IsDefaultIncoming bool                        `json:"is_default_incoming"`
-	IsDefaultOutgoing bool                        `json:"is_default_outgoing"`
-	HasCredentials    bool                        `json:"has_credentials"`
-	ConnectedAt       *time.Time                  `json:"connected_at,omitempty"`
-	LastHealthCheckAt *time.Time                  `json:"last_health_check_at,omitempty"`
-	LastInboundAt     *time.Time                  `json:"last_inbound_at,omitempty"`
-	LastOutboundAt    *time.Time                  `json:"last_outbound_at,omitempty"`
-	LastErrorAt       *time.Time                  `json:"last_error_at,omitempty"`
-	LastError         string                      `json:"last_error,omitempty"`
-	OutboxPending     int64                       `json:"outbox_pending"`
-	OutboxFailed      int64                       `json:"outbox_failed"`
-	CreatedByID       *uuid.UUID                  `json:"created_by_id,omitempty"`
-	UpdatedByID       *uuid.UUID                  `json:"updated_by_id,omitempty"`
-	CreatedAt         time.Time                   `json:"created_at"`
-	UpdatedAt         time.Time                   `json:"updated_at"`
+	ID                                     uuid.UUID                   `json:"id"`
+	OrganizationID                         uuid.UUID                   `json:"organization_id"`
+	Channel                                models.Channel              `json:"channel"`
+	Provider                               string                      `json:"provider"`
+	Name                                   string                      `json:"name"`
+	ExternalAccountID                      string                      `json:"external_account_id"`
+	Status                                 models.ChannelAccountStatus `json:"status"`
+	Capabilities                           models.JSONB                `json:"capabilities"`
+	Config                                 models.JSONB                `json:"config"`
+	IsDefaultIncoming                      bool                        `json:"is_default_incoming"`
+	IsDefaultOutgoing                      bool                        `json:"is_default_outgoing"`
+	HasCredentials                         bool                        `json:"has_credentials"`
+	MetaSubscriptionReconciliationRequired bool                        `json:"meta_subscription_reconciliation_required"`
+	ConnectedAt                            *time.Time                  `json:"connected_at,omitempty"`
+	LastHealthCheckAt                      *time.Time                  `json:"last_health_check_at,omitempty"`
+	LastInboundAt                          *time.Time                  `json:"last_inbound_at,omitempty"`
+	LastOutboundAt                         *time.Time                  `json:"last_outbound_at,omitempty"`
+	LastErrorAt                            *time.Time                  `json:"last_error_at,omitempty"`
+	LastError                              string                      `json:"last_error,omitempty"`
+	OutboxPending                          int64                       `json:"outbox_pending"`
+	OutboxFailed                           int64                       `json:"outbox_failed"`
+	CreatedByID                            *uuid.UUID                  `json:"created_by_id,omitempty"`
+	UpdatedByID                            *uuid.UUID                  `json:"updated_by_id,omitempty"`
+	CreatedAt                              time.Time                   `json:"created_at"`
+	UpdatedAt                              time.Time                   `json:"updated_at"`
 }
 
 type CreateChannelAccountResponse struct {
@@ -803,7 +804,10 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 					currentAccount.Status = models.ChannelAccountStatusDegraded
 				}
 			} else {
-				currentAccount.Status = models.ChannelAccountStatusActive
+				managedMeta := metaRegistryControlPlaneConfig(currentAccount.Config)
+				if !managedMeta {
+					currentAccount.Status = models.ChannelAccountStatusActive
+				}
 				currentAccount.Capabilities = capabilitiesToJSONB(result.Capabilities)
 				if currentAccount.Channel == models.ChannelThreads {
 					currentAccount.Capabilities = threadsPublicEngagementCapabilities(
@@ -813,7 +817,28 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 				currentAccount.LastError = ""
 				currentAccount.LastErrorAt = nil
 				if currentAccount.ConnectedAt == nil {
-					currentAccount.ConnectedAt = &now
+					if !managedMeta || currentAccount.Status == models.ChannelAccountStatusActive {
+						currentAccount.ConnectedAt = &now
+					}
+				}
+				if managedMeta {
+					oauth := currentMetaRegistryCredential(currentAccount.Credentials, models.ChannelCredentialKindOAuth, now)
+					webhook := currentMetaRegistryCredential(currentAccount.Credentials, models.ChannelCredentialKindWebhook, now)
+					if oauth == nil || webhook == nil ||
+						stringConfigValue(currentAccount.Metadata, "meta_ownership_state") != metaregistry.OwnershipVerified ||
+						stringConfigValue(currentAccount.Metadata, "meta_subscription_state") != "verified" {
+						return errors.New("managed Meta health validation lost its credential or ownership fence")
+					}
+					metadata := cloneJSONB(currentAccount.Metadata)
+					metadata["meta_health_checked_at"] = now.Format(time.RFC3339Nano)
+					metadata["meta_health_oauth_credential_id"] = oauth.ID.String()
+					metadata["meta_health_oauth_version"] = oauth.Version
+					metadata["meta_health_webhook_credential_id"] = webhook.ID.String()
+					metadata["meta_health_webhook_version"] = webhook.Version
+					if currentAccount.Status == models.ChannelAccountStatusPending {
+						metadata["meta_activation_state"] = "awaiting_admin_approval"
+					}
+					currentAccount.Metadata = metadata
 				}
 			}
 			currentAccount.UpdatedByID = &userID
@@ -842,6 +867,7 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 					"last_error":           account.LastError,
 					"last_error_at":        account.LastErrorAt,
 					"connected_at":         account.ConnectedAt,
+					"metadata":             account.Metadata,
 					"updated_by_id":        userID,
 					"updated_at":           now,
 				}).Error; err != nil {
@@ -1082,6 +1108,8 @@ func additionalChannelCreationEntitlement(channel models.Channel) (string, bool)
 
 func validateChannelCreationPolicy(request ChannelAccountRequest) error {
 	switch request.Channel {
+	case models.ChannelMessenger:
+		return errors.New("messenger accounts must be connected through managed Meta onboarding and cannot be created manually")
 	case models.ChannelThreads:
 		return errors.New("threads accounts are OAuth-managed from Settings > Integrations and cannot be created manually")
 	case models.ChannelTikTok:
@@ -1140,28 +1168,48 @@ func loadChannelAccount(db *gorm.DB, orgID, accountID uuid.UUID, credentials boo
 
 func channelAccountToResponse(account *models.ChannelAccount) ChannelAccountResponse {
 	return ChannelAccountResponse{
-		ID:                account.ID,
-		OrganizationID:    account.OrganizationID,
-		Channel:           account.Channel,
-		Provider:          account.Provider,
-		Name:              account.Name,
-		ExternalAccountID: account.ExternalAccountID,
-		Status:            account.Status,
-		Capabilities:      cloneJSONB(account.Capabilities),
-		Config:            sanitizeChannelConfig(account.Config),
-		IsDefaultIncoming: account.IsDefaultIncoming,
-		IsDefaultOutgoing: account.IsDefaultOutgoing,
-		HasCredentials:    currentChannelCredential(account) != nil,
-		ConnectedAt:       account.ConnectedAt,
-		LastHealthCheckAt: account.LastHealthCheckAt,
-		LastInboundAt:     account.LastInboundAt,
-		LastOutboundAt:    account.LastOutboundAt,
-		LastErrorAt:       account.LastErrorAt,
-		LastError:         account.LastError,
-		CreatedByID:       account.CreatedByID,
-		UpdatedByID:       account.UpdatedByID,
-		CreatedAt:         account.CreatedAt,
-		UpdatedAt:         account.UpdatedAt,
+		ID:                                     account.ID,
+		OrganizationID:                         account.OrganizationID,
+		Channel:                                account.Channel,
+		Provider:                               account.Provider,
+		Name:                                   account.Name,
+		ExternalAccountID:                      account.ExternalAccountID,
+		Status:                                 account.Status,
+		Capabilities:                           cloneJSONB(account.Capabilities),
+		Config:                                 sanitizeChannelConfig(account.Config),
+		IsDefaultIncoming:                      account.IsDefaultIncoming,
+		IsDefaultOutgoing:                      account.IsDefaultOutgoing,
+		HasCredentials:                         currentChannelCredential(account) != nil,
+		MetaSubscriptionReconciliationRequired: metaMessengerSubscriptionReconciliationRequired(account),
+		ConnectedAt:                            account.ConnectedAt,
+		LastHealthCheckAt:                      account.LastHealthCheckAt,
+		LastInboundAt:                          account.LastInboundAt,
+		LastOutboundAt:                         account.LastOutboundAt,
+		LastErrorAt:                            account.LastErrorAt,
+		LastError:                              account.LastError,
+		CreatedByID:                            account.CreatedByID,
+		UpdatedByID:                            account.UpdatedByID,
+		CreatedAt:                              account.CreatedAt,
+		UpdatedAt:                              account.UpdatedAt,
+	}
+}
+
+func metaMessengerSubscriptionReconciliationRequired(account *models.ChannelAccount) bool {
+	if account == nil || account.Channel != models.ChannelMessenger ||
+		!metaRegistryControlPlaneConfig(account.Config) {
+		return false
+	}
+	if stringConfigValue(account.Metadata, metaMessengerSubscriptionFencedOperationIDKey) != "" {
+		return true
+	}
+	switch stringConfigValue(account.Metadata, metaMessengerSubscriptionOperationStateKey) {
+	case metaMessengerSubscriptionSubscribePending,
+		metaMessengerSubscriptionSubscribeFailed,
+		metaMessengerSubscriptionUnsubscribePending,
+		metaMessengerSubscriptionUnsubscribeFailed:
+		return true
+	default:
+		return false
 	}
 }
 

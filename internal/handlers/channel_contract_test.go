@@ -54,6 +54,38 @@ func TestChannelAccountResponseRedactsCredentialsAndRestrictedConfig(t *testing.
 	assert.NotContains(t, string(encoded), "nested-must-not-leak")
 }
 
+func TestManagedMessengerResponseExposesOnlyDerivedReconciliationState(t *testing.T) {
+	t.Parallel()
+
+	account := &models.ChannelAccount{
+		Channel:  models.ChannelMessenger,
+		Provider: channelapi.RelayProvider,
+		Config: models.JSONB{
+			"meta_registry_managed": true,
+		},
+		Metadata: models.JSONB{
+			metaMessengerSubscriptionOperationStateKey:    metaMessengerSubscriptionSubscribeFailed,
+			metaMessengerSubscriptionFencedOperationIDKey: "operation-id-must-not-leak",
+			"meta_authorizing_user_id":                    "authorizer-must-not-leak",
+			"meta_deauthorization_event_digest":           "digest-must-not-leak",
+		},
+	}
+
+	response := channelAccountToResponse(account)
+	assert.True(t, response.MetaSubscriptionReconciliationRequired)
+
+	encoded, err := json.Marshal(response)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"meta_subscription_reconciliation_required":true`)
+	assert.NotContains(t, string(encoded), "operation-id-must-not-leak")
+	assert.NotContains(t, string(encoded), "authorizer-must-not-leak")
+	assert.NotContains(t, string(encoded), "digest-must-not-leak")
+	assert.NotContains(t, string(encoded), `"metadata"`)
+
+	account.Channel = models.ChannelInstagram
+	assert.False(t, channelAccountToResponse(account).MetaSubscriptionReconciliationRequired)
+}
+
 func TestChannelIdentifiersAreAllowlisted(t *testing.T) {
 	t.Parallel()
 
