@@ -231,7 +231,7 @@ func TestThreadsHealthCheckReviewDowngradeDuringProviderIOCannotCrossPersistence
 	app.HTTPClient = &http.Client{Transport: threadsOAuthEndpointRoundTripFunc(
 		func(request *http.Request) (*http.Response, error) {
 			providerCalls++
-			payload := "{}"
+			var payload string
 			switch request.URL.Path {
 			case "/v1.0/me":
 				require.NoError(t, app.DB.Model(&integration).Updates(map[string]any{

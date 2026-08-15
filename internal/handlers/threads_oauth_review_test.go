@@ -270,7 +270,7 @@ func TestThreadsOAuthReviewDowngradeDuringProviderIOCannotCrossPersistenceFence(
 	app.HTTPClient = &http.Client{Transport: threadsOAuthEndpointRoundTripFunc(
 		func(request *http.Request) (*http.Response, error) {
 			providerCalls++
-			payload := "{}"
+			var payload string
 			switch request.URL.Path {
 			case "/oauth/access_token":
 				payload = `{"access_token":"short-token","user_id":"` + profileID + `"}`
