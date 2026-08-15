@@ -77,6 +77,7 @@ const THREADS_PUBLIC_ENGAGEMENT_ENTITLEMENT =
 interface FieldOption {
   value: string;
   label: string;
+  disabled?: boolean;
 }
 
 interface IntegrationField {
@@ -105,6 +106,13 @@ const reviewOptions: FieldOption[] = [
   { value: "not_submitted", label: "Not submitted" },
   { value: "pending", label: "In review" },
   { value: "approved", label: "Approved" },
+  { value: "rejected", label: "Rejected" },
+];
+
+const threadsReviewOptions: FieldOption[] = [
+  { value: "not_submitted", label: "Not submitted" },
+  { value: "pending", label: "In review" },
+  { value: "approved", label: "Approved by platform owner", disabled: true },
   { value: "rejected", label: "Rejected" },
 ];
 
@@ -207,9 +215,34 @@ const definitions: Record<IntegrationProvider, IntegrationDefinition> = {
         key: "app_review_status",
         label: "Meta app review",
         description:
-          "Record the review state for the required Threads public-engagement permissions.",
+          "Track submission state here. Production approval is recorded separately by the platform owner with evidence.",
         kind: "select",
-        options: reviewOptions,
+        options: threadsReviewOptions,
+      },
+      {
+        key: "deauthorization_callback_url",
+        label: "Uninstall / deauthorization callback URL",
+        description:
+          "Copy this exact non-secret URL into the Threads app uninstall or deauthorization callback setting.",
+        kind: "url",
+        readOnly: true,
+      },
+      {
+        key: "data_deletion_callback_url",
+        label: "Data deletion request URL",
+        description:
+          "Copy this exact non-secret URL into the Threads app data deletion request setting.",
+        kind: "url",
+        readOnly: true,
+      },
+      {
+        key: "account_webhook_callback_url",
+        label: "Connected account webhook callback URL",
+        description:
+          "Available after OAuth creates the workspace account. Copy the exact URL into the Threads webhook subscription.",
+        placeholder: "Available after Threads OAuth",
+        kind: "url",
+        readOnly: true,
       },
     ],
     secrets: [
@@ -552,12 +585,33 @@ const canRevokeThreadsEntitlementSupport = computed(
     threadsSupportRevokeReason.value.trim().length > 0 &&
     activeAction.value === null,
 );
+function isApprovedThreadsReviewStatus(value: unknown) {
+  return value === "approved";
+}
+function isThreadsReviewAccessAuthorized() {
+  const mode = selectedIntegration.value?.config.app_review_access_mode;
+  if (mode === "approved") {
+    return isApprovedThreadsReviewStatus(configDraft.app_review_status);
+  }
+  return (
+    mode === "development_testing" &&
+    ["not_submitted", "pending"].includes(configDraft.app_review_status ?? "")
+  );
+}
+const isThreadsReviewLocked = computed(
+  () =>
+    selectedIntegration.value?.provider === "threads" &&
+    !isThreadsReviewAccessAuthorized(),
+);
 const isActivationLocked = computed(() => {
   const integration = selectedIntegration.value;
   if (!integration) return false;
   return (
     isThreadsEntitlementLocked.value ||
-    ["approval_required", "adapter_unavailable"].includes(integration.status) ||
+    isThreadsReviewLocked.value ||
+    integration.status === "adapter_unavailable" ||
+    (integration.provider !== "threads" &&
+      integration.status === "approval_required") ||
     (integration.provider === "tiktok" && !integration.oauth.available)
   );
 });
@@ -847,14 +901,14 @@ async function copyWebhookCallback() {
   }
 }
 
-async function copyThreadsOAuthCallback() {
-  const callback = configDraft.redirect_uri ?? "";
+async function copyThreadsSetupURL(key: string, label: string) {
+  const callback = configDraft[key] ?? "";
   if (!callback.trim()) return;
   try {
     await navigator.clipboard.writeText(callback);
-    toast.success("Threads OAuth callback copied");
+    toast.success(`${label} copied`);
   } catch {
-    toast.error("Could not copy the Threads OAuth callback");
+    toast.error(`Could not copy ${label.toLowerCase()}`);
   }
 }
 
@@ -906,7 +960,9 @@ async function saveConfiguration() {
         .filter(([, value]) => value !== ""),
     );
     const preserveThreadsEnabledState =
-      integration.provider === "threads" && isThreadsEntitlementLocked.value;
+      integration.provider === "threads" &&
+      isThreadsEntitlementLocked.value &&
+      !isThreadsReviewLocked.value;
     const response = await integrationsService.update(integration.provider, {
       ...(preserveThreadsEnabledState
         ? {}
@@ -1289,6 +1345,15 @@ watch(isDialogOpen, (open) => {
   }
 });
 
+watch(
+  () => configDraft.app_review_status,
+  () => {
+    if (selectedProvider.value === "threads" && isThreadsReviewLocked.value) {
+      enabledDraft.value = false;
+    }
+  },
+);
+
 watch(threadsSupportTargetOrganizationId, (organizationID, previousID) => {
   if (
     organizationID === previousID ||
@@ -1338,6 +1403,12 @@ async function handleThreadsOAuthReturn() {
     openConfiguration("threads");
   } else if (outcome === "cancelled") {
     toast.info("Threads authorization was cancelled. No changes were made.");
+  } else if (outcome === "approval_required") {
+    await loadIntegrations({ quiet: true });
+    toast.error(
+      "Threads authorization stopped because Meta App Review is not approved.",
+    );
+    openConfiguration("threads");
   } else if (outcome === "error") {
     toast.error(
       "Threads authorization was not completed. Try connecting again.",
@@ -1904,6 +1975,7 @@ onMounted(async () => {
                         v-for="option in field.options"
                         :key="option.value"
                         :value="option.value"
+                        :disabled="option.disabled"
                       >
                         {{ option.label }}
                       </SelectItem>
@@ -1948,14 +2020,24 @@ onMounted(async () => {
                     <Button
                       v-if="
                         selectedIntegration.provider === 'threads' &&
-                        field.key === 'redirect_uri'
+                        [
+                          'redirect_uri',
+                          'deauthorization_callback_url',
+                          'data_deletion_callback_url',
+                          'account_webhook_callback_url',
+                        ].includes(field.key) &&
+                        Boolean(configDraft[field.key]?.trim())
                       "
                       type="button"
                       variant="outline"
                       size="icon"
-                      data-testid="threads-oauth-callback-copy"
-                      aria-label="Copy Threads OAuth callback"
-                      @click="copyThreadsOAuthCallback"
+                      :data-testid="
+                        field.key === 'redirect_uri'
+                          ? 'threads-oauth-callback-copy'
+                          : `threads-${field.key}-copy`
+                      "
+                      :aria-label="`Copy ${field.label}`"
+                      @click="copyThreadsSetupURL(field.key, field.label)"
                     >
                       <Copy class="h-4 w-4" aria-hidden="true" />
                     </Button>
@@ -2198,14 +2280,19 @@ onMounted(async () => {
             <Button
               v-if="
                 selectedIntegration.oauth.supported &&
-                selectedIntegration.oauth.available &&
-                selectedIntegration.enabled
+                (selectedIntegration.provider === 'threads' ||
+                  selectedIntegration.enabled)
               "
               :data-testid="`integration-connect-${selectedIntegration.provider}`"
               variant="outline"
               size="sm"
               :loading="activeAction === 'connect'"
-              :disabled="activeAction !== null"
+              :disabled="
+                activeAction !== null ||
+                !selectedIntegration.enabled ||
+                !selectedIntegration.oauth.available ||
+                isThreadsReviewLocked
+              "
               @click="connectProvider"
             >
               <ExternalLink class="h-3.5 w-3.5" aria-hidden="true" />

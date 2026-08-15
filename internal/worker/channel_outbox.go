@@ -12,8 +12,10 @@ import (
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/threadsreview"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -330,7 +332,7 @@ func (w *Worker) deliverChannelOutboxJob(
 			if !threadsEntitled {
 				return errChannelOutboxThreadsUnlicensed
 			}
-			if err := validateThreadsChannelOutboxBinding(tx, orgID, &account); err != nil {
+			if err := validateThreadsChannelOutboxBinding(w.Config, tx, orgID, &account); err != nil {
 				return err
 			}
 		}
@@ -448,6 +450,7 @@ func (w *Worker) deliverChannelOutboxJob(
 }
 
 func validateThreadsChannelOutboxBinding(
+	cfg *config.Config,
 	tx *gorm.DB,
 	orgID uuid.UUID,
 	account *models.ChannelAccount,
@@ -473,6 +476,15 @@ func validateThreadsChannelOutboxBinding(
 	if integration.ThreadsAppID == nil || integrationAppID == "" || accountAppID == "" ||
 		strings.TrimSpace(*integration.ThreadsAppID) != integrationAppID ||
 		accountAppID != integrationAppID || len(account.Credentials) == 0 {
+		return errChannelOutboxThreadsBinding
+	}
+	if threadsreview.AccessMode(
+		cfg,
+		orgID,
+		integration.Config,
+		integrationAppID,
+		account.ExternalAccountID,
+	) == threadsreview.ModeBlocked {
 		return errChannelOutboxThreadsBinding
 	}
 	credentialAppID := strings.TrimSpace(channelOutboxText(account.Credentials[0].Metadata["app_id"]))
@@ -677,7 +689,7 @@ func (w *Worker) markChannelOutboxDispatching(
 				fencedAccount.Credentials[0].Kind != models.ChannelCredentialKindOAuth {
 				return errChannelOutboxThreadsBinding
 			}
-			if err := validateThreadsChannelOutboxBinding(tx, orgID, &fencedAccount); err != nil {
+			if err := validateThreadsChannelOutboxBinding(w.Config, tx, orgID, &fencedAccount); err != nil {
 				return err
 			}
 		}

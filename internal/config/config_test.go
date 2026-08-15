@@ -297,6 +297,82 @@ func TestLoad_EmptyConfigPathStillLoadsDefaults(t *testing.T) {
 	assert.Equal(t, 8080, cfg.Server.Port)
 }
 
+func TestLoad_ThreadsDevelopmentTestingGateIsExactAndNonProductionOnly(t *testing.T) {
+	t.Run("staging exact allowlist", func(t *testing.T) {
+		cfg, err := config.Load(writeConfig(t, `
+[app]
+environment = "staging"
+
+[threads_app_review]
+development_testing_enabled = true
+development_organization_id = "11111111-1111-4111-8111-111111111111"
+development_app_id = "123456789012345"
+development_profile_id = "987654321098765"
+`))
+		require.NoError(t, err)
+		assert.True(t, cfg.ThreadsAppReview.DevelopmentTestingEnabled)
+	})
+
+	for _, testCase := range []struct {
+		name    string
+		content string
+		message string
+	}{
+		{
+			name: "production rejects even a complete gate",
+			content: `
+[app]
+environment = "production"
+
+[threads_app_review]
+development_testing_enabled = true
+development_organization_id = "11111111-1111-4111-8111-111111111111"
+development_app_id = "123456789012345"
+development_profile_id = "987654321098765"
+`,
+			message: "forbidden in production",
+		},
+		{
+			name: "allowlist requires explicit enablement",
+			content: `
+[threads_app_review]
+development_organization_id = "11111111-1111-4111-8111-111111111111"
+development_app_id = "123456789012345"
+development_profile_id = "987654321098765"
+`,
+			message: "explicitly enabled",
+		},
+		{
+			name: "workspace must be canonical",
+			content: `
+[threads_app_review]
+development_testing_enabled = true
+development_organization_id = "11111111-1111-4111-8111-11111111111A"
+development_app_id = "123456789012345"
+development_profile_id = "987654321098765"
+`,
+			message: "canonical UUID",
+		},
+		{
+			name: "profile must be numeric",
+			content: `
+[threads_app_review]
+development_testing_enabled = true
+development_organization_id = "11111111-1111-4111-8111-111111111111"
+development_app_id = "123456789012345"
+development_profile_id = "profile-1"
+`,
+			message: "canonical numeric Meta IDs",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := config.Load(writeConfig(t, testCase.content))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), testCase.message)
+		})
+	}
+}
+
 func TestLoad_MissingFileReturnsError(t *testing.T) {
 	_, err := config.Load("/nonexistent/path/config.toml")
 	require.Error(t, err)

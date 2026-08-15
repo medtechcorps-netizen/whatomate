@@ -14,8 +14,10 @@ import (
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/threadsreview"
 	appwebsocket "github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -50,6 +52,7 @@ func (a *App) VerifyChannelWebhook(r *fastglue.Request) error {
 		account = *loaded
 		if account.Channel == models.ChannelThreads {
 			if loadErr = validateThreadsWebhookAccountBinding(
+				scoped.Config,
 				scoped.DB,
 				&account,
 				strings.TrimSpace(fmt.Sprint(account.Metadata["app_id"])),
@@ -167,7 +170,7 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 	if account.Channel == models.ChannelThreads {
 		threadsPayloadAppID = strings.TrimSpace(fmt.Sprint(hint.Metadata["app_id"]))
 		if err := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
-			return validateThreadsWebhookAccountBinding(tx, &account, threadsPayloadAppID)
+			return validateThreadsWebhookAccountBinding(a.Config, tx, &account, threadsPayloadAppID)
 		}); err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Webhook route does not match the dedicated Threads app", nil, "")
 		}
@@ -200,6 +203,7 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 	if err := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
 		if account.Channel == models.ChannelThreads {
 			currentAccount, bindingErr := lockThreadsWebhookPersistenceBinding(
+				a.Config,
 				tx,
 				orgID,
 				account.ID,
@@ -422,6 +426,7 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 }
 
 func validateThreadsWebhookAccountBinding(
+	cfg *config.Config,
 	tx *gorm.DB,
 	account *models.ChannelAccount,
 	payloadAppID string,
@@ -449,6 +454,15 @@ func validateThreadsWebhookAccountBinding(
 	if integration.ThreadsAppID == nil || strings.TrimSpace(*integration.ThreadsAppID) != payloadAppID {
 		return errors.New("threads webhook app is not bound to this workspace")
 	}
+	if threadsreview.AccessMode(
+		cfg,
+		account.OrganizationID,
+		integration.Config,
+		payloadAppID,
+		account.ExternalAccountID,
+	) == threadsreview.ModeBlocked {
+		return errThreadsWebhookBindingInactive
+	}
 
 	var accountCount int64
 	if err := tx.Model(&models.ChannelAccount{}).
@@ -473,6 +487,7 @@ func validateThreadsWebhookAccountBinding(
 // here makes disconnect, app rotation, OAuth rotation, and webhook acceptance
 // linearizable without holding a database lock during signature verification.
 func lockThreadsWebhookPersistenceBinding(
+	cfg *config.Config,
 	tx *gorm.DB,
 	organizationID, accountID uuid.UUID,
 	payloadAppID, expectedExternalAccountID string,
@@ -504,6 +519,15 @@ func lockThreadsWebhookPersistenceBinding(
 	configuredAppID := stringConfigValue(integration.Config, "app_id")
 	if integration.ThreadsAppID == nil || configuredAppID != payloadAppID ||
 		strings.TrimSpace(*integration.ThreadsAppID) != payloadAppID {
+		return nil, errThreadsWebhookBindingInactive
+	}
+	if threadsreview.AccessMode(
+		cfg,
+		organizationID,
+		integration.Config,
+		payloadAppID,
+		expectedExternalAccountID,
+	) == threadsreview.ModeBlocked {
 		return nil, errThreadsWebhookBindingInactive
 	}
 

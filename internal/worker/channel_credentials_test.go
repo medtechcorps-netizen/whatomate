@@ -101,6 +101,33 @@ func TestThreadsCredentialRefreshRejectsCredentialFromDifferentApp(t *testing.T)
 	assert.Zero(t, providerCalls)
 }
 
+func TestThreadsCredentialRefreshRejectsSeededLegacyEnabledPendingReviewBeforeProviderIO(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	now := time.Now().UTC()
+	fixture := createThreadsRefreshTestFixture(t, db, now.Add(time.Hour))
+	require.NoError(t, db.Model(&fixture.Integration).Updates(map[string]any{
+		"enabled": true,
+		"config": models.JSONB{
+			"app_id":            fixture.AppID,
+			"app_review_status": "pending",
+		},
+	}).Error)
+	providerCalls := 0
+
+	processed, err := threadsRefreshTestWorker(db).refreshThreadsCredentialWithProvider(
+		context.Background(),
+		fixture.Organization.ID,
+		now.Add(defaultThreadsCredentialRefreshWindow),
+		func(context.Context, *models.ChannelAccount) (channelapi.CredentialRefreshResult, error) {
+			providerCalls++
+			return channelapi.CredentialRefreshResult{}, nil
+		},
+	)
+	require.NoError(t, err)
+	assert.False(t, processed)
+	assert.Zero(t, providerCalls)
+}
+
 func TestThreadsCredentialRefreshReleasesClaimAfterProviderFailure(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	now := time.Now().UTC()
@@ -239,6 +266,51 @@ func TestThreadsCredentialRefreshAppChangeWinsDuringProviderIO(t *testing.T) {
 	assert.Empty(t, credentials[0].Metadata[threadsCredentialRefreshClaimTokenKey])
 	require.NoError(t, db.First(&fixture.Account, "id = ?", fixture.Account.ID).Error)
 	assert.Equal(t, newAppID, fixture.Account.Metadata["app_id"])
+}
+
+func TestThreadsCredentialRefreshReviewDowngradeDuringProviderIOCannotRotate(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	now := time.Now().UTC()
+	fixture := createThreadsRefreshTestFixture(t, db, now.Add(time.Hour))
+	worker := threadsRefreshTestWorker(db)
+	refreshedExpiry := now.Add(30 * 24 * time.Hour)
+	providerCalls := 0
+
+	processed, err := worker.refreshThreadsCredentialWithProvider(
+		context.Background(),
+		fixture.Organization.ID,
+		now.Add(defaultThreadsCredentialRefreshWindow),
+		func(context.Context, *models.ChannelAccount) (channelapi.CredentialRefreshResult, error) {
+			providerCalls++
+			require.NoError(t, db.Model(&fixture.Integration).Updates(map[string]any{
+				"enabled": true,
+				"config": models.JSONB{
+					"app_id":            fixture.AppID,
+					"app_review_status": "pending",
+				},
+			}).Error)
+			return channelapi.CredentialRefreshResult{
+				CredentialBlob: models.JSONB{"access_token": "must-not-be-stored"},
+				KeyVersion:     "app:v1",
+				ExpiresAt:      &refreshedExpiry,
+				Metadata:       models.JSONB{},
+			}, nil
+		},
+	)
+	require.NoError(t, err)
+	assert.True(t, processed)
+	assert.Equal(t, 1, providerCalls)
+
+	var credentials []models.ChannelCredential
+	require.NoError(t, db.Where(
+		"organization_id = ? AND channel_account_id = ?",
+		fixture.Organization.ID,
+		fixture.Account.ID,
+	).Find(&credentials).Error)
+	require.Len(t, credentials, 1)
+	assert.Equal(t, models.ChannelCredentialStatusActive, credentials[0].Status)
+	assert.NotEqual(t, "must-not-be-stored", credentials[0].CredentialBlob["access_token"])
+	assert.Empty(t, credentials[0].Metadata[threadsCredentialRefreshClaimTokenKey])
 }
 
 func TestThreadsCredentialRefreshConnectionChangesPreventStaleRotation(t *testing.T) {
@@ -380,7 +452,7 @@ func createThreadsRefreshTestFixture(
 		Provider:        channelapi.ThreadsProvider,
 		ThreadsAppID:    &appID,
 		Enabled:         true,
-		Config:          models.JSONB{"app_id": appID},
+		Config:          approvedThreadsWorkerTestConfig(t, models.JSONB{"app_id": appID}, appID),
 		CredentialData:  models.JSONB{},
 		ValidationToken: "",
 	}

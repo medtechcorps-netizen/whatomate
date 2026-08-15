@@ -36,6 +36,18 @@ type Config struct {
 	GoogleSearchConsole GoogleSearchConsoleConfig `koanf:"google_search_console"`
 	MetaRegistry        MetaRegistryConfig        `koanf:"meta_registry"`
 	MetaMessenger       MetaMessengerConfig       `koanf:"meta_messenger_onboarding"`
+	ThreadsAppReview    ThreadsAppReviewConfig    `koanf:"threads_app_review"`
+}
+
+// ThreadsAppReviewConfig is a deployment-owned escape hatch used only to
+// record Meta App Review demonstrations in a non-production environment. It
+// binds the exception to one workspace, one Meta app, and one app-role Threads
+// profile. Production must use server-recorded approval evidence instead.
+type ThreadsAppReviewConfig struct {
+	DevelopmentTestingEnabled bool   `koanf:"development_testing_enabled"`
+	DevelopmentOrganizationID string `koanf:"development_organization_id"`
+	DevelopmentAppID          string `koanf:"development_app_id"`
+	DevelopmentProfileID      string `koanf:"development_profile_id"`
 }
 
 // MetaRegistryConfig protects the private broker used by the isolated Meta
@@ -286,8 +298,36 @@ func Load(configPath string) (*Config, error) {
 	if err := validateMetaMessengerConfig(cfg.MetaMessenger, cfg.MetaRegistry, cfg.App.Environment, cfg.Server); err != nil {
 		return nil, err
 	}
+	if err := validateThreadsAppReviewConfig(cfg.ThreadsAppReview, cfg.App.Environment); err != nil {
+		return nil, err
+	}
 
 	return &cfg, nil
+}
+
+func validateThreadsAppReviewConfig(config ThreadsAppReviewConfig, environment string) error {
+	organizationID := strings.TrimSpace(config.DevelopmentOrganizationID)
+	appID := strings.TrimSpace(config.DevelopmentAppID)
+	profileID := strings.TrimSpace(config.DevelopmentProfileID)
+	configured := config.DevelopmentTestingEnabled || organizationID != "" || appID != "" || profileID != ""
+	production := strings.EqualFold(strings.TrimSpace(environment), "production")
+	if production && configured {
+		return errors.New("threads development testing gate is forbidden in production")
+	}
+	if !config.DevelopmentTestingEnabled {
+		if configured {
+			return errors.New("threads development testing must be explicitly enabled when its allowlist is configured")
+		}
+		return nil
+	}
+	if organizationID != config.DevelopmentOrganizationID || !canonicalUUID(organizationID) {
+		return errors.New("threads development organization_id must be a canonical UUID")
+	}
+	if appID != config.DevelopmentAppID || profileID != config.DevelopmentProfileID ||
+		!canonicalNumericMetaID(appID) || !canonicalNumericMetaID(profileID) {
+		return errors.New("threads development app_id and profile_id must be canonical numeric Meta IDs")
+	}
+	return nil
 }
 
 func validateMetaRegistryConfig(config MetaRegistryConfig, messenger MetaMessengerConfig, app AppConfig) error {

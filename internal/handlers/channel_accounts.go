@@ -703,6 +703,17 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			if account.Provider == channelapi.LegacyMetaProvider {
 				return nil
 			}
+			if account.Channel == models.ChannelThreads {
+				if bindingErr := validateThreadsWebhookAccountBinding(
+					a.Config,
+					tx,
+					account,
+					stringConfigValue(account.Metadata, "app_id"),
+				); bindingErr != nil {
+					adapterErr = bindingErr
+					return nil
+				}
+			}
 			adapter, adapterErr = a.channelAdapter(account)
 			if adapterErr != nil {
 				return nil
@@ -774,6 +785,16 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			currentAccount, err := loadChannelAccount(tx, orgID, account.ID, true)
 			if err != nil {
 				return err
+			}
+			if currentAccount.Channel == models.ChannelThreads {
+				if err := validateThreadsWebhookAccountBinding(
+					a.Config,
+					tx,
+					currentAccount,
+					stringConfigValue(currentAccount.Metadata, "app_id"),
+				); err != nil {
+					return ErrChannelAccountChangedDuringValidation
+				}
 			}
 			if !channelAccountValidationTokenMatches(
 				currentAccount,
@@ -1054,7 +1075,10 @@ func (a *App) channelAdapter(account *models.ChannelAccount) (channelapi.Adapter
 		if !strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
 			return nil, fmt.Errorf("%w: Threads account is not OAuth-managed", ErrChannelAdapterUnavailable)
 		}
-		appSecret, verifyToken, err := a.threadsWebhookCredentials(account.OrganizationID)
+		appSecret, verifyToken, err := a.threadsWebhookCredentials(
+			account.OrganizationID,
+			account.ExternalAccountID,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("%w: Threads app credentials are unavailable", ErrChannelAdapterUnavailable)
 		}

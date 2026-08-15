@@ -345,7 +345,7 @@ func TestChannelOutboxRejectsMismatchedThreadsAppBinding(t *testing.T) {
 		Provider:       channelapi.ThreadsProvider,
 		ThreadsAppID:   &appID,
 		Enabled:        true,
-		Config:         models.JSONB{"app_id": configuredAppID},
+		Config:         approvedThreadsWorkerTestConfig(t, models.JSONB{"app_id": configuredAppID}, configuredAppID),
 		CredentialData: models.JSONB{},
 	}).Error)
 	enableChannelAIReplyOmnichannel(t, db, org.ID)
@@ -617,6 +617,80 @@ func TestThreadsDispatchFencePublishesWithCurrentCredentialSnapshot(t *testing.T
 	assert.Equal(t, 1, sender.publishCalls)
 	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
 	assert.Equal(t, models.OutboxJobStatusSent, job.Status)
+}
+
+func TestThreadsDispatchFenceRejectsSeededLegacyEnabledPendingReview(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	account, _, _, job := createChannelOutboxTestFixture(
+		t,
+		db,
+		organization.ID,
+		"threads-pending-review-worker",
+	)
+	configureThreadsDispatchFenceFixture(t, db, organization.ID, account, job, "current-token")
+	var integration models.ProviderIntegration
+	require.NoError(t, db.Where(
+		"organization_id = ? AND provider = ?",
+		organization.ID,
+		channelapi.ThreadsProvider,
+	).First(&integration).Error)
+	require.NoError(t, db.Model(&integration).Updates(map[string]any{
+		"enabled": true,
+		"config": models.JSONB{
+			"app_id":            *integration.ThreadsAppID,
+			"app_review_status": "pending",
+		},
+	}).Error)
+
+	worker := &Worker{DB: db, Log: testutil.NopLogger()}
+	_, err := worker.markChannelOutboxDispatching(
+		organization.ID,
+		job.ID,
+		account.ID,
+		job.LockedBy,
+	)
+	require.ErrorIs(t, err, errChannelOutboxThreadsBinding)
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusProcessing, job.Status)
+}
+
+func TestThreadsOutboundRejectsSeededLegacyEnabledPendingReviewBeforeAdapter(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	account, _, message, job := createChannelOutboxTestFixture(
+		t,
+		db,
+		organization.ID,
+		"threads-pending-review-initial-worker",
+	)
+	configureThreadsDispatchFenceFixture(t, db, organization.ID, account, job, "current-token")
+	var integration models.ProviderIntegration
+	require.NoError(t, db.Where(
+		"organization_id = ? AND provider = ?",
+		organization.ID,
+		channelapi.ThreadsProvider,
+	).First(&integration).Error)
+	require.NoError(t, db.Model(&integration).Updates(map[string]any{
+		"enabled": true,
+		"config": models.JSONB{
+			"app_id":            *integration.ThreadsAppID,
+			"app_review_status": "pending",
+		},
+	}).Error)
+
+	worker := &Worker{DB: db, Log: testutil.NopLogger()}
+	require.NoError(t, worker.deliverChannelOutboxJob(
+		context.Background(),
+		organization.ID,
+		job.ID,
+		job.LockedBy,
+	))
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusFailed, job.Status)
+	assert.Contains(t, job.LastError, "threads app binding")
+	require.NoError(t, db.First(message, "id = ?", message.ID).Error)
+	assert.Equal(t, models.MessageStatusFailed, message.Status)
 }
 
 func TestChannelOutboxResolvesThreadsAdapter(t *testing.T) {
@@ -1301,7 +1375,7 @@ func configureThreadsDispatchFenceFixture(
 		Provider:       channelapi.ThreadsProvider,
 		ThreadsAppID:   &appID,
 		Enabled:        true,
-		Config:         models.JSONB{"app_id": appID},
+		Config:         approvedThreadsWorkerTestConfig(t, models.JSONB{"app_id": appID}, appID),
 		CredentialData: models.JSONB{},
 	}).Error)
 	enableChannelAIReplyOmnichannel(t, db, orgID)

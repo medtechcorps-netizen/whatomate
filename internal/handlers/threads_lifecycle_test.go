@@ -283,6 +283,30 @@ func TestThreadsDeauthorizeDisconnectsOnlySignedAccountAndFencesReplay(t *testin
 	assert.Equal(t, "new-encrypted-token", targetOAuth.CredentialBlob["access_token"])
 }
 
+func TestThreadsDeauthorizeRemainsAvailableWhenReviewIsPendingAndIntegrationDisabled(t *testing.T) {
+	fixture := newThreadsLifecycleFixture(t, true)
+	require.NoError(t, fixture.App.DB.Model(&models.ProviderIntegration{}).
+		Where("id = ?", fixture.Integration.ID).
+		Updates(map[string]any{
+			"enabled": false,
+			"config": models.JSONB{
+				"app_id":            fixture.AppID,
+				"redirect_uri":      "https://app.example.test/api/integrations/threads/callback",
+				"app_review_status": "pending",
+			},
+		}).Error)
+	signed := signThreadsLifecyclePayload(t, map[string]any{
+		"algorithm": "HMAC-SHA256",
+		"issued_at": time.Now().UTC().Unix(),
+		"user_id":   fixture.Target.ExternalAccountID,
+	}, fixture.Secret, false)
+	request := newThreadsLifecyclePOSTRequest(t, fixture.Organization.ID, signed)
+	require.NoError(t, fixture.App.DeauthorizeThreads(request))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+	require.NoError(t, fixture.App.DB.First(&fixture.Target, "id = ?", fixture.Target.ID).Error)
+	assert.Equal(t, models.ChannelAccountStatusDisconnected, fixture.Target.Status)
+}
+
 func TestThreadsDeauthorizeIgnoresDelayedFirstDeliveryAfterReconnect(t *testing.T) {
 	fixture := newThreadsLifecycleFixture(t, true)
 	issuedAt := time.Now().UTC().Add(-10 * time.Minute).Unix()
@@ -535,10 +559,10 @@ func newThreadsLifecycleFixture(t *testing.T, withAccounts bool) threadsLifecycl
 		Provider:       integrationProviderThreads,
 		ThreadsAppID:   &appID,
 		Enabled:        true,
-		Config: models.JSONB{
+		Config: approvedThreadsTestConfig(t, models.JSONB{
 			"app_id":       appID,
 			"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
-		},
+		}, appID),
 		CredentialData: models.JSONB{
 			"app_secret":           encryptedSecret,
 			"webhook_verify_token": encryptedVerifyToken,

@@ -10,8 +10,10 @@ import (
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/threadsreview"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -269,7 +271,13 @@ func (w *Worker) claimThreadsCredentialRefresh(
 		}
 
 		appID := threadsRefreshJSONBString(account.Metadata, "app_id")
-		bindingActive, err := activeThreadsRefreshIntegrationBinding(tx, orgID, appID)
+		bindingActive, err := activeThreadsRefreshIntegrationBinding(
+			w.Config,
+			tx,
+			orgID,
+			appID,
+			account.ExternalAccountID,
+		)
 		if err != nil {
 			return err
 		}
@@ -370,9 +378,11 @@ func (w *Worker) finalizeThreadsCredentialRefresh(
 
 		accountAppID := threadsRefreshJSONBString(account.Metadata, "app_id")
 		bindingActive, err := activeThreadsRefreshIntegrationBinding(
+			w.Config,
 			tx,
 			claim.OrganizationID,
 			accountAppID,
+			account.ExternalAccountID,
 		)
 		if err != nil {
 			return err
@@ -479,9 +489,10 @@ func (w *Worker) finalizeThreadsCredentialRefresh(
 }
 
 func activeThreadsRefreshIntegrationBinding(
+	cfg *config.Config,
 	tx *gorm.DB,
 	organizationID uuid.UUID,
-	expectedAppID string,
+	expectedAppID, expectedProfileID string,
 ) (bool, error) {
 	expectedAppID = strings.TrimSpace(expectedAppID)
 	if expectedAppID == "" {
@@ -503,7 +514,16 @@ func activeThreadsRefreshIntegrationBinding(
 	if integration.ThreadsAppID == nil || strings.TrimSpace(*integration.ThreadsAppID) != expectedAppID {
 		return false, nil
 	}
-	return threadsRefreshJSONBString(integration.Config, "app_id") == expectedAppID, nil
+	if threadsRefreshJSONBString(integration.Config, "app_id") != expectedAppID {
+		return false, nil
+	}
+	return threadsreview.AccessMode(
+		cfg,
+		organizationID,
+		integration.Config,
+		expectedAppID,
+		expectedProfileID,
+	) != threadsreview.ModeBlocked, nil
 }
 
 func validateThreadsCredentialRefreshResult(
