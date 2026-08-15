@@ -417,16 +417,18 @@ func TestMetaMessengerTokenInspectionUsesExactScopesForGraphEdges(t *testing.T) 
 		t.Run(testCase.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				require.Equal(t, "/v25.0/debug_token", request.URL.Path)
-				require.Equal(t, http.MethodPost, request.Method)
-				require.NoError(t, request.ParseForm())
-				assert.Equal(t, "user-token", request.Form.Get("input_token"))
+				require.Equal(t, http.MethodGet, request.Method)
 				appAccessToken := metaLifecycleTestAppID + "|" + metaLifecycleTestAppSecret
 				assert.Equal(t, "Bearer "+appAccessToken, request.Header.Get("Authorization"))
 				mac := hmac.New(sha256.New, []byte(metaLifecycleTestAppSecret))
 				_, _ = mac.Write([]byte(appAccessToken))
-				assert.Equal(t, hex.EncodeToString(mac.Sum(nil)), request.Form.Get("appsecret_proof"))
-				assert.Empty(t, request.URL.RawQuery)
-				assert.NotContains(t, request.URL.String(), "user-token")
+				query := request.URL.Query()
+				require.Len(t, query, 2)
+				assert.Equal(t, "user-token", query.Get("input_token"))
+				assert.Equal(t, hex.EncodeToString(mac.Sum(nil)), query.Get("appsecret_proof"))
+				assert.Empty(t, query.Get("access_token"))
+				assert.Equal(t, http.NoBody, request.Body)
+				assert.NotContains(t, request.URL.String(), appAccessToken)
 				assert.NotContains(t, request.URL.String(), metaLifecycleTestAppSecret)
 				writer.Header().Set("Content-Type", "application/json")
 				_ = json.NewEncoder(writer).Encode(map[string]any{"data": map[string]any{
@@ -703,6 +705,7 @@ func TestMetaMessengerScheduledRevalidationChecksExactPageAndSubscription(t *tes
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/v25.0/debug_token":
+			require.Equal(t, http.MethodGet, request.Method)
 			if request.URL.Query().Get("input_token") == "page-token" {
 				_, _ = writer.Write([]byte(`{"data":{"is_valid":true,"app_id":"100000000000001","type":"PAGE","user_id":"700000000000001"}}`))
 				return
