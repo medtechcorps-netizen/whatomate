@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/services/api";
 import {
   MetaMessengerAuthorizationCancelledError,
+  MetaMessengerAuthorizationFailedError,
   MetaMessengerOrganizationChangedError,
   metaMessengerOnboarding,
   type MetaMessengerSelection,
@@ -53,10 +54,20 @@ function response<T>(data: T) {
 }
 
 function installFacebookLogin(afterCallback?: () => void) {
+  installFacebookLoginResponse(
+    { authResponse: { code: "authorization-code" }, status: "connected" },
+    afterCallback,
+  );
+}
+
+function installFacebookLoginResponse(
+  loginResponse: unknown,
+  afterCallback?: () => void,
+) {
   (window as any).FB = {
     init: vi.fn(),
     login: vi.fn((callback: (value: unknown) => void) => {
-      callback({ authResponse: { code: "authorization-code" } });
+      callback(loginResponse);
       afterCallback?.();
     }),
   };
@@ -66,6 +77,7 @@ describe("metaMessengerOnboarding organization pinning", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.setItem("selected_organization_id", organizationB);
+    document.getElementById("facebook-jssdk")?.remove();
     installFacebookLogin();
   });
 
@@ -106,6 +118,51 @@ describe("metaMessengerOnboarding organization pinning", () => {
         timeout: 120_000,
       });
     }
+    expect(vi.mocked(api.post).mock.calls[1]?.[1]).toEqual({
+      code: "authorization-code",
+      nonce: start.nonce,
+    });
+  });
+
+  it("treats Meta's explicit unknown/null response as authorization cancellation", async () => {
+    installFacebookLoginResponse({ authResponse: null, status: "unknown" });
+    vi.mocked(api.post).mockImplementation((url: string) => {
+      if (url.endsWith("/start")) return response(start) as any;
+      throw new Error("the callback must not be sent after cancellation");
+    });
+
+    await expect(
+      metaMessengerOnboarding.begin(organizationA, () => true),
+    ).rejects.toBeInstanceOf(MetaMessengerAuthorizationCancelledError);
+    expect(api.post).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a sanitized provider failure when Meta completes without a code", async () => {
+    installFacebookLoginResponse({
+      authResponse: {},
+      status: "connected",
+      error_type: "OAuthException",
+      error_code: 200,
+      error_message: "private provider detail <token-like-value>",
+    });
+    vi.mocked(api.post).mockImplementation((url: string) => {
+      if (url.endsWith("/start")) return response(start) as any;
+      throw new Error("the callback must not be sent without a code");
+    });
+
+    const failure = await metaMessengerOnboarding
+      .begin(organizationA, () => true)
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(MetaMessengerAuthorizationFailedError);
+    expect((failure as Error).message).toContain(
+      "Facebook completed without returning the required authorization code",
+    );
+    expect((failure as Error).message).toContain("status: connected");
+    expect((failure as Error).message).toContain("error type: OAuthException");
+    expect((failure as Error).message).toContain("error code: 200");
+    expect((failure as Error).message).not.toContain("private provider detail");
+    expect((failure as Error).message).not.toContain("token-like-value");
+    expect(api.post).toHaveBeenCalledTimes(1);
   });
 
   it("detaches after a workspace switch before sending the authorization code", async () => {
@@ -217,7 +274,7 @@ describe("metaMessengerOnboarding organization pinning", () => {
 
       const result = metaMessengerOnboarding.begin(organizationA, () => true);
       const rejection = expect(result).rejects.toBeInstanceOf(
-        MetaMessengerAuthorizationCancelledError,
+        MetaMessengerAuthorizationFailedError,
       );
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(90_000);
@@ -255,5 +312,54 @@ describe("metaMessengerOnboarding organization pinning", () => {
     facebookCallback?.({ authResponse: { code: "late-code" } });
     await Promise.resolve();
     expect(api.post).toHaveBeenCalledTimes(1);
+  });
+
+  it("removes a stale SDK element after timeout so a retry can load cleanly", async () => {
+    vi.useFakeTimers();
+    let appendSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      delete (window as any).FB;
+      const staleScript = document.createElement("script");
+      staleScript.id = "facebook-jssdk";
+      document.head.appendChild(staleScript);
+      vi.mocked(api.post).mockImplementation((url: string) => {
+        if (url.endsWith("/start")) return response(start) as any;
+        if (url.endsWith("/callback")) return response(selection()) as any;
+        throw new Error(`unexpected request ${url}`);
+      });
+
+      const firstAttempt = metaMessengerOnboarding.begin(
+        organizationA,
+        () => true,
+      );
+      const firstRejection = expect(firstAttempt).rejects.toThrow(
+        "Facebook login took too long to load",
+      );
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(15_000);
+      await firstRejection;
+      expect(document.getElementById("facebook-jssdk")).toBeNull();
+
+      const appendedSDK: { current: HTMLScriptElement | null } = {
+        current: null,
+      };
+      appendSpy = vi
+        .spyOn(document.head, "appendChild")
+        .mockImplementation((node: Node) => {
+          appendedSDK.current = node as HTMLScriptElement;
+          return node;
+        });
+      const retry = metaMessengerOnboarding.begin(organizationA, () => true);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(appendedSDK.current?.id).toBe("facebook-jssdk");
+      installFacebookLogin();
+      (window as any).fbAsyncInit?.();
+      await expect(retry).resolves.toEqual(selection());
+    } finally {
+      appendSpy?.mockRestore();
+      document.getElementById("facebook-jssdk")?.remove();
+      vi.useRealTimers();
+    }
   });
 });

@@ -55,14 +55,30 @@ export class MetaMessengerAuthorizationCancelledError extends Error {
   }
 }
 
+export class MetaMessengerAuthorizationFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MetaMessengerAuthorizationFailedError";
+  }
+}
+
+type FacebookLoginResponse = {
+  authResponse?: { code?: unknown } | null;
+  status?: unknown;
+  error?: unknown;
+  error_type?: unknown;
+  error_code?: unknown;
+  error_reason?: unknown;
+  error_description?: unknown;
+  error_message?: unknown;
+  message?: unknown;
+};
+
 type FacebookWindow = {
   FB?: {
     init(options: Record<string, unknown>): void;
     login(
-      callback: (response: {
-        authResponse?: { code?: string };
-        status?: string;
-      }) => void,
+      callback: (response: FacebookLoginResponse | null | undefined) => void,
       options: Record<string, unknown>,
     ): void;
   };
@@ -73,6 +89,67 @@ const facebookWindow = window as unknown as FacebookWindow;
 let sdkPromise: Promise<NonNullable<FacebookWindow["FB"]>> | null = null;
 const providerRequestTimeout = 120_000;
 const facebookAuthorizationTimeout = 90_000;
+const facebookSDKLoadTimeout = 15_000;
+const facebookSDKElementID = "facebook-jssdk";
+
+const safeProviderDetailPattern = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
+
+function safeProviderDetail(value: unknown) {
+  if (typeof value !== "string" && typeof value !== "number") return "";
+  const candidate = String(value).trim();
+  return safeProviderDetailPattern.test(candidate) ? candidate : "";
+}
+
+function providerErrorRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function hasProviderErrorMarker(response: FacebookLoginResponse) {
+  return [
+    "error",
+    "error_type",
+    "error_code",
+    "error_reason",
+    "error_description",
+    "error_message",
+    "message",
+  ].some((key) => Object.prototype.hasOwnProperty.call(response, key));
+}
+
+function isFacebookAuthorizationCancellation(response: FacebookLoginResponse) {
+  return (
+    response.authResponse === null &&
+    safeProviderDetail(response.status).toLowerCase() === "unknown" &&
+    !hasProviderErrorMarker(response)
+  );
+}
+
+function facebookAuthorizationFailure(response: FacebookLoginResponse) {
+  const providerError = providerErrorRecord(response.error);
+  const status = safeProviderDetail(response.status);
+  const errorType =
+    safeProviderDetail(response.error_type) ||
+    safeProviderDetail(providerError?.type) ||
+    safeProviderDetail(response.error_reason) ||
+    (typeof response.error === "string"
+      ? safeProviderDetail(response.error)
+      : "");
+  const errorCode =
+    safeProviderDetail(response.error_code) ||
+    safeProviderDetail(providerError?.code);
+  const details = [
+    status ? `status: ${status}` : "",
+    errorType ? `error type: ${errorType}` : "",
+    errorCode ? `error code: ${errorCode}` : "",
+  ].filter(Boolean);
+  const suffix = details.length > 0 ? ` (${details.join("; ")})` : "";
+  return new MetaMessengerAuthorizationFailedError(
+    "Facebook completed without returning the required authorization code. " +
+      "Retry the connection; if it happens again, ask an administrator to verify the Login for Business configuration." +
+      suffix,
+  );
+}
 
 function loadFacebookSDK(appId: string, version: string) {
   if (facebookWindow.FB) {
@@ -82,34 +159,57 @@ function loadFacebookSDK(appId: string, version: string) {
   if (sdkPromise) return sdkPromise;
   const pending = new Promise<NonNullable<FacebookWindow["FB"]>>(
     (resolve, reject) => {
-      const timeout = window.setTimeout(
-        () => reject(new Error("Facebook login took too long to load")),
-        15_000,
-      );
       const previousInit = facebookWindow.fbAsyncInit;
-      facebookWindow.fbAsyncInit = () => {
+      let settled = false;
+      let timeout = 0;
+      const restoreInit = () => {
+        if (facebookWindow.fbAsyncInit === initHandler) {
+          facebookWindow.fbAsyncInit = previousInit;
+        }
+      };
+      const finish = (action: () => void) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        restoreInit();
+        action();
+      };
+      const removeStaleSDKElement = () => {
+        if (!facebookWindow.FB) {
+          // A previously loaded or failed SDK element will never fire
+          // fbAsyncInit again. Remove only this reserved element so the next
+          // attempt can perform a fresh load instead of repeating the same
+          // timeout forever.
+          document.getElementById(facebookSDKElementID)?.remove();
+        }
+      };
+      const initHandler = () => {
         previousInit?.();
         const fb = facebookWindow.FB;
         if (!fb) {
-          window.clearTimeout(timeout);
-          reject(new Error("Facebook login is unavailable"));
+          removeStaleSDKElement();
+          finish(() => reject(new Error("Facebook login is unavailable")));
           return;
         }
         fb.init({ appId, cookie: true, xfbml: false, version });
-        window.clearTimeout(timeout);
-        resolve(fb);
+        finish(() => resolve(fb));
       };
-      const existing = document.getElementById("facebook-jssdk");
+      facebookWindow.fbAsyncInit = initHandler;
+      timeout = window.setTimeout(() => {
+        removeStaleSDKElement();
+        finish(() => reject(new Error("Facebook login took too long to load")));
+      }, facebookSDKLoadTimeout);
+      const existing = document.getElementById(facebookSDKElementID);
       if (existing) return;
       const script = document.createElement("script");
-      script.id = "facebook-jssdk";
+      script.id = facebookSDKElementID;
       script.async = true;
       script.defer = true;
       script.crossOrigin = "anonymous";
       script.src = "https://connect.facebook.net/en_US/sdk.js";
       script.onerror = () => {
-        window.clearTimeout(timeout);
-        reject(new Error("Facebook login could not be loaded"));
+        removeStaleSDKElement();
+        finish(() => reject(new Error("Facebook login could not be loaded")));
       };
       document.head.appendChild(script);
     },
@@ -171,8 +271,8 @@ function waitForFacebookAuthorization(
       () =>
         finish(() =>
           reject(
-            new MetaMessengerAuthorizationCancelledError(
-              "Facebook authorization timed out or the popup was closed",
+            new MetaMessengerAuthorizationFailedError(
+              "Facebook authorization timed out before a result was returned. Retry and keep the Facebook window open until it finishes.",
             ),
           ),
         ),
@@ -186,16 +286,24 @@ function waitForFacebookAuthorization(
     fb.login(
       (response) => {
         if (settled || signal?.aborted) return;
-        const value = response.authResponse?.code?.trim();
+        const safeResponse =
+          response && typeof response === "object" ? response : {};
+        const value =
+          typeof safeResponse.authResponse?.code === "string"
+            ? safeResponse.authResponse.code.trim()
+            : "";
         if (value) finish(() => resolve(value));
-        else
+        else if (isFacebookAuthorizationCancellation(safeResponse)) {
           finish(() =>
             reject(
               new MetaMessengerAuthorizationCancelledError(
-                "Facebook authorization was cancelled or did not return a code",
+                "Facebook authorization was cancelled",
               ),
             ),
           );
+        } else {
+          finish(() => reject(facebookAuthorizationFailure(safeResponse)));
+        }
       },
       {
         config_id: start.public_config.config_id,
