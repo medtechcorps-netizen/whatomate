@@ -32,6 +32,7 @@ import (
 
 const (
 	metaLifecycleTestAppID         = "100000000000001"
+	metaLifecycleTestConfigID      = "300000000000001"
 	metaLifecycleTestAppSecret     = "server-only-meta-lifecycle-test-secret-at-least-32-bytes"
 	metaLifecycleTestBusinessID    = "200000000000001"
 	metaLifecycleTestPageID        = "700000000000001"
@@ -66,7 +67,7 @@ func newMetaLifecycleGraphApp(t *testing.T, server *httptest.Server) *App {
 			App:          configpkg.AppConfig{Environment: "test", EncryptionKey: metaLifecycleTestEncryptionKey},
 			MetaRegistry: configpkg.MetaRegistryConfig{Enabled: true},
 			MetaMessenger: configpkg.MetaMessengerConfig{
-				Enabled: true, AppID: metaLifecycleTestAppID, ConfigID: "1720929458946813",
+				Enabled: true, AppID: metaLifecycleTestAppID, ConfigID: metaLifecycleTestConfigID,
 				AppSecret: metaLifecycleTestAppSecret, GraphAPIVersion: "v25.0",
 				GraphBaseURL: "https://graph.meta.test", ReReplyBaseURL: "https://app.example.test",
 				RelayBaseURL: "https://relay.example.test", AllowDevelopmentUserToken: true,
