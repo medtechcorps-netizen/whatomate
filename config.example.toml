@@ -197,6 +197,16 @@ allowed_organization_ids = ""  # Pilot: one canonical UUID; never a clinic name.
 allow_all_organizations = false # External release only after Live + Advanced Access evidence.
 allow_development_user_token = false # Non-production testing only; production requires BISU/SYSTEM_USER.
 
+# Meta App Review recording gate for Threads. Leave this entire gate disabled
+# in production; startup rejects any production deployment that configures it.
+# Non-production testing must bind one exact workspace, Threads App ID, and
+# app-role Threads profile ID. It does not create production approval evidence.
+[threads_app_review]
+development_testing_enabled = false
+development_organization_id = ""
+development_app_id = ""
+development_profile_id = ""
+
 # Default admin credentials (only used during initial setup when no users exist)
 [default_admin]
 email = "admin@rereply.app"

@@ -970,6 +970,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		"/api/admin/organizations/{target_organization_id}/entitlements/threads-public-engagement/enable",
 		app.EnableOrganizationThreadsPublicEngagement,
 	)
+	g.POST(
+		"/api/admin/organizations/{target_organization_id}/integrations/threads/app-review/approve",
+		app.ApproveOrganizationThreadsAppReview,
+	)
 	g.GET(
 		"/api/admin/organizations/{target_organization_id}/entitlements/threads-public-engagement/support-status",
 		app.GetOrganizationThreadsPublicEngagementSupportStatus,

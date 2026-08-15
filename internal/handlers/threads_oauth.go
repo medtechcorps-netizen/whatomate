@@ -19,6 +19,7 @@ import (
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/threadsreview"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
@@ -57,6 +58,8 @@ type threadsIntegrationSnapshot struct {
 	RedirectURI        string
 	EncryptedAppSecret string
 	AppSecret          string
+	ReviewAccessMode   string
+	ExpectedProfileID  string
 	Fingerprint        string
 }
 
@@ -171,6 +174,22 @@ func (a *App) startThreadsOAuth(r *fastglue.Request, orgID, userID uuid.UUID) er
 	}
 	snapshot, err := a.loadThreadsIntegrationSnapshot(orgID, true)
 	if err != nil {
+		if errors.Is(err, errThreadsAppReviewApprovalRequired) {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusConflict,
+				"Meta App Review approval is required before Threads OAuth can start",
+				map[string]any{
+					"provider": integrationProviderThreads,
+					"status":   integrationStatusApprovalNeeded,
+					"oauth": integrationOAuthResponse{
+						Supported: true,
+						Available: false,
+						Mode:      "oauth",
+					},
+				},
+				"",
+			)
+		}
 		if errors.Is(err, errThreadsOAuthNotConfigured) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Enable Threads and configure its App ID, redirect URI, and App Secret first", nil, "")
 		}
@@ -235,13 +254,6 @@ func (a *App) CallbackThreads(r *fastglue.Request) error {
 		a.redirectThreadsCallback(r, "error")
 		return nil
 	}
-	orgID, orgErr := uuid.Parse(state.OrganizationID)
-	userID, userErr := uuid.Parse(state.UserID)
-	integrationID, integrationErr := uuid.Parse(state.IntegrationID)
-	if orgErr != nil || userErr != nil || integrationErr != nil || orgID == uuid.Nil || userID == uuid.Nil || integrationID == uuid.Nil {
-		a.redirectThreadsCallback(r, "error")
-		return nil
-	}
 	if providerError := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("error"))); providerError != "" {
 		a.redirectThreadsCallback(r, "cancelled")
 		return nil
@@ -252,8 +264,39 @@ func (a *App) CallbackThreads(r *fastglue.Request) error {
 		return nil
 	}
 
+	err = a.completeThreadsOAuth(state, code)
+	if err != nil {
+		if errors.Is(err, errThreadsAppReviewApprovalRequired) {
+			a.redirectThreadsCallback(r, integrationStatusApprovalNeeded)
+			return nil
+		}
+		a.Log.Error("Threads OAuth completion failed", "error", err, "organization_id", state.OrganizationID)
+		a.redirectThreadsCallback(r, "error")
+		return nil
+	}
+	a.redirectThreadsCallback(r, "connected")
+	return nil
+}
+
+// completeThreadsOAuth deliberately performs every tenant-local gate before
+// the first Meta request. It is split from the public callback so the
+// fail-closed, zero-provider-I/O behavior can be tested without Redis.
+func (a *App) completeThreadsOAuth(state threadsOAuthState, code string) error {
+	orgID, orgErr := uuid.Parse(state.OrganizationID)
+	userID, userErr := uuid.Parse(state.UserID)
+	integrationID, integrationErr := uuid.Parse(state.IntegrationID)
+	if orgErr != nil || userErr != nil || integrationErr != nil || orgID == uuid.Nil ||
+		userID == uuid.Nil || integrationID == uuid.Nil ||
+		strings.TrimSpace(state.IntegrationFingerprint) == "" {
+		return errThreadsOAuthForbidden
+	}
+	code = strings.TrimSpace(code)
+	if code == "" || len(code) > 8192 {
+		return errThreadsOAuthForbidden
+	}
+
 	var snapshot threadsIntegrationSnapshot
-	err = a.WithTenantApp(orgID, func(scoped *App) error {
+	err := a.WithTenantApp(orgID, func(scoped *App) error {
 		if !scoped.HasPermission(userID, models.ResourceSettingsIntegrations, models.ActionWrite, orgID) {
 			return errThreadsOAuthForbidden
 		}
@@ -272,23 +315,36 @@ func (a *App) CallbackThreads(r *fastglue.Request) error {
 		return nil
 	})
 	if err != nil {
-		a.redirectThreadsCallback(r, "error")
-		return nil
+		return err
 	}
 
 	exchangeCtx, exchangeCancel := context.WithTimeout(context.Background(), threadsOAuthHTTPTimeout)
 	defer exchangeCancel()
 	shortToken, err := a.exchangeThreadsAuthorizationCode(exchangeCtx, snapshot, code)
 	if err != nil {
-		a.Log.Error("Threads OAuth code exchange failed", "error", err, "organization_id", orgID)
-		a.redirectThreadsCallback(r, "error")
-		return nil
+		return err
+	}
+	if snapshot.ReviewAccessMode == threadsreview.ModeDevelopmentTesting &&
+		strings.TrimSpace(string(shortToken.UserID)) != snapshot.ExpectedProfileID {
+		return errThreadsOAuthForbidden
 	}
 	longToken, err := a.exchangeThreadsLongLivedToken(exchangeCtx, snapshot.AppSecret, shortToken.AccessToken)
 	if err != nil {
-		a.Log.Error("Threads long-lived token exchange failed", "error", err, "organization_id", orgID)
-		a.redirectThreadsCallback(r, "error")
-		return nil
+		return err
+	}
+	profile, err := a.fetchThreadsProfile(exchangeCtx, longToken.AccessToken)
+	if err != nil || strings.TrimSpace(string(profile.ID)) == "" {
+		if err != nil {
+			return err
+		}
+		return errors.New("threads profile discovery returned no account")
+	}
+	if shortID := strings.TrimSpace(string(shortToken.UserID)); shortID != "" && shortID != strings.TrimSpace(string(profile.ID)) {
+		return errors.New("threads profile does not match the authorization")
+	}
+	if snapshot.ReviewAccessMode == threadsreview.ModeDevelopmentTesting &&
+		strings.TrimSpace(string(profile.ID)) != snapshot.ExpectedProfileID {
+		return errThreadsOAuthForbidden
 	}
 	permissionAdapter := channelapi.NewThreadsAdapter(a.HTTPClient, a.integrationEncryptionKey())
 	permissions, err := permissionAdapter.InspectTokenPermissions(
@@ -297,30 +353,17 @@ func (a *App) CallbackThreads(r *fastglue.Request) error {
 		strings.TrimSpace(string(shortToken.UserID)),
 	)
 	if err != nil {
-		a.Log.Error("Threads OAuth permission verification failed", "organization_id", orgID)
-		a.redirectThreadsCallback(r, "error")
-		return nil
-	}
-	profile, err := a.fetchThreadsProfile(exchangeCtx, longToken.AccessToken)
-	if err != nil || strings.TrimSpace(string(profile.ID)) == "" {
-		a.Log.Error("Threads profile discovery failed", "organization_id", orgID)
-		a.redirectThreadsCallback(r, "error")
-		return nil
-	}
-	if shortID := strings.TrimSpace(string(shortToken.UserID)); shortID != "" && shortID != strings.TrimSpace(string(profile.ID)) {
-		a.redirectThreadsCallback(r, "error")
-		return nil
+		return err
 	}
 	if longToken.ExpiresIn <= 0 {
 		longToken.ExpiresIn = 60 * 24 * 60 * 60
 	}
 	encryptedToken, err := appcrypto.Encrypt(strings.TrimSpace(longToken.AccessToken), a.integrationEncryptionKey())
 	if err != nil || !appcrypto.IsEncrypted(encryptedToken) {
-		a.redirectThreadsCallback(r, "error")
-		return nil
+		return errors.New("threads authorization could not be protected")
 	}
 
-	err = a.WithTenantApp(orgID, func(scoped *App) error {
+	return a.WithTenantApp(orgID, func(scoped *App) error {
 		if !scoped.HasPermission(userID, models.ResourceSettingsIntegrations, models.ActionWrite, orgID) {
 			return errThreadsOAuthForbidden
 		}
@@ -339,32 +382,40 @@ func (a *App) CallbackThreads(r *fastglue.Request) error {
 			permissions,
 		)
 	})
-	if err != nil {
-		a.Log.Error("Failed to persist Threads authorization", "error", err, "organization_id", orgID)
-		a.redirectThreadsCallback(r, "error")
-		return nil
-	}
-	a.redirectThreadsCallback(r, "connected")
-	return nil
 }
 
-func (a *App) loadThreadsIntegrationSnapshot(orgID uuid.UUID, requireEnabled bool) (threadsIntegrationSnapshot, error) {
+func (a *App) loadThreadsIntegrationSnapshot(
+	orgID uuid.UUID,
+	requireEnabled bool,
+	profileIDs ...string,
+) (threadsIntegrationSnapshot, error) {
 	var row models.ProviderIntegration
-	query := a.DB.Where("organization_id = ? AND provider = ?", orgID, integrationProviderThreads)
-	if requireEnabled {
-		query = query.Where("enabled = ?", true)
-	}
-	if err := query.First(&row).Error; err != nil {
+	if err := a.DB.Where(
+		"organization_id = ? AND provider = ?",
+		orgID,
+		integrationProviderThreads,
+	).First(&row).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return threadsIntegrationSnapshot{}, errThreadsOAuthNotConfigured
 		}
 		return threadsIntegrationSnapshot{}, err
 	}
+	profileID := ""
+	if len(profileIDs) > 0 {
+		profileID = strings.TrimSpace(profileIDs[0])
+	}
+	reviewAccessMode, err := a.requireThreadsAppReviewAccess(orgID, row.Config, profileID)
+	if err != nil {
+		return threadsIntegrationSnapshot{}, err
+	}
+	if requireEnabled && !row.Enabled {
+		return threadsIntegrationSnapshot{}, errThreadsOAuthNotConfigured
+	}
 	appID := stringJSONValue(row.Config, "app_id")
 	redirectURI := stringJSONValue(row.Config, "redirect_uri")
 	encryptedSecret, _ := row.CredentialData["app_secret"].(string)
 	if appID == "" || row.ThreadsAppID == nil || strings.TrimSpace(*row.ThreadsAppID) != appID ||
-		redirectURI == "" || !appcrypto.IsEncrypted(strings.TrimSpace(encryptedSecret)) || validateIntegrationRedirectURI(redirectURI) != nil {
+		redirectURI == "" || !appcrypto.IsEncrypted(strings.TrimSpace(encryptedSecret)) || validateThreadsRedirectURI(redirectURI) != nil {
 		return threadsIntegrationSnapshot{}, errThreadsOAuthNotConfigured
 	}
 	secret, err := appcrypto.Decrypt(encryptedSecret, a.integrationEncryptionKey())
@@ -375,6 +426,8 @@ func (a *App) loadThreadsIntegrationSnapshot(orgID uuid.UUID, requireEnabled boo
 		row.ID.String(),
 		appID,
 		redirectURI,
+		reviewAccessMode,
+		threadsreview.ExpectedDevelopmentProfileID(a.Config, reviewAccessMode),
 		encryptedSecret,
 		row.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	}, "\x00")))
@@ -384,16 +437,18 @@ func (a *App) loadThreadsIntegrationSnapshot(orgID uuid.UUID, requireEnabled boo
 		RedirectURI:        redirectURI,
 		EncryptedAppSecret: encryptedSecret,
 		AppSecret:          strings.TrimSpace(secret),
+		ReviewAccessMode:   reviewAccessMode,
+		ExpectedProfileID:  threadsreview.ExpectedDevelopmentProfileID(a.Config, reviewAccessMode),
 		Fingerprint:        hex.EncodeToString(fingerprint[:]),
 	}, nil
 }
 
-func (a *App) threadsWebhookCredentials(orgID uuid.UUID) (string, string, error) {
+func (a *App) threadsWebhookCredentials(orgID uuid.UUID, profileIDs ...string) (string, string, error) {
 	if a.rlsEnabled() && !a.hasTenantScope() {
 		var appSecret, verifyToken string
 		err := a.WithTenantApp(orgID, func(scoped *App) error {
 			var resolveErr error
-			appSecret, verifyToken, resolveErr = scoped.threadsWebhookCredentials(orgID)
+			appSecret, verifyToken, resolveErr = scoped.threadsWebhookCredentials(orgID, profileIDs...)
 			return resolveErr
 		})
 		return appSecret, verifyToken, err
@@ -408,6 +463,13 @@ func (a *App) threadsWebhookCredentials(orgID uuid.UUID) (string, string, error)
 		integrationProviderThreads,
 		true,
 	).First(&row).Error; err != nil {
+		return "", "", err
+	}
+	profileID := ""
+	if len(profileIDs) > 0 {
+		profileID = strings.TrimSpace(profileIDs[0])
+	}
+	if _, err := a.requireThreadsAppReviewAccess(orgID, row.Config, profileID); err != nil {
 		return "", "", err
 	}
 	decrypt := func(name string) (string, error) {
@@ -585,7 +647,11 @@ func (a *App) persistThreadsConnection(
 			First(&integration).Error; err != nil {
 			return err
 		}
-		currentSnapshot, err := txApp.loadThreadsIntegrationSnapshot(orgID, true)
+		currentSnapshot, err := txApp.loadThreadsIntegrationSnapshot(
+			orgID,
+			true,
+			strings.TrimSpace(string(profile.ID)),
+		)
 		if err != nil || currentSnapshot.IntegrationID != integrationID || currentSnapshot.Fingerprint != expectedFingerprint {
 			return errThreadsOAuthStale
 		}

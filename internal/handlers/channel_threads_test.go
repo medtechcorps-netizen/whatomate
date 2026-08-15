@@ -1,16 +1,23 @@
 package handlers
 
 import (
+	"encoding/binary"
 	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -35,7 +42,7 @@ func TestThreadsWebhookBindingRequiresDedicatedAppAndSingleAccount(t *testing.T)
 		Provider:       integrationProviderThreads,
 		ThreadsAppID:   &appID,
 		Enabled:        true,
-		Config:         models.JSONB{"app_id": appID},
+		Config:         approvedThreadsTestConfig(t, models.JSONB{"app_id": appID}, appID),
 		CredentialData: models.JSONB{},
 	}).Error)
 	account := models.ChannelAccount{
@@ -51,15 +58,15 @@ func TestThreadsWebhookBindingRequiresDedicatedAppAndSingleAccount(t *testing.T)
 		Metadata:          models.JSONB{"app_id": appID},
 	}
 	require.NoError(t, db.Create(&account).Error)
-	require.NoError(t, validateThreadsWebhookAccountBinding(db, &account, appID))
-	require.Error(t, validateThreadsWebhookAccountBinding(db, &account, "other-app"))
+	require.NoError(t, validateThreadsWebhookAccountBinding(nil, db, &account, appID))
+	require.Error(t, validateThreadsWebhookAccountBinding(nil, db, &account, "other-app"))
 
 	second := account
 	second.ID = uuid.New()
 	second.Name = "Second Threads binding test"
 	second.ExternalAccountID = "9988776655443322"
 	require.NoError(t, db.Create(&second).Error)
-	require.Error(t, validateThreadsWebhookAccountBinding(db, &account, appID))
+	require.Error(t, validateThreadsWebhookAccountBinding(nil, db, &account, appID))
 }
 
 func TestThreadsWebhookPersistenceRequiresCurrentOAuthCredential(t *testing.T) {
@@ -92,6 +99,35 @@ func TestThreadsWebhookPersistenceRequiresCurrentOAuthCredential(t *testing.T) {
 		).
 		Count(&count).Error)
 	assert.EqualValues(t, 1, count, "the revoked-credential attempt must not persist a raw event")
+}
+
+func TestThreadsWebhookLegacyEnabledPendingReviewFailsClosedBeforePersistence(t *testing.T) {
+	fixture := newThreadsWebhookPersistenceFixture(t, "1771429782494499")
+	legacyConfig := models.JSONB{
+		"app_id":            fixture.AppID,
+		"app_review_status": "pending",
+	}
+	require.NoError(t, fixture.DB.Model(&models.ProviderIntegration{}).
+		Where("id = ?", fixture.Integration.ID).
+		Updates(map[string]any{"config": legacyConfig, "enabled": true}).Error)
+
+	err := validateThreadsWebhookAccountBinding(
+		nil,
+		fixture.DB,
+		&fixture.Account,
+		fixture.AppID,
+	)
+	require.Error(t, err)
+	err = persistThreadsWebhookTestRawEvent(
+		fixture,
+		"threads-legacy-pending-review",
+	)
+	require.ErrorIs(t, err, errThreadsWebhookBindingInactive)
+	var count int64
+	require.NoError(t, fixture.DB.Model(&models.InboundEvent{}).
+		Where("organization_id = ?", fixture.Organization.ID).
+		Count(&count).Error)
+	assert.Zero(t, count)
 }
 
 func TestThreadsWebhookPersistenceWaitsForDisconnectAndFailsClosed(t *testing.T) {
@@ -156,6 +192,87 @@ func TestThreadsWebhookPersistenceWaitsForDisconnectAndFailsClosed(t *testing.T)
 		).
 		Count(&count).Error)
 	assert.Zero(t, count)
+}
+
+func TestThreadsHealthCheckRejectsSeededLegacyEnabledPendingReviewBeforeProviderIO(t *testing.T) {
+	app, organization, admin, integration, account := newThreadsHealthReviewFixture(t)
+	require.NoError(t, app.DB.Model(&integration).Updates(map[string]any{
+		"enabled": true,
+		"config": models.JSONB{
+			"app_id":            *integration.ThreadsAppID,
+			"app_review_status": "pending",
+		},
+	}).Error)
+	providerCalls := 0
+	app.HTTPClient = &http.Client{Transport: threadsOAuthEndpointRoundTripFunc(
+		func(*http.Request) (*http.Response, error) {
+			providerCalls++
+			return nil, errors.New("provider request must not run for a review-blocked account")
+		},
+	)}
+
+	request := testutil.NewRequest(t)
+	testutil.SetAuthContext(request, organization.ID, admin.ID)
+	testutil.SetPathParam(request, "id", account.ID.String())
+	require.NoError(t, app.TestChannelAccount(request))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+	assert.Zero(t, providerCalls)
+	assert.Contains(t, string(testutil.GetResponseBody(request)), `"success":false`)
+
+	var stored models.ChannelAccount
+	require.NoError(t, app.DB.First(&stored, "id = ?", account.ID).Error)
+	assert.Nil(t, stored.LastHealthCheckAt)
+	assert.Empty(t, stored.Metadata[channelAccountHealthValidationTokenKey])
+}
+
+func TestThreadsHealthCheckReviewDowngradeDuringProviderIOCannotCrossPersistenceFence(t *testing.T) {
+	app, organization, admin, integration, account := newThreadsHealthReviewFixture(t)
+	providerCalls := 0
+	app.HTTPClient = &http.Client{Transport: threadsOAuthEndpointRoundTripFunc(
+		func(request *http.Request) (*http.Response, error) {
+			providerCalls++
+			var payload string
+			switch request.URL.Path {
+			case "/v1.0/me":
+				require.NoError(t, app.DB.Model(&integration).Updates(map[string]any{
+					"enabled": true,
+					"config": models.JSONB{
+						"app_id":            *integration.ThreadsAppID,
+						"app_review_status": "pending",
+					},
+				}).Error)
+				payload = `{"id":"` + account.ExternalAccountID + `","username":"synthetic_health_profile"}`
+			case "/v1.0/debug_token":
+				payload = `{"data":{"type":"USER","is_valid":true,"user_id":"` + account.ExternalAccountID +
+					`","scopes":["threads_basic","threads_read_replies","threads_manage_replies","threads_content_publish","threads_manage_mentions"],"expires_at":1999999999,"data_access_expires_at":1999999999}}`
+			default:
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"code":404}}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(payload)),
+			}, nil
+		},
+	)}
+
+	request := testutil.NewRequest(t)
+	testutil.SetAuthContext(request, organization.ID, admin.ID)
+	testutil.SetPathParam(request, "id", account.ID.String())
+	require.NoError(t, app.TestChannelAccount(request))
+	require.Equal(t, fasthttp.StatusConflict, testutil.GetResponseStatusCode(request))
+	assert.Equal(t, 2, providerCalls)
+	assert.Contains(t, string(testutil.GetResponseBody(request)), "changed during validation")
+
+	var stored models.ChannelAccount
+	require.NoError(t, app.DB.First(&stored, "id = ?", account.ID).Error)
+	assert.Nil(t, stored.LastHealthCheckAt)
+	assert.Equal(t, models.ChannelAccountStatusActive, stored.Status)
+	assert.Equal(t, models.JSONB{"text": false}, stored.Capabilities)
 }
 
 func TestThreadsChannelCreationRequiresAdditionalEntitlement(t *testing.T) {
@@ -322,7 +439,7 @@ func newThreadsWebhookPersistenceFixture(
 		Provider:       integrationProviderThreads,
 		ThreadsAppID:   &binding,
 		Enabled:        true,
-		Config:         models.JSONB{"app_id": appID},
+		Config:         approvedThreadsTestConfig(t, models.JSONB{"app_id": appID}, appID),
 		CredentialData: models.JSONB{},
 		CreatedByID:    &user.ID,
 		UpdatedByID:    &user.ID,
@@ -371,6 +488,77 @@ func newThreadsWebhookPersistenceFixture(
 	}
 }
 
+func newThreadsHealthReviewFixture(
+	t *testing.T,
+) (*App, *models.Organization, *models.User, models.ProviderIntegration, models.ChannelAccount) {
+	t.Helper()
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	organization := testutil.CreateTestOrganization(t, app.DB)
+	admin := integrationTestUser(
+		t,
+		app,
+		organization.ID,
+		models.ResourceChannelAccounts+":"+models.ActionWrite,
+	)
+	grantThreadsOAuthReviewTestEntitlement(t, app, organization, admin.ID)
+	randomIDs := uuid.New()
+	appID := strconv.FormatUint(binary.BigEndian.Uint64(randomIDs[:8]), 10)
+	profileID := strconv.FormatUint(binary.BigEndian.Uint64(randomIDs[8:]), 10)
+	appSecret, err := appcrypto.Encrypt("synthetic-health-app-secret", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	verifyToken, err := appcrypto.Encrypt("synthetic-health-verify-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	binding := appID
+	integration := models.ProviderIntegration{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: organization.ID,
+		Provider:       integrationProviderThreads,
+		ThreadsAppID:   &binding,
+		Enabled:        true,
+		Config: approvedThreadsTestConfig(t, models.JSONB{
+			"app_id":       appID,
+			"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
+		}, appID),
+		CredentialData: models.JSONB{
+			"app_secret":           appSecret,
+			"webhook_verify_token": verifyToken,
+		},
+		CreatedByID: &admin.ID,
+		UpdatedByID: &admin.ID,
+	}
+	require.NoError(t, app.DB.Create(&integration).Error)
+	account := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    organization.ID,
+		Channel:           models.ChannelThreads,
+		Provider:          channelapi.ThreadsProvider,
+		Name:              "Synthetic Threads health review account",
+		ExternalAccountID: profileID,
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{"text": false},
+		Config: models.JSONB{
+			"engagement_mode":  threadsPublicEngagementMode,
+			"outbound_enabled": true,
+		},
+		Metadata: models.JSONB{"app_id": appID},
+	}
+	require.NoError(t, app.DB.Create(&account).Error)
+	expiresAt := time.Now().UTC().Add(30 * 24 * time.Hour)
+	require.NoError(t, app.DB.Create(&models.ChannelCredential{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		OrganizationID:   organization.ID,
+		ChannelAccountID: account.ID,
+		Kind:             models.ChannelCredentialKindOAuth,
+		Version:          1,
+		CredentialBlob:   models.JSONB{"access_token": "synthetic-health-access-token"},
+		Status:           models.ChannelCredentialStatusActive,
+		KeyVersion:       "test:v1",
+		ExpiresAt:        &expiresAt,
+		Metadata:         models.JSONB{"app_id": appID},
+	}).Error)
+	return app, organization, admin, integration, account
+}
+
 func persistThreadsWebhookTestRawEvent(
 	fixture *threadsWebhookPersistenceFixture,
 	dedupeKey string,
@@ -389,6 +577,7 @@ func persistThreadsWebhookTestRawEventWithDB(
 ) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		account, err := lockThreadsWebhookPersistenceBinding(
+			nil,
 			tx,
 			fixture.Organization.ID,
 			fixture.Account.ID,

@@ -20,6 +20,7 @@ import (
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	qwenapi "github.com/shridarpatil/whatomate/internal/qwen"
+	"github.com/shridarpatil/whatomate/internal/threadsreview"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -118,6 +119,7 @@ type integrationSources struct {
 	copilot                *models.CopilotSettings
 	connections            map[string]integrationConnectionResponse
 	channelConnections     map[string]integrationConnectionResponse
+	threadsWebhookAccount  *uuid.UUID
 	intendedChannels       *[]string
 	metaLegacyWebhookToken bool
 }
@@ -458,12 +460,36 @@ func (a *App) loadIntegrationSources(orgID uuid.UUID) (*integrationSources, erro
 		Count(&legacyWebhookTokenCount).Error; err != nil {
 		return nil, err
 	}
+	var threadsWebhookAccount *uuid.UUID
+	threadsRow := rows[integrationProviderThreads]
+	if threadsRow != nil && threadsRow.ThreadsAppID != nil {
+		expectedAppID := strings.TrimSpace(*threadsRow.ThreadsAppID)
+		var threadsAccounts []models.ChannelAccount
+		if err := a.DB.Select("id", "metadata").Where(
+			"organization_id = ? AND channel = ? AND provider = ? AND status = ?",
+			orgID,
+			models.ChannelThreads,
+			channelapi.ThreadsProvider,
+			models.ChannelAccountStatusActive,
+		).Order("updated_at DESC, id ASC").Find(&threadsAccounts).Error; err != nil {
+			return nil, err
+		}
+		for index := range threadsAccounts {
+			if expectedAppID != "" &&
+				stringJSONValue(threadsAccounts[index].Metadata, "app_id") == expectedAppID {
+				accountID := threadsAccounts[index].ID
+				threadsWebhookAccount = &accountID
+				break
+			}
+		}
+	}
 	return &integrationSources{
 		organization:           organization,
 		rows:                   rows,
 		copilot:                copilot,
 		connections:            connections,
 		channelConnections:     channelConnections,
+		threadsWebhookAccount:  threadsWebhookAccount,
 		intendedChannels:       intendedChannels,
 		metaLegacyWebhookToken: legacyWebhookTokenCount > 0,
 	}, nil
@@ -556,8 +582,20 @@ func (a *App) composeIntegrationResponse(provider string, sources *integrationSo
 			response.Message = "The stored integration credential is unavailable to this server."
 		}
 	case integrationProviderThreads:
-		response.Enabled = row != nil && row.Enabled
+		threadsAccessMode := threadsreview.ModeBlocked
+		if row != nil {
+			threadsAccessMode = a.threadsAppReviewAccessMode(sources.organization.ID, row.Config, "")
+		}
+		response.Enabled = row != nil && row.Enabled && threadsAccessMode != threadsreview.ModeBlocked
 		response.Config = safeIntegrationConfig(provider, integrationRowConfig(row))
+		response.Config["app_review_access_mode"] = threadsAccessMode
+		for key, value := range a.threadsPublicSetupURLs(
+			sources.organization.ID,
+			stringJSONValue(response.Config, "redirect_uri"),
+			sources.threadsWebhookAccount,
+		) {
+			response.Config[key] = value
+		}
 		response.Credentials["app_secret"] = encryptedCredentialFlag(row, "app_secret")
 		response.Credentials["webhook_verify_token"] = encryptedCredentialFlag(row, "webhook_verify_token")
 		response.Configured = stringJSONValue(response.Config, "app_id") != "" &&
@@ -569,13 +607,19 @@ func (a *App) composeIntegrationResponse(provider string, sources *integrationSo
 			a.storedIntegrationCredentialUsable(stringJSONValue(row.CredentialData, "webhook_verify_token"))
 		response.OAuth = integrationOAuthResponse{
 			Supported: true,
-			Available: response.Configured && response.credentialUsable && a.threadsOAuthAvailable(),
-			Mode:      "oauth",
+			Available: response.Configured && response.credentialUsable &&
+				threadsAccessMode != threadsreview.ModeBlocked && a.threadsOAuthAvailable(),
+			Mode: "oauth",
 		}
 		response.TestSupported = false
 		response.Status = integrationOperationalStatus(response, row)
 		response.Message = "Public replies and mentions only. Direct messages and standalone posts are not supported."
-		if response.Configured && !response.credentialUsable {
+		if threadsAccessMode == threadsreview.ModeBlocked {
+			response.Status = integrationStatusApprovalNeeded
+			response.Message = "Meta App Review approval is required before Threads can be enabled or authorized."
+		} else if threadsAccessMode == threadsreview.ModeDevelopmentTesting {
+			response.Message = "Non-production Threads App Review testing is restricted to the deployment-allowlisted app-role profile."
+		} else if response.Configured && !response.credentialUsable {
 			response.Status = integrationStatusDegraded
 			response.Message = "The stored Threads app or webhook credential is unavailable to this server."
 		}
@@ -854,8 +898,21 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 		credentialsChanged := false
 		configChanged := len(config) > 0
 		oldThreadsAppID := ""
+		oldThreadsApproved := false
+		legacyThreadsEnabledWithoutAccess := false
+		threadsReviewStatus, threadsReviewStatusProvided := config[threadsreview.StatusKey]
 		if provider == integrationProviderThreads {
 			oldThreadsAppID = strings.TrimSpace(stringJSONValue(row.Config, "app_id"))
+			oldThreadsApproved = threadsAppReviewApproved(row.Config)
+			legacyThreadsEnabledWithoutAccess = row.Enabled &&
+				a.threadsAppReviewAccessMode(orgID, row.Config, "") == threadsreview.ModeBlocked
+			if threadsReviewStatusProvided && strings.TrimSpace(fmt.Sprint(threadsReviewStatus)) == threadsAppReviewApprovedStatus &&
+				!oldThreadsApproved {
+				return &integrationClientError{
+					status:  fasthttp.StatusForbidden,
+					message: "Threads App Review approval must be recorded by the platform owner with approval evidence",
+				}
+			}
 		}
 		_, threadsAppSecretCleared := clearSet["app_secret"]
 		threadsAppSecretReplaced := strings.TrimSpace(credentialValues["app_secret"]) != ""
@@ -975,6 +1032,12 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 				row.Config[key] = value
 			}
 			if provider == integrationProviderThreads {
+				if threadsReviewStatusProvided && stringJSONValue(row.Config, threadsreview.StatusKey) != threadsAppReviewApprovedStatus {
+					row.Config = threadsreview.RemoveApproval(
+						row.Config,
+						stringJSONValue(row.Config, threadsreview.StatusKey),
+					)
+				}
 				appID := stringJSONValue(row.Config, "app_id")
 				if appID == "" {
 					row.ThreadsAppID = nil
@@ -1008,11 +1071,22 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 		if isNew && request.Enabled == nil {
 			row.Enabled = false
 		}
-		threadsAuthorizationChanged := provider == integrationProviderThreads &&
+		threadsAuthorizationChanged := provider == integrationProviderThreads && !isNew &&
 			(oldThreadsAppID != strings.TrimSpace(stringJSONValue(row.Config, "app_id")) ||
 				threadsAppSecretCleared || threadsAppSecretReplaced)
+		threadsReviewDowngraded := provider == integrationProviderThreads && oldThreadsApproved &&
+			threadsReviewStatusProvided && stringJSONValue(row.Config, threadsreview.StatusKey) != threadsAppReviewApprovedStatus
+		if provider == integrationProviderThreads && oldThreadsApproved && oldThreadsAppID != strings.TrimSpace(stringJSONValue(row.Config, "app_id")) {
+			row.Config = threadsreview.RemoveApproval(row.Config, "not_submitted")
+			threadsReviewDowngraded = true
+		}
+		threadsMustAutoDisable := provider == integrationProviderThreads &&
+			(threadsAuthorizationChanged || threadsReviewDowngraded || legacyThreadsEnabledWithoutAccess)
+		if threadsMustAutoDisable {
+			row.Enabled = false
+		}
 		if provider == integrationProviderThreads &&
-			((request.Enabled != nil && !*request.Enabled) || threadsAuthorizationChanged) {
+			((request.Enabled != nil && !*request.Enabled) || threadsMustAutoDisable) {
 			if err := disconnectThreadsChannelAccounts(tx, orgID, userID, time.Now().UTC()); err != nil {
 				return err
 			}
@@ -1037,7 +1111,11 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 
 		if row.Enabled {
 			if err := a.validateEnabledIntegration(provider, &organization, row, tx, orgID); err != nil {
-				return &integrationClientError{status: fasthttp.StatusBadRequest, message: err.Error()}
+				status := fasthttp.StatusBadRequest
+				if errors.Is(err, errThreadsAppReviewApprovalRequired) {
+					status = fasthttp.StatusConflict
+				}
+				return &integrationClientError{status: status, message: err.Error()}
 			}
 		}
 		if err := tx.Save(row).Error; err != nil {
@@ -1247,6 +1325,9 @@ func (a *App) validateEnabledIntegration(provider string, organization *models.O
 			return errors.New("qwen endpoint region is invalid")
 		}
 	case integrationProviderThreads:
+		if _, err := a.requireThreadsAppReviewAccess(orgID, row.Config, ""); err != nil {
+			return err
+		}
 		if stringJSONValue(row.Config, "app_id") == "" || stringJSONValue(row.Config, "redirect_uri") == "" ||
 			!encryptedCredentialFlag(row, "app_secret").Configured ||
 			!encryptedCredentialFlag(row, "webhook_verify_token").Configured {
@@ -1339,6 +1420,9 @@ func validateIntegrationConfig(provider string, input models.JSONB) (models.JSON
 			if !ok || len(text) > 2048 || validateIntegrationRedirectURI(text) != nil {
 				return nil, errors.New("config.redirect_uri must be an HTTPS URL without credentials or a fragment")
 			}
+			if provider == integrationProviderThreads && validateThreadsRedirectURI(text) != nil {
+				return nil, errors.New("config.redirect_uri must use HTTPS and the exact /api/integrations/threads/callback path without a query")
+			}
 			result[key] = text
 		case "app_review_status", "approval_status":
 			text, ok := value.(string)
@@ -1428,6 +1512,26 @@ func validateIntegrationRedirectURI(value string) error {
 		return nil
 	}
 	return errors.New("redirect URI must use HTTPS")
+}
+
+func validateThreadsRedirectURI(value string) error {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
+		parsed.Fragment != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Opaque != "" ||
+		parsed.RawPath != "" || parsed.EscapedPath() != parsed.Path ||
+		!strings.HasSuffix(parsed.Path, threadsOAuthCallbackPath) {
+		return errors.New("invalid Threads redirect URI")
+	}
+	basePath := strings.TrimSuffix(parsed.Path, threadsOAuthCallbackPath)
+	if basePath != "" && (sanitizeRedirectPath(basePath) != basePath || strings.Contains(basePath, "\\")) {
+		return errors.New("invalid Threads redirect URI base path")
+	}
+	for _, segment := range strings.Split(basePath, "/") {
+		if segment == "." || segment == ".." {
+			return errors.New("invalid Threads redirect URI base path")
+		}
+	}
+	return nil
 }
 
 func integrationCredentialNames(provider string) []string {

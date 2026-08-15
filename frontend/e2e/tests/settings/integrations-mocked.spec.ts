@@ -148,6 +148,11 @@ function integrationFixture(): MockIntegration[] {
         redirect_uri:
           "https://app.example.test/api/integrations/threads/callback",
         app_review_status: "approved",
+        app_review_access_mode: "approved",
+        deauthorization_callback_url: `https://app.example.test/api/integrations/threads/${organizationId}/deauthorize`,
+        data_deletion_callback_url: `https://app.example.test/api/integrations/threads/${organizationId}/data-deletion`,
+        account_webhook_callback_url:
+          "https://app.example.test/api/webhooks/channels/8bbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
       },
       credentials: {
         app_secret: { configured: true, source: "workspace" },
@@ -289,6 +294,8 @@ async function installIntegrationMocks(
     supportOverrideActive?: boolean;
     supportStatusUnavailable?: boolean;
     supportStatusOrganizationId?: string;
+    threadsReviewStatus?: "not_submitted" | "pending" | "approved" | "rejected";
+    threadsDevelopmentTesting?: boolean;
     failSupportStatusRefreshAfterGrant?: boolean;
     failSupportStatusRefreshAfterRevoke?: boolean;
     revokeConflict?: boolean;
@@ -327,6 +334,24 @@ async function installIntegrationMocks(
     meta.config.webhook_callback_path = "/api/webhook";
     meta.credentials.app_secret.source = "platform";
     meta.credentials.webhook_verify_token.source = "platform";
+  }
+  if (
+    options.threadsReviewStatus &&
+    options.threadsReviewStatus !== "approved"
+  ) {
+    const threads = integrations.find((item) => item.provider === "threads")!;
+    threads.config.app_review_status = options.threadsReviewStatus;
+    threads.config.app_review_access_mode = options.threadsDevelopmentTesting
+      ? "development_testing"
+      : "blocked";
+    threads.status = options.threadsDevelopmentTesting
+      ? "configured"
+      : "approval_required";
+    threads.enabled = Boolean(options.threadsDevelopmentTesting);
+    threads.oauth.available = Boolean(options.threadsDevelopmentTesting);
+    threads.message = options.threadsDevelopmentTesting
+      ? "Non-production Threads App Review testing is restricted to the deployment-allowlisted app-role profile."
+      : "Meta App Review approval is required before Threads can be enabled or authorized.";
   }
   const traffic = {
     listReads: 0,
@@ -1447,6 +1472,24 @@ test("Threads exposes the exact stored callback and starts live OAuth authorizat
   );
   await expect(redirectInput).toBeEditable();
   await expect(page.getByTestId("threads-oauth-callback-copy")).toBeVisible();
+  const deauthorizationInput = page.locator(
+    "#threads-deauthorization_callback_url",
+  );
+  await expect(deauthorizationInput).toHaveValue(
+    `https://app.example.test/api/integrations/threads/${organizationId}/deauthorize`,
+  );
+  await expect(deauthorizationInput).not.toBeEditable();
+  await expect(
+    page.getByTestId("threads-deauthorization_callback_url-copy"),
+  ).toBeVisible();
+  await expect(page.locator("#threads-data_deletion_callback_url")).toHaveValue(
+    `https://app.example.test/api/integrations/threads/${organizationId}/data-deletion`,
+  );
+  await expect(
+    page.locator("#threads-account_webhook_callback_url"),
+  ).toHaveValue(
+    "https://app.example.test/api/webhooks/channels/8bbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  );
   const webhookTokenInput = page.locator("#threads-webhook_verify_token");
   await expect(webhookTokenInput).toHaveAttribute("type", "password");
   await expect(webhookTokenInput).toHaveValue("");
@@ -1500,6 +1543,60 @@ test("Threads exposes the exact stored callback and starts live OAuth authorizat
   await page.getByTestId("integration-connect-threads").click();
   await expect.poll(() => traffic.threadsConnects).toBe(1);
   await expect(page).toHaveURL(/\/mock-threads-oauth\?state=server-issued$/);
+});
+
+test("Threads review pending disables activation and OAuth", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, adminUser, {
+    threadsReviewStatus: "pending",
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  const dialog = page.getByTestId("integration-dialog-threads");
+  await expect(page.locator("#integration-enabled")).toBeDisabled();
+  await page.locator("#threads-app_review_status").click();
+  await expect(
+    page.getByRole("option", { name: "Approved by platform owner" }),
+  ).toHaveAttribute("data-disabled");
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("integration-connect-threads")).toBeVisible();
+  await expect(page.getByTestId("integration-connect-threads")).toBeDisabled();
+  await expect(
+    dialog.getByText(
+      "Meta App Review approval is required before Threads can be enabled or authorized.",
+      { exact: true },
+    ).first(),
+  ).toBeVisible();
+  expect(traffic.threadsConnects).toBe(0);
+});
+
+test("Threads exact non-production review gate enables app-role OAuth without self-approval", async ({
+  page,
+}) => {
+  await installIntegrationMocks(page, adminUser, {
+    threadsReviewStatus: "pending",
+    threadsDevelopmentTesting: true,
+  });
+  await page.goto("/settings/integrations");
+  await page
+    .getByTestId("integration-card-threads")
+    .getByRole("button", { name: "Configure" })
+    .click();
+
+  await expect(page.locator("#integration-enabled")).toBeEnabled();
+  await expect(page.locator("#integration-enabled")).toBeChecked();
+  await expect(page.getByTestId("integration-connect-threads")).toBeEnabled();
+  await expect(
+    page.getByText(
+      "Non-production Threads App Review testing is restricted to the deployment-allowlisted app-role profile.",
+      { exact: true },
+    ).first(),
+  ).toBeVisible();
 });
 
 test("Threads OAuth callback opens the provider and removes its one-time URL marker", async ({

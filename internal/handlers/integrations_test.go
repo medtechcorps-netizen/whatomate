@@ -597,11 +597,11 @@ func TestIntegrationCenterThreadsCanBeEnabledForOAuth(t *testing.T) {
 	org := testutil.CreateTestOrganization(t, app.DB)
 	admin := integrationTestUser(t, app, org.ID, "settings.integrations:read", "settings.integrations:write")
 	request := testutil.NewJSONRequest(t, map[string]any{
-		"enabled": true,
+		"enabled": false,
 		"config": map[string]any{
 			"app_id":            "1234567890123457",
 			"redirect_uri":      "https://app.example.test/api/integrations/threads/callback",
-			"app_review_status": "approved",
+			"app_review_status": "pending",
 		},
 		"credentials": map[string]any{
 			"app_secret":           "threads-app-secret",
@@ -619,6 +619,15 @@ func TestIntegrationCenterThreadsCanBeEnabledForOAuth(t *testing.T) {
 		org.ID,
 		integrationProviderThreads,
 	).First(&row).Error)
+	row.Config = approvedThreadsTestConfig(t, row.Config, "1234567890123457")
+	require.NoError(t, app.DB.Model(&row).Update("config", row.Config).Error)
+	enable := testutil.NewJSONRequest(t, map[string]any{"enabled": true})
+	testutil.SetAuthContext(enable, org.ID, admin.ID)
+	testutil.SetPathParam(enable, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(enable))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(enable))
+	request = enable
+	require.NoError(t, app.DB.First(&row, "id = ?", row.ID).Error)
 	assert.True(t, row.Enabled)
 	assert.True(t, appcrypto.IsEncrypted(stringJSONValue(row.CredentialData, "app_secret")))
 	assert.True(t, appcrypto.IsEncrypted(stringJSONValue(row.CredentialData, "webhook_verify_token")))
@@ -630,8 +639,68 @@ func TestIntegrationCenterThreadsCanBeEnabledForOAuth(t *testing.T) {
 	assert.Equal(t, integrationStatusConfigured, response.Status)
 	assert.True(t, response.OAuth.Supported)
 	assert.False(t, response.OAuth.Available, "Redis is intentionally absent in this unit test")
+	assert.Equal(
+		t,
+		"https://app.example.test/api/integrations/threads/callback",
+		response.Config["oauth_callback_url"],
+	)
+	assert.Equal(
+		t,
+		"https://app.example.test/api/integrations/threads/"+org.ID.String()+"/deauthorize",
+		response.Config["deauthorization_callback_url"],
+	)
+	assert.Equal(
+		t,
+		"https://app.example.test/api/integrations/threads/"+org.ID.String()+"/data-deletion",
+		response.Config["data_deletion_callback_url"],
+	)
+	assert.NotContains(t, response.Config, "account_webhook_callback_url")
 	assert.NotContains(t, string(testutil.GetResponseBody(request)), "threads-app-secret")
 	assert.NotContains(t, string(testutil.GetResponseBody(request)), "threads-webhook-verify-token")
+}
+
+func TestIntegrationCenterThreadsReviewApprovalGatesEnableAndOAuth(t *testing.T) {
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := integrationTestUser(t, app, org.ID, "settings.integrations:read", "settings.integrations:write")
+	configure := testutil.NewJSONRequest(t, map[string]any{
+		"enabled": false,
+		"config": map[string]any{
+			"app_id":            "1234567890123456",
+			"redirect_uri":      "https://app.example.test/api/integrations/threads/callback",
+			"app_review_status": "pending",
+		},
+		"credentials": map[string]any{
+			"app_secret":           "threads-app-secret",
+			"webhook_verify_token": "threads-webhook-verify-token",
+		},
+	})
+	testutil.SetAuthContext(configure, org.ID, admin.ID)
+	testutil.SetPathParam(configure, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(configure))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(configure))
+
+	var response IntegrationResponse
+	testutil.ParseEnvelopeResponse(t, configure, &response)
+	assert.Equal(t, integrationStatusApprovalNeeded, response.Status)
+	assert.False(t, response.Enabled)
+	assert.True(t, response.OAuth.Supported)
+	assert.False(t, response.OAuth.Available)
+	assert.Contains(t, response.Message, "App Review approval is required")
+
+	enable := testutil.NewJSONRequest(t, map[string]any{"enabled": true})
+	testutil.SetAuthContext(enable, org.ID, admin.ID)
+	testutil.SetPathParam(enable, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(enable))
+	testutil.AssertErrorResponse(t, enable, fasthttp.StatusConflict, "App Review approval is required")
+
+	var stored models.ProviderIntegration
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND provider = ?",
+		org.ID,
+		integrationProviderThreads,
+	).First(&stored).Error)
+	assert.False(t, stored.Enabled)
 }
 
 func TestIntegrationCenterThreadsAppIDCannotBeSharedAcrossWorkspaces(t *testing.T) {
@@ -642,10 +711,11 @@ func TestIntegrationCenterThreadsAppIDCannotBeSharedAcrossWorkspaces(t *testing.
 	adminB := integrationTestUser(t, app, orgB.ID, "settings.integrations:read", "settings.integrations:write")
 	requestFor := func(orgID, userID uuid.UUID) *fastglue.Request {
 		request := testutil.NewJSONRequest(t, map[string]any{
-			"enabled": true,
+			"enabled": false,
 			"config": map[string]any{
-				"app_id":       "1234567890123458",
-				"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
+				"app_id":            "1234567890123458",
+				"redirect_uri":      "https://app.example.test/api/integrations/threads/callback",
+				"app_review_status": "pending",
 			},
 			"credentials": map[string]any{
 				"app_secret":           "threads-app-secret",
@@ -695,10 +765,10 @@ func TestIntegrationCenterThreadsDeleteDisconnectsAccountsAndRevokesOAuthCredent
 		OrganizationID: org.ID,
 		Provider:       integrationProviderThreads,
 		Enabled:        true,
-		Config: models.JSONB{
+		Config: approvedThreadsTestConfig(t, models.JSONB{
 			"app_id":       appID,
 			"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
-		},
+		}, appID),
 		CredentialData: models.JSONB{
 			"app_secret":           appSecret,
 			"webhook_verify_token": verifyToken,
@@ -870,10 +940,10 @@ func TestIntegrationCenterThreadsAppChangeRevokesOldAuthorizationAndReenableIsNo
 		Provider:       integrationProviderThreads,
 		ThreadsAppID:   &oldBinding,
 		Enabled:        true,
-		Config: models.JSONB{
+		Config: approvedThreadsTestConfig(t, models.JSONB{
 			"app_id":       oldAppID,
 			"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
-		},
+		}, oldAppID),
 		CredentialData: models.JSONB{
 			"app_secret":           appSecret,
 			"webhook_verify_token": verifyToken,
@@ -934,7 +1004,10 @@ func TestIntegrationCenterThreadsAppChangeRevokesOldAuthorizationAndReenableIsNo
 	assert.Equal(t, models.ChannelCredentialStatusRevoked, credential.Status)
 	var changedResponse IntegrationResponse
 	testutil.ParseEnvelopeResponse(t, change, &changedResponse)
-	assert.Equal(t, integrationStatusConfigured, changedResponse.Status)
+	assert.Equal(t, integrationStatusApprovalNeeded, changedResponse.Status)
+	assert.False(t, changedResponse.Enabled)
+	changedIntegration.Config = approvedThreadsTestConfig(t, changedIntegration.Config, newAppID)
+	require.NoError(t, app.DB.Model(&changedIntegration).Update("config", changedIntegration.Config).Error)
 
 	account.Status = models.ChannelAccountStatusActive
 	account.Config["outbound_enabled"] = true
@@ -1008,10 +1081,10 @@ func TestPersistThreadsConnectionRestoresHistoricalSoftDeletedMatchingAccount(t 
 		Provider:       integrationProviderThreads,
 		ThreadsAppID:   &binding,
 		Enabled:        true,
-		Config: models.JSONB{
+		Config: approvedThreadsTestConfig(t, models.JSONB{
 			"app_id":       appID,
 			"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
-		},
+		}, appID),
 		CredentialData: models.JSONB{
 			"app_secret":           appSecret,
 			"webhook_verify_token": verifyToken,
@@ -1085,6 +1158,13 @@ func TestPersistThreadsConnectionRestoresHistoricalSoftDeletedMatchingAccount(t 
 		models.ChannelCredentialStatusActive,
 	).First(&credential).Error)
 	assert.Equal(t, appID, credential.Metadata["app_id"])
+	response, err := app.integrationResponse(org.ID, integrationProviderThreads)
+	require.NoError(t, err)
+	assert.Equal(
+		t,
+		"https://app.example.test/api/webhooks/channels/"+restored.ID.String(),
+		response.Config["account_webhook_callback_url"],
+	)
 }
 
 func TestIntegrationCenterStrictValidationAndPermissions(t *testing.T) {
@@ -1209,6 +1289,32 @@ func TestIntegrationRedirectURIRejectsValuesOver2048Characters(t *testing.T) {
 		"redirect_uri": "https://example.test/callback/" + strings.Repeat("a", 2049),
 	})
 	require.EqualError(t, err, "config.redirect_uri must be an HTTPS URL without credentials or a fragment")
+}
+
+func TestThreadsRedirectURIRequiresExactCallbackPath(t *testing.T) {
+	valid, err := validateIntegrationConfig(integrationProviderThreads, models.JSONB{
+		"redirect_uri": "https://app.example.test/tenant/api/integrations/threads/callback",
+	})
+	require.NoError(t, err)
+	assert.Equal(
+		t,
+		"https://app.example.test/tenant/api/integrations/threads/callback",
+		valid["redirect_uri"],
+	)
+
+	for _, value := range []string{
+		"https://app.example.test/oauth/callback",
+		"https://app.example.test/api/integrations/threads/callback/extra",
+		"https://app.example.test/api/integrations/threads/callback?workspace=tenant-a",
+		"http://localhost/api/integrations/threads/callback",
+		"https://app.example.test/%2e%2e/api/integrations/threads/callback",
+	} {
+		_, err := validateIntegrationConfig(integrationProviderThreads, models.JSONB{
+			"redirect_uri": value,
+		})
+		require.Error(t, err, value)
+		assert.Contains(t, err.Error(), "exact /api/integrations/threads/callback path")
+	}
 }
 
 func TestThreadsWebhookVerifyTokenRequiresSixteenCharacters(t *testing.T) {
