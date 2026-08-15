@@ -95,7 +95,8 @@ func normalizeInboundResolvedWithLimit(
 		return nil, errorsWrap(ErrInvalidMetaPayload, "canonical body limit is invalid")
 	}
 	switch webhookApp {
-	case WebhookAppMessenger, WebhookAppManagedMessenger, WebhookAppInstagramLogin:
+	case WebhookAppMessenger, WebhookAppManagedMessenger, WebhookAppInstagramLogin,
+		WebhookAppManagedInstagram:
 	default:
 		return nil, errorsWrap(ErrInvalidMetaPayload, "webhook app is invalid")
 	}
@@ -126,7 +127,14 @@ func normalizeInboundResolvedWithLimit(
 		entry.ID = strings.TrimSpace(entry.ID)
 		account, ok := config.account(channel, entry.ID)
 		if !ok && resolver != nil {
-			resolved, resolveErr := resolver.Resolve(ctx, channel, entry.ID, metaregistry.ResolvePurposeInbound, true)
+			// Managed Instagram privacy/control-plane fences are evaluated for every
+			// provider delivery. A cached lease may outlive a committed deauth,
+			// deletion, or quarantine, so this inbound path deliberately bypasses the
+			// registry cache. Static lookup remains first and unchanged.
+			useCache := webhookApp != WebhookAppManagedInstagram
+			resolved, resolveErr := resolver.Resolve(
+				ctx, channel, entry.ID, metaregistry.ResolvePurposeInbound, useCache,
+			)
 			if resolveErr == nil {
 				account, ok = resolved, true
 			} else if errors.Is(resolveErr, ErrRegistryStale) {

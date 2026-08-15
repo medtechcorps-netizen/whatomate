@@ -284,19 +284,75 @@ func (a *App) resolvePendingMetaDeauthorizationRevalidation(
 	outcome string,
 	checkedAt time.Time,
 ) error {
-	digest := stringConfigValue(snapshot.Account.Metadata, metaDeauthorizationPendingDigestKey)
-	issuedAt := stringConfigValue(snapshot.Account.Metadata, metaDeauthorizationPendingIssuedKey)
+	return a.resolvePendingMetaDeauthorizationFence(
+		snapshot.Account.Metadata,
+		metaDeauthorizationRevalidationFence{
+			OrganizationID: snapshot.OrganizationID,
+			AccountID:      snapshot.Account.ID,
+			Channel:        snapshot.Account.Channel,
+			PlatformAppID:  stringConfigValue(snapshot.Account.Metadata, "meta_platform_app_id"),
+			AuthorizingUserID: stringConfigValue(
+				snapshot.Account.Metadata, "meta_authorizing_user_id",
+			),
+			OAuthCredentialID: snapshot.OAuth.ID, OAuthVersion: snapshot.OAuth.Version,
+			WebhookCredentialID: snapshot.Webhook.ID, WebhookVersion: snapshot.Webhook.Version,
+		},
+		outcome, checkedAt,
+	)
+}
+
+type metaDeauthorizationRevalidationFence struct {
+	OrganizationID      uuid.UUID
+	AccountID           uuid.UUID
+	Channel             models.Channel
+	PlatformAppID       string
+	AuthorizingUserID   string
+	OAuthCredentialID   uuid.UUID
+	OAuthVersion        int
+	WebhookCredentialID uuid.UUID
+	WebhookVersion      int
+}
+
+// resolvePendingMetaDeauthorizationFence settles an ambiguous same-second
+// callback only after a provider revalidation is fenced to the exact current
+// credential generation and channel/app/profile binding. Both managed Meta
+// lifecycles use this helper; stale outcomes deliberately leave the callback
+// pending and non-routable.
+func (a *App) resolvePendingMetaDeauthorizationFence(
+	snapshotMetadata models.JSONB,
+	fence metaDeauthorizationRevalidationFence,
+	outcome string,
+	checkedAt time.Time,
+) error {
+	digest := stringConfigValue(snapshotMetadata, metaDeauthorizationPendingDigestKey)
+	issuedAt := stringConfigValue(snapshotMetadata, metaDeauthorizationPendingIssuedKey)
 	if digest == "" || issuedAt == "" || outcome == metaregistry.OwnershipStale {
 		return nil
 	}
 	if outcome != metaregistry.OwnershipVerified && outcome != metaregistry.OwnershipRevoked {
 		return nil
 	}
+	if fence.OrganizationID == uuid.Nil || fence.AccountID == uuid.Nil ||
+		(fence.Channel != models.ChannelMessenger && fence.Channel != models.ChannelInstagram) ||
+		!validCanonicalMetaID(strings.TrimSpace(fence.PlatformAppID)) ||
+		!validCanonicalMetaID(strings.TrimSpace(fence.AuthorizingUserID)) ||
+		fence.OAuthCredentialID == uuid.Nil || fence.OAuthVersion < 1 ||
+		fence.WebhookCredentialID == uuid.Nil || fence.WebhookVersion < 1 {
+		return errMetaMessengerSubscriptionFence
+	}
 	var account models.ChannelAccount
 	if err := a.DB.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("id = ? AND organization_id = ?", snapshot.Account.ID, snapshot.OrganizationID).
+		Where("id = ? AND organization_id = ? AND channel = ? AND provider = ?",
+			fence.AccountID, fence.OrganizationID, fence.Channel, channelapi.RelayProvider).
 		First(&account).Error; err != nil {
 		return err
+	}
+	if !metaRegistryControlPlaneConfig(account.Config) ||
+		stringConfigValue(account.Metadata, "meta_platform_app_id") != strings.TrimSpace(fence.PlatformAppID) ||
+		stringConfigValue(account.Metadata, "meta_authorizing_user_id") != strings.TrimSpace(fence.AuthorizingUserID) ||
+		(fence.Channel == models.ChannelInstagram &&
+			stringConfigValue(account.Config, "instagram_api_mode") != "instagram_login") {
+		return errMetaMessengerSubscriptionFence
 	}
 	if stringConfigValue(account.Metadata, metaDeauthorizationPendingDigestKey) != digest ||
 		stringConfigValue(account.Metadata, metaDeauthorizationPendingIssuedKey) != issuedAt {
@@ -306,10 +362,10 @@ func (a *App) resolvePendingMetaDeauthorizationRevalidation(
 		var current int64
 		if err := a.DB.Model(&models.ChannelCredential{}).
 			Where("organization_id = ? AND channel_account_id = ? AND status IN ? AND ((id = ? AND version = ? AND kind = ?) OR (id = ? AND version = ? AND kind = ?))",
-				snapshot.OrganizationID, snapshot.Account.ID,
+				fence.OrganizationID, fence.AccountID,
 				[]models.ChannelCredentialStatus{models.ChannelCredentialStatusActive, models.ChannelCredentialStatusExpiring},
-				snapshot.OAuth.ID, snapshot.OAuth.Version, models.ChannelCredentialKindOAuth,
-				snapshot.Webhook.ID, snapshot.Webhook.Version, models.ChannelCredentialKindWebhook).
+				fence.OAuthCredentialID, fence.OAuthVersion, models.ChannelCredentialKindOAuth,
+				fence.WebhookCredentialID, fence.WebhookVersion, models.ChannelCredentialKindWebhook).
 			Count(&current).Error; err != nil {
 			return err
 		}
@@ -321,6 +377,7 @@ func (a *App) resolvePendingMetaDeauthorizationRevalidation(
 	delete(metadata, metaDeauthorizationPendingDigestKey)
 	delete(metadata, metaDeauthorizationPendingIssuedKey)
 	metadata[metaDeauthorizationResolvedDigestKey] = digest
+	metadata[metaDeauthorizationResolvedAtKey] = checkedAt.UTC().Format(time.RFC3339Nano)
 	updates := map[string]any{"metadata": metadata, "updated_at": checkedAt.UTC()}
 	if outcome == metaregistry.OwnershipRevoked {
 		metadata[metaDeauthorizationResolvedStateKey] = "authorization_revoked"
@@ -344,7 +401,7 @@ func (a *App) resolvePendingMetaDeauthorizationRevalidation(
 		updates["connected_at"] = nil
 	}
 	result := a.DB.Model(&models.ChannelAccount{}).
-		Where("id = ? AND organization_id = ?", account.ID, snapshot.OrganizationID).
+		Where("id = ? AND organization_id = ?", account.ID, fence.OrganizationID).
 		Updates(updates)
 	if result.Error != nil {
 		return result.Error

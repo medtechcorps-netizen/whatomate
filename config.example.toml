@@ -207,6 +207,32 @@ development_organization_id = ""
 development_app_id = ""
 development_profile_id = ""
 
+# Managed Instagram Login lifecycle. This uses a different Meta application,
+# webhook route, app secret, and verify token from the legacy/static Instagram
+# relay configuration. Enable only after the relay reader understands managed
+# Instagram registry leases and the app review status is exactly `approved`.
+# The pilot is deliberately limited to one canonical workspace UUID.
+[meta_instagram_onboarding]
+enabled = false
+quarantine_only = false # Emergency server-owned kill switch; keeps teardown/callback lifecycle running.
+app_id = ""
+app_secret = ""
+app_review_status = "" # Required when enabled; production intake accepts only `approved`, while quarantine_only permits a server-owned downgrade.
+graph_api_version = "v25.0"
+authorization_base_url = "https://www.instagram.com"
+token_base_url = "https://api.instagram.com"
+graph_base_url = "https://graph.instagram.com"
+rereply_base_url = "" # Production: exactly https://app.rereply.app
+relay_base_url = "" # Production: exactly https://app.rereply.app/meta-relay
+health_approval_max_age_mins = 15
+revalidation_lead_mins = 60
+token_refresh_lead_hours = 168
+scheduler_interval_seconds = 60
+allowed_organization_id = "" # Exactly one canonical UUID; never an organization name.
+development_test_profile_id = "" # Nonproduction only; exact IG professional profile ID.
+development_test_oauth_subject_id = "" # Nonproduction only; exact app-scoped OAuth subject returned as /me.id.
+development_app_role = "" # Nonproduction only: administrator, developer, or tester.
+
 # Default admin credentials (only used during initial setup when no users exist)
 [default_admin]
 email = "admin@rereply.app"

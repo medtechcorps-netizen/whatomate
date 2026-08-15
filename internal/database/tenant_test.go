@@ -273,6 +273,63 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		},
 	}
 	require.NoError(t, adminDB.Create(&metaChannelB).Error)
+	metaInstagramChannelB := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    orgB.ID,
+		Channel:           models.ChannelInstagram,
+		Provider:          "relay",
+		Name:              "Synthetic Instagram registry",
+		ExternalAccountID: "700000000000001",
+		Status:            models.ChannelAccountStatusDegraded,
+		Capabilities:      models.JSONB{},
+		Config: models.JSONB{
+			"meta_registry_managed": true,
+			"meta_management_mode":  "platform_oauth",
+			"instagram_api_mode":    "instagram_login",
+		},
+		Metadata: models.JSONB{
+			"meta_platform_app_id":      metaPlatformAppID,
+			"meta_authorizing_user_id":  metaAuthorizingUserID,
+			"meta_ownership_checked_at": time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano),
+		},
+	}
+	require.NoError(t, adminDB.Create(&metaInstagramChannelB).Error)
+	managedInstagramProfileID := "700000000000002"
+	managedInstagramAppID := "100000000000002"
+	managedInstagramExactB := models.ChannelAccount{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgB.ID,
+		Channel: models.ChannelInstagram, Provider: "relay",
+		Name: "Synthetic exact managed Instagram", ExternalAccountID: managedInstagramProfileID,
+		Status: models.ChannelAccountStatusActive, Capabilities: models.JSONB{},
+		Config: models.JSONB{
+			"meta_registry_managed": true,
+			"meta_management_mode":  "platform_oauth",
+			"instagram_api_mode":    "instagram_login",
+		},
+		Metadata: models.JSONB{
+			"meta_platform_app_id":      managedInstagramAppID,
+			"meta_webhook_app":          "instagram_login",
+			"meta_authorizing_user_id":  managedInstagramProfileID,
+			"meta_authority_asset_id":   managedInstagramProfileID,
+			"meta_ownership_checked_at": time.Now().UTC().Format(time.RFC3339Nano),
+		},
+	}
+	foreignStaticInstagramA := models.ChannelAccount{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgA.ID,
+		Channel: models.ChannelInstagram, Provider: "relay",
+		Name: "Synthetic foreign static Instagram", ExternalAccountID: "700000000000003",
+		Status: models.ChannelAccountStatusPending, Capabilities: models.JSONB{},
+		Config: models.JSONB{
+			"instagram_api_mode": "instagram_login",
+		},
+		Metadata: models.JSONB{},
+	}
+	require.NoError(t, adminDB.Create(&managedInstagramExactB).Error)
+	foreignShadowAttempt := foreignStaticInstagramA
+	foreignShadowAttempt.ID = uuid.New()
+	foreignShadowAttempt.ExternalAccountID = managedInstagramProfileID
+	require.Error(t, adminDB.Create(&foreignShadowAttempt).Error,
+		"the global routable-identity constraint must reject a cross-tenant shadow")
 	threadsChannelB := models.ChannelAccount{
 		BaseModel:         models.BaseModel{ID: uuid.New()},
 		OrganizationID:    orgB.ID,
@@ -456,6 +513,27 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	require.NoError(t, adminDB.Create(&transferA).Error)
 	require.NoError(t, adminDB.Create(&transferB).Error)
 
+	deletionJournalA := models.MetaInstagramDataDeletionEvent{
+		Digest:            fmt.Sprintf("%064d", 1),
+		PlatformAppID:     "610000000000001",
+		AuthorizingUserID: "620000000000001",
+		IssuedAt:          time.Now().UTC().Add(-2 * time.Minute),
+		VerifiedAt:        time.Now().UTC().Add(-time.Minute),
+		State:             "verified",
+		OrganizationID:    orgA.ID,
+	}
+	deletionJournalB := models.MetaInstagramDataDeletionEvent{
+		Digest:            fmt.Sprintf("%064d", 2),
+		PlatformAppID:     "610000000000002",
+		AuthorizingUserID: "620000000000002",
+		IssuedAt:          time.Now().UTC().Add(-2 * time.Minute),
+		VerifiedAt:        time.Now().UTC().Add(-time.Minute),
+		State:             "verified",
+		OrganizationID:    orgB.ID,
+	}
+	require.NoError(t, adminDB.Create(&deletionJournalA).Error)
+	require.NoError(t, adminDB.Create(&deletionJournalB).Error)
+
 	require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
 
 	asRuntime := func(fn func(*gorm.DB) error) error {
@@ -615,6 +693,37 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		}))
 		require.Len(t, contacts, 1)
 		require.Equal(t, contactA.ID, contacts[0].ID)
+	})
+
+	t.Run("Instagram deletion journals are tenant isolated from first insert", func(t *testing.T) {
+		var journals []models.MetaInstagramDataDeletionEvent
+		require.NoError(t, asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+			return tenantDB.Order("digest").Find(&journals).Error
+		}))
+		require.Len(t, journals, 1)
+		require.Equal(t, deletionJournalA.Digest, journals[0].Digest)
+		require.Equal(t, orgA.ID, journals[0].OrganizationID)
+
+		var rowsAffected int64
+		require.NoError(t, asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+			result := tenantDB.Model(&models.MetaInstagramDataDeletionEvent{}).
+				Where("digest = ?", deletionJournalB.Digest).
+				Update("state", "completed")
+			rowsAffected = result.RowsAffected
+			return result.Error
+		}))
+		require.Zero(t, rowsAffected)
+
+		var missingTenantCount int64
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Model(&models.MetaInstagramDataDeletionEvent{}).
+				Count(&missingTenantCount).Error
+		}))
+		require.Zero(t, missingTenantCount)
+
+		var foreignAfter models.MetaInstagramDataDeletionEvent
+		require.NoError(t, adminDB.First(&foreignAfter, "digest = ?", deletionJournalB.Digest).Error)
+		require.Equal(t, "verified", foreignAfter.State)
 	})
 
 	t.Run("new commercial CRM booking and channel tables are tenant isolated", func(t *testing.T) {
@@ -953,6 +1062,33 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 		require.Equal(t, orgB.ID, resolved)
 	})
 
+	t.Run("managed Instagram router is exact and a foreign static shadow cannot persist", func(t *testing.T) {
+		var exactIDs []uuid.UUID
+		require.NoError(t, asTenant(orgB.ID, func(tenantDB *gorm.DB) error {
+			return tenantDB.Model(&models.ChannelAccount{}).
+				Where("external_account_id = ? AND metadata ->> 'meta_platform_app_id' = ?",
+					managedInstagramProfileID, managedInstagramAppID).
+				Pluck("id", &exactIDs).Error
+		}))
+		require.Equal(t, []uuid.UUID{managedInstagramExactB.ID}, exactIDs)
+		var visibleWithoutTenant int64
+		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+			return runtimeDB.Model(&models.ChannelAccount{}).
+				Where("external_account_id = ?", managedInstagramProfileID).
+				Count(&visibleWithoutTenant).Error
+		}))
+		require.Zero(t, visibleWithoutTenant)
+		var shadowCount int64
+		require.NoError(t, adminDB.Model(&models.ChannelAccount{}).
+			Where("organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+				orgA.ID, models.ChannelInstagram, "relay", managedInstagramProfileID).
+			Count(&shadowCount).Error)
+		require.Zero(t, shadowCount)
+		var exactAfter models.ChannelAccount
+		require.NoError(t, adminDB.First(&exactAfter, "id = ?", managedInstagramExactB.ID).Error)
+		require.Equal(t, models.ChannelAccountStatusActive, exactAfter.Status)
+	})
+
 	t.Run("Meta lifecycle resolver pages due tenants without exposing accounts", func(t *testing.T) {
 		var organizationIDs []uuid.UUID
 		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
@@ -1039,6 +1175,56 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 			).Scan(&targets).Error
 		}))
 		require.Empty(t, targets)
+	})
+
+	t.Run("Managed Instagram uses tenant RLS without cross-tenant resolver functions", func(t *testing.T) {
+		partialManagedInstagram := models.ChannelAccount{
+			BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgA.ID,
+			Channel: models.ChannelInstagram, Provider: "relay",
+			Name: "Synthetic partial managed Instagram", ExternalAccountID: "700000000000003",
+			Status: models.ChannelAccountStatusActive, Capabilities: models.JSONB{},
+			Config: models.JSONB{"meta_registry_managed": true}, Metadata: models.JSONB{},
+		}
+		require.NoError(t, adminDB.Create(&partialManagedInstagram).Error)
+		t.Cleanup(func() { _ = adminDB.Delete(&partialManagedInstagram).Error })
+		for _, signature := range []string{
+			"public.rereply_resolve_managed_instagram_org(text,text,uuid)",
+			"public.rereply_ready_meta_instagram_lifecycle_orgs(uuid,integer)",
+			"public.rereply_ready_meta_instagram_lifecycle_orgs_v2(uuid,integer,uuid,text)",
+			"public.rereply_meta_deauth_target_page_v2(text,text,text,uuid,integer)",
+		} {
+			var exists, executable bool
+			require.NoError(t, adminDB.Raw(
+				"SELECT to_regprocedure(?) IS NOT NULL", signature,
+			).Scan(&exists).Error)
+			require.False(t, exists, signature)
+			require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {
+				return runtimeDB.Raw(
+					"SELECT COALESCE(has_function_privilege(current_user, to_regprocedure(?), 'EXECUTE'), false)",
+					signature,
+				).Scan(&executable).Error
+			}))
+			require.False(t, executable, signature)
+		}
+		var orgAInstagramIDs []uuid.UUID
+		require.NoError(t, asTenant(orgA.ID, func(tenantDB *gorm.DB) error {
+			return tenantDB.Model(&models.ChannelAccount{}).
+				Where("channel = ?", models.ChannelInstagram).
+				Pluck("id", &orgAInstagramIDs).Error
+		}))
+		require.Equal(t, []uuid.UUID{partialManagedInstagram.ID}, orgAInstagramIDs)
+		var orgBInstagramIDs []uuid.UUID
+		require.NoError(t, asTenant(orgB.ID, func(tenantDB *gorm.DB) error {
+			return tenantDB.Model(&models.ChannelAccount{}).
+				Where("channel = ?", models.ChannelInstagram).
+				Pluck("id", &orgBInstagramIDs).Error
+		}))
+		require.ElementsMatch(t, []uuid.UUID{
+			metaInstagramChannelB.ID, managedInstagramExactB.ID,
+		}, orgBInstagramIDs)
+		var foreignAfter models.ChannelAccount
+		require.NoError(t, adminDB.First(&foreignAfter, "id = ?", partialManagedInstagram.ID).Error)
+		require.Equal(t, models.ChannelAccountStatusActive, foreignAfter.Status)
 	})
 
 	t.Run("Meta lifecycle and deauthorization resolver limits are NULL-safe and hard-capped", func(t *testing.T) {

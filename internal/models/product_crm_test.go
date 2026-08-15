@@ -140,6 +140,7 @@ func TestProductCRMConstants(t *testing.T) {
 		want string
 	}{
 		{"scheduled job pending", string(models.ScheduledJobStatusPending), "pending"},
+		{"scheduled job generating", string(models.ScheduledJobStatusGenerating), "generating"},
 		{"scheduled job cancelled", string(models.ScheduledJobStatusCancelled), "cancelled"},
 		{"outbox published", string(models.OutboxEventStatusPublished), "published"},
 		{"outbox failed", string(models.OutboxEventStatusFailed), "failed"},

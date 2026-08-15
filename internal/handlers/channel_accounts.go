@@ -23,6 +23,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var ErrChannelAdapterUnavailable = errors.New("channel provider adapter is not available")
@@ -78,6 +79,7 @@ type ChannelAccountResponse struct {
 	IsDefaultOutgoing                      bool                        `json:"is_default_outgoing"`
 	HasCredentials                         bool                        `json:"has_credentials"`
 	MetaSubscriptionReconciliationRequired bool                        `json:"meta_subscription_reconciliation_required"`
+	MetaSubscriptionReconciliationDesired  string                      `json:"meta_subscription_reconciliation_desired_state,omitempty"`
 	ConnectedAt                            *time.Time                  `json:"connected_at,omitempty"`
 	LastHealthCheckAt                      *time.Time                  `json:"last_health_check_at,omitempty"`
 	LastInboundAt                          *time.Time                  `json:"last_inbound_at,omitempty"`
@@ -206,6 +208,16 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,
 			"OAuth-managed Meta accounts must be created through Meta onboarding",
+			nil,
+			"",
+		)
+	}
+	if request.Channel == models.ChannelInstagram && request.Provider == channelapi.RelayProvider &&
+		a.Config.MetaInstagram.Enabled &&
+		strings.TrimSpace(a.Config.MetaInstagram.AllowedOrganizationID) == orgID.String() {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusConflict,
+			"Instagram accounts in this workspace must be connected through managed Meta onboarding",
 			nil,
 			"",
 		)
@@ -417,7 +429,7 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
 			return ErrThreadsAccountManaged
 		}
-		if metaRegistryControlPlaneConfig(account.Config) &&
+		if managedMetaControlPlaneIntent(account) &&
 			(request.Config != nil || request.Capabilities != nil || request.OutboundSecret != "") {
 			return ErrMetaRegistryAccountManaged
 		}
@@ -463,11 +475,18 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 				account.Capabilities = threadsPublicEngagementCapabilities(account.Capabilities)
 			}
 		}
+		managedInstagramEnableRequested := managedInstagramControlPlaneIntent(account) &&
+			((request.OutboundEnabled != nil && *request.OutboundEnabled) ||
+				(request.AIReplyEnabled != nil && *request.AIReplyEnabled))
+		if managedInstagramEnableRequested &&
+			a.metaInstagramCurrentRuntimeBindingReason(account, orgID, time.Now().UTC()) != "" {
+			return ErrMetaRegistryAccountManaged
+		}
 		if request.OutboundEnabled != nil {
 			if *request.OutboundEnabled && account.Status != models.ChannelAccountStatusActive {
 				return errors.New("test and activate the channel account before enabling outbound delivery")
 			}
-			if *request.OutboundEnabled && metaRegistryControlPlaneConfig(account.Config) {
+			if *request.OutboundEnabled && managedMetaControlPlaneIntent(account) {
 				if err := requireFreshMetaRegistryHealthApproval(account, time.Now().UTC()); err != nil {
 					return err
 				}
@@ -475,7 +494,7 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			account.Config["outbound_enabled"] = *request.OutboundEnabled
 		}
 		if request.AIReplyEnabled != nil && *request.AIReplyEnabled &&
-			metaRegistryControlPlaneConfig(account.Config) {
+			managedMetaControlPlaneIntent(account) {
 			if err := requireFreshMetaRegistryHealthApproval(account, time.Now().UTC()); err != nil {
 				return err
 			}
@@ -554,12 +573,12 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			} else if request.OutboundEnabled != nil && !*request.OutboundEnabled {
 				cancelReason = "channel_account_outbound_disabled"
 			}
-			if err := cancelChannelAIReplyJobsForAccountTx(
-				tx,
-				orgID,
-				account.ID,
-				cancelReason,
-			); err != nil {
+			cancel := cancelChannelAIReplyJobsForAccountTx
+			if managedMetaControlPlaneIntent(account) &&
+				request.OutboundEnabled != nil && !*request.OutboundEnabled {
+				cancel = cancelManagedMetaQueuedWorkForAccountTx
+			}
+			if err := cancel(tx, orgID, account.ID, cancelReason); err != nil {
 				return err
 			}
 		}
@@ -645,6 +664,72 @@ func disableChannelDeliveryForRetest(account *models.ChannelAccount) {
 	account.Config["ai_reply_enabled"] = false
 }
 
+func quarantineManagedInstagramHealthPreflightTx(
+	tx *gorm.DB,
+	organizationID uuid.UUID,
+	account *models.ChannelAccount,
+	reason string,
+	now time.Time,
+) error {
+	if tx == nil || account == nil || strings.TrimSpace(reason) == "" {
+		return errors.New("managed Instagram health quarantine requires an exact account and reason")
+	}
+	if account.Status == models.ChannelAccountStatusDisconnected ||
+		metaInstagramDeletionReconciliationPending(account.Metadata) ||
+		metaDeauthorizationReconciliationPending(account.Metadata) ||
+		stringConfigValue(
+			account.Metadata, metaMessengerSubscriptionDesiredStateKey,
+		) == metaMessengerSubscriptionDesiredUnsubscribed {
+		// Callback/disconnect state already owns its exact lifecycle metadata and
+		// has canceled queued work. Health must not overwrite that evidence.
+		return nil
+	}
+	checkedAt := now.UTC()
+	if previous, err := time.Parse(
+		time.RFC3339Nano,
+		stringConfigValue(account.Metadata, "meta_ownership_checked_at"),
+	); err == nil && !checkedAt.After(previous) {
+		checkedAt = previous.Add(time.Nanosecond)
+	}
+	metadata := cloneJSONB(account.Metadata)
+	metadata["meta_ownership_state"] = metaregistry.OwnershipStale
+	metadata["meta_ownership_checked_at"] = checkedAt.Format(time.RFC3339Nano)
+	metadata["meta_ownership_reason"] = reason
+	metadata["meta_activation_state"] = "quarantined"
+	for _, key := range []string{
+		"meta_health_checked_at", "meta_health_oauth_credential_id",
+		"meta_health_oauth_version", "meta_health_webhook_credential_id",
+		"meta_health_webhook_version",
+	} {
+		delete(metadata, key)
+	}
+	config := cloneJSONB(account.Config)
+	config["outbound_enabled"] = false
+	config["ai_reply_enabled"] = false
+	result := tx.Model(&models.ChannelAccount{}).Where(
+		"id = ? AND organization_id = ?", account.ID, organizationID,
+	).Updates(map[string]any{
+		"status": models.ChannelAccountStatusDegraded,
+		"config": config, "metadata": metadata,
+		"last_health_check_at": nil,
+		"last_error":           "Managed Instagram health validation is fenced",
+		"last_error_at":        checkedAt,
+		"updated_at":           checkedAt,
+	})
+	if result.Error != nil || result.RowsAffected != 1 {
+		if result.Error != nil {
+			return result.Error
+		}
+		return gorm.ErrRecordNotFound
+	}
+	account.Status = models.ChannelAccountStatusDegraded
+	account.Config = config
+	account.Metadata = metadata
+	return cancelManagedMetaQueuedWorkForAccountTx(
+		tx, organizationID, account.ID, "managed_instagram_health_preflight_fenced",
+	)
+}
+
 func applyChannelAIReplyOptIn(
 	account *models.ChannelAccount,
 	enabled *bool,
@@ -688,6 +773,10 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 	var account *models.ChannelAccount
 	var adapter channelapi.Adapter
 	var adapterErr error
+	var managedInstagramPreflightReason string
+	var managedInstagramValidationResult channelapi.AccountValidationResult
+	var managedInstagramValidationErr error
+	managedInstagramValidationPerformed := false
 	if err := database.WithTenantReadCommitted(
 		a.rootApp().DB,
 		orgID,
@@ -703,6 +792,7 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			if account.Provider == channelapi.LegacyMetaProvider {
 				return nil
 			}
+			managedInstagram := managedInstagramControlPlaneIntent(account)
 			if account.Channel == models.ChannelThreads {
 				if bindingErr := validateThreadsWebhookAccountBinding(
 					a.Config,
@@ -712,6 +802,21 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 				); bindingErr != nil {
 					adapterErr = bindingErr
 					return nil
+				}
+			}
+			if managedInstagram {
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+					"id = ? AND organization_id = ?", account.ID, orgID,
+				).First(account).Error; err != nil {
+					return err
+				}
+				managedInstagramPreflightReason = a.metaInstagramCurrentRuntimeBindingReason(
+					account, orgID, time.Now().UTC(),
+				)
+				if managedInstagramPreflightReason != "" {
+					return quarantineManagedInstagramHealthPreflightTx(
+						tx, orgID, account, managedInstagramPreflightReason, time.Now().UTC(),
+					)
 				}
 			}
 			adapter, adapterErr = a.channelAdapter(account)
@@ -730,6 +835,14 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 				return gorm.ErrRecordNotFound
 			}
 			account.Metadata = metadata
+			if managedInstagram {
+				// The organization mutex remains held through the signed relay health
+				// request. Whichever of health or a control-plane downgrade owns it
+				// first determines whether the request runs or is fenced.
+				managedInstagramValidationResult, managedInstagramValidationErr =
+					adapter.ValidateAccount(requestContext(r), account)
+				managedInstagramValidationPerformed = true
+			}
 			return nil
 		},
 	); err != nil {
@@ -741,6 +854,13 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			"Failed to prepare channel account validation",
 			nil,
 			"",
+		)
+	}
+	if managedInstagramPreflightReason != "" {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusConflict,
+			"Managed Instagram health validation is fenced by the current binding",
+			nil, "",
 		)
 	}
 	if account.Provider == channelapi.LegacyMetaProvider {
@@ -771,7 +891,11 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			"",
 		)
 	}
-	result, validationErr := adapter.ValidateAccount(requestContext(r), account)
+	validatedStatus := account.Status
+	result, validationErr := managedInstagramValidationResult, managedInstagramValidationErr
+	if !managedInstagramValidationPerformed {
+		result, validationErr = adapter.ValidateAccount(requestContext(r), account)
+	}
 	now := time.Now().UTC()
 	var oldAccount models.ChannelAccount
 
@@ -809,11 +933,39 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			if currentFingerprint != validatedFingerprint {
 				return ErrChannelAccountChangedDuringValidation
 			}
+			managedInstagramBindingDriftReason := ""
+			managedInstagram := managedInstagramControlPlaneIntent(currentAccount)
+			if managedInstagram &&
+				(currentAccount.Status == models.ChannelAccountStatusDisconnected ||
+					metaInstagramDeletionReconciliationPending(currentAccount.Metadata) ||
+					metaDeauthorizationReconciliationPending(currentAccount.Metadata) ||
+					stringConfigValue(
+						currentAccount.Metadata, metaMessengerSubscriptionDesiredStateKey,
+					) == metaMessengerSubscriptionDesiredUnsubscribed) {
+				// A disconnect or signed callback that acquired the organization
+				// mutex owns the final state. Never let an older provider health
+				// response overwrite its status, credentials, or reconciliation
+				// evidence.
+				return ErrChannelAccountValidationSuperseded
+			}
+			if validationErr == nil && result.Valid && managedInstagram {
+				if currentAccount.Status != validatedStatus {
+					managedInstagramBindingDriftReason = "managed_instagram_status_changed"
+				} else {
+					managedInstagramBindingDriftReason = a.metaInstagramCurrentRuntimeBindingReason(
+						currentAccount, orgID, now,
+					)
+				}
+				if managedInstagramBindingDriftReason != "" {
+					validationErr = errors.New("managed Instagram binding changed during validation")
+				}
+			}
 			oldAccount = *currentAccount
 			oldAccount.Config = cloneJSONB(currentAccount.Config)
 			oldAccount.Capabilities = cloneJSONB(currentAccount.Capabilities)
 			oldAccount.Metadata = cloneJSONB(currentAccount.Metadata)
 			currentAccount.LastHealthCheckAt = &now
+			managedMetaHealthFailure := false
 			if validationErr != nil || !result.Valid {
 				currentAccount.LastErrorAt = &now
 				if validationErr != nil {
@@ -821,11 +973,32 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 				} else {
 					currentAccount.LastError = "Provider rejected the channel account"
 				}
-				if currentAccount.Status == models.ChannelAccountStatusActive {
+				if currentAccount.Status == models.ChannelAccountStatusActive ||
+					(managedInstagramBindingDriftReason != "" &&
+						currentAccount.Status != models.ChannelAccountStatusDisconnected) {
 					currentAccount.Status = models.ChannelAccountStatusDegraded
 				}
+				if managedMetaControlPlaneIntent(currentAccount) {
+					managedMetaHealthFailure = true
+					currentAccount.Config = cloneJSONB(currentAccount.Config)
+					currentAccount.Config["outbound_enabled"] = false
+					currentAccount.Config["ai_reply_enabled"] = false
+				}
+				if managedInstagramBindingDriftReason != "" {
+					metadata := cloneJSONB(currentAccount.Metadata)
+					metadata["meta_activation_state"] = "quarantined"
+					metadata["meta_ownership_reason"] = managedInstagramBindingDriftReason
+					for _, key := range []string{
+						"meta_health_checked_at", "meta_health_oauth_credential_id",
+						"meta_health_oauth_version", "meta_health_webhook_credential_id",
+						"meta_health_webhook_version",
+					} {
+						delete(metadata, key)
+					}
+					currentAccount.Metadata = metadata
+				}
 			} else {
-				managedMeta := metaRegistryControlPlaneConfig(currentAccount.Config)
+				managedMeta := managedMetaControlPlaneIntent(currentAccount)
 				if !managedMeta {
 					currentAccount.Status = models.ChannelAccountStatusActive
 				}
@@ -869,7 +1042,16 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 			// epoch. Cancel old AI work before saving the new account status so a
 			// later recovery cannot resurrect an inbound message from the prior
 			// state.
-			if oldAccount.Status != account.Status {
+			if managedMetaHealthFailure {
+				if err := cancelManagedMetaQueuedWorkForAccountTx(
+					tx,
+					orgID,
+					account.ID,
+					"managed_meta_health_downgraded",
+				); err != nil {
+					return err
+				}
+			} else if oldAccount.Status != account.Status {
 				if err := cancelChannelAIReplyJobsForAccountTx(
 					tx,
 					orgID,
@@ -883,6 +1065,7 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 				Where("id = ? AND organization_id = ?", account.ID, orgID).
 				Updates(map[string]any{
 					"status":               account.Status,
+					"config":               account.Config,
 					"capabilities":         account.Capabilities,
 					"last_health_check_at": account.LastHealthCheckAt,
 					"last_error":           account.LastError,
@@ -1017,7 +1200,7 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
 			return ErrThreadsAccountManaged
 		}
-		if metaRegistryControlPlaneConfig(account.Config) {
+		if managedMetaControlPlaneIntent(account) {
 			return ErrMetaRegistryAccountManaged
 		}
 		if err := cancelChannelAIReplyJobsForAccountTx(
@@ -1070,6 +1253,9 @@ func (a *App) DeleteChannelAccount(r *fastglue.Request) error {
 func (a *App) channelAdapter(account *models.ChannelAccount) (channelapi.Adapter, error) {
 	if account == nil {
 		return nil, ErrChannelAdapterUnavailable
+	}
+	if a.channelAdapterFactory != nil {
+		return a.channelAdapterFactory(account)
 	}
 	if account.Channel == models.ChannelThreads {
 		if !strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
@@ -1205,6 +1391,7 @@ func channelAccountToResponse(account *models.ChannelAccount) ChannelAccountResp
 		IsDefaultOutgoing:                      account.IsDefaultOutgoing,
 		HasCredentials:                         currentChannelCredential(account) != nil,
 		MetaSubscriptionReconciliationRequired: metaMessengerSubscriptionReconciliationRequired(account),
+		MetaSubscriptionReconciliationDesired:  metaSubscriptionReconciliationDesiredState(account),
 		ConnectedAt:                            account.ConnectedAt,
 		LastHealthCheckAt:                      account.LastHealthCheckAt,
 		LastInboundAt:                          account.LastInboundAt,
@@ -1219,8 +1406,13 @@ func channelAccountToResponse(account *models.ChannelAccount) ChannelAccountResp
 }
 
 func metaMessengerSubscriptionReconciliationRequired(account *models.ChannelAccount) bool {
-	if account == nil || account.Channel != models.ChannelMessenger ||
-		!metaRegistryControlPlaneConfig(account.Config) {
+	if account == nil ||
+		(account.Channel != models.ChannelMessenger && account.Channel != models.ChannelInstagram) ||
+		!managedMetaControlPlaneIntent(account) {
+		return false
+	}
+	if account.Channel == models.ChannelInstagram &&
+		stringConfigValue(account.Config, "instagram_api_mode") != "instagram_login" {
 		return false
 	}
 	if stringConfigValue(account.Metadata, metaMessengerSubscriptionFencedOperationIDKey) != "" {
@@ -1234,6 +1426,18 @@ func metaMessengerSubscriptionReconciliationRequired(account *models.ChannelAcco
 		return true
 	default:
 		return false
+	}
+}
+
+func metaSubscriptionReconciliationDesiredState(account *models.ChannelAccount) string {
+	if !metaMessengerSubscriptionReconciliationRequired(account) {
+		return ""
+	}
+	switch desired := stringConfigValue(account.Metadata, metaMessengerSubscriptionDesiredStateKey); desired {
+	case metaMessengerSubscriptionDesiredSubscribed, metaMessengerSubscriptionDesiredUnsubscribed:
+		return desired
+	default:
+		return ""
 	}
 }
 
@@ -1452,6 +1656,56 @@ func boolConfigValue(config models.JSONB, key string) bool {
 func metaRegistryControlPlaneConfig(config models.JSONB) bool {
 	return boolConfigValue(config, "meta_registry_managed") ||
 		stringConfigValue(config, "meta_management_mode") == metaregistry.ManagementModePlatformOAuth
+}
+
+// metaRegistryControlPlaneConfig detects managed-control-plane intent using
+// either reserved marker so partial rollback/seeded rows are never mistaken
+// for static relay accounts. Exact runtime bindings must require both markers.
+func exactMetaRegistryControlPlaneConfig(config models.JSONB) bool {
+	return boolConfigValue(config, "meta_registry_managed") &&
+		stringConfigValue(config, "meta_management_mode") == metaregistry.ManagementModePlatformOAuth
+}
+
+// managedInstagramControlPlaneIntent is deliberately broader than an exact
+// authorization binding. Either reserved marker identifies managed intent;
+// server-owned Instagram Login metadata, operation, or URL residue also
+// identifies a rollback row after an older editor strips both markers. Exact
+// provider calls still require both markers.
+func managedInstagramControlPlaneIntent(account *models.ChannelAccount) bool {
+	if account == nil || account.Channel != models.ChannelInstagram ||
+		account.Provider != channelapi.RelayProvider {
+		return false
+	}
+	if metaRegistryControlPlaneConfig(account.Config) {
+		return true
+	}
+	platformAppID := stringConfigValue(account.Metadata, "meta_platform_app_id")
+	if !validCanonicalMetaID(platformAppID) || !validCanonicalMetaID(account.ExternalAccountID) {
+		return false
+	}
+	instagramIdentityResidue := stringConfigValue(account.Config, "instagram_api_mode") == "instagram_login" &&
+		stringConfigValue(account.Metadata, "meta_webhook_app") == "instagram_login"
+	subscriptionResidue := stringConfigValue(
+		account.Metadata, metaMessengerSubscriptionOperationIDKey,
+	) != ""
+	webhookSuffix := "/api/webhooks/channels/" + account.ID.String()
+	relaySuffix := "/v1/accounts/instagram/" + account.ExternalAccountID
+	managedURLResidue := strings.HasSuffix(
+		stringConfigValue(account.Config, "rereply_webhook_url"), webhookSuffix,
+	) && strings.HasSuffix(stringConfigValue(account.Config, "relay_url"), relaySuffix)
+	return instagramIdentityResidue || subscriptionResidue || managedURLResidue
+}
+
+func managedMetaControlPlaneIntent(account *models.ChannelAccount) bool {
+	if account == nil {
+		return false
+	}
+	if account.Channel == models.ChannelInstagram {
+		return managedInstagramControlPlaneIntent(account)
+	}
+	return account.Channel == models.ChannelMessenger &&
+		account.Provider == channelapi.RelayProvider &&
+		metaRegistryControlPlaneConfig(account.Config)
 }
 
 func hasReservedMetaRegistryMarker(config models.JSONB) bool {

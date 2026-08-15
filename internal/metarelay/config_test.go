@@ -51,7 +51,7 @@ func loadTestEnvironment(environment map[string]string) (*Config, error) {
 	return loadConfig(func(name string) string { return environment[name] })
 }
 
-func TestLoadConfigRequiresDistinctWebhookCredentialsAndExplicitModes(t *testing.T) {
+func TestLoadConfigPreservesStaticWebhookRouteIsolationAndExplicitModes(t *testing.T) {
 	environment := validConfigEnvironment()
 	config, err := loadTestEnvironment(environment)
 	if err != nil {
@@ -70,14 +70,14 @@ func TestLoadConfigRequiresDistinctWebhookCredentialsAndExplicitModes(t *testing
 	environment["META_RELAY_INSTAGRAM_APP_SECRET"] = environment["META_RELAY_MESSENGER_APP_SECRET"]
 	if _, err := loadTestEnvironment(environment); err == nil ||
 		!strings.Contains(err.Error(), "must be distinct") {
-		t.Fatalf("expected duplicate app secret rejection, got %v", err)
+		t.Fatalf("expected static app-secret isolation, got %v", err)
 	}
 
 	environment = validConfigEnvironment()
 	environment["META_RELAY_INSTAGRAM_VERIFY_TOKEN"] = environment["META_RELAY_MESSENGER_VERIFY_TOKEN"]
 	if _, err := loadTestEnvironment(environment); err == nil ||
 		!strings.Contains(err.Error(), "must be distinct") {
-		t.Fatalf("expected duplicate verify token rejection, got %v", err)
+		t.Fatalf("expected static verify-token isolation, got %v", err)
 	}
 }
 
@@ -185,5 +185,106 @@ func TestLoadConfigRequiresExplicitDynamicRegistryAndReaderFence(t *testing.T) {
 	delete(environment, "META_RELAY_MANAGED_MESSENGER_APP_ID")
 	if _, err := loadTestEnvironment(environment); err == nil || !strings.Contains(err.Error(), "MANAGED_MESSENGER_APP_ID") {
 		t.Fatalf("expected exact dynamic Messenger app identity, got %v", err)
+	}
+}
+
+func TestLoadConfigIsolatesManagedInstagramApplicationAndAllowsIGOnlyRegistry(t *testing.T) {
+	environment := validConfigEnvironment()
+	environment["META_RELAY_REGISTRY_URL"] = "https://app.example.test/internal/meta-registry/v1/resolve"
+	environment["META_RELAY_REGISTRY_SECRET"] = "synthetic-registry-config-secret-at-least-32-bytes"
+	environment["META_RELAY_REGISTRY_EDGE_SECRET"] = "synthetic-registry-edge-secret-at-least-32-bytes"
+	environment["META_RELAY_REGISTRY_ENABLED"] = "true"
+	environment["META_RELAY_DYNAMIC_QUEUE_READER_VERSION"] = "2"
+	environment["META_RELAY_MANAGED_INSTAGRAM_APP_ID"] = "789012"
+	environment["META_RELAY_MANAGED_INSTAGRAM_APP_SECRET"] = "managed-instagram-app-secret-at-least-32-bytes"
+	environment["META_RELAY_MANAGED_INSTAGRAM_VERIFY_TOKEN"] = "managed-instagram-verify-token"
+
+	config, err := loadTestEnvironment(environment)
+	if err != nil {
+		t.Fatalf("expected managed Instagram-only registry config: %v", err)
+	}
+	if config.ManagedInstagramAppID != "789012" || !config.RegistryEnabled {
+		t.Fatalf("managed Instagram identity was not retained: %#v", config)
+	}
+
+	delete(environment, "META_RELAY_MANAGED_INSTAGRAM_VERIFY_TOKEN")
+	if _, err := loadTestEnvironment(environment); err == nil ||
+		!strings.Contains(err.Error(), "MANAGED_INSTAGRAM_VERIFY_TOKEN") {
+		t.Fatalf("expected complete managed Instagram credential group, got %v", err)
+	}
+
+	environment["META_RELAY_MANAGED_INSTAGRAM_VERIFY_TOKEN"] = "instagram-verify"
+	if _, err := loadTestEnvironment(environment); err == nil || !strings.Contains(err.Error(), "use distinct") {
+		t.Fatalf("expected managed/static verify-token isolation, got %v", err)
+	}
+}
+
+func TestLoadConfigRequiresDistinctManagedMessengerAndInstagramCredentials(t *testing.T) {
+	managedEnvironment := func() map[string]string {
+		environment := validConfigEnvironment()
+		environment["META_RELAY_REGISTRY_URL"] = "https://app.example.test/internal/meta-registry/v1/resolve"
+		environment["META_RELAY_REGISTRY_SECRET"] = "synthetic-registry-config-secret-at-least-32-bytes"
+		environment["META_RELAY_REGISTRY_EDGE_SECRET"] = "synthetic-registry-edge-secret-at-least-32-bytes"
+		environment["META_RELAY_REGISTRY_ENABLED"] = "true"
+		environment["META_RELAY_DYNAMIC_QUEUE_READER_VERSION"] = "2"
+		environment["META_RELAY_MANAGED_MESSENGER_APP_ID"] = "123456"
+		environment["META_RELAY_MANAGED_MESSENGER_APP_SECRET"] = "synthetic-managed-messenger-secret-at-least-32-bytes"
+		environment["META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN"] = "synthetic-managed-messenger-verify-token"
+		environment["META_RELAY_MANAGED_INSTAGRAM_APP_ID"] = "789012"
+		environment["META_RELAY_MANAGED_INSTAGRAM_APP_SECRET"] = "synthetic-managed-instagram-secret-at-least-32-bytes"
+		environment["META_RELAY_MANAGED_INSTAGRAM_VERIFY_TOKEN"] = "synthetic-managed-instagram-verify-token"
+		return environment
+	}
+
+	if _, err := loadTestEnvironment(managedEnvironment()); err != nil {
+		t.Fatalf("expected pairwise-isolated static and managed credentials: %v", err)
+	}
+	for _, field := range []string{
+		"META_RELAY_INSTAGRAM_APP_SECRET", "META_RELAY_INSTAGRAM_VERIFY_TOKEN",
+	} {
+		environment := managedEnvironment()
+		if field == "META_RELAY_INSTAGRAM_APP_SECRET" {
+			environment[field] = environment["META_RELAY_MESSENGER_APP_SECRET"]
+		} else {
+			environment[field] = environment["META_RELAY_MESSENGER_VERIFY_TOKEN"]
+		}
+		if _, err := loadTestEnvironment(environment); err == nil ||
+			!strings.Contains(err.Error(), "must be distinct") {
+			t.Fatalf("expected registry-enabled static route isolation for %s, got %v", field, err)
+		}
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+	}{
+		{
+			name: "app ID",
+			mutate: func(environment map[string]string) {
+				environment["META_RELAY_MANAGED_INSTAGRAM_APP_ID"] = environment["META_RELAY_MANAGED_MESSENGER_APP_ID"]
+			},
+		},
+		{
+			name: "app secret",
+			mutate: func(environment map[string]string) {
+				environment["META_RELAY_MANAGED_INSTAGRAM_APP_SECRET"] = environment["META_RELAY_MANAGED_MESSENGER_APP_SECRET"]
+			},
+		},
+		{
+			name: "verify token",
+			mutate: func(environment map[string]string) {
+				environment["META_RELAY_MANAGED_INSTAGRAM_VERIFY_TOKEN"] = environment["META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN"]
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			environment := managedEnvironment()
+			test.mutate(environment)
+			_, err := loadTestEnvironment(environment)
+			if err == nil || !strings.Contains(err.Error(), "distinct app IDs, app secrets, and verify tokens") {
+				t.Fatalf("expected managed %s collision rejection, got %v", test.name, err)
+			}
+		})
 	}
 }

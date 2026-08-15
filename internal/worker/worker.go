@@ -38,6 +38,10 @@ type Worker struct {
 	QwenHTTP  *http.Client
 	Consumer  *queue.RedisConsumer
 	Publisher *queue.Publisher
+	// channelAdapterFactory is an internal deterministic seam for exercising
+	// the complete outbox authorization/send/settlement path in package tests.
+	// Production workers leave it nil and use the built-in provider adapters.
+	channelAdapterFactory func(*models.ChannelAccount) (channelapi.Adapter, error)
 }
 
 // Ensure Worker implements JobHandler interface

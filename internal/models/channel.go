@@ -233,6 +233,32 @@ func (MetaDeauthorizationEvent) TableName() string {
 	return "meta_deauthorization_events"
 }
 
+// MetaInstagramDataDeletionEvent is the non-secret durable journal for the
+// managed Instagram Login application's data-deletion callback. It is
+// intentionally separate from MetaDeauthorizationEvent: a deletion request
+// creates a privacy workflow and status URL, while deauthorization only
+// revokes an authorization. The callback is assigned to the deployment-owned
+// tenant immediately after its app signature has been verified. Keeping the
+// tenant non-null from the first insert lets PostgreSQL RLS protect the privacy
+// journal even when there is no current channel account.
+type MetaInstagramDataDeletionEvent struct {
+	Digest            string     `gorm:"size:64;primaryKey" json:"-"`
+	PlatformAppID     string     `gorm:"size:64;not null;index" json:"-"`
+	AuthorizingUserID string     `gorm:"size:64;not null;index" json:"-"`
+	IssuedAt          time.Time  `gorm:"not null" json:"-"`
+	VerifiedAt        time.Time  `gorm:"not null;index" json:"-"`
+	State             string     `gorm:"size:24;not null;default:'verified';index" json:"-"`
+	OrganizationID    uuid.UUID  `gorm:"type:uuid;not null;index" json:"-"`
+	PrivacyRequestID  *uuid.UUID `gorm:"type:uuid;index" json:"-"`
+	RequestNumber     string     `gorm:"size:64;index" json:"-"`
+	LastAttemptAt     *time.Time `json:"-"`
+	CompletedAt       *time.Time `gorm:"index" json:"-"`
+}
+
+func (MetaInstagramDataDeletionEvent) TableName() string {
+	return "meta_instagram_data_deletion_events"
+}
+
 // ContactIdentity maps an internal CRM contact to one provider identity.
 type ContactIdentity struct {
 	BaseModel

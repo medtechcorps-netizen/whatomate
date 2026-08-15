@@ -29,7 +29,10 @@ const (
 	rawInboundProcessingLease = 2 * time.Minute
 )
 
-var errThreadsWebhookBindingInactive = errors.New("threads webhook binding is no longer active")
+var (
+	errThreadsWebhookBindingInactive       = errors.New("threads webhook binding is no longer active")
+	errMetaInstagramWebhookBindingInactive = errors.New("managed Instagram webhook binding is no longer active")
+)
 
 // VerifyChannelWebhook handles Meta's GET subscription challenge for an
 // OAuth-managed channel callback URL.
@@ -162,6 +165,21 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		)
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid webhook signature", nil, "")
 	}
+	managedInstagram := managedInstagramLoginWebhookAccount(&account)
+	verifiedWebhookCredentialID := uuid.Nil
+	verifiedWebhookCredentialVersion := 0
+	if managedInstagram {
+		verifiedWebhook := currentMetaRegistryCredential(
+			account.Credentials,
+			models.ChannelCredentialKindWebhook,
+			time.Now().UTC(),
+		)
+		if verifiedWebhook == nil {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
+		}
+		verifiedWebhookCredentialID = verifiedWebhook.ID
+		verifiedWebhookCredentialVersion = verifiedWebhook.Version
+	}
 	hint, err := adapter.RouteHint(headers, body)
 	if err != nil || (account.Channel != models.ChannelThreads && hint.ExternalAccountID != account.ExternalAccountID) {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Webhook route does not match payload", nil, "")
@@ -201,7 +219,8 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 	shouldProcess := false
 	retry := false
 	if err := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
-		if account.Channel == models.ChannelThreads {
+		switch {
+		case account.Channel == models.ChannelThreads:
 			currentAccount, bindingErr := lockThreadsWebhookPersistenceBinding(
 				a.Config,
 				tx,
@@ -216,12 +235,30 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 			}
 			account = *currentAccount
 			rawEvent.ChannelAccountID = account.ID
+		case managedInstagram:
+			currentAccount, bindingErr := a.lockMetaInstagramWebhookPersistenceBinding(
+				tx,
+				orgID,
+				account.ID,
+				account.ExternalAccountID,
+				verifiedWebhookCredentialID,
+				verifiedWebhookCredentialVersion,
+				headers,
+				body,
+				time.Now().UTC(),
+			)
+			if bindingErr != nil {
+				return bindingErr
+			}
+			account = *currentAccount
+			rawEvent.ChannelAccountID = account.ID
 		}
 		var claimErr error
 		shouldProcess, retry, claimErr = persistOrClaimRawInboundEvent(tx, &rawEvent)
 		return claimErr
 	}); err != nil {
-		if errors.Is(err, errThreadsWebhookBindingInactive) {
+		if errors.Is(err, errThreadsWebhookBindingInactive) ||
+			errors.Is(err, errMetaInstagramWebhookBindingInactive) {
 			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Channel webhook not found", nil, "")
 		}
 		a.Log.Error("Failed to persist channel webhook", "error", err, "organization_id", orgID)
@@ -356,15 +393,40 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 	}
 
 	processErr := database.WithTenant(a.DB, orgID, func(tx *gorm.DB) error {
-		// AI scheduling and every control-plane change share this tenant mutex.
-		// Acquire it before touching account, identity, contact, conversation, or
-		// message rows so no later lock is held while waiting for the mutex.
-		if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
-			return err
-		}
-		currentAccount, err := loadChannelAccount(tx, orgID, account.ID, false)
-		if err != nil {
-			return err
+		var currentAccount *models.ChannelAccount
+		if managedInstagram {
+			// The durable raw event and canonical inbox writes are separate
+			// transactions. Re-run the exact generation/signature fence at this
+			// second boundary so a downgrade between them cannot persist contacts,
+			// conversations, messages, or AI work.
+			var bindingErr error
+			currentAccount, bindingErr = a.lockMetaInstagramWebhookPersistenceBinding(
+				tx,
+				orgID,
+				account.ID,
+				account.ExternalAccountID,
+				verifiedWebhookCredentialID,
+				verifiedWebhookCredentialVersion,
+				headers,
+				body,
+				time.Now().UTC(),
+			)
+			if bindingErr != nil {
+				return bindingErr
+			}
+		} else {
+			// AI scheduling and every control-plane change share this tenant
+			// mutex. Acquire it before touching account, identity, contact,
+			// conversation, or message rows so no later lock is held while
+			// waiting for the mutex.
+			if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
+				return err
+			}
+			var loadErr error
+			currentAccount, loadErr = loadChannelAccount(tx, orgID, account.ID, false)
+			if loadErr != nil {
+				return loadErr
+			}
 		}
 		account = *currentAccount
 		for i := range events {
@@ -390,6 +452,39 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 			}).Error
 	})
 	if processErr != nil {
+		if errors.Is(processErr, errMetaInstagramWebhookBindingInactive) {
+			if err := markInboundEventIgnored(
+				a.DB,
+				orgID,
+				rawEvent.ID,
+				"managed_instagram_binding_inactive",
+				"Verified webhook quarantined because the managed Instagram binding changed before canonical persistence",
+			); err != nil {
+				a.Log.Error(
+					"Failed to quarantine managed Instagram webhook",
+					"error",
+					err,
+					"organization_id",
+					orgID,
+					"channel_account_id",
+					account.ID,
+					"inbound_event_id",
+					rawEvent.ID,
+				)
+				return r.SendErrorEnvelope(
+					fasthttp.StatusServiceUnavailable,
+					"Webhook could not be safely quarantined",
+					nil,
+					"",
+				)
+			}
+			return r.SendEnvelope(map[string]any{
+				"accepted":  true,
+				"duplicate": false,
+				"discarded": true,
+				"reason":    "managed_instagram_binding_inactive",
+			})
+		}
 		markInboundEventFailed(a.DB, orgID, rawEvent.ID, "processing_failed", processErr)
 		a.Log.Error(
 			"Failed to process channel webhook",
@@ -592,6 +687,110 @@ func lockThreadsWebhookPersistenceBinding(
 		return nil, errThreadsWebhookBindingInactive
 	}
 	account.Credentials = credentials
+	return &account, nil
+}
+
+func managedInstagramLoginWebhookAccount(account *models.ChannelAccount) bool {
+	return managedInstagramControlPlaneIntent(account)
+}
+
+// lockMetaInstagramWebhookPersistenceBinding is the final authorization
+// boundary before a relay-authenticated Instagram Login payload becomes
+// durable. Control-plane changes use the same organization -> account ->
+// credential lock order, so a downgrade that owns the organization mutex is
+// visible here before any raw event, inbox message, or AI job can be written.
+func (a *App) lockMetaInstagramWebhookPersistenceBinding(
+	tx *gorm.DB,
+	organizationID, accountID uuid.UUID,
+	expectedExternalAccountID string,
+	verifiedWebhookCredentialID uuid.UUID,
+	verifiedWebhookCredentialVersion int,
+	headers http.Header,
+	body []byte,
+	now time.Time,
+) (*models.ChannelAccount, error) {
+	if a == nil || a.Config == nil || tx == nil || organizationID == uuid.Nil ||
+		accountID == uuid.Nil || verifiedWebhookCredentialID == uuid.Nil ||
+		verifiedWebhookCredentialVersion < 1 {
+		return nil, errMetaInstagramWebhookBindingInactive
+	}
+	expectedExternalAccountID = strings.TrimSpace(expectedExternalAccountID)
+	if expectedExternalAccountID == "" {
+		return nil, errMetaInstagramWebhookBindingInactive
+	}
+	now = now.UTC()
+	if now.IsZero() {
+		return nil, errMetaInstagramWebhookBindingInactive
+	}
+	if err := lockChannelAIOrganizationScopeTx(tx, organizationID); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errMetaInstagramWebhookBindingInactive
+		}
+		return nil, err
+	}
+
+	var account models.ChannelAccount
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"id = ? AND organization_id = ? AND channel = ? AND provider = ?",
+		accountID, organizationID, models.ChannelInstagram, channelapi.RelayProvider,
+	).First(&account).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errMetaInstagramWebhookBindingInactive
+		}
+		return nil, err
+	}
+	if account.Status != models.ChannelAccountStatusActive ||
+		strings.TrimSpace(account.ExternalAccountID) != expectedExternalAccountID ||
+		!managedInstagramLoginWebhookAccount(&account) ||
+		!exactManagedInstagramCallbackBinding(
+			&account,
+			strings.TrimSpace(a.Config.MetaInstagram.AppID),
+			stringConfigValue(account.Metadata, "meta_authorizing_user_id"),
+		) {
+		return nil, errMetaInstagramWebhookBindingInactive
+	}
+
+	var credentials []models.ChannelCredential
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"organization_id = ? AND channel_account_id = ? AND status IN ?",
+		organizationID,
+		account.ID,
+		[]models.ChannelCredentialStatus{
+			models.ChannelCredentialStatusActive,
+			models.ChannelCredentialStatusExpiring,
+		},
+	).Order("version DESC, id ASC").Find(&credentials).Error; err != nil {
+		return nil, err
+	}
+	account.Credentials = credentials
+	oauth := currentMetaRegistryCredential(
+		account.Credentials,
+		models.ChannelCredentialKindOAuth,
+		now,
+	)
+	webhook := currentMetaRegistryCredential(
+		account.Credentials,
+		models.ChannelCredentialKindWebhook,
+		now,
+	)
+	if !metaInstagramCredentialPairGenerationValid(oauth, webhook, now) ||
+		webhook.ID != verifiedWebhookCredentialID ||
+		webhook.Version != verifiedWebhookCredentialVersion ||
+		a.metaInstagramCurrentRuntimeBindingReason(&account, organizationID, now) != "" ||
+		!metaInstagramSubscribedOperationMatchesCredentials(account.Metadata, *oauth, *webhook) {
+		return nil, errMetaInstagramWebhookBindingInactive
+	}
+
+	// Verify again with only the exact locked webhook credential. This prevents
+	// a stale generation or a non-webhook credential from being used as a
+	// fallback after the control-plane state was reloaded.
+	account.Credentials = []models.ChannelCredential{*oauth, *webhook}
+	verificationAccount := account
+	verificationAccount.Credentials = []models.ChannelCredential{*webhook}
+	adapter, err := a.channelAdapter(&verificationAccount)
+	if err != nil || adapter.VerifyWebhook(&verificationAccount, headers, body) != nil {
+		return nil, errMetaInstagramWebhookBindingInactive
+	}
 	return &account, nil
 }
 

@@ -13,6 +13,12 @@ import (
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+var errMetaInstagramProfileAlreadyRegistered = errors.New(
+	"instagram profile already has a relay account; reconnect or migrate that account",
 )
 
 // metaRegistryProvisionInput is the narrow persistence boundary for future
@@ -29,6 +35,7 @@ type metaRegistryProvisionInput struct {
 	WebhookApp                     string
 	PlatformAppID                  string
 	MetaBusinessID                 string
+	MetaAuthorityAssetID           string
 	AuthorizingMetaUserID          string
 	AuthorizationTokenKind         string
 	GrantedScopes                  []string
@@ -36,6 +43,7 @@ type metaRegistryProvisionInput struct {
 	AuthorityToken                 string
 	TokenExpiresAt                 *time.Time
 	OwnershipCheckedAt             time.Time
+	AuthorizationStartedAt         time.Time
 	ReReplyBaseURL                 string
 	RelayBaseURL                   string
 	SubscriptionOperationID        uuid.UUID
@@ -62,6 +70,7 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 	input.AccessToken = strings.TrimSpace(input.AccessToken)
 	input.AuthorityToken = strings.TrimSpace(input.AuthorityToken)
 	input.MetaBusinessID = strings.TrimSpace(input.MetaBusinessID)
+	input.MetaAuthorityAssetID = strings.TrimSpace(input.MetaAuthorityAssetID)
 	input.AuthorizingMetaUserID = strings.TrimSpace(input.AuthorizingMetaUserID)
 	input.AuthorizationTokenKind = strings.ToUpper(strings.TrimSpace(input.AuthorizationTokenKind))
 	input.WebhookApp = strings.TrimSpace(input.WebhookApp)
@@ -76,17 +85,63 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 	} else {
 		input.SubscriptionOperationExpiresAt = input.SubscriptionOperationExpiresAt.UTC()
 	}
+	validPlatformBinding := false
+	switch input.Channel {
+	case models.ChannelMessenger:
+		validPlatformBinding = input.InstagramAPIMode == "" && input.WebhookApp == "messenger" &&
+			input.MetaBusinessID != ""
+	case models.ChannelInstagram:
+		validPlatformBinding = input.InstagramAPIMode == "instagram_login" &&
+			input.WebhookApp == "instagram_login" &&
+			input.MetaAuthorityAssetID == input.ExternalAccountID &&
+			validCanonicalMetaID(input.AuthorizingMetaUserID) &&
+			input.PlatformAppID == strings.TrimSpace(a.Config.MetaInstagram.AppID)
+	}
 	if input.Name == "" || utf8.RuneCountInString(input.Name) > 100 ||
 		!channelExternalAccountIdentifier.MatchString(input.ExternalAccountID) ||
-		input.AccessToken == "" || input.AuthorityToken == "" || input.MetaBusinessID == "" || input.AuthorizingMetaUserID == "" ||
+		input.AccessToken == "" || input.AuthorityToken == "" || input.AuthorizingMetaUserID == "" ||
 		(input.AuthorizationTokenKind != metaMessengerTokenKindSystemUser &&
 			input.AuthorizationTokenKind != metaMessengerTokenKindUser) ||
-		input.PlatformAppID == "" ||
+		input.PlatformAppID == "" || !validPlatformBinding ||
 		input.OwnershipCheckedAt.IsZero() || input.OwnershipCheckedAt.After(now.Add(time.Minute)) ||
 		input.OwnershipCheckedAt.Before(now.Add(-10*time.Minute)) ||
 		(input.TokenExpiresAt != nil && !input.TokenExpiresAt.After(now.Add(5*time.Second))) ||
+		(input.Channel == models.ChannelInstagram &&
+			(input.TokenExpiresAt == nil || !input.TokenExpiresAt.After(now.Add(metaInstagramProviderOperationLimit)) ||
+				!metaInstagramOAuthAuthorizationStartValid(input.AuthorizationStartedAt, now))) ||
 		!input.SubscriptionOperationExpiresAt.After(now) {
 		return metaRegistryProvisionResult{}, metaregistry.ErrInvalidRequest
+	}
+	if input.Channel == models.ChannelInstagram {
+		// The organization row is the gap-lock surrogate for a profile that does
+		// not exist yet. It serializes two valid OAuth callbacks before either can
+		// create an account and also protects the exact static/managed collision
+		// query from a concurrent account create.
+		if err := lockChannelAIOrganizationScopeTx(a.DB, input.OrganizationID); err != nil {
+			return metaRegistryProvisionResult{}, err
+		}
+		if err := a.metaInstagramOAuthGenerationFence(
+			input.OrganizationID,
+			input.PlatformAppID,
+			input.AuthorizingMetaUserID,
+			input.AuthorizationStartedAt,
+			time.Time{},
+			nil,
+		); err != nil {
+			return metaRegistryProvisionResult{}, err
+		}
+		var conflict models.ChannelAccount
+		err := a.DB.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").Where(
+			"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+			input.OrganizationID, models.ChannelInstagram,
+			channelapi.RelayProvider, input.ExternalAccountID,
+		).Take(&conflict).Error
+		switch {
+		case err == nil:
+			return metaRegistryProvisionResult{}, errMetaInstagramProfileAlreadyRegistered
+		case !errors.Is(err, gorm.ErrRecordNotFound):
+			return metaRegistryProvisionResult{}, err
+		}
 	}
 	var membership models.UserOrganization
 	if err := a.DB.Where("user_id = ? AND organization_id = ?", input.UserID, input.OrganizationID).
@@ -104,6 +159,10 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 	if err != nil {
 		return metaRegistryProvisionResult{}, err
 	}
+	authorizationGrantedAt := input.OwnershipCheckedAt.UTC()
+	if input.Channel == models.ChannelInstagram {
+		authorizationGrantedAt = input.AuthorizationStartedAt.UTC()
+	}
 	account := models.ChannelAccount{
 		BaseModel: models.BaseModel{ID: accountID}, OrganizationID: input.OrganizationID,
 		Channel: input.Channel, Provider: channelapi.RelayProvider, Name: input.Name,
@@ -118,10 +177,11 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 		Metadata: models.JSONB{
 			"meta_ownership_state":                 metaregistry.OwnershipVerified,
 			"meta_ownership_checked_at":            input.OwnershipCheckedAt.UTC().Format(time.RFC3339Nano),
-			metaMessengerAuthorizationGrantedAtKey: input.OwnershipCheckedAt.UTC().Format(time.RFC3339Nano),
+			metaMessengerAuthorizationGrantedAtKey: authorizationGrantedAt.Format(time.RFC3339Nano),
 			"meta_webhook_app":                     input.WebhookApp,
 			"meta_platform_app_id":                 input.PlatformAppID,
 			"meta_business_id":                     input.MetaBusinessID,
+			"meta_authority_asset_id":              input.MetaAuthorityAssetID,
 			"meta_authorizing_user_id":             input.AuthorizingMetaUserID,
 			metaMessengerAuthorizationTokenKindKey: input.AuthorizationTokenKind,
 			"meta_granted_scopes":                  append([]string(nil), input.GrantedScopes...),
@@ -129,6 +189,22 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 			"meta_activation_state":                metaMessengerAwaitingRegistryState,
 		},
 		CreatedByID: &input.UserID, UpdatedByID: &input.UserID,
+	}
+	if input.Channel == models.ChannelInstagram {
+		account.Metadata[metaInstagramOAuthSubjectIDKey] = input.AuthorizingMetaUserID
+		releaseMode, allowed := a.metaInstagramReleaseMode(
+			input.OrganizationID, input.AuthorizingMetaUserID, input.ExternalAccountID,
+		)
+		if !allowed {
+			return metaRegistryProvisionResult{}, metaregistry.ErrInvalidRequest
+		}
+		account.Metadata["meta_release_evidence_mode"] = releaseMode
+		account.Metadata["meta_release_review_status"] = strings.ToLower(strings.TrimSpace(a.Config.MetaInstagram.AppReviewStatus))
+		if releaseMode == "development_app_role" {
+			account.Metadata["meta_release_profile_id"] = input.ExternalAccountID
+			account.Metadata["meta_release_oauth_subject_id"] = input.AuthorizingMetaUserID
+			account.Metadata["meta_release_app_role"] = strings.ToLower(strings.TrimSpace(a.Config.MetaInstagram.DevelopmentAppRole))
+		}
 	}
 	markMetaMessengerAuthorizationDurability(account.Metadata, input.AuthorizationTokenKind, input.TokenExpiresAt)
 	if err := validateMetaRegistryPlatformBinding(&account); err != nil {
@@ -198,6 +274,18 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 	}
 	if err := a.DB.Create(&oauth).Error; err != nil {
 		return metaRegistryProvisionResult{}, err
+	}
+	if input.Channel == models.ChannelInstagram {
+		if err := a.metaInstagramOAuthGenerationFence(
+			input.OrganizationID,
+			input.PlatformAppID,
+			input.AuthorizingMetaUserID,
+			input.AuthorizationStartedAt,
+			oauth.CreatedAt,
+			account.Metadata,
+		); err != nil {
+			return metaRegistryProvisionResult{}, err
+		}
 	}
 	if err := a.DB.Create(&webhook).Error; err != nil {
 		return metaRegistryProvisionResult{}, err

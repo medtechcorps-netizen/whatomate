@@ -99,6 +99,7 @@ var DirectTenantTables = []string{
 	"message_parts",
 	"messages",
 	"meta_analytics_snapshots",
+	"meta_instagram_data_deletion_events",
 	"notification_rules",
 	"organization_onboardings",
 	"outbox_events",
@@ -557,6 +558,13 @@ func installPolicy(tx *gorm.DB, table, expression, runtimeRole, migrationRole st
 
 func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 	statements := []string{
+		// These Instagram SECURITY DEFINER enumerators existed only in an
+		// unreleased implementation. Remove any staged copy before installing the
+		// retained Messenger/static routing contract.
+		"DROP FUNCTION IF EXISTS public.rereply_resolve_managed_instagram_org(text,text,uuid)",
+		"DROP FUNCTION IF EXISTS public.rereply_ready_meta_instagram_lifecycle_orgs(uuid,integer)",
+		"DROP FUNCTION IF EXISTS public.rereply_ready_meta_instagram_lifecycle_orgs_v2(uuid,integer,uuid,text)",
+		"DROP FUNCTION IF EXISTS public.rereply_meta_deauth_target_page_v2(text,text,text,uuid,integer)",
 		`CREATE OR REPLACE FUNCTION public.rereply_resolve_whatsapp_org(p_phone_id text)
 		 RETURNS uuid
 		 LANGUAGE sql
@@ -675,7 +683,7 @@ func installRoutingFunctions(tx *gorm.DB, runtimeRole string) error {
 		       AND (
 		         status = 'pending'
 		         OR (
-		           status = 'processing'
+		         status IN ('processing', 'generating')
 		           AND (locked_at IS NULL OR locked_at < p_stale_before)
 		         )
 		       )

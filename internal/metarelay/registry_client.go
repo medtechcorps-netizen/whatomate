@@ -41,6 +41,7 @@ type RegistryClient struct {
 	client                *http.Client
 	cacheTTL              time.Duration
 	managedMessengerAppID string
+	managedInstagramAppID string
 	now                   func() time.Time
 	mu                    sync.Mutex
 	cache                 map[string]registryCacheEntry
@@ -56,7 +57,8 @@ func NewRegistryClient(config *Config, client *http.Client) (*RegistryClient, er
 	if len(config.RegistrySecret) < 32 {
 		return nil, ErrRegistryUnavailable
 	}
-	if strings.TrimSpace(config.ManagedMessengerAppID) == "" {
+	if strings.TrimSpace(config.ManagedMessengerAppID) == "" &&
+		strings.TrimSpace(config.ManagedInstagramAppID) == "" {
 		return nil, ErrRegistryUnavailable
 	}
 	parsed, err := url.Parse(strings.TrimSpace(config.RegistryURL))
@@ -75,7 +77,8 @@ func NewRegistryClient(config *Config, client *http.Client) (*RegistryClient, er
 	return &RegistryClient{
 		endpoint: strings.TrimSpace(config.RegistryURL), secret: config.RegistrySecret,
 		client: client, cacheTTL: config.RegistryCacheTTL,
-		managedMessengerAppID: strings.TrimSpace(config.ManagedMessengerAppID), now: time.Now,
+		managedMessengerAppID: strings.TrimSpace(config.ManagedMessengerAppID),
+		managedInstagramAppID: strings.TrimSpace(config.ManagedInstagramAppID), now: time.Now,
 		cache: make(map[string]registryCacheEntry),
 	}, nil
 }
@@ -148,7 +151,10 @@ func (client *RegistryClient) Resolve(ctx context.Context, channel models.Channe
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&binding) != nil || rejectTrailingJSON(decoder) != nil || binding.Validate(now) != nil ||
 		binding.Channel != requestValue.Channel || binding.ExternalAccountID != requestValue.ExternalAccountID ||
-		(binding.Channel == models.ChannelMessenger && binding.PlatformAppID != client.managedMessengerAppID) {
+		(binding.Channel == models.ChannelMessenger &&
+			(client.managedMessengerAppID == "" || binding.PlatformAppID != client.managedMessengerAppID)) ||
+		(binding.Channel == models.ChannelInstagram &&
+			(client.managedInstagramAppID == "" || binding.PlatformAppID != client.managedInstagramAppID)) {
 		return nil, ErrRegistryUnavailable
 	}
 	account := accountConfigFromBinding(binding)

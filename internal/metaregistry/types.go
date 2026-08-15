@@ -128,12 +128,10 @@ func (binding Binding) Validate(now time.Time) error {
 		}
 	case models.ChannelInstagram:
 		mode := strings.TrimSpace(binding.InstagramAPIMode)
-		if mode != "instagram_login" && mode != "facebook_login" {
+		if (mode != "instagram_login" && mode != "facebook_login") ||
+			strings.TrimSpace(binding.PlatformAppID) == "" {
 			return ErrInvalidRequest
 		}
-	}
-	if binding.Channel != models.ChannelMessenger && strings.TrimSpace(binding.PlatformAppID) != "" {
-		return ErrInvalidRequest
 	}
 	if binding.Channel != models.ChannelInstagram && strings.TrimSpace(binding.InstagramAPIMode) != "" {
 		return ErrInvalidRequest

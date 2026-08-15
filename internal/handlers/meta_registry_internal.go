@@ -198,7 +198,25 @@ func decodeMetaRegistryJSON(raw []byte, value any) error {
 
 func (a *App) resolveMetaRegistryOrganization(request metaregistry.ResolveRequest) (uuid.UUID, error) {
 	root := a.rootApp()
-	var organizationID uuid.UUID
+	type organizationOwner struct {
+		OrganizationID uuid.UUID `gorm:"column:organization_id"`
+	}
+	if request.Channel == models.ChannelInstagram {
+		if a == nil || a.Config == nil || !a.Config.MetaInstagram.Enabled {
+			return uuid.Nil, gorm.ErrRecordNotFound
+		}
+		allowedOrganizationID, err := uuid.Parse(
+			strings.TrimSpace(a.Config.MetaInstagram.AllowedOrganizationID),
+		)
+		if err != nil || allowedOrganizationID == uuid.Nil ||
+			!validCanonicalMetaID(strings.TrimSpace(a.Config.MetaInstagram.AppID)) {
+			return uuid.Nil, gorm.ErrRecordNotFound
+		}
+		// The deployment config is the sole tenant router for managed Instagram.
+		// Exact account/app/profile cardinality is checked only after entering the
+		// tenant RLS transaction; no cross-tenant SECURITY DEFINER lookup exists.
+		return allowedOrganizationID, nil
+	}
 	if a.rlsEnabled() {
 		var raw string
 		if err := root.DB.Raw(
@@ -212,20 +230,20 @@ func (a *App) resolveMetaRegistryOrganization(request metaregistry.ResolveReques
 		}
 		return uuid.Parse(raw)
 	}
+	var owner organizationOwner
 	if err := root.DB.Model(&models.ChannelAccount{}).
 		Select("organization_id").
 		Where("channel = ? AND provider = ? AND external_account_id = ? AND status IN ?",
 			request.Channel, channelapi.RelayProvider, request.ExternalAccountID,
 			[]models.ChannelAccountStatus{models.ChannelAccountStatusPending, models.ChannelAccountStatusActive, models.ChannelAccountStatusDegraded}).
-		Take(&organizationID).Error; err != nil {
+		Take(&owner).Error; err != nil {
 		return uuid.Nil, err
 	}
-	return organizationID, nil
+	return owner.OrganizationID, nil
 }
 
 func (a *App) resolveChannelAccountOrganization(accountID uuid.UUID) (uuid.UUID, error) {
 	root := a.rootApp()
-	var organizationID uuid.UUID
 	if a.rlsEnabled() {
 		var raw string
 		if err := root.DB.Raw(
@@ -238,21 +256,48 @@ func (a *App) resolveChannelAccountOrganization(accountID uuid.UUID) (uuid.UUID,
 		}
 		return uuid.Parse(raw)
 	}
+	var owner struct {
+		OrganizationID uuid.UUID `gorm:"column:organization_id"`
+	}
 	if err := root.DB.Model(&models.ChannelAccount{}).Select("organization_id").
-		Where("id = ?", accountID).Take(&organizationID).Error; err != nil {
+		Where("id = ?", accountID).Take(&owner).Error; err != nil {
 		return uuid.Nil, err
 	}
-	return organizationID, nil
+	return owner.OrganizationID, nil
 }
 
 func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now time.Time) (metaregistry.Binding, error) {
 	var account models.ChannelAccount
-	if err := a.DB.Preload("Credentials", func(db *gorm.DB) *gorm.DB {
+	query := a.DB.Preload("Credentials", func(db *gorm.DB) *gorm.DB {
 		return db.Order("version DESC")
-	}).Where(
+	})
+	statuses := []models.ChannelAccountStatus{
+		models.ChannelAccountStatusPending,
+		models.ChannelAccountStatusActive,
+		models.ChannelAccountStatusDegraded,
+	}
+	if request.Channel == models.ChannelInstagram {
+		if a.Config == nil {
+			return metaregistry.Binding{}, metaregistry.ErrNotFound
+		}
+		var accounts []models.ChannelAccount
+		if err := query.Where(
+			"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ? AND status IN ? AND config ->> 'meta_registry_managed' = ? AND config ->> 'meta_management_mode' = ? AND config ->> 'instagram_api_mode' = ? AND metadata ->> 'meta_platform_app_id' = ? AND metadata ->> 'meta_webhook_app' = ? AND metadata ->> 'meta_authority_asset_id' = ?",
+			a.tenantOrgID, request.Channel, channelapi.RelayProvider,
+			request.ExternalAccountID, statuses,
+			"true", metaregistry.ManagementModePlatformOAuth, "instagram_login",
+			strings.TrimSpace(a.Config.MetaInstagram.AppID), "instagram_login",
+			request.ExternalAccountID,
+		).Limit(2).Find(&accounts).Error; err != nil {
+			return metaregistry.Binding{}, err
+		}
+		if len(accounts) != 1 {
+			return metaregistry.Binding{}, metaregistry.ErrNotFound
+		}
+		account = accounts[0]
+	} else if err := query.Where(
 		"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ? AND status IN ?",
-		a.tenantOrgID, request.Channel, channelapi.RelayProvider, request.ExternalAccountID,
-		[]models.ChannelAccountStatus{models.ChannelAccountStatusPending, models.ChannelAccountStatusActive, models.ChannelAccountStatusDegraded},
+		a.tenantOrgID, request.Channel, channelapi.RelayProvider, request.ExternalAccountID, statuses,
 	).First(&account).Error; err != nil {
 		return metaregistry.Binding{}, err
 	}
@@ -263,7 +308,19 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 		// inbound, outbound, worker, or health traffic.
 		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
 	}
-	if account.Channel == models.ChannelMessenger &&
+	if account.Channel == models.ChannelInstagram &&
+		!a.metaInstagramOrganizationAllowed(account.OrganizationID) {
+		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
+	}
+	if account.Channel == models.ChannelInstagram &&
+		metaInstagramDeletionReconciliationPending(account.Metadata) {
+		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
+	}
+	if account.Channel == models.ChannelInstagram &&
+		metaDeauthorizationReconciliationPending(account.Metadata) {
+		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
+	}
+	if (account.Channel == models.ChannelMessenger || account.Channel == models.ChannelInstagram) &&
 		stringConfigValue(account.Metadata, metaMessengerSubscriptionDesiredStateKey) ==
 			metaMessengerSubscriptionDesiredUnsubscribed &&
 		stringConfigValue(account.Metadata, metaMessengerSubscriptionOperationStateKey) !=
@@ -279,6 +336,18 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 	if account.Status == models.ChannelAccountStatusDegraded {
 		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
 	}
+	if request.Purpose == metaregistry.ResolvePurposeOutbound &&
+		!boolConfigValue(account.Config, "outbound_enabled") {
+		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
+	}
+	if (request.Purpose == metaregistry.ResolvePurposeInbound ||
+		request.Purpose == metaregistry.ResolvePurposeWorker ||
+		request.Purpose == metaregistry.ResolvePurposeOutbound) &&
+		account.Channel == models.ChannelInstagram {
+		if _, ready := metaInstagramSubscribedOperation(account.Metadata); !ready {
+			return metaregistry.Binding{}, metaregistry.ErrStaleBinding
+		}
+	}
 	if !boolConfigValue(account.Config, "meta_registry_managed") ||
 		stringConfigValue(account.Config, "meta_management_mode") != metaregistry.ManagementModePlatformOAuth ||
 		stringConfigValue(account.Metadata, "meta_ownership_state") != metaregistry.OwnershipVerified ||
@@ -288,12 +357,19 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 	if err := validateMetaRegistryPlatformBinding(&account); err != nil {
 		return metaregistry.Binding{}, metaregistry.ErrNotFound
 	}
-	if !metaMessengerAuthorizationTokenAllowed(a.Config, account.Metadata) {
+	if !metaAuthorizationTokenAllowed(a.Config, &account) {
 		return metaregistry.Binding{}, metaregistry.ErrNotFound
 	}
 	if account.Channel == models.ChannelMessenger && (a.Config == nil ||
 		stringConfigValue(account.Metadata, "meta_platform_app_id") != strings.TrimSpace(a.Config.MetaMessenger.AppID)) {
 		return metaregistry.Binding{}, metaregistry.ErrNotFound
+	}
+	if account.Channel == models.ChannelInstagram {
+		if a.Config == nil ||
+			stringConfigValue(account.Metadata, "meta_platform_app_id") != strings.TrimSpace(a.Config.MetaInstagram.AppID) ||
+			a.metaInstagramReleaseGuardReason(account, account.OrganizationID) != "" {
+			return metaregistry.Binding{}, metaregistry.ErrNotFound
+		}
 	}
 	checkedAt, err := time.Parse(time.RFC3339Nano, stringConfigValue(account.Metadata, "meta_ownership_checked_at"))
 	if err != nil {
@@ -311,6 +387,16 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 	webhookCredential := currentMetaRegistryCredential(account.Credentials, models.ChannelCredentialKindWebhook, now)
 	if oauthCredential == nil || webhookCredential == nil {
 		return metaregistry.Binding{}, metaregistry.ErrNotFound
+	}
+	if account.Channel == models.ChannelInstagram &&
+		!metaInstagramCredentialPairGenerationValid(oauthCredential, webhookCredential, now) {
+		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
+	}
+	if account.Channel == models.ChannelInstagram &&
+		!metaInstagramSubscribedOperationMatchesCredentials(
+			account.Metadata, *oauthCredential, *webhookCredential,
+		) {
+		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
 	}
 	accessToken, err := decryptRequiredMetaRegistrySecret(oauthCredential.CredentialBlob, "access_token", a.Config.App.EncryptionKey)
 	if err != nil {
@@ -352,6 +438,62 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 	return binding, nil
 }
 
+func metaAuthorizationTokenAllowed(config *configpkg.Config, account *models.ChannelAccount) bool {
+	if config == nil || account == nil {
+		return false
+	}
+	kind := strings.ToUpper(strings.TrimSpace(stringConfigValue(account.Metadata, metaMessengerAuthorizationTokenKindKey)))
+	if account.Channel == models.ChannelInstagram {
+		return kind == metaMessengerTokenKindUser &&
+			metaInstagramReleaseEvidenceAllowed(config, account)
+	}
+	if kind == metaMessengerTokenKindSystemUser {
+		return true
+	}
+	if kind != metaMessengerTokenKindUser || config == nil ||
+		!config.MetaMessenger.AllowDevelopmentUserToken || config.MetaMessenger.AllowAllOrganizations {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(config.App.Environment), "production")
+}
+
+func metaInstagramReleaseEvidenceAllowed(
+	config *configpkg.Config,
+	account *models.ChannelAccount,
+) bool {
+	if config == nil || account == nil || account.Channel != models.ChannelInstagram ||
+		!config.MetaInstagram.Enabled ||
+		config.MetaInstagram.QuarantineOnly ||
+		strings.TrimSpace(config.MetaInstagram.AllowedOrganizationID) != account.OrganizationID.String() ||
+		stringConfigValue(account.Config, "instagram_api_mode") != "instagram_login" ||
+		stringConfigValue(account.Metadata, "meta_platform_app_id") != strings.TrimSpace(config.MetaInstagram.AppID) {
+		return false
+	}
+	reviewStatus := strings.ToLower(strings.TrimSpace(config.MetaInstagram.AppReviewStatus))
+	mode := stringConfigValue(account.Metadata, "meta_release_evidence_mode")
+	if reviewStatus == "approved" {
+		return mode == "app_review_approved" &&
+			stringConfigValue(account.Metadata, "meta_release_review_status") == "approved"
+	}
+	if !validMetaInstagramDevelopmentEnvironment(config.App.Environment) ||
+		mode != "development_app_role" ||
+		!validMetaInstagramDevelopmentRole(config.MetaInstagram.DevelopmentAppRole) {
+		return false
+	}
+	profileID := strings.TrimSpace(config.MetaInstagram.DevelopmentTestProfileID)
+	oauthSubjectID := strings.TrimSpace(config.MetaInstagram.DevelopmentTestOAuthSubjectID)
+	return validCanonicalMetaID(profileID) && validCanonicalMetaID(oauthSubjectID) &&
+		account.ExternalAccountID == profileID &&
+		stringConfigValue(account.Metadata, "meta_authorizing_user_id") == oauthSubjectID &&
+		stringConfigValue(account.Metadata, "meta_release_profile_id") == profileID &&
+		stringConfigValue(account.Metadata, "meta_release_oauth_subject_id") == oauthSubjectID &&
+		stringConfigValue(account.Metadata, "meta_release_app_role") ==
+			strings.ToLower(strings.TrimSpace(config.MetaInstagram.DevelopmentAppRole)) &&
+		stringConfigValue(account.Metadata, "meta_release_review_status") == reviewStatus
+}
+
+// metaMessengerAuthorizationTokenAllowed remains the Messenger-specific
+// compatibility wrapper used by its existing lifecycle checks.
 func metaMessengerAuthorizationTokenAllowed(config *configpkg.Config, metadata models.JSONB) bool {
 	kind := strings.ToUpper(strings.TrimSpace(stringConfigValue(metadata, metaMessengerAuthorizationTokenKindKey)))
 	if kind == metaMessengerTokenKindSystemUser {
@@ -362,6 +504,12 @@ func metaMessengerAuthorizationTokenAllowed(config *configpkg.Config, metadata m
 		return false
 	}
 	return !strings.EqualFold(strings.TrimSpace(config.App.Environment), "production")
+}
+
+func (a *App) metaInstagramOrganizationAllowed(organizationID uuid.UUID) bool {
+	return a != nil && a.Config != nil && a.Config.MetaInstagram.Enabled &&
+		organizationID != uuid.Nil &&
+		strings.TrimSpace(a.Config.MetaInstagram.AllowedOrganizationID) == organizationID.String()
 }
 
 func currentMetaRegistryCredential(credentials []models.ChannelCredential, kind models.ChannelCredentialKind, now time.Time) *models.ChannelCredential {
@@ -387,6 +535,12 @@ func decryptRequiredMetaRegistrySecret(blob models.JSONB, key, encryptionKey str
 }
 
 func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, outcome string) (bool, error) {
+	if a == nil || a.DB == nil || a.tenantOrgID == uuid.Nil {
+		return false, metaregistry.ErrInvalidRequest
+	}
+	if err := lockChannelAIOrganizationScopeTx(a.DB, a.tenantOrgID); err != nil {
+		return false, err
+	}
 	var account models.ChannelAccount
 	if err := a.DB.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("id = ? AND organization_id = ? AND provider = ? AND channel IN ?",
@@ -404,18 +558,44 @@ func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, ou
 	); err != nil || !request.CheckedAt.After(previousCheckedAt) {
 		return false, metaregistry.ErrNotFound
 	}
-	var credentials []models.ChannelCredential
+	var currentCredentials []models.ChannelCredential
 	if err := a.DB.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
-		"organization_id = ? AND channel_account_id = ? AND status IN ? AND ((id = ? AND version = ? AND kind = ?) OR (id = ? AND version = ? AND kind = ?))",
+		"organization_id = ? AND channel_account_id = ? AND status IN ?",
 		a.tenantOrgID, account.ID,
-		[]models.ChannelCredentialStatus{models.ChannelCredentialStatusActive, models.ChannelCredentialStatusExpiring},
-		request.CredentialID, request.CredentialVersion, models.ChannelCredentialKindOAuth,
-		request.WebhookCredentialID, request.WebhookCredentialVersion, models.ChannelCredentialKindWebhook,
-	).Find(&credentials).Error; err != nil {
+		[]models.ChannelCredentialStatus{
+			models.ChannelCredentialStatusActive,
+			models.ChannelCredentialStatusExpiring,
+		},
+	).Order("version DESC").Find(&currentCredentials).Error; err != nil {
 		return false, err
 	}
-	if len(credentials) != 2 {
+	now := time.Now().UTC()
+	oauth := currentMetaRegistryCredential(
+		currentCredentials, models.ChannelCredentialKindOAuth, now,
+	)
+	webhook := currentMetaRegistryCredential(
+		currentCredentials, models.ChannelCredentialKindWebhook, now,
+	)
+	if account.Channel == models.ChannelInstagram {
+		account.Credentials = currentCredentials
+		if !a.metaInstagramRegistryMutationBindingValid(
+			&account, oauth, webhook, request, now,
+		) {
+			return false, metaregistry.ErrNotFound
+		}
+	} else if oauth == nil || webhook == nil || oauth.ID != request.CredentialID ||
+		oauth.Version != request.CredentialVersion || webhook.ID != request.WebhookCredentialID ||
+		webhook.Version != request.WebhookCredentialVersion {
 		return false, metaregistry.ErrNotFound
+	}
+	credentials := []models.ChannelCredential{*oauth, *webhook}
+	if account.Channel == models.ChannelInstagram && outcome == metaregistry.OwnershipVerified {
+		if a.metaInstagramReleaseGuardReason(account, a.tenantOrgID) != "" ||
+			!metaInstagramSubscribedOperationMatchesCredentials(
+				account.Metadata, *oauth, *webhook,
+			) {
+			return false, metaregistry.ErrNotFound
+		}
 	}
 	metadata := cloneJSONB(account.Metadata)
 	metadata["meta_ownership_state"] = outcome
@@ -464,6 +644,17 @@ func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, ou
 		}
 		return false, metaregistry.ErrNotFound
 	}
+	if account.Channel == models.ChannelInstagram &&
+		(outcome == metaregistry.OwnershipStale ||
+			outcome == metaregistry.OwnershipRevoked ||
+			(outcome == metaregistry.OwnershipVerified &&
+				account.Status == models.ChannelAccountStatusDegraded)) {
+		if err := cancelManagedMetaQueuedWorkForAccountTx(
+			a.DB, a.tenantOrgID, account.ID, "managed_instagram_registry_mutation",
+		); err != nil {
+			return false, err
+		}
+	}
 	actorID := uuid.Nil
 	if account.UpdatedByID != nil {
 		actorID = *account.UpdatedByID
@@ -489,8 +680,56 @@ func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, ou
 	return true, nil
 }
 
+// metaInstagramRegistryMutationBindingValid is the common persistence fence
+// for verified, stale, and revoked registry outcomes. Release downgrades and
+// quarantine must still be able to disable an exact existing binding, but
+// they must not grant the registry authority over a foreign or drifted row.
+func (a *App) metaInstagramRegistryMutationBindingValid(
+	account *models.ChannelAccount,
+	oauth, webhook *models.ChannelCredential,
+	request metaregistry.MutationRequest,
+	now time.Time,
+) bool {
+	configuredProfileID := ""
+	configuredOAuthSubjectID := ""
+	if a != nil && a.Config != nil {
+		configuredProfileID = strings.TrimSpace(
+			a.Config.MetaInstagram.DevelopmentTestProfileID,
+		)
+		configuredOAuthSubjectID = strings.TrimSpace(
+			a.Config.MetaInstagram.DevelopmentTestOAuthSubjectID,
+		)
+	}
+	if a == nil || a.Config == nil || account == nil ||
+		account.OrganizationID != a.tenantOrgID ||
+		!a.metaInstagramOrganizationAllowed(account.OrganizationID) ||
+		(configuredProfileID != "" &&
+			account.ExternalAccountID != configuredProfileID) ||
+		(configuredOAuthSubjectID != "" &&
+			stringConfigValue(account.Metadata, "meta_authorizing_user_id") != configuredOAuthSubjectID) ||
+		!exactManagedInstagramCallbackBinding(
+			account,
+			strings.TrimSpace(a.Config.MetaInstagram.AppID),
+			stringConfigValue(account.Metadata, "meta_authorizing_user_id"),
+		) ||
+		!metaInstagramCredentialPairGenerationValid(oauth, webhook, now) ||
+		oauth.ID != request.CredentialID ||
+		oauth.Version != request.CredentialVersion ||
+		webhook.ID != request.WebhookCredentialID ||
+		webhook.Version != request.WebhookCredentialVersion {
+		return false
+	}
+	currentGenerationCount := 0
+	for index := range account.Credentials {
+		if channelapi.CredentialIsCurrent(&account.Credentials[index], now) {
+			currentGenerationCount++
+		}
+	}
+	return currentGenerationCount == 2
+}
+
 func validateMetaRegistryPlatformBinding(account *models.ChannelAccount) error {
-	if account == nil {
+	if account == nil || !exactMetaRegistryControlPlaneConfig(account.Config) {
 		return metaregistry.ErrNotFound
 	}
 	mode := stringConfigValue(account.Config, "instagram_api_mode")
@@ -511,9 +750,21 @@ func validateMetaRegistryPlatformBinding(account *models.ChannelAccount) error {
 	}
 	if stringConfigValue(account.Metadata, "meta_webhook_app") != wantApp ||
 		stringConfigValue(account.Metadata, "meta_platform_app_id") == "" ||
-		stringConfigValue(account.Metadata, "meta_business_id") == "" ||
 		stringConfigValue(account.Metadata, "meta_authorizing_user_id") == "" {
 		return metaregistry.ErrNotFound
+	}
+	if account.Channel == models.ChannelMessenger &&
+		stringConfigValue(account.Metadata, "meta_business_id") == "" {
+		return metaregistry.ErrNotFound
+	}
+	if account.Channel == models.ChannelInstagram {
+		if !validCanonicalMetaID(account.ExternalAccountID) ||
+			!validCanonicalMetaID(stringConfigValue(account.Metadata, "meta_authorizing_user_id")) ||
+			stringConfigValue(account.Metadata, metaInstagramOAuthSubjectIDKey) !=
+				stringConfigValue(account.Metadata, "meta_authorizing_user_id") ||
+			stringConfigValue(account.Metadata, "meta_authority_asset_id") != account.ExternalAccountID {
+			return metaregistry.ErrNotFound
+		}
 	}
 	granted := make(map[string]bool)
 	switch values := account.Metadata["meta_granted_scopes"].(type) {

@@ -2,12 +2,40 @@ package metarelay
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/models"
 )
+
+type warmRegistryProbe struct {
+	cached   *AccountConfig
+	current  *AccountConfig
+	err      error
+	cacheUse []bool
+}
+
+func (resolver *warmRegistryProbe) Resolve(
+	_ context.Context,
+	_ models.Channel,
+	_ string,
+	_ string,
+	useCache bool,
+) (*AccountConfig, error) {
+	resolver.cacheUse = append(resolver.cacheUse, useCache)
+	if useCache && resolver.cached != nil {
+		copy := *resolver.cached
+		return &copy, nil
+	}
+	if resolver.err != nil {
+		return nil, resolver.err
+	}
+	copy := *resolver.current
+	return &copy, nil
+}
 
 func TestSignedBodyVerification(t *testing.T) {
 	body := []byte(`{"event":"one"}`)
@@ -198,6 +226,111 @@ func TestManagedMessengerWebhookUsesDistinctDynamicCredentialsAndKeepsStaticRout
 	assertWebhook("/v1/meta/messenger/webhook", config.MessengerAppSecret, staticBody, http.StatusOK)
 	if store.acceptCalls != 2 {
 		t.Fatalf("durable accept called %d times, want managed+legacy only", store.acceptCalls)
+	}
+}
+
+func TestManagedInstagramWebhookIsIsolatedAndStaticMappingKeepsPrecedence(t *testing.T) {
+	config := newTestConfig(t)
+	config.RegistryEnabled = true
+	config.RegistryURL = "https://app.example.test/internal/meta-registry/v1/resolve"
+	config.RegistrySecret = "registry-service-secret-at-least-32-bytes"
+	config.RegistryEdgeSecret = "registry-edge-secret-at-least-32-bytes"
+	config.ManagedInstagramAppID = "789012"
+	config.ManagedInstagramAppSecret = "managed-instagram-app-secret-at-least-32-bytes"
+	config.ManagedInstagramVerifyToken = "managed-instagram-verify-token"
+	static, _ := config.accountByKey("instagram-direct")
+	dynamic := *static
+	dynamic.Key = "managed-instagram-profile"
+	dynamic.ExternalAccountID = "managed-ig-1"
+	dynamic.PlatformAppID = config.ManagedInstagramAppID
+	dynamic.registryManaged = true
+	store := newMemoryServerStore()
+	server, err := NewServer(config, store)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	server.registry = fixedRegistryResolver{account: &dynamic}
+	handler := server.Handler()
+
+	verify := func(path, token string, want int) {
+		t.Helper()
+		request := httptest.NewRequest(
+			http.MethodGet,
+			path+"?hub.mode=subscribe&hub.challenge=challenge&hub.verify_token="+token,
+			nil,
+		)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != want {
+			t.Fatalf("%s verification returned %d, want %d", path, response.Code, want)
+		}
+	}
+	verify("/v1/meta/instagram/managed-webhook", config.ManagedInstagramVerifyToken, http.StatusOK)
+	verify("/v1/meta/instagram/managed-webhook", config.InstagramLoginVerifyToken, http.StatusForbidden)
+	verify("/v1/meta/instagram/webhook", config.ManagedInstagramVerifyToken, http.StatusForbidden)
+
+	managedBody := []byte(`{"object":"instagram","entry":[{"id":"managed-ig-1","time":1770000000,"messaging":[{"sender":{"id":"customer-1"},"recipient":{"id":"managed-ig-1"},"timestamp":1770000000000,"message":{"mid":"managed-mid","text":"hello"}}]}]}`)
+	staticBody := []byte(`{"object":"instagram","entry":[{"id":"ig-direct-1","time":1770000000,"messaging":[{"sender":{"id":"customer-2"},"recipient":{"id":"ig-direct-1"},"timestamp":1770000000000,"message":{"mid":"static-mid","text":"hello"}}]}]}`)
+	post := func(path, secret string, body []byte, want int) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+		request.Header.Set(MetaSignatureHeader, signBody(secret, body))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != want {
+			t.Fatalf("%s returned %d (%s), want %d", path, response.Code, response.Body.String(), want)
+		}
+	}
+	post("/v1/meta/instagram/managed-webhook", config.InstagramLoginAppSecret, managedBody, http.StatusUnauthorized)
+	post("/v1/meta/instagram/webhook", config.ManagedInstagramAppSecret, staticBody, http.StatusUnauthorized)
+	post("/v1/meta/instagram/managed-webhook", config.ManagedInstagramAppSecret, staticBody, http.StatusNotFound)
+	post("/v1/meta/instagram/managed-webhook", config.ManagedInstagramAppSecret, managedBody, http.StatusOK)
+	post("/v1/meta/instagram/webhook", config.InstagramLoginAppSecret, staticBody, http.StatusOK)
+	if store.acceptCalls != 2 {
+		t.Fatalf("durable accept called %d times, want managed+static only", store.acceptCalls)
+	}
+}
+
+func TestManagedInstagramInboundBypassesWarmRegistryLeaseAfterDowngrade(t *testing.T) {
+	config := newTestConfig(t)
+	config.RegistryEnabled = true
+	config.RegistryURL = "https://app.example.test/internal/meta-registry/v1/resolve"
+	config.RegistrySecret = "registry-service-secret-at-least-32-bytes"
+	config.RegistryEdgeSecret = "registry-edge-secret-at-least-32-bytes"
+	config.ManagedInstagramAppID = "789012"
+	config.ManagedInstagramAppSecret = "managed-instagram-app-secret-at-least-32-bytes"
+	config.ManagedInstagramVerifyToken = "managed-instagram-verify-token"
+	static, _ := config.accountByKey("instagram-direct")
+	dynamic := *static
+	dynamic.Key = "managed-instagram-cache-probe"
+	dynamic.ExternalAccountID = "managed-ig-cache-probe"
+	dynamic.PlatformAppID = config.ManagedInstagramAppID
+	dynamic.registryManaged = true
+	resolver := &warmRegistryProbe{
+		cached: &dynamic,
+		err:    ErrRegistryStale,
+	}
+	store := newMemoryServerStore()
+	server, err := NewServer(config, store)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	server.registry = resolver
+	body := []byte(`{"object":"instagram","entry":[{"id":"managed-ig-cache-probe","time":1770000000,"messaging":[]}]}`)
+	request := httptest.NewRequest(
+		http.MethodPost, "/v1/meta/instagram/managed-webhook", bytes.NewReader(body),
+	)
+	request.Header.Set(MetaSignatureHeader, signBody(config.ManagedInstagramAppSecret, body))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("managed webhook returned %d (%s), want 503", response.Code, response.Body.String())
+	}
+	if len(resolver.cacheUse) != 1 || resolver.cacheUse[0] {
+		t.Fatalf("managed Instagram inbound used cached registry lease: %#v", resolver.cacheUse)
+	}
+	if store.acceptCalls != 0 {
+		t.Fatalf("durable accept called %d times after downgrade, want zero", store.acceptCalls)
 	}
 }
 

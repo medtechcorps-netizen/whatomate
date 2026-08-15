@@ -53,6 +53,17 @@ import {
   type MetaMessengerSelection,
 } from '@/services/metaMessengerOnboarding'
 import {
+  type MetaInstagramAvailabilityState,
+  metaInstagramOAuthAvailable,
+  metaInstagramOnboarding,
+  metaInstagramReconciliationAvailable,
+  metaInstagramStaticCreationAvailable,
+  metaInstagramTeardownAvailable,
+  MetaInstagramOffPilotError,
+  MetaInstagramOrganizationChangedError,
+  type MetaInstagramStatus,
+} from '@/services/metaInstagramOnboarding'
+import {
   channelsService,
   type ChannelAccount,
   type ChannelType,
@@ -110,6 +121,12 @@ const metaMessengerReconnectName = ref('')
 const metaMessengerOnboardingReady = ref(false)
 const metaMessengerSelectionOrganizationId = ref('')
 const metaMessengerAuthorizationController = ref<AbortController | null>(null)
+const metaInstagramBusy = ref(false)
+const metaInstagramState = ref<MetaInstagramAvailabilityState>({
+  availability: 'loading',
+  organizationId: '',
+  status: null,
+})
 const settingsAccount = ref<ChannelAccount | null>(null)
 const conversationPage = ref(1)
 const conversationTotal = ref(0)
@@ -128,6 +145,12 @@ const canManageMetaMessenger = computed(
 )
 const canReconcileMetaMessenger = computed(
   () => canManageMetaMessenger.value && canDeleteAccounts.value,
+)
+const canManageMetaInstagram = computed(
+  () => canManageAccounts.value && canManageIntegrations.value,
+)
+const canReconcileMetaInstagram = computed(
+  () => canManageMetaInstagram.value && canDeleteAccounts.value,
 )
 const canManageConversations = computed(() => authStore.hasPermission('conversations', 'write'))
 const threadsPublicEngagementEntitlement = 'threads.public_engagement.enabled'
@@ -149,15 +172,38 @@ let refreshInFlight = false
 let conversationViewSequence = 0
 let metaMessengerContextVersion = 0
 let metaMessengerStatusSequence = 0
+let metaInstagramStatusSequence = 0
 const metaMessengerSwitchLockOwner = 'meta-messenger-onboarding'
 const metaMessengerSwitchLockMessage =
-  'Finish or cancel the Messenger connection before switching workspaces.'
+  'Finish the managed Meta connection before switching workspaces.'
 
 const activeOrganizationId = computed(
   () => organizationsStore.selectedOrgId || authStore.organizationId || null,
 )
+const metaInstagramAvailability = computed(() =>
+  metaInstagramState.value.organizationId === (activeOrganizationId.value ?? '')
+    ? metaInstagramState.value.availability
+    : 'loading',
+)
+const metaInstagramStatus = computed<MetaInstagramStatus | null>(() =>
+  metaInstagramAvailability.value === 'managed'
+    ? metaInstagramState.value.status
+    : null,
+)
+const metaInstagramStaticConnectionAvailable = computed(() =>
+  metaInstagramStaticCreationAvailable(
+    metaInstagramState.value,
+    activeOrganizationId.value,
+  ),
+)
 const metaMessengerWorkspaceLocked = computed(
-  () => metaMessengerBusy.value || metaMessengerSelection.value !== null,
+  () => metaMessengerBusy.value || metaMessengerSelection.value !== null || metaInstagramBusy.value,
+)
+const metaInstagramOnboardingReady = computed(() =>
+  metaInstagramOAuthAvailable(metaInstagramStatus.value),
+)
+const metaInstagramTeardownReady = computed(() =>
+  metaInstagramTeardownAvailable(metaInstagramStatus.value),
 )
 
 function isCurrentConversationView(sequence: number, conversationId: string) {
@@ -269,6 +315,43 @@ function isManagedMetaMessenger(account: ChannelAccount) {
   )
 }
 
+function isManagedMetaInstagram(account: ChannelAccount) {
+  return (
+    account.channel === 'instagram' &&
+    account.provider === 'relay' &&
+    account.config?.instagram_api_mode === 'instagram_login' &&
+    (account.config?.meta_registry_managed === true ||
+      account.config?.meta_management_mode === 'platform_oauth')
+  )
+}
+
+function isManagedMetaAccount(account: ChannelAccount) {
+  return isManagedMetaMessenger(account) || isManagedMetaInstagram(account)
+}
+
+function managedMetaLifecycleReady(account: ChannelAccount) {
+  if (isManagedMetaMessenger(account)) return metaMessengerOnboardingReady.value
+  if (isManagedMetaInstagram(account)) return metaInstagramOnboardingReady.value
+  return true
+}
+
+function managedMetaTeardownReady(account: ChannelAccount) {
+  if (isManagedMetaMessenger(account)) return metaMessengerOnboardingReady.value
+  if (isManagedMetaInstagram(account)) return metaInstagramTeardownReady.value
+  return true
+}
+
+function managedMetaActionBusy(account: ChannelAccount) {
+  if (isManagedMetaMessenger(account)) return metaMessengerBusy.value
+  if (isManagedMetaInstagram(account)) return metaInstagramBusy.value
+  return false
+}
+
+function approveManagedMeta(account: ChannelAccount) {
+  if (isManagedMetaMessenger(account)) return approveMetaMessenger(account)
+  if (isManagedMetaInstagram(account)) return approveMetaInstagram(account)
+}
+
 function metaMessengerPageKey(page: MetaMessengerPage) {
   return `${page.business_id ?? ''}:${page.page_id}`
 }
@@ -280,7 +363,7 @@ const selectedMetaMessengerPage = computed(() =>
 )
 
 function accountConnectionLabel(account: ChannelAccount) {
-  if (isManagedMetaMessenger(account) && account.status === 'pending') {
+  if (isManagedMetaAccount(account) && account.status === 'pending') {
     return account.last_health_check_at && !account.last_error
       ? 'Awaiting admin approval'
       : 'Test connection to continue'
@@ -566,6 +649,14 @@ async function connectAccount() {
     toast.warning('Messenger must be connected through managed Facebook authorization')
     return
   }
+  if (newAccount.channel === 'instagram' && !metaInstagramStaticConnectionAvailable.value) {
+    toast.warning(
+      metaInstagramAvailability.value === 'managed'
+        ? 'This workspace connects Instagram through managed Instagram authorization'
+        : 'Instagram connection policy is not available yet',
+    )
+    return
+  }
   if (
     !newAccount.name.trim() ||
     !newAccount.external_account_id.trim() ||
@@ -614,6 +705,21 @@ function metaMessengerNeedsSubscriptionReconciliation(account: ChannelAccount) {
   return (
     isManagedMetaMessenger(account) &&
     account.meta_subscription_reconciliation_required
+  )
+}
+
+function metaInstagramNeedsSubscriptionReconciliation(account: ChannelAccount) {
+  return (
+    isManagedMetaInstagram(account) &&
+    account.meta_subscription_reconciliation_required
+  )
+}
+
+function metaInstagramCanReconcile(account: ChannelAccount) {
+  if (!metaInstagramNeedsSubscriptionReconciliation(account)) return false
+  return metaInstagramReconciliationAvailable(
+    metaInstagramStatus.value,
+    account.meta_subscription_reconciliation_desired_state,
   )
 }
 
@@ -780,6 +886,65 @@ async function confirmMetaMessengerPage() {
   }
 }
 
+async function connectMetaInstagram() {
+  if (
+    !canManageMetaInstagram.value ||
+    !metaInstagramOnboardingReady.value ||
+    metaInstagramBusy.value
+  ) return
+  const organizationId = activeOrganizationId.value
+  if (!organizationId) {
+    toast.error('Select a workspace before connecting Instagram')
+    return
+  }
+  const contextVersion = metaMessengerContextVersion
+  metaInstagramBusy.value = true
+  try {
+    const start = await metaInstagramOnboarding.begin(organizationId)
+    if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      throw new MetaInstagramOrganizationChangedError()
+    }
+    window.location.assign(start.authorization_url)
+  } catch (error) {
+    if (
+      isMetaMessengerContextCurrent(organizationId, contextVersion) &&
+      !(error instanceof MetaInstagramOrganizationChangedError)
+    ) {
+      toast.error('Instagram authorization did not start', getErrorMessage(error))
+    }
+    metaInstagramBusy.value = false
+  }
+}
+
+async function reconnectMetaInstagram(account: ChannelAccount) {
+  if (
+    !canManageMetaInstagram.value ||
+    !metaInstagramOnboardingReady.value ||
+    !isManagedMetaInstagram(account) ||
+    metaInstagramBusy.value
+  ) return
+  const organizationId = activeOrganizationId.value
+  if (!organizationId) return
+  const contextVersion = metaMessengerContextVersion
+  metaInstagramBusy.value = true
+  try {
+    const start = await metaInstagramOnboarding.reconnect(account.id, organizationId)
+    if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      throw new MetaInstagramOrganizationChangedError()
+    }
+    settingsAccount.value = null
+    window.location.assign(start.authorization_url)
+  } catch (error) {
+    if (
+      isMetaMessengerContextCurrent(organizationId, contextVersion) &&
+      !(error instanceof MetaInstagramOrganizationChangedError)
+    ) {
+      toast.error('Instagram reconnect did not start', getErrorMessage(error))
+    }
+    metaInstagramBusy.value = false
+  }
+}
+
 async function copyConnectionValue(label: string, value: string) {
   try {
     await navigator.clipboard.writeText(value)
@@ -856,6 +1021,36 @@ async function approveMetaMessenger(account: ChannelAccount) {
   }
 }
 
+async function approveMetaInstagram(account: ChannelAccount) {
+  if (
+    !canManageMetaInstagram.value ||
+    !metaInstagramOnboardingReady.value ||
+    !isManagedMetaInstagram(account) ||
+    metaInstagramBusy.value
+  ) return
+  const organizationId = activeOrganizationId.value
+  if (!organizationId) return
+  const contextVersion = metaMessengerContextVersion
+  metaInstagramBusy.value = true
+  try {
+    await metaInstagramOnboarding.approve(account.id, organizationId)
+    if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) return
+    toast.success(
+      `${account.name} activated`,
+      'Agent replies are enabled. Automatic AI replies remain off until you opt in.',
+    )
+    await load()
+  } catch (error) {
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      toast.error('Instagram activation was not approved', getErrorMessage(error))
+    }
+  } finally {
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      metaInstagramBusy.value = false
+    }
+  }
+}
+
 async function reconcileMetaMessenger(account: ChannelAccount) {
   if (
     !canReconcileMetaMessenger.value ||
@@ -890,6 +1085,39 @@ async function reconcileMetaMessenger(account: ChannelAccount) {
   }
 }
 
+async function reconcileMetaInstagram(account: ChannelAccount) {
+  if (
+    !canReconcileMetaInstagram.value ||
+    !metaInstagramCanReconcile(account) ||
+    metaInstagramBusy.value
+  ) return
+  const organizationId = activeOrganizationId.value
+  if (!organizationId) return
+  const contextVersion = metaMessengerContextVersion
+  if (!window.confirm(
+    `Reconcile ${account.name}? ReReply will repeat only the recorded Instagram subscription operation and verify its exact result.`,
+  )) return
+  metaInstagramBusy.value = true
+  try {
+    await metaInstagramOnboarding.reconcile(account.id, organizationId)
+    if (!isMetaMessengerContextCurrent(organizationId, contextVersion)) return
+    settingsAccount.value = null
+    toast.success(
+      'Instagram subscription reconciled',
+      'The recorded operation was verified. Run Test and approve activation if the account is pending.',
+    )
+    await load()
+  } catch (error) {
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      toast.error('Instagram subscription was not reconciled', getErrorMessage(error))
+    }
+  } finally {
+    if (isMetaMessengerContextCurrent(organizationId, contextVersion)) {
+      metaInstagramBusy.value = false
+    }
+  }
+}
+
 function openAccountSettings(account: ChannelAccount) {
   settingsAccount.value = account
   accountSettingsDraft.name = account.name
@@ -902,10 +1130,10 @@ function openAccountSettings(account: ChannelAccount) {
 async function saveAccountSettings() {
   const account = settingsAccount.value
   if (!account || !canManageAccounts.value || !accountSettingsDraft.name.trim()) return
-  const managedMessenger = isManagedMetaMessenger(account)
+  const managedMeta = isManagedMetaAccount(account)
   if (
     account.provider === 'relay' &&
-    !managedMessenger &&
+    !managedMeta &&
     !accountSettingsDraft.relay_url.trim()
   ) {
     toast.warning('A signed-relay URL is required')
@@ -915,13 +1143,13 @@ async function saveAccountSettings() {
     const update: Record<string, unknown> = {
       name: accountSettingsDraft.name.trim(),
     }
-    if (account.provider === 'relay' && !managedMessenger) {
+    if (account.provider === 'relay' && !managedMeta) {
       update.config = {
         ...account.config,
         relay_url: accountSettingsDraft.relay_url.trim(),
       }
     }
-    if (!managedMessenger && accountSettingsDraft.outbound_secret.trim()) {
+    if (!managedMeta && accountSettingsDraft.outbound_secret.trim()) {
       update.outbound_secret = accountSettingsDraft.outbound_secret
     }
     if (['instagram', 'messenger'].includes(account.channel)) {
@@ -952,18 +1180,21 @@ async function disableOutbound() {
 
 async function disconnectAccount() {
   const account = settingsAccount.value
-  if (!account || !canDeleteAccounts.value || metaMessengerBusy.value) return
-  if (isManagedMetaMessenger(account) && !canManageIntegrations.value) return
+  if (!account || !canDeleteAccounts.value || metaMessengerBusy.value || metaInstagramBusy.value) return
+  if (isManagedMetaAccount(account) && !canManageIntegrations.value) return
   const organizationId = activeOrganizationId.value
   const contextVersion = metaMessengerContextVersion
   if (!organizationId) return
   const confirmed = window.confirm(
     isManagedMetaMessenger(account)
       ? `Disconnect ${account.name}? ReReply will unsubscribe this exact Facebook Page and revoke both credential versions. Existing CRM history remains.`
-      : `Disconnect ${account.name}? New inbound and outbound traffic for this relay will stop. Existing CRM history remains.`,
+      : isManagedMetaInstagram(account)
+        ? `Disconnect ${account.name}? ReReply will unsubscribe this exact Instagram profile and revoke both credential versions. Existing CRM history remains.`
+        : `Disconnect ${account.name}? New inbound and outbound traffic for this relay will stop. Existing CRM history remains.`,
   )
   if (!confirmed) return
   if (isManagedMetaMessenger(account)) metaMessengerBusy.value = true
+  if (isManagedMetaInstagram(account)) metaInstagramBusy.value = true
   try {
     if (isManagedMetaMessenger(account)) {
       if (!metaMessengerOnboardingReady.value) {
@@ -973,6 +1204,18 @@ async function disconnectAccount() {
         throw new Error('The managed Messenger Page ID is missing')
       }
       await metaMessengerOnboarding.disconnect(
+        account.id,
+        account.external_account_id,
+        organizationId,
+      )
+    } else if (isManagedMetaInstagram(account)) {
+      if (!metaInstagramTeardownReady.value) {
+        throw new Error('Managed Instagram lifecycle is unavailable')
+      }
+      if (!account.external_account_id) {
+        throw new Error('The managed Instagram profile ID is missing')
+      }
+      await metaInstagramOnboarding.disconnect(
         account.id,
         account.external_account_id,
         organizationId,
@@ -997,6 +1240,12 @@ async function disconnectAccount() {
       isMetaMessengerContextCurrent(organizationId, contextVersion)
     ) {
       metaMessengerBusy.value = false
+    }
+    if (
+      isManagedMetaInstagram(account) &&
+      isMetaMessengerContextCurrent(organizationId, contextVersion)
+    ) {
+      metaInstagramBusy.value = false
     }
   }
 }
@@ -1034,10 +1283,80 @@ async function loadMetaMessengerOnboardingStatus() {
   }
 }
 
+async function loadMetaInstagramOnboardingStatus() {
+  const organizationId = activeOrganizationId.value
+  const requestSequence = ++metaInstagramStatusSequence
+  metaInstagramState.value = {
+    availability: organizationId ? 'loading' : 'error',
+    organizationId: organizationId ?? '',
+    status: null,
+  }
+  if (!organizationId) return
+  try {
+    const status = await metaInstagramOnboarding.status(organizationId)
+    if (
+      requestSequence === metaInstagramStatusSequence &&
+      activeOrganizationId.value === organizationId
+    ) {
+      metaInstagramState.value = {
+        availability: 'managed',
+        organizationId,
+        status,
+      }
+    }
+  } catch (error) {
+    if (
+      requestSequence === metaInstagramStatusSequence &&
+      activeOrganizationId.value === organizationId
+    ) {
+      metaInstagramState.value = {
+        availability: error instanceof MetaInstagramOffPilotError ? 'off_pilot' : 'error',
+        organizationId,
+        status: null,
+      }
+    }
+  }
+}
+
+function consumeMetaInstagramCallbackResult() {
+  const currentURL = new URL(window.location.href)
+  const result = currentURL.searchParams.get('managed_instagram')
+  if (!result) return
+  currentURL.searchParams.delete('managed_instagram')
+  window.history.replaceState(
+    {},
+    '',
+    `${currentURL.pathname}${currentURL.search}${currentURL.hash}`,
+  )
+  switch (result) {
+    case 'pending':
+      toast.success(
+        'Instagram profile connected safely',
+        'It remains pending. Run Test, review the result, then approve activation.',
+      )
+      void load()
+      break
+    case 'reconcile':
+      toast.error(
+        'Instagram subscription needs reconciliation',
+        'Open connection settings and reconcile the recorded provider operation.',
+      )
+      void load()
+      break
+    case 'cancelled':
+      toast.warning('Instagram authorization was cancelled')
+      break
+    default:
+      toast.error('Instagram authorization did not finish')
+  }
+}
+
 onMounted(() => {
   window.addEventListener('beforeunload', guardMetaMessengerNavigation)
   void load()
   void loadMetaMessengerOnboardingStatus()
+  void loadMetaInstagramOnboardingStatus()
+  consumeMetaInstagramCallbackResult()
   stopChannelSync = wsService.onChannelSync(scheduleChannelRefresh)
   pollTimer = window.setInterval(() => {
     if (document.visibilityState === 'visible') void load(true)
@@ -1060,18 +1379,26 @@ watch(activeOrganizationId, (organizationId, previousOrganizationId) => {
   metaMessengerAuthorizationController.value = null
   metaMessengerContextVersion += 1
   metaMessengerStatusSequence += 1
+  metaInstagramStatusSequence += 1
   const detached = Boolean(
     previousOrganizationId &&
     previousOrganizationId !== organizationId &&
-    (metaMessengerBusy.value || metaMessengerSelection.value),
+    (metaMessengerBusy.value || metaMessengerSelection.value || metaInstagramBusy.value),
   )
   metaMessengerBusy.value = false
+  metaInstagramBusy.value = false
   metaMessengerOnboardingReady.value = false
+  metaInstagramState.value = {
+    availability: organizationId ? 'loading' : 'error',
+    organizationId: organizationId ?? '',
+    status: null,
+  }
   closeMetaMessengerSelection()
   if (detached) {
-    toast.error('Messenger onboarding was detached because the active workspace changed')
+    toast.error('Managed Meta onboarding was detached because the active workspace changed')
   }
   void loadMetaMessengerOnboardingStatus()
+  void loadMetaInstagramOnboardingStatus()
 })
 
 watch([search, channelFilter], () => {
@@ -1099,7 +1426,14 @@ onBeforeUnmount(() => {
   conversationViewSequence += 1
   metaMessengerContextVersion += 1
   metaMessengerStatusSequence += 1
+  metaInstagramStatusSequence += 1
   metaMessengerBusy.value = false
+  metaInstagramBusy.value = false
+  metaInstagramState.value = {
+    availability: 'loading',
+    organizationId: '',
+    status: null,
+  }
   closeMetaMessengerSelection()
   window.removeEventListener('beforeunload', guardMetaMessengerNavigation)
   organizationsStore.unblockOrganizationSwitch(metaMessengerSwitchLockOwner)
@@ -1217,6 +1551,94 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
           </p>
         </div>
       </template>
+      <template
+        v-else-if="
+          newAccount.channel === 'instagram' && !metaInstagramStaticConnectionAvailable
+        "
+      >
+        <div
+          v-if="metaInstagramAvailability === 'loading'"
+          data-testid="instagram-onboarding-loading"
+          class="md:col-span-1 xl:col-span-4"
+        >
+          <p class="text-sm font-medium text-white light:text-slate-950">
+            Checking Instagram connection options
+          </p>
+          <p class="mt-1 text-xs leading-5 text-white/45 light:text-slate-600">
+            Static Instagram setup stays unavailable until this workspace policy is confirmed.
+          </p>
+        </div>
+        <div
+          v-else-if="metaInstagramAvailability === 'error'"
+          data-testid="instagram-onboarding-error"
+          class="md:col-span-1 xl:col-span-4"
+        >
+          <p class="text-sm font-medium text-white light:text-slate-950">
+            Instagram connection status is unavailable
+          </p>
+          <p class="mt-1 text-xs leading-5 text-white/45 light:text-slate-600">
+            No Instagram connection can be created until the workspace policy can be loaded.
+          </p>
+        </div>
+        <template
+          v-else-if="
+            metaInstagramStatus && metaInstagramOnboardingReady && canManageMetaInstagram
+          "
+        >
+          <div class="md:col-span-1 xl:col-span-3">
+            <div class="flex items-center gap-2">
+              <p class="text-sm font-medium text-white light:text-slate-950">
+                Connect an Instagram professional profile
+              </p>
+              <Badge
+                variant="outline"
+                class="border-rose-300/20 text-[9px] uppercase tracking-wider text-rose-200 light:text-rose-700"
+              >
+                {{
+                  metaInstagramStatus.quarantine_only
+                    ? 'Quarantine only'
+                    : metaInstagramStatus.app_review_status === 'approved'
+                      ? 'App reviewed'
+                      : 'Development role'
+                }}
+              </Badge>
+            </div>
+            <p class="mt-1 text-xs leading-5 text-white/45 light:text-slate-600">
+              Instagram verifies the exact Business or Creator profile. ReReply then confirms the
+              messages subscription before creating a pending connection.
+            </p>
+          </div>
+          <Button
+            data-testid="instagram-connect-managed"
+            class="bg-gradient-to-r from-[#f58529] via-[#dd2a7b] to-[#8134af] text-white shadow-lg shadow-[#dd2a7b]/15 hover:brightness-110"
+            :disabled="metaInstagramBusy"
+            @click="connectMetaInstagram"
+          >
+            <Loader2 v-if="metaInstagramBusy" class="mr-2 h-4 w-4 animate-spin" />
+            <Instagram v-else class="mr-2 h-4 w-4" />
+            Continue with Instagram
+          </Button>
+        </template>
+        <div
+          v-else
+          data-testid="instagram-onboarding-unavailable"
+          class="md:col-span-1 xl:col-span-4"
+        >
+          <p class="text-sm font-medium text-white light:text-slate-950">
+            Managed Instagram connection is not available
+          </p>
+          <p class="mt-1 text-xs leading-5 text-white/45 light:text-slate-600">
+            {{
+              metaInstagramStatus && metaInstagramOnboardingReady
+                ? 'You need both channel and integration administrator permission.'
+                : metaInstagramStatus?.quarantine_only
+                  ? 'The deployment is in quarantine-only mode. OAuth, reconnect, testing, and activation are disabled; teardown remains available on existing connections.'
+                  : 'Deployment-owned App Review or development app-role evidence is not ready.'
+            }}
+            Workspace administrators cannot supply or override that evidence.
+          </p>
+        </div>
+      </template>
       <template v-else>
         <Input v-model="newAccount.name" placeholder="Connection name" />
         <Input v-model="newAccount.external_account_id" placeholder="External account ID" />
@@ -1320,7 +1742,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             v-if="
               canManageAccounts &&
               account.provider === 'relay' &&
-              !isManagedMetaMessenger(account) &&
+              !isManagedMetaAccount(account) &&
               account.status === 'active' &&
               account.config?.outbound_enabled !== true
             "
@@ -1334,22 +1756,26 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             v-if="
               canManageAccounts &&
               canManageIntegrations &&
-              metaMessengerOnboardingReady &&
-              isManagedMetaMessenger(account) &&
+              managedMetaLifecycleReady(account) &&
+              isManagedMetaAccount(account) &&
               account.status === 'pending' &&
               Boolean(account.last_health_check_at) &&
               !account.last_error
             "
-            data-testid="messenger-approve-activation"
+            :data-testid="
+              isManagedMetaInstagram(account)
+                ? 'instagram-approve-activation'
+                : 'messenger-approve-activation'
+            "
             size="sm"
             class="h-8 bg-emerald-300 text-black hover:bg-emerald-200"
-            :disabled="metaMessengerBusy"
-            @click="approveMetaMessenger(account)"
+            :disabled="managedMetaActionBusy(account)"
+            @click="approveManagedMeta(account)"
           >
             Approve activation
           </Button>
           <Button
-            v-if="canManageAccounts && (!isManagedMetaMessenger(account) || metaMessengerOnboardingReady)"
+            v-if="canManageAccounts && (!isManagedMetaAccount(account) || managedMetaLifecycleReady(account))"
             variant="outline"
             size="sm"
             class="h-8"
@@ -1428,7 +1854,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               v-if="
                 canManageAccounts &&
                 account.provider === 'relay' &&
-                !isManagedMetaMessenger(account) &&
+                !isManagedMetaAccount(account) &&
                 account.status === 'active' &&
                 account.config?.outbound_enabled !== true
               "
@@ -1442,22 +1868,26 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               v-if="
                 canManageAccounts &&
                 canManageIntegrations &&
-                metaMessengerOnboardingReady &&
-                isManagedMetaMessenger(account) &&
+                managedMetaLifecycleReady(account) &&
+                isManagedMetaAccount(account) &&
                 account.status === 'pending' &&
                 Boolean(account.last_health_check_at) &&
                 !account.last_error
               "
               type="button"
-              data-testid="messenger-approve-activation-rail"
+              :data-testid="
+                isManagedMetaInstagram(account)
+                  ? 'instagram-approve-activation-rail'
+                  : 'messenger-approve-activation-rail'
+              "
               class="rounded-lg bg-emerald-300/10 px-2 py-1 text-[9px] font-semibold text-emerald-200 transition hover:bg-emerald-300/15"
-              :disabled="metaMessengerBusy"
-              @click.stop="approveMetaMessenger(account)"
+              :disabled="managedMetaActionBusy(account)"
+              @click.stop="approveManagedMeta(account)"
             >
               Activate
             </button>
             <button
-              v-if="canManageAccounts && (!isManagedMetaMessenger(account) || metaMessengerOnboardingReady)"
+              v-if="canManageAccounts && (!isManagedMetaAccount(account) || managedMetaLifecycleReady(account))"
               type="button"
               class="rounded-lg p-1.5 text-white/25 transition hover:bg-white/[0.05] hover:text-sky-300 light:text-slate-500 light:hover:text-sky-700"
               :aria-label="`Test ${account.name}`"
@@ -1507,13 +1937,15 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               {{
                 channel.key === 'threads'
                   ? 'OAuth managed in Settings → Integrations'
-                  : channel.key === 'messenger' && metaMessengerOnboardingReady
-                    ? 'Facebook Login for Business'
-                    : channel.connectable
-                    ? 'Signed relay'
-                    : channel.gated
-                      ? 'Approval gated'
-                      : 'Use WhatsApp setup'
+                  : channel.key === 'instagram' && metaInstagramOnboardingReady
+                    ? 'Managed Instagram Login'
+                    : channel.key === 'messenger' && metaMessengerOnboardingReady
+                      ? 'Facebook Login for Business'
+                      : channel.connectable
+                        ? 'Signed relay'
+                        : channel.gated
+                          ? 'Approval gated'
+                          : 'Use WhatsApp setup'
               }}
             </p>
           </div>
@@ -1947,7 +2379,11 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               {{
                 isManagedMetaMessenger(settingsAccount)
                   ? `Facebook-managed Page ${settingsAccount.external_account_id ?? ''}. Reconnect, test, approve, or disconnect it here.`
-                  : 'Repair the relay, rotate its outbound signing credential, or stop delivery.'
+                  : isManagedMetaInstagram(settingsAccount)
+                    ? metaInstagramOnboardingReady
+                      ? `Managed Instagram profile ${settingsAccount.external_account_id ?? ''}. Reconnect, test, approve, or disconnect it here.`
+                      : `Managed Instagram profile ${settingsAccount.external_account_id ?? ''}. Only safe unsubscribe reconciliation and disconnect remain available.`
+                    : 'Repair the relay, rotate its outbound signing credential, or stop delivery.'
               }}
             </p>
           </div>
@@ -1956,9 +2392,34 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
 
         <div
           v-if="
+            !metaInstagramOnboardingReady &&
+            canReconcileMetaInstagram &&
+            metaInstagramCanReconcile(settingsAccount)
+          "
+          class="mt-5 rounded-xl border border-amber-300/15 bg-amber-300/[0.035] p-3"
+        >
+          <p class="text-xs leading-5 text-white/50 light:text-gray-600">
+            OAuth intake is quarantined. This action can only finish the already-recorded
+            unsubscribe operation.
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            class="mt-3"
+            data-testid="instagram-reconcile-subscription"
+            :disabled="metaInstagramBusy"
+            @click="reconcileMetaInstagram(settingsAccount)"
+          >
+            <RefreshCw class="mr-2 h-4 w-4" />
+            Reconcile Instagram unsubscribe
+          </Button>
+        </div>
+
+        <div
+          v-if="
             canManageAccounts &&
-            (!isManagedMetaMessenger(settingsAccount) ||
-              (metaMessengerOnboardingReady && canManageIntegrations))
+            (!isManagedMetaAccount(settingsAccount) ||
+              (managedMetaLifecycleReady(settingsAccount) && canManageIntegrations))
           "
           class="mt-5 space-y-4"
         >
@@ -1967,7 +2428,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             <Input v-model="accountSettingsDraft.name" class="mt-1.5" required maxlength="100" />
           </label>
           <label
-            v-if="settingsAccount.provider === 'relay' && !isManagedMetaMessenger(settingsAccount)"
+            v-if="settingsAccount.provider === 'relay' && !isManagedMetaAccount(settingsAccount)"
             class="block"
           >
             <span class="text-xs font-medium text-white/60 light:text-gray-600">HTTPS relay URL</span>
@@ -2000,7 +2461,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             </span>
           </label>
           <label
-            v-if="settingsAccount.provider === 'relay' && !isManagedMetaMessenger(settingsAccount)"
+            v-if="settingsAccount.provider === 'relay' && !isManagedMetaAccount(settingsAccount)"
             class="block"
           >
             <span class="text-xs font-medium text-white/60 light:text-gray-600">Rotate outbound signing secret</span>
@@ -2033,6 +2494,17 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               Reconcile Meta subscription
             </Button>
             <Button
+              v-if="canReconcileMetaInstagram && metaInstagramCanReconcile(settingsAccount)"
+              type="button"
+              variant="outline"
+              data-testid="instagram-reconcile-subscription"
+              :disabled="metaInstagramBusy"
+              @click="reconcileMetaInstagram(settingsAccount)"
+            >
+              <RefreshCw class="mr-2 h-4 w-4" />
+              Reconcile Instagram subscription
+            </Button>
+            <Button
               v-if="
                 canManageIntegrations &&
                 metaMessengerOnboardingReady &&
@@ -2047,6 +2519,20 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               Reconnect Facebook
             </Button>
             <Button
+              v-if="
+                canManageIntegrations &&
+                metaInstagramOnboardingReady &&
+                isManagedMetaInstagram(settingsAccount)
+              "
+              type="button"
+              variant="outline"
+              :disabled="metaInstagramBusy"
+              @click="reconnectMetaInstagram(settingsAccount)"
+            >
+              <Instagram class="mr-2 h-4 w-4" />
+              Reconnect Instagram
+            </Button>
+            <Button
               v-if="metaMessengerAuthorizationController"
               type="button"
               variant="outline"
@@ -2056,10 +2542,12 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               Cancel Facebook authorization
             </Button>
             <Button
-              v-if="metaMessengerOnboardingReady && isManagedMetaMessenger(settingsAccount)"
+              v-if="
+                isManagedMetaAccount(settingsAccount) && managedMetaLifecycleReady(settingsAccount)
+              "
               type="button"
               variant="outline"
-              :disabled="metaMessengerBusy"
+              :disabled="managedMetaActionBusy(settingsAccount)"
               @click="testAccount(settingsAccount)"
             >
               <RefreshCw class="mr-2 h-4 w-4" />
@@ -2067,31 +2555,31 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             </Button>
             <Button
               v-if="
-                isManagedMetaMessenger(settingsAccount) &&
+                isManagedMetaAccount(settingsAccount) &&
                 canManageIntegrations &&
-                metaMessengerOnboardingReady &&
+                managedMetaLifecycleReady(settingsAccount) &&
                 settingsAccount.status === 'pending' &&
                 Boolean(settingsAccount.last_health_check_at) &&
                 !settingsAccount.last_error
               "
               type="button"
               class="bg-emerald-300 text-black hover:bg-emerald-200"
-              :disabled="metaMessengerBusy"
-              @click="approveMetaMessenger(settingsAccount)"
+              :disabled="managedMetaActionBusy(settingsAccount)"
+              @click="approveManagedMeta(settingsAccount)"
             >
               Approve activation
             </Button>
             <Button
               v-if="
-                isManagedMetaMessenger(settingsAccount) &&
+                isManagedMetaAccount(settingsAccount) &&
                 canManageIntegrations &&
-                metaMessengerOnboardingReady &&
+                managedMetaLifecycleReady(settingsAccount) &&
                 settingsAccount.status === 'active' &&
                 settingsAccount.config?.outbound_enabled !== true
               "
               type="button"
               class="bg-emerald-300 text-black hover:bg-emerald-200"
-              :disabled="metaMessengerBusy"
+              :disabled="managedMetaActionBusy(settingsAccount)"
               @click="approveOutbound(settingsAccount)"
             >
               Re-enable outbound
@@ -2110,22 +2598,38 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
         <div
           v-if="
             canDeleteAccounts &&
-            (!isManagedMetaMessenger(settingsAccount) ||
-              (metaMessengerOnboardingReady && canManageIntegrations))
+            (!isManagedMetaAccount(settingsAccount) ||
+              (managedMetaTeardownReady(settingsAccount) && canManageIntegrations))
           "
           class="mt-5 border-t border-red-300/15 pt-5 light:border-red-200"
         >
           <p class="text-xs font-semibold text-red-200 light:text-red-700">
-            {{ isManagedMetaMessenger(settingsAccount) ? 'Disconnect Facebook Page' : 'Disconnect relay' }}
+            {{
+              isManagedMetaMessenger(settingsAccount)
+                ? 'Disconnect Facebook Page'
+                : isManagedMetaInstagram(settingsAccount)
+                  ? 'Disconnect Instagram profile'
+                  : 'Disconnect relay'
+            }}
           </p>
           <p class="mt-1 text-[11px] leading-5 text-white/40 light:text-gray-500">
             {{
               isManagedMetaMessenger(settingsAccount)
                 ? 'Unsubscribes the exact Page, revokes both ReReply credential versions, and keeps CRM history.'
-                : 'Stops new traffic and removes the connection. CRM history is retained.'
+                : isManagedMetaInstagram(settingsAccount)
+                  ? 'Unsubscribes the exact profile, revokes both ReReply credential versions, and keeps CRM history.'
+                  : 'Stops new traffic and removes the connection. CRM history is retained.'
             }}
           </p>
-          <Button type="button" variant="destructive" class="mt-3" @click="disconnectAccount">
+          <Button
+            type="button"
+            variant="destructive"
+            class="mt-3"
+            :data-testid="
+              isManagedMetaInstagram(settingsAccount) ? 'instagram-disconnect-managed' : undefined
+            "
+            @click="disconnectAccount"
+          >
             Disconnect connection
           </Button>
         </div>

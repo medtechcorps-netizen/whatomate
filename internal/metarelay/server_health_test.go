@@ -63,6 +63,56 @@ func TestDynamicMessengerHealthRequiresExactPlatformAppMessagesSubscription(t *t
 	}
 }
 
+func TestDynamicInstagramHealthPinsManagedAppAndMessagesSubscriptionWithProof(t *testing.T) {
+	config := newTestConfig(t)
+	config.ManagedInstagramAppID = "789012"
+	config.ManagedInstagramAppSecret = "managed-instagram-app-secret-at-least-32-bytes"
+	static, _ := config.accountByKey("instagram-direct")
+	account := *static
+	account.registryManaged = true
+	account.PlatformAppID = config.ManagedInstagramAppID
+
+	proofMAC := hmac.New(sha256.New, []byte(config.ManagedInstagramAppSecret))
+	_, _ = proofMAC.Write([]byte(account.accessToken))
+	wantProof := hex.EncodeToString(proofMAC.Sum(nil))
+	fields := "feed"
+	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+account.accessToken {
+			t.Errorf("missing Instagram access token")
+		}
+		if request.URL.Query().Get("appsecret_proof") != wantProof {
+			t.Errorf("appsecret_proof = %q", request.URL.Query().Get("appsecret_proof"))
+		}
+		switch request.URL.Path {
+		case "/v25.0/me":
+			if request.URL.Query().Get("fields") != "user_id" {
+				t.Errorf("profile fields = %q", request.URL.Query().Get("fields"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"user_id":"ig-direct-1"}]}`))
+		case "/v25.0/ig-direct-1/subscribed_apps":
+			_, _ = w.Write([]byte(`{"data":[{"id":"789012","subscribed_fields":["` + fields + `"]}]}`))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer graph.Close()
+	server, err := NewServer(config, newMemoryServerStore(), withGraphBases("http://facebook.invalid", graph.URL))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := server.validateGraphBinding(t.Context(), &account); err == nil {
+		t.Fatal("expected non-messages Instagram subscription to fail")
+	}
+	fields = "messages"
+	if err := server.validateGraphBinding(t.Context(), &account); err != nil {
+		t.Fatalf("expected exact managed Instagram health: %v", err)
+	}
+	account.PlatformAppID = "different-app"
+	if err := server.validateGraphBinding(t.Context(), &account); err == nil {
+		t.Fatal("expected managed Instagram app mismatch to fail closed")
+	}
+}
+
 func TestAccountHealthValidatesRedisTokenAccountAndGraphHost(t *testing.T) {
 	config := newTestConfig(t)
 	store := newMemoryServerStore()
@@ -105,7 +155,7 @@ func TestAccountHealthValidatesRedisTokenAccountAndGraphHost(t *testing.T) {
 			http.Error(w, "expired token", http.StatusUnauthorized)
 			return
 		}
-		_, _ = w.Write([]byte(`{"user_id":"ig-direct-1"}`))
+		_, _ = w.Write([]byte(`{"data":[{"user_id":"ig-direct-1"}]}`))
 	}))
 	defer instagram.Close()
 
@@ -164,8 +214,14 @@ func TestAccountHealthFailsClosedWithoutLeakingProviderData(t *testing.T) {
 		{
 			name:   "wrong account",
 			status: http.StatusOK,
-			body:   `{"user_id":"some-other-instagram-account"}`,
+			body:   `{"data":[{"user_id":"some-other-instagram-account"}]}`,
 		},
+		{name: "obsolete top-level response", status: http.StatusOK, body: `{"user_id":"ig-direct-1"}`},
+		{name: "empty data", status: http.StatusOK, body: `{"data":[]}`},
+		{name: "multiple profiles", status: http.StatusOK, body: `{"data":[{"user_id":"ig-direct-1"},{"user_id":"ig-direct-1"}]}`},
+		{name: "missing professional ID", status: http.StatusOK, body: `{"data":[{}]}`},
+		{name: "unknown profile field", status: http.StatusOK, body: `{"data":[{"user_id":"ig-direct-1","id":"app-subject"}]}`},
+		{name: "trailing JSON", status: http.StatusOK, body: `{"data":[{"user_id":"ig-direct-1"}]} {}`},
 		{
 			name:   "malformed response",
 			status: http.StatusOK,

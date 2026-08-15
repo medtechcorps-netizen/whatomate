@@ -137,6 +137,14 @@ func (s *Server) Handler() http.Handler {
 		"POST /v1/meta/instagram/webhook",
 		s.metaWebhookHandler(WebhookAppInstagramLogin),
 	)
+	mux.HandleFunc(
+		"GET /v1/meta/instagram/managed-webhook",
+		s.metaVerificationHandler(WebhookAppManagedInstagram),
+	)
+	mux.HandleFunc(
+		"POST /v1/meta/instagram/managed-webhook",
+		s.metaWebhookHandler(WebhookAppManagedInstagram),
+	)
 	mux.HandleFunc("HEAD /v1/accounts/{channel}/{externalID}", s.handleAccountHealth)
 	mux.HandleFunc("POST /v1/accounts/{channel}/{externalID}", s.handleReReplyOutbound)
 	return securityHeaders(mux)
@@ -254,12 +262,19 @@ func (s *Server) webhookCredentials(webhookApp WebhookApp) (string, string, bool
 	case WebhookAppMessenger:
 		return s.config.MessengerAppSecret, s.config.MessengerVerifyToken, true
 	case WebhookAppManagedMessenger:
-		if !s.config.RegistryEnabled {
+		if !s.config.RegistryEnabled || strings.TrimSpace(s.config.ManagedMessengerAppSecret) == "" ||
+			strings.TrimSpace(s.config.ManagedMessengerVerifyToken) == "" {
 			return "", "", false
 		}
 		return s.config.ManagedMessengerAppSecret, s.config.ManagedMessengerVerifyToken, true
 	case WebhookAppInstagramLogin:
 		return s.config.InstagramLoginAppSecret, s.config.InstagramLoginVerifyToken, true
+	case WebhookAppManagedInstagram:
+		if !s.config.RegistryEnabled || strings.TrimSpace(s.config.ManagedInstagramAppSecret) == "" ||
+			strings.TrimSpace(s.config.ManagedInstagramVerifyToken) == "" {
+			return "", "", false
+		}
+		return s.config.ManagedInstagramAppSecret, s.config.ManagedInstagramVerifyToken, true
 	default:
 		return "", "", false
 	}
@@ -314,6 +329,12 @@ type graphBindingResponse struct {
 	} `json:"instagram_business_account"`
 }
 
+type instagramLoginGraphBindingEnvelope struct {
+	Data []struct {
+		UserID string `json:"user_id"`
+	} `json:"data"`
+}
+
 func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfig) error {
 	base, err := s.graphBase(account)
 	if err != nil {
@@ -339,8 +360,12 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 	}
 	query := parsed.Query()
 	query.Set("fields", fields)
-	if account.registryManaged && account.Channel == models.ChannelMessenger {
-		query.Set("appsecret_proof", metaAccessTokenProof(account.accessToken, s.config.ManagedMessengerAppSecret))
+	if account.registryManaged {
+		appSecret, proofErr := s.managedAppSecret(account)
+		if proofErr != nil {
+			return proofErr
+		}
+		query.Set("appsecret_proof", metaAccessTokenProof(account.accessToken, appSecret))
 	}
 	parsed.RawQuery = query.Encode()
 
@@ -363,8 +388,27 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return errors.New("graph rejected account health request")
 	}
-	var binding graphBindingResponse
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
+	if account.Channel == models.ChannelInstagram &&
+		account.InstagramAPIMode == InstagramAPIModeInstagramLogin {
+		decoder.DisallowUnknownFields()
+		var envelope instagramLoginGraphBindingEnvelope
+		if err := decoder.Decode(&envelope); err != nil || len(envelope.Data) != 1 {
+			return errors.New("graph account binding response is invalid")
+		}
+		if err := rejectTrailingJSON(decoder); err != nil {
+			return errors.New("graph account binding response is invalid")
+		}
+		if strings.TrimSpace(envelope.Data[0].UserID) != account.ExternalAccountID {
+			return errors.New("instagram token is bound to a different account")
+		}
+		if account.registryManaged {
+			return s.validateInstagramAppSubscription(ctx, account)
+		}
+		return nil
+	}
+
+	var binding graphBindingResponse
 	if err := decoder.Decode(&binding); err != nil {
 		return errors.New("graph account binding response is invalid")
 	}
@@ -381,11 +425,6 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 			return s.validateMessengerAppSubscription(ctx, account)
 		}
 	case account.Channel == models.ChannelInstagram &&
-		account.InstagramAPIMode == InstagramAPIModeInstagramLogin:
-		if strings.TrimSpace(binding.UserID) != account.ExternalAccountID {
-			return errors.New("instagram token is bound to a different account")
-		}
-	case account.Channel == models.ChannelInstagram &&
 		account.InstagramAPIMode == InstagramAPIModeFacebookLogin:
 		if binding.InstagramBusinessAccount == nil ||
 			strings.TrimSpace(binding.InstagramBusinessAccount.ID) != account.ExternalAccountID {
@@ -395,6 +434,31 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 		return errors.New("account Graph mode is invalid")
 	}
 	return nil
+}
+
+func (s *Server) managedAppSecret(account *AccountConfig) (string, error) {
+	if account == nil || !account.registryManaged {
+		return "", errors.New("managed Meta account binding is invalid")
+	}
+	switch account.Channel {
+	case models.ChannelMessenger:
+		if strings.TrimSpace(account.PlatformAppID) == "" ||
+			account.PlatformAppID != strings.TrimSpace(s.config.ManagedMessengerAppID) ||
+			strings.TrimSpace(s.config.ManagedMessengerAppSecret) == "" {
+			return "", errors.New("messenger platform app binding is invalid")
+		}
+		return s.config.ManagedMessengerAppSecret, nil
+	case models.ChannelInstagram:
+		if account.InstagramAPIMode != InstagramAPIModeInstagramLogin ||
+			strings.TrimSpace(account.PlatformAppID) == "" ||
+			account.PlatformAppID != strings.TrimSpace(s.config.ManagedInstagramAppID) ||
+			strings.TrimSpace(s.config.ManagedInstagramAppSecret) == "" {
+			return "", errors.New("instagram platform app binding is invalid")
+		}
+		return s.config.ManagedInstagramAppSecret, nil
+	default:
+		return "", errors.New("managed Meta account binding is invalid")
+	}
 }
 
 func (s *Server) validateMessengerAppSubscription(ctx context.Context, account *AccountConfig) error {
@@ -456,6 +520,66 @@ func (s *Server) validateMessengerAppSubscription(ctx context.Context, account *
 		}
 	}
 	return errors.New("messenger platform app is not subscribed to messages")
+}
+
+func (s *Server) validateInstagramAppSubscription(ctx context.Context, account *AccountConfig) error {
+	appSecret, err := s.managedAppSecret(account)
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf(
+		"%s/%s/%s/subscribed_apps",
+		strings.TrimRight(s.instagramGraphBase, "/"),
+		url.PathEscape(s.config.GraphAPIVersion),
+		url.PathEscape(account.ExternalAccountID),
+	)
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return errors.New("invalid Instagram subscription health endpoint")
+	}
+	query := parsed.Query()
+	query.Set("fields", "id,subscribed_fields")
+	query.Set("appsecret_proof", metaAccessTokenProof(account.accessToken, appSecret))
+	parsed.RawQuery = query.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return errors.New("invalid Instagram subscription health request")
+	}
+	request.Header.Set("Authorization", "Bearer "+account.accessToken)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", "ReReply-Meta-Relay/1.0")
+	response, err := s.client.Do(request)
+	if err != nil {
+		return errors.New("instagram subscription health transport failure")
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+		_ = response.Body.Close()
+	}()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return errors.New("instagram rejected subscription health request")
+	}
+	var result struct {
+		Data []struct {
+			ID               string   `json:"id"`
+			SubscribedFields []string `json:"subscribed_fields"`
+		} `json:"data"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
+	if decoder.Decode(&result) != nil || rejectTrailingJSON(decoder) != nil {
+		return errors.New("instagram subscription health response is invalid")
+	}
+	for _, subscription := range result.Data {
+		if strings.TrimSpace(subscription.ID) != account.PlatformAppID {
+			continue
+		}
+		for _, field := range subscription.SubscribedFields {
+			if strings.EqualFold(strings.TrimSpace(field), "messages") {
+				return nil
+			}
+		}
+	}
+	return errors.New("instagram platform app is not subscribed to messages")
 }
 
 func metaAccessTokenProof(accessToken, appSecret string) string {
@@ -698,13 +822,17 @@ func (s *Server) sendGraph(
 		url.PathEscape(s.config.GraphAPIVersion),
 		url.PathEscape(account.ExternalAccountID),
 	)
-	if account.registryManaged && account.Channel == models.ChannelMessenger {
+	if account.registryManaged {
 		parsed, parseErr := url.Parse(endpoint)
 		if parseErr != nil {
 			return graphResult{status: http.StatusInternalServerError, body: errorJSON("provider_request_failed")}
 		}
+		appSecret, proofErr := s.managedAppSecret(account)
+		if proofErr != nil {
+			return graphResult{status: http.StatusInternalServerError, body: errorJSON("provider_request_failed")}
+		}
 		query := parsed.Query()
-		query.Set("appsecret_proof", metaAccessTokenProof(account.accessToken, s.config.ManagedMessengerAppSecret))
+		query.Set("appsecret_proof", metaAccessTokenProof(account.accessToken, appSecret))
 		parsed.RawQuery = query.Encode()
 		endpoint = parsed.String()
 	}
@@ -841,11 +969,15 @@ func validateOutboundMessage(channel models.Channel, message channelapi.Outbound
 		strings.TrimSpace(message.Parts[0].Text) == "" {
 		return errors.New("exactly one text part is required")
 	}
-	maxRunes := 2000
-	if channel == models.ChannelInstagram {
-		maxRunes = 1000
+	text := message.Parts[0].Text
+	if !utf8.ValidString(text) {
+		return errors.New("text is not valid UTF-8")
 	}
-	if utf8.RuneCountInString(message.Parts[0].Text) > maxRunes {
+	tooLong := utf8.RuneCountInString(text) > 2000
+	if channel == models.ChannelInstagram {
+		tooLong = len(text) > 1000
+	}
+	if tooLong {
 		return errors.New("text exceeds provider limit")
 	}
 	if message.Template != nil || len(message.CC) > 0 || len(message.ReplyToExternalID) > 512 {

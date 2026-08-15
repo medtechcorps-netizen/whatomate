@@ -87,6 +87,56 @@ func TestRegistryClientAuthenticatesResponseCachesOnlyWithinLeaseAndSupportsUnca
 	require.ErrorIs(t, err, ErrRegistryUnavailable)
 }
 
+func TestRegistryClientCachesManagedInstagramByPurposeAndBindsExactApp(t *testing.T) {
+	now := time.Date(2026, 8, 15, 3, 0, 0, 0, time.UTC)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		body, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		var resolve metaregistry.ResolveRequest
+		require.NoError(t, json.Unmarshal(body, &resolve))
+		require.NotEmpty(t, resolve.Purpose)
+		binding := metaregistry.Binding{
+			SchemaVersion: metaregistry.SchemaVersion, LeaseID: uuid.New(), LeaseExpiresAt: now.Add(30 * time.Second),
+			OrganizationID: uuid.New(), ChannelAccountID: uuid.New(),
+			Channel: models.ChannelInstagram, ExternalAccountID: "ig-profile-1",
+			PlatformAppID: "789012", InstagramAPIMode: string(InstagramAPIModeInstagramLogin),
+			ReReplyWebhookURL: "https://app.example.test/api/webhooks/channels/account",
+			AccessToken:       "token", InboundSecret: "inbound", OutboundSecret: "outbound",
+			CredentialID: uuid.New(), CredentialVersion: 1,
+			WebhookCredentialID: uuid.New(), WebhookCredentialVersion: 1,
+			OwnershipCheckedAt: now,
+		}
+		encoded, err := json.Marshal(binding)
+		require.NoError(t, err)
+		w.Header().Set(metaregistry.ResponseHeader, metaregistry.SignResponse(
+			registryClientTestSecret, request.Header.Get(metaregistry.NonceHeader), http.StatusOK, encoded,
+		))
+		_, _ = w.Write(encoded)
+	}))
+	defer server.Close()
+	client, err := NewRegistryClient(&Config{
+		RegistryURL:           server.URL + metaregistry.ResolvePath,
+		RegistrySecret:        registryClientTestSecret,
+		ManagedInstagramAppID: "789012",
+		RegistryCacheTTL:      time.Second, RegistryTimeout: time.Second,
+		allowInsecureTestEndpoints: true, RegistryEnabled: true,
+	}, server.Client())
+	require.NoError(t, err)
+	client.now = func() time.Time { return now }
+
+	_, err = client.Resolve(t.Context(), models.ChannelInstagram, "ig-profile-1", metaregistry.ResolvePurposeInbound, true)
+	require.NoError(t, err)
+	_, err = client.Resolve(t.Context(), models.ChannelInstagram, "ig-profile-1", metaregistry.ResolvePurposeHealth, true)
+	require.NoError(t, err)
+	require.Equal(t, int32(2), calls.Load(), "purpose-specific leases must not share a cache entry")
+
+	client.managedInstagramAppID = "different-app"
+	_, err = client.Resolve(t.Context(), models.ChannelInstagram, "ig-profile-1", metaregistry.ResolvePurposeWorker, false)
+	require.ErrorIs(t, err, ErrRegistryUnavailable)
+}
+
 func TestRegistryClientFailsClosedOnUnsignedOrMismatchedBinding(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		body := []byte(`{"schema_version":1}`)
@@ -162,6 +212,30 @@ func TestDynamicPublicRouteRequiresOuterServiceCredentialBeforeRegistryLookup(t 
 	staticRequest.SetPathValue("channel", "messenger")
 	staticRequest.SetPathValue("externalID", "page-1")
 	resolved, err := server.accountFromPath(staticRequest, metaregistry.ResolvePurposeOutbound, false)
+	require.NoError(t, err)
+	require.Same(t, static, resolved)
+}
+
+func TestManagedInstagramPilotStaticMappingMustBeRemovedBeforeRegistryResolution(t *testing.T) {
+	config := newTestConfig(t)
+	config.RegistryEnabled = true
+	config.RegistryEdgeSecret = "synthetic-registry-edge-secret-at-least-32-bytes"
+	static, ok := config.account(models.ChannelInstagram, "ig-direct-1")
+	require.True(t, ok)
+
+	// A registry resolver that panics makes the rollout invariant executable:
+	// as long as the exact profile remains in META_RELAY_ACCOUNTS_JSON, static
+	// lookup wins and the managed binding is unreachable.
+	server := &Server{config: config, registry: panicRegistryResolver{}}
+	request := httptest.NewRequest(
+		http.MethodPost, "/v1/accounts/instagram/ig-direct-1", nil,
+	)
+	request.SetPathValue("channel", "instagram")
+	request.SetPathValue("externalID", "ig-direct-1")
+	request.Header.Set(RelayServiceTokenHeader, config.RegistryEdgeSecret)
+	resolved, err := server.accountFromPath(
+		request, metaregistry.ResolvePurposeOutbound, false,
+	)
 	require.NoError(t, err)
 	require.Same(t, static, resolved)
 }
