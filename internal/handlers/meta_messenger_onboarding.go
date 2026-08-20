@@ -513,6 +513,12 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 	}
 	pageInspection, pageName, err := a.bindMetaMessengerPageToken(ctx, request.PageID, pageToken)
 	if err != nil {
+		a.Log.Warn(
+			"Messenger Page token validation failed",
+			"organization_id", orgID,
+			"page_id", request.PageID,
+			"error", err,
+		)
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Meta could not verify the selected Page token", nil, "")
 	}
 	if pageName != "" {
