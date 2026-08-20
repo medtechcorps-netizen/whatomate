@@ -242,10 +242,37 @@ Use this order:
    unchanged.
 2. Deploy queue-v2 readers to every relay replica. Confirm static webhook and
    outbound smoke tests still use the existing static mappings and routes.
-3. Create the platform-owned compliance organization. It must be distinct from
-   every clinic, have the documented privacy ownership/retention controls, and
-   exist before the organization-set configuration can pass the synchronous
-   startup check.
+3. Create the platform-owned compliance organization through the authorized
+   control plane. It must be distinct from every clinic, belong to the
+   undeleted active reseller whose slug is exactly `platform-direct`, have the
+   documented privacy ownership/retention controls, and carry this independent
+   durable organization-settings marker:
+
+   ```json
+   {"meta_instagram_data_deletion_compliance_tenant": true}
+   ```
+
+   The JSON value must be the boolean `true`, not a string. This marker is not
+   interchangeable with `threads_managed_compliance_tenant`; one platform
+   compliance organization may carry both product-specific markers. Never put
+   a production organization UUID in source, examples, logs, or release
+   evidence. Before opening listeners or claiming work, every API and worker
+   enters the configured compliance tenant's ordinary RLS transaction and
+   performs one bounded `organizations` to `resellers` ownership check. A
+   missing/deleted organization, missing/deleted/inactive/non-platform reseller,
+   or absent/malformed marker makes startup fail closed without a provider call.
+   The compliance organization remains excluded from both the active and
+   quarantined clinic sets, so it cannot onboard, receive messaging routes, or
+   own a managed profile.
+
+   In isolated staging, operator-test both directions before rollout: provision
+   the intended platform compliance organization and marker, confirm startup
+   passes, remove only the Instagram marker through the same authorized control
+   plane, and confirm a fresh API/worker startup refuses to serve or claim work.
+   Restore the marker and confirm startup passes again. Marker removal is an
+   emergency fail-closed proof, not an offboarding shortcut: quarantine and
+   settle every retained privacy obligation first, and do not remove the marker
+   from a running deployment merely to bypass cleanup.
 4. After every API, worker, and callback reader runs the new binary, configure
    `allowed_organization_ids` with the same singleton as the legacy key and set
    `data_deletion_compliance_organization_id`. This same-singleton overlap is

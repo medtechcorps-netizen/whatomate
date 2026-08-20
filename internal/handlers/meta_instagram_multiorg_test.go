@@ -41,6 +41,56 @@ func configureMetaInstagramOrganizationSet(
 	fixture.app.Config.MetaInstagram.DataDeletionComplianceOrganizationID = compliance.String()
 }
 
+func setMetaInstagramComplianceTenantMarker(
+	t *testing.T,
+	db *gorm.DB,
+	organization *models.Organization,
+	value any,
+) {
+	t.Helper()
+	settings := cloneJSONB(organization.Settings)
+	if settings == nil {
+		settings = models.JSONB{}
+	}
+	if value == nil {
+		delete(settings, metaInstagramDataDeletionComplianceTenantMarkerKey)
+	} else {
+		settings[metaInstagramDataDeletionComplianceTenantMarkerKey] = value
+	}
+	require.NoError(t, db.Model(&models.Organization{}).
+		Where("id = ?", organization.ID).
+		Update("settings", settings).Error)
+	organization.Settings = settings
+}
+
+func createMetaInstagramPlatformComplianceOrganization(
+	t *testing.T,
+	db *gorm.DB,
+) (*models.Reseller, *models.Organization) {
+	t.Helper()
+	var reseller models.Reseller
+	err := db.Unscoped().Where("slug = ?", database.PlatformResellerSlug).
+		First(&reseller).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		created := testutil.CreateTestReseller(t, db)
+		require.NoError(t, db.Model(created).
+			Update("slug", database.PlatformResellerSlug).Error)
+		created.Slug = database.PlatformResellerSlug
+		reseller = *created
+	} else {
+		require.NoError(t, err)
+		require.NoError(t, db.Unscoped().Model(&reseller).Updates(map[string]any{
+			"deleted_at": nil,
+			"status":     models.ResellerStatusActive,
+		}).Error)
+		reseller.DeletedAt = gorm.DeletedAt{}
+		reseller.Status = models.ResellerStatusActive
+	}
+	organization := testutil.CreateTestOrganizationForReseller(t, db, reseller.ID)
+	setMetaInstagramComplianceTenantMarker(t, db, organization, true)
+	return &reseller, organization
+}
+
 func TestMetaInstagramMultiOrgOAuthFingerprintIsTargetScopedAndCompliancePinned(t *testing.T) {
 	organizationA := uuid.New()
 	organizationB := uuid.New()
@@ -66,7 +116,7 @@ func TestMetaInstagramMultiOrgOAuthFingerprintIsTargetScopedAndCompliancePinned(
 func TestManagedInstagramMultiOrgOnboardingRequiresReleaseAndEntitlement(t *testing.T) {
 	fixture := newMetaInstagramLifecycleFixture(t)
 	fixture.app.Redis = testutil.SetupTestRedis(t)
-	complianceOrganization := testutil.CreateTestOrganization(t, fixture.db)
+	_, complianceOrganization := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
 	configureMetaInstagramOrganizationSet(
 		fixture, []uuid.UUID{fixture.org.ID}, nil, complianceOrganization.ID,
 	)
@@ -206,7 +256,7 @@ func TestManagedInstagramMultiOrgPerTenantQuarantineAndRegistryRouting(t *testin
 	fixture.app.Redis = testutil.SetupTestRedis(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	secondOrganization := testutil.CreateTestOrganization(t, fixture.db)
-	complianceOrganization := testutil.CreateTestOrganization(t, fixture.db)
+	_, complianceOrganization := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
 	second := seedManagedInstagramMultiOrgAccount(
 		t, fixture, secondOrganization,
 		"770000000000101", "780000000000101", now,
@@ -279,7 +329,7 @@ func TestManagedInstagramMultiOrgPerTenantQuarantineAndRegistryRouting(t *testin
 func TestManagedInstagramMultiOrgConcurrentProvisionHasOneProfileOwner(t *testing.T) {
 	fixture := newMetaInstagramLifecycleFixture(t)
 	secondOrganization := testutil.CreateTestOrganization(t, fixture.db)
-	complianceOrganization := testutil.CreateTestOrganization(t, fixture.db)
+	_, complianceOrganization := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
 	secondRole := testutil.CreateTestRoleWithKeys(
 		t, fixture.db, secondOrganization.ID,
 		"synthetic-instagram-multiorg-provision-"+uuid.NewString(),
@@ -371,17 +421,106 @@ func TestManagedInstagramMultiOrgConcurrentProvisionHasOneProfileOwner(t *testin
 	assert.Equal(t, int64(2), credentials)
 }
 
-func TestManagedInstagramMultiOrgStartupRejectsMissingComplianceTenant(t *testing.T) {
+// This test deliberately remains top-level sequential because it proves
+// deleted/inactive rejection by temporarily changing the canonical synthetic
+// platform reseller, restoring it before any top-level parallel test can run.
+func TestManagedInstagramMultiOrgStartupRequiresMarkedPlatformComplianceTenant(t *testing.T) {
 	fixture := newMetaInstagramLifecycleFixture(t)
+	var providerCalls atomic.Int32
+	fixture.app.HTTPClient = &http.Client{Transport: metaInstagramRoundTripFunc(
+		func(*http.Request) (*http.Response, error) {
+			providerCalls.Add(1)
+			return nil, errors.New("compliance startup validation must not call the provider")
+		},
+	)}
+	assertRejected := func(t *testing.T, complianceID uuid.UUID) {
+		t.Helper()
+		configureMetaInstagramOrganizationSet(
+			fixture, []uuid.UUID{fixture.org.ID}, nil, complianceID,
+		)
+		err := fixture.app.ReconcileMetaInstagramQuarantineStartup(t.Context())
+		require.ErrorIs(t, err, errMetaInstagramComplianceTenantInvalid)
+		var account models.ChannelAccount
+		require.NoError(t, fixture.db.First(&account, "id = ?", fixture.account.ID).Error)
+		assert.Equal(t, models.ChannelAccountStatusActive, account.Status)
+		assert.True(t, boolConfigValue(account.Config, "outbound_enabled"))
+		assert.Zero(t, providerCalls.Load())
+	}
+
+	t.Run("missing organization", func(t *testing.T) {
+		assertRejected(t, uuid.New())
+	})
+
+	unowned := testutil.CreateTestOrganization(t, fixture.db)
+	setMetaInstagramComplianceTenantMarker(t, fixture.db, unowned, true)
+	t.Run("marked but unowned organization", func(t *testing.T) {
+		assertRejected(t, unowned.ID)
+	})
+
+	ordinaryReseller := testutil.CreateTestReseller(t, fixture.db)
+	ordinary := testutil.CreateTestOrganizationForReseller(t, fixture.db, ordinaryReseller.ID)
+	setMetaInstagramComplianceTenantMarker(t, fixture.db, ordinary, true)
+	t.Run("marked organization owned by ordinary reseller", func(t *testing.T) {
+		assertRejected(t, ordinary.ID)
+	})
+
+	platformReseller, valid := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
+	t.Cleanup(func() {
+		_ = fixture.db.Unscoped().Model(platformReseller).Updates(map[string]any{
+			"deleted_at": nil,
+			"status":     models.ResellerStatusActive,
+		}).Error
+		_ = fixture.db.Unscoped().Model(valid).Updates(map[string]any{
+			"deleted_at": nil,
+			"settings": models.JSONB{
+				metaInstagramDataDeletionComplianceTenantMarkerKey: true,
+			},
+		}).Error
+	})
+	unmarked := testutil.CreateTestOrganizationForReseller(t, fixture.db, platformReseller.ID)
+	t.Run("unmarked platform organization", func(t *testing.T) {
+		assertRejected(t, unmarked.ID)
+	})
+	setMetaInstagramComplianceTenantMarker(t, fixture.db, unmarked, "true")
+	t.Run("marker must be exact JSON boolean", func(t *testing.T) {
+		assertRejected(t, unmarked.ID)
+	})
+
+	require.NoError(t, fixture.db.Model(platformReseller).
+		Update("status", models.ResellerStatusSuspended).Error)
+	t.Run("inactive platform reseller", func(t *testing.T) {
+		assertRejected(t, valid.ID)
+	})
+	require.NoError(t, fixture.db.Model(platformReseller).
+		Update("status", models.ResellerStatusActive).Error)
+	platformReseller.Status = models.ResellerStatusActive
+
+	require.NoError(t, fixture.db.Delete(platformReseller).Error)
+	t.Run("deleted platform reseller", func(t *testing.T) {
+		assertRejected(t, valid.ID)
+	})
+	require.NoError(t, fixture.db.Unscoped().Model(platformReseller).
+		Update("deleted_at", nil).Error)
+	platformReseller.DeletedAt = gorm.DeletedAt{}
+
+	require.NoError(t, fixture.db.Delete(valid).Error)
+	t.Run("deleted marked organization", func(t *testing.T) {
+		assertRejected(t, valid.ID)
+	})
+	require.NoError(t, fixture.db.Unscoped().Model(valid).
+		Update("deleted_at", nil).Error)
+	valid.DeletedAt = gorm.DeletedAt{}
+
 	configureMetaInstagramOrganizationSet(
-		fixture, []uuid.UUID{fixture.org.ID}, nil, uuid.New(),
+		fixture, []uuid.UUID{fixture.org.ID}, nil, valid.ID,
 	)
-	err := fixture.app.ReconcileMetaInstagramQuarantineStartup(t.Context())
-	require.ErrorContains(t, err, "compliance tenant does not exist")
-	var account models.ChannelAccount
-	require.NoError(t, fixture.db.First(&account, "id = ?", fixture.account.ID).Error)
-	assert.Equal(t, models.ChannelAccountStatusActive, account.Status)
-	assert.True(t, boolConfigValue(account.Config, "outbound_enabled"))
+	require.NoError(t, fixture.app.ReconcileMetaInstagramQuarantineStartup(t.Context()))
+	assert.Zero(t, providerCalls.Load())
+
+	setMetaInstagramComplianceTenantMarker(t, fixture.db, valid, nil)
+	t.Run("marker removal fails closed on next startup", func(t *testing.T) {
+		assertRejected(t, valid.ID)
+	})
 }
 
 func TestManagedInstagramMultiOrgDeletionFailsClosedWithoutComplianceConfig(t *testing.T) {
@@ -434,7 +573,7 @@ func TestManagedInstagramMultiOrgReplaysLegacyNoTargetReceiptAfterSetMigration(t
 	var legacyResponse metaInstagramDeletionResponse
 	require.NoError(t, json.Unmarshal(legacy.RequestCtx.Response.Body(), &legacyResponse))
 
-	complianceOrganization := testutil.CreateTestOrganization(t, fixture.db)
+	_, complianceOrganization := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
 	configureMetaInstagramOrganizationSet(
 		fixture, []uuid.UUID{fixture.org.ID}, nil, complianceOrganization.ID,
 	)
@@ -464,7 +603,7 @@ func TestManagedInstagramMultiOrgExactOffboardedDeletionStaysWithTargetTenant(t 
 	fixture.app.Redis = testutil.SetupTestRedis(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	offboardedOrganization := testutil.CreateTestOrganization(t, fixture.db)
-	complianceOrganization := testutil.CreateTestOrganization(t, fixture.db)
+	_, complianceOrganization := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
 	foreignOrganization := testutil.CreateTestOrganization(t, fixture.db)
 	offboarded := seedManagedInstagramMultiOrgAccount(
 		t, fixture, offboardedOrganization,
@@ -537,7 +676,7 @@ func TestManagedInstagramMultiOrgDeauthorizationScopesExactOffboardedTenant(
 	fixture.app.Redis = testutil.SetupTestRedis(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	offboardedOrganization := testutil.CreateTestOrganization(t, fixture.db)
-	complianceOrganization := testutil.CreateTestOrganization(t, fixture.db)
+	_, complianceOrganization := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
 	foreignOrganization := testutil.CreateTestOrganization(t, fixture.db)
 	offboarded := seedManagedInstagramMultiOrgAccount(
 		t, fixture, offboardedOrganization,
@@ -598,7 +737,7 @@ func TestManagedInstagramMultiOrgNoTargetAndAmbiguousDeletionUseOpaqueCompliance
 			fixture.app.Redis = testutil.SetupTestRedis(t)
 			now := time.Now().UTC().Truncate(time.Second)
 			secondOrganization := testutil.CreateTestOrganization(t, fixture.db)
-			complianceOrganization := testutil.CreateTestOrganization(t, fixture.db)
+			_, complianceOrganization := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
 			active := []uuid.UUID{fixture.org.ID}
 			var second metaInstagramLifecycleFixture
 			var firstQueued, firstDispatching models.OutboxJob
@@ -773,7 +912,7 @@ func TestManagedInstagramMultiOrgNoTargetAndAmbiguousDeletionUseOpaqueCompliance
 
 func TestManagedInstagramMultiOrgOAuthFenceIncludesOpaqueComplianceJournal(t *testing.T) {
 	fixture := newMetaInstagramLifecycleFixture(t)
-	complianceOrganization := testutil.CreateTestOrganization(t, fixture.db)
+	_, complianceOrganization := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
 	configureMetaInstagramOrganizationSet(
 		fixture, []uuid.UUID{fixture.org.ID}, nil, complianceOrganization.ID,
 	)
@@ -814,7 +953,7 @@ func TestManagedInstagramMultiOrgOAuthFenceIncludesOpaqueComplianceJournal(t *te
 func TestManagedInstagramMultiOrgDeletionReplayRejectsInvalidComplianceOwnership(t *testing.T) {
 	fixture := newMetaInstagramLifecycleFixture(t)
 	fixture.app.Redis = testutil.SetupTestRedis(t)
-	complianceOrganization := testutil.CreateTestOrganization(t, fixture.db)
+	_, complianceOrganization := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
 	configureMetaInstagramOrganizationSet(
 		fixture, []uuid.UUID{fixture.org.ID}, nil, complianceOrganization.ID,
 	)
@@ -863,9 +1002,13 @@ func TestManagedInstagramMultiOrgComplianceCallbackUsesOnlyTenantRLS(t *testing.
 		testutil.TruncateTables(adminDB)
 	})
 
-	reseller := testutil.CreateTestReseller(t, adminDB)
+	reseller, compliance := createMetaInstagramPlatformComplianceOrganization(t, adminDB)
 	clinic := testutil.CreateTestOrganizationForReseller(t, adminDB, reseller.ID)
-	compliance := testutil.CreateTestOrganizationForReseller(t, adminDB, reseller.ID)
+	unmarkedCompliance := testutil.CreateTestOrganizationForReseller(t, adminDB, reseller.ID)
+	ordinaryReseller := testutil.CreateTestReseller(t, adminDB)
+	ordinaryCompliance := testutil.CreateTestOrganizationForReseller(
+		t, adminDB, ordinaryReseller.ID,
+	)
 	foreign := testutil.CreateTestOrganizationForReseller(t, adminDB, reseller.ID)
 	foreignJournal := models.MetaInstagramDataDeletionEvent{
 		Digest: strings.Repeat("f", 64), OrganizationID: foreign.ID,
@@ -887,6 +1030,19 @@ func TestManagedInstagramMultiOrgComplianceCallbackUsesOnlyTenantRLS(t *testing.
 		},
 		db: adminDB, org: clinic,
 	}
+	fixture.app.Config.MetaInstagram.DataDeletionComplianceOrganizationID = ordinaryCompliance.ID.String()
+	require.ErrorIs(
+		t,
+		fixture.app.ReconcileMetaInstagramQuarantineStartup(t.Context()),
+		errMetaInstagramComplianceTenantInvalid,
+	)
+	fixture.app.Config.MetaInstagram.DataDeletionComplianceOrganizationID = unmarkedCompliance.ID.String()
+	require.ErrorIs(
+		t,
+		fixture.app.ReconcileMetaInstagramQuarantineStartup(t.Context()),
+		errMetaInstagramComplianceTenantInvalid,
+	)
+	fixture.app.Config.MetaInstagram.DataDeletionComplianceOrganizationID = compliance.ID.String()
 	require.NoError(t, fixture.app.ReconcileMetaInstagramQuarantineStartup(t.Context()))
 	subjectID := "770000000000401"
 	now := time.Now().UTC().Truncate(time.Second)

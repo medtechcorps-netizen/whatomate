@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -18,9 +19,21 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-const metaInstagramRevalidationLease = 2 * time.Minute
+const (
+	metaInstagramRevalidationLease = 2 * time.Minute
 
-var errMetaInstagramProviderAttemptFenced = errors.New("managed Instagram provider attempt was fenced")
+	// metaInstagramDataDeletionComplianceTenantMarkerKey is an independent,
+	// durable control-plane assertion. A clinic UUID named in configuration is
+	// never sufficient to become the sink for no-target deletion receipts.
+	metaInstagramDataDeletionComplianceTenantMarkerKey = "meta_instagram_data_deletion_compliance_tenant"
+)
+
+var (
+	errMetaInstagramProviderAttemptFenced   = errors.New("managed Instagram provider attempt was fenced")
+	errMetaInstagramComplianceTenantInvalid = errors.New(
+		"managed Instagram compliance tenant is not an active platform-owned marked compliance tenant",
+	)
+)
 
 type metaInstagramRevalidationSnapshot struct {
 	OrganizationID uuid.UUID
@@ -207,12 +220,28 @@ func (a *App) validateMetaInstagramComplianceOrganization(ctx context.Context) e
 	if err != nil || complianceID == uuid.Nil || complianceID.String() != complianceText {
 		return errors.New("managed Instagram compliance tenant is invalid")
 	}
-	exists, err := organizationExists(complianceID)
-	if err != nil {
-		return err
+	var valid bool
+	if err := database.WithTenantReadCommitted(
+		a.rootApp().DB.WithContext(ctx), complianceID, func(tx *gorm.DB) error {
+			return tx.Raw(`
+				SELECT EXISTS (
+					SELECT 1
+					FROM organizations AS organization
+					JOIN resellers AS reseller ON reseller.id = organization.reseller_id
+					WHERE organization.id = ?
+					  AND organization.deleted_at IS NULL
+					  AND reseller.deleted_at IS NULL
+					  AND reseller.status = 'active'
+					  AND reseller.slug = ?
+					  AND organization.settings @> '{"meta_instagram_data_deletion_compliance_tenant":true}'::jsonb
+				)
+			`, complianceID, database.PlatformResellerSlug).Scan(&valid).Error
+		},
+	); err != nil {
+		return fmt.Errorf("validate managed Instagram compliance tenant: %w", err)
 	}
-	if !exists {
-		return errors.New("managed Instagram compliance tenant does not exist")
+	if !valid {
+		return errMetaInstagramComplianceTenantInvalid
 	}
 	return nil
 }

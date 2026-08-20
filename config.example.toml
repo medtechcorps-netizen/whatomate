@@ -260,7 +260,7 @@ scheduler_interval_seconds = 60
 allowed_organization_id = "" # Deprecated singleton rollout key. Keep only until every reader understands the plural fields.
 allowed_organization_ids = "" # Comma-separated active canonical clinic UUIDs; maximum 32 across active + quarantined.
 quarantined_organization_ids = "" # Offboarded/kill-switched clinic UUIDs retained for teardown, callbacks, and privacy status only.
-data_deletion_compliance_organization_id = "" # Required with plural/quarantine fields; one distinct platform-owned compliance org, never a clinic.
+data_deletion_compliance_organization_id = "" # Required with plural/quarantine fields; one distinct org owned by the active `platform-direct` reseller and marked `meta_instagram_data_deletion_compliance_tenant=true`, never a clinic.
 development_test_profile_id = "" # Nonproduction only; exact IG professional profile ID.
 development_test_oauth_subject_id = "" # Nonproduction only; exact app-scoped OAuth subject returned as /me.id.
 development_app_role = "" # Nonproduction only: administrator, developer, or tester.
