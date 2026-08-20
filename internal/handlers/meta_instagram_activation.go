@@ -33,7 +33,7 @@ type metaInstagramSubscriptionApproval struct {
 // a managed Instagram Login binding. App Review/development-role approval is
 // deployment-owned; this endpoint only accepts an already healthy binding.
 func (a *App) ApproveMetaInstagramActivation(r *fastglue.Request) error {
-	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionWrite, true)
+	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionWrite, true, false)
 	if err != nil {
 		return nil
 	}
@@ -165,6 +165,15 @@ func (a *App) activateMetaInstagramAccount(
 			subscription.OAuthCredentialID != oauth.ID || subscription.OAuthCredentialVersion != oauth.Version ||
 			subscription.WebhookCredentialID != webhook.ID || subscription.WebhookCredentialVersion != webhook.Version {
 			return errors.New("managed Instagram subscription approval was superseded")
+		}
+		allowed, entitlementErr := scoped.HasProductEntitlement(
+			uuid.Nil, orgID, channelapi.OmnichannelEntitlementKey,
+		)
+		if entitlementErr != nil {
+			return entitlementErr
+		}
+		if !allowed {
+			return errMetaInstagramEntitlementDenied
 		}
 
 		oldAccount := account

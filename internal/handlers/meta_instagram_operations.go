@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	configpkg "github.com/shridarpatil/whatomate/internal/config"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
@@ -535,6 +536,15 @@ func (a *App) withLockedMetaInstagramSubscriptionProviderAttempt(
 				return errMetaMessengerSubscriptionFence
 			}
 			if operation.DesiredState == metaMessengerSubscriptionDesiredSubscribed {
+				allowed, entitlementErr := scoped.HasProductEntitlement(
+					uuid.Nil, organizationID, channelapi.OmnichannelEntitlementKey,
+				)
+				if entitlementErr != nil {
+					return entitlementErr
+				}
+				if !allowed {
+					return errMetaInstagramEntitlementDenied
+				}
 				authorizationStartedAt, parseErr := time.Parse(
 					time.RFC3339Nano,
 					stringConfigValue(account.Metadata, metaMessengerAuthorizationGrantedAtKey),
@@ -566,6 +576,21 @@ func (a *App) finalizeMetaInstagramSubscribeOperation(
 	operation metaMessengerSubscriptionOperation,
 	confirmedAt time.Time,
 ) (metaRegistryProvisionResult, error) {
+	// A plan downgrade can commit after the provider attempt releases its
+	// organization lock. Reacquire that mutex and fail closed before recording
+	// a usable subscription locally.
+	if err := lockChannelAIOrganizationScopeTx(a.DB, organizationID); err != nil {
+		return metaRegistryProvisionResult{}, err
+	}
+	allowed, entitlementErr := a.HasProductEntitlement(
+		uuid.Nil, organizationID, channelapi.OmnichannelEntitlementKey,
+	)
+	if entitlementErr != nil {
+		return metaRegistryProvisionResult{}, entitlementErr
+	}
+	if !allowed {
+		return metaRegistryProvisionResult{}, errMetaInstagramEntitlementDenied
+	}
 	account, credentials, err := a.lockMetaInstagramSubscriptionOperation(
 		organizationID, accountID, operation, metaMessengerSubscriptionSubscribePending,
 	)
@@ -642,10 +667,16 @@ func (a *App) recordMetaInstagramSubscriptionOperationFailure(
 	config := cloneJSONB(account.Config)
 	config["outbound_enabled"] = false
 	config["ai_reply_enabled"] = false
+	status := models.ChannelAccountStatusPending
+	if operation.DesiredState == metaMessengerSubscriptionDesiredUnsubscribed &&
+		stringConfigValue(metadata, "meta_entitlement_cleanup_reason") ==
+			channelapi.OmnichannelEntitlementKey {
+		status = models.ChannelAccountStatusDegraded
+	}
 	result := a.DB.Model(&models.ChannelAccount{}).Where(
 		"id = ? AND organization_id = ?", account.ID, organizationID,
 	).Updates(map[string]any{
-		"status": models.ChannelAccountStatusPending, "config": config, "metadata": metadata,
+		"status": status, "config": config, "metadata": metadata,
 		"last_error":    "Meta subscription operation was not confirmed",
 		"last_error_at": failedAt.UTC(), "updated_at": failedAt.UTC(),
 	})
@@ -656,6 +687,160 @@ func (a *App) recordMetaInstagramSubscriptionOperationFailure(
 		return errMetaMessengerSubscriptionFence
 	}
 	return nil
+}
+
+type metaInstagramEntitlementCleanupClaim struct {
+	Account   models.ChannelAccount
+	Operation metaMessengerSubscriptionOperation
+}
+
+// claimMetaInstagramEntitlementCleanup atomically replaces an exact pending or
+// failed subscribe operation with an unsubscribe operation bound to the same
+// current credential generation. It does not require an active entitlement:
+// teardown must remain possible after the commercial grant has ended.
+func (a *App) claimMetaInstagramEntitlementCleanup(
+	organizationID, userID, accountID uuid.UUID,
+	subscribeOperation metaMessengerSubscriptionOperation,
+	now time.Time,
+) (metaInstagramEntitlementCleanupClaim, error) {
+	if a == nil || a.DB == nil || a.Config == nil ||
+		a.tenantOrgID != organizationID || organizationID == uuid.Nil ||
+		userID == uuid.Nil || accountID == uuid.Nil ||
+		subscribeOperation.DesiredState != metaMessengerSubscriptionDesiredSubscribed ||
+		(subscribeOperation.State != metaMessengerSubscriptionSubscribePending &&
+			subscribeOperation.State != metaMessengerSubscriptionSubscribeFailed) {
+		return metaInstagramEntitlementCleanupClaim{}, metaregistry.ErrInvalidRequest
+	}
+	if err := lockChannelAIOrganizationScopeTx(a.DB, organizationID); err != nil {
+		return metaInstagramEntitlementCleanupClaim{}, err
+	}
+	account, credentials, err := a.lockMetaInstagramSubscriptionOperation(
+		organizationID, accountID, subscribeOperation,
+		subscribeOperation.State,
+	)
+	if err != nil {
+		return metaInstagramEntitlementCleanupClaim{}, err
+	}
+	account.Credentials = credentials
+	now = now.UTC()
+	if a.metaInstagramTeardownBindingReason(
+		&account, organizationID, now, &subscribeOperation, false,
+	) != "" {
+		return metaInstagramEntitlementCleanupClaim{}, errMetaMessengerSubscriptionFence
+	}
+	cleanupOperation := metaMessengerSubscriptionOperation{
+		ID:                  uuid.New(),
+		OAuthCredentialID:   subscribeOperation.OAuthCredentialID,
+		OAuthVersion:        subscribeOperation.OAuthVersion,
+		WebhookCredentialID: subscribeOperation.WebhookCredentialID,
+		WebhookVersion:      subscribeOperation.WebhookVersion,
+		DesiredState:        metaMessengerSubscriptionDesiredUnsubscribed,
+		State:               metaMessengerSubscriptionUnsubscribePending,
+		ExpiresAt:           now.Add(metaMessengerSubscriptionOperationLease),
+	}
+	metadata := metadataWithMetaMessengerSubscriptionOperation(
+		account.Metadata, cleanupOperation, metaMessengerSubscriptionRemoteUnknown,
+	)
+	metadata["meta_subscription_state"] = metaMessengerSubscriptionUnsubscribePending
+	metadata["meta_activation_state"] = "disconnecting"
+	metadata["meta_entitlement_cleanup_reason"] = channelapi.OmnichannelEntitlementKey
+	config := cloneJSONB(account.Config)
+	config["outbound_enabled"] = false
+	config["ai_reply_enabled"] = false
+	result := a.DB.Model(&models.ChannelAccount{}).Where(
+		"id = ? AND organization_id = ?", account.ID, organizationID,
+	).Updates(map[string]any{
+		"status": models.ChannelAccountStatusDegraded,
+		"config": config, "metadata": metadata,
+		"is_default_incoming": false, "is_default_outgoing": false,
+		"connected_at": nil, "last_health_check_at": nil,
+		"last_error":    "Instagram entitlement ended; provider unsubscription is pending",
+		"last_error_at": now, "updated_by_id": userID, "updated_at": now,
+	})
+	if result.Error != nil || result.RowsAffected != 1 {
+		if result.Error != nil {
+			return metaInstagramEntitlementCleanupClaim{}, result.Error
+		}
+		return metaInstagramEntitlementCleanupClaim{}, errMetaMessengerSubscriptionFence
+	}
+	if err := cancelManagedMetaQueuedWorkForAccountTx(
+		a.DB, organizationID, account.ID, "managed_instagram_entitlement_cleanup",
+	); err != nil {
+		return metaInstagramEntitlementCleanupClaim{}, err
+	}
+	if err := audit.LogAudit(
+		a.DB, organizationID, userID, audit.GetUserName(a.DB, userID),
+		"meta_channel_registry", account.ID, models.AuditActionUpdated,
+		nil, map[string]any{
+			"operation":                      cleanupOperation.ID.String(),
+			"instagram_subscription_cleanup": "entitlement_revoked",
+		},
+	); err != nil {
+		return metaInstagramEntitlementCleanupClaim{}, err
+	}
+	account.Status = models.ChannelAccountStatusDegraded
+	account.Config = config
+	account.Metadata = metadata
+	account.IsDefaultIncoming = false
+	account.IsDefaultOutgoing = false
+	account.ConnectedAt = nil
+	account.LastHealthCheckAt = nil
+	account.LastError = "Instagram entitlement ended; provider unsubscription is pending"
+	account.LastErrorAt = &now
+	return metaInstagramEntitlementCleanupClaim{
+		Account: account, Operation: cleanupOperation,
+	}, nil
+}
+
+// compensateMetaInstagramEntitlementLoss settles a possibly-created remote
+// subscription through the teardown-only path and then revokes the local
+// generation. If Meta is ambiguous, the unsubscribe_failed operation remains
+// explicitly reconcilable without restoring the entitlement.
+func (a *App) compensateMetaInstagramEntitlementLoss(
+	ctx context.Context,
+	settings configpkg.MetaInstagramConfig,
+	organizationID, userID, accountID uuid.UUID,
+	subscribeOperation metaMessengerSubscriptionOperation,
+) error {
+	var claim metaInstagramEntitlementCleanupClaim
+	err := a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+		var claimErr error
+		claim, claimErr = scoped.claimMetaInstagramEntitlementCleanup(
+			organizationID, userID, accountID, subscribeOperation, time.Now().UTC(),
+		)
+		return claimErr
+	})
+	if err != nil {
+		return err
+	}
+	err = a.withLockedMetaInstagramSubscriptionProviderAttempt(
+		ctx, organizationID, accountID, claim.Operation,
+		metaMessengerSubscriptionUnsubscribePending,
+		func(account models.ChannelAccount, accessToken string) error {
+			return a.unsubscribeMetaInstagramMessages(
+				ctx, settings, account.ExternalAccountID, accessToken,
+			)
+		},
+	)
+	if err != nil {
+		failureErr := a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+			return scoped.recordMetaInstagramSubscriptionOperationFailure(
+				organizationID, accountID, claim.Operation,
+				metaMessengerSubscriptionUnsubscribePending,
+				metaMessengerSubscriptionUnsubscribeFailed,
+				time.Now().UTC(),
+			)
+		})
+		if failureErr != nil {
+			return failureErr
+		}
+		return err
+	}
+	return a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+		return scoped.finalizeMetaInstagramDisconnect(
+			organizationID, claim.Operation, accountID, time.Now().UTC(),
+		)
+	})
 }
 
 type metaInstagramReconciliationClaim struct {
@@ -829,7 +1014,7 @@ func (a *App) acknowledgeMetaInstagramSubscriptionReconciliation(
 }
 
 func (a *App) ReconcileMetaInstagramSubscription(r *fastglue.Request) error {
-	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionDelete, true)
+	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionDelete, true, true)
 	if err != nil {
 		return nil
 	}
@@ -887,6 +1072,24 @@ func (a *App) ReconcileMetaInstagramSubscription(r *fastglue.Request) error {
 		},
 	)
 	if err != nil {
+		if errors.Is(err, errMetaInstagramEntitlementDenied) &&
+			claim.Operation.DesiredState == metaMessengerSubscriptionDesiredSubscribed {
+			cleanupErr := a.compensateMetaInstagramEntitlementLoss(
+				ctx, settings, orgID, userID, accountID, claim.Operation,
+			)
+			if cleanupErr != nil {
+				return r.SendErrorEnvelope(
+					fasthttp.StatusBadGateway,
+					"Instagram entitlement cleanup is awaiting reconciliation",
+					nil, "",
+				)
+			}
+			return r.SendErrorEnvelope(
+				fasthttp.StatusPaymentRequired,
+				"Instagram entitlement ended and the account was disconnected",
+				nil, "",
+			)
+		}
 		if errors.Is(err, errMetaMessengerSubscriptionFence) {
 			return r.SendErrorEnvelope(
 				fasthttp.StatusConflict,
@@ -918,6 +1121,24 @@ func (a *App) ReconcileMetaInstagramSubscription(r *fastglue.Request) error {
 		})
 	}
 	if err != nil {
+		if errors.Is(err, errMetaInstagramEntitlementDenied) &&
+			claim.Operation.DesiredState == metaMessengerSubscriptionDesiredSubscribed {
+			cleanupErr := a.compensateMetaInstagramEntitlementLoss(
+				ctx, settings, orgID, userID, accountID, claim.Operation,
+			)
+			if cleanupErr != nil {
+				return r.SendErrorEnvelope(
+					fasthttp.StatusBadGateway,
+					"Instagram entitlement cleanup is awaiting reconciliation",
+					nil, "",
+				)
+			}
+			return r.SendErrorEnvelope(
+				fasthttp.StatusPaymentRequired,
+				"Instagram entitlement ended and the account was disconnected",
+				nil, "",
+			)
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Instagram subscription reconciliation needs another retry", nil, "")
 	}
 	return r.SendEnvelope(map[string]any{
@@ -931,10 +1152,11 @@ type disconnectMetaInstagramRequest struct {
 }
 
 type metaInstagramDisconnectClaim struct {
-	Account             models.ChannelAccount
-	Operation           metaMessengerSubscriptionOperation
-	AccessToken         string
-	AlreadyDisconnected bool
+	Account                  models.ChannelAccount
+	Operation                metaMessengerSubscriptionOperation
+	FailedSubscribeOperation *metaMessengerSubscriptionOperation
+	AccessToken              string
+	AlreadyDisconnected      bool
 }
 
 func (a *App) claimMetaInstagramDisconnect(
@@ -967,9 +1189,18 @@ func (a *App) claimMetaInstagramDisconnect(
 		return metaInstagramDisconnectClaim{Account: account, AlreadyDisconnected: true}, nil
 	}
 	now := time.Now().UTC()
-	if !expiresAt.After(now.Add(metaInstagramProviderOperationLimit)) ||
-		!metaMessengerSubscriptionOperationAvailable(account.Metadata, now) {
+	if !expiresAt.After(now.Add(metaInstagramProviderOperationLimit)) {
 		return metaInstagramDisconnectClaim{}, errMetaMessengerSubscriptionFence
+	}
+	if !metaMessengerSubscriptionOperationAvailable(account.Metadata, now) {
+		operation, ok := metaMessengerSubscriptionOperationFromMetadata(account.Metadata)
+		if !ok || operation.DesiredState != metaMessengerSubscriptionDesiredSubscribed ||
+			operation.State != metaMessengerSubscriptionSubscribeFailed {
+			return metaInstagramDisconnectClaim{}, errMetaMessengerSubscriptionFence
+		}
+		return metaInstagramDisconnectClaim{
+			Account: account, FailedSubscribeOperation: &operation,
+		}, nil
 	}
 	var credentials []models.ChannelCredential
 	if err := a.DB.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
@@ -1094,7 +1325,7 @@ func (a *App) finalizeMetaInstagramDisconnect(
 }
 
 func (a *App) DisconnectMetaInstagram(r *fastglue.Request) error {
-	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionDelete, true)
+	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionDelete, true, true)
 	if err != nil {
 		return nil
 	}
@@ -1135,6 +1366,23 @@ func (a *App) DisconnectMetaInstagram(r *fastglue.Request) error {
 	}
 	ctx, cancel := context.WithTimeout(requestContext(r), metaInstagramProviderOperationLimit)
 	defer cancel()
+	if claim.FailedSubscribeOperation != nil {
+		if err := a.compensateMetaInstagramEntitlementLoss(
+			ctx, settings, orgID, userID, claim.Account.ID, *claim.FailedSubscribeOperation,
+		); err != nil {
+			if errors.Is(err, errMetaMessengerSubscriptionFence) {
+				return r.SendErrorEnvelope(
+					fasthttp.StatusConflict, "The Instagram disconnect was superseded", nil, "",
+				)
+			}
+			return r.SendErrorEnvelope(
+				fasthttp.StatusBadGateway,
+				"Instagram unsubscription is ambiguous; the account is quarantined for reconciliation",
+				nil, "",
+			)
+		}
+		return r.SendEnvelope(map[string]any{"disconnected": true, "account_id": claim.Account.ID})
+	}
 	if err := a.withLockedMetaInstagramSubscriptionProviderAttempt(
 		ctx, orgID, claim.Account.ID, claim.Operation,
 		metaMessengerSubscriptionUnsubscribePending,
