@@ -203,6 +203,8 @@ func GetMigrationModels() []MigrationModel {
 		{"ProviderIntegration", &models.ProviderIntegration{}},
 		{"GoogleSearchConsoleProperty", &models.GoogleSearchConsoleProperty{}},
 		{"ChannelAccount", &models.ChannelAccount{}},
+		{"ThreadsPlatformBinding", &models.ThreadsPlatformBinding{}},
+		{"ThreadsPlatformEventJournal", &models.ThreadsPlatformEventJournal{}},
 		{"ChannelCredential", &models.ChannelCredential{}},
 		{"MetaDeauthorizationEvent", &models.MetaDeauthorizationEvent{}},
 		{"MetaInstagramDataDeletionEvent", &models.MetaInstagramDataDeletionEvent{}},
@@ -220,6 +222,9 @@ func GetMigrationModels() []MigrationModel {
 
 // AutoMigrate runs auto migration for all models (silent mode)
 func AutoMigrate(db *gorm.DB) error {
+	if err := PrepareProviderIntegrationManagementMode(db); err != nil {
+		return err
+	}
 	migrationModels := GetMigrationModels()
 	for _, m := range migrationModels {
 		if m.Name == "MetaInstagramDataDeletionEvent" {
@@ -232,6 +237,39 @@ func AutoMigrate(db *gorm.DB) error {
 		}
 	}
 	return BackfillProviderIntegrationBindings(db)
+}
+
+// PrepareProviderIntegrationManagementMode adds the mode discriminator before
+// AutoMigrate. Existing and concurrently waiting old-binary inserts receive
+// workspace_byo, preserving the exact pre-managed Threads behavior throughout
+// a rolling deployment.
+func PrepareProviderIntegrationManagementMode(db *gorm.DB) error {
+	if db == nil || !db.Migrator().HasTable(&models.ProviderIntegration{}) {
+		return nil
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`
+			ALTER TABLE provider_integrations
+			ADD COLUMN IF NOT EXISTS management_mode varchar(32)
+		`).Error; err != nil {
+			return fmt.Errorf("add provider integration management mode: %w", err)
+		}
+		if err := tx.Exec(`
+			UPDATE provider_integrations
+			SET management_mode = 'workspace_byo'
+			WHERE management_mode IS NULL OR BTRIM(management_mode) = ''
+		`).Error; err != nil {
+			return fmt.Errorf("backfill provider integration management mode: %w", err)
+		}
+		if err := tx.Exec(`
+			ALTER TABLE provider_integrations
+			ALTER COLUMN management_mode SET DEFAULT 'workspace_byo',
+			ALTER COLUMN management_mode SET NOT NULL
+		`).Error; err != nil {
+			return fmt.Errorf("enforce provider integration management mode default: %w", err)
+		}
+		return nil
+	})
 }
 
 // PrepareMetaInstagramDeletionJournalTenant safely upgrades the unreleased
@@ -318,6 +356,10 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 	}
 
 	fmt.Println()
+	if err := PrepareProviderIntegrationManagementMode(silentDB); err != nil {
+		fmt.Printf("\n  \033[31mProvider management-mode preparation failed\033[0m\n\n")
+		return err
+	}
 
 	// Migrate models
 	for _, m := range migrationModels {
@@ -545,6 +587,96 @@ func getIndexes() []string {
 		`CREATE INDEX IF NOT EXISTS idx_inbox_conversations_org_queue ON inbox_conversations(organization_id, status, priority DESC, last_message_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_inbound_events_processing ON inbound_events(status, next_attempt_at, received_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_outbox_jobs_processing ON outbox_jobs(status, available_at, priority DESC)`,
+		// Management mode is additive and defaults every legacy row to BYO. A
+		// platform-managed row may select only a deployment app key and may not
+		// retain any tenant-owned Threads app identity or credential material.
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_provider_integrations_management_mode') THEN
+				ALTER TABLE provider_integrations
+				ADD CONSTRAINT chk_provider_integrations_management_mode CHECK (
+					(
+						management_mode = 'workspace_byo'
+						AND platform_app_key IS NULL
+					) OR (
+						provider = 'threads'
+						AND management_mode = 'platform_managed'
+						AND platform_app_key IS NOT NULL
+						AND platform_app_key ~ '^[a-z][a-z0-9_-]{0,63}$'
+						AND threads_app_id IS NULL
+						AND NOT (credential_data ?| ARRAY['app_secret', 'webhook_verify_token'])
+						AND NOT (config ?| ARRAY['app_id', 'redirect_uri', 'app_review_status', '_app_review_approval'])
+					)
+				);
+			END IF;
+		END $$`,
+		// Refuse ambiguous historical ownership instead of choosing a clinic.
+		// Quarantined claims remain live and continue to reserve the identity.
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM threads_platform_bindings
+				WHERE deleted_at IS NULL AND status IN ('pending', 'active', 'quarantined')
+				GROUP BY platform_app_id, oauth_subject_id
+				HAVING COUNT(*) > 1
+			) OR EXISTS (
+				SELECT 1
+				FROM threads_platform_bindings
+				WHERE deleted_at IS NULL AND status IN ('pending', 'active', 'quarantined')
+				GROUP BY platform_app_id, authority_asset_id
+				HAVING COUNT(*) > 1
+			) THEN
+				RAISE EXCEPTION 'cannot enforce managed Threads identity ownership; resolve duplicate live claims before retrying';
+			END IF;
+		END $$`,
+		// App keys are operator-facing aliases and may be renamed. Remove the
+		// early Phase-1 alias-scoped indexes before installing immutable Meta app
+		// ID ownership, otherwise a rekey could evade the no-transfer boundary.
+		`DROP INDEX IF EXISTS uq_threads_platform_bindings_live_subject`,
+		`DROP INDEX IF EXISTS uq_threads_platform_bindings_live_asset`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_threads_platform_bindings_live_app_subject
+			ON threads_platform_bindings(platform_app_id, oauth_subject_id)
+			WHERE deleted_at IS NULL AND status IN ('pending', 'active', 'quarantined')`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_threads_platform_bindings_live_app_asset
+			ON threads_platform_bindings(platform_app_id, authority_asset_id)
+			WHERE deleted_at IS NULL AND status IN ('pending', 'active', 'quarantined')`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_threads_platform_bindings_live_integration
+			ON threads_platform_bindings(integration_id)
+			WHERE deleted_at IS NULL AND status IN ('pending', 'active', 'quarantined')`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_threads_platform_bindings_live_account
+			ON threads_platform_bindings(channel_account_id)
+			WHERE channel_account_id IS NOT NULL AND deleted_at IS NULL AND status IN ('pending', 'active', 'quarantined')`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_threads_platform_bindings_values') THEN
+				ALTER TABLE threads_platform_bindings
+				ADD CONSTRAINT chk_threads_platform_bindings_values CHECK (
+					platform_app_key ~ '^[a-z][a-z0-9_-]{0,63}$'
+					AND platform_app_id ~ '^[0-9]+$'
+					AND oauth_subject_id ~ '^[0-9]+$'
+					AND authority_asset_id ~ '^[0-9]+$'
+					AND configuration_generation > 0
+					AND authorization_generation > 0
+					AND status IN ('pending', 'active', 'quarantined', 'revoked')
+					AND (
+						(status = 'revoked' AND released_at IS NOT NULL)
+						OR (status <> 'revoked' AND released_at IS NULL)
+					)
+				);
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_threads_platform_journal_values') THEN
+				ALTER TABLE threads_platform_event_journal
+				ADD CONSTRAINT chk_threads_platform_journal_values CHECK (
+					platform_app_key ~ '^[a-z][a-z0-9_-]{0,63}$'
+					AND platform_app_id ~ '^[0-9]+$'
+					AND event_digest ~ '^[0-9a-f]{64}$'
+					AND subject_digest ~ '^[0-9a-f]{64}$'
+					AND configuration_generation > 0
+					AND event_type IN ('webhook', 'deauthorization', 'data_deletion')
+					AND routing_state IN ('received', 'routed', 'unknown', 'ambiguous', 'quarantined', 'processed')
+				);
+			END IF;
+		END $$`,
 		// Provider identities routed outside a tenant-specific webhook path must
 		// have exactly one workspace owner. Existing duplicates intentionally
 		// fail migration so an operator chooses the correct owner explicitly.
@@ -689,7 +821,7 @@ func MigrateUserOrganizations(db *gorm.DB) error {
 	`).Error
 }
 
-const platformResellerSlug = "platform-direct"
+const PlatformResellerSlug = "platform-direct"
 
 // EnsurePlatformReseller creates the first-party reseller, assigns every
 // legacy organization to it, and records platform super administrators as
@@ -701,12 +833,12 @@ func EnsurePlatformReseller(db *gorm.DB) error {
 	}
 
 	var reseller models.Reseller
-	err := db.Unscoped().Where("slug = ?", platformResellerSlug).First(&reseller).Error
+	err := db.Unscoped().Where("slug = ?", PlatformResellerSlug).First(&reseller).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		reseller = models.Reseller{
 			BaseModel:        models.BaseModel{ID: uuid.New()},
 			Name:             "Platform Direct",
-			Slug:             platformResellerSlug,
+			Slug:             PlatformResellerSlug,
 			Status:           models.ResellerStatusActive,
 			Plan:             models.ResellerPlanEnterprise,
 			MaxOrganizations: 10000,

@@ -124,6 +124,7 @@ var DirectTenantTables = []string{
 	"support_cases",
 	"tags",
 	"templates",
+	"threads_platform_bindings",
 	"usage_events",
 	"user_availability_logs",
 	"webhooks",

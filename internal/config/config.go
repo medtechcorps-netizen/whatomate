@@ -5,6 +5,7 @@ import (
 	"crypto/sha1" //nolint:gosec // SHA-1 is mandated by the coturn TURN REST API (RFC draft)
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -38,6 +39,7 @@ type Config struct {
 	MetaMessenger       MetaMessengerConfig       `koanf:"meta_messenger_onboarding"`
 	MetaInstagram       MetaInstagramConfig       `koanf:"meta_instagram_onboarding"`
 	ThreadsAppReview    ThreadsAppReviewConfig    `koanf:"threads_app_review"`
+	ThreadsManaged      ThreadsManagedConfig      `koanf:"threads_managed"`
 }
 
 // ThreadsAppReviewConfig is a deployment-owned escape hatch used only to
@@ -49,6 +51,34 @@ type ThreadsAppReviewConfig struct {
 	DevelopmentOrganizationID string `koanf:"development_organization_id"`
 	DevelopmentAppID          string `koanf:"development_app_id"`
 	DevelopmentProfileID      string `koanf:"development_profile_id"`
+}
+
+// ThreadsManagedConfig owns the shared Threads application control plane at
+// deployment scope. Tenant records select only a PlatformAppKey and never
+// receive either secret below. PlatformApps is a list so the persistence and
+// runtime contracts are shard-ready even though the first deployment may
+// configure just one app.
+type ThreadsManagedConfig struct {
+	Enabled                  bool                       `koanf:"enabled" json:"enabled"`
+	AllowedOrganizationIDs   string                     `koanf:"allowed_organization_ids" json:"allowed_organization_ids"`
+	AllowAllOrganizations    bool                       `koanf:"allow_all_organizations" json:"allow_all_organizations"`
+	ComplianceOrganizationID string                     `koanf:"compliance_organization_id" json:"compliance_organization_id"`
+	PlatformApp              ThreadsPlatformAppConfig   `koanf:"platform_app" json:"-"`
+	PlatformApps             []ThreadsPlatformAppConfig `koanf:"platform_apps" json:"platform_apps"`
+}
+
+// ThreadsPlatformAppConfig describes one deployment-owned Meta application.
+// AppSecret and WebhookVerifyToken are deliberately excluded from JSON so an
+// accidental config response cannot disclose them to a tenant or UI.
+type ThreadsPlatformAppConfig struct {
+	PlatformAppKey          string `koanf:"platform_app_key" json:"platform_app_key"`
+	AppID                   string `koanf:"app_id" json:"app_id"`
+	AppSecret               string `koanf:"app_secret" json:"-"`
+	WebhookVerifyToken      string `koanf:"webhook_verify_token" json:"-"`
+	AppReviewStatus         string `koanf:"app_review_status" json:"app_review_status"`
+	AppReviewEvidenceSHA256 string `koanf:"app_review_evidence_sha256" json:"-"`
+	AppReviewApprovedAt     string `koanf:"app_review_approved_at" json:"app_review_approved_at,omitempty"`
+	ConfigurationGeneration uint64 `koanf:"configuration_generation" json:"configuration_generation"`
 }
 
 // MetaRegistryConfig protects the private broker used by the isolated Meta
@@ -319,6 +349,11 @@ func Load(configPath string) (*Config, error) {
 
 	// Set defaults
 	setDefaults(&cfg)
+	canonicalThreadsManaged, err := CanonicalizeThreadsManagedConfig(cfg.ThreadsManaged)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ThreadsManaged = canonicalThreadsManaged
 	if err := validateMetaRegistryConfig(
 		cfg.MetaRegistry,
 		cfg.MetaMessenger,
@@ -339,14 +374,17 @@ func Load(configPath string) (*Config, error) {
 	); err != nil {
 		return nil, err
 	}
-	if err := validateThreadsAppReviewConfig(cfg.ThreadsAppReview, cfg.App.Environment); err != nil {
+	if err := ValidateThreadsAppReviewConfig(cfg.ThreadsAppReview, cfg.App.Environment); err != nil {
+		return nil, err
+	}
+	if err := ValidateThreadsManagedConfig(cfg.ThreadsManaged, cfg.ThreadsAppReview, cfg.App.Environment); err != nil {
 		return nil, err
 	}
 
 	return &cfg, nil
 }
 
-func validateThreadsAppReviewConfig(config ThreadsAppReviewConfig, environment string) error {
+func ValidateThreadsAppReviewConfig(config ThreadsAppReviewConfig, environment string) error {
 	organizationID := strings.TrimSpace(config.DevelopmentOrganizationID)
 	appID := strings.TrimSpace(config.DevelopmentAppID)
 	profileID := strings.TrimSpace(config.DevelopmentProfileID)
@@ -361,7 +399,7 @@ func validateThreadsAppReviewConfig(config ThreadsAppReviewConfig, environment s
 		}
 		return nil
 	}
-	if organizationID != config.DevelopmentOrganizationID || !canonicalUUID(organizationID) {
+	if organizationID != config.DevelopmentOrganizationID || !canonicalNonNilUUID(organizationID) {
 		return errors.New("threads development organization_id must be a canonical UUID")
 	}
 	if appID != config.DevelopmentAppID || profileID != config.DevelopmentProfileID ||
@@ -369,6 +407,180 @@ func validateThreadsAppReviewConfig(config ThreadsAppReviewConfig, environment s
 		return errors.New("threads development app_id and profile_id must be canonical numeric Meta IDs")
 	}
 	return nil
+}
+
+var (
+	threadsPlatformAppKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
+	lowerHexSHA256Pattern        = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+// ValidateThreadsManagedConfig is exported so every server/worker entry point
+// and the runtime policy helper can fail closed before using managed-app state.
+func ValidateThreadsManagedConfig(
+	managed ThreadsManagedConfig,
+	development ThreadsAppReviewConfig,
+	environment string,
+) error {
+	if err := ValidateThreadsAppReviewConfig(development, environment); err != nil {
+		return err
+	}
+	canonicalManaged, err := CanonicalizeThreadsManagedConfig(managed)
+	if err != nil {
+		return err
+	}
+	managed = canonicalManaged
+	configured := managed.AllowAllOrganizations ||
+		strings.TrimSpace(managed.AllowedOrganizationIDs) != "" ||
+		strings.TrimSpace(managed.ComplianceOrganizationID) != "" ||
+		len(managed.PlatformApps) > 0
+	if !managed.Enabled {
+		if configured {
+			return errors.New("managed Threads must be explicitly enabled when platform apps, an organization release policy, or a compliance organization are configured")
+		}
+		return nil
+	}
+
+	normalizedEnvironment := strings.ToLower(strings.TrimSpace(environment))
+	switch normalizedEnvironment {
+	case "development", "staging", "production":
+	default:
+		return errors.New("managed Threads environment must be development, staging, or production")
+	}
+
+	allowedOrganizations, err := canonicalThreadsManagedOrganizationAllowlist(managed.AllowedOrganizationIDs)
+	if err != nil {
+		return err
+	}
+	if managed.AllowAllOrganizations == (len(allowedOrganizations) > 0) {
+		return errors.New("managed Threads requires exactly one of an organization allowlist or allow_all_organizations")
+	}
+	if managed.AllowAllOrganizations && normalizedEnvironment != "production" {
+		return errors.New("managed Threads allow_all_organizations is reserved for an explicit production release")
+	}
+	complianceOrganizationID := strings.TrimSpace(managed.ComplianceOrganizationID)
+	if !canonicalNonNilUUID(complianceOrganizationID) {
+		return errors.New("managed Threads compliance_organization_id must be a canonical UUID")
+	}
+	for _, organizationID := range allowedOrganizations {
+		if organizationID == complianceOrganizationID {
+			return errors.New("managed Threads compliance organization must be separate from every onboarding organization")
+		}
+	}
+	if len(managed.PlatformApps) == 0 {
+		return errors.New("managed Threads requires at least one deployment-owned platform app")
+	}
+
+	seenKeys := make(map[string]struct{}, len(managed.PlatformApps))
+	seenAppIDs := make(map[string]struct{}, len(managed.PlatformApps))
+	for index, platformApp := range managed.PlatformApps {
+		key := strings.TrimSpace(platformApp.PlatformAppKey)
+		if key != platformApp.PlatformAppKey || !threadsPlatformAppKeyPattern.MatchString(key) {
+			return fmt.Errorf("managed Threads platform_apps[%d].platform_app_key must be a canonical lowercase app key", index)
+		}
+		if _, duplicate := seenKeys[key]; duplicate {
+			return errors.New("managed Threads platform_app_key values must be unique")
+		}
+		seenKeys[key] = struct{}{}
+
+		if !canonicalNumericMetaID(platformApp.AppID) {
+			return fmt.Errorf("managed Threads platform app %q app_id must be a canonical numeric Meta ID", key)
+		}
+		if _, duplicate := seenAppIDs[platformApp.AppID]; duplicate {
+			return errors.New("managed Threads app_id values must be unique across platform app keys")
+		}
+		seenAppIDs[platformApp.AppID] = struct{}{}
+		if len(platformApp.AppSecret) < 32 || strings.TrimSpace(platformApp.AppSecret) != platformApp.AppSecret {
+			return fmt.Errorf("managed Threads platform app %q app_secret must contain at least 32 bytes without surrounding whitespace", key)
+		}
+		if len(platformApp.WebhookVerifyToken) < 32 ||
+			strings.TrimSpace(platformApp.WebhookVerifyToken) != platformApp.WebhookVerifyToken {
+			return fmt.Errorf("managed Threads platform app %q webhook_verify_token must contain at least 32 bytes without surrounding whitespace", key)
+		}
+		if subtleConstantTimeConfigEqual(platformApp.AppSecret, platformApp.WebhookVerifyToken) {
+			return fmt.Errorf("managed Threads platform app %q must use distinct app-secret and webhook-verification credentials", key)
+		}
+		if platformApp.ConfigurationGeneration == 0 {
+			return fmt.Errorf("managed Threads platform app %q configuration_generation must be at least 1", key)
+		}
+
+		reviewStatus := strings.ToLower(strings.TrimSpace(platformApp.AppReviewStatus))
+		if reviewStatus != platformApp.AppReviewStatus {
+			return fmt.Errorf("managed Threads platform app %q app_review_status must be canonical lowercase", key)
+		}
+		switch reviewStatus {
+		case "not_submitted", "pending", "approved", "rejected":
+		default:
+			return fmt.Errorf("managed Threads platform app %q app_review_status must be not_submitted, pending, approved, or rejected", key)
+		}
+		approved := reviewStatus == "approved"
+		if approved {
+			if !lowerHexSHA256Pattern.MatchString(platformApp.AppReviewEvidenceSHA256) {
+				return fmt.Errorf("managed Threads platform app %q approved review requires a lowercase SHA-256 evidence digest", key)
+			}
+			approvedAt, parseErr := time.Parse(time.RFC3339Nano, platformApp.AppReviewApprovedAt)
+			if parseErr != nil || approvedAt.IsZero() {
+				return fmt.Errorf("managed Threads platform app %q approved review requires an RFC3339 approval timestamp", key)
+			}
+		} else if platformApp.AppReviewEvidenceSHA256 != "" || platformApp.AppReviewApprovedAt != "" {
+			return fmt.Errorf("managed Threads platform app %q cannot retain approval evidence before review is approved", key)
+		}
+
+		if normalizedEnvironment == "production" && !approved {
+			return fmt.Errorf("managed Threads platform app %q requires approved app review in production", key)
+		}
+		if normalizedEnvironment != "production" && !approved {
+			if !development.DevelopmentTestingEnabled ||
+				development.DevelopmentAppID != platformApp.AppID ||
+				managed.AllowAllOrganizations || len(allowedOrganizations) != 1 ||
+				allowedOrganizations[0] != development.DevelopmentOrganizationID {
+				return fmt.Errorf("managed Threads platform app %q without approved review requires the exact nonproduction app-role workspace and app gate", key)
+			}
+		}
+	}
+
+	return nil
+}
+
+// CanonicalizeThreadsManagedConfig converts the env-friendly single-app shape
+// into the app-keyed slice consumed by runtime and persistence code. Operators
+// must choose one shape so credentials cannot be shadowed by precedence rules.
+func CanonicalizeThreadsManagedConfig(managed ThreadsManagedConfig) (ThreadsManagedConfig, error) {
+	singleConfigured := threadsPlatformAppConfigured(managed.PlatformApp)
+	if singleConfigured && len(managed.PlatformApps) > 0 {
+		return ThreadsManagedConfig{}, errors.New("managed Threads must configure platform_app or platform_apps, not both")
+	}
+	if singleConfigured {
+		managed.PlatformApps = []ThreadsPlatformAppConfig{managed.PlatformApp}
+		managed.PlatformApp = ThreadsPlatformAppConfig{}
+	}
+	return managed, nil
+}
+
+func threadsPlatformAppConfigured(platformApp ThreadsPlatformAppConfig) bool {
+	return platformApp.PlatformAppKey != "" || platformApp.AppID != "" ||
+		platformApp.AppSecret != "" || platformApp.WebhookVerifyToken != "" ||
+		platformApp.AppReviewStatus != "" || platformApp.AppReviewEvidenceSHA256 != "" ||
+		platformApp.AppReviewApprovedAt != "" || platformApp.ConfigurationGeneration != 0
+}
+
+func canonicalThreadsManagedOrganizationAllowlist(raw string) ([]string, error) {
+	seen := make(map[string]struct{})
+	values := make([]string, 0)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if !canonicalNonNilUUID(item) {
+			return nil, errors.New("managed Threads allowed_organization_ids must contain canonical UUIDs")
+		}
+		if _, exists := seen[item]; exists {
+			return nil, errors.New("managed Threads allowed_organization_ids contains a duplicate UUID")
+		}
+		seen[item] = struct{}{}
+		values = append(values, item)
+	}
+	return values, nil
 }
 
 func validateMetaRegistryConfig(
@@ -659,6 +871,10 @@ func canonicalUUID(value string) bool {
 		}
 	}
 	return true
+}
+
+func canonicalNonNilUUID(value string) bool {
+	return canonicalUUID(value) && value != "00000000-0000-0000-0000-000000000000"
 }
 
 func canonicalNumericMetaID(value string) bool {
