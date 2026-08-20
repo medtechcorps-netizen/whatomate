@@ -2,6 +2,9 @@ package database_test
 
 import (
 	"fmt"
+	"net/url"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,7 +13,9 @@ import (
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 func TestWithTenantReadCommittedOverridesSessionDefault(t *testing.T) {
@@ -48,28 +53,1416 @@ func TestWithTenantReadCommittedOverridesSessionDefault(t *testing.T) {
 	}))
 }
 
+type tenantRLSApplyMutationState struct {
+	SchemaGrants     int64 `gorm:"column:schema_grants"`
+	RelationGrants   int64 `gorm:"column:relation_grants"`
+	DefaultGrants    int64 `gorm:"column:default_grants"`
+	Policies         int64 `gorm:"column:policies"`
+	Fingerprint      bool  `gorm:"column:fingerprint_installed"`
+	RoutingInstalled bool  `gorm:"column:routing_installed"`
+}
+
+func readTenantRLSApplyMutationState(
+	t *testing.T,
+	db *gorm.DB,
+	runtimeRole string,
+) tenantRLSApplyMutationState {
+	t.Helper()
+
+	var state tenantRLSApplyMutationState
+	require.NoError(t, db.Raw(`
+		SELECT
+			(
+				SELECT COUNT(*)::bigint
+				FROM pg_catalog.pg_namespace AS schema
+				CROSS JOIN LATERAL pg_catalog.aclexplode(schema.nspacl) AS grant_state
+				WHERE schema.nspname = 'public'
+				  AND grant_state.grantee = (
+					SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ?
+				  )
+			) AS schema_grants,
+			(
+				SELECT COUNT(*)::bigint
+				FROM pg_catalog.pg_class AS relation
+				JOIN pg_catalog.pg_namespace AS schema
+				  ON schema.oid = relation.relnamespace
+				CROSS JOIN LATERAL pg_catalog.aclexplode(relation.relacl) AS grant_state
+				WHERE schema.nspname = 'public'
+				  AND grant_state.grantee = (
+					SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ?
+				  )
+			) AS relation_grants,
+			(
+				SELECT COUNT(*)::bigint
+				FROM pg_catalog.pg_default_acl AS defaults
+				CROSS JOIN LATERAL pg_catalog.aclexplode(defaults.defaclacl) AS grant_state
+				WHERE defaults.defaclnamespace = 'public'::regnamespace
+				  AND grant_state.grantee = (
+					SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ?
+				  )
+			) AS default_grants,
+			(
+				SELECT COUNT(*)::bigint
+				FROM pg_catalog.pg_policy AS policy
+				JOIN pg_catalog.pg_class AS policy_table
+				  ON policy_table.oid = policy.polrelid
+				JOIN pg_catalog.pg_namespace AS policy_schema
+				  ON policy_schema.oid = policy_table.relnamespace
+				WHERE policy_schema.nspname = 'public'
+				  AND policy.polname IN (
+					'rereply_tenant_isolation',
+					'rereply_migration_access'
+				  )
+			) AS policies,
+			to_regprocedure('public.rereply_tenant_policy_fingerprint()') IS NOT NULL
+				AS fingerprint_installed,
+			to_regprocedure('public.rereply_rls_routing_version()') IS NOT NULL
+				AS routing_installed
+	`, runtimeRole, runtimeRole, runtimeRole).Scan(&state).Error)
+	return state
+}
+
+func quoteTenantRLSTestIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+func quoteTenantRLSTestLiteral(value string) string {
+	return `'` + strings.ReplaceAll(value, `'`, `''`) + `'`
+}
+
+func openTenantRLSTestRoleConnection(
+	t *testing.T,
+	role string,
+	password string,
+) *gorm.DB {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	require.NotEmpty(t, dsn)
+	parsed, err := url.Parse(dsn)
+	require.NoError(t, err)
+	require.NotEmpty(t, parsed.Scheme)
+	parsed.User = url.UserPassword(role, password)
+	query := parsed.Query()
+	query.Set("statement_cache_capacity", "0")
+	query.Set("default_query_exec_mode", "describe_exec")
+	parsed.RawQuery = query.Encode()
+
+	runtimeDB, err := gorm.Open(postgres.Open(parsed.String()), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	sqlDB, err := runtimeDB.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(2)
+	sqlDB.SetMaxIdleConns(2)
+	require.NoError(t, sqlDB.Ping())
+	t.Cleanup(func() {
+		require.NoError(t, sqlDB.Close())
+	})
+	return runtimeDB
+}
+
+func runAsTenantRLSTestRole(
+	db *gorm.DB,
+	role string,
+	fn func(*gorm.DB) error,
+) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		var authenticatedRole string
+		if err := tx.Raw(`
+			SELECT activity.usename::text
+			FROM pg_catalog.pg_stat_activity AS activity
+			WHERE activity.pid = pg_catalog.pg_backend_pid()
+		`).Scan(&authenticatedRole).Error; err != nil {
+			return err
+		}
+		if authenticatedRole != role {
+			return fmt.Errorf(
+				"test backend authenticated as %q; expected %q",
+				authenticatedRole,
+				role,
+			)
+		}
+		return fn(tx)
+	})
+}
+
+func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
+	adminDB := testutil.SetupTestDB(t)
+	require.NoError(t, database.RemoveTenantRLS(adminDB))
+
+	var migrationRole string
+	require.NoError(t, adminDB.Raw("SELECT current_user").Scan(&migrationRole).Error)
+	migration := quoteTenantRLSTestIdentifier(migrationRole)
+	runtimeRole := "rereply_rls_member_" + uuid.NewString()[:8]
+	runtimePassword := uuid.NewString() + uuid.NewString()
+	bridgeRole := "rereply_rls_bridge_" + uuid.NewString()[:8]
+	privilegedRole := "rereply_rls_bypass_" + uuid.NewString()[:8]
+	replicationRole := "rereply_rls_replication_" + uuid.NewString()[:8]
+	runtime := quoteTenantRLSTestIdentifier(runtimeRole)
+	bridge := quoteTenantRLSTestIdentifier(bridgeRole)
+	privileged := quoteTenantRLSTestIdentifier(privilegedRole)
+	replication := quoteTenantRLSTestIdentifier(replicationRole)
+	var resellerID uuid.UUID
+	var preexistingUnassignedOrganizationIDs []uuid.UUID
+	var organizationIDs []uuid.UUID
+	var contactIDs []uuid.UUID
+	var originalContactsOwner string
+	var contactsOwnerChanged bool
+	var originalFingerprintOwner string
+	var fingerprintOwnerChanged bool
+
+	t.Cleanup(func() {
+		if fingerprintOwnerChanged && originalFingerprintOwner != "" {
+			_ = adminDB.Exec(
+				"ALTER FUNCTION public.rereply_tenant_policy_fingerprint() OWNER TO " +
+					quoteTenantRLSTestIdentifier(originalFingerprintOwner),
+			).Error
+		}
+		if contactsOwnerChanged && originalContactsOwner != "" {
+			_ = adminDB.Exec(
+				"ALTER TABLE public.contacts OWNER TO " +
+					quoteTenantRLSTestIdentifier(originalContactsOwner),
+			).Error
+		}
+		_ = adminDB.Exec(
+			"DROP POLICY IF EXISTS rereply_renamed_migration_access ON public.contacts",
+		).Error
+		_ = adminDB.Exec(
+			"DROP POLICY IF EXISTS rereply_extra_permissive_access ON public.chatbot_flow_steps",
+		).Error
+		_ = database.RemoveTenantRLS(adminDB)
+		_ = adminDB.Exec("REVOKE " + migration + " FROM " + runtime).Error
+		_ = adminDB.Exec("REVOKE " + migration + " FROM " + bridge).Error
+		_ = adminDB.Exec("REVOKE " + bridge + " FROM " + runtime).Error
+		_ = adminDB.Exec("REVOKE " + privileged + " FROM " + runtime).Error
+		_ = adminDB.Exec("REVOKE " + replication + " FROM " + runtime).Error
+		_ = adminDB.Exec("REVOKE " + replication + " FROM " + bridge).Error
+		_ = adminDB.Exec("ALTER ROLE " + runtime + " NOREPLICATION").Error
+		if len(contactIDs) > 0 {
+			_ = adminDB.Unscoped().Where("id IN ?", contactIDs).
+				Delete(&models.Contact{}).Error
+		}
+		if len(organizationIDs) > 0 {
+			_ = adminDB.Unscoped().Where("id IN ?", organizationIDs).
+				Delete(&models.Organization{}).Error
+		}
+		if len(preexistingUnassignedOrganizationIDs) > 0 && resellerID != uuid.Nil {
+			_ = adminDB.Model(&models.Organization{}).
+				Where(
+					"id IN ? AND reseller_id = ?",
+					preexistingUnassignedOrganizationIDs,
+					resellerID,
+				).
+				UpdateColumn("reseller_id", nil).Error
+		}
+		if resellerID != uuid.Nil {
+			_ = adminDB.Unscoped().Where("id = ?", resellerID).
+				Delete(&models.Reseller{}).Error
+		}
+		_ = adminDB.Exec("DROP OWNED BY " + runtime).Error
+		_ = adminDB.Exec("DROP ROLE IF EXISTS " + runtime).Error
+		_ = adminDB.Exec("DROP ROLE IF EXISTS " + bridge).Error
+		_ = adminDB.Exec("DROP ROLE IF EXISTS " + privileged).Error
+		_ = adminDB.Exec("DROP ROLE IF EXISTS " + replication).Error
+	})
+	require.NoError(t, adminDB.Exec(fmt.Sprintf(
+		"CREATE ROLE %s LOGIN PASSWORD %s NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS",
+		runtime,
+		quoteTenantRLSTestLiteral(runtimePassword),
+	)).Error)
+	require.NoError(t, adminDB.Exec(fmt.Sprintf(
+		"CREATE ROLE %s NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS",
+		bridge,
+	)).Error)
+	require.NoError(t, adminDB.Exec(fmt.Sprintf(
+		"CREATE ROLE %s NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS",
+		privileged,
+	)).Error)
+	require.NoError(t, adminDB.Exec(fmt.Sprintf(
+		"CREATE ROLE %s NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS REPLICATION",
+		replication,
+	)).Error)
+	runtimeDB := openTenantRLSTestRoleConnection(
+		t,
+		runtimeRole,
+		runtimePassword,
+	)
+	require.NoError(t, adminDB.Raw(`
+		SELECT table_owner.rolname
+		FROM pg_catalog.pg_class AS protected_table
+		JOIN pg_catalog.pg_namespace AS table_schema
+		  ON table_schema.oid = protected_table.relnamespace
+		JOIN pg_catalog.pg_roles AS table_owner
+		  ON table_owner.oid = protected_table.relowner
+		WHERE table_schema.nspname = 'public'
+		  AND protected_table.relname = 'contacts'
+	`).Scan(&originalContactsOwner).Error)
+	require.NotEmpty(t, originalContactsOwner)
+
+	reseller := testutil.CreateTestReseller(t, adminDB)
+	resellerID = reseller.ID
+	require.NoError(t, adminDB.Raw(`
+		SELECT id
+		FROM public.organizations
+		WHERE deleted_at IS NULL
+		  AND reseller_id IS NULL
+		ORDER BY id
+	`).Scan(&preexistingUnassignedOrganizationIDs).Error)
+	if len(preexistingUnassignedOrganizationIDs) > 0 {
+		require.NoError(t, adminDB.Model(&models.Organization{}).
+			Where("id IN ? AND reseller_id IS NULL", preexistingUnassignedOrganizationIDs).
+			UpdateColumn("reseller_id", resellerID).Error)
+	}
+
+	t.Run("Apply rejects direct NOINHERIT membership before mutation", func(t *testing.T) {
+		granted := true
+		t.Cleanup(func() {
+			if granted {
+				_ = adminDB.Exec("REVOKE " + migration + " FROM " + runtime).Error
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+migration+" TO "+runtime,
+		).Error)
+
+		var membership struct {
+			Member   bool `gorm:"column:member"`
+			Usage    bool `gorm:"column:usage"`
+			Settable bool `gorm:"column:settable"`
+		}
+		require.NoError(t, adminDB.Raw(`
+			SELECT
+				pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'MEMBER') AS member,
+				pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'USAGE') AS usage,
+				pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'SET') AS settable
+		`,
+			runtimeRole, migrationRole,
+			runtimeRole, migrationRole,
+			runtimeRole, migrationRole,
+		).Scan(&membership).Error)
+		require.True(t, membership.Member)
+		require.False(t, membership.Usage,
+			"NOINHERIT membership should require SET ROLE")
+		require.True(t, membership.Settable,
+			"NOINHERIT membership still retains SET ROLE capability")
+
+		require.NoError(t, runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				if err := runtimeDB.Exec(
+					"SET LOCAL ROLE " + migration,
+				).Error; err != nil {
+					return err
+				}
+				var currentRole string
+				if err := runtimeDB.Raw("SELECT current_user").Scan(&currentRole).Error; err != nil {
+					return err
+				}
+				if currentRole != migrationRole {
+					return fmt.Errorf(
+						"SET ROLE selected %q; expected %q",
+						currentRole,
+						migrationRole,
+					)
+				}
+				return nil
+			},
+		))
+
+		before := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		err := database.ApplyTenantRLS(adminDB, runtimeRole)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "must not be a member of migration role")
+		after := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		require.Equal(t, before, after,
+			"a rejected ApplyTenantRLS call must not grant or install anything")
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+migration+" FROM "+runtime,
+		).Error)
+		granted = false
+	})
+
+	t.Run("Apply rejects indirect membership before mutation", func(t *testing.T) {
+		grantedMigrationToBridge := true
+		grantedBridgeToRuntime := true
+		t.Cleanup(func() {
+			if grantedBridgeToRuntime {
+				_ = adminDB.Exec("REVOKE " + bridge + " FROM " + runtime).Error
+			}
+			if grantedMigrationToBridge {
+				_ = adminDB.Exec("REVOKE " + migration + " FROM " + bridge).Error
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+migration+" TO "+bridge,
+		).Error)
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+bridge+" TO "+runtime,
+		).Error)
+
+		before := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		err := database.ApplyTenantRLS(adminDB, runtimeRole)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "must not be a member of migration role")
+		after := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		require.Equal(t, before, after)
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+bridge+" FROM "+runtime,
+		).Error)
+		grantedBridgeToRuntime = false
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+migration+" FROM "+bridge,
+		).Error)
+		grantedMigrationToBridge = false
+	})
+
+	t.Run("Apply rejects membership in an unrelated BYPASSRLS role before mutation", func(t *testing.T) {
+		granted := true
+		t.Cleanup(func() {
+			if granted {
+				_ = adminDB.Exec("REVOKE " + privileged + " FROM " + runtime).Error
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+privileged+" TO "+runtime,
+		).Error)
+		before := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		err := database.ApplyTenantRLS(adminDB, runtimeRole)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "privileged role")
+		require.Contains(t, err.Error(), privilegedRole)
+		after := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		require.Equal(t, before, after)
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+privileged+" FROM "+runtime,
+		).Error)
+		granted = false
+	})
+
+	t.Run("Apply rejects a direct REPLICATION runtime before mutation", func(t *testing.T) {
+		replicationEnabled := true
+		t.Cleanup(func() {
+			if replicationEnabled {
+				_ = adminDB.Exec("ALTER ROLE " + runtime + " NOREPLICATION").Error
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"ALTER ROLE "+runtime+" REPLICATION",
+		).Error)
+		before := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		err := database.ApplyTenantRLS(adminDB, runtimeRole)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "NOREPLICATION")
+		after := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		require.Equal(t, before, after)
+
+		require.NoError(t, adminDB.Exec(
+			"ALTER ROLE "+runtime+" NOREPLICATION",
+		).Error)
+		replicationEnabled = false
+	})
+
+	t.Run("Apply rejects indirect membership in a REPLICATION role before mutation", func(t *testing.T) {
+		grantedReplicationToBridge := true
+		grantedBridgeToRuntime := true
+		t.Cleanup(func() {
+			if grantedBridgeToRuntime {
+				_ = adminDB.Exec("REVOKE " + bridge + " FROM " + runtime).Error
+			}
+			if grantedReplicationToBridge {
+				_ = adminDB.Exec("REVOKE " + replication + " FROM " + bridge).Error
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+replication+" TO "+bridge,
+		).Error)
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+bridge+" TO "+runtime,
+		).Error)
+		before := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		err := database.ApplyTenantRLS(adminDB, runtimeRole)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "privileged role")
+		require.Contains(t, err.Error(), replicationRole)
+		after := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		require.Equal(t, before, after)
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+bridge+" FROM "+runtime,
+		).Error)
+		grantedBridgeToRuntime = false
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+replication+" FROM "+bridge,
+		).Error)
+		grantedReplicationToBridge = false
+	})
+
+	t.Run("Apply rejects a protected public relation with an unexpected kind before mutation", func(t *testing.T) {
+		viewName := "rereply_rls_view_" + uuid.NewString()[:8]
+		view := quoteTenantRLSTestIdentifier(viewName)
+		originalTables := append([]string(nil), database.DirectTenantTables...)
+		database.DirectTenantTables = append(database.DirectTenantTables, viewName)
+		cleaned := false
+		t.Cleanup(func() {
+			if cleaned {
+				return
+			}
+			database.DirectTenantTables = originalTables
+			_ = adminDB.Exec("DROP VIEW IF EXISTS public." + view).Error
+		})
+		require.NoError(t, adminDB.Exec(
+			"CREATE VIEW public."+view+" AS SELECT 1::bigint AS id",
+		).Error)
+
+		before := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		err := database.ApplyTenantRLS(adminDB, runtimeRole)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "unexpected PostgreSQL relation kind")
+		require.Contains(t, err.Error(), viewName)
+		after := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		require.Equal(t, before, after)
+
+		database.DirectTenantTables = originalTables
+		require.NoError(t, adminDB.Exec("DROP VIEW public."+view).Error)
+		cleaned = true
+	})
+
+	for _, testCase := range []struct {
+		name            string
+		registeredChild bool
+		partitioned     bool
+		errorFragment   string
+	}{
+		{
+			name:          "partitioned protected parent",
+			partitioned:   true,
+			errorFragment: "unexpected PostgreSQL relation kind",
+		},
+		{
+			name:            "partitioned protected child",
+			registeredChild: true,
+			partitioned:     true,
+			errorFragment:   "participates in PostgreSQL inheritance",
+		},
+		{
+			name:          "protected inheritance parent",
+			errorFragment: "participates in PostgreSQL inheritance",
+		},
+		{
+			name:            "protected inheritance child",
+			registeredChild: true,
+			errorFragment:   "participates in PostgreSQL inheritance",
+		},
+	} {
+		testCase := testCase
+		t.Run("Apply rejects a "+testCase.name+" before mutation", func(t *testing.T) {
+			parentName := "rereply_rls_parent_" + uuid.NewString()[:8]
+			childName := "rereply_rls_child_" + uuid.NewString()[:8]
+			parent := quoteTenantRLSTestIdentifier(parentName)
+			child := quoteTenantRLSTestIdentifier(childName)
+			registeredName := parentName
+			if testCase.registeredChild {
+				registeredName = childName
+			}
+			originalTables := append([]string(nil), database.DirectTenantTables...)
+			database.DirectTenantTables = append(database.DirectTenantTables, registeredName)
+			cleaned := false
+			t.Cleanup(func() {
+				if cleaned {
+					return
+				}
+				database.DirectTenantTables = originalTables
+				_ = adminDB.Exec("DROP TABLE IF EXISTS public." + parent + " CASCADE").Error
+			})
+
+			if testCase.partitioned {
+				require.NoError(t, adminDB.Exec(
+					"CREATE TABLE public."+parent+
+						" (id bigint, organization_id uuid) PARTITION BY RANGE (id)",
+				).Error)
+				require.NoError(t, adminDB.Exec(
+					"CREATE TABLE public."+child+" PARTITION OF public."+parent+
+						" FOR VALUES FROM (0) TO (100)",
+				).Error)
+			} else {
+				require.NoError(t, adminDB.Exec(
+					"CREATE TABLE public."+parent+" (id bigint, organization_id uuid)",
+				).Error)
+				require.NoError(t, adminDB.Exec(
+					"CREATE TABLE public."+child+" () INHERITS (public."+parent+")",
+				).Error)
+			}
+
+			before := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+			err := database.ApplyTenantRLS(adminDB, runtimeRole)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), testCase.errorFragment)
+			require.Contains(t, err.Error(), registeredName)
+			after := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+			require.Equal(t, before, after)
+
+			database.DirectTenantTables = originalTables
+			require.NoError(t, adminDB.Exec(
+				"DROP TABLE public."+parent+" CASCADE",
+			).Error)
+			cleaned = true
+		})
+	}
+
+	t.Run("Apply rejects membership in a protected table owner before mutation", func(t *testing.T) {
+		granted := false
+		t.Cleanup(func() {
+			if granted {
+				_ = adminDB.Exec("REVOKE " + bridge + " FROM " + runtime).Error
+			}
+			if contactsOwnerChanged {
+				_ = adminDB.Exec(
+					"ALTER TABLE public.contacts OWNER TO " +
+						quoteTenantRLSTestIdentifier(originalContactsOwner),
+				).Error
+				contactsOwnerChanged = false
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"ALTER TABLE public.contacts OWNER TO "+bridge,
+		).Error)
+		contactsOwnerChanged = true
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+bridge+" TO "+runtime,
+		).Error)
+		granted = true
+
+		before := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		err := database.ApplyTenantRLS(adminDB, runtimeRole)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "protected table owner")
+		require.Contains(t, err.Error(), bridgeRole)
+		after := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
+		require.Equal(t, before, after)
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+bridge+" FROM "+runtime,
+		).Error)
+		granted = false
+		require.NoError(t, adminDB.Exec(
+			"ALTER TABLE public.contacts OWNER TO "+
+				quoteTenantRLSTestIdentifier(originalContactsOwner),
+		).Error)
+		contactsOwnerChanged = false
+	})
+
+	var installedPolicyCount int64
+	var installedFingerprint bool
+	require.NoError(t, adminDB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SET LOCAL search_path = pg_catalog, public").Error; err != nil {
+			return err
+		}
+		if err := database.ApplyTenantRLS(tx, runtimeRole); err != nil {
+			return err
+		}
+		if err := tx.Raw(`
+			SELECT COUNT(*)::bigint
+			FROM pg_catalog.pg_policy AS policy
+			JOIN pg_catalog.pg_class AS policy_table
+			  ON policy_table.oid = policy.polrelid
+			JOIN pg_catalog.pg_namespace AS policy_schema
+			  ON policy_schema.oid = policy_table.relnamespace
+			WHERE policy_schema.nspname = 'public'
+			  AND policy.polname = 'rereply_tenant_isolation'
+		`).Scan(&installedPolicyCount).Error; err != nil {
+			return err
+		}
+		return tx.Raw(`
+			SELECT to_regprocedure(
+				'public.rereply_tenant_policy_fingerprint()'
+			) IS NOT NULL
+		`).Scan(&installedFingerprint).Error
+	}))
+	require.Positive(t, installedPolicyCount,
+		"Apply must discover and protect public tables under a pg_catalog-first search_path")
+	require.True(t, installedFingerprint)
+
+	verifyClean := func(t *testing.T) {
+		t.Helper()
+		require.NoError(t, runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		))
+	}
+
+	t.Run("Verify succeeds under a pg_catalog-first search path", func(t *testing.T) {
+		require.NoError(t, runtimeDB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec("SET LOCAL search_path = pg_catalog, public").Error; err != nil {
+				return err
+			}
+			return database.VerifyTenantRLS(tx, runtimeRole)
+		}))
+	})
+
+	t.Run("Verify rejects an owner-authenticated SET ROLE masquerade", func(t *testing.T) {
+		err := adminDB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec("SET LOCAL ROLE " + runtime).Error; err != nil {
+				return err
+			}
+			return database.VerifyTenantRLS(tx, runtimeRole)
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "backend authenticates")
+	})
+
+	t.Run("Verify rejects owner-authenticated SET SESSION AUTHORIZATION", func(t *testing.T) {
+		var spoofedIdentity struct {
+			CurrentRole       string `gorm:"column:current_role"`
+			SessionRole       string `gorm:"column:session_role"`
+			AuthenticatedRole string `gorm:"column:authenticated_role"`
+		}
+		err := adminDB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec(
+				"SET LOCAL SESSION AUTHORIZATION " + runtime,
+			).Error; err != nil {
+				return err
+			}
+			if err := tx.Raw(`
+				SELECT
+					current_user::text AS current_role,
+					session_user::text AS session_role,
+					activity.usename::text AS authenticated_role
+				FROM pg_catalog.pg_stat_activity AS activity
+				WHERE activity.pid = pg_catalog.pg_backend_pid()
+			`).Scan(&spoofedIdentity).Error; err != nil {
+				return err
+			}
+			return database.VerifyTenantRLS(tx, runtimeRole)
+		})
+		require.Equal(t, runtimeRole, spoofedIdentity.CurrentRole)
+		require.Equal(t, runtimeRole, spoofedIdentity.SessionRole)
+		require.Equal(t, migrationRole, spoofedIdentity.AuthenticatedRole)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "backend authenticates")
+	})
+
+	t.Run("Verify rejects a protected public relation with an unexpected kind", func(t *testing.T) {
+		viewName := "rereply_rls_view_" + uuid.NewString()[:8]
+		view := quoteTenantRLSTestIdentifier(viewName)
+		originalTables := append([]string(nil), database.DirectTenantTables...)
+		database.DirectTenantTables = append(database.DirectTenantTables, viewName)
+		cleaned := false
+		t.Cleanup(func() {
+			if cleaned {
+				return
+			}
+			database.DirectTenantTables = originalTables
+			_ = adminDB.Exec("DROP VIEW IF EXISTS public." + view).Error
+		})
+		require.NoError(t, adminDB.Exec(
+			"CREATE VIEW public."+view+" AS SELECT 1::bigint AS id",
+		).Error)
+
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "unexpected PostgreSQL relation kind")
+		require.Contains(t, err.Error(), viewName)
+
+		database.DirectTenantTables = originalTables
+		require.NoError(t, adminDB.Exec("DROP VIEW public."+view).Error)
+		cleaned = true
+		verifyClean(t)
+	})
+
+	for _, testCase := range []struct {
+		name            string
+		registeredChild bool
+		partitioned     bool
+		errorFragment   string
+	}{
+		{
+			name:          "partitioned protected parent",
+			partitioned:   true,
+			errorFragment: "unexpected PostgreSQL relation kind",
+		},
+		{
+			name:            "partitioned protected child",
+			registeredChild: true,
+			partitioned:     true,
+			errorFragment:   "participates in PostgreSQL inheritance",
+		},
+		{
+			name:          "protected inheritance parent",
+			errorFragment: "participates in PostgreSQL inheritance",
+		},
+		{
+			name:            "protected inheritance child",
+			registeredChild: true,
+			errorFragment:   "participates in PostgreSQL inheritance",
+		},
+	} {
+		testCase := testCase
+		t.Run("Verify rejects a "+testCase.name, func(t *testing.T) {
+			parentName := "rereply_rls_parent_" + uuid.NewString()[:8]
+			childName := "rereply_rls_child_" + uuid.NewString()[:8]
+			parent := quoteTenantRLSTestIdentifier(parentName)
+			child := quoteTenantRLSTestIdentifier(childName)
+			registeredName := parentName
+			if testCase.registeredChild {
+				registeredName = childName
+			}
+			originalTables := append([]string(nil), database.DirectTenantTables...)
+			database.DirectTenantTables = append(database.DirectTenantTables, registeredName)
+			cleaned := false
+			t.Cleanup(func() {
+				if cleaned {
+					return
+				}
+				database.DirectTenantTables = originalTables
+				_ = adminDB.Exec("DROP TABLE IF EXISTS public." + parent + " CASCADE").Error
+			})
+
+			if testCase.partitioned {
+				require.NoError(t, adminDB.Exec(
+					"CREATE TABLE public."+parent+
+						" (id bigint, organization_id uuid) PARTITION BY RANGE (id)",
+				).Error)
+				require.NoError(t, adminDB.Exec(
+					"CREATE TABLE public."+child+" PARTITION OF public."+parent+
+						" FOR VALUES FROM (0) TO (100)",
+				).Error)
+			} else {
+				require.NoError(t, adminDB.Exec(
+					"CREATE TABLE public."+parent+" (id bigint, organization_id uuid)",
+				).Error)
+				require.NoError(t, adminDB.Exec(
+					"CREATE TABLE public."+child+" () INHERITS (public."+parent+")",
+				).Error)
+			}
+
+			err := runAsTenantRLSTestRole(
+				runtimeDB,
+				runtimeRole,
+				func(runtimeDB *gorm.DB) error {
+					return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+				},
+			)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), testCase.errorFragment)
+			require.Contains(t, err.Error(), registeredName)
+
+			database.DirectTenantTables = originalTables
+			require.NoError(t, adminDB.Exec(
+				"DROP TABLE public."+parent+" CASCADE",
+			).Error)
+			cleaned = true
+			verifyClean(t)
+		})
+	}
+
+	t.Run("Verify rejects membership in the fingerprint function owner", func(t *testing.T) {
+		type fingerprintAuthorityState struct {
+			Owner string `gorm:"column:owner_name"`
+			ACL   string `gorm:"column:acl"`
+		}
+		readAuthority := func() fingerprintAuthorityState {
+			var state fingerprintAuthorityState
+			require.NoError(t, adminDB.Raw(`
+				SELECT
+					function_owner.rolname AS owner_name,
+					COALESCE(fingerprint_function.proacl::text, '') AS acl
+				FROM pg_catalog.pg_proc AS fingerprint_function
+				JOIN pg_catalog.pg_namespace AS function_schema
+				  ON function_schema.oid = fingerprint_function.pronamespace
+				JOIN pg_catalog.pg_roles AS function_owner
+				  ON function_owner.oid = fingerprint_function.proowner
+				WHERE function_schema.nspname = 'public'
+				  AND fingerprint_function.proname = 'rereply_tenant_policy_fingerprint'
+				  AND fingerprint_function.pronargs = 0
+			`).Scan(&state).Error)
+			return state
+		}
+		originalAuthority := readAuthority()
+		require.NotEmpty(t, originalAuthority.Owner)
+		originalFingerprintOwner = originalAuthority.Owner
+		granted := false
+		t.Cleanup(func() {
+			if granted {
+				_ = adminDB.Exec("REVOKE " + bridge + " FROM " + runtime).Error
+			}
+			if fingerprintOwnerChanged {
+				_ = adminDB.Exec(
+					"ALTER FUNCTION public.rereply_tenant_policy_fingerprint() OWNER TO " +
+						quoteTenantRLSTestIdentifier(originalFingerprintOwner),
+				).Error
+				fingerprintOwnerChanged = false
+			}
+		})
+
+		require.NoError(t, adminDB.Exec(
+			"ALTER FUNCTION public.rereply_tenant_policy_fingerprint() OWNER TO "+bridge,
+		).Error)
+		fingerprintOwnerChanged = true
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+bridge+" TO "+runtime,
+		).Error)
+		granted = true
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "fingerprint owner")
+		require.Contains(t, err.Error(), bridgeRole)
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+bridge+" FROM "+runtime,
+		).Error)
+		granted = false
+		require.NoError(t, adminDB.Exec(
+			"ALTER FUNCTION public.rereply_tenant_policy_fingerprint() OWNER TO "+
+				quoteTenantRLSTestIdentifier(originalFingerprintOwner),
+		).Error)
+		fingerprintOwnerChanged = false
+		require.Equal(t, originalAuthority, readAuthority(),
+			"fingerprint owner and ACL must be restored exactly")
+		verifyClean(t)
+	})
+
+	t.Run("Verify rejects membership in a protected table owner", func(t *testing.T) {
+		granted := false
+		t.Cleanup(func() {
+			if granted {
+				_ = adminDB.Exec("REVOKE " + bridge + " FROM " + runtime).Error
+			}
+			if contactsOwnerChanged {
+				_ = adminDB.Exec(
+					"ALTER TABLE public.contacts OWNER TO " +
+						quoteTenantRLSTestIdentifier(originalContactsOwner),
+				).Error
+				contactsOwnerChanged = false
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"ALTER TABLE public.contacts OWNER TO "+bridge,
+		).Error)
+		contactsOwnerChanged = true
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+bridge+" TO "+runtime,
+		).Error)
+		granted = true
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "protected table owner")
+		require.Contains(t, err.Error(), bridgeRole)
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+bridge+" FROM "+runtime,
+		).Error)
+		granted = false
+		require.NoError(t, adminDB.Exec(
+			"ALTER TABLE public.contacts OWNER TO "+
+				quoteTenantRLSTestIdentifier(originalContactsOwner),
+		).Error)
+		contactsOwnerChanged = false
+		verifyClean(t)
+	})
+
+	t.Run("Verify rejects membership in an unrelated BYPASSRLS role", func(t *testing.T) {
+		granted := true
+		t.Cleanup(func() {
+			if granted {
+				_ = adminDB.Exec("REVOKE " + privileged + " FROM " + runtime).Error
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+privileged+" TO "+runtime,
+		).Error)
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "privileged role")
+		require.Contains(t, err.Error(), privilegedRole)
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+privileged+" FROM "+runtime,
+		).Error)
+		granted = false
+		verifyClean(t)
+	})
+
+	t.Run("Verify rejects a direct REPLICATION runtime login", func(t *testing.T) {
+		replicationEnabled := true
+		t.Cleanup(func() {
+			if replicationEnabled {
+				_ = adminDB.Exec("ALTER ROLE " + runtime + " NOREPLICATION").Error
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"ALTER ROLE "+runtime+" REPLICATION",
+		).Error)
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "NOREPLICATION")
+
+		require.NoError(t, adminDB.Exec(
+			"ALTER ROLE "+runtime+" NOREPLICATION",
+		).Error)
+		replicationEnabled = false
+		verifyClean(t)
+	})
+
+	t.Run("Verify rejects indirect membership in a REPLICATION role", func(t *testing.T) {
+		grantedReplicationToBridge := true
+		grantedBridgeToRuntime := true
+		t.Cleanup(func() {
+			if grantedBridgeToRuntime {
+				_ = adminDB.Exec("REVOKE " + bridge + " FROM " + runtime).Error
+			}
+			if grantedReplicationToBridge {
+				_ = adminDB.Exec("REVOKE " + replication + " FROM " + bridge).Error
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+replication+" TO "+bridge,
+		).Error)
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+bridge+" TO "+runtime,
+		).Error)
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "privileged role")
+		require.Contains(t, err.Error(), replicationRole)
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+bridge+" FROM "+runtime,
+		).Error)
+		grantedBridgeToRuntime = false
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+replication+" FROM "+bridge,
+		).Error)
+		grantedReplicationToBridge = false
+		verifyClean(t)
+	})
+
+	orgA := models.Organization{
+		BaseModel:  models.BaseModel{ID: uuid.New()},
+		ResellerID: &reseller.ID,
+		Name:       "Membership fence clinic A",
+		Slug:       "membership-fence-a-" + uuid.NewString()[:8],
+		Settings:   models.JSONB{},
+	}
+	orgB := models.Organization{
+		BaseModel:  models.BaseModel{ID: uuid.New()},
+		ResellerID: &reseller.ID,
+		Name:       "Membership fence clinic B",
+		Slug:       "membership-fence-b-" + uuid.NewString()[:8],
+		Settings:   models.JSONB{},
+	}
+	require.NoError(t, adminDB.Create(&orgA).Error)
+	require.NoError(t, adminDB.Create(&orgB).Error)
+	organizationIDs = []uuid.UUID{orgA.ID, orgB.ID}
+	for index, organizationID := range []uuid.UUID{orgA.ID, orgB.ID} {
+		contact := models.Contact{
+			BaseModel:       models.BaseModel{ID: uuid.New()},
+			OrganizationID:  organizationID,
+			PhoneNumber:     fmt.Sprintf("+6011888%05d", index),
+			ProfileName:     fmt.Sprintf("Membership fixture %d", index),
+			WhatsAppAccount: fmt.Sprintf("membership-fixture-%d", index),
+		}
+		require.NoError(t, adminDB.Create(&contact).Error)
+		contactIDs = append(contactIDs, contact.ID)
+	}
+
+	t.Run("Verify rejects direct drift and revocation restores isolation", func(t *testing.T) {
+		granted := true
+		t.Cleanup(func() {
+			if granted {
+				_ = adminDB.Exec("REVOKE " + migration + " FROM " + runtime).Error
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+migration+" TO "+runtime,
+		).Error)
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "permissive RLS policy")
+
+		var visibleBeforeSetRole int64
+		var visibleAfterSetRole int64
+		require.NoError(t, runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				if err := database.SetTenantContext(runtimeDB, orgA.ID); err != nil {
+					return err
+				}
+				if err := runtimeDB.Model(&models.Contact{}).
+					Where("id IN ?", contactIDs).
+					Count(&visibleBeforeSetRole).Error; err != nil {
+					return err
+				}
+				if err := runtimeDB.Exec(
+					"SET LOCAL ROLE " + migration,
+				).Error; err != nil {
+					return err
+				}
+				return runtimeDB.Model(&models.Contact{}).
+					Where("id IN ?", contactIDs).
+					Count(&visibleAfterSetRole).Error
+			},
+		))
+		require.Equal(t, int64(1), visibleBeforeSetRole,
+			"NOINHERIT runtime access should remain tenant-scoped before SET ROLE")
+		require.Equal(t, int64(2), visibleAfterSetRole,
+			"SET ROLE into the permissive migration policy exposes both tenants")
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+migration+" FROM "+runtime,
+		).Error)
+		granted = false
+		verifyClean(t)
+	})
+
+	t.Run("Verify rejects indirect drift and accepts a clean revoke", func(t *testing.T) {
+		grantedMigrationToBridge := true
+		grantedBridgeToRuntime := true
+		t.Cleanup(func() {
+			if grantedBridgeToRuntime {
+				_ = adminDB.Exec("REVOKE " + bridge + " FROM " + runtime).Error
+			}
+			if grantedMigrationToBridge {
+				_ = adminDB.Exec("REVOKE " + migration + " FROM " + bridge).Error
+			}
+		})
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+migration+" TO "+bridge,
+		).Error)
+		require.NoError(t, adminDB.Exec(
+			"GRANT "+bridge+" TO "+runtime,
+		).Error)
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "permissive RLS policy")
+
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+bridge+" FROM "+runtime,
+		).Error)
+		grantedBridgeToRuntime = false
+		require.NoError(t, adminDB.Exec(
+			"REVOKE "+migration+" FROM "+bridge,
+		).Error)
+		grantedMigrationToBridge = false
+		verifyClean(t)
+	})
+
+	t.Run("Verify rejects a renamed permissive migration policy", func(t *testing.T) {
+		const renamedPolicy = "rereply_renamed_migration_access"
+		restored := false
+		t.Cleanup(func() {
+			if restored {
+				return
+			}
+			_ = adminDB.Exec(
+				"DROP POLICY IF EXISTS " + renamedPolicy + " ON public.contacts",
+			).Error
+			_ = adminDB.Exec(
+				"DROP POLICY IF EXISTS rereply_migration_access ON public.contacts",
+			).Error
+			_ = adminDB.Exec(
+				"CREATE POLICY rereply_migration_access ON public.contacts TO " + migration +
+					" USING (true) WITH CHECK (true)",
+			).Error
+		})
+
+		require.NoError(t, adminDB.Exec(
+			"ALTER POLICY rereply_migration_access ON public.contacts RENAME TO "+renamedPolicy,
+		).Error)
+		require.NoError(t, adminDB.Exec(
+			"ALTER POLICY "+renamedPolicy+" ON public.contacts TO "+runtime,
+		).Error)
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), renamedPolicy)
+		require.Contains(t, err.Error(), "contacts")
+
+		require.NoError(t, adminDB.Exec(
+			"ALTER POLICY "+renamedPolicy+" ON public.contacts TO "+migration,
+		).Error)
+		require.NoError(t, adminDB.Exec(
+			"ALTER POLICY "+renamedPolicy+
+				" ON public.contacts RENAME TO rereply_migration_access",
+		).Error)
+		restored = true
+		verifyClean(t)
+	})
+
+	t.Run("Verify rejects an extra permissive policy on a related table", func(t *testing.T) {
+		const extraPolicy = "rereply_extra_permissive_access"
+		removed := false
+		t.Cleanup(func() {
+			if removed {
+				return
+			}
+			_ = adminDB.Exec(
+				"DROP POLICY IF EXISTS " + extraPolicy + " ON public.chatbot_flow_steps",
+			).Error
+		})
+
+		require.NoError(t, adminDB.Exec(
+			"CREATE POLICY "+extraPolicy+" ON public.chatbot_flow_steps TO "+runtime+
+				" USING (true) WITH CHECK (true)",
+		).Error)
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), extraPolicy)
+		require.Contains(t, err.Error(), "chatbot_flow_steps")
+
+		require.NoError(t, adminDB.Exec(
+			"DROP POLICY "+extraPolicy+" ON public.chatbot_flow_steps",
+		).Error)
+		removed = true
+		verifyClean(t)
+	})
+
+	t.Run("Verify permits an absent migration policy", func(t *testing.T) {
+		restored := false
+		t.Cleanup(func() {
+			if restored {
+				return
+			}
+			_ = adminDB.Exec(
+				"DROP POLICY IF EXISTS rereply_migration_access ON public.contacts",
+			).Error
+			_ = adminDB.Exec(
+				"CREATE POLICY rereply_migration_access ON public.contacts TO " + migration +
+					" USING (true) WITH CHECK (true)",
+			).Error
+		})
+		require.NoError(t, adminDB.Exec(
+			"DROP POLICY rereply_migration_access ON public.contacts",
+		).Error)
+		verifyClean(t)
+		require.NoError(t, adminDB.Exec(
+			"CREATE POLICY rereply_migration_access ON public.contacts TO "+migration+
+				" USING (true) WITH CHECK (true)",
+		).Error)
+		restored = true
+		verifyClean(t)
+	})
+
+	t.Run("Verify rejects canonical tenant policy expression drift", func(t *testing.T) {
+		const tenantExpression = "organization_id = NULLIF(current_setting('app.current_organization_id', true), '')::uuid"
+		restored := false
+		t.Cleanup(func() {
+			if restored {
+				return
+			}
+			_ = adminDB.Exec(
+				"ALTER POLICY rereply_tenant_isolation ON public.contacts USING (" +
+					tenantExpression + ") WITH CHECK (" + tenantExpression + ")",
+			).Error
+		})
+
+		require.NoError(t, adminDB.Exec(`
+			ALTER POLICY rereply_tenant_isolation ON public.contacts
+			USING (true) WITH CHECK (true)
+		`).Error)
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "fingerprint does not match")
+
+		require.NoError(t, adminDB.Exec(
+			"ALTER POLICY rereply_tenant_isolation ON public.contacts USING ("+
+				tenantExpression+") WITH CHECK ("+tenantExpression+")",
+		).Error)
+		restored = true
+		verifyClean(t)
+	})
+
+	t.Run("Verify rejects PUBLIC migration policy drift", func(t *testing.T) {
+		restored := false
+		t.Cleanup(func() {
+			if restored {
+				return
+			}
+			_ = adminDB.Exec(
+				"DROP POLICY IF EXISTS rereply_migration_access ON public.contacts",
+			).Error
+			_ = adminDB.Exec(
+				"CREATE POLICY rereply_migration_access ON public.contacts TO " + migration +
+					" USING (true) WITH CHECK (true)",
+			).Error
+		})
+		require.NoError(t, adminDB.Exec(
+			"DROP POLICY rereply_migration_access ON public.contacts",
+		).Error)
+		require.NoError(t, adminDB.Exec(`
+			CREATE POLICY rereply_migration_access ON public.contacts
+			TO PUBLIC USING (true) WITH CHECK (true)
+		`).Error)
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "must not apply to PUBLIC")
+
+		require.NoError(t, adminDB.Exec(
+			"DROP POLICY rereply_migration_access ON public.contacts",
+		).Error)
+		require.NoError(t, adminDB.Exec(
+			"CREATE POLICY rereply_migration_access ON public.contacts TO "+migration+
+				" USING (true) WITH CHECK (true)",
+		).Error)
+		restored = true
+		verifyClean(t)
+	})
+
+	t.Run("Remove drops public policies and fingerprint under a pg_catalog-first search path", func(t *testing.T) {
+		var remainingPolicies int64
+		var fingerprintExists bool
+		var contactsRLSEnabled bool
+		require.NoError(t, adminDB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec("SET LOCAL search_path = pg_catalog, public").Error; err != nil {
+				return err
+			}
+			if err := database.RemoveTenantRLS(tx); err != nil {
+				return err
+			}
+			if err := tx.Raw(`
+				SELECT COUNT(*)::bigint
+				FROM pg_catalog.pg_policy AS policy
+				JOIN pg_catalog.pg_class AS policy_table
+				  ON policy_table.oid = policy.polrelid
+				JOIN pg_catalog.pg_namespace AS policy_schema
+				  ON policy_schema.oid = policy_table.relnamespace
+				WHERE policy_schema.nspname = 'public'
+				  AND policy.polname IN (
+					'rereply_tenant_isolation',
+					'rereply_migration_access'
+				  )
+			`).Scan(&remainingPolicies).Error; err != nil {
+				return err
+			}
+			if err := tx.Raw(`
+				SELECT to_regprocedure(
+					'public.rereply_tenant_policy_fingerprint()'
+				) IS NOT NULL
+			`).Scan(&fingerprintExists).Error; err != nil {
+				return err
+			}
+			return tx.Raw(`
+				SELECT relation.relrowsecurity
+				FROM pg_catalog.pg_class AS relation
+				JOIN pg_catalog.pg_namespace AS schema
+				  ON schema.oid = relation.relnamespace
+				WHERE schema.nspname = 'public'
+				  AND relation.relname = 'contacts'
+			`).Scan(&contactsRLSEnabled).Error
+		}))
+		require.Zero(t, remainingPolicies)
+		require.False(t, fingerprintExists)
+		require.False(t, contactsRLSEnabled)
+	})
+}
+
 func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	adminDB := testutil.SetupTestDB(t)
 	testutil.TruncateTables(adminDB)
 
-	// A unique, non-login role keeps this test isolated from concurrent CI
-	// runs. SET LOCAL ROLE exercises the same PostgreSQL permissions and RLS
-	// behavior as the production runtime login without putting a password in
-	// the test environment.
+	// A unique LOGIN role and an independent connection exercise the immutable
+	// PostgreSQL backend identity used by the production runtime pool.
 	runtimeRole := "rereply_rls_" + uuid.NewString()[:8]
+	runtimePassword := uuid.NewString() + uuid.NewString()
+	runtime := quoteTenantRLSTestIdentifier(runtimeRole)
 	require.NoError(t, adminDB.Exec(fmt.Sprintf(
-		"CREATE ROLE %s NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS",
-		runtimeRole,
+		"CREATE ROLE %s LOGIN PASSWORD %s NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS",
+		runtime,
+		quoteTenantRLSTestLiteral(runtimePassword),
 	)).Error)
 
 	t.Cleanup(func() {
 		// Cleanup is deliberately best-effort so the original assertion remains
 		// visible if a policy test fails.
 		_ = database.RemoveTenantRLS(adminDB)
-		_ = adminDB.Exec("DROP OWNED BY " + runtimeRole).Error
-		_ = adminDB.Exec("DROP ROLE IF EXISTS " + runtimeRole).Error
+		_ = adminDB.Exec("DROP OWNED BY " + runtime).Error
+		_ = adminDB.Exec("DROP ROLE IF EXISTS " + runtime).Error
 		testutil.TruncateTables(adminDB)
 	})
+	runtimeDB := openTenantRLSTestRoleConnection(
+		t,
+		runtimeRole,
+		runtimePassword,
+	)
 
 	reseller := testutil.CreateTestReseller(t, adminDB)
 	orgA := models.Organization{
@@ -537,12 +1930,7 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 	require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
 
 	asRuntime := func(fn func(*gorm.DB) error) error {
-		return adminDB.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Exec("SET LOCAL ROLE " + runtimeRole).Error; err != nil {
-				return err
-			}
-			return fn(tx)
-		})
+		return runAsTenantRLSTestRole(runtimeDB, runtimeRole, fn)
 	}
 	asTenant := func(organizationID uuid.UUID, fn func(*gorm.DB) error) error {
 		return asRuntime(func(runtimeDB *gorm.DB) error {
@@ -1389,6 +2777,7 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 			"public.rereply_ready_meta_lifecycle_orgs(uuid,integer,timestamptz)",
 			"public.rereply_meta_deauth_targets(text,text)",
 			"public.rereply_meta_deauth_target_page(text,text,uuid,integer)",
+			"public.rereply_tenant_policy_fingerprint()",
 		} {
 			var resolverExists bool
 			require.NoError(t, adminDB.Raw(
