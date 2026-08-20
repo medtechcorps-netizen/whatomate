@@ -155,6 +155,9 @@ func runMigrations(db *gorm.DB) error {
 	if err := database.PrepareMetaInstagramDeletionJournalTenant(db); err != nil {
 		return err
 	}
+	if err := database.PrepareProviderIntegrationManagementMode(db); err != nil {
+		return err
+	}
 	if err := db.AutoMigrate(modelsToMigrate...); err != nil {
 		return err
 	}

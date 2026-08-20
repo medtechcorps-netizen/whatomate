@@ -207,6 +207,33 @@ development_organization_id = ""
 development_app_id = ""
 development_profile_id = ""
 
+# Shared, deployment-owned Threads applications. This control plane is
+# independent from tenant-owned/BYO Threads apps and remains default-off. The
+# compliance organization is a dedicated platform tenant and must not appear in
+# allowed_organization_ids; it is also excluded when allow_all is released. Its
+# Organization.settings must carry threads_managed_compliance_tenant=true and
+# it must belong to the active `platform-direct` reseller before runtime use.
+[threads_managed]
+enabled = false
+allowed_organization_ids = ""
+allow_all_organizations = false
+compliance_organization_id = ""
+
+# The first deployment uses this env-compatible single-app object. Its key is
+# persisted as the shard abstraction; a future release may instead use the
+# `platform_apps` array, but startup rejects configuring both shapes. Keep both
+# credentials in deployment secret storage, never clinic settings. Environment
+# form example: WHATOMATE_THREADS_MANAGED__PLATFORM_APP__APP_SECRET.
+[threads_managed.platform_app]
+platform_app_key = ""
+app_id = ""
+app_secret = ""
+webhook_verify_token = ""
+app_review_status = ""
+app_review_evidence_sha256 = ""
+app_review_approved_at = ""
+configuration_generation = 0
+
 # Managed Instagram Login lifecycle. This uses a different Meta application,
 # webhook route, app secret, and verify token from the legacy/static Instagram
 # relay configuration. Enable only after the relay reader understands managed

@@ -23,6 +23,23 @@ func TestGetIndexesEnforcesOneOwnerForGloballyRoutedChannelIdentities(t *testing
 	assert.Contains(t, statements, "channel = 'threads' AND provider = 'threads'")
 }
 
+func TestGetIndexesEnforcesManagedThreadsLiveClaimsAndTenantSecretBoundary(t *testing.T) {
+	statements := strings.Join(getIndexes(), "\n")
+	assert.Contains(t, statements, "chk_provider_integrations_management_mode")
+	assert.Contains(t, statements, "management_mode = 'workspace_byo'")
+	assert.Contains(t, statements, "management_mode = 'platform_managed'")
+	assert.Contains(t, statements, "NOT (credential_data ?| ARRAY['app_secret', 'webhook_verify_token'])")
+	assert.Contains(t, statements, "platform_app_key IS NOT NULL")
+	assert.Contains(t, statements, "GROUP BY platform_app_id, oauth_subject_id")
+	assert.Contains(t, statements, "GROUP BY platform_app_id, authority_asset_id")
+	assert.Contains(t, statements, "uq_threads_platform_bindings_live_app_subject")
+	assert.Contains(t, statements, "ON threads_platform_bindings(platform_app_id, oauth_subject_id)")
+	assert.Contains(t, statements, "uq_threads_platform_bindings_live_app_asset")
+	assert.Contains(t, statements, "ON threads_platform_bindings(platform_app_id, authority_asset_id)")
+	assert.Contains(t, statements, "status IN ('pending', 'active', 'quarantined')")
+	assert.Contains(t, statements, "cannot enforce managed Threads identity ownership")
+}
+
 func TestGetIndexesEnforcesOneOwnerForNormalizedLiveWhatsAppPhoneIDs(t *testing.T) {
 	indexes := getIndexes()
 	preflightPosition := -1
