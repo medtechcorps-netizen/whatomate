@@ -870,8 +870,7 @@ func (w *Worker) managedInstagramChannelOutboxRuntimeAllowed(
 		time.RFC3339Nano,
 		channelOutboxText(account.Metadata["meta_authorized_at"]),
 	)
-	if !settings.Enabled || settings.QuarantineOnly ||
-		strings.TrimSpace(settings.AllowedOrganizationID) != account.OrganizationID.String() ||
+	if !settings.Enabled || !settings.OrganizationReleased(account.OrganizationID.String()) ||
 		!managedMetaCanonicalID(strings.TrimSpace(settings.AppID)) ||
 		!managedMetaCanonicalID(account.ExternalAccountID) ||
 		channelOutboxText(account.Config["instagram_api_mode"]) != "instagram_login" ||

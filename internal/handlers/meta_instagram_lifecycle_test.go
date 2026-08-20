@@ -1304,8 +1304,10 @@ func TestManagedInstagramDevelopmentCallbackRejectsWrongShortTokenProfileBeforeG
 	nonce := "synthetic-dev-profile-state-" + uuid.NewString()
 	state := metaInstagramOAuthState{
 		OrganizationID: fixture.org.ID.String(), UserID: fixture.user.ID.String(), Nonce: nonce,
-		ConfigFingerprint: fixture.app.metaInstagramRuntimeFingerprint(fixture.app.Config.MetaInstagram),
-		IssuedAt:          now, ExpiresAt: now.Add(metaInstagramOAuthStateTTL),
+		ConfigFingerprint: fixture.app.metaInstagramRuntimeFingerprint(
+			fixture.app.Config.MetaInstagram, fixture.org.ID,
+		),
+		IssuedAt: now, ExpiresAt: now.Add(metaInstagramOAuthStateTTL),
 	}
 	browserVerifier := generateRandomString(metaInstagramOAuthBrowserSecretSize)
 	state.BrowserBindingDigest = metaInstagramOAuthBrowserBindingDigest(state, browserVerifier)
@@ -1373,7 +1375,7 @@ func TestManagedInstagramQuarantineOnlyDowngradeCancelsQueuesWithoutGraphCall(t 
 		}, time.Now().UTC(),
 	)
 	require.ErrorIs(t, err, metaregistry.ErrStaleBinding)
-	assert.False(t, fixture.app.metaInstagramOnboardingAvailable())
+	assert.False(t, fixture.app.metaInstagramOnboardingAvailable(fixture.org.ID))
 	var credentials []models.ChannelCredential
 	require.NoError(t, fixture.db.Where("channel_account_id = ?", account.ID).Find(&credentials).Error)
 	for _, credential := range credentials {
@@ -2109,8 +2111,10 @@ func TestManagedInstagramReconnectCallbackRejectsPartialManagedMarkersBeforeProv
 			state := metaInstagramOAuthState{
 				ReconnectAccountID: fixture.account.ID.String(),
 				OrganizationID:     fixture.org.ID.String(), UserID: fixture.user.ID.String(), Nonce: nonce,
-				ConfigFingerprint: fixture.app.metaInstagramRuntimeFingerprint(fixture.app.Config.MetaInstagram),
-				IssuedAt:          now, ExpiresAt: now.Add(metaInstagramOAuthStateTTL),
+				ConfigFingerprint: fixture.app.metaInstagramRuntimeFingerprint(
+					fixture.app.Config.MetaInstagram, fixture.org.ID,
+				),
+				IssuedAt: now, ExpiresAt: now.Add(metaInstagramOAuthStateTTL),
 			}
 			browserVerifier := generateRandomString(metaInstagramOAuthBrowserSecretSize)
 			state.BrowserBindingDigest = metaInstagramOAuthBrowserBindingDigest(state, browserVerifier)
@@ -2215,7 +2219,7 @@ func TestManagedInstagramDeauthorizationLookupCannotCrossMessengerChannel(t *tes
 	require.NoError(t, fixture.db.Create(&messenger).Error)
 
 	targets, err := fixture.app.resolveMetaInstagramCallbackTargets(
-		fixture.org.ID, metaInstagramTestAppID, fixture.profileID,
+		metaInstagramTestAppID, fixture.profileID,
 	)
 	require.NoError(t, err)
 	require.Len(t, targets, 1)
@@ -2832,7 +2836,8 @@ func TestManagedInstagramDataDeletionJournalSerializesPrivacyRequestCreation(t *
 	firstScoped := fixture.app.scopedApp(firstTx, fixture.org.ID)
 	first, err := firstScoped.createOrResumeMetaInstagramDeletionRequest(
 		fixture.org.ID, metaInstagramTestAppID, fixture.profileID,
-		digest, nil, issuedAt, time.Now().UTC(),
+		fixture.profileID, digest, metaInstagramDeletionResolutionExact, false,
+		issuedAt, time.Now().UTC(),
 	)
 	require.NoError(t, err)
 
@@ -2852,7 +2857,8 @@ func TestManagedInstagramDataDeletionJournalSerializesPrivacyRequestCreation(t *
 				scoped := fixture.app.scopedApp(tx, fixture.org.ID)
 				request, createErr := scoped.createOrResumeMetaInstagramDeletionRequest(
 					fixture.org.ID, metaInstagramTestAppID, fixture.profileID,
-					digest, nil, issuedAt, time.Now().UTC(),
+					fixture.profileID, digest, metaInstagramDeletionResolutionExact, false,
+					issuedAt, time.Now().UTC(),
 				)
 				if createErr == nil {
 					secondResult <- request

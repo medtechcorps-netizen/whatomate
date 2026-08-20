@@ -1,15 +1,20 @@
 # Managed Meta self-service control plane
 
-Lifecycle B provides a default-off, self-service Messenger onboarding path on
-top of the encrypted Meta registry. It does not enable Instagram onboarding;
-Instagram Login stays rejected at startup until it has the same OAuth,
-ownership, subscription, deauthorization, and recovery lifecycle.
+The encrypted Meta registry now supports two default-off dynamic onboarding
+flows: Facebook Login for Business for managed Messenger, and Instagram Login
+for managed Instagram Business/Creator accounts. Each has its own platform app,
+OAuth identity model, subscription lifecycle, callbacks, release gates, and
+recovery path. Threads remains a separate dedicated/BYO OAuth lifecycle and is
+not provisioned through this shared Meta registry.
 
-Existing static relay mappings are a separate compatibility boundary. Do not
-change their webhook routes, app secrets, Page tokens, or environment mapping
-while rolling out managed Messenger. Static Page tokens can have a different
-application identity from the legacy webhook signer, so the managed lifecycle
-must never infer or reuse that identity.
+Existing static relay mappings are a legacy/off-pilot compatibility boundary.
+Do not change their webhook routes, app secrets, Page tokens, or environment
+mapping while rolling out a managed profile. A static mapping must never contain
+the same Page/profile ID as a dynamic registry binding: static lookup has
+precedence and would shadow the managed route. Drain its legacy queue work and
+remove the exact mapping from every relay replica before managed OAuth. Static
+tokens can have a different application identity from the legacy webhook
+signer, so neither managed lifecycle may infer or reuse that identity.
 
 ## Deployment-owned trust boundaries
 
@@ -26,6 +31,13 @@ must never infer or reuse that identity.
   authentication and per-request replay protection.
 - Tenant routing stays inside a tenant transaction/RLS boundary. The globally
   unique Page claim prevents two workspaces from subscribing the same Page.
+
+Managed Instagram applies the same encrypted-registry principle with its own
+app/profile identity split and bounded active/quarantined organization sets.
+Zero-target or ambiguous signed deletion requests belong only to a distinct
+platform compliance organization; exact targets remain tenant-owned. See
+[Managed Instagram Login lifecycle](./meta-instagram-managed-lifecycle.md) for
+its release, callback, migration, and rollback gates.
 
 ## Enablement gates
 

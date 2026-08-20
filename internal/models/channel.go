@@ -240,7 +240,9 @@ func (MetaDeauthorizationEvent) TableName() string {
 // revokes an authorization. The callback is assigned to the deployment-owned
 // tenant immediately after its app signature has been verified. Keeping the
 // tenant non-null from the first insert lets PostgreSQL RLS protect the privacy
-// journal even when there is no current channel account.
+// journal even when there is no current channel account. Exact targets stay in
+// their clinic tenant; no-target/ambiguous requests use the separate platform
+// compliance tenant and store only HMAC-bound provider identities.
 type MetaInstagramDataDeletionEvent struct {
 	Digest            string     `gorm:"size:64;primaryKey" json:"-"`
 	PlatformAppID     string     `gorm:"size:64;not null;index" json:"-"`
@@ -249,6 +251,8 @@ type MetaInstagramDataDeletionEvent struct {
 	VerifiedAt        time.Time  `gorm:"not null;index" json:"-"`
 	State             string     `gorm:"size:24;not null;default:'verified';index" json:"-"`
 	OrganizationID    uuid.UUID  `gorm:"type:uuid;not null;index" json:"-"`
+	TargetResolution  string     `gorm:"size:32;not null;default:'exact_target'" json:"-"`
+	IdentityHashed    bool       `gorm:"not null;default:false" json:"-"`
 	PrivacyRequestID  *uuid.UUID `gorm:"type:uuid;index" json:"-"`
 	RequestNumber     string     `gorm:"size:64;index" json:"-"`
 	LastAttemptAt     *time.Time `json:"-"`

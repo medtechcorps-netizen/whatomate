@@ -33,8 +33,8 @@ type metaInstagramRevalidationSnapshot struct {
 
 // RunMetaInstagramLifecycle revalidates the exact app/profile/subscription
 // binding and refreshes long-lived credentials without changing their queue
-// generation fence. Release evidence and the one-workspace gate are checked
-// before every provider request.
+// generation fence. Release evidence and the exact per-organization gate are
+// checked before every provider request.
 func (a *App) RunMetaInstagramLifecycle(ctx context.Context) error {
 	if a == nil || a.Config == nil || !a.Config.MetaInstagram.Enabled || !a.Config.MetaRegistry.Enabled {
 		return nil
@@ -75,13 +75,13 @@ func (a *App) revalidateDueMetaInstagramBindingsWithJournalCleanup(
 		return errors.New("managed Instagram journal cleanup is unavailable")
 	}
 	now := time.Now().UTC()
+	// Global and per-organization emergency downgrades are safety barriers, not
+	// maintenance. Always settle their tenant rows and cancellable work before
+	// journal cleanup or any provider-capable lifecycle path.
+	if err := a.reconcileMetaInstagramQuarantineBarrier(ctx, now); err != nil {
+		return err
+	}
 	if a != nil && a.Config != nil && a.Config.MetaInstagram.QuarantineOnly {
-		// The emergency downgrade is a safety barrier, not maintenance. Always
-		// settle the tenant rows and their cancellable work before journal cleanup
-		// can fail this sweep, and never enter a provider-capable path.
-		if err := a.reconcileMetaInstagramQuarantineBarrier(ctx, now); err != nil {
-			return err
-		}
 		return cleanup(now)
 	}
 	after := uuid.Nil
@@ -126,7 +126,7 @@ func ReconcileMetaInstagramQuarantineStartup(
 	if cfg == nil {
 		return errors.New("managed Instagram startup barrier requires configuration")
 	}
-	if !cfg.MetaInstagram.Enabled || !cfg.MetaInstagram.QuarantineOnly {
+	if !cfg.MetaInstagram.Enabled {
 		return nil
 	}
 	if db == nil || !cfg.MetaRegistry.Enabled {
@@ -146,7 +146,7 @@ func (a *App) ReconcileMetaInstagramQuarantineStartup(ctx context.Context) error
 	if a == nil || a.Config == nil {
 		return errors.New("managed Instagram startup barrier requires configuration")
 	}
-	if !a.Config.MetaInstagram.Enabled || !a.Config.MetaInstagram.QuarantineOnly {
+	if !a.Config.MetaInstagram.Enabled {
 		return nil
 	}
 	if a.rootApp() == nil || a.rootApp().DB == nil || !a.Config.MetaRegistry.Enabled {
@@ -155,7 +155,66 @@ func (a *App) ReconcileMetaInstagramQuarantineStartup(ctx context.Context) error
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return a.reconcileMetaInstagramQuarantineBarrier(ctx, time.Now().UTC())
+	if err := a.validateMetaInstagramComplianceOrganization(ctx); err != nil {
+		return err
+	}
+	checkedAt := time.Now().UTC()
+	if err := a.reconcileMetaInstagramQuarantineBarrier(ctx, checkedAt); err != nil {
+		return err
+	}
+	return a.reconcileMetaInstagramStartupJournalFences(ctx, checkedAt)
+}
+
+func (a *App) validateMetaInstagramComplianceOrganization(ctx context.Context) error {
+	if a == nil || a.Config == nil || a.rootApp() == nil || a.rootApp().DB == nil {
+		return errors.New("managed Instagram compliance tenant validation is unavailable")
+	}
+	managedTexts := a.Config.MetaInstagram.ManagedOrganizationIDs()
+	if len(managedTexts) == 0 {
+		return errors.New("managed Instagram tenant set is invalid")
+	}
+	organizationExists := func(organizationID uuid.UUID) (bool, error) {
+		var count int64
+		err := database.WithTenantReadCommitted(
+			a.rootApp().DB.WithContext(ctx), organizationID, func(tx *gorm.DB) error {
+				return tx.Model(&models.Organization{}).
+					Where("id = ?", organizationID).Count(&count).Error
+			},
+		)
+		return count == 1, err
+	}
+	for _, organizationText := range managedTexts {
+		organizationID, err := uuid.Parse(organizationText)
+		if err != nil || organizationID == uuid.Nil || organizationID.String() != organizationText {
+			return errors.New("managed Instagram tenant set is invalid")
+		}
+		exists, err := organizationExists(organizationID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return errors.New("managed Instagram configured tenant does not exist")
+		}
+	}
+	complianceText := a.Config.MetaInstagram.DataDeletionComplianceOrganization()
+	if complianceText == "" {
+		if a.Config.MetaInstagram.UsesOrganizationSetModel() {
+			return errors.New("managed Instagram compliance tenant is invalid")
+		}
+		return nil
+	}
+	complianceID, err := uuid.Parse(complianceText)
+	if err != nil || complianceID == uuid.Nil || complianceID.String() != complianceText {
+		return errors.New("managed Instagram compliance tenant is invalid")
+	}
+	exists, err := organizationExists(complianceID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("managed Instagram compliance tenant does not exist")
+	}
+	return nil
 }
 
 func (a *App) reconcileMetaInstagramQuarantineBarrier(
@@ -165,14 +224,117 @@ func (a *App) reconcileMetaInstagramQuarantineBarrier(
 	if a == nil || a.Config == nil || a.rootApp() == nil || a.rootApp().DB == nil {
 		return errors.New("managed Instagram quarantine barrier is unavailable")
 	}
-	if !a.Config.MetaInstagram.Enabled || !a.Config.MetaInstagram.QuarantineOnly {
+	if !a.Config.MetaInstagram.Enabled {
 		return nil
 	}
-	organizationText := strings.TrimSpace(a.Config.MetaInstagram.AllowedOrganizationID)
-	organizationID, err := uuid.Parse(organizationText)
-	if err != nil || organizationID == uuid.Nil || organizationID.String() != organizationText {
-		return errors.New("managed Instagram quarantine barrier tenant is invalid")
+	organizationTexts := a.Config.MetaInstagram.ManagedOrganizationIDs()
+	for _, organizationText := range organizationTexts {
+		if !a.Config.MetaInstagram.OrganizationQuarantined(organizationText) {
+			continue
+		}
+		organizationID, err := uuid.Parse(organizationText)
+		if err != nil || organizationID == uuid.Nil || organizationID.String() != organizationText {
+			return errors.New("managed Instagram quarantine barrier tenant is invalid")
+		}
+		if err := a.reconcileMetaInstagramOrganizationQuarantine(
+			ctx, organizationID, checkedAt,
+		); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// reconcileMetaInstagramStartupJournalFences prevents a previously removed
+// clinic from becoming routable merely because its UUID is added again. A
+// signed no-target event may already live in the compliance tenant; all active
+// bindings therefore cross the exact durable generation fence before this
+// process can serve or claim work. This phase is database-only.
+func (a *App) reconcileMetaInstagramStartupJournalFences(
+	ctx context.Context,
+	checkedAt time.Time,
+) error {
+	if a == nil || a.Config == nil || a.rootApp() == nil || a.rootApp().DB == nil {
+		return errors.New("managed Instagram startup journal fence is unavailable")
+	}
+	for _, organizationText := range a.Config.MetaInstagram.ActiveOrganizationIDs() {
+		organizationID, err := uuid.Parse(organizationText)
+		if err != nil || organizationID == uuid.Nil || organizationID.String() != organizationText {
+			return errors.New("managed Instagram startup journal tenant is invalid")
+		}
+		err = a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := lockChannelAIOrganizationScopeTx(scoped.DB, organizationID); err != nil {
+				return err
+			}
+			var accounts []models.ChannelAccount
+			if err := scoped.DB.WithContext(ctx).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Preload("Credentials", func(db *gorm.DB) *gorm.DB {
+					return db.Order("version DESC")
+				}).
+				Where(
+					"organization_id = ? AND channel = ? AND provider = ? AND status IN ?",
+					organizationID, models.ChannelInstagram, channelapi.RelayProvider,
+					[]models.ChannelAccountStatus{
+						models.ChannelAccountStatusPending,
+						models.ChannelAccountStatusActive,
+					},
+				).
+				Order("id").Find(&accounts).Error; err != nil {
+				return err
+			}
+			for index := range accounts {
+				account := &accounts[index]
+				if !managedInstagramControlPlaneIntent(account) {
+					continue
+				}
+				authorizationStartedAt, _ := time.Parse(
+					time.RFC3339Nano,
+					stringConfigValue(account.Metadata, metaMessengerAuthorizationGrantedAtKey),
+				)
+				oauth := currentMetaRegistryCredential(
+					account.Credentials, models.ChannelCredentialKindOAuth, checkedAt,
+				)
+				credentialCreatedAt := time.Time{}
+				if oauth != nil {
+					credentialCreatedAt = oauth.CreatedAt
+				}
+				fenceErr := scoped.metaInstagramOAuthGenerationFence(
+					organizationID,
+					strings.TrimSpace(a.Config.MetaInstagram.AppID),
+					stringConfigValue(account.Metadata, "meta_authorizing_user_id"),
+					authorizationStartedAt, credentialCreatedAt, account.Metadata,
+				)
+				switch {
+				case fenceErr == nil:
+					continue
+				case errors.Is(fenceErr, errMetaInstagramAuthorizationSuperseded):
+					if err := scoped.quarantineMetaInstagramAccountTx(
+						account, "managed_lifecycle_journal_superseded", checkedAt,
+					); err != nil {
+						return err
+					}
+				default:
+					return fenceErr
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *App) reconcileMetaInstagramOrganizationQuarantine(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	checkedAt time.Time,
+) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -224,16 +386,20 @@ func (a *App) metaInstagramLifecycleOrganizations(after uuid.UUID) ([]uuid.UUID,
 	if root == nil || root.Config == nil {
 		return nil, nil
 	}
-	allowedOrganizationID, err := uuid.Parse(strings.TrimSpace(
-		root.Config.MetaInstagram.AllowedOrganizationID,
-	))
-	if err != nil || allowedOrganizationID == uuid.Nil {
-		return nil, nil
+	organizations := make([]uuid.UUID, 0)
+	for _, organizationText := range root.Config.MetaInstagram.ActiveOrganizationIDs() {
+		organizationID, err := uuid.Parse(organizationText)
+		if err != nil || organizationID == uuid.Nil || organizationID.String() != organizationText {
+			return nil, errors.New("managed Instagram lifecycle tenant is invalid")
+		}
+		if after == uuid.Nil || organizationID.String() > after.String() {
+			organizations = append(organizations, organizationID)
+		}
+		if len(organizations) == 100 {
+			break
+		}
 	}
-	if after != uuid.Nil && allowedOrganizationID.String() <= after.String() {
-		return nil, nil
-	}
-	return []uuid.UUID{allowedOrganizationID}, nil
+	return organizations, nil
 }
 
 func (a *App) revalidateMetaInstagramOrganization(

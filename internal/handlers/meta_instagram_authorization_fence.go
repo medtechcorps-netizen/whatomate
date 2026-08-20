@@ -89,7 +89,7 @@ func (a *App) metaInstagramOAuthGenerationFence(
 	authorizationStartedAt, credentialCreatedAt time.Time,
 	metadata models.JSONB,
 ) error {
-	if a == nil || a.DB == nil || a.tenantOrgID != organizationID ||
+	if a == nil || a.DB == nil || a.Config == nil || a.tenantOrgID != organizationID ||
 		organizationID == uuid.Nil || !validCanonicalMetaID(appID) ||
 		!validCanonicalMetaID(profileID) || authorizationStartedAt.IsZero() ||
 		authorizationStartedAt.After(time.Now().UTC().Add(time.Minute)) {
@@ -131,15 +131,48 @@ func (a *App) metaInstagramOAuthGenerationFence(
 		return err
 	}
 
-	var deletion models.MetaInstagramDataDeletionEvent
-	err = a.DB.Select("digest").Where(
-		"organization_id = ? AND platform_app_id = ? AND authorizing_user_id = ? AND issued_at >= ?",
-		organizationID, appID, profileID, startedSecond,
-	).Order("issued_at DESC").Take(&deletion).Error
-	if err == nil {
-		return errMetaInstagramAuthorizationSuperseded
+	journalOrganizations, err := a.metaInstagramDeletionJournalOrganizations()
+	if err != nil {
+		return err
 	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
+	complianceText := a.Config.MetaInstagram.DataDeletionComplianceOrganization()
+	for _, journalOrganizationID := range journalOrganizations {
+		if err := a.setMetaInstagramTenantContextTx(a.DB, journalOrganizationID); err != nil {
+			return err
+		}
+		journalAppID := appID
+		journalSubjectID := profileID
+		identityHashed := false
+		if journalOrganizationID.String() == complianceText {
+			journalAppID, err = metaInstagramComplianceIdentityHash(
+				a.Config.MetaInstagram.AppSecret, "app", appID,
+			)
+			if err != nil {
+				return err
+			}
+			journalSubjectID, err = metaInstagramComplianceIdentityHash(
+				a.Config.MetaInstagram.AppSecret, "subject", profileID,
+			)
+			if err != nil {
+				return err
+			}
+			identityHashed = true
+		}
+		var deletion models.MetaInstagramDataDeletionEvent
+		err = a.DB.Select("digest").Where(
+			"organization_id = ? AND platform_app_id = ? AND authorizing_user_id = ? AND identity_hashed = ? AND issued_at >= ?",
+			journalOrganizationID, journalAppID, journalSubjectID, identityHashed, startedSecond,
+		).Order("issued_at DESC").Take(&deletion).Error
+		if err == nil {
+			_ = a.setMetaInstagramTenantContextTx(a.DB, organizationID)
+			return errMetaInstagramAuthorizationSuperseded
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			_ = a.setMetaInstagramTenantContextTx(a.DB, organizationID)
+			return err
+		}
+	}
+	if err := a.setMetaInstagramTenantContextTx(a.DB, organizationID); err != nil {
 		return err
 	}
 	return nil

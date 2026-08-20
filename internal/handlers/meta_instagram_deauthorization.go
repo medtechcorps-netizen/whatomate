@@ -2,7 +2,10 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -56,14 +59,8 @@ func (a *App) DeauthorizeMetaInstagram(r *fastglue.Request) error {
 	if allowed, err := a.requireMetaDeauthorizationRateLimit(r, digest); !allowed {
 		return err
 	}
-	allowedOrganizationID, parseErr := uuid.Parse(
-		strings.TrimSpace(a.Config.MetaInstagram.AllowedOrganizationID),
-	)
-	if parseErr != nil || allowedOrganizationID == uuid.Nil {
-		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Deauthorization is temporarily unavailable", nil, "")
-	}
-	journal, err := a.loadOrCreateMetaInstagramDeauthorizationEvent(
-		allowedOrganizationID, digest, a.Config.MetaInstagram.AppID, payload, now,
+	journal, targets, err := a.loadOrCreateMetaInstagramDeauthorizationEvent(
+		digest, a.Config.MetaInstagram.AppID, payload, now,
 	)
 	if err != nil {
 		if errors.Is(err, errMetaDeauthorizationEventStale) {
@@ -90,17 +87,11 @@ func (a *App) DeauthorizeMetaInstagram(r *fastglue.Request) error {
 			_ = a.releaseMetaMessengerDeauthorization(context.Background(), claim)
 		}
 	}()
-	targets, err := a.resolveMetaInstagramCallbackTargets(
-		allowedOrganizationID, a.Config.MetaInstagram.AppID, payload.UserID,
-	)
-	if err != nil {
-		a.Log.Warn("Instagram deauthorization target lookup failed")
-		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Deauthorization is temporarily unavailable", nil, "")
-	}
 	if len(targets) == 0 {
-		// Fail closed: a foreign duplicate cannot poison the exact pilot target,
-		// but a foreign-only callback remains unacknowledged and unmutated.
-		a.Log.Warn("Instagram deauthorization identity did not match the managed pilot account")
+		// A verified no-target journal still fences a later same-generation OAuth
+		// callback, but remains publicly unacknowledged until an exact managed
+		// target can be processed.
+		a.Log.Warn("Instagram deauthorization identity did not match a managed account")
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Deauthorization is temporarily unavailable", nil, "")
 	}
 	eventIssuedAt := time.Unix(payload.IssuedAt, 0).UTC()
@@ -132,47 +123,70 @@ func (a *App) DeauthorizeMetaInstagram(r *fastglue.Request) error {
 }
 
 func (a *App) loadOrCreateMetaInstagramDeauthorizationEvent(
-	organizationID uuid.UUID,
 	digest, appID string,
 	payload metaMessengerSignedRequestPayload,
 	now time.Time,
-) (models.MetaDeauthorizationEvent, error) {
+) (models.MetaDeauthorizationEvent, []metaDeauthorizationTarget, error) {
 	var event models.MetaDeauthorizationEvent
-	if a == nil || a.DB == nil || organizationID == uuid.Nil {
-		return event, errMetaDeauthorizationEventStale
+	var targets []metaDeauthorizationTarget
+	if a == nil || a.DB == nil || a.Config == nil {
+		return event, nil, errMetaDeauthorizationEventStale
 	}
-	err := database.WithTenantReadCommitted(
-		a.rootApp().DB, organizationID, func(tx *gorm.DB) error {
-			// The durable Instagram deauthorization write participates in the
-			// same organization mutex as OAuth provision/rotation. Messenger keeps
-			// its existing global journal path unchanged.
-			if lockErr := lockChannelAIOrganizationScopeTx(tx, organizationID); lockErr != nil {
-				return lockErr
+	err := a.rootApp().DB.Transaction(func(tx *gorm.DB) error {
+		if lockErr := lockMetaInstagramIdentityScopeTx(tx, appID, payload.UserID); lockErr != nil {
+			return lockErr
+		}
+		var resolveErr error
+		targets, resolveErr = a.resolveMetaInstagramCallbackTargetsTx(
+			tx, appID, payload.UserID,
+		)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		organizationIDs := make([]uuid.UUID, 0, len(targets))
+		seen := make(map[uuid.UUID]struct{}, len(targets))
+		for _, target := range targets {
+			if _, exists := seen[target.OrganizationID]; exists {
+				continue
 			}
-			var journalErr error
-			event, journalErr = loadOrCreateMetaDeauthorizationEventDB(
-				tx, digest, appID, payload, now,
-			)
-			if journalErr != nil {
-				return journalErr
+			seen[target.OrganizationID] = struct{}{}
+			organizationIDs = append(organizationIDs, target.OrganizationID)
+		}
+		sort.Slice(organizationIDs, func(left, right int) bool {
+			return organizationIDs[left].String() < organizationIDs[right].String()
+		})
+		for _, organizationID := range organizationIDs {
+			if err := a.setMetaInstagramTenantContextTx(tx, organizationID); err != nil {
+				return err
 			}
-			targets, resolveErr := resolveMetaInstagramCallbackTargetsTx(
-				tx, organizationID, appID, payload.UserID,
-			)
-			if resolveErr != nil {
-				return resolveErr
+			if err := lockChannelAIOrganizationScopeTx(tx, organizationID); err != nil {
+				return err
 			}
-			if len(targets) == 0 {
-				return nil
+		}
+
+		var journalErr error
+		event, journalErr = loadOrCreateMetaDeauthorizationEventDB(
+			tx, digest, appID, payload, now,
+		)
+		if journalErr != nil {
+			return journalErr
+		}
+		for _, target := range targets {
+			if err := a.setMetaInstagramTenantContextTx(tx, target.OrganizationID); err != nil {
+				return err
 			}
-			return a.rootApp().scopedApp(tx, organizationID).
+			fenceErr := a.rootApp().scopedApp(tx, target.OrganizationID).
 				fenceMetaInstagramDeauthorizationJournalTarget(
-					targets[0], appID, payload.UserID, digest,
+					target, appID, payload.UserID, digest,
 					time.Unix(payload.IssuedAt, 0).UTC(), now,
 				)
-		},
-	)
-	return event, err
+			if fenceErr != nil && !errors.Is(fenceErr, metaregistry.ErrNotFound) {
+				return fenceErr
+			}
+		}
+		return nil
+	})
+	return event, targets, err
 }
 
 // fenceMetaInstagramDeauthorizationJournalTarget runs in the same tenant
@@ -304,44 +318,118 @@ func (a *App) fenceMetaInstagramDeauthorizationJournalTarget(
 	)
 }
 
-// resolveMetaInstagramCallbackTargets scopes public Instagram callback lookup
-// inside the configured pilot tenant before cardinality is evaluated. Foreign
-// rows therefore cannot poison deauthorization or data-deletion callbacks by
-// exhausting the global pager. Messenger keeps its existing global resolver.
+func lockMetaInstagramIdentityScopeTx(tx *gorm.DB, appID, oauthSubjectID string) error {
+	return lockMetaInstagramProviderIdentityScopeTx(
+		tx, "oauth-subject", appID, oauthSubjectID,
+	)
+}
+
+func lockMetaInstagramProfessionalScopeTx(
+	tx *gorm.DB,
+	appID, professionalAccountID string,
+) error {
+	return lockMetaInstagramProviderIdentityScopeTx(
+		tx, "professional-account", appID, professionalAccountID,
+	)
+}
+
+func lockMetaInstagramProviderIdentityScopeTx(
+	tx *gorm.DB,
+	domain, appID, providerID string,
+) error {
+	if tx == nil || !validCanonicalMetaID(strings.TrimSpace(appID)) ||
+		!validCanonicalMetaID(strings.TrimSpace(providerID)) ||
+		(domain != "oauth-subject" && domain != "professional-account") {
+		return metaregistry.ErrInvalidRequest
+	}
+	digest := sha256.Sum256([]byte(
+		"managed-instagram-identity-v2\x00" + domain + "\x00" +
+			strings.TrimSpace(appID) + "\x00" + strings.TrimSpace(providerID),
+	))
+	return tx.Exec(
+		"SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+		hex.EncodeToString(digest[:]),
+	).Error
+}
+
+func (a *App) setMetaInstagramTenantContextTx(tx *gorm.DB, organizationID uuid.UUID) error {
+	if tx == nil || organizationID == uuid.Nil {
+		return database.ErrMissingTenant
+	}
+	if a != nil && a.rlsEnabled() {
+		return database.SetTenantContext(tx, organizationID)
+	}
+	return nil
+}
+
+// resolveMetaInstagramCallbackTargets searches only the bounded configured
+// managed-organization set. Every lookup enters the candidate tenant's normal
+// RLS context; Instagram adds no cross-tenant SECURITY DEFINER resolver.
 func (a *App) resolveMetaInstagramCallbackTargets(
-	allowedOrganizationID uuid.UUID,
 	appID, profileID string,
 ) ([]metaDeauthorizationTarget, error) {
-	if allowedOrganizationID == uuid.Nil || !validCanonicalMetaID(appID) ||
+	if a == nil || a.Config == nil || !validCanonicalMetaID(appID) ||
 		!validCanonicalMetaID(profileID) {
 		return nil, errors.New("instagram deauthorization target identity is invalid")
 	}
-	targets := make([]metaDeauthorizationTarget, 0, 1)
-	err := database.WithTenantReadCommitted(
-		a.rootApp().DB, allowedOrganizationID,
-		func(tx *gorm.DB) error {
-			var resolveErr error
-			targets, resolveErr = resolveMetaInstagramCallbackTargetsTx(
-				tx, allowedOrganizationID, appID, profileID,
-			)
-			return resolveErr
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	if len(targets) > 1 {
-		return nil, errors.New("instagram deauthorization target is ambiguous")
+	targets := make([]metaDeauthorizationTarget, 0)
+	for _, organizationText := range a.Config.MetaInstagram.ManagedOrganizationIDs() {
+		organizationID, err := uuid.Parse(organizationText)
+		if err != nil || organizationID == uuid.Nil || organizationID.String() != organizationText {
+			return nil, errors.New("instagram callback tenant is invalid")
+		}
+		var tenantTargets []metaDeauthorizationTarget
+		err = database.WithTenantReadCommitted(
+			a.rootApp().DB, organizationID, func(tx *gorm.DB) error {
+				var resolveErr error
+				tenantTargets, resolveErr = resolveMetaInstagramCallbackTargetsForOrganizationTx(
+					tx, organizationID, appID, profileID,
+				)
+				return resolveErr
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, tenantTargets...)
 	}
 	return targets, nil
 }
 
-func resolveMetaInstagramCallbackTargetsTx(
+func (a *App) resolveMetaInstagramCallbackTargetsTx(
 	tx *gorm.DB,
-	allowedOrganizationID uuid.UUID,
 	appID, profileID string,
 ) ([]metaDeauthorizationTarget, error) {
-	if tx == nil || allowedOrganizationID == uuid.Nil || !validCanonicalMetaID(appID) ||
+	if a == nil || a.Config == nil || tx == nil || !validCanonicalMetaID(appID) ||
+		!validCanonicalMetaID(profileID) {
+		return nil, errors.New("instagram callback target identity is invalid")
+	}
+	targets := make([]metaDeauthorizationTarget, 0)
+	for _, organizationText := range a.Config.MetaInstagram.ManagedOrganizationIDs() {
+		organizationID, err := uuid.Parse(organizationText)
+		if err != nil || organizationID == uuid.Nil || organizationID.String() != organizationText {
+			return nil, errors.New("instagram callback tenant is invalid")
+		}
+		if err := a.setMetaInstagramTenantContextTx(tx, organizationID); err != nil {
+			return nil, err
+		}
+		tenantTargets, err := resolveMetaInstagramCallbackTargetsForOrganizationTx(
+			tx, organizationID, appID, profileID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, tenantTargets...)
+	}
+	return targets, nil
+}
+
+func resolveMetaInstagramCallbackTargetsForOrganizationTx(
+	tx *gorm.DB,
+	organizationID uuid.UUID,
+	appID, profileID string,
+) ([]metaDeauthorizationTarget, error) {
+	if tx == nil || organizationID == uuid.Nil || !validCanonicalMetaID(appID) ||
 		!validCanonicalMetaID(profileID) {
 		return nil, errors.New("instagram callback target identity is invalid")
 	}
@@ -350,7 +438,7 @@ func resolveMetaInstagramCallbackTargetsTx(
 		Select("organization_id, id AS account_id").
 		Where(
 			"organization_id = ? AND channel = ? AND provider = ? AND status IN ? AND config ->> 'meta_registry_managed' = 'true' AND config ->> 'meta_management_mode' = ? AND config ->> 'instagram_api_mode' = 'instagram_login' AND metadata ->> 'meta_platform_app_id' = ? AND metadata ->> 'meta_webhook_app' = 'instagram_login' AND metadata ->> 'meta_authorizing_user_id' = ? AND metadata ->> 'meta_oauth_subject_id' = ? AND metadata ->> 'meta_authority_asset_id' = external_account_id",
-			allowedOrganizationID, models.ChannelInstagram, channelapi.RelayProvider,
+			organizationID, models.ChannelInstagram, channelapi.RelayProvider,
 			[]models.ChannelAccountStatus{
 				models.ChannelAccountStatusPending,
 				models.ChannelAccountStatusActive,
@@ -361,9 +449,6 @@ func resolveMetaInstagramCallbackTargetsTx(
 		).
 		Order("id").Limit(2).Scan(&targets).Error; err != nil {
 		return nil, err
-	}
-	if len(targets) > 1 {
-		return nil, errors.New("instagram callback target is ambiguous")
 	}
 	return targets, nil
 }

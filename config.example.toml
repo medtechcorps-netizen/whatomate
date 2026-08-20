@@ -238,7 +238,9 @@ configuration_generation = 0
 # webhook route, app secret, and verify token from the legacy/static Instagram
 # relay configuration. Enable only after the relay reader understands managed
 # Instagram registry leases and the app review status is exactly `approved`.
-# The pilot is deliberately limited to one canonical workspace UUID.
+# Active and quarantined workspace UUIDs are deployment-owned, canonical,
+# disjoint, and bounded. Multi-workspace mode also requires one separate
+# platform compliance organization for no-target/ambiguous deletion receipts.
 [meta_instagram_onboarding]
 enabled = false
 quarantine_only = false # Emergency server-owned kill switch; keeps teardown/callback lifecycle running.
@@ -255,7 +257,10 @@ health_approval_max_age_mins = 15
 revalidation_lead_mins = 60
 token_refresh_lead_hours = 168
 scheduler_interval_seconds = 60
-allowed_organization_id = "" # Exactly one canonical UUID; never an organization name.
+allowed_organization_id = "" # Deprecated singleton rollout key. Keep only until every reader understands the plural fields.
+allowed_organization_ids = "" # Comma-separated active canonical clinic UUIDs; maximum 32 across active + quarantined.
+quarantined_organization_ids = "" # Offboarded/kill-switched clinic UUIDs retained for teardown, callbacks, and privacy status only.
+data_deletion_compliance_organization_id = "" # Required with plural/quarantine fields; one distinct platform-owned compliance org, never a clinic.
 development_test_profile_id = "" # Nonproduction only; exact IG professional profile ID.
 development_test_oauth_subject_id = "" # Nonproduction only; exact app-scoped OAuth subject returned as /me.id.
 development_app_role = "" # Nonproduction only: administrator, developer, or tester.

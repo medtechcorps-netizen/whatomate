@@ -13,8 +13,6 @@ import (
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
-	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 var errMetaInstagramProfileAlreadyRegistered = errors.New(
@@ -113,6 +111,16 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 		return metaRegistryProvisionResult{}, metaregistry.ErrInvalidRequest
 	}
 	if input.Channel == models.ChannelInstagram {
+		if err := lockMetaInstagramIdentityScopeTx(
+			a.DB, input.PlatformAppID, input.AuthorizingMetaUserID,
+		); err != nil {
+			return metaRegistryProvisionResult{}, err
+		}
+		if err := lockMetaInstagramProfessionalScopeTx(
+			a.DB, input.PlatformAppID, input.ExternalAccountID,
+		); err != nil {
+			return metaRegistryProvisionResult{}, err
+		}
 		// The organization row is the gap-lock surrogate for a profile that does
 		// not exist yet. It serializes two valid OAuth callbacks before either can
 		// create an account and also protects the exact static/managed collision
@@ -130,16 +138,9 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 		); err != nil {
 			return metaRegistryProvisionResult{}, err
 		}
-		var conflict models.ChannelAccount
-		err := a.DB.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").Where(
-			"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
-			input.OrganizationID, models.ChannelInstagram,
-			channelapi.RelayProvider, input.ExternalAccountID,
-		).Take(&conflict).Error
-		switch {
-		case err == nil:
-			return metaRegistryProvisionResult{}, errMetaInstagramProfileAlreadyRegistered
-		case !errors.Is(err, gorm.ErrRecordNotFound):
+		if err := a.ensureMetaInstagramProfileAvailableTx(
+			input.OrganizationID, uuid.Nil, input.ExternalAccountID,
+		); err != nil {
 			return metaRegistryProvisionResult{}, err
 		}
 	}
@@ -308,6 +309,41 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 		WebhookCredentialID: webhook.ID, WebhookVersion: webhook.Version,
 		SubscriptionOperation: operation,
 	}, nil
+}
+
+func (a *App) ensureMetaInstagramProfileAvailableTx(
+	requestOrganizationID, permittedAccountID uuid.UUID,
+	professionalAccountID string,
+) error {
+	if a == nil || a.DB == nil || a.Config == nil ||
+		requestOrganizationID == uuid.Nil ||
+		!validCanonicalMetaID(strings.TrimSpace(professionalAccountID)) {
+		return metaregistry.ErrInvalidRequest
+	}
+	for _, organizationText := range a.Config.MetaInstagram.ManagedOrganizationIDs() {
+		organizationID, err := uuid.Parse(organizationText)
+		if err != nil || organizationID == uuid.Nil || organizationID.String() != organizationText {
+			return metaregistry.ErrInvalidRequest
+		}
+		if err := a.setMetaInstagramTenantContextTx(a.DB, organizationID); err != nil {
+			return err
+		}
+		var accountIDs []uuid.UUID
+		if err := a.DB.Model(&models.ChannelAccount{}).Where(
+			"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+			organizationID, models.ChannelInstagram,
+			channelapi.RelayProvider, strings.TrimSpace(professionalAccountID),
+		).Order("id").Limit(2).Pluck("id", &accountIDs).Error; err != nil {
+			return err
+		}
+		for _, accountID := range accountIDs {
+			if permittedAccountID == uuid.Nil || accountID != permittedAccountID ||
+				organizationID != requestOrganizationID {
+				return errMetaInstagramProfileAlreadyRegistered
+			}
+		}
+	}
+	return a.setMetaInstagramTenantContextTx(a.DB, requestOrganizationID)
 }
 
 func metaRegistryJoinURL(base string, path ...string) (string, error) {

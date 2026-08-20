@@ -249,8 +249,8 @@ license and tenant-specific authorization gates.
 | Channel | Tenant record required | External/runtime requirement |
 | --- | --- | --- |
 | WhatsApp | Active WhatsApp account and its `meta_legacy` inbox mirror | WABA ownership, access token and webhook subscription |
-| Instagram | Tested `instagram` + `relay` channel account | Matching Meta relay mapping, Instagram account ID, token and HMAC secrets |
-| Messenger | Tested `messenger` + `relay` channel account | Matching Meta relay mapping, Page ID, page token and HMAC secrets |
+| Instagram | Active managed `instagram` + `relay` account created by Instagram Login | Dedicated managed Instagram app, encrypted dynamic registry binding, exact subscription/health/approval evidence; static mapping only for explicit off-pilot legacy accounts |
+| Messenger | Active managed `messenger` + `relay` account created by Facebook Login for Business | Dedicated managed Messenger app, encrypted dynamic registry binding, exact Page/subscription/health/approval evidence; static mapping only for explicit legacy accounts |
 | Threads | Active `threads` channel account created by workspace OAuth | Dedicated Threads app, entitlement, reviewed scopes and workspace authorization |
 | Email/web chat | Tested signed-relay channel account | Matching mailbox/site relay and HMAC secrets |
 
@@ -271,9 +271,10 @@ Before go-live for every future organization:
    require `threads.public_engagement.enabled` before starting OAuth.
 2. Record which channels the organization intends to use; do not infer them
    from another tenant. Save them under **Launchpad → Workspace profile**.
-3. Complete the tenant row and the external/runtime registration for each
-   intended channel. For Instagram and Messenger, both sides must use the same
-   channel and external account ID.
+3. Complete the tenant row and external/runtime registration for each intended
+   channel. Managed Instagram and Messenger must use their dedicated OAuth
+   flows and encrypted registry; prove the exact Page/profile ID is absent from
+   every legacy static relay mapping before onboarding.
 4. Run the account health test and require an active connection for every
    intended channel. Launchpad and support health remain incomplete while any
    declared channel is missing, degraded, or untested.
@@ -289,11 +290,12 @@ WhatsApp account is active and every other declared channel is active,
 outbound-approved, free of a recorded error, and has a health-check timestamp.
 Go-live approval cannot bypass either inferred step.
 
-The environment-only Meta relay registry still requires an operator change for
-each Instagram or Messenger account. Until that registry is replaced by an
-encrypted dynamic tenant registry, update the relay mapping and secret
-references in the same controlled change as the pending ReReply connection,
-deploy, run Test, and only then approve outbound delivery.
+Managed Instagram and Messenger use the encrypted dynamic tenant registry;
+clinics never place their provider tokens or HMAC secrets in deployment
+environment mappings. `META_RELAY_ACCOUNTS_JSON` is legacy/off-pilot fallback
+only. A static entry for the same Page/profile shadows dynamic resolution, so
+drain its legacy work, remove it from every replica, verify absence, and only
+then begin managed OAuth. Threads remains on its dedicated/BYO OAuth lifecycle.
 
 Legacy Meta WhatsApp is mirrored into the normalized inbox without changing its
 delivery path. The migration creates a credential-free `meta_legacy` shadow
@@ -322,10 +324,12 @@ verified webhook for a tenant without a durable omnichannel entitlement is
 accepted without domain dispatch, and its raw headers and payload are
 discarded after an audit marker is recorded.
 
-For every signed-relay account (Instagram, Messenger, email, or web chat), use
-the checklist below. Legacy WhatsApp uses its established account flow and
-Threads uses the dedicated OAuth lifecycle in the next section; do not create
-either one as a generic relay account.
+For every legacy/off-pilot signed-relay account (including static Instagram or
+Messenger) and every email or web-chat adapter, use the checklist below.
+Managed Instagram and Messenger use their server-owned OAuth control planes;
+legacy WhatsApp uses its established account flow, and Threads uses the
+dedicated/BYO OAuth lifecycle in the next section. Do not create any managed
+identity as a generic relay account.
 
 1. Implement and verify the
    [ReReply signed-relay contract v1](./relay-integration-v1.md), including its
