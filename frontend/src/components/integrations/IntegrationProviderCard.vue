@@ -58,6 +58,7 @@ const statusCopy: Record<
 > = {
   connected: { label: "Connected", icon: CheckCircle2 },
   configured: { label: "Ready to connect", icon: CircleDashed },
+  pending: { label: "Pending activation", icon: Clock3 },
   degraded: { label: "Needs attention", icon: ShieldAlert },
   approval_required: { label: "Approval required", icon: ShieldAlert },
   adapter_unavailable: { label: "Adapter pending", icon: ShieldAlert },
@@ -70,6 +71,7 @@ const status = computed(
 );
 const statusVariant = computed(() => {
   if (props.integration.status === "connected") return "success";
+  if (props.integration.status === "pending") return "info";
   if (props.integration.status === "degraded") return "destructive";
   if (
     props.integration.status === "approval_required" ||

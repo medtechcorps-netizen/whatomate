@@ -25,6 +25,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/middleware"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/storage"
+	"github.com/shridarpatil/whatomate/internal/threadsplatform"
 	"github.com/shridarpatil/whatomate/internal/tts"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/shridarpatil/whatomate/internal/worker"
@@ -358,6 +359,26 @@ func runServer(args []string) {
 		lo.Info("Managed Instagram quarantine startup barrier committed")
 	}
 
+	var threadsManagedRuntime *threadsplatform.ValidatedRuntime
+	if cfg.ThreadsManaged.Enabled {
+		runtime, runtimeErr := threadsplatform.NewRuntime(
+			cfg.ThreadsManaged,
+			cfg.ThreadsAppReview,
+			cfg.App.Environment,
+		)
+		if runtimeErr != nil {
+			lo.Fatal("Managed Threads runtime validation failed", "error", runtimeErr)
+		}
+		threadsManagedRuntime, runtimeErr = runtime.ValidateComplianceOrganization(
+			context.Background(),
+			db,
+		)
+		if runtimeErr != nil {
+			lo.Fatal("Managed Threads compliance organization validation failed", "error", runtimeErr)
+		}
+		lo.Info("Managed Threads durable deployment policy validated")
+	}
+
 	// Connect to Redis
 	rdb, err := database.NewRedis(&cfg.Redis)
 	if err != nil {
@@ -393,14 +414,15 @@ func runServer(args []string) {
 	}
 
 	app := &handlers.App{
-		Config:     cfg,
-		DB:         db,
-		Redis:      rdb,
-		Log:        lo,
-		WhatsApp:   waClient,
-		WSHub:      wsHub,
-		Queue:      jobQueue,
-		HTTPClient: httpClient,
+		Config:                cfg,
+		DB:                    db,
+		Redis:                 rdb,
+		Log:                   lo,
+		WhatsApp:              waClient,
+		WSHub:                 wsHub,
+		Queue:                 jobQueue,
+		HTTPClient:            httpClient,
+		ThreadsManagedRuntime: threadsManagedRuntime,
 	}
 
 	// Initialize the S3-compatible client when durable media storage or call
@@ -856,6 +878,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// only in a one-time Redis state and are re-authorized by the handler.
 	g.GET("/api/integrations/google_search_console/callback", app.CallbackGoogleSearchConsole)
 	g.GET("/api/integrations/threads/callback", app.CallbackThreads)
+	g.GET("/api/integrations/threads/managed/callback", app.CallbackManagedThreads)
 	g.POST(
 		"/api/integrations/threads/{target_organization_id}/deauthorize",
 		app.DeauthorizeThreads,
@@ -914,7 +937,8 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 			return r
 		}
 		if path == "/api/integrations/google_search_console/callback" ||
-			path == "/api/integrations/threads/callback" {
+			path == "/api/integrations/threads/callback" ||
+			path == "/api/integrations/threads/managed/callback" {
 			return r
 		}
 		if isPublicThreadsLifecyclePath(path) {
@@ -1118,6 +1142,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.PUT("/api/integrations/{provider}", tenant((*handlers.App).UpdateIntegration))
 	g.DELETE("/api/integrations/{provider}/credentials", tenant((*handlers.App).DeleteIntegrationCredentials))
 	g.POST("/api/integrations/{provider}/connect", tenant((*handlers.App).ConnectIntegration))
+	g.POST("/api/integrations/threads/managed/onboarding/start", app.StartManagedThreadsOAuth)
 	g.POST("/api/integrations/{provider}/test", app.TestIntegration)
 	g.GET("/api/integrations/google_search_console/properties", tenant((*handlers.App).ListGoogleSearchConsoleProperties))
 	g.PUT("/api/integrations/google_search_console/properties", tenant((*handlers.App).UpdateGoogleSearchConsoleProperties))

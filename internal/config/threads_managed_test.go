@@ -21,6 +21,7 @@ const (
 func approvedManagedThreadsConfig() config.ThreadsManagedConfig {
 	return config.ThreadsManagedConfig{
 		Enabled:                  true,
+		ReReplyBaseURL:           "https://threads.test.example",
 		AllowedOrganizationIDs:   managedClinicOrganizationID,
 		ComplianceOrganizationID: managedComplianceOrganizationID,
 		PlatformApps: []config.ThreadsPlatformAppConfig{
@@ -54,6 +55,7 @@ enabled = true
 allowed_organization_ids = %q
 allow_all_organizations = false
 compliance_organization_id = %q
+rereply_base_url = "https://threads.test.example"
 
 [[threads_managed.platform_apps]]
 platform_app_key = "primary"
@@ -83,6 +85,7 @@ func TestLoad_ManagedThreadsPlatformAppIsEnvironmentOnlyCompatible(t *testing.T)
 	t.Setenv("WHATOMATE_THREADS_MANAGED__ENABLED", "true")
 	t.Setenv("WHATOMATE_THREADS_MANAGED__ALLOWED_ORGANIZATION_IDS", managedClinicOrganizationID)
 	t.Setenv("WHATOMATE_THREADS_MANAGED__COMPLIANCE_ORGANIZATION_ID", managedComplianceOrganizationID)
+	t.Setenv("WHATOMATE_THREADS_MANAGED__REREPLY_BASE_URL", "https://threads.test.example")
 	t.Setenv("WHATOMATE_THREADS_MANAGED__PLATFORM_APP__PLATFORM_APP_KEY", "primary")
 	t.Setenv("WHATOMATE_THREADS_MANAGED__PLATFORM_APP__APP_ID", "123456789012345")
 	t.Setenv("WHATOMATE_THREADS_MANAGED__PLATFORM_APP__APP_SECRET", managedAppSecret)
@@ -189,6 +192,9 @@ func TestManagedThreadsConfigRejectsPartialOrUnsafeReleasePolicy(t *testing.T) {
 			candidate := valid
 			candidate.PlatformApps = append([]config.ThreadsPlatformAppConfig(nil), valid.PlatformApps...)
 			testCase.mutate(&candidate)
+			if testCase.env == "production" {
+				candidate.ReReplyBaseURL = "https://app.rereply.app"
+			}
 			err := config.ValidateThreadsManagedConfig(candidate, config.ThreadsAppReviewConfig{}, testCase.env)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), testCase.message)
@@ -215,6 +221,48 @@ func TestManagedThreadsNonProductionReviewGateIsExact(t *testing.T) {
 	err := config.ValidateThreadsManagedConfig(managed, development, "staging")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exact nonproduction app-role")
+}
+
+func TestManagedThreadsBaseURLIsDeploymentOwnedCanonicalOrigin(t *testing.T) {
+	valid := approvedManagedThreadsConfig()
+	for _, candidate := range []string{
+		"http://threads.test.example",
+		" https://threads.test.example",
+		"https://threads.test.example ",
+		"https://user@threads.test.example",
+		"https://threads.test.example/callback",
+		"https://threads.test.example?tenant=clinic",
+		"https://threads.test.example#fragment",
+		"https://threads.test.example/",
+	} {
+		t.Run(candidate, func(t *testing.T) {
+			managed := valid
+			managed.ReReplyBaseURL = candidate
+			err := config.ValidateThreadsManagedConfig(
+				managed,
+				config.ThreadsAppReviewConfig{},
+				"staging",
+			)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "canonical HTTPS origin")
+		})
+	}
+
+	production := valid
+	production.ReReplyBaseURL = "https://app.rereply.app"
+	require.NoError(t, config.ValidateThreadsManagedConfig(
+		production,
+		config.ThreadsAppReviewConfig{},
+		"production",
+	))
+	production.ReReplyBaseURL = "https://other.rereply.app"
+	err := config.ValidateThreadsManagedConfig(
+		production,
+		config.ThreadsAppReviewConfig{},
+		"production",
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "canonical HTTPS origin")
 }
 
 func TestManagedThreadsDeploymentSecretsAreExcludedFromJSON(t *testing.T) {

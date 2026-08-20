@@ -296,6 +296,7 @@ async function installIntegrationMocks(
     supportStatusOrganizationId?: string;
     threadsReviewStatus?: "not_submitted" | "pending" | "approved" | "rejected";
     threadsDevelopmentTesting?: boolean;
+    managedThreads?: boolean;
     failSupportStatusRefreshAfterGrant?: boolean;
     failSupportStatusRefreshAfterRevoke?: boolean;
     revokeConflict?: boolean;
@@ -353,6 +354,30 @@ async function installIntegrationMocks(
       ? "Non-production Threads App Review testing is restricted to the deployment-allowlisted app-role profile."
       : "Meta App Review approval is required before Threads can be enabled or authorized.";
   }
+  if (options.managedThreads) {
+    const threads = integrations.find((item) => item.provider === "threads")!;
+    threads.status = "pending";
+    threads.enabled = false;
+    threads.configured = true;
+    threads.config = {
+      management_mode: "platform_managed",
+      authorization_state: "pending_activation",
+      reconnect_available: true,
+      routing_enabled: false,
+      outbound_enabled: false,
+      activation_available: false,
+    };
+    threads.credentials = {};
+    threads.connection = connection(1, 0);
+    threads.oauth = {
+      supported: true,
+      available: true,
+      mode: "managed_oauth",
+    };
+    threads.test_supported = false;
+    threads.message =
+      "Authorization is stored and pending platform activation. Inbound routing, outbound replies, and webhooks remain disabled.";
+  }
   const traffic = {
     listReads: 0,
     entitlementReads: 0,
@@ -377,6 +402,7 @@ async function installIntegrationMocks(
     threadsUpdates: [] as Array<Record<string, unknown>>,
     threadsEnabledAfterUpdates: [] as boolean[],
     threadsConnects: 0,
+    managedThreadsConnects: 0,
     qwenUpdates: [] as Array<Record<string, unknown>>,
     credentialClears: [] as string[],
     googlePropertyUpdates: [] as string[][],
@@ -617,6 +643,24 @@ async function installIntegrationMocks(
     await route.fulfill({ json: { data: meta } });
   });
   await page.route(
+    /\/api\/integrations\/threads\/managed\/onboarding\/start(?:\?.*)?$/,
+    async (route) => {
+      traffic.managedThreadsConnects += 1;
+      await route.fulfill({
+        json: {
+          data: {
+            provider: "threads",
+            ready: true,
+            reconnect: true,
+            mode: "managed_oauth",
+            authorization_url:
+              "/mock-managed-threads-oauth?state=server-issued",
+          },
+        },
+      });
+    },
+  );
+  await page.route(
     /\/api\/integrations\/threads\/connect(?:\?.*)?$/,
     async (route) => {
       traffic.threadsConnects += 1;
@@ -654,6 +698,12 @@ async function installIntegrationMocks(
     route.fulfill({
       contentType: "text/html",
       body: "<html><body>Threads authorization</body></html>",
+    }),
+  );
+  await page.route("**/mock-managed-threads-oauth**", (route) =>
+    route.fulfill({
+      contentType: "text/html",
+      body: "<html><body>Managed Threads authorization</body></html>",
     }),
   );
   await page.route(/\/api\/integrations\/qwen(?:\?.*)?$/, async (route) => {
@@ -1073,9 +1123,7 @@ test("platform owner sees plan-only Threads access without a support revocation 
     .getByRole("button", { name: "Configure" })
     .click();
 
-  await expect
-    .poll(() => traffic.threadsSupportStatusRequests.length)
-    .toBe(1);
+  await expect.poll(() => traffic.threadsSupportStatusRequests.length).toBe(1);
   const statusRequest = traffic.threadsSupportStatusRequests[0];
   expect(statusRequest.method).toBe("GET");
   expect(new URL(statusRequest.url).pathname).toBe(
@@ -1545,6 +1593,49 @@ test("Threads exposes the exact stored callback and starts live OAuth authorizat
   await expect(page).toHaveURL(/\/mock-threads-oauth\?state=server-issued$/);
 });
 
+test("ReReply-managed Threads exposes only pending clinic-safe controls", async ({
+  page,
+}) => {
+  const traffic = await installIntegrationMocks(page, adminUser, {
+    managedThreads: true,
+  });
+  await page.goto("/settings/integrations");
+
+  const threadsCard = page.getByTestId("integration-card-threads");
+  await expect(threadsCard).toContainText("Pending activation");
+  await threadsCard.getByRole("button", { name: "Configure" }).click();
+
+  const dialog = page.getByTestId("integration-dialog-threads");
+  await expect(page.getByTestId("threads-managed-status")).toContainText(
+    "ReReply-managed Threads connection",
+  );
+  await expect(page.getByTestId("threads-managed-status")).toContainText(
+    "Disabled until activation",
+  );
+  await expect(dialog.locator("#threads-app_id")).toHaveCount(0);
+  await expect(dialog.locator("#threads-app_secret")).toHaveCount(0);
+  await expect(dialog.locator("#threads-webhook_verify_token")).toHaveCount(0);
+  await expect(dialog.locator("#threads-app_review_status")).toHaveCount(0);
+  await expect(page.getByTestId("integration-save-threads")).toHaveCount(0);
+  await expect(page.getByTestId("threads-entitlement-support")).toHaveCount(0);
+  await expect(
+    page.getByTestId(
+      "integration-dialog-readiness-threads-managed_non_routable",
+    ),
+  ).toContainText("Managed");
+
+  const reconnect = page.getByTestId("integration-connect-threads");
+  await expect(reconnect).toHaveText(/Reconnect Threads/);
+  await expect(reconnect).toBeEnabled();
+  await reconnect.click();
+  await expect.poll(() => traffic.managedThreadsConnects).toBe(1);
+  await expect(page).toHaveURL(
+    /\/mock-managed-threads-oauth\?state=server-issued$/,
+  );
+  expect(traffic.threadsUpdates).toHaveLength(0);
+  expect(traffic.threadsConnects).toBe(0);
+});
+
 test("Threads review pending disables activation and OAuth", async ({
   page,
 }) => {
@@ -1567,10 +1658,12 @@ test("Threads review pending disables activation and OAuth", async ({
   await expect(page.getByTestId("integration-connect-threads")).toBeVisible();
   await expect(page.getByTestId("integration-connect-threads")).toBeDisabled();
   await expect(
-    dialog.getByText(
-      "Meta App Review approval is required before Threads can be enabled or authorized.",
-      { exact: true },
-    ).first(),
+    dialog
+      .getByText(
+        "Meta App Review approval is required before Threads can be enabled or authorized.",
+        { exact: true },
+      )
+      .first(),
   ).toBeVisible();
   expect(traffic.threadsConnects).toBe(0);
 });
@@ -1592,10 +1685,12 @@ test("Threads exact non-production review gate enables app-role OAuth without se
   await expect(page.locator("#integration-enabled")).toBeChecked();
   await expect(page.getByTestId("integration-connect-threads")).toBeEnabled();
   await expect(
-    page.getByText(
-      "Non-production Threads App Review testing is restricted to the deployment-allowlisted app-role profile.",
-      { exact: true },
-    ).first(),
+    page
+      .getByText(
+        "Non-production Threads App Review testing is restricted to the deployment-allowlisted app-role profile.",
+        { exact: true },
+      )
+      .first(),
   ).toBeVisible();
 });
 

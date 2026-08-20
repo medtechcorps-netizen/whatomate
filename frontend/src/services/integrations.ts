@@ -12,6 +12,7 @@ export type IntegrationProvider =
 export type IntegrationStatus =
   | "not_configured"
   | "configured"
+  | "pending"
   | "connected"
   | "degraded"
   | "disabled"
@@ -87,6 +88,8 @@ export interface IntegrationConnectResult {
   ready: boolean;
   mode: string;
   authorization_url?: string;
+  reconnect?: boolean;
+  expires_at?: string;
   message?: string;
   public_config?: Record<string, unknown>;
 }
@@ -122,5 +125,9 @@ export const integrationsService = {
   connect: (provider: IntegrationProvider) =>
     api.post<APIEnvelope<IntegrationConnectResult>>(
       `/integrations/${encodeURIComponent(provider)}/connect`,
+    ),
+  connectManagedThreads: () =>
+    api.post<APIEnvelope<IntegrationConnectResult>>(
+      "/integrations/threads/managed/onboarding/start",
     ),
 };

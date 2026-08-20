@@ -92,6 +92,44 @@ describe("integrationReadiness", () => {
     expect(connection?.detail).not.toContain("ReAlign");
   });
 
+  it("shows only safe pending controls for ReReply-managed Threads", () => {
+    const readiness = integrationReadiness(
+      integrationState("threads", {
+        status: "pending",
+        configured: true,
+        config: {
+          management_mode: "platform_managed",
+          authorization_state: "pending_activation",
+          routing_enabled: false,
+          outbound_enabled: false,
+          activation_available: false,
+        },
+        credentials: {},
+        connection: {
+          account_count: 1,
+          active_count: 0,
+          pending_count: 1,
+        },
+        oauth: { supported: true, available: true, mode: "managed_oauth" },
+      }),
+    );
+    const byKey = Object.fromEntries(readiness.map((item) => [item.key, item]));
+
+    expect(byKey.managed_platform_application?.state).toBe("managed");
+    expect(byKey.oauth_authorization?.state).toBe("ready");
+    expect(byKey.pending_activation?.state).toBe("prepared");
+    expect(byKey.managed_non_routable?.detail).toContain("webhooks");
+    expect(readiness.map((item) => item.key)).not.toEqual(
+      expect.arrayContaining([
+        "app_id",
+        "app_secret",
+        "webhook_verify_token",
+        "app_review_status",
+        "redirect_uri",
+      ]),
+    );
+  });
+
   it("blocks a partially healthy channel instead of hiding its error", () => {
     const readiness = integrationReadiness(
       integrationState("meta", {
