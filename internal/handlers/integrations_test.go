@@ -596,6 +596,13 @@ func TestIntegrationCenterThreadsCanBeEnabledForOAuth(t *testing.T) {
 	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	admin := integrationTestUser(t, app, org.ID, "settings.integrations:read", "settings.integrations:write")
+	enableBookingCommerceTestEntitlement(
+		t,
+		app.DB,
+		org.ID,
+		admin.ID,
+		channelapi.ThreadsPublicEngagementEntitlementKey,
+	)
 	request := testutil.NewJSONRequest(t, map[string]any{
 		"enabled": false,
 		"config": map[string]any{
@@ -659,10 +666,228 @@ func TestIntegrationCenterThreadsCanBeEnabledForOAuth(t *testing.T) {
 	assert.NotContains(t, string(testutil.GetResponseBody(request)), "threads-webhook-verify-token")
 }
 
+func TestIntegrationCenterThreadsEnableRequiresEffectiveEntitlementWithoutPartialPersistence(t *testing.T) {
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := integrationTestUser(t, app, org.ID, "settings.integrations:read", "settings.integrations:write")
+	const appID = "1234567890123460"
+	const originalRedirectURI = "https://app.example.test/api/integrations/threads/callback"
+
+	configure := testutil.NewJSONRequest(t, map[string]any{
+		"enabled": false,
+		"config": map[string]any{
+			"app_id":            appID,
+			"redirect_uri":      originalRedirectURI,
+			"app_review_status": "pending",
+		},
+		"credentials": map[string]any{
+			"app_secret":           "threads-original-app-secret",
+			"webhook_verify_token": "threads-original-webhook-token",
+		},
+	})
+	testutil.SetAuthContext(configure, org.ID, admin.ID)
+	testutil.SetPathParam(configure, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(configure))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(configure))
+
+	var before models.ProviderIntegration
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND provider = ?",
+		org.ID,
+		integrationProviderThreads,
+	).First(&before).Error)
+	before.Config = approvedThreadsTestConfig(t, before.Config, appID)
+	require.NoError(t, app.DB.Model(&before).Update("config", before.Config).Error)
+	require.NoError(t, app.DB.First(&before, "id = ?", before.ID).Error)
+	originalAppSecret := stringJSONValue(before.CredentialData, "app_secret")
+	require.True(t, appcrypto.IsEncrypted(originalAppSecret))
+
+	enable := testutil.NewJSONRequest(t, map[string]any{
+		"enabled": true,
+		"config": map[string]any{
+			"redirect_uri": "https://changed.example.test/api/integrations/threads/callback",
+		},
+		"credentials": map[string]any{
+			"app_secret": "threads-replacement-app-secret",
+		},
+	})
+	testutil.SetAuthContext(enable, org.ID, admin.ID)
+	testutil.SetPathParam(enable, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(enable))
+	testutil.AssertErrorResponse(
+		t,
+		enable,
+		fasthttp.StatusPaymentRequired,
+		"Threads public replies are not included",
+	)
+
+	var after models.ProviderIntegration
+	require.NoError(t, app.DB.First(&after, "id = ?", before.ID).Error)
+	assert.False(t, after.Enabled)
+	assert.Equal(t, originalRedirectURI, stringJSONValue(after.Config, "redirect_uri"))
+	assert.Equal(t, originalAppSecret, stringJSONValue(after.CredentialData, "app_secret"))
+	assert.Equal(t, before.UpdatedAt, after.UpdatedAt)
+}
+
+func TestIntegrationCenterThreadsCommittedEntitlementRevocationWinsFinalEnableFence(t *testing.T) {
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := integrationTestUser(t, app, org.ID, "settings.integrations:read", "settings.integrations:write")
+	enableBookingCommerceTestEntitlement(
+		t, app.DB, org.ID, admin.ID,
+		channelapi.ThreadsPublicEngagementEntitlementKey,
+	)
+	const appID = "1234567890123462"
+	configure := testutil.NewJSONRequest(t, map[string]any{
+		"enabled": false,
+		"config": map[string]any{
+			"app_id":            appID,
+			"redirect_uri":      "https://app.example.test/api/integrations/threads/callback",
+			"app_review_status": "pending",
+		},
+		"credentials": map[string]any{
+			"app_secret":           "threads-race-app-secret",
+			"webhook_verify_token": "threads-race-webhook-token",
+		},
+	})
+	testutil.SetAuthContext(configure, org.ID, admin.ID)
+	testutil.SetPathParam(configure, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(configure))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(configure))
+
+	var before models.ProviderIntegration
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND provider = ?", org.ID, integrationProviderThreads,
+	).First(&before).Error)
+	before.Config = approvedThreadsTestConfig(t, before.Config, appID)
+	require.NoError(t, app.DB.Model(&before).Update("config", before.Config).Error)
+	require.NoError(t, app.DB.First(&before, "id = ?", before.ID).Error)
+
+	var subscription models.Subscription
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND status = ?", org.ID, models.SubscriptionStatusActive,
+	).First(&subscription).Error)
+	revokedSnapshot := cloneJSONB(subscription.EntitlementsSnapshot)
+	revokedSnapshot[channelapi.ThreadsPublicEngagementEntitlementKey] = false
+	downgradeTx := app.DB.Begin()
+	require.NoError(t, downgradeTx.Error)
+	committed := false
+	t.Cleanup(func() {
+		if !committed {
+			_ = downgradeTx.Rollback().Error
+		}
+	})
+	require.NoError(t, lockChannelAIOrganizationScopeTx(downgradeTx, org.ID))
+	require.NoError(t, downgradeTx.Model(&models.Subscription{}).Where(
+		"id = ? AND organization_id = ?", subscription.ID, org.ID,
+	).Update("entitlements_snapshot", revokedSnapshot).Error)
+
+	enable := testutil.NewJSONRequest(t, map[string]any{"enabled": true})
+	testutil.SetAuthContext(enable, org.ID, admin.ID)
+	testutil.SetPathParam(enable, "provider", integrationProviderThreads)
+	enablePID := make(chan int, 1)
+	enableDone := make(chan error, 1)
+	go func() {
+		enableDone <- app.DB.Connection(func(connection *gorm.DB) error {
+			session := connection.Session(&gorm.Session{NewDB: true})
+			var backendPID int
+			if err := session.Raw("SELECT pg_backend_pid()").Scan(&backendPID).Error; err != nil {
+				enablePID <- 0
+				return err
+			}
+			enablePID <- backendPID
+			requestApp := &App{Config: app.Config, DB: session, Redis: app.Redis, Log: app.Log}
+			return requestApp.UpdateIntegration(enable)
+		})
+	}()
+	backendPID := <-enablePID
+	require.Positive(t, backendPID)
+	testutil.RequirePostgresBackendWaitingForLock(t, app.DB, backendPID)
+	require.NoError(t, downgradeTx.Commit().Error)
+	committed = true
+	select {
+	case err := <-enableDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "Threads enable did not resume after entitlement downgrade")
+	}
+	testutil.AssertErrorResponse(
+		t, enable, fasthttp.StatusPaymentRequired,
+		"Threads public replies are not included",
+	)
+	var after models.ProviderIntegration
+	require.NoError(t, app.DB.First(&after, "id = ?", before.ID).Error)
+	assert.False(t, after.Enabled)
+	assert.Equal(t, before.Config, after.Config)
+	assert.Equal(t, before.CredentialData, after.CredentialData)
+	assert.Equal(t, before.UpdatedAt, after.UpdatedAt)
+}
+
+func TestIntegrationCenterThreadsConfigOnlyAndDisableRemainAllowedWithoutEntitlement(t *testing.T) {
+	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	admin := integrationTestUser(t, app, org.ID, "settings.integrations:read", "settings.integrations:write")
+	const appID = "1234567890123461"
+	appSecret, err := appcrypto.Encrypt("threads-preserved-app-secret", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	verifyToken, err := appcrypto.Encrypt("threads-preserved-webhook-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	binding := appID
+	integration := models.ProviderIntegration{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Provider:       integrationProviderThreads,
+		ThreadsAppID:   &binding,
+		Enabled:        true,
+		Config: approvedThreadsTestConfig(t, models.JSONB{
+			"app_id":       appID,
+			"redirect_uri": "https://app.example.test/api/integrations/threads/callback",
+		}, appID),
+		CredentialData: models.JSONB{
+			"app_secret":           appSecret,
+			"webhook_verify_token": verifyToken,
+		},
+		CreatedByID: &admin.ID,
+		UpdatedByID: &admin.ID,
+	}
+	require.NoError(t, app.DB.Create(&integration).Error)
+
+	configOnly := testutil.NewJSONRequest(t, map[string]any{
+		"credentials": map[string]any{
+			"webhook_verify_token": "threads-rotated-webhook-token",
+		},
+	})
+	testutil.SetAuthContext(configOnly, org.ID, admin.ID)
+	testutil.SetPathParam(configOnly, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(configOnly))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(configOnly))
+
+	require.NoError(t, app.DB.First(&integration, "id = ?", integration.ID).Error)
+	assert.True(t, integration.Enabled, "an omitted enabled field must preserve existing state")
+	rotatedVerifyToken := stringJSONValue(integration.CredentialData, "webhook_verify_token")
+	assert.True(t, appcrypto.IsEncrypted(rotatedVerifyToken))
+	assert.NotEqual(t, verifyToken, rotatedVerifyToken)
+
+	disable := testutil.NewJSONRequest(t, map[string]any{"enabled": false})
+	testutil.SetAuthContext(disable, org.ID, admin.ID)
+	testutil.SetPathParam(disable, "provider", integrationProviderThreads)
+	require.NoError(t, app.UpdateIntegration(disable))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(disable))
+	require.NoError(t, app.DB.First(&integration, "id = ?", integration.ID).Error)
+	assert.False(t, integration.Enabled)
+}
+
 func TestIntegrationCenterThreadsReviewApprovalGatesEnableAndOAuth(t *testing.T) {
 	app := newIntegrationHandlerTestApp(t, integrationTestEncryptionKey)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	admin := integrationTestUser(t, app, org.ID, "settings.integrations:read", "settings.integrations:write")
+	enableBookingCommerceTestEntitlement(
+		t,
+		app.DB,
+		org.ID,
+		admin.ID,
+		channelapi.ThreadsPublicEngagementEntitlementKey,
+	)
 	configure := testutil.NewJSONRequest(t, map[string]any{
 		"enabled": false,
 		"config": map[string]any{
@@ -923,6 +1148,13 @@ func TestIntegrationCenterThreadsAppChangeRevokesOldAuthorizationAndReenableIsNo
 		org.ID,
 		"settings.integrations:read",
 		"settings.integrations:write",
+	)
+	enableBookingCommerceTestEntitlement(
+		t,
+		app.DB,
+		org.ID,
+		admin.ID,
+		channelapi.ThreadsPublicEngagementEntitlementKey,
 	)
 	const oldAppID = "1442429782494481"
 	const newAppID = "1442429782494482"

@@ -869,6 +869,25 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 			message: "This provider cannot be enabled until its approved adapter is installed",
 		}
 	}
+	if request.Enabled != nil && *request.Enabled && provider == integrationProviderThreads {
+		allowed, entitlementErr := a.HasProductEntitlement(
+			userID,
+			orgID,
+			channelapi.ThreadsPublicEngagementEntitlementKey,
+		)
+		if entitlementErr != nil {
+			return &integrationClientError{
+				status:  fasthttp.StatusServiceUnavailable,
+				message: "Threads public engagement entitlement could not be evaluated",
+			}
+		}
+		if !allowed {
+			return &integrationClientError{
+				status:  fasthttp.StatusPaymentRequired,
+				message: "Threads public replies are not included in this workspace's active plan",
+			}
+		}
+	}
 	config, err := validateIntegrationConfig(provider, request.Config)
 	if err != nil {
 		return &integrationClientError{status: fasthttp.StatusBadRequest, message: err.Error()}
@@ -1109,6 +1128,29 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 			row.CreatedByID = &userID
 		}
 
+		// The initial check is a fast client-facing rejection. Re-evaluate while
+		// holding the organization row lock immediately before persistence so a
+		// concurrent plan downgrade that commits first cannot leave Threads
+		// enabled with no effective entitlement.
+		if provider == integrationProviderThreads && row.Enabled &&
+			request.Enabled != nil && *request.Enabled {
+			scoped := a.rootApp().scopedApp(tx, orgID)
+			allowed, entitlementErr := scoped.HasProductEntitlement(
+				userID, orgID, channelapi.ThreadsPublicEngagementEntitlementKey,
+			)
+			if entitlementErr != nil {
+				return &integrationClientError{
+					status:  fasthttp.StatusServiceUnavailable,
+					message: "Threads public engagement entitlement could not be evaluated",
+				}
+			}
+			if !allowed {
+				return &integrationClientError{
+					status:  fasthttp.StatusPaymentRequired,
+					message: "Threads public replies are not included in this workspace's active plan",
+				}
+			}
+		}
 		if row.Enabled {
 			if err := a.validateEnabledIntegration(provider, &organization, row, tx, orgID); err != nil {
 				status := fasthttp.StatusBadRequest

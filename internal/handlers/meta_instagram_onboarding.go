@@ -38,6 +38,7 @@ const (
 var (
 	errMetaInstagramOnboardingDisabled = errors.New("managed Instagram onboarding is disabled")
 	errMetaInstagramOAuthForbidden     = errors.New("instagram authorization is no longer permitted")
+	errMetaInstagramEntitlementDenied  = errors.New("instagram omnichannel entitlement is no longer active")
 )
 
 type metaInstagramOAuthState struct {
@@ -107,6 +108,43 @@ func (a *App) metaInstagramOnboardingSettings() (configpkg.MetaInstagramConfig, 
 		return configpkg.MetaInstagramConfig{}, errMetaInstagramOnboardingDisabled
 	}
 	return settings, nil
+}
+
+// withLockedMetaInstagramEntitledAttempt makes the organization mutex the
+// ordering point between an entitlement downgrade and provider I/O. A
+// downgrade that commits first therefore prevents the attempt from running;
+// an attempt that owns the mutex first completes before the downgrade can
+// commit and is fenced again at its subsequent persistence boundary.
+func (a *App) withLockedMetaInstagramEntitledAttempt(
+	ctx context.Context,
+	organizationID, userID uuid.UUID,
+	attempt func() error,
+) error {
+	if a == nil || a.rootApp() == nil || a.rootApp().DB == nil ||
+		organizationID == uuid.Nil || userID == uuid.Nil {
+		return errMetaInstagramOAuthForbidden
+	}
+	return database.WithTenantReadCommitted(
+		a.rootApp().DB, organizationID, func(tx *gorm.DB) error {
+			if err := lockChannelAIOrganizationScopeTx(tx, organizationID); err != nil {
+				return err
+			}
+			scoped := a.rootApp().scopedApp(tx.WithContext(ctx), organizationID)
+			allowed, entitlementErr := scoped.HasProductEntitlement(
+				userID, organizationID, channelapi.OmnichannelEntitlementKey,
+			)
+			if entitlementErr != nil {
+				return entitlementErr
+			}
+			if !allowed {
+				return errMetaInstagramEntitlementDenied
+			}
+			if attempt == nil {
+				return nil
+			}
+			return attempt()
+		},
+	)
 }
 
 func metaInstagramOnboardingFingerprint(settings configpkg.MetaInstagramConfig) string {
@@ -253,14 +291,28 @@ func (a *App) consumeMetaInstagramOAuthState(
 }
 
 func (a *App) GetMetaInstagramOnboardingStatus(r *fastglue.Request) error {
-	orgID, _, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionWrite, false)
+	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionWrite, false, true)
 	if err != nil {
 		return nil
 	}
 	settings, settingsErr := a.metaInstagramOnboardingSettings()
+	entitled := false
+	if settingsErr == nil {
+		entitlementErr := a.WithTenantApp(orgID, func(scoped *App) error {
+			var evaluateErr error
+			entitled, evaluateErr = scoped.HasProductEntitlement(
+				userID, orgID, channelapi.OmnichannelEntitlementKey,
+			)
+			return evaluateErr
+		})
+		if entitlementErr != nil {
+			a.Log.Warn("Instagram onboarding entitlement status is unavailable", "organization_id", orgID)
+			entitled = false
+		}
+	}
 	status := metaInstagramOnboardingStatus{
 		OrganizationID: orgID,
-		Enabled:        settingsErr == nil && a.metaInstagramOnboardingAvailable(),
+		Enabled:        settingsErr == nil && entitled && a.metaInstagramOnboardingAvailable(),
 		ReviewStatus:   "not_configured",
 	}
 	if settingsErr == nil {
@@ -286,7 +338,7 @@ func (a *App) GetMetaInstagramOnboardingStatus(r *fastglue.Request) error {
 }
 
 func (a *App) StartMetaInstagramOnboarding(r *fastglue.Request) error {
-	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionWrite, true)
+	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionWrite, true, false)
 	if err != nil {
 		return nil
 	}
@@ -294,7 +346,7 @@ func (a *App) StartMetaInstagramOnboarding(r *fastglue.Request) error {
 }
 
 func (a *App) ReconnectMetaInstagramOnboarding(r *fastglue.Request) error {
-	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionWrite, true)
+	orgID, userID, _, err := a.requireMetaInstagramOnboardingAuth(r, models.ActionWrite, true, false)
 	if err != nil {
 		return nil
 	}
@@ -331,6 +383,22 @@ func (a *App) beginMetaInstagramOnboarding(
 	settings, err := a.metaInstagramOnboardingSettings()
 	if err != nil || !a.metaInstagramOnboardingAvailable() {
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Managed Instagram onboarding is unavailable until App Review is approved", nil, "")
+	}
+	if err := a.withLockedMetaInstagramEntitledAttempt(
+		requestContext(r), orgID, userID, nil,
+	); err != nil {
+		if errors.Is(err, errMetaInstagramEntitlementDenied) {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusPaymentRequired,
+				"Instagram messaging is not included in this workspace's active plan",
+				nil, "",
+			)
+		}
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Instagram entitlement could not be evaluated",
+			nil, "",
+		)
 	}
 	if allowed, err := a.requireMetaInstagramRateLimit(r, orgID, userID, "start", 12, time.Minute); !allowed {
 		return err
@@ -442,53 +510,73 @@ func (a *App) CallbackMetaInstagram(r *fastglue.Request) error {
 	}
 	providerCtx, providerCancel := context.WithTimeout(context.Background(), metaInstagramProviderOperationLimit)
 	defer providerCancel()
-	shortToken, err := a.exchangeMetaInstagramAuthorizationCode(providerCtx, settings, code, redirectURI)
+	var shortToken, longToken metaInstagramTokenResponse
+	var inspection metaInstagramTokenInspection
+	var profile metaInstagramProfile
+	var expiresAt *time.Time
+	var now time.Time
+	err = a.withLockedMetaInstagramEntitledAttempt(
+		providerCtx, orgID, userID, func() error {
+			var attemptErr error
+			shortToken, attemptErr = a.exchangeMetaInstagramAuthorizationCode(
+				providerCtx, settings, code, redirectURI,
+			)
+			if attemptErr != nil {
+				a.Log.Warn("Instagram authorization code exchange failed", "organization_id", orgID)
+				return attemptErr
+			}
+			if !a.metaInstagramReleaseSubjectAllowed(orgID, shortToken.UserID) {
+				// Development/test evidence is an exact server-owned profile tuple.
+				// Stop before exchanging or inspecting any other app-role user.
+				a.Log.Warn("Instagram short-token profile is outside release evidence", "organization_id", orgID)
+				return errMetaInstagramOAuthForbidden
+			}
+			longToken, attemptErr = a.exchangeMetaInstagramLongLivedToken(
+				providerCtx, settings, shortToken.AccessToken,
+			)
+			if attemptErr != nil {
+				a.Log.Warn("Instagram long-lived token exchange failed", "organization_id", orgID)
+				return attemptErr
+			}
+			inspection, attemptErr = a.inspectMetaInstagramToken(
+				providerCtx, settings, longToken.AccessToken,
+			)
+			if attemptErr != nil {
+				a.Log.Warn("Instagram token inspection failed", "organization_id", orgID)
+				return attemptErr
+			}
+			profile, attemptErr = a.fetchMetaInstagramProfile(
+				providerCtx, settings, longToken.AccessToken,
+			)
+			oauthSubjectID := profile.oauthSubjectID()
+			professionalAccountID := profile.professionalAccountID()
+			if attemptErr != nil || oauthSubjectID != shortToken.UserID ||
+				oauthSubjectID != inspection.UserID || !validCanonicalMetaID(professionalAccountID) {
+				a.Log.Warn("Instagram token and profile identities did not match", "organization_id", orgID)
+				if attemptErr != nil {
+					return attemptErr
+				}
+				return errMetaInstagramOAuthForbidden
+			}
+			if _, allowed := a.metaInstagramReleaseMode(
+				orgID, oauthSubjectID, professionalAccountID,
+			); !allowed {
+				a.Log.Warn("Instagram profile is outside the deployment-owned release evidence", "organization_id", orgID)
+				return errMetaInstagramOAuthForbidden
+			}
+			now = time.Now().UTC()
+			expiresAt, attemptErr = metaInstagramExpiry(
+				now, longToken.ExpiresIn, inspection.ExpiresAt,
+			)
+			return attemptErr
+		},
+	)
 	if err != nil {
-		a.Log.Warn("Instagram authorization code exchange failed", "organization_id", orgID)
 		a.redirectMetaInstagramCallback(r, "error")
 		return nil
 	}
-	if !a.metaInstagramReleaseSubjectAllowed(orgID, shortToken.UserID) {
-		// Development/test evidence is an exact server-owned profile tuple. Stop
-		// before exchanging or inspecting a token for any other app-role user.
-		a.Log.Warn("Instagram short-token profile is outside release evidence", "organization_id", orgID)
-		a.redirectMetaInstagramCallback(r, "error")
-		return nil
-	}
-	longToken, err := a.exchangeMetaInstagramLongLivedToken(providerCtx, settings, shortToken.AccessToken)
-	if err != nil {
-		a.Log.Warn("Instagram long-lived token exchange failed", "organization_id", orgID)
-		a.redirectMetaInstagramCallback(r, "error")
-		return nil
-	}
-	inspection, err := a.inspectMetaInstagramToken(providerCtx, settings, longToken.AccessToken)
-	if err != nil {
-		a.Log.Warn("Instagram token inspection failed", "organization_id", orgID)
-		a.redirectMetaInstagramCallback(r, "error")
-		return nil
-	}
-	profile, err := a.fetchMetaInstagramProfile(providerCtx, settings, longToken.AccessToken)
 	oauthSubjectID := profile.oauthSubjectID()
 	professionalAccountID := profile.professionalAccountID()
-	if err != nil || oauthSubjectID != shortToken.UserID || oauthSubjectID != inspection.UserID ||
-		!validCanonicalMetaID(professionalAccountID) {
-		a.Log.Warn("Instagram token and profile identities did not match", "organization_id", orgID)
-		a.redirectMetaInstagramCallback(r, "error")
-		return nil
-	}
-	if _, allowed := a.metaInstagramReleaseMode(
-		orgID, oauthSubjectID, professionalAccountID,
-	); !allowed {
-		a.Log.Warn("Instagram profile is outside the deployment-owned release evidence", "organization_id", orgID)
-		a.redirectMetaInstagramCallback(r, "error")
-		return nil
-	}
-	now := time.Now().UTC()
-	expiresAt, err := metaInstagramExpiry(now, longToken.ExpiresIn, inspection.ExpiresAt)
-	if err != nil {
-		a.redirectMetaInstagramCallback(r, "error")
-		return nil
-	}
 	operationID := uuid.New()
 	operationExpiresAt := now.Add(metaMessengerSubscriptionOperationLease)
 	var result metaRegistryProvisionResult
@@ -497,10 +585,25 @@ func (a *App) CallbackMetaInstagram(r *fastglue.Request) error {
 		return nil
 	}
 	err = a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		// The callback can outlive the commercial grant that permitted OAuth
+		// start. Serialize this final authorization check with subscription
+		// changes before a new credential generation is persisted.
+		if err := lockChannelAIOrganizationScopeTx(scoped.DB, orgID); err != nil {
+			return err
+		}
 		if !scoped.HasPermission(userID, models.ResourceSettingsIntegrations, models.ActionWrite, orgID) ||
 			!scoped.HasPermission(userID, models.ResourceChannelAccounts, models.ActionWrite, orgID) ||
 			!scoped.metaInstagramOrganizationAllowed(orgID) {
 			return errMetaInstagramOAuthForbidden
+		}
+		allowed, entitlementErr := scoped.HasProductEntitlement(
+			userID, orgID, channelapi.OmnichannelEntitlementKey,
+		)
+		if entitlementErr != nil {
+			return entitlementErr
+		}
+		if !allowed {
+			return errMetaInstagramEntitlementDenied
 		}
 		if reconnectID != uuid.Nil {
 			var rotateErr error
@@ -550,6 +653,17 @@ func (a *App) CallbackMetaInstagram(r *fastglue.Request) error {
 			)
 		},
 	); err != nil {
+		if errors.Is(err, errMetaInstagramEntitlementDenied) {
+			if cleanupErr := a.compensateMetaInstagramEntitlementLoss(
+				providerCtx, settings, orgID, userID, result.Account.ID, operation,
+			); cleanupErr != nil {
+				a.Log.Warn("Instagram entitlement cleanup needs reconciliation", "organization_id", orgID)
+				a.redirectMetaInstagramCallback(r, "reconcile")
+				return nil
+			}
+			a.redirectMetaInstagramCallback(r, "error")
+			return nil
+		}
 		if errors.Is(err, errMetaMessengerSubscriptionFence) {
 			a.redirectMetaInstagramCallback(r, "reconcile")
 			return nil
@@ -573,6 +687,17 @@ func (a *App) CallbackMetaInstagram(r *fastglue.Request) error {
 		return finalizeErr
 	})
 	if err != nil {
+		if errors.Is(err, errMetaInstagramEntitlementDenied) {
+			if cleanupErr := a.compensateMetaInstagramEntitlementLoss(
+				providerCtx, settings, orgID, userID, result.Account.ID, operation,
+			); cleanupErr != nil {
+				a.Log.Warn("Instagram post-subscribe entitlement cleanup needs reconciliation", "organization_id", orgID)
+				a.redirectMetaInstagramCallback(r, "reconcile")
+				return nil
+			}
+			a.redirectMetaInstagramCallback(r, "error")
+			return nil
+		}
 		a.redirectMetaInstagramCallback(r, "reconcile")
 		return nil
 	}
@@ -590,6 +715,15 @@ func (a *App) authorizeMetaInstagramCallback(
 		if !scoped.HasPermission(userID, models.ResourceSettingsIntegrations, models.ActionWrite, organizationID) ||
 			!scoped.HasPermission(userID, models.ResourceChannelAccounts, models.ActionWrite, organizationID) {
 			return errMetaInstagramOAuthForbidden
+		}
+		allowed, entitlementErr := scoped.HasProductEntitlement(
+			userID, organizationID, channelapi.OmnichannelEntitlementKey,
+		)
+		if entitlementErr != nil {
+			return entitlementErr
+		}
+		if !allowed {
+			return errMetaInstagramEntitlementDenied
 		}
 		if reconnectAccountID == uuid.Nil {
 			return nil
@@ -698,6 +832,7 @@ func (a *App) requireMetaInstagramOnboardingAuth(
 	r *fastglue.Request,
 	channelAction string,
 	requireIntegrationWrite bool,
+	allowMissingEntitlement bool,
 ) (uuid.UUID, uuid.UUID, string, error) {
 	selectedOrgID, err := a.requireExplicitOrganization(r)
 	if err != nil {
@@ -721,7 +856,13 @@ func (a *App) requireMetaInstagramOnboardingAuth(
 	var workspaceName string
 	if err := database.WithTenantReadCommitted(root.DB, orgID, func(tx *gorm.DB) error {
 		scoped := root.scopedApp(tx, orgID)
-		_, _, authErr = scoped.requireAuth(r, models.ResourceChannelAccounts, channelAction)
+		if allowMissingEntitlement {
+			authErr = scoped.requirePermission(
+				r, userID, models.ResourceChannelAccounts, channelAction,
+			)
+		} else {
+			_, _, authErr = scoped.requireAuth(r, models.ResourceChannelAccounts, channelAction)
+		}
 		if authErr != nil {
 			return nil
 		}
