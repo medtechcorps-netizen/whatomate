@@ -57,8 +57,8 @@ func TestManagedInstagramSignedJournalCommitAtomicallyFencesCurrentGeneration(t 
 				t *testing.T, fixture metaInstagramLifecycleFixture,
 				payload metaMessengerSignedRequestPayload, digest string, now time.Time,
 			) error {
-				event, err := fixture.app.loadOrCreateMetaInstagramDeauthorizationEvent(
-					fixture.org.ID, digest, metaInstagramTestAppID, payload, now,
+				event, _, err := fixture.app.loadOrCreateMetaInstagramDeauthorizationEvent(
+					digest, metaInstagramTestAppID, payload, now,
 				)
 				require.NoError(t, err)
 				assert.Equal(t, "verified", event.State)
@@ -72,11 +72,11 @@ func TestManagedInstagramSignedJournalCommitAtomicallyFencesCurrentGeneration(t 
 				t *testing.T, fixture metaInstagramLifecycleFixture,
 				payload metaMessengerSignedRequestPayload, digest string, now time.Time,
 			) error {
-				event, err := fixture.app.loadOrCreateMetaInstagramDeletionEvent(
-					fixture.org.ID, digest, metaInstagramTestAppID, payload, now,
+				claim, err := fixture.app.loadOrCreateMetaInstagramDeletionEvent(
+					digest, fixture.app.Config.MetaInstagram, payload, now,
 				)
 				require.NoError(t, err)
-				assert.Equal(t, "verified", event.State)
+				assert.Equal(t, "verified", claim.Event.State)
 				return nil
 			},
 			expectStatus: models.ChannelAccountStatusDisconnected,
@@ -150,12 +150,12 @@ func TestManagedInstagramSignedJournalStrictlyOlderThanReconnectDoesNotQuarantin
 			)
 			if deletion {
 				_, err := fixture.app.loadOrCreateMetaInstagramDeletionEvent(
-					fixture.org.ID, digest, metaInstagramTestAppID, payload, now,
+					digest, fixture.app.Config.MetaInstagram, payload, now,
 				)
 				require.NoError(t, err)
 			} else {
-				_, err := fixture.app.loadOrCreateMetaInstagramDeauthorizationEvent(
-					fixture.org.ID, digest, metaInstagramTestAppID, payload, now,
+				_, _, err := fixture.app.loadOrCreateMetaInstagramDeauthorizationEvent(
+					digest, metaInstagramTestAppID, payload, now,
 				)
 				require.NoError(t, err)
 			}

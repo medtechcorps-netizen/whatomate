@@ -16,6 +16,7 @@ import (
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	configpkg "github.com/shridarpatil/whatomate/internal/config"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/zerodha/fastglue"
@@ -30,8 +31,9 @@ const (
 
 // ResolveMetaRegistryBinding is a private, service-authenticated broker. It
 // returns a short lease and never exposes credentials to a browser or tenant
-// API. The global lookup yields only one organization ID; all secret reads then
-// happen inside that exact tenant's RLS transaction.
+// API. Messenger retains its established global organization resolver;
+// Instagram searches only the bounded deployment-owned tenant set with normal
+// RLS. Either path must yield exactly one organization before secret reads.
 func (a *App) ResolveMetaRegistryBinding(r *fastglue.Request) error {
 	raw, nonce, ok := a.authenticateMetaRegistryRequest(r, metaregistry.ResolvePath)
 	if !ok {
@@ -205,17 +207,51 @@ func (a *App) resolveMetaRegistryOrganization(request metaregistry.ResolveReques
 		if a == nil || a.Config == nil || !a.Config.MetaInstagram.Enabled {
 			return uuid.Nil, gorm.ErrRecordNotFound
 		}
-		allowedOrganizationID, err := uuid.Parse(
-			strings.TrimSpace(a.Config.MetaInstagram.AllowedOrganizationID),
-		)
-		if err != nil || allowedOrganizationID == uuid.Nil ||
-			!validCanonicalMetaID(strings.TrimSpace(a.Config.MetaInstagram.AppID)) {
+		if !validCanonicalMetaID(strings.TrimSpace(a.Config.MetaInstagram.AppID)) {
 			return uuid.Nil, gorm.ErrRecordNotFound
 		}
-		// The deployment config is the sole tenant router for managed Instagram.
-		// Exact account/app/profile cardinality is checked only after entering the
-		// tenant RLS transaction; no cross-tenant SECURITY DEFINER lookup exists.
-		return allowedOrganizationID, nil
+		var resolved uuid.UUID
+		for _, organizationText := range a.Config.MetaInstagram.ManagedOrganizationIDs() {
+			organizationID, err := uuid.Parse(organizationText)
+			if err != nil || organizationID == uuid.Nil || organizationID.String() != organizationText {
+				return uuid.Nil, gorm.ErrRecordNotFound
+			}
+			matches := int64(0)
+			err = database.WithTenantReadCommitted(
+				root.DB, organizationID, func(tx *gorm.DB) error {
+					return tx.Model(&models.ChannelAccount{}).Where(
+						"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ? AND status IN ? AND config ->> 'meta_registry_managed' = 'true' AND config ->> 'meta_management_mode' = ? AND config ->> 'instagram_api_mode' = 'instagram_login' AND metadata ->> 'meta_platform_app_id' = ? AND metadata ->> 'meta_webhook_app' = 'instagram_login' AND metadata ->> 'meta_authority_asset_id' = ?",
+						organizationID, models.ChannelInstagram, channelapi.RelayProvider,
+						request.ExternalAccountID,
+						[]models.ChannelAccountStatus{
+							models.ChannelAccountStatusPending,
+							models.ChannelAccountStatusActive,
+							models.ChannelAccountStatusDegraded,
+						},
+						metaregistry.ManagementModePlatformOAuth,
+						strings.TrimSpace(a.Config.MetaInstagram.AppID),
+						request.ExternalAccountID,
+					).Limit(2).Count(&matches).Error
+				},
+			)
+			if err != nil {
+				return uuid.Nil, err
+			}
+			if matches == 0 {
+				continue
+			}
+			if matches != 1 || resolved != uuid.Nil {
+				return uuid.Nil, gorm.ErrRecordNotFound
+			}
+			resolved = organizationID
+		}
+		if resolved == uuid.Nil {
+			return uuid.Nil, gorm.ErrRecordNotFound
+		}
+		// The bounded deployment allowlist is the only cross-tenant router. Each
+		// candidate is queried through an ordinary tenant RLS transaction; no
+		// Instagram SECURITY DEFINER resolver or caller-selected org exists.
+		return resolved, nil
 	}
 	if a.rlsEnabled() {
 		var raw string
@@ -463,8 +499,7 @@ func metaInstagramReleaseEvidenceAllowed(
 ) bool {
 	if config == nil || account == nil || account.Channel != models.ChannelInstagram ||
 		!config.MetaInstagram.Enabled ||
-		config.MetaInstagram.QuarantineOnly ||
-		strings.TrimSpace(config.MetaInstagram.AllowedOrganizationID) != account.OrganizationID.String() ||
+		!config.MetaInstagram.OrganizationReleased(account.OrganizationID.String()) ||
 		stringConfigValue(account.Config, "instagram_api_mode") != "instagram_login" ||
 		stringConfigValue(account.Metadata, "meta_platform_app_id") != strings.TrimSpace(config.MetaInstagram.AppID) {
 		return false
@@ -509,7 +544,7 @@ func metaMessengerAuthorizationTokenAllowed(config *configpkg.Config, metadata m
 func (a *App) metaInstagramOrganizationAllowed(organizationID uuid.UUID) bool {
 	return a != nil && a.Config != nil && a.Config.MetaInstagram.Enabled &&
 		organizationID != uuid.Nil &&
-		strings.TrimSpace(a.Config.MetaInstagram.AllowedOrganizationID) == organizationID.String()
+		a.Config.MetaInstagram.OrganizationManaged(organizationID.String())
 }
 
 func currentMetaRegistryCredential(credentials []models.ChannelCredential, kind models.ChannelCredentialKind, now time.Time) *models.ChannelCredential {

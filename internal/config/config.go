@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -115,28 +116,123 @@ type MetaMessengerConfig struct {
 
 // MetaInstagramConfig is the deployment-owned Instagram Login application
 // used only by the managed Instagram lifecycle. It is intentionally separate
-// from the relay's legacy/static Instagram application and is released to one
-// explicit workspace at a time.
+// from the relay's legacy/static Instagram application. Active and
+// quarantined organization sets remain deployment-owned and bounded.
 type MetaInstagramConfig struct {
-	Enabled                       bool   `koanf:"enabled"`
-	QuarantineOnly                bool   `koanf:"quarantine_only"`
-	AppID                         string `koanf:"app_id"`
-	AppSecret                     string `koanf:"app_secret"`
-	AppReviewStatus               string `koanf:"app_review_status"`
-	GraphAPIVersion               string `koanf:"graph_api_version"`
-	AuthorizationBaseURL          string `koanf:"authorization_base_url"`
-	TokenBaseURL                  string `koanf:"token_base_url"`
-	GraphBaseURL                  string `koanf:"graph_base_url"`
-	ReReplyBaseURL                string `koanf:"rereply_base_url"`
-	RelayBaseURL                  string `koanf:"relay_base_url"`
-	HealthApprovalMaxAgeMins      int    `koanf:"health_approval_max_age_mins"`
-	RevalidationLeadMins          int    `koanf:"revalidation_lead_mins"`
-	TokenRefreshLeadHours         int    `koanf:"token_refresh_lead_hours"`
-	SchedulerIntervalSeconds      int    `koanf:"scheduler_interval_seconds"`
-	AllowedOrganizationID         string `koanf:"allowed_organization_id"`
-	DevelopmentTestProfileID      string `koanf:"development_test_profile_id"`
-	DevelopmentTestOAuthSubjectID string `koanf:"development_test_oauth_subject_id"`
-	DevelopmentAppRole            string `koanf:"development_app_role"`
+	Enabled                  bool   `koanf:"enabled"`
+	QuarantineOnly           bool   `koanf:"quarantine_only"`
+	AppID                    string `koanf:"app_id"`
+	AppSecret                string `koanf:"app_secret"`
+	AppReviewStatus          string `koanf:"app_review_status"`
+	GraphAPIVersion          string `koanf:"graph_api_version"`
+	AuthorizationBaseURL     string `koanf:"authorization_base_url"`
+	TokenBaseURL             string `koanf:"token_base_url"`
+	GraphBaseURL             string `koanf:"graph_base_url"`
+	ReReplyBaseURL           string `koanf:"rereply_base_url"`
+	RelayBaseURL             string `koanf:"relay_base_url"`
+	HealthApprovalMaxAgeMins int    `koanf:"health_approval_max_age_mins"`
+	RevalidationLeadMins     int    `koanf:"revalidation_lead_mins"`
+	TokenRefreshLeadHours    int    `koanf:"token_refresh_lead_hours"`
+	SchedulerIntervalSeconds int    `koanf:"scheduler_interval_seconds"`
+	// AllowedOrganizationID is the legacy singleton gate. New deployments use
+	// AllowedOrganizationIDs; both may overlap only as the same singleton while
+	// a reader-first rollout is in progress.
+	AllowedOrganizationID                string `koanf:"allowed_organization_id"`
+	AllowedOrganizationIDs               string `koanf:"allowed_organization_ids"`
+	QuarantinedOrganizationIDs           string `koanf:"quarantined_organization_ids"`
+	DataDeletionComplianceOrganizationID string `koanf:"data_deletion_compliance_organization_id"`
+	DevelopmentTestProfileID             string `koanf:"development_test_profile_id"`
+	DevelopmentTestOAuthSubjectID        string `koanf:"development_test_oauth_subject_id"`
+	DevelopmentAppRole                   string `koanf:"development_app_role"`
+}
+
+// MaxMetaInstagramManagedOrganizations bounds every tenant-scoped registry,
+// callback, lifecycle, and privacy lookup performed for the managed Instagram
+// app. The bound is deliberately much smaller than an untrusted database scan.
+const MaxMetaInstagramManagedOrganizations = 32
+
+type metaInstagramOrganizationSets struct {
+	active       []string
+	quarantined  []string
+	compliance   string
+	usesSetModel bool
+}
+
+// ActiveOrganizationIDs returns the canonical sorted organizations that may
+// start OAuth and acquire runtime authority. Invalid unvalidated configuration
+// returns an empty set so call sites fail closed.
+func (config MetaInstagramConfig) ActiveOrganizationIDs() []string {
+	sets, err := canonicalMetaInstagramOrganizationSets(config)
+	if err != nil {
+		return nil
+	}
+	return append([]string(nil), sets.active...)
+}
+
+// ManagedOrganizationIDs includes active and explicitly quarantined tenants.
+// Quarantined tenants remain addressable only for callbacks, lifecycle
+// cancellation, disconnect, and retained privacy status obligations.
+func (config MetaInstagramConfig) ManagedOrganizationIDs() []string {
+	sets, err := canonicalMetaInstagramOrganizationSets(config)
+	if err != nil {
+		return nil
+	}
+	values := append(append([]string(nil), sets.active...), sets.quarantined...)
+	sort.Strings(values)
+	return values
+}
+
+func (config MetaInstagramConfig) OrganizationManaged(organizationID string) bool {
+	organizationID = strings.TrimSpace(organizationID)
+	for _, configured := range config.ManagedOrganizationIDs() {
+		if configured == organizationID {
+			return true
+		}
+	}
+	return false
+}
+
+func (config MetaInstagramConfig) OrganizationReleased(organizationID string) bool {
+	if config.QuarantineOnly {
+		return false
+	}
+	organizationID = strings.TrimSpace(organizationID)
+	for _, configured := range config.ActiveOrganizationIDs() {
+		if configured == organizationID {
+			return true
+		}
+	}
+	return false
+}
+
+func (config MetaInstagramConfig) OrganizationQuarantined(organizationID string) bool {
+	organizationID = strings.TrimSpace(organizationID)
+	if config.QuarantineOnly {
+		return config.OrganizationManaged(organizationID)
+	}
+	sets, err := canonicalMetaInstagramOrganizationSets(config)
+	if err != nil {
+		return false
+	}
+	for _, configured := range sets.quarantined {
+		if configured == organizationID {
+			return true
+		}
+	}
+	return false
+}
+
+func (config MetaInstagramConfig) DataDeletionComplianceOrganization() string {
+	sets, err := canonicalMetaInstagramOrganizationSets(config)
+	if err != nil {
+		return ""
+	}
+	return sets.compliance
+}
+
+func (config MetaInstagramConfig) UsesOrganizationSetModel() bool {
+	sets, err := canonicalMetaInstagramOrganizationSets(config)
+	return err == nil && sets.usesSetModel
 }
 
 // GoogleSearchConsoleConfig contains deployment-managed OAuth credentials.
@@ -627,6 +723,118 @@ func validateMetaRegistryConfig(
 	return nil
 }
 
+func canonicalMetaInstagramOrganizationList(raw, field string) ([]string, error) {
+	seen := make(map[string]struct{})
+	values := make([]string, 0)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if !canonicalNonNilUUID(item) {
+			return nil, fmt.Errorf("instagram onboarding %s must contain canonical UUIDs", field)
+		}
+		if _, exists := seen[item]; exists {
+			return nil, fmt.Errorf("instagram onboarding %s contains a duplicate UUID", field)
+		}
+		seen[item] = struct{}{}
+		values = append(values, item)
+	}
+	sort.Strings(values)
+	return values, nil
+}
+
+func canonicalMetaInstagramOrganizationSets(
+	config MetaInstagramConfig,
+) (metaInstagramOrganizationSets, error) {
+	legacy := strings.TrimSpace(config.AllowedOrganizationID)
+	pluralRaw := strings.TrimSpace(config.AllowedOrganizationIDs)
+	quarantineRaw := strings.TrimSpace(config.QuarantinedOrganizationIDs)
+	compliance := strings.TrimSpace(config.DataDeletionComplianceOrganizationID)
+
+	active, err := canonicalMetaInstagramOrganizationList(
+		pluralRaw, "allowed_organization_ids",
+	)
+	if err != nil {
+		return metaInstagramOrganizationSets{}, err
+	}
+	if pluralRaw == "" {
+		active = nil
+		if legacy != "" {
+			if !canonicalNonNilUUID(legacy) {
+				return metaInstagramOrganizationSets{}, errors.New(
+					"instagram onboarding allowed_organization_id must contain one canonical UUID",
+				)
+			}
+			active = []string{legacy}
+		}
+	} else if legacy != "" && (len(active) != 1 || active[0] != legacy) {
+		return metaInstagramOrganizationSets{}, errors.New(
+			"instagram onboarding legacy allowed_organization_id may overlap allowed_organization_ids only as the same singleton",
+		)
+	}
+
+	quarantined, err := canonicalMetaInstagramOrganizationList(
+		quarantineRaw, "quarantined_organization_ids",
+	)
+	if err != nil {
+		return metaInstagramOrganizationSets{}, err
+	}
+	activeSet := make(map[string]struct{}, len(active))
+	for _, organizationID := range active {
+		activeSet[organizationID] = struct{}{}
+	}
+	for _, organizationID := range quarantined {
+		if _, overlaps := activeSet[organizationID]; overlaps {
+			return metaInstagramOrganizationSets{}, errors.New(
+				"instagram onboarding active and quarantined organization IDs must be disjoint",
+			)
+		}
+	}
+	managedCount := len(active) + len(quarantined)
+	if managedCount == 0 {
+		return metaInstagramOrganizationSets{}, errors.New(
+			"instagram onboarding requires at least one active or quarantined organization UUID",
+		)
+	}
+	if managedCount > MaxMetaInstagramManagedOrganizations {
+		return metaInstagramOrganizationSets{}, fmt.Errorf(
+			"instagram onboarding supports at most %d managed organizations",
+			MaxMetaInstagramManagedOrganizations,
+		)
+	}
+
+	usesSetModel := pluralRaw != "" || quarantineRaw != ""
+	if usesSetModel {
+		if !canonicalNonNilUUID(compliance) {
+			return metaInstagramOrganizationSets{}, errors.New(
+				"instagram onboarding data_deletion_compliance_organization_id must contain one canonical UUID when organization sets are configured",
+			)
+		}
+		if _, collides := activeSet[compliance]; collides {
+			return metaInstagramOrganizationSets{}, errors.New(
+				"instagram onboarding data-deletion compliance organization must be distinct from every managed clinic organization",
+			)
+		}
+		for _, organizationID := range quarantined {
+			if organizationID == compliance {
+				return metaInstagramOrganizationSets{}, errors.New(
+					"instagram onboarding data-deletion compliance organization must be distinct from every managed clinic organization",
+				)
+			}
+		}
+	} else if compliance != "" {
+		return metaInstagramOrganizationSets{}, errors.New(
+			"instagram onboarding data-deletion compliance organization requires the organization-set model",
+		)
+	}
+
+	return metaInstagramOrganizationSets{
+		active: active, quarantined: quarantined, compliance: compliance,
+		usesSetModel: usesSetModel,
+	}, nil
+}
+
 func validateMetaInstagramConfig(
 	config MetaInstagramConfig,
 	messenger MetaMessengerConfig,
@@ -639,6 +847,9 @@ func validateMetaInstagramConfig(
 		strings.TrimSpace(config.AppReviewStatus) != "" ||
 		config.ReReplyBaseURL != "" || config.RelayBaseURL != "" ||
 		strings.TrimSpace(config.AllowedOrganizationID) != "" ||
+		strings.TrimSpace(config.AllowedOrganizationIDs) != "" ||
+		strings.TrimSpace(config.QuarantinedOrganizationIDs) != "" ||
+		strings.TrimSpace(config.DataDeletionComplianceOrganizationID) != "" ||
 		strings.TrimSpace(config.DevelopmentTestProfileID) != "" ||
 		strings.TrimSpace(config.DevelopmentTestOAuthSubjectID) != "" ||
 		strings.TrimSpace(config.DevelopmentAppRole) != ""
@@ -660,9 +871,9 @@ func validateMetaInstagramConfig(
 	if server.WriteTimeout < 120 {
 		return errors.New("instagram onboarding requires server.write_timeout of at least 120 seconds")
 	}
-	organizationID := strings.TrimSpace(config.AllowedOrganizationID)
-	if !canonicalUUID(organizationID) {
-		return errors.New("instagram onboarding allowed_organization_id must contain exactly one canonical UUID")
+	organizationSets, err := canonicalMetaInstagramOrganizationSets(config)
+	if err != nil {
+		return err
 	}
 	if !canonicalNumericMetaID(config.AppID) {
 		return errors.New("instagram onboarding app_id must be a canonical numeric Meta ID")
@@ -696,6 +907,9 @@ func validateMetaInstagramConfig(
 			return errors.New("instagram onboarding requires approved app review in production unless quarantine_only is enabled")
 		}
 	} else if reviewStatus != "approved" {
+		if len(organizationSets.active) != 1 || len(organizationSets.quarantined) != 0 {
+			return errors.New("nonproduction Instagram app-role testing requires exactly one active organization")
+		}
 		if !canonicalNumericMetaID(developmentProfileID) {
 			return errors.New("nonproduction Instagram testing requires one canonical development_test_profile_id")
 		}

@@ -193,7 +193,9 @@ func TestManagedInstagramOAuthStartSetsBoundBrowserOnlyProof(t *testing.T) {
 	assert.Equal(t, fixture.user.ID.String(), state.UserID)
 	assert.Equal(t, nonce, state.Nonce)
 	assert.Equal(
-		t, fixture.app.metaInstagramRuntimeFingerprint(fixture.app.Config.MetaInstagram),
+		t, fixture.app.metaInstagramRuntimeFingerprint(
+			fixture.app.Config.MetaInstagram, fixture.org.ID,
+		),
 		state.ConfigFingerprint,
 	)
 	assert.Equal(t, metaInstagramOAuthBrowserBindingDigest(state, verifier), state.BrowserBindingDigest)

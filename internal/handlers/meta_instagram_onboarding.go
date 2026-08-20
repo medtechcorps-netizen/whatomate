@@ -64,9 +64,10 @@ type metaInstagramOnboardingStatus struct {
 	WebhookURL      string    `json:"managed_webhook_url"`
 }
 
-func (a *App) metaInstagramOnboardingAvailable() bool {
+func (a *App) metaInstagramOnboardingAvailable(organizationID uuid.UUID) bool {
 	if a == nil || a.Redis == nil || !a.hasIntegrationEncryptionKey() ||
-		(a.Config != nil && a.Config.MetaInstagram.QuarantineOnly) {
+		a.Config == nil || organizationID == uuid.Nil ||
+		!a.Config.MetaInstagram.OrganizationReleased(organizationID.String()) {
 		return false
 	}
 	settings, err := a.metaInstagramOnboardingSettings()
@@ -97,6 +98,11 @@ func (a *App) metaInstagramOnboardingSettings() (configpkg.MetaInstagramConfig, 
 	settings.ReReplyBaseURL = strings.TrimRight(strings.TrimSpace(settings.ReReplyBaseURL), "/")
 	settings.RelayBaseURL = strings.TrimRight(strings.TrimSpace(settings.RelayBaseURL), "/")
 	settings.AllowedOrganizationID = strings.TrimSpace(settings.AllowedOrganizationID)
+	settings.AllowedOrganizationIDs = strings.TrimSpace(settings.AllowedOrganizationIDs)
+	settings.QuarantinedOrganizationIDs = strings.TrimSpace(settings.QuarantinedOrganizationIDs)
+	settings.DataDeletionComplianceOrganizationID = strings.TrimSpace(
+		settings.DataDeletionComplianceOrganizationID,
+	)
 	settings.DevelopmentTestProfileID = strings.TrimSpace(settings.DevelopmentTestProfileID)
 	settings.DevelopmentTestOAuthSubjectID = strings.TrimSpace(settings.DevelopmentTestOAuthSubjectID)
 	settings.DevelopmentAppRole = strings.ToLower(strings.TrimSpace(settings.DevelopmentAppRole))
@@ -104,7 +110,7 @@ func (a *App) metaInstagramOnboardingSettings() (configpkg.MetaInstagramConfig, 
 		settings.GraphAPIVersion == "" || settings.AuthorizationBaseURL == "" ||
 		settings.TokenBaseURL == "" || settings.GraphBaseURL == "" ||
 		settings.ReReplyBaseURL == "" || settings.RelayBaseURL == "" ||
-		settings.AllowedOrganizationID == "" {
+		len(settings.ManagedOrganizationIDs()) == 0 {
 		return configpkg.MetaInstagramConfig{}, errMetaInstagramOnboardingDisabled
 	}
 	return settings, nil
@@ -147,7 +153,10 @@ func (a *App) withLockedMetaInstagramEntitledAttempt(
 	)
 }
 
-func metaInstagramOnboardingFingerprint(settings configpkg.MetaInstagramConfig) string {
+func metaInstagramOnboardingFingerprint(
+	settings configpkg.MetaInstagramConfig,
+	organizationID uuid.UUID,
+) string {
 	secretDigest := sha256.Sum256([]byte(settings.AppSecret))
 	digest := sha256.Sum256([]byte(strings.Join([]string{
 		settings.AppID,
@@ -160,7 +169,10 @@ func metaInstagramOnboardingFingerprint(settings configpkg.MetaInstagramConfig) 
 		settings.GraphBaseURL,
 		settings.ReReplyBaseURL,
 		settings.RelayBaseURL,
-		settings.AllowedOrganizationID,
+		organizationID.String(),
+		strconv.FormatBool(settings.OrganizationReleased(organizationID.String())),
+		strconv.FormatBool(settings.OrganizationQuarantined(organizationID.String())),
+		settings.DataDeletionComplianceOrganization(),
 		settings.DevelopmentTestProfileID,
 		settings.DevelopmentTestOAuthSubjectID,
 		settings.DevelopmentAppRole,
@@ -168,8 +180,11 @@ func metaInstagramOnboardingFingerprint(settings configpkg.MetaInstagramConfig) 
 	return hex.EncodeToString(digest[:])
 }
 
-func (a *App) metaInstagramRuntimeFingerprint(settings configpkg.MetaInstagramConfig) string {
-	base := metaInstagramOnboardingFingerprint(settings)
+func (a *App) metaInstagramRuntimeFingerprint(
+	settings configpkg.MetaInstagramConfig,
+	organizationID uuid.UUID,
+) string {
+	base := metaInstagramOnboardingFingerprint(settings, organizationID)
 	if a == nil || a.Config == nil {
 		return base
 	}
@@ -179,7 +194,6 @@ func (a *App) metaInstagramRuntimeFingerprint(settings configpkg.MetaInstagramCo
 		base,
 		hex.EncodeToString(serviceDigest[:]),
 		hex.EncodeToString(edgeDigest[:]),
-		a.Config.MetaInstagram.AllowedOrganizationID,
 	}, "\x00")))
 	return hex.EncodeToString(digest[:])
 }
@@ -312,12 +326,12 @@ func (a *App) GetMetaInstagramOnboardingStatus(r *fastglue.Request) error {
 	}
 	status := metaInstagramOnboardingStatus{
 		OrganizationID: orgID,
-		Enabled:        settingsErr == nil && entitled && a.metaInstagramOnboardingAvailable(),
+		Enabled:        settingsErr == nil && entitled && a.metaInstagramOnboardingAvailable(orgID),
 		ReviewStatus:   "not_configured",
 	}
 	if settingsErr == nil {
 		status.Configured = true
-		status.QuarantineOnly = settings.QuarantineOnly
+		status.QuarantineOnly = settings.OrganizationQuarantined(orgID.String())
 		status.ReviewStatus = settings.AppReviewStatus
 		status.RedirectURL, _ = a.metaInstagramCallbackURL(settings)
 		status.DeauthorizeURL, _ = metaRegistryJoinURL(
@@ -381,7 +395,7 @@ func (a *App) beginMetaInstagramOnboarding(
 	orgID, userID, reconnectAccountID uuid.UUID,
 ) error {
 	settings, err := a.metaInstagramOnboardingSettings()
-	if err != nil || !a.metaInstagramOnboardingAvailable() {
+	if err != nil || !a.metaInstagramOnboardingAvailable(orgID) {
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Managed Instagram onboarding is unavailable until App Review is approved", nil, "")
 	}
 	if err := a.withLockedMetaInstagramEntitledAttempt(
@@ -407,7 +421,7 @@ func (a *App) beginMetaInstagramOnboarding(
 	now := time.Now().UTC()
 	state := metaInstagramOAuthState{
 		OrganizationID: orgID.String(), UserID: userID.String(), Nonce: nonce,
-		ConfigFingerprint: a.metaInstagramRuntimeFingerprint(settings),
+		ConfigFingerprint: a.metaInstagramRuntimeFingerprint(settings, orgID),
 		IssuedAt:          now,
 		ExpiresAt:         now.Add(metaInstagramOAuthStateTTL),
 	}
@@ -494,8 +508,10 @@ func (a *App) CallbackMetaInstagram(r *fastglue.Request) error {
 		return nil
 	}
 	settings, err := a.metaInstagramOnboardingSettings()
-	if err != nil || !a.metaInstagramOnboardingAvailable() ||
-		!metaInstagramOpaqueValuesEqual(state.ConfigFingerprint, a.metaInstagramRuntimeFingerprint(settings)) {
+	if err != nil || !a.metaInstagramOnboardingAvailable(orgID) ||
+		!metaInstagramOpaqueValuesEqual(
+			state.ConfigFingerprint, a.metaInstagramRuntimeFingerprint(settings, orgID),
+		) {
 		a.redirectMetaInstagramCallback(r, "error")
 		return nil
 	}
@@ -580,14 +596,28 @@ func (a *App) CallbackMetaInstagram(r *fastglue.Request) error {
 	operationID := uuid.New()
 	operationExpiresAt := now.Add(metaMessengerSubscriptionOperationLease)
 	var result metaRegistryProvisionResult
-	if !metaInstagramOpaqueValuesEqual(state.ConfigFingerprint, a.metaInstagramRuntimeFingerprint(settings)) {
+	if !metaInstagramOpaqueValuesEqual(
+		state.ConfigFingerprint, a.metaInstagramRuntimeFingerprint(settings, orgID),
+	) {
 		a.redirectMetaInstagramCallback(r, "error")
 		return nil
 	}
 	err = a.WithCommittedTenantApp(orgID, func(scoped *App) error {
 		// The callback can outlive the commercial grant that permitted OAuth
-		// start. Serialize this final authorization check with subscription
-		// changes before a new credential generation is persisted.
+		// start. Preserve the global Instagram lock order used by provision,
+		// reconnect, and lifecycle callbacks before taking the organization
+		// mutex that serializes this final entitlement check with subscription
+		// changes and credential persistence.
+		if err := lockMetaInstagramIdentityScopeTx(
+			scoped.DB, strings.TrimSpace(settings.AppID), oauthSubjectID,
+		); err != nil {
+			return err
+		}
+		if err := lockMetaInstagramProfessionalScopeTx(
+			scoped.DB, strings.TrimSpace(settings.AppID), professionalAccountID,
+		); err != nil {
+			return err
+		}
 		if err := lockChannelAIOrganizationScopeTx(scoped.DB, orgID); err != nil {
 			return err
 		}
@@ -776,9 +806,8 @@ func (a *App) metaInstagramReleaseSubjectAllowed(
 	oauthSubjectID string,
 ) bool {
 	if a == nil || a.Config == nil || !a.Config.MetaInstagram.Enabled ||
-		a.Config.MetaInstagram.QuarantineOnly ||
 		organizationID == uuid.Nil ||
-		strings.TrimSpace(a.Config.MetaInstagram.AllowedOrganizationID) != organizationID.String() {
+		!a.Config.MetaInstagram.OrganizationReleased(organizationID.String()) {
 		return false
 	}
 	reviewStatus := strings.ToLower(strings.TrimSpace(a.Config.MetaInstagram.AppReviewStatus))

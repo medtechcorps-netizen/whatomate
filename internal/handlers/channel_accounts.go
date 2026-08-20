@@ -214,7 +214,7 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 	}
 	if request.Channel == models.ChannelInstagram && request.Provider == channelapi.RelayProvider &&
 		a.Config.MetaInstagram.Enabled &&
-		strings.TrimSpace(a.Config.MetaInstagram.AllowedOrganizationID) == orgID.String() {
+		a.Config.MetaInstagram.OrganizationManaged(orgID.String()) {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusConflict,
 			"Instagram accounts in this workspace must be connected through managed Meta onboarding",

@@ -170,6 +170,16 @@ func (a *App) rotateMetaInstagramBinding(
 		!metaInstagramOAuthAuthorizationStartValid(input.AuthorizationStartedAt, time.Now().UTC()) {
 		return metaRegistryProvisionResult{}, metaregistry.ErrInvalidRequest
 	}
+	if err := lockMetaInstagramIdentityScopeTx(
+		a.DB, strings.TrimSpace(a.Config.MetaInstagram.AppID), oauthSubjectID,
+	); err != nil {
+		return metaRegistryProvisionResult{}, err
+	}
+	if err := lockMetaInstagramProfessionalScopeTx(
+		a.DB, strings.TrimSpace(a.Config.MetaInstagram.AppID), professionalAccountID,
+	); err != nil {
+		return metaRegistryProvisionResult{}, err
+	}
 	if err := lockChannelAIOrganizationScopeTx(a.DB, input.OrganizationID); err != nil {
 		return metaRegistryProvisionResult{}, err
 	}
@@ -192,6 +202,11 @@ func (a *App) rotateMetaInstagramBinding(
 		stringConfigValue(account.Metadata, "meta_platform_app_id") != strings.TrimSpace(a.Config.MetaInstagram.AppID) ||
 		!metaMessengerSubscriptionOperationAvailable(account.Metadata, time.Now().UTC()) {
 		return metaRegistryProvisionResult{}, errMetaMessengerSubscriptionFence
+	}
+	if err := a.ensureMetaInstagramProfileAvailableTx(
+		input.OrganizationID, account.ID, professionalAccountID,
+	); err != nil {
+		return metaRegistryProvisionResult{}, err
 	}
 	if err := a.metaInstagramOAuthGenerationFence(
 		input.OrganizationID,

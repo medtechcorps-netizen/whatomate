@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"html"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/audit"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	configpkg "github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -41,6 +44,9 @@ const (
 	metaInstagramDeletionResolvedDigestKey   = "meta_data_deletion_resolved_digest"
 	metaInstagramDeletionResolvedStateKey    = "meta_data_deletion_resolved_state"
 	metaInstagramDeletionResolvedAtKey       = "meta_data_deletion_resolved_at"
+	metaInstagramDeletionResolutionExact     = "exact_target"
+	metaInstagramDeletionResolutionNoTarget  = "no_current_target"
+	metaInstagramDeletionResolutionAmbiguous = "ambiguous_targets"
 )
 
 var (
@@ -59,6 +65,13 @@ type metaInstagramDeletionClaim struct {
 	Acquired bool
 }
 
+type metaInstagramDeletionJournalClaim struct {
+	Event      models.MetaInstagramDataDeletionEvent
+	OwnerID    uuid.UUID
+	SubjectKey string
+	Resolution string
+}
+
 // DeleteMetaInstagramUserData is Meta's dedicated data-deletion callback for
 // the managed Instagram Login application. It is intentionally not the
 // deauthorization handler: an authentic request creates a privacy workflow
@@ -67,6 +80,13 @@ func (a *App) DeleteMetaInstagramUserData(r *fastglue.Request) error {
 	setMetaInstagramDeletionResponseHeaders(r)
 	settings, err := a.metaInstagramOnboardingSettings()
 	if err != nil || a.Redis == nil {
+		if a != nil && a.Config != nil && a.Config.MetaInstagram.Enabled &&
+			(strings.TrimSpace(a.Config.MetaInstagram.AllowedOrganizationIDs) != "" ||
+				strings.TrimSpace(a.Config.MetaInstagram.QuarantinedOrganizationIDs) != "" ||
+				strings.TrimSpace(a.Config.MetaInstagram.DataDeletionComplianceOrganizationID) != "") &&
+			a.Config.MetaInstagram.DataDeletionComplianceOrganization() == "" {
+			return sendMetaInstagramDeletionError(r, fasthttp.StatusServiceUnavailable)
+		}
 		return sendMetaInstagramDeletionError(r, fasthttp.StatusNotFound)
 	}
 	body := r.RequestCtx.PostBody()
@@ -88,16 +108,12 @@ func (a *App) DeleteMetaInstagramUserData(r *fastglue.Request) error {
 	if err != nil {
 		return sendMetaInstagramDeletionError(r, fasthttp.StatusBadRequest)
 	}
-	organizationID, err := uuid.Parse(settings.AllowedOrganizationID)
-	if err != nil || organizationID == uuid.Nil {
-		return sendMetaInstagramDeletionError(r, fasthttp.StatusServiceUnavailable)
-	}
 	if allowed, rateErr := a.requireMetaInstagramDeletionRateLimit(r, digest); !allowed {
 		return rateErr
 	}
 	now := time.Now().UTC()
-	event, err := a.loadOrCreateMetaInstagramDeletionEvent(
-		organizationID, digest, settings.AppID, payload, now,
+	journalClaim, err := a.loadOrCreateMetaInstagramDeletionEvent(
+		digest, settings, payload, now,
 	)
 	if err != nil {
 		if errors.Is(err, errMetaInstagramDeletionEventStale) {
@@ -106,8 +122,10 @@ func (a *App) DeleteMetaInstagramUserData(r *fastglue.Request) error {
 		a.Log.Warn("Instagram data-deletion journal is unavailable")
 		return sendMetaInstagramDeletionError(r, fasthttp.StatusServiceUnavailable)
 	}
-	if event.State == "completed" {
-		return a.sendCompletedMetaInstagramDeletion(r, settings.ReReplyBaseURL, event)
+	if journalClaim.Event.State == "completed" {
+		return a.sendCompletedMetaInstagramDeletion(
+			r, settings.ReReplyBaseURL, journalClaim.Event,
+		)
 	}
 
 	claim, err := a.acquireMetaInstagramDeletion(requestContext(r), digest)
@@ -124,25 +142,20 @@ func (a *App) DeleteMetaInstagramUserData(r *fastglue.Request) error {
 		}
 	}()
 
-	targets, err := a.resolveMetaInstagramCallbackTargets(
-		organizationID, settings.AppID, payload.UserID,
-	)
-	if err != nil {
-		a.Log.Warn("Instagram data-deletion target lookup failed")
-		return sendMetaInstagramDeletionError(r, fasthttp.StatusServiceUnavailable)
-	}
-	accountIDs := make([]uuid.UUID, 0, len(targets))
-	for _, target := range targets {
-		accountIDs = append(accountIDs, target.AccountID)
-	}
-
 	eventIssuedAt := time.Unix(payload.IssuedAt, 0).UTC()
 	var privacyRequest models.PrivacyRequest
-	err = a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+	err = a.WithCommittedTenantApp(journalClaim.OwnerID, func(scoped *App) error {
 		var mutationErr error
 		privacyRequest, mutationErr = scoped.createOrResumeMetaInstagramDeletionRequest(
-			organizationID, settings.AppID, payload.UserID, digest, accountIDs,
-			eventIssuedAt, now,
+			journalClaim.OwnerID,
+			journalClaim.Event.PlatformAppID,
+			journalClaim.Event.AuthorizingUserID,
+			journalClaim.SubjectKey,
+			digest,
+			journalClaim.Resolution,
+			journalClaim.Event.IdentityHashed,
+			eventIssuedAt,
+			now,
 		)
 		return mutationErr
 	})
@@ -151,7 +164,7 @@ func (a *App) DeleteMetaInstagramUserData(r *fastglue.Request) error {
 		return sendMetaInstagramDeletionError(r, fasthttp.StatusServiceUnavailable)
 	}
 	if err := a.completeMetaInstagramDeletionEvent(
-		event, organizationID, privacyRequest, time.Now().UTC(),
+		journalClaim.Event, journalClaim.OwnerID, privacyRequest, time.Now().UTC(),
 	); err != nil {
 		a.Log.Warn("Instagram data-deletion journal completion failed")
 		return sendMetaInstagramDeletionError(r, fasthttp.StatusServiceUnavailable)
@@ -181,31 +194,41 @@ func (a *App) MetaInstagramDataDeletionStatus(r *fastglue.Request) error {
 		a.Config == nil {
 		return sendMetaInstagramDeletionText(r, fasthttp.StatusNotFound, "Request not found")
 	}
-	organizationID, err := uuid.Parse(strings.TrimSpace(
-		a.Config.MetaInstagram.AllowedOrganizationID,
-	))
-	if err != nil || organizationID == uuid.Nil {
+	organizationIDs, err := a.metaInstagramDeletionJournalOrganizations()
+	if err != nil || len(organizationIDs) == 0 {
 		return sendMetaInstagramDeletionText(r, fasthttp.StatusNotFound, "Request not found")
 	}
-	var journal models.MetaInstagramDataDeletionEvent
 	var privacyRequest models.PrivacyRequest
-	err = database.WithTenantReadCommitted(
-		a.rootApp().DB, organizationID, func(tx *gorm.DB) error {
-			if queryErr := tx.Where(
-				"organization_id = ? AND state = ? AND request_number = ? AND privacy_request_id IS NOT NULL",
-				organizationID, "completed", confirmationCode,
-			).First(&journal).Error; queryErr != nil {
-				return queryErr
-			}
-			return tx.Where(
-				"id = ? AND organization_id = ? AND request_number = ? AND type = ? AND received_channel = ? AND verification_method = ?",
-				*journal.PrivacyRequestID, organizationID, confirmationCode,
-				models.PrivacyRequestTypeDeletion, metaInstagramDeletionReceivedChannel,
-				metaInstagramDeletionVerification,
-			).First(&privacyRequest).Error
-		},
-	)
-	if err != nil {
+	found := false
+	for _, organizationID := range organizationIDs {
+		var candidateJournal models.MetaInstagramDataDeletionEvent
+		var candidateRequest models.PrivacyRequest
+		err = database.WithTenantReadCommitted(
+			a.rootApp().DB, organizationID, func(tx *gorm.DB) error {
+				if queryErr := tx.Where(
+					"organization_id = ? AND state = ? AND request_number = ? AND privacy_request_id IS NOT NULL",
+					organizationID, "completed", confirmationCode,
+				).First(&candidateJournal).Error; queryErr != nil {
+					return queryErr
+				}
+				return tx.Where(
+					"id = ? AND organization_id = ? AND request_number = ? AND type = ? AND received_channel = ? AND verification_method = ?",
+					*candidateJournal.PrivacyRequestID, organizationID, confirmationCode,
+					models.PrivacyRequestTypeDeletion, metaInstagramDeletionReceivedChannel,
+					metaInstagramDeletionVerification,
+				).First(&candidateRequest).Error
+			},
+		)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			continue
+		}
+		if err != nil || found {
+			return sendMetaInstagramDeletionText(r, fasthttp.StatusNotFound, "Request not found")
+		}
+		privacyRequest = candidateRequest
+		found = true
+	}
+	if !found {
 		return sendMetaInstagramDeletionText(r, fasthttp.StatusNotFound, "Request not found")
 	}
 	displayStatus, statusReason := metaInstagramDeletionDisplayStatus(
@@ -246,84 +269,266 @@ func (a *App) sendCompletedMetaInstagramDeletion(
 	})
 }
 
+func (a *App) metaInstagramDeletionJournalOrganizations() ([]uuid.UUID, error) {
+	if a == nil || a.Config == nil {
+		return nil, errors.New("instagram data-deletion journal configuration is unavailable")
+	}
+	values := append(
+		[]string(nil), a.Config.MetaInstagram.ManagedOrganizationIDs()...,
+	)
+	if compliance := a.Config.MetaInstagram.DataDeletionComplianceOrganization(); compliance != "" {
+		values = append(values, compliance)
+	} else if a.Config.MetaInstagram.UsesOrganizationSetModel() {
+		return nil, errors.New("instagram data-deletion compliance tenant is unavailable")
+	}
+	seen := make(map[uuid.UUID]struct{}, len(values))
+	organizationIDs := make([]uuid.UUID, 0, len(values))
+	for _, value := range values {
+		organizationID, err := uuid.Parse(value)
+		if err != nil || organizationID == uuid.Nil || organizationID.String() != value {
+			return nil, errors.New("instagram data-deletion journal tenant is invalid")
+		}
+		if _, exists := seen[organizationID]; exists {
+			continue
+		}
+		seen[organizationID] = struct{}{}
+		organizationIDs = append(organizationIDs, organizationID)
+	}
+	sort.Slice(organizationIDs, func(left, right int) bool {
+		return organizationIDs[left].String() < organizationIDs[right].String()
+	})
+	if len(organizationIDs) == 0 {
+		return nil, errors.New("instagram data-deletion journal tenant is unavailable")
+	}
+	return organizationIDs, nil
+}
+
+func metaInstagramComplianceIdentityHash(
+	appSecret, field, value string,
+) (string, error) {
+	appSecret = strings.TrimSpace(appSecret)
+	field = strings.TrimSpace(field)
+	value = strings.TrimSpace(value)
+	if appSecret == "" || (field != "app" && field != "subject") ||
+		!validCanonicalMetaID(value) {
+		return "", errors.New("instagram data-deletion compliance identity is invalid")
+	}
+	digest := hmac.New(sha256.New, []byte(appSecret))
+	_, _ = digest.Write([]byte("managed-instagram-data-deletion-v1\x00" + field + "\x00" + value))
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
 func (a *App) loadOrCreateMetaInstagramDeletionEvent(
-	organizationID uuid.UUID,
-	digest, appID string,
+	digest string,
+	settings configpkg.MetaInstagramConfig,
 	payload metaMessengerSignedRequestPayload,
 	now time.Time,
-) (models.MetaInstagramDataDeletionEvent, error) {
-	var event models.MetaInstagramDataDeletionEvent
-	if a == nil || a.DB == nil || organizationID == uuid.Nil ||
+) (metaInstagramDeletionJournalClaim, error) {
+	var claim metaInstagramDeletionJournalClaim
+	appID := strings.TrimSpace(settings.AppID)
+	if a == nil || a.DB == nil || a.Config == nil ||
 		len(strings.TrimSpace(digest)) != sha256.Size*2 ||
 		!validCanonicalMetaID(appID) || !validCanonicalMetaID(payload.UserID) || payload.IssuedAt <= 0 {
-		return event, errMetaInstagramDeletionEventStale
+		return claim, errMetaInstagramDeletionEventStale
 	}
 	issuedAt := time.Unix(payload.IssuedAt, 0).UTC()
 	now = now.UTC()
-	if issuedAt.After(now.Add(2 * time.Minute)) {
-		return event, errMetaInstagramDeletionEventStale
+	if issuedAt.After(now.Add(2*time.Minute)) ||
+		now.Sub(issuedAt) > metaInstagramDeletionUnresolvedRetention {
+		return claim, errMetaInstagramDeletionEventStale
 	}
-	if now.Sub(issuedAt) > metaInstagramDeletionUnresolvedRetention {
-		return event, errMetaInstagramDeletionEventStale
+	journalOrganizations, err := a.metaInstagramDeletionJournalOrganizations()
+	if err != nil {
+		return claim, err
 	}
-	err := database.WithTenantReadCommitted(
-		a.rootApp().DB, organizationID, func(tx *gorm.DB) error {
-			// Serialize the first durable signed-event write with OAuth
-			// provision/rotation. If OAuth owns this mutex first, the callback
-			// resolves the account after that transaction commits; if this insert
-			// wins, OAuth observes the journal and cannot persist or subscribe.
+	err = a.rootApp().DB.Transaction(func(tx *gorm.DB) error {
+		// The app-scoped subject mutex serializes callbacks with OAuth across
+		// every configured tenant. Organization locks are then acquired in one
+		// canonical order before any tenant journal/account row is read.
+		if lockErr := lockMetaInstagramIdentityScopeTx(tx, appID, payload.UserID); lockErr != nil {
+			return lockErr
+		}
+		for _, organizationID := range journalOrganizations {
+			if setErr := a.setMetaInstagramTenantContextTx(tx, organizationID); setErr != nil {
+				return setErr
+			}
 			if lockErr := lockChannelAIOrganizationScopeTx(tx, organizationID); lockErr != nil {
 				return lockErr
 			}
-			queryErr := tx.Where(
+		}
+
+		var existing *models.MetaInstagramDataDeletionEvent
+		for _, organizationID := range journalOrganizations {
+			if setErr := a.setMetaInstagramTenantContextTx(tx, organizationID); setErr != nil {
+				return setErr
+			}
+			var candidate models.MetaInstagramDataDeletionEvent
+			queryErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
 				"organization_id = ? AND digest = ?", organizationID, digest,
-			).First(&event).Error
+			).First(&candidate).Error
 			if errors.Is(queryErr, gorm.ErrRecordNotFound) {
-				event = models.MetaInstagramDataDeletionEvent{
-					Digest: digest, OrganizationID: organizationID,
-					PlatformAppID: appID, AuthorizingUserID: payload.UserID,
-					IssuedAt: issuedAt, VerifiedAt: now, State: "verified", LastAttemptAt: &now,
-				}
-				if createErr := tx.Clauses(clause.OnConflict{DoNothing: true}).
-					Create(&event).Error; createErr != nil {
-					return createErr
-				}
-				queryErr = tx.Where(
-					"organization_id = ? AND digest = ?", organizationID, digest,
-				).First(&event).Error
+				continue
 			}
 			if queryErr != nil {
 				return queryErr
 			}
-			if event.OrganizationID != organizationID || event.PlatformAppID != appID ||
-				event.AuthorizingUserID != payload.UserID ||
-				!event.IssuedAt.UTC().Equal(issuedAt) {
+			if existing != nil {
+				return errors.New("instagram data-deletion journal is duplicated across tenants")
+			}
+			existing = &candidate
+		}
+		if existing != nil {
+			resolution := strings.TrimSpace(existing.TargetResolution)
+			if resolution == "" {
+				resolution = metaInstagramDeletionResolutionExact
+			}
+			switch resolution {
+			case metaInstagramDeletionResolutionExact,
+				metaInstagramDeletionResolutionNoTarget,
+				metaInstagramDeletionResolutionAmbiguous:
+			default:
+				return errors.New("instagram data-deletion journal resolution is invalid")
+			}
+			ownerText := existing.OrganizationID.String()
+			if settings.UsesOrganizationSetModel() {
+				ownerIsCompliance := ownerText == settings.DataDeletionComplianceOrganization()
+				if existing.IdentityHashed {
+					if !ownerIsCompliance || resolution == metaInstagramDeletionResolutionExact {
+						return errors.New("instagram data-deletion journal ownership is invalid")
+					}
+				} else {
+					// A no-target receipt created while this same binary was still in
+					// legacy-singleton rollout mode remains owned by that original
+					// tenant for idempotent replay/status retention. New no-target and
+					// ambiguous receipts in the organization-set model are always
+					// HMAC-bound to the separate compliance tenant below.
+					validLegacyResolution := resolution == metaInstagramDeletionResolutionExact ||
+						resolution == metaInstagramDeletionResolutionNoTarget
+					if ownerIsCompliance || !settings.OrganizationManaged(ownerText) ||
+						!validLegacyResolution {
+						return errors.New("instagram data-deletion journal ownership is invalid")
+					}
+				}
+			} else if existing.IdentityHashed || !settings.OrganizationManaged(ownerText) ||
+				resolution == metaInstagramDeletionResolutionAmbiguous {
+				return errors.New("instagram data-deletion journal ownership is invalid")
+			}
+			expectedAppID := appID
+			expectedSubjectID := payload.UserID
+			if existing.IdentityHashed {
+				expectedAppID, err = metaInstagramComplianceIdentityHash(
+					settings.AppSecret, "app", appID,
+				)
+				if err != nil {
+					return err
+				}
+				expectedSubjectID, err = metaInstagramComplianceIdentityHash(
+					settings.AppSecret, "subject", payload.UserID,
+				)
+				if err != nil {
+					return err
+				}
+			}
+			if existing.PlatformAppID != expectedAppID ||
+				existing.AuthorizingUserID != expectedSubjectID ||
+				!existing.IssuedAt.UTC().Equal(issuedAt) ||
+				(existing.State != "verified" && existing.State != "completed") {
 				return errors.New("instagram data-deletion journal identity mismatch")
 			}
-			if event.State != "verified" && event.State != "completed" {
-				return errors.New("instagram data-deletion journal state is invalid")
+			claim = metaInstagramDeletionJournalClaim{
+				Event: *existing, OwnerID: existing.OrganizationID,
+				SubjectKey: existing.AuthorizingUserID, Resolution: resolution,
 			}
-			targets, resolveErr := resolveMetaInstagramCallbackTargetsTx(
-				tx, organizationID, appID, payload.UserID,
-			)
-			if resolveErr != nil {
-				return resolveErr
+			return nil
+		}
+
+		targets, resolveErr := a.resolveMetaInstagramCallbackTargetsTx(
+			tx, appID, payload.UserID,
+		)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		resolution := metaInstagramDeletionResolutionExact
+		ownerID := uuid.Nil
+		journalAppID := appID
+		journalSubjectID := payload.UserID
+		identityHashed := false
+		var exactTarget *metaDeauthorizationTarget
+		switch len(targets) {
+		case 1:
+			ownerID = targets[0].OrganizationID
+			exactTarget = &targets[0]
+		case 0:
+			resolution = metaInstagramDeletionResolutionNoTarget
+		default:
+			resolution = metaInstagramDeletionResolutionAmbiguous
+		}
+		if exactTarget == nil {
+			if settings.UsesOrganizationSetModel() {
+				complianceText := settings.DataDeletionComplianceOrganization()
+				ownerID, err = uuid.Parse(complianceText)
+				if err != nil || ownerID == uuid.Nil || ownerID.String() != complianceText {
+					return errors.New("instagram data-deletion compliance tenant is unavailable")
+				}
+				journalAppID, err = metaInstagramComplianceIdentityHash(
+					settings.AppSecret, "app", appID,
+				)
+				if err != nil {
+					return err
+				}
+				journalSubjectID, err = metaInstagramComplianceIdentityHash(
+					settings.AppSecret, "subject", payload.UserID,
+				)
+				if err != nil {
+					return err
+				}
+				identityHashed = true
+			} else {
+				// Reader-first rollout preserves the former singleton no-target
+				// privacy owner. Legacy ambiguity remains fail closed until the
+				// dedicated compliance tenant is configured.
+				if len(targets) > 1 {
+					return errors.New("instagram data-deletion target is ambiguous")
+				}
+				managed := settings.ManagedOrganizationIDs()
+				if len(managed) != 1 {
+					return errors.New("instagram data-deletion legacy tenant is unavailable")
+				}
+				ownerID, err = uuid.Parse(managed[0])
+				if err != nil || ownerID == uuid.Nil {
+					return errors.New("instagram data-deletion legacy tenant is unavailable")
+				}
 			}
-			if len(targets) == 0 {
-				return nil
-			}
-			// The account mutation is deliberately part of the first journal
-			// transaction. If this signed event is current or same-second,
-			// revoke/quarantine and queue cancellation become visible atomically
-			// with the journal. Strictly older events remain evidence only.
-			scoped := a.rootApp().scopedApp(tx, organizationID)
-			return scoped.applyMetaInstagramDeletionToAccount(
-				organizationID, targets[0].AccountID, appID, payload.UserID,
-				digest, issuedAt, now,
-			)
-		},
-	)
-	return event, err
+		}
+		if setErr := a.setMetaInstagramTenantContextTx(tx, ownerID); setErr != nil {
+			return setErr
+		}
+		event := models.MetaInstagramDataDeletionEvent{
+			Digest: digest, OrganizationID: ownerID,
+			PlatformAppID: journalAppID, AuthorizingUserID: journalSubjectID,
+			IssuedAt: issuedAt, VerifiedAt: now, State: "verified",
+			TargetResolution: resolution, IdentityHashed: identityHashed,
+			LastAttemptAt: &now,
+		}
+		if createErr := tx.Create(&event).Error; createErr != nil {
+			return createErr
+		}
+		claim = metaInstagramDeletionJournalClaim{
+			Event: event, OwnerID: ownerID,
+			SubjectKey: journalSubjectID, Resolution: resolution,
+		}
+		if exactTarget == nil {
+			return nil
+		}
+		// Exact target mutation is atomic with the first journal write. A
+		// current/same-second generation becomes non-routable before commit;
+		// a strictly older signed event remains privacy evidence only.
+		return a.rootApp().scopedApp(tx, ownerID).applyMetaInstagramDeletionToAccount(
+			ownerID, exactTarget.AccountID, appID, payload.UserID,
+			digest, issuedAt, now,
+		)
+	})
+	return claim, err
 }
 
 func (a *App) completeMetaInstagramDeletionEvent(
@@ -376,52 +581,56 @@ func (a *App) cleanupMetaInstagramDeletionEvents(now time.Time) error {
 	if a == nil || a.DB == nil || a.Config == nil {
 		return errors.New("instagram data-deletion journal is unavailable")
 	}
-	organizationID, err := uuid.Parse(strings.TrimSpace(
-		a.Config.MetaInstagram.AllowedOrganizationID,
-	))
-	if err != nil || organizationID == uuid.Nil {
-		return errors.New("instagram data-deletion journal tenant is unavailable")
+	organizationIDs, err := a.metaInstagramDeletionJournalOrganizations()
+	if err != nil {
+		return err
 	}
 	now = now.UTC()
-	return database.WithTenantReadCommitted(
-		a.rootApp().DB, organizationID, func(tx *gorm.DB) error {
-			for _, cleanup := range []struct {
-				where string
-				args  []any
-			}{
-				{
-					where: "organization_id = ? AND state = ? AND completed_at IS NOT NULL AND completed_at < ?",
-					args:  []any{organizationID, "completed", now.Add(-metaInstagramDeletionCompletedRetention)},
-				},
-				{
-					where: "organization_id = ? AND state = ? AND verified_at < ?",
-					args:  []any{organizationID, "verified", now.Add(-metaInstagramDeletionUnresolvedRetention)},
-				},
-			} {
-				var digests []string
-				if queryErr := tx.Model(&models.MetaInstagramDataDeletionEvent{}).
-					Where(cleanup.where, cleanup.args...).Order("verified_at").
-					Limit(metaInstagramDeletionCleanupBatch).Pluck("digest", &digests).Error; queryErr != nil {
-					return queryErr
+	for _, organizationID := range organizationIDs {
+		err = database.WithTenantReadCommitted(
+			a.rootApp().DB, organizationID, func(tx *gorm.DB) error {
+				for _, cleanup := range []struct {
+					where string
+					args  []any
+				}{
+					{
+						where: "organization_id = ? AND state = ? AND completed_at IS NOT NULL AND completed_at < ?",
+						args:  []any{organizationID, "completed", now.Add(-metaInstagramDeletionCompletedRetention)},
+					},
+					{
+						where: "organization_id = ? AND state = ? AND verified_at < ?",
+						args:  []any{organizationID, "verified", now.Add(-metaInstagramDeletionUnresolvedRetention)},
+					},
+				} {
+					var digests []string
+					if queryErr := tx.Model(&models.MetaInstagramDataDeletionEvent{}).
+						Where(cleanup.where, cleanup.args...).Order("verified_at").
+						Limit(metaInstagramDeletionCleanupBatch).Pluck("digest", &digests).Error; queryErr != nil {
+						return queryErr
+					}
+					if len(digests) == 0 {
+						continue
+					}
+					if deleteErr := tx.Where(
+						"organization_id = ? AND digest IN ?", organizationID, digests,
+					).Delete(&models.MetaInstagramDataDeletionEvent{}).Error; deleteErr != nil {
+						return deleteErr
+					}
 				}
-				if len(digests) == 0 {
-					continue
-				}
-				if deleteErr := tx.Where(
-					"organization_id = ? AND digest IN ?", organizationID, digests,
-				).Delete(&models.MetaInstagramDataDeletionEvent{}).Error; deleteErr != nil {
-					return deleteErr
-				}
-			}
-			return nil
-		},
-	)
+				return nil
+			},
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *App) createOrResumeMetaInstagramDeletionRequest(
 	organizationID uuid.UUID,
-	appID, userID, digest string,
-	accountIDs []uuid.UUID,
+	journalAppID, journalUserID, subjectKey, digest, resolution string,
+	identityHashed bool,
 	eventIssuedAt, now time.Time,
 ) (models.PrivacyRequest, error) {
 	if err := lockChannelAIOrganizationScopeTx(a.DB, organizationID); err != nil {
@@ -437,7 +646,14 @@ func (a *App) createOrResumeMetaInstagramDeletionRequest(
 		First(&journal).Error; err != nil {
 		return models.PrivacyRequest{}, err
 	}
-	if journal.PlatformAppID != appID || journal.AuthorizingUserID != userID ||
+	journalResolution := strings.TrimSpace(journal.TargetResolution)
+	if journalResolution == "" {
+		journalResolution = metaInstagramDeletionResolutionExact
+	}
+	if journal.PlatformAppID != journalAppID ||
+		journal.AuthorizingUserID != journalUserID ||
+		journalResolution != resolution ||
+		journal.IdentityHashed != identityHashed ||
 		!journal.IssuedAt.UTC().Equal(eventIssuedAt.UTC()) {
 		return models.PrivacyRequest{}, errors.New("instagram data-deletion journal identity mismatch")
 	}
@@ -449,7 +665,7 @@ func (a *App) createOrResumeMetaInstagramDeletionRequest(
 		if err := a.DB.Where(
 			"id = ? AND organization_id = ? AND verification_token_hash = ?",
 			*journal.PrivacyRequestID, organizationID,
-			metaInstagramDeletionEventHash(appID, userID, digest),
+			metaInstagramDeletionEventHash(journalAppID, journalUserID, digest),
 		).First(&completed).Error; err != nil {
 			return models.PrivacyRequest{}, err
 		}
@@ -461,7 +677,7 @@ func (a *App) createOrResumeMetaInstagramDeletionRequest(
 	if journal.State != "verified" {
 		return models.PrivacyRequest{}, errors.New("instagram data-deletion journal is not actionable")
 	}
-	eventHash := metaInstagramDeletionEventHash(appID, userID, digest)
+	eventHash := metaInstagramDeletionEventHash(journalAppID, journalUserID, digest)
 	var privacyRequest models.PrivacyRequest
 	err := a.DB.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
 		"organization_id = ? AND type = ? AND received_channel = ? AND verification_method = ? AND verification_token_hash = ?",
@@ -477,10 +693,13 @@ func (a *App) createOrResumeMetaInstagramDeletionRequest(
 			BaseModel: models.BaseModel{ID: requestID}, OrganizationID: organizationID,
 			RequestNumber: "IGDEL" + strings.ToUpper(strings.ReplaceAll(requestID.String(), "-", "")),
 			Type:          models.PrivacyRequestTypeDeletion, Status: models.PrivacyRequestStatusInProgress,
-			SubjectType: metaInstagramDeletionSubjectType, SubjectKey: userID,
-			ReceivedChannel:       metaInstagramDeletionReceivedChannel,
-			RequesterProfile:      models.JSONB{},
-			RequestDetails:        models.JSONB{"source": "meta_instagram_managed_login"},
+			SubjectType: metaInstagramDeletionSubjectType, SubjectKey: subjectKey,
+			ReceivedChannel:  metaInstagramDeletionReceivedChannel,
+			RequesterProfile: models.JSONB{},
+			RequestDetails: models.JSONB{
+				"source": "meta_instagram_managed_login", "target_resolution": resolution,
+				"requires_manual_resolution": resolution == metaInstagramDeletionResolutionAmbiguous,
+			},
 			VerificationMethod:    metaInstagramDeletionVerification,
 			VerificationTokenHash: eventHash, ReceivedAt: now.UTC(),
 			DueAt: now.UTC().Add(30 * 24 * time.Hour), VerifiedAt: utcTimePointer(now),
@@ -499,19 +718,20 @@ func (a *App) createOrResumeMetaInstagramDeletionRequest(
 		if err := a.DB.Create(&event).Error; err != nil {
 			return models.PrivacyRequest{}, err
 		}
-	}
-
-	for _, accountID := range accountIDs {
-		if err := a.applyMetaInstagramDeletionToAccount(
-			organizationID, accountID, appID, userID, digest, eventIssuedAt, now,
-		); err != nil {
-			if errors.Is(err, errMetaInstagramDeletionTargetNotExact) {
-				// An authentic privacy request does not depend on a current OAuth
-				// authorization. Ignore a corrupt/stale candidate without touching
-				// it, while still completing the durable deletion workflow.
-				continue
+		if resolution == metaInstagramDeletionResolutionAmbiguous {
+			escalation := models.PrivacyRequestEvent{
+				BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: organizationID,
+				PrivacyRequestID: privacyRequest.ID, EventType: "target_resolution_required",
+				ToStatus: privacyRequest.Status,
+				Message:  "Managed Instagram deletion target resolution requires compliance review",
+				Details: models.JSONB{
+					"target_resolution": resolution,
+				},
+				OccurredAt: now.UTC(),
 			}
-			return models.PrivacyRequest{}, err
+			if err := a.DB.Create(&escalation).Error; err != nil {
+				return models.PrivacyRequest{}, err
+			}
 		}
 	}
 	return privacyRequest, nil

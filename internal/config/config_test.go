@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha1" //nolint:gosec // matches the coturn TURN REST API derivation under test
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -438,6 +439,128 @@ development_app_role = "tester"
 			assert.Contains(t, loadErr.Error(), "environment must be development, staging, or production")
 		})
 	}
+}
+
+func TestLoad_ManagedInstagramOrganizationSetsAreBoundedAndBackwardCompatible(t *testing.T) {
+	const (
+		activeA    = "11111111-1111-4111-8111-111111111111"
+		activeB    = "22222222-2222-4222-8222-222222222222"
+		quarantine = "33333333-3333-4333-8333-333333333333"
+		compliance = "99999999-9999-4999-8999-999999999999"
+	)
+	base := `
+[app]
+environment = "production"
+encryption_key = "synthetic-encryption-key-at-least-32-bytes"
+
+[server]
+write_timeout = 120
+
+[meta_registry]
+enabled = true
+service_secret = "synthetic-registry-service-secret-at-least-32-bytes"
+relay_edge_secret = "synthetic-registry-edge-secret-at-least-32-bytes"
+queue_reader_version = 2
+
+[meta_instagram_onboarding]
+enabled = true
+app_id = "111122223333444"
+app_secret = "synthetic-instagram-secret-at-least-32-bytes"
+app_review_status = "approved"
+rereply_base_url = "https://app.rereply.app"
+relay_base_url = "https://app.rereply.app/meta-relay"
+`
+
+	legacy, err := config.Load(writeConfig(t, base+`
+allowed_organization_id = "`+activeA+`"
+`))
+	require.NoError(t, err)
+	assert.False(t, legacy.MetaInstagram.UsesOrganizationSetModel())
+	assert.Equal(t, []string{activeA}, legacy.MetaInstagram.ActiveOrganizationIDs())
+	assert.Equal(t, []string{activeA}, legacy.MetaInstagram.ManagedOrganizationIDs())
+	assert.Empty(t, legacy.MetaInstagram.DataDeletionComplianceOrganization())
+
+	transition, err := config.Load(writeConfig(t, base+`
+allowed_organization_id = "`+activeA+`"
+allowed_organization_ids = "`+activeA+`"
+data_deletion_compliance_organization_id = "`+compliance+`"
+`))
+	require.NoError(t, err)
+	assert.True(t, transition.MetaInstagram.UsesOrganizationSetModel())
+	assert.Equal(t, []string{activeA}, transition.MetaInstagram.ActiveOrganizationIDs())
+	assert.Equal(t, compliance, transition.MetaInstagram.DataDeletionComplianceOrganization())
+
+	multi, err := config.Load(writeConfig(t, base+`
+allowed_organization_ids = "`+activeB+`,`+activeA+`"
+quarantined_organization_ids = "`+quarantine+`"
+data_deletion_compliance_organization_id = "`+compliance+`"
+`))
+	require.NoError(t, err)
+	assert.True(t, multi.MetaInstagram.UsesOrganizationSetModel())
+	assert.Equal(t, []string{activeA, activeB}, multi.MetaInstagram.ActiveOrganizationIDs())
+	assert.Equal(t, []string{activeA, activeB, quarantine}, multi.MetaInstagram.ManagedOrganizationIDs())
+	assert.True(t, multi.MetaInstagram.OrganizationReleased(activeA))
+	assert.False(t, multi.MetaInstagram.OrganizationReleased(quarantine))
+	assert.True(t, multi.MetaInstagram.OrganizationManaged(quarantine))
+	assert.True(t, multi.MetaInstagram.OrganizationQuarantined(quarantine))
+	assert.Equal(t, compliance, multi.MetaInstagram.DataDeletionComplianceOrganization())
+	multi.MetaInstagram.QuarantineOnly = true
+	assert.False(t, multi.MetaInstagram.OrganizationReleased(activeA))
+	assert.True(t, multi.MetaInstagram.OrganizationQuarantined(activeA))
+	assert.True(t, multi.MetaInstagram.OrganizationQuarantined(quarantine))
+
+	_, err = config.Load(writeConfig(t, base+`
+allowed_organization_ids = "`+activeA+`,`+activeB+`"
+`))
+	require.ErrorContains(t, err, "data_deletion_compliance_organization_id")
+
+	_, err = config.Load(writeConfig(t, base+`
+allowed_organization_id = "`+activeA+`"
+data_deletion_compliance_organization_id = "`+compliance+`"
+`))
+	require.ErrorContains(t, err, "requires the organization-set model")
+
+	_, err = config.Load(writeConfig(t, base+`
+allowed_organization_id = "`+activeA+`"
+allowed_organization_ids = "`+activeA+`,`+activeB+`"
+data_deletion_compliance_organization_id = "`+compliance+`"
+`))
+	require.ErrorContains(t, err, "legacy allowed_organization_id")
+
+	_, err = config.Load(writeConfig(t, base+`
+allowed_organization_ids = "`+activeA+`"
+quarantined_organization_ids = "`+activeA+`"
+data_deletion_compliance_organization_id = "`+compliance+`"
+`))
+	require.ErrorContains(t, err, "must be disjoint")
+
+	_, err = config.Load(writeConfig(t, base+`
+allowed_organization_ids = "`+activeA+`"
+data_deletion_compliance_organization_id = "`+activeA+`"
+`))
+	require.ErrorContains(t, err, "distinct from every managed clinic")
+
+	_, err = config.Load(writeConfig(t, base+`
+allowed_organization_ids = "00000000-0000-0000-0000-000000000000"
+data_deletion_compliance_organization_id = "`+compliance+`"
+`))
+	require.ErrorContains(t, err, "allowed_organization_ids must contain canonical UUIDs")
+
+	_, err = config.Load(writeConfig(t, base+`
+allowed_organization_ids = "`+activeA+`"
+data_deletion_compliance_organization_id = "00000000-0000-0000-0000-000000000000"
+`))
+	require.ErrorContains(t, err, "data_deletion_compliance_organization_id")
+
+	tooMany := make([]string, 0, config.MaxMetaInstagramManagedOrganizations+1)
+	for index := 1; index <= config.MaxMetaInstagramManagedOrganizations+1; index++ {
+		tooMany = append(tooMany, fmt.Sprintf("00000000-0000-4000-8000-%012x", index))
+	}
+	_, err = config.Load(writeConfig(t, base+`
+allowed_organization_ids = "`+strings.Join(tooMany, ",")+`"
+data_deletion_compliance_organization_id = "`+compliance+`"
+`))
+	require.ErrorContains(t, err, "at most 32 managed organizations")
 }
 
 func TestLoad_ManagedInstagramAppMustRemainDistinctFromManagedMessenger(t *testing.T) {
