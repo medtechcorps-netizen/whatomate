@@ -794,9 +794,9 @@ func metaMessengerCandidateTargetsAllowed(
 // revalidateMetaMessengerOwnedPage repeats the two authoritative edges at the
 // point of selection. The earlier inventory is only a UI snapshot: it cannot
 // authorize persistence after the user's Page task or Business ownership has
-// changed. The Page token used below is also replaced with the fresh token
-// returned by the token holder's actual Page-authority edge: /me/accounts for
-// a USER or /{system-user-id}/assigned_pages for a SYSTEM_USER.
+// changed. For a USER, /me/accounts supplies the Page token directly. For a
+// SYSTEM_USER, assigned_pages proves the exact task assignment, then the
+// official Page edge supplies a fresh Page access token for the selected Page.
 func (a *App) revalidateMetaMessengerOwnedPage(
 	ctx context.Context,
 	userToken string,
@@ -899,6 +899,30 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 		}
 		if !foundOwned {
 			return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+		}
+		// assigned_pages is the authority edge for the integration system
+		// user's Page tasks, but its access_token field is not the documented
+		// Page-token exchange contract. Resolve the selected Page's token from
+		// the exact Page edge using the freshly revalidated system-user token.
+		// This is bounded to one provider request after both assignment and
+		// ownership have been proven.
+		var pageBinding metaMessengerGraphPageAccess
+		if err := a.doMetaMessengerGraphJSON(
+			ctx,
+			http.MethodGet,
+			url.PathEscape(selected.PageID),
+			url.Values{"fields": {"id,name,access_token"}},
+			userToken,
+			&pageBinding,
+		); err != nil {
+			return metaMessengerStoredPage{}, err
+		}
+		if strings.TrimSpace(pageBinding.ID) != selected.PageID {
+			return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+		}
+		accessible.AccessToken = strings.TrimSpace(pageBinding.AccessToken)
+		if pageName := strings.TrimSpace(pageBinding.Name); pageName != "" {
+			ownedName = pageName
 		}
 	default:
 		return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
