@@ -1535,9 +1535,20 @@ func (w *Worker) recheckChannelAIOutboxDispatchWithAccount(
 			}
 			return err
 		}
+		if err := channelapi.ApplyCentralQwenSettings(
+			tx,
+			orgID,
+			&settings.AI,
+		); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: qwen settings are disabled", errChannelOutboxAIPolicy)
+			}
+			return fmt.Errorf("resolve central qwen settings at dispatch fence: %w", err)
+		}
 		if !settings.IsEnabled ||
 			!settings.AI.Enabled ||
-			settings.AI.Provider != models.AIProviderQwen {
+			settings.AI.Provider != models.AIProviderQwen ||
+			strings.TrimSpace(settings.AI.APIKey) == "" {
 			return fmt.Errorf("%w: qwen settings are disabled", errChannelOutboxAIPolicy)
 		}
 		now := time.Now().UTC()

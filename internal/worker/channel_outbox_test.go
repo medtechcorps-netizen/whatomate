@@ -921,6 +921,122 @@ func TestChannelAIOutboxDispatchAllowsUnchangedEligibleJob(t *testing.T) {
 	assert.Zero(t, result.RowsAffected)
 }
 
+func TestChannelAIOutboxDispatchUsesCentralQwenForBoundDefaultProvider(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	fixture := createChannelAIReplyWorkerFixture(t, db)
+	require.NoError(t, db.Model(&models.ChatbotSettings{}).
+		Where("id = ?", fixture.Settings.ID).
+		Updates(map[string]any{
+			"ai_provider": "",
+			"ai_api_key":  "",
+			"ai_model":    "",
+		}).Error)
+
+	// A newer profile must not replace the exact settings row bound into the
+	// outbox payload when the reply was generated.
+	_ = createChannelAIReplySettings(
+		t,
+		db,
+		fixture.Organization.ID,
+		fixture.Account.Name,
+		models.AIProviderQwen,
+		false,
+		time.Now().UTC().Add(time.Minute),
+	)
+	job, _ := createChannelAIOutboxDispatchFixture(
+		t,
+		db,
+		fixture,
+		time.Now().UTC().Add(time.Hour),
+		"central-qwen-dispatch-worker",
+	)
+
+	worker := &Worker{DB: db, Log: testutil.NopLogger()}
+	require.NoError(t, worker.recheckChannelAIOutboxDispatch(
+		fixture.Organization.ID,
+		job.ID,
+		job.LockedBy,
+	))
+	require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+	assert.Equal(t, models.OutboxJobStatusDispatching, job.Status)
+}
+
+func TestChannelAIOutboxDispatchCancelsWithoutCentralQwen(t *testing.T) {
+	tests := []struct {
+		name                string
+		makeQwenUnavailable func(*testing.T, *gorm.DB, *channelAIReplyFixture)
+	}{
+		{
+			name: "disabled",
+			makeQwenUnavailable: func(
+				t *testing.T,
+				db *gorm.DB,
+				fixture *channelAIReplyFixture,
+			) {
+				require.NoError(t, db.Model(&models.CopilotSettings{}).
+					Where("organization_id = ? AND whats_app_account = ''", fixture.Organization.ID).
+					Update("is_enabled", false).Error)
+			},
+		},
+		{
+			name: "missing",
+			makeQwenUnavailable: func(
+				t *testing.T,
+				db *gorm.DB,
+				fixture *channelAIReplyFixture,
+			) {
+				require.NoError(t, db.Where(
+					"organization_id = ? AND whats_app_account = ''",
+					fixture.Organization.ID,
+				).Delete(&models.CopilotSettings{}).Error)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			fixture := createChannelAIReplyWorkerFixture(t, db)
+			require.NoError(t, db.Model(&models.ChatbotSettings{}).
+				Where("id = ?", fixture.Settings.ID).
+				Updates(map[string]any{
+					"ai_provider": "",
+					"ai_api_key":  "",
+					"ai_model":    "",
+				}).Error)
+			job, message := createChannelAIOutboxDispatchFixture(
+				t,
+				db,
+				fixture,
+				time.Now().UTC().Add(time.Hour),
+				"central-qwen-policy-worker",
+			)
+			test.makeQwenUnavailable(t, db, fixture)
+
+			worker := &Worker{DB: db, Log: testutil.NopLogger()}
+			err := worker.recheckChannelAIOutboxDispatch(
+				fixture.Organization.ID,
+				job.ID,
+				job.LockedBy,
+			)
+			require.ErrorIs(t, err, errChannelOutboxAIPolicy)
+			assert.Contains(t, err.Error(), "qwen settings are disabled")
+			require.NoError(t, worker.cancelChannelAIOutboxJob(
+				fixture.Organization.ID,
+				job,
+				job.LockedBy,
+				err,
+			))
+
+			require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+			assert.Equal(t, models.OutboxJobStatusCancelled, job.Status)
+			assert.Equal(t, "ai_reply_cancelled", job.LastErrorCode)
+			require.NoError(t, db.First(message, "id = ?", message.ID).Error)
+			assert.Equal(t, models.MessageStatusFailed, message.Status)
+		})
+	}
+}
+
 func TestChannelAIOutboxDispatchSerializesCommittedConsentWithdrawal(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	fixture := createChannelAIReplyWorkerFixture(t, db)
