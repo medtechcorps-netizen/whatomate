@@ -88,7 +88,10 @@ type FacebookWindow = {
 const facebookWindow = window as unknown as FacebookWindow;
 let sdkPromise: Promise<NonNullable<FacebookWindow["FB"]>> | null = null;
 const providerRequestTimeout = 120_000;
-const facebookAuthorizationTimeout = 90_000;
+// The server keeps the one-time onboarding nonce for ten minutes. Leave a
+// two-minute safety margin so Meta's slower Login for Business completion can
+// still return while the nonce is guaranteed to be usable.
+const facebookAuthorizationTimeout = 8 * 60_000;
 const facebookSDKLoadTimeout = 15_000;
 const facebookSDKElementID = "facebook-jssdk";
 
@@ -272,7 +275,7 @@ function waitForFacebookAuthorization(
         finish(() =>
           reject(
             new MetaMessengerAuthorizationFailedError(
-              "Facebook authorization timed out before a result was returned. Retry and keep the Facebook window open until it finishes.",
+              "Facebook authorization timed out before Meta returned a result. Retry, complete the Meta steps, and click Finish before closing either window.",
             ),
           ),
         ),

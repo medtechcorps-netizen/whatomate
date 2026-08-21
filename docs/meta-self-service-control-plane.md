@@ -88,7 +88,10 @@ have Advanced Access.
    BISU token remains the authority credential; the system user's `accounts`
    edge supplies a distinct Page access token, which is independently bound to
    the exact Page before it is persisted as the connected credential or used
-   for Messenger operations.
+   for Messenger operations. Binding requires a valid same-app `PAGE` token and
+   matches the Debug Token `profile_id` (falling back to `user_id` only when the
+   profile field is absent); the Page name remains sourced from the separately
+   verified `owned_pages` edge rather than a generic Page data read.
 4. ReReply commits a globally unique pending Page claim, encrypted credential
    versions, and a subscription-operation fence before any Meta subscription
    mutation. A losing workspace makes zero Meta calls.
