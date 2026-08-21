@@ -177,10 +177,13 @@ type metaMessengerProviderError struct {
 
 type metaMessengerRevalidationStage string
 
+const metaMessengerAuthorizationValidationFailureMessage = "Meta authorization could not be verified; start again"
+
 const (
 	metaMessengerRevalidationStagePageAccounts         metaMessengerRevalidationStage = "page_accounts"
 	metaMessengerRevalidationStageAssignedPages        metaMessengerRevalidationStage = "assigned_pages"
 	metaMessengerRevalidationStageOwnedPages           metaMessengerRevalidationStage = "owned_pages"
+	metaMessengerRevalidationStagePageBinding          metaMessengerRevalidationStage = "page_binding"
 	metaMessengerRevalidationStageFinalPredicates      metaMessengerRevalidationStage = "final_predicates"
 	metaMessengerRevalidationStageCredentialProtection metaMessengerRevalidationStage = "credential_protection"
 )
@@ -206,6 +209,24 @@ func (e *metaMessengerRevalidationError) Unwrap() error {
 		return nil
 	}
 	return e.cause
+}
+
+// metaMessengerAuthorizationValidationResponse preserves actionable local
+// validation errors while preventing provider-controlled identifiers from
+// being reflected into the browser response.
+func metaMessengerAuthorizationValidationResponse(err error) string {
+	if err == nil {
+		return metaMessengerAuthorizationValidationFailureMessage
+	}
+	var provider *metaMessengerProviderError
+	if errors.As(err, &provider) {
+		return metaMessengerAuthorizationValidationFailureMessage
+	}
+	message := strings.TrimSpace(err.Error())
+	if message == "" {
+		return metaMessengerAuthorizationValidationFailureMessage
+	}
+	return message
 }
 
 // metaMessengerRevalidationFailure emits only an allowlisted diagnostic
@@ -679,7 +700,24 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		metaMessengerGraphMaxPageAssets,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, &metaMessengerRevalidationError{
+			Stage: metaMessengerRevalidationStageAssignedPages,
+			cause: err,
+		}
+	}
+	pageAccounts, err := fetchMetaMessengerGraphList[metaMessengerGraphPageAccess](
+		a,
+		ctx,
+		url.PathEscape(platform.UserID)+"/accounts",
+		url.Values{"fields": {"id,name,tasks,access_token"}},
+		accessToken,
+		metaMessengerGraphMaxPageAssets,
+	)
+	if err != nil {
+		return nil, nil, &metaMessengerRevalidationError{
+			Stage: metaMessengerRevalidationStagePageAccounts,
+			cause: err,
+		}
 	}
 	ownedPages, err := fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
 		a,
@@ -690,7 +728,10 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		metaMessengerGraphMaxPageAssets,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, &metaMessengerRevalidationError{
+			Stage: metaMessengerRevalidationStageOwnedPages,
+			cause: err,
+		}
 	}
 	clientPages, err := fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
 		a,
@@ -719,6 +760,16 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		page.Tasks = normalizedMetaMessengerValues(page.Tasks)
 		assignedByPage[page.ID] = page
 	}
+	accountByPage := make(map[string]metaMessengerGraphPageAccess, len(pageAccounts))
+	for _, page := range pageAccounts {
+		page.ID = strings.TrimSpace(page.ID)
+		if !validCanonicalMetaID(page.ID) {
+			continue
+		}
+		page.Name = strings.TrimSpace(page.Name)
+		page.AccessToken = strings.TrimSpace(page.AccessToken)
+		accountByPage[page.ID] = page
+	}
 	ownedIDs := make(map[string]struct{}, len(ownedPages))
 	for _, page := range ownedPages {
 		page.ID = strings.TrimSpace(page.ID)
@@ -727,11 +778,12 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		}
 		ownedIDs[page.ID] = struct{}{}
 		access, assigned := assignedByPage[page.ID]
+		account, accountFound := accountByPage[page.ID]
 		candidate := metaMessengerPageSummary{
 			BusinessID:   businessID,
 			BusinessName: businessName,
 			PageID:       page.ID,
-			PageName:     firstNonemptyMetaMessengerValue(strings.TrimSpace(page.Name), access.Name),
+			PageName:     firstNonemptyMetaMessengerValue(strings.TrimSpace(page.Name), access.Name, account.Name),
 			Ownership:    metaMessengerOwnershipOwned,
 			Selectable:   true,
 			Tasks:        access.Tasks,
@@ -739,6 +791,9 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		if !assigned {
 			candidate.Selectable = false
 			candidate.DisabledReason = metaMessengerDisabledAssignment
+		} else if !accountFound || account.AccessToken == "" {
+			candidate.Selectable = false
+			candidate.DisabledReason = metaMessengerDisabledTokenMissing
 		} else if !metaMessengerHasRequiredPageTasks(access.Tasks) {
 			candidate.Selectable = false
 			candidate.DisabledReason = metaMessengerDisabledTask
@@ -748,7 +803,7 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		}
 		encryptedToken := ""
 		if candidate.Selectable {
-			encryptedToken, err = appcrypto.Encrypt(accessToken, a.integrationEncryptionKey())
+			encryptedToken, err = appcrypto.Encrypt(account.AccessToken, a.integrationEncryptionKey())
 			if err != nil || !appcrypto.IsEncrypted(encryptedToken) {
 				return nil, nil, errors.New("meta Page token could not be protected")
 			}
@@ -848,8 +903,8 @@ func metaMessengerCandidateTargetsAllowed(
 	businessID, pageID string,
 ) bool {
 	// A SYSTEM_USER is bounded by the freshly inspected client_business_id
-	// and the exact intersection of its assigned_pages (including the actual
-	// task and Page token) with that Business's owned_pages. Meta may omit
+	// and the exact intersection of its assigned_pages tasks, accounts Page
+	// credential, and that Business's owned_pages. Meta may omit
 	// target_ids from debug_token for this token kind, so those optional IDs
 	// must not override the authoritative BISU edges.
 	if strings.EqualFold(strings.TrimSpace(inspection.Type), metaMessengerTokenKindSystemUser) {
@@ -866,12 +921,12 @@ func metaMessengerCandidateTargetsAllowed(
 	return true
 }
 
-// revalidateMetaMessengerOwnedPage repeats the two authoritative edges at the
+// revalidateMetaMessengerOwnedPage repeats the authoritative edges at the
 // point of selection. The earlier inventory is only a UI snapshot: it cannot
 // authorize persistence after the user's Page task or Business ownership has
 // changed. For a USER, /me/accounts supplies the Page token directly. For a
 // SYSTEM_USER, assigned_pages proves the exact task assignment while the
-// freshly inspected BISU token remains the operational Page credential.
+// system user's accounts edge supplies the actual Page access token.
 func (a *App) revalidateMetaMessengerOwnedPage(
 	ctx context.Context,
 	organizationID uuid.UUID,
@@ -972,6 +1027,36 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 				errMetaMessengerSelectionInvalid,
 			)
 		}
+		pageAccounts, err := fetchMetaMessengerGraphList[metaMessengerGraphPageAccess](
+			a,
+			ctx,
+			url.PathEscape(inspection.UserID)+"/accounts",
+			url.Values{"fields": {"id,name,tasks,access_token"}},
+			userToken,
+			metaMessengerGraphMaxPageAssets,
+		)
+		if err != nil {
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStagePageAccounts, err,
+			)
+		}
+		foundAccount := false
+		for index := range pageAccounts {
+			if strings.TrimSpace(pageAccounts[index].ID) == selected.PageID {
+				accessible.AccessToken = pageAccounts[index].AccessToken
+				if strings.TrimSpace(accessible.Name) == "" {
+					accessible.Name = pageAccounts[index].Name
+				}
+				foundAccount = true
+				break
+			}
+		}
+		if !foundAccount || strings.TrimSpace(accessible.AccessToken) == "" {
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStagePageAccounts,
+				errMetaMessengerSelectionInvalid,
+			)
+		}
 		ownedPages, err := fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
 			a,
 			ctx,
@@ -999,12 +1084,9 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 				errMetaMessengerSelectionInvalid,
 			)
 		}
-		// The freshly inspected Business Integration System User token is the
-		// operational credential for its assigned Page. assigned_pages proves
-		// the exact Page task assignment; owned_pages proves the Business owns
-		// it. Meta may return an access_token-looking field on assigned_pages,
-		// but that value is not a usable Graph credential for this token kind.
-		accessible.AccessToken = strings.TrimSpace(userToken)
+		// The system user's accounts edge supplies the actual Page access token.
+		// assigned_pages remains the independent task-authority edge and
+		// owned_pages remains the independent Business-ownership edge.
 	default:
 		return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
 			organizationID, selected, metaMessengerRevalidationStageFinalPredicates,
@@ -1144,31 +1226,18 @@ func (a *App) bindMetaMessengerPageToken(
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	}
-	endpoint := "me"
-	var inspection metaMessengerTokenInspection
-	if strings.EqualFold(strings.TrimSpace(authorityInspection.Type), metaMessengerTokenKindSystemUser) {
-		// A freshly inspected BISU token is already bound to the app, system
-		// user, and Business. The immediately preceding assigned_pages and
-		// owned_pages checks bind it to the exact Page and messaging tasks.
-		// Verify that it can read the explicit Page-ID edge; BISU credentials do
-		// not use the normal Page-token debug_token or /me surfaces.
-		endpoint = url.PathEscape(strings.TrimSpace(pageID))
-		inspection = metaMessengerTokenInspection{
-			AppID:               authorityInspection.AppID,
-			Type:                "PAGE",
-			UserID:              strings.TrimSpace(pageID),
-			ExpiresAt:           authorityInspection.ExpiresAt,
-			DataAccessExpiresAt: authorityInspection.DataAccessExpiresAt,
-			CheckedAt:           time.Now().UTC(),
-		}
-	} else {
-		var err error
-		inspection, err = a.inspectMetaMessengerToken(ctx, pageToken, false)
-		if err != nil {
-			return inspection, "", err
-		}
+	inspection, err := a.inspectMetaMessengerToken(ctx, pageToken, false)
+	if err != nil {
+		return inspection, "", err
 	}
-	if err := a.doMetaMessengerGraphJSON(ctx, http.MethodGet, endpoint, url.Values{
+	if !strings.EqualFold(strings.TrimSpace(inspection.Type), "PAGE") {
+		return inspection, "", errors.New("meta Page credential has the wrong token kind")
+	}
+	if strings.TrimSpace(authorityInspection.AppID) != "" &&
+		strings.TrimSpace(inspection.AppID) != strings.TrimSpace(authorityInspection.AppID) {
+		return inspection, "", errors.New("meta Page credential belongs to a different app")
+	}
+	if err := a.doMetaMessengerGraphJSON(ctx, http.MethodGet, "me", url.Values{
 		"fields": {"id,name"},
 	}, pageToken, &binding); err != nil {
 		return inspection, "", err

@@ -357,7 +357,12 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 	inspection, err := a.inspectMetaMessengerToken(ctx, token.AccessToken, true)
 	if err != nil {
 		a.Log.Warn("Messenger authorization permission validation failed", "organization_id", orgID)
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			metaMessengerAuthorizationValidationResponse(err),
+			nil,
+			"",
+		)
 	}
 	platform, businesses, pages, err := a.discoverMetaMessengerInventory(
 		ctx,
@@ -365,7 +370,17 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 		inspection,
 	)
 	if err != nil {
-		a.Log.Warn("Messenger Page ownership discovery failed", "organization_id", orgID)
+		var staged *metaMessengerRevalidationError
+		if errors.As(err, &staged) && staged != nil {
+			_ = a.metaMessengerRevalidationFailure(
+				orgID,
+				metaMessengerStoredPage{},
+				staged.Stage,
+				staged.cause,
+			)
+		} else {
+			a.Log.Warn("Messenger Page ownership discovery failed", "organization_id", orgID)
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusBadGateway, "Meta Page ownership could not be verified", nil, "")
 	}
 
@@ -518,11 +533,11 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 		freshUserInspection,
 	)
 	if err != nil {
-		a.Log.Warn(
-			"Messenger Page token validation failed",
-			"organization_id", orgID,
-			"page_id", request.PageID,
-			"error", err,
+		_ = a.metaMessengerRevalidationFailure(
+			orgID,
+			selected,
+			metaMessengerRevalidationStagePageBinding,
+			err,
 		)
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Meta could not verify the selected Page token", nil, "")
 	}

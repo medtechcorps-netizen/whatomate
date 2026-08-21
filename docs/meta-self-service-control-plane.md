@@ -84,7 +84,11 @@ have Advanced Access.
    it server-side and requires a durable SYSTEM_USER/BISU token in production.
 3. ReReply validates the exact minimum flow permissions plus the Business/Page
    discovery permission used by the implementation, exact Page ownership, and
-   both Page tasks required for messaging and `subscribed_apps` management.
+   both Page tasks required for messaging and `subscribed_apps` management. The
+   BISU token remains the authority credential; the system user's `accounts`
+   edge supplies a distinct Page access token, which is independently bound to
+   the exact Page before it is persisted as the connected credential or used
+   for Messenger operations.
 4. ReReply commits a globally unique pending Page claim, encrypted credential
    versions, and a subscription-operation fence before any Meta subscription
    mutation. A losing workspace makes zero Meta calls.
