@@ -329,6 +329,16 @@ type graphBindingResponse struct {
 	} `json:"instagram_business_account"`
 }
 
+type graphTokenDebugResponse struct {
+	Data struct {
+		AppID     string `json:"app_id"`
+		IsValid   bool   `json:"is_valid"`
+		ProfileID string `json:"profile_id"`
+		Type      string `json:"type"`
+		UserID    string `json:"user_id"`
+	} `json:"data"`
+}
+
 type instagramLoginGraphBindingEnvelope struct {
 	Data []struct {
 		UserID string `json:"user_id"`
@@ -336,6 +346,13 @@ type instagramLoginGraphBindingEnvelope struct {
 }
 
 func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfig) error {
+	if account != nil && account.registryManaged && account.Channel == models.ChannelMessenger {
+		if err := s.validateManagedMessengerPageIdentity(ctx, account); err != nil {
+			return err
+		}
+		return s.validateMessengerAppSubscription(ctx, account)
+	}
+
 	base, err := s.graphBase(account)
 	if err != nil {
 		return err
@@ -432,6 +449,70 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 		}
 	default:
 		return errors.New("account Graph mode is invalid")
+	}
+	return nil
+}
+
+func (s *Server) validateManagedMessengerPageIdentity(ctx context.Context, account *AccountConfig) error {
+	if account == nil || !account.registryManaged || account.Channel != models.ChannelMessenger ||
+		strings.TrimSpace(account.ExternalAccountID) == "" {
+		return errors.New("managed Messenger account binding is invalid")
+	}
+	appSecret, err := s.managedAppSecret(account)
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf(
+		"%s/%s/debug_token",
+		strings.TrimRight(s.facebookGraphBase, "/"),
+		url.PathEscape(s.config.GraphAPIVersion),
+	)
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return errors.New("invalid Graph token inspection endpoint")
+	}
+	query := parsed.Query()
+	query.Set("input_token", account.accessToken)
+	parsed.RawQuery = query.Encode()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return errors.New("invalid Graph token inspection request")
+	}
+	request.Header.Set("Authorization", "Bearer "+account.PlatformAppID+"|"+appSecret)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", "ReReply-Meta-Relay/1.0")
+	response, err := s.client.Do(request)
+	if err != nil {
+		return errors.New("graph token inspection transport failure")
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+		_ = response.Body.Close()
+	}()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return errors.New("graph rejected token inspection request")
+	}
+	var result graphTokenDebugResponse
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
+	if decoder.Decode(&result) != nil || rejectTrailingJSON(decoder) != nil {
+		return errors.New("graph token inspection response is invalid")
+	}
+	data := result.Data
+	if !data.IsValid || strings.TrimSpace(data.AppID) != account.PlatformAppID ||
+		!strings.EqualFold(strings.TrimSpace(data.Type), "PAGE") {
+		return errors.New("graph Page token binding is invalid")
+	}
+	// Meta's Debug Token contract binds an impersonated Page token through
+	// profile_id. Some Page-token variants expose only user_id, so retain the
+	// same fail-closed compatibility fallback used during onboarding and never
+	// issue a broader generic Page /me read here.
+	boundPageID := strings.TrimSpace(data.ProfileID)
+	if boundPageID == "" {
+		boundPageID = strings.TrimSpace(data.UserID)
+	}
+	if boundPageID == "" || boundPageID != strings.TrimSpace(account.ExternalAccountID) {
+		return errors.New("graph token is bound to a different Page")
 	}
 	return nil
 }

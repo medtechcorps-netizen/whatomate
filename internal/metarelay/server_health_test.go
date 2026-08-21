@@ -26,17 +26,30 @@ func TestDynamicMessengerHealthRequiresExactPlatformAppMessagesSubscription(t *t
 	_, _ = proofMAC.Write([]byte(account.accessToken))
 	wantProof := hex.EncodeToString(proofMAC.Sum(nil))
 	fields := "feed"
+	debugAppID := config.ManagedMessengerAppID
+	debugType := "PAGE"
+	debugProfileID := account.ExternalAccountID
+	debugUserID := "authority-user"
 	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("Authorization") != "Bearer "+account.accessToken {
-			t.Errorf("missing Page access token")
-		}
-		if request.URL.Query().Get("appsecret_proof") != wantProof {
-			t.Errorf("appsecret_proof = %q", request.URL.Query().Get("appsecret_proof"))
-		}
 		switch request.URL.Path {
-		case "/v25.0/me":
-			_, _ = w.Write([]byte(`{"id":"page-1"}`))
+		case "/v25.0/debug_token":
+			if request.Header.Get("Authorization") != "Bearer "+config.ManagedMessengerAppID+"|"+
+				config.ManagedMessengerAppSecret {
+				t.Errorf("missing exact managed-app access token")
+			}
+			if request.URL.Query().Get("input_token") != account.accessToken {
+				t.Error("debug_token did not inspect the Page access token")
+			}
+			_, _ = w.Write([]byte(`{"data":{"app_id":"` + debugAppID +
+				`","is_valid":true,"profile_id":"` + debugProfileID +
+				`","type":"` + debugType + `","user_id":"` + debugUserID + `"}}`))
 		case "/v25.0/page-1/subscribed_apps":
+			if request.Header.Get("Authorization") != "Bearer "+account.accessToken {
+				t.Errorf("missing Page access token")
+			}
+			if request.URL.Query().Get("appsecret_proof") != wantProof {
+				t.Errorf("appsecret_proof = %q", request.URL.Query().Get("appsecret_proof"))
+			}
 			if request.URL.Query().Get("fields") != "id,subscribed_fields" {
 				t.Errorf("subscription fields = %q", request.URL.Query().Get("fields"))
 			}
@@ -57,6 +70,28 @@ func TestDynamicMessengerHealthRequiresExactPlatformAppMessagesSubscription(t *t
 	if err := server.validateGraphBinding(t.Context(), &account); err != nil {
 		t.Fatalf("expected exact messages subscription health: %v", err)
 	}
+	debugProfileID = ""
+	debugUserID = account.ExternalAccountID
+	if err := server.validateGraphBinding(t.Context(), &account); err != nil {
+		t.Fatalf("expected user_id-only Page-token compatibility health: %v", err)
+	}
+	debugProfileID = "different-page"
+	debugUserID = account.ExternalAccountID
+	if err := server.validateGraphBinding(t.Context(), &account); err == nil {
+		t.Fatal("expected Page profile mismatch to override matching user_id and fail health")
+	}
+	debugProfileID = account.ExternalAccountID
+	debugUserID = "authority-user"
+	debugType = "USER"
+	if err := server.validateGraphBinding(t.Context(), &account); err == nil {
+		t.Fatal("expected non-Page token to fail health")
+	}
+	debugType = "PAGE"
+	debugAppID = "different-app"
+	if err := server.validateGraphBinding(t.Context(), &account); err == nil {
+		t.Fatal("expected inspected app mismatch to fail health")
+	}
+	debugAppID = config.ManagedMessengerAppID
 	account.PlatformAppID = "different-app"
 	if err := server.validateGraphBinding(t.Context(), &account); err == nil {
 		t.Fatal("expected relay/web platform app mismatch to fail closed")
