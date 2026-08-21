@@ -44,6 +44,11 @@ func TestMetaMessengerRevalidationLogsExactSafeStageWithoutCredentialsOrProvider
 			userFlow:      true,
 		},
 		{
+			name:          "system user Page accounts provider rejection",
+			wantStage:     metaMessengerRevalidationStagePageAccounts,
+			providerStage: metaMessengerRevalidationStagePageAccounts,
+		},
+		{
 			name:          "assigned pages provider rejection",
 			wantStage:     metaMessengerRevalidationStageAssignedPages,
 			providerStage: metaMessengerRevalidationStageAssignedPages,
@@ -90,6 +95,18 @@ func TestMetaMessengerRevalidationLogsExactSafeStageWithoutCredentialsOrProvider
 						return
 					}
 					http.Error(writer, "unexpected Page accounts request", http.StatusNotFound)
+				case "/v25.0/" + metaLifecycleTestUserID + "/accounts":
+					if testCase.providerStage == metaMessengerRevalidationStagePageAccounts {
+						providerError(writer)
+						return
+					}
+					_, _ = fmt.Fprintf(
+						writer,
+						`{"data":[{"id":%q,"name":%q,"tasks":["MESSAGING","MODERATE"],"access_token":%q}]}`,
+						metaLifecycleTestPageID,
+						metaMessengerRevalidationTestPageName,
+						metaMessengerRevalidationTestPageToken,
+					)
 				case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
 					if testCase.providerStage == metaMessengerRevalidationStageAssignedPages {
 						providerError(writer)
@@ -200,6 +217,93 @@ func TestMetaMessengerRevalidationLogsExactSafeStageWithoutCredentialsOrProvider
 			}
 		})
 	}
+}
+
+func TestMetaMessengerPageBindingFailureLogsOnlyAllowlistedProviderFields(t *testing.T) {
+	organizationID := uuid.MustParse("11111111-2222-4333-8444-555555555555")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(t, "/v25.0/debug_token", request.URL.Path)
+		require.Equal(t, metaMessengerRevalidationTestPageToken, request.URL.Query().Get("input_token"))
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Header().Set("X-FB-Request-ID", metaMessengerRevalidationTestRequestID)
+		writer.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprintf(
+			writer,
+			`{"error":{"message":%q,"type":%q,"code":190,"error_subcode":463,"fbtrace_id":%q}}`,
+			metaMessengerRevalidationTestProviderBody+" "+metaMessengerRevalidationTestPageToken,
+			metaMessengerRevalidationTestProviderType,
+			metaMessengerRevalidationTestTraceID,
+		)
+	}))
+	defer server.Close()
+
+	var logs bytes.Buffer
+	app := newMetaLifecycleGraphApp(t, server)
+	app.Log = metaMessengerDebugTestLogger(&logs)
+	selected := metaMessengerStoredPage{metaMessengerPageSummary: metaMessengerPageSummary{
+		BusinessID: metaLifecycleTestBusinessID,
+		PageID:     metaLifecycleTestPageID,
+	}}
+	_, _, bindErr := app.bindMetaMessengerPageToken(
+		t.Context(),
+		metaLifecycleTestPageID,
+		metaMessengerRevalidationTestPageToken,
+		metaMessengerTokenInspection{AppID: metaLifecycleTestAppID},
+	)
+	require.Error(t, bindErr)
+
+	err := app.metaMessengerRevalidationFailure(
+		organizationID,
+		selected,
+		metaMessengerRevalidationStagePageBinding,
+		bindErr,
+	)
+	require.Error(t, err)
+	var provider *metaMessengerProviderError
+	require.True(t, errors.As(err, &provider))
+
+	output := logs.String()
+	assert.Contains(t, output, "stage="+string(metaMessengerRevalidationStagePageBinding))
+	assert.Contains(t, output, "organization_id="+organizationID.String())
+	assert.Contains(t, output, "page_id="+metaLifecycleTestPageID)
+	assert.Contains(t, output, "business_id="+metaLifecycleTestBusinessID)
+	assert.Contains(t, output, "meta_http_status=400")
+	assert.Contains(t, output, "meta_code=190")
+	assert.Contains(t, output, "meta_subcode=463")
+	for _, forbidden := range []string{
+		metaMessengerRevalidationTestPageToken,
+		metaMessengerRevalidationTestProviderBody,
+		metaMessengerRevalidationTestProviderType,
+		metaMessengerRevalidationTestTraceID,
+		metaMessengerRevalidationTestRequestID,
+	} {
+		assert.NotContains(t, err.Error()+output, forbidden)
+	}
+}
+
+func TestMetaMessengerAuthorizationValidationResponseRedactsProviderError(t *testing.T) {
+	provider := &metaMessengerProviderError{
+		StatusCode: http.StatusBadRequest,
+		Code:       190,
+		Subcode:    463,
+		Type:       metaMessengerRevalidationTestProviderType,
+		TraceID:    metaMessengerRevalidationTestTraceID,
+		RequestID:  metaMessengerRevalidationTestRequestID,
+	}
+	wrapped := fmt.Errorf("token inspection: %w", provider)
+
+	response := metaMessengerAuthorizationValidationResponse(wrapped)
+	assert.Equal(t, metaMessengerAuthorizationValidationFailureMessage, response)
+	for _, forbidden := range []string{
+		metaMessengerRevalidationTestProviderType,
+		metaMessengerRevalidationTestTraceID,
+		metaMessengerRevalidationTestRequestID,
+	} {
+		assert.NotContains(t, response, forbidden)
+	}
+
+	local := errors.New("meta authorization is missing required permissions: pages_messaging")
+	assert.Equal(t, local.Error(), metaMessengerAuthorizationValidationResponse(local))
 }
 
 func TestMetaMessengerCredentialProtectionDiagnosticRedactsLocalCause(t *testing.T) {
