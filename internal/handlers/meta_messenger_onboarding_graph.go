@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 )
 
@@ -172,6 +173,85 @@ type metaMessengerProviderError struct {
 	Type       string
 	TraceID    string
 	RequestID  string
+}
+
+type metaMessengerRevalidationStage string
+
+const (
+	metaMessengerRevalidationStagePageAccounts             metaMessengerRevalidationStage = "page_accounts"
+	metaMessengerRevalidationStageAssignedPages            metaMessengerRevalidationStage = "assigned_pages"
+	metaMessengerRevalidationStageOwnedPages               metaMessengerRevalidationStage = "owned_pages"
+	metaMessengerRevalidationStageDirectPageCredentialEdge metaMessengerRevalidationStage = "direct_page_credential_edge"
+	metaMessengerRevalidationStageFinalPredicates          metaMessengerRevalidationStage = "final_predicates"
+	metaMessengerRevalidationStageCredentialProtection     metaMessengerRevalidationStage = "credential_protection"
+)
+
+// metaMessengerRevalidationError identifies the exact fail-closed edge without
+// copying a provider response or credential into its message. Unwrap preserves
+// the existing errors.Is/errors.As behavior used by onboarding and lifecycle
+// classification.
+type metaMessengerRevalidationError struct {
+	Stage metaMessengerRevalidationStage
+	cause error
+}
+
+func (e *metaMessengerRevalidationError) Error() string {
+	if e == nil || e.Stage == "" {
+		return "Meta Messenger Page revalidation failed"
+	}
+	return "Meta Messenger Page revalidation failed at " + string(e.Stage)
+}
+
+func (e *metaMessengerRevalidationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// metaMessengerRevalidationFailure emits only an allowlisted diagnostic
+// envelope. Provider-origin strings are omitted because a character filter
+// cannot prove that a type, trace, or request ID is not token-shaped or PII. In
+// particular, never attach the error, token, response body, Page name, tasks,
+// or authorizing Meta user to this log record.
+func (a *App) metaMessengerRevalidationFailure(
+	organizationID uuid.UUID,
+	selected metaMessengerStoredPage,
+	stage metaMessengerRevalidationStage,
+	cause error,
+) error {
+	if cause == nil {
+		cause = errMetaMessengerSelectionInvalid
+	}
+	failure := &metaMessengerRevalidationError{Stage: stage, cause: cause}
+	if a == nil || a.Log.Writer == nil {
+		return failure
+	}
+
+	pageID := strings.TrimSpace(selected.PageID)
+	if !validCanonicalMetaID(pageID) {
+		pageID = ""
+	}
+	businessID := strings.TrimSpace(selected.BusinessID)
+	if !validCanonicalMetaID(businessID) {
+		businessID = ""
+	}
+	fields := []any{
+		"stage", string(stage),
+		"organization_id", organizationID,
+		"page_id", pageID,
+		"business_id", businessID,
+	}
+	var provider *metaMessengerProviderError
+	if errors.As(cause, &provider) && provider != nil {
+		fields = append(fields,
+			"meta_http_status", provider.StatusCode,
+			"meta_code", provider.Code,
+			"meta_subcode", provider.Subcode,
+		)
+	}
+	a.Log.Warn("Messenger Page ownership revalidation failed", fields...)
+	return failure
 }
 
 func (e *metaMessengerProviderError) Error() string {
@@ -799,13 +879,17 @@ func metaMessengerCandidateTargetsAllowed(
 // official Page edge supplies a fresh Page access token for the selected Page.
 func (a *App) revalidateMetaMessengerOwnedPage(
 	ctx context.Context,
+	organizationID uuid.UUID,
 	userToken string,
 	inspection metaMessengerTokenInspection,
 	selected metaMessengerStoredPage,
 ) (metaMessengerStoredPage, error) {
 	if selected.Ownership != metaMessengerOwnershipOwned || !selected.Selectable ||
 		!validCanonicalMetaID(selected.BusinessID) || !validCanonicalMetaID(selected.PageID) {
-		return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+		return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+			organizationID, selected, metaMessengerRevalidationStageFinalPredicates,
+			errMetaMessengerSelectionInvalid,
+		)
 	}
 	var accessible metaMessengerGraphPageAccess
 	ownedName := ""
@@ -820,7 +904,9 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			metaMessengerGraphMaxPageAssets,
 		)
 		if err != nil {
-			return metaMessengerStoredPage{}, err
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStagePageAccounts, err,
+			)
 		}
 		foundAccess := false
 		for index := range pageAccess {
@@ -831,7 +917,10 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			}
 		}
 		if !foundAccess {
-			return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStagePageAccounts,
+				errMetaMessengerSelectionInvalid,
+			)
 		}
 		ownedPages, err := fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
 			a,
@@ -842,7 +931,9 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			metaMessengerGraphMaxPageAssets,
 		)
 		if err != nil {
-			return metaMessengerStoredPage{}, err
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStageOwnedPages, err,
+			)
 		}
 		owned := false
 		for _, page := range ownedPages {
@@ -853,7 +944,10 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			}
 		}
 		if !owned {
-			return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStageOwnedPages,
+				errMetaMessengerSelectionInvalid,
+			)
 		}
 	case metaMessengerTokenKindSystemUser:
 		pageAccess, err := fetchMetaMessengerGraphList[metaMessengerGraphPageAccess](
@@ -865,7 +959,9 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			metaMessengerGraphMaxPageAssets,
 		)
 		if err != nil {
-			return metaMessengerStoredPage{}, err
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStageAssignedPages, err,
+			)
 		}
 		foundAccess := false
 		for index := range pageAccess {
@@ -876,7 +972,10 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			}
 		}
 		if !foundAccess {
-			return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStageAssignedPages,
+				errMetaMessengerSelectionInvalid,
+			)
 		}
 		ownedPages, err := fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
 			a,
@@ -887,7 +986,9 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			metaMessengerGraphMaxPageAssets,
 		)
 		if err != nil {
-			return metaMessengerStoredPage{}, err
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStageOwnedPages, err,
+			)
 		}
 		foundOwned := false
 		for _, page := range ownedPages {
@@ -898,7 +999,10 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			}
 		}
 		if !foundOwned {
-			return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStageOwnedPages,
+				errMetaMessengerSelectionInvalid,
+			)
 		}
 		// assigned_pages is the authority edge for the integration system
 		// user's Page tasks, but its access_token field is not the documented
@@ -915,17 +1019,31 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			userToken,
 			&pageBinding,
 		); err != nil {
-			return metaMessengerStoredPage{}, err
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStageDirectPageCredentialEdge, err,
+			)
 		}
 		if strings.TrimSpace(pageBinding.ID) != selected.PageID {
-			return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStageDirectPageCredentialEdge,
+				errMetaMessengerSelectionInvalid,
+			)
 		}
 		accessible.AccessToken = strings.TrimSpace(pageBinding.AccessToken)
+		if accessible.AccessToken == "" {
+			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+				organizationID, selected, metaMessengerRevalidationStageDirectPageCredentialEdge,
+				errMetaMessengerSelectionInvalid,
+			)
+		}
 		if pageName := strings.TrimSpace(pageBinding.Name); pageName != "" {
 			ownedName = pageName
 		}
 	default:
-		return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+		return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+			organizationID, selected, metaMessengerRevalidationStageFinalPredicates,
+			errMetaMessengerSelectionInvalid,
+		)
 	}
 	accessible.AccessToken = strings.TrimSpace(accessible.AccessToken)
 	accessible.Tasks = normalizedMetaMessengerValues(accessible.Tasks)
@@ -935,14 +1053,20 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			selected.BusinessID,
 			selected.PageID,
 		) {
-		return metaMessengerStoredPage{}, errMetaMessengerSelectionInvalid
+		return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+			organizationID, selected, metaMessengerRevalidationStageFinalPredicates,
+			errMetaMessengerSelectionInvalid,
+		)
 	}
 	encryptedPageToken, err := appcrypto.Encrypt(
 		accessible.AccessToken,
 		a.integrationEncryptionKey(),
 	)
 	if err != nil || !appcrypto.IsEncrypted(encryptedPageToken) {
-		return metaMessengerStoredPage{}, errors.New("meta Page token could not be protected")
+		return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
+			organizationID, selected, metaMessengerRevalidationStageCredentialProtection,
+			errors.New("meta Page token could not be protected"),
+		)
 	}
 	selected.PageName = firstNonemptyMetaMessengerValue(
 		ownedName,

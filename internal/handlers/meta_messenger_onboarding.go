@@ -503,7 +503,7 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 		request.BusinessID != freshPlatform.ClientBusinessID {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "The Business Portfolio no longer matches the authorized integration", nil, "")
 	}
-	selected, err = a.revalidateMetaMessengerOwnedPage(ctx, userToken, freshUserInspection, selected)
+	selected, err = a.revalidateMetaMessengerOwnedPage(ctx, orgID, userToken, freshUserInspection, selected)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "The selected Page is no longer owned or accessible", nil, "")
 	}

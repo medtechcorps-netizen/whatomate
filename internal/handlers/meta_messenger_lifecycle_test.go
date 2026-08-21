@@ -581,6 +581,7 @@ func TestMetaMessengerSelectionRechecksBothPageTasksImmediatelyBeforePersistence
 			}}
 			fresh, err := app.revalidateMetaMessengerOwnedPage(
 				context.Background(),
+				uuid.Nil,
 				"user-token",
 				inspection,
 				selected,
@@ -639,6 +640,7 @@ func TestMetaMessengerSystemUserSelectionFetchesExactPageAccessToken(t *testing.
 
 	fresh, err := app.revalidateMetaMessengerOwnedPage(
 		context.Background(),
+		uuid.Nil,
 		"system-user-token",
 		inspection,
 		selected,
@@ -682,6 +684,7 @@ func TestMetaMessengerSystemUserSelectionRejectsInvalidExactPageTokenResponse(t 
 			app := newMetaLifecycleGraphApp(t, server)
 			fresh, err := app.revalidateMetaMessengerOwnedPage(
 				context.Background(),
+				uuid.Nil,
 				"system-user-token",
 				metaMessengerTokenInspection{
 					AppID: metaLifecycleTestAppID, Type: metaMessengerTokenKindSystemUser,
