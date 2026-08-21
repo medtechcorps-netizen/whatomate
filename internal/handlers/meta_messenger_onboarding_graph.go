@@ -1155,7 +1155,7 @@ func (a *App) bindMetaMessengerPageToken(
 		Name string `json:"name"`
 	}
 	endpoint := "me"
-	inspection := metaMessengerTokenInspection{}
+	var inspection metaMessengerTokenInspection
 	if strings.EqualFold(strings.TrimSpace(authorityInspection.Type), metaMessengerTokenKindSystemUser) {
 		// A Page credential returned by SYSTEM_USER/assigned_pages is already
 		// bound to the freshly inspected app, system user, Business, exact Page,
