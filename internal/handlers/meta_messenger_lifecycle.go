@@ -489,7 +489,9 @@ func (a *App) checkMetaMessengerOwnership(
 		},
 		OwnershipVerifiedAt: inspection.CheckedAt,
 	}
-	fresh, err := a.revalidateMetaMessengerOwnedPage(ctx, snapshot.AuthorityToken, inspection, selected)
+	fresh, err := a.revalidateMetaMessengerOwnedPage(
+		ctx, snapshot.OrganizationID, snapshot.AuthorityToken, inspection, selected,
+	)
 	if err != nil {
 		if errors.Is(err, errMetaMessengerSelectionInvalid) {
 			return metaregistry.OwnershipRevoked, "page_ownership_or_task_removed"
