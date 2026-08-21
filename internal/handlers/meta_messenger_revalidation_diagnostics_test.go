@@ -32,7 +32,7 @@ func TestMetaMessengerRevalidationLogsExactSafeStageWithoutCredentialsOrProvider
 		name             string
 		wantStage        metaMessengerRevalidationStage
 		providerStage    metaMessengerRevalidationStage
-		omitPageToken    bool
+		omitAssignedPage bool
 		omitRequiredTask bool
 		userFlow         bool
 		selectionInvalid bool
@@ -54,9 +54,9 @@ func TestMetaMessengerRevalidationLogsExactSafeStageWithoutCredentialsOrProvider
 			providerStage: metaMessengerRevalidationStageOwnedPages,
 		},
 		{
-			name:             "assigned Page credential missing",
+			name:             "assigned Page missing",
 			wantStage:        metaMessengerRevalidationStageAssignedPages,
-			omitPageToken:    true,
+			omitAssignedPage: true,
 			selectionInvalid: true,
 		},
 		{
@@ -95,21 +95,20 @@ func TestMetaMessengerRevalidationLogsExactSafeStageWithoutCredentialsOrProvider
 						providerError(writer)
 						return
 					}
+					if testCase.omitAssignedPage {
+						_, _ = writer.Write([]byte(`{"data":[]}`))
+						return
+					}
 					tasks := `["MESSAGING","MODERATE"]`
 					if testCase.omitRequiredTask {
 						tasks = `["MESSAGING"]`
 					}
-					pageToken := metaMessengerRevalidationTestAssignedToken
-					if testCase.omitPageToken {
-						pageToken = ""
-					}
 					_, _ = fmt.Fprintf(
 						writer,
-						`{"data":[{"id":%q,"name":%q,"tasks":%s,"access_token":%q}]}`,
+						`{"data":[{"id":%q,"name":%q,"tasks":%s}]}`,
 						metaLifecycleTestPageID,
 						metaMessengerRevalidationTestPageName,
 						tasks,
-						pageToken,
 					)
 				case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
 					if testCase.providerStage == metaMessengerRevalidationStageOwnedPages {
