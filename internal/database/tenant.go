@@ -1004,8 +1004,8 @@ func tenantPolicyFingerprint(db *gorm.DB, tables []string) (string, error) {
 				policy.polcmd::text AS command,
 				policy.polpermissive AS permissive,
 				policy.polroles::text AS roles,
-				COALESCE(policy.polqual::text, '') AS using_expression,
-				COALESCE(policy.polwithcheck::text, '') AS check_expression
+				COALESCE(pg_catalog.pg_get_expr(policy.polqual, policy.polrelid, false), '') AS using_expression,
+				COALESCE(pg_catalog.pg_get_expr(policy.polwithcheck, policy.polrelid, false), '') AS check_expression
 			FROM pg_catalog.pg_policy AS policy
 			JOIN pg_catalog.pg_class AS policy_table
 			  ON policy_table.oid = policy.polrelid
