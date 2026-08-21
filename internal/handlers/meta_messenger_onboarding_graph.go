@@ -178,12 +178,11 @@ type metaMessengerProviderError struct {
 type metaMessengerRevalidationStage string
 
 const (
-	metaMessengerRevalidationStagePageAccounts             metaMessengerRevalidationStage = "page_accounts"
-	metaMessengerRevalidationStageAssignedPages            metaMessengerRevalidationStage = "assigned_pages"
-	metaMessengerRevalidationStageOwnedPages               metaMessengerRevalidationStage = "owned_pages"
-	metaMessengerRevalidationStageDirectPageCredentialEdge metaMessengerRevalidationStage = "direct_page_credential_edge"
-	metaMessengerRevalidationStageFinalPredicates          metaMessengerRevalidationStage = "final_predicates"
-	metaMessengerRevalidationStageCredentialProtection     metaMessengerRevalidationStage = "credential_protection"
+	metaMessengerRevalidationStagePageAccounts         metaMessengerRevalidationStage = "page_accounts"
+	metaMessengerRevalidationStageAssignedPages        metaMessengerRevalidationStage = "assigned_pages"
+	metaMessengerRevalidationStageOwnedPages           metaMessengerRevalidationStage = "owned_pages"
+	metaMessengerRevalidationStageFinalPredicates      metaMessengerRevalidationStage = "final_predicates"
+	metaMessengerRevalidationStageCredentialProtection metaMessengerRevalidationStage = "credential_protection"
 )
 
 // metaMessengerRevalidationError identifies the exact fail-closed edge without
@@ -875,8 +874,8 @@ func metaMessengerCandidateTargetsAllowed(
 // point of selection. The earlier inventory is only a UI snapshot: it cannot
 // authorize persistence after the user's Page task or Business ownership has
 // changed. For a USER, /me/accounts supplies the Page token directly. For a
-// SYSTEM_USER, assigned_pages proves the exact task assignment, then the
-// official Page edge supplies a fresh Page access token for the selected Page.
+// SYSTEM_USER, assigned_pages proves the exact task assignment and supplies
+// the Page access token bound to that assignment.
 func (a *App) revalidateMetaMessengerOwnedPage(
 	ctx context.Context,
 	organizationID uuid.UUID,
@@ -1004,40 +1003,17 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 				errMetaMessengerSelectionInvalid,
 			)
 		}
-		// assigned_pages is the authority edge for the integration system
-		// user's Page tasks, but its access_token field is not the documented
-		// Page-token exchange contract. Resolve the selected Page's token from
-		// the exact Page edge using the freshly revalidated system-user token.
-		// This is bounded to one provider request after both assignment and
-		// ownership have been proven.
-		var pageBinding metaMessengerGraphPageAccess
-		if err := a.doMetaMessengerGraphJSON(
-			ctx,
-			http.MethodGet,
-			url.PathEscape(selected.PageID),
-			url.Values{"fields": {"id,name,access_token"}},
-			userToken,
-			&pageBinding,
-		); err != nil {
-			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
-				organizationID, selected, metaMessengerRevalidationStageDirectPageCredentialEdge, err,
-			)
-		}
-		if strings.TrimSpace(pageBinding.ID) != selected.PageID {
-			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
-				organizationID, selected, metaMessengerRevalidationStageDirectPageCredentialEdge,
-				errMetaMessengerSelectionInvalid,
-			)
-		}
-		accessible.AccessToken = strings.TrimSpace(pageBinding.AccessToken)
+		// The fresh assigned_pages response is both the task-authority edge and
+		// the Page-token source for a Business Integration System User. A
+		// second GET /{page-id}?fields=access_token is not supported for this
+		// token kind. The caller still inspects the returned Page token and
+		// requires its exact Page ID before anything can be persisted.
+		accessible.AccessToken = strings.TrimSpace(accessible.AccessToken)
 		if accessible.AccessToken == "" {
 			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
-				organizationID, selected, metaMessengerRevalidationStageDirectPageCredentialEdge,
+				organizationID, selected, metaMessengerRevalidationStageAssignedPages,
 				errMetaMessengerSelectionInvalid,
 			)
-		}
-		if pageName := strings.TrimSpace(pageBinding.Name); pageName != "" {
-			ownedName = pageName
 		}
 	default:
 		return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(

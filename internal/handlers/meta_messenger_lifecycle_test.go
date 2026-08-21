@@ -600,7 +600,7 @@ func TestMetaMessengerSelectionRechecksBothPageTasksImmediatelyBeforePersistence
 	}
 }
 
-func TestMetaMessengerSystemUserSelectionFetchesExactPageAccessToken(t *testing.T) {
+func TestMetaMessengerSystemUserSelectionUsesFreshAssignedPageAccessToken(t *testing.T) {
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
@@ -613,12 +613,9 @@ func TestMetaMessengerSystemUserSelectionFetchesExactPageAccessToken(t *testing.
 		switch request.URL.Path {
 		case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
 			assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
-			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MESSAGING","MODERATE"],"access_token":"not-a-page-token"}]}`))
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MESSAGING","MODERATE"],"access_token":"fresh-assigned-page-token"}]}`))
 		case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
 			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Owned Page"}]}`))
-		case "/v25.0/" + metaLifecycleTestPageID:
-			assert.Equal(t, "id,name,access_token", request.URL.Query().Get("fields"))
-			_, _ = writer.Write([]byte(`{"id":"700000000000001","name":"Exact Page","access_token":"exact-page-token"}`))
 		default:
 			http.Error(writer, "unexpected", http.StatusNotFound)
 		}
@@ -648,33 +645,30 @@ func TestMetaMessengerSystemUserSelectionFetchesExactPageAccessToken(t *testing.
 	require.NoError(t, err)
 	plain, decryptErr := appcrypto.Decrypt(fresh.EncryptedPageToken, metaLifecycleTestEncryptionKey)
 	require.NoError(t, decryptErr)
-	assert.Equal(t, "exact-page-token", plain)
-	assert.Equal(t, "Exact Page", fresh.PageName)
+	assert.Equal(t, "fresh-assigned-page-token", plain)
+	assert.Equal(t, "Owned Page", fresh.PageName)
 	assert.Equal(t, []string{
 		"/v25.0/" + metaLifecycleTestUserID + "/assigned_pages",
 		"/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages",
-		"/v25.0/" + metaLifecycleTestPageID,
 	}, paths)
 }
 
-func TestMetaMessengerSystemUserSelectionRejectsInvalidExactPageTokenResponse(t *testing.T) {
+func TestMetaMessengerSystemUserSelectionRejectsInvalidAssignedPageTokenResponse(t *testing.T) {
 	for _, testCase := range []struct {
-		name         string
-		pageResponse string
+		name             string
+		assignedResponse string
 	}{
-		{"wrong Page", `{"id":"700000000000099","name":"Wrong Page","access_token":"wrong-page-token"}`},
-		{"missing Page token", `{"id":"700000000000001","name":"Owned Page"}`},
+		{"wrong Page", `{"data":[{"id":"700000000000099","name":"Wrong Page","tasks":["MESSAGING","MODERATE"],"access_token":"wrong-page-token"}]}`},
+		{"missing Page token", `{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MESSAGING","MODERATE"]}]}`},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				writer.Header().Set("Content-Type", "application/json")
 				switch request.URL.Path {
 				case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
-					_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MESSAGING","MODERATE"],"access_token":"must-not-be-used"}]}`))
+					_, _ = writer.Write([]byte(testCase.assignedResponse))
 				case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
 					_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Owned Page"}]}`))
-				case "/v25.0/" + metaLifecycleTestPageID:
-					_, _ = writer.Write([]byte(testCase.pageResponse))
 				default:
 					http.Error(writer, "unexpected", http.StatusNotFound)
 				}
@@ -700,6 +694,9 @@ func TestMetaMessengerSystemUserSelectionRejectsInvalidExactPageTokenResponse(t 
 			)
 			require.Error(t, err)
 			assert.Empty(t, fresh.EncryptedPageToken)
+			var staged *metaMessengerRevalidationError
+			require.True(t, errors.As(err, &staged))
+			assert.Equal(t, metaMessengerRevalidationStageAssignedPages, staged.Stage)
 		})
 	}
 }
