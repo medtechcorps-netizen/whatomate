@@ -511,7 +511,12 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 	if err != nil || strings.TrimSpace(pageToken) == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Messenger Page authorization is invalid; start again", nil, "")
 	}
-	pageInspection, pageName, err := a.bindMetaMessengerPageToken(ctx, request.PageID, pageToken)
+	pageInspection, pageName, err := a.bindMetaMessengerPageToken(
+		ctx,
+		request.PageID,
+		pageToken,
+		freshUserInspection,
+	)
 	if err != nil {
 		a.Log.Warn(
 			"Messenger Page token validation failed",

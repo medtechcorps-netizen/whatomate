@@ -653,6 +653,58 @@ func TestMetaMessengerSystemUserSelectionUsesFreshAssignedPageAccessToken(t *tes
 	}, paths)
 }
 
+func TestMetaMessengerSystemUserPageBindingUsesExactPageIDEdge(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		bindingID string
+		wantError bool
+	}{
+		{name: "exact Page", bindingID: metaLifecycleTestPageID},
+		{name: "different Page", bindingID: "700000000000099", wantError: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var paths []string
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				paths = append(paths, request.URL.Path)
+				require.Equal(t, "/v25.0/"+metaLifecycleTestPageID, request.URL.Path)
+				require.Equal(t, "Bearer fresh-assigned-page-token", request.Header.Get("Authorization"))
+				require.Equal(t, "id,name", request.URL.Query().Get("fields"))
+				mac := hmac.New(sha256.New, []byte(metaLifecycleTestAppSecret))
+				_, _ = mac.Write([]byte("fresh-assigned-page-token"))
+				require.Equal(t, hex.EncodeToString(mac.Sum(nil)), request.URL.Query().Get("appsecret_proof"))
+				writer.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(writer).Encode(map[string]string{
+					"id": testCase.bindingID, "name": "Owned Page",
+				})
+			}))
+			defer server.Close()
+
+			app := newMetaLifecycleGraphApp(t, server)
+			inspection, pageName, err := app.bindMetaMessengerPageToken(
+				context.Background(),
+				metaLifecycleTestPageID,
+				"fresh-assigned-page-token",
+				metaMessengerTokenInspection{
+					AppID: metaLifecycleTestAppID,
+					Type:  metaMessengerTokenKindSystemUser,
+				},
+			)
+			if testCase.wantError {
+				require.Error(t, err)
+				assert.Empty(t, pageName)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "Owned Page", pageName)
+			assert.Equal(t, metaLifecycleTestAppID, inspection.AppID)
+			assert.Equal(t, "PAGE", inspection.Type)
+			assert.Equal(t, metaLifecycleTestPageID, inspection.UserID)
+			assert.False(t, inspection.CheckedAt.IsZero())
+			assert.Equal(t, []string{"/v25.0/" + metaLifecycleTestPageID}, paths)
+		})
+	}
+}
+
 func TestMetaMessengerSystemUserSelectionRejectsInvalidAssignedPageTokenResponse(t *testing.T) {
 	for _, testCase := range []struct {
 		name             string
