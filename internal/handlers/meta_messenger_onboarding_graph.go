@@ -674,7 +674,7 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		a,
 		ctx,
 		url.PathEscape(platform.UserID)+"/assigned_pages",
-		url.Values{"fields": {"id,name,tasks,access_token"}},
+		url.Values{"fields": {"id,name,tasks"}},
 		accessToken,
 		metaMessengerGraphMaxPageAssets,
 	)
@@ -717,7 +717,6 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		}
 		page.Name = strings.TrimSpace(page.Name)
 		page.Tasks = normalizedMetaMessengerValues(page.Tasks)
-		page.AccessToken = strings.TrimSpace(page.AccessToken)
 		assignedByPage[page.ID] = page
 	}
 	ownedIDs := make(map[string]struct{}, len(ownedPages))
@@ -740,9 +739,6 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		if !assigned {
 			candidate.Selectable = false
 			candidate.DisabledReason = metaMessengerDisabledAssignment
-		} else if access.AccessToken == "" {
-			candidate.Selectable = false
-			candidate.DisabledReason = metaMessengerDisabledTokenMissing
 		} else if !metaMessengerHasRequiredPageTasks(access.Tasks) {
 			candidate.Selectable = false
 			candidate.DisabledReason = metaMessengerDisabledTask
@@ -752,7 +748,7 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		}
 		encryptedToken := ""
 		if candidate.Selectable {
-			encryptedToken, err = appcrypto.Encrypt(access.AccessToken, a.integrationEncryptionKey())
+			encryptedToken, err = appcrypto.Encrypt(accessToken, a.integrationEncryptionKey())
 			if err != nil || !appcrypto.IsEncrypted(encryptedToken) {
 				return nil, nil, errors.New("meta Page token could not be protected")
 			}
@@ -874,8 +870,8 @@ func metaMessengerCandidateTargetsAllowed(
 // point of selection. The earlier inventory is only a UI snapshot: it cannot
 // authorize persistence after the user's Page task or Business ownership has
 // changed. For a USER, /me/accounts supplies the Page token directly. For a
-// SYSTEM_USER, assigned_pages proves the exact task assignment and supplies
-// the Page access token bound to that assignment.
+// SYSTEM_USER, assigned_pages proves the exact task assignment while the
+// freshly inspected BISU token remains the operational Page credential.
 func (a *App) revalidateMetaMessengerOwnedPage(
 	ctx context.Context,
 	organizationID uuid.UUID,
@@ -953,7 +949,7 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 			a,
 			ctx,
 			url.PathEscape(inspection.UserID)+"/assigned_pages",
-			url.Values{"fields": {"id,name,tasks,access_token"}},
+			url.Values{"fields": {"id,name,tasks"}},
 			userToken,
 			metaMessengerGraphMaxPageAssets,
 		)
@@ -1003,18 +999,12 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 				errMetaMessengerSelectionInvalid,
 			)
 		}
-		// The fresh assigned_pages response is both the task-authority edge and
-		// the Page-token source for a Business Integration System User. A
-		// second GET /{page-id}?fields=access_token is not supported for this
-		// token kind. The caller still inspects the returned Page token and
-		// requires its exact Page ID before anything can be persisted.
-		accessible.AccessToken = strings.TrimSpace(accessible.AccessToken)
-		if accessible.AccessToken == "" {
-			return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
-				organizationID, selected, metaMessengerRevalidationStageAssignedPages,
-				errMetaMessengerSelectionInvalid,
-			)
-		}
+		// The freshly inspected Business Integration System User token is the
+		// operational credential for its assigned Page. assigned_pages proves
+		// the exact Page task assignment; owned_pages proves the Business owns
+		// it. Meta may return an access_token-looking field on assigned_pages,
+		// but that value is not a usable Graph credential for this token kind.
+		accessible.AccessToken = strings.TrimSpace(userToken)
 	default:
 		return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
 			organizationID, selected, metaMessengerRevalidationStageFinalPredicates,
@@ -1157,13 +1147,11 @@ func (a *App) bindMetaMessengerPageToken(
 	endpoint := "me"
 	var inspection metaMessengerTokenInspection
 	if strings.EqualFold(strings.TrimSpace(authorityInspection.Type), metaMessengerTokenKindSystemUser) {
-		// A Page credential returned by SYSTEM_USER/assigned_pages is already
-		// bound to the freshly inspected app, system user, Business, exact Page,
-		// and messaging tasks. Meta does not expose this credential through the
-		// normal debug_token or /me surfaces. Verify that it can read the exact
-		// Page-ID edge instead; this proves that the credential selected from the
-		// authoritative assignment is usable for that Page without widening it
-		// to any other asset.
+		// A freshly inspected BISU token is already bound to the app, system
+		// user, and Business. The immediately preceding assigned_pages and
+		// owned_pages checks bind it to the exact Page and messaging tasks.
+		// Verify that it can read the explicit Page-ID edge; BISU credentials do
+		// not use the normal Page-token debug_token or /me surfaces.
 		endpoint = url.PathEscape(strings.TrimSpace(pageID))
 		inspection = metaMessengerTokenInspection{
 			AppID:               authorityInspection.AppID,

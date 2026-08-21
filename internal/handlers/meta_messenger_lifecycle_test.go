@@ -600,7 +600,56 @@ func TestMetaMessengerSelectionRechecksBothPageTasksImmediatelyBeforePersistence
 	}
 }
 
-func TestMetaMessengerSystemUserSelectionUsesFreshAssignedPageAccessToken(t *testing.T) {
+func TestMetaMessengerSystemUserInventoryUsesAuthorityToken(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		paths = append(paths, request.URL.Path)
+		require.Equal(t, "Bearer system-user-token", request.Header.Get("Authorization"))
+		switch request.URL.Path {
+		case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
+			require.Equal(t, "id,name,tasks", request.URL.Query().Get("fields"))
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MESSAGING","MODERATE"],"access_token":"unusable-assigned-token"}]}`))
+		case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Owned Page"}]}`))
+		case "/v25.0/" + metaLifecycleTestBusinessID + "/client_pages":
+			_, _ = writer.Write([]byte(`{"data":[]}`))
+		default:
+			http.Error(writer, "unexpected", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	app := newMetaLifecycleGraphApp(t, server)
+	inspection := metaMessengerTokenInspection{
+		AppID: metaLifecycleTestAppID, Type: metaMessengerTokenKindSystemUser,
+		UserID: metaLifecycleTestUserID, Scopes: append([]string(nil), metaMessengerRequiredScopes...),
+		CheckedAt: time.Now().UTC(),
+	}
+	businesses, pages, err := app.discoverMetaMessengerSystemUserInventory(
+		context.Background(),
+		"system-user-token",
+		inspection,
+		metaMessengerPlatformUser{
+			UserID: metaLifecycleTestUserID, TokenKind: metaMessengerTokenKindSystemUser,
+			ClientBusinessID: metaLifecycleTestBusinessID,
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, businesses, 1)
+	require.Len(t, pages, 1)
+	assert.True(t, pages[0].Selectable)
+	plain, decryptErr := appcrypto.Decrypt(pages[0].EncryptedPageToken, metaLifecycleTestEncryptionKey)
+	require.NoError(t, decryptErr)
+	assert.Equal(t, "system-user-token", plain)
+	assert.Equal(t, []string{
+		"/v25.0/" + metaLifecycleTestUserID + "/assigned_pages",
+		"/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages",
+		"/v25.0/" + metaLifecycleTestBusinessID + "/client_pages",
+	}, paths)
+}
+
+func TestMetaMessengerSystemUserSelectionUsesFreshAuthorityToken(t *testing.T) {
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
@@ -612,8 +661,8 @@ func TestMetaMessengerSystemUserSelectionUsesFreshAssignedPageAccessToken(t *tes
 		assert.Empty(t, request.URL.Query().Get("access_token"))
 		switch request.URL.Path {
 		case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
-			assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
-			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MESSAGING","MODERATE"],"access_token":"fresh-assigned-page-token"}]}`))
+			assert.Equal(t, "id,name,tasks", request.URL.Query().Get("fields"))
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MESSAGING","MODERATE"],"access_token":"unusable-assigned-token"}]}`))
 		case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
 			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Owned Page"}]}`))
 		default:
@@ -645,7 +694,7 @@ func TestMetaMessengerSystemUserSelectionUsesFreshAssignedPageAccessToken(t *tes
 	require.NoError(t, err)
 	plain, decryptErr := appcrypto.Decrypt(fresh.EncryptedPageToken, metaLifecycleTestEncryptionKey)
 	require.NoError(t, decryptErr)
-	assert.Equal(t, "fresh-assigned-page-token", plain)
+	assert.Equal(t, "system-user-token", plain)
 	assert.Equal(t, "Owned Page", fresh.PageName)
 	assert.Equal(t, []string{
 		"/v25.0/" + metaLifecycleTestUserID + "/assigned_pages",
@@ -667,10 +716,10 @@ func TestMetaMessengerSystemUserPageBindingUsesExactPageIDEdge(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				paths = append(paths, request.URL.Path)
 				require.Equal(t, "/v25.0/"+metaLifecycleTestPageID, request.URL.Path)
-				require.Equal(t, "Bearer fresh-assigned-page-token", request.Header.Get("Authorization"))
+				require.Equal(t, "Bearer system-user-token", request.Header.Get("Authorization"))
 				require.Equal(t, "id,name", request.URL.Query().Get("fields"))
 				mac := hmac.New(sha256.New, []byte(metaLifecycleTestAppSecret))
-				_, _ = mac.Write([]byte("fresh-assigned-page-token"))
+				_, _ = mac.Write([]byte("system-user-token"))
 				require.Equal(t, hex.EncodeToString(mac.Sum(nil)), request.URL.Query().Get("appsecret_proof"))
 				writer.Header().Set("Content-Type", "application/json")
 				_ = json.NewEncoder(writer).Encode(map[string]string{
@@ -683,7 +732,7 @@ func TestMetaMessengerSystemUserPageBindingUsesExactPageIDEdge(t *testing.T) {
 			inspection, pageName, err := app.bindMetaMessengerPageToken(
 				context.Background(),
 				metaLifecycleTestPageID,
-				"fresh-assigned-page-token",
+				"system-user-token",
 				metaMessengerTokenInspection{
 					AppID: metaLifecycleTestAppID,
 					Type:  metaMessengerTokenKindSystemUser,
@@ -705,13 +754,22 @@ func TestMetaMessengerSystemUserPageBindingUsesExactPageIDEdge(t *testing.T) {
 	}
 }
 
-func TestMetaMessengerSystemUserSelectionRejectsInvalidAssignedPageTokenResponse(t *testing.T) {
+func TestMetaMessengerSystemUserSelectionRejectsInvalidAssignment(t *testing.T) {
 	for _, testCase := range []struct {
 		name             string
 		assignedResponse string
+		expectedStage    metaMessengerRevalidationStage
 	}{
-		{"wrong Page", `{"data":[{"id":"700000000000099","name":"Wrong Page","tasks":["MESSAGING","MODERATE"],"access_token":"wrong-page-token"}]}`},
-		{"missing Page token", `{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MESSAGING","MODERATE"]}]}`},
+		{
+			"wrong Page",
+			`{"data":[{"id":"700000000000099","name":"Wrong Page","tasks":["MESSAGING","MODERATE"]}]}`,
+			metaMessengerRevalidationStageAssignedPages,
+		},
+		{
+			"missing messaging task",
+			`{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MODERATE"]}]}`,
+			metaMessengerRevalidationStageFinalPredicates,
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -748,7 +806,7 @@ func TestMetaMessengerSystemUserSelectionRejectsInvalidAssignedPageTokenResponse
 			assert.Empty(t, fresh.EncryptedPageToken)
 			var staged *metaMessengerRevalidationError
 			require.True(t, errors.As(err, &staged))
-			assert.Equal(t, metaMessengerRevalidationStageAssignedPages, staged.Stage)
+			assert.Equal(t, testCase.expectedStage, staged.Stage)
 		})
 	}
 }
