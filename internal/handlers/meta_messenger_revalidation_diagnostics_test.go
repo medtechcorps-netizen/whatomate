@@ -54,13 +54,8 @@ func TestMetaMessengerRevalidationLogsExactSafeStageWithoutCredentialsOrProvider
 			providerStage: metaMessengerRevalidationStageOwnedPages,
 		},
 		{
-			name:          "direct Page credential provider rejection",
-			wantStage:     metaMessengerRevalidationStageDirectPageCredentialEdge,
-			providerStage: metaMessengerRevalidationStageDirectPageCredentialEdge,
-		},
-		{
-			name:             "direct Page credential missing",
-			wantStage:        metaMessengerRevalidationStageDirectPageCredentialEdge,
+			name:             "assigned Page credential missing",
+			wantStage:        metaMessengerRevalidationStageAssignedPages,
 			omitPageToken:    true,
 			selectionInvalid: true,
 		},
@@ -104,13 +99,17 @@ func TestMetaMessengerRevalidationLogsExactSafeStageWithoutCredentialsOrProvider
 					if testCase.omitRequiredTask {
 						tasks = `["MESSAGING"]`
 					}
+					pageToken := metaMessengerRevalidationTestAssignedToken
+					if testCase.omitPageToken {
+						pageToken = ""
+					}
 					_, _ = fmt.Fprintf(
 						writer,
 						`{"data":[{"id":%q,"name":%q,"tasks":%s,"access_token":%q}]}`,
 						metaLifecycleTestPageID,
 						metaMessengerRevalidationTestPageName,
 						tasks,
-						metaMessengerRevalidationTestAssignedToken,
+						pageToken,
 					)
 				case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
 					if testCase.providerStage == metaMessengerRevalidationStageOwnedPages {
@@ -122,22 +121,6 @@ func TestMetaMessengerRevalidationLogsExactSafeStageWithoutCredentialsOrProvider
 						`{"data":[{"id":%q,"name":%q}]}`,
 						metaLifecycleTestPageID,
 						metaMessengerRevalidationTestPageName,
-					)
-				case "/v25.0/" + metaLifecycleTestPageID:
-					if testCase.providerStage == metaMessengerRevalidationStageDirectPageCredentialEdge {
-						providerError(writer)
-						return
-					}
-					pageToken := metaMessengerRevalidationTestPageToken
-					if testCase.omitPageToken {
-						pageToken = ""
-					}
-					_, _ = fmt.Fprintf(
-						writer,
-						`{"id":%q,"name":%q,"access_token":%q}`,
-						metaLifecycleTestPageID,
-						metaMessengerRevalidationTestPageName,
-						pageToken,
 					)
 				default:
 					http.Error(writer, "unexpected endpoint", http.StatusNotFound)
