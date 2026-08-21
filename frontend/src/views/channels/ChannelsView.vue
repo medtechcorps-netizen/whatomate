@@ -1508,7 +1508,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
           <div class="md:col-span-1 xl:col-span-3">
             <p class="text-sm font-medium text-white light:text-slate-950">Connect a Facebook Page</p>
             <p class="mt-1 text-xs leading-5 text-white/45 light:text-slate-600">
-              Sign in with Facebook, choose an owned Page, then test and approve it before any message can be sent.
+              Sign in with Facebook, complete Meta's steps, and click Finish in the Meta window. Keep both windows open; authorization can take several minutes. Then choose an owned Page here, test it, and approve activation.
             </p>
           </div>
           <div class="flex gap-2">
@@ -1520,7 +1520,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             >
               <Loader2 v-if="metaMessengerBusy" class="mr-2 h-4 w-4 animate-spin" />
               <Facebook v-else class="mr-2 h-4 w-4" />
-              Continue with Facebook
+              {{ metaMessengerBusy ? 'Waiting for Meta…' : 'Continue with Facebook' }}
             </Button>
             <Button
               v-if="metaMessengerAuthorizationController"
@@ -1532,6 +1532,15 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               Cancel
             </Button>
           </div>
+          <p
+            v-if="metaMessengerAuthorizationController"
+            data-testid="messenger-facebook-wait-guidance"
+            role="status"
+            aria-live="polite"
+            class="rounded-lg border border-[#1877f2]/25 bg-[#1877f2]/10 px-3 py-2 text-xs leading-5 text-blue-100 light:border-blue-200 light:bg-blue-50 light:text-blue-900 md:col-span-2 xl:col-span-4"
+          >
+            Waiting for Meta. Complete the steps in the Meta window and click Finish. Do not close either window while it is loading.
+          </p>
         </template>
         <div
           v-else
@@ -2515,8 +2524,9 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               :disabled="metaMessengerBusy"
               @click="reconnectMetaMessenger(settingsAccount)"
             >
-              <Facebook class="mr-2 h-4 w-4" />
-              Reconnect Facebook
+              <Loader2 v-if="metaMessengerAuthorizationController" class="mr-2 h-4 w-4 animate-spin" />
+              <Facebook v-else class="mr-2 h-4 w-4" />
+              {{ metaMessengerAuthorizationController ? 'Waiting for Meta…' : 'Reconnect Facebook' }}
             </Button>
             <Button
               v-if="
@@ -2593,6 +2603,15 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               Disable outbound
             </Button>
           </div>
+          <p
+            v-if="metaMessengerAuthorizationController && isManagedMetaMessenger(settingsAccount)"
+            data-testid="messenger-facebook-reconnect-wait-guidance"
+            role="status"
+            aria-live="polite"
+            class="mt-3 rounded-lg border border-[#1877f2]/25 bg-[#1877f2]/10 px-3 py-2 text-xs leading-5 text-blue-100 light:border-blue-200 light:bg-blue-50 light:text-blue-900"
+          >
+            Waiting for Meta. Complete the steps in the Meta window and click Finish. Do not close either window while it is loading.
+          </p>
         </div>
 
         <div

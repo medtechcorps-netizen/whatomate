@@ -90,6 +90,7 @@ type metaMessengerTokenInspection struct {
 	AppID                string
 	Type                 string
 	UserID               string
+	ProfileID            string
 	Scopes               []string
 	GranularScopeTargets map[string]map[string]struct{}
 	ExpiresAt            *time.Time
@@ -184,6 +185,8 @@ const (
 	metaMessengerRevalidationStageAssignedPages        metaMessengerRevalidationStage = "assigned_pages"
 	metaMessengerRevalidationStageOwnedPages           metaMessengerRevalidationStage = "owned_pages"
 	metaMessengerRevalidationStagePageBinding          metaMessengerRevalidationStage = "page_binding"
+	metaMessengerRevalidationStagePageTokenInspection  metaMessengerRevalidationStage = "page_token_inspection"
+	metaMessengerRevalidationStagePageTokenIdentity    metaMessengerRevalidationStage = "page_token_identity"
 	metaMessengerRevalidationStageFinalPredicates      metaMessengerRevalidationStage = "final_predicates"
 	metaMessengerRevalidationStageCredentialProtection metaMessengerRevalidationStage = "credential_protection"
 )
@@ -209,6 +212,22 @@ func (e *metaMessengerRevalidationError) Unwrap() error {
 		return nil
 	}
 	return e.cause
+}
+
+// metaMessengerPageBindingStage returns only an internal allowlisted stage.
+// bindMetaMessengerPageToken wraps every expected failure with one of the two
+// precise substages; page_binding remains a defensive fallback for an
+// unexpected unwrapped caller error.
+func metaMessengerPageBindingStage(err error) metaMessengerRevalidationStage {
+	var staged *metaMessengerRevalidationError
+	if errors.As(err, &staged) && staged != nil {
+		switch staged.Stage {
+		case metaMessengerRevalidationStagePageTokenInspection,
+			metaMessengerRevalidationStagePageTokenIdentity:
+			return staged.Stage
+		}
+	}
+	return metaMessengerRevalidationStagePageBinding
 }
 
 // metaMessengerAuthorizationValidationResponse preserves actionable local
@@ -426,6 +445,7 @@ func (a *App) inspectMetaMessengerToken(
 		AppID:                strings.TrimSpace(data.AppID),
 		Type:                 tokenKind,
 		UserID:               userID,
+		ProfileID:            strings.TrimSpace(data.ProfileID),
 		Scopes:               verifiedScopes,
 		GranularScopeTargets: granularTargets,
 		ExpiresAt:            expiresAt,
@@ -1222,30 +1242,44 @@ func (a *App) bindMetaMessengerPageToken(
 	pageID, pageToken string,
 	authorityInspection metaMessengerTokenInspection,
 ) (metaMessengerTokenInspection, string, error) {
-	var binding struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
 	inspection, err := a.inspectMetaMessengerToken(ctx, pageToken, false)
 	if err != nil {
-		return inspection, "", err
+		return inspection, "", &metaMessengerRevalidationError{
+			Stage: metaMessengerRevalidationStagePageTokenInspection,
+			cause: err,
+		}
 	}
 	if !strings.EqualFold(strings.TrimSpace(inspection.Type), "PAGE") {
-		return inspection, "", errors.New("meta Page credential has the wrong token kind")
+		return inspection, "", &metaMessengerRevalidationError{
+			Stage: metaMessengerRevalidationStagePageTokenInspection,
+			cause: errors.New("meta Page credential has the wrong token kind"),
+		}
 	}
 	if strings.TrimSpace(authorityInspection.AppID) != "" &&
 		strings.TrimSpace(inspection.AppID) != strings.TrimSpace(authorityInspection.AppID) {
-		return inspection, "", errors.New("meta Page credential belongs to a different app")
+		return inspection, "", &metaMessengerRevalidationError{
+			Stage: metaMessengerRevalidationStagePageTokenInspection,
+			cause: errors.New("meta Page credential belongs to a different app"),
+		}
 	}
-	if err := a.doMetaMessengerGraphJSON(ctx, http.MethodGet, "me", url.Values{
-		"fields": {"id,name"},
-	}, pageToken, &binding); err != nil {
-		return inspection, "", err
+	// Meta's Debug Token contract exposes profile_id for an impersonated
+	// Page token. Some Page-token variants expose only user_id, so use it only
+	// as a compatibility fallback when profile_id is absent. This avoids a
+	// second generic Page read (and its broader field-permission surface) while
+	// still binding the credential to the exact Page selected from the freshly
+	// intersected assigned_pages, accounts, and owned_pages edges.
+	// https://developers.facebook.com/docs/graph-api/reference/debug_token/
+	boundPageID := strings.TrimSpace(inspection.ProfileID)
+	if boundPageID == "" {
+		boundPageID = strings.TrimSpace(inspection.UserID)
 	}
-	if strings.TrimSpace(binding.ID) != strings.TrimSpace(pageID) {
-		return inspection, "", errors.New("meta Page token is bound to a different Page")
+	if !validCanonicalMetaID(boundPageID) || boundPageID != strings.TrimSpace(pageID) {
+		return inspection, "", &metaMessengerRevalidationError{
+			Stage: metaMessengerRevalidationStagePageTokenIdentity,
+			cause: errors.New("meta Page token is bound to a different Page"),
+		}
 	}
-	return inspection, strings.TrimSpace(binding.Name), nil
+	return inspection, "", nil
 }
 
 func (a *App) subscribeMetaMessengerPage(

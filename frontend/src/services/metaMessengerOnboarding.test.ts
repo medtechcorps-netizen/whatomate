@@ -260,12 +260,58 @@ describe("metaMessengerOnboarding organization pinning", () => {
     }
   });
 
-  it("times out a lost Facebook popup callback without posting a code", async () => {
+  it("accepts a Facebook callback after 90 seconds without a stale timeout rejection", async () => {
     vi.useFakeTimers();
     try {
+      let facebookCallback: ((value: unknown) => void) | undefined;
       (window as any).FB = {
         init: vi.fn(),
-        login: vi.fn(),
+        login: vi.fn((callback: (value: unknown) => void) => {
+          facebookCallback = callback;
+        }),
+      };
+      vi.mocked(api.post).mockImplementation((url: string) => {
+        if (url.endsWith("/start")) return response(start) as any;
+        if (url.endsWith("/callback")) return response(selection()) as any;
+        throw new Error(`unexpected request ${url}`);
+      });
+
+      const result = metaMessengerOnboarding.begin(
+        organizationA,
+        () => true,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(facebookCallback).toBeTypeOf("function");
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      facebookCallback?.({
+        authResponse: { code: "authorization-code-after-finish" },
+        status: "connected",
+      });
+      await expect(result).resolves.toEqual(selection());
+
+      // Cross the original eight-minute deadline. A successful callback must
+      // have cleared that timer instead of producing a stale rejection.
+      await vi.advanceTimersByTimeAsync(360_001);
+      expect(api.post).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(api.post).mock.calls[1]?.[1]).toEqual({
+        code: "authorization-code-after-finish",
+        nonce: start.nonce,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out a lost Facebook popup callback before the server nonce expires", async () => {
+    vi.useFakeTimers();
+    try {
+      let facebookCallback: ((value: unknown) => void) | undefined;
+      (window as any).FB = {
+        init: vi.fn(),
+        login: vi.fn((callback: (value: unknown) => void) => {
+          facebookCallback = callback;
+        }),
       };
       vi.mocked(api.post).mockImplementation((url: string) => {
         if (url.endsWith("/start")) return response(start) as any;
@@ -277,8 +323,10 @@ describe("metaMessengerOnboarding organization pinning", () => {
         MetaMessengerAuthorizationFailedError,
       );
       await Promise.resolve();
-      await vi.advanceTimersByTimeAsync(90_000);
+      await vi.advanceTimersByTimeAsync(8 * 60_000);
       await rejection;
+      facebookCallback?.({ authResponse: { code: "stale-code" } });
+      await Promise.resolve();
       expect(api.post).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();

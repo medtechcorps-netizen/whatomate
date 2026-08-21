@@ -712,30 +712,51 @@ func TestMetaMessengerSystemUserSelectionUsesFreshAuthorityToken(t *testing.T) {
 
 func TestMetaMessengerSystemUserPageBindingUsesActualPageToken(t *testing.T) {
 	for _, testCase := range []struct {
-		name       string
-		bindingID  string
-		debugAppID string
-		debugType  string
-		wantPaths  []string
-		wantError  bool
+		name           string
+		debugAppID     string
+		debugType      string
+		debugUserID    string
+		debugProfileID string
+		wantStage      metaMessengerRevalidationStage
+		wantError      bool
 	}{
 		{
-			name: "exact Page", bindingID: metaLifecycleTestPageID,
-			wantPaths: []string{"/v25.0/debug_token", "/v25.0/me"},
+			name:           "profile ID binds exact Page while user ID remains authority",
+			debugUserID:    metaLifecycleTestUserID,
+			debugProfileID: metaLifecycleTestPageID,
 		},
 		{
-			name: "different Page", bindingID: "700000000000099", wantError: true,
-			wantPaths: []string{"/v25.0/debug_token", "/v25.0/me"},
+			name:        "user ID fallback binds exact Page when profile ID is absent",
+			debugUserID: metaLifecycleTestPageID,
 		},
 		{
-			name: "wrong token kind", bindingID: metaLifecycleTestPageID,
-			debugType: "SYSTEM_USER", wantError: true,
-			wantPaths: []string{"/v25.0/debug_token"},
+			name:           "different profile ID fails even when user ID matches Page",
+			debugUserID:    metaLifecycleTestPageID,
+			debugProfileID: "700000000000099",
+			wantError:      true,
+			wantStage:      metaMessengerRevalidationStagePageTokenIdentity,
 		},
 		{
-			name: "different app", bindingID: metaLifecycleTestPageID,
-			debugAppID: "100000000000099", wantError: true,
-			wantPaths: []string{"/v25.0/debug_token"},
+			name:        "authority user ID cannot bind Page when profile ID is absent",
+			debugUserID: metaLifecycleTestUserID,
+			wantError:   true,
+			wantStage:   metaMessengerRevalidationStagePageTokenIdentity,
+		},
+		{
+			name:           "wrong token kind",
+			debugType:      "SYSTEM_USER",
+			debugUserID:    metaLifecycleTestUserID,
+			debugProfileID: metaLifecycleTestPageID,
+			wantError:      true,
+			wantStage:      metaMessengerRevalidationStagePageTokenInspection,
+		},
+		{
+			name:           "different app",
+			debugAppID:     "100000000000099",
+			debugUserID:    metaLifecycleTestUserID,
+			debugProfileID: metaLifecycleTestPageID,
+			wantError:      true,
+			wantStage:      metaMessengerRevalidationStagePageTokenInspection,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -751,23 +772,20 @@ func TestMetaMessengerSystemUserPageBindingUsesActualPageToken(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				paths = append(paths, request.URL.Path)
 				writer.Header().Set("Content-Type", "application/json")
-				switch request.URL.Path {
-				case "/v25.0/debug_token":
-					require.Equal(t, "Bearer "+metaLifecycleTestAppID+"|"+metaLifecycleTestAppSecret, request.Header.Get("Authorization"))
-					require.Equal(t, "page-access-token", request.URL.Query().Get("input_token"))
-					_ = json.NewEncoder(writer).Encode(map[string]any{"data": map[string]any{
-						"app_id": debugAppID, "type": debugType,
-						"profile_id": metaLifecycleTestPageID, "is_valid": true,
-					}})
-				case "/v25.0/me":
-					require.Equal(t, "Bearer page-access-token", request.Header.Get("Authorization"))
-					require.Equal(t, "id,name", request.URL.Query().Get("fields"))
-					_ = json.NewEncoder(writer).Encode(map[string]string{
-						"id": testCase.bindingID, "name": "Owned Page",
-					})
-				default:
+				if request.URL.Path != "/v25.0/debug_token" {
 					http.Error(writer, "unexpected", http.StatusNotFound)
+					return
 				}
+				require.Equal(t, "Bearer "+metaLifecycleTestAppID+"|"+metaLifecycleTestAppSecret, request.Header.Get("Authorization"))
+				require.Equal(t, "page-access-token", request.URL.Query().Get("input_token"))
+				data := map[string]any{
+					"app_id": debugAppID, "type": debugType,
+					"user_id": testCase.debugUserID, "is_valid": true,
+				}
+				if testCase.debugProfileID != "" {
+					data["profile_id"] = testCase.debugProfileID
+				}
+				_ = json.NewEncoder(writer).Encode(map[string]any{"data": data})
 			}))
 			defer server.Close()
 
@@ -784,16 +802,21 @@ func TestMetaMessengerSystemUserPageBindingUsesActualPageToken(t *testing.T) {
 			if testCase.wantError {
 				require.Error(t, err)
 				assert.Empty(t, pageName)
-				assert.Equal(t, testCase.wantPaths, paths)
+				assert.Equal(t, []string{"/v25.0/debug_token"}, paths)
+				assert.Equal(t, testCase.wantStage, metaMessengerPageBindingStage(err))
+				var staged *metaMessengerRevalidationError
+				require.True(t, errors.As(err, &staged))
+				assert.Equal(t, testCase.wantStage, staged.Stage)
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, "Owned Page", pageName)
+			assert.Empty(t, pageName)
 			assert.Equal(t, metaLifecycleTestAppID, inspection.AppID)
 			assert.Equal(t, "PAGE", inspection.Type)
-			assert.Equal(t, metaLifecycleTestPageID, inspection.UserID)
+			assert.Equal(t, testCase.debugUserID, inspection.UserID)
+			assert.Equal(t, testCase.debugProfileID, inspection.ProfileID)
 			assert.False(t, inspection.CheckedAt.IsZero())
-			assert.Equal(t, testCase.wantPaths, paths)
+			assert.Equal(t, []string{"/v25.0/debug_token"}, paths)
 		})
 	}
 }

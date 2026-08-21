@@ -536,7 +536,7 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 		_ = a.metaMessengerRevalidationFailure(
 			orgID,
 			selected,
-			metaMessengerRevalidationStagePageBinding,
+			metaMessengerPageBindingStage(err),
 			err,
 		)
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Meta could not verify the selected Page token", nil, "")
