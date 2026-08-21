@@ -1148,16 +1148,39 @@ func validCanonicalMetaID(value string) bool {
 func (a *App) bindMetaMessengerPageToken(
 	ctx context.Context,
 	pageID, pageToken string,
+	authorityInspection metaMessengerTokenInspection,
 ) (metaMessengerTokenInspection, string, error) {
-	inspection, err := a.inspectMetaMessengerToken(ctx, pageToken, false)
-	if err != nil {
-		return inspection, "", err
-	}
 	var binding struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	}
-	if err := a.doMetaMessengerGraphJSON(ctx, http.MethodGet, "me", url.Values{
+	endpoint := "me"
+	inspection := metaMessengerTokenInspection{}
+	if strings.EqualFold(strings.TrimSpace(authorityInspection.Type), metaMessengerTokenKindSystemUser) {
+		// A Page credential returned by SYSTEM_USER/assigned_pages is already
+		// bound to the freshly inspected app, system user, Business, exact Page,
+		// and messaging tasks. Meta does not expose this credential through the
+		// normal debug_token or /me surfaces. Verify that it can read the exact
+		// Page-ID edge instead; this proves that the credential selected from the
+		// authoritative assignment is usable for that Page without widening it
+		// to any other asset.
+		endpoint = url.PathEscape(strings.TrimSpace(pageID))
+		inspection = metaMessengerTokenInspection{
+			AppID:               authorityInspection.AppID,
+			Type:                "PAGE",
+			UserID:              strings.TrimSpace(pageID),
+			ExpiresAt:           authorityInspection.ExpiresAt,
+			DataAccessExpiresAt: authorityInspection.DataAccessExpiresAt,
+			CheckedAt:           time.Now().UTC(),
+		}
+	} else {
+		var err error
+		inspection, err = a.inspectMetaMessengerToken(ctx, pageToken, false)
+		if err != nil {
+			return inspection, "", err
+		}
+	}
+	if err := a.doMetaMessengerGraphJSON(ctx, http.MethodGet, endpoint, url.Values{
 		"fields": {"id,name"},
 	}, pageToken, &binding); err != nil {
 		return inspection, "", err

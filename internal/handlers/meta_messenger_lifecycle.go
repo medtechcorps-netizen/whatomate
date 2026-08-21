@@ -505,7 +505,12 @@ func (a *App) checkMetaMessengerOwnership(
 	if !metaMessengerOpaqueValuesEqual(strings.TrimSpace(freshPageToken), strings.TrimSpace(snapshot.PageToken)) {
 		return metaregistry.OwnershipStale, "page_token_rotation_requires_reconnect"
 	}
-	if _, _, err := a.bindMetaMessengerPageToken(ctx, snapshot.Account.ExternalAccountID, snapshot.PageToken); err != nil {
+	if _, _, err := a.bindMetaMessengerPageToken(
+		ctx,
+		snapshot.Account.ExternalAccountID,
+		snapshot.PageToken,
+		inspection,
+	); err != nil {
 		return classifyMetaMessengerRevalidationError(err)
 	}
 	subscribed, err := a.metaMessengerPageHasConfiguredAppSubscription(ctx, snapshot.Account.ExternalAccountID, snapshot.PageToken)
