@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"gorm.io/gorm"
 )
@@ -108,6 +109,7 @@ func (p *CopilotRetentionProcessor) RunOnce(ctx context.Context) (int64, error) 
 
 	var organizationIDs []uuid.UUID
 	if err := p.app.rootApp().DB.WithContext(ctx).
+		Scopes(database.ExcludePlatformComplianceOrganizations).
 		Model(&models.Organization{}).
 		Order("id").
 		Pluck("id", &organizationIDs).Error; err != nil {

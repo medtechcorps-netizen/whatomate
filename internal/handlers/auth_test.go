@@ -1,6 +1,7 @@
 package handlers_test
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -340,7 +341,9 @@ func TestApp_RefreshToken_Success(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithEmail(testutil.UniqueEmail("refresh")), testutil.WithPassword("password123"))
-	refreshToken := testutil.GenerateTestRefreshToken(t, user, testutil.TestJWTSecret, 7*24*time.Hour)
+	jti := uuid.NewString()
+	require.NoError(t, app.Redis.Set(context.Background(), "refresh:"+jti, user.ID.String(), 7*24*time.Hour).Err())
+	refreshToken := generateRefreshTokenWithJTI(t, testutil.TestJWTSecret, user, jti, 7*24*time.Hour)
 
 	req := testutil.NewJSONRequest(t, map[string]string{
 		"refresh_token": refreshToken,
@@ -406,7 +409,9 @@ func TestApp_RefreshToken_UserNotFound(t *testing.T) {
 		OrganizationID: uuid.New(),
 		Email:          "fake@example.com",
 	}
-	token := testutil.GenerateTestRefreshToken(t, fakeUser, testutil.TestJWTSecret, 7*24*time.Hour)
+	jti := uuid.NewString()
+	require.NoError(t, app.Redis.Set(context.Background(), "refresh:"+jti, fakeUser.ID.String(), 7*24*time.Hour).Err())
+	token := generateRefreshTokenWithJTI(t, testutil.TestJWTSecret, fakeUser, jti, 7*24*time.Hour)
 
 	req := testutil.NewJSONRequest(t, map[string]string{
 		"refresh_token": token,
@@ -421,7 +426,9 @@ func TestApp_RefreshToken_DisabledUser(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithEmail(testutil.UniqueEmail("disabled")), testutil.WithPassword("password123"), testutil.WithInactive())
-	token := testutil.GenerateTestRefreshToken(t, user, testutil.TestJWTSecret, 7*24*time.Hour)
+	jti := uuid.NewString()
+	require.NoError(t, app.Redis.Set(context.Background(), "refresh:"+jti, user.ID.String(), 7*24*time.Hour).Err())
+	token := generateRefreshTokenWithJTI(t, testutil.TestJWTSecret, user, jti, 7*24*time.Hour)
 
 	req := testutil.NewJSONRequest(t, map[string]string{
 		"refresh_token": token,
@@ -436,7 +443,9 @@ func TestApp_RefreshToken_RejectsRemovedOrganizationMembership(t *testing.T) {
 	app := newTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	user := testutil.CreateTestUser(t, app.DB, org.ID)
-	token := testutil.GenerateTestRefreshToken(t, user, testutil.TestJWTSecret, time.Hour)
+	jti := uuid.NewString()
+	require.NoError(t, app.Redis.Set(context.Background(), "refresh:"+jti, user.ID.String(), time.Hour).Err())
+	token := generateRefreshTokenWithJTI(t, testutil.TestJWTSecret, user, jti, time.Hour)
 
 	require.NoError(t, app.DB.Where("user_id = ? AND organization_id = ?", user.ID, org.ID).
 		Delete(&models.UserOrganization{}).Error)
@@ -509,6 +518,7 @@ func TestApp_GeneratedTokensAreValid(t *testing.T) {
 	assert.Equal(t, user.Email, accessClaims.Email)
 	assert.Equal(t, user.RoleID, accessClaims.RoleID)
 	assert.Equal(t, "whatomate", accessClaims.Issuer)
+	assert.Equal(t, middleware.JWTSubjectAccess, accessClaims.Subject)
 
 	// Verify refresh token can be parsed
 	refreshToken, err := jwt.ParseWithClaims(refreshTokenStr, &middleware.JWTClaims{}, func(token *jwt.Token) (any, error) {
@@ -520,4 +530,6 @@ func TestApp_GeneratedTokensAreValid(t *testing.T) {
 	refreshClaims, ok := refreshToken.Claims.(*middleware.JWTClaims)
 	require.True(t, ok)
 	assert.Equal(t, user.ID, refreshClaims.UserID)
+	assert.Equal(t, middleware.JWTSubjectRefresh, refreshClaims.Subject)
+	assert.NotEmpty(t, refreshClaims.ID)
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/stretchr/testify/require"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -73,6 +75,27 @@ func SetupTestDB(t *testing.T) *gorm.DB {
 
 	// Return a new session for this test to avoid connection conflicts
 	return testDB.Session(&gorm.Session{})
+}
+
+// OpenTestDBAsRole opens a direct test connection whose session_user and
+// current_user are both the supplied login role. It intentionally runs no
+// migrations and is used for startup-verifier identity tests that cannot be
+// faithfully exercised with SET ROLE.
+func OpenTestDBAsRole(t *testing.T, role, password string) *gorm.DB {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	parsed, err := url.Parse(dsn)
+	require.NoError(t, err)
+	require.NotEmpty(t, parsed.Scheme, "TEST_DATABASE_URL must be a PostgreSQL URL")
+	parsed.User = url.UserPassword(role, password)
+	db, err := gorm.Open(postgres.Open(parsed.String()), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	return db
 }
 
 // SetupTestDBWithCleanup is like SetupTestDB but allows controlling cleanup behavior.
@@ -192,8 +215,111 @@ func truncateModelTables(db *gorm.DB) {
 	tables["chatbot_flow_steps"] = struct{}{}
 	tables["role_permissions"] = struct{}{}
 
+	ordered := make([]string, 0, len(tables)+1)
 	for table := range tables {
-		quoted := `"` + strings.ReplaceAll(table, `"`, `""`) + `"`
-		db.Exec(fmt.Sprintf("TRUNCATE TABLE %s CASCADE", quoted))
+		ordered = append(ordered, table)
+	}
+	sort.Strings(ordered)
+
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		var truncateGuardInstalled bool
+		if err := tx.Raw(`
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_trigger AS trigger
+				JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+				JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+				WHERE namespace.nspname = 'public' AND relation.relname = 'organizations'
+				  AND trigger.tgname = 'rereply_platform_compliance_truncate_guard'
+				  AND NOT trigger.tgisinternal
+			)
+		`).Scan(&truncateGuardInstalled).Error; err != nil {
+			return fmt.Errorf("inspect organization truncate guard: %w", err)
+		}
+		if truncateGuardInstalled {
+			if err := tx.Exec(`
+				ALTER TABLE public.organizations
+				DISABLE TRIGGER rereply_platform_compliance_truncate_guard
+			`).Error; err != nil {
+				return fmt.Errorf("disable test organization truncate guard: %w", err)
+			}
+		}
+		var identityTruncateGuardInstalled bool
+		if err := tx.Raw(`
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_trigger AS trigger
+				JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+				JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+				WHERE namespace.nspname = 'public'
+				  AND relation.relname = 'organization_identity_registry'
+				  AND trigger.tgname = 'rereply_platform_compliance_identity_registry_truncate_guard'
+				  AND NOT trigger.tgisinternal
+			)
+		`).Scan(&identityTruncateGuardInstalled).Error; err != nil {
+			return fmt.Errorf("inspect organization identity registry truncate guard: %w", err)
+		}
+		if identityTruncateGuardInstalled {
+			if err := tx.Exec(`
+				ALTER TABLE public.organization_identity_registry
+				DISABLE TRIGGER rereply_platform_compliance_identity_registry_truncate_guard
+			`).Error; err != nil {
+				return fmt.Errorf("disable test organization identity registry truncate guard: %w", err)
+			}
+		}
+		for _, table := range ordered {
+			quoted := `"` + strings.ReplaceAll(table, `"`, `""`) + `"`
+			if err := tx.Exec(fmt.Sprintf("TRUNCATE TABLE public.%s CASCADE", quoted)).Error; err != nil {
+				return fmt.Errorf("truncate test table %s: %w", table, err)
+			}
+		}
+		var identityRegistryExists bool
+		if err := tx.Raw(`
+			SELECT pg_catalog.to_regclass('public.organization_identity_registry') IS NOT NULL
+		`).Scan(&identityRegistryExists).Error; err != nil {
+			return fmt.Errorf("inspect organization identity registry: %w", err)
+		}
+		if identityRegistryExists {
+			if err := tx.Exec("TRUNCATE TABLE public.organization_identity_registry").Error; err != nil {
+				return fmt.Errorf("truncate test organization identity registry: %w", err)
+			}
+		}
+		if truncateGuardInstalled {
+			if err := tx.Exec(`
+				ALTER TABLE public.organizations
+				ENABLE TRIGGER rereply_platform_compliance_truncate_guard
+			`).Error; err != nil {
+				return fmt.Errorf("re-enable test organization truncate guard: %w", err)
+			}
+		}
+		if identityTruncateGuardInstalled {
+			if err := tx.Exec(`
+				ALTER TABLE public.organization_identity_registry
+				ENABLE TRIGGER rereply_platform_compliance_identity_registry_truncate_guard
+			`).Error; err != nil {
+				return fmt.Errorf("re-enable test organization identity registry truncate guard: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		panic(fmt.Sprintf("truncate disposable PostgreSQL test tables: %v", err))
+	}
+	var disabledUserTriggers int64
+	if err := db.Raw(`
+		SELECT pg_catalog.count(*)
+		FROM pg_catalog.pg_trigger AS trigger
+		JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		WHERE namespace.nspname = 'public'
+		  AND NOT trigger.tgisinternal
+		  AND trigger.tgenabled <> 'O'
+	`).Scan(&disabledUserTriggers).Error; err != nil {
+		panic(fmt.Sprintf("verify disposable PostgreSQL test trigger cleanup: %v", err))
+	}
+	if disabledUserTriggers != 0 {
+		panic(fmt.Sprintf(
+			"verify disposable PostgreSQL test trigger cleanup: %d public user triggers remain disabled",
+			disabledUserTriggers,
+		))
 	}
 }

@@ -27,6 +27,10 @@ var (
 	// ErrMissingTenant is returned before any database work when a request or
 	// background job does not carry an organization identity.
 	ErrMissingTenant = errors.New("organization context is required")
+	// ErrTenantRLSRemovalTransaction rejects nested or stale-snapshot rollback
+	// attempts. RLS removal is an operational root transaction whose first
+	// visibility boundary must be a READ COMMITTED organizations lock.
+	ErrTenantRLSRemovalTransaction = errors.New("tenant RLS removal requires a root READ COMMITTED transaction")
 
 	sqlIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
@@ -416,9 +420,12 @@ func ApplyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		); err != nil {
 			return err
 		}
+		if err := installPlatformComplianceGuards(tx, migrationRole, runtimeRole); err != nil {
+			return err
+		}
 
 		return installRoutingFunctions(tx, runtime)
-	}); err != nil {
+	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted}); err != nil {
 		return fmt.Errorf("apply tenant RLS: %w", err)
 	}
 
@@ -691,6 +698,9 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 			currentRole,
 			strings.Join(privilegedRoles, ", "),
 		)
+	}
+	if err := verifyPlatformComplianceGuards(db, currentRole); err != nil {
+		return fmt.Errorf("verify platform compliance write barrier: %w", err)
 	}
 
 	var whatsappPhoneRoutingIndexValid bool
@@ -1493,7 +1503,33 @@ func RemoveTenantRLS(db *gorm.DB) error {
 	if db == nil {
 		return errors.New("database connection is required")
 	}
+	// GORM implements Transaction on an existing *sql.Tx as a savepoint and
+	// ignores new isolation options. Reject nesting outright so a caller cannot
+	// smuggle a REPEATABLE READ snapshot across the purpose-organization
+	// teardown interlock.
+	type transactionCommitter interface {
+		Commit() error
+		Rollback() error
+	}
+	if db.Statement != nil {
+		if _, nested := db.Statement.ConnPool.(transactionCommitter); nested {
+			return ErrTenantRLSRemovalTransaction
+		}
+	}
 	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SET LOCAL search_path = pg_catalog, public").Error; err != nil {
+			return fmt.Errorf("pin tenant RLS removal search path: %w", err)
+		}
+		var isolation string
+		if err := tx.Raw("SHOW transaction_isolation").Scan(&isolation).Error; err != nil {
+			return fmt.Errorf("inspect tenant RLS removal isolation: %w", err)
+		}
+		if strings.ToLower(strings.TrimSpace(isolation)) != "read committed" {
+			return ErrTenantRLSRemovalTransaction
+		}
+		if err := removePlatformComplianceGuards(tx); err != nil {
+			return err
+		}
 		tables, err := existingProtectedTenantTables(tx)
 		if err != nil {
 			return fmt.Errorf("inspect protected tenant tables for RLS removal: %w", err)
@@ -1532,7 +1568,7 @@ func RemoveTenantRLS(db *gorm.DB) error {
 			}
 		}
 		return nil
-	})
+	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 }
 
 func validateIdentifier(value string) error {

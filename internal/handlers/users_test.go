@@ -14,6 +14,30 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+func TestSuperAdminCannotCreateUserInPlatformComplianceTenant(t *testing.T) {
+	app := newTestApp(t)
+	home := testutil.CreateTestOrganization(t, app.DB)
+	_, target := testutil.CreateTestPlatformComplianceOrganization(t, app.DB, false, false)
+	superAdmin := testutil.CreateTestUser(
+		t, app.DB, home.ID,
+		testutil.WithEmail(testutil.UniqueEmail("compliance-super-admin")),
+		testutil.WithSuperAdmin(),
+	)
+
+	newEmail := testutil.UniqueEmail("must-not-enter-compliance")
+	request := testutil.NewJSONRequest(t, map[string]any{
+		"email": newEmail, "password": "securePass123", "full_name": "Blocked User",
+	})
+	testutil.SetAuthContext(request, home.ID, superAdmin.ID)
+	testutil.SetHeader(request, "X-Organization-ID", target.ID.String())
+
+	require.NoError(t, app.Tenant((*handlers.App).CreateUser)(request))
+	assert.Equal(t, fasthttp.StatusUnauthorized, testutil.GetResponseStatusCode(request))
+	var count int64
+	require.NoError(t, app.DB.Model(&models.User{}).Where("email = ?", newEmail).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
 // --- ListUsers Tests ---
 
 func TestApp_ListUsers(t *testing.T) {

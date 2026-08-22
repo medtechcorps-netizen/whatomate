@@ -6,6 +6,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/middleware"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -13,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
 )
 
 const testJWTSecret = "test-secret-key-must-be-at-least-32-chars"
@@ -38,6 +40,28 @@ func generateTestToken(t *testing.T, userID, orgID uuid.UUID, email string, role
 		},
 	}
 
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString([]byte(testJWTSecret))
+	require.NoError(t, err)
+	return tokenString
+}
+
+func generateTypedTestToken(
+	t *testing.T,
+	userID, orgID uuid.UUID,
+	subject, jti string,
+) string {
+	t.Helper()
+	claims := middleware.JWTClaims{
+		UserID:         userID,
+		OrganizationID: orgID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        jti,
+			Subject:   subject,
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString([]byte(testJWTSecret))
 	require.NoError(t, err)
@@ -151,6 +175,43 @@ func TestAuth_ValidJWT(t *testing.T) {
 	gotRoleID, ok := result.RequestCtx.UserValue(middleware.ContextKeyRoleID).(uuid.UUID)
 	require.True(t, ok, "role_id should be uuid.UUID")
 	assert.Equal(t, roleID, gotRoleID)
+}
+
+func TestAuth_AcceptsOnlyAccessCredentialShapes(t *testing.T) {
+	t.Parallel()
+	userID := uuid.New()
+	orgID := uuid.New()
+
+	tests := []struct {
+		name    string
+		subject string
+		jti     string
+		allowed bool
+	}{
+		{name: "typed access", subject: middleware.JWTSubjectAccess, allowed: true},
+		{name: "legacy access", allowed: true},
+		{name: "typed refresh", subject: middleware.JWTSubjectRefresh, jti: uuid.NewString()},
+		{name: "typed websocket", subject: middleware.JWTSubjectWebSocket},
+		{name: "legacy refresh", jti: uuid.NewString()},
+		{name: "unknown typed token", subject: "unknown"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			token := generateTypedTestToken(t, userID, orgID, test.subject, test.jti)
+			request := newTestRequest()
+			request.RequestCtx.Request.Header.Set("Authorization", "Bearer "+token)
+
+			result := middleware.Auth(testJWTSecret)(request)
+			if test.allowed {
+				require.NotNil(t, result)
+				return
+			}
+			assert.Nil(t, result)
+			assert.Equal(t, fasthttp.StatusUnauthorized, request.RequestCtx.Response.StatusCode())
+		})
+	}
 }
 
 func TestAuth_ExpiredJWT(t *testing.T) {
@@ -588,6 +649,130 @@ func TestAuthWithDB_RejectsTokenAfterOrganizationMembershipIsRemoved(t *testing.
 
 	assert.Nil(t, result)
 	assert.Equal(t, fasthttp.StatusUnauthorized, req.RequestCtx.Response.StatusCode())
+}
+
+func TestAuthWithDBRejectsRefreshCredentialAsHTTPAccess(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, organization.ID)
+	refreshToken := generateTypedTestToken(
+		t,
+		user.ID,
+		organization.ID,
+		middleware.JWTSubjectRefresh,
+		uuid.NewString(),
+	)
+	request := newTestRequest()
+	request.RequestCtx.Request.Header.Set("Authorization", "Bearer "+refreshToken)
+
+	result := middleware.AuthWithDB(testJWTSecret, db)(request)
+
+	assert.Nil(t, result)
+	assert.Equal(t, fasthttp.StatusUnauthorized, request.RequestCtx.Response.StatusCode())
+	assert.Nil(t, request.RequestCtx.UserValue(middleware.ContextKeyUserID))
+}
+
+func TestAuthWithDBRejectsPlatformComplianceTenant(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	home := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, home.ID, testutil.WithSuperAdmin())
+	_, target := testutil.CreateTestPlatformComplianceOrganization(t, db, true, false)
+	purpose, err := database.IsPlatformComplianceOrganization(db, target.ID)
+	require.NoError(t, err)
+	require.True(t, purpose)
+	token := generateTestToken(t, user.ID, target.ID, user.Email, user.RoleID, time.Hour)
+	request := newTestRequest()
+	request.RequestCtx.Request.Header.Set("Authorization", "Bearer "+token)
+
+	result := middleware.AuthWithDB(testJWTSecret, db)(request)
+
+	assert.Nil(t, result)
+	assert.Equal(t, fasthttp.StatusUnauthorized, request.RequestCtx.Response.StatusCode())
+}
+
+func TestAuthWithDBRejectsMalformedPlatformComplianceMarker(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	home := testutil.CreateTestOrganization(t, db)
+	target := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, home.ID, testutil.WithSuperAdmin())
+	// Install the complete production guard contract. The created purpose row is
+	// unrelated to the assertion; this test targets a historically malformed
+	// ordinary row that the current guards make impossible to create normally.
+	testutil.CreateTestPlatformComplianceOrganization(t, db, true, false)
+	t.Cleanup(func() {
+		testutil.TruncateTables(db)
+		assertMiddlewareOrganizationGuardEnabled(t, db)
+	})
+
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		var guardEnabled bool
+		if err := tx.Raw(`
+			SELECT pg_catalog.count(*) = 1
+				AND pg_catalog.bool_and(trigger.tgenabled = 'O')
+			FROM pg_catalog.pg_trigger AS trigger
+			JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+			JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+			WHERE namespace.nspname = 'public'
+			  AND relation.relname = 'organizations'
+			  AND trigger.tgname = 'rereply_platform_compliance_classification_guard'
+			  AND NOT trigger.tgisinternal
+		`).Scan(&guardEnabled).Error; err != nil {
+			return err
+		}
+		if !guardEnabled {
+			return gorm.ErrInvalidData
+		}
+		if err := tx.Exec(
+			"ALTER TABLE public.organizations DISABLE TRIGGER rereply_platform_compliance_classification_guard",
+		).Error; err != nil {
+			return err
+		}
+		result := tx.Exec(`
+			UPDATE public.organizations
+			SET settings = COALESCE(settings, '{}'::jsonb)
+				|| pg_catalog.jsonb_build_object(CAST(? AS text), '"malformed"'::jsonb)
+			WHERE id = ?
+		`, database.PlatformCompliancePurposeMarkerKey, target.ID)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		return tx.Exec(
+			"ALTER TABLE public.organizations ENABLE TRIGGER rereply_platform_compliance_classification_guard",
+		).Error
+	}))
+	assertMiddlewareOrganizationGuardEnabled(t, db)
+	purpose, err := database.IsPlatformComplianceOrganization(db, target.ID)
+	require.ErrorIs(t, err, database.ErrPlatformComplianceMarkerInvalid)
+	require.False(t, purpose)
+
+	token := generateTestToken(t, user.ID, target.ID, user.Email, user.RoleID, time.Hour)
+	request := newTestRequest()
+	request.RequestCtx.Request.Header.Set("Authorization", "Bearer "+token)
+
+	result := middleware.AuthWithDB(testJWTSecret, db)(request)
+
+	assert.Nil(t, result)
+	assert.Equal(t, fasthttp.StatusUnauthorized, request.RequestCtx.Response.StatusCode())
+}
+
+func assertMiddlewareOrganizationGuardEnabled(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var enabled bool
+	require.NoError(t, db.Raw(`
+		SELECT pg_catalog.count(*) = 1
+			AND pg_catalog.bool_and(trigger.tgenabled = 'O')
+		FROM pg_catalog.pg_trigger AS trigger
+		JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		WHERE namespace.nspname = 'public'
+		  AND relation.relname = 'organizations'
+		  AND trigger.tgname = 'rereply_platform_compliance_classification_guard'
+		  AND NOT trigger.tgisinternal
+	`).Scan(&enabled).Error)
+	require.True(t, enabled, "organization compliance guard must remain enabled")
 }
 
 func TestAuthWithDB_UsesCurrentOrganizationRoleInsteadOfStaleTokenRole(t *testing.T) {

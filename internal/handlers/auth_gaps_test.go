@@ -27,6 +27,7 @@ func generateRefreshTokenWithJTI(t *testing.T, secret string, user *models.User,
 		RoleID:         user.RoleID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        jti,
+			Subject:   middleware.JWTSubjectRefresh,
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiry)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    "whatomate",
@@ -203,7 +204,7 @@ func TestApp_GetWSToken_Success(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, user.ID, claims.UserID)
 	assert.Equal(t, org.ID, claims.OrganizationID)
-	assert.Equal(t, "ws", claims.Subject, "WS token must have subject=ws")
+	assert.Equal(t, middleware.JWTSubjectWebSocket, claims.Subject, "WS token must have subject=ws")
 
 	require.NotNil(t, claims.ExpiresAt)
 	ttl := time.Until(claims.ExpiresAt.Time)
@@ -280,6 +281,7 @@ func TestApp_RefreshToken_RotatesJTI_ReplayFails(t *testing.T) {
 	newClaims, ok := parsed.Claims.(*middleware.JWTClaims)
 	require.True(t, ok)
 	assert.NotEqual(t, jti, newClaims.ID, "rotation must produce a fresh JTI")
+	assert.Equal(t, middleware.JWTSubjectRefresh, newClaims.Subject)
 }
 
 func TestApp_RefreshToken_FromCookie(t *testing.T) {

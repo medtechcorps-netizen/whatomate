@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	appwebsocket "github.com/shridarpatil/whatomate/internal/websocket"
 	"gorm.io/gorm"
@@ -269,6 +270,7 @@ func (p *CareContinuityProcessor) RunOnce(ctx context.Context) error {
 func (p *CareContinuityProcessor) listOrganizations(ctx context.Context) ([]uuid.UUID, error) {
 	var organizationIDs []uuid.UUID
 	if err := p.app.rootApp().DB.WithContext(ctx).
+		Scopes(database.ExcludePlatformComplianceOrganizations).
 		Model(&models.Organization{}).
 		Order("id").
 		Pluck("id", &organizationIDs).Error; err != nil {

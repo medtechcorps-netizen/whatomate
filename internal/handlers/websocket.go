@@ -1,14 +1,22 @@
 package handlers
 
 import (
+	"context"
+	"time"
+
 	"github.com/fasthttp/websocket"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/middleware"
+	"github.com/shridarpatil/whatomate/internal/models"
 	ws "github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
 )
+
+const websocketAuthorizationTimeout = 5 * time.Second
 
 // newUpgrader creates a WebSocket upgrader that validates origins against the
 // configured allowed origins. If no origins are configured, all are allowed.
@@ -57,19 +65,49 @@ func (a *App) WebSocketHandler(r *fastglue.Request) error {
 // and returns user ID and organization ID.
 func (a *App) validateWSTokenFn() ws.AuthenticateFn {
 	return func(tokenString string) (uuid.UUID, uuid.UUID, error) {
+		root := a.rootApp()
+		if root == nil || root.Config == nil || root.DB == nil {
+			return uuid.Nil, uuid.Nil, jwt.ErrTokenInvalidClaims
+		}
 		token, err := jwt.ParseWithClaims(tokenString, &middleware.JWTClaims{}, func(token *jwt.Token) (any, error) {
-			return []byte(a.Config.JWT.Secret), nil
-		})
+			return []byte(root.Config.JWT.Secret), nil
+		}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
 
 		if err != nil || !token.Valid {
-			return uuid.Nil, uuid.Nil, err
-		}
-
-		claims, ok := token.Claims.(*middleware.JWTClaims)
-		if !ok {
 			return uuid.Nil, uuid.Nil, jwt.ErrTokenInvalidClaims
 		}
 
+		claims, ok := token.Claims.(*middleware.JWTClaims)
+		if !ok || claims.Subject != middleware.JWTSubjectWebSocket || claims.ID != "" ||
+			claims.UserID == uuid.Nil || claims.OrganizationID == uuid.Nil {
+			return uuid.Nil, uuid.Nil, jwt.ErrTokenInvalidClaims
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), websocketAuthorizationTimeout)
+		defer cancel()
+		err = database.WithTenantReadCommitted(
+			root.DB.WithContext(ctx),
+			claims.OrganizationID,
+			func(tx *gorm.DB) error {
+				purpose, purposeErr := database.IsPlatformComplianceOrganization(tx, claims.OrganizationID)
+				if purposeErr != nil || purpose {
+					return jwt.ErrTokenInvalidClaims
+				}
+				var user models.User
+				if userErr := tx.Where("id = ?", claims.UserID).First(&user).Error; userErr != nil || !user.IsActive {
+					return jwt.ErrTokenInvalidClaims
+				}
+				scoped := root.scopedApp(tx, claims.OrganizationID)
+				if membershipErr := scoped.applyOrganizationMembership(&user, claims.OrganizationID, false); membershipErr != nil ||
+					user.OrganizationID != claims.OrganizationID {
+					return jwt.ErrTokenInvalidClaims
+				}
+				return nil
+			},
+		)
+		if err != nil {
+			return uuid.Nil, uuid.Nil, jwt.ErrTokenInvalidClaims
+		}
 		return claims.UserID, claims.OrganizationID, nil
 	}
 }

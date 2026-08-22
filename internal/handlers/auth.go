@@ -8,6 +8,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/access"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/middleware"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
@@ -301,19 +302,17 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 	}
 
 	claims, ok := token.Claims.(*middleware.JWTClaims)
-	if !ok {
+	if !ok || !middleware.IsRefreshJWTClaims(claims) {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid token claims", nil, "")
 	}
 
 	// Validate JTI in Redis (single-use: delete on consumption)
-	if claims.ID != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		deleted, err := a.Redis.Del(ctx, refreshTokenKey(claims.ID)).Result()
-		if err != nil || deleted == 0 {
-			// Token was already used or revoked
-			return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Refresh token has been revoked", nil, "")
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	deleted, err := a.Redis.Del(ctx, refreshTokenKey(claims.ID)).Result()
+	if err != nil || deleted == 0 {
+		// Token was already used or revoked
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Refresh token has been revoked", nil, "")
 	}
 
 	// Get user
@@ -381,9 +380,12 @@ func (a *App) applyOrganizationMembership(user *models.User, orgID uuid.UUID, al
 		return membershipErr
 	}
 
-	var org models.Organization
-	if err := a.DB.Where("id = ?", orgID).First(&org).Error; err != nil {
+	compliance, err := database.IsPlatformComplianceOrganization(a.DB, orgID)
+	if err != nil {
 		return err
+	}
+	if compliance {
+		return database.ErrPlatformComplianceTenant
 	}
 
 	user.OrganizationID = orgID
@@ -419,6 +421,7 @@ func (a *App) generateAccessToken(user *models.User) (string, error) {
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(a.Config.JWT.AccessExpiryMins) * time.Minute)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    "whatomate",
+			Subject:   middleware.JWTSubjectAccess,
 		},
 	}
 
@@ -441,6 +444,7 @@ func (a *App) generateRefreshToken(user *models.User) (string, error) {
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiry)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    "whatomate",
+			Subject:   middleware.JWTSubjectRefresh,
 		},
 	}
 
@@ -609,14 +613,25 @@ func (a *App) GetWSToken(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
+	// Re-resolve the principal and selected organization at issuance time. The
+	// request context identifies the candidate only; current database state is
+	// authoritative for active status, membership, and purpose classification.
+	var user models.User
+	if err := a.DB.Where("id = ?", userID).First(&user).Error; err != nil || !user.IsActive {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	if err := a.applyOrganizationMembership(&user, orgID, false); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Organization access is no longer available", nil, "")
+	}
+
 	claims := middleware.JWTClaims{
-		UserID:         userID,
-		OrganizationID: orgID,
+		UserID:         user.ID,
+		OrganizationID: user.OrganizationID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(30 * time.Second)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    "whatomate",
-			Subject:   "ws",
+			Subject:   middleware.JWTSubjectWebSocket,
 		},
 	}
 

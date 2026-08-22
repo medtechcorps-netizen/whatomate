@@ -144,7 +144,7 @@ func (a *App) DeleteMetaInstagramUserData(r *fastglue.Request) error {
 
 	eventIssuedAt := time.Unix(payload.IssuedAt, 0).UTC()
 	var privacyRequest models.PrivacyRequest
-	err = a.WithCommittedTenantApp(journalClaim.OwnerID, func(scoped *App) error {
+	persistPrivacyRequest := func(scoped *App) error {
 		var mutationErr error
 		privacyRequest, mutationErr = scoped.createOrResumeMetaInstagramDeletionRequest(
 			journalClaim.OwnerID,
@@ -158,7 +158,17 @@ func (a *App) DeleteMetaInstagramUserData(r *fastglue.Request) error {
 			now,
 		)
 		return mutationErr
-	})
+	}
+	if journalClaim.Event.IdentityHashed {
+		// Organization-set no-target/ambiguous receipts belong only to the
+		// dedicated exact-purpose Instagram compliance tenant. Ordinary and
+		// legacy singleton receipts continue through ordinary admission.
+		err = a.withPlatformComplianceInstagramTenantApp(
+			journalClaim.OwnerID, persistPrivacyRequest,
+		)
+	} else {
+		err = a.WithCommittedTenantApp(journalClaim.OwnerID, persistPrivacyRequest)
+	}
 	if err != nil {
 		a.Log.Warn("Instagram data-deletion privacy workflow could not be persisted")
 		return sendMetaInstagramDeletionError(r, fasthttp.StatusServiceUnavailable)
@@ -589,6 +599,13 @@ func (a *App) cleanupMetaInstagramDeletionEvents(now time.Time) error {
 	for _, organizationID := range organizationIDs {
 		err = database.WithTenantReadCommitted(
 			a.rootApp().DB, organizationID, func(tx *gorm.DB) error {
+				purpose, purposeErr := database.IsPlatformComplianceOrganization(tx, organizationID)
+				if purposeErr != nil {
+					return purposeErr
+				}
+				if purpose {
+					return nil
+				}
 				for _, cleanup := range []struct {
 					where string
 					args  []any

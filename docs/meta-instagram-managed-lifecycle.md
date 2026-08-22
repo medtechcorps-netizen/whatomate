@@ -227,26 +227,55 @@ journal is tenant-owned from its first verified insert. No-current-account and
 ambiguous requests belong only to the compliance tenant; exact requests belong
 only to the matched clinic tenant. It retains completed entries for 365 days and unresolved
 entries for 90 days. Cleanup deletes at most 500 entries per state class per
-sweep. Neither journal stores the raw signed request, access token, or app
+sweep for ordinary clinic-owned journals. Purpose-owned compliance evidence is
+not purgeable in this phase: the database barrier rejects deletion even after
+the journal is terminal, so its retention window does not confer deletion
+authority. Neither journal stores the raw signed request, access token, or app
 secret.
 
 ## Reader-first rollout and rollback
 
 Use this order:
 
-1. Deploy the database migration and new reader binary while retaining only
+1. Deploy the database migration, run the normal `ApplyTenantRLS` contract, and
+   deploy the new reader binary while retaining only
    the legacy singleton `allowed_organization_id`. The deletion journal remains
    in the direct tenant-RLS table set. No new Instagram `SECURITY DEFINER`
-   resolver is installed or granted; each bounded configured organization
+   resolver is installed or granted; the migration-owned compliance write
+   barrier is independently installed and startup-verified. Each bounded configured organization
    enters an ordinary tenant transaction, and routing version 5 remains
    unchanged.
 2. Deploy queue-v2 readers to every relay replica. Confirm static webhook and
    outbound smoke tests still use the existing static mappings and routes.
-3. Create the platform-owned compliance organization through the authorized
-   control plane. It must be distinct from every clinic, belong to the
-   undeleted active reseller whose slug is exactly `platform-direct`, have the
-   documented privacy ownership/retention controls, and carry this independent
-   durable organization-settings marker:
+   Before atomic purpose creation, prove that every tenant reader and
+   writer—including every web/API replica, worker, tenant-authenticated admin
+   path, API-key path, and explicit tenant-header path—is running the
+   purpose/auth-guard-aware release and rejects a purpose organization. Do not
+   create a purpose organization during a mixed fleet. The database write barrier constrains guarded
+   writes; it does not make a pre-guard reader safe.
+3. Choose a new canonical UUID that has never belonged to an organization and
+   is distinct from every clinic. Do not create a bare row and do not use the
+   ordinary tenant creator, which seeds prohibited rows. Dry-run and then apply
+   `-create-purpose -feature instagram` through the reviewed bootstrap command.
+   Its exact migration-owned creator performs a strict insert of the complete
+   purpose organization, Instagram marker, and audit evidence in one database
+   transaction. It requires the undeleted active reseller whose slug is exactly
+   `platform-direct` and fails closed on any live, soft-deleted, previously
+   identity-claimed, or historical use of the UUID. There is no Redis fence or
+   external recovery
+   state because no committed ordinary row can transition to purpose.
+
+   The resulting marker is:
+
+   ```json
+   {"platform_compliance_tenant": true}
+   ```
+
+   Existing ordinary organizations can never be classified. The database
+   creation, row, audit, append-only identity-registry, and truncate guards are
+   part of the normal tenant-RLS migration and startup verification contract.
+   After atomic birth, purpose is immutable and the organization carries this
+   independent product marker:
 
    ```json
    {"meta_instagram_data_deletion_compliance_tenant": true}
@@ -260,19 +289,37 @@ Use this order:
    enters the configured compliance tenant's ordinary RLS transaction and
    performs one bounded `organizations` to `resellers` ownership check. A
    missing/deleted organization, missing/deleted/inactive/non-platform reseller,
-   or absent/malformed marker makes startup fail closed without a provider call.
-   The compliance organization remains excluded from both the active and
+   or absent/malformed purpose or product marker makes startup fail closed
+   without a provider call.
+   Authenticated tenant selection also rejects the purpose organization,
+   including super-admin `X-Organization-ID`; global callback/control-plane
+   readers remain available. The compliance organization remains excluded from both the active and
    quarantined clinic sets, so it cannot onboard, receive messaging routes, or
    own a managed profile.
 
    In isolated staging, operator-test both directions before rollout: provision
-   the intended platform compliance organization and marker, confirm startup
-   passes, remove only the Instagram marker through the same authorized control
-   plane, and confirm a fresh API/worker startup refuses to serve or claim work.
+   the intended platform compliance organization and marker and confirm startup
+   passes. To test removal, first detach the UUID from the current Instagram
+   release configuration and settle all nonterminal callback/privacy work;
+   otherwise the command fails closed. Then dry-run and apply
+   `-remove-feature instagram` through the reviewed bootstrap command and
+   confirm a fresh API/worker startup refuses to serve or claim work when the
+   release configuration is restored without its required marker.
    Restore the marker and confirm startup passes again. Marker removal is an
    emergency fail-closed proof, not an offboarding shortcut: quarantine and
    settle every retained privacy obligation first, and do not remove the marker
    from a running deployment merely to bypass cleanup.
+
+   Atomic purpose creation is permanent in this phase. The purpose organization cannot
+   be deleted, archived, reparented, or unclassified; its admitted bootstrap,
+   callback, and privacy evidence cannot be deleted even after it is terminal.
+   There is no supported terminal purge or `RemoveTenantRLS` path once the
+   purpose marker exists.
+
+   Use the reviewed, dry-run-first
+   [platform compliance bootstrap](./platform-compliance-bootstrap.md) to apply
+   this marker; do not mutate organization settings through a tenant API or an
+   implicit startup migration.
 4. After every API, worker, and callback reader runs the new binary, configure
    `allowed_organization_ids` with the same singleton as the legacy key and set
    `data_deletion_compliance_organization_id`. This same-singleton overlap is
@@ -340,16 +387,21 @@ Before rollback after any managed binding exists:
    queues are drained or parked, and the managed binding is non-routable; once
    re-added, the static mapping wins on every replica.
 
-A full rollback of the web binary is safe only when there is no retained
-Instagram deletion status obligation, or when a compatible responder remains
-online for both the signed callback and every retained confirmation URL. An
-old binary ignores the additive deletion table but cannot serve a route it
-does not contain. Remove RLS only through the documented migration rollback
-after all web and worker processes are stopped.
+A pre-purpose/auth-guard web binary is never a valid rollback target after
+atomic purpose creation, even if no feature marker or unresolved workflow
+remains. The purpose marker is immutable, admitted evidence is not purgeable in
+this phase, and `RemoveTenantRLS` remains blocked while the purpose organization
+exists. Keep every tenant reader and writer on a guard-aware release. A
+managed-Instagram feature rollback may disable its release configuration only
+while retaining those application guards, the additive database barriers, and
+a compatible responder for the signed callback and every retained confirmation
+URL.
 
-An old singleton binary is not a valid rollback target after a second clinic
-has been added or a compliance-owned request exists. Keep a compatible callback
-and status responder online until all retained workflows expire.
+An old singleton binary is also not a valid rollback target after a second
+clinic has been added or a compliance-owned request exists. Keep a compatible
+callback and status responder online for retained workflows; expiry of a
+documented retention interval does not authorize deletion of purpose-owned
+evidence in this phase.
 
 Do not roll an old worker back into a mixed fleet and do not delete queue keys,
 credential rows, privacy requests, or journals to force rollback. Those actions

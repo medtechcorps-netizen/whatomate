@@ -391,7 +391,7 @@ func (a *App) ListOrganizations(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
-	query := a.DB.Preload("Reseller")
+	query := a.DB.Scopes(database.ExcludePlatformComplianceOrganizations).Preload("Reseller")
 	if !a.IsSuperAdmin(userID) {
 		resellerIDs, err := a.resellerIDsForUser(userID)
 		if err != nil {
@@ -436,6 +436,9 @@ func (a *App) ListOrganizations(r *fastglue.Request) error {
 func (a *App) GetCurrentOrganization(r *fastglue.Request) error {
 	orgID, err := a.getOrgID(r)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 
@@ -482,6 +485,7 @@ func (a *App) CreateOrganization(r *fastglue.Request) error {
 	}
 	var organizationCount int64
 	if err := a.DB.Model(&models.Organization{}).
+		Scopes(database.ExcludePlatformComplianceOrganizations).
 		Where("reseller_id = ?", reseller.ID).
 		Count(&organizationCount).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to validate reseller plan", nil, "")
@@ -573,6 +577,7 @@ func (a *App) DeleteOrganization(r *fastglue.Request) error {
 
 		var activeOrganizationCount int64
 		if err := tx.Model(&models.Organization{}).
+			Scopes(database.ExcludePlatformComplianceOrganizations).
 			Where("reseller_id = ?", *deletedOrganization.ResellerID).
 			Count(&activeOrganizationCount).Error; err != nil {
 			return err

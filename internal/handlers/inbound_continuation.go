@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -247,6 +248,7 @@ func (p *InboundContinuationProcessor) listOrganizations(
 ) ([]uuid.UUID, error) {
 	var organizationIDs []uuid.UUID
 	if err := p.app.rootApp().DB.WithContext(ctx).
+		Scopes(database.ExcludePlatformComplianceOrganizations).
 		Model(&models.Organization{}).
 		Order("id").
 		Pluck("id", &organizationIDs).Error; err != nil {

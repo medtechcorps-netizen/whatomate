@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 )
@@ -63,7 +64,8 @@ func (p *SLAProcessor) processStaleTransfers() {
 	// transaction per organization. Background processors must never query
 	// tenant tables without an explicit tenant context.
 	var organizationIDs []uuid.UUID
-	if err := p.app.rootApp().DB.Model(&models.Organization{}).
+	if err := p.app.rootApp().DB.Scopes(database.ExcludePlatformComplianceOrganizations).
+		Model(&models.Organization{}).
 		Pluck("id", &organizationIDs).Error; err != nil {
 		p.app.Log.Error("Failed to list organizations for SLA processing", "error", err)
 		return

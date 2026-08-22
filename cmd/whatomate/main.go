@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,6 +25,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/frontend"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/middleware"
+	"github.com/shridarpatil/whatomate/internal/platformcompliance"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/storage"
 	"github.com/shridarpatil/whatomate/internal/tts"
@@ -54,6 +57,8 @@ func main() {
 		runRLSMigration(os.Args[2:])
 	case "seed-klinik-relive-sales":
 		runKlinikReliveSalesSeed(os.Args[2:])
+	case "bootstrap-platform-compliance":
+		runPlatformComplianceBootstrap(os.Args[2:])
 	case "version":
 		fmt.Printf("ReReply %s (built %s)\n", Version, BuildTime)
 	case "help", "-h", "--help":
@@ -76,6 +81,7 @@ Commands:
   worker    Start background workers only (no API server)
   rls-migrate  Run schema migrations and install PostgreSQL tenant RLS
   seed-klinik-relive-sales  Safely validate or apply Klinik Relive sales fixtures
+  bootstrap-platform-compliance  Validate or apply platform compliance tenant markers
   version   Show version information
   help      Show this help message
 
@@ -97,11 +103,196 @@ Examples:
   rereply rls-migrate                # Pre-deploy migration using database.migration_url
   rereply seed-klinik-relive-sales -organization-id c73f761f-5154-4fe1-9a13-06bae570277a -organization-name "Klinik Relive"
   rereply seed-klinik-relive-sales -organization-id c73f761f-5154-4fe1-9a13-06bae570277a -organization-name "Klinik Relive" -apply
+  rereply bootstrap-platform-compliance -organization-id CANONICAL_UUID -operator-run-id CHANGE-20260821-01 -feature instagram
+  rereply bootstrap-platform-compliance -organization-id CANONICAL_UUID -operator-run-id CHANGE-20260821-00 -create-purpose -feature instagram -apply
+  rereply bootstrap-platform-compliance -organization-id CANONICAL_UUID -operator-run-id CHANGE-20260821-01 -feature instagram -feature threads -apply
+  rereply bootstrap-platform-compliance -organization-id CANONICAL_UUID -operator-run-id CHANGE-20260821-02 -remove-feature threads
 
 Deployment Scenarios:
   All-in-one:    rereply server
   Separate:      rereply server -workers 0  (on API server)
                  rereply worker -workers 4  (on worker server)`)
+}
+
+// ============================================================================
+// PLATFORM COMPLIANCE ORGANIZATION BOOTSTRAP COMMAND
+// ============================================================================
+
+type platformComplianceFeatures []platformcompliance.Feature
+
+func (features *platformComplianceFeatures) String() string {
+	values := make([]string, 0, len(*features))
+	for _, feature := range *features {
+		values = append(values, string(feature))
+	}
+	return strings.Join(values, ",")
+}
+
+func (features *platformComplianceFeatures) Set(value string) error {
+	*features = append(*features, platformcompliance.Feature(value))
+	return nil
+}
+
+type platformComplianceBootstrapArgs struct {
+	configPath     string
+	organizationID string
+	operatorRunID  string
+	createPurpose  bool
+	apply          bool
+	features       platformComplianceFeatures
+	removeFeatures platformComplianceFeatures
+}
+
+func parsePlatformComplianceBootstrapArgs(args []string) (platformComplianceBootstrapArgs, error) {
+	bootstrapFlags := flag.NewFlagSet("bootstrap-platform-compliance", flag.ContinueOnError)
+	bootstrapFlags.SetOutput(io.Discard)
+	configPath := bootstrapFlags.String("config", "config.toml", "Path to config file")
+	organizationID := bootstrapFlags.String("organization-id", "", "Required exact compliance organization UUID")
+	operatorRunID := bootstrapFlags.String("operator-run-id", "", "Required bounded reviewed operator/change run identifier")
+	createPurpose := bootstrapFlags.Bool("create-purpose", false, "Atomically create a new dedicated platform-direct compliance organization")
+	apply := bootstrapFlags.Bool("apply", false, "Commit marker changes; without this flag the transaction is read-only")
+	var features platformComplianceFeatures
+	var removeFeatures platformComplianceFeatures
+	bootstrapFlags.Var(&features, "feature", "Feature marker to enable; repeat for instagram and threads")
+	bootstrapFlags.Var(&removeFeatures, "remove-feature", "Feature marker key to remove; repeat for instagram and threads")
+	if err := bootstrapFlags.Parse(args); err != nil {
+		return platformComplianceBootstrapArgs{}, err
+	}
+	for _, arg := range args {
+		if arg == "--" {
+			return platformComplianceBootstrapArgs{}, errors.New("flag terminator is not accepted")
+		}
+	}
+	if bootstrapFlags.NArg() != 0 {
+		return platformComplianceBootstrapArgs{}, errors.New("positional arguments are not accepted")
+	}
+
+	parsed := platformComplianceBootstrapArgs{
+		configPath:     *configPath,
+		organizationID: *organizationID,
+		operatorRunID:  *operatorRunID,
+		createPurpose:  *createPurpose,
+		apply:          *apply,
+		features:       features,
+		removeFeatures: removeFeatures,
+	}
+	if err := validatePlatformComplianceBootstrapMode(parsed); err != nil {
+		return platformComplianceBootstrapArgs{}, err
+	}
+	return parsed, nil
+}
+
+func validatePlatformComplianceBootstrapMode(parsed platformComplianceBootstrapArgs) error {
+	markerOperationSelected := parsed.createPurpose || len(parsed.features)+len(parsed.removeFeatures) != 0
+	if !markerOperationSelected {
+		return errors.New("at least one bootstrap operation is required")
+	}
+	if parsed.createPurpose && len(parsed.removeFeatures) != 0 {
+		return errors.New("atomic purpose creation cannot be combined with feature removal")
+	}
+	return nil
+}
+
+func dispatchPlatformComplianceBootstrap(
+	args []string,
+	onValid func(platformComplianceBootstrapArgs),
+) error {
+	parsed, err := parsePlatformComplianceBootstrapArgs(args)
+	if err != nil {
+		return err
+	}
+	onValid(parsed)
+	return nil
+}
+
+func runPlatformComplianceBootstrap(args []string) {
+	if err := dispatchPlatformComplianceBootstrap(args, runParsedPlatformComplianceBootstrap); err != nil {
+		fmt.Fprintln(os.Stderr, "Invalid bootstrap flags: use named flags only, write booleans as -apply or -apply=false, and do not use positional arguments or --; no configuration was loaded and no database changes were made.")
+		os.Exit(1)
+	}
+}
+
+func runParsedPlatformComplianceBootstrap(parsed platformComplianceBootstrapArgs) {
+	parsedOrganizationID, err := uuid.Parse(parsed.organizationID)
+	if err != nil || parsedOrganizationID == uuid.Nil || parsedOrganizationID.String() != parsed.organizationID {
+		fmt.Fprintln(os.Stderr, "A canonical non-nil -organization-id is required; no database changes were made.")
+		os.Exit(1)
+	}
+	if parsed.operatorRunID == "" {
+		fmt.Fprintln(os.Stderr, "A reviewed -operator-run-id is required; no database changes were made.")
+		os.Exit(1)
+	}
+
+	cfg, err := config.Load(parsed.configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to load the compliance bootstrap configuration; no database changes were made.")
+		os.Exit(1)
+	}
+	if cfg.Database.MigrationURL == "" {
+		fmt.Fprintln(os.Stderr, "database.migration_url is required; no database changes were made.")
+		os.Exit(1)
+	}
+
+	migrationCfg := cfg.Database
+	migrationCfg.URL = cfg.Database.MigrationURL
+	commandContext, cancel := context.WithTimeout(context.Background(), platformcompliance.CommandTimeout)
+	defer cancel()
+	db, err := database.NewPostgresWithContext(commandContext, &migrationCfg, false)
+	if err != nil {
+		// Driver errors can echo connection strings, so do not print err here.
+		fmt.Fprintln(os.Stderr, "Failed to connect using database.migration_url; no database changes were made.")
+		os.Exit(1)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to initialize the migration database connection; no database changes were made.")
+		os.Exit(1)
+	}
+	defer func() {
+		_ = sqlDB.Close()
+	}()
+
+	report, err := platformcompliance.Bootstrap(
+		commandContext,
+		db,
+		platformcompliance.Options{
+			OrganizationID:    parsed.organizationID,
+			CreatePurpose:     parsed.createPurpose,
+			Features:          parsed.features,
+			RemoveFeatures:    parsed.removeFeatures,
+			OperatorRunID:     parsed.operatorRunID,
+			RuntimeRole:       cfg.Database.RuntimeRole,
+			ClinicScopes:      platformcompliance.ConfiguredClinicScopes(cfg),
+			ReleaseReferences: platformcompliance.ConfiguredReleaseReferences(cfg),
+			Apply:             parsed.apply,
+		},
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Platform compliance bootstrap failed: %v; no changes were committed.\n", err)
+		os.Exit(1)
+	}
+
+	mode := "DRY RUN (read only)"
+	if report.ApplyRequested {
+		mode = "APPLY COMPLETE"
+	}
+	fmt.Printf(
+		"Platform compliance bootstrap %s: requested=%d changes=%d unchanged=%d purpose_created=%t purpose_unchanged=%t audit_written=%t\n",
+		mode,
+		len(parsed.features)+len(parsed.removeFeatures)+boolCount(parsed.createPurpose),
+		len(report.Changed),
+		len(report.Unchanged),
+		report.PurposeCreated,
+		report.PurposeUnchanged,
+		report.AuditWritten,
+	)
+}
+
+func boolCount(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // ============================================================================
