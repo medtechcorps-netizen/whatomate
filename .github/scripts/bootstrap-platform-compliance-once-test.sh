@@ -74,10 +74,116 @@ readonly MOCK_READINESS_MARKER="${MOCK_STATE_DIR}/readiness-checked"
 MOCK_LOG_CONTENT=""
 MOCK_CASE_NAME="uninitialized"
 MOCK_FAIL_WAIT_NUMBER=""
+MOCK_CAPTURE_MODE=""
+MOCK_CAPTURE_UPDATE_SEEN="0"
+MOCK_CAPTURE_DESIRED_DRIFT="0"
+MOCK_CAPTURE_WRONG_APP_ID="0"
+MOCK_CAPTURE_DEPLOYMENT_DRIFT="0"
+readonly MOCK_CAPTURE_PRIOR_ID="00000000-0000-4000-8000-000000000001"
+readonly MOCK_CAPTURE_DEPLOYMENT_ID="00000000-0000-4000-8000-000000000002"
+readonly MOCK_CAPTURE_SECOND_ID="00000000-0000-4000-8000-000000000003"
+readonly MOCK_CAPTURE_STAGED_STATE="${MOCK_STATE_DIR}/capture-staged.json"
+readonly MOCK_CAPTURE_OBSERVED_STATE="${MOCK_STATE_DIR}/capture-observed.json"
+readonly MOCK_CAPTURE_DEPLOYMENT_STATE="${MOCK_STATE_DIR}/capture-deployment.json"
+readonly MOCK_CAPTURE_UPDATE_COUNT_FILE="${MOCK_STATE_DIR}/capture-update-count"
+
+mock_capture_app_state() {
+	local state="$1" app_id="$APP_ID" active_id="$MOCK_CAPTURE_PRIOR_ID" pending_id="" in_progress_id=""
+	if [[ "$MOCK_CAPTURE_UPDATE_SEEN" == "1" && "$MOCK_CAPTURE_WRONG_APP_ID" == "1" ]]; then
+		app_id="00000000-0000-4000-8000-000000000099"
+	fi
+	case "$state" in
+	prior) ;;
+	pending) pending_id="$MOCK_CAPTURE_DEPLOYMENT_ID" ;;
+	in-progress) in_progress_id="$MOCK_CAPTURE_DEPLOYMENT_ID" ;;
+	fast-active) active_id="$MOCK_CAPTURE_DEPLOYMENT_ID" ;;
+	multiple)
+		pending_id="$MOCK_CAPTURE_DEPLOYMENT_ID"
+		in_progress_id="$MOCK_CAPTURE_SECOND_ID"
+		;;
+	*) test_fail "unknown mock capture state" ;;
+	esac
+	jq -n \
+		--arg app "$app_id" \
+		--arg active "$active_id" \
+		--arg pending "$pending_id" \
+		--arg in_progress "$in_progress_id" '[{
+      id: $app,
+      active_deployment: {id: $active},
+      pending_deployment: (if $pending == "" then null else {id: $pending} end),
+      in_progress_deployment: (if $in_progress == "" then null else {id: $in_progress} end)
+    }]'
+}
 
 # The mock has an explicit allow-list. Any new provider operation makes this
 # test fail instead of accidentally reaching a real control plane.
 doctl() {
+	if [[ -n "$MOCK_CAPTURE_MODE" && "${1:-}" == "apps" && "${2:-}" == "get" ]]; then
+		if [[ "$MOCK_CAPTURE_UPDATE_SEEN" == "0" ]]; then
+			mock_capture_app_state prior
+		elif [[ "$MOCK_CAPTURE_MODE" == "delayed-pending" ]]; then
+			mock_capture_app_state pending
+		else
+			mock_capture_app_state "$MOCK_CAPTURE_MODE"
+		fi
+		return 0
+	fi
+	if [[ -n "$MOCK_CAPTURE_MODE" && "${1:-}" == "apps" && "${2:-}" == "update" ]]; then
+		local index spec_path="" update_count no_source_refresh="0" json_output="0"
+		for ((index = 1; index <= $#; index++)); do
+			if [[ "${!index}" == "--update-sources=false" ]]; then
+				no_source_refresh="1"
+			elif [[ "${!index}" == "--output" ]]; then
+				index=$((index + 1))
+				[[ "${!index}" == "json" ]] && json_output="1"
+			elif [[ "${!index}" == "--spec" ]]; then
+				index=$((index + 1))
+				spec_path="${!index}"
+			fi
+		done
+		[[ -n "$spec_path" ]] || test_fail "mock app update omitted its staged spec"
+		[[ "$no_source_refresh" == "1" ]] || test_fail "mock app update permitted a source refresh"
+		[[ "$json_output" == "1" ]] || test_fail "mock app update did not request its complete JSON state"
+		cp "$spec_path" "$MOCK_CAPTURE_STAGED_STATE"
+		jq --arg job "$MIGRATION_JOB" --arg target_key "$TARGET_ENV_KEY" '
+        .jobs |= map(
+          if .name == $job then
+            .envs |= map(if .key == $target_key then .value = "EV[mock-protected-target]" else . end)
+          else . end
+        )
+      ' "$spec_path" >"$MOCK_CAPTURE_OBSERVED_STATE"
+		if [[ "$MOCK_CAPTURE_DESIRED_DRIFT" == "1" ]]; then
+			jq '.name = "concurrent-drift"' "$MOCK_CAPTURE_OBSERVED_STATE" >"$MOCK_DESIRED_STATE"
+		else
+			cp "$MOCK_CAPTURE_OBSERVED_STATE" "$MOCK_DESIRED_STATE"
+		fi
+		update_count="$(command cat "$MOCK_CAPTURE_UPDATE_COUNT_FILE")"
+		printf '%s\n' "$((update_count + 1))" >"$MOCK_CAPTURE_UPDATE_COUNT_FILE"
+		MOCK_CAPTURE_UPDATE_SEEN="1"
+		if [[ "$MOCK_CAPTURE_MODE" == "delayed-pending" ]]; then
+			mock_capture_app_state prior
+		else
+			mock_capture_app_state "$MOCK_CAPTURE_MODE"
+		fi
+		return 0
+	fi
+	if [[ -n "$MOCK_CAPTURE_MODE" && "${1:-}" == "apps" && "${2:-}" == "get-deployment" ]]; then
+		[[ -f "$MOCK_CAPTURE_OBSERVED_STATE" ]] || test_fail "mock deployment was queried before app update"
+		if [[ "$MOCK_CAPTURE_DEPLOYMENT_DRIFT" == "1" ]]; then
+			jq --arg job "$MIGRATION_JOB" --arg nonce_key "$DEPLOYMENT_NONCE_ENV_KEY" '
+          .jobs |= map(
+            if .name == $job then
+              .envs |= map(if .key == $nonce_key then .value = "9999999" else . end)
+            else . end
+          )
+        ' "$MOCK_CAPTURE_OBSERVED_STATE" >"$MOCK_CAPTURE_DEPLOYMENT_STATE"
+		else
+			cp "$MOCK_CAPTURE_OBSERVED_STATE" "$MOCK_CAPTURE_DEPLOYMENT_STATE"
+		fi
+		jq -n --arg id "$MOCK_CAPTURE_DEPLOYMENT_ID" --slurpfile spec "$MOCK_CAPTURE_DEPLOYMENT_STATE" \
+			'[{id: $id, spec: $spec[0]}]'
+		return 0
+	fi
 	if [[ "${1:-}" == "apps" && "${2:-}" == "spec" && "${3:-}" == "validate" ]]; then
 		jq -e 'type == "object"' "${4:?}" >/dev/null
 		return 0
@@ -361,6 +467,103 @@ if grep -Fq "$BOOTSTRAP_ORGANIZATION_ID" "$TEST_STDOUT" || grep -Fq "$BOOTSTRAP_
 fi
 
 mkdir -p "$MOCK_STATE_DIR"
+
+run_capture_update_case() {
+	local mode="$1" staged_path="${2:-$ARMED_SPEC}" captured
+	MOCK_CAPTURE_MODE="$mode"
+	MOCK_CAPTURE_UPDATE_SEEN="0"
+	MOCK_CAPTURE_DESIRED_DRIFT="0"
+	MOCK_CAPTURE_WRONG_APP_ID="0"
+	MOCK_CAPTURE_DEPLOYMENT_DRIFT="0"
+	cp "$FIXTURE_SPEC" "$MOCK_DESIRED_STATE"
+	printf '0\n' >"$MOCK_CAPTURE_UPDATE_COUNT_FILE"
+	rm -f "$MOCK_CAPTURE_STAGED_STATE" "$MOCK_CAPTURE_OBSERVED_STATE"
+	captured="$(capture_update_deployment "$FIXTURE_SPEC" "$staged_path")"
+	[[ "$captured" == "$MOCK_CAPTURE_DEPLOYMENT_ID" ]] ||
+		test_fail "${mode} app update did not return the accepted deployment"
+	[[ "$(command cat "$MOCK_CAPTURE_UPDATE_COUNT_FILE")" == "1" ]] ||
+		test_fail "${mode} app update did not execute exactly once"
+	same_json "$MOCK_CAPTURE_STAGED_STATE" "$staged_path" ||
+		test_fail "${mode} app update changed the staged spec"
+}
+
+# doctl 1.167 can return an empty InProgressDeployment.ID column even though
+# App Platform accepted the update under pending_deployment. The production
+# capture path must also recognize in-progress, fast-active, and a response
+# that exposes the accepted deployment only on the first follow-up poll.
+run_capture_update_case pending
+run_capture_update_case in-progress
+run_capture_update_case fast-active
+run_capture_update_case delayed-pending
+run_capture_update_case pending "$STANDARD_NEW_NONCE_SPEC"
+run_capture_update_case fast-active "$FIXTURE_SPEC"
+
+MOCK_CAPTURE_MODE="multiple"
+MOCK_CAPTURE_UPDATE_SEEN="0"
+MOCK_CAPTURE_DESIRED_DRIFT="0"
+cp "$FIXTURE_SPEC" "$MOCK_DESIRED_STATE"
+printf '0\n' >"$MOCK_CAPTURE_UPDATE_COUNT_FILE"
+if (
+	trap - EXIT
+	capture_update_deployment "$FIXTURE_SPEC" "$ARMED_SPEC"
+) >"$TEST_STDOUT" 2>"$TEST_STDERR"; then
+	test_fail "multiple provider deployment identifiers were accepted"
+fi
+grep -Fq 'multiple concurrent deployment identifiers' "$TEST_STDERR" ||
+	test_fail "multiple provider deployment identifiers failed for an unexpected reason"
+
+MOCK_CAPTURE_MODE="pending"
+MOCK_CAPTURE_UPDATE_SEEN="0"
+MOCK_CAPTURE_DESIRED_DRIFT="1"
+MOCK_CAPTURE_WRONG_APP_ID="0"
+MOCK_CAPTURE_DEPLOYMENT_DRIFT="0"
+cp "$FIXTURE_SPEC" "$MOCK_DESIRED_STATE"
+printf '0\n' >"$MOCK_CAPTURE_UPDATE_COUNT_FILE"
+if (
+	trap - EXIT
+	capture_update_deployment "$FIXTURE_SPEC" "$ARMED_SPEC"
+) >"$TEST_STDOUT" 2>"$TEST_STDERR"; then
+	test_fail "concurrent desired-spec drift was accepted"
+fi
+grep -Fq 'staged spec differs from the reviewed update' "$TEST_STDERR" ||
+	test_fail "concurrent desired-spec drift failed for an unexpected reason"
+
+MOCK_CAPTURE_MODE="pending"
+MOCK_CAPTURE_UPDATE_SEEN="0"
+MOCK_CAPTURE_DESIRED_DRIFT="0"
+MOCK_CAPTURE_WRONG_APP_ID="1"
+MOCK_CAPTURE_DEPLOYMENT_DRIFT="0"
+cp "$FIXTURE_SPEC" "$MOCK_DESIRED_STATE"
+printf '0\n' >"$MOCK_CAPTURE_UPDATE_COUNT_FILE"
+if (
+	trap - EXIT
+	capture_update_deployment "$FIXTURE_SPEC" "$ARMED_SPEC"
+) >"$TEST_STDOUT" 2>"$TEST_STDERR"; then
+	test_fail "wrong app identity in update response was accepted"
+fi
+grep -Fq 'app update response was ambiguous' "$TEST_STDERR" ||
+	test_fail "wrong app identity failed for an unexpected reason"
+
+MOCK_CAPTURE_MODE="pending"
+MOCK_CAPTURE_UPDATE_SEEN="0"
+MOCK_CAPTURE_DESIRED_DRIFT="0"
+MOCK_CAPTURE_WRONG_APP_ID="0"
+MOCK_CAPTURE_DEPLOYMENT_DRIFT="1"
+cp "$FIXTURE_SPEC" "$MOCK_DESIRED_STATE"
+printf '0\n' >"$MOCK_CAPTURE_UPDATE_COUNT_FILE"
+if (
+	trap - EXIT
+	capture_update_deployment "$FIXTURE_SPEC" "$ARMED_OLD_NONCE_SPEC"
+) >"$TEST_STDOUT" 2>"$TEST_STDERR"; then
+	test_fail "deployment spec or nonce drift was accepted"
+fi
+grep -Fq 'staged spec differs from the reviewed update' "$TEST_STDERR" ||
+	test_fail "deployment spec drift failed for an unexpected reason"
+
+MOCK_CAPTURE_MODE=""
+MOCK_CAPTURE_DESIRED_DRIFT="0"
+MOCK_CAPTURE_WRONG_APP_ID="0"
+MOCK_CAPTURE_DEPLOYMENT_DRIFT="0"
 
 verify_basic_context() {
 	:

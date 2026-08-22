@@ -378,6 +378,75 @@ normalize_bootstrap_spec() {
   ' "$input_path" >"$output_path"
 }
 
+normalize_protected_target_spec() {
+	local input_path="$1" output_path="$2"
+	jq --arg job "$MIGRATION_JOB" --arg target_key "$TARGET_ENV_KEY" '
+    .jobs |= map(
+      if .name == $job then
+        .envs |= map(if .key == $target_key then .value = "<protected-target>" else . end)
+      else . end
+    )
+  ' "$input_path" >"$output_path"
+}
+
+verify_provider_staged_spec() {
+	local observed_path="$1" staged_path="$2"
+	local normalized_observed="${WORK_DIR}/normalized-provider-observed.json"
+	local normalized_staged="${WORK_DIR}/normalized-provider-staged.json"
+	local expected_target_count
+	expected_target_count="$(jq -r \
+		--arg job "$MIGRATION_JOB" \
+		--arg target_key "$TARGET_ENV_KEY" \
+		'[.jobs[] | select(.name == $job).envs[] | select(.key == $target_key)] | length' "$staged_path")"
+	case "$expected_target_count" in
+	0)
+		jq -e \
+			--arg job "$MIGRATION_JOB" \
+			--arg target_key "$TARGET_ENV_KEY" '
+          [.jobs[] | select(.name == $job)] as $migration
+          | ($migration | length) == 1
+            and ([ $migration[0].envs[] | select(.key == $target_key) ] | length) == 0
+        ' "$observed_path" >/dev/null || die "DigitalOcean added an unexpected bootstrap credential"
+		;;
+	1)
+		jq -e \
+			--arg job "$MIGRATION_JOB" \
+			--arg target_key "$TARGET_ENV_KEY" '
+          [.jobs[] | select(.name == $job)] as $migration
+          | ([ $migration[0].envs[] | select(.key == $target_key) ]) as $target
+          | ($migration | length) == 1
+            and ($target | length) == 1
+            and $target[0].type == "SECRET"
+            and $target[0].scope == "RUN_TIME"
+        ' "$staged_path" >/dev/null || die "reviewed staged spec contains an invalid bootstrap credential"
+		jq -e \
+			--arg job "$MIGRATION_JOB" \
+			--arg target_key "$TARGET_ENV_KEY" '
+          [.jobs[] | select(.name == $job)] as $migration
+          | ([ $migration[0].envs[] | select(.key == $target_key) ]) as $target
+          | ($migration | length) == 1
+            and ($target | length) == 1
+            and $target[0].type == "SECRET"
+            and $target[0].scope == "RUN_TIME"
+            and ($target[0].value | startswith("EV["))
+        ' "$observed_path" >/dev/null || die "DigitalOcean did not protect the staged bootstrap credential"
+		;;
+	*) die "reviewed staged spec contains an invalid bootstrap credential count" ;;
+	esac
+	jq -e \
+		--arg job "$MIGRATION_JOB" \
+		--arg target_key "$TARGET_ENV_KEY" '
+      [.jobs[] | select(.name == $job)] as $migration
+      | ([ $migration[0].envs[] | select(.key == $target_key) ]) as $target
+      | ($migration | length) == 1
+		and ($target | length) <= 1
+    ' "$staged_path" >/dev/null || die "reviewed staged spec contains duplicate bootstrap credentials"
+	normalize_protected_target_spec "$observed_path" "$normalized_observed"
+	normalize_protected_target_spec "$staged_path" "$normalized_staged"
+	same_json "$normalized_observed" "$normalized_staged" ||
+		die "DigitalOcean staged spec differs from the reviewed update"
+}
+
 reconstruct_baseline() {
 	local armed_path="$1" output_path="$2"
 	jq \
@@ -502,12 +571,71 @@ assert_desired_unchanged() {
 }
 
 capture_update_deployment() {
-	local current_path="$1" staged_path="$2" output deployment_id
+	local current_path="$1" staged_path="$2" previous_active_id deployment_id deadline
+	local candidate_spec="${WORK_DIR}/candidate-deployment-spec.json"
+	local -a candidate_ids=()
+
+	doctl apps get "$APP_ID" --output json >"$APP_STATE"
+	jq -e --arg app "$APP_ID" '
+      length == 1
+        and .[0].id == $app
+        and (.[0].active_deployment.id // "" | test("^[0-9a-f-]{36}$"))
+        and (.[0].pending_deployment == null)
+        and (.[0].in_progress_deployment == null)
+    ' "$APP_STATE" >/dev/null || die "production app gained a concurrent deployment before update"
+	previous_active_id="$(jq -r '.[0].active_deployment.id' "$APP_STATE")"
+	is_uuid "$previous_active_id" || die "active deployment identifier is invalid before update"
 	assert_desired_unchanged "$current_path"
-	output="$(doctl apps update "$APP_ID" --spec "$staged_path" --format 'InProgressDeployment.ID' --no-header)"
-	deployment_id="$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' <<<"$output" | tail -n 1 || true)"
-	is_uuid "$deployment_id" || die "DigitalOcean did not return a deployment identifier"
-	printf '%s' "$deployment_id"
+
+	# App Platform can expose a newly accepted spec as pending, in progress, or
+	# already active. In particular, doctl 1.167 may leave the formatted
+	# InProgressDeployment.ID column empty while returning the deployment under
+	# pending_deployment. Keep the full response protected on disk and resolve
+	# all three documented states instead of trusting one formatted column.
+	doctl apps update "$APP_ID" --spec "$staged_path" --update-sources=false --output json >"$APP_STATE"
+	jq -e --arg app "$APP_ID" 'length == 1 and .[0].id == $app' "$APP_STATE" >/dev/null ||
+		die "DigitalOcean app update response was ambiguous"
+	doctl apps spec get "$APP_ID" --format json >"$REFETCHED_SPEC"
+	verify_provider_staged_spec "$REFETCHED_SPEC" "$staged_path"
+
+	deadline=$((SECONDS + 120))
+	while ((SECONDS < deadline)); do
+		mapfile -t candidate_ids < <(jq -r --arg previous "$previous_active_id" '
+        .[0]
+        | [
+            .in_progress_deployment.id?,
+            .pending_deployment.id?,
+            .active_deployment.id?
+          ]
+        | map(select(. != null and . != "" and . != $previous))
+        | unique
+        | .[]
+      ' "$APP_STATE")
+		((${#candidate_ids[@]} <= 1)) || die "DigitalOcean exposed multiple concurrent deployment identifiers"
+		deployment_id="${candidate_ids[0]:-}"
+
+		if [[ -n "$deployment_id" ]]; then
+			is_uuid "$deployment_id" || die "DigitalOcean exposed an invalid deployment identifier"
+			if doctl apps get-deployment "$APP_ID" "$deployment_id" --output json >"$DEPLOYMENT_STATE" 2>/dev/null &&
+				jq -e --arg deployment "$deployment_id" 'length == 1 and .[0].id == $deployment' "$DEPLOYMENT_STATE" >/dev/null; then
+				jq '.[0].spec' "$DEPLOYMENT_STATE" >"$candidate_spec"
+				verify_provider_staged_spec "$candidate_spec" "$staged_path"
+				doctl apps spec get "$APP_ID" --format json >"$REFETCHED_SPEC"
+				verify_provider_staged_spec "$REFETCHED_SPEC" "$staged_path"
+				same_json "$candidate_spec" "$REFETCHED_SPEC" ||
+					die "DigitalOcean desired spec drifted from the accepted deployment"
+				printf '%s' "$deployment_id"
+				return 0
+			fi
+		fi
+
+		sleep 2
+		doctl apps get "$APP_ID" --output json >"$APP_STATE"
+		jq -e --arg app "$APP_ID" 'length == 1 and .[0].id == $app' "$APP_STATE" >/dev/null ||
+			die "DigitalOcean app lookup became ambiguous after update"
+	done
+
+	die "DigitalOcean did not expose the accepted deployment identifier"
 }
 
 wait_for_deployment() {
