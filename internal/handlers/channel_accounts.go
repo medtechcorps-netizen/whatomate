@@ -896,7 +896,7 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 	if !managedInstagramValidationPerformed {
 		result, validationErr = adapter.ValidateAccount(requestContext(r), account)
 	}
-	now := time.Now().UTC()
+	now := canonicalChannelHealthTimestamp(time.Now())
 	var oldAccount models.ChannelAccount
 
 	if err := database.WithTenantReadCommitted(
@@ -1126,6 +1126,22 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 		"warnings":     result.Warnings,
 		"checked_at":   result.CheckedAt,
 	})
+}
+
+// PostgreSQL stores timestamptz values with microsecond precision. Health
+// evidence is persisted both in a timestamptz column and in JSON metadata, so
+// canonicalize it before writing either representation.
+func canonicalChannelHealthTimestamp(value time.Time) time.Time {
+	return value.UTC().Truncate(time.Microsecond)
+}
+
+// Older health rows may have retained sub-microsecond precision in their JSON
+// metadata while PostgreSQL rounded or truncated the matching timestamptz
+// value. Treat values that differ only below PostgreSQL's storage precision as
+// the same evidence; a full microsecond remains a distinct validation.
+func channelHealthTimestampsMatch(stored, metadata time.Time) bool {
+	delta := stored.UTC().Sub(metadata.UTC())
+	return delta > -time.Microsecond && delta < time.Microsecond
 }
 
 func (a *App) requireChannelAccountTestAuth(

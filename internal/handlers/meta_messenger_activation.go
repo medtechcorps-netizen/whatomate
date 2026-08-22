@@ -122,7 +122,7 @@ func (a *App) activateMetaMessengerAccount(
 		healthCheckedAt, err := time.Parse(time.RFC3339Nano, stringConfigValue(account.Metadata, "meta_health_checked_at"))
 		if err != nil || healthCheckedAt.After(now.Add(time.Minute)) ||
 			now.Sub(healthCheckedAt) > time.Duration(a.Config.MetaMessenger.HealthApprovalMaxAgeMins)*time.Minute ||
-			!account.LastHealthCheckAt.UTC().Equal(healthCheckedAt.UTC()) {
+			!channelHealthTimestampsMatch(*account.LastHealthCheckAt, healthCheckedAt) {
 			return errors.New("managed Messenger health approval is stale")
 		}
 		ownershipCheckedAt, err := time.Parse(time.RFC3339Nano, stringConfigValue(account.Metadata, "meta_ownership_checked_at"))
