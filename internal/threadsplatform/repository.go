@@ -21,6 +21,7 @@ var (
 	ErrIntegrationNotManaged = errors.New("threads integration is not configured for the requested managed platform app")
 	ErrBindingClaimConflict  = errors.New("managed Threads subject or asset is already claimed")
 	ErrBindingNotFound       = errors.New("managed Threads binding was not found")
+	ErrBindingReconnectFence = errors.New("managed Threads reconnect no longer matches the claimed binding")
 	ErrInvalidJournalReceipt = errors.New("managed Threads journal receipt is invalid")
 
 	lowerHexDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -38,6 +39,22 @@ type BindingClaim struct {
 	ConfigurationGeneration uint64
 	AuthorizationGeneration uint64
 	ClaimedAt               time.Time
+}
+
+// BindingReconnect is a compare-and-swap authorization rotation. Every
+// ownership field is repeated deliberately: a reconnect can refresh only the
+// exact existing tenant claim and can never rekey, alias, or transfer it.
+type BindingReconnect struct {
+	OrganizationID                  uuid.UUID
+	BindingID                       uuid.UUID
+	IntegrationID                   uuid.UUID
+	ChannelAccountID                uuid.UUID
+	PlatformAppKey                  string
+	PlatformAppID                   string
+	OAuthSubjectID                  string
+	AuthorityAssetID                string
+	ConfigurationGeneration         uint64
+	ExpectedAuthorizationGeneration uint64
 }
 
 type JournalReceipt struct {
@@ -86,15 +103,47 @@ func (store *PostgresStore) ClaimBinding(
 		ctx = context.Background()
 	}
 
+	var binding *models.ThreadsPlatformBinding
+	err := database.WithTenant(store.db.WithContext(ctx), claim.OrganizationID, func(tx *gorm.DB) error {
+		var claimErr error
+		binding, claimErr = ClaimBindingTx(tx, claim)
+		return claimErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return binding, nil
+}
+
+// ClaimBindingTx performs the global claim inside the caller's tenant
+// transaction so account, encrypted credential, and ownership become durable
+// atomically. Partial unique indexes remain the global race arbiter.
+func ClaimBindingTx(tx *gorm.DB, claim BindingClaim) (*models.ThreadsPlatformBinding, error) {
+	if tx == nil {
+		return nil, ErrStoreUnavailable
+	}
+	if err := validateBindingClaim(claim); err != nil {
+		return nil, err
+	}
+	if err := validateManagedIntegrationTx(tx, claim.OrganizationID, claim.IntegrationID, claim.PlatformAppKey); err != nil {
+		return nil, err
+	}
+	if claim.ChannelAccountID != nil {
+		if err := validateManagedAccountTx(
+			tx, claim.OrganizationID, *claim.ChannelAccountID, claim.AuthorityAssetID,
+		); err != nil {
+			return nil, err
+		}
+	}
 	claimedAt := claim.ClaimedAt.UTC()
 	if claimedAt.IsZero() {
 		claimedAt = time.Now().UTC()
 	}
-	generation := claim.AuthorizationGeneration
-	if generation == 0 {
-		generation = 1
+	authorizationGeneration := claim.AuthorizationGeneration
+	if authorizationGeneration == 0 {
+		authorizationGeneration = 1
 	}
-	binding := models.ThreadsPlatformBinding{
+	binding := &models.ThreadsPlatformBinding{
 		BaseModel:               models.BaseModel{ID: uuid.New()},
 		OrganizationID:          claim.OrganizationID,
 		IntegrationID:           claim.IntegrationID,
@@ -104,56 +153,126 @@ func (store *PostgresStore) ClaimBinding(
 		OAuthSubjectID:          claim.OAuthSubjectID,
 		AuthorityAssetID:        claim.AuthorityAssetID,
 		ConfigurationGeneration: claim.ConfigurationGeneration,
-		AuthorizationGeneration: generation,
+		AuthorizationGeneration: authorizationGeneration,
 		Status:                  models.ThreadsPlatformBindingStatusPending,
 		ClaimedAt:               claimedAt,
 	}
+	result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(binding)
+	if result.Error != nil {
+		return nil, fmt.Errorf("claim managed Threads binding: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return nil, ErrBindingClaimConflict
+	}
+	return binding, nil
+}
 
-	err := database.WithTenant(store.db.WithContext(ctx), claim.OrganizationID, func(tx *gorm.DB) error {
-		var integration models.ProviderIntegration
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND organization_id = ? AND provider = ?", claim.IntegrationID, claim.OrganizationID, "threads").
-			First(&integration).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrIntegrationNotManaged
-			}
-			return fmt.Errorf("lock managed Threads integration: %w", err)
-		}
-		if err := ValidateIntegrationManagement(&integration); err != nil ||
-			EffectiveManagementMode(&integration) != models.ThreadsManagementModePlatformManaged ||
-			integration.PlatformAppKey == nil || *integration.PlatformAppKey != claim.PlatformAppKey {
-			return ErrIntegrationNotManaged
-		}
-		if claim.ChannelAccountID != nil {
-			var account models.ChannelAccount
-			if err := tx.Where(
-				"id = ? AND organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
-				*claim.ChannelAccountID,
-				claim.OrganizationID,
-				models.ChannelThreads,
-				"threads",
-				claim.AuthorityAssetID,
-			).First(&account).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return ErrInvalidBindingClaim
-				}
-				return fmt.Errorf("validate managed Threads channel account: %w", err)
-			}
-		}
-
-		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&binding)
-		if result.Error != nil {
-			return fmt.Errorf("claim managed Threads binding: %w", result.Error)
-		}
-		if result.RowsAffected != 1 {
-			return ErrBindingClaimConflict
-		}
-		return nil
-	})
-	if err != nil {
+// ReconnectBindingTx advances only the exact immutable claim captured at OAuth
+// start. It has no release or transfer branch and never mutates app, subject,
+// profile, tenant, integration, or account ownership fields.
+func ReconnectBindingTx(tx *gorm.DB, reconnect BindingReconnect) (*models.ThreadsPlatformBinding, error) {
+	if tx == nil {
+		return nil, ErrStoreUnavailable
+	}
+	claim := BindingClaim{
+		OrganizationID: reconnect.OrganizationID, IntegrationID: reconnect.IntegrationID,
+		ChannelAccountID: &reconnect.ChannelAccountID, PlatformAppKey: reconnect.PlatformAppKey,
+		PlatformAppID: reconnect.PlatformAppID, OAuthSubjectID: reconnect.OAuthSubjectID,
+		AuthorityAssetID:        reconnect.AuthorityAssetID,
+		ConfigurationGeneration: reconnect.ConfigurationGeneration,
+		AuthorizationGeneration: reconnect.ExpectedAuthorizationGeneration,
+	}
+	if reconnect.BindingID == uuid.Nil || reconnect.ChannelAccountID == uuid.Nil ||
+		reconnect.ExpectedAuthorizationGeneration == 0 || validateBindingClaim(claim) != nil {
+		return nil, ErrInvalidBindingClaim
+	}
+	if err := validateManagedIntegrationTx(
+		tx, reconnect.OrganizationID, reconnect.IntegrationID, reconnect.PlatformAppKey,
+	); err != nil {
 		return nil, err
 	}
+	if err := validateManagedAccountTx(
+		tx, reconnect.OrganizationID, reconnect.ChannelAccountID, reconnect.AuthorityAssetID,
+	); err != nil {
+		return nil, err
+	}
+	var binding models.ThreadsPlatformBinding
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"id = ? AND organization_id = ? AND integration_id = ? AND channel_account_id = ?",
+		reconnect.BindingID, reconnect.OrganizationID, reconnect.IntegrationID, reconnect.ChannelAccountID,
+	).First(&binding).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrBindingReconnectFence
+		}
+		return nil, fmt.Errorf("lock managed Threads reconnect binding: %w", err)
+	}
+	if binding.PlatformAppKey != reconnect.PlatformAppKey ||
+		binding.PlatformAppID != reconnect.PlatformAppID ||
+		binding.OAuthSubjectID != reconnect.OAuthSubjectID ||
+		binding.AuthorityAssetID != reconnect.AuthorityAssetID ||
+		binding.ConfigurationGeneration != reconnect.ConfigurationGeneration ||
+		binding.AuthorizationGeneration != reconnect.ExpectedAuthorizationGeneration ||
+		(binding.Status != models.ThreadsPlatformBindingStatusPending &&
+			binding.Status != models.ThreadsPlatformBindingStatusActive &&
+			binding.Status != models.ThreadsPlatformBindingStatusQuarantined) {
+		return nil, ErrBindingReconnectFence
+	}
+	result := tx.Model(&models.ThreadsPlatformBinding{}).Where(
+		"id = ? AND organization_id = ? AND authorization_generation = ?",
+		binding.ID, reconnect.OrganizationID, reconnect.ExpectedAuthorizationGeneration,
+	).Updates(map[string]any{
+		"authorization_generation": reconnect.ExpectedAuthorizationGeneration + 1,
+		"status":                   models.ThreadsPlatformBindingStatusPending,
+	})
+	if result.Error != nil {
+		return nil, fmt.Errorf("advance managed Threads authorization generation: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return nil, ErrBindingReconnectFence
+	}
+	binding.AuthorizationGeneration++
+	binding.Status = models.ThreadsPlatformBindingStatusPending
 	return &binding, nil
+}
+
+func validateManagedIntegrationTx(
+	tx *gorm.DB,
+	organizationID, integrationID uuid.UUID,
+	platformAppKey string,
+) error {
+	var integration models.ProviderIntegration
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"id = ? AND organization_id = ? AND provider = ?", integrationID, organizationID, "threads",
+	).First(&integration).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrIntegrationNotManaged
+		}
+		return fmt.Errorf("lock managed Threads integration: %w", err)
+	}
+	if err := ValidateIntegrationManagement(&integration); err != nil ||
+		EffectiveManagementMode(&integration) != models.ThreadsManagementModePlatformManaged ||
+		integration.PlatformAppKey == nil || *integration.PlatformAppKey != platformAppKey {
+		return ErrIntegrationNotManaged
+	}
+	return nil
+}
+
+func validateManagedAccountTx(
+	tx *gorm.DB,
+	organizationID, accountID uuid.UUID,
+	authorityAssetID string,
+) error {
+	var account models.ChannelAccount
+	if err := tx.Where(
+		"id = ? AND organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+		accountID, organizationID, models.ChannelThreads, "threads", authorityAssetID,
+	).First(&account).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrInvalidBindingClaim
+		}
+		return fmt.Errorf("validate managed Threads channel account: %w", err)
+	}
+	return nil
 }
 
 // ReleaseBinding is an explicit owner action. There is intentionally no

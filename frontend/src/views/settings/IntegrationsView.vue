@@ -464,12 +464,11 @@ const secretDraft = reactive<Record<string, string>>({});
 const enabledDraft = ref(false);
 const threadsSupportReason = ref("");
 const threadsSupportRevokeReason = ref("");
-const threadsSupportStatus = ref<ThreadsPublicEngagementSupportStatusResponse | null>(
-  null,
+const threadsSupportStatus =
+  ref<ThreadsPublicEngagementSupportStatusResponse | null>(null);
+const threadsSupportStatusState = ref<"idle" | "loading" | "ready" | "error">(
+  "idle",
 );
-const threadsSupportStatusState = ref<
-  "idle" | "loading" | "ready" | "error"
->("idle");
 const threadsSupportStatusTargetOrganizationId = ref("");
 let threadsSupportStatusRequestID = 0;
 const canWrite = computed(() =>
@@ -481,6 +480,16 @@ const selectedIntegration = computed(() =>
 );
 const selectedDefinition = computed(() =>
   selectedProvider.value ? definitions[selectedProvider.value] : undefined,
+);
+const isManagedThreads = computed(
+  () =>
+    selectedIntegration.value?.provider === "threads" &&
+    selectedIntegration.value?.config?.management_mode === "platform_managed",
+);
+const managedThreadsReconnectAvailable = computed(
+  () =>
+    isManagedThreads.value &&
+    selectedIntegration.value?.config?.reconnect_available === true,
 );
 const selectedReadiness = computed(() =>
   selectedIntegration.value
@@ -510,6 +519,7 @@ const isThreadsEntitlementLocked = computed(
 const showThreadsEntitlementSupport = computed(
   () =>
     selectedIntegration.value?.provider === "threads" &&
+    !isManagedThreads.value &&
     Boolean(authStore.user?.is_super_admin),
 );
 const isThreadsSupportStatusCurrent = computed(
@@ -601,6 +611,7 @@ function isThreadsReviewAccessAuthorized() {
 const isThreadsReviewLocked = computed(
   () =>
     selectedIntegration.value?.provider === "threads" &&
+    !isManagedThreads.value &&
     !isThreadsReviewAccessAuthorized(),
 );
 const isActivationLocked = computed(() => {
@@ -929,7 +940,7 @@ function typedConfigValue(field: IntegrationField, value: string): unknown {
 }
 
 async function saveConfiguration() {
-  if (!canWrite.value) return;
+  if (!canWrite.value || isManagedThreads.value) return;
   const integration = selectedIntegration.value;
   const definition = selectedDefinition.value;
   if (!integration || !definition) return;
@@ -1001,11 +1012,13 @@ async function enableThreadsPublicEngagement() {
       throw new Error("Threads public engagement did not become effective");
     }
 
-    const [entitlementsRefreshed, , supportStatusRefreshed] = await Promise.all([
-      authStore.fetchProductEntitlements(),
-      loadIntegrations({ quiet: true }),
-      refreshThreadsSupportStatus(organizationID),
-    ]);
+    const [entitlementsRefreshed, , supportStatusRefreshed] = await Promise.all(
+      [
+        authStore.fetchProductEntitlements(),
+        loadIntegrations({ quiet: true }),
+        refreshThreadsSupportStatus(organizationID),
+      ],
+    );
     if (
       !entitlementsRefreshed ||
       !authStore.hasProductEntitlement(THREADS_PUBLIC_ENGAGEMENT_ENTITLEMENT)
@@ -1070,11 +1083,13 @@ async function revokeThreadsPublicEngagementSupport() {
         { override_id: overrideID, reason },
       );
 
-    const [entitlementsRefreshed, , supportStatusRefreshed] = await Promise.all([
-      authStore.fetchProductEntitlements(),
-      loadIntegrations({ quiet: true }),
-      refreshThreadsSupportStatus(organizationID),
-    ]);
+    const [entitlementsRefreshed, , supportStatusRefreshed] = await Promise.all(
+      [
+        authStore.fetchProductEntitlements(),
+        loadIntegrations({ quiet: true }),
+        refreshThreadsSupportStatus(organizationID),
+      ],
+    );
     if (
       !supportStatusRefreshed ||
       !isThreadsSupportStatusCurrent.value ||
@@ -1167,13 +1182,16 @@ async function connectProvider() {
   if (
     !integration ||
     !definition ||
-    !integration.enabled ||
+    (!isManagedThreads.value && !integration.enabled) ||
+    (isManagedThreads.value && isThreadsEntitlementLocked.value) ||
     !integration.oauth.available
   )
     return;
   activeAction.value = "connect";
   try {
-    const response = await integrationsService.connect(integration.provider);
+    const response = isManagedThreads.value
+      ? await integrationsService.connectManagedThreads()
+      : await integrationsService.connect(integration.provider);
     const result = response.data.data;
     if (result.ready && result.mode === "embedded_signup") {
       isDialogOpen.value = false;
@@ -1271,6 +1289,7 @@ function statusLabel(status: IntegrationStatus) {
   const labels: Record<IntegrationStatus, string> = {
     connected: "Connected",
     configured: "Ready to connect",
+    pending: "Pending activation",
     degraded: "Needs attention",
     disabled: "Disabled",
     not_configured: "Setup required",
@@ -1283,7 +1302,7 @@ function statusLabel(status: IntegrationStatus) {
 function statusBadgeVariant(status: IntegrationStatus) {
   if (status === "connected") return "success";
   if (status === "degraded") return "destructive";
-  if (status === "configured") return "info";
+  if (status === "configured" || status === "pending") return "info";
   if (status === "approval_required" || status === "adapter_unavailable")
     return "warning";
   return "secondary";
@@ -1416,6 +1435,36 @@ async function handleThreadsOAuthReturn() {
   }
 }
 
+async function handleManagedThreadsOAuthReturn() {
+  const rawOutcome = route.query.threads_managed;
+  if (rawOutcome == null) return;
+  const outcome = Array.isArray(rawOutcome) ? rawOutcome[0] : rawOutcome;
+
+  const nextQuery = { ...route.query };
+  delete nextQuery.threads_managed;
+  await router.replace({ query: nextQuery });
+
+  if (outcome === "pending") {
+    await loadIntegrations({ quiet: true });
+    toast.success(
+      "Threads authorization stored. The account remains pending and non-routable until platform activation.",
+    );
+    openConfiguration("threads");
+  } else if (outcome === "cancelled") {
+    toast.info(
+      "Managed Threads authorization was cancelled. No account was changed.",
+    );
+  } else if (outcome === "reconcile") {
+    await loadIntegrations({ quiet: true });
+    toast.error(
+      "This Threads profile could not be claimed. Platform support must reconcile ownership before retrying.",
+    );
+    openConfiguration("threads");
+  } else if (outcome === "error") {
+    toast.error("Managed Threads authorization was not completed. Try again.");
+  }
+}
+
 onMounted(async () => {
   await Promise.all([
     loadIntegrations(),
@@ -1423,6 +1472,7 @@ onMounted(async () => {
   ]);
   await handleSearchConsoleOAuthReturn();
   await handleThreadsOAuthReturn();
+  await handleManagedThreadsOAuthReturn();
 });
 </script>
 
@@ -1898,7 +1948,89 @@ onMounted(async () => {
               </div>
             </section>
 
-            <section aria-labelledby="application-config-title">
+            <section
+              v-if="isManagedThreads"
+              data-testid="threads-managed-status"
+              class="rounded-xl border border-sky-400/15 bg-sky-400/[0.045] px-4 py-4 light:border-sky-200 light:bg-sky-50"
+              aria-labelledby="threads-managed-status-title"
+            >
+              <div class="flex items-start gap-3">
+                <div
+                  class="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-sky-400/15 bg-black/15 text-sky-200 light:bg-white light:text-sky-700"
+                >
+                  <ShieldCheck class="h-4 w-4" aria-hidden="true" />
+                </div>
+                <div class="min-w-0 flex-1">
+                  <h3
+                    id="threads-managed-status-title"
+                    class="text-sm font-semibold text-white light:text-gray-900"
+                  >
+                    ReReply-managed Threads connection
+                  </h3>
+                  <p
+                    class="mt-1 text-xs leading-5 text-white/45 light:text-gray-600"
+                  >
+                    ReReply securely owns the Threads application, callback and
+                    review evidence. No app IDs, app secrets, webhook tokens or
+                    review controls are available in this workspace.
+                  </p>
+                </div>
+              </div>
+              <div class="mt-4 grid gap-2 sm:grid-cols-3">
+                <div
+                  class="rounded-lg border border-white/[0.07] bg-black/10 px-3 py-2.5 light:border-sky-100 light:bg-white"
+                >
+                  <p
+                    class="text-[10px] uppercase tracking-wider text-white/30 light:text-gray-400"
+                  >
+                    Authorization
+                  </p>
+                  <p
+                    class="mt-1 text-xs font-medium text-white/75 light:text-gray-800"
+                  >
+                    {{
+                      selectedIntegration.config.authorization_state ===
+                      "pending_activation"
+                        ? "Stored securely"
+                        : "Ready to connect"
+                    }}
+                  </p>
+                </div>
+                <div
+                  class="rounded-lg border border-white/[0.07] bg-black/10 px-3 py-2.5 light:border-sky-100 light:bg-white"
+                >
+                  <p
+                    class="text-[10px] uppercase tracking-wider text-white/30 light:text-gray-400"
+                  >
+                    Account state
+                  </p>
+                  <p
+                    class="mt-1 text-xs font-medium text-white/75 light:text-gray-800"
+                  >
+                    {{
+                      selectedIntegration.connection.pending_count || 0
+                    }}
+                    pending
+                  </p>
+                </div>
+                <div
+                  class="rounded-lg border border-white/[0.07] bg-black/10 px-3 py-2.5 light:border-sky-100 light:bg-white"
+                >
+                  <p
+                    class="text-[10px] uppercase tracking-wider text-white/30 light:text-gray-400"
+                  >
+                    Routing
+                  </p>
+                  <p
+                    class="mt-1 text-xs font-medium text-amber-200 light:text-amber-800"
+                  >
+                    Disabled until activation
+                  </p>
+                </div>
+              </div>
+            </section>
+
+            <section v-else aria-labelledby="application-config-title">
               <div class="mb-4 flex items-center justify-between gap-3">
                 <div>
                   <div class="flex flex-wrap items-center gap-2">
@@ -2052,7 +2184,7 @@ onMounted(async () => {
             </section>
 
             <section
-              v-if="selectedDefinition.secrets.length"
+              v-if="!isManagedThreads && selectedDefinition.secrets.length"
               class="border-t border-white/[0.08] pt-5 light:border-gray-200"
               aria-labelledby="credentials-title"
             >
@@ -2248,6 +2380,7 @@ onMounted(async () => {
           <Button
             v-if="
               canWrite &&
+              !isManagedThreads &&
               selectedDefinition.secrets.length &&
               hasRemovableCredentials(selectedIntegration)
             "
@@ -2289,16 +2422,22 @@ onMounted(async () => {
               :loading="activeAction === 'connect'"
               :disabled="
                 activeAction !== null ||
-                !selectedIntegration.enabled ||
                 !selectedIntegration.oauth.available ||
-                isThreadsReviewLocked
+                (isManagedThreads && isThreadsEntitlementLocked) ||
+                (!isManagedThreads &&
+                  (!selectedIntegration.enabled || isThreadsReviewLocked))
               "
               @click="connectProvider"
             >
               <ExternalLink class="h-3.5 w-3.5" aria-hidden="true" />
-              {{ selectedDefinition.connectLabel }}
+              {{
+                managedThreadsReconnectAvailable
+                  ? "Reconnect Threads"
+                  : selectedDefinition.connectLabel
+              }}
             </Button>
             <Button
+              v-if="!isManagedThreads"
               :data-testid="`integration-save-${selectedIntegration.provider}`"
               type="submit"
               form="integration-config-form"

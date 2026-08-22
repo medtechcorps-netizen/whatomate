@@ -51,8 +51,9 @@ func (CredentialMaterial) String() string   { return "[REDACTED]" }
 func (CredentialMaterial) GoString() string { return "[REDACTED]" }
 
 type runtimeApp struct {
-	descriptor  AppDescriptor
-	credentials CredentialMaterial
+	descriptor                 AppDescriptor
+	credentials                CredentialMaterial
+	expectedDevelopmentProfile string
 }
 
 // Runtime is the fail-closed deployment policy shared by future OAuth,
@@ -62,6 +63,7 @@ type Runtime struct {
 	allowAllOrganizations    bool
 	allowedOrganizations     map[uuid.UUID]struct{}
 	complianceOrganizationID uuid.UUID
+	reReplyBaseURL           string
 	apps                     map[string]runtimeApp
 }
 
@@ -94,6 +96,7 @@ func NewRuntime(
 		enabled:               managed.Enabled,
 		allowAllOrganizations: managed.AllowAllOrganizations,
 		allowedOrganizations:  make(map[uuid.UUID]struct{}),
+		reReplyBaseURL:        managed.ReReplyBaseURL,
 		apps:                  make(map[string]runtimeApp),
 	}
 	if !managed.Enabled {
@@ -137,6 +140,12 @@ func NewRuntime(
 				AppSecret:          configuredApp.AppSecret,
 				WebhookVerifyToken: configuredApp.WebhookVerifyToken,
 			},
+			expectedDevelopmentProfile: func() string {
+				if configuredApp.AppReviewStatus == "approved" {
+					return ""
+				}
+				return strings.TrimSpace(development.DevelopmentProfileID)
+			}(),
 		}
 	}
 	return runtime, nil
@@ -174,6 +183,76 @@ func (r *ValidatedRuntime) Credentials(platformAppKey string) (CredentialMateria
 		return CredentialMaterial{}, ErrUnknownPlatformApp
 	}
 	return app.credentials, nil
+}
+
+// OrganizationAllowed exposes only the already validated deployment release
+// decision. Tenant rows cannot expand this allowlist.
+func (r *ValidatedRuntime) OrganizationAllowed(organizationID uuid.UUID) bool {
+	return r != nil && r.runtime != nil && r.runtime.OrganizationAllowed(organizationID)
+}
+
+// App returns safe, non-secret app metadata from the durable-validated
+// runtime. It never releases credential material.
+func (r *ValidatedRuntime) App(platformAppKey string) (AppDescriptor, error) {
+	if r == nil || r.runtime == nil {
+		return AppDescriptor{}, ErrManagedDisabled
+	}
+	return r.runtime.App(platformAppKey)
+}
+
+// SoleApp is the fail-closed initial shard selector. Existing managed rows
+// retain their immutable key; a deployment with multiple apps must add an
+// explicit server-owned shard policy before onboarding a new tenant.
+func (r *ValidatedRuntime) SoleApp() (AppDescriptor, error) {
+	if r == nil || r.runtime == nil || !r.runtime.enabled {
+		return AppDescriptor{}, ErrManagedDisabled
+	}
+	if len(r.runtime.apps) != 1 {
+		return AppDescriptor{}, ErrUnknownPlatformApp
+	}
+	for _, app := range r.runtime.apps {
+		return app.descriptor, nil
+	}
+	return AppDescriptor{}, ErrUnknownPlatformApp
+}
+
+// CallbackURL derives the one global managed callback from deployment-owned
+// configuration. No tenant or request value participates in this URL.
+func (r *ValidatedRuntime) CallbackURL() (string, error) {
+	if r == nil || r.runtime == nil || !r.runtime.enabled || r.runtime.reReplyBaseURL == "" {
+		return "", ErrManagedDisabled
+	}
+	return r.runtime.reReplyBaseURL + "/api/integrations/threads/managed/callback", nil
+}
+
+// ValidateActivation repeats the complete release policy through the
+// durable-validated capability.
+func (r *ValidatedRuntime) ValidateActivation(facts ActivationFacts) error {
+	if r == nil || r.runtime == nil {
+		return ErrManagedDisabled
+	}
+	return r.runtime.ValidateActivation(facts)
+}
+
+// ValidateProviderIdentity keeps the OAuth subject and Threads authority
+// profile distinct. Meta documents the former as the debug-token app-scoped
+// user_id and the latter as /me.id; it does not promise they are equal.
+func (r *ValidatedRuntime) ValidateProviderIdentity(
+	platformAppKey, oauthSubjectID, authorityProfileID string,
+) error {
+	if r == nil || r.runtime == nil || !r.runtime.enabled ||
+		!canonicalNumericID(oauthSubjectID) || !canonicalNumericID(authorityProfileID) {
+		return ErrInvalidManagementMode
+	}
+	app, ok := r.runtime.apps[platformAppKey]
+	if !ok {
+		return ErrUnknownPlatformApp
+	}
+	if app.expectedDevelopmentProfile != "" &&
+		authorityProfileID != app.expectedDevelopmentProfile {
+		return ErrOrganizationNotAllowed
+	}
+	return nil
 }
 
 // ActivationFacts are authorization results supplied by the caller. Runtime

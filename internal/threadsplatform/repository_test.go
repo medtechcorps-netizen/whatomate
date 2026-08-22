@@ -109,6 +109,81 @@ func TestPostgresStoreClaimsGloballyUniqueLiveSubjectAndAssetWithoutTransfer(t *
 	assert.Equal(t, organizationB.ID, replacement.OrganizationID)
 }
 
+func TestReconnectBindingTxOnlyRotatesExactClaimAndReturnsItToPending(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	testutil.TruncateTables(db)
+	organization := testutil.CreateTestOrganization(t, db)
+	integration := createManagedIntegration(t, db, organization.ID, "primary")
+	account := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    organization.ID,
+		Channel:           models.ChannelThreads,
+		Provider:          "threads",
+		Name:              "Managed Threads",
+		ExternalAccountID: "300000000000001",
+		Status:            models.ChannelAccountStatusPending,
+		Capabilities:      models.JSONB{},
+		Config: models.JSONB{
+			"management_mode": models.ThreadsManagementModePlatformManaged,
+		},
+		Metadata: models.JSONB{},
+	}
+	require.NoError(t, db.Create(&account).Error)
+	store := NewPostgresStore(db)
+	binding, err := store.ClaimBinding(context.Background(), BindingClaim{
+		OrganizationID:          organization.ID,
+		IntegrationID:           integration.ID,
+		ChannelAccountID:        &account.ID,
+		PlatformAppKey:          "primary",
+		PlatformAppID:           "123456789012345",
+		OAuthSubjectID:          "200000000000001",
+		AuthorityAssetID:        account.ExternalAccountID,
+		ConfigurationGeneration: 7,
+		AuthorizationGeneration: 1,
+	})
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&models.ThreadsPlatformBinding{}).Where(
+		"id = ?", binding.ID,
+	).Update("status", models.ThreadsPlatformBindingStatusActive).Error)
+
+	reconnect := BindingReconnect{
+		OrganizationID:                  organization.ID,
+		BindingID:                       binding.ID,
+		IntegrationID:                   integration.ID,
+		ChannelAccountID:                account.ID,
+		PlatformAppKey:                  "primary",
+		PlatformAppID:                   "123456789012345",
+		OAuthSubjectID:                  "200000000000001",
+		AuthorityAssetID:                account.ExternalAccountID,
+		ConfigurationGeneration:         7,
+		ExpectedAuthorizationGeneration: 1,
+	}
+	var rotated *models.ThreadsPlatformBinding
+	require.NoError(t, database.WithTenant(db, organization.ID, func(tx *gorm.DB) error {
+		var rotateErr error
+		rotated, rotateErr = ReconnectBindingTx(tx, reconnect)
+		return rotateErr
+	}))
+	require.NotNil(t, rotated)
+	assert.Equal(t, uint64(2), rotated.AuthorizationGeneration)
+	assert.Equal(t, models.ThreadsPlatformBindingStatusPending, rotated.Status)
+
+	stale := reconnect
+	stale.OAuthSubjectID = "200000000000002"
+	err = database.WithTenant(db, organization.ID, func(tx *gorm.DB) error {
+		_, reconnectErr := ReconnectBindingTx(tx, stale)
+		return reconnectErr
+	})
+	assert.ErrorIs(t, err, ErrBindingReconnectFence)
+
+	var persisted models.ThreadsPlatformBinding
+	require.NoError(t, db.First(&persisted, "id = ?", binding.ID).Error)
+	assert.Equal(t, uint64(2), persisted.AuthorizationGeneration)
+	assert.Equal(t, "200000000000001", persisted.OAuthSubjectID)
+	assert.Equal(t, "300000000000001", persisted.AuthorityAssetID)
+	assert.Equal(t, models.ThreadsPlatformBindingStatusPending, persisted.Status)
+}
+
 func TestPostgresStoreRejectsBYOIntegrationBinding(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	testutil.TruncateTables(db)

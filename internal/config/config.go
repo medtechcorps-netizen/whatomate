@@ -64,6 +64,7 @@ type ThreadsManagedConfig struct {
 	AllowedOrganizationIDs   string                     `koanf:"allowed_organization_ids" json:"allowed_organization_ids"`
 	AllowAllOrganizations    bool                       `koanf:"allow_all_organizations" json:"allow_all_organizations"`
 	ComplianceOrganizationID string                     `koanf:"compliance_organization_id" json:"compliance_organization_id"`
+	ReReplyBaseURL           string                     `koanf:"rereply_base_url" json:"rereply_base_url"`
 	PlatformApp              ThreadsPlatformAppConfig   `koanf:"platform_app" json:"-"`
 	PlatformApps             []ThreadsPlatformAppConfig `koanf:"platform_apps" json:"platform_apps"`
 }
@@ -528,6 +529,7 @@ func ValidateThreadsManagedConfig(
 	configured := managed.AllowAllOrganizations ||
 		strings.TrimSpace(managed.AllowedOrganizationIDs) != "" ||
 		strings.TrimSpace(managed.ComplianceOrganizationID) != "" ||
+		strings.TrimSpace(managed.ReReplyBaseURL) != "" ||
 		len(managed.PlatformApps) > 0
 	if !managed.Enabled {
 		if configured {
@@ -541,6 +543,20 @@ func ValidateThreadsManagedConfig(
 	case "development", "staging", "production":
 	default:
 		return errors.New("managed Threads environment must be development, staging, or production")
+	}
+	production := normalizedEnvironment == "production"
+	if strings.TrimSpace(managed.ReReplyBaseURL) != managed.ReReplyBaseURL {
+		return errors.New("managed Threads rereply_base_url must be a canonical HTTPS origin")
+	}
+	if err := validateMetaLifecyclePinnedOrigin(
+		managed.ReReplyBaseURL,
+		production,
+		"app.rereply.app",
+	); err != nil {
+		return errors.New("managed Threads rereply_base_url must be a canonical HTTPS origin")
+	}
+	if production && managed.ReReplyBaseURL != "https://app.rereply.app" {
+		return errors.New("managed Threads production rereply_base_url must be exactly https://app.rereply.app")
 	}
 
 	allowedOrganizations, err := canonicalThreadsManagedOrganizationAllowlist(managed.AllowedOrganizationIDs)

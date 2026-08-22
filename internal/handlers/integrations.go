@@ -20,6 +20,7 @@ import (
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	qwenapi "github.com/shridarpatil/whatomate/internal/qwen"
+	"github.com/shridarpatil/whatomate/internal/threadsplatform"
 	"github.com/shridarpatil/whatomate/internal/threadsreview"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
@@ -42,6 +43,7 @@ const (
 	integrationStatusConnected       = "connected"
 	integrationStatusDegraded        = "degraded"
 	integrationStatusDisabled        = "disabled"
+	integrationStatusPending         = "pending"
 	integrationStatusApprovalNeeded  = "approval_required"
 	integrationStatusAdapterMissing  = "adapter_unavailable"
 	integrationValidationFailedCode  = "provider_validation_failed"
@@ -582,6 +584,53 @@ func (a *App) composeIntegrationResponse(provider string, sources *integrationSo
 			response.Message = "The stored integration credential is unavailable to this server."
 		}
 	case integrationProviderThreads:
+		managed := row != nil &&
+			threadsplatform.EffectiveManagementMode(row) == models.ThreadsManagementModePlatformManaged
+		if row == nil && a.rootApp() != nil && a.rootApp().ThreadsManagedRuntime != nil {
+			managed = a.rootApp().ThreadsManagedRuntime.OrganizationAllowed(sources.organization.ID)
+		}
+		if managed {
+			available := a.managedThreadsOAuthAvailable(sources.organization.ID)
+			authorizationState := managedThreadsAuthorizationRequiredState
+			if row != nil {
+				if stored := stringJSONValue(row.Config, "authorization_state"); stored == managedThreadsAuthorizationRequiredState || stored == managedThreadsPendingActivationState {
+					authorizationState = stored
+				}
+			}
+			if response.Connection.PendingCount > 0 {
+				authorizationState = managedThreadsPendingActivationState
+			}
+			response.Enabled = false
+			response.Configured = available
+			response.Config = models.JSONB{
+				"management_mode":      models.ThreadsManagementModePlatformManaged,
+				"authorization_state":  authorizationState,
+				"reconnect_available":  available && response.Connection.PendingCount == 1,
+				"routing_enabled":      false,
+				"outbound_enabled":     false,
+				"activation_available": false,
+			}
+			response.Credentials = map[string]integrationCredentialResponse{}
+			response.OAuth = integrationOAuthResponse{
+				Supported: true,
+				Available: available,
+				Mode:      "managed_oauth",
+			}
+			response.TestSupported = false
+			response.RequiredScopes = append([]string(nil), threadsRequiredScopes...)
+			switch {
+			case response.Connection.PendingCount > 0:
+				response.Status = integrationStatusPending
+				response.Message = "Authorization is stored and pending platform activation. Inbound routing, outbound replies, and webhooks remain disabled."
+			case available:
+				response.Status = integrationStatusConfigured
+				response.Message = "Connect a Threads profile. The connection will remain pending and non-routable until a later platform activation phase."
+			default:
+				response.Status = integrationStatusDegraded
+				response.Message = "Managed Threads onboarding is not currently available on this server."
+			}
+			break
+		}
 		threadsAccessMode := threadsreview.ModeBlocked
 		if row != nil {
 			threadsAccessMode = a.threadsAppReviewAccessMode(sources.organization.ID, row.Config, "")
@@ -912,6 +961,13 @@ func (a *App) updateIntegration(orgID, userID uuid.UUID, provider string, reques
 		row, isNew, err := lockOrCreateIntegrationRow(tx, orgID, userID, provider)
 		if err != nil {
 			return err
+		}
+		if provider == integrationProviderThreads && !isNew &&
+			threadsplatform.EffectiveManagementMode(row) == models.ThreadsManagementModePlatformManaged {
+			return &integrationClientError{
+				status:  fasthttp.StatusConflict,
+				message: "Managed Threads settings and credentials are controlled by platform onboarding",
+			}
 		}
 		oldSnapshot := integrationAuditSnapshot(provider, &organization, row, nil)
 		credentialsChanged := false
