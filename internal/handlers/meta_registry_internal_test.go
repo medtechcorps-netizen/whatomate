@@ -245,12 +245,26 @@ func TestManagedMessengerActivationRequiresFreshHealthAndCredentialFences(t *tes
 	assert.False(t, boolConfigValue(pending.Config, "outbound_enabled"))
 	assert.False(t, boolConfigValue(pending.Config, "ai_reply_enabled"))
 
-	freshHealth := now.Add(-time.Minute)
+	// Metadata written before the precision fix could retain nanoseconds while
+	// PostgreSQL stored the matching column at microsecond precision.
+	freshHealth := now.Add(-time.Minute).Add(789 * time.Nanosecond)
 	metadata["meta_health_checked_at"] = freshHealth.Format(time.RFC3339Nano)
 	metadata["meta_ownership_checked_at"] = freshHealth.Format(time.RFC3339Nano)
 	require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).Updates(map[string]any{
-		"metadata": metadata, "last_health_check_at": freshHealth,
+		"metadata": metadata, "last_health_check_at": freshHealth.Add(-time.Microsecond),
 	}).Error)
+	_, err = app.activateMetaMessengerAccount(
+		organization.ID, fixture.userID, fixture.account.ID, now, subscriptionApproval,
+	)
+	require.Error(t, err, "a full-microsecond evidence mismatch must remain fail closed")
+	require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).
+		Update("last_health_check_at", freshHealth).Error)
+	var storedHealth models.ChannelAccount
+	require.NoError(t, db.First(&storedHealth, "id = ?", fixture.account.ID).Error)
+	require.NotNil(t, storedHealth.LastHealthCheckAt)
+	assert.False(t, storedHealth.LastHealthCheckAt.UTC().Equal(freshHealth.UTC()))
+	assert.Equal(t, freshHealth.Truncate(time.Microsecond), storedHealth.LastHealthCheckAt.UTC())
+	assert.True(t, channelHealthTimestampsMatch(*storedHealth.LastHealthCheckAt, freshHealth))
 	activated, err := app.activateMetaMessengerAccount(
 		organization.ID, fixture.userID, fixture.account.ID, now, subscriptionApproval,
 	)
@@ -260,6 +274,19 @@ func TestManagedMessengerActivationRequiresFreshHealthAndCredentialFences(t *tes
 	assert.False(t, boolConfigValue(activated.Config, "ai_reply_enabled"))
 	assert.NotNil(t, activated.ConnectedAt)
 	assert.Equal(t, "active", stringConfigValue(activated.Metadata, "meta_activation_state"))
+}
+
+func TestChannelHealthTimestampPrecision(t *testing.T) {
+	base := time.Date(2026, time.August, 22, 1, 2, 3, 456789000, time.UTC)
+	source := base.Add(987 * time.Nanosecond).In(time.FixedZone("test", 8*60*60))
+	canonical := canonicalChannelHealthTimestamp(source)
+
+	assert.Equal(t, base, canonical)
+	assert.True(t, channelHealthTimestampsMatch(base, base))
+	assert.True(t, channelHealthTimestampsMatch(base, base.Add(999*time.Nanosecond)))
+	assert.True(t, channelHealthTimestampsMatch(base.Add(time.Microsecond), base.Add(501*time.Nanosecond)))
+	assert.False(t, channelHealthTimestampsMatch(base, base.Add(time.Microsecond)))
+	assert.False(t, channelHealthTimestampsMatch(base, base.Add(-time.Microsecond)))
 }
 
 func TestManagedMessengerProductionRejectsCarriedDevelopmentUserToken(t *testing.T) {

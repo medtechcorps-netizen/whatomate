@@ -1943,10 +1943,11 @@ func TestManagedInstagramDeterministicGraphLossImmediatelyDowngradesAndCancels(t
 func TestManagedInstagramActivationRequiresFreshHealthAndExactCredentialFences(t *testing.T) {
 	fixture := newMetaInstagramLifecycleFixture(t)
 	now := time.Now().UTC().Truncate(time.Microsecond)
+	healthCheckedAt := now.Add(-time.Minute).Add(789 * time.Nanosecond)
 	metadata := cloneJSONB(fixture.account.Metadata)
 	metadata["meta_activation_state"] = "awaiting_admin_approval"
-	metadata["meta_health_checked_at"] = now.Add(-time.Minute).Format(time.RFC3339Nano)
-	metadata["meta_ownership_checked_at"] = now.Add(-time.Minute).Format(time.RFC3339Nano)
+	metadata["meta_health_checked_at"] = healthCheckedAt.Format(time.RFC3339Nano)
+	metadata["meta_ownership_checked_at"] = healthCheckedAt.Format(time.RFC3339Nano)
 	metadata["meta_health_oauth_credential_id"] = fixture.oauth.ID.String()
 	metadata["meta_health_oauth_version"] = fixture.oauth.Version
 	metadata["meta_health_webhook_credential_id"] = fixture.webhook.ID.String()
@@ -1957,7 +1958,7 @@ func TestManagedInstagramActivationRequiresFreshHealthAndExactCredentialFences(t
 	require.NoError(t, fixture.db.Model(&models.ChannelAccount{}).
 		Where("id = ?", fixture.account.ID).Updates(map[string]any{
 		"status": models.ChannelAccountStatusPending, "config": accountConfig,
-		"metadata": metadata, "last_health_check_at": now.Add(-time.Minute),
+		"metadata": metadata, "last_health_check_at": healthCheckedAt.Add(-time.Microsecond),
 		"last_error": "", "connected_at": nil,
 	}).Error)
 	evidence := metaInstagramSubscriptionApproval{
@@ -1965,6 +1966,18 @@ func TestManagedInstagramActivationRequiresFreshHealthAndExactCredentialFences(t
 		OAuthCredentialID: fixture.oauth.ID, OAuthCredentialVersion: fixture.oauth.Version,
 		WebhookCredentialID: fixture.webhook.ID, WebhookCredentialVersion: fixture.webhook.Version,
 	}
+	_, err := fixture.app.activateMetaInstagramAccount(
+		fixture.org.ID, fixture.user.ID, fixture.account.ID, now, evidence,
+	)
+	require.Error(t, err, "a full-microsecond evidence mismatch must remain fail closed")
+	require.NoError(t, fixture.db.Model(&models.ChannelAccount{}).
+		Where("id = ?", fixture.account.ID).Update("last_health_check_at", healthCheckedAt).Error)
+	var storedHealth models.ChannelAccount
+	require.NoError(t, fixture.db.First(&storedHealth, "id = ?", fixture.account.ID).Error)
+	require.NotNil(t, storedHealth.LastHealthCheckAt)
+	assert.False(t, storedHealth.LastHealthCheckAt.UTC().Equal(healthCheckedAt.UTC()))
+	assert.Equal(t, healthCheckedAt.Truncate(time.Microsecond), storedHealth.LastHealthCheckAt.UTC())
+	assert.True(t, channelHealthTimestampsMatch(*storedHealth.LastHealthCheckAt, healthCheckedAt))
 	activated, err := fixture.app.activateMetaInstagramAccount(
 		fixture.org.ID, fixture.user.ID, fixture.account.ID, now, evidence,
 	)
