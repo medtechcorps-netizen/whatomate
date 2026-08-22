@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/stretchr/testify/require"
@@ -96,6 +97,168 @@ func OpenTestDBAsRole(t *testing.T, role, password string) *gorm.DB {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 	return db
+}
+
+// OpenIsolatedTestDatabaseOwnedByRole creates a disposable database whose
+// direct LOGIN owner is deliberately NOSUPERUSER. It is used for migration
+// authority tests that cannot be represented faithfully by SET ROLE or by the
+// superuser-owned shared CI database. It owns and removes both the disposable
+// database and its cluster-global runtime/owner roles in one cleanup.
+func OpenIsolatedTestDatabaseOwnedByRole(t *testing.T) (*gorm.DB, *gorm.DB, string, string) {
+	t.Helper()
+	clusterDB := SetupTestDB(t)
+	baseURL, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+	require.NoError(t, err)
+	require.NotEmpty(t, baseURL.Scheme, "TEST_DATABASE_URL must be a PostgreSQL URL")
+
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	ownerRole := "rereply_migration_" + suffix[:16]
+	runtimeRole := "rereply_compliance_test_" + suffix[:16]
+	databaseName := "rereply_compliance_" + suffix
+	ownerPassword := uuid.NewString() + uuid.NewString()
+
+	ownerRoleCreated := false
+	runtimeRoleCreated := false
+	databaseCreated := false
+	var ownerSQLDB interface{ Close() error }
+	var isolatedAdminSQLDB interface{ Close() error }
+	t.Cleanup(func() {
+		if ownerSQLDB != nil {
+			if closeErr := ownerSQLDB.Close(); closeErr != nil {
+				t.Errorf("close isolated migration-owner database: %v", closeErr)
+			}
+		}
+		if isolatedAdminSQLDB != nil {
+			if closeErr := isolatedAdminSQLDB.Close(); closeErr != nil {
+				t.Errorf("close isolated administrator database: %v", closeErr)
+			}
+		}
+		if databaseCreated {
+			if dropErr := clusterDB.Exec("DROP DATABASE IF EXISTS " + databaseName + " WITH (FORCE)").Error; dropErr != nil {
+				t.Errorf("drop isolated migration-owner database: %v", dropErr)
+			}
+		}
+		if runtimeRoleCreated {
+			if dropErr := clusterDB.Exec("DROP ROLE IF EXISTS " + runtimeRole).Error; dropErr != nil {
+				t.Errorf("drop isolated runtime role: %v", dropErr)
+			}
+		}
+		if ownerRoleCreated {
+			if dropErr := clusterDB.Exec("DROP ROLE IF EXISTS " + ownerRole).Error; dropErr != nil {
+				t.Errorf("drop isolated migration-owner role: %v", dropErr)
+			}
+		}
+	})
+
+	require.NoError(t, clusterDB.Exec(fmt.Sprintf(
+		"CREATE ROLE %s LOGIN PASSWORD %s NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION",
+		ownerRole,
+		quoteTestPostgresLiteral(ownerPassword),
+	)).Error)
+	ownerRoleCreated = true
+	require.NoError(t, clusterDB.Exec(
+		"CREATE ROLE "+runtimeRole+" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION",
+	).Error)
+	runtimeRoleCreated = true
+	require.NoError(t, clusterDB.Exec(
+		"CREATE DATABASE "+databaseName+" OWNER "+ownerRole,
+	).Error)
+	databaseCreated = true
+
+	baseURL.Path = "/" + databaseName
+	baseURL.RawPath = ""
+	query := baseURL.Query()
+	query.Set("statement_cache_capacity", "0")
+	query.Set("default_query_exec_mode", "describe_exec")
+	baseURL.RawQuery = query.Encode()
+	isolatedAdminDB, err := gorm.Open(postgres.Open(baseURL.String()), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	isolatedAdminSQLDB, err = isolatedAdminDB.DB()
+	require.NoError(t, err)
+
+	ownerURL := *baseURL
+	ownerURL.User = url.UserPassword(ownerRole, ownerPassword)
+	ownerDB, err := gorm.Open(postgres.Open(ownerURL.String()), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	sqlDB, err := ownerDB.DB()
+	require.NoError(t, err)
+	ownerSQLDB = sqlDB
+	require.NoError(t, runMigrations(ownerDB))
+	return ownerDB, isolatedAdminDB, ownerRole, runtimeRole
+}
+
+// OpenIsolatedTestDatabaseAsAdmin creates a disposable database using the
+// TEST_DATABASE_URL login itself. It exists only for negative authority tests
+// that must prove a table-owning superuser is rejected.
+func OpenIsolatedTestDatabaseAsAdmin(t *testing.T) (*gorm.DB, string) {
+	t.Helper()
+	clusterDB := SetupTestDB(t)
+	baseURL, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+	require.NoError(t, err)
+	require.NotEmpty(t, baseURL.Scheme, "TEST_DATABASE_URL must be a PostgreSQL URL")
+
+	var superuser bool
+	require.NoError(t, clusterDB.Raw(`
+		SELECT role.rolsuper
+		FROM pg_catalog.pg_roles AS role
+		WHERE role.rolname = current_user
+	`).Scan(&superuser).Error)
+	if !superuser {
+		t.Skip("negative migration-authority regression requires a disposable superuser test login")
+	}
+
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	databaseName := "rereply_superuser_" + suffix
+	runtimeRole := "rereply_compliance_runtime_" + suffix[:16]
+	require.NoError(t, clusterDB.Exec("CREATE DATABASE "+databaseName).Error)
+	databaseCreated := true
+	runtimeRoleCreated := false
+	var isolatedSQLDB interface{ Close() error }
+	t.Cleanup(func() {
+		if isolatedSQLDB != nil {
+			if closeErr := isolatedSQLDB.Close(); closeErr != nil {
+				t.Errorf("close isolated superuser database: %v", closeErr)
+			}
+		}
+		if databaseCreated {
+			if dropErr := clusterDB.Exec("DROP DATABASE IF EXISTS " + databaseName + " WITH (FORCE)").Error; dropErr != nil {
+				t.Errorf("drop isolated superuser database: %v", dropErr)
+			}
+		}
+		if runtimeRoleCreated {
+			if dropErr := clusterDB.Exec("DROP ROLE IF EXISTS " + runtimeRole).Error; dropErr != nil {
+				t.Errorf("drop isolated superuser-test runtime role: %v", dropErr)
+			}
+		}
+	})
+	require.NoError(t, clusterDB.Exec(
+		"CREATE ROLE "+runtimeRole+" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION",
+	).Error)
+	runtimeRoleCreated = true
+
+	baseURL.Path = "/" + databaseName
+	baseURL.RawPath = ""
+	query := baseURL.Query()
+	query.Set("statement_cache_capacity", "0")
+	query.Set("default_query_exec_mode", "describe_exec")
+	baseURL.RawQuery = query.Encode()
+	db, err := gorm.Open(postgres.Open(baseURL.String()), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	isolatedSQLDB = sqlDB
+	require.NoError(t, runMigrations(db))
+	return db, runtimeRole
+}
+
+func quoteTestPostgresLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 // SetupTestDBWithCleanup is like SetupTestDB but allows controlling cleanup behavior.

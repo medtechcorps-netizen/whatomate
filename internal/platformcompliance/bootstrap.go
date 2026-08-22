@@ -63,7 +63,9 @@ var (
 	ErrFootprintValidationFailed   = errors.New("cannot prove the organization has no clinic, channel, or customer data footprint")
 	ErrMigrationAuthorityRequired  = errors.New("database.migration_url must use the migration/table-owner authority")
 	ErrRemovalStillConfigured      = errors.New("compliance feature removal is blocked while release configuration still names the organization")
-	ErrPrivacyObligationActive     = errors.New("compliance feature removal is blocked by a nonterminal privacy obligation")
+	ErrInstagramEvidenceRetained   = errors.New("instagram compliance feature removal is permanently blocked by retained privacy evidence")
+	ErrCommitOutcomeIndeterminate  = errors.New("platform compliance apply commit outcome is indeterminate")
+	ErrDryRunFinalizationFailed    = errors.New("platform compliance dry-run transaction finalization failed")
 	ErrCreateWithRemoval           = errors.New("atomic purpose creation cannot be combined with feature removal")
 
 	operatorRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@/-]{7,95}$`)
@@ -146,7 +148,11 @@ type validatedReleaseReference struct {
 
 type migrationAuthority struct {
 	CurrentUser          string `gorm:"column:current_user_name"`
+	CurrentUserOID       int64  `gorm:"column:current_user_oid"`
 	SessionUser          string `gorm:"column:session_user_name"`
+	AuthenticatedUser    string `gorm:"column:authenticated_user_name"`
+	AuthenticatedUserOID int64  `gorm:"column:authenticated_user_oid"`
+	BackendRows          int64  `gorm:"column:backend_rows"`
 	Superuser            bool   `gorm:"column:superuser"`
 	OwnsOrganizations    bool   `gorm:"column:owns_organizations"`
 	OwnsAuditLogs        bool   `gorm:"column:owns_audit_logs"`
@@ -267,6 +273,7 @@ func Bootstrap(
 		txOptions = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 	}
 	var report Report
+	bodyCompleted := false
 	err = db.WithContext(boundedContext).Transaction(func(tx *gorm.DB) error {
 		// The search path pin must remain the first statement. Every subsequent
 		// control-plane query is also public-schema-qualified.
@@ -275,13 +282,30 @@ func Bootstrap(
 		}
 		var runErr error
 		report, runErr = bootstrapTransaction(tx, validated)
+		if runErr == nil {
+			bodyCompleted = true
+		}
 		return runErr
 	}, txOptions)
-	if err != nil {
-		return Report{}, err
+	if transactionErr := classifyBootstrapTransactionError(err, validated.apply, bodyCompleted); transactionErr != nil {
+		return Report{}, transactionErr
 	}
 	return report, nil
 }
+
+func classifyBootstrapTransactionError(err error, apply, bodyCompleted bool) error {
+	if err == nil {
+		return nil
+	}
+	if apply && bodyCompleted {
+		return ErrCommitOutcomeIndeterminate
+	}
+	if bodyCompleted {
+		return ErrDryRunFinalizationFailed
+	}
+	return err
+}
+
 func pinTransaction(tx *gorm.DB) error {
 	if tx == nil {
 		return errors.New("compliance bootstrap transaction is required")
@@ -718,9 +742,22 @@ func verifyMigrationAuthority(tx *gorm.DB) (migrationAuthority, error) {
 	}
 	var authority migrationAuthority
 	result := tx.Raw(`
+		WITH backend_identity AS (
+			SELECT
+				activity.usesysid::bigint AS authenticated_user_oid,
+				activity.usename::text AS authenticated_user_name
+			FROM pg_catalog.pg_stat_activity AS activity
+			WHERE activity.pid = pg_catalog.pg_backend_pid()
+		)
 		SELECT
 			current_user::text AS current_user_name,
+			role.oid::bigint AS current_user_oid,
 			session_user::text AS session_user_name,
+			COALESCE((SELECT authenticated_user_name FROM backend_identity), '')
+				AS authenticated_user_name,
+			COALESCE((SELECT authenticated_user_oid FROM backend_identity), 0)
+				AS authenticated_user_oid,
+			(SELECT COUNT(*)::bigint FROM backend_identity) AS backend_rows,
 			role.rolsuper AS superuser,
 			COALESCE((
 				SELECT relation.relowner = role.oid
@@ -752,12 +789,20 @@ func verifyMigrationAuthority(tx *gorm.DB) (migrationAuthority, error) {
 	if result.Error != nil {
 		return migrationAuthority{}, fmt.Errorf("verify migration authority: %w", result.Error)
 	}
-	if result.RowsAffected != 1 || authority.CurrentUser == "" ||
-		authority.SessionUser != authority.CurrentUser || !authority.OwnsOrganizations ||
-		!authority.OwnsAuditLogs || !authority.OwnsIdentityRegistry {
+	if result.RowsAffected != 1 || !validMigrationAuthority(authority) {
 		return migrationAuthority{}, ErrMigrationAuthorityRequired
 	}
 	return authority, nil
+}
+
+func validMigrationAuthority(authority migrationAuthority) bool {
+	return authority.CurrentUser != "" && authority.CurrentUserOID != 0 &&
+		authority.BackendRows == 1 &&
+		authority.AuthenticatedUser == authority.CurrentUser &&
+		authority.AuthenticatedUserOID == authority.CurrentUserOID &&
+		!authority.Superuser && authority.SessionUser == authority.CurrentUser &&
+		authority.OwnsOrganizations &&
+		authority.OwnsAuditLogs && authority.OwnsIdentityRegistry
 }
 
 func loadOrganization(
@@ -854,12 +899,11 @@ func validateFeatureRemovalSafety(tx *gorm.DB, options validatedOptions) error {
 		return nil
 	}
 
-	// Completed journals and bootstrap audit evidence remain admitted retention
-	// evidence. The approved privacy request shape is exact in_progress state,
-	// so it blocks removal here; terminal or malformed privacy rows, privacy
-	// jobs, retention policies, and legal holds already fail the authoritative
-	// footprint scan. The explicit queries remain a second fail-closed defense
-	// if the row-shape contract is revised later.
+	// Any admitted Instagram privacy evidence permanently binds the feature
+	// marker in this release. These rows are append-only and retained to serve
+	// signed status obligations, so a terminal-looking journal is not removal
+	// authority. Audit rows are intentionally excluded so a pristine staging
+	// organization can still exercise marker removal before its first receipt.
 	queries := []struct {
 		name  string
 		query string
@@ -868,34 +912,21 @@ func validateFeatureRemovalSafety(tx *gorm.DB, options validatedOptions) error {
 			name: "meta_instagram_data_deletion_events",
 			query: `SELECT EXISTS (
 				SELECT 1 FROM public.meta_instagram_data_deletion_events
-				WHERE organization_id = ? AND (state <> 'completed' OR completed_at IS NULL)
+				WHERE organization_id = ?
 			)`,
 		},
 		{
 			name: "privacy_requests",
 			query: `SELECT EXISTS (
 				SELECT 1 FROM public.privacy_requests
-				WHERE organization_id = ? AND (
-					status NOT IN ('completed', 'denied', 'canceled', 'expired')
-					OR (status = 'completed' AND completed_at IS NULL)
-				)
+				WHERE organization_id = ?
 			)`,
 		},
 		{
-			name: "privacy_jobs",
+			name: "privacy_request_events",
 			query: `SELECT EXISTS (
-				SELECT 1 FROM public.privacy_jobs
-				WHERE organization_id = ? AND (
-					status NOT IN ('succeeded', 'failed', 'canceled')
-					OR (status IN ('succeeded', 'failed', 'canceled') AND finished_at IS NULL)
-				)
-			)`,
-		},
-		{
-			name: "legal_holds",
-			query: `SELECT EXISTS (
-				SELECT 1 FROM public.legal_holds
-				WHERE organization_id = ? AND status = 'active'
+				SELECT 1 FROM public.privacy_request_events
+				WHERE organization_id = ?
 			)`,
 		},
 	}
@@ -905,7 +936,7 @@ func validateFeatureRemovalSafety(tx *gorm.DB, options validatedOptions) error {
 			return fmt.Errorf("verify %s removal obligations: %w", obligation.name, err)
 		}
 		if exists {
-			return fmt.Errorf("%w: %s", ErrPrivacyObligationActive, obligation.name)
+			return fmt.Errorf("%w: %s", ErrInstagramEvidenceRetained, obligation.name)
 		}
 	}
 	return nil

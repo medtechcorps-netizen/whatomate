@@ -299,16 +299,21 @@ Use this order:
 
    In isolated staging, operator-test both directions before rollout: provision
    the intended platform compliance organization and marker and confirm startup
-   passes. To test removal, first detach the UUID from the current Instagram
-   release configuration and settle all nonterminal callback/privacy work;
-   otherwise the command fails closed. Then dry-run and apply
+   passes. The marker-removal drill is valid only before the first
+   compliance-owned deletion receipt. Detach the UUID from the current
+   Instagram release configuration, then dry-run and apply
    `-remove-feature instagram` through the reviewed bootstrap command and
    confirm a fresh API/worker startup refuses to serve or claim work when the
-   release configuration is restored without its required marker.
-   Restore the marker and confirm startup passes again. Marker removal is an
-   emergency fail-closed proof, not an offboarding shortcut: quarantine and
-   settle every retained privacy obligation first, and do not remove the marker
-   from a running deployment merely to bypass cleanup.
+   release configuration is restored without its required marker. Restore the
+   marker and confirm startup passes again before testing any signed deletion
+   callback.
+
+   After the first compliance-owned deletion journal, privacy request, or
+   privacy event exists, the Instagram marker is permanent in this release,
+   including after a journal reaches `completed`. Normal shutdown quarantines
+   or disables ordinary product routing while retaining the marker and the
+   compatible signed callback/status responder. Never delete retained evidence
+   or remove the marker to bypass cleanup.
 
    Atomic purpose creation is permanent in this phase. The purpose organization cannot
    be deleted, archived, reparented, or unclassified; its admitted bootstrap,
@@ -377,15 +382,18 @@ Before rollback after any managed binding exists:
    scheduled `generating` job to finalize or terminally settle without replay;
 5. verify no active, pending, or degraded managed Instagram row is routable and
    no deletion/deauthorization journal entry remains unresolved; and
-6. collapse back to the legacy singleton only after every other clinic is
-   quarantined, drained, unsubscribed, and outside all callback/status retention
-   windows. Then disable the registry and managed-Instagram configuration and roll back
-   workers or relay readers. Leave the additive tenant-RLS journal table and
-   existing routing functions in place during the old-binary observation
-   window. Do not add the profile to `META_RELAY_ACCOUNTS_JSON` until managed
-   ingress is blocked, the provider subscription is reconciled, all managed
-   queues are drained or parked, and the managed binding is non-routable; once
-   re-added, the static mapping wins on every replica.
+6. collapse back to the legacy singleton and disable the registry/managed
+   configuration only if no compliance-owned receipt ever existed and every
+   ordinary clinic is quarantined, drained, unsubscribed, and outside all
+   callback/status retention windows. After any compliance-owned evidence,
+   keep `quarantine_only=true`, the registry, exact app, organization set, and
+   compliance binding enabled so this release can continue serving the signed
+   callback/status contract. A future responder handoff requires separate
+   implementation and review; it does not exist in this release. Do not add a
+   profile to `META_RELAY_ACCOUNTS_JSON` until managed ingress is blocked, its
+   provider subscription is reconciled, all managed queues are drained or
+   parked, and the managed binding is non-routable; once re-added, the static
+   mapping wins on every replica.
 
 A pre-purpose/auth-guard web binary is never a valid rollback target after
 atomic purpose creation, even if no feature marker or unresolved workflow
@@ -393,9 +401,9 @@ remains. The purpose marker is immutable, admitted evidence is not purgeable in
 this phase, and `RemoveTenantRLS` remains blocked while the purpose organization
 exists. Keep every tenant reader and writer on a guard-aware release. A
 managed-Instagram feature rollback may disable its release configuration only
-while retaining those application guards, the additive database barriers, and
-a compatible responder for the signed callback and every retained confirmation
-URL.
+before any compliance-owned receipt exists. Otherwise it must retain the
+quarantine-only responder configuration described above, together with the
+application guards and additive database barriers.
 
 An old singleton binary is also not a valid rollback target after a second
 clinic has been added or a compliance-owned request exists. Keep a compatible

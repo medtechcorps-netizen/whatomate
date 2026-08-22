@@ -35,6 +35,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"github.com/zerodha/logf"
+	"gorm.io/gorm"
 )
 
 var (
@@ -144,6 +145,9 @@ type platformComplianceBootstrapArgs struct {
 }
 
 func parsePlatformComplianceBootstrapArgs(args []string) (platformComplianceBootstrapArgs, error) {
+	if err := validatePlatformComplianceBootstrapFlagGrammar(args); err != nil {
+		return platformComplianceBootstrapArgs{}, err
+	}
 	bootstrapFlags := flag.NewFlagSet("bootstrap-platform-compliance", flag.ContinueOnError)
 	bootstrapFlags.SetOutput(io.Discard)
 	configPath := bootstrapFlags.String("config", "config.toml", "Path to config file")
@@ -180,6 +184,64 @@ func parsePlatformComplianceBootstrapArgs(args []string) (platformComplianceBoot
 		return platformComplianceBootstrapArgs{}, err
 	}
 	return parsed, nil
+}
+
+func validatePlatformComplianceBootstrapFlagGrammar(args []string) error {
+	singletons := map[string]bool{
+		"config": true, "organization-id": true, "operator-run-id": true,
+		"create-purpose": true, "apply": true,
+	}
+	booleans := map[string]bool{"create-purpose": true, "apply": true}
+	values := map[string]bool{
+		"config": true, "organization-id": true, "operator-run-id": true,
+		"feature": true, "remove-feature": true,
+	}
+	seen := make(map[string]bool, len(singletons))
+
+	for index := 0; index < len(args); index++ {
+		argument := args[index]
+		if argument == "--" {
+			return errors.New("flag terminator is not accepted")
+		}
+		if !strings.HasPrefix(argument, "-") || argument == "-" {
+			return errors.New("positional arguments are not accepted")
+		}
+		if strings.HasPrefix(argument, "--") {
+			return errors.New("flags require the canonical single-hyphen spelling")
+		}
+
+		body := strings.TrimPrefix(argument, "-")
+		if body == "" || strings.HasPrefix(body, "-") {
+			return errors.New("invalid flag spelling")
+		}
+		name, inlineValue, hasInlineValue := strings.Cut(body, "=")
+		if singletons[name] {
+			if seen[name] {
+				return fmt.Errorf("flag -%s may be specified only once", name)
+			}
+			seen[name] = true
+		}
+
+		switch {
+		case booleans[name]:
+			if hasInlineValue && inlineValue != "true" && inlineValue != "false" {
+				return fmt.Errorf("flag -%s accepts only true or false", name)
+			}
+		case values[name]:
+			if hasInlineValue {
+				if strings.TrimSpace(inlineValue) == "" {
+					return fmt.Errorf("flag -%s requires a value", name)
+				}
+				continue
+			}
+			if index+1 >= len(args) || strings.TrimSpace(args[index+1]) == "" ||
+				strings.HasPrefix(args[index+1], "-") {
+				return fmt.Errorf("flag -%s requires a value", name)
+			}
+			index++
+		}
+	}
+	return nil
 }
 
 func validatePlatformComplianceBootstrapMode(parsed platformComplianceBootstrapArgs) error {
@@ -268,7 +330,7 @@ func runParsedPlatformComplianceBootstrap(parsed platformComplianceBootstrapArgs
 		},
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Platform compliance bootstrap failed: %v; no changes were committed.\n", err)
+		fmt.Fprintln(os.Stderr, platformComplianceBootstrapFailureMessage(err, parsed.apply))
 		os.Exit(1)
 	}
 
@@ -288,11 +350,88 @@ func runParsedPlatformComplianceBootstrap(parsed platformComplianceBootstrapArgs
 	)
 }
 
+func platformComplianceBootstrapFailureMessage(err error, apply bool) string {
+	if errors.Is(err, platformcompliance.ErrCommitOutcomeIndeterminate) {
+		return "Platform compliance bootstrap apply outcome is indeterminate: the database may have committed. Rerun the identical reviewed command with the same organization UUID, operator run ID, feature operations, and -apply before taking any other action."
+	}
+	if apply {
+		return fmt.Sprintf(
+			"Platform compliance bootstrap failed: %v; the transaction was rolled back and no changes were committed.",
+			err,
+		)
+	}
+	return fmt.Sprintf(
+		"Platform compliance bootstrap dry run failed: %v; the dry run requested no database changes.",
+		err,
+	)
+}
+
 func boolCount(value bool) int {
 	if value {
 		return 1
 	}
 	return 0
+}
+
+type startupDatabaseContract uint8
+
+const (
+	startupDatabaseContractNone startupDatabaseContract = iota
+	startupDatabaseContractPlatformCompliance
+	startupDatabaseContractTenantRLS
+)
+
+func requiredStartupDatabaseContract(cfg *config.Config) startupDatabaseContract {
+	if cfg == nil {
+		return startupDatabaseContractNone
+	}
+	if cfg.Database.RLSEnabled {
+		return startupDatabaseContractTenantRLS
+	}
+	if cfg.MetaInstagram.Enabled || cfg.ThreadsManaged.Enabled {
+		return startupDatabaseContractPlatformCompliance
+	}
+	return startupDatabaseContractNone
+}
+
+func validateServerMigrationMode(cfg *config.Config, migrate bool) error {
+	if !migrate {
+		return nil
+	}
+	switch requiredStartupDatabaseContract(cfg) {
+	case startupDatabaseContractNone:
+		return nil
+	case startupDatabaseContractTenantRLS:
+		return errors.New("server -migrate is not allowed when tenant RLS is required; run the rls-migrate pre-deploy command")
+	case startupDatabaseContractPlatformCompliance:
+		return errors.New("server -migrate is not allowed when platform compliance guards are required; run the rls-migrate pre-deploy command")
+	default:
+		return errors.New("server -migrate is not allowed when a runtime database contract is required; run the rls-migrate pre-deploy command")
+	}
+}
+
+func verifyStartupDatabaseContract(
+	db *gorm.DB,
+	cfg *config.Config,
+) (startupDatabaseContract, error) {
+	if cfg == nil {
+		return startupDatabaseContractNone, errors.New("startup database configuration is required")
+	}
+	contract := requiredStartupDatabaseContract(cfg)
+	if contract != startupDatabaseContractNone && db == nil {
+		return contract, errors.New("startup database connection is required")
+	}
+	switch contract {
+	case startupDatabaseContractTenantRLS:
+		return contract, database.VerifyTenantRLS(db, cfg.Database.RuntimeRole)
+	case startupDatabaseContractPlatformCompliance:
+		return contract, database.VerifyPlatformComplianceGuardContract(
+			db,
+			cfg.Database.RuntimeRole,
+		)
+	default:
+		return contract, nil
+	}
 }
 
 // ============================================================================
@@ -469,8 +608,8 @@ func runServer(args []string) {
 	if err != nil {
 		lo.Fatal("Failed to load config", "error", err)
 	}
-	if cfg.Database.RLSEnabled && *migrate {
-		lo.Fatal("server -migrate is not allowed when database.rls_enabled=true; run the rls-migrate pre-deploy command")
+	if err := validateServerMigrationMode(cfg, *migrate); err != nil {
+		lo.Fatal(err.Error())
 	}
 
 	// Validate JWT secret
@@ -506,11 +645,15 @@ func runServer(args []string) {
 		lo.Fatal("Failed to connect to database", "error", err)
 	}
 	lo.Info("Connected to PostgreSQL")
-	if cfg.Database.RLSEnabled {
-		if err := database.VerifyTenantRLS(db, cfg.Database.RuntimeRole); err != nil {
-			lo.Fatal("PostgreSQL tenant RLS verification failed", "error", err)
-		}
+	startupContract, err := verifyStartupDatabaseContract(db, cfg)
+	if err != nil {
+		lo.Fatal("PostgreSQL runtime contract verification failed", "error", err)
+	}
+	switch startupContract {
+	case startupDatabaseContractTenantRLS:
 		lo.Info("PostgreSQL tenant RLS verified", "runtime_role", cfg.Database.RuntimeRole)
+	case startupDatabaseContractPlatformCompliance:
+		lo.Info("PostgreSQL platform compliance guards verified", "runtime_role", cfg.Database.RuntimeRole)
 	}
 
 	// Run migrations if requested
@@ -891,11 +1034,15 @@ func runWorker(args []string) {
 		lo.Fatal("Failed to connect to database", "error", err)
 	}
 	lo.Info("Connected to PostgreSQL")
-	if cfg.Database.RLSEnabled {
-		if err := database.VerifyTenantRLS(db, cfg.Database.RuntimeRole); err != nil {
-			lo.Fatal("PostgreSQL tenant RLS verification failed", "error", err)
-		}
+	startupContract, err := verifyStartupDatabaseContract(db, cfg)
+	if err != nil {
+		lo.Fatal("PostgreSQL runtime contract verification failed", "error", err)
+	}
+	switch startupContract {
+	case startupDatabaseContractTenantRLS:
 		lo.Info("PostgreSQL tenant RLS verified", "runtime_role", cfg.Database.RuntimeRole)
+	case startupDatabaseContractPlatformCompliance:
+		lo.Info("PostgreSQL platform compliance guards verified", "runtime_role", cfg.Database.RuntimeRole)
 	}
 	// Worker-only deployments must cross the same synchronous database barrier
 	// before constructing a worker or claiming any queued delivery/generation.

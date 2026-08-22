@@ -2,6 +2,7 @@ package platformcompliance
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,46 @@ import (
 )
 
 const testOperatorRunID = "arham:review-20260821-001"
+
+func TestClassifyBootstrapTransactionError(t *testing.T) {
+	t.Parallel()
+
+	cause := errors.New("database operation failed")
+	assert.NoError(t, classifyBootstrapTransactionError(nil, true, true))
+	assert.Same(t, cause, classifyBootstrapTransactionError(cause, true, false))
+	applyErr := classifyBootstrapTransactionError(
+		errors.New("postgres://secret-user:secret-password@example.invalid/database"),
+		true,
+		true,
+	)
+	assert.ErrorIs(t, applyErr, ErrCommitOutcomeIndeterminate)
+	assert.NotContains(t, applyErr.Error(), "secret-password")
+	dryRunErr := classifyBootstrapTransactionError(
+		errors.New("postgres://secret-user:secret-password@example.invalid/database"),
+		false,
+		true,
+	)
+	assert.ErrorIs(t, dryRunErr, ErrDryRunFinalizationFailed)
+	assert.NotContains(t, dryRunErr.Error(), "secret-password")
+}
+
+func TestValidMigrationAuthorityRejectsSuperuser(t *testing.T) {
+	t.Parallel()
+
+	valid := migrationAuthority{
+		CurrentUser: "rereply_migration", CurrentUserOID: 101,
+		SessionUser:       "rereply_migration",
+		AuthenticatedUser: "rereply_migration", AuthenticatedUserOID: 101,
+		BackendRows:       1,
+		OwnsOrganizations: true, OwnsAuditLogs: true, OwnsIdentityRegistry: true,
+	}
+	assert.True(t, validMigrationAuthority(valid))
+	valid.Superuser = true
+	assert.False(t, validMigrationAuthority(valid))
+	valid.Superuser = false
+	valid.AuthenticatedUser = "postgres"
+	assert.False(t, validMigrationAuthority(valid))
+}
 
 func TestValidateOptionsRequiresCanonicalIndependentFeaturesAndClinicSeparation(t *testing.T) {
 	organizationID := uuid.New()
@@ -297,6 +338,115 @@ func TestBootstrapFeatureMarkersAreIndependentAuditedAndRemovalSafe(t *testing.T
 	assert.False(t, threadsExists)
 }
 
+func TestBootstrapInstagramRemovalBecomesPermanentAfterFirstRetainedReceipt(t *testing.T) {
+	db, runtimeRole := preparePlatformComplianceRLS(t)
+	organizationID := uuid.New()
+	_, err := Bootstrap(context.Background(), db, Options{
+		OrganizationID: organizationID.String(), CreatePurpose: true,
+		Features: []Feature{FeatureInstagram}, OperatorRunID: testOperatorRunID,
+		RuntimeRole: runtimeRole, Apply: true,
+	})
+	require.NoError(t, err)
+
+	remove := Options{
+		OrganizationID: organizationID.String(), RemoveFeatures: []Feature{FeatureInstagram},
+		OperatorRunID: "arham:review-20260821-pristine-remove", RuntimeRole: runtimeRole, Apply: true,
+	}
+	_, err = Bootstrap(context.Background(), db, remove)
+	require.NoError(t, err, "a pristine pre-receipt staging marker remains removable")
+
+	_, err = Bootstrap(context.Background(), db, Options{
+		OrganizationID: organizationID.String(), Features: []Feature{FeatureInstagram},
+		OperatorRunID: "arham:review-20260821-restore-instagram", RuntimeRole: runtimeRole, Apply: true,
+	})
+	require.NoError(t, err)
+	assertAuditCount(t, db, organizationID, 3)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	journal := models.MetaInstagramDataDeletionEvent{
+		Digest: strings.Repeat("1", 64), PlatformAppID: strings.Repeat("2", 64),
+		AuthorizingUserID: strings.Repeat("3", 64), IssuedAt: now.Add(-time.Minute),
+		VerifiedAt: now, State: "verified", OrganizationID: organizationID,
+		TargetResolution: "no_current_target", IdentityHashed: true, LastAttemptAt: &now,
+	}
+	require.NoError(t, db.Create(&journal).Error)
+
+	remove.OperatorRunID = "arham:review-20260821-remove-after-receipt"
+	_, err = Bootstrap(context.Background(), db, remove)
+	assert.ErrorIs(t, err, ErrInstagramEvidenceRetained)
+	assertAuditCount(t, db, organizationID, 3)
+	assertInstagramMarker(t, db, organizationID, true)
+
+	requestID := uuid.New()
+	requestNumber := "IGDEL" + strings.ToUpper(strings.ReplaceAll(requestID.String(), "-", ""))
+	request := models.PrivacyRequest{
+		BaseModel: models.BaseModel{ID: requestID}, OrganizationID: organizationID,
+		RequestNumber: requestNumber, Type: models.PrivacyRequestTypeDeletion,
+		Status: models.PrivacyRequestStatusInProgress, SubjectType: "instagram_profile",
+		SubjectKey: journal.AuthorizingUserID, ReceivedChannel: "instagram",
+		RequesterProfile: models.JSONB{}, RequestDetails: models.JSONB{
+			"source": "meta_instagram_managed_login", "target_resolution": "no_current_target",
+			"requires_manual_resolution": false,
+		},
+		VerificationMethod:    "meta_instagram_signed_request",
+		VerificationTokenHash: strings.Repeat("4", 64), ReceivedAt: now,
+		DueAt: now.Add(30 * 24 * time.Hour), VerifiedAt: &now,
+	}
+	require.NoError(t, db.Create(&request).Error)
+	completedAt := now.Add(time.Second)
+	require.NoError(t, db.Exec(`
+		UPDATE public.meta_instagram_data_deletion_events
+		SET state = 'completed', privacy_request_id = ?, request_number = ?,
+			completed_at = ?, last_attempt_at = ?
+		WHERE digest = ?
+	`, request.ID, request.RequestNumber, completedAt, completedAt, journal.Digest).Error)
+
+	remove.OperatorRunID = "arham:review-20260821-remove-completed-receipt"
+	_, err = Bootstrap(context.Background(), db, remove)
+	assert.ErrorIs(t, err, ErrInstagramEvidenceRetained)
+	assertAuditCount(t, db, organizationID, 3)
+	assertInstagramMarker(t, db, organizationID, true)
+}
+
+func TestBootstrapInstagramRemovalRejectsRetainedPrivacyRequestWithoutJournal(t *testing.T) {
+	db, runtimeRole := preparePlatformComplianceRLS(t)
+	organizationID := uuid.New()
+	_, err := Bootstrap(context.Background(), db, Options{
+		OrganizationID: organizationID.String(), CreatePurpose: true,
+		Features: []Feature{FeatureInstagram}, OperatorRunID: testOperatorRunID,
+		RuntimeRole: runtimeRole, Apply: true,
+	})
+	require.NoError(t, err)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	requestID := uuid.New()
+	request := models.PrivacyRequest{
+		BaseModel: models.BaseModel{ID: requestID}, OrganizationID: organizationID,
+		RequestNumber: "IGDEL" + strings.ToUpper(strings.ReplaceAll(requestID.String(), "-", "")),
+		Type:          models.PrivacyRequestTypeDeletion, Status: models.PrivacyRequestStatusInProgress,
+		SubjectType: "instagram_profile", SubjectKey: strings.Repeat("5", 64),
+		ReceivedChannel: "instagram", RequesterProfile: models.JSONB{},
+		RequestDetails: models.JSONB{
+			"source": "meta_instagram_managed_login", "target_resolution": "no_current_target",
+			"requires_manual_resolution": false,
+		},
+		VerificationMethod:    "meta_instagram_signed_request",
+		VerificationTokenHash: strings.Repeat("6", 64), ReceivedAt: now,
+		DueAt: now.Add(30 * 24 * time.Hour), VerifiedAt: &now,
+	}
+	require.NoError(t, db.Create(&request).Error)
+
+	_, err = Bootstrap(context.Background(), db, Options{
+		OrganizationID: organizationID.String(), RemoveFeatures: []Feature{FeatureInstagram},
+		OperatorRunID: "arham:review-20260821-remove-privacy-only",
+		RuntimeRole:   runtimeRole, Apply: true,
+	})
+	assert.ErrorIs(t, err, ErrInstagramEvidenceRetained)
+	assert.Contains(t, err.Error(), "privacy_requests")
+	assertAuditCount(t, db, organizationID, 1)
+	assertInstagramMarker(t, db, organizationID, true)
+}
+
 func TestBootstrapClinicCollisionIsReadOnlyAndFailClosed(t *testing.T) {
 	db, runtimeRole := preparePlatformComplianceRLS(t)
 	organizationID := uuid.New()
@@ -357,20 +507,72 @@ func TestBootstrapRejectsGuardDriftWithoutCreationOrAudit(t *testing.T) {
 	}
 }
 
-func preparePlatformComplianceRLS(t *testing.T) (*gorm.DB, string) {
-	t.Helper()
-	db := testutil.SetupTestDB(t)
-	testutil.TruncateTables(db)
-	require.NoError(t, database.RemoveTenantRLS(db))
-	runtimeRole := "rereply_compliance_test_" + strings.ReplaceAll(uuid.NewString()[:8], "-", "")
-	require.NoError(t, db.Exec(
-		"CREATE ROLE "+runtimeRole+" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS",
-	).Error)
+func TestBootstrapRejectsDirectTableOwningSuperuserWithoutMutation(t *testing.T) {
+	db, runtimeRole := testutil.OpenIsolatedTestDatabaseAsAdmin(t)
 	t.Cleanup(func() {
 		testutil.TruncateTables(db)
-		require.NoError(t, database.RemoveTenantRLS(db))
-		require.NoError(t, db.Exec("DROP OWNED BY "+runtimeRole).Error)
-		require.NoError(t, db.Exec("DROP ROLE IF EXISTS "+runtimeRole).Error)
+		if err := database.RemoveTenantRLS(db); err != nil {
+			t.Errorf("remove tenant RLS from isolated superuser database: %v", err)
+		}
+	})
+	require.NoError(t, database.ApplyTenantRLS(db, runtimeRole))
+	createPlatformReseller(t, db)
+
+	organizationID := uuid.New()
+	_, err := Bootstrap(context.Background(), db, Options{
+		OrganizationID: organizationID.String(), CreatePurpose: true,
+		Features: []Feature{FeatureInstagram}, OperatorRunID: testOperatorRunID,
+		RuntimeRole: runtimeRole, Apply: true,
+	})
+	assert.ErrorIs(t, err, ErrMigrationAuthorityRequired)
+	assertOrganizationAbsent(t, db, organizationID)
+	assertAuditCount(t, db, organizationID, 0)
+}
+
+func TestBootstrapRejectsSuperuserAuthenticatedBackendAfterSessionAuthorizationSpoof(t *testing.T) {
+	db, adminDB, ownerRole, runtimeRole := testutil.OpenIsolatedTestDatabaseOwnedByRole(t)
+	t.Cleanup(func() {
+		testutil.TruncateTables(db)
+		if err := database.RemoveTenantRLS(db); err != nil {
+			t.Errorf("remove tenant RLS from isolated migration-owner database: %v", err)
+		}
+	})
+	require.NoError(t, database.ApplyTenantRLS(db, runtimeRole))
+	createPlatformReseller(t, db)
+
+	organizationID := uuid.New()
+	var bootstrapErr error
+	require.NoError(t, adminDB.Connection(func(connection *gorm.DB) (callbackErr error) {
+		if err := connection.Exec("SET SESSION AUTHORIZATION " + ownerRole).Error; err != nil {
+			return err
+		}
+		defer func() {
+			if resetErr := connection.Exec("RESET SESSION AUTHORIZATION").Error; resetErr != nil {
+				callbackErr = errors.Join(callbackErr, resetErr)
+			}
+		}()
+		_, bootstrapErr = Bootstrap(context.Background(), connection, Options{
+			OrganizationID: organizationID.String(), CreatePurpose: true,
+			Features: []Feature{FeatureInstagram}, OperatorRunID: testOperatorRunID,
+			RuntimeRole: runtimeRole, Apply: true,
+		})
+		return nil
+	}))
+	assert.ErrorIs(t, bootstrapErr, ErrMigrationAuthorityRequired)
+	assertOrganizationAbsent(t, db, organizationID)
+	assertAuditCount(t, db, organizationID, 0)
+}
+
+func preparePlatformComplianceRLS(t *testing.T) (*gorm.DB, string) {
+	t.Helper()
+	db, _, _, runtimeRole := testutil.OpenIsolatedTestDatabaseOwnedByRole(t)
+	testutil.TruncateTables(db)
+	require.NoError(t, database.RemoveTenantRLS(db))
+	t.Cleanup(func() {
+		testutil.TruncateTables(db)
+		if err := database.RemoveTenantRLS(db); err != nil {
+			t.Errorf("remove tenant RLS from isolated migration-owner database: %v", err)
+		}
 	})
 	require.NoError(t, database.ApplyTenantRLS(db, runtimeRole))
 	createPlatformReseller(t, db)
@@ -409,4 +611,15 @@ func assertAuditCount(t *testing.T, db *gorm.DB, organizationID uuid.UUID, want 
 		Where("organization_id = ? AND resource_type = ?", organizationID, auditResourceType).
 		Count(&count).Error)
 	assert.Equal(t, want, count)
+}
+
+func assertInstagramMarker(t *testing.T, db *gorm.DB, organizationID uuid.UUID, want bool) {
+	t.Helper()
+	var enabled bool
+	require.NoError(t, db.Raw(`
+		SELECT COALESCE(settings -> 'meta_instagram_data_deletion_compliance_tenant' = 'true'::jsonb, false)
+		FROM public.organizations
+		WHERE id = ?
+	`, organizationID).Scan(&enabled).Error)
+	assert.Equal(t, want, enabled)
 }

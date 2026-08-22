@@ -74,6 +74,14 @@ The command pins `search_path` to `pg_catalog, public`, bounds connection and
 command execution, applies lock and statement timeouts, and never logs a DSN or
 secret.
 
+Command syntax is deliberately narrow. Spell every flag with one leading
+hyphen. Supply each of `-config`, `-organization-id`, `-operator-run-id`,
+`-create-purpose`, and `-apply` at most once. Boolean flags are accepted only
+as a bare flag or with exact `=true` or `=false`; aliases such as `=1`, `=t`,
+uppercase values, separate boolean values, `--`, and positional arguments are
+rejected before configuration or database access. Only `-feature` and
+`-remove-feature` may repeat.
+
 ## Trust boundary
 
 This release treats the direct migration/table owner as a trusted deployment
@@ -159,10 +167,13 @@ rereply bootstrap-platform-compliance `
 ```
 
 Apply only after the dry-run succeeds. Removal fails while the current release
-configuration still names the organization for that product. Instagram
-removal additionally fails while a nonterminal deletion/privacy obligation
-exists. Retained audit, privacy, and deletion evidence is not deleted by marker
-removal and is not purgeable in this phase.
+configuration still names the organization for that product. The Instagram
+marker is removable only from a pristine pre-receipt organization; operational
+policy reserves the removal drill for isolated staging.
+After the first compliance-owned deletion journal, privacy request, or privacy
+event exists, the Instagram marker is permanent in this release regardless of
+workflow state or retention age. Retained audit, privacy, and deletion evidence
+is never deletion authority and is not purgeable in this phase.
 
 The purpose marker itself cannot be removed. A purpose organization cannot be
 archived, reparented, renamed, rewritten, hard-deleted, or reused. There is no
@@ -216,19 +227,25 @@ cannot be purged to make rollback appear safe.
 
 Application product configuration may be rolled back only after its marker
 removal gates pass and a compatible responder remains available for every
-retained callback/status obligation. Do not delete audit/privacy rows, change
-reserved JSON directly, disable triggers, edit RLS policies, or recreate an
-organization under another path to force a rollback.
+retained callback/status obligation. Once Instagram evidence exists, retain
+the marker and the signed callback/status responder; quarantine or disable
+ordinary product routing instead of attempting marker removal. Do not delete
+audit/privacy rows, change reserved JSON directly, disable triggers, edit RLS
+policies, or recreate an organization under another path to force a rollback.
 
 ## Failure handling
 
 Dry-run is read-only: it takes no row lock, writes no audit, and creates no
-organization. Apply is a single PostgreSQL transaction. If creator validation,
-the strict insert, the creation audit trigger, or commit fails, no purpose row
-or audit evidence commits. There is no Redis or external serving-fleet state to
-recover.
+organization. Apply is a single PostgreSQL transaction. Validation, statement,
+trigger, and other transaction-body failures roll back definitively. If the
+transaction body succeeds but the client loses the COMMIT acknowledgement, the
+outcome is indeterminate: PostgreSQL may have committed even though the command
+returned an error. There is no Redis or external serving-fleet state to recover.
 
-On any failure, retain the exact error and reviewed run ID, verify the normal
-guard contract and current database identity, and retry only the same reviewed
-operation after correcting the root cause. Do not use ad-hoc SQL or manually
-weaken a guard to salvage a UUID.
+For an indeterminate outcome, rerun the identical reviewed command with the
+same UUID, operator run ID, feature operations, and `-apply` before taking any
+other action. The exact idempotence checks reconcile a committed result or
+permit the rolled-back operation to run. For any other failure, retain the
+reviewed run ID, verify the normal guard contract and current database identity,
+and retry only after correcting the root cause. Do not use ad-hoc SQL or
+manually weaken a guard to salvage a UUID.
