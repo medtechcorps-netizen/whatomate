@@ -41,7 +41,8 @@ var retiredManagerSettingsPermissions = map[string]struct{}{
 // non-manager system roles, and all other permissions are deliberately ignored.
 func ApplyManagerSettingsPolicyMigration(db *gorm.DB) error {
 	var organizationIDs []uuid.UUID
-	if err := db.Model(&models.Organization{}).Pluck("id", &organizationIDs).Error; err != nil {
+	if err := db.Scopes(ExcludePlatformComplianceOrganizations).
+		Model(&models.Organization{}).Pluck("id", &organizationIDs).Error; err != nil {
 		return fmt.Errorf("list organizations for manager settings policy: %w", err)
 	}
 

@@ -8,6 +8,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/access"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -36,6 +37,35 @@ type JWTClaims struct {
 	RoleID         *uuid.UUID `json:"role_id,omitempty"`
 	IsSuperAdmin   bool       `json:"is_super_admin"`
 	jwt.RegisteredClaims
+}
+
+const (
+	// JWTSubjectAccess, JWTSubjectRefresh, and JWTSubjectWebSocket bind a JWT
+	// to exactly one authentication surface. Empty-subject compatibility is
+	// intentionally limited to the legacy shapes accepted below so rolling
+	// deployments do not turn refresh or WebSocket credentials into API access.
+	JWTSubjectAccess    = "access"
+	JWTSubjectRefresh   = "refresh"
+	JWTSubjectWebSocket = "ws"
+)
+
+// IsAccessJWTClaims accepts newly typed access tokens and the one legacy
+// access-token shape: no subject and no JTI. A legacy token with a JTI is a
+// refresh credential and must never authenticate an API request.
+func IsAccessJWTClaims(claims *JWTClaims) bool {
+	if claims == nil {
+		return false
+	}
+	return claims.Subject == JWTSubjectAccess || (claims.Subject == "" && claims.ID == "")
+}
+
+// IsRefreshJWTClaims accepts newly typed refresh tokens and the legacy refresh
+// shape, but always requires a JTI so every accepted credential is single-use.
+func IsRefreshJWTClaims(claims *JWTClaims) bool {
+	if claims == nil || claims.ID == "" {
+		return false
+	}
+	return claims.Subject == JWTSubjectRefresh || claims.Subject == ""
 }
 
 // RequestLogger logs incoming requests
@@ -182,6 +212,10 @@ func AuthWithDB(secret string, db *gorm.DB) fastglue.FastMiddleware {
 			_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid token claims", nil, "")
 			return nil
 		}
+		if !IsAccessJWTClaims(claims) {
+			_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid access token", nil, "")
+			return nil
+		}
 
 		if db != nil {
 			if !setAuthenticatedContext(r, db, claims.UserID, claims.OrganizationID) {
@@ -223,6 +257,10 @@ func setAuthenticatedContext(r *fastglue.Request, db *gorm.DB, userID, orgID uui
 
 	var org models.Organization
 	if err := db.Where("id = ?", orgID).First(&org).Error; err != nil {
+		return false
+	}
+	isPlatformCompliance, err := database.IsPlatformComplianceOrganization(db, orgID)
+	if err != nil || isPlatformCompliance {
 		return false
 	}
 

@@ -1284,7 +1284,7 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		verifyClean(t)
 	})
 
-	t.Run("Verify permits an absent migration policy", func(t *testing.T) {
+	t.Run("Verify rejects an absent migration policy required by compliance guards", func(t *testing.T) {
 		restored := false
 		t.Cleanup(func() {
 			if restored {
@@ -1301,7 +1301,15 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		require.NoError(t, adminDB.Exec(
 			"DROP POLICY rereply_migration_access ON public.contacts",
 		).Error)
-		verifyClean(t)
+		err := runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "platform compliance write guard is incomplete")
 		require.NoError(t, adminDB.Exec(
 			"CREATE POLICY rereply_migration_access ON public.contacts TO "+migration+
 				" USING (true) WITH CHECK (true)",
@@ -1387,18 +1395,16 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		verifyClean(t)
 	})
 
-	t.Run("Remove drops public policies and fingerprint under a pg_catalog-first search path", func(t *testing.T) {
+	t.Run("Remove rejects nested transactions then drops policies and fingerprint", func(t *testing.T) {
 		var remainingPolicies int64
 		var fingerprintExists bool
 		var contactsRLSEnabled bool
-		require.NoError(t, adminDB.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Exec("SET LOCAL search_path = pg_catalog, public").Error; err != nil {
-				return err
-			}
-			if err := database.RemoveTenantRLS(tx); err != nil {
-				return err
-			}
-			if err := tx.Raw(`
+		err := adminDB.Transaction(func(tx *gorm.DB) error {
+			return database.RemoveTenantRLS(tx)
+		})
+		require.ErrorIs(t, err, database.ErrTenantRLSRemovalTransaction)
+		require.NoError(t, database.RemoveTenantRLS(adminDB))
+		require.NoError(t, adminDB.Raw(`
 				SELECT COUNT(*)::bigint
 				FROM pg_catalog.pg_policy AS policy
 				JOIN pg_catalog.pg_class AS policy_table
@@ -1410,25 +1416,20 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 					'rereply_tenant_isolation',
 					'rereply_migration_access'
 				  )
-			`).Scan(&remainingPolicies).Error; err != nil {
-				return err
-			}
-			if err := tx.Raw(`
+			`).Scan(&remainingPolicies).Error)
+		require.NoError(t, adminDB.Raw(`
 				SELECT to_regprocedure(
 					'public.rereply_tenant_policy_fingerprint()'
 				) IS NOT NULL
-			`).Scan(&fingerprintExists).Error; err != nil {
-				return err
-			}
-			return tx.Raw(`
+			`).Scan(&fingerprintExists).Error)
+		require.NoError(t, adminDB.Raw(`
 				SELECT relation.relrowsecurity
 				FROM pg_catalog.pg_class AS relation
 				JOIN pg_catalog.pg_namespace AS schema
 				  ON schema.oid = relation.relnamespace
 				WHERE schema.nspname = 'public'
 				  AND relation.relname = 'contacts'
-			`).Scan(&contactsRLSEnabled).Error
-		}))
+			`).Scan(&contactsRLSEnabled).Error)
 		require.Zero(t, remainingPolicies)
 		require.False(t, fingerprintExists)
 		require.False(t, contactsRLSEnabled)
@@ -1937,7 +1938,6 @@ func TestTenantRLS_FailsClosedAcrossOrganizations(t *testing.T) {
 			return database.WithTenant(runtimeDB, organizationID, fn)
 		})
 	}
-
 	t.Run("runtime startup verification accepts only the restricted role", func(t *testing.T) {
 		require.Error(t, database.VerifyTenantRLS(adminDB, runtimeRole))
 		require.NoError(t, asRuntime(func(runtimeDB *gorm.DB) error {

@@ -50,3 +50,37 @@ func TestEveryMigratedOrganizationModelIsRegisteredForTenantRLS(t *testing.T) {
 		)
 	}
 }
+
+func TestPlatformComplianceRegistryCoversEveryOrganizationScopedTable(t *testing.T) {
+	t.Parallel()
+
+	rules, err := PlatformComplianceTableRules()
+	require.NoError(t, err)
+	require.Len(t, rules, len(DirectTenantTables)+len(DirectTenantTableExemptions))
+
+	seen := make(map[string]PlatformComplianceTableRule, len(rules))
+	for _, rule := range rules {
+		assert.NotEmpty(t, rule.ReviewReason, "compliance rule for %s needs a review reason", rule.Table)
+		_, duplicate := seen[rule.Table]
+		assert.False(t, duplicate, "duplicate compliance rule for %s", rule.Table)
+		seen[rule.Table] = rule
+	}
+	for _, table := range DirectTenantTables {
+		rule, exists := seen[table]
+		assert.True(t, exists, "direct tenant table %s lacks a compliance rule", table)
+		assert.True(t, rule.ForceTenantRLS, "direct tenant table %s must retain FORCE RLS", table)
+	}
+	for table := range DirectTenantTableExemptions {
+		rule, exists := seen[table]
+		assert.True(t, exists, "pre-tenant exemption %s lacks a compliance rule", table)
+		assert.False(t, rule.ForceTenantRLS, "pre-tenant exemption %s must not be mislabeled FORCE RLS", table)
+	}
+	for table, writable := range platformComplianceWritableExemptions {
+		rule := seen[table]
+		assert.NotEmpty(t, writable.reason)
+		assert.NotEmpty(t, rule.AllowedRowPredicate, "writable table %s needs an exact row predicate", table)
+	}
+	assert.Empty(t, seen["threads_platform_bindings"].AllowedRowPredicate)
+	assert.Empty(t, seen["retention_policies"].AllowedRowPredicate)
+	assert.Empty(t, seen["legal_holds"].AllowedRowPredicate)
+}

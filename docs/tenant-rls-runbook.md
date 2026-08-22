@@ -136,6 +136,14 @@ runtime role access, and verifies that role cannot bypass RLS.
 
 Use rollback only for an incident confirmed to be caused by RLS:
 
+This rollback is unavailable after a platform compliance purpose organization
+has been created: `RemoveTenantRLS` fails closed and that purpose identity is
+permanent. It is also not a valid route to an RLS-disabled server or worker
+while managed Instagram or managed Threads is enabled,
+because those entry points still require the exact additive guard contract.
+Retain a purpose-aware binary and follow the product-specific quarantine and
+retained-responder procedure instead.
+
 1. Stop or scale down web and worker components to prevent mixed policy modes.
 2. With the owner migration connection, run:
 

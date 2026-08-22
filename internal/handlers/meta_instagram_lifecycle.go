@@ -15,6 +15,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/platformcompliance"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -25,7 +26,7 @@ const (
 	// metaInstagramDataDeletionComplianceTenantMarkerKey is an independent,
 	// durable control-plane assertion. A clinic UUID named in configuration is
 	// never sufficient to become the sink for no-target deletion receipts.
-	metaInstagramDataDeletionComplianceTenantMarkerKey = "meta_instagram_data_deletion_compliance_tenant"
+	metaInstagramDataDeletionComplianceTenantMarkerKey = platformcompliance.InstagramMarkerKey
 )
 
 var (
@@ -226,16 +227,22 @@ func (a *App) validateMetaInstagramComplianceOrganization(ctx context.Context) e
 			return tx.Raw(`
 				SELECT EXISTS (
 					SELECT 1
-					FROM organizations AS organization
-					JOIN resellers AS reseller ON reseller.id = organization.reseller_id
+					FROM public.organizations AS organization
+					JOIN public.resellers AS reseller ON reseller.id = organization.reseller_id
 					WHERE organization.id = ?
 					  AND organization.deleted_at IS NULL
 					  AND reseller.deleted_at IS NULL
 					  AND reseller.status = 'active'
 					  AND reseller.slug = ?
-					  AND organization.settings @> '{"meta_instagram_data_deletion_compliance_tenant":true}'::jsonb
+					  AND organization.settings @> pg_catalog.jsonb_build_object(CAST(? AS text), true)
+					  AND organization.settings @> pg_catalog.jsonb_build_object(CAST(? AS text), true)
 				)
-			`, complianceID, database.PlatformResellerSlug).Scan(&valid).Error
+			`,
+				complianceID,
+				database.PlatformResellerSlug,
+				metaInstagramDataDeletionComplianceTenantMarkerKey,
+				platformcompliance.PurposeMarkerKey,
+			).Scan(&valid).Error
 		},
 	); err != nil {
 		return fmt.Errorf("validate managed Instagram compliance tenant: %w", err)

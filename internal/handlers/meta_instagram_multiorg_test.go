@@ -16,6 +16,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/platformcompliance"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -57,10 +58,167 @@ func setMetaInstagramComplianceTenantMarker(
 	} else {
 		settings[metaInstagramDataDeletionComplianceTenantMarkerKey] = value
 	}
-	require.NoError(t, db.Model(&models.Organization{}).
-		Where("id = ?", organization.ID).
-		Update("settings", settings).Error)
+	updateMetaInstagramComplianceOrganizationFixture(t, db, organization.ID, map[string]any{
+		"settings": settings,
+	})
 	organization.Settings = settings
+}
+
+func setPlatformCompliancePurposeMarker(
+	t *testing.T,
+	db *gorm.DB,
+	organization *models.Organization,
+	value any,
+) {
+	t.Helper()
+	settings := cloneJSONB(organization.Settings)
+	if settings == nil {
+		settings = models.JSONB{}
+	}
+	if value == nil {
+		delete(settings, platformcompliance.PurposeMarkerKey)
+	} else {
+		settings[platformcompliance.PurposeMarkerKey] = value
+	}
+	updateMetaInstagramComplianceOrganizationFixture(t, db, organization.ID, map[string]any{
+		"settings": settings,
+	})
+	organization.Settings = settings
+	if enabled, exactBoolean := value.(bool); exactBoolean && enabled {
+		t.Cleanup(func() {
+			clearMetaInstagramPlatformComplianceMarkers(t, db, organization.ID)
+		})
+	}
+}
+
+func clearMetaInstagramPlatformComplianceMarkers(
+	t *testing.T,
+	db *gorm.DB,
+	organizationID uuid.UUID,
+) {
+	t.Helper()
+	updateMetaInstagramComplianceOrganizationFixture(t, db, organizationID, map[string]any{
+		"settings": gorm.Expr(`
+			COALESCE(settings, '{}'::jsonb)
+			- ARRAY[CAST(? AS text), CAST(? AS text), CAST(? AS text)]
+		`,
+			platformcompliance.PurposeMarkerKey,
+			metaInstagramDataDeletionComplianceTenantMarkerKey,
+			database.PlatformComplianceThreadsMarkerKey,
+		),
+	})
+	var state struct {
+		GuardEnabled bool `gorm:"column:guard_enabled"`
+		Purpose      bool `gorm:"column:purpose"`
+	}
+	require.NoError(t, db.Raw(`
+		SELECT
+			(
+				SELECT count(*) = 1 AND pg_catalog.bool_and(trigger.tgenabled = 'O')
+				FROM pg_catalog.pg_trigger AS trigger
+				JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+				JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+				WHERE namespace.nspname = 'public'
+				  AND relation.relname = 'organizations'
+				  AND trigger.tgname = 'rereply_platform_compliance_classification_guard'
+				  AND NOT trigger.tgisinternal
+			) AS guard_enabled,
+			COALESCE(
+				pg_catalog.jsonb_typeof(organization.settings -> CAST(? AS text)) = 'boolean'
+				AND organization.settings -> CAST(? AS text) = 'true'::jsonb,
+				false
+			) AS purpose
+		FROM public.organizations AS organization
+		WHERE organization.id = ?
+	`, platformcompliance.PurposeMarkerKey,
+		platformcompliance.PurposeMarkerKey, organizationID).Scan(&state).Error)
+	require.True(t, state.GuardEnabled, "organization compliance guard must remain enabled")
+	require.False(t, state.Purpose, "synthetic platform compliance purpose must not survive the test")
+}
+
+func updateMetaInstagramComplianceOrganizationFixture(
+	t *testing.T,
+	db *gorm.DB,
+	organizationID uuid.UUID,
+	updates map[string]any,
+) {
+	t.Helper()
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		var triggerExists bool
+		if err := tx.Raw(`
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_trigger AS trigger
+				JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+				JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+				WHERE namespace.nspname = 'public' AND relation.relname = 'organizations'
+				  AND trigger.tgname = 'rereply_platform_compliance_classification_guard'
+				  AND NOT trigger.tgisinternal
+			)
+		`).Scan(&triggerExists).Error; err != nil {
+			return err
+		}
+		if triggerExists {
+			if err := tx.Exec(
+				"ALTER TABLE public.organizations DISABLE TRIGGER rereply_platform_compliance_classification_guard",
+			).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Unscoped().Model(&models.Organization{}).
+			Where("id = ?", organizationID).Updates(updates).Error; err != nil {
+			return err
+		}
+		if triggerExists {
+			return tx.Exec(
+				"ALTER TABLE public.organizations ENABLE TRIGGER rereply_platform_compliance_classification_guard",
+			).Error
+		}
+		return nil
+	}))
+}
+
+func createMetaInstagramHistoricalDeletionFixture(
+	t *testing.T,
+	db *gorm.DB,
+	event *models.MetaInstagramDataDeletionEvent,
+) {
+	t.Helper()
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		var triggerExists bool
+		if err := tx.Raw(`
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_trigger AS trigger
+				JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+				JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+				WHERE namespace.nspname = 'public'
+				  AND relation.relname = 'meta_instagram_data_deletion_events'
+				  AND trigger.tgname = 'rereply_platform_compliance_write_guard'
+				  AND NOT trigger.tgisinternal
+			)
+		`).Scan(&triggerExists).Error; err != nil {
+			return err
+		}
+		if triggerExists {
+			if err := tx.Exec(`
+				ALTER TABLE public.meta_instagram_data_deletion_events
+				DISABLE TRIGGER rereply_platform_compliance_write_guard
+			`).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Create(event).Error; err != nil {
+			return err
+		}
+		if triggerExists {
+			return tx.Exec(`
+				ALTER TABLE public.meta_instagram_data_deletion_events
+				ENABLE TRIGGER rereply_platform_compliance_write_guard
+			`).Error
+		}
+		return nil
+	}))
 }
 
 func createMetaInstagramPlatformComplianceOrganization(
@@ -68,27 +226,7 @@ func createMetaInstagramPlatformComplianceOrganization(
 	db *gorm.DB,
 ) (*models.Reseller, *models.Organization) {
 	t.Helper()
-	var reseller models.Reseller
-	err := db.Unscoped().Where("slug = ?", database.PlatformResellerSlug).
-		First(&reseller).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		created := testutil.CreateTestReseller(t, db)
-		require.NoError(t, db.Model(created).
-			Update("slug", database.PlatformResellerSlug).Error)
-		created.Slug = database.PlatformResellerSlug
-		reseller = *created
-	} else {
-		require.NoError(t, err)
-		require.NoError(t, db.Unscoped().Model(&reseller).Updates(map[string]any{
-			"deleted_at": nil,
-			"status":     models.ResellerStatusActive,
-		}).Error)
-		reseller.DeletedAt = gorm.DeletedAt{}
-		reseller.Status = models.ResellerStatusActive
-	}
-	organization := testutil.CreateTestOrganizationForReseller(t, db, reseller.ID)
-	setMetaInstagramComplianceTenantMarker(t, db, organization, true)
-	return &reseller, organization
+	return testutil.CreateTestPlatformComplianceOrganization(t, db, true, false)
 }
 
 func TestMetaInstagramMultiOrgOAuthFingerprintIsTargetScopedAndCompliancePinned(t *testing.T) {
@@ -451,7 +589,27 @@ func TestManagedInstagramMultiOrgStartupRequiresMarkedPlatformComplianceTenant(t
 		assertRejected(t, uuid.New())
 	})
 
+	// Install and exercise the production atomic creator before seeding the
+	// deliberately invalid historical purpose-marker rows below. The guard
+	// installer must reject those rows at rest, so creating the valid purpose
+	// organization after them makes this package-order fixture self-defeating.
+	platformReseller, valid := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
+	t.Cleanup(func() {
+		_ = fixture.db.Unscoped().Model(platformReseller).Updates(map[string]any{
+			"deleted_at": nil,
+			"status":     models.ResellerStatusActive,
+		}).Error
+		updateMetaInstagramComplianceOrganizationFixture(t, fixture.db, valid.ID, map[string]any{
+			"deleted_at": nil,
+			"settings": models.JSONB{
+				metaInstagramDataDeletionComplianceTenantMarkerKey: true,
+				platformcompliance.PurposeMarkerKey:                true,
+			},
+		})
+	})
+
 	unowned := testutil.CreateTestOrganization(t, fixture.db)
+	setPlatformCompliancePurposeMarker(t, fixture.db, unowned, true)
 	setMetaInstagramComplianceTenantMarker(t, fixture.db, unowned, true)
 	t.Run("marked but unowned organization", func(t *testing.T) {
 		assertRejected(t, unowned.ID)
@@ -459,25 +617,14 @@ func TestManagedInstagramMultiOrgStartupRequiresMarkedPlatformComplianceTenant(t
 
 	ordinaryReseller := testutil.CreateTestReseller(t, fixture.db)
 	ordinary := testutil.CreateTestOrganizationForReseller(t, fixture.db, ordinaryReseller.ID)
+	setPlatformCompliancePurposeMarker(t, fixture.db, ordinary, true)
 	setMetaInstagramComplianceTenantMarker(t, fixture.db, ordinary, true)
 	t.Run("marked organization owned by ordinary reseller", func(t *testing.T) {
 		assertRejected(t, ordinary.ID)
 	})
 
-	platformReseller, valid := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
-	t.Cleanup(func() {
-		_ = fixture.db.Unscoped().Model(platformReseller).Updates(map[string]any{
-			"deleted_at": nil,
-			"status":     models.ResellerStatusActive,
-		}).Error
-		_ = fixture.db.Unscoped().Model(valid).Updates(map[string]any{
-			"deleted_at": nil,
-			"settings": models.JSONB{
-				metaInstagramDataDeletionComplianceTenantMarkerKey: true,
-			},
-		}).Error
-	})
 	unmarked := testutil.CreateTestOrganizationForReseller(t, fixture.db, platformReseller.ID)
+	setPlatformCompliancePurposeMarker(t, fixture.db, unmarked, true)
 	t.Run("unmarked platform organization", func(t *testing.T) {
 		assertRejected(t, unmarked.ID)
 	})
@@ -485,6 +632,12 @@ func TestManagedInstagramMultiOrgStartupRequiresMarkedPlatformComplianceTenant(t
 	t.Run("marker must be exact JSON boolean", func(t *testing.T) {
 		assertRejected(t, unmarked.ID)
 	})
+
+	setPlatformCompliancePurposeMarker(t, fixture.db, valid, "true")
+	t.Run("purpose marker must be exact JSON boolean", func(t *testing.T) {
+		assertRejected(t, valid.ID)
+	})
+	setPlatformCompliancePurposeMarker(t, fixture.db, valid, true)
 
 	require.NoError(t, fixture.db.Model(platformReseller).
 		Update("status", models.ResellerStatusSuspended).Error)
@@ -503,12 +656,15 @@ func TestManagedInstagramMultiOrgStartupRequiresMarkedPlatformComplianceTenant(t
 		Update("deleted_at", nil).Error)
 	platformReseller.DeletedAt = gorm.DeletedAt{}
 
-	require.NoError(t, fixture.db.Delete(valid).Error)
+	updateMetaInstagramComplianceOrganizationFixture(t, fixture.db, valid.ID, map[string]any{
+		"deleted_at": time.Now().UTC(),
+	})
 	t.Run("deleted marked organization", func(t *testing.T) {
 		assertRejected(t, valid.ID)
 	})
-	require.NoError(t, fixture.db.Unscoped().Model(valid).
-		Update("deleted_at", nil).Error)
+	updateMetaInstagramComplianceOrganizationFixture(t, fixture.db, valid.ID, map[string]any{
+		"deleted_at": nil,
+	})
 	valid.DeletedAt = gorm.DeletedAt{}
 
 	configureMetaInstagramOrganizationSet(
@@ -931,7 +1087,7 @@ func TestManagedInstagramMultiOrgOAuthFenceIncludesOpaqueComplianceJournal(t *te
 		Digest: strings.Repeat("e", 64), OrganizationID: complianceOrganization.ID,
 		PlatformAppID: hashedAppID, AuthorizingUserID: hashedSubjectID,
 		IssuedAt: eventIssuedAt, VerifiedAt: eventIssuedAt,
-		State: "completed", TargetResolution: metaInstagramDeletionResolutionNoTarget,
+		State: "verified", TargetResolution: metaInstagramDeletionResolutionNoTarget,
 		IdentityHashed: true,
 	}).Error)
 
@@ -966,13 +1122,14 @@ func TestManagedInstagramMultiOrgDeletionReplayRejectsInvalidComplianceOwnership
 		signedRequest, metaInstagramTestAppSecret,
 	)
 	require.NoError(t, err)
-	require.NoError(t, fixture.db.Create(&models.MetaInstagramDataDeletionEvent{
+	historicalJournal := models.MetaInstagramDataDeletionEvent{
 		Digest: digest, OrganizationID: complianceOrganization.ID,
 		PlatformAppID: metaInstagramTestAppID, AuthorizingUserID: subjectID,
 		IssuedAt: now, VerifiedAt: now, State: "verified",
 		TargetResolution: metaInstagramDeletionResolutionAmbiguous,
 		IdentityHashed:   false,
-	}).Error)
+	}
+	createMetaInstagramHistoricalDeletionFixture(t, fixture.db, &historicalJournal)
 
 	request := newMetaInstagramDeletionRequest(t, signedRequest)
 	require.NoError(t, fixture.app.DeleteMetaInstagramUserData(request))
@@ -996,10 +1153,10 @@ func TestManagedInstagramMultiOrgComplianceCallbackUsesOnlyTenantRLS(t *testing.
 		runtimeRole, runtimePassword,
 	)).Error)
 	t.Cleanup(func() {
+		testutil.TruncateTables(adminDB)
 		_ = database.RemoveTenantRLS(adminDB)
 		_ = adminDB.Exec("DROP OWNED BY " + runtimeRole).Error
 		_ = adminDB.Exec("DROP ROLE IF EXISTS " + runtimeRole).Error
-		testutil.TruncateTables(adminDB)
 	})
 
 	reseller, compliance := createMetaInstagramPlatformComplianceOrganization(t, adminDB)
@@ -1018,6 +1175,7 @@ func TestManagedInstagramMultiOrgComplianceCallbackUsesOnlyTenantRLS(t *testing.
 	}
 	require.NoError(t, adminDB.Create(&foreignJournal).Error)
 	require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
+	setMetaInstagramComplianceTenantMarker(t, adminDB, unmarkedCompliance, true)
 	runtimeDB := openRuntimeRoleTestDB(t, runtimeRole, runtimePassword)
 	require.NoError(t, database.VerifyTenantRLS(runtimeDB, runtimeRole))
 

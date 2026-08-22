@@ -3136,6 +3136,56 @@ func TestManagedInstagramDataDeletionJournalCleanupIsBounded(t *testing.T) {
 	assert.Equal(t, []string{strings.Repeat("3", 64)}, remaining)
 }
 
+func TestManagedInstagramJournalCleanupRetainsPurposeEvidenceWithoutStarvingOrdinaryCleanup(t *testing.T) {
+	fixture := newMetaInstagramLifecycleFixture(t)
+	_, complianceOrganization := createMetaInstagramPlatformComplianceOrganization(t, fixture.db)
+	configureMetaInstagramOrganizationSet(
+		fixture, []uuid.UUID{fixture.org.ID}, nil, complianceOrganization.ID,
+	)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	oldVerified := now.Add(-metaInstagramDeletionUnresolvedRetention - time.Hour)
+	purposeEvent := models.MetaInstagramDataDeletionEvent{
+		Digest: strings.Repeat("4", 64), OrganizationID: complianceOrganization.ID,
+		PlatformAppID: strings.Repeat("a", 64), AuthorizingUserID: strings.Repeat("b", 64),
+		IssuedAt: oldVerified, VerifiedAt: oldVerified, State: "verified",
+		TargetResolution: metaInstagramDeletionResolutionNoTarget, IdentityHashed: true,
+		LastAttemptAt: &oldVerified,
+	}
+	ordinaryEvent := models.MetaInstagramDataDeletionEvent{
+		Digest: strings.Repeat("5", 64), OrganizationID: fixture.org.ID,
+		PlatformAppID: metaInstagramTestAppID, AuthorizingUserID: fixture.profileID,
+		IssuedAt: oldVerified, VerifiedAt: oldVerified, State: "verified",
+		TargetResolution: metaInstagramDeletionResolutionExact,
+	}
+	oldDeauthorization := models.MetaDeauthorizationEvent{
+		Digest: strings.Repeat("6", 64), PlatformAppID: metaInstagramTestAppID,
+		AuthorizingUserID: fixture.profileID, IssuedAt: oldVerified,
+		VerifiedAt: oldVerified, State: "verified",
+	}
+	require.NoError(t, fixture.db.Create(&purposeEvent).Error)
+	require.NoError(t, fixture.db.Create(&ordinaryEvent).Error)
+	require.NoError(t, fixture.db.Create(&oldDeauthorization).Error)
+
+	require.NoError(t, fixture.app.cleanupMetaInstagramLifecycleJournals(now))
+
+	var purposeCount int64
+	require.NoError(t, fixture.db.Model(&models.MetaInstagramDataDeletionEvent{}).
+		Where("digest = ? AND organization_id = ?", purposeEvent.Digest, complianceOrganization.ID).
+		Count(&purposeCount).Error)
+	assert.Equal(t, int64(1), purposeCount, "purpose-owned evidence must be permanently retained")
+	var ordinaryCount int64
+	require.NoError(t, fixture.db.Model(&models.MetaInstagramDataDeletionEvent{}).
+		Where("digest = ? AND organization_id = ?", ordinaryEvent.Digest, fixture.org.ID).
+		Count(&ordinaryCount).Error)
+	assert.Zero(t, ordinaryCount, "ordinary expired journals must still be cleaned")
+	var deauthorizationCount int64
+	require.NoError(t, fixture.db.Model(&models.MetaDeauthorizationEvent{}).
+		Where("digest = ?", oldDeauthorization.Digest).
+		Count(&deauthorizationCount).Error)
+	assert.Zero(t, deauthorizationCount, "purpose retention must not starve later deauthorization cleanup")
+}
+
 func signMetaInstagramLifecycleRequest(
 	t *testing.T,
 	issuedAt time.Time,

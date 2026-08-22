@@ -367,7 +367,9 @@ func (a *App) ensureResellerOrganizationMembership(
 
 func (a *App) syncResellerMemberOrganizations(tx *gorm.DB, member *models.ResellerMember) error {
 	var orgs []models.Organization
-	if err := tx.Where("reseller_id = ?", member.ResellerID).Find(&orgs).Error; err != nil {
+	if err := tx.Scopes(database.ExcludePlatformComplianceOrganizations).
+		Where("reseller_id = ?", member.ResellerID).
+		Find(&orgs).Error; err != nil {
 		return fmt.Errorf("list reseller organizations: %w", err)
 	}
 	for _, org := range orgs {
@@ -387,7 +389,10 @@ func (a *App) syncResellerMemberOrganizations(tx *gorm.DB, member *models.Resell
 
 func (a *App) resellerSummary(reseller models.Reseller) resellerResponse {
 	var organizationCount, memberCount int64
-	a.DB.Model(&models.Organization{}).Where("reseller_id = ?", reseller.ID).Count(&organizationCount)
+	a.DB.Model(&models.Organization{}).
+		Scopes(database.ExcludePlatformComplianceOrganizations).
+		Where("reseller_id = ?", reseller.ID).
+		Count(&organizationCount)
 	a.DB.Model(&models.ResellerMember{}).Where(
 		"reseller_id = ? AND is_active = ?", reseller.ID, true,
 	).Count(&memberCount)
@@ -825,12 +830,14 @@ func (a *App) GetResellerUsage(r *fastglue.Request) error {
 	pg := parsePagination(r)
 	var orgIDs []uuid.UUID
 	if err := a.DB.Model(&models.Organization{}).
+		Scopes(database.ExcludePlatformComplianceOrganizations).
 		Where("reseller_id = ?", resellerID).
 		Pluck("id", &orgIDs).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load reseller organizations", nil, "")
 	}
 	var pageOrganizations []models.Organization
-	if err := pg.Apply(a.DB.Where("reseller_id = ?", resellerID).
+	if err := pg.Apply(a.DB.Scopes(database.ExcludePlatformComplianceOrganizations).
+		Where("reseller_id = ?", resellerID).
 		Order("name ASC, id ASC")).Find(&pageOrganizations).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load reseller organizations", nil, "")
 	}

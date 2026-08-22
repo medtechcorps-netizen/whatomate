@@ -15,6 +15,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/calling"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/storage"
@@ -119,18 +120,32 @@ func (a *App) getOrgID(r *fastglue.Request) (uuid.UUID, error) {
 				// Super admins can access any org
 				var count int64
 				if err := a.DB.Table("organizations").Where("id = ?", parsedOrgID).Count(&count).Error; err == nil && count > 0 {
-					return parsedOrgID, nil
+					return a.requireAuthenticatedTenant(parsedOrgID)
 				}
 			} else {
 				// Non-super-admins can switch if they have membership
 				if _, ok := access.OrganizationMembership(a.DB, userID, parsedOrgID); ok {
-					return parsedOrgID, nil
+					return a.requireAuthenticatedTenant(parsedOrgID)
 				}
 			}
 		}
 	}
 
-	return defaultOrgID, nil
+	return a.requireAuthenticatedTenant(defaultOrgID)
+}
+
+func (a *App) requireAuthenticatedTenant(organizationID uuid.UUID) (uuid.UUID, error) {
+	if a == nil || a.DB == nil {
+		return uuid.Nil, errors.New("database connection is required")
+	}
+	purpose, err := database.IsPlatformComplianceOrganization(a.DB, organizationID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if purpose {
+		return uuid.Nil, database.ErrPlatformComplianceTenant
+	}
+	return organizationID, nil
 }
 
 var (
@@ -157,12 +172,12 @@ func (a *App) getExplicitOrgID(r *fastglue.Request) (uuid.UUID, error) {
 	}
 	// getOrgID proves access, but a stale membership (or a super-admin lookup
 	// using Table) can outlive a soft-deleted workspace. Re-resolve the exact
-	// organization through the normal soft-delete scope on the root control
-	// plane before any provider request or tenant write.
+	// organization through the normal soft-delete scope before any provider
+	// request or tenant write. A scoped App must retain its transaction-local
+	// tenant context for this lookup.
 	var activeOrganization models.Organization
-	root := a.rootApp()
-	if root == nil || root.DB == nil ||
-		root.DB.Select("id").Where("id = ?", requested).First(&activeOrganization).Error != nil {
+	if a == nil || a.DB == nil ||
+		a.DB.Select("id").Where("id = ?", requested).First(&activeOrganization).Error != nil {
 		return uuid.Nil, errExplicitOrganizationUnavailable
 	}
 	return requested, nil

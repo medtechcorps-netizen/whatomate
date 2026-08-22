@@ -19,9 +19,11 @@ type TenantRequestHandler func(*App, *fastglue.Request) error
 
 var errTenantResponseRollback = errors.New("tenant handler returned an error response")
 
+var errPlatformComplianceInstagramTenantRequired = errors.New("platform compliance Instagram tenant is required")
+
 // Tenant wraps an authenticated handler in a transaction-local PostgreSQL
-// tenant context. When RLS is disabled it is intentionally a no-op, which makes
-// the rollout reversible while keeping the same route registrations.
+// tenant context. Purpose admission is always checked; when RLS is disabled,
+// only the transaction-local tenant binding is skipped.
 func (a *App) Tenant(handler TenantRequestHandler) fastglue.FastRequestHandler {
 	return func(r *fastglue.Request) error {
 		if handler == nil {
@@ -32,13 +34,12 @@ func (a *App) Tenant(handler TenantRequestHandler) fastglue.FastRequestHandler {
 				"",
 			)
 		}
-		if !a.rlsEnabled() {
-			return handler(a, r)
-		}
-
 		organizationID, err := a.getOrgID(r)
 		if err != nil || organizationID == uuid.Nil {
 			return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		}
+		if !a.rlsEnabled() {
+			return handler(a, r)
 		}
 
 		var handlerErr error
@@ -74,6 +75,55 @@ func (a *App) Tenant(handler TenantRequestHandler) fastglue.FastRequestHandler {
 		}
 		return handlerErr
 	}
+}
+
+func requireOrdinaryTenantOrganization(db *gorm.DB, organizationID uuid.UUID) error {
+	purpose, err := database.IsPlatformComplianceOrganization(db, organizationID)
+	if err != nil {
+		return err
+	}
+	if purpose {
+		return database.ErrPlatformComplianceTenant
+	}
+	return nil
+}
+
+func requirePlatformComplianceInstagramOrganization(db *gorm.DB, organizationID uuid.UUID) error {
+	purpose, err := database.IsPlatformComplianceOrganization(db, organizationID)
+	if err != nil {
+		return err
+	}
+	if !purpose {
+		return errPlatformComplianceInstagramTenantRequired
+	}
+	var eligible bool
+	result := db.Raw(`
+		SELECT true
+		FROM public.organizations AS organization
+		JOIN public.resellers AS reseller ON reseller.id = organization.reseller_id
+		WHERE organization.id = ?
+		  AND organization.deleted_at IS NULL
+		  AND reseller.deleted_at IS NULL
+		  AND reseller.status = 'active'
+		  AND reseller.slug = ?
+		  AND pg_catalog.jsonb_typeof(
+			organization.settings -> CAST(? AS text)
+		  ) = 'boolean'
+		  AND organization.settings -> CAST(? AS text) = 'true'::jsonb
+		FOR SHARE OF organization
+	`,
+		organizationID,
+		database.PlatformResellerSlug,
+		database.PlatformComplianceInstagramMarkerKey,
+		database.PlatformComplianceInstagramMarkerKey,
+	).Scan(&eligible)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 || !eligible {
+		return errPlatformComplianceInstagramTenantRequired
+	}
+	return nil
 }
 
 func (a *App) rlsEnabled() bool {
@@ -113,26 +163,39 @@ func (a *App) scopedApp(tx *gorm.DB, organizationID uuid.UUID) *App {
 	return scoped
 }
 
-// WithTenantApp is the safe entry point for background jobs and webhook
-// goroutines. It always starts from the root connection pool, so it never
+// WithTenantApp is the ordinary-tenant entry point for background jobs and
+// webhook goroutines. It rejects reserved compliance tenants before invoking
+// the callback and always starts from the root connection pool, so it never
 // reuses an HTTP transaction after that request has completed.
 func (a *App) WithTenantApp(organizationID uuid.UUID, fn func(*App) error) error {
 	if a == nil || fn == nil {
 		return errors.New("tenant app callback is required")
 	}
-	if !a.rlsEnabled() {
-		return fn(a.rootApp())
+	if organizationID == uuid.Nil {
+		return database.ErrMissingTenant
 	}
 	root := a.rootApp()
+	if root == nil || root.DB == nil {
+		return errors.New("database connection is required")
+	}
+	if !a.rlsEnabled() {
+		if err := requireOrdinaryTenantOrganization(root.DB, organizationID); err != nil {
+			return err
+		}
+		return fn(root)
+	}
 	return database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
+		if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+			return err
+		}
 		return fn(root.scopedApp(tx, organizationID))
 	})
 }
 
-// WithCommittedTenantApp runs one short database phase and commits it before
-// returning. It is used when provider I/O must happen between durable tenant
-// state transitions. Unlike WithTenantApp, it also opens a real transaction
-// when PostgreSQL RLS is disabled.
+// WithCommittedTenantApp runs one short ordinary-tenant database phase and
+// commits it before returning. It is used when provider I/O must happen between
+// durable tenant state transitions. Unlike WithTenantApp, it also opens a real
+// transaction when PostgreSQL RLS is disabled.
 func (a *App) WithCommittedTenantApp(organizationID uuid.UUID, fn func(*App) error) error {
 	if a == nil || fn == nil {
 		return errors.New("tenant app callback is required")
@@ -141,14 +204,50 @@ func (a *App) WithCommittedTenantApp(organizationID uuid.UUID, fn func(*App) err
 		return database.ErrMissingTenant
 	}
 	root := a.rootApp()
+	if root == nil || root.DB == nil {
+		return errors.New("database connection is required")
+	}
 	if a.rlsEnabled() {
 		return database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+				return err
+			}
 			return fn(root.scopedApp(tx, organizationID))
 		})
 	}
 	return root.DB.Transaction(func(tx *gorm.DB) error {
+		if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+			return err
+		}
 		return fn(root.scopedApp(tx, organizationID))
 	})
+}
+
+// withPlatformComplianceInstagramTenantApp is the only tenant-App entry point
+// for the managed Instagram compliance callback. It rejects ordinary tenants,
+// other compliance features, malformed reserved markers, and inactive or
+// non-platform ownership before exposing a scoped transaction.
+func (a *App) withPlatformComplianceInstagramTenantApp(
+	organizationID uuid.UUID,
+	fn func(*App) error,
+) error {
+	if a == nil || fn == nil {
+		return errors.New("platform compliance Instagram callback is required")
+	}
+	if organizationID == uuid.Nil {
+		return database.ErrMissingTenant
+	}
+	root := a.rootApp()
+	if root == nil || root.DB == nil {
+		return errors.New("database connection is required")
+	}
+	run := func(tx *gorm.DB) error {
+		if err := requirePlatformComplianceInstagramOrganization(tx, organizationID); err != nil {
+			return err
+		}
+		return fn(root.scopedApp(tx, organizationID))
+	}
+	return database.WithTenantReadCommitted(root.DB, organizationID, run)
 }
 
 func (a *App) hasTenantScope() bool {

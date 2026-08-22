@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -17,6 +18,19 @@ import (
 
 // NewPostgres creates a new PostgreSQL connection
 func NewPostgres(cfg *config.DatabaseConfig, debug bool) (*gorm.DB, error) {
+	return NewPostgresWithContext(context.Background(), cfg, debug)
+}
+
+// NewPostgresWithContext bounds both connection establishment and the initial
+// PostgreSQL health check. It disables GORM's implicit unbounded ping and
+// closes the pool if the explicit context-bound ping fails.
+func NewPostgresWithContext(ctx context.Context, cfg *config.DatabaseConfig, debug bool) (*gorm.DB, error) {
+	if cfg == nil {
+		return nil, errors.New("database configuration is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	dsn := postgresDSN(cfg)
 
 	logLevel := logger.Silent
@@ -25,7 +39,8 @@ func NewPostgres(cfg *config.DatabaseConfig, debug bool) (*gorm.DB, error) {
 	}
 
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
-		Logger: logger.Default.LogMode(logLevel),
+		Logger:               logger.Default.LogMode(logLevel),
+		DisableAutomaticPing: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
@@ -40,6 +55,10 @@ func NewPostgres(cfg *config.DatabaseConfig, debug bool) (*gorm.DB, error) {
 	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
 	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
 	sqlDB.SetConnMaxLifetime(time.Duration(cfg.ConnMaxLifetime) * time.Second)
+	if err := sqlDB.PingContext(ctx); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
 
 	return db, nil
 }
@@ -742,9 +761,11 @@ func CreateDefaultAdmin(db *gorm.DB, cfg *config.DefaultAdminConfig) error {
 		return nil
 	}
 
-	// Find any existing organization, or create the ReReply organization if none exist
+	// Find an ordinary organization, or create ReReply when the installation
+	// contains only atomic platform-compliance control-plane organizations.
 	var org models.Organization
-	if err := db.First(&org).Error; err != nil {
+	err := db.Scopes(ExcludePlatformComplianceOrganizations).First(&org).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// No organizations exist, create default one
 		org = models.Organization{
 			BaseModel: models.BaseModel{ID: uuid.New()},
@@ -754,6 +775,8 @@ func CreateDefaultAdmin(db *gorm.DB, cfg *config.DefaultAdminConfig) error {
 		if err := db.Create(&org).Error; err != nil {
 			return fmt.Errorf("failed to create default organization: %w", err)
 		}
+	} else if err != nil {
+		return fmt.Errorf("failed to find an ordinary organization: %w", err)
 	}
 
 	// Hash the default password from config
@@ -944,7 +967,7 @@ func SeedPermissionsAndRoles(db *gorm.DB) error {
 // This is idempotent - it skips organizations that already have system roles
 func SeedSystemRolesForAllOrgs(db *gorm.DB) error {
 	var orgs []models.Organization
-	if err := db.Find(&orgs).Error; err != nil {
+	if err := db.Scopes(ExcludePlatformComplianceOrganizations).Find(&orgs).Error; err != nil {
 		return fmt.Errorf("failed to fetch organizations: %w", err)
 	}
 
@@ -1220,7 +1243,7 @@ func SeedDefaultWidgets(db *gorm.DB) error {
 
 	// Get all organizations
 	var orgs []models.Organization
-	if err := db.Find(&orgs).Error; err != nil {
+	if err := db.Scopes(ExcludePlatformComplianceOrganizations).Find(&orgs).Error; err != nil {
 		return fmt.Errorf("failed to fetch organizations: %w", err)
 	}
 
