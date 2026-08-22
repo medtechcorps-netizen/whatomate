@@ -76,6 +76,68 @@ jobs:
         uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          version: 1.167.0
+
+      - name: Reject nonstandard production migration jobs
+        run: |
+          set -euo pipefail
+          app_spec="$(
+            doctl apps spec get \
+              54bc0d92-73e9-4f8b-86cd-c3fd96e06beb \
+              --format json
+          )"
+          jq -e '
+            (.jobs // []) as $jobs
+            | (.services // []) as $services
+            | ((.envs // []) | length) == 0
+              and (((.workers // []) | length) == 0)
+              and (((.static_sites // []) | length) == 0)
+              and (((.functions // []) | length) == 0)
+              and (($services | map(.name) | sort) == ["gmail-relay", "meta-relay", "omnitech-web"])
+              and all($services[]; (.git.deploy_on_push // false) == false)
+              and any($services[];
+                .name == "omnitech-web"
+                and .git.repo_clone_url == "https://github.com/medtechcorps-netizen/whatomate.git"
+                and .git.branch == "main"
+                and .dockerfile_path == "docker/Dockerfile"
+              )
+              and any($services[];
+                .name == "meta-relay"
+                and .git.repo_clone_url == "https://github.com/medtechcorps-netizen/whatomate.git"
+                and .git.branch == "main"
+                and .dockerfile_path == "docker/meta-relay.Dockerfile"
+              )
+              and any($services[];
+                .name == "gmail-relay"
+                and .git.repo_clone_url == "https://github.com/medtechcorps-netizen/whatomate.git"
+                and .git.branch == "main"
+                and .dockerfile_path == "docker/gmail-relay.Dockerfile"
+              )
+              and ($jobs | length) == 1
+              and $jobs[0].name == "rereply-rls-migrate"
+              and $jobs[0].kind == "PRE_DEPLOY"
+              and $jobs[0].git.repo_clone_url == "https://github.com/medtechcorps-netizen/whatomate.git"
+              and $jobs[0].git.branch == "main"
+              and $jobs[0].dockerfile_path == "docker/Dockerfile"
+              and ($jobs[0].git.deploy_on_push // false) == false
+              and $jobs[0].run_command == "./rereply rls-migrate -config config.toml"
+              and (($jobs[0].envs | map(.key) | sort) == [
+                "WHATOMATE_DATABASE__MIGRATION_URL",
+                "WHATOMATE_DATABASE__RUNTIME_ROLE"
+              ])
+              and any(
+                $jobs[0].envs[];
+                .key == "WHATOMATE_DATABASE__MIGRATION_URL"
+                and .scope == "RUN_TIME"
+                and .type == "SECRET"
+                and (.value | startswith("EV["))
+              )
+              and any(
+                $jobs[0].envs[];
+                .key == "WHATOMATE_DATABASE__RUNTIME_ROLE"
+                and .value == "rereply_app"
+              )
+          ' <<<"${app_spec}" >/dev/null
 
       - name: Ensure production runtime RLS scope
         run: |
@@ -173,9 +235,23 @@ jobs:
               and .git.repo_clone_url == "https://github.com/medtechcorps-netizen/whatomate.git"
               and .git.branch == "main"
               and .dockerfile_path == "docker/Dockerfile"
-              and (.run_command | contains("rereply rls-migrate"))
-              and any(.envs[]?; .key == "WHATOMATE_DATABASE__MIGRATION_URL")
-              and any(.envs[]?; .key == "WHATOMATE_DATABASE__RUNTIME_ROLE")
+              and .run_command == "./rereply rls-migrate -config config.toml"
+              and ((.envs | map(.key) | sort) == [
+                "WHATOMATE_DATABASE__MIGRATION_URL",
+                "WHATOMATE_DATABASE__RUNTIME_ROLE"
+              ])
+              and any(
+                .envs[]?;
+                .key == "WHATOMATE_DATABASE__MIGRATION_URL"
+                and .scope == "RUN_TIME"
+                and .type == "SECRET"
+                and (.value | startswith("EV["))
+              )
+              and any(
+                .envs[]?;
+                .key == "WHATOMATE_DATABASE__RUNTIME_ROLE"
+                and .value == "rereply_app"
+              )
             )
             and (
               (.services // [])

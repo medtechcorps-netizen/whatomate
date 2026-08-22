@@ -1,0 +1,107 @@
+name: Platform Compliance Bootstrap (One Shot)
+
+run-name: Platform compliance ${{ inputs.phase }} CHANGE-20260822-MANAGED-IG-001
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Exact reviewed bootstrap phase
+        required: true
+        type: choice
+        options:
+          - dry-run
+          - apply
+      confirmation:
+        description: Exact phase and reviewed change ID confirmation; do not enter an organization UUID
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: bootstrap-platform-compliance
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: production
+
+    steps:
+      - name: Check out exact main revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Rehearse the bootstrap state machine offline
+        run: bash .github/scripts/bootstrap-platform-compliance-once-test.sh
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          version: 1.167.0
+
+      - name: Execute exact bootstrap phase
+        id: bootstrap
+        env:
+          BOOTSTRAP_ORGANIZATION_ID: ${{ secrets.PLATFORM_COMPLIANCE_BOOTSTRAP_ORGANIZATION_ID }}
+          BOOTSTRAP_CONFIRMATION: ${{ inputs.confirmation }}
+          BOOTSTRAP_PHASE: ${{ inputs.phase }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/bootstrap-platform-compliance-once.sh execute
+
+    outputs:
+      operator_status: ${{ steps.bootstrap.outputs.operator_status }}
+
+  restore:
+    name: restore-standard-migration-job
+    needs: bootstrap
+    if: ${{ always() && (inputs.phase == 'dry-run' || needs.bootstrap.outputs.operator_status == '0' || needs.bootstrap.outputs.operator_status == '1') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    environment: production
+
+    steps:
+      - name: Check out exact main revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Rehearse the bootstrap state machine offline
+        run: bash .github/scripts/bootstrap-platform-compliance-once-test.sh
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          version: 1.167.0
+
+      - name: Restore exact standard migration job
+        env:
+          BOOTSTRAP_ORGANIZATION_ID: ${{ secrets.PLATFORM_COMPLIANCE_BOOTSTRAP_ORGANIZATION_ID }}
+          BOOTSTRAP_CONFIRMATION: ${{ inputs.confirmation }}
+          BOOTSTRAP_PHASE: ${{ inputs.phase }}
+        run: bash .github/scripts/bootstrap-platform-compliance-once.sh cleanup
+
+  retire:
+    name: retire-one-shot-operator
+    needs:
+      - bootstrap
+      - restore
+    if: ${{ always() && inputs.phase == 'apply' && needs.bootstrap.result == 'success' && needs.restore.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Disable this completed one-shot workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api --method PUT
+          "repos/${GITHUB_REPOSITORY}/actions/workflows/bootstrap-platform-compliance-once.yml/disable"
