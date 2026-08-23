@@ -1307,10 +1307,11 @@ func TestMetaMessengerApprovalRechecksExactMessagesSubscription(t *testing.T) {
 }
 
 func TestMetaMessengerBISUApprovalRechecksExactAuthorityEdges(t *testing.T) {
+	const approvalPageID = "700000000000109"
 	db := testutil.SetupTestDB(t)
 	organization := testutil.CreateTestOrganization(t, db)
 	fixture := createMetaRegistryFixture(
-		t, db, organization.ID, models.ChannelMessenger, metaLifecycleTestPageID,
+		t, db, organization.ID, models.ChannelMessenger, approvalPageID,
 	)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	metadata := cloneJSONB(fixture.account.Metadata)
@@ -1332,7 +1333,7 @@ func TestMetaMessengerBISUApprovalRechecksExactAuthorityEdges(t *testing.T) {
 		"123",
 		metaLifecycleTestUserID,
 		metaLifecycleTestBusinessID,
-		metaLifecycleTestPageID,
+		approvalPageID,
 		now,
 		fixture.oauth.ID,
 		fixture.oauth.Version,
@@ -1351,28 +1352,28 @@ func TestMetaMessengerBISUApprovalRechecksExactAuthorityEdges(t *testing.T) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/v25.0/debug_token":
-			if request.URL.Query().Get("input_token") == "provider-token-"+metaLifecycleTestPageID {
-				_, _ = writer.Write([]byte(`{"data":{"is_valid":true,"app_id":"123","type":"PAGE","user_id":"700000000000001"}}`))
+			if request.URL.Query().Get("input_token") == "provider-token-"+approvalPageID {
+				_, _ = writer.Write([]byte(`{"data":{"is_valid":true,"app_id":"123","type":"PAGE","user_id":"700000000000109"}}`))
 				return
 			}
 			_, _ = writer.Write([]byte(`{"data":{"is_valid":true,"app_id":"123","type":"SYSTEM_USER","user_id":"900000000000001","scopes":["public_profile","pages_show_list","pages_manage_metadata","pages_messaging"]}}`))
 		case "/v25.0/me":
-			if request.Header.Get("Authorization") == "Bearer provider-token-"+metaLifecycleTestPageID {
-				_, _ = writer.Write([]byte(`{"id":"700000000000001","name":"Review Page"}`))
+			if request.Header.Get("Authorization") == "Bearer provider-token-"+approvalPageID {
+				_, _ = writer.Write([]byte(`{"id":"700000000000109","name":"Review Page"}`))
 				return
 			}
 			_, _ = writer.Write([]byte(`{"id":"900000000000001","client_business_id":"200000000000001"}`))
 		case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
 			if authorityPresent.Load() {
-				_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Review Page","tasks":["MESSAGING","MODERATE"]}]}`))
+				_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000109","name":"Review Page","tasks":["MESSAGING","MODERATE"]}]}`))
 			} else {
 				_, _ = writer.Write([]byte(`{"data":[]}`))
 			}
 		case "/v25.0/" + metaLifecycleTestUserID + "/accounts":
-			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Review Page","access_token":"provider-token-700000000000001"}]}`))
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000109","name":"Review Page","access_token":"provider-token-700000000000109"}]}`))
 		case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
-			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Review Page"}]}`))
-		case "/v25.0/" + metaLifecycleTestPageID + "/subscribed_apps":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000109","name":"Review Page"}]}`))
+		case "/v25.0/" + approvalPageID + "/subscribed_apps":
 			_, _ = writer.Write([]byte(`{"data":[{"id":"123","subscribed_fields":["messages"]}]}`))
 		default:
 			http.Error(writer, "unexpected", http.StatusNotFound)
@@ -1382,9 +1383,12 @@ func TestMetaMessengerBISUApprovalRechecksExactAuthorityEdges(t *testing.T) {
 	app := metaRegistryTestApp(db, organization.ID)
 	app.Config.MetaRegistry.Enabled = true
 	app.Config.MetaMessenger.Enabled = true
+	app.Config.MetaMessenger.ConfigID = "456"
 	app.Config.MetaMessenger.AppSecret = metaLifecycleTestAppSecret
 	app.Config.MetaMessenger.GraphAPIVersion = "v25.0"
 	app.Config.MetaMessenger.GraphBaseURL = "https://graph.meta.test"
+	app.Config.MetaMessenger.ReReplyBaseURL = "https://app.example.test"
+	app.Config.MetaMessenger.RelayBaseURL = "https://relay.example.test"
 	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
 		"https://graph.meta.test": server,
 	})
@@ -1630,13 +1634,15 @@ func TestMetaMessengerDelayedOldDeauthorizationCannotRevokeReconnectGeneration(t
 	require.NoError(t, err)
 	reconciledAt := ambiguousEvent.Add(3 * time.Second)
 	require.NoError(t, root.WithCommittedTenantApp(fixture.account.OrganizationID, func(scoped *App) error {
-		applied, applyErr := scoped.applyMetaRegistryMutation(metaregistry.MutationRequest{
+		// This synthetic reconciliation stands in for the in-process lifecycle
+		// after its fresh Graph checker has repeated the exact BISU asset edges.
+		applied, applyErr := scoped.applyMetaRegistryMutationWithMessengerAuthorityProof(metaregistry.MutationRequest{
 			ChannelAccountID: snapshot.Account.ID,
 			CredentialID:     snapshot.OAuth.ID, CredentialVersion: snapshot.OAuth.Version,
 			WebhookCredentialID: snapshot.Webhook.ID, WebhookCredentialVersion: snapshot.Webhook.Version,
 			Outcome: metaregistry.OwnershipVerified, Reason: "scheduled_graph_revalidation",
 			CheckedAt: reconciledAt,
-		}, metaregistry.OwnershipVerified)
+		}, metaregistry.OwnershipVerified, true)
 		if applyErr != nil {
 			return applyErr
 		}
