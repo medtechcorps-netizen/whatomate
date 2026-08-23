@@ -8,11 +8,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -630,16 +633,19 @@ func TestMetaMessengerSelectionRechecksBothPageTasksImmediatelyBeforePersistence
 
 func TestMetaMessengerSystemUserInventoryUsesAccountsPageToken(t *testing.T) {
 	var paths []string
+	var pathsMu sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
+		pathsMu.Lock()
 		paths = append(paths, request.URL.Path)
-		require.Equal(t, "Bearer system-user-token", request.Header.Get("Authorization"))
+		pathsMu.Unlock()
+		assert.Equal(t, "Bearer system-user-token", request.Header.Get("Authorization"))
 		switch request.URL.Path {
 		case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
-			require.Equal(t, "id,name,tasks", request.URL.Query().Get("fields"))
+			assert.Equal(t, "id,name,tasks", request.URL.Query().Get("fields"))
 			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MESSAGING","MODERATE"],"access_token":"unusable-assigned-token"}]}`))
 		case "/v25.0/" + metaLifecycleTestUserID + "/accounts":
-			require.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
+			assert.Equal(t, "id,name,tasks,access_token", request.URL.Query().Get("fields"))
 			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Account Page","tasks":["MESSAGING","MODERATE"],"access_token":"page-access-token"}]}`))
 		case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
 			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Owned Page"}]}`))
@@ -675,11 +681,347 @@ func TestMetaMessengerSystemUserInventoryUsesAccountsPageToken(t *testing.T) {
 	plain, decryptErr := appcrypto.Decrypt(pages[0].EncryptedPageToken, metaLifecycleTestEncryptionKey)
 	require.NoError(t, decryptErr)
 	assert.Equal(t, "page-access-token", plain)
-	assert.Equal(t, []string{
+	pathsMu.Lock()
+	observedPaths := append([]string(nil), paths...)
+	pathsMu.Unlock()
+	assert.ElementsMatch(t, []string{
 		"/v25.0/" + metaLifecycleTestUserID + "/assigned_pages",
 		"/v25.0/" + metaLifecycleTestUserID + "/accounts",
 		"/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages",
-	}, paths)
+	}, observedPaths)
+}
+
+func TestMetaMessengerInteractiveProviderBudgetLeavesIngressHeadroom(t *testing.T) {
+	assert.Less(
+		t,
+		metaMessengerCallbackOperationLimit+metaMessengerCallbackNonProviderOverheadReserve,
+		metaMessengerProductionIngressIdleLimit,
+	)
+	assert.LessOrEqual(t, metaMessengerGraphHTTPTimeout, metaMessengerCallbackOperationLimit)
+
+	ctx, cancel := metaMessengerCallbackContext(nil)
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	require.True(t, ok)
+	remaining := time.Until(deadline)
+	assert.LessOrEqual(t, remaining, metaMessengerCallbackOperationLimit)
+	assert.Greater(t, remaining, metaMessengerCallbackOperationLimit-time.Second)
+}
+
+func TestExchangeMetaMessengerOnboardingLaunchNonceAllowsOneCodeExchange(t *testing.T) {
+	for _, testCase := range []struct {
+		name           string
+		concurrentCode string
+	}{
+		{name: "same_code", concurrentCode: "single-use-code"},
+		{name: "different_code", concurrentCode: "different-code"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			redisClient := testutil.SetupTestRedis(t)
+			if redisClient == nil {
+				if strings.TrimSpace(os.Getenv("TEST_REDIS_URL")) == "" {
+					t.Skip("TEST_REDIS_URL is required for the callback replay-resistance test")
+				}
+				require.NotNil(t, redisClient, "configured test Redis must be reachable")
+			}
+			app, organization, _, user := newMetaLifecycleAuthorizationFixture(t)
+			app.Redis = redisClient
+			app.Config.App.EncryptionKey = metaLifecycleTestEncryptionKey
+			app.Config.MetaRegistry.Enabled = true
+			app.Config.MetaMessenger = configpkg.MetaMessengerConfig{
+				Enabled: true, AppID: metaLifecycleTestAppID, ConfigID: metaLifecycleTestConfigID,
+				AppSecret: metaLifecycleTestAppSecret, GraphAPIVersion: "v25.0",
+				GraphBaseURL: "https://graph.meta.test", ReReplyBaseURL: "https://app.example.test",
+				RelayBaseURL:           "https://relay.example.test",
+				AllowedOrganizationIDs: organization.ID.String(),
+			}
+
+			settings, err := app.metaMessengerOnboardingSettings()
+			require.NoError(t, err)
+			nonce := "nonce-" + uuid.NewString()
+			startState := metaMessengerStartState{
+				OrganizationID: organization.ID.String(), UserID: user.ID.String(), Nonce: nonce,
+				ConfigFingerprint: app.metaMessengerOnboardingRuntimeFingerprint(settings),
+				ExpiresAt:         time.Now().UTC().Add(metaMessengerOnboardingStateTTL),
+			}
+			stateJSON, err := json.Marshal(startState)
+			require.NoError(t, err)
+			startKey := metaMessengerStartStateKey(organization.ID, user.ID, nonce)
+			require.NoError(t, redisClient.Set(t.Context(), startKey, stateJSON, metaMessengerOnboardingStateTTL).Err())
+
+			exchangeStarted := make(chan struct{})
+			releaseExchange := make(chan struct{})
+			var exchangeStartedOnce sync.Once
+			var releaseOnce sync.Once
+			t.Cleanup(func() {
+				releaseOnce.Do(func() { close(releaseExchange) })
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Second)
+				defer cleanupCancel()
+				_ = redisClient.Del(cleanupCtx, startKey).Err()
+			})
+			var oauthExchangeCalls atomic.Int32
+			var oauthDeadlineRemaining atomic.Int64
+			app.HTTPClient = &http.Client{Transport: metaMessengerRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				response := func(status int, body string) *http.Response {
+					return &http.Response{
+						StatusCode: status,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(body)),
+						Request:    request,
+					}
+				}
+				switch request.URL.Path {
+				case "/v25.0/oauth/access_token":
+					oauthExchangeCalls.Add(1)
+					if deadline, ok := request.Context().Deadline(); ok {
+						oauthDeadlineRemaining.Store(int64(time.Until(deadline)))
+					}
+					exchangeStartedOnce.Do(func() { close(exchangeStarted) })
+					select {
+					case <-releaseExchange:
+					case <-request.Context().Done():
+						return nil, request.Context().Err()
+					}
+					return response(http.StatusOK, `{"access_token":"system-user-token","token_type":"bearer"}`), nil
+				case "/v25.0/debug_token":
+					return response(http.StatusOK, `{"data":{"app_id":"100000000000001","type":"SYSTEM_USER","is_valid":true,"scopes":["public_profile","pages_show_list","pages_manage_metadata","pages_messaging"],"user_id":"900000000000001"}}`), nil
+				case "/v25.0/me":
+					return response(http.StatusOK, `{"id":"900000000000001","client_business_id":"200000000000001"}`), nil
+				case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
+					return response(http.StatusOK, `{"data":[{"id":"700000000000001","name":"Review Page","tasks":["MESSAGING","MODERATE"]}]}`), nil
+				case "/v25.0/" + metaLifecycleTestUserID + "/accounts":
+					return response(http.StatusOK, `{"data":[{"id":"700000000000001","name":"Review Page","tasks":["MESSAGING","MODERATE"],"access_token":"page-access-token"}]}`), nil
+				case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
+					return response(http.StatusOK, `{"data":[{"id":"700000000000001","name":"Review Page"}]}`), nil
+				default:
+					return response(http.StatusNotFound, `{"error":{"type":"OAuthException","code":100}}`), nil
+				}
+			})}
+
+			newRequest := func(code string) *fastglue.Request {
+				request := testutil.NewJSONRequest(t, exchangeMetaMessengerOnboardingRequest{Code: code, Nonce: nonce})
+				testutil.SetAuthContext(request, organization.ID, user.ID)
+				testutil.SetHeader(request, "X-Organization-ID", organization.ID.String())
+				return request
+			}
+			firstRequest := newRequest("single-use-code")
+			firstDone := make(chan error, 1)
+			go func() { firstDone <- app.ExchangeMetaMessengerOnboarding(firstRequest) }()
+			select {
+			case <-exchangeStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first callback did not reach the authorization-code exchange")
+			}
+
+			concurrentRequest := newRequest(testCase.concurrentCode)
+			require.NoError(t, app.ExchangeMetaMessengerOnboarding(concurrentRequest))
+			testutil.AssertErrorResponse(
+				t, concurrentRequest, fasthttp.StatusBadRequest,
+				"Messenger onboarding session is invalid or expired",
+			)
+			assert.Equal(t, int32(1), oauthExchangeCalls.Load())
+			remaining := time.Duration(oauthDeadlineRemaining.Load())
+			// The Graph client's per-request timeout is intentionally tighter than
+			// the enclosing callback budget, so the transport observes 30s here.
+			assert.LessOrEqual(t, remaining, metaMessengerGraphHTTPTimeout)
+			assert.Greater(t, remaining, metaMessengerGraphHTTPTimeout-10*time.Second)
+
+			releaseOnce.Do(func() { close(releaseExchange) })
+			select {
+			case err = <-firstDone:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("first callback did not complete after the provider was released")
+			}
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(firstRequest))
+			var exchangeResponse exchangeMetaMessengerOnboardingResponse
+			testutil.ParseEnvelopeResponse(t, firstRequest, &exchangeResponse)
+			require.NotEmpty(t, exchangeResponse.SessionID)
+			selectionKey := metaMessengerSelectionStateKey(organization.ID, user.ID, exchangeResponse.SessionID)
+			t.Cleanup(func() {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Second)
+				defer cleanupCancel()
+				_ = redisClient.Del(cleanupCtx, selectionKey).Err()
+			})
+			selectionJSON, err := redisClient.Get(t.Context(), selectionKey).Bytes()
+			require.NoError(t, err)
+			var selection metaMessengerSelectionSession
+			require.NoError(t, json.Unmarshal(selectionJSON, &selection))
+			assert.Equal(t, exchangeResponse.SessionID, selection.SessionID)
+
+			replayRequest := newRequest("single-use-code")
+			require.NoError(t, app.ExchangeMetaMessengerOnboarding(replayRequest))
+			testutil.AssertErrorResponse(
+				t, replayRequest, fasthttp.StatusBadRequest,
+				"Messenger onboarding session is invalid or expired",
+			)
+			assert.Equal(t, int32(1), oauthExchangeCalls.Load())
+		})
+	}
+}
+
+func TestDiscoverMetaMessengerSystemUserInventoryStartsIndependentEdgesInParallel(t *testing.T) {
+	started := make(chan string, 4)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		current := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			maximum := maxInFlight.Load()
+			if current <= maximum || maxInFlight.CompareAndSwap(maximum, current) {
+				break
+			}
+		}
+		select {
+		case started <- request.URL.Path:
+		case <-request.Context().Done():
+			return
+		default:
+			http.Error(writer, "unexpected duplicate inventory request", http.StatusInternalServerError)
+			return
+		}
+		select {
+		case <-release:
+		case <-request.Context().Done():
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Assigned Page","tasks":["MESSAGING","MODERATE"]}]}`))
+		case "/v25.0/" + metaLifecycleTestUserID + "/accounts":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Account Page","tasks":["MESSAGING","MODERATE"],"access_token":"page-access-token"}]}`))
+		case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Owned Page"}]}`))
+		case "/v25.0/" + metaLifecycleTestBusinessID + "/client_pages":
+			_, _ = writer.Write([]byte(`{"data":[]}`))
+		default:
+			http.Error(writer, "unexpected endpoint", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	type inventoryResult struct {
+		businesses []metaMessengerBusinessSummary
+		pages      []metaMessengerStoredPage
+		err        error
+	}
+	result := make(chan inventoryResult, 1)
+	app := newMetaLifecycleGraphApp(t, server)
+	go func() {
+		businesses, pages, err := app.discoverMetaMessengerSystemUserInventory(
+			t.Context(),
+			"system-user-token",
+			metaMessengerTokenInspection{
+				AppID: metaLifecycleTestAppID, Type: metaMessengerTokenKindSystemUser,
+				UserID: metaLifecycleTestUserID, Scopes: append([]string(nil), metaMessengerRequiredScopes...),
+				CheckedAt: time.Now().UTC(),
+			},
+			metaMessengerPlatformUser{
+				UserID: metaLifecycleTestUserID, TokenKind: metaMessengerTokenKindSystemUser,
+				ClientBusinessID: metaLifecycleTestBusinessID,
+			},
+		)
+		result <- inventoryResult{businesses: businesses, pages: pages, err: err}
+	}()
+
+	watchdog, cancelWatchdog := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelWatchdog()
+	seen := make(map[string]struct{}, 4)
+	for len(seen) < 4 {
+		select {
+		case path := <-started:
+			seen[path] = struct{}{}
+		case <-watchdog.Done():
+			releaseOnce.Do(func() { close(release) })
+			t.Fatal("independent Meta inventory edges did not start concurrently")
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+
+	var discovered inventoryResult
+	select {
+	case discovered = <-result:
+	case <-watchdog.Done():
+		releaseOnce.Do(func() { close(release) })
+		t.Fatal("concurrent Meta inventory discovery did not finish")
+	}
+	require.NoError(t, discovered.err)
+	require.Len(t, discovered.businesses, 1)
+	require.Len(t, discovered.pages, 1)
+	assert.Equal(t, int32(4), maxInFlight.Load())
+	assert.ElementsMatch(t, []string{
+		"/v25.0/" + metaLifecycleTestUserID + "/assigned_pages",
+		"/v25.0/" + metaLifecycleTestUserID + "/accounts",
+		"/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages",
+		"/v25.0/" + metaLifecycleTestBusinessID + "/client_pages",
+	}, stringSetValues(seen))
+}
+
+func TestMetaMessengerParallelInventoryCancelsSiblingsAndPreservesStage(t *testing.T) {
+	allStarted := make(chan struct{})
+	var started atomic.Int32
+	var startedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if started.Add(1) == 3 {
+			startedOnce.Do(func() { close(allStarted) })
+		}
+		select {
+		case <-allStarted:
+		case <-request.Context().Done():
+			return
+		}
+		if request.URL.Path == "/v25.0/"+metaLifecycleTestBusinessID+"/owned_pages" {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusForbidden)
+			_, _ = writer.Write([]byte(`{"error":{"type":"OAuthException","code":200,"error_subcode":0}}`))
+			return
+		}
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	app := newMetaLifecycleGraphApp(t, server)
+	_, _, err := app.discoverMetaMessengerSystemUserInventory(
+		ctx,
+		"system-user-token",
+		metaMessengerTokenInspection{
+			AppID: metaLifecycleTestAppID, Type: metaMessengerTokenKindSystemUser,
+			UserID:                    metaLifecycleTestUserID,
+			Scopes:                    append([]string(nil), metaMessengerSystemUserRequiredScopes...),
+			BusinessEdgeProofRequired: true,
+			CheckedAt:                 time.Now().UTC(),
+		},
+		metaMessengerPlatformUser{
+			UserID: metaLifecycleTestUserID, TokenKind: metaMessengerTokenKindSystemUser,
+			ClientBusinessID: metaLifecycleTestBusinessID,
+		},
+	)
+	require.Error(t, err)
+	var staged *metaMessengerRevalidationError
+	require.ErrorAs(t, err, &staged)
+	assert.Equal(t, metaMessengerRevalidationStageOwnedPages, staged.Stage)
+	var provider *metaMessengerProviderError
+	require.ErrorAs(t, err, &provider)
+	assert.Equal(t, http.StatusForbidden, provider.StatusCode)
+	assert.Equal(t, 200, provider.Code)
+	assert.Equal(t, "Meta Messenger Page revalidation failed at owned_pages", err.Error())
+	assert.Equal(t, int32(3), started.Load())
+}
+
+func stringSetValues(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	return result
 }
 
 func TestMetaMessengerSystemUserSelectionUsesFreshAuthorityToken(t *testing.T) {

@@ -28,18 +28,21 @@ import (
 )
 
 const (
-	metaMessengerStartStatePrefix       = "integration:meta:messenger:onboarding:start:"
-	metaMessengerSelectionStatePrefix   = "integration:meta:messenger:onboarding:selection:"
-	metaMessengerOnboardingStateTTL     = 10 * time.Minute
-	metaMessengerProviderOperationLimit = 90 * time.Second
-	metaMessengerOnboardingMode         = "facebook_login_for_business"
-	metaMessengerAwaitingRegistryState  = "awaiting_relay_registry"
-	metaMessengerVerifyingSubscription  = "verifying_subscription"
-	metaMessengerSubscriptionFailed     = "subscription_failed"
-	metaMessengerReviewReadyState       = "review_relay_ready"
-	metaMessengerManagementMode         = "meta_messenger_oauth"
-	metaMessengerMaxAuthorizationCode   = 8192
-	metaMessengerMaxOpaqueState         = 256
+	metaMessengerStartStatePrefix                   = "integration:meta:messenger:onboarding:start:"
+	metaMessengerSelectionStatePrefix               = "integration:meta:messenger:onboarding:selection:"
+	metaMessengerOnboardingStateTTL                 = 10 * time.Minute
+	metaMessengerProviderOperationLimit             = 90 * time.Second
+	metaMessengerCallbackOperationLimit             = 45 * time.Second
+	metaMessengerProductionIngressIdleLimit         = 60 * time.Second
+	metaMessengerCallbackNonProviderOverheadReserve = 10 * time.Second
+	metaMessengerOnboardingMode                     = "facebook_login_for_business"
+	metaMessengerAwaitingRegistryState              = "awaiting_relay_registry"
+	metaMessengerVerifyingSubscription              = "verifying_subscription"
+	metaMessengerSubscriptionFailed                 = "subscription_failed"
+	metaMessengerReviewReadyState                   = "review_relay_ready"
+	metaMessengerManagementMode                     = "meta_messenger_oauth"
+	metaMessengerMaxAuthorizationCode               = 8192
+	metaMessengerMaxOpaqueState                     = 256
 
 	metaMessengerSubscriptionDesiredStateKey        = "meta_subscription_desired_state"
 	metaMessengerSubscriptionOperationIDKey         = "meta_subscription_operation_id"
@@ -299,12 +302,28 @@ func (a *App) beginMetaMessengerOnboarding(
 	return r.SendEnvelope(response)
 }
 
+// metaMessengerCallbackContext starts at handler entry so every blocking DB,
+// Redis, and provider operation shares one ingress-safe budget. The remaining
+// reserve covers local response construction and serialization. Other
+// onboarding operations keep the wider provider budget because they are not
+// one-shot callbacks.
+func metaMessengerCallbackContext(r *fastglue.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(requestContext(r), metaMessengerCallbackOperationLimit)
+}
+
 // ExchangeMetaMessengerOnboarding consumes the one-time nonce, exchanges the
 // JavaScript SDK authorization code server-side, validates the required five
 // permissions, and returns only an ownership-aware Page inventory. No access
 // token is returned to the browser.
 func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
-	orgID, userID, workspaceName, err := a.requireMetaMessengerOnboardingAuth(r, models.ActionWrite, true)
+	ctx, cancel := metaMessengerCallbackContext(r)
+	defer cancel()
+	orgID, userID, workspaceName, err := a.requireMetaMessengerOnboardingAuthContext(
+		ctx,
+		r,
+		models.ActionWrite,
+		true,
+	)
 	if err != nil {
 		return nil
 	}
@@ -324,14 +343,20 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 	}
 
 	stateJSON, err := a.Redis.GetDel(
-		requestContext(r),
+		ctx,
 		metaMessengerStartStateKey(orgID, userID, request.Nonce),
 	).Bytes()
 	if err != nil {
-		if !errors.Is(err, redis.Nil) {
-			a.Log.Warn("Messenger onboarding nonce lookup failed", "organization_id", orgID)
+		if errors.Is(err, redis.Nil) {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Messenger onboarding session is invalid or expired", nil, "")
 		}
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Messenger onboarding session is invalid or expired", nil, "")
+		a.Log.Warn("Messenger onboarding nonce lookup failed", "organization_id", orgID)
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Messenger onboarding session is temporarily unavailable; start again",
+			nil,
+			"",
+		)
 	}
 	var state metaMessengerStartState
 	if json.Unmarshal(stateJSON, &state) != nil ||
@@ -347,8 +372,6 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Messenger onboarding settings changed; start again", nil, "")
 	}
 
-	ctx, cancel := context.WithTimeout(requestContext(r), metaMessengerProviderOperationLimit)
-	defer cancel()
 	token, err := a.exchangeMetaMessengerAuthorizationCode(ctx, request.Code)
 	if err != nil {
 		a.Log.Warn("Messenger authorization code exchange failed", "organization_id", orgID)
@@ -428,9 +451,10 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to prepare Messenger Page selection", nil, "")
 	}
+	selectionKey := metaMessengerSelectionStateKey(orgID, userID, sessionID)
 	if err := a.Redis.Set(
-		requestContext(r),
-		metaMessengerSelectionStateKey(orgID, userID, sessionID),
+		ctx,
+		selectionKey,
 		sessionJSON,
 		time.Until(expiresAt),
 	).Err(); err != nil {
@@ -440,6 +464,17 @@ func (a *App) ExchangeMetaMessengerOnboarding(r *fastglue.Request) error {
 	pageResponse := make([]metaMessengerPageSummary, 0, len(pages))
 	for _, page := range pages {
 		pageResponse = append(pageResponse, page.metaMessengerPageSummary)
+	}
+	if ctx.Err() != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Second)
+		_ = a.Redis.Del(cleanupCtx, selectionKey).Err()
+		cleanupCancel()
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Messenger Page selection timed out; start again",
+			nil,
+			"",
+		)
 	}
 	setMetaMessengerNoStoreHeaders(r)
 	return r.SendEnvelope(exchangeMetaMessengerOnboardingResponse{
@@ -761,6 +796,20 @@ func (a *App) requireMetaMessengerOnboardingAuth(
 	channelAction string,
 	requireIntegrationWrite bool,
 ) (uuid.UUID, uuid.UUID, string, error) {
+	return a.requireMetaMessengerOnboardingAuthContext(
+		requestContext(r),
+		r,
+		channelAction,
+		requireIntegrationWrite,
+	)
+}
+
+func (a *App) requireMetaMessengerOnboardingAuthContext(
+	ctx context.Context,
+	r *fastglue.Request,
+	channelAction string,
+	requireIntegrationWrite bool,
+) (uuid.UUID, uuid.UUID, string, error) {
 	selectedOrgID, err := a.requireExplicitOrganization(r)
 	if err != nil {
 		return uuid.Nil, uuid.Nil, "", err
@@ -781,7 +830,7 @@ func (a *App) requireMetaMessengerOnboardingAuth(
 	}
 	var authErr error
 	var workspaceName string
-	if err := database.WithTenantReadCommitted(root.DB, orgID, func(tx *gorm.DB) error {
+	if err := database.WithTenantReadCommitted(root.DB.WithContext(ctx), orgID, func(tx *gorm.DB) error {
 		scoped := root.scopedApp(tx, orgID)
 		_, _, authErr = scoped.requireAuth(r, models.ResourceChannelAccounts, channelAction)
 		if authErr != nil {
