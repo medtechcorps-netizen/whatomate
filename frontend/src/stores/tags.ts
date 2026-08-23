@@ -29,14 +29,31 @@ export const useTagsStore = defineStore('tags', () => {
   const tags = ref<Tag[]>([])
   const loading = ref(false)
   const error = ref<string | null>(null)
+  let identityGeneration = 0
+  let fetchGeneration = 0
+
+  function resetForIdentityChange() {
+    identityGeneration++
+    fetchGeneration++
+    tags.value = []
+    loading.value = false
+    error.value = null
+  }
 
   async function fetchTags(params?: FetchTagsParams): Promise<FetchTagsResponse> {
+    const identity = identityGeneration
+    const requestGeneration = ++fetchGeneration
     loading.value = true
     error.value = null
     try {
       const response = await tagsService.list(params)
       const data = (response.data as any).data || response.data
-      tags.value = data.tags || []
+      if (
+        identity === identityGeneration &&
+        requestGeneration === fetchGeneration
+      ) {
+        tags.value = data.tags || []
+      }
       return {
         tags: data.tags || [],
         total: data.total ?? tags.value.length,
@@ -44,65 +61,90 @@ export const useTagsStore = defineStore('tags', () => {
         limit: data.limit ?? 50
       }
     } catch (err: any) {
-      error.value = err.response?.data?.message || 'Failed to fetch tags'
+      if (
+        identity === identityGeneration &&
+        requestGeneration === fetchGeneration
+      ) {
+        error.value = err.response?.data?.message || 'Failed to fetch tags'
+      }
       throw err
     } finally {
-      loading.value = false
+      if (
+        identity === identityGeneration &&
+        requestGeneration === fetchGeneration
+      ) {
+        loading.value = false
+      }
     }
   }
 
   async function createTag(data: CreateTagData): Promise<Tag> {
+    const identity = identityGeneration
     loading.value = true
     error.value = null
     try {
       const response = await tagsService.create(data)
       const newTag = (response.data as any).data || response.data
-      tags.value.push(newTag)
-      // Sort by name
-      tags.value.sort((a, b) => a.name.localeCompare(b.name))
+      if (identity === identityGeneration) {
+        tags.value.push(newTag)
+        // Sort by name
+        tags.value.sort((a, b) => a.name.localeCompare(b.name))
+      }
       return newTag
     } catch (err: any) {
-      error.value = err.response?.data?.message || 'Failed to create tag'
+      if (identity === identityGeneration) {
+        error.value = err.response?.data?.message || 'Failed to create tag'
+      }
       throw err
     } finally {
-      loading.value = false
+      if (identity === identityGeneration) loading.value = false
     }
   }
 
   async function updateTag(name: string, data: UpdateTagData): Promise<Tag> {
+    const identity = identityGeneration
     loading.value = true
     error.value = null
     try {
       const response = await tagsService.update(name, data)
       const updatedTag = (response.data as any).data || response.data
-      const index = tags.value.findIndex(t => t.name === name)
-      if (index !== -1) {
-        tags.value[index] = updatedTag
-      }
-      // Re-sort if name changed
-      if (data.name && data.name !== name) {
-        tags.value.sort((a, b) => a.name.localeCompare(b.name))
+      if (identity === identityGeneration) {
+        const index = tags.value.findIndex(t => t.name === name)
+        if (index !== -1) {
+          tags.value[index] = updatedTag
+        }
+        // Re-sort if name changed
+        if (data.name && data.name !== name) {
+          tags.value.sort((a, b) => a.name.localeCompare(b.name))
+        }
       }
       return updatedTag
     } catch (err: any) {
-      error.value = err.response?.data?.message || 'Failed to update tag'
+      if (identity === identityGeneration) {
+        error.value = err.response?.data?.message || 'Failed to update tag'
+      }
       throw err
     } finally {
-      loading.value = false
+      if (identity === identityGeneration) loading.value = false
     }
   }
 
   async function deleteTag(name: string): Promise<void> {
+    const identity = identityGeneration
     loading.value = true
     error.value = null
     try {
       await tagsService.delete(name)
-      tags.value = tags.value.filter(t => t.name !== name)
+      if (identity === identityGeneration) {
+        tags.value = tags.value.filter(t => t.name !== name)
+      }
     } catch (err: any) {
-      error.value = err.response?.data?.message || 'Failed to delete tag'
+      if (identity === identityGeneration) {
+        error.value = err.response?.data?.message || 'Failed to delete tag'
+      }
       throw err
     } finally {
-      loading.value = false
+      if (identity === identityGeneration) loading.value = false
     }
   }
 
@@ -118,6 +160,7 @@ export const useTagsStore = defineStore('tags', () => {
     createTag,
     updateTag,
     deleteTag,
-    getTagByName
+    getTagByName,
+    resetForIdentityChange,
   }
 })

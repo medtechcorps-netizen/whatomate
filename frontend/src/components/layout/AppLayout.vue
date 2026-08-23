@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
@@ -38,7 +38,7 @@ onMounted(() => {
     authStore.refreshUserData()
     authStore.ensureProductEntitlements()
 
-    wsService.connect(async () => {
+    void wsService.connect(async () => {
       try {
         const resp = await authService.getWSToken()
         return resp.data.data.token
@@ -159,9 +159,20 @@ const toggleSidebar = () => {
 }
 
 const handleLogout = async () => {
+  // Stop reconnect attempts before revoking the session. Otherwise a token
+  // request already in flight can reopen the socket while logout completes.
+  wsService.disconnect()
   await authStore.logout()
+  // Clear every cached workspace identity only after the logout request has
+  // used the current tenant. A different account must never inherit names,
+  // memberships, pending reply keys, or the old org header.
+  organizationsStore.resetForIdentityChange()
   router.push('/login')
 }
+
+onBeforeUnmount(() => {
+  wsService.disconnect()
+})
 </script>
 
 <template>

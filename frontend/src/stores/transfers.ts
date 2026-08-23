@@ -81,6 +81,9 @@ export const useTransfersStore = defineStore('transfers', () => {
   const historyOffset = ref(0)
   const historyLimit = ref(20)
   const isLoadingHistory = ref(false)
+  let identityGeneration = 0
+  let transfersFetchGeneration = 0
+  let historyFetchGeneration = 0
 
   // Total queue count (general + all teams)
   const queueCount = computed(() => {
@@ -111,6 +114,24 @@ export const useTransfersStore = defineStore('transfers', () => {
   // Pagination state
   const totalCount = ref(0)
 
+  function resetForIdentityChange() {
+    identityGeneration++
+    transfersFetchGeneration++
+    historyFetchGeneration++
+    transfers.value = []
+    generalQueueCount.value = 0
+    teamQueueCounts.value = {}
+    allowQueuePickup.value = true
+    isLoading.value = false
+    lastSyncedAt.value = 0
+    totalCount.value = 0
+    historyTransfers.value = []
+    historyTotalCount.value = 0
+    historyOffset.value = 0
+    historyLimit.value = 20
+    isLoadingHistory.value = false
+  }
+
   async function fetchTransfers(params?: {
     status?: string
     limit?: number
@@ -118,10 +139,16 @@ export const useTransfersStore = defineStore('transfers', () => {
     include?: string
     append?: boolean // If true, append to existing list instead of replacing
   }) {
+    const identity = identityGeneration
+    const requestGeneration = ++transfersFetchGeneration
     isLoading.value = true
     try {
       const response = await chatbotService.listTransfers(params)
       const data = response.data.data || response.data
+      if (
+        identity !== identityGeneration ||
+        requestGeneration !== transfersFetchGeneration
+      ) return
 
       if (params?.append && params.offset) {
         // Append for pagination
@@ -137,14 +164,26 @@ export const useTransfersStore = defineStore('transfers', () => {
         : true
       totalCount.value = data.total_count ?? transfers.value.length
     } catch (error) {
-      console.error('Failed to fetch transfers:', error)
+      if (
+        identity === identityGeneration &&
+        requestGeneration === transfersFetchGeneration
+      ) {
+        console.error('Failed to fetch transfers:', error)
+      }
     } finally {
-      isLoading.value = false
+      if (
+        identity === identityGeneration &&
+        requestGeneration === transfersFetchGeneration
+      ) {
+        isLoading.value = false
+      }
     }
   }
 
   // Fetch transfer history (resumed transfers) with pagination
   async function fetchHistory(params?: { limit?: number; offset?: number; append?: boolean }) {
+    const identity = identityGeneration
+    const requestGeneration = ++historyFetchGeneration
     isLoadingHistory.value = true
     try {
       const response = await chatbotService.listTransfers({
@@ -154,6 +193,10 @@ export const useTransfersStore = defineStore('transfers', () => {
         include: 'contact,agent,team,resumed_by' // Skip transferred_by for history
       })
       const data = response.data.data || response.data
+      if (
+        identity !== identityGeneration ||
+        requestGeneration !== historyFetchGeneration
+      ) return
 
       if (params?.append && params.offset) {
         historyTransfers.value = [...historyTransfers.value, ...(data.transfers || [])]
@@ -164,9 +207,19 @@ export const useTransfersStore = defineStore('transfers', () => {
       historyTotalCount.value = data.total_count ?? historyTransfers.value.length
       historyOffset.value = data.offset ?? 0
     } catch (error) {
-      console.error('Failed to fetch transfer history:', error)
+      if (
+        identity === identityGeneration &&
+        requestGeneration === historyFetchGeneration
+      ) {
+        console.error('Failed to fetch transfer history:', error)
+      }
     } finally {
-      isLoadingHistory.value = false
+      if (
+        identity === identityGeneration &&
+        requestGeneration === historyFetchGeneration
+      ) {
+        isLoadingHistory.value = false
+      }
     }
   }
 
@@ -294,6 +347,7 @@ export const useTransfersStore = defineStore('transfers', () => {
     addTransfer,
     updateTransfer,
     removeTransfer,
-    getActiveTransferForContact
+    getActiveTransferForContact,
+    resetForIdentityChange,
   }
 })

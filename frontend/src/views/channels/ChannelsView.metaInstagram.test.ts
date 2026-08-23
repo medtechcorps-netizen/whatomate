@@ -20,7 +20,12 @@ const mocks = vi.hoisted(() => ({
   },
   blockOrganizationSwitch: vi.fn(),
   unblockOrganizationSwitch: vi.fn(),
-  onChannelSync: vi.fn(() => vi.fn()),
+  connectWebSocket: vi.fn().mockResolvedValue(undefined),
+  onInboxActivity: vi.fn(() => vi.fn()),
+  onConnectionStateChange: vi.fn((callback) => {
+    callback("connected");
+    return vi.fn();
+  }),
 }));
 
 const organizationId = mocks.organizationId;
@@ -54,7 +59,12 @@ vi.mock("@/stores/organizations", () => ({
 }));
 
 vi.mock("@/services/websocket", () => ({
-  wsService: { onChannelSync: mocks.onChannelSync },
+  wsService: {
+    getConnectionState: () => "connected",
+    connect: mocks.connectWebSocket,
+    onInboxActivity: mocks.onInboxActivity,
+    onConnectionStateChange: mocks.onConnectionStateChange,
+  },
 }));
 
 vi.mock("@/services/metaMessengerOnboarding", () => {

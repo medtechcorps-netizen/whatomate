@@ -44,6 +44,12 @@ export const useCallingStore = defineStore('calling', () => {
   const outgoingContactPhone = ref<string>('')
   const isOnHold = ref(false)
   const isTransferring = ref(false)
+  let identityGeneration = 0
+  let callLogsFetchGeneration = 0
+  let callLogFetchGeneration = 0
+  let ivrFlowsFetchGeneration = 0
+  let ivrFlowFetchGeneration = 0
+  let waitingTransfersFetchGeneration = 0
 
   // Computed
   const activeFlows = computed(() => ivrFlows.value.filter(f => f.is_active && f.is_call_start))
@@ -62,11 +68,17 @@ export const useCallingStore = defineStore('calling', () => {
     page?: number
     limit?: number
   }) {
+    const identity = identityGeneration
+    const requestGeneration = ++callLogsFetchGeneration
     callLogsLoading.value = true
     try {
       const page = params?.page ?? callLogsPage.value
       const limit = params?.limit ?? callLogsLimit.value
       const response = await callLogsService.list({ ...params, page, limit })
+      if (
+        identity !== identityGeneration ||
+        requestGeneration !== callLogsFetchGeneration
+      ) return
       const data = response.data as any
       callLogs.value = data.data?.call_logs ?? data.call_logs ?? []
       callLogsTotal.value = data.data?.total ?? data.total ?? 0
@@ -74,13 +86,24 @@ export const useCallingStore = defineStore('calling', () => {
     } catch {
       // Silently handle
     } finally {
-      callLogsLoading.value = false
+      if (
+        identity === identityGeneration &&
+        requestGeneration === callLogsFetchGeneration
+      ) {
+        callLogsLoading.value = false
+      }
     }
   }
 
   async function fetchCallLog(id: string) {
+    const identity = identityGeneration
+    const requestGeneration = ++callLogFetchGeneration
     try {
       const response = await callLogsService.get(id)
+      if (
+        identity !== identityGeneration ||
+        requestGeneration !== callLogFetchGeneration
+      ) return null
       const data = response.data as any
       currentCallLog.value = data.data ?? data
       return currentCallLog.value
@@ -91,22 +114,39 @@ export const useCallingStore = defineStore('calling', () => {
 
   // IVR Flows actions
   async function fetchIVRFlows(params?: { search?: string; page?: number; limit?: number }) {
+    const identity = identityGeneration
+    const requestGeneration = ++ivrFlowsFetchGeneration
     ivrFlowsLoading.value = true
     try {
       const response = await ivrFlowsService.list(params)
+      if (
+        identity !== identityGeneration ||
+        requestGeneration !== ivrFlowsFetchGeneration
+      ) return
       const data = response.data as any
       ivrFlows.value = data.data?.ivr_flows ?? data.ivr_flows ?? []
       ivrFlowsTotal.value = data.data?.total ?? data.total ?? 0
     } catch {
       // Silently handle
     } finally {
-      ivrFlowsLoading.value = false
+      if (
+        identity === identityGeneration &&
+        requestGeneration === ivrFlowsFetchGeneration
+      ) {
+        ivrFlowsLoading.value = false
+      }
     }
   }
 
   async function fetchIVRFlow(id: string) {
+    const identity = identityGeneration
+    const requestGeneration = ++ivrFlowFetchGeneration
     try {
       const response = await ivrFlowsService.get(id)
+      if (
+        identity !== identityGeneration ||
+        requestGeneration !== ivrFlowFetchGeneration
+      ) return null
       const data = response.data as any
       currentIVRFlow.value = data.data ?? data
       return currentIVRFlow.value
@@ -116,27 +156,34 @@ export const useCallingStore = defineStore('calling', () => {
   }
 
   async function createIVRFlow(flowData: Parameters<typeof ivrFlowsService.create>[0]) {
+    const identity = identityGeneration
     const response = await ivrFlowsService.create(flowData)
     const data = response.data as any
     const flow = data.data ?? data
-    ivrFlows.value.unshift(flow)
+    if (identity === identityGeneration) ivrFlows.value.unshift(flow)
     return flow
   }
 
   async function updateIVRFlow(id: string, flowData: Parameters<typeof ivrFlowsService.update>[1]) {
+    const identity = identityGeneration
     const response = await ivrFlowsService.update(id, flowData)
     const data = response.data as any
     const updated = data.data ?? data
-    const idx = ivrFlows.value.findIndex(f => f.id === id)
-    if (idx !== -1) {
-      ivrFlows.value[idx] = updated
+    if (identity === identityGeneration) {
+      const idx = ivrFlows.value.findIndex(f => f.id === id)
+      if (idx !== -1) {
+        ivrFlows.value[idx] = updated
+      }
     }
     return updated
   }
 
   async function deleteIVRFlow(id: string) {
+    const identity = identityGeneration
     await ivrFlowsService.delete(id)
-    ivrFlows.value = ivrFlows.value.filter(f => f.id !== id)
+    if (identity === identityGeneration) {
+      ivrFlows.value = ivrFlows.value.filter(f => f.id !== id)
+    }
   }
 
   // ICE server config (fetched from backend)
@@ -144,24 +191,52 @@ export const useCallingStore = defineStore('calling', () => {
 
   async function getICEServers(): Promise<RTCIceServer[]> {
     if (cachedICEServers) return cachedICEServers
+    const identity = identityGeneration
     try {
       const response = await outgoingCallsService.getICEServers()
       const data = response.data as any
       const servers = data.data?.ice_servers ?? data.ice_servers ?? []
-      cachedICEServers = servers.map((s: any) => ({
+      const mappedServers = servers.map((s: any) => ({
         urls: s.urls,
         ...(s.username && { username: s.username, credential: s.credential }),
       }))
+      if (identity === identityGeneration) cachedICEServers = mappedServers
+      return mappedServers
     } catch {
-      cachedICEServers = []
+      if (identity === identityGeneration) cachedICEServers = []
+      return []
     }
-    return cachedICEServers!
+  }
+
+  function assertCallIdentity(
+    identity: number,
+    stream?: MediaStream,
+    pc?: RTCPeerConnection,
+  ) {
+    if (identity === identityGeneration) return
+    if (pc) {
+      pc.ontrack = null
+      pc.onconnectionstatechange = null
+      pc.close()
+      if (peerConnection.value === pc) peerConnection.value = null
+    }
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop())
+      if (localStream.value === stream) localStream.value = null
+    }
+    throw new Error('Calling identity changed')
   }
 
   // Call Transfer actions
   async function fetchWaitingTransfers() {
+    const identity = identityGeneration
+    const requestGeneration = ++waitingTransfersFetchGeneration
     try {
       const response = await callTransfersService.list({ status: 'waiting' })
+      if (
+        identity !== identityGeneration ||
+        requestGeneration !== waitingTransfersFetchGeneration
+      ) return
       const data = response.data as any
       waitingTransfers.value = data.data?.call_transfers ?? data.call_transfers ?? []
     } catch {
@@ -170,6 +245,7 @@ export const useCallingStore = defineStore('calling', () => {
   }
 
   async function acceptTransfer(id: string) {
+    const identity = identityGeneration
     // Snapshot the transfer before the API call — the server broadcasts
     // call_transfer_connected immediately which removes it from waitingTransfers
     // via the WebSocket handler before this function completes.
@@ -183,11 +259,13 @@ export const useCallingStore = defineStore('calling', () => {
     } catch {
       throw new Error('Microphone access is required to accept calls')
     }
+    assertCallIdentity(identity, stream)
 
     localStream.value = stream
 
     // Create RTCPeerConnection with configured ICE servers
     const iceServers = await getICEServers()
+    assertCallIdentity(identity, stream)
     const pc = new RTCPeerConnection({ iceServers })
     peerConnection.value = pc
 
@@ -201,7 +279,7 @@ export const useCallingStore = defineStore('calling', () => {
       // A queued ontrack can still fire after cleanup() tore this call down
       // (or after a new call replaced the connection); recreating the audio
       // element here would leak it and play ghost audio from a dead stream.
-      if (peerConnection.value !== pc) return
+      if (identity !== identityGeneration || peerConnection.value !== pc) return
       if (!remoteAudioEl) remoteAudioEl = new Audio()
       remoteAudioEl.srcObject = event.streams[0]
       remoteAudioEl.play().catch(() => { /* ignore autoplay */ })
@@ -209,6 +287,7 @@ export const useCallingStore = defineStore('calling', () => {
 
     // Clean up when WebRTC connection drops
     pc.onconnectionstatechange = () => {
+      if (identity !== identityGeneration) return
       if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         cleanup()
       }
@@ -216,7 +295,9 @@ export const useCallingStore = defineStore('calling', () => {
 
     // Create SDP offer
     const offer = await pc.createOffer()
+    assertCallIdentity(identity, stream, pc)
     await pc.setLocalDescription(offer)
+    assertCallIdentity(identity, stream, pc)
 
     // Wait for ICE gathering (with 3s timeout to avoid long TURN delays)
     await new Promise<void>((resolve) => {
@@ -232,6 +313,7 @@ export const useCallingStore = defineStore('calling', () => {
         }
       }
     })
+    assertCallIdentity(identity, stream, pc)
 
     const sdpOffer = pc.localDescription?.sdp
     if (!sdpOffer) {
@@ -241,6 +323,7 @@ export const useCallingStore = defineStore('calling', () => {
 
     // Send offer to server, get answer
     const response = await callTransfersService.connect(id, sdpOffer)
+    assertCallIdentity(identity, stream, pc)
     const data = response.data as any
     const sdpAnswer = data.data?.sdp_answer ?? data.sdp_answer
 
@@ -249,6 +332,7 @@ export const useCallingStore = defineStore('calling', () => {
       type: 'answer',
       sdp: sdpAnswer
     }))
+    assertCallIdentity(identity, stream, pc)
 
     // Transfer is now connected — use the snapshot taken before the API call
     if (transfer) {
@@ -265,6 +349,7 @@ export const useCallingStore = defineStore('calling', () => {
 
   // Outgoing call actions
   async function makeOutgoingCall(contactId: string, contactName: string, whatsappAccount: string) {
+    const identity = identityGeneration
     // Get microphone access
     let stream: MediaStream
     try {
@@ -272,11 +357,13 @@ export const useCallingStore = defineStore('calling', () => {
     } catch {
       throw new Error('Microphone access is required to make calls')
     }
+    assertCallIdentity(identity, stream)
 
     localStream.value = stream
 
     // Create RTCPeerConnection with configured ICE servers
     const iceServers = await getICEServers()
+    assertCallIdentity(identity, stream)
     const pc = new RTCPeerConnection({ iceServers })
     peerConnection.value = pc
 
@@ -289,7 +376,7 @@ export const useCallingStore = defineStore('calling', () => {
     pc.ontrack = (event) => {
       // Same late-ontrack guard as in acceptTransfer: never re-create
       // the audio element for a connection that is no longer the active one.
-      if (peerConnection.value !== pc) return
+      if (identity !== identityGeneration || peerConnection.value !== pc) return
       if (!remoteAudioEl) remoteAudioEl = new Audio()
       remoteAudioEl.srcObject = event.streams[0]
       remoteAudioEl.play().catch(() => { /* ignore autoplay */ })
@@ -297,6 +384,7 @@ export const useCallingStore = defineStore('calling', () => {
 
     // Clean up when WebRTC connection drops
     pc.onconnectionstatechange = () => {
+      if (identity !== identityGeneration) return
       if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         cleanup()
       }
@@ -304,7 +392,9 @@ export const useCallingStore = defineStore('calling', () => {
 
     // Create SDP offer
     const offer = await pc.createOffer()
+    assertCallIdentity(identity, stream, pc)
     await pc.setLocalDescription(offer)
+    assertCallIdentity(identity, stream, pc)
 
     // Wait for ICE gathering (with 3s timeout to avoid long TURN delays)
     await new Promise<void>((resolve) => {
@@ -320,6 +410,7 @@ export const useCallingStore = defineStore('calling', () => {
         }
       }
     })
+    assertCallIdentity(identity, stream, pc)
 
     const sdpOffer = pc.localDescription?.sdp
     if (!sdpOffer) {
@@ -333,6 +424,7 @@ export const useCallingStore = defineStore('calling', () => {
       whatsapp_account: whatsappAccount,
       sdp_offer: sdpOffer,
     })
+    assertCallIdentity(identity, stream, pc)
     const data = response.data as any
     const callLogId = data.data?.call_log_id ?? data.call_log_id
     const sdpAnswer = data.data?.sdp_answer ?? data.sdp_answer
@@ -342,6 +434,7 @@ export const useCallingStore = defineStore('calling', () => {
       type: 'answer',
       sdp: sdpAnswer,
     }))
+    assertCallIdentity(identity, stream, pc)
 
     // Update state
     outgoingCallLogId.value = callLogId
@@ -358,6 +451,7 @@ export const useCallingStore = defineStore('calling', () => {
   }
 
   async function initiateTransfer(teamId: string, agentId?: string) {
+    const identity = identityGeneration
     const callLogId = outgoingCallLogId.value ?? activeTransfer.value?.call_log_id
     if (!callLogId) throw new Error('No active call to transfer')
     isTransferring.value = true
@@ -367,13 +461,16 @@ export const useCallingStore = defineStore('calling', () => {
         team_id: teamId,
         ...(agentId ? { agent_id: agentId } : {}),
       })
-      cleanup() // Agent is disconnected — tear down local WebRTC
+      if (identity === identityGeneration) {
+        cleanup() // Agent is disconnected — tear down local WebRTC
+      }
     } finally {
-      isTransferring.value = false
+      if (identity === identityGeneration) isTransferring.value = false
     }
   }
 
   async function endCall() {
+    const identity = identityGeneration
     if (outgoingCallLogId.value) {
       // Outgoing call hangup
       try {
@@ -389,7 +486,7 @@ export const useCallingStore = defineStore('calling', () => {
         // Best effort
       }
     }
-    cleanup()
+    if (identity === identityGeneration) cleanup()
   }
 
   function toggleMute() {
@@ -403,17 +500,19 @@ export const useCallingStore = defineStore('calling', () => {
   }
 
   async function holdCall() {
+    const identity = identityGeneration
     const callLogId = outgoingCallLogId.value ?? activeTransfer.value?.call_log_id
     if (!callLogId) return
     await callLogsService.hold(callLogId)
-    isOnHold.value = true
+    if (identity === identityGeneration) isOnHold.value = true
   }
 
   async function resumeCall() {
+    const identity = identityGeneration
     const callLogId = outgoingCallLogId.value ?? activeTransfer.value?.call_log_id
     if (!callLogId) return
     await callLogsService.resume(callLogId)
-    isOnHold.value = false
+    if (identity === identityGeneration) isOnHold.value = false
   }
 
   function cleanup() {
@@ -443,6 +542,29 @@ export const useCallingStore = defineStore('calling', () => {
     outgoingContactPhone.value = ''
     callDuration.value = 0
     isMuted.value = false
+  }
+
+  function resetForIdentityChange() {
+    identityGeneration++
+    callLogsFetchGeneration++
+    callLogFetchGeneration++
+    ivrFlowsFetchGeneration++
+    ivrFlowFetchGeneration++
+    waitingTransfersFetchGeneration++
+    cleanup()
+    callLogs.value = []
+    callLogsTotal.value = 0
+    callLogsLoading.value = false
+    callLogsPage.value = 1
+    currentCallLog.value = null
+    ivrFlows.value = []
+    ivrFlowsTotal.value = 0
+    ivrFlowsLoading.value = false
+    currentIVRFlow.value = null
+    waitingTransfers.value = []
+    callPermissions.clear()
+    cachedICEServers = null
+    isTransferring.value = false
   }
 
   // Call permission helpers
@@ -579,6 +701,7 @@ export const useCallingStore = defineStore('calling', () => {
     getCallPermission,
     setCallPermissionPending,
     // WS handler
-    handleCallEvent
+    handleCallEvent,
+    resetForIdentityChange,
   }
 })

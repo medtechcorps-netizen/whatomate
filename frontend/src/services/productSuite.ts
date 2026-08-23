@@ -618,6 +618,7 @@ export interface InboxConversation {
   status: string
   last_message_preview?: string
   last_message_at?: string
+  service_window_ends_at?: string
   unread_count: number
   ai_paused: boolean
   ai_pause_reason?: string
@@ -896,6 +897,24 @@ export const channelsService = {
   messages: (id: string, params?: { before?: string; limit?: number }) =>
     api.get(`/conversations/${id}/messages`, { params }),
   send: (id: string, data: Record<string, unknown>) => api.post(`/conversations/${id}/messages`, data),
+  replyLegacyWhatsApp: (
+    id: string,
+    data: {
+      type: 'text'
+      content: { body: string }
+      reply_to_message_id?: string
+      idempotency_key: string
+    },
+    organizationId: string,
+  ) => {
+    const explicitOrganizationId = organizationId.trim()
+    if (!explicitOrganizationId) {
+      throw new Error('Organization is required for a WhatsApp reply')
+    }
+    return api.post(`/conversations/${id}/legacy-whatsapp-replies`, data, {
+      headers: { 'X-Organization-ID': explicitOrganizationId },
+    })
+  },
   markRead: (id: string) => api.post(`/conversations/${id}/read`),
   setAIState: (id: string, paused: boolean) => api.put(`/conversations/${id}/ai`, { paused }),
 }

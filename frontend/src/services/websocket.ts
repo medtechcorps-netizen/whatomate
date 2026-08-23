@@ -1,6 +1,10 @@
 import { useContactsStore } from '@/stores/contacts'
 import { useTransfersStore } from '@/stores/transfers'
 import { useCallingStore } from '@/stores/calling'
+import { useTagsStore } from '@/stores/tags'
+import { useUsersStore } from '@/stores/users'
+import { useRolesStore } from '@/stores/roles'
+import { useTeamsStore } from '@/stores/teams'
 import { useAuthStore } from '@/stores/auth'
 import { useNotesStore } from '@/stores/notes'
 import { contactsService } from '@/services/api'
@@ -64,6 +68,7 @@ const WS_TYPE_CAMPAIGN_STATS_UPDATE = 'campaign_stats_update'
 // Permission types
 const WS_TYPE_PERMISSIONS_UPDATED = 'permissions_updated'
 const WS_TYPE_CHANNEL_SYNC = 'channel_sync'
+const WS_TYPE_REALTIME_SYNC = 'realtime_sync'
 
 // Call types
 const WS_TYPE_CALL_INCOMING = 'call_incoming'
@@ -94,43 +99,100 @@ interface WSMessage {
   payload: any
 }
 
+export type InboxActivityType =
+  | typeof WS_TYPE_NEW_MESSAGE
+  | typeof WS_TYPE_STATUS_UPDATE
+  | typeof WS_TYPE_CHANNEL_SYNC
+  | typeof WS_TYPE_REALTIME_SYNC
+
+export interface InboxActivityEvent {
+  type: InboxActivityType
+  payload: any
+}
+
+export type WebSocketConnectionState =
+  | 'disconnected'
+  | 'connecting'
+  | 'connected'
+  | 'reconnecting'
+
 class WebSocketService {
   private ws: WebSocket | null = null
   private reconnectAttempts = 0
-  private maxReconnectAttempts = 5
   private reconnectDelay = 1000
+  private maxReconnectDelay = 30000
+  private reconnectTimer: number | null = null
+  private connectTimeoutTimer: number | null = null
   private pingInterval: number | null = null
+  private heartbeatWatchdogInterval: number | null = null
+  private lastPongAt = 0
+  private nativeInboxRefreshTimer: number | null = null
+  private nativeInboxRefreshTimerGeneration: number | null = null
+  private nativeInboxRefreshInFlightGeneration: number | null = null
+  private nativeInboxRefreshQueuedGeneration: number | null = null
+  private connectInFlightGeneration: number | null = null
+  private shouldReconnect = false
+  private connectionGeneration = 0
   private isConnected = false
   private hasConnectedBefore = false
+  private connectionState: WebSocketConnectionState = 'disconnected'
   private campaignStatsCallbacks: ((payload: any) => void)[] = []
   private channelSyncCallbacks: ((payload: any) => void)[] = []
+  private inboxActivityCallbacks: ((event: InboxActivityEvent) => void)[] = []
+  private connectionStateCallbacks: ((state: WebSocketConnectionState) => void)[] = []
   private getTokenFn: (() => Promise<string | null>) | null = null
 
   async connect(getToken?: () => Promise<string | null>) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      return
-    }
-
     // Store the token function for reconnects
     if (getToken) {
       this.getTokenFn = getToken
     }
 
-    // Get a fresh short-lived WS token
-    const token = this.getTokenFn ? await this.getTokenFn() : null
-    if (!token) {
+    this.shouldReconnect = true
+    const generation = this.connectionGeneration
+
+    if (
+      this.ws?.readyState === WebSocket.OPEN ||
+      this.ws?.readyState === WebSocket.CONNECTING ||
+      this.connectInFlightGeneration === generation
+    ) {
       return
     }
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const host = window.location.host
-    const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')
-    const url = `${protocol}//${host}${basePath}/ws`
+    if (!this.getTokenFn) {
+      this.setConnectionState('disconnected')
+      return
+    }
+
+    this.clearReconnectTimer()
+    this.connectInFlightGeneration = generation
+    this.setConnectionState(this.hasConnectedBefore ? 'reconnecting' : 'connecting')
 
     try {
-      this.ws = new WebSocket(url)
+      // Get a fresh short-lived WS token for every connection attempt.
+      const token = await this.getTokenFn()
+      if (!this.shouldReconnect || generation !== this.connectionGeneration) {
+        return
+      }
+      if (!token) {
+        this.scheduleReconnect()
+        return
+      }
 
-      this.ws.onopen = () => {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const host = window.location.host
+      const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')
+      const url = `${protocol}//${host}${basePath}/ws`
+      const socket = new WebSocket(url)
+      this.ws = socket
+      this.startConnectTimeout(socket, generation)
+
+      socket.onopen = () => {
+        if (this.ws !== socket || !this.shouldReconnect) {
+          socket.close()
+          return
+        }
+        this.clearConnectTimeout()
         // Send auth message as the first message (token not in URL for security)
         this.send({ type: WS_TYPE_AUTH, payload: { token } })
 
@@ -138,6 +200,8 @@ class WebSocketService {
         this.isConnected = true
         this.hasConnectedBefore = true
         this.reconnectAttempts = 0
+        this.clearReconnectTimer()
+        this.setConnectionState('connected')
         this.startPing()
 
         // Force refresh data after reconnection to sync any missed updates
@@ -146,35 +210,68 @@ class WebSocketService {
         }
       }
 
-      this.ws.onmessage = (event) => {
+      socket.onmessage = (event) => {
+        if (this.ws !== socket || !this.shouldReconnect) return
         this.handleMessage(event.data)
       }
 
-      this.ws.onclose = () => {
+      socket.onclose = () => {
+        if (this.ws !== socket) return
+        this.clearConnectTimeout()
+        this.ws = null
         this.isConnected = false
         this.stopPing()
-        this.handleReconnect()
+        if (this.shouldReconnect) {
+          this.scheduleReconnect()
+        } else {
+          this.setConnectionState('disconnected')
+        }
       }
 
-      this.ws.onerror = () => {
-        // Error handled by onclose
+      socket.onerror = () => {
+        if (this.ws === socket) this.forceReconnect(socket)
       }
     } catch {
-      this.handleReconnect()
+      if (this.shouldReconnect && generation === this.connectionGeneration) {
+        this.scheduleReconnect()
+      }
+    } finally {
+      if (this.connectInFlightGeneration === generation) {
+        this.connectInFlightGeneration = null
+      }
     }
   }
 
   disconnect() {
+    this.shouldReconnect = false
+    this.connectionGeneration++
+    this.clearReconnectTimer()
+    this.clearConnectTimeout()
     this.stopPing()
-    if (this.ws) {
-      this.ws.close()
-      this.ws = null
+    this.clearNativeInboxRefresh()
+    this.resetTenantInboxState()
+    const socket = this.ws
+    this.ws = null
+    if (socket) {
+      socket.onopen = null
+      socket.onmessage = null
+      socket.onclose = null
+      socket.onerror = null
+      socket.close()
     }
     this.isConnected = false
-    this.reconnectAttempts = this.maxReconnectAttempts // Prevent reconnect
+    this.hasConnectedBefore = false
+    this.reconnectAttempts = 0
+    this.getTokenFn = null
+    this.setConnectionState('disconnected')
   }
 
   private handleMessage(data: string) {
+    if (typeof data !== 'string') return
+    if (data.trim() === WS_TYPE_PONG) {
+      this.recordPong()
+      return
+    }
     try {
       const message: WSMessage = JSON.parse(data)
       const store = useContactsStore()
@@ -182,9 +279,11 @@ class WebSocketService {
       switch (message.type) {
         case WS_TYPE_NEW_MESSAGE:
           this.handleNewMessage(store, message.payload)
+          this.emitInboxActivity(WS_TYPE_NEW_MESSAGE, message.payload)
           break
         case WS_TYPE_STATUS_UPDATE:
           this.handleStatusUpdate(store, message.payload)
+          this.emitInboxActivity(WS_TYPE_STATUS_UPDATE, message.payload)
           break
         case WS_TYPE_AGENT_TRANSFER:
           this.handleAgentTransfer(message.payload)
@@ -202,7 +301,7 @@ class WebSocketService {
           this.handleReactionUpdate(store, message.payload)
           break
         case WS_TYPE_PONG:
-          // Pong received, connection is alive
+          this.recordPong()
           break
         case WS_TYPE_CAMPAIGN_STATS_UPDATE:
           this.handleCampaignStatsUpdate(message.payload)
@@ -211,7 +310,12 @@ class WebSocketService {
           this.handlePermissionsUpdated()
           break
         case WS_TYPE_CHANNEL_SYNC:
-          this.channelSyncCallbacks.forEach((callback) => callback(message.payload))
+          this.emitChannelSync(message.payload)
+          this.emitInboxActivity(WS_TYPE_CHANNEL_SYNC, message.payload)
+          break
+        case WS_TYPE_REALTIME_SYNC:
+          this.scheduleNativeInboxRefresh()
+          this.emitInboxActivity(WS_TYPE_REALTIME_SYNC, message.payload)
           break
         case WS_TYPE_CALL_INCOMING:
           this.handleCallIncoming(message.payload)
@@ -548,17 +652,236 @@ class WebSocketService {
     }
   }
 
-  private handleReconnect() {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      return
+  onInboxActivity(callback: (event: InboxActivityEvent) => void) {
+    this.inboxActivityCallbacks.push(callback)
+    return () => {
+      const index = this.inboxActivityCallbacks.indexOf(callback)
+      if (index > -1) {
+        this.inboxActivityCallbacks.splice(index, 1)
+      }
     }
+  }
+
+  onConnectionStateChange(callback: (state: WebSocketConnectionState) => void) {
+    this.connectionStateCallbacks.push(callback)
+    try {
+      callback(this.connectionState)
+    } catch {
+      // A connection-state observer must not break registration or reconnection.
+    }
+    return () => {
+      const index = this.connectionStateCallbacks.indexOf(callback)
+      if (index > -1) {
+        this.connectionStateCallbacks.splice(index, 1)
+      }
+    }
+  }
+
+  private scheduleReconnect() {
+    if (!this.shouldReconnect || this.reconnectTimer !== null) return
 
     this.reconnectAttempts++
-    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1)
+    const delay = Math.min(
+      this.reconnectDelay * Math.pow(2, Math.min(this.reconnectAttempts - 1, 10)),
+      this.maxReconnectDelay,
+    )
+    this.setConnectionState('reconnecting')
 
-    setTimeout(() => {
-      this.connect()
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null
+      void this.connect()
     }, delay)
+  }
+
+  private clearReconnectTimer() {
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+  }
+
+  private startConnectTimeout(socket: WebSocket, generation: number) {
+    this.clearConnectTimeout()
+    this.connectTimeoutTimer = window.setTimeout(() => {
+      this.connectTimeoutTimer = null
+      if (
+        this.shouldReconnect &&
+        generation === this.connectionGeneration &&
+        this.ws === socket &&
+        socket.readyState === WebSocket.CONNECTING
+      ) {
+        // A proxy/TLS handshake can leave the browser in CONNECTING forever.
+        this.forceReconnect(socket)
+      }
+    }, 15000)
+  }
+
+  private clearConnectTimeout() {
+    if (this.connectTimeoutTimer !== null) {
+      window.clearTimeout(this.connectTimeoutTimer)
+      this.connectTimeoutTimer = null
+    }
+  }
+
+  private forceReconnect(socket: WebSocket) {
+    if (this.ws !== socket) return
+    this.clearConnectTimeout()
+    this.ws = null
+    this.isConnected = false
+    this.stopPing()
+    // Do not wait for a close event from the very transport path we have
+    // declared unhealthy. Detach it and schedule the retry immediately.
+    socket.onopen = null
+    socket.onmessage = null
+    socket.onclose = null
+    socket.onerror = null
+    try {
+      socket.close()
+    } catch {
+      // The retry below is authoritative even if browser teardown throws.
+    }
+    if (this.shouldReconnect) {
+      this.scheduleReconnect()
+    } else {
+      this.setConnectionState('disconnected')
+    }
+  }
+
+  private emitInboxActivity(type: InboxActivityType, payload: any) {
+    const event: InboxActivityEvent = { type, payload }
+    for (const callback of [...this.inboxActivityCallbacks]) {
+      try {
+        callback(event)
+      } catch {
+        // A page-level subscriber must not break WebSocket event processing.
+      }
+    }
+  }
+
+  private emitChannelSync(payload: any) {
+    for (const callback of [...this.channelSyncCallbacks]) {
+      try {
+        callback(payload)
+      } catch {
+        // Preserve newer inbox subscribers if a legacy observer fails.
+      }
+    }
+  }
+
+  private setConnectionState(state: WebSocketConnectionState) {
+    if (this.connectionState === state) return
+    this.connectionState = state
+    for (const callback of [...this.connectionStateCallbacks]) {
+      try {
+        callback(state)
+      } catch {
+        // A connection-state observer must not break reconnection.
+      }
+    }
+  }
+
+  private scheduleNativeInboxRefresh() {
+    const generation = this.connectionGeneration
+    this.nativeInboxRefreshQueuedGeneration = generation
+    if (
+      this.nativeInboxRefreshTimerGeneration === generation ||
+      this.nativeInboxRefreshInFlightGeneration === generation
+    ) return
+
+    if (this.nativeInboxRefreshTimer !== null) {
+      window.clearTimeout(this.nativeInboxRefreshTimer)
+    }
+
+    this.nativeInboxRefreshTimerGeneration = generation
+    this.nativeInboxRefreshTimer = window.setTimeout(() => {
+      if (this.nativeInboxRefreshTimerGeneration !== generation) return
+      this.nativeInboxRefreshTimer = null
+      this.nativeInboxRefreshTimerGeneration = null
+      void this.refreshNativeInbox(generation)
+    }, 150)
+  }
+
+  private async refreshNativeInbox(generation: number) {
+    if (!this.shouldReconnect || generation !== this.connectionGeneration) {
+      if (this.nativeInboxRefreshQueuedGeneration === generation) {
+        this.nativeInboxRefreshQueuedGeneration = null
+      }
+      return
+    }
+    this.nativeInboxRefreshInFlightGeneration = generation
+    if (this.nativeInboxRefreshQueuedGeneration === generation) {
+      this.nativeInboxRefreshQueuedGeneration = null
+    }
+    try {
+      const store = useContactsStore()
+      await Promise.allSettled([store.fetchContacts(), store.refreshCurrentMessages()])
+    } finally {
+      if (this.nativeInboxRefreshInFlightGeneration === generation) {
+        this.nativeInboxRefreshInFlightGeneration = null
+      }
+      if (
+        this.nativeInboxRefreshQueuedGeneration === generation &&
+        this.shouldReconnect &&
+        generation === this.connectionGeneration
+      ) {
+        this.scheduleNativeInboxRefresh()
+      }
+    }
+  }
+
+  private clearNativeInboxRefresh() {
+    if (this.nativeInboxRefreshTimer !== null) {
+      window.clearTimeout(this.nativeInboxRefreshTimer)
+      this.nativeInboxRefreshTimer = null
+    }
+    this.nativeInboxRefreshTimerGeneration = null
+    this.nativeInboxRefreshInFlightGeneration = null
+    this.nativeInboxRefreshQueuedGeneration = null
+  }
+
+  private resetTenantInboxState() {
+    // An already-started HTTP refresh cannot always be canceled by closing the
+    // socket. Store-level generation guards make any late tenant response inert.
+    try {
+      useContactsStore().resetForIdentityChange()
+    } catch {
+      // The service can be torn down while Pinia itself is being disposed.
+    }
+    try {
+      useNotesStore().clearNotes()
+    } catch {
+      // Keep socket teardown reliable even if a store is no longer available.
+    }
+    try {
+      useTagsStore().resetForIdentityChange()
+    } catch {
+      // Keep socket teardown reliable even if a store is no longer available.
+    }
+    try {
+      useTransfersStore().resetForIdentityChange()
+    } catch {
+      // Keep socket teardown reliable even if a store is no longer available.
+    }
+    try {
+      useCallingStore().resetForIdentityChange()
+    } catch {
+      // Media/cache teardown is best effort only when Pinia is being disposed.
+    }
+    try {
+      useUsersStore().resetForIdentityChange()
+    } catch {
+      // Assignment names and in-flight user requests are tenant scoped.
+    }
+    try {
+      useRolesStore().resetForIdentityChange()
+    } catch {
+      // Settings caches must not survive an SPA identity transition.
+    }
+    try {
+      useTeamsStore().resetForIdentityChange()
+    } catch {
+      // Routing and assignment team names are tenant scoped.
+    }
   }
 
   setCurrentContact(contactId: string | null) {
@@ -576,27 +899,50 @@ class WebSocketService {
 
   private startPing() {
     this.stopPing()
+    this.lastPongAt = Date.now()
     this.pingInterval = window.setInterval(() => {
       this.send({ type: WS_TYPE_PING, payload: {} })
     }, 30000) // Ping every 30 seconds
+    this.heartbeatWatchdogInterval = window.setInterval(() => {
+      if (
+        this.ws?.readyState === WebSocket.OPEN &&
+        Date.now() - this.lastPongAt >= 75000
+      ) {
+        // OPEN does not guarantee a proxy path is still usable. Force the
+        // reconnect/catch-up path when application-level pong frames stop.
+        this.forceReconnect(this.ws)
+      }
+    }, 15000)
   }
 
   private stopPing() {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval)
+    if (this.pingInterval !== null) {
+      window.clearInterval(this.pingInterval)
       this.pingInterval = null
     }
+    if (this.heartbeatWatchdogInterval !== null) {
+      window.clearInterval(this.heartbeatWatchdogInterval)
+      this.heartbeatWatchdogInterval = null
+    }
+    this.lastPongAt = 0
+  }
+
+  private recordPong() {
+    this.lastPongAt = Date.now()
   }
 
   private refreshStaleData() {
     // Refresh contacts list
     const contactsStore = useContactsStore()
     contactsStore.fetchContacts()
+    void contactsStore.refreshCurrentMessages()
 
     // Refresh transfers
     const transfersStore = useTransfersStore()
     transfersStore.fetchTransfers()
-    this.channelSyncCallbacks.forEach((callback) => callback({ reason: 'reconnected' }))
+    const payload = { reason: 'reconnected' }
+    this.emitChannelSync(payload)
+    this.emitInboxActivity(WS_TYPE_CHANNEL_SYNC, payload)
 
     // Show subtle notification
     toast.info('Connection restored', {
@@ -607,6 +953,10 @@ class WebSocketService {
 
   getIsConnected() {
     return this.isConnected
+  }
+
+  getConnectionState() {
+    return this.connectionState
   }
 }
 

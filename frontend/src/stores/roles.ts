@@ -42,6 +42,25 @@ export const useRolesStore = defineStore('roles', () => {
   const permissions = ref<Permission[]>([])
   const loading = ref(false)
   const error = ref<string | null>(null)
+  let identityGeneration = 0
+  let rolesFetchGeneration = 0
+  let permissionsFetchGeneration = 0
+  let rolesFetchController: AbortController | null = null
+  let permissionsFetchController: AbortController | null = null
+
+  function resetForIdentityChange() {
+    identityGeneration++
+    rolesFetchGeneration++
+    permissionsFetchGeneration++
+    rolesFetchController?.abort()
+    permissionsFetchController?.abort()
+    rolesFetchController = null
+    permissionsFetchController = null
+    roles.value = []
+    permissions.value = []
+    loading.value = false
+    error.value = null
+  }
 
   // Group permissions by resource
   const permissionGroups = computed<PermissionGroup[]>(() => {
@@ -64,27 +83,50 @@ export const useRolesStore = defineStore('roles', () => {
   })
 
   async function fetchRoles(params?: FetchRolesParams): Promise<FetchRolesResponse> {
+    const identity = identityGeneration
+    const requestGeneration = ++rolesFetchGeneration
+    rolesFetchController?.abort()
+    const controller = new AbortController()
+    rolesFetchController = controller
     loading.value = true
     error.value = null
     try {
-      const response = await rolesService.list(params)
+      const response = await rolesService.list(params, controller.signal)
       const data = (response.data as any).data || response.data
-      roles.value = data.roles || []
+      const fetchedRoles = data.roles || []
+      if (
+        identity === identityGeneration &&
+        requestGeneration === rolesFetchGeneration
+      ) {
+        roles.value = fetchedRoles
+      }
       return {
-        roles: data.roles || [],
-        total: data.total ?? roles.value.length,
+        roles: fetchedRoles,
+        total: data.total ?? fetchedRoles.length,
         page: data.page ?? 1,
         limit: data.limit ?? 50
       }
     } catch (err: any) {
-      error.value = err.response?.data?.message || 'Failed to fetch roles'
+      if (
+        identity === identityGeneration &&
+        requestGeneration === rolesFetchGeneration
+      ) {
+        error.value = err.response?.data?.message || 'Failed to fetch roles'
+      }
       throw err
     } finally {
-      loading.value = false
+      if (
+        identity === identityGeneration &&
+        requestGeneration === rolesFetchGeneration
+      ) {
+        loading.value = false
+        if (rolesFetchController === controller) rolesFetchController = null
+      }
     }
   }
 
   async function fetchRole(id: string): Promise<Role> {
+    const identity = identityGeneration
     loading.value = true
     error.value = null
     try {
@@ -92,69 +134,107 @@ export const useRolesStore = defineStore('roles', () => {
       const data = (response.data as any).data || response.data
       return data
     } catch (err: any) {
-      error.value = err.response?.data?.message || 'Failed to fetch role'
+      if (identity === identityGeneration) {
+        error.value = err.response?.data?.message || 'Failed to fetch role'
+      }
       throw err
     } finally {
-      loading.value = false
+      if (identity === identityGeneration) loading.value = false
     }
   }
 
   async function fetchPermissions(): Promise<void> {
+    const identity = identityGeneration
+    const requestGeneration = ++permissionsFetchGeneration
+    permissionsFetchController?.abort()
+    const controller = new AbortController()
+    permissionsFetchController = controller
     try {
-      const response = await permissionsService.list()
-      permissions.value = (response.data as any).data?.permissions || response.data?.permissions || []
+      const response = await permissionsService.list(controller.signal)
+      if (
+        identity === identityGeneration &&
+        requestGeneration === permissionsFetchGeneration
+      ) {
+        permissions.value = (response.data as any).data?.permissions || response.data?.permissions || []
+      }
     } catch (err: any) {
-      error.value = err.response?.data?.message || 'Failed to fetch permissions'
+      if (
+        identity === identityGeneration &&
+        requestGeneration === permissionsFetchGeneration
+      ) {
+        error.value = err.response?.data?.message || 'Failed to fetch permissions'
+      }
       throw err
+    } finally {
+      if (
+        identity === identityGeneration &&
+        requestGeneration === permissionsFetchGeneration &&
+        permissionsFetchController === controller
+      ) {
+        permissionsFetchController = null
+      }
     }
   }
 
   async function createRole(data: CreateRoleData): Promise<Role> {
+    const identity = identityGeneration
     loading.value = true
     error.value = null
     try {
       const response = await rolesService.create(data)
       const newRole = (response.data as any).data || response.data
-      roles.value.unshift(newRole)
+      if (identity === identityGeneration) roles.value.unshift(newRole)
       return newRole
     } catch (err: any) {
-      error.value = err.response?.data?.message || 'Failed to create role'
+      if (identity === identityGeneration) {
+        error.value = err.response?.data?.message || 'Failed to create role'
+      }
       throw err
     } finally {
-      loading.value = false
+      if (identity === identityGeneration) loading.value = false
     }
   }
 
   async function updateRole(id: string, data: UpdateRoleData): Promise<Role> {
+    const identity = identityGeneration
     loading.value = true
     error.value = null
     try {
       const response = await rolesService.update(id, data)
       const updatedRole = (response.data as any).data || response.data
-      const index = roles.value.findIndex(r => r.id === id)
-      if (index !== -1) {
-        roles.value[index] = updatedRole
+      if (identity === identityGeneration) {
+        const index = roles.value.findIndex(r => r.id === id)
+        if (index !== -1) {
+          roles.value[index] = updatedRole
+        }
       }
       return updatedRole
     } catch (err: any) {
-      error.value = err.response?.data?.message || 'Failed to update role'
+      if (identity === identityGeneration) {
+        error.value = err.response?.data?.message || 'Failed to update role'
+      }
       throw err
     } finally {
-      loading.value = false
+      if (identity === identityGeneration) loading.value = false
     }
   }
 
   async function deleteRole(id: string): Promise<void> {
+    const identity = identityGeneration
     loading.value = true
     error.value = null
     try {
       await rolesService.delete(id)
-      roles.value = roles.value.filter(r => r.id !== id)
+      if (identity === identityGeneration) {
+        roles.value = roles.value.filter(r => r.id !== id)
+      }
     } catch (err: any) {
-      error.value = err.response?.data?.message || 'Failed to delete role'
+      if (identity === identityGeneration) {
+        error.value = err.response?.data?.message || 'Failed to delete role'
+      }
       throw err
     } finally {
-      loading.value = false
+      if (identity === identityGeneration) loading.value = false
     }
   }
 
@@ -169,6 +249,7 @@ export const useRolesStore = defineStore('roles', () => {
     fetchPermissions,
     createRole,
     updateRole,
-    deleteRole
+    deleteRole,
+    resetForIdentityChange,
   }
 })

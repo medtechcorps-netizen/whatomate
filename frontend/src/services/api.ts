@@ -4,6 +4,10 @@ import axios, {
   type InternalAxiosRequestConfig,
 } from "axios";
 import { resolveOrganizationHeader } from "@/lib/organizationHeaders";
+import {
+  clearBrowserOrganizationIdentity,
+  readSelectedOrganizationId,
+} from "@/lib/browserIdentity";
 
 // Get base path from server-injected config or fallback
 const basePath = ((window as any).__BASE_PATH__ ?? "").replace(/\/$/, "");
@@ -34,7 +38,7 @@ export function getRequestHeaders(opts?: {
   csrf?: boolean;
 }): Record<string, string> {
   const headers: Record<string, string> = {};
-  const selectedOrgId = localStorage.getItem("selected_organization_id");
+  const selectedOrgId = readSelectedOrganizationId();
   if (selectedOrgId) {
     headers["X-Organization-ID"] = selectedOrgId;
   }
@@ -64,7 +68,7 @@ api.interceptors.request.use(
       }
     }
     // Add organization override header for org switching
-    const selectedOrgId = localStorage.getItem("selected_organization_id");
+    const selectedOrgId = readSelectedOrganizationId();
     const organizationId = resolveOrganizationHeader(
       config.headers.get("X-Organization-ID"),
       selectedOrgId,
@@ -162,9 +166,28 @@ api.interceptors.response.use(
         onRefreshComplete(false);
         isRefreshing = false;
 
-        localStorage.removeItem("user");
-        localStorage.removeItem("auth_token");
-        localStorage.removeItem("refresh_token");
+        clearBrowserOrganizationIdentity();
+        for (const key of [
+          "user",
+          "auth_token",
+          "refresh_token",
+          "break_started_at",
+        ]) {
+          let removed = false;
+          try {
+            localStorage.removeItem(key);
+            removed = localStorage.getItem(key) === null;
+          } catch {
+            // Fall through to a non-sensitive tombstone where writes work.
+          }
+          if (!removed) {
+            try {
+              localStorage.setItem(key, "");
+            } catch {
+              // A denied storage backend must not skip redirect/isolation.
+            }
+          }
+        }
         window.location.href = basePath + "/login";
       }
     }
@@ -185,7 +208,7 @@ export const usersService = {
     limit?: number;
     role_id?: string;
     online_only?: boolean;
-  }) => api.get("/users", { params }),
+  }, signal?: AbortSignal) => api.get("/users", { params, signal }),
   get: (id: string) => api.get(`/users/${id}`),
   create: (data: {
     email: string;
@@ -214,7 +237,7 @@ export const usersService = {
     api.put("/me/password", data),
   updateAvailability: (isAvailable: boolean) =>
     api.put("/me/availability", { is_available: isAvailable }),
-  listMyOrganizations: () => api.get("/me/organizations"),
+  listMyOrganizations: (signal?: AbortSignal) => api.get("/me/organizations", { signal }),
 };
 
 export const apiKeysService = {
@@ -238,7 +261,7 @@ export const contactsService = {
     page?: number;
     limit?: number;
     tags?: string;
-  }) => api.get("/contacts", { params }),
+  }, signal?: AbortSignal) => api.get("/contacts", { params, signal }),
   get: (id: string) => api.get(`/contacts/${id}`),
   create: (data: any) => api.post("/contacts", data),
   update: (id: string, data: any) => api.put(`/contacts/${id}`, data),
@@ -335,7 +358,8 @@ export const messagesService = {
       before_id?: string;
       account?: string;
     },
-  ) => api.get(`/contacts/${contactId}/messages`, { params }),
+    signal?: AbortSignal,
+  ) => api.get(`/contacts/${contactId}/messages`, { params, signal }),
   send: (
     contactId: string,
     data: {
@@ -889,7 +913,8 @@ export interface Organization {
 }
 
 export const organizationsService = {
-  list: () => api.get<{ organizations: Organization[] }>("/organizations"),
+  list: (signal?: AbortSignal) =>
+    api.get<{ organizations: Organization[] }>("/organizations", { signal }),
   create: (data: { name: string; reseller_id?: string }) =>
     api.post("/organizations", data),
   delete: (id: string) =>
@@ -1067,8 +1092,10 @@ export interface TeamMember {
 }
 
 export const teamsService = {
-  list: (params?: { search?: string; page?: number; limit?: number }) =>
-    api.get<{ teams: Team[] }>("/teams", { params }),
+  list: (
+    params?: { search?: string; page?: number; limit?: number },
+    signal?: AbortSignal,
+  ) => api.get<{ teams: Team[] }>("/teams", { params, signal }),
   get: (id: string) => api.get<{ team: Team }>(`/teams/${id}`),
   create: (data: {
     name: string;
@@ -1251,8 +1278,10 @@ export interface Role {
 }
 
 export const rolesService = {
-  list: (params?: { search?: string; page?: number; limit?: number }) =>
-    api.get<{ roles: Role[] }>("/roles", { params }),
+  list: (
+    params?: { search?: string; page?: number; limit?: number },
+    signal?: AbortSignal,
+  ) => api.get<{ roles: Role[] }>("/roles", { params, signal }),
   get: (id: string) => api.get<Role>(`/roles/${id}`),
   create: (data: {
     name: string;
@@ -1273,7 +1302,8 @@ export const rolesService = {
 };
 
 export const permissionsService = {
-  list: () => api.get<{ permissions: Permission[] }>("/permissions"),
+  list: (signal?: AbortSignal) =>
+    api.get<{ permissions: Permission[] }>("/permissions", { signal }),
 };
 
 // Tags
