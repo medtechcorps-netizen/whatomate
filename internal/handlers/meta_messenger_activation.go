@@ -98,7 +98,7 @@ func (a *App) freshMetaMessengerSubscriptionApproval(
 		}
 		outcome, _, businessAuthorityVerified := a.checkMetaMessengerOwnership(ctx, snapshot)
 		if outcome != "" || !businessAuthorityVerified {
-			return metaMessengerSubscriptionApproval{}, errors.New("Messenger business authority is no longer current")
+			return metaMessengerSubscriptionApproval{}, errors.New("messenger business authority is no longer current")
 		}
 		if usesExactBusinessAuthority {
 			businessAuthorityCheckedAt = time.Now().UTC()
