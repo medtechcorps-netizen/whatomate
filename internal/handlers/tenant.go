@@ -39,10 +39,20 @@ func (a *App) Tenant(handler TenantRequestHandler) fastglue.FastRequestHandler {
 			return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 		}
 		if !a.rlsEnabled() {
-			return handler(a, r)
+			scoped := a.scopedApp(a.rootApp().DB, organizationID)
+			// Preserve the historical non-RLS handler semantics: this is a
+			// callback owner, not a database tenant binding.
+			scoped.tenantOrgID = uuid.Nil
+			handlerErr := handler(scoped, r)
+			if handlerErr != nil || r.RequestCtx.Response.StatusCode() >= fasthttp.StatusBadRequest {
+				return handlerErr
+			}
+			a.runAfterCommit(scoped.takeAfterCommit())
+			return nil
 		}
 
 		var handlerErr error
+		var afterCommit []func()
 		err = database.WithTenant(a.rootApp().DB, organizationID, func(tx *gorm.DB) error {
 			scoped := a.scopedApp(tx, organizationID)
 			handlerErr = handler(scoped, r)
@@ -52,6 +62,7 @@ func (a *App) Tenant(handler TenantRequestHandler) fastglue.FastRequestHandler {
 			if r.RequestCtx.Response.StatusCode() >= fasthttp.StatusBadRequest {
 				return errTenantResponseRollback
 			}
+			afterCommit = scoped.takeAfterCommit()
 			return nil
 		})
 		if errors.Is(err, errTenantResponseRollback) {
@@ -73,6 +84,7 @@ func (a *App) Tenant(handler TenantRequestHandler) fastglue.FastRequestHandler {
 				"",
 			)
 		}
+		a.runAfterCommit(afterCommit)
 		return handlerErr
 	}
 }
@@ -140,23 +152,31 @@ func (a *App) rootApp() *App {
 func (a *App) scopedApp(tx *gorm.DB, organizationID uuid.UUID) *App {
 	root := a.rootApp()
 	scoped := &App{
-		Config:              root.Config,
-		DB:                  tx,
-		Redis:               root.Redis,
-		Log:                 root.Log,
-		WhatsApp:            root.WhatsApp,
-		WSHub:               root.WSHub,
-		Queue:               root.Queue,
-		CampaignSubCancel:   root.CampaignSubCancel,
-		HTTPClient:          root.HTTPClient,
-		CallManager:         root.CallManager,
-		TTS:                 root.TTS,
-		S3Client:            root.S3Client,
-		ObjectStore:         root.ObjectStore,
-		root:                root,
-		tenantOrgID:         organizationID,
-		inboundContinuation: a.inboundContinuation,
+		Config:                root.Config,
+		DB:                    tx,
+		Redis:                 root.Redis,
+		Log:                   root.Log,
+		WhatsApp:              root.WhatsApp,
+		WSHub:                 root.WSHub,
+		Queue:                 root.Queue,
+		CampaignSubCancel:     root.CampaignSubCancel,
+		RealtimeSubCancel:     root.RealtimeSubCancel,
+		RealtimeSourceID:      root.RealtimeSourceID,
+		HTTPClient:            root.HTTPClient,
+		CallManager:           root.CallManager,
+		TTS:                   root.TTS,
+		S3Client:              root.S3Client,
+		ObjectStore:           root.ObjectStore,
+		root:                  root,
+		tenantOrgID:           organizationID,
+		inboundContinuation:   a.inboundContinuation,
+		afterCommitScoped:     true,
+		channelAdapterFactory: root.channelAdapterFactory,
 	}
+	// Transactional terminal-state helpers receive only *gorm.DB. Preserve the
+	// request-scoped App in the DB context so they can enqueue identifier-only
+	// realtime hints that the outer tenant owner drains strictly after commit.
+	scoped.DB = bindRealtimeAppToDB(tx, scoped)
 	if root.Assigner != nil {
 		scoped.Assigner = root.Assigner.WithDB(tx)
 	}
@@ -182,14 +202,31 @@ func (a *App) WithTenantApp(organizationID uuid.UUID, fn func(*App) error) error
 		if err := requireOrdinaryTenantOrganization(root.DB, organizationID); err != nil {
 			return err
 		}
-		return fn(root)
+		scoped := root.scopedApp(root.DB, organizationID)
+		scoped.tenantOrgID = uuid.Nil
+		if err := fn(scoped); err != nil {
+			return err
+		}
+		a.runAfterCommit(scoped.takeAfterCommit())
+		return nil
 	}
-	return database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
+	var afterCommit []func()
+	err := database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
 		if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
 			return err
 		}
-		return fn(root.scopedApp(tx, organizationID))
+		scoped := root.scopedApp(tx, organizationID)
+		if err := fn(scoped); err != nil {
+			return err
+		}
+		afterCommit = scoped.takeAfterCommit()
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	a.runAfterCommit(afterCommit)
+	return nil
 }
 
 // WithCommittedTenantApp runs one short ordinary-tenant database phase and
@@ -208,19 +245,133 @@ func (a *App) WithCommittedTenantApp(organizationID uuid.UUID, fn func(*App) err
 		return errors.New("database connection is required")
 	}
 	if a.rlsEnabled() {
-		return database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
+		var afterCommit []func()
+		err := database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
 			if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
 				return err
 			}
-			return fn(root.scopedApp(tx, organizationID))
+			scoped := root.scopedApp(tx, organizationID)
+			if err := fn(scoped); err != nil {
+				return err
+			}
+			afterCommit = scoped.takeAfterCommit()
+			return nil
 		})
+		if err != nil {
+			return err
+		}
+		a.runAfterCommit(afterCommit)
+		return nil
 	}
-	return root.DB.Transaction(func(tx *gorm.DB) error {
+	var afterCommit []func()
+	err := root.DB.Transaction(func(tx *gorm.DB) error {
 		if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
 			return err
 		}
-		return fn(root.scopedApp(tx, organizationID))
+		scoped := root.scopedApp(tx, organizationID)
+		if err := fn(scoped); err != nil {
+			return err
+		}
+		afterCommit = scoped.takeAfterCommit()
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	a.runAfterCommit(afterCommit)
+	return nil
+}
+
+// withCommittedTenantReadCommittedApp preserves the explicit READ COMMITTED
+// row-lock protocol used by channel-account health validation while giving its
+// transaction-scoped App the same commit-only side-effect ownership as
+// WithCommittedTenantApp.
+func (a *App) withCommittedTenantReadCommittedApp(
+	organizationID uuid.UUID,
+	fn func(*App) error,
+) error {
+	if a == nil || fn == nil {
+		return errors.New("tenant app callback is required")
+	}
+	if organizationID == uuid.Nil {
+		return database.ErrMissingTenant
+	}
+	root := a.rootApp()
+	if root == nil || root.DB == nil {
+		return errors.New("database connection is required")
+	}
+	var afterCommit []func()
+	err := database.WithTenantReadCommitted(root.DB, organizationID, func(tx *gorm.DB) error {
+		if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+			return err
+		}
+		scoped := root.scopedApp(tx, organizationID)
+		if err := fn(scoped); err != nil {
+			return err
+		}
+		afterCommit = scoped.takeAfterCommit()
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	a.runAfterCommit(afterCommit)
+	return nil
+}
+
+// afterTenantCommit defers external side effects until the surrounding tenant
+// transaction commits. Without an outer tenant transaction, database writes
+// have already completed when callers reach this helper, so it runs directly.
+func (a *App) afterTenantCommit(fn func()) {
+	if fn == nil {
+		return
+	}
+	if a != nil && (a.afterCommitScoped || a.hasTenantScope()) {
+		a.afterCommit = append(a.afterCommit, fn)
+		return
+	}
+	a.runAfterCommit([]func(){fn})
+}
+
+func (a *App) takeAfterCommit() []func() {
+	if a == nil || len(a.afterCommit) == 0 {
+		return nil
+	}
+	callbacks := append([]func(){}, a.afterCommit...)
+	a.afterCommit = nil
+	return callbacks
+}
+
+// adoptAfterCommit drains callbacks from a nested scoped App into the owner of
+// the surrounding tenant transaction. The destructive take prevents either
+// scope from running the same external side effect twice. If the surrounding
+// transaction rolls back, its owner discards the adopted callbacks normally.
+func (a *App) adoptAfterCommit(nested *App) {
+	if a == nil || nested == nil || a == nested {
+		return
+	}
+	for _, callback := range nested.takeAfterCommit() {
+		a.afterTenantCommit(callback)
+	}
+}
+
+func (a *App) runAfterCommit(callbacks []func()) {
+	for index, callback := range callbacks {
+		if callback != nil {
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						a.rootApp().Log.Error(
+							"After-commit callback panicked",
+							"callback_index", index,
+							"panic", recovered,
+						)
+					}
+				}()
+				callback()
+			}()
+		}
+	}
 }
 
 // withPlatformComplianceInstagramTenantApp is the only tenant-App entry point
@@ -241,13 +392,23 @@ func (a *App) withPlatformComplianceInstagramTenantApp(
 	if root == nil || root.DB == nil {
 		return errors.New("database connection is required")
 	}
+	var afterCommit []func()
 	run := func(tx *gorm.DB) error {
 		if err := requirePlatformComplianceInstagramOrganization(tx, organizationID); err != nil {
 			return err
 		}
-		return fn(root.scopedApp(tx, organizationID))
+		scoped := root.scopedApp(tx, organizationID)
+		if err := fn(scoped); err != nil {
+			return err
+		}
+		afterCommit = scoped.takeAfterCommit()
+		return nil
 	}
-	return database.WithTenantReadCommitted(root.DB, organizationID, run)
+	if err := database.WithTenantReadCommitted(root.DB, organizationID, run); err != nil {
+		return err
+	}
+	a.runAfterCommit(afterCommit)
+	return nil
 }
 
 func (a *App) hasTenantScope() bool {

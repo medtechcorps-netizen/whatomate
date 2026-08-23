@@ -71,7 +71,7 @@ func (a *App) ApproveMetaMessengerActivation(r *fastglue.Request) error {
 	}
 	return r.SendEnvelope(map[string]any{
 		"activated": true,
-		"account":   channelAccountToResponse(&activated),
+		"account":   a.channelAccountToResponse(&activated),
 	})
 }
 

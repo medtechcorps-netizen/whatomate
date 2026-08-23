@@ -210,7 +210,7 @@ func cancelManagedMetaQueuedWorkForAccountTx(
 	if len(messageIDs) == 0 {
 		return nil
 	}
-	return tx.Model(&models.Message{}).
+	messageUpdate := tx.Model(&models.Message{}).
 		Where(
 			"organization_id = ? AND id IN ? AND status = ?",
 			organizationID,
@@ -221,7 +221,18 @@ func cancelManagedMetaQueuedWorkForAccountTx(
 			"status":        models.MessageStatusFailed,
 			"error_message": "Managed Meta authorization changed before delivery",
 			"updated_at":    now,
-		}).Error
+		})
+	if messageUpdate.Error != nil {
+		return messageUpdate.Error
+	}
+	publishTerminalMessageBatchTx(
+		tx,
+		organizationID,
+		&channelAccountID,
+		nil,
+		messageUpdate.RowsAffected,
+	)
+	return nil
 }
 
 func cancelChannelAIScheduledJobsForConversationTx(
@@ -388,7 +399,7 @@ func cancelChannelAIOutboxJobsTx(
 	if result.RowsAffected == 0 || len(messageIDs) == 0 {
 		return nil
 	}
-	return tx.Model(&models.Message{}).
+	messageUpdate := tx.Model(&models.Message{}).
 		Where(
 			"organization_id = ? AND id IN ? AND status = ?",
 			organizationID,
@@ -399,5 +410,27 @@ func cancelChannelAIOutboxJobsTx(
 			"status":        models.MessageStatusFailed,
 			"error_message": "Automatic AI reply cancelled before delivery",
 			"updated_at":    now,
-		}).Error
+		})
+	if messageUpdate.Error != nil {
+		return messageUpdate.Error
+	}
+	var channelAccountID, conversationID *uuid.UUID
+	switch strings.TrimSpace(bindingPredicate) {
+	case "channel_account_id = ?":
+		if value, ok := bindingID.(uuid.UUID); ok && value != uuid.Nil {
+			channelAccountID = &value
+		}
+	case "conversation_id = ?":
+		if value, ok := bindingID.(uuid.UUID); ok && value != uuid.Nil {
+			conversationID = &value
+		}
+	}
+	publishTerminalMessageBatchTx(
+		tx,
+		organizationID,
+		channelAccountID,
+		conversationID,
+		messageUpdate.RowsAffected,
+	)
+	return nil
 }

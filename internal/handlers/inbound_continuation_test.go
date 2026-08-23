@@ -12,8 +12,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/queue"
+	appwebsocket "github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -50,6 +53,216 @@ func loadInboundContinuationJob(
 		messageID,
 	).First(&job).Error)
 	return job
+}
+
+func TestInboundContinuation_CommittedNativeInboundPublishesRealtimeExactlyOnce(
+	t *testing.T,
+) {
+	app := newProcessorTestApp(t)
+	if app.Redis == nil {
+		t.Skip("TEST_REDIS_URL not set")
+	}
+	organization, account := createProcessorTestOrg(t, app)
+	message := inboundContinuationTextMessage(
+		t,
+		"wamid.realtime-commit-"+uuid.NewString(),
+		"6050"+uuid.NewString()[:8],
+		"Show this inbound message live",
+	)
+	work, duplicate, err := app.persistIncomingMessageBeforeAck(
+		account.PhoneID,
+		message,
+		"Realtime patient",
+	)
+	require.NoError(t, err)
+	require.False(t, duplicate)
+
+	// Stop immediately after the native inbound broadcast. This avoids an
+	// unrelated chatbot reply or transfer adding another realtime event.
+	require.NoError(t, app.DB.Create(&models.AgentTransfer{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  organization.ID,
+		ContactID:       work.Contact.ID,
+		WhatsAppAccount: account.Name,
+		PhoneNumber:     work.Contact.PhoneNumber,
+		Status:          models.TransferStatusActive,
+		Source:          models.TransferSourceManual,
+		TransferredAt:   time.Now().UTC(),
+	}).Error)
+
+	hub := appwebsocket.NewHub(app.Log)
+	go hub.Run()
+	app.WSHub = hub
+	client := appwebsocket.NewClient(hub, nil, uuid.New(), organization.ID)
+	hub.Register(client)
+	testutil.AssertEventually(
+		t,
+		func() bool { return hub.GetClientCount() == 1 },
+		2*time.Second,
+		"inbound realtime client registered",
+	)
+
+	redisSubscription := app.Redis.Subscribe(context.Background(), queue.RealtimeChannel)
+	t.Cleanup(func() { _ = redisSubscription.Close() })
+	_, err = redisSubscription.Receive(context.Background())
+	require.NoError(t, err)
+	redisMessages := redisSubscription.Channel()
+
+	// Enable the same outer tenant transaction and after-commit drain used by
+	// production. The test database owner may bypass row policies, but the
+	// transaction-local tenant and callback lifecycle are identical.
+	app.Config = &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
+	processor := NewInboundContinuationProcessor(app, time.Second)
+	require.NoError(t, processor.ProcessMessage(
+		context.Background(),
+		organization.ID,
+		work.Persisted.ID,
+	))
+
+	local := receiveInboundContinuationLocalEnvelope(t, client.SendChan())
+	assert.Equal(t, appwebsocket.TypeNewMessage, local.Type)
+	assert.Equal(t, work.Persisted.ID.String(), local.MessageID)
+	remote := receiveInboundContinuationRedisEvent(t, redisMessages)
+	assert.Equal(t, queue.RealtimeEventMessageCreated, remote.Kind)
+	require.NotNil(t, remote.MessageID)
+	assert.Equal(t, work.Persisted.ID, *remote.MessageID)
+	assert.Equal(t, organization.ID, remote.OrganizationID)
+
+	assertNoInboundContinuationLocalEnvelope(t, client.SendChan())
+	assertNoInboundContinuationRedisEvent(t, redisMessages)
+	stored := loadInboundContinuationJob(t, app, organization.ID, work.Persisted.ID)
+	assert.Equal(t, models.ScheduledJobStatusCompleted, stored.Status)
+}
+
+func TestInboundContinuation_RolledBackNativeInboundPublishesNoRealtime(
+	t *testing.T,
+) {
+	app := newProcessorTestApp(t)
+	if app.Redis == nil {
+		t.Skip("TEST_REDIS_URL not set")
+	}
+	organization, account := createProcessorTestOrg(t, app)
+	message := inboundContinuationTextMessage(
+		t,
+		"wamid.realtime-rollback-"+uuid.NewString(),
+		"6051"+uuid.NewString()[:8],
+		"Never advertise a rollback",
+	)
+	work, duplicate, err := app.persistIncomingMessageBeforeAck(
+		account.PhoneID,
+		message,
+		"Rollback patient",
+	)
+	require.NoError(t, err)
+	require.False(t, duplicate)
+
+	hub := appwebsocket.NewHub(app.Log)
+	go hub.Run()
+	app.WSHub = hub
+	client := appwebsocket.NewClient(hub, nil, uuid.New(), organization.ID)
+	hub.Register(client)
+	testutil.AssertEventually(
+		t,
+		func() bool { return hub.GetClientCount() == 1 },
+		2*time.Second,
+		"rollback realtime client registered",
+	)
+	redisSubscription := app.Redis.Subscribe(context.Background(), queue.RealtimeChannel)
+	t.Cleanup(func() { _ = redisSubscription.Close() })
+	_, err = redisSubscription.Receive(context.Background())
+	require.NoError(t, err)
+	redisMessages := redisSubscription.Channel()
+
+	app.Config = &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
+	processor := NewInboundContinuationProcessor(app, time.Second)
+	processor.process = func(
+		_ context.Context,
+		execution *App,
+		loaded *persistedIncomingMessage,
+	) error {
+		execution.broadcastNewMessage(
+			loaded.OrganizationID,
+			&loaded.Persisted,
+			&loaded.Contact,
+		)
+		// PostgreSQL marks the transaction aborted. processClaimed deliberately
+		// returns nil from its callback to retain safe action checkpoints, so the
+		// failed COMMIT is the rollback boundary under test.
+		return execution.DB.Exec(
+			"SELECT * FROM rereply_forced_missing_inbound_realtime_table",
+		).Error
+	}
+	require.Error(t, processor.ProcessMessage(
+		context.Background(),
+		organization.ID,
+		work.Persisted.ID,
+	))
+
+	assertNoInboundContinuationLocalEnvelope(t, client.SendChan())
+	assertNoInboundContinuationRedisEvent(t, redisMessages)
+}
+
+type inboundContinuationLocalEnvelope struct {
+	Type      string         `json:"type"`
+	MessageID string         `json:"-"`
+	Payload   map[string]any `json:"payload"`
+}
+
+func receiveInboundContinuationLocalEnvelope(
+	t *testing.T,
+	messages <-chan []byte,
+) inboundContinuationLocalEnvelope {
+	t.Helper()
+	select {
+	case data := <-messages:
+		var envelope inboundContinuationLocalEnvelope
+		require.NoError(t, json.Unmarshal(data, &envelope))
+		envelope.MessageID, _ = envelope.Payload["id"].(string)
+		return envelope
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for committed inbound local realtime")
+		return inboundContinuationLocalEnvelope{}
+	}
+}
+
+func receiveInboundContinuationRedisEvent(
+	t *testing.T,
+	messages <-chan *redis.Message,
+) queue.RealtimeEvent {
+	t.Helper()
+	select {
+	case message := <-messages:
+		var event queue.RealtimeEvent
+		require.NoError(t, json.Unmarshal([]byte(message.Payload), &event))
+		return event
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for committed inbound Redis realtime")
+		return queue.RealtimeEvent{}
+	}
+}
+
+func assertNoInboundContinuationLocalEnvelope(
+	t *testing.T,
+	messages <-chan []byte,
+) {
+	t.Helper()
+	select {
+	case data := <-messages:
+		t.Fatalf("received duplicate or rolled-back local realtime: %s", data)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func assertNoInboundContinuationRedisEvent(
+	t *testing.T,
+	messages <-chan *redis.Message,
+) {
+	t.Helper()
+	select {
+	case message := <-messages:
+		t.Fatalf("received duplicate or rolled-back Redis realtime: %s", message.Payload)
+	case <-time.After(200 * time.Millisecond):
+	}
 }
 
 func TestInboundContinuation_CrashLeaseIsReclaimedAndDuplicateWakesJob(

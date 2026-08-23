@@ -74,6 +74,17 @@ app_id = ""      # Meta App ID for Embedded Signup
 app_secret = ""  # Meta App Secret
 config_id = ""  # WhatsApp Config ID for frontend login
 
+# Fail-closed rollout gate for replying from a legacy WhatsApp conversation in
+# Omnichannel. Keep disabled until the strict backend is deployed. With enabled
+# = true, an empty allowlist releases every organization; a comma-separated
+# canonical UUID list releases only those pilot tenants.
+# Environment equivalents:
+# WHATOMATE_LEGACY_WHATSAPP_REPLY__ENABLED=true
+# WHATOMATE_LEGACY_WHATSAPP_REPLY__ALLOWED_ORGANIZATION_IDS=<uuid>,<uuid>
+[legacy_whatsapp_reply]
+enabled = false
+allowed_organization_ids = ""
+
 [ai]
 # Alibaba Cloud Model Studio international endpoint. For production workloads,
 # replace this with the workspace-specific Singapore endpoint when available:

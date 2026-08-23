@@ -28,6 +28,7 @@ type Config struct {
 	Redis               RedisConfig               `koanf:"redis"`
 	JWT                 JWTConfig                 `koanf:"jwt"`
 	WhatsApp            WhatsAppConfig            `koanf:"whatsapp"`
+	LegacyWhatsAppReply LegacyWhatsAppReplyConfig `koanf:"legacy_whatsapp_reply"`
 	AI                  AIConfig                  `koanf:"ai"`
 	Storage             StorageConfig             `koanf:"storage"`
 	DefaultAdmin        DefaultAdminConfig        `koanf:"default_admin"`
@@ -41,6 +42,34 @@ type Config struct {
 	MetaInstagram       MetaInstagramConfig       `koanf:"meta_instagram_onboarding"`
 	ThreadsAppReview    ThreadsAppReviewConfig    `koanf:"threads_app_review"`
 	ThreadsManaged      ThreadsManagedConfig      `koanf:"threads_managed"`
+}
+
+// LegacyWhatsAppReplyConfig is a deployment-owned rollout gate for the new
+// exact-conversation Omnichannel reply endpoint. It defaults off. When enabled
+// with an empty allowlist it is global; otherwise only the canonical tenant
+// UUIDs in AllowedOrganizationIDs are released.
+type LegacyWhatsAppReplyConfig struct {
+	Enabled                bool   `koanf:"enabled" json:"enabled"`
+	AllowedOrganizationIDs string `koanf:"allowed_organization_ids" json:"allowed_organization_ids"`
+}
+
+func (config LegacyWhatsAppReplyConfig) OrganizationEnabled(organizationID string) bool {
+	if !config.Enabled || !canonicalNonNilUUID(organizationID) {
+		return false
+	}
+	allowed, err := canonicalLegacyWhatsAppReplyAllowlist(config.AllowedOrganizationIDs)
+	if err != nil {
+		return false
+	}
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, candidate := range allowed {
+		if candidate == organizationID {
+			return true
+		}
+	}
+	return false
 }
 
 // ThreadsAppReviewConfig is a deployment-owned escape hatch used only to
@@ -476,8 +505,42 @@ func Load(configPath string) (*Config, error) {
 	if err := ValidateThreadsManagedConfig(cfg.ThreadsManaged, cfg.ThreadsAppReview, cfg.App.Environment); err != nil {
 		return nil, err
 	}
+	if err := ValidateLegacyWhatsAppReplyConfig(cfg.LegacyWhatsAppReply); err != nil {
+		return nil, err
+	}
 
 	return &cfg, nil
+}
+
+func ValidateLegacyWhatsAppReplyConfig(config LegacyWhatsAppReplyConfig) error {
+	allowed, err := canonicalLegacyWhatsAppReplyAllowlist(config.AllowedOrganizationIDs)
+	if err != nil {
+		return err
+	}
+	if !config.Enabled && len(allowed) != 0 {
+		return errors.New("legacy WhatsApp reply allowlist requires explicit enablement")
+	}
+	return nil
+}
+
+func canonicalLegacyWhatsAppReplyAllowlist(raw string) ([]string, error) {
+	seen := make(map[string]struct{})
+	values := make([]string, 0)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if !canonicalNonNilUUID(item) {
+			return nil, errors.New("legacy WhatsApp reply allowed_organization_ids must contain canonical UUIDs")
+		}
+		if _, exists := seen[item]; exists {
+			return nil, errors.New("legacy WhatsApp reply allowed_organization_ids contains a duplicate UUID")
+		}
+		seen[item] = struct{}{}
+		values = append(values, item)
+	}
+	return values, nil
 }
 
 func ValidateThreadsAppReviewConfig(config ThreadsAppReviewConfig, environment string) error {

@@ -171,16 +171,21 @@ func (w *Worker) listReadyChannelOutboxOrganizations(
 func (w *Worker) claimChannelOutboxJob(orgID uuid.UUID, workerID string) (uuid.UUID, bool, error) {
 	var jobID uuid.UUID
 	claimed := false
+	recoveredFailed := false
+	var recoveredAccountID, recoveredConversationID uuid.UUID
+	var recoveredMessageID *uuid.UUID
 	err := database.WithTenant(w.DB, orgID, func(tx *gorm.DB) error {
 		now := time.Now().UTC()
 		staleBefore := now.Add(-defaultChannelOutboxLease)
 		var candidate struct {
-			ID        uuid.UUID
-			Status    models.OutboxJobStatus
-			MessageID *uuid.UUID
+			ID               uuid.UUID
+			Status           models.OutboxJobStatus
+			ChannelAccountID uuid.UUID
+			ConversationID   uuid.UUID
+			MessageID        *uuid.UUID
 		}
 		if err := tx.Raw(`
-			SELECT id, status, message_id
+			SELECT id, status, channel_account_id, conversation_id, message_id
 			FROM outbox_jobs
 			WHERE organization_id = ?
 			  AND deleted_at IS NULL
@@ -249,6 +254,10 @@ func (w *Worker) claimChannelOutboxJob(orgID uuid.UUID, workerID string) (uuid.U
 					return err
 				}
 			}
+			recoveredFailed = true
+			recoveredAccountID = candidate.ChannelAccountID
+			recoveredConversationID = candidate.ConversationID
+			recoveredMessageID = candidate.MessageID
 			return nil
 		}
 		result := tx.Model(&models.OutboxJob{}).
@@ -269,6 +278,15 @@ func (w *Worker) claimChannelOutboxJob(orgID uuid.UUID, workerID string) (uuid.U
 		claimed = true
 		return nil
 	})
+	if err == nil && recoveredFailed {
+		w.publishChannelMessageStatus(
+			orgID,
+			recoveredAccountID,
+			recoveredConversationID,
+			recoveredMessageID,
+			string(models.OutboxJobStatusFailed),
+		)
+	}
 	return jobID, claimed, err
 }
 
@@ -1740,7 +1758,8 @@ func (w *Worker) cancelChannelAIOutboxJob(
 		return policyErr
 	}
 	reason := channelOutboxErrorMessage(policyErr)
-	return database.WithTenant(w.DB, orgID, func(tx *gorm.DB) error {
+	changed := false
+	persistErr := database.WithTenant(w.DB, orgID, func(tx *gorm.DB) error {
 		now := time.Now().UTC()
 		result := tx.Model(&models.OutboxJob{}).
 			Where(
@@ -1768,6 +1787,7 @@ func (w *Worker) cancelChannelAIOutboxJob(
 		if result.RowsAffected == 0 {
 			return nil
 		}
+		changed = true
 		if job.MessageID == nil {
 			return nil
 		}
@@ -1784,6 +1804,19 @@ func (w *Worker) cancelChannelAIOutboxJob(
 				"updated_at":    now,
 			}).Error
 	})
+	if persistErr != nil {
+		return persistErr
+	}
+	if changed {
+		w.publishChannelMessageStatus(
+			orgID,
+			job.ChannelAccountID,
+			job.ConversationID,
+			job.MessageID,
+			string(models.OutboxJobStatusCancelled),
+		)
+	}
+	return nil
 }
 
 func (w *Worker) completeChannelOutboxJob(
@@ -1793,7 +1826,7 @@ func (w *Worker) completeChannelOutboxJob(
 	workerID string,
 	result channelapi.SendResult,
 ) error {
-	return database.WithTenant(w.DB, orgID, func(tx *gorm.DB) error {
+	persistErr := database.WithTenant(w.DB, orgID, func(tx *gorm.DB) error {
 		now := time.Now().UTC()
 		providerMessageID := result.ProviderMessageIDs[0]
 		update := tx.Model(&models.OutboxJob{}).
@@ -1863,6 +1896,17 @@ func (w *Worker) completeChannelOutboxJob(
 			DoNothing: true,
 		}).Create(&messageEvent).Error
 	})
+	if persistErr != nil {
+		return persistErr
+	}
+	w.publishChannelMessageStatus(
+		orgID,
+		account.ID,
+		job.ConversationID,
+		job.MessageID,
+		string(models.MessageStatusSent),
+	)
+	return nil
 }
 
 // failChannelOutboxProviderAttempt terminally settles every managed Instagram
@@ -1903,6 +1947,7 @@ func (w *Worker) failChannelOutboxProviderAttempt(
 		Cause:     deliveryErr,
 	}
 	attempt := job.AttemptCount + 1
+	changed := false
 	persistErr := database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
 		// Serialize the terminal provider outcome with reconnect/rotation. The
 		// winner cannot leave a retryable row for a later credential generation.
@@ -1947,6 +1992,7 @@ func (w *Worker) failChannelOutboxProviderAttempt(
 			}
 			return errors.New("managed Instagram provider failure settlement lost its lease")
 		}
+		changed = true
 		if job.MessageID != nil {
 			if err := tx.Model(&models.Message{}).
 				Where("id = ? AND organization_id = ?", *job.MessageID, orgID).
@@ -1981,6 +2027,15 @@ func (w *Worker) failChannelOutboxProviderAttempt(
 	})
 	if persistErr != nil {
 		return errors.Join(ambiguousErr, persistErr)
+	}
+	if changed {
+		w.publishChannelMessageStatus(
+			orgID,
+			job.ChannelAccountID,
+			job.ConversationID,
+			job.MessageID,
+			string(models.OutboxJobStatusFailed),
+		)
 	}
 	return nil
 }
@@ -2075,6 +2130,13 @@ func (w *Worker) failChannelOutboxJob(
 	if persistErr != nil {
 		return errors.Join(deliveryErr, persistErr)
 	}
+	w.publishChannelMessageStatus(
+		orgID,
+		job.ChannelAccountID,
+		job.ConversationID,
+		job.MessageID,
+		string(nextStatus),
+	)
 	// Delivery errors are expected job outcomes once durably scheduled or dead
 	// lettered; returning nil prevents the outer loop from double-reporting them.
 	return nil

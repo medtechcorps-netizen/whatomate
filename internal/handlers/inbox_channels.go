@@ -17,6 +17,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
@@ -180,7 +181,7 @@ func (a *App) ListInboxConversations(r *fastglue.Request) error {
 
 	response := make([]InboxConversationResponse, len(conversations))
 	for i := range conversations {
-		response[i] = inboxConversationToResponse(&conversations[i])
+		response[i] = a.inboxConversationToResponse(&conversations[i])
 	}
 	return r.SendEnvelope(listEnvelope("conversations", response, total, pagination))
 }
@@ -666,6 +667,19 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Failed to queue message", nil, "")
 	}
 
+	accountID := conversation.ChannelAccountID
+	contactID := conversation.ContactID
+	a.publishRealtimeEvent(queue.RealtimeEvent{
+		OrganizationID:   orgID,
+		Kind:             queue.RealtimeEventMessageCreated,
+		ChannelAccountID: &accountID,
+		ConversationID:   &conversationID,
+		ContactID:        &contactID,
+		MessageID:        &message.ID,
+		Status:           string(message.Status),
+		OccurredAt:       now,
+	}, nil)
+
 	r.RequestCtx.SetStatusCode(fasthttp.StatusAccepted)
 	return r.SendEnvelope(map[string]any{
 		"message":    message,
@@ -1071,6 +1085,15 @@ func inboxConversationToResponse(conversation *models.InboxConversation) InboxCo
 		CreatedAt:              conversation.CreatedAt,
 		UpdatedAt:              conversation.UpdatedAt,
 	}
+}
+
+func (a *App) inboxConversationToResponse(conversation *models.InboxConversation) InboxConversationResponse {
+	response := inboxConversationToResponse(conversation)
+	if conversation != nil && conversation.ChannelAccount != nil {
+		account := a.channelAccountToResponse(conversation.ChannelAccount)
+		response.ChannelAccount = &account
+	}
+	return response
 }
 
 func validateOutboundParts(capabilities channelapi.Capabilities, request SendInboxConversationMessageRequest) error {

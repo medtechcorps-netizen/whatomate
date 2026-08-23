@@ -25,6 +25,7 @@ func TestReadyCheckRequiresFreshWorkerHeartbeat(t *testing.T) {
 	})
 
 	app := &App{DB: db, Redis: rdb, Log: testutil.NopLogger()}
+	app.realtimeSubscriberLive.Store(true)
 
 	missing := testutil.NewGETRequest(t)
 	require.NoError(t, app.ReadyCheck(missing))
@@ -60,4 +61,14 @@ func TestReadyCheckRequiresFreshWorkerHeartbeat(t *testing.T) {
 	ready := testutil.NewGETRequest(t)
 	require.NoError(t, app.ReadyCheck(ready))
 	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(ready))
+
+	app.realtimeSubscriberLive.Store(false)
+	notLive := testutil.NewGETRequest(t)
+	require.NoError(t, app.ReadyCheck(notLive))
+	testutil.AssertErrorResponse(
+		t,
+		notLive,
+		fasthttp.StatusServiceUnavailable,
+		"Realtime subscriber unavailable",
+	)
 }

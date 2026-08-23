@@ -15,6 +15,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/shridarpatil/whatomate/internal/websocket"
@@ -28,6 +29,10 @@ import (
 // ============================================================================
 // Unified Message Sending
 // ============================================================================
+
+// A provider attempt may consume or cancel the caller's deadline. Settlement
+// recovery owns a fresh bounded context and never invokes the provider again.
+const outgoingDeliveryRecoveryTimeout = 10 * time.Second
 
 // OutgoingMessageRequest contains all parameters for sending any type of message
 type OutgoingMessageRequest struct {
@@ -78,6 +83,15 @@ type OutgoingMessageRequest struct {
 
 	// Reply context
 	ReplyToMessage *models.Message
+
+	// legacyWhatsAppReply is populated only by the fail-closed, exact
+	// Omnichannel reply endpoint. Established Chat callers cannot opt into or
+	// influence this server-derived binding.
+	legacyWhatsAppReply *legacyWhatsAppReplyPolicy
+
+	// deliveryOverride is an internal deterministic test seam for exercising
+	// post-provider transaction failures. Public handlers never populate it.
+	deliveryOverride func(context.Context, *models.Contact) (string, error)
 }
 
 // MessageSendOptions configures optional behaviors for message sending
@@ -187,7 +201,7 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	// Message persistence and the contact-list preview are one fact. Resolve
 	// and lock the canonical contact in the same transaction so a concurrent
 	// merge cannot strand either write on a soft-deleted alias.
-	err := a.outgoingCanonicalTransaction(ctx, organizationID, func(tx *gorm.DB) error {
+	err := a.outgoingPreProviderTransaction(ctx, organizationID, opts.Async, func(tx *gorm.DB) error {
 		contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
 			tx,
 			organizationID,
@@ -218,6 +232,31 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 			}
 		}
 
+		if req.legacyWhatsAppReply != nil {
+			existing, claimErr := claimLegacyReplyIdempotency(
+				tx,
+				organizationID,
+				req.legacyWhatsAppReply,
+			)
+			if claimErr != nil {
+				return claimErr
+			}
+			if existing != nil {
+				return &outgoingIdempotentReplay{
+					message: *existing,
+					contact: *contact,
+				}
+			}
+			if _, policyErr := a.validateLegacyReplyPolicyTx(
+				tx,
+				&req,
+				contact.ID,
+				true,
+			); policyErr != nil {
+				return policyErr
+			}
+		}
+
 		transactionalReq := req
 		transactionalReq.Contact = contact
 		validatedReply = nil
@@ -226,12 +265,19 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 				return fmt.Errorf("%w: reply message ID is required", errOutgoingReplyInvalid)
 			}
 			var reply models.Message
-			replyErr := tx.Where(
+			replyQuery := tx.Where(
 				"id = ? AND organization_id = ? AND contact_id = ?",
 				req.ReplyToMessage.ID,
 				organizationID,
 				contact.ID,
-			).First(&reply).Error
+			)
+			if req.legacyWhatsAppReply != nil {
+				replyQuery = replyQuery.Where(
+					"inbox_conversation_id = ? AND BTRIM(whats_app_message_id) <> ''",
+					req.legacyWhatsAppReply.ConversationID,
+				)
+			}
+			replyErr := replyQuery.First(&reply).Error
 			if replyErr != nil {
 				if errors.Is(replyErr, gorm.ErrRecordNotFound) {
 					return fmt.Errorf(
@@ -246,8 +292,25 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		}
 
 		candidate := a.createOutgoingMessage(transactionalReq, opts)
+		if req.legacyWhatsAppReply != nil {
+			conversationID := req.legacyWhatsAppReply.ConversationID
+			candidate.InboxConversationID = &conversationID
+			if candidate.Metadata == nil {
+				candidate.Metadata = models.JSONB{}
+			}
+			candidate.Metadata[legacyReplyIdempotencyMetadataKey] = req.legacyWhatsAppReply.IdempotencyKey
+			candidate.Metadata[legacyReplyPayloadDigestKey] = req.legacyWhatsAppReply.PayloadDigest
+			candidate.Metadata[legacyReplyAccountMetadataKey] = req.legacyWhatsAppReply.WhatsAppAccountID.String()
+			candidate.Metadata[legacyReplyConversationMetadataKey] = conversationID.String()
+			candidate.Metadata["send_surface"] = "omnichannel_legacy_whatsapp"
+		}
 		if createErr := tx.Create(candidate).Error; createErr != nil {
 			return fmt.Errorf("failed to create message: %w", createErr)
+		}
+		if req.legacyWhatsAppReply != nil {
+			if mirrorErr := persistStrictLegacyReplyMirror(tx, &req, candidate); mirrorErr != nil {
+				return mirrorErr
+			}
 		}
 
 		lastMessageAt := time.Now().UTC()
@@ -275,6 +338,16 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		return nil
 	})
 	if err != nil {
+		var replay *outgoingIdempotentReplay
+		if errors.As(err, &replay) {
+			// A lost-response retry is an at-most-once replay: never invoke Meta,
+			// but do rebroadcast the canonical row so every live client sees its
+			// durable sent, failed, or provider-ambiguous pending state.
+			if opts.BroadcastWebSocket {
+				a.broadcastNewMessage(organizationID, &replay.message, &replay.contact)
+			}
+			return &replay.message, nil
+		}
 		a.Log.Error(
 			"Failed to persist outgoing message",
 			"error", err,
@@ -286,25 +359,36 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 
 	req.Contact = &canonicalContact
 	req.ReplyToMessage = validatedReply
-	if mirrorErr := a.outgoingTenantTransaction(
-		ctx,
-		organizationID,
-		func(tx *gorm.DB) error {
-			a.scopedApp(tx, organizationID).
-				mirrorLegacyWhatsAppMessage(req.Account, msg.ID)
-			return nil
-		},
-	); mirrorErr != nil {
-		a.Log.Error(
-			"Failed to run legacy WhatsApp mirror phase",
-			"error", mirrorErr,
-			"organization_id", organizationID,
-			"message_id", msg.ID,
-		)
+	if req.legacyWhatsAppReply == nil {
+		if opts.Async && a.usesCurrentTenantPreProvider(organizationID) {
+			a.mirrorLegacyWhatsAppMessageInSavepoint(
+				ctx,
+				req.Account,
+				msg.ID,
+			)
+		} else if mirrorErr := a.outgoingTenantTransaction(
+			ctx,
+			organizationID,
+			func(tx *gorm.DB) error {
+				a.scopedApp(tx, organizationID).
+					mirrorLegacyWhatsAppMessage(req.Account, msg.ID)
+				return nil
+			},
+		); mirrorErr != nil {
+			a.Log.Error(
+				"Failed to run legacy WhatsApp mirror phase",
+				"error", mirrorErr,
+				"organization_id", organizationID,
+				"message_id", msg.ID,
+			)
+		}
 	}
 
 	// 2. Define the send function based on message type
 	sendFn := func(sendCtx context.Context, deliveryContact *models.Contact) (string, error) {
+		if req.deliveryOverride != nil {
+			return req.deliveryOverride(sendCtx, deliveryContact)
+		}
 		waAccount := a.toWhatsAppAccount(req.Account)
 		rcpt := whatsapp.Recipient{Phone: deliveryContact.PhoneNumber, BSUID: deliveryContact.BSUID}
 
@@ -382,17 +466,20 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		}
 	}
 
-	// 3. Execute send (async or sync)
+	// 3. Execute send (async or sync). An async send entered through Tenant
+	// must not start its provider phase until the request transaction commits:
+	// the pending row and its new_message event are the durable/UI boundary.
+	var startAsyncDelivery func()
 	if opts.Async {
 		root := a.rootApp()
-		root.wg.Add(1)
-		go func() {
-			defer root.wg.Done()
-			asyncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
+		startAsyncDelivery = func() {
+			root.wg.Add(1)
+			go func() {
+				defer root.wg.Done()
+				asyncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
 
-			if err := root.WithTenantApp(organizationID, func(scoped *App) error {
-				delivery, deliveryErr := scoped.deliverOutgoingMessage(
+				delivery, deliveryErr := root.deliverOutgoingMessage(
 					asyncCtx,
 					msg,
 					req,
@@ -405,22 +492,35 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 				}
 				if deliveryErr != nil {
 					if delivery.providerAttempted {
-						scoped.Log.Error(
+						root.Log.Error(
 							"Provider delivery completed but its database result is unresolved; automatic resend is disabled",
 							"error", deliveryErr,
 							"organization_id", organizationID,
 							"message_id", msg.ID,
 						)
-						return nil
+						return
 					}
-					scoped.finalizeMessageSend(msg, deliveryReq, opts, "", deliveryErr, true)
-					return nil
+					if settlementErr := root.settleOutgoingFailureBeforeProvider(
+						msg,
+						deliveryReq,
+						opts,
+						deliveryErr,
+					); settlementErr != nil {
+						root.Log.Error(
+							"Failed to settle outgoing message before provider attempt",
+							"error", settlementErr,
+							"delivery_error", deliveryErr,
+							"organization_id", organizationID,
+							"message_id", msg.ID,
+						)
+					}
+					return
 				}
 				finalErr := delivery.sendErr
 				if delivery.policyErr != nil {
 					finalErr = delivery.policyErr
 				}
-				scoped.finalizeMessageSend(
+				root.finalizeMessageSend(
 					msg,
 					deliveryReq,
 					opts,
@@ -428,15 +528,8 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 					finalErr,
 					false,
 				)
-				return nil
-			}); err != nil {
-				root.Log.Error("Failed to deliver asynchronous message in tenant transaction",
-					"error", err,
-					"organization_id", organizationID,
-					"message_id", msg.ID,
-				)
-			}
-		}()
+			}()
+		}
 	} else {
 		delivery, deliveryErr := a.deliverOutgoingMessage(ctx, msg, req, opts, sendFn)
 		if delivery.contact.ID != uuid.Nil {
@@ -452,12 +545,34 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 				)
 				return msg, nil
 			}
-			a.finalizeMessageSend(msg, req, opts, "", deliveryErr, true)
+			if settlementErr := a.settleOutgoingFailureBeforeProvider(
+				msg,
+				req,
+				opts,
+				deliveryErr,
+			); settlementErr != nil {
+				return nil, fmt.Errorf(
+					"settle outgoing message before provider attempt: %w (delivery error: %v)",
+					settlementErr,
+					deliveryErr,
+				)
+			}
 			return nil, deliveryErr
 		}
 		finalErr := delivery.sendErr
 		if delivery.policyErr != nil {
 			finalErr = delivery.policyErr
+		}
+		// Synchronous callers broadcast and return the settled envelope. Without
+		// this copy, a final status_update was followed by a stale pending
+		// new_message from the original in-memory value.
+		msg.WhatsAppMessageID = delivery.whatsAppMessageID
+		if finalErr != nil {
+			msg.Status = models.MessageStatusFailed
+			msg.ErrorMessage = finalErr.Error()
+		} else {
+			msg.Status = models.MessageStatusSent
+			msg.ErrorMessage = ""
 		}
 		a.finalizeMessageSend(
 			msg,
@@ -479,6 +594,9 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 
 	if opts.TrackSLA {
 		a.UpdateContactChatbotMessage(req.Contact.ID)
+	}
+	if startAsyncDelivery != nil {
+		a.afterTenantCommit(startAsyncDelivery)
 	}
 
 	return msg, nil
@@ -542,6 +660,25 @@ func (a *App) deliverOutgoingMessage(
 				}
 				return nil
 			}
+			if req.legacyWhatsAppReply != nil {
+				if !legacyReplyMessageMatchesPolicy(&stored, req.legacyWhatsAppReply) {
+					policyErr := fmt.Errorf(
+						"%w: pending message binding changed",
+						errLegacyReplyBindingUnavailable,
+					)
+					result.policyErr = policyErr
+					return persistOutgoingDeliveryResult(tx, &stored, contact.ID, "", policyErr)
+				}
+				if _, policyErr := a.validateLegacyReplyPolicyTx(
+					tx,
+					&req,
+					contact.ID,
+					false,
+				); policyErr != nil {
+					result.policyErr = policyErr
+					return persistOutgoingDeliveryResult(tx, &stored, contact.ID, "", policyErr)
+				}
+			}
 
 			if opts.SentByUserID != nil {
 				if visibilityErr := a.lockOutgoingContactVisibility(
@@ -591,7 +728,12 @@ func (a *App) deliverOutgoingMessage(
 		return result, err
 	}
 
-	if recoveryErr := a.recoverOutgoingDeliveryResult(ctx, msg, &result); recoveryErr != nil {
+	recoveryContext, cancelRecovery := context.WithTimeout(
+		context.Background(),
+		outgoingDeliveryRecoveryTimeout,
+	)
+	defer cancelRecovery()
+	if recoveryErr := a.recoverOutgoingDeliveryResult(recoveryContext, msg, &result); recoveryErr != nil {
 		return result, fmt.Errorf(
 			"persist provider-attempt result after transaction failure: %w (original error: %v)",
 			recoveryErr,
@@ -673,6 +815,113 @@ func (a *App) recoverOutgoingDeliveryResult(
 	)
 }
 
+// settleOutgoingFailureBeforeProvider owns the known-no-provider failure
+// boundary. The failed delivery transaction may have never acquired a tenant
+// connection or may have rolled back before its first query, so settlement
+// must start from the root pool with a fresh bounded context. Realtime is
+// emitted only after this transaction returns successfully (and therefore
+// after the failed state is committed).
+func (a *App) settleOutgoingFailureBeforeProvider(
+	pendingMessage *models.Message,
+	req OutgoingMessageRequest,
+	opts MessageSendOptions,
+	deliveryErr error,
+) error {
+	if a == nil || pendingMessage == nil || pendingMessage.ID == uuid.Nil ||
+		req.Account == nil || req.Account.OrganizationID == uuid.Nil ||
+		deliveryErr == nil {
+		return errors.New("pre-provider failure settlement requires an exact message, account, and error")
+	}
+	organizationID := req.Account.OrganizationID
+	if pendingMessage.OrganizationID != organizationID {
+		return errors.New("pre-provider failure settlement organization does not match pending message")
+	}
+
+	settlementContext, cancelSettlement := context.WithTimeout(
+		context.Background(),
+		outgoingDeliveryRecoveryTimeout,
+	)
+	defer cancelSettlement()
+
+	root := a.rootApp()
+	var canonical models.Message
+	err := root.outgoingTenantTransaction(
+		settlementContext,
+		organizationID,
+		func(tx *gorm.DB) error {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+				"id = ? AND organization_id = ? AND direction = ?",
+				pendingMessage.ID,
+				organizationID,
+				models.DirectionOutgoing,
+			).First(&canonical).Error; err != nil {
+				return fmt.Errorf("lock pre-provider failure message: %w", err)
+			}
+			if req.legacyWhatsAppReply != nil &&
+				!legacyReplyMessageMatchesPolicy(&canonical, req.legacyWhatsAppReply) {
+				return fmt.Errorf(
+					"%w: pre-provider failure message binding changed",
+					errLegacyReplyBindingUnavailable,
+				)
+			}
+
+			switch canonical.Status {
+			case models.MessageStatusPending:
+				update := tx.Model(&models.Message{}).Where(
+					"id = ? AND organization_id = ? AND status = ?",
+					canonical.ID,
+					organizationID,
+					models.MessageStatusPending,
+				).Updates(map[string]any{
+					"status":        models.MessageStatusFailed,
+					"error_message": deliveryErr.Error(),
+				})
+				if update.Error != nil {
+					return fmt.Errorf("persist pre-provider failure: %w", update.Error)
+				}
+				if update.RowsAffected != 1 {
+					return errors.New("pending message changed before pre-provider failure settlement")
+				}
+				if err := tx.Where(
+					"id = ? AND organization_id = ?",
+					canonical.ID,
+					organizationID,
+				).First(&canonical).Error; err != nil {
+					return fmt.Errorf("reload pre-provider failure message: %w", err)
+				}
+			case models.MessageStatusFailed:
+				if strings.TrimSpace(canonical.ErrorMessage) == "" {
+					return errors.New("canonical failed message is missing its failure reason")
+				}
+			default:
+				return fmt.Errorf(
+					"pre-provider failure message is already in terminal status %s",
+					canonical.Status,
+				)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	terminalErr := errors.New(canonical.ErrorMessage)
+	deliveryReq := req
+	deliveryReq.Contact = &models.Contact{
+		BaseModel: models.BaseModel{ID: canonical.ContactID},
+	}
+	root.finalizeMessageSend(
+		&canonical,
+		deliveryReq,
+		opts,
+		canonical.WhatsAppMessageID,
+		terminalErr,
+		false,
+	)
+	return nil
+}
+
 func (a *App) outgoingProviderTransaction(
 	ctx context.Context,
 	organizationID uuid.UUID,
@@ -706,12 +955,48 @@ func (a *App) outgoingCanonicalTransaction(
 	return err
 }
 
+// outgoingPreProviderTransaction keeps an asynchronous request's pending
+// state inside an already-open RLS Tenant transaction. Starting a second root
+// transaction while that request owns the pool's only connection would
+// self-deadlock. A nested transaction gives retryable canonical-contact writes
+// a savepoint, while the provider phase is scheduled separately after the
+// outer request commits.
+func (a *App) outgoingPreProviderTransaction(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	async bool,
+	write func(tx *gorm.DB) error,
+) error {
+	if async && a != nil && a.rlsEnabled() && a.hasTenantScope() {
+		if !a.usesCurrentTenantPreProvider(organizationID) {
+			return errors.New("outgoing pre-provider tenant scope does not match account organization")
+		}
+		current := bindRealtimeAppToDB(a.DB.WithContext(ctx), a)
+		var err error
+		for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
+			err = current.Transaction(write)
+			if !isRetryableCanonicalContactWrite(err) {
+				return err
+			}
+		}
+		return err
+	}
+	return a.outgoingCanonicalTransaction(ctx, organizationID, write)
+}
+
+func (a *App) usesCurrentTenantPreProvider(organizationID uuid.UUID) bool {
+	return a != nil && a.rlsEnabled() && a.DB != nil &&
+		a.tenantOrgID != uuid.Nil && a.tenantOrgID == organizationID
+}
+
 // outgoingTenantTransaction normally starts from the root pool. In
-// particular, generic HTTP sends never become savepoints inside a request
+// particular, provider delivery never becomes a savepoint inside a request
 // Tenant transaction, so a provider attempt cannot be made durable or
-// ambiguous only at the mercy of a later outer commit. The inbound
-// continuation exception below uses its current transaction because a
-// separately committed action claim already provides its crash boundary.
+// ambiguous only at the mercy of a later outer commit. Async request callers
+// use outgoingPreProviderTransaction only for their pending state, then start
+// provider delivery after that request commits. The inbound continuation
+// exception below uses its current transaction because a separately committed
+// action claim already provides its crash boundary.
 func (a *App) outgoingTenantTransaction(
 	ctx context.Context,
 	organizationID uuid.UUID,
@@ -968,18 +1253,22 @@ func (a *App) finalizeMessageSend(
 	// which may be read concurrently by the caller when sending is async.
 	if err != nil {
 		errMsg := err.Error()
+		statusPersisted := true
 
 		if persist {
-			a.DB.Model(&models.Message{}).Where("id = ?", msg.ID).Updates(map[string]any{
+			persistErr := a.DB.Model(&models.Message{}).Where("id = ?", msg.ID).Updates(map[string]any{
 				"status":        models.MessageStatusFailed,
 				"error_message": errMsg,
-			})
+			}).Error
+			statusPersisted = persistErr == nil
+			if persistErr != nil {
+				a.Log.Error("Failed to persist message failure", "error", persistErr, "message_id", msg.ID)
+			}
 		}
 		a.Log.Error("Failed to send message", "error", err, "message_id", msg.ID, "type", msg.MessageType)
 
-		// Broadcast failure status via WebSocket so frontend updates immediately
-		if opts.BroadcastWebSocket && a.WSHub != nil {
-			a.WSHub.BroadcastToOrg(req.Account.OrganizationID, websocket.WSMessage{
+		if opts.BroadcastWebSocket && statusPersisted {
+			fallback := websocket.WSMessage{
 				Type: websocket.TypeStatusUpdate,
 				Payload: map[string]any{
 					"message_id":    msg.ID,
@@ -987,16 +1276,29 @@ func (a *App) finalizeMessageSend(
 					"status":        models.MessageStatusFailed,
 					"error_message": errMsg,
 				},
-			})
+			}
+			contactID := req.Contact.ID
+			a.publishRealtimeEvent(queue.RealtimeEvent{
+				OrganizationID: req.Account.OrganizationID,
+				Kind:           queue.RealtimeEventMessageStatusChanged,
+				ContactID:      &contactID,
+				MessageID:      &msg.ID,
+				Status:         string(models.MessageStatusFailed),
+			}, &fallback)
 		}
 		return
 	}
 
+	statusPersisted := true
 	if persist {
-		a.DB.Model(&models.Message{}).Where("id = ?", msg.ID).Updates(map[string]any{
+		persistErr := a.DB.Model(&models.Message{}).Where("id = ?", msg.ID).Updates(map[string]any{
 			"status":               models.MessageStatusSent,
 			"whats_app_message_id": wamid,
-		})
+		}).Error
+		statusPersisted = persistErr == nil
+		if persistErr != nil {
+			a.Log.Error("Failed to persist message success", "error", persistErr, "message_id", msg.ID)
+		}
 	}
 	a.Log.Info("Message sent", "message_id", msg.ID, "wa_message_id", wamid, "type", msg.MessageType)
 
@@ -1005,9 +1307,8 @@ func (a *App) finalizeMessageSend(
 		a.dispatchMessageSentWebhook(req.Account, req.Contact, msg)
 	}
 
-	// Broadcast status update via WebSocket
-	if opts.BroadcastWebSocket && a.WSHub != nil {
-		a.WSHub.BroadcastToOrg(req.Account.OrganizationID, websocket.WSMessage{
+	if opts.BroadcastWebSocket && statusPersisted {
+		fallback := websocket.WSMessage{
 			Type: websocket.TypeStatusUpdate,
 			Payload: map[string]any{
 				"message_id": msg.ID,
@@ -1015,7 +1316,15 @@ func (a *App) finalizeMessageSend(
 				"status":     models.MessageStatusSent,
 				"wamid":      wamid,
 			},
-		})
+		}
+		contactID := req.Contact.ID
+		a.publishRealtimeEvent(queue.RealtimeEvent{
+			OrganizationID: req.Account.OrganizationID,
+			Kind:           queue.RealtimeEventMessageStatusChanged,
+			ContactID:      &contactID,
+			MessageID:      &msg.ID,
+			Status:         string(models.MessageStatusSent),
+		}, &fallback)
 	}
 
 	// Mark the contact's incoming messages as read once a chatbot reply has
@@ -1028,7 +1337,7 @@ func (a *App) finalizeMessageSend(
 
 // broadcastNewMessage broadcasts a new message via WebSocket
 func (a *App) broadcastNewMessage(orgID uuid.UUID, msg *models.Message, contact *models.Contact) {
-	if a.WSHub == nil {
+	if a == nil || msg == nil || contact == nil {
 		return
 	}
 
@@ -1081,10 +1390,19 @@ func (a *App) broadcastNewMessage(orgID uuid.UUID, msg *models.Message, contact 
 		}
 	}
 
-	a.WSHub.BroadcastToOrg(orgID, websocket.WSMessage{
+	fallback := websocket.WSMessage{
 		Type:    websocket.TypeNewMessage,
 		Payload: payload,
-	})
+	}
+	contactID := contact.ID
+	a.publishRealtimeEvent(queue.RealtimeEvent{
+		OrganizationID: orgID,
+		Kind:           queue.RealtimeEventMessageCreated,
+		ContactID:      &contactID,
+		MessageID:      &msg.ID,
+		Status:         string(msg.Status),
+		OccurredAt:     msg.CreatedAt,
+	}, &fallback)
 }
 
 // broadcastReactionUpdate broadcasts a reaction update via WebSocket
@@ -1397,14 +1715,16 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 		}
 		contact = c
 	} else {
-		// SendOutgoingMessage intentionally persists through top-level tenant
-		// phases. Resolve/create the phone-only contact through the same root
-		// boundary so it is committed and visible before those phases begin,
-		// rather than leaving it uncommitted in the HTTP tenant transaction.
+		// This handler sends asynchronously. Under an RLS Tenant request the
+		// phone-only contact therefore belongs to the same pre-provider outer
+		// transaction as the pending Message; delivery is started only after that
+		// transaction commits. Root/background callers still receive an
+		// independent committed transaction.
 		var created bool
-		err := a.outgoingTenantTransaction(
+		err := a.outgoingPreProviderTransaction(
 			context.Background(),
 			orgID,
+			true,
 			func(tx *gorm.DB) error {
 				var resolveErr error
 				contact, created, resolveErr = contactutil.GetOrCreateContact(

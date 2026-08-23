@@ -17,6 +17,9 @@ const (
 	TypeSetContact    = "set_contact"
 	TypePing          = "ping"
 	TypePong          = "pong"
+	// TypeRealtimeSync tells clients to refresh canonical conversation data.
+	// Its payload contains tenant-scoped identifiers only, never message bodies.
+	TypeRealtimeSync = "realtime_sync"
 
 	// Agent transfer types
 	TypeAgentTransfer       = "agent_transfer"

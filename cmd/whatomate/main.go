@@ -781,6 +781,12 @@ func runServer(args []string) {
 	if err := app.StartCampaignStatsSubscriber(); err != nil {
 		lo.Error("Failed to start campaign stats subscriber", "error", err)
 	}
+	if err := app.StartRealtimeSubscriber(); err != nil {
+		// Cross-replica invalidation is a required correctness capability for
+		// Omnichannel. Do not advertise a healthy API replica that can only
+		// update clients connected to itself.
+		lo.Fatal("Failed to start required realtime subscriber", "error", err)
+	}
 
 	// Parse allowed origins for CORS
 	allowedOrigins := middleware.ParseAllowedOrigins(cfg.Server.AllowedOrigins)
@@ -929,6 +935,7 @@ func runServer(args []string) {
 
 	// Stop campaign stats subscriber
 	lo.Info("Stopping campaign stats subscriber...")
+	app.StopRealtimeSubscriber()
 	app.StopCampaignStatsSubscriber()
 	lo.Info("Campaign stats subscriber stopped")
 
@@ -1495,6 +1502,13 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST(
 		"/api/conversations/{id}/messages",
 		tenant((*handlers.App).SendInboxConversationMessage),
+	)
+	g.POST(
+		"/api/conversations/{id}/legacy-whatsapp-replies",
+		// The strict reply handler owns short committed tenant phases around
+		// synchronous Meta delivery. A request-long tenant wrapper would retain
+		// one pool connection while delivery opens independent transactions.
+		app.SendLegacyWhatsAppConversationReply,
 	)
 	g.POST(
 		"/api/conversations/{id}/read",

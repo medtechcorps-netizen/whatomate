@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -413,6 +414,40 @@ func TestInboxConversationResponseIncludesContactIdentity(t *testing.T) {
 	require.NotNil(t, response.ContactIdentity)
 	assert.Equal(t, identity.ID, response.ContactIdentity.ID)
 	assert.Equal(t, "Amira", response.ContactIdentity.DisplayName)
+}
+
+func TestLegacyWhatsAppReplyCapabilityMatchesRolloutGate(t *testing.T) {
+	organizationID := uuid.New()
+	account := &models.ChannelAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: organizationID,
+		Channel:        models.ChannelWhatsApp,
+		Provider:       channelapi.LegacyMetaProvider,
+		Capabilities:   models.JSONB{"text": true, "template": true},
+		Config:         models.JSONB{"reply_route": "chat"},
+	}
+
+	disabled := (&App{Config: &config.Config{}}).channelAccountToResponse(account)
+	assert.NotContains(t, disabled.Capabilities, "legacy_text_reply_endpoint")
+	assert.True(t, boolConfigValue(disabled.Capabilities, "template"))
+
+	allowed := (&App{Config: &config.Config{LegacyWhatsAppReply: config.LegacyWhatsAppReplyConfig{
+		Enabled:                true,
+		AllowedOrganizationIDs: organizationID.String(),
+	}}}).channelAccountToResponse(account)
+	assert.True(t, boolConfigValue(allowed.Capabilities, "legacy_text_reply_endpoint"))
+
+	notAllowed := (&App{Config: &config.Config{LegacyWhatsAppReply: config.LegacyWhatsAppReplyConfig{
+		Enabled:                true,
+		AllowedOrganizationIDs: uuid.NewString(),
+	}}}).channelAccountToResponse(account)
+	assert.NotContains(t, notAllowed.Capabilities, "legacy_text_reply_endpoint")
+
+	account.Capabilities = nil
+	nilCapabilities := (&App{Config: &config.Config{LegacyWhatsAppReply: config.LegacyWhatsAppReplyConfig{
+		Enabled: true,
+	}}}).channelAccountToResponse(account)
+	assert.True(t, boolConfigValue(nilCapabilities.Capabilities, "legacy_text_reply_endpoint"))
 }
 
 func TestChannelIdempotencyReplayBindsConversationAndPayload(t *testing.T) {

@@ -636,7 +636,7 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 	}
 	setMetaMessengerNoStoreHeaders(r)
 	return r.SendEnvelope(selectMetaMessengerOnboardingResponse{
-		Account:              channelAccountToResponse(&result.Account),
+		Account:              a.channelAccountToResponse(&result.Account),
 		OnboardingState:      "awaiting_health_and_approval",
 		SubscriptionVerified: true, RegistryRecognized: true,
 	})

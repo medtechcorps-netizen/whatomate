@@ -17,6 +17,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -707,20 +708,23 @@ func (a *App) updateMessageStatus(whatsappMsgID, statusValue string, errors []We
 		}
 	}
 
-	// Broadcast status update via WebSocket
-	if a.WSHub != nil {
-		wsPayload := map[string]any{
-			"message_id": message.ID.String(),
-			"status":     statusValue,
-		}
-		if errMsg, ok := updates["error_message"].(string); ok && errMsg != "" {
-			wsPayload["error_message"] = errMsg
-		}
-		a.WSHub.BroadcastToOrg(message.OrganizationID, websocket.WSMessage{
-			Type:    websocket.TypeStatusUpdate,
-			Payload: wsPayload,
-		})
+	wsPayload := map[string]any{
+		"message_id": message.ID.String(),
+		"status":     statusValue,
 	}
+	if errMsg, ok := updates["error_message"].(string); ok && errMsg != "" {
+		wsPayload["error_message"] = errMsg
+	}
+	fallback := websocket.WSMessage{Type: websocket.TypeStatusUpdate, Payload: wsPayload}
+	contactID := message.ContactID
+	a.publishRealtimeEvent(queue.RealtimeEvent{
+		OrganizationID: message.OrganizationID,
+		Kind:           queue.RealtimeEventMessageStatusChanged,
+		ContactID:      &contactID,
+		MessageID:      &message.ID,
+		Status:         statusValue,
+		OccurredAt:     time.Now().UTC(),
+	}, &fallback)
 }
 
 // processTemplateStatusUpdate updates template status when Meta sends a status update webhook

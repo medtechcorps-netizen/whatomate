@@ -47,25 +47,26 @@ type ContactResponse struct {
 
 // MessageResponse represents a message for the frontend
 type MessageResponse struct {
-	ID               uuid.UUID            `json:"id"`
-	ContactID        uuid.UUID            `json:"contact_id"`
-	Direction        models.Direction     `json:"direction"`
-	MessageType      models.MessageType   `json:"message_type"`
-	Content          any                  `json:"content"`
-	MediaURL         string               `json:"media_url,omitempty"`
-	MediaMimeType    string               `json:"media_mime_type,omitempty"`
-	MediaFilename    string               `json:"media_filename,omitempty"`
-	InteractiveData  models.JSONB         `json:"interactive_data,omitempty"`
-	Status           models.MessageStatus `json:"status"`
-	WAMID            string               `json:"wamid"`
-	Error            string               `json:"error_message"`
-	IsReply          bool                 `json:"is_reply"`
-	ReplyToMessageID *string              `json:"reply_to_message_id,omitempty"`
-	ReplyToMessage   *ReplyPreview        `json:"reply_to_message,omitempty"`
-	Reactions        []ReactionInfo       `json:"reactions,omitempty"`
-	WhatsAppAccount  string               `json:"whatsapp_account,omitempty"`
-	CreatedAt        time.Time            `json:"created_at"`
-	UpdatedAt        time.Time            `json:"updated_at"`
+	ID                  uuid.UUID            `json:"id"`
+	ContactID           uuid.UUID            `json:"contact_id"`
+	Direction           models.Direction     `json:"direction"`
+	MessageType         models.MessageType   `json:"message_type"`
+	Content             any                  `json:"content"`
+	MediaURL            string               `json:"media_url,omitempty"`
+	MediaMimeType       string               `json:"media_mime_type,omitempty"`
+	MediaFilename       string               `json:"media_filename,omitempty"`
+	InteractiveData     models.JSONB         `json:"interactive_data,omitempty"`
+	Status              models.MessageStatus `json:"status"`
+	WAMID               string               `json:"wamid"`
+	Error               string               `json:"error_message"`
+	IsReply             bool                 `json:"is_reply"`
+	ReplyToMessageID    *string              `json:"reply_to_message_id,omitempty"`
+	ReplyToMessage      *ReplyPreview        `json:"reply_to_message,omitempty"`
+	Reactions           []ReactionInfo       `json:"reactions,omitempty"`
+	WhatsAppAccount     string               `json:"whatsapp_account,omitempty"`
+	InboxConversationID *uuid.UUID           `json:"inbox_conversation_id,omitempty"`
+	CreatedAt           time.Time            `json:"created_at"`
+	UpdatedAt           time.Time            `json:"updated_at"`
 }
 
 // ReplyPreview contains a preview of the replied-to message

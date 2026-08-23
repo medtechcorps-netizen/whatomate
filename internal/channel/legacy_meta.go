@@ -46,6 +46,29 @@ type LegacyMetaBackfillStats struct {
 	Linked   int
 }
 
+// LegacyMetaWhatsAppAccountID resolves the immutable established WhatsApp
+// account behind a read-only omnichannel shadow. Both the private metadata and
+// deterministic external ID must agree, so callers fail closed on stale or
+// manually altered bridge rows.
+func LegacyMetaWhatsAppAccountID(account *models.ChannelAccount) (uuid.UUID, error) {
+	if account == nil || account.ID == uuid.Nil || account.OrganizationID == uuid.Nil ||
+		account.Channel != models.ChannelWhatsApp || account.Provider != LegacyMetaProvider {
+		return uuid.Nil, errors.New("legacy Meta WhatsApp shadow account is invalid")
+	}
+	rawID, ok := account.Metadata["legacy_account_id"].(string)
+	if !ok {
+		return uuid.Nil, errors.New("legacy Meta WhatsApp account binding is missing")
+	}
+	accountID, err := uuid.Parse(strings.TrimSpace(rawID))
+	if err != nil || accountID == uuid.Nil {
+		return uuid.Nil, errors.New("legacy Meta WhatsApp account binding is invalid")
+	}
+	if account.ExternalAccountID != legacyMetaIDPrefix+"account:"+accountID.String() {
+		return uuid.Nil, errors.New("legacy Meta WhatsApp account binding is inconsistent")
+	}
+	return accountID, nil
+}
+
 // MirrorLegacyWhatsAppMessage links an existing legacy Message envelope into
 // the provider-neutral inbox. It never creates an outbound job, sends to Meta,
 // copies credentials, or duplicates message content.
@@ -302,8 +325,14 @@ func ensureLegacyMetaAccount(
 		ExternalAccountID: externalID,
 		Status:            status,
 		Capabilities: models.JSONB{
-			"text":        true,
-			"media":       true,
+			"text":           true,
+			"media":          true,
+			"replies":        true,
+			"templates":      true,
+			"service_window": true,
+			"read_receipts":  true,
+			// Preserve the original bridge aliases for older clients while
+			// exposing the provider-neutral capability names additively.
 			"template":    true,
 			"mark_read":   true,
 			"attachments": true,
@@ -497,6 +526,10 @@ func ensureLegacyMetaConversation(
 	}
 	persisted.ContactIdentityID = &identity.ID
 	persisted.AssignedUserID = contact.AssignedUserID
+	persisted.Config = models.JSONB{
+		"legacy_read_only": true,
+		"reply_route":      "chat",
+	}
 	persisted.DeletedAt = gorm.DeletedAt{}
 	return &persisted, nil
 }

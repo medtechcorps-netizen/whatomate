@@ -420,6 +420,11 @@ func (p *InboundContinuationProcessor) processClaimed(
 			return errors.New("inbound continuation processor is not configured")
 		}
 		executionApp := scoped.scopedApp(scoped.DB, organizationID)
+		// executionApp carries per-job action state, but the surrounding scoped
+		// App owns the transaction commit. Move every deferred realtime callback
+		// to that owner on all exits; adoptAfterCommit drains the nested queue so
+		// it cannot be delivered twice.
+		defer scoped.adoptAfterCommit(executionApp)
 		executionApp.inboundContinuation = &inboundContinuationExecution{
 			MessageID: work.Persisted.ID,
 			WAMID:     work.Message.ID,
