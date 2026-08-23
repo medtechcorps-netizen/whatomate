@@ -72,7 +72,7 @@ func claimLegacyReplyIdempotency(
 	if tx == nil || policy == nil {
 		return nil, fmt.Errorf("%w: policy is required", errLegacyReplyBindingUnavailable)
 	}
-	if tx.Dialector.Name() != "postgres" {
+	if tx.Name() != "postgres" {
 		return nil, errors.New("durable legacy reply idempotency requires PostgreSQL")
 	}
 	lockID := legacyReplyAdvisoryLockID(

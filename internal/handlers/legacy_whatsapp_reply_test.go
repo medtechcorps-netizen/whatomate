@@ -258,7 +258,7 @@ func TestSendLegacyWhatsAppConversationReplyDatabaseFailureCallsNoProvider(t *te
 	callbackName := "test:reject_strict_legacy_reply_" + uuid.NewString()
 	require.NoError(t, fixture.app.DB.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
 		if tx.Statement != nil && tx.Statement.Schema != nil && tx.Statement.Schema.Table == "messages" {
-			tx.AddError(errors.New("forced pending-message persistence failure"))
+			_ = tx.AddError(errors.New("forced pending-message persistence failure"))
 		}
 	}))
 	t.Cleanup(func() { _ = fixture.app.DB.Callback().Create().Remove(callbackName) })

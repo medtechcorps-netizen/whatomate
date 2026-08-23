@@ -219,7 +219,7 @@ func TestLegacyWhatsAppReplyRouteUsesExplicitHeaderWithoutHoldingTenantConnectio
 			// omnichannel mirror locks its legacy Contact. The provider phase's
 			// canonical Contact lock is therefore the third matching query.
 			if lockedContactQueries.Add(1) == 3 {
-				tx.AddError(forcedProviderQueryErr)
+				_ = tx.AddError(forcedProviderQueryErr)
 			}
 		},
 	))

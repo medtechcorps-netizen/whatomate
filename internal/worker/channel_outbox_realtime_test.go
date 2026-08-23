@@ -127,7 +127,7 @@ func TestChannelOutboxSettlementFailurePublishesNothing(t *testing.T) {
 	callbackName := "test:fail_channel_outbox_settlement_" + uuid.NewString()
 	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
 		if tx.Statement != nil && tx.Statement.Schema != nil && tx.Statement.Schema.Table == "message_events" {
-			tx.AddError(errors.New("forced message-event persistence failure"))
+			_ = tx.AddError(errors.New("forced message-event persistence failure"))
 		}
 	}))
 	t.Cleanup(func() { _ = db.Callback().Create().Remove(callbackName) })
