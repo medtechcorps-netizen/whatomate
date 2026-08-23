@@ -3,7 +3,12 @@ import { ref, watch, onMounted, onUnmounted, nextTick, computed, defineAsyncComp
 import { useMediaQuery } from '@vueuse/core'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { useContactsStore, type Contact, type Message } from '@/stores/contacts'
+import {
+  normalizeContactSearch,
+  useContactsStore,
+  type Contact,
+  type Message,
+} from '@/stores/contacts'
 import { useAuthStore } from '@/stores/auth'
 import { useUsersStore } from '@/stores/users'
 import { useTransfersStore } from '@/stores/transfers'
@@ -139,6 +144,13 @@ const newMessagesCount = ref(0)
 const firstUnreadId = ref<string | null>(null)
 const isAtBottom = ref(true)
 const SCROLL_BOTTOM_THRESHOLD = 80
+const CANONICAL_CATCH_UP_INTERVAL_MS = 30_000
+let contactSelectionGeneration = 0
+let initialConversationScrollTimer: ReturnType<typeof setTimeout> | null = null
+let canonicalCatchUpTimer: number | null = null
+let canonicalCatchUpInFlight = false
+let canonicalCatchUpQueued = false
+let chatViewMounted = false
 const isInfoPanelOpen = ref(false)
 const isNotesPanelOpen = ref(false)
 const contactSessionData = ref<any>(null)
@@ -438,6 +450,7 @@ const filteredAssignableUsers = computed(() => {
 
 // Fetch contacts on mount (WebSocket is connected in AppLayout)
 onMounted(async () => {
+  chatViewMounted = true
   // Ensure auth session is restored
   if (!authStore.isAuthenticated) {
     authStore.restoreSession()
@@ -481,13 +494,18 @@ onMounted(async () => {
     await selectContact(contactId.value)
   }
 
+  if (!chatViewMounted) return
+
   // Auto-scroll to the unread divider and mark messages read when the agent
   // returns — covers both tab-switch (visibilitychange) and OS window focus
   // (focus event), since "tab visible but window unfocused" is a real state
   // and we don't want to send blue-tick receipts when no one is looking.
   // See issue #280.
   document.addEventListener('visibilitychange', onUserActive)
+  document.addEventListener('visibilitychange', onChatVisibilityChange)
   window.addEventListener('focus', onUserActive)
+  window.addEventListener('online', onChatOnline)
+  startCanonicalCatchUpTimer()
 })
 
 function onUserActive() {
@@ -505,7 +523,76 @@ function onUserActive() {
   })
 }
 
+function isChatDocumentVisible() {
+  return document.visibilityState !== 'hidden'
+}
+
+async function runCanonicalCatchUp() {
+  if (!chatViewMounted || !isChatDocumentVisible()) return
+  if (canonicalCatchUpInFlight) {
+    canonicalCatchUpQueued = true
+    return
+  }
+
+  canonicalCatchUpInFlight = true
+  canonicalCatchUpQueued = false
+  try {
+    const search = normalizeContactSearch(contactsStore.searchQuery) || undefined
+    // Both store paths are identity/request-generation guarded. Message refresh
+    // merges the latest canonical page into loaded history, preserving a
+    // scrolled-up reader's anchor while the existing length watcher follows a
+    // newly appended message only when the reader was already near the bottom.
+    await Promise.allSettled([
+      contactsStore.fetchContacts({ search }),
+      contactsStore.refreshCurrentMessages(),
+    ])
+  } finally {
+    canonicalCatchUpInFlight = false
+    if (
+      canonicalCatchUpQueued &&
+      chatViewMounted &&
+      isChatDocumentVisible()
+    ) {
+      canonicalCatchUpQueued = false
+      void runCanonicalCatchUp()
+    }
+  }
+}
+
+function stopCanonicalCatchUpTimer() {
+  if (canonicalCatchUpTimer !== null) {
+    window.clearInterval(canonicalCatchUpTimer)
+    canonicalCatchUpTimer = null
+  }
+}
+
+function startCanonicalCatchUpTimer() {
+  stopCanonicalCatchUpTimer()
+  if (!chatViewMounted || !isChatDocumentVisible()) return
+  canonicalCatchUpTimer = window.setInterval(() => {
+    void runCanonicalCatchUp()
+  }, CANONICAL_CATCH_UP_INTERVAL_MS)
+}
+
+function onChatVisibilityChange() {
+  if (!isChatDocumentVisible()) {
+    stopCanonicalCatchUpTimer()
+    return
+  }
+  startCanonicalCatchUpTimer()
+  void runCanonicalCatchUp()
+}
+
+function onChatOnline() {
+  if (isChatDocumentVisible()) void runCanonicalCatchUp()
+}
+
 onUnmounted(() => {
+  chatViewMounted = false
+  canonicalCatchUpQueued = false
+  stopCanonicalCatchUpTimer()
+  invalidateContactSelection()
+  messagesScroll.cleanup()
   wsService.setCurrentContact(null)
   // Clear current contact when leaving chat view so notifications work on other pages
   contactsStore.setCurrentContact(null)
@@ -513,7 +600,9 @@ onUnmounted(() => {
   // Clear sticky date timeout
   if (stickyDateTimeout) clearTimeout(stickyDateTimeout)
   document.removeEventListener('visibilitychange', onUserActive)
+  document.removeEventListener('visibilitychange', onChatVisibilityChange)
   window.removeEventListener('focus', onUserActive)
+  window.removeEventListener('online', onChatOnline)
 })
 
 function updateStickyDate(scrollContainer: HTMLElement) {
@@ -553,10 +642,12 @@ function updateStickyDate(scrollContainer: HTMLElement) {
 // Watch for route changes
 watch(contactId, async (newId) => {
   if (newId) {
-    notesStore.notes = []
-    notesStore.hasMore = false
+    // Invalidate an in-flight notes request for the previous conversation
+    // before the next contact starts loading.
+    notesStore.clearNotes()
     await selectContact(newId)
   } else {
+    invalidateContactSelection()
     wsService.setCurrentContact(null)
     contactsStore.setCurrentContact(null)
     contactsStore.clearMessages()
@@ -564,21 +655,55 @@ watch(contactId, async (newId) => {
   }
 })
 
+function cancelInitialConversationScroll() {
+  if (initialConversationScrollTimer !== null) {
+    clearTimeout(initialConversationScrollTimer)
+    initialConversationScrollTimer = null
+  }
+}
+
+function invalidateContactSelection() {
+  contactSelectionGeneration++
+  cancelInitialConversationScroll()
+  contactSessionData.value = null
+  // Allow the newly selected conversation to act immediately. Late promises
+  // from the previous selection are guarded by their captured generation and
+  // must not clear or scroll the replacement conversation.
+  isSending.value = false
+  retryingMessageId.value = null
+  isSendingCanned.value = false
+  isSendingTemplate.value = false
+  isUploadingMedia.value = false
+}
+
+function isContactSelectionRequested(generation: number, id: string) {
+  return generation === contactSelectionGeneration && contactId.value === id
+}
+
+function isContactSelectionActive(generation: number, id: string) {
+  return isContactSelectionRequested(generation, id) && contactsStore.currentContact?.id === id
+}
+
 async function selectContact(id: string) {
+  const selectionGeneration = ++contactSelectionGeneration
+  cancelInitialConversationScroll()
+  contactSessionData.value = null
+  // Stop the old viewport listener immediately. It must not load history or
+  // update scroll state while the replacement conversation is resolving.
+  messagesScroll.cleanup()
+
   // Direct deep links to /chat/:id may target a contact that isn't in the
   // currently-loaded (paginated) list — fall back to fetching it directly.
   let contact = contactsStore.contacts.find(c => c.id === id)
   if (!contact) {
     contact = await contactsStore.fetchContact(id)
   }
+  if (!isContactSelectionRequested(selectionGeneration, id)) return
   if (contact) {
     // Reset unread pill — fetchMessages will mark everything read on the server
     newMessagesCount.value = 0
     firstUnreadId.value = null
     isAtBottom.value = true
-
-    // Remove old scroll listener before switching contacts
-    messagesScroll.cleanup()
 
     // Reset account selection when switching contacts
     selectedAccount.value = null
@@ -587,6 +712,7 @@ async function selectContact(id: string) {
 
     contactsStore.setCurrentContact(contact)
     await contactsStore.fetchMessages(id)
+    if (!isContactSelectionActive(selectionGeneration, id)) return
 
     // Discover distinct accounts from the unfiltered message set
     const accounts = new Set<string>()
@@ -628,8 +754,10 @@ async function selectContact(id: string) {
     await nextTick()
     // Individual message components hydrate fetched media.
     // Scroll after a brief delay to ensure content is rendered (instant on initial load)
-    setTimeout(() => {
-      scrollToBottom(true)
+    initialConversationScrollTimer = setTimeout(() => {
+      initialConversationScrollTimer = null
+      if (!isContactSelectionActive(selectionGeneration, id)) return
+      scrollToBottom(true, () => isContactSelectionActive(selectionGeneration, id))
       // Setup scroll listener for infinite scroll after initial scroll
       messagesScroll.setup()
     }, 50)
@@ -639,6 +767,7 @@ async function selectContact(id: string) {
       notesStore.fetchNotes(id),
       contactsService.getSessionData(id).catch(() => null)
     ])
+    if (!isContactSelectionActive(selectionGeneration, id)) return
     if (sessionResult) {
       contactSessionData.value = sessionResult.data.data || sessionResult.data
       if (isRevenueRail.value && contactSessionData.value?.panel_config?.sections?.length > 0) {
@@ -684,9 +813,11 @@ watch(() => contactsStore.messages.length, (newLen, oldLen) => {
 
 async function switchAccount(accountName: string) {
   if (!contactsStore.currentContact || accountName === selectedAccount.value) return
+  const contactID = contactsStore.currentContact.id
   selectedAccount.value = accountName
   contactsStore.setAccountFilter(accountName)
-  await contactsStore.fetchMessages(contactsStore.currentContact.id, { account: accountName })
+  await contactsStore.fetchMessages(contactID, { account: accountName })
+  if (contactsStore.currentContact?.id !== contactID || selectedAccount.value !== accountName) return
   await nextTick()
   scrollToBottom(true)
 }
@@ -698,24 +829,34 @@ function handleContactClick(contact: Contact) {
 async function sendMessage() {
   if (!messageInput.value.trim() || !contactsStore.currentContact) return
 
+  const contactIdAtSend = contactsStore.currentContact.id
+  const selectionGeneration = contactSelectionGeneration
+  const bodyAtSend = messageInput.value
   isSending.value = true
   try {
     await contactsStore.sendMessage(
-      contactsStore.currentContact.id,
+      contactIdAtSend,
       'text',
-      { body: messageInput.value },
+      { body: bodyAtSend },
       contactsStore.replyingTo?.id,
       selectedAccount.value || undefined
     )
+    if (!isContactSelectionActive(selectionGeneration, contactIdAtSend)) return
     messageInput.value = ''
     contactsStore.clearReplyingTo()
     resetTextareaHeight()
     await nextTick()
-    scrollToBottom()
+    scrollToBottom(false, () =>
+      isContactSelectionActive(selectionGeneration, contactIdAtSend),
+    )
   } catch (error) {
-    toast.error(getErrorMessage(error, t('chat.sendMessageFailed')))
+    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+      toast.error(getErrorMessage(error, t('chat.sendMessageFailed')))
+    }
   } finally {
-    isSending.value = false
+    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+      isSending.value = false
+    }
   }
 }
 
@@ -724,18 +865,21 @@ const retryingMessageId = ref<string | null>(null)
 async function retryMessage(message: Message) {
   if (!contactsStore.currentContact || retryingMessageId.value) return
 
+  const contactIdAtSend = contactsStore.currentContact.id
+  const selectionGeneration = contactSelectionGeneration
   retryingMessageId.value = message.id
   try {
     // Get the message content based on type
     const content = message.content || {}
 
     await contactsStore.sendMessage(
-      contactsStore.currentContact.id,
+      contactIdAtSend,
       message.message_type,
       content,
       undefined,
       message.whatsapp_account || selectedAccount.value || undefined
     )
+    if (!isContactSelectionActive(selectionGeneration, contactIdAtSend)) return
 
     // Remove the failed message from the list after successful retry
     const messages = (contactsStore.messages as any).get?.(contactsStore.currentContact.id) as Message[] | undefined
@@ -748,9 +892,13 @@ async function retryMessage(message: Message) {
 
     toast.success(t('chat.messageSent'))
   } catch (error) {
-    toast.error(getErrorMessage(error, t('chat.sendMessageFailed')))
+    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+      toast.error(getErrorMessage(error, t('chat.sendMessageFailed')))
+    }
   } finally {
-    retryingMessageId.value = null
+    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+      retryingMessageId.value = null
+    }
   }
 }
 
@@ -883,6 +1031,9 @@ function handleCannedSelect(response: CannedResponse) {
 async function sendCannedResponse() {
   if (!contactsStore.currentContact || !selectedCannedResponse.value) return
 
+  const contactIdAtSend = contactsStore.currentContact.id
+  const selectionGeneration = contactSelectionGeneration
+
   const missing = cannedParamNames.value.some(n => !cannedParamValues.value[n]?.trim())
   if (missing) {
     toast.error(t('chat.parameterRequired'))
@@ -966,13 +1117,14 @@ async function sendCannedResponse() {
   isSendingCanned.value = true
   try {
     await contactsStore.sendMessage(
-      contactsStore.currentContact.id,
+      contactIdAtSend,
       sendType,
       sendType === 'interactive' ? { body } : { body },
       contactsStore.replyingTo?.id,
       selectedAccount.value || undefined,
       interactive ? { interactive } : undefined,
     )
+    if (!isContactSelectionActive(selectionGeneration, contactIdAtSend)) return
     cannedResponsesService.use(responseId).catch(() => {})
     contactsStore.clearReplyingTo()
     cannedDialogOpen.value = false
@@ -980,11 +1132,17 @@ async function sendCannedResponse() {
     cannedParamNames.value = []
     cannedParamValues.value = {}
     await nextTick()
-    scrollToBottom()
+    scrollToBottom(false, () =>
+      isContactSelectionActive(selectionGeneration, contactIdAtSend),
+    )
   } catch (error) {
-    toast.error(getErrorMessage(error, t('chat.sendMessageFailed')))
+    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+      toast.error(getErrorMessage(error, t('chat.sendMessageFailed')))
+    }
   } finally {
-    isSendingCanned.value = false
+    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+      isSendingCanned.value = false
+    }
   }
 }
 
@@ -1075,6 +1233,9 @@ function handleTemplateWithParams(template: any, paramNames: string[]) {
 async function sendTemplateMessage() {
   if (!contactsStore.currentContact || !selectedTemplate.value) return
 
+  const contactIdAtSend = contactsStore.currentContact.id
+  const selectionGeneration = contactSelectionGeneration
+
   // Validate header param (separate ref so it can hold its own value even
   // when the body has a {{1}} that would otherwise collide). Auto-resolved
   // context tokens are exempt — their value comes from the conversation.
@@ -1119,7 +1280,7 @@ async function sendTemplateMessage() {
   isSendingTemplate.value = true
   try {
     await contactsStore.sendTemplate(
-      contactsStore.currentContact.id,
+      contactIdAtSend,
       selectedTemplate.value.name,
       templateParamValues.value,
       selectedAccount.value || undefined,
@@ -1127,6 +1288,7 @@ async function sendTemplateMessage() {
       buttonParams,
       headerParams
     )
+    if (!isContactSelectionActive(selectionGeneration, contactIdAtSend)) return
     toast.success(t('chat.templateSent'))
     templateDialogOpen.value = false
     selectedTemplate.value = null
@@ -1137,10 +1299,14 @@ async function sendTemplateMessage() {
     clearTemplateHeaderMedia()
     templateButtonUrlParams.value = []
   } catch (error: any) {
-    const message = error.response?.data?.message || t('chat.templateSendFailed')
-    toast.error(message)
+    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+      const message = error.response?.data?.message || t('chat.templateSendFailed')
+      toast.error(message)
+    }
   } finally {
-    isSendingTemplate.value = false
+    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+      isSendingTemplate.value = false
+    }
   }
 }
 
@@ -1270,9 +1436,9 @@ async function resumeChatbot() {
   }
 }
 
-function scrollToBottom(instant = false) {
+function scrollToBottom(instant = false, shouldScroll: () => boolean = () => true) {
   nextTick(() => {
-    if (messagesEndRef.value) {
+    if (shouldScroll() && messagesEndRef.value) {
       messagesEndRef.value.scrollIntoView({
         behavior: instant ? 'instant' : 'smooth',
         block: 'end'
@@ -1607,11 +1773,13 @@ function getMediaType(mimeType: string): string {
 async function sendMediaMessage() {
   if (!selectedFile.value || !contactsStore.currentContact) return
 
+  const contactIdAtSend = contactsStore.currentContact.id
+  const selectionGeneration = contactSelectionGeneration
   isUploadingMedia.value = true
   try {
     const formData = new FormData()
     formData.append('file', selectedFile.value)
-    formData.append('contact_id', contactsStore.currentContact.id)
+    formData.append('contact_id', contactIdAtSend)
     formData.append('type', getMediaType(selectedFile.value.type))
     if (mediaCaption.value.trim()) {
       formData.append('caption', mediaCaption.value.trim())
@@ -1634,6 +1802,7 @@ async function sendMediaMessage() {
     }
 
     const result = await response.json()
+    if (!isContactSelectionActive(selectionGeneration, contactIdAtSend)) return
 
     // Add the message to the store (addMessage has duplicate checking for WebSocket)
     if (result.data) {
@@ -1644,11 +1813,15 @@ async function sendMediaMessage() {
     toast.success(t('chat.mediaSent'))
     closeMediaDialog()
   } catch (error: any) {
-    toast.error(t('chat.mediaFailed'), {
-      description: error.message || t('chat.mediaFailedDesc')
-    })
+    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+      toast.error(t('chat.mediaFailed'), {
+        description: error.message || t('chat.mediaFailedDesc')
+      })
+    }
   } finally {
-    isUploadingMedia.value = false
+    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+      isUploadingMedia.value = false
+    }
   }
 }
 </script>

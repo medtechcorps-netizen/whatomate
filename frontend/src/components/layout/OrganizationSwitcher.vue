@@ -15,6 +15,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { organizationsService } from '@/services/api'
+import { wsService } from '@/services/websocket'
 import { toast } from 'vue-sonner'
 import { Building2, Plus, Loader2 } from 'lucide-vue-next'
 
@@ -89,6 +90,7 @@ const handleOrgChange = async (value: string | number | bigint | Record<string, 
 
   if (isSuperAdmin.value) {
     // Super admins: set localStorage header and reload
+    wsService.disconnect()
     organizationsStore.selectOrganization(value)
     if (route.name === 'workspace-upgrade') {
       await router.replace({
@@ -101,6 +103,8 @@ const handleOrgChange = async (value: string | number | bigint | Record<string, 
     // Multi-org users: call switchOrg API for new JWT tokens, then reload
     try {
       await authStore.switchOrg(value)
+      wsService.disconnect()
+      organizationsStore.selectOrganization(value)
       window.location.reload()
     } catch {
       // If switch fails, don't reload

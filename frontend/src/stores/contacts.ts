@@ -1,12 +1,14 @@
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import { contactsService, messagesService } from '@/services/api'
+import { useAuthStore } from '@/stores/auth'
+import { useOrganizationsStore } from '@/stores/organizations'
 
 // Phones are stored without leading + or whitespace (see CreateContact in
 // internal/handlers/contacts.go). Strip them from a digit-only query so a user
 // typing "+91 98765 43210" still matches a stored "919876543210" via the
 // server's substring LIKE.
-function normalizeContactSearch(raw: string): string {
+export function normalizeContactSearch(raw: string): string {
   const trimmed = raw.trim().replace(/^\+/, '')
   if (trimmed && /^[\d\s+()-]+$/.test(trimmed)) {
     return trimmed.replace(/[\s+()-]/g, '')
@@ -83,6 +85,8 @@ export interface Message {
 }
 
 export const useContactsStore = defineStore('contacts', () => {
+  const authStore = useAuthStore()
+  const organizationsStore = useOrganizationsStore()
   const contacts = ref<Contact[]>([])
   const currentContact = ref<Contact | null>(null)
   const messages = ref<Message[]>([])
@@ -94,6 +98,22 @@ export const useContactsStore = defineStore('contacts', () => {
   const selectedTags = ref<string[]>([])
   const replyingTo = ref<Message | null>(null)
   const accountFilter = ref<string | null>(null)
+  const activeOrganizationScope = computed(
+    () => organizationsStore.selectedOrgId || authStore.organizationId || '',
+  )
+  let identityGeneration = 0
+  let contactLoadGeneration = 0
+  let contactLoadAbortController: AbortController | null = null
+  let moreContactsLoadGeneration = 0
+  let moreContactsLoadAbortController: AbortController | null = null
+  let messageLoadGeneration = 0
+  let messageLoadAbortController: AbortController | null = null
+  let messageRefreshQueued = false
+  let olderMessageLoadGeneration = 0
+  let olderMessageLoadAbortController: AbortController | null = null
+  let searchDebounceHandle: ReturnType<typeof setTimeout> | null = null
+  let searchDebounceGeneration = 0
+  let suppressEmptySearchReset = false
 
   // Contacts pagination
   const contactsPage = ref(1)
@@ -114,31 +134,111 @@ export const useContactsStore = defineStore('contacts', () => {
     })
   })
 
+  function isAbortError(error: unknown) {
+    return (
+      (error instanceof DOMException && error.name === 'AbortError') ||
+      (typeof error === 'object' && error !== null && 'code' in error && (error as any).code === 'ERR_CANCELED')
+    )
+  }
+
+  function resetForIdentityChange() {
+    identityGeneration++
+    contactLoadGeneration++
+    moreContactsLoadGeneration++
+    messageLoadGeneration++
+    olderMessageLoadGeneration++
+    contactLoadAbortController?.abort()
+    contactLoadAbortController = null
+    moreContactsLoadAbortController?.abort()
+    moreContactsLoadAbortController = null
+    messageLoadAbortController?.abort()
+    messageLoadAbortController = null
+    olderMessageLoadAbortController?.abort()
+    olderMessageLoadAbortController = null
+    searchDebounceGeneration++
+    if (searchDebounceHandle !== null) {
+      clearTimeout(searchDebounceHandle)
+      searchDebounceHandle = null
+    }
+    if (searchQuery.value !== '') {
+      suppressEmptySearchReset = true
+      searchQuery.value = ''
+    }
+
+    contacts.value = []
+    currentContact.value = null
+    messages.value = []
+    contactsPage.value = 1
+    contactsTotal.value = 0
+    isLoading.value = false
+    isLoadingMoreContacts.value = false
+    isLoadingMessages.value = false
+    isLoadingOlderMessages.value = false
+    hasMoreMessages.value = false
+    selectedTags.value = []
+    replyingTo.value = null
+    accountFilter.value = null
+    messageRefreshQueued = false
+  }
+
   async function fetchContacts(params?: { search?: string; page?: number; limit?: number; tags?: string }) {
+    const loadGeneration = ++contactLoadGeneration
+    const identity = identityGeneration
+    const organizationScope = activeOrganizationScope.value
+    contactLoadAbortController?.abort()
+    moreContactsLoadGeneration++
+    moreContactsLoadAbortController?.abort()
+    moreContactsLoadAbortController = null
+    isLoadingMoreContacts.value = false
+    const controller = new AbortController()
+    contactLoadAbortController = controller
     isLoading.value = true
     try {
       const tagsParam = selectedTags.value.length > 0 ? selectedTags.value.join(',') : undefined
+      const currentSearch = normalizeContactSearch(searchQuery.value) || undefined
       const response = await contactsService.list({
         page: 1,
         limit: contactsLimit.value,
         tags: tagsParam,
+        search: currentSearch,
         ...params
-      })
+      }, controller.signal)
+      if (
+        loadGeneration !== contactLoadGeneration ||
+        identity !== identityGeneration ||
+        organizationScope !== activeOrganizationScope.value
+      ) return
       // API returns { status: "success", data: { contacts: [...], total: number } }
       const data = response.data.data || response.data
       contacts.value = data.contacts || []
       contactsTotal.value = data.total ?? contacts.value.length
       contactsPage.value = 1
     } catch (error) {
-      console.error('Failed to fetch contacts:', error)
+      if (
+        loadGeneration === contactLoadGeneration &&
+        identity === identityGeneration &&
+        organizationScope === activeOrganizationScope.value &&
+        !isAbortError(error)
+      ) {
+        console.error('Failed to fetch contacts:', error)
+      }
     } finally {
-      isLoading.value = false
+      if (loadGeneration === contactLoadGeneration) {
+        isLoading.value = false
+        if (contactLoadAbortController === controller) contactLoadAbortController = null
+      }
     }
   }
 
   async function loadMoreContacts() {
-    if (isLoadingMoreContacts.value || !hasMoreContacts.value) return
+    if (isLoading.value || isLoadingMoreContacts.value || !hasMoreContacts.value) return
 
+    const loadGeneration = ++moreContactsLoadGeneration
+    const identity = identityGeneration
+    const organizationScope = activeOrganizationScope.value
+    moreContactsLoadAbortController?.abort()
+    const controller = new AbortController()
+    moreContactsLoadAbortController = controller
     isLoadingMoreContacts.value = true
     try {
       const nextPage = contactsPage.value + 1
@@ -149,7 +249,12 @@ export const useContactsStore = defineStore('contacts', () => {
         limit: contactsLimit.value,
         tags: tagsParam,
         search
-      })
+      }, controller.signal)
+      if (
+        loadGeneration !== moreContactsLoadGeneration ||
+        identity !== identityGeneration ||
+        organizationScope !== activeOrganizationScope.value
+      ) return
       const data = response.data.data || response.data
       const newContacts = data.contacts || []
 
@@ -162,41 +267,118 @@ export const useContactsStore = defineStore('contacts', () => {
       }
       contactsTotal.value = data.total ?? contactsTotal.value
     } catch (error) {
-      console.error('Failed to load more contacts:', error)
+      if (
+        loadGeneration === moreContactsLoadGeneration &&
+        identity === identityGeneration &&
+        organizationScope === activeOrganizationScope.value &&
+        !isAbortError(error)
+      ) {
+        console.error('Failed to load more contacts:', error)
+      }
     } finally {
-      isLoadingMoreContacts.value = false
+      if (loadGeneration === moreContactsLoadGeneration) {
+        isLoadingMoreContacts.value = false
+        if (moreContactsLoadAbortController === controller) moreContactsLoadAbortController = null
+      }
     }
   }
 
   async function fetchContact(id: string) {
+    const identity = identityGeneration
+    const organizationScope = activeOrganizationScope.value
     try {
       const response = await contactsService.get(id)
+      if (
+        identity !== identityGeneration ||
+        organizationScope !== activeOrganizationScope.value
+      ) return null
       // API returns { status: "success", data: { ... } }
       const data = response.data.data || response.data
-      currentContact.value = data
       return data
     } catch (error) {
-      console.error('Failed to fetch contact:', error)
+      if (
+        identity === identityGeneration &&
+        organizationScope === activeOrganizationScope.value
+      ) {
+        console.error('Failed to fetch contact:', error)
+      }
       return null
     }
   }
 
-  async function fetchMessages(contactId: string, params?: { page?: number; limit?: number; account?: string }) {
-    isLoadingMessages.value = true
-    // Drop the previous contact's messages immediately so the list doesn't show
-    // stale content under the new contact's header while the fetch is in flight.
-    messages.value = []
+  async function fetchMessages(
+    contactId: string,
+    params?: { page?: number; limit?: number; account?: string },
+    options?: { preserveExisting?: boolean },
+  ) {
+    const preserveExisting = options?.preserveExisting === true
+    const loadGeneration = ++messageLoadGeneration
+    const identity = identityGeneration
+    const organizationScope = activeOrganizationScope.value
+    messageLoadAbortController?.abort()
+    const controller = new AbortController()
+    messageLoadAbortController = controller
+    if (!preserveExisting) {
+      isLoadingMessages.value = true
+      // Selection loads intentionally clear the previous contact immediately.
+      messages.value = []
+    }
     try {
-      const response = await messagesService.list(contactId, params)
+      const response = await messagesService.list(contactId, params, controller.signal)
+      if (
+        loadGeneration !== messageLoadGeneration ||
+        identity !== identityGeneration ||
+        organizationScope !== activeOrganizationScope.value
+      ) return
       // API returns { status: "success", data: { messages: [...], has_more: boolean } }
       const data = response.data.data || response.data
-      messages.value = data.messages || []
-      hasMoreMessages.value = data.has_more === true
+      const fetchedMessages = data.messages || []
+      if (preserveExisting) {
+        // A realtime refresh returns the canonical latest page. Merge it into
+        // already-loaded history so a reader who paged upward does not lose
+        // older messages, while canonical status/content wins for duplicate IDs.
+        const mergedById = new Map(messages.value.map(message => [message.id, message]))
+        for (const message of fetchedMessages) mergedById.set(message.id, message)
+        messages.value = Array.from(mergedById.values()).sort((left, right) => {
+          const leftTime = new Date(left.created_at).getTime()
+          const rightTime = new Date(right.created_at).getTime()
+          return leftTime - rightTime
+        })
+      } else {
+        messages.value = fetchedMessages
+        hasMoreMessages.value = data.has_more === true
+      }
     } catch (error) {
-      console.error('Failed to fetch messages:', error)
+      if (
+        loadGeneration === messageLoadGeneration &&
+        identity === identityGeneration &&
+        organizationScope === activeOrganizationScope.value &&
+        !isAbortError(error)
+      ) {
+        console.error('Failed to fetch messages:', error)
+      }
     } finally {
-      isLoadingMessages.value = false
+      if (loadGeneration === messageLoadGeneration) {
+        if (!preserveExisting) isLoadingMessages.value = false
+        if (messageLoadAbortController === controller) messageLoadAbortController = null
+        if (messageRefreshQueued && currentContact.value?.id === contactId) {
+          messageRefreshQueued = false
+          void refreshCurrentMessages()
+        }
+      }
     }
+  }
+
+  async function refreshCurrentMessages() {
+    const contactId = currentContact.value?.id
+    if (!contactId) return
+    if (isLoadingMessages.value) {
+      messageRefreshQueued = true
+      return
+    }
+    await fetchMessages(contactId, {
+      account: accountFilter.value || undefined,
+    }, { preserveExisting: true })
   }
 
   async function fetchOlderMessages(contactId: string, account?: string) {
@@ -204,11 +386,27 @@ export const useContactsStore = defineStore('contacts', () => {
       return
     }
 
+    const loadGeneration = ++olderMessageLoadGeneration
+    const identity = identityGeneration
+    const organizationScope = activeOrganizationScope.value
+    olderMessageLoadAbortController?.abort()
+    const controller = new AbortController()
+    olderMessageLoadAbortController = controller
     isLoadingOlderMessages.value = true
     try {
       // Get the oldest message ID for cursor-based pagination
       const oldestMessageId = messages.value[0].id
-      const response = await messagesService.list(contactId, { before_id: oldestMessageId, account })
+      const response = await messagesService.list(
+        contactId,
+        { before_id: oldestMessageId, account },
+        controller.signal,
+      )
+      if (
+        loadGeneration !== olderMessageLoadGeneration ||
+        identity !== identityGeneration ||
+        organizationScope !== activeOrganizationScope.value ||
+        currentContact.value?.id !== contactId
+      ) return
       const data = response.data.data || response.data
       const olderMessages = data.messages || []
 
@@ -218,9 +416,19 @@ export const useContactsStore = defineStore('contacts', () => {
       }
       hasMoreMessages.value = data.has_more === true
     } catch (error) {
-      console.error('Failed to fetch older messages:', error)
+      if (
+        loadGeneration === olderMessageLoadGeneration &&
+        identity === identityGeneration &&
+        organizationScope === activeOrganizationScope.value &&
+        !isAbortError(error)
+      ) {
+        console.error('Failed to fetch older messages:', error)
+      }
     } finally {
-      isLoadingOlderMessages.value = false
+      if (loadGeneration === olderMessageLoadGeneration) {
+        isLoadingOlderMessages.value = false
+        if (olderMessageLoadAbortController === controller) olderMessageLoadAbortController = null
+      }
     }
   }
 
@@ -232,6 +440,8 @@ export const useContactsStore = defineStore('contacts', () => {
     whatsappAccount?: string,
     extra?: { interactive?: Parameters<typeof messagesService.send>[1]['interactive'] },
   ) {
+    const identity = identityGeneration
+    const organizationScope = activeOrganizationScope.value
     try {
       const response = await messagesService.send(contactId, {
         type,
@@ -242,8 +452,15 @@ export const useContactsStore = defineStore('contacts', () => {
       })
       // API returns { status: "success", data: { ... } }
       const newMessage = response.data.data || response.data
-      // Use addMessage which has duplicate checking (WebSocket may also broadcast this)
-      addMessage(newMessage)
+      if (
+        identity === identityGeneration &&
+        organizationScope === activeOrganizationScope.value &&
+        currentContact.value?.id === contactId &&
+        newMessage?.contact_id === contactId
+      ) {
+        // Use addMessage which has duplicate checking (WebSocket may also broadcast this).
+        addMessage(newMessage)
+      }
 
       return newMessage
     } catch (error) {
@@ -261,6 +478,8 @@ export const useContactsStore = defineStore('contacts', () => {
     buttonParams?: Record<string, string>,
     headerParams?: Record<string, string>
   ) {
+    const identity = identityGeneration
+    const organizationScope = activeOrganizationScope.value
     try {
       const response = await messagesService.sendTemplate(contactId, {
         template_name: templateName,
@@ -270,8 +489,15 @@ export const useContactsStore = defineStore('contacts', () => {
         account_name: accountName
       }, headerFile)
       const data = response.data.data || response.data
-      // Use addMessage which has duplicate checking (WebSocket may also broadcast this)
-      addMessage(data)
+      if (
+        identity === identityGeneration &&
+        organizationScope === activeOrganizationScope.value &&
+        currentContact.value?.id === contactId &&
+        data?.contact_id === contactId
+      ) {
+        // Use addMessage which has duplicate checking (WebSocket may also broadcast this).
+        addMessage(data)
+      }
       return data
     } catch (error) {
       console.error('Failed to send template:', error)
@@ -304,6 +530,13 @@ export const useContactsStore = defineStore('contacts', () => {
       currentContact.value.service_window_open = true
     }
 
+    // The shared message list belongs exclusively to currentContact. A send
+    // response or socket event for another contact may still update that
+    // contact's sidebar metadata, but it must never enter the open transcript.
+    if (!currentContact.value || currentContact.value.id !== message.contact_id) {
+      return
+    }
+
     // Skip adding to messages array if account filter is active and doesn't match
     if (accountFilter.value && message.whatsapp_account && message.whatsapp_account !== accountFilter.value) {
       return
@@ -328,6 +561,19 @@ export const useContactsStore = defineStore('contacts', () => {
   }
 
   function setCurrentContact(contact: Contact | null) {
+    if (currentContact.value?.id !== contact?.id) {
+      // Invalidate a slower message request for the previous contact before it
+      // can replace the active conversation's messages.
+      messageLoadGeneration++
+      olderMessageLoadGeneration++
+      messageLoadAbortController?.abort()
+      messageLoadAbortController = null
+      olderMessageLoadAbortController?.abort()
+      olderMessageLoadAbortController = null
+      isLoadingMessages.value = false
+      isLoadingOlderMessages.value = false
+      messageRefreshQueued = false
+    }
     currentContact.value = contact
     replyingTo.value = null // Clear reply state when switching contacts
     if (contact) {
@@ -340,9 +586,18 @@ export const useContactsStore = defineStore('contacts', () => {
   }
 
   function clearMessages() {
+    messageLoadGeneration++
+    olderMessageLoadGeneration++
+    messageLoadAbortController?.abort()
+    messageLoadAbortController = null
+    olderMessageLoadAbortController?.abort()
+    olderMessageLoadAbortController = null
     messages.value = []
+    isLoadingMessages.value = false
+    isLoadingOlderMessages.value = false
     hasMoreMessages.value = false
     accountFilter.value = null
+    messageRefreshQueued = false
   }
 
   function updateMessageReactions(messageId: string, reactions: Reaction[]) {
@@ -364,13 +619,24 @@ export const useContactsStore = defineStore('contacts', () => {
     }
   }
 
+  watch(activeOrganizationScope, (organizationScope, previousScope) => {
+    if (organizationScope !== previousScope) resetForIdentityChange()
+  })
+
   // Debounce server-side search so each keystroke doesn't fire a request.
-  let searchDebounceHandle: ReturnType<typeof setTimeout> | null = null
   watch(searchQuery, (query) => {
-    if (searchDebounceHandle) clearTimeout(searchDebounceHandle)
+    if (suppressEmptySearchReset && query === '') {
+      suppressEmptySearchReset = false
+      return
+    }
+    suppressEmptySearchReset = false
+    const debounceGeneration = ++searchDebounceGeneration
+    if (searchDebounceHandle !== null) clearTimeout(searchDebounceHandle)
     searchDebounceHandle = setTimeout(() => {
+      searchDebounceHandle = null
+      if (debounceGeneration !== searchDebounceGeneration) return
       const search = normalizeContactSearch(query) || undefined
-      fetchContacts({ search })
+      void fetchContacts({ search })
     }, 300)
   })
 
@@ -396,6 +662,7 @@ export const useContactsStore = defineStore('contacts', () => {
     // Other
     fetchContact,
     fetchMessages,
+    refreshCurrentMessages,
     fetchOlderMessages,
     sendMessage,
     sendTemplate,
@@ -403,6 +670,7 @@ export const useContactsStore = defineStore('contacts', () => {
     updateMessageStatus,
     setCurrentContact,
     clearMessages,
+    resetForIdentityChange,
     setAccountFilter,
     setReplyingTo,
     clearReplyingTo,

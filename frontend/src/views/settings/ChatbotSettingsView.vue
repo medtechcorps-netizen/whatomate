@@ -19,6 +19,7 @@ import { ArrowUpRight, Bot, Loader2, Brain, Plus, X, Clock, AlertTriangle, UserP
 import { chatbotService } from '@/services/api'
 import { useUsersStore } from '@/stores/users'
 import { useAuthStore } from '@/stores/auth'
+import { readSelectedOrganizationId } from '@/lib/browserIdentity'
 
 const { t } = useI18n()
 const usersStore = useUsersStore()
@@ -32,7 +33,7 @@ const canReadIntegrations = computed(() =>
 // That override is what the backend uses for scoping, so we must read it here
 // too — otherwise the activity log panel would query the user's default org.
 const orgID = computed(
-  () => localStorage.getItem('selected_organization_id') || authStore.organizationId,
+  () => readSelectedOrganizationId() || authStore.organizationId,
 )
 
 // Bump these keys to force the AuditLogPanel to remount and refetch after

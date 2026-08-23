@@ -1,6 +1,10 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { api } from '@/services/api'
+import {
+  clearBrowserOrganizationIdentity,
+  setSelectedOrganizationId,
+} from '@/lib/browserIdentity'
 
 export interface UserSettings {
   email_notifications?: boolean
@@ -48,6 +52,10 @@ export const useAuthStore = defineStore('auth', () => {
   const productEntitlementMode = ref('unlicensed')
   const productEntitlementsLoaded = ref(false)
   let productEntitlementsRequest: Promise<boolean> | null = null
+  let identityGeneration = 0
+  let authenticationRequestGeneration = 0
+  let userRequestGeneration = 0
+  let productEntitlementRequestGeneration = 0
 
   const isAuthenticated = computed(() => !!user.value)
   const userRole = computed(() => user.value?.role?.name || 'agent')
@@ -55,20 +63,82 @@ export const useAuthStore = defineStore('auth', () => {
   const userSettings = computed(() => user.value?.settings || {})
   const isAvailable = computed(() => user.value?.is_available ?? true)
 
-  function setAuth(authData: { user: User }) {
+  function safeSetLocalStorage(key: string, value: string) {
+    try {
+      localStorage.setItem(key, value)
+    } catch {
+      // In-memory identity remains authoritative when browser storage is denied.
+    }
+  }
+
+  function safeGetLocalStorage(key: string) {
+    try {
+      return localStorage.getItem(key)
+    } catch {
+      return null
+    }
+  }
+
+  function safeRemoveLocalStorage(key: string) {
+    try {
+      localStorage.removeItem(key)
+      if (localStorage.getItem(key) === null) return
+    } catch {
+      // Fall through to a non-sensitive tombstone when removal is denied.
+    }
+    try {
+      localStorage.setItem(key, '')
+    } catch {
+      // Continue clearing every other in-memory/browser identity surface.
+    }
+  }
+
+  function applyAuth(authData: { user: User }, clearBreak = true) {
+    identityGeneration++
+    userRequestGeneration++
     user.value = authData.user
     resetProductEntitlements()
-    localStorage.setItem('user', JSON.stringify(authData.user))
+    if (clearBreak) {
+      breakStartedAt.value = null
+      safeRemoveLocalStorage('break_started_at')
+    }
+    safeSetLocalStorage('user', JSON.stringify(authData.user))
+  }
+
+  function setAuth(authData: { user: User }) {
+    authenticationRequestGeneration++
+    applyAuth(authData)
+  }
+
+  function clearPersistedIdentity() {
+    // Run the dependency-free organization/attempt cleanup first so a throwing
+    // localStorage implementation cannot skip tenant isolation.
+    clearBrowserOrganizationIdentity()
+    safeRemoveLocalStorage('user')
+    safeRemoveLocalStorage('auth_token')
+    safeRemoveLocalStorage('refresh_token')
+    safeRemoveLocalStorage('break_started_at')
   }
 
   function clearAuth() {
+    authenticationRequestGeneration++
+    identityGeneration++
+    userRequestGeneration++
     user.value = null
+    breakStartedAt.value = null
     resetProductEntitlements()
+    clearPersistedIdentity()
+  }
 
-    // Clean up localStorage (including legacy token keys)
-    localStorage.removeItem('user')
-    localStorage.removeItem('auth_token')
-    localStorage.removeItem('refresh_token')
+  function beginAuthenticationAttempt() {
+    const requestGeneration = ++authenticationRequestGeneration
+    identityGeneration++
+    userRequestGeneration++
+    user.value = null
+    breakStartedAt.value = null
+    resetProductEntitlements()
+    clearPersistedIdentity()
+    return requestGeneration
   }
 
   /**
@@ -78,14 +148,14 @@ export const useAuthStore = defineStore('auth', () => {
    * handles 401s and token refresh automatically.
    */
   function restoreSession(): boolean {
-    const storedUser = localStorage.getItem('user')
+    const storedUser = safeGetLocalStorage('user')
 
     // Remove legacy token keys if present
-    if (localStorage.getItem('auth_token')) {
-      localStorage.removeItem('auth_token')
+    if (safeGetLocalStorage('auth_token')) {
+      safeRemoveLocalStorage('auth_token')
     }
-    if (localStorage.getItem('refresh_token')) {
-      localStorage.removeItem('refresh_token')
+    if (safeGetLocalStorage('refresh_token')) {
+      safeRemoveLocalStorage('refresh_token')
     }
 
     if (storedUser) {
@@ -95,8 +165,8 @@ export const useAuthStore = defineStore('auth', () => {
           clearAuth()
           return false
         }
-        user.value = parsed
-        resetProductEntitlements()
+        authenticationRequestGeneration++
+        applyAuth({ user: parsed }, false)
         return true
       } catch {
         clearAuth()
@@ -108,11 +178,25 @@ export const useAuthStore = defineStore('auth', () => {
 
   // Fetch fresh user data from API (including updated permissions)
   async function refreshUserData(): Promise<boolean> {
+    const requestGeneration = ++userRequestGeneration
+    const identity = identityGeneration
+    const expectedUserId = user.value?.id ?? null
+    const expectedOrganizationId = user.value?.organization_id ?? null
     try {
       const response = await api.get('/me')
+      if (
+        requestGeneration !== userRequestGeneration ||
+        identity !== identityGeneration ||
+        user.value?.id !== expectedUserId ||
+        user.value?.organization_id !== expectedOrganizationId
+      ) return false
       const freshUser = response.data.data
+      if (
+        freshUser?.id !== expectedUserId ||
+        freshUser?.organization_id !== expectedOrganizationId
+      ) return false
       user.value = freshUser
-      localStorage.setItem('user', JSON.stringify(freshUser))
+      safeSetLocalStorage('user', JSON.stringify(freshUser))
       return true
     } catch {
       // If unauthorized, clear auth
@@ -121,9 +205,11 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function login(email: string, password: string): Promise<void> {
+    const requestGeneration = beginAuthenticationAttempt()
     const response = await api.post('/auth/login', { email, password })
+    if (requestGeneration !== authenticationRequestGeneration) return
     // Server sets cookies; response body has { user, expires_in }
-    setAuth({ user: response.data.data.user })
+    applyAuth({ user: response.data.data.user })
   }
 
   async function register(data: {
@@ -132,15 +218,23 @@ export const useAuthStore = defineStore('auth', () => {
     full_name: string
     invitation_token: string
   }): Promise<void> {
+    const requestGeneration = beginAuthenticationAttempt()
     const response = await api.post('/auth/register', data)
-    setAuth({ user: response.data.data.user })
+    if (requestGeneration !== authenticationRequestGeneration) return
+    applyAuth({ user: response.data.data.user })
   }
 
   async function switchOrg(organizationId: string): Promise<void> {
+    const requestGeneration = ++authenticationRequestGeneration
+    const identity = identityGeneration
     const response = await api.post('/auth/switch-org', { organization_id: organizationId })
-    setAuth({ user: response.data.data.user })
+    if (
+      requestGeneration !== authenticationRequestGeneration ||
+      identity !== identityGeneration
+    ) return
+    applyAuth({ user: response.data.data.user })
     // Update localStorage org override
-    localStorage.setItem('selected_organization_id', organizationId)
+    setSelectedOrganizationId(organizationId)
   }
 
   async function logout(): Promise<void> {
@@ -156,20 +250,20 @@ export const useAuthStore = defineStore('auth', () => {
   function setAvailability(available: boolean, breakStart?: string | null) {
     if (user.value) {
       user.value = { ...user.value, is_available: available }
-      localStorage.setItem('user', JSON.stringify(user.value))
+      safeSetLocalStorage('user', JSON.stringify(user.value))
     }
     // Track break start time
     if (!available && breakStart) {
       breakStartedAt.value = breakStart
-      localStorage.setItem('break_started_at', breakStart)
+      safeSetLocalStorage('break_started_at', breakStart)
     } else if (available) {
       breakStartedAt.value = null
-      localStorage.removeItem('break_started_at')
+      safeRemoveLocalStorage('break_started_at')
     }
   }
 
   function restoreBreakTime() {
-    const stored = localStorage.getItem('break_started_at')
+    const stored = safeGetLocalStorage('break_started_at')
     if (stored && !isAvailable.value) {
       breakStartedAt.value = stored
     }
@@ -194,6 +288,7 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   function resetProductEntitlements() {
+    productEntitlementRequestGeneration++
     productEntitlements.value = {}
     productEntitlementMode.value = 'unlicensed'
     productEntitlementsLoaded.value = false
@@ -216,8 +311,18 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function fetchProductEntitlements(): Promise<boolean> {
+    const requestGeneration = ++productEntitlementRequestGeneration
+    const identity = identityGeneration
+    const expectedUserId = user.value?.id ?? null
+    const expectedOrganizationId = user.value?.organization_id ?? null
     try {
       const response = await api.get('/product/entitlements')
+      if (
+        requestGeneration !== productEntitlementRequestGeneration ||
+        identity !== identityGeneration ||
+        user.value?.id !== expectedUserId ||
+        user.value?.organization_id !== expectedOrganizationId
+      ) return false
       const payload = response.data?.data ?? response.data ?? {}
       productEntitlements.value =
         payload.entitlements && typeof payload.entitlements === 'object'
@@ -228,6 +333,12 @@ export const useAuthStore = defineStore('auth', () => {
       productEntitlementsLoaded.value = true
       return true
     } catch {
+      if (
+        requestGeneration !== productEntitlementRequestGeneration ||
+        identity !== identityGeneration ||
+        user.value?.id !== expectedUserId ||
+        user.value?.organization_id !== expectedOrganizationId
+      ) return false
       // Licensing is fail-closed. Core modules remain usable, while routes
       // that require an explicit product entitlement stay unavailable.
       productEntitlements.value = {}
@@ -240,8 +351,12 @@ export const useAuthStore = defineStore('auth', () => {
   async function ensureProductEntitlements(): Promise<boolean> {
     if (productEntitlementsLoaded.value) return true
     if (!productEntitlementsRequest) {
-      productEntitlementsRequest = fetchProductEntitlements().finally(() => {
-        productEntitlementsRequest = null
+      const request = fetchProductEntitlements()
+      productEntitlementsRequest = request
+      void request.finally(() => {
+        if (productEntitlementsRequest === request) {
+          productEntitlementsRequest = null
+        }
       })
     }
     return productEntitlementsRequest

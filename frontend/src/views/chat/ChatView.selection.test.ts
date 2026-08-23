@@ -1,0 +1,668 @@
+/** @vitest-environment happy-dom */
+
+import { flushPromises, shallowMount, type VueWrapper } from '@vue/test-utils'
+import { nextTick } from 'vue'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import ChatViewComponent from './ChatView.vue'
+
+const mocks = vi.hoisted(() => ({
+  routeSource: { params: { contactId: 'first' as string | undefined } },
+  route: null as { params: { contactId?: string } } | null,
+  routerPush: vi.fn(),
+  contactsStore: null as Record<string, any> | null,
+  fetchContacts: vi.fn(),
+  fetchContact: vi.fn(),
+  fetchMessages: vi.fn(),
+  refreshCurrentMessages: vi.fn(),
+  setCurrentContact: vi.fn(),
+  setAccountFilter: vi.fn(),
+  clearMessages: vi.fn(),
+  fetchTransfers: vi.fn(),
+  fetchTags: vi.fn(),
+  fetchNotes: vi.fn(),
+  clearNotes: vi.fn(),
+  listAccounts: vi.fn(),
+  getSessionData: vi.fn(),
+  setWebSocketContact: vi.fn(),
+  scrollIntoView: vi.fn(),
+  infiniteControllers: [] as Array<{
+    scrollAreaRef: { value: unknown }
+    setup: ReturnType<typeof vi.fn>
+    cleanup: ReturnType<typeof vi.fn>
+    preserveScrollPosition: ReturnType<typeof vi.fn>
+    onScroll?: (event: Event) => void
+  }>,
+}))
+
+vi.mock('vue-router', async () => {
+  const { reactive } = await import('vue')
+  const route = reactive(mocks.routeSource)
+  mocks.route = route
+  return {
+    useRoute: () => route,
+    useRouter: () => ({ push: mocks.routerPush }),
+  }
+})
+
+vi.mock('vue-i18n', async importOriginal => ({
+  ...(await importOriginal<typeof import('vue-i18n')>()),
+  useI18n: () => ({
+    t: (key: string, fallback?: string) => fallback ?? key,
+  }),
+}))
+
+vi.mock('@vueuse/core', async () => {
+  const { ref } = await import('vue')
+  return { useMediaQuery: () => ref(false) }
+})
+
+vi.mock('@/composables/useColorMode', async () => {
+  const { ref } = await import('vue')
+  return { useColorMode: () => ({ isDark: ref(true) }) }
+})
+
+vi.mock('@/composables/useHeaderMedia', async () => {
+  const { ref } = await import('vue')
+  return {
+    useHeaderMedia: () => ({
+      file: ref(null),
+      preview: ref(''),
+      acceptTypes: ref(''),
+      handleFileChange: vi.fn(),
+      clear: vi.fn(),
+    }),
+  }
+})
+
+vi.mock('@/composables/useInfiniteScroll', () => ({
+  useInfiniteScroll: (options: { onScroll?: (event: Event) => void }) => {
+    const controller = {
+      scrollAreaRef: { value: null },
+      setup: vi.fn(),
+      cleanup: vi.fn(),
+      getViewport: vi.fn(() => null),
+      preserveScrollPosition: vi.fn(async (callback: () => Promise<void>) => callback()),
+      onScroll: options.onScroll,
+    }
+    mocks.infiniteControllers.push(controller)
+    return controller
+  },
+}))
+
+vi.mock('@/stores/contacts', async () => {
+  const { reactive } = await import('vue')
+  const store = reactive({
+    contacts: [] as Array<Record<string, unknown>>,
+    sortedContacts: [] as Array<Record<string, unknown>>,
+    currentContact: null as Record<string, any> | null,
+    messages: [] as Array<Record<string, unknown>>,
+    replyingTo: null,
+    searchQuery: '',
+    selectedTags: [] as string[],
+    hasMoreContacts: false,
+    hasMoreMessages: false,
+    isLoadingMessages: false,
+    isLoadingMoreContacts: false,
+    isLoadingOlderMessages: false,
+    fetchContacts: mocks.fetchContacts,
+    fetchContact: mocks.fetchContact,
+    fetchMessages: mocks.fetchMessages,
+    refreshCurrentMessages: mocks.refreshCurrentMessages,
+    fetchOlderMessages: vi.fn(),
+    loadMoreContacts: vi.fn(),
+    setCurrentContact: mocks.setCurrentContact,
+    setAccountFilter: mocks.setAccountFilter,
+    clearMessages: mocks.clearMessages,
+    clearReplyingTo: vi.fn(),
+    setReplyingTo: vi.fn(),
+    sendMessage: vi.fn(),
+    sendTemplate: vi.fn(),
+    addMessage: vi.fn(),
+    updateMessageReactions: vi.fn(),
+    updateContactTags: vi.fn(),
+  })
+  mocks.contactsStore = store
+  return {
+    normalizeContactSearch: (raw: string) => {
+      const trimmed = raw.trim().replace(/^\+/, '')
+      return trimmed && /^[\d\s+()-]+$/.test(trimmed)
+        ? trimmed.replace(/[\s+()-]/g, '')
+        : trimmed
+    },
+    useContactsStore: () => store,
+  }
+})
+
+vi.mock('@/stores/auth', () => ({
+  useAuthStore: () => ({
+    isAuthenticated: true,
+    userRole: 'agent',
+    user: { id: 'agent-1' },
+    hasPermission: () => false,
+    restoreSession: vi.fn(),
+  }),
+}))
+
+vi.mock('@/stores/users', () => ({
+  useUsersStore: () => ({ users: [], fetchUsers: vi.fn() }),
+}))
+
+vi.mock('@/stores/transfers', () => ({
+  useTransfersStore: () => ({
+    fetchTransfers: mocks.fetchTransfers,
+    getActiveTransferForContact: () => null,
+  }),
+}))
+
+vi.mock('@/stores/tags', () => ({
+  useTagsStore: () => ({
+    tags: [{ name: 'existing-tag' }],
+    fetchTags: mocks.fetchTags,
+    getTagByName: () => null,
+  }),
+}))
+
+vi.mock('@/stores/notes', async () => {
+  const { reactive } = await import('vue')
+  const store = reactive({
+    notes: [] as unknown[],
+    hasMore: false,
+    fetchNotes: mocks.fetchNotes,
+    clearNotes: mocks.clearNotes,
+  })
+  return { useNotesStore: () => store }
+})
+
+vi.mock('@/services/websocket', () => ({
+  wsService: { setCurrentContact: mocks.setWebSocketContact },
+}))
+
+vi.mock('@/services/api', () => ({
+  contactsService: {
+    getSessionData: mocks.getSessionData,
+    markRead: vi.fn().mockResolvedValue(undefined),
+    assign: vi.fn(),
+  },
+  chatbotService: { createTransfer: vi.fn(), resumeTransfer: vi.fn() },
+  messagesService: { sendReaction: vi.fn() },
+  customActionsService: { list: vi.fn(), execute: vi.fn() },
+  accountsService: { list: mocks.listAccounts },
+  cannedResponsesService: { use: vi.fn() },
+  getRequestHeaders: vi.fn(() => ({})),
+}))
+
+vi.mock('vue-sonner', () => ({
+  toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
+}))
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>(res => {
+    resolve = res
+  })
+  return { promise, resolve }
+}
+
+function deferredValue<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(res => {
+    resolve = res
+  })
+  return { promise, resolve }
+}
+
+function contact(id: string) {
+  return {
+    id,
+    phone_number: `phone-${id}`,
+    name: `Contact ${id}`,
+    status: 'active',
+    tags: [],
+    metadata: {},
+    unread_count: 0,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+  }
+}
+
+function mountChatView() {
+  return shallowMount(ChatViewComponent, {
+    global: {
+      mocks: {
+        $t: (key: string, fallback?: string) => fallback ?? key,
+      },
+      stubs: {
+        ScrollArea: { template: '<div><slot /></div>' },
+        Transition: { template: '<div><slot /></div>' },
+        Teleport: true,
+      },
+    },
+  })
+}
+
+describe('ChatView conversation selection', () => {
+  let wrapper: VueWrapper | null = null
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.clearAllMocks()
+    mocks.infiniteControllers = []
+    mocks.routeSource.params.contactId = 'first'
+    if (mocks.route) mocks.route.params.contactId = 'first'
+
+    const first = contact('first')
+    const second = contact('second')
+    Object.assign(mocks.contactsStore!, {
+      contacts: [first, second],
+      sortedContacts: [first, second],
+      currentContact: null,
+      messages: [],
+      searchQuery: '',
+      isLoadingMessages: false,
+    })
+    mocks.setCurrentContact.mockImplementation(value => {
+      mocks.contactsStore!.currentContact = value
+    })
+    mocks.fetchContacts.mockResolvedValue(undefined)
+    mocks.refreshCurrentMessages.mockResolvedValue(undefined)
+    mocks.fetchNotes.mockResolvedValue(undefined)
+    mocks.listAccounts.mockResolvedValue({ data: { data: { accounts: [] } } })
+    mocks.getSessionData.mockRejectedValue(new Error('not configured'))
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0)
+      return 1
+    })
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: mocks.scrollIntoView,
+    })
+  })
+
+  afterEach(() => {
+    wrapper?.unmount()
+    wrapper = null
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('lets only the current contact completion schedule the initial bottom scroll', async () => {
+    const firstLoad = deferred()
+    const secondLoad = deferred()
+    mocks.fetchMessages.mockImplementation((id: string) => {
+      return id === 'first' ? firstLoad.promise : secondLoad.promise
+    })
+
+    wrapper = shallowMount(ChatViewComponent, {
+      global: {
+        mocks: {
+          $t: (key: string, fallback?: string) => fallback ?? key,
+        },
+        stubs: {
+          ScrollArea: { template: '<div><slot /></div>' },
+          Transition: { template: '<div><slot /></div>' },
+          Teleport: true,
+        },
+      },
+    })
+    await flushPromises()
+    expect(mocks.fetchMessages).toHaveBeenCalledWith('first')
+
+    mocks.route!.params.contactId = 'second'
+    await nextTick()
+    await flushPromises()
+    expect(mocks.fetchMessages).toHaveBeenCalledWith('second')
+
+    secondLoad.resolve()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+
+    expect(mocks.setWebSocketContact).toHaveBeenCalledTimes(1)
+    expect(mocks.setWebSocketContact).toHaveBeenLastCalledWith('second')
+    expect(mocks.scrollIntoView).toHaveBeenCalledTimes(1)
+    expect(mocks.scrollIntoView).toHaveBeenCalledWith({
+      behavior: 'instant',
+      block: 'end',
+    })
+
+    firstLoad.resolve()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(100)
+    await nextTick()
+
+    expect(mocks.setWebSocketContact).toHaveBeenCalledTimes(1)
+    expect(mocks.scrollIntoView).toHaveBeenCalledTimes(1)
+    expect(mocks.contactsStore!.currentContact.id).toBe('second')
+  })
+
+  it('cancels the first contact bottom-scroll timer when another contact is selected', async () => {
+    const firstLoad = deferred()
+    const secondLoad = deferred()
+    mocks.fetchMessages.mockImplementation((id: string) => {
+      return id === 'first' ? firstLoad.promise : secondLoad.promise
+    })
+
+    wrapper = shallowMount(ChatViewComponent, {
+      global: {
+        mocks: {
+          $t: (key: string, fallback?: string) => fallback ?? key,
+        },
+        stubs: {
+          ScrollArea: { template: '<div><slot /></div>' },
+          Transition: { template: '<div><slot /></div>' },
+          Teleport: true,
+        },
+      },
+    })
+    await flushPromises()
+    firstLoad.resolve()
+    await flushPromises()
+    expect(mocks.setWebSocketContact).toHaveBeenLastCalledWith('first')
+
+    mocks.route!.params.contactId = 'second'
+    await nextTick()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+    expect(mocks.scrollIntoView).not.toHaveBeenCalled()
+
+    secondLoad.resolve()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+    expect(mocks.setWebSocketContact).toHaveBeenLastCalledWith('second')
+    expect(mocks.scrollIntoView).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves a scrolled-up reader on canonical refresh and follows new messages near the bottom', async () => {
+    const focusSpy = vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+    const visibilitySpy = vi
+      .spyOn(document, 'visibilityState', 'get')
+      .mockReturnValue('visible')
+    const initialMessage = {
+      id: 'message-initial',
+      direction: 'incoming',
+      created_at: '2026-08-23T09:00:00Z',
+    }
+    mocks.contactsStore!.messages = [initialMessage]
+    mocks.fetchMessages.mockResolvedValue(undefined)
+
+    try {
+      wrapper = shallowMount(ChatViewComponent, {
+        global: {
+          mocks: {
+            $t: (key: string, fallback?: string) => fallback ?? key,
+          },
+          stubs: {
+            ScrollArea: { template: '<div><slot /></div>' },
+            Transition: { template: '<div><slot /></div>' },
+            Teleport: true,
+          },
+        },
+      })
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+      mocks.scrollIntoView.mockClear()
+
+      const messagesController = mocks.infiniteControllers[1]
+      expect(messagesController?.onScroll).toBeTypeOf('function')
+      const viewport = document.createElement('div')
+      Object.defineProperties(viewport, {
+        scrollHeight: { configurable: true, value: 1_000 },
+        clientHeight: { configurable: true, value: 300 },
+      })
+      viewport.scrollTop = 100
+      messagesController.onScroll?.({ target: viewport } as unknown as Event)
+
+      mocks.contactsStore!.messages = [
+        initialMessage,
+        {
+          id: 'message-while-reading',
+          direction: 'incoming',
+          created_at: '2026-08-23T10:00:00Z',
+        },
+      ]
+      await nextTick()
+      await nextTick()
+      expect(mocks.scrollIntoView).not.toHaveBeenCalled()
+
+      viewport.scrollTop = 695
+      messagesController.onScroll?.({ target: viewport } as unknown as Event)
+      mocks.contactsStore!.messages = [
+        ...mocks.contactsStore!.messages,
+        {
+          id: 'message-near-bottom',
+          direction: 'incoming',
+          created_at: '2026-08-23T11:00:00Z',
+        },
+      ]
+      await nextTick()
+      await nextTick()
+
+      expect(mocks.scrollIntoView).toHaveBeenCalledTimes(1)
+      expect(mocks.scrollIntoView).toHaveBeenCalledWith({
+        behavior: 'smooth',
+        block: 'end',
+      })
+    } finally {
+      focusSpy.mockRestore()
+      visibilitySpy.mockRestore()
+    }
+  })
+
+  it('does not clear or scroll contact B when a deferred contact A send completes', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    const pendingSend = deferredValue<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValue(pendingSend.promise)
+
+    wrapper = shallowMount(ChatViewComponent, {
+      global: {
+        mocks: {
+          $t: (key: string, fallback?: string) => fallback ?? key,
+        },
+        stubs: {
+          ScrollArea: { template: '<div><slot /></div>' },
+          Transition: { template: '<div><slot /></div>' },
+          Teleport: true,
+        },
+      },
+    })
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+
+    const composer = wrapper.find('textarea')
+    expect(composer.exists()).toBe(true)
+    await composer.setValue('Contact A draft')
+    const composerForm = wrapper
+      .findAll('form')
+      .find(form => form.find('textarea').exists())
+    expect(composerForm).toBeDefined()
+    await composerForm!.trigger('submit')
+    await Promise.resolve()
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledWith(
+      'first',
+      'text',
+      { body: 'Contact A draft' },
+      undefined,
+      undefined,
+    )
+
+    mocks.route!.params.contactId = 'second'
+    await nextTick()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+    await wrapper.find('textarea').setValue('Contact B draft')
+    mocks.scrollIntoView.mockClear()
+    mocks.contactsStore!.clearReplyingTo.mockClear()
+
+    pendingSend.resolve({ id: 'sent-for-first' })
+    await flushPromises()
+    await nextTick()
+
+    expect((wrapper.find('textarea').element as HTMLTextAreaElement).value).toBe(
+      'Contact B draft',
+    )
+    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
+    expect(mocks.scrollIntoView).not.toHaveBeenCalled()
+    expect(mocks.contactsStore!.currentContact.id).toBe('second')
+  })
+
+  it('catches up canonical native Chat state every thirty visible seconds', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.contactsStore!.searchQuery = '  +60 (12) 345-6789  '
+    wrapper = mountChatView()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+    mocks.fetchContacts.mockClear()
+    mocks.refreshCurrentMessages.mockClear()
+
+    await vi.advanceTimersByTimeAsync(30_000)
+    await flushPromises()
+
+    expect(mocks.fetchContacts).toHaveBeenCalledTimes(1)
+    expect(mocks.fetchContacts).toHaveBeenCalledWith({
+      search: '60123456789',
+    })
+    expect(mocks.refreshCurrentMessages).toHaveBeenCalledTimes(1)
+  })
+
+  it('catches up the visible Chat sidebar when no conversation is selected', async () => {
+    mocks.routeSource.params.contactId = undefined
+    mocks.route!.params.contactId = undefined
+    mocks.contactsStore!.currentContact = null
+    wrapper = mountChatView()
+    await flushPromises()
+    mocks.fetchContacts.mockClear()
+    mocks.refreshCurrentMessages.mockClear()
+
+    await vi.advanceTimersByTimeAsync(30_000)
+    await flushPromises()
+
+    expect(mocks.fetchContacts).toHaveBeenCalledTimes(1)
+    expect(mocks.refreshCurrentMessages).toHaveBeenCalledTimes(1)
+    expect(mocks.contactsStore!.currentContact).toBeNull()
+  })
+
+  it('skips hidden polling and catches up immediately on visibility and online events', async () => {
+    let visibility: DocumentVisibilityState = 'hidden'
+    const visibilitySpy = vi
+      .spyOn(document, 'visibilityState', 'get')
+      .mockImplementation(() => visibility)
+    mocks.fetchMessages.mockResolvedValue(undefined)
+
+    try {
+      wrapper = mountChatView()
+      await flushPromises()
+      mocks.fetchContacts.mockClear()
+      mocks.refreshCurrentMessages.mockClear()
+
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(mocks.fetchContacts).not.toHaveBeenCalled()
+      expect(mocks.refreshCurrentMessages).not.toHaveBeenCalled()
+
+      mocks.contactsStore!.searchQuery = '  Search Customer  '
+      visibility = 'visible'
+      document.dispatchEvent(new Event('visibilitychange'))
+      await flushPromises()
+      expect(mocks.fetchContacts).toHaveBeenCalledTimes(1)
+      expect(mocks.fetchContacts).toHaveBeenLastCalledWith({
+        search: 'Search Customer',
+      })
+      expect(mocks.refreshCurrentMessages).toHaveBeenCalledTimes(1)
+
+      window.dispatchEvent(new Event('online'))
+      await flushPromises()
+      expect(mocks.fetchContacts).toHaveBeenCalledTimes(2)
+      expect(mocks.refreshCurrentMessages).toHaveBeenCalledTimes(2)
+    } finally {
+      visibilitySpy.mockRestore()
+    }
+  })
+
+  it('coalesces catch-up and never applies an old contact continuation to the new selection', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    const firstCatchUp = deferred()
+    const refreshedContacts: string[] = []
+    mocks.refreshCurrentMessages.mockImplementation(() => {
+      refreshedContacts.push(mocks.contactsStore!.currentContact?.id ?? '')
+      return refreshedContacts.length === 1
+        ? firstCatchUp.promise
+        : Promise.resolve()
+    })
+    wrapper = mountChatView()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    mocks.fetchContacts.mockClear()
+    mocks.refreshCurrentMessages.mockClear()
+    refreshedContacts.length = 0
+
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(refreshedContacts).toEqual(['first'])
+
+    mocks.route!.params.contactId = 'second'
+    await nextTick()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    mocks.scrollIntoView.mockClear()
+    window.dispatchEvent(new Event('online'))
+    await Promise.resolve()
+    expect(mocks.refreshCurrentMessages).toHaveBeenCalledTimes(1)
+
+    firstCatchUp.resolve()
+    await flushPromises()
+
+    expect(refreshedContacts).toEqual(['first', 'second'])
+    expect(mocks.contactsStore!.currentContact.id).toBe('second')
+    expect(mocks.scrollIntoView).not.toHaveBeenCalled()
+  })
+
+  it('removes catch-up listeners and timers on unmount', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    wrapper = mountChatView()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    mocks.fetchContacts.mockClear()
+    mocks.refreshCurrentMessages.mockClear()
+
+    wrapper.unmount()
+    wrapper = null
+    await vi.advanceTimersByTimeAsync(60_000)
+    document.dispatchEvent(new Event('visibilitychange'))
+    window.dispatchEvent(new Event('online'))
+    await flushPromises()
+
+    expect(mocks.fetchContacts).not.toHaveBeenCalled()
+    expect(mocks.refreshCurrentMessages).not.toHaveBeenCalled()
+  })
+
+  it('clears contact A session data synchronously while contact B is loading', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    const secondSession = deferredValue<any>()
+    mocks.getSessionData
+      .mockResolvedValueOnce({ data: { data: { private_value: 'contact-a' } } })
+      .mockReturnValueOnce(secondSession.promise)
+    wrapper = mountChatView()
+    await flushPromises()
+
+    expect((wrapper.vm as any).contactSessionData).toEqual({
+      private_value: 'contact-a',
+    })
+
+    mocks.route!.params.contactId = 'second'
+    await nextTick()
+    expect((wrapper.vm as any).contactSessionData).toBeNull()
+    await flushPromises()
+    expect((wrapper.vm as any).contactSessionData).toBeNull()
+
+    secondSession.resolve({ data: { data: { private_value: 'contact-b' } } })
+    await flushPromises()
+    expect((wrapper.vm as any).contactSessionData).toEqual({
+      private_value: 'contact-b',
+    })
+  })
+})

@@ -33,6 +33,7 @@ import {
 } from "lucide-vue-next";
 import { usersService, organizationService } from "@/services/api";
 import { useAuthStore } from "@/stores/auth";
+import { readSelectedOrganizationId } from "@/lib/browserIdentity";
 
 const { t } = useI18n();
 const authStore = useAuthStore();
@@ -44,7 +45,7 @@ const authStore = useAuthStore();
 // instead of the currently-active one.
 const orgID = computed(
   () =>
-    localStorage.getItem("selected_organization_id") ||
+    readSelectedOrganizationId() ||
     authStore.organizationId,
 );
 const userID = computed(() => authStore.user?.id || "");

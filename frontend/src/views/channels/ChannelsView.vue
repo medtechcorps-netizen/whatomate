@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useMediaQuery } from '@vueuse/core'
 import { onBeforeRouteLeave } from 'vue-router'
 import {
@@ -41,10 +41,15 @@ import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
 import { getErrorMessage, unwrapItemResponse, unwrapListResponse } from '@/lib/api-utils'
 import {
+  clearLegacyWhatsAppReplyAttempt,
+  getOrCreateLegacyWhatsAppReplyAttempt,
+  LegacyWhatsAppReplyAttemptStorageError,
+} from '@/lib/legacyWhatsAppReplyAttempts'
+import {
   threadsPublicEngagementAccountReady,
   threadsPublicEngagementTarget,
 } from '@/lib/threadsPublicEngagement'
-import { wsService } from '@/services/websocket'
+import { wsService, type WebSocketConnectionState } from '@/services/websocket'
 import {
   metaMessengerOnboarding,
   MetaMessengerAuthorizationCancelledError,
@@ -88,6 +93,17 @@ interface InboxMessageEnvelope {
   }>
 }
 
+interface LegacyWhatsAppMessage {
+  id: string
+  direction: 'incoming' | 'outgoing'
+  message_type: string
+  content: string | { body?: string } | null
+  status: string
+  created_at: string
+}
+
+const acknowledgedLegacyWhatsAppStatuses = new Set(['sent', 'delivered', 'read'])
+
 interface CreatedConnection {
   account: ChannelAccount
   inbound_secret: string
@@ -110,6 +126,7 @@ const selectedConversation = ref<InboxConversation | null>(null)
 const isWorkspaceOpen = ref(false)
 const isWorkspaceRail = useMediaQuery('(min-width: 1280px)')
 const messages = ref<InboxMessage[]>([])
+const messagesViewport = ref<HTMLElement | null>(null)
 const channelFilter = ref<ChannelType | 'all'>('all')
 const search = ref('')
 const composer = ref('')
@@ -164,11 +181,15 @@ const accountSettingsDraft = reactive({
   outbound_secret: '',
   ai_reply_enabled: false,
 })
-let stopChannelSync: (() => void) | null = null
+const connectionState = ref<WebSocketConnectionState>(wsService.getConnectionState())
+let stopInboxActivity: (() => void) | null = null
+let stopConnectionState: (() => void) | null = null
 let pollTimer: number | null = null
 let syncDebounceTimer: number | null = null
 let filterDebounceTimer: number | null = null
 let refreshInFlight = false
+let refreshQueued = false
+let viewMounted = false
 let conversationViewSequence = 0
 let metaMessengerContextVersion = 0
 let metaMessengerStatusSequence = 0
@@ -176,6 +197,7 @@ let metaInstagramStatusSequence = 0
 const metaMessengerSwitchLockOwner = 'meta-messenger-onboarding'
 const metaMessengerSwitchLockMessage =
   'Finish the managed Meta connection before switching workspaces.'
+const messageBottomThreshold = 80
 
 const activeOrganizationId = computed(
   () => organizationsStore.selectedOrgId || authStore.organizationId || null,
@@ -261,6 +283,59 @@ const selectedAccount = computed(() =>
     ? accounts.value.find((account) => account.id === selectedConversation.value?.channel_account_id)
     : undefined,
 )
+const whatsappServiceWindowOpen = computed(() => {
+  const end = selectedConversation.value?.service_window_ends_at
+  if (!end) return false
+  const endTime = Date.parse(end)
+  return Number.isFinite(endTime) && endTime > Date.now()
+})
+const canSendWhatsAppText = computed(
+  () =>
+    selectedConversation.value?.channel === 'whatsapp' &&
+    Boolean(activeOrganizationId.value) &&
+    canManageConversations.value &&
+    authStore.hasPermission('chat', 'write') &&
+    selectedAccount.value?.status === 'active' &&
+    selectedAccount.value?.provider === 'meta_legacy' &&
+    selectedAccount.value?.config?.reply_route === 'chat' &&
+    selectedAccount.value?.config?.legacy_read_only === true &&
+    selectedAccount.value?.config?.outbound_enabled === false &&
+    selectedAccount.value?.capabilities?.legacy_text_reply_endpoint === true &&
+    selectedAccount.value?.capabilities?.text === true &&
+    selectedAccount.value?.capabilities?.replies === true &&
+    selectedAccount.value?.capabilities?.service_window === true &&
+    whatsappServiceWindowOpen.value,
+)
+const whatsappReplyUnavailableReason = computed(() => {
+  if (!canManageConversations.value || !authStore.hasPermission('chat', 'write')) {
+    return 'You need both conversation and chat reply permission to send from this inbox.'
+  }
+  if (selectedAccount.value?.provider !== 'meta_legacy') {
+    return 'Open WhatsApp to reply safely; this conversation is not backed by the native WhatsApp adapter.'
+  }
+  if (
+    selectedAccount.value?.config?.reply_route !== 'chat' ||
+    selectedAccount.value?.config?.legacy_read_only !== true ||
+    selectedAccount.value?.config?.outbound_enabled !== false
+  ) {
+    return 'Open WhatsApp to reply safely; this native conversation has an incompatible routing configuration.'
+  }
+  if (selectedAccount.value?.status !== 'active') {
+    return 'This WhatsApp account is not active. Open WhatsApp to review the connection.'
+  }
+  if (
+    selectedAccount.value?.capabilities?.legacy_text_reply_endpoint !== true ||
+    selectedAccount.value?.capabilities?.text !== true ||
+    selectedAccount.value?.capabilities?.replies !== true ||
+    selectedAccount.value?.capabilities?.service_window !== true
+  ) {
+    return 'Open WhatsApp to reply safely; this connection does not advertise every required reply capability.'
+  }
+  if (!whatsappServiceWindowOpen.value) {
+    return 'The service window is closed. Open WhatsApp to send an approved template.'
+  }
+  return 'This WhatsApp adapter does not currently support text replies from the Omnichannel inbox.'
+})
 const canControlConversationAI = computed(
   () =>
     canManageConversations.value &&
@@ -280,6 +355,7 @@ const threadsPublicReplyReady = computed(() =>
 const canSendText = computed(() => {
   const conversation = selectedConversation.value
   if (!canManageConversations.value || !conversation) return false
+  if (conversation.channel === 'whatsapp') return canSendWhatsAppText.value
   if (conversation.channel === 'tiktok') return false
   if (conversation.channel === 'threads') return threadsPublicReplyReady.value
   return (
@@ -298,6 +374,25 @@ const attentionCount = computed(() =>
         account.status === 'active' &&
         account.config?.outbound_enabled !== true),
   ).length,
+)
+const connectionLabel = computed(() => {
+  switch (connectionState.value) {
+    case 'connected':
+      return 'Live'
+    case 'connecting':
+      return 'Connecting'
+    case 'reconnecting':
+      return 'Reconnecting'
+    default:
+      return 'Offline'
+  }
+})
+const connectionBadgeClass = computed(() =>
+  connectionState.value === 'connected'
+    ? 'border-emerald-400/20 text-emerald-300 light:border-emerald-300 light:text-emerald-700'
+    : connectionState.value === 'disconnected'
+      ? 'border-rose-400/20 text-rose-300 light:border-rose-300 light:text-rose-700'
+      : 'border-amber-400/20 text-amber-300 light:border-amber-300 light:text-amber-700',
 )
 
 function accountReadyForOutbound(account: ChannelAccount) {
@@ -395,13 +490,76 @@ function normalizeMessage(envelope: InboxMessageEnvelope): InboxMessage {
   }
 }
 
+function normalizeLegacyWhatsAppMessage(message: LegacyWhatsAppMessage): InboxMessage {
+  const content =
+    typeof message.content === 'string'
+      ? message.content
+      : typeof message.content?.body === 'string'
+        ? message.content.body
+        : ''
+  return { ...message, content }
+}
+
+function upsertInboxMessage(message: InboxMessage) {
+  const existingIndex = messages.value.findIndex(item => item.id === message.id)
+  if (existingIndex >= 0) {
+    messages.value.splice(existingIndex, 1, message)
+  } else {
+    messages.value.push(message)
+    messageTotal.value = Math.max(messageTotal.value + 1, messages.value.length)
+  }
+  messages.value.sort(
+    (left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime(),
+  )
+}
+
+function isMessageViewportNearBottom() {
+  const viewport = messagesViewport.value
+  if (!viewport) return true
+  return (
+    viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= messageBottomThreshold
+  )
+}
+
+function prefersReducedMotion() {
+  return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
+}
+
+async function scrollMessagesToBottom(smooth = false) {
+  await nextTick()
+  const viewport = messagesViewport.value
+  if (!viewport) return
+  if (smooth && !prefersReducedMotion() && typeof viewport.scrollTo === 'function') {
+    viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' })
+    return
+  }
+  viewport.scrollTop = viewport.scrollHeight
+}
+
+function updateLocalConversationPreview(conversationId: string, message: InboxMessage) {
+  const apply = (conversation: InboxConversation) => {
+    conversation.last_message_preview = message.content
+    conversation.last_message_at = message.created_at
+  }
+  const listed = conversations.value.find(conversation => conversation.id === conversationId)
+  if (listed) apply(listed)
+  if (selectedConversation.value?.id === conversationId && selectedConversation.value !== listed) {
+    apply(selectedConversation.value)
+  }
+}
+
 function totalFromResponse(response: any) {
   const payload = response?.data?.data ?? response?.data
   return typeof payload?.total === 'number' ? payload.total : 0
 }
 
 async function load(silent = false, append = false) {
-  if (refreshInFlight) return
+  if (refreshInFlight) {
+    // Realtime events can arrive while the canonical fetch is in flight. Keep
+    // one trailing refresh instead of silently dropping the newest state.
+    if (!append) refreshQueued = true
+    return
+  }
   refreshInFlight = true
   if (!silent) loading.value = true
   if (append) loadingMore.value = true
@@ -451,12 +609,14 @@ async function load(silent = false, append = false) {
       const latest = unwrapListResponse<InboxMessageEnvelope>(messageResponse, 'messages')
         .map(normalizeMessage)
         .reverse()
+      const shouldFollowLatestMessage = isMessageViewportNearBottom()
       messageTotal.value = totalFromResponse(messageResponse)
       const merged = new Map(messages.value.map((message) => [message.id, message]))
       for (const message of latest) merged.set(message.id, message)
       messages.value = [...merged.values()].sort(
         (left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime(),
       )
+      if (shouldFollowLatestMessage) void scrollMessagesToBottom(true)
     }
   } catch (error) {
     if (!silent) toast.error('Channels could not be loaded', getErrorMessage(error))
@@ -464,6 +624,10 @@ async function load(silent = false, append = false) {
     if (!silent) loading.value = false
     loadingMore.value = false
     refreshInFlight = false
+    if (refreshQueued && viewMounted) {
+      refreshQueued = false
+      void load(true)
+    }
   }
 }
 
@@ -471,12 +635,24 @@ function loadMoreConversations() {
   void load(true, true)
 }
 
-function scheduleChannelRefresh() {
+function scheduleChannelRefresh(delay = 300) {
+  if (document.visibilityState !== 'visible') return
   if (syncDebounceTimer !== null) window.clearTimeout(syncDebounceTimer)
   syncDebounceTimer = window.setTimeout(() => {
     syncDebounceTimer = null
-    if (document.visibilityState === 'visible') void load(true)
-  }, 300)
+    void load(true)
+  }, delay)
+}
+
+function catchUpInbox() {
+  if (document.visibilityState !== 'visible') return
+  void wsService.connect()
+  scheduleChannelRefresh(0)
+}
+
+function handleOnline() {
+  void wsService.connect()
+  if (document.visibilityState === 'visible') scheduleChannelRefresh(0)
 }
 
 async function selectConversation(conversation: InboxConversation) {
@@ -489,6 +665,7 @@ async function selectConversation(conversation: InboxConversation) {
   aiStateUpdating.value = false
   if (isWorkspaceRail.value) isWorkspaceOpen.value = true
   loadingMessages.value = true
+  let loaded = false
   try {
     const response = await channelsService.messages(conversation.id, { limit: 100 })
     if (!isCurrentConversationView(viewSequence, conversation.id)) return
@@ -496,6 +673,7 @@ async function selectConversation(conversation: InboxConversation) {
       .map(normalizeMessage)
       .reverse()
     messageTotal.value = totalFromResponse(response)
+    loaded = true
     if (conversation.unread_count > 0 && canManageConversations.value) {
       await channelsService.markRead(conversation.id)
       conversation.unread_count = 0
@@ -507,6 +685,7 @@ async function selectConversation(conversation: InboxConversation) {
   } finally {
     if (isCurrentConversationView(viewSequence, conversation.id)) {
       loadingMessages.value = false
+      if (loaded) await scrollMessagesToBottom()
     }
   }
 }
@@ -529,6 +708,9 @@ async function loadOlderMessages() {
   const oldest = messages.value[0]
   if (!conversation || !oldest || loadingOlderMessages.value || !hasOlderMessages.value) return
   const viewSequence = conversationViewSequence
+  const viewport = messagesViewport.value
+  const previousScrollHeight = viewport?.scrollHeight ?? 0
+  const previousScrollTop = viewport?.scrollTop ?? 0
   loadingOlderMessages.value = true
   try {
     const response = await channelsService.messages(conversation.id, {
@@ -545,6 +727,14 @@ async function loadOlderMessages() {
       ...older.filter((message) => !existingIDs.has(message.id)),
       ...messages.value,
     ]
+    await nextTick()
+    if (
+      isCurrentConversationView(viewSequence, conversation.id) &&
+      viewport &&
+      messagesViewport.value === viewport
+    ) {
+      viewport.scrollTop = previousScrollTop + (viewport.scrollHeight - previousScrollHeight)
+    }
   } catch (error) {
     if (isCurrentConversationView(viewSequence, conversation.id)) {
       toast.error('Older messages could not be loaded', getErrorMessage(error))
@@ -559,7 +749,7 @@ async function loadOlderMessages() {
 async function sendMessage() {
   const conversation = selectedConversation.value
   const messageText = composer.value.trim()
-  if (!conversation || !messageText) return
+  if (!conversation || !messageText || sending.value) return
   const threadsTarget =
     conversation.channel === 'threads'
       ? threadsPublicEngagementTarget(conversation)
@@ -574,6 +764,74 @@ async function sendMessage() {
   const viewSequence = conversationViewSequence
   sending.value = true
   try {
+    if (conversation.channel === 'whatsapp') {
+      const organizationId = activeOrganizationId.value
+      const serviceWindowEndsAt = conversation.service_window_ends_at
+      if (!organizationId || !serviceWindowEndsAt) return
+      const attempt = await getOrCreateLegacyWhatsAppReplyAttempt({
+        organizationId,
+        conversationId: conversation.id,
+        body: messageText,
+        serviceWindowEndsAt,
+      })
+      if (
+        !isCurrentConversationView(viewSequence, conversation.id) ||
+        activeOrganizationId.value !== organizationId
+      ) {
+        // A newly-created key has not reached the server and is safe to drop.
+        // A reused key represents an earlier ambiguous request and must remain.
+        if (!attempt.reused) {
+          clearLegacyWhatsAppReplyAttempt(
+            { organizationId, conversationId: conversation.id },
+            attempt.key,
+          )
+        }
+        return
+      }
+      const response = await channelsService.replyLegacyWhatsApp(conversation.id, {
+        type: 'text',
+        content: { body: messageText },
+        idempotency_key: attempt.key,
+      }, organizationId)
+      const result = unwrapItemResponse<LegacyWhatsAppMessage>(response)
+      const message = normalizeLegacyWhatsAppMessage(result)
+      const replyAcknowledged = acknowledgedLegacyWhatsAppStatuses.has(message.status)
+      let acknowledgedAttemptCleanupFailed = false
+      if (replyAcknowledged) {
+        try {
+          clearLegacyWhatsAppReplyAttempt(
+            { organizationId, conversationId: conversation.id },
+            attempt.key,
+          )
+        } catch (error) {
+          if (error instanceof LegacyWhatsAppReplyAttemptStorageError) {
+            acknowledgedAttemptCleanupFailed = true
+          } else {
+            throw error
+          }
+        }
+      }
+      // A settled response belongs to the original conversation even if the
+      // operator switched away while it was in flight. Retire its retry key
+      // before applying the view guard, otherwise a later same-body send could
+      // replay the already-sent backend row. All UI mutations remain guarded.
+      if (!isCurrentConversationView(viewSequence, conversation.id)) return
+      upsertInboxMessage(message)
+      updateLocalConversationPreview(conversation.id, message)
+      if (replyAcknowledged) {
+        if (acknowledgedAttemptCleanupFailed) {
+          toast.warning(
+            'WhatsApp reply sent',
+            'The server confirmed the reply, but secure retry state could not be cleared. Open native Chat before sending another reply.',
+          )
+        }
+        composer.value = ''
+      }
+      void scrollMessagesToBottom(true)
+      scheduleChannelRefresh(0)
+      return
+    }
+
     const payload: Record<string, unknown> = {
       idempotency_key: crypto.randomUUID(),
       purpose: 'service',
@@ -585,12 +843,34 @@ async function sendMessage() {
     const response = await channelsService.send(conversation.id, payload)
     if (!isCurrentConversationView(viewSequence, conversation.id)) return
     const result = unwrapItemResponse<InboxMessageEnvelope>(response)
-    messages.value.push(normalizeMessage(result))
+    const message = normalizeMessage(result)
+    upsertInboxMessage(message)
+    updateLocalConversationPreview(conversation.id, message)
     updateLocalConversationAIState(conversation.id, true, 'human_reply')
     composer.value = ''
+    void scrollMessagesToBottom(true)
+    scheduleChannelRefresh(0)
   } catch (error) {
     if (isCurrentConversationView(viewSequence, conversation.id)) {
-      toast.error('Message was not sent', getErrorMessage(error))
+      const status = (error as { response?: { status?: number } })?.response?.status
+      if (
+        conversation.channel === 'whatsapp' &&
+        error instanceof LegacyWhatsAppReplyAttemptStorageError
+      ) {
+        toast.error(
+          'WhatsApp reply unavailable',
+          'Secure retry storage is unavailable. No message was sent; open native Chat to reply safely.',
+        )
+      } else if (conversation.channel === 'whatsapp' && status === 404) {
+        toast.error(
+          'WhatsApp reply unavailable',
+          'Omnichannel direct reply is not enabled on this server. No message was sent.',
+        )
+      } else if (conversation.channel === 'whatsapp' && status === 409) {
+        toast.warning('WhatsApp reply unavailable', getErrorMessage(error))
+      } else {
+        toast.error('Message was not sent', getErrorMessage(error))
+      }
     }
   } finally {
     if (isCurrentConversationView(viewSequence, conversation.id)) {
@@ -1352,14 +1632,21 @@ function consumeMetaInstagramCallbackResult() {
 }
 
 onMounted(() => {
+  viewMounted = true
   window.addEventListener('beforeunload', guardMetaMessengerNavigation)
+  document.addEventListener('visibilitychange', catchUpInbox)
+  window.addEventListener('online', handleOnline)
   void load()
   void loadMetaMessengerOnboardingStatus()
   void loadMetaInstagramOnboardingStatus()
   consumeMetaInstagramCallbackResult()
-  stopChannelSync = wsService.onChannelSync(scheduleChannelRefresh)
+  stopInboxActivity = wsService.onInboxActivity(() => scheduleChannelRefresh())
+  stopConnectionState = wsService.onConnectionStateChange(state => {
+    connectionState.value = state
+  })
+  void wsService.connect()
   pollTimer = window.setInterval(() => {
-    if (document.visibilityState === 'visible') void load(true)
+    if (document.visibilityState === 'visible') scheduleChannelRefresh(0)
   }, 30000)
 })
 
@@ -1421,6 +1708,8 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  viewMounted = false
+  refreshQueued = false
   metaMessengerAuthorizationController.value?.abort()
   metaMessengerAuthorizationController.value = null
   conversationViewSequence += 1
@@ -1436,8 +1725,11 @@ onBeforeUnmount(() => {
   }
   closeMetaMessengerSelection()
   window.removeEventListener('beforeunload', guardMetaMessengerNavigation)
+  document.removeEventListener('visibilitychange', catchUpInbox)
+  window.removeEventListener('online', handleOnline)
   organizationsStore.unblockOrganizationSwitch(metaMessengerSwitchLockOwner)
-  stopChannelSync?.()
+  stopInboxActivity?.()
+  stopConnectionState?.()
   if (pollTimer !== null) window.clearInterval(pollTimer)
   if (syncDebounceTimer !== null) window.clearTimeout(syncDebounceTimer)
   if (filterDebounceTimer !== null) window.clearTimeout(filterDebounceTimer)
@@ -1467,6 +1759,26 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
     >
       <template #actions>
         <div class="flex items-center gap-2">
+          <Badge
+            data-testid="omnichannel-live-state"
+            role="status"
+            aria-live="polite"
+            variant="outline"
+            class="gap-1.5"
+            :class="connectionBadgeClass"
+          >
+            <span
+              class="h-1.5 w-1.5 rounded-full"
+              :class="
+                connectionState === 'connected'
+                  ? 'bg-emerald-300'
+                  : connectionState === 'disconnected'
+                    ? 'bg-rose-300'
+                    : 'bg-amber-300 animate-pulse'
+              "
+            />
+            {{ connectionLabel }}
+          </Badge>
           <Badge variant="outline" class="hidden gap-1.5 border-emerald-400/20 text-emerald-300 light:border-emerald-300 light:text-emerald-700 lg:flex">
             <CheckCircle2 class="h-3.5 w-3.5" />
             {{ activeCount }} active
@@ -2113,7 +2425,12 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
           <div v-if="loadingMessages" class="flex flex-1 items-center justify-center">
             <Loader2 class="h-5 w-5 animate-spin text-sky-300" />
           </div>
-          <div v-else class="flex-1 space-y-3 overflow-y-auto p-3 sm:p-5 md:p-7">
+          <div
+            v-else
+            ref="messagesViewport"
+            data-testid="omnichannel-message-viewport"
+            class="flex-1 space-y-3 overflow-y-auto p-3 sm:p-5 md:p-7"
+          >
             <div v-if="hasOlderMessages" class="pb-2 text-center">
               <Button
                 variant="outline"
@@ -2128,6 +2445,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             <div
               v-for="message in messages"
               :key="message.id"
+              :data-message-id="message.id"
               class="flex"
               :class="message.direction === 'outgoing' ? 'justify-end' : 'justify-start'"
             >
@@ -2148,14 +2466,32 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
           <footer class="border-t border-white/[0.08] bg-[#0d0f10] p-3 light:border-slate-300 light:bg-slate-50 sm:p-4">
             <div
               v-if="selectedConversation.channel === 'whatsapp'"
-                class="flex flex-col items-start gap-3 rounded-xl border border-emerald-300/15 bg-emerald-300/[0.04] px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+              data-testid="whatsapp-direct-reply-notice"
+              class="flex flex-col items-start gap-3 rounded-xl border px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+              :class="
+                canSendWhatsAppText
+                  ? 'border-emerald-300/15 bg-emerald-300/[0.04]'
+                  : 'border-amber-300/15 bg-amber-300/[0.04]'
+              "
             >
-                <p class="text-xs text-emerald-100/65 light:text-emerald-800">Open the WhatsApp conversation to use templates, media and service-window controls.</p>
+              <p
+                class="text-xs leading-5"
+                :class="canSendWhatsAppText ? 'text-emerald-100/65 light:text-emerald-800' : 'text-amber-100/65 light:text-amber-800'"
+              >
+                {{
+                  canSendWhatsAppText
+                    ? 'Text replies can be sent here during the active service window. Open WhatsApp for templates and media.'
+                    : whatsappReplyUnavailableReason
+                }}
+              </p>
               <RouterLink :to="`/chat/${selectedConversation.contact_id}`">
                 <Button size="sm" class="bg-emerald-300 text-black hover:bg-emerald-200">Open WhatsApp</Button>
               </RouterLink>
             </div>
-            <div v-else class="space-y-2">
+            <div
+              v-if="selectedConversation.channel !== 'whatsapp' || canSendWhatsAppText"
+              class="mt-2 space-y-2 first:mt-0"
+            >
               <div
                 v-if="['threads', 'tiktok'].includes(selectedConversation.channel)"
                 :data-testid="
@@ -2194,11 +2530,14 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               <div class="flex items-end gap-3">
               <textarea
                 v-model="composer"
+                data-testid="omnichannel-reply-composer"
                 rows="2"
                 class="min-h-11 flex-1 resize-none rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm text-white outline-none placeholder:text-white/20 focus:border-sky-300/35 light:border-slate-400 light:bg-white light:text-slate-950 light:placeholder:text-slate-500"
                 :disabled="!canSendText"
                 :placeholder="
-                  selectedConversation.channel === 'threads'
+                  selectedConversation.channel === 'whatsapp'
+                    ? 'Write a WhatsApp reply...'
+                    : selectedConversation.channel === 'threads'
                     ? threadsPublicReplyReady
                       ? 'Write a public Threads reply...'
                       : selectedThreadsTarget
@@ -2215,11 +2554,14 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
                 @keydown.ctrl.enter.prevent="sendMessage"
               />
               <Button
+                data-testid="omnichannel-send-reply"
                 size="icon"
                 class="h-11 w-11 shrink-0 bg-sky-300 text-black hover:bg-sky-200"
                 :disabled="sending || !composer.trim() || !canSendText"
                 :aria-label="
-                  selectedConversation.channel === 'threads'
+                  selectedConversation.channel === 'whatsapp'
+                    ? 'Send WhatsApp reply'
+                    : selectedConversation.channel === 'threads'
                     ? threadsPublicReplyReady
                       ? 'Send public Threads reply'
                       : 'Threads reply unavailable'
