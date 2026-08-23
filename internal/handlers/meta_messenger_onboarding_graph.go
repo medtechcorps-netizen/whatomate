@@ -53,6 +53,13 @@ var metaMessengerRequiredScopes = []string{
 	"business_management",
 }
 
+var metaMessengerSystemUserRequiredScopes = []string{
+	"public_profile",
+	"pages_show_list",
+	"pages_manage_metadata",
+	"pages_messaging",
+}
+
 var metaMessengerPageTargetScopes = []string{
 	"pages_show_list",
 	"pages_manage_metadata",
@@ -87,15 +94,16 @@ type metaMessengerTokenDebugResponse struct {
 }
 
 type metaMessengerTokenInspection struct {
-	AppID                string
-	Type                 string
-	UserID               string
-	ProfileID            string
-	Scopes               []string
-	GranularScopeTargets map[string]map[string]struct{}
-	ExpiresAt            *time.Time
-	DataAccessExpiresAt  *time.Time
-	CheckedAt            time.Time
+	AppID                     string
+	Type                      string
+	UserID                    string
+	ProfileID                 string
+	Scopes                    []string
+	BusinessEdgeProofRequired bool
+	GranularScopeTargets      map[string]map[string]struct{}
+	ExpiresAt                 *time.Time
+	DataAccessExpiresAt       *time.Time
+	CheckedAt                 time.Time
 }
 
 type metaMessengerPlatformUser struct {
@@ -422,7 +430,7 @@ func (a *App) inspectMetaMessengerToken(
 		granularTargets[scope] = targets
 	}
 	if requireUserScopes {
-		if missing := missingMetaMessengerScopes(granted); len(missing) > 0 {
+		if missing := missingMetaMessengerScopes(granted, tokenKind); len(missing) > 0 {
 			return metaMessengerTokenInspection{}, fmt.Errorf(
 				"meta authorization is missing required permissions: %s",
 				strings.Join(missing, ", "),
@@ -442,11 +450,13 @@ func (a *App) inspectMetaMessengerToken(
 		return metaMessengerTokenInspection{}, errors.New("meta user token identity is missing or invalid")
 	}
 	return metaMessengerTokenInspection{
-		AppID:                strings.TrimSpace(data.AppID),
-		Type:                 tokenKind,
-		UserID:               userID,
-		ProfileID:            strings.TrimSpace(data.ProfileID),
-		Scopes:               verifiedScopes,
+		AppID:     strings.TrimSpace(data.AppID),
+		Type:      tokenKind,
+		UserID:    userID,
+		ProfileID: strings.TrimSpace(data.ProfileID),
+		Scopes:    verifiedScopes,
+		BusinessEdgeProofRequired: tokenKind == metaMessengerTokenKindSystemUser &&
+			!metaMessengerScopeGranted(verifiedScopes, "business_management"),
 		GranularScopeTargets: granularTargets,
 		ExpiresAt:            expiresAt,
 		DataAccessExpiresAt:  dataAccessExpiresAt,
@@ -454,9 +464,28 @@ func (a *App) inspectMetaMessengerToken(
 	}, nil
 }
 
-func missingMetaMessengerScopes(granted map[string]struct{}) []string {
-	missing := make([]string, 0, len(metaMessengerRequiredScopes))
-	for _, required := range metaMessengerRequiredScopes {
+func metaMessengerScopeGranted(scopes []string, required string) bool {
+	required = strings.TrimSpace(required)
+	for _, scope := range scopes {
+		if strings.TrimSpace(scope) == required {
+			return true
+		}
+	}
+	return false
+}
+
+func missingMetaMessengerScopes(granted map[string]struct{}, tokenKind string) []string {
+	requiredScopes := metaMessengerRequiredScopes
+	if strings.EqualFold(strings.TrimSpace(tokenKind), metaMessengerTokenKindSystemUser) {
+		// Meta may omit the literal business_management label for a Business
+		// Integration System User. That omission is accepted only at this early
+		// scope gate: the exact client Business, system-user Page assignment,
+		// Page-token account, and Business-owned Page edges must still succeed
+		// before any binding is persisted.
+		requiredScopes = metaMessengerSystemUserRequiredScopes
+	}
+	missing := make([]string, 0, len(requiredScopes))
+	for _, required := range requiredScopes {
 		if _, ok := granted[required]; !ok {
 			missing = append(missing, required)
 		}
@@ -753,16 +782,19 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 			cause: err,
 		}
 	}
-	clientPages, err := fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
-		a,
-		ctx,
-		url.PathEscape(businessID)+"/client_pages",
-		url.Values{"fields": {"id,name"}},
-		accessToken,
-		metaMessengerGraphMaxPageAssets,
-	)
-	if err != nil {
-		return nil, nil, err
+	clientPages := []metaMessengerGraphBusinessPage(nil)
+	if !inspection.BusinessEdgeProofRequired {
+		clientPages, err = fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
+			a,
+			ctx,
+			url.PathEscape(businessID)+"/client_pages",
+			url.Values{"fields": {"id,name"}},
+			accessToken,
+			metaMessengerGraphMaxPageAssets,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	// assigned_pages is the authority edge for this BISU: its tasks are the
 	// roles actually granted to the system user. Business Page
@@ -952,10 +984,15 @@ func (a *App) revalidateMetaMessengerOwnedPage(
 	organizationID uuid.UUID,
 	userToken string,
 	inspection metaMessengerTokenInspection,
+	platform metaMessengerPlatformUser,
 	selected metaMessengerStoredPage,
 ) (metaMessengerStoredPage, error) {
 	if selected.Ownership != metaMessengerOwnershipOwned || !selected.Selectable ||
-		!validCanonicalMetaID(selected.BusinessID) || !validCanonicalMetaID(selected.PageID) {
+		!validCanonicalMetaID(selected.BusinessID) || !validCanonicalMetaID(selected.PageID) ||
+		strings.ToUpper(strings.TrimSpace(inspection.Type)) != platform.TokenKind ||
+		inspection.UserID != platform.UserID ||
+		(platform.TokenKind == metaMessengerTokenKindSystemUser &&
+			platform.ClientBusinessID != selected.BusinessID) {
 		return metaMessengerStoredPage{}, a.metaMessengerRevalidationFailure(
 			organizationID, selected, metaMessengerRevalidationStageFinalPredicates,
 			errMetaMessengerSelectionInvalid,

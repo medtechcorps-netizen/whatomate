@@ -36,6 +36,7 @@ type metaRegistryProvisionInput struct {
 	MetaAuthorityAssetID           string
 	AuthorizingMetaUserID          string
 	AuthorizationTokenKind         string
+	BusinessAuthorityVerified      bool
 	GrantedScopes                  []string
 	AccessToken                    string
 	AuthorityToken                 string
@@ -87,7 +88,11 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 	switch input.Channel {
 	case models.ChannelMessenger:
 		validPlatformBinding = input.InstagramAPIMode == "" && input.WebhookApp == "messenger" &&
-			input.MetaBusinessID != ""
+			input.MetaBusinessID != "" &&
+			((input.AuthorizationTokenKind == metaMessengerTokenKindSystemUser &&
+				input.BusinessAuthorityVerified) ||
+				(input.AuthorizationTokenKind == metaMessengerTokenKindUser &&
+					!input.BusinessAuthorityVerified))
 	case models.ChannelInstagram:
 		validPlatformBinding = input.InstagramAPIMode == "instagram_login" &&
 			input.WebhookApp == "instagram_login" &&
@@ -208,9 +213,6 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 		}
 	}
 	markMetaMessengerAuthorizationDurability(account.Metadata, input.AuthorizationTokenKind, input.TokenExpiresAt)
-	if err := validateMetaRegistryPlatformBinding(&account); err != nil {
-		return metaRegistryProvisionResult{}, err
-	}
 	inboundSecret, err := generateChannelSecret()
 	if err != nil {
 		return metaRegistryProvisionResult{}, err
@@ -270,6 +272,25 @@ func (a *App) provisionMetaRegistryBinding(input metaRegistryProvisionInput) (me
 		operation,
 		metaMessengerSubscriptionRemoteUnknown,
 	)
+	if input.Channel == models.ChannelMessenger &&
+		input.AuthorizationTokenKind == metaMessengerTokenKindSystemUser &&
+		!metaMessengerScopeGranted(input.GrantedScopes, "business_management") {
+		setMetaMessengerBusinessAuthorityEvidence(
+			account.Metadata,
+			input.PlatformAppID,
+			input.AuthorizingMetaUserID,
+			input.MetaBusinessID,
+			input.ExternalAccountID,
+			input.OwnershipCheckedAt,
+			oauth.ID,
+			oauth.Version,
+		)
+	}
+	validationAccount := account
+	validationAccount.Credentials = []models.ChannelCredential{oauth, webhook}
+	if err := validateMetaRegistryPlatformBinding(&validationAccount); err != nil {
+		return metaRegistryProvisionResult{}, err
+	}
 	if err := a.DB.Create(&account).Error; err != nil {
 		return metaRegistryProvisionResult{}, err
 	}

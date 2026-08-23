@@ -47,6 +47,67 @@ func TestMetaMessengerAuthorizationDurabilityMetadataMarksDevelopmentUserTokens(
 	assert.False(t, hasExpiry)
 }
 
+func TestRotateMetaMessengerBindingRejectsUnprovenBusinessAuthority(t *testing.T) {
+	organizationID := uuid.New()
+	base := metaMessengerRotateInput{
+		AccountID:      uuid.New(),
+		OrganizationID: organizationID,
+		UserID:         uuid.New(),
+		Page: metaMessengerStoredPage{metaMessengerPageSummary: metaMessengerPageSummary{
+			BusinessID: "200000000000001",
+			PageID:     "700000000000001",
+		}},
+		Platform: metaMessengerPlatformUser{
+			UserID:           "900000000000001",
+			TokenKind:        metaMessengerTokenKindSystemUser,
+			ClientBusinessID: "200000000000001",
+		},
+		Inspection: metaMessengerTokenInspection{
+			Type:      metaMessengerTokenKindSystemUser,
+			UserID:    "900000000000001",
+			CheckedAt: time.Now().UTC(),
+		},
+		BusinessAuthorityVerified: true,
+	}
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*metaMessengerRotateInput)
+	}{
+		{
+			name: "inspection token kind mismatch",
+			mutate: func(input *metaMessengerRotateInput) {
+				input.Inspection.Type = metaMessengerTokenKindUser
+			},
+		},
+		{
+			name: "inspection identity mismatch",
+			mutate: func(input *metaMessengerRotateInput) {
+				input.Inspection.UserID = "900000000000099"
+			},
+		},
+		{
+			name: "client business mismatch",
+			mutate: func(input *metaMessengerRotateInput) {
+				input.Platform.ClientBusinessID = "200000000000099"
+			},
+		},
+		{
+			name: "missing exact edge proof",
+			mutate: func(input *metaMessengerRotateInput) {
+				input.BusinessAuthorityVerified = false
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			input := base
+			testCase.mutate(&input)
+			app := &App{tenantOrgID: organizationID}
+			_, err := app.rotateMetaMessengerBinding(input)
+			require.ErrorIs(t, err, metaregistry.ErrInvalidRequest)
+		})
+	}
+}
+
 func claimMetaMessengerReconnectForTest(
 	t *testing.T,
 	root *App,
@@ -55,6 +116,7 @@ func claimMetaMessengerReconnectForTest(
 	expiresAt time.Time,
 ) (metaRegistryProvisionResult, error) {
 	t.Helper()
+	checkedAt := time.Now().UTC()
 	var result metaRegistryProvisionResult
 	err := root.WithCommittedTenantApp(fixture.account.OrganizationID, func(scoped *App) error {
 		var rotateErr error
@@ -62,19 +124,26 @@ func claimMetaMessengerReconnectForTest(
 			AccountID:      fixture.account.ID,
 			OrganizationID: fixture.account.OrganizationID,
 			UserID:         fixture.userID,
-			Page: metaMessengerStoredPage{metaMessengerPageSummary: metaMessengerPageSummary{
-				BusinessID: "business-" + fixture.account.ExternalAccountID,
-				PageID:     fixture.account.ExternalAccountID,
-				PageName:   "Fence test Page",
-			}},
+			Page: metaMessengerStoredPage{
+				metaMessengerPageSummary: metaMessengerPageSummary{
+					BusinessID: "business-" + fixture.account.ExternalAccountID,
+					PageID:     fixture.account.ExternalAccountID,
+					PageName:   "Fence test Page",
+				},
+				OwnershipVerifiedAt: checkedAt.Add(time.Nanosecond),
+			},
 			Platform: metaMessengerPlatformUser{
-				UserID:    "fence-test-user",
-				TokenKind: metaMessengerTokenKindSystemUser,
+				UserID:           "fence-test-user",
+				TokenKind:        metaMessengerTokenKindSystemUser,
+				ClientBusinessID: "business-" + fixture.account.ExternalAccountID,
 			},
 			Inspection: metaMessengerTokenInspection{
-				CheckedAt: time.Now().UTC(),
+				Type:      metaMessengerTokenKindSystemUser,
+				UserID:    "fence-test-user",
+				CheckedAt: checkedAt,
 				Scopes:    append([]string(nil), metaMessengerRequiredScopes...),
 			},
+			BusinessAuthorityVerified:      true,
 			PageToken:                      "new-page-token",
 			AuthorityToken:                 "new-authority-token",
 			SubscriptionOperationID:        operationID,
@@ -149,6 +218,7 @@ func TestMetaMessengerNewPageClaimIsDurableAndGloballyUniqueBeforeProviderMutati
 			MetaBusinessID:                 "business-" + pageID,
 			AuthorizingMetaUserID:          "user-" + pageID,
 			AuthorizationTokenKind:         metaMessengerTokenKindSystemUser,
+			BusinessAuthorityVerified:      true,
 			GrantedScopes:                  append([]string(nil), metaMessengerRequiredScopes...),
 			AccessToken:                    "page-token",
 			AuthorityToken:                 "authority-token",

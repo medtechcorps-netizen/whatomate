@@ -383,10 +383,12 @@ func TestMetaMessengerAuthenticatedGraphRequestsUseAppSecretProof(t *testing.T) 
 
 func TestMetaMessengerTokenInspectionUsesExactScopesForGraphEdges(t *testing.T) {
 	for _, testCase := range []struct {
-		name       string
-		scopes     []string
-		wantError  bool
-		missingKey string
+		name          string
+		tokenKind     string
+		scopes        []string
+		wantError     bool
+		missingKey    string
+		wantEdgeProof bool
 	}{
 		{
 			name: "minimum plus business edge without read engagement",
@@ -413,8 +415,30 @@ func TestMetaMessengerTokenInspectionUsesExactScopesForGraphEdges(t *testing.T) 
 			wantError:  true,
 			missingKey: "business_management",
 		},
+		{
+			name:      "system user may defer only business management to exact edges",
+			tokenKind: metaMessengerTokenKindSystemUser,
+			scopes: []string{
+				"public_profile", "pages_show_list", "pages_manage_metadata",
+				"pages_messaging",
+			},
+			wantEdgeProof: true,
+		},
+		{
+			name:      "system user still requires every Page scope",
+			tokenKind: metaMessengerTokenKindSystemUser,
+			scopes: []string{
+				"public_profile", "pages_show_list", "pages_messaging",
+			},
+			wantError:  true,
+			missingKey: "pages_manage_metadata",
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
+			tokenKind := testCase.tokenKind
+			if tokenKind == "" {
+				tokenKind = metaMessengerTokenKindUser
+			}
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				require.Equal(t, "/v25.0/debug_token", request.URL.Path)
 				require.Equal(t, http.MethodGet, request.Method)
@@ -434,7 +458,7 @@ func TestMetaMessengerTokenInspectionUsesExactScopesForGraphEdges(t *testing.T) 
 				_ = json.NewEncoder(writer).Encode(map[string]any{"data": map[string]any{
 					"is_valid": true,
 					"app_id":   metaLifecycleTestAppID,
-					"type":     metaMessengerTokenKindUser,
+					"type":     tokenKind,
 					"user_id":  metaLifecycleTestUserID,
 					"scopes":   testCase.scopes,
 				}})
@@ -453,6 +477,7 @@ func TestMetaMessengerTokenInspectionUsesExactScopesForGraphEdges(t *testing.T) 
 			}
 			require.NoError(t, err)
 			assert.ElementsMatch(t, testCase.scopes, inspection.Scopes)
+			assert.Equal(t, testCase.wantEdgeProof, inspection.BusinessEdgeProofRequired)
 			assert.NotContains(t, inspection.Scopes, "pages_read_engagement")
 		})
 	}
@@ -584,6 +609,9 @@ func TestMetaMessengerSelectionRechecksBothPageTasksImmediatelyBeforePersistence
 				uuid.Nil,
 				"user-token",
 				inspection,
+				metaMessengerPlatformUser{
+					UserID: metaLifecycleTestUserID, TokenKind: metaMessengerTokenKindUser,
+				},
 				selected,
 			)
 			if !testCase.wantValid {
@@ -626,8 +654,10 @@ func TestMetaMessengerSystemUserInventoryUsesAccountsPageToken(t *testing.T) {
 	app := newMetaLifecycleGraphApp(t, server)
 	inspection := metaMessengerTokenInspection{
 		AppID: metaLifecycleTestAppID, Type: metaMessengerTokenKindSystemUser,
-		UserID: metaLifecycleTestUserID, Scopes: append([]string(nil), metaMessengerRequiredScopes...),
-		CheckedAt: time.Now().UTC(),
+		UserID:                    metaLifecycleTestUserID,
+		Scopes:                    append([]string(nil), metaMessengerSystemUserRequiredScopes...),
+		BusinessEdgeProofRequired: true,
+		CheckedAt:                 time.Now().UTC(),
 	}
 	businesses, pages, err := app.discoverMetaMessengerSystemUserInventory(
 		context.Background(),
@@ -649,7 +679,6 @@ func TestMetaMessengerSystemUserInventoryUsesAccountsPageToken(t *testing.T) {
 		"/v25.0/" + metaLifecycleTestUserID + "/assigned_pages",
 		"/v25.0/" + metaLifecycleTestUserID + "/accounts",
 		"/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages",
-		"/v25.0/" + metaLifecycleTestBusinessID + "/client_pages",
 	}, paths)
 }
 
@@ -696,6 +725,10 @@ func TestMetaMessengerSystemUserSelectionUsesFreshAuthorityToken(t *testing.T) {
 		uuid.Nil,
 		"system-user-token",
 		inspection,
+		metaMessengerPlatformUser{
+			UserID: metaLifecycleTestUserID, TokenKind: metaMessengerTokenKindSystemUser,
+			ClientBusinessID: metaLifecycleTestBusinessID,
+		},
 		selected,
 	)
 	require.NoError(t, err)
@@ -881,6 +914,10 @@ func TestMetaMessengerSystemUserSelectionRejectsInvalidAssignment(t *testing.T) 
 					UserID: metaLifecycleTestUserID, Scopes: append([]string(nil), metaMessengerRequiredScopes...),
 					CheckedAt: time.Now().UTC(),
 				},
+				metaMessengerPlatformUser{
+					UserID: metaLifecycleTestUserID, TokenKind: metaMessengerTokenKindSystemUser,
+					ClientBusinessID: metaLifecycleTestBusinessID,
+				},
 				metaMessengerStoredPage{metaMessengerPageSummary: metaMessengerPageSummary{
 					BusinessID: metaLifecycleTestBusinessID,
 					PageID:     metaLifecycleTestPageID,
@@ -1045,14 +1082,81 @@ func TestMetaMessengerScheduledRevalidationChecksExactPageAndSubscription(t *tes
 		AuthorityToken: "user-token",
 		PageToken:      "page-token",
 	}
-	outcome, reason := app.checkMetaMessengerOwnership(context.Background(), snapshot)
+	outcome, reason, businessAuthorityVerified := app.checkMetaMessengerOwnership(context.Background(), snapshot)
 	assert.Empty(t, outcome)
 	assert.Equal(t, "scheduled_graph_revalidation", reason)
+	assert.True(t, businessAuthorityVerified)
 
 	subscribed.Store(false)
-	outcome, reason = app.checkMetaMessengerOwnership(context.Background(), snapshot)
+	outcome, reason, businessAuthorityVerified = app.checkMetaMessengerOwnership(context.Background(), snapshot)
 	assert.Equal(t, metaregistry.OwnershipStale, outcome)
 	assert.Equal(t, "messages_subscription_missing", reason)
+	assert.False(t, businessAuthorityVerified)
+}
+
+func TestMetaMessengerScheduledRevalidationRejectsTokenKindDrift(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v25.0/debug_token":
+			_, _ = writer.Write([]byte(`{"data":{"is_valid":true,"app_id":"100000000000001","type":"USER","user_id":"900000000000001","scopes":["public_profile","pages_show_list","pages_manage_metadata","pages_messaging","business_management"]}}`))
+		default:
+			http.Error(writer, "unexpected", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	app := newMetaLifecycleGraphApp(t, server)
+	future := time.Now().UTC().Add(time.Hour)
+	snapshot := metaMessengerRevalidationSnapshot{
+		Account: models.ChannelAccount{
+			ExternalAccountID: metaLifecycleTestPageID,
+			Metadata: models.JSONB{
+				"meta_authorizing_user_id":             metaLifecycleTestUserID,
+				"meta_business_id":                     metaLifecycleTestBusinessID,
+				metaMessengerAuthorizationTokenKindKey: metaMessengerTokenKindSystemUser,
+			},
+		},
+		OAuth:          models.ChannelCredential{ExpiresAt: &future},
+		AuthorityToken: "changed-user-token",
+		PageToken:      "page-token",
+	}
+	outcome, reason, businessAuthorityVerified := app.checkMetaMessengerOwnership(t.Context(), snapshot)
+	assert.Equal(t, metaregistry.OwnershipRevoked, outcome)
+	assert.Equal(t, "authorization_token_kind_changed", reason)
+	assert.False(t, businessAuthorityVerified)
+}
+
+func TestMetaMessengerScheduledRevalidationRejectsStaleLiteralBusinessScope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v25.0/debug_token":
+			_, _ = writer.Write([]byte(`{"data":{"is_valid":true,"app_id":"100000000000001","type":"SYSTEM_USER","user_id":"900000000000001","scopes":["public_profile","pages_show_list","pages_manage_metadata","pages_messaging"]}}`))
+		default:
+			http.Error(writer, "unexpected", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	app := newMetaLifecycleGraphApp(t, server)
+	future := time.Now().UTC().Add(time.Hour)
+	snapshot := metaMessengerRevalidationSnapshot{
+		Account: models.ChannelAccount{
+			ExternalAccountID: metaLifecycleTestPageID,
+			Metadata: models.JSONB{
+				"meta_authorizing_user_id":             metaLifecycleTestUserID,
+				"meta_business_id":                     metaLifecycleTestBusinessID,
+				"meta_granted_scopes":                  append([]string(nil), metaMessengerRequiredScopes...),
+				metaMessengerAuthorizationTokenKindKey: metaMessengerTokenKindSystemUser,
+			},
+		},
+		OAuth:          models.ChannelCredential{ExpiresAt: &future},
+		AuthorityToken: "system-user-token-without-business-scope",
+		PageToken:      "page-token",
+	}
+	outcome, reason, businessAuthorityVerified := app.checkMetaMessengerOwnership(t.Context(), snapshot)
+	assert.Equal(t, metaregistry.OwnershipStale, outcome)
+	assert.Equal(t, "business_authority_contract_changed", reason)
+	assert.False(t, businessAuthorityVerified)
 }
 
 func TestMetaMessengerRuntimeAllowlistBlocksEveryLeaseAndSchedulerQuarantinesWithoutGraph(t *testing.T) {
@@ -1113,6 +1217,9 @@ func TestMetaMessengerApprovalRechecksExactMessagesSubscription(t *testing.T) {
 	)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	metadata := cloneJSONB(fixture.account.Metadata)
+	metadata["meta_platform_app_id"] = "123"
+	metadata["meta_authorizing_user_id"] = metaLifecycleTestUserID
+	metadata["meta_business_id"] = metaLifecycleTestBusinessID
 	metadata["meta_subscription_state"] = "verified"
 	metadata["meta_activation_state"] = "awaiting_admin_approval"
 	metadata["meta_health_checked_at"] = now.Format(time.RFC3339Nano)
@@ -1130,15 +1237,35 @@ func TestMetaMessengerApprovalRechecksExactMessagesSubscription(t *testing.T) {
 
 	var subscribed atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		require.Equal(t, "/v25.0/"+metaLifecycleTestPageID+"/subscribed_apps", request.URL.Path)
-		require.Contains(t, request.URL.Query().Get("fields"), "subscribed_fields")
-		require.Equal(t, "Bearer provider-token-"+metaLifecycleTestPageID, request.Header.Get("Authorization"))
 		writer.Header().Set("Content-Type", "application/json")
-		field := "feed"
-		if subscribed.Load() {
-			field = "messages"
+		switch request.URL.Path {
+		case "/v25.0/debug_token":
+			if request.URL.Query().Get("input_token") == "provider-token-"+metaLifecycleTestPageID {
+				_, _ = writer.Write([]byte(`{"data":{"is_valid":true,"app_id":"123","type":"PAGE","user_id":"700000000000001"}}`))
+				return
+			}
+			_, _ = writer.Write([]byte(`{"data":{"is_valid":true,"app_id":"123","type":"SYSTEM_USER","user_id":"900000000000001","scopes":["public_profile","pages_show_list","pages_manage_metadata","pages_messaging","business_management"]}}`))
+		case "/v25.0/me":
+			if request.Header.Get("Authorization") == "Bearer provider-token-"+metaLifecycleTestPageID {
+				_, _ = writer.Write([]byte(`{"id":"700000000000001","name":"Review Page"}`))
+				return
+			}
+			_, _ = writer.Write([]byte(`{"id":"900000000000001","client_business_id":"200000000000001"}`))
+		case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Review Page","tasks":["MESSAGING","MODERATE"]}]}`))
+		case "/v25.0/" + metaLifecycleTestUserID + "/accounts":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Review Page","access_token":"provider-token-700000000000001"}]}`))
+		case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000001","name":"Review Page"}]}`))
+		case "/v25.0/" + metaLifecycleTestPageID + "/subscribed_apps":
+			field := "feed"
+			if subscribed.Load() {
+				field = "messages"
+			}
+			_, _ = writer.Write([]byte(`{"data":[{"id":"123","subscribed_fields":["` + field + `"]}]}`))
+		default:
+			http.Error(writer, "unexpected", http.StatusNotFound)
 		}
-		_, _ = writer.Write([]byte(`{"data":[{"id":"123","subscribed_fields":["` + field + `"]}]}`))
 	}))
 	defer server.Close()
 	app := metaRegistryTestApp(db, organization.ID)
@@ -1177,6 +1304,111 @@ func TestMetaMessengerApprovalRechecksExactMessagesSubscription(t *testing.T) {
 	assert.Equal(t, models.ChannelAccountStatusActive, activated.Status)
 	assert.True(t, boolConfigValue(activated.Config, "outbound_enabled"))
 	assert.False(t, boolConfigValue(activated.Config, "ai_reply_enabled"))
+}
+
+func TestMetaMessengerBISUApprovalRechecksExactAuthorityEdges(t *testing.T) {
+	const approvalPageID = "700000000000109"
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	fixture := createMetaRegistryFixture(
+		t, db, organization.ID, models.ChannelMessenger, approvalPageID,
+	)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	metadata := cloneJSONB(fixture.account.Metadata)
+	metadata["meta_platform_app_id"] = "123"
+	metadata["meta_authorizing_user_id"] = metaLifecycleTestUserID
+	metadata["meta_business_id"] = metaLifecycleTestBusinessID
+	metadata[metaMessengerAuthorizationTokenKindKey] = metaMessengerTokenKindSystemUser
+	metadata["meta_granted_scopes"] = append([]string(nil), metaMessengerSystemUserRequiredScopes...)
+	metadata["meta_ownership_checked_at"] = now.Format(time.RFC3339Nano)
+	metadata["meta_subscription_state"] = "verified"
+	metadata["meta_activation_state"] = "awaiting_admin_approval"
+	metadata["meta_health_checked_at"] = now.Format(time.RFC3339Nano)
+	metadata["meta_health_oauth_credential_id"] = fixture.oauth.ID.String()
+	metadata["meta_health_oauth_version"] = fixture.oauth.Version
+	metadata["meta_health_webhook_credential_id"] = fixture.webhook.ID.String()
+	metadata["meta_health_webhook_version"] = fixture.webhook.Version
+	setMetaMessengerBusinessAuthorityEvidence(
+		metadata,
+		"123",
+		metaLifecycleTestUserID,
+		metaLifecycleTestBusinessID,
+		approvalPageID,
+		now,
+		fixture.oauth.ID,
+		fixture.oauth.Version,
+	)
+	configJSON := cloneJSONB(fixture.account.Config)
+	configJSON["outbound_enabled"] = false
+	configJSON["ai_reply_enabled"] = false
+	require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).Updates(map[string]any{
+		"status": models.ChannelAccountStatusPending, "config": configJSON, "metadata": metadata,
+		"last_health_check_at": now, "last_error": "",
+	}).Error)
+
+	var authorityPresent atomic.Bool
+	authorityPresent.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v25.0/debug_token":
+			if request.URL.Query().Get("input_token") == "provider-token-"+approvalPageID {
+				_, _ = writer.Write([]byte(`{"data":{"is_valid":true,"app_id":"123","type":"PAGE","user_id":"700000000000109"}}`))
+				return
+			}
+			_, _ = writer.Write([]byte(`{"data":{"is_valid":true,"app_id":"123","type":"SYSTEM_USER","user_id":"900000000000001","scopes":["public_profile","pages_show_list","pages_manage_metadata","pages_messaging"]}}`))
+		case "/v25.0/me":
+			if request.Header.Get("Authorization") == "Bearer provider-token-"+approvalPageID {
+				_, _ = writer.Write([]byte(`{"id":"700000000000109","name":"Review Page"}`))
+				return
+			}
+			_, _ = writer.Write([]byte(`{"id":"900000000000001","client_business_id":"200000000000001"}`))
+		case "/v25.0/" + metaLifecycleTestUserID + "/assigned_pages":
+			if authorityPresent.Load() {
+				_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000109","name":"Review Page","tasks":["MESSAGING","MODERATE"]}]}`))
+			} else {
+				_, _ = writer.Write([]byte(`{"data":[]}`))
+			}
+		case "/v25.0/" + metaLifecycleTestUserID + "/accounts":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000109","name":"Review Page","access_token":"provider-token-700000000000109"}]}`))
+		case "/v25.0/" + metaLifecycleTestBusinessID + "/owned_pages":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"700000000000109","name":"Review Page"}]}`))
+		case "/v25.0/" + approvalPageID + "/subscribed_apps":
+			_, _ = writer.Write([]byte(`{"data":[{"id":"123","subscribed_fields":["messages"]}]}`))
+		default:
+			http.Error(writer, "unexpected", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	app := metaRegistryTestApp(db, organization.ID)
+	app.Config.MetaRegistry.Enabled = true
+	app.Config.MetaMessenger.Enabled = true
+	app.Config.MetaMessenger.ConfigID = "456"
+	app.Config.MetaMessenger.AppSecret = metaLifecycleTestAppSecret
+	app.Config.MetaMessenger.GraphAPIVersion = "v25.0"
+	app.Config.MetaMessenger.GraphBaseURL = "https://graph.meta.test"
+	app.Config.MetaMessenger.ReReplyBaseURL = "https://app.example.test"
+	app.Config.MetaMessenger.RelayBaseURL = "https://relay.example.test"
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://graph.meta.test": server,
+	})
+
+	snapshot, err := app.loadMetaMessengerRevalidationSnapshot(
+		organization.ID, fixture.account.ID, now,
+	)
+	require.NoError(t, err)
+	evidence, err := app.freshMetaMessengerSubscriptionApproval(t.Context(), snapshot)
+	require.NoError(t, err)
+	assert.False(t, evidence.BusinessAuthorityCheckedAt.IsZero())
+
+	authorityPresent.Store(false)
+	_, err = app.freshMetaMessengerSubscriptionApproval(t.Context(), snapshot)
+	require.Error(t, err, "removing the exact BISU Page assignment must block approval")
+	var pending models.ChannelAccount
+	require.NoError(t, db.First(&pending, "id = ?", fixture.account.ID).Error)
+	assert.Equal(t, models.ChannelAccountStatusPending, pending.Status)
+	assert.False(t, boolConfigValue(pending.Config, "outbound_enabled"))
+	assert.False(t, boolConfigValue(pending.Config, "ai_reply_enabled"))
 }
 
 func TestClassifyMetaMessengerRevalidationError(t *testing.T) {
@@ -1304,24 +1536,34 @@ func TestMetaMessengerDelayedOldDeauthorizationCannotRevokeReconnectGeneration(t
 		Update("metadata", fixture.account.Metadata).Error)
 	oldEventIssuedAt := time.Now().UTC().Add(-time.Second)
 	result, err := func() (metaRegistryProvisionResult, error) {
+		checkedAt := time.Now().UTC()
 		var rotated metaRegistryProvisionResult
 		err := root.WithCommittedTenantApp(fixture.account.OrganizationID, func(scoped *App) error {
 			var rotateErr error
 			rotated, rotateErr = scoped.rotateMetaMessengerBinding(metaMessengerRotateInput{
 				AccountID: fixture.account.ID, OrganizationID: fixture.account.OrganizationID,
 				UserID: fixture.userID,
-				Page: metaMessengerStoredPage{metaMessengerPageSummary: metaMessengerPageSummary{
-					BusinessID: reconnectBusinessID,
-					PageID:     fixture.account.ExternalAccountID, PageName: "Reconnected Page",
-				}},
+				Page: metaMessengerStoredPage{
+					metaMessengerPageSummary: metaMessengerPageSummary{
+						BusinessID: reconnectBusinessID,
+						PageID:     fixture.account.ExternalAccountID, PageName: "Reconnected Page",
+					},
+					OwnershipVerifiedAt: checkedAt.Add(time.Nanosecond),
+				},
 				Platform: metaMessengerPlatformUser{
-					UserID:    reconnectAuthorizingUserID,
-					TokenKind: metaMessengerTokenKindSystemUser,
+					UserID:           reconnectAuthorizingUserID,
+					TokenKind:        metaMessengerTokenKindSystemUser,
+					ClientBusinessID: reconnectBusinessID,
 				},
 				Inspection: metaMessengerTokenInspection{
-					CheckedAt: time.Now().UTC(), Scopes: append([]string(nil), metaMessengerRequiredScopes...),
+					Type:                      metaMessengerTokenKindSystemUser,
+					UserID:                    reconnectAuthorizingUserID,
+					CheckedAt:                 checkedAt,
+					Scopes:                    append([]string(nil), metaMessengerSystemUserRequiredScopes...),
+					BusinessEdgeProofRequired: true,
 				},
-				PageToken: "new-page-token", AuthorityToken: "new-authority-token",
+				BusinessAuthorityVerified: true,
+				PageToken:                 "new-page-token", AuthorityToken: "new-authority-token",
 				SubscriptionOperationID:        uuid.New(),
 				SubscriptionOperationExpiresAt: time.Now().UTC().Add(metaMessengerSubscriptionOperationLease),
 			})
@@ -1349,6 +1591,17 @@ func TestMetaMessengerDelayedOldDeauthorizationCannotRevokeReconnectGeneration(t
 	var newOAuth models.ChannelCredential
 	require.NoError(t, root.DB.First(&newOAuth, "id = ?", result.OAuthCredentialID).Error)
 	assert.Equal(t, models.ChannelCredentialStatusActive, newOAuth.Status)
+	assert.Equal(
+		t,
+		metaregistry.MessengerBusinessAuthoritySystemUserExactEdges,
+		stringConfigValue(account.Metadata, metaregistry.MessengerBusinessAuthorityMetadataKey),
+	)
+	assert.True(t, metaregistry.MessengerBusinessAuthorityCurrent(
+		account.Metadata,
+		account.ExternalAccountID,
+		newOAuth.ID,
+		newOAuth.Version,
+	))
 	authorizedAt, err := time.Parse(
 		time.RFC3339Nano,
 		stringConfigValue(account.Metadata, metaMessengerAuthorizationGrantedAtKey),
@@ -1381,13 +1634,15 @@ func TestMetaMessengerDelayedOldDeauthorizationCannotRevokeReconnectGeneration(t
 	require.NoError(t, err)
 	reconciledAt := ambiguousEvent.Add(3 * time.Second)
 	require.NoError(t, root.WithCommittedTenantApp(fixture.account.OrganizationID, func(scoped *App) error {
-		applied, applyErr := scoped.applyMetaRegistryMutation(metaregistry.MutationRequest{
+		// This synthetic reconciliation stands in for the in-process lifecycle
+		// after its fresh Graph checker has repeated the exact BISU asset edges.
+		applied, applyErr := scoped.applyMetaRegistryMutationWithMessengerAuthorityProof(metaregistry.MutationRequest{
 			ChannelAccountID: snapshot.Account.ID,
 			CredentialID:     snapshot.OAuth.ID, CredentialVersion: snapshot.OAuth.Version,
 			WebhookCredentialID: snapshot.Webhook.ID, WebhookCredentialVersion: snapshot.Webhook.Version,
 			Outcome: metaregistry.OwnershipVerified, Reason: "scheduled_graph_revalidation",
 			CheckedAt: reconciledAt,
-		}, metaregistry.OwnershipVerified)
+		}, metaregistry.OwnershipVerified, true)
 		if applyErr != nil {
 			return applyErr
 		}

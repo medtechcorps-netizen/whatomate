@@ -424,6 +424,15 @@ func (a *App) loadMetaRegistryBinding(request metaregistry.ResolveRequest, now t
 	if oauthCredential == nil || webhookCredential == nil {
 		return metaregistry.Binding{}, metaregistry.ErrNotFound
 	}
+	if account.Channel == models.ChannelMessenger &&
+		!metaregistry.MessengerBusinessAuthorityCurrent(
+			account.Metadata,
+			account.ExternalAccountID,
+			oauthCredential.ID,
+			oauthCredential.Version,
+		) {
+		return metaregistry.Binding{}, metaregistry.ErrNotFound
+	}
 	if account.Channel == models.ChannelInstagram &&
 		!metaInstagramCredentialPairGenerationValid(oauthCredential, webhookCredential, now) {
 		return metaregistry.Binding{}, metaregistry.ErrStaleBinding
@@ -570,6 +579,19 @@ func decryptRequiredMetaRegistrySecret(blob models.JSONB, key, encryptionKey str
 }
 
 func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, outcome string) (bool, error) {
+	return a.applyMetaRegistryMutationWithMessengerAuthorityProof(request, outcome, false)
+}
+
+// applyMetaRegistryMutationWithMessengerAuthorityProof is reserved for the
+// in-process Messenger lifecycle after it has freshly repeated the exact BISU
+// asset edges. Service-authenticated mutation requests must use
+// applyMetaRegistryMutation so their caller-controlled reason cannot mint or
+// refresh this proof.
+func (a *App) applyMetaRegistryMutationWithMessengerAuthorityProof(
+	request metaregistry.MutationRequest,
+	outcome string,
+	messengerAuthorityVerified bool,
+) (bool, error) {
 	if a == nil || a.DB == nil || a.tenantOrgID == uuid.Nil {
 		return false, metaregistry.ErrInvalidRequest
 	}
@@ -624,6 +646,19 @@ func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, ou
 		return false, metaregistry.ErrNotFound
 	}
 	credentials := []models.ChannelCredential{*oauth, *webhook}
+	usesExactMessengerBusinessAuthority := account.Channel == models.ChannelMessenger &&
+		metaregistry.MessengerUsesExactSystemUserBusinessAuthority(account.Metadata)
+	if usesExactMessengerBusinessAuthority && outcome == metaregistry.OwnershipVerified {
+		if !messengerAuthorityVerified ||
+			!metaregistry.MessengerBusinessAuthorityGenerationBound(
+				account.Metadata,
+				account.ExternalAccountID,
+				oauth.ID,
+				oauth.Version,
+			) {
+			return false, metaregistry.ErrNotFound
+		}
+	}
 	if account.Channel == models.ChannelInstagram && outcome == metaregistry.OwnershipVerified {
 		if a.metaInstagramReleaseGuardReason(account, a.tenantOrgID) != "" ||
 			!metaInstagramSubscribedOperationMatchesCredentials(
@@ -635,6 +670,18 @@ func (a *App) applyMetaRegistryMutation(request metaregistry.MutationRequest, ou
 	metadata := cloneJSONB(account.Metadata)
 	metadata["meta_ownership_state"] = outcome
 	metadata["meta_ownership_checked_at"] = request.CheckedAt.Format(time.RFC3339Nano)
+	if usesExactMessengerBusinessAuthority && outcome == metaregistry.OwnershipVerified {
+		setMetaMessengerBusinessAuthorityEvidence(
+			metadata,
+			stringConfigValue(account.Metadata, "meta_platform_app_id"),
+			stringConfigValue(account.Metadata, "meta_authorizing_user_id"),
+			stringConfigValue(account.Metadata, "meta_business_id"),
+			account.ExternalAccountID,
+			request.CheckedAt,
+			oauth.ID,
+			oauth.Version,
+		)
+	}
 	if request.Reason != "" {
 		metadata["meta_ownership_reason"] = request.Reason
 	}
@@ -769,7 +816,7 @@ func validateMetaRegistryPlatformBinding(account *models.ChannelAccount) error {
 	}
 	mode := stringConfigValue(account.Config, "instagram_api_mode")
 	wantApp := "messenger"
-	requiredScopes := metaMessengerRequiredScopes
+	requiredScopes := metaMessengerSystemUserRequiredScopes
 	if account.Channel == models.ChannelInstagram {
 		switch mode {
 		case "instagram_login":
@@ -820,5 +867,49 @@ func validateMetaRegistryPlatformBinding(account *models.ChannelAccount) error {
 			return metaregistry.ErrNotFound
 		}
 	}
+	if account.Channel == models.ChannelMessenger &&
+		!metaregistry.MessengerBusinessAuthorityMetadataValid(
+			account.Metadata,
+			account.ExternalAccountID,
+		) {
+		return metaregistry.ErrNotFound
+	}
 	return nil
+}
+
+func setMetaMessengerBusinessAuthorityEvidence(
+	metadata models.JSONB,
+	appID, userID, businessID, pageID string,
+	checkedAt time.Time,
+	oauthCredentialID uuid.UUID,
+	oauthCredentialVersion int,
+) {
+	clearMetaMessengerBusinessAuthorityEvidence(metadata)
+	metadata[metaregistry.MessengerBusinessAuthorityMetadataKey] =
+		metaregistry.MessengerBusinessAuthoritySystemUserExactEdges
+	metadata[metaregistry.MessengerBusinessAuthorityCheckedAtMetadataKey] =
+		checkedAt.UTC().Format(time.RFC3339Nano)
+	metadata[metaregistry.MessengerBusinessAuthorityOAuthIDMetadataKey] =
+		oauthCredentialID.String()
+	metadata[metaregistry.MessengerBusinessAuthorityOAuthVersionMetadataKey] =
+		oauthCredentialVersion
+	metadata[metaregistry.MessengerBusinessAuthorityAppIDMetadataKey] = strings.TrimSpace(appID)
+	metadata[metaregistry.MessengerBusinessAuthorityUserIDMetadataKey] = strings.TrimSpace(userID)
+	metadata[metaregistry.MessengerBusinessAuthorityBusinessIDMetadataKey] = strings.TrimSpace(businessID)
+	metadata[metaregistry.MessengerBusinessAuthorityPageIDMetadataKey] = strings.TrimSpace(pageID)
+}
+
+func clearMetaMessengerBusinessAuthorityEvidence(metadata models.JSONB) {
+	for _, key := range []string{
+		metaregistry.MessengerBusinessAuthorityMetadataKey,
+		metaregistry.MessengerBusinessAuthorityCheckedAtMetadataKey,
+		metaregistry.MessengerBusinessAuthorityOAuthIDMetadataKey,
+		metaregistry.MessengerBusinessAuthorityOAuthVersionMetadataKey,
+		metaregistry.MessengerBusinessAuthorityAppIDMetadataKey,
+		metaregistry.MessengerBusinessAuthorityUserIDMetadataKey,
+		metaregistry.MessengerBusinessAuthorityBusinessIDMetadataKey,
+		metaregistry.MessengerBusinessAuthorityPageIDMetadataKey,
+	} {
+		delete(metadata, key)
+	}
 }

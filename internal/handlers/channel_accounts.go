@@ -1023,6 +1023,15 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 						stringConfigValue(currentAccount.Metadata, "meta_subscription_state") != "verified" {
 						return errors.New("managed Meta health validation lost its credential or ownership fence")
 					}
+					if currentAccount.Channel == models.ChannelMessenger &&
+						!metaregistry.MessengerBusinessAuthorityCurrent(
+							currentAccount.Metadata,
+							currentAccount.ExternalAccountID,
+							oauth.ID,
+							oauth.Version,
+						) {
+						return errors.New("managed Messenger health validation lost its business-authority fence")
+					}
 					metadata := cloneJSONB(currentAccount.Metadata)
 					metadata["meta_health_checked_at"] = now.Format(time.RFC3339Nano)
 					metadata["meta_health_oauth_credential_id"] = oauth.ID.String()

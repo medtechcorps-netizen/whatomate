@@ -518,7 +518,9 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 		request.BusinessID != freshPlatform.ClientBusinessID {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "The Business Portfolio no longer matches the authorized integration", nil, "")
 	}
-	selected, err = a.revalidateMetaMessengerOwnedPage(ctx, orgID, userToken, freshUserInspection, selected)
+	selected, err = a.revalidateMetaMessengerOwnedPage(
+		ctx, orgID, userToken, freshUserInspection, freshPlatform, selected,
+	)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "The selected Page is no longer owned or accessible", nil, "")
 	}
@@ -558,7 +560,8 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 			result, rotateErr = scoped.rotateMetaMessengerBinding(metaMessengerRotateInput{
 				AccountID: reconnectID, OrganizationID: orgID, UserID: userID,
 				Page: selected, Platform: freshPlatform, Inspection: freshUserInspection,
-				PageToken: pageToken, AuthorityToken: userToken, TokenExpiresAt: tokenExpiry,
+				BusinessAuthorityVerified: freshPlatform.TokenKind == metaMessengerTokenKindSystemUser,
+				PageToken:                 pageToken, AuthorityToken: userToken, TokenExpiresAt: tokenExpiry,
 				SubscriptionOperationID: operationID, SubscriptionOperationExpiresAt: operationExpiresAt,
 			})
 			return rotateErr
@@ -569,11 +572,12 @@ func (a *App) SelectMetaMessengerOnboarding(r *fastglue.Request) error {
 			Name:              metaMessengerAccountName(selected.PageName, selected.PageID),
 			ExternalAccountID: selected.PageID, WebhookApp: "messenger",
 			PlatformAppID: settings.AppID, MetaBusinessID: selected.BusinessID,
-			AuthorizingMetaUserID:  freshPlatform.UserID,
-			AuthorizationTokenKind: freshPlatform.TokenKind,
-			GrantedScopes:          freshUserInspection.Scopes, AccessToken: pageToken,
+			AuthorizingMetaUserID:     freshPlatform.UserID,
+			AuthorizationTokenKind:    freshPlatform.TokenKind,
+			BusinessAuthorityVerified: freshPlatform.TokenKind == metaMessengerTokenKindSystemUser,
+			GrantedScopes:             freshUserInspection.Scopes, AccessToken: pageToken,
 			AuthorityToken: userToken,
-			TokenExpiresAt: tokenExpiry, OwnershipCheckedAt: pageInspection.CheckedAt,
+			TokenExpiresAt: tokenExpiry, OwnershipCheckedAt: selected.OwnershipVerifiedAt,
 			ReReplyBaseURL: settings.ReReplyBaseURL, RelayBaseURL: settings.RelayBaseURL,
 			SubscriptionOperationID: operationID, SubscriptionOperationExpiresAt: operationExpiresAt,
 		})
@@ -821,6 +825,7 @@ type metaMessengerRotateInput struct {
 	Page                              metaMessengerStoredPage
 	Platform                          metaMessengerPlatformUser
 	Inspection                        metaMessengerTokenInspection
+	BusinessAuthorityVerified         bool
 	PageToken                         string
 	AuthorityToken                    string
 	TokenExpiresAt                    *time.Time
@@ -950,8 +955,21 @@ func (a *App) rotateMetaMessengerBinding(input metaMessengerRotateInput) (metaRe
 		return metaRegistryProvisionResult{}, metaregistry.ErrInvalidRequest
 	}
 	input.Platform.TokenKind = strings.ToUpper(strings.TrimSpace(input.Platform.TokenKind))
+	inspectionTokenKind := strings.ToUpper(strings.TrimSpace(input.Inspection.Type))
 	if input.Platform.TokenKind != metaMessengerTokenKindSystemUser &&
 		input.Platform.TokenKind != metaMessengerTokenKindUser {
+		return metaRegistryProvisionResult{}, metaregistry.ErrInvalidRequest
+	}
+	if inspectionTokenKind != input.Platform.TokenKind ||
+		strings.TrimSpace(input.Inspection.UserID) != strings.TrimSpace(input.Platform.UserID) ||
+		(input.Platform.TokenKind == metaMessengerTokenKindSystemUser &&
+			strings.TrimSpace(input.Platform.ClientBusinessID) != strings.TrimSpace(input.Page.BusinessID)) {
+		return metaRegistryProvisionResult{}, metaregistry.ErrInvalidRequest
+	}
+	if (input.Platform.TokenKind == metaMessengerTokenKindSystemUser &&
+		!input.BusinessAuthorityVerified) ||
+		(input.Platform.TokenKind == metaMessengerTokenKindUser &&
+			input.BusinessAuthorityVerified) {
 		return metaRegistryProvisionResult{}, metaregistry.ErrInvalidRequest
 	}
 	if err := a.DB.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -968,7 +986,10 @@ func (a *App) rotateMetaMessengerBinding(input metaMessengerRotateInput) (metaRe
 	}
 	now := time.Now().UTC()
 	if input.Inspection.CheckedAt.IsZero() || input.Inspection.CheckedAt.Before(now.Add(-10*time.Minute)) ||
-		input.Inspection.CheckedAt.After(now.Add(time.Minute)) {
+		input.Inspection.CheckedAt.After(now.Add(time.Minute)) ||
+		input.Page.OwnershipVerifiedAt.IsZero() ||
+		input.Page.OwnershipVerifiedAt.Before(input.Inspection.CheckedAt) ||
+		input.Page.OwnershipVerifiedAt.After(now.Add(time.Minute)) {
 		return metaRegistryProvisionResult{}, metaregistry.ErrInvalidRequest
 	}
 	if !metaMessengerSubscriptionOperationAvailable(account.Metadata, now) {
@@ -1031,7 +1052,7 @@ func (a *App) rotateMetaMessengerBinding(input metaMessengerRotateInput) (metaRe
 		Version:        nextOAuthVersion,
 		CredentialBlob: models.JSONB{"access_token": encryptedToken, "authority_token": encryptedAuthorityToken},
 		Status:         models.ChannelCredentialStatusActive, KeyVersion: "app:v1",
-		ExpiresAt: input.TokenExpiresAt, LastValidatedAt: &input.Inspection.CheckedAt, Metadata: models.JSONB{},
+		ExpiresAt: input.TokenExpiresAt, LastValidatedAt: &input.Page.OwnershipVerifiedAt, Metadata: models.JSONB{},
 	}
 	if err := a.DB.Create(&oauth).Error; err != nil {
 		return metaRegistryProvisionResult{}, err
@@ -1084,10 +1105,32 @@ func (a *App) rotateMetaMessengerBinding(input metaMessengerRotateInput) (metaRe
 	}
 	metadata := cloneJSONB(account.Metadata)
 	metadata["meta_ownership_state"] = metaregistry.OwnershipVerified
-	metadata["meta_ownership_checked_at"] = input.Inspection.CheckedAt.UTC().Format(time.RFC3339Nano)
+	metadata["meta_ownership_checked_at"] = input.Page.OwnershipVerifiedAt.UTC().Format(time.RFC3339Nano)
 	metadata["meta_authorizing_user_id"] = input.Platform.UserID
 	metadata[metaMessengerAuthorizationGrantedAtKey] = input.Inspection.CheckedAt.UTC().Format(time.RFC3339Nano)
 	metadata["meta_granted_scopes"] = append([]string(nil), input.Inspection.Scopes...)
+	clearMetaMessengerBusinessAuthorityEvidence(metadata)
+	if input.Platform.TokenKind == metaMessengerTokenKindSystemUser &&
+		input.Inspection.BusinessEdgeProofRequired {
+		setMetaMessengerBusinessAuthorityEvidence(
+			metadata,
+			stringConfigValue(account.Metadata, "meta_platform_app_id"),
+			input.Platform.UserID,
+			input.Page.BusinessID,
+			input.Page.PageID,
+			input.Page.OwnershipVerifiedAt,
+			oauth.ID,
+			oauth.Version,
+		)
+	}
+	if !metaregistry.MessengerBusinessAuthorityCurrent(
+		metadata,
+		account.ExternalAccountID,
+		oauth.ID,
+		oauth.Version,
+	) {
+		return metaRegistryProvisionResult{}, metaregistry.ErrInvalidRequest
+	}
 	metadata["meta_subscription_state"] = metaMessengerVerifyingSubscription
 	metadata["meta_activation_state"] = metaMessengerAwaitingRegistryState
 	markMetaMessengerAuthorizationDurability(metadata, input.Platform.TokenKind, input.TokenExpiresAt)

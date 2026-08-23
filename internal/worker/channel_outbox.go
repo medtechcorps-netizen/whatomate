@@ -854,7 +854,7 @@ func (w *Worker) managedMetaChannelOutboxRuntimeAllowed(
 	case models.ChannelInstagram:
 		return w.managedInstagramChannelOutboxRuntimeAllowed(account, generation, now)
 	case models.ChannelMessenger:
-		return w.managedMessengerChannelOutboxRuntimeAllowed(account)
+		return w.managedMessengerChannelOutboxRuntimeAllowed(account, generation)
 	default:
 		return false
 	}
@@ -975,6 +975,7 @@ func managedInstagramExactChannelURL(actual, expected string) bool {
 
 func (w *Worker) managedMessengerChannelOutboxRuntimeAllowed(
 	account *models.ChannelAccount,
+	generation managedMetaCredentialGeneration,
 ) bool {
 	settings := w.Config.MetaMessenger
 	if !settings.Enabled || !managedMetaCanonicalID(strings.TrimSpace(settings.AppID)) ||
@@ -982,13 +983,11 @@ func (w *Worker) managedMessengerChannelOutboxRuntimeAllowed(
 		channelOutboxText(account.Metadata["meta_webhook_app"]) != "messenger" ||
 		channelOutboxText(account.Metadata["meta_authorizing_user_id"]) == "" ||
 		channelOutboxText(account.Metadata["meta_business_id"]) == "" ||
-		!channelOutboxScopesInclude(
-			account.Metadata["meta_granted_scopes"],
-			"public_profile",
-			"pages_show_list",
-			"pages_messaging",
-			"pages_manage_metadata",
-			"business_management",
+		!metaregistry.MessengerBusinessAuthorityCurrent(
+			account.Metadata,
+			account.ExternalAccountID,
+			generation.OAuthID,
+			generation.OAuthVersion,
 		) {
 		return false
 	}

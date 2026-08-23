@@ -28,6 +28,22 @@ const (
 	ResolvePurposeWorker   = "worker"
 
 	ManagementModePlatformOAuth = "platform_oauth"
+
+	// MessengerBusinessAuthorityMetadataKey records the independently verified
+	// Business authority used when Meta omits the literal business_management
+	// label from a Business Integration System User debug-token response.
+	MessengerBusinessAuthorityMetadataKey = "meta_business_authority"
+	// MessengerBusinessAuthoritySystemUserExactEdges is written only after the
+	// exact client_business_id, assigned_pages, accounts, and owned_pages edges
+	// have all been revalidated for the selected Page.
+	MessengerBusinessAuthoritySystemUserExactEdges    = "bisu_exact_asset_edges_v1"
+	MessengerBusinessAuthorityCheckedAtMetadataKey    = "meta_business_authority_checked_at"
+	MessengerBusinessAuthorityOAuthIDMetadataKey      = "meta_business_authority_oauth_credential_id"
+	MessengerBusinessAuthorityOAuthVersionMetadataKey = "meta_business_authority_oauth_version"
+	MessengerBusinessAuthorityAppIDMetadataKey        = "meta_business_authority_app_id"
+	MessengerBusinessAuthorityUserIDMetadataKey       = "meta_business_authority_user_id"
+	MessengerBusinessAuthorityBusinessIDMetadataKey   = "meta_business_authority_business_id"
+	MessengerBusinessAuthorityPageIDMetadataKey       = "meta_business_authority_page_id"
 )
 
 var (
