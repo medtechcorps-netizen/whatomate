@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,6 +39,8 @@ type App struct {
 	WSHub             *websocket.Hub
 	Queue             queue.Queue
 	CampaignSubCancel context.CancelFunc
+	RealtimeSubCancel context.CancelFunc
+	RealtimeSourceID  string
 	// HTTPClient is a shared HTTP client with connection pooling for external API calls
 	HTTPClient *http.Client
 	// Assigner provides shared team-based agent assignment (used by both chat and call transfers)
@@ -64,6 +67,19 @@ type App struct {
 	// calls that must race a committed control-plane mutation. Production leaves
 	// it nil and always uses the concrete adapters below.
 	channelAdapterFactory func(*models.ChannelAccount) (channelapi.Adapter, error)
+	// afterCommit contains request-scoped side effects that must run only after
+	// the outer tenant transaction commits. It is never shared with the root App.
+	afterCommit       []func()
+	afterCommitScoped bool
+	// realtimeSourceOnce safely initializes RealtimeSourceID for independently
+	// constructed Apps used outside the normal server startup path.
+	realtimeSourceOnce sync.Once
+	// realtimeSubscriberLive gates /ready. Cross-replica invalidation is a
+	// required API correctness dependency, not an optional optimization.
+	realtimeSubscriberLive atomic.Bool
+	// realtimeSubscriber exposes the confirmed receive-loop liveness to /ready;
+	// the queue subscriber marks itself unavailable while it resubscribes.
+	realtimeSubscriber atomic.Pointer[queue.Subscriber]
 }
 
 // whatsAppClient returns the application's shared client when available. The
@@ -240,6 +256,21 @@ func (a *App) ReadyCheck(r *fastglue.Request) error {
 			"",
 		)
 	}
+	root := a.rootApp()
+	realtimeLive := root.realtimeSubscriberLive.Load()
+	if subscriber := root.realtimeSubscriber.Load(); subscriber != nil {
+		realtimeLive = subscriber.RealtimeLive()
+		root.realtimeSubscriberLive.Store(realtimeLive)
+	}
+	if !realtimeLive {
+		a.Log.Error("Realtime subscriber is not live")
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Realtime subscriber unavailable",
+			nil,
+			"",
+		)
+	}
 
 	heartbeatValue, err := a.Redis.Get(readinessContext, queue.WorkerHeartbeatKey).Result()
 	if err != nil {
@@ -265,8 +296,9 @@ func (a *App) ReadyCheck(r *fastglue.Request) error {
 	}
 
 	return r.SendEnvelope(map[string]string{
-		"status": "ready",
-		"worker": "ready",
+		"status":   "ready",
+		"worker":   "ready",
+		"realtime": "ready",
 	})
 }
 

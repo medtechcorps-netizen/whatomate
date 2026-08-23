@@ -124,7 +124,7 @@ func (a *App) ListChannelAccounts(r *fastglue.Request) error {
 
 	response := make([]ChannelAccountResponse, len(accounts))
 	for i := range accounts {
-		response[i] = channelAccountToResponse(&accounts[i])
+		response[i] = a.channelAccountToResponse(&accounts[i])
 	}
 	type outboxCount struct {
 		ChannelAccountID uuid.UUID
@@ -379,7 +379,7 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 	account.Credentials = []models.ChannelCredential{credential}
 
 	return r.SendEnvelope(CreateChannelAccountResponse{
-		Account:       channelAccountToResponse(&account),
+		Account:       a.channelAccountToResponse(&account),
 		InboundSecret: inboundSecret,
 		WebhookPath: fmt.Sprintf(
 			"/api/webhooks/channels/%s",
@@ -629,7 +629,7 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		); err != nil {
 			return err
 		}
-		response = channelAccountToResponse(account)
+		response = a.channelAccountToResponse(account)
 		return nil
 	})
 	if err != nil {
@@ -777,10 +777,10 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 	var managedInstagramValidationResult channelapi.AccountValidationResult
 	var managedInstagramValidationErr error
 	managedInstagramValidationPerformed := false
-	if err := database.WithTenantReadCommitted(
-		a.rootApp().DB,
+	if err := a.withCommittedTenantReadCommittedApp(
 		orgID,
-		func(tx *gorm.DB) error {
+		func(scoped *App) error {
+			tx := scoped.DB
 			if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
 				return err
 			}
@@ -899,10 +899,10 @@ func (a *App) TestChannelAccount(r *fastglue.Request) error {
 	now := canonicalChannelHealthTimestamp(time.Now())
 	var oldAccount models.ChannelAccount
 
-	if err := database.WithTenantReadCommitted(
-		a.rootApp().DB,
+	if err := a.withCommittedTenantReadCommittedApp(
 		orgID,
-		func(tx *gorm.DB) error {
+		func(scoped *App) error {
+			tx := scoped.DB
 			if err := lockChannelAIOrganizationScopeTx(tx, orgID); err != nil {
 				return err
 			}
@@ -1428,6 +1428,26 @@ func channelAccountToResponse(account *models.ChannelAccount) ChannelAccountResp
 		CreatedAt:                              account.CreatedAt,
 		UpdatedAt:                              account.UpdatedAt,
 	}
+}
+
+// channelAccountToResponse applies deployment-owned rollout policy to the
+// otherwise persisted provider capabilities. The direct-reply marker is never
+// persisted; clients see it only when the same tenant gate enforced by the
+// endpoint is released.
+func (a *App) channelAccountToResponse(account *models.ChannelAccount) ChannelAccountResponse {
+	response := channelAccountToResponse(account)
+	if account != nil && account.Channel == models.ChannelWhatsApp &&
+		account.Provider == channelapi.LegacyMetaProvider {
+		if a.legacyWhatsAppReplyEnabled(account.OrganizationID) {
+			if response.Capabilities == nil {
+				response.Capabilities = models.JSONB{}
+			}
+			response.Capabilities["legacy_text_reply_endpoint"] = true
+		} else {
+			delete(response.Capabilities, "legacy_text_reply_endpoint")
+		}
+	}
+	return response
 }
 
 func metaMessengerSubscriptionReconciliationRequired(account *models.ChannelAccount) bool {

@@ -69,7 +69,7 @@ func (a *App) ApproveMetaInstagramActivation(r *fastglue.Request) error {
 	}
 	return r.SendEnvelope(map[string]any{
 		"activated": true,
-		"account":   channelAccountToResponse(&activated),
+		"account":   a.channelAccountToResponse(&activated),
 	})
 }
 

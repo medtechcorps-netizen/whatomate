@@ -17,6 +17,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/threadsreview"
 	appwebsocket "github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/valyala/fasthttp"
@@ -499,18 +500,25 @@ func (a *App) RelayChannelWebhook(r *fastglue.Request) error {
 		)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Webhook processing failed", nil, "")
 	}
-	if a.WSHub != nil {
-		// The event carries no provider payload. It only asks authenticated
-		// clients in this tenant to catch up from the canonical API.
-		a.WSHub.BroadcastToOrg(orgID, appwebsocket.WSMessage{
-			Type: "channel_sync",
-			Payload: map[string]any{
-				"channel_account_id": account.ID,
-				"event_count":        len(events),
-				"occurred_at":        time.Now().UTC(),
-			},
-		})
-	}
+	// The canonical writes above have committed. Publish an identifier-only
+	// invalidation across replicas and retain the legacy local event shape for
+	// clients already connected to this process.
+	accountID := account.ID
+	occurredAt := time.Now().UTC()
+	a.publishRealtimeEvent(queue.RealtimeEvent{
+		OrganizationID:   orgID,
+		Kind:             queue.RealtimeEventConversationChanged,
+		ChannelAccountID: &accountID,
+		EventCount:       len(events),
+		OccurredAt:       occurredAt,
+	}, &appwebsocket.WSMessage{
+		Type: "channel_sync",
+		Payload: map[string]any{
+			"channel_account_id": account.ID,
+			"event_count":        len(events),
+			"occurred_at":        occurredAt,
+		},
+	})
 
 	return r.SendEnvelope(map[string]any{
 		"accepted":    true,

@@ -3,6 +3,10 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -13,7 +17,85 @@ import (
 const (
 	// CampaignStatsChannel is the Redis pub/sub channel for campaign stats updates
 	CampaignStatsChannel = "whatomate:campaign_stats"
+	// RealtimeChannel carries tenant-scoped invalidation hints between workers and
+	// API replicas. PostgreSQL remains canonical; message bodies never use it.
+	RealtimeChannel = "whatomate:realtime:v1"
+
+	realtimeSubscriberPingInterval = 5 * time.Second
+	realtimeSubscriberPingTimeout  = 2 * time.Second
+	realtimeSubscriberRetryMin     = 100 * time.Millisecond
+	realtimeSubscriberRetryMax     = 2 * time.Second
 )
+
+// RealtimeEventKind identifies which canonical data clients should refresh.
+type RealtimeEventKind string
+
+const (
+	RealtimeEventMessageCreated       RealtimeEventKind = "message_created"
+	RealtimeEventMessageStatusChanged RealtimeEventKind = "message_status_changed"
+	RealtimeEventConversationChanged  RealtimeEventKind = "conversation_changed"
+)
+
+// RealtimeEvent is a provider-neutral invalidation hint. It contains only
+// tenant-scoped identifiers, never customer content or provider payloads.
+type RealtimeEvent struct {
+	EventID          uuid.UUID         `json:"event_id"`
+	OrganizationID   uuid.UUID         `json:"organization_id"`
+	SourceID         string            `json:"source_id,omitempty"`
+	Kind             RealtimeEventKind `json:"kind"`
+	ChannelAccountID *uuid.UUID        `json:"channel_account_id,omitempty"`
+	ConversationID   *uuid.UUID        `json:"conversation_id,omitempty"`
+	ContactID        *uuid.UUID        `json:"contact_id,omitempty"`
+	MessageID        *uuid.UUID        `json:"message_id,omitempty"`
+	Status           string            `json:"status,omitempty"`
+	EventCount       int               `json:"event_count,omitempty"`
+	OccurredAt       time.Time         `json:"occurred_at"`
+}
+
+func validateRealtimeEventScope(event *RealtimeEvent) error {
+	if event == nil {
+		return errors.New("realtime event is required")
+	}
+	if event.OrganizationID == uuid.Nil {
+		return errors.New("realtime event organization is required")
+	}
+	switch event.Kind {
+	case RealtimeEventMessageCreated,
+		RealtimeEventMessageStatusChanged,
+		RealtimeEventConversationChanged:
+	default:
+		return errors.New("realtime event kind is invalid")
+	}
+	return nil
+}
+
+func prepareRealtimeEvent(event *RealtimeEvent) error {
+	if err := validateRealtimeEventScope(event); err != nil {
+		return err
+	}
+	if event.EventID == uuid.Nil {
+		event.EventID = uuid.New()
+	}
+	if event.OccurredAt.IsZero() {
+		event.OccurredAt = time.Now().UTC()
+	} else {
+		event.OccurredAt = event.OccurredAt.UTC()
+	}
+	return nil
+}
+
+func validateRealtimeEvent(event *RealtimeEvent) error {
+	if err := validateRealtimeEventScope(event); err != nil {
+		return err
+	}
+	if event.EventID == uuid.Nil {
+		return errors.New("realtime event ID is required")
+	}
+	if event.OccurredAt.IsZero() {
+		return errors.New("realtime event occurrence time is required")
+	}
+	return nil
+}
 
 // CampaignStatsUpdate represents a campaign stats update message
 type CampaignStatsUpdate struct {
@@ -56,11 +138,41 @@ func (p *Publisher) PublishCampaignStats(ctx context.Context, update *CampaignSt
 	return nil
 }
 
+// PublishRealtime publishes a tenant-scoped canonical-data invalidation hint.
+func (p *Publisher) PublishRealtime(ctx context.Context, event *RealtimeEvent) error {
+	if err := prepareRealtimeEvent(event); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	if p == nil || p.client == nil {
+		return errors.New("realtime publisher is unavailable")
+	}
+	if err := p.client.Publish(ctx, RealtimeChannel, payload).Err(); err != nil {
+		p.log.Error(
+			"Failed to publish realtime event",
+			"error", err,
+			"event_id", event.EventID,
+			"organization_id", event.OrganizationID,
+			"kind", event.Kind,
+		)
+		return err
+	}
+	return nil
+}
+
 // Subscriber subscribes to Redis pub/sub channels
 type Subscriber struct {
-	client *redis.Client
-	log    logf.Logger
-	pubsub *redis.PubSub
+	client     *redis.Client
+	log        logf.Logger
+	pubsubMu   sync.Mutex
+	pubsub     *redis.PubSub
+	done       chan struct{}
+	doneOnce   sync.Once
+	live       atomic.Bool
+	reconnects atomic.Uint64
 }
 
 // NewSubscriber creates a new Redis subscriber
@@ -74,10 +186,11 @@ func NewSubscriber(client *redis.Client, log logf.Logger) *Subscriber {
 // SubscribeCampaignStats subscribes to campaign stats updates
 // The handler is called for each received update
 func (s *Subscriber) SubscribeCampaignStats(ctx context.Context, handler func(update *CampaignStatsUpdate)) error {
-	s.pubsub = s.client.Subscribe(ctx, CampaignStatsChannel)
+	pubsub := s.client.Subscribe(ctx, CampaignStatsChannel)
+	s.setPubSub(pubsub)
 
 	// Wait for subscription confirmation
-	_, err := s.pubsub.Receive(ctx)
+	_, err := pubsub.Receive(ctx)
 	if err != nil {
 		return err
 	}
@@ -85,7 +198,7 @@ func (s *Subscriber) SubscribeCampaignStats(ctx context.Context, handler func(up
 	s.log.Info("Subscribed to campaign stats channel")
 
 	// Start receiving messages
-	ch := s.pubsub.Channel()
+	ch := pubsub.Channel()
 	go func() {
 		for {
 			select {
@@ -112,10 +225,167 @@ func (s *Subscriber) SubscribeCampaignStats(ctx context.Context, handler func(up
 	return nil
 }
 
+// SubscribeRealtime subscribes an API replica to tenant-scoped invalidation
+// hints. Invalid or unscoped messages are discarded before reaching the hub.
+func (s *Subscriber) SubscribeRealtime(ctx context.Context, handler func(event *RealtimeEvent)) error {
+	if s == nil || s.client == nil {
+		return errors.New("realtime subscriber is unavailable")
+	}
+	if handler == nil {
+		return errors.New("realtime subscriber handler is required")
+	}
+	pubsub, err := s.confirmRealtimeSubscription(ctx)
+	if err != nil {
+		return err
+	}
+	s.setPubSub(pubsub)
+
+	s.log.Info("Subscribed to realtime channel")
+	s.done = make(chan struct{})
+	s.live.Store(true)
+	go s.runRealtimeSubscriber(ctx, pubsub, handler)
+	return nil
+}
+
+func (s *Subscriber) confirmRealtimeSubscription(ctx context.Context) (*redis.PubSub, error) {
+	pubsub := s.client.Subscribe(ctx, RealtimeChannel)
+	if _, err := pubsub.Receive(ctx); err != nil {
+		_ = pubsub.Close()
+		return nil, err
+	}
+	return pubsub, nil
+}
+
+func (s *Subscriber) runRealtimeSubscriber(
+	ctx context.Context,
+	pubsub *redis.PubSub,
+	handler func(event *RealtimeEvent),
+) {
+	defer func() {
+		s.live.Store(false)
+		s.doneOnce.Do(func() { close(s.done) })
+	}()
+
+	for {
+		ch := pubsub.Channel()
+		pingTicker := time.NewTicker(realtimeSubscriberPingInterval)
+		interrupted := false
+		for !interrupted {
+			select {
+			case <-ctx.Done():
+				pingTicker.Stop()
+				s.log.Info("Realtime subscriber shutting down")
+				return
+			case <-pingTicker.C:
+				pingContext, cancelPing := context.WithTimeout(ctx, realtimeSubscriberPingTimeout)
+				pingErr := pubsub.Ping(pingContext)
+				cancelPing()
+				if pingErr != nil {
+					s.log.Warn("Realtime subscription health check failed", "error", pingErr)
+					interrupted = true
+				}
+			case msg, ok := <-ch:
+				if !ok {
+					s.log.Warn("Realtime subscription channel closed unexpectedly")
+					interrupted = true
+					continue
+				}
+				var event RealtimeEvent
+				if err := json.Unmarshal([]byte(msg.Payload), &event); err != nil {
+					s.log.Error("Failed to unmarshal realtime event", "error", err)
+					continue
+				}
+				if err := validateRealtimeEvent(&event); err != nil {
+					s.log.Warn("Discarding invalid realtime event", "error", err)
+					continue
+				}
+				func() {
+					defer func() {
+						if recovered := recover(); recovered != nil {
+							s.log.Error("Realtime subscriber handler panicked", "panic", recovered)
+						}
+					}()
+					handler(&event)
+				}()
+			}
+		}
+		pingTicker.Stop()
+		s.live.Store(false)
+		_ = pubsub.Close()
+		if ctx.Err() != nil {
+			return
+		}
+
+		retryDelay := realtimeSubscriberRetryMin
+		for {
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			replacement, err := s.confirmRealtimeSubscription(ctx)
+			if err == nil {
+				pubsub = replacement
+				s.setPubSub(replacement)
+				s.reconnects.Add(1)
+				s.live.Store(true)
+				s.log.Info("Realtime subscription recovered", "reconnect_count", s.reconnects.Load())
+				break
+			}
+			s.log.Warn("Realtime subscription recovery failed", "error", err, "retry_in", retryDelay)
+			if retryDelay < realtimeSubscriberRetryMax {
+				retryDelay *= 2
+				if retryDelay > realtimeSubscriberRetryMax {
+					retryDelay = realtimeSubscriberRetryMax
+				}
+			}
+		}
+	}
+}
+
+func (s *Subscriber) setPubSub(pubsub *redis.PubSub) {
+	s.pubsubMu.Lock()
+	s.pubsub = pubsub
+	s.pubsubMu.Unlock()
+}
+
+// RealtimeLive reports whether the confirmed realtime subscription receive
+// loop is still running.
+func (s *Subscriber) RealtimeLive() bool {
+	return s != nil && s.live.Load()
+}
+
+// RealtimeReconnectCount exposes confirmed receive-loop recoveries for health
+// diagnostics and interruption tests.
+func (s *Subscriber) RealtimeReconnectCount() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.reconnects.Load()
+}
+
+// Done is closed when the realtime receive loop exits.
+func (s *Subscriber) Done() <-chan struct{} {
+	if s == nil || s.done == nil {
+		closed := make(chan struct{})
+		close(closed)
+		return closed
+	}
+	return s.done
+}
+
 // Close closes the subscriber
 func (s *Subscriber) Close() error {
-	if s.pubsub != nil {
-		return s.pubsub.Close()
+	if s == nil {
+		return nil
 	}
-	return nil
+	s.pubsubMu.Lock()
+	pubsub := s.pubsub
+	s.pubsubMu.Unlock()
+	if pubsub == nil {
+		return nil
+	}
+	return pubsub.Close()
 }

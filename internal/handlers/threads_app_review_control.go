@@ -7,7 +7,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
-	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/threadsreview"
 	"github.com/valyala/fasthttp"
@@ -57,7 +56,8 @@ func (a *App) ApproveOrganizationThreadsAppReview(r *fastglue.Request) error {
 	}
 
 	var response approveThreadsAppReviewResponse
-	err = database.WithTenant(a.rootApp().DB, targetOrgID, func(tx *gorm.DB) error {
+	err = a.WithCommittedTenantApp(targetOrgID, func(scoped *App) error {
+		tx := scoped.DB
 		var organization models.Organization
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ?", targetOrgID).

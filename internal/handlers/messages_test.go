@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,8 +24,11 @@ import (
 // mockWhatsAppServer creates a mock WhatsApp API server for testing.
 // It handles various endpoints and returns configurable responses.
 type mockWhatsAppServer struct {
+	mu            sync.Mutex
 	server        *httptest.Server
 	sentMessages  []map[string]any
+	sentPaths     []string
+	sentAuth      []string
 	uploadedMedia []map[string]any
 	returnError   bool
 	errorMessage  string
@@ -41,6 +45,12 @@ func newMockWhatsAppServer() *mockWhatsAppServer {
 	}
 
 	m.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v18.0/") && strings.HasSuffix(r.URL.Path, "/messages") {
+			m.mu.Lock()
+			m.sentPaths = append(m.sentPaths, r.URL.Path)
+			m.sentAuth = append(m.sentAuth, r.Header.Get("Authorization"))
+			m.mu.Unlock()
+		}
 		// Check authorization
 		auth := r.Header.Get("Authorization")
 		if auth != "Bearer test-token" {
@@ -86,12 +96,26 @@ func (m *mockWhatsAppServer) handleMessages(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	m.mu.Lock()
 	m.sentMessages = append(m.sentMessages, body)
+	m.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"messages": []map[string]string{{"id": m.nextMessageID}},
 	})
+}
+
+func (m *mockWhatsAppServer) sentMessageCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sentMessages)
+}
+
+func (m *mockWhatsAppServer) messageRequestSnapshot() ([]string, []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.sentPaths...), append([]string(nil), m.sentAuth...)
 }
 
 func (m *mockWhatsAppServer) handleMediaUpload(w http.ResponseWriter, r *http.Request) {

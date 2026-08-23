@@ -1279,8 +1279,9 @@ func disconnectLockedThreadsChannelAccounts(
 			messageIDs = append(messageIDs, *cancelledJobs[index].MessageID)
 		}
 	}
+	var terminalMessageCount int64
 	if len(messageIDs) > 0 {
-		if err := tx.Model(&models.Message{}).
+		messageUpdate := tx.Model(&models.Message{}).
 			Where(
 				"organization_id = ? AND id IN ? AND status = ?",
 				orgID,
@@ -1291,9 +1292,11 @@ func disconnectLockedThreadsChannelAccounts(
 				"status":        models.MessageStatusFailed,
 				"error_message": "Threads integration disconnected before delivery",
 				"updated_at":    now,
-			}).Error; err != nil {
-			return err
+			})
+		if messageUpdate.Error != nil {
+			return messageUpdate.Error
 		}
+		terminalMessageCount = messageUpdate.RowsAffected
 	}
 
 	credentialQuery := tx.Model(&models.ChannelCredential{}).
@@ -1309,12 +1312,17 @@ func disconnectLockedThreadsChannelAccounts(
 	if len(credentialKinds) > 0 {
 		credentialQuery = credentialQuery.Where("kind IN ?", credentialKinds)
 	}
-	return credentialQuery.Updates(map[string]any{
+	credentialUpdate := credentialQuery.Updates(map[string]any{
 		"status":     models.ChannelCredentialStatusRevoked,
 		"revoked_at": now,
 		"rotated_at": now,
 		"updated_at": now,
-	}).Error
+	})
+	if credentialUpdate.Error != nil {
+		return credentialUpdate.Error
+	}
+	publishTerminalMessageBatchTx(tx, orgID, nil, nil, terminalMessageCount)
+	return nil
 }
 
 func lockOrCreateIntegrationRow(tx *gorm.DB, orgID, userID uuid.UUID, provider string) (*models.ProviderIntegration, bool, error) {
