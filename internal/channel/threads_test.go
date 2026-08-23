@@ -165,6 +165,41 @@ func TestThreadsAdapterRejectsMissingRequiredPermission(t *testing.T) {
 	assert.Equal(t, "permissions_missing", providerErr.Code)
 }
 
+func TestThreadsAdapterManagedPermissionInspectionRequiresExactApp(t *testing.T) {
+	now := time.Date(2026, time.August, 3, 8, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload := threadsTestDebugTokenPayload("200000000000001", now.Add(time.Hour))
+		data := payload["data"].(map[string]any)
+		data["app_id"] = "123456789012345"
+		_ = json.NewEncoder(w).Encode(payload)
+	}))
+	defer server.Close()
+	adapter := NewThreadsAdapter(server.Client(), threadsTestEncryptionKey)
+	adapter.apiBaseURL = server.URL
+	adapter.now = func() time.Time { return now }
+
+	snapshot, err := adapter.InspectTokenPermissionsForApp(
+		context.Background(),
+		"threads-token",
+		"200000000000001",
+		"123456789012345",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "123456789012345", snapshot.AppID)
+	assert.Equal(t, "200000000000001", snapshot.UserID)
+
+	_, err = adapter.InspectTokenPermissionsForApp(
+		context.Background(),
+		"threads-token",
+		"200000000000001",
+		"999999999999999",
+	)
+	require.Error(t, err)
+	var providerErr *ProviderError
+	require.ErrorAs(t, err, &providerErr)
+	assert.Equal(t, "token_invalid", providerErr.Code)
+}
+
 func TestThreadsAdapterVerifiesWebhookSignatureAndChallenge(t *testing.T) {
 	adapter := NewThreadsWebhookAdapter(nil, threadsTestEncryptionKey, "threads-app-secret", "verify-token-at-least-sixteen")
 	body := []byte(`{"app_id":"threads-app-1","topic":"moderate","target_id":"123","values":{"field":"replies","value":{"id":"456"}}}`)

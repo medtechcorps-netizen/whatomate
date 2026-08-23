@@ -19,6 +19,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/storage"
+	"github.com/shridarpatil/whatomate/internal/threadsplatform"
 	"github.com/shridarpatil/whatomate/internal/tts"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
@@ -50,6 +51,9 @@ type App struct {
 	S3Client *storage.S3Client
 	// ObjectStore persists tenant media independently of any app replica.
 	ObjectStore storage.ObjectStore
+	// ThreadsManagedRuntime is available only after startup has validated the
+	// deployment policy and the durable platform compliance organization.
+	ThreadsManagedRuntime *threadsplatform.ValidatedRuntime
 	// wg tracks background goroutines for graceful shutdown
 	wg sync.WaitGroup
 	// root points from a request-scoped clone back to the long-lived App.

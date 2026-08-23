@@ -218,6 +218,9 @@ enabled = false
 allowed_organization_ids = ""
 allow_all_organizations = false
 compliance_organization_id = ""
+# Deployment-owned HTTPS origin. The managed callback path is derived by the
+# server and is never accepted from a clinic or tenant row.
+rereply_base_url = ""
 
 # The first deployment uses this env-compatible single-app object. Its key is
 # persisted as the shard abstraction; a future release may instead use the

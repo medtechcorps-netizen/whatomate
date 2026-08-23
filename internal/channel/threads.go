@@ -53,6 +53,7 @@ func RequiredThreadsScopes() []string {
 
 // ThreadsPermissionSnapshot contains only non-secret debug-token metadata.
 type ThreadsPermissionSnapshot struct {
+	AppID               string
 	UserID              string
 	Scopes              []string
 	ExpiresAt           *time.Time
@@ -567,13 +568,32 @@ func (a *ThreadsAdapter) InspectTokenPermissions(
 	ctx context.Context,
 	accessToken, expectedUserID string,
 ) (ThreadsPermissionSnapshot, error) {
+	return a.inspectTokenPermissions(ctx, accessToken, expectedUserID, "")
+}
+
+// InspectTokenPermissionsForApp additionally fences the app-scoped subject to
+// the immutable deployment-owned Threads App ID. BYO callers retain the
+// existing method because their dedicated-app row is already the authority.
+func (a *ThreadsAdapter) InspectTokenPermissionsForApp(
+	ctx context.Context,
+	accessToken, expectedUserID, expectedAppID string,
+) (ThreadsPermissionSnapshot, error) {
+	return a.inspectTokenPermissions(ctx, accessToken, expectedUserID, expectedAppID)
+}
+
+func (a *ThreadsAdapter) inspectTokenPermissions(
+	ctx context.Context,
+	accessToken, expectedUserID, expectedAppID string,
+) (ThreadsPermissionSnapshot, error) {
 	accessToken = strings.TrimSpace(accessToken)
 	expectedUserID = strings.TrimSpace(expectedUserID)
+	expectedAppID = strings.TrimSpace(expectedAppID)
 	if accessToken == "" || expectedUserID == "" {
 		return ThreadsPermissionSnapshot{}, threadsProviderError("debug_token", "invalid_request", "Threads token identity is missing", false, nil)
 	}
 	var response struct {
 		Data struct {
+			AppID               threadsWebhookID `json:"app_id"`
 			Type                string           `json:"type"`
 			IsValid             bool             `json:"is_valid"`
 			UserID              threadsWebhookID `json:"user_id"`
@@ -589,8 +609,10 @@ func (a *ThreadsAdapter) InspectTokenPermissions(
 	if err != nil {
 		return ThreadsPermissionSnapshot{}, threadsProviderError("debug_token", "permission_check_failed", "Threads permissions could not be verified", true, err)
 	}
+	appID := strings.TrimSpace(string(response.Data.AppID))
 	if !response.Data.IsValid || !strings.EqualFold(strings.TrimSpace(response.Data.Type), "USER") ||
-		strings.TrimSpace(string(response.Data.UserID)) != expectedUserID {
+		strings.TrimSpace(string(response.Data.UserID)) != expectedUserID ||
+		(expectedAppID != "" && appID != expectedAppID) {
 		return ThreadsPermissionSnapshot{}, threadsProviderError("debug_token", "token_invalid", "Threads authorization is invalid or belongs to a different account", false, nil)
 	}
 	granted := make(map[string]struct{}, len(response.Data.Scopes))
@@ -635,6 +657,7 @@ func (a *ThreadsAdapter) InspectTokenPermissions(
 	}
 	sort.Strings(verifiedScopes)
 	return ThreadsPermissionSnapshot{
+		AppID:               appID,
 		UserID:              expectedUserID,
 		Scopes:              verifiedScopes,
 		ExpiresAt:           expiresAt,

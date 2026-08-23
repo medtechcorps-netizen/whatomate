@@ -287,7 +287,10 @@ function metaChannelConnectionRequirements(
   integration: IntegrationState,
 ): IntegrationReadinessItem[] {
   const requirements: Array<{
-    channel: Extract<IntegrationChannel, "whatsapp" | "instagram" | "messenger">;
+    channel: Extract<
+      IntegrationChannel,
+      "whatsapp" | "instagram" | "messenger"
+    >;
     label: string;
     emptyDetail: string;
   }> = [
@@ -429,61 +432,111 @@ const builders: Record<
         "Calling needs no additional client secret: it reuses the Phone number ID and access token on each WhatsApp account. Enable it per account; manage call behavior under Calling Settings.",
     },
   ],
-  threads: (integration) => [
-    configRequirement(
-      integration,
-      "app_id",
-      "Threads application ID",
-      "A dedicated Threads OAuth application is bound to this workspace and profile.",
-      "Add a dedicated Threads App ID from Meta for Developers; App IDs cannot be shared between ReReply workspaces.",
-    ),
-    httpsRedirectRequirement(integration, "redirect_uri", "OAuth redirect URI"),
-    secretRequirement(
-      integration,
-      "app_secret",
-      "Server-side app secret",
-      "Add the Threads App Secret for server-side token exchange.",
-    ),
-    secretRequirement(
-      integration,
-      "webhook_verify_token",
-      "Webhook verify token",
-      "Enter the same strong secret of at least 16 characters in the Meta Threads Webhooks callback setup.",
-    ),
-    reviewRequirement(
-      integration,
-      "app_review_status",
-      "Meta App Review",
-      "Meta",
-    ),
-    {
-      key: "oauth_authorization",
-      label: "Threads authorization",
-      state:
-        integration.oauth.supported && integration.oauth.available
-          ? "ready"
-          : "blocked",
-      detail:
-        integration.oauth.supported && integration.oauth.available
-          ? "OAuth authorization is available for a Threads account."
-          : integration.message ||
-            "Threads OAuth is unavailable until the server-side integration is configured.",
-    },
-    activationRequirement(integration),
-    connectionRequirement(
-      integration,
-      "Connected Threads account",
-      "Authorize this workspace's Threads account.",
-    ),
-    healthRequirement(integration),
-    {
-      key: "public_engagement_policy",
-      label: "Public-engagement safety policy",
-      state: "managed",
-      detail:
-        "Replies require an existing public reply or mention target. Threads direct messages and standalone posts remain unavailable.",
-    },
-  ],
+  threads: (integration) =>
+    integration.config?.management_mode === "platform_managed"
+      ? [
+          {
+            key: "managed_platform_application",
+            label: "ReReply managed application",
+            state: "managed",
+            detail:
+              "The Threads App ID, app secret, callback registration and Meta review evidence are controlled by ReReply and are never exposed to this workspace.",
+          },
+          {
+            key: "oauth_authorization",
+            label: "Threads authorization",
+            state: integration.oauth.available ? "ready" : "blocked",
+            detail: integration.oauth.available
+              ? "Connect or reconnect the workspace profile through the browser-bound managed authorization flow."
+              : integration.message ||
+                "Managed Threads authorization is unavailable on this server.",
+          },
+          {
+            key: "pending_activation",
+            label: "Platform activation",
+            state:
+              integration.config?.authorization_state === "pending_activation"
+                ? "prepared"
+                : "missing",
+            detail:
+              integration.config?.authorization_state === "pending_activation"
+                ? "Authorization is stored. A later platform phase must activate routing and provider delivery."
+                : "Authorize a Threads profile first; activation remains a separate platform-controlled phase.",
+          },
+          {
+            key: "managed_non_routable",
+            label: "Routing safety fence",
+            state: "managed",
+            detail:
+              "Managed accounts remain pending with inbound routing, webhooks, outbound replies and default-channel selection disabled.",
+          },
+          {
+            key: "public_engagement_policy",
+            label: "Public-engagement safety policy",
+            state: "managed",
+            detail:
+              "Only public replies and mentions are planned. Direct messages and standalone posts remain unavailable.",
+          },
+        ]
+      : [
+          configRequirement(
+            integration,
+            "app_id",
+            "Threads application ID",
+            "A dedicated Threads OAuth application is bound to this workspace and profile.",
+            "Add a dedicated Threads App ID from Meta for Developers; App IDs cannot be shared between ReReply workspaces.",
+          ),
+          httpsRedirectRequirement(
+            integration,
+            "redirect_uri",
+            "OAuth redirect URI",
+          ),
+          secretRequirement(
+            integration,
+            "app_secret",
+            "Server-side app secret",
+            "Add the Threads App Secret for server-side token exchange.",
+          ),
+          secretRequirement(
+            integration,
+            "webhook_verify_token",
+            "Webhook verify token",
+            "Enter the same strong secret of at least 16 characters in the Meta Threads Webhooks callback setup.",
+          ),
+          reviewRequirement(
+            integration,
+            "app_review_status",
+            "Meta App Review",
+            "Meta",
+          ),
+          {
+            key: "oauth_authorization",
+            label: "Threads authorization",
+            state:
+              integration.oauth.supported && integration.oauth.available
+                ? "ready"
+                : "blocked",
+            detail:
+              integration.oauth.supported && integration.oauth.available
+                ? "OAuth authorization is available for a Threads account."
+                : integration.message ||
+                  "Threads OAuth is unavailable until the server-side integration is configured.",
+          },
+          activationRequirement(integration),
+          connectionRequirement(
+            integration,
+            "Connected Threads account",
+            "Authorize this workspace's Threads account.",
+          ),
+          healthRequirement(integration),
+          {
+            key: "public_engagement_policy",
+            label: "Public-engagement safety policy",
+            state: "managed",
+            detail:
+              "Replies require an existing public reply or mention target. Threads direct messages and standalone posts remain unavailable.",
+          },
+        ],
   tiktok: (integration) => [
     configRequirement(
       integration,
