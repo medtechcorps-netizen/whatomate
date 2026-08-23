@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -740,60 +741,95 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 	platform metaMessengerPlatformUser,
 ) ([]metaMessengerBusinessSummary, []metaMessengerStoredPage, error) {
 	businessID := platform.ClientBusinessID
-	assignedPages, err := fetchMetaMessengerGraphList[metaMessengerGraphPageAccess](
-		a,
-		ctx,
-		url.PathEscape(platform.UserID)+"/assigned_pages",
-		url.Values{"fields": {"id,name,tasks"}},
-		accessToken,
-		metaMessengerGraphMaxPageAssets,
-	)
-	if err != nil {
-		return nil, nil, &metaMessengerRevalidationError{
-			Stage: metaMessengerRevalidationStageAssignedPages,
-			cause: err,
-		}
+	inventoryCtx, cancelInventory := context.WithCancel(ctx)
+	defer cancelInventory()
+
+	type inventoryFailure struct {
+		stage metaMessengerRevalidationStage
+		err   error
 	}
-	pageAccounts, err := fetchMetaMessengerGraphList[metaMessengerGraphPageAccess](
-		a,
-		ctx,
-		url.PathEscape(platform.UserID)+"/accounts",
-		url.Values{"fields": {"id,name,tasks,access_token"}},
-		accessToken,
-		metaMessengerGraphMaxPageAssets,
+	var (
+		assignedPages []metaMessengerGraphPageAccess
+		pageAccounts  []metaMessengerGraphPageAccess
+		ownedPages    []metaMessengerGraphBusinessPage
+		clientPages   []metaMessengerGraphBusinessPage
+		assignedErr   error
+		accountsErr   error
+		ownedErr      error
+		clientErr     error
+		inventoryWait sync.WaitGroup
+		failureMu     sync.Mutex
+		firstFailure  *inventoryFailure
 	)
-	if err != nil {
-		return nil, nil, &metaMessengerRevalidationError{
-			Stage: metaMessengerRevalidationStagePageAccounts,
-			cause: err,
-		}
+	runInventoryFetch := func(stage metaMessengerRevalidationStage, fetch func() error) {
+		inventoryWait.Add(1)
+		go func() {
+			defer inventoryWait.Done()
+			if err := fetch(); err != nil {
+				failureMu.Lock()
+				if firstFailure == nil {
+					firstFailure = &inventoryFailure{stage: stage, err: err}
+					cancelInventory()
+				}
+				failureMu.Unlock()
+			}
+		}()
 	}
-	ownedPages, err := fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
-		a,
-		ctx,
-		url.PathEscape(businessID)+"/owned_pages",
-		url.Values{"fields": {"id,name"}},
-		accessToken,
-		metaMessengerGraphMaxPageAssets,
-	)
-	if err != nil {
-		return nil, nil, &metaMessengerRevalidationError{
-			Stage: metaMessengerRevalidationStageOwnedPages,
-			cause: err,
-		}
-	}
-	clientPages := []metaMessengerGraphBusinessPage(nil)
-	if !inspection.BusinessEdgeProofRequired {
-		clientPages, err = fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
+	runInventoryFetch(metaMessengerRevalidationStageAssignedPages, func() error {
+		assignedPages, assignedErr = fetchMetaMessengerGraphList[metaMessengerGraphPageAccess](
 			a,
-			ctx,
-			url.PathEscape(businessID)+"/client_pages",
+			inventoryCtx,
+			url.PathEscape(platform.UserID)+"/assigned_pages",
+			url.Values{"fields": {"id,name,tasks"}},
+			accessToken,
+			metaMessengerGraphMaxPageAssets,
+		)
+		return assignedErr
+	})
+	runInventoryFetch(metaMessengerRevalidationStagePageAccounts, func() error {
+		pageAccounts, accountsErr = fetchMetaMessengerGraphList[metaMessengerGraphPageAccess](
+			a,
+			inventoryCtx,
+			url.PathEscape(platform.UserID)+"/accounts",
+			url.Values{"fields": {"id,name,tasks,access_token"}},
+			accessToken,
+			metaMessengerGraphMaxPageAssets,
+		)
+		return accountsErr
+	})
+	runInventoryFetch(metaMessengerRevalidationStageOwnedPages, func() error {
+		ownedPages, ownedErr = fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
+			a,
+			inventoryCtx,
+			url.PathEscape(businessID)+"/owned_pages",
 			url.Values{"fields": {"id,name"}},
 			accessToken,
 			metaMessengerGraphMaxPageAssets,
 		)
-		if err != nil {
-			return nil, nil, err
+		return ownedErr
+	})
+	if !inspection.BusinessEdgeProofRequired {
+		runInventoryFetch("", func() error {
+			clientPages, clientErr = fetchMetaMessengerGraphList[metaMessengerGraphBusinessPage](
+				a,
+				inventoryCtx,
+				url.PathEscape(businessID)+"/client_pages",
+				url.Values{"fields": {"id,name"}},
+				accessToken,
+				metaMessengerGraphMaxPageAssets,
+			)
+			return clientErr
+		})
+	}
+	inventoryWait.Wait()
+
+	if firstFailure != nil {
+		if firstFailure.stage == "" {
+			return nil, nil, firstFailure.err
+		}
+		return nil, nil, &metaMessengerRevalidationError{
+			Stage: firstFailure.stage,
+			cause: firstFailure.err,
 		}
 	}
 	// assigned_pages is the authority edge for this BISU: its tasks are the
@@ -855,8 +891,9 @@ func (a *App) discoverMetaMessengerSystemUserInventory(
 		}
 		encryptedToken := ""
 		if candidate.Selectable {
-			encryptedToken, err = appcrypto.Encrypt(account.AccessToken, a.integrationEncryptionKey())
-			if err != nil || !appcrypto.IsEncrypted(encryptedToken) {
+			var encryptErr error
+			encryptedToken, encryptErr = appcrypto.Encrypt(account.AccessToken, a.integrationEncryptionKey())
+			if encryptErr != nil || !appcrypto.IsEncrypted(encryptedToken) {
 				return nil, nil, errors.New("meta Page token could not be protected")
 			}
 		}

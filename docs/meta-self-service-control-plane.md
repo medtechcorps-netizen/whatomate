@@ -46,9 +46,11 @@ Keep both `[meta_registry].enabled` and
 
 1. Deploy queue reader schema 2 to every relay replica and confirm old workers
    are gone before allowing a dynamic producer.
-2. Set `server.write_timeout` to at least 120 seconds. Browser provider actions
-   use the same 120-second class of deadline; the provider phase itself is
-   bounded to 90 seconds.
+2. Set `server.write_timeout` to at least 120 seconds. The one-shot Messenger
+   authorization callback bounds all blocking database, Redis, and provider
+   work to 45 seconds, leaving response headroom beneath
+   [DigitalOcean's documented 60-second load-balancer idle timeout](https://docs.digitalocean.com/support/why-does-my-load-balancer-respond-with-a-504-gateway-timeout-error/).
+   Other browser provider operations remain bounded to 90 seconds.
 3. Configure the web encryption key, separate registry service and edge
    secrets, and an exact private registry resolve URL.
 4. Configure a dedicated managed Messenger app at both services. Prove the app
