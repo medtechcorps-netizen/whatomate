@@ -11,6 +11,7 @@ import (
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
+	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -25,6 +26,90 @@ func TestChannelOutboxBackoffIsBounded(t *testing.T) {
 	assert.Equal(t, 2*time.Second, channelOutboxBackoff(1))
 	assert.Equal(t, 4*time.Second, channelOutboxBackoff(2))
 	assert.Equal(t, time.Hour, channelOutboxBackoff(20))
+}
+
+func TestManagedMessengerRuntimeRequiresCurrentBusinessAuthority(t *testing.T) {
+	t.Parallel()
+
+	organizationID := uuid.New()
+	accountID := uuid.New()
+	oauthID := uuid.New()
+	checkedAt := time.Now().UTC().Truncate(time.Microsecond)
+	base := models.JSONB{
+		"meta_platform_app_id":          "100000000000001",
+		"meta_webhook_app":              "messenger",
+		"meta_authorizing_user_id":      "900000000000001",
+		"meta_business_id":              "200000000000001",
+		"meta_authorization_token_kind": "SYSTEM_USER",
+		"meta_ownership_checked_at":     checkedAt.Format(time.RFC3339Nano),
+		"meta_granted_scopes": []string{
+			"public_profile", "pages_show_list", "pages_manage_metadata", "pages_messaging",
+		},
+		metaregistry.MessengerBusinessAuthorityMetadataKey:             metaregistry.MessengerBusinessAuthoritySystemUserExactEdges,
+		metaregistry.MessengerBusinessAuthorityCheckedAtMetadataKey:    checkedAt.Format(time.RFC3339Nano),
+		metaregistry.MessengerBusinessAuthorityOAuthIDMetadataKey:      oauthID.String(),
+		metaregistry.MessengerBusinessAuthorityOAuthVersionMetadataKey: 2,
+		metaregistry.MessengerBusinessAuthorityAppIDMetadataKey:        "100000000000001",
+		metaregistry.MessengerBusinessAuthorityUserIDMetadataKey:       "900000000000001",
+		metaregistry.MessengerBusinessAuthorityBusinessIDMetadataKey:   "200000000000001",
+		metaregistry.MessengerBusinessAuthorityPageIDMetadataKey:       "700000000000001",
+	}
+	worker := &Worker{Config: &config.Config{MetaMessenger: config.MetaMessengerConfig{
+		Enabled: true, AppID: "100000000000001", AllowAllOrganizations: true,
+	}}}
+	generation := managedMetaCredentialGeneration{OAuthID: oauthID, OAuthVersion: 2}
+	account := &models.ChannelAccount{
+		BaseModel: models.BaseModel{ID: accountID}, OrganizationID: organizationID,
+		Channel: models.ChannelMessenger, ExternalAccountID: "700000000000001", Metadata: base,
+	}
+	assert.True(t, worker.managedMessengerChannelOutboxRuntimeAllowed(account, generation))
+
+	for _, testCase := range []struct {
+		name       string
+		mutate     func(models.JSONB)
+		generation managedMetaCredentialGeneration
+	}{
+		{name: "missing marker", mutate: func(metadata models.JSONB) {
+			delete(metadata, metaregistry.MessengerBusinessAuthorityMetadataKey)
+		}},
+		{name: "user cannot borrow marker", mutate: func(metadata models.JSONB) {
+			metadata["meta_authorization_token_kind"] = "USER"
+		}},
+		{name: "missing Page scope", mutate: func(metadata models.JSONB) {
+			metadata["meta_granted_scopes"] = []string{"public_profile", "pages_show_list", "pages_messaging"}
+		}},
+		{name: "old credential generation", generation: managedMetaCredentialGeneration{
+			OAuthID: oauthID, OAuthVersion: 3,
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			metadata := cloneChannelOutboxTestJSONB(base)
+			if testCase.mutate != nil {
+				testCase.mutate(metadata)
+			}
+			candidate := *account
+			candidate.Metadata = metadata
+			currentGeneration := testCase.generation
+			if currentGeneration.OAuthID == uuid.Nil {
+				currentGeneration = generation
+			}
+			assert.False(t, worker.managedMessengerChannelOutboxRuntimeAllowed(
+				&candidate, currentGeneration,
+			))
+		})
+	}
+
+	legacy := cloneChannelOutboxTestJSONB(base)
+	delete(legacy, metaregistry.MessengerBusinessAuthorityMetadataKey)
+	legacy["meta_granted_scopes"] = append(
+		append([]string(nil), legacy["meta_granted_scopes"].([]string)...),
+		"business_management",
+	)
+	account.Metadata = legacy
+	assert.True(t, worker.managedMessengerChannelOutboxRuntimeAllowed(
+		account,
+		managedMetaCredentialGeneration{OAuthID: uuid.New(), OAuthVersion: 99},
+	))
 }
 
 func TestChannelOutboxDurableEntitlementSemantics(t *testing.T) {

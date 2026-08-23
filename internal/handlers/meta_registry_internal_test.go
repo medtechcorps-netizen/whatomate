@@ -186,6 +186,71 @@ func TestMetaRegistryBindingFailsClosedWithoutPlatformAppOrScopes(t *testing.T) 
 	}
 }
 
+func TestMetaRegistryBindingAcceptsOnlyCurrentBISUAuthorityEvidence(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	fixture := createMetaRegistryFixture(t, db, org.ID, models.ChannelMessenger, "page-bisu-proof")
+	scoped := metaRegistryTestApp(db, org.ID)
+	now := time.Now().UTC()
+	checkedAt, err := time.Parse(
+		time.RFC3339Nano,
+		stringConfigValue(fixture.account.Metadata, "meta_ownership_checked_at"),
+	)
+	require.NoError(t, err)
+	base := cloneJSONB(fixture.account.Metadata)
+	base["meta_granted_scopes"] = append([]string(nil), metaMessengerSystemUserRequiredScopes...)
+	setMetaMessengerBusinessAuthorityEvidence(
+		base,
+		stringConfigValue(base, "meta_platform_app_id"),
+		stringConfigValue(base, "meta_authorizing_user_id"),
+		stringConfigValue(base, "meta_business_id"),
+		fixture.account.ExternalAccountID,
+		checkedAt,
+		fixture.oauth.ID,
+		fixture.oauth.Version,
+	)
+	update := func(metadata models.JSONB) error {
+		return db.Model(&models.ChannelAccount{}).
+			Where("id = ? AND organization_id = ?", fixture.account.ID, org.ID).
+			Update("metadata", metadata).Error
+	}
+	resolve := func() error {
+		_, resolveErr := scoped.loadMetaRegistryBinding(metaregistry.ResolveRequest{
+			Channel: models.ChannelMessenger, ExternalAccountID: fixture.account.ExternalAccountID,
+			Purpose: metaregistry.ResolvePurposeHealth,
+		}, now)
+		return resolveErr
+	}
+
+	require.NoError(t, update(base))
+	require.NoError(t, resolve())
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(models.JSONB)
+	}{
+		{name: "missing marker", mutate: func(metadata models.JSONB) {
+			delete(metadata, metaregistry.MessengerBusinessAuthorityMetadataKey)
+		}},
+		{name: "wrong token kind", mutate: func(metadata models.JSONB) {
+			metadata[metaMessengerAuthorizationTokenKindKey] = metaMessengerTokenKindUser
+		}},
+		{name: "old OAuth generation", mutate: func(metadata models.JSONB) {
+			metadata[metaregistry.MessengerBusinessAuthorityOAuthVersionMetadataKey] = fixture.oauth.Version + 1
+		}},
+		{name: "Page identity mismatch", mutate: func(metadata models.JSONB) {
+			metadata[metaregistry.MessengerBusinessAuthorityPageIDMetadataKey] = "different-page"
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			metadata := cloneJSONB(base)
+			testCase.mutate(metadata)
+			require.NoError(t, update(metadata))
+			require.ErrorIs(t, resolve(), metaregistry.ErrNotFound)
+		})
+	}
+}
+
 func TestMetaRegistryPendingBindingIsHealthOnlyUntilExplicitApproval(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	org := testutil.CreateTestOrganization(t, db)
@@ -333,9 +398,61 @@ func TestManagedMessengerProductionRejectsCarriedDevelopmentUserToken(t *testing
 	require.Error(t, err, "production approval must fail before enabling outbound")
 	snapshot, err := app.loadMetaMessengerRevalidationSnapshot(organization.ID, fixture.account.ID, now)
 	require.NoError(t, err)
-	outcome, reason := app.checkMetaMessengerOwnership(t.Context(), snapshot)
+	outcome, reason, businessAuthorityVerified := app.checkMetaMessengerOwnership(t.Context(), snapshot)
 	assert.Equal(t, metaregistry.OwnershipStale, outcome)
 	assert.Equal(t, "authorization_token_kind_not_allowed", reason)
+	assert.False(t, businessAuthorityVerified)
+}
+
+func TestProvisionMetaRegistryBindingRequiresTokenKindMatchedBusinessAuthority(t *testing.T) {
+	for _, testCase := range []struct {
+		name                      string
+		tokenKind                 string
+		businessAuthorityVerified bool
+	}{
+		{
+			name:      "system user without exact edge proof",
+			tokenKind: metaMessengerTokenKindSystemUser,
+		},
+		{
+			name:                      "user token cannot claim system user edge proof",
+			tokenKind:                 metaMessengerTokenKindUser,
+			businessAuthorityVerified: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			org := testutil.CreateTestOrganization(t, db)
+			user := testutil.CreateTestUser(t, db, org.ID)
+			app := metaRegistryTestApp(db, org.ID)
+			_, err := app.provisionMetaRegistryBinding(metaRegistryProvisionInput{
+				OrganizationID:                 org.ID,
+				UserID:                         user.ID,
+				Channel:                        models.ChannelMessenger,
+				Name:                           "Rejected Messenger binding",
+				ExternalAccountID:              "780000000000114",
+				WebhookApp:                     "messenger",
+				PlatformAppID:                  "123",
+				MetaBusinessID:                 "280000000000114",
+				AuthorizingMetaUserID:          "980000000000114",
+				AuthorizationTokenKind:         testCase.tokenKind,
+				BusinessAuthorityVerified:      testCase.businessAuthorityVerified,
+				GrantedScopes:                  append([]string(nil), metaMessengerSystemUserRequiredScopes...),
+				AccessToken:                    "provider-token",
+				AuthorityToken:                 "authority-token",
+				OwnershipCheckedAt:             time.Now().UTC(),
+				ReReplyBaseURL:                 "https://app.example.test",
+				RelayBaseURL:                   "https://app.example.test/meta-relay",
+				SubscriptionOperationExpiresAt: time.Now().UTC().Add(metaMessengerSubscriptionOperationLease),
+			})
+			require.ErrorIs(t, err, metaregistry.ErrInvalidRequest)
+			var count int64
+			require.NoError(t, db.Model(&models.ChannelAccount{}).
+				Where("organization_id = ?", org.ID).
+				Count(&count).Error)
+			assert.Zero(t, count)
+		})
+	}
 }
 
 func TestProvisionMetaRegistryBindingCreatesEncryptedAuditedTenantRecord(t *testing.T) {
@@ -361,9 +478,10 @@ func TestProvisionMetaRegistryBindingCreatesEncryptedAuditedTenantRecord(t *test
 			OrganizationID: org.ID, UserID: user.ID, Channel: models.ChannelMessenger,
 			Name: "Synthetic Clinic Messenger", ExternalAccountID: "780000000000113",
 			WebhookApp: "messenger", PlatformAppID: "123", MetaBusinessID: "280000000000113", AuthorizingMetaUserID: "980000000000113",
-			AuthorizationTokenKind: metaMessengerTokenKindSystemUser,
-			GrantedScopes:          append([]string(nil), metaMessengerRequiredScopes...),
-			AccessToken:            "plaintext-provider-token", AuthorityToken: "plaintext-authority-token",
+			AuthorizationTokenKind:    metaMessengerTokenKindSystemUser,
+			BusinessAuthorityVerified: true,
+			GrantedScopes:             append([]string(nil), metaMessengerSystemUserRequiredScopes...),
+			AccessToken:               "plaintext-provider-token", AuthorityToken: "plaintext-authority-token",
 			OwnershipCheckedAt: time.Now().UTC(),
 			ReReplyBaseURL:     "https://app.example.test", RelayBaseURL: "https://app.example.test/meta-relay",
 		})
@@ -373,6 +491,18 @@ func TestProvisionMetaRegistryBindingCreatesEncryptedAuditedTenantRecord(t *test
 	assert.Equal(t, org.ID, result.Account.OrganizationID)
 	assert.Equal(t, models.ChannelAccountStatusPending, result.Account.Status)
 	assert.False(t, boolConfigValue(result.Account.Config, "outbound_enabled"), "outbound still requires an explicit post-health approval")
+	assert.Equal(
+		t,
+		metaregistry.MessengerBusinessAuthoritySystemUserExactEdges,
+		stringConfigValue(result.Account.Metadata, metaregistry.MessengerBusinessAuthorityMetadataKey),
+	)
+	assert.NotContains(t, result.Account.Metadata["meta_granted_scopes"], "business_management")
+	assert.True(t, metaregistry.MessengerBusinessAuthorityCurrent(
+		result.Account.Metadata,
+		result.Account.ExternalAccountID,
+		result.OAuthCredentialID,
+		result.OAuthVersion,
+	))
 
 	var credentials []models.ChannelCredential
 	require.NoError(t, db.Where("channel_account_id = ?", result.Account.ID).Find(&credentials).Error)
@@ -429,6 +559,212 @@ func TestMetaRegistryRevalidationIsMonotonicAndCanRecoverDegradedAccount(t *test
 	require.NoError(t, db.Where("id = ?", fixture.account.ID).First(&account).Error)
 	require.Equal(t, models.ChannelAccountStatusPending, account.Status)
 	require.Equal(t, metaregistry.OwnershipVerified, stringConfigValue(account.Metadata, "meta_ownership_state"))
+}
+
+func TestMetaRegistryBISUAuthorityRefreshRequiresScheduledCurrentGeneration(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	fixture := createMetaRegistryFixture(t, db, org.ID, models.ChannelMessenger, "page-bisu-refresh")
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	metadata := cloneJSONB(fixture.account.Metadata)
+	metadata["meta_platform_app_id"] = "123"
+	metadata["meta_authorizing_user_id"] = "system-user-refresh"
+	metadata["meta_business_id"] = "business-refresh"
+	metadata[metaMessengerAuthorizationTokenKindKey] = metaMessengerTokenKindSystemUser
+	metadata["meta_granted_scopes"] = append([]string(nil), metaMessengerSystemUserRequiredScopes...)
+	metadata["meta_ownership_state"] = metaregistry.OwnershipVerified
+	metadata["meta_ownership_checked_at"] = base.Format(time.RFC3339Nano)
+	setMetaMessengerBusinessAuthorityEvidence(
+		metadata,
+		"123",
+		"system-user-refresh",
+		"business-refresh",
+		fixture.account.ExternalAccountID,
+		base,
+		fixture.oauth.ID,
+		fixture.oauth.Version,
+	)
+	require.NoError(t, db.Model(&models.ChannelAccount{}).
+		Where("id = ?", fixture.account.ID).
+		Update("metadata", metadata).Error)
+
+	scoped := metaRegistryTestApp(db, org.ID)
+	request := metaregistry.MutationRequest{
+		ChannelAccountID: fixture.account.ID,
+		CredentialID:     fixture.oauth.ID, CredentialVersion: fixture.oauth.Version,
+		WebhookCredentialID: fixture.webhook.ID, WebhookCredentialVersion: fixture.webhook.Version,
+		CheckedAt: base.Add(time.Second),
+		Reason:    "scheduled_graph_revalidation",
+	}
+	applied, err := scoped.applyMetaRegistryMutation(request, metaregistry.OwnershipVerified)
+	require.ErrorIs(t, err, metaregistry.ErrNotFound)
+	require.False(t, applied, "caller-controlled reason must not refresh exact BISU authority")
+
+	request.CheckedAt = base.Add(2 * time.Second)
+	applied, err = scoped.applyMetaRegistryMutationWithMessengerAuthorityProof(
+		request,
+		metaregistry.OwnershipVerified,
+		true,
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	var refreshed models.ChannelAccount
+	require.NoError(t, db.First(&refreshed, "id = ?", fixture.account.ID).Error)
+	assert.Equal(
+		t,
+		request.CheckedAt.Format(time.RFC3339Nano),
+		stringConfigValue(refreshed.Metadata, metaregistry.MessengerBusinessAuthorityCheckedAtMetadataKey),
+	)
+	assert.Equal(
+		t,
+		request.CheckedAt.Format(time.RFC3339Nano),
+		stringConfigValue(refreshed.Metadata, "meta_ownership_checked_at"),
+	)
+	assert.True(t, metaregistry.MessengerBusinessAuthorityCurrent(
+		refreshed.Metadata,
+		refreshed.ExternalAccountID,
+		fixture.oauth.ID,
+		fixture.oauth.Version,
+	))
+
+	request.CheckedAt = base.Add(3 * time.Second)
+	request.Reason = "provider_temporarily_unavailable"
+	applied, err = scoped.applyMetaRegistryMutation(request, metaregistry.OwnershipStale)
+	require.NoError(t, err)
+	require.True(t, applied)
+	var staleAccount models.ChannelAccount
+	require.NoError(t, db.First(&staleAccount, "id = ?", fixture.account.ID).Error)
+	assert.False(t, metaregistry.MessengerBusinessAuthorityCurrent(
+		staleAccount.Metadata,
+		staleAccount.ExternalAccountID,
+		fixture.oauth.ID,
+		fixture.oauth.Version,
+	))
+	assert.True(t, metaregistry.MessengerBusinessAuthorityGenerationBound(
+		staleAccount.Metadata,
+		staleAccount.ExternalAccountID,
+		fixture.oauth.ID,
+		fixture.oauth.Version,
+	))
+
+	request.CheckedAt = base.Add(4 * time.Second)
+	request.Reason = "scheduled_graph_revalidation"
+	applied, err = scoped.applyMetaRegistryMutationWithMessengerAuthorityProof(
+		request,
+		metaregistry.OwnershipVerified,
+		true,
+	)
+	require.NoError(t, err)
+	require.True(t, applied, "a same-generation exact Graph proof must recover a stale account")
+	require.NoError(t, db.First(&refreshed, "id = ?", fixture.account.ID).Error)
+	assert.True(t, metaregistry.MessengerBusinessAuthorityCurrent(
+		refreshed.Metadata,
+		refreshed.ExternalAccountID,
+		fixture.oauth.ID,
+		fixture.oauth.Version,
+	))
+
+	stale := cloneJSONB(refreshed.Metadata)
+	stale[metaregistry.MessengerBusinessAuthorityOAuthVersionMetadataKey] = fixture.oauth.Version + 1
+	require.NoError(t, db.Model(&models.ChannelAccount{}).
+		Where("id = ?", fixture.account.ID).
+		Update("metadata", stale).Error)
+	request.CheckedAt = base.Add(5 * time.Second)
+	applied, err = scoped.applyMetaRegistryMutationWithMessengerAuthorityProof(
+		request,
+		metaregistry.OwnershipVerified,
+		true,
+	)
+	require.ErrorIs(t, err, metaregistry.ErrNotFound)
+	require.False(t, applied, "stale proof generation must not be refreshed")
+}
+
+func TestMetaRegistryServiceCannotSpoofScheduledBISUAuthorityProof(t *testing.T) {
+	redisClient := testutil.SetupTestRedis(t)
+	if redisClient == nil {
+		t.Skip("TEST_REDIS_URL is required for the authenticated mutation regression")
+	}
+	db := testutil.SetupTestDB(t)
+	org := testutil.CreateTestOrganization(t, db)
+	fixture := createMetaRegistryFixture(t, db, org.ID, models.ChannelMessenger, "page-bisu-service-spoof")
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	metadata := cloneJSONB(fixture.account.Metadata)
+	metadata["meta_platform_app_id"] = "123"
+	metadata["meta_authorizing_user_id"] = "system-user-service-spoof"
+	metadata["meta_business_id"] = "business-service-spoof"
+	metadata[metaMessengerAuthorizationTokenKindKey] = metaMessengerTokenKindSystemUser
+	metadata["meta_granted_scopes"] = append([]string(nil), metaMessengerSystemUserRequiredScopes...)
+	metadata["meta_ownership_state"] = metaregistry.OwnershipVerified
+	metadata["meta_ownership_checked_at"] = base.Format(time.RFC3339Nano)
+	setMetaMessengerBusinessAuthorityEvidence(
+		metadata,
+		"123",
+		"system-user-service-spoof",
+		"business-service-spoof",
+		fixture.account.ExternalAccountID,
+		base,
+		fixture.oauth.ID,
+		fixture.oauth.Version,
+	)
+	require.NoError(t, db.Model(&models.ChannelAccount{}).
+		Where("id = ?", fixture.account.ID).
+		Update("metadata", metadata).Error)
+
+	app := metaRegistryTestApp(db, org.ID)
+	app.Redis = redisClient
+	app.Config.MetaRegistry.ServiceSecret = metaRegistryTestServiceSecret
+	mutation := metaregistry.MutationRequest{
+		ChannelAccountID: fixture.account.ID,
+		CredentialID:     fixture.oauth.ID, CredentialVersion: fixture.oauth.Version,
+		WebhookCredentialID: fixture.webhook.ID, WebhookCredentialVersion: fixture.webhook.Version,
+		Outcome:   metaregistry.OwnershipVerified,
+		Reason:    "scheduled_graph_revalidation",
+		CheckedAt: base.Add(time.Second),
+	}
+	request := testutil.NewJSONRequest(t, mutation)
+	request.RequestCtx.Request.Header.SetMethod(fasthttp.MethodPost)
+	now := time.Now().UTC()
+	nonce := "messenger-bisu-spoof-" + uuid.NewString()
+	raw := request.RequestCtx.PostBody()
+	request.RequestCtx.Request.Header.Set(
+		metaregistry.TimestampHeader,
+		strconv.FormatInt(now.Unix(), 10),
+	)
+	request.RequestCtx.Request.Header.Set(metaregistry.NonceHeader, nonce)
+	request.RequestCtx.Request.Header.Set(
+		metaregistry.SignatureHeader,
+		metaregistry.SignRequest(
+			metaRegistryTestServiceSecret,
+			fasthttp.MethodPost,
+			metaregistry.ReviewPath,
+			now,
+			nonce,
+			raw,
+		),
+	)
+	require.NoError(t, app.RecordMetaRegistryRevalidation(request))
+	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(request))
+	require.NoError(t, metaregistry.VerifyResponse(
+		metaRegistryTestServiceSecret,
+		nonce,
+		request.RequestCtx.Response.StatusCode(),
+		request.RequestCtx.Response.Body(),
+		string(request.RequestCtx.Response.Header.Peek(metaregistry.ResponseHeader)),
+	))
+
+	var unchanged models.ChannelAccount
+	require.NoError(t, db.First(&unchanged, "id = ?", fixture.account.ID).Error)
+	assert.Equal(
+		t,
+		base.Format(time.RFC3339Nano),
+		stringConfigValue(unchanged.Metadata, metaregistry.MessengerBusinessAuthorityCheckedAtMetadataKey),
+	)
+	assert.Equal(
+		t,
+		base.Format(time.RFC3339Nano),
+		stringConfigValue(unchanged.Metadata, "meta_ownership_checked_at"),
+	)
 }
 
 func TestGenericChannelAPIProtectsManagedMetaRoutingButAllowsSafeProfileToggle(t *testing.T) {

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,12 +22,13 @@ type approveMetaMessengerRequest struct {
 }
 
 type metaMessengerSubscriptionApproval struct {
-	PageID                   string
-	CheckedAt                time.Time
-	OAuthCredentialID        uuid.UUID
-	OAuthCredentialVersion   int
-	WebhookCredentialID      uuid.UUID
-	WebhookCredentialVersion int
+	PageID                     string
+	CheckedAt                  time.Time
+	BusinessAuthorityCheckedAt time.Time
+	OAuthCredentialID          uuid.UUID
+	OAuthCredentialVersion     int
+	WebhookCredentialID        uuid.UUID
+	WebhookCredentialVersion   int
 }
 
 // ApproveMetaMessengerActivation is the only pending-to-active transition for
@@ -77,6 +79,31 @@ func (a *App) freshMetaMessengerSubscriptionApproval(
 	ctx context.Context,
 	snapshot metaMessengerRevalidationSnapshot,
 ) (metaMessengerSubscriptionApproval, error) {
+	businessAuthorityCheckedAt := time.Time{}
+	usesExactBusinessAuthority := metaregistry.MessengerUsesExactSystemUserBusinessAuthority(
+		snapshot.Account.Metadata,
+	)
+	tokenKind := strings.ToUpper(strings.TrimSpace(stringConfigValue(
+		snapshot.Account.Metadata,
+		metaMessengerAuthorizationTokenKindKey,
+	)))
+	if tokenKind == metaMessengerTokenKindSystemUser {
+		if !metaregistry.MessengerBusinessAuthorityCurrent(
+			snapshot.Account.Metadata,
+			snapshot.Account.ExternalAccountID,
+			snapshot.OAuth.ID,
+			snapshot.OAuth.Version,
+		) {
+			return metaMessengerSubscriptionApproval{}, errors.New("stored Messenger business authority is invalid")
+		}
+		outcome, _, businessAuthorityVerified := a.checkMetaMessengerOwnership(ctx, snapshot)
+		if outcome != "" || !businessAuthorityVerified {
+			return metaMessengerSubscriptionApproval{}, errors.New("Messenger business authority is no longer current")
+		}
+		if usesExactBusinessAuthority {
+			businessAuthorityCheckedAt = time.Now().UTC()
+		}
+	}
 	subscribed, err := a.metaMessengerPageHasConfiguredAppSubscription(
 		ctx,
 		snapshot.Account.ExternalAccountID,
@@ -90,7 +117,8 @@ func (a *App) freshMetaMessengerSubscriptionApproval(
 	}
 	return metaMessengerSubscriptionApproval{
 		PageID: snapshot.Account.ExternalAccountID, CheckedAt: time.Now().UTC(),
-		OAuthCredentialID: snapshot.OAuth.ID, OAuthCredentialVersion: snapshot.OAuth.Version,
+		BusinessAuthorityCheckedAt: businessAuthorityCheckedAt,
+		OAuthCredentialID:          snapshot.OAuth.ID, OAuthCredentialVersion: snapshot.OAuth.Version,
 		WebhookCredentialID: snapshot.Webhook.ID, WebhookCredentialVersion: snapshot.Webhook.Version,
 	}, nil
 }
@@ -138,6 +166,20 @@ func (a *App) activateMetaMessengerAccount(
 			stringConfigValue(account.Metadata, "meta_health_webhook_credential_id") != webhook.ID.String() ||
 			intConfigValue(account.Metadata, "meta_health_webhook_version") != webhook.Version {
 			return errors.New("managed Messenger health approval was superseded")
+		}
+		if !metaregistry.MessengerBusinessAuthorityCurrent(
+			account.Metadata,
+			account.ExternalAccountID,
+			oauth.ID,
+			oauth.Version,
+		) {
+			return errors.New("managed Messenger business authority is invalid")
+		}
+		if metaregistry.MessengerUsesExactSystemUserBusinessAuthority(account.Metadata) &&
+			(subscription.BusinessAuthorityCheckedAt.IsZero() ||
+				subscription.BusinessAuthorityCheckedAt.After(now.Add(time.Minute)) ||
+				now.Sub(subscription.BusinessAuthorityCheckedAt) > time.Minute) {
+			return errors.New("managed Messenger business authority approval is stale")
 		}
 		if subscription.PageID != account.ExternalAccountID || subscription.CheckedAt.IsZero() ||
 			subscription.CheckedAt.After(now.Add(time.Minute)) || now.Sub(subscription.CheckedAt) > time.Minute ||

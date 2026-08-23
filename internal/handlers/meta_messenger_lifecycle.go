@@ -243,7 +243,7 @@ func (a *App) revalidateOneMetaMessengerBinding(
 	}
 	providerCtx, cancel := context.WithTimeout(ctx, metaMessengerProviderOperationLimit)
 	defer cancel()
-	outcome, reason := a.checkMetaMessengerOwnership(providerCtx, snapshot)
+	outcome, reason, messengerAuthorityVerified := a.checkMetaMessengerOwnership(providerCtx, snapshot)
 	checkedAt := time.Now().UTC()
 	if !checkedAt.After(snapshot.PreviousCheck) {
 		checkedAt = snapshot.PreviousCheck.Add(time.Nanosecond)
@@ -266,7 +266,11 @@ func (a *App) revalidateOneMetaMessengerBinding(
 		Outcome: outcome, Reason: reason, CheckedAt: checkedAt,
 	}
 	if err := a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
-		applied, applyErr := scoped.applyMetaRegistryMutation(mutation, outcome)
+		applied, applyErr := scoped.applyMetaRegistryMutationWithMessengerAuthorityProof(
+			mutation,
+			outcome,
+			messengerAuthorityVerified,
+		)
 		if applyErr != nil {
 			return applyErr
 		}
@@ -460,27 +464,43 @@ func latestActiveMetaCredential(
 
 func (a *App) checkMetaMessengerOwnership(
 	ctx context.Context, snapshot metaMessengerRevalidationSnapshot,
-) (outcome, reason string) {
+) (outcome, reason string, businessAuthorityVerified bool) {
 	if !metaMessengerAuthorizationTokenAllowed(a.Config, snapshot.Account.Metadata) {
-		return metaregistry.OwnershipStale, "authorization_token_kind_not_allowed"
+		return metaregistry.OwnershipStale, "authorization_token_kind_not_allowed", false
 	}
 	if snapshot.OAuth.ExpiresAt != nil && !snapshot.OAuth.ExpiresAt.After(time.Now().UTC()) {
-		return metaregistry.OwnershipRevoked, "oauth_credential_expired"
+		return metaregistry.OwnershipRevoked, "oauth_credential_expired", false
 	}
 	inspection, err := a.inspectMetaMessengerToken(ctx, snapshot.AuthorityToken, true)
 	if err != nil {
-		return classifyMetaMessengerRevalidationError(err)
+		outcome, reason = classifyMetaMessengerRevalidationError(err)
+		return outcome, reason, false
+	}
+	persistedTokenKind := strings.ToUpper(strings.TrimSpace(stringConfigValue(
+		snapshot.Account.Metadata,
+		metaMessengerAuthorizationTokenKindKey,
+	)))
+	if inspection.Type != persistedTokenKind {
+		return metaregistry.OwnershipRevoked, "authorization_token_kind_changed", false
+	}
+	if inspection.BusinessEdgeProofRequired &&
+		!metaregistry.MessengerUsesExactSystemUserBusinessAuthority(snapshot.Account.Metadata) {
+		// Never keep authorizing from a stale stored business_management claim
+		// after Meta stops returning it. A fresh reconnect can mint the
+		// versioned exact-edge proof atomically with the new credential.
+		return metaregistry.OwnershipStale, "business_authority_contract_changed", false
 	}
 	platform, err := a.fetchMetaMessengerPlatformIdentity(ctx, snapshot.AuthorityToken, inspection)
 	if err != nil {
-		return classifyMetaMessengerRevalidationError(err)
+		outcome, reason = classifyMetaMessengerRevalidationError(err)
+		return outcome, reason, false
 	}
 	if platform.UserID != stringConfigValue(snapshot.Account.Metadata, "meta_authorizing_user_id") {
-		return metaregistry.OwnershipRevoked, "authorizing_identity_changed"
+		return metaregistry.OwnershipRevoked, "authorizing_identity_changed", false
 	}
 	businessID := stringConfigValue(snapshot.Account.Metadata, "meta_business_id")
 	if platform.TokenKind == metaMessengerTokenKindSystemUser && platform.ClientBusinessID != businessID {
-		return metaregistry.OwnershipRevoked, "authorizing_business_changed"
+		return metaregistry.OwnershipRevoked, "authorizing_business_changed", false
 	}
 	selected := metaMessengerStoredPage{
 		metaMessengerPageSummary: metaMessengerPageSummary{
@@ -490,20 +510,21 @@ func (a *App) checkMetaMessengerOwnership(
 		OwnershipVerifiedAt: inspection.CheckedAt,
 	}
 	fresh, err := a.revalidateMetaMessengerOwnedPage(
-		ctx, snapshot.OrganizationID, snapshot.AuthorityToken, inspection, selected,
+		ctx, snapshot.OrganizationID, snapshot.AuthorityToken, inspection, platform, selected,
 	)
 	if err != nil {
 		if errors.Is(err, errMetaMessengerSelectionInvalid) {
-			return metaregistry.OwnershipRevoked, "page_ownership_or_task_removed"
+			return metaregistry.OwnershipRevoked, "page_ownership_or_task_removed", false
 		}
-		return classifyMetaMessengerRevalidationError(err)
+		outcome, reason = classifyMetaMessengerRevalidationError(err)
+		return outcome, reason, false
 	}
 	freshPageToken, err := appcrypto.Decrypt(fresh.EncryptedPageToken, a.Config.App.EncryptionKey)
 	if err != nil || strings.TrimSpace(freshPageToken) == "" {
-		return metaregistry.OwnershipStale, "fresh_page_token_unavailable"
+		return metaregistry.OwnershipStale, "fresh_page_token_unavailable", false
 	}
 	if !metaMessengerOpaqueValuesEqual(strings.TrimSpace(freshPageToken), strings.TrimSpace(snapshot.PageToken)) {
-		return metaregistry.OwnershipStale, "page_token_rotation_requires_reconnect"
+		return metaregistry.OwnershipStale, "page_token_rotation_requires_reconnect", false
 	}
 	if _, _, err := a.bindMetaMessengerPageToken(
 		ctx,
@@ -511,16 +532,18 @@ func (a *App) checkMetaMessengerOwnership(
 		snapshot.PageToken,
 		inspection,
 	); err != nil {
-		return classifyMetaMessengerRevalidationError(err)
+		outcome, reason = classifyMetaMessengerRevalidationError(err)
+		return outcome, reason, false
 	}
 	subscribed, err := a.metaMessengerPageHasConfiguredAppSubscription(ctx, snapshot.Account.ExternalAccountID, snapshot.PageToken)
 	if err != nil {
-		return classifyMetaMessengerRevalidationError(err)
+		outcome, reason = classifyMetaMessengerRevalidationError(err)
+		return outcome, reason, false
 	}
 	if !subscribed {
-		return metaregistry.OwnershipStale, "messages_subscription_missing"
+		return metaregistry.OwnershipStale, "messages_subscription_missing", false
 	}
-	return "", "scheduled_graph_revalidation"
+	return "", "scheduled_graph_revalidation", true
 }
 
 func classifyMetaMessengerRevalidationError(err error) (outcome, reason string) {

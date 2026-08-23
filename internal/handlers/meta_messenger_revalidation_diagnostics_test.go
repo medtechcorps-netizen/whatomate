@@ -162,6 +162,15 @@ func TestMetaMessengerRevalidationLogsExactSafeStageWithoutCredentialsOrProvider
 					Scopes:    append([]string(nil), metaMessengerRequiredScopes...),
 					CheckedAt: time.Now().UTC(),
 				},
+				metaMessengerPlatformUser{
+					UserID: metaLifecycleTestUserID, TokenKind: tokenKind,
+					ClientBusinessID: func() string {
+						if tokenKind == metaMessengerTokenKindSystemUser {
+							return metaLifecycleTestBusinessID
+						}
+						return ""
+					}(),
+				},
 				metaMessengerStoredPage{metaMessengerPageSummary: metaMessengerPageSummary{
 					BusinessID:   metaLifecycleTestBusinessID,
 					BusinessName: metaMessengerRevalidationTestBusinessName,
