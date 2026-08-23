@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,47 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestScopedAppCreationDoesNotCopyOrRaceRootRealtimeState(t *testing.T) {
+	const iterations = 256
+	for range iterations {
+		root := &App{
+			CampaignSubCancel: func() {},
+			RealtimeSubCancel: func() {},
+		}
+		organizationID := uuid.New()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var scoped *App
+		var sourceID string
+
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			<-start
+			scoped = root.scopedApp(nil, organizationID)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			sourceID = root.realtimeSourceID()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			root.StopRealtimeSubscriber()
+		}()
+		close(start)
+		wg.Wait()
+
+		require.NotNil(t, scoped)
+		require.Nil(t, scoped.CampaignSubCancel)
+		require.Nil(t, scoped.RealtimeSubCancel)
+		require.Empty(t, scoped.RealtimeSourceID)
+		require.NotEmpty(t, sourceID)
+		assert.Equal(t, sourceID, scoped.realtimeSourceID())
+	}
+}
 
 func TestPublishRealtimeEventDeliversLocallyAndScopesTenant(t *testing.T) {
 	log := testutil.NopLogger()

@@ -159,9 +159,6 @@ func (a *App) scopedApp(tx *gorm.DB, organizationID uuid.UUID) *App {
 		WhatsApp:              root.WhatsApp,
 		WSHub:                 root.WSHub,
 		Queue:                 root.Queue,
-		CampaignSubCancel:     root.CampaignSubCancel,
-		RealtimeSubCancel:     root.RealtimeSubCancel,
-		RealtimeSourceID:      root.RealtimeSourceID,
 		HTTPClient:            root.HTTPClient,
 		CallManager:           root.CallManager,
 		TTS:                   root.TTS,
@@ -173,6 +170,9 @@ func (a *App) scopedApp(tx *gorm.DB, organizationID uuid.UUID) *App {
 		afterCommitScoped:     true,
 		channelAdapterFactory: root.channelAdapterFactory,
 	}
+	// Subscriber lifecycle callbacks and RealtimeSourceID are root-owned.
+	// Scoped apps resolve realtime identity through rootApp and never copy
+	// lifecycle state that can change during graceful shutdown.
 	// Transactional terminal-state helpers receive only *gorm.DB. Preserve the
 	// request-scoped App in the DB context so they can enqueue identifier-only
 	// realtime hints that the outer tenant owner drains strictly after commit.
