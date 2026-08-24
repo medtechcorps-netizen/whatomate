@@ -2567,11 +2567,19 @@ func verifyPlatformComplianceIdentityRegistryContract(
 }
 
 type platformComplianceProductTrigger struct {
-	name         string
-	function     string
-	typeBits     int
-	functionBody string
+	name          string
+	function      string
+	typeBits      int
+	updateColumns []string
+	functionBody  string
 }
+
+type platformComplianceProductTriggerProfile uint8
+
+const (
+	platformComplianceLegacyTriggerProfile platformComplianceProductTriggerProfile = iota
+	platformComplianceMessageCursorTriggerProfile
+)
 
 var platformComplianceProductTriggers = map[string][]platformComplianceProductTrigger{
 	"customer_activity_events": {
@@ -2646,15 +2654,129 @@ var platformComplianceProductTriggers = map[string][]platformComplianceProductTr
 	},
 }
 
+// platformComplianceFutureMessageCursorTriggers is verifier-only rollout
+// metadata. The compatibility bridge never installs these functions, triggers,
+// or their additive columns. It merely lets a fully upgraded database remain a
+// valid rollback target after the singleton future migration has committed.
+var platformComplianceFutureMessageCursorTriggers = map[string][]platformComplianceProductTrigger{
+	"messages": {
+		{
+			name:          "trg_messages_ingestion_order",
+			function:      "rereply_set_message_ingestion_order",
+			typeBits:      23,
+			updateColumns: []string{"inbox_conversation_id"},
+			functionBody:  functionBodyFromCreateSQL(messageIngestionOrderFunctionSQL),
+		},
+		{
+			name:         "trg_messages_cleanup_read_cursors",
+			function:     "rereply_cleanup_deleted_message_read_cursors",
+			typeBits:     11,
+			functionBody: functionBodyFromCreateSQL(deletedMessageReadCursorCleanupFunctionSQL),
+		},
+	},
+	"conversation_reads": {
+		{
+			name:          "trg_conversation_reads_ingestion_order",
+			function:      "rereply_set_conversation_read_ingestion_order",
+			typeBits:      23,
+			updateColumns: []string{"last_read_message_id", "last_read_at"},
+			functionBody:  functionBodyFromCreateSQL(conversationReadIngestionOrderFunctionSQL),
+		},
+	},
+}
+
 func normalizePlatformComplianceFunctionBody(value string) string {
 	return strings.Join(strings.Fields(value), " ")
+}
+
+func detectPlatformComplianceProductTriggerProfile(
+	db *gorm.DB,
+) (platformComplianceProductTriggerProfile, error) {
+	var state struct {
+		RelationCount            int64  `gorm:"column:relation_count"`
+		MessageTriggers          string `gorm:"column:message_triggers"`
+		ConversationReadTriggers string `gorm:"column:conversation_read_triggers"`
+	}
+	result := db.Raw(`
+		SELECT
+			COUNT(DISTINCT relation.oid) AS relation_count,
+			COALESCE(
+				pg_catalog.string_agg(trigger.tgname, ',' ORDER BY trigger.tgname)
+					FILTER (WHERE relation.relname = 'messages'),
+				''
+			) AS message_triggers,
+			COALESCE(
+				pg_catalog.string_agg(trigger.tgname, ',' ORDER BY trigger.tgname)
+					FILTER (WHERE relation.relname = 'conversation_reads'),
+				''
+			) AS conversation_read_triggers
+		FROM pg_catalog.pg_class AS relation
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		LEFT JOIN pg_catalog.pg_trigger AS trigger
+		  ON trigger.tgrelid = relation.oid AND NOT trigger.tgisinternal
+		WHERE namespace.nspname = 'public'
+		  AND relation.relname IN ('messages', 'conversation_reads')
+		  AND relation.relkind = 'r'
+	`).Scan(&state)
+	if result.Error != nil {
+		return platformComplianceLegacyTriggerProfile,
+			fmt.Errorf("inspect message-cursor trigger rollout profile: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return platformComplianceLegacyTriggerProfile,
+			errors.New("message-cursor trigger rollout profile is unavailable")
+	}
+	return classifyPlatformComplianceProductTriggerProfile(
+		state.RelationCount,
+		state.MessageTriggers,
+		state.ConversationReadTriggers,
+	)
+}
+
+func classifyPlatformComplianceProductTriggerProfile(
+	relationCount int64,
+	messageTriggers, conversationReadTriggers string,
+) (platformComplianceProductTriggerProfile, error) {
+	if relationCount != 2 {
+		return platformComplianceLegacyTriggerProfile,
+			errors.New("message-cursor trigger rollout relations are incomplete")
+	}
+
+	const legacyTriggers = "rereply_platform_compliance_write_guard"
+	const futureMessageTriggers = "rereply_platform_compliance_write_guard," +
+		"trg_messages_cleanup_read_cursors,trg_messages_ingestion_order"
+	const futureConversationReadTriggers = "rereply_platform_compliance_write_guard," +
+		"trg_conversation_reads_ingestion_order"
+
+	switch {
+	case messageTriggers == legacyTriggers &&
+		conversationReadTriggers == legacyTriggers:
+		return platformComplianceLegacyTriggerProfile, nil
+	case messageTriggers == futureMessageTriggers &&
+		conversationReadTriggers == futureConversationReadTriggers:
+		return platformComplianceMessageCursorTriggerProfile, nil
+	default:
+		return platformComplianceLegacyTriggerProfile, errors.New(
+			"message-cursor trigger rollout state is neither exact legacy nor exact future",
+		)
+	}
 }
 
 func verifyPlatformComplianceExactTableTriggerSet(
 	db *gorm.DB,
 	table, expectedOwner string,
+	profile platformComplianceProductTriggerProfile,
 ) error {
-	expectedProducts := platformComplianceProductTriggers[table]
+	expectedProducts := append(
+		[]platformComplianceProductTrigger(nil),
+		platformComplianceProductTriggers[table]...,
+	)
+	if profile == platformComplianceMessageCursorTriggerProfile {
+		expectedProducts = append(
+			expectedProducts,
+			platformComplianceFutureMessageCursorTriggers[table]...,
+		)
+	}
 	var state struct {
 		TriggerCount int64 `gorm:"column:trigger_count"`
 		RuleCount    int64 `gorm:"column:rule_count"`
@@ -2678,12 +2800,16 @@ func verifyPlatformComplianceExactTableTriggerSet(
 		return fmt.Errorf("platform compliance trigger/rule set is not exact on public.%s", table)
 	}
 	for _, expected := range expectedProducts {
+		expectedUpdateColumns := append([]string(nil), expected.updateColumns...)
+		sort.Strings(expectedUpdateColumns)
 		var actual struct {
-			Source          string `gorm:"column:source"`
-			Owner           string `gorm:"column:owner_name"`
-			Language        string `gorm:"column:language"`
-			SecurityDefiner bool   `gorm:"column:security_definer"`
-			Valid           bool   `gorm:"column:valid"`
+			Source               string `gorm:"column:source"`
+			Owner                string `gorm:"column:owner_name"`
+			Language             string `gorm:"column:language"`
+			SecurityDefiner      bool   `gorm:"column:security_definer"`
+			UpdateColumns        string `gorm:"column:update_columns"`
+			UpdateAttributeCount int    `gorm:"column:update_attribute_count"`
+			Valid                bool   `gorm:"column:valid"`
 		}
 		result := db.Raw(`
 			SELECT
@@ -2691,6 +2817,16 @@ func verifyPlatformComplianceExactTableTriggerSet(
 				owner.rolname::text AS owner_name,
 				language.lanname AS language,
 				procedure.prosecdef AS security_definer,
+				COALESCE(pg_catalog.cardinality(trigger.tgattr::smallint[]), 0) AS update_attribute_count,
+				COALESCE((
+					SELECT pg_catalog.string_agg(attribute.attname, ',' ORDER BY attribute.attname)
+					FROM pg_catalog.unnest(trigger.tgattr::smallint[])
+						WITH ORDINALITY AS trigger_column(attnum, ordinality)
+					JOIN pg_catalog.pg_attribute AS attribute
+					  ON attribute.attrelid = relation.oid
+					 AND attribute.attnum = trigger_column.attnum
+					 AND NOT attribute.attisdropped
+				), '') AS update_columns,
 				(
 					trigger.tgenabled = 'O'
 					AND trigger.tgtype = CAST(? AS smallint)
@@ -2701,7 +2837,6 @@ func verifyPlatformComplianceExactTableTriggerSet(
 					AND NOT trigger.tgdeferrable
 					AND NOT trigger.tginitdeferred
 					AND trigger.tgqual IS NULL
-					AND trigger.tgattr::text = ''
 					AND trigger.tgoldtable IS NULL
 					AND trigger.tgnewtable IS NULL
 					AND procedure.pronargs = 0
@@ -2717,6 +2852,7 @@ func verifyPlatformComplianceExactTableTriggerSet(
 			  AND relation.relname = CAST(? AS text)
 			  AND trigger.tgname = CAST(? AS text)
 			  AND NOT trigger.tgisinternal
+			  AND procedure.pronamespace = namespace.oid
 			  AND procedure.proname = CAST(? AS text)
 		`, expected.typeBits, table, expected.name, expected.function).Scan(&actual)
 		if result.Error != nil {
@@ -2724,6 +2860,8 @@ func verifyPlatformComplianceExactTableTriggerSet(
 		}
 		if result.RowsAffected != 1 || !actual.Valid || actual.Owner != expectedOwner ||
 			actual.Language != "plpgsql" || actual.SecurityDefiner ||
+			actual.UpdateAttributeCount != len(expectedUpdateColumns) ||
+			actual.UpdateColumns != strings.Join(expectedUpdateColumns, ",") ||
 			normalizePlatformComplianceFunctionBody(actual.Source) != normalizePlatformComplianceFunctionBody(expected.functionBody) {
 			return fmt.Errorf("product trigger %q on public.%s does not match the platform compliance contract", expected.name, table)
 		}
@@ -3046,6 +3184,10 @@ func verifyPlatformComplianceGuards(db *gorm.DB, runtimeRole string) error {
 	if installedFingerprint != fingerprint {
 		return fmt.Errorf("platform compliance contract fingerprint mismatch: got %q", installedFingerprint)
 	}
+	triggerProfile, err := detectPlatformComplianceProductTriggerProfile(db)
+	if err != nil {
+		return err
+	}
 
 	for _, rule := range rules {
 		var valid bool
@@ -3103,7 +3245,7 @@ func verifyPlatformComplianceGuards(db *gorm.DB, runtimeRole string) error {
 			return fmt.Errorf("platform compliance write guard is incomplete on %q", rule.Table)
 		}
 		if err := verifyPlatformComplianceExactTableTriggerSet(
-			db, rule.Table, functionState.OwnerName,
+			db, rule.Table, functionState.OwnerName, triggerProfile,
 		); err != nil {
 			return err
 		}

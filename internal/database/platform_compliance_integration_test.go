@@ -1321,6 +1321,144 @@ func TestRemoveTenantRLSRejectsNestedAndRepeatableReadSnapshots(t *testing.T) {
 	assert.True(t, enabled)
 }
 
+func TestPlatformComplianceStartupVerificationAcceptsExactMessageCursorRolloutProfiles(t *testing.T) {
+	db, runtimeRole := setupPlatformComplianceGuardTest(t)
+	verify := func(tx *gorm.DB) error {
+		return database.VerifyPlatformComplianceGuardContract(tx, runtimeRole)
+	}
+	installFuture := func(t *testing.T, tx *gorm.DB) {
+		t.Helper()
+		require.NoError(t, database.PrepareFutureMessageCursorContractForTest(tx))
+		require.NoError(t, database.InstallFutureMessageCursorTriggersForTest(tx))
+	}
+
+	// The bridge is deployed before the future migration, so the exact legacy
+	// trigger profile must remain a valid startup state.
+	require.NoError(t, verify(db))
+
+	t.Run("complete future profile", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		installFuture(t, tx)
+		require.NoError(t, verify(tx))
+	})
+
+	t.Run("mixed table profiles", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		require.NoError(t, database.PrepareFutureMessageCursorContractForTest(tx))
+		require.NoError(t, database.InstallFutureMessageTriggersForTest(tx, true, true))
+		err := verify(tx)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "neither exact legacy nor exact future")
+	})
+
+	t.Run("partial future profile", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		require.NoError(t, database.PrepareFutureMessageCursorContractForTest(tx))
+		require.NoError(t, database.InstallFutureMessageTriggersForTest(tx, true, false))
+		err := verify(tx)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "neither exact legacy nor exact future")
+	})
+
+	t.Run("extra arbitrary trigger", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		installFuture(t, tx)
+		require.NoError(t, tx.Exec(`
+			CREATE FUNCTION public.zz_future_message_rewrite()
+			RETURNS trigger LANGUAGE plpgsql
+			AS $function$ BEGIN RETURN NEW; END $function$;
+			CREATE TRIGGER zz_future_message_rewrite
+			BEFORE INSERT ON public.messages
+			FOR EACH ROW EXECUTE FUNCTION public.zz_future_message_rewrite()
+		`).Error)
+		err := verify(tx)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "neither exact legacy nor exact future")
+	})
+
+	for _, functionName := range []string{
+		"rereply_set_message_ingestion_order",
+		"rereply_cleanup_deleted_message_read_cursors",
+		"rereply_set_conversation_read_ingestion_order",
+	} {
+		t.Run("tampered function body "+functionName, func(t *testing.T) {
+			tx := db.Begin()
+			require.NoError(t, tx.Error)
+			defer tx.Rollback()
+			installFuture(t, tx)
+			require.NoError(t, tx.Exec(fmt.Sprintf(`
+				CREATE OR REPLACE FUNCTION public.%s()
+				RETURNS trigger LANGUAGE plpgsql
+				AS $function$ BEGIN RETURN NEW; END $function$
+			`, functionName)).Error)
+			err := verify(tx)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "does not match the platform compliance contract")
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		ddl  string
+	}{
+		{
+			name: "message trigger",
+			ddl: `
+				DROP TRIGGER trg_messages_ingestion_order ON public.messages;
+				CREATE TRIGGER trg_messages_ingestion_order
+				BEFORE INSERT OR UPDATE OF contact_id ON public.messages
+				FOR EACH ROW
+				EXECUTE FUNCTION public.rereply_set_message_ingestion_order()
+			`,
+		},
+		{
+			name: "conversation read trigger",
+			ddl: `
+				DROP TRIGGER trg_conversation_reads_ingestion_order ON public.conversation_reads;
+				CREATE TRIGGER trg_conversation_reads_ingestion_order
+				BEFORE INSERT OR UPDATE OF last_read_message_id
+				ON public.conversation_reads
+				FOR EACH ROW
+				EXECUTE FUNCTION public.rereply_set_conversation_read_ingestion_order()
+			`,
+		},
+	} {
+		t.Run("wrong UPDATE OF columns "+test.name, func(t *testing.T) {
+			tx := db.Begin()
+			require.NoError(t, tx.Error)
+			defer tx.Rollback()
+			installFuture(t, tx)
+			require.NoError(t, tx.Exec(test.ddl).Error)
+			err := verify(tx)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "does not match the platform compliance contract")
+		})
+	}
+
+	t.Run("wrong function owner", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		installFuture(t, tx)
+		role := "rereply_future_trigger_" + strings.ReplaceAll(uuid.NewString()[:8], "-", "")
+		require.NoError(t, tx.Exec("CREATE ROLE "+role+" NOLOGIN NOSUPERUSER NOBYPASSRLS").Error)
+		require.NoError(t, tx.Exec(
+			"ALTER FUNCTION public.rereply_set_message_ingestion_order() OWNER TO "+role,
+		).Error)
+		err := verify(tx)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not match the platform compliance contract")
+	})
+}
+
 func TestPlatformComplianceStartupVerificationRejectsContractDrift(t *testing.T) {
 	db, runtimeRole := setupPlatformComplianceGuardTest(t)
 	verifyAsRuntime := func(tx *gorm.DB) error {
