@@ -9,6 +9,7 @@ import (
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
@@ -28,6 +29,8 @@ func TestProcessNormalizedChannelEventRetainsLatestMetaServiceWindowOutOfOrder(t
 	olderProviderTime := newerProviderTime.Add(-3 * time.Hour)
 	newer := validPolicyInboundEvent(newerProviderTime)
 	older := validPolicyInboundEvent(olderProviderTime)
+	newer.Message.Parts[0].Text = "Newest provider preview"
+	older.Message.Parts[0].Text = "Delayed older provider message"
 	older.Message.Conversation = newer.Message.Conversation
 	older.Message.Sender = newer.Message.Sender
 
@@ -51,6 +54,29 @@ func TestProcessNormalizedChannelEventRetainsLatestMetaServiceWindowOutOfOrder(t
 		conversation.ServiceWindowEndsAt.UTC(),
 		"a delayed older event must not shorten the newer service window",
 	)
+	assert.Equal(t, "Delayed older provider message", conversation.LastMessagePreview)
+	assert.Equal(t, 2, conversation.UnreadCount)
+
+	var persisted []models.Message
+	require.NoError(t, db.Where(
+		"organization_id = ? AND inbox_conversation_id = ?",
+		org.ID,
+		conversation.ID,
+	).Order("COALESCE(ingested_at, created_at), id").Find(&persisted).Error)
+	require.Len(t, persisted, 2)
+	assert.Equal(t, newer.Message.ExternalMessageID, persisted[0].WhatsAppMessageID)
+	assert.Equal(t, older.Message.ExternalMessageID, persisted[1].WhatsAppMessageID)
+	require.NotNil(t, persisted[0].IngestedAt)
+	require.NotNil(t, persisted[1].IngestedAt)
+	assert.True(t, persisted[1].IngestedAt.After(*persisted[0].IngestedAt))
+	require.NotNil(t, conversation.LastMessageAt)
+	assert.Equal(t, persisted[1].EffectiveIngestedAt(), conversation.LastMessageAt.UTC())
+
+	var contact models.Contact
+	require.NoError(t, db.First(&contact, "id = ?", conversation.ContactID).Error)
+	assert.Equal(t, "Delayed older provider message", contact.LastMessagePreview)
+	require.NotNil(t, contact.LastMessageAt)
+	assert.Equal(t, persisted[1].EffectiveIngestedAt(), contact.LastMessageAt.UTC())
 }
 
 func TestMonotonicServiceWindowEndsAtSerializesCompetingPostgresUpdates(t *testing.T) {

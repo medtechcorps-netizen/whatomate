@@ -1496,6 +1496,10 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST("/api/channel-accounts/{id}/meta-instagram/approve", app.ApproveMetaInstagramActivation)
 	g.GET("/api/conversations", tenant((*handlers.App).ListInboxConversations))
 	g.GET(
+		"/api/conversations/attention-summary",
+		tenant((*handlers.App).GetInboxAttentionSummary),
+	)
+	g.GET(
 		"/api/conversations/{id}/messages",
 		tenant((*handlers.App).GetInboxConversationMessages),
 	)
@@ -1512,7 +1516,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	)
 	g.POST(
 		"/api/conversations/{id}/read",
-		tenant((*handlers.App).MarkInboxConversationRead),
+		// The read handler owns a short committed tenant phase and performs
+		// optional provider receipt I/O only after that commit.
+		app.MarkInboxConversationRead,
 	)
 	g.PUT(
 		"/api/conversations/{id}/ai",

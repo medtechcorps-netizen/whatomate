@@ -1041,6 +1041,15 @@ func persistInboundChannelMessage(
 	if err := tx.Create(&message).Error; err != nil {
 		return err
 	}
+	if message.IngestedAt == nil || message.IngestedAt.IsZero() {
+		var persistedMessage models.Message
+		if err := tx.Select("ingested_at").
+			Where("id = ? AND organization_id = ?", message.ID, account.OrganizationID).
+			First(&persistedMessage).Error; err != nil {
+			return err
+		}
+		message.IngestedAt = persistedMessage.IngestedAt
+	}
 	parts := persistentMessageParts(account.OrganizationID, conversation.ID, message.ID, inbound.Parts)
 	if len(parts) > 0 {
 		if err := tx.Create(&parts).Error; err != nil {
@@ -1060,28 +1069,91 @@ func persistInboundChannelMessage(
 	}
 
 	preview := messagePreview(inbound.Parts)
-	when := inbound.ReceivedAt
-	if when.IsZero() {
-		when = time.Now().UTC()
-	}
+	activityAt := message.EffectiveIngestedAt()
 	if err := tx.Model(&models.Contact{}).
 		Where("id = ? AND organization_id = ?", contact.ID, account.OrganizationID).
 		Updates(map[string]any{
-			"last_message_at":      when,
-			"last_inbound_at":      when,
-			"last_message_preview": preview,
-			"is_read":              false,
-			"updated_at":           when,
+			"last_message_at": gorm.Expr(
+				"GREATEST(COALESCE(last_message_at, ?), ?)",
+				activityAt,
+				activityAt,
+			),
+			"last_inbound_at": gorm.Expr(
+				"GREATEST(COALESCE(last_inbound_at, ?), ?)",
+				activityAt,
+				activityAt,
+			),
+			"last_message_preview": gorm.Expr(
+				`CASE WHEN NOT EXISTS (
+					SELECT 1
+					FROM messages AS newer_message
+					WHERE newer_message.organization_id = ?
+					  AND newer_message.contact_id = ?
+					  AND newer_message.deleted_at IS NULL
+					  AND (
+						COALESCE(newer_message.ingested_at, newer_message.created_at) > ?
+						OR (
+						  COALESCE(newer_message.ingested_at, newer_message.created_at) = ?
+						  AND newer_message.id > ?
+						)
+					  )
+				 ) THEN ? ELSE last_message_preview END`,
+				account.OrganizationID,
+				contact.ID,
+				activityAt,
+				activityAt,
+				message.ID,
+				preview,
+			),
+			"is_read": false,
+			"updated_at": gorm.Expr(
+				"GREATEST(COALESCE(updated_at, ?), ?)",
+				activityAt,
+				activityAt,
+			),
 		}).Error; err != nil {
 		return err
 	}
 	conversationUpdates := map[string]any{
-		"status":               models.InboxConversationStatusOpen,
-		"last_message_at":      when,
-		"last_inbound_at":      when,
-		"last_message_preview": preview,
-		"unread_count":         gorm.Expr("unread_count + 1"),
-		"updated_at":           when,
+		"status": models.InboxConversationStatusOpen,
+		"last_message_at": gorm.Expr(
+			"GREATEST(COALESCE(last_message_at, ?), ?)",
+			activityAt,
+			activityAt,
+		),
+		"last_inbound_at": gorm.Expr(
+			"GREATEST(COALESCE(last_inbound_at, ?), ?)",
+			activityAt,
+			activityAt,
+		),
+		"last_message_preview": gorm.Expr(
+			`CASE WHEN NOT EXISTS (
+				SELECT 1
+				FROM messages AS newer_message
+				WHERE newer_message.organization_id = ?
+				  AND newer_message.inbox_conversation_id = ?
+				  AND newer_message.deleted_at IS NULL
+				  AND (
+					COALESCE(newer_message.ingested_at, newer_message.created_at) > ?
+					OR (
+					  COALESCE(newer_message.ingested_at, newer_message.created_at) = ?
+					  AND newer_message.id > ?
+					)
+				  )
+			 ) THEN ? ELSE last_message_preview END`,
+			account.OrganizationID,
+			conversation.ID,
+			activityAt,
+			activityAt,
+			message.ID,
+			preview,
+		),
+		"unread_count": gorm.Expr("unread_count + 1"),
+		"updated_at": gorm.Expr(
+			"GREATEST(COALESCE(updated_at, ?), ?)",
+			activityAt,
+			activityAt,
+		),
 	}
 	if serviceWindowEndsAt := channelapi.InboundServiceWindowEndsAt(
 		account.Channel,

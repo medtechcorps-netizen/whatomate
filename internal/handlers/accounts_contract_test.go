@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
@@ -478,7 +479,6 @@ func TestUpdateAccountPendingRecoveryRejectsContractChangeWithoutMetaOrMutation(
 		Status:         "pending_registration",
 	}
 	require.NoError(t, app.DB.Create(account).Error)
-
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":         "Must Not Replace Pending Claim",
 		"phone_id":     phoneID,
@@ -523,6 +523,22 @@ func TestUpdateAccountPendingRecoveryNonContractEditPreservesClaimCiphertexts(t 
 		Status:         "pending_registration",
 	}
 	require.NoError(t, app.DB.Create(account).Error)
+	shadow := &models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    org.ID,
+		Channel:           models.ChannelWhatsApp,
+		Provider:          channelapi.LegacyMetaProvider,
+		Name:              "WhatsApp " + account.Name + " [" + account.ID.String() + "]",
+		ExternalAccountID: "legacy-account:" + account.ID.String(),
+		Status:            models.ChannelAccountStatusSuspended,
+		Capabilities:      models.JSONB{"text": true, "replies": true, "service_window": true},
+		Config:            models.JSONB{"legacy_read_only": true, "outbound_enabled": false, "reply_route": "chat"},
+		Metadata: models.JSONB{
+			"legacy_account_id":   account.ID.String(),
+			"legacy_account_name": account.Name,
+		},
+	}
+	require.NoError(t, app.DB.Create(shadow).Error)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
 		"name":              "Safe Pending Display Edit",
@@ -541,6 +557,10 @@ func TestUpdateAccountPendingRecoveryNonContractEditPreservesClaimCiphertexts(t 
 	assert.True(t, stored.AutoReadReceipt)
 	assert.Equal(t, accessToken, stored.AccessToken)
 	assert.Equal(t, pinCiphertext, stored.Pin)
+	var storedShadow models.ChannelAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", shadow.ID, org.ID).
+		First(&storedShadow).Error)
+	assert.Equal(t, "Safe Pending Display Edit", storedShadow.Metadata["legacy_account_name"])
 }
 
 func TestUpdateAccountActiveStalePUTCannotOverwriteEmbeddedSignupTokenRefresh(t *testing.T) {

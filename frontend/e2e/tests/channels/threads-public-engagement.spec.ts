@@ -172,6 +172,16 @@ async function mockChannels(
       json: { data: { accounts: options.accounts ?? [] } },
     })
   })
+  await page.route(/\/api\/conversations\/attention-summary(?:\?.*)?$/, route =>
+    route.fulfill({
+      json: {
+        data: {
+          unread_conversations: 0,
+          as_of: '2026-07-28T08:00:00Z',
+        },
+      },
+    }),
+  )
   await page.route(/\/api\/conversations(?:\?.*)?$/, route =>
     route.fulfill({
       json: {

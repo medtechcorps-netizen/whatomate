@@ -2567,10 +2567,11 @@ func verifyPlatformComplianceIdentityRegistryContract(
 }
 
 type platformComplianceProductTrigger struct {
-	name         string
-	function     string
-	typeBits     int
-	functionBody string
+	name          string
+	function      string
+	typeBits      int
+	updateColumns []string
+	functionBody  string
 }
 
 var platformComplianceProductTriggers = map[string][]platformComplianceProductTrigger{
@@ -2644,6 +2645,30 @@ var platformComplianceProductTriggers = map[string][]platformComplianceProductTr
 		END;`,
 		},
 	},
+	"messages": {
+		{
+			name:          "trg_messages_ingestion_order",
+			function:      "rereply_set_message_ingestion_order",
+			typeBits:      23,
+			updateColumns: []string{"inbox_conversation_id"},
+			functionBody:  functionBodyFromCreateSQL(messageIngestionOrderFunctionSQL),
+		},
+		{
+			name:         "trg_messages_cleanup_read_cursors",
+			function:     "rereply_cleanup_deleted_message_read_cursors",
+			typeBits:     11,
+			functionBody: functionBodyFromCreateSQL(deletedMessageReadCursorCleanupFunctionSQL),
+		},
+	},
+	"conversation_reads": {
+		{
+			name:          "trg_conversation_reads_ingestion_order",
+			function:      "rereply_set_conversation_read_ingestion_order",
+			typeBits:      23,
+			updateColumns: []string{"last_read_message_id", "last_read_at"},
+			functionBody:  functionBodyFromCreateSQL(conversationReadIngestionOrderFunctionSQL),
+		},
+	},
 }
 
 func normalizePlatformComplianceFunctionBody(value string) string {
@@ -2678,12 +2703,16 @@ func verifyPlatformComplianceExactTableTriggerSet(
 		return fmt.Errorf("platform compliance trigger/rule set is not exact on public.%s", table)
 	}
 	for _, expected := range expectedProducts {
+		expectedUpdateColumns := append([]string(nil), expected.updateColumns...)
+		sort.Strings(expectedUpdateColumns)
 		var actual struct {
-			Source          string `gorm:"column:source"`
-			Owner           string `gorm:"column:owner_name"`
-			Language        string `gorm:"column:language"`
-			SecurityDefiner bool   `gorm:"column:security_definer"`
-			Valid           bool   `gorm:"column:valid"`
+			Source               string `gorm:"column:source"`
+			Owner                string `gorm:"column:owner_name"`
+			Language             string `gorm:"column:language"`
+			SecurityDefiner      bool   `gorm:"column:security_definer"`
+			UpdateColumns        string `gorm:"column:update_columns"`
+			UpdateAttributeCount int    `gorm:"column:update_attribute_count"`
+			Valid                bool   `gorm:"column:valid"`
 		}
 		result := db.Raw(`
 			SELECT
@@ -2691,6 +2720,16 @@ func verifyPlatformComplianceExactTableTriggerSet(
 				owner.rolname::text AS owner_name,
 				language.lanname AS language,
 				procedure.prosecdef AS security_definer,
+				COALESCE(pg_catalog.cardinality(trigger.tgattr::smallint[]), 0) AS update_attribute_count,
+				COALESCE((
+					SELECT pg_catalog.string_agg(attribute.attname, ',' ORDER BY attribute.attname)
+					FROM pg_catalog.unnest(trigger.tgattr::smallint[])
+						WITH ORDINALITY AS trigger_column(attnum, ordinality)
+					JOIN pg_catalog.pg_attribute AS attribute
+					  ON attribute.attrelid = relation.oid
+					 AND attribute.attnum = trigger_column.attnum
+					 AND NOT attribute.attisdropped
+				), '') AS update_columns,
 				(
 					trigger.tgenabled = 'O'
 					AND trigger.tgtype = CAST(? AS smallint)
@@ -2701,7 +2740,6 @@ func verifyPlatformComplianceExactTableTriggerSet(
 					AND NOT trigger.tgdeferrable
 					AND NOT trigger.tginitdeferred
 					AND trigger.tgqual IS NULL
-					AND trigger.tgattr::text = ''
 					AND trigger.tgoldtable IS NULL
 					AND trigger.tgnewtable IS NULL
 					AND procedure.pronargs = 0
@@ -2717,6 +2755,7 @@ func verifyPlatformComplianceExactTableTriggerSet(
 			  AND relation.relname = CAST(? AS text)
 			  AND trigger.tgname = CAST(? AS text)
 			  AND NOT trigger.tgisinternal
+			  AND procedure.pronamespace = namespace.oid
 			  AND procedure.proname = CAST(? AS text)
 		`, expected.typeBits, table, expected.name, expected.function).Scan(&actual)
 		if result.Error != nil {
@@ -2724,6 +2763,8 @@ func verifyPlatformComplianceExactTableTriggerSet(
 		}
 		if result.RowsAffected != 1 || !actual.Valid || actual.Owner != expectedOwner ||
 			actual.Language != "plpgsql" || actual.SecurityDefiner ||
+			actual.UpdateAttributeCount != len(expectedUpdateColumns) ||
+			actual.UpdateColumns != strings.Join(expectedUpdateColumns, ",") ||
 			normalizePlatformComplianceFunctionBody(actual.Source) != normalizePlatformComplianceFunctionBody(expected.functionBody) {
 			return fmt.Errorf("product trigger %q on public.%s does not match the platform compliance contract", expected.name, table)
 		}
@@ -2774,7 +2815,14 @@ func verifyPlatformComplianceAuditIndexes(db *gorm.DB) error {
 					AND index_state.indimmediate
 					AND NOT index_state.indisprimary
 					AND NOT index_state.indisexclusion
-					AND NOT index_state.indnullsnotdistinct
+					-- indnullsnotdistinct is a PostgreSQL 15+ catalog column. Reading
+					-- the catalog row through JSON keeps PostgreSQL 14 supported (a
+					-- missing key is NULL/default false) while still rejecting a
+					-- PG15+ UNIQUE NULLS NOT DISTINCT index.
+					AND NOT COALESCE(
+						(pg_catalog.to_jsonb(index_state)->>'indnullsnotdistinct')::boolean,
+						false
+					)
 					AND index_state.indnkeyatts = index_state.indnatts
 					AND index_state.indexprs IS NULL
 					AND index_state.indpred IS NOT NULL

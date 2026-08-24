@@ -38,6 +38,7 @@ const mocks = vi.hoisted(() => ({
     onNoteDeleted: vi.fn(),
     clearNotes: vi.fn(),
   },
+  omnichannelUnreadStore: { resetForIdentityChange: vi.fn() },
   markRead: vi.fn().mockResolvedValue(undefined),
   toastInfo: vi.fn(),
   toastWarning: vi.fn(),
@@ -70,6 +71,9 @@ vi.mock('@/stores/auth', () => ({
 }))
 vi.mock('@/stores/notes', () => ({
   useNotesStore: () => mocks.notesStore,
+}))
+vi.mock('@/stores/omnichannelUnread', () => ({
+  useOmnichannelUnreadStore: () => mocks.omnichannelUnreadStore,
 }))
 vi.mock('@/services/api', () => ({
   contactsService: { markRead: mocks.markRead },
@@ -362,6 +366,7 @@ describe('WebSocketService realtime reliability', () => {
     expect(mocks.contactsStore.fetchContacts).not.toHaveBeenCalled()
     expect(mocks.contactsStore.resetForIdentityChange).toHaveBeenCalledTimes(1)
     expect(mocks.notesStore.clearNotes).toHaveBeenCalledTimes(1)
+    expect(mocks.omnichannelUnreadStore.resetForIdentityChange).toHaveBeenCalledTimes(1)
     expect(mocks.tagsStore.resetForIdentityChange).toHaveBeenCalledTimes(1)
     expect(mocks.transfersStore.resetForIdentityChange).toHaveBeenCalledTimes(1)
     expect(mocks.callingStore.resetForIdentityChange).toHaveBeenCalledTimes(1)
@@ -425,6 +430,47 @@ describe('WebSocketService realtime reliability', () => {
     unsubscribe()
     socket.receive({ type: 'channel_sync', payload: { event_id: 'event-3' } })
     expect(activity).toHaveBeenCalledTimes(4)
+  })
+
+  it('never marks a current-contact message read without Chat viewport evidence', async () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+    const focus = vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+    try {
+      mocks.contactsStore.currentContact = { id: 'contact-1' }
+      service = await loadService()
+      await service.connect(async () => 'ws-token')
+      const socket = FakeWebSocket.instances[0]
+      socket.open()
+      mocks.contactsStore.fetchContacts.mockClear()
+      mocks.contactsStore.addMessage.mockClear()
+      mocks.markRead.mockClear()
+
+      socket.receive({
+        type: 'new_message',
+        payload: {
+          id: 'message-visible-1',
+          contact_id: 'contact-1',
+          direction: 'incoming',
+          status: 'received',
+          whatsapp_account: 'account-b',
+          ingested_at: '2026-08-24T12:00:01Z',
+        },
+      })
+      await Promise.resolve()
+
+      expect(mocks.markRead).not.toHaveBeenCalled()
+      expect(mocks.contactsStore.addMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'message-visible-1',
+          whatsapp_account: 'account-b',
+          ingested_at: '2026-08-24T12:00:01Z',
+        }),
+      )
+      expect(mocks.contactsStore.fetchContacts).toHaveBeenCalledTimes(1)
+    } finally {
+      visibility.mockRestore()
+      focus.mockRestore()
+    }
   })
 
   it('lets a new identity refresh while an old generation refresh is still pending', async () => {

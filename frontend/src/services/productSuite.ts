@@ -637,6 +637,11 @@ export interface InboxConversation {
   }
 }
 
+export interface InboxAttentionSummary {
+  unread_conversations: number
+  as_of: string
+}
+
 export const productService = {
   plans: () => api.get<APIEnvelope<{ plans: PlanSummary[] }>>('/product/plans'),
   subscription: () => api.get<APIEnvelope<SubscriptionSummary>>('/product/subscription'),
@@ -894,6 +899,16 @@ export const channelsService = {
     fetchAllPages<InboxConversation>('conversations', (page, limit) =>
       api.get('/conversations', { params: { ...params, page, limit } }),
     ),
+  attentionSummary: (organizationId: string, signal?: AbortSignal) => {
+    const explicitOrganizationId = organizationId.trim()
+    if (!explicitOrganizationId) {
+      throw new Error('Organization is required for an inbox attention summary')
+    }
+    return api.get<APIEnvelope<InboxAttentionSummary>>('/conversations/attention-summary', {
+      signal,
+      headers: { 'X-Organization-ID': explicitOrganizationId },
+    })
+  },
   messages: (id: string, params?: { before?: string; limit?: number }) =>
     api.get(`/conversations/${id}/messages`, { params }),
   send: (id: string, data: Record<string, unknown>) => api.post(`/conversations/${id}/messages`, data),
@@ -915,6 +930,18 @@ export const channelsService = {
       headers: { 'X-Organization-ID': explicitOrganizationId },
     })
   },
-  markRead: (id: string) => api.post(`/conversations/${id}/read`),
+  markRead: (
+    id: string,
+    data: { last_visible_message_id?: string; external_message_ids?: string[] } | undefined,
+    organizationId: string,
+  ) => {
+    const explicitOrganizationId = organizationId.trim()
+    if (!explicitOrganizationId) {
+      throw new Error('Organization is required to mark an inbox conversation read')
+    }
+    return api.post(`/conversations/${id}/read`, data ?? {}, {
+      headers: { 'X-Organization-ID': explicitOrganizationId },
+    })
+  },
   setAIState: (id: string, paused: boolean) => api.put(`/conversations/${id}/ai`, { paused }),
 }

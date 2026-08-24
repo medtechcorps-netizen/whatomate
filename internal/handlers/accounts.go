@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
@@ -44,6 +45,7 @@ var (
 	errSubscriptionRecoverySuperseded             = errors.New("subscription recovery was superseded")
 	errPhoneWebhookOverrideAccountInactive        = errors.New("phone webhook override account is inactive")
 	errPhoneWebhookOverrideCredentialsUnavailable = errors.New("phone webhook override credentials are unavailable")
+	errWhatsAppAccountUpdateSuperseded            = errors.New("WhatsApp account update was superseded")
 )
 
 // canonicalPhoneWebhookOrigin is intentionally a fixed production origin.
@@ -380,30 +382,61 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		if req.Name != "" {
 			updatedName = req.Name
 		}
-		result := a.DB.Model(&models.WhatsAppAccount{}).
-			Where(
-				"id = ? AND organization_id = ? AND status = ? AND updated_at = ? AND access_token = ? AND pin = ?",
-				account.ID,
+		updateErr := a.DB.Transaction(func(tx *gorm.DB) error {
+			shadowPrepared, err := channelapi.StageLegacyMetaWhatsAppAccountRename(
+				tx,
 				orgID,
-				accountStatus,
-				originalUpdatedAt,
-				originalAccessTokenCiphertext,
-				originalPINCiphertext,
-			).
-			Updates(map[string]any{
-				"name":                     updatedName,
-				"auto_read_receipt":        req.AutoReadReceipt,
-				"business_calling_enabled": req.BusinessCallingEnabled,
-				"is_default_incoming":      req.IsDefaultIncoming,
-				"is_default_outgoing":      req.IsDefaultOutgoing,
-				"updated_by_id":            userID,
-			})
-		if result.Error != nil {
-			a.Log.Error("Failed to update pending WhatsApp account", "account_id", account.ID)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
-		}
-		if result.RowsAffected != 1 {
+				account.ID,
+				account.Name,
+				updatedName,
+			)
+			if err != nil {
+				return err
+			}
+			result := tx.Model(&models.WhatsAppAccount{}).
+				Where(
+					"id = ? AND organization_id = ? AND status = ? AND updated_at = ? AND access_token = ? AND pin = ?",
+					account.ID,
+					orgID,
+					accountStatus,
+					originalUpdatedAt,
+					originalAccessTokenCiphertext,
+					originalPINCiphertext,
+				).
+				Updates(map[string]any{
+					"name":                     updatedName,
+					"auto_read_receipt":        req.AutoReadReceipt,
+					"business_calling_enabled": req.BusinessCallingEnabled,
+					"is_default_incoming":      req.IsDefaultIncoming,
+					"is_default_outgoing":      req.IsDefaultOutgoing,
+					"updated_by_id":            userID,
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errWhatsAppAccountUpdateSuperseded
+			}
+			if !shadowPrepared {
+				return channelapi.FinalizeLegacyMetaWhatsAppAccountRename(
+					tx,
+					orgID,
+					account.ID,
+					account.Name,
+					updatedName,
+				)
+			}
+			return nil
+		})
+		if errors.Is(updateErr, errWhatsAppAccountUpdateSuperseded) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account recovery changed; reload and try again", nil, "")
+		}
+		if errors.Is(updateErr, channelapi.ErrLegacyMetaBridgeConflict) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account Omnichannel binding changed; reload and try again", nil, "")
+		}
+		if updateErr != nil {
+			a.Log.Error("Failed to update pending WhatsApp account", "error", updateErr, "account_id", account.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
 		}
 		if req.IsDefaultIncoming && !account.IsDefaultIncoming {
 			a.DB.Model(&models.WhatsAppAccount{}).
@@ -513,23 +546,54 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 	if accountContractChanged {
 		updates["status"] = "pending_subscription"
 	}
-	result := a.DB.Model(&models.WhatsAppAccount{}).
-		Where(
-			"id = ? AND organization_id = ? AND status = ? AND updated_at = ? AND access_token = ? AND pin = ?",
-			account.ID,
+	updateErr := a.DB.Transaction(func(tx *gorm.DB) error {
+		shadowPrepared, err := channelapi.StageLegacyMetaWhatsAppAccountRename(
+			tx,
 			orgID,
-			originalStatus,
-			originalUpdatedAt,
-			originalAccessTokenCiphertext,
-			originalPINCiphertext,
-		).
-		Updates(updates)
-	if result.Error != nil {
-		a.Log.Error("Failed to update account", "error", result.Error)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
-	}
-	if result.RowsAffected != 1 {
+			account.ID,
+			oldAccount.Name,
+			account.Name,
+		)
+		if err != nil {
+			return err
+		}
+		result := tx.Model(&models.WhatsAppAccount{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ? AND updated_at = ? AND access_token = ? AND pin = ?",
+				account.ID,
+				orgID,
+				originalStatus,
+				originalUpdatedAt,
+				originalAccessTokenCiphertext,
+				originalPINCiphertext,
+			).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errWhatsAppAccountUpdateSuperseded
+		}
+		if !shadowPrepared {
+			return channelapi.FinalizeLegacyMetaWhatsAppAccountRename(
+				tx,
+				orgID,
+				account.ID,
+				oldAccount.Name,
+				account.Name,
+			)
+		}
+		return nil
+	})
+	if errors.Is(updateErr, errWhatsAppAccountUpdateSuperseded) {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account changed; reload and try again", nil, "")
+	}
+	if errors.Is(updateErr, channelapi.ErrLegacyMetaBridgeConflict) {
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account Omnichannel binding changed; reload and try again", nil, "")
+	}
+	if updateErr != nil {
+		a.Log.Error("Failed to update account", "error", updateErr)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
 	}
 	if req.IsDefaultIncoming && !oldAccount.IsDefaultIncoming {
 		a.DB.Model(&models.WhatsAppAccount{}).

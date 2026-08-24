@@ -5,12 +5,14 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
+	"gorm.io/gorm"
 )
 
 // --- ListAccounts Tests ---
@@ -493,6 +495,100 @@ func TestApp_UpdateAccount_PartialUpdate(t *testing.T) {
 	assert.Equal(t, account.PhoneID, resp.Data.PhoneID)
 	assert.Equal(t, account.BusinessID, resp.Data.BusinessID)
 	assert.Equal(t, account.APIVersion, resp.Data.APIVersion)
+}
+
+func TestApp_UpdateAccount_RenameRefreshesOnlyBoundTenantLegacyShadow(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	otherOrg := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	otherAccount := testutil.CreateTestWhatsAppAccount(t, app.DB, otherOrg.ID)
+	shadow := createLegacyRenameShadow(t, app.DB, account)
+	otherShadow := createLegacyRenameShadow(t, app.DB, otherAccount)
+
+	req := testutil.NewJSONRequest(t, map[string]any{"name": "Renamed Main Account"})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", account.ID.String())
+	require.NoError(t, app.UpdateAccount(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var storedAccount models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).
+		First(&storedAccount).Error)
+	assert.Equal(t, "Renamed Main Account", storedAccount.Name)
+
+	var storedShadow models.ChannelAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", shadow.ID, org.ID).
+		First(&storedShadow).Error)
+	assert.Equal(t, "Renamed Main Account", storedShadow.Metadata["legacy_account_name"])
+	assert.Contains(t, storedShadow.Name, "Renamed Main Account")
+	boundAccountID, err := channelapi.LegacyMetaWhatsAppAccountID(&storedShadow)
+	require.NoError(t, err)
+	assert.Equal(t, account.ID, boundAccountID)
+
+	var untouchedShadow models.ChannelAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", otherShadow.ID, otherOrg.ID).
+		First(&untouchedShadow).Error)
+	assert.Equal(t, otherAccount.Name, untouchedShadow.Metadata["legacy_account_name"])
+}
+
+func TestApp_UpdateAccount_RenameRollsBackWhenLegacyShadowNameIsInconsistent(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createAdminUser(t, app, org.ID)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	shadow := createLegacyRenameShadow(t, app.DB, account)
+	require.NoError(t, app.DB.Model(&models.ChannelAccount{}).
+		Where("id = ? AND organization_id = ?", shadow.ID, org.ID).
+		Update("metadata", models.JSONB{
+			"legacy_account_id":   account.ID.String(),
+			"legacy_account_name": "unexpected-account-name",
+		}).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{"name": "Must Not Commit"})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", account.ID.String())
+	require.NoError(t, app.UpdateAccount(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "Omnichannel binding changed")
+
+	var storedAccount models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).
+		First(&storedAccount).Error)
+	assert.Equal(t, account.Name, storedAccount.Name)
+	var storedShadow models.ChannelAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", shadow.ID, org.ID).
+		First(&storedShadow).Error)
+	assert.Equal(t, "unexpected-account-name", storedShadow.Metadata["legacy_account_name"])
+}
+
+func createLegacyRenameShadow(
+	t *testing.T,
+	db *gorm.DB,
+	account *models.WhatsAppAccount,
+) *models.ChannelAccount {
+	t.Helper()
+	shadow := &models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    account.OrganizationID,
+		Channel:           models.ChannelWhatsApp,
+		Provider:          channelapi.LegacyMetaProvider,
+		Name:              "WhatsApp " + account.Name + " [" + account.ID.String() + "]",
+		ExternalAccountID: "legacy-account:" + account.ID.String(),
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{"text": true, "replies": true, "service_window": true},
+		Config:            models.JSONB{"legacy_read_only": true, "outbound_enabled": false, "reply_route": "chat"},
+		Metadata: models.JSONB{
+			"legacy_account_id":   account.ID.String(),
+			"legacy_account_name": account.Name,
+		},
+	}
+	require.NoError(t, db.Create(shadow).Error)
+	return shadow
 }
 
 func TestApp_UpdateAccount_RejectsAppCredentialsAndPreservesLegacyValues(t *testing.T) {

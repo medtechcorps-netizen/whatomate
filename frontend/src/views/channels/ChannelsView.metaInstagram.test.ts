@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
     callback("connected");
     return vi.fn();
   }),
+  refreshUnread: vi.fn().mockResolvedValue(true),
 }));
 
 const organizationId = mocks.organizationId;
@@ -45,6 +46,7 @@ vi.mock("@/composables/useAppToast", () => ({
 vi.mock("@/stores/auth", () => ({
   useAuthStore: () => ({
     organizationId: mocks.organizationId,
+    user: { id: 'agent-1' },
     hasPermission: () => true,
     hasProductEntitlement: () => true,
   }),
@@ -58,7 +60,14 @@ vi.mock("@/stores/organizations", () => ({
   }),
 }));
 
+vi.mock("@/stores/omnichannelUnread", () => ({
+  useOmnichannelUnreadStore: () => ({ refresh: mocks.refreshUnread }),
+}));
+
 vi.mock("@/services/websocket", () => ({
+  isInboxContentRefreshActivity: (event: { type: string; payload?: any }) =>
+    event.type !== "status_update"
+    && !(event.type === "realtime_sync" && event.payload?.kind === "message_status_changed"),
   wsService: {
     getConnectionState: () => "connected",
     connect: mocks.connectWebSocket,

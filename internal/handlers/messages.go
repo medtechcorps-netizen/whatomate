@@ -202,6 +202,17 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	// and lock the canonical contact in the same transaction so a concurrent
 	// merge cannot strand either write on a soft-deleted alias.
 	err := a.outgoingPreProviderTransaction(ctx, organizationID, opts.Async, func(tx *gorm.DB) error {
+		if req.legacyWhatsAppReply != nil {
+			// The legacy bridge owns ChannelAccount before Conversation. Establish
+			// that prefix before resolving (and locking) Contact.
+			if lockErr := lockStrictLegacyReplyOrder(
+				tx,
+				organizationID,
+				req.legacyWhatsAppReply,
+			); lockErr != nil {
+				return lockErr
+			}
+		}
 		contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
 			tx,
 			organizationID,
@@ -360,28 +371,7 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	req.Contact = &canonicalContact
 	req.ReplyToMessage = validatedReply
 	if req.legacyWhatsAppReply == nil {
-		if opts.Async && a.usesCurrentTenantPreProvider(organizationID) {
-			a.mirrorLegacyWhatsAppMessageInSavepoint(
-				ctx,
-				req.Account,
-				msg.ID,
-			)
-		} else if mirrorErr := a.outgoingTenantTransaction(
-			ctx,
-			organizationID,
-			func(tx *gorm.DB) error {
-				a.scopedApp(tx, organizationID).
-					mirrorLegacyWhatsAppMessage(req.Account, msg.ID)
-				return nil
-			},
-		); mirrorErr != nil {
-			a.Log.Error(
-				"Failed to run legacy WhatsApp mirror phase",
-				"error", mirrorErr,
-				"organization_id", organizationID,
-				"message_id", msg.ID,
-			)
-		}
+		a.mirrorLegacyWhatsAppMessageAfterCommit(req.Account, msg.ID)
 	}
 
 	// 2. Define the send function based on message type
@@ -630,6 +620,15 @@ func (a *App) deliverOutgoingMessage(
 		ctx,
 		req.Account.OrganizationID,
 		func(tx *gorm.DB, providerAttempted *bool) error {
+			if req.legacyWhatsAppReply != nil {
+				if lockErr := lockStrictLegacyReplyOrder(
+					tx,
+					req.Account.OrganizationID,
+					req.legacyWhatsAppReply,
+				); lockErr != nil {
+					return lockErr
+				}
+			}
 			contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
 				tx,
 				req.Account.OrganizationID,
@@ -1353,6 +1352,7 @@ func (a *App) broadcastNewMessage(orgID uuid.UUID, msg *models.Message, contact 
 	payload := map[string]any{
 		"id":               msg.ID.String(),
 		"contact_id":       contact.ID.String(),
+		"whatsapp_account": msg.WhatsAppAccount,
 		"assigned_user_id": assignedUserIDStr,
 		"profile_name":     profileName,
 		"direction":        msg.Direction,
@@ -1364,6 +1364,7 @@ func (a *App) broadcastNewMessage(orgID uuid.UUID, msg *models.Message, contact 
 		"interactive_data": msg.InteractiveData,
 		"status":           msg.Status,
 		"wamid":            msg.WhatsAppMessageID,
+		"ingested_at":      msg.IngestedAt,
 		"created_at":       msg.CreatedAt,
 		"updated_at":       msg.UpdatedAt,
 		"is_reply":         msg.IsReply,
@@ -1401,7 +1402,7 @@ func (a *App) broadcastNewMessage(orgID uuid.UUID, msg *models.Message, contact 
 		ContactID:      &contactID,
 		MessageID:      &msg.ID,
 		Status:         string(msg.Status),
-		OccurredAt:     msg.CreatedAt,
+		OccurredAt:     msg.EffectiveIngestedAt(),
 	}, &fallback)
 }
 
@@ -1936,6 +1937,7 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 		Status:          message.Status,
 		IsReply:         message.IsReply,
 		WhatsAppAccount: message.WhatsAppAccount,
+		IngestedAt:      message.IngestedAt,
 		CreatedAt:       message.CreatedAt,
 		UpdatedAt:       message.UpdatedAt,
 	}

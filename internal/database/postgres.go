@@ -241,7 +241,14 @@ func GetMigrationModels() []MigrationModel {
 
 // AutoMigrate runs auto migration for all models (silent mode)
 func AutoMigrate(db *gorm.DB) error {
+	return withMigrationSession(db, autoMigrateOnSession)
+}
+
+func autoMigrateOnSession(db *gorm.DB) error {
 	if err := PrepareProviderIntegrationManagementMode(db); err != nil {
+		return err
+	}
+	if err := PrepareMessageIngestionOrder(db); err != nil {
 		return err
 	}
 	migrationModels := GetMigrationModels()
@@ -255,7 +262,220 @@ func AutoMigrate(db *gorm.DB) error {
 			return err
 		}
 	}
+	if err := InstallMessageIngestionOrderTrigger(db); err != nil {
+		return err
+	}
 	return BackfillProviderIntegrationBindings(db)
+}
+
+const migrationAdvisoryLockNamespace int32 = 1380270905
+
+// withMigrationSession pins every migration statement to one PostgreSQL
+// connection, takes a database-scoped session advisory lock, and applies a
+// bounded lock timeout. Pinning matters because CREATE INDEX CONCURRENTLY
+// cannot run inside a transaction, while a transaction-scoped advisory lock
+// would otherwise be the only straightforward way to keep one connection.
+// The database-name hash keeps disposable test databases and independent
+// deployments on the same PostgreSQL cluster from blocking each other.
+func withMigrationSession(db *gorm.DB, migrate func(*gorm.DB) error) error {
+	if db == nil {
+		return errors.New("database is required")
+	}
+	if migrate == nil {
+		return errors.New("migration callback is required")
+	}
+	if db.Name() != "postgres" {
+		return migrate(db.Session(&gorm.Session{NewDB: true}))
+	}
+
+	return db.Connection(func(connection *gorm.DB) (returnErr error) {
+		// Connection returns a handle whose Statement can be reused in place.
+		// Keep a clone-on-use wrapper around its pinned ConnPool so Raw().Scan(),
+		// migrators, and callbacks cannot leak model/table state into each other.
+		session := connection.Session(&gorm.Session{NewDB: true})
+		var acquired bool
+		if err := session.Raw(
+			"SELECT pg_try_advisory_lock(hashtext(current_database()), ?)",
+			migrationAdvisoryLockNamespace,
+		).Scan(&acquired).Error; err != nil {
+			return fmt.Errorf("acquire database migration advisory lock: %w", err)
+		}
+		if !acquired {
+			return errors.New("another database migrator already owns the ReReply migration lock")
+		}
+		defer func() {
+			var unlocked bool
+			if err := session.Raw(
+				"SELECT pg_advisory_unlock(hashtext(current_database()), ?)",
+				migrationAdvisoryLockNamespace,
+			).Scan(&unlocked).Error; err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("release database migration advisory lock: %w", err))
+			} else if !unlocked {
+				returnErr = errors.Join(returnErr, errors.New("database migration advisory lock was not owned at release"))
+			}
+		}()
+
+		var previousLockTimeout string
+		if err := session.Raw("SHOW lock_timeout").Scan(&previousLockTimeout).Error; err != nil {
+			return fmt.Errorf("read database migration lock timeout: %w", err)
+		}
+		var configuredLockTimeout string
+		if err := session.Raw(
+			"SELECT set_config('lock_timeout', '5s', false)",
+		).Scan(&configuredLockTimeout).Error; err != nil {
+			return fmt.Errorf("set database migration lock timeout: %w", err)
+		}
+		defer func() {
+			var restoredLockTimeout string
+			if err := session.Raw(
+				"SELECT set_config('lock_timeout', ?, false)",
+				previousLockTimeout,
+			).Scan(&restoredLockTimeout).Error; err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("restore database migration lock timeout: %w", err))
+			}
+		}()
+
+		return migrate(session)
+	})
+}
+
+// PrepareMessageIngestionOrder adds the nullable rollout column before GORM
+// sees the Message model. Adding the column without a default is a metadata-only
+// change for existing rows; setting the default afterwards does not rewrite or
+// backfill them. Old rows remain NULL and are read through COALESCE(created_at),
+// while every old- or new-binary insert after this preparation receives the
+// database clock. A later maintenance migration can batch-backfill and enforce
+// NOT NULL after all replicas have upgraded.
+func PrepareMessageIngestionOrder(db *gorm.DB) error {
+	if db == nil {
+		return nil
+	}
+	// Keep the additive columns, defaults, and rolling-version trigger contracts
+	// in one PostgreSQL transaction. No old replica can insert a normalized
+	// message or advance a legacy cursor in a partially prepared schema between
+	// these statements.
+	return db.Transaction(func(tx *gorm.DB) error {
+		// Fail fast rather than queue an ACCESS EXCLUSIVE schema lock behind a
+		// long-running production transaction and stall all following traffic on
+		// the same relations. The migration can be retried by the singleton
+		// migrator after the blocker is cleared.
+		if tx.Name() == "postgres" {
+			if err := tx.Exec("SET LOCAL lock_timeout = '5s'").Error; err != nil {
+				return fmt.Errorf("set message-ingestion migration lock timeout: %w", err)
+			}
+		}
+		if tx.Migrator().HasTable(&models.Message{}) {
+			if err := tx.Exec(`
+				ALTER TABLE messages
+				ADD COLUMN IF NOT EXISTS ingested_at timestamptz
+			`).Error; err != nil {
+				return fmt.Errorf("add nullable message ingestion timestamp: %w", err)
+			}
+			if err := tx.Exec(`
+				ALTER TABLE messages
+				ALTER COLUMN ingested_at SET DEFAULT clock_timestamp()
+			`).Error; err != nil {
+				return fmt.Errorf("set message ingestion timestamp default: %w", err)
+			}
+		}
+		if tx.Migrator().HasTable(&models.ConversationRead{}) {
+			if err := tx.Exec(`
+				ALTER TABLE conversation_reads
+				ADD COLUMN IF NOT EXISTS last_read_ingested_at timestamptz
+			`).Error; err != nil {
+				return fmt.Errorf("add nullable conversation-read ingestion cursor: %w", err)
+			}
+		}
+		return InstallMessageIngestionOrderTrigger(tx)
+	})
+}
+
+// InstallMessageIngestionOrderTrigger makes the conversation row the shared
+// commit-order serialization point for message visibility and read cursors.
+// The trigger also protects writes from older replicas during the rolling
+// deployment. clock_timestamp() is assigned only after the conversation lock
+// is acquired, so a message transaction that commits after a completed read
+// cannot retain an older cursor position.
+func InstallMessageIngestionOrderTrigger(db *gorm.DB) error {
+	if db == nil || !db.Migrator().HasTable(&models.Message{}) ||
+		!db.Migrator().HasTable(&models.InboxConversation{}) {
+		return nil
+	}
+	if err := db.Exec(messageIngestionOrderFunctionSQL).Error; err != nil {
+		return fmt.Errorf("create message ingestion-order trigger function: %w", err)
+	}
+	if err := db.Exec(`
+		DO $block$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_trigger
+				WHERE tgname = 'trg_messages_ingestion_order'
+				  AND tgrelid = 'messages'::regclass
+				  AND NOT tgisinternal
+			) THEN
+				CREATE TRIGGER trg_messages_ingestion_order
+				BEFORE INSERT OR UPDATE OF inbox_conversation_id ON messages
+				FOR EACH ROW
+				EXECUTE FUNCTION rereply_set_message_ingestion_order();
+			END IF;
+		END
+		$block$
+	`).Error; err != nil {
+		return fmt.Errorf("install message ingestion-order trigger: %w", err)
+	}
+	if !db.Migrator().HasTable(&models.ConversationRead{}) ||
+		!db.Migrator().HasColumn(&models.ConversationRead{}, "LastReadIngestedAt") {
+		return nil
+	}
+	if err := db.Exec(conversationReadIngestionOrderFunctionSQL).Error; err != nil {
+		return fmt.Errorf("create conversation-read ingestion-order trigger function: %w", err)
+	}
+	if err := db.Exec(`
+		DO $block$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_trigger
+				WHERE tgname = 'trg_conversation_reads_ingestion_order'
+				  AND tgrelid = 'conversation_reads'::regclass
+				  AND NOT tgisinternal
+			) THEN
+				CREATE TRIGGER trg_conversation_reads_ingestion_order
+				BEFORE INSERT OR UPDATE OF last_read_message_id, last_read_at
+				ON conversation_reads
+				FOR EACH ROW
+				EXECUTE FUNCTION rereply_set_conversation_read_ingestion_order();
+			END IF;
+		END
+		$block$
+	`).Error; err != nil {
+		return fmt.Errorf("install conversation-read ingestion-order trigger: %w", err)
+	}
+	if err := db.Exec(deletedMessageReadCursorCleanupFunctionSQL).Error; err != nil {
+		return fmt.Errorf("create deleted-message cursor cleanup function: %w", err)
+	}
+	if err := db.Exec(`
+		DO $block$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_trigger
+				WHERE tgname = 'trg_messages_cleanup_read_cursors'
+				  AND tgrelid = 'messages'::regclass
+				  AND NOT tgisinternal
+			) THEN
+				CREATE TRIGGER trg_messages_cleanup_read_cursors
+				BEFORE DELETE ON messages
+				FOR EACH ROW
+				EXECUTE FUNCTION rereply_cleanup_deleted_message_read_cursors();
+			END IF;
+		END
+		$block$
+	`).Error; err != nil {
+		return fmt.Errorf("install deleted-message cursor cleanup trigger: %w", err)
+	}
+	return nil
 }
 
 // PrepareProviderIntegrationManagementMode adds the mode discriminator before
@@ -353,8 +573,20 @@ func BackfillProviderIntegrationBindings(db *gorm.DB) error {
 
 // RunMigrationWithProgress runs migrations with a progress bar display
 func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) error {
+	return withMigrationSession(db, func(session *gorm.DB) error {
+		return runMigrationWithProgressOnSession(session, adminCfg)
+	})
+}
+
+func runMigrationWithProgressOnSession(db *gorm.DB, adminCfg *config.DefaultAdminConfig) error {
 	// Silence GORM logging during migration
-	silentDB := db.Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)})
+	// Start from a fresh statement while preserving the pinned ConnPool. The
+	// connection callback otherwise carries scalar Raw().Scan() state into ORM
+	// seed operations, leaving GORM without a valid model/table.
+	silentDB := db.Session(&gorm.Session{
+		Logger: logger.Default.LogMode(logger.Silent),
+		NewDB:  true,
+	})
 
 	migrationModels := GetMigrationModels()
 	indexes := getIndexes()
@@ -379,6 +611,10 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 		fmt.Printf("\n  \033[31mProvider management-mode preparation failed\033[0m\n\n")
 		return err
 	}
+	if err := PrepareMessageIngestionOrder(silentDB); err != nil {
+		fmt.Printf("\n  \033[31mMessage ingestion-order preparation failed\033[0m\n\n")
+		return err
+	}
 
 	// Migrate models
 	for _, m := range migrationModels {
@@ -394,6 +630,10 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 			return fmt.Errorf("failed to migrate %s: %w", m.Name, err)
 		}
 		currentStep++
+	}
+	if err := InstallMessageIngestionOrderTrigger(silentDB); err != nil {
+		fmt.Printf("\n  \033[31mMessage ingestion-order trigger installation failed\033[0m\n\n")
+		return err
 	}
 
 	printProgress(currentStep, totalSteps)
@@ -603,6 +843,50 @@ func getIndexes() []string {
 		`CREATE INDEX IF NOT EXISTS idx_copilot_runs_org_contact ON copilot_runs(organization_id, contact_id, created_at DESC)`,
 		// Provider-neutral inbox
 		`CREATE INDEX IF NOT EXISTS idx_messages_inbox_conversation ON messages(inbox_conversation_id, created_at DESC) WHERE inbox_conversation_id IS NOT NULL`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_index AS index_state
+				JOIN pg_catalog.pg_class AS index_class
+				  ON index_class.oid = index_state.indexrelid
+				JOIN pg_catalog.pg_namespace AS index_namespace
+				  ON index_namespace.oid = index_class.relnamespace
+				WHERE index_namespace.nspname = current_schema()
+				  AND index_class.relname IN (
+					'idx_messages_org_inbox_ingested',
+					'idx_messages_org_inbox_ingested_highwater',
+					'idx_messages_org_contact_ingested',
+					'idx_messages_org_contact_account_ingested'
+				  )
+				  AND NOT index_state.indisvalid
+			) THEN
+				RAISE EXCEPTION 'an invalid message ingestion-order pagination index must be dropped concurrently before retrying migration';
+			END IF;
+		END $$`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_inbox_ingested ON messages(organization_id, inbox_conversation_id, (COALESCE(ingested_at, created_at)), id) WHERE inbox_conversation_id IS NOT NULL AND deleted_at IS NULL`,
+		// The ingestion trigger serializes incoming writes on InboxConversation and
+		// reads MAX(ingested_at) while holding that lock. Keep this raw high-water
+		// lookup index aligned with its deleted-inclusive, non-null predicate so a
+		// large transcript does not turn every inbound insert into a table scan.
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_inbox_ingested_highwater ON messages(organization_id, inbox_conversation_id, ingested_at DESC) WHERE ingested_at IS NOT NULL`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_contact_ingested ON messages(organization_id, contact_id, (COALESCE(ingested_at, created_at)), id) WHERE deleted_at IS NULL`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_contact_account_ingested ON messages(organization_id, contact_id, whats_app_account, (COALESCE(ingested_at, created_at)), id) WHERE deleted_at IS NULL`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_index AS index_state
+				JOIN pg_catalog.pg_class AS index_class
+				  ON index_class.oid = index_state.indexrelid
+				JOIN pg_catalog.pg_namespace AS index_namespace
+				  ON index_namespace.oid = index_class.relnamespace
+				WHERE index_namespace.nspname = current_schema()
+				  AND index_class.relname = 'idx_messages_org_inbox_incoming_ingested'
+				  AND NOT index_state.indisvalid
+			) THEN
+				RAISE EXCEPTION 'invalid index idx_messages_org_inbox_incoming_ingested must be dropped concurrently before retrying migration';
+			END IF;
+		END $$`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_inbox_incoming_ingested ON messages(organization_id, inbox_conversation_id, (COALESCE(ingested_at, created_at)), id) WHERE inbox_conversation_id IS NOT NULL AND direction = 'incoming' AND deleted_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_inbox_conversations_org_queue ON inbox_conversations(organization_id, status, priority DESC, last_message_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_inbound_events_processing ON inbound_events(status, next_attempt_at, received_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_outbox_jobs_processing ON outbox_jobs(status, available_at, priority DESC)`,
@@ -741,6 +1025,10 @@ func getIndexes() []string {
 
 // CreateIndexes creates additional indexes not handled by GORM tags
 func CreateIndexes(db *gorm.DB) error {
+	return withMigrationSession(db, createIndexesOnSession)
+}
+
+func createIndexesOnSession(db *gorm.DB) error {
 	for _, idx := range getIndexes() {
 		if err := db.Exec(idx).Error; err != nil {
 			return fmt.Errorf("failed to create index: %w", err)

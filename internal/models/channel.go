@@ -370,14 +370,25 @@ type ConversationRead struct {
 	ReaderKey          string     `gorm:"size:512;not null;uniqueIndex:idx_conversation_reads_reader,priority:3" json:"reader_key"`
 	LastReadMessageID  *uuid.UUID `gorm:"type:uuid;index" json:"last_read_message_id,omitempty"`
 	LastReadExternalID string     `gorm:"size:512" json:"last_read_external_id,omitempty"`
+	// LastReadIngestedAt is the server-order half of the durable cursor. It is
+	// nullable for rolling compatibility with older writers; unread queries
+	// fall back to LastReadAt until those rows are advanced by the new binary.
+	LastReadIngestedAt *time.Time `json:"last_read_ingested_at,omitempty"`
 	LastReadAt         time.Time  `gorm:"not null;index" json:"last_read_at"`
 	Metadata           JSONB      `gorm:"type:jsonb;not null;default:'{}'" json:"metadata"`
 
-	Organization    *Organization            `gorm:"foreignKey:OrganizationID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"organization,omitempty"`
-	Conversation    *InboxConversation       `gorm:"foreignKey:ConversationID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"conversation,omitempty"`
-	Participant     *ConversationParticipant `gorm:"foreignKey:ParticipantID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL" json:"participant,omitempty"`
-	User            *User                    `gorm:"foreignKey:UserID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL" json:"user,omitempty"`
-	LastReadMessage *Message                 `gorm:"foreignKey:LastReadMessageID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL" json:"last_read_message,omitempty"`
+	Organization *Organization            `gorm:"foreignKey:OrganizationID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"organization,omitempty"`
+	Conversation *InboxConversation       `gorm:"foreignKey:ConversationID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"conversation,omitempty"`
+	Participant  *ConversationParticipant `gorm:"foreignKey:ParticipantID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL" json:"participant,omitempty"`
+	User         *User                    `gorm:"foreignKey:UserID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL" json:"user,omitempty"`
+	// Product integrity owns the composite tenant FK
+	// (last_read_message_id, organization_id) -> messages(id, organization_id)
+	// with ON DELETE RESTRICT. A PostgreSQL-14-compatible message-delete trigger
+	// clears only the optional message ID before the constraint is checked.
+	// Excluding this association from AutoMigrate
+	// avoids a conflicting single-column SET NULL constraint while preserving
+	// runtime preload behavior.
+	LastReadMessage *Message `gorm:"foreignKey:LastReadMessageID;-:migration" json:"last_read_message,omitempty"`
 }
 
 func (ConversationRead) TableName() string {

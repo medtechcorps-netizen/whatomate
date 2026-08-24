@@ -175,6 +175,45 @@ describe('contacts store conversation selection', () => {
     expect(store.isLoadingMessages).toBe(false)
   })
 
+  it('orders canonical merges by ingestion time and then message id', async () => {
+    const { useContactsStore } = await import('./contacts')
+    const store = useContactsStore()
+    const activeContact = contact('arrival-order')
+    const existing = {
+      ...message('message-b', activeContact.id),
+      created_at: '2026-08-24T12:00:00Z',
+      ingested_at: '2026-08-24T12:01:00Z',
+    }
+    const delayedHigherID = {
+      ...message('message-z', activeContact.id),
+      created_at: '2026-08-20T09:00:00Z',
+      ingested_at: '2026-08-24T12:02:00.000100Z',
+    }
+    const delayedLowerID = {
+      ...message('message-a', activeContact.id),
+      created_at: '2026-08-19T09:00:00Z',
+      ingested_at: '2026-08-24T12:02:00.000900Z',
+    }
+    mocks.listMessages.mockResolvedValue({
+      data: {
+        data: {
+          messages: [delayedHigherID, delayedLowerID],
+          has_more: false,
+        },
+      },
+    })
+
+    store.setCurrentContact(activeContact)
+    store.messages = [existing]
+    await store.refreshCurrentMessages()
+
+    expect(store.messages.map(item => item.id)).toEqual([
+      'message-b',
+      'message-z',
+      'message-a',
+    ])
+  })
+
   it('aborts and ignores an old tenant contact refresh after identity reset', async () => {
     const { useOrganizationsStore } = await import('./organizations')
     const organizationsStore = useOrganizationsStore()
@@ -296,6 +335,45 @@ describe('contacts store conversation selection', () => {
     expect(store.contacts.find(item => item.id === first.id)?.last_message_at).toBe(
       '2026-01-01T00:00:00Z',
     )
+  })
+
+  it('does not append a message from a different WhatsApp account filter', async () => {
+    const { useContactsStore } = await import('./contacts')
+    const store = useContactsStore()
+    const activeContact = contact('multi-account')
+    store.contacts = [activeContact]
+    store.setCurrentContact(activeContact)
+    store.setAccountFilter('account-a')
+    store.messages = [{
+      ...message('account-a-message', activeContact.id),
+      whatsapp_account: 'account-a',
+    }]
+
+    store.addMessage({
+      ...message('account-b-message', activeContact.id),
+      whatsapp_account: 'account-b',
+    })
+
+    expect(store.messages.map(item => item.id)).toEqual(['account-a-message'])
+    expect(store.contacts[0].unread_count).toBe(1)
+  })
+
+  it('does not append a fieldless rolling-deployment event to an account-filtered transcript', async () => {
+    const { useContactsStore } = await import('./contacts')
+    const store = useContactsStore()
+    const activeContact = contact('mixed-version')
+    store.contacts = [activeContact]
+    store.setCurrentContact(activeContact)
+    store.setAccountFilter('account-a')
+    store.messages = [{
+      ...message('account-a-message', activeContact.id),
+      whatsapp_account: 'account-a',
+    }]
+
+    store.addMessage(message('fieldless-message', activeContact.id))
+
+    expect(store.messages.map(item => item.id)).toEqual(['account-a-message'])
+    expect(store.contacts[0].unread_count).toBe(1)
   })
 
   it('does not append a late send response after contact A changes to B', async () => {

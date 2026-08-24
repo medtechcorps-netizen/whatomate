@@ -344,7 +344,13 @@ func runMigrations(db *gorm.DB) error {
 	if err := database.PrepareProviderIntegrationManagementMode(db); err != nil {
 		return err
 	}
+	if err := database.PrepareMessageIngestionOrder(db); err != nil {
+		return err
+	}
 	if err := db.AutoMigrate(modelsToMigrate...); err != nil {
+		return err
+	}
+	if err := database.InstallMessageIngestionOrderTrigger(db); err != nil {
 		return err
 	}
 	// The shared local PostgreSQL container can contain rows from an interrupted

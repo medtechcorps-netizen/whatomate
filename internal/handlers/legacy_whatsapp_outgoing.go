@@ -135,6 +135,87 @@ func legacyReplyStringJSONValue(value models.JSONB, key string) string {
 	return strings.TrimSpace(result)
 }
 
+// lockStrictLegacyReplyOrder establishes the same global row-lock prefix as
+// the idempotent legacy bridge before the send path resolves (and therefore
+// locks) its canonical Contact. Ordinary mirrors lock ChannelAccount ->
+// ContactIdentity -> InboxConversation -> Contact -> Message, then write the
+// ConversationParticipant. Strict replies must never take any part of that
+// prefix in the opposite order.
+func lockStrictLegacyReplyOrder(
+	tx *gorm.DB,
+	organizationID uuid.UUID,
+	policy *legacyWhatsAppReplyPolicy,
+) error {
+	if tx == nil || organizationID == uuid.Nil || policy == nil ||
+		policy.ChannelAccountID == uuid.Nil || policy.ConversationID == uuid.Nil ||
+		policy.WhatsAppAccountID == uuid.Nil {
+		return fmt.Errorf("%w: strict lock scope is required", errLegacyReplyBindingUnavailable)
+	}
+
+	var shadow models.ChannelAccount
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"id = ? AND organization_id = ?",
+			policy.ChannelAccountID,
+			organizationID,
+		).
+		First(&shadow).Error; err != nil {
+		return fmt.Errorf("%w: lock channel account: %v", errLegacyReplyBindingUnavailable, err)
+	}
+	boundAccountID, err := channelapi.LegacyMetaWhatsAppAccountID(&shadow)
+	if err != nil || shadow.Provider != channelapi.LegacyMetaProvider ||
+		boundAccountID != policy.WhatsAppAccountID {
+		return fmt.Errorf("%w: immutable account mapping", errLegacyReplyBindingUnavailable)
+	}
+
+	// Resolve the immutable identity key without taking the conversation lock;
+	// the final locked query below revalidates every projected field. Ordinary
+	// legacy mirrors lock this identity before they lock the conversation.
+	var conversationProjection models.InboxConversation
+	if err := tx.Select("id, organization_id, channel_account_id, contact_id, contact_identity_id").
+		Where(
+			"id = ? AND organization_id = ? AND channel_account_id = ?",
+			policy.ConversationID,
+			organizationID,
+			policy.ChannelAccountID,
+		).
+		First(&conversationProjection).Error; err != nil ||
+		conversationProjection.ContactIdentityID == nil ||
+		*conversationProjection.ContactIdentityID == uuid.Nil {
+		return fmt.Errorf("%w: conversation identity binding", errLegacyReplyBindingUnavailable)
+	}
+	var identity models.ContactIdentity
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id").
+		Where(
+			"id = ? AND organization_id = ? AND channel_account_id = ? AND contact_id = ?",
+			*conversationProjection.ContactIdentityID,
+			organizationID,
+			policy.ChannelAccountID,
+			conversationProjection.ContactID,
+		).
+		First(&identity).Error; err != nil {
+		return fmt.Errorf("%w: lock contact identity: %v", errLegacyReplyBindingUnavailable, err)
+	}
+
+	var conversation models.InboxConversation
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id").
+		Where(
+			`id = ? AND organization_id = ? AND channel_account_id = ?
+			 AND contact_id = ? AND contact_identity_id = ?`,
+			policy.ConversationID,
+			organizationID,
+			policy.ChannelAccountID,
+			conversationProjection.ContactID,
+			*conversationProjection.ContactIdentityID,
+		).
+		First(&conversation).Error; err != nil {
+		return fmt.Errorf("%w: lock conversation: %v", errLegacyReplyBindingUnavailable, err)
+	}
+	return nil
+}
+
 // validateLegacyReplyPolicyTx re-derives every sensitive binding from locked,
 // tenant-scoped rows. It is called both while creating the pending Message and
 // immediately before the provider request.

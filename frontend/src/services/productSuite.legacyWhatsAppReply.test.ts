@@ -69,4 +69,34 @@ describe('conversation-scoped legacy WhatsApp reply organization header', () => 
     ).toThrow('Organization is required for a WhatsApp reply')
     expect(adapter).not.toHaveBeenCalled()
   })
+
+  it.each([
+    ['attention summary', () => channelsService.attentionSummary('organization-captured')],
+    ['read cursor', () => channelsService.markRead(
+      'conversation-1',
+      { last_visible_message_id: 'message-visible' },
+      'organization-captured',
+    )],
+  ])('pins the captured organization for the %s request', async (_label, requestAction) => {
+    localStorage.setItem('selected_organization_id', 'organization-wrong')
+
+    await requestAction()
+
+    expect(adapter).toHaveBeenCalledTimes(1)
+    expect(request?.headers.get('X-Organization-ID')).toBe('organization-captured')
+  })
+
+  it('fails closed for read-state requests without a captured organization', () => {
+    localStorage.setItem('selected_organization_id', 'organization-wrong')
+
+    expect(() => channelsService.attentionSummary('  ')).toThrow(
+      'Organization is required for an inbox attention summary',
+    )
+    expect(() => channelsService.markRead(
+      'conversation-1',
+      { last_visible_message_id: 'message-visible' },
+      '  ',
+    )).toThrow('Organization is required to mark an inbox conversation read')
+    expect(adapter).not.toHaveBeenCalled()
+  })
 })
