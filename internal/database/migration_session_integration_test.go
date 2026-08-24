@@ -5,12 +5,29 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
+	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestRunMigrationWithProgressKeepsFreshPinnedSessionStatement(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+
+	require.NoError(t, database.RunMigrationWithProgress(
+		db,
+		&config.DefaultAdminConfig{},
+	))
+
+	var permissionCount int64
+	require.NoError(t, db.Model(&models.Permission{}).
+		Where("resource = ? AND action = ?", "users", "read").
+		Count(&permissionCount).Error)
+	require.Equal(t, int64(1), permissionCount)
+}
 
 func TestCreateIndexesRejectsConcurrentMigratorForSameDatabase(t *testing.T) {
 	db := testutil.SetupTestDB(t)
