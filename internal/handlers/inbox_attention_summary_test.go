@@ -703,7 +703,11 @@ func TestDelayedProviderTimestampUsesIngestionOrderForUnreadAndTranscript(t *tes
 	require.Len(t, response.Data.Messages, 2)
 	assert.Equal(t, delayed.ID, response.Data.Messages[0].Message.ID)
 	assert.Equal(t, first.ID, response.Data.Messages[1].Message.ID)
-	assert.Equal(t, delayed.CreatedAt, response.Data.Messages[0].Message.CreatedAt)
+	assert.True(
+		t,
+		delayed.CreatedAt.Equal(response.Data.Messages[0].Message.CreatedAt),
+		"transcript timestamps should represent the same instant regardless of time zone",
+	)
 	assert.NotNil(t, response.Data.Messages[0].Message.IngestedAt)
 
 	beforeRequest := testutil.NewGETRequest(t)

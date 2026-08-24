@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"sync"
 	"testing"
@@ -328,10 +329,10 @@ func TestRealtimeUserTargetFanoutAcrossTwoReplicasWithoutRollingLeakOrOriginEcho
 		t.Fatalf("origin subscriber echoed its own targeted event: %s", duplicate)
 	case <-time.After(150 * time.Millisecond):
 	}
-	oldReceiveContext, cancelOldReceive := context.WithTimeout(context.Background(), 150*time.Millisecond)
-	defer cancelOldReceive()
-	_, err = oldReplicaSubscription.ReceiveMessage(oldReceiveContext)
-	assert.ErrorIs(t, err, context.DeadlineExceeded, "old org-only subscriber must not receive user-targeted events")
+	_, err = oldReplicaSubscription.ReceiveTimeout(context.Background(), 150*time.Millisecond)
+	var timeoutErr net.Error
+	require.ErrorAs(t, err, &timeoutErr)
+	assert.True(t, timeoutErr.Timeout(), "old org-only subscriber must not receive user-targeted events")
 }
 
 type realtimeTestEnvelope struct {
