@@ -99,27 +99,6 @@ func (a *App) logLegacyWhatsAppMessageMirrorError(
 	}
 }
 
-func (a *App) mirrorLegacyWhatsAppRead(
-	organizationID uuid.UUID,
-	contactID uuid.UUID,
-) {
-	if err := channelapi.MarkLegacyWhatsAppConversationRead(
-		a.DB,
-		organizationID,
-		contactID,
-	); err != nil {
-		a.Log.Error(
-			"Failed to mirror legacy WhatsApp read state into omnichannel inbox",
-			"error",
-			err,
-			"organization_id",
-			organizationID,
-			"contact_id",
-			contactID,
-		)
-	}
-}
-
 // syncLegacyVisibleMessagesRead advances the authenticated user's normalized
 // inbox cursor only through legacy WhatsApp messages that the Chat caller
 // explicitly identified as visible after rendering.
