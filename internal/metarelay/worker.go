@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
+	"github.com/shridarpatil/whatomate/internal/models"
 )
 
 type WorkerOption func(*Worker)
@@ -131,13 +132,24 @@ func (w *Worker) ProcessOnce(ctx context.Context) error {
 }
 
 func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
-	// Version 0/1 are legacy static jobs and remain readable for rollback
-	// compatibility. A future producer version is parked, never destroyed by a
-	// worker that does not understand its routing/fence semantics.
-	if job.SchemaVersion > InboundJobSchemaVersion {
+	// Version 0/1 are legacy static jobs, version 2 carries registry/static
+	// routing fields, and version 3 adds an app-bound static Messenger fence.
+	// A future producer version is parked, never destroyed by a worker that does
+	// not understand its routing/fence semantics.
+	if job.SchemaVersion > maxInboundJobSchemaVersion {
 		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
 		defer cancel()
 		return w.store.ParkInbound(settleCtx, job.ID, w.now().UTC().Add(time.Minute))
+	}
+	validStaticMessengerV3 := job.SchemaVersion == staticMessengerInboundJobSchemaVersion &&
+		isStaticMessengerWebhookApp(job.WebhookApp) &&
+		job.Channel == models.ChannelMessenger &&
+		strings.TrimSpace(job.ExternalAccountID) != "" && job.RegistryFence == ""
+	if (job.SchemaVersion == staticMessengerInboundJobSchemaVersion && !validStaticMessengerV3) ||
+		(job.SchemaVersion < staticMessengerInboundJobSchemaVersion && job.WebhookApp != "") {
+		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+		defer cancel()
+		return w.store.DeadInbound(settleCtx, job.ID, "invalid_static_messenger_job")
 	}
 	var account *AccountConfig
 	ok := false
@@ -145,7 +157,8 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 	if job.RegistryFence == "" {
 		account, ok = w.config.accountByKey(job.AccountKey)
 	}
-	if !ok && w.registry != nil && job.Channel != "" && job.ExternalAccountID != "" {
+	if !ok && w.registry != nil && job.RegistryFence != "" &&
+		job.Channel != "" && job.ExternalAccountID != "" {
 		resolved, resolveErr := w.registry.Resolve(ctx, job.Channel, job.ExternalAccountID, metaregistry.ResolvePurposeWorker, false)
 		if resolveErr == nil && registryFence(resolved) == job.RegistryFence && job.RegistryFence != "" {
 			account, ok = resolved, true
@@ -171,6 +184,28 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
 		defer cancel()
 		return w.store.DeadInbound(settleCtx, job.ID, deadReason)
+	}
+	expectedWebhookApp := account.webhookApp()
+	appBindingChanged := job.WebhookApp != "" && job.WebhookApp != expectedWebhookApp
+	if account.MessengerAppID != "" && job.WebhookApp != expectedWebhookApp {
+		appBindingChanged = true
+	}
+	if appBindingChanged {
+		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+		defer cancel()
+		return w.store.DeadInbound(settleCtx, job.ID, "webhook_app_binding_changed")
+	}
+	staticAccountBindingChanged := job.RegistryFence == "" &&
+		((job.Channel != "" && job.Channel != account.Channel) ||
+			(job.ExternalAccountID != "" && job.ExternalAccountID != account.ExternalAccountID))
+	if account.MessengerAppID != "" &&
+		(job.Channel != account.Channel || job.ExternalAccountID != account.ExternalAccountID) {
+		staticAccountBindingChanged = true
+	}
+	if staticAccountBindingChanged {
+		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+		defer cancel()
+		return w.store.DeadInbound(settleCtx, job.ID, "static_account_binding_changed")
 	}
 
 	forwardCtx, cancelForward := context.WithTimeout(ctx, w.config.ForwardTimeout)

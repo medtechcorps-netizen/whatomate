@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	pathpkg "path"
 	"strconv"
 	"strings"
 	"time"
@@ -129,6 +130,13 @@ func (s *Server) Handler() http.Handler {
 		"POST /v1/meta/messenger/managed-webhook",
 		s.metaWebhookHandler(WebhookAppManagedMessenger),
 	)
+	for index := range s.config.StaticMessengerApps {
+		app := &s.config.StaticMessengerApps[index]
+		webhookApp := staticMessengerWebhookApp(app.AppID)
+		path := "/v1/meta/messenger/apps/" + app.AppID + "/webhook"
+		mux.HandleFunc("GET "+path, s.metaVerificationHandler(webhookApp))
+		mux.HandleFunc("POST "+path, s.metaWebhookHandler(webhookApp))
+	}
 	mux.HandleFunc(
 		"GET /v1/meta/instagram/webhook",
 		s.metaVerificationHandler(WebhookAppInstagramLogin),
@@ -147,7 +155,7 @@ func (s *Server) Handler() http.Handler {
 	)
 	mux.HandleFunc("HEAD /v1/accounts/{channel}/{externalID}", s.handleAccountHealth)
 	mux.HandleFunc("POST /v1/accounts/{channel}/{externalID}", s.handleReReplyOutbound)
-	return securityHeaders(mux)
+	return securityHeaders(rejectNonCanonicalPath(mux))
 }
 
 func (s *Server) handleLive(w http.ResponseWriter, _ *http.Request) {
@@ -181,15 +189,18 @@ func (s *Server) handleMetaVerification(
 		return
 	}
 	query := request.URL.Query()
-	if query.Get("hub.mode") != "subscribe" ||
-		!constantTimeEqual(query.Get("hub.verify_token"), verifyToken) ||
-		query.Get("hub.challenge") == "" {
+	modes := query["hub.mode"]
+	tokens := query["hub.verify_token"]
+	challenges := query["hub.challenge"]
+	if len(modes) != 1 || modes[0] != "subscribe" ||
+		len(tokens) != 1 || !constantTimeEqual(tokens[0], verifyToken) ||
+		len(challenges) != 1 || challenges[0] == "" {
 		writeError(w, http.StatusForbidden, "verification_failed")
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.WriteString(w, query.Get("hub.challenge"))
+	_, _ = io.WriteString(w, challenges[0])
 }
 
 func (s *Server) metaWebhookHandler(webhookApp WebhookApp) http.HandlerFunc {
@@ -213,7 +224,8 @@ func (s *Server) handleMetaWebhook(
 		writeError(w, http.StatusNotFound, "unknown_webhook")
 		return
 	}
-	if !verifySignedBody(appSecret, request.Header.Get(MetaSignatureHeader), raw) {
+	signatures := request.Header.Values(MetaSignatureHeader)
+	if len(signatures) != 1 || !verifySignedBody(appSecret, signatures[0], raw) {
 		writeError(w, http.StatusUnauthorized, "invalid_signature")
 		return
 	}
@@ -246,7 +258,7 @@ func (s *Server) handleMetaWebhook(
 
 	// Acknowledge only after this atomic Redis operation has durably stored all
 	// canonical jobs (or the no-op marker) inside the shared deadline.
-	acceptanceID := digestHex(raw)
+	acceptanceID := inboundAcceptanceID(webhookApp, raw)
 	if _, err := s.store.AcceptInbound(ctx, acceptanceID, jobs); err != nil {
 		s.logger.Error("Meta delivery was not durably accepted", "component", "inbound_accept")
 		writeError(w, http.StatusServiceUnavailable, "durable_acceptance_failed")
@@ -276,7 +288,11 @@ func (s *Server) webhookCredentials(webhookApp WebhookApp) (string, string, bool
 		}
 		return s.config.ManagedInstagramAppSecret, s.config.ManagedInstagramVerifyToken, true
 	default:
-		return "", "", false
+		app, ok := s.config.staticMessengerAppForRoute(webhookApp)
+		if !ok {
+			return "", "", false
+		}
+		return app.appSecret, app.verifyToken, true
 	}
 }
 
@@ -346,8 +362,8 @@ type instagramLoginGraphBindingEnvelope struct {
 }
 
 func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfig) error {
-	if account != nil && account.registryManaged && account.Channel == models.ChannelMessenger {
-		if err := s.validateManagedMessengerPageIdentity(ctx, account); err != nil {
+	if account.usesAppBoundMessenger() {
+		if err := s.validateMessengerPageIdentity(ctx, account); err != nil {
 			return err
 		}
 		return s.validateMessengerAppSubscription(ctx, account)
@@ -453,12 +469,11 @@ func (s *Server) validateGraphBinding(ctx context.Context, account *AccountConfi
 	return nil
 }
 
-func (s *Server) validateManagedMessengerPageIdentity(ctx context.Context, account *AccountConfig) error {
-	if account == nil || !account.registryManaged || account.Channel != models.ChannelMessenger ||
-		strings.TrimSpace(account.ExternalAccountID) == "" {
-		return errors.New("managed Messenger account binding is invalid")
+func (s *Server) validateMessengerPageIdentity(ctx context.Context, account *AccountConfig) error {
+	if !account.usesAppBoundMessenger() || strings.TrimSpace(account.ExternalAccountID) == "" {
+		return errors.New("app-bound Messenger account binding is invalid")
 	}
-	appSecret, err := s.managedAppSecret(account)
+	appSecret, err := s.messengerAppSecret(account)
 	if err != nil {
 		return err
 	}
@@ -517,6 +532,27 @@ func (s *Server) validateManagedMessengerPageIdentity(ctx context.Context, accou
 	return nil
 }
 
+func (s *Server) messengerAppSecret(account *AccountConfig) (string, error) {
+	if !account.usesAppBoundMessenger() || strings.TrimSpace(account.PlatformAppID) == "" {
+		return "", errors.New("messenger platform app binding is invalid")
+	}
+	if account.registryManaged {
+		if account.PlatformAppID != strings.TrimSpace(s.config.ManagedMessengerAppID) ||
+			strings.TrimSpace(s.config.ManagedMessengerAppSecret) == "" {
+			return "", errors.New("messenger platform app binding is invalid")
+		}
+		return s.config.ManagedMessengerAppSecret, nil
+	}
+	if account.MessengerAppID == "" || account.PlatformAppID != account.MessengerAppID {
+		return "", errors.New("messenger platform app binding is invalid")
+	}
+	app, ok := s.config.staticMessengerApp(account.MessengerAppID)
+	if !ok || app.AppID != account.PlatformAppID || strings.TrimSpace(app.appSecret) == "" {
+		return "", errors.New("messenger platform app binding is invalid")
+	}
+	return app.appSecret, nil
+}
+
 func (s *Server) managedAppSecret(account *AccountConfig) (string, error) {
 	if account == nil || !account.registryManaged {
 		return "", errors.New("managed Meta account binding is invalid")
@@ -543,9 +579,12 @@ func (s *Server) managedAppSecret(account *AccountConfig) (string, error) {
 }
 
 func (s *Server) validateMessengerAppSubscription(ctx context.Context, account *AccountConfig) error {
-	if account == nil || strings.TrimSpace(account.PlatformAppID) == "" ||
-		account.PlatformAppID != strings.TrimSpace(s.config.ManagedMessengerAppID) {
+	if !account.usesAppBoundMessenger() || strings.TrimSpace(account.PlatformAppID) == "" {
 		return errors.New("messenger platform app binding is invalid")
+	}
+	appSecret, err := s.messengerAppSecret(account)
+	if err != nil {
+		return err
 	}
 	endpoint := fmt.Sprintf(
 		"%s/%s/%s/subscribed_apps",
@@ -559,7 +598,7 @@ func (s *Server) validateMessengerAppSubscription(ctx context.Context, account *
 	}
 	query := parsed.Query()
 	query.Set("fields", "id,subscribed_fields")
-	query.Set("appsecret_proof", metaAccessTokenProof(account.accessToken, s.config.ManagedMessengerAppSecret))
+	query.Set("appsecret_proof", metaAccessTokenProof(account.accessToken, appSecret))
 	parsed.RawQuery = query.Encode()
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
@@ -903,12 +942,18 @@ func (s *Server) sendGraph(
 		url.PathEscape(s.config.GraphAPIVersion),
 		url.PathEscape(account.ExternalAccountID),
 	)
-	if account.registryManaged {
+	if account.registryManaged || account.usesAppBoundMessenger() {
 		parsed, parseErr := url.Parse(endpoint)
 		if parseErr != nil {
 			return graphResult{status: http.StatusInternalServerError, body: errorJSON("provider_request_failed")}
 		}
-		appSecret, proofErr := s.managedAppSecret(account)
+		var appSecret string
+		var proofErr error
+		if account.Channel == models.ChannelMessenger {
+			appSecret, proofErr = s.messengerAppSecret(account)
+		} else {
+			appSecret, proofErr = s.managedAppSecret(account)
+		}
 		if proofErr != nil {
 			return graphResult{status: http.StatusInternalServerError, body: errorJSON("provider_request_failed")}
 		}
@@ -1091,10 +1136,12 @@ func signBody(secret string, body []byte) string {
 }
 
 func verifySignedBody(secret, signature string, body []byte) bool {
-	if secret == "" || !strings.HasPrefix(signature, signaturePrefix) {
+	if secret == "" || len(signature) != len(signaturePrefix)+sha256.Size*2 ||
+		!strings.HasPrefix(signature, signaturePrefix) {
 		return false
 	}
-	provided, err := hex.DecodeString(strings.TrimPrefix(signature, signaturePrefix))
+	digest := strings.TrimPrefix(signature, signaturePrefix)
+	provided, err := hex.DecodeString(digest)
 	if err != nil {
 		return false
 	}
@@ -1135,6 +1182,19 @@ func safeProviderRequestID(header http.Header) string {
 		}
 	}
 	return value
+}
+
+func rejectNonCanonicalPath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL == nil || request.URL.Opaque != "" || request.URL.RawPath != "" ||
+			request.URL.Path == "" || request.URL.EscapedPath() != request.URL.Path ||
+			strings.Contains(request.URL.Path, "//") ||
+			pathpkg.Clean(request.URL.Path) != request.URL.Path {
+			writeError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		next.ServeHTTP(w, request)
+	})
 }
 
 func securityHeaders(next http.Handler) http.Handler {

@@ -94,10 +94,7 @@ func normalizeInboundResolvedWithLimit(
 		maxCanonicalBodyBytes > channelapi.RelayCanonicalWebhookMaxBodyBytes {
 		return nil, errorsWrap(ErrInvalidMetaPayload, "canonical body limit is invalid")
 	}
-	switch webhookApp {
-	case WebhookAppMessenger, WebhookAppManagedMessenger, WebhookAppInstagramLogin,
-		WebhookAppManagedInstagram:
-	default:
+	if !config.webhookAppConfigured(webhookApp) {
 		return nil, errorsWrap(ErrInvalidMetaPayload, "webhook app is invalid")
 	}
 	var payload metaWebhook
@@ -114,6 +111,9 @@ func normalizeInboundResolvedWithLimit(
 	default:
 		return nil, ErrUnsupportedObject
 	}
+	if isStaticMessengerWebhookApp(webhookApp) && channel != models.ChannelMessenger {
+		return nil, ErrUnsupportedObject
+	}
 	if len(payload.Entry) == 0 {
 		return nil, errorsWrap(ErrInvalidMetaPayload, "entry is required")
 	}
@@ -126,7 +126,7 @@ func normalizeInboundResolvedWithLimit(
 	for entryIndex, entry := range payload.Entry {
 		entry.ID = strings.TrimSpace(entry.ID)
 		account, ok := config.account(channel, entry.ID)
-		if !ok && resolver != nil {
+		if !ok && resolver != nil && !isStaticMessengerWebhookApp(webhookApp) {
 			// Managed Instagram privacy/control-plane fences are evaluated for every
 			// provider delivery. A cached lease may outlive a committed deauth,
 			// deletion, or quarantine, so this inbound path deliberately bypasses the
@@ -258,6 +258,17 @@ func normalizeInboundResolvedWithLimit(
 		if err != nil {
 			return nil, err
 		}
+		if isStaticMessengerWebhookApp(webhookApp) {
+			for index := range accountJobs {
+				accountJobs[index].SchemaVersion = staticMessengerInboundJobSchemaVersion
+				accountJobs[index].WebhookApp = webhookApp
+				accountJobs[index].ID = staticMessengerInboundJobID(
+					webhookApp,
+					accountJobs[index].AccountKey,
+					accountJobs[index].Body,
+				)
+			}
+		}
 		jobs = append(jobs, accountJobs...)
 	}
 	return jobs, nil
@@ -363,6 +374,37 @@ func metaTimestamp(messageMilliseconds, entrySeconds int64) (time.Time, error) {
 func digestHex(value []byte) string {
 	sum := sha256.Sum256(value)
 	return hex.EncodeToString(sum[:])
+}
+
+func inboundAcceptanceID(webhookApp WebhookApp, raw []byte) string {
+	if !isStaticMessengerWebhookApp(webhookApp) {
+		// Preserve every legacy, managed, and Instagram durable identity.
+		return digestHex(raw)
+	}
+	return digestHex(bytes.Join(
+		[][]byte{
+			[]byte("meta-relay:static-messenger:acceptance:v1"),
+			[]byte(webhookApp),
+			raw,
+		},
+		[]byte{0},
+	))
+}
+
+func staticMessengerInboundJobID(
+	webhookApp WebhookApp,
+	accountKey string,
+	body []byte,
+) string {
+	return digestHex(bytes.Join(
+		[][]byte{
+			[]byte("meta-relay:static-messenger:job:v1"),
+			[]byte(webhookApp),
+			[]byte(accountKey),
+			body,
+		},
+		[]byte{0},
+	))
 }
 
 func errorsWrap(base error, detail string) error {
