@@ -285,10 +285,14 @@ func withMigrationSession(db *gorm.DB, migrate func(*gorm.DB) error) error {
 		return errors.New("migration callback is required")
 	}
 	if db.Name() != "postgres" {
-		return migrate(db)
+		return migrate(db.Session(&gorm.Session{NewDB: true}))
 	}
 
-	return db.Connection(func(session *gorm.DB) (returnErr error) {
+	return db.Connection(func(connection *gorm.DB) (returnErr error) {
+		// Connection returns a handle whose Statement can be reused in place.
+		// Keep a clone-on-use wrapper around its pinned ConnPool so Raw().Scan(),
+		// migrators, and callbacks cannot leak model/table state into each other.
+		session := connection.Session(&gorm.Session{NewDB: true})
 		var acquired bool
 		if err := session.Raw(
 			"SELECT pg_try_advisory_lock(hashtext(current_database()), ?)",
@@ -576,7 +580,13 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 
 func runMigrationWithProgressOnSession(db *gorm.DB, adminCfg *config.DefaultAdminConfig) error {
 	// Silence GORM logging during migration
-	silentDB := db.Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)})
+	// Start from a fresh statement while preserving the pinned ConnPool. The
+	// connection callback otherwise carries scalar Raw().Scan() state into ORM
+	// seed operations, leaving GORM without a valid model/table.
+	silentDB := db.Session(&gorm.Session{
+		Logger: logger.Default.LogMode(logger.Silent),
+		NewDB:  true,
+	})
 
 	migrationModels := GetMigrationModels()
 	indexes := getIndexes()
