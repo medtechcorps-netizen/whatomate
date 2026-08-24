@@ -2912,7 +2912,14 @@ func verifyPlatformComplianceAuditIndexes(db *gorm.DB) error {
 					AND index_state.indimmediate
 					AND NOT index_state.indisprimary
 					AND NOT index_state.indisexclusion
-					AND NOT index_state.indnullsnotdistinct
+					-- indnullsnotdistinct is a PostgreSQL 15+ catalog column. Reading
+					-- the catalog row through JSON keeps PostgreSQL 14 supported (a
+					-- missing key is NULL/default false) while still rejecting a
+					-- PG15+ UNIQUE NULLS NOT DISTINCT index.
+					AND NOT COALESCE(
+						(pg_catalog.to_jsonb(index_state)->>'indnullsnotdistinct')::boolean,
+						false
+					)
 					AND index_state.indnkeyatts = index_state.indnatts
 					AND index_state.indexprs IS NULL
 					AND index_state.indpred IS NOT NULL
