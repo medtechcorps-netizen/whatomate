@@ -401,6 +401,7 @@ func messageResponse(message *models.Message, replyToMessage *models.Message) Me
 		IsReply:             message.IsReply,
 		WhatsAppAccount:     message.WhatsAppAccount,
 		InboxConversationID: message.InboxConversationID,
+		IngestedAt:          message.IngestedAt,
 		CreatedAt:           message.CreatedAt,
 		UpdatedAt:           message.UpdatedAt,
 	}

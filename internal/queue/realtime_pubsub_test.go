@@ -22,11 +22,19 @@ func TestPublisherPublishRealtimeValidatesTenantAndSchema(t *testing.T) {
 		OrganizationID: uuid.New(),
 		Kind:           queue.RealtimeEventKind("raw_provider_payload"),
 	}), "kind")
+	zeroUserID := uuid.Nil
+	require.ErrorContains(t, publisher.PublishRealtime(context.Background(), &queue.RealtimeEvent{
+		OrganizationID: uuid.New(),
+		UserID:         &zeroUserID,
+		Kind:           queue.RealtimeEventConversationChanged,
+	}), "user")
 
 	messageID := uuid.New()
+	userID := uuid.New()
 	event := queue.RealtimeEvent{
 		EventID:        uuid.New(),
 		OrganizationID: uuid.New(),
+		UserID:         &userID,
 		Kind:           queue.RealtimeEventMessageCreated,
 		MessageID:      &messageID,
 		OccurredAt:     time.Now().UTC(),
@@ -36,6 +44,7 @@ func TestPublisherPublishRealtimeValidatesTenantAndSchema(t *testing.T) {
 	var decoded map[string]any
 	require.NoError(t, json.Unmarshal(payload, &decoded))
 	assert.Contains(t, decoded, "organization_id")
+	assert.Contains(t, decoded, "user_id")
 	assert.Contains(t, decoded, "message_id")
 	assert.NotContains(t, decoded, "content")
 	assert.NotContains(t, decoded, "payload")
@@ -63,6 +72,25 @@ func TestRealtimeSubscriberDiscardsMalformedAndFansOutTenantHints(t *testing.T) 
 	})
 	require.NoError(t, err)
 	require.NoError(t, rdb.Publish(ctx, queue.RealtimeChannel, malformed).Err())
+
+	userID := uuid.New()
+	userOnOrganizationChannel, err := json.Marshal(queue.RealtimeEvent{
+		EventID:        uuid.New(),
+		OrganizationID: uuid.New(),
+		UserID:         &userID,
+		Kind:           queue.RealtimeEventConversationChanged,
+		OccurredAt:     time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, rdb.Publish(ctx, queue.RealtimeChannel, userOnOrganizationChannel).Err())
+	organizationOnUserChannel, err := json.Marshal(queue.RealtimeEvent{
+		EventID:        uuid.New(),
+		OrganizationID: uuid.New(),
+		Kind:           queue.RealtimeEventConversationChanged,
+		OccurredAt:     time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, rdb.Publish(ctx, queue.RealtimeUserChannel, organizationOnUserChannel).Err())
 
 	want := &queue.RealtimeEvent{
 		EventID:        uuid.New(),

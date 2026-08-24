@@ -69,6 +69,193 @@ func LegacyMetaWhatsAppAccountID(account *models.ChannelAccount) (uuid.UUID, err
 	return accountID, nil
 }
 
+// StageLegacyMetaWhatsAppAccountRename refreshes the mutable display-name
+// projection of an established WhatsApp account. Callers must invoke it in the
+// same transaction as the corresponding whatsapp_accounts update and before
+// taking that account row lock. That preserves the bridge-wide lock order
+// (ChannelAccount -> WhatsAppAccount) used by strict replies.
+//
+// A missing shadow is valid: the first mirror/backfill will create one from the
+// renamed account. An existing shadow, however, must still carry the exact
+// immutable account binding and the expected previous name. Any disagreement
+// fails closed so a rename cannot silently bless a corrupt or cross-account
+// projection.
+func StageLegacyMetaWhatsAppAccountRename(
+	db *gorm.DB,
+	organizationID, accountID uuid.UUID,
+	previousName, nextName string,
+) (bool, error) {
+	if db == nil || organizationID == uuid.Nil || accountID == uuid.Nil {
+		return false, errors.New("legacy Meta account rename scope is required")
+	}
+	previousName = strings.TrimSpace(previousName)
+	nextName = strings.TrimSpace(nextName)
+	if previousName == "" || nextName == "" {
+		return false, errors.New("legacy Meta account rename names are required")
+	}
+	if previousName == nextName {
+		return true, nil
+	}
+
+	externalID := legacyMetaIDPrefix + "account:" + accountID.String()
+	var shadow models.ChannelAccount
+	err := db.Unscoped().
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+			organizationID,
+			models.ChannelWhatsApp,
+			LegacyMetaProvider,
+			externalID,
+		).
+		First(&shadow).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock legacy Meta shadow for account rename: %w", err)
+	}
+	boundAccountID, bindingErr := LegacyMetaWhatsAppAccountID(&shadow)
+	if bindingErr != nil || boundAccountID != accountID {
+		return false, fmt.Errorf(
+			"%w: shadow account binding changed before rename",
+			ErrLegacyMetaBridgeConflict,
+		)
+	}
+	shadowName, ok := shadow.Metadata["legacy_account_name"].(string)
+	if !ok || strings.TrimSpace(shadowName) != previousName {
+		return false, fmt.Errorf(
+			"%w: shadow account name changed before rename",
+			ErrLegacyMetaBridgeConflict,
+		)
+	}
+
+	metadata := make(models.JSONB, len(shadow.Metadata))
+	for key, value := range shadow.Metadata {
+		metadata[key] = value
+	}
+	metadata["legacy_account_name"] = nextName
+	result := db.Unscoped().Model(&models.ChannelAccount{}).
+		Where(
+			"id = ? AND organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+			shadow.ID,
+			organizationID,
+			models.ChannelWhatsApp,
+			LegacyMetaProvider,
+			externalID,
+		).
+		Updates(map[string]any{
+			"name":     legacyMetaAccountName(nextName, accountID),
+			"metadata": metadata,
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("refresh legacy Meta shadow account name: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return false, fmt.Errorf(
+			"%w: shadow account changed before rename",
+			ErrLegacyMetaBridgeConflict,
+		)
+	}
+	return true, nil
+}
+
+// FinalizeLegacyMetaWhatsAppAccountRename closes the only creation race left
+// when StageLegacyMetaWhatsAppAccountRename found no shadow. It must run after
+// the caller has updated (and therefore locked) the established account row in
+// the same transaction. NOWAIT is intentional: taking a new ChannelAccount
+// lock after WhatsAppAccount would otherwise invert the normal bridge order.
+//
+// If a concurrent mirror's new shadow is still invisible, that mirror must be
+// waiting for this transaction's WhatsAppAccount lock in
+// ensureLegacyMetaAccount; after commit it revalidates the name and rolls back.
+func FinalizeLegacyMetaWhatsAppAccountRename(
+	db *gorm.DB,
+	organizationID, accountID uuid.UUID,
+	previousName, nextName string,
+) error {
+	if db == nil || organizationID == uuid.Nil || accountID == uuid.Nil {
+		return errors.New("legacy Meta account rename scope is required")
+	}
+	previousName = strings.TrimSpace(previousName)
+	nextName = strings.TrimSpace(nextName)
+	if previousName == "" || nextName == "" {
+		return errors.New("legacy Meta account rename names are required")
+	}
+	if previousName == nextName {
+		return nil
+	}
+
+	externalID := legacyMetaIDPrefix + "account:" + accountID.String()
+	var shadow models.ChannelAccount
+	err := db.Unscoped().
+		Clauses(clause.Locking{Strength: "UPDATE", Options: "NOWAIT"}).
+		Where(
+			"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+			organizationID,
+			models.ChannelWhatsApp,
+			LegacyMetaProvider,
+			externalID,
+		).
+		First(&shadow).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock newly created legacy Meta shadow after account rename: %w", err)
+	}
+	boundAccountID, bindingErr := LegacyMetaWhatsAppAccountID(&shadow)
+	if bindingErr != nil || boundAccountID != accountID {
+		return fmt.Errorf(
+			"%w: newly created shadow account binding changed before rename",
+			ErrLegacyMetaBridgeConflict,
+		)
+	}
+	shadowName, ok := shadow.Metadata["legacy_account_name"].(string)
+	if !ok {
+		return fmt.Errorf(
+			"%w: newly created shadow account name is missing",
+			ErrLegacyMetaBridgeConflict,
+		)
+	}
+	shadowName = strings.TrimSpace(shadowName)
+	if shadowName != previousName && shadowName != nextName {
+		return fmt.Errorf(
+			"%w: newly created shadow account name changed before rename",
+			ErrLegacyMetaBridgeConflict,
+		)
+	}
+
+	metadata := make(models.JSONB, len(shadow.Metadata))
+	for key, value := range shadow.Metadata {
+		metadata[key] = value
+	}
+	metadata["legacy_account_name"] = nextName
+	result := db.Unscoped().Model(&models.ChannelAccount{}).
+		Where(
+			"id = ? AND organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+			shadow.ID,
+			organizationID,
+			models.ChannelWhatsApp,
+			LegacyMetaProvider,
+			externalID,
+		).
+		Updates(map[string]any{
+			"name":     legacyMetaAccountName(nextName, accountID),
+			"metadata": metadata,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("finalize legacy Meta shadow account name: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf(
+			"%w: newly created shadow account changed before rename",
+			ErrLegacyMetaBridgeConflict,
+		)
+	}
+	return nil
+}
+
 // MirrorLegacyWhatsAppMessage links an existing legacy Message envelope into
 // the provider-neutral inbox. It never creates an outbound job, sends to Meta,
 // copies credentials, or duplicates message content.
@@ -94,7 +281,7 @@ func MirrorLegacyWhatsAppMessage(
 		accountRef = verifiedRef
 
 		var message models.Message
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		if err := tx.
 			Where("id = ? AND organization_id = ?", messageID, accountRef.OrganizationID).
 			First(&message).Error; err != nil {
 			return fmt.Errorf("load legacy WhatsApp message: %w", err)
@@ -107,7 +294,7 @@ func MirrorLegacyWhatsAppMessage(
 		}
 
 		var contact models.Contact
-		if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
+		if err := tx.
 			Where("id = ? AND organization_id = ?", message.ContactID, accountRef.OrganizationID).
 			First(&contact).Error; err != nil {
 			return fmt.Errorf("load legacy WhatsApp contact: %w", err)
@@ -134,6 +321,40 @@ func MirrorLegacyWhatsAppMessage(
 			return err
 		}
 		result.ConversationID = conversation.ID
+		// Read cursors lock this same row before advancing. Acquire it before
+		// the message row so a legacy link cannot commit behind a newer cursor
+		// with an older ingestion position, and so mirror/read lock order cannot
+		// deadlock.
+		var lockedConversation models.InboxConversation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(
+				"id = ? AND organization_id = ?",
+				conversation.ID,
+				accountRef.OrganizationID,
+			).
+			First(&lockedConversation).Error; err != nil {
+			return fmt.Errorf("lock legacy WhatsApp conversation: %w", err)
+		}
+		*conversation = lockedConversation
+		if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
+			Where("id = ? AND organization_id = ?", contact.ID, accountRef.OrganizationID).
+			First(&contact).Error; err != nil {
+			return fmt.Errorf("lock legacy WhatsApp contact: %w", err)
+		}
+		var lockedMessage models.Message
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", messageID, accountRef.OrganizationID).
+			First(&lockedMessage).Error; err != nil {
+			return fmt.Errorf("lock legacy WhatsApp message: %w", err)
+		}
+		if lockedMessage.WhatsAppAccount != accountRef.Name ||
+			lockedMessage.ContactID != message.ContactID {
+			return fmt.Errorf(
+				"%w: message binding changed before legacy mirror",
+				ErrLegacyMetaBridgeConflict,
+			)
+		}
+		message = lockedMessage
 
 		if err := ensureLegacyMetaParticipant(tx, conversation, identity, &contact); err != nil {
 			return err
@@ -171,6 +392,15 @@ func MirrorLegacyWhatsAppMessage(
 						ErrLegacyMetaBridgeConflict,
 					)
 				}
+			}
+			// The ingestion trigger refreshes the tuple when a previously
+			// unlinked legacy row enters this normalized conversation.
+			if err := tx.Where(
+				"id = ? AND organization_id = ?",
+				message.ID,
+				accountRef.OrganizationID,
+			).First(&message).Error; err != nil {
+				return fmt.Errorf("reload linked legacy WhatsApp message: %w", err)
 			}
 		}
 
@@ -238,7 +468,10 @@ func BackfillLegacyWhatsAppInbox(
 	}
 
 	for _, accountRef := range accounts {
-		if _, err := ensureLegacyMetaAccount(db, accountRef); err != nil {
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			_, err := ensureLegacyMetaAccount(tx, accountRef)
+			return err
+		}); err != nil {
 			return stats, err
 		}
 		stats.Accounts++
@@ -252,7 +485,7 @@ func BackfillLegacyWhatsAppInbox(
 					accountRef.OrganizationID,
 					accountRef.Name,
 				).
-				Order("created_at, id").
+				Order("COALESCE(ingested_at, created_at), id").
 				Limit(batchSize).
 				Find(&messageIDs).Error; err != nil {
 				return stats, fmt.Errorf("list legacy WhatsApp messages: %w", err)
@@ -282,8 +515,20 @@ func verifiedLegacyMetaAccountRef(
 	db *gorm.DB,
 	supplied LegacyMetaAccountRef,
 ) (LegacyMetaAccountRef, error) {
+	return verifiedLegacyMetaAccountRefWithLock(db, supplied, false)
+}
+
+func verifiedLegacyMetaAccountRefWithLock(
+	db *gorm.DB,
+	supplied LegacyMetaAccountRef,
+	lock bool,
+) (LegacyMetaAccountRef, error) {
 	var persisted LegacyMetaAccountRef
-	result := db.Table("whatsapp_accounts").
+	query := db.Table("whatsapp_accounts")
+	if lock {
+		query = query.Clauses(clause.Locking{Strength: "SHARE"})
+	}
+	result := query.
 		Select("id, organization_id, name, status").
 		Where(
 			"id = ? AND organization_id = ? AND deleted_at IS NULL",
@@ -371,6 +616,22 @@ func ensureLegacyMetaAccount(
 		}
 		return nil, fmt.Errorf("load legacy Meta channel account: %w", err)
 	}
+	// Revalidate the established account only after owning the shadow lock.
+	// Account renames take this same ChannelAccount -> WhatsAppAccount order;
+	// without the second check, a mirror that read the old name just before a
+	// rename could wait here and then overwrite the newly committed metadata.
+	verifiedRef, err := verifiedLegacyMetaAccountRefWithLock(db, ref, true)
+	if err != nil {
+		return nil, err
+	}
+	ref = verifiedRef
+	status = models.ChannelAccountStatusSuspended
+	if strings.EqualFold(strings.TrimSpace(ref.Status), "active") {
+		status = models.ChannelAccountStatusActive
+	}
+	account.Name = legacyMetaAccountName(ref.Name, ref.ID)
+	account.Status = status
+	account.Metadata["legacy_account_name"] = ref.Name
 	if err := db.Unscoped().Model(&models.ChannelAccount{}).
 		Where("id = ? AND organization_id = ?", persisted.ID, ref.OrganizationID).
 		Updates(map[string]any{
@@ -580,27 +841,36 @@ func refreshLegacyMetaConversation(
 	contact *models.Contact,
 	message *models.Message,
 ) error {
-	messageAt := message.CreatedAt
-	if messageAt.IsZero() {
-		messageAt = time.Now().UTC()
+	activityAt := message.EffectiveIngestedAt()
+	if activityAt.IsZero() {
+		activityAt = time.Now().UTC()
+	}
+	providerAt := message.CreatedAt.UTC()
+	if providerAt.IsZero() {
+		providerAt = activityAt
 	}
 	updates := map[string]any{
 		"assigned_user_id": contact.AssignedUserID,
 		"unread_count":     legacyUnreadCount(contact),
 	}
-	if conversation.LastMessageAt == nil || !conversation.LastMessageAt.After(messageAt) {
-		updates["last_message_at"] = messageAt
+	if conversation.LastMessageAt == nil || !conversation.LastMessageAt.After(activityAt) {
+		updates["last_message_at"] = activityAt
 		updates["last_message_preview"] = legacyMessagePreview(message)
 	}
 	if message.Direction == models.DirectionIncoming &&
-		(conversation.LastInboundAt == nil || !conversation.LastInboundAt.After(messageAt)) {
-		updates["last_inbound_at"] = messageAt
-		serviceWindowEnd := messageAt.Add(24 * time.Hour)
-		updates["service_window_ends_at"] = serviceWindowEnd
+		(conversation.LastInboundAt == nil || !conversation.LastInboundAt.After(activityAt)) {
+		updates["last_inbound_at"] = activityAt
+	}
+	if message.Direction == models.DirectionIncoming {
+		serviceWindowEnd := providerAt.Add(24 * time.Hour)
+		if conversation.ServiceWindowEndsAt == nil ||
+			conversation.ServiceWindowEndsAt.Before(serviceWindowEnd) {
+			updates["service_window_ends_at"] = serviceWindowEnd
+		}
 	}
 	if message.Direction == models.DirectionOutgoing &&
-		(conversation.LastOutboundAt == nil || !conversation.LastOutboundAt.After(messageAt)) {
-		updates["last_outbound_at"] = messageAt
+		(conversation.LastOutboundAt == nil || !conversation.LastOutboundAt.After(activityAt)) {
+		updates["last_outbound_at"] = activityAt
 	}
 	if err := db.Model(&models.InboxConversation{}).
 		Where("id = ? AND organization_id = ?", conversation.ID, conversation.OrganizationID).
@@ -610,12 +880,12 @@ func refreshLegacyMetaConversation(
 
 	accountUpdates := map[string]any{}
 	if message.Direction == models.DirectionIncoming &&
-		(account.LastInboundAt == nil || !account.LastInboundAt.After(messageAt)) {
-		accountUpdates["last_inbound_at"] = messageAt
+		(account.LastInboundAt == nil || !account.LastInboundAt.After(activityAt)) {
+		accountUpdates["last_inbound_at"] = activityAt
 	}
 	if message.Direction == models.DirectionOutgoing &&
-		(account.LastOutboundAt == nil || !account.LastOutboundAt.After(messageAt)) {
-		accountUpdates["last_outbound_at"] = messageAt
+		(account.LastOutboundAt == nil || !account.LastOutboundAt.After(activityAt)) {
+		accountUpdates["last_outbound_at"] = activityAt
 	}
 	if len(accountUpdates) == 0 {
 		return nil

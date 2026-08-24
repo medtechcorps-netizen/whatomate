@@ -42,7 +42,7 @@ func TestProductIntegrityStatementsCoverTenantAndLedgerBoundaries(t *testing.T) 
 		assert.Contains(t, statements, required)
 	}
 	assert.NotContains(t, statements, "ON DELETE SET NULL",
-		"composite nullable tenant foreign keys use RESTRICT to preserve tenant binding")
+		"composite nullable tenant foreign keys retain organization binding")
 	assert.NotContains(
 		t,
 		statements,

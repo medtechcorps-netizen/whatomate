@@ -61,6 +61,13 @@ type InboxMessageResponse struct {
 	Parts   []models.MessagePart `json:"parts"`
 }
 
+// InboxAttentionSummaryResponse is intentionally content-free so the shared
+// navigation can poll it without loading customer or message records.
+type InboxAttentionSummaryResponse struct {
+	UnreadConversations int64     `json:"unread_conversations"`
+	AsOf                time.Time `json:"as_of"`
+}
+
 type SendInboxConversationMessageRequest struct {
 	IdempotencyKey    string                          `json:"idempotency_key,omitempty"`
 	Purpose           models.ChannelPreferencePurpose `json:"purpose"`
@@ -72,7 +79,18 @@ type SendInboxConversationMessageRequest struct {
 }
 
 type MarkInboxConversationReadRequest struct {
-	ExternalMessageIDs []string `json:"external_message_ids,omitempty"`
+	LastVisibleMessageID *uuid.UUID `json:"last_visible_message_id,omitempty"`
+	ExternalMessageIDs   []string   `json:"external_message_ids,omitempty"`
+}
+
+type markInboxConversationReadResponse struct {
+	ReadAt             time.Time  `json:"read_at"`
+	LastReadIngestedAt *time.Time `json:"last_read_ingested_at,omitempty"`
+	LastReadMessageID  *uuid.UUID `json:"last_read_message_id,omitempty"`
+	UnreadCount        int64      `json:"unread_count"`
+	ProviderSynced     bool       `json:"provider_synced"`
+	ProviderSyncQueued bool       `json:"provider_sync_queued"`
+	LegacyStateSynced  bool       `json:"legacy_state_synced"`
 }
 
 var errChannelIdempotencyCollision = errors.New(
@@ -83,6 +101,15 @@ var errChannelAccountUnavailableAtEnqueue = errors.New(
 	"channel account became unavailable before the message was queued",
 )
 
+var errInboxReadCursorMessageNotFound = errors.New(
+	"last visible message was not found in the conversation",
+)
+
+const (
+	maxInboxReadReceiptMessageIDs      = 500
+	maxInboxReadReceiptMessageIDLength = 255
+)
+
 func (a *App) ListInboxConversations(r *fastglue.Request) error {
 	orgID, userID, err := a.requireAuth(r, models.ResourceConversations, models.ActionRead)
 	if err != nil {
@@ -91,18 +118,27 @@ func (a *App) ListInboxConversations(r *fastglue.Request) error {
 	pagination := parsePagination(r)
 	readerKey := "user:" + userID.String()
 	perUserUnreadSQL := `(SELECT COUNT(*) FROM messages AS unread_messages
+		LEFT JOIN conversation_reads AS read_cursor
+		  ON read_cursor.organization_id = inbox_conversations.organization_id
+		 AND read_cursor.conversation_id = inbox_conversations.id
+		 AND read_cursor.reader_key = ?
+		 AND read_cursor.deleted_at IS NULL
 		WHERE unread_messages.organization_id = inbox_conversations.organization_id
 		  AND unread_messages.inbox_conversation_id = inbox_conversations.id
+		  AND unread_messages.deleted_at IS NULL
 		  AND unread_messages.direction = ?
-		  AND unread_messages.created_at > COALESCE(
-			(SELECT conversation_reads.last_read_at
-			 FROM conversation_reads
-			 WHERE conversation_reads.organization_id = inbox_conversations.organization_id
-			   AND conversation_reads.conversation_id = inbox_conversations.id
-			   AND conversation_reads.reader_key = ?
-			   AND conversation_reads.deleted_at IS NULL
-			 LIMIT 1),
-			TIMESTAMPTZ 'epoch'
+		  AND (
+			read_cursor.id IS NULL
+			OR COALESCE(unread_messages.ingested_at, unread_messages.created_at) >
+			   COALESCE(read_cursor.last_read_ingested_at, read_cursor.last_read_at)
+			OR (
+			  COALESCE(unread_messages.ingested_at, unread_messages.created_at) =
+			  COALESCE(read_cursor.last_read_ingested_at, read_cursor.last_read_at)
+			  AND (
+				read_cursor.last_read_message_id IS NULL
+				OR unread_messages.id > read_cursor.last_read_message_id
+			  )
+			)
 		  ))`
 
 	query := a.DB.Model(&models.InboxConversation{}).Where("organization_id = ?", orgID)
@@ -122,8 +158,8 @@ func (a *App) ListInboxConversations(r *fastglue.Request) error {
 	if unreadOnly := strings.EqualFold(string(r.RequestCtx.QueryArgs().Peek("unread")), "true"); unreadOnly {
 		query = query.Where(
 			perUserUnreadSQL+" > 0",
-			models.DirectionIncoming,
 			readerKey,
+			models.DirectionIncoming,
 		)
 	}
 	if search := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("search"))); search != "" {
@@ -167,8 +203,8 @@ func (a *App) ListInboxConversations(r *fastglue.Request) error {
 	var conversations []models.InboxConversation
 	if err := pagination.Apply(query.Select(
 		"inbox_conversations.*, "+perUserUnreadSQL+" AS unread_count",
-		models.DirectionIncoming,
 		readerKey,
+		models.DirectionIncoming,
 	)).
 		Preload("ChannelAccount", "organization_id = ?", orgID).
 		Preload("Contact", "organization_id = ?", orgID).
@@ -184,6 +220,177 @@ func (a *App) ListInboxConversations(r *fastglue.Request) error {
 		response[i] = a.inboxConversationToResponse(&conversations[i])
 	}
 	return r.SendEnvelope(listEnvelope("conversations", response, total, pagination))
+}
+
+// GetInboxAttentionSummary returns the current user's unread conversation
+// count for the authenticated tenant. Read cursors are user-specific, so this
+// must not use the legacy shared unread_count column.
+func (a *App) GetInboxAttentionSummary(r *fastglue.Request) error {
+	orgID, userID, err := a.requireAuth(r, models.ResourceConversations, models.ActionRead)
+	if err != nil {
+		return nil
+	}
+
+	response := InboxAttentionSummaryResponse{AsOf: time.Now().UTC()}
+	readerKey := "user:" + userID.String()
+	if err := a.DB.Raw(`
+		SELECT COUNT(*) AS unread_conversations
+		FROM inbox_conversations AS inbox_conversation
+		WHERE inbox_conversation.organization_id = ?
+		  AND inbox_conversation.deleted_at IS NULL
+		  AND EXISTS (
+			SELECT 1
+			FROM messages AS unread_message
+			LEFT JOIN conversation_reads AS read_cursor
+			  ON read_cursor.organization_id = inbox_conversation.organization_id
+			 AND read_cursor.conversation_id = inbox_conversation.id
+			 AND read_cursor.reader_key = ?
+			 AND read_cursor.deleted_at IS NULL
+			WHERE unread_message.organization_id = inbox_conversation.organization_id
+			  AND unread_message.inbox_conversation_id = inbox_conversation.id
+			  AND unread_message.deleted_at IS NULL
+			  AND unread_message.direction = ?
+			  AND (
+				read_cursor.id IS NULL
+				OR COALESCE(unread_message.ingested_at, unread_message.created_at) >
+				   COALESCE(read_cursor.last_read_ingested_at, read_cursor.last_read_at)
+				OR (
+				  COALESCE(unread_message.ingested_at, unread_message.created_at) =
+				  COALESCE(read_cursor.last_read_ingested_at, read_cursor.last_read_at)
+				  AND (
+					read_cursor.last_read_message_id IS NULL
+					OR unread_message.id > read_cursor.last_read_message_id
+				  )
+				)
+			  )
+		  )`,
+		orgID,
+		readerKey,
+		models.DirectionIncoming,
+	).Scan(&response).Error; err != nil {
+		a.Log.Error(
+			"Failed to load inbox attention summary",
+			"error", err,
+			"organization_id", orgID,
+			"user_id", userID,
+		)
+		return r.SendErrorEnvelope(
+			fasthttp.StatusInternalServerError,
+			"Failed to load inbox attention summary",
+			nil,
+			"",
+		)
+	}
+
+	return r.SendEnvelope(response)
+}
+
+func countUnreadInboxMessages(
+	db *gorm.DB,
+	organizationID, userID, conversationID uuid.UUID,
+) (int64, error) {
+	var unreadCount int64
+	err := db.Raw(`
+		SELECT COUNT(*)
+		FROM messages AS unread_message
+		LEFT JOIN conversation_reads AS read_cursor
+		  ON read_cursor.organization_id = unread_message.organization_id
+		 AND read_cursor.conversation_id = unread_message.inbox_conversation_id
+		 AND read_cursor.reader_key = ?
+		 AND read_cursor.deleted_at IS NULL
+		WHERE unread_message.organization_id = ?
+		  AND unread_message.inbox_conversation_id = ?
+		  AND unread_message.deleted_at IS NULL
+		  AND unread_message.direction = ?
+		  AND (
+			read_cursor.id IS NULL
+			OR COALESCE(unread_message.ingested_at, unread_message.created_at) >
+			   COALESCE(read_cursor.last_read_ingested_at, read_cursor.last_read_at)
+			OR (
+			  COALESCE(unread_message.ingested_at, unread_message.created_at) =
+			  COALESCE(read_cursor.last_read_ingested_at, read_cursor.last_read_at)
+			  AND (
+				read_cursor.last_read_message_id IS NULL
+				OR unread_message.id > read_cursor.last_read_message_id
+			  )
+			)
+		  )`,
+		"user:"+userID.String(),
+		organizationID,
+		conversationID,
+		models.DirectionIncoming,
+	).Scan(&unreadCount).Error
+	return unreadCount, err
+}
+
+// validateInboxReadReceiptMessageIDs proves that every opaque provider ID in a
+// receipt request belongs to an incoming message in the exact tenant and
+// conversation, and that no requested message is newer than what the agent
+// explicitly reported as visible. The boolean deliberately does not describe
+// which ID failed validation.
+func validateInboxReadReceiptMessageIDs(
+	db *gorm.DB,
+	organizationID, conversationID uuid.UUID,
+	visibleMessage *models.Message,
+	requestedIDs []string,
+) ([]string, bool, error) {
+	if db == nil || organizationID == uuid.Nil || conversationID == uuid.Nil ||
+		visibleMessage == nil || visibleMessage.ID == uuid.Nil ||
+		visibleMessage.OrganizationID != organizationID ||
+		visibleMessage.InboxConversationID == nil ||
+		*visibleMessage.InboxConversationID != conversationID ||
+		len(requestedIDs) == 0 || len(requestedIDs) > maxInboxReadReceiptMessageIDs {
+		return nil, false, nil
+	}
+
+	uniqueIDs := make([]string, 0, len(requestedIDs))
+	requestedSet := make(map[string]struct{}, len(requestedIDs))
+	for _, externalID := range requestedIDs {
+		if strings.TrimSpace(externalID) == "" ||
+			len(externalID) > maxInboxReadReceiptMessageIDLength {
+			return nil, false, nil
+		}
+		if _, exists := requestedSet[externalID]; exists {
+			continue
+		}
+		requestedSet[externalID] = struct{}{}
+		uniqueIDs = append(uniqueIDs, externalID)
+	}
+
+	visibleIngestedAt := visibleMessage.EffectiveIngestedAt()
+	var matchedIDs []string
+	if err := db.Model(&models.Message{}).
+		Distinct("whats_app_message_id").
+		Where(
+			`organization_id = ?
+			 AND inbox_conversation_id = ?
+			 AND deleted_at IS NULL
+			 AND direction = ?
+			 AND whats_app_message_id IN ?
+			 AND (
+				COALESCE(ingested_at, created_at) < ?
+				OR (COALESCE(ingested_at, created_at) = ? AND id <= ?)
+			 )`,
+			organizationID,
+			conversationID,
+			models.DirectionIncoming,
+			uniqueIDs,
+			visibleIngestedAt,
+			visibleIngestedAt,
+			visibleMessage.ID,
+		).
+		Pluck("whats_app_message_id", &matchedIDs).Error; err != nil {
+		return nil, false, err
+	}
+	if len(matchedIDs) != len(uniqueIDs) {
+		return nil, false, nil
+	}
+	for _, externalID := range matchedIDs {
+		if _, requested := requestedSet[externalID]; !requested {
+			return nil, false, nil
+		}
+	}
+	return uniqueIDs, true, nil
 }
 
 func (a *App) GetInboxConversationMessages(r *fastglue.Request) error {
@@ -212,7 +419,7 @@ func (a *App) GetInboxConversationMessages(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "before must be a valid message ID", nil, "")
 		}
 		var cursor models.Message
-		if err := a.DB.Select("id", "created_at").
+		if err := a.DB.Select("id", "created_at", "ingested_at").
 			Where(
 				"id = ? AND organization_id = ? AND inbox_conversation_id = ?",
 				beforeID,
@@ -222,17 +429,19 @@ func (a *App) GetInboxConversationMessages(r *fastglue.Request) error {
 			First(&cursor).Error; err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "before message was not found", nil, "")
 		}
+		cursorIngestedAt := cursor.EffectiveIngestedAt()
 		query = query.Where(
-			"(created_at < ? OR (created_at = ? AND id < ?))",
-			cursor.CreatedAt,
-			cursor.CreatedAt,
+			`(COALESCE(ingested_at, created_at) < ?
+			 OR (COALESCE(ingested_at, created_at) = ? AND id < ?))`,
+			cursorIngestedAt,
+			cursorIngestedAt,
 			cursor.ID,
 		)
 	}
 
 	var messages []models.Message
 	if err := pagination.Apply(query).
-		Order("created_at DESC, id DESC").
+		Order("COALESCE(ingested_at, created_at) DESC, id DESC").
 		Find(&messages).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load messages", nil, "")
 	}
@@ -778,138 +987,433 @@ func lockChannelAccountForMessageEnqueue(
 	return nil
 }
 
+// MarkInboxConversationRead owns one short committed tenant phase for the
+// local cursor/state transition. Provider I/O is registered as an after-commit
+// callback and therefore never runs while that tenant transaction is open.
 func (a *App) MarkInboxConversationRead(r *fastglue.Request) error {
-	orgID, userID, err := a.requireAuth(r, models.ResourceConversations, models.ActionWrite)
-	if err != nil {
+	orgID, err := a.getOrgID(r)
+	if err != nil || orgID == uuid.Nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	var handlerErr error
+	var response *markInboxConversationReadResponse
+	err = a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		response, handlerErr = scoped.markInboxConversationReadCommitted(r)
+		if handlerErr != nil {
+			return handlerErr
+		}
+		if r.RequestCtx.Response.StatusCode() >= fasthttp.StatusBadRequest {
+			return errTenantResponseRollback
+		}
 		return nil
+	})
+	if errors.Is(err, errTenantResponseRollback) {
+		return nil
+	}
+	if err != nil {
+		if handlerErr != nil {
+			return handlerErr
+		}
+		a.Log.Error(
+			"Committed conversation read phase failed",
+			"error", err,
+			"organization_id", orgID,
+		)
+		return r.SendErrorEnvelope(
+			fasthttp.StatusInternalServerError,
+			"Failed to mark conversation as read",
+			nil,
+			"",
+		)
+	}
+	if response == nil {
+		return handlerErr
+	}
+	return r.SendEnvelope(response)
+}
+
+func (a *App) markInboxConversationReadCommitted(
+	r *fastglue.Request,
+) (*markInboxConversationReadResponse, error) {
+	orgID, userID, err := a.requireAuth(r, models.ResourceConversations, models.ActionRead)
+	if err != nil {
+		return nil, nil
 	}
 	conversationID, err := parsePathUUID(r, "id", "conversation")
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	var request MarkInboxConversationReadRequest
 	if len(r.RequestCtx.PostBody()) > 0 {
 		if err := a.decodeRequest(r, &request); err != nil {
-			return nil
+			return nil, nil
 		}
 	}
 
 	conversation, err := loadInboxConversation(a.DB, orgID, conversationID, true)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Conversation not found", nil, "")
-	}
-	now := time.Now().UTC()
-	read := models.ConversationRead{
-		OrganizationID: orgID,
-		ConversationID: conversation.ID,
-		UserID:         &userID,
-		ReaderKey:      "user:" + userID.String(),
-		LastReadAt:     now,
-		Metadata:       models.JSONB{},
+		return nil, r.SendErrorEnvelope(fasthttp.StatusNotFound, "Conversation not found", nil, "")
 	}
 
+	var visibleMessage *models.Message
+	var effectiveRead models.ConversationRead
+	var cursorAdvanced bool
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
-		var lastMessage models.Message
-		if err := tx.
-			Where("organization_id = ? AND inbox_conversation_id = ?", orgID, conversation.ID).
-			Order("created_at DESC").
-			First(&lastMessage).Error; err == nil {
-			read.LastReadMessageID = &lastMessage.ID
-			read.LastReadExternalID = lastMessage.WhatsAppMessageID
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		if err := lockInboxConversationReadOrder(tx, orgID, conversation.ID); err != nil {
 			return err
 		}
-		if err := tx.Clauses(clause.OnConflict{
-			Columns: []clause.Column{
-				{Name: "organization_id"},
-				{Name: "conversation_id"},
-				{Name: "reader_key"},
-			},
-			DoUpdates: clause.AssignmentColumns([]string{
-				"user_id",
-				"last_read_message_id",
-				"last_read_external_id",
-				"last_read_at",
-				"metadata",
-				"updated_at",
-			}),
-		}).Create(&read).Error; err != nil {
+		var target models.Message
+		targetQuery := tx.Clauses(clause.Locking{Strength: "SHARE"}).Where(
+			"organization_id = ? AND inbox_conversation_id = ?",
+			orgID,
+			conversation.ID,
+		)
+		if request.LastVisibleMessageID != nil {
+			if *request.LastVisibleMessageID == uuid.Nil {
+				return errInboxReadCursorMessageNotFound
+			}
+			targetQuery = targetQuery.Where("id = ?", *request.LastVisibleMessageID)
+		} else {
+			targetQuery = targetQuery.Order("COALESCE(ingested_at, created_at) DESC, id DESC")
+		}
+		if err := targetQuery.First(&target).Error; err == nil {
+			visibleMessage = &target
+		} else if request.LastVisibleMessageID != nil || !errors.Is(err, gorm.ErrRecordNotFound) {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errInboxReadCursorMessageNotFound
+			}
 			return err
 		}
-		return audit.LogAudit(
+
+		var advanceErr error
+		effectiveRead, cursorAdvanced, advanceErr = advanceConversationReadCursor(
 			tx,
 			orgID,
 			userID,
-			audit.GetUserName(tx, userID),
-			"conversation_read",
 			conversation.ID,
-			models.AuditActionUpdated,
-			nil,
-			map[string]any{
-				"reader_key":           read.ReaderKey,
-				"last_read_message_id": read.LastReadMessageID,
-				"last_read_at":         read.LastReadAt,
-			},
+			visibleMessage,
+			time.Now().UTC(),
 		)
+		return advanceErr
 	})
+	if errors.Is(err, errInboxReadCursorMessageNotFound) {
+		return nil, r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Last visible message was not found in this conversation",
+			nil,
+			"",
+		)
+	}
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to mark conversation as read", nil, "")
+		return nil, r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to mark conversation as read", nil, "")
+	}
+	unreadCount, err := countUnreadInboxMessages(a.DB, orgID, userID, conversation.ID)
+	if err != nil {
+		return nil, r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load unread message count", nil, "")
+	}
+	response := &markInboxConversationReadResponse{
+		ReadAt:             effectiveRead.LastReadAt,
+		LastReadIngestedAt: effectiveRead.LastReadIngestedAt,
+		LastReadMessageID:  effectiveRead.LastReadMessageID,
+		UnreadCount:        unreadCount,
 	}
 
-	legacyStateSynced := false
-	if conversation.ChannelAccount != nil &&
+	// Queue the local invalidation before any optional shared/provider effects
+	// so a slow receipt endpoint cannot delay the user's cross-tab/navbar update
+	// after the durable cursor commit.
+	if cursorAdvanced {
+		a.publishRealtimeEvent(queue.RealtimeEvent{
+			OrganizationID: orgID,
+			UserID:         &userID,
+			Kind:           queue.RealtimeEventConversationChanged,
+			ConversationID: &conversationID,
+			Status:         "read_cursor_changed",
+			OccurredAt:     time.Now().UTC(),
+		}, nil)
+	}
+
+	if a.HasPermission(userID, models.ResourceConversations, models.ActionWrite, orgID) &&
+		conversation.ChannelAccount != nil &&
 		conversation.ChannelAccount.Provider == channelapi.LegacyMetaProvider &&
 		conversation.Contact != nil {
 		// The legacy chat is still the WhatsApp delivery authority. Keep its
 		// contact/message read state aligned when an agent opens the mirrored
 		// thread in the normalized inbox.
-		a.markMessagesAsRead(orgID, conversation.ContactID, conversation.Contact)
-		legacyStateSynced = true
+		if visibleMessage != nil {
+			verified, verifyErr := a.syncLegacyVisibleMessagesRead(
+				orgID,
+				userID,
+				conversation.ContactID,
+				[]models.Message{*visibleMessage},
+				false,
+			)
+			verifiedConversationID, bindingVerified :=
+				verified.VerifiedMessageConversations[visibleMessage.ID]
+			markErr := verifyErr
+			if markErr == nil && (!bindingVerified || verifiedConversationID != conversation.ID) {
+				markErr = errors.New("legacy message binding is not verified for this conversation")
+			}
+			if verifiedMessage, ok := verified.VerifiedMessages[visibleMessage.ID]; ok {
+				visibleMessage = &verifiedMessage
+			}
+			if markErr == nil {
+				markErr = a.markMessagesAsReadThrough(
+					orgID,
+					conversation.ContactID,
+					conversation.Contact,
+					visibleMessage,
+					conversation.ID,
+					nil,
+				)
+			}
+			response.LegacyStateSynced = markErr == nil
+			if markErr != nil {
+				a.Log.Warn(
+					"Failed to synchronize legacy message read state",
+					"error", markErr,
+					"organization_id", orgID,
+					"conversation_id", conversation.ID,
+				)
+			}
+		} else {
+			// An empty normalized conversation has no exact legacy message that
+			// can safely authorize a contact/account-wide acknowledgement.
+			response.LegacyStateSynced = true
+		}
 	}
-
-	providerSynced := false
 	if len(request.ExternalMessageIDs) > 0 &&
+		a.HasPermission(userID, models.ResourceConversations, models.ActionWrite, orgID) &&
 		conversation.ChannelAccount != nil &&
 		conversation.ChannelAccount.Status == models.ChannelAccountStatusActive {
-		var markErr error
-		if managedInstagramReadReceiptRequiresFence(conversation.ChannelAccount) {
-			providerSynced, markErr = a.markManagedInstagramConversationRead(
-				requestContext(r),
-				orgID,
-				conversation,
-				request.ExternalMessageIDs,
-			)
-		} else if adapter, adapterErr := a.channelAdapter(conversation.ChannelAccount); adapterErr == nil &&
-			adapter.Capabilities(conversation.ChannelAccount).ReadReceipts {
-			markErr = adapter.MarkRead(
-				requestContext(r),
-				conversation.ChannelAccount,
-				channelapi.ConversationRef{
-					ID:         conversation.ID,
-					ExternalID: conversation.ExternalConversationID,
-				},
-				request.ExternalMessageIDs,
-			)
-			providerSynced = markErr == nil
-		}
-		if markErr != nil {
+		validatedExternalIDs, valid, validationErr := validateInboxReadReceiptMessageIDs(
+			a.DB,
+			orgID,
+			conversation.ID,
+			visibleMessage,
+			request.ExternalMessageIDs,
+		)
+		if validationErr != nil {
 			a.Log.Warn(
-				"Failed to sync conversation read receipt",
-				"error",
-				markErr,
-				"organization_id",
-				orgID,
-				"conversation_id",
-				conversation.ID,
+				"Failed to validate conversation read receipts",
+				"error", validationErr,
+				"organization_id", orgID,
+				"conversation_id", conversation.ID,
 			)
+		}
+
+		if validationErr == nil && valid {
+			conversationCopy := *conversation
+			accountCopy := *conversation.ChannelAccount
+			accountCopy.Credentials = append(
+				[]models.ChannelCredential(nil),
+				conversation.ChannelAccount.Credentials...,
+			)
+			conversationCopy.ChannelAccount = &accountCopy
+			validatedIDsCopy := append([]string(nil), validatedExternalIDs...)
+			response.ProviderSyncQueued = true
+			a.afterTenantCommit(func() {
+				root := a.rootApp()
+				if root == nil {
+					return
+				}
+				var markErr error
+				if managedInstagramReadReceiptRequiresFence(conversationCopy.ChannelAccount) {
+					response.ProviderSynced, markErr = root.markManagedInstagramConversationRead(
+						requestContext(r),
+						orgID,
+						&conversationCopy,
+						validatedIDsCopy,
+					)
+				} else {
+					adapter, adapterErr := root.channelAdapter(conversationCopy.ChannelAccount)
+					if adapterErr != nil {
+						markErr = adapterErr
+					} else if adapter.Capabilities(conversationCopy.ChannelAccount).ReadReceipts {
+						markErr = adapter.MarkRead(
+							requestContext(r),
+							conversationCopy.ChannelAccount,
+							channelapi.ConversationRef{
+								ID:         conversationCopy.ID,
+								ExternalID: conversationCopy.ExternalConversationID,
+							},
+							validatedIDsCopy,
+						)
+						response.ProviderSynced = markErr == nil
+					}
+				}
+				if markErr != nil {
+					root.Log.Warn(
+						"Failed to sync conversation read receipt",
+						"error", markErr,
+						"organization_id", orgID,
+						"conversation_id", conversationCopy.ID,
+					)
+				}
+			})
 		}
 	}
 
-	return r.SendEnvelope(map[string]any{
-		"read_at":             now,
-		"provider_synced":     providerSynced,
-		"legacy_state_synced": legacyStateSynced,
-	})
+	return response, nil
+}
+
+// advanceConversationReadCursor performs a monotonic cursor upsert. The
+// conditional conflict update is evaluated by the database, so a stale or
+// concurrently delayed request cannot move an existing cursor backwards.
+func advanceConversationReadCursor(
+	tx *gorm.DB,
+	organizationID, userID, conversationID uuid.UUID,
+	visibleMessage *models.Message,
+	fallbackReadAt time.Time,
+) (models.ConversationRead, bool, error) {
+	var effective models.ConversationRead
+	if tx == nil || organizationID == uuid.Nil || userID == uuid.Nil || conversationID == uuid.Nil {
+		return effective, false, errors.New("conversation read cursor scope is required")
+	}
+	if err := lockInboxConversationReadOrder(tx, organizationID, conversationID); err != nil {
+		return effective, false, err
+	}
+	// Cursor advancement and hard deletion share a single lock order:
+	// Conversation -> target Message -> ConversationRead. Reload the exact
+	// visible envelope under FOR SHARE before touching the cursor row. Besides
+	// preventing callers from advancing with stale message metadata, this means
+	// a delete that already owns Message can finish its cursor cleanup without
+	// deadlocking against a reader that owns ConversationRead and is waiting for
+	// the same Message's tenant FK check.
+	if visibleMessage != nil {
+		if visibleMessage.ID == uuid.Nil {
+			return effective, false, errInboxReadCursorMessageNotFound
+		}
+		var lockedVisibleMessage models.Message
+		if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).Where(
+			"id = ? AND organization_id = ? AND inbox_conversation_id = ?",
+			visibleMessage.ID,
+			organizationID,
+			conversationID,
+		).First(&lockedVisibleMessage).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return effective, false, errInboxReadCursorMessageNotFound
+			}
+			return effective, false, err
+		}
+		visibleMessage = &lockedVisibleMessage
+	}
+
+	candidate := models.ConversationRead{
+		OrganizationID: organizationID,
+		ConversationID: conversationID,
+		UserID:         &userID,
+		ReaderKey:      "user:" + userID.String(),
+		LastReadAt:     fallbackReadAt.UTC(),
+		Metadata:       models.JSONB{},
+	}
+	if visibleMessage != nil {
+		messageID := visibleMessage.ID
+		ingestedAt := visibleMessage.EffectiveIngestedAt()
+		candidate.LastReadMessageID = &messageID
+		candidate.LastReadExternalID = visibleMessage.WhatsAppMessageID
+		candidate.LastReadIngestedAt = &ingestedAt
+	}
+	if candidate.LastReadAt.IsZero() {
+		candidate.LastReadAt = time.Now().UTC()
+	}
+	if candidate.LastReadIngestedAt == nil {
+		ingestedAt := candidate.LastReadAt
+		candidate.LastReadIngestedAt = &ingestedAt
+	}
+
+	result := tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "organization_id"},
+			{Name: "conversation_id"},
+			{Name: "reader_key"},
+		},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"user_id",
+			"last_read_message_id",
+			"last_read_external_id",
+			"last_read_ingested_at",
+			"last_read_at",
+			"metadata",
+			"updated_at",
+			"deleted_at",
+		}),
+		Where: clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: `
+			COALESCE(conversation_reads.last_read_ingested_at, conversation_reads.last_read_at) <
+			COALESCE(excluded.last_read_ingested_at, excluded.last_read_at)
+			OR (
+				COALESCE(conversation_reads.last_read_ingested_at, conversation_reads.last_read_at) =
+				COALESCE(excluded.last_read_ingested_at, excluded.last_read_at)
+				AND (
+					(
+						excluded.last_read_message_id IS NOT NULL
+						AND (
+							conversation_reads.last_read_message_id IS NULL
+							OR conversation_reads.last_read_message_id < excluded.last_read_message_id
+						)
+					)
+					OR (
+						conversation_reads.deleted_at IS NOT NULL
+						AND (
+							conversation_reads.last_read_message_id = excluded.last_read_message_id
+							OR (
+								conversation_reads.last_read_message_id IS NULL
+								AND excluded.last_read_message_id IS NULL
+							)
+						)
+					)
+				)
+			)`}}},
+	}).Create(&candidate)
+	if result.Error != nil {
+		return effective, false, result.Error
+	}
+	advanced := result.RowsAffected > 0
+
+	if err := tx.Where(
+		"organization_id = ? AND conversation_id = ? AND reader_key = ?",
+		organizationID,
+		conversationID,
+		candidate.ReaderKey,
+	).First(&effective).Error; err != nil {
+		return effective, false, err
+	}
+	if !advanced {
+		return effective, false, nil
+	}
+
+	if err := audit.LogAudit(
+		tx,
+		organizationID,
+		userID,
+		audit.GetUserName(tx, userID),
+		"conversation_read",
+		conversationID,
+		models.AuditActionUpdated,
+		nil,
+		map[string]any{
+			"reader_key":            effective.ReaderKey,
+			"last_read_message_id":  effective.LastReadMessageID,
+			"last_read_ingested_at": effective.LastReadIngestedAt,
+			"last_read_at":          effective.LastReadAt,
+		},
+	); err != nil {
+		return effective, false, err
+	}
+	return effective, true, nil
+}
+
+func lockInboxConversationReadOrder(
+	tx *gorm.DB,
+	organizationID, conversationID uuid.UUID,
+) error {
+	if tx == nil || organizationID == uuid.Nil || conversationID == uuid.Nil {
+		return errors.New("conversation read-order lock scope is required")
+	}
+	var locked models.InboxConversation
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id").
+		Where("id = ? AND organization_id = ?", conversationID, organizationID).
+		First(&locked).Error
 }
 
 func managedInstagramReadReceiptRequiresFence(account *models.ChannelAccount) bool {

@@ -20,6 +20,10 @@ const (
 	// RealtimeChannel carries tenant-scoped invalidation hints between workers and
 	// API replicas. PostgreSQL remains canonical; message bodies never use it.
 	RealtimeChannel = "whatomate:realtime:v1"
+	// RealtimeUserChannel is intentionally separate from RealtimeChannel. Older
+	// replicas only understand organization-wide delivery and must never consume
+	// a user-targeted event during a rolling deployment.
+	RealtimeUserChannel = "whatomate:realtime:user:v1"
 
 	realtimeSubscriberPingInterval = 5 * time.Second
 	realtimeSubscriberPingTimeout  = 2 * time.Second
@@ -41,6 +45,7 @@ const (
 type RealtimeEvent struct {
 	EventID          uuid.UUID         `json:"event_id"`
 	OrganizationID   uuid.UUID         `json:"organization_id"`
+	UserID           *uuid.UUID        `json:"user_id,omitempty"`
 	SourceID         string            `json:"source_id,omitempty"`
 	Kind             RealtimeEventKind `json:"kind"`
 	ChannelAccountID *uuid.UUID        `json:"channel_account_id,omitempty"`
@@ -58,6 +63,9 @@ func validateRealtimeEventScope(event *RealtimeEvent) error {
 	}
 	if event.OrganizationID == uuid.Nil {
 		return errors.New("realtime event organization is required")
+	}
+	if event.UserID != nil && *event.UserID == uuid.Nil {
+		return errors.New("realtime event user is invalid")
 	}
 	switch event.Kind {
 	case RealtimeEventMessageCreated,
@@ -150,7 +158,11 @@ func (p *Publisher) PublishRealtime(ctx context.Context, event *RealtimeEvent) e
 	if p == nil || p.client == nil {
 		return errors.New("realtime publisher is unavailable")
 	}
-	if err := p.client.Publish(ctx, RealtimeChannel, payload).Err(); err != nil {
+	channel := RealtimeChannel
+	if event.UserID != nil {
+		channel = RealtimeUserChannel
+	}
+	if err := p.client.Publish(ctx, channel, payload).Err(); err != nil {
 		p.log.Error(
 			"Failed to publish realtime event",
 			"error", err,
@@ -248,10 +260,25 @@ func (s *Subscriber) SubscribeRealtime(ctx context.Context, handler func(event *
 }
 
 func (s *Subscriber) confirmRealtimeSubscription(ctx context.Context) (*redis.PubSub, error) {
-	pubsub := s.client.Subscribe(ctx, RealtimeChannel)
-	if _, err := pubsub.Receive(ctx); err != nil {
-		_ = pubsub.Close()
-		return nil, err
+	channels := []string{RealtimeChannel, RealtimeUserChannel}
+	pubsub := s.client.Subscribe(ctx, channels...)
+	confirmed := make(map[string]struct{}, len(channels))
+	for len(confirmed) < len(channels) {
+		received, err := pubsub.Receive(ctx)
+		if err != nil {
+			_ = pubsub.Close()
+			return nil, err
+		}
+		subscription, ok := received.(*redis.Subscription)
+		if !ok || subscription.Kind != "subscribe" {
+			continue
+		}
+		for _, expected := range channels {
+			if subscription.Channel == expected {
+				confirmed[expected] = struct{}{}
+				break
+			}
+		}
 	}
 	return pubsub, nil
 }
@@ -297,6 +324,15 @@ func (s *Subscriber) runRealtimeSubscriber(
 				}
 				if err := validateRealtimeEvent(&event); err != nil {
 					s.log.Warn("Discarding invalid realtime event", "error", err)
+					continue
+				}
+				if (msg.Channel == RealtimeUserChannel && event.UserID == nil) ||
+					(msg.Channel == RealtimeChannel && event.UserID != nil) {
+					s.log.Warn(
+						"Discarding realtime event from mismatched scope channel",
+						"channel", msg.Channel,
+						"event_id", event.EventID,
+					)
 					continue
 				}
 				func() {

@@ -91,13 +91,17 @@ func (a *App) publishRealtimeEvent(event queue.RealtimeEvent, fallback *websocke
 		}
 
 		if root.WSHub != nil {
+			message := websocket.WSMessage{
+				Type:    websocket.TypeRealtimeSync,
+				Payload: eventCopy,
+			}
 			if fallback != nil && fallback.Type != "" {
-				root.WSHub.BroadcastToOrg(eventCopy.OrganizationID, *fallback)
+				message = *fallback
+			}
+			if eventCopy.UserID != nil {
+				root.WSHub.BroadcastToUser(eventCopy.OrganizationID, *eventCopy.UserID, message)
 			} else {
-				root.WSHub.BroadcastToOrg(eventCopy.OrganizationID, websocket.WSMessage{
-					Type:    websocket.TypeRealtimeSync,
-					Payload: eventCopy,
-				})
+				root.WSHub.BroadcastToOrg(eventCopy.OrganizationID, message)
 			}
 		}
 
@@ -136,10 +140,15 @@ func (a *App) StartRealtimeSubscriber() error {
 		if event.SourceID != "" && event.SourceID == root.realtimeSourceID() {
 			return
 		}
-		root.WSHub.BroadcastToOrg(event.OrganizationID, websocket.WSMessage{
+		message := websocket.WSMessage{
 			Type:    websocket.TypeRealtimeSync,
 			Payload: event,
-		})
+		}
+		if event.UserID != nil {
+			root.WSHub.BroadcastToUser(event.OrganizationID, *event.UserID, message)
+		} else {
+			root.WSHub.BroadcastToOrg(event.OrganizationID, message)
+		}
 	}); err != nil {
 		cancel()
 		return err

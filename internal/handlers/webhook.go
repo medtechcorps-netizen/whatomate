@@ -1214,7 +1214,10 @@ func (a *App) processMessageEcho(phoneNumberID string, msg IncomingTextMessage) 
 		"is_read":              true, // Echoes from mobile app are outgoing, so conversation is read
 		"whats_app_account":    account.Name,
 	})
-	a.mirrorLegacyWhatsAppMessage(account, message.ID)
+	// Under RLS this callback is still inside the phone-scoped tenant
+	// transaction and already touched Contact/Message. Defer the normalized
+	// mirror to its own committed tenant phase to preserve global lock order.
+	a.mirrorLegacyWhatsAppMessageAfterCommit(account, message.ID)
 
 	// Broadcast new message via WebSocket to keep UI updated
 	a.broadcastNewMessage(account.OrganizationID, &message, contact)

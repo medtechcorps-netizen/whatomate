@@ -1977,6 +1977,7 @@ func (a *App) persistIncomingMessageBeforeAck(
 	// RLS supplies an outer tenant transaction in production. Keep the same
 	// all-or-nothing boundary when RLS is disabled by binding a scoped clone to
 	// one explicit transaction.
+	var afterCommit []func()
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
 		txApp := a.scopedApp(tx, uuid.Nil)
 		var transactionErr error
@@ -1986,8 +1987,14 @@ func (a *App) persistIncomingMessageBeforeAck(
 			profileName,
 			nil,
 		)
+		if transactionErr == nil {
+			afterCommit = txApp.takeAfterCommit()
+		}
 		return transactionErr
 	})
+	if err == nil {
+		a.runAfterCommit(afterCommit)
+	}
 	return work, duplicate, err
 }
 
@@ -2458,7 +2465,10 @@ func (a *App) persistIncomingMessageWithFlow(account *models.WhatsAppAccount, co
 	canonicalContact.WhatsAppAccount = account.Name
 	canonicalContact.LastInboundAt = &now
 	*contact = canonicalContact
-	a.mirrorLegacyWhatsAppMessage(account, message.ID)
+	// The surrounding inbound transaction already owns canonical Contact and
+	// Message locks. Mirror only after it commits so the bridge can establish
+	// ChannelAccount -> InboxConversation -> Contact -> Message ordering.
+	a.mirrorLegacyWhatsAppMessageAfterCommit(account, message.ID)
 
 	return &message, nil
 }

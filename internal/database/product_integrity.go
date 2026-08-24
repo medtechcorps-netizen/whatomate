@@ -421,6 +421,41 @@ func productCheckConstraint(name, table, expression string) string {
 }
 
 func productTenantForeignKeyStatement(foreignKey productTenantForeignKey) string {
+	if foreignKey.name == "fk_conversation_reads_message_tenant" {
+		// Reconcile GORM's redundant single-column FK and any wrong-action
+		// composite constraint in one atomic DO statement. A dedicated
+		// PostgreSQL-14-compatible BEFORE DELETE trigger clears only the optional
+		// message ID; the sole tenant-composite FK remains RESTRICT.
+		return `DO $$
+		BEGIN
+			ALTER TABLE conversation_reads
+			DROP CONSTRAINT IF EXISTS fk_conversation_reads_last_read_message;
+
+			IF EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_constraint AS constraint_state
+				WHERE constraint_state.conname = 'fk_conversation_reads_message_tenant'
+				  AND constraint_state.conrelid = 'conversation_reads'::regclass
+				  AND constraint_state.confdeltype <> 'r'
+			) THEN
+				ALTER TABLE conversation_reads
+				DROP CONSTRAINT fk_conversation_reads_message_tenant;
+			END IF;
+
+			IF NOT EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_constraint AS constraint_state
+				WHERE constraint_state.conname = 'fk_conversation_reads_message_tenant'
+				  AND constraint_state.conrelid = 'conversation_reads'::regclass
+			) THEN
+				ALTER TABLE conversation_reads
+				ADD CONSTRAINT fk_conversation_reads_message_tenant
+				FOREIGN KEY (last_read_message_id, organization_id)
+				REFERENCES messages(id, organization_id)
+				ON DELETE RESTRICT;
+			END IF;
+		END $$`
+	}
 	return fmt.Sprintf(`DO $$ BEGIN
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '%s') THEN
 			ALTER TABLE %s

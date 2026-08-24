@@ -9,11 +9,13 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
@@ -21,6 +23,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ContactResponse represents a contact with additional fields for the frontend
@@ -65,6 +68,7 @@ type MessageResponse struct {
 	Reactions           []ReactionInfo       `json:"reactions,omitempty"`
 	WhatsAppAccount     string               `json:"whatsapp_account,omitempty"`
 	InboxConversationID *uuid.UUID           `json:"inbox_conversation_id,omitempty"`
+	IngestedAt          *time.Time           `json:"ingested_at,omitempty"`
 	CreatedAt           time.Time            `json:"created_at"`
 	UpdatedAt           time.Time            `json:"updated_at"`
 }
@@ -287,6 +291,15 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 	if accountFilter != "" {
 		msgQuery = msgQuery.Where("whats_app_account = ?", accountFilter)
 	}
+	// Preserve the established GET side effect for cached/older write-capable
+	// clients. New clients opt out for polling and use POST /mark-read with an
+	// exact visible cursor after rendering instead. A chat:read-only principal
+	// may view rows but must not mutate tenant-shared legacy status or send a
+	// provider receipt.
+	acknowledgeRead := !strings.EqualFold(
+		strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("acknowledge"))),
+		"false",
+	) && a.HasPermission(userID, models.ResourceChat, models.ActionWrite, orgID)
 
 	conversationRestricted, conversationCutoff, scopeErr := a.customerConversationScope(
 		orgID,
@@ -300,7 +313,7 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 	if conversationRestricted && conversationCutoff == nil {
 		msgQuery = msgQuery.Where("1 = 0")
 	} else if conversationCutoff != nil {
-		msgQuery = msgQuery.Where("created_at >= ?", *conversationCutoff)
+		msgQuery = msgQuery.Where("created_at >= ?", conversationCutoff.UTC())
 	}
 
 	// Count total messages (with session filter if applied)
@@ -311,20 +324,34 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 	if beforeIDStr != "" {
 		beforeID, err := uuid.Parse(beforeIDStr)
 		if err == nil {
-			// Get the created_at of the before_id message
+			// Resolve the same effective ingestion tuple used by unread cursors.
 			var beforeMsg models.Message
-			if err := a.DB.Where(
+			beforeQuery := a.DB.Where(
 				"id = ? AND organization_id = ? AND contact_id = ?",
 				beforeID,
 				orgID,
 				contactID,
-			).First(&beforeMsg).Error; err == nil {
-				msgQuery = msgQuery.Where("created_at < ?", beforeMsg.CreatedAt)
+			)
+			if accountFilter != "" {
+				beforeQuery = beforeQuery.Where("whats_app_account = ?", accountFilter)
+			}
+			if err := beforeQuery.First(&beforeMsg).Error; err == nil {
+				beforeIngestedAt := beforeMsg.EffectiveIngestedAt()
+				msgQuery = msgQuery.Where(
+					`(COALESCE(ingested_at, created_at) < ?
+					 OR (COALESCE(ingested_at, created_at) = ? AND id < ?))`,
+					beforeIngestedAt,
+					beforeIngestedAt,
+					beforeMsg.ID,
+				)
 			}
 		}
 		// For loading older messages, order DESC and limit, then reverse
 		var messages []models.Message
-		if err := msgQuery.Preload("ReplyToMessage").Order("created_at DESC").Limit(limit).Find(&messages).Error; err != nil {
+		if err := msgQuery.Preload("ReplyToMessage").
+			Order("COALESCE(ingested_at, created_at) DESC, id DESC").
+			Limit(limit).
+			Find(&messages).Error; err != nil {
 			a.Log.Error("Failed to list messages", "error", err)
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list messages", nil, "")
 		}
@@ -360,13 +387,17 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 	}
 
 	var messages []models.Message
-	if err := msgQuery.Preload("ReplyToMessage").Order("created_at ASC").Offset(offset).Limit(queryLimit).Find(&messages).Error; err != nil {
+	if err := msgQuery.Preload("ReplyToMessage").
+		Order("COALESCE(ingested_at, created_at) ASC, id ASC").
+		Offset(offset).
+		Limit(queryLimit).
+		Find(&messages).Error; err != nil {
 		a.Log.Error("Failed to list messages", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list messages", nil, "")
 	}
-
-	// Mark messages as read
-	a.markMessagesAsRead(orgID, contactID, &contact)
+	if acknowledgeRead {
+		a.markMessagesAsRead(orgID, contactID, &contact)
+	}
 
 	response := a.buildMessagesResponse(messages)
 	return r.SendEnvelope(map[string]any{
@@ -390,22 +421,24 @@ func (a *App) buildMessagesResponse(messages []models.Message) []MessageResponse
 		}
 
 		msgResp := MessageResponse{
-			ID:              m.ID,
-			ContactID:       m.ContactID,
-			Direction:       m.Direction,
-			MessageType:     m.MessageType,
-			Content:         content,
-			MediaURL:        m.MediaURL,
-			MediaMimeType:   m.MediaMimeType,
-			MediaFilename:   m.MediaFilename,
-			InteractiveData: m.InteractiveData,
-			Status:          m.Status,
-			WAMID:           m.WhatsAppMessageID,
-			Error:           m.ErrorMessage,
-			IsReply:         m.IsReply,
-			WhatsAppAccount: m.WhatsAppAccount,
-			CreatedAt:       m.CreatedAt,
-			UpdatedAt:       m.UpdatedAt,
+			ID:                  m.ID,
+			ContactID:           m.ContactID,
+			Direction:           m.Direction,
+			MessageType:         m.MessageType,
+			Content:             content,
+			MediaURL:            m.MediaURL,
+			MediaMimeType:       m.MediaMimeType,
+			MediaFilename:       m.MediaFilename,
+			InteractiveData:     m.InteractiveData,
+			Status:              m.Status,
+			WAMID:               m.WhatsAppMessageID,
+			InboxConversationID: m.InboxConversationID,
+			Error:               m.ErrorMessage,
+			IsReply:             m.IsReply,
+			WhatsAppAccount:     m.WhatsAppAccount,
+			IngestedAt:          m.IngestedAt,
+			CreatedAt:           m.CreatedAt,
+			UpdatedAt:           m.UpdatedAt,
 		}
 
 		if m.IsReply && m.ReplyToMessageID != nil {
@@ -445,7 +478,13 @@ func (a *App) buildMessagesResponse(messages []models.Message) []MessageResponse
 	return response
 }
 
-// MarkContactRead marks all incoming messages from a contact as read.
+type MarkContactReadRequest struct {
+	LastVisibleMessageID *uuid.UUID `json:"last_visible_message_id,omitempty"`
+}
+
+// MarkContactRead marks incoming messages from a contact as read. When the
+// caller supplies a visible message ID, the same exact message also advances
+// the current user's provider-neutral inbox cursor.
 // Called from the frontend when a new message arrives for the chat the
 // user is currently viewing, so the sidebar unread badge stays at zero.
 func (a *App) MarkContactRead(r *fastglue.Request) error {
@@ -453,9 +492,18 @@ func (a *App) MarkContactRead(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
+	if !a.HasPermission(userID, models.ResourceChat, models.ActionRead, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to view messages", nil, "")
+	}
 	contactID, err := parsePathUUID(r, "id", "contact")
 	if err != nil {
 		return nil
+	}
+	var request MarkContactReadRequest
+	if len(r.RequestCtx.PostBody()) > 0 {
+		if err := a.decodeRequest(r, &request); err != nil {
+			return nil
+		}
 	}
 
 	var contact models.Contact
@@ -465,50 +513,291 @@ func (a *App) MarkContactRead(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
 	}
 
-	a.markMessagesAsRead(orgID, contactID, &contact)
-	return r.SendEnvelope(map[string]any{"status": "ok"})
+	cursorSynced := false
+	sharedLegacyWrite := a.HasPermission(
+		userID,
+		models.ResourceChat,
+		models.ActionWrite,
+		orgID,
+	)
+	var visibleMessage models.Message
+	var verifiedLegacyConversationID uuid.UUID
+	var conversationCutoff *time.Time
+	if request.LastVisibleMessageID != nil {
+		if *request.LastVisibleMessageID == uuid.Nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid last visible message ID", nil, "")
+		}
+		conversationRestricted, cutoff, scopeErr := a.customerConversationScope(
+			orgID,
+			userID,
+			[]uuid.UUID{contactID},
+		)
+		conversationCutoff = cutoff
+		if scopeErr != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to validate visible message", nil, "")
+		}
+		if conversationRestricted && conversationCutoff == nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Last visible message was not found for this contact", nil, "")
+		}
+		visibleQuery := a.DB.Where(
+			"id = ? AND organization_id = ? AND contact_id = ?",
+			*request.LastVisibleMessageID,
+			orgID,
+			contactID,
+		)
+		if conversationCutoff != nil {
+			visibleQuery = visibleQuery.Where("created_at >= ?", conversationCutoff.UTC())
+		}
+		if err := visibleQuery.First(&visibleMessage).Error; err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Last visible message was not found for this contact", nil, "")
+		}
+		syncResult, err := a.syncLegacyVisibleMessagesRead(
+			orgID,
+			userID,
+			contactID,
+			[]models.Message{visibleMessage},
+			sharedLegacyWrite,
+		)
+		if err != nil {
+			a.Log.Error("Failed to synchronize visible Chat message", "error", err, "organization_id", orgID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update read state", nil, "")
+		}
+		verifiedLegacyConversationID, cursorSynced =
+			syncResult.VerifiedMessageConversations[visibleMessage.ID]
+		if verifiedMessage, verified := syncResult.VerifiedMessages[visibleMessage.ID]; verified {
+			visibleMessage = verifiedMessage
+		}
+	}
+
+	if request.LastVisibleMessageID != nil && cursorSynced && sharedLegacyWrite {
+		if err := a.markMessagesAsReadThrough(
+			orgID,
+			contactID,
+			&contact,
+			&visibleMessage,
+			verifiedLegacyConversationID,
+			conversationCutoff,
+		); err != nil {
+			a.Log.Error("Failed to mark Chat messages through visible cursor", "error", err, "organization_id", orgID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update read state", nil, "")
+		}
+	} else if request.LastVisibleMessageID == nil && sharedLegacyWrite {
+		// Backward compatibility for cached write-capable clients that have not
+		// yet adopted the explicit visible-message cursor. Read-only users never
+		// enter this tenant-shared/provider side-effect path.
+		a.markMessagesAsRead(orgID, contactID, &contact)
+	}
+	return r.SendEnvelope(map[string]any{
+		"status":        "ok",
+		"cursor_synced": cursorSynced,
+	})
 }
 
 // markMessagesAsRead marks messages as read and sends read receipts
 func (a *App) markMessagesAsRead(orgID uuid.UUID, contactID uuid.UUID, contact *models.Contact) {
 	var unreadMessages []models.Message
-	a.DB.Where("contact_id = ? AND direction = ? AND status != ?", contactID, models.DirectionIncoming, models.MessageStatusRead).
-		Find(&unreadMessages)
+	if err := a.DB.Where(
+		"organization_id = ? AND contact_id = ? AND direction = ? AND status != ?",
+		orgID,
+		contactID,
+		models.DirectionIncoming,
+		models.MessageStatusRead,
+	).Find(&unreadMessages).Error; err != nil {
+		a.Log.Error("Failed to load unread messages", "error", err, "organization_id", orgID)
+		return
+	}
+	if err := a.markSelectedMessagesAsRead(orgID, contactID, contact, unreadMessages, true); err != nil {
+		a.Log.Error("Failed to mark messages as read", "error", err, "organization_id", orgID)
+	}
+}
 
-	a.DB.Model(&models.Message{}).
-		Where("contact_id = ? AND direction = ?", contactID, models.DirectionIncoming).
-		Update("status", models.MessageStatusRead)
+// markMessagesAsReadThrough acknowledges incoming rows no newer than the exact
+// visible cursor and only within a normalized conversation whose binding was
+// independently established by the caller.
+func (a *App) markMessagesAsReadThrough(
+	orgID, contactID uuid.UUID,
+	contact *models.Contact,
+	visibleMessage *models.Message,
+	inboxConversationID uuid.UUID,
+	notBefore *time.Time,
+) error {
+	if visibleMessage == nil || visibleMessage.ID == uuid.Nil ||
+		visibleMessage.OrganizationID != orgID || visibleMessage.ContactID != contactID ||
+		strings.TrimSpace(visibleMessage.WhatsAppAccount) == "" ||
+		inboxConversationID == uuid.Nil ||
+		(visibleMessage.InboxConversationID != nil &&
+			*visibleMessage.InboxConversationID != inboxConversationID) {
+		return errors.New("visible message cursor is outside the contact scope")
+	}
+	visibleIngestedAt := visibleMessage.EffectiveIngestedAt()
+	query := a.DB.Where(
+		`organization_id = ? AND contact_id = ? AND direction = ? AND status != ?
+		 AND (
+			COALESCE(ingested_at, created_at) < ?
+			OR (COALESCE(ingested_at, created_at) = ? AND id <= ?)
+		 )`,
+		orgID,
+		contactID,
+		models.DirectionIncoming,
+		models.MessageStatusRead,
+		visibleIngestedAt,
+		visibleIngestedAt,
+		visibleMessage.ID,
+	).Where(
+		"inbox_conversation_id = ? AND whats_app_account = ?",
+		inboxConversationID,
+		visibleMessage.WhatsAppAccount,
+	)
+	if notBefore != nil {
+		query = query.Where("created_at >= ?", notBefore.UTC())
+	}
+	var unreadMessages []models.Message
+	if err := query.Find(&unreadMessages).Error; err != nil {
+		return err
+	}
+	return a.markSelectedMessagesAsRead(orgID, contactID, contact, unreadMessages, false)
+}
 
-	a.DB.Model(contact).Update("is_read", true)
-	a.mirrorLegacyWhatsAppRead(orgID, contactID)
-
-	if len(unreadMessages) > 0 && contact.WhatsAppAccount != "" {
-		if account, err := a.resolveWhatsAppAccount(orgID, contact.WhatsAppAccount); err == nil {
-			if account.AutoReadReceipt {
-				a.rootApp().wg.Add(1)
-				go func() {
-					defer a.rootApp().wg.Done()
-					// Use timeout context for external API calls
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-
-					waAccount := a.toWhatsAppAccount(account)
-					for _, msg := range unreadMessages {
-						// Check if context was cancelled
-						if ctx.Err() != nil {
-							a.Log.Warn("Read receipt sending cancelled", "reason", ctx.Err())
-							return
-						}
-						if msg.WhatsAppMessageID != "" {
-							if err := a.WhatsApp.MarkMessageRead(ctx, waAccount, msg.WhatsAppMessageID); err != nil {
-								a.Log.Error("Failed to send read receipt", "error", err, "message_id", msg.WhatsAppMessageID)
-							}
-						}
-					}
-				}()
-			}
+func (a *App) markSelectedMessagesAsRead(
+	orgID, contactID uuid.UUID,
+	contact *models.Contact,
+	unreadMessages []models.Message,
+	mirrorEntireContact bool,
+) error {
+	if a == nil || a.DB == nil || contact == nil || orgID == uuid.Nil || contactID == uuid.Nil {
+		return errors.New("message read-state scope is required")
+	}
+	messageIDs := make([]uuid.UUID, 0, len(unreadMessages))
+	conversationSet := make(map[uuid.UUID]struct{})
+	messagesByAccount := make(map[string][]models.Message)
+	for i := range unreadMessages {
+		message := unreadMessages[i]
+		if message.ID == uuid.Nil || message.OrganizationID != orgID ||
+			message.ContactID != contactID || message.Direction != models.DirectionIncoming {
+			continue
+		}
+		messageIDs = append(messageIDs, message.ID)
+		if message.InboxConversationID != nil && *message.InboxConversationID != uuid.Nil {
+			conversationSet[*message.InboxConversationID] = struct{}{}
+		}
+		if message.WhatsAppAccount != "" {
+			messagesByAccount[message.WhatsAppAccount] = append(
+				messagesByAccount[message.WhatsAppAccount],
+				message,
+			)
 		}
 	}
+	conversationIDs := make([]uuid.UUID, 0, len(conversationSet))
+	for conversationID := range conversationSet {
+		conversationIDs = append(conversationIDs, conversationID)
+	}
+	sort.Slice(conversationIDs, func(i, j int) bool {
+		return conversationIDs[i].String() < conversationIDs[j].String()
+	})
+
+	if err := a.DB.Transaction(func(tx *gorm.DB) error {
+		conversationQuery := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id").
+			Where("organization_id = ? AND contact_id = ?", orgID, contactID)
+		if !mirrorEntireContact {
+			if len(conversationIDs) == 0 {
+				conversationQuery = conversationQuery.Where("1 = 0")
+			} else {
+				conversationQuery = conversationQuery.Where("id IN ?", conversationIDs)
+			}
+		}
+		var lockedConversations []models.InboxConversation
+		if err := conversationQuery.Order("id").Find(&lockedConversations).Error; err != nil {
+			return err
+		}
+
+		var lockedContact models.Contact
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id").
+			Where("id = ? AND organization_id = ?", contactID, orgID).
+			First(&lockedContact).Error; err != nil {
+			return err
+		}
+		if len(messageIDs) > 0 {
+			if err := tx.Model(&models.Message{}).
+				Where(
+					"organization_id = ? AND contact_id = ? AND direction = ? AND id IN ?",
+					orgID,
+					contactID,
+					models.DirectionIncoming,
+					messageIDs,
+				).
+				Update("status", models.MessageStatusRead).Error; err != nil {
+				return err
+			}
+		}
+
+		isReadExpression := gorm.Expr(`NOT EXISTS (
+			SELECT 1
+			FROM messages AS unread_message
+			WHERE unread_message.organization_id = ?
+			  AND unread_message.contact_id = ?
+			  AND unread_message.deleted_at IS NULL
+			  AND unread_message.direction = ?
+			  AND unread_message.status != ?
+		)`, orgID, contactID, models.DirectionIncoming, models.MessageStatusRead)
+		updated := tx.Model(&models.Contact{}).
+			Where("id = ? AND organization_id = ?", contactID, orgID).
+			Update("is_read", isReadExpression)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		if err := tx.Model(&models.Contact{}).
+			Select("is_read").
+			Where("id = ? AND organization_id = ?", contactID, orgID).
+			Scan(&contact.IsRead).Error; err != nil {
+			return err
+		}
+		if mirrorEntireContact {
+			if err := channelapi.MarkLegacyWhatsAppConversationRead(tx, orgID, contactID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	for accountName, messages := range messagesByAccount {
+		account, err := a.resolveWhatsAppAccount(orgID, accountName)
+		if err != nil || !account.AutoReadReceipt {
+			continue
+		}
+		accountCopy := *account
+		messageBatch := append([]models.Message(nil), messages...)
+		a.afterTenantCommit(func() {
+			root := a.rootApp()
+			root.wg.Add(1)
+			go func() {
+				defer root.wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+
+				waAccount := a.toWhatsAppAccount(&accountCopy)
+				for i := range messageBatch {
+					message := messageBatch[i]
+					if ctx.Err() != nil {
+						a.Log.Warn("Read receipt sending cancelled", "reason", ctx.Err())
+						return
+					}
+					if message.WhatsAppMessageID != "" {
+						if err := a.WhatsApp.MarkMessageRead(ctx, waAccount, message.WhatsAppMessageID); err != nil {
+							a.Log.Error("Failed to send read receipt", "error", err, "message_id", message.WhatsAppMessageID)
+						}
+					}
+				}
+			}()
+		})
+	}
+	return nil
 }
 
 // SendMessageRequest represents a send message request
@@ -727,6 +1016,7 @@ func (a *App) SendMessage(r *fastglue.Request) error {
 		Status:          message.Status,
 		IsReply:         message.IsReply,
 		WhatsAppAccount: message.WhatsAppAccount,
+		IngestedAt:      message.IngestedAt,
 		CreatedAt:       message.CreatedAt,
 		UpdatedAt:       message.UpdatedAt,
 	}
@@ -926,6 +1216,7 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 		MediaFilename:   message.MediaFilename,
 		Status:          message.Status,
 		WhatsAppAccount: message.WhatsAppAccount,
+		IngestedAt:      message.IngestedAt,
 		CreatedAt:       message.CreatedAt,
 		UpdatedAt:       message.UpdatedAt,
 	}

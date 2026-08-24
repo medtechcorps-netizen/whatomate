@@ -1491,6 +1491,55 @@ func TestPlatformComplianceStartupVerificationRejectsContractDrift(t *testing.T)
 		assert.Contains(t, err.Error(), "does not match the platform compliance contract")
 	})
 
+	t.Run("message ingestion trigger update column is exact", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		require.NoError(t, tx.Exec(`
+			DROP TRIGGER trg_messages_ingestion_order ON public.messages;
+			CREATE TRIGGER trg_messages_ingestion_order
+			BEFORE INSERT OR UPDATE OF contact_id ON public.messages
+			FOR EACH ROW
+			EXECUTE FUNCTION public.rereply_set_message_ingestion_order()
+		`).Error)
+		err := verifyAsRuntime(tx)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "product trigger")
+		assert.Contains(t, err.Error(), "does not match the platform compliance contract")
+	})
+
+	t.Run("conversation read trigger update columns are exact", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		require.NoError(t, tx.Exec(`
+			DROP TRIGGER trg_conversation_reads_ingestion_order ON public.conversation_reads;
+			CREATE TRIGGER trg_conversation_reads_ingestion_order
+			BEFORE INSERT OR UPDATE OF last_read_message_id ON public.conversation_reads
+			FOR EACH ROW
+			EXECUTE FUNCTION public.rereply_set_conversation_read_ingestion_order()
+		`).Error)
+		err := verifyAsRuntime(tx)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "product trigger")
+		assert.Contains(t, err.Error(), "does not match the platform compliance contract")
+	})
+
+	t.Run("message ingestion trigger function body is pinned", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		require.NoError(t, tx.Exec(`
+			CREATE OR REPLACE FUNCTION public.rereply_set_message_ingestion_order()
+			RETURNS trigger LANGUAGE plpgsql
+			AS $function$ BEGIN RETURN NEW; END $function$
+		`).Error)
+		err := verifyAsRuntime(tx)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "product trigger")
+		assert.Contains(t, err.Error(), "does not match the platform compliance contract")
+	})
+
 	t.Run("guard function body", func(t *testing.T) {
 		tx := db.Begin()
 		require.NoError(t, tx.Error)
