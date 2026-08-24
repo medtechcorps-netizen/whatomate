@@ -11,13 +11,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   tenant-isolation:
-    runs-on: ubuntu-latest
+    name: tenant-isolation
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
-        image: postgres:17
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -32,10 +37,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.6"
           cache: true
@@ -43,14 +50,16 @@ jobs:
       - name: Run PostgreSQL tenant isolation tests
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_tenant_test?sslmode=disable
-        run: go test -v ./internal/database -run '^TestTenantRLS_'
+        run: go test -mod=readonly -v ./internal/database -run '^TestTenantRLS_'
 
   test:
-    runs-on: ubuntu-latest
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
 
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -64,7 +73,7 @@ jobs:
           --health-retries 5
 
       redis:
-        image: redis:7
+        image: redis:7@sha256:91d0f7e8c748ec7a4c2b4fb2c4f84edab794dd91d01e095e38dc906db9d684ab
         ports:
           - 6379:6379
         options: >-
@@ -75,10 +84,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.6"
           cache: true
@@ -86,14 +97,15 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Install gotestsum
-        run: go install gotest.tools/gotestsum@latest
+      - name: Install pinned gotestsum
+        run: go install gotest.tools/gotestsum@v1.13.0
 
       - name: Run tests
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_test?sslmode=disable
           TEST_REDIS_URL: redis://localhost:6379
         run: |
+          set -euo pipefail
           # gotestsum gives live "Running N/M tests" output, names failed
           # tests prominently at the end, and re-prints failure logs in a
           # final summary so we don't have to scroll.
@@ -102,76 +114,92 @@ jobs:
           # --format testname streams a PASS/FAIL line per test as it
           # completes, so a hanging test is easy to spot — the last
           # printed test is the one before the hang.
-          # -timeout 20m caps each package's test binary, leaving headroom for
-          # race+coverage integration suites while still bounding genuine hangs.
-          mapfile -t packages < <(go list ./... | grep -v /test/)
+          # -timeout 30m caps each package's test binary. The enclosing 120m job
+          # bound retains a finite ceiling while allowing for hosted PostgreSQL
+          # runner variance in the race+coverage integration suites.
+          package_output="$(go list -mod=readonly ./...)"
+          [[ -n "$package_output" ]]
+          mapfile -t packages < <(printf '%s\n' "$package_output" | grep -v /test/)
+          [[ "${#packages[@]}" -gt 0 ]]
           gotestsum \
             --format testname \
             --hide-summary=skipped \
-            -- -race -p 1 -timeout 20m -coverprofile=coverage.out "${packages[@]}"
+            -- -mod=readonly -race -p 1 -timeout 30m -coverprofile=coverage.out "${packages[@]}"
+          git diff --exit-code -- go.mod go.sum
 
       - name: Display coverage
         run: go tool cover -func=coverage.out | grep "total:"
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-report
           path: coverage.out
           retention-days: 7
 
   lint:
-    runs-on: ubuntu-latest
+    name: lint
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.6"
           cache: true
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
         with:
           version: v2.11.4
 
   build:
-    runs-on: ubuntu-latest
+    name: build
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.6"
           cache: true
 
       - name: Build
-        run: go build -v ./...
+        run: go build -mod=readonly -v ./...
 
   security:
-    runs-on: ubuntu-latest
+    name: security
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.6"
           cache: true
 
       - name: Scan Go dependencies and code
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          GOFLAGS=-mod=readonly govulncheck ./...
+          git diff --exit-code -- go.mod go.sum
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: "npm"
