@@ -342,16 +342,18 @@ func TestManagedInstagramReadReceiptPersistsLocallyButRejectsRuntimeDrift(t *tes
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newMetaInstagramLifecycleFixture(t)
 			require.NotNil(t, fixture.user.RoleID)
-			var permission models.Permission
-			require.NoError(t, fixture.db.Where(
-				"resource = ? AND action = ?",
-				models.ResourceConversations,
-				models.ActionWrite,
-			).First(&permission).Error)
-			require.NoError(t, fixture.db.Create(&models.RolePermission{
-				CustomRoleID: *fixture.user.RoleID,
-				PermissionID: permission.ID,
-			}).Error)
+			for _, action := range []string{models.ActionRead, models.ActionWrite} {
+				var permission models.Permission
+				require.NoError(t, fixture.db.Where(
+					"resource = ? AND action = ?",
+					models.ResourceConversations,
+					action,
+				).First(&permission).Error)
+				require.NoError(t, fixture.db.Create(&models.RolePermission{
+					CustomRoleID: *fixture.user.RoleID,
+					PermissionID: permission.ID,
+				}).Error)
+			}
 
 			capabilities := cloneJSONB(fixture.account.Capabilities)
 			capabilities[string(channelapi.CapabilityReadReceipts)] = true
