@@ -271,8 +271,17 @@ export const contactsService = {
   updateTags: (id: string, tags: string[]) =>
     api.put(`/contacts/${id}/tags`, { tags }),
   getSessionData: (id: string) => api.get(`/contacts/${id}/session-data`),
-  markRead: (id: string) =>
-    api.post(`/contacts/${encodeURIComponent(id)}/mark-read`),
+  markRead: (id: string, lastVisibleMessageId: string, organizationId: string) => {
+    const explicitOrganizationId = organizationId.trim();
+    if (!explicitOrganizationId) {
+      throw new Error("Organization is required to mark a chat conversation read");
+    }
+    return api.post(
+      `/contacts/${encodeURIComponent(id)}/mark-read`,
+      { last_visible_message_id: lastVisibleMessageId },
+      { headers: { "X-Organization-ID": explicitOrganizationId } },
+    );
+  },
 };
 
 // Generic Import/Export Service
@@ -359,7 +368,13 @@ export const messagesService = {
       account?: string;
     },
     signal?: AbortSignal,
-  ) => api.get(`/contacts/${contactId}/messages`, { params, signal }),
+  ) => api.get(`/contacts/${contactId}/messages`, {
+    // The legacy endpoint historically marked the whole contact read on GET.
+    // The current Chat UI owns an exact visible-message cursor instead, so
+    // every transcript fetch must remain side-effect free.
+    params: { ...params, acknowledge: false },
+    signal,
+  }),
   send: (
     contactId: string,
     data: {

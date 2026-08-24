@@ -10,6 +10,8 @@ import {
   type Message,
 } from '@/stores/contacts'
 import { useAuthStore } from '@/stores/auth'
+import { useOrganizationsStore } from '@/stores/organizations'
+import { useOmnichannelUnreadStore } from '@/stores/omnichannelUnread'
 import { useUsersStore } from '@/stores/users'
 import { useTransfersStore } from '@/stores/transfers'
 import { wsService } from '@/services/websocket'
@@ -121,6 +123,8 @@ const route = useRoute()
 const router = useRouter()
 const contactsStore = useContactsStore()
 const authStore = useAuthStore()
+const organizationsStore = useOrganizationsStore()
+const omnichannelUnreadStore = useOmnichannelUnreadStore()
 const usersStore = useUsersStore()
 const transfersStore = useTransfersStore()
 const tagsStore = useTagsStore()
@@ -144,6 +148,7 @@ const newMessagesCount = ref(0)
 const firstUnreadId = ref<string | null>(null)
 const isAtBottom = ref(true)
 const SCROLL_BOTTOM_THRESHOLD = 80
+const READ_BOUNDARY_TOLERANCE = 2
 const CANONICAL_CATCH_UP_INTERVAL_MS = 30_000
 let contactSelectionGeneration = 0
 let initialConversationScrollTimer: ReturnType<typeof setTimeout> | null = null
@@ -151,6 +156,10 @@ let canonicalCatchUpTimer: number | null = null
 let canonicalCatchUpInFlight = false
 let canonicalCatchUpQueued = false
 let chatViewMounted = false
+let visibleBoundaryFrame: number | null = null
+let readCursorInFlightKey: string | null = null
+let readCursorCheckQueued = false
+const acknowledgedReadCursorByContact = new Map<string, string>()
 const isInfoPanelOpen = ref(false)
 const isNotesPanelOpen = ref(false)
 const contactSessionData = ref<any>(null)
@@ -294,8 +303,103 @@ const messagesScroll = useInfiniteScroll({
 })
 
 function updateAtBottom(el: HTMLElement) {
-  const distanceFromBottom = el.scrollHeight - el.clientHeight - el.scrollTop
+  const distanceFromBottom = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop)
   isAtBottom.value = distanceFromBottom < SCROLL_BOTTOM_THRESHOLD
+  if (distanceFromBottom <= READ_BOUNDARY_TOLERANCE) {
+    void acknowledgeVisibleChatBoundary()
+  }
+}
+
+function isChatUserActive() {
+  return document.visibilityState === 'visible' && document.hasFocus()
+}
+
+function latestIncomingMessageID() {
+  for (let index = contactsStore.messages.length - 1; index >= 0; index--) {
+    const message = contactsStore.messages[index]
+    if (message.direction === 'incoming') return message.id
+  }
+  return null
+}
+
+function isViewportAtReadBoundary(viewport: HTMLElement) {
+  return Math.max(0, viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop)
+    <= READ_BOUNDARY_TOLERANCE
+}
+
+function scheduleVisibleBoundaryCheck() {
+  if (visibleBoundaryFrame !== null) window.cancelAnimationFrame(visibleBoundaryFrame)
+  visibleBoundaryFrame = window.requestAnimationFrame(() => {
+    visibleBoundaryFrame = null
+    const viewport = messagesScroll.getViewport()
+    if (viewport) updateAtBottom(viewport)
+  })
+}
+
+async function acknowledgeVisibleChatBoundary() {
+  if (!chatViewMounted || !isChatUserActive()) return
+  const viewport = messagesScroll.getViewport()
+  const currentContact = contactsStore.currentContact
+  const messageID = latestIncomingMessageID()
+  if (!viewport || !currentContact || !messageID || !isViewportAtReadBoundary(viewport)) return
+
+  const contactID = currentContact.id
+  const cursorKey = `${contactID}:${messageID}`
+  if (acknowledgedReadCursorByContact.get(contactID) === messageID) return
+  if (readCursorInFlightKey === cursorKey) return
+  if (readCursorInFlightKey !== null) {
+    readCursorCheckQueued = true
+    return
+  }
+
+  const selectionGeneration = contactSelectionGeneration
+  const acknowledgementOrganizationID = organizationsStore.selectedOrgId || authStore.organizationId
+  const acknowledgementUserID = authStore.user?.id
+  if (!acknowledgementOrganizationID || !acknowledgementUserID) return
+  readCursorInFlightKey = cursorKey
+  try {
+    const response = await contactsService.markRead(
+      contactID,
+      messageID,
+      acknowledgementOrganizationID,
+    )
+    const payload = response?.data?.data ?? response?.data
+    const cursorSynced = payload?.cursor_synced === true
+    if (
+      acknowledgementOrganizationID
+      && (organizationsStore.selectedOrgId || authStore.organizationId) === acknowledgementOrganizationID
+      && authStore.user?.id === acknowledgementUserID
+    ) {
+      // Do not rely solely on a websocket invalidation: another tab may have
+      // advanced the same cursor already, in which case the server emits none.
+      void omnichannelUnreadStore.refresh(acknowledgementOrganizationID, acknowledgementUserID)
+    }
+    if (!cursorSynced) {
+      // A resolved request can still be intentionally rejected when the
+      // legacy message cannot be proven to belong to its normalized shadow.
+      // Keep the boundary retryable and restore canonical sidebar state.
+      if (isContactSelectionActive(selectionGeneration, contactID)) {
+        const search = normalizeContactSearch(contactsStore.searchQuery) || undefined
+        void contactsStore.fetchContacts({ search })
+      }
+      return
+    }
+    acknowledgedReadCursorByContact.set(contactID, messageID)
+    if (isContactSelectionActive(selectionGeneration, contactID)) {
+      newMessagesCount.value = 0
+      firstUnreadId.value = null
+      const search = normalizeContactSearch(contactsStore.searchQuery) || undefined
+      void contactsStore.fetchContacts({ search })
+    }
+  } catch {
+    // Keep the unread boundary visible. A later bottom/focus event retries.
+  } finally {
+    if (readCursorInFlightKey === cursorKey) readCursorInFlightKey = null
+    if (readCursorCheckQueued) {
+      readCursorCheckQueued = false
+      scheduleVisibleBoundaryCheck()
+    }
+  }
 }
 
 const contactId = computed(() => route.params.contactId as string | undefined)
@@ -509,16 +613,24 @@ onMounted(async () => {
 })
 
 function onUserActive() {
-  if (document.visibilityState !== 'visible' || !document.hasFocus()) return
-  if (!firstUnreadId.value) return
-  if (contactsStore.currentContact) {
-    contactsService.markRead(contactsStore.currentContact.id)
-      .catch(() => { /* non-critical */ })
+  if (!isChatUserActive()) return
+  const unreadMessageID = firstUnreadId.value
+  const contactID = contactsStore.currentContact?.id
+  const selectionGeneration = contactSelectionGeneration
+  if (!unreadMessageID || !contactID) {
+    scheduleVisibleBoundaryCheck()
+    return
   }
+
+  // Returning to Chat reveals the beginning of the unread batch. Do not move
+  // the cursor through later messages until the reader actually reaches the
+  // bottom boundary.
   nextTick(() => {
-    const el = document.getElementById(`message-${firstUnreadId.value}`)
+    if (!isContactSelectionActive(selectionGeneration, contactID)) return
+    const el = document.getElementById(`message-${unreadMessageID}`)
     if (el) {
       el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      scheduleVisibleBoundaryCheck()
     }
   })
 }
@@ -590,6 +702,11 @@ function onChatOnline() {
 onUnmounted(() => {
   chatViewMounted = false
   canonicalCatchUpQueued = false
+  readCursorCheckQueued = false
+  if (visibleBoundaryFrame !== null) {
+    window.cancelAnimationFrame(visibleBoundaryFrame)
+    visibleBoundaryFrame = null
+  }
   stopCanonicalCatchUpTimer()
   invalidateContactSelection()
   messagesScroll.cleanup()
@@ -665,6 +782,7 @@ function cancelInitialConversationScroll() {
 function invalidateContactSelection() {
   contactSelectionGeneration++
   cancelInitialConversationScroll()
+  readCursorCheckQueued = false
   contactSessionData.value = null
   // Allow the newly selected conversation to act immediately. Late promises
   // from the previous selection are guarded by their captured generation and
@@ -688,6 +806,9 @@ async function selectContact(id: string) {
   const selectionGeneration = ++contactSelectionGeneration
   cancelInitialConversationScroll()
   contactSessionData.value = null
+  newMessagesCount.value = 0
+  firstUnreadId.value = null
+  isAtBottom.value = true
   // Stop the old viewport listener immediately. It must not load history or
   // update scroll state while the replacement conversation is resolving.
   messagesScroll.cleanup()
@@ -700,11 +821,6 @@ async function selectContact(id: string) {
   }
   if (!isContactSelectionRequested(selectionGeneration, id)) return
   if (contact) {
-    // Reset unread pill — fetchMessages will mark everything read on the server
-    newMessagesCount.value = 0
-    firstUnreadId.value = null
-    isAtBottom.value = true
-
     // Reset account selection when switching contacts
     selectedAccount.value = null
     contactAccounts.value = []
@@ -780,36 +896,37 @@ async function selectContact(id: string) {
   }
 }
 
-// Watch for new messages. WhatsApp Web style: while the browser tab is
-// focused on this chat the user is "watching", so auto-scroll if they're
-// at the bottom. When they're on another tab, pile up unread and surface
-// a divider above the first message that arrived while away (issue #280).
-// The two branches are mutually exclusive — auto-scrolling while the tab
-// is hidden races with the divider state.
-watch(() => contactsStore.messages.length, (newLen, oldLen) => {
-  if (newLen <= oldLen) return
-  const latest = contactsStore.messages[newLen - 1]
-  const isIncoming = latest?.direction === 'incoming'
-  // "Not actively looking" covers both other-tab (hidden) and other-window
-  // (visible but unfocused). The divider should pile in either case.
-  const userAway = typeof document !== 'undefined'
-    && (document.visibilityState === 'hidden' || !document.hasFocus())
-  if (isIncoming && userAway) {
-    if (newMessagesCount.value === 0) {
-      firstUnreadId.value = latest.id
+// Track only messages appended after the previous latest ID. Loading older
+// history prepends IDs and must never manufacture an unread divider.
+watch(
+  () => contactsStore.messages.map(message => message.id),
+  (messageIDs, previousMessageIDs) => {
+    if (messageIDs.length === 0 || previousMessageIDs.length === 0) return
+    const previousLatestID = previousMessageIDs[previousMessageIDs.length - 1]
+    const previousLatestIndex = messageIDs.indexOf(previousLatestID)
+    if (previousLatestIndex < 0) return
+
+    const appended = contactsStore.messages.slice(previousLatestIndex + 1)
+    if (appended.length === 0) return
+    const incoming = appended.filter(message => message.direction === 'incoming')
+    const readerAway = !isChatUserActive()
+
+    if (incoming.length > 0 && (readerAway || !isAtBottom.value)) {
+      if (newMessagesCount.value === 0) firstUnreadId.value = incoming[0].id
+      newMessagesCount.value += incoming.length
+      return
     }
-    newMessagesCount.value += 1
-    return
-  }
-  // Outgoing (the agent replied) — they've seen the unread, drop the divider.
-  if (!isIncoming && newMessagesCount.value > 0) {
-    newMessagesCount.value = 0
-    firstUnreadId.value = null
-  }
-  if (isAtBottom.value || !isIncoming) {
-    scrollToBottom()
-  }
-})
+
+    // An outgoing reply signals deliberate engagement with the thread.
+    if (incoming.length === 0 && newMessagesCount.value > 0) {
+      newMessagesCount.value = 0
+      firstUnreadId.value = null
+    }
+    if (incoming.length > 0 || appended.some(message => message.direction === 'outgoing')) {
+      scrollToBottom()
+    }
+  },
+)
 
 async function switchAccount(accountName: string) {
   if (!contactsStore.currentContact || accountName === selectedAccount.value) return
@@ -1443,6 +1560,7 @@ function scrollToBottom(instant = false, shouldScroll: () => boolean = () => tru
         behavior: instant ? 'instant' : 'smooth',
         block: 'end'
       })
+      scheduleVisibleBoundaryCheck()
     }
   })
 }

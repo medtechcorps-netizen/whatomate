@@ -23,12 +23,16 @@ const mocks = vi.hoisted(() => ({
   clearNotes: vi.fn(),
   listAccounts: vi.fn(),
   getSessionData: vi.fn(),
+  markRead: vi.fn(),
+  refreshUnread: vi.fn(),
+  organizationStore: { selectedOrgId: null as string | null },
   setWebSocketContact: vi.fn(),
   scrollIntoView: vi.fn(),
   infiniteControllers: [] as Array<{
     scrollAreaRef: { value: unknown }
     setup: ReturnType<typeof vi.fn>
     cleanup: ReturnType<typeof vi.fn>
+    getViewport: ReturnType<typeof vi.fn>
     preserveScrollPosition: ReturnType<typeof vi.fn>
     onScroll?: (event: Event) => void
   }>,
@@ -80,7 +84,7 @@ vi.mock('@/composables/useInfiniteScroll', () => ({
       scrollAreaRef: { value: null },
       setup: vi.fn(),
       cleanup: vi.fn(),
-      getViewport: vi.fn(() => null),
+      getViewport: vi.fn(() => null as HTMLElement | null),
       preserveScrollPosition: vi.fn(async (callback: () => Promise<void>) => callback()),
       onScroll: options.onScroll,
     }
@@ -136,11 +140,20 @@ vi.mock('@/stores/contacts', async () => {
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => ({
     isAuthenticated: true,
+    organizationId: 'organization-1',
     userRole: 'agent',
     user: { id: 'agent-1' },
     hasPermission: () => false,
     restoreSession: vi.fn(),
   }),
+}))
+
+vi.mock('@/stores/omnichannelUnread', () => ({
+  useOmnichannelUnreadStore: () => ({ refresh: mocks.refreshUnread }),
+}))
+
+vi.mock('@/stores/organizations', () => ({
+  useOrganizationsStore: () => mocks.organizationStore,
 }))
 
 vi.mock('@/stores/users', () => ({
@@ -180,7 +193,7 @@ vi.mock('@/services/websocket', () => ({
 vi.mock('@/services/api', () => ({
   contactsService: {
     getSessionData: mocks.getSessionData,
-    markRead: vi.fn().mockResolvedValue(undefined),
+    markRead: mocks.markRead,
     assign: vi.fn(),
   },
   chatbotService: { createTransfer: vi.fn(), resumeTransfer: vi.fn() },
@@ -248,6 +261,7 @@ describe('ChatView conversation selection', () => {
     vi.clearAllMocks()
     mocks.infiniteControllers = []
     mocks.routeSource.params.contactId = 'first'
+    mocks.organizationStore.selectedOrgId = null
     if (mocks.route) mocks.route.params.contactId = 'first'
 
     const first = contact('first')
@@ -268,6 +282,7 @@ describe('ChatView conversation selection', () => {
     mocks.fetchNotes.mockResolvedValue(undefined)
     mocks.listAccounts.mockResolvedValue({ data: { data: { accounts: [] } } })
     mocks.getSessionData.mockRejectedValue(new Error('not configured'))
+    mocks.markRead.mockResolvedValue({ data: { data: { cursor_synced: true } } })
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
       callback(0)
       return 1
@@ -447,6 +462,217 @@ describe('ChatView conversation selection', () => {
         block: 'end',
       })
     } finally {
+      focusSpy.mockRestore()
+      visibilitySpy.mockRestore()
+    }
+  })
+
+  it('keeps a focused scrolled-up message unread and refreshes the selected workspace at bottom', async () => {
+    const focusSpy = vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+    const visibilitySpy = vi
+      .spyOn(document, 'visibilityState', 'get')
+      .mockReturnValue('visible')
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.organizationStore.selectedOrgId = 'selected-organization'
+
+    try {
+      wrapper = mountChatView()
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      const messagesController = mocks.infiniteControllers[1]
+      const viewport = document.createElement('div')
+      Object.defineProperties(viewport, {
+        scrollHeight: { configurable: true, value: 1_000 },
+        clientHeight: { configurable: true, value: 300 },
+      })
+      viewport.scrollTop = 100
+      messagesController.getViewport.mockReturnValue(viewport)
+
+      const initialMessage = {
+        id: 'message-initial',
+        direction: 'incoming',
+        created_at: '2026-08-23T09:00:00Z',
+      }
+      mocks.contactsStore!.messages = [initialMessage]
+      await nextTick()
+      messagesController.onScroll?.({ target: viewport } as unknown as Event)
+      mocks.markRead.mockClear()
+      mocks.scrollIntoView.mockClear()
+
+      mocks.contactsStore!.messages = [
+        initialMessage,
+        {
+          id: 'message-focused-while-scrolled-up',
+          direction: 'incoming',
+          created_at: '2026-08-23T10:00:00Z',
+        },
+      ]
+      await nextTick()
+      await nextTick()
+
+      expect(mocks.markRead).not.toHaveBeenCalled()
+      expect(mocks.scrollIntoView).not.toHaveBeenCalled()
+      expect(wrapper.text()).toContain('1 unread message')
+
+      viewport.scrollTop = 700
+      messagesController.onScroll?.({ target: viewport } as unknown as Event)
+      await flushPromises()
+
+      expect(mocks.markRead).toHaveBeenCalledTimes(1)
+      expect(mocks.markRead).toHaveBeenCalledWith(
+        'first',
+        'message-focused-while-scrolled-up',
+        'selected-organization',
+      )
+      expect(mocks.refreshUnread).toHaveBeenCalledWith('selected-organization', 'agent-1')
+      expect(wrapper.text()).not.toContain('1 unread message')
+    } finally {
+      focusSpy.mockRestore()
+      visibilitySpy.mockRestore()
+    }
+  })
+
+  it('keeps an unverified visible cursor unread and retryable after a resolved POST', async () => {
+    const focusSpy = vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+    const visibilitySpy = vi
+      .spyOn(document, 'visibilityState', 'get')
+      .mockReturnValue('visible')
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.markRead.mockResolvedValue({ data: { data: { cursor_synced: false } } })
+
+    try {
+      wrapper = mountChatView()
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      const messagesController = mocks.infiniteControllers[1]
+      const viewport = document.createElement('div')
+      Object.defineProperties(viewport, {
+        scrollHeight: { configurable: true, value: 1_000 },
+        clientHeight: { configurable: true, value: 300 },
+      })
+      viewport.scrollTop = 100
+      messagesController.getViewport.mockReturnValue(viewport)
+
+      const initialMessage = {
+        id: 'message-before-unverified',
+        direction: 'incoming',
+        created_at: '2026-08-23T09:00:00Z',
+      }
+      mocks.contactsStore!.messages = [initialMessage]
+      await nextTick()
+      messagesController.onScroll?.({ target: viewport } as unknown as Event)
+      mocks.markRead.mockClear()
+      mocks.fetchContacts.mockClear()
+      mocks.refreshUnread.mockClear()
+
+      mocks.contactsStore!.messages = [
+        initialMessage,
+        {
+          id: 'message-unverified-visible',
+          direction: 'incoming',
+          created_at: '2026-08-23T10:00:00Z',
+        },
+      ]
+      await nextTick()
+      await nextTick()
+      expect(wrapper.text()).toContain('1 unread message')
+
+      viewport.scrollTop = 700
+      messagesController.onScroll?.({ target: viewport } as unknown as Event)
+      await flushPromises()
+
+      expect(mocks.markRead).toHaveBeenCalledWith(
+        'first',
+        'message-unverified-visible',
+        'organization-1',
+      )
+      expect(mocks.refreshUnread).toHaveBeenCalledWith('organization-1', 'agent-1')
+      expect(mocks.fetchContacts).toHaveBeenCalled()
+      expect(wrapper.text()).toContain('1 unread message')
+
+      mocks.markRead.mockClear()
+      messagesController.onScroll?.({ target: viewport } as unknown as Event)
+      await flushPromises()
+      expect(mocks.markRead).toHaveBeenCalledWith(
+        'first',
+        'message-unverified-visible',
+        'organization-1',
+      )
+    } finally {
+      focusSpy.mockRestore()
+      visibilitySpy.mockRestore()
+    }
+  })
+
+  it('shows the first queued unread on focus without acknowledging unseen later messages', async () => {
+    let focused = false
+    const focusSpy = vi.spyOn(document, 'hasFocus').mockImplementation(() => focused)
+    const visibilitySpy = vi
+      .spyOn(document, 'visibilityState', 'get')
+      .mockReturnValue('visible')
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    const firstUnreadElement = document.createElement('div')
+    firstUnreadElement.id = 'message-message-first-unread'
+    document.body.appendChild(firstUnreadElement)
+
+    try {
+      wrapper = mountChatView()
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      const messagesController = mocks.infiniteControllers[1]
+      const viewport = document.createElement('div')
+      Object.defineProperties(viewport, {
+        scrollHeight: { configurable: true, value: 1_200 },
+        clientHeight: { configurable: true, value: 300 },
+      })
+      viewport.scrollTop = 200
+      messagesController.getViewport.mockReturnValue(viewport)
+
+      const initialMessage = {
+        id: 'message-initial',
+        direction: 'incoming',
+        created_at: '2026-08-23T09:00:00Z',
+      }
+      mocks.contactsStore!.messages = [initialMessage]
+      await nextTick()
+      mocks.contactsStore!.messages = [
+        initialMessage,
+        {
+          id: 'message-first-unread',
+          direction: 'incoming',
+          created_at: '2026-08-23T10:00:00Z',
+        },
+        {
+          id: 'message-later-unread',
+          direction: 'incoming',
+          created_at: '2026-08-23T11:00:00Z',
+        },
+      ]
+      await nextTick()
+      await nextTick()
+      expect(wrapper.text()).toContain('2 unread messages')
+
+      mocks.markRead.mockClear()
+      mocks.scrollIntoView.mockClear()
+      focused = true
+      window.dispatchEvent(new Event('focus'))
+      await nextTick()
+      await nextTick()
+
+      expect(mocks.scrollIntoView).toHaveBeenCalledWith({
+        behavior: 'smooth',
+        block: 'start',
+      })
+      expect(mocks.markRead).not.toHaveBeenCalled()
+      expect(wrapper.text()).toContain('2 unread messages')
+    } finally {
+      firstUnreadElement.remove()
       focusSpy.mockRestore()
       visibilitySpy.mockRestore()
     }

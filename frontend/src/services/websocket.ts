@@ -7,7 +7,7 @@ import { useRolesStore } from '@/stores/roles'
 import { useTeamsStore } from '@/stores/teams'
 import { useAuthStore } from '@/stores/auth'
 import { useNotesStore } from '@/stores/notes'
-import { contactsService } from '@/services/api'
+import { useOmnichannelUnreadStore } from '@/stores/omnichannelUnread'
 import { toast } from 'vue-sonner'
 import router from '@/router'
 
@@ -108,6 +108,31 @@ export type InboxActivityType =
 export interface InboxActivityEvent {
   type: InboxActivityType
   payload: any
+}
+
+/**
+ * True when an inbox activity can change a user's unread-conversation count.
+ * Unknown realtime kinds intentionally refresh so a rolling deployment cannot
+ * hide a future inbound invalidation; known delivery-only events are skipped.
+ */
+export function isUnreadRelevantInboxActivity(event: InboxActivityEvent) {
+  if (event.type === WS_TYPE_STATUS_UPDATE) return false
+  if (event.type === WS_TYPE_NEW_MESSAGE) {
+    return event.payload?.direction !== 'outgoing'
+  }
+  if (event.type === WS_TYPE_REALTIME_SYNC) {
+    return event.payload?.kind !== 'message_status_changed'
+  }
+  return event.type === WS_TYPE_CHANNEL_SYNC
+}
+
+/** True when the normalized conversation/message lists need a canonical fetch. */
+export function isInboxContentRefreshActivity(event: InboxActivityEvent) {
+  if (event.type === WS_TYPE_STATUS_UPDATE) return false
+  if (event.type === WS_TYPE_REALTIME_SYNC) {
+    return event.payload?.kind !== 'message_status_changed'
+  }
+  return event.type === WS_TYPE_NEW_MESSAGE || event.type === WS_TYPE_CHANNEL_SYNC
 }
 
 export type WebSocketConnectionState =
@@ -382,6 +407,8 @@ class WebSocketService {
         reply_to_message_id: payload.reply_to_message_id,
         reply_to_message: payload.reply_to_message,
         reactions: payload.reactions,
+        whatsapp_account: payload.whatsapp_account,
+        ingested_at: payload.ingested_at,
         created_at: payload.created_at,
         updated_at: payload.updated_at
       })
@@ -417,32 +444,10 @@ class WebSocketService {
       }
     }
 
-    // If the user is actively viewing this contact, mark messages read on
-    // the server before refetching so the unread badge stays at zero
-    // (otherwise the new message comes back as unread and the sidebar flashes
-    // a count for a chat that's already open). See issue #280.
-    // Use currentContact.id (already validated, from our /contacts response)
-    // rather than the WS payload value to avoid pushing untrusted data into
-    // a request URL.
-    // Skip the call when the message already arrived as 'read' — the backend
-    // pre-marks chatbot-handled messages at save time, and re-marking just
-    // touches DB rows that are already in the right state.
-    // Also skip when the agent isn't actually looking — that includes both
-    // tab-hidden (different browser tab) and window-unfocused (browser is
-    // visible but agent is in another OS window). Firing markRead in those
-    // cases would send a WhatsApp read receipt to the customer (blue ticks)
-    // for a message no one has read. The mark fires when the user comes
-    // back instead (handled in ChatView's focus/visibility listeners).
-    const alreadyRead = payload.status === 'read'
-    const userActive = typeof document === 'undefined'
-      || (document.visibilityState === 'visible' && document.hasFocus())
-    if (isViewingThisContact && currentContact && payload.direction === 'incoming' && !alreadyRead && userActive) {
-      contactsService.markRead(currentContact.id)
-        .catch(() => { /* non-critical, will resync on next chat-open */ })
-        .finally(() => store.fetchContacts())
-    } else {
-      store.fetchContacts()
-    }
+    // Read acknowledgement belongs to ChatView, which owns the actual scroll
+    // viewport. Document focus alone cannot prove that the new bubble is on
+    // screen (the reader may be inspecting older history).
+    store.fetchContacts()
   }
 
   private handleStatusUpdate(store: ReturnType<typeof useContactsStore>, payload: any) {
@@ -851,6 +856,11 @@ class WebSocketService {
       useNotesStore().clearNotes()
     } catch {
       // Keep socket teardown reliable even if a store is no longer available.
+    }
+    try {
+      useOmnichannelUnreadStore().resetForIdentityChange()
+    } catch {
+      // Tenant-scoped navigation attention must not survive logout or org switch.
     }
     try {
       useTagsStore().resetForIdentityChange()

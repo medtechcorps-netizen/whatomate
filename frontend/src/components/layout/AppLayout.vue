@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
+import { ref, computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
+import { useOmnichannelUnreadStore } from '@/stores/omnichannelUnread'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
@@ -13,7 +14,11 @@ import {
   X,
   Zap
 } from 'lucide-vue-next'
-import { wsService } from '@/services/websocket'
+import {
+  isUnreadRelevantInboxActivity,
+  wsService,
+  type WebSocketConnectionState,
+} from '@/services/websocket'
 import { authService } from '@/services/api'
 import OrganizationSwitcher from './OrganizationSwitcher.vue'
 import UserMenu from './UserMenu.vue'
@@ -21,18 +26,27 @@ import ActiveCallPanel from '@/components/calling/ActiveCallPanel.vue'
 import { ScrollToTop } from '@/components/shared'
 import { navigationSections, type NavSection } from './navigation'
 import ReReplyLogo from '@/components/brand/ReReplyLogo.vue'
+import NavUnreadBadge from './NavUnreadBadge.vue'
 
-useI18n() // Enable $t() in template
+const { t } = useI18n()
 
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
 const organizationsStore = useOrganizationsStore()
+const omnichannelUnreadStore = useOmnichannelUnreadStore()
 const isCollapsed = ref(false)
 const isMobileMenuOpen = ref(false)
+let layoutMounted = false
+let stopInboxActivity: (() => void) | null = null
+let stopInboxConnectionState: (() => void) | null = null
+let unreadRefreshTimer: number | null = null
+let unreadPollTimer: number | null = null
+const inboxConnectionState = ref<WebSocketConnectionState>(wsService.getConnectionState())
 
 // Refresh user data and connect WebSocket on mount
 onMounted(() => {
+  layoutMounted = true
   if (authStore.isAuthenticated) {
     // Fetch fresh permissions in background (non-destructive — interceptor handles 401)
     authStore.refreshUserData()
@@ -46,6 +60,7 @@ onMounted(() => {
         return null
       }
     })
+    startOmnichannelUnreadMonitoring()
   }
 })
 
@@ -147,6 +162,112 @@ const activeOrganizationId = computed(() =>
     ? organizationsStore.selectedOrgId || authStore.organizationId
     : authStore.organizationId
 )
+const activeUserId = computed(() => authStore.user?.id?.trim() || null)
+const canAccessOmnichannel = computed(() =>
+  authStore.hasProductEntitlement('omnichannel.enabled')
+  && authStore.hasPermission('conversations', 'read')
+  && authStore.hasPermission('channel_accounts', 'read')
+)
+const unreadConversationCount = computed(() =>
+  omnichannelUnreadStore.unreadConversationCount ?? 0
+)
+const omnichannelUnreadDescription = computed(() => {
+  const count = unreadConversationCount.value
+  if (count <= 0) return ''
+  return t(
+    count === 1 ? 'nav.omnichannelUnreadOne' : 'nav.omnichannelUnreadMany',
+    { count },
+  )
+})
+const mobileMenuAriaLabel = computed(() =>
+  omnichannelUnreadDescription.value
+    ? t('nav.openMobileWorkspaceMenuWithUnread', {
+        unread: omnichannelUnreadDescription.value,
+      })
+    : t('nav.openMobileWorkspaceMenu')
+)
+const omnichannelUnreadDescriptionId = 'omnichannel-nav-unread-description'
+
+function isOmnichannelNavPath(path: string) {
+  return path === '/inbox'
+}
+
+function scheduleOmnichannelUnreadRefresh(delay = 250) {
+  if (
+    !layoutMounted
+    || !canAccessOmnichannel.value
+    || !activeOrganizationId.value
+    || document.visibilityState !== 'visible'
+  ) return
+
+  if (unreadRefreshTimer !== null) window.clearTimeout(unreadRefreshTimer)
+  unreadRefreshTimer = window.setTimeout(() => {
+    unreadRefreshTimer = null
+    const organizationId = activeOrganizationId.value
+    const userId = activeUserId.value
+    if (!organizationId || !userId || !canAccessOmnichannel.value) return
+    void omnichannelUnreadStore.refresh(organizationId, userId)
+  }, delay)
+}
+
+function catchUpOmnichannelUnread() {
+  if (document.visibilityState === 'visible') scheduleOmnichannelUnreadRefresh(0)
+}
+
+function scheduleOmnichannelUnreadPoll() {
+  if (unreadPollTimer !== null) window.clearTimeout(unreadPollTimer)
+  const baseDelay = inboxConnectionState.value === 'connected' ? 120000 : 30000
+  const jitteredDelay = Math.round(baseDelay * (0.85 + Math.random() * 0.3))
+  unreadPollTimer = window.setTimeout(() => {
+    unreadPollTimer = null
+    if (document.visibilityState === 'visible') scheduleOmnichannelUnreadRefresh(0)
+    if (layoutMounted) scheduleOmnichannelUnreadPoll()
+  }, jitteredDelay)
+}
+
+function startOmnichannelUnreadMonitoring() {
+  stopInboxActivity = wsService.onInboxActivity(event => {
+    if (isUnreadRelevantInboxActivity(event)) scheduleOmnichannelUnreadRefresh()
+  })
+  stopInboxConnectionState = wsService.onConnectionStateChange(state => {
+    const reconnected = inboxConnectionState.value !== 'connected' && state === 'connected'
+    inboxConnectionState.value = state
+    if (reconnected) scheduleOmnichannelUnreadRefresh(0)
+    scheduleOmnichannelUnreadPoll()
+  })
+  document.addEventListener('visibilitychange', catchUpOmnichannelUnread)
+  window.addEventListener('focus', catchUpOmnichannelUnread)
+  window.addEventListener('online', catchUpOmnichannelUnread)
+  scheduleOmnichannelUnreadRefresh(0)
+}
+
+function stopOmnichannelUnreadMonitoring() {
+  stopInboxActivity?.()
+  stopInboxActivity = null
+  stopInboxConnectionState?.()
+  stopInboxConnectionState = null
+  document.removeEventListener('visibilitychange', catchUpOmnichannelUnread)
+  window.removeEventListener('focus', catchUpOmnichannelUnread)
+  window.removeEventListener('online', catchUpOmnichannelUnread)
+  if (unreadRefreshTimer !== null) window.clearTimeout(unreadRefreshTimer)
+  if (unreadPollTimer !== null) window.clearTimeout(unreadPollTimer)
+  unreadRefreshTimer = null
+  unreadPollTimer = null
+}
+
+watch(
+  [activeOrganizationId, activeUserId, canAccessOmnichannel],
+  ([organizationId, userId, canAccess]) => {
+    if (!organizationId || !userId || !canAccess) {
+      omnichannelUnreadStore.resetForIdentityChange()
+      return
+    }
+    omnichannelUnreadStore.setIdentity(organizationId, userId)
+    if (layoutMounted) scheduleOmnichannelUnreadRefresh(0)
+  },
+  { immediate: true },
+)
+
 const workspaceUpgradeRoute = computed(() => ({
   path: '/upgrade-workspace',
   query: activeOrganizationId.value
@@ -167,10 +288,14 @@ const handleLogout = async () => {
   // used the current tenant. A different account must never inherit names,
   // memberships, pending reply keys, or the old org header.
   organizationsStore.resetForIdentityChange()
+  omnichannelUnreadStore.resetForIdentityChange()
   router.push('/login')
 }
 
 onBeforeUnmount(() => {
+  layoutMounted = false
+  stopOmnichannelUnreadMonitoring()
+  omnichannelUnreadStore.resetForIdentityChange()
   wsService.disconnect()
 })
 </script>
@@ -179,6 +304,13 @@ onBeforeUnmount(() => {
   <div class="flex h-screen bg-[#0a0a0b] light:bg-slate-100">
     <!-- Skip link for accessibility -->
     <a href="#main-content" class="skip-link">{{ $t('nav.skipToMain') }}</a>
+    <span
+      v-if="omnichannelUnreadStore.hasUnread"
+      :id="omnichannelUnreadDescriptionId"
+      class="sr-only"
+    >
+      {{ omnichannelUnreadDescription }}
+    </span>
 
     <!-- Mobile header -->
     <header class="fixed top-0 left-0 right-0 z-50 flex h-12 items-center justify-between border-b border-white/[0.08] light:border-slate-300 bg-[#0a0a0b]/95 light:bg-slate-50/95 backdrop-blur-sm px-3 lg:hidden">
@@ -189,13 +321,19 @@ onBeforeUnmount(() => {
       <Button
         variant="ghost"
         size="icon"
-        class="h-11 w-11 text-white/70 hover:text-white hover:bg-white/[0.08] light:text-slate-700 light:hover:text-slate-950 light:hover:bg-slate-200"
-        aria-label="Open mobile workspace menu"
+        class="relative h-11 w-11 text-white/70 hover:text-white hover:bg-white/[0.08] light:text-slate-700 light:hover:text-slate-950 light:hover:bg-slate-200"
+        :aria-label="mobileMenuAriaLabel"
         :aria-expanded="isMobileMenuOpen"
         @click="isMobileMenuOpen = !isMobileMenuOpen"
       >
         <X v-if="isMobileMenuOpen" class="h-5 w-5" />
         <Menu v-else class="h-5 w-5" />
+        <span
+          v-if="omnichannelUnreadStore.hasUnread && !isMobileMenuOpen"
+          data-testid="omnichannel-mobile-menu-unread-dot"
+          class="absolute right-1.5 top-1.5 h-2.5 w-2.5 rounded-full bg-sky-300 shadow-[0_0_0_2px_#0a0a0b] light:shadow-[0_0_0_2px_#f8fafc]"
+          aria-hidden="true"
+        />
       </Button>
     </header>
 
@@ -261,10 +399,17 @@ onBeforeUnmount(() => {
                 data-mobile-primary
                 :data-active="item.active"
                 :aria-current="item.active ? 'page' : undefined"
+                :aria-describedby="isOmnichannelNavPath(item.path) && omnichannelUnreadStore.hasUnread ? omnichannelUnreadDescriptionId : undefined"
+                :title="isOmnichannelNavPath(item.path) && omnichannelUnreadStore.hasUnread ? omnichannelUnreadDescription : undefined"
                 @click="isMobileMenuOpen = false"
               >
                 <component :is="item.icon" class="h-5 w-5 shrink-0" aria-hidden="true" />
                 <span>{{ $t(item.name) }}</span>
+                <NavUnreadBadge
+                  v-if="isOmnichannelNavPath(item.path)"
+                  :count="unreadConversationCount"
+                  data-testid="omnichannel-mobile-nav-unread-badge"
+                />
               </RouterLink>
 
               <div
@@ -313,7 +458,7 @@ onBeforeUnmount(() => {
                 <RouterLink
                   :to="item.path"
                   :class="[
-                    'nav-active-indicator btn-press flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-all duration-200',
+                    'nav-active-indicator btn-press relative flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-all duration-200',
                     item.active
                       ? 'bg-white/[0.08] text-white light:bg-gray-100 light:text-gray-900'
                       : 'text-white/50 hover:text-white hover:bg-white/[0.06] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-50',
@@ -322,10 +467,18 @@ onBeforeUnmount(() => {
                   :data-active="item.active"
                   role="menuitem"
                   :aria-current="item.active ? 'page' : undefined"
+                  :aria-describedby="isOmnichannelNavPath(item.path) && omnichannelUnreadStore.hasUnread ? omnichannelUnreadDescriptionId : undefined"
+                  :title="isOmnichannelNavPath(item.path) && omnichannelUnreadStore.hasUnread ? omnichannelUnreadDescription : undefined"
                   @click="isMobileMenuOpen = false"
                 >
                   <component :is="item.icon" class="h-4 w-4 shrink-0" aria-hidden="true" />
                   <span :class="isCollapsed && 'lg:sr-only'">{{ $t(item.name) }}</span>
+                  <NavUnreadBadge
+                    v-if="isOmnichannelNavPath(item.path)"
+                    :count="unreadConversationCount"
+                    :compact="isCollapsed"
+                    data-testid="omnichannel-desktop-nav-unread-badge"
+                  />
                 </RouterLink>
 
                 <!-- Submenu items -->

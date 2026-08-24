@@ -39,7 +39,9 @@ import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
+import { useOmnichannelUnreadStore } from '@/stores/omnichannelUnread'
 import { getErrorMessage, unwrapItemResponse, unwrapListResponse } from '@/lib/api-utils'
+import { compareMessageIngestionOrder } from '@/lib/messageOrdering'
 import {
   clearLegacyWhatsAppReplyAttempt,
   getOrCreateLegacyWhatsAppReplyAttempt,
@@ -49,7 +51,12 @@ import {
   threadsPublicEngagementAccountReady,
   threadsPublicEngagementTarget,
 } from '@/lib/threadsPublicEngagement'
-import { wsService, type WebSocketConnectionState } from '@/services/websocket'
+import {
+  isInboxContentRefreshActivity,
+  wsService,
+  type InboxActivityEvent,
+  type WebSocketConnectionState,
+} from '@/services/websocket'
 import {
   metaMessengerOnboarding,
   MetaMessengerAuthorizationCancelledError,
@@ -81,6 +88,7 @@ interface InboxMessage {
   message_type: string
   content: string
   status: string
+  ingested_at?: string
   created_at: string
 }
 
@@ -99,6 +107,7 @@ interface LegacyWhatsAppMessage {
   message_type: string
   content: string | { body?: string } | null
   status: string
+  ingested_at?: string
   created_at: string
 }
 
@@ -113,6 +122,7 @@ interface CreatedConnection {
 const toast = useAppToast()
 const authStore = useAuthStore()
 const organizationsStore = useOrganizationsStore()
+const omnichannelUnreadStore = useOmnichannelUnreadStore()
 const loading = ref(true)
 const loadingMessages = ref(false)
 const loadingMore = ref(false)
@@ -169,6 +179,7 @@ const canManageMetaInstagram = computed(
 const canReconcileMetaInstagram = computed(
   () => canManageMetaInstagram.value && canDeleteAccounts.value,
 )
+const canReadConversations = computed(() => authStore.hasPermission('conversations', 'read'))
 const canManageConversations = computed(() => authStore.hasPermission('conversations', 'write'))
 const threadsPublicEngagementEntitlement = 'threads.public_engagement.enabled'
 const absoluteWebhookURL = computed(() => {
@@ -191,6 +202,9 @@ let refreshInFlight = false
 let refreshQueued = false
 let viewMounted = false
 let conversationViewSequence = 0
+let messageViewportScrollFrame: number | null = null
+let readCursorInFlightKey: string | null = null
+let readCursorCheckQueued = false
 let metaMessengerContextVersion = 0
 let metaMessengerStatusSequence = 0
 let metaInstagramStatusSequence = 0
@@ -233,6 +247,65 @@ function isCurrentConversationView(sequence: number, conversationId: string) {
     sequence === conversationViewSequence &&
     selectedConversation.value?.id === conversationId
   )
+}
+
+function refreshOmnichannelUnread(organizationId: string | null, userId: string | undefined) {
+  if (
+    !organizationId
+    || !userId
+    || activeOrganizationId.value !== organizationId
+    || authStore.user?.id !== userId
+  ) return
+  void omnichannelUnreadStore.refresh(organizationId, userId)
+}
+
+async function markOpenConversationRead(
+  conversation: InboxConversation,
+  viewSequence: number,
+) {
+  const lastVisibleMessageID = messages.value.at(-1)?.id
+  if (
+    conversation.unread_count <= 0
+    || !canReadConversations.value
+    || !lastVisibleMessageID
+    || !isCurrentConversationView(viewSequence, conversation.id)
+  ) return
+
+  const cursorKey = `${conversation.id}:${lastVisibleMessageID}`
+  if (readCursorInFlightKey !== null) {
+    readCursorCheckQueued = true
+    return
+  }
+
+  const organizationId = activeOrganizationId.value
+  const userId = authStore.user?.id
+  if (!organizationId) return
+  readCursorInFlightKey = cursorKey
+  try {
+    const response = await channelsService.markRead(conversation.id, {
+      last_visible_message_id: lastVisibleMessageID,
+    }, organizationId)
+    // Refresh the still-active tenant even if the operator changed threads while
+    // the POST was in flight. A no-op cursor advance emits no websocket event.
+    refreshOmnichannelUnread(organizationId, userId)
+    if (!isCurrentConversationView(viewSequence, conversation.id)) return
+    const payload = response?.data?.data ?? response?.data
+    if (Number.isSafeInteger(payload?.unread_count) && payload.unread_count >= 0) {
+      const unreadCount = payload.unread_count as number
+      conversation.unread_count = unreadCount
+      const listed = conversations.value.find(item => item.id === conversation.id)
+      if (listed) listed.unread_count = unreadCount
+      if (selectedConversation.value?.id === conversation.id) {
+        selectedConversation.value.unread_count = unreadCount
+      }
+    }
+  } finally {
+    if (readCursorInFlightKey === cursorKey) readCursorInFlightKey = null
+    if (readCursorCheckQueued && viewMounted) {
+      readCursorCheckQueued = false
+      scheduleMessageViewportReadCheck()
+    }
+  }
 }
 
 const supportedChannels: Array<{
@@ -508,9 +581,7 @@ function upsertInboxMessage(message: InboxMessage) {
     messages.value.push(message)
     messageTotal.value = Math.max(messageTotal.value + 1, messages.value.length)
   }
-  messages.value.sort(
-    (left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime(),
-  )
+  messages.value.sort(compareMessageIngestionOrder)
 }
 
 function isMessageViewportNearBottom() {
@@ -613,10 +684,29 @@ async function load(silent = false, append = false) {
       messageTotal.value = totalFromResponse(messageResponse)
       const merged = new Map(messages.value.map((message) => [message.id, message]))
       for (const message of latest) merged.set(message.id, message)
-      messages.value = [...merged.values()].sort(
-        (left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime(),
-      )
-      if (shouldFollowLatestMessage) void scrollMessagesToBottom(true)
+      messages.value = [...merged.values()].sort(compareMessageIngestionOrder)
+      if (shouldFollowLatestMessage) {
+        // A smooth scroll returns before the viewport reaches its destination.
+        // Use an immediate positioning step whenever this refresh may advance
+        // the read cursor, then verify the boundary again below.
+        const willAcknowledge = selectedConversation.value.unread_count > 0
+          && document.visibilityState === 'visible'
+          && document.hasFocus()
+        await scrollMessagesToBottom(!willAcknowledge)
+      }
+      if (
+        shouldFollowLatestMessage
+        && document.visibilityState === 'visible'
+        && document.hasFocus()
+        && isMessageViewportNearBottom()
+      ) {
+        try {
+          await markOpenConversationRead(selectedConversation.value, viewSequence)
+        } catch {
+          // Keep it unread when the cursor update fails. A later activity
+          // event or poll will retry without creating repeated error toasts.
+        }
+      }
     }
   } catch (error) {
     if (!silent) toast.error('Channels could not be loaded', getErrorMessage(error))
@@ -642,6 +732,44 @@ function scheduleChannelRefresh(delay = 300) {
     syncDebounceTimer = null
     void load(true)
   }, delay)
+}
+
+function scheduleMessageViewportReadCheck() {
+  if (messageViewportScrollFrame !== null) return
+  messageViewportScrollFrame = window.requestAnimationFrame(() => {
+    messageViewportScrollFrame = null
+    const conversation = selectedConversation.value
+    const viewSequence = conversationViewSequence
+    if (
+      !conversation
+      || document.visibilityState !== 'visible'
+      || !document.hasFocus()
+      || !isMessageViewportNearBottom()
+    ) return
+    void markOpenConversationRead(conversation, viewSequence).catch(() => {
+      // Preserve the unread marker. Focus, realtime, polling, or another
+      // bottom scroll will retry the exact visible boundary.
+    })
+  })
+}
+
+function applyInboxMessageStatus(event: InboxActivityEvent) {
+  const isStatusActivity = event.type === 'status_update'
+    || (event.type === 'realtime_sync' && event.payload?.kind === 'message_status_changed')
+  if (!isStatusActivity) return false
+
+  const messageID = event.payload?.message_id
+  const status = event.payload?.status
+  if (typeof messageID === 'string' && typeof status === 'string') {
+    const message = messages.value.find(item => item.id === messageID)
+    if (message) message.status = status
+  }
+  return true
+}
+
+function handleInboxActivity(event: InboxActivityEvent) {
+  if (applyInboxMessageStatus(event)) return
+  if (isInboxContentRefreshActivity(event)) scheduleChannelRefresh()
 }
 
 function catchUpInbox() {
@@ -674,10 +802,6 @@ async function selectConversation(conversation: InboxConversation) {
       .reverse()
     messageTotal.value = totalFromResponse(response)
     loaded = true
-    if (conversation.unread_count > 0 && canManageConversations.value) {
-      await channelsService.markRead(conversation.id)
-      conversation.unread_count = 0
-    }
   } catch (error) {
     if (isCurrentConversationView(viewSequence, conversation.id)) {
       toast.error('Messages could not be loaded', getErrorMessage(error))
@@ -685,9 +809,29 @@ async function selectConversation(conversation: InboxConversation) {
   } finally {
     if (isCurrentConversationView(viewSequence, conversation.id)) {
       loadingMessages.value = false
-      if (loaded) await scrollMessagesToBottom()
     }
   }
+
+  if (!loaded || !isCurrentConversationView(viewSequence, conversation.id)) return
+  await scrollMessagesToBottom()
+  if (!isCurrentConversationView(viewSequence, conversation.id)) return
+
+  // A tab switch can happen while the transcript request is in flight. Keep
+  // the viewport ready at the latest message, but do not acknowledge anything
+  // until this document is actually active and the bottom boundary is proven.
+  if (
+    document.visibilityState !== 'visible'
+    || !document.hasFocus()
+    || !isMessageViewportNearBottom()
+  ) return
+
+  // Rendering and positioning the transcript must never wait on the cursor
+  // mutation. The exact visible boundary is posted only after the scroll.
+  void markOpenConversationRead(conversation, viewSequence).catch(error => {
+    if (isCurrentConversationView(viewSequence, conversation.id)) {
+      toast.error('Read state could not be updated', getErrorMessage(error))
+    }
+  })
 }
 
 function closeMobileConversation() {
@@ -701,6 +845,7 @@ function closeMobileConversation() {
   loadingOlderMessages.value = false
   sending.value = false
   aiStateUpdating.value = false
+  readCursorCheckQueued = false
 }
 
 async function loadOlderMessages() {
@@ -1635,12 +1780,13 @@ onMounted(() => {
   viewMounted = true
   window.addEventListener('beforeunload', guardMetaMessengerNavigation)
   document.addEventListener('visibilitychange', catchUpInbox)
+  window.addEventListener('focus', catchUpInbox)
   window.addEventListener('online', handleOnline)
   void load()
   void loadMetaMessengerOnboardingStatus()
   void loadMetaInstagramOnboardingStatus()
   consumeMetaInstagramCallbackResult()
-  stopInboxActivity = wsService.onInboxActivity(() => scheduleChannelRefresh())
+  stopInboxActivity = wsService.onInboxActivity(handleInboxActivity)
   stopConnectionState = wsService.onConnectionStateChange(state => {
     connectionState.value = state
   })
@@ -1726,7 +1872,13 @@ onBeforeUnmount(() => {
   closeMetaMessengerSelection()
   window.removeEventListener('beforeunload', guardMetaMessengerNavigation)
   document.removeEventListener('visibilitychange', catchUpInbox)
+  window.removeEventListener('focus', catchUpInbox)
   window.removeEventListener('online', handleOnline)
+  if (messageViewportScrollFrame !== null) {
+    window.cancelAnimationFrame(messageViewportScrollFrame)
+    messageViewportScrollFrame = null
+  }
+  readCursorCheckQueued = false
   organizationsStore.unblockOrganizationSwitch(metaMessengerSwitchLockOwner)
   stopInboxActivity?.()
   stopConnectionState?.()
@@ -2430,6 +2582,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             ref="messagesViewport"
             data-testid="omnichannel-message-viewport"
             class="flex-1 space-y-3 overflow-y-auto p-3 sm:p-5 md:p-7"
+            @scroll.passive="scheduleMessageViewportReadCheck"
           >
             <div v-if="hasOlderMessages" class="pb-2 text-center">
               <Button

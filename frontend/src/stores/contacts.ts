@@ -3,6 +3,7 @@ import { ref, computed, watch } from 'vue'
 import { contactsService, messagesService } from '@/services/api'
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
+import { compareMessageIngestionOrder } from '@/lib/messageOrdering'
 
 // Phones are stored without leading + or whitespace (see CreateContact in
 // internal/handlers/contacts.go). Strip them from a digit-only query so a user
@@ -80,6 +81,7 @@ export interface Message {
   reply_to_message?: ReplyPreview
   reactions?: Reaction[]
   whatsapp_account?: string
+  ingested_at?: string
   created_at: string
   updated_at: string
 }
@@ -339,11 +341,7 @@ export const useContactsStore = defineStore('contacts', () => {
         // older messages, while canonical status/content wins for duplicate IDs.
         const mergedById = new Map(messages.value.map(message => [message.id, message]))
         for (const message of fetchedMessages) mergedById.set(message.id, message)
-        messages.value = Array.from(mergedById.values()).sort((left, right) => {
-          const leftTime = new Date(left.created_at).getTime()
-          const rightTime = new Date(right.created_at).getTime()
-          return leftTime - rightTime
-        })
+        messages.value = Array.from(mergedById.values()).sort(compareMessageIngestionOrder)
       } else {
         messages.value = fetchedMessages
         hasMoreMessages.value = data.has_more === true
@@ -537,8 +535,10 @@ export const useContactsStore = defineStore('contacts', () => {
       return
     }
 
-    // Skip adding to messages array if account filter is active and doesn't match
-    if (accountFilter.value && message.whatsapp_account && message.whatsapp_account !== accountFilter.value) {
+    // Fail closed while an account-specific transcript is open. During a
+    // rolling deployment an older socket publisher may omit whatsapp_account;
+    // the canonical account-filtered fetch will safely pick up that message.
+    if (accountFilter.value && message.whatsapp_account !== accountFilter.value) {
       return
     }
 
@@ -546,6 +546,7 @@ export const useContactsStore = defineStore('contacts', () => {
     const exists = messages.value.some(m => m.id === message.id)
     if (!exists) {
       messages.value.push(message)
+      messages.value.sort(compareMessageIngestionOrder)
     }
   }
 

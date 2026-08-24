@@ -9,6 +9,9 @@ const mocks = vi.hoisted(() => ({
   connect: vi.fn(),
   logout: vi.fn(),
   resetOrganizations: vi.fn(),
+  resetOmnichannelUnread: vi.fn(),
+  setOmnichannelIdentity: vi.fn(),
+  refreshOmnichannelUnread: vi.fn(),
   routerPush: vi.fn(),
 }))
 
@@ -27,10 +30,11 @@ vi.mock('vue-i18n', async importOriginal => ({
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => ({
     isAuthenticated: false,
-    user: null,
-    organizationId: null,
-    hasPermission: () => false,
-    hasProductEntitlement: () => false,
+    user: { id: 'agent-1', is_super_admin: false },
+    organizationId: 'previous-tenant',
+    hasPermission: (resource: string, action: string) =>
+      action === 'read' && (resource === 'conversations' || resource === 'channel_accounts'),
+    hasProductEntitlement: (entitlement: string) => entitlement === 'omnichannel.enabled',
     refreshUserData: vi.fn(),
     ensureProductEntitlements: vi.fn(),
     logout: mocks.logout,
@@ -44,10 +48,24 @@ vi.mock('@/stores/organizations', () => ({
   }),
 }))
 
+vi.mock('@/stores/omnichannelUnread', () => ({
+  useOmnichannelUnreadStore: () => ({
+    unreadConversationCount: null,
+    hasUnread: false,
+    resetForIdentityChange: mocks.resetOmnichannelUnread,
+    setIdentity: mocks.setOmnichannelIdentity,
+    refresh: mocks.refreshOmnichannelUnread,
+  }),
+}))
+
 vi.mock('@/services/websocket', () => ({
+  isUnreadRelevantInboxActivity: () => true,
   wsService: {
     connect: mocks.connect,
     disconnect: mocks.disconnect,
+    getConnectionState: () => 'disconnected',
+    onInboxActivity: vi.fn(() => vi.fn()),
+    onConnectionStateChange: vi.fn(() => vi.fn()),
   },
 }))
 
@@ -105,6 +123,7 @@ describe('AppLayout logout identity isolation', () => {
     await flushPromises()
 
     expect(mocks.resetOrganizations).toHaveBeenCalledTimes(1)
+    expect(mocks.resetOmnichannelUnread).toHaveBeenCalledTimes(1)
     expect(mocks.routerPush).toHaveBeenCalledWith('/login')
   })
 })
