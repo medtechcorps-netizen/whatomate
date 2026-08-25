@@ -45,9 +45,8 @@ type Config struct {
 }
 
 // LegacyWhatsAppReplyConfig is a deployment-owned rollout gate for the new
-// exact-conversation Omnichannel reply endpoint. It defaults off. When enabled
-// with an empty allowlist it is global; otherwise only the canonical tenant
-// UUIDs in AllowedOrganizationIDs are released.
+// exact-conversation Omnichannel reply endpoint. It defaults off and always
+// requires an explicit, nonempty canonical tenant allowlist when enabled.
 type LegacyWhatsAppReplyConfig struct {
 	Enabled                bool   `koanf:"enabled" json:"enabled"`
 	AllowedOrganizationIDs string `koanf:"allowed_organization_ids" json:"allowed_organization_ids"`
@@ -60,9 +59,6 @@ func (config LegacyWhatsAppReplyConfig) OrganizationEnabled(organizationID strin
 	allowed, err := canonicalLegacyWhatsAppReplyAllowlist(config.AllowedOrganizationIDs)
 	if err != nil {
 		return false
-	}
-	if len(allowed) == 0 {
-		return true
 	}
 	for _, candidate := range allowed {
 		if candidate == organizationID {
@@ -471,6 +467,14 @@ func Load(configPath string) (*Config, error) {
 	if err := k.Unmarshal("", &cfg); err != nil {
 		return nil, err
 	}
+	if strings.TrimSpace(cfg.App.Environment) == "" {
+		cfg.App.Environment = "development"
+	}
+	canonicalEnvironment, err := canonicalAppEnvironment(cfg.App.Environment)
+	if err != nil {
+		return nil, err
+	}
+	cfg.App.Environment = canonicalEnvironment
 
 	// Set defaults
 	setDefaults(&cfg)
@@ -508,8 +512,21 @@ func Load(configPath string) (*Config, error) {
 	if err := ValidateLegacyWhatsAppReplyConfig(cfg.LegacyWhatsAppReply); err != nil {
 		return nil, err
 	}
+	if err := validateWhatsAppConfig(cfg.WhatsApp, cfg.App.Environment); err != nil {
+		return nil, err
+	}
 
 	return &cfg, nil
+}
+
+func canonicalAppEnvironment(raw string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	switch normalized {
+	case "development", "staging", "test", "production":
+		return normalized, nil
+	default:
+		return "", errors.New("app environment must be development, staging, or production (test is reserved for CI)")
+	}
 }
 
 func ValidateLegacyWhatsAppReplyConfig(config LegacyWhatsAppReplyConfig) error {
@@ -519,6 +536,26 @@ func ValidateLegacyWhatsAppReplyConfig(config LegacyWhatsAppReplyConfig) error {
 	}
 	if !config.Enabled && len(allowed) != 0 {
 		return errors.New("legacy WhatsApp reply allowlist requires explicit enablement")
+	}
+	if config.Enabled && len(allowed) == 0 {
+		return errors.New("legacy WhatsApp reply requires a nonempty allowed_organization_ids allowlist")
+	}
+	return nil
+}
+
+func validateWhatsAppConfig(config WhatsAppConfig, environment string) error {
+	baseURL := strings.TrimSpace(config.BaseURL)
+	parsed, err := url.Parse(baseURL)
+	if err != nil || baseURL == "" || baseURL != config.BaseURL || parsed.Host == "" || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" ||
+		parsed.ForceQuery || parsed.Opaque != "" ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		(parsed.Path != "" && parsed.Path != "/") {
+		return errors.New("whatsapp base_url must be an HTTP(S) origin without credentials, query, or fragment")
+	}
+	normalizedEnvironment := strings.ToLower(strings.TrimSpace(environment))
+	if normalizedEnvironment == "production" && baseURL != "https://graph.facebook.com" {
+		return errors.New("production WhatsApp base_url must be exactly https://graph.facebook.com")
 	}
 	return nil
 }

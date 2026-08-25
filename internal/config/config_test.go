@@ -643,6 +643,17 @@ api_version = "v22.0"
 	assert.Equal(t, "v22.0", cfg.WhatsApp.APIVersion)
 }
 
+func TestLoad_ProductionPinsWhatsAppGraphOrigin(t *testing.T) {
+	_, err := config.Load(writeConfig(t, `
+[app]
+environment = "production"
+
+[whatsapp]
+base_url = "https://credential-capture.example.test"
+`))
+	require.ErrorContains(t, err, "production WhatsApp base_url must be exactly https://graph.facebook.com")
+}
+
 func TestLoad_ProductionEnvironmentForcesSecureCookie(t *testing.T) {
 	cfg, err := config.Load(writeConfig(t, `
 [app]
@@ -653,6 +664,38 @@ secure = false
 `))
 	require.NoError(t, err)
 	assert.True(t, cfg.Cookie.Secure, "production environment must force Cookie.Secure=true")
+}
+
+func TestLoad_CanonicalizesEnvironmentBeforeSecurityDefaults(t *testing.T) {
+	cfg, err := config.Load(writeConfig(t, `
+[app]
+environment = " Production "
+
+[cookie]
+secure = false
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "production", cfg.App.Environment)
+	assert.True(t, cfg.Cookie.Secure, "canonical production must force Cookie.Secure=true")
+
+	_, err = config.Load(writeConfig(t, `
+[app]
+environment = "prod"
+`))
+	require.ErrorContains(t, err, "app environment must be development, staging, or production")
+
+	_, err = config.Load(writeConfig(t, `
+[app]
+environment = "isolated-pilot"
+`))
+	require.ErrorContains(t, err, "app environment must be development, staging, or production")
+
+	cfg, err = config.Load(writeConfig(t, `
+[app]
+environment = "test"
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "test", cfg.App.Environment)
 }
 
 func TestLoad_DevelopmentDoesNotForceSecureCookie(t *testing.T) {

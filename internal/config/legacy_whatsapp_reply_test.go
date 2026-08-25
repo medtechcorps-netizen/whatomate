@@ -13,7 +13,8 @@ func TestLegacyWhatsAppReplyRolloutGate(t *testing.T) {
 	otherOrganizationID := uuid.NewString()
 
 	assert.False(t, (LegacyWhatsAppReplyConfig{}).OrganizationEnabled(organizationID))
-	assert.True(t, (LegacyWhatsAppReplyConfig{Enabled: true}).OrganizationEnabled(organizationID))
+	assert.False(t, (LegacyWhatsAppReplyConfig{Enabled: true}).OrganizationEnabled(organizationID))
+	require.Error(t, ValidateLegacyWhatsAppReplyConfig(LegacyWhatsAppReplyConfig{Enabled: true}))
 	allowlisted := LegacyWhatsAppReplyConfig{
 		Enabled:                true,
 		AllowedOrganizationIDs: organizationID,

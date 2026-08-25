@@ -28,6 +28,11 @@ const mocks = vi.hoisted(() => ({
   organizationStore: { selectedOrgId: null as string | null },
   setWebSocketContact: vi.fn(),
   scrollIntoView: vi.fn(),
+  resizeObservers: [] as Array<{
+    callback: ResizeObserverCallback
+    observe: ReturnType<typeof vi.fn>
+    disconnect: ReturnType<typeof vi.fn>
+  }>,
   infiniteControllers: [] as Array<{
     scrollAreaRef: { value: unknown }
     setup: ReturnType<typeof vi.fn>
@@ -260,6 +265,7 @@ describe('ChatView conversation selection', () => {
     vi.useFakeTimers()
     vi.clearAllMocks()
     mocks.infiniteControllers = []
+    mocks.resizeObservers = []
     mocks.routeSource.params.contactId = 'first'
     mocks.organizationStore.selectedOrgId = null
     if (mocks.route) mocks.route.params.contactId = 'first'
@@ -291,6 +297,20 @@ describe('ChatView conversation selection', () => {
       configurable: true,
       value: mocks.scrollIntoView,
     })
+    class MockResizeObserver {
+      observe = vi.fn()
+      unobserve = vi.fn()
+      disconnect = vi.fn()
+
+      constructor(callback: ResizeObserverCallback) {
+        mocks.resizeObservers.push({
+          callback,
+          observe: this.observe,
+          disconnect: this.disconnect,
+        })
+      }
+    }
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
   })
 
   afterEach(() => {
@@ -465,6 +485,73 @@ describe('ChatView conversation selection', () => {
       focusSpy.mockRestore()
       visibilitySpy.mockRestore()
     }
+  })
+
+  it('follows late media layout growth only while the reader remains at the bottom', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    wrapper = mountChatView()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+
+    const resizeObserver = mocks.resizeObservers[0]
+    expect(resizeObserver).toBeDefined()
+    expect(resizeObserver.observe).toHaveBeenCalledTimes(1)
+    const observedContent = resizeObserver.observe.mock.calls[0][0] as Element
+    const messagesController = mocks.infiniteControllers[1]
+    const viewport = document.createElement('div')
+    Object.defineProperties(viewport, {
+      scrollHeight: { configurable: true, value: 1_000 },
+      clientHeight: { configurable: true, value: 300 },
+    })
+    messagesController.getViewport.mockReturnValue(viewport)
+
+    viewport.scrollTop = 700
+    messagesController.onScroll?.({ target: viewport } as unknown as Event)
+    mocks.scrollIntoView.mockClear()
+    resizeObserver.callback([
+      { target: observedContent, contentRect: { height: 600 } } as ResizeObserverEntry,
+    ], {} as ResizeObserver)
+    await nextTick()
+    await nextTick()
+
+    expect(mocks.scrollIntoView).toHaveBeenCalledTimes(1)
+    expect(mocks.scrollIntoView).toHaveBeenCalledWith({
+      behavior: 'instant',
+      block: 'end',
+    })
+
+    viewport.scrollTop = 100
+    messagesController.onScroll?.({ target: viewport } as unknown as Event)
+    mocks.scrollIntoView.mockClear()
+    resizeObserver.callback([
+      { target: observedContent, contentRect: { height: 700 } } as ResizeObserverEntry,
+    ], {} as ResizeObserver)
+    await nextTick()
+    await nextTick()
+
+    expect(mocks.scrollIntoView).not.toHaveBeenCalled()
+
+    mocks.route!.params.contactId = 'second'
+    await nextTick()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+
+    expect(resizeObserver.disconnect).toHaveBeenCalledTimes(1)
+    const replacementObserver = mocks.resizeObservers[1]
+    expect(replacementObserver).toBeDefined()
+    mocks.scrollIntoView.mockClear()
+    resizeObserver.callback([
+      { target: observedContent, contentRect: { height: 800 } } as ResizeObserverEntry,
+    ], {} as ResizeObserver)
+    await nextTick()
+    await nextTick()
+    expect(mocks.scrollIntoView).not.toHaveBeenCalled()
+
+    wrapper.unmount()
+    wrapper = null
+    expect(replacementObserver.disconnect).toHaveBeenCalledTimes(1)
   })
 
   it('keeps a focused scrolled-up message unread and refreshes the selected workspace at bottom', async () => {

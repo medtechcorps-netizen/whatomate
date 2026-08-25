@@ -75,9 +75,9 @@ app_secret = ""  # Meta App Secret
 config_id = ""  # WhatsApp Config ID for frontend login
 
 # Fail-closed rollout gate for replying from a legacy WhatsApp conversation in
-# Omnichannel. Keep disabled until the strict backend is deployed. With enabled
-# = true, an empty allowlist releases every organization; a comma-separated
-# canonical UUID list releases only those pilot tenants.
+# Omnichannel. Keep disabled until the strict backend is deployed. Enabling the
+# gate requires a nonempty comma-separated list of canonical pilot tenant UUIDs;
+# an empty or invalid allowlist fails startup and never releases every tenant.
 # Environment equivalents:
 # WHATOMATE_LEGACY_WHATSAPP_REPLY__ENABLED=true
 # WHATOMATE_LEGACY_WHATSAPP_REPLY__ALLOWED_ORGANIZATION_IDS=<uuid>,<uuid>

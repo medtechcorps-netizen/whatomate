@@ -31,7 +31,10 @@ func (c *Client) SendTextMessage(ctx context.Context, account *Account, rcpt Rec
 		}
 	}
 
-	url := c.buildMessagesURL(account)
+	url, err := c.buildMessagesURL(account)
+	if err != nil {
+		return "", fmt.Errorf("build WhatsApp messages endpoint: %w", err)
+	}
 	c.Log.Debug("Sending text message", "phone", rcpt.Phone, "url", url)
 
 	respBody, err := c.doRequest(ctx, "POST", url, payload, account.AccessToken)
@@ -125,7 +128,10 @@ func (c *Client) SendInteractiveButtons(ctx context.Context, account *Account, r
 	}
 	rcpt.SetOnPayload(payload)
 
-	url := c.buildMessagesURL(account)
+	url, err := c.buildMessagesURL(account)
+	if err != nil {
+		return "", fmt.Errorf("build WhatsApp messages endpoint: %w", err)
+	}
 	c.Log.Debug("Sending interactive message", "phone", rcpt.Phone, "button_count", len(buttons))
 
 	respBody, err := c.doRequest(ctx, "POST", url, payload, account.AccessToken)
@@ -176,7 +182,10 @@ func (c *Client) SendCTAURLButton(ctx context.Context, account *Account, rcpt Re
 	}
 	rcpt.SetOnPayload(payload)
 
-	apiURL := c.buildMessagesURL(account)
+	apiURL, err := c.buildMessagesURL(account)
+	if err != nil {
+		return "", fmt.Errorf("build WhatsApp messages endpoint: %w", err)
+	}
 	c.Log.Debug("Sending CTA URL button message", "phone", rcpt.Phone, "url", url)
 
 	respBody, err := c.doRequest(ctx, "POST", apiURL, payload, account.AccessToken)
@@ -243,7 +252,10 @@ func (c *Client) SendVoiceCallButton(ctx context.Context, account *Account, rcpt
 	}
 	rcpt.SetOnPayload(msg)
 
-	url := c.buildMessagesURL(account)
+	url, err := c.buildMessagesURL(account)
+	if err != nil {
+		return "", fmt.Errorf("build WhatsApp messages endpoint: %w", err)
+	}
 	// Logged at info during the sticky-routing rollout: confirms display_text,
 	// ttl_minutes, and the agent-id payload actually leave our box, so when
 	// the incoming-call webhook arrives we know whether Meta echoed it back.
@@ -626,7 +638,10 @@ func (c *Client) SendFlowMessage(ctx context.Context, account *Account, rcpt Rec
 	}
 	rcpt.SetOnPayload(payload)
 
-	url := c.buildMessagesURL(account)
+	url, err := c.buildMessagesURL(account)
+	if err != nil {
+		return "", fmt.Errorf("build WhatsApp messages endpoint: %w", err)
+	}
 	c.Log.Debug("Sending flow message", "phone", rcpt.Phone, "flow_id", flowID)
 
 	respBody, err := c.doRequest(ctx, "POST", url, payload, account.AccessToken)
@@ -663,7 +678,10 @@ func (c *Client) SendTemplateMessage(ctx context.Context, account *Account, rcpt
 	}
 	rcpt.SetOnPayload(payload)
 
-	url := c.buildMessagesURL(account)
+	url, err := c.buildMessagesURL(account)
+	if err != nil {
+		return "", fmt.Errorf("build WhatsApp messages endpoint: %w", err)
+	}
 	c.Log.Debug("Sending template message with components", "phone", rcpt.Phone, "template", templateName)
 
 	respBody, err := c.doRequest(ctx, "POST", url, payload, account.AccessToken)

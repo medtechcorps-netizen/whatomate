@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -340,10 +341,147 @@ func TestSendLegacyWhatsAppConversationReplyRequiresIdempotencyKey(t *testing.T)
 	assert.Zero(t, fixture.mock.sentMessageCount())
 }
 
+func TestSendLegacyWhatsAppConversationReplyRejectsUnsafeJSONShape(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unknown root field",
+			body: `{"idempotency_key":"key","type":"text","content":{"body":"hello"},"account_id":"attacker-selected"}`,
+		},
+		{
+			name: "unknown nested field",
+			body: `{"idempotency_key":"key","type":"text","content":{"body":"hello","media_id":"attacker-selected"}}`,
+		},
+		{
+			name: "case variant root field",
+			body: `{"idempotency_key":"key","Type":"text","content":{"body":"hello"}}`,
+		},
+		{
+			name: "case variant nested field",
+			body: `{"idempotency_key":"key","type":"text","content":{"Body":"hello"}}`,
+		},
+		{
+			name: "duplicate idempotency key",
+			body: `{"idempotency_key":"first","idempotency_key":"second","type":"text","content":{"body":"hello"}}`,
+		},
+		{
+			name: "duplicate nested body",
+			body: `{"idempotency_key":"key","type":"text","content":{"body":"first","body":"second"}}`,
+		},
+		{
+			name: "trailing JSON value",
+			body: `{"idempotency_key":"key","type":"text","content":{"body":"hello"}} {}`,
+		},
+		{
+			name: "non object root",
+			body: `[]`,
+		},
+		{
+			name: "content array",
+			body: `{"idempotency_key":"key","type":"text","content":[]}`,
+		},
+		{
+			name: "nested body object",
+			body: `{"idempotency_key":"key","type":"text","content":{"body":{}}}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLegacyReplyFixture(t)
+			request := legacyReplyRequest(t, fixture, "placeholder")
+			request.RequestCtx.Request.SetBodyString(test.body)
+
+			require.NoError(t, fixture.app.SendLegacyWhatsAppConversationReply(request))
+			assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(request))
+			assert.Zero(t, fixture.mock.sentMessageCount())
+		})
+	}
+}
+
+func TestSendLegacyWhatsAppConversationReplyRejectsInvalidUTF8(t *testing.T) {
+	fixture := newLegacyReplyFixture(t)
+	request := legacyReplyRequest(t, fixture, "placeholder")
+	body := append(
+		[]byte(`{"idempotency_key":"key","type":"text","content":{"body":"hello`),
+		0xff,
+	)
+	body = append(body, []byte(`"}}`)...)
+	request.RequestCtx.Request.SetBodyRaw(body)
+
+	require.NoError(t, fixture.app.SendLegacyWhatsAppConversationReply(request))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(request))
+	assert.Zero(t, fixture.mock.sentMessageCount())
+}
+
+func TestSendLegacyWhatsAppConversationReplyEnforcesRequestBodyBoundary(t *testing.T) {
+	const maxRequestBytes = 64 << 10
+	validJSON := `{"idempotency_key":"body-boundary","type":"text","content":{"body":"hello"}}`
+
+	fixture := newLegacyReplyFixture(t)
+	boundaryRequest := legacyReplyRequest(t, fixture, "placeholder")
+	boundaryRequest.RequestCtx.Request.SetBodyString(
+		validJSON + strings.Repeat(" ", maxRequestBytes-len(validJSON)),
+	)
+	require.NoError(t, fixture.app.SendLegacyWhatsAppConversationReply(boundaryRequest))
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(boundaryRequest))
+	assert.Equal(t, 1, fixture.mock.sentMessageCount())
+
+	oversizedRequest := legacyReplyRequest(t, fixture, "placeholder")
+	oversizedRequest.RequestCtx.Request.SetBodyString(
+		validJSON + strings.Repeat(" ", maxRequestBytes-len(validJSON)+1),
+	)
+	require.NoError(t, fixture.app.SendLegacyWhatsAppConversationReply(oversizedRequest))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(oversizedRequest))
+	assert.Equal(t, 1, fixture.mock.sentMessageCount())
+}
+
+func TestSendLegacyWhatsAppConversationReplyRejectsProviderOversizedText(t *testing.T) {
+	fixture := newLegacyReplyFixture(t)
+	request := legacyReplyRequest(
+		t,
+		fixture,
+		strings.Repeat("界", 4097),
+	)
+
+	require.NoError(t, fixture.app.SendLegacyWhatsAppConversationReply(request))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(request))
+	assert.Zero(t, fixture.mock.sentMessageCount())
+}
+
+func TestSendLegacyWhatsAppConversationReplyAcceptsProviderTextBoundary(t *testing.T) {
+	fixture := newLegacyReplyFixture(t)
+	request := legacyReplyRequest(
+		t,
+		fixture,
+		strings.Repeat("界", 4096),
+	)
+
+	require.NoError(t, fixture.app.SendLegacyWhatsAppConversationReply(request))
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+	assert.Equal(t, 1, fixture.mock.sentMessageCount())
+}
+
+func TestSendLegacyWhatsAppConversationReplyRejectsNULText(t *testing.T) {
+	fixture := newLegacyReplyFixture(t)
+	request := legacyReplyRequest(t, fixture, "hello\x00world")
+
+	require.NoError(t, fixture.app.SendLegacyWhatsAppConversationReply(request))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(request))
+	assert.Zero(t, fixture.mock.sentMessageCount())
+}
+
 func TestSendLegacyWhatsAppConversationReplyRolloutGateFailsClosed(t *testing.T) {
 	fixture := newLegacyReplyFixture(t)
 	fixture.app.Config.LegacyWhatsAppReply.Enabled = false
 	request := legacyReplyRequest(t, fixture, "Disabled rollout")
+	require.NoError(t, fixture.app.SendLegacyWhatsAppConversationReply(request))
+	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(request))
+	assert.Zero(t, fixture.mock.sentMessageCount())
+
+	fixture.app.Config.LegacyWhatsAppReply.Enabled = true
+	fixture.app.Config.LegacyWhatsAppReply.AllowedOrganizationIDs = ""
+	request = legacyReplyRequest(t, fixture, "Empty allowlist")
 	require.NoError(t, fixture.app.SendLegacyWhatsAppConversationReply(request))
 	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(request))
 	assert.Zero(t, fixture.mock.sentMessageCount())
@@ -363,6 +501,7 @@ func newLegacyReplyFixture(t *testing.T) *legacyReplyFixture {
 	app := newMsgTestApp(t, mockServer)
 	organization := testutil.CreateTestOrganization(t, app.DB)
 	app.Config.LegacyWhatsAppReply.Enabled = true
+	app.Config.LegacyWhatsAppReply.AllowedOrganizationIDs = organization.ID.String()
 	adminRole := testutil.CreateAdminRole(t, app.DB, organization.ID)
 	user := testutil.CreateTestUser(t, app.DB, organization.ID, testutil.WithRoleID(&adminRole.ID))
 	enableLegacyReplyOmnichannel(t, app.DB, organization.ID, user.ID)

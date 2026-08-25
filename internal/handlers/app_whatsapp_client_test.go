@@ -34,7 +34,7 @@ func TestWhatsAppClientUsesConfiguredBaseURLWhenSharedClientIsMissing(t *testing
 	messageID, err := app.whatsAppClient().SendTextMessage(
 		context.Background(),
 		&whatsapp.Account{
-			PhoneID:     "handler-phone-id",
+			PhoneID:     "987654321",
 			APIVersion:  "v99.0",
 			AccessToken: "synthetic-handler-token",
 		},
@@ -43,7 +43,7 @@ func TestWhatsAppClientUsesConfiguredBaseURLWhenSharedClientIsMissing(t *testing
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "wamid.handler-local", messageID)
-	assert.Equal(t, "/v99.0/handler-phone-id/messages", <-paths)
+	assert.Equal(t, "/v99.0/987654321/messages", <-paths)
 }
 
 func TestWhatsAppClientPrefersInjectedSharedClient(t *testing.T) {

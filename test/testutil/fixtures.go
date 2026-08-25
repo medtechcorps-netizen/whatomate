@@ -22,6 +22,23 @@ const TestJWTSecret = "test-secret-key-must-be-at-least-32-chars"
 // hashes for authentication tests. Production password hashing remains unchanged.
 const testBcryptCost = bcrypt.MinCost
 
+// NewTestGraphObjectID returns a unique, numeric identifier shaped like the
+// object IDs accepted by Meta's Graph API. Keeping shared fixtures realistic
+// ensures provider-path validation is exercised instead of bypassed by test-only
+// values such as "phone-...".
+func NewTestGraphObjectID() string {
+	id := uuid.New()
+	digits := make([]byte, 32)
+	for index, value := range id {
+		digits[index*2] = '0' + ((value >> 4) % 10)
+		digits[index*2+1] = '0' + ((value & 0x0f) % 10)
+	}
+	// Real Graph object IDs are non-zero decimal strings. Avoid a synthetic
+	// leading zero while retaining ample uniqueness for parallel test fixtures.
+	digits[0] = '1' + ((id[0] >> 4) % 9)
+	return string(digits)
+}
+
 // --- Organization ---
 
 // CreateTestReseller creates a test reseller in the database.
@@ -189,7 +206,7 @@ func CreateTestWhatsAppAccount(t *testing.T, db *gorm.DB, orgID uuid.UUID) *mode
 		BaseModel:          models.BaseModel{ID: uuid.New()},
 		OrganizationID:     orgID,
 		Name:               "test-account-" + uuid.New().String()[:8],
-		PhoneID:            "phone-" + uuid.New().String()[:8],
+		PhoneID:            NewTestGraphObjectID(),
 		BusinessID:         "business-" + uuid.New().String()[:8],
 		AccessToken:        "test-token",
 		WebhookVerifyToken: "webhook-token",
@@ -218,7 +235,7 @@ func CreateTestWhatsAppAccountWith(t *testing.T, db *gorm.DB, orgID uuid.UUID, o
 		BaseModel:          models.BaseModel{ID: uuid.New()},
 		OrganizationID:     orgID,
 		Name:               "test-account-" + uuid.New().String()[:8],
-		PhoneID:            "phone-" + uuid.New().String()[:8],
+		PhoneID:            NewTestGraphObjectID(),
 		BusinessID:         "business-" + uuid.New().String()[:8],
 		AccessToken:        "test-token",
 		WebhookVerifyToken: "webhook-token",

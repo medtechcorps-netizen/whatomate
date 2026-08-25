@@ -175,6 +175,60 @@ func TestClient_SendTextMessage(t *testing.T) {
 	}
 }
 
+func TestClient_SendTextMessageRejectsNonCanonicalAccountPathBeforeProvider(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"messages":[{"id":"must-not-send"}]}`))
+	}))
+	defer server.Close()
+
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+	for _, test := range []struct {
+		name    string
+		account *whatsapp.Account
+	}{
+		{name: "missing account", account: nil},
+		{
+			name: "phone path injection",
+			account: &whatsapp.Account{
+				PhoneID: "123/messages/456", APIVersion: "v21.0", AccessToken: "secret",
+			},
+		},
+		{
+			name: "phone surrounding whitespace",
+			account: &whatsapp.Account{
+				PhoneID: " 123456789 ", APIVersion: "v21.0", AccessToken: "secret",
+			},
+		},
+		{
+			name: "version path injection",
+			account: &whatsapp.Account{
+				PhoneID: "123456789", APIVersion: "v21.0/123", AccessToken: "secret",
+			},
+		},
+		{
+			name: "version surrounding whitespace",
+			account: &whatsapp.Account{
+				PhoneID: "123456789", APIVersion: " v21.0 ", AccessToken: "secret",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := client.SendTextMessage(
+				testutil.TestContext(t),
+				test.account,
+				whatsapp.Recipient{Phone: "60123456789"},
+				"must not send",
+			)
+			require.Error(t, err)
+		})
+	}
+
+	assert.Zero(t, requestCount)
+}
+
 func TestClient_ConfigurePhoneWebhookOverride_UsesPhoneEndpointAndVerifiesReadback(t *testing.T) {
 	t.Parallel()
 

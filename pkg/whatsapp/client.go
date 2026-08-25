@@ -279,9 +279,22 @@ func (c *Client) ValidateCredentials(ctx context.Context, phoneID, businessID, a
 	}, nil
 }
 
-// buildMessagesURL builds the messages endpoint URL
-func (c *Client) buildMessagesURL(account *Account) string {
-	return fmt.Sprintf("%s/%s/%s/messages", c.getBaseURL(), account.APIVersion, account.PhoneID)
+// buildMessagesURL builds the messages endpoint URL from a canonical account
+// tuple. Account rows can predate current write-time validation, so every
+// provider attempt revalidates the path segments before attaching a token.
+func (c *Client) buildMessagesURL(account *Account) (string, error) {
+	if account == nil {
+		return "", errors.New("WhatsApp account is required")
+	}
+	apiVersion, err := normalizeGraphAPIVersion(account.APIVersion)
+	if err != nil || apiVersion != account.APIVersion {
+		return "", errors.New("invalid WhatsApp API version")
+	}
+	phoneID, err := normalizeGraphObjectID(account.PhoneID, "phone_id")
+	if err != nil || phoneID != account.PhoneID {
+		return "", errors.New("invalid phone_id")
+	}
+	return fmt.Sprintf("%s/%s/%s/messages", c.getBaseURL(), apiVersion, phoneID), nil
 }
 
 // buildTemplatesURL builds the message_templates endpoint URL
@@ -419,7 +432,10 @@ func (c *Client) sendMediaMessage(ctx context.Context, account *Account, rcpt Re
 	}
 	rcpt.SetOnPayload(payload)
 
-	url := c.buildMessagesURL(account)
+	url, err := c.buildMessagesURL(account)
+	if err != nil {
+		return "", fmt.Errorf("build WhatsApp messages endpoint: %w", err)
+	}
 	c.Log.Debug("Sending media message", "type", mediaType, "phone", rcpt.Phone, "media_id", mediaFields["id"])
 
 	respBody, err := c.doRequest(ctx, "POST", url, payload, account.AccessToken)
@@ -471,10 +487,13 @@ func (c *Client) MarkMessageRead(ctx context.Context, account *Account, messageI
 		"message_id":        messageID,
 	}
 
-	url := c.buildMessagesURL(account)
+	url, err := c.buildMessagesURL(account)
+	if err != nil {
+		return fmt.Errorf("build WhatsApp messages endpoint: %w", err)
+	}
 	c.Log.Debug("Sending read receipt", "message_id", messageID)
 
-	_, err := c.doRequest(ctx, "POST", url, payload, account.AccessToken)
+	_, err = c.doRequest(ctx, "POST", url, payload, account.AccessToken)
 	if err != nil {
 		return fmt.Errorf("failed to send read receipt: %w", err)
 	}

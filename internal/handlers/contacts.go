@@ -1074,10 +1074,17 @@ func (a *App) resolveWhatsAppAccountByID(r *fastglue.Request, id, orgID uuid.UUI
 }
 
 func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	if maxLen <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen-3] + "..."
+	if maxLen <= 3 {
+		return string(runes[:maxLen])
+	}
+	return string(runes[:maxLen-3]) + "..."
 }
 
 // SendMediaMessage sends a media message (image, document, video, audio) to a contact

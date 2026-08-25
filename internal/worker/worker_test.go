@@ -69,7 +69,7 @@ func TestNewWhatsAppClientUsesConfiguredBaseURL(t *testing.T) {
 	messageID, err := client.SendTextMessage(
 		context.Background(),
 		&whatsapp.Account{
-			PhoneID:     "test-phone-id",
+			PhoneID:     "123456789",
 			APIVersion:  "v99.0",
 			AccessToken: "synthetic-local-token",
 		},
@@ -80,7 +80,7 @@ func TestNewWhatsAppClientUsesConfiguredBaseURL(t *testing.T) {
 	assert.Equal(t, "wamid.local-only", messageID)
 
 	request := <-observed
-	assert.Equal(t, "/v99.0/test-phone-id/messages", request.path)
+	assert.Equal(t, "/v99.0/123456789/messages", request.path)
 	assert.Equal(t, "Bearer synthetic-local-token", request.authorization)
 }
 
@@ -188,7 +188,7 @@ func createTestCampaignData(t *testing.T, w *Worker) (*models.Organization, *mod
 	account := &models.WhatsAppAccount{
 		OrganizationID: org.ID,
 		Name:           accountName,
-		PhoneID:        "phone-" + uniqueID,
+		PhoneID:        testutil.NewTestGraphObjectID(),
 		BusinessID:     "business-" + uniqueID,
 		AccessToken:    "test-token",
 	}
@@ -390,7 +390,7 @@ func createMinimalCampaignData(t *testing.T, w *Worker, status models.CampaignSt
 	account := &models.WhatsAppAccount{
 		OrganizationID: org.ID,
 		Name:           accountName,
-		PhoneID:        "phone-" + uniqueID,
+		PhoneID:        testutil.NewTestGraphObjectID(),
 		BusinessID:     "business-" + uniqueID,
 		AccessToken:    "test-token",
 	}
