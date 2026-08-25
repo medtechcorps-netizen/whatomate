@@ -1,0 +1,988 @@
+name: Assemble and Attest Exact Four-Phase Rollout
+
+run-name: Assemble exact four-phase rollout authority
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase_evidence_json:
+        description: Exact control SHA plus ordered baseline/bridge/backend/ui image run, attempt, artifact ID, and release-set hash evidence
+        required: true
+        type: string
+
+# This workflow can read existing Actions evidence, create GitHub artifact
+# attestations, and upload a digest-only rollout capsule. It has no deployment
+# environment, cloud credentials, package permission, registry login, mutable
+# tag publication, or infrastructure mutation operation.
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-exact-four-phase-rollout-authority
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  ROLLOUT_WORKFLOW_PATH: .github/workflows/aggregate-exact-four-phase-rollout.yml
+  IMAGE_WORKFLOW_PATH: .github/workflows/build-attest-exact-release-images.yml
+  VALIDATION_WORKFLOW_PATH: .github/workflows/validate-exact-release-source.yml
+  SOURCE_MANIFEST_PATH: release/exact-sources.json
+  ROLLOUT_CONTRACT_PATH: release/deployment/exact-rollout-contract.json
+  ROLLOUT_SCHEMA_PATH: release/deployment/rollout-plan.schema.json
+  ROLLOUT_VERIFIER_PATH: release/deployment/verify_rollout_evidence.py
+  RELEASE_SET_PREDICATE: https://rereply.app/attestations/exact-release-set/v1
+  ROLLOUT_PLAN_PREDICATE: https://rereply.app/attestations/exact-four-phase-rollout/v1
+  PINNED_JQ_VERSION: "1.8.2"
+  PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+  PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
+
+jobs:
+  assemble:
+    name: Assemble and sign exact rollout capsule
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      control_sha: ${{ steps.authority.outputs.control_sha }}
+      capsule_name: ${{ steps.summary.outputs.capsule_name }}
+      capsule_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      capsule_artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      final_evidence_json: ${{ steps.summary.outputs.final_evidence_json }}
+    steps:
+      - name: Require protected-main GitHub-hosted authority
+        id: authority
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$ROLLOUT_WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" ]]
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf 'control_sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out protected rollout controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Reverify protected controls and normalize the strict input
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PHASE_EVIDENCE_JSON: ${{ inputs.phase_evidence_json }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+
+          require_control_blob() {
+            local path="$1"
+            local mode type object entry_path control_root resolved
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            [[ "$path" != /* && "$path" != *".."* ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+            read -r mode type object entry_path < <(git -C control ls-tree HEAD -- "$path")
+            [[ "$mode" == "100644" && "$type" == "blob" && "$entry_path" == "$path" ]]
+            [[ "$(git hash-object "control/$path")" == "$object" ]]
+            control_root="$(realpath -e control)"
+            resolved="$(realpath -e -- "control/$path")"
+            [[ "$resolved" == "$control_root/"* ]]
+          }
+
+          for path in \
+            "$ROLLOUT_WORKFLOW_PATH" \
+            "$IMAGE_WORKFLOW_PATH" \
+            "$VALIDATION_WORKFLOW_PATH" \
+            "$SOURCE_MANIFEST_PATH" \
+            "$ROLLOUT_CONTRACT_PATH" \
+            "$ROLLOUT_SCHEMA_PATH" \
+            "$ROLLOUT_VERIFIER_PATH"; do
+            require_control_blob "$path"
+          done
+
+          python3 "control/$ROLLOUT_VERIFIER_PATH" validate-contract \
+            --contract "control/$ROLLOUT_CONTRACT_PATH" \
+            --manifest "control/$SOURCE_MANIFEST_PATH" \
+            --schema "control/$ROLLOUT_SCHEMA_PATH"
+          python3 "control/$ROLLOUT_VERIFIER_PATH" normalize-input \
+            --raw "$PHASE_EVIDENCE_JSON" \
+            --control-sha "$CONTROL_SHA" \
+            --output normalized-input.json
+
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+
+      - name: Verify all four exact image runs and acquire immutable evidence
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image_workflow_id="$(gh api "/repos/$REPOSITORY/actions/workflows/build-attest-exact-release-images.yml" --jq '.id')"
+          validation_workflow_id="$(gh api "/repos/$REPOSITORY/actions/workflows/validate-exact-release-source.yml" --jq '.id')"
+          [[ "$image_workflow_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$validation_workflow_id" =~ ^[1-9][0-9]*$ ]]
+
+          mkdir -p downloads extracted capsule/phases
+          jq -n '{schema_version: 1, phases: []}' > artifact-evidence.json
+          : > validation-evidence.ndjson
+
+          for phase in baseline bridge backend ui; do
+            phase_json="$(jq -ce --arg phase "$phase" '.phases[] | select(.phase == $phase)' normalized-input.json)"
+            image_run_id="$(jq -er '.image_run_id' <<< "$phase_json")"
+            image_run_attempt="$(jq -er '.image_run_attempt' <<< "$phase_json")"
+            release_set_artifact_id="$(jq -er '.release_set_artifact_id' <<< "$phase_json")"
+            expected_release_set_sha256="$(jq -er '.release_set_sha256' <<< "$phase_json")"
+            [[ "$image_run_id" =~ ^[1-9][0-9]{0,14}$ ]]
+            [[ "$image_run_attempt" =~ ^[1-9][0-9]{0,9}$ ]]
+            [[ "$release_set_artifact_id" =~ ^[1-9][0-9]{0,14}$ ]]
+            [[ "$expected_release_set_sha256" =~ ^[0-9a-f]{64}$ ]]
+
+            latest_run_json="$(gh api "/repos/$REPOSITORY/actions/runs/$image_run_id")"
+            [[ "$(jq -er '.run_attempt' <<< "$latest_run_json")" == "$image_run_attempt" ]]
+            exact_run_json="$(gh api "/repos/$REPOSITORY/actions/runs/$image_run_id/attempts/$image_run_attempt")"
+            expected_title="Build exact $phase release images"
+            for run_json in "$latest_run_json" "$exact_run_json"; do
+              jq -e \
+                --arg control_sha "$CONTROL_SHA" \
+                --arg expected_title "$expected_title" \
+                --arg repository "$REPOSITORY" \
+                --argjson run_attempt "$image_run_attempt" \
+                --argjson run_id "$image_run_id" \
+                --argjson workflow_id "$image_workflow_id" '
+                  .id == $run_id and
+                  .run_attempt == $run_attempt and
+                  .workflow_id == $workflow_id and
+                  .repository.full_name == $repository and
+                  .event == "workflow_dispatch" and
+                  .status == "completed" and
+                  .conclusion == "success" and
+                  .head_branch == "main" and
+                  .head_sha == $control_sha and
+                  .path == ".github/workflows/build-attest-exact-release-images.yml" and
+                  .display_title == $expected_title
+                ' <<< "$run_json" > /dev/null
+            done
+
+            gh api "/repos/$REPOSITORY/actions/runs/$image_run_id/attempts/$image_run_attempt/jobs?per_page=100" \
+              > "downloads/$phase-jobs.json"
+            jq -e \
+              --argjson run_attempt "$image_run_attempt" \
+              --slurpfile contract "control/$ROLLOUT_CONTRACT_PATH" '
+                .total_count == 16 and
+                (.jobs | length) == 16 and
+                ([.jobs[].name] | sort) == ($contract[0].image_workflow.expected_jobs | sort) and
+                all(.jobs[];
+                  .run_attempt == $run_attempt and
+                  .status == "completed" and
+                  .conclusion == "success" and
+                  .runner_name != null
+                ) and
+                ([.jobs[] | select(.name == $contract[0].image_workflow.gate_job_name)] | length) == 1
+              ' "downloads/$phase-jobs.json" > /dev/null
+
+            gh api "/repos/$REPOSITORY/actions/runs/$image_run_id/artifacts?per_page=100" \
+              > "downloads/$phase-artifacts.json"
+            expected_artifact_names="$(jq -cn \
+              --arg phase "$phase" \
+              --arg run_id "$image_run_id" \
+              --arg attempt "$image_run_attempt" '
+                (["gmail-relay", "meta-relay", "web"] as $components |
+                  ["image", "scanned", "attested", "verified"] as $kinds |
+                  [$components[] as $component | $kinds[] as $kind |
+                    "\($kind)-\($phase)-\($component)-\($run_id)-\($attempt)"]
+                ) + [
+                  "release-set-\($phase)-\($run_id)-\($attempt)",
+                  "verified-release-set-\($phase)-\($run_id)-\($attempt)"
+                ] | sort
+              ')"
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --argjson expected_names "$expected_artifact_names" \
+              --argjson run_id "$image_run_id" '
+                .total_count == 14 and
+                (.artifacts | length) == 14 and
+                ([.artifacts[].name] | sort) == $expected_names and
+                all(.artifacts[];
+                  .expired == false and
+                  (.id | type == "number") and
+                  (.size_in_bytes | type == "number" and . > 0 and . <= 67108864) and
+                  (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                  .workflow_run.id == $run_id and
+                  .workflow_run.head_branch == "main" and
+                  .workflow_run.head_sha == $control_sha
+                )
+              ' "downloads/$phase-artifacts.json" > /dev/null
+            jq -e \
+              --arg expected_id "$release_set_artifact_id" \
+              --arg name "release-set-$phase-$image_run_id-$image_run_attempt" '
+                ([.artifacts[] | select(.name == $name and (.id | tostring) == $expected_id)] | length) == 1
+              ' "downloads/$phase-artifacts.json" > /dev/null
+
+            : > "downloads/$phase-records.ndjson"
+            while IFS= read -r artifact; do
+              artifact_id="$(jq -er '.id | tostring' <<< "$artifact")"
+              artifact_name="$(jq -er '.name' <<< "$artifact")"
+              artifact_digest="$(jq -er '.digest' <<< "$artifact")"
+              artifact_size="$(jq -er '.size_in_bytes' <<< "$artifact")"
+              [[ "$artifact_id" =~ ^[1-9][0-9]{0,14}$ ]]
+              [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              [[ "$artifact_size" =~ ^[1-9][0-9]*$ ]]
+
+              exact_artifact_json="$(gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id")"
+              jq -e \
+                --arg control_sha "$CONTROL_SHA" \
+                --arg digest "$artifact_digest" \
+                --arg name "$artifact_name" \
+                --argjson artifact_id "$artifact_id" \
+                --argjson run_id "$image_run_id" \
+                --argjson size "$artifact_size" '
+                  .id == $artifact_id and
+                  .name == $name and
+                  .size_in_bytes == $size and .size_in_bytes <= 67108864 and
+                  .digest == $digest and
+                  .expired == false and
+                  .workflow_run.id == $run_id and
+                  .workflow_run.head_branch == "main" and
+                  .workflow_run.head_sha == $control_sha
+                ' <<< "$exact_artifact_json" > /dev/null
+
+              case "$artifact_name" in
+                image-*) kind=image ;;
+                scanned-*) kind=scanned ;;
+                attested-*) kind=attested ;;
+                verified-release-set-*) kind=verified-release-set ;;
+                verified-*) kind=verified ;;
+                release-set-*) kind=release-set ;;
+                *) echo "Unexpected artifact name after exact-set check: $artifact_name" >&2; exit 1 ;;
+              esac
+              archive="downloads/$phase-$artifact_id.zip"
+              gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$archive"
+              [[ -s "$archive" && -f "$archive" && ! -L "$archive" ]]
+              archive_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+              [[ "sha256:$archive_sha256" == "$artifact_digest" ]]
+              extraction="extracted/$phase/$artifact_name"
+              inventory="$(python3 "control/$ROLLOUT_VERIFIER_PATH" inspect-archive \
+                --archive "$archive" \
+                --kind "$kind" \
+                --contract "control/$ROLLOUT_CONTRACT_PATH" \
+                --output "$extraction")"
+              jq -cn \
+                --arg artifact_id "$artifact_id" \
+                --arg name "$artifact_name" \
+                --arg archive_digest "$artifact_digest" \
+                --arg archive_sha256 "$archive_sha256" \
+                --argjson size_in_bytes "$artifact_size" \
+                --argjson inventory "$inventory" '
+                  {
+                    artifact_id: $artifact_id,
+                    name: $name,
+                    archive_digest: $archive_digest,
+                    archive_sha256: $archive_sha256,
+                    size_in_bytes: $size_in_bytes,
+                    inventory: $inventory
+                  }
+                ' >> "downloads/$phase-records.ndjson"
+            done < <(jq -c '.artifacts | sort_by(.name)[]' "downloads/$phase-artifacts.json")
+
+            jq -s 'sort_by(.name)' "downloads/$phase-records.ndjson" > "downloads/$phase-records.json"
+            jq \
+              --arg phase "$phase" \
+              --slurpfile records "downloads/$phase-records.json" '
+                .phases += [{phase: $phase, artifacts: $records[0]}]
+              ' artifact-evidence.json > artifact-evidence.next.json
+            mv artifact-evidence.next.json artifact-evidence.json
+
+            release_artifact="extracted/$phase/release-set-$phase-$image_run_id-$image_run_attempt"
+            verified_artifact="extracted/$phase/verified-release-set-$phase-$image_run_id-$image_run_attempt"
+            phase_capsule="capsule/phases/$phase"
+            mkdir -p "$phase_capsule"
+            for name in \
+              release-set.json \
+              release-set.sha256 \
+              release-set-provenance.bundle.json \
+              release-set-source-binding.bundle.json; do
+              install -m 0600 "$release_artifact/$name" "$phase_capsule/$name"
+            done
+            actual_release_set_sha256="$(sha256sum "$phase_capsule/release-set.json" | awk '{print $1}')"
+            [[ "$actual_release_set_sha256" == "$expected_release_set_sha256" ]]
+            [[ "$(cat "$phase_capsule/release-set.sha256")" == "$expected_release_set_sha256" ]]
+            cmp "$release_artifact/release-set.json" "$verified_artifact/release-set.json"
+            cmp "$release_artifact/release-set.sha256" "$verified_artifact/release-set.sha256"
+            jq -e 'type == "array" and length > 0' \
+              "$verified_artifact/verified-release-set-provenance.json" > /dev/null
+            jq -e --slurpfile expected "$phase_capsule/release-set.json" '
+              type == "array" and length > 0 and
+              any(.[]; .verificationResult.statement.predicate == $expected[0])
+            ' "$verified_artifact/verified-release-set-binding.json" > /dev/null
+
+            signer_workflow="$RELEASE_REPOSITORY/$IMAGE_WORKFLOW_PATH"
+            common_flags=(
+              --repo "$RELEASE_REPOSITORY"
+              --signer-workflow "$signer_workflow"
+              --signer-digest "$CONTROL_SHA"
+              --source-digest "$CONTROL_SHA"
+              --source-ref refs/heads/main
+              --deny-self-hosted-runners
+              --format json
+            )
+            gh attestation verify "$phase_capsule/release-set.json" "${common_flags[@]}" \
+              --bundle "$phase_capsule/release-set-provenance.bundle.json" \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              > "downloads/$phase-verified-provenance.json"
+            gh attestation verify "$phase_capsule/release-set.json" "${common_flags[@]}" \
+              --bundle "$phase_capsule/release-set-source-binding.bundle.json" \
+              --predicate-type "$RELEASE_SET_PREDICATE" \
+              > "downloads/$phase-verified-binding.json"
+            jq -e 'type == "array" and length > 0' "downloads/$phase-verified-provenance.json" > /dev/null
+            jq -e --slurpfile expected "$phase_capsule/release-set.json" '
+              type == "array" and length > 0 and
+              any(.[]; .verificationResult.statement.predicate == $expected[0])
+            ' "downloads/$phase-verified-binding.json" > /dev/null
+
+            validation_run_id="$(jq -er '.validation.run_id' "$phase_capsule/release-set.json")"
+            validation_run_attempt="$(jq -er '.validation.run_attempt' "$phase_capsule/release-set.json")"
+            [[ "$validation_run_id" =~ ^[1-9][0-9]{0,14}$ ]]
+            [[ "$validation_run_attempt" =~ ^[1-9][0-9]{0,9}$ ]]
+            latest_validation_json="$(gh api "/repos/$REPOSITORY/actions/runs/$validation_run_id")"
+            [[ "$(jq -er '.run_attempt' <<< "$latest_validation_json")" == "$validation_run_attempt" ]]
+            exact_validation_json="$(gh api "/repos/$REPOSITORY/actions/runs/$validation_run_id/attempts/$validation_run_attempt")"
+            expected_validation_title="Validate exact $phase release source"
+            for validation_json in "$latest_validation_json" "$exact_validation_json"; do
+              jq -e \
+                --arg control_sha "$CONTROL_SHA" \
+                --arg expected_title "$expected_validation_title" \
+                --arg repository "$REPOSITORY" \
+                --argjson run_attempt "$validation_run_attempt" \
+                --argjson run_id "$validation_run_id" \
+                --argjson workflow_id "$validation_workflow_id" '
+                  .id == $run_id and
+                  .run_attempt == $run_attempt and
+                  .workflow_id == $workflow_id and
+                  .repository.full_name == $repository and
+                  .event == "workflow_dispatch" and
+                  .status == "completed" and
+                  .conclusion == "success" and
+                  .head_branch == "main" and
+                  .head_sha == $control_sha and
+                  .path == ".github/workflows/validate-exact-release-source.yml" and
+                  .display_title == $expected_title
+                ' <<< "$validation_json" > /dev/null
+            done
+            validation_jobs_json="$(gh api "/repos/$REPOSITORY/actions/runs/$validation_run_id/attempts/$validation_run_attempt/jobs?per_page=100")"
+            jq -e --argjson run_attempt "$validation_run_attempt" '
+              ([.jobs[] | select(.name == "Exact source validation gate")] | length) == 1 and
+              all(.jobs[] | select(.name == "Exact source validation gate");
+                .run_attempt == $run_attempt and
+                .status == "completed" and
+                .conclusion == "success"
+              )
+            ' <<< "$validation_jobs_json" > /dev/null
+
+            release_archive_digest="$(jq -er \
+              --arg name "release-set-$phase-$image_run_id-$image_run_attempt" '
+                .artifacts[] | select(.name == $name) | .digest
+              ' "downloads/$phase-artifacts.json")"
+            jq -cn \
+              --arg phase "$phase" \
+              --arg image_run_id "$image_run_id" \
+              --argjson image_run_attempt "$image_run_attempt" \
+              --arg release_set_artifact_id "$release_set_artifact_id" \
+              --arg release_set_archive_digest "$release_archive_digest" \
+              --arg validation_run_id "$validation_run_id" \
+              --argjson validation_run_attempt "$validation_run_attempt" '
+                {
+                  phase: $phase,
+                  image_run_id: $image_run_id,
+                  image_run_attempt: $image_run_attempt,
+                  release_set_artifact_id: $release_set_artifact_id,
+                  release_set_archive_digest: $release_set_archive_digest,
+                  validation_run_id: $validation_run_id,
+                  validation_run_attempt: $validation_run_attempt
+                }
+              ' >> validation-evidence.ndjson
+          done
+
+          jq -e '[.phases[].phase] == ["baseline", "bridge", "backend", "ui"]' \
+            artifact-evidence.json > /dev/null
+          jq -s '.' validation-evidence.ndjson > final-evidence.json
+
+      - name: Build and strictly validate the digest-only rollout plan
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          python3 "control/$ROLLOUT_VERIFIER_PATH" build-plan \
+            --normalized-input normalized-input.json \
+            --artifact-evidence artifact-evidence.json \
+            --release-root capsule/phases \
+            --manifest "control/$SOURCE_MANIFEST_PATH" \
+            --contract "control/$ROLLOUT_CONTRACT_PATH" \
+            --schema "control/$ROLLOUT_SCHEMA_PATH" \
+            --verifier "control/$ROLLOUT_VERIFIER_PATH" \
+            --control-sha "$CONTROL_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output capsule/rollout-plan.json
+          sha256sum capsule/rollout-plan.json | awk '{print $1}' > capsule/rollout-plan.sha256
+
+      - name: Require live main immediately before rollout signing
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+
+      - name: Create rollout-plan provenance
+        id: plan-provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: capsule/rollout-plan.json
+          push-to-registry: false
+
+      - name: Create exact rollout-policy attestation
+        id: plan-policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: capsule/rollout-plan.json
+          predicate-type: ${{ env.ROLLOUT_PLAN_PREDICATE }}
+          predicate-path: capsule/rollout-plan.json
+          push-to-registry: false
+
+      - name: Complete and validate the exact twenty-file capsule
+        env:
+          POLICY_BUNDLE: ${{ steps.plan-policy.outputs.bundle-path }}
+          PROVENANCE_BUNDLE: ${{ steps.plan-provenance.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          [[ -s "$PROVENANCE_BUNDLE" && -f "$PROVENANCE_BUNDLE" && ! -L "$PROVENANCE_BUNDLE" ]]
+          [[ -s "$POLICY_BUNDLE" && -f "$POLICY_BUNDLE" && ! -L "$POLICY_BUNDLE" ]]
+          install -m 0600 "$PROVENANCE_BUNDLE" capsule/rollout-plan-provenance.bundle.json
+          install -m 0600 "$POLICY_BUNDLE" capsule/rollout-plan-policy.bundle.json
+          python3 "control/$ROLLOUT_VERIFIER_PATH" validate-capsule \
+            --root capsule \
+            --manifest "control/$SOURCE_MANIFEST_PATH" \
+            --contract "control/$ROLLOUT_CONTRACT_PATH" \
+            --schema "control/$ROLLOUT_SCHEMA_PATH" \
+            --verifier "control/$ROLLOUT_VERIFIER_PATH"
+          [[ "$(find capsule -type f | wc -l)" -eq 20 ]]
+          [[ -z "$(find capsule -type l -print -quit)" ]]
+
+      - name: Record final CAS evidence
+        id: summary
+        run: |
+          set -euo pipefail
+          capsule_name="exact-four-phase-rollout-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          final_evidence_json="$(jq -c '.' final-evidence.json)"
+          {
+            printf 'capsule_name=%s\n' "$capsule_name"
+            printf 'final_evidence_json=%s\n' "$final_evidence_json"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact rollout capsule
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.summary.outputs.capsule_name }}
+          path: capsule
+          if-no-files-found: error
+          retention-days: 90
+
+  verify:
+    name: Independently verify exact rollout capsule
+    needs: assemble
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Check out exact protected rollout controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.assemble.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Acquire the capsule by exact artifact ID and API digest
+        env:
+          CAPSULE_ARTIFACT_DIGEST: ${{ needs.assemble.outputs.capsule_artifact_digest }}
+          CAPSULE_ARTIFACT_ID: ${{ needs.assemble.outputs.capsule_artifact_id }}
+          CAPSULE_NAME: ${{ needs.assemble.outputs.capsule_name }}
+          CONTROL_SHA: ${{ needs.assemble.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$CAPSULE_ARTIFACT_ID" =~ ^[1-9][0-9]{0,14}$ ]]
+          [[ "$CAPSULE_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          current_run_json="$(gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT")"
+          jq -e \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg repository "$REPOSITORY" \
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              .id == $run_id and
+              .run_attempt == $run_attempt and
+              .repository.full_name == $repository and
+              .event == "workflow_dispatch" and
+              .head_branch == "main" and
+              .head_sha == $control_sha and
+              .path == ".github/workflows/aggregate-exact-four-phase-rollout.yml"
+            ' <<< "$current_run_json" > /dev/null
+
+          run_artifacts_json="$(gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"
+          jq -e \
+            --arg digest "$CAPSULE_ARTIFACT_DIGEST" \
+            --arg name "$CAPSULE_NAME" \
+            --argjson artifact_id "$CAPSULE_ARTIFACT_ID" '
+              .total_count == 1 and
+              (.artifacts | length) == 1 and
+              .artifacts[0].id == $artifact_id and
+              .artifacts[0].name == $name and
+              .artifacts[0].digest == $digest and
+              .artifacts[0].expired == false
+            ' <<< "$run_artifacts_json" > /dev/null
+          exact_artifact_json="$(gh api "/repos/$REPOSITORY/actions/artifacts/$CAPSULE_ARTIFACT_ID")"
+          jq -e \
+            --arg digest "$CAPSULE_ARTIFACT_DIGEST" \
+            --arg name "$CAPSULE_NAME" \
+            --argjson artifact_id "$CAPSULE_ARTIFACT_ID" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              .id == $artifact_id and
+              .name == $name and
+              .digest == $digest and
+              .expired == false and
+              .workflow_run.id == $run_id
+            ' <<< "$exact_artifact_json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/artifacts/$CAPSULE_ARTIFACT_ID/zip" > capsule.zip
+          [[ -s capsule.zip && -f capsule.zip && ! -L capsule.zip ]]
+          [[ "sha256:$(sha256sum capsule.zip | awk '{print $1}')" == "$CAPSULE_ARTIFACT_DIGEST" ]]
+          python3 "control/$ROLLOUT_VERIFIER_PATH" inspect-capsule-archive \
+            --archive capsule.zip \
+            --contract "control/$ROLLOUT_CONTRACT_PATH" \
+            --output capsule
+          python3 "control/$ROLLOUT_VERIFIER_PATH" validate-capsule \
+            --root capsule \
+            --manifest "control/$SOURCE_MANIFEST_PATH" \
+            --contract "control/$ROLLOUT_CONTRACT_PATH" \
+            --schema "control/$ROLLOUT_SCHEMA_PATH" \
+            --verifier "control/$ROLLOUT_VERIFIER_PATH"
+
+      - name: Reverify all run attempts and exact artifact records
+        env:
+          CONTROL_SHA: ${{ needs.assemble.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image_workflow_id="$(gh api "/repos/$REPOSITORY/actions/workflows/build-attest-exact-release-images.yml" --jq '.id')"
+          validation_workflow_id="$(gh api "/repos/$REPOSITORY/actions/workflows/validate-exact-release-source.yml" --jq '.id')"
+          for phase in baseline bridge backend ui; do
+            phase_json="$(jq -ce --arg phase "$phase" '.phases[] | select(.phase == $phase)' capsule/rollout-plan.json)"
+            image_run_id="$(jq -er '.image_build.run_id' <<< "$phase_json")"
+            image_run_attempt="$(jq -er '.image_build.run_attempt' <<< "$phase_json")"
+            expected_title="Build exact $phase release images"
+            latest_run_json="$(gh api "/repos/$REPOSITORY/actions/runs/$image_run_id")"
+            exact_run_json="$(gh api "/repos/$REPOSITORY/actions/runs/$image_run_id/attempts/$image_run_attempt")"
+            for run_json in "$latest_run_json" "$exact_run_json"; do
+              jq -e \
+                --arg control_sha "$CONTROL_SHA" \
+                --arg expected_title "$expected_title" \
+                --arg repository "$REPOSITORY" \
+                --argjson attempt "$image_run_attempt" \
+                --argjson run_id "$image_run_id" \
+                --argjson workflow_id "$image_workflow_id" '
+                  .id == $run_id and .run_attempt == $attempt and .workflow_id == $workflow_id and
+                  .repository.full_name == $repository and .event == "workflow_dispatch" and
+                  .status == "completed" and .conclusion == "success" and
+                  .head_branch == "main" and .head_sha == $control_sha and
+                  .path == ".github/workflows/build-attest-exact-release-images.yml" and
+                  .display_title == $expected_title
+                ' <<< "$run_json" > /dev/null
+            done
+            jobs_json="$(gh api "/repos/$REPOSITORY/actions/runs/$image_run_id/attempts/$image_run_attempt/jobs?per_page=100")"
+            jq -e \
+              --argjson attempt "$image_run_attempt" \
+              --slurpfile contract "control/$ROLLOUT_CONTRACT_PATH" '
+                .total_count == 16 and (.jobs | length) == 16 and
+                ([.jobs[].name] | sort) == ($contract[0].image_workflow.expected_jobs | sort) and
+                all(.jobs[]; .run_attempt == $attempt and .status == "completed" and .conclusion == "success")
+              ' <<< "$jobs_json" > /dev/null
+
+            artifacts_json="$(gh api "/repos/$REPOSITORY/actions/runs/$image_run_id/artifacts?per_page=100")"
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --argjson plan_phase "$phase_json" \
+              --argjson run_id "$image_run_id" '
+                .total_count == 14 and (.artifacts | length) == 14 and
+                all(.artifacts[];
+                  .expired == false and
+                  (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                  .workflow_run.id == $run_id and
+                  .workflow_run.head_branch == "main" and
+                  .workflow_run.head_sha == $control_sha
+                ) and
+                ([.artifacts | sort_by(.name)[] | {
+                  artifact_id: (.id | tostring),
+                  name,
+                  archive_digest: .digest,
+                  size_in_bytes
+                }] ==
+                [$plan_phase.input_artifacts | sort_by(.name)[] | {
+                  artifact_id,
+                  name,
+                  archive_digest,
+                  size_in_bytes
+                }])
+              ' <<< "$artifacts_json" > /dev/null
+
+            validation_run_id="$(jq -er '.validation.run_id' <<< "$phase_json")"
+            validation_run_attempt="$(jq -er '.validation.run_attempt' <<< "$phase_json")"
+            expected_validation_title="Validate exact $phase release source"
+            latest_validation_json="$(gh api "/repos/$REPOSITORY/actions/runs/$validation_run_id")"
+            exact_validation_json="$(gh api "/repos/$REPOSITORY/actions/runs/$validation_run_id/attempts/$validation_run_attempt")"
+            for validation_json in "$latest_validation_json" "$exact_validation_json"; do
+              jq -e \
+                --arg control_sha "$CONTROL_SHA" \
+                --arg expected_title "$expected_validation_title" \
+                --arg repository "$REPOSITORY" \
+                --argjson attempt "$validation_run_attempt" \
+                --argjson run_id "$validation_run_id" \
+                --argjson workflow_id "$validation_workflow_id" '
+                  .id == $run_id and .run_attempt == $attempt and .workflow_id == $workflow_id and
+                  .repository.full_name == $repository and .event == "workflow_dispatch" and
+                  .status == "completed" and .conclusion == "success" and
+                  .head_branch == "main" and .head_sha == $control_sha and
+                  .path == ".github/workflows/validate-exact-release-source.yml" and
+                  .display_title == $expected_title
+                ' <<< "$validation_json" > /dev/null
+            done
+            validation_jobs_json="$(gh api "/repos/$REPOSITORY/actions/runs/$validation_run_id/attempts/$validation_run_attempt/jobs?per_page=100")"
+            jq -e --argjson attempt "$validation_run_attempt" '
+              ([.jobs[] | select(.name == "Exact source validation gate")] | length) == 1 and
+              all(.jobs[] | select(.name == "Exact source validation gate");
+                .run_attempt == $attempt and .status == "completed" and .conclusion == "success")
+            ' <<< "$validation_jobs_json" > /dev/null
+          done
+
+      - name: Cryptographically reverify every phase and the rollout plan
+        env:
+          CONTROL_SHA: ${{ needs.assemble.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+
+          image_signer="$RELEASE_REPOSITORY/$IMAGE_WORKFLOW_PATH"
+          image_flags=(
+            --repo "$RELEASE_REPOSITORY"
+            --signer-workflow "$image_signer"
+            --signer-digest "$CONTROL_SHA"
+            --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main
+            --deny-self-hosted-runners
+            --format json
+          )
+          for phase in baseline bridge backend ui; do
+            phase_root="capsule/phases/$phase"
+            gh attestation verify "$phase_root/release-set.json" "${image_flags[@]}" \
+              --bundle "$phase_root/release-set-provenance.bundle.json" \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              > "$phase-verified-provenance.json"
+            gh attestation verify "$phase_root/release-set.json" "${image_flags[@]}" \
+              --bundle "$phase_root/release-set-source-binding.bundle.json" \
+              --predicate-type "$RELEASE_SET_PREDICATE" \
+              > "$phase-verified-binding.json"
+            jq -e 'type == "array" and length > 0' "$phase-verified-provenance.json" > /dev/null
+            jq -e --slurpfile expected "$phase_root/release-set.json" '
+              type == "array" and length > 0 and
+              any(.[]; .verificationResult.statement.predicate == $expected[0])
+            ' "$phase-verified-binding.json" > /dev/null
+          done
+
+          rollout_signer="$RELEASE_REPOSITORY/$ROLLOUT_WORKFLOW_PATH"
+          rollout_flags=(
+            --repo "$RELEASE_REPOSITORY"
+            --signer-workflow "$rollout_signer"
+            --signer-digest "$CONTROL_SHA"
+            --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main
+            --deny-self-hosted-runners
+            --format json
+          )
+          gh attestation verify capsule/rollout-plan.json "${rollout_flags[@]}" \
+            --bundle capsule/rollout-plan-provenance.bundle.json \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            > verified-rollout-provenance.json
+          gh attestation verify capsule/rollout-plan.json "${rollout_flags[@]}" \
+            --bundle capsule/rollout-plan-policy.bundle.json \
+            --predicate-type "$ROLLOUT_PLAN_PREDICATE" \
+            > verified-rollout-policy.json
+          jq -e 'type == "array" and length > 0' verified-rollout-provenance.json > /dev/null
+          jq -e --slurpfile expected capsule/rollout-plan.json '
+            type == "array" and length > 0 and
+            any(.[]; .verificationResult.statement.predicate == $expected[0])
+          ' verified-rollout-policy.json > /dev/null
+
+  gate:
+    name: Exact four-phase rollout authority gate
+    if: always()
+    needs:
+      - assemble
+      - verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Close the rollout authority window without deploying
+        env:
+          ASSEMBLE_RESULT: ${{ needs.assemble.result }}
+          CAPSULE_ARTIFACT_DIGEST: ${{ needs.assemble.outputs.capsule_artifact_digest }}
+          CAPSULE_ARTIFACT_ID: ${{ needs.assemble.outputs.capsule_artifact_id }}
+          CAPSULE_NAME: ${{ needs.assemble.outputs.capsule_name }}
+          CONTROL_SHA: ${{ needs.assemble.outputs.control_sha }}
+          FINAL_EVIDENCE_JSON: ${{ needs.assemble.outputs.final_evidence_json }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$ASSEMBLE_RESULT" == "success" ]]
+          [[ "$VERIFY_RESULT" == "success" ]]
+          [[ "$CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          image_workflow_id="$(gh api "/repos/$REPOSITORY/actions/workflows/build-attest-exact-release-images.yml" --jq '.id')"
+          validation_workflow_id="$(gh api "/repos/$REPOSITORY/actions/workflows/validate-exact-release-source.yml" --jq '.id')"
+          [[ "$image_workflow_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$validation_workflow_id" =~ ^[1-9][0-9]*$ ]]
+          jq -e '
+            type == "array" and length == 4 and
+            [.[].phase] == ["baseline", "bridge", "backend", "ui"]
+          ' <<< "$FINAL_EVIDENCE_JSON" > /dev/null
+
+          for phase in baseline bridge backend ui; do
+            evidence="$(jq -ce --arg phase "$phase" '.[] | select(.phase == $phase)' <<< "$FINAL_EVIDENCE_JSON")"
+            image_run_id="$(jq -er '.image_run_id' <<< "$evidence")"
+            image_run_attempt="$(jq -er '.image_run_attempt' <<< "$evidence")"
+            release_artifact_id="$(jq -er '.release_set_artifact_id' <<< "$evidence")"
+            release_archive_digest="$(jq -er '.release_set_archive_digest' <<< "$evidence")"
+            validation_run_id="$(jq -er '.validation_run_id' <<< "$evidence")"
+            validation_run_attempt="$(jq -er '.validation_run_attempt' <<< "$evidence")"
+
+            latest_image_json="$(gh api "/repos/$REPOSITORY/actions/runs/$image_run_id")"
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --arg expected_title "Build exact $phase release images" \
+              --arg repository "$REPOSITORY" \
+              --argjson attempt "$image_run_attempt" \
+              --argjson run_id "$image_run_id" \
+              --argjson workflow_id "$image_workflow_id" '
+                .id == $run_id and .run_attempt == $attempt and .workflow_id == $workflow_id and
+                .repository.full_name == $repository and .event == "workflow_dispatch" and
+                .status == "completed" and .conclusion == "success" and
+                .head_branch == "main" and .head_sha == $control_sha and
+                .path == ".github/workflows/build-attest-exact-release-images.yml" and
+                .display_title == $expected_title
+              ' <<< "$latest_image_json" > /dev/null
+            image_jobs="$(gh api "/repos/$REPOSITORY/actions/runs/$image_run_id/attempts/$image_run_attempt/jobs?per_page=100")"
+            jq -e --argjson attempt "$image_run_attempt" '
+              ([.jobs[] | select(.name == "Exact release image gate")] | length) == 1 and
+              all(.jobs[] | select(.name == "Exact release image gate");
+                .run_attempt == $attempt and .status == "completed" and .conclusion == "success")
+            ' <<< "$image_jobs" > /dev/null
+            release_artifact_json="$(gh api "/repos/$REPOSITORY/actions/artifacts/$release_artifact_id")"
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --arg digest "$release_archive_digest" \
+              --arg name "release-set-$phase-$image_run_id-$image_run_attempt" \
+              --argjson artifact_id "$release_artifact_id" \
+              --argjson run_id "$image_run_id" '
+                .id == $artifact_id and .name == $name and .digest == $digest and
+                .expired == false and .workflow_run.id == $run_id and
+                .workflow_run.head_branch == "main" and .workflow_run.head_sha == $control_sha
+              ' <<< "$release_artifact_json" > /dev/null
+
+            latest_validation_json="$(gh api "/repos/$REPOSITORY/actions/runs/$validation_run_id")"
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --arg expected_title "Validate exact $phase release source" \
+              --arg repository "$REPOSITORY" \
+              --argjson attempt "$validation_run_attempt" \
+              --argjson run_id "$validation_run_id" \
+              --argjson workflow_id "$validation_workflow_id" '
+                .id == $run_id and .run_attempt == $attempt and .workflow_id == $workflow_id and
+                .repository.full_name == $repository and .event == "workflow_dispatch" and
+                .status == "completed" and .conclusion == "success" and
+                .head_branch == "main" and .head_sha == $control_sha and
+                .path == ".github/workflows/validate-exact-release-source.yml" and
+                .display_title == $expected_title
+              ' <<< "$latest_validation_json" > /dev/null
+            validation_jobs="$(gh api "/repos/$REPOSITORY/actions/runs/$validation_run_id/attempts/$validation_run_attempt/jobs?per_page=100")"
+            jq -e --argjson attempt "$validation_run_attempt" '
+              ([.jobs[] | select(.name == "Exact source validation gate")] | length) == 1 and
+              all(.jobs[] | select(.name == "Exact source validation gate");
+                .run_attempt == $attempt and .status == "completed" and .conclusion == "success")
+            ' <<< "$validation_jobs" > /dev/null
+          done
+
+          [[ "$CAPSULE_ARTIFACT_ID" =~ ^[1-9][0-9]{0,14}$ ]]
+          [[ "$CAPSULE_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          capsule_artifact_json="$(gh api "/repos/$REPOSITORY/actions/artifacts/$CAPSULE_ARTIFACT_ID")"
+          jq -e \
+            --arg digest "$CAPSULE_ARTIFACT_DIGEST" \
+            --arg name "$CAPSULE_NAME" \
+            --argjson artifact_id "$CAPSULE_ARTIFACT_ID" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              .id == $artifact_id and .name == $name and .digest == $digest and
+              .expired == false and .workflow_run.id == $run_id
+            ' <<< "$capsule_artifact_json" > /dev/null
+
+          # Re-fetch each latest image and validation attempt after all other
+          # checks. This second pass prevents an early phase rerun during the
+          # longer artifact/attestation verification window from being missed.
+          for phase in baseline bridge backend ui; do
+            evidence="$(jq -ce --arg phase "$phase" '.[] | select(.phase == $phase)' <<< "$FINAL_EVIDENCE_JSON")"
+            image_run_id="$(jq -er '.image_run_id' <<< "$evidence")"
+            image_run_attempt="$(jq -er '.image_run_attempt' <<< "$evidence")"
+            validation_run_id="$(jq -er '.validation_run_id' <<< "$evidence")"
+            validation_run_attempt="$(jq -er '.validation_run_attempt' <<< "$evidence")"
+            final_image_json="$(gh api "/repos/$REPOSITORY/actions/runs/$image_run_id")"
+            final_validation_json="$(gh api "/repos/$REPOSITORY/actions/runs/$validation_run_id")"
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --arg expected_title "Build exact $phase release images" \
+              --arg repository "$REPOSITORY" \
+              --argjson attempt "$image_run_attempt" \
+              --argjson run_id "$image_run_id" \
+              --argjson workflow_id "$image_workflow_id" '
+                .id == $run_id and .run_attempt == $attempt and .workflow_id == $workflow_id and
+                .repository.full_name == $repository and .event == "workflow_dispatch" and
+                .status == "completed" and .conclusion == "success" and
+                .head_branch == "main" and .head_sha == $control_sha and
+                .path == ".github/workflows/build-attest-exact-release-images.yml" and
+                .display_title == $expected_title
+              ' <<< "$final_image_json" > /dev/null
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --arg expected_title "Validate exact $phase release source" \
+              --arg repository "$REPOSITORY" \
+              --argjson attempt "$validation_run_attempt" \
+              --argjson run_id "$validation_run_id" \
+              --argjson workflow_id "$validation_workflow_id" '
+                .id == $run_id and .run_attempt == $attempt and .workflow_id == $workflow_id and
+                .repository.full_name == $repository and .event == "workflow_dispatch" and
+                .status == "completed" and .conclusion == "success" and
+                .head_branch == "main" and .head_sha == $control_sha and
+                .path == ".github/workflows/validate-exact-release-source.yml" and
+                .display_title == $expected_title
+              ' <<< "$final_validation_json" > /dev/null
+          done
+
+          # This is deliberately the final authority read. A main update or a
+          # rerun of any input attempt must invalidate the capsule before this
+          # no-deploy workflow can report success.
+          final_live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$final_live_main_sha" == "$CONTROL_SHA" ]]
+          echo "Exact four-phase rollout authority passed. No deployment or package mutation was performed."
