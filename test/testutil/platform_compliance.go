@@ -71,7 +71,6 @@ func CreateTestPlatformComplianceOrganizationWithID(
 	require.NoError(t, db.Unscoped().Where("id = ?", organizationID).
 		First(&organization).Error)
 	t.Cleanup(func() {
-		TruncateTables(db)
 		assertPlatformComplianceOrganizationGuardEnabled(t, db)
 	})
 	return &reseller, &organization
