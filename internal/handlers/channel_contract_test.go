@@ -445,7 +445,8 @@ func TestLegacyWhatsAppReplyCapabilityMatchesRolloutGate(t *testing.T) {
 
 	account.Capabilities = nil
 	nilCapabilities := (&App{Config: &config.Config{LegacyWhatsAppReply: config.LegacyWhatsAppReplyConfig{
-		Enabled: true,
+		Enabled:                true,
+		AllowedOrganizationIDs: organizationID.String(),
 	}}}).channelAccountToResponse(account)
 	assert.True(t, boolConfigValue(nilCapabilities.Capabilities, "legacy_text_reply_endpoint"))
 }

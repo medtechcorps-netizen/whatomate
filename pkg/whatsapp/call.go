@@ -108,7 +108,10 @@ func (c *Client) SendCallPermissionRequest(ctx context.Context, account *Account
 	}
 	rcpt.SetOnPayload(payload)
 
-	url := c.buildMessagesURL(account)
+	url, err := c.buildMessagesURL(account)
+	if err != nil {
+		return "", fmt.Errorf("build WhatsApp messages endpoint: %w", err)
+	}
 	c.Log.Info("Sending call permission request", "phone", rcpt.Phone)
 
 	respBody, err := c.doRequest(ctx, http.MethodPost, url, payload, account.AccessToken)

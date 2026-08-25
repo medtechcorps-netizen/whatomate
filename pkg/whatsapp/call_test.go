@@ -179,7 +179,7 @@ func TestClient_SendCallPermissionRequest_DefaultBody(t *testing.T) {
 	client := newCallTestClient(srv.server.URL)
 
 	id, err := client.SendCallPermissionRequest(context.Background(), &whatsapp.Account{
-		PhoneID: "p", APIVersion: "v18.0", AccessToken: "tok",
+		PhoneID: "123", APIVersion: "v18.0", AccessToken: "tok",
 	}, whatsapp.Recipient{Phone: "1234567890"}, "")
 	require.NoError(t, err)
 	assert.Equal(t, "wamid.perm-1", id)
@@ -198,7 +198,7 @@ func TestClient_SendCallPermissionRequest_CustomBody(t *testing.T) {
 	client := newCallTestClient(srv.server.URL)
 
 	id, err := client.SendCallPermissionRequest(context.Background(), &whatsapp.Account{
-		PhoneID: "p", APIVersion: "v18.0", AccessToken: "tok",
+		PhoneID: "123", APIVersion: "v18.0", AccessToken: "tok",
 	}, whatsapp.Recipient{Phone: "555"}, "Custom prompt")
 	require.NoError(t, err)
 	assert.Equal(t, "wamid.perm-2", id)

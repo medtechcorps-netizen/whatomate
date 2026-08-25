@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -175,6 +177,17 @@ func TestEndOfDay(t *testing.T) {
 	assert.Equal(t, 23, end.Hour())
 	assert.Equal(t, 59, end.Minute())
 	assert.Equal(t, 59, end.Second())
+}
+
+func TestTruncateStringPreservesUTF8(t *testing.T) {
+	t.Parallel()
+
+	value := strings.Repeat("界", 100)
+	truncated := truncateString(value, 10)
+
+	assert.True(t, utf8.ValidString(truncated))
+	assert.Equal(t, strings.Repeat("界", 7)+"...", truncated)
+	assert.Equal(t, 10, utf8.RuneCountInString(truncated))
 }
 
 // --- findByIDAndOrg ---

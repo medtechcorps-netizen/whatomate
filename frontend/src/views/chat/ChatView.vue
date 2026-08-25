@@ -135,6 +135,7 @@ const canWriteContacts = authStore.hasPermission('contacts', 'write')
 
 const messageInput = ref('')
 const messagesEndRef = ref<HTMLElement | null>(null)
+const messagesContentRef = ref<HTMLElement | null>(null)
 const messageInputRef = ref<HTMLTextAreaElement | null>(null)
 const isSending = ref(false)
 const isAssignDialogOpen = ref(false)
@@ -152,6 +153,8 @@ const READ_BOUNDARY_TOLERANCE = 2
 const CANONICAL_CATCH_UP_INTERVAL_MS = 30_000
 let contactSelectionGeneration = 0
 let initialConversationScrollTimer: ReturnType<typeof setTimeout> | null = null
+let messagesContentResizeObserver: ResizeObserver | null = null
+let messagesContentObservedHeight = 0
 let canonicalCatchUpTimer: number | null = null
 let canonicalCatchUpInFlight = false
 let canonicalCatchUpQueued = false
@@ -779,9 +782,48 @@ function cancelInitialConversationScroll() {
   }
 }
 
+function stopMessagesContentResizeObserver() {
+  messagesContentResizeObserver?.disconnect()
+  messagesContentResizeObserver = null
+  messagesContentObservedHeight = 0
+}
+
+function startMessagesContentResizeObserver(generation: number, contactID: string) {
+  stopMessagesContentResizeObserver()
+  const content = messagesContentRef.value
+  if (!content || typeof ResizeObserver === 'undefined') return
+
+  messagesContentObservedHeight = content.getBoundingClientRect().height
+  const observer = new ResizeObserver(entries => {
+    if (
+      messagesContentResizeObserver !== observer
+      || messagesContentRef.value !== content
+      || !isContactSelectionActive(generation, contactID)
+    ) return
+
+    const entry = entries.find(candidate => candidate.target === content)
+    const nextHeight = entry?.contentRect.height ?? content.getBoundingClientRect().height
+    const contentGrew = nextHeight > messagesContentObservedHeight + 0.5
+    messagesContentObservedHeight = nextHeight
+    if (!contentGrew || !isAtBottom.value) return
+
+    // Images, video metadata, fonts, and reply previews can change height after
+    // the initial conversation render. Follow those late layout shifts only
+    // when the reader was already following the latest message.
+    scrollToBottom(true, () =>
+      messagesContentResizeObserver === observer
+      && isContactSelectionActive(generation, contactID)
+      && isAtBottom.value,
+    )
+  })
+  messagesContentResizeObserver = observer
+  observer.observe(content)
+}
+
 function invalidateContactSelection() {
   contactSelectionGeneration++
   cancelInitialConversationScroll()
+  stopMessagesContentResizeObserver()
   readCursorCheckQueued = false
   contactSessionData.value = null
   // Allow the newly selected conversation to act immediately. Late promises
@@ -805,6 +847,7 @@ function isContactSelectionActive(generation: number, id: string) {
 async function selectContact(id: string) {
   const selectionGeneration = ++contactSelectionGeneration
   cancelInitialConversationScroll()
+  stopMessagesContentResizeObserver()
   contactSessionData.value = null
   newMessagesCount.value = 0
   firstUnreadId.value = null
@@ -876,6 +919,7 @@ async function selectContact(id: string) {
       scrollToBottom(true, () => isContactSelectionActive(selectionGeneration, id))
       // Setup scroll listener for infinite scroll after initial scroll
       messagesScroll.setup()
+      startMessagesContentResizeObserver(selectionGeneration, id)
     }, 50)
 
     // Fetch notes and session data in parallel (independent requests)
@@ -2288,7 +2332,7 @@ async function sendMediaMessage() {
           </Transition>
 
           <ScrollArea :ref="(el: any) => messagesScroll.scrollAreaRef.value = el" class="h-full p-3 chat-background">
-            <div class="space-y-2">
+            <div ref="messagesContentRef" class="space-y-2">
               <!-- Loading indicator for older messages -->
               <div v-if="contactsStore.isLoadingOlderMessages" class="flex justify-center py-2">
                 <div class="flex items-center gap-2 text-white/40 light:text-gray-500 text-sm">

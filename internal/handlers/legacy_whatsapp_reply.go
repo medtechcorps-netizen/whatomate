@@ -1,12 +1,17 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
@@ -16,7 +21,11 @@ import (
 	"gorm.io/gorm"
 )
 
-const legacyWhatsAppReplyOperationTimeout = 30 * time.Second
+const (
+	legacyWhatsAppReplyOperationTimeout  = 30 * time.Second
+	legacyWhatsAppReplyMaxRequestBytes   = 64 << 10
+	legacyWhatsAppReplyMaxTextCharacters = 4096
+)
 
 // LegacyWhatsAppReplyRequest is deliberately text-only. Media, interactive,
 // template, and account-selection fields belong to their existing dedicated
@@ -73,8 +82,19 @@ func (a *App) SendLegacyWhatsAppConversationReply(r *fastglue.Request) error {
 	}
 
 	var request LegacyWhatsAppReplyRequest
-	if err := a.decodeRequest(r, &request); err != nil {
-		return nil
+	if err := decodeLegacyWhatsAppReplyRequest(r, &request); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid request body", nil, "")
+	}
+	if utf8.RuneCountInString(request.Content.Body) > legacyWhatsAppReplyMaxTextCharacters {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Message text must be at most 4096 characters",
+			nil,
+			"",
+		)
+	}
+	if strings.ContainsRune(request.Content.Body, '\x00') {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Message text contains an invalid character", nil, "")
 	}
 	if request.Type != models.MessageTypeText {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Only text replies are supported from this WhatsApp inbox", nil, "")
@@ -359,6 +379,134 @@ func (a *App) SendLegacyWhatsAppConversationReply(r *fastglue.Request) error {
 
 	response := messageResponse(&canonical, snapshot.replyToMessage)
 	return r.SendEnvelope(response)
+}
+
+func decodeLegacyWhatsAppReplyRequest(
+	r *fastglue.Request,
+	request *LegacyWhatsAppReplyRequest,
+) error {
+	if r == nil || request == nil {
+		return errors.New("legacy WhatsApp reply request is required")
+	}
+	body := r.RequestCtx.PostBody()
+	if len(body) == 0 || len(body) > legacyWhatsAppReplyMaxRequestBytes {
+		return errors.New("legacy WhatsApp reply request body is outside safe bounds")
+	}
+	if !utf8.Valid(body) {
+		return errors.New("legacy WhatsApp reply request body must be valid UTF-8")
+	}
+	if err := rejectDuplicateLegacyWhatsAppReplyJSONKeys(body); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(request); err != nil {
+		return err
+	}
+	if err := rejectTrailingLegacyWhatsAppReplyJSON(decoder); err != nil {
+		return err
+	}
+	return nil
+}
+
+func rejectTrailingLegacyWhatsAppReplyJSON(decoder *json.Decoder) error {
+	if decoder == nil {
+		return errors.New("JSON decoder is required")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values are not allowed")
+		}
+		return err
+	}
+	return nil
+}
+
+func rejectDuplicateLegacyWhatsAppReplyJSONKeys(body []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	var consumeValue func([]string) error
+	consumeValue = func(path []string) error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, composite := token.(json.Delim)
+		if !composite {
+			if len(path) == 0 {
+				return errors.New("legacy WhatsApp reply JSON root must be an object")
+			}
+			if len(path) == 1 && path[0] == "content" {
+				return errors.New("legacy WhatsApp reply content must be an object")
+			}
+			return nil
+		}
+		if delimiter != '{' {
+			return errors.New("legacy WhatsApp reply JSON arrays are not allowed")
+		}
+		if !legacyWhatsAppReplyJSONObjectAllowed(path) {
+			return errors.New("legacy WhatsApp reply JSON contains an unexpected object")
+		}
+		switch delimiter {
+		case '{':
+			seen := make(map[string]struct{})
+			for decoder.More() {
+				keyToken, keyErr := decoder.Token()
+				if keyErr != nil {
+					return keyErr
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return errors.New("JSON object key must be a string")
+				}
+				if !legacyWhatsAppReplyJSONKeyAllowed(path, key) {
+					return fmt.Errorf("unknown JSON key %q", key)
+				}
+				if _, duplicate := seen[key]; duplicate {
+					return fmt.Errorf("duplicate JSON key %q", key)
+				}
+				seen[key] = struct{}{}
+				if valueErr := consumeValue(append(path, key)); valueErr != nil {
+					return valueErr
+				}
+			}
+			closing, closeErr := decoder.Token()
+			if closeErr != nil || closing != json.Delim('}') {
+				if closeErr != nil {
+					return closeErr
+				}
+				return errors.New("invalid JSON object")
+			}
+		default:
+			return errors.New("invalid JSON delimiter")
+		}
+		return nil
+	}
+	if err := consumeValue(nil); err != nil {
+		return err
+	}
+	if token, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON token %v", token)
+		}
+		return err
+	}
+	return nil
+}
+
+func legacyWhatsAppReplyJSONObjectAllowed(path []string) bool {
+	return len(path) == 0 || (len(path) == 1 && path[0] == "content")
+}
+
+func legacyWhatsAppReplyJSONKeyAllowed(path []string, key string) bool {
+	if len(path) == 0 {
+		switch key {
+		case "idempotency_key", "type", "content", "reply_to_message_id":
+			return true
+		}
+		return false
+	}
+	return len(path) == 1 && path[0] == "content" && key == "body"
 }
 
 func (a *App) legacyWhatsAppReplyEnabled(organizationID uuid.UUID) bool {
