@@ -169,6 +169,20 @@ function sessionStorageWith(overrides: Partial<Storage>): Storage {
   }
 }
 
+function delayLegacyReplyDigestForValidation() {
+  const delayMs = Number(process.env.VITEST_LEGACY_REPLY_DIGEST_DELAY_MS ?? 0)
+  if (delayMs === 0) return
+  if (!Number.isSafeInteger(delayMs) || delayMs < 1 || delayMs > 1000) {
+    throw new Error('VITEST_LEGACY_REPLY_DIGEST_DELAY_MS must be an integer from 1 to 1000')
+  }
+
+  const digest = crypto.subtle.digest.bind(crypto.subtle)
+  vi.spyOn(crypto.subtle, 'digest').mockImplementation(async (algorithm, data) => {
+    await new Promise<void>(resolve => setTimeout(resolve, delayMs))
+    return digest(algorithm, data)
+  })
+}
+
 function setInbox(options: InboxOptions = {}) {
   const selectedAccount = {
     id: 'channel-account-selected',
@@ -274,6 +288,7 @@ async function mountAndSelectConversation() {
 describe('ChannelsView messaging behavior', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    delayLegacyReplyDigestForValidation()
     clearLegacyWhatsAppReplyAttemptNamespace()
     mocks.organizationStore.selectedOrgId = 'organization-1'
     vi.spyOn(HTMLElement.prototype, 'scrollTo').mockImplementation(
@@ -546,6 +561,7 @@ describe('ChannelsView messaging behavior', () => {
     await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
 
+    await vi.waitFor(() => expect(storedLegacyReplyAttempts()).toHaveLength(1))
     const [stored] = storedLegacyReplyAttempts()
     const record = JSON.parse(stored!.value)
     record.createdAt = Date.now() - 16 * 60 * 1000
@@ -558,12 +574,14 @@ describe('ChannelsView messaging behavior', () => {
     await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
 
-    expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
-      '00000000-0000-4000-8000-000000000041',
-    )
-    expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(
-      '00000000-0000-4000-8000-000000000041',
-    )
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
+        '00000000-0000-4000-8000-000000000041',
+      )
+      expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(
+        '00000000-0000-4000-8000-000000000041',
+      )
+    })
   })
 
   it('fails closed without calling the reply endpoint when secure retry storage is unavailable', async () => {
@@ -696,14 +714,16 @@ describe('ChannelsView messaging behavior', () => {
     await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
 
-    expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[0]).toBe('conversation-1')
-    expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
-      '00000000-0000-4000-8000-000000000031',
-    )
-    expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[0]).toBe('conversation-2')
-    expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(
-      '00000000-0000-4000-8000-000000000032',
-    )
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[0]).toBe('conversation-1')
+      expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
+        '00000000-0000-4000-8000-000000000031',
+      )
+      expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[0]).toBe('conversation-2')
+      expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(
+        '00000000-0000-4000-8000-000000000032',
+      )
+    })
   })
 
   it('reports a server without the fail-closed reply endpoint and never falls back', async () => {
@@ -718,11 +738,13 @@ describe('ChannelsView messaging behavior', () => {
     await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
 
+    await vi.waitFor(() => {
+      expect(mocks.toastError).toHaveBeenCalledWith(
+        'WhatsApp reply unavailable',
+        'Omnichannel direct reply is not enabled on this server. No message was sent.',
+      )
+    })
     expect(mocks.sendChannelMessage).not.toHaveBeenCalled()
-    expect(mocks.toastError).toHaveBeenCalledWith(
-      'WhatsApp reply unavailable',
-      'Omnichannel direct reply is not enabled on this server. No message was sent.',
-    )
   })
 
   it('shows a service-window conflict from the authoritative endpoint', async () => {
@@ -737,11 +759,13 @@ describe('ChannelsView messaging behavior', () => {
     await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
 
+    await vi.waitFor(() => {
+      expect(mocks.toastWarning).toHaveBeenCalledWith(
+        'WhatsApp reply unavailable',
+        'WhatsApp service window is closed',
+      )
+    })
     expect(mocks.sendChannelMessage).not.toHaveBeenCalled()
-    expect(mocks.toastWarning).toHaveBeenCalledWith(
-      'WhatsApp reply unavailable',
-      'WhatsApp service window is closed',
-    )
   })
 
   it('does not fall back when the selected account lacks the additive endpoint capability', async () => {
