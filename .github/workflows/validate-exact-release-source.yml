@@ -1,0 +1,734 @@
+name: Validate Exact Release Source
+
+run-name: Validate exact ${{ inputs.phase }} release source
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Immutable release phase to validate
+        required: true
+        type: choice
+        options:
+          - baseline
+          - bridge
+          - backend
+          - ui
+
+# This workflow validates source only. It has no deployment environment,
+# repository secrets, package permissions, registry login, or cloud mutation.
+permissions:
+  contents: read
+
+concurrency:
+  # Release phases are dispatched serially, but phase-scoped groups prevent a
+  # later phase from cancelling an older phase that is still queued.
+  group: rereply-exact-release-source-validation-${{ inputs.phase }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  source_identity:
+    name: Resolve and verify exact source identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      phase: ${{ steps.select.outputs.phase }}
+      source_sha: ${{ steps.select.outputs.source_sha }}
+      root_tree: ${{ steps.select.outputs.root_tree }}
+      frontend_tree: ${{ steps.select.outputs.frontend_tree }}
+      internal_tree: ${{ steps.select.outputs.internal_tree }}
+      workflow_sha: ${{ steps.authority.outputs.workflow_sha }}
+    steps:
+      - name: Require dispatch from protected main
+        id: authority
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+
+          [[ "$REPOSITORY" == "medtechcorps-netizen/whatomate" ]]
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]]
+          [[ "$WORKFLOW_REF" == "medtechcorps-netizen/whatomate/.github/workflows/validate-exact-release-source.yml@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" ]]
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          printf 'workflow_sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Select an allowlisted immutable source
+        id: select
+        env:
+          REQUESTED_PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+
+          case "$REQUESTED_PHASE" in
+            baseline)
+              source_sha="974bb998f6d4c94ce750a92bf23f4550f8e45a2f"
+              root_tree="e964211fbb5858c9a9028ce5cdc54a7518d5d573"
+              frontend_tree="0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74"
+              internal_tree="f70860bcee374d507b7e6443f4f21df2855b217f"
+              ;;
+            bridge)
+              source_sha="b3d8f167bf428e1f3e209b0d42982f16b21cfae8"
+              root_tree="fb90f9c4be3ffefe50c95c0c5dab44cfe8b19538"
+              frontend_tree="0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74"
+              internal_tree="32763888c556305e8aee180183c92f36ddf5d195"
+              ;;
+            backend)
+              source_sha="63e54fe72a753006733931ddfb5bdbdbe2a2a4fc"
+              root_tree="7c7a789bffea8e2d7688ed8e12f780f500e9de5a"
+              frontend_tree="0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74"
+              internal_tree="494d3957ff3559375f406886be45646049ec9378"
+              ;;
+            ui)
+              source_sha="ab44af2e7c093b4502c1928126c31306b2ba0389"
+              root_tree="3553b783d5cfdcbda2ffcee332a2aa392a897bc5"
+              frontend_tree="2f92a064f2f3d7f1867c835ef3be7f41e2f30444"
+              internal_tree="494d3957ff3559375f406886be45646049ec9378"
+              ;;
+            *)
+              echo "::error::The requested phase is not allowlisted."
+              exit 1
+              ;;
+          esac
+
+          {
+            printf 'phase=%s\n' "$REQUESTED_PHASE"
+            printf 'source_sha=%s\n' "$source_sha"
+            printf 'root_tree=%s\n' "$root_tree"
+            printf 'frontend_tree=%s\n' "$frontend_tree"
+            printf 'internal_tree=%s\n' "$internal_tree"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the exact allowlisted commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.select.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Fail closed unless commit and trees match
+        env:
+          EXPECTED_SOURCE_SHA: ${{ steps.select.outputs.source_sha }}
+          EXPECTED_ROOT_TREE: ${{ steps.select.outputs.root_tree }}
+          EXPECTED_FRONTEND_TREE: ${{ steps.select.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ steps.select.outputs.internal_tree }}
+        run: |
+          set -euo pipefail
+
+          actual_source_sha="$(git rev-parse 'HEAD^{commit}')"
+          actual_root_tree="$(git show -s --format=%T HEAD)"
+          actual_frontend_tree="$(git rev-parse 'HEAD:frontend')"
+          actual_internal_tree="$(git rev-parse 'HEAD:internal')"
+
+          printf 'source=%s\nroot=%s\nfrontend=%s\ninternal=%s\n' \
+            "$actual_source_sha" "$actual_root_tree" \
+            "$actual_frontend_tree" "$actual_internal_tree"
+
+          [[ "$actual_source_sha" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$actual_root_tree" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$actual_frontend_tree" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$actual_internal_tree" == "$EXPECTED_INTERNAL_TREE" ]]
+          git diff --exit-code
+          [[ -z "$(git status --porcelain)" ]]
+
+  full_go:
+    name: Full Go race and service tests (PostgreSQL 17)
+    needs: source_identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: whatomate_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7@sha256:91d0f7e8c748ec7a4c2b4fb2c4f84edab794dd91d01e095e38dc906db9d684ab
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source_identity.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact source identity
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
+          EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
+          EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -z "$(git status --porcelain)" ]]
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.6"
+          cache: false
+
+      - name: Download Go dependencies
+        run: go mod download
+
+      - name: Install pinned gotestsum
+        run: go install gotest.tools/gotestsum@v1.13.0
+
+      - name: Run full race and service test suite
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_test?sslmode=disable
+          TEST_REDIS_URL: redis://localhost:6379
+        run: |
+          set -euo pipefail
+          package_output="$(go list -mod=readonly ./...)"
+          mapfile -t packages < <(printf '%s\n' "$package_output" | grep -v /test/)
+          [[ "${#packages[@]}" -gt 0 ]]
+          gotestsum \
+            --format testname \
+            --hide-summary=skipped \
+            -- -mod=readonly -race -p 1 -timeout 40m -coverprofile=coverage.out "${packages[@]}"
+          go tool cover -func=coverage.out | grep 'total:'
+          git diff --exit-code -- go.mod go.sum
+
+  bridge_pg14:
+    name: Bridge compatibility contract (PostgreSQL 14)
+    if: needs.source_identity.outputs.phase == 'bridge'
+    needs: source_identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:14@sha256:2fdfb9b432d4a73bd3eea3d989752c1e669b68d502347e0bfd2cc6d709f3d6b4
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: whatomate_bridge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source_identity.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact source identity
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
+          EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
+          EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -z "$(git status --porcelain)" ]]
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.6"
+          cache: false
+
+      - name: Run the exact 12-test PostgreSQL 14 bridge selector
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_bridge_test?sslmode=disable
+        run: |
+          set -euo pipefail
+
+          selector='^(TestPlatformComplianceDatabaseWriteBarrier|TestPlatformComplianceAtomicBirthAndMonotonicIdentity|TestPlatformComplianceAtomicCreationIdempotenceRejectsDrift|TestPlatformComplianceGlobalDatabaseSeedsSkipPurposeOrganization|TestPlatformComplianceScanAuthorityRejectsPolicyGaps|TestRemoveTenantRLSPreservesPlatformComplianceBarrier|TestPlatformComplianceRemoveTenantRLSSerializesAtomicCreation|TestRemoveTenantRLSRejectsNestedAndRepeatableReadSnapshots|TestPlatformComplianceStartupVerificationAcceptsExactMessageCursorRolloutProfiles|TestPlatformComplianceStartupVerificationRejectsContractDrift|TestClassifyPlatformComplianceProductTriggerProfile|TestFutureMessageCursorTriggerContractMetadataIsExact)$'
+          expected_tests=(
+            TestClassifyPlatformComplianceProductTriggerProfile
+            TestFutureMessageCursorTriggerContractMetadataIsExact
+            TestPlatformComplianceDatabaseWriteBarrier
+            TestPlatformComplianceAtomicBirthAndMonotonicIdentity
+            TestPlatformComplianceAtomicCreationIdempotenceRejectsDrift
+            TestPlatformComplianceGlobalDatabaseSeedsSkipPurposeOrganization
+            TestPlatformComplianceScanAuthorityRejectsPolicyGaps
+            TestRemoveTenantRLSPreservesPlatformComplianceBarrier
+            TestPlatformComplianceRemoveTenantRLSSerializesAtomicCreation
+            TestRemoveTenantRLSRejectsNestedAndRepeatableReadSnapshots
+            TestPlatformComplianceStartupVerificationAcceptsExactMessageCursorRolloutProfiles
+            TestPlatformComplianceStartupVerificationRejectsContractDrift
+          )
+
+          listed_tests="$(go test -mod=readonly ./internal/database -list "$selector")"
+          mapfile -t selected_tests < <(printf '%s\n' "$listed_tests" | grep '^Test')
+          [[ "${#selected_tests[@]}" -eq 12 ]]
+          diff -u \
+            <(printf '%s\n' "${expected_tests[@]}") \
+            <(printf '%s\n' "${selected_tests[@]}")
+
+          go test -mod=readonly -v ./internal/database -run "$selector" -count=1 -timeout 20m
+          git diff --exit-code -- go.mod go.sum
+
+  frontend:
+    name: Frontend typecheck, unit tests, and build
+    needs: source_identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source_identity.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact source identity
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
+          EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
+          EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -z "$(git status --porcelain)" ]]
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Typecheck frontend
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: Run frontend unit tests
+        working-directory: frontend
+        run: npx --no-install vitest run src
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+  quality:
+    name: Build, vet, lint, and dependency security
+    needs: source_identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source_identity.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact source identity
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
+          EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
+          EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -z "$(git status --porcelain)" ]]
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.6"
+          cache: false
+
+      - name: Build all Go packages
+        run: go build -mod=readonly -v ./...
+
+      - name: Vet all Go packages
+        run: go vet -mod=readonly ./...
+
+      - name: Run pinned golangci-lint
+        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
+        with:
+          version: v2.11.4
+          skip-cache: true
+
+      - name: Run pinned govulncheck
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          GOFLAGS=-mod=readonly govulncheck ./...
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Audit locked frontend dependencies
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          npm ci
+          npm audit --audit-level=high
+
+  containers:
+    name: Local container builds and Trivy scans
+    needs: source_identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source_identity.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact source identity
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
+          EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
+          EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -z "$(git status --porcelain)" ]]
+
+      - name: Build production container locally
+        run: docker build -f docker/Dockerfile -t rereply:exact-validation .
+
+      - name: Build Meta relay container locally
+        run: docker build -f docker/meta-relay.Dockerfile -t rereply-meta-relay:exact-validation .
+
+      - name: Build Gmail relay container locally
+        run: docker build -f docker/gmail-relay.Dockerfile -t rereply-gmail-relay:exact-validation .
+
+      - name: Scan production container
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: rereply:exact-validation
+          format: table
+          exit-code: "1"
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          version: v0.70.0
+          cache: false
+
+      - name: Scan Meta relay container
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: rereply-meta-relay:exact-validation
+          format: table
+          exit-code: "1"
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          version: v0.70.0
+          cache: false
+
+      - name: Scan Gmail relay container
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: rereply-gmail-relay:exact-validation
+          format: table
+          exit-code: "1"
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          version: v0.70.0
+          cache: false
+
+  e2e_shard:
+    name: PostgreSQL 17 E2E shard ${{ matrix.shard }}
+    needs: source_identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    services:
+      postgres:
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
+        env:
+          POSTGRES_DB: whatomate_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7@sha256:91d0f7e8c748ec7a4c2b4fb2c4f84edab794dd91d01e095e38dc906db9d684ab
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source_identity.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact source identity
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
+          EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
+          EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -z "$(git status --porcelain)" ]]
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.6"
+          cache: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Create test config
+        run: |
+          set -euo pipefail
+          cat > config.toml << 'EOF'
+          [app]
+          name = "ReReply"
+          environment = "test"
+          debug = true
+          # CI-only deterministic fixture key for this disposable test database.
+          encryption_key = "synthetic-e2e-key-not-for-production" # gitleaks:allow
+
+          [server]
+          host = "0.0.0.0"
+          port = 8080
+          read_timeout = 30
+          write_timeout = 30
+          base_path = ""
+
+          [database]
+          host = "localhost"
+          port = 5432
+          user = "test"
+          password = "test"
+          name = "whatomate_test"
+          ssl_mode = "disable"
+          max_open_conns = 25
+          max_idle_conns = 5
+          conn_max_lifetime = 300
+
+          [redis]
+          host = "localhost"
+          port = 6379
+          username = ""
+          password = ""
+          db = 0
+          tls = false
+
+          [jwt]
+          secret = "test-secret-key-for-ci"
+          access_expiry_mins = 60
+          refresh_expiry_days = 7
+
+          [storage]
+          type = "local"
+          local_path = "./uploads"
+
+          [whatsapp]
+          base_url = "http://127.0.0.1:9"
+          EOF
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Copy frontend to embed directory
+        run: |
+          set -euo pipefail
+          rm -rf internal/frontend/dist/*
+          cp -r frontend/dist/* internal/frontend/dist/
+
+      - name: Build backend
+        run: |
+          set -euo pipefail
+          go build -mod=readonly -o rereply ./cmd/whatomate
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Start backend with migrations
+        env:
+          WHATOMATE_CONFIG: config.toml
+        run: |
+          set -euo pipefail
+          ./rereply server -migrate > backend.log 2>&1 &
+          backend_pid=$!
+
+          for attempt in $(seq 1 90); do
+            if curl --fail --silent --show-error --max-time 5 http://localhost:8080/ready > /dev/null; then
+              echo "Backend became ready after $((attempt * 2)) seconds"
+              exit 0
+            fi
+
+            if ! kill -0 "$backend_pid" 2>/dev/null; then
+              echo "Backend exited before becoming ready"
+              cat backend.log
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "Backend did not become ready within 180 seconds"
+          cat backend.log
+          exit 1
+
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: npx playwright install chromium --with-deps
+
+      - name: Run E2E tests
+        working-directory: frontend
+        env:
+          BASE_URL: http://localhost:8080
+          TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/whatomate_test
+          E2E_SEED_WHATSAPP_ACCOUNTS: "1"
+          CI: true
+          E2E_SHARD: ${{ matrix.shard }}
+        run: npm run test:e2e -- --shard="${E2E_SHARD}/4"
+
+      - name: Require backend readiness after E2E
+        run: curl --fail --silent --show-error --max-time 10 http://localhost:8080/ready > /dev/null
+
+      - name: Print backend log after failure
+        if: failure()
+        run: tail -n 400 backend.log || true
+
+  gate:
+    name: Exact source validation gate
+    if: always()
+    needs:
+      - source_identity
+      - full_go
+      - bridge_pg14
+      - frontend
+      - quality
+      - containers
+      - e2e_shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every applicable validation to pass
+        env:
+          PHASE: ${{ needs.source_identity.outputs.phase }}
+          SOURCE_IDENTITY_RESULT: ${{ needs.source_identity.result }}
+          VALIDATION_WORKFLOW_SHA: ${{ needs.source_identity.outputs.workflow_sha }}
+          FULL_GO_RESULT: ${{ needs.full_go.result }}
+          BRIDGE_PG14_RESULT: ${{ needs.bridge_pg14.result }}
+          FRONTEND_RESULT: ${{ needs.frontend.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          CONTAINERS_RESULT: ${{ needs.containers.result }}
+          E2E_RESULT: ${{ needs.e2e_shard.result }}
+        run: |
+          set -euo pipefail
+          failures=0
+
+          require_success() {
+            local label="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "::error::$label result was '$result'; expected 'success'."
+              failures=1
+            fi
+          }
+
+          require_success "source identity" "$SOURCE_IDENTITY_RESULT"
+          if [[ ! "$VALIDATION_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Protected-main workflow SHA is missing or malformed."
+            failures=1
+          fi
+          require_success "full Go" "$FULL_GO_RESULT"
+          require_success "frontend" "$FRONTEND_RESULT"
+          require_success "quality" "$QUALITY_RESULT"
+          require_success "containers" "$CONTAINERS_RESULT"
+          require_success "E2E" "$E2E_RESULT"
+
+          case "$PHASE" in
+            bridge)
+              require_success "PostgreSQL 14 bridge" "$BRIDGE_PG14_RESULT"
+              ;;
+            baseline|backend|ui)
+              if [[ "$BRIDGE_PG14_RESULT" != "skipped" ]]; then
+                echo "::error::PostgreSQL 14 bridge result was '$BRIDGE_PG14_RESULT'; expected 'skipped' for $PHASE."
+                failures=1
+              fi
+              ;;
+            *)
+              echo "::error::Resolved phase '$PHASE' is not allowlisted."
+              failures=1
+              ;;
+          esac
+
+          if [[ "$failures" -ne 0 ]]; then
+            exit 1
+          fi
+
+          echo "All validation gates passed for exact phase '$PHASE'."
