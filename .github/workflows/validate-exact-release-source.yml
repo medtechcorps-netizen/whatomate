@@ -304,26 +304,95 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Check out exact source
+      - name: Check out protected-main validation control
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.source_identity.outputs.source_sha }}
+          ref: ${{ needs.source_identity.outputs.workflow_sha }}
+          path: validation-control
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Reverify exact source identity
+      - name: Check out immutable product source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source_identity.outputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify control and product identities
         env:
+          EXPECTED_WORKFLOW_SHA: ${{ needs.source_identity.outputs.workflow_sha }}
           EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
           EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
           EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
           EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
         run: |
           set -euo pipefail
-          [[ "$(git rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
-          [[ "$(git show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
-          [[ "$(git rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
-          [[ "$(git rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
-          [[ -z "$(git status --porcelain)" ]]
+
+          control_dir="$GITHUB_WORKSPACE/validation-control"
+          source_dir="$GITHUB_WORKSPACE/source"
+
+          [[ "$(git -C "$control_dir" rev-parse 'HEAD^{commit}')" == "$EXPECTED_WORKFLOW_SHA" ]]
+          [[ -z "$(git -C "$control_dir" status --porcelain)" ]]
+
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git -C "$source_dir" show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -z "$(git -C "$source_dir" status --porcelain)" ]]
+
+      - name: Apply audited test-only outcome-wait harness
+        id: harness
+        env:
+          PHASE: ${{ needs.source_identity.outputs.phase }}
+          EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
+          EXPECTED_PATCH_SHA256: 917868ced113fe03b0f93d5a0d2acbb9c75021f666517c80af2092a2e2fc2ab1
+          PATCH_RELATIVE_PATH: release/validation/patches/channels-view-webcrypto-waits.patch
+          TEST_RELATIVE_PATH: frontend/src/views/channels/ChannelsView.test.ts
+        run: |
+          set -euo pipefail
+
+          control_dir="$GITHUB_WORKSPACE/validation-control"
+          source_dir="$GITHUB_WORKSPACE/source"
+          patch_path="$control_dir/$PATCH_RELATIVE_PATH"
+          test_path="$source_dir/$TEST_RELATIVE_PATH"
+
+          git -C "$control_dir" ls-files --error-unmatch "$PATCH_RELATIVE_PATH" > /dev/null
+          [[ -f "$patch_path" && ! -L "$patch_path" ]]
+          actual_patch_sha256="$(sha256sum "$patch_path" | awk '{print $1}')"
+          [[ "$actual_patch_sha256" == "$EXPECTED_PATCH_SHA256" ]]
+
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ -z "$(git -C "$source_dir" status --porcelain)" ]]
+          [[ -f "$test_path" && ! -L "$test_path" ]]
+          git -C "$source_dir" apply --unidiff-zero --check --whitespace=error-all "$patch_path"
+          git -C "$source_dir" apply --unidiff-zero --whitespace=error-all "$patch_path"
+          [[ -f "$test_path" && ! -L "$test_path" ]]
+          git -C "$source_dir" diff HEAD --check --
+
+          mapfile -t changed_paths < <(git -C "$source_dir" diff HEAD --name-only --)
+          mapfile -t untracked_paths < <(git -C "$source_dir" ls-files --others --exclude-standard)
+          [[ "${#changed_paths[@]}" -eq 1 ]]
+          [[ "${changed_paths[0]}" == "$TEST_RELATIVE_PATH" ]]
+          [[ "${#untracked_paths[@]}" -eq 0 ]]
+
+          case "$PHASE" in
+            baseline|bridge|backend)
+              expected_patched_blob="ade1da3561942105ab376122e7dcb2f85f7c8f16"
+              ;;
+            ui)
+              expected_patched_blob="906e09c8ebf43d4ba23fcd3caf856175c6ecc332"
+              ;;
+            *)
+              echo "::error::Resolved phase '$PHASE' is not allowlisted for the frontend harness."
+              exit 1
+              ;;
+          esac
+
+          actual_patched_blob="$(git -C "$source_dir" hash-object "$TEST_RELATIVE_PATH")"
+          [[ "$actual_patched_blob" == "$expected_patched_blob" ]]
+          printf 'patched_blob=%s\n' "$actual_patched_blob" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -331,20 +400,97 @@ jobs:
           node-version: "22"
 
       - name: Install locked frontend dependencies
-        working-directory: frontend
+        working-directory: source/frontend
         run: npm ci
 
       - name: Typecheck frontend
-        working-directory: frontend
+        working-directory: source/frontend
         run: npm run typecheck
 
+      - name: Prove outcome waits across delayed WebCrypto completion
+        working-directory: source/frontend
+        env:
+          VITEST_LEGACY_REPLY_DIGEST_DELAY_MS: "25"
+        run: |
+          set -euo pipefail
+          selector='reuses an unresolved WhatsApp attempt beyond fifteen minutes while the service window remains open|uses a new WhatsApp idempotency key after the conversation changes|reports a server without the fail-closed reply endpoint and never falls back|shows a service-window conflict from the authoritative endpoint'
+          report="$(mktemp "$RUNNER_TEMP/webcrypto-waits.XXXXXX.json")"
+          npx --no-install vitest run \
+            src/views/channels/ChannelsView.test.ts \
+            --reporter=json \
+            --outputFile="$report" \
+            -t "$selector"
+
+          node - "$report" <<'NODE'
+          const fs = require('node:fs')
+
+          const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
+          const expected = new Set([
+            'reuses an unresolved WhatsApp attempt beyond fifteen minutes while the service window remains open',
+            'uses a new WhatsApp idempotency key after the conversation changes',
+            'reports a server without the fail-closed reply endpoint and never falls back',
+            'shows a service-window conflict from the authoritative endpoint',
+          ])
+          const assertions = report.testResults.flatMap(result => result.assertionResults ?? [])
+          const executed = assertions.filter(result => result.status === 'passed' || result.status === 'failed')
+
+          if (report.numPassedTests !== expected.size || report.numFailedTests !== 0) {
+            throw new Error(`Expected ${expected.size} focused passes and zero failures; received ${report.numPassedTests} passes and ${report.numFailedTests} failures`)
+          }
+          if (executed.length !== expected.size) {
+            throw new Error(`Expected exactly ${expected.size} executed focused tests; received ${executed.length}`)
+          }
+          for (const result of executed) {
+            if (!expected.delete(result.title) || result.status !== 'passed') {
+              throw new Error(`Unexpected focused result: ${result.title} (${result.status})`)
+            }
+          }
+          if (expected.size !== 0) {
+            throw new Error(`Focused tests were not executed: ${[...expected].join(', ')}`)
+          }
+          NODE
+
       - name: Run frontend unit tests
-        working-directory: frontend
+        working-directory: source/frontend
         run: npx --no-install vitest run src
 
       - name: Build frontend
-        working-directory: frontend
+        working-directory: source/frontend
         run: npm run build
+
+      - name: Reverify test-only harness scope
+        env:
+          EXPECTED_WORKFLOW_SHA: ${{ needs.source_identity.outputs.workflow_sha }}
+          EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
+          EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
+          EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
+          EXPECTED_PATCHED_BLOB: ${{ steps.harness.outputs.patched_blob }}
+          TEST_RELATIVE_PATH: frontend/src/views/channels/ChannelsView.test.ts
+        run: |
+          set -euo pipefail
+
+          control_dir="$GITHUB_WORKSPACE/validation-control"
+          source_dir="$GITHUB_WORKSPACE/source"
+          test_path="$source_dir/$TEST_RELATIVE_PATH"
+
+          [[ "$(git -C "$control_dir" rev-parse 'HEAD^{commit}')" == "$EXPECTED_WORKFLOW_SHA" ]]
+          [[ -z "$(git -C "$control_dir" status --porcelain)" ]]
+
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git -C "$source_dir" show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -f "$test_path" && ! -L "$test_path" ]]
+
+          mapfile -t changed_paths < <(git -C "$source_dir" diff HEAD --name-only --)
+          mapfile -t untracked_paths < <(git -C "$source_dir" ls-files --others --exclude-standard)
+
+          [[ "${#changed_paths[@]}" -eq 1 ]]
+          [[ "${changed_paths[0]}" == "$TEST_RELATIVE_PATH" ]]
+          [[ "${#untracked_paths[@]}" -eq 0 ]]
+          [[ "$(git -C "$source_dir" hash-object "$TEST_RELATIVE_PATH")" == "$EXPECTED_PATCHED_BLOB" ]]
+          git -C "$source_dir" diff HEAD --check --
 
   quality:
     name: Build, vet, lint, and dependency security
