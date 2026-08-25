@@ -1,57 +1,28 @@
-name: Release
+name: Legacy Release - Disabled Safety Gate
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+
+# The historical tag-triggered GoReleaser path published mutable Docker Hub and
+# GHCR tags without the exact-source, scan, SBOM, or attestation controls used by
+# the production release process. Keep this entry point fail-closed so a tag can
+# never create an artifact that might be mistaken for a production candidate.
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-legacy-release-disabled
+  cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
+  release-disabled:
+    name: legacy-release-disabled
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PASSWORD }}
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.26.6"
-          cache: true
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          version: "~> v2"
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DOCKER_ORG: shridh0r
-          GITHUB_ORG: ${{ github.repository_owner }}
+      - name: Refuse legacy release publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::error::Legacy mutable-tag publication is disabled. Use the reviewed exact release image workflow."
+          exit 1
