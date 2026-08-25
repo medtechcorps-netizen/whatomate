@@ -1,0 +1,159 @@
+diff --git a/frontend/src/views/channels/ChannelsView.test.ts b/frontend/src/views/channels/ChannelsView.test.ts
+index ade1da356..7d7dc8a0b 100644
+--- a/frontend/src/views/channels/ChannelsView.test.ts
++++ b/frontend/src/views/channels/ChannelsView.test.ts
+@@ -319,4 +319,6 @@ describe('ChannelsView messaging behavior', () => {
+-    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+-    await flushPromises()
+-
+-    expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
++    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
++    await vi.waitFor(() => {
++      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
++      expect((composer.element as HTMLTextAreaElement).value).toBe('')
++    })
++
+@@ -347,6 +349,13 @@ describe('ChannelsView messaging behavior', () => {
+-    await send.trigger('click')
+-    await flushPromises()
+-    await send.trigger('click')
+-    await flushPromises()
+-
+-    expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
++    await send.trigger('click')
++    await vi.waitFor(() => {
++      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
++      expect(storedLegacyReplyAttempts()).toHaveLength(1)
++      expect(send.attributes('disabled')).toBeUndefined()
++    })
++    await send.trigger('click')
++    await vi.waitFor(() => {
++      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
++      expect(storedLegacyReplyAttempts()).toHaveLength(0)
++      expect((composer.element as HTMLTextAreaElement).value).toBe('')
++    })
++
+@@ -363,5 +372,6 @@ describe('ChannelsView messaging behavior', () => {
+-    await send.trigger('click')
+-    await flushPromises()
+-    expect(mocks.sendLegacyWhatsAppReply.mock.calls[2]?.[1]?.idempotency_key).toBe(
+-      '00000000-0000-4000-8000-000000000012',
+-    )
++    await send.trigger('click')
++    await vi.waitFor(() => {
++      expect(mocks.sendLegacyWhatsAppReply.mock.calls[2]?.[1]?.idempotency_key).toBe(
++        '00000000-0000-4000-8000-000000000012',
++      )
++    })
+@@ -394,5 +404,5 @@ describe('ChannelsView messaging behavior', () => {
+-      await send.trigger('click')
+-      await flushPromises()
+-
+-      expect(storedLegacyReplyAttempts()).toHaveLength(0)
+-      expect((composer.element as HTMLTextAreaElement).value).toBe('')
++      await send.trigger('click')
++      await vi.waitFor(() => {
++        expect(storedLegacyReplyAttempts()).toHaveLength(0)
++        expect((composer.element as HTMLTextAreaElement).value).toBe('')
++      })
+@@ -401,9 +411,9 @@ describe('ChannelsView messaging behavior', () => {
+-      await send.trigger('click')
+-      await flushPromises()
+-
+-      expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
+-        '00000000-0000-4000-8000-000000000031',
+-      )
+-      expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(
+-        '00000000-0000-4000-8000-000000000032',
+-      )
++      await send.trigger('click')
++      await vi.waitFor(() => {
++        expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
++          '00000000-0000-4000-8000-000000000031',
++        )
++        expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(
++          '00000000-0000-4000-8000-000000000032',
++        )
++      })
+@@ -445,3 +455,5 @@ describe('ChannelsView messaging behavior', () => {
+-    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+-    await flushPromises()
+-    expect(storedLegacyReplyAttempts()).toHaveLength(1)
++    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
++    await vi.waitFor(() => {
++      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
++      expect(storedLegacyReplyAttempts()).toHaveLength(1)
++    })
+@@ -468,4 +480,4 @@ describe('ChannelsView messaging behavior', () => {
+-    await flushPromises()
+-
+-    expect(storedLegacyReplyAttempts()).toHaveLength(0)
+-    expect(view.text()).not.toContain('Settled while switching')
++    await vi.waitFor(() => {
++      expect(storedLegacyReplyAttempts()).toHaveLength(0)
++      expect(view.text()).not.toContain('Settled while switching')
++    })
+@@ -480,6 +492,8 @@ describe('ChannelsView messaging behavior', () => {
+-    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+-    await flushPromises()
+-
+-    const firstKey = mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key
+-    const stored = storedLegacyReplyAttempts()
+-    expect(stored).toHaveLength(1)
++    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
++    await vi.waitFor(() => {
++      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
++      expect(storedLegacyReplyAttempts()).toHaveLength(1)
++    })
++
++    const firstKey = mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key
++    const stored = storedLegacyReplyAttempts()
+@@ -500,5 +514,5 @@ describe('ChannelsView messaging behavior', () => {
+-    await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+-    await flushPromises()
+-
+-    expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(firstKey)
+-    expect(storedLegacyReplyAttempts()).toHaveLength(0)
++    await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
++    await vi.waitFor(() => {
++      expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(firstKey)
++      expect(storedLegacyReplyAttempts()).toHaveLength(0)
++    })
+@@ -524,5 +538,5 @@ describe('ChannelsView messaging behavior', () => {
+-    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+-    await flushPromises()
+-
+-    expect(storedLegacyReplyAttempts()).toHaveLength(1)
+-    expect((composer.element as HTMLTextAreaElement).value).toBe('Keep this attempt')
++    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
++    await vi.waitFor(() => {
++      expect(storedLegacyReplyAttempts()).toHaveLength(1)
++      expect((composer.element as HTMLTextAreaElement).value).toBe('Keep this attempt')
++    })
+@@ -602,2 +616,5 @@ describe('ChannelsView messaging behavior', () => {
+-    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+-    await flushPromises()
++    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
++    await vi.waitFor(() => {
++      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
++      expect(storedLegacyReplyAttempts()).toHaveLength(1)
++    })
+@@ -611,9 +628,9 @@ describe('ChannelsView messaging behavior', () => {
+-    await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+-    await flushPromises()
+-
+-    expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
+-      '00000000-0000-4000-8000-000000000051',
+-    )
+-    expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(
+-      '00000000-0000-4000-8000-000000000052',
+-    )
++    await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
++    await vi.waitFor(() => {
++      expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
++        '00000000-0000-4000-8000-000000000051',
++      )
++      expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(
++        '00000000-0000-4000-8000-000000000052',
++      )
++    })
