@@ -1,0 +1,2689 @@
+name: Build and Attest Exact Release Images
+
+run-name: Build exact ${{ inputs.phase }} release images
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Exact validated release phase to package
+        required: true
+        type: choice
+        options:
+          - baseline
+          - bridge
+          - backend
+          - ui
+      validation_run_id:
+        description: Successful Validate Exact Release Source workflow run ID
+        required: true
+        type: string
+
+# This workflow can publish release artifacts, but it cannot read deployment
+# secrets, update App Platform, change package visibility, or deploy anything.
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-exact-release-image-build
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  RELEASE_WORKFLOW_PATH: .github/workflows/build-attest-exact-release-images.yml
+  SOURCE_MANIFEST_PATH: release/exact-sources.json
+  CUSTOM_IMAGE_PREDICATE: https://rereply.app/attestations/exact-release-image/v1
+  CUSTOM_SET_PREDICATE: https://rereply.app/attestations/exact-release-set/v1
+  SPDX_PREDICATE: https://spdx.dev/Document/v2.3
+  PINNED_JQ_VERSION: "1.8.2"
+  PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+  PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
+  PINNED_TRIVY_VERSION: "0.70.0"
+  PINNED_TRIVY_URL: https://github.com/aquasecurity/trivy/releases/download/v0.70.0/trivy_0.70.0_Linux-64bit.tar.gz
+  PINNED_TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+  PINNED_TRIVY_DB: ghcr.io/aquasecurity/trivy-db@sha256:354879494133734128160eabaf873069c1da593adb1760eaf657d17411cb6c8a
+  PINNED_SYFT_VERSION: "1.51.0"
+  PINNED_SYFT_URL: https://github.com/anchore/syft/releases/download/v1.51.0/syft_1.51.0_linux_amd64.tar.gz
+  PINNED_SYFT_SHA256: 2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f
+  PINNED_BUILDX_VERSION: v0.36.1
+  PINNED_BUILDX_URL: https://github.com/docker/buildx/releases/download/v0.36.1/buildx-v0.36.1.linux-amd64
+  PINNED_BUILDX_SHA256: 48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778
+  PINNED_BUILDKIT_IMAGE: docker.io/moby/buildkit:buildx-stable-1@sha256:040d34121c27906c4ff9ac152a30d52bf2c5d328d3bb748916bb3d2743c02528
+
+jobs:
+  authority:
+    name: Verify protected-main authority and exact validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read # Query and verify the exact successful source-validation run.
+      contents: read
+    outputs:
+      phase: ${{ steps.source.outputs.phase }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      root_tree: ${{ steps.source.outputs.root_tree }}
+      frontend_tree: ${{ steps.source.outputs.frontend_tree }}
+      internal_tree: ${{ steps.source.outputs.internal_tree }}
+      source_manifest_sha256: ${{ steps.source.outputs.source_manifest_sha256 }}
+      matrix: ${{ steps.source.outputs.matrix }}
+      control_sha: ${{ steps.authority.outputs.control_sha }}
+      validation_run_id: ${{ steps.validation.outputs.validation_run_id }}
+      validation_run_attempt: ${{ steps.validation.outputs.validation_run_attempt }}
+      validation_run_url: ${{ steps.validation.outputs.validation_run_url }}
+    steps:
+      - name: Require protected-main GitHub-hosted authority
+        id: authority
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$RELEASE_WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" ]]
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf 'control_sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out protected release controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Require the live main ref to match this control
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+
+      - name: Resolve the reviewed source and component matrix
+        id: source
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          REQUESTED_PHASE: ${{ inputs.phase }}
+        working-directory: control
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git status --porcelain)" ]]
+
+          manifest="$SOURCE_MANIFEST_PATH"
+          require_control_blob() {
+            local path="$1"
+            local mode type object entry_path control_root resolved
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            [[ "$path" != /* && "$path" != *".."* ]]
+            [[ -f "$path" && ! -L "$path" ]]
+            read -r mode type object entry_path < <(git ls-tree HEAD -- "$path")
+            [[ "$mode" == "100644" && "$type" == "blob" && "$entry_path" == "$path" ]]
+            [[ "$(git hash-object "$path")" == "$object" ]]
+            control_root="$(realpath -e .)"
+            resolved="$(realpath -e -- "$path")"
+            [[ "$resolved" == "$control_root/"* ]]
+          }
+          require_control_blob "$manifest"
+
+          jq -e '
+            (keys == ["phases", "release", "repository", "schema_version", "validation"]) and
+            .schema_version == 1 and
+            .repository == "medtechcorps-netizen/whatomate" and
+            (.validation | keys) == ["gate_job_name", "workflow_path"] and
+            .validation.workflow_path == ".github/workflows/validate-exact-release-source.yml" and
+            .validation.gate_job_name == "Exact source validation gate" and
+            (.phases | keys) == ["backend", "baseline", "bridge", "ui"] and
+            .phases.baseline == {
+              source_sha: "974bb998f6d4c94ce750a92bf23f4550f8e45a2f",
+              root_tree: "e964211fbb5858c9a9028ce5cdc54a7518d5d573",
+              frontend_tree: "0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74",
+              internal_tree: "f70860bcee374d507b7e6443f4f21df2855b217f"
+            } and
+            .phases.bridge == {
+              source_sha: "b3d8f167bf428e1f3e209b0d42982f16b21cfae8",
+              root_tree: "fb90f9c4be3ffefe50c95c0c5dab44cfe8b19538",
+              frontend_tree: "0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74",
+              internal_tree: "32763888c556305e8aee180183c92f36ddf5d195"
+            } and
+            .phases.backend == {
+              source_sha: "63e54fe72a753006733931ddfb5bdbdbe2a2a4fc",
+              root_tree: "7c7a789bffea8e2d7688ed8e12f780f500e9de5a",
+              frontend_tree: "0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74",
+              internal_tree: "494d3957ff3559375f406886be45646049ec9378"
+            } and
+            .phases.ui == {
+              source_sha: "ab44af2e7c093b4502c1928126c31306b2ba0389",
+              root_tree: "3553b783d5cfdcbda2ffcee332a2aa392a897bc5",
+              frontend_tree: "2f92a064f2f3d7f1867c835ef3be7f41e2f30444",
+              internal_tree: "494d3957ff3559375f406886be45646049ec9378"
+            } and
+            (.release | keys) == ["components", "materials", "platform"] and
+            .release.platform == "linux/amd64" and
+            (.release.components | keys) == ["gmail-relay", "meta-relay", "web"] and
+            (.release.materials | keys) == ["base_images", "direct_downloads", "scratch_stages", "ubuntu_snapshot"] and
+            .release.components.web == {
+              image: "ghcr.io/medtechcorps-netizen/rereply-release-web",
+              dockerfile: "docker/release/web.Dockerfile",
+              dockerfile_sha256: "6c5b065797072000d66124120ea6da940858b54a2a8bcf3b5595f3719cf03582",
+              user: "rereply",
+              working_dir: "/app",
+              entrypoint: ["./rereply"],
+              cmd: ["server", "-config", "config.toml"],
+              port: "8080/tcp",
+              smoke: "version"
+            } and
+            .release.components["meta-relay"] == {
+              image: "ghcr.io/medtechcorps-netizen/rereply-release-meta-relay",
+              dockerfile: "docker/release/meta-relay.Dockerfile",
+              dockerfile_sha256: "38a6dcceaa252750f4ffd016002687423f062b15d8b47f6478af2185b628eb25",
+              user: "relay",
+              working_dir: "/app",
+              entrypoint: ["/app/meta-relay"],
+              cmd: null,
+              port: "8081/tcp",
+              smoke: "binary"
+            } and
+            .release.components["gmail-relay"] == {
+              image: "ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay",
+              dockerfile: "docker/release/gmail-relay.Dockerfile",
+              dockerfile_sha256: "f0c2ac09e585b3504123c1a5d336658dca5a52a0124a04aace202fb61a98a098",
+              user: "relay",
+              working_dir: "/app",
+              entrypoint: ["/app/gmail-relay"],
+              cmd: null,
+              port: "8082/tcp",
+              smoke: "binary"
+            } and
+            ([.release.components[].image] | unique | length) == 3 and
+            .release.materials.ubuntu_snapshot == {
+              id: "20260824T000000Z",
+              packages: {
+                "ca-certificates": "20260601~24.04.1",
+                "espeak-ng": "1.51+dfsg-12build1",
+                "ffmpeg": "7:6.1.1-3ubuntu5",
+                "opus-tools": "0.2-1build3",
+                "tzdata": "2026c-0ubuntu0.24.04.1"
+              },
+              dockerfile: "docker/release/web.Dockerfile",
+              stage: null
+            } and
+            .release.materials.base_images == [
+              {
+                name: "docker.io/library/node:22-alpine",
+                digest: "sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c",
+                uses: [
+                  {dockerfile: "docker/release/web.Dockerfile", stage: "frontend-builder"},
+                  {dockerfile: "docker/release/web.Dockerfile", stage: "piper-download"}
+                ]
+              },
+              {
+                name: "docker.io/library/golang:1.26.6-alpine",
+                digest: "sha256:1a9c10cf505a9e6b1e96ea77ebdbfe79a0f10380181faf88bc3b51d7e4315fae",
+                uses: [
+                  {dockerfile: "docker/release/gmail-relay.Dockerfile", stage: "builder"},
+                  {dockerfile: "docker/release/meta-relay.Dockerfile", stage: "builder"},
+                  {dockerfile: "docker/release/web.Dockerfile", stage: "builder"}
+                ]
+              },
+              {
+                name: "docker.io/library/ubuntu:24.04",
+                digest: "sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316",
+                uses: [
+                  {dockerfile: "docker/release/web.Dockerfile", stage: null}
+                ]
+              }
+            ] and
+            .release.materials.scratch_stages == [
+              {dockerfile: "docker/release/gmail-relay.Dockerfile", stage: null},
+              {dockerfile: "docker/release/meta-relay.Dockerfile", stage: null}
+            ] and
+            .release.materials.direct_downloads == [
+              {
+                name: "piper_linux_x86_64.tar.gz",
+                url: "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz",
+                sha256: "a50cb45f355b7af1f6d758c1b360717877ba0a398cc8cbe6d2a7a3a26e225992",
+                dockerfile: "docker/release/web.Dockerfile",
+                stage: "piper-download",
+                destination: "/tmp/piper.tar.gz",
+                runtime_path: null,
+                runtime_mode: null
+              },
+              {
+                name: "en_US-lessac-medium.onnx",
+                url: "https://huggingface.co/rhasspy/piper-voices/resolve/39ab474be869e9181350af6a65e4953eef67aaa0/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+                sha256: "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f",
+                dockerfile: "docker/release/web.Dockerfile",
+                stage: "piper-download",
+                destination: "/tmp/piper-models/en_US-lessac-medium.onnx",
+                runtime_path: "/opt/piper/models/en_US-lessac-medium.onnx",
+                runtime_mode: "0644"
+              },
+              {
+                name: "en_US-lessac-medium.onnx.json",
+                url: "https://huggingface.co/rhasspy/piper-voices/resolve/39ab474be869e9181350af6a65e4953eef67aaa0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
+                sha256: "efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0",
+                dockerfile: "docker/release/web.Dockerfile",
+                stage: "piper-download",
+                destination: "/tmp/piper-models/en_US-lessac-medium.onnx.json",
+                runtime_path: "/opt/piper/models/en_US-lessac-medium.onnx.json",
+                runtime_mode: "0644"
+              }
+            ]
+          ' "$manifest" > /dev/null
+
+          while IFS= read -r dockerfile; do
+            require_control_blob "$dockerfile"
+          done < <(jq -r '.release.components[].dockerfile' "$manifest" | sort -u)
+
+          source_sha="$(jq -er --arg phase "$REQUESTED_PHASE" '.phases[$phase].source_sha' "$manifest")"
+          root_tree="$(jq -er --arg phase "$REQUESTED_PHASE" '.phases[$phase].root_tree' "$manifest")"
+          frontend_tree="$(jq -er --arg phase "$REQUESTED_PHASE" '.phases[$phase].frontend_tree' "$manifest")"
+          internal_tree="$(jq -er --arg phase "$REQUESTED_PHASE" '.phases[$phase].internal_tree' "$manifest")"
+          for value in "$source_sha" "$root_tree" "$frontend_tree" "$internal_tree"; do
+            [[ "$value" =~ ^[0-9a-f]{40}$ ]]
+          done
+
+          matrix="$(jq -c '[.release.components | to_entries[] | .value + {component: .key}]' "$manifest")"
+          [[ "$(jq 'length' <<< "$matrix")" -eq 3 ]]
+          source_manifest_sha256="$(sha256sum "$manifest" | awk '{print $1}')"
+
+          {
+            printf 'phase=%s\n' "$REQUESTED_PHASE"
+            printf 'source_sha=%s\n' "$source_sha"
+            printf 'root_tree=%s\n' "$root_tree"
+            printf 'frontend_tree=%s\n' "$frontend_tree"
+            printf 'internal_tree=%s\n' "$internal_tree"
+            printf 'source_manifest_sha256=%s\n' "$source_manifest_sha256"
+            printf 'matrix=%s\n' "$matrix"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Require a successful exact-source validation run
+        id: validation
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          EXPECTED_PHASE: ${{ steps.source.outputs.phase }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VALIDATION_RUN_ID: ${{ inputs.validation_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$VALIDATION_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+
+          workflow_id="$(gh api \
+            "/repos/$REPOSITORY/actions/workflows/validate-exact-release-source.yml" \
+            --jq '.id')"
+          [[ "$workflow_id" =~ ^[1-9][0-9]*$ ]]
+
+          latest_run_json="$(gh api "/repos/$REPOSITORY/actions/runs/$VALIDATION_RUN_ID")"
+          validation_run_attempt="$(jq -er '.run_attempt' <<< "$latest_run_json")"
+          [[ "$validation_run_attempt" =~ ^[1-9][0-9]{0,9}$ ]]
+          run_json="$(gh api "/repos/$REPOSITORY/actions/runs/$VALIDATION_RUN_ID/attempts/$validation_run_attempt")"
+          expected_title="Validate exact $EXPECTED_PHASE release source"
+          jq -e \
+            --arg repository "$REPOSITORY" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg expected_title "$expected_title" \
+            --argjson run_id "$VALIDATION_RUN_ID" \
+            --argjson run_attempt "$validation_run_attempt" \
+            --argjson workflow_id "$workflow_id" '
+              .id == $run_id and
+              .run_attempt == $run_attempt and
+              .workflow_id == $workflow_id and
+              .repository.full_name == $repository and
+              .event == "workflow_dispatch" and
+              .status == "completed" and
+              .conclusion == "success" and
+              .head_branch == "main" and
+              .head_sha == $control_sha and
+              .path == ".github/workflows/validate-exact-release-source.yml" and
+              .display_title == $expected_title
+            ' <<< "$run_json" > /dev/null
+
+          jobs_json="$(gh api "/repos/$REPOSITORY/actions/runs/$VALIDATION_RUN_ID/attempts/$validation_run_attempt/jobs?per_page=100")"
+          jq -e --argjson run_attempt "$validation_run_attempt" '
+              ([.jobs[] | select(.name == "Exact source validation gate")] | length) == 1 and
+              ([.jobs[] | select(
+                .name == "Exact source validation gate" and
+                .run_attempt == $run_attempt and
+                .status == "completed" and
+              .conclusion == "success"
+            )] | length) == 1
+          ' <<< "$jobs_json" > /dev/null
+
+          validation_run_url="$(jq -er '.html_url' <<< "$run_json")"
+          {
+            printf 'validation_run_id=%s\n' "$VALIDATION_RUN_ID"
+            printf 'validation_run_attempt=%s\n' "$validation_run_attempt"
+            printf 'validation_run_url=%s\n' "$validation_run_url"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the exact reviewed product source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.source.outputs.source_sha }}
+          fetch-depth: 1
+          path: source
+          persist-credentials: false
+
+      - name: Reverify source trees and immutable packaging materials
+        env:
+          EXPECTED_FRONTEND_TREE: ${{ steps.source.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ steps.source.outputs.internal_tree }}
+          EXPECTED_ROOT_TREE: ${{ steps.source.outputs.root_tree }}
+          EXPECTED_SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C source rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git -C source show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git -C source rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git -C source rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          git -C source diff --exit-code
+          [[ -z "$(git -C source status --porcelain)" ]]
+
+          require_control_blob() {
+            local path="$1"
+            local mode type object entry_path control_root resolved
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            [[ "$path" != /* && "$path" != *".."* ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+            read -r mode type object entry_path < <(git -C control ls-tree HEAD -- "$path")
+            [[ "$mode" == "100644" && "$type" == "blob" && "$entry_path" == "$path" ]]
+            [[ "$(git hash-object "control/$path")" == "$object" ]]
+            control_root="$(realpath -e control)"
+            resolved="$(realpath -e -- "control/$path")"
+            [[ "$resolved" == "$control_root/"* ]]
+          }
+
+          require_control_blob "$SOURCE_MANIFEST_PATH"
+          manifest="control/$SOURCE_MANIFEST_PATH"
+          expected_dockerfiles="$RUNNER_TEMP/expected-dockerfiles.txt"
+          committed_dockerfiles="$RUNNER_TEMP/committed-dockerfiles.txt"
+
+          jq -r '.release.components[].dockerfile' "$manifest" | sort -u > "$expected_dockerfiles"
+          git -C control ls-tree -r --name-only HEAD -- docker/release | sort -u > "$committed_dockerfiles"
+          diff -u "$expected_dockerfiles" "$committed_dockerfiles"
+          while IFS= read -r dockerfile; do
+            require_control_blob "$dockerfile"
+            [[ "$dockerfile" =~ ^docker/release/[a-z-]+\.Dockerfile$ ]]
+          done < <(jq -r '.release.components[].dockerfile' "$manifest" | sort -u)
+
+          python3 - "$manifest" <<'PY'
+          import hashlib
+          import json
+          import re
+          import shlex
+          import sys
+          from pathlib import Path
+
+          manifest_path = Path(sys.argv[1])
+          control_root = manifest_path.parents[1]
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          components = manifest["release"]["components"]
+          materials = manifest["release"]["materials"]
+
+          # These are deliberately duplicated outside the mutable manifest. A
+          # release-Dockerfile change must update the protected workflow as an
+          # explicit control change; refreshing only the manifest cannot bless
+          # new package managers, downloaders, or weakened runtime setup.
+          approved_dockerfile_sha256 = {
+              "docker/release/web.Dockerfile": "6c5b065797072000d66124120ea6da940858b54a2a8bcf3b5595f3719cf03582",
+              "docker/release/meta-relay.Dockerfile": "38a6dcceaa252750f4ffd016002687423f062b15d8b47f6478af2185b628eb25",
+              "docker/release/gmail-relay.Dockerfile": "f0c2ac09e585b3504123c1a5d336658dca5a52a0124a04aace202fb61a98a098",
+          }
+          manifest_dockerfile_sha256 = {
+              component["dockerfile"]: component["dockerfile_sha256"]
+              for component in components.values()
+          }
+          if manifest_dockerfile_sha256 != approved_dockerfile_sha256:
+              raise SystemExit("release Dockerfile allowlist differs from the protected control")
+
+          expected_bases = sorted(
+              (
+                  use["dockerfile"],
+                  use["stage"] or "-",
+                  f'{item["name"]}@{item["digest"]}',
+              )
+              for item in materials["base_images"]
+              for use in item["uses"]
+          )
+          expected_downloads = sorted(
+              (
+                  item["dockerfile"],
+                  item["stage"] or "-",
+                  item["url"],
+                  item["sha256"],
+                  item["destination"],
+              )
+              for item in materials["direct_downloads"]
+          )
+          expected_scratch = sorted(
+              (item["dockerfile"], item["stage"] or "-")
+              for item in materials["scratch_stages"]
+          )
+          expected_packages = materials["ubuntu_snapshot"]["packages"]
+          snapshot_dockerfile = materials["ubuntu_snapshot"]["dockerfile"]
+          snapshot_id = materials["ubuntu_snapshot"]["id"]
+
+          actual_bases = []
+          actual_downloads = []
+          actual_scratch = []
+          apt_installs = []
+          snapshot_args = []
+
+          def logical_instructions(text: str, dockerfile: str):
+              instructions = []
+              buffer = ""
+              start_line = 0
+              first_keyword = None
+              for line_number, raw in enumerate(text.splitlines(), start=1):
+                  if re.match(r"^[ \t]*#[ \t]*(syntax|escape|check)[ \t]*=", raw, re.I):
+                      raise SystemExit(f"{dockerfile}:{line_number}: Docker parser directives are forbidden")
+                  if not buffer and (not raw.strip() or raw.lstrip().startswith("#")):
+                      continue
+                  if not buffer:
+                      start_line = line_number
+                      match = re.match(r"^[ \t]*([A-Za-z]+)\b", raw)
+                      if not match:
+                          raise SystemExit(f"{dockerfile}:{line_number}: malformed Docker instruction")
+                      first_keyword = match.group(1).lower()
+                      buffer = raw.strip()
+                  else:
+                      buffer += " " + raw.strip()
+                  continued = re.search(r"\\[ \t]*$", raw) is not None
+                  if continued:
+                      if first_keyword in {"from", "add", "copy"}:
+                          raise SystemExit(
+                              f"{dockerfile}:{start_line}: continued {first_keyword.upper()} is forbidden"
+                          )
+                      buffer = re.sub(r"\\[ \t]*$", " ", buffer).rstrip()
+                      continue
+                  instructions.append((start_line, buffer))
+                  buffer = ""
+                  first_keyword = None
+              if buffer:
+                  raise SystemExit(f"{dockerfile}:{start_line}: unterminated continuation")
+              return instructions
+
+          for component in components.values():
+              dockerfile = component["dockerfile"]
+              path = control_root / dockerfile
+              raw = path.read_bytes()
+              actual_hash = hashlib.sha256(raw).hexdigest()
+              if actual_hash != component["dockerfile_sha256"]:
+                  raise SystemExit(f"{dockerfile}: Dockerfile SHA-256 mismatch")
+              text = raw.decode("utf-8")
+              aliases = set()
+              current_stage = "-"
+              from_count = 0
+
+              for line_number, logical in logical_instructions(text, dockerfile):
+                  match = re.match(r"^[ \t]*([A-Za-z]+)(?:[ \t]+(.*))?$", logical)
+                  if not match:
+                      raise SystemExit(f"{dockerfile}:{line_number}: malformed logical instruction")
+                  keyword = match.group(1).lower()
+                  operands = (match.group(2) or "").strip()
+
+                  if keyword == "from":
+                      from_count += 1
+                      scratch = re.fullmatch(
+                          r"scratch(?:[ \t]+as[ \t]+([A-Za-z0-9._-]+))?",
+                          operands,
+                          re.I,
+                      )
+                      pinned = re.fullmatch(
+                          r"--platform=linux/amd64[ \t]+([^ \t]+@sha256:[0-9a-f]{64})"
+                          r"(?:[ \t]+as[ \t]+([A-Za-z0-9._-]+))?",
+                          operands,
+                          re.I,
+                      )
+                      if scratch:
+                          current_stage = scratch.group(1) or "-"
+                          actual_scratch.append((dockerfile, current_stage))
+                      elif pinned:
+                          current_stage = pinned.group(2) or "-"
+                          actual_bases.append((dockerfile, current_stage, pinned.group(1)))
+                      else:
+                          raise SystemExit(f"{dockerfile}:{line_number}: unpinned or unsupported FROM")
+                      if current_stage != "-":
+                          if current_stage in aliases:
+                              raise SystemExit(f"{dockerfile}:{line_number}: duplicate stage alias")
+                          aliases.add(current_stage)
+
+                  elif keyword == "add":
+                      remote = re.fullmatch(
+                          r"--checksum=sha256:([0-9a-f]{64})[ \t]+(https://[^ \t]+)[ \t]+([^ \t]+)",
+                          operands,
+                      )
+                      if not remote:
+                          raise SystemExit(f"{dockerfile}:{line_number}: unsupported ADD material")
+                      actual_downloads.append(
+                          (dockerfile, current_stage, remote.group(2), remote.group(1), remote.group(3))
+                      )
+
+                  elif keyword == "copy":
+                      from_tokens = re.findall(r"(?:^|[ \t])--from=([^ \t]+)", operands, re.I)
+                      from_markers = re.findall(r"(?:^|[ \t])--from(?==|[ \t])", operands, re.I)
+                      if from_markers:
+                          if len(from_markers) != 1 or len(from_tokens) != 1:
+                              raise SystemExit(f"{dockerfile}:{line_number}: malformed COPY --from")
+                          if from_tokens[0] not in aliases:
+                              raise SystemExit(f"{dockerfile}:{line_number}: external COPY --from is forbidden")
+
+                  elif keyword == "run":
+                      if operands.startswith("--"):
+                          raise SystemExit(f"{dockerfile}:{line_number}: RUN options are forbidden")
+                      if re.search(r"--mount(?:=|[ \t])", operands, re.I):
+                          raise SystemExit(f"{dockerfile}:{line_number}: RUN --mount is forbidden")
+                      if re.search(
+                          r"resolve/main|:latest(?:[ \t@]|$)|"
+                          r"\b(?:curl|wget|apk|git)\b|\bfetch[ \t]*\(",
+                          operands,
+                          re.I,
+                      ):
+                          raise SystemExit(f"{dockerfile}:{line_number}: mutable downloader/reference is forbidden")
+
+                      # Remove the three exact apt-related literals used by the
+                      # approved snapshot contract, then reject every remaining
+                      # apt/aptitude token regardless of options or JSON form.
+                      unsupported_apt_probe = re.sub(
+                          r"APT::Snapshot|/etc/apt/apt\.conf\.d/50snapshot|"
+                          r"/var/lib/apt/lists/\*|\bapt-(?:get|cache)\b",
+                          "",
+                          operands,
+                          flags=re.I,
+                      )
+                      if re.search(r"\b(?:apt|aptitude)\b", unsupported_apt_probe, re.I):
+                          raise SystemExit(f"{dockerfile}:{line_number}: unsupported package installer is forbidden")
+
+                      apt_get_uses = list(re.finditer(r"\bapt-get\b", operands, re.I))
+                      for apt_get_use in apt_get_uses:
+                          suffix = operands[apt_get_use.end():]
+                          command = re.match(r"[ \t]+(update|install)\b", suffix, re.I)
+                          if not command:
+                              raise SystemExit(f"{dockerfile}:{line_number}: unsupported apt-get invocation")
+                          if command.group(1).lower() == "update":
+                              update_tail = suffix[command.end():]
+                              update_span = re.split(
+                                  r"[ \t]*(?:&&|\|\||;|\|)[ \t]*",
+                                  update_tail,
+                                  maxsplit=1,
+                              )[0]
+                              if shlex.split(update_span, posix=True):
+                                  raise SystemExit(f"{dockerfile}:{line_number}: non-canonical apt-get update")
+
+                      installs = list(re.finditer(r"\bapt-get[ \t]+install\b", operands, re.I))
+                      if installs:
+                          if len(installs) != 1:
+                              raise SystemExit(f"{dockerfile}:{line_number}: multiple apt-get install invocations")
+                          install_prefix = operands[:installs[0].start()]
+                          if not re.search(
+                              r"(?:^|&&|;|\|\|)[ \t]*"
+                              r"DEBIAN_FRONTEND=noninteractive[ \t]+"
+                              r"TZ=Etc/UTC[ \t]+$",
+                              install_prefix,
+                          ):
+                              raise SystemExit(f"{dockerfile}:{line_number}: missing canonical inline apt environment")
+                          tail = operands[installs[0].end():].lstrip()
+                          install_span = re.split(r"[ \t]*(?:&&|\|\||;|\|)[ \t]*", tail, maxsplit=1)[0]
+                          tokens = shlex.split(install_span, posix=True)
+                          if tokens[:2] != ["-y", "--no-install-recommends"]:
+                              raise SystemExit(f"{dockerfile}:{line_number}: non-canonical apt flags")
+                          packages = {}
+                          for token in tokens[2:]:
+                              package = re.fullmatch(r"([a-z0-9][a-z0-9+.-]*)=([^ \t$`]+)", token)
+                              if not package or package.group(1) in packages:
+                                  raise SystemExit(f"{dockerfile}:{line_number}: invalid/duplicate apt operand")
+                              packages[package.group(1)] = package.group(2)
+                          apt_installs.append((dockerfile, packages))
+
+                  elif keyword == "arg" and operands.lower().startswith("ubuntu_snapshot="):
+                      snapshot_args.append((dockerfile, operands.split("=", 1)[1]))
+
+                  elif keyword in {"onbuild", "shell"}:
+                      raise SystemExit(f"{dockerfile}:{line_number}: {keyword.upper()} is forbidden")
+
+              if from_count == 0:
+                  raise SystemExit(f"{dockerfile}: no FROM instructions")
+
+          if sorted(actual_bases) != expected_bases:
+              raise SystemExit(f"base-image uses differ: actual={sorted(actual_bases)!r}")
+          if sorted(actual_downloads) != expected_downloads:
+              raise SystemExit(f"remote ADD materials differ: actual={sorted(actual_downloads)!r}")
+          if sorted(actual_scratch) != expected_scratch:
+              raise SystemExit(f"scratch stages differ: actual={sorted(actual_scratch)!r}")
+          if apt_installs != [(snapshot_dockerfile, expected_packages)]:
+              raise SystemExit(f"APT package map differs: actual={apt_installs!r}")
+          if snapshot_args != [(snapshot_dockerfile, snapshot_id)]:
+              raise SystemExit(f"Ubuntu snapshot ARG differs: actual={snapshot_args!r}")
+
+          mode_materials = [
+              item for item in materials["direct_downloads"] if item["runtime_mode"] is not None
+          ]
+          if sorted((item["runtime_mode"], item["runtime_path"]) for item in mode_materials) != [
+              ("0644", "/opt/piper/models/en_US-lessac-medium.onnx"),
+              ("0644", "/opt/piper/models/en_US-lessac-medium.onnx.json"),
+          ]:
+              raise SystemExit("runtime model modes/paths differ from the exact contract")
+          PY
+
+  build:
+    name: Build and publish ${{ matrix.component }}
+    needs: authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write # Publish only the three allowlisted GHCR image packages.
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.authority.outputs.matrix) }}
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Check out protected release controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Check out exact product source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.source_sha }}
+          fetch-depth: 1
+          path: source
+          persist-credentials: false
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Reverify source and release control identity
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          EXPECTED_DOCKERFILE_SHA256: ${{ matrix.dockerfile_sha256 }}
+          EXPECTED_FRONTEND_TREE: ${{ needs.authority.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ needs.authority.outputs.internal_tree }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.authority.outputs.source_manifest_sha256 }}
+          EXPECTED_ROOT_TREE: ${{ needs.authority.outputs.root_tree }}
+          EXPECTED_SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          require_control_blob() {
+            local path="$1"
+            local mode type object entry_path control_root resolved
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            [[ "$path" != /* && "$path" != *".."* ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+            read -r mode type object entry_path < <(git -C control ls-tree HEAD -- "$path")
+            [[ "$mode" == "100644" && "$type" == "blob" && "$entry_path" == "$path" ]]
+            [[ "$(git hash-object "control/$path")" == "$object" ]]
+            control_root="$(realpath -e control)"
+            resolved="$(realpath -e -- "control/$path")"
+            [[ "$resolved" == "$control_root/"* ]]
+          }
+          require_control_blob "$SOURCE_MANIFEST_PATH"
+          require_control_blob "$DOCKERFILE"
+          [[ "$(sha256sum "control/$SOURCE_MANIFEST_PATH" | awk '{print $1}')" == "$EXPECTED_MANIFEST_SHA256" ]]
+          [[ "$(sha256sum "control/$DOCKERFILE" | awk '{print $1}')" == "$EXPECTED_DOCKERFILE_SHA256" ]]
+          [[ "$(git -C source rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git -C source show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git -C source rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git -C source rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+          [[ -z "$(git -C source status --porcelain)" ]]
+
+      - name: Install pinned Docker Buildx and start pinned BuildKit
+        run: |
+          set -euo pipefail
+          plugin_dir="$HOME/.docker/cli-plugins"
+          mkdir -p "$plugin_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_BUILDX_URL" -o "$plugin_dir/docker-buildx"
+          echo "$PINNED_BUILDX_SHA256  $plugin_dir/docker-buildx" | sha256sum -c -
+          chmod 0755 "$plugin_dir/docker-buildx"
+          [[ "$(docker buildx version | awk '{print $2}')" == "$PINNED_BUILDX_VERSION" ]]
+          docker buildx create \
+            --name rereply-release \
+            --driver docker-container \
+            --driver-opt "image=$PINNED_BUILDKIT_IMAGE" \
+            --use
+          docker buildx inspect --bootstrap rereply-release
+
+      - name: Create a unique non-authority tag
+        id: identity
+        env:
+          COMPONENT: ${{ matrix.component }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          IMAGE: ${{ matrix.image }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$COMPONENT" =~ ^(web|meta-relay|gmail-relay)$ ]]
+          [[ "$IMAGE" =~ ^ghcr\.io/medtechcorps-netizen/rereply-release-(web|meta-relay|gmail-relay)$ ]]
+          tag="${PHASE}-${SOURCE_SHA:0:12}-control-${CONTROL_SHA:0:12}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "$tag" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'image_ref=%s:%s\n' "$IMAGE" "$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build the exact AMD64 image without registry credentials
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./source
+          file: ./control/${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          pull: true
+          no-cache: true
+          provenance: false
+          sbom: false
+          builder: rereply-release
+          # The build uses a verified local checkout, so do not expose the
+          # workflow token to BuildKit as a Git authentication secret.
+          github-token: ""
+          tags: ${{ steps.identity.outputs.image_ref }}
+          build-args: |
+            TARGETOS=linux
+            TARGETARCH=amd64
+            UBUNTU_SNAPSHOT=20260824T000000Z
+          labels: |
+            org.opencontainers.image.source=https://github.com/medtechcorps-netizen/whatomate
+            org.opencontainers.image.revision=${{ needs.authority.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.authority.outputs.phase }}-${{ needs.authority.outputs.source_sha }}
+            org.opencontainers.image.title=rereply-release-${{ matrix.component }}
+            io.rereply.release.phase=${{ needs.authority.outputs.phase }}
+            io.rereply.release.control-sha=${{ needs.authority.outputs.control_sha }}
+
+      - name: Recheck live main and publish the unique non-authority tag
+        id: publish
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ matrix.image }}
+          IMAGE_REF: ${{ steps.identity.outputs.image_ref }}
+          REGISTRY_USER: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+          [[ "$IMAGE_REF" == "$IMAGE:"* ]]
+
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          docker push "$IMAGE_REF" 2>&1 | tee docker-push.txt
+          mapfile -t pushed_digests < <(
+            sed -nE 's/^.*digest:[[:space:]]*(sha256:[0-9a-f]{64})([[:space:]].*)?$/\1/p' docker-push.txt
+          )
+          [[ "${#pushed_digests[@]}" -eq 1 ]]
+          digest="${pushed_digests[0]}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$IMAGE@$digest" --raw > published-manifest.json
+          [[ -s published-manifest.json && -f published-manifest.json && ! -L published-manifest.json ]]
+          manifest_sha256="$(sha256sum published-manifest.json | awk '{print $1}')"
+          [[ "sha256:$manifest_sha256" == "$digest" ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Record the published digest
+        env:
+          COMPONENT: ${{ matrix.component }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          EXPECTED_DOCKERFILE_SHA256: ${{ matrix.dockerfile_sha256 }}
+          IMAGE: ${{ matrix.image }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          SOURCE_MANIFEST_SHA256: ${{ needs.authority.outputs.source_manifest_sha256 }}
+          SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          VALIDATION_RUN_ID: ${{ needs.authority.outputs.validation_run_id }}
+          VALIDATION_RUN_ATTEMPT: ${{ needs.authority.outputs.validation_run_attempt }}
+          VALIDATION_RUN_URL: ${{ needs.authority.outputs.validation_run_url }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ -s published-manifest.json && -f published-manifest.json && ! -L published-manifest.json ]]
+          cp -- published-manifest.json remote-descriptor.json
+          [[ -s remote-descriptor.json && -f remote-descriptor.json && ! -L remote-descriptor.json ]]
+          descriptor_sha256="$(sha256sum remote-descriptor.json | awk '{print $1}')"
+          [[ "sha256:$descriptor_sha256" == "$DIGEST" ]]
+          dockerfile_sha256="$(sha256sum "control/$DOCKERFILE" | awk '{print $1}')"
+          [[ "$dockerfile_sha256" == "$EXPECTED_DOCKERFILE_SHA256" ]]
+          runtime="$(jq -c --arg component "$COMPONENT" '.release.components[$component] | {user, working_dir, entrypoint, cmd, port, smoke}' "control/$SOURCE_MANIFEST_PATH")"
+
+          jq -n \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg descriptor_sha256 "$descriptor_sha256" \
+            --arg digest "$DIGEST" \
+            --arg dockerfile "$DOCKERFILE" \
+            --arg dockerfile_sha256 "$dockerfile_sha256" \
+            --arg image "$IMAGE" \
+            --arg phase "$PHASE" \
+            --arg platform "linux/amd64" \
+            --arg source_manifest_sha256 "$SOURCE_MANIFEST_SHA256" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg tag "$TAG" \
+            --arg validation_run_id "$VALIDATION_RUN_ID" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" \
+            --arg validation_run_url "$VALIDATION_RUN_URL" \
+            --argjson runtime "$runtime" '
+              {
+                schema_version: 1,
+                component: $component,
+                phase: $phase,
+                source_sha: $source_sha,
+                source_manifest_sha256: $source_manifest_sha256,
+                control_sha: $control_sha,
+                validation_run_id: $validation_run_id,
+                validation_run_url: $validation_run_url,
+                image: $image,
+                digest: $digest,
+                platform: $platform,
+                tag: $tag,
+                tag_is_authority: false,
+                dockerfile: $dockerfile,
+                dockerfile_sha256: $dockerfile_sha256,
+                remote_descriptor_sha256: $descriptor_sha256,
+                validation_run_attempt: $validation_run_attempt,
+                runtime: $runtime
+              }
+            ' > image.json
+          jq -e '.tag_is_authority == false and (.digest | test("^sha256:[0-9a-f]{64}$"))' image.json > /dev/null
+
+      - name: Upload immutable image identity
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            image.json
+            remote-descriptor.json
+          if-no-files-found: error
+          retention-days: 90
+
+  scan:
+    name: Scan, SBOM, and verify ${{ matrix.component }}
+    needs:
+      - authority
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read # Pull the just-published exact digest for inspection and scans.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.authority.outputs.matrix) }}
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Download immutable image identity
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+
+      - name: Require the exact image identity artifact inventory
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import stat
+
+          expected = {"image.json", "remote-descriptor.json"}
+          root = "evidence"
+          if not stat.S_ISDIR(os.lstat(root).st_mode):
+              raise SystemExit("evidence is not a real directory")
+          entries = list(os.scandir(root))
+          if {entry.name for entry in entries} != expected:
+              raise SystemExit(f"unexpected image artifact inventory: {[entry.name for entry in entries]!r}")
+          for entry in entries:
+              if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit(f"artifact entry is not a regular non-symlink file: {entry.name}")
+          PY
+
+      - name: Install pinned jq, Trivy, and Syft
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_TRIVY_URL" -o "$RUNNER_TEMP/trivy.tar.gz"
+          echo "$PINNED_TRIVY_SHA256  $RUNNER_TEMP/trivy.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$tools_dir" trivy
+          [[ "$("$tools_dir/trivy" --version | awk '/^Version:/ {print $2; exit}')" == "$PINNED_TRIVY_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_SYFT_URL" -o "$RUNNER_TEMP/syft.tar.gz"
+          echo "$PINNED_SYFT_SHA256  $RUNNER_TEMP/syft.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/syft.tar.gz" -C "$tools_dir" syft
+          "$tools_dir/syft" version | grep -Eq "^[[:space:]]*Version:[[:space:]]+$PINNED_SYFT_VERSION$"
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Validate the image identity artifact
+        env:
+          COMPONENT: ${{ matrix.component }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          EXPECTED_DOCKERFILE_SHA256: ${{ matrix.dockerfile_sha256 }}
+          IMAGE: ${{ matrix.image }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          SOURCE_MANIFEST_SHA256: ${{ needs.authority.outputs.source_manifest_sha256 }}
+          SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+          VALIDATION_RUN_ID: ${{ needs.authority.outputs.validation_run_id }}
+          VALIDATION_RUN_ATTEMPT: ${{ needs.authority.outputs.validation_run_attempt }}
+        run: |
+          set -euo pipefail
+          jq -e \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg dockerfile "$DOCKERFILE" \
+            --arg expected_dockerfile_sha256 "$EXPECTED_DOCKERFILE_SHA256" \
+            --arg image "$IMAGE" \
+            --arg phase "$PHASE" \
+            --arg source_manifest_sha256 "$SOURCE_MANIFEST_SHA256" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg validation_run_id "$VALIDATION_RUN_ID" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" '
+              .schema_version == 1 and
+              .component == $component and
+              .control_sha == $control_sha and
+              .dockerfile == $dockerfile and
+              .dockerfile_sha256 == $expected_dockerfile_sha256 and
+              .image == $image and
+              .phase == $phase and
+              .source_manifest_sha256 == $source_manifest_sha256 and
+              .source_sha == $source_sha and
+              .validation_run_id == $validation_run_id and
+              .validation_run_attempt == $validation_run_attempt and
+              .platform == "linux/amd64" and
+              .tag_is_authority == false and
+              (.digest | test("^sha256:[0-9a-f]{64}$"))
+            ' evidence/image.json > /dev/null
+          digest="$(jq -er '.digest' evidence/image.json)"
+          descriptor_sha256="$(sha256sum evidence/remote-descriptor.json | awk '{print $1}')"
+          [[ "sha256:$descriptor_sha256" == "$digest" ]]
+          [[ "$(jq -er '.remote_descriptor_sha256' evidence/image.json)" == "$descriptor_sha256" ]]
+          jq -e '
+            .schemaVersion == 2 and
+            (
+              .mediaType == "application/vnd.oci.image.manifest.v1+json" or
+              .mediaType == "application/vnd.docker.distribution.manifest.v2+json"
+            ) and
+            (.config.digest | test("^sha256:[0-9a-f]{64}$")) and
+            (.layers | type == "array" and length > 0) and
+            all(.layers[]; .digest | test("^sha256:[0-9a-f]{64}$")) and
+            (has("manifests") | not)
+          ' evidence/remote-descriptor.json > /dev/null
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Pull the exact digest and verify its runtime contract
+        env:
+          COMPONENT: ${{ matrix.component }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          EXPECTED_CMD: ${{ toJSON(matrix.cmd) }}
+          EXPECTED_ENTRYPOINT: ${{ toJSON(matrix.entrypoint) }}
+          EXPECTED_PORT: ${{ matrix.port }}
+          EXPECTED_USER: ${{ matrix.user }}
+          EXPECTED_WORKING_DIR: ${{ matrix.working_dir }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          SMOKE: ${{ matrix.smoke }}
+          SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          image="$(jq -er '.image' evidence/image.json)"
+          digest="$(jq -er '.digest' evidence/image.json)"
+          image_ref="$image@$digest"
+          docker pull --platform linux/amd64 "$image_ref"
+          docker image inspect "$image_ref" > image-inspect.json
+
+          jq -e \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$digest" \
+            --arg expected_port "$EXPECTED_PORT" \
+            --arg expected_user "$EXPECTED_USER" \
+            --arg expected_working_dir "$EXPECTED_WORKING_DIR" \
+            --arg image "$image" \
+            --arg phase "$PHASE" \
+            --arg source_sha "$SOURCE_SHA" \
+            --argjson expected_cmd "$EXPECTED_CMD" \
+            --argjson expected_entrypoint "$EXPECTED_ENTRYPOINT" '
+              length == 1 and
+              .[0].Os == "linux" and
+              .[0].Architecture == "amd64" and
+              (.[0].RepoDigests | index($image + "@" + $digest) != null) and
+              .[0].Config.User == $expected_user and
+              .[0].Config.WorkingDir == $expected_working_dir and
+              .[0].Config.Entrypoint == $expected_entrypoint and
+              .[0].Config.Cmd == $expected_cmd and
+              (.[0].Config.ExposedPorts | has($expected_port)) and
+              .[0].Config.Labels["org.opencontainers.image.source"] == "https://github.com/medtechcorps-netizen/whatomate" and
+              .[0].Config.Labels["org.opencontainers.image.revision"] == $source_sha and
+              .[0].Config.Labels["org.opencontainers.image.version"] == ($phase + "-" + $source_sha) and
+              .[0].Config.Labels["org.opencontainers.image.title"] == ("rereply-release-" + $component) and
+              .[0].Config.Labels["io.rereply.release.phase"] == $phase and
+              .[0].Config.Labels["io.rereply.release.control-sha"] == $control_sha
+            ' image-inspect.json > /dev/null
+
+          case "$COMPONENT:$SMOKE" in
+            web:version)
+              docker run --rm --platform linux/amd64 --entrypoint /bin/sh "$image_ref" \
+                -ceu '
+                  uid="$(id -u)"
+                  test "$uid" -gt 0
+                  test "$(id -un)" = rereply
+                  model=/opt/piper/models/en_US-lessac-medium.onnx
+                  config=/opt/piper/models/en_US-lessac-medium.onnx.json
+                  test -s "$model" && test -r "$model" && test "$(stat -c %a "$model")" = 644
+                  test -s "$config" && test -r "$config" && test "$(stat -c %a "$config")" = 644
+                  test -s /etc/ssl/certs/ca-certificates.crt
+                  test -r /etc/ssl/certs/ca-certificates.crt
+                  test -x /usr/local/bin/piper
+                  test -d /usr/share/espeak-ng-data
+                  test -d /app/audio && test -w /app/audio
+                  printf "%s\n" "release image smoke test" |
+                    piper --model "$model" --output_file /app/audio/release-smoke.wav
+                  test -s /app/audio/release-smoke.wav
+                  opusenc --quiet /app/audio/release-smoke.wav /app/audio/release-smoke.ogg
+                  test -s /app/audio/release-smoke.ogg
+                  ffmpeg -nostdin -v error -i /app/audio/release-smoke.ogg -f null -
+                  test "$(stat -c %u /app/audio/release-smoke.wav)" = "$uid"
+                  test "$(stat -c %u /app/audio/release-smoke.ogg)" = "$uid"
+                '
+              docker run --rm --platform linux/amd64 "$image_ref" version
+              ;;
+            meta-relay:binary|gmail-relay:binary)
+              binary="$(jq -er '.runtime.entrypoint[0]' evidence/image.json)"
+              [[ "$binary" =~ ^/app/(meta-relay|gmail-relay)$ ]]
+              container_id="$(docker create --platform linux/amd64 "$image_ref")"
+              trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+              docker export "$container_id" > relay-rootfs.tar
+              tar -xOf relay-rootfs.tar etc/passwd | grep -Fx 'relay:x:65532:65532:ReReply relay:/app:/sbin/nologin'
+              tar -xOf relay-rootfs.tar etc/group | grep -Fx 'relay:x:65532:'
+              tar -xOf relay-rootfs.tar etc/ssl/certs/ca-certificates.crt > relay-ca-certificates.crt
+              [[ -s relay-ca-certificates.crt ]]
+              tar -tvf relay-rootfs.tar | grep -E -- "^-rwx[^[:space:]]*[[:space:]].*[[:space:]]${binary#/}$"
+              docker rm "$container_id" > /dev/null
+              trap - EXIT
+              ;;
+            *)
+              echo "::error::Unsupported runtime smoke contract."
+              exit 1
+              ;;
+          esac
+
+      - name: Download the exact pinned Trivy database
+        run: |
+          set -euo pipefail
+          export TRIVY_CACHE_DIR="$RUNNER_TEMP/trivy-cache"
+          trivy image \
+            --cache-dir "$TRIVY_CACHE_DIR" \
+            --db-repository "$PINNED_TRIVY_DB" \
+            --download-db-only \
+            --skip-version-check
+
+          metadata="$TRIVY_CACHE_DIR/db/metadata.json"
+          database="$TRIVY_CACHE_DIR/db/trivy.db"
+          [[ -s "$metadata" ]]
+          [[ -s "$database" ]]
+          updated_at="$(jq -er '.UpdatedAt // .updatedAt' "$metadata")"
+          updated_epoch="$(date -u -d "$updated_at" +%s)"
+          now_epoch="$(date -u +%s)"
+          age_seconds="$((now_epoch - updated_epoch))"
+          [[ "$age_seconds" -ge -3600 ]]
+          [[ "$age_seconds" -le 604800 ]]
+          sha256sum "$metadata" | awk '{print $1}' > trivy-db-metadata.sha256
+          sha256sum "$database" | awk '{print $1}' > trivy-db.sha256
+          printf '%s\n' "$updated_at" > trivy-db-updated-at.txt
+
+      - name: Fail on embedded secrets
+        run: |
+          set -euo pipefail
+          image="$(jq -er '.image' evidence/image.json)"
+          digest="$(jq -er '.digest' evidence/image.json)"
+          trivy image \
+            --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --skip-db-update \
+            --skip-version-check \
+            --scanners secret \
+            --image-config-scanners secret \
+            --exit-code 1 \
+            --format json \
+            --output secret-report.json \
+            --timeout 30m \
+            "$image@$digest"
+
+      - name: Fail on HIGH or CRITICAL vulnerabilities
+        run: |
+          set -euo pipefail
+          image="$(jq -er '.image' evidence/image.json)"
+          digest="$(jq -er '.digest' evidence/image.json)"
+          trivy image \
+            --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --skip-db-update \
+            --skip-version-check \
+            --scanners vuln \
+            --pkg-types os,library \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --format json \
+            --output vulnerability-report.json \
+            --timeout 30m \
+            "$image@$digest"
+
+      - name: Generate and validate the exact SPDX SBOM
+        env:
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+        run: |
+          set -euo pipefail
+          image="$(jq -er '.image' evidence/image.json)"
+          digest="$(jq -er '.digest' evidence/image.json)"
+          syft scan "docker:$image@$digest" --output spdx-json=sbom.spdx.json
+          jq -e '
+            .spdxVersion == "SPDX-2.3" and
+            (.documentNamespace | type == "string" and length > 0) and
+            (.packages | type == "array" and length > 0)
+          ' sbom.spdx.json > /dev/null
+
+      - name: Record scan and SBOM evidence
+        env:
+          COMPONENT: ${{ matrix.component }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          IMAGE: ${{ matrix.image }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          SOURCE_MANIFEST_SHA256: ${{ needs.authority.outputs.source_manifest_sha256 }}
+          SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+          TRIVY_DB_REFERENCE: ${{ env.PINNED_TRIVY_DB }}
+          VALIDATION_RUN_ID: ${{ needs.authority.outputs.validation_run_id }}
+          VALIDATION_RUN_ATTEMPT: ${{ needs.authority.outputs.validation_run_attempt }}
+        run: |
+          set -euo pipefail
+          cp evidence/image.json image.json
+          cp evidence/remote-descriptor.json remote-descriptor.json
+          digest="$(jq -er '.digest' image.json)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_inspect_sha256="$(sha256sum image-inspect.json | awk '{print $1}')"
+          remote_descriptor_sha256="$(sha256sum remote-descriptor.json | awk '{print $1}')"
+          sbom_sha256="$(sha256sum sbom.spdx.json | awk '{print $1}')"
+          secret_report_sha256="$(sha256sum secret-report.json | awk '{print $1}')"
+          vulnerability_report_sha256="$(sha256sum vulnerability-report.json | awk '{print $1}')"
+          trivy_db_sha256="$(cat trivy-db.sha256)"
+          trivy_db_metadata_sha256="$(cat trivy-db-metadata.sha256)"
+          trivy_db_updated_at="$(cat trivy-db-updated-at.txt)"
+          [[ "sha256:$remote_descriptor_sha256" == "$digest" ]]
+          [[ "$(jq -er '.remote_descriptor_sha256' image.json)" == "$remote_descriptor_sha256" ]]
+          jq -e '
+            .schemaVersion == 2 and
+            (
+              .mediaType == "application/vnd.oci.image.manifest.v1+json" or
+              .mediaType == "application/vnd.docker.distribution.manifest.v2+json"
+            ) and
+            (.config.digest | test("^sha256:[0-9a-f]{64}$")) and
+            (.layers | type == "array" and length > 0) and
+            all(.layers[]; .digest | test("^sha256:[0-9a-f]{64}$")) and
+            (has("manifests") | not)
+          ' remote-descriptor.json > /dev/null
+          jq -e '
+            (.Results | type == "array") and
+            ([.Results[]? | .Secrets[]?] | length == 0)
+          ' secret-report.json > /dev/null
+          jq -e '
+            (.Results | type == "array") and
+            ([.Results[]? | .Vulnerabilities[]? |
+              select(.Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0)
+          ' vulnerability-report.json > /dev/null
+          jq -e '
+            .spdxVersion == "SPDX-2.3" and
+            (.documentNamespace | type == "string" and length > 0) and
+            (.packages | type == "array" and length > 0)
+          ' sbom.spdx.json > /dev/null
+
+          jq -n \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$digest" \
+            --arg image "$IMAGE" \
+            --arg image_inspect_sha256 "$image_inspect_sha256" \
+            --arg phase "$PHASE" \
+            --arg platform "linux/amd64" \
+            --arg remote_descriptor_sha256 "$remote_descriptor_sha256" \
+            --arg sbom_sha256 "$sbom_sha256" \
+            --arg secret_report_sha256 "$secret_report_sha256" \
+            --arg source_manifest_sha256 "$SOURCE_MANIFEST_SHA256" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg syft_version "$PINNED_SYFT_VERSION" \
+            --arg trivy_db_metadata_sha256 "$trivy_db_metadata_sha256" \
+            --arg trivy_db_reference "$TRIVY_DB_REFERENCE" \
+            --arg trivy_db_sha256 "$trivy_db_sha256" \
+            --arg trivy_db_updated_at "$trivy_db_updated_at" \
+            --arg trivy_version "$PINNED_TRIVY_VERSION" \
+            --arg validation_run_id "$VALIDATION_RUN_ID" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" \
+            --arg vulnerability_report_sha256 "$vulnerability_report_sha256" '
+              {
+                schema_version: 1,
+                subject: {
+                  component: $component,
+                  image: $image,
+                  digest: $digest,
+                  platform: $platform
+                },
+                authority: {
+                  control_sha: $control_sha,
+                  phase: $phase,
+                  source_sha: $source_sha,
+                  source_manifest_sha256: $source_manifest_sha256,
+                  validation_run_id: $validation_run_id,
+                  validation_run_attempt: $validation_run_attempt
+                },
+                platform_contract: "passed",
+                runtime_contract: "passed",
+                image_inspect_sha256: $image_inspect_sha256,
+                remote_descriptor_sha256: $remote_descriptor_sha256,
+                secret_scan: {
+                  result: "passed",
+                  report_sha256: $secret_report_sha256
+                },
+                vulnerability_scan: {
+                  result: "passed",
+                  severities: ["HIGH", "CRITICAL"],
+                  report_sha256: $vulnerability_report_sha256
+                },
+                sbom: {
+                  format: "SPDX-2.3",
+                  sha256: $sbom_sha256,
+                  syft_version: $syft_version
+                },
+                trivy: {
+                  version: $trivy_version,
+                  database_reference: $trivy_db_reference,
+                  database_sha256: $trivy_db_sha256,
+                  metadata_sha256: $trivy_db_metadata_sha256,
+                  updated_at: $trivy_db_updated_at
+                }
+              }
+            ' > scan.json
+          jq -e \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$digest" \
+            --arg image "$IMAGE" \
+            --arg phase "$PHASE" \
+            --arg source_sha "$SOURCE_SHA" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" '
+              .subject == {
+                component: $component,
+                image: $image,
+                digest: $digest,
+                platform: "linux/amd64"
+              } and
+              .authority.control_sha == $control_sha and
+              .authority.phase == $phase and
+              .authority.source_sha == $source_sha and
+              .authority.validation_run_attempt == $validation_run_attempt and
+              .platform_contract == "passed" and
+              .runtime_contract == "passed"
+            ' scan.json > /dev/null
+          [[ "$(jq -er '.remote_descriptor_sha256' image.json)" == "$remote_descriptor_sha256" ]]
+
+      - name: Upload scan and SBOM evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scanned-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            image.json
+            image-inspect.json
+            remote-descriptor.json
+            scan.json
+            sbom.spdx.json
+            secret-report.json
+            vulnerability-report.json
+          if-no-files-found: error
+          retention-days: 90
+
+  attest:
+    name: Attest ${{ matrix.component }}
+    needs:
+      - authority
+      - scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      attestations: write # Store provenance, SBOM, and source-binding attestations.
+      contents: read
+      id-token: write # Obtain the short-lived Sigstore signing identity.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.authority.outputs.matrix) }}
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Check out protected release controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Download scan and SBOM evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: scanned-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+
+      - name: Require the exact scan artifact inventory
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import stat
+
+          expected = {
+              "image.json",
+              "image-inspect.json",
+              "remote-descriptor.json",
+              "scan.json",
+              "sbom.spdx.json",
+              "secret-report.json",
+              "vulnerability-report.json",
+          }
+          root = "evidence"
+          if not stat.S_ISDIR(os.lstat(root).st_mode):
+              raise SystemExit("evidence is not a real directory")
+          entries = list(os.scandir(root))
+          if {entry.name for entry in entries} != expected:
+              raise SystemExit(f"unexpected scan artifact inventory: {[entry.name for entry in entries]!r}")
+          for entry in entries:
+              if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit(f"artifact entry is not a regular non-symlink file: {entry.name}")
+          PY
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Build the exact source-binding predicate
+        env:
+          COMPONENT: ${{ matrix.component }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          EXPECTED_CMD: ${{ toJSON(matrix.cmd) }}
+          EXPECTED_DOCKERFILE_SHA256: ${{ matrix.dockerfile_sha256 }}
+          EXPECTED_ENTRYPOINT: ${{ toJSON(matrix.entrypoint) }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.authority.outputs.source_manifest_sha256 }}
+          EXPECTED_PORT: ${{ matrix.port }}
+          EXPECTED_USER: ${{ matrix.user }}
+          EXPECTED_WORKING_DIR: ${{ matrix.working_dir }}
+          FRONTEND_TREE: ${{ needs.authority.outputs.frontend_tree }}
+          IMAGE: ${{ matrix.image }}
+          INTERNAL_TREE: ${{ needs.authority.outputs.internal_tree }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          ROOT_TREE: ${{ needs.authority.outputs.root_tree }}
+          SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+          VALIDATION_RUN_ID: ${{ needs.authority.outputs.validation_run_id }}
+          VALIDATION_RUN_ATTEMPT: ${{ needs.authority.outputs.validation_run_attempt }}
+          VALIDATION_RUN_URL: ${{ needs.authority.outputs.validation_run_url }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          require_control_blob() {
+            local path="$1"
+            local mode type object entry_path control_root resolved
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            [[ "$path" != /* && "$path" != *".."* ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+            read -r mode type object entry_path < <(git -C control ls-tree HEAD -- "$path")
+            [[ "$mode" == "100644" && "$type" == "blob" && "$entry_path" == "$path" ]]
+            [[ "$(git hash-object "control/$path")" == "$object" ]]
+            control_root="$(realpath -e control)"
+            resolved="$(realpath -e -- "control/$path")"
+            [[ "$resolved" == "$control_root/"* ]]
+          }
+          require_control_blob "$SOURCE_MANIFEST_PATH"
+          require_control_blob "$DOCKERFILE"
+          [[ "$(sha256sum "control/$SOURCE_MANIFEST_PATH" | awk '{print $1}')" == "$EXPECTED_MANIFEST_SHA256" ]]
+          [[ "$(sha256sum "control/$DOCKERFILE" | awk '{print $1}')" == "$EXPECTED_DOCKERFILE_SHA256" ]]
+          cp evidence/image.json image.json
+          cp evidence/image-inspect.json image-inspect.json
+          cp evidence/remote-descriptor.json remote-descriptor.json
+          cp evidence/scan.json scan.json
+          cp evidence/sbom.spdx.json sbom.spdx.json
+          cp evidence/secret-report.json secret-report.json
+          cp evidence/vulnerability-report.json vulnerability-report.json
+
+          jq -e \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg dockerfile "$DOCKERFILE" \
+            --arg expected_dockerfile_sha256 "$EXPECTED_DOCKERFILE_SHA256" \
+            --arg expected_manifest_sha256 "$EXPECTED_MANIFEST_SHA256" \
+            --arg image "$IMAGE" \
+            --arg phase "$PHASE" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg validation_run_id "$VALIDATION_RUN_ID" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" \
+            --arg validation_run_url "$VALIDATION_RUN_URL" '
+              .component == $component and
+              .control_sha == $control_sha and
+              .dockerfile == $dockerfile and
+              .dockerfile_sha256 == $expected_dockerfile_sha256 and
+              .image == $image and
+              .phase == $phase and
+              .source_sha == $source_sha and
+              .source_manifest_sha256 == $expected_manifest_sha256 and
+              .validation_run_id == $validation_run_id and
+              .validation_run_attempt == $validation_run_attempt and
+              .validation_run_url == $validation_run_url and
+              .platform == "linux/amd64" and
+              .tag_is_authority == false and
+              (.digest | test("^sha256:[0-9a-f]{64}$"))
+            ' image.json > /dev/null
+
+          digest="$(jq -er '.digest' image.json)"
+          image="$(jq -er '.image' image.json)"
+          [[ "$(sha256sum image-inspect.json | awk '{print $1}')" == "$(jq -er '.image_inspect_sha256' scan.json)" ]]
+          [[ "$(sha256sum remote-descriptor.json | awk '{print $1}')" == "$(jq -er '.remote_descriptor_sha256' scan.json)" ]]
+          [[ "$(sha256sum sbom.spdx.json | awk '{print $1}')" == "$(jq -er '.sbom.sha256' scan.json)" ]]
+          [[ "$(sha256sum secret-report.json | awk '{print $1}')" == "$(jq -er '.secret_scan.report_sha256' scan.json)" ]]
+          [[ "$(sha256sum vulnerability-report.json | awk '{print $1}')" == "$(jq -er '.vulnerability_scan.report_sha256' scan.json)" ]]
+          [[ "$(jq -er '.remote_descriptor_sha256' image.json)" == "$(jq -er '.remote_descriptor_sha256' scan.json)" ]]
+          [[ "sha256:$(sha256sum remote-descriptor.json | awk '{print $1}')" == "$digest" ]]
+          jq -e '
+            .schemaVersion == 2 and
+            (
+              .mediaType == "application/vnd.oci.image.manifest.v1+json" or
+              .mediaType == "application/vnd.docker.distribution.manifest.v2+json"
+            ) and
+            (.config.digest | test("^sha256:[0-9a-f]{64}$")) and
+            (.layers | type == "array" and length > 0) and
+            all(.layers[]; .digest | test("^sha256:[0-9a-f]{64}$")) and
+            (has("manifests") | not)
+          ' remote-descriptor.json > /dev/null
+          jq -e '
+            (.Results | type == "array") and
+            ([.Results[]? | .Secrets[]?] | length == 0)
+          ' secret-report.json > /dev/null
+          jq -e '
+            (.Results | type == "array") and
+            ([.Results[]? | .Vulnerabilities[]? |
+              select(.Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0)
+          ' vulnerability-report.json > /dev/null
+          jq -e '
+            .spdxVersion == "SPDX-2.3" and
+            (.documentNamespace | type == "string" and length > 0) and
+            (.packages | type == "array" and length > 0)
+          ' sbom.spdx.json > /dev/null
+          jq -e \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$digest" \
+            --arg expected_port "$EXPECTED_PORT" \
+            --arg expected_user "$EXPECTED_USER" \
+            --arg expected_working_dir "$EXPECTED_WORKING_DIR" \
+            --arg image "$image" \
+            --arg phase "$PHASE" \
+            --arg source_sha "$SOURCE_SHA" \
+            --argjson expected_cmd "$EXPECTED_CMD" \
+            --argjson expected_entrypoint "$EXPECTED_ENTRYPOINT" '
+              length == 1 and
+              .[0].Os == "linux" and
+              .[0].Architecture == "amd64" and
+              (.[0].RepoDigests | index($image + "@" + $digest) != null) and
+              .[0].Config.User == $expected_user and
+              .[0].Config.WorkingDir == $expected_working_dir and
+              .[0].Config.Entrypoint == $expected_entrypoint and
+              .[0].Config.Cmd == $expected_cmd and
+              (.[0].Config.ExposedPorts | has($expected_port)) and
+              .[0].Config.Labels["org.opencontainers.image.source"] == "https://github.com/medtechcorps-netizen/whatomate" and
+              .[0].Config.Labels["org.opencontainers.image.revision"] == $source_sha and
+              .[0].Config.Labels["org.opencontainers.image.version"] == ($phase + "-" + $source_sha) and
+              .[0].Config.Labels["org.opencontainers.image.title"] == ("rereply-release-" + $component) and
+              .[0].Config.Labels["io.rereply.release.phase"] == $phase and
+              .[0].Config.Labels["io.rereply.release.control-sha"] == $control_sha
+            ' image-inspect.json > /dev/null
+          jq -e \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$digest" \
+            --arg image "$image" \
+            --arg manifest_sha256 "$EXPECTED_MANIFEST_SHA256" \
+            --arg phase "$PHASE" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg validation_run_id "$VALIDATION_RUN_ID" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" '
+            .subject == {
+              component: $component,
+              image: $image,
+              digest: $digest,
+              platform: "linux/amd64"
+            } and
+            .authority == {
+              control_sha: $control_sha,
+              phase: $phase,
+              source_sha: $source_sha,
+              source_manifest_sha256: $manifest_sha256,
+              validation_run_id: $validation_run_id,
+              validation_run_attempt: $validation_run_attempt
+            } and
+            .platform_contract == "passed" and
+            .runtime_contract == "passed" and
+            .secret_scan.result == "passed" and
+            .vulnerability_scan.result == "passed" and
+            .sbom.format == "SPDX-2.3"
+          ' scan.json > /dev/null
+
+          jq -n \
+            --arg buildkit_image "$PINNED_BUILDKIT_IMAGE" \
+            --arg buildx_sha256 "$PINNED_BUILDX_SHA256" \
+            --arg buildx_version "$PINNED_BUILDX_VERSION" \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg frontend_tree "$FRONTEND_TREE" \
+            --arg internal_tree "$INTERNAL_TREE" \
+            --arg phase "$PHASE" \
+            --arg repository "$RELEASE_REPOSITORY" \
+            --arg root_tree "$ROOT_TREE" \
+            --arg source_manifest_sha256 "$EXPECTED_MANIFEST_SHA256" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg validation_run_id "$VALIDATION_RUN_ID" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" \
+            --arg validation_run_url "$VALIDATION_RUN_URL" \
+            --arg workflow_path "$RELEASE_WORKFLOW_PATH" \
+            --argjson image "$(cat image.json)" \
+            --argjson materials "$(jq -c '.release.materials' "control/$SOURCE_MANIFEST_PATH")" \
+            --argjson verification "$(cat scan.json)" '
+              {
+                schema_version: 1,
+                phase: $phase,
+                source: {
+                  repository: $repository,
+                  commit: $source_sha,
+                  root_tree: $root_tree,
+                  frontend_tree: $frontend_tree,
+                  internal_tree: $internal_tree,
+                  manifest_sha256: $source_manifest_sha256
+                },
+                validation: {
+                  run_id: $validation_run_id,
+                  run_attempt: $validation_run_attempt,
+                  run_url: $validation_run_url
+                },
+                builder: {
+                  repository: $repository,
+                  workflow_path: $workflow_path,
+                  workflow_sha: $control_sha,
+                  runner_environment: "github-hosted",
+                  buildx: {
+                    version: $buildx_version,
+                    sha256: $buildx_sha256
+                  },
+                  buildkit_image: $buildkit_image,
+                  run_id: env.GITHUB_RUN_ID,
+                  run_attempt: env.GITHUB_RUN_ATTEMPT
+                },
+                image: ($image | {
+                  component,
+                  image,
+                  digest,
+                  platform,
+                  tag,
+                  tag_is_authority,
+                  dockerfile,
+                  dockerfile_sha256,
+                  remote_descriptor_sha256,
+                  runtime
+                }),
+                materials: $materials,
+                verification: $verification
+              }
+            ' > exact-source-predicate.json
+          jq -e --arg component "$COMPONENT" '.image.component == $component and .image.tag_is_authority == false' exact-source-predicate.json > /dev/null
+
+      - name: Read the attestation subject digest
+        id: read-image
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          [[ "$(jq -er '.image' image.json)" == "$IMAGE" ]]
+          digest="$(jq -er '.digest' image.json)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Require live main immediately before signing
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+
+      - name: Create standard GitHub provenance for the exact digest
+        id: exact-provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ matrix.image }}
+          subject-digest: ${{ steps.read-image.outputs.digest }}
+          push-to-registry: false
+
+      - name: Create SPDX SBOM attestation
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ matrix.image }}
+          subject-digest: ${{ steps.read-image.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: false
+
+      - name: Create exact source-binding attestation
+        id: source-binding
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ matrix.image }}
+          subject-digest: ${{ steps.read-image.outputs.digest }}
+          predicate-type: ${{ env.CUSTOM_IMAGE_PREDICATE }}
+          predicate-path: exact-source-predicate.json
+          push-to-registry: false
+
+      - name: Record attestation identities
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.exact-provenance.outputs.bundle-path }}
+          PROVENANCE_ID: ${{ steps.exact-provenance.outputs.attestation-id }}
+          PROVENANCE_URL: ${{ steps.exact-provenance.outputs.attestation-url }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+          SBOM_ID: ${{ steps.sbom.outputs.attestation-id }}
+          SBOM_URL: ${{ steps.sbom.outputs.attestation-url }}
+          SOURCE_BINDING_BUNDLE: ${{ steps.source-binding.outputs.bundle-path }}
+          SOURCE_BINDING_ID: ${{ steps.source-binding.outputs.attestation-id }}
+          SOURCE_BINDING_URL: ${{ steps.source-binding.outputs.attestation-url }}
+        run: |
+          set -euo pipefail
+          [[ -s "$PROVENANCE_BUNDLE" ]]
+          [[ -s "$SBOM_BUNDLE" ]]
+          [[ -s "$SOURCE_BINDING_BUNDLE" ]]
+          cp "$PROVENANCE_BUNDLE" provenance.bundle.json
+          cp "$SBOM_BUNDLE" sbom.bundle.json
+          cp "$SOURCE_BINDING_BUNDLE" source-binding.bundle.json
+          jq -n \
+            --arg provenance_id "$PROVENANCE_ID" \
+            --arg provenance_url "$PROVENANCE_URL" \
+            --arg sbom_id "$SBOM_ID" \
+            --arg sbom_url "$SBOM_URL" \
+            --arg source_binding_id "$SOURCE_BINDING_ID" \
+            --arg source_binding_url "$SOURCE_BINDING_URL" '
+              {
+                provenance: {id: $provenance_id, url: $provenance_url},
+                sbom: {id: $sbom_id, url: $sbom_url},
+                source_binding: {id: $source_binding_id, url: $source_binding_url}
+              }
+            ' > attestation-record.json
+
+      - name: Upload attestation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: attested-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            image.json
+            image-inspect.json
+            remote-descriptor.json
+            scan.json
+            sbom.spdx.json
+            secret-report.json
+            vulnerability-report.json
+            exact-source-predicate.json
+            attestation-record.json
+            provenance.bundle.json
+            sbom.bundle.json
+            source-binding.bundle.json
+          if-no-files-found: error
+          retention-days: 90
+
+  verify:
+    name: Verify attestations for ${{ matrix.component }}
+    needs:
+      - authority
+      - attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read # Resolve and authenticate the exact GHCR subject digest.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.authority.outputs.matrix) }}
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Download attestation evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: attested-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+
+      - name: Require the exact attestation artifact inventory
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import stat
+
+          expected = {
+              "image.json",
+              "image-inspect.json",
+              "remote-descriptor.json",
+              "scan.json",
+              "sbom.spdx.json",
+              "secret-report.json",
+              "vulnerability-report.json",
+              "exact-source-predicate.json",
+              "attestation-record.json",
+              "provenance.bundle.json",
+              "sbom.bundle.json",
+              "source-binding.bundle.json",
+          }
+          root = "evidence"
+          if not stat.S_ISDIR(os.lstat(root).st_mode):
+              raise SystemExit("evidence is not a real directory")
+          entries = list(os.scandir(root))
+          if {entry.name for entry in entries} != expected:
+              raise SystemExit(f"unexpected attestation artifact inventory: {[entry.name for entry in entries]!r}")
+          for entry in entries:
+              if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit(f"artifact entry is not a regular non-symlink file: {entry.name}")
+          PY
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Cryptographically verify every required attestation
+        env:
+          COMPONENT: ${{ matrix.component }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          EXPECTED_DOCKERFILE_SHA256: ${{ matrix.dockerfile_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ matrix.image }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_MANIFEST_SHA256: ${{ needs.authority.outputs.source_manifest_sha256 }}
+          SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+          VALIDATION_RUN_ID: ${{ needs.authority.outputs.validation_run_id }}
+          VALIDATION_RUN_ATTEMPT: ${{ needs.authority.outputs.validation_run_attempt }}
+        run: |
+          set -euo pipefail
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+          cp evidence/image.json image.json
+          cp evidence/image-inspect.json image-inspect.json
+          cp evidence/remote-descriptor.json remote-descriptor.json
+          cp evidence/scan.json scan.json
+          cp evidence/sbom.spdx.json sbom.spdx.json
+          cp evidence/secret-report.json secret-report.json
+          cp evidence/vulnerability-report.json vulnerability-report.json
+          cp evidence/exact-source-predicate.json exact-source-predicate.json
+          digest="$(jq -er '.digest' image.json)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -e \
+            --arg component "$COMPONENT" \
+            --arg dockerfile "$DOCKERFILE" \
+            --arg dockerfile_sha256 "$EXPECTED_DOCKERFILE_SHA256" \
+            --arg image "$IMAGE" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" '
+              .component == $component and
+              .dockerfile == $dockerfile and
+              .dockerfile_sha256 == $dockerfile_sha256 and
+              .image == $image and
+              .validation_run_attempt == $validation_run_attempt and
+              .tag_is_authority == false
+            ' image.json > /dev/null
+          [[ "$(sha256sum image-inspect.json | awk '{print $1}')" == "$(jq -er '.image_inspect_sha256' scan.json)" ]]
+          [[ "$(sha256sum remote-descriptor.json | awk '{print $1}')" == "$(jq -er '.remote_descriptor_sha256' scan.json)" ]]
+          [[ "$(sha256sum sbom.spdx.json | awk '{print $1}')" == "$(jq -er '.sbom.sha256' scan.json)" ]]
+          [[ "$(sha256sum secret-report.json | awk '{print $1}')" == "$(jq -er '.secret_scan.report_sha256' scan.json)" ]]
+          [[ "$(sha256sum vulnerability-report.json | awk '{print $1}')" == "$(jq -er '.vulnerability_scan.report_sha256' scan.json)" ]]
+          [[ "$(jq -er '.remote_descriptor_sha256' image.json)" == "$(jq -er '.remote_descriptor_sha256' scan.json)" ]]
+          [[ "sha256:$(sha256sum remote-descriptor.json | awk '{print $1}')" == "$digest" ]]
+          jq -e '
+            .schemaVersion == 2 and
+            (
+              .mediaType == "application/vnd.oci.image.manifest.v1+json" or
+              .mediaType == "application/vnd.docker.distribution.manifest.v2+json"
+            ) and
+            (.config.digest | test("^sha256:[0-9a-f]{64}$")) and
+            (.layers | type == "array" and length > 0) and
+            all(.layers[]; .digest | test("^sha256:[0-9a-f]{64}$")) and
+            (has("manifests") | not)
+          ' remote-descriptor.json > /dev/null
+          jq -e '
+            (.Results | type == "array") and
+            ([.Results[]? | .Secrets[]?] | length == 0)
+          ' secret-report.json > /dev/null
+          jq -e '
+            (.Results | type == "array") and
+            ([.Results[]? | .Vulnerabilities[]? |
+              select(.Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0)
+          ' vulnerability-report.json > /dev/null
+          jq -e '
+            .spdxVersion == "SPDX-2.3" and
+            (.documentNamespace | type == "string" and length > 0) and
+            (.packages | type == "array" and length > 0)
+          ' sbom.spdx.json > /dev/null
+          jq -e '
+            (keys == ["provenance", "sbom", "source_binding"]) and
+            all(.[];
+              (.id | type == "string" and length > 0) and
+              (.url | type == "string" and startswith("https://github.com/"))
+            )
+          ' evidence/attestation-record.json > /dev/null
+          jq -e \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$digest" \
+            --arg image "$IMAGE" \
+            --arg manifest_sha256 "$SOURCE_MANIFEST_SHA256" \
+            --arg phase "$PHASE" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg validation_run_id "$VALIDATION_RUN_ID" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" '
+              .subject == {
+                component: $component,
+                image: $image,
+                digest: $digest,
+                platform: "linux/amd64"
+              } and
+              .authority == {
+                control_sha: $control_sha,
+                phase: $phase,
+                source_sha: $source_sha,
+                source_manifest_sha256: $manifest_sha256,
+                validation_run_id: $validation_run_id,
+                validation_run_attempt: $validation_run_attempt
+              } and
+              .platform_contract == "passed" and
+              .runtime_contract == "passed" and
+              .secret_scan.result == "passed" and
+              .vulnerability_scan.result == "passed"
+            ' scan.json > /dev/null
+          subject="oci://$IMAGE@$digest"
+          signer_workflow="$RELEASE_REPOSITORY/$RELEASE_WORKFLOW_PATH"
+
+          common_flags=(
+            --repo "$RELEASE_REPOSITORY"
+            --signer-workflow "$signer_workflow"
+            --signer-digest "$CONTROL_SHA"
+            --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main
+            --deny-self-hosted-runners
+            --format json
+          )
+
+          gh attestation verify "$subject" "${common_flags[@]}" \
+            --bundle evidence/provenance.bundle.json \
+            --predicate-type https://slsa.dev/provenance/v1 > verified-provenance.json
+          gh attestation verify "$subject" "${common_flags[@]}" \
+            --bundle evidence/sbom.bundle.json \
+            --predicate-type "$SPDX_PREDICATE" > verified-sbom.json
+          gh attestation verify "$subject" "${common_flags[@]}" \
+            --bundle evidence/source-binding.bundle.json \
+            --predicate-type "$CUSTOM_IMAGE_PREDICATE" > verified-source-binding.json
+
+          jq -e 'type == "array" and length > 0' verified-provenance.json > /dev/null
+          jq -e --slurpfile expected sbom.spdx.json '
+            type == "array" and
+            any(.[]; .verificationResult.statement.predicate == $expected[0])
+          ' verified-sbom.json > /dev/null
+          jq -e --slurpfile expected exact-source-predicate.json '
+            type == "array" and
+            any(.[]; .verificationResult.statement.predicate == $expected[0])
+          ' verified-source-binding.json > /dev/null
+          jq -e \
+            --arg component "$COMPONENT" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg phase "$PHASE" \
+            --arg source_sha "$SOURCE_SHA" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" '
+              .image.component == $component and
+              .builder.workflow_sha == $control_sha and
+              .phase == $phase and
+              .source.commit == $source_sha and
+              .validation.run_attempt == $validation_run_attempt and
+              .image.tag_is_authority == false
+            ' exact-source-predicate.json > /dev/null
+
+      - name: Upload verified release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            image.json
+            image-inspect.json
+            remote-descriptor.json
+            scan.json
+            sbom.spdx.json
+            secret-report.json
+            vulnerability-report.json
+            exact-source-predicate.json
+            verified-provenance.json
+            verified-sbom.json
+            verified-source-binding.json
+          if-no-files-found: error
+          retention-days: 90
+
+  aggregate:
+    name: Aggregate the exact three-digest release set
+    needs:
+      - authority
+      - verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      attestations: write # Store provenance and source binding for the release set.
+      contents: read
+      id-token: write # Obtain the short-lived Sigstore signing identity.
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Download all verified component evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: verified-${{ needs.authority.outputs.phase }}-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verified
+          merge-multiple: false
+
+      - name: Require the exact verified-component artifact inventory
+        env:
+          PHASE: ${{ needs.authority.outputs.phase }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import stat
+
+          root = "verified"
+          phase = os.environ["PHASE"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          run_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          expected_components = {"gmail-relay", "meta-relay", "web"}
+          expected_directories = {
+              f"verified-{phase}-{component}-{run_id}-{run_attempt}"
+              for component in expected_components
+          }
+          expected_files = {
+              "image.json",
+              "image-inspect.json",
+              "remote-descriptor.json",
+              "scan.json",
+              "sbom.spdx.json",
+              "secret-report.json",
+              "vulnerability-report.json",
+              "exact-source-predicate.json",
+              "verified-provenance.json",
+              "verified-sbom.json",
+              "verified-source-binding.json",
+          }
+          if not stat.S_ISDIR(os.lstat(root).st_mode):
+              raise SystemExit("verified is not a real directory")
+          directories = list(os.scandir(root))
+          if {entry.name for entry in directories} != expected_directories:
+              raise SystemExit(f"unexpected verified artifact directories: {[entry.name for entry in directories]!r}")
+          for directory in directories:
+              if not stat.S_ISDIR(directory.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit(f"artifact entry is not a regular non-symlink directory: {directory.name}")
+              files = list(os.scandir(directory.path))
+              if {entry.name for entry in files} != expected_files:
+                  raise SystemExit(f"unexpected files in {directory.name}: {[entry.name for entry in files]!r}")
+              for entry in files:
+                  if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
+                      raise SystemExit(f"artifact entry is not a regular non-symlink file: {directory.name}/{entry.name}")
+          PY
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Build the digest-authoritative release set
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          EXPECTED_MATRIX: ${{ needs.authority.outputs.matrix }}
+          FRONTEND_TREE: ${{ needs.authority.outputs.frontend_tree }}
+          INTERNAL_TREE: ${{ needs.authority.outputs.internal_tree }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          ROOT_TREE: ${{ needs.authority.outputs.root_tree }}
+          SOURCE_MANIFEST_SHA256: ${{ needs.authority.outputs.source_manifest_sha256 }}
+          SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+          VALIDATION_RUN_ID: ${{ needs.authority.outputs.validation_run_id }}
+          VALIDATION_RUN_ATTEMPT: ${{ needs.authority.outputs.validation_run_attempt }}
+          VALIDATION_RUN_URL: ${{ needs.authority.outputs.validation_run_url }}
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < <(find verified -type f -name image.json | sort)
+          [[ "${#manifests[@]}" -eq 3 ]]
+
+          jq -s \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg frontend_tree "$FRONTEND_TREE" \
+            --arg internal_tree "$INTERNAL_TREE" \
+            --arg phase "$PHASE" \
+            --arg repository "$RELEASE_REPOSITORY" \
+            --arg root_tree "$ROOT_TREE" \
+            --arg source_manifest_sha256 "$SOURCE_MANIFEST_SHA256" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg validation_run_id "$VALIDATION_RUN_ID" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" \
+            --arg validation_run_url "$VALIDATION_RUN_URL" \
+            --argjson expected_matrix "$EXPECTED_MATRIX" '
+              sort_by(.component) as $images |
+              ($expected_matrix | sort_by(.component) | map({
+                component,
+                image,
+                dockerfile,
+                dockerfile_sha256,
+                platform: "linux/amd64"
+              })) as $expected_images |
+              if
+                ($images | length) == 3 and
+                ([$images[].component] == ["gmail-relay", "meta-relay", "web"]) and
+                ([$images[] | {component, image, dockerfile, dockerfile_sha256, platform}] == $expected_images) and
+                ([$images[].digest] | unique | length) == 3 and
+                ([$images[] | select(
+                  .control_sha == $control_sha and
+                  .phase == $phase and
+                  .source_sha == $source_sha and
+                  .source_manifest_sha256 == $source_manifest_sha256 and
+                  .validation_run_id == $validation_run_id and
+                  .validation_run_attempt == $validation_run_attempt and
+                  .validation_run_url == $validation_run_url and
+                  .platform == "linux/amd64" and
+                  .tag_is_authority == false and
+                  (.digest | test("^sha256:[0-9a-f]{64}$"))
+                )] | length) == 3
+              then
+                {
+                  schema_version: 1,
+                  authority: "digest-only",
+                  phase: $phase,
+                  source: {
+                    repository: $repository,
+                    commit: $source_sha,
+                    root_tree: $root_tree,
+                    frontend_tree: $frontend_tree,
+                    internal_tree: $internal_tree,
+                    manifest_sha256: $source_manifest_sha256
+                  },
+                  validation: {
+                    run_id: $validation_run_id,
+                    run_attempt: $validation_run_attempt,
+                    run_url: $validation_run_url
+                  },
+                  builder: {
+                    workflow_sha: $control_sha,
+                    run_id: env.GITHUB_RUN_ID,
+                    run_attempt: env.GITHUB_RUN_ATTEMPT,
+                    runner_environment: "github-hosted"
+                  },
+                  images: [$images[] | {
+                    component,
+                    image,
+                    digest,
+                    platform,
+                    tag,
+                    tag_is_authority,
+                    dockerfile,
+                    dockerfile_sha256
+                  }]
+                }
+              else
+                error("verified evidence is not the exact three-component release set")
+              end
+            ' "${manifests[@]}" > release-set.json
+          jq -e '.authority == "digest-only" and (.images | length) == 3 and ([.images[].digest] | unique | length) == 3' release-set.json > /dev/null
+          sha256sum release-set.json | awk '{print $1}' > release-set.sha256
+
+      - name: Require live main immediately before release-set signing
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+
+      - name: Create release-set provenance
+        id: release-set-provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: release-set.json
+          push-to-registry: false
+
+      - name: Create release-set source-binding attestation
+        id: release-set-binding
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: release-set.json
+          predicate-type: ${{ env.CUSTOM_SET_PREDICATE }}
+          predicate-path: release-set.json
+          push-to-registry: false
+
+      - name: Record release-set attestation bundles
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.release-set-provenance.outputs.bundle-path }}
+          SOURCE_BINDING_BUNDLE: ${{ steps.release-set-binding.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          [[ -s "$PROVENANCE_BUNDLE" ]]
+          [[ -s "$SOURCE_BINDING_BUNDLE" ]]
+          cp "$PROVENANCE_BUNDLE" release-set-provenance.bundle.json
+          cp "$SOURCE_BINDING_BUNDLE" release-set-source-binding.bundle.json
+
+      - name: Upload the exact release set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-set-${{ needs.authority.outputs.phase }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            release-set.json
+            release-set.sha256
+            release-set-provenance.bundle.json
+            release-set-source-binding.bundle.json
+          if-no-files-found: error
+          retention-days: 90
+
+  verify_set:
+    name: Verify exact release-set attestations
+    needs:
+      - authority
+      - aggregate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Download the exact release set
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-set-${{ needs.authority.outputs.phase }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+
+      - name: Require the exact release-set artifact inventory
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import stat
+
+          expected = {
+              "release-set.json",
+              "release-set.sha256",
+              "release-set-provenance.bundle.json",
+              "release-set-source-binding.bundle.json",
+          }
+          root = "evidence"
+          if not stat.S_ISDIR(os.lstat(root).st_mode):
+              raise SystemExit("evidence is not a real directory")
+          entries = list(os.scandir(root))
+          if {entry.name for entry in entries} != expected:
+              raise SystemExit(f"unexpected release-set artifact inventory: {[entry.name for entry in entries]!r}")
+          for entry in entries:
+              if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit(f"artifact entry is not a regular non-symlink file: {entry.name}")
+          PY
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Cryptographically verify the release set
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          EXPECTED_MATRIX: ${{ needs.authority.outputs.matrix }}
+          FRONTEND_TREE: ${{ needs.authority.outputs.frontend_tree }}
+          GH_TOKEN: ${{ github.token }}
+          INTERNAL_TREE: ${{ needs.authority.outputs.internal_tree }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          REPOSITORY: ${{ github.repository }}
+          ROOT_TREE: ${{ needs.authority.outputs.root_tree }}
+          SOURCE_MANIFEST_SHA256: ${{ needs.authority.outputs.source_manifest_sha256 }}
+          SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+          VALIDATION_RUN_ID: ${{ needs.authority.outputs.validation_run_id }}
+          VALIDATION_RUN_ATTEMPT: ${{ needs.authority.outputs.validation_run_attempt }}
+          VALIDATION_RUN_URL: ${{ needs.authority.outputs.validation_run_url }}
+        run: |
+          set -euo pipefail
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+
+          cp evidence/release-set.json release-set.json
+          cp evidence/release-set.sha256 release-set.sha256
+          expected_release_set_sha256="$(cat release-set.sha256)"
+          [[ "$expected_release_set_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(sha256sum release-set.json | awk '{print $1}')" == "$expected_release_set_sha256" ]]
+          jq -e \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg frontend_tree "$FRONTEND_TREE" \
+            --arg internal_tree "$INTERNAL_TREE" \
+            --arg phase "$PHASE" \
+            --arg repository "$REPOSITORY" \
+            --arg root_tree "$ROOT_TREE" \
+            --arg source_manifest_sha256 "$SOURCE_MANIFEST_SHA256" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg validation_run_id "$VALIDATION_RUN_ID" \
+            --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" \
+            --arg validation_run_url "$VALIDATION_RUN_URL" \
+            --argjson expected_matrix "$EXPECTED_MATRIX" '
+              ($expected_matrix | sort_by(.component) | map({
+                component,
+                image,
+                dockerfile,
+                dockerfile_sha256,
+                platform: "linux/amd64"
+              })) as $expected_images |
+              .schema_version == 1 and
+              .authority == "digest-only" and
+              .phase == $phase and
+              .source == {
+                repository: $repository,
+                commit: $source_sha,
+                root_tree: $root_tree,
+                frontend_tree: $frontend_tree,
+                internal_tree: $internal_tree,
+                manifest_sha256: $source_manifest_sha256
+              } and
+              .validation == {
+                run_id: $validation_run_id,
+                run_attempt: $validation_run_attempt,
+                run_url: $validation_run_url
+              } and
+              .builder.workflow_sha == $control_sha and
+              .builder.run_id == env.GITHUB_RUN_ID and
+              .builder.run_attempt == env.GITHUB_RUN_ATTEMPT and
+              .builder.runner_environment == "github-hosted" and
+              [.images[].component] == ["gmail-relay", "meta-relay", "web"] and
+              ([.images[] | {component, image, dockerfile, dockerfile_sha256, platform}] == $expected_images) and
+              all(.images[];
+                .tag_is_authority == false and
+                (.digest | test("^sha256:[0-9a-f]{64}$"))
+              ) and
+              ([.images[].digest] | unique | length) == 3
+            ' release-set.json > /dev/null
+
+          signer_workflow="$RELEASE_REPOSITORY/$RELEASE_WORKFLOW_PATH"
+          common_flags=(
+            --repo "$RELEASE_REPOSITORY"
+            --signer-workflow "$signer_workflow"
+            --signer-digest "$CONTROL_SHA"
+            --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main
+            --deny-self-hosted-runners
+            --format json
+          )
+          gh attestation verify release-set.json "${common_flags[@]}" \
+            --bundle evidence/release-set-provenance.bundle.json \
+            --predicate-type https://slsa.dev/provenance/v1 > verified-release-set-provenance.json
+          gh attestation verify release-set.json "${common_flags[@]}" \
+            --bundle evidence/release-set-source-binding.bundle.json \
+            --predicate-type "$CUSTOM_SET_PREDICATE" > verified-release-set-binding.json
+          jq -e 'type == "array" and length > 0' verified-release-set-provenance.json > /dev/null
+          jq -e --slurpfile expected release-set.json '
+            type == "array" and
+            any(.[]; .verificationResult.statement.predicate == $expected[0])
+          ' verified-release-set-binding.json > /dev/null
+
+      - name: Publish the verified digest-only summary
+        env:
+          PHASE: ${{ needs.authority.outputs.phase }}
+          SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## Verified exact release image set'
+            echo
+            echo "Phase: \`$PHASE\`"
+            echo
+            echo "Source: \`$SOURCE_SHA\`"
+            echo
+            jq -r '.images[] | "- `\(.component)`: `\(.image)@\(.digest)`"' release-set.json
+            echo
+            echo 'Tags are audit labels only and are never deployment authority.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verified release-set evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-release-set-${{ needs.authority.outputs.phase }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            release-set.json
+            release-set.sha256
+            verified-release-set-provenance.json
+            verified-release-set-binding.json
+          if-no-files-found: error
+          retention-days: 90
+
+  gate:
+    name: Exact release image gate
+    if: always()
+    needs:
+      - authority
+      - build
+      - scan
+      - attest
+      - verify
+      - aggregate
+      - verify_set
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read # Revalidate the exact successful source-validation attempt.
+      contents: read
+    steps:
+      - name: Install pinned GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Require every release image control to pass
+        env:
+          AGGREGATE_RESULT: ${{ needs.aggregate.result }}
+          ATTEST_RESULT: ${{ needs.attest.result }}
+          AUTHORITY_RESULT: ${{ needs.authority.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+          VALIDATION_RUN_ATTEMPT: ${{ needs.authority.outputs.validation_run_attempt }}
+          VALIDATION_RUN_ID: ${{ needs.authority.outputs.validation_run_id }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          VERIFY_SET_RESULT: ${{ needs.verify_set.result }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+
+          [[ "$VALIDATION_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$VALIDATION_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+          expected_title="Validate exact $PHASE release source"
+          workflow_id="$(gh api \
+            "/repos/$REPOSITORY/actions/workflows/validate-exact-release-source.yml" \
+            --jq '.id')"
+          [[ "$workflow_id" =~ ^[1-9][0-9]*$ ]]
+
+          require_validation_run() {
+            local validation_json="$1"
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --arg expected_title "$expected_title" \
+              --arg repository "$REPOSITORY" \
+              --argjson run_attempt "$VALIDATION_RUN_ATTEMPT" \
+              --argjson run_id "$VALIDATION_RUN_ID" \
+              --argjson workflow_id "$workflow_id" '
+                .id == $run_id and
+                .run_attempt == $run_attempt and
+                .workflow_id == $workflow_id and
+                .repository.full_name == $repository and
+                .event == "workflow_dispatch" and
+                .status == "completed" and
+                .conclusion == "success" and
+                .head_branch == "main" and
+                .head_sha == $control_sha and
+                .path == ".github/workflows/validate-exact-release-source.yml" and
+                .display_title == $expected_title
+              ' <<< "$validation_json" > /dev/null
+          }
+
+          latest_validation_json="$(gh api "/repos/$REPOSITORY/actions/runs/$VALIDATION_RUN_ID")"
+          exact_validation_json="$(gh api \
+            "/repos/$REPOSITORY/actions/runs/$VALIDATION_RUN_ID/attempts/$VALIDATION_RUN_ATTEMPT")"
+          for validation_json in "$latest_validation_json" "$exact_validation_json"; do
+            require_validation_run "$validation_json"
+          done
+
+          validation_jobs_json="$(gh api \
+            "/repos/$REPOSITORY/actions/runs/$VALIDATION_RUN_ID/attempts/$VALIDATION_RUN_ATTEMPT/jobs?per_page=100")"
+          jq -e --argjson run_attempt "$VALIDATION_RUN_ATTEMPT" '
+            ([.jobs[] | select(.name == "Exact source validation gate")] | length) == 1 and
+            ([.jobs[] | select(
+              .name == "Exact source validation gate" and
+              .run_attempt == $run_attempt and
+              .status == "completed" and
+              .conclusion == "success"
+            )] | length) == 1
+          ' <<< "$validation_jobs_json" > /dev/null
+
+          failures=0
+          for result in \
+            "$AUTHORITY_RESULT" \
+            "$BUILD_RESULT" \
+            "$SCAN_RESULT" \
+            "$ATTEST_RESULT" \
+            "$VERIFY_RESULT" \
+            "$AGGREGATE_RESULT" \
+            "$VERIFY_SET_RESULT"; do
+            if [[ "$result" != success ]]; then
+              failures=1
+            fi
+          done
+          if [[ "$failures" -ne 0 ]]; then
+            echo "::error::At least one exact release image control failed or was skipped."
+            exit 1
+          fi
+
+          # Close the authority window immediately before success. A newer
+          # validation attempt or main update must invalidate this run.
+          final_latest_validation_json="$(gh api "/repos/$REPOSITORY/actions/runs/$VALIDATION_RUN_ID")"
+          require_validation_run "$final_latest_validation_json"
+          final_live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$final_live_main_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$final_live_main_sha" == "$CONTROL_SHA" ]]
+
+          echo "Exact release image controls passed. No deployment was performed."

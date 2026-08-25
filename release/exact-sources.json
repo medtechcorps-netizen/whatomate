@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "repository": "medtechcorps-netizen/whatomate",
+  "validation": {
+    "workflow_path": ".github/workflows/validate-exact-release-source.yml",
+    "gate_job_name": "Exact source validation gate"
+  },
+  "phases": {
+    "baseline": {
+      "source_sha": "974bb998f6d4c94ce750a92bf23f4550f8e45a2f",
+      "root_tree": "e964211fbb5858c9a9028ce5cdc54a7518d5d573",
+      "frontend_tree": "0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74",
+      "internal_tree": "f70860bcee374d507b7e6443f4f21df2855b217f"
+    },
+    "bridge": {
+      "source_sha": "b3d8f167bf428e1f3e209b0d42982f16b21cfae8",
+      "root_tree": "fb90f9c4be3ffefe50c95c0c5dab44cfe8b19538",
+      "frontend_tree": "0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74",
+      "internal_tree": "32763888c556305e8aee180183c92f36ddf5d195"
+    },
+    "backend": {
+      "source_sha": "63e54fe72a753006733931ddfb5bdbdbe2a2a4fc",
+      "root_tree": "7c7a789bffea8e2d7688ed8e12f780f500e9de5a",
+      "frontend_tree": "0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74",
+      "internal_tree": "494d3957ff3559375f406886be45646049ec9378"
+    },
+    "ui": {
+      "source_sha": "ab44af2e7c093b4502c1928126c31306b2ba0389",
+      "root_tree": "3553b783d5cfdcbda2ffcee332a2aa392a897bc5",
+      "frontend_tree": "2f92a064f2f3d7f1867c835ef3be7f41e2f30444",
+      "internal_tree": "494d3957ff3559375f406886be45646049ec9378"
+    }
+  },
+  "release": {
+    "platform": "linux/amd64",
+    "components": {
+      "web": {
+        "image": "ghcr.io/medtechcorps-netizen/rereply-release-web",
+        "dockerfile": "docker/release/web.Dockerfile",
+        "dockerfile_sha256": "6c5b065797072000d66124120ea6da940858b54a2a8bcf3b5595f3719cf03582",
+        "user": "rereply",
+        "working_dir": "/app",
+        "entrypoint": ["./rereply"],
+        "cmd": ["server", "-config", "config.toml"],
+        "port": "8080/tcp",
+        "smoke": "version"
+      },
+      "meta-relay": {
+        "image": "ghcr.io/medtechcorps-netizen/rereply-release-meta-relay",
+        "dockerfile": "docker/release/meta-relay.Dockerfile",
+        "dockerfile_sha256": "38a6dcceaa252750f4ffd016002687423f062b15d8b47f6478af2185b628eb25",
+        "user": "relay",
+        "working_dir": "/app",
+        "entrypoint": ["/app/meta-relay"],
+        "cmd": null,
+        "port": "8081/tcp",
+        "smoke": "binary"
+      },
+      "gmail-relay": {
+        "image": "ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay",
+        "dockerfile": "docker/release/gmail-relay.Dockerfile",
+        "dockerfile_sha256": "f0c2ac09e585b3504123c1a5d336658dca5a52a0124a04aace202fb61a98a098",
+        "user": "relay",
+        "working_dir": "/app",
+        "entrypoint": ["/app/gmail-relay"],
+        "cmd": null,
+        "port": "8082/tcp",
+        "smoke": "binary"
+      }
+    },
+    "materials": {
+      "ubuntu_snapshot": {
+        "id": "20260824T000000Z",
+        "packages": {
+          "ca-certificates": "20260601~24.04.1",
+          "espeak-ng": "1.51+dfsg-12build1",
+          "ffmpeg": "7:6.1.1-3ubuntu5",
+          "opus-tools": "0.2-1build3",
+          "tzdata": "2026c-0ubuntu0.24.04.1"
+        },
+        "dockerfile": "docker/release/web.Dockerfile",
+        "stage": null
+      },
+      "base_images": [
+        {
+          "name": "docker.io/library/node:22-alpine",
+          "digest": "sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c",
+          "uses": [
+            {
+              "dockerfile": "docker/release/web.Dockerfile",
+              "stage": "frontend-builder"
+            },
+            {
+              "dockerfile": "docker/release/web.Dockerfile",
+              "stage": "piper-download"
+            }
+          ]
+        },
+        {
+          "name": "docker.io/library/golang:1.26.6-alpine",
+          "digest": "sha256:1a9c10cf505a9e6b1e96ea77ebdbfe79a0f10380181faf88bc3b51d7e4315fae",
+          "uses": [
+            {
+              "dockerfile": "docker/release/gmail-relay.Dockerfile",
+              "stage": "builder"
+            },
+            {
+              "dockerfile": "docker/release/meta-relay.Dockerfile",
+              "stage": "builder"
+            },
+            {
+              "dockerfile": "docker/release/web.Dockerfile",
+              "stage": "builder"
+            }
+          ]
+        },
+        {
+          "name": "docker.io/library/ubuntu:24.04",
+          "digest": "sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316",
+          "uses": [
+            {
+              "dockerfile": "docker/release/web.Dockerfile",
+              "stage": null
+            }
+          ]
+        }
+      ],
+      "scratch_stages": [
+        {
+          "dockerfile": "docker/release/gmail-relay.Dockerfile",
+          "stage": null
+        },
+        {
+          "dockerfile": "docker/release/meta-relay.Dockerfile",
+          "stage": null
+        }
+      ],
+      "direct_downloads": [
+        {
+          "name": "piper_linux_x86_64.tar.gz",
+          "url": "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz",
+          "sha256": "a50cb45f355b7af1f6d758c1b360717877ba0a398cc8cbe6d2a7a3a26e225992",
+          "dockerfile": "docker/release/web.Dockerfile",
+          "stage": "piper-download",
+          "destination": "/tmp/piper.tar.gz",
+          "runtime_path": null,
+          "runtime_mode": null
+        },
+        {
+          "name": "en_US-lessac-medium.onnx",
+          "url": "https://huggingface.co/rhasspy/piper-voices/resolve/39ab474be869e9181350af6a65e4953eef67aaa0/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+          "sha256": "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f",
+          "dockerfile": "docker/release/web.Dockerfile",
+          "stage": "piper-download",
+          "destination": "/tmp/piper-models/en_US-lessac-medium.onnx",
+          "runtime_path": "/opt/piper/models/en_US-lessac-medium.onnx",
+          "runtime_mode": "0644"
+        },
+        {
+          "name": "en_US-lessac-medium.onnx.json",
+          "url": "https://huggingface.co/rhasspy/piper-voices/resolve/39ab474be869e9181350af6a65e4953eef67aaa0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
+          "sha256": "efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0",
+          "dockerfile": "docker/release/web.Dockerfile",
+          "stage": "piper-download",
+          "destination": "/tmp/piper-models/en_US-lessac-medium.onnx.json",
+          "runtime_path": "/opt/piper/models/en_US-lessac-medium.onnx.json",
+          "runtime_mode": "0644"
+        }
+      ]
+    }
+  }
+}
