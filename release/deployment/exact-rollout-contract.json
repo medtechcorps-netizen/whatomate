@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "repository": "medtechcorps-netizen/whatomate",
+  "authority": "digest-only",
+  "workflows": {
+    "rollout": ".github/workflows/aggregate-exact-four-phase-rollout.yml",
+    "image": ".github/workflows/build-attest-exact-release-images.yml",
+    "validation": ".github/workflows/validate-exact-release-source.yml"
+  },
+  "predicates": {
+    "release_set": "https://rereply.app/attestations/exact-release-set/v1",
+    "rollout_plan": "https://rereply.app/attestations/exact-four-phase-rollout/v1"
+  },
+  "phase_order": [
+    "baseline",
+    "bridge",
+    "backend",
+    "ui"
+  ],
+  "rollback": {
+    "baseline": {
+      "allowed_targets": [],
+      "forbidden_targets": []
+    },
+    "bridge": {
+      "allowed_targets": [
+        "baseline"
+      ],
+      "forbidden_targets": []
+    },
+    "backend": {
+      "allowed_targets": [
+        "bridge"
+      ],
+      "forbidden_targets": [
+        "baseline"
+      ]
+    },
+    "ui": {
+      "allowed_targets": [
+        "backend",
+        "bridge"
+      ],
+      "forbidden_targets": [
+        "baseline"
+      ]
+    }
+  },
+  "migration": {
+    "component": "web",
+    "binding": "same-image-digest",
+    "entrypoint": [
+      "./rereply"
+    ],
+    "arguments": [
+      "rls-migrate",
+      "-config",
+      "config.toml"
+    ]
+  },
+  "image_workflow": {
+    "gate_job_name": "Exact release image gate",
+    "expected_jobs": [
+      "Aggregate the exact three-digest release set",
+      "Attest gmail-relay",
+      "Attest meta-relay",
+      "Attest web",
+      "Build and publish gmail-relay",
+      "Build and publish meta-relay",
+      "Build and publish web",
+      "Exact release image gate",
+      "Scan, SBOM, and verify gmail-relay",
+      "Scan, SBOM, and verify meta-relay",
+      "Scan, SBOM, and verify web",
+      "Verify attestations for gmail-relay",
+      "Verify attestations for meta-relay",
+      "Verify attestations for web",
+      "Verify exact release-set attestations",
+      "Verify protected-main authority and exact validation"
+    ],
+    "artifact_inventories": {
+      "image": [
+        "image.json",
+        "remote-descriptor.json"
+      ],
+      "scanned": [
+        "image-inspect.json",
+        "image.json",
+        "remote-descriptor.json",
+        "sbom.spdx.json",
+        "scan.json",
+        "secret-report.json",
+        "vulnerability-report.json"
+      ],
+      "attested": [
+        "attestation-record.json",
+        "exact-source-predicate.json",
+        "image-inspect.json",
+        "image.json",
+        "provenance.bundle.json",
+        "remote-descriptor.json",
+        "sbom.bundle.json",
+        "sbom.spdx.json",
+        "scan.json",
+        "secret-report.json",
+        "source-binding.bundle.json",
+        "vulnerability-report.json"
+      ],
+      "verified": [
+        "exact-source-predicate.json",
+        "image-inspect.json",
+        "image.json",
+        "remote-descriptor.json",
+        "sbom.spdx.json",
+        "scan.json",
+        "secret-report.json",
+        "verified-provenance.json",
+        "verified-sbom.json",
+        "verified-source-binding.json",
+        "vulnerability-report.json"
+      ],
+      "release-set": [
+        "release-set-provenance.bundle.json",
+        "release-set-source-binding.bundle.json",
+        "release-set.json",
+        "release-set.sha256"
+      ],
+      "verified-release-set": [
+        "release-set.json",
+        "release-set.sha256",
+        "verified-release-set-binding.json",
+        "verified-release-set-provenance.json"
+      ]
+    }
+  },
+  "validation_workflow": {
+    "gate_job_name": "Exact source validation gate"
+  },
+  "capsule": {
+    "retention_days": 90,
+    "root_files": [
+      "rollout-plan-policy.bundle.json",
+      "rollout-plan-provenance.bundle.json",
+      "rollout-plan.json",
+      "rollout-plan.sha256"
+    ],
+    "phase_files": [
+      "release-set-provenance.bundle.json",
+      "release-set-source-binding.bundle.json",
+      "release-set.json",
+      "release-set.sha256"
+    ]
+  }
+}

@@ -1,0 +1,432 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rereply.app/schemas/exact-four-phase-rollout-plan-v1.json",
+  "title": "ReReply exact four-phase rollout plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authority",
+    "repository",
+    "control",
+    "activation_order",
+    "baseline_forbidden_after_activation",
+    "phases"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "authority": {
+      "const": "digest-only"
+    },
+    "repository": {
+      "const": "medtechcorps-netizen/whatomate"
+    },
+    "control": {
+      "$ref": "#/$defs/control"
+    },
+    "activation_order": {
+      "const": [
+        "baseline",
+        "bridge",
+        "backend",
+        "ui"
+      ]
+    },
+    "baseline_forbidden_after_activation": {
+      "const": "backend"
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/phase"
+        },
+        {
+          "$ref": "#/$defs/phase"
+        },
+        {
+          "$ref": "#/$defs/phase"
+        },
+        {
+          "$ref": "#/$defs/phase"
+        }
+      ],
+      "items": false
+    }
+  },
+  "$defs": {
+    "sha1": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,14}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_sha",
+        "workflow_path",
+        "run_id",
+        "run_attempt",
+        "runner_environment",
+        "contract_sha256",
+        "source_manifest_sha256",
+        "plan_schema_sha256",
+        "verifier_sha256"
+      ],
+      "properties": {
+        "workflow_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "workflow_path": {
+          "const": ".github/workflows/aggregate-exact-four-phase-rollout.yml"
+        },
+        "run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "run_attempt": {
+          "$ref": "#/$defs/attempt"
+        },
+        "runner_environment": {
+          "const": "github-hosted"
+        },
+        "contract_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "plan_schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "verifier_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "commit",
+        "root_tree",
+        "frontend_tree",
+        "internal_tree",
+        "manifest_sha256"
+      ],
+      "properties": {
+        "repository": {
+          "const": "medtechcorps-netizen/whatomate"
+        },
+        "commit": {
+          "$ref": "#/$defs/sha1"
+        },
+        "root_tree": {
+          "$ref": "#/$defs/sha1"
+        },
+        "frontend_tree": {
+          "$ref": "#/$defs/sha1"
+        },
+        "internal_tree": {
+          "$ref": "#/$defs/sha1"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "run_attempt",
+        "run_url"
+      ],
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "run_attempt": {
+          "$ref": "#/$defs/attempt"
+        },
+        "run_url": {
+          "type": "string",
+          "pattern": "^https://github\\.com/medtechcorps-netizen/whatomate/actions/runs/[1-9][0-9]{0,14}$"
+        }
+      }
+    },
+    "imageBuild": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "run_attempt",
+        "release_set_artifact_id",
+        "release_set_sha256"
+      ],
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "run_attempt": {
+          "$ref": "#/$defs/attempt"
+        },
+        "release_set_artifact_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "release_set_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "name",
+        "archive_digest",
+        "archive_sha256",
+        "size_in_bytes",
+        "inventory"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "archive_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "archive_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_in_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864
+        },
+        "inventory": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          }
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "image",
+        "digest",
+        "platform",
+        "tag",
+        "tag_is_authority",
+        "dockerfile",
+        "dockerfile_sha256"
+      ],
+      "properties": {
+        "component": {
+          "enum": [
+            "gmail-relay",
+            "meta-relay",
+            "web"
+          ]
+        },
+        "image": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/medtechcorps-netizen/rereply-release-(gmail-relay|meta-relay|web)$"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "platform": {
+          "const": "linux/amd64"
+        },
+        "tag": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "tag_is_authority": {
+          "const": false
+        },
+        "dockerfile": {
+          "type": "string",
+          "pattern": "^docker/release/[a-z-]+\\.Dockerfile$"
+        },
+        "dockerfile_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "migration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "image",
+        "digest",
+        "subject",
+        "binding",
+        "entrypoint",
+        "arguments"
+      ],
+      "properties": {
+        "component": {
+          "const": "web"
+        },
+        "image": {
+          "const": "ghcr.io/medtechcorps-netizen/rereply-release-web"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "subject": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/medtechcorps-netizen/rereply-release-web@sha256:[0-9a-f]{64}$"
+        },
+        "binding": {
+          "const": "same-image-digest"
+        },
+        "entrypoint": {
+          "const": [
+            "./rereply"
+          ]
+        },
+        "arguments": {
+          "const": [
+            "rls-migrate",
+            "-config",
+            "config.toml"
+          ]
+        }
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_targets",
+        "forbidden_targets"
+      ],
+      "properties": {
+        "allowed_targets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "baseline",
+              "bridge",
+              "backend",
+              "ui"
+            ]
+          }
+        },
+        "forbidden_targets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "baseline",
+              "bridge",
+              "backend",
+              "ui"
+            ]
+          }
+        }
+      }
+    },
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "ordinal",
+        "source",
+        "validation",
+        "image_build",
+        "input_artifacts",
+        "images",
+        "migration",
+        "rollback"
+      ],
+      "properties": {
+        "phase": {
+          "enum": [
+            "baseline",
+            "bridge",
+            "backend",
+            "ui"
+          ]
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "validation": {
+          "$ref": "#/$defs/validation"
+        },
+        "image_build": {
+          "$ref": "#/$defs/imageBuild"
+        },
+        "input_artifacts": {
+          "type": "array",
+          "minItems": 14,
+          "maxItems": 14,
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        },
+        "images": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/image"
+          }
+        },
+        "migration": {
+          "$ref": "#/$defs/migration"
+        },
+        "rollback": {
+          "$ref": "#/$defs/rollback"
+        }
+      }
+    }
+  }
+}
