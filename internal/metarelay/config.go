@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -32,13 +33,15 @@ const (
 	queueSettlementTimeout   = 5 * time.Second
 	leaseSafetyMargin        = time.Second
 	maxWorkerConcurrency     = 64
+	maxStaticMessengerApps   = 16
 )
 
 var (
-	envNamePattern      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	graphVersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+$`)
-	accountKeyPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-	metaAppIDPattern    = regexp.MustCompile(`^[0-9]+$`)
+	envNamePattern         = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	graphVersionPattern    = regexp.MustCompile(`^v[0-9]+\.[0-9]+$`)
+	accountKeyPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	metaAppIDPattern       = regexp.MustCompile(`^[0-9]+$`)
+	staticMetaAppIDPattern = regexp.MustCompile(`^[1-9][0-9]{0,31}$`)
 )
 
 // LoadConfig loads and validates the relay's environment-only configuration.
@@ -135,6 +138,28 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 		}
 		if err := rejectTrailingJSON(decoder); err != nil {
 			return nil, errors.New("environment variable META_RELAY_ACCOUNTS_JSON is invalid")
+		}
+	}
+	rawStaticMessengerApps := strings.TrimSpace(
+		getenv("META_RELAY_STATIC_MESSENGER_APPS_JSON"),
+	)
+	if rawStaticMessengerApps != "" {
+		if !strings.HasPrefix(rawStaticMessengerApps, "[") {
+			return nil, errors.New(
+				"environment variable META_RELAY_STATIC_MESSENGER_APPS_JSON is invalid",
+			)
+		}
+		decoder := json.NewDecoder(strings.NewReader(rawStaticMessengerApps))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&config.StaticMessengerApps); err != nil {
+			return nil, errors.New(
+				"environment variable META_RELAY_STATIC_MESSENGER_APPS_JSON is invalid",
+			)
+		}
+		if err := rejectTrailingJSON(decoder); err != nil {
+			return nil, errors.New(
+				"environment variable META_RELAY_STATIC_MESSENGER_APPS_JSON is invalid",
+			)
 		}
 	}
 	if err := config.validateAndIndex(getenv); err != nil {
@@ -247,6 +272,9 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 			return errors.New("environment variable META_RELAY_REGISTRY_EDGE_SECRET must contain at least 32 bytes")
 		}
 	}
+	if err := c.validateStaticMessengerApps(getenv); err != nil {
+		return err
+	}
 	if len(c.Accounts) == 0 && !registryConfigured {
 		return errors.New("at least one static Meta account mapping or dynamic registry is required")
 	}
@@ -280,6 +308,7 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 		account := &c.Accounts[i]
 		account.Key = strings.TrimSpace(account.Key)
 		account.ExternalAccountID = strings.TrimSpace(account.ExternalAccountID)
+		account.MessengerAppID = strings.TrimSpace(account.MessengerAppID)
 		account.ReReplyWebhookURL = strings.TrimSpace(account.ReReplyWebhookURL)
 		if !accountKeyPattern.MatchString(account.Key) {
 			return fmt.Errorf("account %d key must be 1-64 safe identifier characters", i)
@@ -289,7 +318,20 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 			if account.InstagramAPIMode != "" {
 				return fmt.Errorf("account %q instagram_api_mode is only valid for Instagram", account.Key)
 			}
+			if account.MessengerAppID != "" {
+				app, exists := c.staticMessengerApp(account.MessengerAppID)
+				if !exists {
+					return fmt.Errorf(
+						"account %q messenger_app_id does not identify a configured static Messenger app",
+						account.Key,
+					)
+				}
+				account.PlatformAppID = app.AppID
+			}
 		case models.ChannelInstagram:
+			if account.MessengerAppID != "" {
+				return fmt.Errorf("account %q messenger_app_id is only valid for Messenger", account.Key)
+			}
 			switch account.InstagramAPIMode {
 			case InstagramAPIModeInstagramLogin, InstagramAPIModeFacebookLogin:
 			default:
@@ -329,6 +371,152 @@ func (c *Config) validateAndIndex(getenv func(string) string) error {
 		c.byExternal[externalKey] = account
 	}
 	return nil
+}
+
+func (c *Config) validateStaticMessengerApps(getenv func(string) string) error {
+	if len(c.StaticMessengerApps) > maxStaticMessengerApps {
+		return fmt.Errorf(
+			"META_RELAY_STATIC_MESSENGER_APPS_JSON must not contain more than %d applications",
+			maxStaticMessengerApps,
+		)
+	}
+	c.staticMessengerAppsByID = make(
+		map[string]*StaticMessengerAppConfig,
+		len(c.StaticMessengerApps),
+	)
+	c.staticMessengerAppsByRoute = make(
+		map[WebhookApp]*StaticMessengerAppConfig,
+		len(c.StaticMessengerApps),
+	)
+
+	reservedCredentialEnvs := map[string]struct{}{
+		"META_RELAY_MESSENGER_APP_SECRET":           {},
+		"META_RELAY_MESSENGER_VERIFY_TOKEN":         {},
+		"META_RELAY_MANAGED_MESSENGER_APP_SECRET":   {},
+		"META_RELAY_MANAGED_MESSENGER_VERIFY_TOKEN": {},
+		"META_RELAY_MANAGED_INSTAGRAM_APP_SECRET":   {},
+		"META_RELAY_MANAGED_INSTAGRAM_VERIFY_TOKEN": {},
+		"META_RELAY_INSTAGRAM_APP_SECRET":           {},
+		"META_RELAY_INSTAGRAM_VERIFY_TOKEN":         {},
+		"META_RELAY_REGISTRY_SECRET":                {},
+		"META_RELAY_REGISTRY_EDGE_SECRET":           {},
+	}
+	for index := range c.Accounts {
+		account := &c.Accounts[index]
+		for _, envName := range []string{
+			account.AccessTokenEnv,
+			account.ReReplyInboundSecretEnv,
+			account.ReReplyOutboundSecretEnv,
+		} {
+			if envName = strings.TrimSpace(envName); envName != "" {
+				reservedCredentialEnvs[envName] = struct{}{}
+			}
+		}
+	}
+	usedCredentialEnvs := make(map[string]struct{}, len(c.StaticMessengerApps)*2)
+	credentialValues := []string{
+		c.MessengerAppSecret,
+		c.MessengerVerifyToken,
+		c.ManagedMessengerAppSecret,
+		c.ManagedMessengerVerifyToken,
+		c.ManagedInstagramAppSecret,
+		c.ManagedInstagramVerifyToken,
+		c.InstagramLoginAppSecret,
+		c.InstagramLoginVerifyToken,
+	}
+
+	for index := range c.StaticMessengerApps {
+		app := &c.StaticMessengerApps[index]
+		app.AppID = strings.TrimSpace(app.AppID)
+		app.AppSecretEnv = strings.TrimSpace(app.AppSecretEnv)
+		app.VerifyTokenEnv = strings.TrimSpace(app.VerifyTokenEnv)
+		if !staticMetaAppIDPattern.MatchString(app.AppID) {
+			return fmt.Errorf(
+				"static Messenger application %d app_id must be a canonical nonzero numeric Meta app ID",
+				index,
+			)
+		}
+		if app.AppID == strings.TrimSpace(c.ManagedMessengerAppID) ||
+			app.AppID == strings.TrimSpace(c.ManagedInstagramAppID) {
+			return fmt.Errorf(
+				"static Messenger application %d app_id conflicts with a managed Meta application",
+				index,
+			)
+		}
+		if _, exists := c.staticMessengerAppsByID[app.AppID]; exists {
+			return fmt.Errorf("duplicate static Messenger app_id at application %d", index)
+		}
+		for _, envName := range []string{app.AppSecretEnv, app.VerifyTokenEnv} {
+			if !envNamePattern.MatchString(envName) {
+				return fmt.Errorf(
+					"static Messenger application %d credential fields must name environment variables",
+					index,
+				)
+			}
+			if strings.HasPrefix(strings.ToUpper(envName), "META_RELAY_") {
+				return fmt.Errorf(
+					"static Messenger application %d must use dedicated credential environment variables outside the META_RELAY_ namespace",
+					index,
+				)
+			}
+			if _, reserved := reservedCredentialEnvs[envName]; reserved {
+				return fmt.Errorf(
+					"static Messenger application %d must use dedicated credential environment variables",
+					index,
+				)
+			}
+			if _, reused := usedCredentialEnvs[envName]; reused {
+				return fmt.Errorf(
+					"static Messenger application %d reuses a credential environment variable",
+					index,
+				)
+			}
+			usedCredentialEnvs[envName] = struct{}{}
+		}
+
+		app.appSecret = getenv(app.AppSecretEnv)
+		app.verifyToken = getenv(app.VerifyTokenEnv)
+		if !validStaticMessengerCredential(app.appSecret) {
+			return fmt.Errorf(
+				"static Messenger application %d app secret must contain 32-4096 non-control bytes without surrounding whitespace",
+				index,
+			)
+		}
+		if !validStaticMessengerCredential(app.verifyToken) {
+			return fmt.Errorf(
+				"static Messenger application %d verify token must contain 32-4096 non-control bytes without surrounding whitespace",
+				index,
+			)
+		}
+		for _, value := range []string{app.appSecret, app.verifyToken} {
+			for _, existing := range credentialValues {
+				if constantTimeRelayCredentialEqual(value, existing) {
+					return fmt.Errorf(
+						"static Messenger application %d credentials must be unique across configured Meta applications",
+						index,
+					)
+				}
+			}
+			credentialValues = append(credentialValues, value)
+		}
+
+		webhookApp := staticMessengerWebhookApp(app.AppID)
+		c.staticMessengerAppsByID[app.AppID] = app
+		c.staticMessengerAppsByRoute[webhookApp] = app
+	}
+	return nil
+}
+
+func validStaticMessengerCredential(value string) bool {
+	if len(value) < 32 || len(value) > 4096 || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
 }
 
 func managedRelayCredentialConflict(legacy, managed []string) bool {

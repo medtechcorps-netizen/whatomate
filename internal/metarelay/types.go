@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
@@ -44,7 +45,15 @@ type WebhookApp string
 
 const RelayServiceTokenHeader = "X-ReReply-Relay-Service-Token"
 
-const InboundJobSchemaVersion = 2
+const (
+	// InboundJobSchemaVersion remains the dynamic-registry reader fence. Do not
+	// change it when adding a static-only job extension.
+	InboundJobSchemaVersion = 2
+	// App-bound static Messenger jobs use a newer version so a pre-feature
+	// worker parks them instead of ignoring the new webhook-app identity fence.
+	staticMessengerInboundJobSchemaVersion = 3
+	maxInboundJobSchemaVersion             = staticMessengerInboundJobSchemaVersion
+)
 
 const (
 	WebhookAppMessenger        WebhookApp = "messenger"
@@ -70,6 +79,7 @@ type AccountConfig struct {
 	Channel                   models.Channel   `json:"channel"`
 	ExternalAccountID         string           `json:"external_account_id"`
 	InstagramAPIMode          InstagramAPIMode `json:"instagram_api_mode,omitempty"`
+	MessengerAppID            string           `json:"messenger_app_id,omitempty"`
 	ReReplyWebhookURL         string           `json:"rereply_webhook_url"`
 	PlatformAppID             string           `json:"-"`
 	AccessTokenEnv            string           `json:"access_token_env"`
@@ -84,6 +94,17 @@ type AccountConfig struct {
 	registryWebhookVersion    int
 	registryLeaseExpiresAt    time.Time
 	registryManaged           bool
+}
+
+// StaticMessengerAppConfig describes one additional, app-bound Messenger
+// webhook. The JSON contains only public identity and environment-variable
+// names; actual credentials are resolved from the process environment.
+type StaticMessengerAppConfig struct {
+	AppID          string `json:"app_id"`
+	AppSecretEnv   string `json:"app_secret_env"`
+	VerifyTokenEnv string `json:"verify_token_env"`
+	appSecret      string
+	verifyToken    string
 }
 
 // Config is intentionally environment-only. Production does not have a flag
@@ -102,6 +123,7 @@ type Config struct {
 	ManagedInstagramVerifyToken string
 	InstagramLoginAppSecret     string
 	InstagramLoginVerifyToken   string
+	StaticMessengerApps         []StaticMessengerAppConfig
 	GraphAPIVersion             string
 	Accounts                    []AccountConfig
 	InboundRetention            time.Duration
@@ -124,6 +146,8 @@ type Config struct {
 	allowInsecureTestEndpoints bool
 	byExternal                 map[string]*AccountConfig
 	byKey                      map[string]*AccountConfig
+	staticMessengerAppsByID    map[string]*StaticMessengerAppConfig
+	staticMessengerAppsByRoute map[WebhookApp]*StaticMessengerAppConfig
 }
 
 func accountIndexKey(channel models.Channel, externalID string) string {
@@ -146,6 +170,48 @@ func (c *Config) accountByKey(key string) (*AccountConfig, bool) {
 	return account, ok
 }
 
+func staticMessengerWebhookApp(appID string) WebhookApp {
+	return WebhookApp("static_messenger:" + appID)
+}
+
+func isStaticMessengerWebhookApp(webhookApp WebhookApp) bool {
+	return strings.HasPrefix(string(webhookApp), "static_messenger:")
+}
+
+func (c *Config) staticMessengerApp(appID string) (*StaticMessengerAppConfig, bool) {
+	if c == nil {
+		return nil, false
+	}
+	app, ok := c.staticMessengerAppsByID[appID]
+	return app, ok
+}
+
+func (c *Config) staticMessengerAppForRoute(
+	webhookApp WebhookApp,
+) (*StaticMessengerAppConfig, bool) {
+	if c == nil {
+		return nil, false
+	}
+	app, ok := c.staticMessengerAppsByRoute[webhookApp]
+	return app, ok
+}
+
+func (c *Config) webhookAppConfigured(webhookApp WebhookApp) bool {
+	switch webhookApp {
+	case WebhookAppMessenger, WebhookAppInstagramLogin:
+		return true
+	case WebhookAppManagedMessenger:
+		return c != nil && c.RegistryEnabled && c.ManagedMessengerAppSecret != "" &&
+			c.ManagedMessengerVerifyToken != ""
+	case WebhookAppManagedInstagram:
+		return c != nil && c.RegistryEnabled && c.ManagedInstagramAppSecret != "" &&
+			c.ManagedInstagramVerifyToken != ""
+	default:
+		_, ok := c.staticMessengerAppForRoute(webhookApp)
+		return ok
+	}
+}
+
 func (a *AccountConfig) webhookApp() WebhookApp {
 	if a != nil && a.Channel == models.ChannelMessenger && a.registryManaged {
 		return WebhookAppManagedMessenger
@@ -154,12 +220,20 @@ func (a *AccountConfig) webhookApp() WebhookApp {
 		a.InstagramAPIMode == InstagramAPIModeInstagramLogin {
 		return WebhookAppManagedInstagram
 	}
+	if a != nil && a.Channel == models.ChannelMessenger && a.MessengerAppID != "" {
+		return staticMessengerWebhookApp(a.MessengerAppID)
+	}
 	if a != nil &&
 		a.Channel == models.ChannelInstagram &&
 		a.InstagramAPIMode == InstagramAPIModeInstagramLogin {
 		return WebhookAppInstagramLogin
 	}
 	return WebhookAppMessenger
+}
+
+func (a *AccountConfig) usesAppBoundMessenger() bool {
+	return a != nil && a.Channel == models.ChannelMessenger &&
+		(a.registryManaged || a.MessengerAppID != "")
 }
 
 // InboundJob is the durable unit forwarded to one ReReply channel webhook.
@@ -171,6 +245,7 @@ type InboundJob struct {
 	Channel           models.Channel `json:"channel,omitempty"`
 	ExternalAccountID string         `json:"external_account_id,omitempty"`
 	RegistryFence     string         `json:"registry_fence,omitempty"`
+	WebhookApp        WebhookApp     `json:"webhook_app,omitempty"`
 	Body              []byte         `json:"body"`
 	Attempts          int            `json:"-"`
 }

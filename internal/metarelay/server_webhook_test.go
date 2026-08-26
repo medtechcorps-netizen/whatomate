@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
@@ -42,6 +43,10 @@ func TestSignedBodyVerification(t *testing.T) {
 	signature := signBody("secret-one", body)
 	if !verifySignedBody("secret-one", signature, body) {
 		t.Fatal("valid signature was rejected")
+	}
+	uppercaseDigest := signaturePrefix + strings.ToUpper(strings.TrimPrefix(signature, signaturePrefix))
+	if !verifySignedBody("secret-one", uppercaseDigest, body) {
+		t.Fatal("equivalent uppercase hexadecimal digest was rejected")
 	}
 	if verifySignedBody("secret-two", signature, body) {
 		t.Fatal("cross-secret signature was accepted")

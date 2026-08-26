@@ -13,6 +13,7 @@ or a verify token:
 | Meta application | Callback route | Accepted accounts |
 | --- | --- | --- |
 | Legacy Messenger parent app(s) | `GET`/`POST /v1/meta/messenger/webhook` | Existing static Messenger Pages and Instagram accounts using `facebook_login` |
+| Additional app-bound static Messenger app | `GET`/`POST /v1/meta/messenger/apps/{app_id}/webhook` | Static Messenger Pages whose mapping names that exact app ID |
 | Managed Messenger platform app | `GET`/`POST /v1/meta/messenger/managed-webhook` | Registry-managed Messenger Pages only |
 | Existing static Instagram Login app | `GET`/`POST /v1/meta/instagram/webhook` | Existing static Instagram Login mappings only |
 | Managed Instagram Login platform app | `GET`/`POST /v1/meta/instagram/managed-webhook` | Registry-managed Instagram professional profiles only |
@@ -25,7 +26,9 @@ still rejected if its account is bound to the other application.
 Behind the production `/meta-relay` ingress prefix, configure Meta's managed
 Messenger callback as
 `https://app.rereply.app/meta-relay/v1/meta/messenger/managed-webhook`. Keep
-the legacy callback route unchanged. The managed route must use its own exact
+the legacy callback route unchanged. An additional static app callback is
+`https://app.rereply.app/meta-relay/v1/meta/messenger/apps/{app_id}/webhook`.
+The managed route must use its own exact
 app ID, app secret, and verify token; none of these values may be inferred from
 the mixed legacy static mappings.
 
@@ -62,6 +65,7 @@ All deployments require:
 | `META_RELAY_MANAGED_INSTAGRAM_APP_SECRET` | Distinct managed Instagram app secret for its webhook route and `appsecret_proof`. |
 | `META_RELAY_MANAGED_INSTAGRAM_VERIFY_TOKEN` | Distinct verify token for the managed Instagram callback. |
 | `META_RELAY_GRAPH_API_VERSION` | Explicit version such as `v25.0`; update deliberately when Meta support changes. |
+| `META_RELAY_STATIC_MESSENGER_APPS_JSON` | Optional additional static Messenger app descriptors. Each descriptor contains only `app_id`, `app_secret_env`, and `verify_token_env`; actual credentials remain in the referenced secret environment variables. |
 | `META_RELAY_ACCOUNTS_JSON` | Optional static fallback account mappings. It contains environment-variable names, never secret values. Existing mappings continue to take precedence during migration. |
 | `META_RELAY_REGISTRY_ENABLED` | Explicit dynamic-registry gate. Defaults to `false`. |
 | `META_RELAY_REGISTRY_URL` | Exact private dynamic broker endpoint. |
@@ -75,6 +79,14 @@ other. When a managed product is enabled, its app ID, secret, and verify token
 are required and must also differ from every static or other managed app
 credential. A managed Instagram app ID may never equal the managed Messenger
 app ID.
+
+Additional static Messenger descriptors are limited to 16. Each app ID must be
+a canonical nonzero numeric Meta app ID. Every referenced app secret and
+verify token must contain at least 32 bytes, use a dedicated environment
+variable outside the reserved `META_RELAY_` namespace, and be distinct from
+every other configured Meta credential. Use a separate prefix such as
+`META_SUPPORT_` for those referenced credential variables. The route is
+derived from the app ID; raw callback paths are never configurable.
 
 Optional tuning:
 
@@ -175,18 +187,28 @@ amplifying into broker, database, and decryption work.
 ## Reader-first rollout and rollback
 
 The current four production mappings stay in `META_RELAY_ACCOUNTS_JSON`; no
-database import or environment change is part of this patch, and the managed
-pilot must be a different profile. Queue schema 0/1 static jobs remain
-readable, new static jobs carry schema 2, and an unknown future schema is
-parked instead of destroyed. Before the later lifecycle release enables a
-dynamic producer, every relay replica must first run a dynamic-aware schema-v2
-reader and the old-worker queue must be drained. Enable the managed lifecycle
-only after the exact intended web and relay SHA is running everywhere. Once
-the first managed binding or managed queue job exists, rolling back to an old
-binary is prohibited because it cannot honor lifecycle fences and can reopen
-legacy manual Messenger creation. Before any later rollback, disable intake,
-deploy the new binary with `quarantine_only=true`, require every API and worker
-replica to complete the synchronous pre-serve/pre-claim tenant quarantine and
+database import or environment change is part of the first compatible-binary
+deployment, and the managed pilot must be a different profile. Queue schema
+0/1 legacy static jobs remain readable. Legacy static and dynamic-registry jobs
+use schema 2; additional app-bound static Messenger jobs use schema 3. A
+schema-2 worker parks schema-3 jobs instead of interpreting them without the
+new app fence.
+
+Before enabling an additional static app descriptor or binding an account to
+it, every relay replica must run the schema-3-aware reader. Before the later
+lifecycle release enables a dynamic producer, every relay replica must first
+run a dynamic-aware schema-2 reader and the old-worker queue must be drained.
+Enable either producer only after the exact intended web and relay SHA is
+running everywhere. Once the first managed binding or managed queue job
+exists, rolling back to an old binary is prohibited because it cannot honor
+lifecycle fences and can reopen legacy manual Messenger creation.
+
+Before any later rollback, disable intake and drain schema-3 jobs with the new
+reader. If a job cannot be drained, deliberately park or dead-letter it and
+retain a schema-3-aware recovery path; do not let an old reader repeatedly park
+unknown work indefinitely. For a managed-lifecycle rollback, deploy the new
+binary with `quarantine_only=true`, require every API and worker replica to
+complete the synchronous pre-serve/pre-claim tenant quarantine and
 queue-cancellation barrier, and fail startup if that commit cannot complete.
 Do not wait for an asynchronous lifecycle sweep; reconcile
 unsubscribe/disconnect operations, and drain or safely park all managed jobs
@@ -204,7 +226,7 @@ the channel, token, webhook payload, or environment-variable name.
 
 | Channel/mode | Required token | Graph host | Webhook application |
 | --- | --- | --- | --- |
-| `messenger` | Facebook Page token with Messenger permissions | `graph.facebook.com` | Messenger parent app |
+| `messenger` | Facebook Page token with Messenger permissions | `graph.facebook.com` | Legacy Messenger parent app, or the exact additional app named by `messenger_app_id` |
 | `instagram` + `instagram_login` | Instagram user or system-user token with `instagram_business_*` permissions, including `instagram_business_manage_messages` | `graph.instagram.com` | Separate Instagram Login app |
 | `instagram` + `facebook_login` | Facebook Page token with `instagram_*` permissions, including `instagram_manage_messages` | `graph.facebook.com` | Messenger parent app |
 
@@ -219,6 +241,7 @@ Example:
     "key": "support-page",
     "channel": "messenger",
     "external_account_id": "FACEBOOK_PAGE_ID",
+    "messenger_app_id": "META_APP_ID",
     "rereply_webhook_url": "https://app.example.com/api/webhooks/channels/ACCOUNT_ID",
     "access_token_env": "META_SUPPORT_PAGE_TOKEN",
     "rereply_inbound_secret_env": "REREPLY_SUPPORT_INBOUND_SECRET",
@@ -247,11 +270,35 @@ Example:
 ]
 ```
 
-At account health time, the relay first pings Redis and then probes the exact
-mode-bound Graph host using the token only in the `Authorization` header:
+The matching additional-app inventory contains no secret value:
 
-- Messenger requires `GET /{version}/me?fields=id` to return the configured
-  Page ID.
+```json
+[
+  {
+    "app_id": "META_APP_ID",
+    "app_secret_env": "META_SUPPORT_MESSENGER_APP_SECRET",
+    "verify_token_env": "META_SUPPORT_MESSENGER_VERIFY_TOKEN"
+  }
+]
+```
+
+Omit `messenger_app_id` to retain the legacy static route. If it is present,
+startup fails unless the exact app descriptor exists. The account cannot use
+an Instagram mode, and the additional app route never falls through to the
+managed registry for an unknown Page.
+
+At account health time, the relay first pings Redis and then probes the exact
+mode-bound Graph host. Ordinary identity requests send the account token in the
+`Authorization` header. App-bound Messenger additionally uses Meta's required
+`debug_token` request: the Page token is the `input_token` query value and the
+exact app access token is in `Authorization`:
+
+- Legacy Messenger requires `GET /{version}/me?fields=id` to return the
+  configured Page ID.
+- App-bound static and registry-managed Messenger first inspect the Page token
+  with the exact app access token. The token must be valid, have type `PAGE`,
+  report the exact app ID and Page ID, and that app must appear in the Page's
+  `subscribed_apps` response with `messages`.
 - Instagram Login requires
   `GET /{version}/me?fields=user_id` to return the configured Instagram user
   ID.
@@ -263,19 +310,49 @@ Expired tokens, provider errors, malformed responses, wrong accounts, and
 wrong token families all fail health with a generic response. Tokens and
 provider response bodies are never logged or returned.
 
-Registry-managed Messenger Graph health, subscription checks, and outbound
-sends include `appsecret_proof` made with the distinct managed app secret and
-require the binding's exact managed platform-app ID. The static compatibility
-path intentionally does not add that proof: legacy Page tokens may have been
-issued by different clinic-era apps and must not be silently rebound or broken
-by this rollout.
+App-bound static and registry-managed Messenger Graph health, subscription
+checks, and outbound sends include `appsecret_proof` made with their exact app
+secret and require the binding's exact platform-app ID. Only the legacy static
+compatibility path omits that proof: its Page tokens may have been issued by
+different clinic-era apps and must not be silently rebound or broken.
+
+### Additional static Messenger rollout
+
+This is an additive, no-database-migration release. Deploy the compatible
+binary with the existing environment unchanged first; the new route remains a
+404. Then add the descriptor and its masked credentials to every replica while
+leaving all existing account mappings untouched. Verify that legacy and
+managed routes remain healthy before changing any Meta callback.
+
+Before binding a Page, obtain a fresh production Page token issued by the
+exact additional app. Configure the Page mapping and token consistently on all
+replicas, prove the signed account health check, then change only that app's
+Meta callback and subscribe only the intended Page to `messages`. Send one
+inbound test and one allowed outbound reply. If staging and production use the
+same Meta app and Page, keep that Page subscription: changing the app-level
+callback moves delivery, while unsubscribing the Page would disable both
+environments. Remove a Page subscription only from a separately identified
+former app after the new app is proven. Never rotate the legacy or managed
+global credentials for this cutover.
+
+Retain the staging deployment and its masked configuration as a rollback
+resource through the production observation window, even though the shared
+Meta app callback points to production during that window. Rollback is
+routing-first: stop production intake, drain all schema-3 work with the new
+reader, restore the known-good callback and matching account token/mapping,
+and verify that route before rolling back the binary or removing additional
+app credentials. A queued additional-app job stores its app identity and exact
+Page binding and is dead-lettered if either binding changes before forwarding.
 
 ## Delivery safety
 
 Inbound Meta webhooks are acknowledged only after the full normalized delivery
-is durably accepted in Redis. Repeated deliveries use the raw-body digest as
-their acceptance key, while individual canonical events carry stable provider
-dedupe keys.
+is durably accepted in Redis. Legacy, managed, and Instagram routes preserve
+their raw-body acceptance digest. Additional static Messenger routes namespace
+both the acceptance digest and canonical job ID by the exact webhook app, so a
+valid delivery cannot collide with byte-identical work accepted across an app
+cutover. Repeated deliveries within that app still deduplicate, while
+individual canonical events carry stable provider dedupe keys.
 
 Outbound requests require an account-scoped idempotency key. Successful and
 definitive 4xx outcomes are cached. An explicit `429` releases the claim for a

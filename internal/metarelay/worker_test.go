@@ -124,7 +124,7 @@ func TestWorkerParksStaleRegistryBindingWithoutConsumingRetryBudget(t *testing.T
 func TestWorkerParksUnknownFutureQueueVersion(t *testing.T) {
 	config := newTestConfig(t)
 	store := &fakeQueueStore{jobs: []InboundJob{{
-		SchemaVersion: InboundJobSchemaVersion + 1,
+		SchemaVersion: maxInboundJobSchemaVersion + 1,
 		ID:            "future-job", AccountKey: "registry.future", Body: []byte(`{}`),
 	}}}
 	worker, err := NewWorker(config, store)
