@@ -90,7 +90,11 @@ jobs:
 
       - name: Test exact rollout evidence controls
         run: |
-          python3 -m py_compile release/deployment/verify_rollout_evidence.py release/deployment/test_verify_rollout_evidence.py
+          python3 -m py_compile \
+            release/deployment/verify_rollout_evidence.py \
+            release/deployment/test_verify_rollout_evidence.py \
+            release/deployment/verify_production_plan.py \
+            release/deployment/test_verify_production_plan.py
           python3 -m unittest discover -s release/deployment -p 'test_*.py' -v
 
       - name: Set up Go

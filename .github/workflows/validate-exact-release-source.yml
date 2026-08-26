@@ -89,10 +89,10 @@ jobs:
               internal_tree="494d3957ff3559375f406886be45646049ec9378"
               ;;
             ui)
-              source_sha="ab44af2e7c093b4502c1928126c31306b2ba0389"
-              root_tree="3553b783d5cfdcbda2ffcee332a2aa392a897bc5"
-              frontend_tree="2f92a064f2f3d7f1867c835ef3be7f41e2f30444"
-              internal_tree="494d3957ff3559375f406886be45646049ec9378"
+              source_sha="ff0c9c6b8d94a085af164e564028d25d38b0a02c"
+              root_tree="6b3d030924913a562fee2b75fce318b01b421792"
+              frontend_tree="f1cdd8186e2b724dc4bba41081578b2b003a6910"
+              internal_tree="a1da97143c17f3d02e47250269d00f238ac0e38c"
               ;;
             *)
               echo "::error::The requested phase is not allowlisted."
@@ -370,13 +370,18 @@ jobs:
             baseline|bridge|backend)
               expected_original_blob="36a70caacdc068153b8a71e8c8747665f48acf33"
               expected_common_blob="ade1da3561942105ab376122e7dcb2f85f7c8f16"
+              apply_common_patch="true"
               completion_patch_relative_path="$LEGACY_COMPLETION_PATCH_RELATIVE_PATH"
               completion_patch_sha256="$LEGACY_COMPLETION_PATCH_SHA256"
               expected_patched_blob="7d7dc8a0bfe5f94bf728dcc2a499c54872e0e39f"
               ;;
             ui)
-              expected_original_blob="76c084e79d97074e013815d88ba3c8f9e772e685"
+              # The reviewed final source already contains the common
+              # WebCrypto outcome-wait fix. Apply only the audited completion
+              # harness and keep the product source otherwise immutable.
+              expected_original_blob="906e09c8ebf43d4ba23fcd3caf856175c6ecc332"
               expected_common_blob="906e09c8ebf43d4ba23fcd3caf856175c6ecc332"
+              apply_common_patch="false"
               completion_patch_relative_path="$UI_COMPLETION_PATCH_RELATIVE_PATH"
               completion_patch_sha256="$UI_COMPLETION_PATCH_SHA256"
               expected_patched_blob="f9ae2342e236274db62dc50e9acd19dba7e03f2f"
@@ -397,8 +402,12 @@ jobs:
           [[ "$(sha256sum "$completion_patch_path" | awk '{print $1}')" == "$completion_patch_sha256" ]]
           [[ "$(git -C "$source_dir" hash-object "$TEST_RELATIVE_PATH")" == "$expected_original_blob" ]]
 
-          git -C "$source_dir" apply --unidiff-zero --check --whitespace=error-all "$common_patch_path"
-          git -C "$source_dir" apply --unidiff-zero --whitespace=error-all "$common_patch_path"
+          if [[ "$apply_common_patch" == "true" ]]; then
+            git -C "$source_dir" apply --unidiff-zero --check --whitespace=error-all "$common_patch_path"
+            git -C "$source_dir" apply --unidiff-zero --whitespace=error-all "$common_patch_path"
+          else
+            [[ "$apply_common_patch" == "false" ]]
+          fi
           [[ "$(git -C "$source_dir" hash-object "$TEST_RELATIVE_PATH")" == "$expected_common_blob" ]]
           git -C "$source_dir" apply --unidiff-zero --check --whitespace=error-all "$completion_patch_path"
           git -C "$source_dir" apply --unidiff-zero --whitespace=error-all "$completion_patch_path"
