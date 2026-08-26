@@ -25,7 +25,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: rereply-exact-release-image-build
+  # Serialize image publication with validation, planning, apply, canary, and
+  # rollback so no phase can race another production authority.
+  group: rereply-production
   cancel-in-progress: false
 
 defaults:
@@ -1864,6 +1866,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
+      attestations: read
       contents: read
       packages: read # Resolve and authenticate the exact GHCR subject digest.
     strategy:
@@ -2367,8 +2370,9 @@ jobs:
       - authority
       - aggregate
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 45
     permissions:
+      attestations: read
       contents: read
     steps:
       - name: Require a GitHub-hosted runner
@@ -2524,6 +2528,33 @@ jobs:
             type == "array" and
             any(.[]; .verificationResult.statement.predicate == $expected[0])
           ' verified-release-set-binding.json > /dev/null
+
+      - name: Require anonymous pullability of every exact release digest
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker-config
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN CR_PAT REGISTRY_TOKEN DOCKER_AUTH_CONFIG
+          [[ ! -e "$DOCKER_CONFIG" ]]
+          install -d -m 0700 "$DOCKER_CONFIG"
+          [[ -z "$(find "$DOCKER_CONFIG" -mindepth 1 -print -quit)" ]]
+
+          pulled=0
+          while IFS=$'\t' read -r component image digest; do
+            [[ "$component" =~ ^(gmail-relay|meta-relay|web)$ ]]
+            [[ "$image" == "ghcr.io/medtechcorps-netizen/rereply-release-$component" ]]
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            subject="$image@$digest"
+            docker pull --platform linux/amd64 "$subject" > /dev/null
+            docker image inspect "$subject" | jq -e --arg subject "$subject" '
+              length == 1 and
+              (.[0].RepoDigests | type == "array" and index($subject) != null)
+            ' > /dev/null
+            pulled=$((pulled + 1))
+          done < <(jq -r '.images[] | [.component, .image, .digest] | @tsv' release-set.json)
+
+          [[ "$pulled" -eq 3 ]]
+          [[ ! -e "$DOCKER_CONFIG/config.json" ]]
 
       - name: Publish the verified digest-only summary
         env:

@@ -1,0 +1,761 @@
+name: Reconcile Production Orphan
+
+run-name: Classify one locked production mutation orphan without changing production
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Original mutation lane whose durable v2 intent owns the locked main branch
+        required: true
+        type: choice
+        options:
+          - apply
+          - rollback
+          - orphan-rollback
+      original_control_sha:
+        description: Exact protected-main control SHA of the original mutation run
+        required: true
+        type: string
+      original_run_id:
+        description: Exact original GitHub Actions run ID
+        required: true
+        type: string
+      original_run_attempt:
+        description: Exact original attempt; only attempt 1 is accepted
+        required: true
+        type: string
+      rule_id:
+        description: Exact locked main branch-protection rule node ID
+        required: true
+        type: string
+      rule_identity_sha256:
+        description: SHA-256 of the exact UTF-8 rule ID
+        required: true
+        type: string
+      mutation_intent_evidence_json:
+        description: Exact v2 mutation-intent run, attempt, artifact ID/API digest, and file SHA-256
+        required: true
+        type: string
+      original_receipt_evidence_json:
+        description: Optional exact signed original receipt descriptor, or an empty string
+        required: false
+        default: ""
+        type: string
+      typed_confirmation:
+        description: Type the exact content-free phrase shown in the operator runbook; signed artifacts store only its hash
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  WORKFLOW_PATH: .github/workflows/reconcile-production-orphan.yml
+  APPLY_WORKFLOW_PATH: .github/workflows/apply-production-phase.yml
+  ROLLBACK_WORKFLOW_PATH: .github/workflows/rollback-production-phase.yml
+  ORPHAN_ROLLBACK_WORKFLOW_PATH: .github/workflows/rollback-production-orphan.yml
+  CONTROLLER_PATH: release/deployment/reconcile_production_orphan.py
+  RELEASE_POLICY_PATH: release/deployment/production-release-policy.json
+  CHANGE_SCHEMA_PATH: release/deployment/production-change.schema.json
+  INTENT_SCHEMA_PATH: release/deployment/production-mutation-intent.schema.json
+  ASSERTION_SCHEMA_PATH: release/deployment/production-main-lock-assertion.schema.json
+  RECONCILIATION_SCHEMA_PATH: release/deployment/production-orphan-reconciliation.schema.json
+  CONTRACT_PATH: release/deployment/production-app-contract.json
+  INTENT_PREDICATE: https://rereply.app/attestations/production-mutation-intent/v2
+  APPLY_PREDICATE: https://rereply.app/attestations/production-phase-apply-receipt/v1
+  ROLLBACK_PREDICATE: https://rereply.app/attestations/production-phase-rollback-receipt/v1
+  ORPHAN_ROLLBACK_PREDICATE: https://rereply.app/attestations/production-orphan-rollback-receipt/v1
+  ASSERTION_PREDICATE: https://rereply.app/attestations/production-main-lock-assertion/v1
+  RECONCILIATION_PREDICATE: https://rereply.app/attestations/production-orphan-reconciliation/v1
+  PINNED_JQ_VERSION: "1.8.2"
+  PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+  PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
+
+jobs:
+  assertion:
+    name: Authenticate and attest the single-operator lock assertion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: rereply-production-orphan-reconcile
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      control_sha: ${{ steps.guard.outputs.control_sha }}
+      intent_run_id: ${{ steps.auth.outputs.intent_run_id }}
+      intent_run_attempt: ${{ steps.auth.outputs.intent_run_attempt }}
+      intent_artifact_id: ${{ steps.auth.outputs.intent_artifact_id }}
+      intent_artifact_digest: ${{ steps.auth.outputs.intent_artifact_digest }}
+      intent_artifact_name: ${{ steps.auth.outputs.intent_artifact_name }}
+      intent_sha256: ${{ steps.auth.outputs.intent_sha256 }}
+      original_receipt_present: ${{ steps.auth.outputs.original_receipt_present }}
+      original_receipt_run_id: ${{ steps.auth.outputs.original_receipt_run_id }}
+      original_receipt_artifact_id: ${{ steps.auth.outputs.original_receipt_artifact_id }}
+      original_receipt_artifact_digest: ${{ steps.auth.outputs.original_receipt_artifact_digest }}
+      original_receipt_artifact_name: ${{ steps.auth.outputs.original_receipt_artifact_name }}
+      original_receipt_sha256: ${{ steps.auth.outputs.original_receipt_sha256 }}
+      original_workflow_path: ${{ steps.auth.outputs.original_workflow_path }}
+      original_provider_job_b64: ${{ steps.auth.outputs.original_provider_job_b64 }}
+      assertion_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      assertion_artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
+      assertion_artifact_name: ${{ steps.names.outputs.artifact_name }}
+      assertion_sha256: ${{ steps.names.outputs.assertion_sha256 }}
+    steps:
+      - name: Require exact protected-main attempt-one reconciliation authority
+        id: guard
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          ORIGINAL_CONTROL_SHA: ${{ inputs.original_control_sha }}
+          ORIGINAL_RUN_ATTEMPT: ${{ inputs.original_run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == workflow_dispatch ]]
+          [[ "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$DISPATCH_REF" == refs/heads/main && "$REF_PROTECTED" == true ]]
+          [[ "$RUN_ATTEMPT" == 1 && "$ORIGINAL_RUN_ATTEMPT" == 1 ]]
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" && "$WORKFLOW_SHA" == "$ORIGINAL_CONTROL_SHA" ]]
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf 'control_sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact protected reconciliation controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.guard.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned read-only reconciliation authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/reconciliation-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Authenticate the exact locked run intent and optional signed receipt
+        id: auth
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
+          OPERATION: ${{ inputs.operation }}
+          ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+          ORIGINAL_RUN_ATTEMPT: ${{ inputs.original_run_attempt }}
+          RULE_ID: ${{ inputs.rule_id }}
+          RULE_IDENTITY_SHA256: ${{ inputs.rule_identity_sha256 }}
+          INTENT_DESCRIPTOR: ${{ inputs.mutation_intent_evidence_json }}
+          RECEIPT_DESCRIPTOR: ${{ inputs.original_receipt_evidence_json }}
+        with:
+          github-token: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          script: |
+            const crypto = require('crypto');
+            const exactKeys=(value,expected,label)=>{
+              if(!value || typeof value!=='object' || Array.isArray(value) ||
+                 JSON.stringify(Object.keys(value).sort())!==JSON.stringify([...expected].sort())) throw new Error(`${label} keys differ`);
+            };
+            const descriptor=(raw,label)=>{
+              const value=JSON.parse(raw);
+              exactKeys(value,['run_id','run_attempt','artifact_id','artifact_digest','sha256'],label);
+              if(value.run_attempt!==1 || !/^[1-9][0-9]{0,14}$/.test(String(value.run_id)) ||
+                 !/^[1-9][0-9]{0,14}$/.test(String(value.artifact_id)) ||
+                 !/^sha256:[0-9a-f]{64}$/.test(value.artifact_digest) || !/^[0-9a-f]{64}$/.test(value.sha256)) throw new Error(`${label} format differs`);
+              return value;
+            };
+            const intent=descriptor(process.env.INTENT_DESCRIPTOR,'intent descriptor');
+            const receiptRaw=process.env.RECEIPT_DESCRIPTOR.trim();
+            const receipt=receiptRaw===''?null:descriptor(receiptRaw,'receipt descriptor');
+            if(String(intent.run_id)!==process.env.ORIGINAL_RUN_ID || String(intent.run_attempt)!==process.env.ORIGINAL_RUN_ATTEMPT) throw new Error('intent run differs');
+            if(receipt && (String(receipt.run_id)!==process.env.ORIGINAL_RUN_ID || receipt.run_attempt!==1)) throw new Error('receipt run differs');
+            if(crypto.createHash('sha256').update(process.env.RULE_ID,'utf8').digest('hex')!==process.env.RULE_IDENTITY_SHA256) throw new Error('rule identity hash differs');
+            const operation=process.env.OPERATION;
+            const workflow=operation==='apply'?process.env.APPLY_WORKFLOW_PATH:operation==='rollback'?process.env.ROLLBACK_WORKFLOW_PATH:operation==='orphan-rollback'?process.env.ORPHAN_ROLLBACK_WORKFLOW_PATH:null;
+            const workflowName=operation==='apply'?'Apply Production Phase':operation==='rollback'?'Rollback Production Phase':operation==='orphan-rollback'?'Rollback Production Orphan':null;
+            if(!workflow) throw new Error('operation differs');
+            const expectedJobs=operation==='apply'?
+              ['Authenticate exact production apply authority','Prepare exact production apply pre-lock authority','Prepare and attest exact production mutation intent','Acquire exact production apply main lock','Attest exact production apply main lock proof','Apply exact production phase','Exact production apply receipt gate','Release exact production apply main lock']:
+              operation==='rollback'?
+              ['Authenticate exact production rollback authority','Prepare exact production rollback pre-lock authority','Prepare and attest exact production rollback mutation intent','Acquire exact production rollback main lock','Attest exact production rollback main lock proof','Roll back exact production phase','Exact production rollback receipt gate','Release exact production rollback main lock']:
+              ['Authenticate exact production orphan rollback authority','Prepare and attest exact production orphan rollback mutation intent','Attest exact production orphan rollback main lock proof','Roll back exact production orphan','Exact production orphan rollback receipt gate'];
+            const {owner,repo}=context.repo;
+            const latest=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(intent.run_id)});
+            const exact=await github.rest.actions.getWorkflowRunAttempt({owner,repo,run_id:Number(intent.run_id),attempt_number:1});
+            for(const run of [latest.data,exact.data]) {
+              if(run.run_attempt!==1 || run.head_sha!==process.env.CONTROL_SHA || run.head_branch!=='main' || run.event!=='workflow_dispatch' || run.path!==workflow || run.name!==workflowName || run.status!=='completed') throw new Error('original run authority differs');
+            }
+            const jobs=await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs',{owner,repo,run_id:Number(intent.run_id),attempt_number:1,per_page:100});
+            if(JSON.stringify(jobs.map(j=>j.name).sort())!==JSON.stringify([...expectedJobs].sort())) throw new Error('original job inventory differs');
+            const prerequisiteJobs=operation==='orphan-rollback'?expectedJobs.slice(0,2):expectedJobs.slice(0,3);
+            for(const required of prerequisiteJobs) {
+              const job=jobs.find(j=>j.name===required);
+              if(!job || job.status!=='completed' || job.conclusion!=='success') throw new Error(`required original job is not successful: ${required}`);
+            }
+            const providerJobName=operation==='apply'?'Apply exact production phase':operation==='rollback'?'Roll back exact production phase':'Roll back exact production orphan';
+            const providerJob=jobs.find(job=>job.name===providerJobName);
+            if(!providerJob) throw new Error('original provider job is absent');
+            const providerProjection={
+              job_id:String(providerJob.id),
+              job_name:providerJob.name,
+              status:providerJob.status,
+              conclusion:providerJob.conclusion,
+              started_at:providerJob.started_at,
+              completed_at:providerJob.completed_at,
+              steps:(providerJob.steps||[]).map(step=>({
+                number:step.number,
+                name:step.name,
+                status:step.status,
+                conclusion:step.conclusion,
+              })),
+            };
+            const intentArtifact=await github.rest.actions.getArtifact({owner,repo,artifact_id:Number(intent.artifact_id)});
+            const intentName=`production-mutation-intent-${operation}-${intent.run_id}-1`;
+            if(intentArtifact.data.name!==intentName || intentArtifact.data.digest!==intent.artifact_digest || intentArtifact.data.expired || intentArtifact.data.workflow_run.id!==Number(intent.run_id)) throw new Error('intent artifact authority differs');
+            let receiptName='';
+            if(receipt) {
+              const receiptJob=jobs.find(j=>j.name===(operation==='apply'?'Exact production apply receipt gate':operation==='rollback'?'Exact production rollback receipt gate':'Exact production orphan rollback receipt gate'));
+              if(!receiptJob || receiptJob.status!=='completed' || receiptJob.conclusion!=='success') throw new Error('receipt gate is not successful');
+              const receiptArtifact=await github.rest.actions.getArtifact({owner,repo,artifact_id:Number(receipt.artifact_id)});
+              receiptName=operation==='orphan-rollback'?`production-orphan-rollback-${receipt.run_id}-1`:`production-phase-${operation}-${receipt.run_id}-1`;
+              if(receiptArtifact.data.name!==receiptName || receiptArtifact.data.digest!==receipt.artifact_digest || receiptArtifact.data.expired || receiptArtifact.data.workflow_run.id!==Number(receipt.run_id)) throw new Error('receipt artifact authority differs');
+            }
+            const main=await github.rest.git.getRef({owner,repo,ref:'heads/main'});
+            if(main.data.object.sha!==process.env.CONTROL_SHA) throw new Error('main changed');
+            const query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}';
+            const rules=await github.graphql(query,{owner,name:repo});
+            const connection=rules.repository.branchProtectionRules;
+            const exactRules=connection.nodes.filter(rule=>rule.pattern==='main');
+            if(connection.pageInfo.hasNextPage || exactRules.length!==1) throw new Error('main rule is ambiguous');
+            const rule=exactRules[0];
+            if(rule.id!==process.env.RULE_ID || rule.lockBranch!==true || rule.isAdminEnforced!==true || rule.lockAllowsFetchAndMerge!==false) throw new Error('main is not locked by the asserted rule');
+            const allRuns=await github.paginate(github.rest.actions.listWorkflowRunsForRepo,{owner,repo,per_page:100});
+            const controlled=new Set([process.env.APPLY_WORKFLOW_PATH,process.env.ROLLBACK_WORKFLOW_PATH,'.github/workflows/reconcile-production-orphan.yml','.github/workflows/finalize-production-orphan-lock.yml','.github/workflows/rollback-production-orphan.yml','.github/workflows/verify-production-crm-canary.yml']);
+            const active=allRuns.filter(run=>run.id!==context.runId && controlled.has(run.path) && run.status!=='completed');
+            if(active.length!==0) throw new Error('another production control is active');
+            core.setOutput('intent_run_id',String(intent.run_id));
+            core.setOutput('intent_run_attempt','1');
+            core.setOutput('intent_artifact_id',String(intent.artifact_id));
+            core.setOutput('intent_artifact_digest',intent.artifact_digest);
+            core.setOutput('intent_artifact_name',intentName);
+            core.setOutput('intent_sha256',intent.sha256);
+            core.setOutput('original_receipt_present',receipt?'true':'false');
+            core.setOutput('original_receipt_run_id',receipt?String(receipt.run_id):'');
+            core.setOutput('original_receipt_artifact_id',receipt?String(receipt.artifact_id):'');
+            core.setOutput('original_receipt_artifact_digest',receipt?receipt.artifact_digest:'');
+            core.setOutput('original_receipt_artifact_name',receiptName);
+            core.setOutput('original_receipt_sha256',receipt?receipt.sha256:'');
+            core.setOutput('original_workflow_path',workflow);
+            core.setOutput('original_provider_job_b64',Buffer.from(JSON.stringify(providerProjection),'utf8').toString('base64'));
+
+      - name: Download exact v2 production mutation intent
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.auth.outputs.intent_artifact_id }}
+          path: ${{ runner.temp }}/mutation-intent
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.auth.outputs.intent_run_id }}
+
+      - name: Download optional exact original signed receipt
+        if: steps.auth.outputs.original_receipt_present == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.auth.outputs.original_receipt_artifact_id }}
+          path: ${{ runner.temp }}/original-receipt
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.auth.outputs.original_receipt_run_id }}
+
+      - name: Verify exact intent and receipt attestations
+        env:
+          CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
+          EXPECTED_INTENT_SHA256: ${{ steps.auth.outputs.intent_sha256 }}
+          EXPECTED_RECEIPT_SHA256: ${{ steps.auth.outputs.original_receipt_sha256 }}
+          ORIGINAL_RECEIPT_PRESENT: ${{ steps.auth.outputs.original_receipt_present }}
+          OPERATION: ${{ inputs.operation }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$(find "$RUNNER_TEMP/mutation-intent" -maxdepth 1 -type f -printf '%f\n' | sort)" == $'production-mutation-intent.json\nproduction-mutation-intent.sha256' ]]
+          [[ -z "$(find "$RUNNER_TEMP/mutation-intent" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          intent="$RUNNER_TEMP/mutation-intent/production-mutation-intent.json"
+          [[ "$(cat "$RUNNER_TEMP/mutation-intent/production-mutation-intent.sha256")" == "$EXPECTED_INTENT_SHA256" ]]
+          [[ "$(sha256sum "$intent" | awk '{print $1}')" == "$EXPECTED_INTENT_SHA256" ]]
+          workflow="$APPLY_WORKFLOW_PATH"
+          receipt_stem=production-phase-apply-receipt
+          receipt_predicate="$APPLY_PREDICATE"
+          if [[ "$OPERATION" == rollback ]]; then
+            workflow="$ROLLBACK_WORKFLOW_PATH"
+            receipt_stem=production-phase-rollback-receipt
+            receipt_predicate="$ROLLBACK_PREDICATE"
+          elif [[ "$OPERATION" == orphan-rollback ]]; then
+            workflow="$ORPHAN_ROLLBACK_WORKFLOW_PATH"
+            receipt_stem=production-orphan-rollback-receipt
+            receipt_predicate="$ORPHAN_ROLLBACK_PREDICATE"
+          fi
+          flags=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/$workflow" --signer-digest "$CONTROL_SHA" --source-ref refs/heads/main --source-digest "$CONTROL_SHA" --deny-self-hosted-runners --format json)
+          gh attestation verify "$intent" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/intent-provenance.json"
+          gh attestation verify "$intent" "${flags[@]}" --predicate-type "$INTENT_PREDICATE" > "$RUNNER_TEMP/intent-policy.json"
+          jq -e --slurpfile expected "$intent" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/intent-policy.json" > /dev/null
+          if [[ "$ORIGINAL_RECEIPT_PRESENT" == true ]]; then
+            [[ "$(find "$RUNNER_TEMP/original-receipt" -maxdepth 1 -type f -printf '%f\n' | sort)" == "$receipt_stem.json"$'\n'"$receipt_stem.sha256" ]]
+            [[ -z "$(find "$RUNNER_TEMP/original-receipt" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+            receipt="$RUNNER_TEMP/original-receipt/$receipt_stem.json"
+            [[ "$(cat "$RUNNER_TEMP/original-receipt/$receipt_stem.sha256")" == "$EXPECTED_RECEIPT_SHA256" ]]
+            [[ "$(sha256sum "$receipt" | awk '{print $1}')" == "$EXPECTED_RECEIPT_SHA256" ]]
+            gh attestation verify "$receipt" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/receipt-provenance.json"
+            gh attestation verify "$receipt" "${flags[@]}" --predicate-type "$receipt_predicate" > "$RUNNER_TEMP/receipt-policy.json"
+            jq -e --slurpfile expected "$receipt" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/receipt-policy.json" > /dev/null
+          fi
+
+      - name: Build the exact hash-only single-operator lock assertion
+        id: names
+        env:
+          CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
+          INTENT_SHA256: ${{ steps.auth.outputs.intent_sha256 }}
+          ORIGINAL_CONTROL_SHA: ${{ inputs.original_control_sha }}
+          ORIGINAL_RUN_ID: ${{ inputs.original_run_id }}
+          ORIGINAL_RUN_ATTEMPT: ${{ inputs.original_run_attempt }}
+          ORIGINAL_WORKFLOW_PATH: ${{ steps.auth.outputs.original_workflow_path }}
+          ORIGINAL_PROVIDER_JOB_B64: ${{ steps.auth.outputs.original_provider_job_b64 }}
+          RULE_ID: ${{ inputs.rule_id }}
+          TYPED_CONFIRMATION: ${{ inputs.typed_confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+          for path in "$CONTROLLER_PATH" "$INTENT_SCHEMA_PATH" "$ASSERTION_SCHEMA_PATH"; do
+            git -C control ls-files --error-unmatch "$path" > /dev/null
+            [[ "$(git -C control cat-file -t "HEAD:$path")" == blob ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+          done
+          request_dir="$RUNNER_TEMP/lock-assertion-request"
+          mkdir -m 0700 "$request_dir"
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import base64, json, os
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])/'lock-assertion-request'
+          path=root/'assertion-request.json'
+          flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0)
+          fd=os.open(path,flags,0o600)
+          value={
+            'original_workflow_path':os.environ['ORIGINAL_WORKFLOW_PATH'],
+            'original_control_sha':os.environ['ORIGINAL_CONTROL_SHA'],
+            'original_run_id':int(os.environ['ORIGINAL_RUN_ID']),
+            'original_run_attempt':int(os.environ['ORIGINAL_RUN_ATTEMPT']),
+            'rule_id':os.environ['RULE_ID'],
+            'current_main_sha':os.environ['CONTROL_SHA'],
+            'typed_confirmation':os.environ['TYPED_CONFIRMATION'],
+            'original_provider_job':json.loads(base64.b64decode(os.environ['ORIGINAL_PROVIDER_JOB_B64'],validate=True)),
+          }
+          with os.fdopen(fd,'wb') as stream:
+            stream.write(json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()+b'\n')
+            stream.flush(); os.fsync(stream.fileno())
+          PY
+          unset TYPED_CONFIRMATION
+          controller_sha="$(sha256sum "control/$CONTROLLER_PATH" | awk '{print $1}')"
+          /usr/bin/python3 -I -S -B "control/$CONTROLLER_PATH" prepare-lock-assertion \
+            --assertion-request "$request_dir/assertion-request.json" \
+            --mutation-intent "$RUNNER_TEMP/mutation-intent/production-mutation-intent.json" \
+            --mutation-intent-sha256 "$INTENT_SHA256" \
+            --workflow-sha "$CONTROL_SHA" --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt 1 --runner-temp "$RUNNER_TEMP" \
+            --output "$RUNNER_TEMP/production-main-lock-assertion.json"
+          rm -f -- "$request_dir/assertion-request.json"
+          rmdir -- "$request_dir"
+          assertion_sha="$(sha256sum "$RUNNER_TEMP/production-main-lock-assertion.json" | awk '{print $1}')"
+          printf '%s\n' "$assertion_sha" > "$RUNNER_TEMP/production-main-lock-assertion.sha256"
+          printf 'artifact_name=production-main-lock-assertion-%s-1\n' "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          printf 'assertion_sha256=%s\n' "$assertion_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Attest exact lock assertion provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-main-lock-assertion.json
+
+      - name: Attest exact single-operator lock assertion
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-main-lock-assertion.json
+          predicate-type: ${{ env.ASSERTION_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/production-main-lock-assertion.json
+
+      - name: Upload exact production main lock assertion
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.names.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/production-main-lock-assertion.json
+            ${{ runner.temp }}/production-main-lock-assertion.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Canonicalize main-lock-assertion artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+  observe:
+    name: Classify exact production orphan with GET-only capability
+    needs: assertion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: rereply-production-orphan-reconcile
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      unsigned_artifact_name: ${{ steps.names.outputs.unsigned_artifact_name }}
+    steps:
+      - name: Check out exact protected reconciliation controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.assertion.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned GET-only reconciliation authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/reconciliation-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/observe-gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/observe-gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/observe-gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Download exact mutation intent
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.assertion.outputs.intent_artifact_id }}
+          path: ${{ runner.temp }}/mutation-intent
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.assertion.outputs.intent_run_id }}
+
+      - name: Download exact lock assertion
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.assertion.outputs.assertion_artifact_id }}
+          path: ${{ runner.temp }}/lock-assertion
+
+      - name: Download optional original signed receipt
+        if: needs.assertion.outputs.original_receipt_present == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.assertion.outputs.original_receipt_artifact_id }}
+          path: ${{ runner.temp }}/original-receipt
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.assertion.outputs.original_receipt_run_id }}
+
+      - name: Verify exact mutation-intent and lock-assertion attestations before provider reads
+        env:
+          CONTROL_SHA: ${{ needs.assertion.outputs.control_sha }}
+          INTENT_SHA256: ${{ needs.assertion.outputs.intent_sha256 }}
+          ASSERTION_SHA256: ${{ needs.assertion.outputs.assertion_sha256 }}
+          ORIGINAL_WORKFLOW_PATH: ${{ needs.assertion.outputs.original_workflow_path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          intent="$RUNNER_TEMP/mutation-intent/production-mutation-intent.json"
+          assertion="$RUNNER_TEMP/lock-assertion/production-main-lock-assertion.json"
+          for pair in "$intent|$RUNNER_TEMP/mutation-intent/production-mutation-intent.sha256|$INTENT_SHA256" "$assertion|$RUNNER_TEMP/lock-assertion/production-main-lock-assertion.sha256|$ASSERTION_SHA256"; do
+            IFS='|' read -r subject sidecar expected <<< "$pair"
+            [[ -f "$subject" && ! -L "$subject" && -f "$sidecar" && ! -L "$sidecar" ]]
+            [[ "$(cat "$sidecar")" == "$expected" ]]
+            [[ "$(sha256sum "$subject" | awk '{print $1}')" == "$expected" ]]
+          done
+          intent_flags=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/$ORIGINAL_WORKFLOW_PATH" --signer-digest "$CONTROL_SHA" --source-ref refs/heads/main --source-digest "$CONTROL_SHA" --deny-self-hosted-runners --format json)
+          gh attestation verify "$intent" "${intent_flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/observe-intent-provenance.json"
+          gh attestation verify "$intent" "${intent_flags[@]}" --predicate-type "$INTENT_PREDICATE" > "$RUNNER_TEMP/observe-intent-policy.json"
+          assertion_flags=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/$WORKFLOW_PATH" --signer-digest "$CONTROL_SHA" --source-ref refs/heads/main --source-digest "$CONTROL_SHA" --deny-self-hosted-runners --format json)
+          gh attestation verify "$assertion" "${assertion_flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/observe-assertion-provenance.json"
+          gh attestation verify "$assertion" "${assertion_flags[@]}" --predicate-type "$ASSERTION_PREDICATE" > "$RUNNER_TEMP/observe-assertion-policy.json"
+          for path in "$CONTROLLER_PATH" "$CONTRACT_PATH" "$RELEASE_POLICY_PATH" "$CHANGE_SCHEMA_PATH" "$INTENT_SCHEMA_PATH" "$RECONCILIATION_SCHEMA_PATH"; do
+            git -C control ls-files --error-unmatch "$path" > /dev/null
+            [[ "$(git -C control cat-file -t "HEAD:$path")" == blob ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+          done
+
+      - name: Recheck exact main and immutable evidence before provider reads
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          CONTROL_SHA: ${{ needs.assertion.outputs.control_sha }}
+          INTENT_RUN_ID: ${{ needs.assertion.outputs.intent_run_id }}
+          RULE_ID: ${{ inputs.rule_id }}
+        with:
+          github-token: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          script: |
+            const {owner,repo}=context.repo;
+            const main=await github.rest.git.getRef({owner,repo,ref:'heads/main'});
+            const current=await github.rest.actions.getWorkflowRun({owner,repo,run_id:context.runId});
+            const original=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(process.env.INTENT_RUN_ID)});
+            if(main.data.object.sha!==process.env.CONTROL_SHA || current.data.run_attempt!==1 || current.data.head_sha!==process.env.CONTROL_SHA || current.data.event!=='workflow_dispatch') throw new Error('reconciliation authority changed');
+            if(original.data.run_attempt!==1 || original.data.head_sha!==process.env.CONTROL_SHA || original.data.status!=='completed') throw new Error('original run authority changed');
+            const query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}';
+            const result=await github.graphql(query,{owner,name:repo});
+            const connection=result.repository.branchProtectionRules;
+            const rules=connection.nodes.filter(rule=>rule.pattern==='main');
+            if(connection.pageInfo.hasNextPage || rules.length!==1 || rules[0].id!==process.env.RULE_ID || rules[0].lockBranch!==true || rules[0].isAdminEnforced!==true || rules[0].lockAllowsFetchAndMerge!==false) throw new Error('main lock authority changed');
+            const allRuns=await github.paginate(github.rest.actions.listWorkflowRunsForRepo,{owner,repo,per_page:100});
+            const controlled=new Set([process.env.APPLY_WORKFLOW_PATH,process.env.ROLLBACK_WORKFLOW_PATH,process.env.ORPHAN_ROLLBACK_WORKFLOW_PATH,process.env.WORKFLOW_PATH,'.github/workflows/finalize-production-orphan-lock.yml','.github/workflows/verify-production-crm-canary.yml']);
+            if(allRuns.some(run=>run.id!==context.runId && controlled.has(run.path) && run.status!=='completed')) throw new Error('another production control became active');
+
+      - name: Reconcile orphan with one isolated GET-only provider capability
+        env:
+          CONTROL_SHA: ${{ needs.assertion.outputs.control_sha }}
+          DO_PRODUCTION_PLAN_TOKEN: ${{ secrets.DO_PRODUCTION_READ_TOKEN }}
+          DO_PRODUCTION_TARGET_JSON: ${{ secrets.DO_PRODUCTION_TARGET_JSON }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          GITHUB_READ_TOKEN: ${{ github.token }}
+          RULE_ID: ${{ inputs.rule_id }}
+          INTENT_ARTIFACT_DIGEST: ${{ needs.assertion.outputs.intent_artifact_digest }}
+          INTENT_ARTIFACT_ID: ${{ needs.assertion.outputs.intent_artifact_id }}
+          INTENT_ARTIFACT_NAME: ${{ needs.assertion.outputs.intent_artifact_name }}
+          INTENT_RUN_ATTEMPT: ${{ needs.assertion.outputs.intent_run_attempt }}
+          INTENT_RUN_ID: ${{ needs.assertion.outputs.intent_run_id }}
+          INTENT_SHA256: ${{ needs.assertion.outputs.intent_sha256 }}
+          ASSERTION_ARTIFACT_DIGEST: ${{ needs.assertion.outputs.assertion_artifact_digest }}
+          ASSERTION_ARTIFACT_ID: ${{ needs.assertion.outputs.assertion_artifact_id }}
+          ASSERTION_ARTIFACT_NAME: ${{ needs.assertion.outputs.assertion_artifact_name }}
+          ASSERTION_SHA256: ${{ needs.assertion.outputs.assertion_sha256 }}
+          ORIGINAL_RECEIPT_PRESENT: ${{ needs.assertion.outputs.original_receipt_present }}
+          ORIGINAL_RECEIPT_ARTIFACT_DIGEST: ${{ needs.assertion.outputs.original_receipt_artifact_digest }}
+          ORIGINAL_RECEIPT_ARTIFACT_ID: ${{ needs.assertion.outputs.original_receipt_artifact_id }}
+          ORIGINAL_RECEIPT_ARTIFACT_NAME: ${{ needs.assertion.outputs.original_receipt_artifact_name }}
+          ORIGINAL_RECEIPT_RUN_ID: ${{ needs.assertion.outputs.original_receipt_run_id }}
+          ORIGINAL_RECEIPT_SHA256: ${{ needs.assertion.outputs.original_receipt_sha256 }}
+        run: |
+          set -euo pipefail
+          provider_read_token="$DO_PRODUCTION_PLAN_TOKEN"
+          target_json="$DO_PRODUCTION_TARGET_JSON"
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          github_read_token="$GITHUB_READ_TOKEN"
+          unset DO_PRODUCTION_PLAN_TOKEN DO_PRODUCTION_TARGET_JSON GH_PRODUCTION_BRANCH_READ_TOKEN GITHUB_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$provider_read_token" && -n "$target_json" && -n "$branch_read_token" && -n "$github_read_token" ]]
+          tools_dir="$RUNNER_TEMP/reconciliation-tools"
+          gh_bin="$tools_dir/gh"
+          jq_bin="$tools_dir/jq"
+          live_main="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main" == "$CONTROL_SHA" ]]
+          repository_owner="${GITHUB_REPOSITORY%%/*}"
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          rule_query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}'
+          locked_rule="$(GH_TOKEN="$branch_read_token" "$gh_bin" api graphql -f "query=$rule_query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$RULE_ID" '.data.repository.branchProtectionRules.pageInfo.hasNextPage == false and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == true and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$locked_rule" > /dev/null
+          current_run="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"
+          "$jq_bin" -e --arg sha "$CONTROL_SHA" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and (.status == "in_progress" or .status == "queued")' <<< "$current_run" > /dev/null
+          branch_read_token= github_read_token=
+          authority_dir="$RUNNER_TEMP/reconciliation-authorities"
+          mkdir -m 0700 "$authority_dir"
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import json, os
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])/'reconciliation-authorities'
+          def write(name,value):
+              path=root/name
+              fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0),0o600)
+              with os.fdopen(fd,'wb') as stream:
+                  stream.write(json.dumps(value,sort_keys=True,separators=(',',':')).encode()+b'\n')
+                  stream.flush(); os.fsync(stream.fileno())
+          write('intent-authority.json',{
+            'run_id':int(os.environ['INTENT_RUN_ID']),'run_attempt':int(os.environ['INTENT_RUN_ATTEMPT']),
+            'artifact_id':int(os.environ['INTENT_ARTIFACT_ID']),'artifact_name':os.environ['INTENT_ARTIFACT_NAME'],
+            'artifact_digest':os.environ['INTENT_ARTIFACT_DIGEST'],'sha256':os.environ['INTENT_SHA256']})
+          write('assertion-authority.json',{
+            'run_id':int(os.environ['GITHUB_RUN_ID']),'run_attempt':1,
+            'artifact_id':int(os.environ['ASSERTION_ARTIFACT_ID']),'artifact_name':os.environ['ASSERTION_ARTIFACT_NAME'],
+            'artifact_digest':os.environ['ASSERTION_ARTIFACT_DIGEST'],'sha256':os.environ['ASSERTION_SHA256']})
+          if os.environ['ORIGINAL_RECEIPT_PRESENT']=='true':
+              write('original-receipt-authority.json',{
+                'run_id':int(os.environ['ORIGINAL_RECEIPT_RUN_ID']),'run_attempt':1,
+                'artifact_id':int(os.environ['ORIGINAL_RECEIPT_ARTIFACT_ID']),'artifact_name':os.environ['ORIGINAL_RECEIPT_ARTIFACT_NAME'],
+                'artifact_digest':os.environ['ORIGINAL_RECEIPT_ARTIFACT_DIGEST'],'sha256':os.environ['ORIGINAL_RECEIPT_SHA256']})
+          PY
+          controller_sha="$(sha256sum "control/$CONTROLLER_PATH" | awk '{print $1}')"
+          args=(reconcile --target-env DO_PRODUCTION_TARGET_JSON
+            --intent "$RUNNER_TEMP/mutation-intent/production-mutation-intent.json"
+            --intent-authority "$authority_dir/intent-authority.json"
+            --lock-assertion "$RUNNER_TEMP/lock-assertion/production-main-lock-assertion.json"
+            --lock-assertion-authority "$authority_dir/assertion-authority.json"
+            --contract "control/$CONTRACT_PATH" --policy "control/$RELEASE_POLICY_PATH"
+            --change-schema "control/$CHANGE_SCHEMA_PATH"
+            --intent-schema "control/$INTENT_SCHEMA_PATH"
+            --reconciliation-schema "control/$RECONCILIATION_SCHEMA_PATH"
+            --controller-sha256 "$controller_sha"
+            --workflow-sha "$CONTROL_SHA" --workflow-run-id "$GITHUB_RUN_ID"
+            --workflow-run-attempt 1 --runner-temp "$RUNNER_TEMP"
+            --output "$RUNNER_TEMP/production-orphan-reconciliation.json")
+          if [[ "$ORIGINAL_RECEIPT_PRESENT" == true ]]; then
+            receipt_stem=production-phase-apply-receipt
+            if [[ "${{ inputs.operation }}" == rollback ]]; then
+              receipt_stem=production-phase-rollback-receipt
+            elif [[ "${{ inputs.operation }}" == orphan-rollback ]]; then
+              receipt_stem=production-orphan-rollback-receipt
+            fi
+            args+=(--original-receipt "$RUNNER_TEMP/original-receipt/$receipt_stem.json"
+              --original-receipt-authority "$authority_dir/original-receipt-authority.json")
+          fi
+          export DO_PRODUCTION_PLAN_TOKEN="$provider_read_token"
+          export DO_PRODUCTION_TARGET_JSON="$target_json"
+          /usr/bin/python3 -I -S -B "control/$CONTROLLER_PATH" "${args[@]}"
+          unset DO_PRODUCTION_PLAN_TOKEN DO_PRODUCTION_TARGET_JSON
+          provider_read_token= target_json=
+          rm -rf -- "$authority_dir"
+
+      - name: Create exact sanitized reconciliation sidecar
+        id: names
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          sha256sum production-orphan-reconciliation.json | awk '{print $1}' > production-orphan-reconciliation.sha256
+          printf 'unsigned_artifact_name=unsigned-production-orphan-reconciliation-%s-1\n' "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned orphan reconciliation receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.names.outputs.unsigned_artifact_name }}
+          path: |
+            ${{ runner.temp }}/production-orphan-reconciliation.json
+            ${{ runner.temp }}/production-orphan-reconciliation.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  gate:
+    name: Exact production orphan reconciliation gate
+    needs: [assertion, observe]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: rereply-production-orphan-reconcile
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out exact protected reconciliation controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.assertion.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Download unsigned exact orphan reconciliation
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.observe.outputs.unsigned_artifact_name }}
+          path: ${{ runner.temp }}/reconciliation
+
+      - name: Recheck exact main and attempts before attestation
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          CONTROL_SHA: ${{ needs.assertion.outputs.control_sha }}
+          ORIGINAL_RUN_ID: ${{ needs.assertion.outputs.intent_run_id }}
+          RULE_ID: ${{ inputs.rule_id }}
+        with:
+          github-token: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          script: |
+            const {owner,repo}=context.repo;
+            const main=await github.rest.git.getRef({owner,repo,ref:'heads/main'});
+            const current=await github.rest.actions.getWorkflowRun({owner,repo,run_id:context.runId});
+            const original=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(process.env.ORIGINAL_RUN_ID)});
+            if(main.data.object.sha!==process.env.CONTROL_SHA || current.data.run_attempt!==1 || current.data.head_sha!==process.env.CONTROL_SHA || current.data.event!=='workflow_dispatch') throw new Error('reconciliation gate authority changed');
+            if(original.data.run_attempt!==1 || original.data.head_sha!==process.env.CONTROL_SHA || original.data.status!=='completed') throw new Error('original attempt changed');
+            const query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}';
+            const result=await github.graphql(query,{owner,name:repo});
+            const connection=result.repository.branchProtectionRules;
+            const rules=connection.nodes.filter(rule=>rule.pattern==='main');
+            if(connection.pageInfo.hasNextPage || rules.length!==1 || rules[0].id!==process.env.RULE_ID || rules[0].lockBranch!==true || rules[0].isAdminEnforced!==true || rules[0].lockAllowsFetchAndMerge!==false) throw new Error('main lock authority changed before attestation');
+            const allRuns=await github.paginate(github.rest.actions.listWorkflowRunsForRepo,{owner,repo,per_page:100});
+            const controlled=new Set([process.env.APPLY_WORKFLOW_PATH,process.env.ROLLBACK_WORKFLOW_PATH,process.env.ORPHAN_ROLLBACK_WORKFLOW_PATH,process.env.WORKFLOW_PATH,'.github/workflows/finalize-production-orphan-lock.yml','.github/workflows/verify-production-crm-canary.yml']);
+            if(allRuns.some(run=>run.id!==context.runId && controlled.has(run.path) && run.status!=='completed')) throw new Error('another production control became active');
+
+      - name: Validate exact GET-only reconciliation receipt
+        env:
+          CONTROL_SHA: ${{ needs.assertion.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/reconciliation"
+          [[ "$(find . -maxdepth 1 -type f -printf '%f\n' | sort)" == $'production-orphan-reconciliation.json\nproduction-orphan-reconciliation.sha256' ]]
+          [[ -z "$(find . -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(cat production-orphan-reconciliation.sha256)" == "$(sha256sum production-orphan-reconciliation.json | awk '{print $1}')" ]]
+          /usr/bin/python3 -I -S -B -c '
+          import json,pathlib,sys
+          sys.path.insert(0,"'"$GITHUB_WORKSPACE"'/control/release/deployment")
+          import verify_production_release as v
+          value=v.load_json(pathlib.Path("production-orphan-reconciliation.json"),"reconciliation receipt")
+          value=v.validate_reconciliation_receipt(value)
+          if value["control"]["workflow_sha"]!="'"$CONTROL_SHA"'" or str(value["control"]["run_id"])!="'"$GITHUB_RUN_ID"'" or value["control"]["run_attempt"]!=1:
+              raise SystemExit("reconciliation control differs")
+          '
+
+      - name: Attest orphan reconciliation provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/reconciliation/production-orphan-reconciliation.json
+
+      - name: Attest exact orphan reconciliation policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/reconciliation/production-orphan-reconciliation.json
+          predicate-type: ${{ env.RECONCILIATION_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/reconciliation/production-orphan-reconciliation.json
+
+      - name: Upload signed exact orphan reconciliation receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-orphan-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/reconciliation/production-orphan-reconciliation.json
+            ${{ runner.temp }}/reconciliation/production-orphan-reconciliation.sha256
+          if-no-files-found: error
+          retention-days: 30

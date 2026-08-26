@@ -1,0 +1,1412 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rereply.app/schemas/production-mutation-intent-v2.json",
+  "title": "ReReply durable production mutation intent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authority",
+    "repository",
+    "prepared_at",
+    "expires_at",
+    "control",
+    "operation",
+    "lineage",
+    "authorities",
+    "lock",
+    "before",
+    "desired",
+    "mutation",
+    "rollback",
+    "canary"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "authority": {
+      "const": "production-mutation-intent"
+    },
+    "repository": {
+      "const": "medtechcorps-netizen/whatomate"
+    },
+    "prepared_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "expires_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "control": {
+      "$ref": "#/$defs/control"
+    },
+    "operation": {
+      "enum": [
+        "activate",
+        "rollback"
+      ]
+    },
+    "lineage": {
+      "$ref": "#/$defs/lineage"
+    },
+    "authorities": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/applyAuthorities"
+        },
+        {
+          "$ref": "#/$defs/rollbackAuthorities"
+        }
+      ]
+    },
+    "lock": {
+      "$ref": "#/$defs/lock"
+    },
+    "before": {
+      "$ref": "#/$defs/providerState"
+    },
+    "desired": {
+      "$ref": "#/$defs/desiredProjection"
+    },
+    "mutation": {
+      "$ref": "#/$defs/mutation"
+    },
+    "rollback": {
+      "$ref": "#/$defs/rollback"
+    },
+    "canary": {
+      "$ref": "#/$defs/canary"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "activate"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "control": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/apply-production-phase.yml"
+              }
+            }
+          },
+          "lineage": {
+            "properties": {
+              "operation": {
+                "const": "activate"
+              }
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/activateBaselineLineage"
+              },
+              {
+                "$ref": "#/$defs/activateBridgeLineage"
+              },
+              {
+                "$ref": "#/$defs/activateBackendLineage"
+              },
+              {
+                "$ref": "#/$defs/activateUiLineage"
+              }
+            ]
+          },
+          "authorities": {
+            "$ref": "#/$defs/applyAuthorities"
+          },
+          "lock": {
+            "properties": {
+              "mode": {
+                "const": "planned"
+              },
+              "strategy": {
+                "const": "acquire"
+              },
+              "owner_operation": {
+                "const": "apply"
+              },
+              "owner_intent_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "rollback"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "control": {
+            "properties": {
+              "workflow_path": {
+                "enum": [
+                  ".github/workflows/rollback-production-phase.yml",
+                  ".github/workflows/rollback-production-orphan.yml"
+                ]
+              }
+            }
+          },
+          "lineage": {
+            "properties": {
+              "operation": {
+                "const": "rollback"
+              }
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/rollbackBridgeToBaselineLineage"
+              },
+              {
+                "$ref": "#/$defs/rollbackBackendToBridgeLineage"
+              },
+              {
+                "$ref": "#/$defs/rollbackUiToBackendLineage"
+              },
+              {
+                "$ref": "#/$defs/rollbackUiToBridgeLineage"
+              }
+            ]
+          },
+          "authorities": {
+            "$ref": "#/$defs/rollbackAuthorities"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "rollback"
+          },
+          "lock": {
+            "required": [
+              "strategy"
+            ],
+            "properties": {
+              "strategy": {
+                "const": "acquire"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "control": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/rollback-production-phase.yml"
+              }
+            }
+          },
+          "lock": {
+            "properties": {
+              "owner_operation": {
+                "const": "rollback"
+              },
+              "owner_intent_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lock": {
+            "required": [
+              "strategy"
+            ],
+            "properties": {
+              "strategy": {
+                "const": "inherit"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "operation": {
+            "const": "rollback"
+          },
+          "control": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/rollback-production-orphan.yml"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lineage": {
+            "required": [
+              "to"
+            ],
+            "properties": {
+              "to": {
+                "const": "baseline"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "rollback": {
+            "const": {
+              "allowed_targets": [],
+              "forbidden_targets": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lineage": {
+            "required": [
+              "to"
+            ],
+            "properties": {
+              "to": {
+                "const": "bridge"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "rollback": {
+            "const": {
+              "allowed_targets": [
+                "baseline"
+              ],
+              "forbidden_targets": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lineage": {
+            "required": [
+              "to"
+            ],
+            "properties": {
+              "to": {
+                "const": "backend"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "rollback": {
+            "const": {
+              "allowed_targets": [
+                "bridge"
+              ],
+              "forbidden_targets": [
+                "baseline"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lineage": {
+            "required": [
+              "to"
+            ],
+            "properties": {
+              "to": {
+                "const": "ui"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "rollback": {
+            "const": {
+              "allowed_targets": [
+                "backend",
+                "bridge"
+              ],
+              "forbidden_targets": [
+                "baseline"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha1": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,14}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "phase": {
+      "enum": [
+        "baseline",
+        "bridge",
+        "backend",
+        "ui"
+      ]
+    },
+    "state": {
+      "enum": [
+        "genesis",
+        "baseline",
+        "bridge",
+        "backend",
+        "ui"
+      ]
+    },
+    "imageWeb": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "repository",
+        "digest",
+        "subject"
+      ],
+      "properties": {
+        "component": {
+          "const": "web"
+        },
+        "repository": {
+          "const": "ghcr.io/medtechcorps-netizen/rereply-release-web"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "subject": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/medtechcorps-netizen/rereply-release-web@sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "imageMetaRelay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "repository",
+        "digest",
+        "subject"
+      ],
+      "properties": {
+        "component": {
+          "const": "meta-relay"
+        },
+        "repository": {
+          "const": "ghcr.io/medtechcorps-netizen/rereply-release-meta-relay"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "subject": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "imageGmailRelay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "repository",
+        "digest",
+        "subject"
+      ],
+      "properties": {
+        "component": {
+          "const": "gmail-relay"
+        },
+        "repository": {
+          "const": "ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "subject": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "digestImages": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/imageWeb"
+        },
+        {
+          "$ref": "#/$defs/imageMetaRelay"
+        },
+        {
+          "$ref": "#/$defs/imageGmailRelay"
+        }
+      ],
+      "items": false
+    },
+    "providerState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app_identity_sha256",
+        "default_ingress_sha256",
+        "app_updated_at_sha256",
+        "active_deployment_identity_sha256",
+        "canonical_spec_sha256",
+        "environment_values_sha256",
+        "non_source_projection_sha256",
+        "source_mode",
+        "images"
+      ],
+      "properties": {
+        "app_identity_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "default_ingress_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "app_updated_at_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "active_deployment_identity_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "canonical_spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "environment_values_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "non_source_projection_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_mode": {
+          "enum": [
+            "legacy-git",
+            "digest-images"
+          ]
+        },
+        "images": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "source_mode"
+            ],
+            "properties": {
+              "source_mode": {
+                "const": "legacy-git"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "images": {
+                "const": []
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "source_mode"
+            ],
+            "properties": {
+              "source_mode": {
+                "const": "digest-images"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "images": {
+                "$ref": "#/$defs/digestImages"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "desiredProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_spec_sha256",
+        "environment_values_sha256",
+        "non_source_projection_sha256",
+        "source_mode",
+        "images",
+        "migration_job",
+        "migration_digest"
+      ],
+      "properties": {
+        "canonical_spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "environment_values_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "non_source_projection_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_mode": {
+          "const": "digest-images"
+        },
+        "images": {
+          "$ref": "#/$defs/digestImages"
+        },
+        "migration_job": {
+          "const": "rereply-rls-migrate"
+        },
+        "migration_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "artifactBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "run_attempt",
+        "artifact_id",
+        "artifact_name",
+        "artifact_digest",
+        "sha256"
+      ],
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "run_attempt": {
+          "$ref": "#/$defs/attempt"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "artifact_name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"
+        },
+        "artifact_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "predecessorBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "run_id",
+        "run_attempt",
+        "artifact_id",
+        "artifact_name",
+        "artifact_digest",
+        "sha256"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "genesis",
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "run_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/runId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "run_attempt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/attempt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifact_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/runId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifact_name": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifact_digest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "genesis"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "run_id": {
+                "type": "null"
+              },
+              "run_attempt": {
+                "type": "null"
+              },
+              "artifact_id": {
+                "type": "null"
+              },
+              "artifact_name": {
+                "type": "null"
+              },
+              "artifact_digest": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "run_id": {
+                "$ref": "#/$defs/runId"
+              },
+              "run_attempt": {
+                "$ref": "#/$defs/attempt"
+              },
+              "artifact_id": {
+                "$ref": "#/$defs/runId"
+              },
+              "artifact_name": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"
+              },
+              "artifact_digest": {
+                "$ref": "#/$defs/digest"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "applyAuthorities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rollout_plan_sha256",
+        "rollout_authority",
+        "production_plan",
+        "recovery",
+        "predecessor_state"
+      ],
+      "properties": {
+        "rollout_plan_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "rollout_authority": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "production_plan": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "recovery": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "predecessor_state": {
+          "$ref": "#/$defs/predecessorBinding"
+        }
+      }
+    },
+    "targetAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "production_plan_sha256"
+      ],
+      "properties": {
+        "production_plan_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "rollbackAuthorities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rollout_plan_sha256",
+        "current_state",
+        "target_state",
+        "recovery",
+        "target_authority"
+      ],
+      "properties": {
+        "rollout_plan_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "current_state": {
+          "$ref": "#/$defs/predecessorBinding"
+        },
+        "target_state": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "recovery": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "target_authority": {
+          "$ref": "#/$defs/targetAuthority"
+        }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_sha",
+        "workflow_path",
+        "run_id",
+        "run_attempt",
+        "runner_environment",
+        "release_policy_sha256",
+        "change_schema_sha256",
+        "mutation_intent_schema_sha256",
+        "controller_sha256"
+      ],
+      "properties": {
+        "workflow_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "workflow_path": {
+          "enum": [
+            ".github/workflows/apply-production-phase.yml",
+            ".github/workflows/rollback-production-phase.yml",
+            ".github/workflows/rollback-production-orphan.yml"
+          ]
+        },
+        "run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "run_attempt": {
+          "$ref": "#/$defs/attempt"
+        },
+        "runner_environment": {
+          "const": "github-hosted"
+        },
+        "release_policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "change_schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "mutation_intent_schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "controller_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_sequence",
+        "phase_ordinal",
+        "operation",
+        "from",
+        "to",
+        "predecessor_kind",
+        "predecessor_state_sha256",
+        "phase",
+        "phase_source_sha"
+      ],
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "phase_ordinal": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "operation": {
+          "enum": [
+            "activate",
+            "rollback"
+          ]
+        },
+        "from": {
+          "$ref": "#/$defs/state"
+        },
+        "to": {
+          "$ref": "#/$defs/phase"
+        },
+        "predecessor_kind": {
+          "enum": [
+            "genesis",
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "predecessor_state_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "phase": {
+          "$ref": "#/$defs/phase"
+        },
+        "phase_source_sha": {
+          "$ref": "#/$defs/sha1"
+        }
+      }
+    },
+    "activateBaselineLineage": {
+      "properties": {
+        "event_sequence": {
+          "const": 1
+        },
+        "phase_ordinal": {
+          "const": 1
+        },
+        "from": {
+          "const": "genesis"
+        },
+        "to": {
+          "const": "baseline"
+        },
+        "predecessor_kind": {
+          "const": "genesis"
+        },
+        "phase": {
+          "const": "baseline"
+        }
+      }
+    },
+    "activateBridgeLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 2
+        },
+        "from": {
+          "const": "baseline"
+        },
+        "to": {
+          "const": "bridge"
+        },
+        "predecessor_kind": {
+          "const": "phase-state"
+        },
+        "phase": {
+          "const": "bridge"
+        }
+      }
+    },
+    "activateBackendLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 3
+        },
+        "from": {
+          "const": "bridge"
+        },
+        "to": {
+          "const": "backend"
+        },
+        "predecessor_kind": {
+          "const": "phase-state"
+        },
+        "phase": {
+          "const": "backend"
+        }
+      }
+    },
+    "activateUiLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 4
+        },
+        "from": {
+          "const": "backend"
+        },
+        "to": {
+          "const": "ui"
+        },
+        "predecessor_kind": {
+          "const": "phase-state"
+        },
+        "phase": {
+          "const": "ui"
+        }
+      }
+    },
+    "rollbackBridgeToBaselineLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 1
+        },
+        "from": {
+          "const": "bridge"
+        },
+        "to": {
+          "const": "baseline"
+        },
+        "predecessor_kind": {
+          "enum": [
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "phase": {
+          "const": "baseline"
+        }
+      }
+    },
+    "rollbackBackendToBridgeLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 2
+        },
+        "from": {
+          "const": "backend"
+        },
+        "to": {
+          "const": "bridge"
+        },
+        "predecessor_kind": {
+          "enum": [
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "phase": {
+          "const": "bridge"
+        }
+      }
+    },
+    "rollbackUiToBackendLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 3
+        },
+        "from": {
+          "const": "ui"
+        },
+        "to": {
+          "const": "backend"
+        },
+        "predecessor_kind": {
+          "enum": [
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "phase": {
+          "const": "backend"
+        }
+      }
+    },
+    "rollbackUiToBridgeLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 2
+        },
+        "from": {
+          "const": "ui"
+        },
+        "to": {
+          "const": "bridge"
+        },
+        "predecessor_kind": {
+          "enum": [
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "phase": {
+          "const": "bridge"
+        }
+      }
+    },
+    "lock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "strategy",
+        "branch",
+        "rule_id",
+        "rule_identity_sha256",
+        "expected_pre_lock",
+        "expected_post_lock",
+        "root_acquire_intent",
+        "owner_operation",
+        "owner_run_id",
+        "owner_run_attempt",
+        "owner_control_sha",
+        "owner_intent_sha256"
+      ],
+      "properties": {
+        "mode": {
+          "const": "planned"
+        },
+        "strategy": {
+          "enum": [
+            "acquire",
+            "inherit"
+          ]
+        },
+        "branch": {
+          "const": "main"
+        },
+        "rule_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_+/=-]+$",
+          "maxLength": 512
+        },
+        "rule_identity_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "expected_pre_lock": {
+          "$ref": "#/$defs/lockProjection"
+        },
+        "expected_post_lock": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/lockProjection"
+            },
+            {
+              "properties": {
+                "lock_branch": {
+                  "const": true
+                }
+              }
+            }
+          ]
+        },
+        "root_acquire_intent": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "owner_operation": {
+          "enum": [
+            "apply",
+            "rollback"
+          ]
+        },
+        "owner_run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "owner_run_attempt": {
+          "$ref": "#/$defs/attempt"
+        },
+        "owner_control_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "owner_intent_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "strategy"
+            ],
+            "properties": {
+              "strategy": {
+                "const": "acquire"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "expected_pre_lock": {
+                "properties": {
+                  "lock_branch": {
+                    "const": false
+                  }
+                }
+              },
+              "owner_intent_sha256": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "expected_pre_lock": {
+                "properties": {
+                  "lock_branch": {
+                    "const": true
+                  }
+                }
+              },
+              "owner_intent_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "lockProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lock_branch",
+        "is_admin_enforced",
+        "lock_allows_fetch_and_merge"
+      ],
+      "properties": {
+        "lock_branch": {
+          "type": "boolean"
+        },
+        "is_admin_enforced": {
+          "const": true
+        },
+        "lock_allows_fetch_and_merge": {
+          "const": false
+        }
+      }
+    },
+    "mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "http_method",
+        "endpoint_label",
+        "update_all_source_versions",
+        "before_sha256",
+        "desired_sha256",
+        "mutation_fingerprint_sha256"
+      ],
+      "properties": {
+        "http_method": {
+          "const": "PUT"
+        },
+        "endpoint_label": {
+          "const": "app"
+        },
+        "update_all_source_versions": {
+          "const": false
+        },
+        "before_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "desired_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "mutation_fingerprint_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_targets",
+        "forbidden_targets"
+      ],
+      "properties": {
+        "allowed_targets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/phase"
+          }
+        },
+        "forbidden_targets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/phase"
+          }
+        }
+      }
+    },
+    "canary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "completed",
+        "endpoint_labels",
+        "route_contract_sha256"
+      ],
+      "properties": {
+        "required": {
+          "const": true
+        },
+        "completed": {
+          "const": false
+        },
+        "endpoint_labels": {
+          "const": [
+            "app-health",
+            "app-ready",
+            "meta-live",
+            "meta-ready",
+            "gmail-live",
+            "gmail-ready"
+          ]
+        },
+        "route_contract_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1775 @@
+name: Apply Production Phase
+
+run-name: Apply one exact production phase from signed evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_evidence_json:
+        description: Exact control SHA and immutable production-plan, recovery, rollout, and predecessor evidence
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  WORKFLOW_PATH: .github/workflows/apply-production-phase.yml
+  PLAN_WORKFLOW_PATH: .github/workflows/plan-production-rollout.yml
+  RECOVERY_WORKFLOW_PATH: .github/workflows/verify-production-recovery-readiness.yml
+  CONTROLLER_PATH: release/deployment/apply_production_change.py
+  COMMON_PATH: release/deployment/verify_production_release.py
+  PRODUCTION_CONTRACT_PATH: release/deployment/production-app-contract.json
+  PRODUCTION_PLAN_VERIFIER_PATH: release/deployment/verify_production_plan.py
+  POLICY_PATH: release/deployment/production-release-policy.json
+  SCHEMA_PATH: release/deployment/production-change.schema.json
+  INTENT_SCHEMA_PATH: release/deployment/production-mutation-intent.schema.json
+  LOCK_PROOF_SCHEMA_PATH: release/deployment/production-main-lock-proof.schema.json
+  RELEASE_AUTHORIZATION_CONTROLLER_PATH: release/deployment/authorize_production_main_lock_release.py
+  RELEASE_AUTHORIZATION_SCHEMA_PATH: release/deployment/production-main-lock-release-authorization.schema.json
+  PLAN_PREDICATE: https://rereply.app/attestations/observation-only-production-plan/v2
+  INTENT_PREDICATE: https://rereply.app/attestations/production-mutation-intent/v2
+  LOCK_PROOF_PREDICATE: https://rereply.app/attestations/production-main-lock-proof/v1
+  APPLY_PREDICATE: https://rereply.app/attestations/production-phase-apply-receipt/v1
+  RELEASE_AUTHORIZATION_PREDICATE: https://rereply.app/attestations/production-main-lock-release-authorization/v1
+  PINNED_JQ_VERSION: "1.8.2"
+  PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+  PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
+
+jobs:
+  authority:
+    name: Authenticate exact production apply authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      control_sha: ${{ steps.guard.outputs.control_sha }}
+      plan_run_id: ${{ steps.request.outputs.plan_run_id }}
+      plan_name: ${{ steps.request.outputs.plan_name }}
+      recovery_run_id: ${{ steps.request.outputs.recovery_run_id }}
+      recovery_name: ${{ steps.request.outputs.recovery_name }}
+      predecessor_kind: ${{ steps.plan.outputs.predecessor_kind }}
+      predecessor_run_id: ${{ steps.plan.outputs.predecessor_run_id }}
+      predecessor_name: ${{ steps.plan.outputs.predecessor_name }}
+      rollout_run_id: ${{ steps.plan.outputs.rollout_run_id }}
+      rollout_name: ${{ steps.plan.outputs.rollout_name }}
+    steps:
+      - name: Require exact protected-main attempt-one authority
+        id: guard
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == workflow_dispatch && "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$DISPATCH_REF" == refs/heads/main && "$REF_PROTECTED" == true ]]
+          [[ "$RUN_ATTEMPT" == 1 && "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" && "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf 'control_sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.guard.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned production-plan authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+
+      - name: Authenticate requested plan and recovery artifacts
+        id: request
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
+          RAW: ${{ inputs.release_evidence_json }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const value = JSON.parse(process.env.RAW);
+            const expected = ['control_sha','predecessor_state_sha256','production_plan','recovery','rollout_plan_sha256'];
+            if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(expected) || value.control_sha !== process.env.CONTROL_SHA) throw new Error('apply descriptor differs');
+            if (!/^[0-9a-f]{64}$/.test(value.rollout_plan_sha256) || !/^[0-9a-f]{64}$/.test(value.predecessor_state_sha256)) throw new Error('apply hashes differ');
+            const {owner,repo} = context.repo;
+            const main = await github.rest.git.getRef({owner,repo,ref:'heads/main'});
+            if (main.data.object.sha !== process.env.CONTROL_SHA) throw new Error('main changed');
+            async function exact(binding, workflow, prefix, expectedJobs) {
+              const keys=['artifact_digest','artifact_id','run_attempt','run_id','sha256'];
+              if (JSON.stringify(Object.keys(binding).sort()) !== JSON.stringify(keys) || binding.run_attempt !== 1 || !/^sha256:[0-9a-f]{64}$/.test(binding.artifact_digest) || !/^[0-9a-f]{64}$/.test(binding.sha256)) throw new Error(`${prefix} binding differs`);
+              const latest=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(binding.run_id)});
+              const attempt=await github.rest.actions.getWorkflowRunAttempt({owner,repo,run_id:Number(binding.run_id),attempt_number:1});
+              for (const run of [latest.data,attempt.data]) if (run.run_attempt!==1 || run.head_sha!==process.env.CONTROL_SHA || run.head_branch!=='main' || run.event!=='workflow_dispatch' || run.status!=='completed' || run.conclusion!=='success' || run.path!==workflow) throw new Error(`${prefix} run differs`);
+              const jobs=await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs',{owner,repo,run_id:Number(binding.run_id),attempt_number:1,per_page:100});
+              const actual=jobs.map(job=>job.name).sort();
+              if(JSON.stringify(actual)!==JSON.stringify([...expectedJobs].sort()) || jobs.some(job=>job.status!=='completed' || job.conclusion!=='success')) throw new Error(`${prefix} job inventory differs`);
+              const artifact=await github.rest.actions.getArtifact({owner,repo,artifact_id:Number(binding.artifact_id)});
+              const name=`${prefix}-${binding.run_id}-1`;
+              if (artifact.data.name!==name || artifact.data.digest!==binding.artifact_digest || artifact.data.expired || artifact.data.workflow_run.id!==Number(binding.run_id)) throw new Error(`${prefix} artifact differs`);
+              return name;
+            }
+            const planJobs=['Authenticate exact rollout authority','Independently verify and attest the sanitized plan','Observation-only production plan gate','Observe exact production state with read-only capability'];
+            const recoveryJobs=['Authenticate exact production recovery authority','Exact production recovery readiness gate','Observe exact production recovery state'];
+            const planName=await exact(value.production_plan,process.env.PLAN_WORKFLOW_PATH,'verified-production-plan',planJobs);
+            const recoveryName=await exact(value.recovery,process.env.RECOVERY_WORKFLOW_PATH,'production-recovery-readiness',recoveryJobs);
+            core.setOutput('plan_run_id',String(value.production_plan.run_id));
+            core.setOutput('plan_name',planName);
+            core.setOutput('recovery_run_id',String(value.recovery.run_id));
+            core.setOutput('recovery_name',recoveryName);
+
+      - name: Download exact production plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ steps.request.outputs.plan_name }}
+          path: ${{ runner.temp }}/plan
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.request.outputs.plan_run_id }}
+
+      - name: Independently verify the exact production-plan attestations and controls
+        env:
+          CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PLAN_RUN_ID: ${{ steps.request.outputs.plan_run_id }}
+          RAW: ${{ inputs.release_evidence_json }}
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          gh_bin="$tools_dir/gh"
+          jq_bin="$tools_dir/jq"
+          [[ "$(sha256sum "$gh_bin" | awk '{print $1}')" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(sha256sum "$jq_bin" | awk '{print $1}')" == "$PINNED_JQ_SHA256" ]]
+          [[ "$(find "$RUNNER_TEMP/plan" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-plan.json production-plan.sha256 " ]]
+          [[ -z "$(find "$RUNNER_TEMP/plan" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          plan_path = root / "plan" / "production-plan.json"
+          sidecar_path = root / "plan" / "production-plan.sha256"
+          plan_raw = plan_path.read_bytes()
+          plan_sha = hashlib.sha256(plan_raw).hexdigest()
+          if sidecar_path.read_bytes() != (plan_sha + "\n").encode("ascii"):
+              raise SystemExit("production plan sidecar differs")
+          request = json.loads(os.environ["RAW"])
+          binding = request["production_plan"]
+          if binding["sha256"] != plan_sha or str(binding["run_id"]) != os.environ["PLAN_RUN_ID"]:
+              raise SystemExit("production plan request binding differs")
+          plan = json.loads(plan_raw)
+          control = plan["control"]
+          control_root = pathlib.Path("control")
+          expected = {
+              "workflow_sha": os.environ["CONTROL_SHA"],
+              "workflow_path": ".github/workflows/plan-production-rollout.yml",
+              "run_id": os.environ["PLAN_RUN_ID"],
+              "run_attempt": 1,
+              "contract_sha256": hashlib.sha256((control_root / "release/deployment/production-app-contract.json").read_bytes()).hexdigest(),
+              "release_policy_sha256": hashlib.sha256((control_root / "release/deployment/production-release-policy.json").read_bytes()).hexdigest(),
+              "change_schema_sha256": hashlib.sha256((control_root / "release/deployment/production-change.schema.json").read_bytes()).hexdigest(),
+              "verifier_sha256": hashlib.sha256((control_root / "release/deployment/verify_production_plan.py").read_bytes()).hexdigest(),
+          }
+          for key, value in expected.items():
+              if control.get(key) != value:
+                  raise SystemExit(f"production plan {key} differs")
+          PY
+
+          signer="$RELEASE_REPOSITORY/$PLAN_WORKFLOW_PATH"
+          flags=(
+            --repo "$RELEASE_REPOSITORY"
+            --signer-workflow "$signer"
+            --signer-digest "$CONTROL_SHA"
+            --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main
+            --deny-self-hosted-runners
+            --format json
+          )
+          "$gh_bin" attestation verify "$RUNNER_TEMP/plan/production-plan.json" "${flags[@]}" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            > "$RUNNER_TEMP/plan-provenance.json"
+          "$gh_bin" attestation verify "$RUNNER_TEMP/plan/production-plan.json" "${flags[@]}" \
+            --predicate-type "$PLAN_PREDICATE" \
+            > "$RUNNER_TEMP/plan-policy.json"
+          "$jq_bin" -e 'type == "array" and length > 0' "$RUNNER_TEMP/plan-provenance.json" > /dev/null
+          "$jq_bin" -e --slurpfile expected "$RUNNER_TEMP/plan/production-plan.json" \
+            'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' \
+            "$RUNNER_TEMP/plan-policy.json" > /dev/null
+
+      - name: Extract immutable rollout and predecessor coordinates
+        id: plan
+        env:
+          RAW: ${{ inputs.release_evidence_json }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -S -B -c '
+          import json,os,pathlib
+          raw=json.loads(os.environ["RAW"]); p=json.loads(pathlib.Path(os.environ["RUNNER_TEMP"]+"/plan/production-plan.json").read_text())
+          if set(p) != {"schema_version","authority","repository","issued_at","expires_at","control","rollout_authority","predecessor_authority","transition","provider_observation","target","preservation","provider_validation","rollback"}: raise SystemExit("plan keys differ")
+          if p["schema_version"] != 2 or p["control"]["workflow_sha"] != raw["control_sha"] or p["rollout_authority"]["rollout_plan_sha256"] != raw["rollout_plan_sha256"] or p["predecessor_authority"]["state_sha256"] != raw["predecessor_state_sha256"]: raise SystemExit("plan authority differs")
+          out=pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          pred=p["predecessor_authority"]; rollout=p["rollout_authority"]
+          lines=[f"predecessor_kind={pred[\"kind\"]}",f"rollout_run_id={rollout[\"run_id\"]}",f"rollout_name=exact-four-phase-rollout-{rollout[\"run_id\"]}-{rollout[\"run_attempt\"]}"]
+          if pred["kind"]=="phase-state": lines += [f"predecessor_run_id={pred[\"run_id\"]}",f"predecessor_name=production-phase-state-{pred[\"run_id\"]}-{pred[\"run_attempt\"]}"]
+          elif pred["kind"]!="genesis": raise SystemExit("predecessor kind differs")
+          out.open("a",encoding="utf-8").write("\n".join(lines)+"\n")'
+
+  prelock:
+    name: Prepare exact production apply pre-lock authority
+    needs: authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: rereply-production-apply
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      root_marker_name: ${{ steps.prepare.outputs.root_marker_name }}
+      root_marker_sha256: ${{ steps.prepare.outputs.root_marker_sha256 }}
+      rule_id: ${{ steps.prepare.outputs.rule_id }}
+      rule_identity_sha256: ${{ steps.prepare.outputs.rule_identity_sha256 }}
+      route_contract_sha256: ${{ steps.prepare.outputs.route_contract_sha256 }}
+      root_marker_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      root_marker_artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned pre-lock authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Create exact durable apply pre-lock marker
+        id: prepare
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          GITHUB_READ_TOKEN: ${{ github.token }}
+          TARGET_JSON: ${{ secrets.DO_PRODUCTION_TARGET_JSON }}
+        run: |
+          set -euo pipefail
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          github_read_token="$GITHUB_READ_TOKEN"
+          target_json="$TARGET_JSON"
+          unset GH_PRODUCTION_BRANCH_READ_TOKEN GITHUB_READ_TOKEN TARGET_JSON GH_TOKEN GITHUB_TOKEN
+          [[ -n "$branch_read_token" && -n "$github_read_token" && -n "$target_json" ]]
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          [[ "$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          current="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"
+          "$jq_bin" -e --arg sha "$CONTROL_SHA" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and (.status == "in_progress" or .status == "queued")' <<< "$current" > /dev/null
+          repository_owner="$(cut -d/ -f1 <<< "$GITHUB_REPOSITORY")"
+          repository_name="$(cut -d/ -f2- <<< "$GITHUB_REPOSITORY")"
+          query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}} ref(qualifiedName:"refs/heads/main"){target{oid}}}}'
+          rule_json="$(GH_TOKEN="$branch_read_token" "$gh_bin" api graphql -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg sha "$CONTROL_SHA" '.data.repository.ref.target.oid == $sha and .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .lockBranch == false and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$rule_json" > /dev/null
+          rule_id="$("$jq_bin" -er '.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main") | .id' <<< "$rule_json")"
+          RULE_ID="$rule_id" TARGET_DESCRIPTOR="$target_json" /usr/bin/python3 -I -S -B - <<'PY'
+          import hashlib,json,os,pathlib,sys
+          sys.path.insert(0,'control/release/deployment')
+          import verify_production_release as common
+          target=common.validate_target_descriptor(common.loads_strict(os.environ.pop('TARGET_DESCRIPTOR')))
+          route_hash=common.public_route_contract_sha256(target['default_ingress'])
+          path=pathlib.Path(os.environ['RUNNER_TEMP'])/'apply-main-lock.json'
+          payload={'schema_version':1,'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':1,'control_sha':os.environ['CONTROL_SHA'],'rule_id':os.environ['RULE_ID'],'state':'acquire-intent'}
+          fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0),0o600)
+          with os.fdopen(fd,'wb') as stream:
+              stream.write(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()+b'\n')
+              stream.flush(); os.fsync(stream.fileno())
+          with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a',encoding='utf-8') as stream:
+              stream.write(f"root_marker_name=production-main-lock-apply-{os.environ['GITHUB_RUN_ID']}-1\n")
+              stream.write(f"root_marker_sha256={hashlib.sha256(path.read_bytes()).hexdigest()}\n")
+              stream.write(f"rule_id={os.environ['RULE_ID']}\n")
+              stream.write(f"rule_identity_sha256={hashlib.sha256(os.environ['RULE_ID'].encode()).hexdigest()}\n")
+              stream.write(f"route_contract_sha256={route_hash}\n")
+          PY
+          branch_read_token= github_read_token= target_json=
+
+      - name: Upload durable apply pre-lock marker
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.prepare.outputs.root_marker_name }}
+          path: ${{ runner.temp }}/apply-main-lock.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Canonicalize apply pre-lock marker artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+  intent:
+    name: Prepare and attest exact production mutation intent
+    needs: [authority, prelock]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      intent_name: ${{ steps.prepare.outputs.intent_name }}
+      intent_sha256: ${{ steps.prepare.outputs.intent_sha256 }}
+      intent_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      intent_artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+      - name: Download exact plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.plan_name }}
+          path: ${{ runner.temp }}/plan
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.plan_run_id }}
+      - name: Download exact recovery readiness
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.recovery_name }}
+          path: ${{ runner.temp }}/recovery
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.recovery_run_id }}
+      - name: Download exact rollout capsule
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.rollout_name }}
+          path: ${{ runner.temp }}/rollout
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.rollout_run_id }}
+      - name: Download exact predecessor state
+        if: needs.authority.outputs.predecessor_kind == 'phase-state'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.predecessor_name }}
+          path: ${{ runner.temp }}/predecessor
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.predecessor_run_id }}
+      - name: Download exact root apply lock intent
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.prelock.outputs.root_marker_artifact_id }}
+          path: ${{ runner.temp }}/root-lock
+
+      - name: Prepare exact sanitized v2 mutation intent without credentials
+        id: prepare
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          RAW: ${{ inputs.release_evidence_json }}
+          LOCK_ARTIFACT_ID: ${{ needs.prelock.outputs.root_marker_artifact_id }}
+          LOCK_ARTIFACT_DIGEST: ${{ needs.prelock.outputs.root_marker_artifact_digest }}
+          LOCK_ARTIFACT_NAME: ${{ needs.prelock.outputs.root_marker_name }}
+          LOCK_SHA256: ${{ needs.prelock.outputs.root_marker_sha256 }}
+          RULE_ID: ${{ needs.prelock.outputs.rule_id }}
+          RULE_IDENTITY_SHA256: ${{ needs.prelock.outputs.rule_identity_sha256 }}
+          ROUTE_CONTRACT_SHA256: ${{ needs.prelock.outputs.route_contract_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 && "$GITHUB_SHA" == "$CONTROL_SHA" ]]
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import os,pathlib,sys
+          sys.path.insert(0,'control/release/deployment')
+          import verify_production_release as common,apply_production_change as controller
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          request=common.loads_strict(os.environ['RAW'])
+          if request.pop('control_sha',None)!=os.environ['CONTROL_SHA']: common.fail('control SHA differs')
+          controller.validate_evidence_request(request)
+          (root/'apply-evidence.json').write_bytes(common.canonical_file_bytes(request))
+          rollout=next((root/'rollout').rglob('rollout-plan.json'))
+          if rollout.is_symlink(): common.fail('rollout plan symlink is forbidden')
+          (root/'rollout-plan.json').write_bytes(rollout.read_bytes())
+          marker=root/'root-lock'/'apply-main-lock.json'
+          if common.sha256_bytes(marker.read_bytes())!=os.environ['LOCK_SHA256']: common.fail('root lock marker hash differs')
+          lock={'mode':'planned','strategy':'acquire','branch':'main','rule_id':os.environ['RULE_ID'],'rule_identity_sha256':os.environ['RULE_IDENTITY_SHA256'],'expected_pre_lock':{'lock_branch':False,'is_admin_enforced':True,'lock_allows_fetch_and_merge':False},'expected_post_lock':{'lock_branch':True,'is_admin_enforced':True,'lock_allows_fetch_and_merge':False},'root_acquire_intent':{'run_id':int(os.environ['GITHUB_RUN_ID']),'run_attempt':1,'artifact_id':int(os.environ['LOCK_ARTIFACT_ID']),'artifact_name':os.environ['LOCK_ARTIFACT_NAME'],'artifact_digest':os.environ['LOCK_ARTIFACT_DIGEST'],'sha256':os.environ['LOCK_SHA256']},'owner_operation':'apply','owner_run_id':int(os.environ['GITHUB_RUN_ID']),'owner_run_attempt':1,'owner_control_sha':os.environ['CONTROL_SHA'],'owner_intent_sha256':None}
+          common.validate_lock_authority(lock,operation='activate',control={'workflow_sha':os.environ['CONTROL_SHA'],'run_id':int(os.environ['GITHUB_RUN_ID']),'run_attempt':1})
+          (root/'lock-authority.json').write_bytes(common.canonical_file_bytes(lock))
+          PY
+          controller_sha="$(sha256sum "control/$CONTROLLER_PATH" | awk '{print $1}')"
+          policy_sha="$(sha256sum "control/$POLICY_PATH" | awk '{print $1}')"
+          schema_sha="$(sha256sum "control/$SCHEMA_PATH" | awk '{print $1}')"
+          intent_schema_sha="$(sha256sum "control/$INTENT_SCHEMA_PATH" | awk '{print $1}')"
+          args=(prepare-intent --evidence-request "$RUNNER_TEMP/apply-evidence.json" --production-plan "$RUNNER_TEMP/plan/production-plan.json" --rollout-plan "$RUNNER_TEMP/rollout-plan.json" --recovery "$RUNNER_TEMP/recovery/production-recovery-readiness.json" --release-policy-sha256 "$policy_sha" --change-schema-sha256 "$schema_sha" --mutation-intent-schema-sha256 "$intent_schema_sha" --controller-sha256 "$controller_sha" --workflow-sha "$CONTROL_SHA" --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt 1 --runner-temp "$RUNNER_TEMP" --output "$RUNNER_TEMP/production-mutation-intent.json" --lock-authority "$RUNNER_TEMP/lock-authority.json" --route-contract-sha256 "$ROUTE_CONTRACT_SHA256")
+          if [[ "${{ needs.authority.outputs.predecessor_kind }}" == phase-state ]]; then
+            args+=(--predecessor-state "$RUNNER_TEMP/predecessor/production-phase-state.json")
+          fi
+          /usr/bin/python3 -I -S -B "control/$CONTROLLER_PATH" "${args[@]}"
+          intent_sha="$(sha256sum "$RUNNER_TEMP/production-mutation-intent.json" | awk '{print $1}')"
+          printf '%s\n' "$intent_sha" > "$RUNNER_TEMP/production-mutation-intent.sha256"
+          printf 'intent_name=production-mutation-intent-apply-%s-1\n' "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          printf 'intent_sha256=%s\n' "$intent_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Attest production mutation intent provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-mutation-intent.json
+      - name: Attest exact production mutation intent policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-mutation-intent.json
+          predicate-type: ${{ env.INTENT_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/production-mutation-intent.json
+
+      - name: Upload exact production mutation intent
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.prepare.outputs.intent_name }}
+          path: |
+            ${{ runner.temp }}/production-mutation-intent.json
+            ${{ runner.temp }}/production-mutation-intent.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Canonicalize apply mutation-intent artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+  lock:
+    name: Acquire exact production apply main lock
+    needs: [authority, prelock, intent]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: rereply-production-apply
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      outcome: ${{ steps.acquire.outputs.outcome }}
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned lock mutation authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+
+      - name: Download exact durable pre-lock marker
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.prelock.outputs.root_marker_artifact_id }}
+          path: ${{ runner.temp }}/root-lock
+
+      - name: Download exact signed pre-lock mutation intent
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
+          path: ${{ runner.temp }}/mutation-intent
+
+      - name: Authenticate exact signed pre-lock mutation intent
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          INTENT_ARTIFACT_DIGEST: ${{ needs.intent.outputs.intent_artifact_digest }}
+          INTENT_ARTIFACT_ID: ${{ needs.intent.outputs.intent_artifact_id }}
+          INTENT_ARTIFACT_NAME: ${{ needs.intent.outputs.intent_name }}
+          INTENT_SHA256: ${{ needs.intent.outputs.intent_sha256 }}
+          ROOT_ARTIFACT_DIGEST: ${{ needs.prelock.outputs.root_marker_artifact_digest }}
+          ROOT_ARTIFACT_ID: ${{ needs.prelock.outputs.root_marker_artifact_id }}
+          ROOT_ARTIFACT_NAME: ${{ needs.prelock.outputs.root_marker_name }}
+          ROOT_SHA256: ${{ needs.prelock.outputs.root_marker_sha256 }}
+        run: |
+          set -euo pipefail
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          intent="$RUNNER_TEMP/mutation-intent/production-mutation-intent.json"
+          [[ "$(find "$RUNNER_TEMP/mutation-intent" -maxdepth 1 -type f -printf '%f\n' | sort)" == $'production-mutation-intent.json\nproduction-mutation-intent.sha256' ]]
+          [[ -z "$(find "$RUNNER_TEMP/mutation-intent" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(cat "$RUNNER_TEMP/mutation-intent/production-mutation-intent.sha256")" == "$INTENT_SHA256" ]]
+          [[ "$(sha256sum "$intent" | awk '{print $1}')" == "$INTENT_SHA256" ]]
+          [[ "$(sha256sum "$RUNNER_TEMP/root-lock/apply-main-lock.json" | awk '{print $1}')" == "$ROOT_SHA256" ]]
+          for descriptor in \
+            "$INTENT_ARTIFACT_ID|$INTENT_ARTIFACT_NAME|$INTENT_ARTIFACT_DIGEST" \
+            "$ROOT_ARTIFACT_ID|$ROOT_ARTIFACT_NAME|$ROOT_ARTIFACT_DIGEST"; do
+            IFS='|' read -r artifact_id artifact_name artifact_digest <<< "$descriptor"
+            artifact="$("$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id")"
+            "$jq_bin" -e --arg name "$artifact_name" --arg digest "$artifact_digest" --argjson run_id "$GITHUB_RUN_ID" '.name == $name and .digest == $digest and .expired == false and .workflow_run.id == $run_id' <<< "$artifact" > /dev/null
+          done
+          flags=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/$WORKFLOW_PATH" --signer-digest "$CONTROL_SHA" --source-ref refs/heads/main --source-digest "$CONTROL_SHA" --deny-self-hosted-runners --format json)
+          "$gh_bin" attestation verify "$intent" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/intent-provenance.json"
+          "$gh_bin" attestation verify "$intent" "${flags[@]}" --predicate-type "$INTENT_PREDICATE" > "$RUNNER_TEMP/intent-policy.json"
+          "$jq_bin" -e --slurpfile expected "$intent" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/intent-policy.json" > /dev/null
+
+      - name: Acquire the exact main lock with one reconciled mutation
+        id: acquire
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_PRODUCTION_BRANCH_LOCK_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_LOCK_TOKEN }}
+          GITHUB_READ_TOKEN: ${{ github.token }}
+          EXPECTED_INTENT_SHA256: ${{ needs.intent.outputs.intent_sha256 }}
+          EXPECTED_ROOT_ARTIFACT_DIGEST: ${{ needs.prelock.outputs.root_marker_artifact_digest }}
+          EXPECTED_ROOT_ARTIFACT_ID: ${{ needs.prelock.outputs.root_marker_artifact_id }}
+          EXPECTED_ROOT_ARTIFACT_NAME: ${{ needs.prelock.outputs.root_marker_name }}
+          EXPECTED_ROOT_SHA256: ${{ needs.prelock.outputs.root_marker_sha256 }}
+          EXPECTED_RULE_ID: ${{ needs.prelock.outputs.rule_id }}
+          EXPECTED_RULE_IDENTITY_SHA256: ${{ needs.prelock.outputs.rule_identity_sha256 }}
+        run: |
+          set -euo pipefail
+          branch_lock_token="$GH_PRODUCTION_BRANCH_LOCK_TOKEN"
+          github_read_token="$GITHUB_READ_TOKEN"
+          unset GH_PRODUCTION_BRANCH_LOCK_TOKEN GITHUB_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$branch_lock_token" && -n "$github_read_token" ]]
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          [[ "$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          current="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"
+          "$jq_bin" -e --arg sha "$CONTROL_SHA" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and (.status == "in_progress" or .status == "queued")' <<< "$current" > /dev/null
+          jobs="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1/jobs?per_page=100")"
+          "$jq_bin" -e 'any(.jobs[]; .name == "Prepare and attest exact production mutation intent" and .status == "completed" and .conclusion == "success")' <<< "$jobs" > /dev/null
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import datetime as dt,os,pathlib,sys
+          sys.path.insert(0,'control/release/deployment')
+          import verify_production_release as common
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          intent_path=root/'mutation-intent'/'production-mutation-intent.json'
+          if common.sha256_bytes(intent_path.read_bytes()) != common.require_sha256(os.environ['EXPECTED_INTENT_SHA256'],'mutation intent hash'):
+              common.fail('mutation intent exact-file hash differs immediately before lock')
+          intent=common.validate_mutation_intent(common.load_json(intent_path,'mutation intent'),now=dt.datetime.now(dt.timezone.utc))
+          expected_root={'run_id':int(os.environ['GITHUB_RUN_ID']),'run_attempt':1,'artifact_id':int(os.environ['EXPECTED_ROOT_ARTIFACT_ID']),'artifact_name':os.environ['EXPECTED_ROOT_ARTIFACT_NAME'],'artifact_digest':os.environ['EXPECTED_ROOT_ARTIFACT_DIGEST'],'sha256':os.environ['EXPECTED_ROOT_SHA256']}
+          lock=intent['lock']
+          if lock['mode']!='planned' or lock['strategy']!='acquire' or lock['rule_id']!=os.environ['EXPECTED_RULE_ID'] or lock['rule_identity_sha256']!=os.environ['EXPECTED_RULE_IDENTITY_SHA256'] or lock['root_acquire_intent']!=expected_root:
+              common.fail('signed mutation intent lock authority differs immediately before lock')
+          if lock['expected_pre_lock']!={'lock_branch':False,'is_admin_enforced':True,'lock_allows_fetch_and_merge':False} or lock['expected_post_lock']!={'lock_branch':True,'is_admin_enforced':True,'lock_allows_fetch_and_merge':False}:
+              common.fail('signed mutation intent lock projections differ immediately before lock')
+          PY
+          repository_owner="$(cut -d/ -f1 <<< "$GITHUB_REPOSITORY")"
+          repository_name="$(cut -d/ -f2- <<< "$GITHUB_REPOSITORY")"
+          query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}} ref(qualifiedName:"refs/heads/main"){target{oid}}}}'
+          before="$(GH_TOKEN="$branch_lock_token" "$gh_bin" api graphql -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$EXPECTED_RULE_ID" --arg sha "$CONTROL_SHA" '.data.repository.ref.target.oid == $sha and .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == false and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$before" > /dev/null
+          mutation='mutation($ruleId:ID!,$lock:Boolean!){updateBranchProtectionRule(input:{branchProtectionRuleId:$ruleId,lockBranch:$lock}){branchProtectionRule{id pattern lockBranch}}}'
+          response="$RUNNER_TEMP/apply-lock-response.json"
+          set +e
+          GH_TOKEN="$branch_lock_token" "$gh_bin" api graphql -f "query=$mutation" -F "ruleId=$EXPECTED_RULE_ID" -F lock=true > "$response"
+          status=$?
+          set -e
+          after="$(GH_TOKEN="$branch_lock_token" "$gh_bin" api graphql -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$EXPECTED_RULE_ID" --arg sha "$CONTROL_SHA" '.data.repository.ref.target.oid == $sha and .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == true and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$after" > /dev/null
+          outcome=ambiguous-reconciled
+          if [[ "$status" -eq 0 ]] && "$jq_bin" -e --arg id "$EXPECTED_RULE_ID" '(.errors // []) == [] and .data.updateBranchProtectionRule.branchProtectionRule.id == $id and .data.updateBranchProtectionRule.branchProtectionRule.pattern == "main" and .data.updateBranchProtectionRule.branchProtectionRule.lockBranch == true' "$response" > /dev/null; then
+            outcome=applied
+          fi
+          printf 'outcome=%s\n' "$outcome" >> "$GITHUB_OUTPUT"
+          branch_lock_token= github_read_token=
+
+  lock_proof:
+    name: Attest exact production apply main lock proof
+    needs: [authority, prelock, intent, lock]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: rereply-production-apply
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      proof_name: ${{ steps.prepare.outputs.proof_name }}
+      proof_sha256: ${{ steps.prepare.outputs.proof_sha256 }}
+      proof_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      proof_artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned lock-proof authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+
+      - name: Download exact signed mutation intent
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
+          path: ${{ runner.temp }}/mutation-intent
+
+      - name: Recheck the exact locked projection and build proof
+        id: prepare
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          GITHUB_READ_TOKEN: ${{ github.token }}
+          INTENT_ARTIFACT_DIGEST: ${{ needs.intent.outputs.intent_artifact_digest }}
+          INTENT_ARTIFACT_ID: ${{ needs.intent.outputs.intent_artifact_id }}
+          INTENT_ARTIFACT_NAME: ${{ needs.intent.outputs.intent_name }}
+          INTENT_SHA256: ${{ needs.intent.outputs.intent_sha256 }}
+          LOCK_OUTCOME: ${{ needs.lock.outputs.outcome }}
+          RULE_ID: ${{ needs.prelock.outputs.rule_id }}
+          RULE_IDENTITY_SHA256: ${{ needs.prelock.outputs.rule_identity_sha256 }}
+        run: |
+          set -euo pipefail
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          github_read_token="$GITHUB_READ_TOKEN"
+          unset GH_PRODUCTION_BRANCH_READ_TOKEN GITHUB_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$branch_read_token" && -n "$github_read_token" ]]
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          intent="$RUNNER_TEMP/mutation-intent/production-mutation-intent.json"
+          [[ "$(find "$RUNNER_TEMP/mutation-intent" -maxdepth 1 -type f -printf '%f\n' | sort)" == $'production-mutation-intent.json\nproduction-mutation-intent.sha256' ]]
+          [[ -z "$(find "$RUNNER_TEMP/mutation-intent" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(cat "$RUNNER_TEMP/mutation-intent/production-mutation-intent.sha256")" == "$INTENT_SHA256" ]]
+          [[ "$(sha256sum "$intent" | awk '{print $1}')" == "$INTENT_SHA256" ]]
+          intent_artifact="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$INTENT_ARTIFACT_ID")"
+          "$jq_bin" -e --arg name "$INTENT_ARTIFACT_NAME" --arg digest "$INTENT_ARTIFACT_DIGEST" --argjson run_id "$GITHUB_RUN_ID" '.name == $name and .digest == $digest and .expired == false and .workflow_run.id == $run_id' <<< "$intent_artifact" > /dev/null
+          flags=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/$WORKFLOW_PATH" --signer-digest "$CONTROL_SHA" --source-ref refs/heads/main --source-digest "$CONTROL_SHA" --deny-self-hosted-runners --format json)
+          GH_TOKEN="$github_read_token" "$gh_bin" attestation verify "$intent" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/proof-intent-provenance.json"
+          GH_TOKEN="$github_read_token" "$gh_bin" attestation verify "$intent" "${flags[@]}" --predicate-type "$INTENT_PREDICATE" > "$RUNNER_TEMP/proof-intent-policy.json"
+          "$jq_bin" -e --slurpfile expected "$intent" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/proof-intent-policy.json" > /dev/null
+          [[ "$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          current="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"
+          "$jq_bin" -e --arg sha "$CONTROL_SHA" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and (.status == "in_progress" or .status == "queued")' <<< "$current" > /dev/null
+          jobs="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1/jobs?per_page=100")"
+          "$jq_bin" -e 'any(.jobs[]; .name == "Acquire exact production apply main lock" and .status == "completed" and .conclusion == "success")' <<< "$jobs" > /dev/null
+          repository_owner="$(cut -d/ -f1 <<< "$GITHUB_REPOSITORY")"
+          repository_name="$(cut -d/ -f2- <<< "$GITHUB_REPOSITORY")"
+          query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}} ref(qualifiedName:"refs/heads/main"){target{oid}}}}'
+          locked="$(GH_TOKEN="$branch_read_token" "$gh_bin" api graphql -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$RULE_ID" --arg sha "$CONTROL_SHA" '.data.repository.ref.target.oid == $sha and .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == true and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$locked" > /dev/null
+          INTENT_ARTIFACT_DIGEST="$INTENT_ARTIFACT_DIGEST" INTENT_ARTIFACT_ID="$INTENT_ARTIFACT_ID" INTENT_ARTIFACT_NAME="$INTENT_ARTIFACT_NAME" INTENT_SHA256="$INTENT_SHA256" LOCK_OUTCOME="$LOCK_OUTCOME" RULE_ID="$RULE_ID" RULE_IDENTITY_SHA256="$RULE_IDENTITY_SHA256" /usr/bin/python3 -I -S -B - <<'PY'
+          import os,pathlib,sys
+          sys.path.insert(0,'control/release/deployment')
+          import verify_production_release as common
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          request={
+              'operation':'apply','main_sha':os.environ['CONTROL_SHA'],'rule_id':os.environ['RULE_ID'],'rule_identity_sha256':os.environ['RULE_IDENTITY_SHA256'],
+              'pre_lock':{'lock_branch':False,'is_admin_enforced':True,'lock_allows_fetch_and_merge':False},
+              'post_lock':{'lock_branch':True,'is_admin_enforced':True,'lock_allows_fetch_and_merge':False},
+              'http_methods_used':['POST'],'graphql_operations_used':['query','mutation','query'],'mutation_request_count':1,
+              'outcome':os.environ['LOCK_OUTCOME'],'read_confirmed':True,
+          }
+          authority={'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':1,'artifact_id':os.environ['INTENT_ARTIFACT_ID'],'artifact_name':os.environ['INTENT_ARTIFACT_NAME'],'artifact_digest':os.environ['INTENT_ARTIFACT_DIGEST'],'sha256':os.environ['INTENT_SHA256']}
+          (root/'main-lock-proof-request.json').write_bytes(common.canonical_file_bytes(request))
+          (root/'mutation-intent-authority.json').write_bytes(common.canonical_file_bytes(authority))
+          PY
+          /usr/bin/python3 -I -S -B "control/$COMMON_PATH" build-main-lock-proof \
+            --request "$RUNNER_TEMP/main-lock-proof-request.json" \
+            --mutation-intent "$RUNNER_TEMP/mutation-intent/production-mutation-intent.json" \
+            --mutation-intent-authority "$RUNNER_TEMP/mutation-intent-authority.json" \
+            --workflow-path "$WORKFLOW_PATH" --workflow-sha "$CONTROL_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt 1 \
+            --runner-temp "$RUNNER_TEMP" --output "$RUNNER_TEMP/production-main-lock-proof.json"
+          proof_sha="$(sha256sum "$RUNNER_TEMP/production-main-lock-proof.json" | awk '{print $1}')"
+          printf '%s\n' "$proof_sha" > "$RUNNER_TEMP/production-main-lock-proof.sha256"
+          printf 'proof_name=production-main-lock-proof-apply-%s-1\n' "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          printf 'proof_sha256=%s\n' "$proof_sha" >> "$GITHUB_OUTPUT"
+          branch_read_token= github_read_token=
+
+      - name: Attest production apply main lock proof provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-main-lock-proof.json
+
+      - name: Attest exact production apply main lock proof policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-main-lock-proof.json
+          predicate-type: ${{ env.LOCK_PROOF_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/production-main-lock-proof.json
+
+      - name: Upload exact production apply main lock proof
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.prepare.outputs.proof_name }}
+          path: |
+            ${{ runner.temp }}/production-main-lock-proof.json
+            ${{ runner.temp }}/production-main-lock-proof.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Canonicalize apply main-lock-proof artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+  apply:
+    name: Apply exact production phase
+    needs: [authority, prelock, intent, lock, lock_proof]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: rereply-production-apply
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      internal_name: ${{ steps.name.outputs.internal_name }}
+      lock_name: ${{ needs.prelock.outputs.root_marker_name }}
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+      - name: Download exact plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.plan_name }}
+          path: ${{ runner.temp }}/plan
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.plan_run_id }}
+      - name: Download exact recovery readiness
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.recovery_name }}
+          path: ${{ runner.temp }}/recovery
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.recovery_run_id }}
+      - name: Download exact rollout capsule
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.rollout_name }}
+          path: ${{ runner.temp }}/rollout
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.rollout_run_id }}
+      - name: Download exact predecessor state
+        if: needs.authority.outputs.predecessor_kind == 'phase-state'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.predecessor_name }}
+          path: ${{ runner.temp }}/predecessor
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.predecessor_run_id }}
+      - name: Download exact signed mutation intent
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
+          path: ${{ runner.temp }}/mutation-intent
+      - name: Download exact signed main lock proof
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.lock_proof.outputs.proof_artifact_id }}
+          path: ${{ runner.temp }}/main-lock-proof
+      - name: Normalize exact request before capability use
+        env:
+          RAW: ${{ inputs.release_evidence_json }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -S -B -c '
+          import os,sys,pathlib
+          sys.path.insert(0,"control/release/deployment")
+          import verify_production_release as c, apply_production_change as a
+          v=c.loads_strict(os.environ["RAW"])
+          if v.pop("control_sha",None)!=os.environ["CONTROL_SHA"]: c.fail("control SHA differs")
+          a.validate_evidence_request(v)
+          pathlib.Path(os.environ["RUNNER_TEMP"]+"/apply-evidence.json").write_bytes(c.canonical_file_bytes(v))'
+          rollout="$(find "$RUNNER_TEMP/rollout" -name rollout-plan.json -type f -print -quit)"
+          [[ -n "$rollout" && -z "$(find "$RUNNER_TEMP/rollout" -type l -print -quit)" ]]
+          cp "$rollout" "$RUNNER_TEMP/rollout-plan.json"
+
+      - name: Install pinned apply authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+
+      - name: Verify exact mutation-intent and main-lock-proof attestations
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          INTENT_SHA256: ${{ needs.intent.outputs.intent_sha256 }}
+          PROOF_SHA256: ${{ needs.lock_proof.outputs.proof_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          subject="$RUNNER_TEMP/mutation-intent/production-mutation-intent.json"
+          [[ "$(find "$RUNNER_TEMP/mutation-intent" -maxdepth 1 -type f -printf '%f\n' | sort)" == $'production-mutation-intent.json\nproduction-mutation-intent.sha256' ]]
+          [[ -z "$(find "$RUNNER_TEMP/mutation-intent" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(cat "$RUNNER_TEMP/mutation-intent/production-mutation-intent.sha256")" == "$INTENT_SHA256" ]]
+          [[ "$(sha256sum "$subject" | awk '{print $1}')" == "$INTENT_SHA256" ]]
+          flags=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/$WORKFLOW_PATH" --signer-digest "$CONTROL_SHA" --source-ref refs/heads/main --source-digest "$CONTROL_SHA" --deny-self-hosted-runners --format json)
+          "$RUNNER_TEMP/release-tools/gh" attestation verify "$subject" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/intent-provenance.json"
+          "$RUNNER_TEMP/release-tools/gh" attestation verify "$subject" "${flags[@]}" --predicate-type "$INTENT_PREDICATE" > "$RUNNER_TEMP/intent-policy.json"
+          "$RUNNER_TEMP/release-tools/jq" -e --slurpfile expected "$subject" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/intent-policy.json" > /dev/null
+          proof="$RUNNER_TEMP/main-lock-proof/production-main-lock-proof.json"
+          [[ "$(find "$RUNNER_TEMP/main-lock-proof" -maxdepth 1 -type f -printf '%f\n' | sort)" == $'production-main-lock-proof.json\nproduction-main-lock-proof.sha256' ]]
+          [[ -z "$(find "$RUNNER_TEMP/main-lock-proof" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(cat "$RUNNER_TEMP/main-lock-proof/production-main-lock-proof.sha256")" == "$PROOF_SHA256" ]]
+          [[ "$(sha256sum "$proof" | awk '{print $1}')" == "$PROOF_SHA256" ]]
+          "$RUNNER_TEMP/release-tools/gh" attestation verify "$proof" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/proof-provenance.json"
+          "$RUNNER_TEMP/release-tools/gh" attestation verify "$proof" "${flags[@]}" --predicate-type "$LOCK_PROOF_PREDICATE" > "$RUNNER_TEMP/proof-policy.json"
+          "$RUNNER_TEMP/release-tools/jq" -e --slurpfile expected "$proof" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/proof-policy.json" > /dev/null
+
+      - name: Reverify the exact production plan before capability use
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          gh_bin="$tools_dir/gh"
+          jq_bin="$tools_dir/jq"
+          [[ "$(find "$RUNNER_TEMP/plan" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-plan.json production-plan.sha256 " ]]
+          [[ -z "$(find "$RUNNER_TEMP/plan" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          plan_path = root / 'plan' / 'production-plan.json'
+          plan_raw = plan_path.read_bytes()
+          plan_sha = hashlib.sha256(plan_raw).hexdigest()
+          if (root / 'plan' / 'production-plan.sha256').read_bytes() != (plan_sha + '\n').encode('ascii'):
+              raise SystemExit('production plan sidecar differs in apply job')
+          request = json.loads((root / 'apply-evidence.json').read_bytes())
+          binding = request['production_plan']
+          if binding['sha256'] != plan_sha or str(binding['run_id']) != os.environ['PLAN_RUN_ID'] or binding['run_attempt'] != 1:
+              raise SystemExit('production plan binding differs in apply job')
+          plan = json.loads(plan_raw)
+          control = plan['control']
+          control_root = pathlib.Path('control')
+          expected = {
+              'workflow_sha': os.environ['CONTROL_SHA'],
+              'workflow_path': '.github/workflows/plan-production-rollout.yml',
+              'run_id': os.environ['PLAN_RUN_ID'],
+              'run_attempt': 1,
+              'contract_sha256': hashlib.sha256((control_root / 'release/deployment/production-app-contract.json').read_bytes()).hexdigest(),
+              'release_policy_sha256': hashlib.sha256((control_root / 'release/deployment/production-release-policy.json').read_bytes()).hexdigest(),
+              'change_schema_sha256': hashlib.sha256((control_root / 'release/deployment/production-change.schema.json').read_bytes()).hexdigest(),
+              'verifier_sha256': hashlib.sha256((control_root / 'release/deployment/verify_production_plan.py').read_bytes()).hexdigest(),
+          }
+          for key, value in expected.items():
+              if control.get(key) != value:
+                  raise SystemExit(f'production plan {key} differs in apply job')
+          PY
+
+          signer="$RELEASE_REPOSITORY/$PLAN_WORKFLOW_PATH"
+          flags=(
+            --repo "$RELEASE_REPOSITORY"
+            --signer-workflow "$signer"
+            --signer-digest "$CONTROL_SHA"
+            --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main
+            --deny-self-hosted-runners
+            --format json
+          )
+          "$gh_bin" attestation verify "$RUNNER_TEMP/plan/production-plan.json" "${flags[@]}" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            > "$RUNNER_TEMP/apply-plan-provenance.json"
+          "$gh_bin" attestation verify "$RUNNER_TEMP/plan/production-plan.json" "${flags[@]}" \
+            --predicate-type "$PLAN_PREDICATE" \
+            > "$RUNNER_TEMP/apply-plan-policy.json"
+          "$jq_bin" -e 'type == "array" and length > 0' "$RUNNER_TEMP/apply-plan-provenance.json" > /dev/null
+          "$jq_bin" -e --slurpfile expected "$RUNNER_TEMP/plan/production-plan.json" \
+            'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' \
+            "$RUNNER_TEMP/apply-plan-policy.json" > /dev/null
+
+      - name: Recheck exact protected main before capability use
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+          PREDECESSOR_KIND: ${{ needs.authority.outputs.predecessor_kind }}
+          PREDECESSOR_RUN_ID: ${{ needs.authority.outputs.predecessor_run_id }}
+          RECOVERY_RUN_ID: ${{ needs.authority.outputs.recovery_run_id }}
+          ROLLOUT_RUN_ID: ${{ needs.authority.outputs.rollout_run_id }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const {owner, repo} = context.repo;
+            const main = await github.rest.git.getRef({owner, repo, ref:'heads/main'});
+            const current = await github.rest.actions.getWorkflowRun({owner, repo, run_id:context.runId});
+            if (main.data.object.sha !== process.env.CONTROL_SHA || current.data.run_attempt !== 1 || current.data.head_sha !== process.env.CONTROL_SHA || current.data.event !== 'workflow_dispatch') throw new Error('apply capability authority changed');
+            const upstream=[process.env.PLAN_RUN_ID,process.env.RECOVERY_RUN_ID,process.env.ROLLOUT_RUN_ID];
+            if(process.env.PREDECESSOR_KIND==='phase-state') upstream.push(process.env.PREDECESSOR_RUN_ID);
+            for(const runId of upstream) {
+              const run=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(runId)});
+             if(run.data.run_attempt!==1 || run.data.head_sha!==process.env.CONTROL_SHA || run.data.status!=='completed' || run.data.conclusion!=='success') throw new Error('apply upstream authority changed');
+             }
+
+      - name: Require fresh anonymous pullability of the exact apply tuple
+        run: |
+          set -euo pipefail
+          unset DO_PRODUCTION_APPLY_TOKEN DO_PRODUCTION_TARGET_JSON
+          unset DIGITALOCEAN_ACCESS_TOKEN DO_ACCESS_TOKEN DO_TOKEN
+          unset GH_TOKEN GITHUB_TOKEN CR_PAT REGISTRY_AUTH_FILE DOCKER_AUTH_CONFIG
+
+          anonymous_root="$RUNNER_TEMP/rereply-anonymous-apply-pull"
+          anonymous_home="$anonymous_root/home"
+          anonymous_config="$anonymous_root/docker"
+          [[ ! -e "$anonymous_root" ]]
+          install -d -m 0700 "$anonymous_root" "$anonymous_home" "$anonymous_config"
+
+          /usr/bin/python3 -I -S -B - <<'PY' > "$anonymous_root/subjects.txt"
+          import json, pathlib, re
+          plan = json.loads((pathlib.Path(__import__('os').environ['RUNNER_TEMP']) / 'plan' / 'production-plan.json').read_text(encoding='utf-8'))
+          images = plan.get('target', {}).get('images')
+          expected = ['gmail-relay', 'meta-relay', 'web']
+          if not isinstance(images, list) or sorted(item.get('component') for item in images if isinstance(item, dict)) != expected:
+              raise SystemExit('apply target image tuple differs')
+          subjects = []
+          for item in sorted(images, key=lambda value: value['component']):
+              component = item['component']
+              subject = item.get('subject')
+              repository = f'ghcr.io/medtechcorps-netizen/rereply-release-{component}'
+              digest = item.get('digest')
+              if set(item) != {'component', 'repository', 'digest', 'subject'} or item.get('repository') != repository:
+                  raise SystemExit('apply target image record differs')
+              if not isinstance(digest, str) or re.fullmatch(r'sha256:[0-9a-f]{64}', digest) is None or subject != f'{repository}@{digest}':
+                  raise SystemExit('apply target image subject differs')
+              subjects.append(subject)
+          if len(set(subjects)) != 3:
+              raise SystemExit('apply target image subjects are not unique')
+          print(*subjects, sep='\n')
+          PY
+          mapfile -t target_images < "$anonymous_root/subjects.txt"
+          [[ "${#target_images[@]}" -eq 3 ]]
+          pulled=0
+          for image in "${target_images[@]}"; do
+            [[ "$image" =~ ^ghcr\.io/medtechcorps-netizen/rereply-release-(web|meta-relay|gmail-relay)@sha256:[0-9a-f]{64}$ ]]
+            env -i \
+              DOCKER_CONFIG="$anonymous_config" \
+              HOME="$anonymous_home" \
+              LANG=C.UTF-8 \
+              PATH=/usr/local/bin:/usr/bin:/bin \
+              /usr/bin/docker pull --platform linux/amd64 "$image"
+            pulled=$((pulled + 1))
+          done
+          [[ "$pulled" -eq 3 ]]
+          if [[ -f "$anonymous_config/config.json" ]]; then
+            "$RUNNER_TEMP/release-tools/jq" -e '
+              ((.auths // {}) | length) == 0 and
+              ((.credHelpers // {}) | length) == 0 and
+              ((.credsStore // "") == "")
+            ' "$anonymous_config/config.json" > /dev/null
+          fi
+
+      - name: Apply with one isolated app-update capability
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DO_PRODUCTION_APPLY_TOKEN: ${{ secrets.DO_PRODUCTION_APPLY_TOKEN }}
+          DO_PRODUCTION_TARGET_JSON: ${{ secrets.DO_PRODUCTION_TARGET_JSON }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          GITHUB_READ_TOKEN: ${{ github.token }}
+          INTENT_ARTIFACT_ID: ${{ needs.intent.outputs.intent_artifact_id }}
+          INTENT_ARTIFACT_DIGEST: ${{ needs.intent.outputs.intent_artifact_digest }}
+          INTENT_ARTIFACT_NAME: ${{ needs.intent.outputs.intent_name }}
+          INTENT_SHA256: ${{ needs.intent.outputs.intent_sha256 }}
+          PROOF_ARTIFACT_ID: ${{ needs.lock_proof.outputs.proof_artifact_id }}
+          PROOF_ARTIFACT_DIGEST: ${{ needs.lock_proof.outputs.proof_artifact_digest }}
+          PROOF_ARTIFACT_NAME: ${{ needs.lock_proof.outputs.proof_name }}
+          PROOF_SHA256: ${{ needs.lock_proof.outputs.proof_sha256 }}
+          RULE_ID: ${{ needs.prelock.outputs.rule_id }}
+          PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+          RECOVERY_RUN_ID: ${{ needs.authority.outputs.recovery_run_id }}
+          ROLLOUT_RUN_ID: ${{ needs.authority.outputs.rollout_run_id }}
+          PREDECESSOR_KIND: ${{ needs.authority.outputs.predecessor_kind }}
+          PREDECESSOR_RUN_ID: ${{ needs.authority.outputs.predecessor_run_id }}
+        run: |
+          set -euo pipefail
+          provider_token="$DO_PRODUCTION_APPLY_TOKEN"
+          target_json="$DO_PRODUCTION_TARGET_JSON"
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          github_read_token="$GITHUB_READ_TOKEN"
+          unset DO_PRODUCTION_APPLY_TOKEN DO_PRODUCTION_TARGET_JSON GH_PRODUCTION_BRANCH_READ_TOKEN GITHUB_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$provider_token" && -n "$target_json" && -n "$branch_read_token" && -n "$github_read_token" ]]
+          cleanup_secrets() {
+            unset DO_PRODUCTION_APPLY_TOKEN DO_PRODUCTION_TARGET_JSON GH_TOKEN GITHUB_TOKEN
+            provider_token= target_json= branch_read_token= github_read_token=
+          }
+          trap cleanup_secrets EXIT
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          read_api() { GH_TOKEN="$github_read_token" "$gh_bin" api "$@"; }
+          [[ "$(read_api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          current="$(read_api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"
+          "$jq_bin" -e --arg sha "$CONTROL_SHA" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and (.status == "in_progress" or .status == "queued")' <<< "$current" > /dev/null
+          current_jobs="$(read_api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1/jobs?per_page=100")"
+          "$jq_bin" -e 'any(.jobs[]; .name == "Prepare and attest exact production mutation intent" and .status == "completed" and .conclusion == "success")' <<< "$current_jobs" > /dev/null
+          "$jq_bin" -e 'any(.jobs[]; .name == "Attest exact production apply main lock proof" and .status == "completed" and .conclusion == "success")' <<< "$current_jobs" > /dev/null
+          run_ids=("$PLAN_RUN_ID" "$RECOVERY_RUN_ID" "$ROLLOUT_RUN_ID")
+          if [[ "$PREDECESSOR_KIND" == phase-state ]]; then run_ids+=("$PREDECESSOR_RUN_ID"); fi
+          for run_id in "${run_ids[@]}"; do
+            latest="$(read_api "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id")"
+            exact="$(read_api "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id/attempts/1")"
+            for value in "$latest" "$exact"; do
+              "$jq_bin" -e --arg sha "$CONTROL_SHA" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and .status == "completed" and .conclusion == "success"' <<< "$value" > /dev/null
+            done
+          done
+          intent_artifact="$(read_api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$INTENT_ARTIFACT_ID")"
+          "$jq_bin" -e --arg name "$INTENT_ARTIFACT_NAME" --arg digest "$INTENT_ARTIFACT_DIGEST" --argjson run_id "$GITHUB_RUN_ID" '.name == $name and .digest == $digest and .expired == false and .workflow_run.id == $run_id' <<< "$intent_artifact" > /dev/null
+          proof_artifact="$(read_api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$PROOF_ARTIFACT_ID")"
+          "$jq_bin" -e --arg name "$PROOF_ARTIFACT_NAME" --arg digest "$PROOF_ARTIFACT_DIGEST" --argjson run_id "$GITHUB_RUN_ID" '.name == $name and .digest == $digest and .expired == false and .workflow_run.id == $run_id' <<< "$proof_artifact" > /dev/null
+          repository_owner="$(cut -d/ -f1 <<< "$GITHUB_REPOSITORY")"
+          repository_name="$(cut -d/ -f2- <<< "$GITHUB_REPOSITORY")"
+          query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}'
+          locked="$(GH_TOKEN="$branch_read_token" "$gh_bin" api graphql -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$RULE_ID" '.data.repository.branchProtectionRules.pageInfo.hasNextPage == false and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == true and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$locked" > /dev/null
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import datetime as dt,os,pathlib,sys
+          sys.path.insert(0,'control/release/deployment')
+          import verify_production_release as common
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          plan=common.load_json(root/'plan'/'production-plan.json','production plan')
+          intent=common.load_json(root/'mutation-intent'/'production-mutation-intent.json','mutation intent')
+          now=dt.datetime.now(dt.timezone.utc)
+          common.validate_fresh_window(plan['issued_at'],plan['expires_at'],now,maximum_age_seconds=common.MAX_PLAN_AGE_SECONDS,label='production plan immediately before mutation')
+          common.validate_mutation_intent(intent,now=now)
+          authority={'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':1,'artifact_id':os.environ['INTENT_ARTIFACT_ID'],'artifact_name':os.environ['INTENT_ARTIFACT_NAME'],'artifact_digest':os.environ['INTENT_ARTIFACT_DIGEST'],'sha256':os.environ['INTENT_SHA256']}
+          (root/'mutation-intent-authority.json').write_bytes(common.canonical_file_bytes(authority))
+          proof_authority={'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':1,'artifact_id':os.environ['PROOF_ARTIFACT_ID'],'artifact_name':os.environ['PROOF_ARTIFACT_NAME'],'artifact_digest':os.environ['PROOF_ARTIFACT_DIGEST'],'sha256':os.environ['PROOF_SHA256']}
+          proof=common.load_json(root/'main-lock-proof'/'production-main-lock-proof.json','main lock proof')
+          common.validate_main_lock_proof(proof,mutation_intent=intent,now=now)
+          if common.sha256_bytes((root/'main-lock-proof'/'production-main-lock-proof.json').read_bytes()) != common.require_sha256(os.environ['PROOF_SHA256'],'main lock proof hash'):
+              common.fail('main lock proof exact-file hash differs')
+          (root/'main-lock-proof-authority.json').write_bytes(common.canonical_file_bytes(proof_authority))
+          PY
+          export DO_PRODUCTION_APPLY_TOKEN="$provider_token"
+          export DO_PRODUCTION_TARGET_JSON="$target_json"
+          /usr/bin/python3 -I -S -B -c '
+          import hashlib,os,pathlib,sys
+          target = os.environ.pop("DO_PRODUCTION_TARGET_JSON")
+          sys.path.insert(0,"control/release/deployment")
+          import apply_production_change as controller
+          root=pathlib.Path(os.environ["RUNNER_TEMP"])
+          arguments=[
+              "execute","--target",target,
+              "--evidence-request",str(root/"apply-evidence.json"),
+              "--production-plan",str(root/"plan"/"production-plan.json"),
+              "--rollout-plan",str(root/"rollout-plan.json"),
+              "--recovery",str(root/"recovery"/"production-recovery-readiness.json"),
+              "--release-policy-sha256",hashlib.sha256(pathlib.Path("control/release/deployment/production-release-policy.json").read_bytes()).hexdigest(),
+              "--change-schema-sha256",hashlib.sha256(pathlib.Path("control/release/deployment/production-change.schema.json").read_bytes()).hexdigest(),
+              "--mutation-intent-schema-sha256",hashlib.sha256(pathlib.Path("control/release/deployment/production-mutation-intent.schema.json").read_bytes()).hexdigest(),
+              "--controller-sha256",hashlib.sha256(pathlib.Path("control/release/deployment/apply_production_change.py").read_bytes()).hexdigest(),
+              "--workflow-sha",os.environ["CONTROL_SHA"],"--workflow-run-id",os.environ["GITHUB_RUN_ID"],"--workflow-run-attempt","1",
+              "--runner-temp",str(root),"--output",str(root/"production-phase-apply-receipt.json"),
+              "--mutation-intent",str(root/"mutation-intent"/"production-mutation-intent.json"),
+              "--mutation-intent-authority",str(root/"mutation-intent-authority.json"),
+              "--main-lock-proof",str(root/"main-lock-proof"/"production-main-lock-proof.json"),
+              "--main-lock-proof-authority",str(root/"main-lock-proof-authority.json")]
+          if os.environ["PREDECESSOR_KIND"]=="phase-state":
+              arguments+=["--predecessor-state",str(root/"predecessor"/"production-phase-state.json")]
+          raise SystemExit(controller.run_cli(arguments))'
+          unset DO_PRODUCTION_APPLY_TOKEN DO_PRODUCTION_TARGET_JSON
+          provider_token= target_json=
+          [[ "$(read_api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          locked_after="$(GH_TOKEN="$branch_read_token" "$gh_bin" api graphql -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$RULE_ID" '.data.repository.branchProtectionRules.pageInfo.hasNextPage == false and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == true and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$locked_after" > /dev/null
+          cleanup_secrets
+          trap - EXIT
+      - name: Create exact sanitized receipt sidecar
+        id: name
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          sha256sum production-phase-apply-receipt.json | awk '{print $1}' > production-phase-apply-receipt.sha256
+          printf 'internal_name=unsigned-production-phase-apply-%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Upload unsigned apply receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.name.outputs.internal_name }}
+          path: |
+            ${{ runner.temp }}/production-phase-apply-receipt.json
+            ${{ runner.temp }}/production-phase-apply-receipt.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  gate:
+    name: Exact production apply receipt gate
+    needs: [authority, apply]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+      - name: Download unsigned exact receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.apply.outputs.internal_name }}
+          path: ${{ runner.temp }}/receipt
+      - name: Recheck exact protected main before attestation
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+          PREDECESSOR_KIND: ${{ needs.authority.outputs.predecessor_kind }}
+          PREDECESSOR_RUN_ID: ${{ needs.authority.outputs.predecessor_run_id }}
+          RECOVERY_RUN_ID: ${{ needs.authority.outputs.recovery_run_id }}
+          ROLLOUT_RUN_ID: ${{ needs.authority.outputs.rollout_run_id }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const {owner, repo} = context.repo;
+            const main = await github.rest.git.getRef({owner, repo, ref:'heads/main'});
+            const current = await github.rest.actions.getWorkflowRun({owner, repo, run_id:context.runId});
+            if (main.data.object.sha !== process.env.CONTROL_SHA || current.data.run_attempt !== 1 || current.data.head_sha !== process.env.CONTROL_SHA || current.data.event !== 'workflow_dispatch') throw new Error('apply attestation authority changed');
+            const upstream=[process.env.PLAN_RUN_ID,process.env.RECOVERY_RUN_ID,process.env.ROLLOUT_RUN_ID];
+            if(process.env.PREDECESSOR_KIND==='phase-state') upstream.push(process.env.PREDECESSOR_RUN_ID);
+            for(const runId of upstream) {
+              const run=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(runId)});
+              if(run.data.run_attempt!==1 || run.data.head_sha!==process.env.CONTROL_SHA || run.data.status!=='completed' || run.data.conclusion!=='success') throw new Error('apply upstream authority changed before attestation');
+            }
+      - name: Validate exact receipt and unchanged CAS
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 && "$GITHUB_SHA" == "$CONTROL_SHA" ]]
+          cd "$RUNNER_TEMP/receipt"
+          [[ "$(cat production-phase-apply-receipt.sha256)" == "$(sha256sum production-phase-apply-receipt.json | awk '{print $1}')" ]]
+          /usr/bin/python3 -I -S -B -c 'import sys,pathlib; sys.path.insert(0,"control/release/deployment"); import verify_production_release as v; p=pathlib.Path("'"$RUNNER_TEMP"'/receipt/production-phase-apply-receipt.json"); v.validate_apply_receipt(v.load_json(p,"apply receipt"))'
+      - name: Attest apply provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/receipt/production-phase-apply-receipt.json
+      - name: Attest exact apply policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/receipt/production-phase-apply-receipt.json
+          predicate-type: ${{ env.APPLY_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/receipt/production-phase-apply-receipt.json
+      - name: Upload signed apply receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-phase-apply-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/receipt
+          if-no-files-found: error
+          retention-days: 7
+
+  release_authorization:
+    name: Authorize exact production apply main lock release
+    needs: [authority, prelock, intent, lock, lock_proof, apply, gate]
+    if: ${{ needs.authority.result == 'success' && needs.prelock.result == 'success' && needs.intent.result == 'success' && needs.lock.result == 'success' && needs.lock_proof.result == 'success' && needs.apply.result == 'success' && needs.gate.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      authorization_artifact_digest: ${{ steps.upload_release_intent.outputs.artifact-digest }}
+      authorization_artifact_id: ${{ steps.upload_release_intent.outputs.artifact-id }}
+      authorization_name: ${{ steps.release_intent.outputs.intent_name }}
+      authorization_sha256: ${{ steps.release_intent.outputs.intent_sha256 }}
+      receipt_artifact_digest: ${{ steps.authenticate.outputs.receipt_artifact_digest }}
+      receipt_artifact_id: ${{ steps.authenticate.outputs.receipt_artifact_id }}
+      receipt_name: ${{ steps.authenticate.outputs.receipt_name }}
+      receipt_sha256: ${{ steps.evidence.outputs.receipt_sha256 }}
+      rule_id: ${{ steps.evidence.outputs.rule_id }}
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned unlock authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+
+      - name: Authenticate the exact successful apply gate and immutable artifacts
+        id: authenticate
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          LOCK_NAME: ${{ needs.prelock.outputs.root_marker_name }}
+          INTENT_NAME: ${{ needs.intent.outputs.intent_name }}
+          PROOF_NAME: ${{ needs.lock_proof.outputs.proof_name }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const {owner, repo} = context.repo;
+            const runId = context.runId;
+            const expectedJobs = {
+              'Authenticate exact production apply authority': 'success',
+              'Prepare exact production apply pre-lock authority': 'success',
+              'Prepare and attest exact production mutation intent': 'success',
+              'Acquire exact production apply main lock': 'success',
+              'Attest exact production apply main lock proof': 'success',
+              'Apply exact production phase': 'success',
+              'Exact production apply receipt gate': 'success',
+              'Authorize exact production apply main lock release': null,
+            };
+            const main = await github.rest.git.getRef({owner, repo, ref:'heads/main'});
+            if (main.data.object.sha !== process.env.CONTROL_SHA) throw new Error('main changed before apply unlock');
+            const latest = await github.rest.actions.getWorkflowRun({owner, repo, run_id:runId});
+            const exact = await github.rest.actions.getWorkflowRunAttempt({owner, repo, run_id:runId, attempt_number:1});
+            for (const run of [latest.data, exact.data]) {
+              if (run.run_attempt !== 1 || run.head_sha !== process.env.CONTROL_SHA || run.head_branch !== 'main' || run.event !== 'workflow_dispatch' || run.path !== process.env.WORKFLOW_PATH || run.status !== 'in_progress') throw new Error('apply unlock run authority differs');
+            }
+            const jobs = await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs', {owner, repo, run_id:runId, attempt_number:1, per_page:100});
+            if (jobs.length !== 8 || JSON.stringify(jobs.map(job=>job.name).sort()) !== JSON.stringify(Object.keys(expectedJobs).sort())) throw new Error('apply unlock job inventory differs');
+            for (const job of jobs) {
+              const expected = expectedJobs[job.name];
+              if (expected === null) {
+                if (job.status !== 'in_progress' || job.conclusion !== null) throw new Error('apply release-authorization job is not current');
+              } else if (job.status !== 'completed' || job.conclusion !== expected) throw new Error('apply prerequisite job differs');
+            }
+            const receiptName = `production-phase-apply-${runId}-1`;
+            const unsignedName = `unsigned-production-phase-apply-${runId}-1`;
+            const expectedNames = [process.env.LOCK_NAME, process.env.INTENT_NAME, process.env.PROOF_NAME, receiptName, unsignedName].sort();
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {owner, repo, run_id:runId, per_page:100});
+            if (artifacts.length !== 5 || JSON.stringify(artifacts.map(item=>item.name).sort()) !== JSON.stringify(expectedNames)) throw new Error('apply artifact inventory differs');
+            async function exactArtifact(name) {
+              const matches = artifacts.filter(item=>item.name===name);
+              if (matches.length !== 1) throw new Error('apply artifact is ambiguous');
+              const artifact = await github.rest.actions.getArtifact({owner, repo, artifact_id:matches[0].id});
+              if (artifact.data.expired || artifact.data.workflow_run.id !== runId || !/^sha256:[0-9a-f]{64}$/.test(artifact.data.digest)) throw new Error('apply artifact authority differs');
+              return artifact.data;
+            }
+            const marker = await exactArtifact(process.env.LOCK_NAME);
+            const intent = await exactArtifact(process.env.INTENT_NAME);
+            const proof = await exactArtifact(process.env.PROOF_NAME);
+            const receipt = await exactArtifact(receiptName);
+            const unsigned = await exactArtifact(unsignedName);
+            core.setOutput('marker_artifact_id', String(marker.id));
+            core.setOutput('marker_artifact_digest', marker.digest);
+            core.setOutput('intent_artifact_id', String(intent.id));
+            core.setOutput('intent_artifact_digest', intent.digest);
+            core.setOutput('intent_name', process.env.INTENT_NAME);
+            core.setOutput('proof_artifact_id', String(proof.id));
+            core.setOutput('proof_artifact_digest', proof.digest);
+            core.setOutput('proof_name', process.env.PROOF_NAME);
+            core.setOutput('receipt_artifact_id', String(receipt.id));
+            core.setOutput('receipt_artifact_digest', receipt.digest);
+            core.setOutput('receipt_name', receiptName);
+            core.setOutput('unsigned_artifact_id', String(unsigned.id));
+            core.setOutput('unsigned_artifact_digest', unsigned.digest);
+            core.setOutput('unsigned_name', unsignedName);
+
+      - name: Download exact apply lock marker
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.authenticate.outputs.marker_artifact_id }}
+          path: ${{ runner.temp }}/lock
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Download exact signed apply receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.authenticate.outputs.receipt_artifact_id }}
+          path: ${{ runner.temp }}/receipt
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Verify exact apply lock ownership and signed receipt
+        id: evidence
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$(find "$RUNNER_TEMP/lock" -maxdepth 1 -type f -printf '%f\n')" == "apply-main-lock.json" ]]
+          [[ -z "$(find "$RUNNER_TEMP/lock" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(find "$RUNNER_TEMP/receipt" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-phase-apply-receipt.json production-phase-apply-receipt.sha256 " ]]
+          [[ -z "$(find "$RUNNER_TEMP/receipt" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(cat "$RUNNER_TEMP/receipt/production-phase-apply-receipt.sha256")" == "$(sha256sum "$RUNNER_TEMP/receipt/production-phase-apply-receipt.json" | awk '{print $1}')" ]]
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import hashlib, json, os, pathlib, re, sys
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          marker_path = root / 'lock' / 'apply-main-lock.json'
+          marker_raw = marker_path.read_bytes()
+          marker = json.loads(marker_raw)
+          if sorted(marker) != ['control_sha','rule_id','run_attempt','run_id','schema_version','state']:
+              raise SystemExit('apply lock marker keys differ')
+          if marker['schema_version'] != 1 or marker['run_id'] != os.environ['GITHUB_RUN_ID'] or marker['run_attempt'] != 1 or marker['control_sha'] != os.environ['CONTROL_SHA'] or marker['state'] != 'acquire-intent' or re.fullmatch(r'[A-Za-z0-9_+/=-]+', marker['rule_id']) is None:
+              raise SystemExit('apply lock marker authority differs')
+          sys.path.insert(0, 'control/release/deployment')
+          import verify_production_release as common
+          receipt_path = root / 'receipt' / 'production-phase-apply-receipt.json'
+          receipt = common.validate_apply_receipt(common.load_json(receipt_path, 'apply receipt'))
+          control = receipt['control']
+          if control['workflow_sha'] != os.environ['CONTROL_SHA'] or control['workflow_path'] != '.github/workflows/apply-production-phase.yml' or str(control['run_id']) != os.environ['GITHUB_RUN_ID'] or control['run_attempt'] != 1:
+              raise SystemExit('apply receipt control authority differs')
+          output = pathlib.Path(os.environ['GITHUB_OUTPUT'])
+          with output.open('a', encoding='utf-8') as stream:
+              stream.write(f"rule_id={marker['rule_id']}\n")
+              stream.write(f"marker_sha256={hashlib.sha256(marker_raw).hexdigest()}\n")
+              stream.write(f"receipt_sha256={hashlib.sha256(receipt_path.read_bytes()).hexdigest()}\n")
+          PY
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          signer="$RELEASE_REPOSITORY/$WORKFLOW_PATH"
+          flags=(--repo "$RELEASE_REPOSITORY" --signer-workflow "$signer" --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA" --source-ref refs/heads/main --deny-self-hosted-runners --format json)
+          "$gh_bin" attestation verify "$RUNNER_TEMP/receipt/production-phase-apply-receipt.json" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/apply-unlock-provenance.json"
+          "$gh_bin" attestation verify "$RUNNER_TEMP/receipt/production-phase-apply-receipt.json" "${flags[@]}" --predicate-type "$APPLY_PREDICATE" > "$RUNNER_TEMP/apply-unlock-policy.json"
+          "$jq_bin" -e 'type == "array" and length > 0' "$RUNNER_TEMP/apply-unlock-provenance.json" > /dev/null
+          "$jq_bin" -e --slurpfile expected "$RUNNER_TEMP/receipt/production-phase-apply-receipt.json" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/apply-unlock-policy.json" > /dev/null
+
+      - name: Create exact durable apply release authorization before unlock
+        id: release_intent
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          EXPECTED_MARKER_ARTIFACT_DIGEST: ${{ steps.authenticate.outputs.marker_artifact_digest }}
+          EXPECTED_MARKER_ARTIFACT_ID: ${{ steps.authenticate.outputs.marker_artifact_id }}
+          EXPECTED_MARKER_NAME: ${{ needs.apply.outputs.lock_name }}
+          EXPECTED_MARKER_SHA256: ${{ steps.evidence.outputs.marker_sha256 }}
+          EXPECTED_INTENT_ARTIFACT_DIGEST: ${{ steps.authenticate.outputs.intent_artifact_digest }}
+          EXPECTED_INTENT_ARTIFACT_ID: ${{ steps.authenticate.outputs.intent_artifact_id }}
+          EXPECTED_INTENT_NAME: ${{ steps.authenticate.outputs.intent_name }}
+          EXPECTED_INTENT_SHA256: ${{ needs.intent.outputs.intent_sha256 }}
+          EXPECTED_PROOF_ARTIFACT_DIGEST: ${{ steps.authenticate.outputs.proof_artifact_digest }}
+          EXPECTED_PROOF_ARTIFACT_ID: ${{ steps.authenticate.outputs.proof_artifact_id }}
+          EXPECTED_PROOF_NAME: ${{ steps.authenticate.outputs.proof_name }}
+          EXPECTED_PROOF_SHA256: ${{ needs.lock_proof.outputs.proof_sha256 }}
+          EXPECTED_RECEIPT_ARTIFACT_DIGEST: ${{ steps.authenticate.outputs.receipt_artifact_digest }}
+          EXPECTED_RECEIPT_ARTIFACT_ID: ${{ steps.authenticate.outputs.receipt_artifact_id }}
+          EXPECTED_RECEIPT_NAME: ${{ steps.authenticate.outputs.receipt_name }}
+          EXPECTED_RECEIPT_SHA256: ${{ steps.evidence.outputs.receipt_sha256 }}
+          EXPECTED_RULE_ID: ${{ steps.evidence.outputs.rule_id }}
+          EXPECTED_UNSIGNED_ARTIFACT_DIGEST: ${{ steps.authenticate.outputs.unsigned_artifact_digest }}
+          EXPECTED_UNSIGNED_ARTIFACT_ID: ${{ steps.authenticate.outputs.unsigned_artifact_id }}
+          EXPECTED_UNSIGNED_NAME: ${{ steps.authenticate.outputs.unsigned_name }}
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          github_read_token="$GH_READ_TOKEN"
+          unset GH_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$github_read_token" ]]
+          cleanup_tokens() { github_read_token=; }
+          trap cleanup_tokens EXIT
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          read_api() { GH_TOKEN="$github_read_token" "$gh_bin" api "$@"; }
+
+          [[ "$(sha256sum "$RUNNER_TEMP/lock/apply-main-lock.json" | awk '{print $1}')" == "$EXPECTED_MARKER_SHA256" ]]
+          [[ "$(sha256sum "$RUNNER_TEMP/receipt/production-phase-apply-receipt.json" | awk '{print $1}')" == "$EXPECTED_RECEIPT_SHA256" ]]
+          for endpoint in "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1"; do
+            run_json="$(read_api "$endpoint")"
+            "$jq_bin" -e --arg sha "$CONTROL_SHA" --arg path "$WORKFLOW_PATH" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and .path == $path and .status == "in_progress"' <<< "$run_json" > /dev/null
+          done
+          jobs_json="$(read_api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1/jobs?per_page=100")"
+          "$jq_bin" -e '
+            .total_count == 8 and (.jobs | length) == 8 and
+            ([.jobs[].name] | sort) == (["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Authorize exact production apply main lock release","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority"] | sort) and
+            ([.jobs[] | select(.name == "Authorize exact production apply main lock release" and .status == "in_progress" and .conclusion == null)] | length) == 1 and
+            ([.jobs[] | select(.name != "Authorize exact production apply main lock release" and .status == "completed" and .conclusion == "success")] | length) == 7
+          ' <<< "$jobs_json" > /dev/null
+          "$jq_bin" -cS '[
+            "Authenticate exact production apply authority",
+            "Prepare exact production apply pre-lock authority",
+            "Prepare and attest exact production mutation intent",
+            "Acquire exact production apply main lock",
+            "Attest exact production apply main lock proof",
+            "Apply exact production phase",
+            "Exact production apply receipt gate",
+            "Authorize exact production apply main lock release"
+          ] as $expected | [$expected[] as $name | (.jobs[] | select(.name == $name) | {job_id:(.id|tostring),name,status,conclusion})]' \
+            <<< "$jobs_json" > "$RUNNER_TEMP/apply-release-jobs.json"
+          artifacts_json="$(read_api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"
+          "$jq_bin" -e \
+            --arg marker_name "$EXPECTED_MARKER_NAME" --argjson marker_id "$EXPECTED_MARKER_ARTIFACT_ID" --arg marker_digest "$EXPECTED_MARKER_ARTIFACT_DIGEST" \
+            --arg intent_name "$EXPECTED_INTENT_NAME" --argjson intent_id "$EXPECTED_INTENT_ARTIFACT_ID" --arg intent_digest "$EXPECTED_INTENT_ARTIFACT_DIGEST" \
+            --arg proof_name "$EXPECTED_PROOF_NAME" --argjson proof_id "$EXPECTED_PROOF_ARTIFACT_ID" --arg proof_digest "$EXPECTED_PROOF_ARTIFACT_DIGEST" \
+            --arg receipt_name "$EXPECTED_RECEIPT_NAME" --argjson receipt_id "$EXPECTED_RECEIPT_ARTIFACT_ID" --arg receipt_digest "$EXPECTED_RECEIPT_ARTIFACT_DIGEST" \
+            --arg unsigned_name "$EXPECTED_UNSIGNED_NAME" --argjson unsigned_id "$EXPECTED_UNSIGNED_ARTIFACT_ID" --arg unsigned_digest "$EXPECTED_UNSIGNED_ARTIFACT_DIGEST" '
+            .total_count == 5 and (.artifacts | length) == 5 and
+            ([.artifacts[].name] | sort) == ([$marker_name,$intent_name,$proof_name,$receipt_name,$unsigned_name] | sort) and
+            any(.artifacts[]; .id == $marker_id and .name == $marker_name and .digest == $marker_digest and .expired == false) and
+            any(.artifacts[]; .id == $intent_id and .name == $intent_name and .digest == $intent_digest and .expired == false) and
+            any(.artifacts[]; .id == $proof_id and .name == $proof_name and .digest == $proof_digest and .expired == false) and
+            any(.artifacts[]; .id == $receipt_id and .name == $receipt_name and .digest == $receipt_digest and .expired == false) and
+            any(.artifacts[]; .id == $unsigned_id and .name == $unsigned_name and .digest == $unsigned_digest and .expired == false)
+          ' <<< "$artifacts_json" > /dev/null
+          "$jq_bin" -e 'type == "array" and length > 0' "$RUNNER_TEMP/apply-unlock-provenance.json" > /dev/null
+          "$jq_bin" -e --slurpfile expected "$RUNNER_TEMP/receipt/production-phase-apply-receipt.json" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/apply-unlock-policy.json" > /dev/null
+          provenance_sha256="$(sha256sum "$RUNNER_TEMP/apply-unlock-provenance.json" | awk '{print $1}')"
+          policy_sha256="$(sha256sum "$RUNNER_TEMP/apply-unlock-policy.json" | awk '{print $1}')"
+          export PROVENANCE_SHA256="$provenance_sha256" POLICY_SHA256="$policy_sha256"
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import datetime as dt, hashlib, json, os, pathlib, sys
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          sys.path.insert(0, 'control/release/deployment')
+          import authorize_production_main_lock_release as controller
+          import verify_production_release as common
+          request = {
+              'operation': 'apply',
+              'issued_at': dt.datetime.now(dt.timezone.utc).replace(microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'control': {
+                  'workflow_path': os.environ['WORKFLOW_PATH'],
+                  'workflow_sha': os.environ['CONTROL_SHA'],
+                  'run_id': os.environ['GITHUB_RUN_ID'],
+                  'run_attempt': 1,
+                  'runner_environment': 'github-hosted',
+                  'authorization_schema_sha256': hashlib.sha256(pathlib.Path('control', os.environ['RELEASE_AUTHORIZATION_SCHEMA_PATH']).read_bytes()).hexdigest(),
+                  'controller_sha256': hashlib.sha256(pathlib.Path('control', os.environ['RELEASE_AUTHORIZATION_CONTROLLER_PATH']).read_bytes()).hexdigest(),
+              },
+              'jobs': json.loads((root / 'apply-release-jobs.json').read_text(encoding='utf-8')),
+              'branch': {
+                  'main_sha': os.environ['CONTROL_SHA'],
+                  'rule_id': os.environ['EXPECTED_RULE_ID'],
+                  'rule_identity_sha256': hashlib.sha256(os.environ['EXPECTED_RULE_ID'].encode('utf-8')).hexdigest(),
+                  'lock_branch': True,
+                  'is_admin_enforced': True,
+                  'lock_allows_fetch_and_merge': False,
+              },
+              'artifacts': {
+                  'acquire_intent': {'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': 1, 'artifact_id': os.environ['EXPECTED_MARKER_ARTIFACT_ID'], 'artifact_name': os.environ['EXPECTED_MARKER_NAME'], 'artifact_digest': os.environ['EXPECTED_MARKER_ARTIFACT_DIGEST'], 'sha256': os.environ['EXPECTED_MARKER_SHA256']},
+                  'mutation_intent': {'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': 1, 'artifact_id': os.environ['EXPECTED_INTENT_ARTIFACT_ID'], 'artifact_name': os.environ['EXPECTED_INTENT_NAME'], 'artifact_digest': os.environ['EXPECTED_INTENT_ARTIFACT_DIGEST'], 'sha256': os.environ['EXPECTED_INTENT_SHA256']},
+                  'main_lock_proof': {'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': 1, 'artifact_id': os.environ['EXPECTED_PROOF_ARTIFACT_ID'], 'artifact_name': os.environ['EXPECTED_PROOF_NAME'], 'artifact_digest': os.environ['EXPECTED_PROOF_ARTIFACT_DIGEST'], 'sha256': os.environ['EXPECTED_PROOF_SHA256']},
+                  'unsigned_receipt': {'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': 1, 'artifact_id': os.environ['EXPECTED_UNSIGNED_ARTIFACT_ID'], 'artifact_name': os.environ['EXPECTED_UNSIGNED_NAME'], 'artifact_digest': os.environ['EXPECTED_UNSIGNED_ARTIFACT_DIGEST'], 'sha256': os.environ['EXPECTED_RECEIPT_SHA256']},
+                  'signed_receipt': {'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': 1, 'artifact_id': os.environ['EXPECTED_RECEIPT_ARTIFACT_ID'], 'artifact_name': os.environ['EXPECTED_RECEIPT_NAME'], 'artifact_digest': os.environ['EXPECTED_RECEIPT_ARTIFACT_DIGEST'], 'sha256': os.environ['EXPECTED_RECEIPT_SHA256']},
+              },
+              'receipt_attestations': {
+                  'signer_workflow': f"{os.environ['RELEASE_REPOSITORY']}/{os.environ['WORKFLOW_PATH']}",
+                  'signer_digest': os.environ['CONTROL_SHA'],
+                  'source_digest': os.environ['CONTROL_SHA'],
+                  'source_ref': 'refs/heads/main',
+                  'runner_environment': 'github-hosted',
+                  'provenance_predicate_type': 'https://slsa.dev/provenance/v1',
+                  'policy_predicate_type': os.environ['APPLY_PREDICATE'],
+                  'provenance_verification_sha256': os.environ['PROVENANCE_SHA256'],
+                  'policy_verification_sha256': os.environ['POLICY_SHA256'],
+              },
+          }
+          receipt = common.load_json(root / 'receipt' / 'production-phase-apply-receipt.json', 'apply receipt')
+          payload = controller.build_authorization(request, receipt, now=dt.datetime.now(dt.timezone.utc))
+          path = root / 'production-main-lock-release-authorization.json'
+          raw = common.canonical_file_bytes(payload)
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(fd, 'wb') as stream:
+              stream.write(raw)
+          digest = hashlib.sha256(raw).hexdigest()
+          sidecar = root / 'production-main-lock-release-authorization.sha256'
+          sidecar_fd = os.open(sidecar, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(sidecar_fd, 'wb') as stream:
+              stream.write((digest + '\n').encode('ascii'))
+          controller.validate_authorization(payload, receipt=receipt, now=dt.datetime.now(dt.timezone.utc))
+          with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as stream:
+              stream.write(f"intent_name=production-main-lock-release-authorization-apply-{os.environ['GITHUB_RUN_ID']}-1\n")
+              stream.write(f"intent_sha256={digest}\n")
+          PY
+          cleanup_tokens
+          trap - EXIT
+
+      - name: Attest apply release authorization provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-main-lock-release-authorization.json
+
+      - name: Attest exact apply release authorization policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-main-lock-release-authorization.json
+          predicate-type: ${{ env.RELEASE_AUTHORIZATION_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/production-main-lock-release-authorization.json
+
+      - name: Upload durable apply release authorization
+        id: upload_release_intent
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.release_intent.outputs.intent_name }}
+          path: |
+            ${{ runner.temp }}/production-main-lock-release-authorization.json
+            ${{ runner.temp }}/production-main-lock-release-authorization.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  unlock:
+    name: Release exact production apply main lock
+    needs: [authority, prelock, intent, lock, lock_proof, apply, gate, release_authorization]
+    if: ${{ needs.authority.result == 'success' && needs.prelock.result == 'success' && needs.intent.result == 'success' && needs.lock.result == 'success' && needs.lock_proof.result == 'success' && needs.apply.result == 'success' && needs.gate.result == 'success' && needs.release_authorization.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: rereply-production-apply
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned unlock verification tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+
+      - name: Download exact signed apply release authorization
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.release_authorization.outputs.authorization_artifact_id }}
+          path: ${{ runner.temp }}/release-authorization
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Download exact signed apply receipt for release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.release_authorization.outputs.receipt_artifact_id }}
+          path: ${{ runner.temp }}/release-receipt
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Authenticate exact apply pre-unlock authority
+        env:
+          AUTHORIZATION_ARTIFACT_DIGEST: ${{ needs.release_authorization.outputs.authorization_artifact_digest }}
+          AUTHORIZATION_ARTIFACT_ID: ${{ needs.release_authorization.outputs.authorization_artifact_id }}
+          AUTHORIZATION_NAME: ${{ needs.release_authorization.outputs.authorization_name }}
+          AUTHORIZATION_SHA256: ${{ needs.release_authorization.outputs.authorization_sha256 }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          RECEIPT_ARTIFACT_DIGEST: ${{ needs.release_authorization.outputs.receipt_artifact_digest }}
+          RECEIPT_ARTIFACT_ID: ${{ needs.release_authorization.outputs.receipt_artifact_id }}
+          RECEIPT_NAME: ${{ needs.release_authorization.outputs.receipt_name }}
+          RECEIPT_SHA256: ${{ needs.release_authorization.outputs.receipt_sha256 }}
+        run: |
+          set -euo pipefail
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          [[ "$(find "$RUNNER_TEMP/release-authorization" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-main-lock-release-authorization.json production-main-lock-release-authorization.sha256 " ]]
+          [[ -z "$(find "$RUNNER_TEMP/release-authorization" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(cat "$RUNNER_TEMP/release-authorization/production-main-lock-release-authorization.sha256")" == "$AUTHORIZATION_SHA256" ]]
+          [[ "$(sha256sum "$RUNNER_TEMP/release-authorization/production-main-lock-release-authorization.json" | awk '{print $1}')" == "$AUTHORIZATION_SHA256" ]]
+          [[ "$(find "$RUNNER_TEMP/release-receipt" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-phase-apply-receipt.json production-phase-apply-receipt.sha256 " ]]
+          [[ "$(cat "$RUNNER_TEMP/release-receipt/production-phase-apply-receipt.sha256")" == "$RECEIPT_SHA256" ]]
+          [[ "$(sha256sum "$RUNNER_TEMP/release-receipt/production-phase-apply-receipt.json" | awk '{print $1}')" == "$RECEIPT_SHA256" ]]
+          [[ "$AUTHORIZATION_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          auth_api_digest="sha256:$AUTHORIZATION_ARTIFACT_DIGEST"
+          for endpoint in "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1"; do
+            run_json="$("$gh_bin" api "$endpoint")"
+            "$jq_bin" -e --arg sha "$CONTROL_SHA" --arg path "$WORKFLOW_PATH" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and .path == $path and .status == "in_progress"' <<< "$run_json" > /dev/null
+          done
+          jobs_json="$("$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1/jobs?per_page=100")"
+          "$jq_bin" -e '
+            .total_count == 9 and (.jobs | length) == 9 and
+            ([.jobs[].name] | sort) == (["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Authorize exact production apply main lock release","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority","Release exact production apply main lock"] | sort) and
+            ([.jobs[] | select(.name == "Release exact production apply main lock" and .status == "in_progress" and .conclusion == null)] | length) == 1 and
+            ([.jobs[] | select(.name != "Release exact production apply main lock" and .status == "completed" and .conclusion == "success")] | length) == 8
+          ' <<< "$jobs_json" > /dev/null
+          artifacts_json="$("$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"
+          "$jq_bin" -e --arg auth "$AUTHORIZATION_NAME" --arg receipt "$RECEIPT_NAME" '
+            .total_count == 6 and (.artifacts | length) == 6 and
+            ([.artifacts[].name] | sort) == ([
+              "production-main-lock-apply-" + ($ENV.GITHUB_RUN_ID) + "-1",
+              "production-mutation-intent-apply-" + ($ENV.GITHUB_RUN_ID) + "-1",
+              "production-main-lock-proof-apply-" + ($ENV.GITHUB_RUN_ID) + "-1",
+              "unsigned-production-phase-apply-" + ($ENV.GITHUB_RUN_ID) + "-1",
+              $receipt,$auth
+            ] | sort)
+          ' <<< "$artifacts_json" > /dev/null
+          for specification in "$AUTHORIZATION_ARTIFACT_ID|$auth_api_digest|$AUTHORIZATION_NAME" "$RECEIPT_ARTIFACT_ID|$RECEIPT_ARTIFACT_DIGEST|$RECEIPT_NAME"; do
+            IFS='|' read -r artifact_id artifact_digest artifact_name <<< "$specification"
+            artifact_json="$("$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id")"
+            "$jq_bin" -e --argjson id "$artifact_id" --arg digest "$artifact_digest" --arg name "$artifact_name" --argjson run_id "$GITHUB_RUN_ID" '.id == $id and .name == $name and .digest == $digest and .expired == false and .workflow_run.id == $run_id' <<< "$artifact_json" > /dev/null
+          done
+          /usr/bin/python3 -I -S -B "control/$RELEASE_AUTHORIZATION_CONTROLLER_PATH" validate \
+            --authorization "$RUNNER_TEMP/release-authorization/production-main-lock-release-authorization.json" \
+            --receipt "$RUNNER_TEMP/release-receipt/production-phase-apply-receipt.json" \
+            --sha256 "$AUTHORIZATION_SHA256"
+          flags=(--repo "$RELEASE_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/$WORKFLOW_PATH" --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA" --source-ref refs/heads/main --deny-self-hosted-runners --format json)
+          "$gh_bin" attestation verify "$RUNNER_TEMP/release-authorization/production-main-lock-release-authorization.json" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/release-auth-provenance.json"
+          "$gh_bin" attestation verify "$RUNNER_TEMP/release-authorization/production-main-lock-release-authorization.json" "${flags[@]}" --predicate-type "$RELEASE_AUTHORIZATION_PREDICATE" > "$RUNNER_TEMP/release-auth-policy.json"
+          "$jq_bin" -e 'type == "array" and length > 0' "$RUNNER_TEMP/release-auth-provenance.json" > /dev/null
+          "$jq_bin" -e --slurpfile expected "$RUNNER_TEMP/release-authorization/production-main-lock-release-authorization.json" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/release-auth-policy.json" > /dev/null
+
+      - name: Release the exact authorized apply main lock
+        env:
+          AUTHORIZATION_SHA256: ${{ needs.release_authorization.outputs.authorization_sha256 }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          EXPECTED_RULE_ID: ${{ needs.release_authorization.outputs.rule_id }}
+          GH_PRODUCTION_BRANCH_LOCK_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_LOCK_TOKEN }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch_lock_token="$GH_PRODUCTION_BRANCH_LOCK_TOKEN"
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          unset GH_PRODUCTION_BRANCH_LOCK_TOKEN GH_PRODUCTION_BRANCH_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$branch_lock_token" && -n "$branch_read_token" ]]
+          cleanup_tokens() { branch_lock_token= branch_read_token=; }
+          trap cleanup_tokens EXIT
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          read_rule() { GH_TOKEN="$branch_read_token" "$gh_bin" api graphql "$@"; }
+          mutate_rule() { GH_TOKEN="$branch_lock_token" "$gh_bin" api graphql "$@"; }
+          [[ "$(sha256sum "$RUNNER_TEMP/release-authorization/production-main-lock-release-authorization.json" | awk '{print $1}')" == "$AUTHORIZATION_SHA256" ]]
+          /usr/bin/python3 -I -S -B "control/$RELEASE_AUTHORIZATION_CONTROLLER_PATH" validate \
+            --authorization "$RUNNER_TEMP/release-authorization/production-main-lock-release-authorization.json" \
+            --receipt "$RUNNER_TEMP/release-receipt/production-phase-apply-receipt.json" \
+            --sha256 "$AUTHORIZATION_SHA256"
+          repository_owner="${GITHUB_REPOSITORY%%/*}"
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}} ref(qualifiedName:"refs/heads/main"){target{oid}}}}'
+          before="$(read_rule -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$EXPECTED_RULE_ID" --arg sha "$CONTROL_SHA" '.data.repository.branchProtectionRules.pageInfo.hasNextPage == false and .data.repository.ref.target.oid == $sha and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == true and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$before" > /dev/null
+          mutation='mutation($ruleId:ID!,$lock:Boolean!){updateBranchProtectionRule(input:{branchProtectionRuleId:$ruleId,lockBranch:$lock}){branchProtectionRule{id pattern lockBranch}}}'
+          /usr/bin/python3 -I -S -B "control/$RELEASE_AUTHORIZATION_CONTROLLER_PATH" validate \
+            --authorization "$RUNNER_TEMP/release-authorization/production-main-lock-release-authorization.json" \
+            --receipt "$RUNNER_TEMP/release-receipt/production-phase-apply-receipt.json" \
+            --sha256 "$AUTHORIZATION_SHA256"
+          set +e
+          response="$(mutate_rule -f "query=$mutation" -F "ruleId=$EXPECTED_RULE_ID" -F lock=false)"
+          mutation_status=$?
+          set -e
+          after="$(read_rule -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$EXPECTED_RULE_ID" --arg sha "$CONTROL_SHA" '.data.repository.branchProtectionRules.pageInfo.hasNextPage == false and .data.repository.ref.target.oid == $sha and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == false and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$after" > /dev/null
+          if [[ "$mutation_status" -eq 0 ]]; then
+            "$jq_bin" -e --arg id "$EXPECTED_RULE_ID" '(.errors // []) == [] and .data.updateBranchProtectionRule.branchProtectionRule.id == $id and .data.updateBranchProtectionRule.branchProtectionRule.pattern == "main" and .data.updateBranchProtectionRule.branchProtectionRule.lockBranch == false' <<< "$response" > /dev/null
+          fi
+          cleanup_tokens
+          trap - EXIT

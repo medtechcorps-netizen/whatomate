@@ -1,0 +1,359 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rereply.app/schemas/production-orphan-lock-release-v1.json",
+  "title": "ReReply confirmed production orphan main-lock release receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authority",
+    "repository",
+    "completed_at",
+    "state",
+    "control",
+    "preauthorization",
+    "branch_release",
+    "resolution",
+    "gates"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "authority": {"const": "production-orphan-lock-release-receipt"},
+    "repository": {"const": "medtechcorps-netizen/whatomate"},
+    "completed_at": {"$ref": "#/$defs/timestamp"},
+    "state": {"const": "confirmed-released"},
+    "control": {"$ref": "#/$defs/control"},
+    "preauthorization": {"$ref": "#/$defs/preauthorization"},
+    "branch_release": {"$ref": "#/$defs/branchRelease"},
+    "resolution": {"$ref": "#/$defs/resolution"},
+    "gates": {"$ref": "#/$defs/gates"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "resolution": {
+            "properties": {
+              "closure_kind": {"const": "no-mutation-never-started"}
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "resolution": {
+            "properties": {
+              "orphan_rollback_sha256": {"type": "null"},
+              "phase_state_sha256": {"type": "null"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "resolution": {
+            "properties": {
+              "closure_kind": {"const": "reconciliation-canary"}
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "resolution": {
+            "properties": {
+              "orphan_rollback_sha256": {"type": "null"},
+              "phase_state_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "resolution": {
+            "properties": {
+              "closure_kind": {"const": "orphan-rollback-canary"}
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "resolution": {
+            "properties": {
+              "orphan_rollback_sha256": {"$ref": "#/$defs/sha256"},
+              "phase_state_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha1": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullableSha256": {
+      "oneOf": [
+        {"$ref": "#/$defs/sha256"},
+        {"type": "null"}
+      ]
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,14}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_sha",
+        "workflow_path",
+        "run_id",
+        "run_attempt",
+        "runner_environment",
+        "release_schema_sha256",
+        "controller_sha256"
+      ],
+      "properties": {
+        "workflow_sha": {"$ref": "#/$defs/sha1"},
+        "workflow_path": {"const": ".github/workflows/finalize-production-orphan-lock.yml"},
+        "run_id": {"$ref": "#/$defs/runId"},
+        "run_attempt": {"const": 1},
+        "runner_environment": {"const": "github-hosted"},
+        "release_schema_sha256": {"$ref": "#/$defs/sha256"},
+        "controller_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "run_attempt",
+        "artifact_id",
+        "artifact_name",
+        "artifact_digest",
+        "sha256"
+      ],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/runId"},
+        "run_attempt": {"const": 1},
+        "artifact_id": {"$ref": "#/$defs/runId"},
+        "artifact_name": {
+          "type": "string",
+          "pattern": "^production-orphan-lock-finalization-[1-9][0-9]{0,14}-1$"
+        },
+        "artifact_digest": {"$ref": "#/$defs/digest"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "attestedAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "binding",
+        "signer_workflow",
+        "signer_digest",
+        "source_digest",
+        "source_ref",
+        "runner_environment",
+        "provenance_predicate_type",
+        "policy_predicate_type",
+        "provenance_verification_sha256",
+        "policy_verification_sha256"
+      ],
+      "properties": {
+        "binding": {"$ref": "#/$defs/binding"},
+        "signer_workflow": {
+          "const": "medtechcorps-netizen/whatomate/.github/workflows/finalize-production-orphan-lock.yml"
+        },
+        "signer_digest": {"$ref": "#/$defs/sha1"},
+        "source_digest": {"$ref": "#/$defs/sha1"},
+        "source_ref": {"const": "refs/heads/main"},
+        "runner_environment": {"const": "github-hosted"},
+        "provenance_predicate_type": {"const": "https://slsa.dev/provenance/v1"},
+        "policy_predicate_type": {
+          "const": "https://rereply.app/attestations/production-orphan-lock-finalization/v1"
+        },
+        "provenance_verification_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_verification_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "preauthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority",
+        "actor_provenance",
+        "authorization_scope",
+        "typed_confirmation_sha256"
+      ],
+      "properties": {
+        "authority": {"$ref": "#/$defs/attestedAuthority"},
+        "actor_provenance": {
+          "const": "single-operator-break-glass-assertion-not-cryptographic-actor-provenance"
+        },
+        "authorization_scope": {"const": "release-main-lock-only"},
+        "typed_confirmation_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "releaseProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lock_branch",
+        "is_admin_enforced",
+        "lock_allows_fetch_and_merge"
+      ],
+      "properties": {
+        "lock_branch": {"type": "boolean"},
+        "is_admin_enforced": {"const": true},
+        "lock_allows_fetch_and_merge": {"const": false}
+      }
+    },
+    "rootAcquireIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "run_attempt",
+        "artifact_id",
+        "artifact_name",
+        "artifact_digest",
+        "sha256"
+      ],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/runId"},
+        "run_attempt": {"const": 1},
+        "artifact_id": {"$ref": "#/$defs/runId"},
+        "artifact_name": {
+          "type": "string",
+          "pattern": "^production-main-lock-(apply|rollback)-[1-9][0-9]{0,14}-1$"
+        },
+        "artifact_digest": {"$ref": "#/$defs/digest"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "branchRelease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "main_sha",
+        "rule_id",
+        "rule_identity_sha256",
+        "root_acquire_intent",
+        "http_methods_used",
+        "graphql_operations_used",
+        "mutation_request_count",
+        "outcome",
+        "mutation_response_received",
+        "read_confirmed",
+        "pre_release",
+        "post_release",
+        "mutation_fingerprint_sha256"
+      ],
+      "properties": {
+        "main_sha": {"$ref": "#/$defs/sha1"},
+        "rule_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_+/=-]+$",
+          "maxLength": 512
+        },
+        "rule_identity_sha256": {"$ref": "#/$defs/sha256"},
+        "root_acquire_intent": {"$ref": "#/$defs/rootAcquireIntent"},
+        "http_methods_used": {
+          "const": ["POST"]
+        },
+        "graphql_operations_used": {
+          "const": ["query", "mutation", "query"]
+        },
+        "mutation_request_count": {"const": 1},
+        "outcome": {"enum": ["applied", "ambiguous-reconciled"]},
+        "mutation_response_received": {"type": "boolean"},
+        "read_confirmed": {"const": true},
+        "pre_release": {
+          "allOf": [
+            {"$ref": "#/$defs/releaseProjection"},
+            {"properties": {"lock_branch": {"const": true}}}
+          ]
+        },
+        "post_release": {
+          "allOf": [
+            {"$ref": "#/$defs/releaseProjection"},
+            {"properties": {"lock_branch": {"const": false}}}
+          ]
+        },
+        "mutation_fingerprint_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"outcome": {"const": "applied"}}},
+          "then": {"properties": {"mutation_response_received": {"const": true}}},
+          "else": {"properties": {"mutation_response_received": {"const": false}}}
+        }
+      ]
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "closure_kind",
+        "reconciliation_sha256",
+        "closure_receipt_sha256",
+        "orphan_rollback_sha256",
+        "phase_state_sha256"
+      ],
+      "properties": {
+        "closure_kind": {
+          "enum": [
+            "reconciliation-canary",
+            "no-mutation-never-started",
+            "orphan-rollback-canary"
+          ]
+        },
+        "reconciliation_sha256": {"$ref": "#/$defs/sha256"},
+        "closure_receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "orphan_rollback_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "phase_state_sha256": {"$ref": "#/$defs/nullableSha256"}
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "preauthorization_authenticated",
+        "main_unchanged",
+        "rule_identity_unchanged",
+        "one_shot_mutation",
+        "post_read_confirmed",
+        "lock_released"
+      ],
+      "properties": {
+        "preauthorization_authenticated": {"const": true},
+        "main_unchanged": {"const": true},
+        "rule_identity_unchanged": {"const": true},
+        "one_shot_mutation": {"const": true},
+        "post_read_confirmed": {"const": true},
+        "lock_released": {"const": true}
+      }
+    }
+  }
+}

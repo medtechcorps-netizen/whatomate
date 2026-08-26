@@ -12,6 +12,7 @@ import unittest
 from collections import Counter
 from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -20,17 +21,23 @@ import verify_production_plan as verifier
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = ROOT / "release" / "deployment" / "production-app-contract.json"
+POLICY_PATH = ROOT / "release" / "deployment" / "production-release-policy.json"
+SCHEMA_PATH = ROOT / "release" / "deployment" / "production-change.schema.json"
 VERIFIER_PATH = ROOT / "release" / "deployment" / "verify_production_plan.py"
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "plan-production-rollout.yml"
+IMAGE_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "build-attest-exact-release-images.yml"
+APPLY_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "apply-production-phase.yml"
+ROLLBACK_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "rollback-production-phase.yml"
+CANARY_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "verify-production-crm-canary.yml"
 TEST_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "test.yml"
 CONTROL_SHA = "f" * 40
 NOW = dt.datetime(2026, 8, 26, 12, 0, 0, tzinfo=dt.timezone.utc)
 TEST_TARGET = {
     "app_id": "11111111-1111-4111-8111-111111111111",
-    "active_deployment_id": "22222222-2222-4222-8222-222222222222",
-    "app_updated_at": "2026-08-26T11:11:11Z",
     "default_ingress": "https://private-target.invalid",
 }
+ACTIVE_DEPLOYMENT_ID = "22222222-2222-4222-8222-222222222222"
+APP_UPDATED_AT = "2026-08-26T11:11:11Z"
 
 
 def digest(label: str) -> str:
@@ -164,24 +171,32 @@ def database_inventory(spec: dict[str, object]) -> set[tuple[object, ...]]:
 
 
 def rollout_plan() -> dict[str, object]:
-    images = []
-    for component in ("web", "meta-relay", "gmail-relay"):
-        repository = f"ghcr.io/medtechcorps-netizen/rereply-release-{component}"
-        images.append(
+    phases = []
+    for index, phase in enumerate(verifier.PHASES):
+        source_sha = verifier.BOOTSTRAP_SOURCE_SHA if phase == "baseline" else (
+            f"{index + 1:x}" * 40
+        )
+        images = []
+        for component in ("web", "meta-relay", "gmail-relay"):
+            repository = f"ghcr.io/medtechcorps-netizen/rereply-release-{component}"
+            label = component if phase == "baseline" else f"{phase}-{component}"
+            images.append(
+                {
+                    "component": component,
+                    "image": repository,
+                    "digest": digest(label),
+                    "tag_is_authority": False,
+                }
+            )
+        phases.append(
             {
-                "component": component,
-                "image": repository,
-                "digest": digest(component),
-                "tag_is_authority": False,
+                "phase": phase,
+                "source": {"commit": source_sha},
+                "images": images,
+                "migration": {"digest": images[0]["digest"]},
+                "rollback": copy.deepcopy(verifier.ROLLBACK_FLOORS[phase]),
             }
         )
-    baseline = {
-        "phase": "baseline",
-        "source": {"commit": verifier.BOOTSTRAP_SOURCE_SHA},
-        "images": images,
-        "migration": {"digest": digest("web")},
-        "rollback": {"allowed_targets": [], "forbidden_targets": []},
-    }
     return {
         "schema_version": 1,
         "authority": "digest-only",
@@ -192,13 +207,23 @@ def rollout_plan() -> dict[str, object]:
             "run_attempt": 1,
         },
         "activation_order": verifier.PHASES,
-        "phases": [
-            baseline,
-            {"phase": "bridge"},
-            {"phase": "backend"},
-            {"phase": "ui"},
-        ],
+        "phases": phases,
     }
+
+
+def phase_images(
+    rollout: dict[str, object], phase: str, contract: dict[str, object]
+) -> list[dict[str, str]]:
+    selected = next(item for item in rollout["phases"] if item["phase"] == phase)
+    observed: dict[str, dict[str, str]] = {}
+    for image in selected["images"]:
+        repository = image["image"].removeprefix("ghcr.io/")
+        observed[image["component"]] = {
+            "repository": repository,
+            "digest": image["digest"],
+            "subject": f"{image['image']}@{image['digest']}",
+        }
+    return verifier.target_image_records(contract, observed)
 
 
 class FakeResponse:
@@ -244,6 +269,14 @@ class ProductionPlanTests(unittest.TestCase):
         self.spec = fake_spec()
         self.target = dict(TEST_TARGET)
         self.contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        self.policy = verifier.validate_release_policy(
+            json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        )
+        self.schema = verifier.validate_change_schema(
+            json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        )
+        self.policy_hash = verifier.sha256_bytes(POLICY_PATH.read_bytes())
+        self.schema_hash = verifier.sha256_bytes(SCHEMA_PATH.read_bytes())
         target_hashes = {
             key: verifier.sha256_bytes(value.encode("utf-8"))
             for key, value in self.target.items()
@@ -252,12 +285,14 @@ class ProductionPlanTests(unittest.TestCase):
         self.contract["provider"]["default_ingress_sha256"] = target_hashes[
             "default_ingress"
         ]
-        self.contract["bootstrap_state"]["active_deployment_id_sha256"] = (
-            target_hashes["active_deployment_id"]
+        active_deployment_hash = verifier.sha256_bytes(
+            ACTIVE_DEPLOYMENT_ID.encode("utf-8")
         )
-        self.contract["bootstrap_state"]["app_updated_at_sha256"] = target_hashes[
-            "app_updated_at"
-        ]
+        updated_at_hash = verifier.sha256_bytes(APP_UPDATED_AT.encode("utf-8"))
+        self.contract["bootstrap_state"]["active_deployment_id_sha256"] = (
+            active_deployment_hash
+        )
+        self.contract["bootstrap_state"]["app_updated_at_sha256"] = updated_at_hash
         vpc_hash = verifier.sha256_bytes(self.spec["vpc"]["id"].encode("utf-8"))
         db_inventory = database_inventory(self.spec)
         self.contract["expected_topology"]["vpc_id_sha256"] = vpc_hash
@@ -275,6 +310,9 @@ class ProductionPlanTests(unittest.TestCase):
         self.contract["bootstrap_state"]["canonical_spec_sha256"] = canonical_hash
         self.contract["bootstrap_state"]["environment_values_sha256"] = environment_hash
         self.contract["bootstrap_state"]["non_source_projection_sha256"] = non_source_hash
+        self.contract["bootstrap_state"]["genesis_state_sha256"] = (
+            verifier.genesis_state_sha256(self.contract)
+        )
 
         patches = [
             mock.patch.object(verifier, "PRODUCTION_VPC_ID_SHA256", vpc_hash),
@@ -296,12 +334,12 @@ class ProductionPlanTests(unittest.TestCase):
             mock.patch.object(
                 verifier,
                 "BOOTSTRAP_DEPLOYMENT_ID_SHA256",
-                target_hashes["active_deployment_id"],
+                active_deployment_hash,
             ),
             mock.patch.object(
                 verifier,
                 "BOOTSTRAP_UPDATED_AT_SHA256",
-                target_hashes["app_updated_at"],
+                updated_at_hash,
             ),
             mock.patch.object(
                 verifier, "BOOTSTRAP_NON_SOURCE_SHA256", non_source_hash
@@ -310,7 +348,9 @@ class ProductionPlanTests(unittest.TestCase):
         for patcher in patches:
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.contract = verifier.validate_contract(self.contract)
+        self.contract = verifier.validate_contract(
+            self.contract, self.policy, self.schema
+        )
 
         self.rollout = rollout_plan()
         self.rollout_hash = verifier.sha256_bytes(
@@ -325,6 +365,7 @@ class ProductionPlanTests(unittest.TestCase):
                     "capsule_artifact_id": "202",
                     "capsule_artifact_digest": digest("capsule"),
                     "rollout_plan_sha256": self.rollout_hash,
+                    "predecessor": None,
                 },
                 separators=(",", ":"),
             ),
@@ -335,18 +376,18 @@ class ProductionPlanTests(unittest.TestCase):
         app = {
             "app": {
                 "id": self.target["app_id"],
-                "updated_at": self.target["app_updated_at"],
+                "updated_at": APP_UPDATED_AT,
                 "default_ingress": self.target["default_ingress"],
                 "spec": copy.deepcopy(self.spec),
                 "active_deployment": {
-                    "id": self.target["active_deployment_id"],
+                    "id": ACTIVE_DEPLOYMENT_ID,
                     "phase": "ACTIVE",
                 },
             }
         }
         deployment = {
             "deployment": {
-                "id": self.target["active_deployment_id"],
+                "id": ACTIVE_DEPLOYMENT_ID,
                 "phase": "ACTIVE",
                 "spec": copy.deepcopy(self.spec),
                 "services": [
@@ -370,14 +411,20 @@ class ProductionPlanTests(unittest.TestCase):
     def build(self, *, second_app: dict[str, object] | None = None) -> dict[str, object]:
         app, deployment = self.responses()
         second = copy.deepcopy(second_app if second_app is not None else app)
-        app_path, deployment_path = verifier.provider_paths(self.contract, self.target)
+        app_path, deployment_path = verifier.provider_paths(
+            self.contract, self.target, ACTIVE_DEPLOYMENT_ID
+        )
         return verifier.build_plan(
             contract=self.contract,
             contract_sha256="a" * 64,
+            policy=self.policy,
+            policy_sha256=self.policy_hash,
+            schema_sha256=self.schema_hash,
             verifier_sha256="b" * 64,
             normalized_input=self.normalized,
             target_descriptor=self.target,
             rollout_plan=self.rollout,
+            predecessor_state=None,
             first_app_response=app,
             first_deployment_response=deployment,
             second_app_response=second,
@@ -393,73 +440,205 @@ class ProductionPlanTests(unittest.TestCase):
             now=NOW,
         )
 
-    def test_reviewed_contract_is_valid(self) -> None:
-        production_contract = verifier.load_json(CONTRACT_PATH, "contract")
-        with (
-            mock.patch.object(
-                verifier,
-                "PRODUCTION_APP_ID_SHA256",
-                production_contract["provider"]["app_id_sha256"],
-            ),
-            mock.patch.object(
-                verifier,
-                "PRODUCTION_DEFAULT_INGRESS_SHA256",
-                production_contract["provider"]["default_ingress_sha256"],
-            ),
-            mock.patch.object(
-                verifier,
-                "BOOTSTRAP_DEPLOYMENT_ID_SHA256",
-                production_contract["bootstrap_state"][
-                    "active_deployment_id_sha256"
+    def validate(self, plan: dict[str, object], *, now: dt.datetime = NOW) -> None:
+        verifier.validate_plan(
+            plan,
+            self.contract,
+            "a" * 64,
+            self.policy,
+            self.policy_hash,
+            self.schema_hash,
+            "b" * 64,
+            self.rollout,
+            self.rollout_hash,
+            None,
+            now=now,
+        )
+
+    def phase_state(
+        self,
+        phase: str,
+        *,
+        event_sequence: int | None = None,
+        operation: str = "activate",
+        source_phase: str | None = None,
+        predecessor_kind: str | None = None,
+    ) -> dict[str, object]:
+        ordinal = verifier.PHASES.index(phase) + 1
+        if event_sequence is None:
+            event_sequence = ordinal
+        if source_phase is None:
+            source_phase = (
+                "genesis" if phase == "baseline" else verifier.PHASES[ordinal - 2]
+            )
+        if predecessor_kind is None:
+            predecessor_kind = (
+                "apply-receipt" if operation == "activate" else "rollback-receipt"
+            )
+        selected = self.rollout["phases"][ordinal - 1]
+        receipt_sha256 = verifier.sha256_bytes(
+            f"{operation}:{source_phase}:{phase}:{event_sequence}".encode("utf-8")
+        )
+        return {
+            "schema_version": 1,
+            "authority": "production-phase-state",
+            "repository": self.contract["repository"],
+            "completed_at": "2026-08-26T11:55:00Z",
+            "control": {
+                "workflow_sha": CONTROL_SHA,
+                "workflow_path": self.policy["phase_state"]["workflow_path"],
+                "run_id": "401",
+                "run_attempt": 1,
+                "runner_environment": "github-hosted",
+                "release_policy_sha256": self.policy_hash,
+                "change_schema_sha256": self.schema_hash,
+            },
+            "lineage": {
+                "event_sequence": event_sequence,
+                "phase_ordinal": ordinal,
+                "operation": operation,
+                "from": source_phase,
+                "to": phase,
+                "predecessor_kind": predecessor_kind,
+                "predecessor_state_sha256": receipt_sha256,
+                "phase": phase,
+                "phase_source_sha": selected["source"]["commit"],
+            },
+            "provider_state": {
+                "app_identity_sha256": self.contract["provider"]["app_id_sha256"],
+                "default_ingress_sha256": self.contract["provider"][
+                    "default_ingress_sha256"
                 ],
+                "app_updated_at_sha256": verifier.sha256_bytes(
+                    f"updated:{phase}:{event_sequence}".encode("utf-8")
+                ),
+                "active_deployment_identity_sha256": verifier.sha256_bytes(
+                    f"deployment:{phase}:{event_sequence}".encode("utf-8")
+                ),
+                "canonical_spec_sha256": verifier.sha256_bytes(
+                    f"spec:{phase}:{event_sequence}".encode("utf-8")
+                ),
+                "environment_values_sha256": self.contract["bootstrap_state"][
+                    "environment_values_sha256"
+                ],
+                "non_source_projection_sha256": self.contract["bootstrap_state"][
+                    "non_source_projection_sha256"
+                ],
+                "source_mode": "digest-images",
+                "images": phase_images(self.rollout, phase, self.contract),
+            },
+            "evidence": {
+                "rollout_plan_sha256": self.rollout_hash,
+                "production_plan_sha256": verifier.sha256_bytes(
+                    f"plan:{phase}:{event_sequence}".encode("utf-8")
+                ),
+                "recovery_sha256": verifier.sha256_bytes(
+                    f"recovery:{phase}:{event_sequence}".encode("utf-8")
+                ),
+                "change_receipt_sha256": receipt_sha256,
+                "canary_sha256": verifier.sha256_bytes(
+                    f"canary:{phase}:{event_sequence}".encode("utf-8")
+                ),
+            },
+            "gates": {
+                "deployment_succeeded": True,
+                "migration_succeeded": True,
+                "canary_succeeded": True,
+            },
+            "rollback": copy.deepcopy(verifier.ROLLBACK_FLOORS[phase]),
+        }
+
+    def input_for_state(
+        self, state: dict[str, object]
+    ) -> tuple[dict[str, object], str]:
+        state_sha256 = verifier.sha256_bytes(verifier.canonical_file_bytes(state))
+        normalized = copy.deepcopy(self.normalized)
+        normalized["predecessor"] = {
+            "run_id": "401",
+            "run_attempt": 1,
+            "artifact_id": "402",
+            "artifact_digest": digest("phase-state-artifact"),
+            "state_sha256": state_sha256,
+        }
+        return normalized, state_sha256
+
+    def test_change_schema_deep_constraints_fail_closed(self) -> None:
+        mutations = {
+            "receipt kind allowlist": lambda schema: schema["$defs"]["phaseState"][
+                "properties"
+            ]["lineage"]["properties"]["predecessor_kind"]["enum"].append(
+                "phase-state"
             ),
-            mock.patch.object(
-                verifier,
-                "BOOTSTRAP_UPDATED_AT_SHA256",
-                production_contract["bootstrap_state"]["app_updated_at_sha256"],
+            "operation receipt binding": lambda schema: schema["$defs"][
+                "phaseState"
+            ]["properties"]["lineage"]["allOf"][0]["then"]["properties"][
+                "predecessor_kind"
+            ].__setitem__("const", "rollback-receipt"),
+            "image component binding": lambda schema: schema["$defs"][
+                "imageWeb"
+            ]["properties"]["component"].__setitem__("const", "meta-relay"),
+            "image repository binding": lambda schema: schema["$defs"][
+                "imageWeb"
+            ]["properties"]["repository"].__setitem__(
+                "const",
+                "ghcr.io/medtechcorps-netizen/rereply-release-meta-relay",
             ),
-            mock.patch.object(
-                verifier,
-                "PRODUCTION_VPC_ID_SHA256",
-                "aaaf98cef6beb658509d644dc8c56b559a38f79344739cd0edd1442070ec207e",
+            "image subject pattern": lambda schema: schema["$defs"][
+                "imageWeb"
+            ]["properties"]["subject"].__setitem__("pattern", ".*"),
+            "image digest equality template": lambda schema: schema["$defs"][
+                "imageWeb"
+            ].__setitem__(
+                "x-rereply-subject-template",
+                "ghcr.io/medtechcorps-netizen/rereply-release-web@{other}",
             ),
-            mock.patch.object(
-                verifier,
-                "BOOTSTRAP_CANONICAL_SPEC_SHA256",
-                "a93a507a5affd82b4e00636812e4c444d31c9027bc31c19bd075f2e4d580b07e",
+            "component uniqueness": lambda schema: schema["$defs"]["phaseState"][
+                "properties"
+            ]["provider_state"]["properties"]["images"].__setitem__(
+                "uniqueItems", False
             ),
-            mock.patch.object(
-                verifier,
-                "BOOTSTRAP_ENVIRONMENT_SHA256",
-                "3b675a9ca2279c465a102e8256cbf8242a46c456e6898d593e9cde3d0e2361c7",
+            "component order": lambda schema: schema["$defs"]["phaseState"][
+                "properties"
+            ]["provider_state"]["properties"]["images"]["prefixItems"].reverse(),
+            "closed tuple": lambda schema: schema["$defs"]["phaseState"][
+                "properties"
+            ]["provider_state"]["properties"]["images"].__setitem__("items", {}),
+            "rollback phase binding": lambda schema: schema["$defs"]["phaseState"][
+                "allOf"
+            ][1]["then"]["properties"]["rollback"]["const"].__setitem__(
+                "allowed_targets", []
             ),
-            mock.patch.object(
-                verifier,
-                "BOOTSTRAP_NON_SOURCE_SHA256",
-                "4f31183fb7f305a2a36422fdf722f90bed1eadc69fd90026928f522edf9a419b",
+            "success gate": lambda schema: schema["$defs"]["phaseState"][
+                "properties"
+            ]["gates"]["properties"]["canary_succeeded"].__setitem__(
+                "const", False
             ),
-            mock.patch.object(
-                verifier,
-                "PRODUCTION_DATABASE_INVENTORY",
-                {
-                    (
-                        "PG",
-                        "17",
-                        True,
-                        "5a08acdc0eed3e363e1aa4e0bba55a523bff63fec1680f3f63b1f46e834289c2",
-                        "28248f27ae9c2545b42173bd7f06fffce87e1b22db6d51d1721fb3318a871472",
-                    ),
-                    (
-                        "VALKEY",
-                        "8",
-                        True,
-                        "92acd7905c06aeb9db2bb0b6a71b739bfc6032ca8a2a5fb7473e8afd4a1c87e3",
-                        "affc1fc72bb50fa5467e5ba5bd07f5b2bfc7c448bed946c17bbb4078aee1db97",
-                    ),
-                },
+            "digest primitive": lambda schema: schema["$defs"][
+                "digest"
+            ].__setitem__("pattern", "^sha256:.*$"),
+            "phase-state schema version": lambda schema: schema["$defs"][
+                "phaseState"
+            ]["properties"]["schema_version"]["enum"].append(3),
+            "artifact binding closedness": lambda schema: schema["$defs"][
+                "artifactBinding"
+            ].__setitem__("additionalProperties", True),
+            "v2 paired binding requirement": lambda schema: schema["$defs"][
+                "phaseState"
+            ]["allOf"][5]["then"]["properties"]["evidence"]["required"].pop(),
+            "v1 reconciled kind exclusion": lambda schema: schema["$defs"][
+                "phaseState"
+            ]["allOf"][4]["then"]["properties"]["lineage"]["allOf"][0][
+                "then"
+            ]["properties"]["predecessor_kind"]["enum"].append(
+                "apply-reconciled-receipt"
             ),
-        ):
-            verifier.validate_contract(production_contract)
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                schema = copy.deepcopy(self.schema)
+                mutate(schema)
+                with self.assertRaises(verifier.PlanError):
+                    verifier.validate_change_schema(schema)
 
     def test_provider_fingerprint_canonicalization_excludes_file_newline(self) -> None:
         value = {"z": "é", "a": [2, 1]}
@@ -479,18 +658,12 @@ class ProductionPlanTests(unittest.TestCase):
         self.assertNotIn(b"test-ciphertext", encoded)
         for private_value in self.target.values():
             self.assertNotIn(private_value.encode("utf-8"), encoded)
+        self.assertNotIn(ACTIVE_DEPLOYMENT_ID.encode("utf-8"), encoded)
+        self.assertNotIn(APP_UPDATED_AT.encode("utf-8"), encoded)
         self.assertFalse(first["provider_validation"]["mutation_performed"])
         self.assertFalse(first["provider_validation"]["deployment_authority"])
         self.assertEqual(first["provider_observation"]["http_request_count"], 4)
-        verifier.validate_plan(
-            first,
-            self.contract,
-            "a" * 64,
-            "b" * 64,
-            self.rollout,
-            self.rollout_hash,
-            now=NOW,
-        )
+        self.validate(first)
 
     def test_protected_target_descriptor_is_hash_bound_and_never_public(self) -> None:
         normalized = verifier.normalize_target_descriptor(
@@ -500,10 +673,8 @@ class ProductionPlanTests(unittest.TestCase):
         for key in self.target:
             with self.subTest(key=key):
                 tampered = dict(self.target)
-                if key in {"app_id", "active_deployment_id"}:
+                if key == "app_id":
                     tampered[key] = "33333333-3333-4333-8333-333333333333"
-                elif key == "app_updated_at":
-                    tampered[key] = "2026-08-26T11:11:12Z"
                 else:
                     tampered[key] = "https://other-target.invalid"
                 with self.assertRaises(verifier.PlanError):
@@ -544,14 +715,32 @@ class ProductionPlanTests(unittest.TestCase):
             with self.subTest(label=label):
                 app, deployment = self.responses()
                 mutate(app)
+                expected_state, expected_images = verifier.predecessor_provider_expectation(
+                    self.contract, self.rollout, None
+                )
                 with self.assertRaises(verifier.PlanError):
-                    verifier.provider_state(app, deployment, self.contract, self.target)
+                    verifier.provider_state(
+                        app,
+                        deployment,
+                        self.contract,
+                        self.target,
+                        expected_state,
+                        expected_images,
+                    )
 
     def test_logical_candidate_changes_only_four_source_envelopes(self) -> None:
-        _, images = verifier.validate_rollout_plan(
-            self.rollout, self.contract, self.normalized
+        _, images, _, _ = verifier.validate_rollout_plan(
+            self.rollout,
+            self.contract,
+            self.normalized,
+            policy=self.policy,
+            policy_sha256=self.policy_hash,
+            schema_sha256=self.schema_hash,
+            predecessor_state=None,
         )
-        candidate = verifier.build_logical_candidate(self.spec, self.contract, images)
+        candidate = verifier.build_logical_candidate(
+            self.spec, self.contract, images, "legacy-git"
+        )
         self.assertEqual(
             verifier.strip_component_sources(candidate, self.contract),
             verifier.strip_component_sources(self.spec, self.contract),
@@ -572,15 +761,7 @@ class ProductionPlanTests(unittest.TestCase):
         ):
             with self.subTest(checked_at=checked_at):
                 with self.assertRaises(verifier.PlanError):
-                    verifier.validate_plan(
-                        plan,
-                        self.contract,
-                        "a" * 64,
-                        "b" * 64,
-                        self.rollout,
-                        self.rollout_hash,
-                        now=checked_at,
-                    )
+                    self.validate(plan, now=checked_at)
 
     def test_strict_input_rejects_duplicates_floats_booleans_and_long_ids(self) -> None:
         samples = [
@@ -601,11 +782,21 @@ class ProductionPlanTests(unittest.TestCase):
             bad_input = dict(self.normalized)
             bad_input["rollout_plan_sha256"] = "0" * 64
             with self.assertRaises(verifier.PlanError):
-                verifier.load_rollout_plan_for_observation(path, self.contract, bad_input)
+                verifier.load_rollout_plan_for_observation(
+                    path,
+                    self.contract,
+                    bad_input,
+                    policy=self.policy,
+                    policy_sha256=self.policy_hash,
+                    schema_sha256=self.schema_hash,
+                    predecessor_state=None,
+                )
 
     def test_provider_client_uses_only_two_exact_get_paths(self) -> None:
         app, deployment = self.responses()
-        app_path, deployment_path = verifier.provider_paths(self.contract, self.target)
+        app_path, deployment_path = verifier.provider_paths(
+            self.contract, self.target, ACTIVE_DEPLOYMENT_ID
+        )
         origin = self.contract["provider"]["api_origin"]
         opener = FakeOpener(
             [app, deployment, app, deployment],
@@ -615,11 +806,15 @@ class ProductionPlanTests(unittest.TestCase):
             plan = verifier.observe(
                 contract=self.contract,
                 contract_sha256="a" * 64,
+                policy=self.policy,
+                policy_sha256=self.policy_hash,
+                schema_sha256=self.schema_hash,
                 verifier_sha256="b" * 64,
                 normalized_input=self.normalized,
                 target_descriptor=self.target,
                 rollout_plan=self.rollout,
                 rollout_plan_sha256=self.rollout_hash,
+                predecessor_state=None,
                 workflow_run_id="303",
                 workflow_run_attempt=1,
                 token="read-only-test-token-123456",
@@ -683,7 +878,9 @@ class ProductionPlanTests(unittest.TestCase):
 
     def test_forbidden_ambient_credential_stops_before_network(self) -> None:
         app, deployment = self.responses()
-        app_path, deployment_path = verifier.provider_paths(self.contract, self.target)
+        app_path, deployment_path = verifier.provider_paths(
+            self.contract, self.target, ACTIVE_DEPLOYMENT_ID
+        )
         origin = self.contract["provider"]["api_origin"]
         opener = FakeOpener(
             [app, deployment, app, deployment],
@@ -694,11 +891,15 @@ class ProductionPlanTests(unittest.TestCase):
                 verifier.observe(
                     contract=self.contract,
                     contract_sha256="a" * 64,
+                    policy=self.policy,
+                    policy_sha256=self.policy_hash,
+                    schema_sha256=self.schema_hash,
                     verifier_sha256="b" * 64,
                     normalized_input=self.normalized,
                     target_descriptor=self.target,
                     rollout_plan=self.rollout,
                     rollout_plan_sha256=self.rollout_hash,
+                    predecessor_state=None,
                     workflow_run_id="303",
                     workflow_run_attempt=1,
                     token="read-only-test-token-123456",
@@ -721,7 +922,11 @@ class ProductionPlanTests(unittest.TestCase):
         stderr = io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             with self.assertRaises(verifier.PlanError) as captured:
-                client.get_json(verifier.provider_paths(self.contract, self.target)[0])
+                client.get_json(
+                    verifier.provider_paths(
+                        self.contract, self.target, ACTIVE_DEPLOYMENT_ID
+                    )[0]
+                )
         combined = stdout.getvalue() + stderr.getvalue() + str(captured.exception)
         self.assertNotIn("never-log-this", combined)
         with self.assertRaises(verifier.PlanError):
@@ -777,6 +982,601 @@ class ProductionPlanTests(unittest.TestCase):
             with self.assertRaises(verifier.PlanError):
                 verifier.trusted_verifier_hash(other)
 
+    def test_genesis_authority_selects_only_baseline(self) -> None:
+        target, _images, transition, predecessor = verifier.validate_rollout_plan(
+            self.rollout,
+            self.contract,
+            self.normalized,
+            policy=self.policy,
+            policy_sha256=self.policy_hash,
+            schema_sha256=self.schema_hash,
+            predecessor_state=None,
+        )
+        self.assertEqual(target["phase"], "baseline")
+        self.assertEqual(
+            transition,
+            {
+                "operation": "activate",
+                "from": "genesis",
+                "to": "baseline",
+                "ordinal": 1,
+            },
+        )
+        self.assertEqual(predecessor["event_sequence"], 0)
+        self.assertEqual(predecessor["phase_ordinal"], 0)
+        self.assertEqual(
+            predecessor["state_sha256"],
+            self.contract["bootstrap_state"]["genesis_state_sha256"],
+        )
+
+    def test_each_signed_phase_authorizes_only_the_next_activation(self) -> None:
+        for current_phase, next_phase in zip(
+            verifier.PHASES[:-1], verifier.PHASES[1:]
+        ):
+            with self.subTest(current=current_phase, target=next_phase):
+                state = self.phase_state(current_phase)
+                normalized, _ = self.input_for_state(state)
+                target, _images, transition, predecessor = (
+                    verifier.validate_rollout_plan(
+                        self.rollout,
+                        self.contract,
+                        normalized,
+                        policy=self.policy,
+                        policy_sha256=self.policy_hash,
+                        schema_sha256=self.schema_hash,
+                        predecessor_state=state,
+                    )
+                )
+                self.assertEqual(target["phase"], next_phase)
+                self.assertEqual(transition["from"], current_phase)
+                self.assertEqual(transition["to"], next_phase)
+                self.assertEqual(
+                    predecessor["event_sequence"],
+                    state["lineage"]["event_sequence"],
+                )
+                self.assertEqual(
+                    predecessor["phase_ordinal"],
+                    state["lineage"]["phase_ordinal"],
+                )
+
+    def test_rollback_state_can_reauthorize_the_next_legal_activation(self) -> None:
+        state = self.phase_state(
+            "backend",
+            event_sequence=7,
+            operation="rollback",
+            source_phase="ui",
+            predecessor_kind="rollback-receipt",
+        )
+        normalized, _ = self.input_for_state(state)
+        target, _images, transition, predecessor = verifier.validate_rollout_plan(
+            self.rollout,
+            self.contract,
+            normalized,
+            policy=self.policy,
+            policy_sha256=self.policy_hash,
+            schema_sha256=self.schema_hash,
+            predecessor_state=state,
+        )
+        self.assertEqual(target["phase"], "ui")
+        self.assertEqual(transition["ordinal"], 4)
+        self.assertEqual(predecessor["event_sequence"], 7)
+        self.assertEqual(predecessor["phase_ordinal"], 3)
+
+    def test_terminal_ui_and_invalid_phase_lineage_fail_closed(self) -> None:
+        ui = self.phase_state("ui")
+        normalized, _ = self.input_for_state(ui)
+        with self.assertRaises(verifier.PlanError):
+            verifier.validate_rollout_plan(
+                self.rollout,
+                self.contract,
+                normalized,
+                policy=self.policy,
+                policy_sha256=self.policy_hash,
+                schema_sha256=self.schema_hash,
+                predecessor_state=ui,
+            )
+
+        mutations = {
+            "phase ordinal": lambda state: state["lineage"].__setitem__(
+                "phase_ordinal", 4
+            ),
+            "activation skip": lambda state: state["lineage"].__setitem__(
+                "from", "genesis"
+            ),
+            "receipt kind": lambda state: state["lineage"].__setitem__(
+                "predecessor_kind", "rollback-receipt"
+            ),
+            "receipt binding": lambda state: state["evidence"].__setitem__(
+                "change_receipt_sha256", "0" * 64
+            ),
+            "rollback floor": lambda state: state.__setitem__(
+                "rollback", copy.deepcopy(verifier.ROLLBACK_FLOORS["ui"])
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                state = self.phase_state("bridge")
+                mutate(state)
+                normalized, _ = self.input_for_state(state)
+                with self.assertRaises(verifier.PlanError):
+                    verifier.validate_phase_state(
+                        state,
+                        self.contract,
+                        self.policy,
+                        normalized,
+                        self.rollout,
+                        self.policy_hash,
+                        self.schema_hash,
+                    )
+
+    def test_phase_state_image_identity_and_digest_cross_bindings_fail_closed(self) -> None:
+        def duplicate_component(state: dict[str, object]) -> None:
+            images = state["provider_state"]["images"]
+            images[1] = copy.deepcopy(images[0])
+
+        def wrong_repository(state: dict[str, object]) -> None:
+            state["provider_state"]["images"][0]["repository"] = (
+                "ghcr.io/medtechcorps-netizen/rereply-release-meta-relay"
+            )
+
+        def wrong_subject_component(state: dict[str, object]) -> None:
+            image = state["provider_state"]["images"][0]
+            image["subject"] = (
+                "ghcr.io/medtechcorps-netizen/rereply-release-meta-relay@"
+                + image["digest"]
+            )
+
+        def subject_digest_mismatch(state: dict[str, object]) -> None:
+            image = state["provider_state"]["images"][0]
+            image["subject"] = image["repository"] + "@" + digest(
+                "different-subject-digest"
+            )
+
+        def digest_subject_mismatch(state: dict[str, object]) -> None:
+            state["provider_state"]["images"][0]["digest"] = digest(
+                "different-digest-field"
+            )
+
+        def reorder_components(state: dict[str, object]) -> None:
+            state["provider_state"]["images"][0:2] = reversed(
+                state["provider_state"]["images"][0:2]
+            )
+
+        for label, mutate in {
+            "duplicate component": duplicate_component,
+            "component repository": wrong_repository,
+            "component subject": wrong_subject_component,
+            "subject digest": subject_digest_mismatch,
+            "digest subject": digest_subject_mismatch,
+            "component order": reorder_components,
+        }.items():
+            with self.subTest(label=label):
+                state = self.phase_state("bridge")
+                mutate(state)
+                normalized, _ = self.input_for_state(state)
+                with self.assertRaises(verifier.PlanError):
+                    verifier.validate_phase_state(
+                        state,
+                        self.contract,
+                        self.policy,
+                        normalized,
+                        self.rollout,
+                        self.policy_hash,
+                        self.schema_hash,
+                    )
+
+    def test_final_state_accepts_only_the_receipt_kind_for_its_operation(self) -> None:
+        cases = (
+            (
+                "activate",
+                "bridge",
+                "baseline",
+                {"apply-receipt", "reconciliation-receipt"},
+            ),
+            (
+                "rollback",
+                "backend",
+                "ui",
+                {
+                    "rollback-receipt",
+                    "orphan-rollback-receipt",
+                    "reconciliation-receipt",
+                },
+            ),
+        )
+        all_kinds = {
+            "genesis",
+            "phase-state",
+            "apply-receipt",
+            "apply-reconciled-receipt",
+            "rollback-receipt",
+            "rollback-reconciled-receipt",
+            "orphan-rollback-receipt",
+            "reconciliation-receipt",
+        }
+        for operation, phase, source, accepted_kinds in cases:
+            for accepted in sorted(accepted_kinds):
+                with self.subTest(operation=operation, accepted=accepted):
+                    valid = self.phase_state(
+                        phase,
+                        event_sequence=7,
+                        operation=operation,
+                        source_phase=source,
+                        predecessor_kind=accepted,
+                    )
+                    normalized, _ = self.input_for_state(valid)
+                    self.assertEqual(
+                        verifier.validate_phase_state(
+                            valid,
+                            self.contract,
+                            self.policy,
+                            normalized,
+                            self.rollout,
+                            self.policy_hash,
+                            self.schema_hash,
+                        ),
+                        valid,
+                    )
+            for rejected in sorted(all_kinds - accepted_kinds):
+                with self.subTest(operation=operation, rejected=rejected):
+                    invalid = self.phase_state(
+                        phase,
+                        event_sequence=7,
+                        operation=operation,
+                        source_phase=source,
+                        predecessor_kind=rejected,
+                    )
+                    invalid_normalized, _ = self.input_for_state(invalid)
+                    with self.assertRaises(verifier.PlanError):
+                        verifier.validate_phase_state(
+                            invalid,
+                            self.contract,
+                            self.policy,
+                            invalid_normalized,
+                            self.rollout,
+                            self.policy_hash,
+                            self.schema_hash,
+                        )
+
+    def test_predecessor_exact_file_and_sidecar_are_bound(self) -> None:
+        state = self.phase_state("baseline")
+        normalized, state_sha256 = self.input_for_state(state)
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "production-phase-state.json"
+            hash_path = Path(temporary) / "production-phase-state.sha256"
+            state_path.write_bytes(verifier.canonical_file_bytes(state))
+            hash_path.write_bytes((state_sha256 + "\n").encode("ascii"))
+            self.assertEqual(
+                verifier.load_predecessor_state(
+                    normalized, state_path, hash_path, self.policy
+                ),
+                state,
+            )
+            hash_path.write_bytes(("0" * 64 + "\n").encode("ascii"))
+            with self.assertRaises(verifier.PlanError):
+                verifier.load_predecessor_state(
+                    normalized, state_path, hash_path, self.policy
+                )
+
+    def test_cross_module_final_phase_state_contract(self) -> None:
+        import verify_production_release as release_verifier
+
+        direct = self.phase_state("bridge")
+        normalized, _ = self.input_for_state(direct)
+        self.assertEqual(
+            verifier.validate_phase_state(
+                direct,
+                self.contract,
+                self.policy,
+                normalized,
+                self.rollout,
+                self.policy_hash,
+                self.schema_hash,
+            ),
+            direct,
+        )
+        self.assertEqual(release_verifier.validate_phase_state(direct), direct)
+
+        reconciled = self.phase_state(
+            "bridge", predecessor_kind="apply-reconciled-receipt"
+        )
+        reconciled["schema_version"] = 2
+        receipt_hash = reconciled["evidence"]["change_receipt_sha256"]
+        reconciled["evidence"].update(
+            {
+                "change_receipt_binding": {
+                    "run_id": "701",
+                    "run_attempt": 1,
+                    "artifact_id": "702",
+                    "artifact_name": "production-phase-apply-701-1",
+                    "artifact_digest": digest("reconciled-apply-artifact"),
+                    "sha256": receipt_hash,
+                },
+                "main_lock_release_reconciliation_binding": {
+                    "run_id": "703",
+                    "run_attempt": 1,
+                    "artifact_id": "704",
+                    "artifact_name": (
+                        "production-main-lock-release-reconciliation-703-1"
+                    ),
+                    "artifact_digest": digest("main-lock-reconciliation-artifact"),
+                    "sha256": verifier.sha256_bytes(
+                        b"main-lock-release-reconciliation"
+                    ),
+                },
+            }
+        )
+        reconciled_normalized, _ = self.input_for_state(reconciled)
+        self.assertEqual(
+            verifier.validate_phase_state(
+                reconciled,
+                self.contract,
+                self.policy,
+                reconciled_normalized,
+                self.rollout,
+                self.policy_hash,
+                self.schema_hash,
+            ),
+            reconciled,
+        )
+        self.assertEqual(
+            release_verifier.validate_phase_state(reconciled), reconciled
+        )
+
+        for label, mutate in {
+            "operation-kind mismatch": lambda state: state["lineage"].__setitem__(
+                "predecessor_kind", "rollback-reconciled-receipt"
+            ),
+            "original receipt splice": lambda state: state["evidence"][
+                "change_receipt_binding"
+            ].__setitem__("sha256", "0" * 64),
+            "release reconciliation splice": lambda state: state["evidence"][
+                "main_lock_release_reconciliation_binding"
+            ].__setitem__(
+                "artifact_name",
+                "production-main-lock-release-reconciliation-999-1",
+            ),
+        }.items():
+            with self.subTest(label=label):
+                invalid = copy.deepcopy(reconciled)
+                mutate(invalid)
+                invalid_normalized, _ = self.input_for_state(invalid)
+                with self.assertRaises(verifier.PlanError):
+                    verifier.validate_phase_state(
+                        invalid,
+                        self.contract,
+                        self.policy,
+                        invalid_normalized,
+                        self.rollout,
+                        self.policy_hash,
+                        self.schema_hash,
+                    )
+                with self.assertRaises(release_verifier.ReleaseError):
+                    release_verifier.validate_phase_state(invalid)
+
+        rollback_reconciled = self.phase_state(
+            "backend",
+            event_sequence=7,
+            operation="rollback",
+            source_phase="ui",
+            predecessor_kind="rollback-reconciled-receipt",
+        )
+        rollback_reconciled["schema_version"] = 2
+        rollback_receipt_hash = rollback_reconciled["evidence"][
+            "change_receipt_sha256"
+        ]
+        rollback_reconciled["evidence"].update(
+            {
+                "change_receipt_binding": {
+                    "run_id": "801",
+                    "run_attempt": 1,
+                    "artifact_id": "802",
+                    "artifact_name": "production-phase-rollback-801-1",
+                    "artifact_digest": digest("reconciled-rollback-artifact"),
+                    "sha256": rollback_receipt_hash,
+                },
+                "main_lock_release_reconciliation_binding": {
+                    "run_id": "803",
+                    "run_attempt": 1,
+                    "artifact_id": "804",
+                    "artifact_name": (
+                        "production-main-lock-release-reconciliation-803-1"
+                    ),
+                    "artifact_digest": digest(
+                        "rollback-main-lock-reconciliation-artifact"
+                    ),
+                    "sha256": verifier.sha256_bytes(
+                        b"rollback-main-lock-release-reconciliation"
+                    ),
+                },
+            }
+        )
+        rollback_normalized, _ = self.input_for_state(rollback_reconciled)
+        self.assertEqual(
+            verifier.validate_phase_state(
+                rollback_reconciled,
+                self.contract,
+                self.policy,
+                rollback_normalized,
+                self.rollout,
+                self.policy_hash,
+                self.schema_hash,
+            ),
+            rollback_reconciled,
+        )
+        self.assertEqual(
+            release_verifier.validate_phase_state(rollback_reconciled),
+            rollback_reconciled,
+        )
+        wrong_rollback_receipt_name = copy.deepcopy(rollback_reconciled)
+        wrong_rollback_receipt_name["evidence"]["change_receipt_binding"][
+            "artifact_name"
+        ] = "production-phase-apply-801-1"
+        wrong_rollback_normalized, _ = self.input_for_state(
+            wrong_rollback_receipt_name
+        )
+        with self.assertRaises(verifier.PlanError):
+            verifier.validate_phase_state(
+                wrong_rollback_receipt_name,
+                self.contract,
+                self.policy,
+                wrong_rollback_normalized,
+                self.rollout,
+                self.policy_hash,
+                self.schema_hash,
+            )
+        with self.assertRaises(release_verifier.ReleaseError):
+            release_verifier.validate_phase_state(wrong_rollback_receipt_name)
+
+    def test_phase_state_artifact_name_is_identical_across_producer_and_consumers(self) -> None:
+        planner = WORKFLOW_PATH.read_text(encoding="utf-8")
+        apply = APPLY_WORKFLOW_PATH.read_text(encoding="utf-8")
+        rollback = ROLLBACK_WORKFLOW_PATH.read_text(encoding="utf-8")
+        canary = CANARY_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+        # The phase is cryptographically bound inside the state.  Keeping it out of
+        # the artifact name gives every producer and consumer one unambiguous rule.
+        self.assertIn(
+            "name: production-phase-state-${{ github.run_id }}-${{ github.run_attempt }}",
+            canary,
+        )
+        self.assertIn(
+            'expected_name="production-phase-state-${predecessor_run_id}-${predecessor_run_attempt}"',
+            planner,
+        )
+        self.assertIn(
+            r'predecessor_name=production-phase-state-{pred[\"run_id\"]}-{pred[\"run_attempt\"]}',
+            apply,
+        )
+        self.assertIn(
+            "`production-phase-state-${value.target_state.run_id}-1`",
+            rollback,
+        )
+        for workflow in (planner, apply, rollback, canary):
+            self.assertNotRegex(
+                workflow,
+                r"production-phase-state-(?:\$\{\{?\s*)?(?:phase|target_phase|current_phase)[-}]",
+            )
+
+    def test_anonymous_digest_pullability_is_transitively_and_currently_proved(self) -> None:
+        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        image_workflow = IMAGE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        pullability = self.contract["logical_source_transform"][
+            "anonymous_pullability"
+        ]
+        self.assertEqual(
+            pullability,
+            {
+                "mode": "anonymous-exact-digest",
+                "release_image_workflow_path": (
+                    ".github/workflows/build-attest-exact-release-images.yml"
+                ),
+                "release_image_gate_job_name": "Exact release image gate",
+                "release_image_proof_step_name": (
+                    "Require anonymous pullability of every exact release digest"
+                ),
+                "plan_recheck_step_name": (
+                    "Require current anonymous pullability of every target digest"
+                ),
+                "fresh_docker_config_required": True,
+                "registry_credentials_allowed": False,
+            },
+        )
+        self.assertIs(
+            self.policy["planning"]["anonymous_target_pullability_required"], True
+        )
+
+        self.assertIn(
+            "      - name: Require anonymous pullability of every exact release digest\n",
+            image_workflow,
+        )
+        image_pull = image_workflow.split(
+            "      - name: Require anonymous pullability of every exact release digest\n",
+            1,
+        )[1].split("\n      - name:", 1)[0]
+        self.assertNotIn("\n        if:", image_pull)
+        self.assertIn("DOCKER_CONFIG:", image_pull)
+        self.assertIn("unset GH_TOKEN GITHUB_TOKEN CR_PAT", image_pull)
+        self.assertIn("docker pull --platform linux/amd64", image_pull)
+        self.assertNotIn("docker login", image_pull.lower())
+        image_gate = image_workflow.split("\n  gate:\n", 1)[1]
+        self.assertIn("    name: Exact release image gate", image_gate)
+        self.assertIn("      - verify_set", image_gate)
+        self.assertIn('"$VERIFY_SET_RESULT"; do', image_gate)
+        self.assertIn('if [[ "$result" != success ]]', image_gate)
+
+        self.assertIn(
+            "  RELEASE_IMAGE_WORKFLOW_PATH: .github/workflows/build-attest-exact-release-images.yml",
+            workflow,
+        )
+        self.assertIn("  RELEASE_IMAGE_GATE_NAME: Exact release image gate", workflow)
+        self.assertIn('"$RELEASE_IMAGE_WORKFLOW_PATH"', workflow)
+        self.assertEqual(workflow.count("anonymous_image_gates_checked"), 4)
+        self.assertIn('[[ "$anonymous_image_gates_checked" -eq 4 ]]', workflow)
+        self.assertIn(
+            "      - name: Require current anonymous pullability of every target digest\n",
+            workflow,
+        )
+        self.assertLess(
+            workflow.index(
+                "      - name: Require current anonymous pullability of every target digest\n"
+            ),
+            workflow.index(
+                "      - name: Observe exact production state using the dedicated GET-only controller\n"
+            ),
+        )
+        observe_job = workflow.split("\n  observe:\n", 1)[1].split(
+            "\n  attest:\n", 1
+        )[0]
+        self.assertIn("    timeout-minutes: 45", observe_job)
+        self.assertEqual(self.contract["plan"]["maximum_age_seconds"], 900)
+        live_pull = workflow.split(
+            "      - name: Require current anonymous pullability of every target digest\n",
+            1,
+        )[1].split("\n      - name:", 1)[0]
+        self.assertIn("env -i", live_pull)
+        self.assertIn("DOCKER_CONFIG=", live_pull)
+        self.assertIn("/usr/bin/docker pull --platform linux/amd64", live_pull)
+        self.assertIn("unset GH_TOKEN GITHUB_TOKEN CR_PAT", live_pull)
+        self.assertNotIn("docker login", live_pull.lower())
+        self.assertNotIn("packages: read", workflow)
+
+    def test_predecessor_validation_exports_only_the_exact_target_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            normalized_path = root / "normalized.json"
+            rollout_path = root / "rollout.json"
+            contract_path = root / "contract.json"
+            output_path = root / "target-images.json"
+            normalized_path.write_bytes(verifier.canonical_file_bytes(self.normalized))
+            rollout_path.write_bytes(verifier.canonical_file_bytes(self.rollout))
+            contract_path.write_bytes(verifier.canonical_file_bytes(self.contract))
+
+            verifier.command_validate_predecessor(
+                SimpleNamespace(
+                    contract=contract_path,
+                    policy=POLICY_PATH,
+                    schema=SCHEMA_PATH,
+                    normalized_input=normalized_path,
+                    control_sha=CONTROL_SHA,
+                    rollout_plan=rollout_path,
+                    predecessor_state=None,
+                    predecessor_sha256=None,
+                    target_images_output=output_path,
+                )
+            )
+            exported = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(set(exported), {"schema_version", "phase", "images"})
+            self.assertEqual(exported["schema_version"], 1)
+            self.assertEqual(exported["phase"], "baseline")
+            self.assertEqual(
+                exported["images"],
+                phase_images(self.rollout, "baseline", self.contract),
+            )
+            self.assertEqual(
+                output_path.read_bytes(), verifier.canonical_file_bytes(exported)
+            )
+
     def test_workflow_is_manual_observation_only_and_capability_separated(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         trigger = workflow.split("\non:\n", 1)[1].split("\n# This workflow", 1)[0]
@@ -788,6 +1588,14 @@ class ProductionPlanTests(unittest.TestCase):
         self.assertIn("group: rereply-production", workflow)
         self.assertIn('[[ "$REF_PROTECTED" == "true" ]]', workflow)
         self.assertIn("environment: rereply-production-plan", workflow)
+        self.assertIn(
+            "https://rereply.app/attestations/observation-only-production-plan/v2",
+            workflow,
+        )
+        self.assertIn("production-release-policy.json", workflow)
+        self.assertIn("production-change.schema.json", workflow)
+        self.assertIn("verify-production-crm-canary.yml", workflow)
+        self.assertIn("production-phase-state.json", workflow)
         self.assertNotRegex(workflow, r"(?m)^\s*environment:\s*production\s*$")
         self.assertEqual(workflow.count("${{ secrets.DO_PRODUCTION_READ_TOKEN }}"), 1)
         self.assertEqual(workflow.count("${{ secrets.DO_PRODUCTION_TARGET_JSON }}"), 1)
@@ -835,6 +1643,9 @@ class ProductionPlanTests(unittest.TestCase):
         self.assertEqual(workflow.count("latest_upstream_attempt="), 5)
         self.assertEqual(workflow.count('[[ "$upstream_checked" -eq 8 ]]'), 5)
         self.assertEqual(workflow.count("latest_plan_attempt="), 4)
+        self.assertEqual(workflow.count("latest_predecessor_attempt="), 5)
+        self.assertEqual(workflow.count("latest_successful_predecessor="), 4)
+        self.assertEqual(workflow.count("latest_successful_id="), 1)
         self.assertGreaterEqual(
             workflow.count('[[ "$CURRENT_RUN_ATTEMPT" == "$AUTHORITY_PLAN_RUN_ATTEMPT" ]]'),
             4,
@@ -871,6 +1682,12 @@ class ProductionPlanTests(unittest.TestCase):
         protected_ci = TEST_WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn("release/deployment/verify_production_plan.py", protected_ci)
         self.assertIn("release/deployment/test_verify_production_plan.py", protected_ci)
+
+
+class ReviewedProductionContractTests(unittest.TestCase):
+    def test_reviewed_contract_is_valid_against_unpatched_constants(self) -> None:
+        production_contract = verifier.load_json(CONTRACT_PATH, "contract")
+        verifier.validate_contract(production_contract)
 
 
 if __name__ == "__main__":

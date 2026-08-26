@@ -1,0 +1,2315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rereply.app/schemas/production-orphan-reconciliation-v1.json",
+  "title": "ReReply GET-only production orphan reconciliation receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authority",
+    "repository",
+    "completed_at",
+    "control",
+    "intent",
+    "lock_assertion",
+    "lineage",
+    "authorities",
+    "classification",
+    "provider_observation",
+    "before",
+    "desired",
+    "after",
+    "gates",
+    "rollback",
+    "canary"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "authority": {
+      "const": "production-orphan-reconciliation-receipt"
+    },
+    "repository": {
+      "const": "medtechcorps-netizen/whatomate"
+    },
+    "completed_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "control": {
+      "$ref": "#/$defs/control"
+    },
+    "intent": {
+      "$ref": "#/$defs/intentAuthority"
+    },
+    "lock_assertion": {
+      "$ref": "#/$defs/lockAssertion"
+    },
+    "lineage": {
+      "$ref": "#/$defs/lineage"
+    },
+    "authorities": {
+      "$ref": "#/$defs/reconciliationAuthorities"
+    },
+    "classification": {
+      "$ref": "#/$defs/classification"
+    },
+    "provider_observation": {
+      "$ref": "#/$defs/providerObservation"
+    },
+    "before": {
+      "$ref": "#/$defs/providerState"
+    },
+    "desired": {
+      "$ref": "#/$defs/desiredProjection"
+    },
+    "after": {
+      "$ref": "#/$defs/providerState"
+    },
+    "gates": {
+      "$ref": "#/$defs/gates"
+    },
+    "rollback": {
+      "$ref": "#/$defs/rollback"
+    },
+    "canary": {
+      "$ref": "#/$defs/canary"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "lock_assertion": {
+            "properties": {
+              "original_workflow_path": {
+                "const": ".github/workflows/apply-production-phase.yml"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "lock_assertion": {
+            "properties": {
+              "original_provider_job": {
+                "properties": {
+                  "job_name": {"const": "Apply exact production phase"},
+                  "provider_step_name": {"const": "Apply with one isolated app-update capability"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lock_assertion": {
+            "properties": {
+              "original_workflow_path": {
+                "const": ".github/workflows/rollback-production-phase.yml"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "lock_assertion": {
+            "properties": {
+              "original_provider_job": {
+                "properties": {
+                  "job_name": {"const": "Roll back exact production phase"},
+                  "provider_step_name": {"const": "Roll back with one isolated app-update capability"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lock_assertion": {
+            "properties": {
+              "original_workflow_path": {
+                "const": ".github/workflows/rollback-production-orphan.yml"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "lock_assertion": {
+            "properties": {
+              "original_provider_job": {
+                "properties": {
+                  "job_name": {"const": "Roll back exact production orphan"},
+                  "provider_step_name": {"const": "Roll back with one inherited-lock app-update capability"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent": {
+            "required": [
+              "operation"
+            ],
+            "properties": {
+              "operation": {
+                "const": "activate"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "intent": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/apply-production-phase.yml"
+              }
+            }
+          },
+          "lock_assertion": {
+            "properties": {
+              "original_workflow_path": {
+                "const": ".github/workflows/apply-production-phase.yml"
+              }
+            }
+          },
+          "lineage": {
+            "properties": {
+              "operation": {
+                "const": "activate"
+              }
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/activateBaselineLineage"
+              },
+              {
+                "$ref": "#/$defs/activateBridgeLineage"
+              },
+              {
+                "$ref": "#/$defs/activateBackendLineage"
+              },
+              {
+                "$ref": "#/$defs/activateUiLineage"
+              }
+            ]
+          },
+          "authorities": {
+            "properties": {
+              "upstream": {
+                "$ref": "#/$defs/applyAuthorities"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent": {
+            "required": [
+              "operation"
+            ],
+            "properties": {
+              "operation": {
+                "const": "rollback"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "intent": {
+            "properties": {
+              "workflow_path": {
+                "enum": [
+                  ".github/workflows/rollback-production-phase.yml",
+                  ".github/workflows/rollback-production-orphan.yml"
+                ]
+              }
+            }
+          },
+          "lineage": {
+            "properties": {
+              "operation": {
+                "const": "rollback"
+              }
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/rollbackBridgeToBaselineLineage"
+              },
+              {
+                "$ref": "#/$defs/rollbackBackendToBridgeLineage"
+              },
+              {
+                "$ref": "#/$defs/rollbackUiToBackendLineage"
+              },
+              {
+                "$ref": "#/$defs/rollbackUiToBridgeLineage"
+              }
+            ]
+          },
+          "authorities": {
+            "properties": {
+              "upstream": {
+                "$ref": "#/$defs/rollbackAuthorities"
+              }
+            }
+          },
+          "before": {
+            "properties": {
+              "source_mode": {
+                "const": "digest-images"
+              }
+            }
+          },
+          "after": {
+            "properties": {
+              "source_mode": {
+                "const": "digest-images"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent": {
+            "required": [
+              "schema_version"
+            ],
+            "properties": {
+              "schema_version": {
+                "const": 1
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "classification": {
+            "properties": {
+              "outcome": {
+                "const": "already-receipted"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "classification": {
+            "required": [
+              "original_receipt_present"
+            ],
+            "properties": {
+              "original_receipt_present": {
+                "const": true
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "authorities": {
+            "properties": {
+              "original_receipt": {
+                "$ref": "#/$defs/originalReceipt"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "authorities": {
+            "properties": {
+              "original_receipt": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "classification": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "committed"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "$ref": "#/$defs/committedOutcome"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "classification": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "already-receipted"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "$ref": "#/$defs/alreadyReceiptedOutcome"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "classification": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "no-mutation"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "$ref": "#/$defs/noMutationOutcome"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "classification": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "pending"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "$ref": "#/$defs/pendingOutcome"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "classification": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "indeterminate"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "$ref": "#/$defs/indeterminateOutcome"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lineage": {
+            "required": [
+              "to"
+            ],
+            "properties": {
+              "to": {
+                "const": "baseline"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "rollback": {
+            "const": {
+              "allowed_targets": [],
+              "forbidden_targets": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lineage": {
+            "required": [
+              "to"
+            ],
+            "properties": {
+              "to": {
+                "const": "bridge"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "rollback": {
+            "const": {
+              "allowed_targets": [
+                "baseline"
+              ],
+              "forbidden_targets": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lineage": {
+            "required": [
+              "to"
+            ],
+            "properties": {
+              "to": {
+                "const": "backend"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "rollback": {
+            "const": {
+              "allowed_targets": [
+                "bridge"
+              ],
+              "forbidden_targets": [
+                "baseline"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lineage": {
+            "required": [
+              "to"
+            ],
+            "properties": {
+              "to": {
+                "const": "ui"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "rollback": {
+            "const": {
+              "allowed_targets": [
+                "backend",
+                "bridge"
+              ],
+              "forbidden_targets": [
+                "baseline"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha1": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,14}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "phase": {
+      "enum": [
+        "baseline",
+        "bridge",
+        "backend",
+        "ui"
+      ]
+    },
+    "state": {
+      "enum": [
+        "genesis",
+        "baseline",
+        "bridge",
+        "backend",
+        "ui"
+      ]
+    },
+    "imageWeb": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "repository",
+        "digest",
+        "subject"
+      ],
+      "properties": {
+        "component": {
+          "const": "web"
+        },
+        "repository": {
+          "const": "ghcr.io/medtechcorps-netizen/rereply-release-web"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "subject": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/medtechcorps-netizen/rereply-release-web@sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "imageMetaRelay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "repository",
+        "digest",
+        "subject"
+      ],
+      "properties": {
+        "component": {
+          "const": "meta-relay"
+        },
+        "repository": {
+          "const": "ghcr.io/medtechcorps-netizen/rereply-release-meta-relay"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "subject": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "imageGmailRelay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "repository",
+        "digest",
+        "subject"
+      ],
+      "properties": {
+        "component": {
+          "const": "gmail-relay"
+        },
+        "repository": {
+          "const": "ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "subject": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "digestImages": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/imageWeb"
+        },
+        {
+          "$ref": "#/$defs/imageMetaRelay"
+        },
+        {
+          "$ref": "#/$defs/imageGmailRelay"
+        }
+      ],
+      "items": false
+    },
+    "providerState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app_identity_sha256",
+        "default_ingress_sha256",
+        "app_updated_at_sha256",
+        "active_deployment_identity_sha256",
+        "canonical_spec_sha256",
+        "environment_values_sha256",
+        "non_source_projection_sha256",
+        "source_mode",
+        "images"
+      ],
+      "properties": {
+        "app_identity_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "default_ingress_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "app_updated_at_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "active_deployment_identity_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "canonical_spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "environment_values_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "non_source_projection_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_mode": {
+          "enum": [
+            "legacy-git",
+            "digest-images"
+          ]
+        },
+        "images": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "source_mode"
+            ],
+            "properties": {
+              "source_mode": {
+                "const": "legacy-git"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "images": {
+                "const": []
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "source_mode"
+            ],
+            "properties": {
+              "source_mode": {
+                "const": "digest-images"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "images": {
+                "$ref": "#/$defs/digestImages"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "desiredProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_spec_sha256",
+        "environment_values_sha256",
+        "non_source_projection_sha256",
+        "source_mode",
+        "images",
+        "migration_job",
+        "migration_digest"
+      ],
+      "properties": {
+        "canonical_spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "environment_values_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "non_source_projection_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_mode": {
+          "const": "digest-images"
+        },
+        "images": {
+          "$ref": "#/$defs/digestImages"
+        },
+        "migration_job": {
+          "const": "rereply-rls-migrate"
+        },
+        "migration_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "artifactBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "run_attempt",
+        "artifact_id",
+        "artifact_name",
+        "artifact_digest",
+        "sha256"
+      ],
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "run_attempt": {
+          "$ref": "#/$defs/attempt"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "artifact_name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"
+        },
+        "artifact_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "predecessorBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "run_id",
+        "run_attempt",
+        "artifact_id",
+        "artifact_name",
+        "artifact_digest",
+        "sha256"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "genesis",
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "run_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/runId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "run_attempt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/attempt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifact_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/runId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifact_name": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifact_digest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "genesis"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "run_id": {
+                "type": "null"
+              },
+              "run_attempt": {
+                "type": "null"
+              },
+              "artifact_id": {
+                "type": "null"
+              },
+              "artifact_name": {
+                "type": "null"
+              },
+              "artifact_digest": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "run_id": {
+                "$ref": "#/$defs/runId"
+              },
+              "run_attempt": {
+                "$ref": "#/$defs/attempt"
+              },
+              "artifact_id": {
+                "$ref": "#/$defs/runId"
+              },
+              "artifact_name": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"
+              },
+              "artifact_digest": {
+                "$ref": "#/$defs/digest"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "applyAuthorities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rollout_plan_sha256",
+        "rollout_authority",
+        "production_plan",
+        "recovery",
+        "predecessor_state"
+      ],
+      "properties": {
+        "rollout_plan_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "rollout_authority": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "production_plan": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "recovery": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "predecessor_state": {
+          "$ref": "#/$defs/predecessorBinding"
+        }
+      }
+    },
+    "targetAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "production_plan_sha256"
+      ],
+      "properties": {
+        "production_plan_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "rollbackAuthorities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rollout_plan_sha256",
+        "current_state",
+        "target_state",
+        "recovery",
+        "target_authority"
+      ],
+      "properties": {
+        "rollout_plan_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "current_state": {
+          "$ref": "#/$defs/predecessorBinding"
+        },
+        "target_state": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "recovery": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "target_authority": {
+          "$ref": "#/$defs/targetAuthority"
+        }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_sha",
+        "workflow_path",
+        "run_id",
+        "run_attempt",
+        "runner_environment",
+        "release_policy_sha256",
+        "change_schema_sha256",
+        "mutation_intent_schema_sha256",
+        "reconciliation_schema_sha256",
+        "controller_sha256"
+      ],
+      "properties": {
+        "workflow_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "workflow_path": {
+          "const": ".github/workflows/reconcile-production-orphan.yml"
+        },
+        "run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "run_attempt": {
+          "$ref": "#/$defs/attempt"
+        },
+        "runner_environment": {
+          "const": "github-hosted"
+        },
+        "release_policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "change_schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "mutation_intent_schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reconciliation_schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "controller_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "intentAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "operation",
+        "workflow_path",
+        "binding",
+        "lock"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2
+        },
+        "operation": {
+          "enum": [
+            "activate",
+            "rollback"
+          ]
+        },
+        "workflow_path": {
+          "enum": [
+            ".github/workflows/apply-production-phase.yml",
+            ".github/workflows/rollback-production-phase.yml",
+            ".github/workflows/rollback-production-orphan.yml"
+          ]
+        },
+        "binding": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "lock": {
+          "$ref": "#/$defs/mutationLock"
+        }
+      }
+    },
+    "mutationLock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "strategy",
+        "branch",
+        "rule_id",
+        "rule_identity_sha256",
+        "expected_pre_lock",
+        "expected_post_lock",
+        "root_acquire_intent",
+        "owner_operation",
+        "owner_run_id",
+        "owner_run_attempt",
+        "owner_control_sha",
+        "owner_intent_sha256"
+      ],
+      "properties": {
+        "mode": {
+          "const": "planned"
+        },
+        "strategy": {
+          "enum": [
+            "acquire",
+            "inherit"
+          ]
+        },
+        "branch": {
+          "const": "main"
+        },
+        "rule_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_+/=-]+$",
+          "maxLength": 512
+        },
+        "rule_identity_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "expected_pre_lock": {
+          "$ref": "#/$defs/lockProjection"
+        },
+        "expected_post_lock": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/lockProjection"
+            },
+            {
+              "properties": {
+                "lock_branch": {
+                  "const": true
+                }
+              }
+            }
+          ]
+        },
+        "root_acquire_intent": {
+          "$ref": "#/$defs/artifactBinding"
+        },
+        "owner_operation": {
+          "enum": [
+            "apply",
+            "rollback"
+          ]
+        },
+        "owner_run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "owner_run_attempt": {
+          "$ref": "#/$defs/attempt"
+        },
+        "owner_control_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "owner_intent_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "strategy"
+            ],
+            "properties": {
+              "strategy": {
+                "const": "acquire"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "expected_pre_lock": {
+                "properties": {
+                  "lock_branch": {
+                    "const": false
+                  }
+                }
+              },
+              "owner_intent_sha256": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "expected_pre_lock": {
+                "properties": {
+                  "lock_branch": {
+                    "const": true
+                  }
+                }
+              },
+              "owner_intent_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "lockProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lock_branch",
+        "is_admin_enforced",
+        "lock_allows_fetch_and_merge"
+      ],
+      "properties": {
+        "lock_branch": {
+          "type": "boolean"
+        },
+        "is_admin_enforced": {
+          "const": true
+        },
+        "lock_allows_fetch_and_merge": {
+          "const": false
+        }
+      }
+    },
+    "lockAssertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority",
+        "actor_provenance",
+        "original_workflow_path",
+        "original_control_sha",
+        "original_run_id",
+        "original_run_attempt",
+        "rule_id",
+        "rule_identity_sha256",
+        "current_main_sha",
+        "mutation_intent_sha256",
+        "typed_confirmation_sha256",
+        "original_provider_job",
+        "binding"
+      ],
+      "properties": {
+        "authority": {
+          "const": "production-main-lock-ownership-assertion"
+        },
+        "actor_provenance": {
+          "const": "single-operator-assertion-not-audit-log"
+        },
+        "original_workflow_path": {
+          "enum": [
+            ".github/workflows/apply-production-phase.yml",
+            ".github/workflows/rollback-production-phase.yml",
+            ".github/workflows/rollback-production-orphan.yml"
+          ]
+        },
+        "original_control_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "original_run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "original_run_attempt": {
+          "$ref": "#/$defs/attempt"
+        },
+        "rule_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_+/=-]+$",
+          "maxLength": 512
+        },
+        "rule_identity_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "current_main_sha": {
+          "$ref": "#/$defs/sha1"
+        },
+        "mutation_intent_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "typed_confirmation_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "original_provider_job": {
+          "$ref": "#/$defs/originalProviderJob"
+        },
+        "binding": {
+          "$ref": "#/$defs/artifactBinding"
+        }
+      }
+    },
+    "originalProviderJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "job_name",
+        "status",
+        "conclusion",
+        "timing_sha256",
+        "step_inventory_sha256",
+        "step_count",
+        "all_steps_skipped",
+        "provider_step_name",
+        "provider_step_status",
+        "provider_step_conclusion",
+        "never_started"
+      ],
+      "properties": {
+        "job_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "job_name": {
+          "enum": [
+            "Apply exact production phase",
+            "Roll back exact production phase",
+            "Roll back exact production orphan"
+          ]
+        },
+        "status": {
+          "const": "completed"
+        },
+        "conclusion": {
+          "enum": [
+            "action_required",
+            "cancelled",
+            "failure",
+            "neutral",
+            "skipped",
+            "stale",
+            "success",
+            "timed_out"
+          ]
+        },
+        "timing_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "step_inventory_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "step_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "all_steps_skipped": {
+          "type": "boolean"
+        },
+        "provider_step_name": {
+          "enum": [
+            "Apply with one isolated app-update capability",
+            "Roll back with one isolated app-update capability",
+            "Roll back with one inherited-lock app-update capability"
+          ]
+        },
+        "provider_step_status": {
+          "type": ["string", "null"],
+          "enum": ["queued", "in_progress", "completed", null]
+        },
+        "provider_step_conclusion": {
+          "type": ["string", "null"],
+          "enum": [
+            "action_required",
+            "cancelled",
+            "failure",
+            "neutral",
+            "skipped",
+            "stale",
+            "success",
+            "timed_out",
+            null
+          ]
+        },
+        "never_started": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"never_started": {"const": true}},
+            "required": ["never_started"]
+          },
+          "then": {
+            "properties": {
+              "conclusion": {"const": "skipped"},
+              "all_steps_skipped": {"const": true}
+            },
+            "oneOf": [
+              {
+                "properties": {
+                  "step_count": {"const": 0},
+                  "provider_step_status": {"type": "null"},
+                  "provider_step_conclusion": {"type": "null"}
+                }
+              },
+              {
+                "properties": {
+                  "step_count": {"type": "integer", "minimum": 1},
+                  "provider_step_status": {"const": "completed"},
+                  "provider_step_conclusion": {"const": "skipped"}
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_sequence",
+        "phase_ordinal",
+        "operation",
+        "from",
+        "to",
+        "predecessor_kind",
+        "predecessor_state_sha256",
+        "phase",
+        "phase_source_sha"
+      ],
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "phase_ordinal": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "operation": {
+          "enum": [
+            "activate",
+            "rollback"
+          ]
+        },
+        "from": {
+          "$ref": "#/$defs/state"
+        },
+        "to": {
+          "$ref": "#/$defs/phase"
+        },
+        "predecessor_kind": {
+          "enum": [
+            "genesis",
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "predecessor_state_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "phase": {
+          "$ref": "#/$defs/phase"
+        },
+        "phase_source_sha": {
+          "$ref": "#/$defs/sha1"
+        }
+      }
+    },
+    "activateBaselineLineage": {
+      "properties": {
+        "event_sequence": {
+          "const": 1
+        },
+        "phase_ordinal": {
+          "const": 1
+        },
+        "from": {
+          "const": "genesis"
+        },
+        "to": {
+          "const": "baseline"
+        },
+        "predecessor_kind": {
+          "const": "genesis"
+        },
+        "phase": {
+          "const": "baseline"
+        }
+      }
+    },
+    "activateBridgeLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 2
+        },
+        "from": {
+          "const": "baseline"
+        },
+        "to": {
+          "const": "bridge"
+        },
+        "predecessor_kind": {
+          "const": "phase-state"
+        },
+        "phase": {
+          "const": "bridge"
+        }
+      }
+    },
+    "activateBackendLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 3
+        },
+        "from": {
+          "const": "bridge"
+        },
+        "to": {
+          "const": "backend"
+        },
+        "predecessor_kind": {
+          "const": "phase-state"
+        },
+        "phase": {
+          "const": "backend"
+        }
+      }
+    },
+    "activateUiLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 4
+        },
+        "from": {
+          "const": "backend"
+        },
+        "to": {
+          "const": "ui"
+        },
+        "predecessor_kind": {
+          "const": "phase-state"
+        },
+        "phase": {
+          "const": "ui"
+        }
+      }
+    },
+    "rollbackBridgeToBaselineLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 1
+        },
+        "from": {
+          "const": "bridge"
+        },
+        "to": {
+          "const": "baseline"
+        },
+        "predecessor_kind": {
+          "enum": [
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "phase": {
+          "const": "baseline"
+        }
+      }
+    },
+    "rollbackBackendToBridgeLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 2
+        },
+        "from": {
+          "const": "backend"
+        },
+        "to": {
+          "const": "bridge"
+        },
+        "predecessor_kind": {
+          "enum": [
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "phase": {
+          "const": "bridge"
+        }
+      }
+    },
+    "rollbackUiToBackendLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 3
+        },
+        "from": {
+          "const": "ui"
+        },
+        "to": {
+          "const": "backend"
+        },
+        "predecessor_kind": {
+          "enum": [
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "phase": {
+          "const": "backend"
+        }
+      }
+    },
+    "rollbackUiToBridgeLineage": {
+      "properties": {
+        "event_sequence": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "phase_ordinal": {
+          "const": 2
+        },
+        "from": {
+          "const": "ui"
+        },
+        "to": {
+          "const": "bridge"
+        },
+        "predecessor_kind": {
+          "enum": [
+            "phase-state",
+            "apply-receipt",
+            "reconciliation-receipt"
+          ]
+        },
+        "phase": {
+          "const": "bridge"
+        }
+      }
+    },
+    "originalReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "workflow_path",
+        "binding"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "apply",
+            "rollback",
+            "orphan-rollback"
+          ]
+        },
+        "workflow_path": {
+          "enum": [
+            ".github/workflows/apply-production-phase.yml",
+            ".github/workflows/rollback-production-phase.yml",
+            ".github/workflows/rollback-production-orphan.yml"
+          ]
+        },
+        "binding": {
+          "$ref": "#/$defs/artifactBinding"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "apply"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/apply-production-phase.yml"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "rollback"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/rollback-production-phase.yml"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "orphan-rollback"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "workflow_path": {
+                "const": ".github/workflows/rollback-production-orphan.yml"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "reconciliationAuthorities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "upstream",
+        "original_receipt"
+      ],
+      "properties": {
+        "upstream": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/applyAuthorities"
+            },
+            {
+              "$ref": "#/$defs/rollbackAuthorities"
+            }
+          ]
+        },
+        "original_receipt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/originalReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "terminal",
+        "canary_eligible",
+        "original_receipt_present",
+        "reason"
+      ],
+      "properties": {
+        "outcome": {
+          "enum": [
+            "committed",
+            "already-receipted",
+            "no-mutation",
+            "pending",
+            "indeterminate"
+          ]
+        },
+        "terminal": {
+          "type": "boolean"
+        },
+        "canary_eligible": {
+          "type": "boolean"
+        },
+        "original_receipt_present": {
+          "type": "boolean"
+        },
+        "reason": {
+          "enum": [
+            "desired-active-without-receipt",
+            "desired-active-with-signed-receipt",
+            "exact-before-no-provider-transition",
+            "desired-provider-transition-pending",
+            "provider-state-indeterminate"
+          ]
+        }
+      }
+    },
+    "providerObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "http_methods_used",
+        "http_request_count",
+        "mutation_request_count",
+        "endpoint_labels",
+        "observation_rounds",
+        "double_read_equal",
+        "app_spec_matches_active_deployment",
+        "transition_absent",
+        "migration_succeeded"
+      ],
+      "properties": {
+        "http_methods_used": {
+          "const": [
+            "GET"
+          ]
+        },
+        "http_request_count": {
+          "const": 4
+        },
+        "mutation_request_count": {
+          "const": 0
+        },
+        "endpoint_labels": {
+          "const": [
+            "app",
+            "deployment"
+          ]
+        },
+        "observation_rounds": {
+          "const": 2
+        },
+        "double_read_equal": {
+          "const": true
+        },
+        "app_spec_matches_active_deployment": {
+          "const": true
+        },
+        "transition_absent": {
+          "type": "boolean"
+        },
+        "migration_succeeded": {
+          "type": "boolean"
+        }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifacts_authenticated",
+        "main_unchanged",
+        "lock_owned",
+        "get_only",
+        "double_read_complete",
+        "app_spec_matches_active_deployment",
+        "deployment_succeeded",
+        "migration_succeeded"
+      ],
+      "properties": {
+        "artifacts_authenticated": {
+          "const": true
+        },
+        "main_unchanged": {
+          "const": true
+        },
+        "lock_owned": {
+          "const": true
+        },
+        "get_only": {
+          "const": true
+        },
+        "double_read_complete": {
+          "const": true
+        },
+        "app_spec_matches_active_deployment": {
+          "const": true
+        },
+        "deployment_succeeded": {
+          "type": "boolean"
+        },
+        "migration_succeeded": {
+          "type": "boolean"
+        }
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_targets",
+        "forbidden_targets"
+      ],
+      "properties": {
+        "allowed_targets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/phase"
+          }
+        },
+        "forbidden_targets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/phase"
+          }
+        }
+      }
+    },
+    "canary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "eligible",
+        "completed",
+        "endpoint_labels",
+        "route_contract_sha256"
+      ],
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "eligible": {
+          "type": "boolean"
+        },
+        "completed": {
+          "const": false
+        },
+        "endpoint_labels": {
+          "const": [
+            "app-health",
+            "app-ready",
+            "meta-live",
+            "meta-ready",
+            "gmail-live",
+            "gmail-ready"
+          ]
+        },
+        "route_contract_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "committedOutcome": {
+      "properties": {
+        "intent": {
+          "properties": {
+            "schema_version": {
+              "const": 2
+            }
+          }
+        },
+        "classification": {
+          "properties": {
+            "terminal": {
+              "const": true
+            },
+            "canary_eligible": {
+              "const": true
+            },
+            "original_receipt_present": {
+              "const": false
+            },
+            "reason": {
+              "const": "desired-active-without-receipt"
+            }
+          }
+        },
+        "provider_observation": {
+          "properties": {
+            "transition_absent": {
+              "const": true
+            },
+            "migration_succeeded": {
+              "const": true
+            }
+          }
+        },
+        "after": {
+          "properties": {
+            "source_mode": {
+              "const": "digest-images"
+            }
+          }
+        },
+        "gates": {
+          "properties": {
+            "deployment_succeeded": {
+              "const": true
+            },
+            "migration_succeeded": {
+              "const": true
+            }
+          }
+        },
+        "canary": {
+          "properties": {
+            "required": {
+              "const": true
+            },
+            "eligible": {
+              "const": true
+            }
+          }
+        }
+      }
+    },
+    "alreadyReceiptedOutcome": {
+      "properties": {
+        "classification": {
+          "properties": {
+            "terminal": {
+              "const": true
+            },
+            "canary_eligible": {
+              "const": true
+            },
+            "original_receipt_present": {
+              "const": true
+            },
+            "reason": {
+              "const": "desired-active-with-signed-receipt"
+            }
+          }
+        },
+        "provider_observation": {
+          "properties": {
+            "transition_absent": {
+              "const": true
+            },
+            "migration_succeeded": {
+              "const": true
+            }
+          }
+        },
+        "after": {
+          "properties": {
+            "source_mode": {
+              "const": "digest-images"
+            }
+          }
+        },
+        "gates": {
+          "properties": {
+            "deployment_succeeded": {
+              "const": true
+            },
+            "migration_succeeded": {
+              "const": true
+            }
+          }
+        },
+        "canary": {
+          "properties": {
+            "required": {
+              "const": true
+            },
+            "eligible": {
+              "const": true
+            }
+          }
+        }
+      }
+    },
+    "noMutationOutcome": {
+      "properties": {
+        "lock_assertion": {
+          "properties": {
+            "original_provider_job": {
+              "properties": {
+                "never_started": {
+                  "const": true
+                }
+              }
+            }
+          }
+        },
+        "intent": {
+          "properties": {
+            "schema_version": {
+              "const": 2
+            }
+          }
+        },
+        "classification": {
+          "properties": {
+            "terminal": {
+              "const": true
+            },
+            "canary_eligible": {
+              "const": false
+            },
+            "original_receipt_present": {
+              "const": false
+            },
+            "reason": {
+              "const": "exact-before-no-provider-transition"
+            }
+          }
+        },
+        "provider_observation": {
+          "properties": {
+            "transition_absent": {
+              "const": true
+            }
+          }
+        },
+        "gates": {
+          "properties": {
+            "deployment_succeeded": {
+              "const": false
+            },
+            "migration_succeeded": {
+              "const": false
+            }
+          }
+        },
+        "canary": {
+          "properties": {
+            "required": {
+              "const": false
+            },
+            "eligible": {
+              "const": false
+            }
+          }
+        }
+      }
+    },
+    "pendingOutcome": {
+      "properties": {
+        "intent": {
+          "properties": {
+            "schema_version": {
+              "const": 2
+            }
+          }
+        },
+        "classification": {
+          "properties": {
+            "terminal": {
+              "const": false
+            },
+            "canary_eligible": {
+              "const": false
+            },
+            "original_receipt_present": {
+              "const": false
+            },
+            "reason": {
+              "const": "desired-provider-transition-pending"
+            }
+          }
+        },
+        "provider_observation": {
+          "properties": {
+            "transition_absent": {
+              "const": false
+            }
+          }
+        },
+        "gates": {
+          "properties": {
+            "deployment_succeeded": {
+              "const": false
+            },
+            "migration_succeeded": {
+              "const": false
+            }
+          }
+        },
+        "canary": {
+          "properties": {
+            "required": {
+              "const": false
+            },
+            "eligible": {
+              "const": false
+            }
+          }
+        }
+      }
+    },
+    "indeterminateOutcome": {
+      "properties": {
+        "intent": {
+          "properties": {
+            "schema_version": {
+              "const": 2
+            }
+          }
+        },
+        "classification": {
+          "properties": {
+            "terminal": {
+              "const": false
+            },
+            "canary_eligible": {
+              "const": false
+            },
+            "reason": {
+              "const": "provider-state-indeterminate"
+            }
+          }
+        },
+        "gates": {
+          "properties": {
+            "deployment_succeeded": {
+              "const": false
+            },
+            "migration_succeeded": {
+              "const": false
+            }
+          }
+        },
+        "canary": {
+          "properties": {
+            "required": {
+              "const": false
+            },
+            "eligible": {
+              "const": false
+            }
+          }
+        }
+      }
+    }
+  }
+}

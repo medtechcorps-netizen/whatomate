@@ -18,7 +18,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: rereply-exact-four-phase-rollout-authority
+  # Serialize rollout authority with every other production-control phase.
+  group: rereply-production
   cancel-in-progress: false
 
 defaults:
@@ -57,7 +58,7 @@ jobs:
       control_sha: ${{ steps.authority.outputs.control_sha }}
       capsule_name: ${{ steps.summary.outputs.capsule_name }}
       capsule_artifact_id: ${{ steps.upload.outputs.artifact-id }}
-      capsule_artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      capsule_artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
       final_evidence_json: ${{ steps.summary.outputs.final_evidence_json }}
     steps:
       - name: Require protected-main GitHub-hosted authority
@@ -536,6 +537,15 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      - name: Canonicalize exact rollout capsule artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
   verify:
     name: Independently verify exact rollout capsule
     needs: assemble
@@ -543,6 +553,7 @@ jobs:
     timeout-minutes: 25
     permissions:
       actions: read
+      attestations: read
       contents: read
     steps:
       - name: Require a GitHub-hosted runner
