@@ -4,13 +4,17 @@ import copy
 import hashlib
 import io
 import json
+import re
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import verify_rollout_evidence as verifier
 
 
@@ -20,8 +24,72 @@ SCHEMA_PATH = ROOT / "release" / "deployment" / "rollout-plan.schema.json"
 VERIFIER_PATH = ROOT / "release" / "deployment" / "verify_rollout_evidence.py"
 MANIFEST_PATH = ROOT / "release" / "exact-sources.json"
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "aggregate-exact-four-phase-rollout.yml"
+VALIDATION_WORKFLOW_PATH = (
+    ROOT / ".github" / "workflows" / "validate-exact-release-source.yml"
+)
+IMAGE_WORKFLOW_PATH = (
+    ROOT / ".github" / "workflows" / "build-attest-exact-release-images.yml"
+)
 TEST_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "test.yml"
 CONTROL_SHA = "a" * 40
+EXPECTED_FINAL_SOURCE = {
+    "source_sha": "ff0c9c6b8d94a085af164e564028d25d38b0a02c",
+    "root_tree": "6b3d030924913a562fee2b75fce318b01b421792",
+    "frontend_tree": "f1cdd8186e2b724dc4bba41081578b2b003a6910",
+    "internal_tree": "a1da97143c17f3d02e47250269d00f238ac0e38c",
+}
+STALE_FINAL_SOURCE = {
+    "source_sha": "ab44af2e7c093b4502c1928126c31306b2ba0389",
+    "root_tree": "3553b783d5cfdcbda2ffcee332a2aa392a897bc5",
+    "frontend_tree": "2f92a064f2f3d7f1867c835ef3be7f41e2f30444",
+    "internal_tree": "494d3957ff3559375f406886be45646049ec9378",
+}
+
+
+def validation_workflow_sources(workflow: str) -> dict[str, dict[str, str]]:
+    """Parse only the stable, phase-local source selection case statement."""
+
+    marker = 'case "$REQUESTED_PHASE" in'
+    self_contained = workflow.split(marker, 1)[1].split("          esac", 1)[0]
+    result: dict[str, dict[str, str]] = {}
+    case_pattern = re.compile(
+        r"(?ms)^\s{12}(baseline|bridge|backend|ui)\)\s*$"
+        r"(?P<body>.*?)^\s{14};;\s*$"
+    )
+    assignment_pattern = re.compile(
+        r'^\s{14}(source_sha|root_tree|frontend_tree|internal_tree)="([0-9a-f]{40})"\s*$',
+        re.MULTILINE,
+    )
+    for match in case_pattern.finditer(self_contained):
+        phase = match.group(1)
+        values = dict(assignment_pattern.findall(match.group("body")))
+        if set(values) != {"source_sha", "root_tree", "frontend_tree", "internal_tree"}:
+            raise AssertionError(f"workflow source tuple is malformed for {phase}")
+        result[phase] = values
+    return result
+
+
+def image_workflow_sources(workflow: str) -> dict[str, dict[str, str]]:
+    """Parse the four localized phase objects from the jq authority gate."""
+
+    result: dict[str, dict[str, str]] = {}
+    for phase in ("baseline", "bridge", "backend", "ui"):
+        matches = re.findall(
+            rf"(?ms)\.phases\.{phase}\s*==\s*\{{(?P<body>.*?)^\s*\}}\s+and\s*$",
+            workflow,
+        )
+        if len(matches) != 1:
+            raise AssertionError(f"image workflow source object count differs for {phase}")
+        values = dict(
+            re.findall(
+                r'(source_sha|root_tree|frontend_tree|internal_tree)\s*:\s*"([0-9a-f]{40})"',
+                matches[0],
+            )
+        )
+        if set(values) != {"source_sha", "root_tree", "frontend_tree", "internal_tree"}:
+            raise AssertionError(f"image workflow source tuple is malformed for {phase}")
+        result[phase] = values
+    return result
 
 
 def digest(label: str) -> str:
@@ -74,6 +142,145 @@ class RolloutEvidenceTests(unittest.TestCase):
             verifier.MAX_ARCHIVE_FILE_BYTES,
         )
 
+    def test_exact_source_authorities_share_the_reviewed_final_tuple(self) -> None:
+        expected_keys = {"source_sha", "root_tree", "frontend_tree", "internal_tree"}
+        manifest_phases = self.manifest["phases"]
+        self.assertEqual(set(manifest_phases), set(verifier.PHASES))
+        self.assertEqual(manifest_phases, verifier.EXPECTED_PHASE_SOURCES)
+        for phase in verifier.PHASES:
+            with self.subTest(phase=phase):
+                self.assertEqual(set(manifest_phases[phase]), expected_keys)
+                for value in manifest_phases[phase].values():
+                    self.assertRegex(value, r"^[0-9a-f]{40}$")
+
+        self.assertEqual(manifest_phases["ui"], EXPECTED_FINAL_SOURCE)
+
+        validation_workflow = VALIDATION_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertEqual(
+            validation_workflow_sources(validation_workflow),
+            manifest_phases,
+        )
+
+        self.assertEqual(
+            image_workflow_sources(IMAGE_WORKFLOW_PATH.read_text(encoding="utf-8")),
+            manifest_phases,
+        )
+        self.assertNotEqual(manifest_phases["ui"], STALE_FINAL_SOURCE)
+
+    def test_ui_validation_harness_applies_only_the_reviewed_completion_patch(self) -> None:
+        workflow = VALIDATION_WORKFLOW_PATH.read_text(encoding="utf-8")
+        marker = 'case "$PHASE" in'
+        harness_case = workflow.split(marker, 1)[1].split("          esac", 1)[0]
+        ui_case = re.search(
+            r"(?ms)^\s{12}ui\)\s*$(?P<body>.*?)^\s{14};;\s*$",
+            harness_case,
+        )
+        self.assertIsNotNone(ui_case)
+        body = ui_case.group("body")
+        assignments = dict(
+            re.findall(
+                r'^\s{14}(expected_original_blob|expected_common_blob|apply_common_patch|completion_patch_relative_path|expected_patched_blob)="([^"]+)"\s*$',
+                body,
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(
+            assignments,
+            {
+                "expected_original_blob": "906e09c8ebf43d4ba23fcd3caf856175c6ecc332",
+                "expected_common_blob": "906e09c8ebf43d4ba23fcd3caf856175c6ecc332",
+                "apply_common_patch": "false",
+                "completion_patch_relative_path": "$UI_COMPLETION_PATCH_RELATIVE_PATH",
+                "expected_patched_blob": "f9ae2342e236274db62dc50e9acd19dba7e03f2f",
+            },
+        )
+        self.assertIn('if [[ "$apply_common_patch" == "true" ]]; then', workflow)
+        self.assertIn('[[ "$apply_common_patch" == "false" ]]', workflow)
+        self.assertIn('"$completion_patch_path"', workflow)
+
+    def test_ui_validation_harness_behavior_matches_the_reviewed_blobs(self) -> None:
+        target_relative = Path("frontend/src/views/channels/ChannelsView.test.ts")
+        common_relative = Path(
+            "release/validation/patches/channels-view-webcrypto-waits.patch"
+        )
+        completion_relative = Path(
+            "release/validation/patches/channels-view-webcrypto-completion-ui.patch"
+        )
+
+        def head_blob(path: Path) -> bytes:
+            return subprocess.run(
+                ["git", "-C", str(ROOT), "show", f"HEAD:{path.as_posix()}"],
+                check=True,
+                capture_output=True,
+            ).stdout
+
+        source_bytes = head_blob(target_relative)
+        common_bytes = head_blob(common_relative)
+        completion_bytes = head_blob(completion_relative)
+        self.assertEqual(
+            hashlib.sha256(common_bytes).hexdigest(),
+            "917868ced113fe03b0f93d5a0d2acbb9c75021f666517c80af2092a2e2fc2ab1",
+        )
+        self.assertEqual(
+            hashlib.sha256(completion_bytes).hexdigest(),
+            "be427efad3c9b2deffdab3dbd51691cf8d79f212ecbdd3dc250449c271a00dd9",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "source"
+            target = checkout / target_relative
+            target.parent.mkdir(parents=True)
+            target.write_bytes(source_bytes)
+            patch_root = Path(temporary) / "control"
+            patch_root.mkdir()
+            common_patch = patch_root / "common.patch"
+            completion_patch = patch_root / "completion.patch"
+            common_patch.write_bytes(common_bytes)
+            completion_patch.write_bytes(completion_bytes)
+
+            def git(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["git", "-C", str(checkout), *arguments],
+                    check=check,
+                    capture_output=True,
+                    text=True,
+                )
+
+            self.assertEqual(
+                git("hash-object", target_relative.as_posix()).stdout.strip(),
+                "906e09c8ebf43d4ba23fcd3caf856175c6ecc332",
+            )
+            common_check = git(
+                "apply",
+                "--unidiff-zero",
+                "--check",
+                "--whitespace=error-all",
+                str(common_patch),
+                check=False,
+            )
+            self.assertNotEqual(common_check.returncode, 0)
+            git(
+                "apply",
+                "--unidiff-zero",
+                "--check",
+                "--whitespace=error-all",
+                str(completion_patch),
+            )
+            git(
+                "apply",
+                "--unidiff-zero",
+                "--whitespace=error-all",
+                str(completion_patch),
+            )
+            self.assertEqual(
+                git("hash-object", target_relative.as_posix()).stdout.strip(),
+                "f9ae2342e236274db62dc50e9acd19dba7e03f2f",
+            )
+            self.assertEqual(
+                [path.relative_to(checkout).as_posix() for path in checkout.rglob("*") if path.is_file()],
+                [target_relative.as_posix()],
+            )
+
     def test_workflow_remains_no_deploy_and_has_one_strict_input(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn("phase_evidence_json:", workflow)
@@ -101,7 +308,8 @@ class RolloutEvidenceTests(unittest.TestCase):
         self.assertNotIn("  release-control:", test_workflow)
         required_test_job = test_workflow.split("  test:\n", 1)[1].split("\n  lint:", 1)[0]
         self.assertIn("python3 -m unittest discover -s release/deployment", required_test_job)
-        self.assertIn("python3 -m py_compile release/deployment/verify_rollout_evidence.py", required_test_job)
+        self.assertIn("python3 -m py_compile", required_test_job)
+        self.assertIn("release/deployment/verify_rollout_evidence.py", required_test_job)
 
     def test_input_requires_exact_order_and_exact_keys(self) -> None:
         value = self.valid_input_value()

@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "repository": "medtechcorps-netizen/whatomate",
+  "authority": "observation-only",
+  "workflow": {
+    "path": ".github/workflows/plan-production-rollout.yml",
+    "environment": "rereply-production-plan",
+    "concurrency_group": "rereply-production"
+  },
+  "provider": {
+    "name": "digitalocean-app-platform",
+    "api_origin": "https://api.digitalocean.com",
+    "app_id_sha256": "c8c3b97aa3face41a6c2d1357807fa979e8a9bf2db25fff3f31b98dfa2019a31",
+    "app_name": "rereply",
+    "default_ingress_sha256": "05ab4f90194ad37c6926138e9aafbd49c73aa75d08da92b0b1309bfce207cfa8",
+    "allowed_http_methods": [
+      "GET"
+    ],
+    "allowed_path_templates": [
+      "/v2/apps/{app_id}",
+      "/v2/apps/{app_id}/deployments/{active_deployment_id}"
+    ],
+    "required_token_scopes": [
+      "app:read",
+      "regions:read",
+      "sizes:read",
+      "actions:read"
+    ]
+  },
+  "bootstrap_state": {
+    "app_updated_at_sha256": "c849930716929c0f80937eb213f3505c104c4eca913fc03934b8ea6f9a73f3df",
+    "active_deployment_id_sha256": "439ecb65c0e711036d39b26a4d38b91f555dad32325dbdd86544230743d3cb0f",
+    "canonical_spec_sha256": "a93a507a5affd82b4e00636812e4c444d31c9027bc31c19bd075f2e4d580b07e",
+    "environment_values_sha256": "3b675a9ca2279c465a102e8256cbf8242a46c456e6898d593e9cde3d0e2361c7",
+    "non_source_projection_sha256": "4f31183fb7f305a2a36422fdf722f90bed1eadc69fd90026928f522edf9a419b",
+    "source_mode": "legacy-git",
+    "source_sha": "974bb998f6d4c94ce750a92bf23f4550f8e45a2f",
+    "next_phase": "baseline"
+  },
+  "components": [
+    {
+      "collection": "services",
+      "app_name": "omnitech-web",
+      "release_component": "web",
+      "image_repository": "medtechcorps-netizen/rereply-release-web",
+      "legacy_repo_clone_url": "https://github.com/medtechcorps-netizen/whatomate.git",
+      "legacy_branch": "main",
+      "legacy_dockerfile_path": "docker/Dockerfile",
+      "http_port": 8080,
+      "health_path": "/ready"
+    },
+    {
+      "collection": "services",
+      "app_name": "meta-relay",
+      "release_component": "meta-relay",
+      "image_repository": "medtechcorps-netizen/rereply-release-meta-relay",
+      "legacy_repo_clone_url": "https://github.com/medtechcorps-netizen/whatomate.git",
+      "legacy_branch": "main",
+      "legacy_dockerfile_path": "docker/meta-relay.Dockerfile",
+      "http_port": 8081,
+      "health_path": "/readyz"
+    },
+    {
+      "collection": "services",
+      "app_name": "gmail-relay",
+      "release_component": "gmail-relay",
+      "image_repository": "medtechcorps-netizen/rereply-release-gmail-relay",
+      "legacy_repo_clone_url": "https://github.com/medtechcorps-netizen/whatomate.git",
+      "legacy_branch": "main",
+      "legacy_dockerfile_path": "docker/gmail-relay.Dockerfile",
+      "http_port": 8082,
+      "health_path": "/readyz"
+    },
+    {
+      "collection": "jobs",
+      "app_name": "rereply-rls-migrate",
+      "release_component": "web",
+      "image_repository": "medtechcorps-netizen/rereply-release-web",
+      "legacy_repo_clone_url": "https://github.com/medtechcorps-netizen/whatomate.git",
+      "legacy_branch": "main",
+      "legacy_dockerfile_path": "docker/Dockerfile",
+      "kind": "PRE_DEPLOY",
+      "run_command": "./rereply rls-migrate -config config.toml"
+    }
+  ],
+  "logical_source_transform": {
+    "registry_type": "GHCR",
+    "registry": "ghcr.io",
+    "remove_fields": [
+      "git",
+      "dockerfile_path"
+    ],
+    "add_field": "image",
+    "forbidden_image_fields": [
+      "tag",
+      "deploy_on_push",
+      "registry_credentials"
+    ],
+    "migration_binding": "same-web-image-digest"
+  },
+  "expected_topology": {
+    "region": "sgp",
+    "vpc_id_sha256": "aaaf98cef6beb658509d644dc8c56b559a38f79344739cd0edd1442070ec207e",
+    "ingress": [
+      {
+        "kind": "component",
+        "path_prefix": "/gmail-relay",
+        "component": "gmail-relay",
+        "preserve_path_prefix": false
+      },
+      {
+        "kind": "component",
+        "path_prefix": "/meta-relay",
+        "component": "meta-relay",
+        "preserve_path_prefix": false
+      },
+      {
+        "kind": "component",
+        "path_prefix": "/",
+        "component": "omnitech-web",
+        "preserve_path_prefix": false
+      },
+      {
+        "kind": "redirect",
+        "path_prefix": "/",
+        "match_authority": "rereply.app",
+        "redirect_authority": "app.rereply.app",
+        "scheme": "https",
+        "redirect_code": 308
+      }
+    ],
+    "domains": [
+      "app.rereply.app",
+      "rereply.app"
+    ],
+    "databases": [
+      {
+        "engine": "PG",
+        "version": "17",
+        "production": true,
+        "name_sha256": "5a08acdc0eed3e363e1aa4e0bba55a523bff63fec1680f3f63b1f46e834289c2",
+        "cluster_sha256": "28248f27ae9c2545b42173bd7f06fffce87e1b22db6d51d1721fb3318a871472"
+      },
+      {
+        "engine": "VALKEY",
+        "version": "8",
+        "production": true,
+        "name_sha256": "92acd7905c06aeb9db2bb0b6a71b739bfc6032ca8a2a5fb7473e8afd4a1c87e3",
+        "cluster_sha256": "affc1fc72bb50fa5467e5ba5bd07f5b2bfc7c448bed946c17bbb4078aee1db97"
+      }
+    ]
+  },
+  "plan": {
+    "maximum_age_seconds": 900,
+    "phase_order": [
+      "baseline",
+      "bridge",
+      "backend",
+      "ui"
+    ]
+  },
+  "artifact": {
+    "files": [
+      "production-plan.json",
+      "production-plan.sha256"
+    ],
+    "maximum_bytes": 131072
+  },
+  "sanitization": {
+    "forbidden_keys": [
+      "envs",
+      "value",
+      "registry_credentials",
+      "access_token",
+      "authorization",
+      "app_id",
+      "active_deployment_id",
+      "app_updated_at",
+      "default_ingress",
+      "http_paths_used",
+      "spec"
+    ],
+    "forbidden_string_prefixes": [
+      "EV[",
+      "dop_v1_",
+      "doo_v1_",
+      "ghp_",
+      "github_pat_",
+      "-----BEGIN "
+    ]
+  },
+  "security": {
+    "token_environment": "DO_PRODUCTION_READ_TOKEN",
+    "target_environment": "DO_PRODUCTION_TARGET_JSON",
+    "forbidden_ambient_environment": [
+      "DIGITALOCEAN_ACCESS_TOKEN",
+      "DO_ACCESS_TOKEN",
+      "DO_TOKEN",
+      "GHCR_PRODUCTION_PULL_TOKEN"
+    ]
+  }
+}

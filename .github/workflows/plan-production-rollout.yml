@@ -1,0 +1,977 @@
+name: Plan Production Rollout (Observation Only)
+
+run-name: Build observation-only production rollout plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      rollout_evidence_json:
+        description: Exact control SHA, rollout run/attempt, capsule artifact ID/API digest, and rollout-plan exact-file SHA-256
+        required: true
+        type: string
+
+# This workflow observes and attests a sanitized plan. It cannot update an app,
+# publish an image, create a production deployment, or authorize an apply.
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  PRODUCTION_PLAN_WORKFLOW_PATH: .github/workflows/plan-production-rollout.yml
+  ROLLOUT_WORKFLOW_PATH: .github/workflows/aggregate-exact-four-phase-rollout.yml
+  SOURCE_MANIFEST_PATH: release/exact-sources.json
+  ROLLOUT_CONTRACT_PATH: release/deployment/exact-rollout-contract.json
+  ROLLOUT_SCHEMA_PATH: release/deployment/rollout-plan.schema.json
+  ROLLOUT_VERIFIER_PATH: release/deployment/verify_rollout_evidence.py
+  PRODUCTION_CONTRACT_PATH: release/deployment/production-app-contract.json
+  PRODUCTION_PLAN_VERIFIER_PATH: release/deployment/verify_production_plan.py
+  ROLLOUT_PLAN_PREDICATE: https://rereply.app/attestations/exact-four-phase-rollout/v1
+  PRODUCTION_PLAN_PREDICATE: https://rereply.app/attestations/observation-only-production-plan/v1
+  PINNED_JQ_VERSION: "1.8.2"
+  PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+  PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
+
+jobs:
+  authority:
+    name: Authenticate exact rollout authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      control_sha: ${{ steps.authority.outputs.control_sha }}
+      capsule_name: ${{ steps.summary.outputs.capsule_name }}
+      capsule_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      capsule_artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      plan_run_id: ${{ steps.summary.outputs.plan_run_id }}
+      plan_run_attempt: ${{ steps.summary.outputs.plan_run_attempt }}
+      rollout_run_id: ${{ steps.summary.outputs.rollout_run_id }}
+      rollout_run_attempt: ${{ steps.summary.outputs.rollout_run_attempt }}
+      upstream_attempts_b64: ${{ steps.summary.outputs.upstream_attempts_b64 }}
+      upstream_attempts_sha256: ${{ steps.summary.outputs.upstream_attempts_sha256 }}
+    steps:
+      - name: Require protected-main GitHub-hosted authority
+        id: authority
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$PRODUCTION_PLAN_WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" ]]
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf 'control_sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned read-only evidence tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Validate exact control blobs and normalize the request
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_JSON: ${{ inputs.rollout_evidence_json }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+
+          require_control_blob() {
+            local path="$1"
+            local mode type object entry_path control_root resolved
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            [[ "$path" != /* && "$path" != *".."* ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+            read -r mode type object entry_path < <(git -C control ls-tree HEAD -- "$path")
+            [[ "$mode" == "100644" && "$type" == "blob" && "$entry_path" == "$path" ]]
+            [[ "$(git hash-object "control/$path")" == "$object" ]]
+            control_root="$(realpath -e control)"
+            resolved="$(realpath -e -- "control/$path")"
+            [[ "$resolved" == "$control_root/"* ]]
+          }
+
+          for path in \
+            "$PRODUCTION_PLAN_WORKFLOW_PATH" \
+            "$PRODUCTION_CONTRACT_PATH" \
+            "$PRODUCTION_PLAN_VERIFIER_PATH" \
+            "$ROLLOUT_WORKFLOW_PATH" \
+            "$ROLLOUT_CONTRACT_PATH" \
+            "$ROLLOUT_SCHEMA_PATH" \
+            "$ROLLOUT_VERIFIER_PATH" \
+            "$SOURCE_MANIFEST_PATH"; do
+            require_control_blob "$path"
+          done
+
+          /usr/bin/python3 -I -S -B "control/$PRODUCTION_PLAN_VERIFIER_PATH" validate-contract \
+            --contract "control/$PRODUCTION_CONTRACT_PATH"
+          /usr/bin/python3 -I -S -B "control/$ROLLOUT_VERIFIER_PATH" validate-contract \
+            --contract "control/$ROLLOUT_CONTRACT_PATH" \
+            --manifest "control/$SOURCE_MANIFEST_PATH" \
+            --schema "control/$ROLLOUT_SCHEMA_PATH"
+          /usr/bin/python3 -I -S -B "control/$PRODUCTION_PLAN_VERIFIER_PATH" normalize-input \
+            --raw "$REQUEST_JSON" \
+            --control-sha "$CONTROL_SHA" \
+            --output "$RUNNER_TEMP/normalized-input.json"
+
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+
+      - name: Authenticate, download, and independently verify the exact capsule
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          rollout_run_id="$(jq -er '.rollout_run_id' "$RUNNER_TEMP/normalized-input.json")"
+          rollout_run_attempt="$(jq -er '.rollout_run_attempt' "$RUNNER_TEMP/normalized-input.json")"
+          capsule_artifact_id="$(jq -er '.capsule_artifact_id' "$RUNNER_TEMP/normalized-input.json")"
+          capsule_artifact_digest="$(jq -er '.capsule_artifact_digest' "$RUNNER_TEMP/normalized-input.json")"
+          rollout_plan_sha256="$(jq -er '.rollout_plan_sha256' "$RUNNER_TEMP/normalized-input.json")"
+
+          workflow_id="$(gh api "/repos/$REPOSITORY/actions/workflows/aggregate-exact-four-phase-rollout.yml" --jq '.id')"
+          [[ "$workflow_id" =~ ^[1-9][0-9]{0,14}$ ]]
+          latest_run="$(gh api "/repos/$REPOSITORY/actions/runs/$rollout_run_id")"
+          exact_run="$(gh api "/repos/$REPOSITORY/actions/runs/$rollout_run_id/attempts/$rollout_run_attempt")"
+          for run_json in "$latest_run" "$exact_run"; do
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --arg repository "$REPOSITORY" \
+              --argjson run_attempt "$rollout_run_attempt" \
+              --argjson run_id "$rollout_run_id" \
+              --argjson workflow_id "$workflow_id" '
+                .id == $run_id and
+                .run_attempt == $run_attempt and
+                .workflow_id == $workflow_id and
+                .repository.full_name == $repository and
+                .event == "workflow_dispatch" and
+                .status == "completed" and
+                .conclusion == "success" and
+                .head_branch == "main" and
+                .head_sha == $control_sha and
+                .path == ".github/workflows/aggregate-exact-four-phase-rollout.yml" and
+                .display_title == "Assemble exact four-phase rollout authority"
+              ' <<< "$run_json" > /dev/null
+          done
+
+          gh api "/repos/$REPOSITORY/actions/runs/$rollout_run_id/attempts/$rollout_run_attempt/jobs?per_page=100" \
+            > "$RUNNER_TEMP/rollout-jobs.json"
+          jq -e --argjson attempt "$rollout_run_attempt" '
+            .total_count == 3 and
+            (.jobs | length) == 3 and
+            ([.jobs[].name] | sort) == ([
+              "Assemble and sign exact rollout capsule",
+              "Exact four-phase rollout authority gate",
+              "Independently verify exact rollout capsule"
+            ] | sort) and
+            all(.jobs[];
+              .run_attempt == $attempt and
+              .status == "completed" and
+              .conclusion == "success" and
+              .runner_name != null
+            )
+          ' "$RUNNER_TEMP/rollout-jobs.json" > /dev/null
+
+          gh api "/repos/$REPOSITORY/actions/runs/$rollout_run_id/artifacts?per_page=100" \
+            > "$RUNNER_TEMP/rollout-artifacts.json"
+          expected_name="exact-four-phase-rollout-${rollout_run_id}-${rollout_run_attempt}"
+          artifact="$(jq -ce \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$capsule_artifact_digest" \
+            --arg name "$expected_name" \
+            --argjson artifact_id "$capsule_artifact_id" \
+            --argjson run_id "$rollout_run_id" '
+              [.artifacts[] | select(.id == $artifact_id)] |
+              select(length == 1) | .[0] |
+              select(
+                .name == $name and
+                .expired == false and
+                .digest == $digest and
+                .workflow_run.id == $run_id and
+                .workflow_run.head_branch == "main" and
+                .workflow_run.head_sha == $control_sha and
+                (.size_in_bytes | type == "number" and . > 0 and . <= 67108864)
+              )
+            ' "$RUNNER_TEMP/rollout-artifacts.json")"
+          [[ -n "$artifact" ]]
+
+          gh api "/repos/$REPOSITORY/actions/artifacts/$capsule_artifact_id/zip" \
+            > "$RUNNER_TEMP/rollout-capsule.zip"
+          [[ "sha256:$(sha256sum "$RUNNER_TEMP/rollout-capsule.zip" | awk '{print $1}')" == "$capsule_artifact_digest" ]]
+          /usr/bin/python3 -I -S -B "control/$ROLLOUT_VERIFIER_PATH" inspect-capsule-archive \
+            --archive "$RUNNER_TEMP/rollout-capsule.zip" \
+            --contract "control/$ROLLOUT_CONTRACT_PATH" \
+            --output "$RUNNER_TEMP/capsule"
+          /usr/bin/python3 -I -S -B "control/$ROLLOUT_VERIFIER_PATH" validate-capsule \
+            --root "$RUNNER_TEMP/capsule" \
+            --manifest "control/$SOURCE_MANIFEST_PATH" \
+            --contract "control/$ROLLOUT_CONTRACT_PATH" \
+            --schema "control/$ROLLOUT_SCHEMA_PATH" \
+            --verifier "control/$ROLLOUT_VERIFIER_PATH"
+          [[ "$(sha256sum "$RUNNER_TEMP/capsule/rollout-plan.json" | awk '{print $1}')" == "$rollout_plan_sha256" ]]
+          [[ "$(find "$RUNNER_TEMP/capsule" -type f | wc -l)" -eq 20 ]]
+          [[ -z "$(find "$RUNNER_TEMP/capsule" -type l -print -quit)" ]]
+
+          signer="$RELEASE_REPOSITORY/$ROLLOUT_WORKFLOW_PATH"
+          flags=(
+            --repo "$RELEASE_REPOSITORY"
+            --signer-workflow "$signer"
+            --signer-digest "$CONTROL_SHA"
+            --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main
+            --deny-self-hosted-runners
+            --format json
+          )
+          gh attestation verify "$RUNNER_TEMP/capsule/rollout-plan.json" "${flags[@]}" \
+            --bundle "$RUNNER_TEMP/capsule/rollout-plan-provenance.bundle.json" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            > "$RUNNER_TEMP/verified-rollout-provenance.json"
+          gh attestation verify "$RUNNER_TEMP/capsule/rollout-plan.json" "${flags[@]}" \
+            --bundle "$RUNNER_TEMP/capsule/rollout-plan-policy.bundle.json" \
+            --predicate-type "$ROLLOUT_PLAN_PREDICATE" \
+            > "$RUNNER_TEMP/verified-rollout-policy.json"
+          jq -e 'type == "array" and length > 0' "$RUNNER_TEMP/verified-rollout-provenance.json" > /dev/null
+          jq -e --slurpfile expected "$RUNNER_TEMP/capsule/rollout-plan.json" '
+            type == "array" and length > 0 and
+            any(.[]; .verificationResult.statement.predicate == $expected[0])
+          ' "$RUNNER_TEMP/verified-rollout-policy.json" > /dev/null
+
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+          latest_attempt="$(gh api "/repos/$REPOSITORY/actions/runs/$rollout_run_id" --jq '.run_attempt')"
+          [[ "$latest_attempt" == "$rollout_run_attempt" ]]
+
+          jq -ce '
+            [.phases[] as $phase |
+              {
+                phase: $phase.phase,
+                kind: "validation",
+                run_id: $phase.validation.run_id,
+                run_attempt: $phase.validation.run_attempt
+              },
+              {
+                phase: $phase.phase,
+                kind: "image",
+                run_id: $phase.image_build.run_id,
+                run_attempt: $phase.image_build.run_attempt
+              }
+            ] |
+            select(length == 8) |
+            select(([.[].run_id] | unique | length) == 8)
+          ' "$RUNNER_TEMP/capsule/rollout-plan.json" \
+            > "$RUNNER_TEMP/upstream-attempts.json"
+          [[ "$(wc -c < "$RUNNER_TEMP/upstream-attempts.json")" -le 4096 ]]
+          upstream_checked=0
+          while IFS=$'\t' read -r upstream_run_id upstream_run_attempt; do
+            [[ "$upstream_run_id" =~ ^[1-9][0-9]{0,14}$ ]]
+            [[ "$upstream_run_attempt" =~ ^[1-9][0-9]{0,9}$ ]]
+            latest_upstream_attempt="$(gh api "/repos/$REPOSITORY/actions/runs/$upstream_run_id" --jq '.run_attempt')"
+            [[ "$latest_upstream_attempt" == "$upstream_run_attempt" ]]
+            upstream_checked=$((upstream_checked + 1))
+          done < <(jq -r '.[] | [.run_id, (.run_attempt | tostring)] | @tsv' \
+            "$RUNNER_TEMP/upstream-attempts.json")
+          [[ "$upstream_checked" -eq 8 ]]
+
+      - name: Record verified capsule identity
+        id: summary
+        run: |
+          set -euo pipefail
+          rollout_run_id="$(jq -er '.rollout_run_id' "$RUNNER_TEMP/normalized-input.json")"
+          rollout_run_attempt="$(jq -er '.rollout_run_attempt' "$RUNNER_TEMP/normalized-input.json")"
+          {
+            printf 'capsule_name=production-plan-rollout-input-%s-%s\n' \
+              "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'plan_run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'plan_run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'rollout_run_id=%s\n' "$rollout_run_id"
+            printf 'rollout_run_attempt=%s\n' "$rollout_run_attempt"
+            printf 'upstream_attempts_b64=%s\n' \
+              "$(base64 -w0 < "$RUNNER_TEMP/upstream-attempts.json")"
+            printf 'upstream_attempts_sha256=%s\n' \
+              "$(sha256sum "$RUNNER_TEMP/upstream-attempts.json" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified digest-only rollout input
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.summary.outputs.capsule_name }}
+          path: ${{ runner.temp }}/capsule
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+
+  observe:
+    name: Observe exact production state with read-only capability
+    needs: authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: rereply-production-plan
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      plan_b64: ${{ steps.export.outputs.plan_b64 }}
+      plan_sha256: ${{ steps.export.outputs.plan_sha256 }}
+    steps:
+      - name: Require unchanged protected-main authority
+        env:
+          AUTHORITY_PLAN_RUN_ATTEMPT: ${{ needs.authority.outputs.plan_run_attempt }}
+          AUTHORITY_PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          CURRENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$PRODUCTION_PLAN_WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" && "$WORKFLOW_SHA" == "$CONTROL_SHA" ]]
+          [[ "$CURRENT_RUN_ID" == "$AUTHORITY_PLAN_RUN_ID" ]]
+          [[ "$CURRENT_RUN_ATTEMPT" == "$AUTHORITY_PLAN_RUN_ATTEMPT" ]]
+
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Download verified rollout input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.capsule_name }}
+          path: ${{ runner.temp }}/capsule
+
+      - name: Install pinned read-only freshness tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Reverify capsule and exact main before provider access
+        env:
+          AUTHORITY_PLAN_RUN_ATTEMPT: ${{ needs.authority.outputs.plan_run_attempt }}
+          AUTHORITY_PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          CURRENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_JSON: ${{ inputs.rollout_evidence_json }}
+          REPOSITORY: ${{ github.repository }}
+          UPSTREAM_ATTEMPTS_B64: ${{ needs.authority.outputs.upstream_attempts_b64 }}
+          UPSTREAM_ATTEMPTS_SHA256: ${{ needs.authority.outputs.upstream_attempts_sha256 }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -S -B "control/$PRODUCTION_PLAN_VERIFIER_PATH" validate-contract \
+            --contract "control/$PRODUCTION_CONTRACT_PATH"
+          /usr/bin/python3 -I -S -B "control/$ROLLOUT_VERIFIER_PATH" validate-capsule \
+            --root "$RUNNER_TEMP/capsule" \
+            --manifest "control/$SOURCE_MANIFEST_PATH" \
+            --contract "control/$ROLLOUT_CONTRACT_PATH" \
+            --schema "control/$ROLLOUT_SCHEMA_PATH" \
+            --verifier "control/$ROLLOUT_VERIFIER_PATH"
+          /usr/bin/python3 -I -S -B "control/$PRODUCTION_PLAN_VERIFIER_PATH" normalize-input \
+            --raw "$REQUEST_JSON" \
+            --control-sha "$CONTROL_SHA" \
+            --output "$RUNNER_TEMP/normalized-input.json"
+          expected_hash="$(/usr/bin/python3 -I -S -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["rollout_plan_sha256"])' "$RUNNER_TEMP/normalized-input.json")"
+          [[ "$(sha256sum "$RUNNER_TEMP/capsule/rollout-plan.json" | awk '{print $1}')" == "$expected_hash" ]]
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+          [[ "$CURRENT_RUN_ID" == "$AUTHORITY_PLAN_RUN_ID" ]]
+          [[ "$CURRENT_RUN_ATTEMPT" == "$AUTHORITY_PLAN_RUN_ATTEMPT" ]]
+          latest_plan_attempt="$(gh api "/repos/$REPOSITORY/actions/runs/$CURRENT_RUN_ID" --jq '.run_attempt')"
+          [[ "$latest_plan_attempt" == "$CURRENT_RUN_ATTEMPT" ]]
+          rollout_run_id="$(/usr/bin/python3 -I -S -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["rollout_run_id"])' "$RUNNER_TEMP/normalized-input.json")"
+          rollout_run_attempt="$(/usr/bin/python3 -I -S -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["rollout_run_attempt"])' "$RUNNER_TEMP/normalized-input.json")"
+          latest_attempt="$(gh api "/repos/$REPOSITORY/actions/runs/$rollout_run_id" --jq '.run_attempt')"
+          [[ "$latest_attempt" == "$rollout_run_attempt" ]]
+
+          jq -ce '
+            [.phases[] as $phase |
+              {
+                phase: $phase.phase,
+                kind: "validation",
+                run_id: $phase.validation.run_id,
+                run_attempt: $phase.validation.run_attempt
+              },
+              {
+                phase: $phase.phase,
+                kind: "image",
+                run_id: $phase.image_build.run_id,
+                run_attempt: $phase.image_build.run_attempt
+              }
+            ] |
+            select(length == 8) |
+            select(([.[].run_id] | unique | length) == 8)
+          ' "$RUNNER_TEMP/capsule/rollout-plan.json" \
+            > "$RUNNER_TEMP/upstream-attempts.json"
+          [[ "$(sha256sum "$RUNNER_TEMP/upstream-attempts.json" | awk '{print $1}')" == "$UPSTREAM_ATTEMPTS_SHA256" ]]
+          [[ "$(base64 -w0 < "$RUNNER_TEMP/upstream-attempts.json")" == "$UPSTREAM_ATTEMPTS_B64" ]]
+          upstream_checked=0
+          while IFS=$'\t' read -r upstream_run_id upstream_run_attempt; do
+            [[ "$upstream_run_id" =~ ^[1-9][0-9]{0,14}$ ]]
+            [[ "$upstream_run_attempt" =~ ^[1-9][0-9]{0,9}$ ]]
+            latest_upstream_attempt="$(gh api "/repos/$REPOSITORY/actions/runs/$upstream_run_id" --jq '.run_attempt')"
+            [[ "$latest_upstream_attempt" == "$upstream_run_attempt" ]]
+            upstream_checked=$((upstream_checked + 1))
+          done < <(jq -r '.[] | [.run_id, (.run_attempt | tostring)] | @tsv' \
+            "$RUNNER_TEMP/upstream-attempts.json")
+          [[ "$upstream_checked" -eq 8 ]]
+
+      - name: Observe exact production state using the dedicated GET-only controller
+        id: controller
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DO_PRODUCTION_READ_TOKEN: ${{ secrets.DO_PRODUCTION_READ_TOKEN }}
+          DO_PRODUCTION_TARGET_JSON: ${{ secrets.DO_PRODUCTION_TARGET_JSON }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          [[ -n "$DO_PRODUCTION_READ_TOKEN" ]]
+          [[ -n "$DO_PRODUCTION_TARGET_JSON" ]]
+          [[ ! -e "$RUNNER_TEMP/rereply-production-plan" ]]
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+
+          require_control_blob() {
+            local path="$1"
+            local mode type object entry_path control_root resolved
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            [[ "$path" != /* && "$path" != *".."* ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+            read -r mode type object entry_path < <(git -C control ls-tree HEAD -- "$path")
+            [[ "$mode" == "100644" && "$type" == "blob" && "$entry_path" == "$path" ]]
+            [[ "$(git hash-object "control/$path")" == "$object" ]]
+            control_root="$(realpath -e control)"
+            resolved="$(realpath -e -- "control/$path")"
+            [[ "$resolved" == "$control_root/"* ]]
+          }
+
+          require_control_blob "$PRODUCTION_PLAN_VERIFIER_PATH"
+          require_control_blob "$PRODUCTION_CONTRACT_PATH"
+          env -i \
+            LANG=C.UTF-8 \
+            PATH=/usr/bin:/bin \
+            PYTHONHASHSEED=0 \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            GITHUB_REF="$GITHUB_REF" \
+            GITHUB_SHA="$GITHUB_SHA" \
+            GITHUB_WORKFLOW_REF="$GITHUB_WORKFLOW_REF" \
+            GITHUB_WORKFLOW_SHA="$GITHUB_WORKFLOW_SHA" \
+            GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            RUNNER_OS="$RUNNER_OS" \
+            DO_PRODUCTION_READ_TOKEN="$DO_PRODUCTION_READ_TOKEN" \
+            DO_PRODUCTION_TARGET_JSON="$DO_PRODUCTION_TARGET_JSON" \
+            /usr/bin/python3 -I -S -B "control/$PRODUCTION_PLAN_VERIFIER_PATH" observe \
+              --contract "control/$PRODUCTION_CONTRACT_PATH" \
+              --verifier "control/$PRODUCTION_PLAN_VERIFIER_PATH" \
+              --normalized-input "$RUNNER_TEMP/normalized-input.json" \
+              --rollout-plan "$RUNNER_TEMP/capsule/rollout-plan.json" \
+              --control-sha "${{ needs.authority.outputs.control_sha }}" \
+              --workflow-run-id "$GITHUB_RUN_ID" \
+              --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --output-dir "$RUNNER_TEMP/rereply-production-plan"
+          unset DO_PRODUCTION_READ_TOKEN DO_PRODUCTION_TARGET_JSON
+
+          env -i \
+            LANG=C.UTF-8 \
+            PATH=/usr/bin:/bin \
+            PYTHONHASHSEED=0 \
+            /usr/bin/python3 -I -S -B "control/$PRODUCTION_PLAN_VERIFIER_PATH" verify-plan \
+              --contract "control/$PRODUCTION_CONTRACT_PATH" \
+              --verifier "control/$PRODUCTION_PLAN_VERIFIER_PATH" \
+              --rollout-plan "$RUNNER_TEMP/capsule/rollout-plan.json" \
+              --plan "$RUNNER_TEMP/rereply-production-plan/production-plan.json" \
+              --sha256 "$RUNNER_TEMP/rereply-production-plan/production-plan.sha256"
+
+          [[ "$(find "$RUNNER_TEMP/rereply-production-plan" -maxdepth 1 -type f | wc -l)" -eq 2 ]]
+          [[ -z "$(find "$RUNNER_TEMP/rereply-production-plan" -type l -print -quit)" ]]
+          [[ "$(find "$RUNNER_TEMP/rereply-production-plan" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-plan.json production-plan.sha256 " ]]
+
+      - name: Recheck exact main after provider observation
+        env:
+          AUTHORITY_PLAN_RUN_ATTEMPT: ${{ needs.authority.outputs.plan_run_attempt }}
+          AUTHORITY_PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          CURRENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          UPSTREAM_ATTEMPTS_B64: ${{ needs.authority.outputs.upstream_attempts_b64 }}
+          UPSTREAM_ATTEMPTS_SHA256: ${{ needs.authority.outputs.upstream_attempts_sha256 }}
+        run: |
+          set -euo pipefail
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+          [[ "$CURRENT_RUN_ID" == "$AUTHORITY_PLAN_RUN_ID" ]]
+          [[ "$CURRENT_RUN_ATTEMPT" == "$AUTHORITY_PLAN_RUN_ATTEMPT" ]]
+          latest_plan_attempt="$(gh api "/repos/$REPOSITORY/actions/runs/$CURRENT_RUN_ID" --jq '.run_attempt')"
+          [[ "$latest_plan_attempt" == "$CURRENT_RUN_ATTEMPT" ]]
+          rollout_run_id="$(/usr/bin/python3 -I -S -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["rollout_authority"]["run_id"])' "$RUNNER_TEMP/rereply-production-plan/production-plan.json")"
+          rollout_run_attempt="$(/usr/bin/python3 -I -S -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["rollout_authority"]["run_attempt"])' "$RUNNER_TEMP/rereply-production-plan/production-plan.json")"
+          latest_attempt="$(gh api "/repos/$REPOSITORY/actions/runs/$rollout_run_id" --jq '.run_attempt')"
+          [[ "$latest_attempt" == "$rollout_run_attempt" ]]
+          [[ "$(sha256sum "$RUNNER_TEMP/upstream-attempts.json" | awk '{print $1}')" == "$UPSTREAM_ATTEMPTS_SHA256" ]]
+          [[ "$(base64 -w0 < "$RUNNER_TEMP/upstream-attempts.json")" == "$UPSTREAM_ATTEMPTS_B64" ]]
+          upstream_checked=0
+          while IFS=$'\t' read -r upstream_run_id upstream_run_attempt; do
+            latest_upstream_attempt="$(gh api "/repos/$REPOSITORY/actions/runs/$upstream_run_id" --jq '.run_attempt')"
+            [[ "$latest_upstream_attempt" == "$upstream_run_attempt" ]]
+            upstream_checked=$((upstream_checked + 1))
+          done < <(jq -r '.[] | [.run_id, (.run_attempt | tostring)] | @tsv' \
+            "$RUNNER_TEMP/upstream-attempts.json")
+          [[ "$upstream_checked" -eq 8 ]]
+
+      - name: Export only the sanitized plan to the isolated signing job
+        id: export
+        run: |
+          set -euo pipefail
+          plan_b64="$(base64 -w0 < "$RUNNER_TEMP/rereply-production-plan/production-plan.json")"
+          plan_sha256="$(cat "$RUNNER_TEMP/rereply-production-plan/production-plan.sha256")"
+          [[ "$plan_b64" =~ ^[A-Za-z0-9+/=]+$ ]]
+          [[ "$plan_sha256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            printf 'plan_b64=%s\n' "$plan_b64"
+            printf 'plan_sha256=%s\n' "$plan_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+  attest:
+    name: Independently verify and attest the sanitized plan
+    needs:
+      - authority
+      - observe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      verified_plan_name: ${{ steps.summary.outputs.verified_plan_name }}
+      verified_plan_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      verified_plan_artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - name: Require unchanged protected-main signing authority
+        env:
+          AUTHORITY_PLAN_RUN_ATTEMPT: ${{ needs.authority.outputs.plan_run_attempt }}
+          AUTHORITY_PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          CURRENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$PRODUCTION_PLAN_WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" && "$WORKFLOW_SHA" == "$CONTROL_SHA" ]]
+          [[ "$CURRENT_RUN_ID" == "$AUTHORITY_PLAN_RUN_ID" ]]
+          [[ "$CURRENT_RUN_ATTEMPT" == "$AUTHORITY_PLAN_RUN_ATTEMPT" ]]
+
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Download verified rollout input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.capsule_name }}
+          path: ${{ runner.temp }}/capsule
+
+      - name: Reconstruct the exact sanitized plan output
+        env:
+          PLAN_B64: ${{ needs.observe.outputs.plan_b64 }}
+          PLAN_SHA256: ${{ needs.observe.outputs.plan_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$PLAN_B64" =~ ^[A-Za-z0-9+/=]+$ ]]
+          [[ "$PLAN_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          mkdir -m 0700 "$RUNNER_TEMP/production-plan"
+          printf '%s' "$PLAN_B64" | base64 --decode \
+            > "$RUNNER_TEMP/production-plan/production-plan.json"
+          chmod 0600 "$RUNNER_TEMP/production-plan/production-plan.json"
+          [[ "$(sha256sum "$RUNNER_TEMP/production-plan/production-plan.json" | awk '{print $1}')" == "$PLAN_SHA256" ]]
+          printf '%s\n' "$PLAN_SHA256" \
+            > "$RUNNER_TEMP/production-plan/production-plan.sha256"
+          chmod 0600 "$RUNNER_TEMP/production-plan/production-plan.sha256"
+
+      - name: Independently verify exact capsule and sanitized plan
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+
+          require_control_blob() {
+            local path="$1"
+            local mode type object entry_path control_root resolved
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            [[ "$path" != /* && "$path" != *".."* ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+            read -r mode type object entry_path < <(git -C control ls-tree HEAD -- "$path")
+            [[ "$mode" == "100644" && "$type" == "blob" && "$entry_path" == "$path" ]]
+            [[ "$(git hash-object "control/$path")" == "$object" ]]
+            control_root="$(realpath -e control)"
+            resolved="$(realpath -e -- "control/$path")"
+            [[ "$resolved" == "$control_root/"* ]]
+          }
+
+          for path in \
+            "$PRODUCTION_PLAN_WORKFLOW_PATH" \
+            "$PRODUCTION_CONTRACT_PATH" \
+            "$PRODUCTION_PLAN_VERIFIER_PATH" \
+            "$ROLLOUT_WORKFLOW_PATH" \
+            "$ROLLOUT_CONTRACT_PATH" \
+            "$ROLLOUT_SCHEMA_PATH" \
+            "$ROLLOUT_VERIFIER_PATH" \
+            "$SOURCE_MANIFEST_PATH"; do
+            require_control_blob "$path"
+          done
+
+          /usr/bin/python3 -I -S -B "control/$ROLLOUT_VERIFIER_PATH" validate-capsule \
+            --root "$RUNNER_TEMP/capsule" \
+            --manifest "control/$SOURCE_MANIFEST_PATH" \
+            --contract "control/$ROLLOUT_CONTRACT_PATH" \
+            --schema "control/$ROLLOUT_SCHEMA_PATH" \
+            --verifier "control/$ROLLOUT_VERIFIER_PATH"
+          /usr/bin/python3 -I -S -B "control/$PRODUCTION_PLAN_VERIFIER_PATH" verify-plan \
+            --contract "control/$PRODUCTION_CONTRACT_PATH" \
+            --verifier "control/$PRODUCTION_PLAN_VERIFIER_PATH" \
+            --rollout-plan "$RUNNER_TEMP/capsule/rollout-plan.json" \
+            --plan "$RUNNER_TEMP/production-plan/production-plan.json" \
+            --sha256 "$RUNNER_TEMP/production-plan/production-plan.sha256"
+          [[ "$(find "$RUNNER_TEMP/production-plan" -maxdepth 1 -type f | wc -l)" -eq 2 ]]
+          [[ -z "$(find "$RUNNER_TEMP/production-plan" -type l -print -quit)" ]]
+
+      - name: Require live main immediately before plan signing
+        env:
+          AUTHORITY_PLAN_RUN_ATTEMPT: ${{ needs.authority.outputs.plan_run_attempt }}
+          AUTHORITY_PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          CURRENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          UPSTREAM_ATTEMPTS_B64: ${{ needs.authority.outputs.upstream_attempts_b64 }}
+          UPSTREAM_ATTEMPTS_SHA256: ${{ needs.authority.outputs.upstream_attempts_sha256 }}
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          live_main_sha="$("$tools_dir/gh" api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+          [[ "$CURRENT_RUN_ID" == "$AUTHORITY_PLAN_RUN_ID" ]]
+          [[ "$CURRENT_RUN_ATTEMPT" == "$AUTHORITY_PLAN_RUN_ATTEMPT" ]]
+          latest_plan_attempt="$("$tools_dir/gh" api "/repos/$REPOSITORY/actions/runs/$CURRENT_RUN_ID" --jq '.run_attempt')"
+          [[ "$latest_plan_attempt" == "$CURRENT_RUN_ATTEMPT" ]]
+          embedded_plan_run_id="$("$tools_dir/jq" -er '.control.run_id' "$RUNNER_TEMP/production-plan/production-plan.json")"
+          embedded_plan_run_attempt="$("$tools_dir/jq" -er '.control.run_attempt' "$RUNNER_TEMP/production-plan/production-plan.json")"
+          [[ "$embedded_plan_run_id" == "$CURRENT_RUN_ID" ]]
+          [[ "$embedded_plan_run_attempt" == "$CURRENT_RUN_ATTEMPT" ]]
+          rollout_run_id="$(/usr/bin/python3 -I -S -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["rollout_authority"]["run_id"])' "$RUNNER_TEMP/production-plan/production-plan.json")"
+          rollout_run_attempt="$(/usr/bin/python3 -I -S -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["rollout_authority"]["run_attempt"])' "$RUNNER_TEMP/production-plan/production-plan.json")"
+          latest_attempt="$("$tools_dir/gh" api "/repos/$REPOSITORY/actions/runs/$rollout_run_id" --jq '.run_attempt')"
+          [[ "$latest_attempt" == "$rollout_run_attempt" ]]
+
+          "$tools_dir/jq" -ce '
+            [.phases[] as $phase |
+              {
+                phase: $phase.phase,
+                kind: "validation",
+                run_id: $phase.validation.run_id,
+                run_attempt: $phase.validation.run_attempt
+              },
+              {
+                phase: $phase.phase,
+                kind: "image",
+                run_id: $phase.image_build.run_id,
+                run_attempt: $phase.image_build.run_attempt
+              }
+            ] |
+            select(length == 8) |
+            select(([.[].run_id] | unique | length) == 8)
+          ' "$RUNNER_TEMP/capsule/rollout-plan.json" \
+            > "$RUNNER_TEMP/upstream-attempts.json"
+          [[ "$(sha256sum "$RUNNER_TEMP/upstream-attempts.json" | awk '{print $1}')" == "$UPSTREAM_ATTEMPTS_SHA256" ]]
+          [[ "$(base64 -w0 < "$RUNNER_TEMP/upstream-attempts.json")" == "$UPSTREAM_ATTEMPTS_B64" ]]
+          upstream_checked=0
+          while IFS=$'\t' read -r upstream_run_id upstream_run_attempt; do
+            latest_upstream_attempt="$("$tools_dir/gh" api "/repos/$REPOSITORY/actions/runs/$upstream_run_id" --jq '.run_attempt')"
+            [[ "$latest_upstream_attempt" == "$upstream_run_attempt" ]]
+            upstream_checked=$((upstream_checked + 1))
+          done < <("$tools_dir/jq" -r '.[] | [.run_id, (.run_attempt | tostring)] | @tsv' \
+            "$RUNNER_TEMP/upstream-attempts.json")
+          [[ "$upstream_checked" -eq 8 ]]
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+
+          require_control_blob() {
+            local path="$1"
+            local mode type object entry_path control_root resolved
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            [[ "$path" != /* && "$path" != *".."* ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+            read -r mode type object entry_path < <(git -C control ls-tree HEAD -- "$path")
+            [[ "$mode" == "100644" && "$type" == "blob" && "$entry_path" == "$path" ]]
+            [[ "$(git hash-object "control/$path")" == "$object" ]]
+            control_root="$(realpath -e control)"
+            resolved="$(realpath -e -- "control/$path")"
+            [[ "$resolved" == "$control_root/"* ]]
+          }
+
+          require_control_blob "$PRODUCTION_PLAN_VERIFIER_PATH"
+          require_control_blob "$PRODUCTION_CONTRACT_PATH"
+          /usr/bin/python3 -I -S -B "control/$PRODUCTION_PLAN_VERIFIER_PATH" verify-plan \
+            --contract "control/$PRODUCTION_CONTRACT_PATH" \
+            --verifier "control/$PRODUCTION_PLAN_VERIFIER_PATH" \
+            --rollout-plan "$RUNNER_TEMP/capsule/rollout-plan.json" \
+            --plan "$RUNNER_TEMP/production-plan/production-plan.json" \
+            --sha256 "$RUNNER_TEMP/production-plan/production-plan.sha256"
+
+      - name: Create sanitized production-plan provenance
+        id: plan-provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-plan/production-plan.json
+          push-to-registry: false
+
+      - name: Create observation-only production-plan policy attestation
+        id: plan-policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-plan/production-plan.json
+          predicate-type: ${{ env.PRODUCTION_PLAN_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/production-plan/production-plan.json
+          push-to-registry: false
+
+      - name: Record verified plan identity
+        id: summary
+        run: |
+          set -euo pipefail
+          printf 'verified_plan_name=verified-production-plan-%s-%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload independently verified sanitized plan
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.summary.outputs.verified_plan_name }}
+          path: |
+            ${{ runner.temp }}/production-plan/production-plan.json
+            ${{ runner.temp }}/production-plan/production-plan.sha256
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+
+  gate:
+    name: Observation-only production plan gate
+    if: always()
+    needs:
+      - authority
+      - observe
+      - attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      deployments: read
+    steps:
+      - name: Require all observation-only gates and no production deployment
+        env:
+          ATTEST_RESULT: ${{ needs.attest.result }}
+          AUTHORITY_PLAN_RUN_ATTEMPT: ${{ needs.authority.outputs.plan_run_attempt }}
+          AUTHORITY_PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+          AUTHORITY_RESULT: ${{ needs.authority.result }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          CURRENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          OBSERVE_RESULT: ${{ needs.observe.result }}
+          REPOSITORY: ${{ github.repository }}
+          ROLLOUT_RUN_ATTEMPT: ${{ needs.authority.outputs.rollout_run_attempt }}
+          ROLLOUT_RUN_ID: ${{ needs.authority.outputs.rollout_run_id }}
+          UPSTREAM_ATTEMPTS_B64: ${{ needs.authority.outputs.upstream_attempts_b64 }}
+          UPSTREAM_ATTEMPTS_SHA256: ${{ needs.authority.outputs.upstream_attempts_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$AUTHORITY_RESULT" == "success" ]]
+          [[ "$OBSERVE_RESULT" == "success" ]]
+          [[ "$ATTEST_RESULT" == "success" ]]
+          [[ "$CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          live_main_sha="$("$tools_dir/gh" api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+          [[ "$CURRENT_RUN_ID" == "$AUTHORITY_PLAN_RUN_ID" ]]
+          [[ "$CURRENT_RUN_ATTEMPT" == "$AUTHORITY_PLAN_RUN_ATTEMPT" ]]
+          latest_plan_attempt="$("$tools_dir/gh" api "/repos/$REPOSITORY/actions/runs/$CURRENT_RUN_ID" --jq '.run_attempt')"
+          [[ "$latest_plan_attempt" == "$CURRENT_RUN_ATTEMPT" ]]
+          latest_attempt="$("$tools_dir/gh" api "/repos/$REPOSITORY/actions/runs/$ROLLOUT_RUN_ID" --jq '.run_attempt')"
+          [[ "$latest_attempt" == "$ROLLOUT_RUN_ATTEMPT" ]]
+
+          [[ "$UPSTREAM_ATTEMPTS_B64" =~ ^[A-Za-z0-9+/=]+$ ]]
+          [[ "$UPSTREAM_ATTEMPTS_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s' "$UPSTREAM_ATTEMPTS_B64" | base64 --decode \
+            > "$RUNNER_TEMP/upstream-attempts.json"
+          [[ "$(sha256sum "$RUNNER_TEMP/upstream-attempts.json" | awk '{print $1}')" == "$UPSTREAM_ATTEMPTS_SHA256" ]]
+          "$tools_dir/jq" -e '
+            type == "array" and length == 8 and
+            ([.[].run_id] | unique | length) == 8 and
+            ([.[].phase] | sort) == (["baseline", "baseline", "bridge", "bridge", "backend", "backend", "ui", "ui"] | sort) and
+            ([.[].kind] | sort) == (["validation", "image", "validation", "image", "validation", "image", "validation", "image"] | sort) and
+            all(.[];
+              (.run_id | type == "string" and test("^[1-9][0-9]{0,14}$")) and
+              (.run_attempt | type == "number" and . >= 1 and . <= 2147483647)
+            )
+          ' "$RUNNER_TEMP/upstream-attempts.json" > /dev/null
+          upstream_checked=0
+          while IFS=$'\t' read -r upstream_run_id upstream_run_attempt; do
+            latest_upstream_attempt="$("$tools_dir/gh" api "/repos/$REPOSITORY/actions/runs/$upstream_run_id" --jq '.run_attempt')"
+            [[ "$latest_upstream_attempt" == "$upstream_run_attempt" ]]
+            upstream_checked=$((upstream_checked + 1))
+          done < <("$tools_dir/jq" -r '.[] | [.run_id, (.run_attempt | tostring)] | @tsv' \
+            "$RUNNER_TEMP/upstream-attempts.json")
+          [[ "$upstream_checked" -eq 8 ]]
+          production_deployments="$("$tools_dir/gh" api \
+            "/repos/$REPOSITORY/deployments?sha=$CONTROL_SHA&environment=production&per_page=100" \
+            --jq 'length')"
+          [[ "$production_deployments" == "0" ]]
+
+          {
+            echo '### Observation-only production plan'
+            echo
+            echo '- Exact protected-main rollout authority: verified'
+            echo '- Production observation: four successful GET requests; zero mutation requests'
+            echo '- Sanitized plan: independently verified and attested'
+            echo '- Production deployment authority: **false**'
+            echo '- Production app/environment, route, Meta, image, package, and deployment mutation: **none**'
+          } >> "$GITHUB_STEP_SUMMARY"

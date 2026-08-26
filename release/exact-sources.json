@@ -25,10 +25,10 @@
       "internal_tree": "494d3957ff3559375f406886be45646049ec9378"
     },
     "ui": {
-      "source_sha": "ab44af2e7c093b4502c1928126c31306b2ba0389",
-      "root_tree": "3553b783d5cfdcbda2ffcee332a2aa392a897bc5",
-      "frontend_tree": "2f92a064f2f3d7f1867c835ef3be7f41e2f30444",
-      "internal_tree": "494d3957ff3559375f406886be45646049ec9378"
+      "source_sha": "ff0c9c6b8d94a085af164e564028d25d38b0a02c",
+      "root_tree": "6b3d030924913a562fee2b75fce318b01b421792",
+      "frontend_tree": "f1cdd8186e2b724dc4bba41081578b2b003a6910",
+      "internal_tree": "a1da97143c17f3d02e47250269d00f238ac0e38c"
     }
   },
   "release": {
