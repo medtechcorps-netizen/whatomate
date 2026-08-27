@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import unittest
 from pathlib import Path
@@ -23,6 +25,26 @@ ACTIVE_PRODUCTION_CONTROLS = (
     "reconcile-production-main-lock-release.yml",
 )
 PINNED_ACTION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}(?:\s+#.*)?$")
+TERMINAL_PARITY_WORKFLOW_SHA256 = {
+    "apply-production-phase.yml": (
+        "f2f03a0a42b6d7d816eda310fa0b5dfaa8f8f843d280ba96b03bce916e1581c6"
+    ),
+    "rollback-production-phase.yml": (
+        "2a1b66fa716ae078fad7d5c92788b7bec88a8c5ee899762418124b787b0ac8f7"
+    ),
+    "finalize-production-orphan-lock.yml": (
+        "1c4b6e4147afe099ceddd2faa1feaae5da769f1c9c2e57abef61750ffb94370a"
+    ),
+    "reconcile-production-orphan.yml": (
+        "ca16cd68409b28ef34a131c764ba2ee8c0349be420cb99fab1f587ab7512e9ef"
+    ),
+    "reconcile-production-main-lock-release.yml": (
+        "069c7eefa27b3a9159bb41d870f1c871db55b37e4b052061392b0306617b5a99"
+    ),
+    "verify-production-crm-canary.yml": (
+        "7e75973086634d18b1c8c1f5082608de4e08d4f2db227cfc5d95fc2dd5cfc02a"
+    ),
+}
 
 
 def workflow(name: str) -> str:
@@ -50,6 +72,553 @@ def step_block(source: str, name: str) -> str:
     if match is None:
         raise AssertionError(f"step not found: {name}")
     return match.group(0)
+
+
+def shell_function_block(source: str, name: str) -> str:
+    matches = re.findall(
+        rf"(?ms)^          {re.escape(name)}\(\) \{{[ \t]*$.*?"
+        rf"^          \}}[ \t]*$",
+        source,
+    )
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one shell function {name}, found {len(matches)}"
+        )
+    return matches[0]
+
+
+def require_active_source_line(source: str, line: str, count: int = 1) -> None:
+    matches = sum(
+        candidate.strip() == line
+        for candidate in source.splitlines()
+        if not candidate.lstrip().startswith("#")
+    )
+    if matches != count:
+        raise AssertionError(
+            f"required active source line count differs: {line}: "
+            f"expected {count}, found {matches}"
+        )
+
+
+def job_definitions(source: str) -> tuple[tuple[str, str], ...]:
+    matches = re.findall(r"(?ms)^jobs:[ \t]*$\n(?P<body>.*)\Z", source)
+    if len(matches) != 1:
+        raise AssertionError(f"expected one jobs mapping, found {len(matches)}")
+    body = matches[0]
+    job_pattern = re.compile(
+        r"(?m)^  (?:(?P<plain>[a-zA-Z_][a-zA-Z0-9_-]*)|"
+        r"\x22(?P<double>[a-zA-Z_][a-zA-Z0-9_-]*)\x22|"
+        r"'(?P<single>[a-zA-Z_][a-zA-Z0-9_-]*)')[ \t]*:[^\r\n]*$"
+    )
+    jobs = tuple(job_pattern.finditer(body))
+    top_level_keys = tuple(
+        match
+        for match in re.finditer(r"(?m)^  (?!#)[^ \t\r\n][^\r\n]*$", body)
+    )
+    if tuple(match.start() for match in jobs) != tuple(
+        match.start() for match in top_level_keys
+    ):
+        raise AssertionError("unparsed top-level job key found")
+    definitions: list[tuple[str, str]] = []
+    for index, match in enumerate(jobs):
+        job_id = next(
+            value
+            for value in (
+                match.group("plain"),
+                match.group("double"),
+                match.group("single"),
+            )
+            if value is not None
+        )
+        end = jobs[index + 1].start() if index + 1 < len(jobs) else len(body)
+        block = body[match.start() : end]
+        names = re.findall(r"(?m)^    name: (.+)$", block)
+        if len(names) != 1:
+            raise AssertionError(
+                f"job {job_id} must have exactly one explicit name, found {len(names)}"
+            )
+        definitions.append((job_id, names[0]))
+    return tuple(definitions)
+
+
+def job_names(source: str) -> tuple[str, ...]:
+    return tuple(name for _, name in job_definitions(source))
+
+
+def job_ids(source: str) -> tuple[str, ...]:
+    return tuple(job_id for job_id, _ in job_definitions(source))
+
+
+def shell_json_array_assignments(
+    source: str, variable: str
+) -> tuple[tuple[str, ...], ...]:
+    pattern = rf"(?m)^\s*{re.escape(variable)}='(\[[^\r\n]*\])'\s*$"
+    arrays = tuple(tuple(json.loads(raw)) for raw in re.findall(pattern, source))
+    assignment_count = len(
+        re.findall(
+            rf"(?m)^[ \t]*{re.escape(variable)}(?:\+)?=",
+            source,
+        )
+    )
+    if assignment_count != len(arrays):
+        raise AssertionError(
+            f"unparsed shell assignment found for {variable}: "
+            f"parsed {len(arrays)} of {assignment_count}"
+        )
+    if any(not all(isinstance(value, str) for value in values) for values in arrays):
+        raise AssertionError(f"non-string shell array item found: {variable}")
+    return arrays
+
+
+def single_shell_json_array(source: str, variable: str, label: str) -> tuple[str, ...]:
+    arrays = shell_json_array_assignments(source, variable)
+    if len(arrays) != 1:
+        raise AssertionError(
+            f"expected one {variable} assignment in {label}, found {len(arrays)}"
+        )
+    return arrays[0]
+
+
+def assert_no_nested_shell_control(source: str, label: str) -> None:
+    nested_control = re.compile(
+        r"(?m)^[ \t]*(?:(?:if|elif|else|fi|case|esac|for|while|until|select|"
+        r"function)\b|[a-zA-Z_][a-zA-Z0-9_]*[ \t]*\(\)[ \t]*\{|"
+        r"[{}][ \t]*$)"
+    )
+    if nested_control.search(source) is not None or "<<" in source:
+        raise AssertionError(f"nested shell control found in {label}")
+
+
+def shell_if_arm_array(
+    source: str, condition: str, variable: str
+) -> tuple[str, ...]:
+    matches = re.findall(
+        rf"(?ms)^[ \t]*(?:if|elif)[ \t]+\[\[[ \t]+"
+        rf"{re.escape(condition)}[ \t]+\]\];[ \t]+then[ \t]*$"
+        rf"(?P<body>.*?)(?=^[ \t]*(?:elif[ \t]+\[\[|else[ \t]*$|fi[ \t]*$))",
+        source,
+    )
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one shell conditional arm for {condition}, found {len(matches)}"
+        )
+    assert_no_nested_shell_control(matches[0], condition)
+    return single_shell_json_array(matches[0], variable, condition)
+
+
+def shell_case_arm_array(
+    source: str, arm_pattern: str, variable: str
+) -> tuple[str, ...]:
+    arms = re.findall(
+        rf"(?ms)^[ \t]+(?:{arm_pattern})\)[ \t]*$"
+        rf"(?P<body>.*?)(?=^[ \t]+;;[ \t]*$)",
+        source,
+    )
+    assignments: list[tuple[str, ...]] = []
+    for arm in arms:
+        arrays = shell_json_array_assignments(arm, variable)
+        if len(arrays) > 1:
+            raise AssertionError(
+                f"multiple {variable} assignments in case arm {arm_pattern}"
+            )
+        if arrays:
+            assert_no_nested_shell_control(arm, arm_pattern)
+            assignments.extend(arrays)
+    if len(assignments) != 1:
+        raise AssertionError(
+            f"expected one {variable} assignment for case arm {arm_pattern}, "
+            f"found {len(assignments)}"
+        )
+    return assignments[0]
+
+
+def javascript_string_array(body: str, label: str) -> tuple[str, ...]:
+    if re.fullmatch(r"\s*'[^'\r\n]+'(?:\s*,\s*'[^'\r\n]+')*\s*", body) is None:
+        raise AssertionError(f"unparsed JavaScript array item found: {label}")
+    return tuple(re.findall(r"'([^']+)'", body))
+
+
+def javascript_without_block_comments(source: str) -> str:
+    return re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+
+
+def require_active_javascript_line(source: str, line: str) -> None:
+    matches = re.findall(rf"(?m)^[ \t]+{re.escape(line)}[ \t]*$", source)
+    if len(matches) != 1:
+        raise AssertionError(f"required JavaScript dataflow line differs: {line}")
+
+
+def javascript_array_assignment(source: str, variable: str) -> tuple[str, ...]:
+    active_source = javascript_without_block_comments(source)
+    matches = re.findall(
+        rf"(?m)^[ \t]+const {re.escape(variable)}="
+        rf"\[(?P<body>[^\]]*)\];[ \t]*$",
+        active_source,
+    )
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one JavaScript array assignment for {variable}, found {len(matches)}"
+        )
+    assert_javascript_array_is_not_mutated(active_source, variable)
+    return javascript_string_array(matches[0], variable)
+
+
+def assert_javascript_array_is_not_mutated(source: str, variable: str) -> None:
+    mutating_method = re.compile(
+        rf"\b{re.escape(variable)}\."
+        rf"(?:copyWithin|fill|pop|push|reverse|shift|sort|splice|unshift)\s*\("
+    )
+    if mutating_method.search(source) is not None:
+        raise AssertionError(f"JavaScript array is mutated: {variable}")
+    without_declaration = source.replace(f"const {variable}=", "", 1)
+    reassignment = re.compile(
+        rf"\b{re.escape(variable)}\s*(?:\[[^\]]+\]\s*)?"
+        rf"(?:=|\+=|-=|\*=|/=|%=|\+\+|--)"
+    )
+    if reassignment.search(without_declaration) is not None:
+        raise AssertionError(f"JavaScript array is reassigned: {variable}")
+
+
+def reconcile_operation_job_arrays(source: str) -> dict[str, tuple[str, ...]]:
+    active_source = javascript_without_block_comments(source)
+    pattern = re.compile(
+        r"(?m)^[ \t]+const expectedJobs=operation==='apply'\?\s*"
+        r"\[(?P<apply>[^\]]*)\]:\s*operation==='rollback'\?\s*"
+        r"\[(?P<rollback>[^\]]*)\]:\s*"
+        r"\[(?P<orphan_rollback>[^\]]*)\];[ \t]*$"
+    )
+    matches = tuple(pattern.finditer(active_source))
+    declaration_count = len(
+        re.findall(r"(?m)^[ \t]+const expectedJobs=", active_source)
+    )
+    if declaration_count != 1 or len(matches) != 1:
+        raise AssertionError("expected exactly one reconcile expectedJobs assignment")
+    assert_javascript_array_is_not_mutated(active_source, "expectedJobs")
+    if len(re.findall(r"\bexpectedJobs\b", active_source)) != 4:
+        raise AssertionError("reconcile expectedJobs reference count differs")
+    require_active_javascript_line(
+        active_source,
+        "if(JSON.stringify(jobs.map(j=>j.name).sort())!==JSON.stringify("
+        "[...expectedJobs].sort())) throw new Error('original job inventory differs');",
+    )
+    require_active_javascript_line(
+        active_source,
+        "const prerequisiteJobs=operation==='orphan-rollback'?"
+        "expectedJobs.slice(0,2):expectedJobs.slice(0,3);",
+    )
+    match = matches[0]
+    return {
+        operation: javascript_string_array(
+            match.group(operation), f"reconcile {operation} jobs"
+        )
+        for operation in ("apply", "rollback", "orphan_rollback")
+    }
+
+
+def sorted_inventory(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sorted(values))
+
+
+def jq_literal_job_inventory(source: str) -> tuple[str, ...]:
+    matches = re.findall(
+        r"\(\[\.jobs\[\]\.name\]\s*\|\s*sort\)\s*==\s*"
+        r"\(\[(?P<body>.*?)\]\s*\|\s*sort\)",
+        source,
+        re.DOTALL,
+    )
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one literal jq job inventory, found {len(matches)}"
+        )
+    values = json.loads(f"[{matches[0]}]")
+    if not all(isinstance(value, str) for value in values):
+        raise AssertionError("non-string jq job inventory item found")
+    return tuple(values)
+
+
+def workflow_step_blocks(source: str) -> tuple[str, ...]:
+    return tuple(
+        match.group(0)
+        for match in re.finditer(
+            r"(?ms)^      -(?: [^\r\n]*)?[ \t]*$.*?"
+            r"(?=^      -(?: [^\r\n]*)?[ \t]*$|\Z)",
+            source,
+        )
+    )
+
+
+def artifact_upload_use_count(source: str) -> int:
+    return len(
+        re.findall(
+            r"(?m)^(?:      - uses:|        uses:) "
+            r"actions/upload-artifact@[0-9a-f]{40}"
+            r"(?:\s+#.*)?$",
+            source,
+        )
+    )
+
+
+def is_artifact_upload_step(source: str) -> bool:
+    return artifact_upload_use_count(source) == 1
+
+
+def yaml_mapping_key_pattern(indent: int, key: str) -> re.Pattern[str]:
+    escaped = re.escape(key)
+    return re.compile(
+        rf"(?m)^ {{{indent}}}(?:{escaped}|\x22{escaped}\x22|'{escaped}')"
+        rf"[ \t]*:"
+    )
+
+
+def assert_no_quoted_mapping_key(source: str, indent: int, label: str) -> None:
+    quoted_key = re.compile(
+        rf"(?m)^ {{{indent}}}(?:\x22(?:\\.|[^\x22\\])*\x22|"
+        rf"'(?:[^']|'')*')[ \t]*:"
+    )
+    if quoted_key.search(source) is not None:
+        raise AssertionError(f"quoted YAML key is forbidden in {label}")
+
+
+def assert_no_dynamic_job_fanout(source: str) -> None:
+    assert_no_quoted_mapping_key(source, 4, "producer job properties")
+    assert_no_quoted_mapping_key(source, 6, "producer strategy properties")
+    for indent, key in ((4, "strategy"), (6, "matrix")):
+        if yaml_mapping_key_pattern(indent, key).search(source) is not None:
+            raise AssertionError(f"producer job fan-out is forbidden: {key}")
+
+
+def assert_unconditional_artifact_upload(source: str) -> None:
+    assert_no_quoted_mapping_key(source, 8, "artifact upload step")
+    for key in ("if", "continue-on-error"):
+        if yaml_mapping_key_pattern(8, key).search(source) is not None:
+            raise AssertionError(f"artifact upload step is conditional: {key}")
+
+
+def workflow_step_identity(source: str) -> str:
+    match = re.match(r"^      - name: (?P<name>.+?)\s*$", source, re.MULTILINE)
+    if match is None:
+        raise AssertionError("workflow step identity is missing")
+    return match.group("name")
+
+
+def assert_github_output_is_not_rebound(source: str) -> None:
+    active_lines = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+    forbidden = (
+        r"os\.environ\[[\x22\x27]GITHUB_OUTPUT[\x22\x27]\]\s*"
+        r"(?:=|:=|\+=|-=|\*=|/=|%=)",
+        r"\bdel\s+os\.environ\[[\x22\x27]GITHUB_OUTPUT[\x22\x27]\]",
+        r"os\.environ\.(?:clear|popitem|update)\s*\(",
+        r"os\.environ\.(?:pop|setdefault|__setitem__)\s*\([ \t]*"
+        r"[\x22\x27]GITHUB_OUTPUT[\x22\x27]",
+        r"os\.(?:putenv|unsetenv)\s*\([ \t]*[\x22\x27]GITHUB_OUTPUT[\x22\x27]",
+        r"(?m)^[ \t]*(?:(?:export|readonly|local|declare(?:[ \t]+-[a-zA-Z]+)?)"
+        r"[ \t]+)?GITHUB_OUTPUT(?:\+)?=",
+        r"(?m)^[ \t]*(?:unset|read)[^\r\n]*\bGITHUB_OUTPUT\b",
+        r"(?m)^[ \t]*printf[ \t]+-v[ \t]+GITHUB_OUTPUT\b",
+    )
+    if any(re.search(pattern, active_lines) is not None for pattern in forbidden):
+        raise AssertionError("GITHUB_OUTPUT is rebound or mutated in producer step")
+
+
+def exact_github_output_names(source: str) -> tuple[str, ...]:
+    active_lines = tuple(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+    active_source = "\n".join(active_lines)
+    python_sink = re.compile(
+        r"^(?P<indent>[ \t]+)with pathlib\.Path\("
+        r"os\.environ\['GITHUB_OUTPUT'\]\)\.open\('a',[^\r\n]*\) "
+        r"as stream:[ \t]*$"
+    )
+    python_sinks = tuple(
+        (index, match)
+        for index, line in enumerate(active_lines)
+        if (match := python_sink.match(line)) is not None
+    )
+    if python_sinks:
+        if len(python_sinks) != 1 or active_source.count("GITHUB_OUTPUT") != 1:
+            raise AssertionError("Python producer output sink differs")
+        index, match = python_sinks[0]
+        parent_indent = len(match.group("indent").expandtabs(8))
+        suite: list[str] = []
+        for line in active_lines[index + 1 :]:
+            if not line.strip():
+                continue
+            indent = len(line) - len(line.lstrip(" \t"))
+            if indent <= parent_indent:
+                break
+            suite.append(line)
+        write_pattern = re.compile(
+            r"^[ \t]+stream\.write\(f(?P<quote>[\x22\x27])"
+            r"(?P<name>[a-z][a-z0-9_]*)=[^\r\n]*\\n"
+            r"(?P=quote)\)[ \t]*$"
+        )
+        writes = tuple(write_pattern.fullmatch(line) for line in suite)
+        if not suite or any(match is None for match in writes):
+            raise AssertionError("Python producer output writes differ")
+        return tuple(match.group("name") for match in writes if match is not None)
+
+    shell_write = re.compile(
+        r"printf[ \t]+(?P<quote>[\x22\x27])"
+        r"(?P<name>[a-z][a-z0-9_]*)=[^\x22\x27\r\n]*\\n"
+        r"(?P=quote)[^;\r\n]*[ \t]+>>[ \t]+"
+        r"[\x22\x27]\$GITHUB_OUTPUT[\x22\x27]"
+    )
+    writes = tuple(shell_write.finditer(active_source))
+    if not writes or active_source.count("GITHUB_OUTPUT") != len(writes):
+        raise AssertionError("shell producer output writes differ")
+    return tuple(match.group("name") for match in writes)
+
+
+def emitted_output_artifact_prefix(
+    source: str,
+    output_name: str,
+    producer_step_id: str,
+    expected_output_names: tuple[str, ...],
+) -> tuple[str, str]:
+    assignment_patterns = (
+        re.compile(
+            rf"(?m)^[ \t]+with pathlib\.Path\(os\.environ\['GITHUB_OUTPUT'\]\)"
+            rf"\.open\('a',[^\r\n]*\) as stream:[ \t]*\r?\n"
+            rf"[ \t]+stream\.write\(f[\x22\x27]"
+            rf"{re.escape(output_name)}=(?P<prefix>[a-z0-9][a-z0-9-]*)-"
+            rf"(?=\{{os\.environ\[)"
+        ),
+        re.compile(
+            rf"(?m)^[ \t]+printf[ \t]+[\x22\x27]"
+            rf"{re.escape(output_name)}=(?P<prefix>[a-z0-9][a-z0-9-]*)-"
+            rf"(?=%s)[^;\r\n]*[ \t]+>>[ \t]+"
+            rf"[\x22\x27]\$GITHUB_OUTPUT[\x22\x27](?:[ \t]*;|[ \t]*$)"
+        ),
+    )
+    emitted: list[tuple[str, str]] = []
+    for block in workflow_step_blocks(source):
+        matches = [
+            match
+            for pattern in assignment_patterns
+            for match in pattern.findall(block)
+        ]
+        if matches:
+            if len(matches) != 1:
+                raise AssertionError(f"ambiguous producer output: {output_name}")
+            emitted.append((block, matches[0]))
+    if len(emitted) != 1:
+        raise AssertionError(
+            f"expected one producer output for {output_name}, found {len(emitted)}"
+        )
+    emitter, prefix = emitted[0]
+    assert_github_output_is_not_rebound(emitter)
+    actual_output_names = exact_github_output_names(emitter)
+    if (
+        sorted_inventory(actual_output_names)
+        != sorted_inventory(expected_output_names)
+        or len(actual_output_names) != len(set(actual_output_names))
+    ):
+        raise AssertionError(
+            f"producer output inventory differs for {output_name}"
+        )
+    if not re.search(rf"(?m)^        id: {re.escape(producer_step_id)}\s*$", emitter):
+        raise AssertionError(f"producer step id differs for {output_name}")
+
+    binding_pattern = re.compile(
+        rf"(?m)^          name: \$\{{\{{[ \t]+steps\."
+        rf"{re.escape(producer_step_id)}\.outputs\.{re.escape(output_name)}"
+        rf"[ \t]+\}}\}}[ \t]*$"
+    )
+    uploads = [
+        block
+        for block in workflow_step_blocks(source)
+        if binding_pattern.search(block) is not None and is_artifact_upload_step(block)
+    ]
+    if len(uploads) != 1 or len(binding_pattern.findall(uploads[0])) != 1:
+        raise AssertionError(f"artifact upload binding differs for {output_name}")
+    assert_unconditional_artifact_upload(uploads[0])
+    return prefix, workflow_step_identity(uploads[0])
+
+
+def emitted_direct_artifact_prefix(source: str) -> tuple[str, str]:
+    pattern = re.compile(
+        r"(?m)^          name: (?P<prefix>[a-z0-9][a-z0-9-]*)-"
+        r"\$\{\{\s*github\.run_id\s*\}\}-"
+        r"\$\{\{\s*github\.run_attempt\s*\}\}\s*$"
+    )
+    matches: list[str] = []
+    matching_uploads: list[str] = []
+    for block in workflow_step_blocks(source):
+        if not is_artifact_upload_step(block):
+            continue
+        block_matches = pattern.findall(block)
+        matches.extend(block_matches)
+        if block_matches:
+            matching_uploads.append(block)
+    if len(matches) != 1 or len(matching_uploads) != 1:
+        raise AssertionError(
+            f"expected one direct artifact-name producer, found {len(matches)}"
+        )
+    assert_unconditional_artifact_upload(matching_uploads[0])
+    return matches[0], workflow_step_identity(matching_uploads[0])
+
+
+def producer_artifact_prefixes(source: str, operation: str) -> tuple[str, ...]:
+    operation_job = "apply" if operation == "apply" else "rollback"
+    emitted = (
+        emitted_output_artifact_prefix(
+            job_block(source, "prelock"),
+            "root_marker_name",
+            "prepare",
+            (
+                "root_marker_name",
+                "root_marker_sha256",
+                "rule_id",
+                "rule_identity_sha256",
+                "route_contract_sha256",
+            ),
+        ),
+        emitted_output_artifact_prefix(
+            job_block(source, "intent"),
+            "intent_name",
+            "prepare",
+            ("intent_name", "intent_sha256"),
+        ),
+        emitted_output_artifact_prefix(
+            job_block(source, "lock_proof"),
+            "proof_name",
+            "prepare",
+            ("proof_name", "proof_sha256"),
+        ),
+        emitted_output_artifact_prefix(
+            job_block(source, operation_job),
+            "internal_name",
+            "name",
+            ("internal_name",),
+        ),
+        emitted_direct_artifact_prefix(job_block(source, "gate")),
+        emitted_output_artifact_prefix(
+            job_block(source, "release_authorization"),
+            "intent_name",
+            "release_intent",
+            ("intent_name", "intent_sha256"),
+        ),
+    )
+    step_blocks = workflow_step_blocks(source)
+    if (
+        source.count("actions/upload-artifact@") != 6
+        or artifact_upload_use_count(source) != 6
+    ):
+        raise AssertionError("producer must contain exactly six artifact uploads")
+    all_uploads = tuple(
+        workflow_step_identity(block)
+        for block in step_blocks
+        if is_artifact_upload_step(block)
+    )
+    selected_uploads = tuple(upload for _, upload in emitted)
+    if len(all_uploads) != 6 or sorted(all_uploads) != sorted(selected_uploads):
+        raise AssertionError(
+            "producer artifact upload inventory is not exhausted by six bound outputs"
+        )
+    return tuple(prefix for prefix, _ in emitted)
 
 
 class WorkflowAuthorityPolicyTests(unittest.TestCase):
@@ -334,6 +903,283 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
                     f"Authorize exact production {operation} main lock release",
                     source,
                 )
+
+    def test_terminal_normal_run_inventories_match_every_consumer(self) -> None:
+        # These security-critical workflows intentionally fail closed on any
+        # syntactically valid alternate YAML, shell, or JavaScript encoding.
+        # A control change must update its semantic assertions and this
+        # normalized-source fingerprint in the same reviewed commit.
+        for filename, expected_sha256 in TERMINAL_PARITY_WORKFLOW_SHA256.items():
+            with self.subTest(workflow=filename, boundary="source-fingerprint"):
+                actual_sha256 = hashlib.sha256(
+                    workflow(filename).encode("utf-8")
+                ).hexdigest()
+                self.assertEqual(actual_sha256, expected_sha256)
+
+        producer_files = {
+            "apply": "apply-production-phase.yml",
+            "rollback": "rollback-production-phase.yml",
+        }
+        producers = {
+            operation: workflow(filename)
+            for operation, filename in producer_files.items()
+        }
+        terminal_jobs = {
+            operation: job_names(source) for operation, source in producers.items()
+        }
+        artifact_prefixes = {
+            operation: producer_artifact_prefixes(source, operation)
+            for operation, source in producers.items()
+        }
+
+        for operation, source in producers.items():
+            with self.subTest(operation=operation, boundary="producer"):
+                producer_job_ids = job_ids(source)
+                self.assertEqual(len(producer_job_ids), 9)
+                self.assertEqual(len(set(producer_job_ids)), 9)
+                assert_no_dynamic_job_fanout(source)
+                self.assertEqual(len(terminal_jobs[operation]), 9)
+                self.assertEqual(len(set(terminal_jobs[operation])), 9)
+                self.assertEqual(len(artifact_prefixes[operation]), 6)
+                self.assertEqual(len(set(artifact_prefixes[operation])), 6)
+                self.assertIn(
+                    f"Authorize exact production {operation} main lock release",
+                    terminal_jobs[operation],
+                )
+                release_authorization = job_block(source, "release_authorization")
+                unlock = job_block(source, "unlock")
+                self.assertEqual(release_authorization.count(".total_count == 8"), 1)
+                self.assertEqual(release_authorization.count(".total_count == 5"), 1)
+                self.assertNotIn(".total_count == 9", release_authorization)
+                self.assertNotIn(".total_count == 6", release_authorization)
+                self.assertEqual(unlock.count(".total_count == 9"), 1)
+                self.assertEqual(unlock.count(".total_count == 6"), 1)
+                self.assertNotIn(".total_count == 8", unlock)
+                self.assertNotIn(".total_count == 5", unlock)
+                release_job = f"Release exact production {operation} main lock"
+                pre_unlock_jobs = tuple(
+                    name for name in terminal_jobs[operation] if name != release_job
+                )
+                self.assertEqual(len(pre_unlock_jobs), 8)
+                self.assertEqual(
+                    sorted_inventory(jq_literal_job_inventory(release_authorization)),
+                    sorted_inventory(pre_unlock_jobs),
+                )
+                self.assertEqual(
+                    sorted_inventory(jq_literal_job_inventory(unlock)),
+                    sorted_inventory(terminal_jobs[operation]),
+                )
+
+        finalizer = workflow("finalize-production-orphan-lock.yml")
+        finalizer_job_arrays = shell_json_array_assignments(
+            finalizer, "original_jobs"
+        )
+        finalizer_artifact_arrays = shell_json_array_assignments(
+            finalizer, "original_artifacts"
+        )
+        canary = workflow("verify-production-crm-canary.yml")
+        canary_job_arrays = shell_json_array_assignments(canary, "expected_jobs")
+        canary_artifact_arrays = shell_json_array_assignments(
+            canary, "expected_artifact_prefixes"
+        )
+        self.assertEqual(len(finalizer_job_arrays), 6)
+        self.assertEqual(len(finalizer_artifact_arrays), 3)
+        self.assertEqual(len(canary_job_arrays), 4)
+        self.assertEqual(len(canary_artifact_arrays), 4)
+        self.assertEqual(finalizer.count("$original_jobs"), 2)
+        self.assertEqual(finalizer.count("$original_artifacts"), 1)
+        self.assertEqual(finalizer.count("$original_prerequisites"), 2)
+        authority_call = (
+            '          authenticate_subject \\\n'
+            '            "$evidence_dir/intent-binding.json" '
+            '"$intent_workflow_path" "$original_workflow_name" \\\n'
+            '            "$original_jobs" "$original_artifacts" \\\n'
+            '            "production-mutation-intent-$intent_slug" '
+            '"$INTENT_PREDICATE" \\\n'
+            '            "$evidence_dir/mutation-intent" orphan '
+            '"$original_prerequisites"'
+        )
+        preauthorization_call = (
+            '          reacquire_subject "$MUTATION_INTENT_BINDING_JSON" \\\n'
+            '            "$ORIGINAL_WORKFLOW_PATH" "$original_name" \\\n'
+            '            "production-mutation-intent-$ORIGINAL_INTENT_SLUG" '
+            '"$INTENT_PREDICATE" "$sources/mutation-intent" \\\n'
+            '            orphan "$original_jobs" "$original_prerequisites"'
+        )
+        self.assertEqual(finalizer.count(authority_call), 1)
+        self.assertEqual(finalizer.count(preauthorization_call), 1)
+        finalizer_authority = shell_function_block(finalizer, "authenticate_subject")
+        finalizer_reacquire = shell_function_block(finalizer, "reacquire_subject")
+        for function in (finalizer_authority, finalizer_reacquire):
+            require_active_source_line(
+                function,
+                "([.jobs[].name] | sort) == ($expected | sort) and",
+            )
+            require_active_source_line(
+                function,
+                "all(.jobs[]; .status == \"completed\" and "
+                ".conclusion == \"success\")",
+            )
+        require_active_source_line(
+            finalizer_authority,
+            "([.artifacts[].name] | sort) == $expected_names",
+        )
+        self.assertEqual(canary.count("$expected_jobs"), 1)
+        self.assertEqual(canary.count("$expected_artifact_prefixes"), 1)
+        self.assertEqual(
+            canary.count(
+                '          jq -e --argjson expected "$expected_jobs" '
+                '--arg reconciled "$reconciled" --arg release_job "$release_job" \''
+            ),
+            1,
+        )
+        self.assertEqual(
+            canary.count(
+                '            --argjson expected_prefixes '
+                '"$expected_artifact_prefixes" '
+                + "\\"
+            ),
+            1,
+        )
+        canary_receipt = step_block(
+            canary, "Acquire and verify the exact successful change receipt"
+        )
+        require_active_source_line(
+            canary_receipt,
+            "([.jobs[].name] | sort) == ($expected | sort) and",
+        )
+        require_active_source_line(
+            canary_receipt,
+            "all(.jobs[]; .status == \"completed\") and",
+        )
+        require_active_source_line(
+            canary_receipt,
+            "([.artifacts[].name] | sort) == $expected_names and",
+        )
+
+        finalizer_authority_jobs = {
+            "apply": shell_if_arm_array(
+                finalizer,
+                '"$intent_operation" == "activate" && '
+                '"$intent_workflow_path" == '
+                '".github/workflows/apply-production-phase.yml"',
+                "original_jobs",
+            ),
+            "rollback": shell_if_arm_array(
+                finalizer,
+                '"$intent_operation" == "rollback" && '
+                '"$intent_workflow_path" == '
+                '".github/workflows/rollback-production-phase.yml"',
+                "original_jobs",
+            ),
+        }
+        finalizer_authority_artifacts = {
+            "apply": shell_if_arm_array(
+                finalizer,
+                '"$intent_operation" == "activate" && '
+                '"$intent_workflow_path" == '
+                '".github/workflows/apply-production-phase.yml"',
+                "original_artifacts",
+            ),
+            "rollback": shell_if_arm_array(
+                finalizer,
+                '"$intent_operation" == "rollback" && '
+                '"$intent_workflow_path" == '
+                '".github/workflows/rollback-production-phase.yml"',
+                "original_artifacts",
+            ),
+        }
+        finalizer_preauthorization_jobs = {
+            operation: shell_case_arm_array(finalizer, operation, "original_jobs")
+            for operation in producer_files
+        }
+        canary_bound_jobs = {
+            operation: shell_case_arm_array(
+                canary,
+                rf"{operation}\|{operation}-reconciled",
+                "expected_jobs",
+            )
+            for operation in producer_files
+        }
+        canary_bound_artifacts = {
+            operation: shell_case_arm_array(
+                canary,
+                rf"{operation}\|{operation}-reconciled",
+                "expected_artifact_prefixes",
+            )
+            for operation in producer_files
+        }
+
+        reconcile = workflow("reconcile-production-orphan.yml")
+        reconcile_jobs = reconcile_operation_job_arrays(reconcile)
+
+        rollback_authority = javascript_without_block_comments(
+            step_block(
+                producers["rollback"], "Authenticate immutable rollback artifacts"
+            )
+        )
+        require_active_javascript_line(
+            rollback_authority,
+            "if(JSON.stringify(actual)!==JSON.stringify([...expectedJobs].sort()) "
+            "|| jobs.some(job=>job.status!=='completed' || "
+            "job.conclusion!=='success')) throw new Error(`${kind} job inventory "
+            "differs`);",
+        )
+        rollback_direct_apply_jobs = javascript_array_assignment(
+            producers["rollback"], "applyJobs"
+        )
+        rollback_active_source = javascript_without_block_comments(
+            producers["rollback"]
+        )
+        self.assertEqual(
+            len(re.findall(r"\bapplyJobs\b", rollback_active_source)), 2
+        )
+        require_active_javascript_line(
+            rollback_active_source,
+            "const currentJobs=value.current_state.kind==='phase-state'?"
+            "canaryJobs:applyJobs;",
+        )
+        require_active_javascript_line(
+            rollback_active_source,
+            "const currentName=await artifact(value.current_state,'current',"
+            "currentWorkflow,`${currentPrefix}-${value.current_state.run_id}-1`,"
+            "currentJobs);",
+        )
+        self.assertEqual(
+            sorted_inventory(rollback_direct_apply_jobs),
+            sorted_inventory(terminal_jobs["apply"]),
+        )
+
+        for operation in producer_files:
+            expected_jobs = sorted_inventory(terminal_jobs[operation])
+            expected_artifacts = sorted_inventory(artifact_prefixes[operation])
+            with self.subTest(operation=operation, boundary="consumers"):
+                self.assertEqual(
+                    sorted_inventory(finalizer_authority_jobs[operation]),
+                    expected_jobs,
+                )
+                self.assertEqual(
+                    sorted_inventory(finalizer_preauthorization_jobs[operation]),
+                    expected_jobs,
+                )
+                self.assertEqual(
+                    sorted_inventory(reconcile_jobs[operation]), expected_jobs
+                )
+                self.assertEqual(
+                    sorted_inventory(canary_bound_jobs[operation]), expected_jobs
+                )
+                self.assertEqual(
+                    sorted_inventory(finalizer_authority_artifacts[operation]),
+                    expected_artifacts,
+                )
+                self.assertEqual(
+                    sorted_inventory(canary_bound_artifacts[operation]),
+                    expected_artifacts,
+                )
+
+        for filename in ACTIVE_PRODUCTION_CONTROLS:
+            with self.subTest(workflow=filename, boundary="obsolete-prefix"):
+                self.assertNotIn("production-main-release-intent-", workflow(filename))
 
     def test_canary_observer_and_signer_have_disjoint_credentials(self) -> None:
         source = workflow("verify-production-crm-canary.yml")

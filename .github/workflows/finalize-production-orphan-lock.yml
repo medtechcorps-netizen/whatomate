@@ -505,14 +505,14 @@ jobs:
           if [[ "$intent_operation" == "activate" && "$intent_workflow_path" == ".github/workflows/apply-production-phase.yml" ]]; then
               intent_slug=apply
               original_workflow_name="Apply Production Phase"
-              original_jobs='["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority","Release exact production apply main lock"]'
-              original_artifacts='["production-main-lock-apply","production-mutation-intent-apply","production-main-lock-proof-apply","unsigned-production-phase-apply","production-phase-apply","production-main-release-intent-apply"]'
+              original_jobs='["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Authorize exact production apply main lock release","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority","Release exact production apply main lock"]'
+              original_artifacts='["production-main-lock-apply","production-mutation-intent-apply","production-main-lock-proof-apply","unsigned-production-phase-apply","production-phase-apply","production-main-lock-release-authorization-apply"]'
               original_prerequisites='["Authenticate exact production apply authority","Prepare exact production apply pre-lock authority","Prepare and attest exact production mutation intent"]'
           elif [[ "$intent_operation" == "rollback" && "$intent_workflow_path" == ".github/workflows/rollback-production-phase.yml" ]]; then
               intent_slug=rollback
               original_workflow_name="Rollback Production Phase"
-              original_jobs='["Acquire exact production rollback main lock","Attest exact production rollback main lock proof","Authenticate exact production rollback authority","Exact production rollback receipt gate","Prepare and attest exact production rollback mutation intent","Prepare exact production rollback pre-lock authority","Release exact production rollback main lock","Roll back exact production phase"]'
-              original_artifacts='["production-main-lock-rollback","production-mutation-intent-rollback","production-main-lock-proof-rollback","unsigned-production-phase-rollback","production-phase-rollback","production-main-release-intent-rollback"]'
+              original_jobs='["Acquire exact production rollback main lock","Attest exact production rollback main lock proof","Authenticate exact production rollback authority","Authorize exact production rollback main lock release","Exact production rollback receipt gate","Prepare and attest exact production rollback mutation intent","Prepare exact production rollback pre-lock authority","Release exact production rollback main lock","Roll back exact production phase"]'
+              original_artifacts='["production-main-lock-rollback","production-mutation-intent-rollback","production-main-lock-proof-rollback","unsigned-production-phase-rollback","production-phase-rollback","production-main-lock-release-authorization-rollback"]'
               original_prerequisites='["Authenticate exact production rollback authority","Prepare exact production rollback pre-lock authority","Prepare and attest exact production rollback mutation intent"]'
           elif [[ "$intent_operation" == "rollback" && "$intent_workflow_path" == "$ORPHAN_ROLLBACK_WORKFLOW_PATH" ]]; then
               intent_slug=orphan-rollback
@@ -896,13 +896,13 @@ jobs:
             apply)
               [[ "$ORIGINAL_OPERATION" == "activate" && "$ORIGINAL_WORKFLOW_PATH" == ".github/workflows/apply-production-phase.yml" ]]
               original_name="Apply Production Phase"
-              original_jobs='["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority","Release exact production apply main lock"]'
+              original_jobs='["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Authorize exact production apply main lock release","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority","Release exact production apply main lock"]'
               original_prerequisites='["Authenticate exact production apply authority","Prepare exact production apply pre-lock authority","Prepare and attest exact production mutation intent"]'
               ;;
             rollback)
               [[ "$ORIGINAL_OPERATION" == "rollback" && "$ORIGINAL_WORKFLOW_PATH" == ".github/workflows/rollback-production-phase.yml" ]]
               original_name="Rollback Production Phase"
-              original_jobs='["Acquire exact production rollback main lock","Attest exact production rollback main lock proof","Authenticate exact production rollback authority","Exact production rollback receipt gate","Prepare and attest exact production rollback mutation intent","Prepare exact production rollback pre-lock authority","Release exact production rollback main lock","Roll back exact production phase"]'
+              original_jobs='["Acquire exact production rollback main lock","Attest exact production rollback main lock proof","Authenticate exact production rollback authority","Authorize exact production rollback main lock release","Exact production rollback receipt gate","Prepare and attest exact production rollback mutation intent","Prepare exact production rollback pre-lock authority","Release exact production rollback main lock","Roll back exact production phase"]'
               original_prerequisites='["Authenticate exact production rollback authority","Prepare exact production rollback pre-lock authority","Prepare and attest exact production rollback mutation intent"]'
               ;;
             orphan-rollback)
