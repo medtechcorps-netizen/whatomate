@@ -123,7 +123,7 @@ jobs:
             const currentWorkflow=value.current_state.kind==='phase-state'?process.env.CANARY_WORKFLOW_PATH:process.env.APPLY_WORKFLOW_PATH;
             const currentPrefix=value.current_state.kind==='phase-state'?'production-phase-state':'production-phase-apply';
             const canaryJobs=['Authenticate exact change receipt authority','Exact production phase gate','Run content-free production and synthetic canaries'];
-            const applyJobs=['Acquire exact production apply main lock','Apply exact production phase','Attest exact production apply main lock proof','Authenticate exact production apply authority','Exact production apply receipt gate','Prepare and attest exact production mutation intent','Prepare exact production apply pre-lock authority','Release exact production apply main lock'];
+            const applyJobs=['Acquire exact production apply main lock','Apply exact production phase','Attest exact production apply main lock proof','Authenticate exact production apply authority','Authorize exact production apply main lock release','Exact production apply receipt gate','Prepare and attest exact production mutation intent','Prepare exact production apply pre-lock authority','Release exact production apply main lock'];
             const recoveryJobs=['Authenticate exact production recovery authority','Exact production recovery readiness gate','Observe exact production recovery state'];
             const currentJobs=value.current_state.kind==='phase-state'?canaryJobs:applyJobs;
             const currentName=await artifact(value.current_state,'current',currentWorkflow,`${currentPrefix}-${value.current_state.run_id}-1`,currentJobs);
