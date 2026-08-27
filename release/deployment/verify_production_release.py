@@ -694,6 +694,28 @@ def _validate_public_provider_state(value: Any, label: str, *, allow_legacy: boo
     return state
 
 
+def provider_states_share_semantic_lineage(
+    left: Any, right: Any, *, allow_legacy: bool
+) -> bool:
+    """Compare complete provider states, excluding only app_updated_at_sha256."""
+
+    left_state = _validate_public_provider_state(
+        left, "left provider lineage state", allow_legacy=allow_legacy
+    )
+    right_state = _validate_public_provider_state(
+        right, "right provider lineage state", allow_legacy=allow_legacy
+    )
+    return {
+        key: copy.deepcopy(value)
+        for key, value in left_state.items()
+        if key != "app_updated_at_sha256"
+    } == {
+        key: copy.deepcopy(value)
+        for key, value in right_state.items()
+        if key != "app_updated_at_sha256"
+    }
+
+
 def _validate_artifact_binding(value: Any, label: str) -> dict[str, Any]:
     binding = exact_keys(value, {"run_id", "run_attempt", "artifact_id", "artifact_digest", "sha256"}, label)
     require_run_id(binding["run_id"], f"{label} run ID")
@@ -1749,7 +1771,9 @@ def validate_reconciliation_receipt(value: Any) -> dict[str, Any]:
             fail("reconciled desired state is incomplete")
     elif outcome == "no-mutation":
         if (
-            after != before
+            not provider_states_share_semantic_lineage(
+                after, before, allow_legacy=operation == "activate"
+            )
             or observation["transition_absent"] is not True
             or provider_job["never_started"] is not True
         ):

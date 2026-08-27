@@ -288,11 +288,9 @@ class ProductionPlanTests(unittest.TestCase):
         active_deployment_hash = verifier.sha256_bytes(
             ACTIVE_DEPLOYMENT_ID.encode("utf-8")
         )
-        updated_at_hash = verifier.sha256_bytes(APP_UPDATED_AT.encode("utf-8"))
         self.contract["bootstrap_state"]["active_deployment_id_sha256"] = (
             active_deployment_hash
         )
-        self.contract["bootstrap_state"]["app_updated_at_sha256"] = updated_at_hash
         vpc_hash = verifier.sha256_bytes(self.spec["vpc"]["id"].encode("utf-8"))
         db_inventory = database_inventory(self.spec)
         self.contract["expected_topology"]["vpc_id_sha256"] = vpc_hash
@@ -335,11 +333,6 @@ class ProductionPlanTests(unittest.TestCase):
                 verifier,
                 "BOOTSTRAP_DEPLOYMENT_ID_SHA256",
                 active_deployment_hash,
-            ),
-            mock.patch.object(
-                verifier,
-                "BOOTSTRAP_UPDATED_AT_SHA256",
-                updated_at_hash,
             ),
             mock.patch.object(
                 verifier, "BOOTSTRAP_NON_SOURCE_SHA256", non_source_hash
@@ -663,6 +656,10 @@ class ProductionPlanTests(unittest.TestCase):
         self.assertFalse(first["provider_validation"]["mutation_performed"])
         self.assertFalse(first["provider_validation"]["deployment_authority"])
         self.assertEqual(first["provider_observation"]["http_request_count"], 4)
+        self.assertEqual(
+            first["provider_observation"]["app_updated_at_sha256"],
+            verifier.sha256_bytes(APP_UPDATED_AT.encode("utf-8")),
+        )
         self.validate(first)
 
     def test_protected_target_descriptor_is_hash_bound_and_never_public(self) -> None:
@@ -694,8 +691,108 @@ class ProductionPlanTests(unittest.TestCase):
         with self.assertRaises(verifier.PlanError):
             self.build(second_app=app)
 
+        app, _ = self.responses()
+        app["app"]["updated_at"] = "2026-08-27T05:45:23Z"
+        with self.assertRaisesRegex(
+            verifier.PlanError, "production changed between the two observations"
+        ):
+            self.build(second_app=app)
+
+    def test_app_updated_at_is_observation_not_predecessor_lineage(self) -> None:
+        genesis_expectation, genesis_images = (
+            verifier.predecessor_provider_expectation(
+                self.contract, self.rollout, None
+            )
+        )
+        self.assertNotIn("app_updated_at_sha256", genesis_expectation)
+        self.assertIsNone(genesis_images)
+
+        predecessor = self.phase_state("baseline")
+        _, expected_images = verifier.rollout_phase(
+            self.rollout, self.contract, "baseline"
+        )
+        live_spec = verifier.build_logical_candidate(
+            self.spec, self.contract, expected_images, "legacy-git"
+        )
+        predecessor_provider = predecessor["provider_state"]
+        predecessor_provider["active_deployment_identity_sha256"] = (
+            verifier.sha256_bytes(ACTIVE_DEPLOYMENT_ID.encode("utf-8"))
+        )
+        predecessor_provider["canonical_spec_sha256"] = verifier.sha256_value(
+            live_spec
+        )
+        predecessor_provider["environment_values_sha256"] = (
+            verifier.environment_value_fingerprint(live_spec)
+        )
+        predecessor_provider["non_source_projection_sha256"] = (
+            verifier.non_source_fingerprint(live_spec, self.contract)
+        )
+        historical_timestamp_hash = predecessor_provider[
+            "app_updated_at_sha256"
+        ]
+        expected_state, phase_images_value = (
+            verifier.predecessor_provider_expectation(
+                self.contract, self.rollout, predecessor
+            )
+        )
+        self.assertNotIn("app_updated_at_sha256", expected_state)
+
+        app, deployment = self.responses()
+        app["app"]["spec"] = copy.deepcopy(live_spec)
+        app["app"]["updated_at"] = "2026-08-27T05:45:22Z"
+        deployment["deployment"] = {
+            "id": ACTIVE_DEPLOYMENT_ID,
+            "phase": "ACTIVE",
+            "spec": copy.deepcopy(live_spec),
+        }
+        observed, _ = verifier.provider_state(
+            app,
+            deployment,
+            self.contract,
+            self.target,
+            expected_state,
+            phase_images_value,
+        )
+        self.assertNotEqual(
+            observed["app_updated_at_sha256"], historical_timestamp_hash
+        )
+        self.assertTrue(observed["predecessor_match"])
+
+    def test_timestamp_hash_remains_strict_public_evidence(self) -> None:
+        for bad_hash in ("f" * 63, "g" * 64):
+            with self.subTest(bad_hash=bad_hash):
+                plan = self.build()
+                plan["provider_observation"]["app_updated_at_sha256"] = bad_hash
+                with self.assertRaises(verifier.PlanError):
+                    self.validate(plan)
+
+        for mutate in (
+            lambda state: state["provider_state"].pop(
+                "app_updated_at_sha256"
+            ),
+            lambda state: state["provider_state"].__setitem__(
+                "app_updated_at_sha256", "not-a-hash"
+            ),
+        ):
+            state = self.phase_state("baseline")
+            mutate(state)
+            normalized, _ = self.input_for_state(state)
+            with self.assertRaises(verifier.PlanError):
+                verifier.validate_phase_state(
+                    state,
+                    self.contract,
+                    self.policy,
+                    normalized,
+                    self.rollout,
+                    self.policy_hash,
+                    self.schema_hash,
+                )
+
     def test_live_mutations_fail_closed(self) -> None:
         mutations = {
+            "malformed timestamp": lambda app: app["app"].__setitem__(
+                "updated_at", "not-a-timestamp"
+            ),
             "default ingress": lambda app: app["app"].__setitem__(
                 "default_ingress", "https://unexpected.invalid"
             ),
@@ -1688,6 +1785,17 @@ class ReviewedProductionContractTests(unittest.TestCase):
     def test_reviewed_contract_is_valid_against_unpatched_constants(self) -> None:
         production_contract = verifier.load_json(CONTRACT_PATH, "contract")
         verifier.validate_contract(production_contract)
+        self.assertNotIn(
+            "app_updated_at_sha256", production_contract["bootstrap_state"]
+        )
+        self.assertEqual(
+            production_contract["bootstrap_state"]["genesis_state_sha256"],
+            "106d0bcebe6c5d1f961fb9905a9d7e8c971eb27661ccfdd3f941b1dff2bfc960",
+        )
+        self.assertEqual(
+            verifier.genesis_state_sha256(production_contract),
+            production_contract["bootstrap_state"]["genesis_state_sha256"],
+        )
 
 
 if __name__ == "__main__":

@@ -147,6 +147,19 @@ attestations. Credentials, response bodies, full specs, individual
 environment-value hashes, environment counts, and environment values remain
 excluded.
 
+The app update timestamp is volatile provider metadata, not durable rollout
+lineage. Bootstrap identity, genesis, and predecessor matching bind the stable
+app/deployment identity, canonical spec, environment fingerprint, non-source
+projection, source mode, and exact image inventory; they do not require a
+historical `app_updated_at_sha256` to remain unchanged. Each observation still
+parses and hashes the current timestamp. Both complete plan GET rounds must be
+identical, including that hash, and the signed short-lived plan binds it as an
+exact compare-and-swap witness. Apply must match the signed timestamp on its
+fresh live read and again on its immediate second pre-PUT read. Timestamp-only
+provider reconciliation therefore requires a fresh production plan, but does
+not invalidate already completed source validation, image, or rollout-capsule
+evidence while the stable lineage remains unchanged.
+
 Provider responses must never be written, logged, placed in step outputs, or
 uploaded. The token and target descriptor are step-scoped to the isolated
 GET-only controller. The attestation job receives the sanitized plan plus the
@@ -292,6 +305,18 @@ reconciliation, retains the inherited lock, creates a new signed intent and
 GET-confirmed lock proof, performs one permitted compensation PUT, and emits a
 receipt for the normal canary. It never acquires or releases the branch lock.
 
+For a v2 `no-mutation` classification only, the two exact live GET rounds must
+still be identical to each other, including `app_updated_at_sha256`, but that
+live timestamp hash may differ from the signed pre-mutation value. App identity,
+default ingress, active deployment identity, canonical spec, environment and
+non-source projections, source mode, and image inventory must remain exact.
+Both timestamp hashes remain inside the canonically hashed and attested receipt;
+this is not a relaxed mutation compare-and-swap. The exception is valid only
+with no transition, no original receipt, and exact provider-job
+`never_started=true` evidence. The resulting reconciliation is canary-ineligible,
+cannot create a phase state, and cannot authorize an orphan rollback or any
+provider mutation.
+
 `Finalize Production Orphan Lock` is a separate four-job break-glass lane. It
 accepts only one of three terminal chains: a canary-certified committed
 reconciliation, signed `no-mutation` plus exact provider-job-never-started
@@ -405,6 +430,12 @@ signed phase state, recovery proof, and permitted rollback floor. It emits a
 provisional attested rollback receipt. Then manually dispatch the same canary
 workflow with `receipt_kind=rollback`; only a successful rollback canary signs
 the new target phase state.
+
+This timestamp-metadata change does not make normal rollback or `Rollback
+Production Orphan` tolerant of timestamp drift. Those lanes continue to require
+the exact signed current provider state, including `app_updated_at_sha256`,
+before any PUT. Any future rollback-specific tolerance requires a separate
+control design and review.
 
 If apply or rollback stops while `main` remains locked, do not dispatch a new
 mutation, rerun only failed jobs, or unlock the rule. Dispatch `Reconcile

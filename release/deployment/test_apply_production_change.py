@@ -317,6 +317,106 @@ class ApplyControllerTests(unittest.TestCase):
                     apply.observe_stable(client)
                 self.assertFalse(any(request.method == "PUT" for request in opener.requests))
 
+    def test_timestamp_drift_is_allowed_only_for_predecessor_lineage(self) -> None:
+        import test_verify_production_release as release_fixtures
+
+        receipt = release_fixtures.apply_receipt()
+        receipt_hash = common.sha256_bytes(common.canonical_file_bytes(receipt))
+        state = common.build_phase_state(
+            receipt,
+            change_receipt_sha256=receipt_hash,
+            canary_sha256="9" * 64,
+            control={
+                "workflow_sha": "a" * 40,
+                "workflow_path": (
+                    ".github/workflows/verify-production-crm-canary.yml"
+                ),
+                "run_id": "401",
+                "run_attempt": 1,
+                "runner_environment": "github-hosted",
+                "release_policy_sha256": "b" * 64,
+                "change_schema_sha256": "c" * 64,
+            },
+            completed_at="2026-08-27T00:01:00Z",
+        )
+        state_hash = common.sha256_bytes(common.canonical_file_bytes(state))
+        live = copy.deepcopy(state["provider_state"])
+        live["app_updated_at_sha256"] = "9" * 64
+        apply._validate_predecessor(
+            state, state_hash, "baseline", live, state_hash
+        )
+
+        for key in (
+            "app_identity_sha256",
+            "default_ingress_sha256",
+            "active_deployment_identity_sha256",
+            "canonical_spec_sha256",
+            "environment_values_sha256",
+            "non_source_projection_sha256",
+        ):
+            with self.subTest(key=key):
+                drifted = copy.deepcopy(live)
+                drifted[key] = "0" * 64
+                with self.assertRaises(common.ReleaseError):
+                    apply._validate_predecessor(
+                        state, state_hash, "baseline", drifted, state_hash
+                    )
+
+        image_drift = copy.deepcopy(live)
+        image = image_drift["images"][0]
+        image["digest"] = digest("9")
+        image["subject"] = image["repository"] + "@" + digest("9")
+        with self.assertRaises(common.ReleaseError):
+            apply._validate_predecessor(
+                state, state_hash, "baseline", image_drift, state_hash
+            )
+
+        observation = {
+            "provider_observation": {
+                "app_identity_sha256": live["app_identity_sha256"],
+                "default_ingress_sha256": live["default_ingress_sha256"],
+                "app_updated_at_sha256": live["app_updated_at_sha256"],
+                "active_deployment_identity_sha256": live[
+                    "active_deployment_identity_sha256"
+                ],
+                "live_canonical_spec_sha256": live[
+                    "canonical_spec_sha256"
+                ],
+                "environment_values_sha256": live[
+                    "environment_values_sha256"
+                ],
+                "non_source_projection_sha256": live[
+                    "non_source_projection_sha256"
+                ],
+                "live_active_equal": True,
+                "predecessor_match": True,
+            }
+        }
+        apply._match_plan_observation(observation, live)
+        observation["provider_observation"]["app_updated_at_sha256"] = "8" * 64
+        with self.assertRaises(common.ReleaseError):
+            apply._match_plan_observation(observation, live)
+
+    def test_live_timestamp_change_between_apply_reads_fails_closed(self) -> None:
+        spec = digest_spec()
+        first_app = app_response(spec, OLD_DEPLOYMENT)
+        second_app = app_response(spec, OLD_DEPLOYMENT)
+        second_app["app"]["updated_at"] = "2026-08-27T00:01:01Z"
+        opener = QueueOpener(
+            [
+                first_app,
+                deployment_response(spec, OLD_DEPLOYMENT),
+                second_app,
+                deployment_response(spec, OLD_DEPLOYMENT),
+            ]
+        )
+        client = apply.ProductionAppClient(APP_ID, "t" * 24, opener=opener)
+        with self.assertRaisesRegex(
+            common.ReleaseError, "production changed between the two exact reads"
+        ):
+            apply.observe_stable(client)
+        self.assertEqual([request.method for request in opener.requests], ["GET"] * 4)
+
     def test_baseline_uses_non_null_genesis_authority_without_file(self) -> None:
         before = {
             "source_mode": "legacy-git",
