@@ -17,6 +17,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 FROM alpine:3.22
 
 RUN apk add --no-cache ca-certificates tzdata \
+    'libcrypto3>=3.5.8-r0' \
+    'libssl3>=3.5.8-r0' \
     && addgroup -S relay \
     && adduser -S -G relay -h /app relay
 
