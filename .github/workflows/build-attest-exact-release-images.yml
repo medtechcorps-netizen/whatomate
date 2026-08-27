@@ -839,6 +839,8 @@ jobs:
 
       - name: Build the exact AMD64 image without registry credentials
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: ./source
           file: ./control/${{ matrix.dockerfile }}
@@ -2708,6 +2710,117 @@ jobs:
             echo "::error::At least one exact release image control failed or was skipped."
             exit 1
           fi
+
+          expected_artifact_names="$(jq -cn \
+            --arg phase "$PHASE" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" '
+              (["gmail-relay", "meta-relay", "web"] as $components |
+                ["image", "scanned", "attested", "verified"] as $kinds |
+                [$components[] as $component | $kinds[] as $kind |
+                  "\($kind)-\($phase)-\($component)-\($run_id)-\($attempt)"]
+              ) + [
+                "release-set-\($phase)-\($run_id)-\($attempt)",
+                "verified-release-set-\($phase)-\($run_id)-\($attempt)"
+              ] | sort
+            ')"
+          [[ "$(jq -r 'length' <<< "$expected_artifact_names")" -eq 14 ]]
+
+          require_bounded_artifact_inventory() {
+            local artifacts_json="$1"
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --argjson expected_names "$expected_artifact_names" \
+              --argjson run_id "$GITHUB_RUN_ID" '
+                (.total_count | type) == "number" and
+                (.total_count | floor) == .total_count and
+                .total_count >= 0 and
+                .total_count <= 14 and
+                (.artifacts | type) == "array" and
+                (.artifacts | length) <= 14 and
+                .total_count == (.artifacts | length) and
+                ([.artifacts[].name] | length) == ([.artifacts[].name] | unique | length) and
+                all(.artifacts[];
+                  (.name | type) == "string" and
+                  (.name | endswith(".dockerbuild") | not) and
+                  (.name as $name | ($expected_names | index($name)) != null) and
+                  .expired == false and
+                  (.id | type) == "number" and
+                  (.id | floor) == .id and
+                  .id > 0 and
+                  (.size_in_bytes | type) == "number" and
+                  (.size_in_bytes | floor) == .size_in_bytes and
+                  .size_in_bytes > 0 and
+                  .size_in_bytes <= 67108864 and
+                  (.digest | type) == "string" and
+                  (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                  (.workflow_run | type) == "object" and
+                  .workflow_run.id == $run_id and
+                  .workflow_run.head_branch == "main" and
+                  .workflow_run.head_sha == $control_sha
+                )
+              ' <<< "$artifacts_json" > /dev/null
+          }
+
+          require_exact_artifact_inventory() {
+            local artifacts_json="$1"
+            require_bounded_artifact_inventory "$artifacts_json"
+            jq -e \
+              --argjson expected_names "$expected_artifact_names" '
+                .total_count == 14 and
+                (.artifacts | length) == 14 and
+                ([.artifacts[].name] | sort) == $expected_names
+              ' <<< "$artifacts_json" > /dev/null
+          }
+
+          canonical_artifact_inventory() {
+            local artifacts_json="$1"
+            jq -c '
+              [.artifacts[] | {
+                id,
+                name,
+                size_in_bytes,
+                digest,
+                expired,
+                workflow_run: {
+                  id: .workflow_run.id,
+                  head_branch: .workflow_run.head_branch,
+                  head_sha: .workflow_run.head_sha
+                }
+              }] | sort_by(.name)
+            ' <<< "$artifacts_json"
+          }
+
+          first_artifact_inventory=""
+          for delay_seconds in 0 1 2 4 8; do
+            if [[ "$delay_seconds" -gt 0 ]]; then
+              sleep "$delay_seconds"
+            fi
+            artifacts_json="$(gh api \
+              "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"
+            if ! require_bounded_artifact_inventory "$artifacts_json"; then
+              echo "::error::Release image artifacts contain excess, unexpected, duplicate, or malformed records."
+              exit 1
+            fi
+            artifact_count="$(jq -r '.total_count' <<< "$artifacts_json")"
+            returned_count="$(jq -r '.artifacts | length' <<< "$artifacts_json")"
+            if [[ "$artifact_count" -eq 14 && "$returned_count" -eq 14 ]]; then
+              require_exact_artifact_inventory "$artifacts_json"
+              first_artifact_inventory="$(canonical_artifact_inventory "$artifacts_json")"
+              break
+            fi
+          done
+          if [[ -z "$first_artifact_inventory" ]]; then
+            echo "::error::The exact 14-artifact inventory did not become complete in time."
+            exit 1
+          fi
+
+          sleep 2
+          final_artifacts_json="$(gh api \
+            "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"
+          require_exact_artifact_inventory "$final_artifacts_json"
+          final_artifact_inventory="$(canonical_artifact_inventory "$final_artifacts_json")"
+          [[ "$first_artifact_inventory" == "$final_artifact_inventory" ]]
 
           # Close the authority window immediately before success. A newer
           # validation attempt or main update must invalidate this run.
