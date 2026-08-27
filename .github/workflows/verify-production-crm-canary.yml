@@ -1,0 +1,805 @@
+name: Verify Production CRM Canary
+
+run-name: Verify the exact applied production phase and CRM canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_evidence_json:
+        description: Exact control SHA, allowlisted change-receipt kind, successful run/attempt, artifact ID/API digest, and receipt exact-file SHA-256
+        required: true
+        type: string
+
+# The protected observer may read only dedicated synthetic-canary secrets. It
+# has no DigitalOcean/provider token. The final signer receives no environment
+# and no synthetic/application credential.
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  CANARY_WORKFLOW_PATH: .github/workflows/verify-production-crm-canary.yml
+  RELEASE_POLICY_PATH: release/deployment/production-release-policy.json
+  CHANGE_SCHEMA_PATH: release/deployment/production-change.schema.json
+  RELEASE_VERIFIER_PATH: release/deployment/verify_production_release.py
+  CANARY_VERIFIER_PATH: release/canary/verify_production_crm_canary.py
+  PHASE_STATE_PREDICATE: https://rereply.app/attestations/production-phase-state/v1
+  PINNED_JQ_VERSION: "1.8.2"
+  PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+  PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
+
+jobs:
+  authority:
+    name: Authenticate exact change receipt authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      control_sha: ${{ steps.authority.outputs.control_sha }}
+      phase: ${{ steps.receipt.outputs.phase }}
+      receipt_kind: ${{ steps.input.outputs.receipt_kind }}
+      receipt_run_id: ${{ steps.input.outputs.receipt_run_id }}
+      receipt_run_attempt: ${{ steps.input.outputs.receipt_run_attempt }}
+      receipt_artifact_id: ${{ steps.input.outputs.receipt_artifact_id }}
+      receipt_artifact_digest: ${{ steps.input.outputs.receipt_artifact_digest }}
+      receipt_sha256: ${{ steps.input.outputs.receipt_sha256 }}
+      reconciliation_run_id: ${{ steps.input.outputs.reconciliation_run_id }}
+      reconciliation_artifact_id: ${{ steps.input.outputs.reconciliation_artifact_id }}
+      reconciliation_artifact_digest: ${{ steps.input.outputs.reconciliation_artifact_digest }}
+      reconciliation_sha256: ${{ steps.input.outputs.reconciliation_sha256 }}
+    steps:
+      - name: Require protected-main GitHub-hosted authority
+        id: authority
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$CANARY_WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" ]]
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf 'control_sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned read-only evidence tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Normalize the exact change receipt descriptor
+        id: input
+        env:
+          RELEASE_EVIDENCE_JSON: ${{ inputs.release_evidence_json }}
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+          for path in "$RELEASE_VERIFIER_PATH" "$CANARY_VERIFIER_PATH" "$RELEASE_POLICY_PATH" "$CHANGE_SCHEMA_PATH"; do
+            git -C control ls-files --error-unmatch "$path" > /dev/null
+            [[ "$(git -C control cat-file -t "HEAD:$path")" == "blob" ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+          done
+          /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" normalize-input \
+            --input-env RELEASE_EVIDENCE_JSON \
+            --expected-control-sha "$CONTROL_SHA" \
+            --output-dir "$RUNNER_TEMP/release-input"
+          descriptor="$RUNNER_TEMP/release-input/release-evidence.json"
+          {
+            printf 'receipt_kind=%s\n' "$(jq -er '.receipt_kind' "$descriptor")"
+            printf 'receipt_run_id=%s\n' "$(jq -er '.run_id' "$descriptor")"
+            printf 'receipt_run_attempt=%s\n' "$(jq -er '.run_attempt' "$descriptor")"
+            printf 'receipt_artifact_id=%s\n' "$(jq -er '.artifact_id' "$descriptor")"
+            printf 'receipt_artifact_digest=%s\n' "$(jq -er '.artifact_digest' "$descriptor")"
+            printf 'receipt_sha256=%s\n' "$(jq -er '.receipt_sha256' "$descriptor")"
+            printf 'reconciliation_run_id=%s\n' "$(jq -r '.release_reconciliation.run_id // ""' "$descriptor")"
+            printf 'reconciliation_artifact_id=%s\n' "$(jq -r '.release_reconciliation.artifact_id // ""' "$descriptor")"
+            printf 'reconciliation_artifact_digest=%s\n' "$(jq -r '.release_reconciliation.artifact_digest // ""' "$descriptor")"
+            printf 'reconciliation_sha256=%s\n' "$(jq -r '.release_reconciliation.sha256 // ""' "$descriptor")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Acquire and verify the exact successful change receipt
+        id: receipt
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          RECEIPT_ARTIFACT_DIGEST: ${{ steps.input.outputs.receipt_artifact_digest }}
+          RECEIPT_ARTIFACT_ID: ${{ steps.input.outputs.receipt_artifact_id }}
+          RECEIPT_KIND: ${{ steps.input.outputs.receipt_kind }}
+          RECEIPT_RUN_ATTEMPT: ${{ steps.input.outputs.receipt_run_attempt }}
+          RECEIPT_RUN_ID: ${{ steps.input.outputs.receipt_run_id }}
+          RECEIPT_SHA256: ${{ steps.input.outputs.receipt_sha256 }}
+          RECONCILIATION_ARTIFACT_DIGEST: ${{ steps.input.outputs.reconciliation_artifact_digest }}
+          RECONCILIATION_ARTIFACT_ID: ${{ steps.input.outputs.reconciliation_artifact_id }}
+          RECONCILIATION_RUN_ID: ${{ steps.input.outputs.reconciliation_run_id }}
+          RECONCILIATION_SHA256: ${{ steps.input.outputs.reconciliation_sha256 }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+
+          reconciled=false
+          release_job=''
+          case "$RECEIPT_KIND" in
+            apply|apply-reconciled)
+              workflow_path=".github/workflows/apply-production-phase.yml"
+              workflow_name="Apply Production Phase"
+              artifact_prefix="production-phase-apply"
+              receipt_stem="production-phase-apply-receipt"
+              predicate="https://rereply.app/attestations/production-phase-apply-receipt/v1"
+              expected_jobs='["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Authorize exact production apply main lock release","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority","Release exact production apply main lock"]'
+              expected_artifact_prefixes='["production-main-lock-apply","production-mutation-intent-apply","production-main-lock-proof-apply","unsigned-production-phase-apply","production-phase-apply","production-main-lock-release-authorization-apply"]'
+              release_job="Release exact production apply main lock"
+              [[ "$RECEIPT_KIND" == apply-reconciled ]] && reconciled=true
+              ;;
+            rollback|rollback-reconciled)
+              workflow_path=".github/workflows/rollback-production-phase.yml"
+              workflow_name="Rollback Production Phase"
+              artifact_prefix="production-phase-rollback"
+              receipt_stem="production-phase-rollback-receipt"
+              predicate="https://rereply.app/attestations/production-phase-rollback-receipt/v1"
+              expected_jobs='["Acquire exact production rollback main lock","Attest exact production rollback main lock proof","Authenticate exact production rollback authority","Authorize exact production rollback main lock release","Exact production rollback receipt gate","Prepare and attest exact production rollback mutation intent","Prepare exact production rollback pre-lock authority","Release exact production rollback main lock","Roll back exact production phase"]'
+              expected_artifact_prefixes='["production-main-lock-rollback","production-mutation-intent-rollback","production-main-lock-proof-rollback","unsigned-production-phase-rollback","production-phase-rollback","production-main-lock-release-authorization-rollback"]'
+              release_job="Release exact production rollback main lock"
+              [[ "$RECEIPT_KIND" == rollback-reconciled ]] && reconciled=true
+              ;;
+            reconciliation)
+              workflow_path=".github/workflows/reconcile-production-orphan.yml"
+              workflow_name="Reconcile Production Orphan"
+              artifact_prefix="production-orphan-reconciliation"
+              receipt_stem="production-orphan-reconciliation"
+              predicate="https://rereply.app/attestations/production-orphan-reconciliation/v1"
+              expected_jobs='["Authenticate and attest the single-operator lock assertion","Classify exact production orphan with GET-only capability","Exact production orphan reconciliation gate"]'
+              expected_artifact_prefixes='["production-main-lock-assertion","unsigned-production-orphan-reconciliation","production-orphan-reconciliation"]'
+              ;;
+            orphan-rollback)
+              workflow_path=".github/workflows/rollback-production-orphan.yml"
+              workflow_name="Rollback Production Orphan"
+              artifact_prefix="production-orphan-rollback"
+              receipt_stem="production-orphan-rollback-receipt"
+              predicate="https://rereply.app/attestations/production-orphan-rollback-receipt/v1"
+              expected_jobs='["Attest exact production orphan rollback main lock proof","Authenticate exact production orphan rollback authority","Exact production orphan rollback receipt gate","Prepare and attest exact production orphan rollback mutation intent","Roll back exact production orphan"]'
+              expected_artifact_prefixes='["production-mutation-intent-orphan-rollback","production-main-lock-proof-orphan-rollback","unsigned-production-orphan-rollback","production-orphan-rollback"]'
+              ;;
+            *) exit 1 ;;
+          esac
+          [[ "$RECEIPT_RUN_ATTEMPT" == "1" ]]
+
+          gh api "/repos/$REPOSITORY/actions/runs/$RECEIPT_RUN_ID" > "$RUNNER_TEMP/current-receipt-run.json"
+          gh api "/repos/$REPOSITORY/actions/runs/$RECEIPT_RUN_ID/attempts/$RECEIPT_RUN_ATTEMPT" \
+            > "$RUNNER_TEMP/receipt-run.json"
+          jq -e --slurp --argjson attempt "$RECEIPT_RUN_ATTEMPT" '
+            length == 2 and .[0].id == .[1].id and .[0].run_attempt == $attempt and
+            .[1].run_attempt == $attempt and .[0].head_sha == .[1].head_sha and
+            .[0].path == .[1].path and .[0].status == .[1].status and
+            .[0].conclusion == .[1].conclusion
+          ' "$RUNNER_TEMP/current-receipt-run.json" "$RUNNER_TEMP/receipt-run.json" > /dev/null
+          jq -e \
+            --arg repository "$REPOSITORY" \
+            --arg workflow "$workflow_path" \
+            --arg name "$workflow_name" \
+            --arg sha "$CONTROL_SHA" \
+            --argjson attempt "$RECEIPT_RUN_ATTEMPT" --arg reconciled "$reconciled" '
+              .repository.full_name == $repository and .path == $workflow and .name == $name and
+              .event == "workflow_dispatch" and .head_branch == "main" and .head_sha == $sha and
+              .run_attempt == $attempt and .status == "completed" and
+              (if $reconciled == "true" then (.conclusion | IN("failure","cancelled","timed_out")) else .conclusion == "success" end)
+            ' "$RUNNER_TEMP/receipt-run.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/runs/$RECEIPT_RUN_ID/attempts/$RECEIPT_RUN_ATTEMPT/jobs?per_page=100" \
+            > "$RUNNER_TEMP/receipt-jobs.json"
+          jq -e --argjson expected "$expected_jobs" --arg reconciled "$reconciled" --arg release_job "$release_job" '
+            .total_count == ($expected | length) and (.jobs | length) == ($expected | length) and
+            ([.jobs[].name] | sort) == ($expected | sort) and
+            all(.jobs[]; .status == "completed") and
+            (if $reconciled == "true" then
+              all(.jobs[]; if .name == $release_job then (.conclusion | IN("failure","cancelled","timed_out")) else .conclusion == "success" end)
+             else all(.jobs[]; .conclusion == "success") end)
+          ' "$RUNNER_TEMP/receipt-jobs.json" > /dev/null
+
+          gh api "/repos/$REPOSITORY/actions/runs/$RECEIPT_RUN_ID/artifacts?per_page=100" \
+            > "$RUNNER_TEMP/receipt-artifacts.json"
+          jq -e \
+            --argjson expected_prefixes "$expected_artifact_prefixes" \
+            --arg run_id "$RECEIPT_RUN_ID" '
+              ($expected_prefixes | map(. + "-" + $run_id + "-1") | sort) as $expected_names |
+              .total_count == ($expected_names | length) and
+              (.artifacts | length) == ($expected_names | length) and
+              ([.artifacts[].name] | sort) == $expected_names and
+              all(.artifacts[];
+                .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 524288 and
+                (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                (.workflow_run.id | tostring) == $run_id)
+            ' "$RUNNER_TEMP/receipt-artifacts.json" > /dev/null
+
+          artifact_name="$artifact_prefix-$RECEIPT_RUN_ID-$RECEIPT_RUN_ATTEMPT"
+          gh api "/repos/$REPOSITORY/actions/artifacts/$RECEIPT_ARTIFACT_ID" > "$RUNNER_TEMP/receipt-artifact.json"
+          jq -e \
+            --arg name "$artifact_name" \
+            --arg digest "$RECEIPT_ARTIFACT_DIGEST" \
+            --argjson artifact_id "$RECEIPT_ARTIFACT_ID" \
+            --argjson run_id "$RECEIPT_RUN_ID" '
+              .id == $artifact_id and .name == $name and .digest == $digest and
+              .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 524288 and
+              .workflow_run.id == $run_id
+            ' "$RUNNER_TEMP/receipt-artifact.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/artifacts/$RECEIPT_ARTIFACT_ID/zip" > "$RUNNER_TEMP/receipt.zip"
+          /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" extract-receipt \
+            --archive "$RUNNER_TEMP/receipt.zip" \
+            --descriptor "$RUNNER_TEMP/release-input/release-evidence.json" \
+            --expected-control-sha "$CONTROL_SHA" \
+            --output-dir "$RUNNER_TEMP/change-receipt"
+          pair_args=()
+          if [[ "$reconciled" == true ]]; then
+            [[ -n "$RECONCILIATION_RUN_ID" && -n "$RECONCILIATION_ARTIFACT_ID" && -n "$RECONCILIATION_ARTIFACT_DIGEST" && -n "$RECONCILIATION_SHA256" ]]
+            gh api "/repos/$REPOSITORY/actions/runs/$RECONCILIATION_RUN_ID" > "$RUNNER_TEMP/reconciliation-run.json"
+            jq -e --arg sha "$CONTROL_SHA" '.path == ".github/workflows/reconcile-production-main-lock-release.yml" and .name == "Reconcile Production Main Lock Release" and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and .run_attempt == 1 and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/reconciliation-run.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/runs/$RECONCILIATION_RUN_ID/attempts/1/jobs?per_page=100" > "$RUNNER_TEMP/reconciliation-jobs.json"
+            jq -e '.total_count == 3 and (.jobs|length) == 3 and ([.jobs[].name]|sort) == (["Authenticate and attest failed normal lock release assertion","Observe exact normal main lock release with read-only capability","Exact normal main lock release reconciliation gate"]|sort) and all(.jobs[]; .status == "completed" and .conclusion == "success")' "$RUNNER_TEMP/reconciliation-jobs.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/runs/$RECONCILIATION_RUN_ID/artifacts?per_page=100" > "$RUNNER_TEMP/reconciliation-artifacts.json"
+            jq -e --arg run_id "$RECONCILIATION_RUN_ID" '.total_count == 3 and (.artifacts|length) == 3 and ([.artifacts[].name]|sort) == (["production-main-lock-release-failure-assertion-"+$run_id+"-1","unsigned-production-main-lock-release-observations-"+$run_id+"-1","production-main-lock-release-reconciliation-"+$run_id+"-1"]|sort) and all(.artifacts[]; .expired == false and (.workflow_run.id|tostring) == $run_id)' "$RUNNER_TEMP/reconciliation-artifacts.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$RECONCILIATION_ARTIFACT_ID" > "$RUNNER_TEMP/reconciliation-artifact.json"
+            jq -e --argjson id "$RECONCILIATION_ARTIFACT_ID" --argjson run_id "$RECONCILIATION_RUN_ID" --arg name "production-main-lock-release-reconciliation-$RECONCILIATION_RUN_ID-1" --arg digest "$RECONCILIATION_ARTIFACT_DIGEST" '.id == $id and .workflow_run.id == $run_id and .name == $name and .digest == $digest and .expired == false' "$RUNNER_TEMP/reconciliation-artifact.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$RECONCILIATION_ARTIFACT_ID/zip" > "$RUNNER_TEMP/reconciliation.zip"
+            /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" extract-reconciliation --archive "$RUNNER_TEMP/reconciliation.zip" --descriptor "$RUNNER_TEMP/release-input/release-evidence.json" --expected-control-sha "$CONTROL_SHA" --output-dir "$RUNNER_TEMP/release-reconciliation"
+            [[ "$(sha256sum "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.json" | awk '{print $1}')" == "$RECONCILIATION_SHA256" ]]
+            reconciliation_flags=(--repo "$RELEASE_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/.github/workflows/reconcile-production-main-lock-release.yml" --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA" --source-ref refs/heads/main --deny-self-hosted-runners --format json)
+            gh attestation verify "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.json" "${reconciliation_flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/reconciliation-provenance.json"
+            gh attestation verify "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.json" "${reconciliation_flags[@]}" --predicate-type https://rereply.app/attestations/production-main-lock-release-reconciliation/v1 > "$RUNNER_TEMP/reconciliation-policy.json"
+            jq -e 'type == "array" and length > 0' "$RUNNER_TEMP/reconciliation-provenance.json" > /dev/null
+            jq -e --slurpfile expected "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.json" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/reconciliation-policy.json" > /dev/null
+            pair_args=(--reconciliation "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.json" --reconciliation-sha256 "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.sha256")
+          else
+            [[ -z "$RECONCILIATION_RUN_ID$RECONCILIATION_ARTIFACT_ID$RECONCILIATION_ARTIFACT_DIGEST$RECONCILIATION_SHA256" ]]
+          fi
+          phase="$(/usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" inspect-receipt --descriptor "$RUNNER_TEMP/release-input/release-evidence.json" --receipt "$RUNNER_TEMP/change-receipt/$receipt_stem.json" --receipt-sha256 "$RUNNER_TEMP/change-receipt/$receipt_stem.sha256" --control-root control --expected-control-sha "$CONTROL_SHA" "${pair_args[@]}")"
+          [[ "$phase" =~ ^(baseline|bridge|backend|ui)$ ]]
+          [[ "$(sha256sum "$RUNNER_TEMP/change-receipt/$receipt_stem.json" | awk '{print $1}')" == "$RECEIPT_SHA256" ]]
+
+          signer="$RELEASE_REPOSITORY/$workflow_path"
+          flags=(
+            --repo "$RELEASE_REPOSITORY"
+            --signer-workflow "$signer"
+            --signer-digest "$CONTROL_SHA"
+            --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main
+            --deny-self-hosted-runners
+            --format json
+          )
+          gh attestation verify "$RUNNER_TEMP/change-receipt/$receipt_stem.json" "${flags[@]}" \
+            --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/receipt-provenance.json"
+          gh attestation verify "$RUNNER_TEMP/change-receipt/$receipt_stem.json" "${flags[@]}" \
+            --predicate-type "$predicate" > "$RUNNER_TEMP/receipt-policy.json"
+          jq -e 'type == "array" and length > 0' "$RUNNER_TEMP/receipt-provenance.json" > /dev/null
+          jq -e --slurpfile expected "$RUNNER_TEMP/change-receipt/$receipt_stem.json" '
+            type == "array" and length > 0 and
+            any(.[]; .verificationResult.statement.predicate == $expected[0])
+          ' "$RUNNER_TEMP/receipt-policy.json" > /dev/null
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          printf 'phase=%s\n' "$phase" >> "$GITHUB_OUTPUT"
+
+  observe:
+    name: Run content-free production and synthetic canaries
+    needs: authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: rereply-production-canary
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
+      canary_sha256: ${{ steps.summary.outputs.canary_sha256 }}
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned read-only evidence tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Reacquire the exact receipt without provider credentials
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          RECEIPT_ARTIFACT_DIGEST: ${{ needs.authority.outputs.receipt_artifact_digest }}
+          RECEIPT_ARTIFACT_ID: ${{ needs.authority.outputs.receipt_artifact_id }}
+          RECEIPT_KIND: ${{ needs.authority.outputs.receipt_kind }}
+          RECEIPT_RUN_ATTEMPT: ${{ needs.authority.outputs.receipt_run_attempt }}
+          RECEIPT_RUN_ID: ${{ needs.authority.outputs.receipt_run_id }}
+          RELEASE_EVIDENCE_JSON: ${{ inputs.release_evidence_json }}
+          RECONCILIATION_ARTIFACT_DIGEST: ${{ needs.authority.outputs.reconciliation_artifact_digest }}
+          RECONCILIATION_ARTIFACT_ID: ${{ needs.authority.outputs.reconciliation_artifact_id }}
+          RECONCILIATION_RUN_ID: ${{ needs.authority.outputs.reconciliation_run_id }}
+          RECONCILIATION_SHA256: ${{ needs.authority.outputs.reconciliation_sha256 }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          case "$RECEIPT_KIND" in
+            apply|apply-reconciled)
+              workflow_path=".github/workflows/apply-production-phase.yml"
+              artifact_prefix="production-phase-apply"
+              receipt_stem="production-phase-apply-receipt"
+              ;;
+            rollback|rollback-reconciled)
+              workflow_path=".github/workflows/rollback-production-phase.yml"
+              artifact_prefix="production-phase-rollback"
+              receipt_stem="production-phase-rollback-receipt"
+              ;;
+            reconciliation)
+              workflow_path=".github/workflows/reconcile-production-orphan.yml"
+              artifact_prefix="production-orphan-reconciliation"
+              receipt_stem="production-orphan-reconciliation"
+              ;;
+            orphan-rollback)
+              workflow_path=".github/workflows/rollback-production-orphan.yml"
+              artifact_prefix="production-orphan-rollback"
+              receipt_stem="production-orphan-rollback-receipt"
+              ;;
+            *) exit 1 ;;
+          esac
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" normalize-input \
+            --input-env RELEASE_EVIDENCE_JSON --expected-control-sha "$CONTROL_SHA" \
+            --output-dir "$RUNNER_TEMP/release-input"
+          gh api "/repos/$REPOSITORY/actions/runs/$RECEIPT_RUN_ID" > "$RUNNER_TEMP/current-receipt-run.json"
+          gh api "/repos/$REPOSITORY/actions/runs/$RECEIPT_RUN_ID/attempts/$RECEIPT_RUN_ATTEMPT" > "$RUNNER_TEMP/receipt-run.json"
+          reconciled=false
+          [[ "$RECEIPT_KIND" == apply-reconciled || "$RECEIPT_KIND" == rollback-reconciled ]] && reconciled=true
+          jq -e --arg workflow "$workflow_path" --arg sha "$CONTROL_SHA" --argjson attempt "$RECEIPT_RUN_ATTEMPT" --arg reconciled "$reconciled" '
+            .path == $workflow and .head_sha == $sha and .head_branch == "main" and
+            .run_attempt == $attempt and .status == "completed" and
+            (if $reconciled == "true" then (.conclusion | IN("failure","cancelled","timed_out")) else .conclusion == "success" end)
+          ' "$RUNNER_TEMP/current-receipt-run.json" > /dev/null
+          jq -e --slurp --argjson attempt "$RECEIPT_RUN_ATTEMPT" '
+            length == 2 and .[0].id == .[1].id and .[0].run_attempt == $attempt and
+            .[1].run_attempt == $attempt and .[0].head_sha == .[1].head_sha and
+            .[0].path == .[1].path and .[0].status == .[1].status and
+            .[0].conclusion == .[1].conclusion
+          ' "$RUNNER_TEMP/current-receipt-run.json" "$RUNNER_TEMP/receipt-run.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/artifacts/$RECEIPT_ARTIFACT_ID" > "$RUNNER_TEMP/receipt-artifact.json"
+          jq -e \
+            --arg name "$artifact_prefix-$RECEIPT_RUN_ID-$RECEIPT_RUN_ATTEMPT" \
+            --arg digest "$RECEIPT_ARTIFACT_DIGEST" \
+            --argjson artifact_id "$RECEIPT_ARTIFACT_ID" \
+            --argjson run_id "$RECEIPT_RUN_ID" '
+              .id == $artifact_id and .name == $name and .digest == $digest and
+              .expired == false and .workflow_run.id == $run_id
+            ' "$RUNNER_TEMP/receipt-artifact.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/artifacts/$RECEIPT_ARTIFACT_ID/zip" > "$RUNNER_TEMP/receipt.zip"
+          /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" extract-receipt \
+            --archive "$RUNNER_TEMP/receipt.zip" \
+            --descriptor "$RUNNER_TEMP/release-input/release-evidence.json" \
+            --expected-control-sha "$CONTROL_SHA" \
+            --output-dir "$RUNNER_TEMP/change-receipt"
+          if [[ "$reconciled" == true ]]; then
+            gh api "/repos/$REPOSITORY/actions/runs/$RECONCILIATION_RUN_ID" > "$RUNNER_TEMP/reconciliation-run.json"
+            jq -e --arg sha "$CONTROL_SHA" '.path == ".github/workflows/reconcile-production-main-lock-release.yml" and .head_sha == $sha and .head_branch == "main" and .run_attempt == 1 and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/reconciliation-run.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$RECONCILIATION_ARTIFACT_ID" > "$RUNNER_TEMP/reconciliation-artifact.json"
+            jq -e --argjson id "$RECONCILIATION_ARTIFACT_ID" --argjson run_id "$RECONCILIATION_RUN_ID" --arg name "production-main-lock-release-reconciliation-$RECONCILIATION_RUN_ID-1" --arg digest "$RECONCILIATION_ARTIFACT_DIGEST" '.id == $id and .workflow_run.id == $run_id and .name == $name and .digest == $digest and .expired == false' "$RUNNER_TEMP/reconciliation-artifact.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$RECONCILIATION_ARTIFACT_ID/zip" > "$RUNNER_TEMP/reconciliation.zip"
+            /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" extract-reconciliation --archive "$RUNNER_TEMP/reconciliation.zip" --descriptor "$RUNNER_TEMP/release-input/release-evidence.json" --expected-control-sha "$CONTROL_SHA" --output-dir "$RUNNER_TEMP/release-reconciliation"
+            [[ "$(sha256sum "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.json" | awk '{print $1}')" == "$RECONCILIATION_SHA256" ]]
+            printf 'RECONCILIATION_DIR=%s\n' "$RUNNER_TEMP/release-reconciliation" >> "$GITHUB_ENV"
+          else
+            [[ -z "$RECONCILIATION_RUN_ID$RECONCILIATION_ARTIFACT_ID$RECONCILIATION_ARTIFACT_DIGEST$RECONCILIATION_SHA256" ]]
+          fi
+          printf 'RECEIPT_STEM=%s\n' "$receipt_stem" >> "$GITHUB_ENV"
+
+      - name: Run tokenless public and controlled synthetic CRM probes
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          CRM_CANARY_PUBLIC_TARGETS_JSON: ${{ secrets.CRM_CANARY_PUBLIC_TARGETS_JSON }}
+          CRM_CANARY_SYNTHETIC_DRIVER_JSON: ${{ needs.authority.outputs.phase == 'ui' && secrets.CRM_CANARY_SYNTHETIC_DRIVER_JSON || '' }}
+        run: |
+          set -euo pipefail
+          pair_args=()
+          if [[ -n "${RECONCILIATION_DIR:-}" ]]; then
+            pair_args=(--reconciliation "$RECONCILIATION_DIR/production-main-lock-release-reconciliation.json" --reconciliation-sha256 "$RECONCILIATION_DIR/production-main-lock-release-reconciliation.sha256")
+          fi
+          /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" probe \
+            --descriptor "$RUNNER_TEMP/release-input/release-evidence.json" \
+            --receipt "$RUNNER_TEMP/change-receipt/$RECEIPT_STEM.json" \
+            --receipt-sha256 "$RUNNER_TEMP/change-receipt/$RECEIPT_STEM.sha256" \
+            --control-root control \
+            --expected-control-sha "$CONTROL_SHA" \
+            --targets-env CRM_CANARY_PUBLIC_TARGETS_JSON \
+            --driver-env CRM_CANARY_SYNTHETIC_DRIVER_JSON \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            "${pair_args[@]}" \
+            --output-dir "$RUNNER_TEMP/crm-canary"
+
+      - name: Recheck exact main after canary observation
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+
+      - name: Export only the exact content-free canary hash
+        id: summary
+        run: |
+          set -euo pipefail
+          [[ "$(find "$RUNNER_TEMP/crm-canary" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-crm-canary.json production-crm-canary.sha256 " ]]
+          canary_sha256="$(cat "$RUNNER_TEMP/crm-canary/production-crm-canary.sha256")"
+          [[ "$canary_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(sha256sum "$RUNNER_TEMP/crm-canary/production-crm-canary.json" | awk '{print $1}')" == "$canary_sha256" ]]
+          printf 'canary_sha256=%s\n' "$canary_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the exact content-free canary evidence
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-crm-canary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/crm-canary/production-crm-canary.json
+            ${{ runner.temp }}/crm-canary/production-crm-canary.sha256
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+
+      - name: Canonicalize the canary artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+  gate:
+    name: Exact production phase gate
+    needs:
+      - authority
+      - observe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      canary_sha256: ${{ needs.observe.outputs.canary_sha256 }}
+      phase_state_sha256: ${{ steps.summary.outputs.phase_state_sha256 }}
+      phase_state_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      phase_state_artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned read-only evidence tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Normalize and reacquire the exact change receipt
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          RECEIPT_ARTIFACT_DIGEST: ${{ needs.authority.outputs.receipt_artifact_digest }}
+          RECEIPT_ARTIFACT_ID: ${{ needs.authority.outputs.receipt_artifact_id }}
+          RECEIPT_KIND: ${{ needs.authority.outputs.receipt_kind }}
+          RECEIPT_RUN_ATTEMPT: ${{ needs.authority.outputs.receipt_run_attempt }}
+          RECEIPT_RUN_ID: ${{ needs.authority.outputs.receipt_run_id }}
+          RELEASE_EVIDENCE_JSON: ${{ inputs.release_evidence_json }}
+          RECONCILIATION_ARTIFACT_DIGEST: ${{ needs.authority.outputs.reconciliation_artifact_digest }}
+          RECONCILIATION_ARTIFACT_ID: ${{ needs.authority.outputs.reconciliation_artifact_id }}
+          RECONCILIATION_RUN_ID: ${{ needs.authority.outputs.reconciliation_run_id }}
+          RECONCILIATION_SHA256: ${{ needs.authority.outputs.reconciliation_sha256 }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          case "$RECEIPT_KIND" in
+            apply|apply-reconciled)
+              workflow_path=".github/workflows/apply-production-phase.yml"
+              artifact_prefix="production-phase-apply"
+              receipt_stem="production-phase-apply-receipt"
+              ;;
+            rollback|rollback-reconciled)
+              workflow_path=".github/workflows/rollback-production-phase.yml"
+              artifact_prefix="production-phase-rollback"
+              receipt_stem="production-phase-rollback-receipt"
+              ;;
+            reconciliation)
+              workflow_path=".github/workflows/reconcile-production-orphan.yml"
+              artifact_prefix="production-orphan-reconciliation"
+              receipt_stem="production-orphan-reconciliation"
+              ;;
+            orphan-rollback)
+              workflow_path=".github/workflows/rollback-production-orphan.yml"
+              artifact_prefix="production-orphan-rollback"
+              receipt_stem="production-orphan-rollback-receipt"
+              ;;
+            *) exit 1 ;;
+          esac
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" normalize-input \
+            --input-env RELEASE_EVIDENCE_JSON --expected-control-sha "$CONTROL_SHA" \
+            --output-dir "$RUNNER_TEMP/release-input"
+          gh api "/repos/$REPOSITORY/actions/runs/$RECEIPT_RUN_ID" > "$RUNNER_TEMP/current-receipt-run.json"
+          gh api "/repos/$REPOSITORY/actions/runs/$RECEIPT_RUN_ID/attempts/$RECEIPT_RUN_ATTEMPT" > "$RUNNER_TEMP/receipt-run.json"
+          reconciled=false
+          [[ "$RECEIPT_KIND" == apply-reconciled || "$RECEIPT_KIND" == rollback-reconciled ]] && reconciled=true
+          jq -e --arg workflow "$workflow_path" --arg sha "$CONTROL_SHA" --argjson attempt "$RECEIPT_RUN_ATTEMPT" --arg reconciled "$reconciled" '
+            .path == $workflow and .head_sha == $sha and .head_branch == "main" and
+            .run_attempt == $attempt and .status == "completed" and
+            (if $reconciled == "true" then (.conclusion | IN("failure","cancelled","timed_out")) else .conclusion == "success" end)
+          ' "$RUNNER_TEMP/current-receipt-run.json" > /dev/null
+          jq -e --slurp --argjson attempt "$RECEIPT_RUN_ATTEMPT" '
+            length == 2 and .[0].id == .[1].id and .[0].run_attempt == $attempt and
+            .[1].run_attempt == $attempt and .[0].head_sha == .[1].head_sha and
+            .[0].path == .[1].path and .[0].status == .[1].status and
+            .[0].conclusion == .[1].conclusion
+          ' "$RUNNER_TEMP/current-receipt-run.json" "$RUNNER_TEMP/receipt-run.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/artifacts/$RECEIPT_ARTIFACT_ID" > "$RUNNER_TEMP/receipt-artifact.json"
+          jq -e \
+            --arg name "$artifact_prefix-$RECEIPT_RUN_ID-$RECEIPT_RUN_ATTEMPT" \
+            --arg digest "$RECEIPT_ARTIFACT_DIGEST" \
+            --argjson artifact_id "$RECEIPT_ARTIFACT_ID" \
+            --argjson run_id "$RECEIPT_RUN_ID" '
+              .id == $artifact_id and .name == $name and .digest == $digest and
+              .expired == false and .workflow_run.id == $run_id
+            ' "$RUNNER_TEMP/receipt-artifact.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/artifacts/$RECEIPT_ARTIFACT_ID/zip" > "$RUNNER_TEMP/receipt.zip"
+          /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" extract-receipt \
+            --archive "$RUNNER_TEMP/receipt.zip" \
+            --descriptor "$RUNNER_TEMP/release-input/release-evidence.json" \
+            --expected-control-sha "$CONTROL_SHA" \
+            --output-dir "$RUNNER_TEMP/change-receipt"
+          if [[ "$reconciled" == true ]]; then
+            gh api "/repos/$REPOSITORY/actions/runs/$RECONCILIATION_RUN_ID" > "$RUNNER_TEMP/reconciliation-run.json"
+            jq -e --arg sha "$CONTROL_SHA" '.path == ".github/workflows/reconcile-production-main-lock-release.yml" and .head_sha == $sha and .head_branch == "main" and .run_attempt == 1 and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/reconciliation-run.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$RECONCILIATION_ARTIFACT_ID" > "$RUNNER_TEMP/reconciliation-artifact.json"
+            jq -e --argjson id "$RECONCILIATION_ARTIFACT_ID" --argjson run_id "$RECONCILIATION_RUN_ID" --arg name "production-main-lock-release-reconciliation-$RECONCILIATION_RUN_ID-1" --arg digest "$RECONCILIATION_ARTIFACT_DIGEST" '.id == $id and .workflow_run.id == $run_id and .name == $name and .digest == $digest and .expired == false' "$RUNNER_TEMP/reconciliation-artifact.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$RECONCILIATION_ARTIFACT_ID/zip" > "$RUNNER_TEMP/reconciliation.zip"
+            /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" extract-reconciliation --archive "$RUNNER_TEMP/reconciliation.zip" --descriptor "$RUNNER_TEMP/release-input/release-evidence.json" --expected-control-sha "$CONTROL_SHA" --output-dir "$RUNNER_TEMP/release-reconciliation"
+            [[ "$(sha256sum "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.json" | awk '{print $1}')" == "$RECONCILIATION_SHA256" ]]
+            reconciliation_flags=(--repo "$RELEASE_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/.github/workflows/reconcile-production-main-lock-release.yml" --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA" --source-ref refs/heads/main --deny-self-hosted-runners --format json)
+            gh attestation verify "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.json" "${reconciliation_flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/gate-reconciliation-provenance.json"
+            gh attestation verify "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.json" "${reconciliation_flags[@]}" --predicate-type https://rereply.app/attestations/production-main-lock-release-reconciliation/v1 > "$RUNNER_TEMP/gate-reconciliation-policy.json"
+            jq -e 'type == "array" and length > 0' "$RUNNER_TEMP/gate-reconciliation-provenance.json" > /dev/null
+            jq -e --slurpfile expected "$RUNNER_TEMP/release-reconciliation/production-main-lock-release-reconciliation.json" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/gate-reconciliation-policy.json" > /dev/null
+            printf 'RECONCILIATION_DIR=%s\n' "$RUNNER_TEMP/release-reconciliation" >> "$GITHUB_ENV"
+          else
+            [[ -z "$RECONCILIATION_RUN_ID$RECONCILIATION_ARTIFACT_ID$RECONCILIATION_ARTIFACT_DIGEST$RECONCILIATION_SHA256" ]]
+          fi
+          printf 'RECEIPT_STEM=%s\n' "$receipt_stem" >> "$GITHUB_ENV"
+
+      - name: Download the exact internal canary artifact by ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.observe.outputs.artifact_id }}
+          path: ${{ runner.temp }}/crm-canary
+
+      - name: Verify canary artifact metadata and exact inventory
+        env:
+          CANARY_ARTIFACT_DIGEST: ${{ needs.observe.outputs.artifact_digest }}
+          CANARY_ARTIFACT_ID: ${{ needs.observe.outputs.artifact_id }}
+          CANARY_SHA256: ${{ needs.observe.outputs.canary_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$(find "$RUNNER_TEMP/crm-canary" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-crm-canary.json production-crm-canary.sha256 " ]]
+          [[ "$(cat "$RUNNER_TEMP/crm-canary/production-crm-canary.sha256")" == "$CANARY_SHA256" ]]
+          [[ "$(sha256sum "$RUNNER_TEMP/crm-canary/production-crm-canary.json" | awk '{print $1}')" == "$CANARY_SHA256" ]]
+          gh api "/repos/$REPOSITORY/actions/artifacts/$CANARY_ARTIFACT_ID" > "$RUNNER_TEMP/canary-artifact.json"
+          jq -e \
+            --arg name "production-crm-canary-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --arg digest "$CANARY_ARTIFACT_DIGEST" \
+            --argjson artifact_id "$CANARY_ARTIFACT_ID" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              .id == $artifact_id and .name == $name and .digest == $digest and
+              .expired == false and .workflow_run.id == $run_id
+            ' "$RUNNER_TEMP/canary-artifact.json" > /dev/null
+
+      - name: Build and independently validate the final phase state
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          pair_args=()
+          if [[ -n "${RECONCILIATION_DIR:-}" ]]; then
+            pair_args=(--reconciliation "$RECONCILIATION_DIR/production-main-lock-release-reconciliation.json" --reconciliation-sha256 "$RECONCILIATION_DIR/production-main-lock-release-reconciliation.sha256")
+          fi
+          /usr/bin/python3 -I -S -B "control/$CANARY_VERIFIER_PATH" finalize \
+            --descriptor "$RUNNER_TEMP/release-input/release-evidence.json" \
+            --receipt "$RUNNER_TEMP/change-receipt/$RECEIPT_STEM.json" \
+            --receipt-sha256 "$RUNNER_TEMP/change-receipt/$RECEIPT_STEM.sha256" \
+            --canary "$RUNNER_TEMP/crm-canary/production-crm-canary.json" \
+            --canary-sha256 "$RUNNER_TEMP/crm-canary/production-crm-canary.sha256" \
+            --control-root control \
+            --policy "control/$RELEASE_POLICY_PATH" \
+            --schema "control/$CHANGE_SCHEMA_PATH" \
+            --expected-control-sha "$CONTROL_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            "${pair_args[@]}" \
+            --output-dir "$RUNNER_TEMP/phase-state"
+
+      - name: Recheck exact main and receipt immediately before signing
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          RECEIPT_ARTIFACT_DIGEST: ${{ needs.authority.outputs.receipt_artifact_digest }}
+          RECEIPT_ARTIFACT_ID: ${{ needs.authority.outputs.receipt_artifact_id }}
+          RECEIPT_RUN_ID: ${{ needs.authority.outputs.receipt_run_id }}
+          RECONCILIATION_ARTIFACT_DIGEST: ${{ needs.authority.outputs.reconciliation_artifact_digest }}
+          RECONCILIATION_ARTIFACT_ID: ${{ needs.authority.outputs.reconciliation_artifact_id }}
+          RECONCILIATION_RUN_ID: ${{ needs.authority.outputs.reconciliation_run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          receipt_run="$(gh api "/repos/$REPOSITORY/actions/runs/$RECEIPT_RUN_ID")"
+          jq -e --argjson run_id "$RECEIPT_RUN_ID" '.id == $run_id and .run_attempt == 1 and .status == "completed"' <<< "$receipt_run" > /dev/null
+          artifact="$(gh api "/repos/$REPOSITORY/actions/artifacts/$RECEIPT_ARTIFACT_ID")"
+          jq -e --argjson id "$RECEIPT_ARTIFACT_ID" --argjson run_id "$RECEIPT_RUN_ID" --arg digest "$RECEIPT_ARTIFACT_DIGEST" '.id == $id and .workflow_run.id == $run_id and .digest == $digest and .expired == false' <<< "$artifact" > /dev/null
+          if [[ -n "$RECONCILIATION_RUN_ID" ]]; then
+            reconciliation_run="$(gh api "/repos/$REPOSITORY/actions/runs/$RECONCILIATION_RUN_ID")"
+            jq -e --argjson run_id "$RECONCILIATION_RUN_ID" --arg sha "$CONTROL_SHA" '.id == $run_id and .path == ".github/workflows/reconcile-production-main-lock-release.yml" and .head_sha == $sha and .head_branch == "main" and .run_attempt == 1 and .status == "completed" and .conclusion == "success"' <<< "$reconciliation_run" > /dev/null
+            reconciliation_artifact="$(gh api "/repos/$REPOSITORY/actions/artifacts/$RECONCILIATION_ARTIFACT_ID")"
+            jq -e --argjson id "$RECONCILIATION_ARTIFACT_ID" --argjson run_id "$RECONCILIATION_RUN_ID" --arg name "production-main-lock-release-reconciliation-$RECONCILIATION_RUN_ID-1" --arg digest "$RECONCILIATION_ARTIFACT_DIGEST" '.id == $id and .workflow_run.id == $run_id and .name == $name and .digest == $digest and .expired == false' <<< "$reconciliation_artifact" > /dev/null
+          else
+            [[ -z "$RECONCILIATION_ARTIFACT_ID$RECONCILIATION_ARTIFACT_DIGEST" ]]
+          fi
+
+      - name: Create final phase-state provenance
+        id: phase-provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/phase-state/production-phase-state.json
+          push-to-registry: false
+
+      - name: Create exact production phase-state policy attestation
+        id: phase-policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/phase-state/production-phase-state.json
+          predicate-type: ${{ env.PHASE_STATE_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/phase-state/production-phase-state.json
+          push-to-registry: false
+
+      - name: Recheck exact main after phase-state signing
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+
+      - name: Export only final content-free identities
+        id: summary
+        run: |
+          set -euo pipefail
+          [[ "$(find "$RUNNER_TEMP/phase-state" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-phase-state.json production-phase-state.sha256 " ]]
+          phase_state_sha256="$(cat "$RUNNER_TEMP/phase-state/production-phase-state.sha256")"
+          [[ "$phase_state_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(sha256sum "$RUNNER_TEMP/phase-state/production-phase-state.json" | awk '{print $1}')" == "$phase_state_sha256" ]]
+          printf 'phase_state_sha256=%s\n' "$phase_state_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact signed production phase state
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-phase-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/phase-state/production-phase-state.json
+            ${{ runner.temp }}/phase-state/production-phase-state.sha256
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 30
+
+      - name: Canonicalize the phase-state artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Publish content-free release summary
+        env:
+          CANARY_SHA256: ${{ needs.observe.outputs.canary_sha256 }}
+          PHASE: ${{ needs.authority.outputs.phase }}
+          PHASE_STATE_SHA256: ${{ steps.summary.outputs.phase_state_sha256 }}
+        run: |
+          {
+            echo '## Production CRM canary'
+            echo
+            printf -- '- Phase: `%s`\n' "$PHASE"
+            printf -- '- Canary exact-file SHA-256: `%s`\n' "$CANARY_SHA256"
+            printf -- '- Phase-state exact-file SHA-256: `%s`\n' "$PHASE_STATE_SHA256"
+            echo '- DigitalOcean/provider credential exposure: none'
+            echo '- Customer content, screenshots, traces, and response bodies: none'
+            echo '- Automatic next phase or rollback: none'
+          } >> "$GITHUB_STEP_SUMMARY"

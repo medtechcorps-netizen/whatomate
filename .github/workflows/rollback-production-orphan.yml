@@ -1,0 +1,800 @@
+name: Rollback Production Orphan
+
+run-name: Roll back one reconciled production orphan while retaining its exact main lock
+
+on:
+  workflow_dispatch:
+    inputs:
+      rollback_evidence_json:
+        description: Exact control SHA plus committed reconciliation, rollback target, recovery, and rollout authorities
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  WORKFLOW_PATH: .github/workflows/rollback-production-orphan.yml
+  RECONCILE_WORKFLOW_PATH: .github/workflows/reconcile-production-orphan.yml
+  CANARY_WORKFLOW_PATH: .github/workflows/verify-production-crm-canary.yml
+  RECOVERY_WORKFLOW_PATH: .github/workflows/verify-production-recovery-readiness.yml
+  CONTROLLER_PATH: release/deployment/rollback_production_change.py
+  COMMON_PATH: release/deployment/verify_production_release.py
+  POLICY_PATH: release/deployment/production-release-policy.json
+  SCHEMA_PATH: release/deployment/production-change.schema.json
+  INTENT_SCHEMA_PATH: release/deployment/production-mutation-intent.schema.json
+  LOCK_PROOF_SCHEMA_PATH: release/deployment/production-main-lock-proof.schema.json
+  INTENT_PREDICATE: https://rereply.app/attestations/production-mutation-intent/v2
+  LOCK_PROOF_PREDICATE: https://rereply.app/attestations/production-main-lock-proof/v1
+  RECONCILIATION_PREDICATE: https://rereply.app/attestations/production-orphan-reconciliation/v1
+  ORPHAN_ROLLBACK_PREDICATE: https://rereply.app/attestations/production-orphan-rollback-receipt/v1
+  PINNED_JQ_VERSION: "1.8.2"
+  PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+  PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
+
+jobs:
+  authority:
+    name: Authenticate exact production orphan rollback authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      control_sha: ${{ steps.guard.outputs.control_sha }}
+      current_run_id: ${{ steps.github.outputs.current_run_id }}
+      current_name: ${{ steps.github.outputs.current_name }}
+      target_run_id: ${{ steps.github.outputs.target_run_id }}
+      target_name: ${{ steps.github.outputs.target_name }}
+      recovery_run_id: ${{ steps.github.outputs.recovery_run_id }}
+      recovery_name: ${{ steps.github.outputs.recovery_name }}
+    steps:
+      - name: Require exact protected-main attempt-one orphan rollback authority
+        id: guard
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == workflow_dispatch && "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$DISPATCH_REF" == refs/heads/main && "$REF_PROTECTED" == true ]]
+          [[ "$RUN_ATTEMPT" == 1 && "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" && "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf 'control_sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact protected orphan rollback controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.guard.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Authenticate immutable orphan rollback artifacts
+        id: github
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
+          RAW: ${{ inputs.rollback_evidence_json }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const value=JSON.parse(process.env.RAW);
+            const top=['control_sha','current_state','recovery','rollout_plan_sha256','target_state'];
+            if(JSON.stringify(Object.keys(value).sort())!==JSON.stringify(top) || value.control_sha!==process.env.CONTROL_SHA || !/^[0-9a-f]{64}$/.test(value.rollout_plan_sha256)) throw new Error('orphan rollback descriptor differs');
+            if(value.current_state.kind!=='reconciliation-receipt') throw new Error('orphan rollback requires a reconciliation receipt');
+            const {owner,repo}=context.repo;
+            const main=await github.rest.git.getRef({owner,repo,ref:'heads/main'});
+            if(main.data.object.sha!==process.env.CONTROL_SHA) throw new Error('main changed');
+            async function artifact(binding,kind,workflow,name,expectedJobs,expectedArtifacts) {
+              const keys=kind==='current'?['artifact_digest','artifact_id','kind','run_attempt','run_id','sha256']:['artifact_digest','artifact_id','run_attempt','run_id','sha256'];
+              if(JSON.stringify(Object.keys(binding).sort())!==JSON.stringify(keys) || binding.run_attempt!==1 || !/^[1-9][0-9]{0,14}$/.test(String(binding.run_id)) || !/^[1-9][0-9]{0,14}$/.test(String(binding.artifact_id)) || !/^sha256:[0-9a-f]{64}$/.test(binding.artifact_digest) || !/^[0-9a-f]{64}$/.test(binding.sha256)) throw new Error(`${kind} binding differs`);
+              const latest=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(binding.run_id)});
+              const exact=await github.rest.actions.getWorkflowRunAttempt({owner,repo,run_id:Number(binding.run_id),attempt_number:1});
+              for(const run of [latest.data,exact.data]) if(run.run_attempt!==1 || run.head_sha!==process.env.CONTROL_SHA || run.head_branch!=='main' || run.event!=='workflow_dispatch' || run.path!==workflow || run.status!=='completed' || run.conclusion!=='success') throw new Error(`${kind} run differs`);
+              const jobs=await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs',{owner,repo,run_id:Number(binding.run_id),attempt_number:1,per_page:100});
+              if(JSON.stringify(jobs.map(job=>job.name).sort())!==JSON.stringify([...expectedJobs].sort()) || jobs.some(job=>job.status!=='completed' || job.conclusion!=='success')) throw new Error(`${kind} job inventory differs`);
+              const artifacts=await github.paginate(github.rest.actions.listWorkflowRunArtifacts,{owner,repo,run_id:Number(binding.run_id),per_page:100});
+              if(JSON.stringify(artifacts.map(item=>item.name).sort())!==JSON.stringify([...expectedArtifacts].sort())) throw new Error(`${kind} artifact inventory differs`);
+              const selected=artifacts.filter(item=>item.id===Number(binding.artifact_id));
+              if(selected.length!==1 || selected[0].name!==name || selected[0].digest!==binding.artifact_digest || selected[0].expired || selected[0].workflow_run.id!==Number(binding.run_id)) throw new Error(`${kind} artifact differs`);
+              return name;
+            }
+            const canaryJobs=['Authenticate exact change receipt authority','Run content-free production and synthetic canaries','Exact production phase gate'];
+            const recoveryJobs=['Authenticate exact production recovery authority','Observe exact production recovery state','Exact production recovery readiness gate'];
+            const reconciliationJobs=['Authenticate and attest the single-operator lock assertion','Classify exact production orphan with GET-only capability','Exact production orphan reconciliation gate'];
+            const currentName=await artifact(value.current_state,'current',process.env.RECONCILE_WORKFLOW_PATH,`production-orphan-reconciliation-${value.current_state.run_id}-1`,reconciliationJobs,[`production-main-lock-assertion-${value.current_state.run_id}-1`,`unsigned-production-orphan-reconciliation-${value.current_state.run_id}-1`,`production-orphan-reconciliation-${value.current_state.run_id}-1`]);
+            const targetName=await artifact(value.target_state,'target',process.env.CANARY_WORKFLOW_PATH,`production-phase-state-${value.target_state.run_id}-1`,canaryJobs,[`production-crm-canary-${value.target_state.run_id}-1`,`production-phase-state-${value.target_state.run_id}-1`]);
+            const recoveryName=await artifact(value.recovery,'recovery',process.env.RECOVERY_WORKFLOW_PATH,`production-recovery-readiness-${value.recovery.run_id}-1`,recoveryJobs,[`unsigned-production-recovery-readiness-${value.recovery.run_id}-1`,`production-recovery-readiness-${value.recovery.run_id}-1`]);
+            core.setOutput('current_run_id',String(value.current_state.run_id)); core.setOutput('current_name',currentName);
+            core.setOutput('target_run_id',String(value.target_state.run_id)); core.setOutput('target_name',targetName);
+            core.setOutput('recovery_run_id',String(value.recovery.run_id)); core.setOutput('recovery_name',recoveryName);
+
+  intent:
+    name: Prepare and attest exact production orphan rollback mutation intent
+    needs: authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      intent_name: ${{ steps.prepare.outputs.intent_name }}
+      intent_sha256: ${{ steps.prepare.outputs.intent_sha256 }}
+      intent_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      intent_artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
+    steps:
+      - name: Check out exact protected orphan rollback controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Download exact committed reconciliation authority
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.current_name }}
+          path: ${{ runner.temp }}/current
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.current_run_id }}
+
+      - name: Download exact target phase state
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.target_name }}
+          path: ${{ runner.temp }}/target-state
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.target_run_id }}
+
+      - name: Download fresh recovery readiness
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.recovery_name }}
+          path: ${{ runner.temp }}/recovery
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.recovery_run_id }}
+
+      - name: Install pinned orphan rollback intent authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+
+      - name: Authenticate exact orphan rollback inputs before signing intent
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          RAW: ${{ inputs.rollback_evidence_json }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -S -B -c '
+          import os,pathlib,sys
+          sys.path.insert(0,"control/release/deployment")
+          import verify_production_release as c, rollback_production_change as r
+          value=c.loads_strict(os.environ["RAW"])
+          if value.pop("control_sha",None)!=os.environ["CONTROL_SHA"]: c.fail("control SHA differs")
+          r.validate_request(value)
+          if value["current_state"]["kind"]!="reconciliation-receipt": c.fail("orphan rollback current kind differs")
+          pathlib.Path(os.environ["RUNNER_TEMP"]+"/rollback-evidence.json").write_bytes(c.canonical_file_bytes(value))'
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          verify_subject() {
+            local directory="$1" stem="$2" expected_sha="$3" signer_path="$4" predicate="$5" label="$6"
+            local subject="$directory/$stem.json" sidecar="$directory/$stem.sha256"
+            [[ "$(find "$directory" -maxdepth 1 -type f -printf '%f\n' | sort)" == "$stem.json"$'\n'"$stem.sha256" ]]
+            [[ -z "$(find "$directory" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+            [[ "$(cat "$sidecar")" == "$expected_sha" && "$(sha256sum "$subject" | awk '{print $1}')" == "$expected_sha" ]]
+            flags=(--repo "$RELEASE_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/$signer_path" --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA" --source-ref refs/heads/main --deny-self-hosted-runners --format json)
+            "$gh_bin" attestation verify "$subject" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/$label-provenance.json"
+            "$gh_bin" attestation verify "$subject" "${flags[@]}" --predicate-type "$predicate" > "$RUNNER_TEMP/$label-policy.json"
+            "$jq_bin" -e --slurpfile expected "$subject" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/$label-policy.json" > /dev/null
+          }
+          verify_subject "$RUNNER_TEMP/current" production-orphan-reconciliation "$("$jq_bin" -er '.current_state.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECONCILE_WORKFLOW_PATH" "$RECONCILIATION_PREDICATE" current
+          verify_subject "$RUNNER_TEMP/target-state" production-phase-state "$("$jq_bin" -er '.target_state.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$CANARY_WORKFLOW_PATH" https://rereply.app/attestations/production-phase-state/v1 target
+          verify_subject "$RUNNER_TEMP/recovery" production-recovery-readiness "$("$jq_bin" -er '.recovery.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECOVERY_WORKFLOW_PATH" https://rereply.app/attestations/production-recovery-readiness/v1 recovery
+
+      - name: Prepare exact sanitized orphan rollback mutation intent without credentials
+        id: prepare
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 && "$GITHUB_SHA" == "$CONTROL_SHA" ]]
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import copy,os,pathlib,sys
+          sys.path.insert(0,'control/release/deployment')
+          import verify_production_release as common
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          current=common.validate_reconciliation_receipt(common.load_json(root/'current'/'production-orphan-reconciliation.json','reconciliation receipt'))
+          lock=copy.deepcopy(current['intent']['lock'])
+          if lock['strategy']=='acquire':
+              lock['strategy']='inherit'
+              lock['expected_pre_lock']['lock_branch']=True
+              lock['owner_intent_sha256']=current['intent']['binding']['sha256']
+          elif lock['strategy']!='inherit':
+              common.fail('reconciliation lock strategy differs')
+          (root/'lock-authority.json').write_bytes(common.canonical_file_bytes(lock))
+          (root/'route-contract.sha256').write_text(current['canary']['route_contract_sha256']+'\n',encoding='ascii')
+          PY
+          controller_sha="$(sha256sum "control/$CONTROLLER_PATH" | awk '{print $1}')"
+          policy_sha="$(sha256sum "control/$POLICY_PATH" | awk '{print $1}')"
+          schema_sha="$(sha256sum "control/$SCHEMA_PATH" | awk '{print $1}')"
+          intent_schema_sha="$(sha256sum "control/$INTENT_SCHEMA_PATH" | awk '{print $1}')"
+          /usr/bin/python3 -I -S -B "control/$CONTROLLER_PATH" prepare-intent \
+            --evidence-request "$RUNNER_TEMP/rollback-evidence.json" \
+            --current-state "$RUNNER_TEMP/current/production-orphan-reconciliation.json" \
+            --target-state "$RUNNER_TEMP/target-state/production-phase-state.json" \
+            --recovery "$RUNNER_TEMP/recovery/production-recovery-readiness.json" \
+            --release-policy-sha256 "$policy_sha" --change-schema-sha256 "$schema_sha" \
+            --mutation-intent-schema-sha256 "$intent_schema_sha" --controller-sha256 "$controller_sha" \
+            --workflow-path "$WORKFLOW_PATH" --workflow-sha "$CONTROL_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt 1 --runner-temp "$RUNNER_TEMP" \
+            --output "$RUNNER_TEMP/production-mutation-intent.json" --lock-authority "$RUNNER_TEMP/lock-authority.json" \
+            --route-contract-sha256 "$(cat "$RUNNER_TEMP/route-contract.sha256")"
+          intent_sha="$(sha256sum "$RUNNER_TEMP/production-mutation-intent.json" | awk '{print $1}')"
+          printf '%s\n' "$intent_sha" > "$RUNNER_TEMP/production-mutation-intent.sha256"
+          printf 'intent_name=production-mutation-intent-orphan-rollback-%s-1\n' "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          printf 'intent_sha256=%s\n' "$intent_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Attest production orphan rollback mutation intent provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-mutation-intent.json
+
+      - name: Attest exact production orphan rollback mutation intent policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-mutation-intent.json
+          predicate-type: ${{ env.INTENT_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/production-mutation-intent.json
+
+      - name: Upload exact production orphan rollback mutation intent
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.prepare.outputs.intent_name }}
+          path: |
+            ${{ runner.temp }}/production-mutation-intent.json
+            ${{ runner.temp }}/production-mutation-intent.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Canonicalize orphan rollback mutation-intent artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+  lock_proof:
+    name: Attest exact production orphan rollback main lock proof
+    needs: [authority, intent]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: rereply-production-apply
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      proof_name: ${{ steps.prepare.outputs.proof_name }}
+      proof_sha256: ${{ steps.prepare.outputs.proof_sha256 }}
+      proof_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      proof_artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
+      rule_id: ${{ steps.prepare.outputs.rule_id }}
+    steps:
+      - name: Check out exact protected orphan rollback controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned orphan rollback lock-proof authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+
+      - name: Download exact signed orphan rollback mutation intent
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
+          path: ${{ runner.temp }}/mutation-intent
+
+      - name: Recheck inherited lock and build exact orphan rollback proof
+        id: prepare
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          GITHUB_READ_TOKEN: ${{ github.token }}
+          INTENT_ARTIFACT_DIGEST: ${{ needs.intent.outputs.intent_artifact_digest }}
+          INTENT_ARTIFACT_ID: ${{ needs.intent.outputs.intent_artifact_id }}
+          INTENT_ARTIFACT_NAME: ${{ needs.intent.outputs.intent_name }}
+          INTENT_SHA256: ${{ needs.intent.outputs.intent_sha256 }}
+        run: |
+          set -euo pipefail
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          github_read_token="$GITHUB_READ_TOKEN"
+          unset GH_PRODUCTION_BRANCH_READ_TOKEN GITHUB_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$branch_read_token" && -n "$github_read_token" ]]
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          intent="$RUNNER_TEMP/mutation-intent/production-mutation-intent.json"
+          [[ "$(find "$RUNNER_TEMP/mutation-intent" -maxdepth 1 -type f -printf '%f\n' | sort)" == $'production-mutation-intent.json\nproduction-mutation-intent.sha256' ]]
+          [[ -z "$(find "$RUNNER_TEMP/mutation-intent" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(cat "$RUNNER_TEMP/mutation-intent/production-mutation-intent.sha256")" == "$INTENT_SHA256" && "$(sha256sum "$intent" | awk '{print $1}')" == "$INTENT_SHA256" ]]
+          artifact="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$INTENT_ARTIFACT_ID")"
+          "$jq_bin" -e --arg name "$INTENT_ARTIFACT_NAME" --arg digest "$INTENT_ARTIFACT_DIGEST" --argjson run_id "$GITHUB_RUN_ID" '.name == $name and .digest == $digest and .expired == false and .workflow_run.id == $run_id' <<< "$artifact" > /dev/null
+          flags=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/$WORKFLOW_PATH" --signer-digest "$CONTROL_SHA" --source-ref refs/heads/main --source-digest "$CONTROL_SHA" --deny-self-hosted-runners --format json)
+          GH_TOKEN="$github_read_token" "$gh_bin" attestation verify "$intent" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/proof-intent-provenance.json"
+          GH_TOKEN="$github_read_token" "$gh_bin" attestation verify "$intent" "${flags[@]}" --predicate-type "$INTENT_PREDICATE" > "$RUNNER_TEMP/proof-intent-policy.json"
+          "$jq_bin" -e --slurpfile expected "$intent" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/proof-intent-policy.json" > /dev/null
+          [[ "$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          current="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"
+          "$jq_bin" -e --arg sha "$CONTROL_SHA" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and (.status == "in_progress" or .status == "queued")' <<< "$current" > /dev/null
+          jobs="$(GH_TOKEN="$github_read_token" "$gh_bin" api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1/jobs?per_page=100")"
+          "$jq_bin" -e 'any(.jobs[]; .name == "Prepare and attest exact production orphan rollback mutation intent" and .status == "completed" and .conclusion == "success")' <<< "$jobs" > /dev/null
+          rule_id="$("$jq_bin" -er '.lock.rule_id' "$intent")"
+          rule_identity_sha256="$("$jq_bin" -er '.lock.rule_identity_sha256' "$intent")"
+          repository_owner="${GITHUB_REPOSITORY%%/*}"
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}} ref(qualifiedName:"refs/heads/main"){target{oid}}}}'
+          locked="$(GH_TOKEN="$branch_read_token" "$gh_bin" api graphql -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$rule_id" --arg sha "$CONTROL_SHA" '.data.repository.ref.target.oid == $sha and .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == true and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$locked" > /dev/null
+          INTENT_ARTIFACT_DIGEST="$INTENT_ARTIFACT_DIGEST" INTENT_ARTIFACT_ID="$INTENT_ARTIFACT_ID" INTENT_ARTIFACT_NAME="$INTENT_ARTIFACT_NAME" INTENT_SHA256="$INTENT_SHA256" RULE_ID="$rule_id" RULE_IDENTITY_SHA256="$rule_identity_sha256" /usr/bin/python3 -I -S -B - <<'PY'
+          import os,pathlib,sys
+          sys.path.insert(0,'control/release/deployment')
+          import verify_production_release as common
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          request={'operation':'orphan-rollback','main_sha':os.environ['CONTROL_SHA'],'rule_id':os.environ['RULE_ID'],'rule_identity_sha256':os.environ['RULE_IDENTITY_SHA256'],'pre_lock':{'lock_branch':True,'is_admin_enforced':True,'lock_allows_fetch_and_merge':False},'post_lock':{'lock_branch':True,'is_admin_enforced':True,'lock_allows_fetch_and_merge':False},'http_methods_used':['POST'],'graphql_operations_used':['query'],'mutation_request_count':0,'outcome':'already-locked-inherited','read_confirmed':True}
+          authority={'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':1,'artifact_id':os.environ['INTENT_ARTIFACT_ID'],'artifact_name':os.environ['INTENT_ARTIFACT_NAME'],'artifact_digest':os.environ['INTENT_ARTIFACT_DIGEST'],'sha256':os.environ['INTENT_SHA256']}
+          (root/'main-lock-proof-request.json').write_bytes(common.canonical_file_bytes(request))
+          (root/'mutation-intent-authority.json').write_bytes(common.canonical_file_bytes(authority))
+          PY
+          /usr/bin/python3 -I -S -B "control/$COMMON_PATH" build-main-lock-proof \
+            --request "$RUNNER_TEMP/main-lock-proof-request.json" \
+            --mutation-intent "$intent" --mutation-intent-authority "$RUNNER_TEMP/mutation-intent-authority.json" \
+            --workflow-path "$WORKFLOW_PATH" --workflow-sha "$CONTROL_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt 1 --runner-temp "$RUNNER_TEMP" \
+            --output "$RUNNER_TEMP/production-main-lock-proof.json"
+          proof_sha="$(sha256sum "$RUNNER_TEMP/production-main-lock-proof.json" | awk '{print $1}')"
+          printf '%s\n' "$proof_sha" > "$RUNNER_TEMP/production-main-lock-proof.sha256"
+          printf 'proof_name=production-main-lock-proof-orphan-rollback-%s-1\n' "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          printf 'proof_sha256=%s\n' "$proof_sha" >> "$GITHUB_OUTPUT"
+          printf 'rule_id=%s\n' "$rule_id" >> "$GITHUB_OUTPUT"
+          branch_read_token= github_read_token=
+
+      - name: Attest production orphan rollback main lock proof provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-main-lock-proof.json
+
+      - name: Attest exact production orphan rollback main lock proof policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/production-main-lock-proof.json
+          predicate-type: ${{ env.LOCK_PROOF_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/production-main-lock-proof.json
+
+      - name: Upload exact production orphan rollback main lock proof
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.prepare.outputs.proof_name }}
+          path: |
+            ${{ runner.temp }}/production-main-lock-proof.json
+            ${{ runner.temp }}/production-main-lock-proof.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Canonicalize orphan rollback main-lock-proof artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+  rollback:
+    name: Roll back exact production orphan
+    needs: [authority, intent, lock_proof]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment: rereply-production-apply
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      internal_name: ${{ steps.name.outputs.internal_name }}
+    steps:
+      - name: Check out exact protected orphan rollback controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Download exact committed reconciliation authority
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.current_name }}
+          path: ${{ runner.temp }}/current
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.current_run_id }}
+
+      - name: Download exact target phase state
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.target_name }}
+          path: ${{ runner.temp }}/target-state
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.target_run_id }}
+
+      - name: Download fresh recovery readiness
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.authority.outputs.recovery_name }}
+          path: ${{ runner.temp }}/recovery
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.recovery_run_id }}
+
+      - name: Download exact signed orphan rollback mutation intent
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
+          path: ${{ runner.temp }}/mutation-intent
+
+      - name: Download exact signed orphan rollback main lock proof
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.lock_proof.outputs.proof_artifact_id }}
+          path: ${{ runner.temp }}/main-lock-proof
+
+      - name: Install pinned orphan rollback authority tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+
+      - name: Authenticate exact orphan rollback artifacts and attestations
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          RAW: ${{ inputs.rollback_evidence_json }}
+          INTENT_SHA256: ${{ needs.intent.outputs.intent_sha256 }}
+          PROOF_SHA256: ${{ needs.lock_proof.outputs.proof_sha256 }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -S -B -c '
+          import os,pathlib,sys
+          sys.path.insert(0,"control/release/deployment")
+          import verify_production_release as c, rollback_production_change as r
+          value=c.loads_strict(os.environ["RAW"])
+          if value.pop("control_sha",None)!=os.environ["CONTROL_SHA"]: c.fail("control SHA differs")
+          r.validate_request(value)
+          if value["current_state"]["kind"]!="reconciliation-receipt": c.fail("orphan rollback current kind differs")
+          pathlib.Path(os.environ["RUNNER_TEMP"]+"/rollback-evidence.json").write_bytes(c.canonical_file_bytes(value))'
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          verify_subject() {
+            local directory="$1" stem="$2" expected_sha="$3" signer_path="$4" predicate="$5" label="$6"
+            local subject="$directory/$stem.json" sidecar="$directory/$stem.sha256"
+            [[ "$(find "$directory" -maxdepth 1 -type f -printf '%f\n' | sort)" == "$stem.json"$'\n'"$stem.sha256" ]]
+            [[ -z "$(find "$directory" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+            [[ "$(cat "$sidecar")" == "$expected_sha" && "$(sha256sum "$subject" | awk '{print $1}')" == "$expected_sha" ]]
+            flags=(--repo "$RELEASE_REPOSITORY" --signer-workflow "$RELEASE_REPOSITORY/$signer_path" --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA" --source-ref refs/heads/main --deny-self-hosted-runners --format json)
+            "$gh_bin" attestation verify "$subject" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/$label-provenance.json"
+            "$gh_bin" attestation verify "$subject" "${flags[@]}" --predicate-type "$predicate" > "$RUNNER_TEMP/$label-policy.json"
+            "$jq_bin" -e --slurpfile expected "$subject" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/$label-policy.json" > /dev/null
+          }
+          verify_subject "$RUNNER_TEMP/current" production-orphan-reconciliation "$("$jq_bin" -er '.current_state.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECONCILE_WORKFLOW_PATH" "$RECONCILIATION_PREDICATE" current
+          verify_subject "$RUNNER_TEMP/target-state" production-phase-state "$("$jq_bin" -er '.target_state.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$CANARY_WORKFLOW_PATH" https://rereply.app/attestations/production-phase-state/v1 target
+          verify_subject "$RUNNER_TEMP/recovery" production-recovery-readiness "$("$jq_bin" -er '.recovery.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECOVERY_WORKFLOW_PATH" https://rereply.app/attestations/production-recovery-readiness/v1 recovery
+          verify_subject "$RUNNER_TEMP/mutation-intent" production-mutation-intent "$INTENT_SHA256" "$WORKFLOW_PATH" "$INTENT_PREDICATE" intent
+          verify_subject "$RUNNER_TEMP/main-lock-proof" production-main-lock-proof "$PROOF_SHA256" "$WORKFLOW_PATH" "$LOCK_PROOF_PREDICATE" proof
+
+      - name: Re-pull exact orphan rollback image digests anonymously
+        run: |
+          set -euo pipefail
+          anonymous_root="$(mktemp -d "$RUNNER_TEMP/orphan-rollback-anonymous.XXXXXX")"
+          anonymous_home="$anonymous_root/home"
+          anonymous_config="$anonymous_root/docker"
+          mkdir -m 0700 "$anonymous_home" "$anonymous_config"
+          /usr/bin/python3 -I -S -B - <<'PY' > "$anonymous_root/subjects.txt"
+          import json,pathlib,re
+          value=json.loads((pathlib.Path(__import__('os').environ['RUNNER_TEMP'])/'target-state'/'production-phase-state.json').read_text(encoding='utf-8'))
+          images=value.get('provider_state',{}).get('images')
+          expected=['gmail-relay','meta-relay','web']
+          if not isinstance(images,list) or sorted(item.get('component') for item in images if isinstance(item,dict))!=expected:
+              raise SystemExit('orphan rollback target image tuple differs')
+          subjects=[]
+          for item in sorted(images,key=lambda record:record['component']):
+              component=item['component']; repository=f'ghcr.io/medtechcorps-netizen/rereply-release-{component}'
+              digest=item.get('digest'); subject=item.get('subject')
+              if set(item)!={'component','repository','digest','subject'} or item.get('repository')!=repository:
+                  raise SystemExit('orphan rollback target image record differs')
+              if not isinstance(digest,str) or re.fullmatch(r'sha256:[0-9a-f]{64}',digest) is None or subject!=f'{repository}@{digest}':
+                  raise SystemExit('orphan rollback image subject differs')
+              subjects.append(subject)
+          if len(set(subjects))!=3: raise SystemExit('orphan rollback image subjects are not unique')
+          print(*subjects,sep='\n')
+          PY
+          mapfile -t target_images < "$anonymous_root/subjects.txt"
+          [[ "${#target_images[@]}" -eq 3 ]]
+          for image in "${target_images[@]}"; do
+            [[ "$image" =~ ^ghcr\.io/medtechcorps-netizen/rereply-release-(web|meta-relay|gmail-relay)@sha256:[0-9a-f]{64}$ ]]
+            env -i DOCKER_CONFIG="$anonymous_config" HOME="$anonymous_home" LANG=C.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/docker pull --platform linux/amd64 "$image"
+          done
+          if [[ -f "$anonymous_config/config.json" ]]; then
+            "$RUNNER_TEMP/release-tools/jq" -e '((.auths // {}) | length) == 0 and ((.credHelpers // {}) | length) == 0 and ((.credsStore // "") == "")' "$anonymous_config/config.json" > /dev/null
+          fi
+
+      - name: Roll back with one inherited-lock app-update capability
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          CURRENT_RUN_ID: ${{ needs.authority.outputs.current_run_id }}
+          TARGET_RUN_ID: ${{ needs.authority.outputs.target_run_id }}
+          RECOVERY_RUN_ID: ${{ needs.authority.outputs.recovery_run_id }}
+          DO_PRODUCTION_APPLY_TOKEN: ${{ secrets.DO_PRODUCTION_APPLY_TOKEN }}
+          DO_PRODUCTION_TARGET_JSON: ${{ secrets.DO_PRODUCTION_TARGET_JSON }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          GITHUB_READ_TOKEN: ${{ github.token }}
+          INTENT_ARTIFACT_ID: ${{ needs.intent.outputs.intent_artifact_id }}
+          INTENT_ARTIFACT_DIGEST: ${{ needs.intent.outputs.intent_artifact_digest }}
+          INTENT_ARTIFACT_NAME: ${{ needs.intent.outputs.intent_name }}
+          INTENT_SHA256: ${{ needs.intent.outputs.intent_sha256 }}
+          PROOF_ARTIFACT_ID: ${{ needs.lock_proof.outputs.proof_artifact_id }}
+          PROOF_ARTIFACT_DIGEST: ${{ needs.lock_proof.outputs.proof_artifact_digest }}
+          PROOF_ARTIFACT_NAME: ${{ needs.lock_proof.outputs.proof_name }}
+          RULE_ID: ${{ needs.lock_proof.outputs.rule_id }}
+          PROOF_SHA256: ${{ needs.lock_proof.outputs.proof_sha256 }}
+        run: |
+          set -euo pipefail
+          provider_token="$DO_PRODUCTION_APPLY_TOKEN"
+          target_json="$DO_PRODUCTION_TARGET_JSON"
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          github_read_token="$GITHUB_READ_TOKEN"
+          unset DO_PRODUCTION_APPLY_TOKEN DO_PRODUCTION_TARGET_JSON GH_PRODUCTION_BRANCH_READ_TOKEN GITHUB_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$provider_token" && -n "$target_json" && -n "$branch_read_token" && -n "$github_read_token" ]]
+          cleanup_secrets() { provider_token= target_json= branch_read_token= github_read_token=; }
+          trap cleanup_secrets EXIT
+          gh_bin="$RUNNER_TEMP/release-tools/gh"
+          jq_bin="$RUNNER_TEMP/release-tools/jq"
+          read_api() { GH_TOKEN="$github_read_token" "$gh_bin" api "$@"; }
+          [[ "$(read_api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          current_run="$(read_api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"
+          "$jq_bin" -e --arg sha "$CONTROL_SHA" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and (.status == "in_progress" or .status == "queued")' <<< "$current_run" > /dev/null
+          jobs="$(read_api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1/jobs?per_page=100")"
+          "$jq_bin" -e 'any(.jobs[]; .name == "Attest exact production orphan rollback main lock proof" and .status == "completed" and .conclusion == "success")' <<< "$jobs" > /dev/null
+          for run_id in "$CURRENT_RUN_ID" "$TARGET_RUN_ID" "$RECOVERY_RUN_ID"; do
+            for endpoint in "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id" "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id/attempts/1"; do
+              value="$(read_api "$endpoint")"
+              "$jq_bin" -e --arg sha "$CONTROL_SHA" '.run_attempt == 1 and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and .status == "completed" and .conclusion == "success"' <<< "$value" > /dev/null
+            done
+          done
+          for descriptor in "$INTENT_ARTIFACT_ID|$INTENT_ARTIFACT_NAME|$INTENT_ARTIFACT_DIGEST" "$PROOF_ARTIFACT_ID|$PROOF_ARTIFACT_NAME|$PROOF_ARTIFACT_DIGEST"; do
+            IFS='|' read -r artifact_id artifact_name artifact_digest <<< "$descriptor"
+            artifact="$(read_api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id")"
+            "$jq_bin" -e --arg name "$artifact_name" --arg digest "$artifact_digest" --argjson run_id "$GITHUB_RUN_ID" '.name == $name and .digest == $digest and .expired == false and .workflow_run.id == $run_id' <<< "$artifact" > /dev/null
+          done
+          rule_id="$("$jq_bin" -er '.lock.rule_id' "$RUNNER_TEMP/mutation-intent/production-mutation-intent.json")"
+          repository_owner="${GITHUB_REPOSITORY%%/*}"
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}} ref(qualifiedName:"refs/heads/main"){target{oid}}}}'
+          locked="$(GH_TOKEN="$branch_read_token" "$gh_bin" api graphql -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$rule_id" --arg sha "$CONTROL_SHA" '.data.repository.ref.target.oid == $sha and .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == true and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$locked" > /dev/null
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import datetime as dt,os,pathlib,sys
+          sys.path.insert(0,'control/release/deployment')
+          import verify_production_release as common
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          recovery=common.load_json(root/'recovery'/'production-recovery-readiness.json','recovery readiness')
+          common.validate_fresh_window(recovery.get('issued_at'),recovery.get('expires_at'),dt.datetime.now(dt.timezone.utc),maximum_age_seconds=common.MAX_RECOVERY_AGE_SECONDS,label='recovery readiness immediately before orphan rollback')
+          intent_path=root/'mutation-intent'/'production-mutation-intent.json'; proof_path=root/'main-lock-proof'/'production-main-lock-proof.json'
+          if common.sha256_bytes(intent_path.read_bytes())!=common.require_sha256(os.environ['INTENT_SHA256'],'orphan rollback intent hash'): common.fail('orphan rollback intent exact-file hash differs')
+          if common.sha256_bytes(proof_path.read_bytes())!=common.require_sha256(os.environ['PROOF_SHA256'],'orphan rollback proof hash'): common.fail('orphan rollback proof exact-file hash differs')
+          intent=common.validate_mutation_intent(common.load_json(intent_path,'mutation intent'),now=dt.datetime.now(dt.timezone.utc))
+          proof=common.validate_main_lock_proof(common.load_json(proof_path,'main lock proof'),mutation_intent=intent,now=dt.datetime.now(dt.timezone.utc))
+          intent_authority={'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':1,'artifact_id':os.environ['INTENT_ARTIFACT_ID'],'artifact_name':os.environ['INTENT_ARTIFACT_NAME'],'artifact_digest':os.environ['INTENT_ARTIFACT_DIGEST'],'sha256':os.environ['INTENT_SHA256']}
+          proof_authority={'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':1,'artifact_id':os.environ['PROOF_ARTIFACT_ID'],'artifact_name':os.environ['PROOF_ARTIFACT_NAME'],'artifact_digest':os.environ['PROOF_ARTIFACT_DIGEST'],'sha256':os.environ['PROOF_SHA256']}
+          if proof['mutation_intent']!=intent_authority: common.fail('orphan rollback proof intent authority differs')
+          (root/'mutation-intent-authority.json').write_bytes(common.canonical_file_bytes(intent_authority))
+          (root/'main-lock-proof-authority.json').write_bytes(common.canonical_file_bytes(proof_authority))
+          PY
+          export DO_PRODUCTION_APPLY_TOKEN="$provider_token"
+          export DO_PRODUCTION_TARGET_JSON="$target_json"
+          /usr/bin/python3 -I -S -B -c '
+          import hashlib,os,pathlib,sys
+          target=os.environ.pop("DO_PRODUCTION_TARGET_JSON")
+          sys.path.insert(0,"control/release/deployment")
+          import rollback_production_change as controller
+          root=pathlib.Path(os.environ["RUNNER_TEMP"])
+          arguments=["execute","--target",target,"--evidence-request",str(root/"rollback-evidence.json"),"--current-state",str(root/"current"/"production-orphan-reconciliation.json"),"--target-state",str(root/"target-state"/"production-phase-state.json"),"--recovery",str(root/"recovery"/"production-recovery-readiness.json"),"--release-policy-sha256",hashlib.sha256(pathlib.Path("control/release/deployment/production-release-policy.json").read_bytes()).hexdigest(),"--change-schema-sha256",hashlib.sha256(pathlib.Path("control/release/deployment/production-change.schema.json").read_bytes()).hexdigest(),"--mutation-intent-schema-sha256",hashlib.sha256(pathlib.Path("control/release/deployment/production-mutation-intent.schema.json").read_bytes()).hexdigest(),"--controller-sha256",hashlib.sha256(pathlib.Path("control/release/deployment/rollback_production_change.py").read_bytes()).hexdigest(),"--workflow-path",os.environ["WORKFLOW_PATH"],"--workflow-sha",os.environ["CONTROL_SHA"],"--workflow-run-id",os.environ["GITHUB_RUN_ID"],"--workflow-run-attempt","1","--runner-temp",str(root),"--output",str(root/"production-orphan-rollback-receipt.json"),"--mutation-intent",str(root/"mutation-intent"/"production-mutation-intent.json"),"--mutation-intent-authority",str(root/"mutation-intent-authority.json"),"--main-lock-proof",str(root/"main-lock-proof"/"production-main-lock-proof.json"),"--main-lock-proof-authority",str(root/"main-lock-proof-authority.json")]
+          raise SystemExit(controller.run_cli(arguments))'
+          unset DO_PRODUCTION_APPLY_TOKEN DO_PRODUCTION_TARGET_JSON
+          provider_token= target_json=
+          [[ "$(read_api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          post_lock="$(GH_TOKEN="$branch_read_token" "$gh_bin" api graphql -f "query=$query" -F "owner=$repository_owner" -F "name=$repository_name")"
+          "$jq_bin" -e --arg id "$rule_id" --arg sha "$CONTROL_SHA" '.data.repository.ref.target.oid == $sha and .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] | .id == $id and .lockBranch == true and .isAdminEnforced == true and .lockAllowsFetchAndMerge == false)' <<< "$post_lock" > /dev/null
+          cleanup_secrets
+          trap - EXIT
+
+      - name: Create exact sanitized orphan rollback sidecar
+        id: name
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          sha256sum production-orphan-rollback-receipt.json | awk '{print $1}' > production-orphan-rollback-receipt.sha256
+          printf 'internal_name=unsigned-production-orphan-rollback-%s-1\n' "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned orphan rollback receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.name.outputs.internal_name }}
+          path: |
+            ${{ runner.temp }}/production-orphan-rollback-receipt.json
+            ${{ runner.temp }}/production-orphan-rollback-receipt.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  gate:
+    name: Exact production orphan rollback receipt gate
+    needs: [authority, intent, lock_proof, rollback]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: rereply-production-apply
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out exact protected orphan rollback controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Download unsigned exact orphan rollback receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.rollback.outputs.internal_name }}
+          path: ${{ runner.temp }}/receipt
+
+      - name: Recheck exact protected main and inherited lock before attestation
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          CURRENT_RUN_ID: ${{ needs.authority.outputs.current_run_id }}
+          TARGET_RUN_ID: ${{ needs.authority.outputs.target_run_id }}
+          RECOVERY_RUN_ID: ${{ needs.authority.outputs.recovery_run_id }}
+          INTENT_ARTIFACT_ID: ${{ needs.intent.outputs.intent_artifact_id }}
+          INTENT_ARTIFACT_DIGEST: ${{ needs.intent.outputs.intent_artifact_digest }}
+          INTENT_ARTIFACT_NAME: ${{ needs.intent.outputs.intent_name }}
+          PROOF_ARTIFACT_ID: ${{ needs.lock_proof.outputs.proof_artifact_id }}
+          PROOF_ARTIFACT_DIGEST: ${{ needs.lock_proof.outputs.proof_artifact_digest }}
+          PROOF_ARTIFACT_NAME: ${{ needs.lock_proof.outputs.proof_name }}
+          RULE_ID: ${{ needs.lock_proof.outputs.rule_id }}
+        with:
+          github-token: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          script: |
+            const {owner,repo}=context.repo;
+            const main=await github.rest.git.getRef({owner,repo,ref:'heads/main'});
+            const current=await github.rest.actions.getWorkflowRun({owner,repo,run_id:context.runId});
+            if(main.data.object.sha!==process.env.CONTROL_SHA || current.data.run_attempt!==1 || current.data.head_sha!==process.env.CONTROL_SHA || current.data.head_branch!=='main' || current.data.event!=='workflow_dispatch') throw new Error('orphan rollback gate authority changed');
+            for(const runId of [process.env.CURRENT_RUN_ID,process.env.TARGET_RUN_ID,process.env.RECOVERY_RUN_ID]) {
+              const latest=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(runId)});
+              const exact=await github.rest.actions.getWorkflowRunAttempt({owner,repo,run_id:Number(runId),attempt_number:1});
+              for(const run of [latest.data,exact.data]) if(run.run_attempt!==1 || run.head_sha!==process.env.CONTROL_SHA || run.head_branch!=='main' || run.event!=='workflow_dispatch' || run.status!=='completed' || run.conclusion!=='success') throw new Error('orphan rollback upstream changed');
+            }
+            const jobs=await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs',{owner,repo,run_id:context.runId,attempt_number:1,per_page:100});
+            const required=['Authenticate exact production orphan rollback authority','Prepare and attest exact production orphan rollback mutation intent','Attest exact production orphan rollback main lock proof','Roll back exact production orphan'];
+            for(const name of required) {
+              const job=jobs.find(item=>item.name===name);
+              if(!job || job.status!=='completed' || job.conclusion!=='success') throw new Error(`orphan rollback prerequisite differs: ${name}`);
+            }
+            for(const [id,name,digest] of [[process.env.INTENT_ARTIFACT_ID,process.env.INTENT_ARTIFACT_NAME,process.env.INTENT_ARTIFACT_DIGEST],[process.env.PROOF_ARTIFACT_ID,process.env.PROOF_ARTIFACT_NAME,process.env.PROOF_ARTIFACT_DIGEST]]) {
+              const artifact=await github.rest.actions.getArtifact({owner,repo,artifact_id:Number(id)});
+              if(artifact.data.name!==name || artifact.data.digest!==digest || artifact.data.expired || artifact.data.workflow_run.id!==context.runId) throw new Error('orphan rollback artifact changed');
+            }
+            const query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}';
+            const result=await github.graphql(query,{owner,name:repo});
+            const connection=result.repository.branchProtectionRules;
+            const rules=connection.nodes.filter(rule=>rule.pattern==='main');
+            if(connection.pageInfo.hasNextPage || rules.length!==1 || rules[0].id!==process.env.RULE_ID || rules[0].lockBranch!==true || rules[0].isAdminEnforced!==true || rules[0].lockAllowsFetchAndMerge!==false) throw new Error('inherited lock changed before attestation');
+
+      - name: Validate exact orphan rollback receipt
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 && "$GITHUB_SHA" == "$CONTROL_SHA" ]]
+          cd "$RUNNER_TEMP/receipt"
+          [[ "$(find . -maxdepth 1 -type f -printf '%f\n' | sort)" == $'production-orphan-rollback-receipt.json\nproduction-orphan-rollback-receipt.sha256' ]]
+          [[ -z "$(find . -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(cat production-orphan-rollback-receipt.sha256)" == "$(sha256sum production-orphan-rollback-receipt.json | awk '{print $1}')" ]]
+          /usr/bin/python3 -I -S -B -c 'import pathlib,sys; sys.path.insert(0,"control/release/deployment"); import rollback_production_change as r, verify_production_release as v; p=pathlib.Path("'"$RUNNER_TEMP"'/receipt/production-orphan-rollback-receipt.json"); r.validate_orphan_rollback_receipt(v.load_json(p,"orphan rollback receipt"))'
+
+      - name: Attest orphan rollback provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/receipt/production-orphan-rollback-receipt.json
+
+      - name: Attest exact orphan rollback policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/receipt/production-orphan-rollback-receipt.json
+          predicate-type: ${{ env.ORPHAN_ROLLBACK_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/receipt/production-orphan-rollback-receipt.json
+
+      - name: Upload signed exact orphan rollback receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-orphan-rollback-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/receipt/production-orphan-rollback-receipt.json
+            ${{ runner.temp }}/receipt/production-orphan-rollback-receipt.sha256
+          if-no-files-found: error
+          retention-days: 30

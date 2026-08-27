@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rereply.app/schemas/production-main-lock-release-failure-assertion-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "authority", "repository", "issued_at", "expires_at", "state", "operation", "control", "source", "branch", "authorities", "authorization_scope", "static_max_branch_mutations"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "authority": {"const": "production-main-lock-release-failure-assertion"},
+    "repository": {"const": "medtechcorps-netizen/whatomate"},
+    "issued_at": {"$ref": "#/$defs/timestamp"},
+    "expires_at": {"$ref": "#/$defs/timestamp"},
+    "state": {"const": "failed-source-unlock-observation-authorized"},
+    "operation": {"enum": ["apply", "rollback"]},
+    "control": {"$ref": "#/$defs/control"},
+    "source": {"$ref": "#/$defs/source"},
+    "branch": {"$ref": "#/$defs/branch"},
+    "authorities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["release_authorization", "original_receipt"],
+      "properties": {"release_authorization": {"$ref": "#/$defs/authority"}, "original_receipt": {"$ref": "#/$defs/authority"}}
+    },
+    "authorization_scope": {"const": "observe-normal-main-lock-release-only"},
+    "static_max_branch_mutations": {"const": 0}
+  },
+  "$defs": {
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "runId": {"type": "string", "pattern": "^[1-9][0-9]{0,14}$"},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+    "binding": {"type": "object", "additionalProperties": false, "required": ["run_id", "run_attempt", "artifact_id", "artifact_name", "artifact_digest", "sha256"], "properties": {"run_id": {"$ref": "#/$defs/runId"}, "run_attempt": {"const": 1}, "artifact_id": {"$ref": "#/$defs/runId"}, "artifact_name": {"type": "string", "minLength": 1, "maxLength": 256}, "artifact_digest": {"$ref": "#/$defs/digest"}, "sha256": {"$ref": "#/$defs/sha256"}}},
+    "authority": {"type": "object", "additionalProperties": false, "required": ["binding", "signer_workflow", "signer_digest", "source_digest", "source_ref", "runner_environment", "provenance_predicate_type", "policy_predicate_type", "provenance_verification_sha256", "policy_verification_sha256"], "properties": {"binding": {"$ref": "#/$defs/binding"}, "signer_workflow": {"type": "string", "minLength": 1, "maxLength": 512}, "signer_digest": {"$ref": "#/$defs/sha1"}, "source_digest": {"$ref": "#/$defs/sha1"}, "source_ref": {"const": "refs/heads/main"}, "runner_environment": {"const": "github-hosted"}, "provenance_predicate_type": {"const": "https://slsa.dev/provenance/v1"}, "policy_predicate_type": {"type": "string", "pattern": "^https://rereply\\.app/attestations/[a-z0-9-]+/v[0-9]+$"}, "provenance_verification_sha256": {"$ref": "#/$defs/sha256"}, "policy_verification_sha256": {"$ref": "#/$defs/sha256"}}},
+    "control": {"type": "object", "additionalProperties": false, "required": ["workflow_sha", "workflow_path", "run_id", "run_attempt", "runner_environment", "assertion_schema_sha256", "reconciliation_schema_sha256", "controller_sha256"], "properties": {"workflow_sha": {"$ref": "#/$defs/sha1"}, "workflow_path": {"const": ".github/workflows/reconcile-production-main-lock-release.yml"}, "run_id": {"$ref": "#/$defs/runId"}, "run_attempt": {"const": 1}, "runner_environment": {"const": "github-hosted"}, "assertion_schema_sha256": {"$ref": "#/$defs/sha256"}, "reconciliation_schema_sha256": {"$ref": "#/$defs/sha256"}, "controller_sha256": {"$ref": "#/$defs/sha256"}}},
+    "job": {"type": "object", "additionalProperties": false, "required": ["job_id", "name", "status", "conclusion", "started_at", "completed_at"], "properties": {"job_id": {"$ref": "#/$defs/runId"}, "name": {"type": "string", "minLength": 1}, "status": {"const": "completed"}, "conclusion": {"enum": ["success", "failure", "cancelled", "timed_out"]}, "started_at": {"$ref": "#/$defs/timestamp"}, "completed_at": {"$ref": "#/$defs/timestamp"}}},
+    "artifacts": {"type": "object", "additionalProperties": false, "required": ["acquire_intent", "mutation_intent", "main_lock_proof", "unsigned_receipt", "signed_receipt", "release_authorization"], "properties": {"acquire_intent": {"$ref": "#/$defs/binding"}, "mutation_intent": {"$ref": "#/$defs/binding"}, "main_lock_proof": {"$ref": "#/$defs/binding"}, "unsigned_receipt": {"$ref": "#/$defs/binding"}, "signed_receipt": {"$ref": "#/$defs/binding"}, "release_authorization": {"$ref": "#/$defs/binding"}}},
+    "step": {"type": "object", "additionalProperties": false, "required": ["number", "name", "status", "conclusion", "started_at", "completed_at"], "properties": {"number": {"type": "integer", "minimum": 1, "maximum": 1000}, "name": {"type": "string", "minLength": 1}, "status": {"const": "completed"}, "conclusion": {"enum": ["success", "failure", "cancelled", "timed_out", "skipped"]}, "started_at": {"oneOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]}, "completed_at": {"oneOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]}}},
+    "source": {"type": "object", "additionalProperties": false, "required": ["workflow_sha", "workflow_path", "workflow_name", "run_id", "run_attempt", "event", "head_branch", "status", "conclusion", "jobs", "job_inventory_sha256", "authorization_job_inventory_sha256", "unlock_steps", "unlock_step_inventory_sha256", "artifacts", "artifact_inventory_sha256"], "properties": {"workflow_sha": {"$ref": "#/$defs/sha1"}, "workflow_path": {"enum": [".github/workflows/apply-production-phase.yml", ".github/workflows/rollback-production-phase.yml"]}, "workflow_name": {"enum": ["Apply Production Phase", "Rollback Production Phase"]}, "run_id": {"$ref": "#/$defs/runId"}, "run_attempt": {"const": 1}, "event": {"const": "workflow_dispatch"}, "head_branch": {"const": "main"}, "status": {"const": "completed"}, "conclusion": {"enum": ["failure", "cancelled", "timed_out"]}, "jobs": {"type": "array", "minItems": 9, "maxItems": 9, "items": {"$ref": "#/$defs/job"}}, "job_inventory_sha256": {"$ref": "#/$defs/sha256"}, "authorization_job_inventory_sha256": {"$ref": "#/$defs/sha256"}, "unlock_steps": {"type": "array", "minItems": 9, "maxItems": 9, "items": {"$ref": "#/$defs/step"}}, "unlock_step_inventory_sha256": {"$ref": "#/$defs/sha256"}, "artifacts": {"$ref": "#/$defs/artifacts"}, "artifact_inventory_sha256": {"$ref": "#/$defs/sha256"}}},
+    "branch": {"type": "object", "additionalProperties": false, "required": ["main_sha", "rule_id", "rule_identity_sha256", "lock_branch", "is_admin_enforced", "lock_allows_fetch_and_merge"], "properties": {"main_sha": {"$ref": "#/$defs/sha1"}, "rule_id": {"type": "string", "pattern": "^[A-Za-z0-9_+/=-]{1,512}$"}, "rule_identity_sha256": {"$ref": "#/$defs/sha256"}, "lock_branch": {"const": true}, "is_admin_enforced": {"const": true}, "lock_allows_fetch_and_merge": {"const": false}}}
+  }
+}

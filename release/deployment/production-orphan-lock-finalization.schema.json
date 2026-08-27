@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rereply.app/schemas/production-orphan-lock-finalization-v1.json",
+  "title": "ReReply production orphan main-lock pre-release authorization",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "authority", "repository", "prepared_at", "expires_at",
+    "state", "control", "break_glass", "orphan", "resolution",
+    "authorities", "branch_action", "execution_boundary"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "authority": {"const": "production-orphan-lock-finalization"},
+    "repository": {"const": "medtechcorps-netizen/whatomate"},
+    "prepared_at": {"$ref": "#/$defs/timestamp"},
+    "expires_at": {"$ref": "#/$defs/timestamp"},
+    "state": {"const": "pre-unlock-authorization"},
+    "control": {"$ref": "#/$defs/control"},
+    "break_glass": {"$ref": "#/$defs/breakGlass"},
+    "orphan": {"$ref": "#/$defs/orphan"},
+    "resolution": {"$ref": "#/$defs/resolution"},
+    "authorities": {"$ref": "#/$defs/authorities"},
+    "branch_action": {"$ref": "#/$defs/branchAction"},
+    "execution_boundary": {"$ref": "#/$defs/executionBoundary"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"resolution": {"properties": {"closure_kind": {"const": "no-mutation-never-started"}}}}
+      },
+      "then": {
+        "properties": {
+          "resolution": {"properties": {
+            "outcome": {"const": "no-mutation"},
+            "closure_receipt_sha256": {"$ref": "#/$defs/sha256"},
+            "orphan_rollback_sha256": {"type": "null"},
+            "phase_state_sha256": {"type": "null"},
+            "provider_job_never_started": {"const": true},
+            "canary_certified": {"const": false}
+          }},
+          "authorities": {"properties": {
+            "orphan_rollback_intent": {"type": "null"},
+            "orphan_rollback": {"type": "null"},
+            "phase_state": {"type": "null"}
+          }}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"resolution": {"properties": {"closure_kind": {"const": "reconciliation-canary"}}}}
+      },
+      "then": {
+        "properties": {
+          "resolution": {"properties": {
+            "outcome": {"enum": ["committed", "already-receipted"]},
+            "orphan_rollback_sha256": {"type": "null"},
+            "phase_state_sha256": {"$ref": "#/$defs/sha256"},
+            "canary_certified": {"const": true}
+          }},
+          "authorities": {"properties": {
+            "orphan_rollback_intent": {"type": "null"},
+            "orphan_rollback": {"type": "null"},
+            "phase_state": {"$ref": "#/$defs/attestedAuthority"}
+          }}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"resolution": {"properties": {"closure_kind": {"const": "orphan-rollback-canary"}}}}
+      },
+      "then": {
+        "properties": {
+          "resolution": {"properties": {
+            "outcome": {"enum": ["committed", "already-receipted"]},
+            "orphan_rollback_sha256": {"$ref": "#/$defs/sha256"},
+            "phase_state_sha256": {"$ref": "#/$defs/sha256"},
+            "canary_certified": {"const": true}
+          }},
+          "authorities": {"properties": {
+            "orphan_rollback_intent": {"$ref": "#/$defs/attestedAuthority"},
+            "orphan_rollback": {"$ref": "#/$defs/attestedAuthority"},
+            "phase_state": {"$ref": "#/$defs/attestedAuthority"}
+          }}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "runId": {"type": "string", "pattern": "^[1-9][0-9]{0,14}$"},
+    "attempt": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_sha", "workflow_path", "run_id", "run_attempt",
+        "runner_environment", "release_policy_sha256", "change_schema_sha256",
+        "mutation_intent_schema_sha256", "reconciliation_schema_sha256",
+        "finalization_schema_sha256", "controller_sha256"
+      ],
+      "properties": {
+        "workflow_sha": {"$ref": "#/$defs/sha1"},
+        "workflow_path": {"const": ".github/workflows/finalize-production-orphan-lock.yml"},
+        "run_id": {"$ref": "#/$defs/runId"},
+        "run_attempt": {"const": 1},
+        "runner_environment": {"const": "github-hosted"},
+        "release_policy_sha256": {"$ref": "#/$defs/sha256"},
+        "change_schema_sha256": {"$ref": "#/$defs/sha256"},
+        "mutation_intent_schema_sha256": {"$ref": "#/$defs/sha256"},
+        "reconciliation_schema_sha256": {"$ref": "#/$defs/sha256"},
+        "finalization_schema_sha256": {"$ref": "#/$defs/sha256"},
+        "controller_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "artifactBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_attempt", "artifact_id", "artifact_name", "artifact_digest", "sha256"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/runId"},
+        "run_attempt": {"const": 1},
+        "artifact_id": {"$ref": "#/$defs/runId"},
+        "artifact_name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"},
+        "artifact_digest": {"$ref": "#/$defs/digest"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "attestedAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "binding", "signer_workflow", "signer_digest", "source_digest",
+        "source_ref", "runner_environment", "provenance_predicate_type",
+        "policy_predicate_type", "provenance_verification_sha256",
+        "policy_verification_sha256"
+      ],
+      "properties": {
+        "binding": {"$ref": "#/$defs/artifactBinding"},
+        "signer_workflow": {"type": "string", "pattern": "^medtechcorps-netizen/whatomate/\\.github/workflows/[A-Za-z0-9._-]+\\.yml$"},
+        "signer_digest": {"$ref": "#/$defs/sha1"},
+        "source_digest": {"$ref": "#/$defs/sha1"},
+        "source_ref": {"const": "refs/heads/main"},
+        "runner_environment": {"const": "github-hosted"},
+        "provenance_predicate_type": {"const": "https://slsa.dev/provenance/v1"},
+        "policy_predicate_type": {"enum": [
+          "https://rereply.app/attestations/production-mutation-intent/v2",
+          "https://rereply.app/attestations/production-main-lock-assertion/v1",
+          "https://rereply.app/attestations/production-orphan-reconciliation/v1",
+          "https://rereply.app/attestations/production-orphan-rollback-receipt/v1",
+          "https://rereply.app/attestations/production-phase-state/v1"
+        ]},
+        "provenance_verification_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_verification_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "breakGlass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor_provenance", "authorization_scope", "typed_confirmation_sha256"],
+      "properties": {
+        "actor_provenance": {"const": "single-operator-break-glass-assertion-not-cryptographic-actor-provenance"},
+        "authorization_scope": {"const": "release-main-lock-only"},
+        "typed_confirmation_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "orphan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch", "current_main_sha", "rule_id", "rule_identity_sha256",
+        "original_operation", "original_workflow_path", "original_control_sha",
+        "original_run_id", "original_run_attempt", "root_acquire_intent",
+        "mutation_intent_schema_version"
+      ],
+      "properties": {
+        "branch": {"const": "main"},
+        "current_main_sha": {"$ref": "#/$defs/sha1"},
+        "rule_id": {"type": "string", "pattern": "^[A-Za-z0-9_+/=-]+$", "maxLength": 512},
+        "rule_identity_sha256": {"$ref": "#/$defs/sha256"},
+        "original_operation": {"enum": ["activate", "rollback"]},
+        "original_workflow_path": {"enum": [
+          ".github/workflows/apply-production-phase.yml",
+          ".github/workflows/rollback-production-phase.yml",
+          ".github/workflows/rollback-production-orphan.yml"
+        ]},
+        "original_control_sha": {"$ref": "#/$defs/sha1"},
+        "original_run_id": {"$ref": "#/$defs/runId"},
+        "original_run_attempt": {"const": 1},
+        "root_acquire_intent": {"$ref": "#/$defs/artifactBinding"},
+        "mutation_intent_schema_version": {"const": 2}
+      }
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "closure_kind", "outcome", "terminal", "reconciliation_sha256",
+        "closure_receipt_sha256", "orphan_rollback_sha256",
+        "phase_state_sha256", "provider_job_never_started", "canary_certified"
+      ],
+      "properties": {
+        "closure_kind": {"enum": ["reconciliation-canary", "no-mutation-never-started", "orphan-rollback-canary"]},
+        "outcome": {"enum": ["committed", "already-receipted", "no-mutation"]},
+        "terminal": {"const": true},
+        "reconciliation_sha256": {"$ref": "#/$defs/sha256"},
+        "closure_receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "orphan_rollback_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "phase_state_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "provider_job_never_started": {"type": "boolean"},
+        "canary_certified": {"type": "boolean"}
+      }
+    },
+    "authorities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mutation_intent", "lock_assertion", "reconciliation", "orphan_rollback_intent", "orphan_rollback", "phase_state"],
+      "properties": {
+        "mutation_intent": {"$ref": "#/$defs/attestedAuthority"},
+        "lock_assertion": {"$ref": "#/$defs/attestedAuthority"},
+        "reconciliation": {"$ref": "#/$defs/attestedAuthority"},
+        "orphan_rollback_intent": {"oneOf": [{"$ref": "#/$defs/attestedAuthority"}, {"type": "null"}]},
+        "orphan_rollback": {"oneOf": [{"$ref": "#/$defs/attestedAuthority"}, {"type": "null"}]},
+        "phase_state": {"oneOf": [{"$ref": "#/$defs/attestedAuthority"}, {"type": "null"}]}
+      }
+    },
+    "lockedProjection": {
+      "type": "object", "additionalProperties": false,
+      "required": ["lock_branch", "is_admin_enforced", "lock_allows_fetch_and_merge"],
+      "properties": {"lock_branch": {"const": true}, "is_admin_enforced": {"const": true}, "lock_allows_fetch_and_merge": {"const": false}}
+    },
+    "unlockedProjection": {
+      "type": "object", "additionalProperties": false,
+      "required": ["lock_branch", "is_admin_enforced", "lock_allows_fetch_and_merge"],
+      "properties": {"lock_branch": {"const": false}, "is_admin_enforced": {"const": true}, "lock_allows_fetch_and_merge": {"const": false}}
+    },
+    "branchAction": {
+      "type": "object", "additionalProperties": false,
+      "required": ["action", "expected_pre_release", "authorized_post_release", "branch_mutation_request_count", "release_performed"],
+      "properties": {
+        "action": {"const": "release-main-lock"},
+        "expected_pre_release": {"$ref": "#/$defs/lockedProjection"},
+        "authorized_post_release": {"$ref": "#/$defs/unlockedProjection"},
+        "branch_mutation_request_count": {"const": 0},
+        "release_performed": {"const": false}
+      }
+    },
+    "executionBoundary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["controller_network_access", "provider_network_access", "provider_mutation_request_count", "branch_mutation_request_count", "provider_token_present", "branch_admin_token_present", "authorization_only"],
+      "properties": {
+        "controller_network_access": {"const": false},
+        "provider_network_access": {"const": false},
+        "provider_mutation_request_count": {"const": 0},
+        "branch_mutation_request_count": {"const": 0},
+        "provider_token_present": {"const": false},
+        "branch_admin_token_present": {"const": false},
+        "authorization_only": {"const": true}
+      }
+    }
+  }
+}

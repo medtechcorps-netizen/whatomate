@@ -1,11 +1,16 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "repository": "medtechcorps-netizen/whatomate",
   "authority": "observation-only",
   "workflow": {
     "path": ".github/workflows/plan-production-rollout.yml",
     "environment": "rereply-production-plan",
     "concurrency_group": "rereply-production"
+  },
+  "lineage": {
+    "release_policy_path": "release/deployment/production-release-policy.json",
+    "change_schema_path": "release/deployment/production-change.schema.json",
+    "phase_state_predicate_type": "https://rereply.app/attestations/production-phase-state/v1"
   },
   "provider": {
     "name": "digitalocean-app-platform",
@@ -28,14 +33,14 @@
     ]
   },
   "bootstrap_state": {
-    "app_updated_at_sha256": "c849930716929c0f80937eb213f3505c104c4eca913fc03934b8ea6f9a73f3df",
+    "genesis_state_sha256": "de3518b884510c37a3661f1bf597180792614e250c56af127ce0d7b3af951f6c",
+    "app_updated_at_sha256": "caf1e8153dec3481826e02af1c223ab771791bb806eac294d92c55d1d4ebb345",
     "active_deployment_id_sha256": "439ecb65c0e711036d39b26a4d38b91f555dad32325dbdd86544230743d3cb0f",
     "canonical_spec_sha256": "a93a507a5affd82b4e00636812e4c444d31c9027bc31c19bd075f2e4d580b07e",
     "environment_values_sha256": "3b675a9ca2279c465a102e8256cbf8242a46c456e6898d593e9cde3d0e2361c7",
     "non_source_projection_sha256": "4f31183fb7f305a2a36422fdf722f90bed1eadc69fd90026928f522edf9a419b",
     "source_mode": "legacy-git",
-    "source_sha": "974bb998f6d4c94ce750a92bf23f4550f8e45a2f",
-    "next_phase": "baseline"
+    "source_sha": "974bb998f6d4c94ce750a92bf23f4550f8e45a2f"
   },
   "components": [
     {
@@ -96,7 +101,16 @@
       "deploy_on_push",
       "registry_credentials"
     ],
-    "migration_binding": "same-web-image-digest"
+    "migration_binding": "same-web-image-digest",
+    "anonymous_pullability": {
+      "mode": "anonymous-exact-digest",
+      "release_image_workflow_path": ".github/workflows/build-attest-exact-release-images.yml",
+      "release_image_gate_job_name": "Exact release image gate",
+      "release_image_proof_step_name": "Require anonymous pullability of every exact release digest",
+      "plan_recheck_step_name": "Require current anonymous pullability of every target digest",
+      "fresh_docker_config_required": true,
+      "registry_credentials_allowed": false
+    }
   },
   "expected_topology": {
     "region": "sgp",
@@ -192,6 +206,10 @@
   "security": {
     "token_environment": "DO_PRODUCTION_READ_TOKEN",
     "target_environment": "DO_PRODUCTION_TARGET_JSON",
+    "target_fields": [
+      "app_id",
+      "default_ingress"
+    ],
     "forbidden_ambient_environment": [
       "DIGITALOCEAN_ACCESS_TOKEN",
       "DO_ACCESS_TOKEN",

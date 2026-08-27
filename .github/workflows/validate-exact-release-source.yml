@@ -21,9 +21,9 @@ permissions:
   contents: read
 
 concurrency:
-  # Release phases are dispatched serially, but phase-scoped groups prevent a
-  # later phase from cancelling an older phase that is still queued.
-  group: rereply-exact-release-source-validation-${{ inputs.phase }}
+  # Every production-control workflow shares one non-cancelling lock. A later
+  # phase must wait for the current phase instead of overlapping it.
+  group: rereply-production
   cancel-in-progress: false
 
 defaults:
@@ -48,14 +48,20 @@ jobs:
         env:
           DISPATCH_REF: ${{ github.ref }}
           DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
           REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
 
           [[ "$REPOSITORY" == "medtechcorps-netizen/whatomate" ]]
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]]
           [[ "$DISPATCH_REF" == "refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
           [[ "$WORKFLOW_REF" == "medtechcorps-netizen/whatomate/.github/workflows/validate-exact-release-source.yml@refs/heads/main" ]]
           [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" ]]
           [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -587,42 +593,111 @@ jobs:
           npm audit --audit-level=high
 
   containers:
-    name: Local container builds and Trivy scans
+    name: Exact release container builds and Trivy scans
     needs: source_identity
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: Check out exact source
+      - name: Check out protected-main validation control
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.source_identity.outputs.source_sha }}
+          ref: ${{ needs.source_identity.outputs.workflow_sha }}
+          path: validation-control
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Reverify exact source identity
+      - name: Check out immutable product source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source_identity.outputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify control, release packaging, and product identities
         env:
+          EXPECTED_WORKFLOW_SHA: ${{ needs.source_identity.outputs.workflow_sha }}
           EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
           EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
           EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
           EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
+          WEB_DOCKERFILE_SHA256: 6c5b065797072000d66124120ea6da940858b54a2a8bcf3b5595f3719cf03582
+          META_RELAY_DOCKERFILE_SHA256: 38a6dcceaa252750f4ffd016002687423f062b15d8b47f6478af2185b628eb25
+          GMAIL_RELAY_DOCKERFILE_SHA256: f0c2ac09e585b3504123c1a5d336658dca5a52a0124a04aace202fb61a98a098
         run: |
           set -euo pipefail
-          [[ "$(git rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
-          [[ "$(git show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
-          [[ "$(git rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
-          [[ "$(git rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
-          [[ -z "$(git status --porcelain)" ]]
 
-      - name: Build production container locally
-        run: docker build -f docker/Dockerfile -t rereply:exact-validation .
+          control_dir="$GITHUB_WORKSPACE/validation-control"
+          source_dir="$GITHUB_WORKSPACE/source"
 
-      - name: Build Meta relay container locally
-        run: docker build -f docker/meta-relay.Dockerfile -t rereply-meta-relay:exact-validation .
+          [[ "$(git -C "$control_dir" rev-parse 'HEAD^{commit}')" == "$EXPECTED_WORKFLOW_SHA" ]]
+          [[ -z "$(git -C "$control_dir" status --porcelain)" ]]
+          git -C "$control_dir" ls-files --error-unmatch release/exact-sources.json > /dev/null
+          [[ "$(git -C "$control_dir" ls-files -s -- release/exact-sources.json | awk '{print $1}')" == "100644" ]]
+          [[ -f "$control_dir/release/exact-sources.json" && ! -L "$control_dir/release/exact-sources.json" ]]
 
-      - name: Build Gmail relay container locally
-        run: docker build -f docker/gmail-relay.Dockerfile -t rereply-gmail-relay:exact-validation .
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git -C "$source_dir" show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -z "$(git -C "$source_dir" status --porcelain)" ]]
 
-      - name: Scan production container
+          while read -r path expected_sha; do
+            git -C "$control_dir" ls-files --error-unmatch "$path" > /dev/null
+            [[ "$(git -C "$control_dir" ls-files -s -- "$path" | awk '{print $1}')" == "100644" ]]
+            [[ "$(git -C "$control_dir" cat-file -t "HEAD:$path")" == "blob" ]]
+            [[ -f "$control_dir/$path" && ! -L "$control_dir/$path" ]]
+            [[ "$(sha256sum "$control_dir/$path" | awk '{print $1}')" == "$expected_sha" ]]
+          done <<EOF
+          docker/release/web.Dockerfile $WEB_DOCKERFILE_SHA256
+          docker/release/meta-relay.Dockerfile $META_RELAY_DOCKERFILE_SHA256
+          docker/release/gmail-relay.Dockerfile $GMAIL_RELAY_DOCKERFILE_SHA256
+          EOF
+
+          jq -e \
+            --arg web "$WEB_DOCKERFILE_SHA256" \
+            --arg meta "$META_RELAY_DOCKERFILE_SHA256" \
+            --arg gmail "$GMAIL_RELAY_DOCKERFILE_SHA256" '
+              .schema_version == 1 and
+              .repository == "medtechcorps-netizen/whatomate" and
+              .release.platform == "linux/amd64" and
+              .release.components.web.dockerfile == "docker/release/web.Dockerfile" and
+              .release.components.web.dockerfile_sha256 == $web and
+              .release.components["meta-relay"].dockerfile == "docker/release/meta-relay.Dockerfile" and
+              .release.components["meta-relay"].dockerfile_sha256 == $meta and
+              .release.components["gmail-relay"].dockerfile == "docker/release/gmail-relay.Dockerfile" and
+              .release.components["gmail-relay"].dockerfile_sha256 == $gmail and
+              (.release.materials.scratch_stages | sort_by(.dockerfile)) == [
+                {dockerfile: "docker/release/gmail-relay.Dockerfile", stage: null},
+                {dockerfile: "docker/release/meta-relay.Dockerfile", stage: null}
+              ]
+            ' "$control_dir/release/exact-sources.json" > /dev/null
+
+          [[ "$(tail -n +1 "$control_dir/docker/release/meta-relay.Dockerfile" | grep -c '^FROM scratch$')" -eq 1 ]]
+          [[ "$(tail -n +1 "$control_dir/docker/release/gmail-relay.Dockerfile" | grep -c '^FROM scratch$')" -eq 1 ]]
+
+      - name: Build exact web release container locally
+        run: |
+          docker build --platform linux/amd64 \
+            -f "$GITHUB_WORKSPACE/validation-control/docker/release/web.Dockerfile" \
+            -t rereply:exact-validation \
+            "$GITHUB_WORKSPACE/source"
+
+      - name: Build exact Meta relay scratch release container locally
+        run: |
+          docker build --platform linux/amd64 \
+            -f "$GITHUB_WORKSPACE/validation-control/docker/release/meta-relay.Dockerfile" \
+            -t rereply-meta-relay:exact-validation \
+            "$GITHUB_WORKSPACE/source"
+
+      - name: Build exact Gmail relay scratch release container locally
+        run: |
+          docker build --platform linux/amd64 \
+            -f "$GITHUB_WORKSPACE/validation-control/docker/release/gmail-relay.Dockerfile" \
+            -t rereply-gmail-relay:exact-validation \
+            "$GITHUB_WORKSPACE/source"
+
+      - name: Scan exact web release container
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: rereply:exact-validation
@@ -633,7 +708,7 @@ jobs:
           version: v0.70.0
           cache: false
 
-      - name: Scan Meta relay container
+      - name: Scan exact Meta relay scratch release container
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: rereply-meta-relay:exact-validation
@@ -644,7 +719,7 @@ jobs:
           version: v0.70.0
           cache: false
 
-      - name: Scan Gmail relay container
+      - name: Scan exact Gmail relay scratch release container
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: rereply-gmail-relay:exact-validation
@@ -654,6 +729,26 @@ jobs:
           severity: CRITICAL,HIGH
           version: v0.70.0
           cache: false
+
+      - name: Reverify immutable build inputs
+        env:
+          EXPECTED_WORKFLOW_SHA: ${{ needs.source_identity.outputs.workflow_sha }}
+          EXPECTED_SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
+          EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
+          EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
+          EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
+        run: |
+          set -euo pipefail
+          control_dir="$GITHUB_WORKSPACE/validation-control"
+          source_dir="$GITHUB_WORKSPACE/source"
+
+          [[ "$(git -C "$control_dir" rev-parse 'HEAD^{commit}')" == "$EXPECTED_WORKFLOW_SHA" ]]
+          [[ -z "$(git -C "$control_dir" status --porcelain)" ]]
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ "$(git -C "$source_dir" show -s --format=%T HEAD)" == "$EXPECTED_ROOT_TREE" ]]
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD:frontend')" == "$EXPECTED_FRONTEND_TREE" ]]
+          [[ "$(git -C "$source_dir" rev-parse 'HEAD:internal')" == "$EXPECTED_INTERNAL_TREE" ]]
+          [[ -z "$(git -C "$source_dir" status --porcelain)" ]]
 
   e2e_shard:
     name: PostgreSQL 17 E2E shard ${{ matrix.shard }}

@@ -1,0 +1,1883 @@
+name: Finalize Production Orphan Lock
+
+run-name: Finalize one reconciled production orphan lock without changing production
+
+on:
+  workflow_dispatch:
+    inputs:
+      closure_kind:
+        description: Exact signed terminal closure that authorizes releasing the orphaned main lock
+        required: true
+        type: choice
+        options:
+          - reconciliation-canary
+          - no-mutation-never-started
+          - orphan-rollback-canary
+      reconciliation_evidence_json:
+        description: Exact reconciliation control SHA, run/attempt, artifact ID/API digest, and file SHA-256
+        required: true
+        type: string
+      phase_state_evidence_json:
+        description: Exact canary phase-state descriptor for a canary closure, or an empty string for no-mutation
+        required: false
+        default: ""
+        type: string
+      orphan_rollback_evidence_json:
+        description: Exact orphan-rollback receipt and mutation-intent descriptors, or an empty string unless closing an orphan rollback
+        required: false
+        default: ""
+        type: string
+      typed_confirmation:
+        description: Type the exact content-free phrase shown in the operator runbook; signed artifacts store only its hash
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  WORKFLOW_PATH: .github/workflows/finalize-production-orphan-lock.yml
+  RECONCILE_WORKFLOW_PATH: .github/workflows/reconcile-production-orphan.yml
+  CANARY_WORKFLOW_PATH: .github/workflows/verify-production-crm-canary.yml
+  ORPHAN_ROLLBACK_WORKFLOW_PATH: .github/workflows/rollback-production-orphan.yml
+  FINALIZER_PATH: release/deployment/finalize_production_orphan_lock.py
+  RELEASE_CONFIRMATION_PATH: release/deployment/confirm_production_orphan_lock_release.py
+  RELEASE_POLICY_PATH: release/deployment/production-release-policy.json
+  CHANGE_SCHEMA_PATH: release/deployment/production-change.schema.json
+  INTENT_SCHEMA_PATH: release/deployment/production-mutation-intent.schema.json
+  RECONCILIATION_SCHEMA_PATH: release/deployment/production-orphan-reconciliation.schema.json
+  FINALIZATION_SCHEMA_PATH: release/deployment/production-orphan-lock-finalization.schema.json
+  RELEASE_SCHEMA_PATH: release/deployment/production-orphan-lock-release.schema.json
+  INTENT_PREDICATE: https://rereply.app/attestations/production-mutation-intent/v2
+  ASSERTION_PREDICATE: https://rereply.app/attestations/production-main-lock-assertion/v1
+  RECONCILIATION_PREDICATE: https://rereply.app/attestations/production-orphan-reconciliation/v1
+  PHASE_STATE_PREDICATE: https://rereply.app/attestations/production-phase-state/v1
+  ORPHAN_ROLLBACK_PREDICATE: https://rereply.app/attestations/production-orphan-rollback-receipt/v1
+  FINALIZATION_PREDICATE: https://rereply.app/attestations/production-orphan-lock-finalization/v1
+  RELEASE_PREDICATE: https://rereply.app/attestations/production-orphan-lock-release-receipt/v1
+  PINNED_JQ_VERSION: "1.8.2"
+  PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+  PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
+
+jobs:
+  authority:
+    name: Authenticate exact production orphan finalization authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment: rereply-production-orphan-finalize
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      control_sha: ${{ steps.guard.outputs.control_sha }}
+      closure_kind: ${{ steps.normalize.outputs.closure_kind }}
+      reconciliation_run_id: ${{ steps.normalize.outputs.reconciliation_run_id }}
+      reconciliation_run_attempt: ${{ steps.normalize.outputs.reconciliation_run_attempt }}
+      reconciliation_artifact_id: ${{ steps.normalize.outputs.reconciliation_artifact_id }}
+      reconciliation_artifact_digest: ${{ steps.normalize.outputs.reconciliation_artifact_digest }}
+      reconciliation_sha256: ${{ steps.normalize.outputs.reconciliation_sha256 }}
+      reconciliation_binding_json: ${{ steps.authenticate.outputs.reconciliation_binding_json }}
+      mutation_intent_binding_json: ${{ steps.authenticate.outputs.mutation_intent_binding_json }}
+      lock_assertion_binding_json: ${{ steps.authenticate.outputs.lock_assertion_binding_json }}
+      phase_state_binding_json: ${{ steps.authenticate.outputs.phase_state_binding_json }}
+      orphan_rollback_binding_json: ${{ steps.authenticate.outputs.orphan_rollback_binding_json }}
+      orphan_rollback_intent_binding_json: ${{ steps.authenticate.outputs.orphan_rollback_intent_binding_json }}
+      original_operation: ${{ steps.authenticate.outputs.original_operation }}
+      original_intent_slug: ${{ steps.authenticate.outputs.original_intent_slug }}
+      original_workflow_path: ${{ steps.authenticate.outputs.original_workflow_path }}
+    steps:
+      - name: Require exact protected-main attempt-one finalization authority
+        id: guard
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" ]]
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf 'control_sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.guard.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned read-only evidence tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Normalize exact terminal closure descriptors
+        id: normalize
+        env:
+          CLOSURE_KIND: ${{ inputs.closure_kind }}
+          CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
+          ORPHAN_ROLLBACK_EVIDENCE_JSON: ${{ inputs.orphan_rollback_evidence_json }}
+          PHASE_STATE_EVIDENCE_JSON: ${{ inputs.phase_state_evidence_json }}
+          RECONCILIATION_EVIDENCE_JSON: ${{ inputs.reconciliation_evidence_json }}
+          TYPED_CONFIRMATION: ${{ inputs.typed_confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C control rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git -C control status --porcelain)" ]]
+          for path in \
+            "$FINALIZER_PATH" "$RELEASE_CONFIRMATION_PATH" "$RELEASE_POLICY_PATH" \
+            "$CHANGE_SCHEMA_PATH" "$INTENT_SCHEMA_PATH" "$RECONCILIATION_SCHEMA_PATH" \
+            "$FINALIZATION_SCHEMA_PATH" "$RELEASE_SCHEMA_PATH"; do
+            git -C control ls-files --error-unmatch "$path" > /dev/null
+            [[ "$(git -C control cat-file -t "HEAD:$path")" == "blob" ]]
+            [[ -f "control/$path" && ! -L "control/$path" ]]
+          done
+          input_dir="$RUNNER_TEMP/finalization-input"
+          mkdir -m 0700 "$input_dir"
+          umask 077
+          printf '%s' "$RECONCILIATION_EVIDENCE_JSON" > "$input_dir/reconciliation-evidence.json"
+          printf '%s' "$PHASE_STATE_EVIDENCE_JSON" > "$input_dir/phase-state-evidence.input"
+          printf '%s' "$ORPHAN_ROLLBACK_EVIDENCE_JSON" > "$input_dir/orphan-rollback-evidence.input"
+          descriptor_filter='type == "object" and
+            (keys == ["artifact_digest","artifact_id","control_sha","run_attempt","run_id","sha256"]) and
+            (.control_sha == $control) and (.run_id | type == "number" and . > 0 and floor == .) and
+            (.run_attempt == 1) and (.artifact_id | type == "number" and . > 0 and floor == .) and
+            (.artifact_digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))'
+          jq -e --arg control "$CONTROL_SHA" "$descriptor_filter" \
+            "$input_dir/reconciliation-evidence.json" > /dev/null
+          jq -S -c . "$input_dir/reconciliation-evidence.json" > "$input_dir/reconciliation-evidence.canonical.json"
+          mv "$input_dir/reconciliation-evidence.canonical.json" "$input_dir/reconciliation-evidence.json"
+
+          case "$CLOSURE_KIND" in
+            reconciliation-canary)
+              [[ -n "$PHASE_STATE_EVIDENCE_JSON" && -z "$ORPHAN_ROLLBACK_EVIDENCE_JSON" ]]
+              printf '%s' "$PHASE_STATE_EVIDENCE_JSON" > "$input_dir/phase-state-evidence.json"
+              jq -e --arg control "$CONTROL_SHA" "$descriptor_filter" \
+                "$input_dir/phase-state-evidence.json" > /dev/null
+              jq -S -c . "$input_dir/phase-state-evidence.json" > "$input_dir/phase-state-evidence.canonical.json"
+              mv "$input_dir/phase-state-evidence.canonical.json" "$input_dir/phase-state-evidence.json"
+              ;;
+            no-mutation-never-started)
+              [[ -z "$PHASE_STATE_EVIDENCE_JSON" && -z "$ORPHAN_ROLLBACK_EVIDENCE_JSON" ]]
+              ;;
+            orphan-rollback-canary)
+              [[ -n "$PHASE_STATE_EVIDENCE_JSON" && -n "$ORPHAN_ROLLBACK_EVIDENCE_JSON" ]]
+              printf '%s' "$PHASE_STATE_EVIDENCE_JSON" > "$input_dir/phase-state-evidence.json"
+              jq -e --arg control "$CONTROL_SHA" "$descriptor_filter" \
+                "$input_dir/phase-state-evidence.json" > /dev/null
+              jq -S -c . "$input_dir/phase-state-evidence.json" > "$input_dir/phase-state-evidence.canonical.json"
+              mv "$input_dir/phase-state-evidence.canonical.json" "$input_dir/phase-state-evidence.json"
+              printf '%s' "$ORPHAN_ROLLBACK_EVIDENCE_JSON" > "$input_dir/orphan-rollback-evidence.json"
+              jq -e --arg control "$CONTROL_SHA" '
+                type == "object" and
+                (keys == ["control_sha","intent_artifact_digest","intent_artifact_id","intent_sha256","receipt_artifact_digest","receipt_artifact_id","receipt_sha256","run_attempt","run_id"]) and
+                (.control_sha == $control) and (.run_id | type == "number" and . > 0 and floor == .) and
+                (.run_attempt == 1) and
+                (.intent_artifact_id | type == "number" and . > 0 and floor == .) and
+                (.receipt_artifact_id | type == "number" and . > 0 and floor == .) and
+                (.intent_artifact_digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+                (.receipt_artifact_digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+                (.intent_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+                (.receipt_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+              ' "$input_dir/orphan-rollback-evidence.json" > /dev/null
+              jq -S -c . "$input_dir/orphan-rollback-evidence.json" > "$input_dir/orphan-rollback-evidence.canonical.json"
+              mv "$input_dir/orphan-rollback-evidence.canonical.json" "$input_dir/orphan-rollback-evidence.json"
+              ;;
+            *) exit 1 ;;
+          esac
+
+          reconciliation_run_id="$(jq -er '.run_id' "$input_dir/reconciliation-evidence.json")"
+          reconciliation_sha256="$(jq -er '.sha256' "$input_dir/reconciliation-evidence.json")"
+          [[ "$TYPED_CONFIRMATION" == "FINALIZE LOCKED PRODUCTION $reconciliation_run_id $reconciliation_sha256" ]]
+          unset TYPED_CONFIRMATION RECONCILIATION_EVIDENCE_JSON PHASE_STATE_EVIDENCE_JSON ORPHAN_ROLLBACK_EVIDENCE_JSON
+          {
+            printf 'closure_kind=%s\n' "$CLOSURE_KIND"
+            printf 'reconciliation_run_id=%s\n' "$reconciliation_run_id"
+            printf 'reconciliation_run_attempt=%s\n' "$(jq -er '.run_attempt' "$input_dir/reconciliation-evidence.json")"
+            printf 'reconciliation_artifact_id=%s\n' "$(jq -er '.artifact_id' "$input_dir/reconciliation-evidence.json")"
+            printf 'reconciliation_artifact_digest=%s\n' "$(jq -er '.artifact_digest' "$input_dir/reconciliation-evidence.json")"
+            printf 'reconciliation_sha256=%s\n' "$reconciliation_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate exact terminal closure and transitive authorities
+        id: authenticate
+        env:
+          CLOSURE_KIND: ${{ steps.normalize.outputs.closure_kind }}
+          CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          input_dir="$RUNNER_TEMP/finalization-input"
+          evidence_dir="$RUNNER_TEMP/finalization-authority"
+          mkdir -m 0700 "$evidence_dir"
+
+          assert_no_competing_control_run() {
+            local status="$1"
+            gh api "/repos/$REPOSITORY/actions/runs?status=$status&per_page=100" > "$RUNNER_TEMP/$status-runs.json"
+            jq -e --arg run_id "$RUN_ID" '
+              .total_count == (.workflow_runs | length) and
+              all(.workflow_runs[];
+                (.id | tostring) == $run_id or
+                (.name | IN(
+                  "Assemble and Attest Exact Four-Phase Rollout",
+                  "Apply Production Phase", "Rollback Production Phase",
+                  "Build and Attest Exact Release Images",
+                  "Rollback Production Orphan", "Reconcile Production Orphan",
+                  "Reconcile Production Orphan Lock Release",
+                  "Reconcile Production Main Lock Release",
+                  "Finalize Production Orphan Lock", "Verify Production CRM Canary",
+                  "Verify Production Recovery Readiness", "Validate Exact Release Source",
+                  "Plan Production Rollout (Observation Only)",
+                  "Production Deploy - Disabled Safety Gate"
+                ) | not)
+              )
+            ' "$RUNNER_TEMP/$status-runs.json" > /dev/null
+          }
+
+          authenticate_subject() {
+            local binding_file="$1"
+            local workflow_path="$2"
+            local workflow_name="$3"
+            local expected_jobs="$4"
+            local expected_prefixes="$5"
+            local subject_stem="$6"
+            local predicate="$7"
+            local output_dir="$8"
+            local source_mode="$9"
+            local prerequisite_jobs="${10}"
+            local run_id run_attempt artifact_id artifact_name artifact_digest subject_sha signer
+            run_id="$(jq -er '.run_id' "$binding_file")"
+            run_attempt="$(jq -er '.run_attempt' "$binding_file")"
+            artifact_id="$(jq -er '.artifact_id' "$binding_file")"
+            artifact_name="$(jq -er '.artifact_name' "$binding_file")"
+            artifact_digest="$(jq -er '.artifact_digest' "$binding_file")"
+            subject_sha="$(jq -er '.sha256' "$binding_file")"
+            [[ "$run_id" =~ ^[1-9][0-9]*$ && "$run_attempt" == "1" ]]
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+            [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            [[ "$subject_sha" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$artifact_name" == "$subject_stem-$run_id-$run_attempt" ]]
+            mkdir -m 0700 "$output_dir"
+
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id" > "$output_dir/current-run.json"
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id/attempts/$run_attempt" > "$output_dir/run.json"
+            jq -e --slurp --argjson attempt "$run_attempt" '
+              length == 2 and .[0].id == .[1].id and .[0].run_attempt == $attempt and
+              .[1].run_attempt == $attempt and .[0].head_sha == .[1].head_sha and
+              .[0].path == .[1].path and .[0].status == .[1].status and
+              .[0].conclusion == .[1].conclusion
+            ' "$output_dir/current-run.json" "$output_dir/run.json" > /dev/null
+            jq -e \
+              --arg repository "$REPOSITORY" \
+              --arg workflow "$workflow_path" \
+              --arg name "$workflow_name" \
+              --arg sha "$CONTROL_SHA" \
+              --arg source_mode "$source_mode" \
+              --argjson attempt "$run_attempt" '
+                .repository.full_name == $repository and .path == $workflow and .name == $name and
+                .event == "workflow_dispatch" and .head_branch == "main" and .head_sha == $sha and
+                .run_attempt == $attempt and .status == "completed" and
+                ($source_mode == "orphan" or .conclusion == "success")
+              ' "$output_dir/run.json" > /dev/null
+
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id/attempts/$run_attempt/jobs?per_page=100" \
+              > "$output_dir/jobs.json"
+            jq -e --argjson expected "$expected_jobs" --argjson prerequisites "$prerequisite_jobs" \
+              --arg source_mode "$source_mode" '
+              .total_count == ($expected | length) and (.jobs | length) == ($expected | length) and
+              ([.jobs[].name] | sort) == ($expected | sort) and
+              (if $source_mode == "terminal" then
+                all(.jobs[]; .status == "completed" and .conclusion == "success")
+              else
+                all($prerequisites[] as $required;
+                  any(.jobs[]; .name == $required and .status == "completed" and .conclusion == "success"))
+              end)
+            ' "$output_dir/jobs.json" > /dev/null
+
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
+              > "$output_dir/artifacts.json"
+            jq -e --argjson expected_prefixes "$expected_prefixes" --arg run_id "$run_id" \
+              --arg selected "$artifact_name" --arg source_mode "$source_mode" '
+              ($expected_prefixes | map(. + "-" + $run_id + "-1") | sort) as $expected_names |
+              .total_count == (.artifacts | length) and
+              (if $source_mode == "terminal" then
+                (.artifacts | length) == ($expected_names | length) and
+                ([.artifacts[].name] | sort) == $expected_names
+              else
+                (.artifacts | length) > 0 and
+                ([.artifacts[].name] | unique | length) == (.artifacts | length) and
+                all(.artifacts[]; .name as $name | $expected_names | index($name) != null) and
+                any(.artifacts[]; .name == $selected)
+              end) and
+              all(.artifacts[];
+                .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 524288 and
+                (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                (.workflow_run.id | tostring) == $run_id)
+            ' "$output_dir/artifacts.json" > /dev/null
+
+            gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id" > "$output_dir/artifact.json"
+            jq -e \
+              --arg name "$artifact_name" \
+              --arg digest "$artifact_digest" \
+              --argjson artifact_id "$artifact_id" \
+              --argjson run_id "$run_id" '
+                .id == $artifact_id and .name == $name and .digest == $digest and
+                .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 524288 and
+                .workflow_run.id == $run_id
+              ' "$output_dir/artifact.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$output_dir/artifact.zip"
+            [[ "$(unzip -Z1 "$output_dir/artifact.zip" | LC_ALL=C sort | tr '\n' ' ')" == "$subject_stem.json $subject_stem.sha256 " ]]
+            unzip -p "$output_dir/artifact.zip" "$subject_stem.json" > "$output_dir/$subject_stem.json"
+            unzip -p "$output_dir/artifact.zip" "$subject_stem.sha256" > "$output_dir/$subject_stem.sha256"
+            [[ ! -L "$output_dir/$subject_stem.json" && ! -L "$output_dir/$subject_stem.sha256" ]]
+            [[ "$(wc -c < "$output_dir/$subject_stem.sha256" | tr -d ' ')" == "65" ]]
+            [[ "$(cat "$output_dir/$subject_stem.sha256")" == "$subject_sha" ]]
+            [[ "$(tail -c 1 "$output_dir/$subject_stem.sha256" | od -An -t u1 | tr -d ' ')" == "10" ]]
+            [[ "$(sha256sum "$output_dir/$subject_stem.json" | awk '{print $1}')" == "$subject_sha" ]]
+
+            signer="$RELEASE_REPOSITORY/$workflow_path"
+            flags=(
+              --repo "$RELEASE_REPOSITORY"
+              --signer-workflow "$signer"
+              --signer-digest "$CONTROL_SHA"
+              --source-digest "$CONTROL_SHA"
+              --source-ref refs/heads/main
+              --deny-self-hosted-runners
+              --format json
+            )
+            gh attestation verify "$output_dir/$subject_stem.json" "${flags[@]}" \
+              --predicate-type https://slsa.dev/provenance/v1 > "$output_dir/provenance.json"
+            gh attestation verify "$output_dir/$subject_stem.json" "${flags[@]}" \
+              --predicate-type "$predicate" > "$output_dir/policy.json"
+            jq -e 'type == "array" and length > 0' "$output_dir/provenance.json" > /dev/null
+            jq -e --slurpfile expected "$output_dir/$subject_stem.json" '
+              type == "array" and length > 0 and
+              any(.[]; .verificationResult.statement.predicate == $expected[0])
+            ' "$output_dir/policy.json" > /dev/null
+            jq -S -n \
+              --argjson binding "$(cat "$binding_file")" \
+              --arg signer_workflow "$signer" \
+              --arg signer_digest "$CONTROL_SHA" \
+              --arg source_digest "$CONTROL_SHA" \
+              --arg source_ref refs/heads/main \
+              --arg runner_environment github-hosted \
+              --arg provenance_predicate_type https://slsa.dev/provenance/v1 \
+              --arg policy_predicate_type "$predicate" \
+              --arg provenance_verification_sha256 "$(sha256sum "$output_dir/provenance.json" | awk '{print $1}')" \
+              --arg policy_verification_sha256 "$(sha256sum "$output_dir/policy.json" | awk '{print $1}')" '
+                {
+                  binding: $binding,
+                  signer_workflow: $signer_workflow,
+                  signer_digest: $signer_digest,
+                  source_digest: $source_digest,
+                  source_ref: $source_ref,
+                  runner_environment: $runner_environment,
+                  provenance_predicate_type: $provenance_predicate_type,
+                  policy_predicate_type: $policy_predicate_type,
+                  provenance_verification_sha256: $provenance_verification_sha256,
+                  policy_verification_sha256: $policy_verification_sha256
+                }
+              ' > "$output_dir/authority.json"
+          }
+
+          authenticate_root_marker() {
+            local intent_file="$1"
+            local output_dir="$2"
+            local run_id run_attempt artifact_id artifact_name artifact_digest marker_sha marker_stem workflow_path workflow_name
+            mkdir -m 0700 "$output_dir"
+            jq -S '.lock.root_acquire_intent' "$intent_file" > "$output_dir/binding.json"
+            run_id="$(jq -er '.run_id' "$output_dir/binding.json")"
+            run_attempt="$(jq -er '.run_attempt' "$output_dir/binding.json")"
+            artifact_id="$(jq -er '.artifact_id' "$output_dir/binding.json")"
+            artifact_name="$(jq -er '.artifact_name' "$output_dir/binding.json")"
+            artifact_digest="$(jq -er '.artifact_digest' "$output_dir/binding.json")"
+            marker_sha="$(jq -er '.sha256' "$output_dir/binding.json")"
+            [[ "$run_id" =~ ^[1-9][0-9]*$ && "$run_attempt" == "1" ]]
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ && "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            [[ "$marker_sha" =~ ^[0-9a-f]{64}$ ]]
+            if [[ "$artifact_name" == "production-main-lock-apply-$run_id-1" ]]; then
+              marker_stem=apply-main-lock
+              workflow_path=.github/workflows/apply-production-phase.yml
+              workflow_name="Apply Production Phase"
+            elif [[ "$artifact_name" == "production-main-lock-rollback-$run_id-1" ]]; then
+              marker_stem=rollback-main-lock
+              workflow_path=.github/workflows/rollback-production-phase.yml
+              workflow_name="Rollback Production Phase"
+            else
+              exit 1
+            fi
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id" > "$output_dir/current-run.json"
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id/attempts/1" > "$output_dir/run.json"
+            jq -e --slurp --arg workflow "$workflow_path" --arg name "$workflow_name" \
+              --arg sha "$CONTROL_SHA" '
+                length == 2 and all(.[];
+                  .path == $workflow and .name == $name and .head_sha == $sha and
+                  .head_branch == "main" and .event == "workflow_dispatch" and
+                  .run_attempt == 1 and .status == "completed") and .[0].id == .[1].id
+              ' "$output_dir/current-run.json" "$output_dir/run.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id" > "$output_dir/artifact.json"
+            jq -e --arg name "$artifact_name" --arg digest "$artifact_digest" \
+              --argjson artifact_id "$artifact_id" --argjson run_id "$run_id" '
+                .id == $artifact_id and .name == $name and .digest == $digest and
+                .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 131072 and
+                .workflow_run.id == $run_id
+              ' "$output_dir/artifact.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$output_dir/artifact.zip"
+            [[ "$(unzip -Z1 "$output_dir/artifact.zip" | wc -l | tr -d ' ')" == "1" ]]
+            [[ "$(unzip -Z1 "$output_dir/artifact.zip" | tr -d '\r\n')" == "$marker_stem.json" ]]
+            unzip -p "$output_dir/artifact.zip" "$marker_stem.json" > "$output_dir/$marker_stem.json"
+            [[ "$(sha256sum "$output_dir/$marker_stem.json" | awk '{print $1}')" == "$marker_sha" ]]
+            jq -e --arg run_id "$run_id" --arg sha "$CONTROL_SHA" \
+              --arg rule "$(jq -er '.lock.rule_id' "$intent_file")" '
+                type == "object" and
+                (keys == ["control_sha","rule_id","run_attempt","run_id","schema_version","state"]) and
+                .schema_version == 1 and (.run_id | tostring) == $run_id and
+                .run_attempt == 1 and .control_sha == $sha and .rule_id == $rule and
+                .state == "acquire-intent"
+              ' "$output_dir/$marker_stem.json" > /dev/null
+          }
+
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          assert_no_competing_control_run queued
+          assert_no_competing_control_run in_progress
+
+          jq -S \
+            --arg name "production-orphan-reconciliation-$(jq -er '.run_id' "$input_dir/reconciliation-evidence.json")-1" '
+              {
+                run_id, run_attempt, artifact_id, artifact_name: $name,
+                artifact_digest, sha256
+              }
+            ' "$input_dir/reconciliation-evidence.json" > "$evidence_dir/reconciliation-binding.json"
+          authenticate_subject \
+            "$evidence_dir/reconciliation-binding.json" \
+            "$RECONCILE_WORKFLOW_PATH" "Reconcile Production Orphan" \
+            '["Authenticate and attest the single-operator lock assertion","Classify exact production orphan with GET-only capability","Exact production orphan reconciliation gate"]' \
+            '["production-main-lock-assertion","unsigned-production-orphan-reconciliation","production-orphan-reconciliation"]' \
+            production-orphan-reconciliation "$RECONCILIATION_PREDICATE" \
+            "$evidence_dir/reconciliation" terminal '[]'
+
+          reconciliation="$evidence_dir/reconciliation/production-orphan-reconciliation.json"
+          intent_operation="$(jq -er '.intent.operation' "$reconciliation")"
+          intent_workflow_path="$(jq -er '.intent.workflow_path' "$reconciliation")"
+          jq -S '.intent.binding' "$reconciliation" > "$evidence_dir/intent-binding.json"
+          if [[ "$intent_operation" == "activate" && "$intent_workflow_path" == ".github/workflows/apply-production-phase.yml" ]]; then
+              intent_slug=apply
+              original_workflow_name="Apply Production Phase"
+              original_jobs='["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority","Release exact production apply main lock"]'
+              original_artifacts='["production-main-lock-apply","production-mutation-intent-apply","production-main-lock-proof-apply","unsigned-production-phase-apply","production-phase-apply","production-main-release-intent-apply"]'
+              original_prerequisites='["Authenticate exact production apply authority","Prepare exact production apply pre-lock authority","Prepare and attest exact production mutation intent"]'
+          elif [[ "$intent_operation" == "rollback" && "$intent_workflow_path" == ".github/workflows/rollback-production-phase.yml" ]]; then
+              intent_slug=rollback
+              original_workflow_name="Rollback Production Phase"
+              original_jobs='["Acquire exact production rollback main lock","Attest exact production rollback main lock proof","Authenticate exact production rollback authority","Exact production rollback receipt gate","Prepare and attest exact production rollback mutation intent","Prepare exact production rollback pre-lock authority","Release exact production rollback main lock","Roll back exact production phase"]'
+              original_artifacts='["production-main-lock-rollback","production-mutation-intent-rollback","production-main-lock-proof-rollback","unsigned-production-phase-rollback","production-phase-rollback","production-main-release-intent-rollback"]'
+              original_prerequisites='["Authenticate exact production rollback authority","Prepare exact production rollback pre-lock authority","Prepare and attest exact production rollback mutation intent"]'
+          elif [[ "$intent_operation" == "rollback" && "$intent_workflow_path" == "$ORPHAN_ROLLBACK_WORKFLOW_PATH" ]]; then
+              intent_slug=orphan-rollback
+              original_workflow_name="Rollback Production Orphan"
+              original_jobs='["Attest exact production orphan rollback main lock proof","Authenticate exact production orphan rollback authority","Exact production orphan rollback receipt gate","Prepare and attest exact production orphan rollback mutation intent","Roll back exact production orphan"]'
+              original_artifacts='["production-mutation-intent-orphan-rollback","production-main-lock-proof-orphan-rollback","unsigned-production-orphan-rollback","production-orphan-rollback"]'
+              original_prerequisites='["Authenticate exact production orphan rollback authority","Prepare and attest exact production orphan rollback mutation intent"]'
+          else
+            exit 1
+          fi
+          authenticate_subject \
+            "$evidence_dir/intent-binding.json" "$intent_workflow_path" "$original_workflow_name" \
+            "$original_jobs" "$original_artifacts" \
+            "production-mutation-intent-$intent_slug" "$INTENT_PREDICATE" \
+            "$evidence_dir/mutation-intent" orphan "$original_prerequisites"
+          authenticate_root_marker \
+            "$evidence_dir/mutation-intent/production-mutation-intent-$intent_slug.json" \
+            "$evidence_dir/root-marker"
+
+          jq -S '.lock_assertion.binding' "$reconciliation" > "$evidence_dir/lock-assertion-binding.json"
+          authenticate_subject \
+            "$evidence_dir/lock-assertion-binding.json" \
+            "$RECONCILE_WORKFLOW_PATH" "Reconcile Production Orphan" \
+            '["Authenticate and attest the single-operator lock assertion","Classify exact production orphan with GET-only capability","Exact production orphan reconciliation gate"]' \
+            '["production-main-lock-assertion","unsigned-production-orphan-reconciliation","production-orphan-reconciliation"]' \
+            production-main-lock-assertion "$ASSERTION_PREDICATE" \
+            "$evidence_dir/lock-assertion" terminal '[]'
+
+          if [[ "$CLOSURE_KIND" != "no-mutation-never-started" ]]; then
+            phase_descriptor="$input_dir/phase-state-evidence.json"
+            jq -S \
+              --arg name "production-phase-state-$(jq -er '.run_id' "$phase_descriptor")-1" '
+                {run_id, run_attempt, artifact_id, artifact_name: $name, artifact_digest, sha256}
+              ' "$phase_descriptor" > "$evidence_dir/phase-state-binding.json"
+            authenticate_subject \
+              "$evidence_dir/phase-state-binding.json" \
+              "$CANARY_WORKFLOW_PATH" "Verify Production CRM Canary" \
+              '["Authenticate exact change receipt authority","Exact production phase gate","Run content-free production and synthetic canaries"]' \
+              '["production-crm-canary","production-phase-state"]' \
+              production-phase-state "$PHASE_STATE_PREDICATE" \
+              "$evidence_dir/phase-state" terminal '[]'
+          fi
+
+          if [[ "$CLOSURE_KIND" == "orphan-rollback-canary" ]]; then
+            orphan_descriptor="$input_dir/orphan-rollback-evidence.json"
+            orphan_run_id="$(jq -er '.run_id' "$orphan_descriptor")"
+            jq -S \
+              --arg name "production-orphan-rollback-$orphan_run_id-1" '
+                {
+                  run_id, run_attempt,
+                  artifact_id: .receipt_artifact_id,
+                  artifact_name: $name,
+                  artifact_digest: .receipt_artifact_digest,
+                  sha256: .receipt_sha256
+                }
+              ' "$orphan_descriptor" > "$evidence_dir/orphan-rollback-binding.json"
+            orphan_jobs='["Attest exact production orphan rollback main lock proof","Authenticate exact production orphan rollback authority","Exact production orphan rollback receipt gate","Prepare and attest exact production orphan rollback mutation intent","Roll back exact production orphan"]'
+            orphan_artifacts='["production-mutation-intent-orphan-rollback","production-main-lock-proof-orphan-rollback","unsigned-production-orphan-rollback","production-orphan-rollback"]'
+            authenticate_subject \
+              "$evidence_dir/orphan-rollback-binding.json" \
+              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Rollback Production Orphan" \
+              "$orphan_jobs" "$orphan_artifacts" \
+              production-orphan-rollback "$ORPHAN_ROLLBACK_PREDICATE" \
+              "$evidence_dir/orphan-rollback" terminal '[]'
+            jq -S \
+              --arg name "production-mutation-intent-orphan-rollback-$orphan_run_id-1" '
+                {
+                  run_id, run_attempt,
+                  artifact_id: .intent_artifact_id,
+                  artifact_name: $name,
+                  artifact_digest: .intent_artifact_digest,
+                  sha256: .intent_sha256
+                }
+              ' "$orphan_descriptor" > "$evidence_dir/orphan-rollback-intent-binding.json"
+            jq -e --slurpfile supplied "$evidence_dir/orphan-rollback-intent-binding.json" \
+              '.authorities.mutation_intent == $supplied[0]' \
+              "$evidence_dir/orphan-rollback/production-orphan-rollback-receipt.json" > /dev/null
+            authenticate_subject \
+              "$evidence_dir/orphan-rollback-intent-binding.json" \
+              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Rollback Production Orphan" \
+              "$orphan_jobs" "$orphan_artifacts" \
+              production-mutation-intent-orphan-rollback "$INTENT_PREDICATE" \
+              "$evidence_dir/orphan-rollback-intent" terminal '[]'
+          fi
+
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          assert_no_competing_control_run queued
+          assert_no_competing_control_run in_progress
+          {
+            printf 'reconciliation_binding_json=%s\n' "$(jq -c . "$evidence_dir/reconciliation-binding.json")"
+            printf 'mutation_intent_binding_json=%s\n' "$(jq -c . "$evidence_dir/intent-binding.json")"
+            printf 'lock_assertion_binding_json=%s\n' "$(jq -c . "$evidence_dir/lock-assertion-binding.json")"
+            printf 'phase_state_binding_json=%s\n' "$([[ -f "$evidence_dir/phase-state-binding.json" ]] && jq -c . "$evidence_dir/phase-state-binding.json" || true)"
+            printf 'orphan_rollback_binding_json=%s\n' "$([[ -f "$evidence_dir/orphan-rollback-binding.json" ]] && jq -c . "$evidence_dir/orphan-rollback-binding.json" || true)"
+            printf 'orphan_rollback_intent_binding_json=%s\n' "$([[ -f "$evidence_dir/orphan-rollback-intent-binding.json" ]] && jq -c . "$evidence_dir/orphan-rollback-intent-binding.json" || true)"
+            printf 'original_operation=%s\n' "$intent_operation"
+            printf 'original_intent_slug=%s\n' "$intent_slug"
+            printf 'original_workflow_path=%s\n' "$intent_workflow_path"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Recheck the exact uniquely locked main rule
+        env:
+          CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          unset GH_PRODUCTION_BRANCH_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$branch_read_token" ]]
+          rule_id="$(jq -er '.lock_assertion.rule_id' "$RUNNER_TEMP/finalization-authority/reconciliation/production-orphan-reconciliation.json")"
+          rule_hash="$(jq -er '.lock_assertion.rule_identity_sha256' "$RUNNER_TEMP/finalization-authority/reconciliation/production-orphan-reconciliation.json")"
+          [[ "$rule_hash" == "$(printf '%s' "$rule_id" | sha256sum | awk '{print $1}')" ]]
+          owner="${REPOSITORY%%/*}"
+          repo="${REPOSITORY#*/}"
+          rule_query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}'
+          GH_TOKEN="$branch_read_token" gh api graphql -f query="$rule_query" -F owner="$owner" -F name="$repo" \
+            > "$RUNNER_TEMP/finalization-rule.json"
+          jq -e --arg id "$rule_id" '
+            .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and
+            ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and
+            ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] |
+              .id == $id and .lockBranch == true and .isAdminEnforced == true and
+              .lockAllowsFetchAndMerge == false)
+          ' "$RUNNER_TEMP/finalization-rule.json" > /dev/null
+          [[ "$(GH_TOKEN="$branch_read_token" gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          rm -f "$RUNNER_TEMP/finalization-rule.json"
+          unset branch_read_token
+
+  preauthorization:
+    name: Prepare and attest exact production orphan lock finalization
+    needs: authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: rereply-production-orphan-finalize
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
+      artifact_name: ${{ steps.summary.outputs.artifact_name }}
+      authorization_sha256: ${{ steps.summary.outputs.authorization_sha256 }}
+      rule_id: ${{ steps.summary.outputs.rule_id }}
+      rule_identity_sha256: ${{ steps.summary.outputs.rule_identity_sha256 }}
+    steps:
+      - name: Require unchanged attempt-one preauthorization control
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" && "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$RUN_ATTEMPT" == "1" && "$REF_PROTECTED" == "true" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" && "$WORKFLOW_SHA" == "$CONTROL_SHA" ]]
+
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned finalization evidence tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/finalization-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Reacquire and reauthenticate every exact terminal authority
+        env:
+          CLOSURE_KIND: ${{ needs.authority.outputs.closure_kind }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          LOCK_ASSERTION_BINDING_JSON: ${{ needs.authority.outputs.lock_assertion_binding_json }}
+          MUTATION_INTENT_BINDING_JSON: ${{ needs.authority.outputs.mutation_intent_binding_json }}
+          ORIGINAL_INTENT_SLUG: ${{ needs.authority.outputs.original_intent_slug }}
+          ORIGINAL_OPERATION: ${{ needs.authority.outputs.original_operation }}
+          ORIGINAL_WORKFLOW_PATH: ${{ needs.authority.outputs.original_workflow_path }}
+          ORPHAN_ROLLBACK_BINDING_JSON: ${{ needs.authority.outputs.orphan_rollback_binding_json }}
+          ORPHAN_ROLLBACK_INTENT_BINDING_JSON: ${{ needs.authority.outputs.orphan_rollback_intent_binding_json }}
+          PHASE_STATE_BINDING_JSON: ${{ needs.authority.outputs.phase_state_binding_json }}
+          RECONCILIATION_BINDING_JSON: ${{ needs.authority.outputs.reconciliation_binding_json }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          sources="$RUNNER_TEMP/finalization-sources"
+          mkdir -m 0700 "$sources"
+
+          reacquire_subject() {
+            local binding_json="$1"
+            local workflow_path="$2"
+            local workflow_name="$3"
+            local subject_stem="$4"
+            local predicate="$5"
+            local output_dir="$6"
+            local source_mode="$7"
+            local expected_jobs="$8"
+            local prerequisite_jobs="$9"
+            local run_id run_attempt artifact_id artifact_name artifact_digest subject_sha signer
+            mkdir -m 0700 "$output_dir"
+            printf '%s' "$binding_json" > "$output_dir/binding.json"
+            jq -e '
+              type == "object" and
+              (keys == ["artifact_digest","artifact_id","artifact_name","run_attempt","run_id","sha256"]) and
+              (.run_id | type == "number" and . > 0 and floor == .) and .run_attempt == 1 and
+              (.artifact_id | type == "number" and . > 0 and floor == .) and
+              (.artifact_name | type == "string" and length > 0) and
+              (.artifact_digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+              (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+            ' "$output_dir/binding.json" > /dev/null
+            run_id="$(jq -er '.run_id' "$output_dir/binding.json")"
+            run_attempt="$(jq -er '.run_attempt' "$output_dir/binding.json")"
+            artifact_id="$(jq -er '.artifact_id' "$output_dir/binding.json")"
+            artifact_name="$(jq -er '.artifact_name' "$output_dir/binding.json")"
+            artifact_digest="$(jq -er '.artifact_digest' "$output_dir/binding.json")"
+            subject_sha="$(jq -er '.sha256' "$output_dir/binding.json")"
+            [[ "$artifact_name" == "$subject_stem-$run_id-$run_attempt" ]]
+
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id" > "$output_dir/current-run.json"
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id/attempts/$run_attempt" > "$output_dir/run.json"
+            jq -e --slurp --arg workflow "$workflow_path" --arg name "$workflow_name" \
+              --arg sha "$CONTROL_SHA" --arg source_mode "$source_mode" \
+              --argjson attempt "$run_attempt" '
+                length == 2 and all(.[];
+                  .path == $workflow and .name == $name and .head_sha == $sha and
+                  .head_branch == "main" and .event == "workflow_dispatch" and
+                  .run_attempt == $attempt and .status == "completed" and
+                  ($source_mode == "orphan" or .conclusion == "success")) and
+                .[0].id == .[1].id
+              ' "$output_dir/current-run.json" "$output_dir/run.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id/attempts/$run_attempt/jobs?per_page=100" \
+              > "$output_dir/jobs.json"
+            jq -e --argjson expected "$expected_jobs" --argjson prerequisites "$prerequisite_jobs" \
+              --arg source_mode "$source_mode" '
+                .total_count == ($expected | length) and (.jobs | length) == ($expected | length) and
+                ([.jobs[].name] | sort) == ($expected | sort) and
+                (if $source_mode == "terminal" then
+                  all(.jobs[]; .status == "completed" and .conclusion == "success")
+                else
+                  all($prerequisites[] as $required;
+                    any(.jobs[]; .name == $required and .status == "completed" and .conclusion == "success"))
+                end)
+              ' "$output_dir/jobs.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id" > "$output_dir/artifact.json"
+            jq -e --arg name "$artifact_name" --arg digest "$artifact_digest" \
+              --argjson artifact_id "$artifact_id" --argjson run_id "$run_id" '
+                .id == $artifact_id and .name == $name and .digest == $digest and
+                .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 524288 and
+                .workflow_run.id == $run_id
+              ' "$output_dir/artifact.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$output_dir/artifact.zip"
+            [[ "$(unzip -Z1 "$output_dir/artifact.zip" | LC_ALL=C sort | tr '\n' ' ')" == "$subject_stem.json $subject_stem.sha256 " ]]
+            unzip -p "$output_dir/artifact.zip" "$subject_stem.json" > "$output_dir/$subject_stem.json"
+            unzip -p "$output_dir/artifact.zip" "$subject_stem.sha256" > "$output_dir/$subject_stem.sha256"
+            [[ "$(wc -c < "$output_dir/$subject_stem.sha256" | tr -d ' ')" == "65" ]]
+            [[ "$(cat "$output_dir/$subject_stem.sha256")" == "$subject_sha" ]]
+            [[ "$(tail -c 1 "$output_dir/$subject_stem.sha256" | od -An -t u1 | tr -d ' ')" == "10" ]]
+            [[ "$(sha256sum "$output_dir/$subject_stem.json" | awk '{print $1}')" == "$subject_sha" ]]
+
+            signer="$RELEASE_REPOSITORY/$workflow_path"
+            flags=(
+              --repo "$RELEASE_REPOSITORY" --signer-workflow "$signer"
+              --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA"
+              --source-ref refs/heads/main --deny-self-hosted-runners --format json
+            )
+            gh attestation verify "$output_dir/$subject_stem.json" "${flags[@]}" \
+              --predicate-type https://slsa.dev/provenance/v1 > "$output_dir/provenance.json"
+            gh attestation verify "$output_dir/$subject_stem.json" "${flags[@]}" \
+              --predicate-type "$predicate" > "$output_dir/policy.json"
+            jq -e 'type == "array" and length > 0' "$output_dir/provenance.json" > /dev/null
+            jq -e --slurpfile expected "$output_dir/$subject_stem.json" '
+              type == "array" and length > 0 and
+              any(.[]; .verificationResult.statement.predicate == $expected[0])
+            ' "$output_dir/policy.json" > /dev/null
+            jq -S -n \
+              --argjson binding "$(cat "$output_dir/binding.json")" \
+              --arg signer_workflow "$signer" --arg signer_digest "$CONTROL_SHA" \
+              --arg source_digest "$CONTROL_SHA" --arg source_ref refs/heads/main \
+              --arg runner_environment github-hosted \
+              --arg provenance_predicate_type https://slsa.dev/provenance/v1 \
+              --arg policy_predicate_type "$predicate" \
+              --arg provenance_verification_sha256 "$(sha256sum "$output_dir/provenance.json" | awk '{print $1}')" \
+              --arg policy_verification_sha256 "$(sha256sum "$output_dir/policy.json" | awk '{print $1}')" '
+                {
+                  binding: $binding, signer_workflow: $signer_workflow,
+                  signer_digest: $signer_digest, source_digest: $source_digest,
+                  source_ref: $source_ref, runner_environment: $runner_environment,
+                  provenance_predicate_type: $provenance_predicate_type,
+                  policy_predicate_type: $policy_predicate_type,
+                  provenance_verification_sha256: $provenance_verification_sha256,
+                  policy_verification_sha256: $policy_verification_sha256
+                }
+              ' > "$output_dir/authority.json"
+          }
+
+          reacquire_root_marker() {
+            local intent_file="$1"
+            local output_dir="$2"
+            local run_id artifact_id artifact_name artifact_digest marker_sha marker_stem workflow_path workflow_name
+            mkdir -m 0700 "$output_dir"
+            jq -S '.lock.root_acquire_intent' "$intent_file" > "$output_dir/binding.json"
+            run_id="$(jq -er '.run_id' "$output_dir/binding.json")"
+            artifact_id="$(jq -er '.artifact_id' "$output_dir/binding.json")"
+            artifact_name="$(jq -er '.artifact_name' "$output_dir/binding.json")"
+            artifact_digest="$(jq -er '.artifact_digest' "$output_dir/binding.json")"
+            marker_sha="$(jq -er '.sha256' "$output_dir/binding.json")"
+            if [[ "$artifact_name" == "production-main-lock-apply-$run_id-1" ]]; then
+              marker_stem=apply-main-lock
+              workflow_path=.github/workflows/apply-production-phase.yml
+              workflow_name="Apply Production Phase"
+            elif [[ "$artifact_name" == "production-main-lock-rollback-$run_id-1" ]]; then
+              marker_stem=rollback-main-lock
+              workflow_path=.github/workflows/rollback-production-phase.yml
+              workflow_name="Rollback Production Phase"
+            else
+              exit 1
+            fi
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id" > "$output_dir/current-run.json"
+            gh api "/repos/$REPOSITORY/actions/runs/$run_id/attempts/1" > "$output_dir/run.json"
+            jq -e --slurp --arg workflow "$workflow_path" --arg name "$workflow_name" \
+              --arg sha "$CONTROL_SHA" '
+                length == 2 and all(.[];
+                  .path == $workflow and .name == $name and .head_sha == $sha and
+                  .head_branch == "main" and .event == "workflow_dispatch" and
+                  .run_attempt == 1 and .status == "completed") and .[0].id == .[1].id
+              ' "$output_dir/current-run.json" "$output_dir/run.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id" > "$output_dir/artifact.json"
+            jq -e --arg name "$artifact_name" --arg digest "$artifact_digest" \
+              --argjson artifact_id "$artifact_id" --argjson run_id "$run_id" '
+                .id == $artifact_id and .name == $name and .digest == $digest and
+                .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 131072 and
+                .workflow_run.id == $run_id
+              ' "$output_dir/artifact.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$output_dir/artifact.zip"
+            [[ "$(unzip -Z1 "$output_dir/artifact.zip" | wc -l | tr -d ' ')" == "1" ]]
+            [[ "$(unzip -Z1 "$output_dir/artifact.zip" | tr -d '\r\n')" == "$marker_stem.json" ]]
+            unzip -p "$output_dir/artifact.zip" "$marker_stem.json" > "$output_dir/$marker_stem.json"
+            [[ "$(sha256sum "$output_dir/$marker_stem.json" | awk '{print $1}')" == "$marker_sha" ]]
+            jq -e --arg run_id "$run_id" --arg sha "$CONTROL_SHA" \
+              --arg rule "$(jq -er '.lock.rule_id' "$intent_file")" '
+                type == "object" and
+                (keys == ["control_sha","rule_id","run_attempt","run_id","schema_version","state"]) and
+                .schema_version == 1 and (.run_id | tostring) == $run_id and
+                .run_attempt == 1 and .control_sha == $sha and .rule_id == $rule and
+                .state == "acquire-intent"
+              ' "$output_dir/$marker_stem.json" > /dev/null
+          }
+
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          reacquire_subject "$RECONCILIATION_BINDING_JSON" \
+            "$RECONCILE_WORKFLOW_PATH" "Reconcile Production Orphan" \
+            production-orphan-reconciliation "$RECONCILIATION_PREDICATE" "$sources/reconciliation" terminal \
+            '["Authenticate and attest the single-operator lock assertion","Classify exact production orphan with GET-only capability","Exact production orphan reconciliation gate"]' '[]'
+          case "$ORIGINAL_INTENT_SLUG" in
+            apply)
+              [[ "$ORIGINAL_OPERATION" == "activate" && "$ORIGINAL_WORKFLOW_PATH" == ".github/workflows/apply-production-phase.yml" ]]
+              original_name="Apply Production Phase"
+              original_jobs='["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority","Release exact production apply main lock"]'
+              original_prerequisites='["Authenticate exact production apply authority","Prepare exact production apply pre-lock authority","Prepare and attest exact production mutation intent"]'
+              ;;
+            rollback)
+              [[ "$ORIGINAL_OPERATION" == "rollback" && "$ORIGINAL_WORKFLOW_PATH" == ".github/workflows/rollback-production-phase.yml" ]]
+              original_name="Rollback Production Phase"
+              original_jobs='["Acquire exact production rollback main lock","Attest exact production rollback main lock proof","Authenticate exact production rollback authority","Exact production rollback receipt gate","Prepare and attest exact production rollback mutation intent","Prepare exact production rollback pre-lock authority","Release exact production rollback main lock","Roll back exact production phase"]'
+              original_prerequisites='["Authenticate exact production rollback authority","Prepare exact production rollback pre-lock authority","Prepare and attest exact production rollback mutation intent"]'
+              ;;
+            orphan-rollback)
+              [[ "$ORIGINAL_OPERATION" == "rollback" && "$ORIGINAL_WORKFLOW_PATH" == "$ORPHAN_ROLLBACK_WORKFLOW_PATH" ]]
+              original_name="Rollback Production Orphan"
+              original_jobs='["Attest exact production orphan rollback main lock proof","Authenticate exact production orphan rollback authority","Exact production orphan rollback receipt gate","Prepare and attest exact production orphan rollback mutation intent","Roll back exact production orphan"]'
+              original_prerequisites='["Authenticate exact production orphan rollback authority","Prepare and attest exact production orphan rollback mutation intent"]'
+              ;;
+            *) exit 1 ;;
+          esac
+          reacquire_subject "$MUTATION_INTENT_BINDING_JSON" \
+            "$ORIGINAL_WORKFLOW_PATH" "$original_name" \
+            "production-mutation-intent-$ORIGINAL_INTENT_SLUG" "$INTENT_PREDICATE" "$sources/mutation-intent" \
+            orphan "$original_jobs" "$original_prerequisites"
+          reacquire_root_marker \
+            "$sources/mutation-intent/production-mutation-intent-$ORIGINAL_INTENT_SLUG.json" \
+            "$sources/root-marker"
+          reacquire_subject "$LOCK_ASSERTION_BINDING_JSON" \
+            "$RECONCILE_WORKFLOW_PATH" "Reconcile Production Orphan" \
+            production-main-lock-assertion "$ASSERTION_PREDICATE" "$sources/lock-assertion" terminal \
+            '["Authenticate and attest the single-operator lock assertion","Classify exact production orphan with GET-only capability","Exact production orphan reconciliation gate"]' '[]'
+          if [[ "$CLOSURE_KIND" != "no-mutation-never-started" ]]; then
+            reacquire_subject "$PHASE_STATE_BINDING_JSON" \
+              "$CANARY_WORKFLOW_PATH" "Verify Production CRM Canary" \
+              production-phase-state "$PHASE_STATE_PREDICATE" "$sources/phase-state" terminal \
+              '["Authenticate exact change receipt authority","Exact production phase gate","Run content-free production and synthetic canaries"]' '[]'
+          fi
+          if [[ "$CLOSURE_KIND" == "orphan-rollback-canary" ]]; then
+            reacquire_subject "$ORPHAN_ROLLBACK_BINDING_JSON" \
+              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Rollback Production Orphan" \
+              production-orphan-rollback "$ORPHAN_ROLLBACK_PREDICATE" "$sources/orphan-rollback" terminal \
+              '["Attest exact production orphan rollback main lock proof","Authenticate exact production orphan rollback authority","Exact production orphan rollback receipt gate","Prepare and attest exact production orphan rollback mutation intent","Roll back exact production orphan"]' '[]'
+            reacquire_subject "$ORPHAN_ROLLBACK_INTENT_BINDING_JSON" \
+              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Rollback Production Orphan" \
+              production-mutation-intent-orphan-rollback "$INTENT_PREDICATE" "$sources/orphan-rollback-intent" terminal \
+              '["Attest exact production orphan rollback main lock proof","Authenticate exact production orphan rollback authority","Exact production orphan rollback receipt gate","Prepare and attest exact production orphan rollback mutation intent","Roll back exact production orphan"]' '[]'
+          fi
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+
+      - name: Recheck exact locked main immediately before preauthorization
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          unset GH_PRODUCTION_BRANCH_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$branch_read_token" ]]
+          reconciliation="$RUNNER_TEMP/finalization-sources/reconciliation/production-orphan-reconciliation.json"
+          rule_id="$(jq -er '.lock_assertion.rule_id' "$reconciliation")"
+          owner="${REPOSITORY%%/*}"
+          repo="${REPOSITORY#*/}"
+          rule_query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}'
+          GH_TOKEN="$branch_read_token" gh api graphql -f query="$rule_query" -F owner="$owner" -F name="$repo" \
+            > "$RUNNER_TEMP/preauthorization-rule.json"
+          jq -e --arg id "$rule_id" '
+            .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and
+            ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and
+            ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] |
+              .id == $id and .lockBranch == true and .isAdminEnforced == true and
+              .lockAllowsFetchAndMerge == false)
+          ' "$RUNNER_TEMP/preauthorization-rule.json" > /dev/null
+          [[ "$(GH_TOKEN="$branch_read_token" gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          rm -f "$RUNNER_TEMP/preauthorization-rule.json"
+          unset branch_read_token
+
+      - name: Build exact signed pre-unlock authorization
+        id: summary
+        env:
+          CLOSURE_KIND: ${{ needs.authority.outputs.closure_kind }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          ORIGINAL_INTENT_SLUG: ${{ needs.authority.outputs.original_intent_slug }}
+          ORIGINAL_OPERATION: ${{ needs.authority.outputs.original_operation }}
+          ORIGINAL_WORKFLOW_PATH: ${{ needs.authority.outputs.original_workflow_path }}
+          TYPED_CONFIRMATION: ${{ inputs.typed_confirmation }}
+        run: |
+          set -euo pipefail
+          sources="$RUNNER_TEMP/finalization-sources"
+          output_dir="$RUNNER_TEMP/orphan-lock-finalization"
+          mkdir -m 0700 "$output_dir"
+          reconciliation="$sources/reconciliation/production-orphan-reconciliation.json"
+          reconciliation_authority="$sources/reconciliation/authority.json"
+          reconciliation_sha256="$(jq -er '.binding.sha256' "$reconciliation_authority")"
+          reconciliation_run_id="$(jq -er '.binding.run_id' "$reconciliation_authority")"
+          reconciliation_run_attempt="$(jq -er '.binding.run_attempt' "$reconciliation_authority")"
+          [[ "$TYPED_CONFIRMATION" == "FINALIZE LOCKED PRODUCTION $reconciliation_run_id $reconciliation_sha256" ]]
+          typed_confirmation_sha256="$(printf '%s' "$TYPED_CONFIRMATION" | sha256sum | awk '{print $1}')"
+          unset TYPED_CONFIRMATION
+          outcome="$(jq -er '.classification.outcome' "$reconciliation")"
+          rule_id="$(jq -er '.lock_assertion.rule_id' "$reconciliation")"
+          rule_identity_sha256="$(jq -er '.lock_assertion.rule_identity_sha256' "$reconciliation")"
+          original_control_sha="$(jq -er '.lock_assertion.original_control_sha' "$reconciliation")"
+          original_run_id="$(jq -er '.lock_assertion.original_run_id' "$reconciliation")"
+          original_run_attempt="$(jq -er '.lock_assertion.original_run_attempt' "$reconciliation")"
+          phase_state_sha256=null
+          orphan_rollback_sha256=null
+          closure_receipt_sha256="$reconciliation_sha256"
+          if [[ "$CLOSURE_KIND" != "no-mutation-never-started" ]]; then
+            phase_state_sha256="\"$(jq -er '.binding.sha256' "$sources/phase-state/authority.json")\""
+          fi
+          if [[ "$CLOSURE_KIND" == "orphan-rollback-canary" ]]; then
+            orphan_rollback_sha256="\"$(jq -er '.binding.sha256' "$sources/orphan-rollback/authority.json")\""
+            closure_receipt_sha256="$(jq -er '.binding.sha256' "$sources/orphan-rollback/authority.json")"
+          fi
+          jq -S -n \
+            --arg actor_provenance single-operator-break-glass-assertion-not-cryptographic-actor-provenance \
+            --arg authorization_scope release-main-lock-only \
+            --arg branch main \
+            --arg current_main_sha "$CONTROL_SHA" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg control_run_id "$GITHUB_RUN_ID" \
+            --argjson control_run_attempt 1 \
+            --arg rule_id "$rule_id" \
+            --arg rule_identity_sha256 "$rule_identity_sha256" \
+            --arg original_operation "$ORIGINAL_OPERATION" \
+            --arg original_workflow_path "$ORIGINAL_WORKFLOW_PATH" \
+            --arg original_control_sha "$original_control_sha" \
+            --arg original_run_id "$original_run_id" \
+            --argjson original_run_attempt "$original_run_attempt" \
+            --arg reconciliation_run_id "$reconciliation_run_id" \
+            --argjson reconciliation_run_attempt "$reconciliation_run_attempt" \
+            --arg reconciliation_sha256 "$reconciliation_sha256" \
+            --arg reconciliation_outcome "$outcome" \
+            --arg closure_kind "$CLOSURE_KIND" \
+            --arg closure_receipt_sha256 "$closure_receipt_sha256" \
+            --argjson orphan_rollback_sha256 "$orphan_rollback_sha256" \
+            --argjson phase_state_sha256 "$phase_state_sha256" \
+            --arg typed_confirmation_sha256 "$typed_confirmation_sha256" '
+              {
+                actor_provenance: $actor_provenance,
+                authorization_scope: $authorization_scope,
+                branch: $branch,
+                current_main_sha: $current_main_sha,
+                control_sha: $control_sha,
+                control_run_id: $control_run_id,
+                control_run_attempt: $control_run_attempt,
+                rule_id: $rule_id,
+                rule_identity_sha256: $rule_identity_sha256,
+                original_operation: $original_operation,
+                original_workflow_path: $original_workflow_path,
+                original_control_sha: $original_control_sha,
+                original_run_id: $original_run_id,
+                original_run_attempt: $original_run_attempt,
+                reconciliation_run_id: $reconciliation_run_id,
+                reconciliation_run_attempt: $reconciliation_run_attempt,
+                reconciliation_sha256: $reconciliation_sha256,
+                reconciliation_outcome: $reconciliation_outcome,
+                closure_kind: $closure_kind,
+                closure_receipt_sha256: $closure_receipt_sha256,
+                orphan_rollback_sha256: $orphan_rollback_sha256,
+                phase_state_sha256: $phase_state_sha256,
+                typed_confirmation_sha256: $typed_confirmation_sha256
+              }
+            ' > "$RUNNER_TEMP/finalization-request.json"
+          controller_sha256="$(sha256sum "control/$FINALIZER_PATH" | awk '{print $1}')"
+          args=(
+            prepare
+            --request "$RUNNER_TEMP/finalization-request.json"
+            --mutation-intent "$sources/mutation-intent/production-mutation-intent-$ORIGINAL_INTENT_SLUG.json"
+            --mutation-intent-authority "$sources/mutation-intent/authority.json"
+            --lock-assertion "$sources/lock-assertion/production-main-lock-assertion.json"
+            --lock-assertion-authority "$sources/lock-assertion/authority.json"
+            --reconciliation "$reconciliation"
+            --reconciliation-authority "$reconciliation_authority"
+            --policy "control/$RELEASE_POLICY_PATH"
+            --change-schema "control/$CHANGE_SCHEMA_PATH"
+            --intent-schema "control/$INTENT_SCHEMA_PATH"
+            --reconciliation-schema "control/$RECONCILIATION_SCHEMA_PATH"
+            --finalization-schema "control/$FINALIZATION_SCHEMA_PATH"
+            --controller-sha256 "$controller_sha256"
+            --workflow-sha "$CONTROL_SHA"
+            --workflow-run-id "$GITHUB_RUN_ID"
+            --workflow-run-attempt 1
+            --runner-temp "$RUNNER_TEMP"
+            --output "$output_dir/production-orphan-lock-finalization.json"
+          )
+          if [[ "$CLOSURE_KIND" != "no-mutation-never-started" ]]; then
+            args+=(
+              --phase-state "$sources/phase-state/production-phase-state.json"
+              --phase-state-authority "$sources/phase-state/authority.json"
+            )
+          fi
+          if [[ "$CLOSURE_KIND" == "orphan-rollback-canary" ]]; then
+            args+=(
+              --orphan-rollback-intent "$sources/orphan-rollback-intent/production-mutation-intent-orphan-rollback.json"
+              --orphan-rollback-intent-authority "$sources/orphan-rollback-intent/authority.json"
+              --orphan-rollback "$sources/orphan-rollback/production-orphan-rollback-receipt.json"
+              --orphan-rollback-authority "$sources/orphan-rollback/authority.json"
+            )
+          fi
+          /usr/bin/python3 -I -S -B "control/$FINALIZER_PATH" "${args[@]}"
+          authorization_sha256="$(sha256sum "$output_dir/production-orphan-lock-finalization.json" | awk '{print $1}')"
+          printf '%s\n' "$authorization_sha256" > "$output_dir/production-orphan-lock-finalization.sha256"
+          /usr/bin/python3 -I -S -B "control/$FINALIZER_PATH" validate \
+            --authorization "$output_dir/production-orphan-lock-finalization.json" \
+            --sha256 "$authorization_sha256"
+          [[ "$(find "$output_dir" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-orphan-lock-finalization.json production-orphan-lock-finalization.sha256 " ]]
+          {
+            printf 'artifact_name=production-orphan-lock-finalization-%s-1\n' "$GITHUB_RUN_ID"
+            printf 'authorization_sha256=%s\n' "$authorization_sha256"
+            printf 'rule_id=%s\n' "$rule_id"
+            printf 'rule_identity_sha256=%s\n' "$rule_identity_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest pre-unlock authorization provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/orphan-lock-finalization/production-orphan-lock-finalization.json
+
+      - name: Attest exact pre-unlock authorization policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/orphan-lock-finalization/production-orphan-lock-finalization.json
+          predicate-type: ${{ env.FINALIZATION_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/orphan-lock-finalization/production-orphan-lock-finalization.json
+
+      - name: Upload exact pre-unlock authorization
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-orphan-lock-finalization-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/orphan-lock-finalization/production-orphan-lock-finalization.json
+            ${{ runner.temp }}/orphan-lock-finalization/production-orphan-lock-finalization.sha256
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 30
+
+      - name: Canonicalize pre-unlock authorization artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Release exact production orphan main lock
+    needs:
+      - authority
+      - preauthorization
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: rereply-production-orphan-finalize
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
+      receipt_sha256: ${{ steps.release.outputs.receipt_sha256 }}
+    steps:
+      - name: Require unchanged attempt-one release control
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" && "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$RUN_ATTEMPT" == "1" && "$REF_PROTECTED" == "true" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" && "$WORKFLOW_SHA" == "$CONTROL_SHA" ]]
+
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned lock-release evidence tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/finalization-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Download exact signed pre-unlock authorization
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.preauthorization.outputs.artifact_id }}
+          path: ${{ runner.temp }}/signed-finalization
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Authenticate exact signed pre-unlock authority
+        id: authenticate
+        env:
+          ARTIFACT_DIGEST: ${{ needs.preauthorization.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.preauthorization.outputs.artifact_id }}
+          ARTIFACT_NAME: ${{ needs.preauthorization.outputs.artifact_name }}
+          AUTHORIZATION_SHA256: ${{ needs.preauthorization.outputs.authorization_sha256 }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          signed="$RUNNER_TEMP/signed-finalization"
+          [[ "$(find "$signed" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-orphan-lock-finalization.json production-orphan-lock-finalization.sha256 " ]]
+          [[ -z "$(find "$signed" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(wc -c < "$signed/production-orphan-lock-finalization.sha256" | tr -d ' ')" == "65" ]]
+          [[ "$(cat "$signed/production-orphan-lock-finalization.sha256")" == "$AUTHORIZATION_SHA256" ]]
+          [[ "$(tail -c 1 "$signed/production-orphan-lock-finalization.sha256" | od -An -t u1 | tr -d ' ')" == "10" ]]
+          [[ "$(sha256sum "$signed/production-orphan-lock-finalization.json" | awk '{print $1}')" == "$AUTHORIZATION_SHA256" ]]
+          /usr/bin/python3 -I -S -B "control/$FINALIZER_PATH" validate \
+            --authorization "$signed/production-orphan-lock-finalization.json" \
+            --sha256 "$AUTHORIZATION_SHA256"
+
+          gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/current-finalizer-run.json"
+          jq -e --arg sha "$CONTROL_SHA" '
+            .path == ".github/workflows/finalize-production-orphan-lock.yml" and
+            .name == "Finalize Production Orphan Lock" and .event == "workflow_dispatch" and
+            .head_branch == "main" and .head_sha == $sha and .run_attempt == 1 and
+            .status == "in_progress"
+          ' "$RUNNER_TEMP/current-finalizer-run.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/1/jobs?per_page=100" \
+            > "$RUNNER_TEMP/current-finalizer-jobs.json"
+          jq -e '
+            .total_count == 4 and (.jobs | length) == 4 and
+            ([.jobs[].name] | sort) == ([
+              "Authenticate exact production orphan finalization authority",
+              "Prepare and attest exact production orphan lock finalization",
+              "Release exact production orphan main lock",
+              "Exact production orphan lock release receipt gate"
+            ] | sort) and
+            any(.jobs[]; .name == "Authenticate exact production orphan finalization authority" and .status == "completed" and .conclusion == "success") and
+            any(.jobs[]; .name == "Prepare and attest exact production orphan lock finalization" and .status == "completed" and .conclusion == "success") and
+            any(.jobs[]; .name == "Release exact production orphan main lock" and .status == "in_progress") and
+            any(.jobs[]; .name == "Exact production orphan lock release receipt gate" and (.status == "queued" or .status == "waiting"))
+          ' "$RUNNER_TEMP/current-finalizer-jobs.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            > "$RUNNER_TEMP/current-finalizer-artifacts.json"
+          jq -e --arg name "$ARTIFACT_NAME" --arg digest "$ARTIFACT_DIGEST" \
+            --argjson artifact_id "$ARTIFACT_ID" --argjson run_id "$RUN_ID" '
+              .total_count == 1 and (.artifacts | length) == 1 and
+              .artifacts[0].id == $artifact_id and .artifacts[0].name == $name and
+              .artifacts[0].digest == $digest and .artifacts[0].expired == false and
+              .artifacts[0].size_in_bytes > 0 and .artifacts[0].size_in_bytes <= 524288 and
+              .artifacts[0].workflow_run.id == $run_id
+            ' "$RUNNER_TEMP/current-finalizer-artifacts.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/artifacts/$ARTIFACT_ID" > "$RUNNER_TEMP/preauthorization-artifact.json"
+          jq -e --arg name "$ARTIFACT_NAME" --arg digest "$ARTIFACT_DIGEST" \
+            --argjson artifact_id "$ARTIFACT_ID" --argjson run_id "$RUN_ID" '
+              .id == $artifact_id and .name == $name and .digest == $digest and
+              .expired == false and .workflow_run.id == $run_id
+            ' "$RUNNER_TEMP/preauthorization-artifact.json" > /dev/null
+
+          signer="$RELEASE_REPOSITORY/$WORKFLOW_PATH"
+          flags=(
+            --repo "$RELEASE_REPOSITORY" --signer-workflow "$signer"
+            --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main --deny-self-hosted-runners --format json
+          )
+          gh attestation verify "$signed/production-orphan-lock-finalization.json" "${flags[@]}" \
+            --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/preauthorization-provenance.json"
+          gh attestation verify "$signed/production-orphan-lock-finalization.json" "${flags[@]}" \
+            --predicate-type "$FINALIZATION_PREDICATE" > "$RUNNER_TEMP/preauthorization-policy.json"
+          jq -e 'type == "array" and length > 0' "$RUNNER_TEMP/preauthorization-provenance.json" > /dev/null
+          jq -e --slurpfile expected "$signed/production-orphan-lock-finalization.json" '
+            type == "array" and length > 0 and
+            any(.[]; .verificationResult.statement.predicate == $expected[0])
+          ' "$RUNNER_TEMP/preauthorization-policy.json" > /dev/null
+          jq -S -n \
+            --argjson run_id "$RUN_ID" --argjson artifact_id "$ARTIFACT_ID" \
+            --arg artifact_name "$ARTIFACT_NAME" --arg artifact_digest "$ARTIFACT_DIGEST" \
+            --arg sha256 "$AUTHORIZATION_SHA256" --arg signer_workflow "$signer" \
+            --arg signer_digest "$CONTROL_SHA" --arg source_digest "$CONTROL_SHA" \
+            --arg source_ref refs/heads/main --arg runner_environment github-hosted \
+            --arg provenance_predicate_type https://slsa.dev/provenance/v1 \
+            --arg policy_predicate_type "$FINALIZATION_PREDICATE" \
+            --arg provenance_verification_sha256 "$(sha256sum "$RUNNER_TEMP/preauthorization-provenance.json" | awk '{print $1}')" \
+            --arg policy_verification_sha256 "$(sha256sum "$RUNNER_TEMP/preauthorization-policy.json" | awk '{print $1}')" '
+              {
+                binding: {
+                  run_id: $run_id, run_attempt: 1, artifact_id: $artifact_id,
+                  artifact_name: $artifact_name, artifact_digest: $artifact_digest, sha256: $sha256
+                },
+                signer_workflow: $signer_workflow, signer_digest: $signer_digest,
+                source_digest: $source_digest, source_ref: $source_ref,
+                runner_environment: $runner_environment,
+                provenance_predicate_type: $provenance_predicate_type,
+                policy_predicate_type: $policy_predicate_type,
+                provenance_verification_sha256: $provenance_verification_sha256,
+                policy_verification_sha256: $policy_verification_sha256
+              }
+            ' > "$RUNNER_TEMP/preauthorization-authority.json"
+
+      - name: Release with one exact branch-rule mutation and GET reconciliation
+        id: release
+        env:
+          AUTHORIZATION_SHA256: ${{ needs.preauthorization.outputs.authorization_sha256 }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GITHUB_READ_TOKEN: ${{ github.token }}
+          GH_PRODUCTION_BRANCH_LOCK_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_LOCK_TOKEN }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RULE_ID: ${{ needs.preauthorization.outputs.rule_id }}
+          RULE_IDENTITY_SHA256: ${{ needs.preauthorization.outputs.rule_identity_sha256 }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          branch_lock_token="$GH_PRODUCTION_BRANCH_LOCK_TOKEN"
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          github_read_token="$GITHUB_READ_TOKEN"
+          unset GH_PRODUCTION_BRANCH_LOCK_TOKEN GH_PRODUCTION_BRANCH_READ_TOKEN GITHUB_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$branch_lock_token" && -n "$branch_read_token" && -n "$github_read_token" ]]
+          signed="$RUNNER_TEMP/signed-finalization"
+          /usr/bin/python3 -I -S -B "control/$FINALIZER_PATH" validate \
+            --authorization "$signed/production-orphan-lock-finalization.json" \
+            --sha256 "$AUTHORIZATION_SHA256"
+          [[ "$RULE_IDENTITY_SHA256" == "$(printf '%s' "$RULE_ID" | sha256sum | awk '{print $1}')" ]]
+          owner="${REPOSITORY%%/*}"
+          repo="${REPOSITORY#*/}"
+          main_before="$(GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$main_before" == "$CONTROL_SHA" ]]
+          current_attempt="$(GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID" --jq '.run_attempt')"
+          [[ "$current_attempt" == "1" ]]
+          GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/actions/runs?status=queued&per_page=100" > "$RUNNER_TEMP/release-queued.json"
+          GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/actions/runs?status=in_progress&per_page=100" > "$RUNNER_TEMP/release-active.json"
+          jq -e --arg run_id "$RUN_ID" '
+            .total_count == (.workflow_runs | length) and
+            all(.workflow_runs[]; (.id | tostring) == $run_id or
+              (.path | IN(
+                ".github/workflows/aggregate-exact-four-phase-rollout.yml",
+                ".github/workflows/apply-production-phase.yml",
+                ".github/workflows/build-attest-exact-release-images.yml",
+                ".github/workflows/deploy-production.yml",
+                ".github/workflows/plan-production-rollout.yml",
+                ".github/workflows/rollback-production-phase.yml",
+                ".github/workflows/rollback-production-orphan.yml",
+                ".github/workflows/reconcile-production-orphan.yml",
+                ".github/workflows/reconcile-production-orphan-lock-release.yml",
+                ".github/workflows/reconcile-production-main-lock-release.yml",
+                ".github/workflows/finalize-production-orphan-lock.yml",
+                ".github/workflows/validate-exact-release-source.yml",
+                ".github/workflows/verify-production-crm-canary.yml",
+                ".github/workflows/verify-production-recovery-readiness.yml"
+              ) | not))
+          ' "$RUNNER_TEMP/release-queued.json" > /dev/null
+          jq -e --arg run_id "$RUN_ID" '
+            .total_count == (.workflow_runs | length) and
+            all(.workflow_runs[]; (.id | tostring) == $run_id or
+              (.path | IN(
+                ".github/workflows/aggregate-exact-four-phase-rollout.yml",
+                ".github/workflows/apply-production-phase.yml",
+                ".github/workflows/build-attest-exact-release-images.yml",
+                ".github/workflows/deploy-production.yml",
+                ".github/workflows/plan-production-rollout.yml",
+                ".github/workflows/rollback-production-phase.yml",
+                ".github/workflows/rollback-production-orphan.yml",
+                ".github/workflows/reconcile-production-orphan.yml",
+                ".github/workflows/reconcile-production-orphan-lock-release.yml",
+                ".github/workflows/reconcile-production-main-lock-release.yml",
+                ".github/workflows/finalize-production-orphan-lock.yml",
+                ".github/workflows/validate-exact-release-source.yml",
+                ".github/workflows/verify-production-crm-canary.yml",
+                ".github/workflows/verify-production-recovery-readiness.yml"
+              ) | not))
+          ' "$RUNNER_TEMP/release-active.json" > /dev/null
+
+          rule_query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}'
+          release_mutation='mutation($rule:ID!){updateBranchProtectionRule(input:{branchProtectionRuleId:$rule,lockBranch:false}){branchProtectionRule{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge}}}'
+          /usr/bin/python3 -I -S -B "control/$FINALIZER_PATH" validate \
+            --authorization "$signed/production-orphan-lock-finalization.json" \
+            --sha256 "$AUTHORIZATION_SHA256"
+          [[ "$(GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          root_run_id="$(jq -er '.orphan.root_acquire_intent.run_id' "$signed/production-orphan-lock-finalization.json")"
+          root_artifact_id="$(jq -er '.orphan.root_acquire_intent.artifact_id' "$signed/production-orphan-lock-finalization.json")"
+          root_artifact_name="$(jq -er '.orphan.root_acquire_intent.artifact_name' "$signed/production-orphan-lock-finalization.json")"
+          root_artifact_digest="$(jq -er '.orphan.root_acquire_intent.artifact_digest' "$signed/production-orphan-lock-finalization.json")"
+          GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/actions/runs/$root_run_id" > "$RUNNER_TEMP/release-root-run.json"
+          jq -e --arg sha "$CONTROL_SHA" --arg run_id "$root_run_id" '
+            (.id | tostring) == $run_id and .run_attempt == 1 and .head_sha == $sha and
+            .head_branch == "main" and .event == "workflow_dispatch" and .status == "completed"
+          ' "$RUNNER_TEMP/release-root-run.json" > /dev/null
+          GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/actions/artifacts/$root_artifact_id" > "$RUNNER_TEMP/release-root-artifact.json"
+          jq -e --arg name "$root_artifact_name" --arg digest "$root_artifact_digest" \
+            --argjson artifact_id "$root_artifact_id" --argjson run_id "$root_run_id" '
+              .id == $artifact_id and .name == $name and .digest == $digest and
+              .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 131072 and
+              .workflow_run.id == $run_id
+            ' "$RUNNER_TEMP/release-root-artifact.json" > /dev/null
+          while IFS=$'\t' read -r source_run_id source_artifact_id source_name source_digest; do
+            GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/actions/runs/$source_run_id" > "$RUNNER_TEMP/release-source-run-$source_run_id.json"
+            jq -e --arg sha "$CONTROL_SHA" --arg run_id "$source_run_id" '
+              (.id | tostring) == $run_id and .run_attempt == 1 and .head_sha == $sha and
+              .head_branch == "main" and .event == "workflow_dispatch" and .status == "completed"
+            ' "$RUNNER_TEMP/release-source-run-$source_run_id.json" > /dev/null
+            GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/actions/artifacts/$source_artifact_id" > "$RUNNER_TEMP/release-source-artifact-$source_artifact_id.json"
+            jq -e --arg name "$source_name" --arg digest "$source_digest" \
+              --argjson artifact_id "$source_artifact_id" --argjson run_id "$source_run_id" '
+                .id == $artifact_id and .name == $name and .digest == $digest and
+                .expired == false and .size_in_bytes > 0 and .workflow_run.id == $run_id
+              ' "$RUNNER_TEMP/release-source-artifact-$source_artifact_id.json" > /dev/null
+          done < <(jq -r '.authorities[] | select(. != null) | .binding | [.run_id,.artifact_id,.artifact_name,.artifact_digest] | @tsv' "$signed/production-orphan-lock-finalization.json")
+          /usr/bin/python3 -I -S -B -c '
+          import datetime as dt,pathlib,sys
+          sys.path.insert(0,"control/release/deployment")
+          import finalize_production_orphan_lock as f
+          import verify_production_release as v
+          authorization=v.load_json(pathlib.Path(sys.argv[1]),"preauthorization")
+          checked=dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+          validated=f.validate_finalization_authorization(authorization,now=checked)
+          expires=v.require_timestamp(validated["expires_at"],"preauthorization expiry")
+          if expires - checked < dt.timedelta(seconds=120):
+              v.fail("preauthorization has insufficient time remaining for one-shot release")
+          ' "$signed/production-orphan-lock-finalization.json"
+          [[ "$(GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          GH_TOKEN="$branch_read_token" gh api graphql -f query="$rule_query" -F owner="$owner" -F name="$repo" \
+            > "$RUNNER_TEMP/release-pre-rule.json"
+          jq -e --arg id "$RULE_ID" '
+            .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and
+            ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and
+            ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] |
+              .id == $id and .lockBranch == true and .isAdminEnforced == true and
+              .lockAllowsFetchAndMerge == false)
+          ' "$RUNNER_TEMP/release-pre-rule.json" > /dev/null
+          set +e
+          GH_TOKEN="$branch_lock_token" gh api graphql -f query="$release_mutation" -F rule="$RULE_ID" \
+            > "$RUNNER_TEMP/release-mutation.json" 2> "$RUNNER_TEMP/release-mutation.stderr"
+          release_status=$?
+          set -e
+          mutation_response_received=false
+          outcome=ambiguous-reconciled
+          if [[ "$release_status" -eq 0 ]] && jq -e --arg id "$RULE_ID" '
+              .data.updateBranchProtectionRule.branchProtectionRule |
+              .id == $id and .pattern == "main" and .lockBranch == false and
+              .isAdminEnforced == true and .lockAllowsFetchAndMerge == false
+            ' "$RUNNER_TEMP/release-mutation.json" > /dev/null 2>&1; then
+            mutation_response_received=true
+            outcome=applied
+          fi
+          GH_TOKEN="$branch_read_token" gh api graphql -f query="$rule_query" -F owner="$owner" -F name="$repo" \
+            > "$RUNNER_TEMP/release-post-rule.json"
+          jq -e --arg id "$RULE_ID" '
+            .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and
+            ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and
+            ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] |
+              .id == $id and .lockBranch == false and .isAdminEnforced == true and
+              .lockAllowsFetchAndMerge == false)
+          ' "$RUNNER_TEMP/release-post-rule.json" > /dev/null
+          [[ "$(GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+
+          output_dir="$RUNNER_TEMP/orphan-lock-release"
+          mkdir -m 0700 "$output_dir"
+          jq -S -n \
+            --arg preauthorization_sha256 "$AUTHORIZATION_SHA256" \
+            --arg main_sha "$CONTROL_SHA" --arg rule_id "$RULE_ID" \
+            --arg rule_identity_sha256 "$RULE_IDENTITY_SHA256" \
+            --arg outcome "$outcome" --argjson mutation_response_received "$mutation_response_received" '
+              {
+                preauthorization_sha256: $preauthorization_sha256,
+                main_sha: $main_sha,
+                rule_id: $rule_id,
+                rule_identity_sha256: $rule_identity_sha256,
+                http_methods_used: ["POST"],
+                graphql_operations_used: ["query","mutation","query"],
+                mutation_request_count: 1,
+                outcome: $outcome,
+                mutation_response_received: $mutation_response_received,
+                read_confirmed: true,
+                pre_release: {
+                  lock_branch: true,
+                  is_admin_enforced: true,
+                  lock_allows_fetch_and_merge: false
+                },
+                post_release: {
+                  lock_branch: false,
+                  is_admin_enforced: true,
+                  lock_allows_fetch_and_merge: false
+                },
+                mutation_fingerprint_sha256: ("0" * 64)
+              }
+            ' > "$RUNNER_TEMP/release-request.pending.json"
+          mutation_fingerprint_sha256="$(/usr/bin/python3 -I -S -B -c '
+          import json,pathlib,sys
+          sys.path.insert(0,"control/release/deployment")
+          import confirm_production_orphan_lock_release as c
+          request=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print(c._release_fingerprint(request))
+          ' "$RUNNER_TEMP/release-request.pending.json")"
+          jq -S --arg fingerprint "$mutation_fingerprint_sha256" \
+            '.mutation_fingerprint_sha256 = $fingerprint' \
+            "$RUNNER_TEMP/release-request.pending.json" > "$RUNNER_TEMP/release-request.json"
+          controller_sha256="$(sha256sum "control/$RELEASE_CONFIRMATION_PATH" | awk '{print $1}')"
+          /usr/bin/python3 -I -S -B "control/$RELEASE_CONFIRMATION_PATH" confirm \
+            --release-request "$RUNNER_TEMP/release-request.json" \
+            --preauthorization "$signed/production-orphan-lock-finalization.json" \
+            --preauthorization-authority "$RUNNER_TEMP/preauthorization-authority.json" \
+            --release-schema "control/$RELEASE_SCHEMA_PATH" \
+            --controller-sha256 "$controller_sha256" \
+            --workflow-sha "$CONTROL_SHA" \
+            --workflow-run-id "$RUN_ID" \
+            --workflow-run-attempt 1 \
+            --runner-temp "$RUNNER_TEMP" \
+            --output "$output_dir/production-orphan-lock-release-receipt.json"
+          receipt_sha256="$(sha256sum "$output_dir/production-orphan-lock-release-receipt.json" | awk '{print $1}')"
+          printf '%s\n' "$receipt_sha256" > "$output_dir/production-orphan-lock-release-receipt.sha256"
+          /usr/bin/python3 -I -S -B "control/$RELEASE_CONFIRMATION_PATH" validate \
+            --receipt "$output_dir/production-orphan-lock-release-receipt.json" \
+            --sha256 "$receipt_sha256" \
+            --preauthorization "$signed/production-orphan-lock-finalization.json" \
+            --preauthorization-authority "$RUNNER_TEMP/preauthorization-authority.json"
+          rm -f "$RUNNER_TEMP/release-mutation.json" "$RUNNER_TEMP/release-mutation.stderr" \
+            "$RUNNER_TEMP/release-pre-rule.json" "$RUNNER_TEMP/release-post-rule.json"
+          unset branch_lock_token branch_read_token github_read_token
+          printf 'receipt_sha256=%s\n' "$receipt_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned confirmed lock-release receipt
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-production-orphan-lock-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/orphan-lock-release/production-orphan-lock-release-receipt.json
+            ${{ runner.temp }}/orphan-lock-release/production-orphan-lock-release-receipt.sha256
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 30
+
+      - name: Canonicalize unsigned lock-release receipt artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+  gate:
+    name: Exact production orphan lock release receipt gate
+    needs:
+      - authority
+      - preauthorization
+      - release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment: rereply-production-orphan-finalize
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Require unchanged attempt-one release-receipt control
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" && "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$RUN_ATTEMPT" == "1" && "$REF_PROTECTED" == "true" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" && "$WORKFLOW_SHA" == "$CONTROL_SHA" ]]
+
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Install pinned receipt-gate evidence tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/finalization-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Download exact signed preauthorization
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.preauthorization.outputs.artifact_id }}
+          path: ${{ runner.temp }}/signed-finalization
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Download exact unsigned release receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.release.outputs.artifact_id }}
+          path: ${{ runner.temp }}/unsigned-release
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Authenticate and validate exact post-release evidence
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PREAUTHORIZATION_ARTIFACT_DIGEST: ${{ needs.preauthorization.outputs.artifact_digest }}
+          PREAUTHORIZATION_ARTIFACT_ID: ${{ needs.preauthorization.outputs.artifact_id }}
+          PREAUTHORIZATION_ARTIFACT_NAME: ${{ needs.preauthorization.outputs.artifact_name }}
+          PREAUTHORIZATION_SHA256: ${{ needs.preauthorization.outputs.authorization_sha256 }}
+          RECEIPT_ARTIFACT_DIGEST: ${{ needs.release.outputs.artifact_digest }}
+          RECEIPT_ARTIFACT_ID: ${{ needs.release.outputs.artifact_id }}
+          RECEIPT_SHA256: ${{ needs.release.outputs.receipt_sha256 }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          signed="$RUNNER_TEMP/signed-finalization"
+          unsigned="$RUNNER_TEMP/unsigned-release"
+          [[ "$(find "$signed" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-orphan-lock-finalization.json production-orphan-lock-finalization.sha256 " ]]
+          [[ "$(find "$unsigned" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-orphan-lock-release-receipt.json production-orphan-lock-release-receipt.sha256 " ]]
+          [[ -z "$(find "$signed" "$unsigned" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(wc -c < "$signed/production-orphan-lock-finalization.sha256" | tr -d ' ')" == "65" ]]
+          [[ "$(wc -c < "$unsigned/production-orphan-lock-release-receipt.sha256" | tr -d ' ')" == "65" ]]
+          [[ "$(cat "$signed/production-orphan-lock-finalization.sha256")" == "$PREAUTHORIZATION_SHA256" ]]
+          [[ "$(cat "$unsigned/production-orphan-lock-release-receipt.sha256")" == "$RECEIPT_SHA256" ]]
+          [[ "$(sha256sum "$signed/production-orphan-lock-finalization.json" | awk '{print $1}')" == "$PREAUTHORIZATION_SHA256" ]]
+          [[ "$(sha256sum "$unsigned/production-orphan-lock-release-receipt.json" | awk '{print $1}')" == "$RECEIPT_SHA256" ]]
+          jq -S '.preauthorization.authority' \
+            "$unsigned/production-orphan-lock-release-receipt.json" \
+            > "$RUNNER_TEMP/gate-preauthorization-authority.json"
+          /usr/bin/python3 -I -S -B "control/$RELEASE_CONFIRMATION_PATH" validate \
+            --receipt "$unsigned/production-orphan-lock-release-receipt.json" \
+            --sha256 "$RECEIPT_SHA256" \
+            --preauthorization "$signed/production-orphan-lock-finalization.json" \
+            --preauthorization-authority "$RUNNER_TEMP/gate-preauthorization-authority.json"
+          /usr/bin/python3 -I -S -B -c '
+          import pathlib,sys
+          sys.path.insert(0,"control/release/deployment")
+          import confirm_production_orphan_lock_release as c
+          import finalize_production_orphan_lock as f
+          import verify_production_release as v
+          authorization=v.load_json(pathlib.Path(sys.argv[1]),"preauthorization")
+          receipt=c.validate_release_receipt(
+              v.load_json(pathlib.Path(sys.argv[2]),"release receipt"),
+              preauthorization=authorization,
+              preauthorization_authority=v.load_json(pathlib.Path(sys.argv[3]),"preauthorization authority"),
+          )
+          completed=v.require_timestamp(receipt["completed_at"],"release completion time")
+          f.validate_finalization_authorization(authorization,now=completed)
+          ' "$signed/production-orphan-lock-finalization.json" \
+            "$unsigned/production-orphan-lock-release-receipt.json" \
+            "$RUNNER_TEMP/gate-preauthorization-authority.json"
+
+          gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/gate-current-run.json"
+          jq -e --arg sha "$CONTROL_SHA" '
+            .path == ".github/workflows/finalize-production-orphan-lock.yml" and
+            .name == "Finalize Production Orphan Lock" and .event == "workflow_dispatch" and
+            .head_branch == "main" and .head_sha == $sha and .run_attempt == 1 and
+            .status == "in_progress"
+          ' "$RUNNER_TEMP/gate-current-run.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/1/jobs?per_page=100" > "$RUNNER_TEMP/gate-jobs.json"
+          jq -e '
+            .total_count == 4 and (.jobs | length) == 4 and
+            ([.jobs[].name] | sort) == ([
+              "Authenticate exact production orphan finalization authority",
+              "Prepare and attest exact production orphan lock finalization",
+              "Release exact production orphan main lock",
+              "Exact production orphan lock release receipt gate"
+            ] | sort) and
+            all(.jobs[];
+              if .name == "Exact production orphan lock release receipt gate" then
+                .status == "in_progress"
+              else
+                .status == "completed" and .conclusion == "success"
+              end)
+          ' "$RUNNER_TEMP/gate-jobs.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" > "$RUNNER_TEMP/gate-artifacts.json"
+          jq -e \
+            --arg pre_name "$PREAUTHORIZATION_ARTIFACT_NAME" \
+            --arg pre_digest "$PREAUTHORIZATION_ARTIFACT_DIGEST" \
+            --argjson pre_id "$PREAUTHORIZATION_ARTIFACT_ID" \
+            --arg unsigned_name "unsigned-production-orphan-lock-release-$RUN_ID-1" \
+            --arg unsigned_digest "$RECEIPT_ARTIFACT_DIGEST" \
+            --argjson unsigned_id "$RECEIPT_ARTIFACT_ID" \
+            --argjson run_id "$RUN_ID" '
+              .total_count == 2 and (.artifacts | length) == 2 and
+              ([.artifacts[].name] | sort) == ([$pre_name,$unsigned_name] | sort) and
+              any(.artifacts[]; .id == $pre_id and .name == $pre_name and .digest == $pre_digest) and
+              any(.artifacts[]; .id == $unsigned_id and .name == $unsigned_name and .digest == $unsigned_digest) and
+              all(.artifacts[];
+                .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 524288 and
+                .workflow_run.id == $run_id)
+            ' "$RUNNER_TEMP/gate-artifacts.json" > /dev/null
+
+          signer="$RELEASE_REPOSITORY/$WORKFLOW_PATH"
+          flags=(
+            --repo "$RELEASE_REPOSITORY" --signer-workflow "$signer"
+            --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main --deny-self-hosted-runners --format json
+          )
+          gh attestation verify "$signed/production-orphan-lock-finalization.json" "${flags[@]}" \
+            --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/gate-preauthorization-provenance.json"
+          gh attestation verify "$signed/production-orphan-lock-finalization.json" "${flags[@]}" \
+            --predicate-type "$FINALIZATION_PREDICATE" > "$RUNNER_TEMP/gate-preauthorization-policy.json"
+          jq -e 'type == "array" and length > 0' "$RUNNER_TEMP/gate-preauthorization-provenance.json" > /dev/null
+          jq -e --slurpfile expected "$signed/production-orphan-lock-finalization.json" '
+            type == "array" and length > 0 and
+            any(.[]; .verificationResult.statement.predicate == $expected[0])
+          ' "$RUNNER_TEMP/gate-preauthorization-policy.json" > /dev/null
+          root_run_id="$(jq -er '.orphan.root_acquire_intent.run_id' "$signed/production-orphan-lock-finalization.json")"
+          root_artifact_id="$(jq -er '.orphan.root_acquire_intent.artifact_id' "$signed/production-orphan-lock-finalization.json")"
+          root_artifact_name="$(jq -er '.orphan.root_acquire_intent.artifact_name' "$signed/production-orphan-lock-finalization.json")"
+          root_artifact_digest="$(jq -er '.orphan.root_acquire_intent.artifact_digest' "$signed/production-orphan-lock-finalization.json")"
+          gh api "/repos/$REPOSITORY/actions/runs/$root_run_id" > "$RUNNER_TEMP/gate-root-run.json"
+          jq -e --arg sha "$CONTROL_SHA" --arg run_id "$root_run_id" '
+            (.id | tostring) == $run_id and .run_attempt == 1 and .head_sha == $sha and
+            .head_branch == "main" and .event == "workflow_dispatch" and .status == "completed"
+          ' "$RUNNER_TEMP/gate-root-run.json" > /dev/null
+          gh api "/repos/$REPOSITORY/actions/artifacts/$root_artifact_id" > "$RUNNER_TEMP/gate-root-artifact.json"
+          jq -e --arg name "$root_artifact_name" --arg digest "$root_artifact_digest" \
+            --argjson artifact_id "$root_artifact_id" --argjson run_id "$root_run_id" '
+              .id == $artifact_id and .name == $name and .digest == $digest and
+              .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 131072 and
+              .workflow_run.id == $run_id
+            ' "$RUNNER_TEMP/gate-root-artifact.json" > /dev/null
+          while IFS=$'\t' read -r source_run_id source_artifact_id source_name source_digest; do
+            gh api "/repos/$REPOSITORY/actions/runs/$source_run_id" > "$RUNNER_TEMP/gate-source-run-$source_run_id.json"
+            jq -e --arg sha "$CONTROL_SHA" --arg run_id "$source_run_id" '
+              (.id | tostring) == $run_id and .run_attempt == 1 and .head_sha == $sha and
+              .head_branch == "main" and .event == "workflow_dispatch" and .status == "completed"
+            ' "$RUNNER_TEMP/gate-source-run-$source_run_id.json" > /dev/null
+            gh api "/repos/$REPOSITORY/actions/artifacts/$source_artifact_id" > "$RUNNER_TEMP/gate-source-artifact-$source_artifact_id.json"
+            jq -e --arg name "$source_name" --arg digest "$source_digest" \
+              --argjson artifact_id "$source_artifact_id" --argjson run_id "$source_run_id" '
+                .id == $artifact_id and .name == $name and .digest == $digest and
+                .expired == false and .size_in_bytes > 0 and .workflow_run.id == $run_id
+              ' "$RUNNER_TEMP/gate-source-artifact-$source_artifact_id.json" > /dev/null
+          done < <(jq -r '.authorities[] | select(. != null) | .binding | [.run_id,.artifact_id,.artifact_name,.artifact_digest] | @tsv' "$signed/production-orphan-lock-finalization.json")
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+
+      - name: Recheck exact unlocked main before signing the release receipt
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_PRODUCTION_BRANCH_READ_TOKEN: ${{ secrets.GH_PRODUCTION_BRANCH_READ_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RULE_ID: ${{ needs.preauthorization.outputs.rule_id }}
+        run: |
+          set -euo pipefail
+          branch_read_token="$GH_PRODUCTION_BRANCH_READ_TOKEN"
+          unset GH_PRODUCTION_BRANCH_READ_TOKEN GH_TOKEN GITHUB_TOKEN
+          [[ -n "$branch_read_token" ]]
+          owner="${REPOSITORY%%/*}"
+          repo="${REPOSITORY#*/}"
+          rule_query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}'
+          GH_TOKEN="$branch_read_token" gh api graphql -f query="$rule_query" -F owner="$owner" -F name="$repo" \
+            > "$RUNNER_TEMP/gate-post-release-rule.json"
+          jq -e --arg id "$RULE_ID" '
+            .data.repository.branchProtectionRules.pageInfo.hasNextPage == false and
+            ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")] | length) == 1 and
+            ([.data.repository.branchProtectionRules.nodes[] | select(.pattern == "main")][0] |
+              .id == $id and .lockBranch == false and .isAdminEnforced == true and
+              .lockAllowsFetchAndMerge == false)
+          ' "$RUNNER_TEMP/gate-post-release-rule.json" > /dev/null
+          [[ "$(GH_TOKEN="$branch_read_token" gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          rm -f "$RUNNER_TEMP/gate-post-release-rule.json"
+          unset branch_read_token
+
+      - name: Attest confirmed lock-release receipt provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/unsigned-release/production-orphan-lock-release-receipt.json
+
+      - name: Attest exact confirmed lock-release receipt policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/unsigned-release/production-orphan-lock-release-receipt.json
+          predicate-type: ${{ env.RELEASE_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/unsigned-release/production-orphan-lock-release-receipt.json
+
+      - name: Upload exact confirmed lock-release receipt
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-orphan-lock-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/unsigned-release/production-orphan-lock-release-receipt.json
+            ${{ runner.temp }}/unsigned-release/production-orphan-lock-release-receipt.sha256
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 30
+
+      - name: Canonicalize confirmed lock-release receipt artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Recheck exact final artifact inventory
+        env:
+          CONFIRMED_DIGEST: ${{ steps.digest.outputs.artifact_digest }}
+          CONFIRMED_ID: ${{ steps.upload.outputs.artifact-id }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PREAUTHORIZATION_DIGEST: ${{ needs.preauthorization.outputs.artifact_digest }}
+          PREAUTHORIZATION_ID: ${{ needs.preauthorization.outputs.artifact_id }}
+          RECEIPT_DIGEST: ${{ needs.release.outputs.artifact_digest }}
+          RECEIPT_ID: ${{ needs.release.outputs.artifact_id }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" > "$RUNNER_TEMP/final-artifacts.json"
+          jq -e \
+            --argjson pre_id "$PREAUTHORIZATION_ID" --arg pre_digest "$PREAUTHORIZATION_DIGEST" \
+            --argjson unsigned_id "$RECEIPT_ID" --arg unsigned_digest "$RECEIPT_DIGEST" \
+            --argjson signed_id "$CONFIRMED_ID" --arg signed_digest "$CONFIRMED_DIGEST" \
+            --arg run_id "$RUN_ID" '
+              .total_count == 3 and (.artifacts | length) == 3 and
+              ([.artifacts[].name] | sort) == ([
+                "production-orphan-lock-finalization-" + $run_id + "-1",
+                "unsigned-production-orphan-lock-release-" + $run_id + "-1",
+                "production-orphan-lock-release-" + $run_id + "-1"
+              ] | sort) and
+              any(.artifacts[]; .id == $pre_id and .digest == $pre_digest) and
+              any(.artifacts[]; .id == $unsigned_id and .digest == $unsigned_digest) and
+              any(.artifacts[]; .id == $signed_id and .digest == $signed_digest) and
+              all(.artifacts[]; .expired == false and .workflow_run.id == ($run_id | tonumber))
+            ' "$RUNNER_TEMP/final-artifacts.json" > /dev/null
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+
+      - name: Report truthful lock-only finalization summary
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          RECEIPT_SHA256: ${{ needs.release.outputs.receipt_sha256 }}
+        run: |
+          set -euo pipefail
+          {
+            printf '### Exact production orphan lock finalization\n\n'
+            printf -- '- Control SHA: `%s`\n' "$CONTROL_SHA"
+            printf -- '- Confirmed release receipt SHA-256: `%s`\n' "$RECEIPT_SHA256"
+            printf -- '- Main branch lock release: GET-confirmed and signed\n'
+            printf -- '- Production app/environment/provider mutation: none\n'
+          } >> "$GITHUB_STEP_SUMMARY"

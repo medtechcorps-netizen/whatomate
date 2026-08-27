@@ -25,6 +25,16 @@ from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 
 PHASES = ["baseline", "bridge", "backend", "ui"]
+STATES = ["genesis", *PHASES]
+ROLLBACK_FLOORS = {
+    "baseline": {"allowed_targets": [], "forbidden_targets": []},
+    "bridge": {"allowed_targets": ["baseline"], "forbidden_targets": []},
+    "backend": {"allowed_targets": ["bridge"], "forbidden_targets": ["baseline"]},
+    "ui": {
+        "allowed_targets": ["backend", "bridge"],
+        "forbidden_targets": ["baseline"],
+    },
+}
 COMPONENT_COLLECTIONS = ("services", "jobs")
 EMPTY_COMPONENT_COLLECTIONS = ("workers", "static_sites", "functions")
 SOURCE_FIELDS = ("git", "dockerfile_path", "image")
@@ -48,7 +58,17 @@ EXPECTED_INPUT_KEYS = {
     "capsule_artifact_id",
     "capsule_artifact_digest",
     "rollout_plan_sha256",
+    "predecessor",
 }
+PREDECESSOR_INPUT_KEYS = {
+    "run_id",
+    "run_attempt",
+    "artifact_id",
+    "artifact_digest",
+    "state_sha256",
+}
+DEFAULT_POLICY_PATH = Path(__file__).with_name("production-release-policy.json")
+DEFAULT_CHANGE_SCHEMA_PATH = Path(__file__).with_name("production-change.schema.json")
 PRODUCTION_APP_NAME = "rereply"
 PRODUCTION_APP_ID_SHA256 = (
     "c8c3b97aa3face41a6c2d1357807fa979e8a9bf2db25fff3f31b98dfa2019a31"
@@ -57,7 +77,7 @@ PRODUCTION_DEFAULT_INGRESS_SHA256 = (
     "05ab4f90194ad37c6926138e9aafbd49c73aa75d08da92b0b1309bfce207cfa8"
 )
 BOOTSTRAP_UPDATED_AT_SHA256 = (
-    "c849930716929c0f80937eb213f3505c104c4eca913fc03934b8ea6f9a73f3df"
+    "caf1e8153dec3481826e02af1c223ab771791bb806eac294d92c55d1d4ebb345"
 )
 BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
     "439ecb65c0e711036d39b26a4d38b91f555dad32325dbdd86544230743d3cb0f"
@@ -400,6 +420,554 @@ def require_timestamp(value: Any, label: str) -> str:
     return raw
 
 
+def validate_release_policy(value: Any) -> dict[str, Any]:
+    policy = exact_keys(
+        value,
+        {
+            "schema_version",
+            "authority",
+            "repository",
+            "state_order",
+            "activation_transitions",
+            "rollback_floors",
+            "lineage",
+            "planning",
+            "phase_state",
+            "single_operator",
+        },
+        "production release policy",
+    )
+    exact_int(policy["schema_version"], "release policy schema version", 1, 1)
+    if policy["authority"] != "observation-only-phase-lineage":
+        fail("release policy authority differs")
+    if policy["repository"] != "medtechcorps-netizen/whatomate":
+        fail("release policy repository differs")
+    if policy["state_order"] != STATES:
+        fail("release state order differs")
+
+    expected_transitions = [
+        {"from": STATES[index], "to": STATES[index + 1], "ordinal": index + 1}
+        for index in range(len(STATES) - 1)
+    ]
+    transitions = policy["activation_transitions"]
+    if transitions != expected_transitions:
+        fail("activation transitions differ")
+    if policy["rollback_floors"] != ROLLBACK_FLOORS:
+        fail("release rollback floors differ")
+    if policy["lineage"] != {
+        "sequence_model": "monotonic-event-chain",
+        "initial_event_sequence": 1,
+        "phase_ordinal_range": [1, 4],
+        "phase_is_current_state": True,
+        "rollback_canary_required": True,
+    }:
+        fail("release lineage model differs")
+
+    planning = exact_keys(
+        policy["planning"],
+        {
+            "workflow_path",
+            "environment",
+            "concurrency_group",
+            "maximum_age_seconds",
+            "operation",
+            "anonymous_target_pullability_required",
+            "predicate_type",
+        },
+        "release planning policy",
+    )
+    if planning != {
+        "workflow_path": ".github/workflows/plan-production-rollout.yml",
+        "environment": "rereply-production-plan",
+        "concurrency_group": "rereply-production",
+        "maximum_age_seconds": 900,
+        "operation": "activate",
+        "anonymous_target_pullability_required": True,
+        "predicate_type": (
+            "https://rereply.app/attestations/observation-only-production-plan/v2"
+        ),
+    }:
+        fail("release planning policy differs")
+
+    phase_state = exact_keys(
+        policy["phase_state"],
+        {
+            "workflow_path",
+            "workflow_name",
+            "gate_job_name",
+            "predicate_type",
+            "artifact_files",
+            "maximum_bytes",
+            "required_gates",
+        },
+        "phase-state policy",
+    )
+    if phase_state != {
+        "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
+        "workflow_name": "Verify Production CRM Canary",
+        "gate_job_name": "Exact production phase gate",
+        "predicate_type": (
+            "https://rereply.app/attestations/production-phase-state/v1"
+        ),
+        "artifact_files": [
+            "production-phase-state.json",
+            "production-phase-state.sha256",
+        ],
+        "maximum_bytes": 131072,
+        "required_gates": [
+            "deployment_succeeded",
+            "migration_succeeded",
+            "canary_succeeded",
+        ],
+    }:
+        fail("phase-state policy differs")
+
+    single_operator = exact_keys(
+        policy["single_operator"],
+        {
+            "required_reviewers",
+            "protected_main_required",
+            "latest_attempt_required",
+            "latest_successful_predecessor_required",
+            "automatic_advance_allowed",
+        },
+        "single-operator policy",
+    )
+    if single_operator != {
+        "required_reviewers": 0,
+        "protected_main_required": True,
+        "latest_attempt_required": True,
+        "latest_successful_predecessor_required": True,
+        "automatic_advance_allowed": False,
+    }:
+        fail("single-operator release policy differs")
+    return policy
+
+
+def validate_change_schema(value: Any) -> dict[str, Any]:
+    schema = exact_keys(
+        value,
+        {"$schema", "$id", "title", "$ref", "$defs"},
+        "production change schema",
+    )
+    if schema["$schema"] != "https://json-schema.org/draft/2020-12/schema":
+        fail("production change JSON Schema dialect differs")
+    if schema["$id"] != "https://rereply.app/schemas/production-phase-state-v1.json":
+        fail("production change schema identity differs")
+    if schema["title"] != "ReReply signed production phase state":
+        fail("production change schema title differs")
+    if schema["$ref"] != "#/$defs/phaseState":
+        fail("production change schema root differs")
+
+    def ref(name: str) -> dict[str, str]:
+        return {"$ref": f"#/$defs/{name}"}
+
+    def closed_object(
+        required: list[str],
+        properties: dict[str, Any],
+        *,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "type": "object",
+            "additionalProperties": False,
+        }
+        if extra is not None:
+            result.update(extra)
+        result["required"] = required
+        result["properties"] = properties
+        return result
+
+    definitions = schema["$defs"]
+    expected_atomic = {
+        "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "runId": {"type": "string", "pattern": "^[1-9][0-9]{0,14}$"},
+        "attempt": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2_147_483_647,
+        },
+        "timestamp": {
+            "type": "string",
+            "pattern": (
+                "^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+                "[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+            ),
+        },
+        "phase": {"enum": PHASES},
+        "state": {"enum": STATES},
+        "operation": {"enum": ["activate", "rollback"]},
+    }
+    image_definitions = {
+        "imageWeb": "web",
+        "imageMetaRelay": "meta-relay",
+        "imageGmailRelay": "gmail-relay",
+    }
+    if type(definitions) is not dict or set(definitions) != (
+        set(expected_atomic)
+        | set(image_definitions)
+        | {
+            "artifactBinding",
+            "rollback",
+            "phaseState",
+        }
+    ):
+        fail("production change schema definitions differ")
+    for name, expected in expected_atomic.items():
+        if definitions[name] != expected:
+            fail(f"production change schema {name} definition differs")
+
+    expected_artifact_binding = closed_object(
+        [
+            "run_id",
+            "run_attempt",
+            "artifact_id",
+            "artifact_name",
+            "artifact_digest",
+            "sha256",
+        ],
+        {
+            "run_id": ref("runId"),
+            "run_attempt": {"const": 1},
+            "artifact_id": ref("runId"),
+            "artifact_name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+            },
+            "artifact_digest": ref("digest"),
+            "sha256": ref("sha256"),
+        },
+    )
+    if definitions["artifactBinding"] != expected_artifact_binding:
+        fail("production change schema artifact binding differs")
+
+    for name, component in image_definitions.items():
+        repository = (
+            "ghcr.io/medtechcorps-netizen/"
+            f"rereply-release-{component}"
+        )
+        expected_image = closed_object(
+            ["component", "repository", "digest", "subject"],
+            {
+                "component": {"const": component},
+                "repository": {"const": repository},
+                "digest": ref("digest"),
+                "subject": {
+                    "type": "string",
+                    "pattern": (
+                        "^ghcr\\.io/medtechcorps-netizen/"
+                        f"rereply-release-{component}"
+                        "@sha256:[0-9a-f]{64}$"
+                    ),
+                },
+            },
+            extra={"x-rereply-subject-template": f"{repository}@{{digest}}"},
+        )
+        if definitions[name] != expected_image:
+            fail(f"production change schema {component} image binding differs")
+
+    expected_rollback = closed_object(
+        ["allowed_targets", "forbidden_targets"],
+        {
+            "allowed_targets": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": ref("phase"),
+            },
+            "forbidden_targets": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": ref("phase"),
+            },
+        },
+    )
+    if definitions["rollback"] != expected_rollback:
+        fail("production change schema rollback definition differs")
+
+    receipt_conditions = [
+        {
+            "if": {
+                "required": ["operation"],
+                "properties": {"operation": {"const": operation}},
+            },
+            "then": {
+                "properties": {
+                    "predecessor_kind": {"enum": predecessor_kinds}
+                }
+            },
+        }
+        for operation, predecessor_kinds in (
+            (
+                "activate",
+                [
+                    "apply-receipt",
+                    "apply-reconciled-receipt",
+                    "reconciliation-receipt",
+                ],
+            ),
+            (
+                "rollback",
+                [
+                    "rollback-receipt",
+                    "rollback-reconciled-receipt",
+                    "orphan-rollback-receipt",
+                    "reconciliation-receipt",
+                ],
+            ),
+        )
+    ]
+    lineage_required = [
+        "event_sequence",
+        "phase_ordinal",
+        "operation",
+        "from",
+        "to",
+        "predecessor_kind",
+        "predecessor_state_sha256",
+        "phase",
+        "phase_source_sha",
+    ]
+    expected_lineage = closed_object(
+        lineage_required,
+        {
+            "event_sequence": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2_147_483_647,
+            },
+            "phase_ordinal": {"type": "integer", "minimum": 1, "maximum": 4},
+            "operation": ref("operation"),
+            "from": ref("state"),
+            "to": ref("phase"),
+            "predecessor_kind": {
+                "enum": [
+                    "apply-receipt",
+                    "apply-reconciled-receipt",
+                    "rollback-receipt",
+                    "rollback-reconciled-receipt",
+                    "orphan-rollback-receipt",
+                    "reconciliation-receipt",
+                ]
+            },
+            "predecessor_state_sha256": ref("sha256"),
+            "phase": ref("phase"),
+            "phase_source_sha": ref("sha1"),
+        },
+        extra={"allOf": receipt_conditions},
+    )
+
+    control_required = [
+        "workflow_sha",
+        "workflow_path",
+        "run_id",
+        "run_attempt",
+        "runner_environment",
+        "release_policy_sha256",
+        "change_schema_sha256",
+    ]
+    expected_control = closed_object(
+        control_required,
+        {
+            "workflow_sha": ref("sha1"),
+            "workflow_path": {
+                "const": ".github/workflows/verify-production-crm-canary.yml"
+            },
+            "run_id": ref("runId"),
+            "run_attempt": ref("attempt"),
+            "runner_environment": {"const": "github-hosted"},
+            "release_policy_sha256": ref("sha256"),
+            "change_schema_sha256": ref("sha256"),
+        },
+    )
+
+    provider_required = [
+        "app_identity_sha256",
+        "default_ingress_sha256",
+        "app_updated_at_sha256",
+        "active_deployment_identity_sha256",
+        "canonical_spec_sha256",
+        "environment_values_sha256",
+        "non_source_projection_sha256",
+        "source_mode",
+        "images",
+    ]
+    provider_hash_properties = {
+        name: ref("sha256")
+        for name in provider_required[:7]
+    }
+    expected_provider = closed_object(
+        provider_required,
+        {
+            **provider_hash_properties,
+            "source_mode": {"const": "digest-images"},
+            "images": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "uniqueItems": True,
+                "prefixItems": [
+                    ref("imageWeb"),
+                    ref("imageMetaRelay"),
+                    ref("imageGmailRelay"),
+                ],
+                "items": False,
+            },
+        },
+    )
+
+    evidence_required = [
+        "rollout_plan_sha256",
+        "production_plan_sha256",
+        "recovery_sha256",
+        "change_receipt_sha256",
+        "canary_sha256",
+    ]
+    expected_evidence = closed_object(
+        evidence_required,
+        {
+            **{name: ref("sha256") for name in evidence_required},
+            "change_receipt_binding": ref("artifactBinding"),
+            "main_lock_release_reconciliation_binding": ref("artifactBinding"),
+        },
+    )
+    gate_required = [
+        "deployment_succeeded",
+        "migration_succeeded",
+        "canary_succeeded",
+    ]
+    expected_gates = closed_object(
+        gate_required,
+        {name: {"const": True} for name in gate_required},
+    )
+
+    rollback_conditions = [
+        {
+            "if": {
+                "properties": {
+                    "lineage": {
+                        "properties": {"phase": {"const": phase}}
+                    }
+                }
+            },
+            "then": {
+                "properties": {
+                    "rollback": {"const": ROLLBACK_FLOORS[phase]}
+                }
+            },
+        }
+        for phase in PHASES
+    ]
+    v1_receipt_conditions = [
+        {
+            "if": {
+                "required": ["operation"],
+                "properties": {"operation": {"const": operation}},
+            },
+            "then": {
+                "properties": {
+                    "predecessor_kind": {"enum": predecessor_kinds}
+                }
+            },
+        }
+        for operation, predecessor_kinds in (
+            ("activate", ["apply-receipt", "reconciliation-receipt"]),
+            (
+                "rollback",
+                [
+                    "rollback-receipt",
+                    "orphan-rollback-receipt",
+                    "reconciliation-receipt",
+                ],
+            ),
+        )
+    ]
+    version_conditions = [
+        {
+            "if": {
+                "required": ["schema_version"],
+                "properties": {"schema_version": {"const": 1}},
+            },
+            "then": {
+                "properties": {
+                    "lineage": {"allOf": v1_receipt_conditions},
+                    "evidence": {
+                        "not": {
+                            "anyOf": [
+                                {"required": ["change_receipt_binding"]},
+                                {
+                                    "required": [
+                                        "main_lock_release_reconciliation_binding"
+                                    ]
+                                },
+                            ]
+                        }
+                    }
+                }
+            },
+        },
+        {
+            "if": {
+                "required": ["schema_version"],
+                "properties": {"schema_version": {"const": 2}},
+            },
+            "then": {
+                "properties": {
+                    "lineage": {
+                        "properties": {
+                            "predecessor_kind": {
+                                "enum": [
+                                    "apply-reconciled-receipt",
+                                    "rollback-reconciled-receipt",
+                                ]
+                            }
+                        }
+                    },
+                    "evidence": {
+                        "required": [
+                            "change_receipt_binding",
+                            "main_lock_release_reconciliation_binding",
+                        ]
+                    },
+                }
+            },
+        },
+    ]
+    root_required = [
+        "schema_version",
+        "authority",
+        "repository",
+        "completed_at",
+        "control",
+        "lineage",
+        "provider_state",
+        "evidence",
+        "gates",
+        "rollback",
+    ]
+    expected_root = closed_object(
+        root_required,
+        {
+            "schema_version": {"enum": [1, 2]},
+            "authority": {"const": "production-phase-state"},
+            "repository": {"const": "medtechcorps-netizen/whatomate"},
+            "completed_at": ref("timestamp"),
+            "control": expected_control,
+            "lineage": expected_lineage,
+            "provider_state": expected_provider,
+            "evidence": expected_evidence,
+            "gates": expected_gates,
+            "rollback": ref("rollback"),
+        },
+        extra={"allOf": rollback_conditions + version_conditions},
+    )
+    if definitions["phaseState"] != expected_root:
+        fail("production phase-state schema constraints differ")
+    return schema
+
+
 def component_index(spec: Mapping[str, Any], collection: str) -> dict[str, dict[str, Any]]:
     raw = spec.get(collection, [])
     if type(raw) is not list:
@@ -486,7 +1054,17 @@ def non_source_fingerprint(spec: Mapping[str, Any], contract: Mapping[str, Any])
     return sha256_value(strip_component_sources(spec, contract))
 
 
-def validate_contract(value: Any) -> dict[str, Any]:
+def validate_contract(
+    value: Any,
+    policy_value: Any | None = None,
+    schema_value: Any | None = None,
+) -> dict[str, Any]:
+    if policy_value is None:
+        policy_value = load_json(DEFAULT_POLICY_PATH, "production release policy")
+    if schema_value is None:
+        schema_value = load_json(DEFAULT_CHANGE_SCHEMA_PATH, "production change schema")
+    policy = validate_release_policy(policy_value)
+    validate_change_schema(schema_value)
     contract = exact_keys(
         value,
         {
@@ -494,6 +1072,7 @@ def validate_contract(value: Any) -> dict[str, Any]:
             "repository",
             "authority",
             "workflow",
+            "lineage",
             "provider",
             "bootstrap_state",
             "components",
@@ -506,7 +1085,7 @@ def validate_contract(value: Any) -> dict[str, Any]:
         },
         "production app contract",
     )
-    exact_int(contract["schema_version"], "contract schema version", 1, 1)
+    exact_int(contract["schema_version"], "contract schema version", 2, 2)
     if contract["repository"] != "medtechcorps-netizen/whatomate":
         fail("contract repository differs")
     if contract["authority"] != "observation-only":
@@ -523,6 +1102,22 @@ def validate_contract(value: Any) -> dict[str, Any]:
         "concurrency_group": "rereply-production",
     }:
         fail("contract workflow identity differs")
+
+    lineage = exact_keys(
+        contract["lineage"],
+        {
+            "release_policy_path",
+            "change_schema_path",
+            "phase_state_predicate_type",
+        },
+        "contract lineage",
+    )
+    if lineage != {
+        "release_policy_path": "release/deployment/production-release-policy.json",
+        "change_schema_path": "release/deployment/production-change.schema.json",
+        "phase_state_predicate_type": policy["phase_state"]["predicate_type"],
+    }:
+        fail("contract lineage identity differs")
 
     provider = exact_keys(
         contract["provider"],
@@ -570,6 +1165,7 @@ def validate_contract(value: Any) -> dict[str, Any]:
     bootstrap = exact_keys(
         contract["bootstrap_state"],
         {
+            "genesis_state_sha256",
             "app_updated_at_sha256",
             "active_deployment_id_sha256",
             "canonical_spec_sha256",
@@ -577,10 +1173,13 @@ def validate_contract(value: Any) -> dict[str, Any]:
             "non_source_projection_sha256",
             "source_mode",
             "source_sha",
-            "next_phase",
         },
         "bootstrap state",
     )
+    if require_sha256(
+        bootstrap["genesis_state_sha256"], "bootstrap genesis state hash"
+    ) != genesis_state_sha256(contract):
+        fail("bootstrap genesis state hash differs")
     if require_sha256(
         bootstrap["app_updated_at_sha256"], "bootstrap app timestamp hash"
     ) != BOOTSTRAP_UPDATED_AT_SHA256:
@@ -606,8 +1205,6 @@ def validate_contract(value: Any) -> dict[str, Any]:
         fail("bootstrap source mode differs")
     if require_sha1(bootstrap["source_sha"], "bootstrap source SHA") != BOOTSTRAP_SOURCE_SHA:
         fail("bootstrap source SHA differs")
-    if bootstrap["next_phase"] != "baseline":
-        fail("bootstrap next phase differs")
 
     components = contract["components"]
     if type(components) is not list or len(components) != 4:
@@ -696,6 +1293,7 @@ def validate_contract(value: Any) -> dict[str, Any]:
             "add_field",
             "forbidden_image_fields",
             "migration_binding",
+            "anonymous_pullability",
         },
         "logical source transform",
     )
@@ -706,6 +1304,21 @@ def validate_contract(value: Any) -> dict[str, Any]:
         "add_field": "image",
         "forbidden_image_fields": ["tag", "deploy_on_push", "registry_credentials"],
         "migration_binding": "same-web-image-digest",
+        "anonymous_pullability": {
+            "mode": "anonymous-exact-digest",
+            "release_image_workflow_path": (
+                ".github/workflows/build-attest-exact-release-images.yml"
+            ),
+            "release_image_gate_job_name": "Exact release image gate",
+            "release_image_proof_step_name": (
+                "Require anonymous pullability of every exact release digest"
+            ),
+            "plan_recheck_step_name": (
+                "Require current anonymous pullability of every target digest"
+            ),
+            "fresh_docker_config_required": True,
+            "registry_credentials_allowed": False,
+        },
     }:
         fail("logical source transform differs")
 
@@ -789,6 +1402,8 @@ def validate_contract(value: Any) -> dict[str, Any]:
     exact_int(plan["maximum_age_seconds"], "plan maximum age", 60, 1800)
     if plan["phase_order"] != PHASES:
         fail("plan phase order differs")
+    if plan["maximum_age_seconds"] != policy["planning"]["maximum_age_seconds"]:
+        fail("plan maximum age differs from release policy")
 
     artifact = exact_keys(
         contract["artifact"], {"files", "maximum_bytes"}, "artifact policy"
@@ -831,6 +1446,7 @@ def validate_contract(value: Any) -> dict[str, Any]:
         {
             "token_environment",
             "target_environment",
+            "target_fields",
             "forbidden_ambient_environment",
         },
         "security policy",
@@ -839,6 +1455,8 @@ def validate_contract(value: Any) -> dict[str, Any]:
         fail("read token environment differs")
     if security["target_environment"] != "DO_PRODUCTION_TARGET_JSON":
         fail("protected target environment differs")
+    if security["target_fields"] != ["app_id", "default_ingress"]:
+        fail("protected target fields differ")
     if security["forbidden_ambient_environment"] != [
         "DIGITALOCEAN_ACCESS_TOKEN",
         "DO_ACCESS_TOKEN",
@@ -854,16 +1472,10 @@ def normalize_target_descriptor(
 ) -> dict[str, str]:
     value = exact_keys(
         loads_strict(raw),
-        {"app_id", "active_deployment_id", "app_updated_at", "default_ingress"},
+        {"app_id", "default_ingress"},
         "protected production target descriptor",
     )
     app_id = require_uuid(value["app_id"], "protected app ID")
-    active_deployment_id = require_uuid(
-        value["active_deployment_id"], "protected active deployment ID"
-    )
-    app_updated_at = require_timestamp(
-        value["app_updated_at"], "protected app timestamp"
-    )
     default_ingress = exact_string(
         value["default_ingress"], "protected default ingress", maximum=512
     )
@@ -882,16 +1494,10 @@ def normalize_target_descriptor(
 
     expected_hashes = {
         "app_id": contract["provider"]["app_id_sha256"],
-        "active_deployment_id": contract["bootstrap_state"][
-            "active_deployment_id_sha256"
-        ],
-        "app_updated_at": contract["bootstrap_state"]["app_updated_at_sha256"],
         "default_ingress": contract["provider"]["default_ingress_sha256"],
     }
     normalized = {
         "app_id": app_id,
-        "active_deployment_id": active_deployment_id,
-        "app_updated_at": app_updated_at,
         "default_ingress": default_ingress,
     }
     for key, expected in expected_hashes.items():
@@ -901,14 +1507,19 @@ def normalize_target_descriptor(
 
 
 def provider_paths(
-    contract: Mapping[str, Any], target: Mapping[str, str]
+    contract: Mapping[str, Any],
+    target: Mapping[str, str],
+    active_deployment_id: str,
 ) -> tuple[str, str]:
+    active_deployment_id = require_uuid(
+        active_deployment_id, "observed active deployment ID"
+    )
     templates = contract["provider"]["allowed_path_templates"]
     app_path = templates[0].replace("{app_id}", target["app_id"])
     deployment_path = (
         templates[1]
         .replace("{app_id}", target["app_id"])
-        .replace("{active_deployment_id}", target["active_deployment_id"])
+        .replace("{active_deployment_id}", active_deployment_id)
     )
     if "{" in app_path or "}" in app_path or "{" in deployment_path or "}" in deployment_path:
         fail("provider path template was not resolved exactly")
@@ -920,6 +1531,31 @@ def normalize_input(raw: str, control_sha: str) -> dict[str, Any]:
     value = exact_keys(loads_strict(raw), EXPECTED_INPUT_KEYS, "plan input")
     if require_sha1(value["control_sha"], "input control SHA") != control_sha:
         fail("input control SHA differs from workflow SHA")
+    predecessor_raw = value["predecessor"]
+    predecessor: dict[str, Any] | None
+    if predecessor_raw is None:
+        predecessor = None
+    else:
+        predecessor_raw = exact_keys(
+            predecessor_raw, PREDECESSOR_INPUT_KEYS, "predecessor evidence"
+        )
+        predecessor = {
+            "run_id": require_run_id(
+                predecessor_raw["run_id"], "predecessor run ID"
+            ),
+            "run_attempt": exact_int(
+                predecessor_raw["run_attempt"], "predecessor run attempt", 1
+            ),
+            "artifact_id": require_run_id(
+                predecessor_raw["artifact_id"], "predecessor artifact ID"
+            ),
+            "artifact_digest": require_digest(
+                predecessor_raw["artifact_digest"], "predecessor artifact digest"
+            ),
+            "state_sha256": require_sha256(
+                predecessor_raw["state_sha256"], "predecessor state SHA-256"
+            ),
+        }
     result = {
         "control_sha": control_sha,
         "rollout_run_id": require_run_id(value["rollout_run_id"], "rollout run ID"),
@@ -935,6 +1571,7 @@ def normalize_input(raw: str, control_sha: str) -> dict[str, Any]:
         "rollout_plan_sha256": require_sha256(
             value["rollout_plan_sha256"], "rollout plan SHA-256"
         ),
+        "predecessor": predecessor,
     }
     return result
 
@@ -1094,7 +1731,7 @@ def validate_legacy_component_sources(
                     fail("migration job run command differs")
 
 
-def validate_deployment_sources(
+def validate_legacy_deployment_sources(
     deployment: Mapping[str, Any], contract: Mapping[str, Any]
 ) -> None:
     source_sha = contract["bootstrap_state"]["source_sha"]
@@ -1123,45 +1760,26 @@ def validate_deployment_sources(
             fail(f"deployment {collection} source SHA differs")
 
 
-def validate_rollout_plan(
-    value: Any,
+def rollout_phase(
+    value: Mapping[str, Any],
     contract: Mapping[str, Any],
-    normalized_input: Mapping[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    if type(value) is not dict:
-        fail("rollout plan is malformed")
-    if value.get("schema_version") != 1 or value.get("authority") != "digest-only":
-        fail("rollout plan authority differs")
-    if value.get("repository") != contract["repository"]:
-        fail("rollout plan repository differs")
-    if value.get("activation_order") != PHASES:
-        fail("rollout activation order differs")
-    control = value.get("control")
-    if type(control) is not dict:
-        fail("rollout control is malformed")
-    if control.get("workflow_sha") != normalized_input["control_sha"]:
-        fail("rollout control SHA differs")
-    if require_run_id(control.get("run_id"), "rollout plan run ID") != normalized_input[
-        "rollout_run_id"
-    ]:
-        fail("rollout run ID differs")
-    if exact_int(control.get("run_attempt"), "rollout plan run attempt", 1) != normalized_input[
-        "rollout_run_attempt"
-    ]:
-        fail("rollout run attempt differs")
+    phase: str,
+) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
+    if phase not in PHASES:
+        fail("rollout target phase is invalid")
     phases = value.get("phases")
-    if type(phases) is not list or len(phases) != 4:
+    if type(phases) is not list or len(phases) != len(PHASES):
         fail("rollout phases differ")
     if [item.get("phase") if type(item) is dict else None for item in phases] != PHASES:
         fail("rollout phase order differs")
-    target_phase = contract["bootstrap_state"]["next_phase"]
-    target = phases[PHASES.index(target_phase)]
+    target = phases[PHASES.index(phase)]
     source = target.get("source")
-    if type(source) is not dict or source.get("commit") != contract["bootstrap_state"]["source_sha"]:
-        fail("baseline rollout source differs from live source")
+    if type(source) is not dict:
+        fail("rollout source is malformed")
+    require_sha1(source.get("commit"), "rollout source commit")
     images = target.get("images")
     if type(images) is not list or len(images) != 3:
-        fail("baseline rollout image set differs")
+        fail("rollout image set differs")
     expected_images = {
         item["release_component"]: item["image_repository"]
         for item in contract["components"]
@@ -1190,34 +1808,537 @@ def validate_rollout_plan(
     migration = target.get("migration")
     if type(migration) is not dict or migration.get("digest") != observed_images["web"]["digest"]:
         fail("rollout migration/web digest binding differs")
-    rollback = target.get("rollback")
-    if rollback != {"allowed_targets": [], "forbidden_targets": []}:
-        fail("baseline rollback floor differs")
+    rollback = exact_keys(
+        target.get("rollback"),
+        {"allowed_targets", "forbidden_targets"},
+        "rollout rollback floor",
+    )
+    for key in ("allowed_targets", "forbidden_targets"):
+        targets = rollback[key]
+        if (
+            type(targets) is not list
+            or len(targets) != len(set(targets))
+            or any(item not in PHASES for item in targets)
+        ):
+            fail("rollout rollback targets differ")
+    if set(rollback["allowed_targets"]).intersection(rollback["forbidden_targets"]):
+        fail("rollout rollback targets overlap")
+    if rollback != ROLLBACK_FLOORS[phase]:
+        fail("rollout rollback floor differs")
     return target, observed_images
+
+
+def genesis_state_sha256(contract: Mapping[str, Any]) -> str:
+    bootstrap = contract["bootstrap_state"]
+    return sha256_value(
+        {
+            "kind": "genesis",
+            "event_sequence": 0,
+            "phase_ordinal": 0,
+            "phase": "genesis",
+            "app_identity_sha256": contract["provider"]["app_id_sha256"],
+            "default_ingress_sha256": contract["provider"][
+                "default_ingress_sha256"
+            ],
+            "app_updated_at_sha256": bootstrap["app_updated_at_sha256"],
+            "active_deployment_identity_sha256": bootstrap[
+                "active_deployment_id_sha256"
+            ],
+            "canonical_spec_sha256": bootstrap["canonical_spec_sha256"],
+            "environment_values_sha256": bootstrap["environment_values_sha256"],
+            "non_source_projection_sha256": bootstrap[
+                "non_source_projection_sha256"
+            ],
+            "source_mode": bootstrap["source_mode"],
+            "source_sha": bootstrap["source_sha"],
+        }
+    )
+
+
+def validate_full_artifact_binding(value: Any, label: str) -> dict[str, Any]:
+    """Validate an immutable Actions artifact coordinate including its exact name."""
+
+    binding = exact_keys(
+        value,
+        {
+            "run_id",
+            "run_attempt",
+            "artifact_id",
+            "artifact_name",
+            "artifact_digest",
+            "sha256",
+        },
+        label,
+    )
+    require_run_id(binding["run_id"], f"{label} run ID")
+    exact_int(binding["run_attempt"], f"{label} run attempt", 1, 1)
+    require_run_id(binding["artifact_id"], f"{label} artifact ID")
+    artifact_name = exact_string(binding["artifact_name"], f"{label} artifact name")
+    if len(artifact_name) > 256:
+        fail(f"{label} artifact name is too long")
+    require_digest(binding["artifact_digest"], f"{label} artifact digest")
+    require_sha256(binding["sha256"], f"{label} exact-file hash")
+    return binding
+
+
+def validate_phase_state(
+    value: Any,
+    contract: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    normalized_input: Mapping[str, Any],
+    rollout_plan: Mapping[str, Any],
+    policy_sha256: str,
+    schema_sha256: str,
+) -> dict[str, Any]:
+    predecessor_evidence = normalized_input["predecessor"]
+    if predecessor_evidence is None:
+        fail("a phase-state artifact was supplied for genesis")
+    state = exact_keys(
+        value,
+        {
+            "schema_version",
+            "authority",
+            "repository",
+            "completed_at",
+            "control",
+            "lineage",
+            "provider_state",
+            "evidence",
+            "gates",
+            "rollback",
+        },
+        "production phase state",
+    )
+    version = exact_int(state["schema_version"], "phase-state schema version", 1, 2)
+    if state["authority"] != "production-phase-state":
+        fail("phase-state authority differs")
+    if state["repository"] != contract["repository"]:
+        fail("phase-state repository differs")
+    require_timestamp(state["completed_at"], "phase-state completion time")
+
+    control = exact_keys(
+        state["control"],
+        {
+            "workflow_sha",
+            "workflow_path",
+            "run_id",
+            "run_attempt",
+            "runner_environment",
+            "release_policy_sha256",
+            "change_schema_sha256",
+        },
+        "phase-state control",
+    )
+    if require_sha1(control["workflow_sha"], "phase-state control SHA") != normalized_input[
+        "control_sha"
+    ]:
+        fail("phase-state control SHA differs")
+    if control["workflow_path"] != policy["phase_state"]["workflow_path"]:
+        fail("phase-state workflow path differs")
+    if require_run_id(control["run_id"], "phase-state run ID") != predecessor_evidence[
+        "run_id"
+    ]:
+        fail("phase-state run ID differs")
+    if exact_int(control["run_attempt"], "phase-state run attempt", 1) != (
+        predecessor_evidence["run_attempt"]
+    ):
+        fail("phase-state run attempt differs")
+    if control["runner_environment"] != "github-hosted":
+        fail("phase-state runner environment differs")
+    if control["release_policy_sha256"] != require_sha256(
+        policy_sha256, "release policy exact-file hash"
+    ):
+        fail("phase-state release policy hash differs")
+    if control["change_schema_sha256"] != require_sha256(
+        schema_sha256, "change schema exact-file hash"
+    ):
+        fail("phase-state change schema hash differs")
+
+    lineage = exact_keys(
+        state["lineage"],
+        {
+            "event_sequence",
+            "phase_ordinal",
+            "operation",
+            "from",
+            "to",
+            "predecessor_kind",
+            "predecessor_state_sha256",
+            "phase",
+            "phase_source_sha",
+        },
+        "phase-state lineage",
+    )
+    event_sequence = exact_int(
+        lineage["event_sequence"],
+        "phase-state event sequence",
+        1,
+        2147483647,
+    )
+    phase_ordinal = exact_int(
+        lineage["phase_ordinal"], "phase-state phase ordinal", 1, 4
+    )
+    operation = lineage["operation"]
+    source_phase = lineage["from"]
+    target_phase = lineage["to"]
+    phase = lineage["phase"]
+    if (
+        phase not in PHASES
+        or target_phase != phase
+        or phase_ordinal != PHASES.index(phase) + 1
+    ):
+        fail("phase-state current phase differs")
+    if operation == "activate":
+        expected_source = "genesis" if phase == "baseline" else PHASES[
+            PHASES.index(phase) - 1
+        ]
+        if source_phase != expected_source:
+            fail("phase-state activation edge differs")
+    elif operation == "rollback":
+        if (
+            source_phase not in PHASES
+            or phase not in ROLLBACK_FLOORS[source_phase]["allowed_targets"]
+        ):
+            fail("phase-state rollback edge differs")
+    else:
+        fail("phase-state operation differs")
+    predecessor_kind = lineage["predecessor_kind"]
+    if version == 1:
+        expected_kinds = (
+            {"apply-receipt", "reconciliation-receipt"}
+            if operation == "activate"
+            else {
+                "rollback-receipt",
+                "orphan-rollback-receipt",
+                "reconciliation-receipt",
+            }
+        )
+    else:
+        expected_kinds = {
+            "apply-reconciled-receipt"
+            if operation == "activate"
+            else "rollback-reconciled-receipt"
+        }
+    if predecessor_kind not in expected_kinds:
+        fail("phase-state predecessor kind differs")
+    predecessor_hash = require_sha256(
+        lineage["predecessor_state_sha256"], "phase-state predecessor hash"
+    )
+    if event_sequence == 1:
+        if operation != "activate" or source_phase != "genesis" or phase != "baseline":
+            fail("initial phase state does not activate baseline")
+    elif source_phase == "genesis":
+        fail("non-initial phase state cannot start from genesis")
+
+    rollout_phase_value, rollout_images = rollout_phase(rollout_plan, contract, phase)
+    if require_sha1(lineage["phase_source_sha"], "phase-state source SHA") != (
+        rollout_phase_value["source"]["commit"]
+    ):
+        fail("phase-state source SHA differs")
+
+    provider = exact_keys(
+        state["provider_state"],
+        {
+            "app_identity_sha256",
+            "default_ingress_sha256",
+            "app_updated_at_sha256",
+            "active_deployment_identity_sha256",
+            "canonical_spec_sha256",
+            "environment_values_sha256",
+            "non_source_projection_sha256",
+            "source_mode",
+            "images",
+        },
+        "phase-state provider state",
+    )
+    if provider["app_identity_sha256"] != contract["provider"]["app_id_sha256"]:
+        fail("phase-state app identity differs")
+    if provider["default_ingress_sha256"] != contract["provider"][
+        "default_ingress_sha256"
+    ]:
+        fail("phase-state ingress identity differs")
+    for key in (
+        "app_updated_at_sha256",
+        "active_deployment_identity_sha256",
+        "canonical_spec_sha256",
+        "environment_values_sha256",
+        "non_source_projection_sha256",
+    ):
+        require_sha256(provider[key], f"phase-state {key}")
+    if provider["environment_values_sha256"] != contract["bootstrap_state"][
+        "environment_values_sha256"
+    ]:
+        fail("phase-state environment fingerprint differs")
+    if provider["non_source_projection_sha256"] != contract["bootstrap_state"][
+        "non_source_projection_sha256"
+    ]:
+        fail("phase-state non-source fingerprint differs")
+    if provider["source_mode"] != "digest-images":
+        fail("phase-state source mode differs")
+    if provider["images"] != target_image_records(contract, rollout_images):
+        fail("phase-state image set differs")
+
+    evidence_keys = {
+        "rollout_plan_sha256",
+        "production_plan_sha256",
+        "recovery_sha256",
+        "change_receipt_sha256",
+        "canary_sha256",
+    }
+    if version == 2:
+        evidence_keys |= {
+            "change_receipt_binding",
+            "main_lock_release_reconciliation_binding",
+        }
+    evidence = exact_keys(
+        state["evidence"],
+        evidence_keys,
+        "phase-state evidence",
+    )
+    for key in (
+        "rollout_plan_sha256",
+        "production_plan_sha256",
+        "recovery_sha256",
+        "change_receipt_sha256",
+        "canary_sha256",
+    ):
+        require_sha256(evidence[key], f"phase-state {key}")
+    if evidence["rollout_plan_sha256"] != normalized_input["rollout_plan_sha256"]:
+        fail("phase-state rollout plan hash differs")
+    if evidence["change_receipt_sha256"] != predecessor_hash:
+        fail("phase-state consumed receipt binding differs")
+    if version == 2:
+        receipt_binding = validate_full_artifact_binding(
+            evidence["change_receipt_binding"],
+            "phase-state original receipt binding",
+        )
+        release_binding = validate_full_artifact_binding(
+            evidence["main_lock_release_reconciliation_binding"],
+            "phase-state main-lock release reconciliation binding",
+        )
+        expected_receipt_prefix = (
+            "production-phase-apply"
+            if operation == "activate"
+            else "production-phase-rollback"
+        )
+        if (
+            receipt_binding["sha256"] != evidence["change_receipt_sha256"]
+            or receipt_binding["artifact_name"]
+            != f"{expected_receipt_prefix}-{receipt_binding['run_id']}-1"
+            or release_binding["artifact_name"]
+            != (
+                "production-main-lock-release-reconciliation-"
+                f"{release_binding['run_id']}-1"
+            )
+        ):
+            fail("phase-state paired reconciliation bindings differ")
+
+    gates = exact_keys(
+        state["gates"],
+        set(policy["phase_state"]["required_gates"]),
+        "phase-state gates",
+    )
+    if gates != {key: True for key in policy["phase_state"]["required_gates"]}:
+        fail("phase-state success gates differ")
+    if state["rollback"] != rollout_phase_value["rollback"]:
+        fail("phase-state rollback floor differs")
+    sanitize_plan(state, contract)
+    return state
+
+
+def validate_rollout_plan(
+    value: Any,
+    contract: Mapping[str, Any],
+    normalized_input: Mapping[str, Any],
+    *,
+    policy: Mapping[str, Any],
+    policy_sha256: str,
+    schema_sha256: str,
+    predecessor_state: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if type(value) is not dict:
+        fail("rollout plan is malformed")
+    if value.get("schema_version") != 1 or value.get("authority") != "digest-only":
+        fail("rollout plan authority differs")
+    if value.get("repository") != contract["repository"]:
+        fail("rollout plan repository differs")
+    if value.get("activation_order") != PHASES:
+        fail("rollout activation order differs")
+    control = value.get("control")
+    if type(control) is not dict:
+        fail("rollout control is malformed")
+    if control.get("workflow_sha") != normalized_input["control_sha"]:
+        fail("rollout control SHA differs")
+    if require_run_id(control.get("run_id"), "rollout plan run ID") != normalized_input[
+        "rollout_run_id"
+    ]:
+        fail("rollout run ID differs")
+    if exact_int(control.get("run_attempt"), "rollout plan run attempt", 1) != normalized_input[
+        "rollout_run_attempt"
+    ]:
+        fail("rollout run attempt differs")
+    if normalized_input["predecessor"] is None:
+        if predecessor_state is not None:
+            fail("genesis input unexpectedly contains a phase state")
+        predecessor_phase = "genesis"
+        predecessor_event_sequence = 0
+        predecessor_phase_ordinal = 0
+        predecessor_authority = {
+            "kind": "genesis",
+            "event_sequence": 0,
+            "phase_ordinal": 0,
+            "phase": "genesis",
+            "state_sha256": genesis_state_sha256(contract),
+            "run_id": None,
+            "run_attempt": None,
+            "artifact_id": None,
+            "artifact_digest": None,
+        }
+    else:
+        if predecessor_state is None:
+            fail("phase-state predecessor artifact is missing")
+        predecessor_state = validate_phase_state(
+            predecessor_state,
+            contract,
+            policy,
+            normalized_input,
+            value,
+            policy_sha256,
+            schema_sha256,
+        )
+        if sha256_bytes(canonical_file_bytes(predecessor_state)) != normalized_input[
+            "predecessor"
+        ]["state_sha256"]:
+            fail("phase-state predecessor canonical hash differs")
+        lineage = predecessor_state["lineage"]
+        predecessor_phase = lineage["phase"]
+        predecessor_event_sequence = lineage["event_sequence"]
+        predecessor_phase_ordinal = lineage["phase_ordinal"]
+        evidence = normalized_input["predecessor"]
+        predecessor_authority = {
+            "kind": "phase-state",
+            "event_sequence": predecessor_event_sequence,
+            "phase_ordinal": predecessor_phase_ordinal,
+            "phase": predecessor_phase,
+            "state_sha256": evidence["state_sha256"],
+            "run_id": evidence["run_id"],
+            "run_attempt": evidence["run_attempt"],
+            "artifact_id": evidence["artifact_id"],
+            "artifact_digest": evidence["artifact_digest"],
+        }
+    phase_ordinal = 0 if predecessor_phase == "genesis" else (
+        PHASES.index(predecessor_phase) + 1
+    )
+    if phase_ordinal >= len(PHASES):
+        fail("the signed UI phase is terminal")
+    target_phase = PHASES[phase_ordinal]
+    transition = {
+        "operation": policy["planning"]["operation"],
+        "from": predecessor_phase,
+        "to": target_phase,
+        "ordinal": phase_ordinal + 1,
+    }
+    expected_transition = policy["activation_transitions"][phase_ordinal]
+    if transition != {"operation": "activate", **expected_transition}:
+        fail("production activation transition differs")
+    target, observed_images = rollout_phase(value, contract, target_phase)
+    if target_phase == "baseline" and target["source"]["commit"] != contract[
+        "bootstrap_state"
+    ]["source_sha"]:
+        fail("baseline rollout source differs from genesis")
+    return target, observed_images, transition, predecessor_authority
+
+
+def validate_digest_component_sources(
+    spec: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    images: Mapping[str, Mapping[str, str]],
+) -> None:
+    expected_by_collection: dict[str, dict[str, Mapping[str, Any]]] = {
+        collection: {} for collection in COMPONENT_COLLECTIONS
+    }
+    for item in contract["components"]:
+        expected_by_collection[item["collection"]][item["app_name"]] = item
+    for collection in COMPONENT_COLLECTIONS:
+        observed = component_index(spec, collection)
+        if set(observed) != set(expected_by_collection[collection]):
+            fail(f"production {collection} component set differs")
+        for name, component in observed.items():
+            expected = expected_by_collection[collection][name]
+            if set(component).intersection(SOURCE_SELECTORS) != {"image"}:
+                fail(f"digest image source selector is not exact for {name}")
+            if "dockerfile_path" in component:
+                fail(f"digest image component retains a Dockerfile for {name}")
+            image = exact_keys(
+                component.get("image"),
+                {"registry_type", "registry", "repository", "digest"},
+                f"digest image source for {name}",
+            )
+            release_image = images[expected["release_component"]]
+            if image != {
+                "registry_type": contract["logical_source_transform"]["registry_type"],
+                "registry": contract["logical_source_transform"]["registry"],
+                "repository": release_image["repository"],
+                "digest": release_image["digest"],
+            }:
+                fail(f"digest image source differs for {name}")
+            if collection == "services":
+                if component.get("http_port") != expected["http_port"]:
+                    fail(f"HTTP port differs for {name}")
+                health = component.get("health_check")
+                if type(health) is not dict or health.get("http_path") != expected[
+                    "health_path"
+                ]:
+                    fail(f"health path differs for {name}")
+            else:
+                if component.get("kind") != expected["kind"]:
+                    fail("migration job kind differs")
+                if component.get("run_command") != expected["run_command"]:
+                    fail("migration job run command differs")
 
 
 def build_logical_candidate(
     live_spec: Mapping[str, Any],
     contract: Mapping[str, Any],
     images: Mapping[str, Mapping[str, str]],
+    source_mode: str,
 ) -> dict[str, Any]:
     candidate = copy.deepcopy(live_spec)
     for expected in contract["components"]:
         component = component_index(candidate, expected["collection"])[expected["app_name"]]
-        if set(component).intersection(SOURCE_SELECTORS) != {"git"}:
-            fail("live source selector is not exact")
-        if set(SOURCE_FIELDS).intersection(component) != {"git", "dockerfile_path"}:
-            fail("live source envelope is not exact")
-        component.pop("git")
-        component.pop("dockerfile_path")
         release_component = expected["release_component"]
         image = images[release_component]
-        component["image"] = {
-            "registry_type": contract["logical_source_transform"]["registry_type"],
-            "registry": contract["logical_source_transform"]["registry"],
-            "repository": image["repository"],
-            "digest": image["digest"],
-        }
+        if source_mode == "legacy-git":
+            if set(component).intersection(SOURCE_SELECTORS) != {"git"}:
+                fail("live legacy source selector is not exact")
+            if set(SOURCE_FIELDS).intersection(component) != {"git", "dockerfile_path"}:
+                fail("live legacy source envelope is not exact")
+            component.pop("git")
+            component.pop("dockerfile_path")
+            component["image"] = {
+                "registry_type": contract["logical_source_transform"]["registry_type"],
+                "registry": contract["logical_source_transform"]["registry"],
+                "repository": image["repository"],
+                "digest": image["digest"],
+            }
+        elif source_mode == "digest-images":
+            if set(component).intersection(SOURCE_SELECTORS) != {"image"}:
+                fail("live digest source selector is not exact")
+            current = exact_keys(
+                component.get("image"),
+                {"registry_type", "registry", "repository", "digest"},
+                "live digest source envelope",
+            )
+            if current["registry_type"] != contract["logical_source_transform"][
+                "registry_type"
+            ] or current["registry"] != contract["logical_source_transform"]["registry"]:
+                fail("live digest registry differs")
+            if current["repository"] != image["repository"]:
+                fail("live digest repository differs")
+            require_digest(current["digest"], "live image digest")
+            component["image"] = {**current, "digest": image["digest"]}
+        else:
+            fail("live source mode is outside the phase lineage")
         if set(component["image"]).intersection(
             contract["logical_source_transform"]["forbidden_image_fields"]
         ):
@@ -1229,11 +2350,57 @@ def build_logical_candidate(
     return candidate
 
 
+def predecessor_provider_expectation(
+    contract: Mapping[str, Any],
+    rollout_plan: Mapping[str, Any],
+    predecessor_state: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, dict[str, str]] | None]:
+    if predecessor_state is None:
+        bootstrap = contract["bootstrap_state"]
+        return (
+            {
+                "app_updated_at_sha256": bootstrap["app_updated_at_sha256"],
+                "active_deployment_identity_sha256": bootstrap[
+                    "active_deployment_id_sha256"
+                ],
+                "canonical_spec_sha256": bootstrap["canonical_spec_sha256"],
+                "environment_values_sha256": bootstrap[
+                    "environment_values_sha256"
+                ],
+                "non_source_projection_sha256": bootstrap[
+                    "non_source_projection_sha256"
+                ],
+                "source_mode": bootstrap["source_mode"],
+            },
+            None,
+        )
+    phase = predecessor_state["lineage"]["phase"]
+    _, images = rollout_phase(rollout_plan, contract, phase)
+    provider = predecessor_state["provider_state"]
+    return (
+        {
+            "app_updated_at_sha256": provider["app_updated_at_sha256"],
+            "active_deployment_identity_sha256": provider[
+                "active_deployment_identity_sha256"
+            ],
+            "canonical_spec_sha256": provider["canonical_spec_sha256"],
+            "environment_values_sha256": provider["environment_values_sha256"],
+            "non_source_projection_sha256": provider[
+                "non_source_projection_sha256"
+            ],
+            "source_mode": provider["source_mode"],
+        },
+        images,
+    )
+
+
 def provider_state(
     app_response: Any,
     deployment_response: Any,
     contract: Mapping[str, Any],
     target: Mapping[str, str],
+    expected_state: Mapping[str, Any],
+    expected_images: Mapping[str, Mapping[str, str]] | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if type(app_response) is not dict or type(app_response.get("app")) is not dict:
         fail("provider app response is malformed")
@@ -1242,7 +2409,6 @@ def provider_state(
     app = app_response["app"]
     deployment = deployment_response["deployment"]
     provider = contract["provider"]
-    bootstrap = contract["bootstrap_state"]
 
     if require_uuid(app.get("id"), "observed app ID") != target["app_id"]:
         fail("observed app ID differs")
@@ -1254,15 +2420,17 @@ def provider_state(
     if app.get("default_ingress") != target["default_ingress"]:
         fail("observed provider default ingress differs")
     updated_at = require_timestamp(app.get("updated_at"), "observed app updated_at")
-    if updated_at != target["app_updated_at"]:
-        fail("observed app updated_at differs from the reviewed bootstrap")
+    updated_at_sha256 = sha256_bytes(updated_at.encode("utf-8"))
+    if updated_at_sha256 != expected_state["app_updated_at_sha256"]:
+        fail("observed app updated_at differs from the signed predecessor")
 
     active = app.get("active_deployment")
     if type(active) is not dict:
         fail("active deployment is missing")
     active_id = require_uuid(active.get("id"), "active deployment ID")
-    if active_id != target["active_deployment_id"]:
-        fail("active deployment differs from the reviewed bootstrap")
+    active_id_sha256 = sha256_bytes(active_id.encode("utf-8"))
+    if active_id_sha256 != expected_state["active_deployment_identity_sha256"]:
+        fail("active deployment differs from the signed predecessor")
     if active.get("phase") != "ACTIVE":
         fail("active deployment is not ACTIVE")
     for field in ("in_progress_deployment", "pending_deployment", "pinned_deployment"):
@@ -1286,25 +2454,33 @@ def provider_state(
     canonical_spec_sha256 = sha256_value(live_spec)
     environment_sha256 = environment_value_fingerprint(live_spec)
     non_source_sha256 = non_source_fingerprint(live_spec, contract)
-    if canonical_spec_sha256 != bootstrap["canonical_spec_sha256"]:
-        fail("raw production spec differs from the reviewed bootstrap")
-    if environment_sha256 != bootstrap["environment_values_sha256"]:
-        fail("production environment values differ from the reviewed bootstrap")
-    if non_source_sha256 != bootstrap["non_source_projection_sha256"]:
-        fail("production non-source projection differs from the reviewed bootstrap")
+    if canonical_spec_sha256 != expected_state["canonical_spec_sha256"]:
+        fail("raw production spec differs from the signed predecessor")
+    if environment_sha256 != expected_state["environment_values_sha256"]:
+        fail("production environment values differ from the signed predecessor")
+    if non_source_sha256 != expected_state["non_source_projection_sha256"]:
+        fail("production non-source projection differs from the signed predecessor")
 
     validate_topology(live_spec, contract)
-    validate_legacy_component_sources(live_spec, contract)
-    validate_deployment_sources(deployment, contract)
+    source_mode = expected_state["source_mode"]
+    if source_mode == "legacy-git":
+        if expected_images is not None:
+            fail("genesis predecessor unexpectedly contains image authority")
+        validate_legacy_component_sources(live_spec, contract)
+        validate_legacy_deployment_sources(deployment, contract)
+    elif source_mode == "digest-images":
+        if expected_images is None:
+            fail("phase predecessor image authority is missing")
+        validate_digest_component_sources(live_spec, contract, expected_images)
+    else:
+        fail("predecessor source mode differs")
 
     state = {
         "app_identity_sha256": provider["app_id_sha256"],
         "app_name": provider["app_name"],
         "default_ingress_sha256": provider["default_ingress_sha256"],
-        "app_updated_at_sha256": bootstrap["app_updated_at_sha256"],
-        "active_deployment_identity_sha256": bootstrap[
-            "active_deployment_id_sha256"
-        ],
+        "app_updated_at_sha256": updated_at_sha256,
+        "active_deployment_identity_sha256": active_id_sha256,
         "active_phase": "ACTIVE",
         "in_progress_deployment": False,
         "pending_deployment": False,
@@ -1313,8 +2489,9 @@ def provider_state(
         "active_canonical_spec_sha256": sha256_value(active_spec),
         "environment_values_sha256": environment_sha256,
         "non_source_projection_sha256": non_source_sha256,
+        "source_mode": source_mode,
         "live_active_equal": True,
-        "bootstrap_match": True,
+        "predecessor_match": True,
     }
     return state, copy.deepcopy(live_spec)
 
@@ -1392,9 +2569,17 @@ def target_image_records(
     return result
 
 
-def source_mutation_records(contract: Mapping[str, Any]) -> list[str]:
+def source_mutation_records(
+    contract: Mapping[str, Any], source_mode: str
+) -> list[str]:
+    if source_mode == "legacy-git":
+        suffix = "git+dockerfile_path->image"
+    elif source_mode == "digest-images":
+        suffix = "image.digest->image.digest"
+    else:
+        fail("source mutation mode differs")
     return [
-        f"{item['collection']}:{item['app_name']}:git+dockerfile_path->image"
+        f"{item['collection']}:{item['app_name']}:{suffix}"
         for item in contract["components"]
     ]
 
@@ -1403,10 +2588,14 @@ def build_plan(
     *,
     contract: Mapping[str, Any],
     contract_sha256: str,
+    policy: Mapping[str, Any],
+    policy_sha256: str,
+    schema_sha256: str,
     verifier_sha256: str,
     normalized_input: Mapping[str, Any],
     target_descriptor: Mapping[str, str],
     rollout_plan: Mapping[str, Any],
+    predecessor_state: Mapping[str, Any] | None,
     first_app_response: Any,
     first_deployment_response: Any,
     second_app_response: Any,
@@ -1416,18 +2605,43 @@ def build_plan(
     request_log: Sequence[tuple[str, str]],
     now: dt.datetime,
 ) -> dict[str, Any]:
-    target_phase, images = validate_rollout_plan(rollout_plan, contract, normalized_input)
+    target_phase, images, transition, predecessor_authority = validate_rollout_plan(
+        rollout_plan,
+        contract,
+        normalized_input,
+        policy=policy,
+        policy_sha256=policy_sha256,
+        schema_sha256=schema_sha256,
+        predecessor_state=predecessor_state,
+    )
+    expected_state, expected_images = predecessor_provider_expectation(
+        contract, rollout_plan, predecessor_state
+    )
     first_state, live_spec = provider_state(
-        first_app_response, first_deployment_response, contract, target_descriptor
+        first_app_response,
+        first_deployment_response,
+        contract,
+        target_descriptor,
+        expected_state,
+        expected_images,
     )
     second_state, second_spec = provider_state(
-        second_app_response, second_deployment_response, contract, target_descriptor
+        second_app_response,
+        second_deployment_response,
+        contract,
+        target_descriptor,
+        expected_state,
+        expected_images,
     )
     if first_state != second_state or live_spec != second_spec:
         fail("production changed between the two observations")
 
+    first_active = first_app_response["app"]["active_deployment"]
+    active_deployment_id = require_uuid(
+        first_active.get("id"), "observed active deployment ID"
+    )
     expected_app_path, expected_deployment_path = provider_paths(
-        contract, target_descriptor
+        contract, target_descriptor, active_deployment_id
     )
     expected_log = [
         ("GET", expected_app_path),
@@ -1438,7 +2652,8 @@ def build_plan(
     if list(request_log) != expected_log:
         fail("provider request ledger differs from the exact GET-only contract")
 
-    candidate = build_logical_candidate(live_spec, contract, images)
+    source_mode = first_state["source_mode"]
+    candidate = build_logical_candidate(live_spec, contract, images, source_mode)
     candidate_projection = non_source_fingerprint(candidate, contract)
     if candidate_projection != first_state["non_source_projection_sha256"]:
         fail("logical candidate does not preserve the non-source projection")
@@ -1446,7 +2661,7 @@ def build_plan(
     issued_at, expires_at = issue_window(now, contract["plan"]["maximum_age_seconds"])
 
     plan = {
-        "schema_version": 1,
+        "schema_version": 2,
         "authority": "observation-only-production-plan",
         "repository": contract["repository"],
         "issued_at": issued_at,
@@ -1459,6 +2674,12 @@ def build_plan(
             "runner_environment": "github-hosted",
             "contract_sha256": require_sha256(
                 contract_sha256, "production contract exact-file hash"
+            ),
+            "release_policy_sha256": require_sha256(
+                policy_sha256, "release policy exact-file hash"
+            ),
+            "change_schema_sha256": require_sha256(
+                schema_sha256, "change schema exact-file hash"
             ),
             "verifier_sha256": require_sha256(
                 verifier_sha256, "production verifier exact-file hash"
@@ -1473,6 +2694,8 @@ def build_plan(
             "target_phase": target_phase["phase"],
             "target_source_sha": target_phase["source"]["commit"],
         },
+        "predecessor_authority": predecessor_authority,
+        "transition": transition,
         "provider_observation": {
             **first_state,
             "provider": contract["provider"]["name"],
@@ -1483,6 +2706,7 @@ def build_plan(
         },
         "target": {
             "phase": target_phase["phase"],
+            "source_sha": target_phase["source"]["commit"],
             "images": target_image_records(contract, images),
             "migration": {
                 "job": "rereply-rls-migrate",
@@ -1499,7 +2723,7 @@ def build_plan(
             "domains_equal": True,
             "databases_equal": True,
             "runtime_shape_equal": True,
-            "source_mutations": source_mutation_records(contract),
+            "source_mutations": source_mutation_records(contract, source_mode),
         },
         "provider_validation": {
             "spec_validation_performed": False,
@@ -1509,7 +2733,10 @@ def build_plan(
         },
         "rollback": target_phase["rollback"],
     }
-    sanitize_plan(plan, contract, private_values=tuple(target_descriptor.values()))
+    private_values = [*target_descriptor.values(), active_deployment_id]
+    for response in (first_app_response, second_app_response):
+        private_values.append(response["app"]["updated_at"])
+    sanitize_plan(plan, contract, private_values=tuple(private_values))
     return plan
 
 
@@ -1517,9 +2744,13 @@ def validate_plan(
     plan: Any,
     contract: Mapping[str, Any],
     contract_sha256: str,
+    policy: Mapping[str, Any],
+    policy_sha256: str,
+    schema_sha256: str,
     verifier_sha256: str,
     rollout_plan: Mapping[str, Any],
     rollout_plan_sha256: str,
+    predecessor_state: Mapping[str, Any] | None,
     *,
     now: dt.datetime | None = None,
 ) -> dict[str, Any]:
@@ -1533,6 +2764,8 @@ def validate_plan(
             "expires_at",
             "control",
             "rollout_authority",
+            "predecessor_authority",
+            "transition",
             "provider_observation",
             "target",
             "preservation",
@@ -1541,7 +2774,7 @@ def validate_plan(
         },
         "production plan",
     )
-    exact_int(plan["schema_version"], "plan schema version", 1, 1)
+    exact_int(plan["schema_version"], "plan schema version", 2, 2)
     if plan["authority"] != "observation-only-production-plan":
         fail("plan authority differs")
     if plan["repository"] != contract["repository"]:
@@ -1568,6 +2801,8 @@ def validate_plan(
             "run_attempt",
             "runner_environment",
             "contract_sha256",
+            "release_policy_sha256",
+            "change_schema_sha256",
             "verifier_sha256",
         },
         "plan control",
@@ -1583,6 +2818,14 @@ def validate_plan(
         contract_sha256, "production contract exact-file hash"
     ):
         fail("plan contract hash differs")
+    if control["release_policy_sha256"] != require_sha256(
+        policy_sha256, "release policy exact-file hash"
+    ):
+        fail("plan release policy hash differs")
+    if control["change_schema_sha256"] != require_sha256(
+        schema_sha256, "change schema exact-file hash"
+    ):
+        fail("plan change schema hash differs")
     if control["verifier_sha256"] != require_sha256(
         verifier_sha256, "production verifier exact-file hash"
     ):
@@ -1621,11 +2864,78 @@ def validate_plan(
         rollout_plan_sha256, "rollout plan file hash"
     ):
         fail("rollout plan content hash differs")
-    target_phase, images = validate_rollout_plan(rollout_plan, contract, normalized)
+    supplied_predecessor = exact_keys(
+        plan["predecessor_authority"],
+        {
+            "kind",
+            "event_sequence",
+            "phase_ordinal",
+            "phase",
+            "state_sha256",
+            "run_id",
+            "run_attempt",
+            "artifact_id",
+            "artifact_digest",
+        },
+        "plan predecessor authority",
+    )
+    predecessor_kind = supplied_predecessor["kind"]
+    if predecessor_kind == "genesis":
+        if supplied_predecessor != {
+            "kind": "genesis",
+            "event_sequence": 0,
+            "phase_ordinal": 0,
+            "phase": "genesis",
+            "state_sha256": genesis_state_sha256(contract),
+            "run_id": None,
+            "run_attempt": None,
+            "artifact_id": None,
+            "artifact_digest": None,
+        }:
+            fail("plan genesis predecessor authority differs")
+        normalized["predecessor"] = None
+    elif predecessor_kind == "phase-state":
+        normalized["predecessor"] = {
+            "run_id": require_run_id(
+                supplied_predecessor["run_id"], "plan predecessor run ID"
+            ),
+            "run_attempt": exact_int(
+                supplied_predecessor["run_attempt"],
+                "plan predecessor run attempt",
+                1,
+            ),
+            "artifact_id": require_run_id(
+                supplied_predecessor["artifact_id"],
+                "plan predecessor artifact ID",
+            ),
+            "artifact_digest": require_digest(
+                supplied_predecessor["artifact_digest"],
+                "plan predecessor artifact digest",
+            ),
+            "state_sha256": require_sha256(
+                supplied_predecessor["state_sha256"],
+                "plan predecessor state hash",
+            ),
+        }
+    else:
+        fail("plan predecessor kind differs")
+    target_phase, images, transition, predecessor_authority = validate_rollout_plan(
+        rollout_plan,
+        contract,
+        normalized,
+        policy=policy,
+        policy_sha256=policy_sha256,
+        schema_sha256=schema_sha256,
+        predecessor_state=predecessor_state,
+    )
     if authority["target_phase"] != target_phase["phase"]:
         fail("plan target phase differs")
     if authority["target_source_sha"] != target_phase["source"]["commit"]:
         fail("plan target source differs")
+    if supplied_predecessor != predecessor_authority:
+        fail("plan predecessor authority differs")
+    if plan["transition"] != transition:
+        fail("plan transition differs")
 
     observation = exact_keys(
         plan["provider_observation"],
@@ -1643,8 +2953,9 @@ def validate_plan(
             "active_canonical_spec_sha256",
             "environment_values_sha256",
             "non_source_projection_sha256",
+            "source_mode",
             "live_active_equal",
-            "bootstrap_match",
+            "predecessor_match",
             "provider",
             "http_methods_used",
             "http_request_count",
@@ -1653,7 +2964,9 @@ def validate_plan(
         },
         "provider observation",
     )
-    bootstrap = contract["bootstrap_state"]
+    expected_state, _ = predecessor_provider_expectation(
+        contract, rollout_plan, predecessor_state
+    )
     if observation["provider"] != contract["provider"]["name"]:
         fail("observed provider differs")
     if observation["app_identity_sha256"] != contract["provider"]["app_id_sha256"]:
@@ -1664,10 +2977,10 @@ def validate_plan(
         "default_ingress_sha256"
     ]:
         fail("observed default ingress hash differs")
-    if observation["app_updated_at_sha256"] != bootstrap["app_updated_at_sha256"]:
+    if observation["app_updated_at_sha256"] != expected_state["app_updated_at_sha256"]:
         fail("observed app timestamp hash differs")
-    if observation["active_deployment_identity_sha256"] != bootstrap[
-        "active_deployment_id_sha256"
+    if observation["active_deployment_identity_sha256"] != expected_state[
+        "active_deployment_identity_sha256"
     ]:
         fail("observed active deployment hash differs")
     if observation["active_phase"] != "ACTIVE":
@@ -1679,19 +2992,27 @@ def validate_plan(
     ):
         if exact_bool(observation[key], f"observation {key}") is not False:
             fail("observation contains an active deployment transition")
-    for key in ("live_active_equal", "bootstrap_match"):
+    for key in ("live_active_equal", "predecessor_match"):
         if exact_bool(observation[key], f"observation {key}") is not True:
             fail("observation equality proof is false")
-    if observation["live_canonical_spec_sha256"] != bootstrap["canonical_spec_sha256"]:
+    if observation["live_canonical_spec_sha256"] != expected_state[
+        "canonical_spec_sha256"
+    ]:
         fail("observed live spec hash differs")
-    if observation["active_canonical_spec_sha256"] != bootstrap["canonical_spec_sha256"]:
+    if observation["active_canonical_spec_sha256"] != expected_state[
+        "canonical_spec_sha256"
+    ]:
         fail("observed active spec hash differs")
-    if observation["environment_values_sha256"] != bootstrap["environment_values_sha256"]:
+    if observation["environment_values_sha256"] != expected_state[
+        "environment_values_sha256"
+    ]:
         fail("observed environment fingerprint differs")
-    if observation["non_source_projection_sha256"] != bootstrap[
+    if observation["non_source_projection_sha256"] != expected_state[
         "non_source_projection_sha256"
     ]:
         fail("observed non-source fingerprint differs")
+    if observation["source_mode"] != expected_state["source_mode"]:
+        fail("observed source mode differs")
     if observation["http_methods_used"] != ["GET"]:
         fail("provider observation is not GET-only")
     exact_int(observation["http_request_count"], "provider request count", 4, 4)
@@ -1701,11 +3022,19 @@ def validate_plan(
 
     target = exact_keys(
         plan["target"],
-        {"phase", "images", "migration", "credential_neutral_logical_candidate_sha256"},
+        {
+            "phase",
+            "source_sha",
+            "images",
+            "migration",
+            "credential_neutral_logical_candidate_sha256",
+        },
         "plan target",
     )
     if target["phase"] != target_phase["phase"]:
         fail("plan target phase differs")
+    if target["source_sha"] != target_phase["source"]["commit"]:
+        fail("plan target source differs")
     if target["images"] != target_image_records(contract, images):
         fail("plan target images differ")
     require_sha256(
@@ -1736,7 +3065,7 @@ def validate_plan(
         },
         "plan preservation",
     )
-    if preservation["non_source_projection_sha256"] != bootstrap[
+    if preservation["non_source_projection_sha256"] != expected_state[
         "non_source_projection_sha256"
     ]:
         fail("preserved non-source hash differs")
@@ -1750,7 +3079,9 @@ def validate_plan(
     ):
         if exact_bool(preservation[key], f"preservation {key}") is not True:
             fail("plan preservation proof is false")
-    if preservation["source_mutations"] != source_mutation_records(contract):
+    if preservation["source_mutations"] != source_mutation_records(
+        contract, expected_state["source_mode"]
+    ):
         fail("source mutation set differs")
 
     if plan["provider_validation"] != {
@@ -1760,8 +3091,8 @@ def validate_plan(
         "deployment_authority": False,
     }:
         fail("provider validation boundary differs")
-    if plan["rollback"] != {"allowed_targets": [], "forbidden_targets": []}:
-        fail("baseline rollback floor differs")
+    if plan["rollback"] != target_phase["rollback"]:
+        fail("plan rollback floor differs")
     sanitize_plan(plan, contract)
     return plan
 
@@ -1780,12 +3111,30 @@ class ProviderClient:
         if type(token) is not str or len(token) < 20 or any(ch in token for ch in "\r\n\x00"):
             fail("read-only provider token is invalid")
         self.contract = contract
-        self.allowed_paths = set(provider_paths(contract, target))
+        templates = contract["provider"]["allowed_path_templates"]
+        app_path = templates[0].replace("{app_id}", target["app_id"])
+        if "{" in app_path or "}" in app_path:
+            fail("provider app path template was not resolved exactly")
+        self.app_path = app_path
+        self.deployment_path: str | None = None
+        self.allowed_paths = {app_path}
         self.token = token
         self.opener = opener or urllib.request.build_opener(
             urllib.request.ProxyHandler({}), RejectRedirects()
         )
         self.request_log: list[tuple[str, str]] = []
+
+    def bind_active_deployment(self, target: Mapping[str, str], active_id: str) -> str:
+        """Add only the deployment path discovered from the first app snapshot."""
+
+        app_path, deployment_path = provider_paths(self.contract, target, active_id)
+        if app_path != self.app_path:
+            fail("provider app path changed during deployment binding")
+        if self.deployment_path is not None and self.deployment_path != deployment_path:
+            fail("provider active deployment binding changed")
+        self.deployment_path = deployment_path
+        self.allowed_paths.add(deployment_path)
+        return deployment_path
 
     def allowed_path(self, path: str) -> bool:
         return path in self.allowed_paths
@@ -1852,11 +3201,15 @@ def observe(
     *,
     contract: Mapping[str, Any],
     contract_sha256: str,
+    policy: Mapping[str, Any],
+    policy_sha256: str,
+    schema_sha256: str,
     verifier_sha256: str,
     normalized_input: Mapping[str, Any],
     target_descriptor: Mapping[str, str],
     rollout_plan: Mapping[str, Any],
     rollout_plan_sha256: str,
+    predecessor_state: Mapping[str, Any] | None,
     workflow_run_id: str,
     workflow_run_attempt: int,
     token: str,
@@ -1867,7 +3220,7 @@ def observe(
         if os.environ.get(name):
             fail("a forbidden ambient production credential is present")
     client = ProviderClient(contract, target_descriptor, token, opener=opener)
-    app_path, deployment_path = provider_paths(contract, target_descriptor)
+    app_path = client.app_path
     first_app = client.get_json(app_path)
     if type(first_app) is not dict or type(first_app.get("app")) is not dict:
         fail("provider app response is malformed")
@@ -1875,18 +3228,28 @@ def observe(
     if type(first_active) is not dict:
         fail("active deployment is missing")
     active_id = require_uuid(first_active.get("id"), "active deployment ID")
-    if active_id != target_descriptor["active_deployment_id"]:
-        fail("active deployment differs from the protected target")
+    deployment_path = client.bind_active_deployment(target_descriptor, active_id)
     first_deployment = client.get_json(deployment_path)
     second_app = client.get_json(app_path)
+    if type(second_app) is not dict or type(second_app.get("app")) is not dict:
+        fail("second provider app response is malformed")
+    second_active = second_app["app"].get("active_deployment")
+    if type(second_active) is not dict or require_uuid(
+        second_active.get("id"), "second active deployment ID"
+    ) != active_id:
+        fail("active deployment changed between observations")
     second_deployment = client.get_json(deployment_path)
     plan = build_plan(
         contract=contract,
         contract_sha256=contract_sha256,
+        policy=policy,
+        policy_sha256=policy_sha256,
+        schema_sha256=schema_sha256,
         verifier_sha256=verifier_sha256,
         normalized_input=normalized_input,
         target_descriptor=target_descriptor,
         rollout_plan=rollout_plan,
+        predecessor_state=predecessor_state,
         first_app_response=first_app,
         first_deployment_response=first_deployment,
         second_app_response=second_app,
@@ -1901,9 +3264,13 @@ def observe(
         plan,
         contract,
         contract_sha256,
+        policy,
+        policy_sha256,
+        schema_sha256,
         verifier_sha256,
         rollout_plan,
         rollout_plan_sha256,
+        predecessor_state,
         now=checked_at,
     )
     return plan
@@ -1921,14 +3288,84 @@ def load_rollout_plan_for_observation(
     path: Path,
     contract: Mapping[str, Any],
     normalized_input: Mapping[str, Any],
+    *,
+    policy: Mapping[str, Any],
+    policy_sha256: str,
+    schema_sha256: str,
+    predecessor_state: Mapping[str, Any] | None,
 ) -> tuple[dict[str, Any], str]:
     value, digest = load_json_and_hash(path, "rollout plan", canonical=True)
     if type(value) is not dict:
         fail("rollout plan is malformed")
     if digest != normalized_input["rollout_plan_sha256"]:
         fail("rollout plan exact-file hash differs")
-    validate_rollout_plan(value, contract, normalized_input)
+    validate_rollout_plan(
+        value,
+        contract,
+        normalized_input,
+        policy=policy,
+        policy_sha256=policy_sha256,
+        schema_sha256=schema_sha256,
+        predecessor_state=predecessor_state,
+    )
     return value, digest
+
+
+def load_control_documents(
+    contract_path: Path,
+    policy_path: Path,
+    schema_path: Path,
+) -> tuple[dict[str, Any], str, dict[str, Any], str, dict[str, Any], str]:
+    policy_value, policy_sha256 = load_json_and_hash(
+        policy_path, "production release policy"
+    )
+    schema_value, schema_sha256 = load_json_and_hash(
+        schema_path, "production change schema"
+    )
+    policy = validate_release_policy(policy_value)
+    schema = validate_change_schema(schema_value)
+    contract_value, contract_sha256 = load_json_and_hash(
+        contract_path, "production app contract"
+    )
+    contract = validate_contract(contract_value, policy, schema)
+    return (
+        contract,
+        contract_sha256,
+        policy,
+        policy_sha256,
+        schema,
+        schema_sha256,
+    )
+
+
+def load_predecessor_state(
+    normalized_input: Mapping[str, Any],
+    state_path: Path | None,
+    hash_path: Path | None,
+    policy: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    evidence = normalized_input["predecessor"]
+    if evidence is None:
+        if state_path is not None or hash_path is not None:
+            fail("genesis input unexpectedly includes predecessor files")
+        return None
+    if state_path is None or hash_path is None:
+        fail("phase-state predecessor files are required")
+    if state_path.stat().st_size > policy["phase_state"]["maximum_bytes"]:
+        fail("phase-state predecessor exceeds its byte budget")
+    state, state_sha256 = load_json_and_hash(
+        state_path, "production phase state", canonical=True
+    )
+    if type(state) is not dict:
+        fail("production phase state is malformed")
+    if state_sha256 != evidence["state_sha256"]:
+        fail("phase-state predecessor exact-file hash differs")
+    validate_hash_sidecar(
+        state_sha256,
+        hash_path,
+        label="production phase-state predecessor",
+    )
+    return state
 
 
 def trusted_verifier_hash(path: Path) -> str:
@@ -1969,18 +3406,20 @@ def verify_github_runtime(
             fail("GitHub runtime authority differs from the exact plan contract")
 
 
-def validate_hash_sidecar(digest: str, hash_path: Path) -> str:
-    require_sha256(digest, "production plan exact-file hash")
-    raw = read_regular_file(hash_path, "production plan hash", 65)
+def validate_hash_sidecar(
+    digest: str, hash_path: Path, *, label: str = "production plan"
+) -> str:
+    require_sha256(digest, f"{label} exact-file hash")
+    raw = read_regular_file(hash_path, f"{label} hash", 65)
     if len(raw) != 65:
-        fail("production plan hash file has an invalid size")
+        fail(f"{label} hash file has an invalid size")
     if raw != (digest + "\n").encode("ascii"):
-        fail("production plan exact-file hash differs")
+        fail(f"{label} exact-file hash differs")
     return digest
 
 
 def command_validate_contract(args: argparse.Namespace) -> None:
-    validate_contract(load_json(args.contract, "production app contract"))
+    load_control_documents(args.contract, args.policy, args.schema)
 
 
 def command_normalize_input(args: argparse.Namespace) -> None:
@@ -1989,14 +3428,32 @@ def command_normalize_input(args: argparse.Namespace) -> None:
 
 
 def command_observe(args: argparse.Namespace) -> None:
-    contract_value, contract_hash = load_json_and_hash(
-        args.contract, "production app contract"
+    (
+        contract,
+        contract_hash,
+        policy,
+        policy_hash,
+        _schema,
+        schema_hash,
+    ) = load_control_documents(
+        args.contract, args.policy, args.schema
     )
-    contract = validate_contract(contract_value)
     verifier_hash = trusted_verifier_hash(args.verifier)
     normalized = load_normalized_input(args.normalized_input, args.control_sha)
+    predecessor_state = load_predecessor_state(
+        normalized,
+        args.predecessor_state,
+        args.predecessor_sha256,
+        policy,
+    )
     rollout_plan, rollout_hash = load_rollout_plan_for_observation(
-        args.rollout_plan, contract, normalized
+        args.rollout_plan,
+        contract,
+        normalized,
+        policy=policy,
+        policy_sha256=policy_hash,
+        schema_sha256=schema_hash,
+        predecessor_state=predecessor_state,
     )
     require_run_id(args.workflow_run_id, "production-plan workflow run ID")
     exact_int(args.workflow_run_attempt, "production-plan workflow run attempt", 1)
@@ -2025,11 +3482,15 @@ def command_observe(args: argparse.Namespace) -> None:
         plan = observe(
             contract=contract,
             contract_sha256=contract_hash,
+            policy=policy,
+            policy_sha256=policy_hash,
+            schema_sha256=schema_hash,
             verifier_sha256=verifier_hash,
             normalized_input=normalized,
             target_descriptor=target_descriptor,
             rollout_plan=rollout_plan,
             rollout_plan_sha256=rollout_hash,
+            predecessor_state=predecessor_state,
             workflow_run_id=args.workflow_run_id,
             workflow_run_attempt=args.workflow_run_attempt,
             token=token,
@@ -2044,9 +3505,13 @@ def command_observe(args: argparse.Namespace) -> None:
             loaded_plan,
             contract,
             contract_hash,
+            policy,
+            policy_hash,
+            schema_hash,
             verifier_hash,
             rollout_plan,
             rollout_hash,
+            predecessor_state,
             now=dt.datetime.now(dt.timezone.utc),
         )
     except BaseException:
@@ -2059,24 +3524,98 @@ def command_observe(args: argparse.Namespace) -> None:
         raise
 
 
-def command_verify_plan(args: argparse.Namespace) -> None:
-    contract_value, contract_hash = load_json_and_hash(
-        args.contract, "production app contract"
+def command_validate_predecessor(args: argparse.Namespace) -> None:
+    (
+        contract,
+        _contract_hash,
+        policy,
+        policy_hash,
+        _schema,
+        schema_hash,
+    ) = load_control_documents(args.contract, args.policy, args.schema)
+    normalized = load_normalized_input(args.normalized_input, args.control_sha)
+    predecessor_state = load_predecessor_state(
+        normalized,
+        args.predecessor_state,
+        args.predecessor_sha256,
+        policy,
     )
-    contract = validate_contract(contract_value)
+    rollout_plan, _rollout_hash = load_rollout_plan_for_observation(
+        args.rollout_plan,
+        contract,
+        normalized,
+        policy=policy,
+        policy_sha256=policy_hash,
+        schema_sha256=schema_hash,
+        predecessor_state=predecessor_state,
+    )
+    target, images, _transition, _predecessor = validate_rollout_plan(
+        rollout_plan,
+        contract,
+        normalized,
+        policy=policy,
+        policy_sha256=policy_hash,
+        schema_sha256=schema_hash,
+        predecessor_state=predecessor_state,
+    )
+    write_canonical(
+        args.target_images_output,
+        {
+            "schema_version": 1,
+            "phase": target["phase"],
+            "images": target_image_records(contract, images),
+        },
+    )
+
+
+def command_verify_plan(args: argparse.Namespace) -> None:
+    (
+        contract,
+        contract_hash,
+        policy,
+        policy_hash,
+        _schema,
+        schema_hash,
+    ) = load_control_documents(
+        args.contract, args.policy, args.schema
+    )
     verifier_hash = trusted_verifier_hash(args.verifier)
     plan, plan_hash = load_json_and_hash(args.plan, "production plan", canonical=True)
     rollout_plan, rollout_hash = load_json_and_hash(
         args.rollout_plan, "rollout plan", canonical=True
     )
     validate_hash_sidecar(plan_hash, args.sha256)
+    predecessor_authority = plan.get("predecessor_authority")
+    if type(predecessor_authority) is not dict:
+        fail("plan predecessor authority is malformed")
+    normalized_for_predecessor = {
+        "predecessor": None
+        if predecessor_authority.get("kind") == "genesis"
+        else {
+            "run_id": predecessor_authority.get("run_id"),
+            "run_attempt": predecessor_authority.get("run_attempt"),
+            "artifact_id": predecessor_authority.get("artifact_id"),
+            "artifact_digest": predecessor_authority.get("artifact_digest"),
+            "state_sha256": predecessor_authority.get("state_sha256"),
+        }
+    }
+    predecessor_state = load_predecessor_state(
+        normalized_for_predecessor,
+        args.predecessor_state,
+        args.predecessor_sha256,
+        policy,
+    )
     validate_plan(
         plan,
         contract,
         contract_hash,
+        policy,
+        policy_hash,
+        schema_hash,
         verifier_hash,
         rollout_plan,
         rollout_hash,
+        predecessor_state,
         now=dt.datetime.now(dt.timezone.utc),
     )
 
@@ -2087,6 +3626,8 @@ def parser() -> argparse.ArgumentParser:
 
     contract_parser = subparsers.add_parser("validate-contract")
     contract_parser.add_argument("--contract", type=Path, required=True)
+    contract_parser.add_argument("--policy", type=Path, required=True)
+    contract_parser.add_argument("--schema", type=Path, required=True)
     contract_parser.set_defaults(handler=command_validate_contract)
 
     input_parser = subparsers.add_parser("normalize-input")
@@ -2097,21 +3638,41 @@ def parser() -> argparse.ArgumentParser:
 
     observe_parser = subparsers.add_parser("observe")
     observe_parser.add_argument("--contract", type=Path, required=True)
+    observe_parser.add_argument("--policy", type=Path, required=True)
+    observe_parser.add_argument("--schema", type=Path, required=True)
     observe_parser.add_argument("--verifier", type=Path, required=True)
     observe_parser.add_argument("--normalized-input", type=Path, required=True)
     observe_parser.add_argument("--rollout-plan", type=Path, required=True)
+    observe_parser.add_argument("--predecessor-state", type=Path)
+    observe_parser.add_argument("--predecessor-sha256", type=Path)
     observe_parser.add_argument("--control-sha", required=True)
     observe_parser.add_argument("--workflow-run-id", required=True)
     observe_parser.add_argument("--workflow-run-attempt", type=int, required=True)
     observe_parser.add_argument("--output-dir", type=Path, required=True)
     observe_parser.set_defaults(handler=command_observe)
 
+    predecessor_parser = subparsers.add_parser("validate-predecessor")
+    predecessor_parser.add_argument("--contract", type=Path, required=True)
+    predecessor_parser.add_argument("--policy", type=Path, required=True)
+    predecessor_parser.add_argument("--schema", type=Path, required=True)
+    predecessor_parser.add_argument("--normalized-input", type=Path, required=True)
+    predecessor_parser.add_argument("--rollout-plan", type=Path, required=True)
+    predecessor_parser.add_argument("--control-sha", required=True)
+    predecessor_parser.add_argument("--predecessor-state", type=Path)
+    predecessor_parser.add_argument("--predecessor-sha256", type=Path)
+    predecessor_parser.add_argument("--target-images-output", type=Path, required=True)
+    predecessor_parser.set_defaults(handler=command_validate_predecessor)
+
     verify_parser = subparsers.add_parser("verify-plan")
     verify_parser.add_argument("--contract", type=Path, required=True)
+    verify_parser.add_argument("--policy", type=Path, required=True)
+    verify_parser.add_argument("--schema", type=Path, required=True)
     verify_parser.add_argument("--verifier", type=Path, required=True)
     verify_parser.add_argument("--rollout-plan", type=Path, required=True)
     verify_parser.add_argument("--plan", type=Path, required=True)
     verify_parser.add_argument("--sha256", type=Path, required=True)
+    verify_parser.add_argument("--predecessor-state", type=Path)
+    verify_parser.add_argument("--predecessor-sha256", type=Path)
     verify_parser.set_defaults(handler=command_verify_plan)
     return result
 

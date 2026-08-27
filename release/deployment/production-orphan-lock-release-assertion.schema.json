@@ -1,0 +1,345 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rereply.app/schemas/production-orphan-lock-release-assertion-v1.json",
+  "title": "ReReply incomplete-finalizer orphan lock-release assertion",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authority",
+    "repository",
+    "created_at",
+    "expires_at",
+    "control",
+    "actor_provenance",
+    "authorization_scope",
+    "typed_confirmation_sha256",
+    "preauthorization",
+    "orphan",
+    "original_finalizer",
+    "observation_contract"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "authority": {"const": "production-orphan-lock-release-assertion"},
+    "repository": {"const": "medtechcorps-netizen/whatomate"},
+    "created_at": {"$ref": "#/$defs/timestamp"},
+    "expires_at": {"$ref": "#/$defs/timestamp"},
+    "control": {"$ref": "#/$defs/control"},
+    "actor_provenance": {
+      "const": "single-operator-break-glass-assertion-not-cryptographic-actor-provenance"
+    },
+    "authorization_scope": {"const": "observe-orphan-lock-release-only"},
+    "typed_confirmation_sha256": {"$ref": "#/$defs/sha256"},
+    "preauthorization": {"$ref": "#/$defs/preauthorizationAuthority"},
+    "orphan": {"$ref": "#/$defs/orphan"},
+    "original_finalizer": {"$ref": "#/$defs/originalFinalizer"},
+    "observation_contract": {"$ref": "#/$defs/observationContract"}
+  },
+  "$defs": {
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "runId": {"type": "string", "pattern": "^[1-9][0-9]{0,14}$"},
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_sha",
+        "workflow_path",
+        "run_id",
+        "run_attempt",
+        "runner_environment",
+        "assertion_schema_sha256",
+        "controller_sha256"
+      ],
+      "properties": {
+        "workflow_sha": {"$ref": "#/$defs/sha1"},
+        "workflow_path": {
+          "const": ".github/workflows/reconcile-production-orphan-lock-release.yml"
+        },
+        "run_id": {"$ref": "#/$defs/runId"},
+        "run_attempt": {"const": 1},
+        "runner_environment": {"const": "github-hosted"},
+        "assertion_schema_sha256": {"$ref": "#/$defs/sha256"},
+        "controller_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "run_attempt",
+        "artifact_id",
+        "artifact_name",
+        "artifact_digest",
+        "sha256"
+      ],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/runId"},
+        "run_attempt": {"const": 1},
+        "artifact_id": {"$ref": "#/$defs/runId"},
+        "artifact_name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"
+        },
+        "artifact_digest": {"$ref": "#/$defs/digest"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "preauthorizationAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "binding",
+        "signer_workflow",
+        "signer_digest",
+        "source_digest",
+        "source_ref",
+        "runner_environment",
+        "provenance_predicate_type",
+        "policy_predicate_type",
+        "provenance_verification_sha256",
+        "policy_verification_sha256"
+      ],
+      "properties": {
+        "binding": {"$ref": "#/$defs/binding"},
+        "signer_workflow": {
+          "const": "medtechcorps-netizen/whatomate/.github/workflows/finalize-production-orphan-lock.yml"
+        },
+        "signer_digest": {"$ref": "#/$defs/sha1"},
+        "source_digest": {"$ref": "#/$defs/sha1"},
+        "source_ref": {"const": "refs/heads/main"},
+        "runner_environment": {"const": "github-hosted"},
+        "provenance_predicate_type": {"const": "https://slsa.dev/provenance/v1"},
+        "policy_predicate_type": {
+          "const": "https://rereply.app/attestations/production-orphan-lock-finalization/v1"
+        },
+        "provenance_verification_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_verification_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "rootBinding": {
+      "allOf": [
+        {"$ref": "#/$defs/binding"},
+        {
+          "properties": {
+            "artifact_name": {
+              "type": "string",
+              "pattern": "^production-main-lock-(apply|rollback)-[1-9][0-9]{0,14}-1$"
+            }
+          }
+        }
+      ]
+    },
+    "orphan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "main_sha",
+        "rule_id",
+        "rule_identity_sha256",
+        "root_acquire_intent",
+        "preauthorization_sha256"
+      ],
+      "properties": {
+        "main_sha": {"$ref": "#/$defs/sha1"},
+        "rule_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_+/=-]+$",
+          "maxLength": 512
+        },
+        "rule_identity_sha256": {"$ref": "#/$defs/sha256"},
+        "root_acquire_intent": {"$ref": "#/$defs/rootBinding"},
+        "preauthorization_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "name",
+        "status",
+        "conclusion",
+        "started_at",
+        "completed_at"
+      ],
+      "properties": {
+        "job_id": {"$ref": "#/$defs/runId"},
+        "name": {
+          "enum": [
+            "Authenticate exact production orphan finalization authority",
+            "Prepare and attest exact production orphan lock finalization",
+            "Release exact production orphan main lock",
+            "Exact production orphan lock release receipt gate"
+          ]
+        },
+        "status": {"const": "completed"},
+        "conclusion": {
+          "enum": ["success", "failure", "cancelled", "timed_out", "skipped"]
+        },
+        "started_at": {"$ref": "#/$defs/timestamp"},
+        "completed_at": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "sourceArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "binding"],
+      "properties": {
+        "kind": {"enum": ["preauthorization", "unsigned-release-receipt"]},
+        "binding": {"$ref": "#/$defs/binding"}
+      }
+    },
+    "originalFinalizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_sha",
+        "workflow_path",
+        "workflow_name",
+        "run_id",
+        "run_attempt",
+        "event",
+        "head_branch",
+        "status",
+        "conclusion",
+        "jobs",
+        "job_inventory_sha256",
+        "artifacts",
+        "artifact_inventory_sha256",
+        "receipt_truth",
+        "static_max_branch_mutations"
+      ],
+      "properties": {
+        "workflow_sha": {"$ref": "#/$defs/sha1"},
+        "workflow_path": {
+          "const": ".github/workflows/finalize-production-orphan-lock.yml"
+        },
+        "workflow_name": {"const": "Finalize Production Orphan Lock"},
+        "run_id": {"$ref": "#/$defs/runId"},
+        "run_attempt": {"const": 1},
+        "event": {"const": "workflow_dispatch"},
+        "head_branch": {"const": "main"},
+        "status": {"const": "completed"},
+        "conclusion": {"enum": ["failure", "cancelled", "timed_out"]},
+        "jobs": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            {"allOf": [{"$ref": "#/$defs/job"}, {"properties": {"name": {"const": "Authenticate exact production orphan finalization authority"}, "conclusion": {"const": "success"}}}]},
+            {"allOf": [{"$ref": "#/$defs/job"}, {"properties": {"name": {"const": "Prepare and attest exact production orphan lock finalization"}, "conclusion": {"const": "success"}}}]},
+            {"allOf": [{"$ref": "#/$defs/job"}, {"properties": {"name": {"const": "Release exact production orphan main lock"}, "conclusion": {"enum": ["success", "failure", "cancelled", "timed_out"]}}}]},
+            {"allOf": [{"$ref": "#/$defs/job"}, {"properties": {"name": {"const": "Exact production orphan lock release receipt gate"}, "conclusion": {"enum": ["failure", "cancelled", "timed_out", "skipped"]}}}]}
+          ],
+          "items": false
+        },
+        "job_inventory_sha256": {"$ref": "#/$defs/sha256"},
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "prefixItems": [
+            {"allOf": [{"$ref": "#/$defs/sourceArtifact"}, {"properties": {"kind": {"const": "preauthorization"}}}]},
+            {"allOf": [{"$ref": "#/$defs/sourceArtifact"}, {"properties": {"kind": {"const": "unsigned-release-receipt"}}}]}
+          ],
+          "items": false
+        },
+        "artifact_inventory_sha256": {"$ref": "#/$defs/sha256"},
+        "receipt_truth": {"$ref": "#/$defs/receiptTruth"},
+        "static_max_branch_mutations": {"const": 1}
+      }
+    },
+    "receiptTruth": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"classification": {"const": "preauthorization-only"}}, "required": ["classification"]},
+          "then": {"properties": {"unsigned_receipt_binding": {"type": "null"}, "provenance_match_count": {"const": 0}, "policy_match_count": {"const": 0}, "provenance_verification_sha256": {"type": "null"}, "policy_verification_sha256": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"classification": {"const": "unsigned-unattested"}}, "required": ["classification"]},
+          "then": {"properties": {"unsigned_receipt_binding": {"$ref": "#/$defs/binding"}, "provenance_match_count": {"const": 0}, "policy_match_count": {"const": 0}, "provenance_verification_sha256": {"type": "null"}, "policy_verification_sha256": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"classification": {"const": "attested-receipt-upload-incomplete"}}, "required": ["classification"]},
+          "then": {"properties": {"unsigned_receipt_binding": {"$ref": "#/$defs/binding"}, "provenance_match_count": {"const": 1}, "policy_match_count": {"const": 1}, "provenance_verification_sha256": {"$ref": "#/$defs/sha256"}, "policy_verification_sha256": {"$ref": "#/$defs/sha256"}}}
+        }
+      ],
+      "required": [
+        "observed_at", "classification", "source_artifact_inventory_sha256",
+        "signed_release_artifact_present_at_observation", "unsigned_receipt_binding",
+        "provenance_match_count", "policy_match_count", "provenance_query_sha256",
+        "policy_query_sha256", "provenance_verification_sha256",
+        "policy_verification_sha256"
+      ],
+      "properties": {
+        "observed_at": {"$ref": "#/$defs/timestamp"},
+        "classification": {"enum": ["preauthorization-only", "unsigned-unattested", "attested-receipt-upload-incomplete"]},
+        "source_artifact_inventory_sha256": {"$ref": "#/$defs/sha256"},
+        "signed_release_artifact_present_at_observation": {"const": false},
+        "unsigned_receipt_binding": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/binding"}]},
+        "provenance_match_count": {"enum": [0, 1]},
+        "policy_match_count": {"enum": [0, 1]},
+        "provenance_query_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_query_sha256": {"$ref": "#/$defs/sha256"},
+        "provenance_verification_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]},
+        "policy_verification_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]}
+      }
+    },
+    "requestLedgerEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["round", "label", "http_method", "api_operation"],
+      "properties": {
+        "round": {"enum": [1, 2]},
+        "label": {"enum": ["main-ref", "branch-rule"]},
+        "http_method": {"enum": ["GET", "POST"]},
+        "api_operation": {"enum": ["rest-read", "graphql-query"]}
+      }
+    },
+    "lockProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lock_branch", "is_admin_enforced", "lock_allows_fetch_and_merge"],
+      "properties": {
+        "lock_branch": {"const": false},
+        "is_admin_enforced": {"const": true},
+        "lock_allows_fetch_and_merge": {"const": false}
+      }
+    },
+    "observationContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ordered_requests",
+        "http_request_count",
+        "graphql_query_count",
+        "branch_mutation_request_count",
+        "observation_rounds",
+        "required_projection"
+      ],
+      "properties": {
+        "ordered_requests": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {"$ref": "#/$defs/requestLedgerEntry"}
+        },
+        "http_request_count": {"const": 4},
+        "graphql_query_count": {"const": 2},
+        "branch_mutation_request_count": {"const": 0},
+        "observation_rounds": {"const": 2},
+        "required_projection": {"$ref": "#/$defs/lockProjection"}
+      }
+    }
+  }
+}

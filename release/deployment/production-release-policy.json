@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "authority": "observation-only-phase-lineage",
+  "repository": "medtechcorps-netizen/whatomate",
+  "state_order": [
+    "genesis",
+    "baseline",
+    "bridge",
+    "backend",
+    "ui"
+  ],
+  "activation_transitions": [
+    {
+      "from": "genesis",
+      "to": "baseline",
+      "ordinal": 1
+    },
+    {
+      "from": "baseline",
+      "to": "bridge",
+      "ordinal": 2
+    },
+    {
+      "from": "bridge",
+      "to": "backend",
+      "ordinal": 3
+    },
+    {
+      "from": "backend",
+      "to": "ui",
+      "ordinal": 4
+    }
+  ],
+  "rollback_floors": {
+    "baseline": {
+      "allowed_targets": [],
+      "forbidden_targets": []
+    },
+    "bridge": {
+      "allowed_targets": [
+        "baseline"
+      ],
+      "forbidden_targets": []
+    },
+    "backend": {
+      "allowed_targets": [
+        "bridge"
+      ],
+      "forbidden_targets": [
+        "baseline"
+      ]
+    },
+    "ui": {
+      "allowed_targets": [
+        "backend",
+        "bridge"
+      ],
+      "forbidden_targets": [
+        "baseline"
+      ]
+    }
+  },
+  "lineage": {
+    "sequence_model": "monotonic-event-chain",
+    "initial_event_sequence": 1,
+    "phase_ordinal_range": [
+      1,
+      4
+    ],
+    "phase_is_current_state": true,
+    "rollback_canary_required": true
+  },
+  "planning": {
+    "workflow_path": ".github/workflows/plan-production-rollout.yml",
+    "environment": "rereply-production-plan",
+    "concurrency_group": "rereply-production",
+    "maximum_age_seconds": 900,
+    "operation": "activate",
+    "anonymous_target_pullability_required": true,
+    "predicate_type": "https://rereply.app/attestations/observation-only-production-plan/v2"
+  },
+  "phase_state": {
+    "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
+    "workflow_name": "Verify Production CRM Canary",
+    "gate_job_name": "Exact production phase gate",
+    "predicate_type": "https://rereply.app/attestations/production-phase-state/v1",
+    "artifact_files": [
+      "production-phase-state.json",
+      "production-phase-state.sha256"
+    ],
+    "maximum_bytes": 131072,
+    "required_gates": [
+      "deployment_succeeded",
+      "migration_succeeded",
+      "canary_succeeded"
+    ]
+  },
+  "single_operator": {
+    "required_reviewers": 0,
+    "protected_main_required": true,
+    "latest_attempt_required": true,
+    "latest_successful_predecessor_required": true,
+    "automatic_advance_allowed": false
+  }
+}
