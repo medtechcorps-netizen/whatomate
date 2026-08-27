@@ -140,6 +140,81 @@ class ProductionReleaseVerifierTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             release.loads_strict('{"a":1.5}')
 
+    def test_semantic_provider_lineage_excludes_only_app_timestamp(self) -> None:
+        predecessor = provider_state()
+        current = copy.deepcopy(predecessor)
+        current["app_updated_at_sha256"] = "9" * 64
+        self.assertTrue(
+            release.provider_states_share_semantic_lineage(
+                predecessor, current, allow_legacy=False
+            )
+        )
+        self.assertNotEqual(
+            release.sha256_value(predecessor), release.sha256_value(current)
+        )
+
+        mutations = {
+            "app identity": lambda state: state.__setitem__(
+                "app_identity_sha256", "0" * 64
+            ),
+            "default ingress": lambda state: state.__setitem__(
+                "default_ingress_sha256", "0" * 64
+            ),
+            "active deployment": lambda state: state.__setitem__(
+                "active_deployment_identity_sha256", "0" * 64
+            ),
+            "canonical spec": lambda state: state.__setitem__(
+                "canonical_spec_sha256", "0" * 64
+            ),
+            "environment": lambda state: state.__setitem__(
+                "environment_values_sha256", "0" * 64
+            ),
+            "non-source": lambda state: state.__setitem__(
+                "non_source_projection_sha256", "0" * 64
+            ),
+            "source mode": lambda state: state.update(
+                {"source_mode": "legacy-git", "images": []}
+            ),
+            "nested image": lambda state: state["images"][0].update(
+                {
+                    "digest": "sha256:" + "9" * 64,
+                    "subject": (
+                        state["images"][0]["repository"]
+                        + "@sha256:"
+                        + "9" * 64
+                    ),
+                }
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                changed = copy.deepcopy(predecessor)
+                mutate(changed)
+                self.assertFalse(
+                    release.provider_states_share_semantic_lineage(
+                        predecessor, changed, allow_legacy=True
+                    )
+                )
+
+        malformed = copy.deepcopy(predecessor)
+        malformed.pop("app_updated_at_sha256")
+        with self.assertRaises(release.ReleaseError):
+            release.provider_states_share_semantic_lineage(
+                predecessor, malformed, allow_legacy=False
+            )
+        malformed = copy.deepcopy(predecessor)
+        malformed["app_updated_at_sha256"] = "not-a-hash"
+        with self.assertRaises(release.ReleaseError):
+            release.provider_states_share_semantic_lineage(
+                predecessor, malformed, allow_legacy=False
+            )
+        malformed = copy.deepcopy(predecessor)
+        malformed["future_unreviewed_key"] = "0" * 64
+        with self.assertRaises(release.ReleaseError):
+            release.provider_states_share_semantic_lineage(
+                predecessor, malformed, allow_legacy=False
+            )
+
     def test_target_descriptor_requires_exact_stable_https_ingress(self) -> None:
         value = release.validate_target_descriptor(
             {

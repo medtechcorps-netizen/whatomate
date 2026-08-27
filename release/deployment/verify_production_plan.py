@@ -76,9 +76,6 @@ PRODUCTION_APP_ID_SHA256 = (
 PRODUCTION_DEFAULT_INGRESS_SHA256 = (
     "05ab4f90194ad37c6926138e9aafbd49c73aa75d08da92b0b1309bfce207cfa8"
 )
-BOOTSTRAP_UPDATED_AT_SHA256 = (
-    "caf1e8153dec3481826e02af1c223ab771791bb806eac294d92c55d1d4ebb345"
-)
 BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
     "439ecb65c0e711036d39b26a4d38b91f555dad32325dbdd86544230743d3cb0f"
 )
@@ -1166,7 +1163,6 @@ def validate_contract(
         contract["bootstrap_state"],
         {
             "genesis_state_sha256",
-            "app_updated_at_sha256",
             "active_deployment_id_sha256",
             "canonical_spec_sha256",
             "environment_values_sha256",
@@ -1180,10 +1176,6 @@ def validate_contract(
         bootstrap["genesis_state_sha256"], "bootstrap genesis state hash"
     ) != genesis_state_sha256(contract):
         fail("bootstrap genesis state hash differs")
-    if require_sha256(
-        bootstrap["app_updated_at_sha256"], "bootstrap app timestamp hash"
-    ) != BOOTSTRAP_UPDATED_AT_SHA256:
-        fail("bootstrap app timestamp hash differs")
     if require_sha256(
         bootstrap["active_deployment_id_sha256"],
         "bootstrap active deployment ID hash",
@@ -1840,7 +1832,6 @@ def genesis_state_sha256(contract: Mapping[str, Any]) -> str:
             "default_ingress_sha256": contract["provider"][
                 "default_ingress_sha256"
             ],
-            "app_updated_at_sha256": bootstrap["app_updated_at_sha256"],
             "active_deployment_identity_sha256": bootstrap[
                 "active_deployment_id_sha256"
             ],
@@ -2359,7 +2350,6 @@ def predecessor_provider_expectation(
         bootstrap = contract["bootstrap_state"]
         return (
             {
-                "app_updated_at_sha256": bootstrap["app_updated_at_sha256"],
                 "active_deployment_identity_sha256": bootstrap[
                     "active_deployment_id_sha256"
                 ],
@@ -2379,7 +2369,6 @@ def predecessor_provider_expectation(
     provider = predecessor_state["provider_state"]
     return (
         {
-            "app_updated_at_sha256": provider["app_updated_at_sha256"],
             "active_deployment_identity_sha256": provider[
                 "active_deployment_identity_sha256"
             ],
@@ -2421,8 +2410,6 @@ def provider_state(
         fail("observed provider default ingress differs")
     updated_at = require_timestamp(app.get("updated_at"), "observed app updated_at")
     updated_at_sha256 = sha256_bytes(updated_at.encode("utf-8"))
-    if updated_at_sha256 != expected_state["app_updated_at_sha256"]:
-        fail("observed app updated_at differs from the signed predecessor")
 
     active = app.get("active_deployment")
     if type(active) is not dict:
@@ -2977,8 +2964,9 @@ def validate_plan(
         "default_ingress_sha256"
     ]:
         fail("observed default ingress hash differs")
-    if observation["app_updated_at_sha256"] != expected_state["app_updated_at_sha256"]:
-        fail("observed app timestamp hash differs")
+    require_sha256(
+        observation["app_updated_at_sha256"], "observed app timestamp hash"
+    )
     if observation["active_deployment_identity_sha256"] != expected_state[
         "active_deployment_identity_sha256"
     ]:

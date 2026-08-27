@@ -33,8 +33,7 @@
     ]
   },
   "bootstrap_state": {
-    "genesis_state_sha256": "de3518b884510c37a3661f1bf597180792614e250c56af127ce0d7b3af951f6c",
-    "app_updated_at_sha256": "caf1e8153dec3481826e02af1c223ab771791bb806eac294d92c55d1d4ebb345",
+    "genesis_state_sha256": "106d0bcebe6c5d1f961fb9905a9d7e8c971eb27661ccfdd3f941b1dff2bfc960",
     "active_deployment_id_sha256": "439ecb65c0e711036d39b26a4d38b91f555dad32325dbdd86544230743d3cb0f",
     "canonical_spec_sha256": "a93a507a5affd82b4e00636812e4c444d31c9027bc31c19bd075f2e4d580b07e",
     "environment_values_sha256": "3b675a9ca2279c465a102e8256cbf8242a46c456e6898d593e9cde3d0e2361c7",

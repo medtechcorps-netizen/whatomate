@@ -562,7 +562,9 @@ def _validate_predecessor(
     state = common.validate_phase_state(predecessor)
     if common.sha256_bytes(common.canonical_file_bytes(state)) != common.require_sha256(predecessor_sha256, "predecessor hash"):
         common.fail("predecessor exact-file hash differs")
-    if state["lineage"]["phase"] != source_phase or state["provider_state"] != before:
+    if state["lineage"]["phase"] != source_phase or not common.provider_states_share_semantic_lineage(
+        state["provider_state"], before, allow_legacy=False
+    ):
         common.fail("live provider state differs from the signed predecessor")
 
 

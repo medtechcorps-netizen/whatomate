@@ -457,7 +457,11 @@ def build_reconciliation_receipt(
     if desired_match and transition_absent and observed["migration_succeeded"]:
         outcome = "already-receipted" if original is not None else "committed"
     elif (
-        after == intent["before"]
+        common.provider_states_share_semantic_lineage(
+            after,
+            intent["before"],
+            allow_legacy=intent["operation"] == "activate",
+        )
         and transition_absent
         and original is None
         and lock_assertion["original_provider_job"]["never_started"] is True

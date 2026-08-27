@@ -72,7 +72,9 @@ def control() -> dict[str, Any]:
     )
 
 
-def chain(outcome: str) -> dict[str, Any]:
+def chain(
+    outcome: str, *, timestamp_only_mismatch: bool = False
+) -> dict[str, Any]:
     intent = fixtures.valid_intent()
     intent["lock"]["root_acquire_intent"]["artifact_name"] = (
         "production-main-lock-apply-101-1"
@@ -96,6 +98,8 @@ def chain(outcome: str) -> dict[str, Any]:
         ]
         public = fixtures.desired_public_state()
         migration = True
+    elif timestamp_only_mismatch:
+        public["app_updated_at_sha256"] = sha("a")
     assertion = fixtures.valid_lock_assertion(intent, provider_job=provider_job)
     intent_authority = fixtures.intent_binding(intent)
     assertion_binding = fixtures.lock_assertion_binding(assertion)
@@ -469,6 +473,42 @@ class FinalizeProductionOrphanLockTests(unittest.TestCase):
         self.assertIn("root_acquire_intent", authorization["orphan"])
         finalizer.validate_finalization_authorization(authorization, now=NOW)
         self.assertEqual(set(authorization), set(self.schema["required"]))
+
+    def test_timestamp_only_no_mutation_chain_is_exactly_attested(self) -> None:
+        arguments = chain("no-mutation", timestamp_only_mismatch=True)
+        receipt = arguments["reconciliation"]
+        self.assertEqual(receipt["classification"]["outcome"], "no-mutation")
+        self.assertEqual(
+            {
+                key
+                for key in receipt["before"]
+                if receipt["before"][key] != receipt["after"][key]
+            },
+            {"app_updated_at_sha256"},
+        )
+        self.assertEqual(
+            arguments["reconciliation_authority"]["binding"]["sha256"],
+            common.sha256_bytes(common.canonical_file_bytes(receipt)),
+        )
+        authorization = finalizer.build_finalization_authorization(**arguments)
+        self.assertEqual(
+            authorization["resolution"]["closure_kind"],
+            finalizer.CLOSURE_NO_MUTATION,
+        )
+        self.assertTrue(
+            authorization["resolution"]["provider_job_never_started"]
+        )
+        self.assertIsNone(authorization["authorities"]["phase_state"])
+        self.assertIsNone(authorization["authorities"]["orphan_rollback"])
+        self.assertEqual(
+            authorization["resolution"]["closure_receipt_sha256"],
+            authorization["resolution"]["reconciliation_sha256"],
+        )
+        finalizer.validate_finalization_authorization(authorization, now=NOW)
+
+        arguments["reconciliation"]["after"]["app_updated_at_sha256"] = sha("b")
+        with self.assertRaises(common.ReleaseError):
+            finalizer.build_finalization_authorization(**arguments)
 
     def test_finalization_expiry_is_exclusive_at_boundary_and_fraction(self) -> None:
         authorization = finalizer.build_finalization_authorization(**chain("no-mutation"))

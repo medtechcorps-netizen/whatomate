@@ -657,6 +657,78 @@ class ReconcileProductionOrphanTests(unittest.TestCase):
         with self.assertRaises(common.ReleaseError):
             reconcile.validate_lock_assertion(forged, intent=intent)
 
+    def test_no_mutation_allows_only_pre_attested_timestamp_metadata_drift(self) -> None:
+        timestamp_only = before_state()
+        timestamp_only["app_updated_at_sha256"] = sha("a")
+        receipt = build_receipt(
+            public=timestamp_only, migration_succeeded=False
+        )
+        self.assertEqual(receipt["classification"]["outcome"], "no-mutation")
+        self.assertNotEqual(receipt["before"], receipt["after"])
+        self.assertEqual(
+            {
+                key
+                for key in receipt["before"]
+                if receipt["before"][key] != receipt["after"][key]
+            },
+            {"app_updated_at_sha256"},
+        )
+        common.validate_reconciliation_receipt(receipt)
+
+        started = lock_assertion_request(valid_intent())["original_provider_job"]
+        started["conclusion"] = "failure"
+        started["steps"] = [
+            {
+                "number": 1,
+                "name": "Apply with one isolated app-update capability",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+        started_receipt = build_receipt(
+            public=timestamp_only,
+            migration_succeeded=False,
+            provider_job=started,
+        )
+        self.assertEqual(
+            started_receipt["classification"]["outcome"], "indeterminate"
+        )
+
+        mutations = {
+            "app identity": lambda state: state.__setitem__(
+                "app_identity_sha256", sha("a")
+            ),
+            "default ingress": lambda state: state.__setitem__(
+                "default_ingress_sha256", sha("a")
+            ),
+            "active deployment": lambda state: state.__setitem__(
+                "active_deployment_identity_sha256", sha("a")
+            ),
+            "canonical spec": lambda state: state.__setitem__(
+                "canonical_spec_sha256", sha("a")
+            ),
+            "environment": lambda state: state.__setitem__(
+                "environment_values_sha256", sha("a")
+            ),
+            "non-source": lambda state: state.__setitem__(
+                "non_source_projection_sha256", sha("a")
+            ),
+            "source mode and images": lambda state: state.update(
+                {"source_mode": "digest-images", "images": image_records("a")}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                drifted = copy.deepcopy(timestamp_only)
+                mutate(drifted)
+                drifted_receipt = build_receipt(
+                    public=drifted, migration_succeeded=False
+                )
+                self.assertEqual(
+                    drifted_receipt["classification"]["outcome"],
+                    "indeterminate",
+                )
+
     def test_all_five_outcomes_are_classified_exactly(self) -> None:
         committed = build_receipt(
             public=desired_public_state(), migration_succeeded=True
@@ -852,6 +924,27 @@ class ReconcileProductionOrphanTests(unittest.TestCase):
         receipt["provider_observation"]["http_request_count"] = 5
         with self.assertRaises(common.ReleaseError):
             common.validate_reconciliation_receipt(receipt)
+
+        first_app = app_response(spec)
+        second_app = app_response(spec)
+        second_app["app"]["updated_at"] = "2026-08-27T00:04:01Z"
+        opener = QueueOpener(
+            [
+                first_app,
+                deployment_response(spec),
+                second_app,
+                deployment_response(spec),
+            ]
+        )
+        client = reconcile.ReadOnlyProductionClient(
+            APP_ID, "t" * 24, opener=opener
+        )
+        with self.assertRaisesRegex(
+            common.ReleaseError,
+            "production changed between reconciliation observations",
+        ):
+            reconcile.observe_twice(client)
+        self.assertEqual([request.method for request in opener.requests], ["GET"] * 4)
 
     def test_artifact_name_and_hash_cross_splices_are_rejected(self) -> None:
         intent = valid_intent()
