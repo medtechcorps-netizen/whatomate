@@ -82,14 +82,21 @@ GHCR digests; tags are labels and must never authorize deployment.
 The exact image gate also performs a real anonymous manifest/blob pull of all
 three digest subjects from a fresh empty Docker credential directory after all
 build, secret/config, vulnerability, SBOM, smoke, and attestation checks pass.
-It has no package-read token or registry login. Because these release packages
-do not yet exist and first publication defaults them to private, expect that
-first run to fail only at this anonymous-pull gate. Making any of the three
-packages public is a separate, explicit, effectively irreversible release
-authorization after the operator reviews the completed scans. This workflow
-never changes package visibility. After any authorized visibility change, run
-the exact image workflow again from the still-frozen control SHA; no production
-plan or apply is allowed until all three anonymous exact-digest pulls pass.
+It has no package-read token or registry login. The established release package
+namespaces are public and anonymously pullable; the workflow never changes
+package visibility. Public visibility is effectively irreversible. If a
+namespace is missing, private, recreated, renamed, or no longer anonymously
+pullable, stop and obtain a separate package-administration/bootstrap review
+and explicit authorization before continuing.
+
+The producer final gate also requires two stable, complete reads of exactly the
+14 reviewed current-run artifacts. Automatic Docker build-record artifacts are
+disabled at the build step. Extra, duplicate, expired, malformed, oversized,
+wrong-run, wrong-branch, or wrong-control-SHA artifacts fail closed and must not
+be filtered or deleted to make a run pass. Only a green producer gate with this
+stable exact-14 evidence is consumable by the four-phase aggregator. No
+production plan or apply is allowed until all three anonymous exact-digest pulls
+and the stable exact artifact inventory pass.
 
 ### 3. Four-phase rollout capsule
 

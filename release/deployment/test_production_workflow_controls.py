@@ -45,6 +45,40 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "7e75973086634d18b1c8c1f5082608de4e08d4f2db227cfc5d95fc2dd5cfc02a"
     ),
 }
+EXACT_IMAGE_BUILD_ACTION = (
+    "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6"
+)
+EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
+    "8c0b7eccb22a5cc0f64ec40f58203da01455bb8f847cbc7aaf979a2f777812ff"
+)
+EXACT_IMAGE_GATE_STEP_SHA256 = (
+    "1b4bf101f1756d43193ccc0050cf44bb9dd22df25302e084c9a9a91ede2db4a5"
+)
+EXACT_IMAGE_AUTHORITY_MATRIX_STEP_SHA256 = (
+    "7ee856b9d2567f683ffa0a45b0b5664ed2f78914390b237c25c15bd5e290d6f4"
+)
+EXACT_IMAGE_UPLOAD_NAMES = (
+    "image-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-"
+    "${{ github.run_id }}-${{ github.run_attempt }}",
+    "scanned-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-"
+    "${{ github.run_id }}-${{ github.run_attempt }}",
+    "attested-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-"
+    "${{ github.run_id }}-${{ github.run_attempt }}",
+    "verified-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-"
+    "${{ github.run_id }}-${{ github.run_attempt }}",
+    "release-set-${{ needs.authority.outputs.phase }}-${{ github.run_id }}-"
+    "${{ github.run_attempt }}",
+    "verified-release-set-${{ needs.authority.outputs.phase }}-"
+    "${{ github.run_id }}-${{ github.run_attempt }}",
+)
+EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
+    "Verify all four exact image runs and acquire immutable evidence": (
+        "97b71fcdffaba1f0832042d97e31b351686bb026723a20be6e2974f2ee275742"
+    ),
+    "Reverify all run attempts and exact artifact records": (
+        "b91069173df06f0dbdf2b0bcaade40bf6555bec45cb52a2e7acb3be114d15766"
+    ),
+}
 
 
 def workflow(name: str) -> str:
@@ -98,6 +132,14 @@ def require_active_source_line(source: str, line: str, count: int = 1) -> None:
             f"required active source line count differs: {line}: "
             f"expected {count}, found {matches}"
         )
+
+
+def normalized_active_lines(source: str) -> tuple[str, ...]:
+    return tuple(
+        candidate.strip()
+        for candidate in source.splitlines()
+        if candidate.strip() and not candidate.lstrip().startswith("#")
+    )
 
 
 def job_definitions(source: str) -> tuple[tuple[str, str], ...]:
@@ -347,6 +389,62 @@ def workflow_step_blocks(source: str) -> tuple[str, ...]:
     )
 
 
+def canonical_workflow_step_uses_refs(source: str) -> tuple[str, ...]:
+    refs: list[str] = []
+    candidate = re.compile(
+        r"^(?:      - |        )(?:uses|\x22uses\x22|'uses')[ \t]*:"
+    )
+    canonical = re.compile(
+        r"^(?:      - |        )uses: "
+        r"(?P<ref>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40})"
+        r"(?:\s+#.*)?$"
+    )
+    quoted_key = re.compile(
+        r"^(?:      - |        )(?:\x22(?:\\.|[^\x22\\])*\x22|"
+        r"'(?:[^']|'')*')[ \t]*:"
+    )
+    explicit_key = re.compile(r"^(?:      - |        )[?:](?:[ \t]|$)")
+    for block in workflow_step_blocks(source):
+        first_line = block.splitlines()[0]
+        if re.match(r"^      -[ \t]*\{", first_line):
+            raise AssertionError("flow-style workflow steps are forbidden")
+        for line in block.splitlines():
+            if quoted_key.match(line) is not None:
+                raise AssertionError("quoted workflow step mapping keys are forbidden")
+            if explicit_key.match(line) is not None:
+                raise AssertionError("explicit workflow step mapping keys are forbidden")
+            if candidate.match(line) is None:
+                continue
+            match = canonical.fullmatch(line)
+            if match is None:
+                raise AssertionError("workflow step uses mapping is not canonical")
+            refs.append(match.group("ref"))
+    return tuple(refs)
+
+
+def exact_yaml_mapping_active_lines(
+    source: str, indent: int, key: str
+) -> tuple[str, ...]:
+    lines = source.splitlines()
+    marker = f"{' ' * indent}{key}:"
+    starts = [index for index, line in enumerate(lines) if line == marker]
+    if len(starts) != 1:
+        raise AssertionError(
+            f"expected one exact {key} mapping at indent {indent}, found {len(starts)}"
+        )
+    start = starts[0]
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        line_indent = len(line) - len(line.lstrip(" "))
+        if line_indent <= indent:
+            end = index
+            break
+    return normalized_active_lines("\n".join(lines[start:end]))
+
+
 def artifact_upload_use_count(source: str) -> int:
     return len(
         re.findall(
@@ -360,6 +458,295 @@ def artifact_upload_use_count(source: str) -> int:
 
 def is_artifact_upload_step(source: str) -> bool:
     return artifact_upload_use_count(source) == 1
+
+
+def assert_exact_release_image_artifact_controls(source: str) -> None:
+    if hashlib.sha256(source.encode("utf-8")).hexdigest() != (
+        EXACT_RELEASE_IMAGE_WORKFLOW_SHA256
+    ):
+        raise AssertionError("exact release image workflow source differs")
+    build_step = step_block(
+        source, "Build the exact AMD64 image without registry credentials"
+    )
+    action_line = f"uses: {EXACT_IMAGE_BUILD_ACTION}"
+    source_active = normalized_active_lines(source)
+    build_active = normalized_active_lines(build_step)
+    workflow_uses_refs = canonical_workflow_step_uses_refs(source)
+    build_action_refs = tuple(
+        ref
+        for ref in workflow_uses_refs
+        if ref.startswith("docker/build-push-action@")
+    )
+    exact_build_ref = EXACT_IMAGE_BUILD_ACTION.split(" #", 1)[0]
+    if (
+        build_action_refs != (exact_build_ref,)
+        or source_active.count(action_line) != 1
+        or build_active.count(action_line) != 1
+        or canonical_workflow_step_uses_refs(build_step) != (exact_build_ref,)
+    ):
+        raise AssertionError("exactly one pinned release image build action is required")
+    if source_active.count('DOCKER_BUILD_RECORD_UPLOAD: "false"') != 1:
+        raise AssertionError("build-record upload control must occur exactly once")
+    step_scoped_record_control = re.compile(
+        r'(?m)^        env:\r?\n'
+        r'          DOCKER_BUILD_RECORD_UPLOAD: "false"\r?\n'
+        r'^        with:\s*$'
+    )
+    if step_scoped_record_control.search(build_step) is None:
+        raise AssertionError("build-record upload must be literal false on the build step")
+
+    authority_matrix_step = step_block(
+        source, "Resolve the reviewed source and component matrix"
+    )
+    authority_matrix_sha256 = hashlib.sha256(
+        authority_matrix_step.encode("utf-8")
+    ).hexdigest()
+    if authority_matrix_sha256 != EXACT_IMAGE_AUTHORITY_MATRIX_STEP_SHA256:
+        raise AssertionError("exact image authority matrix step differs")
+    authority_matrix_active = normalized_active_lines(authority_matrix_step)
+    for line in (
+        "matrix=\"$(jq -c '[.release.components | to_entries[] | "
+        ".value + {component: .key}]' \"$manifest\")\"",
+        '[[ "$(jq \'length\' <<< "$matrix")" -eq 3 ]]',
+        "printf 'matrix=%s\\n' \"$matrix\"",
+    ):
+        if authority_matrix_active.count(line) != 1:
+            raise AssertionError(f"exact image authority matrix differs: {line}")
+    if len(
+        [line for line in authority_matrix_active if line.startswith("matrix=")]
+    ) != 1:
+        raise AssertionError("image authority matrix assignment count differs")
+    authority = job_block(source, "authority")
+    authority_matrix_outputs = tuple(
+        line
+        for line in authority.splitlines()
+        if re.match(r"^      (?:matrix|\x22matrix\x22|'matrix')[ \t]*:", line)
+    )
+    if authority_matrix_outputs != (
+        "      matrix: ${{ steps.source.outputs.matrix }}",
+    ):
+        raise AssertionError("authority matrix output binding differs")
+
+    def artifact_upload_names(block: str) -> tuple[str, ...]:
+        names: list[str] = []
+        for step in workflow_step_blocks(block):
+            if not is_artifact_upload_step(step):
+                continue
+            assert_unconditional_artifact_upload(step)
+            matches = re.findall(r"(?m)^          name: ([^\r\n]+)$", step)
+            if len(matches) != 1:
+                raise AssertionError(
+                    "every artifact upload must have one literal name binding"
+                )
+            names.extend(matches)
+        return tuple(names)
+
+    upload_names = artifact_upload_names(source)
+    upload_action_ref = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+    upload_action_refs = tuple(
+        ref for ref in workflow_uses_refs if ref.startswith("actions/upload-artifact@")
+    )
+    if (
+        artifact_upload_use_count(source) != 6
+        or upload_action_refs != (upload_action_ref,) * 6
+        or upload_names != EXACT_IMAGE_UPLOAD_NAMES
+    ):
+        raise AssertionError("release image producer upload inventory differs")
+
+    shared_matrix_line = "include: ${{ fromJSON(needs.authority.outputs.matrix) }}"
+    for job_name, expected_upload_name in zip(
+        ("build", "scan", "attest", "verify"),
+        EXACT_IMAGE_UPLOAD_NAMES[:4],
+        strict=True,
+    ):
+        block = job_block(source, job_name)
+        expected_strategy = (
+            "strategy:",
+            "fail-fast: false",
+            *(("max-parallel: 1",) if job_name == "build" else ()),
+            "matrix:",
+            shared_matrix_line,
+        )
+        if exact_yaml_mapping_active_lines(block, 4, "strategy") != expected_strategy:
+            raise AssertionError(f"release image job matrix differs: {job_name}")
+        strategy_keys = yaml_mapping_key_pattern(4, "strategy").findall(block)
+        matrix_keys = yaml_mapping_key_pattern(6, "matrix").findall(block)
+        if len(strategy_keys) != 1 or len(matrix_keys) != 1:
+            raise AssertionError(f"release image job fan-out differs: {job_name}")
+        if (
+            artifact_upload_use_count(block) != 1
+            or artifact_upload_names(block) != (expected_upload_name,)
+        ):
+            raise AssertionError(f"release image job upload differs: {job_name}")
+    for job_name, expected_upload_name in zip(
+        ("aggregate", "verify_set"),
+        EXACT_IMAGE_UPLOAD_NAMES[4:],
+        strict=True,
+    ):
+        block = job_block(source, job_name)
+        assert_no_dynamic_job_fanout(block)
+        if (
+            artifact_upload_use_count(block) != 1
+            or artifact_upload_names(block) != (expected_upload_name,)
+        ):
+            raise AssertionError(f"release image job upload differs: {job_name}")
+
+    gate = step_block(source, "Require every release image control to pass")
+    gate_sha256 = hashlib.sha256(gate.encode("utf-8")).hexdigest()
+    if gate_sha256 != EXACT_IMAGE_GATE_STEP_SHA256:
+        raise AssertionError("exact release image artifact gate step differs")
+    gate_active = normalized_active_lines(gate)
+    expected_name_lines = (
+        '(["gmail-relay", "meta-relay", "web"] as $components |',
+        '["image", "scanned", "attested", "verified"] as $kinds |',
+        r'"\($kind)-\($phase)-\($component)-\($run_id)-\($attempt)"]',
+        r'"release-set-\($phase)-\($run_id)-\($attempt)",',
+        r'"verified-release-set-\($phase)-\($run_id)-\($attempt)"',
+        '[[ "$(jq -r \'length\' <<< "$expected_artifact_names")" -eq 14 ]]',
+    )
+    for line in expected_name_lines:
+        if gate_active.count(line) != 1:
+            raise AssertionError(f"release image expected-name builder differs: {line}")
+
+    function_blocks = {
+        function_name: shell_function_block(gate, function_name)
+        for function_name in (
+            "require_bounded_artifact_inventory",
+            "require_exact_artifact_inventory",
+            "canonical_artifact_inventory",
+        )
+    }
+    bounded_active = normalized_active_lines(
+        function_blocks["require_bounded_artifact_inventory"]
+    )
+    for line in (
+        '--arg control_sha "$CONTROL_SHA" \\',
+        '--argjson expected_names "$expected_artifact_names" \\',
+        '--argjson run_id "$GITHUB_RUN_ID" \'',
+        '(.total_count | type) == "number" and',
+        "(.total_count | floor) == .total_count and",
+        ".total_count >= 0 and",
+        ".total_count <= 14 and",
+        '(.artifacts | type) == "array" and',
+        "(.artifacts | length) <= 14 and",
+        ".total_count == (.artifacts | length) and",
+        "([.artifacts[].name] | length) == "
+        "([.artifacts[].name] | unique | length) and",
+        "all(.artifacts[];",
+        '(.name | type) == "string" and',
+        '(.name | endswith(".dockerbuild") | not) and',
+        "(.name as $name | ($expected_names | index($name)) != null) and",
+        ".expired == false and",
+        '(.id | type) == "number" and',
+        "(.id | floor) == .id and",
+        ".id > 0 and",
+        '(.size_in_bytes | type) == "number" and',
+        "(.size_in_bytes | floor) == .size_in_bytes and",
+        ".size_in_bytes > 0 and",
+        ".size_in_bytes <= 67108864 and",
+        '(.digest | type) == "string" and',
+        '(.digest | test("^sha256:[0-9a-f]{64}$")) and',
+        '(.workflow_run | type) == "object" and',
+        ".workflow_run.id == $run_id and",
+        '.workflow_run.head_branch == "main" and',
+        ".workflow_run.head_sha == $control_sha",
+    ):
+        if bounded_active.count(line) != 1:
+            raise AssertionError(f"bounded artifact inventory differs: {line}")
+
+    exact_active = normalized_active_lines(
+        function_blocks["require_exact_artifact_inventory"]
+    )
+    for line in (
+        'require_bounded_artifact_inventory "$artifacts_json"',
+        ".total_count == 14 and",
+        "(.artifacts | length) == 14 and",
+        "([.artifacts[].name] | sort) == $expected_names",
+    ):
+        if exact_active.count(line) != 1:
+            raise AssertionError(f"exact artifact inventory differs: {line}")
+
+    canonical_active = normalized_active_lines(
+        function_blocks["canonical_artifact_inventory"]
+    )
+    for line in (
+        "id,",
+        "name,",
+        "size_in_bytes,",
+        "digest,",
+        "expired,",
+        "id: .workflow_run.id,",
+        "head_branch: .workflow_run.head_branch,",
+        "head_sha: .workflow_run.head_sha",
+        "}] | sort_by(.name)",
+    ):
+        if canonical_active.count(line) != 1:
+            raise AssertionError(f"canonical artifact inventory differs: {line}")
+
+    artifact_endpoint = (
+        '"/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"'
+    )
+    if gate_active.count(artifact_endpoint) != 2:
+        raise AssertionError("artifact inventory must use two complete current-run reads")
+    ordered_flow = (
+        'artifacts_json="$(gh api \\',
+        'if ! require_bounded_artifact_inventory "$artifacts_json"; then',
+        'artifact_count="$(jq -r \'.total_count\' <<< "$artifacts_json")"',
+        'returned_count="$(jq -r \'.artifacts | length\' <<< "$artifacts_json")"',
+        'if [[ "$artifact_count" -eq 14 && "$returned_count" -eq 14 ]]; then',
+        'require_exact_artifact_inventory "$artifacts_json"',
+        'first_artifact_inventory="$(canonical_artifact_inventory '
+        '"$artifacts_json")"',
+        "break",
+        'if [[ -z "$first_artifact_inventory" ]]; then',
+        "sleep 2",
+        'final_artifacts_json="$(gh api \\',
+        'require_exact_artifact_inventory "$final_artifacts_json"',
+        'final_artifact_inventory="$(canonical_artifact_inventory '
+        '"$final_artifacts_json")"',
+        '[[ "$first_artifact_inventory" == "$final_artifact_inventory" ]]',
+    )
+    ordered_positions: list[int] = []
+    for line in ordered_flow:
+        if gate_active.count(line) != 1:
+            raise AssertionError(f"artifact inventory control-flow line differs: {line}")
+        ordered_positions.append(gate_active.index(line))
+    if ordered_positions != sorted(ordered_positions):
+        raise AssertionError("artifact inventory control-flow order differs")
+    for assignment in (
+        'artifacts_json="$(gh api \\',
+        'final_artifacts_json="$(gh api \\',
+    ):
+        position = gate_active.index(assignment)
+        if gate_active[position + 1] != artifact_endpoint:
+            raise AssertionError("artifact inventory endpoint is not bound to its read")
+
+    active_gate_source = "\n".join(gate_active)
+    for variable in ("artifacts_json", "final_artifacts_json"):
+        assignments = re.findall(
+            rf"(?m)^{re.escape(variable)}=", active_gate_source
+        )
+        if len(assignments) != 1:
+            raise AssertionError(f"artifact inventory assignment count differs: {variable}")
+    for forbidden in (
+        ".total_count >= 14",
+        ".total_count == 17",
+        "map(select(",
+        ".artifacts[] | select(",
+        "del(.artifacts",
+        "delete-artifact",
+        "!*.dockerbuild",
+    ):
+        if forbidden in active_gate_source:
+            raise AssertionError(f"artifact extras may not be filtered or tolerated: {forbidden}")
+
+
+def assert_exact_aggregate_artifact_boundaries(source: str) -> None:
+    for step_name, expected_sha256 in EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256.items():
+        block = step_block(source, step_name)
+        actual_sha256 = hashlib.sha256(block.encode("utf-8")).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise AssertionError(f"aggregate artifact boundary differs: {step_name}")
 
 
 def yaml_mapping_key_pattern(indent: int, key: str) -> re.Pattern[str]:
@@ -797,6 +1184,483 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
         self.assertRegex(gate, r"(?m)^\s+- verify_set\s*$")
         self.assertIn("VERIFY_SET_RESULT: ${{ needs.verify_set.result }}", gate)
         self.assertIn('"$VERIFY_SET_RESULT"', gate)
+
+    def test_release_image_producer_requires_stable_exact_artifact_inventory(self) -> None:
+        source = workflow("build-attest-exact-release-images.yml")
+        assert_exact_release_image_artifact_controls(source)
+
+        aggregate = workflow("aggregate-exact-four-phase-rollout.yml")
+        assert_exact_aggregate_artifact_boundaries(aggregate)
+
+        second_step_name = "Reverify all run attempts and exact artifact records"
+        second_boundary = step_block(aggregate, second_step_name)
+        comparison_start = (
+            "                ([.artifacts | sort_by(.name)[] | {"
+        )
+        comparison_end = "                }])"
+        start = second_boundary.index(comparison_start)
+        end = second_boundary.index(comparison_end, start) + len(comparison_end)
+        comparison = second_boundary[start:end]
+        commented_comparison = "\n".join(
+            f"{line[: len(line) - len(line.lstrip())]}# {line.lstrip()}"
+            for line in comparison.splitlines()
+        )
+        weakened_boundary = (
+            second_boundary[:start]
+            + "                true\n"
+            + commented_comparison
+            + second_boundary[end:]
+        )
+        weakened_aggregate = aggregate.replace(
+            second_boundary, weakened_boundary, 1
+        )
+        self.assertNotEqual(weakened_aggregate, aggregate)
+        with self.assertRaises(AssertionError):
+            assert_exact_aggregate_artifact_boundaries(weakened_aggregate)
+
+    def test_release_image_artifact_control_rejects_weakening_mutations(self) -> None:
+        source = workflow("build-attest-exact-release-images.yml")
+        gate = step_block(source, "Require every release image control to pass")
+        build = step_block(
+            source, "Build the exact AMD64 image without registry credentials"
+        )
+        authority_matrix = step_block(
+            source, "Resolve the reviewed source and component matrix"
+        )
+
+        def mutate_gate(old: str, new: str, occurrences: int = 1) -> str:
+            self.assertEqual(gate.count(old), occurrences)
+            return source.replace(gate, gate.replace(old, new, 1), 1)
+
+        def mutate_build(old: str, new: str) -> str:
+            self.assertEqual(build.count(old), 1)
+            return source.replace(build, build.replace(old, new, 1), 1)
+
+        def mutate_authority_matrix(old: str, new: str) -> str:
+            self.assertEqual(authority_matrix.count(old), 1)
+            mutated_step = authority_matrix.replace(old, new, 1)
+            return source.replace(authority_matrix, mutated_step, 1)
+
+        def mutate_job(job_name: str, old: str, new: str) -> str:
+            block = job_block(source, job_name)
+            self.assertEqual(block.count(old), 1)
+            mutated_block = block.replace(old, new, 1)
+            return source.replace(block, mutated_block, 1)
+
+        def mutate_gate_function(name: str, old: str, new: str) -> str:
+            function = shell_function_block(gate, name)
+            self.assertEqual(function.count(old), 1)
+            mutated_function = function.replace(old, new, 1)
+            return source.replace(gate, gate.replace(function, mutated_function, 1), 1)
+
+        record_env = (
+            "        env:\n"
+            '          DOCKER_BUILD_RECORD_UPLOAD: "false"\n'
+        )
+        record_line = '          DOCKER_BUILD_RECORD_UPLOAD: "false"\n'
+
+        def add_record_control_to_other_step(document: str) -> str:
+            step_name = "Require a GitHub-hosted runner"
+            other_step = step_block(document, step_name)
+            env_header = "        env:\n"
+            self.assertEqual(other_step.count(env_header), 1)
+            self.assertNotIn(record_line, other_step)
+            replacement = other_step.replace(
+                env_header, env_header + record_line, 1
+            )
+            return document.replace(other_step, replacement, 1)
+
+        def insert_step_after(document: str, anchor_name: str, new_step: str) -> str:
+            anchor = step_block(document, anchor_name)
+            separator = "" if anchor.endswith("\n") else "\n"
+            return document.replace(anchor, anchor + separator + new_step, 1)
+
+        upload_action = (
+            "uses: actions/upload-artifact@"
+            "ea165f8d65b6e75b540449e92b4886f43607fa02 # v4"
+        )
+        removed_record_control = mutate_build(record_env, "")
+        duplicate_record_control = add_record_control_to_other_step(source)
+        moved_record_control = add_record_control_to_other_step(
+            removed_record_control
+        )
+        extra_build_step = (
+            "      - name: Unreviewed second release image build\n"
+            "        uses: docker/build-push-action@"
+            "10e90e3645eae34f1e60eeb005ba3a3d33f178e9\n"
+            "        with:\n"
+            "          context: ./source\n"
+        )
+        second_build_action = insert_step_after(
+            source,
+            "Build the exact AMD64 image without registry credentials",
+            extra_build_step,
+        )
+        precolon_build_action = insert_step_after(
+            source,
+            "Build the exact AMD64 image without registry credentials",
+            extra_build_step.replace("        uses:", "        uses :", 1),
+        )
+        quoted_value_build_step = extra_build_step.replace(
+            "        uses: docker/build-push-action@"
+            "10e90e3645eae34f1e60eeb005ba3a3d33f178e9",
+            '        uses: "docker/build-push-action@'
+            '10e90e3645eae34f1e60eeb005ba3a3d33f178e9"',
+            1,
+        )
+        self.assertNotEqual(quoted_value_build_step, extra_build_step)
+        quoted_value_build_action = insert_step_after(
+            source,
+            "Build the exact AMD64 image without registry credentials",
+            quoted_value_build_step,
+        )
+        flow_build_action = insert_step_after(
+            source,
+            "Build the exact AMD64 image without registry credentials",
+            "      - {name: Unreviewed flow release image build, "
+            "uses: docker/build-push-action@"
+            "10e90e3645eae34f1e60eeb005ba3a3d33f178e8, "
+            "with: {context: ./source}}\n",
+        )
+        spaced_inline_build_action = insert_step_after(
+            source,
+            "Build the exact AMD64 image without registry credentials",
+            "      -   uses: docker/build-push-action@"
+            "10e90e3645eae34f1e60eeb005ba3a3d33f178e8\n"
+            "          with:\n"
+            "            context: ./source\n",
+        )
+        newline_flow_build_action = insert_step_after(
+            source,
+            "Build the exact AMD64 image without registry credentials",
+            "      -\n"
+            "        {name: Unreviewed newline-flow release image build, "
+            "uses: docker/build-push-action@"
+            "10e90e3645eae34f1e60eeb005ba3a3d33f178e8, "
+            "with: {context: ./source}}\n",
+        )
+        anchored_flow_build_action = insert_step_after(
+            source,
+            "Build the exact AMD64 image without registry credentials",
+            "      - &hidden {name: Unreviewed anchored release image build, "
+            "uses: docker/build-push-action@"
+            "10e90e3645eae34f1e60eeb005ba3a3d33f178e8, "
+            "with: {context: ./source}}\n",
+        )
+        case_variant_build_action = insert_step_after(
+            source,
+            "Build the exact AMD64 image without registry credentials",
+            extra_build_step.replace(
+                "docker/build-push-action@", "Docker/build-push-action@", 1
+            ),
+        )
+        extra_upload_step = (
+            "      - name: Unreviewed extra release artifact\n"
+            f"        {upload_action}\n"
+            "        with:\n"
+            "          name: unexpected-release-artifact\n"
+            "          path: image.json\n"
+        )
+        second_upload_action = insert_step_after(
+            source, "Upload immutable image identity", extra_upload_step
+        )
+        precolon_upload_action = insert_step_after(
+            source,
+            "Upload immutable image identity",
+            extra_upload_step.replace("        uses:", "        uses :", 1),
+        )
+        quoted_value_upload_action = insert_step_after(
+            source,
+            "Upload immutable image identity",
+            extra_upload_step.replace(
+                "        uses: actions/upload-artifact@"
+                "ea165f8d65b6e75b540449e92b4886f43607fa02 # v4",
+                '        uses: "actions/upload-artifact@'
+                'ea165f8d65b6e75b540449e92b4886f43607fa02" # v4',
+                1,
+            ),
+        )
+        flow_upload_action = insert_step_after(
+            source,
+            "Upload immutable image identity",
+            "      - {name: Unreviewed flow artifact upload, "
+            "uses: actions/upload-artifact@"
+            "ea165f8d65b6e75b540449e92b4886f43607fa02, "
+            "with: {name: unexpected-release-artifact, path: image.json}}\n",
+        )
+        spaced_inline_upload_action = insert_step_after(
+            source,
+            "Upload immutable image identity",
+            "      -   uses: actions/upload-artifact@"
+            "ea165f8d65b6e75b540449e92b4886f43607fa02\n"
+            "          with:\n"
+            "            name: unexpected-release-artifact\n"
+            "            path: image.json\n",
+        )
+        newline_flow_upload_action = insert_step_after(
+            source,
+            "Upload immutable image identity",
+            "      -\n"
+            "        {name: Unreviewed newline-flow artifact upload, "
+            "uses: actions/upload-artifact@"
+            "ea165f8d65b6e75b540449e92b4886f43607fa02, "
+            "with: {name: unexpected-release-artifact, path: image.json}}\n",
+        )
+        anchored_flow_upload_action = insert_step_after(
+            source,
+            "Upload immutable image identity",
+            "      - &hidden {name: Unreviewed anchored artifact upload, "
+            "uses: actions/upload-artifact@"
+            "ea165f8d65b6e75b540449e92b4886f43607fa02, "
+            "with: {name: unexpected-release-artifact, path: image.json}}\n",
+        )
+        case_variant_upload_action = insert_step_after(
+            source,
+            "Upload immutable image identity",
+            extra_upload_step.replace(
+                "actions/upload-artifact@", "Actions/upload-artifact@", 1
+            ),
+        )
+        quoted_upload_step = (
+            "      - name: Quoted-key extra release artifact\n"
+            '        "uses": actions/upload-artifact@'
+            "ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n"
+            "        with:\n"
+            "          name: quoted-key-release-artifact\n"
+            "          path: image.json\n"
+        )
+        quoted_upload_action = insert_step_after(
+            source, "Upload immutable image identity", quoted_upload_step
+        )
+        unicode_escaped_upload_key = insert_step_after(
+            source,
+            "Upload immutable image identity",
+            "      - name: Unicode-escaped-key extra release artifact\n"
+            '        "u\\u0073es": actions/upload-artifact@'
+            "ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n"
+            "        with:\n"
+            "          name: unicode-key-release-artifact\n"
+            "          path: image.json\n",
+        )
+        explicit_upload_key = insert_step_after(
+            source,
+            "Upload immutable image identity",
+            "      - name: Explicit-key extra release artifact\n"
+            "        ? uses\n"
+            "        : actions/upload-artifact@"
+            "ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\n"
+            "        with:\n"
+            "          name: explicit-key-release-artifact\n"
+            "          path: image.json\n",
+        )
+        matrix_assignment = (
+            "          matrix=\"$(jq -c '[.release.components | to_entries[] | "
+            ".value + {component: .key}]' \"$manifest\")\"\n"
+            '          [[ "$(jq \'length\' <<< "$matrix")" -eq 3 ]]'
+        )
+        fourth_matrix_row = mutate_authority_matrix(
+            matrix_assignment,
+            matrix_assignment.splitlines()[0]
+            + "\n"
+            + "          matrix=\"$(jq -c '. + [.[-1]]' <<< \"$matrix\")\"\n"
+            + '          [[ "$(jq \'length\' <<< "$matrix")" -eq 4 ]]',
+        )
+        authority_output_override = source.replace(
+            "      matrix: ${{ steps.source.outputs.matrix }}",
+            "      matrix: '[{\"component\":\"web\"},"
+            "{\"component\":\"meta-relay\"},"
+            "{\"component\":\"gmail-relay\"},"
+            "{\"component\":\"web\"}]'",
+            1,
+        )
+        build_extra_axis = mutate_job(
+            "build",
+            "      matrix:\n"
+            "        include: ${{ fromJSON(needs.authority.outputs.matrix) }}",
+            "      matrix:\n"
+            "        include: ${{ fromJSON(needs.authority.outputs.matrix) }}\n"
+            "        unreviewed: [one, two]",
+        )
+        aggregate_extra_axis = mutate_job(
+            "aggregate",
+            "    steps:",
+            "    strategy:\n"
+            "      matrix:\n"
+            "        unreviewed: [one, two]\n"
+            "    steps:",
+        )
+        verify_set_extra_axis = mutate_job(
+            "verify_set",
+            "    steps:",
+            "    strategy:\n"
+            "      matrix:\n"
+            "        unreviewed: [one, two]\n"
+            "    steps:",
+        )
+        conditional_upload = mutate_job(
+            "build",
+            "      - name: Upload immutable image identity\n",
+            "      - name: Upload immutable image identity\n"
+            "        if: always()\n",
+        )
+        tolerated_upload_failure = mutate_job(
+            "build",
+            "      - name: Upload immutable image identity\n",
+            "      - name: Upload immutable image identity\n"
+            "        continue-on-error: true\n",
+        )
+        mutations = (
+            removed_record_control,
+            mutate_build(
+                'DOCKER_BUILD_RECORD_UPLOAD: "false"',
+                'DOCKER_BUILD_RECORD_UPLOAD: "true"',
+            ),
+            mutate_build(
+                f"uses: {EXACT_IMAGE_BUILD_ACTION}",
+                f"# uses: {EXACT_IMAGE_BUILD_ACTION}\n"
+                "        uses: docker/build-push-action@"
+                "0000000000000000000000000000000000000001 # v6",
+            ),
+            duplicate_record_control,
+            moved_record_control,
+            second_build_action,
+            precolon_build_action,
+            quoted_value_build_action,
+            flow_build_action,
+            spaced_inline_build_action,
+            newline_flow_build_action,
+            anchored_flow_build_action,
+            case_variant_build_action,
+            second_upload_action,
+            precolon_upload_action,
+            quoted_value_upload_action,
+            flow_upload_action,
+            spaced_inline_upload_action,
+            newline_flow_upload_action,
+            anchored_flow_upload_action,
+            case_variant_upload_action,
+            quoted_upload_action,
+            unicode_escaped_upload_key,
+            explicit_upload_key,
+            fourth_matrix_row,
+            authority_output_override,
+            build_extra_axis,
+            aggregate_extra_axis,
+            verify_set_extra_axis,
+            conditional_upload,
+            tolerated_upload_failure,
+            mutate_gate(".total_count <= 14", ".total_count <= 17"),
+            mutate_gate(
+                "                .total_count <= 14 and\n"
+                '                (.artifacts | type) == "array" and\n'
+                "                (.artifacts | length) <= 14 and",
+                "                true and\n"
+                "                # .total_count <= 14 and\n"
+                '                (.artifacts | type) == "array" and\n'
+                "                # (.artifacts | length) <= 14 and",
+            ),
+            mutate_gate(
+                ".total_count == (.artifacts | length)",
+                ".total_count >= (.artifacts | length)",
+            ),
+            mutate_gate(
+                "([.artifacts[].name] | length) == "
+                "([.artifacts[].name] | unique | length)",
+                "true",
+            ),
+            mutate_gate(
+                '(.name | endswith(".dockerbuild") | not)',
+                '(.name | type) == "string"',
+            ),
+            mutate_gate(
+                "(.name as $name | ($expected_names | index($name)) != null)",
+                "(.name | type) == \"string\"",
+            ),
+            mutate_gate(".expired == false", "true"),
+            mutate_gate(".id > 0", ".id >= 0"),
+            mutate_gate(".size_in_bytes > 0", ".size_in_bytes >= 0"),
+            mutate_gate(
+                ".size_in_bytes <= 67108864",
+                ".size_in_bytes <= 67108865",
+            ),
+            mutate_gate(
+                '(.digest | test("^sha256:[0-9a-f]{64}$"))',
+                '(.digest | startswith("sha256:"))',
+            ),
+            mutate_gate(
+                ".workflow_run.id == $run_id",
+                ".workflow_run.id > 0",
+            ),
+            mutate_gate(
+                '.workflow_run.head_branch == "main"',
+                '(.workflow_run.head_branch | type) == "string"',
+            ),
+            mutate_gate(
+                ".workflow_run.head_sha == $control_sha",
+                '(.workflow_run.head_sha | type) == "string"',
+            ),
+            mutate_gate_function(
+                "require_bounded_artifact_inventory",
+                '--arg control_sha "$CONTROL_SHA" \\',
+                '--arg control_sha "$VALIDATION_RUN_ID" \\',
+            ),
+            mutate_gate_function(
+                "require_bounded_artifact_inventory",
+                '--argjson run_id "$GITHUB_RUN_ID" \'',
+                '--argjson run_id "$VALIDATION_RUN_ID" \'',
+            ),
+            mutate_gate(".total_count == 14", ".total_count >= 14"),
+            mutate_gate(
+                "([.artifacts[].name] | sort) == $expected_names",
+                "($expected_names - [.artifacts[].name]) == []",
+            ),
+            mutate_gate(
+                '"/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/'
+                'artifacts?per_page=100"',
+                '"/repos/$REPOSITORY/actions/runs/$VALIDATION_RUN_ID/'
+                'artifacts?per_page=100"',
+                2,
+            ),
+            mutate_gate(
+                "            artifacts_json=\"$(gh api \\\n"
+                "              \"/repos/$REPOSITORY/actions/runs/"
+                "$GITHUB_RUN_ID/artifacts?per_page=100\")\"",
+                "            artifacts_json=\"$(gh api \\\n"
+                "              \"/repos/$REPOSITORY/actions/runs/"
+                "$GITHUB_RUN_ID/artifacts?per_page=100\" | \\\n"
+                "              jq '.artifacts |= map(select((.name | "
+                "endswith(\".dockerbuild\")) | not)) | "
+                ".total_count = (.artifacts | length)')\"",
+            ),
+            mutate_gate(
+                "for delay_seconds in 0 1 2 4 8; do",
+                "for delay_seconds in 0 1 2 4 8 16; do",
+            ),
+            mutate_gate("sleep 2", "sleep 0"),
+            mutate_gate(
+                '[[ "$first_artifact_inventory" == "$final_artifact_inventory" ]]',
+                "true",
+            ),
+            mutate_gate(
+                '          require_exact_artifact_inventory "$final_artifacts_json"',
+                "          true\n"
+                '          # require_exact_artifact_inventory "$final_artifacts_json"',
+            ),
+            mutate_gate(
+                '          require_exact_artifact_inventory "$final_artifacts_json"',
+                '          final_artifacts_json="$artifacts_json"\n'
+                '          require_exact_artifact_inventory "$final_artifacts_json"',
+            ),
+            mutate_gate(
+                "digest,\n                expired,",
+                "expired,",
+            ),
+        )
+        for index, mutated in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.assertNotEqual(mutated, source)
+                with self.assertRaises(AssertionError):
+                    assert_exact_release_image_artifact_controls(mutated)
 
 
 class PermissionAndCredentialIsolationTests(unittest.TestCase):
