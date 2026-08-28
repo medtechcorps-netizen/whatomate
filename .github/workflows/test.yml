@@ -52,8 +52,8 @@ jobs:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_tenant_test?sslmode=disable
         run: go test -mod=readonly -v ./internal/database -run '^TestTenantRLS_'
 
-  test:
-    name: test
+  go-race:
+    name: go-race
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
@@ -88,14 +88,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Test exact rollout evidence controls
+      - name: Verify Gate-A recovery boundary
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONHASHSEED: "0"
         run: |
-          python3 -m py_compile \
-            release/deployment/verify_rollout_evidence.py \
-            release/deployment/test_verify_rollout_evidence.py \
-            release/deployment/verify_production_plan.py \
-            release/deployment/test_verify_production_plan.py
-          python3 -m unittest discover -s release/deployment -p 'test_*.py' -v
+          set -euo pipefail
+          python3 -B -m unittest discover -s prototype/recovery-boundary/tests -p 'test_*.py' -v
+          python3 -B prototype/recovery-boundary/verify_gate_a.py
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -128,7 +128,7 @@ jobs:
           # runner variance in the race+coverage integration suites.
           package_output="$(go list -mod=readonly ./...)"
           [[ -n "$package_output" ]]
-          mapfile -t packages < <(printf '%s\n' "$package_output" | grep -v /test/)
+          mapfile -t packages < <(printf '%s\n' "$package_output")
           [[ "${#packages[@]}" -gt 0 ]]
           gotestsum \
             --format testname \
@@ -165,6 +165,13 @@ jobs:
         uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
         with:
           version: v2.11.4
+
+      - name: Lint workflows and inert recovery templates
+        run: |
+          set -euo pipefail
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          actionlint .github/workflows/test.yml
+          actionlint -ignore '"on" section should not be empty' prototype/recovery-boundary/workflows/*.tmpl
 
   build:
     name: build
@@ -255,3 +262,88 @@ jobs:
           exit-code: "1"
           vuln-type: os,library
           severity: CRITICAL,HIGH
+
+  recovery-boundary-images:
+    name: recovery-boundary-images (${{ matrix.role }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: writer-authority
+            dockerfile: prototype/recovery-boundary/docker/writer-authority.Dockerfile
+            image: recovery-boundary-writer-authority:ci
+          - role: writer-broker
+            dockerfile: prototype/recovery-boundary/docker/writer-broker.Dockerfile
+            image: recovery-boundary-writer-broker:ci
+          - role: observer-authority
+            dockerfile: prototype/recovery-boundary/docker/observer-authority.Dockerfile
+            image: recovery-boundary-observer-authority:ci
+          - role: observer-broker
+            dockerfile: prototype/recovery-boundary/docker/observer-broker.Dockerfile
+            image: recovery-boundary-observer-broker:ci
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build inert recovery boundary image
+        run: >-
+          docker build --pull --no-cache --platform linux/amd64
+          -f "${{ matrix.dockerfile }}"
+          -t "${{ matrix.image }}" .
+
+      - name: Scan inert recovery boundary image
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}
+          format: table
+          exit-code: "1"
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+
+  test:
+    name: test
+    if: ${{ always() }}
+    needs:
+      - tenant-isolation
+      - go-race
+      - lint
+      - build
+      - security
+      - recovery-boundary-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Test exact rollout evidence controls
+        run: |
+          python3 -m py_compile \
+            release/deployment/verify_rollout_evidence.py \
+            release/deployment/test_verify_rollout_evidence.py \
+            release/deployment/verify_production_plan.py \
+            release/deployment/test_verify_production_plan.py
+          python3 -m unittest discover -s release/deployment -p 'test_*.py' -v
+
+      - name: Require every Test job to succeed
+        env:
+          TENANT_ISOLATION_RESULT: ${{ needs.tenant-isolation.result }}
+          GO_RACE_RESULT: ${{ needs.go-race.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          RECOVERY_BOUNDARY_IMAGES_RESULT: ${{ needs.recovery-boundary-images.result }}
+        run: |
+          set -euo pipefail
+          [[ "$TENANT_ISOLATION_RESULT" == "success" ]]
+          [[ "$GO_RACE_RESULT" == "success" ]]
+          [[ "$LINT_RESULT" == "success" ]]
+          [[ "$BUILD_RESULT" == "success" ]]
+          [[ "$SECURITY_RESULT" == "success" ]]
+          [[ "$RECOVERY_BOUNDARY_IMAGES_RESULT" == "success" ]]

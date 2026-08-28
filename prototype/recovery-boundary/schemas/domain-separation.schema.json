@@ -1,0 +1,63 @@
+{
+  "title": "Gate-C nonproduction authority-domain separation evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "claim_scope",
+    "non_authoritative",
+    "kind",
+    "writer",
+    "observer"
+  ],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 2},
+    "claim_scope": {"type": "string", "const": "gate-c-nonproduction-only"},
+    "non_authoritative": {"type": "boolean", "const": true},
+    "kind": {"type": "string", "const": "authority-domain-separation"},
+    "writer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantic_label",
+        "authority_app_sha256",
+        "broker_app_sha256",
+        "ledger_sha256",
+        "root_key_sha256",
+        "signing_kid",
+        "signing_public_key"
+      ],
+      "properties": {
+        "semantic_label": {"type": "string", "const": "writer"},
+        "authority_app_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "broker_app_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "ledger_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "root_key_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "signing_kid": {"type": "string", "pattern": "^synthetic-writer-[0-9a-f]{16}$"},
+        "signing_public_key": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"}
+      }
+    },
+    "observer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantic_label",
+        "authority_app_sha256",
+        "broker_app_sha256",
+        "ledger_sha256",
+        "root_key_sha256",
+        "signing_kid",
+        "signing_public_key"
+      ],
+      "properties": {
+        "semantic_label": {"type": "string", "const": "observer"},
+        "authority_app_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "broker_app_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "ledger_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "root_key_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "signing_kid": {"type": "string", "pattern": "^synthetic-observer-[0-9a-f]{16}$"},
+        "signing_public_key": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"}
+      }
+    }
+  }
+}

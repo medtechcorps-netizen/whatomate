@@ -1,0 +1,24 @@
+{
+  "schema_version": 2,
+  "claim_scope": "gate-c-nonproduction-only",
+  "non_authoritative": true,
+  "kind": "authority-domain-separation",
+  "writer": {
+    "semantic_label": "writer",
+    "authority_app_sha256": "1414141414141414141414141414141414141414141414141414141414141414",
+    "broker_app_sha256": "1515151515151515151515151515151515151515151515151515151515151515",
+    "ledger_sha256": "1616161616161616161616161616161616161616161616161616161616161616",
+    "root_key_sha256": "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+    "signing_kid": "synthetic-writer-56475aa75463474c",
+    "signing_public_key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"
+  },
+  "observer": {
+    "semantic_label": "observer",
+    "authority_app_sha256": "2424242424242424242424242424242424242424242424242424242424242424",
+    "broker_app_sha256": "2525252525252525252525252525252525252525252525252525252525252525",
+    "ledger_sha256": "2626262626262626262626262626262626262626262626262626262626262626",
+    "root_key_sha256": "24f6ed6acbfe1009c030d7ca567c33ca4830911498236b5561a6c82abec5de28",
+    "signing_kid": "synthetic-observer-24f6ed6acbfe1009",
+    "signing_public_key": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+  }
+}
