@@ -286,6 +286,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.prelock.outputs.root_marker_artifact_id }}
           path: ${{ runner.temp }}/root-lock
+          merge-multiple: true
       - name: Install pinned rollback intent authority tools
         run: |
           set -euo pipefail
@@ -335,7 +336,7 @@ jobs:
             verify_subject "$RUNNER_TEMP/current" production-phase-apply-receipt "$current_sha" "$APPLY_WORKFLOW_PATH" https://rereply.app/attestations/production-phase-apply-receipt/v1 current
           fi
           verify_subject "$RUNNER_TEMP/target-state" production-phase-state "$("$jq_bin" -er '.target_state.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$CANARY_WORKFLOW_PATH" https://rereply.app/attestations/production-phase-state/v1 target
-          verify_subject "$RUNNER_TEMP/recovery" production-recovery-readiness "$("$jq_bin" -er '.recovery.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECOVERY_WORKFLOW_PATH" https://rereply.app/attestations/production-recovery-readiness/v1 recovery
+          verify_subject "$RUNNER_TEMP/recovery" production-recovery-readiness "$("$jq_bin" -er '.recovery.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECOVERY_WORKFLOW_PATH" https://rereply.app/attestations/production-recovery-readiness/v2 recovery
       - name: Prepare exact sanitized rollback mutation intent without credentials
         id: prepare
         env:
@@ -448,11 +449,13 @@ jobs:
         with:
           artifact-ids: ${{ needs.prelock.outputs.root_marker_artifact_id }}
           path: ${{ runner.temp }}/root-lock
+          merge-multiple: true
       - name: Download exact signed rollback mutation intent
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
           path: ${{ runner.temp }}/mutation-intent
+          merge-multiple: true
       - name: Authenticate exact signed rollback pre-lock mutation intent
         env:
           CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
@@ -581,6 +584,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
           path: ${{ runner.temp }}/mutation-intent
+          merge-multiple: true
       - name: Recheck the exact rollback lock and build proof
         id: prepare
         env:
@@ -710,11 +714,13 @@ jobs:
         with:
           artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
           path: ${{ runner.temp }}/mutation-intent
+          merge-multiple: true
       - name: Download exact signed rollback main lock proof
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ needs.lock_proof.outputs.proof_artifact_id }}
           path: ${{ runner.temp }}/main-lock-proof
+          merge-multiple: true
       - name: Normalize exact rollback request before capability use
         env:
           RAW: ${{ inputs.rollback_evidence_json }}
@@ -777,7 +783,7 @@ jobs:
             verify_subject "$RUNNER_TEMP/current" production-phase-apply-receipt "$current_sha" "$APPLY_WORKFLOW_PATH" https://rereply.app/attestations/production-phase-apply-receipt/v1 current
           fi
           verify_subject "$RUNNER_TEMP/target-state" production-phase-state "$(jq -er '.target_state.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$CANARY_WORKFLOW_PATH" https://rereply.app/attestations/production-phase-state/v1 target
-          verify_subject "$RUNNER_TEMP/recovery" production-recovery-readiness "$(jq -er '.recovery.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECOVERY_WORKFLOW_PATH" https://rereply.app/attestations/production-recovery-readiness/v1 recovery
+          verify_subject "$RUNNER_TEMP/recovery" production-recovery-readiness "$(jq -er '.recovery.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECOVERY_WORKFLOW_PATH" https://rereply.app/attestations/production-recovery-readiness/v2 recovery
       - name: Verify exact rollback mutation-intent and main-lock-proof attestations
         env:
           CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}

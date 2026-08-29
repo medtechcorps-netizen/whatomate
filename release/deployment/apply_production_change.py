@@ -324,13 +324,22 @@ def validate_recovery(
     now: dt.datetime,
     *,
     contract_path: Path | None = None,
+    expected_control: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     recovery = common.exact_keys(
         value,
-        {"schema_version", "authority", "repository", "issued_at", "expires_at", "control", "target", "postgresql", "valkey", "provider", "gates"},
+        {
+            "schema_version", "authority", "repository", "issued_at", "expires_at",
+            "control", "authorities", "target", "postgresql", "valkey", "provider",
+            "gates",
+        },
         "recovery readiness",
     )
-    if recovery["schema_version"] != 1 or recovery["authority"] != "production-recovery-readiness" or recovery["repository"] != common.REPOSITORY:
+    if (
+        recovery["schema_version"] != 2
+        or recovery["authority"] != "production-recovery-readiness"
+        or recovery["repository"] != common.REPOSITORY
+    ):
         common.fail("recovery readiness authority differs")
     control = common.exact_keys(
         recovery["control"],
@@ -351,13 +360,102 @@ def validate_recovery(
         common.fail("recovery workflow identity differs")
     common.require_sha256(control["contract_sha256"], "recovery contract hash")
     common.require_sha256(control["controller_sha256"], "recovery controller hash")
+    if expected_control is not None:
+        checked_expected_control = common.exact_keys(
+            expected_control,
+            {
+                "workflow_sha", "workflow_path", "run_id", "run_attempt",
+                "runner_environment", "contract_sha256", "controller_sha256",
+            },
+            "expected recovery readiness control",
+        )
+        common.require_sha1(
+            checked_expected_control["workflow_sha"],
+            "expected recovery workflow SHA",
+        )
+        common.require_run_id(
+            checked_expected_control["run_id"], "expected recovery run ID"
+        )
+        common.exact_int(
+            checked_expected_control["run_attempt"],
+            "expected recovery run attempt",
+            1,
+            1,
+        )
+        for key in ("contract_sha256", "controller_sha256"):
+            common.require_sha256(
+                checked_expected_control[key], f"expected recovery {key}"
+            )
+        if (
+            checked_expected_control["workflow_path"]
+            != ".github/workflows/verify-production-recovery-readiness.yml"
+            or checked_expected_control["runner_environment"] != "github-hosted"
+            or control != checked_expected_control
+        ):
+            common.fail("recovery readiness control differs from signing authority")
+    recovery_controller_path = Path(__file__).resolve().with_name(
+        "observe_production_recovery.py"
+    )
+    if control["controller_sha256"] != common.sha256_bytes(
+        recovery_controller_path.read_bytes()
+    ):
+        common.fail("recovery evidence is not bound to the current recovery controller")
     contract_path = contract_path or Path(__file__).resolve().with_name("production-app-contract.json")
-    contract = common.load_json(contract_path, "production app contract")
-    contract_sha256 = common.sha256_bytes(contract_path.read_bytes())
+    contract_raw = contract_path.read_bytes()
+    try:
+        contract = common.loads_strict(contract_raw.decode("utf-8"))
+    except UnicodeError as exc:
+        raise common.ReleaseError("production app contract is malformed") from exc
+    contract_sha256 = common.sha256_bytes(contract_raw)
     if control["contract_sha256"] != contract_sha256:
         common.fail("recovery evidence is not bound to the current production contract")
     contract_databases = recovery_control.contract_database_bindings(contract)
-    common.validate_fresh_window(recovery["issued_at"], recovery["expires_at"], now, maximum_age_seconds=common.MAX_RECOVERY_AGE_SECONDS, label="recovery readiness")
+    common.validate_fresh_window(
+        recovery["issued_at"], recovery["expires_at"], now,
+        maximum_age_seconds=common.MAX_RECOVERY_AGE_SECONDS,
+        label="recovery readiness",
+    )
+    authorities = common.exact_keys(
+        recovery["authorities"], {"production_plan", "valkey_fork"},
+        "recovery readiness authorities",
+    )
+    production_plan = common.exact_keys(
+        authorities["production_plan"], {"run_id", "run_attempt", "sha256"},
+        "recovery production plan authority",
+    )
+    production_plan = {
+        "run_id": common.require_run_id(
+            production_plan["run_id"], "recovery production plan run ID"
+        ),
+        "run_attempt": common.exact_int(
+            production_plan["run_attempt"], "recovery production plan run attempt", 1, 1
+        ),
+        "sha256": common.require_sha256(
+            production_plan["sha256"], "recovery production plan hash"
+        ),
+    }
+    valkey_fork_authority = common.exact_keys(
+        authorities["valkey_fork"],
+        {"run_id", "run_attempt", "sha256", "request_sha256", "receipt_sha256"},
+        "recovery Valkey fork authority",
+    )
+    valkey_fork_authority = {
+        "run_id": common.require_run_id(
+            valkey_fork_authority["run_id"], "Valkey fork run ID"
+        ),
+        "run_attempt": common.exact_int(
+            valkey_fork_authority["run_attempt"], "Valkey fork run attempt", 1, 1
+        ),
+        "sha256": common.require_sha256(
+            valkey_fork_authority["sha256"], "Valkey fork exact-file hash"
+        ),
+        "request_sha256": common.require_sha256(
+            valkey_fork_authority["request_sha256"], "Valkey fork request hash"
+        ),
+        "receipt_sha256": common.require_sha256(
+            valkey_fork_authority["receipt_sha256"], "Valkey fork receipt hash"
+        ),
+    }
     target = common.exact_keys(
         recovery["target"],
         {
@@ -421,7 +519,7 @@ def validate_recovery(
             "recovery_version", "region_sha256", "recovery_region_sha256",
             "source_topology_sha256", "recovery_topology_sha256", "persistence",
             "recovery_persistence", "recovery_is_distinct", "recovery_is_fresh",
-            "topology_equal", "production_cluster_sha256", "live_recovery_sentinel",
+            "topology_equal", "production_cluster_sha256", "provider_fork",
         },
         "Valkey recovery evidence",
     )
@@ -439,6 +537,7 @@ def validate_recovery(
         or valkey["recovery_status"] != "online"
         or valkey["version"] != contract_databases["valkey_version"]
         or valkey["recovery_version"] != contract_databases["valkey_version"]
+        or valkey["identity_sha256"] == valkey["recovery_identity_sha256"]
         or valkey["region_sha256"] != target["region_sha256"]
         or valkey["recovery_region_sha256"] != target["region_sha256"]
         or valkey["source_topology_sha256"] != valkey["recovery_topology_sha256"]
@@ -447,41 +546,86 @@ def validate_recovery(
         or any(valkey[key] is not True for key in ("recovery_is_distinct", "recovery_is_fresh", "topology_equal"))
     ):
         common.fail("Valkey recovery binding differs")
-    sentinel = common.exact_keys(
-        valkey["live_recovery_sentinel"],
+    provider_fork = common.exact_keys(
+        valkey["provider_fork"],
         {
-            "authority", "marker_key_sha256", "marker_sha256", "source_recovery_equal",
-            "live_read_count", "issued_at_sha256", "source_endpoint_sha256",
-            "recovery_endpoint_sha256",
+            "authority", "source_identity_sha256", "recovery_identity_sha256",
+            "request_sha256", "receipt_sha256", "source_config_sha256",
+            "recovery_config_sha256", "source_firewall_sha256",
+            "recovery_firewall_sha256", "fork_name_sha256",
+            "fork_created_at_sha256", "provider_copy_contract", "stable_read_count",
+            "request_attempt_count", "mutation_ambiguous_reconciled",
+            "source_firewall_unchanged", "source_firewall_exact_app",
+            "recovery_firewall_exact_source_app",
+            "recovery_restricted_to_exact_production_app",
         },
-        "Valkey live recovery sentinel",
+        "Valkey provider fork proof",
     )
-    if (
-        sentinel["authority"] != recovery_control.SENTINEL_AUTHORITY
-        or sentinel["source_recovery_equal"] is not True
-        or common.exact_int(sentinel["live_read_count"], "Valkey sentinel live read count", 2, 2) != 2
-        or sentinel["marker_key_sha256"]
-        != common.sha256_bytes(recovery_control.SENTINEL_KEY.encode("utf-8"))
-        or sentinel["source_endpoint_sha256"] == sentinel["recovery_endpoint_sha256"]
+    for key in (
+        "source_identity_sha256", "recovery_identity_sha256", "request_sha256",
+        "receipt_sha256", "source_config_sha256", "recovery_config_sha256",
+        "source_firewall_sha256", "recovery_firewall_sha256", "fork_name_sha256",
+        "fork_created_at_sha256",
     ):
-        common.fail("Valkey live recovery sentinel is incomplete")
-    for key in ("marker_key_sha256", "marker_sha256", "issued_at_sha256", "source_endpoint_sha256", "recovery_endpoint_sha256"):
-        common.require_sha256(sentinel[key], f"Valkey sentinel {key}")
+        common.require_sha256(provider_fork[key], f"Valkey provider fork {key}")
+    if (
+        provider_fork["authority"] != "production-valkey-recovery-fork-v2"
+        or provider_fork["source_identity_sha256"] != valkey["identity_sha256"]
+        or provider_fork["recovery_identity_sha256"]
+        != valkey["recovery_identity_sha256"]
+        or provider_fork["request_sha256"]
+        != valkey_fork_authority["request_sha256"]
+        or provider_fork["receipt_sha256"]
+        != valkey_fork_authority["receipt_sha256"]
+        or valkey_fork_authority["sha256"]
+        != valkey_fork_authority["receipt_sha256"]
+        or provider_fork["source_config_sha256"]
+        != provider_fork["recovery_config_sha256"]
+        or provider_fork["provider_copy_contract"]
+        != "digitalocean-valkey-latest-transaction-data-and-configuration"
+        or common.exact_int(
+            provider_fork["stable_read_count"], "Valkey provider stable read count", 2, 2
+        ) != 2
+        or common.exact_int(
+            provider_fork["request_attempt_count"], "Valkey fork request attempt count", 1, 1
+        ) != 1
+        or common.exact_bool(
+            provider_fork["mutation_ambiguous_reconciled"],
+            "Valkey fork ambiguity reconciliation",
+        ) is not False
+        or provider_fork["source_firewall_unchanged"] is not True
+        or provider_fork["source_firewall_exact_app"] is not True
+        or provider_fork["recovery_firewall_exact_source_app"] is not True
+        or provider_fork["recovery_restricted_to_exact_production_app"] is not True
+    ):
+        common.fail("Valkey provider fork authority differs")
     provider = common.exact_keys(
         recovery["provider"],
         {"http_methods_used", "http_request_count", "http_endpoint_labels", "mutation_request_count"},
         "recovery provider ledger",
     )
-    if recovery["gates"] != {"postgresql_ready": True, "valkey_ready": True, "double_read_equal": True, "mutation_free": True}:
+    if recovery["gates"] != {
+        "postgresql_ready": True,
+        "valkey_ready": True,
+        "double_read_equal": True,
+        "mutation_free": True,
+        "provider_fork_bound": True,
+        "recovery_restricted_to_exact_production_app": True,
+    }:
         common.fail("recovery readiness gates are incomplete")
+    stable_round = [
+        "postgres-cluster", "postgres-backups", "valkey-cluster", "valkey-config",
+        "valkey-source-firewall", "valkey-recovery-cluster",
+        "valkey-recovery-config", "valkey-recovery-firewall",
+    ]
+    endpoint_labels = ["valkey-recovery-discovery", *stable_round, *stable_round]
     if (
         provider["http_methods_used"] != ["GET"]
         or provider["mutation_request_count"] != 0
-        or common.exact_int(provider["http_request_count"], "recovery provider request count", 12, 12) != 12
-        or provider["http_endpoint_labels"] != [
-            "postgres-cluster", "postgres-backups", "valkey-cluster", "valkey-config",
-            "valkey-recovery-cluster", "valkey-recovery-config",
-        ]
+        or common.exact_int(
+            provider["http_request_count"], "recovery provider request count", 17, 17
+        ) != 17
+        or provider["http_endpoint_labels"] != endpoint_labels
     ):
         common.fail("recovery readiness is not mutation-free")
     exact_hash = common.require_sha256(expected_sha256, "recovery exact-file hash")
@@ -489,6 +633,38 @@ def validate_recovery(
         common.fail("recovery exact-file hash differs")
     common.sanitize_public(recovery)
     return recovery
+
+
+def _require_recovery_plan_authority(
+    recovery: Mapping[str, Any], authority: Mapping[str, Any]
+) -> None:
+    supplied = common.exact_keys(
+        recovery["authorities"]["production_plan"],
+        {"run_id", "run_attempt", "sha256"},
+        "recovery production plan authority",
+    )
+    actual = {
+        "run_id": common.require_run_id(
+            supplied["run_id"], "recovery production plan run ID"
+        ),
+        "run_attempt": common.exact_int(
+            supplied["run_attempt"], "recovery production plan run attempt", 1, 1
+        ),
+        "sha256": common.require_sha256(
+            supplied["sha256"], "recovery production plan hash"
+        ),
+    }
+    expected = {
+        "run_id": common.require_run_id(authority.get("run_id"), "production plan run ID"),
+        "run_attempt": common.exact_int(
+            authority.get("run_attempt"), "production plan run attempt", 1, 1
+        ),
+        "sha256": common.require_sha256(
+            authority.get("sha256"), "production plan exact-file hash"
+        ),
+    }
+    if actual != expected:
+        common.fail("recovery production plan authority differs")
 
 
 def _plan_images(plan: Mapping[str, Any], rollout: Mapping[str, Any]) -> tuple[str, str, str, dict[str, str]]:
@@ -778,6 +954,7 @@ def prepare_apply_mutation_intent(
     recovery = validate_recovery(recovery, recovery_sha256, checked)
     if recovery_sha256 != authorities["recovery"]["sha256"]:
         common.fail("recovery authority differs")
+    _require_recovery_plan_authority(recovery, authorities["production_plan"])
     before = _plan_before_state(plan, predecessor)
     authoritative_predecessor_hash = authorities["predecessor_state_sha256"]
     _validate_predecessor(
@@ -1017,6 +1194,7 @@ def apply_change(
     if plan.get("rollback") != common.ROLLBACK_FLOORS[target_phase]:
         common.fail("production plan rollback floor differs")
     recovery = validate_recovery(recovery, recovery_sha256, checked)
+    _require_recovery_plan_authority(recovery, authorities["production_plan"])
     if (
         recovery["control"]["contract_sha256"] != plan["control"]["contract_sha256"]
         or
@@ -1090,6 +1268,8 @@ def apply_change(
             recovery=recovery,
             clock=time_source,
         )
+        recovery = validate_recovery(recovery, recovery_sha256, mutation_checked)
+        _require_recovery_plan_authority(recovery, authorities["production_plan"])
         common.validate_mutation_intent(mutation_intent, now=mutation_checked)
         mutation_fingerprint = mutation_intent["mutation"]["mutation_fingerprint_sha256"]
         try:

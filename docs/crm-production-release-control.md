@@ -207,9 +207,27 @@ The environments have distinct authority:
 
 - `rereply-production-plan` contains only the GET-only DigitalOcean token and
   protected target descriptor;
-- `rereply-production-recovery` contains only the GET-only database recovery
-  inventory token, the three protected database identities, two provider-bound
-  Valkey TLS read descriptors, and the sentinel HMAC verification key;
+- `rereply-production-recovery-create` contains separate GET-only database and
+  `database:create` tokens plus the protected two-cluster target descriptor.
+  Its exact secret-name inventory is
+  `DO_PRODUCTION_DATABASE_TARGET_JSON`,
+  `DO_PRODUCTION_DATABASE_READ_TOKEN`, and
+  `DO_PRODUCTION_DATABASE_CREATE_TOKEN`.
+  The GET token performs intent and post-request reconciliation reads; the
+  create token is confined to the one-shot POST transport in the mutation job;
+- `rereply-production-recovery` contains only the GET-only database inventory
+  token and the same protected target descriptor. Its exact secret-name
+  inventory is `DO_PRODUCTION_DATABASE_TARGET_JSON` and
+  `DO_PRODUCTION_DATABASE_READ_TOKEN`;
+- `rereply-production-recovery-cleanup` contains separate GET-only database and
+  narrowly scoped `database:delete` tokens plus the protected target
+  descriptor. Its exact secret-name inventory is
+  `DO_PRODUCTION_DATABASE_TARGET_JSON`,
+  `DO_PRODUCTION_DATABASE_READ_TOKEN`, and
+  `DO_PRODUCTION_DATABASE_DELETE_TOKEN`. The GET token performs discovery and
+  two stable absence reads;
+  the delete token is confined to the single DELETE transport after exact
+  signed cleanup authority is verified;
 - `rereply-production-apply` contains the narrowly scoped provider mutation
   credential, stable two-field target descriptor, dedicated
   `GH_PRODUCTION_BRANCH_READ_TOKEN`, and separately scoped
@@ -386,50 +404,97 @@ count, sends a branch mutation, unlocks a rule, or receives any production
 provider capability. A still-locked, moved, missing, duplicate, or otherwise
 unknown rule remains **NO-GO**; no generic or manual unlock is allowed.
 
-Recovery is NO-GO until a separate, explicitly authorized environment setup is
-complete. `rereply-production-recovery` must contain
-`DO_PRODUCTION_VALKEY_SENTINEL_SOURCE_JSON` and
-`DO_PRODUCTION_VALKEY_SENTINEL_RECOVERY_JSON`, each with exact
-`host`, `port`, `server_name`, `username`, and `password` fields, plus a
-base64-encoded 32-byte `DO_PRODUCTION_VALKEY_SENTINEL_HMAC_KEY_B64`. The two
-Valkey users must be independently verified as read-only and restricted to
-`GET` on the fixed `rereply:recovery:sentinel:v1` key. The endpoints must match
-the connection authorities returned for the exact contract-bound source and
-recovery cluster IDs.
+Recovery uses DigitalOcean's provider-native Valkey fork operation. DigitalOcean
+documents that a fork contains the source cluster's latest transaction, data,
+and configuration at fork time and requires RDB persistence. This provider
+contract replaces the unavailable per-key Managed Valkey ACL design; no Valkey
+endpoint, username, password, marker, or data-plane command is exposed to
+GitHub. DigitalOcean does not expose a per-key checksum, transaction watermark,
+or parent-lineage field for this API, so the signed evidence claims only the
+reviewed provider copy contract—not an independently measured key-by-key copy.
+
+`Prepare Production Valkey Recovery Fork` first uses a GET-only token to bind an
+immutable signed intent to the exact source identity, provider name,
+configuration, topology, firewall, phase, control SHA, rollout plan, and
+deterministic operation name. Only after that intent is attested may a separate
+`database:create` token issue one POST. A response is authoritative only when a
+strict clean `201` body exactly matches the request and two stable provider
+observations. Any timeout, `408`, `429`, EOF, redirect, malformed response, `5xx`,
+or post-send response mismatch is reconciled with GETs for quarantine/cleanup
+only; it is never accepted as release authority and the POST is never repeated.
 
 The read-only recovery observer binds the App Platform contract region `sgp`
-to DigitalOcean's reviewed managed-database/VPC region `sgp1`. PostgreSQL,
-source Valkey, and the Valkey recovery fork must all report that exact provider
-region and the exact contract versions. Source and recovery Valkey must also
-have equal sanitized topology fingerprints covering size slug, node count,
-private-network identity hash, and storage capacity; raw network identifiers
-never enter evidence. PostgreSQL readiness additionally requires a completed,
-recent backup record with a positive finite `size_gigabytes`. A missing size,
-empty inventory, stale record, or any present `backup_progress` is a hard stop.
+to DigitalOcean's reviewed managed-database region `sgp1`. PostgreSQL, source
+Valkey, and the provider-created Valkey fork must report the exact contract
+versions. Source and fork must have equal sanitized topology and configuration
+fingerprints. Each firewall must contain exactly one `app` trusted-source rule,
+whose value hashes to the exact production app identity in the signed contract;
+the create request installs that same rule atomically. Empty, public, IP/CIDR,
+multi-rule, or arbitrary-app admission fails closed. The fork must be distinct
+and no older than 24 hours, and two complete GET rounds must be identical. This
+admits the existing production app to the temporary fork as an explicit residual
+risk; GitHub receives no fork endpoint or credential and the fork remains
+operation-scoped. Raw provider identifiers remain only in protected descriptors
+and process memory. PostgreSQL readiness additionally requires a completed
+backup no older than 36 hours with a positive finite size; an empty, stale,
+in-progress, or malformed backup inventory fails closed.
 
-Before creating the recovery fork, a controlled process writes a fresh
-content-free nonce/timestamp marker with a valid HMAC to the fixed key on the
-production Valkey source. The recovery workflow reads that key live from both
-clusters over TLS 1.2 or newer and requires byte equality, a valid HMAC, a
-source identity/name/version bound to the production contract, an equal
-contract-bound version on the recovery fork, and an issue time before the fork
-creation time and within 24 hours. A merely new, online, same-shape cluster is
-not recovery evidence. The marker, endpoint, credential, HMAC key, and raw
-cluster identifiers never enter public artifacts. This PR does not
-create users, write the marker, fork a cluster, or install/rotate any secret;
-those remain separate production changes.
+The dedicated tokens use no legacy or broad API scope and never include
+`database:view_credentials`. The read token has `database:read` plus
+`regions:read`, `sizes:read`, and `actions:read`. DigitalOcean requires those
+same read dependencies on the create and delete tokens. The create token adds
+only `database:create` and `vpc:read` (required because the exact create body
+copies `private_network_uuid`); the cleanup token adds only `database:delete`.
+The controller still routes GETs through the separate read token.
 
 For each phase, perform these manual actions in order:
 
-1. Dispatch `Verify Production Recovery Readiness` and record the exact
-   successful run, attempt, artifact ID/API digest, and recovery hash.
-2. Dispatch `Apply Production Phase` for the exact signed plan and recovery
+1. Dispatch `Prepare Production Valkey Recovery Fork` and record the exact
+   successful create-receipt run, attempt, artifact ID/API digest, and file hash.
+2. Dispatch `Plan Production Rollout (Observation Only)` and record its exact
+   short-lived signed observation plan.
+3. Dispatch `Verify Production Recovery Readiness` with the exact production
+   plan and fork receipt, then record its exact successful signed evidence.
+4. Dispatch `Apply Production Phase` for the exact signed plan and recovery
    evidence. It performs one digest-only full-spec update after immediate
    compare-and-swap checks and emits a provisional, attested apply receipt.
-3. Dispatch `Verify Production CRM Canary` with the exact apply receipt
+5. Dispatch `Verify Production CRM Canary` with the exact apply receipt
    descriptor. Only its successful final gate creates the signed phase state.
-4. Stop. Recheck production and `main`. A later phase requires a new explicit
-   dispatch and new phase-specific evidence.
+6. After the 15-minute recovery evidence has expired, dispatch `Cleanup
+   Production Valkey Recovery Fork` with one canonical exact mode. `terminal`
+   requires the create receipt, expired recovery evidence, and successful phase
+   state. `never-started` requires a successful create receipt, an exact typed
+   discard phrase, zero later apply/rollback/reconciliation runs, and zero
+   nonterminal recovery runs. It permits either no successful recovery run or
+   exactly the supplied successful recovery evidence after that evidence has
+   expired. `no-mutation` requires the expired
+   recovery evidence plus an exact signed orphan reconciliation classified
+   `no-mutation`. `quarantine` is limited to a failed prepare run's signed
+   create intent and its exact typed phrase. Each mode permits at most one
+   DELETE. Before deletion the cleanup controller proves the source is online,
+   contract-bound, and still protected by the exact production-app rule. After
+   deletion it requires two delayed complete source-health and fork-absence
+   reads. The independent signing gate repeats those GET-only proofs with a
+   read-only token before attesting the byte-identical cleanup receipt.
+   The canonical cleanup descriptor binds both the current protected-main
+   `control_sha` and the fork's `authority_control_sha`. If `main` moved after
+   fork creation, the cleanup workflow requires the authority SHA to be an
+   exact ancestor of current `main`, authenticates every supplied historical
+   run and attestation at that authority SHA, and uses only the current cleanup
+   controller with the authority SHA's exact signed production contract to
+   validate and delete the deterministic old fork. The current control SHA still
+   commits the current contract, while the receipt's explicit contract hash binds
+   the historical contract that created the fork. The signed delete receipt
+   binds both controls. This cross-main exception grants cleanup
+   authority only; the older evidence cannot authorize planning, apply,
+   canary, rollback, or a new release.
+7. Stop. Recheck production and `main`. A later phase requires a new explicit
+   plan, fork, recovery, apply, canary, and cleanup chain.
+
+Signed create intents, create receipts, recovery evidence, phase states, and
+no-mutation reconciliation receipts are retained for 30 days so cleanup does
+not depend on the short-lived unsigned intermediates. Deleting a fork while
+recovery evidence is still consumable is forbidden.
 
 If an applied phase fails canary, do not improvise a provider rollback. Manually
 dispatch `Rollback Production Phase` with the exact current authority, target
@@ -539,6 +604,8 @@ Invalidate the release and stop if any of these occurs:
   registry credential directory;
 - required production approval, backup evidence, or rollback evidence is
   missing;
-- the live Valkey sentinel is missing, unequal, stale, post-fork, has an invalid
-  HMAC, or is read through an endpoint not bound to the exact provider cluster;
+- the provider-native Valkey fork is missing, duplicate, stale, not an exact
+  topology/configuration copy, lacks the sole contract-bound production-app
+  trusted-source rule, admits any other source, or differs across the two
+  complete provider observation rounds;
 - any step would expose raw specs/secrets or require a direct production bypass.

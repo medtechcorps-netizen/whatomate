@@ -37,6 +37,7 @@ env:
   RELEASE_AUTHORIZATION_CONTROLLER_PATH: release/deployment/authorize_production_main_lock_release.py
   RELEASE_AUTHORIZATION_SCHEMA_PATH: release/deployment/production-main-lock-release-authorization.schema.json
   PLAN_PREDICATE: https://rereply.app/attestations/observation-only-production-plan/v2
+  RECOVERY_PREDICATE: https://rereply.app/attestations/production-recovery-readiness/v2
   INTENT_PREDICATE: https://rereply.app/attestations/production-mutation-intent/v2
   LOCK_PROOF_PREDICATE: https://rereply.app/attestations/production-main-lock-proof/v1
   APPLY_PREDICATE: https://rereply.app/attestations/production-phase-apply-receipt/v1
@@ -418,6 +419,48 @@ jobs:
         with:
           artifact-ids: ${{ needs.prelock.outputs.root_marker_artifact_id }}
           path: ${{ runner.temp }}/root-lock
+          merge-multiple: true
+
+      - name: Install pinned recovery-attestation verification tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/recovery-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/recovery-gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/recovery-gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/recovery-gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" \
+            "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+
+      - name: Verify exact recovery provenance and v2 policy before intent
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          RAW: ${{ inputs.release_evidence_json }}
+          RECOVERY_RUN_ID: ${{ needs.authority.outputs.recovery_run_id }}
+        run: |
+          set -euo pipefail
+          subject="$RUNNER_TEMP/recovery/production-recovery-readiness.json"
+          [[ "$(find "$RUNNER_TEMP/recovery" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-recovery-readiness.json production-recovery-readiness.sha256 " ]]
+          [[ -z "$(find "$RUNNER_TEMP/recovery" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          expected_sha="$(printf '%s' "$RAW" | "$RUNNER_TEMP/recovery-tools/jq" -er '.recovery.sha256')"
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(cat "$RUNNER_TEMP/recovery/production-recovery-readiness.sha256")" == "$expected_sha" ]]
+          [[ "$(sha256sum "$subject" | awk '{print $1}')" == "$expected_sha" ]]
+          signer="$RELEASE_REPOSITORY/$RECOVERY_WORKFLOW_PATH"
+          flags=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$signer" --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA" --source-ref refs/heads/main --deny-self-hosted-runners --format json)
+          "$RUNNER_TEMP/recovery-tools/gh" attestation verify "$subject" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/recovery-intent-provenance.json"
+          "$RUNNER_TEMP/recovery-tools/gh" attestation verify "$subject" "${flags[@]}" --predicate-type "$RECOVERY_PREDICATE" > "$RUNNER_TEMP/recovery-intent-policy.json"
+          "$RUNNER_TEMP/recovery-tools/jq" -e 'type == "array" and length > 0' "$RUNNER_TEMP/recovery-intent-provenance.json" > /dev/null
+          "$RUNNER_TEMP/recovery-tools/jq" -e --slurpfile expected "$subject" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/recovery-intent-policy.json" > /dev/null
+          [[ "$RECOVERY_RUN_ID" =~ ^[1-9][0-9]{0,14}$ ]]
 
       - name: Prepare exact sanitized v2 mutation intent without credentials
         id: prepare
@@ -535,12 +578,14 @@ jobs:
         with:
           artifact-ids: ${{ needs.prelock.outputs.root_marker_artifact_id }}
           path: ${{ runner.temp }}/root-lock
+          merge-multiple: true
 
       - name: Download exact signed pre-lock mutation intent
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
           path: ${{ runner.temp }}/mutation-intent
+          merge-multiple: true
 
       - name: Authenticate exact signed pre-lock mutation intent
         env:
@@ -682,6 +727,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
           path: ${{ runner.temp }}/mutation-intent
+          merge-multiple: true
 
       - name: Recheck the exact locked projection and build proof
         id: prepare
@@ -845,11 +891,13 @@ jobs:
         with:
           artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
           path: ${{ runner.temp }}/mutation-intent
+          merge-multiple: true
       - name: Download exact signed main lock proof
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ needs.lock_proof.outputs.proof_artifact_id }}
           path: ${{ runner.temp }}/main-lock-proof
+          merge-multiple: true
       - name: Normalize exact request before capability use
         env:
           RAW: ${{ inputs.release_evidence_json }}
@@ -977,6 +1025,27 @@ jobs:
           "$jq_bin" -e --slurpfile expected "$RUNNER_TEMP/plan/production-plan.json" \
             'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' \
             "$RUNNER_TEMP/apply-plan-policy.json" > /dev/null
+
+      - name: Reverify exact recovery provenance and v2 policy before capability use
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          RECOVERY_RUN_ID: ${{ needs.authority.outputs.recovery_run_id }}
+        run: |
+          set -euo pipefail
+          subject="$RUNNER_TEMP/recovery/production-recovery-readiness.json"
+          [[ "$(find "$RUNNER_TEMP/recovery" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-recovery-readiness.json production-recovery-readiness.sha256 " ]]
+          [[ -z "$(find "$RUNNER_TEMP/recovery" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          expected_sha="$("$RUNNER_TEMP/release-tools/jq" -er '.recovery.sha256' "$RUNNER_TEMP/apply-evidence.json")"
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$RECOVERY_RUN_ID" =~ ^[1-9][0-9]{0,14}$ ]]
+          [[ "$(cat "$RUNNER_TEMP/recovery/production-recovery-readiness.sha256")" == "$expected_sha" ]]
+          [[ "$(sha256sum "$subject" | awk '{print $1}')" == "$expected_sha" ]]
+          signer="$RELEASE_REPOSITORY/$RECOVERY_WORKFLOW_PATH"
+          flags=(--repo "$GITHUB_REPOSITORY" --signer-workflow "$signer" --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA" --source-ref refs/heads/main --deny-self-hosted-runners --format json)
+          "$RUNNER_TEMP/release-tools/gh" attestation verify "$subject" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/apply-recovery-provenance.json"
+          "$RUNNER_TEMP/release-tools/gh" attestation verify "$subject" "${flags[@]}" --predicate-type "$RECOVERY_PREDICATE" > "$RUNNER_TEMP/apply-recovery-policy.json"
+          "$RUNNER_TEMP/release-tools/jq" -e 'type == "array" and length > 0' "$RUNNER_TEMP/apply-recovery-provenance.json" > /dev/null
+          "$RUNNER_TEMP/release-tools/jq" -e --slurpfile expected "$subject" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/apply-recovery-policy.json" > /dev/null
 
       - name: Recheck exact protected main before capability use
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7

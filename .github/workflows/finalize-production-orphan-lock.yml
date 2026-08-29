@@ -49,6 +49,8 @@ env:
   RECONCILE_WORKFLOW_PATH: .github/workflows/reconcile-production-orphan.yml
   CANARY_WORKFLOW_PATH: .github/workflows/verify-production-crm-canary.yml
   ORPHAN_ROLLBACK_WORKFLOW_PATH: .github/workflows/rollback-production-orphan.yml
+  RECOVERY_FORK_PREPARE_WORKFLOW_PATH: .github/workflows/prepare-production-valkey-recovery-fork.yml
+  RECOVERY_FORK_CLEANUP_WORKFLOW_PATH: .github/workflows/cleanup-production-valkey-recovery-fork.yml
   FINALIZER_PATH: release/deployment/finalize_production_orphan_lock.py
   RELEASE_CONFIRMATION_PATH: release/deployment/confirm_production_orphan_lock_release.py
   RELEASE_POLICY_PATH: release/deployment/production-release-policy.json
@@ -263,6 +265,8 @@ jobs:
                 (.name | IN(
                   "Assemble and Attest Exact Four-Phase Rollout",
                   "Apply Production Phase", "Rollback Production Phase",
+                  "Prepare Production Valkey Recovery Fork",
+                  "Cleanup Production Valkey Recovery Fork",
                   "Build and Attest Exact Release Images",
                   "Rollback Production Orphan", "Reconcile Production Orphan",
                   "Reconcile Production Orphan Lock Release",
@@ -1209,6 +1213,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.preauthorization.outputs.artifact_id }}
           path: ${{ runner.temp }}/signed-finalization
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
@@ -1357,6 +1362,8 @@ jobs:
                 ".github/workflows/build-attest-exact-release-images.yml",
                 ".github/workflows/deploy-production.yml",
                 ".github/workflows/plan-production-rollout.yml",
+                ".github/workflows/prepare-production-valkey-recovery-fork.yml",
+                ".github/workflows/cleanup-production-valkey-recovery-fork.yml",
                 ".github/workflows/rollback-production-phase.yml",
                 ".github/workflows/rollback-production-orphan.yml",
                 ".github/workflows/reconcile-production-orphan.yml",
@@ -1377,6 +1384,8 @@ jobs:
                 ".github/workflows/build-attest-exact-release-images.yml",
                 ".github/workflows/deploy-production.yml",
                 ".github/workflows/plan-production-rollout.yml",
+                ".github/workflows/prepare-production-valkey-recovery-fork.yml",
+                ".github/workflows/cleanup-production-valkey-recovery-fork.yml",
                 ".github/workflows/rollback-production-phase.yml",
                 ".github/workflows/rollback-production-orphan.yml",
                 ".github/workflows/reconcile-production-orphan.yml",
@@ -1623,6 +1632,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.preauthorization.outputs.artifact_id }}
           path: ${{ runner.temp }}/signed-finalization
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
@@ -1632,6 +1642,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.release.outputs.artifact_id }}
           path: ${{ runner.temp }}/unsigned-release
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}

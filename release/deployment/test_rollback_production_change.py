@@ -146,6 +146,7 @@ class RollbackControllerTests(unittest.TestCase):
         source = inspect.getsource(rollback.rollback_change)
         self.assertLess(source.index("cas_before"), source.index("require_fresh_immediately_before_mutation"))
         self.assertLess(source.index("require_fresh_immediately_before_mutation"), source.index("put_app_once"))
+        self.assertEqual(source.count("validate_recovery("), 2)
 
     def test_rollback_expiry_is_exclusive_at_boundary_and_fraction(self) -> None:
         issued = dt.datetime(2026, 8, 27, 0, 0, 0, tzinfo=dt.timezone.utc)
@@ -174,6 +175,30 @@ class RollbackControllerTests(unittest.TestCase):
         request["current_state"]["kind"] = "unknown"
         with self.assertRaises(common.ReleaseError):
             rollback._current_binding(request["current_state"], "current")
+
+    def test_rollback_recovery_must_bind_target_production_plan(self) -> None:
+        recovery = {
+            "authorities": {
+                "production_plan": {
+                    "run_id": "101",
+                    "run_attempt": 1,
+                    "sha256": "a" * 64,
+                }
+            }
+        }
+        target_state = {
+            "evidence": {
+                "rollout_plan_sha256": "b" * 64,
+                "production_plan_sha256": "a" * 64,
+                "recovery_sha256": "c" * 64,
+                "change_receipt_sha256": "d" * 64,
+                "canary_sha256": "e" * 64,
+            }
+        }
+        rollback._require_recovery_target_plan_authority(recovery, target_state)
+        target_state["evidence"]["production_plan_sha256"] = "f" * 64
+        with self.assertRaises(common.ReleaseError):
+            rollback._require_recovery_target_plan_authority(recovery, target_state)
 
     def test_rollback_receipt_and_final_state_preserve_two_link_lineage(self) -> None:
         receipt = rollback_receipt()
