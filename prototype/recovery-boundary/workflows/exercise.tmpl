@@ -1,0 +1,17 @@
+# Inert design template. It contains no authority or provider integration.
+name: Gate-C inert exercise outline
+on: []
+permissions:
+  contents: read
+concurrency:
+  group: gate-c-inert-prototype
+  cancel-in-progress: false
+jobs:
+  inert:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain inert status
+        shell: bash
+        run: |
+          printf '%s\n' 'gate-c-nonproduction-only inert template'

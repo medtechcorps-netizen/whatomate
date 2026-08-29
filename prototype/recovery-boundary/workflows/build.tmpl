@@ -1,0 +1,17 @@
+# Inert design template. It is outside workflow discovery and has no trigger.
+name: Gate-C inert build outline
+on: []
+permissions:
+  contents: read
+concurrency:
+  group: gate-c-inert-prototype
+  cancel-in-progress: false
+jobs:
+  inert:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain inert status
+        shell: bash
+        run: |
+          printf '%s\n' 'gate-c-nonproduction-only inert template'

@@ -79,6 +79,17 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
         "b91069173df06f0dbdf2b0bcaade40bf6555bec45cb52a2e7acb3be114d15766"
     ),
 }
+EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
+    "f8210ebbe4c4c3a5e412b56d20b47de40db75e5c97002ce7e69885f5edfcbe56"
+)
+EXACT_GATE_B_TEST_JOB_SHA256 = {
+    "go-race": "fd7737cc95c3cf1bd857af6f372a419d648f49b21d43edfc4b1e5eb9f61ed093",
+    "lint": "acff25313c68d1a86740a8cafe808480a5ca1a418c8e48e47d17c8d34285a8fd",
+    "recovery-boundary-images": (
+        "90daa97f1350ea5ec53dfc0b86416138fc4737928e6a7d089c33276aa36eaea2"
+    ),
+    "test": "93e443c7ef4d05bfe3b6744b4a6f64da68c8aa1882bebf8611c9708b9af5bfc9",
+}
 
 
 def workflow(name: str) -> str:
@@ -189,6 +200,184 @@ def job_names(source: str) -> tuple[str, ...]:
 
 def job_ids(source: str) -> tuple[str, ...]:
     return tuple(job_id for job_id, _ in job_definitions(source))
+
+
+def normalized_active_sha256(source: str) -> str:
+    canonical = "\n".join(normalized_active_lines(source)).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def assert_gate_b_test_workflow(source: str) -> None:
+    if hashlib.sha256(source.encode("utf-8")).hexdigest() != (
+        EXACT_GATE_B_TEST_WORKFLOW_SHA256
+    ):
+        raise AssertionError("Gate-B Test workflow bytes differ")
+    if exact_yaml_mapping_active_lines(source, 0, "permissions") != (
+        "permissions:",
+        "contents: read",
+    ):
+        raise AssertionError("Test workflow permissions differ from contents:read")
+
+    expected_jobs = (
+        "tenant-isolation",
+        "go-race",
+        "lint",
+        "build",
+        "security",
+        "recovery-boundary-images",
+        "test",
+    )
+    if job_ids(source) != expected_jobs:
+        raise AssertionError("Gate-B Test workflow job inventory differs")
+    if not canonical_workflow_step_uses_refs(source):
+        raise AssertionError("Gate-B Test workflow has no pinned external actions")
+
+    for job, expected_sha256 in EXACT_GATE_B_TEST_JOB_SHA256.items():
+        actual_sha256 = normalized_active_sha256(job_block(source, job))
+        if actual_sha256 != expected_sha256:
+            raise AssertionError(f"Gate-B job bytes differ: {job}")
+
+    go_race = job_block(source, "go-race")
+    gate_a = step_block(go_race, "Verify Gate-A recovery boundary")
+    for line in (
+        'PYTHONDONTWRITEBYTECODE: "1"',
+        'PYTHONHASHSEED: "0"',
+        "python3 -B -m unittest discover -s prototype/recovery-boundary/tests "
+        "-p 'test_*.py' -v",
+        "python3 -B prototype/recovery-boundary/verify_gate_a.py",
+    ):
+        require_active_source_line(gate_a, line)
+    run_tests = step_block(go_race, "Run tests")
+    for line in (
+        'package_output="$(go list -mod=readonly ./...)"',
+        "mapfile -t packages < <(printf '%s\\n' \"$package_output\")",
+    ):
+        require_active_source_line(run_tests, line)
+    if "grep -v /test/" in run_tests or " -race " not in run_tests:
+        raise AssertionError("root-module race coverage is weakened")
+
+    lint = step_block(
+        job_block(source, "lint"), "Lint workflows and inert recovery templates"
+    )
+    for line in (
+        "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7",
+        "actionlint .github/workflows/test.yml",
+        "actionlint -ignore '\"on\" section should not be empty' "
+        "prototype/recovery-boundary/workflows/*.tmpl",
+    ):
+        require_active_source_line(lint, line)
+
+    images = job_block(source, "recovery-boundary-images")
+    expected_matrix = (
+        (
+            "writer-authority",
+            "prototype/recovery-boundary/docker/writer-authority.Dockerfile",
+            "recovery-boundary-writer-authority:ci",
+        ),
+        (
+            "writer-broker",
+            "prototype/recovery-boundary/docker/writer-broker.Dockerfile",
+            "recovery-boundary-writer-broker:ci",
+        ),
+        (
+            "observer-authority",
+            "prototype/recovery-boundary/docker/observer-authority.Dockerfile",
+            "recovery-boundary-observer-authority:ci",
+        ),
+        (
+            "observer-broker",
+            "prototype/recovery-boundary/docker/observer-broker.Dockerfile",
+            "recovery-boundary-observer-broker:ci",
+        ),
+    )
+    matrix = tuple(
+        match.groups()
+        for match in re.finditer(
+            r"(?m)^          - role: ([a-z-]+)$\n"
+            r"^            dockerfile: ([A-Za-z0-9_./-]+)$\n"
+            r"^            image: ([a-z0-9:-]+)$",
+            images,
+        )
+    )
+    if matrix != expected_matrix:
+        raise AssertionError("Gate-B image matrix differs")
+    require_active_source_line(images, "fail-fast: false")
+    build_image = step_block(images, "Build inert recovery boundary image")
+    for line in (
+        "docker build --pull --no-cache --platform linux/amd64",
+        '-f "${{ matrix.dockerfile }}"',
+        '-t "${{ matrix.image }}" .',
+    ):
+        require_active_source_line(build_image, line)
+    scan_image = step_block(images, "Scan inert recovery boundary image")
+    if canonical_workflow_step_uses_refs(scan_image) != (
+        "aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8",
+    ):
+        raise AssertionError("Gate-B Trivy action pin differs")
+    for line in (
+        "image-ref: ${{ matrix.image }}",
+        "format: table",
+        'exit-code: "1"',
+        "vuln-type: os,library",
+        "severity: CRITICAL,HIGH",
+    ):
+        require_active_source_line(scan_image, line)
+    for forbidden in (
+        "continue-on-error:",
+        "ignore-unfixed:",
+        "ignorefile:",
+        "skip-dirs:",
+        "skip-files:",
+        "upload-artifact@",
+        "packages: write",
+        "id-token: write",
+    ):
+        if forbidden in images:
+            raise AssertionError(f"forbidden Gate-B image behavior: {forbidden}")
+
+    aggregate = job_block(source, "test")
+    expected_needs = (
+        "tenant-isolation",
+        "go-race",
+        "lint",
+        "build",
+        "security",
+        "recovery-boundary-images",
+    )
+    needs_match = re.search(
+        r"(?m)^    needs:\s*$\n(?P<body>(?:^      - [a-z0-9-]+\s*$\n?)+)",
+        aggregate,
+    )
+    if needs_match is None:
+        raise AssertionError("Gate-B aggregate needs list is missing")
+    needs = tuple(
+        line.removeprefix("      - ").strip()
+        for line in needs_match.group("body").splitlines()
+    )
+    if needs != expected_needs:
+        raise AssertionError("Gate-B aggregate dependencies differ")
+    require_active_source_line(aggregate, "if: ${{ always() }}")
+    if canonical_workflow_step_uses_refs(aggregate) != (
+        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    ):
+        raise AssertionError("Gate-B aggregate checkout authority differs")
+    for line in (
+        "python3 -m py_compile \\",
+        "python3 -m unittest discover -s release/deployment -p 'test_*.py' -v",
+    ):
+        require_active_source_line(aggregate, line)
+    for dependency in expected_needs:
+        env_name = dependency.replace("-", "_").upper() + "_RESULT"
+        require_active_source_line(
+            aggregate,
+            f"{env_name}: ${{{{ needs.{dependency}.result }}}}",
+        )
+        require_active_source_line(
+            aggregate,
+            f'[[ "${env_name}" == "success" ]]',
+        )
+    if "continue-on-error:" in aggregate:
+        raise AssertionError("Gate-B aggregate accepts a non-success step")
 
 
 def shell_json_array_assignments(
@@ -1031,6 +1220,149 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
                     match = re.match(r"\s*-?\s*uses:\s*(\S.*)$", line)
                     if match is not None and "/" in match.group(1) and "@" in match.group(1):
                         self.assertRegex(match.group(1), PINNED_ACTION)
+
+    def test_gate_b_recovery_boundary_is_a_required_protected_ci_result(self) -> None:
+        source = workflow("test.yml")
+        assert_gate_b_test_workflow(source)
+
+        mutations = {
+            "push-removed": source.replace(
+                "  push:\n    branches:\n      - main\n",
+                "",
+                1,
+            ),
+            "pull-request-removed": source.replace(
+                "  pull_request:\n    branches:\n      - main\n",
+                "",
+                1,
+            ),
+            "pull-request-retargeted": source.replace(
+                "  pull_request:\n    branches:\n      - main\n",
+                "  pull_request:\n    branches:\n      - develop\n",
+                1,
+            ),
+            "pull-request-path-filtered": source.replace(
+                "  pull_request:\n    branches:\n      - main\n",
+                "  pull_request:\n    branches:\n      - main\n"
+                "    paths-ignore:\n      - prototype/**\n",
+                1,
+            ),
+            "gate-a-verifier-removed": source.replace(
+                "python3 -B prototype/recovery-boundary/verify_gate_a.py",
+                "true",
+                1,
+            ),
+            "gate-a-step-disabled": source.replace(
+                "      - name: Verify Gate-A recovery boundary\n",
+                "      - name: Verify Gate-A recovery boundary\n"
+                "        if: ${{ false }}\n",
+                1,
+            ),
+            "gate-a-step-tolerated": source.replace(
+                "      - name: Verify Gate-A recovery boundary\n",
+                "      - name: Verify Gate-A recovery boundary\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "actionlint-template-check-removed": source.replace(
+                "actionlint -ignore '\"on\" section should not be empty' "
+                "prototype/recovery-boundary/workflows/*.tmpl",
+                "true",
+                1,
+            ),
+            "actionlint-workflow-check-removed": source.replace(
+                "actionlint .github/workflows/test.yml",
+                "true",
+                1,
+            ),
+            "actionlint-workflow-check-retargeted": source.replace(
+                "actionlint .github/workflows/test.yml",
+                "actionlint .github/workflows/e2e.yml",
+                1,
+            ),
+            "actionlint-step-tolerated": source.replace(
+                "      - name: Lint workflows and inert recovery templates\n",
+                "      - name: Lint workflows and inert recovery templates\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "image-build-cache-enabled": source.replace(
+                "--pull --no-cache", "--pull", 1
+            ),
+            "image-build-folded-comment": source.replace(
+                "          docker build --pull --no-cache --platform linux/amd64\n",
+                "          # suppress image build\n"
+                "          docker build --pull --no-cache --platform linux/amd64\n",
+                1,
+            ),
+            "image-scan-unbound": source.replace(
+                "image-ref: ${{ matrix.image }}",
+                "image-ref: recovery-boundary-unbound:ci",
+                1,
+            ),
+            "image-matrix-fail-fast": source.replace(
+                "fail-fast: false", "fail-fast: true", 1
+            ),
+            "image-build-tolerated": source.replace(
+                "      - name: Build inert recovery boundary image\n",
+                "      - name: Build inert recovery boundary image\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "image-scan-tolerated": source.replace(
+                "      - name: Scan inert recovery boundary image\n",
+                "      - name: Scan inert recovery boundary image\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "security-write-permission": source.replace(
+                "  security:\n    name: security\n",
+                "  security:\n    name: security\n"
+                "    permissions:\n      packages: write\n",
+                1,
+            ),
+            "security-secret": source.replace(
+                "  security:\n    name: security\n",
+                "  security:\n    name: security\n"
+                "    env:\n      PROVIDER_TOKEN: ${{ secrets.PROVIDER_TOKEN }}\n",
+                1,
+            ),
+            "security-push": source.replace(
+                "      - name: Build production container\n"
+                "        run: docker build -f docker/Dockerfile -t rereply:ci .",
+                "      - name: Build production container\n"
+                "        run: |\n"
+                "          docker build -f docker/Dockerfile -t rereply:ci .\n"
+                "          docker push rereply:ci",
+                1,
+            ),
+            "security-scan-tolerated": source.replace(
+                "      - name: Scan production container\n",
+                "      - name: Scan production container\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "build-job-tolerated": source.replace(
+                "  build:\n    name: build\n    runs-on: ubuntu-24.04\n",
+                "  build:\n    name: build\n    runs-on: ubuntu-24.04\n"
+                "    continue-on-error: true\n",
+                1,
+            ),
+            "aggregate-weakened": source.replace(
+                '[[ "$RECOVERY_BOUNDARY_IMAGES_RESULT" == "success" ]]',
+                "true",
+                1,
+            ),
+        }
+        self.assertEqual(len(mutations), len(set(mutations.values())))
+        for label, mutant in mutations.items():
+            self.assertNotEqual(mutant, source)
+            with self.subTest(
+                label=label,
+                mutant=hashlib.sha256(mutant.encode()).hexdigest(),
+            ):
+                with self.assertRaises(AssertionError):
+                    assert_gate_b_test_workflow(mutant)
 
     def test_every_attestation_verification_job_has_explicit_read_authority(self) -> None:
         for filename in ACTIVE_PRODUCTION_CONTROLS:
