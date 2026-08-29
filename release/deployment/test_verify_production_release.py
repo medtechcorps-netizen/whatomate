@@ -231,6 +231,24 @@ class ProductionReleaseVerifierTests(unittest.TestCase):
             with self.assertRaises(release.ReleaseError):
                 release.validate_target_descriptor(bad)
 
+    def test_recovery_target_descriptor_contains_only_stable_source_identities(self) -> None:
+        descriptor = {
+            "postgres_cluster_id": "11111111-1111-4111-8111-111111111111",
+            "valkey_cluster_id": "22222222-2222-4222-8222-222222222222",
+        }
+        self.assertEqual(
+            release.validate_target_descriptor(descriptor, recovery=True),
+            descriptor,
+        )
+        with self.assertRaises(release.ReleaseError):
+            release.validate_target_descriptor(
+                {
+                    **descriptor,
+                    "valkey_recovery_cluster_id": "33333333-3333-4333-8333-333333333333",
+                },
+                recovery=True,
+            )
+
     def test_apply_receipt_and_canary_state_match_cross_schema_surface(self) -> None:
         receipt = apply_receipt()
         self.assertIs(release.validate_apply_receipt(receipt), receipt)

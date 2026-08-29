@@ -657,6 +657,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.observe.outputs.artifact_id }}
           path: ${{ runner.temp }}/crm-canary
+          merge-multiple: true
 
       - name: Verify canary artifact metadata and exact inventory
         env:

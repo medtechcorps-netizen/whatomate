@@ -14,6 +14,7 @@ ACTIVE_PRODUCTION_CONTROLS = (
     "build-attest-exact-release-images.yml",
     "aggregate-exact-four-phase-rollout.yml",
     "plan-production-rollout.yml",
+    "prepare-production-valkey-recovery-fork.yml",
     "verify-production-recovery-readiness.yml",
     "apply-production-phase.yml",
     "verify-production-crm-canary.yml",
@@ -23,26 +24,27 @@ ACTIVE_PRODUCTION_CONTROLS = (
     "finalize-production-orphan-lock.yml",
     "reconcile-production-orphan-lock-release.yml",
     "reconcile-production-main-lock-release.yml",
+    "cleanup-production-valkey-recovery-fork.yml",
 )
 PINNED_ACTION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}(?:\s+#.*)?$")
 TERMINAL_PARITY_WORKFLOW_SHA256 = {
     "apply-production-phase.yml": (
-        "f2f03a0a42b6d7d816eda310fa0b5dfaa8f8f843d280ba96b03bce916e1581c6"
+        "fbb3757e5eec112b78a86e75a851cfe46fdc58e0fed9aa08b115dc9b7869b2f1"
     ),
     "rollback-production-phase.yml": (
-        "2a1b66fa716ae078fad7d5c92788b7bec88a8c5ee899762418124b787b0ac8f7"
+        "33e97fb2b723e34c4539022b07433ac410deda40e33af0d61985a9c2c0361663"
     ),
     "finalize-production-orphan-lock.yml": (
-        "1c4b6e4147afe099ceddd2faa1feaae5da769f1c9c2e57abef61750ffb94370a"
+        "170779c1e1885b4b5eeecdd34e33910f77544ee03c81c6930b4eb11c98e37433"
     ),
     "reconcile-production-orphan.yml": (
-        "ca16cd68409b28ef34a131c764ba2ee8c0349be420cb99fab1f587ab7512e9ef"
+        "97abfef7db4cfa729aba1e491ea45e4a4b1e63fa33e3908f6d86c9fa76b346da"
     ),
     "reconcile-production-main-lock-release.yml": (
         "069c7eefa27b3a9159bb41d870f1c871db55b37e4b052061392b0306617b5a99"
     ),
     "verify-production-crm-canary.yml": (
-        "7e75973086634d18b1c8c1f5082608de4e08d4f2db227cfc5d95fc2dd5cfc02a"
+        "75f1396d79de838602aaf3ceb7429ff89d90e4d5d44cfe103e63b7745a61b07e"
     ),
 }
 EXACT_IMAGE_BUILD_ACTION = (
@@ -1220,6 +1222,47 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
                     match = re.match(r"\s*-?\s*uses:\s*(\S.*)$", line)
                     if match is not None and "/" in match.group(1) and "@" in match.group(1):
                         self.assertRegex(match.group(1), PINNED_ACTION)
+
+    def test_every_artifact_id_download_flattens_the_exact_selection(self) -> None:
+        expected_counts = {
+            "apply-production-phase.yml": 10,
+            "cleanup-production-valkey-recovery-fork.yml": 6,
+            "finalize-production-orphan-lock.yml": 3,
+            "prepare-production-valkey-recovery-fork.yml": 4,
+            "reconcile-production-main-lock-release.yml": 6,
+            "reconcile-production-orphan-lock-release.yml": 5,
+            "reconcile-production-orphan.yml": 5,
+            "rollback-production-orphan.yml": 3,
+            "rollback-production-phase.yml": 10,
+            "verify-production-crm-canary.yml": 1,
+            "verify-production-recovery-readiness.yml": 2,
+        }
+        observed_total = 0
+        for workflow_name, expected_count in expected_counts.items():
+            downloads = tuple(
+                step
+                for step in workflow_step_blocks(workflow(workflow_name))
+                if re.search(r"(?m)^          artifact-ids:", step)
+            )
+            with self.subTest(workflow=workflow_name):
+                self.assertEqual(len(downloads), expected_count)
+                for download in downloads:
+                    self.assertRegex(
+                        download,
+                        r"(?m)^        uses: actions/download-artifact@"
+                        r"d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4$",
+                    )
+                    self.assertEqual(
+                        len(
+                            re.findall(
+                                r"(?m)^          merge-multiple: true[ \t]*$",
+                                download,
+                            )
+                        ),
+                        1,
+                    )
+            observed_total += len(downloads)
+        self.assertEqual(observed_total, 55)
 
     def test_gate_b_recovery_boundary_is_a_required_protected_ci_result(self) -> None:
         source = workflow("test.yml")
@@ -2573,6 +2616,422 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
         self.assertNotIn("rereply-production-apply", recovery)
         self.assertIn("rereply-production-apply", apply)
         self.assertIn("rereply-production-apply", rollback)
+
+    def test_recovery_unsigned_artifact_name_matches_strict_orphan_consumer(self) -> None:
+        recovery = workflow("verify-production-recovery-readiness.yml")
+        names = step_block(recovery, "Create sanitized sidecar and internal artifact")
+        upload = step_block(recovery, "Upload unsigned sanitized recovery evidence")
+        orphan = workflow("rollback-production-orphan.yml")
+
+        producer = (
+            "internal_name=unsigned-production-recovery-readiness-%s-%s\\n"
+        )
+        self.assertEqual(names.count(producer), 1)
+        self.assertNotIn("internal_name=unsigned-production-recovery-%s-%s\\n", names)
+        self.assertEqual(
+            upload.count("name: ${{ steps.names.outputs.internal_name }}"), 1
+        )
+        self.assertEqual(
+            orphan.count(
+                "`unsigned-production-recovery-readiness-${value.recovery.run_id}-1`"
+            ),
+            1,
+        )
+        self.assertNotIn(
+            "`unsigned-production-recovery-${value.recovery.run_id}-1`", orphan
+        )
+
+    def test_provider_native_valkey_fork_is_exact_token_isolated_and_terminally_cleaned(self) -> None:
+        prepare = workflow("prepare-production-valkey-recovery-fork.yml")
+        recovery = workflow("verify-production-recovery-readiness.yml")
+        cleanup = workflow("cleanup-production-valkey-recovery-fork.yml")
+        finalizer = workflow("finalize-production-orphan-lock.yml")
+
+        self.assertEqual(
+            job_names(prepare),
+            (
+                "Authenticate exact production Valkey recovery fork authority",
+                "Prepare and attest exact production Valkey recovery fork intent",
+                "Create exact production Valkey recovery fork",
+                "Exact production Valkey recovery fork gate",
+            ),
+        )
+        self.assertEqual(
+            job_names(recovery),
+            (
+                "Authenticate exact production recovery authority",
+                "Observe exact production recovery state",
+                "Exact production recovery readiness gate",
+            ),
+        )
+        self.assertEqual(
+            job_names(cleanup),
+            (
+                "Authenticate exact Valkey recovery cleanup authority",
+                "Delete or reconcile exact production Valkey recovery fork",
+                "Exact production Valkey recovery cleanup gate",
+            ),
+        )
+
+        artifact_id_download_counts = {
+            "prepare": (prepare, 4),
+            "recovery": (recovery, 2),
+            "cleanup": (cleanup, 6),
+        }
+        for workflow_name, (source, expected_count) in artifact_id_download_counts.items():
+            downloads = tuple(
+                step
+                for step in workflow_step_blocks(source)
+                if re.search(r"(?m)^          artifact-ids:", step)
+            )
+            with self.subTest(artifact_id_downloads=workflow_name):
+                self.assertEqual(len(downloads), expected_count)
+                for download in downloads:
+                    self.assertEqual(
+                        len(
+                            re.findall(
+                                r"(?m)^          merge-multiple: true[ \t]*$",
+                                download,
+                            )
+                        ),
+                        1,
+                    )
+
+        intent_step = step_block(
+            prepare, "Prepare exact immutable fork intent with GET-only controller path"
+        )
+        create_step = step_block(
+            prepare, "Create one exact provider-native Valkey recovery fork"
+        )
+        create_gate_step = step_block(
+            prepare, "Verify signed intent and live-bind exact clean-create receipt"
+        )
+        observe_step = step_block(
+            recovery,
+            "Observe recovery with the GET-only database read capability and exact app admission",
+        )
+        delete_step = step_block(
+            cleanup, "Delete or reconcile one exact provider-native recovery fork"
+        )
+        cleanup_gate = step_block(
+            cleanup, "Validate exact sanitized cleanup receipt"
+        )
+        cleanup_authority = step_block(cleanup, "Authenticate exact cleanup evidence")
+        cleanup_verify = step_block(
+            cleanup, "Verify signed cleanup authorities before delete capability"
+        )
+        recovery_fork_download = step_block(
+            recovery, "Download exact signed Valkey fork receipt"
+        )
+        recovery_unsigned_download = step_block(
+            recovery, "Download unsigned evidence"
+        )
+        cleanup_downloads = (
+            ("Download exact fork create authority", "prepare_run_id"),
+            ("Download exact terminal recovery evidence", "recovery_run_id"),
+            ("Download exact terminal phase state", "canary_run_id"),
+            (
+                "Download exact no-mutation reconciliation",
+                "reconciliation_run_id",
+            ),
+            ("Download exact cleanup create authority", "prepare_run_id"),
+        )
+        self.assertIn("github-token: ${{ github.token }}", recovery_fork_download)
+        self.assertIn("repository: ${{ github.repository }}", recovery_fork_download)
+        self.assertIn(
+            "run-id: ${{ needs.authority.outputs.fork_run_id }}",
+            recovery_fork_download,
+        )
+        self.assertIn("artifact-ids:", recovery_fork_download)
+        self.assertEqual(recovery_fork_download.count("merge-multiple: true"), 1)
+        self.assertIn("artifact-ids:", recovery_unsigned_download)
+        self.assertEqual(recovery_unsigned_download.count("merge-multiple: true"), 1)
+        for step_name, run_output in cleanup_downloads:
+            with self.subTest(cross_run_download=step_name):
+                download = step_block(cleanup, step_name)
+                self.assertIn("github-token: ${{ github.token }}", download)
+                self.assertIn("repository: ${{ github.repository }}", download)
+                self.assertIn(
+                    f"run-id: ${{{{ needs.authority.outputs.{run_output} }}}}",
+                    download,
+                )
+        same_run_cleanup = step_block(
+            cleanup, "Download exact unsigned cleanup receipt"
+        )
+        self.assertNotIn("github-token:", same_run_cleanup)
+        self.assertNotIn("run-id:", same_run_cleanup)
+        self.assertIn(
+            "DO_PRODUCTION_DATABASE_READ_TOKEN: ${{ secrets.DO_PRODUCTION_DATABASE_READ_TOKEN }}",
+            intent_step,
+        )
+        self.assertNotIn("DATABASE_CREATE_TOKEN", intent_step)
+        self.assertIn(
+            "DO_PRODUCTION_DATABASE_CREATE_TOKEN: ${{ secrets.DO_PRODUCTION_DATABASE_CREATE_TOKEN }}",
+            create_step,
+        )
+        self.assertIn(
+            "DO_PRODUCTION_DATABASE_READ_TOKEN: ${{ secrets.DO_PRODUCTION_DATABASE_READ_TOKEN }}",
+            create_step,
+        )
+        self.assertIn(
+            "DO_PRODUCTION_DATABASE_READ_TOKEN: ${{ secrets.DO_PRODUCTION_DATABASE_READ_TOKEN }}",
+            create_gate_step,
+        )
+        self.assertIn("validate-create-receipt", create_gate_step)
+        self.assertIn("--intent-sha256 \"$INTENT_SHA256\"", create_gate_step)
+        self.assertNotIn("DATABASE_CREATE_TOKEN", create_gate_step)
+        self.assertNotIn("DATABASE_DELETE_TOKEN", create_gate_step)
+        self.assertIn(
+            "DO_PRODUCTION_DATABASE_READ_TOKEN: ${{ secrets.DO_PRODUCTION_DATABASE_READ_TOKEN }}",
+            observe_step,
+        )
+        self.assertNotIn("DATABASE_CREATE_TOKEN", observe_step)
+        self.assertNotIn("DATABASE_DELETE_TOKEN", observe_step)
+        self.assertIn(
+            "DO_PRODUCTION_DATABASE_DELETE_TOKEN: ${{ secrets.DO_PRODUCTION_DATABASE_DELETE_TOKEN }}",
+            delete_step,
+        )
+        self.assertNotIn("DATABASE_CREATE_TOKEN", delete_step)
+        self.assertIn(
+            "DO_PRODUCTION_DATABASE_READ_TOKEN: ${{ secrets.DO_PRODUCTION_DATABASE_READ_TOKEN }}",
+            delete_step,
+        )
+        self.assertIn(
+            'authority_contract_sha="$(sha256sum "authority-control/$CONTRACT_PATH"',
+            delete_step,
+        )
+        self.assertIn(
+            '"contract_sha256":os.environ["authority_contract_sha"]',
+            delete_step,
+        )
+        self.assertIn('--contract "authority-control/$CONTRACT_PATH"', delete_step)
+        self.assertNotIn('--contract "control/$CONTRACT_PATH"', delete_step)
+        self.assertIn('"control/$CONTROLLER_PATH" delete-or-reconcile', delete_step)
+        self.assertNotIn(
+            '"authority-control/$CONTROLLER_PATH" delete-or-reconcile', delete_step
+        )
+        self.assertIn(
+            '"authority_workflow_sha":os.environ["AUTHORITY_CONTROL_SHA"]',
+            delete_step,
+        )
+        self.assertIn(
+            '"authority_controller_sha256":os.environ["authority_controller_sha"]',
+            delete_step,
+        )
+        self.assertIn(
+            'authority_controller_sha="$(sha256sum "authority-control/$CONTROLLER_PATH"',
+            delete_step,
+        )
+        self.assertIn(
+            "DO_PRODUCTION_DATABASE_READ_TOKEN: ${{ secrets.DO_PRODUCTION_DATABASE_READ_TOKEN }}",
+            cleanup_gate,
+        )
+        self.assertIn("validate-delete-receipt", cleanup_gate)
+        self.assertIn(
+            'authority_contract_sha="$(sha256sum "authority-control/$CONTRACT_PATH"',
+            cleanup_gate,
+        )
+        self.assertIn(
+            '"contract_sha256":os.environ["authority_contract_sha"]',
+            cleanup_gate,
+        )
+        self.assertIn(
+            '--contract "authority-control/$CONTRACT_PATH"', cleanup_gate
+        )
+        self.assertNotIn('--contract "control/$CONTRACT_PATH"', cleanup_gate)
+        self.assertIn('"control/$CONTROLLER_PATH" validate-delete-receipt', cleanup_gate)
+        self.assertNotIn(
+            '"authority-control/$CONTROLLER_PATH" validate-delete-receipt',
+            cleanup_gate,
+        )
+        self.assertIn(
+            '"authority_workflow_sha":os.environ["AUTHORITY_CONTROL_SHA"]',
+            cleanup_gate,
+        )
+        self.assertIn(
+            '"authority_controller_sha256":os.environ["authority_controller_sha"]',
+            cleanup_gate,
+        )
+        self.assertIn('cmp --silent "$subject"', cleanup_gate)
+        self.assertNotIn("DATABASE_CREATE_TOKEN", cleanup_gate)
+        self.assertNotIn("DATABASE_DELETE_TOKEN", cleanup_gate)
+        self.assertEqual(
+            prepare.count("${{ secrets.DO_PRODUCTION_DATABASE_READ_TOKEN }}"), 3
+        )
+        self.assertEqual(
+            prepare.count("${{ secrets.DO_PRODUCTION_DATABASE_CREATE_TOKEN }}"), 1
+        )
+        self.assertEqual(
+            cleanup.count("${{ secrets.DO_PRODUCTION_DATABASE_DELETE_TOKEN }}"), 1
+        )
+        self.assertEqual(
+            cleanup.count("${{ secrets.DO_PRODUCTION_DATABASE_READ_TOKEN }}"), 2
+        )
+
+        for source in (prepare, recovery, cleanup):
+            self.assertNotIn("view_credentials", source)
+            self.assertNotIn("api:write", source)
+            self.assertNotIn("DO_PRODUCTION_VALKEY_SENTINEL", source)
+            self.assertNotIn("HMAC_KEY", source)
+        self.assertIn("production-valkey-recovery-fork-create-intent/v2", prepare)
+        self.assertIn("production-valkey-recovery-fork-create-receipt/v2", prepare)
+        self.assertIn("production-recovery-readiness/v2", recovery)
+        self.assertIn("production-valkey-recovery-fork-delete-receipt/v2", cleanup)
+        self.assertIn("validate-delete-receipt", cleanup)
+        self.assertIn("CLEANUP_EVIDENCE_SHA256", cleanup)
+        for mode in ("terminal", "never-started", "no-mutation", "quarantine"):
+            self.assertIn(mode, cleanup)
+        self.assertIn("now>=expires", cleanup)
+        self.assertIn("classification\"][\"outcome\"]==\"no-mutation\"", cleanup)
+        self.assertIn("never-started cleanup recovery authority differs", cleanup)
+        self.assertIn("never-started cleanup found nonterminal recovery evidence", cleanup)
+        self.assertIn("state[\"evidence\"][\"recovery_sha256\"]", cleanup)
+        self.assertIn(
+            "recovery[\"authorities\"][\"valkey_fork\"][\"receipt_sha256\"]",
+            cleanup,
+        )
+        self.assertIn(
+            "artifact.digest!==process.env.ARTIFACT_DIGEST", cleanup
+        )
+        self.assertIn(
+            "['authority','authority_control_sha','canary','confirmation','control_sha','mode','phase','reconciliation','recovery']",
+            cleanup_authority,
+        )
+        self.assertIn("compareCommitsWithBasehead", cleanup_authority)
+        self.assertIn(
+            "ancestry.data.merge_base_commit.sha!==value.authority_control_sha",
+            cleanup_authority,
+        )
+        self.assertIn("ancestry.data.behind_by!==0", cleanup_authority)
+        self.assertIn("run.head_sha!==expectedSha", cleanup_authority)
+        self.assertIn(
+            "createArtifact.data.workflow_run.head_sha!==value.authority_control_sha",
+            cleanup_authority,
+        )
+        self.assertIn(
+            "runs.some(run=>Date.parse(run.created_at)>=Date.parse(createRun.created_at))",
+            cleanup_authority,
+        )
+        self.assertNotIn(
+            "runs.some(run=>run.head_sha===value.authority_control_sha",
+            cleanup_authority,
+        )
+        self.assertEqual(
+            cleanup_verify.count('--signer-digest "$AUTHORITY_CONTROL_SHA"'), 4
+        )
+        self.assertNotIn('--signer-digest "$CONTROL_SHA"', cleanup_verify)
+        for checkout_name in (
+            "Check out exact cleanup authority controls",
+            "Check out exact cleanup authority controls for final binding",
+        ):
+            checkout = step_block(cleanup, checkout_name)
+            self.assertIn(
+                "ref: ${{ needs.authority.outputs.authority_control_sha }}",
+                checkout,
+            )
+            self.assertIn("path: authority-control", checkout)
+        recovery_inventory = step_block(
+            recovery, "Require exact pre-signing recovery job and artifact inventory"
+        )
+        self.assertIn("listWorkflowRunArtifacts", recovery_inventory)
+        self.assertIn("total_count!==1", recovery_inventory)
+        self.assertIn("artifact.digest!==process.env.ARTIFACT_DIGEST", recovery_inventory)
+        recovery_gate = step_block(
+            recovery, "Require exact receipt and unchanged authority"
+        )
+        self.assertIn("expected_control=expected_control", recovery_gate)
+        self.assertIn("cleanup-gate-control.json", cleanup_gate)
+        self.assertIn("cleanup-gate-target.json", cleanup_gate)
+        self.assertIn("validated-cleanup-receipt", cleanup_gate)
+        self.assertNotIn('control=dict(value["control"])', cleanup_gate)
+        runbook = (ROOT / "docs" / "crm-production-release-control.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("`database:create` and `vpc:read`", runbook)
+        self.assertIn("exactly one `app` trusted-source rule", runbook)
+        self.assertIn("`authority_control_sha`", runbook)
+        self.assertIn("exact ancestor of current `main`", runbook)
+        self.assertNotIn("fork firewall must be\nempty", runbook)
+
+        self.assertIn(
+            "retention-days: 30",
+            step_block(prepare, "Upload exact signed fork intent"),
+        )
+        self.assertIn(
+            "retention-days: 2",
+            step_block(prepare, "Upload unsigned exact fork receipt"),
+        )
+        self.assertIn(
+            "retention-days: 30",
+            step_block(prepare, "Upload exact signed fork receipt"),
+        )
+        self.assertIn(
+            "retention-days: 30",
+            step_block(recovery, "Upload exact signed recovery artifact"),
+        )
+
+        self.assertEqual(
+            prepare.count(
+                "artifact_name=production-valkey-recovery-fork-create-intent-%s-%s\\n"
+            ),
+            1,
+        )
+        self.assertEqual(
+            prepare.count(
+                "artifact_name=unsigned-production-valkey-recovery-fork-create-%s-%s\\n"
+            ),
+            1,
+        )
+        self.assertEqual(
+            prepare.count(
+                "production-valkey-recovery-fork-create-${{ github.run_id }}-${{ github.run_attempt }}"
+            ),
+            1,
+        )
+        self.assertEqual(
+            cleanup.count(
+                "unsigned-production-valkey-recovery-fork-delete-%s-%s\\n"
+            ),
+            1,
+        )
+        self.assertEqual(
+            cleanup.count(
+                "production-valkey-recovery-fork-delete-${{ github.run_id }}-${{ github.run_attempt }}"
+            ),
+            1,
+        )
+        for path in (
+            ".github/workflows/prepare-production-valkey-recovery-fork.yml",
+            ".github/workflows/cleanup-production-valkey-recovery-fork.yml",
+        ):
+            self.assertEqual(finalizer.count(path), 3)
+        for name in (
+            "Prepare Production Valkey Recovery Fork",
+            "Cleanup Production Valkey Recovery Fork",
+        ):
+            self.assertEqual(finalizer.count(name), 1)
+
+    def test_recovery_consumers_bind_v2_and_exact_observer_source(self) -> None:
+        apply_source = (
+            ROOT / "release" / "deployment" / "apply_production_change.py"
+        ).read_text(encoding="utf-8")
+        workflows = (
+            workflow("apply-production-phase.yml"),
+            workflow("rollback-production-phase.yml"),
+            workflow("rollback-production-orphan.yml"),
+            workflow("verify-production-recovery-readiness.yml"),
+        )
+        self.assertIn(
+            'with_name(\n        "observe_production_recovery.py"\n    )',
+            apply_source,
+        )
+        self.assertIn(
+            "recovery evidence is not bound to the current recovery controller",
+            apply_source,
+        )
+        for source in workflows:
+            self.assertIn("production-recovery-readiness/v2", source)
+            self.assertNotIn("production-recovery-readiness/v1", source)
 
     def test_apply_and_rollback_repull_exact_tuples_without_credentials(self) -> None:
         cases = (

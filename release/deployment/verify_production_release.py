@@ -313,7 +313,7 @@ def validate_control_identity(
 
 def validate_target_descriptor(value: Any, *, recovery: bool = False) -> dict[str, str]:
     keys = (
-        {"postgres_cluster_id", "valkey_cluster_id", "valkey_recovery_cluster_id"}
+        {"postgres_cluster_id", "valkey_cluster_id"}
         if recovery
         else {"app_id", "default_ingress"}
     )

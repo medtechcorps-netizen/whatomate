@@ -7,6 +7,7 @@ import inspect
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
@@ -87,6 +88,173 @@ def deployment_response(spec: dict[str, object], deployment_id: str) -> dict[str
     }
 
 
+def recovery_contract() -> dict[str, object]:
+    return {
+        "provider": {"app_id_sha256": "d" * 64},
+        "expected_topology": {
+            "region": "sgp",
+            "databases": [
+                {
+                    "engine": "PG",
+                    "version": "17",
+                    "production": True,
+                    "name_sha256": "1" * 64,
+                    "cluster_sha256": "2" * 64,
+                },
+                {
+                    "engine": "VALKEY",
+                    "version": "8",
+                    "production": True,
+                    "name_sha256": "3" * 64,
+                    "cluster_sha256": "4" * 64,
+                },
+            ],
+        }
+    }
+
+
+def recovery_readiness(
+    contract_sha256: str, now: dt.datetime
+) -> dict[str, object]:
+    postgresql_identity = "5" * 64
+    valkey_identity = "6" * 64
+    recovery_identity = "7" * 64
+    identity_projection = common.sha256_value(
+        {
+            "postgresql_identity_sha256": postgresql_identity,
+            "valkey_identity_sha256": valkey_identity,
+            "valkey_recovery_identity_sha256": recovery_identity,
+        }
+    )
+    plan_sha256 = "8" * 64
+    request_sha256 = "9" * 64
+    receipt_sha256 = "a" * 64
+    topology_sha256 = "b" * 64
+    config_sha256 = "c" * 64
+    stable_round = [
+        "postgres-cluster", "postgres-backups", "valkey-cluster", "valkey-config",
+        "valkey-source-firewall", "valkey-recovery-cluster",
+        "valkey-recovery-config", "valkey-recovery-firewall",
+    ]
+    return {
+        "schema_version": 2,
+        "authority": "production-recovery-readiness",
+        "repository": common.REPOSITORY,
+        "issued_at": common.format_timestamp(now),
+        "expires_at": common.format_timestamp(now + dt.timedelta(minutes=5)),
+        "control": {
+            "workflow_sha": "d" * 40,
+            "workflow_path": ".github/workflows/verify-production-recovery-readiness.yml",
+            "run_id": "401",
+            "run_attempt": 1,
+            "runner_environment": "github-hosted",
+            "contract_sha256": contract_sha256,
+            "controller_sha256": common.sha256_bytes(
+                Path(apply.__file__).resolve().with_name(
+                    "observe_production_recovery.py"
+                ).read_bytes()
+            ),
+        },
+        "authorities": {
+            "production_plan": {
+                "run_id": "201",
+                "run_attempt": 1,
+                "sha256": plan_sha256,
+            },
+            "valkey_fork": {
+                "run_id": "301",
+                "run_attempt": 1,
+                "sha256": receipt_sha256,
+                "request_sha256": request_sha256,
+                "receipt_sha256": receipt_sha256,
+            },
+        },
+        "target": {
+            "descriptor_sha256": identity_projection,
+            "contract_sha256": contract_sha256,
+            "postgresql_identity_sha256": postgresql_identity,
+            "valkey_identity_sha256": valkey_identity,
+            "valkey_recovery_identity_sha256": recovery_identity,
+            "identity_projection_sha256": identity_projection,
+            "postgresql_cluster_sha256": "2" * 64,
+            "valkey_cluster_sha256": "4" * 64,
+            "region_sha256": common.sha256_bytes(b"sgp1"),
+        },
+        "postgresql": {
+            "identity_sha256": postgresql_identity,
+            "observation_sha256": "0" * 64,
+            "status": "online",
+            "engine": "postgresql",
+            "version": "17",
+            "region_sha256": common.sha256_bytes(b"sgp1"),
+            "fresh_backup": True,
+            "backup_identity_sha256": "1" * 64,
+            "backup_inventory_sha256": "2" * 64,
+            "point_in_time_restore_ready": True,
+            "production_cluster_sha256": "2" * 64,
+        },
+        "valkey": {
+            "identity_sha256": valkey_identity,
+            "recovery_identity_sha256": recovery_identity,
+            "source_observation_sha256": "3" * 64,
+            "recovery_observation_sha256": "4" * 64,
+            "status": "online",
+            "recovery_status": "online",
+            "version": "8",
+            "recovery_version": "8",
+            "region_sha256": common.sha256_bytes(b"sgp1"),
+            "recovery_region_sha256": common.sha256_bytes(b"sgp1"),
+            "source_topology_sha256": topology_sha256,
+            "recovery_topology_sha256": topology_sha256,
+            "persistence": "rdb",
+            "recovery_persistence": "rdb",
+            "recovery_is_distinct": True,
+            "recovery_is_fresh": True,
+            "topology_equal": True,
+            "production_cluster_sha256": "4" * 64,
+            "provider_fork": {
+                "authority": "production-valkey-recovery-fork-v2",
+                "source_identity_sha256": valkey_identity,
+                "recovery_identity_sha256": recovery_identity,
+                "request_sha256": request_sha256,
+                "receipt_sha256": receipt_sha256,
+                "source_config_sha256": config_sha256,
+                "recovery_config_sha256": config_sha256,
+                "source_firewall_sha256": "5" * 64,
+                "recovery_firewall_sha256": "6" * 64,
+                "fork_name_sha256": "7" * 64,
+                "fork_created_at_sha256": "8" * 64,
+                "provider_copy_contract": (
+                    "digitalocean-valkey-latest-transaction-data-and-configuration"
+                ),
+                "stable_read_count": 2,
+                "request_attempt_count": 1,
+                "mutation_ambiguous_reconciled": False,
+                "source_firewall_unchanged": True,
+                "source_firewall_exact_app": True,
+                "recovery_firewall_exact_source_app": True,
+                "recovery_restricted_to_exact_production_app": True,
+            },
+        },
+        "provider": {
+            "http_methods_used": ["GET"],
+            "http_request_count": 17,
+            "http_endpoint_labels": [
+                "valkey-recovery-discovery", *stable_round, *stable_round,
+            ],
+            "mutation_request_count": 0,
+        },
+        "gates": {
+            "postgresql_ready": True,
+            "valkey_ready": True,
+            "double_read_equal": True,
+            "mutation_free": True,
+            "provider_fork_bound": True,
+            "recovery_restricted_to_exact_production_app": True,
+        },
+    }
+
+
 class FakeResponse:
     def __init__(self, value: object, url: str, *, content_type: str = "application/json", status: int = 200) -> None:
         self.raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
@@ -140,6 +308,148 @@ class ApplyControllerTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_provider_native_recovery_v2_binds_exact_plan_and_fork(self) -> None:
+        now = dt.datetime(2026, 8, 27, 0, 0, 0, tzinfo=dt.timezone.utc)
+        contract_raw = common.canonical_file_bytes(recovery_contract())
+        with tempfile.TemporaryDirectory() as temporary:
+            contract_path = Path(temporary) / "production-app-contract.json"
+            contract_path.write_bytes(contract_raw)
+            value = recovery_readiness(common.sha256_bytes(contract_raw), now)
+            value_sha256 = common.sha256_bytes(common.canonical_file_bytes(value))
+            expected_control = copy.deepcopy(value["control"])
+            validated = apply.validate_recovery(
+                value,
+                value_sha256,
+                now,
+                contract_path=contract_path,
+                expected_control=expected_control,
+            )
+            self.assertEqual(validated["schema_version"], 2)
+            self.assertEqual(
+                validated["valkey"]["provider_fork"]["stable_read_count"], 2
+            )
+            apply._require_recovery_plan_authority(
+                validated,
+                {"run_id": "201", "run_attempt": 1, "sha256": "8" * 64},
+            )
+            with self.assertRaises(common.ReleaseError):
+                apply._require_recovery_plan_authority(
+                    validated,
+                    {"run_id": "201", "run_attempt": 1, "sha256": "9" * 64},
+                )
+            for label, key, replacement in (
+                ("workflow-sha", "workflow_sha", "e" * 40),
+                ("run-id", "run_id", "999"),
+            ):
+                tampered = copy.deepcopy(value)
+                tampered["control"][key] = replacement
+                with self.subTest(control=label):
+                    with self.assertRaises(common.ReleaseError):
+                        apply.validate_recovery(
+                            tampered,
+                            common.sha256_bytes(common.canonical_file_bytes(tampered)),
+                            now,
+                            contract_path=contract_path,
+                            expected_control=expected_control,
+                        )
+
+    def test_recovery_accepts_raw_hash_bound_checked_in_pretty_contract(self) -> None:
+        now = dt.datetime(2026, 8, 27, 0, 0, 0, tzinfo=dt.timezone.utc)
+        contract_path = Path(apply.__file__).resolve().with_name(
+            "production-app-contract.json"
+        )
+        contract_raw = contract_path.read_bytes()
+        value = recovery_readiness(common.sha256_bytes(contract_raw), now)
+        bindings = apply.recovery_control.contract_database_bindings(
+            common.loads_strict(contract_raw.decode("utf-8"))
+        )
+        value["target"]["postgresql_cluster_sha256"] = bindings[
+            "postgresql_cluster_sha256"
+        ]
+        value["target"]["valkey_cluster_sha256"] = bindings[
+            "valkey_cluster_sha256"
+        ]
+        value["target"]["region_sha256"] = bindings["region_sha256"]
+        value["postgresql"]["production_cluster_sha256"] = bindings[
+            "postgresql_cluster_sha256"
+        ]
+        value["postgresql"]["version"] = bindings["postgresql_version"]
+        value["postgresql"]["region_sha256"] = bindings["region_sha256"]
+        value["valkey"]["production_cluster_sha256"] = bindings[
+            "valkey_cluster_sha256"
+        ]
+        value["valkey"]["version"] = bindings["valkey_version"]
+        value["valkey"]["recovery_version"] = bindings["valkey_version"]
+        value["valkey"]["region_sha256"] = bindings["region_sha256"]
+        value["valkey"]["recovery_region_sha256"] = bindings["region_sha256"]
+        self.assertEqual(
+            apply.validate_recovery(value, common.sha256_bytes(common.canonical_file_bytes(value)), now)[
+                "schema_version"
+            ],
+            2,
+        )
+
+    def test_recovery_v1_and_provider_fork_drift_fail_closed(self) -> None:
+        now = dt.datetime(2026, 8, 27, 0, 0, 0, tzinfo=dt.timezone.utc)
+        contract_raw = common.canonical_file_bytes(recovery_contract())
+        mutations: list[tuple[str, tuple[str, ...], object]] = [
+            ("v1", ("schema_version",), 1),
+            ("controller-drift", ("control", "controller_sha256"), "e" * 64),
+            ("fork-attempt", ("authorities", "valkey_fork", "run_attempt"), 2),
+            ("fork-file-sha", ("authorities", "valkey_fork", "sha256"), "f" * 64),
+            ("fork-receipt", ("valkey", "provider_fork", "receipt_sha256"), "0" * 64),
+            ("same-fork", ("valkey", "recovery_identity_sha256"), "6" * 64),
+            ("offline-fork", ("valkey", "recovery_status"), "creating"),
+            ("version-drift", ("valkey", "recovery_version"), "7"),
+            ("non-rdb", ("valkey", "recovery_persistence"), "off"),
+            ("topology-drift", ("valkey", "recovery_topology_sha256"), "0" * 64),
+            ("stale-fork", ("valkey", "recovery_is_fresh"), False),
+            ("config-drift", ("valkey", "provider_fork", "recovery_config_sha256"), "0" * 64),
+            ("source-firewall-drift", ("valkey", "provider_fork", "source_firewall_unchanged"), False),
+            ("source-firewall-not-app", ("valkey", "provider_fork", "source_firewall_exact_app"), False),
+            ("fork-firewall-drift", ("valkey", "provider_fork", "recovery_firewall_exact_source_app"), False),
+            ("fork-not-production-app", ("valkey", "provider_fork", "recovery_restricted_to_exact_production_app"), False),
+            ("single-read", ("valkey", "provider_fork", "stable_read_count"), 1),
+            ("repeated-create", ("valkey", "provider_fork", "request_attempt_count"), 2),
+            ("ambiguous-create", ("valkey", "provider_fork", "mutation_ambiguous_reconciled"), True),
+            ("provider-mutation", ("provider", "mutation_request_count"), 1),
+            ("missing-get", ("provider", "http_request_count"), 16),
+            ("incomplete-gate", ("gates", "recovery_restricted_to_exact_production_app"), False),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            contract_path = Path(temporary) / "production-app-contract.json"
+            contract_path.write_bytes(contract_raw)
+            for label, path, replacement in mutations:
+                tampered = recovery_readiness(common.sha256_bytes(contract_raw), now)
+                cursor: dict[str, object] = tampered
+                for key in path[:-1]:
+                    cursor = cursor[key]  # type: ignore[assignment,index]
+                cursor[path[-1]] = replacement
+                with self.subTest(label=label):
+                    with self.assertRaises(common.ReleaseError):
+                        apply.validate_recovery(
+                            tampered,
+                            common.sha256_bytes(common.canonical_file_bytes(tampered)),
+                            now,
+                            contract_path=contract_path,
+                        )
+
+    def test_recovery_readiness_expiry_is_fail_closed(self) -> None:
+        issued = dt.datetime(2026, 8, 27, 0, 0, 0, tzinfo=dt.timezone.utc)
+        checked = issued + dt.timedelta(minutes=6)
+        contract_raw = common.canonical_file_bytes(recovery_contract())
+        with tempfile.TemporaryDirectory() as temporary:
+            contract_path = Path(temporary) / "production-app-contract.json"
+            contract_path.write_bytes(contract_raw)
+            value = recovery_readiness(common.sha256_bytes(contract_raw), issued)
+            with self.assertRaises(common.ReleaseError):
+                apply.validate_recovery(
+                    value,
+                    common.sha256_bytes(common.canonical_file_bytes(value)),
+                    checked,
+                    contract_path=contract_path,
+                )
+
     def test_plan_and_recovery_expiring_during_preflight_block_before_put(self) -> None:
         initial = dt.datetime(2026, 8, 27, 0, 0, 0, tzinfo=dt.timezone.utc)
         expired = initial + dt.timedelta(minutes=6)
@@ -161,6 +471,7 @@ class ApplyControllerTests(unittest.TestCase):
         source = inspect.getsource(apply.apply_change)
         self.assertLess(source.index("cas_before"), source.index("require_fresh_immediately_before_mutation"))
         self.assertLess(source.index("require_fresh_immediately_before_mutation"), source.index("put_app_once"))
+        self.assertEqual(source.count("validate_recovery("), 2)
 
     def test_expiry_is_exclusive_and_fractional_clock_is_not_truncated(self) -> None:
         issued = dt.datetime(2026, 8, 27, 0, 0, 0, tzinfo=dt.timezone.utc)

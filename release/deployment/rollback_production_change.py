@@ -327,6 +327,19 @@ def _bind_rollback_lock_authority(
     return supplied
 
 
+def _require_recovery_target_plan_authority(
+    recovery: Mapping[str, Any], target_state: Mapping[str, Any]
+) -> None:
+    evidence = target_state.get("evidence")
+    if type(evidence) is not dict:
+        common.fail("rollback target phase evidence is malformed")
+    expected = common.require_sha256(
+        evidence["production_plan_sha256"], "rollback target production plan hash"
+    )
+    if recovery["authorities"]["production_plan"]["sha256"] != expected:
+        common.fail("rollback recovery production plan authority differs")
+
+
 def prepare_rollback_mutation_intent(
     *,
     control: Mapping[str, Any],
@@ -372,6 +385,7 @@ def prepare_rollback_mutation_intent(
     common.validate_rollback_transition(current_phase, target_phase)
     _require_rollout_plan_authority(authorities, current_kind, current_state, target_state)
     recovery = apply_control.validate_recovery(recovery, recovery_sha256, checked)
+    _require_recovery_target_plan_authority(recovery, target_state)
     target_images = _digests(target_state)
     desired = apply_control._desired_projection(
         canonical_spec_sha256=target_state["provider_state"]["canonical_spec_sha256"],
@@ -601,6 +615,7 @@ def rollback_change(
         authorities, current_kind, current_state, target_state
     )
     recovery = apply_control.validate_recovery(recovery, recovery_sha256, checked)
+    _require_recovery_target_plan_authority(recovery, target_state)
     if (
         recovery["control"]["run_id"] != authorities["recovery"]["run_id"]
         or recovery["control"]["run_attempt"]
@@ -644,6 +659,10 @@ def rollback_change(
             recovery=recovery,
             clock=time_source,
         )
+        recovery = apply_control.validate_recovery(
+            recovery, recovery_sha256, mutation_checked
+        )
+        _require_recovery_target_plan_authority(recovery, target_state)
         common.validate_mutation_intent(mutation_intent, now=mutation_checked)
         mutation_fingerprint = mutation_intent["mutation"]["mutation_fingerprint_sha256"]
         try:

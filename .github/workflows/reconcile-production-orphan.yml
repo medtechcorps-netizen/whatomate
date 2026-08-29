@@ -285,6 +285,7 @@ jobs:
         with:
           artifact-ids: ${{ steps.auth.outputs.intent_artifact_id }}
           path: ${{ runner.temp }}/mutation-intent
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ steps.auth.outputs.intent_run_id }}
@@ -295,6 +296,7 @@ jobs:
         with:
           artifact-ids: ${{ steps.auth.outputs.original_receipt_artifact_id }}
           path: ${{ runner.temp }}/original-receipt
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ steps.auth.outputs.original_receipt_run_id }}
@@ -476,6 +478,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.assertion.outputs.intent_artifact_id }}
           path: ${{ runner.temp }}/mutation-intent
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ needs.assertion.outputs.intent_run_id }}
@@ -485,6 +488,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.assertion.outputs.assertion_artifact_id }}
           path: ${{ runner.temp }}/lock-assertion
+          merge-multiple: true
 
       - name: Download optional original signed receipt
         if: needs.assertion.outputs.original_receipt_present == 'true'
@@ -492,6 +496,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.assertion.outputs.original_receipt_artifact_id }}
           path: ${{ runner.temp }}/original-receipt
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ needs.assertion.outputs.original_receipt_run_id }}

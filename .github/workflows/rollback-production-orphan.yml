@@ -226,7 +226,7 @@ jobs:
           }
           verify_subject "$RUNNER_TEMP/current" production-orphan-reconciliation "$("$jq_bin" -er '.current_state.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECONCILE_WORKFLOW_PATH" "$RECONCILIATION_PREDICATE" current
           verify_subject "$RUNNER_TEMP/target-state" production-phase-state "$("$jq_bin" -er '.target_state.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$CANARY_WORKFLOW_PATH" https://rereply.app/attestations/production-phase-state/v1 target
-          verify_subject "$RUNNER_TEMP/recovery" production-recovery-readiness "$("$jq_bin" -er '.recovery.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECOVERY_WORKFLOW_PATH" https://rereply.app/attestations/production-recovery-readiness/v1 recovery
+          verify_subject "$RUNNER_TEMP/recovery" production-recovery-readiness "$("$jq_bin" -er '.recovery.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECOVERY_WORKFLOW_PATH" https://rereply.app/attestations/production-recovery-readiness/v2 recovery
 
       - name: Prepare exact sanitized orphan rollback mutation intent without credentials
         id: prepare
@@ -347,6 +347,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
           path: ${{ runner.temp }}/mutation-intent
+          merge-multiple: true
 
       - name: Recheck inherited lock and build exact orphan rollback proof
         id: prepare
@@ -496,12 +497,14 @@ jobs:
         with:
           artifact-ids: ${{ needs.intent.outputs.intent_artifact_id }}
           path: ${{ runner.temp }}/mutation-intent
+          merge-multiple: true
 
       - name: Download exact signed orphan rollback main lock proof
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ needs.lock_proof.outputs.proof_artifact_id }}
           path: ${{ runner.temp }}/main-lock-proof
+          merge-multiple: true
 
       - name: Install pinned orphan rollback authority tools
         run: |
@@ -549,7 +552,7 @@ jobs:
           }
           verify_subject "$RUNNER_TEMP/current" production-orphan-reconciliation "$("$jq_bin" -er '.current_state.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECONCILE_WORKFLOW_PATH" "$RECONCILIATION_PREDICATE" current
           verify_subject "$RUNNER_TEMP/target-state" production-phase-state "$("$jq_bin" -er '.target_state.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$CANARY_WORKFLOW_PATH" https://rereply.app/attestations/production-phase-state/v1 target
-          verify_subject "$RUNNER_TEMP/recovery" production-recovery-readiness "$("$jq_bin" -er '.recovery.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECOVERY_WORKFLOW_PATH" https://rereply.app/attestations/production-recovery-readiness/v1 recovery
+          verify_subject "$RUNNER_TEMP/recovery" production-recovery-readiness "$("$jq_bin" -er '.recovery.sha256' "$RUNNER_TEMP/rollback-evidence.json")" "$RECOVERY_WORKFLOW_PATH" https://rereply.app/attestations/production-recovery-readiness/v2 recovery
           verify_subject "$RUNNER_TEMP/mutation-intent" production-mutation-intent "$INTENT_SHA256" "$WORKFLOW_PATH" "$INTENT_PREDICATE" intent
           verify_subject "$RUNNER_TEMP/main-lock-proof" production-main-lock-proof "$PROOF_SHA256" "$WORKFLOW_PATH" "$LOCK_PROOF_PREDICATE" proof
 

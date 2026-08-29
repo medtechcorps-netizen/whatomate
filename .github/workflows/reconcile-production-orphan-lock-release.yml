@@ -526,6 +526,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.assertion.outputs.preauthorization_artifact_id }}
           path: ${{ runner.temp }}/source-preauthorization
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ needs.assertion.outputs.finalizer_run_id }}
@@ -535,6 +536,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.assertion.outputs.assertion_artifact_id }}
           path: ${{ runner.temp }}/signed-release-assertion
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
@@ -956,6 +958,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.assertion.outputs.preauthorization_artifact_id }}
           path: ${{ runner.temp }}/source-preauthorization
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ needs.assertion.outputs.finalizer_run_id }}
@@ -965,6 +968,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.assertion.outputs.assertion_artifact_id }}
           path: ${{ runner.temp }}/signed-release-assertion
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
@@ -974,6 +978,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.observe.outputs.artifact_id }}
           path: ${{ runner.temp }}/unsigned-release-reconciliation
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}

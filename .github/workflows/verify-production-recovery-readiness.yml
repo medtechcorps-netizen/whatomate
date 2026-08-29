@@ -9,6 +9,10 @@ on:
         description: Exact control SHA plus production-plan run, attempt, artifact ID/API digest, and plan exact-file SHA-256
         required: true
         type: string
+      valkey_fork_evidence_json:
+        description: Exact successful provider-native Valkey fork run, attempt, artifact ID/API digest, and receipt exact-file SHA-256
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -25,9 +29,18 @@ env:
   RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
   WORKFLOW_PATH: .github/workflows/verify-production-recovery-readiness.yml
   PLAN_WORKFLOW_PATH: .github/workflows/plan-production-rollout.yml
+  FORK_WORKFLOW_PATH: .github/workflows/prepare-production-valkey-recovery-fork.yml
   CONTROLLER_PATH: release/deployment/observe_production_recovery.py
+  FORK_CONTROLLER_PATH: release/deployment/provider_native_valkey_recovery.py
   CONTRACT_PATH: release/deployment/production-app-contract.json
-  RECOVERY_PREDICATE: https://rereply.app/attestations/production-recovery-readiness/v1
+  FORK_RECEIPT_PREDICATE: https://rereply.app/attestations/production-valkey-recovery-fork-create-receipt/v2
+  RECOVERY_PREDICATE: https://rereply.app/attestations/production-recovery-readiness/v2
+  PINNED_JQ_VERSION: "1.8.2"
+  PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+  PINNED_JQ_SHA256: b1c22172dd303fbe49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
 
 jobs:
   authority:
@@ -43,6 +56,13 @@ jobs:
       plan_run_attempt: ${{ steps.github.outputs.plan_run_attempt }}
       plan_artifact_name: ${{ steps.github.outputs.plan_artifact_name }}
       plan_sha256: ${{ steps.github.outputs.plan_sha256 }}
+      fork_run_id: ${{ steps.github.outputs.fork_run_id }}
+      fork_run_attempt: ${{ steps.github.outputs.fork_run_attempt }}
+      fork_artifact_id: ${{ steps.github.outputs.fork_artifact_id }}
+      fork_artifact_name: ${{ steps.github.outputs.fork_artifact_name }}
+      fork_artifact_digest: ${{ steps.github.outputs.fork_artifact_digest }}
+      fork_receipt_sha256: ${{ steps.github.outputs.fork_receipt_sha256 }}
+      phase: ${{ steps.github.outputs.phase }}
     steps:
       - name: Require exact protected-main attempt-one authority
         id: guard
@@ -79,6 +99,7 @@ jobs:
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
         env:
           CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
+          FORK_RAW: ${{ inputs.valkey_fork_evidence_json }}
           RAW: ${{ inputs.production_plan_evidence_json }}
         with:
           github-token: ${{ github.token }}
@@ -108,6 +129,32 @@ jobs:
             core.setOutput('plan_run_attempt', '1');
             core.setOutput('plan_artifact_name', name);
             core.setOutput('plan_sha256', value.plan_sha256);
+            const fork = JSON.parse(process.env.FORK_RAW);
+            const forkKeys = ['artifact_digest','artifact_id','control_sha','phase','receipt_sha256','run_attempt','run_id'];
+            if (JSON.stringify(Object.keys(fork).sort()) !== JSON.stringify(forkKeys)) throw new Error('fork descriptor keys differ');
+            if (fork.control_sha !== process.env.CONTROL_SHA || !['baseline','bridge','backend','ui'].includes(fork.phase) || !/^[0-9a-f]{64}$/.test(fork.receipt_sha256)) throw new Error('fork descriptor authority differs');
+            if (fork.run_attempt !== 1 || !/^[1-9][0-9]{0,14}$/.test(String(fork.run_id)) || !/^[1-9][0-9]{0,14}$/.test(String(fork.artifact_id)) || !/^sha256:[0-9a-f]{64}$/.test(fork.artifact_digest)) throw new Error('fork descriptor format differs');
+            const forkLatest = await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(fork.run_id)});
+            const forkExact = await github.rest.actions.getWorkflowRunAttempt({owner,repo,run_id:Number(fork.run_id),attempt_number:1});
+            for (const run of [forkLatest.data,forkExact.data]) {
+              if (run.run_attempt !== 1 || run.head_sha !== process.env.CONTROL_SHA || run.head_branch !== 'main' || run.event !== 'workflow_dispatch' || run.status !== 'completed' || run.conclusion !== 'success' || run.path !== process.env.FORK_WORKFLOW_PATH || run.display_title !== `Prepare exact ${fork.phase} Valkey recovery fork`) throw new Error('fork run authority differs');
+            }
+            const forkJobs = await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/1/jobs',{owner,repo,run_id:Number(fork.run_id),per_page:100});
+            const expectedForkJobs = ['Authenticate exact production Valkey recovery fork authority','Prepare and attest exact production Valkey recovery fork intent','Create exact production Valkey recovery fork','Exact production Valkey recovery fork gate'];
+            if (JSON.stringify(forkJobs.map(job=>job.name).sort()) !== JSON.stringify(expectedForkJobs.sort()) || forkJobs.some(job=>job.status!=='completed' || job.conclusion!=='success' || job.run_attempt!==1)) throw new Error('fork job inventory differs');
+            const forkArtifacts = await github.rest.actions.listWorkflowRunArtifacts({owner,repo,run_id:Number(fork.run_id),per_page:100});
+            const expectedForkNames = [`production-valkey-recovery-fork-create-intent-${fork.run_id}-1`,`unsigned-production-valkey-recovery-fork-create-${fork.run_id}-1`,`production-valkey-recovery-fork-create-${fork.run_id}-1`].sort();
+            if (forkArtifacts.data.total_count !== 3 || forkArtifacts.data.artifacts.length !== 3 || JSON.stringify(forkArtifacts.data.artifacts.map(item=>item.name).sort()) !== JSON.stringify(expectedForkNames)) throw new Error('fork artifact inventory differs');
+            const forkArtifact = await github.rest.actions.getArtifact({owner,repo,artifact_id:Number(fork.artifact_id)});
+            const forkName = `production-valkey-recovery-fork-create-${fork.run_id}-1`;
+            if (forkArtifact.data.name !== forkName || forkArtifact.data.digest !== fork.artifact_digest || forkArtifact.data.expired || forkArtifact.data.size_in_bytes <= 0 || forkArtifact.data.size_in_bytes > 1048576 || forkArtifact.data.workflow_run.id !== Number(fork.run_id) || forkArtifact.data.workflow_run.head_sha !== process.env.CONTROL_SHA || forkArtifact.data.workflow_run.head_branch !== 'main') throw new Error('fork artifact authority differs');
+            core.setOutput('fork_run_id',String(fork.run_id));
+            core.setOutput('fork_run_attempt','1');
+            core.setOutput('fork_artifact_id',String(fork.artifact_id));
+            core.setOutput('fork_artifact_name',forkName);
+            core.setOutput('fork_artifact_digest',fork.artifact_digest);
+            core.setOutput('fork_receipt_sha256',fork.receipt_sha256);
+            core.setOutput('phase',fork.phase);
 
   observe:
     name: Observe exact production recovery state
@@ -117,9 +164,12 @@ jobs:
     environment: rereply-production-recovery
     permissions:
       actions: read
+      attestations: read
       contents: read
     outputs:
       internal_name: ${{ steps.names.outputs.internal_name }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.digest.outputs.artifact_digest }}
     steps:
       - name: Check out exact protected controls
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -138,6 +188,49 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ needs.authority.outputs.plan_run_id }}
 
+      - name: Download exact signed Valkey fork receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.authority.outputs.fork_artifact_id }}
+          path: ${{ runner.temp }}/fork-receipt
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.authority.outputs.fork_run_id }}
+
+      - name: Install pinned fork-attestation verification tools
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/recovery-tools"
+          mkdir -m 0700 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/recovery-gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/recovery-gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/recovery-gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+
+      - name: Verify exact fork receipt provenance and v2 policy before capability use
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          FORK_RECEIPT_SHA256: ${{ needs.authority.outputs.fork_receipt_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          subject="$RUNNER_TEMP/fork-receipt/production-valkey-recovery-fork-create-receipt.json"
+          [[ "$(find "$RUNNER_TEMP/fork-receipt" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" == "production-valkey-recovery-fork-create-receipt.json production-valkey-recovery-fork-create-receipt.sha256 " ]]
+          [[ -z "$(find "$RUNNER_TEMP/fork-receipt" -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
+          [[ "$(cat "$RUNNER_TEMP/fork-receipt/production-valkey-recovery-fork-create-receipt.sha256")" == "$FORK_RECEIPT_SHA256" ]]
+          [[ "$(sha256sum "$subject" | awk '{print $1}')" == "$FORK_RECEIPT_SHA256" ]]
+          signer="$RELEASE_REPOSITORY/$FORK_WORKFLOW_PATH"
+          flags=(--repo "$RELEASE_REPOSITORY" --signer-workflow "$signer" --signer-digest "$CONTROL_SHA" --source-digest "$CONTROL_SHA" --source-ref refs/heads/main --deny-self-hosted-runners --format json)
+          "$RUNNER_TEMP/recovery-tools/gh" attestation verify "$subject" "${flags[@]}" --predicate-type https://slsa.dev/provenance/v1 > "$RUNNER_TEMP/fork-provenance.json"
+          "$RUNNER_TEMP/recovery-tools/gh" attestation verify "$subject" "${flags[@]}" --predicate-type "$FORK_RECEIPT_PREDICATE" > "$RUNNER_TEMP/fork-policy.json"
+          "$RUNNER_TEMP/recovery-tools/jq" -e 'type == "array" and length > 0' "$RUNNER_TEMP/fork-provenance.json" > /dev/null
+          "$RUNNER_TEMP/recovery-tools/jq" -e --slurpfile expected "$subject" 'type == "array" and length > 0 and any(.[]; .verificationResult.statement.predicate == $expected[0])' "$RUNNER_TEMP/fork-policy.json" > /dev/null
+
       - name: Verify plan exact-file hash before capability use
         env:
           EXPECTED_PLAN_SHA256: ${{ needs.authority.outputs.plan_sha256 }}
@@ -151,6 +244,7 @@ jobs:
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
         env:
           CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          FORK_RUN_ID: ${{ needs.authority.outputs.fork_run_id }}
           PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
         with:
           github-token: ${{ github.token }}
@@ -161,34 +255,44 @@ jobs:
             if (main.data.object.sha !== process.env.CONTROL_SHA || current.data.run_attempt !== 1 || current.data.head_sha !== process.env.CONTROL_SHA || current.data.event !== 'workflow_dispatch') throw new Error('recovery capability authority changed');
             const plan=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(process.env.PLAN_RUN_ID)});
             if(plan.data.run_attempt!==1 || plan.data.head_sha!==process.env.CONTROL_SHA || plan.data.status!=='completed' || plan.data.conclusion!=='success') throw new Error('recovery plan authority changed');
+            const fork=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(process.env.FORK_RUN_ID)});
+            if(fork.data.run_attempt!==1 || fork.data.head_sha!==process.env.CONTROL_SHA || fork.data.status!=='completed' || fork.data.conclusion!=='success') throw new Error('recovery fork authority changed');
 
-      - name: Observe recovery with the isolated read capability
+      - name: Observe recovery with the GET-only database read capability and exact app admission
         env:
           DO_PRODUCTION_DATABASE_READ_TOKEN: ${{ secrets.DO_PRODUCTION_DATABASE_READ_TOKEN }}
           TARGET_JSON: ${{ secrets.DO_PRODUCTION_DATABASE_TARGET_JSON }}
-          VALKEY_SOURCE_JSON: ${{ secrets.DO_PRODUCTION_VALKEY_SENTINEL_SOURCE_JSON }}
-          VALKEY_RECOVERY_JSON: ${{ secrets.DO_PRODUCTION_VALKEY_SENTINEL_RECOVERY_JSON }}
-          VALKEY_SENTINEL_HMAC_KEY_B64: ${{ secrets.DO_PRODUCTION_VALKEY_SENTINEL_HMAC_KEY_B64 }}
           CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          FORK_RECEIPT_SHA256: ${{ needs.authority.outputs.fork_receipt_sha256 }}
+          FORK_RUN_ATTEMPT: ${{ needs.authority.outputs.fork_run_attempt }}
+          FORK_RUN_ID: ${{ needs.authority.outputs.fork_run_id }}
+          PLAN_RUN_ATTEMPT: ${{ needs.authority.outputs.plan_run_attempt }}
+          PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
+          PLAN_SHA256: ${{ needs.authority.outputs.plan_sha256 }}
         run: |
           set -euo pipefail
           [[ -n "$DO_PRODUCTION_DATABASE_READ_TOKEN" && -n "$TARGET_JSON" ]]
-          [[ -n "$VALKEY_SOURCE_JSON" && -n "$VALKEY_RECOVERY_JSON" && -n "$VALKEY_SENTINEL_HMAC_KEY_B64" ]]
           controller_sha="$(sha256sum "control/$CONTROLLER_PATH" | awk '{print $1}')"
           contract_sha="$(sha256sum "control/$CONTRACT_PATH" | awk '{print $1}')"
           env -i PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 \
             RUNNER_TEMP="$RUNNER_TEMP" \
             DO_PRODUCTION_DATABASE_READ_TOKEN="$DO_PRODUCTION_DATABASE_READ_TOKEN" \
             DO_PRODUCTION_DATABASE_TARGET_JSON="$TARGET_JSON" \
-            DO_PRODUCTION_VALKEY_SENTINEL_SOURCE_JSON="$VALKEY_SOURCE_JSON" \
-            DO_PRODUCTION_VALKEY_SENTINEL_RECOVERY_JSON="$VALKEY_RECOVERY_JSON" \
-            DO_PRODUCTION_VALKEY_SENTINEL_HMAC_KEY_B64="$VALKEY_SENTINEL_HMAC_KEY_B64" \
             /usr/bin/python3 -I -S -B "control/$CONTROLLER_PATH" \
-              --contract "control/$CONTRACT_PATH" --output "$RUNNER_TEMP/production-recovery-readiness.json" \
+              --contract "control/$CONTRACT_PATH" \
+              --production-plan "$RUNNER_TEMP/production-plan/production-plan.json" \
+              --production-plan-sha256 "$PLAN_SHA256" \
+              --production-plan-run-id "$PLAN_RUN_ID" \
+              --production-plan-run-attempt "$PLAN_RUN_ATTEMPT" \
+              --fork-receipt "$RUNNER_TEMP/fork-receipt/production-valkey-recovery-fork-create-receipt.json" \
+              --fork-receipt-sha256 "$FORK_RECEIPT_SHA256" \
+              --fork-run-id "$FORK_RUN_ID" \
+              --fork-run-attempt "$FORK_RUN_ATTEMPT" \
+              --output "$RUNNER_TEMP/production-recovery-readiness.json" \
               --contract-sha256 "$contract_sha" --controller-sha256 "$controller_sha" \
               --workflow-sha "$CONTROL_SHA" --workflow-run-id "$GITHUB_RUN_ID" \
               --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" --runner-temp "$RUNNER_TEMP"
-          unset DO_PRODUCTION_DATABASE_READ_TOKEN TARGET_JSON VALKEY_SOURCE_JSON VALKEY_RECOVERY_JSON VALKEY_SENTINEL_HMAC_KEY_B64
+          unset DO_PRODUCTION_DATABASE_READ_TOKEN TARGET_JSON
 
       - name: Create sanitized sidecar and internal artifact
         id: names
@@ -196,9 +300,10 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP"
           sha256sum production-recovery-readiness.json | awk '{print $1}' > production-recovery-readiness.sha256
-          printf 'internal_name=unsigned-production-recovery-%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          printf 'internal_name=unsigned-production-recovery-readiness-%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Upload unsigned sanitized recovery evidence
+        id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.names.outputs.internal_name }}
@@ -207,6 +312,15 @@ jobs:
             ${{ runner.temp }}/production-recovery-readiness.sha256
           if-no-files-found: error
           retention-days: 1
+
+      - name: Canonicalize unsigned recovery artifact digest
+        id: digest
+        env:
+          RAW_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          printf 'artifact_digest=sha256:%s\n' "$RAW_ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
 
   gate:
     name: Exact production recovery readiness gate
@@ -229,12 +343,40 @@ jobs:
       - name: Download unsigned evidence
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ${{ needs.observe.outputs.internal_name }}
+          artifact-ids: ${{ needs.observe.outputs.artifact_id }}
           path: ${{ runner.temp }}/recovery
+          merge-multiple: true
+
+      - name: Require exact pre-signing recovery job and artifact inventory
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          ARTIFACT_DIGEST: ${{ needs.observe.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.observe.outputs.artifact_id }}
+          ARTIFACT_NAME: ${{ needs.observe.outputs.internal_name }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const {owner,repo}=context.repo;
+            const current=await github.rest.actions.getWorkflowRun({owner,repo,run_id:context.runId});
+            if(current.data.run_attempt!==1 || current.data.head_sha!==process.env.CONTROL_SHA || current.data.head_branch!=='main' || current.data.event!=='workflow_dispatch') throw new Error('recovery signing run differs');
+            const jobs=await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/1/jobs',{owner,repo,run_id:context.runId,per_page:100});
+            const expected=['Authenticate exact production recovery authority','Observe exact production recovery state','Exact production recovery readiness gate'];
+            if(JSON.stringify(jobs.map(job=>job.name).sort())!==JSON.stringify(expected.sort())) throw new Error('recovery job inventory differs');
+            for(const job of jobs){
+              if(job.name==='Exact production recovery readiness gate'){
+                if(job.status!=='in_progress') throw new Error('recovery gate state differs');
+              }else if(job.status!=='completed' || job.conclusion!=='success') throw new Error('recovery prerequisite job differs');
+            }
+            const list=await github.rest.actions.listWorkflowRunArtifacts({owner,repo,run_id:context.runId,per_page:100});
+            if(list.data.total_count!==1 || list.data.artifacts.length!==1) throw new Error('recovery artifact inventory differs');
+            const artifact=list.data.artifacts[0];
+            if(artifact.id!==Number(process.env.ARTIFACT_ID) || artifact.name!==process.env.ARTIFACT_NAME || artifact.digest!==process.env.ARTIFACT_DIGEST || artifact.expired || artifact.size_in_bytes<=0 || artifact.size_in_bytes>1048576 || artifact.workflow_run.id!==context.runId || artifact.workflow_run.head_sha!==process.env.CONTROL_SHA || artifact.workflow_run.head_branch!=='main') throw new Error('recovery artifact binding differs');
       - name: Recheck exact protected main before attestation
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
         env:
           CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          FORK_RUN_ID: ${{ needs.authority.outputs.fork_run_id }}
           PLAN_RUN_ID: ${{ needs.authority.outputs.plan_run_id }}
         with:
           github-token: ${{ github.token }}
@@ -245,6 +387,8 @@ jobs:
             if (main.data.object.sha !== process.env.CONTROL_SHA || current.data.run_attempt !== 1 || current.data.head_sha !== process.env.CONTROL_SHA || current.data.event !== 'workflow_dispatch') throw new Error('recovery attestation authority changed');
             const plan=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(process.env.PLAN_RUN_ID)});
             if(plan.data.run_attempt!==1 || plan.data.head_sha!==process.env.CONTROL_SHA || plan.data.status!=='completed' || plan.data.conclusion!=='success') throw new Error('recovery plan authority changed before attestation');
+            const fork=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(process.env.FORK_RUN_ID)});
+            if(fork.data.run_attempt!==1 || fork.data.head_sha!==process.env.CONTROL_SHA || fork.data.status!=='completed' || fork.data.conclusion!=='success') throw new Error('recovery fork authority changed before attestation');
       - name: Require exact receipt and unchanged authority
         env:
           CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
@@ -254,12 +398,34 @@ jobs:
           cd "$RUNNER_TEMP/recovery"
           [[ "$(cat production-recovery-readiness.sha256)" == "$(sha256sum production-recovery-readiness.json | awk '{print $1}')" ]]
           [[ "$(find . -maxdepth 1 -type f | wc -l)" -eq 2 ]]
-          /usr/bin/python3 -I -S -B -c '
-          import datetime,pathlib,sys
-          sys.path.insert(0,"'"$GITHUB_WORKSPACE"'/control/release/deployment")
-          import apply_production_change as a, verify_production_release as v
-          p=pathlib.Path("'"$RUNNER_TEMP"'/recovery/production-recovery-readiness.json")
-          a.validate_recovery(v.load_json(p,"recovery readiness"),v.sha256_bytes(p.read_bytes()),datetime.datetime.now(datetime.timezone.utc))'
+          /usr/bin/python3 -I -S -B <<'PY'
+          import datetime
+          import os
+          import pathlib
+          import sys
+
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "control" / "release" / "deployment"
+          sys.path.insert(0, str(root))
+          import apply_production_change as a
+          import verify_production_release as v
+
+          evidence = pathlib.Path(os.environ["RUNNER_TEMP"]) / "recovery" / "production-recovery-readiness.json"
+          expected_control = {
+              "workflow_sha": os.environ["CONTROL_SHA"],
+              "workflow_path": ".github/workflows/verify-production-recovery-readiness.yml",
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "runner_environment": "github-hosted",
+              "contract_sha256": v.sha256_bytes((root / "production-app-contract.json").read_bytes()),
+              "controller_sha256": v.sha256_bytes((root / "observe_production_recovery.py").read_bytes()),
+          }
+          a.validate_recovery(
+              v.load_json(evidence, "recovery readiness"),
+              v.sha256_bytes(evidence.read_bytes()),
+              datetime.datetime.now(datetime.timezone.utc),
+              expected_control=expected_control,
+          )
+          PY
       - name: Attest recovery provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
@@ -276,4 +442,4 @@ jobs:
           name: production-recovery-readiness-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/recovery
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
