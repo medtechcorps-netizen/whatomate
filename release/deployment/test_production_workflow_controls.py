@@ -82,15 +82,16 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
     ),
 }
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "f8210ebbe4c4c3a5e412b56d20b47de40db75e5c97002ce7e69885f5edfcbe56"
+    "7dd2ede189cd08ac419525236d6658479eae42debf93a468927c22682a855e81"
 )
 EXACT_GATE_B_TEST_JOB_SHA256 = {
     "go-race": "fd7737cc95c3cf1bd857af6f372a419d648f49b21d43edfc4b1e5eb9f61ed093",
     "lint": "acff25313c68d1a86740a8cafe808480a5ca1a418c8e48e47d17c8d34285a8fd",
+    "security": "ed9572d5895abf26417ce1ebf87970cc67b41be00379d42df75df58f73c8cbd4",
     "recovery-boundary-images": (
         "90daa97f1350ea5ec53dfc0b86416138fc4737928e6a7d089c33276aa36eaea2"
     ),
-    "test": "93e443c7ef4d05bfe3b6744b4a6f64da68c8aa1882bebf8611c9708b9af5bfc9",
+    "test": "4cb797b5003caf4dcc2599733d839093b3874c60a17eb9eab1c2620e91d97c1f",
 }
 
 
@@ -269,6 +270,97 @@ def assert_gate_b_test_workflow(source: str) -> None:
     ):
         require_active_source_line(lint, line)
 
+    security = job_block(source, "security")
+    frontend_audit = step_block(security, "Audit frontend dependencies")
+    frontend_unit = step_block(security, "Test frontend unit suite")
+    if normalized_active_lines(frontend_unit) != (
+        "- name: Test frontend unit suite",
+        "working-directory: frontend",
+        "run: npx --no-install vitest run src",
+    ):
+        raise AssertionError("frontend unit test step differs")
+    driver_protocol_test = step_block(security, "Test CRM canary driver protocol")
+    if normalized_active_lines(driver_protocol_test) != (
+        "- name: Test CRM canary driver protocol",
+        "run: node --test frontend/canary-driver/driver.test.mjs",
+    ):
+        raise AssertionError("CRM canary driver protocol test differs")
+    driver_build = step_block(security, "Build CRM canary driver container")
+    if normalized_active_lines(driver_build) != (
+        "- name: Build CRM canary driver container",
+        "run: docker build -f docker/crm-canary-driver.Dockerfile "
+        "-t rereply-crm-canary-driver:ci .",
+    ):
+        raise AssertionError("CRM canary driver image build differs")
+    scan_policy_guard = step_block(security, "Reject ambient Trivy suppression policy")
+    if normalized_active_lines(scan_policy_guard) != (
+        "- name: Reject ambient Trivy suppression policy",
+        "run: |",
+        "set -euo pipefail",
+        "for path in .trivyignore .trivyignore.yaml trivy.yaml trivy.yml; do",
+        '[[ ! -e "$path" && ! -L "$path" ]]',
+        "done",
+    ):
+        raise AssertionError("ambient Trivy suppression guard differs")
+    for name in (
+        ".trivyignore",
+        ".trivyignore.yaml",
+        "trivy.yaml",
+        "trivy.yml",
+    ):
+        path = ROOT / name
+        if path.exists() or path.is_symlink():
+            raise AssertionError(f"ambient Trivy suppression policy exists: {name}")
+    driver_scan = step_block(security, "Scan CRM canary driver container")
+    if normalized_active_lines(driver_scan) != (
+        "- name: Scan CRM canary driver container",
+        "uses: aquasecurity/trivy-action@"
+        "a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0",
+        "with:",
+        "image-ref: rereply-crm-canary-driver:ci",
+        "format: table",
+        'exit-code: "1"',
+        "vuln-type: os,library",
+        "severity: CRITICAL,HIGH",
+        "scanners: vuln",
+    ):
+        raise AssertionError("CRM canary driver scan differs")
+    production_scan = step_block(security, "Scan production container")
+    if not (
+        security.index(frontend_audit)
+        < security.index(frontend_unit)
+        < security.index(driver_protocol_test)
+        < security.index(driver_build)
+        < security.index(scan_policy_guard)
+        < security.index(production_scan)
+        < security.index(driver_scan)
+    ):
+        raise AssertionError("CRM canary driver test/build/scan order differs")
+    if canonical_workflow_step_uses_refs(driver_scan) != (
+        "aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8",
+    ):
+        raise AssertionError("CRM canary driver Trivy action pin differs")
+    for line in (
+        "image-ref: rereply-crm-canary-driver:ci",
+        "format: table",
+        'exit-code: "1"',
+        "vuln-type: os,library",
+        "severity: CRITICAL,HIGH",
+        "scanners: vuln",
+    ):
+        require_active_source_line(driver_scan, line)
+    for forbidden in (
+        "continue-on-error:",
+        "ignore-unfixed:",
+        "ignorefile:",
+        "skip-dirs:",
+        "skip-files:",
+    ):
+        if forbidden in driver_scan:
+            raise AssertionError(f"CRM canary driver scan is suppressed: {forbidden}")
+    if "TRIVY_" in source:
+        raise AssertionError("CRM canary driver scan has an ambient Trivy override")
+
     images = job_block(source, "recovery-boundary-images")
     expected_matrix = (
         (
@@ -363,9 +455,13 @@ def assert_gate_b_test_workflow(source: str) -> None:
         "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
     ):
         raise AssertionError("Gate-B aggregate checkout authority differs")
+    aggregate_checkout = step_block(aggregate, "Checkout repository")
+    require_active_source_line(aggregate_checkout, "fetch-depth: 0")
+    require_active_source_line(aggregate_checkout, "persist-credentials: false")
     for line in (
         "python3 -m py_compile \\",
         "python3 -m unittest discover -s release/deployment -p 'test_*.py' -v",
+        "python3 -B -m unittest discover -s release/canary -p 'test_*.py' -v",
     ):
         require_active_source_line(aggregate, line)
     for dependency in expected_needs:
@@ -1268,6 +1364,27 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
         source = workflow("test.yml")
         assert_gate_b_test_workflow(source)
 
+        protocol_step_source = (
+            "      - name: Test CRM canary driver protocol\n"
+            "        run: node --test frontend/canary-driver/driver.test.mjs\n\n"
+        )
+        driver_build_step_source = (
+            "      - name: Build CRM canary driver container\n"
+            "        run: docker build -f docker/crm-canary-driver.Dockerfile "
+            "-t rereply-crm-canary-driver:ci ."
+        )
+        reordered_protocol_source = source.replace(
+            protocol_step_source,
+            "",
+            1,
+        ).replace(
+            driver_build_step_source,
+            driver_build_step_source
+            + "\n\n      # Test CRM canary driver protocol\n"
+            + protocol_step_source.rstrip(),
+            1,
+        )
+
         mutations = {
             "push-removed": source.replace(
                 "  push:\n    branches:\n      - main\n",
@@ -1383,6 +1500,103 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
                 "      - name: Scan production container\n",
                 "      - name: Scan production container\n"
                 "        continue-on-error: true\n",
+                1,
+            ),
+            "crm-driver-protocol-test-retargeted": source.replace(
+                "node --test frontend/canary-driver/driver.test.mjs",
+                "node --test frontend/canary-driver/runner.test.mjs",
+                1,
+            ),
+            "crm-driver-protocol-test-tolerated": source.replace(
+                "      - name: Test CRM canary driver protocol\n",
+                "      - name: Test CRM canary driver protocol\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "crm-driver-protocol-reordered-with-decoy": reordered_protocol_source,
+            "crm-driver-build-retargeted": source.replace(
+                "docker build -f docker/crm-canary-driver.Dockerfile "
+                "-t rereply-crm-canary-driver:ci .",
+                "docker build -f docker/Dockerfile "
+                "-t rereply-crm-canary-driver:ci .",
+                1,
+            ),
+            "crm-driver-build-tolerated": source.replace(
+                "      - name: Build CRM canary driver container\n",
+                "      - name: Build CRM canary driver container\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "trivy-suppression-guard-weakened": source.replace(
+                ".trivyignore .trivyignore.yaml trivy.yaml trivy.yml",
+                ".trivyignore.yaml trivy.yaml trivy.yml",
+                1,
+            ),
+            "trivy-suppression-guard-tolerated": source.replace(
+                "      - name: Reject ambient Trivy suppression policy\n",
+                "      - name: Reject ambient Trivy suppression policy\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "crm-driver-scan-unbound": source.replace(
+                "image-ref: rereply-crm-canary-driver:ci",
+                "image-ref: rereply:ci",
+                1,
+            ),
+            "crm-driver-scan-tolerated": source.replace(
+                "      - name: Scan CRM canary driver container\n",
+                "      - name: Scan CRM canary driver container\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "crm-driver-scan-severity-weakened": source.replace(
+                "      - name: Scan CRM canary driver container\n"
+                "        uses: aquasecurity/trivy-action@"
+                "a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0\n"
+                "        with:\n"
+                "          image-ref: rereply-crm-canary-driver:ci\n"
+                "          format: table\n"
+                '          exit-code: "1"\n'
+                "          vuln-type: os,library\n"
+                "          severity: CRITICAL,HIGH",
+                "      - name: Scan CRM canary driver container\n"
+                "        uses: aquasecurity/trivy-action@"
+                "a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0\n"
+                "        with:\n"
+                "          image-ref: rereply-crm-canary-driver:ci\n"
+                "          format: table\n"
+                '          exit-code: "1"\n'
+                "          vuln-type: os,library\n"
+                "          severity: CRITICAL",
+                1,
+            ),
+            "crm-driver-scan-suppressed": source.replace(
+                "      - name: Scan CRM canary driver container\n"
+                "        uses: aquasecurity/trivy-action@"
+                "a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0\n"
+                "        with:\n",
+                "      - name: Scan CRM canary driver container\n"
+                "        uses: aquasecurity/trivy-action@"
+                "a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0\n"
+                "        with:\n"
+                "          ignore-unfixed: true\n",
+                1,
+            ),
+            "crm-driver-vulnerability-scanner-replaced": source.replace(
+                "          scanners: vuln\n\n  recovery-boundary-images:",
+                "          scanners: secret\n\n  recovery-boundary-images:",
+                1,
+            ),
+            "crm-driver-scan-ambient-suppression": source.replace(
+                "  security:\n    name: security\n",
+                "  security:\n    name: security\n"
+                "    env:\n      TRIVY_IGNORE_UNFIXED: true\n",
+                1,
+            ),
+            "crm-driver-scan-workflow-ambient-suppression": source.replace(
+                "permissions:\n  contents: read\n",
+                "permissions:\n  contents: read\n\n"
+                "env:\n  TRIVY_IGNORE_UNFIXED: true\n",
                 1,
             ),
             "build-job-tolerated": source.replace(

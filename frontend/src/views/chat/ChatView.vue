@@ -2088,10 +2088,12 @@ async function sendMediaMessage() {
 
       <!-- Contacts -->
       <ScrollArea :ref="(el: any) => contactsScroll.scrollAreaRef.value = el" orientation="vertical" class="flex-1">
-        <div class="py-1 w-full">
+        <div data-testid="chat-contact-list" class="py-1 w-full">
           <div
             v-for="contact in contactsStore.sortedContacts"
             :key="contact.id"
+            data-testid="chat-contact"
+            :data-contact-id="contact.id"
             :class="[
               'flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-white/[0.04] light:hover:bg-gray-50 transition-colors',
               contactsStore.currentContact?.id === contact.id && 'bg-white/[0.08] light:bg-gray-100'
@@ -2332,7 +2334,12 @@ async function sendMediaMessage() {
           </Transition>
 
           <ScrollArea :ref="(el: any) => messagesScroll.scrollAreaRef.value = el" class="h-full p-3 chat-background">
-            <div ref="messagesContentRef" class="space-y-2">
+            <div
+              ref="messagesContentRef"
+              data-testid="chat-message-list"
+              :data-contact-id="contactsStore.currentContact.id"
+              class="space-y-2"
+            >
               <!-- Loading indicator for older messages -->
               <div v-if="contactsStore.isLoadingOlderMessages" class="flex justify-center py-2">
                 <div class="flex items-center gap-2 text-white/40 light:text-gray-500 text-sm">
@@ -2369,6 +2376,9 @@ async function sendMediaMessage() {
               <!-- Message bubble -->
               <div
                 :id="`message-${message.id}`"
+                data-testid="chat-message"
+                :data-message-id="message.id"
+                :data-message-direction="message.direction"
                 :class="[
                   'flex group',
                   message.direction === 'outgoing' ? 'justify-end' : 'justify-start'

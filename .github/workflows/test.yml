@@ -227,6 +227,13 @@ jobs:
           npm ci
           npm audit --audit-level=high
 
+      - name: Test frontend unit suite
+        working-directory: frontend
+        run: npx --no-install vitest run src
+
+      - name: Test CRM canary driver protocol
+        run: node --test frontend/canary-driver/driver.test.mjs
+
       - name: Build production container
         run: docker build -f docker/Dockerfile -t rereply:ci .
 
@@ -235,6 +242,16 @@ jobs:
 
       - name: Build Gmail relay container
         run: docker build -f docker/gmail-relay.Dockerfile -t rereply-gmail-relay:ci .
+
+      - name: Build CRM canary driver container
+        run: docker build -f docker/crm-canary-driver.Dockerfile -t rereply-crm-canary-driver:ci .
+
+      - name: Reject ambient Trivy suppression policy
+        run: |
+          set -euo pipefail
+          for path in .trivyignore .trivyignore.yaml trivy.yaml trivy.yml; do
+            [[ ! -e "$path" && ! -L "$path" ]]
+          done
 
       - name: Scan production container
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
@@ -262,6 +279,16 @@ jobs:
           exit-code: "1"
           vuln-type: os,library
           severity: CRITICAL,HIGH
+
+      - name: Scan CRM canary driver container
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: rereply-crm-canary-driver:ci
+          format: table
+          exit-code: "1"
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          scanners: vuln
 
   recovery-boundary-images:
     name: recovery-boundary-images (${{ matrix.role }})
@@ -320,6 +347,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Test exact rollout evidence controls
@@ -330,6 +358,7 @@ jobs:
             release/deployment/verify_production_plan.py \
             release/deployment/test_verify_production_plan.py
           python3 -m unittest discover -s release/deployment -p 'test_*.py' -v
+          python3 -B -m unittest discover -s release/canary -p 'test_*.py' -v
 
       - name: Require every Test job to succeed
         env:

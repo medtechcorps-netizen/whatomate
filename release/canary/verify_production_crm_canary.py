@@ -24,6 +24,7 @@ import socket
 import ssl
 import stat
 import sys
+import time
 import zipfile
 from http.client import HTTPResponse
 from pathlib import Path, PurePosixPath
@@ -142,6 +143,9 @@ MAX_ARCHIVE_BYTES = 524_288
 MAX_HEALTH_BODY_BYTES = 4096
 MAX_DRIVER_BODY_BYTES = 65_536
 MAX_DRIVER_CLOCK_SKEW_SECONDS = 300
+DEFAULT_SOCKET_TIMEOUT_SECONDS = 20
+DRIVER_SOCKET_TIMEOUT_SECONDS = 240
+REQUEST_HMAC_DOMAIN = b"rereply-crm-canary-request-v1"
 
 
 class CanaryError(RuntimeError):
@@ -632,9 +636,24 @@ def secure_https_request(
     body: bytes | None = None,
     maximum_body_bytes: int,
     retry_addresses: bool = True,
+    socket_timeout_seconds: int = DEFAULT_SOCKET_TIMEOUT_SECONDS,
 ) -> tuple[int, Mapping[str, str], bytes]:
+    if (
+        type(socket_timeout_seconds) is not int
+        or socket_timeout_seconds < 1
+        or socket_timeout_seconds > DRIVER_SOCKET_TIMEOUT_SECONDS
+    ):
+        fail("canary socket timeout is invalid")
     host, path, port = validate_https_url(url, "canary target")
     addresses = resolve_public_addresses(host, port)
+    deadline = time.monotonic() + socket_timeout_seconds
+
+    def remaining_time() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("canary HTTPS request deadline exceeded")
+        return remaining
+
     request_headers = {
         "Host": host,
         "User-Agent": "ReReply-Production-Canary/1",
@@ -661,11 +680,15 @@ def secure_https_request(
         raw_socket: socket.socket | None = None
         tls_socket: ssl.SSLSocket | None = None
         try:
-            raw_socket = socket.create_connection((address, port), timeout=15)
+            raw_socket = socket.create_connection(
+                (address, port), timeout=min(15, remaining_time())
+            )
+            raw_socket.settimeout(remaining_time())
             tls_socket = context.wrap_socket(raw_socket, server_hostname=host)
-            tls_socket.settimeout(20)
+            tls_socket.settimeout(remaining_time())
             tls_socket.sendall(request)
             response = HTTPResponse(tls_socket)
+            tls_socket.settimeout(remaining_time())
             response.begin()
             location = response.getheader("Location")
             if location is not None:
@@ -678,9 +701,18 @@ def secure_https_request(
                     raise CanaryError("canary response length is invalid") from exc
                 if declared < 0 or declared > maximum_body_bytes:
                     fail("canary response is too large")
-            payload = response.read(maximum_body_bytes + 1)
-            if len(payload) > maximum_body_bytes:
-                fail("canary response is too large")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                tls_socket.settimeout(remaining_time())
+                chunk = response.read(min(65_536, maximum_body_bytes + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > maximum_body_bytes:
+                    fail("canary response is too large")
+                chunks.append(chunk)
+            payload = b"".join(chunks)
             return response.status, {key.lower(): value for key, value in response.getheaders()}, payload
         except CanaryError:
             raise
@@ -722,6 +754,22 @@ def parse_utc_timestamp(value: Any, label: str) -> dt.datetime:
         raise CanaryError(f"{label} is invalid") from exc
 
 
+def driver_request_hmac_payload(timestamp: str, request_body: bytes) -> bytes:
+    normalized_timestamp = exact_string(
+        timestamp, "synthetic CRM request timestamp", maximum=20
+    )
+    parse_utc_timestamp(normalized_timestamp, "synthetic CRM request timestamp")
+    if type(request_body) is not bytes:
+        fail("synthetic CRM request body is invalid")
+    return (
+        REQUEST_HMAC_DOMAIN
+        + b"\x00"
+        + normalized_timestamp.encode("ascii")
+        + b"\x00"
+        + request_body
+    )
+
+
 def run_health_probes(endpoints: Mapping[str, str]) -> dict[str, bool]:
     checks: dict[str, bool] = {}
     for label in sorted(HEALTH_STATUSES):
@@ -729,6 +777,7 @@ def run_health_probes(endpoints: Mapping[str, str]) -> dict[str, bool]:
             endpoints[label],
             method="GET",
             maximum_body_bytes=MAX_HEALTH_BODY_BYTES,
+            socket_timeout_seconds=DEFAULT_SOCKET_TIMEOUT_SECONDS,
         )
         if status != HEALTH_STATUSES[label]:
             fail("a production health endpoint returned an unexpected status")
@@ -739,7 +788,13 @@ def run_health_probes(endpoints: Mapping[str, str]) -> dict[str, bool]:
 def validate_driver_config(value: Any) -> dict[str, Any]:
     config = exact_keys(
         value,
-        {"schema_version", "url", "driver_version_sha256", "hmac_key_base64"},
+        {
+            "schema_version",
+            "url",
+            "driver_version_sha256",
+            "fixture_descriptor_sha256",
+            "hmac_key_base64",
+        },
         "synthetic driver config",
     )
     if config["schema_version"] != 1:
@@ -747,6 +802,11 @@ def validate_driver_config(value: Any) -> dict[str, Any]:
     url = exact_string(config["url"], "synthetic driver URL", maximum=2048)
     host, path, _ = validate_https_url(url, "synthetic driver URL")
     version = exact_string(config["driver_version_sha256"], "synthetic driver version", SHA256_RE)
+    fixture_descriptor_sha256 = exact_string(
+        config["fixture_descriptor_sha256"],
+        "synthetic fixture descriptor hash",
+        SHA256_RE,
+    )
     encoded_key = exact_string(config["hmac_key_base64"], "synthetic driver HMAC key", maximum=256)
     try:
         key = base64.b64decode(encoded_key, validate=True)
@@ -759,10 +819,12 @@ def validate_driver_config(value: Any) -> dict[str, Any]:
         "schema_version": 1,
         "url": normalized_url,
         "driver_version_sha256": version,
+        "fixture_descriptor_sha256": fixture_descriptor_sha256,
     }
     return {
         "url": normalized_url,
         "driver_version_sha256": version,
+        "fixture_descriptor_sha256": fixture_descriptor_sha256,
         "driver_config_sha256": sha256_bytes(canonical_payload_bytes(public_binding)),
         "hmac_key": key,
     }
@@ -790,10 +852,13 @@ def run_ui_driver(
             change_receipt_sha256, "change receipt hash", SHA256_RE
         ),
         "driver_version_sha256": config["driver_version_sha256"],
+        "fixture_descriptor_sha256": config["fixture_descriptor_sha256"],
     }
     request_body = canonical_payload_bytes(request_value)
     request_signature = hmac.new(
-        config["hmac_key"], request_body, hashlib.sha256
+        config["hmac_key"],
+        driver_request_hmac_payload(request_timestamp, request_body),
+        hashlib.sha256,
     ).hexdigest()
     status, headers, response_body = secure_https_request(
         config["url"],
@@ -806,6 +871,7 @@ def run_ui_driver(
         body=request_body,
         maximum_body_bytes=MAX_DRIVER_BODY_BYTES,
         retry_addresses=False,
+        socket_timeout_seconds=DRIVER_SOCKET_TIMEOUT_SECONDS,
     )
     if status != 200:
         fail("synthetic CRM driver returned an unexpected status")
@@ -822,6 +888,7 @@ def run_ui_driver(
             "idempotency_key",
             "change_receipt_sha256",
             "driver_version_sha256",
+            "fixture_descriptor_sha256",
             "observed_at",
             "execution_count",
             "checks",
@@ -839,7 +906,11 @@ def run_ui_driver(
         or response["change_receipt_sha256"] != change_receipt_sha256
     ):
         fail("synthetic CRM result request binding differs")
-    if response["driver_version_sha256"] != config["driver_version_sha256"]:
+    if (
+        response["driver_version_sha256"] != config["driver_version_sha256"]
+        or response["fixture_descriptor_sha256"]
+        != config["fixture_descriptor_sha256"]
+    ):
         fail("synthetic CRM driver version differs")
     observed_at = parse_utc_timestamp(response["observed_at"], "synthetic CRM observed_at")
     checked_at = now.astimezone(dt.timezone.utc).replace(microsecond=0)
@@ -860,6 +931,7 @@ def run_ui_driver(
         {key: True for key in UI_CHECKS},
         {
             "driver_version_sha256": config["driver_version_sha256"],
+            "fixture_descriptor_sha256": config["fixture_descriptor_sha256"],
             "driver_config_sha256": config["driver_config_sha256"],
         },
     )
@@ -992,6 +1064,11 @@ def build_canary(
                     ),
                     "driver_config_sha256": exact_string(
                         driver_binding["driver_config_sha256"], "driver config hash", SHA256_RE
+                    ),
+                    "fixture_descriptor_sha256": exact_string(
+                        driver_binding["fixture_descriptor_sha256"],
+                        "fixture descriptor hash",
+                        SHA256_RE,
                     ),
                 }
             ),
@@ -1239,10 +1316,18 @@ def finalize(args: argparse.Namespace) -> None:
     if receipt_phase(receipt) == "ui":
         expected_driver = exact_keys(
             expected_driver,
-            {"driver_version_sha256", "driver_config_sha256"},
+            {
+                "driver_version_sha256",
+                "driver_config_sha256",
+                "fixture_descriptor_sha256",
+            },
             "CRM driver binding",
         )
-        for key in ("driver_version_sha256", "driver_config_sha256"):
+        for key in (
+            "driver_version_sha256",
+            "driver_config_sha256",
+            "fixture_descriptor_sha256",
+        ):
             exact_string(expected_driver[key], f"CRM {key}", SHA256_RE)
     elif expected_driver != {}:
         fail("CRM driver binding is forbidden before UI")
