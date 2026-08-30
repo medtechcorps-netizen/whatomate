@@ -16,7 +16,13 @@ The final `ui` phase is bound to one immutable Git identity:
 The release contains Klinik-only WhatsApp reply hardening and the existing
 authorized-client realtime, unread-marker, and late-layout autoscroll fixes.
 It does not authorize new tenants, Meta routes, callbacks, Page subscriptions,
-or environment values.
+or arbitrary environment values. Before baseline planning, the synthetic-canary
+bootstrap may append only the dedicated synthetic Klinik organization to the
+existing legacy WhatsApp reply allowlist. Preserve every existing allowlist
+entry and keep the non-Klinik fixture excluded. Perform that one-value change by
+an exact full-spec compare-and-swap, wait for the replacement deployment to be
+healthy and active, then rebaseline the production contract and regenerate all
+release evidence on the resulting control SHA.
 
 ## Authority boundaries
 

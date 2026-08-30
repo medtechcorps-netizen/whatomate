@@ -33,11 +33,11 @@
     ]
   },
   "bootstrap_state": {
-    "genesis_state_sha256": "106d0bcebe6c5d1f961fb9905a9d7e8c971eb27661ccfdd3f941b1dff2bfc960",
-    "active_deployment_id_sha256": "439ecb65c0e711036d39b26a4d38b91f555dad32325dbdd86544230743d3cb0f",
-    "canonical_spec_sha256": "a93a507a5affd82b4e00636812e4c444d31c9027bc31c19bd075f2e4d580b07e",
-    "environment_values_sha256": "3b675a9ca2279c465a102e8256cbf8242a46c456e6898d593e9cde3d0e2361c7",
-    "non_source_projection_sha256": "4f31183fb7f305a2a36422fdf722f90bed1eadc69fd90026928f522edf9a419b",
+    "genesis_state_sha256": "c43ed05bc18c2be1c23ab42c85918a821390d39230573780835522481cddcb5d",
+    "active_deployment_id_sha256": "df237a5aaafcee1d0bfe57b4b908eeac1c2a1560690e9755b0a38d714326bd44",
+    "canonical_spec_sha256": "ff39bee11bc7f4755f7225b287de0d1ea5c24dc349ca563ce837b1c3c4dc3284",
+    "environment_values_sha256": "1295999ddf906b9083980f6665b8c3263a03277131f0ccae7a081ac8d3ff1e71",
+    "non_source_projection_sha256": "b6ee9436a9de1c289888d6aa67a4ffa156224c04788af5b603f1e3cbf515a259",
     "source_mode": "legacy-git",
     "source_sha": "974bb998f6d4c94ce750a92bf23f4550f8e45a2f"
   },
