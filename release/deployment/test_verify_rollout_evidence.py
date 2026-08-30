@@ -207,16 +207,19 @@ class RolloutEvidenceTests(unittest.TestCase):
             "release/validation/patches/channels-view-webcrypto-completion-ui.patch"
         )
 
-        def head_blob(path: Path) -> bytes:
+        def git_blob(revision: str, path: Path) -> bytes:
             return subprocess.run(
-                ["git", "-C", str(ROOT), "show", f"HEAD:{path.as_posix()}"],
+                ["git", "-C", str(ROOT), "show", f"{revision}:{path.as_posix()}"],
                 check=True,
                 capture_output=True,
             ).stdout
 
-        source_bytes = head_blob(target_relative)
-        common_bytes = head_blob(common_relative)
-        completion_bytes = head_blob(completion_relative)
+        # The harness patches the frozen UI product source, not the copy of this
+        # test file in the current control commit. Keep the behavioral replay
+        # bound to the same exact UI source selected by the release manifest.
+        source_bytes = git_blob(EXPECTED_FINAL_SOURCE["source_sha"], target_relative)
+        common_bytes = git_blob("HEAD", common_relative)
+        completion_bytes = git_blob("HEAD", completion_relative)
         self.assertEqual(
             hashlib.sha256(common_bytes).hexdigest(),
             "917868ced113fe03b0f93d5a0d2acbb9c75021f666517c80af2092a2e2fc2ab1",

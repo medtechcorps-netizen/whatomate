@@ -82,7 +82,7 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
     ),
 }
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "7a88c43957edfae7c2dd0e0cec2c9256f2978c60c77683b5ae129a195c7d8f67"
+    "7dd2ede189cd08ac419525236d6658479eae42debf93a468927c22682a855e81"
 )
 EXACT_GATE_B_TEST_JOB_SHA256 = {
     "go-race": "fd7737cc95c3cf1bd857af6f372a419d648f49b21d43edfc4b1e5eb9f61ed093",
@@ -91,7 +91,7 @@ EXACT_GATE_B_TEST_JOB_SHA256 = {
     "recovery-boundary-images": (
         "90daa97f1350ea5ec53dfc0b86416138fc4737928e6a7d089c33276aa36eaea2"
     ),
-    "test": "083dbca771eef7cbb07e92369a1dfa589bb5a102527af9d1dfb862020b596f3e",
+    "test": "4cb797b5003caf4dcc2599733d839093b3874c60a17eb9eab1c2620e91d97c1f",
 }
 
 
@@ -455,6 +455,9 @@ def assert_gate_b_test_workflow(source: str) -> None:
         "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
     ):
         raise AssertionError("Gate-B aggregate checkout authority differs")
+    aggregate_checkout = step_block(aggregate, "Checkout repository")
+    require_active_source_line(aggregate_checkout, "fetch-depth: 0")
+    require_active_source_line(aggregate_checkout, "persist-credentials: false")
     for line in (
         "python3 -m py_compile \\",
         "python3 -m unittest discover -s release/deployment -p 'test_*.py' -v",
