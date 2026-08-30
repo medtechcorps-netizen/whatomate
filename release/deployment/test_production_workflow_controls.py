@@ -3678,6 +3678,27 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
             ),
         )
 
+        capsule_step = step_block(
+            prepare, "Independently verify exact capsule and target phase"
+        )
+        capsule_active = normalized_active_lines(capsule_step)
+        capsule_directory_lines = (
+            "expected_dirs=$'phases\\nphases/backend\\nphases/baseline\\n"
+            "phases/bridge\\nphases/ui'",
+            'actual_dirs="$(find "$root" -mindepth 1 -type d -printf '
+            "'%P\\n' | LC_ALL=C sort)\"",
+            '[[ "$actual_dirs" == "$expected_dirs" ]]',
+            '[[ -z "$(find "$root" -mindepth 1 ! -type f ! -type d '
+            '-print -quit)" ]]',
+        )
+        for line in capsule_directory_lines:
+            self.assertEqual(capsule_active.count(line), 1)
+        self.assertNotIn(
+            '[[ -z "$(find "$root" -mindepth 1 \\( -type l -o -type d '
+            '! -path "$root" \\) -print -quit)" ]]',
+            capsule_active,
+        )
+
         artifact_id_download_counts = {
             "prepare": (prepare, 4),
             "recovery": (recovery, 2),
