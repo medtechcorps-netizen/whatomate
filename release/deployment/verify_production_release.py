@@ -540,32 +540,76 @@ def require_exact_image_change(before: Mapping[str, Any], after: Mapping[str, An
 
 
 def environment_value_fingerprint(spec: Mapping[str, Any]) -> str:
-    entries: list[dict[str, Any]] = []
-    for scope in ("app", "services", "workers", "jobs", "static_sites", "functions"):
-        owners = [spec] if scope == "app" else spec.get(scope, [])
-        if type(owners) is not list:
-            fail("environment container is malformed")
-        for owner in owners:
-            if type(owner) is not dict:
-                fail("environment owner is malformed")
-            owner_name = "app" if scope == "app" else exact_string(owner.get("name"), "environment owner name")
-            envs = owner.get("envs", [])
-            if type(envs) is not list:
-                fail("environment list is malformed")
-            for env in envs:
-                if type(env) is not dict:
-                    fail("environment entry is malformed")
-                entries.append(
-                    {
-                        "scope": scope,
-                        "owner": owner_name,
-                        "key": env.get("key"),
-                        "value_sha256": sha256_bytes(str(env.get("value", "")).encode("utf-8")),
-                        "type": env.get("type"),
-                        "run_scope": env.get("scope"),
-                    }
-                )
-    return sha256_value(sorted(entries, key=lambda item: (str(item["scope"]), str(item["owner"]), str(item["key"]))))
+    records: list[list[str]] = []
+
+    def environment_string(value: Any, label: str) -> str:
+        if type(value) is not str or not value or len(value) > 512:
+            fail(f"{label} is invalid")
+        if "\n" in value or "\r" in value or "\x00" in value:
+            fail(f"{label} contains control characters")
+        return value
+
+    def collect(collection: str, component: str, raw: Any) -> None:
+        if raw is None:
+            raw = []
+        if type(raw) is not list:
+            fail("environment list is malformed")
+        seen: set[str] = set()
+        for item in raw:
+            if type(item) is not dict:
+                fail("environment entry is malformed")
+            key = environment_string(item.get("key"), "environment key")
+            if key in seen:
+                fail("duplicate environment key")
+            seen.add(key)
+            scope = item.get("scope", "RUN_TIME")
+            if scope != "RUN_TIME":
+                fail("environment scope is outside the reviewed contract")
+            value = item.get("value")
+            if type(value) is not str:
+                fail("environment value is missing")
+            environment_type = item.get("type", "GENERAL")
+            if environment_type not in {"GENERAL", "SECRET"}:
+                fail("environment type is outside the reviewed contract")
+            records.append(
+                [
+                    collection,
+                    component,
+                    key,
+                    scope,
+                    environment_type,
+                    sha256_bytes(value.encode("utf-8")),
+                ]
+            )
+
+    collect("app", "app", spec.get("envs", []))
+    for collection in ("services", "jobs", "workers", "static_sites", "functions"):
+        raw = spec.get(collection, [])
+        if type(raw) is not list:
+            fail(f"spec {collection} must be an array")
+        indexed: dict[str, dict[str, Any]] = {}
+        for item in raw:
+            if type(item) is not dict:
+                fail(f"spec {collection} entry is malformed")
+            name = environment_string(
+                item.get("name"), f"spec {collection} component name"
+            )
+            if name in indexed:
+                fail(f"duplicate spec component in {collection}")
+            indexed[name] = item
+        for name, component in indexed.items():
+            collect(collection, name, component.get("envs", []))
+    try:
+        canonical_records = json.dumps(
+            sorted(records),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ReleaseError("environment inventory is not canonical JSON") from exc
+    return sha256_bytes(canonical_records)
 
 
 def strip_image_sources(spec: Mapping[str, Any]) -> dict[str, Any]:
