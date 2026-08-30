@@ -26,6 +26,9 @@ ACTIVE_PRODUCTION_CONTROLS = (
     "reconcile-production-main-lock-release.yml",
     "cleanup-production-valkey-recovery-fork.yml",
 )
+AUXILIARY_PRODUCTION_CONTROLS = (
+    "publish-attest-production-crm-canary-driver.yml",
+)
 PINNED_ACTION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}(?:\s+#.*)?$")
 TERMINAL_PARITY_WORKFLOW_SHA256 = {
     "apply-production-phase.yml": (
@@ -52,6 +55,9 @@ EXACT_IMAGE_BUILD_ACTION = (
 )
 EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
     "8c0b7eccb22a5cc0f64ec40f58203da01455bb8f847cbc7aaf979a2f777812ff"
+)
+EXACT_CRM_CANARY_DRIVER_PUBLISHER_SHA256 = (
+    "7104dd5117ec7d79b169603f5a0026e8a172da278f8491d976cd892b11570d93"
 )
 EXACT_IMAGE_GATE_STEP_SHA256 = (
     "1b4bf101f1756d43193ccc0050cf44bb9dd22df25302e084c9a9a91ede2db4a5"
@@ -1295,6 +1301,433 @@ def producer_artifact_prefixes(source: str, operation: str) -> tuple[str, ...]:
     return tuple(prefix for prefix, _ in emitted)
 
 
+def assert_crm_canary_driver_publisher(source: str) -> None:
+    if hashlib.sha256(source.encode("utf-8")).hexdigest() != (
+        EXACT_CRM_CANARY_DRIVER_PUBLISHER_SHA256
+    ):
+        raise AssertionError("exact CRM canary driver publisher source differs")
+    if not source.startswith(
+        "name: Publish and Attest Production CRM Canary Driver\n\n"
+        "run-name: Publish exact production CRM canary driver\n"
+    ):
+        raise AssertionError("CRM canary driver publisher identity differs")
+    if not re.search(r"(?m)^  workflow_dispatch:\s*$", source):
+        raise AssertionError("driver publisher must be manually dispatched")
+    if re.search(
+        r"(?m)^  (?:push|pull_request|schedule|workflow_run|workflow_call|repository_dispatch):\s*$",
+        source,
+    ):
+        raise AssertionError("driver publisher has an unexpected trigger")
+    dispatch = re.search(
+        r"(?ms)^  workflow_dispatch:\s*$.*?(?=^permissions:|\Z)", source
+    )
+    if dispatch is None or normalized_active_lines(dispatch.group(0)) != (
+        "workflow_dispatch:",
+        "inputs:",
+        "test_run_id:",
+        "description: Successful exact-main push Test workflow run ID",
+        "required: true",
+        "type: string",
+    ):
+        raise AssertionError("driver publisher input contract differs")
+    if exact_yaml_mapping_active_lines(source, 0, "on") != (
+        "on:",
+        "workflow_dispatch:",
+        "inputs:",
+        "test_run_id:",
+        "description: Successful exact-main push Test workflow run ID",
+        "required: true",
+        "type: string",
+    ):
+        raise AssertionError("driver publisher trigger map differs")
+    for line in (
+        "group: rereply-crm-canary-driver-publication",
+        "cancel-in-progress: false",
+        "DRIVER_IMAGE: ghcr.io/medtechcorps-netizen/rereply-crm-canary-driver",
+        "DRIVER_DOCKERFILE: docker/crm-canary-driver.Dockerfile",
+    ):
+        require_active_source_line(source, line)
+    if "group: rereply-production" in normalized_active_lines(source):
+        raise AssertionError("driver publisher must not join production mutation lock")
+    if tuple(name for name, _ in job_definitions(source)) != (
+        "authority",
+        "build",
+        "scan",
+        "attest",
+        "verify",
+        "gate",
+    ):
+        raise AssertionError("driver publisher job inventory differs")
+    if exact_yaml_mapping_active_lines(source, 0, "permissions") != (
+        "permissions:",
+        "contents: read",
+    ):
+        raise AssertionError("driver workflow permission map differs")
+    expected_job_permissions = {
+        "authority": ("permissions:", "actions: read", "contents: read"),
+        "build": (
+            "permissions:",
+            "actions: read",
+            "contents: read",
+            "packages: write",
+        ),
+        "scan": ("permissions:", "contents: read", "packages: read"),
+        "attest": (
+            "permissions:",
+            "actions: read",
+            "attestations: write",
+            "contents: read",
+            "id-token: write",
+        ),
+        "verify": (
+            "permissions:",
+            "actions: read",
+            "attestations: read",
+            "contents: read",
+        ),
+        "gate": ("permissions:", "actions: read", "contents: read"),
+    }
+    for job_name, expected_permissions in expected_job_permissions.items():
+        if exact_yaml_mapping_active_lines(
+            job_block(source, job_name), 4, "permissions"
+        ) != expected_permissions:
+            raise AssertionError(f"driver job permissions differ: {job_name}")
+    source_active = normalized_active_lines(source)
+    if any(line.startswith("continue-on-error:") for line in source_active):
+        raise AssertionError("driver publisher cannot tolerate job or step failures")
+    for job_name, _ in job_definitions(source):
+        for block in workflow_step_blocks(job_block(source, job_name)):
+            block_active = normalized_active_lines(block)
+            if any(line.startswith("if:") for line in block_active):
+                raise AssertionError("driver publisher steps must be unconditional")
+            run_indices = tuple(
+                index for index, line in enumerate(block_active) if line == "run: |"
+            )
+            if run_indices:
+                if len(run_indices) != 1 or run_indices[0] + 1 >= len(block_active):
+                    raise AssertionError("driver run-step structure differs")
+                if block_active[run_indices[0] + 1] != "set -euo pipefail":
+                    raise AssertionError("driver run steps must start in strict mode")
+    if source_active.count("packages: write") != 1 or source_active.count(
+        "packages: read"
+    ) != 1:
+        raise AssertionError("driver package permissions differ")
+    if source_active.count("id-token: write") != 1:
+        raise AssertionError("driver attestation signing authority differs")
+    workflow_uses_refs = canonical_workflow_step_uses_refs(source)
+    expected_action_counts = {
+        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262": 2,
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02": 4,
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093": 3,
+        "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8": 1,
+        "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9": 1,
+        "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6": 3,
+    }
+    if len(workflow_uses_refs) != sum(expected_action_counts.values()):
+        raise AssertionError("driver action inventory differs")
+    for action_ref, expected_count in expected_action_counts.items():
+        if workflow_uses_refs.count(action_ref) != expected_count:
+            raise AssertionError(f"driver action count differs: {action_ref}")
+    if re.search(r"(?m)^\s+environment:\s*", source):
+        raise AssertionError("driver publisher must not use a deployment environment")
+    for forbidden in (
+        "secrets.",
+        "deployments: write",
+        "DO_PRODUCTION_",
+        "DIGITALOCEAN",
+        "doctl",
+        "aggregate-exact-four-phase-rollout",
+        "build-attest-exact-release-images",
+    ):
+        if forbidden.lower() in source.lower():
+            raise AssertionError(f"driver publisher contains forbidden authority: {forbidden}")
+
+    for job_name in ("authority", "build", "scan", "attest", "verify", "gate"):
+        job_active = normalized_active_lines(job_block(source, job_name))
+        if job_active.count("RUNNER_ENVIRONMENT: ${{ runner.environment }}") != 1:
+            raise AssertionError(f"driver hosted-runner input differs: {job_name}")
+        if job_active.count('[[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]') != 1:
+            raise AssertionError(f"driver hosted-runner guard differs: {job_name}")
+
+    authority = job_block(source, "authority")
+    authority_active = normalized_active_lines(authority)
+    authority_expected_counts = {
+        "REF_PROTECTED: ${{ github.ref_protected }}": 1,
+        "EVENT_NAME: ${{ github.event_name }}": 1,
+        '[[ "$EVENT_NAME" == "workflow_dispatch" ]]': 1,
+        '[[ "$REF_PROTECTED" == "true" ]]': 1,
+        '[[ "$RUN_ATTEMPT" == "1" ]]': 1,
+        '.run_attempt == 1 and': 2,
+        '.event == "push" and': 1,
+        '.head_branch == "main" and': 1,
+        '.path == ".github/workflows/test.yml"': 1,
+        '([.jobs[] | select(.name == "security")] | length) == 1 and': 1,
+        '.name == "security" and': 1,
+        '([.steps[] | select(.name == "Test CRM canary driver protocol" and .conclusion == "success")] | length) == 1 and': 1,
+        '([.steps[] | select(.name == "Build CRM canary driver container" and .conclusion == "success")] | length) == 1 and': 1,
+        '([.steps[] | select(.name == "Scan CRM canary driver container" and .conclusion == "success")] | length) == 1': 1,
+    }
+    for required, expected_count in authority_expected_counts.items():
+        if authority_active.count(required) != expected_count:
+            raise AssertionError(f"driver Test authority differs: {required}")
+    authority_main_step = normalized_active_lines(
+        step_block(authority, "Require live main and exact successful push Test")
+    )
+    if authority_main_step.count(
+        'live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq \'.object.sha\')"'
+    ) != 1 or authority_main_step.count(
+        '[[ "$live_main_sha" == "$CONTROL_SHA" ]]'
+    ) != 1:
+        raise AssertionError("driver initial live-main authority differs")
+
+    derive_step = step_block(authority, "Derive exact driver build-input version")
+    derive_active = normalized_active_lines(derive_step)
+    for line in (
+        "docker/crm-canary-driver.Dockerfile \\",
+        "frontend/package.json \\",
+        "frontend/package-lock.json",
+        "git ls-tree -r --name-only HEAD -- frontend/canary-driver",
+        ": > driver-inputs.tsv",
+        "driver_version_sha256=\"$(sha256sum driver-inputs.tsv | awk '{print $1}')\"",
+    ):
+        if derive_active.count(line) != 1:
+            raise AssertionError(f"driver authority build-input binding differs: {line}")
+    recompute_step = step_block(
+        job_block(source, "build"), "Recompute exact driver build-input version"
+    )
+    recompute_active = normalized_active_lines(recompute_step)
+    for line in (
+        "printf '%s\\n' docker/crm-canary-driver.Dockerfile frontend/package.json frontend/package-lock.json",
+        "git ls-tree -r --name-only HEAD -- frontend/canary-driver",
+        ": > driver-inputs.tsv",
+        '[[ "$(sha256sum driver-inputs.tsv | awk \'{print $1}\')" == "$EXPECTED_DRIVER_VERSION" ]]',
+    ):
+        if recompute_active.count(line) != 1:
+            raise AssertionError(f"driver build recomputation differs: {line}")
+
+    build_step = step_block(
+        source, "Build exact AMD64 CRM canary driver without registry credentials"
+    )
+    build_active = normalized_active_lines(build_step)
+    exact_build_ref = EXACT_IMAGE_BUILD_ACTION.split(" #", 1)[0]
+    if canonical_workflow_step_uses_refs(build_step) != (exact_build_ref,):
+        raise AssertionError("driver build action pin differs")
+    for line in (
+        'DOCKER_BUILD_RECORD_UPLOAD: "false"',
+        "context: ./source",
+        "file: ./source/docker/crm-canary-driver.Dockerfile",
+        "platforms: linux/amd64",
+        "push: false",
+        "load: true",
+        "pull: true",
+        "no-cache: true",
+        'github-token: ""',
+        "tags: ${{ steps.identity.outputs.image_ref }}",
+        "io.rereply.crm-canary.driver-version-sha256=${{ needs.authority.outputs.driver_version_sha256 }}",
+    ):
+        if build_active.count(line) != 1:
+            raise AssertionError(f"driver build step differs: {line}")
+    identity_active = normalized_active_lines(
+        step_block(source, "Create unique non-authority image tag")
+    )
+    if identity_active.count(
+        'tag="control-${CONTROL_SHA:0:12}-driver-${DRIVER_VERSION:0:12}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"'
+    ) != 1:
+        raise AssertionError("driver unique tag formula differs")
+    publish_active = normalized_active_lines(
+        step_block(source, "Recheck live main and publish unique non-authority tag")
+    )
+    for line in (
+        'docker push "$IMAGE_REF" 2>&1 | tee docker-push.txt',
+        'docker buildx imagetools inspect "$DRIVER_IMAGE@$digest" --raw > remote-descriptor.json',
+    ):
+        if publish_active.count(line) != 1:
+            raise AssertionError(f"driver publish binding differs: {line}")
+    live_main_guard = (
+        '[[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" '
+        '--jq \'.object.sha\')" == "$CONTROL_SHA" ]]'
+    )
+    if publish_active.count(live_main_guard) != 1:
+        raise AssertionError("driver pre-publish live-main guard differs")
+    if source_active.count("tag_is_authority: false,") != 2:
+        raise AssertionError("driver tag must remain non-authoritative")
+    scan = job_block(source, "scan")
+    scan_active = normalized_active_lines(scan)
+    scan_active_source = "\n".join(scan_active)
+    for step_name in (
+        "Pull exact digest and verify unit and metadata contracts",
+        "Fail on embedded secrets",
+        "Fail on HIGH or CRITICAL vulnerabilities",
+        "Generate exact SPDX SBOM",
+        "Record exact scan, unit, and metadata evidence",
+    ):
+        step_block(scan, step_name)
+    for required in (
+        "--test canary-driver/driver.test.mjs",
+        ".Config.User == \"pwuser\"",
+        ".Config.WorkingDir == \"/app\"",
+        ".Config.Entrypoint == [\"node\", \"canary-driver/index.mjs\"]",
+        '.Config.Healthcheck.Test == ["CMD", "node", "-e"',
+        "--scanners secret",
+        "--image-config-scanners secret",
+        "--severity HIGH,CRITICAL",
+        "--exit-code 1",
+        "spdx-json=sbom.spdx.json",
+    ):
+        if required not in scan_active_source:
+            raise AssertionError(f"driver verification differs: {required}")
+    for line in (
+        'image_ref="$DRIVER_IMAGE@$digest"',
+        "--test canary-driver/driver.test.mjs | tee unit-test.txt",
+        '.[0].Config.User == "pwuser" and',
+        '.[0].Config.WorkingDir == "/app" and',
+        '.[0].Config.Entrypoint == ["node", "canary-driver/index.mjs"] and',
+        '.[0].Config.Cmd == null and',
+        '(.[0].Config.ExposedPorts | has("8080/tcp")) and',
+        '.[0].Config.Healthcheck.Test == ["CMD", "node", "-e", "fetch(\'http://127.0.0.1:8080/healthz\').then(r=>{if(r.status!==204)process.exit(1)}).catch(()=>process.exit(1))"] and',
+        '.[0].Config.Labels["org.opencontainers.image.revision"] == $control_sha and',
+        '.[0].Config.Labels["org.opencontainers.image.version"] == $driver_version and',
+        '.[0].Config.Labels["io.rereply.crm-canary.control-sha"] == $control_sha and',
+        '.[0].Config.Labels["io.rereply.crm-canary.driver-version-sha256"] == $driver_version',
+        "--scanners secret --image-config-scanners secret --exit-code 1 --format json \\",
+        '--output secret-report.json --timeout 30m "$DRIVER_IMAGE@$digest"',
+        "--scanners vuln --pkg-types os,library --severity HIGH,CRITICAL --exit-code 1 \\",
+        '--format json --output vulnerability-report.json --timeout 30m "$DRIVER_IMAGE@$digest"',
+        'syft scan "docker:$DRIVER_IMAGE@$digest" --output spdx-json=sbom.spdx.json',
+    ):
+        if scan_active.count(line) != 1:
+            raise AssertionError(f"driver active verification line differs: {line}")
+    for forbidden in ("--ignore-unfixed", ".trivyignore", "continue-on-error"):
+        if forbidden in scan:
+            raise AssertionError(f"driver scan weakening found: {forbidden}")
+
+    attest = job_block(source, "attest")
+    if normalized_active_lines(attest).count(
+        "uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4"
+    ) != 3:
+        raise AssertionError("driver must have exactly three pinned attestations")
+    for step_name in (
+        "Create standard GitHub provenance attestation",
+        "Create SPDX SBOM attestation",
+        "Create exact driver source-binding attestation",
+    ):
+        step_block(attest, step_name)
+    predicate_active = normalized_active_lines(
+        step_block(attest, "Build exact driver source-binding predicate")
+    )
+    if predicate_active.count(live_main_guard) != 1:
+        raise AssertionError("driver pre-attestation live-main guard differs")
+
+    verify = job_block(source, "verify")
+    verify_active = normalized_active_lines(verify)
+    verify_active_source = "\n".join(verify_active)
+    for required in (
+        "gh attestation verify",
+        "--predicate-type https://slsa.dev/provenance/v1",
+        '--predicate-type "$SPDX_PREDICATE"',
+        '--predicate-type "$DRIVER_PREDICATE"',
+        "unset GH_TOKEN GITHUB_TOKEN CR_PAT REGISTRY_TOKEN DOCKER_AUTH_CONFIG",
+        "anonymous_docker_config=\"$(mktemp -d)\"",
+        "https://ghcr.io/token?scope=repository:${repository_path}:pull",
+        "https://ghcr.io/v2/${repository_path}/manifests/${digest}",
+        "https://ghcr.io/v2/${repository_path}/blobs/${blob_digest}",
+        '[[ "sha256:$(sha256sum anonymous-manifest.json | awk \'{print $1}\')" == "$digest" ]]',
+    ):
+        if required not in verify_active_source:
+            raise AssertionError(f"driver anonymous/attestation verification differs: {required}")
+    for line in (
+        '--repo "$RELEASE_REPOSITORY"',
+        '--signer-workflow "$signer_workflow"',
+        '--signer-digest "$CONTROL_SHA"',
+        '--source-digest "$CONTROL_SHA"',
+        "--source-ref refs/heads/main",
+        "--deny-self-hosted-runners",
+        "--format json",
+        "unset GH_TOKEN GITHUB_TOKEN CR_PAT REGISTRY_TOKEN DOCKER_AUTH_CONFIG",
+        'anonymous_docker_config="$(mktemp -d)"',
+        '"https://ghcr.io/v2/${repository_path}/manifests/${digest}" \\',
+        '"https://ghcr.io/v2/${repository_path}/blobs/${blob_digest}" \\',
+        '[[ "sha256:$(sha256sum anonymous-manifest.json | awk \'{print $1}\')" == "$digest" ]]',
+    ):
+        if verify_active.count(line) != 1:
+            raise AssertionError(f"driver active anonymous-pull line differs: {line}")
+    if "docker/login-action" in verify_active_source or "packages: read" in verify_active_source:
+        raise AssertionError("driver anonymous verification must not receive registry auth")
+    attestation_verify_active = normalized_active_lines(
+        step_block(verify, "Cryptographically verify all three exact attestations")
+    )
+    if attestation_verify_active.count(live_main_guard) != 1:
+        raise AssertionError("driver attestation verification live-main guard differs")
+
+    expected_upload_names = (
+        "image-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}",
+        "scanned-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}",
+        "attested-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}",
+        "verified-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}",
+    )
+    upload_blocks = tuple(
+        block for block in workflow_step_blocks(source) if is_artifact_upload_step(block)
+    )
+    for block in upload_blocks:
+        assert_unconditional_artifact_upload(block)
+    upload_names = tuple(
+        re.search(r"(?m)^          name: ([^\r\n]+)$", block).group(1)
+        for block in upload_blocks
+    )
+    if artifact_upload_use_count(source) != 4 or upload_names != expected_upload_names:
+        raise AssertionError("driver artifact producer inventory differs")
+
+    gate = step_block(source, "Require stable exact four-artifact driver authority")
+    gate_active = normalized_active_lines(gate)
+    if gate_active.count(live_main_guard) != 2:
+        raise AssertionError("driver final-gate live-main guards differ")
+    for line in (
+        ".total_count >= 0 and .total_count <= 4 and",
+        "(.artifacts | length) <= 4 and",
+        ".total_count == 4 and",
+        "(.artifacts | length) == 4 and",
+        '(.name | endswith(".dockerbuild") | not) and',
+        '.size_in_bytes > 0 and .size_in_bytes <= 67108864 and',
+        '(.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$")) and',
+        'artifacts_json="$(gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"',
+        'require_exact_artifact_inventory "$final_artifacts_json"',
+        '[[ "$first_inventory" == "$final_inventory" ]]',
+    ):
+        if gate_active.count(line) != 1:
+            raise AssertionError(f"driver stable artifact gate differs: {line}")
+    ordered_gate_lines = (
+        'artifacts_json="$(gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"',
+        'require_exact_artifact_inventory "$artifacts_json"',
+        'first_inventory="$(canonical_artifact_inventory "$artifacts_json")"',
+        "sleep 2",
+        'final_artifacts_json="$(gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"',
+        'require_exact_artifact_inventory "$final_artifacts_json"',
+        'final_inventory="$(canonical_artifact_inventory "$final_artifacts_json")"',
+        '[[ "$first_inventory" == "$final_inventory" ]]',
+    )
+    positions: list[int] = []
+    for line in ordered_gate_lines:
+        if gate_active.count(line) != 1:
+            raise AssertionError(f"driver artifact double-read line differs: {line}")
+        positions.append(gate_active.index(line))
+    if positions != sorted(positions) or len(set(positions)) != len(positions):
+        raise AssertionError("driver artifact double-read order differs")
+    if sum(line.startswith("artifacts_json=") for line in gate_active) != 1:
+        raise AssertionError("driver first artifact inventory assignment differs")
+    if sum(line.startswith("final_artifacts_json=") for line in gate_active) != 1:
+        raise AssertionError("driver final artifact inventory assignment differs")
+    gate_active_source = "\n".join(gate_active)
+    for forbidden in (
+        "map(select(",
+        ".artifacts[] | select(",
+        "del(.artifacts",
+        "delete-artifact",
+        "--method DELETE",
+    ):
+        if forbidden in gate_active_source:
+            raise AssertionError(f"driver artifact inventory filtering found: {forbidden}")
+
+
 class WorkflowAuthorityPolicyTests(unittest.TestCase):
     def test_every_active_release_control_is_manual_exact_main_and_serialized(self) -> None:
         for name in ACTIVE_PRODUCTION_CONTROLS:
@@ -1312,12 +1745,302 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
                 self.assertRegex(source, r"(?m)^  cancel-in-progress: false\s*$")
 
     def test_every_external_action_is_pinned_to_a_full_commit(self) -> None:
-        for name in ACTIVE_PRODUCTION_CONTROLS:
+        for name in ACTIVE_PRODUCTION_CONTROLS + AUXILIARY_PRODUCTION_CONTROLS:
             with self.subTest(workflow=name):
                 for line in workflow(name).splitlines():
                     match = re.match(r"\s*-?\s*uses:\s*(\S.*)$", line)
                     if match is not None and "/" in match.group(1) and "@" in match.group(1):
                         self.assertRegex(match.group(1), PINNED_ACTION)
+
+    def test_crm_canary_driver_publisher_is_digest_only_and_independent(self) -> None:
+        source = workflow("publish-attest-production-crm-canary-driver.yml")
+        assert_crm_canary_driver_publisher(source)
+        runbook = (ROOT / "docs" / "crm-production-release-control.md").read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "### Independent CRM canary driver image",
+            "successful attempt-1 push `Test` run ID",
+            "Tags are unique diagnostic labels and never deployment authority.",
+            "two identical complete reads of exactly four current-run",
+            "does not modify or participate in `Build and Attest Exact",
+            "The driver digest is not a fourth component of the product",
+            "does not deploy the driver, provision its ledger",
+        ):
+            self.assertIn(required, runbook)
+
+        def without_step_strict_mode(step_name: str) -> str:
+            original = step_block(source, step_name)
+            mutated = original.replace(
+                "        run: |\n          set -euo pipefail\n",
+                "        run: |\n",
+                1,
+            )
+            self.assertNotEqual(mutated, original)
+            return source.replace(original, mutated, 1)
+
+        def without_step_line(step_name: str, line: str) -> str:
+            original = step_block(source, step_name)
+            mutated = original.replace(f"          {line}\n", "", 1)
+            self.assertNotEqual(mutated, original)
+            return source.replace(original, mutated, 1)
+
+        mutations = {
+            "unexpected-push-trigger": source.replace(
+                "  workflow_dispatch:\n", "  workflow_dispatch:\n  push:\n", 1
+            ),
+            "callable-trigger-added": source.replace(
+                "  workflow_dispatch:\n",
+                "  workflow_call:\n"
+                "    inputs:\n"
+                "      test_run_id:\n"
+                "        required: true\n"
+                "        type: string\n"
+                "  workflow_dispatch:\n",
+                1,
+            ),
+            "input-renamed": source.replace("test_run_id:", "test_run:", 1),
+            "production-concurrency": source.replace(
+                "group: rereply-crm-canary-driver-publication",
+                "group: rereply-production",
+                1,
+            ),
+            "protected-ref-bypass": source.replace(
+                '[[ "$REF_PROTECTED" == "true" ]]', "true", 1
+            ),
+            "protected-ref-comment-decoy": source.replace(
+                '          [[ "$REF_PROTECTED" == "true" ]]',
+                '          # [[ "$REF_PROTECTED" == "true" ]]\n'
+                "          true",
+                1,
+            ),
+            "protected-ref-inline-decoy": source.replace(
+                '          [[ "$REF_PROTECTED" == "true" ]]',
+                '          true # [[ "$REF_PROTECTED" == "true" ]]',
+                1,
+            ),
+            "test-event-weakened": source.replace(
+                '.event == "push"', '.event == "workflow_dispatch"', 1
+            ),
+            "test-event-comment-decoy": source.replace(
+                '                .event == "push" and',
+                '                # .event == "push" and\n'
+                '                .event == "workflow_dispatch" and',
+                1,
+            ),
+            "test-event-inline-decoy": source.replace(
+                '                .event == "push" and',
+                '                .event == "workflow_dispatch" and # .event == "push"',
+                1,
+            ),
+            "test-security-step-renamed": source.replace(
+                '.name == "Test CRM canary driver protocol"',
+                '.name == "Test some driver protocol"',
+                1,
+            ),
+            "driver-lockfile-omitted": source.replace(
+                "                frontend/package-lock.json\n", "", 1
+            ),
+            "driver-lockfile-dual-omission-decoys": source.replace(
+                "                frontend/package-lock.json\n",
+                "                : # frontend/package-lock.json\n",
+                1,
+            ).replace(
+                "          printf '%s\\n' docker/crm-canary-driver.Dockerfile frontend/package.json frontend/package-lock.json\n",
+                "          printf '%s\\n' docker/crm-canary-driver.Dockerfile frontend/package.json\n"
+                "          : # frontend/package-lock.json\n",
+                1,
+            ),
+            "build-record-upload-enabled": source.replace(
+                'DOCKER_BUILD_RECORD_UPLOAD: "false"',
+                'DOCKER_BUILD_RECORD_UPLOAD: "true"',
+                1,
+            ),
+            "quoted-action-key": source.replace(
+                "        uses: actions/checkout@",
+                '        "uses": actions/checkout@',
+                1,
+            ),
+            "build-context-retargeted": source.replace(
+                "file: ./source/docker/crm-canary-driver.Dockerfile",
+                "file: ./source/docker/Dockerfile",
+                1,
+            ),
+            "mutable-shared-tag": source.replace(
+                '          tag="control-${CONTROL_SHA:0:12}-driver-${DRIVER_VERSION:0:12}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+                '          tag="latest"',
+                1,
+            ),
+            "published-tag-retargeted": source.replace(
+                '          docker push "$IMAGE_REF" 2>&1 | tee docker-push.txt',
+                '          docker push "$DRIVER_IMAGE:latest" 2>&1 | tee docker-push.txt',
+                1,
+            ),
+            "pre-publish-live-main-recheck-removed": without_step_line(
+                "Recheck live main and publish unique non-authority tag",
+                '[[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq \'.object.sha\')" == "$CONTROL_SHA" ]]',
+            ),
+            "build-label-removed": source.replace(
+                "            io.rereply.crm-canary.driver-version-sha256=${{ needs.authority.outputs.driver_version_sha256 }}\n",
+                "",
+                1,
+            ),
+            "tag-authority-enabled": source.replace(
+                "tag_is_authority: false", "tag_is_authority: true"
+            ),
+            "unit-test-disabled": source.replace(
+                "--test canary-driver/driver.test.mjs", "--version", 1
+            ),
+            "pull-inspect-tag-target": source.replace(
+                '          image_ref="$DRIVER_IMAGE@$digest"',
+                '          image_ref="$DRIVER_IMAGE:latest"',
+                1,
+            ),
+            "metadata-user-inline-decoy": source.replace(
+                '              .[0].Config.User == "pwuser" and',
+                '              true and # .[0].Config.User == "pwuser"',
+                1,
+            ),
+            "secret-scan-disabled": source.replace(
+                "--scanners secret", "--scanners vuln", 1
+            ),
+            "secret-scan-tag-target": source.replace(
+                '            --output secret-report.json --timeout 30m "$DRIVER_IMAGE@$digest"',
+                '            --output secret-report.json --timeout 30m "$DRIVER_IMAGE:latest"',
+                1,
+            ),
+            "vulnerability-severity-weakened": source.replace(
+                "--severity HIGH,CRITICAL", "--severity CRITICAL", 1
+            ),
+            "vulnerability-scan-tag-target": source.replace(
+                '            --format json --output vulnerability-report.json --timeout 30m "$DRIVER_IMAGE@$digest"',
+                '            --format json --output vulnerability-report.json --timeout 30m "$DRIVER_IMAGE:latest"',
+                1,
+            ),
+            "vulnerability-severity-comment-decoy": source.replace(
+                "            --scanners vuln --pkg-types os,library --severity HIGH,CRITICAL --exit-code 1 \\\n",
+                "            # --scanners vuln --pkg-types os,library --severity HIGH,CRITICAL --exit-code 1\n"
+                "            --scanners vuln --pkg-types os,library --severity CRITICAL --exit-code 1 \\\n",
+                1,
+            ),
+            "vulnerability-severity-inline-decoy": source.replace(
+                "            --scanners vuln --pkg-types os,library --severity HIGH,CRITICAL --exit-code 1 \\\n"
+                "            --format json --output vulnerability-report.json --timeout 30m \"$DRIVER_IMAGE@$digest\"",
+                "            --scanners vuln --pkg-types os,library --severity CRITICAL --exit-code 1 \\\n"
+                "            --format json --output vulnerability-report.json --timeout 30m \"$DRIVER_IMAGE@$digest\"\n"
+                "          : # --severity HIGH,CRITICAL",
+                1,
+            ),
+            "attestation-removed": source.replace(
+                "        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4\n",
+                "        run: true\n",
+                1,
+            ),
+            "attestation-comment-decoy": source.replace(
+                "        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4\n",
+                "        # uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4\n"
+                "        run: true\n",
+                1,
+            ),
+            "anonymous-credential-clearing-removed": source.replace(
+                "          unset GH_TOKEN GITHUB_TOKEN CR_PAT REGISTRY_TOKEN DOCKER_AUTH_CONFIG\n",
+                "",
+                1,
+            ),
+            "attestation-signer-workflow-unbound": source.replace(
+                '            --signer-workflow "$signer_workflow"\n', "", 1
+            ),
+            "attestation-signer-digest-unbound": source.replace(
+                '            --signer-digest "$CONTROL_SHA"\n', "", 1
+            ),
+            "attestation-self-hosted-allowed": source.replace(
+                "            --deny-self-hosted-runners\n", "", 1
+            ),
+            "anonymous-blob-pull-removed": source.replace(
+                '              "https://ghcr.io/v2/${repository_path}/blobs/${blob_digest}" \\\n',
+                '              "https://example.invalid/${blob_digest}" \\\n',
+                1,
+            ),
+            "attestation-verification-tolerated": source.replace(
+                "      - name: Cryptographically verify all three exact attestations\n",
+                "      - name: Cryptographically verify all three exact attestations\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "attestation-verification-not-strict": without_step_strict_mode(
+                "Cryptographically verify all three exact attestations"
+            ),
+            "anonymous-verification-tolerated": source.replace(
+                "      - name: Require credential-free anonymous exact-digest pull\n",
+                "      - name: Require credential-free anonymous exact-digest pull\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "anonymous-verification-not-strict": without_step_strict_mode(
+                "Require credential-free anonymous exact-digest pull"
+            ),
+            "anonymous-blob-comment-decoy": source.replace(
+                '              "https://ghcr.io/v2/${repository_path}/blobs/${blob_digest}" \\\n',
+                '              # "https://ghcr.io/v2/${repository_path}/blobs/${blob_digest}" \\\n'
+                '              "https://example.invalid/${blob_digest}" \\\n',
+                1,
+            ),
+            "anonymous-blob-inline-decoy": source.replace(
+                '              "https://ghcr.io/v2/${repository_path}/blobs/${blob_digest}" \\\n'
+                '              --output "$blob_file"',
+                '              "https://example.invalid/${blob_digest}" \\\n'
+                '              --output "$blob_file"\n'
+                '            : # https://ghcr.io/v2/${repository_path}/blobs/${blob_digest}',
+                1,
+            ),
+            "artifact-upper-bound-weakened": source.replace(
+                ".total_count >= 0 and .total_count <= 4 and",
+                ".total_count >= 0 and .total_count <= 5 and",
+                1,
+            ),
+            "artifact-extras-filtered": source.replace(
+                '            artifacts_json="$(gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"',
+                '            artifacts_json="$(gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"\n'
+                '            artifacts_json="$(jq \'del(.artifacts[4:]) | .total_count = (.artifacts | length)\' <<< "$artifacts_json")"',
+                1,
+            ),
+            "artifact-upload-tolerated": source.replace(
+                "      - name: Upload immutable driver image identity\n",
+                "      - name: Upload immutable driver image identity\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+            "final-artifact-read-unchecked": source.replace(
+                '          require_exact_artifact_inventory "$final_artifacts_json"',
+                "          true",
+                1,
+            ),
+            "final-artifact-fetch-reused-inline-decoy": source.replace(
+                '          final_artifacts_json="$(gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"',
+                '          final_artifacts_json="$artifacts_json" # gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100"',
+                1,
+            ),
+            "stable-artifact-delay-inline-decoy": source.replace(
+                "          sleep 2", "          true # sleep 2", 1
+            ),
+            "stable-artifact-equality-removed": source.replace(
+                '          [[ "$first_inventory" == "$final_inventory" ]]',
+                "          true",
+                1,
+            ),
+            "deployment-environment-added": source.replace(
+                "  build:\n    name: Build and publish exact CRM canary driver\n",
+                "  build:\n    name: Build and publish exact CRM canary driver\n"
+                "    environment: production\n",
+                1,
+            ),
+        }
+        self.assertEqual(len(mutations), len(set(mutations.values())))
+        for label, mutant in mutations.items():
+            self.assertNotEqual(mutant, source)
+            with self.subTest(label=label):
+                with self.assertRaises(AssertionError):
+                    assert_crm_canary_driver_publisher(mutant)
 
     def test_every_artifact_id_download_flattens_the_exact_selection(self) -> None:
         expected_counts = {

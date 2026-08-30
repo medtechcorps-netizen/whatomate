@@ -98,6 +98,47 @@ stable exact-14 evidence is consumable by the four-phase aggregator. No
 production plan or apply is allowed until all three anonymous exact-digest pulls
 and the stable exact artifact inventory pass.
 
+### Independent CRM canary driver image
+
+Before provisioning the synthetic CRM canary runtime, dispatch `Publish and
+Attest Production CRM Canary Driver` once from protected `main`. Its sole input
+is the successful attempt-1 push `Test` run ID for that exact control SHA. The
+workflow re-verifies the protected ref, live `main`, the Test workflow identity,
+and the successful CRM driver protocol/build/Trivy steps before publication.
+
+The driver version is the SHA-256 of a canonical manifest containing Git mode,
+blob ID, file SHA-256, and path for exactly
+`docker/crm-canary-driver.Dockerfile`, `frontend/package.json`,
+`frontend/package-lock.json`, and all regular blobs below
+`frontend/canary-driver/`. Record this driver-version hash beside the immutable
+image digest. Tags are unique diagnostic labels and never deployment authority.
+
+The publisher builds only `linux/amd64`, disables Docker build-record artifact
+upload, rechecks live `main` immediately before pushing, scans the exact digest
+for embedded secrets and unsuppressed HIGH/CRITICAL OS or library
+vulnerabilities, generates an SPDX SBOM, reruns the driver unit suite, and
+verifies the runtime metadata contract. It creates GitHub provenance, SPDX, and
+exact driver source-binding attestations, verifies all three, then anonymously
+pulls the manifest and every blob with an empty credential directory. Its final
+gate requires two identical complete reads of exactly four current-run
+artifacts: image, scanned, attested, and verified evidence. Extra, duplicate,
+expired, malformed, oversized, wrong-run, or `.dockerbuild` artifacts fail
+closed.
+
+This is a separate support-image authority. It uses its own non-cancelling
+concurrency group and does not modify or participate in `Build and Attest Exact
+Release Images`, its exact 14-artifact contract, or `Assemble and Attest Exact
+Four-Phase Rollout`. The driver digest is not a fourth component of the product
+release set. The workflow has no deployment environment, provider credential,
+runtime secret, or deployment permission.
+
+The GHCR namespace must be public before a run can pass its credential-free
+gate. If first publication creates a private package, treat that run as
+non-authoritative bootstrap evidence, obtain separate explicit package-
+visibility authorization, verify anonymous access, and issue a fresh dispatch
+rather than rerunning the failed run. Public package visibility is effectively
+irreversible.
+
 ### 3. Four-phase rollout capsule
 
 Dispatch `Assemble and Attest Exact Four-Phase Rollout` with all four phases in
@@ -607,9 +648,10 @@ the TLS `sslmode` value `require`, `verify-ca`, or `verify-full`. Every other
 query key or connection-setting override is rejected.
 `CRM_CANARY_DRIVER_VERSION_SHA256`
 is a non-secret,
-operator-provisioned version label echoed against the verifier configuration;
-the current driver does not derive it from its own source bytes or deployed
-image. It is not image-attestation or digest authority. None of the driver-side
+operator-provisioned version label copied from the successful publisher's exact
+build-input manifest hash and echoed against the verifier configuration. The
+runtime does not derive it from its own source bytes or deployed image, and the
+label alone is not image-attestation or digest authority. None of the driver-side
 fixture, login, webhook-signing, or ledger values may be copied into repository
 or organization secrets, the GitHub canary environment, logs, artifacts, or
 attestations. The shared HMAC key is the sole credential present on both sides
@@ -636,19 +678,18 @@ driver-request wall-clock deadline and 300-second signed
 freshness window. A driver deadline, runner loss, or concurrent replay cannot
 produce a successful signed result.
 
-This repository contains the verifier/client contract and the dedicated driver
-code plus `docker/crm-canary-driver.Dockerfile`; protected Test CI builds that
-exact Dockerfile and fails on unsuppressed HIGH or CRITICAL OS/library
-vulnerabilities from the pinned Trivy vulnerability scanner. It does not deploy
-the driver, provision its ledger or fixtures, or install any runtime secret.
-The `ui` phase is therefore **NO-GO** until a separate review
-publishes and deploys the reviewed image by immutable digest, designates only
-synthetic Klinik, non-Klinik, cross-organization, and native-Chat fixtures,
-defines and reviews the version-label derivation and records it beside that
-immutable digest, provisions the dedicated runtime secret store and ledger, and
-installs the protected GitHub canary configuration under separate explicit
-authorization. Customer accounts, conversations, or messages must never be
-used as fixtures.
+This repository contains the verifier/client contract, the dedicated driver
+code, `docker/crm-canary-driver.Dockerfile`, and the independent publication
+workflow described above. Protected Test CI and that publisher both fail on
+unsuppressed HIGH or CRITICAL OS/library vulnerabilities. Publication still
+does not deploy the driver, provision its ledger or fixtures, or install any
+runtime secret. The `ui` phase is therefore **NO-GO** until a separate review
+deploys the reviewed image by immutable digest, designates only synthetic
+Klinik, non-Klinik, cross-organization, and native-Chat fixtures, records the
+published driver-version hash beside that digest, provisions the dedicated
+runtime secret store and ledger, and installs the protected GitHub canary
+configuration under separate explicit authorization. Customer accounts,
+conversations, or messages must never be used as fixtures.
 
 For `baseline`, `bridge`, and `backend`, CRM synthetic sending is not run; the
 canary still requires exact receipt lineage, image digests, migration success,
