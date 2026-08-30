@@ -362,7 +362,10 @@ describe('ChannelsView messaging behavior', () => {
     await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
 
-    expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
+      expect(view.text()).toContain('Hello from Omnichannel')
+    }, { timeout: 2_000 })
     expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledWith(
       'conversation-1',
       {
@@ -389,8 +392,15 @@ describe('ChannelsView messaging behavior', () => {
     await composer.setValue('Retry this exact draft')
     await send.trigger('click')
     await flushPromises()
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
+      expect(send.attributes('disabled')).toBeUndefined()
+    }, { timeout: 2_000 })
     await send.trigger('click')
     await flushPromises()
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
+    }, { timeout: 2_000 })
 
     expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
     expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
@@ -405,6 +415,9 @@ describe('ChannelsView messaging behavior', () => {
     await composer.setValue('Retry this exact draft')
     await send.trigger('click')
     await flushPromises()
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(3)
+    }, { timeout: 2_000 })
     expect(mocks.sendLegacyWhatsAppReply.mock.calls[2]?.[1]?.idempotency_key).toBe(
       '00000000-0000-4000-8000-000000000012',
     )
@@ -492,7 +505,10 @@ describe('ChannelsView messaging behavior', () => {
       .setValue('Settled while switching')
     await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
-    expect(storedLegacyReplyAttempts()).toHaveLength(1)
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
+      expect(storedLegacyReplyAttempts()).toHaveLength(1)
+    }, { timeout: 2_000 })
 
     const secondConversationButton = view
       .findAll('button')
@@ -524,11 +540,14 @@ describe('ChannelsView messaging behavior', () => {
     mocks.sendLegacyWhatsAppReply.mockRejectedValueOnce(new Error('network timeout'))
     const firstView = await mountAndSelectConversation()
     const body = 'Private patient follow-up details'
-    await firstView.get('[data-testid="omnichannel-reply-composer"]').setValue(body)
-    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+    const firstComposer = firstView.get('[data-testid="omnichannel-reply-composer"]')
+    const firstSend = firstView.get('[data-testid="omnichannel-send-reply"]')
+    await firstComposer.setValue(body)
+    await firstSend.trigger('click')
     await vi.waitFor(() => {
       expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
       expect(storedLegacyReplyAttempts()).toHaveLength(1)
+      expect(firstSend.attributes('disabled')).toBeUndefined()
     }, { timeout: 2_000 })
 
     const firstKey = mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key
@@ -573,11 +592,16 @@ describe('ChannelsView messaging behavior', () => {
     })
     const view = await mountAndSelectConversation()
     const composer = view.get('[data-testid="omnichannel-reply-composer"]')
+    const send = view.get('[data-testid="omnichannel-send-reply"]')
     await composer.setValue('Keep this attempt')
-    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+    await send.trigger('click')
     await flushPromises()
 
-    expect(storedLegacyReplyAttempts()).toHaveLength(1)
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
+      expect(storedLegacyReplyAttempts()).toHaveLength(1)
+      expect(send.attributes('disabled')).toBeUndefined()
+    }, { timeout: 2_000 })
     expect((composer.element as HTMLTextAreaElement).value).toBe('Keep this attempt')
   })
 
@@ -652,8 +676,13 @@ describe('ChannelsView messaging behavior', () => {
     mocks.sendLegacyWhatsAppReply.mockRejectedValueOnce(new Error('network timeout'))
     const firstView = await mountAndSelectConversation()
     await firstView.get('[data-testid="omnichannel-reply-composer"]').setValue('Scoped draft')
-    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+    const firstSend = firstView.get('[data-testid="omnichannel-send-reply"]')
+    await firstSend.trigger('click')
     await flushPromises()
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
+      expect(firstSend.attributes('disabled')).toBeUndefined()
+    }, { timeout: 2_000 })
 
     firstView.unmount()
     wrapper = null
@@ -661,8 +690,12 @@ describe('ChannelsView messaging behavior', () => {
     setInbox()
     const remounted = await mountAndSelectConversation()
     await remounted.get('[data-testid="omnichannel-reply-composer"]').setValue('Scoped draft')
-    await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+    const secondSend = remounted.get('[data-testid="omnichannel-send-reply"]')
+    await secondSend.trigger('click')
     await flushPromises()
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
+    }, { timeout: 2_000 })
 
     expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
       '00000000-0000-4000-8000-000000000051',
