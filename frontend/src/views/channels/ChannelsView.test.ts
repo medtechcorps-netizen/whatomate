@@ -435,14 +435,19 @@ describe('ChannelsView messaging behavior', () => {
 
       await composer.setValue('Already acknowledged')
       await send.trigger('click')
-      await flushPromises()
+      await vi.waitFor(() => {
+        expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
+        expect((composer.element as HTMLTextAreaElement).value).toBe('')
+      }, { timeout: 2_000 })
 
       expect(storedLegacyReplyAttempts()).toHaveLength(0)
-      expect((composer.element as HTMLTextAreaElement).value).toBe('')
 
       await composer.setValue('Already acknowledged')
       await send.trigger('click')
-      await flushPromises()
+      await vi.waitFor(() => {
+        expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
+        expect((composer.element as HTMLTextAreaElement).value).toBe('')
+      }, { timeout: 2_000 })
 
       expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
         '00000000-0000-4000-8000-000000000031',
@@ -521,7 +526,10 @@ describe('ChannelsView messaging behavior', () => {
     const body = 'Private patient follow-up details'
     await firstView.get('[data-testid="omnichannel-reply-composer"]').setValue(body)
     await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
-    await flushPromises()
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
+      expect(storedLegacyReplyAttempts()).toHaveLength(1)
+    }, { timeout: 2_000 })
 
     const firstKey = mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key
     const stored = storedLegacyReplyAttempts()
@@ -541,10 +549,12 @@ describe('ChannelsView messaging behavior', () => {
     const remounted = await mountAndSelectConversation()
     await remounted.get('[data-testid="omnichannel-reply-composer"]').setValue(body)
     await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
-    await flushPromises()
+    await vi.waitFor(() => {
+      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
+      expect(storedLegacyReplyAttempts()).toHaveLength(0)
+    }, { timeout: 2_000 })
 
     expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(firstKey)
-    expect(storedLegacyReplyAttempts()).toHaveLength(0)
   })
 
   it.each(['pending', 'failed'])('retains the attempt after a non-sent %s response', async status => {
