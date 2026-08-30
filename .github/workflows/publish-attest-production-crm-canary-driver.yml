@@ -483,6 +483,7 @@ jobs:
         env:
           CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
           DRIVER_VERSION: ${{ needs.authority.outputs.driver_version_sha256 }}
+          EXPECTED_HEALTHCHECK_JS: "fetch('http://127.0.0.1:8080/healthz').then(r=>{if(r.status!==204)process.exit(1)}).catch(()=>process.exit(1))"
         run: |
           set -euo pipefail
           digest="$(jq -er '.digest' evidence/image.json)"
@@ -493,6 +494,7 @@ jobs:
             --arg control_sha "$CONTROL_SHA" \
             --arg digest "$digest" \
             --arg driver_version "$DRIVER_VERSION" \
+            --arg healthcheck_js "$EXPECTED_HEALTHCHECK_JS" \
             --arg image "$DRIVER_IMAGE" '
               length == 1 and
               .[0].Os == "linux" and .[0].Architecture == "amd64" and
@@ -502,7 +504,7 @@ jobs:
               .[0].Config.Entrypoint == ["node", "canary-driver/index.mjs"] and
               .[0].Config.Cmd == null and
               (.[0].Config.ExposedPorts | has("8080/tcp")) and
-              .[0].Config.Healthcheck.Test == ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>{if(r.status!==204)process.exit(1)}).catch(()=>process.exit(1))"] and
+              .[0].Config.Healthcheck.Test == ["CMD", "node", "-e", $healthcheck_js] and
               .[0].Config.Labels["org.opencontainers.image.source"] == "https://github.com/medtechcorps-netizen/whatomate" and
               .[0].Config.Labels["org.opencontainers.image.revision"] == $control_sha and
               .[0].Config.Labels["org.opencontainers.image.version"] == $driver_version and

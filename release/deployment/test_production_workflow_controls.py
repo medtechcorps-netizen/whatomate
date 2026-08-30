@@ -57,7 +57,7 @@ EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
     "8c0b7eccb22a5cc0f64ec40f58203da01455bb8f847cbc7aaf979a2f777812ff"
 )
 EXACT_CRM_CANARY_DRIVER_PUBLISHER_SHA256 = (
-    "7104dd5117ec7d79b169603f5a0026e8a172da278f8491d976cd892b11570d93"
+    "97fb1ee75c363914dcf7ba5baa25c51ea7e6ba0090151e26b305d9eed79c8357"
 )
 EXACT_IMAGE_GATE_STEP_SHA256 = (
     "1b4bf101f1756d43193ccc0050cf44bb9dd22df25302e084c9a9a91ede2db4a5"
@@ -1567,7 +1567,8 @@ def assert_crm_canary_driver_publisher(source: str) -> None:
         ".Config.User == \"pwuser\"",
         ".Config.WorkingDir == \"/app\"",
         ".Config.Entrypoint == [\"node\", \"canary-driver/index.mjs\"]",
-        '.Config.Healthcheck.Test == ["CMD", "node", "-e"',
+        '--arg healthcheck_js "$EXPECTED_HEALTHCHECK_JS"',
+        '.[0].Config.Healthcheck.Test == ["CMD", "node", "-e", $healthcheck_js]',
         "--scanners secret",
         "--image-config-scanners secret",
         "--severity HIGH,CRITICAL",
@@ -1584,7 +1585,9 @@ def assert_crm_canary_driver_publisher(source: str) -> None:
         '.[0].Config.Entrypoint == ["node", "canary-driver/index.mjs"] and',
         '.[0].Config.Cmd == null and',
         '(.[0].Config.ExposedPorts | has("8080/tcp")) and',
-        '.[0].Config.Healthcheck.Test == ["CMD", "node", "-e", "fetch(\'http://127.0.0.1:8080/healthz\').then(r=>{if(r.status!==204)process.exit(1)}).catch(()=>process.exit(1))"] and',
+        'EXPECTED_HEALTHCHECK_JS: "fetch(\'http://127.0.0.1:8080/healthz\').then(r=>{if(r.status!==204)process.exit(1)}).catch(()=>process.exit(1))"',
+        '--arg healthcheck_js "$EXPECTED_HEALTHCHECK_JS" \\',
+        '.[0].Config.Healthcheck.Test == ["CMD", "node", "-e", $healthcheck_js] and',
         '.[0].Config.Labels["org.opencontainers.image.revision"] == $control_sha and',
         '.[0].Config.Labels["org.opencontainers.image.version"] == $driver_version and',
         '.[0].Config.Labels["io.rereply.crm-canary.control-sha"] == $control_sha and',
@@ -1899,6 +1902,15 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
             "metadata-user-inline-decoy": source.replace(
                 '              .[0].Config.User == "pwuser" and',
                 '              true and # .[0].Config.User == "pwuser"',
+                1,
+            ),
+            "healthcheck-shell-quote-regression": source.replace(
+                '            --arg healthcheck_js "$EXPECTED_HEALTHCHECK_JS" \\\n',
+                "",
+                1,
+            ).replace(
+                '              .[0].Config.Healthcheck.Test == ["CMD", "node", "-e", $healthcheck_js] and',
+                '              .[0].Config.Healthcheck.Test == ["CMD", "node", "-e", "fetch(\'http://127.0.0.1:8080/healthz\').then(r=>{if(r.status!==204)process.exit(1)}).catch(()=>process.exit(1))"] and',
                 1,
             ),
             "secret-scan-disabled": source.replace(
