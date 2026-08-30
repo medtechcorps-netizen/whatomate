@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import apply_production_change as apply
 import verify_production_release as common
+import verify_production_plan as planner
 
 
 APP_ID = "11111111-1111-4111-8111-111111111111"
@@ -44,6 +45,55 @@ def digest_spec(character: str = "1") -> dict[str, object]:
         "domains": [{"domain": "example.invalid", "type": "PRIMARY"}],
         "databases": [],
     }
+
+
+def environment_spec() -> dict[str, object]:
+    spec = digest_spec()
+    spec["envs"] = [
+        {"key": "Z_APP", "value": "", "type": "GENERAL"},
+        {
+            "key": "A_APP",
+            "value": "app-secret",
+            "type": "SECRET",
+            "scope": "RUN_TIME",
+        },
+    ]
+    for index, service in enumerate(spec["services"]):
+        service["envs"] = [
+            {
+                "key": f"SERVICE_{index}",
+                "value": f"service-value-{index}",
+                "scope": "RUN_TIME",
+            }
+        ]
+    spec["jobs"][0]["envs"] = [
+        {"key": "JOB_SECRET", "value": "job-secret", "type": "SECRET"}
+    ]
+    spec["workers"] = [
+        {
+            "name": "wørker-a",
+            "envs": [{"key": "WORKER_值", "value": "välue"}],
+        }
+    ]
+    spec["static_sites"] = [
+        {
+            "name": "static-a",
+            "envs": [
+                {
+                    "key": "STATIC_SECRET",
+                    "value": "static-secret",
+                    "type": "SECRET",
+                }
+            ],
+        }
+    ]
+    spec["functions"] = [
+        {
+            "name": "function-a",
+            "envs": [{"key": "FUNCTION_VALUE", "value": "function-value"}],
+        }
+    ]
+    return spec
 
 
 def legacy_spec() -> dict[str, object]:
@@ -536,6 +586,226 @@ class ApplyControllerTests(unittest.TestCase):
         self.assertEqual(common.environment_value_fingerprint(before), common.environment_value_fingerprint(desired))
         self.assertEqual(common.extract_image_digests(desired)["web"], digest("1"))
         self.assertEqual(common.extract_image_digests(desired)["meta-relay"], digest("2"))
+
+    def test_environment_fingerprint_matches_planner_inventory_and_apply_snapshot(
+        self,
+    ) -> None:
+        spec = environment_spec()
+        expected_records = [
+            [
+                "app",
+                "app",
+                "Z_APP",
+                "RUN_TIME",
+                "GENERAL",
+                common.sha256_bytes(b""),
+            ],
+            [
+                "app",
+                "app",
+                "A_APP",
+                "RUN_TIME",
+                "SECRET",
+                common.sha256_bytes(b"app-secret"),
+            ],
+            [
+                "services",
+                "omnitech-web",
+                "SERVICE_0",
+                "RUN_TIME",
+                "GENERAL",
+                common.sha256_bytes(b"service-value-0"),
+            ],
+            [
+                "services",
+                "meta-relay",
+                "SERVICE_1",
+                "RUN_TIME",
+                "GENERAL",
+                common.sha256_bytes(b"service-value-1"),
+            ],
+            [
+                "services",
+                "gmail-relay",
+                "SERVICE_2",
+                "RUN_TIME",
+                "GENERAL",
+                common.sha256_bytes(b"service-value-2"),
+            ],
+            [
+                "jobs",
+                "rereply-rls-migrate",
+                "JOB_SECRET",
+                "RUN_TIME",
+                "SECRET",
+                common.sha256_bytes(b"job-secret"),
+            ],
+            [
+                "workers",
+                "wørker-a",
+                "WORKER_值",
+                "RUN_TIME",
+                "GENERAL",
+                common.sha256_bytes("välue".encode("utf-8")),
+            ],
+            [
+                "static_sites",
+                "static-a",
+                "STATIC_SECRET",
+                "RUN_TIME",
+                "SECRET",
+                common.sha256_bytes(b"static-secret"),
+            ],
+            [
+                "functions",
+                "function-a",
+                "FUNCTION_VALUE",
+                "RUN_TIME",
+                "GENERAL",
+                common.sha256_bytes(b"function-value"),
+            ],
+        ]
+        expected_hash = planner.sha256_value(sorted(expected_records))
+        self.assertEqual(
+            planner.environment_value_inventory(spec), (expected_hash, 9, 3)
+        )
+        self.assertEqual(common.environment_value_fingerprint(spec), expected_hash)
+
+        snapshot, _live_spec, _deployment = apply.provider_snapshot(
+            app_response(spec, OLD_DEPLOYMENT),
+            deployment_response(spec, OLD_DEPLOYMENT),
+            APP_ID,
+        )
+        self.assertEqual(snapshot["environment_values_sha256"], expected_hash)
+
+    def test_environment_fingerprint_ordering_and_empty_defaults_match_planner(
+        self,
+    ) -> None:
+        spec = environment_spec()
+        expected = planner.environment_value_fingerprint(spec)
+        reordered = copy.deepcopy(spec)
+        reordered["envs"].reverse()
+        for collection in (
+            "services",
+            "jobs",
+            "workers",
+            "static_sites",
+            "functions",
+        ):
+            reordered[collection].reverse()
+            for component in reordered[collection]:
+                component["envs"].reverse()
+        self.assertEqual(planner.environment_value_fingerprint(reordered), expected)
+        self.assertEqual(common.environment_value_fingerprint(reordered), expected)
+
+        nullable = copy.deepcopy(reordered)
+        nullable["functions"][0]["envs"] = None
+        self.assertEqual(
+            common.environment_value_fingerprint(nullable),
+            planner.environment_value_fingerprint(nullable),
+        )
+        snapshot, _live_spec, _deployment = apply.provider_snapshot(
+            app_response(reordered, OLD_DEPLOYMENT),
+            deployment_response(reordered, OLD_DEPLOYMENT),
+            APP_ID,
+        )
+        self.assertEqual(snapshot["environment_values_sha256"], expected)
+
+    def test_environment_fingerprint_rejects_planner_invalid_apply_snapshots(
+        self,
+    ) -> None:
+        mutations = (
+            (
+                "malformed component collection",
+                lambda value: value.__setitem__("workers", {}),
+            ),
+            (
+                "malformed component",
+                lambda value: value["workers"].__setitem__(0, "worker-a"),
+            ),
+            (
+                "missing component name",
+                lambda value: value["workers"][0].pop("name"),
+            ),
+            (
+                "oversize component name",
+                lambda value: value["workers"][0].__setitem__("name", "n" * 513),
+            ),
+            (
+                "duplicate component name",
+                lambda value: value["workers"].append(
+                    copy.deepcopy(value["workers"][0])
+                ),
+            ),
+            (
+                "malformed environment list",
+                lambda value: value["workers"][0].__setitem__("envs", {}),
+            ),
+            (
+                "malformed environment entry",
+                lambda value: value["workers"][0]["envs"].__setitem__(0, "env"),
+            ),
+            (
+                "missing environment key",
+                lambda value: value["workers"][0]["envs"][0].pop("key"),
+            ),
+            (
+                "oversize environment key",
+                lambda value: value["workers"][0]["envs"][0].__setitem__(
+                    "key", "k" * 513
+                ),
+            ),
+            (
+                "environment key control character",
+                lambda value: value["workers"][0]["envs"][0].__setitem__(
+                    "key", "BAD\nKEY"
+                ),
+            ),
+            (
+                "duplicate environment key",
+                lambda value: value["workers"][0]["envs"].append(
+                    copy.deepcopy(value["workers"][0]["envs"][0])
+                ),
+            ),
+            (
+                "unsupported environment scope",
+                lambda value: value["workers"][0]["envs"][0].__setitem__(
+                    "scope", "BUILD_TIME"
+                ),
+            ),
+            (
+                "unsupported environment type",
+                lambda value: value["workers"][0]["envs"][0].__setitem__(
+                    "type", "ENCRYPTED"
+                ),
+            ),
+            (
+                "missing environment value",
+                lambda value: value["workers"][0]["envs"][0].pop("value"),
+            ),
+            (
+                "non-string environment value",
+                lambda value: value["workers"][0]["envs"][0].__setitem__(
+                    "value", 1
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            spec = environment_spec()
+            mutate(spec)
+            with self.subTest(label=label, consumer="planner"):
+                with self.assertRaises(planner.PlanError):
+                    planner.environment_value_fingerprint(spec)
+            with self.subTest(label=label, consumer="release"):
+                with self.assertRaises(common.ReleaseError):
+                    common.environment_value_fingerprint(spec)
+            with self.subTest(label=label, consumer="apply snapshot"):
+                with self.assertRaises(common.ReleaseError):
+                    apply.provider_snapshot(
+                        app_response(spec, OLD_DEPLOYMENT),
+                        deployment_response(spec, OLD_DEPLOYMENT),
+                        APP_ID,
+                    )
 
     def test_digest_phase_changes_exactly_four_digest_leaves(self) -> None:
         before = digest_spec("1")
