@@ -173,7 +173,10 @@ jobs:
           set -euo pipefail
           root="$RUNNER_TEMP/rollout-capsule"
           [[ "$(find "$root" -type f | wc -l)" -eq 20 ]]
-          [[ -z "$(find "$root" -mindepth 1 \( -type l -o -type d ! -path "$root" \) -print -quit)" ]]
+          expected_dirs=$'phases\nphases/backend\nphases/baseline\nphases/bridge\nphases/ui'
+          actual_dirs="$(find "$root" -mindepth 1 -type d -printf '%P\n' | LC_ALL=C sort)"
+          [[ "$actual_dirs" == "$expected_dirs" ]]
+          [[ -z "$(find "$root" -mindepth 1 ! -type f ! -type d -print -quit)" ]]
           [[ "$(sha256sum "$root/rollout-plan.json" | awk '{print $1}')" == "$ROLLOUT_PLAN_SHA256" ]]
           /usr/bin/python3 -I -S -B "control/$ROLLOUT_VERIFIER_PATH" validate-capsule --root "$root" --manifest "control/$SOURCE_MANIFEST_PATH" --contract "control/$ROLLOUT_CONTRACT_PATH" --schema "control/$ROLLOUT_SCHEMA_PATH" --verifier "control/$ROLLOUT_VERIFIER_PATH"
           "$RUNNER_TEMP/recovery-tools/jq" -e --arg phase "$PHASE" '([.phases[] | select(.phase == $phase)] | length) == 1' "$root/rollout-plan.json" > /dev/null
