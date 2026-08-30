@@ -1,0 +1,1066 @@
+name: Publish and Attest Production CRM Canary Driver
+
+run-name: Publish exact production CRM canary driver
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_run_id:
+        description: Successful exact-main push Test workflow run ID
+        required: true
+        type: string
+
+# This workflow publishes one reviewed support image. It has no deployment
+# environment, production secret, provider credential, or deployment authority.
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-crm-canary-driver-publication
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  RELEASE_WORKFLOW_PATH: .github/workflows/publish-attest-production-crm-canary-driver.yml
+  TEST_WORKFLOW_PATH: .github/workflows/test.yml
+  DRIVER_IMAGE: ghcr.io/medtechcorps-netizen/rereply-crm-canary-driver
+  DRIVER_DOCKERFILE: docker/crm-canary-driver.Dockerfile
+  DRIVER_PREDICATE: https://rereply.app/attestations/production-crm-canary-driver-image/v1
+  SPDX_PREDICATE: https://spdx.dev/Document/v2.3
+  PINNED_JQ_VERSION: "1.8.2"
+  PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+  PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
+  PINNED_TRIVY_VERSION: "0.70.0"
+  PINNED_TRIVY_URL: https://github.com/aquasecurity/trivy/releases/download/v0.70.0/trivy_0.70.0_Linux-64bit.tar.gz
+  PINNED_TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+  PINNED_TRIVY_DB: ghcr.io/aquasecurity/trivy-db@sha256:354879494133734128160eabaf873069c1da593adb1760eaf657d17411cb6c8a
+  PINNED_SYFT_VERSION: "1.51.0"
+  PINNED_SYFT_URL: https://github.com/anchore/syft/releases/download/v1.51.0/syft_1.51.0_linux_amd64.tar.gz
+  PINNED_SYFT_SHA256: 2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f
+  PINNED_BUILDX_VERSION: v0.36.1
+  PINNED_BUILDX_URL: https://github.com/docker/buildx/releases/download/v0.36.1/buildx-v0.36.1.linux-amd64
+  PINNED_BUILDX_SHA256: 48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778
+  PINNED_BUILDKIT_IMAGE: docker.io/moby/buildkit:buildx-stable-1@sha256:040d34121c27906c4ff9ac152a30d52bf2c5d328d3bb748916bb3d2743c02528
+
+jobs:
+  authority:
+    name: Verify protected-main Test authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      control_sha: ${{ steps.authority.outputs.control_sha }}
+      driver_version_sha256: ${{ steps.driver.outputs.driver_version_sha256 }}
+      test_run_id: ${{ steps.test.outputs.test_run_id }}
+      test_run_url: ${{ steps.test.outputs.test_run_url }}
+    steps:
+      - name: Require protected-main GitHub-hosted authority
+        id: authority
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == "$RELEASE_REPOSITORY" ]]
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$WORKFLOW_REF" == "$RELEASE_REPOSITORY/$RELEASE_WORKFLOW_PATH@refs/heads/main" ]]
+          [[ "$WORKFLOW_SHA" == "$DISPATCH_SHA" ]]
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf 'control_sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact protected-main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: source
+          persist-credentials: false
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          [[ "$("$tools_dir/jq" --version)" == "jq-$PINNED_JQ_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          [[ "$("$tools_dir/gh" --version | awk 'NR == 1 {print $3}')" == "$PINNED_GH_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Require live main and exact successful push Test
+        id: test
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TEST_RUN_ID: ${{ inputs.test_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$TEST_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          live_main_sha="$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$live_main_sha" == "$CONTROL_SHA" ]]
+          workflow_id="$(gh api "/repos/$REPOSITORY/actions/workflows/test.yml" --jq '.id')"
+          [[ "$workflow_id" =~ ^[1-9][0-9]*$ ]]
+          require_test_run() {
+            local run_json="$1"
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --arg repository "$REPOSITORY" \
+              --argjson run_id "$TEST_RUN_ID" \
+              --argjson workflow_id "$workflow_id" '
+                .id == $run_id and
+                .run_attempt == 1 and
+                .workflow_id == $workflow_id and
+                .repository.full_name == $repository and
+                .event == "push" and
+                .status == "completed" and
+                .conclusion == "success" and
+                .head_branch == "main" and
+                .head_sha == $control_sha and
+                .path == ".github/workflows/test.yml"
+              ' <<< "$run_json" > /dev/null
+          }
+          latest_json="$(gh api "/repos/$REPOSITORY/actions/runs/$TEST_RUN_ID")"
+          attempt_json="$(gh api "/repos/$REPOSITORY/actions/runs/$TEST_RUN_ID/attempts/1")"
+          require_test_run "$latest_json"
+          require_test_run "$attempt_json"
+          jobs_json="$(gh api "/repos/$REPOSITORY/actions/runs/$TEST_RUN_ID/attempts/1/jobs?per_page=100")"
+          jq -e '
+            ([.jobs[] | select(.name == "security")] | length) == 1 and
+            ([.jobs[] | select(
+              .name == "security" and
+              .run_attempt == 1 and
+              .status == "completed" and
+              .conclusion == "success" and
+              ([.steps[] | select(.name == "Test CRM canary driver protocol" and .conclusion == "success")] | length) == 1 and
+              ([.steps[] | select(.name == "Build CRM canary driver container" and .conclusion == "success")] | length) == 1 and
+              ([.steps[] | select(.name == "Scan CRM canary driver container" and .conclusion == "success")] | length) == 1
+            )] | length) == 1
+          ' <<< "$jobs_json" > /dev/null
+          printf 'test_run_id=%s\n' "$TEST_RUN_ID" >> "$GITHUB_OUTPUT"
+          printf 'test_run_url=%s\n' "$(jq -er '.html_url' <<< "$latest_json")" >> "$GITHUB_OUTPUT"
+
+      - name: Derive exact driver build-input version
+        id: driver
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          [[ -z "$(git status --porcelain)" ]]
+          mapfile -t driver_files < <(
+            {
+              printf '%s\n' \
+                docker/crm-canary-driver.Dockerfile \
+                frontend/package.json \
+                frontend/package-lock.json
+              git ls-tree -r --name-only HEAD -- frontend/canary-driver
+            } | LC_ALL=C sort -u
+          )
+          [[ "${#driver_files[@]}" -ge 4 ]]
+          : > driver-inputs.tsv
+          for path in "${driver_files[@]}"; do
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            [[ "$path" != /* && "$path" != *".."* ]]
+            read -r mode type object entry_path < <(git ls-tree HEAD -- "$path")
+            [[ "$entry_path" == "$path" && "$type" == "blob" ]]
+            [[ "$mode" == "100644" || "$mode" == "100755" ]]
+            [[ -f "$path" && ! -L "$path" ]]
+            [[ "$(git hash-object "$path")" == "$object" ]]
+            printf '%s\t%s\t%s\t%s\n' \
+              "$mode" "$object" "$(sha256sum "$path" | awk '{print $1}')" "$path" \
+              >> driver-inputs.tsv
+          done
+          [[ "$(wc -l < driver-inputs.tsv)" -eq "${#driver_files[@]}" ]]
+          driver_version_sha256="$(sha256sum driver-inputs.tsv | awk '{print $1}')"
+          [[ "$driver_version_sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'driver_version_sha256=%s\n' "$driver_version_sha256" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and publish exact CRM canary driver
+    needs: authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Check out exact protected-main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.authority.outputs.control_sha }}
+          fetch-depth: 1
+          path: source
+          persist-credentials: false
+
+      - name: Recompute exact driver build-input version
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          EXPECTED_DRIVER_VERSION: ${{ needs.authority.outputs.driver_version_sha256 }}
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$CONTROL_SHA" ]]
+          mapfile -t driver_files < <(
+            {
+              printf '%s\n' docker/crm-canary-driver.Dockerfile frontend/package.json frontend/package-lock.json
+              git ls-tree -r --name-only HEAD -- frontend/canary-driver
+            } | LC_ALL=C sort -u
+          )
+          : > driver-inputs.tsv
+          for path in "${driver_files[@]}"; do
+            [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
+            read -r mode type object entry_path < <(git ls-tree HEAD -- "$path")
+            [[ "$entry_path" == "$path" && "$type" == "blob" ]]
+            [[ "$mode" == "100644" || "$mode" == "100755" ]]
+            [[ -f "$path" && ! -L "$path" && "$(git hash-object "$path")" == "$object" ]]
+            printf '%s\t%s\t%s\t%s\n' "$mode" "$object" "$(sha256sum "$path" | awk '{print $1}')" "$path" >> driver-inputs.tsv
+          done
+          [[ "$(sha256sum driver-inputs.tsv | awk '{print $1}')" == "$EXPECTED_DRIVER_VERSION" ]]
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+
+      - name: Install pinned jq, GitHub CLI, and Docker Buildx
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir" "$HOME/.docker/cli-plugins"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_BUILDX_URL" -o "$HOME/.docker/cli-plugins/docker-buildx"
+          echo "$PINNED_BUILDX_SHA256  $HOME/.docker/cli-plugins/docker-buildx" | sha256sum -c -
+          chmod 0755 "$HOME/.docker/cli-plugins/docker-buildx"
+          [[ "$(docker buildx version | awk '{print $2}')" == "$PINNED_BUILDX_VERSION" ]]
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+          docker buildx create --name rereply-canary-driver --driver docker-container \
+            --driver-opt "image=$PINNED_BUILDKIT_IMAGE" --use
+          docker buildx inspect --bootstrap rereply-canary-driver
+
+      - name: Create unique non-authority image tag
+        id: identity
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DRIVER_VERSION: ${{ needs.authority.outputs.driver_version_sha256 }}
+        run: |
+          set -euo pipefail
+          tag="control-${CONTROL_SHA:0:12}-driver-${DRIVER_VERSION:0:12}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "$tag" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'image_ref=%s:%s\n' "$DRIVER_IMAGE" "$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build exact AMD64 CRM canary driver without registry credentials
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: ./source
+          file: ./source/docker/crm-canary-driver.Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          pull: true
+          no-cache: true
+          provenance: false
+          sbom: false
+          builder: rereply-canary-driver
+          github-token: ""
+          tags: ${{ steps.identity.outputs.image_ref }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/medtechcorps-netizen/whatomate
+            org.opencontainers.image.revision=${{ needs.authority.outputs.control_sha }}
+            org.opencontainers.image.version=${{ needs.authority.outputs.driver_version_sha256 }}
+            org.opencontainers.image.title=rereply-crm-canary-driver
+            io.rereply.crm-canary.control-sha=${{ needs.authority.outputs.control_sha }}
+            io.rereply.crm-canary.driver-version-sha256=${{ needs.authority.outputs.driver_version_sha256 }}
+
+      - name: Recheck live main and publish unique non-authority tag
+        id: publish
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_REF: ${{ steps.identity.outputs.image_ref }}
+          REGISTRY_USER: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          docker push "$IMAGE_REF" 2>&1 | tee docker-push.txt
+          mapfile -t digests < <(sed -nE 's/^.*digest:[[:space:]]*(sha256:[0-9a-f]{64})([[:space:]].*)?$/\1/p' docker-push.txt)
+          [[ "${#digests[@]}" -eq 1 ]]
+          digest="${digests[0]}"
+          docker buildx imagetools inspect "$DRIVER_IMAGE@$digest" --raw > remote-descriptor.json
+          [[ "sha256:$(sha256sum remote-descriptor.json | awk '{print $1}')" == "$digest" ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Record immutable driver image identity
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          DRIVER_VERSION: ${{ needs.authority.outputs.driver_version_sha256 }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          TEST_RUN_ID: ${{ needs.authority.outputs.test_run_id }}
+          TEST_RUN_URL: ${{ needs.authority.outputs.test_run_url }}
+        run: |
+          set -euo pipefail
+          cp source/driver-inputs.tsv driver-inputs.tsv
+          dockerfile_sha256="$(sha256sum "source/$DRIVER_DOCKERFILE" | awk '{print $1}')"
+          [[ "$(sha256sum driver-inputs.tsv | awk '{print $1}')" == "$DRIVER_VERSION" ]]
+          [[ "sha256:$(sha256sum remote-descriptor.json | awk '{print $1}')" == "$DIGEST" ]]
+          jq -n \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$DIGEST" \
+            --arg dockerfile "$DRIVER_DOCKERFILE" \
+            --arg dockerfile_sha256 "$dockerfile_sha256" \
+            --arg driver_version_sha256 "$DRIVER_VERSION" \
+            --arg image "$DRIVER_IMAGE" \
+            --arg tag "$TAG" \
+            --arg test_run_id "$TEST_RUN_ID" \
+            --arg test_run_url "$TEST_RUN_URL" '
+              {
+                schema_version: 1,
+                control_sha: $control_sha,
+                test_run: {id: $test_run_id, attempt: 1, url: $test_run_url},
+                driver_version_sha256: $driver_version_sha256,
+                image: $image,
+                digest: $digest,
+                platform: "linux/amd64",
+                tag: $tag,
+                tag_is_authority: false,
+                dockerfile: $dockerfile,
+                dockerfile_sha256: $dockerfile_sha256,
+                runtime: {
+                  user: "pwuser",
+                  working_dir: "/app",
+                  entrypoint: ["node", "canary-driver/index.mjs"],
+                  cmd: null,
+                  port: "8080/tcp",
+                  healthcheck_path: "/healthz"
+                }
+              }
+            ' > image.json
+          jq -e '.tag_is_authority == false and (.digest | test("^sha256:[0-9a-f]{64}$"))' image.json > /dev/null
+
+      - name: Upload immutable driver image identity
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            driver-inputs.tsv
+            image.json
+            remote-descriptor.json
+          if-no-files-found: error
+          retention-days: 90
+
+  scan:
+    name: Scan, SBOM, unit-test, and inspect exact driver
+    needs:
+      - authority
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Download immutable driver image identity
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+
+      - name: Require exact image identity files
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, stat
+          expected = {"driver-inputs.tsv", "image.json", "remote-descriptor.json"}
+          entries = list(os.scandir("evidence"))
+          if {entry.name for entry in entries} != expected:
+              raise SystemExit("unexpected image evidence inventory")
+          if not all(stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode) for entry in entries):
+              raise SystemExit("image evidence must contain regular files only")
+          PY
+
+      - name: Install pinned jq, Trivy, and Syft
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_TRIVY_URL" -o "$RUNNER_TEMP/trivy.tar.gz"
+          echo "$PINNED_TRIVY_SHA256  $RUNNER_TEMP/trivy.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$tools_dir" trivy
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_SYFT_URL" -o "$RUNNER_TEMP/syft.tar.gz"
+          echo "$PINNED_SYFT_SHA256  $RUNNER_TEMP/syft.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/syft.tar.gz" -C "$tools_dir" syft
+          [[ "$("$tools_dir/trivy" --version | awk '/^Version:/ {print $2; exit}')" == "$PINNED_TRIVY_VERSION" ]]
+          "$tools_dir/syft" version | grep -Eq "^[[:space:]]*Version:[[:space:]]+$PINNED_SYFT_VERSION$"
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Validate exact image identity
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DRIVER_VERSION: ${{ needs.authority.outputs.driver_version_sha256 }}
+          TEST_RUN_ID: ${{ needs.authority.outputs.test_run_id }}
+        run: |
+          set -euo pipefail
+          jq -e \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg driver_version "$DRIVER_VERSION" \
+            --arg image "$DRIVER_IMAGE" \
+            --arg test_run_id "$TEST_RUN_ID" '
+              .schema_version == 1 and
+              .control_sha == $control_sha and
+              .test_run == {id: $test_run_id, attempt: 1, url: .test_run.url} and
+              .driver_version_sha256 == $driver_version and
+              .image == $image and
+              .platform == "linux/amd64" and
+              .tag_is_authority == false and
+              (.digest | test("^sha256:[0-9a-f]{64}$"))
+            ' evidence/image.json > /dev/null
+          [[ "$(sha256sum evidence/driver-inputs.tsv | awk '{print $1}')" == "$DRIVER_VERSION" ]]
+          [[ "sha256:$(sha256sum evidence/remote-descriptor.json | awk '{print $1}')" == "$(jq -er '.digest' evidence/image.json)" ]]
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Pull exact digest and verify unit and metadata contracts
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DRIVER_VERSION: ${{ needs.authority.outputs.driver_version_sha256 }}
+        run: |
+          set -euo pipefail
+          digest="$(jq -er '.digest' evidence/image.json)"
+          image_ref="$DRIVER_IMAGE@$digest"
+          docker pull --platform linux/amd64 "$image_ref"
+          docker image inspect "$image_ref" > image-inspect.json
+          jq -e \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$digest" \
+            --arg driver_version "$DRIVER_VERSION" \
+            --arg image "$DRIVER_IMAGE" '
+              length == 1 and
+              .[0].Os == "linux" and .[0].Architecture == "amd64" and
+              (.[0].RepoDigests | index($image + "@" + $digest) != null) and
+              .[0].Config.User == "pwuser" and
+              .[0].Config.WorkingDir == "/app" and
+              .[0].Config.Entrypoint == ["node", "canary-driver/index.mjs"] and
+              .[0].Config.Cmd == null and
+              (.[0].Config.ExposedPorts | has("8080/tcp")) and
+              .[0].Config.Healthcheck.Test == ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>{if(r.status!==204)process.exit(1)}).catch(()=>process.exit(1))"] and
+              .[0].Config.Labels["org.opencontainers.image.source"] == "https://github.com/medtechcorps-netizen/whatomate" and
+              .[0].Config.Labels["org.opencontainers.image.revision"] == $control_sha and
+              .[0].Config.Labels["org.opencontainers.image.version"] == $driver_version and
+              .[0].Config.Labels["org.opencontainers.image.title"] == "rereply-crm-canary-driver" and
+              .[0].Config.Labels["io.rereply.crm-canary.control-sha"] == $control_sha and
+              .[0].Config.Labels["io.rereply.crm-canary.driver-version-sha256"] == $driver_version
+            ' image-inspect.json > /dev/null
+          docker run --rm --platform linux/amd64 --entrypoint node "$image_ref" \
+            --test canary-driver/driver.test.mjs | tee unit-test.txt
+          docker run --rm --platform linux/amd64 --entrypoint /bin/sh "$image_ref" -ceu '
+            test "$(id -un)" = pwuser
+            test "$(id -u)" -gt 0
+            for binary in npm npx yarn yarnpkg; do
+              ! command -v "$binary"
+            done
+            test ! -e /usr/lib/node_modules/npm
+            test ! -e /usr/local/lib/node_modules/npm
+          '
+
+      - name: Download exact pinned Trivy database
+        run: |
+          set -euo pipefail
+          export TRIVY_CACHE_DIR="$RUNNER_TEMP/trivy-cache"
+          trivy image --cache-dir "$TRIVY_CACHE_DIR" --db-repository "$PINNED_TRIVY_DB" \
+            --download-db-only --skip-version-check
+          metadata="$TRIVY_CACHE_DIR/db/metadata.json"
+          database="$TRIVY_CACHE_DIR/db/trivy.db"
+          [[ -s "$metadata" && -s "$database" ]]
+          updated_at="$(jq -er '.UpdatedAt // .updatedAt' "$metadata")"
+          age_seconds="$(( $(date -u +%s) - $(date -u -d "$updated_at" +%s) ))"
+          [[ "$age_seconds" -ge -3600 && "$age_seconds" -le 604800 ]]
+          sha256sum "$metadata" | awk '{print $1}' > trivy-db-metadata.sha256
+          sha256sum "$database" | awk '{print $1}' > trivy-db.sha256
+
+      - name: Fail on embedded secrets
+        run: |
+          set -euo pipefail
+          digest="$(jq -er '.digest' evidence/image.json)"
+          trivy image --cache-dir "$RUNNER_TEMP/trivy-cache" --skip-db-update --skip-version-check \
+            --scanners secret --image-config-scanners secret --exit-code 1 --format json \
+            --output secret-report.json --timeout 30m "$DRIVER_IMAGE@$digest"
+
+      - name: Fail on HIGH or CRITICAL vulnerabilities
+        run: |
+          set -euo pipefail
+          digest="$(jq -er '.digest' evidence/image.json)"
+          trivy image --cache-dir "$RUNNER_TEMP/trivy-cache" --skip-db-update --skip-version-check \
+            --scanners vuln --pkg-types os,library --severity HIGH,CRITICAL --exit-code 1 \
+            --format json --output vulnerability-report.json --timeout 30m "$DRIVER_IMAGE@$digest"
+
+      - name: Generate exact SPDX SBOM
+        env:
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+        run: |
+          set -euo pipefail
+          digest="$(jq -er '.digest' evidence/image.json)"
+          syft scan "docker:$DRIVER_IMAGE@$digest" --output spdx-json=sbom.spdx.json
+          jq -e '.spdxVersion == "SPDX-2.3" and (.packages | type == "array" and length > 0)' sbom.spdx.json > /dev/null
+
+      - name: Record exact scan, unit, and metadata evidence
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DRIVER_VERSION: ${{ needs.authority.outputs.driver_version_sha256 }}
+          TEST_RUN_ID: ${{ needs.authority.outputs.test_run_id }}
+        run: |
+          set -euo pipefail
+          cp evidence/driver-inputs.tsv driver-inputs.tsv
+          cp evidence/image.json image.json
+          cp evidence/remote-descriptor.json remote-descriptor.json
+          jq -e '([.Results[]? | .Secrets[]?] | length) == 0' secret-report.json > /dev/null
+          jq -e '([.Results[]? | .Vulnerabilities[]? | select(.Severity == "HIGH" or .Severity == "CRITICAL")] | length) == 0' vulnerability-report.json > /dev/null
+          digest="$(jq -er '.digest' image.json)"
+          jq -n \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$digest" \
+            --arg driver_version_sha256 "$DRIVER_VERSION" \
+            --arg image "$DRIVER_IMAGE" \
+            --arg image_inspect_sha256 "$(sha256sum image-inspect.json | awk '{print $1}')" \
+            --arg sbom_sha256 "$(sha256sum sbom.spdx.json | awk '{print $1}')" \
+            --arg secret_sha256 "$(sha256sum secret-report.json | awk '{print $1}')" \
+            --arg test_run_id "$TEST_RUN_ID" \
+            --arg unit_test_sha256 "$(sha256sum unit-test.txt | awk '{print $1}')" \
+            --arg vulnerability_sha256 "$(sha256sum vulnerability-report.json | awk '{print $1}')" '
+              {
+                schema_version: 1,
+                subject: {image: $image, digest: $digest, platform: "linux/amd64"},
+                authority: {control_sha: $control_sha, test_run_id: $test_run_id, test_run_attempt: 1, driver_version_sha256: $driver_version_sha256},
+                metadata_contract: {result: "passed", image_inspect_sha256: $image_inspect_sha256},
+                unit_test: {result: "passed", report_sha256: $unit_test_sha256},
+                secret_scan: {result: "passed", report_sha256: $secret_sha256},
+                vulnerability_scan: {result: "passed", severities: ["HIGH", "CRITICAL"], report_sha256: $vulnerability_sha256},
+                sbom: {format: "SPDX-2.3", sha256: $sbom_sha256}
+              }
+            ' > scan.json
+
+      - name: Upload exact scan evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scanned-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            driver-inputs.tsv
+            image-inspect.json
+            image.json
+            remote-descriptor.json
+            sbom.spdx.json
+            scan.json
+            secret-report.json
+            unit-test.txt
+            vulnerability-report.json
+          if-no-files-found: error
+          retention-days: 90
+
+  attest:
+    name: Attest exact CRM canary driver
+    needs:
+      - authority
+      - scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Download exact scan evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: scanned-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Build exact driver source-binding predicate
+        id: predicate
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DRIVER_VERSION: ${{ needs.authority.outputs.driver_version_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TEST_RUN_ID: ${{ needs.authority.outputs.test_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          cp evidence/* .
+          [[ "$(sha256sum driver-inputs.tsv | awk '{print $1}')" == "$DRIVER_VERSION" ]]
+          digest="$(jq -er '.digest' image.json)"
+          jq -n \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$digest" \
+            --arg driver_version_sha256 "$DRIVER_VERSION" \
+            --arg image "$DRIVER_IMAGE" \
+            --arg test_run_id "$TEST_RUN_ID" \
+            --argjson image_identity "$(cat image.json)" \
+            --argjson verification "$(cat scan.json)" '
+              {
+                schema_version: 1,
+                repository: "medtechcorps-netizen/whatomate",
+                workflow_path: ".github/workflows/publish-attest-production-crm-canary-driver.yml",
+                workflow_sha: $control_sha,
+                run_id: env.GITHUB_RUN_ID,
+                run_attempt: 1,
+                test_authority: {run_id: $test_run_id, run_attempt: 1},
+                driver_version_sha256: $driver_version_sha256,
+                subject: {image: $image, digest: $digest, platform: "linux/amd64"},
+                image_identity: $image_identity,
+                verification: $verification
+              }
+            ' > driver-predicate.json
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Create standard GitHub provenance attestation
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.DRIVER_IMAGE }}
+          subject-digest: ${{ steps.predicate.outputs.digest }}
+          push-to-registry: false
+
+      - name: Create SPDX SBOM attestation
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.DRIVER_IMAGE }}
+          subject-digest: ${{ steps.predicate.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: false
+
+      - name: Create exact driver source-binding attestation
+        id: source-binding
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.DRIVER_IMAGE }}
+          subject-digest: ${{ steps.predicate.outputs.digest }}
+          predicate-type: ${{ env.DRIVER_PREDICATE }}
+          predicate-path: driver-predicate.json
+          push-to-registry: false
+
+      - name: Record exact attestation bundles
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+          SOURCE_BUNDLE: ${{ steps.source-binding.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          for bundle in "$PROVENANCE_BUNDLE" "$SBOM_BUNDLE" "$SOURCE_BUNDLE"; do
+            [[ -s "$bundle" && -f "$bundle" && ! -L "$bundle" ]]
+          done
+          cp "$PROVENANCE_BUNDLE" provenance.bundle.json
+          cp "$SBOM_BUNDLE" sbom.bundle.json
+          cp "$SOURCE_BUNDLE" source-binding.bundle.json
+
+      - name: Upload exact attestation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: attested-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            driver-inputs.tsv
+            driver-predicate.json
+            image-inspect.json
+            image.json
+            provenance.bundle.json
+            remote-descriptor.json
+            sbom.bundle.json
+            sbom.spdx.json
+            scan.json
+            secret-report.json
+            source-binding.bundle.json
+            unit-test.txt
+            vulnerability-report.json
+          if-no-files-found: error
+          retention-days: 90
+
+  verify:
+    name: Verify exact attestations and anonymous digest pull
+    needs:
+      - authority
+      - attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    steps:
+      - name: Require a GitHub-hosted runner
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+
+      - name: Download exact attestation evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: attested-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Cryptographically verify all three exact attestations
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DRIVER_VERSION: ${{ needs.authority.outputs.driver_version_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TEST_RUN_ID: ${{ needs.authority.outputs.test_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          cp evidence/* .
+          digest="$(jq -er '.digest' image.json)"
+          subject="oci://$DRIVER_IMAGE@$digest"
+          signer_workflow="$RELEASE_REPOSITORY/$RELEASE_WORKFLOW_PATH"
+          common_flags=(
+            --repo "$RELEASE_REPOSITORY"
+            --signer-workflow "$signer_workflow"
+            --signer-digest "$CONTROL_SHA"
+            --source-digest "$CONTROL_SHA"
+            --source-ref refs/heads/main
+            --deny-self-hosted-runners
+            --format json
+          )
+          gh attestation verify "$subject" "${common_flags[@]}" --bundle provenance.bundle.json \
+            --predicate-type https://slsa.dev/provenance/v1 > verified-provenance.json
+          gh attestation verify "$subject" "${common_flags[@]}" --bundle sbom.bundle.json \
+            --predicate-type "$SPDX_PREDICATE" > verified-sbom.json
+          gh attestation verify "$subject" "${common_flags[@]}" --bundle source-binding.bundle.json \
+            --predicate-type "$DRIVER_PREDICATE" > verified-source-binding.json
+          jq -e 'type == "array" and length > 0' verified-provenance.json > /dev/null
+          jq -e --slurpfile expected sbom.spdx.json 'any(.[]; .verificationResult.statement.predicate == $expected[0])' verified-sbom.json > /dev/null
+          jq -e --slurpfile expected driver-predicate.json 'any(.[]; .verificationResult.statement.predicate == $expected[0])' verified-source-binding.json > /dev/null
+          jq -e \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg driver_version "$DRIVER_VERSION" \
+            --arg test_run_id "$TEST_RUN_ID" '
+              .workflow_sha == $control_sha and
+              .run_attempt == 1 and
+              .test_authority == {run_id: $test_run_id, run_attempt: 1} and
+              .driver_version_sha256 == $driver_version and
+              .image_identity.tag_is_authority == false
+            ' driver-predicate.json > /dev/null
+
+      - name: Require credential-free anonymous exact-digest pull
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN CR_PAT REGISTRY_TOKEN DOCKER_AUTH_CONFIG
+          anonymous_docker_config="$(mktemp -d)"
+          export DOCKER_CONFIG="$anonymous_docker_config"
+          [[ -z "$(find "$DOCKER_CONFIG" -mindepth 1 -print -quit)" ]]
+          digest="$(jq -er '.digest' image.json)"
+          repository_path="medtechcorps-netizen/rereply-crm-canary-driver"
+          token_json="$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://ghcr.io/token?scope=repository:${repository_path}:pull")"
+          token="$(jq -er '.token | select(type == "string" and length > 0)' <<< "$token_json")"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            --header "Authorization: Bearer $token" \
+            --header 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            --dump-header anonymous-manifest.headers \
+            "https://ghcr.io/v2/${repository_path}/manifests/${digest}" \
+            --output anonymous-manifest.json
+          reported_digest="$(awk 'BEGIN{IGNORECASE=1} /^Docker-Content-Digest:/ {gsub("\r", "", $2); print $2}' anonymous-manifest.headers)"
+          [[ "$reported_digest" == "$digest" ]]
+          [[ "sha256:$(sha256sum anonymous-manifest.json | awk '{print $1}')" == "$digest" ]]
+          mapfile -t blobs < <(jq -er '[.config.digest, .layers[].digest] | unique[]' anonymous-manifest.json)
+          [[ "${#blobs[@]}" -ge 2 ]]
+          for blob_digest in "${blobs[@]}"; do
+            [[ "$blob_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            blob_file="$RUNNER_TEMP/blob-${blob_digest#sha256:}"
+            curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-redirs 3 \
+              --header "Authorization: Bearer $token" \
+              "https://ghcr.io/v2/${repository_path}/blobs/${blob_digest}" \
+              --output "$blob_file"
+            [[ -s "$blob_file" ]]
+            [[ "sha256:$(sha256sum "$blob_file" | awk '{print $1}')" == "$blob_digest" ]]
+            rm -f "$blob_file"
+          done
+          rm -rf "$anonymous_docker_config"
+          unset token token_json
+
+      - name: Record verified digest-only authority
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DRIVER_VERSION: ${{ needs.authority.outputs.driver_version_sha256 }}
+          TEST_RUN_ID: ${{ needs.authority.outputs.test_run_id }}
+        run: |
+          set -euo pipefail
+          digest="$(jq -er '.digest' image.json)"
+          jq -n \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg digest "$digest" \
+            --arg driver_version_sha256 "$DRIVER_VERSION" \
+            --arg image "$DRIVER_IMAGE" \
+            --arg test_run_id "$TEST_RUN_ID" '
+              {
+                schema_version: 1,
+                control_sha: $control_sha,
+                test_run: {id: $test_run_id, attempt: 1},
+                driver_version_sha256: $driver_version_sha256,
+                subject: {image: $image, digest: $digest, platform: "linux/amd64"},
+                tag_is_authority: false,
+                attestations: {provenance: "verified", sbom: "verified", source_binding: "verified"},
+                anonymous_manifest_and_blobs: "verified"
+              }
+            ' > verified-driver.json
+
+      - name: Upload verified digest-only driver evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-crm-canary-driver-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            anonymous-manifest.headers
+            anonymous-manifest.json
+            driver-inputs.tsv
+            driver-predicate.json
+            image-inspect.json
+            image.json
+            remote-descriptor.json
+            sbom.spdx.json
+            scan.json
+            verified-driver.json
+            verified-provenance.json
+            verified-sbom.json
+            verified-source-binding.json
+          if-no-files-found: error
+          retention-days: 90
+
+  gate:
+    name: Exact production CRM canary driver image gate
+    if: always()
+    needs:
+      - authority
+      - build
+      - scan
+      - attest
+      - verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Install pinned jq and GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/release-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_JQ_URL" -o "$tools_dir/jq"
+          echo "$PINNED_JQ_SHA256  $tools_dir/jq" | sha256sum -c -
+          chmod 0755 "$tools_dir/jq"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          echo "$PINNED_GH_SHA256  $RUNNER_TEMP/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Require stable exact four-artifact driver authority
+        env:
+          ATTEST_RESULT: ${{ needs.attest.result }}
+          AUTHORITY_RESULT: ${{ needs.authority.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+          TEST_RUN_ID: ${{ needs.authority.outputs.test_run_id }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == "github-hosted" ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]
+          for result in "$AUTHORITY_RESULT" "$BUILD_RESULT" "$SCAN_RESULT" "$ATTEST_RESULT" "$VERIFY_RESULT"; do
+            [[ "$result" == "success" ]]
+          done
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          workflow_id="$(gh api "/repos/$REPOSITORY/actions/workflows/test.yml" --jq '.id')"
+          test_json="$(gh api "/repos/$REPOSITORY/actions/runs/$TEST_RUN_ID")"
+          jq -e \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg repository "$REPOSITORY" \
+            --argjson run_id "$TEST_RUN_ID" \
+            --argjson workflow_id "$workflow_id" '
+              .id == $run_id and .run_attempt == 1 and .workflow_id == $workflow_id and
+              .repository.full_name == $repository and .event == "push" and
+              .status == "completed" and .conclusion == "success" and
+              .head_branch == "main" and .head_sha == $control_sha and
+              .path == ".github/workflows/test.yml"
+            ' <<< "$test_json" > /dev/null
+
+          expected_names="$(jq -cn --arg run_id "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" '[
+            "attested-crm-canary-driver-\($run_id)-\($attempt)",
+            "image-crm-canary-driver-\($run_id)-\($attempt)",
+            "scanned-crm-canary-driver-\($run_id)-\($attempt)",
+            "verified-crm-canary-driver-\($run_id)-\($attempt)"
+          ] | sort')"
+          [[ "$(jq -r 'length' <<< "$expected_names")" -eq 4 ]]
+
+          require_bounded_artifact_inventory() {
+            local artifacts_json="$1"
+            jq -e \
+              --arg control_sha "$CONTROL_SHA" \
+              --argjson expected_names "$expected_names" \
+              --argjson run_id "$GITHUB_RUN_ID" '
+                (.total_count | type) == "number" and
+                (.total_count | floor) == .total_count and
+                .total_count >= 0 and .total_count <= 4 and
+                (.artifacts | type) == "array" and
+                (.artifacts | length) <= 4 and
+                .total_count == (.artifacts | length) and
+                ([.artifacts[].name] | length) == ([.artifacts[].name] | unique | length) and
+                all(.artifacts[];
+                  (.name | type) == "string" and
+                  (.name | endswith(".dockerbuild") | not) and
+                  (.name as $name | ($expected_names | index($name)) != null) and
+                  .expired == false and
+                  (.id | type) == "number" and (.id | floor) == .id and .id > 0 and
+                  (.size_in_bytes | type) == "number" and (.size_in_bytes | floor) == .size_in_bytes and
+                  .size_in_bytes > 0 and .size_in_bytes <= 67108864 and
+                  (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                  (.workflow_run | type) == "object" and
+                  .workflow_run.id == $run_id and
+                  .workflow_run.head_branch == "main" and
+                  .workflow_run.head_sha == $control_sha
+                )
+              ' <<< "$artifacts_json" > /dev/null
+          }
+          require_exact_artifact_inventory() {
+            local artifacts_json="$1"
+            require_bounded_artifact_inventory "$artifacts_json"
+            jq -e --argjson expected_names "$expected_names" '
+              .total_count == 4 and
+              (.artifacts | length) == 4 and
+              ([.artifacts[].name] | sort) == $expected_names
+            ' <<< "$artifacts_json" > /dev/null
+          }
+          canonical_artifact_inventory() {
+            local artifacts_json="$1"
+            jq -c '[.artifacts[] | {
+              id, name, size_in_bytes, digest, expired,
+              workflow_run: {id: .workflow_run.id, head_branch: .workflow_run.head_branch, head_sha: .workflow_run.head_sha}
+            }] | sort_by(.name)' <<< "$artifacts_json"
+          }
+
+          first_inventory=""
+          for delay_seconds in 0 1 2 4 8; do
+            if [[ "$delay_seconds" -gt 0 ]]; then sleep "$delay_seconds"; fi
+            artifacts_json="$(gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"
+            if ! require_bounded_artifact_inventory "$artifacts_json"; then
+              echo "::error::Driver artifacts contain excess, unexpected, duplicate, or malformed records."
+              exit 1
+            fi
+            if [[ "$(jq -r '.total_count' <<< "$artifacts_json")" -eq 4 ]]; then
+              require_exact_artifact_inventory "$artifacts_json"
+              first_inventory="$(canonical_artifact_inventory "$artifacts_json")"
+              break
+            fi
+          done
+          [[ -n "$first_inventory" ]]
+          sleep 2
+          final_artifacts_json="$(gh api "/repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"
+          require_exact_artifact_inventory "$final_artifacts_json"
+          final_inventory="$(canonical_artifact_inventory "$final_artifacts_json")"
+          [[ "$first_inventory" == "$final_inventory" ]]
+          [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
+          final_test_json="$(gh api "/repos/$REPOSITORY/actions/runs/$TEST_RUN_ID")"
+          [[ "$(jq -er '.run_attempt' <<< "$final_test_json")" == "1" ]]
+          [[ "$(jq -er '.conclusion' <<< "$final_test_json")" == "success" ]]
+          [[ "$(jq -er '.head_sha' <<< "$final_test_json")" == "$CONTROL_SHA" ]]
+          echo "Exact CRM canary driver image controls passed. No deployment was performed."
