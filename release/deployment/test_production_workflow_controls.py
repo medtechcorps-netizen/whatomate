@@ -88,10 +88,10 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
     ),
 }
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "7dd2ede189cd08ac419525236d6658479eae42debf93a468927c22682a855e81"
+    "88cd01af3d37deda224bae886cedaf806611f3b43f089c3a41142c1f015c701c"
 )
 EXACT_GATE_B_TEST_JOB_SHA256 = {
-    "go-race": "fd7737cc95c3cf1bd857af6f372a419d648f49b21d43edfc4b1e5eb9f61ed093",
+    "go-race": "0aa5bc14dd3d264191134048bc4e9dc6b50f77b58b13d3f596dadcd93a1c1a98",
     "lint": "acff25313c68d1a86740a8cafe808480a5ca1a418c8e48e47d17c8d34285a8fd",
     "security": "ed9572d5895abf26417ce1ebf87970cc67b41be00379d42df75df58f73c8cbd4",
     "recovery-boundary-images": (
@@ -260,6 +260,8 @@ def assert_gate_b_test_workflow(source: str) -> None:
     for line in (
         'package_output="$(go list -mod=readonly ./...)"',
         "mapfile -t packages < <(printf '%s\\n' \"$package_output\")",
+        '-- -mod=readonly -race -p 1 -timeout 60m '
+        '-coverprofile=coverage.out "${packages[@]}"',
     ):
         require_active_source_line(run_tests, line)
     if "grep -v /test/" in run_tests or " -race " not in run_tests:

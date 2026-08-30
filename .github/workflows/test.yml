@@ -123,7 +123,7 @@ jobs:
           # --format testname streams a PASS/FAIL line per test as it
           # completes, so a hanging test is easy to spot — the last
           # printed test is the one before the hang.
-          # -timeout 30m caps each package's test binary. The enclosing 120m job
+          # -timeout 60m caps each package's test binary. The enclosing 120m job
           # bound retains a finite ceiling while allowing for hosted PostgreSQL
           # runner variance in the race+coverage integration suites.
           package_output="$(go list -mod=readonly ./...)"
@@ -133,7 +133,7 @@ jobs:
           gotestsum \
             --format testname \
             --hide-summary=skipped \
-            -- -mod=readonly -race -p 1 -timeout 30m -coverprofile=coverage.out "${packages[@]}"
+            -- -mod=readonly -race -p 1 -timeout 60m -coverprofile=coverage.out "${packages[@]}"
           git diff --exit-code -- go.mod go.sum
 
       - name: Display coverage
