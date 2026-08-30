@@ -137,6 +137,7 @@ const isWorkspaceOpen = ref(false)
 const isWorkspaceRail = useMediaQuery('(min-width: 1280px)')
 const messages = ref<InboxMessage[]>([])
 const messagesViewport = ref<HTMLElement | null>(null)
+const messagesContent = ref<HTMLElement | null>(null)
 const channelFilter = ref<ChannelType | 'all'>('all')
 const search = ref('')
 const composer = ref('')
@@ -203,6 +204,9 @@ let refreshQueued = false
 let viewMounted = false
 let conversationViewSequence = 0
 let messageViewportScrollFrame: number | null = null
+let messagesContentResizeObserver: ResizeObserver | null = null
+let messagesContentObservedHeight = 0
+let messageViewportFollowingBottom = true
 let readCursorInFlightKey: string | null = null
 let readCursorCheckQueued = false
 let metaMessengerContextVersion = 0
@@ -596,15 +600,60 @@ function prefersReducedMotion() {
   return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
 }
 
-async function scrollMessagesToBottom(smooth = false) {
+async function scrollMessagesToBottom(
+  smooth = false,
+  shouldScroll: () => boolean = () => true,
+) {
   await nextTick()
+  if (!shouldScroll()) return
   const viewport = messagesViewport.value
   if (!viewport) return
   if (smooth && !prefersReducedMotion() && typeof viewport.scrollTo === 'function') {
     viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' })
+    messageViewportFollowingBottom = true
     return
   }
   viewport.scrollTop = viewport.scrollHeight
+  messageViewportFollowingBottom = true
+}
+
+function stopMessagesContentResizeObserver() {
+  messagesContentResizeObserver?.disconnect()
+  messagesContentResizeObserver = null
+  messagesContentObservedHeight = 0
+}
+
+function startMessagesContentResizeObserver(sequence: number, conversationId: string) {
+  stopMessagesContentResizeObserver()
+  const content = messagesContent.value
+  if (!content || typeof ResizeObserver === 'undefined') return
+
+  messagesContentObservedHeight = content.getBoundingClientRect().height
+  const observer = new ResizeObserver(entries => {
+    if (
+      messagesContentResizeObserver !== observer
+      || messagesContent.value !== content
+      || !isCurrentConversationView(sequence, conversationId)
+    ) return
+
+    const entry = entries.find(candidate => candidate.target === content)
+    const nextHeight = entry?.contentRect.height ?? content.getBoundingClientRect().height
+    const contentGrew = nextHeight > messagesContentObservedHeight + 0.5
+    messagesContentObservedHeight = nextHeight
+    if (!contentGrew || !messageViewportFollowingBottom) return
+
+    // Media, fonts, and rich previews may resize after the transcript first
+    // renders. Preserve bottom-following for an operator already at the
+    // newest message without pulling a scrolled-up reader away from history.
+    void scrollMessagesToBottom(false, () =>
+      messagesContentResizeObserver === observer
+      && messagesContent.value === content
+      && isCurrentConversationView(sequence, conversationId)
+      && messageViewportFollowingBottom,
+    )
+  })
+  messagesContentResizeObserver = observer
+  observer.observe(content)
 }
 
 function updateLocalConversationPreview(conversationId: string, message: InboxMessage) {
@@ -669,8 +718,13 @@ async function load(silent = false, append = false) {
     }
 
     if (selectedConversation.value) {
+      const selectedConversationId = selectedConversation.value.id
       selectedConversation.value =
-        conversations.value.find((item) => item.id === selectedConversation.value?.id) ?? null
+        conversations.value.find(item => item.id === selectedConversationId) ?? null
+      if (!selectedConversation.value) {
+        stopMessagesContentResizeObserver()
+        messageViewportFollowingBottom = true
+      }
     }
     if (silent && selectedConversation.value) {
       const conversationId = selectedConversation.value.id
@@ -753,6 +807,11 @@ function scheduleMessageViewportReadCheck() {
   })
 }
 
+function handleMessageViewportScroll() {
+  messageViewportFollowingBottom = isMessageViewportNearBottom()
+  scheduleMessageViewportReadCheck()
+}
+
 function applyInboxMessageStatus(event: InboxActivityEvent) {
   const isStatusActivity = event.type === 'status_update'
     || (event.type === 'realtime_sync' && event.payload?.kind === 'message_status_changed')
@@ -785,6 +844,8 @@ function handleOnline() {
 
 async function selectConversation(conversation: InboxConversation) {
   const viewSequence = ++conversationViewSequence
+  stopMessagesContentResizeObserver()
+  messageViewportFollowingBottom = true
   selectedConversation.value = conversation
   messages.value = []
   messageTotal.value = 0
@@ -815,6 +876,7 @@ async function selectConversation(conversation: InboxConversation) {
   if (!loaded || !isCurrentConversationView(viewSequence, conversation.id)) return
   await scrollMessagesToBottom()
   if (!isCurrentConversationView(viewSequence, conversation.id)) return
+  startMessagesContentResizeObserver(viewSequence, conversation.id)
 
   // A tab switch can happen while the transcript request is in flight. Keep
   // the viewport ready at the latest message, but do not acknowledge anything
@@ -836,6 +898,8 @@ async function selectConversation(conversation: InboxConversation) {
 
 function closeMobileConversation() {
   conversationViewSequence += 1
+  stopMessagesContentResizeObserver()
+  messageViewportFollowingBottom = true
   selectedConversation.value = null
   isWorkspaceOpen.value = false
   messages.value = []
@@ -1859,6 +1923,7 @@ onBeforeUnmount(() => {
   metaMessengerAuthorizationController.value?.abort()
   metaMessengerAuthorizationController.value = null
   conversationViewSequence += 1
+  stopMessagesContentResizeObserver()
   metaMessengerContextVersion += 1
   metaMessengerStatusSequence += 1
   metaInstagramStatusSequence += 1
@@ -2464,6 +2529,9 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
           <button
             v-for="conversation in filteredConversations"
             :key="conversation.id"
+            data-testid="omnichannel-conversation"
+            :data-conversation-id="conversation.id"
+            :data-contact-id="conversation.contact_id"
             class="flex min-h-[72px] w-full gap-3 border-b border-white/[0.055] px-3 py-3.5 text-left transition light:border-slate-300"
             :class="
               selectedConversation?.id === conversation.id
@@ -2581,37 +2649,50 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             v-else
             ref="messagesViewport"
             data-testid="omnichannel-message-viewport"
-            class="flex-1 space-y-3 overflow-y-auto p-3 sm:p-5 md:p-7"
-            @scroll.passive="scheduleMessageViewportReadCheck"
+            :data-conversation-id="selectedConversation.id"
+            class="flex-1 overflow-y-auto p-3 sm:p-5 md:p-7"
+            @scroll.passive="handleMessageViewportScroll"
           >
-            <div v-if="hasOlderMessages" class="pb-2 text-center">
-              <Button
-                variant="outline"
-                size="sm"
-                :disabled="loadingOlderMessages"
-                @click="loadOlderMessages"
-              >
-                <Loader2 v-if="loadingOlderMessages" class="mr-2 h-3.5 w-3.5 animate-spin" />
-                Load older messages
-              </Button>
-            </div>
             <div
-              v-for="message in messages"
-              :key="message.id"
-              :data-message-id="message.id"
-              class="flex"
-              :class="message.direction === 'outgoing' ? 'justify-end' : 'justify-start'"
+              ref="messagesContent"
+              data-testid="omnichannel-message-list"
+              :data-conversation-id="selectedConversation.id"
+              class="space-y-3"
             >
               <div
-                class="max-w-[86%] rounded-2xl px-4 py-3 text-sm leading-6 sm:max-w-[72%]"
-                :class="
-                  message.direction === 'outgoing'
-                    ? 'rounded-br-md bg-sky-300 text-slate-950'
-                    : 'rounded-bl-md border border-white/[0.07] bg-white/[0.04] text-white/80 light:border-slate-300 light:bg-slate-50 light:text-slate-900'
-                "
+                v-if="hasOlderMessages"
+                class="pb-2 text-center"
               >
-                <p>{{ message.content }}</p>
-                <p class="mt-1 text-right text-[9px] opacity-50">{{ formatTime(message.created_at) }} · {{ message.status }}</p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  :disabled="loadingOlderMessages"
+                  @click="loadOlderMessages"
+                >
+                  <Loader2 v-if="loadingOlderMessages" class="mr-2 h-3.5 w-3.5 animate-spin" />
+                  Load older messages
+                </Button>
+              </div>
+              <div
+                v-for="message in messages"
+                :key="message.id"
+                data-testid="omnichannel-message"
+                :data-message-id="message.id"
+                :data-message-direction="message.direction"
+                class="flex"
+                :class="message.direction === 'outgoing' ? 'justify-end' : 'justify-start'"
+              >
+                <div
+                  class="max-w-[86%] rounded-2xl px-4 py-3 text-sm leading-6 sm:max-w-[72%]"
+                  :class="
+                    message.direction === 'outgoing'
+                      ? 'rounded-br-md bg-sky-300 text-slate-950'
+                      : 'rounded-bl-md border border-white/[0.07] bg-white/[0.04] text-white/80 light:border-slate-300 light:bg-slate-50 light:text-slate-900'
+                  "
+                >
+                  <p>{{ message.content }}</p>
+                  <p class="mt-1 text-right text-[9px] opacity-50">{{ formatTime(message.created_at) }} · {{ message.status }}</p>
+                </div>
               </div>
             </div>
           </div>

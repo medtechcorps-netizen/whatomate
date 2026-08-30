@@ -246,8 +246,14 @@ The environments have distinct authority:
   permission-scoped job token. This environment contains no branch-write,
   DigitalOcean, provider, application, database, registry, package, Meta, or
   route credential;
-- `rereply-production-canary` contains only the six public health targets and,
-  for `ui`, the controlled synthetic-driver configuration.
+- `rereply-production-canary` has the exact secret-name inventory
+  `CRM_CANARY_PUBLIC_TARGETS_JSON` and `CRM_CANARY_SYNTHETIC_DRIVER_JSON`.
+  The latter is consumed only for `ui` and is schema version 1 with exactly the
+  reviewed driver HTTPS URL, driver-version SHA-256 label, canonical fixture-
+  descriptor SHA-256, and the base64 32-byte request/result HMAC key.
+  Driver fixture descriptors, fixture logins, the synthetic webhook-signing
+  secret, and the execution-ledger credential do not belong in this GitHub
+  environment.
 
 No job may fall back to repository, organization, workstation, or legacy
 secrets. The canary signer has no environment, provider token, application
@@ -554,7 +560,8 @@ and verified provenance plus custom receipt attestation.
 
 The final controlled CRM pilot additionally verifies:
 
-- one Klinik-only WhatsApp reply and one inbound response;
+- one Klinik-only outbound reply through the product endpoint and one
+  synthetic inbound message through the signed product webhook boundary;
 - inbound and outbound messages appear without reloading;
 - unread counts and the main-navbar marker update and clear correctly;
 - switching Omnichannel or Chat conversations scrolls to the latest message,
@@ -562,22 +569,84 @@ The final controlled CRM pilot additionally verifies:
 - unauthorized tenants are still unable to send through the Klinik-only path.
 
 The `ui` probe is delegated only to a reviewed synthetic driver bound by exact
-HTTPS origin/path and driver-version/config hashes. The request contains a
-fresh nonce, idempotency key, control SHA, and exact change-receipt hash; it is
-HMAC-signed without transmitting the shared key. The response must echo those
-bindings, report one execution for the nonce, be fresh, carry a valid HMAC, and
-contain exactly the required boolean checks with every value true. The driver
+HTTPS origin/path, driver-version/config hashes, and the reviewed canonical
+fixture-descriptor SHA-256. The request contains that fixture hash plus a fresh
+nonce, idempotency key, control SHA, and exact change-receipt hash. Its HMAC
+binds both the canonical body and the separate freshness timestamp without
+transmitting the shared key. The response must echo those bindings, report one
+execution for the nonce, be fresh, carry a valid HMAC, and contain exactly the
+required boolean checks with every value true. The driver
 uses only designated synthetic Klinik, non-Klinik, cross-organization, and
 native-Chat fixtures. Customer content, message bodies, URLs, credentials,
 screenshots, videos, browser traces, network traces, and response bodies must
 never enter logs, outputs, summaries, attestations, or artifacts.
 
-This repository currently contains the verifier/client contract only. It does
-not contain or provision the synthetic driver endpoint or its fixtures. The
-`ui` phase is therefore **NO-GO** until a separate review implements and deploys
-the controlled driver, designates synthetic Klinik, non-Klinik,
-cross-organization, and native-Chat accounts, records the exact driver version
-hash, and installs its protected canary configuration under separate explicit
+The inbound fixture is a WhatsApp-shaped payload signed with the dedicated
+synthetic app secret and posted directly to the product's exact
+`/api/webhook?workspace=...` boundary. It does not call Meta, traverse Meta
+transport, prove account-specific Meta delivery, or require a Meta access
+token. The app secret authenticates only this product-boundary fixture; it is
+not a transport credential. The resulting persistence, websocket, unread, and
+layout observations are product assertions, not evidence about Meta transport.
+
+The driver is a dedicated synthetic-only service and must not share an
+application service, customer browser identity, customer conversation, or
+general-purpose automation account. Its runtime secret store has separate
+boundaries: `CRM_CANARY_HMAC_KEY_BASE64` authenticates only verifier requests
+and signed results; `CRM_CANARY_FIXTURE_DESCRIPTOR_JSON` identifies only the
+schema-version-1 exact product origin `https://app.rereply.app`, reviewed
+synthetic namespace, organizations, conversations, contacts, display labels,
+sender identities, and the exact synthetic Meta business-account, phone,
+shadow-channel-account, legacy-account ID/name fields;
+`CRM_CANARY_KLINIK_LOGIN_JSON` and
+`CRM_CANARY_NON_KLINIK_LOGIN_JSON` are dedicated synthetic browser logins;
+`CRM_CANARY_META_APP_SECRET` signs only the product-boundary webhook fixture;
+and `CRM_CANARY_LEDGER_DATABASE_URL` reaches only the dedicated idempotency
+ledger. That database URL must carry a password and exactly one query setting:
+the TLS `sslmode` value `require`, `verify-ca`, or `verify-full`. Every other
+query key or connection-setting override is rejected.
+`CRM_CANARY_DRIVER_VERSION_SHA256`
+is a non-secret,
+operator-provisioned version label echoed against the verifier configuration;
+the current driver does not derive it from its own source bytes or deployed
+image. It is not image-attestation or digest authority. None of the driver-side
+fixture, login, webhook-signing, or ledger values may be copied into repository
+or organization secrets, the GitHub canary environment, logs, artifacts, or
+attestations. The shared HMAC key is the sole credential present on both sides
+and appears in GitHub only inside `CRM_CANARY_SYNTHETIC_DRIVER_JSON`.
+
+Before any synthetic injection or reply, the driver requires the exact public
+product origin to resolve only to public addresses, signs in the dedicated
+users to their expected organizations, rejects any runtime descriptor whose
+canonical hash differs from the separately protected GitHub binding, and
+uniquely re-reads both live fixture conversations. The live organization,
+contact, identity, channel-account,
+legacy read-only configuration, reply capability, and descriptor bindings must
+all match; the unread fixture must begin at exactly zero. The driver refreshes
+and requires an open service window after the first signed inbound fixture and
+again immediately before the outbound reply. Unread increment and clear are
+bound to the exact synthetic conversation as well as the aggregate navbar
+count.
+
+Individual browser and product operations have a 45-second ceiling and the
+signed-webhook response is bounded to 4 KiB. The complete driver scenario has
+a hard 210-second deadline that initiates network abort and separately bounded
+best-effort browser-context closure, inside the verifier's 240-second total
+driver-request wall-clock deadline and 300-second signed
+freshness window. A driver deadline, runner loss, or concurrent replay cannot
+produce a successful signed result.
+
+This repository contains the verifier/client contract and the dedicated driver
+code plus `docker/crm-canary-driver.Dockerfile`; protected Test CI builds that
+exact Dockerfile and fails on unsuppressed HIGH or CRITICAL OS/library
+vulnerabilities from the pinned Trivy vulnerability scanner. It does not deploy
+the driver, provision its ledger or fixtures, or install any runtime secret.
+The `ui` phase is therefore **NO-GO** until a separate review
+publishes and deploys the reviewed image by immutable digest, designates only
+synthetic Klinik, non-Klinik, cross-organization, and native-Chat fixtures,
+defines and reviews the version-label derivation and records it beside that
+immutable digest, provisions the dedicated runtime secret store and ledger, and
+installs the protected GitHub canary configuration under separate explicit
 authorization. Customer accounts, conversations, or messages must never be
 used as fixtures.
 

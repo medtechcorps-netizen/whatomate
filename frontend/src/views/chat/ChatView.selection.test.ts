@@ -321,6 +321,34 @@ describe('ChatView conversation selection', () => {
     vi.unstubAllGlobals()
   })
 
+  it('exposes stable contact and message identity selectors', async () => {
+    mocks.contactsStore!.messages = [{
+      id: 'message-selector-1',
+      direction: 'incoming',
+      message_type: 'text',
+      content: { body: 'Selector-bound message' },
+      status: 'received',
+      created_at: '2026-08-24T04:00:00Z',
+    }]
+    mocks.fetchMessages.mockResolvedValue(undefined)
+
+    wrapper = mountChatView()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+
+    const contacts = wrapper.findAll('[data-testid="chat-contact"]')
+    expect(contacts).toHaveLength(2)
+    expect(contacts[0].attributes('data-contact-id')).toBe('first')
+    expect(contacts[1].attributes('data-contact-id')).toBe('second')
+
+    const transcript = wrapper.get('[data-testid="chat-message-list"]')
+    expect(transcript.attributes('data-contact-id')).toBe('first')
+    const message = transcript.get('[data-testid="chat-message"]')
+    expect(message.attributes('data-message-id')).toBe('message-selector-1')
+    expect(message.attributes('data-message-direction')).toBe('incoming')
+  })
+
   it('lets only the current contact completion schedule the initial bottom scroll', async () => {
     const firstLoad = deferred()
     const secondLoad = deferred()

@@ -249,6 +249,7 @@ class DriverTests(unittest.TestCase):
         return {
             "url": "https://synthetic.example.com/run/ui",
             "driver_version_sha256": digest("a"),
+            "fixture_descriptor_sha256": digest("f"),
             "driver_config_sha256": digest("d"),
             "hmac_key": b"k" * 32,
         }
@@ -260,6 +261,7 @@ class DriverTests(unittest.TestCase):
         checks: dict[str, bool] | None = None,
         *,
         execution_count: int = 1,
+        fixture_descriptor_sha256: str | None = None,
     ) -> bytes:
         value: dict[str, object] = {
             "schema_version": 1,
@@ -269,6 +271,9 @@ class DriverTests(unittest.TestCase):
             "idempotency_key": nonce,
             "change_receipt_sha256": digest("c"),
             "driver_version_sha256": digest("a"),
+            "fixture_descriptor_sha256": (
+                fixture_descriptor_sha256 or digest("f")
+            ),
             "observed_at": observed_at,
             "execution_count": execution_count,
             "checks": checks or {name: True for name in canary.UI_CHECKS},
@@ -277,6 +282,19 @@ class DriverTests(unittest.TestCase):
             b"k" * 32, canary.canonical_payload_bytes(value), hashlib.sha256
         ).hexdigest()
         return canary.canonical_payload_bytes(value)
+
+    def test_request_hmac_has_exact_cross_language_timestamp_vector(self) -> None:
+        key = bytes(range(32))
+        timestamp = "2026-08-30T01:02:03Z"
+        body = b'{"schema_version":1}'
+        self.assertEqual(
+            hmac.new(
+                key,
+                canary.driver_request_hmac_payload(timestamp, body),
+                hashlib.sha256,
+            ).hexdigest(),
+            "cb84422660014e889aa1de606126338f4eab813db4bc5355c8ec29cb7e239a37",
+        )
 
     def test_ui_driver_requires_nonce_hmac_freshness_and_every_check(self) -> None:
         nonce = digest("b")
@@ -293,13 +311,30 @@ class DriverTests(unittest.TestCase):
             )
         self.assertEqual(result, {name: True for name in canary.UI_CHECKS})
         self.assertEqual(driver["driver_version_sha256"], digest("a"))
+        self.assertEqual(driver["fixture_descriptor_sha256"], digest("f"))
         self.assertFalse(request.call_args.kwargs["retry_addresses"])
+        self.assertEqual(
+            request.call_args.kwargs["socket_timeout_seconds"],
+            canary.DRIVER_SOCKET_TIMEOUT_SECONDS,
+        )
         sent = canary.loads_strict(request.call_args.kwargs["body"])
         self.assertEqual(sent["idempotency_key"], nonce)
         self.assertEqual(sent["change_receipt_sha256"], digest("c"))
+        self.assertEqual(sent["fixture_descriptor_sha256"], digest("f"))
         headers = request.call_args.kwargs["headers"]
         self.assertNotIn("Authorization", headers)
         self.assertRegex(headers["X-ReReply-Canary-Signature"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            headers["X-ReReply-Canary-Signature"],
+            hmac.new(
+                b"k" * 32,
+                canary.driver_request_hmac_payload(
+                    headers["X-ReReply-Canary-Timestamp"],
+                    request.call_args.kwargs["body"],
+                ),
+                hashlib.sha256,
+            ).hexdigest(),
+        )
 
         failed = {name: True for name in canary.UI_CHECKS}
         failed["cross_organization_send_denied"] = False
@@ -313,6 +348,29 @@ class DriverTests(unittest.TestCase):
                 canary.run_ui_driver(
                     self.driver_config(), control_sha="a" * 40,
                     change_receipt_sha256=digest("c"), nonce=nonce, now=now,
+                )
+
+        mismatched_fixture = self.response(
+            nonce,
+            "2026-08-27T01:00:00Z",
+            fixture_descriptor_sha256=digest("e"),
+        )
+        with mock.patch.object(
+            canary,
+            "secure_https_request",
+            return_value=(
+                200,
+                {"content-type": "application/json"},
+                mismatched_fixture,
+            ),
+        ):
+            with self.assertRaises(canary.CanaryError):
+                canary.run_ui_driver(
+                    self.driver_config(),
+                    control_sha="a" * 40,
+                    change_receipt_sha256=digest("c"),
+                    nonce=nonce,
+                    now=now,
                 )
 
         replayed = self.response(
@@ -329,14 +387,151 @@ class DriverTests(unittest.TestCase):
                     change_receipt_sha256=digest("c"), nonce=nonce, now=now,
                 )
 
+    def test_driver_timeout_is_bounded_and_health_probes_keep_the_default(self) -> None:
+        endpoints = {
+            label: f"https://crm.example.com/canary/{label}"
+            for label in canary.HEALTH_STATUSES
+        }
+        with mock.patch.object(
+            canary,
+            "secure_https_request",
+            side_effect=[
+                (status, {"content-type": "application/json"}, b"{}")
+                for status in [
+                    canary.HEALTH_STATUSES[label]
+                    for label in sorted(canary.HEALTH_STATUSES)
+                ]
+            ],
+        ) as request:
+            self.assertEqual(
+                canary.run_health_probes(endpoints),
+                {label: True for label in sorted(canary.HEALTH_STATUSES)},
+            )
+        self.assertEqual(request.call_count, len(canary.HEALTH_STATUSES))
+        for call in request.call_args_list:
+            self.assertEqual(
+                call.kwargs["socket_timeout_seconds"],
+                canary.DEFAULT_SOCKET_TIMEOUT_SECONDS,
+            )
+
+        self.assertLess(
+            canary.DRIVER_SOCKET_TIMEOUT_SECONDS,
+            canary.MAX_DRIVER_CLOCK_SKEW_SECONDS,
+        )
+        with self.assertRaises(canary.CanaryError):
+            canary.secure_https_request(
+                "https://crm.example.com/health",
+                method="GET",
+                maximum_body_bytes=1,
+                socket_timeout_seconds=canary.DRIVER_SOCKET_TIMEOUT_SECONDS + 1,
+            )
+
+    def test_https_deadline_is_monotonic_across_headers_and_bounded_reads(self) -> None:
+        class FakeSocket:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+                self.closed = False
+
+            def settimeout(self, value: float) -> None:
+                self.timeouts.append(value)
+
+            def sendall(self, _value: bytes) -> None:
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self, tls_socket: FakeSocket) -> None:
+                self.tls_socket = tls_socket
+
+            def wrap_socket(self, _raw: FakeSocket, *, server_hostname: str) -> FakeSocket:
+                self.server_hostname = server_hostname
+                return self.tls_socket
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, chunks: list[bytes], on_read=None) -> None:
+                self.chunks = list(chunks)
+                self.read_sizes: list[int] = []
+                self.on_read = on_read
+
+            def begin(self) -> None:
+                return None
+
+            def getheader(self, _name: str):
+                return None
+
+            def read(self, size: int) -> bytes:
+                self.read_sizes.append(size)
+                if self.on_read is not None:
+                    self.on_read(len(self.read_sizes))
+                return self.chunks.pop(0)
+
+            def getheaders(self) -> list[tuple[str, str]]:
+                return [("Content-Type", "application/json")]
+
+        raw_socket = FakeSocket()
+        tls_socket = FakeSocket()
+        response = FakeResponse([b"ab", b"cd", b""])
+        ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+        with (
+            mock.patch.object(canary, "resolve_public_addresses", return_value=["203.0.114.10"]),
+            mock.patch.object(canary.time, "monotonic", side_effect=lambda: next(ticks)),
+            mock.patch.object(canary.socket, "create_connection", return_value=raw_socket) as connect,
+            mock.patch.object(canary.ssl, "create_default_context", return_value=FakeContext(tls_socket)),
+            mock.patch.object(canary, "HTTPResponse", return_value=response),
+        ):
+            status, headers, payload = canary.secure_https_request(
+                "https://synthetic.example.com/run/ui",
+                method="GET",
+                maximum_body_bytes=4,
+                retry_addresses=False,
+                socket_timeout_seconds=20,
+            )
+        self.assertEqual((status, headers, payload), (200, {"content-type": "application/json"}, b"abcd"))
+        self.assertEqual(response.read_sizes, [5, 3, 1])
+        self.assertLess(connect.call_args.kwargs["timeout"], 20)
+        self.assertTrue(all(0 < value < 20 for value in tls_socket.timeouts))
+        self.assertEqual(tls_socket.timeouts, sorted(tls_socket.timeouts, reverse=True))
+
+        deadline_clock = {"now": 0.0}
+        expired_response = FakeResponse(
+            [b"a", b""],
+            on_read=lambda count: deadline_clock.update(now=21.0) if count == 1 else None,
+        )
+        with (
+            mock.patch.object(canary, "resolve_public_addresses", return_value=["203.0.114.10"]),
+            mock.patch.object(canary.time, "monotonic", side_effect=lambda: deadline_clock["now"]),
+            mock.patch.object(canary.socket, "create_connection", return_value=FakeSocket()),
+            mock.patch.object(canary.ssl, "create_default_context", return_value=FakeContext(FakeSocket())),
+            mock.patch.object(canary, "HTTPResponse", return_value=expired_response),
+        ):
+            with self.assertRaises(canary.CanaryError):
+                canary.secure_https_request(
+                    "https://synthetic.example.com/run/ui",
+                    method="GET",
+                    maximum_body_bytes=4,
+                    retry_addresses=False,
+                    socket_timeout_seconds=20,
+                )
+
     def test_driver_config_requires_a_32_byte_key_and_exact_version(self) -> None:
         value = {
             "schema_version": 1,
             "url": "https://synthetic.example.com/run/ui",
             "driver_version_sha256": digest("a"),
+            "fixture_descriptor_sha256": digest("f"),
             "hmac_key_base64": base64.b64encode(b"k" * 32).decode("ascii"),
         }
-        self.assertEqual(canary.validate_driver_config(value)["hmac_key"], b"k" * 32)
+        validated = canary.validate_driver_config(value)
+        self.assertEqual(validated["hmac_key"], b"k" * 32)
+        self.assertEqual(validated["fixture_descriptor_sha256"], digest("f"))
+        invalid_fixture = dict(value)
+        invalid_fixture["fixture_descriptor_sha256"] = "not-a-hash"
+        with self.assertRaises(canary.CanaryError):
+            canary.validate_driver_config(invalid_fixture)
         value["hmac_key_base64"] = base64.b64encode(b"short").decode("ascii")
         with self.assertRaises(canary.CanaryError):
             canary.validate_driver_config(value)

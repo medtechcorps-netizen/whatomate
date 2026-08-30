@@ -27,6 +27,11 @@ const mocks = vi.hoisted(() => ({
   toastError: vi.fn(),
   blockOrganizationSwitch: vi.fn(),
   unblockOrganizationSwitch: vi.fn(),
+  resizeObservers: [] as Array<{
+    callback: ResizeObserverCallback
+    observe: ReturnType<typeof vi.fn>
+    disconnect: ReturnType<typeof vi.fn>
+  }>,
   organizationStore: {
     selectedOrgId: 'organization-1',
   },
@@ -288,6 +293,7 @@ async function mountAndSelectConversation() {
 describe('ChannelsView messaging behavior', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.resizeObservers = []
     delayLegacyReplyDigestForValidation()
     clearLegacyWhatsAppReplyAttemptNamespace()
     mocks.organizationStore.selectedOrgId = 'organization-1'
@@ -322,6 +328,20 @@ describe('ChannelsView messaging behavior', () => {
         },
       },
     })
+    class MockResizeObserver {
+      observe = vi.fn()
+      unobserve = vi.fn()
+      disconnect = vi.fn()
+
+      constructor(callback: ResizeObserverCallback) {
+        mocks.resizeObservers.push({
+          callback,
+          observe: this.observe,
+          disconnect: this.disconnect,
+        })
+      }
+    }
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
   })
 
   afterEach(() => {
@@ -329,6 +349,7 @@ describe('ChannelsView messaging behavior', () => {
     wrapper = null
     inboxActivityHandler = null
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
 
   it('sends only through the conversation-scoped legacy WhatsApp endpoint', async () => {
@@ -826,6 +847,105 @@ describe('ChannelsView messaging behavior', () => {
       ).toBe(640)
     } finally {
       scrollHeight.mockRestore()
+    }
+  })
+
+  it('exposes stable conversation and message identity selectors', async () => {
+    setInbox()
+    mocks.messages.mockResolvedValue({
+      data: {
+        data: {
+          messages: [{
+            message: {
+              id: 'message-selector-1',
+              direction: 'incoming',
+              message_type: 'text',
+              content: 'Selector-bound message',
+              status: 'received',
+              created_at: '2026-08-24T04:00:00Z',
+            },
+          }],
+          total: 1,
+        },
+      },
+    })
+
+    const view = await mountAndSelectConversation()
+    const conversation = view.get('[data-testid="omnichannel-conversation"]')
+    expect(conversation.attributes('data-conversation-id')).toBe('conversation-1')
+    expect(conversation.attributes('data-contact-id')).toBe('contact-1')
+
+    const transcript = view.get('[data-testid="omnichannel-message-list"]')
+    expect(transcript.attributes('data-conversation-id')).toBe('conversation-1')
+    const message = transcript.get('[data-testid="omnichannel-message"]')
+    expect(message.attributes('data-message-id')).toBe('message-selector-1')
+    expect(message.attributes('data-message-direction')).toBe('incoming')
+  })
+
+  it('follows late transcript reflow only while the reader remains at the bottom', async () => {
+    setInbox()
+    const view = await mountAndSelectConversation()
+    const resizeObserver = mocks.resizeObservers[0]
+    expect(resizeObserver).toBeDefined()
+
+    const content = view.get('[data-testid="omnichannel-message-list"]').element
+    expect(resizeObserver.observe).toHaveBeenCalledWith(content)
+    const viewport = view.get('[data-testid="omnichannel-message-viewport"]')
+      .element as HTMLElement
+    let scrollHeight = 400
+    Object.defineProperties(viewport, {
+      scrollHeight: { configurable: true, get: () => scrollHeight },
+      clientHeight: { configurable: true, value: 300 },
+    })
+
+    viewport.scrollTop = 100
+    viewport.dispatchEvent(new Event('scroll'))
+    scrollHeight = 600
+    resizeObserver.callback([{
+      target: content,
+      contentRect: { height: 600 },
+    } as ResizeObserverEntry], {} as ResizeObserver)
+    await nextTick()
+    await nextTick()
+    expect(viewport.scrollTop).toBe(600)
+
+    viewport.scrollTop = 50
+    viewport.dispatchEvent(new Event('scroll'))
+    scrollHeight = 800
+    resizeObserver.callback([{
+      target: content,
+      contentRect: { height: 800 },
+    } as ResizeObserverEntry], {} as ResizeObserver)
+    await nextTick()
+    await nextTick()
+    expect(viewport.scrollTop).toBe(50)
+
+    view.unmount()
+    wrapper = null
+    expect(resizeObserver.disconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it('disconnects transcript observation when a refresh removes the selected conversation', async () => {
+    vi.useFakeTimers()
+    try {
+      setInbox()
+      const view = await mountAndSelectConversation()
+      const resizeObserver = mocks.resizeObservers[0]
+      expect(resizeObserver).toBeDefined()
+
+      mocks.conversations.mockResolvedValue({
+        data: { data: { conversations: [], total: 0 } },
+      })
+      inboxActivityHandler?.({ type: 'new_message' })
+      await vi.advanceTimersByTimeAsync(300)
+      await flushPromises()
+
+      expect(resizeObserver.disconnect).toHaveBeenCalledTimes(1)
+      expect(view.find('[data-testid="omnichannel-message-list"]').exists()).toBe(false)
+    } finally {
+      wrapper?.unmount()
+      wrapper = null
+      vi.useRealTimers()
     }
   })
 

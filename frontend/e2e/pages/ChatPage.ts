@@ -19,7 +19,7 @@ export class ChatPage extends BasePage {
 
   constructor(page: Page) {
     super(page)
-    this.contactList = page.locator('.contacts-list, [data-testid="contacts"]').first()
+    this.contactList = page.getByTestId('chat-contact-list')
     this.searchInput = page.locator('input[placeholder*="Search"]').first()
     this.messageInput = page.locator('textarea[placeholder*="message"], input[placeholder*="message"]')
     this.sendButton = page.getByRole('button').filter({ has: page.locator('.lucide-send') })
@@ -27,7 +27,7 @@ export class ChatPage extends BasePage {
     this.emojiButton = page.getByRole('button').filter({ has: page.locator('.lucide-smile') })
     this.cannedResponsesButton = page.locator('#canned-response-picker-button')
     this.contactInfoPanel = page.locator('[data-testid="customer-revenue-workspace"]').first()
-    this.messageList = page.locator('.messages-container, [data-testid="messages"]')
+    this.messageList = page.getByTestId('chat-message-list')
     this.assignDialog = page.locator('[role="dialog"][data-state="open"]')
     this.mediaDialog = page.locator('[role="dialog"][data-state="open"]').filter({ hasText: /Send|Upload|Media/i })
   }
@@ -48,12 +48,12 @@ export class ChatPage extends BasePage {
   }
 
   async selectContact(name: string) {
-    await this.page.locator('.contact-item, [data-testid="contact"]').filter({ hasText: name }).click()
+    await this.page.getByTestId('chat-contact').filter({ hasText: name }).click()
     await this.page.waitForLoadState('networkidle')
   }
 
   getContactItem(name: string): Locator {
-    return this.page.locator('.contact-item, [data-testid="contact"]').filter({ hasText: name })
+    return this.page.getByTestId('chat-contact').filter({ hasText: name })
   }
 
   // Message helpers
@@ -67,11 +67,11 @@ export class ChatPage extends BasePage {
   }
 
   getMessageBubble(text: string): Locator {
-    return this.messageList.locator('.message-bubble, [data-testid="message"]').filter({ hasText: text })
+    return this.messageList.getByTestId('chat-message').filter({ hasText: text })
   }
 
   async getLastMessage(): Promise<string> {
-    const messages = this.messageList.locator('.message-bubble, [data-testid="message"]')
+    const messages = this.messageList.getByTestId('chat-message')
     const lastMessage = messages.last()
     return await lastMessage.textContent() || ''
   }
