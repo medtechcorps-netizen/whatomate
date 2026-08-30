@@ -1734,6 +1734,60 @@ def assert_crm_canary_driver_publisher(source: str) -> None:
 
 
 class WorkflowAuthorityPolicyTests(unittest.TestCase):
+    def test_pinned_jq_release_checksum_is_exact_in_every_consumer(self) -> None:
+        url = "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64"
+        expected = (
+            "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f"
+        )
+
+        def assert_exact_pin(source: str) -> None:
+            active = normalized_active_lines(source)
+            self.assertEqual(active.count(f"PINNED_JQ_URL: {url}"), 1)
+            pins = tuple(
+                line for line in active if line.startswith("PINNED_JQ_SHA256:")
+            )
+            self.assertEqual(pins, (f"PINNED_JQ_SHA256: {expected}",))
+
+        consumers = (
+            "aggregate-exact-four-phase-rollout.yml",
+            "apply-production-phase.yml",
+            "build-attest-exact-release-images.yml",
+            "cleanup-production-valkey-recovery-fork.yml",
+            "finalize-production-orphan-lock.yml",
+            "plan-production-rollout.yml",
+            "prepare-production-valkey-recovery-fork.yml",
+            "publish-attest-production-crm-canary-driver.yml",
+            "reconcile-production-main-lock-release.yml",
+            "reconcile-production-orphan-lock-release.yml",
+            "reconcile-production-orphan.yml",
+            "rollback-production-orphan.yml",
+            "rollback-production-phase.yml",
+            "verify-production-crm-canary.yml",
+            "verify-production-recovery-readiness.yml",
+        )
+        for name in consumers:
+            with self.subTest(workflow=name):
+                assert_exact_pin(workflow(name))
+
+        source = workflow("prepare-production-valkey-recovery-fork.yml")
+        pin_line = f"PINNED_JQ_SHA256: {expected}"
+        mutants = (
+            source.replace(pin_line, "PINNED_JQ_SHA256: " + expected[:-1], 1),
+            source.replace(pin_line, "PINNED_JQ_SHA256: " + "0" * 64, 1),
+            source.replace(pin_line, "", 1),
+            source.replace(pin_line, pin_line + "\n  " + pin_line, 1),
+            source.replace(f"PINNED_JQ_URL: {url}", "", 1),
+            source.replace(
+                f"PINNED_JQ_URL: {url}",
+                "PINNED_JQ_URL: https://example.invalid/jq",
+                1,
+            ),
+        )
+        for mutant in mutants:
+            self.assertNotEqual(mutant, source)
+            with self.assertRaises(AssertionError):
+                assert_exact_pin(mutant)
+
     def test_every_active_release_control_is_manual_exact_main_and_serialized(self) -> None:
         for name in ACTIVE_PRODUCTION_CONTROLS:
             with self.subTest(workflow=name):
