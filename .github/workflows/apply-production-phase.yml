@@ -248,8 +248,8 @@ jobs:
           if p["schema_version"] != 2 or p["control"]["workflow_sha"] != raw["control_sha"] or p["rollout_authority"]["rollout_plan_sha256"] != raw["rollout_plan_sha256"] or p["predecessor_authority"]["state_sha256"] != raw["predecessor_state_sha256"]: raise SystemExit("plan authority differs")
           out=pathlib.Path(os.environ["GITHUB_OUTPUT"])
           pred=p["predecessor_authority"]; rollout=p["rollout_authority"]
-          lines=[f"predecessor_kind={pred[\"kind\"]}",f"rollout_run_id={rollout[\"run_id\"]}",f"rollout_name=exact-four-phase-rollout-{rollout[\"run_id\"]}-{rollout[\"run_attempt\"]}"]
-          if pred["kind"]=="phase-state": lines += [f"predecessor_run_id={pred[\"run_id\"]}",f"predecessor_name=production-phase-state-{pred[\"run_id\"]}-{pred[\"run_attempt\"]}"]
+          lines=["predecessor_kind={}".format(pred["kind"]),"rollout_run_id={}".format(rollout["run_id"]),"rollout_name=exact-four-phase-rollout-{}-{}".format(rollout["run_id"],rollout["run_attempt"])]
+          if pred["kind"]=="phase-state": lines += ["predecessor_run_id={}".format(pred["run_id"]),"predecessor_name=production-phase-state-{}-{}".format(pred["run_id"],pred["run_attempt"])]
           elif pred["kind"]!="genesis": raise SystemExit("predecessor kind differs")
           out.open("a",encoding="utf-8").write("\n".join(lines)+"\n")'
 
