@@ -458,11 +458,11 @@ class ProductionReleaseVerifierTests(unittest.TestCase):
             root / ".github/workflows/apply-production-phase.yml"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            r'production-phase-state-{pred[\"run_id\"]}-{pred[\"run_attempt\"]}',
+            'production-phase-state-{}-{}".format(pred["run_id"],pred["run_attempt"])',
             apply_workflow,
         )
         self.assertNotIn(
-            r'production-phase-state-{pred[\"phase\"]}',
+            'production-phase-state-{}".format(pred["phase"])',
             apply_workflow,
         )
 

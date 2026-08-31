@@ -1542,7 +1542,7 @@ class ProductionPlanTests(unittest.TestCase):
             planner,
         )
         self.assertIn(
-            r'predecessor_name=production-phase-state-{pred[\"run_id\"]}-{pred[\"run_attempt\"]}',
+            'predecessor_name=production-phase-state-{}-{}".format(pred["run_id"],pred["run_attempt"])',
             apply,
         )
         self.assertIn(

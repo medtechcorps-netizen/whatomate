@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -32,7 +33,7 @@ AUXILIARY_PRODUCTION_CONTROLS = (
 PINNED_ACTION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}(?:\s+#.*)?$")
 TERMINAL_PARITY_WORKFLOW_SHA256 = {
     "apply-production-phase.yml": (
-        "fbb3757e5eec112b78a86e75a851cfe46fdc58e0fed9aa08b115dc9b7869b2f1"
+        "8e4facad9a22b9154f1e1f9c5365e7ac7830c84e3ae509cab661beb5a5b47386"
     ),
     "rollback-production-phase.yml": (
         "33e97fb2b723e34c4539022b07433ac410deda40e33af0d61985a9c2c0361663"
@@ -3554,10 +3555,10 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
             plan,
         )
         self.assertIn(
-            'f"predecessor_name=production-phase-state-{pred[\\"run_id\\"]}-{pred[\\"run_attempt\\"]}"',
+            '"predecessor_name=production-phase-state-{}-{}".format(pred["run_id"],pred["run_attempt"])',
             apply,
         )
-        self.assertNotIn('production-phase-state-{pred[\\"phase\\"]}', apply)
+        self.assertNotIn('production-phase-state-{}".format(pred["phase"])', apply)
         self.assertIn(
             "`production-phase-state-${value.target_state.run_id}-1`",
             rollback,
@@ -4341,6 +4342,23 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
         self.assertIn("contract_sha256", verification)
         self.assertIn("verifier_sha256", verification)
         self.assertIn("production plan sidecar differs", verification)
+
+    def test_apply_coordinate_extractor_is_valid_python(self) -> None:
+        source = workflow("apply-production-phase.yml")
+        extraction = step_block(
+            source,
+            "Extract immutable rollout and predecessor coordinates",
+        )
+        match = re.search(
+            r"(?ms)^          /usr/bin/python3 -I -S -B -c '\n"
+            r"(?P<body>.*?)'\s*$",
+            extraction,
+        )
+        self.assertIsNotNone(match)
+        body = textwrap.dedent(match.group("body"))
+        compile(body, "apply-coordinate-extractor", "exec")
+        self.assertNotIn(r'pred[\"', body)
+        self.assertNotIn(r'rollout[\"', body)
 
     def test_attestation_signers_are_full_repository_workflow_identities(self) -> None:
         for name in ACTIVE_PRODUCTION_CONTROLS:
