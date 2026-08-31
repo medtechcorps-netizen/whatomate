@@ -49,10 +49,12 @@ MAX_FORK_TTL_SECONDS = 24 * 60 * 60
 MAX_INTENT_AGE_SECONDS = 15 * 60
 MAX_PROVIDER_POLLS = 40
 PROVIDER_POLL_SECONDS = 15
-LIST_PATH = "/v2/databases?page=1&per_page=200"
+LIST_PAGE_SIZE = 200
+LIST_PATH = f"/v2/databases?page=1&per_page={LIST_PAGE_SIZE}"
 DATABASES_PATH = "/v2/databases"
 APP_TO_DATABASE_REGION = {"sgp": "sgp1"}
 CLUSTER_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])$")
+_MISSING = object()
 SIZE_RE = re.compile(r"^db-[a-z0-9-]{3,120}$")
 
 CREATE_CONTROL_KEYS = {
@@ -781,25 +783,46 @@ def _require_exact_app_firewall(
     return raw_rules[0]["value"]
 
 
+def _complete_database_collection(value: Any) -> list[Any]:
+    if type(value) is not dict:
+        _fail("database inventory response differs")
+    databases = value.get("databases", _MISSING)
+    if type(databases) is not list or len(databases) > LIST_PAGE_SIZE:
+        _fail("database inventory is malformed or incomplete")
+
+    links = value.get("links", _MISSING)
+    if links is not _MISSING:
+        if type(links) is not dict or set(links) - {"pages"}:
+            _fail("database inventory pagination metadata is malformed")
+        pages = links.get("pages", _MISSING)
+        if pages is not _MISSING and (type(pages) is not dict or pages):
+            _fail("database inventory has unconsumed pagination metadata")
+
+    meta = value.get("meta", _MISSING)
+    if meta is _MISSING:
+        # DigitalOcean may omit the optional collection metadata when the
+        # complete result fits on the requested page.  A full page without a
+        # total remains ambiguous and therefore fails closed.
+        if len(databases) >= LIST_PAGE_SIZE:
+            _fail("database inventory completeness metadata is missing")
+    else:
+        if type(meta) is not dict or type(meta.get("total", _MISSING)) is not int:
+            _fail("database inventory completeness metadata is malformed")
+        total = common.exact_int(
+            meta["total"], "database inventory total", 0, LIST_PAGE_SIZE
+        )
+        if total != len(databases):
+            _fail("database inventory is paginated or incomplete")
+    return databases
+
+
 def _list_inventory(
     session: ProviderSession, *, label: str = "valkey-recovery-discovery"
 ) -> list[dict[str, Any]]:
     result = session.call(label, "GET", LIST_PATH)
-    if result.status != 200 or type(result.value) is not dict:
+    if result.status != 200:
         _fail("database inventory response differs")
-    databases = result.value.get("databases")
-    if type(databases) is not list or len(databases) > 200:
-        _fail("database inventory is malformed or incomplete")
-    meta = result.value.get("meta")
-    if type(meta) is not dict or type(meta.get("total")) is not int:
-        _fail("database inventory completeness metadata is missing")
-    total = common.exact_int(meta["total"], "database inventory total", 0, 200)
-    if total != len(databases):
-        _fail("database inventory is paginated or incomplete")
-    links = result.value.get("links")
-    if type(links) is dict and type(links.get("pages")) is dict:
-        if links["pages"].get("next") is not None:
-            _fail("database inventory has an unconsumed next page")
+    databases = _complete_database_collection(result.value)
     identities: set[str] = set()
     names: set[str] = set()
     inventory: list[dict[str, Any]] = []
