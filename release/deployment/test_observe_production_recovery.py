@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import apply_production_change as apply
 import observe_production_recovery as recovery
+import provider_native_valkey_recovery as fork_control
 import verify_production_release as common
 
 
@@ -116,12 +117,26 @@ def observations() -> dict[str, object]:
     }
 
 
-def discovery(*, duplicate: bool = False) -> dict[str, object]:
+def discovery_records(count: int = 3) -> list[dict[str, str]]:
+    if count < 3:
+        raise ValueError("discovery fixture must contain the three bound records")
     records = [
         {"id": TARGET["postgres_cluster_id"], "name": DATABASE_NAMES["postgres"]},
         {"id": TARGET["valkey_cluster_id"], "name": DATABASE_NAMES["valkey"]},
         {"id": RECOVERY_ID, "name": FORK_NAME},
     ]
+    records.extend(
+        {
+            "id": f"{index:08x}-aaaa-4aaa-8aaa-{index:012x}",
+            "name": f"synthetic-discovery-{index:03d}",
+        }
+        for index in range(1, count - 2)
+    )
+    return records
+
+
+def discovery(*, duplicate: bool = False) -> dict[str, object]:
+    records = discovery_records()
     if duplicate:
         records.append(
             {"id": "66666666-6666-4666-8666-666666666666", "name": FORK_NAME}
@@ -550,14 +565,72 @@ class RecoveryReadinessTests(unittest.TestCase):
         self.assertEqual(result["authorities"]["valkey_fork"]["sha256"], fork_auth["sha256"])
 
     def test_discovery_is_exact_unique_and_complete(self) -> None:
-        for value in (
+        accepted = (
+            {"databases": discovery_records(5)},
+            {"databases": discovery_records(5), "links": {}},
+            {"databases": discovery_records(5), "links": {"pages": {}}},
+            {"databases": discovery_records(5), "meta": {"total": 5}},
+            {
+                "databases": discovery_records(
+                    fork_control.LIST_PAGE_SIZE - 1
+                )
+            },
+        )
+        for value in accepted:
+            with self.subTest(accepted=value):
+                opener = FakeOpener(
+                    [(value, common.API_ORIGIN + recovery.DISCOVERY_PATH)]
+                )
+                client = recovery.DatabaseReadClient(
+                    TARGET, "t" * 24, opener=opener
+                )
+                self.assertEqual(client.discover_fork(FORK_NAME), RECOVERY_ID)
+                self.assertEqual(len(opener.requests), 1)
+
+        malformed = (
             {"databases": [], "meta": {"total": 0}},
             discovery(duplicate=True),
+            {
+                "databases": discovery_records()
+                + [
+                    {
+                        "id": TARGET["postgres_cluster_id"],
+                        "name": "synthetic-duplicate-identity",
+                    }
+                ],
+                "meta": {"total": 4},
+            },
             {**discovery(), "meta": {"total": 4}},
-        ):
-            with self.subTest(value=value):
+            {"databases": discovery_records(fork_control.LIST_PAGE_SIZE)},
+            {
+                "databases": discovery_records(fork_control.LIST_PAGE_SIZE + 1),
+                "meta": {"total": fork_control.LIST_PAGE_SIZE + 1},
+            },
+            {"databases": discovery_records(), "meta": None},
+            {"databases": discovery_records(), "meta": []},
+            {"databases": discovery_records(), "meta": {}},
+            {"databases": discovery_records(), "meta": {"total": True}},
+            {"databases": discovery_records(), "meta": {"total": -1}},
+            {
+                "databases": discovery_records(),
+                "meta": {"total": fork_control.LIST_PAGE_SIZE + 1},
+            },
+            {"databases": discovery_records(), "links": None},
+            {"databases": discovery_records(), "links": []},
+            {"databases": discovery_records(), "links": {"pages": None}},
+            {"databases": discovery_records(), "links": {"pages": []}},
+            {
+                "databases": discovery_records(),
+                "links": {"pages": {"next": "https://example.invalid/page/2"}},
+            },
+            {"databases": discovery_records(), "links": {"pages": {"last": 2}}},
+            {"databases": discovery_records(), "links": {"pages": {"prev": 1}}},
+            {"databases": discovery_records(), "links": {"other": {}}},
+        )
+        for value in malformed:
+            with self.subTest(rejected=value):
                 opener = FakeOpener(
-                    [(value, common.API_ORIGIN + "/v2/databases?page=1&per_page=200")]
+                    [(value, common.API_ORIGIN + recovery.DISCOVERY_PATH)]
                 )
                 client = recovery.DatabaseReadClient(TARGET, "t" * 24, opener=opener)
                 with self.assertRaises(common.ReleaseError):

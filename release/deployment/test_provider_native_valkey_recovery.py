@@ -337,6 +337,96 @@ class ProviderNativeValkeyRecoveryTests(unittest.TestCase):
             common.canonical_file_bytes(self.intent)
         )
 
+    def test_inventory_accepts_absent_optional_meta_only_below_page_ceiling(
+        self,
+    ) -> None:
+        def unique_records(count: int) -> list[dict[str, Any]]:
+            return [
+                database(
+                    f"{index:08x}-1111-4111-8111-{index:012x}",
+                    f"synthetic-valkey-{index:03d}",
+                    created_at="2025-01-01T00:00:00Z",
+                )
+                for index in range(1, count + 1)
+            ]
+
+        five = unique_records(5)
+        accepted_responses = (
+            {"databases": five},
+            {"databases": five, "links": {}},
+            {"databases": five, "links": {"pages": {}}},
+            {"databases": five, "meta": {"total": 5}},
+            {"databases": unique_records(fork.LIST_PAGE_SIZE - 1)},
+        )
+        for response in accepted_responses:
+            with self.subTest(response=response):
+                session = fork.ProviderSession(
+                    FakeTransport([("GET", fork.LIST_PATH, ok(response))])
+                )
+                inventory = fork._list_inventory(session)
+                self.assertEqual(len(inventory), len(response["databases"]))
+                self.assertEqual(
+                    [item["id"] for item in inventory],
+                    [item["id"] for item in response["databases"]],
+                )
+                self.assertTrue(all("connection" not in item for item in inventory))
+                self.assertEqual(
+                    session.ledger, [("GET", "valkey-recovery-discovery")]
+                )
+
+        source = five[0]
+        malformed_responses = (
+            {"databases": unique_records(fork.LIST_PAGE_SIZE)},
+            {
+                "databases": unique_records(fork.LIST_PAGE_SIZE + 1),
+                "meta": {"total": fork.LIST_PAGE_SIZE + 1},
+            },
+            {
+                "databases": [source],
+                "links": {"pages": {"next": "https://example.invalid/page/2"}},
+            },
+            {"databases": [source], "links": {"pages": {"last": 2}}},
+            {"databases": [source], "links": {"pages": {"prev": 1}}},
+            {"databases": [source], "links": {"other": {}}},
+            {"databases": [source], "links": None},
+            {"databases": [source], "links": []},
+            {"databases": [source], "links": {"pages": None}},
+            {"databases": [source], "links": {"pages": []}},
+            {"databases": [source], "meta": None},
+            {"databases": [source], "meta": []},
+            {"databases": [source], "meta": {}},
+            {"databases": [source], "meta": {"total": True}},
+            {"databases": [source], "meta": {"total": -1}},
+            {
+                "databases": [source],
+                "meta": {"total": fork.LIST_PAGE_SIZE + 1},
+            },
+            {"databases": [source], "meta": {"total": 2}},
+            {
+                "databases": [
+                    source,
+                    {**unique_records(2)[1], "id": source["id"]},
+                ],
+                "meta": {"total": 2},
+            },
+            {
+                "databases": [
+                    source,
+                    {**unique_records(2)[1], "name": source["name"]},
+                ],
+                "meta": {"total": 2},
+            },
+        )
+        for response in malformed_responses:
+            with self.subTest(response=response):
+                rejected = fork.ProviderSession(
+                    FakeTransport(
+                        [("GET", fork.LIST_PATH, ok(response))]
+                    )
+                )
+                with self.assertRaises(common.ReleaseError):
+                    fork._list_inventory(rejected)
+
     def create_receipt(self) -> tuple[dict[str, Any], FakeCapabilities]:
         transport = FakeCapabilities(create_steps(self.fork_name))
         receipt = fork.create_or_reconcile(

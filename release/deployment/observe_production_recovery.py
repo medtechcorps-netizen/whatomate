@@ -45,6 +45,7 @@ STABLE_LABELS = [
     "valkey-recovery-firewall",
 ]
 DISCOVERY_LABEL = "valkey-recovery-discovery"
+DISCOVERY_PATH = fork_control.LIST_PATH
 
 
 def _provider_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -351,23 +352,20 @@ class DatabaseReadClient:
     def discover_fork(self, exact_name: str) -> str:
         if not FORK_NAME_RE.fullmatch(exact_name) or len(exact_name) > 63:
             common.fail("Valkey recovery fork name differs")
-        value = self._get(DISCOVERY_LABEL, "/v2/databases?page=1&per_page=200")
-        if type(value) is not dict or type(value.get("databases")) is not list:
-            common.fail("database discovery response is malformed")
-        databases = value["databases"]
-        meta = value.get("meta")
-        if (
-            type(meta) is not dict
-            or common.exact_int(meta.get("total"), "database discovery total", 0, 200)
-            != len(databases)
-        ):
-            common.fail("database discovery inventory is incomplete")
+        value = self._get(DISCOVERY_LABEL, DISCOVERY_PATH)
+        databases = fork_control._complete_database_collection(value)
         matches: list[dict[str, str]] = []
+        identities: set[str] = set()
+        names: set[str] = set()
         for item in databases:
             if type(item) is not dict:
                 common.fail("database discovery record is malformed")
             name = common.exact_string(item.get("name"), "database discovery name")
             identity = common.require_uuid(item.get("id"), "database discovery identity")
+            if identity in identities or name in names:
+                common.fail("database discovery contains duplicate identities or names")
+            identities.add(identity)
+            names.add(name)
             if name == exact_name:
                 matches.append({"id": identity, "name": name})
         if len(matches) != 1:
