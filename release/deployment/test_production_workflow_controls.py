@@ -3742,6 +3742,59 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
         cleanup_gate = step_block(
             cleanup, "Validate exact sanitized cleanup receipt"
         )
+        direct_output_cases = (
+            (
+                intent_step,
+                "prepare-intent",
+                "production-valkey-recovery-fork-create-intent.json",
+                "fork-intent",
+            ),
+            (
+                create_step,
+                "create-or-reconcile",
+                "production-valkey-recovery-fork-create-receipt.json",
+                "fork-receipt",
+            ),
+            (
+                delete_step,
+                "delete-or-reconcile",
+                "production-valkey-recovery-fork-delete-receipt.json",
+                "cleanup-receipt",
+            ),
+            (
+                cleanup_gate,
+                "validate-delete-receipt",
+                "production-valkey-recovery-fork-delete-receipt.json",
+                "validated-cleanup-receipt",
+            ),
+        )
+        for step, subcommand, filename, artifact_directory in direct_output_cases:
+            active = normalized_active_lines(step)
+            with self.subTest(direct_runner_temp_output=artifact_directory):
+                output_lines = tuple(
+                    (index, line)
+                    for index, line in enumerate(active)
+                    if "--output" in line
+                )
+                self.assertEqual(len(output_lines), 1)
+                output_index, output_line = output_lines[0]
+                self.assertIn(
+                    f'"control/$CONTROLLER_PATH" {subcommand}', output_line
+                )
+                self.assertEqual(output_line.count("--output"), 1)
+                self.assertIn(f'--output "$RUNNER_TEMP/{filename}"', output_line)
+                self.assertNotIn(
+                    f'--output "$RUNNER_TEMP/{artifact_directory}/{filename}"',
+                    output_line,
+                )
+                move_line = (
+                    f'mv "$RUNNER_TEMP/{filename}" '
+                    f'"$RUNNER_TEMP/{artifact_directory}/{filename}"'
+                )
+                self.assertEqual(
+                    active.count(move_line), 1
+                )
+                self.assertLess(output_index, active.index(move_line))
         cleanup_authority = step_block(cleanup, "Authenticate exact cleanup evidence")
         cleanup_verify = step_block(
             cleanup, "Verify signed cleanup authorities before delete capability"
