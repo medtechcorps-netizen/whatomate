@@ -185,7 +185,13 @@ INTENT_SPEC_KEYS = {
     "fork_name_sha256",
     "backup_created_at_omitted",
 }
-CLEANUP_MODES = {"terminal", "never-started", "no-mutation", "quarantine"}
+CLEANUP_MODES = {
+    "terminal",
+    "never-started",
+    "pre-mutation-failure",
+    "no-mutation",
+    "quarantine",
+}
 
 
 class MutationAmbiguous(common.AmbiguousMutation):
@@ -2191,7 +2197,8 @@ def _delete_or_reconcile_impl(
             create_intent_sha256, "Valkey fork intent hash"
         )
     if (
-        checked_cleanup_mode in {"terminal", "never-started", "no-mutation"}
+        checked_cleanup_mode
+        in {"terminal", "never-started", "pre-mutation-failure", "no-mutation"}
     ) != receipt_mode:
         _fail("cleanup mode differs from its create authority")
     _require_cleanup_release_binding(checked_control, prepare_control)
@@ -2538,7 +2545,8 @@ def validate_delete_receipt(
         or receipt_cleanup_mode != checked_cleanup_mode
         or target_value["cleanup_authority_sha256"] != cleanup_authority_sha256
         or (
-            checked_cleanup_mode in {"terminal", "never-started", "no-mutation"}
+            checked_cleanup_mode
+            in {"terminal", "never-started", "pre-mutation-failure", "no-mutation"}
         ) != (create_authority == "create-receipt")
     ):
         _fail("Valkey fork delete target authority differs")

@@ -315,6 +315,15 @@ class ProviderNativeValkeyRecoveryTests(unittest.TestCase):
             "mode": "quarantine",
             "authority_set_sha256": "e" * 64,
         }
+        self.pre_mutation_cleanup_evidence = {
+            "mode": "pre-mutation-failure",
+            "apply_failure": {
+                "run_id": "7010",
+                "run_attempt": 1,
+                "job_inventory_sha256": "1" * 64,
+                "artifact_inventory_sha256": "2" * 64,
+            },
+        }
         source = database(SOURCE_ID, SOURCE_NAME, created_at="2025-01-01T00:00:00Z")
         self.intent_transport = FakeTransport(
             [
@@ -531,6 +540,7 @@ class ProviderNativeValkeyRecoveryTests(unittest.TestCase):
         self.assertEqual(delete_help.returncode, 0, delete_help.stderr)
         self.assertIn("--cleanup-mode", delete_help.stdout)
         self.assertIn("--cleanup-evidence", delete_help.stdout)
+        self.assertIn("pre-mutation-failure", delete_help.stdout)
         gate_help = subprocess.run(
             [
                 sys.executable,
@@ -1626,6 +1636,15 @@ class ProviderNativeValkeyRecoveryTests(unittest.TestCase):
                 self.terminal_cleanup_evidence,
             ),
             (
+                "intent-pre-mutation-failure",
+                {
+                    "create_intent": self.intent,
+                    "create_intent_sha256": self.intent_sha,
+                },
+                "pre-mutation-failure",
+                self.pre_mutation_cleanup_evidence,
+            ),
+            (
                 "evidence-mode",
                 {
                     "create_receipt": receipt,
@@ -1653,6 +1672,83 @@ class ProviderNativeValkeyRecoveryTests(unittest.TestCase):
                         **authority,
                     )
                 self.assertEqual(transport.calls, [])
+
+    def test_pre_mutation_failure_cleanup_is_receipt_backed_and_exactly_bound(
+        self,
+    ) -> None:
+        create_receipt, _ = self.create_receipt()
+        create_receipt_sha = common.sha256_bytes(
+            common.canonical_file_bytes(create_receipt)
+        )
+        source = database(
+            SOURCE_ID, SOURCE_NAME, created_at="2025-01-01T00:00:00Z"
+        )
+        recovery = database(FORK_ID, self.fork_name)
+        transport = FakeCapabilities(
+            source_read_steps()
+            + [
+                ("GET", fork.LIST_PATH, inventory_result(source, recovery)),
+                ("DELETE", f"/v2/databases/{FORK_ID}", fork.APIResult(204, None)),
+                ("GET", fork.LIST_PATH, inventory_result(source)),
+            ]
+            + cleanup_round_steps(source)
+            + cleanup_round_steps(source)
+        )
+        deleted = fork.delete_or_reconcile(
+            target=TARGET,
+            control=self.cleanup_control,
+            phase=PHASE,
+            contract=self.contract,
+            contract_file_sha256=self.contract_sha,
+            create_receipt=create_receipt,
+            create_receipt_sha256=create_receipt_sha,
+            cleanup_mode="pre-mutation-failure",
+            cleanup_evidence=self.pre_mutation_cleanup_evidence,
+            read_transport=transport.read,
+            mutation_transport=transport.mutation,
+            now=NOW + dt.timedelta(days=2),
+            poll_limit=2,
+        )
+        self.assertEqual(deleted["target"]["cleanup_mode"], "pre-mutation-failure")
+        self.assertEqual(
+            deleted["target"]["cleanup_authority_sha256"],
+            common.sha256_bytes(
+                common.canonical_file_bytes(self.pre_mutation_cleanup_evidence)
+            ),
+        )
+        self.assertEqual(deleted["result"]["outcome"], "deleted")
+        self.assertEqual(sum(call[0] == "DELETE" for call in transport.calls), 1)
+        deleted_sha = common.sha256_bytes(common.canonical_file_bytes(deleted))
+        self.assertEqual(
+            fork.validate_delete_receipt(
+                deleted,
+                exact_sha256=deleted_sha,
+                target=TARGET,
+                control=self.cleanup_control,
+                phase=PHASE,
+                now=NOW + dt.timedelta(days=2),
+                cleanup_mode="pre-mutation-failure",
+                cleanup_evidence=self.pre_mutation_cleanup_evidence,
+                create_receipt=create_receipt,
+                create_receipt_sha256=create_receipt_sha,
+            ),
+            deleted,
+        )
+        tampered = copy.deepcopy(self.pre_mutation_cleanup_evidence)
+        tampered["apply_failure"]["job_inventory_sha256"] = "3" * 64
+        with self.assertRaises(common.ReleaseError):
+            fork.validate_delete_receipt(
+                deleted,
+                exact_sha256=deleted_sha,
+                target=TARGET,
+                control=self.cleanup_control,
+                phase=PHASE,
+                now=NOW + dt.timedelta(days=2),
+                cleanup_mode="pre-mutation-failure",
+                cleanup_evidence=tampered,
+                create_receipt=create_receipt,
+                create_receipt_sha256=create_receipt_sha,
+            )
 
     def test_ambiguous_delete_is_get_reconciled_without_second_delete(self) -> None:
         receipt, _ = self.create_receipt()
