@@ -7,6 +7,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from release.deployment import verify_rollout_evidence
+
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -55,7 +57,7 @@ EXACT_IMAGE_BUILD_ACTION = (
     "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6"
 )
 EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
-    "8c0b7eccb22a5cc0f64ec40f58203da01455bb8f847cbc7aaf979a2f777812ff"
+    "b9c754a5068797514c8b270aaa6f44cfc7db1fe247fcfefbee17d5b5413da0d3"
 )
 EXACT_CRM_CANARY_DRIVER_PUBLISHER_SHA256 = (
     "97fb1ee75c363914dcf7ba5baa25c51ea7e6ba0090151e26b305d9eed79c8357"
@@ -64,7 +66,26 @@ EXACT_IMAGE_GATE_STEP_SHA256 = (
     "1b4bf101f1756d43193ccc0050cf44bb9dd22df25302e084c9a9a91ede2db4a5"
 )
 EXACT_IMAGE_AUTHORITY_MATRIX_STEP_SHA256 = (
-    "7ee856b9d2567f683ffa0a45b0b5664ed2f78914390b237c25c15bd5e290d6f4"
+    "01bf9d5c8320d65eedb4cc2936e62c40fbbfe85ce3b178d5c25f553cac159962"
+)
+EXACT_RELEASE_WEB_SNAPSHOT_RUN = (
+    "RUN set -eu; "
+    "printf 'APT::Snapshot \"%s\";\\nAcquire::Retries \"10\";\\n' "
+    "\"$UBUNTU_SNAPSHOT\" > /etc/apt/apt.conf.d/50snapshot "
+    "&& apt-get update "
+    "&& DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC "
+    "apt-get install -y --no-install-recommends "
+    "ca-certificates=20260601~24.04.1 "
+    "tzdata=2026c-0ubuntu0.24.04.1 "
+    "espeak-ng=1.51+dfsg-12build1 "
+    "opus-tools=0.2-1build3 "
+    "ffmpeg=7:6.1.1-3ubuntu5 "
+    "&& for package in ca-certificates tzdata espeak-ng opus-tools ffmpeg; do "
+    "apt-cache policy \"$package\" | grep -F 'snapshot.ubuntu.com' "
+    "> /dev/null || exit 1; done "
+    "&& printf 'APT::Snapshot \"%s\";\\n' \"$UBUNTU_SNAPSHOT\" "
+    "> /etc/apt/apt.conf.d/50snapshot "
+    "&& rm -rf /var/lib/apt/lists/*"
 )
 EXACT_IMAGE_UPLOAD_NAMES = (
     "image-${{ needs.authority.outputs.phase }}-${{ matrix.component }}-"
@@ -754,6 +775,43 @@ def artifact_upload_use_count(source: str) -> int:
 
 def is_artifact_upload_step(source: str) -> bool:
     return artifact_upload_use_count(source) == 1
+
+
+def logical_dockerfile_instructions(source: str) -> tuple[str, ...]:
+    instructions: list[str] = []
+    buffer = ""
+    for raw in source.splitlines():
+        if not buffer and (not raw.strip() or raw.lstrip().startswith("#")):
+            continue
+        buffer = f"{buffer} {raw.strip()}".strip() if buffer else raw.strip()
+        if re.search(r"\\[ \t]*$", raw):
+            buffer = re.sub(r"\\[ \t]*$", "", buffer).rstrip()
+            continue
+        instructions.append(buffer)
+        buffer = ""
+    if buffer:
+        raise AssertionError("unterminated Dockerfile continuation")
+    return tuple(instructions)
+
+
+def assert_exact_release_web_snapshot_retry_controls(source: str) -> None:
+    contract_tokens = (
+        "APT::Snapshot",
+        "Acquire::Retries",
+        "/etc/apt/apt.conf.d/50snapshot",
+        "/var/lib/apt/lists/*",
+        "apt-get",
+        "apt-cache",
+    )
+    contract_instructions = tuple(
+        instruction
+        for instruction in logical_dockerfile_instructions(source)
+        if any(token in instruction for token in contract_tokens)
+    )
+    if contract_instructions != (EXACT_RELEASE_WEB_SNAPSHOT_RUN,):
+        raise AssertionError(
+            "release web exact executable APT snapshot transaction differs"
+        )
 
 
 def assert_exact_release_image_artifact_controls(source: str) -> None:
@@ -2545,6 +2603,106 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
         self.assertIn("FROM scratch", source)
         self.assertNotIn("ignore-unfixed", source)
         self.assertNotIn(".trivyignore", source)
+
+    def test_release_web_snapshot_retry_is_bounded_restored_and_hash_bound(self) -> None:
+        dockerfile_path = ROOT / "docker" / "release" / "web.Dockerfile"
+        dockerfile = dockerfile_path.read_text(encoding="utf-8")
+        assert_exact_release_web_snapshot_retry_controls(dockerfile)
+
+        dockerfile_sha256 = hashlib.sha256(dockerfile.encode("utf-8")).hexdigest()
+        manifest = json.loads(
+            (ROOT / "release" / "exact-sources.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            manifest["release"]["components"]["web"]["dockerfile_sha256"],
+            dockerfile_sha256,
+        )
+        self.assertEqual(
+            manifest["release"]["materials"]["ubuntu_snapshot"],
+            {
+                "id": "20260824T000000Z",
+                "packages": {
+                    "ca-certificates": "20260601~24.04.1",
+                    "espeak-ng": "1.51+dfsg-12build1",
+                    "ffmpeg": "7:6.1.1-3ubuntu5",
+                    "opus-tools": "0.2-1build3",
+                    "tzdata": "2026c-0ubuntu0.24.04.1",
+                },
+                "dockerfile": "docker/release/web.Dockerfile",
+                "stage": None,
+            },
+        )
+
+        validate_source = workflow("validate-exact-release-source.yml")
+        image_source = workflow("build-attest-exact-release-images.yml")
+        validate_step = step_block(
+            validate_source,
+            "Reverify control, release packaging, and product identities",
+        )
+        self.assertEqual(
+            normalized_active_lines(validate_step).count(
+                f"WEB_DOCKERFILE_SHA256: {dockerfile_sha256}"
+            ),
+            1,
+        )
+        image_active = normalized_active_lines(image_source)
+        self.assertEqual(
+            image_active.count(f'dockerfile_sha256: "{dockerfile_sha256}",'),
+            1,
+        )
+        self.assertEqual(
+            image_active.count(
+                f'"docker/release/web.Dockerfile": "{dockerfile_sha256}",'
+            ),
+            1,
+        )
+        self.assertEqual(
+            verify_rollout_evidence.EXPECTED_COMPONENTS["web"]["dockerfile_sha256"],
+            dockerfile_sha256,
+        )
+
+        retry_literal = 'Acquire::Retries "10";\\n'
+        initial_config = (
+            'printf \'APT::Snapshot "%s";\\nAcquire::Retries "10";\\n\' '
+            '"$UBUNTU_SNAPSHOT" > /etc/apt/apt.conf.d/50snapshot'
+        )
+        restored_config = (
+            'printf \'APT::Snapshot "%s";\\n\' "$UBUNTU_SNAPSHOT" '
+            '> /etc/apt/apt.conf.d/50snapshot'
+        )
+        cleanup = "rm -rf /var/lib/apt/lists/*"
+        reordered = dockerfile.replace(restored_config, "__RESTORE__", 1)
+        reordered = reordered.replace(cleanup, restored_config, 1)
+        reordered = reordered.replace("__RESTORE__", cleanup, 1)
+        sed_before_update = dockerfile.replace(
+            "    && apt-get update \\\n",
+            "    && sed -i '2d' /etc/apt/apt.conf.d/50snapshot \\\n"
+            "    && apt-get update \\\n",
+            1,
+        )
+        mutations = {
+            "retry-removed": dockerfile.replace(retry_literal, "", 1),
+            "retry-duplicated": dockerfile.replace(
+                retry_literal, retry_literal + retry_literal, 1
+            ),
+            "retry-value": dockerfile.replace(
+                retry_literal, 'Acquire::Retries "11";\\n', 1
+            ),
+            "restore-removed": dockerfile.replace(restored_config, "true", 1),
+            "restore-reordered": reordered,
+            "retry-deleted-before-update": sed_before_update,
+            "initial-config-skipped": dockerfile.replace(
+                initial_config, f"true || {initial_config}", 1
+            ),
+            "restore-skipped-and-failure-masked": dockerfile.replace(
+                restored_config, f"true || {restored_config}", 1
+            ),
+        }
+        for label, mutated in mutations.items():
+            with self.subTest(mutation=label):
+                self.assertNotEqual(mutated, dockerfile)
+                with self.assertRaises(AssertionError):
+                    assert_exact_release_web_snapshot_retry_controls(mutated)
 
     def test_release_image_gate_requires_credential_free_exact_digest_pulls(self) -> None:
         source = workflow("build-attest-exact-release-images.yml")

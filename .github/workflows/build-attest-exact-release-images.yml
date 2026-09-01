@@ -206,7 +206,7 @@ jobs:
             .release.components.web == {
               image: "ghcr.io/medtechcorps-netizen/rereply-release-web",
               dockerfile: "docker/release/web.Dockerfile",
-              dockerfile_sha256: "6c5b065797072000d66124120ea6da940858b54a2a8bcf3b5595f3719cf03582",
+              dockerfile_sha256: "f441cbd45867a32a509af11c246f2c4e6d81104db99b728d7ccd865c7f9ad381",
               user: "rereply",
               working_dir: "/app",
               entrypoint: ["./rereply"],
@@ -468,7 +468,7 @@ jobs:
           # explicit control change; refreshing only the manifest cannot bless
           # new package managers, downloaders, or weakened runtime setup.
           approved_dockerfile_sha256 = {
-              "docker/release/web.Dockerfile": "6c5b065797072000d66124120ea6da940858b54a2a8bcf3b5595f3719cf03582",
+              "docker/release/web.Dockerfile": "f441cbd45867a32a509af11c246f2c4e6d81104db99b728d7ccd865c7f9ad381",
               "docker/release/meta-relay.Dockerfile": "38a6dcceaa252750f4ffd016002687423f062b15d8b47f6478af2185b628eb25",
               "docker/release/gmail-relay.Dockerfile": "f0c2ac09e585b3504123c1a5d336658dca5a52a0124a04aace202fb61a98a098",
           }
@@ -505,11 +505,40 @@ jobs:
           expected_packages = materials["ubuntu_snapshot"]["packages"]
           snapshot_dockerfile = materials["ubuntu_snapshot"]["dockerfile"]
           snapshot_id = materials["ubuntu_snapshot"]["id"]
+          snapshot_package_order = (
+              "ca-certificates",
+              "tzdata",
+              "espeak-ng",
+              "opus-tools",
+              "ffmpeg",
+          )
+          expected_snapshot_run = (
+              "set -eu; "
+              "printf 'APT::Snapshot \"%s\";\\nAcquire::Retries \"10\";\\n' "
+              "\"$UBUNTU_SNAPSHOT\" > /etc/apt/apt.conf.d/50snapshot "
+              "&& apt-get update "
+              "&& DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC "
+              "apt-get install -y --no-install-recommends "
+              + " ".join(
+                  f"{package}={expected_packages[package]}"
+                  for package in snapshot_package_order
+              )
+              + " && for package in "
+              + " ".join(snapshot_package_order)
+              + "; do "
+              "apt-cache policy \"$package\" | grep -F 'snapshot.ubuntu.com' "
+              "> /dev/null || exit 1; done "
+              "&& printf 'APT::Snapshot \"%s\";\\n' \"$UBUNTU_SNAPSHOT\" "
+              "> /etc/apt/apt.conf.d/50snapshot "
+              "&& rm -rf /var/lib/apt/lists/*"
+          )
 
           actual_bases = []
           actual_downloads = []
           actual_scratch = []
           apt_installs = []
+          apt_retry_controls = []
+          snapshot_runs = []
           snapshot_args = []
 
           def logical_instructions(text: str, dockerfile: str):
@@ -624,11 +653,45 @@ jobs:
                       ):
                           raise SystemExit(f"{dockerfile}:{line_number}: mutable downloader/reference is forbidden")
 
-                      # Remove the three exact apt-related literals used by the
+                      retry_values = re.findall(
+                          r'Acquire::Retries[ \t]+"([^"]+)";',
+                          operands,
+                      )
+                      if retry_values:
+                          if (
+                              dockerfile != snapshot_dockerfile
+                              or current_stage != "-"
+                              or retry_values != ["10"]
+                              or operands != expected_snapshot_run
+                          ):
+                              raise SystemExit(
+                                  f"{dockerfile}:{line_number}: exact APT snapshot transaction differs"
+                              )
+                          apt_retry_controls.append((dockerfile, current_stage, retry_values[0]))
+                          snapshot_runs.append((dockerfile, current_stage, operands))
+
+                      snapshot_contract_tokens = (
+                          "APT::Snapshot",
+                          "Acquire::Retries",
+                          "/etc/apt/apt.conf.d/50snapshot",
+                          "/var/lib/apt/lists/*",
+                          "apt-get",
+                          "apt-cache",
+                      )
+                      if (
+                          dockerfile == snapshot_dockerfile
+                          and any(token in operands for token in snapshot_contract_tokens)
+                          and operands != expected_snapshot_run
+                      ):
+                          raise SystemExit(
+                              f"{dockerfile}:{line_number}: non-canonical APT snapshot command"
+                          )
+
+                      # Remove the exact apt-related literals used by the
                       # approved snapshot contract, then reject every remaining
                       # apt/aptitude token regardless of options or JSON form.
                       unsupported_apt_probe = re.sub(
-                          r"APT::Snapshot|/etc/apt/apt\.conf\.d/50snapshot|"
+                          r"APT::Snapshot|Acquire::Retries|/etc/apt/apt\.conf\.d/50snapshot|"
                           r"/var/lib/apt/lists/\*|\bapt-(?:get|cache)\b",
                           "",
                           operands,
@@ -695,6 +758,10 @@ jobs:
               raise SystemExit(f"scratch stages differ: actual={sorted(actual_scratch)!r}")
           if apt_installs != [(snapshot_dockerfile, expected_packages)]:
               raise SystemExit(f"APT package map differs: actual={apt_installs!r}")
+          if apt_retry_controls != [(snapshot_dockerfile, "-", "10")]:
+              raise SystemExit(f"APT retry controls differ: actual={apt_retry_controls!r}")
+          if snapshot_runs != [(snapshot_dockerfile, "-", expected_snapshot_run)]:
+              raise SystemExit(f"APT snapshot transaction differs: actual={snapshot_runs!r}")
           if snapshot_args != [(snapshot_dockerfile, snapshot_id)]:
               raise SystemExit(f"Ubuntu snapshot ARG differs: actual={snapshot_args!r}")
 
