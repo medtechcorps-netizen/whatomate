@@ -57,16 +57,16 @@ EXACT_IMAGE_BUILD_ACTION = (
     "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6"
 )
 EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
-    "b9c754a5068797514c8b270aaa6f44cfc7db1fe247fcfefbee17d5b5413da0d3"
+    "8b95579d20ae14b45efc9104adfa8c7bedf63d6d12badd7e2ea022b0815e005a"
 )
 EXACT_CRM_CANARY_DRIVER_PUBLISHER_SHA256 = (
-    "97fb1ee75c363914dcf7ba5baa25c51ea7e6ba0090151e26b305d9eed79c8357"
+    "36501e78999f16f172615d920f559e1f91f1ea639e414db06258b4e343948304"
 )
 EXACT_IMAGE_GATE_STEP_SHA256 = (
     "1b4bf101f1756d43193ccc0050cf44bb9dd22df25302e084c9a9a91ede2db4a5"
 )
 EXACT_IMAGE_AUTHORITY_MATRIX_STEP_SHA256 = (
-    "01bf9d5c8320d65eedb4cc2936e62c40fbbfe85ce3b178d5c25f553cac159962"
+    "1c47547c6839e7a77e45944a1ab9f3645f2bc153d94de385784d63fb4a31a0ee"
 )
 EXACT_RELEASE_WEB_SNAPSHOT_RUN = (
     "RUN set -eu; "
@@ -2332,6 +2332,27 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
             with self.subTest(label=label):
                 with self.assertRaises(AssertionError):
                     assert_crm_canary_driver_publisher(mutant)
+
+    def test_release_publishers_share_the_reviewed_trivy_database_pin(self) -> None:
+        reviewed_database = (
+            "ghcr.io/aquasecurity/trivy-db@"
+            "sha256:2c970207420044aba72c733cf41dc24501e75e8c7f96ec01014aa362e20c013a"
+        )
+        stale_database = (
+            "ghcr.io/aquasecurity/trivy-db@"
+            "sha256:354879494133734128160eabaf873069c1da593adb1760eaf657d17411cb6c8a"
+        )
+        for workflow_name in (
+            "build-attest-exact-release-images.yml",
+            "publish-attest-production-crm-canary-driver.yml",
+        ):
+            with self.subTest(workflow=workflow_name):
+                source = workflow(workflow_name)
+                active = normalized_active_lines(source)
+                self.assertEqual(
+                    active.count(f"PINNED_TRIVY_DB: {reviewed_database}"), 1
+                )
+                self.assertNotIn(stale_database, source)
 
     def test_every_artifact_id_download_flattens_the_exact_selection(self) -> None:
         expected_counts = {

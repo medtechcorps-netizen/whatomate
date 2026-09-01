@@ -8,8 +8,8 @@ release evidence, and changing production are three separate authorities.
 
 The final `ui` phase is bound to one immutable Git identity:
 
-- commit: `ff0c9c6b8d94a085af164e564028d25d38b0a02c`
-- root tree: `6b3d030924913a562fee2b75fce318b01b421792`
+- commit: `f69f45fbb60962e7f7c679fbb6c1e5a2b391b455`
+- root tree: `844d742a232c6b3b92b0522c1c96dba98321bca7`
 - `frontend` tree: `f1cdd8186e2b724dc4bba41081578b2b003a6910`
 - `internal` tree: `a1da97143c17f3d02e47250269d00f238ac0e38c`
 

@@ -80,6 +80,7 @@ BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
     "783cc7adf0a1cb8433c404e20244f7fe8ef6ac47eb7dba7bb1877353fbb02951"
 )
 BOOTSTRAP_SOURCE_SHA = "974bb998f6d4c94ce750a92bf23f4550f8e45a2f"
+BASELINE_TARGET_SOURCE_SHA = "ad580e949f264a67032ad004f2995d0199af84c9"
 BOOTSTRAP_CANONICAL_SPEC_SHA256 = (
     "fb0e0ce579aa67c4ef3cb666ba1da658852d78e26a4e13a9dd83beb8a8d5cf30"
 )
@@ -2233,10 +2234,11 @@ def validate_rollout_plan(
     if transition != {"operation": "activate", **expected_transition}:
         fail("production activation transition differs")
     target, observed_images = rollout_phase(value, contract, target_phase)
-    if target_phase == "baseline" and target["source"]["commit"] != contract[
-        "bootstrap_state"
-    ]["source_sha"]:
-        fail("baseline rollout source differs from genesis")
+    if (
+        target_phase == "baseline"
+        and target["source"]["commit"] != BASELINE_TARGET_SOURCE_SHA
+    ):
+        fail("baseline rollout source differs from the reviewed target")
     return target, observed_images, transition, predecessor_authority
 
 

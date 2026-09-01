@@ -33,8 +33,8 @@ IMAGE_WORKFLOW_PATH = (
 TEST_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "test.yml"
 CONTROL_SHA = "a" * 40
 EXPECTED_FINAL_SOURCE = {
-    "source_sha": "ff0c9c6b8d94a085af164e564028d25d38b0a02c",
-    "root_tree": "6b3d030924913a562fee2b75fce318b01b421792",
+    "source_sha": "f69f45fbb60962e7f7c679fbb6c1e5a2b391b455",
+    "root_tree": "844d742a232c6b3b92b0522c1c96dba98321bca7",
     "frontend_tree": "f1cdd8186e2b724dc4bba41081578b2b003a6910",
     "internal_tree": "a1da97143c17f3d02e47250269d00f238ac0e38c",
 }
@@ -43,6 +43,16 @@ STALE_FINAL_SOURCE = {
     "root_tree": "3553b783d5cfdcbda2ffcee332a2aa392a897bc5",
     "frontend_tree": "2f92a064f2f3d7f1867c835ef3be7f41e2f30444",
     "internal_tree": "494d3957ff3559375f406886be45646049ec9378",
+}
+ORIGINAL_PHASE_SOURCE_SHA = {
+    "baseline": "974bb998f6d4c94ce750a92bf23f4550f8e45a2f",
+    "bridge": "b3d8f167bf428e1f3e209b0d42982f16b21cfae8",
+    "backend": "63e54fe72a753006733931ddfb5bdbdbe2a2a4fc",
+    "ui": "ff0c9c6b8d94a085af164e564028d25d38b0a02c",
+}
+REVIEWED_GO_DEPENDENCY_BLOBS = {
+    "go.mod": "e8d0c05379c6b1303744116ee8b81121452d8a50",
+    "go.sum": "6768bc62e9296bea40ef9cdc9b8cc1cfa8a8387f",
 }
 
 
@@ -166,6 +176,61 @@ class RolloutEvidenceTests(unittest.TestCase):
             manifest_phases,
         )
         self.assertNotEqual(manifest_phases["ui"], STALE_FINAL_SOURCE)
+
+    def test_phase_sources_apply_only_the_reviewed_dependency_remediation(self) -> None:
+        for phase, source in self.manifest["phases"].items():
+            with self.subTest(phase=phase):
+                commit = source["source_sha"]
+                ancestry = subprocess.run(
+                    ["git", "-C", str(ROOT), "rev-list", "--parents", "-n", "1", commit],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.split()
+                self.assertEqual(ancestry, [commit, ORIGINAL_PHASE_SOURCE_SHA[phase]])
+                changed_paths = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(ROOT),
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        commit,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+                self.assertEqual(changed_paths, ["go.mod", "go.sum"])
+                for path, expected_blob in REVIEWED_GO_DEPENDENCY_BLOBS.items():
+                    actual_blob = subprocess.run(
+                        ["git", "-C", str(ROOT), "rev-parse", f"{commit}:{path}"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    self.assertEqual(actual_blob, expected_blob)
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "-C", str(ROOT), "rev-parse", f"{commit}^{{tree}}"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip(),
+                    source["root_tree"],
+                )
+                for subtree in ("frontend", "internal"):
+                    self.assertEqual(
+                        subprocess.run(
+                            ["git", "-C", str(ROOT), "rev-parse", f"{commit}:{subtree}"],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        ).stdout.strip(),
+                        source[f"{subtree}_tree"],
+                    )
 
     def test_ui_validation_harness_applies_only_the_reviewed_completion_patch(self) -> None:
         workflow = VALIDATION_WORKFLOW_PATH.read_text(encoding="utf-8")
