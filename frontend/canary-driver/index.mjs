@@ -223,6 +223,9 @@ function parseEnvironmentJson(raw, label) {
 
 function validateDatabaseUrl(value) {
   const raw = exactString(value, "ledger database URL", undefined, 4096);
+  if (/[\u0000-\u0020\u007f]/u.test(raw)) {
+    fail("ledger database URL is invalid", 500);
+  }
   let parsed;
   try {
     parsed = new URL(raw);
@@ -240,15 +243,21 @@ function validateDatabaseUrl(value) {
     fail("ledger database URL is invalid", 500);
   }
   // libpq-style query parameters can override connection authority, client
-  // credentials, and TLS files. The sole accepted setting is the canonical
-  // sslmode policy; hostname, port, and credentials come only from the URL
-  // authority installed in the protected driver environment.
+  // credentials, and TLS files. Accept only DigitalOcean's canonical
+  // libpq-compatible TLS policy; hostname, port, and credentials come only
+  // from the URL authority installed in the protected driver environment.
   const sslModes = parsed.searchParams.getAll("sslmode");
+  const libpqCompat = parsed.searchParams.getAll("uselibpqcompat");
+  const exactQuery = "?sslmode=require&uselibpqcompat=true";
   if (
-    [...parsed.searchParams.keys()].length !== 1 ||
+    [...parsed.searchParams.keys()].length !== 2 ||
     sslModes.length !== 1 ||
-    !["require", "verify-ca", "verify-full"].includes(sslModes[0]) ||
-    parsed.search !== "?sslmode=" + sslModes[0]
+    sslModes[0] !== "require" ||
+    libpqCompat.length !== 1 ||
+    libpqCompat[0] !== "true" ||
+    parsed.search !== exactQuery ||
+    raw.indexOf("?") !== raw.length - exactQuery.length ||
+    raw.slice(-exactQuery.length) !== exactQuery
   ) {
     fail("ledger database TLS policy is invalid", 500);
   }

@@ -112,6 +112,12 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
     "88cd01af3d37deda224bae886cedaf806611f3b43f089c3a41142c1f015c701c"
 )
+EXACT_CLEANUP_WORKFLOW_SHA256 = (
+    "aaa247fb6301b17465983565e94b27344c314458b88cb3e050492b1eda3dc0e7"
+)
+EXACT_CLEANUP_AUTHORITY_STEP_SHA256 = (
+    "914c4ac9f63a67f63383d5158919529672be15dddbfa8d7a621ca3eea601a2a6"
+)
 EXACT_GATE_B_TEST_JOB_SHA256 = {
     "go-race": "0aa5bc14dd3d264191134048bc4e9dc6b50f77b58b13d3f596dadcd93a1c1a98",
     "lint": "acff25313c68d1a86740a8cafe808480a5ca1a418c8e48e47d17c8d34285a8fd",
@@ -182,6 +188,161 @@ def normalized_active_lines(source: str) -> tuple[str, ...]:
         for candidate in source.splitlines()
         if candidate.strip() and not candidate.lstrip().startswith("#")
     )
+
+
+CLEANUP_PRE_MUTATION_REQUIRED_LINES = (
+    "CANARY_WORKFLOW_PATH: ${{ env.CANARY_WORKFLOW_PATH }}",
+    "const preMutationFailure=value.mode==='pre-mutation-failure';",
+    (
+        "const exact=preMutationFailure?['apply_failure','authority',"
+        "'authority_control_sha','canary','confirmation','control_sha','mode',"
+        "'phase','reconciliation','recovery']:['authority',"
+        "'authority_control_sha','canary','confirmation','control_sha','mode',"
+        "'phase','reconciliation','recovery'];"
+    ),
+    (
+        "if((terminal||neverStarted||preMutationFailure||noMutation)!=="
+        "receiptMode || quarantine===receiptMode) throw new Error('cleanup "
+        "mode/create authority differs');"
+    ),
+    (
+        "if(preMutationFailure && !(value.recovery&&value.canary===null&&"
+        "value.reconciliation===null&&value.confirmation===`DELETE RECOVERY "
+        "FORK AFTER PRE-MUTATION APPLY FAILURE ${value.apply_failure&&"
+        "value.apply_failure.run_id}`)) throw new Error('pre-mutation-failure "
+        "cleanup authority differs');"
+    ),
+    (
+        "if(preMutationFailure && (!applyFailure || JSON.stringify(Object.keys("
+        "applyFailure).sort())!==JSON.stringify(['artifact_inventory_sha256',"
+        "'job_inventory_sha256','run_attempt','run_id']) || typeof "
+        "applyFailure.run_id!=='string' || applyFailure.run_attempt!==1 || "
+        "!/^[1-9][0-9]{0,14}$/.test(applyFailure.run_id) || "
+        "!/^[0-9a-f]{64}$/.test(applyFailure.job_inventory_sha256) || "
+        "!/^[0-9a-f]{64}$/.test(applyFailure.artifact_inventory_sha256))) "
+        "throw new Error('pre-mutation-failure apply authority differs');"
+    ),
+    (
+        "const recovery=(terminal||preMutationFailure||noMutation||"
+        "(neverStarted&&value.recovery!==null))?descriptor(value.recovery,"
+        "'recovery authority'):null;"
+    ),
+    (
+        "const applyRun=await runExact(applyFailure,process.env."
+        "APPLY_WORKFLOW_PATH,'pre-mutation apply failure',"
+        "value.authority_control_sha);"
+    ),
+    (
+        "if(applyRun.conclusion!=='failure') throw new Error('pre-mutation "
+        "apply run conclusion differs');"
+    ),
+    (
+        "if(!Number.isFinite(recoveryCompleted) || !Number.isFinite("
+        "applyCreated) || applyCreated<recoveryCompleted) throw new Error("
+        "'pre-mutation apply chronology differs');"
+    ),
+    (
+        "const expectedJobs=['Authenticate exact production apply authority',"
+        "'Prepare exact production apply pre-lock authority','Acquire exact "
+        "production apply main lock','Prepare and attest exact production "
+        "mutation intent','Attest exact production apply main lock proof',"
+        "'Apply exact production phase','Exact production apply receipt gate',"
+        "'Authorize exact production apply main lock release','Release exact "
+        "production apply main lock'];"
+    ),
+    (
+        "if(JSON.stringify(jobs.map(job=>job.name).sort())!==JSON.stringify("
+        "expectedJobs.slice().sort())) throw new Error('pre-mutation apply job "
+        "inventory differs');"
+    ),
+    (
+        "if(!authorityJob || authorityJob.status!=='completed' || "
+        "authorityJob.conclusion!=='failure' || !Array.isArray("
+        "authorityJob.steps)) throw new Error('pre-mutation apply authority "
+        "job differs');"
+    ),
+    (
+        "const expectedAuthoritySteps=[['Set up job','success'],['Require exact "
+        "protected-main attempt-one authority','success'],['Check out exact "
+        "protected controls','success'],['Install pinned production-plan "
+        "authority tools','success'],['Authenticate requested plan and recovery "
+        "artifacts','success'],['Download exact production plan','success'],"
+        "['Independently verify the exact production-plan attestations and "
+        "controls','success'],['Extract immutable rollout and predecessor "
+        "coordinates','failure'],['Post Check out exact protected controls',"
+        "'success'],['Complete job','success']];"
+    ),
+    (
+        "if(JSON.stringify(authoritySteps)!==JSON.stringify("
+        "expectedAuthoritySteps) || authorityJob.steps.some(step=>step.status"
+        "!=='completed')) throw new Error('pre-mutation apply failure boundary "
+        "differs');"
+    ),
+    (
+        "if(skippedJobs.length!==8 || skippedJobs.some(job=>job.status"
+        "!=='completed' || job.conclusion!=='skipped' || !Array.isArray("
+        "job.steps) || job.steps.length!==0)) throw new Error('pre-mutation "
+        "apply side-effect job was not skipped');"
+    ),
+    (
+        "const jobProjection=jobs.map(job=>({job_id:String(job.id),"
+        "name:job.name,status:job.status,conclusion:job.conclusion,steps:"
+        "job.steps.map(step=>({number:step.number,name:step.name,status:"
+        "step.status,conclusion:step.conclusion}))})).sort((left,right)=>"
+        "left.name.localeCompare(right.name));"
+    ),
+    (
+        "if(jobInventorySha256!==applyFailure.job_inventory_sha256) throw new "
+        "Error('pre-mutation apply job inventory hash differs');"
+    ),
+    (
+        "if(artifacts.data.total_count!==0 || artifacts.data.artifacts.length"
+        "!==0) throw new Error('pre-mutation apply artifact inventory differs');"
+    ),
+    (
+        "if(artifactInventorySha256!==applyFailure.artifact_inventory_sha256) "
+        "throw new Error('pre-mutation apply artifact inventory hash differs');"
+    ),
+    (
+        "const mutationPaths=[process.env.APPLY_WORKFLOW_PATH,process.env."
+        "CANARY_WORKFLOW_PATH,process.env.ROLLBACK_WORKFLOW_PATH,process.env."
+        "ORPHAN_ROLLBACK_WORKFLOW_PATH,process.env.RECONCILIATION_WORKFLOW_PATH];"
+    ),
+    (
+        "if(later.length!==1 || String(later[0].id)!==applyFailure.run_id || "
+        "later[0].run_attempt!==1) throw new Error('pre-mutation cleanup apply "
+        "inventory differs');"
+    ),
+    (
+        "throw new Error(`pre-mutation cleanup found a later ${path} run`);"
+    ),
+    (
+        "if(laterRecovery.length!==1 || String(laterRecovery[0].id)!==String("
+        "recovery.run_id) || laterRecovery[0].run_attempt!==1 || "
+        "laterRecovery[0].status!=='completed' || laterRecovery[0].conclusion"
+        "!=='success' || laterRecovery[0].head_sha!==value.authority_control_sha) "
+        "throw new Error('pre-mutation cleanup recovery inventory differs');"
+    ),
+)
+
+
+def assert_cleanup_pre_mutation_failure_controls(source: str) -> None:
+    if hashlib.sha256(source.encode("utf-8")).hexdigest() != (
+        EXACT_CLEANUP_WORKFLOW_SHA256
+    ):
+        raise AssertionError("exact cleanup workflow source differs")
+    authority = step_block(source, "Authenticate exact cleanup evidence")
+    if normalized_active_sha256(authority) != EXACT_CLEANUP_AUTHORITY_STEP_SHA256:
+        raise AssertionError("exact cleanup authority step differs")
+    for line in CLEANUP_PRE_MUTATION_REQUIRED_LINES:
+        require_active_source_line(authority, line)
+    for forbidden in (
+        "downloadJobLogsForWorkflowRun",
+        "downloadWorkflowRunLogs",
+        "getJobLogs",
+    ):
+        if forbidden in authority:
+            raise AssertionError("cleanup authority must not infer safety from logs")
 
 
 def job_definitions(source: str) -> tuple[tuple[str, str], ...]:
@@ -4117,8 +4278,15 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
         self.assertIn("production-valkey-recovery-fork-delete-receipt/v2", cleanup)
         self.assertIn("validate-delete-receipt", cleanup)
         self.assertIn("CLEANUP_EVIDENCE_SHA256", cleanup)
-        for mode in ("terminal", "never-started", "no-mutation", "quarantine"):
+        for mode in (
+            "terminal",
+            "never-started",
+            "pre-mutation-failure",
+            "no-mutation",
+            "quarantine",
+        ):
             self.assertIn(mode, cleanup)
+        assert_cleanup_pre_mutation_failure_controls(cleanup)
         self.assertIn("now>=expires", cleanup)
         self.assertIn("classification\"][\"outcome\"]==\"no-mutation\"", cleanup)
         self.assertIn("never-started cleanup recovery authority differs", cleanup)
@@ -4248,6 +4416,65 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
             "Cleanup Production Valkey Recovery Fork",
         ):
             self.assertEqual(finalizer.count(name), 1)
+
+    def test_cleanup_pre_mutation_failure_rejects_each_control_weakening(
+        self,
+    ) -> None:
+        source = workflow("cleanup-production-valkey-recovery-fork.yml")
+        authority = step_block(source, "Authenticate exact cleanup evidence")
+        assert_cleanup_pre_mutation_failure_controls(source)
+        self.assertEqual(
+            len(CLEANUP_PRE_MUTATION_REQUIRED_LINES),
+            len(set(CLEANUP_PRE_MUTATION_REQUIRED_LINES)),
+        )
+        mutants = []
+        for index, required in enumerate(CLEANUP_PRE_MUTATION_REQUIRED_LINES):
+            weakened = authority.replace(
+                required, f"// removed pre-mutation cleanup control {index}", 1
+            )
+            self.assertNotEqual(weakened, authority)
+            mutants.append(source.replace(authority, weakened, 1))
+        disabled = authority.replace(
+            "if(preMutationFailure){", "if(false&&preMutationFailure){", 1
+        )
+        self.assertNotEqual(disabled, authority)
+        mutants.append(source.replace(authority, disabled, 1))
+        match = re.search(
+            r"(?ms)^               if\(preMutationFailure\)\{\n"
+            r"(?P<body>.*?)^               \}[ \t]*$",
+            authority,
+        )
+        self.assertIsNotNone(match)
+        assert match is not None
+        commented = authority.replace(
+            match.group(0),
+            "               if(preMutationFailure){\n"
+            "                 /*\n"
+            f"{match.group('body')}"
+            "                 */\n"
+            "               }",
+            1,
+        )
+        self.assertNotEqual(commented, authority)
+        mutants.append(source.replace(authority, commented, 1))
+        for workflow_path in (
+            "CANARY_WORKFLOW_PATH",
+            "RECOVERY_WORKFLOW_PATH",
+            "ROLLBACK_WORKFLOW_PATH",
+        ):
+            original = next(
+                line
+                for line in source.splitlines()
+                if line.startswith(f"  {workflow_path}: .github/workflows/")
+            )
+            alias = f"  {workflow_path}: .github/workflows/apply-production-phase.yml"
+            self.assertNotEqual(original, alias)
+            mutants.append(source.replace(original, alias, 1))
+        self.assertEqual(len(mutants), len(set(mutants)))
+        for index, mutant in enumerate(mutants):
+            with self.subTest(control=index):
+                with self.assertRaises(AssertionError):
+                    assert_cleanup_pre_mutation_failure_controls(mutant)
 
     def test_recovery_consumers_bind_v2_and_exact_observer_source(self) -> None:
         apply_source = (

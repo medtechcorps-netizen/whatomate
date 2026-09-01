@@ -520,11 +520,21 @@ For each phase, perform these manual actions in order:
    discard phrase, zero later apply/rollback/reconciliation runs, and zero
    nonterminal recovery runs. It permits either no successful recovery run or
    exactly the supplied successful recovery evidence after that evidence has
-   expired. `no-mutation` requires the expired
-   recovery evidence plus an exact signed orphan reconciliation classified
-   `no-mutation`. `quarantine` is limited to a failed prepare run's signed
-   create intent and its exact typed phrase. Each mode permits at most one
-   DELETE. Before deletion the cleanup controller proves the source is online,
+   expired. `pre-mutation-failure` is a separate receipt-backed exception for
+   an apply attempt that failed inside the exact read-only authority boundary:
+   it requires expired recovery evidence, one attempt-one failed apply run, the
+   exact nine-job inventory, the reviewed authority-step failure, all eight
+   lock/intent/provider/receipt jobs skipped with no steps, and an exact empty
+   run-artifact inventory. Canonical job and artifact inventory hashes enter the
+   typed cleanup descriptor. The workflow also requires exactly one supplied
+   recovery run and one supplied apply run since fork creation, with no later
+   canary, rollback, orphan rollback, or reconciliation run; it never infers
+   safety from logs. Its confirmation is `DELETE RECOVERY FORK AFTER
+   PRE-MUTATION APPLY FAILURE <apply_run_id>`. `no-mutation` requires the
+   expired recovery evidence plus an exact signed orphan reconciliation
+   classified `no-mutation`. `quarantine` is limited to a failed prepare run's
+   signed create intent and its exact typed phrase. Each mode permits at most
+   one DELETE. Before deletion the cleanup controller proves the source is online,
    contract-bound, and still protected by the exact production-app rule. After
    deletion it requires two delayed complete source-health and fork-absence
    reads. The independent signing gate repeats those GET-only proofs with a
@@ -649,9 +659,10 @@ shadow-channel-account, legacy-account ID/name fields;
 `CRM_CANARY_NON_KLINIK_LOGIN_JSON` are dedicated synthetic browser logins;
 `CRM_CANARY_META_APP_SECRET` signs only the product-boundary webhook fixture;
 and `CRM_CANARY_LEDGER_DATABASE_URL` reaches only the dedicated idempotency
-ledger. That database URL must carry a password and exactly one query setting:
-the TLS `sslmode` value `require`, `verify-ca`, or `verify-full`. Every other
-query key or connection-setting override is rejected.
+ledger. That database URL must carry a password and exactly the ordered query
+`?sslmode=require&uselibpqcompat=true`, which keeps DigitalOcean's encrypted
+connection while using libpq-compatible certificate handling. Every other
+ordering, value, query key, or connection-setting override is rejected.
 `CRM_CANARY_DRIVER_VERSION_SHA256`
 is a non-secret,
 operator-provisioned version label copied from the successful publisher's exact

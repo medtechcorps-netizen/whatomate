@@ -15,7 +15,7 @@ on:
           - backend
           - ui
       cleanup_evidence_json:
-        description: Canonical exact terminal, never-started, no-mutation, or quarantined-create cleanup authority
+        description: Canonical exact terminal, never-started, pre-mutation-failure, no-mutation, or quarantined-create cleanup authority
         required: true
         type: string
 
@@ -109,6 +109,7 @@ jobs:
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
         env:
           APPLY_WORKFLOW_PATH: ${{ env.APPLY_WORKFLOW_PATH }}
+          CANARY_WORKFLOW_PATH: ${{ env.CANARY_WORKFLOW_PATH }}
           CONTROL_SHA: ${{ steps.guard.outputs.control_sha }}
           ORPHAN_ROLLBACK_WORKFLOW_PATH: ${{ env.ORPHAN_ROLLBACK_WORKFLOW_PATH }}
           PHASE: ${{ inputs.phase }}
@@ -123,9 +124,10 @@ jobs:
             const canonical=(item)=>Array.isArray(item)?item.map(canonical):(item!==null&&typeof item==='object'?Object.fromEntries(Object.keys(item).sort().map(key=>[key,canonical(item[key])])):item);
             const canonicalRaw=JSON.stringify(canonical(value));
             if(process.env.RAW!==canonicalRaw) throw new Error('cleanup descriptor is not canonical compact JSON');
-            const exact=['authority','authority_control_sha','canary','confirmation','control_sha','mode','phase','reconciliation','recovery'];
+            const preMutationFailure=value.mode==='pre-mutation-failure';
+            const exact=preMutationFailure?['apply_failure','authority','authority_control_sha','canary','confirmation','control_sha','mode','phase','reconciliation','recovery']:['authority','authority_control_sha','canary','confirmation','control_sha','mode','phase','reconciliation','recovery'];
             if(JSON.stringify(Object.keys(value).sort())!==JSON.stringify(exact)) throw new Error('cleanup descriptor keys differ');
-            if(value.control_sha!==process.env.CONTROL_SHA || !/^[0-9a-f]{40}$/.test(value.authority_control_sha) || value.phase!==process.env.PHASE || !['baseline','bridge','backend','ui'].includes(value.phase) || !['terminal','never-started','no-mutation','quarantine'].includes(value.mode) || typeof value.confirmation!=='string') throw new Error('cleanup descriptor authority differs');
+            if(value.control_sha!==process.env.CONTROL_SHA || !/^[0-9a-f]{40}$/.test(value.authority_control_sha) || value.phase!==process.env.PHASE || !['baseline','bridge','backend','ui'].includes(value.phase) || !['terminal','never-started','pre-mutation-failure','no-mutation','quarantine'].includes(value.mode) || typeof value.confirmation!=='string') throw new Error('cleanup descriptor authority differs');
             const descriptor=(item,label)=>{
               if(!item || JSON.stringify(Object.keys(item).sort())!==JSON.stringify(['artifact_digest','artifact_id','run_attempt','run_id','sha256'])) throw new Error(`${label} keys differ`);
               if(typeof item.run_id!=='string' || typeof item.artifact_id!=='string' || item.run_attempt!==1 || !/^[1-9][0-9]{0,14}$/.test(item.run_id) || !/^[1-9][0-9]{0,14}$/.test(item.artifact_id) || !/^sha256:[0-9a-f]{64}$/.test(item.artifact_digest) || !/^[0-9a-f]{64}$/.test(item.sha256)) throw new Error(`${label} format differs`);
@@ -138,12 +140,15 @@ jobs:
             const neverStarted=value.mode==='never-started';
             const noMutation=value.mode==='no-mutation';
             const quarantine=value.mode==='quarantine';
-            if((terminal||neverStarted||noMutation)!==receiptMode || quarantine===receiptMode) throw new Error('cleanup mode/create authority differs');
+            if((terminal||neverStarted||preMutationFailure||noMutation)!==receiptMode || quarantine===receiptMode) throw new Error('cleanup mode/create authority differs');
             if(terminal && !(value.recovery&&value.canary&&value.reconciliation===null&&value.confirmation==='')) throw new Error('terminal cleanup authority differs');
             if(neverStarted && !((value.recovery===null||typeof value.recovery==='object')&&value.canary===null&&value.reconciliation===null&&value.confirmation===`DELETE UNUSED RECOVERY FORK ${create.run_id}`)) throw new Error('never-started cleanup authority differs');
+            if(preMutationFailure && !(value.recovery&&value.canary===null&&value.reconciliation===null&&value.confirmation===`DELETE RECOVERY FORK AFTER PRE-MUTATION APPLY FAILURE ${value.apply_failure&&value.apply_failure.run_id}`)) throw new Error('pre-mutation-failure cleanup authority differs');
             if(noMutation && !(value.recovery&&value.canary===null&&value.reconciliation&&value.confirmation===`DELETE RECOVERY FORK AFTER NO MUTATION ${value.reconciliation.run_id}`)) throw new Error('no-mutation cleanup authority differs');
             if(quarantine && !(value.recovery===null&&value.canary===null&&value.reconciliation===null&&value.confirmation===`DELETE QUARANTINED RECOVERY FORK ${create.run_id}`)) throw new Error('quarantine cleanup authority differs');
-            const recovery=(terminal||noMutation||(neverStarted&&value.recovery!==null))?descriptor(value.recovery,'recovery authority'):null;
+            const applyFailure=preMutationFailure?value.apply_failure:null;
+            if(preMutationFailure && (!applyFailure || JSON.stringify(Object.keys(applyFailure).sort())!==JSON.stringify(['artifact_inventory_sha256','job_inventory_sha256','run_attempt','run_id']) || typeof applyFailure.run_id!=='string' || applyFailure.run_attempt!==1 || !/^[1-9][0-9]{0,14}$/.test(applyFailure.run_id) || !/^[0-9a-f]{64}$/.test(applyFailure.job_inventory_sha256) || !/^[0-9a-f]{64}$/.test(applyFailure.artifact_inventory_sha256))) throw new Error('pre-mutation-failure apply authority differs');
+            const recovery=(terminal||preMutationFailure||noMutation||(neverStarted&&value.recovery!==null))?descriptor(value.recovery,'recovery authority'):null;
             const canary=terminal?descriptor(value.canary,'canary authority'):null;
             const reconciliation=noMutation?descriptor(value.reconciliation,'reconciliation authority'):null;
             const {owner,repo}=context.repo;
@@ -166,9 +171,10 @@ jobs:
               const jobs=await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/1/jobs',{owner,repo,run_id:Number(create.run_id),per_page:100});
               const expected=['Authenticate exact production Valkey recovery fork authority','Prepare and attest exact production Valkey recovery fork intent','Create exact production Valkey recovery fork','Exact production Valkey recovery fork gate'];
               if(JSON.stringify(jobs.map(job=>job.name).sort())!==JSON.stringify(expected.sort()) || jobs.some(job=>job.status!=='completed' || job.conclusion!=='success')) throw new Error('create job inventory differs');
-              if(terminal||noMutation||(neverStarted&&recovery!==null)){
-                const recoveryRun=await runExact(recovery,process.env.RECOVERY_WORKFLOW_PATH,'recovery',value.authority_control_sha);
-                if(recoveryRun.conclusion!=='success') throw new Error('recovery run conclusion differs');
+               let recoveryRun=null;
+               if(terminal||preMutationFailure||noMutation||(neverStarted&&recovery!==null)){
+                 recoveryRun=await runExact(recovery,process.env.RECOVERY_WORKFLOW_PATH,'recovery',value.authority_control_sha);
+                 if(recoveryRun.conclusion!=='success') throw new Error('recovery run conclusion differs');
                 const recoveryArtifact=await github.rest.actions.getArtifact({owner,repo,artifact_id:Number(recovery.artifact_id)});
                 if(recoveryArtifact.data.name!==`production-recovery-readiness-${recovery.run_id}-1` || recoveryArtifact.data.digest!==recovery.artifact_digest || recoveryArtifact.data.expired || recoveryArtifact.data.size_in_bytes<=0 || recoveryArtifact.data.size_in_bytes>1048576 || recoveryArtifact.data.workflow_run.id!==Number(recovery.run_id) || recoveryArtifact.data.workflow_run.head_sha!==value.authority_control_sha || recoveryArtifact.data.workflow_run.head_branch!=='main') throw new Error('recovery artifact differs');
               }
@@ -184,7 +190,7 @@ jobs:
                 const reconciliationArtifact=await github.rest.actions.getArtifact({owner,repo,artifact_id:Number(reconciliation.artifact_id)});
                 if(reconciliationArtifact.data.name!==`production-orphan-reconciliation-${reconciliation.run_id}-1` || reconciliationArtifact.data.digest!==reconciliation.artifact_digest || reconciliationArtifact.data.expired || reconciliationArtifact.data.size_in_bytes<=0 || reconciliationArtifact.data.size_in_bytes>1048576 || reconciliationArtifact.data.workflow_run.id!==Number(reconciliation.run_id) || reconciliationArtifact.data.workflow_run.head_sha!==value.authority_control_sha || reconciliationArtifact.data.workflow_run.head_branch!=='main') throw new Error('reconciliation artifact differs');
               }
-              if(neverStarted){
+               if(neverStarted){
                 const mutationPaths=[process.env.APPLY_WORKFLOW_PATH,process.env.ROLLBACK_WORKFLOW_PATH,process.env.ORPHAN_ROLLBACK_WORKFLOW_PATH,process.env.RECONCILIATION_WORKFLOW_PATH];
                 for(const path of mutationPaths){
                   const runs=await github.paginate(github.rest.actions.listWorkflowRuns,{owner,repo,workflow_id:path,branch:'main',event:'workflow_dispatch',created:`>=${createRun.created_at}`,per_page:100});
@@ -195,9 +201,46 @@ jobs:
                 if(laterRecovery.some(run=>run.status!=='completed')) throw new Error('never-started cleanup found nonterminal recovery evidence');
                 const matchingRecovery=laterRecovery.filter(run=>run.head_sha===value.authority_control_sha);
                 const successfulRecovery=matchingRecovery.filter(run=>run.conclusion==='success');
-                if(recovery===null ? successfulRecovery.length!==0 : (successfulRecovery.length!==1 || String(successfulRecovery[0].id)!==String(recovery.run_id))) throw new Error('never-started cleanup recovery authority differs');
-              }
-            }
+                 if(recovery===null ? successfulRecovery.length!==0 : (successfulRecovery.length!==1 || String(successfulRecovery[0].id)!==String(recovery.run_id))) throw new Error('never-started cleanup recovery authority differs');
+               }
+               if(preMutationFailure){
+                 const applyRun=await runExact(applyFailure,process.env.APPLY_WORKFLOW_PATH,'pre-mutation apply failure',value.authority_control_sha);
+                 if(applyRun.conclusion!=='failure') throw new Error('pre-mutation apply run conclusion differs');
+                 const recoveryCompleted=Date.parse(recoveryRun.completed_at);
+                 const applyCreated=Date.parse(applyRun.created_at);
+                 if(!Number.isFinite(recoveryCompleted) || !Number.isFinite(applyCreated) || applyCreated<recoveryCompleted) throw new Error('pre-mutation apply chronology differs');
+                 const jobs=await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/1/jobs',{owner,repo,run_id:Number(applyFailure.run_id),per_page:100});
+                 const expectedJobs=['Authenticate exact production apply authority','Prepare exact production apply pre-lock authority','Acquire exact production apply main lock','Prepare and attest exact production mutation intent','Attest exact production apply main lock proof','Apply exact production phase','Exact production apply receipt gate','Authorize exact production apply main lock release','Release exact production apply main lock'];
+                 if(JSON.stringify(jobs.map(job=>job.name).sort())!==JSON.stringify(expectedJobs.slice().sort())) throw new Error('pre-mutation apply job inventory differs');
+                 const authorityJob=jobs.find(job=>job.name==='Authenticate exact production apply authority');
+                 const skippedJobs=jobs.filter(job=>job.name!=='Authenticate exact production apply authority');
+                 if(!authorityJob || authorityJob.status!=='completed' || authorityJob.conclusion!=='failure' || !Array.isArray(authorityJob.steps)) throw new Error('pre-mutation apply authority job differs');
+                 const expectedAuthoritySteps=[['Set up job','success'],['Require exact protected-main attempt-one authority','success'],['Check out exact protected controls','success'],['Install pinned production-plan authority tools','success'],['Authenticate requested plan and recovery artifacts','success'],['Download exact production plan','success'],['Independently verify the exact production-plan attestations and controls','success'],['Extract immutable rollout and predecessor coordinates','failure'],['Post Check out exact protected controls','success'],['Complete job','success']];
+                 const authoritySteps=authorityJob.steps.map(step=>[step.name,step.conclusion]);
+                 if(JSON.stringify(authoritySteps)!==JSON.stringify(expectedAuthoritySteps) || authorityJob.steps.some(step=>step.status!=='completed')) throw new Error('pre-mutation apply failure boundary differs');
+                 if(skippedJobs.length!==8 || skippedJobs.some(job=>job.status!=='completed' || job.conclusion!=='skipped' || !Array.isArray(job.steps) || job.steps.length!==0)) throw new Error('pre-mutation apply side-effect job was not skipped');
+                 const jobProjection=jobs.map(job=>({job_id:String(job.id),name:job.name,status:job.status,conclusion:job.conclusion,steps:job.steps.map(step=>({number:step.number,name:step.name,status:step.status,conclusion:step.conclusion}))})).sort((left,right)=>left.name.localeCompare(right.name));
+                 const jobInventorySha256=crypto.createHash('sha256').update(Buffer.from(JSON.stringify(canonical(jobProjection))+'\n','utf8')).digest('hex');
+                 if(jobInventorySha256!==applyFailure.job_inventory_sha256) throw new Error('pre-mutation apply job inventory hash differs');
+                 const artifacts=await github.rest.actions.listWorkflowRunArtifacts({owner,repo,run_id:Number(applyFailure.run_id),per_page:100});
+                 if(artifacts.data.total_count!==0 || artifacts.data.artifacts.length!==0) throw new Error('pre-mutation apply artifact inventory differs');
+                 const artifactInventorySha256=crypto.createHash('sha256').update(Buffer.from(JSON.stringify(canonical(artifacts.data.artifacts))+'\n','utf8')).digest('hex');
+                 if(artifactInventorySha256!==applyFailure.artifact_inventory_sha256) throw new Error('pre-mutation apply artifact inventory hash differs');
+                 const mutationPaths=[process.env.APPLY_WORKFLOW_PATH,process.env.CANARY_WORKFLOW_PATH,process.env.ROLLBACK_WORKFLOW_PATH,process.env.ORPHAN_ROLLBACK_WORKFLOW_PATH,process.env.RECONCILIATION_WORKFLOW_PATH];
+                 for(const path of mutationPaths){
+                   const runs=await github.paginate(github.rest.actions.listWorkflowRuns,{owner,repo,workflow_id:path,branch:'main',event:'workflow_dispatch',created:`>=${createRun.created_at}`,per_page:100});
+                   const later=runs.filter(run=>Date.parse(run.created_at)>=Date.parse(createRun.created_at));
+                   if(path===process.env.APPLY_WORKFLOW_PATH){
+                     if(later.length!==1 || String(later[0].id)!==applyFailure.run_id || later[0].run_attempt!==1) throw new Error('pre-mutation cleanup apply inventory differs');
+                   }else if(later.length!==0){
+                     throw new Error(`pre-mutation cleanup found a later ${path} run`);
+                   }
+                 }
+                 const recoveryRuns=await github.paginate(github.rest.actions.listWorkflowRuns,{owner,repo,workflow_id:process.env.RECOVERY_WORKFLOW_PATH,branch:'main',event:'workflow_dispatch',created:`>=${createRun.created_at}`,per_page:100});
+                 const laterRecovery=recoveryRuns.filter(run=>Date.parse(run.created_at)>=Date.parse(createRun.created_at));
+                 if(laterRecovery.length!==1 || String(laterRecovery[0].id)!==String(recovery.run_id) || laterRecovery[0].run_attempt!==1 || laterRecovery[0].status!=='completed' || laterRecovery[0].conclusion!=='success' || laterRecovery[0].head_sha!==value.authority_control_sha) throw new Error('pre-mutation cleanup recovery inventory differs');
+               }
+             }
             core.setOutput('authority_artifact_id',String(create.artifact_id));
             core.setOutput('authority_control_sha',value.authority_control_sha);
             core.setOutput('authority_kind',value.authority.kind);

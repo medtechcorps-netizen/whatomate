@@ -858,7 +858,7 @@ test("runtime configuration is exact and requires dedicated secrets", () => {
     CRM_CANARY_HMAC_KEY_BASE64: HMAC_KEY.toString("base64"),
     CRM_CANARY_DRIVER_VERSION_SHA256: DRIVER_VERSION,
     CRM_CANARY_LEDGER_DATABASE_URL:
-      "postgresql://ledger:password@ledger.invalid/canary?sslmode=require",
+      "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true",
     CRM_CANARY_FIXTURE_DESCRIPTOR_JSON: canonicalJson(descriptor),
     CRM_CANARY_KLINIK_LOGIN_JSON: canonicalJson(klinikLogin),
     CRM_CANARY_NON_KLINIK_LOGIN_JSON: canonicalJson(nonKlinikLogin),
@@ -887,16 +887,26 @@ test("runtime configuration is exact and requires dedicated secrets", () => {
     "postgresql://ledger:password@ledger.invalid/canary",
     "postgresql://ledger:password@ledger.invalid/canary?sslmode=disable",
     "postgresql://ledger:password@ledger.invalid/canary?sslmode=prefer",
-    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&ssl=false",
-    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&host=attacker.invalid",
-    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&port=5432",
-    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&user=other",
-    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&password=other",
-    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&sslcert=client.crt",
-    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&sslkey=client.key",
-    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&sslrootcert=root.crt",
-    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&unknown=value",
-    "postgresql://ledger@ledger.invalid/canary?sslmode=require",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=false",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true&uselibpqcompat=true",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&sslmode=require&uselibpqcompat=true",
+    "postgresql://ledger:password@ledger.invalid/canary?uselibpqcompat=true&sslmode=require",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=verify-ca&uselibpqcompat=true",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=verify-full&uselibpqcompat=true",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true&ssl=false",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true&host=attacker.invalid",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true&port=5432",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true&user=other",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true&password=other",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true&sslcert=client.crt",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true&sslkey=client.key",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true&sslrootcert=root.crt",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true&unknown=value",
+    "postgresql://ledger@ledger.invalid/canary?sslmode=require&uselibpqcompat=true",
+    "postgre\tsql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true",
+    "postgresql://ledger:pass\tword@ledger.invalid/canary?sslmode=require&uselibpqcompat=true",
+    "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&\tuselibpqcompat=true",
   ]) {
     assert.throws(() =>
       loadRuntimeConfig({
@@ -970,7 +980,16 @@ test("driver sources disable diagnostic capture and contain no logging calls", a
   assert.match(runnerSource, /\.body\.getReader\(\)/u);
   assert.match(runnerSource, /DRIVER_EXECUTION_TIMEOUT_MS\s*=\s*210_000/u);
   assert.match(runnerSource, /https:\/\/app\.rereply\.app/u);
-  assert.match(indexSource, /\["require",\s*"verify-ca",\s*"verify-full"\]/u);
+  assert.match(
+    indexSource,
+    /const exactQuery\s*=\s*"\?sslmode=require&uselibpqcompat=true"/u,
+  );
+  assert.match(indexSource, /raw\.indexOf\("\?"\)\s*!==/u);
+  assert.match(indexSource, /\[\\u0000-\\u0020\\u007f\]/u);
+  assert.match(
+    indexSource,
+    /parsed\.searchParams\.getAll\("uselibpqcompat"\)/u,
+  );
   assert.equal(
     /DIGITALOCEAN|DO_TOKEN|doctl/u.test(indexSource + runnerSource),
     false,
