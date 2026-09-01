@@ -148,6 +148,13 @@ def fake_spec() -> dict[str, object]:
                 "production": True,
             },
             {
+                "name": "test-postgres-runtime-binding",
+                "cluster_name": "test-postgres-cluster",
+                "engine": "PG",
+                "version": "17",
+                "production": True,
+            },
+            {
                 "name": "test-valkey-binding",
                 "cluster_name": "test-valkey-cluster",
                 "engine": "VALKEY",
@@ -295,13 +302,18 @@ class ProductionPlanTests(unittest.TestCase):
         vpc_hash = verifier.sha256_bytes(self.spec["vpc"]["id"].encode("utf-8"))
         db_inventory = database_inventory(self.spec)
         self.contract["expected_topology"]["vpc_id_sha256"] = vpc_hash
-        db_by_engine = {item[0]: item for item in db_inventory}
-        for item in self.contract["expected_topology"]["databases"]:
-            observed = db_by_engine[item["engine"]]
-            item["version"] = observed[1]
-            item["production"] = observed[2]
-            item["name_sha256"] = observed[3]
-            item["cluster_sha256"] = observed[4]
+        self.contract["expected_topology"]["databases"] = [
+            {
+                "engine": engine,
+                "version": version,
+                "production": production,
+                "name_sha256": name_sha256,
+                "cluster_sha256": cluster_sha256,
+            }
+            for engine, version, production, name_sha256, cluster_sha256 in sorted(
+                db_inventory
+            )
+        ]
 
         canonical_hash = verifier.sha256_value(self.spec)
         environment_hash = verifier.environment_value_fingerprint(self.spec)
@@ -825,6 +837,155 @@ class ProductionPlanTests(unittest.TestCase):
                         expected_state,
                         expected_images,
                     )
+
+    def test_database_alias_topology_is_exact_and_order_independent(self) -> None:
+        verifier.validate_topology(self.spec, self.contract)
+
+        reordered = copy.deepcopy(self.spec)
+        reordered["databases"][0:2] = reversed(reordered["databases"][0:2])
+        verifier.validate_topology(reordered, self.contract)
+
+        def replace_runtime_with_second_valkey(spec: dict[str, object]) -> None:
+            duplicate = copy.deepcopy(spec["databases"][2])
+            duplicate["name"] = "test-second-valkey-binding"
+            spec["databases"][1] = duplicate
+
+        def drift_both_pg_versions(spec: dict[str, object]) -> None:
+            spec["databases"][0]["version"] = "16"
+            spec["databases"][1]["version"] = "16"
+
+        def drift_both_pg_clusters(spec: dict[str, object]) -> None:
+            spec["databases"][0]["cluster_name"] = "test-other-postgres-cluster"
+            spec["databases"][1]["cluster_name"] = "test-other-postgres-cluster"
+
+        mutations = {
+            "missing runtime alias": lambda spec: spec["databases"].pop(1),
+            "extra alias": lambda spec: spec["databases"].append(
+                copy.deepcopy(spec["databases"][1])
+            ),
+            "duplicate alias name": lambda spec: spec["databases"][1].__setitem__(
+                "name", spec["databases"][0]["name"]
+            ),
+            "different PG cluster": lambda spec: spec["databases"][1].__setitem__(
+                "cluster_name", "test-other-postgres-cluster"
+            ),
+            "different PG version": lambda spec: spec["databases"][1].__setitem__(
+                "version", "16"
+            ),
+            "both PG versions drift": drift_both_pg_versions,
+            "both PG clusters drift": drift_both_pg_clusters,
+            "non-production PG alias": lambda spec: spec["databases"][1].__setitem__(
+                "production", False
+            ),
+            "Valkey version drift": lambda spec: spec["databases"][2].__setitem__(
+                "version", "7"
+            ),
+            "Valkey cluster drift": lambda spec: spec["databases"][2].__setitem__(
+                "cluster_name", "test-other-valkey-cluster"
+            ),
+            "Valkey name drift": lambda spec: spec["databases"][2].__setitem__(
+                "name", "test-other-valkey-binding"
+            ),
+            "physical clusters overlap": lambda spec: spec["databases"][
+                2
+            ].__setitem__("cluster_name", spec["databases"][0]["cluster_name"]),
+            "cross-engine binding name collision": lambda spec: spec["databases"][
+                2
+            ].__setitem__("name", spec["databases"][0]["name"]),
+            "duplicate Valkey binding": replace_runtime_with_second_valkey,
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                candidate = copy.deepcopy(self.spec)
+                mutate(candidate)
+                with self.assertRaises(verifier.PlanError):
+                    verifier.validate_topology(candidate, self.contract)
+
+        reordered_contract = copy.deepcopy(self.contract)
+        reordered_contract["expected_topology"]["databases"].reverse()
+        verifier.validate_contract(
+            reordered_contract,
+            policy_value=self.policy,
+            schema_value=self.schema,
+        )
+
+        def replace_contract_runtime_with_second_valkey(
+            value: dict[str, object],
+        ) -> None:
+            duplicate = copy.deepcopy(value["expected_topology"]["databases"][2])
+            duplicate["name_sha256"] = "8" * 64
+            value["expected_topology"]["databases"][1] = duplicate
+
+        def drift_both_contract_pg_versions(value: dict[str, object]) -> None:
+            value["expected_topology"]["databases"][0]["version"] = "16"
+            value["expected_topology"]["databases"][1]["version"] = "16"
+
+        def drift_both_contract_pg_clusters(value: dict[str, object]) -> None:
+            value["expected_topology"]["databases"][0]["cluster_sha256"] = "7" * 64
+            value["expected_topology"]["databases"][1]["cluster_sha256"] = "7" * 64
+
+        contract_mutations = {
+            "missing contract runtime alias": lambda value: value[
+                "expected_topology"
+            ]["databases"].pop(1),
+            "extra contract alias": lambda value: value["expected_topology"][
+                "databases"
+            ].append(copy.deepcopy(value["expected_topology"]["databases"][1])),
+            "duplicate contract alias name": lambda value: value[
+                "expected_topology"
+            ]["databases"][1].__setitem__(
+                "name_sha256",
+                value["expected_topology"]["databases"][0]["name_sha256"],
+            ),
+            "different contract PG cluster": lambda value: value[
+                "expected_topology"
+            ]["databases"][1].__setitem__("cluster_sha256", "9" * 64),
+            "different contract PG version": lambda value: value[
+                "expected_topology"
+            ]["databases"][1].__setitem__("version", "16"),
+            "both contract PG versions drift": drift_both_contract_pg_versions,
+            "both contract PG clusters drift": drift_both_contract_pg_clusters,
+            "unique contract alias name drift": lambda value: value[
+                "expected_topology"
+            ]["databases"][1].__setitem__("name_sha256", "6" * 64),
+            "non-production contract PG alias": lambda value: value[
+                "expected_topology"
+            ]["databases"][1].__setitem__("production", False),
+            "contract Valkey version drift": lambda value: value[
+                "expected_topology"
+            ]["databases"][2].__setitem__("version", "7"),
+            "contract Valkey cluster drift": lambda value: value[
+                "expected_topology"
+            ]["databases"][2].__setitem__("cluster_sha256", "5" * 64),
+            "contract physical clusters overlap": lambda value: value[
+                "expected_topology"
+            ]["databases"][2].__setitem__(
+                "cluster_sha256",
+                value["expected_topology"]["databases"][0]["cluster_sha256"],
+            ),
+            "duplicate contract Valkey binding": (
+                replace_contract_runtime_with_second_valkey
+            ),
+        }
+        for label, mutate in contract_mutations.items():
+            with self.subTest(label=label):
+                candidate = copy.deepcopy(self.contract)
+                mutate(candidate)
+                with self.assertRaises(verifier.PlanError):
+                    verifier.validate_contract(
+                        candidate,
+                        policy_value=self.policy,
+                        schema_value=self.schema,
+                    )
+
+        malformed_contract = copy.deepcopy(self.contract)
+        malformed_contract["expected_topology"]["databases"][0]["unexpected"] = True
+        with self.assertRaises(verifier.PlanError):
+            verifier.validate_contract(
+                malformed_contract,
+                policy_value=self.policy,
+                schema_value=self.schema,
+            )
 
     def test_logical_candidate_changes_only_four_source_envelopes(self) -> None:
         _, images, _, _ = verifier.validate_rollout_plan(
@@ -1816,7 +1977,7 @@ class ReviewedProductionContractTests(unittest.TestCase):
         )
         self.assertEqual(
             production_contract["bootstrap_state"]["genesis_state_sha256"],
-            "11ff1c82148f8893de1f10fc05808b7660d3c7e5a13475223d6e949a5b53d3d1",
+            "6cb64c4108ae092aefa6d1330202c924c5da18496ad381d8c718ed8d95722f2d",
         )
         self.assertEqual(
             verifier.genesis_state_sha256(production_contract),

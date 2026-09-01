@@ -160,6 +160,15 @@ def contract() -> dict[str, object]:
                     ),
                 },
                 {
+                    "engine": "PG", "version": "17", "production": True,
+                    "name_sha256": common.sha256_bytes(
+                        b"postgres-runtime-app-binding"
+                    ),
+                    "cluster_sha256": common.sha256_bytes(
+                        DATABASE_NAMES["postgres"].encode("utf-8")
+                    ),
+                },
+                {
                     "engine": "VALKEY", "version": "8", "production": True,
                     "name_sha256": common.sha256_bytes(b"valkey-app-binding"),
                     "cluster_sha256": common.sha256_bytes(
@@ -428,7 +437,7 @@ class RecoveryReadinessTests(unittest.TestCase):
         )
         self.assertNotEqual(
             bindings["valkey_cluster_sha256"],
-            source_contract["expected_topology"]["databases"][1]["name_sha256"],
+            source_contract["expected_topology"]["databases"][2]["name_sha256"],
         )
         wrong_name = observations()
         wrong_name["valkey-cluster"]["database"]["name"] = "unrelated-valkey-name"
@@ -440,6 +449,74 @@ class RecoveryReadinessTests(unittest.TestCase):
         )
         with self.assertRaises(common.ReleaseError):
             self.build(values=wrong_identity)
+
+    def test_contract_requires_two_role_separated_pg_aliases_and_one_valkey(self) -> None:
+        expected = recovery.contract_database_bindings(contract())
+        reordered = contract()
+        reordered["expected_topology"]["databases"].reverse()
+        self.assertEqual(recovery.contract_database_bindings(reordered), expected)
+
+        def duplicate_valkey(value: dict[str, object]) -> None:
+            replacement = copy.deepcopy(value["expected_topology"]["databases"][2])
+            replacement["name_sha256"] = "8" * 64
+            value["expected_topology"]["databases"][1] = replacement
+
+        def drift_both_pg_versions(value: dict[str, object]) -> None:
+            value["expected_topology"]["databases"][0]["version"] = "16"
+            value["expected_topology"]["databases"][1]["version"] = "16"
+
+        mutations = {
+            "missing PG alias": lambda value: value["expected_topology"][
+                "databases"
+            ].pop(1),
+            "extra PG alias": lambda value: value["expected_topology"][
+                "databases"
+            ].append(copy.deepcopy(value["expected_topology"]["databases"][1])),
+            "duplicate binding name": lambda value: value["expected_topology"][
+                "databases"
+            ][1].__setitem__(
+                "name_sha256",
+                value["expected_topology"]["databases"][0]["name_sha256"],
+            ),
+            "different PG cluster": lambda value: value["expected_topology"][
+                "databases"
+            ][1].__setitem__("cluster_sha256", "9" * 64),
+            "different PG version": lambda value: value["expected_topology"][
+                "databases"
+            ][1].__setitem__("version", "16"),
+            "both PG versions drift": drift_both_pg_versions,
+            "Valkey version drift": lambda value: value["expected_topology"][
+                "databases"
+            ][2].__setitem__("version", "7"),
+            "physical clusters overlap": lambda value: value["expected_topology"][
+                "databases"
+            ][2].__setitem__(
+                "cluster_sha256",
+                value["expected_topology"]["databases"][0]["cluster_sha256"],
+            ),
+            "non-production PG": lambda value: value["expected_topology"][
+                "databases"
+            ][1].__setitem__("production", False),
+            "non-production Valkey": lambda value: value["expected_topology"][
+                "databases"
+            ][2].__setitem__("production", False),
+            "cross-engine binding name collision": lambda value: value[
+                "expected_topology"
+            ]["databases"][2].__setitem__(
+                "name_sha256",
+                value["expected_topology"]["databases"][0]["name_sha256"],
+            ),
+            "duplicate Valkey": duplicate_valkey,
+            "unexpected key": lambda value: value["expected_topology"][
+                "databases"
+            ][0].__setitem__("unexpected", True),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                candidate = contract()
+                mutate(candidate)
+                with self.assertRaises(common.ReleaseError):
+                    recovery.contract_database_bindings(candidate)
 
     def test_pretty_checked_in_contract_is_raw_hash_bound_but_artifacts_stay_canonical(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

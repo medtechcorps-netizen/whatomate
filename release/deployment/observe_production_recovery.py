@@ -246,9 +246,11 @@ def contract_database_bindings(contract: Any) -> dict[str, str]:
         common.fail("production contract has no reviewed database region mapping")
     region = APP_TO_DATABASE_REGION[app_region]
     databases = topology.get("databases")
-    if type(databases) is not list or len(databases) != 2:
+    if type(databases) is not list or len(databases) != 3:
         common.fail("production contract database inventory differs")
-    output: dict[str, dict[str, str]] = {}
+    postgres: list[dict[str, str]] = []
+    valkey: list[dict[str, str]] = []
+    binding_names: set[str] = set()
     for item in databases:
         item = common.exact_keys(
             item,
@@ -256,9 +258,15 @@ def contract_database_bindings(contract: Any) -> dict[str, str]:
             "production contract database",
         )
         engine = common.exact_string(item["engine"], "production contract database engine")
-        if engine not in {"PG", "VALKEY"} or engine in output or item["production"] is not True:
+        if engine not in {"PG", "VALKEY"} or item["production"] is not True:
             common.fail("production contract database authority differs")
-        output[engine] = {
+        binding_name = common.require_sha256(
+            item["name_sha256"], "production database binding hash"
+        )
+        if binding_name in binding_names:
+            common.fail("production contract database binding names differ")
+        binding_names.add(binding_name)
+        record = {
             "version": common.exact_string(
                 item["version"], "production contract database version"
             ),
@@ -266,9 +274,17 @@ def contract_database_bindings(contract: Any) -> dict[str, str]:
                 item["cluster_sha256"], "production database cluster hash"
             ),
         }
-        common.require_sha256(item["name_sha256"], "production database binding hash")
-    if set(output) != {"PG", "VALKEY"}:
+        (postgres if engine == "PG" else valkey).append(record)
+    if len(postgres) != 2 or len(valkey) != 1:
         common.fail("production contract database engines differ")
+    if postgres[0] != postgres[1]:
+        common.fail("production PostgreSQL role bindings differ")
+    postgres_binding = postgres[0]
+    valkey_binding = valkey[0]
+    if postgres_binding["version"] != "17" or valkey_binding["version"] != "8":
+        common.fail("production contract database versions differ")
+    if postgres_binding["cluster_sha256"] == valkey_binding["cluster_sha256"]:
+        common.fail("production contract physical database clusters overlap")
     return {
         "app_id_sha256": common.require_sha256(
             contract["provider"].get("app_id_sha256"),
@@ -276,10 +292,10 @@ def contract_database_bindings(contract: Any) -> dict[str, str]:
         ),
         "region": region,
         "region_sha256": common.sha256_bytes(region.encode("utf-8")),
-        "postgresql_cluster_sha256": output["PG"]["cluster_sha256"],
-        "postgresql_version": output["PG"]["version"],
-        "valkey_cluster_sha256": output["VALKEY"]["cluster_sha256"],
-        "valkey_version": output["VALKEY"]["version"],
+        "postgresql_cluster_sha256": postgres_binding["cluster_sha256"],
+        "postgresql_version": postgres_binding["version"],
+        "valkey_cluster_sha256": valkey_binding["cluster_sha256"],
+        "valkey_version": valkey_binding["version"],
     }
 
 

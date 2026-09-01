@@ -77,18 +77,18 @@ PRODUCTION_DEFAULT_INGRESS_SHA256 = (
     "05ab4f90194ad37c6926138e9aafbd49c73aa75d08da92b0b1309bfce207cfa8"
 )
 BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
-    "783cc7adf0a1cb8433c404e20244f7fe8ef6ac47eb7dba7bb1877353fbb02951"
+    "b2169930aeb6cbccfc121beca21a971e8cb5a2c4917c9a5d99d2dd58b4aeb8a1"
 )
 BOOTSTRAP_SOURCE_SHA = "974bb998f6d4c94ce750a92bf23f4550f8e45a2f"
 BASELINE_TARGET_SOURCE_SHA = "ad580e949f264a67032ad004f2995d0199af84c9"
 BOOTSTRAP_CANONICAL_SPEC_SHA256 = (
-    "fb0e0ce579aa67c4ef3cb666ba1da658852d78e26a4e13a9dd83beb8a8d5cf30"
+    "dc758943902680a142fd30dc1b27bd484cea3f8155e564d08b6dfa8025d0d874"
 )
 BOOTSTRAP_ENVIRONMENT_SHA256 = (
-    "572694fce97757943d8f0cca09567a354428da64e109de409a247340e321a8e9"
+    "c7e20ec77021f8b90b6ff0bb79080ee13b010eab121687ac5e391a43b2365b23"
 )
 BOOTSTRAP_NON_SOURCE_SHA256 = (
-    "6e70f990d875c90277867a3777f3e2724daaf31cf69c5aa5cd2c368d2900dcce"
+    "1c46d577dd13e43f9eb0be9ce1b9c1f292530bc6f0950d9e30f4196ecbc6aad9"
 )
 PRODUCTION_VPC_ID_SHA256 = (
     "aaaf98cef6beb658509d644dc8c56b559a38f79344739cd0edd1442070ec207e"
@@ -99,6 +99,13 @@ PRODUCTION_DATABASE_INVENTORY = {
         "17",
         True,
         "5a08acdc0eed3e363e1aa4e0bba55a523bff63fec1680f3f63b1f46e834289c2",
+        "28248f27ae9c2545b42173bd7f06fffce87e1b22db6d51d1721fb3318a871472",
+    ),
+    (
+        "PG",
+        "17",
+        True,
+        "9bfa326c0b98e9f182c25cdb260258e8f368869e399afd476eac27da879c104a",
         "28248f27ae9c2545b42173bd7f06fffce87e1b22db6d51d1721fb3318a871472",
     ),
     (
@@ -1360,7 +1367,9 @@ def validate_contract(
     if topology["domains"] != ["app.rereply.app", "rereply.app"]:
         fail("domain contract differs")
     databases = topology["databases"]
-    if type(databases) is not list or len(databases) != 2:
+    if type(databases) is not list or len(databases) != len(
+        PRODUCTION_DATABASE_INVENTORY
+    ):
         fail("database contract differs")
     for item in databases:
         item = exact_keys(
@@ -1654,7 +1663,9 @@ def validate_topology(spec: Mapping[str, Any], contract: Mapping[str, Any]) -> N
         fail("production domains differ")
 
     databases = spec.get("databases")
-    if type(databases) is not list or len(databases) != 2:
+    if type(databases) is not list or len(databases) != len(
+        PRODUCTION_DATABASE_INVENTORY
+    ):
         fail("production database bindings differ")
     observed_databases = []
     for database in databases:
@@ -1671,9 +1682,25 @@ def validate_topology(spec: Mapping[str, Any], contract: Mapping[str, Any]) -> N
                 "cluster_sha256": sha256_bytes(cluster.encode("utf-8")),
             }
         )
-    if sorted(observed_databases, key=lambda item: item["engine"]) != sorted(
-        topology["databases"], key=lambda item: item["engine"]
-    ):
+    if {
+        (
+            item["engine"],
+            item["version"],
+            item["production"],
+            item["name_sha256"],
+            item["cluster_sha256"],
+        )
+        for item in observed_databases
+    } != {
+        (
+            item["engine"],
+            item["version"],
+            item["production"],
+            item["name_sha256"],
+            item["cluster_sha256"],
+        )
+        for item in topology["databases"]
+    }:
         fail("production database bindings differ")
 
 
