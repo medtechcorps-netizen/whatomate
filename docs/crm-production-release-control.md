@@ -8,9 +8,9 @@ release evidence, and changing production are three separate authorities.
 
 The final `ui` phase is bound to one immutable Git identity:
 
-- commit: `f69f45fbb60962e7f7c679fbb6c1e5a2b391b455`
-- root tree: `844d742a232c6b3b92b0522c1c96dba98321bca7`
-- `frontend` tree: `f1cdd8186e2b724dc4bba41081578b2b003a6910`
+- commit: `c6e16810b8dec7d54305be47f7f7fc12430a1f0a`
+- root tree: `2e300415c550f7fade95d16da8d1499ed3e0a5fd`
+- `frontend` tree: `b9e93e27948ef2287b3f35bb38f6399b7f0a05c6`
 - `internal` tree: `a1da97143c17f3d02e47250269d00f238ac0e38c`
 
 The release contains Klinik-only WhatsApp reply hardening and the existing

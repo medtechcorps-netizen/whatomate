@@ -33,9 +33,9 @@ IMAGE_WORKFLOW_PATH = (
 TEST_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "test.yml"
 CONTROL_SHA = "a" * 40
 EXPECTED_FINAL_SOURCE = {
-    "source_sha": "f69f45fbb60962e7f7c679fbb6c1e5a2b391b455",
-    "root_tree": "844d742a232c6b3b92b0522c1c96dba98321bca7",
-    "frontend_tree": "f1cdd8186e2b724dc4bba41081578b2b003a6910",
+    "source_sha": "c6e16810b8dec7d54305be47f7f7fc12430a1f0a",
+    "root_tree": "2e300415c550f7fade95d16da8d1499ed3e0a5fd",
+    "frontend_tree": "b9e93e27948ef2287b3f35bb38f6399b7f0a05c6",
     "internal_tree": "a1da97143c17f3d02e47250269d00f238ac0e38c",
 }
 STALE_FINAL_SOURCE = {
@@ -50,9 +50,19 @@ ORIGINAL_PHASE_SOURCE_SHA = {
     "backend": "63e54fe72a753006733931ddfb5bdbdbe2a2a4fc",
     "ui": "ff0c9c6b8d94a085af164e564028d25d38b0a02c",
 }
+GO_REMEDIATED_PHASE_SOURCE_SHA = {
+    "baseline": "ad580e949f264a67032ad004f2995d0199af84c9",
+    "bridge": "66b9351a5e7767cb7450e17cb6362990b4fc4f6f",
+    "backend": "022cce50d96dff0991a742abec579bd6bc25963a",
+    "ui": "f69f45fbb60962e7f7c679fbb6c1e5a2b391b455",
+}
 REVIEWED_GO_DEPENDENCY_BLOBS = {
     "go.mod": "e8d0c05379c6b1303744116ee8b81121452d8a50",
     "go.sum": "6768bc62e9296bea40ef9cdc9b8cc1cfa8a8387f",
+}
+REVIEWED_FRONTEND_DEPENDENCY_BLOBS = {
+    "frontend/package-lock.json": "12a47b71bd16057f76da532084003d3b7ecda935",
+    "frontend/package.json": "9881717b4eda324598217a469295c629b28903ca",
 }
 
 
@@ -181,13 +191,14 @@ class RolloutEvidenceTests(unittest.TestCase):
         for phase, source in self.manifest["phases"].items():
             with self.subTest(phase=phase):
                 commit = source["source_sha"]
+                go_remediated_commit = GO_REMEDIATED_PHASE_SOURCE_SHA[phase]
                 ancestry = subprocess.run(
                     ["git", "-C", str(ROOT), "rev-list", "--parents", "-n", "1", commit],
                     check=True,
                     capture_output=True,
                     text=True,
                 ).stdout.split()
-                self.assertEqual(ancestry, [commit, ORIGINAL_PHASE_SOURCE_SHA[phase]])
+                self.assertEqual(ancestry, [commit, go_remediated_commit])
                 changed_paths = subprocess.run(
                     [
                         "git",
@@ -203,10 +214,60 @@ class RolloutEvidenceTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 ).stdout.splitlines()
-                self.assertEqual(changed_paths, ["go.mod", "go.sum"])
-                for path, expected_blob in REVIEWED_GO_DEPENDENCY_BLOBS.items():
+                self.assertEqual(changed_paths, ["frontend/package-lock.json"])
+                for path, expected_blob in REVIEWED_FRONTEND_DEPENDENCY_BLOBS.items():
                     actual_blob = subprocess.run(
                         ["git", "-C", str(ROOT), "rev-parse", f"{commit}:{path}"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    self.assertEqual(actual_blob, expected_blob)
+
+                go_ancestry = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(ROOT),
+                        "rev-list",
+                        "--parents",
+                        "-n",
+                        "1",
+                        go_remediated_commit,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.split()
+                self.assertEqual(
+                    go_ancestry,
+                    [go_remediated_commit, ORIGINAL_PHASE_SOURCE_SHA[phase]],
+                )
+                go_changed_paths = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(ROOT),
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        go_remediated_commit,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+                self.assertEqual(go_changed_paths, ["go.mod", "go.sum"])
+                for path, expected_blob in REVIEWED_GO_DEPENDENCY_BLOBS.items():
+                    actual_blob = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(ROOT),
+                            "rev-parse",
+                            f"{go_remediated_commit}:{path}",
+                        ],
                         check=True,
                         capture_output=True,
                         text=True,
