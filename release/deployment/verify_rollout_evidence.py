@@ -135,27 +135,27 @@ MIGRATION = {
 
 EXPECTED_PHASE_SOURCES = {
     "baseline": {
-        "source_sha": "ad580e949f264a67032ad004f2995d0199af84c9",
-        "root_tree": "feb8096aa3c9e89296295cb866709601b84b75e2",
-        "frontend_tree": "0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74",
+        "source_sha": "fe0fc9e4f5ad8f3f8b98af945a78a7239e848f33",
+        "root_tree": "f43c28bd4c712d2f3a5610a567fdc358ced899c6",
+        "frontend_tree": "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
         "internal_tree": "f70860bcee374d507b7e6443f4f21df2855b217f",
     },
     "bridge": {
-        "source_sha": "66b9351a5e7767cb7450e17cb6362990b4fc4f6f",
-        "root_tree": "349735041a41afd12c3754631963097da2323adf",
-        "frontend_tree": "0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74",
+        "source_sha": "45334bf62943885291a73c55788d18001b191be9",
+        "root_tree": "693cc853fa1e0ec5ec894884b9d7b88f61902222",
+        "frontend_tree": "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
         "internal_tree": "32763888c556305e8aee180183c92f36ddf5d195",
     },
     "backend": {
-        "source_sha": "022cce50d96dff0991a742abec579bd6bc25963a",
-        "root_tree": "0ec920b9a5842d3a37cc6b506e7d5172c99068b6",
-        "frontend_tree": "0f16215d6bab3496e23d8a1e0d4d2c048ad4ba74",
+        "source_sha": "f90ae3b1713c76694680c0cb3b36114db1688f30",
+        "root_tree": "1346a39805919f5a0d690200cd0f02fab3cbfba0",
+        "frontend_tree": "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
         "internal_tree": "494d3957ff3559375f406886be45646049ec9378",
     },
     "ui": {
-        "source_sha": "f69f45fbb60962e7f7c679fbb6c1e5a2b391b455",
-        "root_tree": "844d742a232c6b3b92b0522c1c96dba98321bca7",
-        "frontend_tree": "f1cdd8186e2b724dc4bba41081578b2b003a6910",
+        "source_sha": "c6e16810b8dec7d54305be47f7f7fc12430a1f0a",
+        "root_tree": "2e300415c550f7fade95d16da8d1499ed3e0a5fd",
+        "frontend_tree": "b9e93e27948ef2287b3f35bb38f6399b7f0a05c6",
         "internal_tree": "a1da97143c17f3d02e47250269d00f238ac0e38c",
     },
 }
