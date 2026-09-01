@@ -152,6 +152,13 @@ def recovery_contract() -> dict[str, object]:
                     "cluster_sha256": "2" * 64,
                 },
                 {
+                    "engine": "PG",
+                    "version": "17",
+                    "production": True,
+                    "name_sha256": "5" * 64,
+                    "cluster_sha256": "2" * 64,
+                },
+                {
                     "engine": "VALKEY",
                     "version": "8",
                     "production": True,
