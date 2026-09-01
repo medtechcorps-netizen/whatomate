@@ -41,7 +41,7 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifi
 ARG UBUNTU_SNAPSHOT=20260824T000000Z
 WORKDIR /app
 RUN set -eu; \
-    printf 'APT::Snapshot "%s";\n' "$UBUNTU_SNAPSHOT" > /etc/apt/apt.conf.d/50snapshot \
+    printf 'APT::Snapshot "%s";\nAcquire::Retries "10";\n' "$UBUNTU_SNAPSHOT" > /etc/apt/apt.conf.d/50snapshot \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends \
       ca-certificates=20260601~24.04.1 \
@@ -52,6 +52,7 @@ RUN set -eu; \
     && for package in ca-certificates tzdata espeak-ng opus-tools ffmpeg; do \
          apt-cache policy "$package" | grep -F 'snapshot.ubuntu.com' > /dev/null || exit 1; \
        done \
+    && printf 'APT::Snapshot "%s";\n' "$UBUNTU_SNAPSHOT" > /etc/apt/apt.conf.d/50snapshot \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/rereply ./rereply
 COPY --from=builder /app/config.example.toml ./config.toml

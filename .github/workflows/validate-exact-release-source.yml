@@ -621,7 +621,7 @@ jobs:
           EXPECTED_ROOT_TREE: ${{ needs.source_identity.outputs.root_tree }}
           EXPECTED_FRONTEND_TREE: ${{ needs.source_identity.outputs.frontend_tree }}
           EXPECTED_INTERNAL_TREE: ${{ needs.source_identity.outputs.internal_tree }}
-          WEB_DOCKERFILE_SHA256: 6c5b065797072000d66124120ea6da940858b54a2a8bcf3b5595f3719cf03582
+          WEB_DOCKERFILE_SHA256: f441cbd45867a32a509af11c246f2c4e6d81104db99b728d7ccd865c7f9ad381
           META_RELAY_DOCKERFILE_SHA256: 38a6dcceaa252750f4ffd016002687423f062b15d8b47f6478af2185b628eb25
           GMAIL_RELAY_DOCKERFILE_SHA256: f0c2ac09e585b3504123c1a5d336658dca5a52a0124a04aace202fb61a98a098
         run: |

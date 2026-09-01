@@ -186,7 +186,7 @@ EXPECTED_COMPONENTS = {
     "web": {
         "image": "ghcr.io/medtechcorps-netizen/rereply-release-web",
         "dockerfile": "docker/release/web.Dockerfile",
-        "dockerfile_sha256": "6c5b065797072000d66124120ea6da940858b54a2a8bcf3b5595f3719cf03582",
+        "dockerfile_sha256": "f441cbd45867a32a509af11c246f2c4e6d81104db99b728d7ccd865c7f9ad381",
         "user": "rereply",
         "working_dir": "/app",
         "entrypoint": ["./rereply"],
