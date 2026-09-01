@@ -206,7 +206,7 @@ jobs:
                if(preMutationFailure){
                  const applyRun=await runExact(applyFailure,process.env.APPLY_WORKFLOW_PATH,'pre-mutation apply failure',value.authority_control_sha);
                  if(applyRun.conclusion!=='failure') throw new Error('pre-mutation apply run conclusion differs');
-                 const recoveryCompleted=Date.parse(recoveryRun.completed_at);
+                 const recoveryCompleted=Date.parse(recoveryRun.updated_at);
                  const applyCreated=Date.parse(applyRun.created_at);
                  if(!Number.isFinite(recoveryCompleted) || !Number.isFinite(applyCreated) || applyCreated<recoveryCompleted) throw new Error('pre-mutation apply chronology differs');
                  const jobs=await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/1/jobs',{owner,repo,run_id:Number(applyFailure.run_id),per_page:100});

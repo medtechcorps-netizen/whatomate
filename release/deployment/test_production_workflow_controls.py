@@ -113,10 +113,10 @@ EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
     "88cd01af3d37deda224bae886cedaf806611f3b43f089c3a41142c1f015c701c"
 )
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
-    "aaa247fb6301b17465983565e94b27344c314458b88cb3e050492b1eda3dc0e7"
+    "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
 )
 EXACT_CLEANUP_AUTHORITY_STEP_SHA256 = (
-    "914c4ac9f63a67f63383d5158919529672be15dddbfa8d7a621ca3eea601a2a6"
+    "30096cb73e5db041a6120d3ed4dcf6bb29169134713e2515e9baf32ee3179232"
 )
 EXACT_GATE_B_TEST_JOB_SHA256 = {
     "go-race": "0aa5bc14dd3d264191134048bc4e9dc6b50f77b58b13d3f596dadcd93a1c1a98",
@@ -236,6 +236,7 @@ CLEANUP_PRE_MUTATION_REQUIRED_LINES = (
         "if(applyRun.conclusion!=='failure') throw new Error('pre-mutation "
         "apply run conclusion differs');"
     ),
+    "const recoveryCompleted=Date.parse(recoveryRun.updated_at);",
     (
         "if(!Number.isFinite(recoveryCompleted) || !Number.isFinite("
         "applyCreated) || applyCreated<recoveryCompleted) throw new Error("
@@ -343,6 +344,8 @@ def assert_cleanup_pre_mutation_failure_controls(source: str) -> None:
     ):
         if forbidden in authority:
             raise AssertionError("cleanup authority must not infer safety from logs")
+    if "recoveryRun.completed_at" in authority:
+        raise AssertionError("cleanup chronology uses an unavailable run field")
 
 
 def job_definitions(source: str) -> tuple[tuple[str, str], ...]:
@@ -4439,6 +4442,11 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
         )
         self.assertNotEqual(disabled, authority)
         mutants.append(source.replace(authority, disabled, 1))
+        unavailable_timestamp = authority.replace(
+            "recoveryRun.updated_at", "recoveryRun.completed_at", 1
+        )
+        self.assertNotEqual(unavailable_timestamp, authority)
+        mutants.append(source.replace(authority, unavailable_timestamp, 1))
         match = re.search(
             r"(?ms)^               if\(preMutationFailure\)\{\n"
             r"(?P<body>.*?)^               \}[ \t]*$",
