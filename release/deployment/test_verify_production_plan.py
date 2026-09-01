@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = ROOT / "release" / "deployment" / "production-app-contract.json"
 POLICY_PATH = ROOT / "release" / "deployment" / "production-release-policy.json"
 SCHEMA_PATH = ROOT / "release" / "deployment" / "production-change.schema.json"
+SOURCE_MANIFEST_PATH = ROOT / "release" / "exact-sources.json"
 VERIFIER_PATH = ROOT / "release" / "deployment" / "verify_production_plan.py"
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "plan-production-rollout.yml"
 IMAGE_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "build-attest-exact-release-images.yml"
@@ -173,7 +174,7 @@ def database_inventory(spec: dict[str, object]) -> set[tuple[object, ...]]:
 def rollout_plan() -> dict[str, object]:
     phases = []
     for index, phase in enumerate(verifier.PHASES):
-        source_sha = verifier.BOOTSTRAP_SOURCE_SHA if phase == "baseline" else (
+        source_sha = verifier.BASELINE_TARGET_SOURCE_SHA if phase == "baseline" else (
             f"{index + 1:x}" * 40
         )
         images = []
@@ -1080,6 +1081,11 @@ class ProductionPlanTests(unittest.TestCase):
                 verifier.trusted_verifier_hash(other)
 
     def test_genesis_authority_selects_only_baseline(self) -> None:
+        source_manifest = json.loads(SOURCE_MANIFEST_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(
+            source_manifest["phases"]["baseline"]["source_sha"],
+            verifier.BASELINE_TARGET_SOURCE_SHA,
+        )
         target, _images, transition, predecessor = verifier.validate_rollout_plan(
             self.rollout,
             self.contract,
@@ -1090,6 +1096,12 @@ class ProductionPlanTests(unittest.TestCase):
             predecessor_state=None,
         )
         self.assertEqual(target["phase"], "baseline")
+        self.assertEqual(
+            target["source"]["commit"], verifier.BASELINE_TARGET_SOURCE_SHA
+        )
+        self.assertNotEqual(
+            verifier.BASELINE_TARGET_SOURCE_SHA, verifier.BOOTSTRAP_SOURCE_SHA
+        )
         self.assertEqual(
             transition,
             {
@@ -1105,6 +1117,20 @@ class ProductionPlanTests(unittest.TestCase):
             predecessor["state_sha256"],
             self.contract["bootstrap_state"]["genesis_state_sha256"],
         )
+
+    def test_genesis_rejects_the_unpatched_predecessor_as_baseline_target(self) -> None:
+        rollout = copy.deepcopy(self.rollout)
+        rollout["phases"][0]["source"]["commit"] = verifier.BOOTSTRAP_SOURCE_SHA
+        with self.assertRaises(verifier.PlanError):
+            verifier.validate_rollout_plan(
+                rollout,
+                self.contract,
+                self.normalized,
+                policy=self.policy,
+                policy_sha256=self.policy_hash,
+                schema_sha256=self.schema_hash,
+                predecessor_state=None,
+            )
 
     def test_each_signed_phase_authorizes_only_the_next_activation(self) -> None:
         for current_phase, next_phase in zip(

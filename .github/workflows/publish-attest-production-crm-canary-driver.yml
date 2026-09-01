@@ -40,7 +40,7 @@ env:
   PINNED_TRIVY_VERSION: "0.70.0"
   PINNED_TRIVY_URL: https://github.com/aquasecurity/trivy/releases/download/v0.70.0/trivy_0.70.0_Linux-64bit.tar.gz
   PINNED_TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
-  PINNED_TRIVY_DB: ghcr.io/aquasecurity/trivy-db@sha256:354879494133734128160eabaf873069c1da593adb1760eaf657d17411cb6c8a
+  PINNED_TRIVY_DB: ghcr.io/aquasecurity/trivy-db@sha256:2c970207420044aba72c733cf41dc24501e75e8c7f96ec01014aa362e20c013a
   PINNED_SYFT_VERSION: "1.51.0"
   PINNED_SYFT_URL: https://github.com/anchore/syft/releases/download/v1.51.0/syft_1.51.0_linux_amd64.tar.gz
   PINNED_SYFT_SHA256: 2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f
