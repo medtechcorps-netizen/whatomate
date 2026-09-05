@@ -546,11 +546,50 @@ class TestClaimAdapter(unittest.TestCase):
             bundle = Path(tmp)/"probe.cjs"
             for source,expected in cases:
                 bundle.write_text(source,encoding="utf-8")
-                process = subprocess.run([node,"-e",fixture.CLAIM_PROBE_WRAPPER,str(bundle)],
+                process = subprocess.run([node,"--disable-warning=DEP0040","--disable-warning=DEP0169",
+                                          "-e",fixture.CLAIM_PROBE_WRAPPER,str(bundle)],
                                          capture_output=True,timeout=10,check=False)
                 self.assertEqual(process.returncode,expected)
                 self.assertEqual(process.stdout,b"")
                 self.assertEqual(process.stderr,b"")
+
+    def test_probe_suppresses_only_the_two_reviewed_warning_codes(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node)
+        flags = ["--disable-warning=DEP0040","--disable-warning=DEP0169"]
+        annotation = "::error::Failed to CreateArtifact: Received non-retryable error: Failed request: (409) Conflict: an artifact with this name already exists on the workflow run\n"
+        conflict = "process.stdout.write("+json.dumps(annotation)+");process.exitCode=1;"
+        warnings_by_code = [
+            "process.emitWarning('synthetic',{type:'DeprecationWarning',code:"+json.dumps(code)+"});"
+            for code in ("DEP0040","DEP0169")
+        ]
+        cases = [(flags,warning,0) for warning in warnings_by_code]
+        cases.extend(((flags,"".join(warnings_by_code),0),
+                      (flags,conflict+"".join(warnings_by_code),fixture.CLAIM_CONFLICT_EXIT)))
+        for index,warning in enumerate(warnings_by_code):
+            for candidate in (flags[:index]+flags[index+1:],
+                              ["--disable-warning=DEP9999" if i == index else flag
+                               for i,flag in enumerate(flags)]):
+                self.assertNotEqual(candidate,flags)
+                cases.extend(((candidate,warning,1),(candidate,conflict+warning,1)))
+        for warning in (
+            "process.emitWarning('synthetic',{code:'FIXTURE_OTHER'});",
+            "process.emitWarning('synthetic');",
+            "process.emitWarning('synthetic',{type:'ExperimentalWarning'});",
+            "process.emitWarning('synthetic',{type:'DeprecationWarning',code:'DEP9999'});",
+            "process.stderr.write('[DEP0040] [DEP0169] synthetic\\n');",
+        ):
+            cases.extend(((flags,warning,1),(flags,conflict+warning,1)))
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)/"probe.cjs"
+            for candidate,source,expected in cases:
+                with self.subTest(flags=candidate,source=source):
+                    bundle.write_text(source,encoding="utf-8")
+                    process = subprocess.run([node,*candidate,"-e",fixture.CLAIM_PROBE_WRAPPER,str(bundle)],
+                                             capture_output=True,timeout=10,check=False)
+                    self.assertEqual(process.returncode,expected)
+                    self.assertEqual(process.stdout,b"")
+                    self.assertEqual(process.stderr,b"")
 
     def test_hosted_probe_does_not_accept_guard_or_transport_failure(self):
         for failure in ("duplicate","guard","transport"):
@@ -596,22 +635,35 @@ class TestClaimAdapter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env = {"RUNNER_TEMP":tmp,"ACTIONS_RUNTIME_TOKEN":"runtime-only",
                    "ACTIONS_RESULTS_URL":"https://results.example.test/", "GH_TOKEN":"never-forward",
-                   "CRM_CANARY_FIXTURE_INPUT_JSON":"never-forward", "DO_PRODUCTION_FIXTURE_UPDATE_TOKEN":"never-forward"}
+                   "CRM_CANARY_FIXTURE_INPUT_JSON":"never-forward", "DO_PRODUCTION_FIXTURE_UPDATE_TOKEN":"never-forward",
+                   "NODE_OPTIONS":"--no-warnings", "NODE_NO_WARNINGS":"1", "NODE_PATH":"never-forward"}
             def launch(command,**kwargs):
                 child = kwargs["env"]
-                self.assertFalse(set(child) & {"GH_TOKEN","CRM_CANARY_FIXTURE_INPUT_JSON","DO_PRODUCTION_FIXTURE_UPDATE_TOKEN"})
+                self.assertEqual(command, [gate.node,"--disable-warning=DEP0040","--disable-warning=DEP0169",
+                                           "-e",fixture.CLAIM_PROBE_WRAPPER,str(gate.bundle)] if gate.claim_test
+                                 else [gate.node,str(gate.bundle)])
+                self.assertEqual(set(child), {"RUNNER_TEMP","ACTIONS_RUNTIME_TOKEN","ACTIONS_RESULTS_URL",
+                    "GITHUB_OUTPUT","INPUT_NAME","INPUT_PATH","INPUT_IF-NO-FILES-FOUND","INPUT_OVERWRITE",
+                    "INPUT_INCLUDE-HIDDEN-FILES","INPUT_COMPRESSION-LEVEL","INPUT_RETENTION-DAYS"})
+                for key in ("RUNNER_TEMP","ACTIONS_RUNTIME_TOKEN","ACTIONS_RESULTS_URL"):
+                    self.assertEqual(child[key],env[key])
                 self.assertEqual(child["INPUT_OVERWRITE"],"false")
+                self.assertEqual(kwargs["stdin"],subprocess.DEVNULL)
                 self.assertEqual(kwargs["stdout"],subprocess.DEVNULL)
                 self.assertEqual(kwargs["stderr"],subprocess.DEVNULL)
+                self.assertEqual(kwargs["timeout"],120)
+                self.assertIs(kwargs["check"],False)
                 Path(child["GITHUB_OUTPUT"]).write_text("artifact-id=77\nartifact-digest="+"a"*64+
                     "\nartifact-url=https://github.com/"+common.REPOSITORY+"/actions/runs/12345/artifacts/77\n",encoding="utf-8")
                 return mock.Mock(returncode=0)
-            with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(fixture.os,"fchmod",create=True), \
-                 mock.patch.object(fixture.subprocess,"run",side_effect=launch):
-                self.assertEqual(fixture.ClaimGate._fresh_claim(gate,record)["artifact-id"],"77")
-            with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(fixture.os,"fchmod",create=True), \
-                 mock.patch.object(fixture.subprocess,"run",return_value=mock.Mock(returncode=1)):
-                with self.assertRaises(common.ReleaseError): fixture.ClaimGate._fresh_claim(gate,record)
+            for gate.claim_test in (False,True):
+                with self.subTest(claim_test=gate.claim_test):
+                    with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(fixture.os,"fchmod",create=True), \
+                         mock.patch.object(fixture.subprocess,"run",side_effect=launch):
+                        self.assertEqual(fixture.ClaimGate._fresh_claim(gate,record)["artifact-id"],"77")
+                    with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(fixture.os,"fchmod",create=True), \
+                         mock.patch.object(fixture.subprocess,"run",return_value=mock.Mock(returncode=1)):
+                        with self.assertRaises(common.ReleaseError): fixture.ClaimGate._fresh_claim(gate,record)
 
     def test_provider_complete_history_rejects_active_conflict_and_bad_pages(self):
         provider = object.__new__(fixture.ProviderFixture)

@@ -1133,7 +1133,8 @@ class ClaimGate:
                 "INPUT_OVERWRITE":"false", "INPUT_INCLUDE-HIDDEN-FILES":"false",
                 "INPUT_COMPRESSION-LEVEL":"0", "INPUT_RETENTION-DAYS":"90",
             })
-            command = ([self.node,"-e",CLAIM_PROBE_WRAPPER,str(self.bundle)] if self.claim_test
+            command = ([self.node,"--disable-warning=DEP0040","--disable-warning=DEP0169",
+                        "-e",CLAIM_PROBE_WRAPPER,str(self.bundle)] if self.claim_test
                        else [self.node,str(self.bundle)])
             result = subprocess.run(command,env=env,stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
