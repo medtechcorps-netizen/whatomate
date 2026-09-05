@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Content-free fixture abort or quarantine",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "control_sha",
+    "origin_run_id",
+    "origin_run_attempt",
+    "origin_intent_sha256",
+    "operation_sha256",
+    "classification",
+    "effects_possible_upper_bound",
+    "evidence_sha256",
+    "requires_separate_inverse",
+    "no_live_mutation"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "crm-canary-fixture-cleanup"
+    },
+    "control_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "origin_run_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,14}$"
+    },
+    "origin_run_attempt": {
+      "const": 1
+    },
+    "origin_intent_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "operation_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "classification": {
+      "enum": [
+        "aborted_before_effect",
+        "quarantined"
+      ]
+    },
+    "effects_possible_upper_bound": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 13
+    },
+    "evidence_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "requires_separate_inverse": {
+      "type": "boolean"
+    },
+    "no_live_mutation": {
+      "const": true
+    }
+  }
+}

@@ -28,6 +28,8 @@ ACTIVE_PRODUCTION_CONTROLS = (
     "reconcile-production-orphan-lock-release.yml",
     "reconcile-production-main-lock-release.yml",
     "cleanup-production-valkey-recovery-fork.yml",
+    "provision-production-crm-canary-fixture.yml",
+    "cleanup-production-crm-canary-fixture.yml",
 )
 AUXILIARY_PRODUCTION_CONTROLS = (
     "publish-attest-production-crm-canary-driver.yml",
@@ -41,7 +43,7 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "33e97fb2b723e34c4539022b07433ac410deda40e33af0d61985a9c2c0361663"
     ),
     "finalize-production-orphan-lock.yml": (
-        "170779c1e1885b4b5eeecdd34e33910f77544ee03c81c6930b4eb11c98e37433"
+        "00530cec41dbdcf7d6a5f02b5e383c65c7427020f5f71234619476fc79697f54"
     ),
     "reconcile-production-orphan.yml": (
         "97abfef7db4cfa729aba1e491ea45e4a4b1e63fa33e3908f6d86c9fa76b346da"
@@ -50,7 +52,7 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "069c7eefa27b3a9159bb41d870f1c871db55b37e4b052061392b0306617b5a99"
     ),
     "verify-production-crm-canary.yml": (
-        "75f1396d79de838602aaf3ceb7429ff89d90e4d5d44cfe103e63b7745a61b07e"
+        "590c0b744f269e70918be19f0f6390679a5aa968b78b7d458a0fb32f4703536e"
     ),
 }
 EXACT_IMAGE_BUILD_ACTION = (
@@ -110,7 +112,7 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
     ),
 }
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "88cd01af3d37deda224bae886cedaf806611f3b43f089c3a41142c1f015c701c"
+    "ab0fd29ec13b3aa973c3ab749f46dc216cbfcada0d71a753c2dfc22a33b1d1aa"
 )
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
     "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
@@ -120,7 +122,7 @@ EXACT_CLEANUP_AUTHORITY_STEP_SHA256 = (
 )
 EXACT_GATE_B_TEST_JOB_SHA256 = {
     "go-race": "0aa5bc14dd3d264191134048bc4e9dc6b50f77b58b13d3f596dadcd93a1c1a98",
-    "lint": "acff25313c68d1a86740a8cafe808480a5ca1a418c8e48e47d17c8d34285a8fd",
+    "lint": "02dd41096ca9d060d9f2f26be9588775356ab21856c1982a3d33a0559a28f3e1",
     "security": "ed9572d5895abf26417ce1ebf87970cc67b41be00379d42df75df58f73c8cbd4",
     "recovery-boundary-images": (
         "90daa97f1350ea5ec53dfc0b86416138fc4737928e6a7d089c33276aa36eaea2"
@@ -459,6 +461,8 @@ def assert_gate_b_test_workflow(source: str) -> None:
     for line in (
         "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7",
         "actionlint .github/workflows/test.yml",
+        "actionlint .github/workflows/provision-production-crm-canary-fixture.yml "
+        ".github/workflows/cleanup-production-crm-canary-fixture.yml",
         "actionlint -ignore '\"on\" section should not be empty' "
         "prototype/recovery-boundary/workflows/*.tmpl",
     ):
@@ -1957,6 +1961,137 @@ def assert_crm_canary_driver_publisher(source: str) -> None:
 
 
 class WorkflowAuthorityPolicyTests(unittest.TestCase):
+    def test_fixture_controllers_are_covered_by_existing_protected_test_discovery(self) -> None:
+        source = workflow("test.yml")
+        gate = job_block(source, "test")
+        discovery = step_block(gate, "Test exact rollout evidence controls")
+        require_active_source_line(
+            discovery,
+            "python3 -m unittest discover -s release/deployment -p 'test_*.py' -v",
+        )
+        self.assertNotRegex(discovery, r"(?m)^        (?:if|continue-on-error):")
+        discovered = {
+            path.name for path in (ROOT / "release" / "deployment").glob("test_*.py")
+            if path.is_file() and not path.is_symlink()
+        }
+        self.assertTrue({
+            "test_provision_production_crm_canary_fixture.py",
+            "test_cleanup_production_crm_canary_fixture.py",
+        }.issubset(discovered))
+        lint = step_block(
+            job_block(source, "lint"), "Lint workflows and inert recovery templates"
+        )
+        require_active_source_line(
+            lint,
+            "actionlint .github/workflows/provision-production-crm-canary-fixture.yml "
+            ".github/workflows/cleanup-production-crm-canary-fixture.yml",
+        )
+
+    def test_fixture_claim_host_and_read_only_reconciliation_have_disjoint_authority(self) -> None:
+        source = workflow("provision-production-crm-canary-fixture.yml")
+        self.assertEqual(job_ids(source), ("intent", "claim-test", "execute", "reconcile", "gate"))
+        self.assertEqual(
+            re.findall(r"(?m)^      ([a-z_]+):$", source.split("\npermissions:", 1)[0]),
+            ["mode", "request_json", "origin_evidence_json"],
+        )
+        self.assertEqual(
+            exact_yaml_mapping_active_lines(source, 0, "permissions"),
+            ("permissions:", "contents: read"),
+        )
+        refs = canonical_workflow_step_uses_refs(source)
+        host = "actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea"
+        upload = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        self.assertEqual(refs.count(host), 2)
+        self.assertEqual(refs.count(upload), 2)
+        execute = job_block(source, "execute")
+        self.assertEqual(
+            set(re.findall(r"secrets\.([A-Z0-9_]+)", source)),
+            {
+                "CRM_CANARY_FIXTURE_AUTHORITY_JSON", "CRM_CANARY_FIXTURE_INPUT_JSON",
+                "DO_PRODUCTION_FIXTURE_READ_TOKEN", "DO_PRODUCTION_FIXTURE_UPDATE_TOKEN",
+            },
+        )
+        self.assertNotIn("secrets.", source.replace(execute, ""))
+        require_active_source_line(execute, "environment: rereply-production-crm-fixture")
+        for job in ("claim-test", "execute"):
+            block = job_block(source, job)
+            require_active_source_line(block, f"if: ${{{{ inputs.mode == '{job}' }}}}")
+            require_active_source_line(block, f"uses: {host}")
+            uploader = step_block(block, "Check out immutable claim uploader")
+            require_active_source_line(uploader, "repository: actions/upload-artifact")
+            require_active_source_line(uploader, "ref: ea165f8d65b6e75b540449e92b4886f43607fa02")
+            require_active_source_line(uploader, "persist-credentials: false")
+            require_active_source_line(
+                block, "const env = {...process.env, CLAIM_NODE:process.execPath};"
+            )
+            self.assertIn("spawnSync('/usr/bin/python3'", block)
+            self.assertIn("stdio:['ignore','ignore','ignore']", block)
+            self.assertNotRegex(block, r"(?m)^        continue-on-error:")
+        claim = job_block(source, "claim-test")
+        self.assertNotIn("environment:", claim)
+        self.assertNotIn("id-token: write", claim)
+        reconcile = job_block(source, "reconcile")
+        self.assertNotIn("claim-upload", reconcile)
+        self.assertNotIn(host, reconcile)
+        self.assertNotIn("id-token: write", reconcile)
+        self.assertNotIn("secrets.", reconcile)
+        self.assertNotIn("GITHUB_ENV", source)
+        for step in workflow_step_blocks(source):
+            if not is_artifact_upload_step(step):
+                continue
+            for line in (
+                "overwrite: false", "if-no-files-found: error",
+                "include-hidden-files: false", "compression-level: 0",
+                "retention-days: 90",
+            ):
+                require_active_source_line(step, line)
+        gate = job_block(source, "gate")
+        require_active_source_line(gate, "needs: [intent, claim-test, execute, reconcile]")
+        for line in (
+            '[[ "$INTENT" == success ]]',
+            'claim-test) [[ "$CLAIM/$EXECUTE/$RECONCILE" == success/skipped/skipped ]] ;;',
+            'execute) [[ "$CLAIM/$EXECUTE/$RECONCILE" == skipped/success/skipped ]] ;;',
+            'reconcile) [[ "$CLAIM/$EXECUTE/$RECONCILE" == skipped/skipped/success ]] ;;',
+            "*) exit 1 ;;",
+        ):
+            require_active_source_line(gate, line)
+
+    def test_fixture_cleanup_can_only_publish_an_abort_or_quarantine_classification(self) -> None:
+        source = workflow("cleanup-production-crm-canary-fixture.yml")
+        self.assertEqual(job_ids(source), ("classify", "gate"))
+        self.assertEqual(
+            canonical_workflow_step_uses_refs(source),
+            (
+                "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+                "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
+                "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
+                "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            ),
+        )
+        for forbidden in (
+            "secrets.", "environment:", "claim-upload", "GITHUB_ENV", "doctl",
+            "--method DELETE", "deleteArtifact", "overwrite: true",
+        ):
+            self.assertNotIn(forbidden, source)
+        classify = step_block(
+            source, "Classify only proven pre-effect abort or post-effect quarantine"
+        )
+        self.assertNotIn("env:", classify)
+        for line in (
+            '--intent "$RUNNER_TEMP/fixture-origin/intent.json" \\',
+            '--evidence "$RUNNER_TEMP/fixture-origin/evidence.json" \\',
+            '--provenance "$RUNNER_TEMP/fixture-origin/provenance.json" \\',
+            '--policy-verification "$RUNNER_TEMP/fixture-origin/policy.json" \\',
+        ):
+            require_active_source_line(classify, line)
+        upload = step_block(source, "Upload immutable cleanup classification")
+        for line in ("overwrite: false", "if-no-files-found: error", "include-hidden-files: false"):
+            require_active_source_line(upload, line)
+        gate = job_block(source, "gate")
+        require_active_source_line(gate, "needs: classify")
+        require_active_source_line(gate, "if: ${{ always() }}")
+        require_active_source_line(gate, '[[ "$RESULT" == success ]]')
+
     def test_pinned_jq_release_checksum_is_exact_in_every_consumer(self) -> None:
         url = "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64"
         expected = (
@@ -3808,7 +3943,11 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
         self.assertIn("attestations: write", signer)
         self.assertIn("id-token: write", signer)
         self.assertEqual(source.count("${{ secrets.CRM_CANARY_PUBLIC_TARGETS_JSON }}"), 1)
-        self.assertEqual(source.count("secrets.CRM_CANARY_SYNTHETIC_DRIVER_JSON"), 1)
+        self.assertEqual(source.count("secrets.CRM_CANARY_SYNTHETIC_DRIVER_JSON"), 2)
+        binding_step = observer.split("- name: Bind UI runtime fixture to the exact signed setup result", 1)[1].split("- name:", 1)[0]
+        self.assertIn("if: ${{ needs.authority.outputs.phase == 'ui' }}", binding_step)
+        self.assertIn("verify-fixture-result --control-root control", binding_step)
+        self.assertIn("FIXTURE_EVIDENCE_JSON: ${{ inputs.fixture_evidence_json }}", binding_step)
         self.assertNotRegex(
             source,
             r"GH_PRODUCTION_BRANCH_(?:READ|LOCK)_TOKEN|secrets\.DO_PRODUCTION_",

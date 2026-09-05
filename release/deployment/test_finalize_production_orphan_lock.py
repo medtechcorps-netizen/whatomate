@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -444,6 +445,66 @@ def orphan_rollback_chain() -> dict[str, Any]:
 
 
 class FinalizeProductionOrphanLockTests(unittest.TestCase):
+    def test_workflow_competing_inventory_includes_fixture_controls_at_every_boundary(self) -> None:
+        workflows = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+        source = (workflows / "finalize-production-orphan-lock.yml").read_text(
+            encoding="utf-8"
+        )
+        names: set[str] = set()
+        paths: set[str] = set()
+        for path in workflows.glob("*.yml"):
+            content = path.read_text(encoding="utf-8")
+            if not re.search(r"(?m)^  group: rereply-production$", content):
+                continue
+            name = re.fullmatch(r"name: ([^\r\n]+)", content.splitlines()[0])
+            self.assertIsNotNone(name)
+            names.add(name.group(1))
+            paths.add(f".github/workflows/{path.name}")
+        additions = {
+            "Provision Production CRM Canary Fixture":
+                ".github/workflows/provision-production-crm-canary-fixture.yml",
+            "Cleanup Production CRM Canary Fixture":
+                ".github/workflows/cleanup-production-crm-canary-fixture.yml",
+        }
+        self.assertTrue(set(additions).issubset(names))
+        self.assertTrue(set(additions.values()).issubset(paths))
+
+        def require_exact_inventories(candidate: str) -> None:
+            active = "\n".join(
+                line for line in candidate.splitlines()
+                if not line.lstrip().startswith("#")
+            )
+            for field, expected, copies in (("name", names, 1), ("path", paths, 2)):
+                blocks = re.findall(
+                    rf"\(\.{field} \| IN\(\s*(.*?)\s*\) \| not\)",
+                    active,
+                    re.DOTALL,
+                )
+                self.assertEqual(len(blocks), copies)
+                for block in blocks:
+                    inventory = json.loads("[" + block + "]")
+                    self.assertEqual(len(inventory), len(set(inventory)))
+                    self.assertEqual(set(inventory), expected)
+
+        require_exact_inventories(source)
+        for name, path in additions.items():
+            for value, copies in ((name, 1), (path, 2)):
+                needle = f'"{value}",'
+                positions = [match.start() for match in re.finditer(re.escape(needle), source)]
+                self.assertEqual(len(positions), copies)
+                for position in positions:
+                    prefix, suffix = source[:position], source[position + len(needle):]
+                    mutants = (
+                        prefix + suffix,
+                        prefix + "# " + needle + suffix,
+                        prefix + needle + " " + needle + suffix,
+                    )
+                    for mutant in mutants:
+                        self.assertNotEqual(mutant, source)
+                        with self.subTest(value=value, boundary=position):
+                            with self.assertRaises((AssertionError, json.JSONDecodeError)):
+                                require_exact_inventories(mutant)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))

@@ -1,0 +1,253 @@
+name: Provision Production CRM Canary Fixture
+run-name: Control exact production CRM canary fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Claim-only plumbing test, single approved execution, or read-only reconciliation
+        required: true
+        type: choice
+        options: [claim-test, execute, reconcile]
+      request_json:
+        description: Canonical public request containing only schema, control, operation and protected-descriptor hashes
+        required: true
+        type: string
+      origin_evidence_json:
+        description: Exact signed original intent descriptor; required only for reconciliation
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  WORKFLOW_PATH: .github/workflows/provision-production-crm-canary-fixture.yml
+  CONTROLLER_PATH: release/deployment/provision_production_crm_canary_fixture.py
+  INTENT_PREDICATE: https://rereply.app/attestations/crm-canary-fixture-intent/v1
+  RESULT_PREDICATE: https://rereply.app/attestations/crm-canary-fixture-result/v1
+
+jobs:
+  intent:
+    name: Prepare and attest CRM canary fixture intent
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      attestations: write
+      id-token: write
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Prepare exact public intent after live protected-main checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_SHA: ${{ github.sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REQUEST_JSON: ${{ inputs.request_json }}
+          FIXTURE_MODE: ${{ inputs.mode }}
+          ORIGIN_EVIDENCE_JSON: ${{ inputs.origin_evidence_json }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main && "$REF_PROTECTED" == true ]]
+          python3 -I -S -B "control/$CONTROLLER_PATH" prepare-intent --control-root control --output-dir "$RUNNER_TEMP/fixture-intent"
+      - name: Attest exact fixture intent provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/fixture-intent/intent.json
+      - name: Attest exact fixture intent policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/fixture-intent/intent.json
+          predicate-type: ${{ env.INTENT_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/fixture-intent/intent.json
+      - name: Upload immutable exact fixture intent
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: crm-canary-fixture-intent-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/fixture-intent
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+          compression-level: 0
+          retention-days: 90
+
+  claim-test:
+    name: Test exact fixture claim adapter
+    needs: intent
+    if: ${{ inputs.mode == 'claim-test' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      attestations: read
+    steps:
+      - name: Check out exact controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Check out immutable claim uploader
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: actions/upload-artifact
+          ref: ea165f8d65b6e75b540449e92b4886f43607fa02
+          path: claim-upload
+          persist-credentials: false
+      - name: Exercise fresh finalization and conflict without any product or provider credentials
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        env:
+          CONTROL_SHA: ${{ github.sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REQUEST_JSON: ${{ inputs.request_json }}
+          INTENT_ARTIFACT_ID: ${{ needs.intent.outputs.artifact_id }}
+          INTENT_ARTIFACT_DIGEST: ${{ needs.intent.outputs.artifact_digest }}
+          GH_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const {spawnSync} = require('node:child_process');
+            const env = {...process.env, CLAIM_NODE:process.execPath};
+            const result = spawnSync('/usr/bin/python3', ['-I','-S','-B','control/release/deployment/provision_production_crm_canary_fixture.py','claim-test','--control-root','control','--upload-bundle','claim-upload/dist/upload/index.js'], {env,stdio:['ignore','ignore','ignore'],timeout:480000});
+            if (result.error || result.signal || result.status !== 0) core.setFailed('Fixture claim-only adapter verification failed; no live authority granted');
+
+  execute:
+    name: Execute exact CRM canary fixture bootstrap
+    needs: intent
+    if: ${{ inputs.mode == 'execute' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment: rereply-production-crm-fixture
+    permissions:
+      actions: read
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out exact controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Check out immutable claim uploader
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: actions/upload-artifact
+          ref: ea165f8d65b6e75b540449e92b4886f43607fa02
+          path: claim-upload
+          persist-credentials: false
+      - name: Consume fresh same-process claims and execute fixed fixture sequence
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        env:
+          CONTROL_SHA: ${{ github.sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REQUEST_JSON: ${{ inputs.request_json }}
+          INTENT_ARTIFACT_ID: ${{ needs.intent.outputs.artifact_id }}
+          INTENT_ARTIFACT_DIGEST: ${{ needs.intent.outputs.artifact_digest }}
+          GH_TOKEN: ${{ github.token }}
+          CRM_CANARY_FIXTURE_AUTHORITY_JSON: ${{ secrets.CRM_CANARY_FIXTURE_AUTHORITY_JSON }}
+          CRM_CANARY_FIXTURE_INPUT_JSON: ${{ secrets.CRM_CANARY_FIXTURE_INPUT_JSON }}
+          DO_PRODUCTION_FIXTURE_READ_TOKEN: ${{ secrets.DO_PRODUCTION_FIXTURE_READ_TOKEN }}
+          DO_PRODUCTION_FIXTURE_UPDATE_TOKEN: ${{ secrets.DO_PRODUCTION_FIXTURE_UPDATE_TOKEN }}
+        with:
+          script: |
+            const {spawnSync} = require('node:child_process');
+            const env = {...process.env, CLAIM_NODE:process.execPath};
+            const result = spawnSync('/usr/bin/python3', ['-I','-S','-B','control/release/deployment/provision_production_crm_canary_fixture.py','execute','--control-root','control','--upload-bundle','claim-upload/dist/upload/index.js','--output-dir',process.env.RUNNER_TEMP+'/fixture-result'], {env,stdio:['ignore','ignore','ignore'],timeout:2100000});
+            if (result.error || result.signal || result.status !== 0) core.setFailed('Fixture execution stopped; inspect content-free burn evidence, never rerun');
+      - name: Attest content-free fixture result provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/fixture-result/result.json
+      - name: Attest content-free fixture result policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/fixture-result/result.json
+          predicate-type: ${{ env.RESULT_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/fixture-result/result.json
+      - name: Upload only content-free fixture result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: crm-canary-fixture-result-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/fixture-result
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+          compression-level: 0
+          retention-days: 90
+
+  reconcile:
+    name: Reconcile exact CRM canary fixture state
+    needs: intent
+    if: ${{ inputs.mode == 'reconcile' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: rereply-production-crm-fixture-read
+    permissions:
+      actions: read
+      contents: read
+      attestations: read
+    steps:
+      - name: Check out exact controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Inspect immutable origin evidence without a claim uploader or mutation credentials
+        env:
+          CONTROL_SHA: ${{ github.sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_JSON: ${{ inputs.request_json }}
+          ORIGIN_EVIDENCE_JSON: ${{ inputs.origin_evidence_json }}
+        run: |
+          set -euo pipefail
+          python3 -I -S -B "control/$CONTROLLER_PATH" reconcile --control-root control --output-dir "$RUNNER_TEMP/fixture-reconciliation"
+
+  gate:
+    name: Exact CRM fixture control gate
+    if: ${{ always() }}
+    needs: [intent, claim-test, execute, reconcile]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the one selected path and no unexpected skip
+        env:
+          MODE: ${{ inputs.mode }}
+          INTENT: ${{ needs.intent.result }}
+          CLAIM: ${{ needs.claim-test.result }}
+          EXECUTE: ${{ needs.execute.result }}
+          RECONCILE: ${{ needs.reconcile.result }}
+        run: |
+          set -euo pipefail
+          [[ "$INTENT" == success ]]
+          case "$MODE" in
+            claim-test) [[ "$CLAIM/$EXECUTE/$RECONCILE" == success/skipped/skipped ]] ;;
+            execute) [[ "$CLAIM/$EXECUTE/$RECONCILE" == skipped/success/skipped ]] ;;
+            reconcile) [[ "$CLAIM/$EXECUTE/$RECONCILE" == skipped/skipped/success ]] ;;
+            *) exit 1 ;;
+          esac
