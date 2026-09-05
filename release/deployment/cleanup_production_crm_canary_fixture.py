@@ -148,7 +148,7 @@ def validate_verified_provenance(intent: dict[str, Any], provenance: Any, policy
         if (definition.get("buildType") == "https://actions.github.io/buildtypes/workflow/v1"
                 and workflow.get("repository") == f"https://github.com/{common.REPOSITORY}"
                 and workflow.get("path") == WORKFLOW_PATH and workflow.get("ref") == "refs/heads/main"
-                and builder.get("id") == "https://github.com/actions/runner/github-hosted"
+                and builder.get("id") == f"https://github.com/{common.REPOSITORY}/{WORKFLOW_PATH}@refs/heads/main"
                 and metadata.get("invocationId") == f"https://github.com/{common.REPOSITORY}/actions/runs/{intent['origin_run_id']}/attempts/1"
                 and len(matches) == 1):
             return
