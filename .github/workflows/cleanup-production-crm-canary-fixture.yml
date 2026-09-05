@@ -1,0 +1,98 @@
+name: Cleanup Production CRM Canary Fixture
+run-name: Classify exact CRM canary fixture abort or quarantine
+
+on:
+  workflow_dispatch:
+    inputs:
+      origin_evidence_json:
+        description: Exact original signed intent run, artifact ID, API digest and content SHA256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  WORKFLOW_PATH: .github/workflows/cleanup-production-crm-canary-fixture.yml
+  CONTROLLER_PATH: release/deployment/cleanup_production_crm_canary_fixture.py
+  PROVISION_PATH: release/deployment/provision_production_crm_canary_fixture.py
+  CLEANUP_PREDICATE: https://rereply.app/attestations/crm-canary-fixture-cleanup/v1
+
+jobs:
+  classify:
+    name: Verify exact fixture origin and classify cleanup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Acquire signed immutable origin without product or provider credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          ORIGIN_EVIDENCE_JSON: ${{ inputs.origin_evidence_json }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main && "$REF_PROTECTED" == true ]]
+          python3 -I -S -B "control/$PROVISION_PATH" acquire-origin --control-root control --output-dir "$RUNNER_TEMP/fixture-origin"
+      - name: Classify only proven pre-effect abort or post-effect quarantine
+        run: |
+          set -euo pipefail
+          python3 -I -S -B "control/$CONTROLLER_PATH" classify \
+            --intent "$RUNNER_TEMP/fixture-origin/intent.json" \
+            --evidence "$RUNNER_TEMP/fixture-origin/evidence.json" \
+            --provenance "$RUNNER_TEMP/fixture-origin/provenance.json" \
+            --policy-verification "$RUNNER_TEMP/fixture-origin/policy.json" \
+            --output-dir "$RUNNER_TEMP/fixture-cleanup"
+      - name: Attest exact content-free cleanup provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/fixture-cleanup/cleanup.json
+      - name: Attest exact abort or quarantine policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/fixture-cleanup/cleanup.json
+          predicate-type: ${{ env.CLEANUP_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/fixture-cleanup/cleanup.json
+      - name: Upload immutable cleanup classification
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: crm-canary-fixture-cleanup-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/fixture-cleanup
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+          compression-level: 0
+          retention-days: 90
+
+  gate:
+    name: Exact CRM fixture cleanup gate
+    needs: classify
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require successful exact classification without deletion authority
+        env:
+          RESULT: ${{ needs.classify.result }}
+        run: |
+          set -euo pipefail
+          [[ "$RESULT" == success ]]

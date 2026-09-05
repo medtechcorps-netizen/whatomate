@@ -1,0 +1,498 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Content-free CRM fixture lifecycle authority",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "control_sha",
+        "origin_run_id",
+        "origin_run_attempt",
+        "executor_job",
+        "workflow_path",
+        "workflow_sha256",
+        "controller_sha256",
+        "upload_bundle_sha256",
+        "request",
+        "slots",
+        "issued_at",
+        "expires_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "crm-canary-fixture-intent"
+        },
+        "control_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "origin_run_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,14}$"
+        },
+        "origin_run_attempt": {
+          "const": 1
+        },
+        "executor_job": {
+          "const": "Execute exact CRM canary fixture bootstrap"
+        },
+        "workflow_path": {
+          "const": ".github/workflows/provision-production-crm-canary-fixture.yml"
+        },
+        "workflow_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "controller_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "upload_bundle_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "control_sha",
+            "operation_sha256",
+            "descriptor_sha256"
+          ],
+          "properties": {
+            "schema_version": {
+              "const": 1
+            },
+            "control_sha": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "operation_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "descriptor_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "slots": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "stage",
+              "wrapper_upper_bound",
+              "nested_upper_bound"
+            ],
+            "properties": {
+              "stage": {
+                "enum": [
+                  "create_klinik_org",
+                  "license_klinik",
+                  "create_klinik_user",
+                  "create_non_klinik_org",
+                  "license_non_klinik",
+                  "create_non_klinik_user",
+                  "configure_meta",
+                  "create_account",
+                  "webhook_a",
+                  "webhook_b",
+                  "clear_b",
+                  "append_klinik_allowlist"
+                ]
+              },
+              "wrapper_upper_bound": {
+                "const": 1
+              },
+              "nested_upper_bound": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        },
+        "issued_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "control_sha",
+        "origin_run_id",
+        "origin_run_attempt",
+        "executor_job_id",
+        "operation_sha256",
+        "intent_sha256",
+        "stage",
+        "artifact_name",
+        "method",
+        "route_sha256",
+        "request_sha256",
+        "wrapper_upper_bound",
+        "nested_upper_bound"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "crm-canary-fixture-burn"
+        },
+        "control_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "origin_run_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,14}$"
+        },
+        "origin_run_attempt": {
+          "const": 1
+        },
+        "executor_job_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,14}$"
+        },
+        "operation_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "intent_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "stage": {
+          "enum": [
+            "create_klinik_org",
+            "license_klinik",
+            "create_klinik_user",
+            "create_non_klinik_org",
+            "license_non_klinik",
+            "create_non_klinik_user",
+            "configure_meta",
+            "create_account",
+            "webhook_a",
+            "webhook_b",
+            "clear_b",
+            "append_klinik_allowlist"
+          ]
+        },
+        "artifact_name": {
+          "type": "string",
+          "pattern": "^crm-canary-fixture-burn-[1-9][0-9]*-1-[a-z_]+$"
+        },
+        "method": {
+          "enum": [
+            "POST",
+            "PUT"
+          ]
+        },
+        "route_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "request_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "wrapper_upper_bound": {
+          "const": 1
+        },
+        "nested_upper_bound": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "control_sha",
+        "operation_sha256",
+        "descriptor_sha256",
+        "fixture_descriptor_sha256",
+        "registration_sha256",
+        "stages",
+        "state",
+        "provider",
+        "release_evidence_invalidated",
+        "contract_rebaseline_required",
+        "origin",
+        "burns"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "crm-canary-fixture-provisioning"
+        },
+        "control_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "operation_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "descriptor_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "fixture_descriptor_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "registration_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "stages": {
+          "type": "array",
+          "minItems": 11,
+          "maxItems": 11,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "stage",
+              "request_sha256",
+              "response_sha256",
+              "wrapper_upper_bound",
+              "nested_upper_bound"
+            ],
+            "properties": {
+              "stage": {
+                "enum": [
+                  "create_klinik_org",
+                  "license_klinik",
+                  "create_klinik_user",
+                  "create_non_klinik_org",
+                  "license_non_klinik",
+                  "create_non_klinik_user",
+                  "configure_meta",
+                  "create_account",
+                  "webhook_a",
+                  "webhook_b",
+                  "clear_b"
+                ]
+              },
+              "request_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "response_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "wrapper_upper_bound": {
+                "const": 1
+              },
+              "nested_upper_bound": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        },
+        "state": {
+          "const": "allowlist_deployment_verified"
+        },
+        "provider": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "spec_sha256",
+            "deployment_sha256",
+            "app_updated_at_sha256"
+          ],
+          "properties": {
+            "spec_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "deployment_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "app_updated_at_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "release_evidence_invalidated": {
+          "const": true
+        },
+        "contract_rebaseline_required": {
+          "const": true
+        },
+        "origin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "run_id",
+            "artifact_id",
+            "artifact_digest",
+            "intent_sha256"
+          ],
+          "properties": {
+            "run_id": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,14}$"
+            },
+            "artifact_id": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,14}$"
+            },
+            "artifact_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "intent_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "burns": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema_version",
+              "kind",
+              "control_sha",
+              "origin_run_id",
+              "origin_run_attempt",
+              "executor_job_id",
+              "operation_sha256",
+              "intent_sha256",
+              "stage",
+              "artifact_name",
+              "method",
+              "route_sha256",
+              "request_sha256",
+              "wrapper_upper_bound",
+              "nested_upper_bound",
+              "artifact_id",
+              "artifact_digest"
+            ],
+            "properties": {
+              "schema_version": {
+                "const": 1
+              },
+              "kind": {
+                "const": "crm-canary-fixture-burn"
+              },
+              "control_sha": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              "origin_run_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,14}$"
+              },
+              "origin_run_attempt": {
+                "const": 1
+              },
+              "executor_job_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,14}$"
+              },
+              "operation_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "intent_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "stage": {
+                "enum": [
+                  "create_klinik_org",
+                  "license_klinik",
+                  "create_klinik_user",
+                  "create_non_klinik_org",
+                  "license_non_klinik",
+                  "create_non_klinik_user",
+                  "configure_meta",
+                  "create_account",
+                  "webhook_a",
+                  "webhook_b",
+                  "clear_b",
+                  "append_klinik_allowlist"
+                ]
+              },
+              "artifact_name": {
+                "type": "string",
+                "pattern": "^crm-canary-fixture-burn-[1-9][0-9]*-1-[a-z_]+$"
+              },
+              "method": {
+                "enum": [
+                  "POST",
+                  "PUT"
+                ]
+              },
+              "route_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "request_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "wrapper_upper_bound": {
+                "const": 1
+              },
+              "nested_upper_bound": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "artifact_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,14}$"
+              },
+              "artifact_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

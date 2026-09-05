@@ -24,6 +24,142 @@ an exact full-spec compare-and-swap, wait for the replacement deployment to be
 healthy and active, then rebaseline the production contract and regenerate all
 release evidence on the resulting control SHA.
 
+## One-time protected CRM fixture setup
+
+The fixture controls are a one-time bootstrap, not a replacement release lane.
+They create only the two reserved synthetic organizations, their dedicated
+least-privilege logins and explicitly selected manual licenses, one dedicated
+Meta integration/account, two signed synthetic inbound messages, and the
+Klinik-only allowlist append. They neither create a Meta app nor configure a
+phone webhook override. Account creation has a possible nested WABA subscription
+POST; subscription recovery is disabled in this first implementation. A failed
+create followed by no local account is quarantined: the nested Meta POST may
+have succeeded before the product transaction rolled back.
+
+Local tests and merging this code do not establish hosted adapter or production
+authority. Use this exact order:
+
+1. Review and merge the controls; wait for exact-main Test/E2E success.
+2. Run one separately authorized `claim-test` of
+   `provision-production-crm-canary-fixture.yml`. It has no environment and no
+   product, Meta or provider credential. It must prove fresh artifact finalization
+   succeeds and a second controller cannot obtain the same claim. Keep that
+   exact successful run/artifact proof. A local fault mock is not this proof.
+3. Register one canonical public request containing only `schema_version:1`,
+   `control_sha`, `operation_sha256` and `descriptor_sha256`. The selector
+   descriptor is protected; passwords are excluded from its public digest.
+   Generate the two login local parts once using `generate_registration`:
+   independent 256-bit lowercase base32 values under an explicitly controlled
+   fixture email domain. Freeze these values before the intent, and never
+   regenerate them after an issued operation. This provides collision resistance,
+   not database-proven historical absence: the product can restore a soft-deleted
+   same-email user, and live REST inventory cannot disprove that history.
+4. Preconfigure `rereply-production-crm-fixture` with the sole custom branch
+   policy `main` and a required-reviewer rule. Dispatch one `execute` run. Its
+   intent job signs and uploads the immutable request/control binding before
+   the executor waits for approval. While the executor is genuinely waiting,
+   install its exact origin run/attempt=1, intent artifact ID/API digest/content
+   digest, YAML job key `execute`, request and registration hashes, and approval
+   expiry into the protected execution authority. Verify the actual waiting
+   job if GitHub exposes its numeric ID; the runtime independently requires a
+   unique matching active job and binds every burn to that numeric ID.
+   Approve only this run. Do not use a sleep in an already-started job as an
+   environment-secret refresh mechanism.
+5. The executor verifies current protected main, its exact immutable intent,
+   the prior claim-only proof and the provider predecessor before its first
+   effect. It performs only the fixed ordered sequence. Each claim is consumed
+   before the product/provider call. All product/provider mutation requests
+   have zero retries and no redirect following. After the allowlist append,
+   require stable live/active spec equality, unchanged source bindings, a new
+   ACTIVE deployment and two full readiness rounds.
+6. Keep the signed content-free terminal result. Rebaseline the production
+   contract in the separate three-path window, merge, and regenerate all source,
+   image, capsule and applicable driver evidence only after the last main move.
+   No existing release evidence survives the allowlist deployment/rebaseline.
+
+### Claim semantics and limitations
+
+The pinned `actions/upload-artifact` JavaScript bundle is checked by commit,
+Git blob and SHA-256. The Python executor runs it as a child of an exact pinned
+JavaScript action host, which supplies the Actions runtime authority directly
+in memory. Runtime tokens never pass through `GITHUB_ENV`, outputs, command-line
+arguments or log files. All upload inputs are explicit, including
+`overwrite:false` and `if-no-files-found:error`, with exactly one `claim.json`.
+
+A successful fresh create/upload/finalize return in that same living process
+creates a single in-memory send permit. Artifact readback verifies this permit;
+it cannot create one. The permit is consumed before calling the fixed wrapper.
+Conflict, incomplete or duplicate output, failed readback, upload ambiguity,
+process loss, a second invocation, another run/job/attempt, or missing/deleted/
+expired evidence grants no send permission. All contenders use the same
+original-run/stage name. A later reconciliation never invokes the uploader.
+
+Burn records reserve conservative **possible-attempt upper bounds**, not exact
+observed remote execution counts: one product wrapper and at most one nested
+Meta subscription for account creation. No exactly-once completion claim is
+made after timeout/408/EOF/5xx. The pinned artifact client may retry claim RPCs;
+this does not authorize retrying a product/provider mutation. The Actions runtime
+token itself also supports artifact deletion: no deletion/overwrite relies on
+pinned reviewed code and trusted GitHub administration, not on a cryptographic
+create-only bearer. Artifact retention expiry never replenishes an operation.
+
+### Temporary credential custody and read-only rehydration
+
+One explicit bootstrap-only custody exception allows the protected fixture
+executor to consume the original dedicated inputs. Its environment secret names
+are exactly:
+
+- `CRM_CANARY_FIXTURE_AUTHORITY_JSON`: immutable original execution, expiry,
+  registration, hosted-adapter proof and provider target/prestate bindings.
+- `CRM_CANARY_FIXTURE_INPUT_JSON`: fixed selector descriptor, original registered
+  login identities, super-admin login, two distinct generated fixture passwords,
+  and dedicated Meta access/app/verification credentials. No customer identity
+  or shared Meta asset is an acceptable substitute.
+- `DO_PRODUCTION_FIXTURE_READ_TOKEN`: dedicated GET-only app authority.
+- `DO_PRODUCTION_FIXTURE_UPDATE_TOKEN`: dedicated, separately scope-reviewed
+  app-update authority for only the exact full-spec allowlist append.
+
+The executor has no environment-secret-write capability. These inputs must not
+be copied to repository/organization secrets or the steady-state canary
+environment. Their readers and lifetime are limited to the reviewed bootstrap
+and later read-only descriptor reconstruction; revoke the bootstrap admin/Meta
+transport/provider capabilities after the separately reviewed handoff/closure.
+The two fixture passwords and runtime webhook secret retain their separately
+reviewed runtime custody. Never publish credential-bearing request hashes as
+password oracles: the public effect policy substitutes fixed custody-slot labels.
+
+There is no raw-descriptor artifact or new persistence service. The product's
+existing records retain the generated org/account/channel/contact/conversation
+identities. `rehydrate` repeats complete unique readbacks using the original
+protected selectors and credentials, reconstructs the raw driver descriptor in
+memory, and requires its actual canonical SHA-256 to match the signed terminal
+result. This hash is tested against the existing driver validator/canonicalizer;
+it is not either of the earlier oracle's semantic-projection hashes. Missing or
+changed rows never authorize recreation. Passwords are not obtained from GETs.
+
+The later driver bootstrap remains a separate runtime/provider window: call
+the read-only rehydration interface and transfer the descriptor directly to the
+dedicated driver app. App creation, ledger binding/firewall, runtime secrets,
+cost/size/count, digest readback and GitHub's five-field driver descriptor still
+need their exact reviewed packet. No `/v1/execute` is run during this bootstrap.
+The prior “sole shared credential” rule describes steady-state canary execution,
+not this explicit temporary provisioning custody. The UI canary additionally
+requires `fixture_evidence_json`, binding its runtime descriptor hash to the
+successful signed setup result. Baseline/bridge/backend health probes do not
+require the synthetic runtime.
+
+### Abort and quarantine
+
+`cleanup-production-crm-canary-fixture.yml` has no product/provider credentials
+and deletes nothing. Signed intent plus complete terminal origin/attempt/job/
+artifact evidence can classify `aborted_before_effect` only when the executor
+never started and no effect was burned. Any started executor or burn requires
+quarantine and a separately reviewed inverse. It does not improvise removal of
+messages, ledger rows, users, accounts, organizations, or allowlist entries.
+The `reconcile` mode is evidence-only and cannot repeat setup. Both workflows
+share `rereply-production` concurrency and are included in every orphan-lock
+finalizer competing-run inventory.
+
 ## Authority boundaries
 
 The following are independent decisions and must never be treated as one:

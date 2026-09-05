@@ -171,6 +171,7 @@ jobs:
           set -euo pipefail
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
           actionlint .github/workflows/test.yml
+          actionlint .github/workflows/provision-production-crm-canary-fixture.yml .github/workflows/cleanup-production-crm-canary-fixture.yml
           actionlint -ignore '"on" section should not be empty' prototype/recovery-boundary/workflows/*.tmpl
 
   build:

@@ -9,6 +9,11 @@ on:
         description: Exact control SHA, allowlisted change-receipt kind, successful run/attempt, artifact ID/API digest, and receipt exact-file SHA-256
         required: true
         type: string
+      fixture_evidence_json:
+        description: Signed successful fixture origin result descriptor; mandatory for UI only
+        required: false
+        default: ''
+        type: string
 
 # The protected observer may read only dedicated synthetic-canary secrets. It
 # has no DigitalOcean/provider token. The final signer receives no environment
@@ -450,6 +455,19 @@ jobs:
             [[ -z "$RECONCILIATION_RUN_ID$RECONCILIATION_ARTIFACT_ID$RECONCILIATION_ARTIFACT_DIGEST$RECONCILIATION_SHA256" ]]
           fi
           printf 'RECEIPT_STEM=%s\n' "$receipt_stem" >> "$GITHUB_ENV"
+
+      - name: Bind UI runtime fixture to the exact signed setup result
+        if: ${{ needs.authority.outputs.phase == 'ui' }}
+        env:
+          CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          GH_TOKEN: ${{ github.token }}
+          FIXTURE_EVIDENCE_JSON: ${{ inputs.fixture_evidence_json }}
+          CRM_CANARY_SYNTHETIC_DRIVER_JSON: ${{ secrets.CRM_CANARY_SYNTHETIC_DRIVER_JSON }}
+        run: |
+          set -euo pipefail
+          python3 -I -S -B control/release/deployment/provision_production_crm_canary_fixture.py verify-fixture-result --control-root control
 
       - name: Run tokenless public and controlled synthetic CRM probes
         env:
