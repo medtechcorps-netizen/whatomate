@@ -58,6 +58,7 @@ import {
   type Pipeline,
 } from '@/services/productSuite'
 import ContactInfoPanel from '@/components/chat/ContactInfoPanel.vue'
+import ContactBookingDialog from '@/components/booking/ContactBookingDialog.vue'
 
 type WorkspaceTab = 'overview' | 'timeline' | 'details' | 'copilot'
 type CopilotAction = Extract<CopilotRun['task_type'], 'summary' | 'qualify' | 'extract_actions'>
@@ -90,6 +91,7 @@ let loadSequence = 0
 
 const showJourneyDialog = ref(false)
 const showTaskDialog = ref(false)
+const showBookingDialog = ref(false)
 const savingJourney = ref(false)
 const savingTask = ref(false)
 const pipelines = ref<Pipeline[]>([])
@@ -206,6 +208,9 @@ const canCreateJourney = computed(() =>
 )
 const canCreateTask = computed(() =>
   canViewTasks.value && authStore.hasPermission('tasks', 'write'),
+)
+const canCreateBooking = computed(() =>
+  canViewBookings.value && authStore.hasPermission('bookings', 'write'),
 )
 
 const detailContact = computed<Contact>(() => ({
@@ -370,6 +375,11 @@ async function createFollowUp() {
   }
 }
 
+async function bookingCreated() {
+  toast.success('Appointment reserved', `${contactName.value}'s booking is now visible in the care timeline.`)
+  await loadWorkspace(true)
+}
+
 function copilotLabel(action: CopilotAction) {
   return {
     summary: 'Summary',
@@ -471,6 +481,7 @@ watch(
   () => props.contactId,
   () => {
     activeTab.value = 'overview'
+    showBookingDialog.value = false
     copilotRun.value = null
     copilotResult.value = ''
     void loadWorkspace()
@@ -687,28 +698,40 @@ onMounted(() => void loadWorkspace())
                 <LockKeyhole class="mr-2 inline h-3.5 w-3.5" />
                 Booking details are hidden by your permissions.
               </div>
-              <div v-else-if="upcomingBookings.length || recentBookings.length" class="space-y-2">
-                <article v-for="booking in upcomingBookings" :key="booking.id" class="rounded-xl border border-fuchsia-300/12 bg-fuchsia-300/[0.03] p-3">
-                  <div class="flex items-start justify-between gap-2">
-                    <div class="min-w-0">
-                      <p class="truncate text-xs font-medium">{{ bookingName(booking) }}</p>
-                      <p class="mt-1 text-[10px] text-white/40 light:text-gray-500">{{ dateTime(booking.event?.starts_at) }}</p>
-                      <p v-if="booking.event?.resource?.name" class="mt-1 truncate text-[10px] text-white/30 light:text-gray-400">{{ booking.event.resource.name }}</p>
+              <div v-else class="space-y-2">
+                <Button
+                  v-if="canCreateBooking"
+                  type="button"
+                  variant="outline"
+                  class="h-11 w-full justify-center border-fuchsia-300/20 text-fuchsia-100 hover:bg-fuchsia-300/[0.08] light:text-fuchsia-800"
+                  @click="showBookingDialog = true"
+                >
+                  <Plus class="mr-2 h-4 w-4" />
+                  Book appointment
+                </Button>
+                <template v-if="upcomingBookings.length || recentBookings.length">
+                  <article v-for="booking in upcomingBookings" :key="booking.id" class="rounded-xl border border-fuchsia-300/12 bg-fuchsia-300/[0.03] p-3">
+                    <div class="flex items-start justify-between gap-2">
+                      <div class="min-w-0">
+                        <p class="truncate text-xs font-medium">{{ bookingName(booking) }}</p>
+                        <p class="mt-1 text-[10px] text-white/40 light:text-gray-500">{{ dateTime(booking.event?.starts_at) }}</p>
+                        <p v-if="booking.event?.resource?.name" class="mt-1 truncate text-[10px] text-white/30 light:text-gray-400">{{ booking.event.resource.name }}</p>
+                      </div>
+                      <Badge variant="outline" class="shrink-0 capitalize text-[9px]">{{ booking.status.replace('_', ' ') }}</Badge>
                     </div>
-                    <Badge variant="outline" class="shrink-0 capitalize text-[9px]">{{ booking.status.replace('_', ' ') }}</Badge>
-                  </div>
-                </article>
-                <details v-if="recentBookings.length" class="rounded-xl border border-white/[0.06] px-3 py-2 light:border-gray-200">
-                  <summary class="cursor-pointer text-[10px] font-medium text-white/45 light:text-gray-600">Recent attendance</summary>
-                  <div class="mt-2 space-y-2">
-                    <div v-for="booking in recentBookings" :key="booking.id" class="flex items-center justify-between gap-2 text-[10px]">
-                      <span class="truncate">{{ bookingName(booking) }} · {{ shortDate(booking.event?.starts_at) }}</span>
-                      <Badge variant="secondary" class="capitalize text-[9px]">{{ booking.status.replace('_', ' ') }}</Badge>
+                  </article>
+                  <details v-if="recentBookings.length" class="rounded-xl border border-white/[0.06] px-3 py-2 light:border-gray-200">
+                    <summary class="cursor-pointer text-[10px] font-medium text-white/45 light:text-gray-600">Recent attendance</summary>
+                    <div class="mt-2 space-y-2">
+                      <div v-for="booking in recentBookings" :key="booking.id" class="flex items-center justify-between gap-2 text-[10px]">
+                        <span class="truncate">{{ bookingName(booking) }} · {{ shortDate(booking.event?.starts_at) }}</span>
+                        <Badge variant="secondary" class="capitalize text-[9px]">{{ booking.status.replace('_', ' ') }}</Badge>
+                      </div>
                     </div>
-                  </div>
-                </details>
+                  </details>
+                </template>
+                <p v-else class="rounded-xl border border-dashed border-white/[0.08] p-3 text-xs text-white/35 light:border-gray-200 light:text-gray-500">No bookings found.</p>
               </div>
-              <p v-else class="rounded-xl border border-dashed border-white/[0.08] p-3 text-xs text-white/35 light:border-gray-200 light:text-gray-500">No bookings found.</p>
             </section>
 
             <section aria-labelledby="workspace-revenue-title">
@@ -940,5 +963,13 @@ onMounted(() => void loadWorkspace())
         </DialogFooter>
       </DialogContent>
     </Dialog>
+
+    <ContactBookingDialog
+      v-model:open="showBookingDialog"
+      :contact-id="props.contactId"
+      :contact-name="contactName"
+      :surface="props.surface"
+      @booked="bookingCreated"
+    />
   </section>
 </template>
