@@ -656,6 +656,17 @@ func createBookingAvailabilityFixture(
 		UpdatedByID:     &userID,
 	}
 	require.NoError(t, db.Create(&service).Error)
+	serviceActiveUpdate := db.Model(&models.BookingService{}).
+		Where("id = ? AND organization_id = ?", service.ID, organizationID).
+		UpdateColumn("is_active", serviceActive)
+	require.NoError(t, serviceActiveUpdate.Error)
+	require.EqualValues(t, 1, serviceActiveUpdate.RowsAffected)
+	var persistedService models.BookingService
+	require.NoError(t, db.Select("id", "is_active").
+		Where("id = ? AND organization_id = ?", service.ID, organizationID).
+		First(&persistedService).Error)
+	require.Equal(t, serviceActive, persistedService.IsActive)
+	service.IsActive = persistedService.IsActive
 	resource := models.BookingResource{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: organizationID,
@@ -669,6 +680,17 @@ func createBookingAvailabilityFixture(
 		UpdatedByID:    &userID,
 	}
 	require.NoError(t, db.Create(&resource).Error)
+	resourceActiveUpdate := db.Model(&models.BookingResource{}).
+		Where("id = ? AND organization_id = ?", resource.ID, organizationID).
+		UpdateColumn("is_active", resourceActive)
+	require.NoError(t, resourceActiveUpdate.Error)
+	require.EqualValues(t, 1, resourceActiveUpdate.RowsAffected)
+	var persistedResource models.BookingResource
+	require.NoError(t, db.Select("id", "is_active").
+		Where("id = ? AND organization_id = ?", resource.ID, organizationID).
+		First(&persistedResource).Error)
+	require.Equal(t, resourceActive, persistedResource.IsActive)
+	resource.IsActive = persistedResource.IsActive
 	event := models.BookingEvent{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: organizationID,
