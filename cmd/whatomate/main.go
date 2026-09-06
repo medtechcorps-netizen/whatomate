@@ -1615,6 +1615,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		tenant((*handlers.App).DeleteResourceTimeOff),
 	)
 	g.GET("/api/booking/events", tenant((*handlers.App).ListBookingEvents))
+	g.GET("/api/booking/availability", tenant((*handlers.App).ListBookingAvailability))
 	g.POST("/api/booking/events", tenant((*handlers.App).CreateBookingEvent))
 	g.PUT("/api/booking/events/{id}", tenant((*handlers.App).UpdateBookingEvent))
 	g.GET("/api/bookings", tenant((*handlers.App).ListBookings))

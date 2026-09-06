@@ -135,6 +135,15 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	// Query params
 	status := string(r.RequestCtx.QueryArgs().Peek("status"))
 	teamIDStr := string(r.RequestCtx.QueryArgs().Peek("team_id"))
+	contactIDStr := string(r.RequestCtx.QueryArgs().Peek("contact_id"))
+	var contactID *uuid.UUID
+	if contactIDStr != "" {
+		parsedContactID, parseErr := uuid.Parse(contactIDStr)
+		if parseErr != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid contact_id", nil, "")
+		}
+		contactID = &parsedContactID
+	}
 
 	// Pagination params
 	limit := 100 // Default limit
@@ -213,6 +222,9 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	if status != "" {
 		query = query.Where("agent_transfers.status = ?", status)
 	}
+	if contactID != nil {
+		query = query.Where("agent_transfers.contact_id = ?", *contactID)
+	}
 
 	// Filter by team if provided
 	if teamIDStr != "" {
@@ -241,12 +253,24 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 
 	// Filter based on permissions
 	if !hasFullAccess {
-		// Users without full access see their assigned transfers + unassigned in their team queues + general queue
+		// Users without full access see their assigned transfers + unassigned in
+		// their team queues + general queue. An exact contact lookup also lets the
+		// creator observe a transfer that assignment policy routed to somebody
+		// else, so the Chat header cannot falsely claim AI is active immediately
+		// after that user paused it. Resume authorization remains stricter.
 		if len(userTeamIDs) > 0 {
-			query = query.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userTeamIDs)
+			if contactID != nil {
+				query = query.Where("agent_transfers.transferred_by_user_id = ? OR agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userID, userTeamIDs)
+			} else {
+				query = query.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userTeamIDs)
+			}
 		} else {
 			// User not in any team - see own transfers + general queue only
-			query = query.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID)
+			if contactID != nil {
+				query = query.Where("agent_transfers.transferred_by_user_id = ? OR agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID, userID)
+			} else {
+				query = query.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID)
+			}
 		}
 	}
 	// Users with full access see all transfers (no filter applied)
@@ -257,6 +281,9 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	if status != "" {
 		countQuery = countQuery.Where("agent_transfers.status = ?", status)
 	}
+	if contactID != nil {
+		countQuery = countQuery.Where("agent_transfers.contact_id = ?", *contactID)
+	}
 	if teamIDStr != "" {
 		if teamIDStr == "general" {
 			countQuery = countQuery.Where("agent_transfers.team_id IS NULL")
@@ -266,9 +293,17 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	}
 	if !hasFullAccess {
 		if len(userTeamIDs) > 0 {
-			countQuery = countQuery.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userTeamIDs)
+			if contactID != nil {
+				countQuery = countQuery.Where("agent_transfers.transferred_by_user_id = ? OR agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userID, userTeamIDs)
+			} else {
+				countQuery = countQuery.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userTeamIDs)
+			}
 		} else {
-			countQuery = countQuery.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID)
+			if contactID != nil {
+				countQuery = countQuery.Where("agent_transfers.transferred_by_user_id = ? OR agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID, userID)
+			} else {
+				countQuery = countQuery.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID)
+			}
 		}
 	}
 	countQuery.Count(&totalCount)
@@ -713,8 +748,14 @@ func (a *App) ResumeFromTransfer(r *fastglue.Request) error {
 		if transfer.Status != models.TransferStatusActive {
 			return errTransferNotActive
 		}
+		ownsAssignedTransfer := transfer.AgentID != nil && *transfer.AgentID == userID
+		ownsUnassignedManualTransfer := transfer.AgentID == nil &&
+			transfer.Source == models.TransferSourceManual &&
+			transfer.TransferredByUserID != nil &&
+			*transfer.TransferredByUserID == userID
 		if !hasManagementAccess &&
-			(transfer.AgentID == nil || *transfer.AgentID != userID) {
+			!ownsAssignedTransfer &&
+			!ownsUnassignedManualTransfer {
 			return errTransferAccessDenied
 		}
 
@@ -748,7 +789,7 @@ func (a *App) ResumeFromTransfer(r *fastglue.Request) error {
 	case errors.Is(txErr, errTransferNotActive):
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Transfer is not active", nil, "")
 	case errors.Is(txErr, errTransferAccessDenied):
-		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You can only resume a transfer assigned to you", nil, "")
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You can only resume a transfer assigned to you or an unassigned manual transfer you created", nil, "")
 	case txErr != nil:
 		a.Log.Error("Failed to resume transfer", "error", txErr, "transfer_id", transferID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resume transfer", nil, "")
@@ -1230,6 +1271,9 @@ func (a *App) broadcastTransferCreated(transfer *models.AgentTransfer, contact *
 
 	if transfer.TeamID != nil {
 		payload["team_id"] = transfer.TeamID.String()
+	}
+	if transfer.TransferredByUserID != nil {
+		payload["transferred_by"] = transfer.TransferredByUserID.String()
 	}
 
 	a.WSHub.BroadcastToOrg(transfer.OrganizationID, websocket.WSMessage{

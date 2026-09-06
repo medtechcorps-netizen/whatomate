@@ -562,6 +562,7 @@ export const chatbotService = {
     status?: string;
     agent_id?: string;
     team_id?: string;
+    contact_id?: string;
     limit?: number;
     offset?: number;
     include?: string; // 'all' | 'contact,agent,team' etc.

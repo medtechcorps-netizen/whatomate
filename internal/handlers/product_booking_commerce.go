@@ -33,6 +33,10 @@ const (
 	paymentAuditResource         = "payment_transaction"
 )
 
+// bookingReservationNow is an internal clock seam for deterministic tests of
+// the post-lock booking boundary. Production always leaves it as time.Now.
+var bookingReservationNow = time.Now
+
 type bookingCommerceClientError struct {
 	status  int
 	message string
@@ -1130,17 +1134,13 @@ func (a *App) CreateBooking(r *fastglue.Request) error {
 		); err != nil {
 			return err
 		}
-		var event models.BookingEvent
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where(
-				"id = ? AND organization_id = ? AND status = ?",
-				req.EventID, orgID, models.BookingEventStatusScheduled,
-			).
-			First(&event).Error; err != nil {
-			return newBookingCommerceClientError(
-				fasthttp.StatusBadRequest,
-				"event_id does not belong to an active scheduled event",
-			)
+		event, err := lockBookableEventForReservation(
+			tx,
+			orgID,
+			req.EventID,
+		)
+		if err != nil {
+			return err
 		}
 		err = tx.Where(
 			"organization_id = ? AND idempotency_key = ?",
@@ -1175,13 +1175,20 @@ func (a *App) CreateBooking(r *fastglue.Request) error {
 			if !req.AllowWaitlist {
 				return newBookingCommerceClientError(
 					fasthttp.StatusConflict,
-					"Booking event does not have enough remaining capacity",
+					"Booking slot was just filled; refresh available slots and choose another",
 				)
 			}
 			status = models.BookingStatusWaitlisted
 		}
 
-		now := time.Now().UTC()
+		// Sample the clock only at the actual new-reservation boundary. Event,
+		// service, and resource locks are already held, and the post-lock
+		// idempotency lookup above has already allowed completed identical
+		// requests to replay even after the slot starts.
+		now := bookingReservationNow().UTC()
+		if err := ensureBookingEventHasNotStarted(event, now); err != nil {
+			return err
+		}
 		booking = models.Booking{
 			BaseModel:        models.BaseModel{ID: uuid.New()},
 			OrganizationID:   orgID,

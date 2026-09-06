@@ -373,6 +373,32 @@ export interface BookingEvent {
   version: number
 }
 
+export interface BookingAvailabilitySlot extends BookingEvent {
+  remaining_capacity: number
+  timezone: string
+  local_starts_at: string
+  local_ends_at: string
+}
+
+export interface BookingAvailabilityParams {
+  service_id?: string
+  resource_id?: string
+  from?: string
+  to?: string
+  page?: number
+  limit?: number
+}
+
+export interface CreateBookingInput {
+  contact_id: string
+  quantity: number
+  status: 'reserved'
+  source: 'agent'
+  allow_waitlist: false
+  idempotency_key: string
+  notes?: string
+}
+
 export interface Booking {
   id: string
   event_id: string
@@ -837,6 +863,11 @@ export const bookingService = {
     fetchAllPages<BookingEvent>('events', (page, limit) =>
       api.get('/booking/events', { params: { ...params, page, limit } }),
     ),
+  availability: (params?: BookingAvailabilityParams) => api.get('/booking/availability', { params }),
+  allAvailability: (params?: Omit<BookingAvailabilityParams, 'page' | 'limit'>) =>
+    fetchAllPages<BookingAvailabilitySlot>('slots', (page, limit) =>
+      api.get('/booking/availability', { params: { ...params, page, limit } }),
+    ),
   createEvent: (
     data: Partial<BookingEvent> & {
       local_starts_at?: string
@@ -847,7 +878,7 @@ export const bookingService = {
   bookings: (params?: Record<string, string | number>) => api.get('/bookings', { params }),
   allBookings: (params?: Record<string, string | number>) =>
     fetchAllPages<Booking>('bookings', (page, limit) => api.get('/bookings', { params: { ...params, page, limit } })),
-  createBooking: (eventId: string, data: Record<string, unknown>) =>
+  createBooking: (eventId: string, data: CreateBookingInput | Record<string, unknown>) =>
     api.post(`/booking/events/${eventId}/bookings`, data),
   transitionBooking: (id: string, transition: string, data?: Record<string, unknown>) =>
     api.post(`/bookings/${id}/${encodeURIComponent(transition)}`, data ?? {}),
