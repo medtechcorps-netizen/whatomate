@@ -133,6 +133,44 @@ MIGRATION = {
     "arguments": ["rls-migrate", "-config", "config.toml"],
 }
 
+DATABASE_PHASE_COMPATIBILITY = {
+    "authority": "exact-database-phase-compatibility/v1",
+    "harness_path": "release/validation/verify_database_phase_compatibility.sh",
+    "harness_sha256": "55ac39dbf96314c3692bcd55595fe1a480ff535ec00b09d1650eb1aabb3c0bbc",
+    "job_name": "Exact database phase compatibility",
+}
+
+DATABASE_PHASE_POLICIES = {
+    "baseline": {
+        "compile_time_value": "rlsMigrationPhaseBaseline",
+        "legacy_database": "prepare-legacy-without-future-activation",
+        "future_database": "verify-future-read-only",
+        "future_activation_from_legacy": False,
+        "future_replay": "verify-future-read-only",
+    },
+    "bridge": {
+        "compile_time_value": "rlsMigrationPhaseBridge",
+        "legacy_database": "activate-complete-future-profile",
+        "future_database": "verify-future-read-only",
+        "future_activation_from_legacy": True,
+        "future_replay": "verify-future-read-only",
+    },
+    "backend": {
+        "compile_time_value": "rlsMigrationPhaseBackend",
+        "legacy_database": "reject-before-mutation",
+        "future_database": "verify-future-read-only",
+        "future_activation_from_legacy": False,
+        "future_replay": "verify-future-read-only",
+    },
+    "ui": {
+        "compile_time_value": "rlsMigrationPhaseUI",
+        "legacy_database": "reject-before-mutation",
+        "future_database": "verify-future-read-only",
+        "future_activation_from_legacy": False,
+        "future_replay": "verify-future-read-only",
+    },
+}
+
 EXPECTED_PHASE_SOURCES = {
     "baseline": {
         "source_sha": "fe0fc9e4f5ad8f3f8b98af945a78a7239e848f33",
@@ -828,13 +866,24 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
     )
     require_exact_int(manifest["schema_version"], "source manifest schema version", 1, 1)
     require(manifest["repository"] == "medtechcorps-netizen/whatomate", "manifest repository differs")
+    validation = exact_keys(
+        manifest["validation"],
+        {"workflow_path", "gate_job_name", "database_phase_compatibility"},
+        "manifest validation",
+    )
     require(
-        manifest["validation"]
-        == {
-            "workflow_path": ".github/workflows/validate-exact-release-source.yml",
-            "gate_job_name": "Exact source validation gate",
-        },
+        validation["workflow_path"] == ".github/workflows/validate-exact-release-source.yml"
+        and validation["gate_job_name"] == "Exact source validation gate",
         "manifest validation authority differs",
+    )
+    database_compatibility = exact_keys(
+        validation["database_phase_compatibility"],
+        {"authority", "harness_path", "harness_sha256", "job_name"},
+        "manifest database phase compatibility",
+    )
+    require(
+        strict_json_equal(database_compatibility, DATABASE_PHASE_COMPATIBILITY),
+        "manifest database phase compatibility authority differs",
     )
     phases = exact_keys(manifest["phases"], set(PHASES), "manifest phases")
     for phase in PHASES:
@@ -848,6 +897,20 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
         require(
             strict_json_equal(entry, EXPECTED_PHASE_SOURCES[phase]),
             f"manifest phase authority differs: {phase}",
+        )
+        require(
+            DATABASE_PHASE_POLICIES[phase]["compile_time_value"]
+            == f"rlsMigrationPhase{'UI' if phase == 'ui' else phase.title()}",
+            f"database compile-time phase mapping differs: {phase}",
+        )
+    # A full checkout that happens to exercise the parametrized coordinator
+    # tests is not four independently compiled release roles. Every role must
+    # retain its own immutable commit, root tree, and internal tree before the
+    # validation workflow can attest its phase literal.
+    for key in ("source_sha", "root_tree", "internal_tree"):
+        require(
+            len({phases[phase][key] for phase in PHASES}) == len(PHASES),
+            f"database phase source allocation is not unique: {key}",
         )
     release = exact_keys(manifest["release"], {"platform", "components", "materials"}, "release")
     require(release["platform"] == "linux/amd64", "release platform differs")

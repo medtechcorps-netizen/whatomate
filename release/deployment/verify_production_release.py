@@ -42,6 +42,65 @@ ROLLBACK_FLOORS = {
     "backend": {"allowed_targets": ["bridge"], "forbidden_targets": ["baseline"]},
     "ui": {"allowed_targets": ["backend", "bridge"], "forbidden_targets": ["baseline"]},
 }
+
+
+def validate_rollback_floor(
+    phase: str, value: Any, label: str = "rollback floor"
+) -> dict[str, list[str]]:
+    """Validate one canonical effective floor for ``phase``.
+
+    A bridge reached from backend or UI permanently inherits the prohibition on
+    returning to baseline.  It is the only phase with two valid effective
+    shapes; accepting either shape here is structural validation, not authority
+    to select the weaker one during a rollback.
+    """
+    phase = validate_phase(phase, f"{label} phase")
+    floor = exact_keys(value, {"allowed_targets", "forbidden_targets"}, label)
+    allowed = floor["allowed_targets"]
+    forbidden = floor["forbidden_targets"]
+    if type(allowed) is not list or type(forbidden) is not list:
+        fail(f"{label} targets are malformed")
+    for targets, suffix in ((allowed, "allowed"), (forbidden, "forbidden")):
+        if any(type(item) is not str or item not in PHASES for item in targets):
+            fail(f"{label} {suffix} targets are malformed")
+        if len(set(targets)) != len(targets):
+            fail(f"{label} {suffix} targets contain duplicates")
+    if set(allowed).intersection(forbidden):
+        fail(f"{label} targets overlap")
+    canonical = [ROLLBACK_FLOORS[phase]]
+    if phase == "bridge":
+        canonical.append(
+            {"allowed_targets": [], "forbidden_targets": ["baseline"]}
+        )
+    normalized = {"allowed_targets": list(allowed), "forbidden_targets": list(forbidden)}
+    if normalized not in canonical:
+        fail(f"{label} differs")
+    return normalized
+
+
+def derive_rollback_floor(
+    current: str, current_floor: Any, target: str
+) -> dict[str, list[str]]:
+    """Authorize a rollback and derive its monotonic effective floor."""
+    current = validate_phase(current, "current phase")
+    target = validate_phase(target, "rollback target phase")
+    inherited = validate_rollback_floor(current, current_floor, "current rollback floor")
+    if (
+        target not in inherited["allowed_targets"]
+        or target in inherited["forbidden_targets"]
+    ):
+        fail("rollback target violates the signed floor")
+    intrinsic = ROLLBACK_FLOORS[target]
+    forbidden_set = set(inherited["forbidden_targets"]).union(
+        intrinsic["forbidden_targets"]
+    )
+    derived = {
+        "allowed_targets": [
+            item for item in intrinsic["allowed_targets"] if item not in forbidden_set
+        ],
+        "forbidden_targets": [item for item in PHASES if item in forbidden_set],
+    }
+    return validate_rollback_floor(target, derived, "derived rollback floor")
 COMPONENTS = (
     ("services", "omnitech-web", "web", "medtechcorps-netizen/rereply-release-web"),
     ("services", "meta-relay", "meta-relay", "medtechcorps-netizen/rereply-release-meta-relay"),
@@ -653,10 +712,16 @@ def sanitized_image_records(digests: Mapping[str, str]) -> list[dict[str, str]]:
     ]
 
 
-def validate_rollback_transition(current: str, target: str) -> None:
+def validate_rollback_transition(
+    current: str, target: str, *, current_floor: Any | None = None
+) -> None:
     current = validate_phase(current, "current phase")
     target = validate_phase(target, "rollback target phase")
-    floor = ROLLBACK_FLOORS[current]
+    floor = (
+        ROLLBACK_FLOORS[current]
+        if current_floor is None
+        else validate_rollback_floor(current, current_floor, "current rollback floor")
+    )
     if target not in floor["allowed_targets"] or target in floor["forbidden_targets"]:
         fail("rollback target violates the signed floor")
 
@@ -1106,8 +1171,15 @@ def validate_mutation_intent(value: Any, *, now: dt.datetime | None = None) -> d
     if mutation["mutation_fingerprint_sha256"] != expected_fingerprint:
         fail("mutation intent fingerprint differs")
     target = lineage["to"]
-    if intent["rollback"] != ROLLBACK_FLOORS[target]:
-        fail("mutation intent rollback floor differs")
+    if operation == "activate":
+        if intent["rollback"] != ROLLBACK_FLOORS[target]:
+            fail("mutation intent rollback floor differs")
+    else:
+        expected_floor = derive_rollback_floor(
+            lineage["from"], ROLLBACK_FLOORS[lineage["from"]], target
+        )
+        if intent["rollback"] != expected_floor:
+            fail("mutation intent rollback floor differs")
     canary = exact_keys(
         intent["canary"],
         {"required", "completed", "endpoint_labels", "route_contract_sha256"},
@@ -1848,8 +1920,15 @@ def validate_reconciliation_receipt(value: Any) -> dict[str, Any]:
     ):
         fail("reconciliation deployment gates differ")
     target = lineage["to"]
-    if receipt["rollback"] != ROLLBACK_FLOORS[target]:
-        fail("reconciliation rollback floor differs")
+    if lineage["operation"] == "activate":
+        if receipt["rollback"] != ROLLBACK_FLOORS[target]:
+            fail("reconciliation rollback floor differs")
+    else:
+        expected_floor = derive_rollback_floor(
+            lineage["from"], ROLLBACK_FLOORS[lineage["from"]], target
+        )
+        if receipt["rollback"] != expected_floor:
+            fail("reconciliation rollback floor differs")
     canary = exact_keys(
         receipt["canary"],
         {
@@ -2234,8 +2313,15 @@ def validate_phase_state(value: Any, *, now: dt.datetime | None = None) -> dict[
     gates = exact_keys(state["gates"], {"deployment_succeeded", "migration_succeeded", "canary_succeeded"}, "phase gates")
     if gates != {"deployment_succeeded": True, "migration_succeeded": True, "canary_succeeded": True}:
         fail("phase state gates are incomplete")
-    if state["rollback"] != ROLLBACK_FLOORS[phase]:
-        fail("phase state rollback floor differs")
+    if operation == "activate":
+        if state["rollback"] != ROLLBACK_FLOORS[phase]:
+            fail("phase state rollback floor differs")
+    else:
+        expected_floor = derive_rollback_floor(
+            source, ROLLBACK_FLOORS[source], target
+        )
+        if state["rollback"] != expected_floor:
+            fail("phase state rollback floor differs")
     sanitize_public(state)
     return state
 

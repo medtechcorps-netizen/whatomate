@@ -63,7 +63,21 @@ jobs:
   authority:
     name: Verify protected-main authority and exact validation
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: whatomate_image_phase_compatibility
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     permissions:
       actions: read # Query and verify the exact successful source-validation run.
       contents: read
@@ -79,6 +93,8 @@ jobs:
       validation_run_id: ${{ steps.validation.outputs.validation_run_id }}
       validation_run_attempt: ${{ steps.validation.outputs.validation_run_attempt }}
       validation_run_url: ${{ steps.validation.outputs.validation_run_url }}
+      database_phase_compatibility_b64: ${{ steps.compatibility.outputs.evidence_b64 }}
+      database_phase_compatibility_sha256: ${{ steps.compatibility.outputs.evidence_sha256 }}
     steps:
       - name: Require protected-main GitHub-hosted authority
         id: authority
@@ -171,9 +187,15 @@ jobs:
             (keys == ["phases", "release", "repository", "schema_version", "validation"]) and
             .schema_version == 1 and
             .repository == "medtechcorps-netizen/whatomate" and
-            (.validation | keys) == ["gate_job_name", "workflow_path"] and
+            (.validation | keys) == ["database_phase_compatibility", "gate_job_name", "workflow_path"] and
             .validation.workflow_path == ".github/workflows/validate-exact-release-source.yml" and
             .validation.gate_job_name == "Exact source validation gate" and
+            .validation.database_phase_compatibility == {
+              authority: "exact-database-phase-compatibility/v1",
+              harness_path: "release/validation/verify_database_phase_compatibility.sh",
+              harness_sha256: "55ac39dbf96314c3692bcd55595fe1a480ff535ec00b09d1650eb1aabb3c0bbc",
+              job_name: "Exact database phase compatibility"
+            } and
             (.phases | keys) == ["backend", "baseline", "bridge", "ui"] and
             .phases.baseline == {
               source_sha: "fe0fc9e4f5ad8f3f8b98af945a78a7239e848f33",
@@ -199,6 +221,9 @@ jobs:
               frontend_tree: "b9e93e27948ef2287b3f35bb38f6399b7f0a05c6",
               internal_tree: "a1da97143c17f3d02e47250269d00f238ac0e38c"
             } and
+            ([.phases[].source_sha] | unique | length) == 4 and
+            ([.phases[].root_tree] | unique | length) == 4 and
+            ([.phases[].internal_tree] | unique | length) == 4 and
             (.release | keys) == ["components", "materials", "platform"] and
             .release.platform == "linux/amd64" and
             (.release.components | keys) == ["gmail-relay", "meta-relay", "web"] and
@@ -388,8 +413,15 @@ jobs:
                 .name == "Exact source validation gate" and
                 .run_attempt == $run_attempt and
                 .status == "completed" and
-              .conclusion == "success"
-            )] | length) == 1
+                .conclusion == "success"
+              )] | length) == 1 and
+              ([.jobs[] | select(.name == "Exact database phase compatibility")] | length) == 1 and
+              ([.jobs[] | select(
+                .name == "Exact database phase compatibility" and
+                .run_attempt == $run_attempt and
+                .status == "completed" and
+                .conclusion == "success"
+              )] | length) == 1
           ' <<< "$jobs_json" > /dev/null
 
           validation_run_url="$(jq -er '.html_url' <<< "$run_json")"
@@ -406,6 +438,58 @@ jobs:
           fetch-depth: 1
           path: source
           persist-credentials: false
+
+      - name: Set up Go for database compatibility evidence
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.6"
+          cache: false
+
+      - name: Bind the pinned database phase compatibility evidence
+        id: compatibility
+        env:
+          CONTROL_SHA: ${{ steps.authority.outputs.control_sha }}
+          PHASE: ${{ steps.source.outputs.phase }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_image_phase_compatibility?sslmode=disable
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/database-phase-compatibility.json"
+          bash control/release/validation/verify_database_phase_compatibility.sh \
+            --phase "$PHASE" \
+            --source-dir source \
+            --manifest control/release/exact-sources.json \
+            --workflow-sha "$CONTROL_SHA" \
+            --workflow-path .github/workflows/build-attest-exact-release-images.yml \
+            --workflow-repository "$REPOSITORY" \
+            --runner-environment "$RUNNER_ENVIRONMENT" \
+            --output "$evidence"
+          python3 - "$evidence" "$PHASE" "$SOURCE_SHA" "$CONTROL_SHA" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          evidence = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          if (
+              evidence["authority"] != "exact-database-phase-compatibility/v1"
+              or evidence["phase"] != sys.argv[2]
+              or evidence["source"]["commit"] != sys.argv[3]
+              or evidence["workflow"]["sha"] != sys.argv[4]
+              or evidence["workflow"]["path"] != ".github/workflows/build-attest-exact-release-images.yml"
+              or evidence["workflow"]["runner_environment"] != "github-hosted"
+              or evidence["tests"]["result"] != "passed"
+          ):
+              raise SystemExit("image database phase compatibility evidence differs")
+          PY
+          evidence_sha256="$(sha256sum "$evidence" | awk '{print $1}')"
+          evidence_b64="$(base64 -w 0 "$evidence")"
+          [[ "$evidence_sha256" =~ ^[0-9a-f]{64}$ && -n "$evidence_b64" ]]
+          {
+            printf 'evidence_sha256=%s\n' "$evidence_sha256"
+            printf 'evidence_b64=%s\n' "$evidence_b64"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Reverify source trees and immutable packaging materials
         env:
@@ -970,6 +1054,8 @@ jobs:
         env:
           COMPONENT: ${{ matrix.component }}
           CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DATABASE_PHASE_COMPATIBILITY_B64: ${{ needs.authority.outputs.database_phase_compatibility_b64 }}
+          DATABASE_PHASE_COMPATIBILITY_SHA256: ${{ needs.authority.outputs.database_phase_compatibility_sha256 }}
           DIGEST: ${{ steps.publish.outputs.digest }}
           DOCKERFILE: ${{ matrix.dockerfile }}
           EXPECTED_DOCKERFILE_SHA256: ${{ matrix.dockerfile_sha256 }}
@@ -989,6 +1075,9 @@ jobs:
           [[ -s remote-descriptor.json && -f remote-descriptor.json && ! -L remote-descriptor.json ]]
           descriptor_sha256="$(sha256sum remote-descriptor.json | awk '{print $1}')"
           [[ "sha256:$descriptor_sha256" == "$DIGEST" ]]
+          printf '%s' "$DATABASE_PHASE_COMPATIBILITY_B64" | base64 --decode > database-phase-compatibility.json
+          [[ "$(sha256sum database-phase-compatibility.json | awk '{print $1}')" == "$DATABASE_PHASE_COMPATIBILITY_SHA256" ]]
+          database_phase_compatibility="$(jq -c '.' database-phase-compatibility.json)"
           dockerfile_sha256="$(sha256sum "control/$DOCKERFILE" | awk '{print $1}')"
           [[ "$dockerfile_sha256" == "$EXPECTED_DOCKERFILE_SHA256" ]]
           runtime="$(jq -c --arg component "$COMPONENT" '.release.components[$component] | {user, working_dir, entrypoint, cmd, port, smoke}' "control/$SOURCE_MANIFEST_PATH")"
@@ -1009,6 +1098,7 @@ jobs:
             --arg validation_run_id "$VALIDATION_RUN_ID" \
             --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" \
             --arg validation_run_url "$VALIDATION_RUN_URL" \
+            --argjson database_phase_compatibility "$database_phase_compatibility" \
             --argjson runtime "$runtime" '
               {
                 schema_version: 1,
@@ -1017,6 +1107,7 @@ jobs:
                 source_sha: $source_sha,
                 source_manifest_sha256: $source_manifest_sha256,
                 control_sha: $control_sha,
+                database_phase_compatibility: $database_phase_compatibility,
                 validation_run_id: $validation_run_id,
                 validation_run_url: $validation_run_url,
                 image: $image,
@@ -1119,6 +1210,7 @@ jobs:
         env:
           COMPONENT: ${{ matrix.component }}
           CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DATABASE_PHASE_COMPATIBILITY_SHA256: ${{ needs.authority.outputs.database_phase_compatibility_sha256 }}
           DOCKERFILE: ${{ matrix.dockerfile }}
           EXPECTED_DOCKERFILE_SHA256: ${{ matrix.dockerfile_sha256 }}
           IMAGE: ${{ matrix.image }}
@@ -1159,6 +1251,20 @@ jobs:
           descriptor_sha256="$(sha256sum evidence/remote-descriptor.json | awk '{print $1}')"
           [[ "sha256:$descriptor_sha256" == "$digest" ]]
           [[ "$(jq -er '.remote_descriptor_sha256' evidence/image.json)" == "$descriptor_sha256" ]]
+          jq -cS '.database_phase_compatibility' evidence/image.json > database-phase-compatibility.json
+          [[ "$(sha256sum database-phase-compatibility.json | awk '{print $1}')" == "$DATABASE_PHASE_COMPATIBILITY_SHA256" ]]
+          jq -e \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg phase "$PHASE" \
+            --arg source_sha "$SOURCE_SHA" '
+              .authority == "exact-database-phase-compatibility/v1" and
+              .phase == $phase and
+              .source.commit == $source_sha and
+              .workflow.path == ".github/workflows/build-attest-exact-release-images.yml" and
+              .workflow.sha == $control_sha and
+              .workflow.runner_environment == "github-hosted" and
+              .tests.result == "passed"
+            ' database-phase-compatibility.json > /dev/null
           jq -e '
             .schemaVersion == 2 and
             (
@@ -1372,6 +1478,7 @@ jobs:
           trivy_db_sha256="$(cat trivy-db.sha256)"
           trivy_db_metadata_sha256="$(cat trivy-db-metadata.sha256)"
           trivy_db_updated_at="$(cat trivy-db-updated-at.txt)"
+          database_phase_compatibility="$(jq -c '.database_phase_compatibility' image.json)"
           [[ "sha256:$remote_descriptor_sha256" == "$digest" ]]
           [[ "$(jq -er '.remote_descriptor_sha256' image.json)" == "$remote_descriptor_sha256" ]]
           jq -e '
@@ -1421,9 +1528,11 @@ jobs:
             --arg trivy_version "$PINNED_TRIVY_VERSION" \
             --arg validation_run_id "$VALIDATION_RUN_ID" \
             --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" \
-            --arg vulnerability_report_sha256 "$vulnerability_report_sha256" '
+            --arg vulnerability_report_sha256 "$vulnerability_report_sha256" \
+            --argjson database_phase_compatibility "$database_phase_compatibility" '
               {
                 schema_version: 1,
+                database_phase_compatibility: $database_phase_compatibility,
                 subject: {
                   component: $component,
                   image: $image,
@@ -1487,6 +1596,9 @@ jobs:
               .runtime_contract == "passed"
             ' scan.json > /dev/null
           [[ "$(jq -er '.remote_descriptor_sha256' image.json)" == "$remote_descriptor_sha256" ]]
+          jq -e --slurpfile image image.json \
+            '.database_phase_compatibility == $image[0].database_phase_compatibility' \
+            scan.json > /dev/null
 
       - name: Upload scan and SBOM evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -1636,6 +1748,9 @@ jobs:
           cp evidence/sbom.spdx.json sbom.spdx.json
           cp evidence/secret-report.json secret-report.json
           cp evidence/vulnerability-report.json vulnerability-report.json
+          database_phase_compatibility="$(jq -c '.database_phase_compatibility' image.json)"
+          jq -e --argjson expected "$database_phase_compatibility" \
+            '.database_phase_compatibility == $expected' scan.json > /dev/null
 
           jq -e \
             --arg component "$COMPONENT" \
@@ -1775,12 +1890,14 @@ jobs:
             --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" \
             --arg validation_run_url "$VALIDATION_RUN_URL" \
             --arg workflow_path "$RELEASE_WORKFLOW_PATH" \
+            --argjson database_phase_compatibility "$database_phase_compatibility" \
             --argjson image "$(cat image.json)" \
             --argjson materials "$(jq -c '.release.materials' "control/$SOURCE_MANIFEST_PATH")" \
             --argjson verification "$(cat scan.json)" '
               {
                 schema_version: 1,
                 phase: $phase,
+                database_phase_compatibility: $database_phase_compatibility,
                 source: {
                   repository: $repository,
                   commit: $source_sha,
@@ -2064,6 +2181,10 @@ jobs:
           [[ "$(sha256sum secret-report.json | awk '{print $1}')" == "$(jq -er '.secret_scan.report_sha256' scan.json)" ]]
           [[ "$(sha256sum vulnerability-report.json | awk '{print $1}')" == "$(jq -er '.vulnerability_scan.report_sha256' scan.json)" ]]
           [[ "$(jq -er '.remote_descriptor_sha256' image.json)" == "$(jq -er '.remote_descriptor_sha256' scan.json)" ]]
+          jq -e --slurpfile image image.json --slurpfile scan scan.json '
+            .database_phase_compatibility == $image[0].database_phase_compatibility and
+            .database_phase_compatibility == $scan[0].database_phase_compatibility
+          ' exact-source-predicate.json > /dev/null
           [[ "sha256:$(sha256sum remote-descriptor.json | awk '{print $1}')" == "$digest" ]]
           jq -e '
             .schemaVersion == 2 and
@@ -2168,6 +2289,10 @@ jobs:
               .builder.workflow_sha == $control_sha and
               .phase == $phase and
               .source.commit == $source_sha and
+              .database_phase_compatibility.phase == $phase and
+              .database_phase_compatibility.source.commit == $source_sha and
+              .database_phase_compatibility.workflow.sha == $control_sha and
+              .database_phase_compatibility.tests.result == "passed" and
               .validation.run_attempt == $validation_run_attempt and
               .image.tag_is_authority == false
             ' exact-source-predicate.json > /dev/null
@@ -2288,6 +2413,8 @@ jobs:
       - name: Build the digest-authoritative release set
         env:
           CONTROL_SHA: ${{ needs.authority.outputs.control_sha }}
+          DATABASE_PHASE_COMPATIBILITY_B64: ${{ needs.authority.outputs.database_phase_compatibility_b64 }}
+          DATABASE_PHASE_COMPATIBILITY_SHA256: ${{ needs.authority.outputs.database_phase_compatibility_sha256 }}
           EXPECTED_MATRIX: ${{ needs.authority.outputs.matrix }}
           FRONTEND_TREE: ${{ needs.authority.outputs.frontend_tree }}
           INTERNAL_TREE: ${{ needs.authority.outputs.internal_tree }}
@@ -2302,6 +2429,8 @@ jobs:
           set -euo pipefail
           mapfile -t manifests < <(find verified -type f -name image.json | sort)
           [[ "${#manifests[@]}" -eq 3 ]]
+          printf '%s' "$DATABASE_PHASE_COMPATIBILITY_B64" | base64 --decode > database-phase-compatibility.json
+          [[ "$(sha256sum database-phase-compatibility.json | awk '{print $1}')" == "$DATABASE_PHASE_COMPATIBILITY_SHA256" ]]
 
           jq -s \
             --arg control_sha "$CONTROL_SHA" \
@@ -2315,6 +2444,7 @@ jobs:
             --arg validation_run_id "$VALIDATION_RUN_ID" \
             --argjson validation_run_attempt "$VALIDATION_RUN_ATTEMPT" \
             --arg validation_run_url "$VALIDATION_RUN_URL" \
+            --argjson database_phase_compatibility "$(cat database-phase-compatibility.json)" \
             --argjson expected_matrix "$EXPECTED_MATRIX" '
               sort_by(.component) as $images |
               ($expected_matrix | sort_by(.component) | map({
@@ -2337,6 +2467,7 @@ jobs:
                   .validation_run_id == $validation_run_id and
                   .validation_run_attempt == $validation_run_attempt and
                   .validation_run_url == $validation_run_url and
+                  .database_phase_compatibility == $database_phase_compatibility and
                   .platform == "linux/amd64" and
                   .tag_is_authority == false and
                   (.digest | test("^sha256:[0-9a-f]{64}$"))

@@ -416,6 +416,55 @@ class ProductionReleaseVerifierTests(unittest.TestCase):
             with self.assertRaises(release.ReleaseError):
                 release.validate_rollback_transition(*edge)
 
+    def test_rollback_floor_is_monotonic_across_backend_to_bridge(self) -> None:
+        hardened_bridge = {
+            "allowed_targets": [],
+            "forbidden_targets": ["baseline"],
+        }
+        self.assertEqual(
+            release.derive_rollback_floor(
+                "backend", release.ROLLBACK_FLOORS["backend"], "bridge"
+            ),
+            hardened_bridge,
+        )
+        self.assertEqual(
+            release.derive_rollback_floor(
+                "ui", release.ROLLBACK_FLOORS["ui"], "bridge"
+            ),
+            hardened_bridge,
+        )
+        self.assertEqual(
+            release.derive_rollback_floor(
+                "ui", release.ROLLBACK_FLOORS["ui"], "backend"
+            ),
+            release.ROLLBACK_FLOORS["backend"],
+        )
+        with self.assertRaises(release.ReleaseError):
+            release.validate_rollback_transition(
+                "bridge", "baseline", current_floor=hardened_bridge
+            )
+        with self.assertRaises(release.ReleaseError):
+            release.derive_rollback_floor("bridge", hardened_bridge, "baseline")
+
+    def test_rollback_floor_rejects_noncanonical_or_malformed_shapes(self) -> None:
+        release.validate_rollback_floor("bridge", release.ROLLBACK_FLOORS["bridge"])
+        release.validate_rollback_floor(
+            "bridge", {"allowed_targets": [], "forbidden_targets": ["baseline"]}
+        )
+        malformed = (
+            {"allowed_targets": ["baseline", "baseline"], "forbidden_targets": []},
+            {"allowed_targets": ["baseline"], "forbidden_targets": ["baseline"]},
+            {"allowed_targets": [], "forbidden_targets": ["baseline", "baseline"]},
+            {"allowed_targets": [], "forbidden_targets": ["unknown"]},
+            {"allowed_targets": [], "forbidden_targets": ["baseline"], "extra": []},
+            {"allowed_targets": "baseline", "forbidden_targets": []},
+            {"allowed_targets": ["bridge", "backend"], "forbidden_targets": ["baseline"]},
+        )
+        for candidate in malformed:
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(release.ReleaseError):
+                    release.validate_rollback_floor("bridge", candidate)
+
     def test_public_sanitizer_rejects_raw_topology_and_secret_keys(self) -> None:
         for value in (
             {"app_id": "11111111-1111-4111-8111-111111111111"},

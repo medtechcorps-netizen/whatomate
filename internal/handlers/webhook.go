@@ -16,12 +16,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // WebhookVerify handles Meta's webhook verification challenge
@@ -204,6 +206,7 @@ type WebhookPayload struct {
 	Object string `json:"object"`
 	Entry  []struct {
 		ID      string `json:"id"`
+		Time    int64  `json:"time,omitempty"`
 		Changes []struct {
 			Value struct {
 				MessagingProduct string `json:"messaging_product"`
@@ -212,22 +215,15 @@ type WebhookPayload struct {
 					PhoneNumberID      string `json:"phone_number_id"`
 				} `json:"metadata"`
 				// Template status update fields (when field == "message_template_status_update")
-				Event                   string `json:"event,omitempty"`
-				MessageTemplateID       int64  `json:"message_template_id,omitempty"`
-				MessageTemplateName     string `json:"message_template_name,omitempty"`
-				MessageTemplateLanguage string `json:"message_template_language,omitempty"`
-				Reason                  string `json:"reason,omitempty"`
-				Contacts                []struct {
-					Profile struct {
-						Name     string `json:"name"`
-						Username string `json:"username,omitempty"`
-					} `json:"profile"`
-					WaID   string `json:"wa_id"`
-					UserID string `json:"user_id,omitempty"` // BSUID
-				} `json:"contacts"`
-				Messages        []IncomingTextMessage `json:"messages,omitempty"`
-				Statuses        []WebhookStatus       `json:"statuses,omitempty"`
-				UserPreferences []struct {
+				Event                   string                      `json:"event,omitempty"`
+				MessageTemplateID       int64                       `json:"message_template_id,omitempty"`
+				MessageTemplateName     string                      `json:"message_template_name,omitempty"`
+				MessageTemplateLanguage string                      `json:"message_template_language,omitempty"`
+				Reason                  string                      `json:"reason,omitempty"`
+				Contacts                []CoexistenceWebhookContact `json:"contacts"`
+				Messages                []CoexistenceMessage        `json:"messages,omitempty"`
+				Statuses                []WebhookStatus             `json:"statuses,omitempty"`
+				UserPreferences         []struct {
 					WaID      string `json:"wa_id"`
 					UserID    string `json:"user_id,omitempty"`
 					Category  string `json:"category"`
@@ -258,13 +254,13 @@ type WebhookPayload struct {
 					EndTime   string          `json:"end_time,omitempty"`
 					Duration  int             `json:"duration,omitempty"`
 				} `json:"calls,omitempty"`
-				// Contact state sync fields (when field == "smb_app_state_sync")
-				Action             string `json:"action,omitempty"`
-				ContactName        string `json:"contact_name,omitempty"`
-				ContactFirstName   string `json:"contact_first_name,omitempty"`
-				ContactPhoneNumber string `json:"contact_phone_number,omitempty"`
+				// WhatsApp Business App Coexistence fields.
+				StateSync         []CoexistenceStateSyncItem `json:"state_sync,omitempty"`
+				History           []CoexistenceHistoryBatch  `json:"history,omitempty"`
+				PhoneNumber       string                     `json:"phone_number,omitempty"`
+				DisconnectionInfo *CoexistenceDisconnection  `json:"disconnection_info,omitempty"`
 				// Message echoes fields (when field == "smb_message_echoes")
-				MessageEchoes []IncomingTextMessage `json:"message_echoes,omitempty"`
+				MessageEchoes []CoexistenceMessage `json:"message_echoes,omitempty"`
 			} `json:"value"`
 			Field string `json:"field"`
 		} `json:"changes"`
@@ -289,10 +285,38 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 		a.Log.Warn("Invalid or unverifiable webhook signature")
 		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Invalid signature", nil, "")
 	}
+	webhookBodyDigest := sha256.Sum256(body)
+	webhookBodySHA256 := hex.EncodeToString(webhookBodyDigest[:])
 
 	// Process each entry
 	for _, entry := range payload.Entry {
 		for _, change := range entry.Changes {
+			// Coexistence lifecycle events are WABA-scoped and normally do not
+			// include phone-number metadata. Persist them before acknowledging so
+			// disconnected accounts cannot continue sending from a stale cache.
+			if change.Field == "account_update" && isCoexistenceLifecycleEvent(change.Value.Event) {
+				if err := a.persistCoexistenceLifecycleBeforeAck(
+					entry.ID,
+					entry.Time,
+					change.Value.Event,
+					change.Value.PhoneNumber,
+					change.Value.DisconnectionInfo,
+				); err != nil {
+					a.Log.Error("Failed to durably process coexistence lifecycle event",
+						"error", err,
+						"waba_id", entry.ID,
+						"event", change.Value.Event,
+					)
+					return r.SendErrorEnvelope(
+						fasthttp.StatusServiceUnavailable,
+						"Coexistence lifecycle persistence failed",
+						nil,
+						"",
+					)
+				}
+				continue
+			}
+
 			// Handle template status updates
 			if change.Field == "message_template_status_update" {
 				a.Log.Info("Received template status update",
@@ -368,11 +392,20 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 				phoneNumberID := change.Value.Metadata.PhoneNumberID
 				a.Log.Info("Received smb_app_state_sync event",
 					"phone_number_id", phoneNumberID,
-					"action", change.Value.Action,
-					"contact_phone_number", change.Value.ContactPhoneNumber,
-					"contact_name", change.Value.ContactName,
+					"item_count", len(change.Value.StateSync),
 				)
-				go a.processContactSync(phoneNumberID, change.Value.ContactPhoneNumber, change.Value.ContactName, change.Value.Action)
+				if err := a.persistContactStateSyncBeforeAck(phoneNumberID, change.Value.StateSync); err != nil {
+					a.Log.Error("Failed to durably process contact state sync",
+						"error", err,
+						"phone_id", phoneNumberID,
+					)
+					return r.SendErrorEnvelope(
+						fasthttp.StatusServiceUnavailable,
+						"Contact state sync persistence failed",
+						nil,
+						"",
+					)
+				}
 				continue
 			}
 
@@ -385,7 +418,48 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 						"type", echo.Type,
 						"phone_number_id", phoneNumberID,
 					)
-					go a.processMessageEcho(phoneNumberID, echo)
+				}
+				if err := a.persistMessageEchoesBeforeAck(
+					phoneNumberID,
+					change.Value.MessageEchoes,
+					change.Value.Contacts,
+				); err != nil {
+					a.Log.Error("Failed to durably process message echoes",
+						"error", err,
+						"phone_id", phoneNumberID,
+					)
+					return r.SendErrorEnvelope(
+						fasthttp.StatusServiceUnavailable,
+						"Message echo persistence failed",
+						nil,
+						"",
+					)
+				}
+				continue
+			}
+
+			// Initial history arrives as history[] phase/chunk batches. Media
+			// details can arrive later in value.messages with the same wamid.
+			if change.Field == "history" {
+				phoneNumberID := change.Value.Metadata.PhoneNumberID
+				if err := a.persistCoexistenceHistoryBeforeAck(
+					phoneNumberID,
+					change.Value.Metadata.DisplayPhoneNumber,
+					entry.Time,
+					change.Value.History,
+					change.Value.Messages,
+					change.Value.Contacts,
+				); err != nil {
+					a.Log.Error("Failed to durably process coexistence history",
+						"error", err,
+						"phone_id", phoneNumberID,
+					)
+					return r.SendErrorEnvelope(
+						fasthttp.StatusServiceUnavailable,
+						"History sync persistence failed",
+						nil,
+						"",
+					)
 				}
 				continue
 			}
@@ -403,6 +477,40 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 					"type", msg.Type,
 					"phone_number_id", phoneNumberID,
 				)
+
+				if strings.EqualFold(msg.Type, "edit") || strings.EqualFold(msg.Type, "revoke") {
+					if err := a.persistCoexistenceInboundMutationBeforeAck(
+						phoneNumberID,
+						msg,
+						change.Value.Contacts,
+					); err != nil {
+						a.Log.Error(
+							"Failed to durably process WhatsApp message mutation",
+							"error", err,
+							"phone_id", phoneNumberID,
+							"message_id", msg.ID,
+							"type", msg.Type,
+						)
+						return r.SendErrorEnvelope(
+							fasthttp.StatusServiceUnavailable,
+							"Message mutation persistence failed",
+							nil,
+							"",
+						)
+					}
+					continue
+				}
+
+				// Get contact profile name (match by phone or BSUID).
+				profileName := ""
+				for _, contact := range change.Value.Contacts {
+					if (msg.From != "" && contact.WaID == msg.From) ||
+						(msg.FromUserID != "" && contact.UserID == msg.FromUserID) ||
+						(msg.FromParentUserID != "" && contact.ParentUserID == msg.FromParentUserID) {
+						profileName = contact.Profile.Name
+						break
+					}
+				}
 
 				// Handle call permission replies before regular message processing
 				if msg.Type == "interactive" && msg.Interactive != nil &&
@@ -423,34 +531,19 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 					continue
 				}
 
-				// Get contact profile name (match by phone or BSUID)
-				profileName := ""
-				for _, contact := range change.Value.Contacts {
-					if (msg.From != "" && contact.WaID == msg.From) || (msg.FromUserID != "" && contact.UserID == msg.FromUserID) {
-						profileName = contact.Profile.Name
-						break
-					}
-				}
-
-				// If phone number is missing (username user), skip — BSUID-only messaging not yet supported
-				if msg.From == "" {
-					a.Log.Warn("Incoming message without phone number (username user), skipping",
-						"bsuid", msg.FromUserID, "message_id", msg.ID)
-					continue
-				}
-
 				// Reactions update an existing row and retain their specialized
 				// asynchronous path. Every regular inbound message crosses a
 				// durable database boundary before Meta receives HTTP 200.
 				if msg.Type == "reaction" && msg.Reaction != nil {
-					a.startSpecializedIncomingMessage(phoneNumberID, msg, profileName)
+					a.startSpecializedIncomingMessage(phoneNumberID, msg.IncomingTextMessage, profileName)
 					continue
 				}
 
-				work, duplicate, err := a.persistIncomingMessageBeforeAck(
+				work, duplicate, err := a.persistAuthenticatedIncomingMessageBeforeAck(
 					phoneNumberID,
-					msg,
+					msg.IncomingTextMessage,
 					profileName,
+					webhookBodySHA256,
 				)
 				if err != nil {
 					a.Log.Error(
@@ -482,7 +575,24 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 					"status", status.Status,
 				)
 
-				go a.processStatusUpdate(phoneNumberID, status)
+				if err := a.processStatusUpdate(phoneNumberID, status); err != nil {
+					a.Log.Error(
+						"Failed to durably process status update before acknowledgement",
+						"error", err,
+						"phone_id", phoneNumberID,
+						"message_id", status.ID,
+					)
+					// A non-2xx response asks Meta to retry. Returning 200 before
+					// the committed receipt mutation would lose an early receipt if
+					// this process exits or the matching outgoing WAMID has not yet
+					// committed.
+					return r.SendErrorEnvelope(
+						fasthttp.StatusServiceUnavailable,
+						"Status update persistence failed",
+						nil,
+						"",
+					)
+				}
 			}
 		}
 	}
@@ -581,30 +691,82 @@ func (a *App) startPersistedIncomingMessageContinuation(work *persistedIncomingM
 	}()
 }
 
-func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) {
-	if a.rlsEnabled() && !a.hasTenantScope() {
-		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
-			scoped.processStatusUpdate(phoneNumberID, status)
-			return nil
-		}); err != nil {
-			a.Log.Error("Failed to scope status update to tenant", "error", err, "phone_id", phoneNumberID)
-		}
-		return
-	}
-
+func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) (resultErr error) {
 	defer func() {
 		if r := recover(); r != nil {
 			a.Log.Error("Panic recovered in processStatusUpdate", "panic", r, "phone_id", phoneNumberID, "status_id", status.ID)
+			resultErr = fmt.Errorf("process WhatsApp status update panic: %v", r)
 		}
 	}()
 
-	messageID := status.ID
-	statusValue := status.Status
+	phoneNumberID = strings.TrimSpace(phoneNumberID)
+	messageID := strings.TrimSpace(status.ID)
+	if phoneNumberID == "" || messageID == "" {
+		return errors.New("WhatsApp status update identity is incomplete")
+	}
+	if !a.rlsEnabled() {
+		// The production resolver has an RLS-safe cardinality function. Mirror
+		// that fail-closed property in non-RLS test/development mode instead of
+		// allowing GORM's First() to choose a cross-tenant phone collision.
+		var phoneOwnerCount int64
+		if err := a.rootApp().DB.Model(&models.WhatsAppAccount{}).
+			Where("BTRIM(phone_id) = ?", phoneNumberID).
+			Count(&phoneOwnerCount).Error; err != nil {
+			return fmt.Errorf("count WhatsApp status phone authority: %w", err)
+		}
+		if phoneOwnerCount != 1 {
+			return fmt.Errorf(
+				"WhatsApp status phone authority requires exactly one owner: got %d",
+				phoneOwnerCount,
+			)
+		}
+	}
+	organizationID, err := a.resolveWhatsAppOrganization(phoneNumberID)
+	if err != nil {
+		return fmt.Errorf("resolve WhatsApp status organization: %w", err)
+	}
 
-	a.Log.Info("Processing status update", "message_id", messageID, "status", statusValue, "phone_number_id", phoneNumberID)
-
-	// Update messages table - this also handles campaign stats via incrementCampaignStat
-	a.updateMessageStatus(messageID, statusValue, status.Errors)
+	// A delivery receipt is a mutation. Always use a committed tenant
+	// transaction, including in non-RLS development/test configurations: this
+	// preserves the WAMID -> account -> contact -> message lock order and keeps
+	// the message, recipient, and campaign counter atomically consistent.
+	err = a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+		if err := database.LockWhatsAppWAMIDScopes(scoped.DB, organizationID, messageID); err != nil {
+			return err
+		}
+		var accounts []models.WhatsAppAccount
+		if err := scoped.DB.Where(
+			"organization_id = ? AND BTRIM(phone_id) = ?", organizationID, phoneNumberID,
+		).Order("id").Find(&accounts).Error; err != nil {
+			return err
+		}
+		if len(accounts) != 1 {
+			return fmt.Errorf("WhatsApp status account authority is ambiguous")
+		}
+		account := accounts[0]
+		if err := scoped.prepareWhatsAppMessageAuthority(&account); err != nil {
+			return err
+		}
+		resolved, err := scoped.resolveWhatsAppMessage(&account, whatsAppMessageLookup{
+			WAMID:            messageID,
+			Direction:        models.DirectionOutgoing,
+			Lock:             true,
+			RepairProjection: true,
+		})
+		if errors.Is(err, errWhatsAppMessageOwnerDeleted) {
+			return nil // durable tombstones reserve the WAMID but accept no replay mutation.
+		}
+		if err != nil {
+			return err
+		}
+		return scoped.updateResolvedMessageStatus(&resolved.Message, status.Status, status.Errors)
+	})
+	if err != nil {
+		a.Log.Warn("Rejected WhatsApp status update", "error", err, "phone_id", phoneNumberID, "status_id", messageID)
+		return err
+	}
+	a.Log.Info("Processed status update", "message_id", messageID, "status", status.Status, "phone_number_id", phoneNumberID)
+	return nil
 }
 
 // statusPriority returns the priority of a status (higher = more progressed)
@@ -625,27 +787,66 @@ func statusPriority(status models.MessageStatus) int {
 	}
 }
 
-// updateMessageStatus updates the status of a regular message in the messages table
-func (a *App) updateMessageStatus(whatsappMsgID, statusValue string, errors []WebhookStatusError) {
-	// Find the message by WhatsApp message ID
-	var message models.Message
-	result := a.DB.Where("whats_app_message_id = ?", whatsappMsgID).First(&message)
-	if result.Error != nil {
-		a.Log.Debug("No message found for status update", "whats_app_message_id", whatsappMsgID)
-		return
+const campaignStatusProjectionFailureMetadataKey = "campaign_status_projection_failure"
+
+type campaignStatusCounters struct {
+	sent      int
+	delivered int
+	read      int
+	failed    int
+}
+
+func campaignStatusCounterMembership(status models.MessageStatus) campaignStatusCounters {
+	switch status {
+	case models.MessageStatusSent:
+		return campaignStatusCounters{sent: 1}
+	case models.MessageStatusDelivered:
+		return campaignStatusCounters{sent: 1, delivered: 1}
+	case models.MessageStatusRead:
+		return campaignStatusCounters{sent: 1, delivered: 1, read: 1}
+	case models.MessageStatusFailed:
+		return campaignStatusCounters{failed: 1}
+	default:
+		return campaignStatusCounters{}
+	}
+}
+
+func campaignStatusCounterTransition(
+	currentStatus,
+	newStatus models.MessageStatus,
+) campaignStatusCounters {
+	current := campaignStatusCounterMembership(currentStatus)
+	next := campaignStatusCounterMembership(newStatus)
+	return campaignStatusCounters{
+		sent:      next.sent - current.sent,
+		delivered: next.delivered - current.delivered,
+		read:      next.read - current.read,
+		failed:    next.failed - current.failed,
+	}
+}
+
+// updateResolvedMessageStatus mutates a message only after processStatusUpdate
+// has proven its exact WAMID owner under the stable phone/account authority.
+// It deliberately accepts no caller-selected WAMID or account display name.
+func (a *App) updateResolvedMessageStatus(message *models.Message, statusValue string, statusErrors []WebhookStatusError) error {
+	if message == nil || message.ID == uuid.Nil || message.OrganizationID == uuid.Nil || strings.TrimSpace(message.WhatsAppMessageID) == "" {
+		return errors.New("resolved WhatsApp message status owner is incomplete")
 	}
 
 	newStatus := models.MessageStatus(statusValue)
-	currentPriority := statusPriority(message.Status)
+	currentStatus := message.Status
+	currentPriority := statusPriority(currentStatus)
 	newPriority := statusPriority(newStatus)
 
-	// Only update if new status is a progression (higher priority) or if it's failed
-	if newPriority <= currentPriority && newStatus != models.MessageStatusFailed {
+	// Accept only a strict progression. Failed already has the highest priority,
+	// so it can override every delivery status while duplicate failure receipts
+	// remain idempotent for recipient state and campaign counters.
+	if newPriority <= currentPriority {
 		a.Log.Debug("Ignoring status update - not a progression",
 			"message_id", message.ID,
 			"current_status", message.Status,
 			"new_status", statusValue)
-		return
+		return nil
 	}
 
 	updates := map[string]any{}
@@ -659,52 +860,84 @@ func (a *App) updateMessageStatus(whatsappMsgID, statusValue string, errors []We
 		updates["status"] = models.MessageStatusRead
 	case models.MessageStatusFailed:
 		updates["status"] = models.MessageStatusFailed
-		if len(errors) > 0 {
+		if len(statusErrors) > 0 {
 			// Prefer error_data.details (most descriptive), then Message, then Title.
-			errText := errors[0].ErrorData.Details
+			errText := statusErrors[0].ErrorData.Details
 			if errText == "" {
-				errText = errors[0].Message
+				errText = statusErrors[0].Message
 			}
-			if errText == "" || errText == errors[0].Title {
-				errText = errors[0].Title
+			if errText == "" || errText == statusErrors[0].Title {
+				errText = statusErrors[0].Title
 			}
 
 			updates["error_message"] = errText
 		}
 	default:
 		a.Log.Debug("Ignoring message status update", "status", statusValue)
-		return
+		return nil
 	}
 
-	if err := a.DB.Model(&message).Updates(updates).Error; err != nil {
+	if err := a.DB.Model(&models.Message{}).Where("id = ? AND organization_id = ?", message.ID, message.OrganizationID).Updates(updates).Error; err != nil {
 		a.Log.Error("Failed to update message status", "error", err, "message_id", message.ID)
-		return
+		return err
+	}
+	message.Status = newStatus
+	if errorMessage, ok := updates["error_message"].(string); ok {
+		message.ErrorMessage = errorMessage
 	}
 
 	a.Log.Info("Updated message status", "message_id", message.ID, "status", statusValue)
 
-	// Update campaign stats and recipient status if this is a campaign message
+	// Update campaign stats and recipient status if this is a campaign message.
+	// The Message is the receipt authority; campaign rows are a denormalized
+	// projection. Isolate that projection behind a savepoint so a deleted or
+	// inconsistent campaign cannot make an otherwise-valid provider receipt an
+	// endless retry. A durable marker on the Message preserves repair evidence.
 	if message.Metadata != nil {
 		if campaignID, ok := message.Metadata["campaign_id"].(string); ok && campaignID != "" {
-			a.incrementCampaignStat(campaignID, statusValue)
-
-			// Update the BulkMessageRecipient status and timestamps
-			recipientUpdates := map[string]any{
-				"status": newStatus,
+			campaignUUID, err := uuid.Parse(campaignID)
+			var campaign models.BulkMessageCampaign
+			projectionErr := err
+			if projectionErr == nil {
+				projectionErr = a.DB.Transaction(func(projectionTx *gorm.DB) error {
+					var projectionErr error
+					campaign, projectionErr = updateCampaignStatusProjection(
+						projectionTx,
+						message,
+						campaignUUID,
+						currentStatus,
+						newStatus,
+						updates,
+					)
+					return projectionErr
+				})
 			}
-			switch newStatus {
-			case models.MessageStatusDelivered:
-				recipientUpdates["delivered_at"] = time.Now()
-			case models.MessageStatusRead:
-				recipientUpdates["read_at"] = time.Now()
-			case models.MessageStatusFailed:
-				if errMsg, ok := updates["error_message"].(string); ok && errMsg != "" {
-					recipientUpdates["error_message"] = errMsg
+			if projectionErr != nil {
+				if markerErr := a.persistCampaignStatusProjectionFailure(
+					message,
+					campaignID,
+					newStatus,
+					projectionErr,
+				); markerErr != nil {
+					return fmt.Errorf(
+						"persist campaign status projection failure: %w (projection error: %v)",
+						markerErr,
+						projectionErr,
+					)
 				}
+				a.Log.Warn(
+					"Deferred campaign status projection after settling provider receipt",
+					"error", projectionErr,
+					"campaign_id", campaignID,
+					"message_id", message.ID,
+					"status", newStatus,
+				)
+			} else {
+				if err := a.clearCampaignStatusProjectionFailure(message); err != nil {
+					return err
+				}
+				a.broadcastCampaignStatusProjection(campaign)
 			}
-			a.DB.Model(&models.BulkMessageRecipient{}).
-				Where("whats_app_message_id = ?", whatsappMsgID).
-				Updates(recipientUpdates)
 		}
 	}
 
@@ -725,6 +958,153 @@ func (a *App) updateMessageStatus(whatsappMsgID, statusValue string, errors []We
 		Status:         statusValue,
 		OccurredAt:     time.Now().UTC(),
 	}, &fallback)
+	return nil
+}
+
+func updateCampaignStatusProjection(
+	tx *gorm.DB,
+	message *models.Message,
+	campaignID uuid.UUID,
+	currentStatus,
+	newStatus models.MessageStatus,
+	messageUpdates map[string]any,
+) (models.BulkMessageCampaign, error) {
+	var campaign models.BulkMessageCampaign
+	if tx == nil || message == nil {
+		return campaign, errors.New("campaign status projection identity is incomplete")
+	}
+	if err := tx.Where(
+		"id = ? AND organization_id = ?",
+		campaignID,
+		message.OrganizationID,
+	).First(&campaign).Error; err != nil {
+		return campaign, fmt.Errorf("load campaign status owner: %w", err)
+	}
+
+	recipientUpdates := map[string]any{"status": newStatus}
+	now := time.Now().UTC()
+	switch newStatus {
+	case models.MessageStatusDelivered:
+		recipientUpdates["delivered_at"] = now
+	case models.MessageStatusRead:
+		recipientUpdates["read_at"] = now
+	case models.MessageStatusFailed:
+		if errMsg, ok := messageUpdates["error_message"].(string); ok && errMsg != "" {
+			recipientUpdates["error_message"] = errMsg
+		}
+	}
+	recipientResult := tx.Model(&models.BulkMessageRecipient{}).
+		Where(
+			"campaign_id = ? AND message_id = ? AND whats_app_message_id = ?",
+			campaign.ID,
+			message.ID,
+			message.WhatsAppMessageID,
+		).
+		Updates(recipientUpdates)
+	if recipientResult.Error != nil {
+		return campaign, fmt.Errorf("update campaign recipient status: %w", recipientResult.Error)
+	}
+	if recipientResult.RowsAffected != 1 {
+		return campaign, errors.New("campaign recipient status owner is missing or ambiguous")
+	}
+
+	delta := campaignStatusCounterTransition(currentStatus, newStatus)
+	counterUpdates := make(map[string]any, 4)
+	addCampaignCounterDelta(counterUpdates, "sent_count", delta.sent)
+	addCampaignCounterDelta(counterUpdates, "delivered_count", delta.delivered)
+	addCampaignCounterDelta(counterUpdates, "read_count", delta.read)
+	addCampaignCounterDelta(counterUpdates, "failed_count", delta.failed)
+	if len(counterUpdates) == 0 {
+		return campaign, nil
+	}
+	result := tx.Model(&campaign).
+		Clauses(clause.Returning{}).
+		Where("id = ? AND organization_id = ?", campaign.ID, message.OrganizationID).
+		Updates(counterUpdates)
+	if result.Error != nil {
+		return campaign, fmt.Errorf("update campaign status counters: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return campaign, errors.New("campaign counter owner changed")
+	}
+	return campaign, nil
+}
+
+func addCampaignCounterDelta(updates map[string]any, column string, delta int) {
+	if delta == 0 {
+		return
+	}
+	updates[column] = gorm.Expr("GREATEST("+column+" + ?, 0)", delta)
+}
+
+func (a *App) persistCampaignStatusProjectionFailure(
+	message *models.Message,
+	campaignID string,
+	status models.MessageStatus,
+	projectionErr error,
+) error {
+	if message == nil || projectionErr == nil {
+		return errors.New("campaign projection failure marker is incomplete")
+	}
+	metadata := cloneOutgoingMessageMetadata(message.Metadata)
+	metadata[campaignStatusProjectionFailureMetadataKey] = map[string]any{
+		"campaign_id": campaignID,
+		"status":      string(status),
+		"error":       projectionErr.Error(),
+		"recorded_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	result := a.DB.Model(&models.Message{}).
+		Where("id = ? AND organization_id = ?", message.ID, message.OrganizationID).
+		Update("metadata", metadata)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("campaign projection failure message owner changed")
+	}
+	message.Metadata = metadata
+	return nil
+}
+
+func (a *App) clearCampaignStatusProjectionFailure(message *models.Message) error {
+	if message == nil || message.Metadata == nil {
+		return nil
+	}
+	if _, exists := message.Metadata[campaignStatusProjectionFailureMetadataKey]; !exists {
+		return nil
+	}
+	metadata := cloneOutgoingMessageMetadata(message.Metadata)
+	delete(metadata, campaignStatusProjectionFailureMetadataKey)
+	result := a.DB.Model(&models.Message{}).
+		Where("id = ? AND organization_id = ?", message.ID, message.OrganizationID).
+		Update("metadata", metadata)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("campaign projection repair message owner changed")
+	}
+	message.Metadata = metadata
+	return nil
+}
+
+func (a *App) broadcastCampaignStatusProjection(campaign models.BulkMessageCampaign) {
+	if a == nil || a.WSHub == nil || campaign.ID == uuid.Nil || campaign.OrganizationID == uuid.Nil {
+		return
+	}
+	a.afterTenantCommit(func() {
+		a.rootApp().WSHub.BroadcastToOrg(campaign.OrganizationID, websocket.WSMessage{
+			Type: websocket.TypeCampaignStatsUpdate,
+			Payload: map[string]any{
+				"campaign_id":     campaign.ID.String(),
+				"status":          campaign.Status,
+				"sent_count":      campaign.SentCount,
+				"delivered_count": campaign.DeliveredCount,
+				"read_count":      campaign.ReadCount,
+				"failed_count":    campaign.FailedCount,
+			},
+		})
+	})
 }
 
 // processTemplateStatusUpdate updates template status when Meta sends a status update webhook
@@ -819,8 +1199,35 @@ func (a *App) verifyMetaWebhookPayload(body, signature []byte, payload *WebhookP
 	for _, entry := range payload.Entry {
 		for _, change := range entry.Changes {
 			verifiedAnyTarget = true
+			lifecycleChange := change.Field == "account_update" && isCoexistenceLifecycleEvent(change.Value.Event)
 			phoneNumberID := strings.TrimSpace(change.Value.Metadata.PhoneNumberID)
-			if phoneNumberID != "" {
+			if lifecycleChange && phoneNumberID != "" {
+				// Lifecycle dispatch targets entry.ID, not the metadata phone.
+				// Check current ownership in the DB: a stale phone cache after a
+				// WABA rebind must not authorize offboarding the prior WABA.
+				orgID, err := a.resolveWhatsAppOrganization(phoneNumberID)
+				if err != nil {
+					return false
+				}
+				phoneVerified := false
+				err = a.WithTenantApp(orgID, func(scoped *App) error {
+					var account models.WhatsAppAccount
+					if err := scoped.DB.Where(
+						"organization_id = ? AND BTRIM(phone_id) = ? AND business_id = ?",
+						orgID, phoneNumberID, strings.TrimSpace(entry.ID),
+					).First(&account).Error; err != nil {
+						return err
+					}
+					_, effectiveSecret, _, err := scoped.resolveEffectiveMetaAppCredsScoped(&account)
+					phoneVerified = err == nil && strings.TrimSpace(effectiveSecret) != "" &&
+						verifyWebhookSignature(body, signature, []byte(effectiveSecret))
+					return err
+				})
+				if err != nil || !phoneVerified {
+					return false
+				}
+			}
+			if phoneNumberID != "" && !lifecycleChange {
 				verified, checked := verifiedPhoneIDs[phoneNumberID]
 				if !checked {
 					account, err := a.getWhatsAppAccountCached(phoneNumberID)
@@ -875,7 +1282,7 @@ func (a *App) verifyMetaWABAPayload(body, signature []byte, wabaID string) bool 
 		tenantVerified := false
 		if err := a.WithTenantApp(organizationID, func(scoped *App) error {
 			var accounts []models.WhatsAppAccount
-			if err := scoped.DB.Where("business_id = ?", wabaID).Find(&accounts).Error; err != nil {
+			if err := scoped.DB.Where("organization_id = ? AND business_id = ?", organizationID, wabaID).Find(&accounts).Error; err != nil {
 				return err
 			}
 			if len(accounts) == 0 {
@@ -968,6 +1375,17 @@ func (a *App) processMarketingPreference(
 
 	var updated models.Contact
 	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		// Marketing consent is a tenant-wide automatic-reply policy mutation.
+		// Take the organization writer lock before any account or contact lock so
+		// a STOP/RESUME webhook cannot commit across an in-flight AI provider
+		// attempt that already made its final policy decision.
+		if lockErr := database.LockOrganizationPolicyScope(
+			tx,
+			account.OrganizationID,
+		); lockErr != nil {
+			return fmt.Errorf("lock marketing preference policy scope: %w", lockErr)
+		}
+
 		contact, findErr := findMarketingPreferenceContact(
 			tx,
 			account.OrganizationID,
@@ -1098,195 +1516,5 @@ func marketingPreferenceOptOut(value string) (bool, error) {
 		return false, nil
 	default:
 		return false, fmt.Errorf("unsupported marketing preference %q", value)
-	}
-}
-
-// processMessageEcho handles mirroring of messages sent from the mobile WhatsApp Business App.
-func (a *App) processMessageEcho(phoneNumberID string, msg IncomingTextMessage) {
-	if a.rlsEnabled() && !a.hasTenantScope() {
-		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
-			scoped.processMessageEcho(phoneNumberID, msg)
-			return nil
-		}); err != nil {
-			a.Log.Error("Failed to scope message echo to tenant", "error", err, "phone_id", phoneNumberID)
-		}
-		return
-	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			a.Log.Error("Panic recovered in processMessageEcho", "panic", r, "phone_id", phoneNumberID, "message_id", msg.ID)
-		}
-	}()
-
-	// Find the WhatsApp account by phone_number_id (use cache)
-	account, err := a.getWhatsAppAccountCached(phoneNumberID)
-	if err != nil {
-		a.Log.Error("WhatsApp account not found for echo", "phone_id", phoneNumberID, "error", err)
-		return
-	}
-
-	// Check for duplicate message - Meta sometimes sends the same message multiple times
-	if msg.ID != "" {
-		var existingMsg models.Message
-		if err := a.DB.Where(
-			"organization_id = ? AND whats_app_account = ? AND whats_app_message_id = ?",
-			account.OrganizationID,
-			account.Name,
-			msg.ID,
-		).First(&existingMsg).Error; err == nil {
-			a.Log.Debug("Duplicate echo message detected, skipping", "message_id", msg.ID)
-			return
-		}
-	}
-
-	// Get or create contact (always do this for all echoed messages)
-	// For message echoes, the message is sent TO the contact FROM the business.
-	contactPhone := msg.To
-	if contactPhone == "" {
-		a.Log.Warn("Message echo missing 'to' field, falling back to 'from'", "from", msg.From)
-		contactPhone = msg.From
-	}
-
-	contact, _, err := a.getOrCreateInboundContact(account, contactPhone, "", msg.FromUserID)
-	if err != nil {
-		a.Log.Error("Failed to get or create contact for echo", "phone", contactPhone, "error", err)
-		return
-	}
-
-	// Store BSUID without allowing this optional metadata write to abort the
-	// message-echo transaction.
-	a.updateContactBSUID(contact, msg.FromUserID)
-
-	// Get message content - handle text and media
-	extracted := a.extractMessageContent(context.Background(), msg, account)
-	messageText := extracted.Text
-	messageType := extracted.Type
-	mediaInfo := extracted.Media
-
-	// Save message as outgoing, status sent
-	now := time.Now()
-	message := models.Message{
-		BaseModel:         models.BaseModel{ID: uuid.New()},
-		OrganizationID:    account.OrganizationID,
-		WhatsAppAccount:   account.Name,
-		ContactID:         contact.ID,
-		WhatsAppMessageID: msg.ID,
-		Direction:         models.DirectionOutgoing,
-		MessageType:       models.MessageType(messageType),
-		Content:           messageText,
-		Status:            models.MessageStatusSent,
-	}
-
-	// Reply context
-	if msg.Context != nil && msg.Context.ID != "" {
-		var replyToMsg models.Message
-		if err := a.DB.Where("whats_app_message_id = ?", msg.Context.ID).First(&replyToMsg).Error; err == nil {
-			message.IsReply = true
-			message.ReplyToMessageID = &replyToMsg.ID
-		}
-	}
-
-	// Add media fields if present
-	if mediaInfo != nil {
-		message.MediaURL = mediaInfo.MediaURL
-		message.MediaMimeType = mediaInfo.MediaMimeType
-		message.MediaFilename = mediaInfo.MediaFilename
-	}
-
-	if err := a.DB.Create(&message).Error; err != nil {
-		a.Log.Error("Failed to save echoed message", "error", err)
-		return
-	}
-
-	// Update contact's last message info
-	preview := messageText
-	if len(preview) > 100 {
-		preview = preview[:97] + "..."
-	}
-	if messageType != "text" && messageType != "button_reply" && messageType != "nfm_reply" {
-		preview = "[" + messageType + "]"
-	}
-
-	a.DB.Model(contact).Updates(map[string]any{
-		"last_message_at":      now,
-		"last_message_preview": preview,
-		"is_read":              true, // Echoes from mobile app are outgoing, so conversation is read
-		"whats_app_account":    account.Name,
-	})
-	// Under RLS this callback is still inside the phone-scoped tenant
-	// transaction and already touched Contact/Message. Defer the normalized
-	// mirror to its own committed tenant phase to preserve global lock order.
-	a.mirrorLegacyWhatsAppMessageAfterCommit(account, message.ID)
-
-	// Broadcast new message via WebSocket to keep UI updated
-	a.broadcastNewMessage(account.OrganizationID, &message, contact)
-
-	// Dispatch webhook for outgoing message
-	a.DispatchWebhook(account.OrganizationID, models.WebhookEventMessageOutgoing, MessageEventData{
-		MessageID:       message.ID.String(),
-		ContactID:       contact.ID.String(),
-		ContactPhone:    contact.PhoneNumber,
-		ContactName:     contact.ProfileName,
-		MessageType:     models.MessageType(messageType),
-		Content:         messageText,
-		WhatsAppAccount: account.Name,
-		Direction:       models.DirectionOutgoing,
-	})
-}
-
-// processContactSync handles contact additions and deletions from the mobile app address book.
-func (a *App) processContactSync(phoneNumberID, contactPhone, contactName, action string) {
-	if a.rlsEnabled() && !a.hasTenantScope() {
-		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
-			scoped.processContactSync(phoneNumberID, contactPhone, contactName, action)
-			return nil
-		}); err != nil {
-			a.Log.Error("Failed to scope contact sync to tenant", "error", err, "phone_id", phoneNumberID)
-		}
-		return
-	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			a.Log.Error("Panic recovered in processContactSync", "panic", r, "phone_id", phoneNumberID, "phone", contactPhone)
-		}
-	}()
-
-	// Find the WhatsApp account by phone_number_id (use cache)
-	account, err := a.getWhatsAppAccountCached(phoneNumberID)
-	if err != nil {
-		a.Log.Error("WhatsApp account not found for contact sync", "phone_id", phoneNumberID, "error", err)
-		return
-	}
-
-	switch action {
-	case "add":
-		contact, isNewContact, err := a.getOrCreateInboundContact(
-			account,
-			contactPhone,
-			contactName,
-			"",
-		)
-		if err != nil {
-			a.Log.Error("Failed to sync new contact from app state sync", "phone", contactPhone, "error", err)
-			return
-		}
-
-		a.Log.Info("Synced contact (add) from mobile app", "contact_id", contact.ID, "is_new", isNewContact)
-	case "remove":
-		// Try to find the contact first using the FindContact helper
-		contact, err := contactutil.FindContact(a.DB, account.OrganizationID, contactPhone)
-		if err == nil {
-			if err := a.DB.Delete(contact).Error; err != nil {
-				a.Log.Error("Failed to delete contact on sync remove", "contact_id", contact.ID, "error", err)
-			} else {
-				a.Log.Info("Soft-deleted synced contact (remove) from mobile app", "contact_id", contact.ID, "phone", contactPhone)
-			}
-		} else {
-			a.Log.Info("Contact not found for sync remove", "phone", contactPhone)
-		}
-	default:
-		a.Log.Warn("Unknown contact sync action", "action", action)
 	}
 }

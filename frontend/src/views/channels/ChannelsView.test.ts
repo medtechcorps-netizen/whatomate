@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   refreshUnread: vi.fn(),
   sendChannelMessage: vi.fn(),
   sendLegacyWhatsAppReply: vi.fn(),
+  setAIState: vi.fn(),
   hasPermission: vi.fn(),
   hasProductEntitlement: vi.fn(),
   connectWebSocket: vi.fn(),
@@ -45,6 +46,18 @@ vi.mock('@vueuse/core', () => ({
   useMediaQuery: () => ref(false),
 }))
 
+// The identity-review dialog has its own focused contract tests. Keeping it
+// stubbed here isolates channel polling/control behavior and prevents this
+// suite's deliberately narrow @vueuse mock from leaking into the dialog.
+vi.mock('@/components/chat/ContactIdentityReviewDialog.vue', () => ({
+  default: {
+    name: 'ContactIdentityReviewDialog',
+    props: ['open', 'contactId', 'effectiveState', 'canReview', 'canViewStaged'],
+    emits: ['update:open', 'resolved'],
+    template: '<div data-testid="identity-review-dialog-stub" :data-open="String(open)" />',
+  },
+}))
+
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => ({
     organizationId: 'organization-1',
@@ -54,15 +67,16 @@ vi.mock('@/stores/auth', () => ({
   }),
 }))
 
-vi.mock('@/stores/organizations', () => ({
-  useOrganizationsStore: () => ({
-    get selectedOrgId() {
-      return mocks.organizationStore.selectedOrgId
-    },
+vi.mock('@/stores/organizations', async () => {
+  const { reactive } = await import('vue')
+  const store = reactive({
+    selectedOrgId: mocks.organizationStore.selectedOrgId,
     blockOrganizationSwitch: mocks.blockOrganizationSwitch,
     unblockOrganizationSwitch: mocks.unblockOrganizationSwitch,
-  }),
-}))
+  })
+  mocks.organizationStore = store
+  return { useOrganizationsStore: () => store }
+})
 
 vi.mock('@/stores/omnichannelUnread', () => ({
   useOmnichannelUnreadStore: () => ({
@@ -86,6 +100,7 @@ vi.mock('@/services/productSuite', () => ({
     markRead: mocks.markRead,
     send: mocks.sendChannelMessage,
     replyLegacyWhatsApp: mocks.sendLegacyWhatsAppReply,
+    setAIState: mocks.setAIState,
   },
 }))
 
@@ -130,11 +145,14 @@ vi.mock('@/services/websocket', () => ({
 }))
 
 interface InboxOptions {
+  channel?: 'whatsapp' | 'instagram'
   selectedProvider?: string
   legacyReplyEndpoint?: boolean
   serviceWindowEndsAt?: string
   includeOtherLegacyAccount?: boolean
   unreadCount?: number
+  aiPaused?: boolean
+  effectiveAIState?: Record<string, unknown>
 }
 
 let wrapper: VueWrapper | null = null
@@ -191,7 +209,7 @@ function delayLegacyReplyDigestForValidation() {
 function setInbox(options: InboxOptions = {}) {
   const selectedAccount = {
     id: 'channel-account-selected',
-    channel: 'whatsapp',
+    channel: options.channel ?? 'whatsapp',
     provider: options.selectedProvider ?? 'meta_legacy',
     name: 'Selected WhatsApp',
     status: 'active',
@@ -205,6 +223,7 @@ function setInbox(options: InboxOptions = {}) {
       reply_route: 'chat',
       legacy_read_only: true,
       outbound_enabled: false,
+      ai_reply_enabled: true,
     },
     has_credentials: true,
     outbox_pending: 0,
@@ -227,6 +246,7 @@ function setInbox(options: InboxOptions = {}) {
         reply_route: 'chat',
         legacy_read_only: true,
         outbound_enabled: false,
+        ai_reply_enabled: true,
       },
     })
   }
@@ -234,14 +254,21 @@ function setInbox(options: InboxOptions = {}) {
     id: 'conversation-1',
     channel_account_id: selectedAccount.id,
     contact_id: 'contact-1',
-    channel: 'whatsapp',
+    channel: options.channel ?? 'whatsapp',
     external_conversation_id: 'external-conversation-1',
     status: 'open',
     service_window_ends_at:
       options.serviceWindowEndsAt ??
       '2099-01-01T00:00:00.000Z',
     unread_count: options.unreadCount ?? 0,
-    ai_paused: false,
+    ai_paused: options.aiPaused ?? false,
+    identity_review_ai_state: options.effectiveAIState ?? {
+      known: true,
+      ai_allowed: true,
+      blocked: false,
+      open_hold_count: 0,
+      reason: 'no_open_identity_review',
+    },
     contact: {
       id: 'contact-1',
       profile_name: 'Customer One',
@@ -923,6 +950,387 @@ describe('ChannelsView messaging behavior', () => {
     const message = transcript.get('[data-testid="omnichannel-message"]')
     expect(message.attributes('data-message-id')).toBe('message-selector-1')
     expect(message.attributes('data-message-direction')).toBe('incoming')
+  })
+
+  it('polls a newly arriving identity hold into the selected conversation', async () => {
+    vi.useFakeTimers()
+    try {
+      const { conversation } = setInbox()
+      const view = await mountAndSelectConversation()
+      expect(view.find('[data-testid="channel-identity-review"]').exists()).toBe(false)
+
+      mocks.conversations.mockResolvedValue({
+        data: {
+          data: {
+            conversations: [{
+              ...conversation,
+              identity_review_ai_state: {
+                known: true,
+                ai_allowed: false,
+                blocked: true,
+                open_hold_count: 1,
+                reason: 'identity_review_open',
+                latest_hold_id: 'hold-new',
+              },
+            }],
+            total: 1,
+          },
+        },
+      })
+
+      inboxActivityHandler?.({ type: 'new_message' })
+      await vi.advanceTimersByTimeAsync(300)
+      await flushPromises()
+
+      expect(view.get('[data-testid="channel-identity-review"]').text())
+        .toContain('Identity review')
+      expect(view.get('[data-testid="omnichannel-message-list"]')
+        .attributes('data-conversation-id')).toBe('conversation-1')
+    } finally {
+      wrapper?.unmount()
+      wrapper = null
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps and reconciles the canonical off-page selection when the visible total shrinks', async () => {
+    vi.useFakeTimers()
+    try {
+      const { conversation } = setInbox()
+      const secondConversation = {
+        ...conversation,
+        id: 'conversation-2',
+        contact_id: 'contact-2',
+        external_conversation_id: 'external-conversation-2',
+        contact: {
+          id: 'contact-2',
+          profile_name: 'Customer Two',
+          phone_number: '+60222222222',
+        },
+      }
+      mocks.conversations
+        .mockResolvedValueOnce({
+          data: { data: { conversations: [conversation], total: 2 } },
+        })
+        .mockResolvedValueOnce({
+          data: { data: { conversations: [secondConversation], total: 2 } },
+        })
+        .mockResolvedValueOnce({
+          data: { data: { conversations: [conversation], total: 1 } },
+        })
+        .mockResolvedValueOnce({
+          data: {
+            data: {
+              conversations: [{
+                ...secondConversation,
+                contact_id: 'canonical-contact-2',
+                contact: {
+                  id: 'canonical-contact-2',
+                  profile_name: 'Canonical Customer Two',
+                  phone_number: '+60222222222',
+                },
+                identity_review_ai_state: {
+                  known: true,
+                  ai_allowed: false,
+                  blocked: true,
+                  open_hold_count: 1,
+                  reason: 'identity_review_open',
+                  latest_hold_id: 'hold-off-page',
+                },
+              }],
+              total: 1,
+            },
+          },
+        })
+      const view = await mountAndSelectConversation()
+
+      const loadMore = view.findAll('button')
+        .find(button => button.text().includes('Load more conversations'))
+      expect(loadMore).toBeDefined()
+      await loadMore!.trigger('click')
+      await flushPromises()
+      const secondButton = view.findAll('button')
+        .find(button => button.text().includes('Customer Two'))
+      expect(secondButton).toBeDefined()
+      await secondButton!.trigger('click')
+      await flushPromises()
+
+      await (view.vm as any).load(true)
+      await flushPromises()
+
+      expect(mocks.conversations).toHaveBeenNthCalledWith(4, {
+        conversation_id: 'conversation-2',
+        page: 1,
+        limit: 1,
+      })
+      expect((view.vm as any).conversationTotal).toBe(1)
+      expect((view.vm as any).conversations.map((item: { id: string }) => item.id))
+        .toEqual(['conversation-1'])
+      expect((view.vm as any).selectedConversation.id).toBe('conversation-2')
+      expect((view.vm as any).selectedConversation.contact_id).toBe('canonical-contact-2')
+      expect((view.vm as any).selectedConversation.contact.id).toBe('canonical-contact-2')
+      expect((view.vm as any).selectedConversation.identity_review_ai_state.latest_hold_id)
+        .toBe('hold-off-page')
+      expect(view.get('[data-testid="channel-identity-review"]').text())
+        .toContain('Identity review')
+    } finally {
+      wrapper?.unmount()
+      wrapper = null
+      vi.useRealTimers()
+    }
+  })
+
+  it('retains an off-page selection fail-closed when its canonical lookup fails', async () => {
+    setInbox()
+    const view = await mountAndSelectConversation()
+    const resizeObserver = mocks.resizeObservers[0]
+    expect(resizeObserver).toBeDefined()
+    mocks.conversations
+      .mockResolvedValueOnce({
+        data: { data: { conversations: [], total: 0 } },
+      })
+      .mockRejectedValueOnce(new Error('canonical conversation unavailable'))
+
+    await (view.vm as any).load(true)
+    await flushPromises()
+
+    expect(mocks.conversations).toHaveBeenNthCalledWith(3, {
+      conversation_id: 'conversation-1',
+      page: 1,
+      limit: 1,
+    })
+    expect((view.vm as any).selectedConversation.id).toBe('conversation-1')
+    expect((view.vm as any).selectedConversation.identity_review_ai_state).toEqual({
+      known: false,
+      ai_allowed: false,
+      blocked: true,
+      open_hold_count: 0,
+      reason: 'identity_review_state_unavailable',
+    })
+    expect(resizeObserver.disconnect).not.toHaveBeenCalled()
+    expect(view.find('[data-testid="omnichannel-message-list"]').exists()).toBe(true)
+  })
+
+  it('keeps a resolved identity state ahead of an older in-flight list response', async () => {
+    const { selectedAccount, conversation } = setInbox({ channel: 'instagram', selectedProvider: 'relay' })
+    const view = await mountAndSelectConversation()
+    const oldAccounts = deferred<unknown>()
+    const oldConversations = deferred<unknown>()
+    const canonicalAccounts = deferred<unknown>()
+    const canonicalConversations = deferred<unknown>()
+    const resolvedState = {
+      known: true,
+      ai_allowed: false,
+      blocked: true,
+      open_hold_count: 1,
+      latest_generation: 8,
+      reason: 'identity_review_open',
+    }
+    const staleConversation = {
+      ...conversation,
+      identity_review_ai_state: {
+        known: true,
+        ai_allowed: true,
+        blocked: false,
+        open_hold_count: 0,
+        reason: 'no_open_identity_review',
+      },
+    }
+    mocks.accounts
+      .mockReturnValueOnce(oldAccounts.promise)
+      .mockReturnValueOnce(canonicalAccounts.promise)
+    mocks.conversations
+      .mockReturnValueOnce(oldConversations.promise)
+      .mockReturnValueOnce(canonicalConversations.promise)
+
+    void (view.vm as any).load(true)
+    await Promise.resolve()
+
+    view.findComponent({ name: 'ContactIdentityReviewDialog' }).vm.$emit('resolved', resolvedState)
+    await nextTick()
+
+    expect(view.get('[data-testid="channel-identity-review"]').text()).toContain('Identity review')
+    expect((view.vm as any).selectedConversation.identity_review_ai_state).toEqual(resolvedState)
+    oldAccounts.resolve({ data: { data: { accounts: [selectedAccount] } } })
+    oldConversations.resolve({
+      data: {
+        data: {
+          conversations: [staleConversation],
+          total: 1,
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(mocks.conversations).toHaveBeenCalledTimes(3)
+    expect((view.vm as any).selectedConversation.identity_review_ai_state).toEqual(resolvedState)
+    expect(view.get('[data-testid="channel-identity-review"]').text()).toContain('Identity review')
+
+    canonicalAccounts.resolve({ data: { data: { accounts: [selectedAccount] } } })
+    canonicalConversations.resolve({
+      data: {
+        data: {
+          conversations: [{ ...conversation, identity_review_ai_state: resolvedState }],
+          total: 1,
+        },
+      },
+    })
+    await flushPromises()
+    expect((view.vm as any).selectedConversation.identity_review_ai_state).toEqual(resolvedState)
+  })
+
+  it('labels unavailable AI state without presenting an unusable review action', async () => {
+    setInbox({
+      channel: 'instagram',
+      selectedProvider: 'relay',
+      effectiveAIState: {
+        known: false,
+        ai_allowed: false,
+        blocked: true,
+        open_hold_count: 0,
+        reason: 'identity_review_read_failed',
+      },
+    })
+    const view = await mountAndSelectConversation()
+
+    expect(view.text()).toContain('AI status unavailable')
+    expect(view.find('[data-testid="channel-identity-review"]').exists()).toBe(false)
+  })
+
+  it('withholds identity-review affordances without the dedicated review permission', async () => {
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      (action === 'write' && resource === 'contacts')
+      || (action === 'read' && resource === 'conversations'),
+    )
+    setInbox({
+      channel: 'instagram',
+      selectedProvider: 'relay',
+      effectiveAIState: {
+        known: true,
+        ai_allowed: false,
+        blocked: true,
+        open_hold_count: 1,
+        reason: 'identity_review_open',
+      },
+    })
+    const view = await mountAndSelectConversation()
+
+    expect(view.find('[data-testid="channel-identity-review"]').exists()).toBe(false)
+    expect(view.findComponent({ name: 'ContactIdentityReviewDialog' }).props('canReview')).toBe(false)
+  })
+
+  it('invalidates colliding old-workspace responses and clears protected conversation state', async () => {
+    const blockedState = {
+      known: true,
+      ai_allowed: false,
+      blocked: true,
+      open_hold_count: 1,
+      latest_generation: 3,
+      reason: 'identity_review_open',
+    }
+    const { selectedAccount, conversation } = setInbox({ effectiveAIState: blockedState })
+    const view = await mountAndSelectConversation()
+    await view.get('[data-testid="channel-identity-review"]').trigger('click')
+    expect(view.get('[data-testid="identity-review-dialog-stub"]').attributes('data-open')).toBe('true')
+
+    const oldAccounts = deferred<unknown>()
+    const oldConversations = deferred<unknown>()
+    mocks.accounts
+      .mockReturnValueOnce(oldAccounts.promise)
+      .mockResolvedValue({ data: { data: { accounts: [{ ...selectedAccount, name: 'New workspace account' }] } } })
+    mocks.conversations
+      .mockReturnValueOnce(oldConversations.promise)
+      .mockResolvedValue({
+        data: {
+          data: {
+            conversations: [{
+              ...conversation,
+              contact: { ...conversation.contact, profile_name: 'New workspace customer' },
+            }],
+            total: 1,
+          },
+        },
+      })
+
+    void (view.vm as any).load(true)
+    await Promise.resolve()
+    mocks.organizationStore.selectedOrgId = 'organization-2'
+    await nextTick()
+
+    expect(view.find('[data-testid="omnichannel-message-list"]').exists()).toBe(false)
+    expect(view.get('[data-testid="identity-review-dialog-stub"]').attributes('data-open')).toBe('false')
+
+    oldAccounts.resolve({
+      data: { data: { accounts: [{ ...selectedAccount, name: 'Old workspace account' }] } },
+    })
+    oldConversations.resolve({
+      data: {
+        data: {
+          conversations: [{
+            ...conversation,
+            contact: { ...conversation.contact, profile_name: 'Old workspace customer' },
+          }],
+          total: 1,
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(mocks.conversations).toHaveBeenCalledTimes(3)
+    expect(view.text()).toContain('New workspace customer')
+    expect(view.text()).not.toContain('Old workspace customer')
+    expect(view.find('[data-testid="omnichannel-message-list"]').exists()).toBe(false)
+  })
+
+  it('does not claim AI resumed when the control response remains identity-blocked', async () => {
+    setInbox({
+      channel: 'instagram',
+      selectedProvider: 'relay',
+      aiPaused: true,
+      effectiveAIState: {
+        known: true,
+        ai_allowed: false,
+        blocked: true,
+        open_hold_count: 1,
+        reason: 'identity_review_open',
+        latest_hold_id: 'hold-1',
+      },
+    })
+    mocks.setAIState.mockResolvedValue({
+      data: {
+        data: {
+          conversation_id: 'conversation-1',
+          ai_paused: false,
+          identity_review_ai_state: {
+            known: true,
+            ai_allowed: false,
+            blocked: true,
+            open_hold_count: 1,
+            reason: 'identity_review_open',
+            latest_hold_id: 'hold-1',
+          },
+        },
+      },
+    })
+    const view = await mountAndSelectConversation()
+    mocks.toastSuccess.mockClear()
+    mocks.toastWarning.mockClear()
+
+    expect(view.get('[data-testid="conversation-ai-toggle"]').attributes('aria-label'))
+      .toBe('End conversation pause')
+
+    await view.get('[data-testid="conversation-ai-toggle"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.setAIState).toHaveBeenCalledWith('conversation-1', false)
+    expect(mocks.toastSuccess).not.toHaveBeenCalledWith(
+      'AI replies resumed',
+      expect.anything(),
+    )
+    expect(mocks.toastWarning).toHaveBeenCalledWith(
+      'Conversation pause removed',
+      expect.stringContaining('identity review'),
+    )
   })
 
   it('follows late transcript reflow only while the reader remains at the bottom', async () => {

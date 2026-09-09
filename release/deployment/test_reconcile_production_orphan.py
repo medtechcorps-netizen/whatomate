@@ -241,6 +241,82 @@ def valid_intent() -> dict[str, Any]:
     return common.validate_mutation_intent(intent)
 
 
+def valid_hardened_rollback_intent() -> dict[str, Any]:
+    intent = valid_intent()
+    before = desired_public_state()
+    desired = desired_projection()
+    desired["canonical_spec_sha256"] = sha("c")
+    desired["images"] = image_records("d")
+    desired["migration_digest"] = digest("d")
+    current_binding = artifact_binding(
+        run_id="81",
+        artifact_id="181",
+        artifact_name="production-phase-state-81-1",
+        file_sha256=sha("e"),
+        digest_character="e",
+    )
+    intent["control"]["workflow_path"] = (
+        ".github/workflows/rollback-production-phase.yml"
+    )
+    intent["operation"] = "rollback"
+    intent["lineage"] = {
+        "event_sequence": 4,
+        "phase_ordinal": 2,
+        "operation": "rollback",
+        "from": "backend",
+        "to": "bridge",
+        "predecessor_kind": "phase-state",
+        "predecessor_state_sha256": current_binding["sha256"],
+        "phase": "bridge",
+        "phase_source_sha": "1" * 40,
+    }
+    intent["authorities"] = {
+        "rollout_plan_sha256": sha("1"),
+        "current_state": {"kind": "phase-state", **current_binding},
+        "target_state": artifact_binding(
+            run_id="82",
+            artifact_id="182",
+            artifact_name="production-phase-state-82-1",
+            file_sha256=sha("2"),
+            digest_character="2",
+        ),
+        "recovery": artifact_binding(
+            run_id="83",
+            artifact_id="183",
+            artifact_name="production-recovery-readiness-83-1",
+            file_sha256=sha("3"),
+            digest_character="3",
+        ),
+        "target_authority": {"production_plan_sha256": sha("4")},
+    }
+    intent["lock"]["owner_operation"] = "rollback"
+    intent["before"] = before
+    intent["desired"] = desired
+    before_hash = common.sha256_value(before)
+    desired_hash = common.sha256_value(desired)
+    intent["mutation"] = {
+        "http_method": "PUT",
+        "endpoint_label": "app",
+        "update_all_source_versions": False,
+        "before_sha256": before_hash,
+        "desired_sha256": desired_hash,
+        "mutation_fingerprint_sha256": common.sha256_value(
+            {
+                "before_sha256": before_hash,
+                "desired_sha256": desired_hash,
+                "http_method": "PUT",
+                "endpoint_label": "app",
+                "update_all_source_versions": False,
+            }
+        ),
+    }
+    intent["rollback"] = {
+        "allowed_targets": [],
+        "forbidden_targets": ["baseline"],
+    }
+    return common.validate_mutation_intent(intent)
+
+
 def reconciliation_control() -> dict[str, Any]:
     return {
         "workflow_sha": RECONCILE_CONTROL_SHA,
@@ -265,10 +341,19 @@ def simple_reconciliation_control() -> dict[str, Any]:
 
 
 def intent_binding(intent: Mapping[str, Any]) -> dict[str, Any]:
+    operation = (
+        "apply"
+        if intent["operation"] == "activate"
+        else (
+            "orphan-rollback"
+            if intent["lock"]["strategy"] == "inherit"
+            else "rollback"
+        )
+    )
     return artifact_binding(
         run_id="101",
         artifact_id="301",
-        artifact_name="production-mutation-intent-apply-101-1",
+        artifact_name=f"production-mutation-intent-{operation}-101-1",
         file_sha256=common.sha256_bytes(common.canonical_file_bytes(intent)),
         digest_character="5",
     )
@@ -416,8 +501,9 @@ def build_receipt(
     migration_succeeded: bool,
     with_original_receipt: bool = False,
     provider_job: Mapping[str, Any] | None = None,
+    intent: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    intent = valid_intent()
+    intent = copy.deepcopy(intent) if intent is not None else valid_intent()
     assertion = valid_lock_assertion(intent, provider_job=provider_job)
     original: dict[str, Any] | None = None
     original_binding: dict[str, Any] | None = None
@@ -776,6 +862,52 @@ class ReconcileProductionOrphanTests(unittest.TestCase):
             )],
             [True, True, False, False, False],
         )
+
+    def test_original_receipt_floor_must_equal_the_signed_intent(self) -> None:
+        intent = valid_intent()
+        original, authority = original_apply_receipt(
+            intent, desired_public_state()
+        )
+        intent_hash = common.sha256_bytes(common.canonical_file_bytes(intent))
+        reconcile._validate_original_receipt(
+            original, authority, intent, intent_hash
+        )
+        drifted = copy.deepcopy(intent)
+        drifted["rollback"] = {
+            "allowed_targets": [],
+            "forbidden_targets": ["baseline"],
+        }
+        with self.assertRaises(common.ReleaseError):
+            reconcile._validate_original_receipt(
+                original, authority, drifted, intent_hash
+            )
+
+    def test_reconciliation_retains_attempted_floor_for_every_outcome(self) -> None:
+        intent = valid_hardened_rollback_intent()
+        expected = intent["rollback"]
+        before = intent["before"]
+        desired = desired_public_state()
+        desired["canonical_spec_sha256"] = intent["desired"][
+            "canonical_spec_sha256"
+        ]
+        desired["images"] = copy.deepcopy(intent["desired"]["images"])
+        for public, transitions, migrated in (
+            (desired, None, True),
+            (before, None, False),
+            (
+                before,
+                [{"canonical_spec_sha256": intent["desired"]["canonical_spec_sha256"]}],
+                False,
+            ),
+        ):
+            with self.subTest(public=public, transitions=transitions):
+                receipt = build_receipt(
+                    public=public,
+                    transitions=transitions,
+                    migration_succeeded=migrated,
+                    intent=intent,
+                )
+                self.assertEqual(receipt["rollback"], expected)
 
     def test_v1_without_an_exact_signed_receipt_is_rejected(self) -> None:
         receipt = build_receipt(

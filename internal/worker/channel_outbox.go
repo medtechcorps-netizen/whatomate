@@ -429,6 +429,17 @@ func (w *Worker) deliverChannelOutboxJob(
 	); err != nil {
 		return w.failChannelOutboxJob(orgID, &job, workerID, err, false)
 	}
+	if isChannelAIReplyOutbox(&job, outbound) {
+		return w.deliverChannelAIOutboxPhysicalAttempt(
+			ctx,
+			orgID,
+			&job,
+			&account,
+			workerID,
+			outbound,
+			adapter,
+		)
+	}
 	if preparedSender, ok := adapter.(channelapi.PreparedSender); ok {
 		return w.deliverPreparedChannelOutboxJob(
 			ctx,
@@ -440,24 +451,7 @@ func (w *Worker) deliverChannelOutboxJob(
 			preparedSender,
 		)
 	}
-	if isChannelAIReplyOutbox(&job, outbound) {
-		fencedAccount, err := w.recheckChannelAIOutboxDispatchWithAccount(
-			orgID,
-			job.ID,
-			workerID,
-			&account,
-		)
-		if err != nil {
-			return w.cancelChannelAIOutboxJob(
-				orgID,
-				&job,
-				workerID,
-				err,
-			)
-		}
-		account = *fencedAccount
-		job.Status = models.OutboxJobStatusDispatching
-	} else if isManagedMetaChannelOutboxAccount(&account) {
+	if isManagedMetaChannelOutboxAccount(&account) {
 		// This is the provider-attempt boundary for ordinary managed-Meta
 		// messages. Re-read the runtime binding and exact credential generation
 		// under the shared organization mutex, then atomically cross processing
@@ -502,6 +496,106 @@ func (w *Worker) deliverChannelOutboxJob(
 		)
 	}
 	return w.completeChannelOutboxJob(orgID, &job, &account, workerID, result)
+}
+
+// deliverChannelAIOutboxPhysicalAttempt holds only the organization row across
+// the relay provider call. Its final policy check and dispatching CAS commit on
+// an independent connection first, and provider result/uncertainty settlement
+// commits independently after the network returns. Contact, account,
+// credential, Message, and OutboxJob locks never cross the network boundary.
+func (w *Worker) deliverChannelAIOutboxPhysicalAttempt(
+	ctx context.Context,
+	orgID uuid.UUID,
+	job *models.OutboxJob,
+	account *models.ChannelAccount,
+	workerID string,
+	outbound channelapi.OutboundMessage,
+	adapter channelapi.Adapter,
+) error {
+	if w == nil || w.DB == nil || job == nil || account == nil || adapter == nil ||
+		orgID == uuid.Nil {
+		return errors.New("channel AI delivery attempt identity is incomplete")
+	}
+	if err := database.RequireIndependentAIAttemptConnections(w.DB); err != nil {
+		return w.cancelChannelAIOutboxJob(orgID, job, workerID, err)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	attemptCtx, cancel := context.WithTimeout(
+		ctx,
+		managedInstagramChannelOutboxProviderOperationLimit,
+	)
+	defer cancel()
+
+	var (
+		fencedAccount *models.ChannelAccount
+		result        channelapi.SendResult
+		sendErr       error
+		settlementErr error
+	)
+	fenceErr := database.WithTenantReadCommitted(
+		w.DB.WithContext(attemptCtx),
+		orgID,
+		func(guardTx *gorm.DB) error {
+			if err := database.LockOrganizationAIAttemptScope(guardTx, orgID); err != nil {
+				return err
+			}
+			var err error
+			fencedAccount, err = w.recheckChannelAIOutboxDispatchWithAccountWithinAttempt(
+				orgID,
+				job.ID,
+				workerID,
+				account,
+			)
+			if err != nil {
+				return err
+			}
+			job.Status = models.OutboxJobStatusDispatching
+			result, sendErr = adapter.Send(attemptCtx, fencedAccount, outbound)
+			switch {
+			case sendErr != nil:
+				settlementErr = w.failChannelOutboxProviderAttemptWithinAttempt(
+					orgID,
+					job,
+					fencedAccount,
+					workerID,
+					sendErr,
+					retryableChannelError(sendErr),
+				)
+			case len(result.ProviderMessageIDs) == 0:
+				settlementErr = w.failChannelOutboxProviderAttemptWithinAttempt(
+					orgID,
+					job,
+					fencedAccount,
+					workerID,
+					errors.New("provider accepted the request without a message ID"),
+					true,
+				)
+			default:
+				settlementErr = w.completeChannelOutboxJob(
+					orgID,
+					job,
+					fencedAccount,
+					workerID,
+					result,
+				)
+			}
+			return nil
+		},
+	)
+	if fenceErr != nil {
+		return w.cancelChannelAIOutboxJob(orgID, job, workerID, fenceErr)
+	}
+	if fencedAccount == nil {
+		return w.cancelChannelAIOutboxJob(
+			orgID,
+			job,
+			workerID,
+			errors.New("channel AI delivery attempt did not produce a fenced account"),
+		)
+	}
+	return settlementErr
 }
 
 func validateThreadsChannelOutboxBinding(
@@ -801,14 +895,7 @@ func (w *Worker) markManagedMetaChannelOutboxDispatching(
 }
 
 func lockChannelOutboxOrganizationScopeTx(tx *gorm.DB, organizationID uuid.UUID) error {
-	if tx == nil || organizationID == uuid.Nil {
-		return errors.New("tenant organization outbox transaction is required")
-	}
-	var organization models.Organization
-	return tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Select("id").
-		Where("id = ?", organizationID).
-		First(&organization).Error
+	return database.LockOrganizationPolicyScope(tx, organizationID)
 }
 
 func (w *Worker) failManagedMetaChannelOutboxFence(
@@ -1390,6 +1477,35 @@ func (w *Worker) recheckChannelAIOutboxDispatchWithAccount(
 	workerID string,
 	expectedAccounts ...*models.ChannelAccount,
 ) (*models.ChannelAccount, error) {
+	return w.recheckChannelAIOutboxDispatchWithAccountAndFence(
+		orgID,
+		jobID,
+		workerID,
+		false,
+		expectedAccounts...,
+	)
+}
+
+func (w *Worker) recheckChannelAIOutboxDispatchWithAccountWithinAttempt(
+	orgID, jobID uuid.UUID,
+	workerID string,
+	expectedAccounts ...*models.ChannelAccount,
+) (*models.ChannelAccount, error) {
+	return w.recheckChannelAIOutboxDispatchWithAccountAndFence(
+		orgID,
+		jobID,
+		workerID,
+		true,
+		expectedAccounts...,
+	)
+}
+
+func (w *Worker) recheckChannelAIOutboxDispatchWithAccountAndFence(
+	orgID, jobID uuid.UUID,
+	workerID string,
+	physicalAttemptFenceHeld bool,
+	expectedAccounts ...*models.ChannelAccount,
+) (*models.ChannelAccount, error) {
 	var expectedAccount *models.ChannelAccount
 	if len(expectedAccounts) > 0 {
 		expectedAccount = expectedAccounts[0]
@@ -1416,8 +1532,10 @@ func (w *Worker) recheckChannelAIOutboxDispatchWithAccount(
 		// before taking the job/account locks. This makes a committed lifecycle
 		// cancellation deterministically beat the dispatch CAS when it owns the
 		// tenant mutex first.
-		if err := lockChannelOutboxOrganizationScopeTx(tx, orgID); err != nil {
-			return err
+		if !physicalAttemptFenceHeld {
+			if err := lockChannelOutboxOrganizationScopeTx(tx, orgID); err != nil {
+				return err
+			}
 		}
 		var job models.OutboxJob
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
@@ -1509,6 +1627,20 @@ func (w *Worker) recheckChannelAIOutboxDispatchWithAccount(
 			conversation.Config[models.ConversationConfigAIPaused],
 		) {
 			return fmt.Errorf("%w: conversation AI is paused", errChannelOutboxAIPolicy)
+		}
+		identityBlocked, identityErr := database.ContactHasBlockingIdentityReviewHold(
+			tx,
+			orgID,
+			conversation.ContactID,
+		)
+		if identityErr != nil {
+			return fmt.Errorf(
+				"%w: identity review state is unavailable",
+				errChannelOutboxAIPolicy,
+			)
+		}
+		if identityBlocked {
+			return fmt.Errorf("%w: identity review is active", errChannelOutboxAIPolicy)
 		}
 
 		// Consent withdrawal and human handover creation acquire this same
@@ -1910,11 +2042,11 @@ func (w *Worker) completeChannelOutboxJob(
 }
 
 // failChannelOutboxProviderAttempt terminally settles every managed Instagram
-// error after the dispatching CAS. A transport error or an accepted response
-// without a message ID is ambiguous: the provider may already have delivered
-// generation N. Retrying under N (or a later reconnect generation N+1) would
-// risk a duplicate or an authorization replay. Static Instagram and all
-// Messenger jobs retain the ordinary retry policy.
+// error after the dispatching CAS. The physical-attempt variant also settles
+// static Instagram/Messenger automatic-AI delivery uncertainty: once the
+// provider call starts, a transport error or accepted response without an ID
+// cannot safely be retried. Ordinary manual/API/campaign delivery retains the
+// existing retry policy.
 func (w *Worker) failChannelOutboxProviderAttempt(
 	orgID uuid.UUID,
 	job *models.OutboxJob,
@@ -1923,11 +2055,52 @@ func (w *Worker) failChannelOutboxProviderAttempt(
 	deliveryErr error,
 	retryable bool,
 ) error {
+	return w.failChannelOutboxProviderAttemptWithFence(
+		orgID,
+		job,
+		account,
+		workerID,
+		deliveryErr,
+		retryable,
+		false,
+	)
+}
+
+func (w *Worker) failChannelOutboxProviderAttemptWithinAttempt(
+	orgID uuid.UUID,
+	job *models.OutboxJob,
+	account *models.ChannelAccount,
+	workerID string,
+	deliveryErr error,
+	retryable bool,
+) error {
+	return w.failChannelOutboxProviderAttemptWithFence(
+		orgID,
+		job,
+		account,
+		workerID,
+		deliveryErr,
+		retryable,
+		true,
+	)
+}
+
+func (w *Worker) failChannelOutboxProviderAttemptWithFence(
+	orgID uuid.UUID,
+	job *models.OutboxJob,
+	account *models.ChannelAccount,
+	workerID string,
+	deliveryErr error,
+	retryable bool,
+	physicalAttemptFenceHeld bool,
+) error {
+	automaticAIDispatch := physicalAttemptFenceHeld && job != nil && account != nil &&
+		job.Status == models.OutboxJobStatusDispatching
 	managedInstagramDispatch := job != nil && account != nil &&
 		job.Status == models.OutboxJobStatusDispatching &&
 		account.Channel == models.ChannelInstagram &&
 		isManagedMetaChannelOutboxAccount(account)
-	if !managedInstagramDispatch {
+	if !managedInstagramDispatch && !automaticAIDispatch {
 		return w.failChannelOutboxJob(
 			orgID,
 			job,
@@ -1937,12 +2110,17 @@ func (w *Worker) failChannelOutboxProviderAttempt(
 		)
 	}
 
+	errorCode := "channel_ai_delivery_state_ambiguous"
+	errorPrefix := "Automatic AI provider delivery state is ambiguous; automatic retry is disabled: "
+	if managedInstagramDispatch {
+		errorCode = "managed_instagram_delivery_state_ambiguous"
+		errorPrefix = "Managed Instagram provider delivery state is ambiguous; automatic retry is disabled: "
+	}
 	ambiguousErr := &channelapi.ProviderError{
 		Operation: "send",
 		Provider:  account.Provider,
-		Code:      "managed_instagram_delivery_state_ambiguous",
-		Message: "Managed Instagram provider delivery state is ambiguous; automatic retry is disabled: " +
-			channelOutboxErrorMessage(deliveryErr),
+		Code:      errorCode,
+		Message:   errorPrefix + channelOutboxErrorMessage(deliveryErr),
 		Retryable: false,
 		Cause:     deliveryErr,
 	}
@@ -1951,8 +2129,10 @@ func (w *Worker) failChannelOutboxProviderAttempt(
 	persistErr := database.WithTenantReadCommitted(w.DB, orgID, func(tx *gorm.DB) error {
 		// Serialize the terminal provider outcome with reconnect/rotation. The
 		// winner cannot leave a retryable row for a later credential generation.
-		if err := lockChannelOutboxOrganizationScopeTx(tx, orgID); err != nil {
-			return err
+		if !physicalAttemptFenceHeld {
+			if err := lockChannelOutboxOrganizationScopeTx(tx, orgID); err != nil {
+				return err
+			}
 		}
 		now := time.Now().UTC()
 		errorMessage := channelOutboxErrorMessage(ambiguousErr)
@@ -1990,7 +2170,7 @@ func (w *Worker) failChannelOutboxProviderAttempt(
 				current.Status == models.OutboxJobStatusCancelled {
 				return nil
 			}
-			return errors.New("managed Instagram provider failure settlement lost its lease")
+			return errors.New("automatic AI provider failure settlement lost its lease")
 		}
 		changed = true
 		if job.MessageID != nil {

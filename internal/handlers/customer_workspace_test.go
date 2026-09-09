@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/require"
@@ -736,6 +738,14 @@ func TestMergeContactPreviewBlocksActiveTransferAndSessionCollisions(t *testing.
 	testutil.SetPathParam(confirmReq, "id", target.ID.String())
 	require.NoError(t, app.MergeContact(confirmReq))
 	require.Equal(t, fasthttp.StatusConflict, testutil.GetResponseStatusCode(confirmReq))
+	var collisionDetails struct {
+		Collisions []string `json:"collisions"`
+	}
+	testutil.ParseEnvelopeResponse(t, confirmReq, &collisionDetails)
+	require.ElementsMatch(t, []string{
+		"multiple active agent transfers would overlap",
+		"active chatbot sessions overlap",
+	}, collisionDetails.Collisions)
 }
 
 func TestMergeContactPreviewConfirmReplayAndAliasWorkspace(t *testing.T) {
@@ -810,6 +820,17 @@ func TestMergeContactPreviewConfirmReplayAndAliasWorkspace(t *testing.T) {
 	confirmReq := mergeRequest(true, mergeKey)
 	require.NoError(t, app.MergeContact(confirmReq))
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(confirmReq))
+	type mergeResponse struct {
+		Merged          bool             `json:"merged"`
+		TargetContactID uuid.UUID        `json:"target_contact_id"`
+		SourceContactID uuid.UUID        `json:"source_contact_id"`
+		Preserved       map[string]int64 `json:"preserved"`
+	}
+	var firstMerge mergeResponse
+	testutil.ParseEnvelopeResponse(t, confirmReq, &firstMerge)
+	require.True(t, firstMerge.Merged)
+	require.Equal(t, target.ID, firstMerge.TargetContactID)
+	require.Equal(t, source.ID, firstMerge.SourceContactID)
 
 	var mergedSource models.Contact
 	require.NoError(t, db.Unscoped().
@@ -830,9 +851,106 @@ func TestMergeContactPreviewConfirmReplayAndAliasWorkspace(t *testing.T) {
 	require.NotNil(t, preservedConsent.ContactID)
 	require.Equal(t, source.ID, *preservedConsent.ContactID)
 
+	// A replay represents the original successful operation. Facts written
+	// later must remain visible to previews without retroactively turning the
+	// exact same request into a collision failure or changing its response.
+	laterAt := time.Now().UTC()
+	for _, contact := range []*models.Contact{target, source} {
+		require.NoError(t, db.Create(&models.AgentTransfer{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: org.ID,
+			ContactID:      contact.ID,
+			PhoneNumber:    contact.PhoneNumber,
+			Status:         models.TransferStatusActive,
+			Source:         models.TransferSourceManual,
+			TransferredAt:  laterAt,
+		}).Error)
+		require.NoError(t, db.Create(&models.ChatbotSession{
+			BaseModel:       models.BaseModel{ID: uuid.New()},
+			OrganizationID:  org.ID,
+			ContactID:       contact.ID,
+			WhatsAppAccount: "workspace-later-collision",
+			PhoneNumber:     contact.PhoneNumber,
+			Status:          models.SessionStatusActive,
+			SessionData:     models.JSONB{},
+			StartedAt:       laterAt,
+			LastActivityAt:  laterAt,
+		}).Error)
+	}
+	channelAccount := &models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    org.ID,
+		Channel:           models.ChannelWebChat,
+		Provider:          "workspace-replay-test",
+		Name:              "Workspace replay collision",
+		ExternalAccountID: "workspace-replay-" + uuid.NewString(),
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, db.Create(channelAccount).Error)
+	for _, contact := range []*models.Contact{target, source} {
+		require.NoError(t, db.Create(&models.ContactChannelPreference{
+			BaseModel:        models.BaseModel{ID: uuid.New()},
+			OrganizationID:   org.ID,
+			ContactID:        contact.ID,
+			ChannelAccountID: channelAccount.ID,
+			Channel:          channelAccount.Channel,
+			Purpose:          models.ChannelPreferencePurposeService,
+			Status:           models.ChannelPreferenceStatusOptedIn,
+			Source:           "workspace-replay-test",
+			QuietHours:       models.JSONB{},
+			Config:           models.JSONB{},
+			Metadata:         models.JSONB{},
+		}).Error)
+		consentEvent := &models.ConsentEvent{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: org.ID,
+			ContactID:      &contact.ID,
+			SubjectType:    "contact",
+			SubjectKey:     "workspace-replay-" + contact.ID.String(),
+			Purpose:        string(models.ChannelPreferencePurposeService),
+			Channel:        string(models.ChannelWebChat),
+			Action:         models.ConsentActionGranted,
+			Source:         "workspace-replay-test",
+			Evidence:       models.JSONB{},
+			CapturedAt:     laterAt,
+		}
+		require.NoError(t, db.Create(consentEvent).Error)
+		require.NoError(t, db.Create(&models.ConsentState{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: org.ID,
+			ContactID:      &contact.ID,
+			SubjectType:    consentEvent.SubjectType,
+			SubjectKey:     consentEvent.SubjectKey,
+			Purpose:        consentEvent.Purpose,
+			Channel:        consentEvent.Channel,
+			Status:         models.ConsentStatusGranted,
+			LatestEventID:  consentEvent.ID,
+			EffectiveAt:    laterAt,
+			Metadata:       models.JSONB{},
+		}).Error)
+	}
+
+	laterPreviewReq := mergeRequest(false, "")
+	require.NoError(t, app.MergeContact(laterPreviewReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(laterPreviewReq))
+	var laterPreview ContactMergePreview
+	testutil.ParseEnvelopeResponse(t, laterPreviewReq, &laterPreview)
+	require.ElementsMatch(t, []string{
+		"contact channel preferences overlap",
+		"multiple active agent transfers would overlap",
+		"active chatbot sessions overlap",
+		"consent states overlap",
+	}, laterPreview.Collisions)
+
 	replayReq := mergeRequest(true, mergeKey)
 	require.NoError(t, app.MergeContact(replayReq))
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(replayReq))
+	var replayMerge mergeResponse
+	testutil.ParseEnvelopeResponse(t, replayReq, &replayMerge)
+	require.Equal(t, firstMerge, replayMerge)
 
 	var activityCount, outboxCount int64
 	require.NoError(t, db.Model(&models.CustomerActivityEvent{}).
@@ -908,4 +1026,507 @@ func TestMergeContactPreviewConfirmReplayAndAliasWorkspace(t *testing.T) {
 		}
 	}
 	require.True(t, foundPriorMessage)
+}
+
+type customerWorkspaceMergeIdentityFixture struct {
+	app              *App
+	db               *gorm.DB
+	organization     *models.Organization
+	account          *models.WhatsAppAccount
+	user             *models.User
+	target           *models.Contact
+	targetAlias      *models.Contact
+	targetGrandchild *models.Contact
+	source           *models.Contact
+	sourceAlias      *models.Contact
+	sourceGrandchild *models.Contact
+}
+
+func newCustomerWorkspaceMergeIdentityFixture(t *testing.T) customerWorkspaceMergeIdentityFixture {
+	t.Helper()
+	app, db, organization, account := setupWhatsAppIdentityReviewAdmissionTest(t)
+	adminRole := testutil.CreateAdminRole(t, db, organization.ID)
+	user := testutil.CreateTestUser(t, db, organization.ID, testutil.WithRoleID(&adminRole.ID))
+	return customerWorkspaceMergeIdentityFixture{
+		app:              app,
+		db:               db,
+		organization:     organization,
+		account:          account,
+		user:             user,
+		target:           testutil.CreateTestContact(t, db, organization.ID),
+		targetAlias:      testutil.CreateTestContact(t, db, organization.ID),
+		targetGrandchild: testutil.CreateTestContact(t, db, organization.ID),
+		source:           testutil.CreateTestContact(t, db, organization.ID),
+		sourceAlias:      testutil.CreateTestContact(t, db, organization.ID),
+		sourceGrandchild: testutil.CreateTestContact(t, db, organization.ID),
+	}
+}
+
+func (fixture customerWorkspaceMergeIdentityFixture) attachAliases(t *testing.T) {
+	t.Helper()
+	mergedAt := time.Now().UTC().Add(-time.Minute)
+	for _, pair := range []struct {
+		alias     *models.Contact
+		canonical *models.Contact
+	}{
+		{alias: fixture.targetAlias, canonical: fixture.target},
+		{alias: fixture.targetGrandchild, canonical: fixture.targetAlias},
+		{alias: fixture.sourceAlias, canonical: fixture.source},
+		{alias: fixture.sourceGrandchild, canonical: fixture.sourceAlias},
+	} {
+		require.NoError(t, fixture.db.Unscoped().Model(&models.Contact{}).
+			Where("id = ? AND organization_id = ?", pair.alias.ID, fixture.organization.ID).
+			Updates(map[string]any{
+				"merged_into_id": pair.canonical.ID,
+				"merged_at":      mergedAt,
+				"merged_by_id":   fixture.user.ID,
+				"deleted_at":     mergedAt,
+			}).Error)
+	}
+}
+
+func (fixture customerWorkspaceMergeIdentityFixture) createOpenIdentityReviewHold(
+	t *testing.T,
+	contact *models.Contact,
+) *WhatsAppIdentityReviewSnapshot {
+	t.Helper()
+	principal := "contact-merge-review-" + uuid.NewString()
+	require.NoError(t, fixture.db.Unscoped().Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", contact.ID, fixture.organization.ID).
+		Update("bs_uid", principal).Error)
+	claim := WhatsAppIdentityReviewClaim{
+		OrganizationID:          fixture.organization.ID,
+		WhatsAppAccountID:       fixture.account.ID,
+		OnboardingCycle:         1,
+		DirectPrimaryBSUID:      principal,
+		VerifiedEventDigest:     strings.Repeat("a", 64),
+		VerifiedEventProvenance: WhatsAppIdentityReviewVerifiedMetaEvent,
+		SelectorBodyDigest:      strings.Repeat("b", 64),
+	}
+	var snapshot *WhatsAppIdentityReviewSnapshot
+	var created bool
+	require.NoError(t, fixture.db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		snapshot, created, err = fixture.app.CreateOrReuseWhatsAppIdentityReviewHold(tx, &claim)
+		return err
+	}))
+	require.True(t, created)
+	require.NotNil(t, snapshot)
+	return snapshot
+}
+
+func (fixture customerWorkspaceMergeIdentityFixture) mergeRequest(
+	t *testing.T,
+	idempotencyKey string,
+) *fastglue.Request {
+	t.Helper()
+	return fixture.mergePairRequest(t, fixture.target.ID, fixture.source.ID, idempotencyKey)
+}
+
+func (fixture customerWorkspaceMergeIdentityFixture) mergePairRequest(
+	t *testing.T,
+	targetID, sourceID uuid.UUID,
+	idempotencyKey string,
+) *fastglue.Request {
+	t.Helper()
+	req := testutil.NewJSONRequest(t, MergeContactRequest{
+		SourceContactID: sourceID,
+		Confirm:         true,
+		IdempotencyKey:  idempotencyKey,
+		Reason:          "duplicate identity",
+	})
+	testutil.SetAuthContext(req, fixture.organization.ID, fixture.user.ID)
+	testutil.SetPathParam(req, "id", targetID.String())
+	return req
+}
+
+func TestMergeContactExactReplaySurvivesLaterCanonicalMerge(t *testing.T) {
+	fixture := newCustomerWorkspaceMergeIdentityFixture(t)
+	finalTarget := testutil.CreateTestContact(t, fixture.db, fixture.organization.ID)
+	loadFirstMergeEvidence := func() (models.CustomerActivityEvent, models.OutboxEvent) {
+		t.Helper()
+		var activities []models.CustomerActivityEvent
+		require.NoError(t, fixture.db.Where(
+			"organization_id = ? AND idempotency_key = ?",
+			fixture.organization.ID,
+			"contact-merge:merge-chain-first",
+		).Find(&activities).Error)
+		require.Len(t, activities, 1)
+
+		var outboxes []models.OutboxEvent
+		require.NoError(t, fixture.db.Where(
+			"organization_id = ? AND idempotency_key = ?",
+			fixture.organization.ID,
+			"customer-activity-webhook:"+activities[0].ID.String(),
+		).Find(&outboxes).Error)
+		require.Len(t, outboxes, 1)
+		return activities[0], outboxes[0]
+	}
+
+	type mergeResponse struct {
+		Merged          bool             `json:"merged"`
+		TargetContactID uuid.UUID        `json:"target_contact_id"`
+		SourceContactID uuid.UUID        `json:"source_contact_id"`
+		Preserved       map[string]int64 `json:"preserved"`
+	}
+
+	firstRequest := fixture.mergePairRequest(
+		t,
+		fixture.target.ID,
+		fixture.source.ID,
+		"merge-chain-first",
+	)
+	require.NoError(t, fixture.app.MergeContact(firstRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(firstRequest))
+	var firstResponse mergeResponse
+	testutil.ParseEnvelopeResponse(t, firstRequest, &firstResponse)
+	firstActivity, firstOutbox := loadFirstMergeEvidence()
+	require.Equal(t, fixture.target.ID, firstActivity.ContactID)
+	require.Equal(t, &fixture.source.ID, firstActivity.SourceObjectID)
+	require.Equal(t, string(models.CustomerActivityContactMerged), firstOutbox.EventType)
+	require.Equal(t, "contact", firstOutbox.AggregateType)
+	require.Equal(t, &fixture.source.ID, firstOutbox.AggregateID)
+	require.Equal(t, firstActivity.ID.String(), firstOutbox.Payload["activity_event_id"])
+	require.Equal(t, fixture.target.ID.String(), firstOutbox.Payload["contact_id"])
+	require.Equal(t, fixture.source.ID.String(), firstOutbox.Payload["source_id"])
+
+	secondRequest := fixture.mergePairRequest(
+		t,
+		finalTarget.ID,
+		fixture.target.ID,
+		"merge-chain-second",
+	)
+	require.NoError(t, fixture.app.MergeContact(secondRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(secondRequest))
+
+	replayRequest := fixture.mergePairRequest(
+		t,
+		fixture.target.ID,
+		fixture.source.ID,
+		"merge-chain-first",
+	)
+	require.NoError(t, fixture.app.MergeContact(replayRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(replayRequest))
+	var replayResponse mergeResponse
+	testutil.ParseEnvelopeResponse(t, replayRequest, &replayResponse)
+	require.Equal(t, firstResponse, replayResponse)
+
+	replayActivity, replayOutbox := loadFirstMergeEvidence()
+	require.Equal(t, firstActivity, replayActivity)
+	require.Equal(t, firstOutbox.ID, replayOutbox.ID)
+	require.Equal(t, firstOutbox.EventType, replayOutbox.EventType)
+	require.Equal(t, firstOutbox.AggregateType, replayOutbox.AggregateType)
+	require.Equal(t, firstOutbox.AggregateID, replayOutbox.AggregateID)
+	require.Equal(t, firstOutbox.IdempotencyKey, replayOutbox.IdempotencyKey)
+	require.Equal(t, firstOutbox.Payload, replayOutbox.Payload)
+}
+
+func TestMergeContactRejectsOpenIdentityReviewAcrossCompleteFamilies(t *testing.T) {
+	cases := []struct {
+		name   string
+		member func(customerWorkspaceMergeIdentityFixture) *models.Contact
+	}{
+		{name: "target root", member: func(fixture customerWorkspaceMergeIdentityFixture) *models.Contact { return fixture.target }},
+		{name: "target alias", member: func(fixture customerWorkspaceMergeIdentityFixture) *models.Contact { return fixture.targetAlias }},
+		{name: "target multi-hop descendant", member: func(fixture customerWorkspaceMergeIdentityFixture) *models.Contact { return fixture.targetGrandchild }},
+		{name: "source root", member: func(fixture customerWorkspaceMergeIdentityFixture) *models.Contact { return fixture.source }},
+		{name: "source alias", member: func(fixture customerWorkspaceMergeIdentityFixture) *models.Contact { return fixture.sourceAlias }},
+		{name: "source multi-hop descendant", member: func(fixture customerWorkspaceMergeIdentityFixture) *models.Contact { return fixture.sourceGrandchild }},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newCustomerWorkspaceMergeIdentityFixture(t)
+			memberContact := testCase.member(fixture)
+			hold := fixture.createOpenIdentityReviewHold(t, memberContact)
+			fixture.attachAliases(t)
+
+			var memberBefore models.WhatsAppIdentityReviewMember
+			require.NoError(t, fixture.db.Where(
+				"organization_id = ? AND hold_id = ? AND contact_id = ?",
+				fixture.organization.ID,
+				hold.HoldID,
+				memberContact.ID,
+			).First(&memberBefore).Error)
+
+			req := fixture.mergeRequest(t, "open-review-"+strings.ReplaceAll(testCase.name, " ", "-"))
+			require.NoError(t, fixture.app.MergeContact(req))
+			require.Equal(t, fasthttp.StatusConflict, testutil.GetResponseStatusCode(req))
+			require.Contains(t, string(testutil.GetResponseBody(req)), "WhatsApp identity review is open")
+
+			var persistedSource models.Contact
+			require.NoError(t, fixture.db.Unscoped().Where(
+				"id = ? AND organization_id = ?",
+				fixture.source.ID,
+				fixture.organization.ID,
+			).First(&persistedSource).Error)
+			require.False(t, persistedSource.DeletedAt.Valid)
+			require.Nil(t, persistedSource.MergedIntoID)
+
+			var persistedTargetAlias, persistedTargetChild models.Contact
+			var persistedSourceAlias, persistedSourceChild models.Contact
+			require.NoError(t, fixture.db.Unscoped().First(
+				&persistedTargetAlias,
+				"id = ? AND organization_id = ?",
+				fixture.targetAlias.ID,
+				fixture.organization.ID,
+			).Error)
+			require.NoError(t, fixture.db.Unscoped().First(
+				&persistedTargetChild,
+				"id = ? AND organization_id = ?",
+				fixture.targetGrandchild.ID,
+				fixture.organization.ID,
+			).Error)
+			require.NoError(t, fixture.db.Unscoped().First(
+				&persistedSourceAlias,
+				"id = ? AND organization_id = ?",
+				fixture.sourceAlias.ID,
+				fixture.organization.ID,
+			).Error)
+			require.NoError(t, fixture.db.Unscoped().First(
+				&persistedSourceChild,
+				"id = ? AND organization_id = ?",
+				fixture.sourceGrandchild.ID,
+				fixture.organization.ID,
+			).Error)
+			require.Equal(t, fixture.target.ID, *persistedTargetAlias.MergedIntoID)
+			require.Equal(t, fixture.targetAlias.ID, *persistedTargetChild.MergedIntoID)
+			require.Equal(t, fixture.source.ID, *persistedSourceAlias.MergedIntoID)
+			require.Equal(t, fixture.sourceAlias.ID, *persistedSourceChild.MergedIntoID)
+
+			var memberAfter models.WhatsAppIdentityReviewMember
+			require.NoError(t, fixture.db.Where(
+				"organization_id = ? AND hold_id = ? AND contact_id = ?",
+				fixture.organization.ID,
+				hold.HoldID,
+				memberContact.ID,
+			).First(&memberAfter).Error)
+			require.Equal(t, memberBefore, memberAfter, "immutable review membership must not be rewritten")
+			var persistedHold models.WhatsAppIdentityReviewHold
+			require.NoError(t, fixture.db.Where(
+				"organization_id = ? AND id = ?",
+				fixture.organization.ID,
+				hold.HoldID,
+			).First(&persistedHold).Error)
+			require.Equal(t, models.WhatsAppIdentityReviewDispositionOpen, persistedHold.Disposition)
+			require.Equal(t, uint64(1), persistedHold.Version)
+		})
+	}
+}
+
+func TestMergeContactAllowsResolvedAndSupersededIdentityReviewHolds(t *testing.T) {
+	cases := []struct {
+		name        string
+		disposition models.WhatsAppIdentityReviewDisposition
+		resolve     func(*testing.T, customerWorkspaceMergeIdentityFixture, *WhatsAppIdentityReviewSnapshot)
+	}{
+		{
+			name:        "future routing decision",
+			disposition: models.WhatsAppIdentityReviewDispositionFutureRouting,
+			resolve: func(t *testing.T, fixture customerWorkspaceMergeIdentityFixture, hold *WhatsAppIdentityReviewSnapshot) {
+				t.Helper()
+				resolvedAt := time.Now().UTC()
+				require.NoError(t, fixture.db.Model(&models.WhatsAppIdentityReviewHold{}).
+					Where("organization_id = ? AND id = ?", fixture.organization.ID, hold.HoldID).
+					Updates(map[string]any{
+						"version":                    2,
+						"disposition":                models.WhatsAppIdentityReviewDispositionFutureRouting,
+						"decision_target_contact_id": fixture.source.ID,
+						"decision_resolved_by_id":    fixture.user.ID,
+						"decision_resolved_at":       resolvedAt,
+						"decision_request_id":        uuid.New(),
+						"decision_request_digest":    strings.Repeat("c", 64),
+						"decision_chain_digest":      strings.Repeat("d", 64),
+					}).Error)
+			},
+		},
+		{
+			name:        "later onboarding cycle",
+			disposition: models.WhatsAppIdentityReviewDispositionSupersededByCycle,
+			resolve: func(t *testing.T, fixture customerWorkspaceMergeIdentityFixture, _ *WhatsAppIdentityReviewSnapshot) {
+				t.Helper()
+				require.NoError(t, fixture.db.Model(&models.WhatsAppCoexistenceState{}).
+					Where(
+						"organization_id = ? AND whats_app_account_id = ?",
+						fixture.organization.ID,
+						fixture.account.ID,
+					).
+					Update("onboarding_cycle", 2).Error)
+			},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newCustomerWorkspaceMergeIdentityFixture(t)
+			hold := fixture.createOpenIdentityReviewHold(t, fixture.source)
+			testCase.resolve(t, fixture, hold)
+			fixture.attachAliases(t)
+
+			var memberBefore models.WhatsAppIdentityReviewMember
+			require.NoError(t, fixture.db.Where(
+				"organization_id = ? AND hold_id = ? AND contact_id = ?",
+				fixture.organization.ID,
+				hold.HoldID,
+				fixture.source.ID,
+			).First(&memberBefore).Error)
+			var resolved models.WhatsAppIdentityReviewHold
+			require.NoError(t, fixture.db.Where(
+				"organization_id = ? AND id = ?",
+				fixture.organization.ID,
+				hold.HoldID,
+			).First(&resolved).Error)
+			require.Equal(t, testCase.disposition, resolved.Disposition)
+
+			req := fixture.mergeRequest(t, "closed-review-"+strings.ReplaceAll(testCase.name, " ", "-"))
+			require.NoError(t, fixture.app.MergeContact(req))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+			var persistedSource models.Contact
+			require.NoError(t, fixture.db.Unscoped().Where(
+				"id = ? AND organization_id = ?",
+				fixture.source.ID,
+				fixture.organization.ID,
+			).First(&persistedSource).Error)
+			require.True(t, persistedSource.DeletedAt.Valid)
+			require.NotNil(t, persistedSource.MergedIntoID)
+			require.Equal(t, fixture.target.ID, *persistedSource.MergedIntoID)
+
+			var memberAfter models.WhatsAppIdentityReviewMember
+			require.NoError(t, fixture.db.Where(
+				"organization_id = ? AND hold_id = ? AND contact_id = ?",
+				fixture.organization.ID,
+				hold.HoldID,
+				fixture.source.ID,
+			).First(&memberAfter).Error)
+			require.Equal(t, memberBefore, memberAfter, "resolved review membership must remain immutable")
+		})
+	}
+}
+
+func TestMergeContactExactReplayPrecedesOpenIdentityReviewCheck(t *testing.T) {
+	fixture := newCustomerWorkspaceMergeIdentityFixture(t)
+	const idempotencyKey = "merge-before-later-review"
+
+	first := fixture.mergeRequest(t, idempotencyKey)
+	require.NoError(t, fixture.app.MergeContact(first))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(first))
+
+	hold := fixture.createOpenIdentityReviewHold(t, fixture.target)
+	replay := fixture.mergeRequest(t, idempotencyKey)
+	require.NoError(t, fixture.app.MergeContact(replay))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(replay))
+
+	var activityCount int64
+	require.NoError(t, fixture.db.Model(&models.CustomerActivityEvent{}).
+		Where(
+			"organization_id = ? AND idempotency_key = ?",
+			fixture.organization.ID,
+			"contact-merge:"+idempotencyKey,
+		).
+		Count(&activityCount).Error)
+	require.EqualValues(t, 1, activityCount)
+	var persistedHold models.WhatsAppIdentityReviewHold
+	require.NoError(t, fixture.db.Where(
+		"organization_id = ? AND id = ?",
+		fixture.organization.ID,
+		hold.HoldID,
+	).First(&persistedHold).Error)
+	require.Equal(t, models.WhatsAppIdentityReviewDispositionOpen, persistedHold.Disposition)
+}
+
+func TestMergeContactWaitsForPhysicalAIAttemptFence(t *testing.T) {
+	fixture := newCustomerWorkspaceMergeIdentityFixture(t)
+	request := fixture.mergeRequest(t, "merge-policy-fence")
+
+	attemptTx := fixture.db.Begin()
+	require.NoError(t, attemptTx.Error)
+	t.Cleanup(func() { _ = attemptTx.Rollback().Error })
+	require.NoError(t, database.LockOrganizationAIAttemptScope(attemptTx, fixture.organization.ID))
+	var blockerPID int
+	require.NoError(t, attemptTx.Raw("SELECT pg_backend_pid()").Scan(&blockerPID).Error)
+	require.Positive(t, blockerPID)
+
+	type mergeResult struct {
+		err    error
+		status int
+	}
+	writerPID := make(chan int, 1)
+	writerDone := make(chan mergeResult, 1)
+	go func() {
+		result := mergeResult{}
+		result.err = fixture.db.Connection(func(connection *gorm.DB) error {
+			session := connection.Session(&gorm.Session{NewDB: true})
+			var backendPID int
+			if err := session.Raw("SELECT pg_backend_pid()").Scan(&backendPID).Error; err != nil {
+				writerPID <- 0
+				return err
+			}
+			writerPID <- backendPID
+			scoped := &App{
+				DB:     session,
+				Log:    fixture.app.Log,
+				Config: fixture.app.Config,
+			}
+			err := scoped.MergeContact(request)
+			result.status = testutil.GetResponseStatusCode(request)
+			return err
+		})
+		writerDone <- result
+	}()
+
+	backendPID := <-writerPID
+	require.Positive(t, backendPID)
+	testutil.RequirePostgresBackendWaitingForLock(t, fixture.db, backendPID)
+	var blockingMatches int64
+	require.NoError(t, fixture.db.Raw(`
+		SELECT COUNT(*)
+		  FROM pg_catalog.unnest(pg_catalog.pg_blocking_pids(?)) AS blocker(pid)
+		 WHERE blocker.pid = ?
+	`, backendPID, blockerPID).Scan(&blockingMatches).Error)
+	require.EqualValues(t, 1, blockingMatches)
+	var contactLocks []uuid.UUID
+	require.NoError(t, attemptTx.Raw(`
+		SELECT id
+		  FROM contacts
+		 WHERE organization_id = ?
+		   AND id IN ?
+		 ORDER BY id
+		 FOR UPDATE NOWAIT
+	`, fixture.organization.ID, []uuid.UUID{fixture.target.ID, fixture.source.ID}).Scan(&contactLocks).Error)
+	require.ElementsMatch(t, []uuid.UUID{fixture.target.ID, fixture.source.ID}, contactLocks,
+		"the waiting merge must not lock contacts before the organization fence")
+
+	var beforeRelease models.Contact
+	require.NoError(t, fixture.db.Unscoped().Where(
+		"id = ? AND organization_id = ?",
+		fixture.source.ID,
+		fixture.organization.ID,
+	).First(&beforeRelease).Error)
+	require.False(t, beforeRelease.DeletedAt.Valid)
+	require.Nil(t, beforeRelease.MergedIntoID)
+	select {
+	case result := <-writerDone:
+		require.Failf(t, "contact merge bypassed the policy fence", "result: %+v", result)
+	default:
+	}
+
+	require.NoError(t, attemptTx.Commit().Error)
+	select {
+	case result := <-writerDone:
+		require.NoError(t, result.err)
+		require.Equal(t, fasthttp.StatusOK, result.status)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "contact merge did not resume after the attempt fence")
+	}
+
+	var persistedSource models.Contact
+	require.NoError(t, fixture.db.Unscoped().Where(
+		"id = ? AND organization_id = ?",
+		fixture.source.ID,
+		fixture.organization.ID,
+	).First(&persistedSource).Error)
+	require.True(t, persistedSource.DeletedAt.Valid)
+	require.NotNil(t, persistedSource.MergedIntoID)
+	require.Equal(t, fixture.target.ID, *persistedSource.MergedIntoID)
 }

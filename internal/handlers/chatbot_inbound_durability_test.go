@@ -287,7 +287,10 @@ func TestInboundDurability_ReplyLookupIsTenantScoped(t *testing.T) {
 
 	foreignWAMID := "wamid.foreign-reply-target-" + uuid.New().String()
 	foreignMessage := models.Message{
-		BaseModel:         models.BaseModel{ID: uuid.New()},
+		BaseModel: models.BaseModel{ID: uuid.NewSHA1(
+			accountB.ID,
+			[]byte("coexistence-message:"+foreignWAMID),
+		)},
 		OrganizationID:    organizationB.ID,
 		WhatsAppAccount:   accountB.Name,
 		ContactID:         contactB.ID,
@@ -321,7 +324,10 @@ func TestInboundDurability_ReplyLookupIsTenantScoped(t *testing.T) {
 
 	localWAMID := "wamid.local-reply-target-" + uuid.New().String()
 	localMessage := models.Message{
-		BaseModel:         models.BaseModel{ID: uuid.New()},
+		BaseModel: models.BaseModel{ID: uuid.NewSHA1(
+			accountA.ID,
+			[]byte("coexistence-message:"+localWAMID),
+		)},
 		OrganizationID:    organizationA.ID,
 		WhatsAppAccount:   accountA.Name,
 		ContactID:         contactA.ID,

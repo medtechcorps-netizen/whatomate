@@ -2,12 +2,15 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // SLAProcessor handles periodic SLA checks and escalations
@@ -157,13 +160,44 @@ func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings model
 			p.sendSLATextToCustomer(transfer, "SLA auto-close message", settings.SLA.AutoCloseMessage)
 		}
 
-		// Update transfer status
-		if err := p.app.DB.Model(&transfer).Updates(map[string]any{
-			"status":     models.TransferStatusExpired,
-			"resumed_at": now,
-			"notes":      transfer.Notes + "\n[Auto-closed: No agent response within SLA]",
-		}).Error; err != nil {
-			p.app.Log.Error("Failed to expire transfer", "error", err, "transfer_id", transfer.ID)
+		// Expiry changes the physical-contact AI policy. Serialize it against a
+		// currently running AI provider attempt, but keep the human SLA message
+		// above outside that fence.
+		expireErr := database.WithTenantReadCommitted(
+			p.app.DB,
+			orgID,
+			func(tx *gorm.DB) error {
+				if err := database.LockOrganizationPolicyScope(tx, orgID); err != nil {
+					return err
+				}
+				if err := database.LockContactPolicyScope(
+					tx,
+					orgID,
+					transfer.ContactID,
+				); err != nil {
+					return err
+				}
+				result := tx.Model(&models.AgentTransfer{}).Where(
+					"id = ? AND organization_id = ? AND status = ?",
+					transfer.ID,
+					orgID,
+					models.TransferStatusActive,
+				).Updates(map[string]any{
+					"status":     models.TransferStatusExpired,
+					"resumed_at": now,
+					"notes":      transfer.Notes + "\n[Auto-closed: No agent response within SLA]",
+				})
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return errors.New("transfer expiry lost its active policy state")
+				}
+				return nil
+			},
+		)
+		if expireErr != nil {
+			p.app.Log.Error("Failed to expire transfer", "error", expireErr, "transfer_id", transfer.ID)
 			continue
 		}
 
@@ -611,15 +645,145 @@ func (p *SLAProcessor) autoCloseChatbotSession(contact models.Contact, settings 
 // UpdateContactChatbotMessage updates the chatbot last message timestamp for a contact
 func (a *App) UpdateContactChatbotMessage(contactID uuid.UUID) {
 	now := time.Now()
-	a.DB.Exec("UPDATE contacts SET chatbot_last_message_at = ?, chatbot_reminder_sent = false WHERE id = ?", now, contactID)
+	update := func(tx *gorm.DB) error {
+		return tx.Exec(
+			"UPDATE contacts SET chatbot_last_message_at = ?, chatbot_reminder_sent = false WHERE id = ?",
+			now,
+			contactID,
+		).Error
+	}
+	if a.inboundContinuation != nil {
+		orgID := a.inboundContinuationOrganizationID()
+		if err := a.rootApp().WithCommittedTenantApp(
+			orgID,
+			func(scoped *App) error { return update(scoped.DB) },
+		); err != nil {
+			a.Log.Error(
+				"Failed to update independently committed chatbot tracking",
+				"error", err,
+				"contact_id", contactID,
+			)
+		}
+		return
+	}
+	_ = update(a.DB)
 }
 
 // ClearContactChatbotTracking clears chatbot tracking when client replies or is transferred
 func (a *App) ClearContactChatbotTracking(contactID uuid.UUID) {
-	a.DB.Model(&models.Contact{}).
-		Where("id = ?", contactID).
-		Updates(map[string]any{
-			"chatbot_last_message_at": nil,
-			"chatbot_reminder_sent":   false,
-		})
+	update := func(tx *gorm.DB) error {
+		return tx.Model(&models.Contact{}).
+			Where("id = ?", contactID).
+			Updates(map[string]any{
+				"chatbot_last_message_at": nil,
+				"chatbot_reminder_sent":   false,
+			}).Error
+	}
+	if a.inboundContinuation != nil {
+		orgID := a.inboundContinuationOrganizationID()
+		if err := a.rootApp().WithCommittedTenantApp(
+			orgID,
+			func(scoped *App) error { return update(scoped.DB) },
+		); err != nil {
+			a.Log.Error(
+				"Failed to clear independently committed chatbot tracking",
+				"error", err,
+				"contact_id", contactID,
+			)
+		}
+		return
+	}
+	_ = update(a.DB)
+}
+
+const chatbotTrackingClearedThroughMetadataKey = "chatbot_tracking_cleared_through"
+
+func chatbotTrackingClearWatermark(metadata models.JSONB) (time.Time, error) {
+	if metadata == nil {
+		return time.Time{}, nil
+	}
+	raw, exists := metadata[chatbotTrackingClearedThroughMetadataKey]
+	if !exists {
+		return time.Time{}, nil
+	}
+	value, ok := raw.(string)
+	if !ok || value == "" {
+		return time.Time{}, errors.New("chatbot tracking clear watermark is invalid")
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || parsed.IsZero() {
+		return time.Time{}, errors.New("chatbot tracking clear watermark is invalid")
+	}
+	return parsed.UTC(), nil
+}
+
+// clearContactChatbotTrackingForInbound clears only chatbot state that is no
+// newer than the durable inbound message being processed. This keeps an older
+// continuation replay from erasing a later bot reply committed by another
+// worker.
+func (a *App) clearContactChatbotTrackingForInbound(contactID uuid.UUID) error {
+	if a == nil || a.inboundContinuation == nil {
+		a.ClearContactChatbotTracking(contactID)
+		return nil
+	}
+	execution := a.inboundContinuation
+	organizationID := a.inboundContinuationOrganizationID()
+	update := func(tx *gorm.DB) error {
+		var inbound models.Message
+		if err := tx.Select("id", "created_at", "ingested_at").
+			Where(
+				"id = ? AND organization_id = ? AND contact_id = ? AND direction = ?",
+				execution.MessageID,
+				organizationID,
+				contactID,
+				models.DirectionIncoming,
+			).
+			First(&inbound).Error; err != nil {
+			return err
+		}
+		inboundAt := inbound.EffectiveIngestedAt()
+		if inboundAt.IsZero() {
+			return errors.New("durable inbound message has no ordering timestamp")
+		}
+		var contact models.Contact
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "metadata", "chatbot_last_message_at").
+			Where("id = ? AND organization_id = ?", contactID, organizationID).
+			First(&contact).Error; err != nil {
+			return err
+		}
+		clearedThrough, err := chatbotTrackingClearWatermark(contact.Metadata)
+		if err != nil {
+			return err
+		}
+		if !clearedThrough.IsZero() && !inboundAt.After(clearedThrough) {
+			// A later (or identical replayed) inbound clear remains authoritative.
+			return nil
+		}
+		metadata := cloneMessageMetadata(contact.Metadata)
+		metadata[chatbotTrackingClearedThroughMetadataKey] =
+			inboundAt.UTC().Format(time.RFC3339Nano)
+		updates := map[string]any{"metadata": metadata}
+		if contact.ChatbotLastMessageAt == nil ||
+			!contact.ChatbotLastMessageAt.After(inboundAt) {
+			updates["chatbot_last_message_at"] = nil
+			updates["chatbot_reminder_sent"] = false
+		}
+		result := tx.Model(&models.Contact{}).
+			Where("id = ? AND organization_id = ?", contactID, organizationID).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("inbound chatbot tracking contact changed before clear")
+		}
+		return nil
+	}
+	if err := a.rootApp().WithCommittedTenantApp(organizationID, func(scoped *App) error {
+		return update(scoped.DB)
+	}); err != nil {
+		return err
+	}
+	return nil
 }

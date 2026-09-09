@@ -59,7 +59,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -105,6 +105,68 @@ jobs:
 
       - name: Download dependencies
         run: go mod download
+
+      - name: Verify this checkout's compile-time UI database role
+        env:
+          GITHUB_WORKFLOW_REPOSITORY: ${{ github.repository }}
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_test?sslmode=disable
+        run: |
+          set -euo pipefail
+          # This proves only the one role compiled into this checkout. The
+          # release workflows separately prove each immutable phase source;
+          # this integrated checkout is never treated as evidence for all four.
+          phase_manifest="$RUNNER_TEMP/current-ui-exact-sources.json"
+          phase_evidence="$RUNNER_TEMP/current-ui-database-phase-compatibility.json"
+          source_sha="$(git rev-parse 'HEAD^{commit}')"
+          root_tree="$(git show -s --format=%T HEAD)"
+          frontend_tree="$(git rev-parse 'HEAD:frontend')"
+          internal_tree="$(git rev-parse 'HEAD:internal')"
+          SOURCE_SHA="$source_sha" ROOT_TREE="$root_tree" \
+            FRONTEND_TREE="$frontend_tree" INTERNAL_TREE="$internal_tree" \
+            python3 - "$phase_manifest" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          manifest = json.loads(Path("release/exact-sources.json").read_text(encoding="utf-8"))
+          manifest["phases"]["ui"] = {
+              "source_sha": os.environ["SOURCE_SHA"],
+              "root_tree": os.environ["ROOT_TREE"],
+              "frontend_tree": os.environ["FRONTEND_TREE"],
+              "internal_tree": os.environ["INTERNAL_TREE"],
+          }
+          Path(sys.argv[1]).write_bytes(
+              json.dumps(manifest, ensure_ascii=True, indent=2).encode("ascii") + b"\n"
+          )
+          PY
+          bash release/validation/verify_database_phase_compatibility.sh \
+            --phase ui \
+            --source-dir . \
+            --manifest "$phase_manifest" \
+            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --workflow-path .github/workflows/test.yml \
+            --workflow-repository "$GITHUB_WORKFLOW_REPOSITORY" \
+            --runner-environment "$RUNNER_ENVIRONMENT" \
+            --output "$phase_evidence"
+          python3 - "$phase_evidence" "$source_sha" "$GITHUB_WORKFLOW_SHA" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          evidence = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          if (
+              evidence["phase"] != "ui"
+              or evidence["source"]["commit"] != sys.argv[2]
+              or evidence["compile_time"]["value"] != "rlsMigrationPhaseUI"
+              or evidence["workflow"]["sha"] != sys.argv[3]
+              or evidence["workflow"]["path"] != ".github/workflows/test.yml"
+              or evidence["tests"]["result"] != "passed"
+          ):
+              raise SystemExit("current UI database compatibility evidence differs")
+          PY
 
       - name: Install pinned gotestsum
         run: go install gotest.tools/gotestsum@v1.13.0

@@ -46,6 +46,28 @@ type LegacyMetaBackfillStats struct {
 	Linked   int
 }
 
+// EnsureLegacyMetaWhatsAppAccount resolves the real read-only ChannelAccount
+// shadow for an established WhatsApp account without manufacturing a contact,
+// conversation, message, or credential. Callers must already be inside the
+// tenant transaction whose organization/account authority they are extending.
+//
+// Identity-review staging uses this narrow entry point because InboundEvent
+// requires a genuine ChannelAccountID even when no physical Contact can yet be
+// selected safely.
+func EnsureLegacyMetaWhatsAppAccount(
+	db *gorm.DB,
+	ref LegacyMetaAccountRef,
+) (*models.ChannelAccount, error) {
+	if db == nil || ref.ID == uuid.Nil || ref.OrganizationID == uuid.Nil {
+		return nil, errors.New("legacy Meta account-only bridge scope is required")
+	}
+	verified, err := verifiedLegacyMetaAccountRef(db, ref)
+	if err != nil {
+		return nil, err
+	}
+	return ensureLegacyMetaAccount(db, verified)
+}
+
 // LegacyMetaWhatsAppAccountID resolves the immutable established WhatsApp
 // account behind a read-only omnichannel shadow. Both the private metadata and
 // deterministic external ID must agree, so callers fail closed on stale or

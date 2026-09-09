@@ -81,9 +81,21 @@ export const useTransfersStore = defineStore('transfers', () => {
   const historyOffset = ref(0)
   const historyLimit = ref(20)
   const isLoadingHistory = ref(false)
+  // Exact per-contact state is kept separate from the paginated FIFO queue.
+  // A selected conversation can therefore resolve a transfer that is beyond
+  // the first queue page without replacing the queue used by the transfer UI.
+  const activeTransferByContact = ref<Record<string, AgentTransfer | null>>({})
   let identityGeneration = 0
   let transfersFetchGeneration = 0
   let historyFetchGeneration = 0
+  const contactFetchGenerations = new Map<string, number>()
+
+  function invalidateContactFetchAuthority(contactId: string) {
+    contactFetchGenerations.set(
+      contactId,
+      (contactFetchGenerations.get(contactId) ?? 0) + 1,
+    )
+  }
 
   // Total queue count (general + all teams)
   const queueCount = computed(() => {
@@ -108,6 +120,9 @@ export const useTransfersStore = defineStore('transfers', () => {
 
   // Get active transfer for a specific contact
   function getActiveTransferForContact(contactId: string): AgentTransfer | undefined {
+    if (Object.prototype.hasOwnProperty.call(activeTransferByContact.value, contactId)) {
+      return activeTransferByContact.value[contactId] ?? undefined
+    }
     return transfers.value.find(t => t.contact_id === contactId && t.status === 'active')
   }
 
@@ -130,10 +145,13 @@ export const useTransfersStore = defineStore('transfers', () => {
     historyOffset.value = 0
     historyLimit.value = 20
     isLoadingHistory.value = false
+    activeTransferByContact.value = {}
+    contactFetchGenerations.clear()
   }
 
   async function fetchTransfers(params?: {
     status?: string
+    contact_id?: string
     limit?: number
     offset?: number
     include?: string
@@ -177,6 +195,44 @@ export const useTransfersStore = defineStore('transfers', () => {
       ) {
         isLoading.value = false
       }
+    }
+  }
+
+  async function fetchActiveTransferForContact(contactId: string) {
+    const identity = identityGeneration
+    const requestGeneration = (contactFetchGenerations.get(contactId) ?? 0) + 1
+    contactFetchGenerations.set(contactId, requestGeneration)
+
+    try {
+      const response = await chatbotService.listTransfers({
+        status: 'active',
+        contact_id: contactId,
+        limit: 1,
+        include: 'agent,team,transferred_by',
+      })
+      const data = response.data.data || response.data
+      if (
+        identity !== identityGeneration ||
+        contactFetchGenerations.get(contactId) !== requestGeneration
+      ) return getActiveTransferForContact(contactId)
+
+      const transfer = (data.transfers || []).find(
+        (candidate: AgentTransfer) =>
+          candidate.contact_id === contactId && candidate.status === 'active',
+      ) as AgentTransfer | undefined
+      activeTransferByContact.value = {
+        ...activeTransferByContact.value,
+        [contactId]: transfer ?? null,
+      }
+      return transfer
+    } catch (error) {
+      if (
+        identity === identityGeneration &&
+        contactFetchGenerations.get(contactId) === requestGeneration
+      ) {
+        console.error('Failed to fetch active transfer for contact:', error)
+      }
+      return getActiveTransferForContact(contactId)
     }
   }
 
@@ -239,15 +295,28 @@ export const useTransfersStore = defineStore('transfers', () => {
     })
   }
 
-  function addTransfer(transfer: AgentTransfer) {
+  function upsertTransfer(transfer: AgentTransfer) {
     // Mark as synced via WebSocket
     lastSyncedAt.value = Date.now()
 
-    // Add to beginning (newest first for display, but server returns FIFO)
-    const exists = transfers.value.some(t => t.id === transfer.id)
-    if (!exists) {
+    const existingIndex = transfers.value.findIndex(t => t.id === transfer.id)
+    const existingContactId = existingIndex !== -1
+      ? transfers.value[existingIndex].contact_id
+      : undefined
+    if (existingContactId && existingContactId !== transfer.contact_id) {
+      invalidateContactFetchAuthority(existingContactId)
+    }
+    invalidateContactFetchAuthority(transfer.contact_id)
+
+    if (existingIndex !== -1) {
+      transfers.value.splice(existingIndex, 1, {
+        ...transfers.value[existingIndex],
+        ...transfer,
+      })
+    } else {
+      // Add to beginning (newest first for display, but server returns FIFO)
       transfers.value.unshift(transfer)
-      if (!transfer.agent_id) {
+      if (transfer.status === 'active' && !transfer.agent_id) {
         if (transfer.team_id) {
           teamQueueCounts.value[transfer.team_id] = (teamQueueCounts.value[transfer.team_id] || 0) + 1
         } else {
@@ -255,19 +324,59 @@ export const useTransfersStore = defineStore('transfers', () => {
         }
       }
     }
+
+    activeTransferByContact.value = {
+      ...activeTransferByContact.value,
+      [transfer.contact_id]: transfer.status === 'active' ? transfer : null,
+    }
   }
 
-  function updateTransfer(id: string, updates: Partial<AgentTransfer>): boolean {
+  function addTransfer(transfer: AgentTransfer) {
+    upsertTransfer(transfer)
+  }
+
+  function updateTransfer(
+    id: string,
+    updates: Partial<AgentTransfer>,
+    authoritativeContactId?: string,
+  ): boolean {
     // Mark as synced via WebSocket
     lastSyncedAt.value = Date.now()
+    // Resume/assignment events carry the authoritative contact identity even
+    // when their transfer is outside the bounded queue and exact-contact cache.
+    // Make an older exact lookup stale before attempting the local update.
+    if (authoritativeContactId) {
+      invalidateContactFetchAuthority(authoritativeContactId)
+    }
 
     const index = transfers.value.findIndex(t => t.id === id)
     if (index !== -1) {
       const oldTransfer = transfers.value[index]
       const updatedTransfer = { ...oldTransfer, ...updates }
+      if (oldTransfer.contact_id !== authoritativeContactId) {
+        invalidateContactFetchAuthority(oldTransfer.contact_id)
+      }
+      if (
+        updatedTransfer.contact_id !== oldTransfer.contact_id &&
+        updatedTransfer.contact_id !== authoritativeContactId
+      ) {
+        invalidateContactFetchAuthority(updatedTransfer.contact_id)
+      }
 
       // Use splice for proper Vue reactivity (array element replacement)
       transfers.value.splice(index, 1, updatedTransfer)
+
+      if (updatedTransfer.status === 'active') {
+        activeTransferByContact.value = {
+          ...activeTransferByContact.value,
+          [updatedTransfer.contact_id]: updatedTransfer,
+        }
+      } else if (activeTransferByContact.value[updatedTransfer.contact_id]?.id === id) {
+        activeTransferByContact.value = {
+          ...activeTransferByContact.value,
+          [updatedTransfer.contact_id]: null,
+        }
+      }
 
       // Update queue count if assignment changed
       if (updates.agent_id !== undefined) {
@@ -301,6 +410,28 @@ export const useTransfersStore = defineStore('transfers', () => {
       return true
     }
 
+    const cachedEntry = Object.entries(activeTransferByContact.value).find(
+      ([, transfer]) => transfer?.id === id,
+    )
+    if (cachedEntry) {
+      const [contactId, cachedTransfer] = cachedEntry
+      const updatedTransfer = { ...cachedTransfer!, ...updates }
+      if (contactId !== authoritativeContactId) {
+        invalidateContactFetchAuthority(contactId)
+      }
+      if (
+        updatedTransfer.contact_id !== contactId &&
+        updatedTransfer.contact_id !== authoritativeContactId
+      ) {
+        invalidateContactFetchAuthority(updatedTransfer.contact_id)
+      }
+      activeTransferByContact.value = {
+        ...activeTransferByContact.value,
+        [contactId]: updatedTransfer.status === 'active' ? updatedTransfer : null,
+      }
+      return true
+    }
+
     return false
   }
 
@@ -311,6 +442,7 @@ export const useTransfersStore = defineStore('transfers', () => {
     const index = transfers.value.findIndex(t => t.id === id)
     if (index !== -1) {
       const transfer = transfers.value[index]
+      invalidateContactFetchAuthority(transfer.contact_id)
       if (transfer.status === 'active' && !transfer.agent_id) {
         if (transfer.team_id) {
           teamQueueCounts.value[transfer.team_id] = Math.max(0, (teamQueueCounts.value[transfer.team_id] || 0) - 1)
@@ -319,6 +451,24 @@ export const useTransfersStore = defineStore('transfers', () => {
         }
       }
       transfers.value.splice(index, 1)
+      if (activeTransferByContact.value[transfer.contact_id]?.id === id) {
+        activeTransferByContact.value = {
+          ...activeTransferByContact.value,
+          [transfer.contact_id]: null,
+        }
+      }
+      return
+    }
+
+    const cachedEntry = Object.entries(activeTransferByContact.value).find(
+      ([, transfer]) => transfer?.id === id,
+    )
+    if (cachedEntry) {
+      invalidateContactFetchAuthority(cachedEntry[0])
+      activeTransferByContact.value = {
+        ...activeTransferByContact.value,
+        [cachedEntry[0]]: null,
+      }
     }
   }
 
@@ -336,6 +486,7 @@ export const useTransfersStore = defineStore('transfers', () => {
     // Pagination
     totalCount,
     fetchTransfers,
+    fetchActiveTransferForContact,
     // History
     historyTransfers,
     historyTotalCount,
@@ -345,6 +496,7 @@ export const useTransfersStore = defineStore('transfers', () => {
     loadMoreHistory,
     // CRUD
     addTransfer,
+    upsertTransfer,
     updateTransfer,
     removeTransfer,
     getActiveTransferForContact,

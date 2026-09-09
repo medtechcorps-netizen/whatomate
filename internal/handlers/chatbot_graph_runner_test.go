@@ -58,7 +58,46 @@ func newGraphTestFixtures(t *testing.T) (
 		LastActivityAt:  time.Now(),
 	}
 	require.NoError(t, app.DB.Create(session).Error)
+	bindNewGraphTestInbound(t, app, org, account, contact, "graph trigger")
 	return app, org, account, contact, session
+}
+
+// bindNewGraphTestInbound persists the durable inbound identity that
+// InboundContinuationProcessor.processClaimed installs before invoking the
+// graph runner in production. Call it once for each logically new inbound
+// message. An intentional retry of the same delivery must retain the existing
+// binding instead so its action-ledger identity remains stable.
+func bindNewGraphTestInbound(
+	t *testing.T,
+	app *App,
+	org *models.Organization,
+	account *models.WhatsAppAccount,
+	contact *models.Contact,
+	content string,
+) *models.Message {
+	t.Helper()
+	messageID := uuid.New()
+	wamid := "wamid.graph-" + messageID.String()
+	message := &models.Message{
+		BaseModel:         models.BaseModel{ID: messageID},
+		OrganizationID:    org.ID,
+		WhatsAppAccount:   account.Name,
+		ContactID:         contact.ID,
+		WhatsAppMessageID: wamid,
+		Direction:         models.DirectionIncoming,
+		MessageType:       models.MessageTypeText,
+		Content:           content,
+		Status:            models.MessageStatusReceived,
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(message).Error)
+	app.inboundContinuation = &inboundContinuationExecution{
+		OrganizationID: org.ID,
+		ContactID:      contact.ID,
+		MessageID:      message.ID,
+		WAMID:          wamid,
+	}
+	return message
 }
 
 // chatGraphPath extracts the recorded __path__ entries from session data
@@ -134,6 +173,7 @@ func TestRunChatGraph_GoldenPath(t *testing.T) {
 	assert.Equal(t, "", p1[1]["outcome"])
 
 	// Run 2: user clicks button opt_a. b1 consumes → e1 → terminal.
+	bindNewGraphTestInbound(t, app, org, account, contact, "opt_a")
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "", "opt_a", nil))
 
 	require.NoError(t, app.DB.First(session, session.ID).Error)
@@ -186,6 +226,7 @@ func TestRunChatGraph_ButtonsStoreAs(t *testing.T) {
 	require.Equal(t, "b1", session.CurrentStep)
 
 	// Click: WhatsApp delivers the title as text and the id as buttonID.
+	bindNewGraphTestInbound(t, app, org, account, contact, "PIS vs Non PIS Account")
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "PIS vs Non PIS Account", "opt_a", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 
@@ -232,6 +273,7 @@ func TestRunChatGraph_ButtonsRePromptOnText(t *testing.T) {
 
 	// Second inbound: text instead of button click. Should re-send (stays
 	// at b1, status still active, path has another b1 entry).
+	bindNewGraphTestInbound(t, app, org, account, contact, "huh?")
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "huh?", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 	assert.Equal(t, "b1", session.CurrentStep)
@@ -280,6 +322,7 @@ func TestRunChatGraph_UnknownButtonEndsFlow(t *testing.T) {
 	require.Equal(t, "b1", session.CurrentStep)
 
 	// Click an unknown button. No edge matches, no default → session completes.
+	bindNewGraphTestInbound(t, app, org, account, contact, "opt_z")
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "", "opt_z", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 	assert.Equal(t, models.SessionStatusCompleted, session.Status)
@@ -439,6 +482,7 @@ func TestRunChatGraph_WhatsAppFlow_ConsumesResponseAndAdvances(t *testing.T) {
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 	require.Equal(t, "wa", session.CurrentStep)
 
+	bindNewGraphTestInbound(t, app, org, account, contact, "WhatsApp flow response")
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "", "", map[string]any{
 		"full_name": "Shri",
 		"email":     "shri@example.com",
@@ -488,6 +532,7 @@ func TestRunChatGraph_Prompt_HappyPath(t *testing.T) {
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 	assert.Equal(t, "p1", session.CurrentStep, "should park at prompt on first inbound")
 
+	bindNewGraphTestInbound(t, app, org, account, contact, "shri@example.com")
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "shri@example.com", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 	assert.Equal(t, models.SessionStatusCompleted, session.Status)
@@ -504,6 +549,7 @@ func TestRunChatGraph_Prompt_RetryOnInvalid(t *testing.T) {
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
 
 	// First invalid attempt
+	bindNewGraphTestInbound(t, app, org, account, contact, "not-an-email")
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "not-an-email", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 	assert.Equal(t, "p1", session.CurrentStep, "should stay at prompt on invalid")
@@ -522,12 +568,14 @@ func TestRunChatGraph_Prompt_MaxRetriesRoutesToEdge(t *testing.T) {
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
 
 	// First invalid → retry
+	bindNewGraphTestInbound(t, app, org, account, contact, "x")
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "x", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 	require.Equal(t, "p1", session.CurrentStep)
 	require.Equal(t, 1, session.StepRetries)
 
 	// Second invalid → max_retries → end
+	bindNewGraphTestInbound(t, app, org, account, contact, "y")
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "y", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 	assert.Equal(t, models.SessionStatusCompleted, session.Status)
@@ -1482,6 +1530,7 @@ func TestRunChatGraph_Prompt_NoRegexAcceptsAnything(t *testing.T) {
 	flow := newPromptFlow(t, app, org, account, "", 3)
 
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
+	bindNewGraphTestInbound(t, app, org, account, contact, "literally anything")
 	require.NoError(t, app.runChatGraph(account, contact, session, flow, "literally anything", "", nil))
 	require.NoError(t, app.DB.First(session, session.ID).Error)
 	assert.Equal(t, models.SessionStatusCompleted, session.Status)

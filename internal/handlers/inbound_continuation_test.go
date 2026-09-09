@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/config"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	appwebsocket "github.com/shridarpatil/whatomate/internal/websocket"
@@ -21,6 +22,7 @@ import (
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func inboundContinuationTextMessage(
@@ -63,10 +65,39 @@ func TestInboundContinuation_CommittedNativeInboundPublishesRealtimeExactlyOnce(
 		t.Skip("TEST_REDIS_URL not set")
 	}
 	organization, account := createProcessorTestOrg(t, app)
+	var providerCalls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		providerCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"messages": []map[string]string{{"id": "wamid.must-not-send"}},
+		})
+	}))
+	t.Cleanup(provider.Close)
+	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, provider.URL)
+	phone := "6050" + uuid.NewString()[:8]
+	contact := testutil.CreateTestContactWith(
+		t,
+		app.DB,
+		organization.ID,
+		testutil.WithContactAccount(account.Name),
+		testutil.WithPhoneNumber(phone),
+	)
+	transfer := &models.AgentTransfer{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  organization.ID,
+		ContactID:       contact.ID,
+		WhatsAppAccount: account.Name,
+		PhoneNumber:     contact.PhoneNumber,
+		Status:          models.TransferStatusActive,
+		Source:          models.TransferSourceManual,
+		TransferredAt:   time.Now().UTC(),
+	}
+	require.NoError(t, app.DB.Create(transfer).Error)
 	message := inboundContinuationTextMessage(
 		t,
 		"wamid.realtime-commit-"+uuid.NewString(),
-		"6050"+uuid.NewString()[:8],
+		phone,
 		"Show this inbound message live",
 	)
 	work, duplicate, err := app.persistIncomingMessageBeforeAck(
@@ -76,19 +107,24 @@ func TestInboundContinuation_CommittedNativeInboundPublishesRealtimeExactlyOnce(
 	)
 	require.NoError(t, err)
 	require.False(t, duplicate)
+	require.Equal(t, contact.ID, work.Contact.ID)
+	assert.Equal(t, true, work.Persisted.Metadata[incomingAutomaticAISuppressedKey])
+	assert.Equal(
+		t,
+		database.AutomaticReplyBlockedHumanHandover,
+		work.Persisted.Metadata[incomingAutomaticAISuppressionReasonKey],
+	)
 
-	// Stop immediately after the native inbound broadcast. This avoids an
-	// unrelated chatbot reply or transfer adding another realtime event.
-	require.NoError(t, app.DB.Create(&models.AgentTransfer{
-		BaseModel:       models.BaseModel{ID: uuid.New()},
-		OrganizationID:  organization.ID,
-		ContactID:       work.Contact.ID,
-		WhatsAppAccount: account.Name,
-		PhoneNumber:     work.Contact.PhoneNumber,
-		Status:          models.TransferStatusActive,
-		Source:          models.TransferSourceManual,
-		TransferredAt:   time.Now().UTC(),
-	}).Error)
+	// Resume after admission. The per-WAMID suppression is monotonic and must
+	// remain authoritative for this already accepted physical message.
+	require.NoError(t, app.DB.Transaction(func(tx *gorm.DB) error {
+		if err := database.LockOrganizationPolicyScope(tx, organization.ID); err != nil {
+			return err
+		}
+		return tx.Model(&models.AgentTransfer{}).
+			Where("id = ? AND organization_id = ? AND status = ?", transfer.ID, organization.ID, models.TransferStatusActive).
+			Update("status", models.TransferStatusResumed).Error
+	}))
 
 	hub := appwebsocket.NewHub(app.Log)
 	go hub.Run()
@@ -132,6 +168,25 @@ func TestInboundContinuation_CommittedNativeInboundPublishesRealtimeExactlyOnce(
 	assertNoInboundContinuationRedisEvent(t, redisMessages)
 	stored := loadInboundContinuationJob(t, app, organization.ID, work.Persisted.ID)
 	assert.Equal(t, models.ScheduledJobStatusCompleted, stored.Status)
+	assert.Zero(t, providerCalls.Load())
+	var outgoingCount, actionCount int64
+	require.NoError(t, app.DB.Model(&models.Message{}).Where(
+		"organization_id = ? AND contact_id = ? AND direction = ?",
+		organization.ID,
+		contact.ID,
+		models.DirectionOutgoing,
+	).Count(&outgoingCount).Error)
+	require.NoError(t, app.DB.Model(&models.ScheduledJob{}).Where(
+		"organization_id = ? AND kind = ? AND aggregate_id = ?",
+		organization.ID,
+		inboundContinuationActionJobKind,
+		work.Persisted.ID,
+	).Count(&actionCount).Error)
+	assert.Zero(t, outgoingCount)
+	assert.Zero(t, actionCount)
+	var persisted models.Message
+	require.NoError(t, app.DB.First(&persisted, "id = ?", work.Persisted.ID).Error)
+	assert.Equal(t, true, persisted.Metadata[incomingAutomaticAISuppressedKey])
 }
 
 func TestInboundContinuation_RolledBackNativeInboundPublishesNoRealtime(
@@ -590,8 +645,10 @@ func TestInboundContinuation_ResponseActionMarkerSkipsReplay(t *testing.T) {
 
 	first := app.scopedApp(app.DB, organization.ID)
 	first.inboundContinuation = &inboundContinuationExecution{
-		MessageID: inboundMessageID,
-		WAMID:     wamid,
+		OrganizationID: organization.ID,
+		ContactID:      contact.ID,
+		MessageID:      inboundMessageID,
+		WAMID:          wamid,
 	}
 	require.NoError(t, first.sendAndSaveTextMessage(
 		account,
@@ -601,8 +658,10 @@ func TestInboundContinuation_ResponseActionMarkerSkipsReplay(t *testing.T) {
 
 	replay := app.scopedApp(app.DB, organization.ID)
 	replay.inboundContinuation = &inboundContinuationExecution{
-		MessageID: inboundMessageID,
-		WAMID:     wamid,
+		OrganizationID: organization.ID,
+		ContactID:      contact.ID,
+		MessageID:      inboundMessageID,
+		WAMID:          wamid,
 	}
 	require.NoError(t, replay.sendAndSaveTextMessage(
 		account,
@@ -671,8 +730,10 @@ func TestInboundContinuation_CompletionCheckpointSkipsWholeJobReplay(
 
 	checkpointApp := app.scopedApp(app.DB, organization.ID)
 	checkpointApp.inboundContinuation = &inboundContinuationExecution{
-		MessageID: work.Persisted.ID,
-		WAMID:     message.ID,
+		OrganizationID: organization.ID,
+		ContactID:      work.Contact.ID,
+		MessageID:      work.Persisted.ID,
+		WAMID:          message.ID,
 	}
 	require.NoError(t, checkpointApp.markInboundContinuationCompleted(
 		work.Persisted.ID,
@@ -723,8 +784,10 @@ func TestInboundContinuation_ProviderAttemptFailureIsTerminalWithoutReplay(
 
 	execution := app.scopedApp(app.DB, organization.ID)
 	execution.inboundContinuation = &inboundContinuationExecution{
-		MessageID: uuid.New(),
-		WAMID:     "wamid.provider-failure-" + uuid.NewString(),
+		OrganizationID: organization.ID,
+		ContactID:      contact.ID,
+		MessageID:      uuid.New(),
+		WAMID:          "wamid.provider-failure-" + uuid.NewString(),
 	}
 	err := execution.sendAndSaveTextMessage(
 		account,
@@ -750,8 +813,10 @@ func TestInboundContinuation_ProviderAttemptFailureIsTerminalWithoutReplay(
 
 	replay := app.scopedApp(app.DB, organization.ID)
 	replay.inboundContinuation = &inboundContinuationExecution{
-		MessageID: execution.inboundContinuation.MessageID,
-		WAMID:     execution.inboundContinuation.WAMID,
+		OrganizationID: organization.ID,
+		ContactID:      contact.ID,
+		MessageID:      execution.inboundContinuation.MessageID,
+		WAMID:          execution.inboundContinuation.WAMID,
 	}
 	err = replay.sendAndSaveTextMessage(
 		account,
@@ -826,8 +891,8 @@ func TestInboundContinuation_RLSTenantReplySendsWithoutSelfDeadlock(
 	require.False(t, duplicate)
 
 	// Enable the production transaction shape only after fixture creation.
-	// The processor now holds the same contact/session locks as production,
-	// while inbound SendOutgoingMessage deliberately reuses that tenant tx.
+	// The processor holds the same outer tenant transaction as production,
+	// while durable provider-result and read-state phases commit independently.
 	app.Config = &config.Config{
 		Database: config.DatabaseConfig{RLSEnabled: true},
 	}
@@ -880,6 +945,53 @@ func TestInboundContinuation_RLSTenantReplySendsWithoutSelfDeadlock(
 	assert.Equal(t, int32(1), providerCalls.Load())
 }
 
+func TestInboundContinuation_RLSTransferCommitsBeforeCompletionFence(t *testing.T) {
+	app := newProcessorTestApp(t)
+	organization, account := createProcessorTestOrg(t, app)
+	contact := testutil.CreateTestContactWith(
+		t,
+		app.DB,
+		organization.ID,
+		testutil.WithContactAccount(account.Name),
+	)
+	app.Config = &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
+
+	err := app.WithTenantApp(organization.ID, func(scoped *App) error {
+		execution := scoped.scopedApp(scoped.DB, organization.ID)
+		execution.inboundContinuation = &inboundContinuationExecution{
+			OrganizationID: organization.ID,
+			ContactID:      contact.ID,
+			MessageID:      uuid.New(),
+			WAMID:          "wamid.rls-transfer-" + uuid.NewString(),
+		}
+		execution.createTransferToQueue(
+			account,
+			contact,
+			models.TransferSourceFlow,
+		)
+
+		fenceCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return database.WithTenantReadCommitted(
+			app.DB.WithContext(fenceCtx),
+			organization.ID,
+			func(tx *gorm.DB) error {
+				return database.LockOrganizationAIAttemptScope(tx, organization.ID)
+			},
+		)
+	})
+	require.NoError(t, err, "completion fence must not wait on its own outer RLS transaction")
+
+	var transferCount int64
+	require.NoError(t, app.DB.Model(&models.AgentTransfer{}).Where(
+		"organization_id = ? AND contact_id = ? AND status = ?",
+		organization.ID,
+		contact.ID,
+		models.TransferStatusActive,
+	).Count(&transferCount).Error)
+	assert.EqualValues(t, 1, transferCount)
+}
+
 func TestInboundContinuation_RLSOuterRollbackDoesNotReplayAcceptedSend(
 	t *testing.T,
 ) {
@@ -921,10 +1033,12 @@ func TestInboundContinuation_RLSOuterRollbackDoesNotReplayAcceptedSend(
 		func(scoped *App) error {
 			execution := scoped.scopedApp(scoped.DB, organization.ID)
 			execution.inboundContinuation = &inboundContinuationExecution{
-				MessageID: work.Persisted.ID,
-				WAMID:     message.ID,
+				OrganizationID: organization.ID,
+				ContactID:      work.Contact.ID,
+				MessageID:      work.Persisted.ID,
+				WAMID:          message.ID,
 			}
-			execution.ClearContactChatbotTracking(work.Contact.ID)
+			require.NoError(t, execution.clearContactChatbotTrackingForInbound(work.Contact.ID))
 			_, _, sessionErr := execution.getOrCreateSession(
 				organization.ID,
 				work.Contact.ID,
@@ -957,46 +1071,222 @@ func TestInboundContinuation_RLSOuterRollbackDoesNotReplayAcceptedSend(
 			work.Contact.ID,
 		).
 		Count(&outgoingCount).Error)
-	assert.Zero(
+	assert.EqualValues(
 		t,
+		1,
 		outgoingCount,
-		"the outer tenant transaction was intentionally rolled back",
+		"the independently committed provider result must survive outer rollback",
+	)
+	var persistedOutgoing models.Message
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND direction = ? AND contact_id = ?",
+		organization.ID,
+		models.DirectionOutgoing,
+		work.Contact.ID,
+	).First(&persistedOutgoing).Error)
+	settledAtText, ok := persistedOutgoing.Metadata[automaticAIDispatchSettledAtKey].(string)
+	require.True(t, ok)
+	settledAt, err := time.Parse(time.RFC3339Nano, settledAtText)
+	require.NoError(t, err)
+
+	var persistedIncoming models.Message
+	require.NoError(t, app.DB.First(
+		&persistedIncoming,
+		"id = ? AND organization_id = ?",
+		work.Persisted.ID,
+		organization.ID,
+	).Error)
+	assert.Equal(
+		t,
+		models.MessageStatusRead,
+		persistedIncoming.Status,
+		"the independently committed read state must survive outer rollback",
 	)
 
-	replayErr := app.WithTenantApp(
+	var persistedContact models.Contact
+	require.NoError(t, app.DB.First(
+		&persistedContact,
+		"id = ? AND organization_id = ?",
+		work.Contact.ID,
 		organization.ID,
-		func(scoped *App) error {
-			execution := scoped.scopedApp(scoped.DB, organization.ID)
-			execution.inboundContinuation = &inboundContinuationExecution{
-				MessageID: work.Persisted.ID,
-				WAMID:     message.ID,
-			}
-			execution.ClearContactChatbotTracking(work.Contact.ID)
-			_, _, sessionErr := execution.getOrCreateSession(
-				organization.ID,
-				work.Contact.ID,
-				account.Name,
-				work.Contact.PhoneNumber,
-				30,
-			)
-			if sessionErr != nil {
-				return sessionErr
-			}
-			return execution.sendAndSaveTextMessage(
-				account,
-				&work.Contact,
-				"Exactly one provider attempt",
-			)
-		},
+	).Error)
+	assert.True(
+		t,
+		persistedContact.IsRead,
+		"the independently committed contact read state must survive outer rollback",
 	)
-	require.Error(t, replayErr)
-	assert.True(t, inboundContinuationRequiresManualReview(replayErr))
+	assert.NotNil(
+		t,
+		persistedContact.ChatbotLastMessageAt,
+		"the independently committed chatbot timestamp must survive outer rollback",
+	)
+
+	// Model a transient failure of the original best-effort SLA update after
+	// the provider result and action resolution committed. Resolved replay must
+	// repair this local postcondition without contacting the provider again.
+	require.NoError(t, app.DB.Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", work.Contact.ID, organization.ID).
+		Updates(map[string]any{
+			"chatbot_last_message_at": nil,
+			"chatbot_reminder_sent":   true,
+		}).Error)
+
+	replay := func() error {
+		return app.WithTenantApp(
+			organization.ID,
+			func(scoped *App) error {
+				execution := scoped.scopedApp(scoped.DB, organization.ID)
+				execution.inboundContinuation = &inboundContinuationExecution{
+					OrganizationID: organization.ID,
+					ContactID:      work.Contact.ID,
+					MessageID:      work.Persisted.ID,
+					WAMID:          message.ID,
+				}
+				if err := execution.clearContactChatbotTrackingForInbound(work.Contact.ID); err != nil {
+					return err
+				}
+				_, _, sessionErr := execution.getOrCreateSession(
+					organization.ID,
+					work.Contact.ID,
+					account.Name,
+					work.Contact.PhoneNumber,
+					30,
+				)
+				if sessionErr != nil {
+					return sessionErr
+				}
+				return execution.sendAndSaveTextMessage(
+					account,
+					&work.Contact,
+					"Exactly one provider attempt",
+				)
+			},
+		)
+	}
+	replayErr := replay()
+	require.NoError(t, replayErr)
 	assert.Equal(
 		t,
 		int32(1),
 		providerCalls.Load(),
 		"the accepted-but-rolled-back send must be reconciled, never replayed",
 	)
+	require.NoError(t, app.DB.Model(&models.Message{}).
+		Where(
+			"organization_id = ? AND direction = ? AND contact_id = ?",
+			organization.ID,
+			models.DirectionOutgoing,
+			work.Contact.ID,
+		).
+		Count(&outgoingCount).Error)
+	assert.EqualValues(t, 1, outgoingCount)
+	require.NoError(t, app.DB.First(
+		&persistedContact,
+		"id = ? AND organization_id = ?",
+		work.Contact.ID,
+		organization.ID,
+	).Error)
+	require.NotNil(t, persistedContact.ChatbotLastMessageAt)
+	assert.WithinDuration(
+		t,
+		settledAt,
+		persistedContact.ChatbotLastMessageAt.UTC(),
+		time.Microsecond,
+		"resolved replay must restore the canonical provider-settlement SLA time",
+	)
+	assert.False(t, persistedContact.ChatbotReminderSent)
+
+	newerTrackingAt := settledAt.Add(time.Minute)
+	require.NoError(t, app.DB.Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", work.Contact.ID, organization.ID).
+		Updates(map[string]any{
+			"chatbot_last_message_at": newerTrackingAt,
+			"chatbot_reminder_sent":   true,
+		}).Error)
+	require.NoError(t, replay())
+	assert.Equal(t, int32(1), providerCalls.Load())
+	require.NoError(t, app.DB.First(
+		&persistedContact,
+		"id = ? AND organization_id = ?",
+		work.Contact.ID,
+		organization.ID,
+	).Error)
+	require.NotNil(t, persistedContact.ChatbotLastMessageAt)
+	assert.WithinDuration(
+		t,
+		newerTrackingAt,
+		persistedContact.ChatbotLastMessageAt.UTC(),
+		time.Microsecond,
+		"an older resolved replay must preserve a newer chatbot SLA state",
+	)
+	assert.True(t, persistedContact.ChatbotReminderSent)
+
+	require.NoError(t, app.DB.Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", work.Contact.ID, organization.ID).
+		Updates(map[string]any{
+			"chatbot_last_message_at": settledAt,
+			"chatbot_reminder_sent":   false,
+		}).Error)
+	newerInbound := models.Message{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    organization.ID,
+		WhatsAppAccount:   account.Name,
+		ContactID:         work.Contact.ID,
+		WhatsAppMessageID: "wamid.newer-clear-" + uuid.NewString(),
+		Direction:         models.DirectionIncoming,
+		MessageType:       models.MessageTypeText,
+		Content:           "newer customer reply",
+		Status:            models.MessageStatusReceived,
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(&newerInbound).Error)
+	require.NoError(t, app.DB.First(&newerInbound, "id = ?", newerInbound.ID).Error)
+	newerInboundAt := newerInbound.EffectiveIngestedAt()
+	require.True(t, newerInboundAt.After(settledAt))
+	require.NoError(t, app.WithTenantApp(
+		organization.ID,
+		func(scoped *App) error {
+			execution := scoped.scopedApp(scoped.DB, organization.ID)
+			execution.inboundContinuation = &inboundContinuationExecution{
+				OrganizationID: organization.ID,
+				ContactID:      work.Contact.ID,
+				MessageID:      newerInbound.ID,
+				WAMID:          newerInbound.WhatsAppMessageID,
+			}
+			return execution.clearContactChatbotTrackingForInbound(work.Contact.ID)
+		},
+	))
+	persistedContact = models.Contact{}
+	require.NoError(t, app.DB.First(
+		&persistedContact,
+		"id = ? AND organization_id = ?",
+		work.Contact.ID,
+		organization.ID,
+	).Error)
+	assert.Nil(t, persistedContact.ChatbotLastMessageAt)
+	assert.False(t, persistedContact.ChatbotReminderSent)
+	clearedThrough, err := chatbotTrackingClearWatermark(persistedContact.Metadata)
+	require.NoError(t, err)
+	assert.WithinDuration(t, newerInboundAt, clearedThrough, time.Microsecond)
+
+	require.NoError(t, replay())
+	assert.Equal(t, int32(1), providerCalls.Load())
+	persistedContact = models.Contact{}
+	require.NoError(t, app.DB.First(
+		&persistedContact,
+		"id = ? AND organization_id = ?",
+		work.Contact.ID,
+		organization.ID,
+	).Error)
+	assert.Nil(
+		t,
+		persistedContact.ChatbotLastMessageAt,
+		"an older resolved send must not undo a newer customer clear",
+	)
+	assert.False(t, persistedContact.ChatbotReminderSent)
+	clearedThrough, err = chatbotTrackingClearWatermark(persistedContact.Metadata)
+	require.NoError(t, err)
+	assert.WithinDuration(t, newerInboundAt, clearedThrough, time.Microsecond)
 }
 
 func TestInboundContinuation_UnresolvedPreAttemptIsTerminalBeforeCallback(
@@ -1020,13 +1310,23 @@ func TestInboundContinuation_UnresolvedPreAttemptIsTerminalBeforeCallback(
 
 	first := app.scopedApp(app.DB, organization.ID)
 	first.inboundContinuation = &inboundContinuationExecution{
-		MessageID: work.Persisted.ID,
-		WAMID:     message.ID,
+		OrganizationID: organization.ID,
+		ContactID:      work.Contact.ID,
+		MessageID:      work.Persisted.ID,
+		WAMID:          message.ID,
 	}
-	claim, err := first.claimInboundContinuationAction(
+	var claim *inboundContinuationActionClaim
+	err = first.withInboundContinuationPhysicalAIAttempt(
 		context.Background(),
-		"text",
-		nil,
+		func() error {
+			var claimErr error
+			claim, claimErr = first.claimInboundContinuationAction(
+				context.Background(),
+				"text",
+				nil,
+			)
+			return claimErr
+		},
 	)
 	require.NoError(t, err)
 	require.True(t, claim.Execute)
@@ -1034,8 +1334,10 @@ func TestInboundContinuation_UnresolvedPreAttemptIsTerminalBeforeCallback(
 	var callbackCalls atomic.Int32
 	replay := app.scopedApp(app.DB, organization.ID)
 	replay.inboundContinuation = &inboundContinuationExecution{
-		MessageID: work.Persisted.ID,
-		WAMID:     message.ID,
+		OrganizationID: organization.ID,
+		ContactID:      work.Contact.ID,
+		MessageID:      work.Persisted.ID,
+		WAMID:          message.ID,
 	}
 	err = replay.runInboundContinuationSend(
 		"text",
@@ -1075,21 +1377,26 @@ func TestInboundContinuation_UncertainActionFailsJobAndDuplicateCannotRevive(
 	processCalls := 0
 	var providerCallbacks atomic.Int32
 	processor.process = func(
-		_ context.Context,
+		processCtx context.Context,
 		scoped *App,
 		_ *persistedIncomingMessage,
 	) error {
 		processCalls++
 		if processCalls == 1 {
-			_, claimErr := scoped.claimInboundContinuationAction(
-				context.Background(),
-				"text",
-				nil,
+			return scoped.withInboundContinuationPhysicalAIAttempt(
+				processCtx,
+				func() error {
+					_, claimErr := scoped.claimInboundContinuationAction(
+						context.Background(),
+						"text",
+						nil,
+					)
+					if claimErr != nil {
+						return claimErr
+					}
+					return errors.New("simulated crash after committed pre-attempt")
+				},
 			)
-			if claimErr != nil {
-				return claimErr
-			}
-			return errors.New("simulated crash after committed pre-attempt")
 		}
 		return scoped.runInboundContinuationSend(
 			"text",
@@ -1206,8 +1513,10 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 		}
 		first := app.scopedApp(app.DB, organization.ID)
 		first.inboundContinuation = &inboundContinuationExecution{
-			MessageID: inboundMessageID,
-			WAMID:     "wamid.graph-api",
+			OrganizationID: organization.ID,
+			ContactID:      contact.ID,
+			MessageID:      inboundMessageID,
+			WAMID:          "wamid.graph-api",
 		}
 		restore := first.pushInboundContinuationActionScope(
 			"chat-graph:flow-a:lookup-customer:visit:0",
@@ -1235,8 +1544,10 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 		}
 		replay := app.scopedApp(app.DB, organization.ID)
 		replay.inboundContinuation = &inboundContinuationExecution{
-			MessageID: inboundMessageID,
-			WAMID:     "wamid.graph-api",
+			OrganizationID: organization.ID,
+			ContactID:      contact.ID,
+			MessageID:      inboundMessageID,
+			WAMID:          "wamid.graph-api",
 		}
 		restore = replay.pushInboundContinuationActionScope(
 			"chat-graph:flow-a:lookup-customer:visit:0",
@@ -1303,8 +1614,10 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 			}
 			execution := app.scopedApp(app.DB, organization.ID)
 			execution.inboundContinuation = &inboundContinuationExecution{
-				MessageID: inboundMessageID,
-				WAMID:     "wamid.graph-webhook",
+				OrganizationID: organization.ID,
+				ContactID:      contact.ID,
+				MessageID:      inboundMessageID,
+				WAMID:          "wamid.graph-webhook",
 			}
 			restore := execution.pushInboundContinuationActionScope(
 				"chat-graph:flow-a:notify-crm:visit:1",
@@ -1414,4 +1727,93 @@ func TestMarketingPreference_MergedPhoneAndBSUIDUpdateCanonicalBeforeACK(
 	).Error)
 	assert.False(t, storedCanonical.MarketingOptOut)
 	assert.Equal(t, aliasBSUID, storedCanonical.BSUID)
+}
+
+func TestMarketingPreference_STOPWaitsForPhysicalAIAttemptFence(t *testing.T) {
+	app := newProcessorTestApp(t)
+	organization, account := createProcessorTestOrg(t, app)
+	phone := "6019" + uuid.NewString()[:8]
+	contact := testutil.CreateTestContactWith(
+		t,
+		app.DB,
+		organization.ID,
+		testutil.WithContactAccount(account.Name),
+		testutil.WithPhoneNumber(phone),
+	)
+
+	// Model an automatic-AI physical provider attempt after its final policy
+	// decision. The KEY SHARE lock must exclude the consent writer's UPDATE
+	// until that attempt finishes.
+	attemptTx := app.DB.Begin()
+	require.NoError(t, attemptTx.Error)
+	t.Cleanup(func() { _ = attemptTx.Rollback().Error })
+	require.NoError(t, database.LockOrganizationAIAttemptScope(
+		attemptTx,
+		organization.ID,
+	))
+
+	writerPID := make(chan int, 1)
+	writerDone := make(chan error, 1)
+	go func() {
+		writerDone <- app.DB.Connection(func(connection *gorm.DB) error {
+			session := connection.Session(&gorm.Session{NewDB: true})
+			var backendPID int
+			if err := session.Raw("SELECT pg_backend_pid()").
+				Scan(&backendPID).Error; err != nil {
+				writerPID <- 0
+				return err
+			}
+			writerPID <- backendPID
+			scoped := &App{
+				DB:     session,
+				Log:    app.Log,
+				Config: app.Config,
+			}
+			return scoped.processMarketingPreference(
+				account.PhoneID,
+				"+"+phone,
+				"",
+				"STOP",
+			)
+		})
+	}()
+
+	backendPID := <-writerPID
+	require.Positive(t, backendPID)
+	testutil.RequirePostgresBackendWaitingForLock(t, app.DB, backendPID)
+
+	var beforeRelease models.Contact
+	require.NoError(t, app.DB.First(
+		&beforeRelease,
+		"id = ? AND organization_id = ?",
+		contact.ID,
+		organization.ID,
+	).Error)
+	assert.False(
+		t,
+		beforeRelease.MarketingOptOut,
+		"STOP must not commit across the in-flight provider attempt",
+	)
+	select {
+	case err := <-writerDone:
+		require.Failf(t, "marketing preference writer bypassed the attempt fence", "error: %v", err)
+	default:
+	}
+
+	require.NoError(t, attemptTx.Commit().Error)
+	select {
+	case err := <-writerDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "marketing preference writer did not resume after the attempt fence")
+	}
+
+	var persisted models.Contact
+	require.NoError(t, app.DB.First(
+		&persisted,
+		"id = ? AND organization_id = ?",
+		contact.ID,
+		organization.ID,
+	).Error)
+	assert.True(t, persisted.MarketingOptOut)
 }

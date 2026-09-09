@@ -985,6 +985,46 @@ class ApplyControllerTests(unittest.TestCase):
         with self.assertRaises(common.ReleaseError):
             apply._match_plan_observation(observation, live)
 
+    def test_hardened_bridge_remains_a_valid_forward_predecessor(self) -> None:
+        import test_rollback_production_change as rollback_fixtures
+
+        receipt = rollback_fixtures.rollback_receipt()
+        receipt["lineage"].update(
+            {
+                "phase_ordinal": 2,
+                "from": "backend",
+                "to": "bridge",
+                "phase": "bridge",
+            }
+        )
+        receipt["rollback"] = {
+            "allowed_targets": [],
+            "forbidden_targets": ["baseline"],
+        }
+        rollback_fixtures.rollback.validate_rollback_receipt(receipt)
+        receipt_hash = common.sha256_bytes(common.canonical_file_bytes(receipt))
+        state = common.build_phase_state(
+            receipt,
+            change_receipt_sha256=receipt_hash,
+            canary_sha256="9" * 64,
+            control={
+                "workflow_sha": "a" * 40,
+                "workflow_path": (
+                    ".github/workflows/verify-production-crm-canary.yml"
+                ),
+                "run_id": "402",
+                "run_attempt": 1,
+                "runner_environment": "github-hosted",
+                "release_policy_sha256": "b" * 64,
+                "change_schema_sha256": "c" * 64,
+            },
+            completed_at="2026-08-27T00:04:00Z",
+        )
+        state_hash = common.sha256_bytes(common.canonical_file_bytes(state))
+        apply._validate_predecessor(
+            state, state_hash, "bridge", state["provider_state"], state_hash
+        )
+
     def test_live_timestamp_change_between_apply_reads_fails_closed(self) -> None:
         spec = digest_spec()
         first_app = app_response(spec, OLD_DEPLOYMENT)

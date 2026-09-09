@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -928,6 +930,40 @@ func TestSaveIncomingMessage_WithReplyContext(t *testing.T) {
 	}
 	require.NoError(t, app.DB.Create(&originalMsg).Error)
 
+	// Attribute the existing random-ID outgoing row through the real legacy
+	// mirror. A display-name/contact match alone is not account authority.
+	require.NoError(t, persistLegacyWhatsAppMessageMirror(app.DB, account, originalMsg.ID))
+	var mirrored models.Message
+	require.NoError(t, app.DB.Where("organization_id = ? AND id = ?", org.ID, originalMsg.ID).First(&mirrored).Error)
+	require.Equal(t, originalMsg.ID, mirrored.ID)
+	require.Equal(t, originalWAMID, mirrored.WhatsAppMessageID)
+	require.Equal(t, org.ID, mirrored.OrganizationID)
+	require.Equal(t, contact.ID, mirrored.ContactID)
+	require.Equal(t, originalMsg.Direction, mirrored.Direction)
+	require.Equal(t, originalMsg.Status, mirrored.Status)
+	require.Equal(t, originalMsg.Content, mirrored.Content)
+	require.NotNil(t, mirrored.InboxConversationID)
+	var conversation models.InboxConversation
+	require.NoError(t, app.DB.Where("organization_id = ? AND id = ?", org.ID, *mirrored.InboxConversationID).First(&conversation).Error)
+	require.Equal(t, models.ChannelWhatsApp, conversation.Channel)
+	require.Equal(t, contact.ID, conversation.ContactID)
+	require.Equal(t, "legacy-contact:"+contact.ID.String(), conversation.ExternalConversationID)
+	require.NotNil(t, conversation.ContactIdentityID)
+	var channel models.ChannelAccount
+	require.NoError(t, app.DB.Where("organization_id = ? AND id = ?", org.ID, conversation.ChannelAccountID).First(&channel).Error)
+	require.Equal(t, models.ChannelWhatsApp, channel.Channel)
+	require.Equal(t, channelapi.LegacyMetaProvider, channel.Provider)
+	require.Equal(t, "legacy-account:"+account.ID.String(), channel.ExternalAccountID)
+	boundAccountID, err := channelapi.LegacyMetaWhatsAppAccountID(&channel)
+	require.NoError(t, err)
+	require.Equal(t, account.ID, boundAccountID)
+	var identity models.ContactIdentity
+	require.NoError(t, app.DB.Where("organization_id = ? AND id = ?", org.ID, *conversation.ContactIdentityID).First(&identity).Error)
+	require.Equal(t, channel.ID, identity.ChannelAccountID)
+	require.Equal(t, models.ChannelWhatsApp, identity.Channel)
+	require.Equal(t, contact.ID, identity.ContactID)
+	require.Equal(t, "legacy-contact:"+contact.ID.String(), identity.ExternalID)
+
 	// Save reply message
 	replyWAMID := "wamid.reply_" + uuid.New().String()[:8]
 	app.saveIncomingMessage(account, contact, replyWAMID, "text", "Reply to your message", nil, originalWAMID)
@@ -1040,6 +1076,120 @@ func TestMatchFlowTrigger_Match(t *testing.T) {
 	// No match
 	noMatch := app.matchFlowTrigger(org.ID, "hello there")
 	assert.Nil(t, noMatch)
+}
+
+func TestIncomingReactionUsesStableOwnerAcrossAccountRename(t *testing.T) {
+	app, account, contact := whatsappIdentityFixture(t)
+	wamid := "wamid.reaction-rename-" + uuid.NewString()
+	message := models.Message{
+		BaseModel:      models.BaseModel{ID: uuid.NewSHA1(account.ID, []byte("coexistence-message:"+wamid))},
+		OrganizationID: account.OrganizationID, ContactID: contact.ID,
+		WhatsAppAccount: account.Name, WhatsAppMessageID: wamid,
+		Direction: models.DirectionOutgoing, MessageType: models.MessageTypeText,
+		Content: "stable owner", Status: models.MessageStatusSent, Metadata: models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(&message).Error)
+	originalAccountName := account.Name
+	renameWhatsAppIdentityAccount(t, app, account)
+
+	app.handleIncomingReaction(account, contact.PhoneNumber, wamid, "👍", "Patient")
+
+	var stored models.Message
+	require.NoError(t, app.DB.First(&stored, "id = ?", message.ID).Error)
+	assert.NotEqual(t, originalAccountName, stored.WhatsAppAccount)
+	assert.Equal(t, account.Name, stored.WhatsAppAccount,
+		"the stable account proof may repair only the mutable display projection")
+	reactions, ok := stored.Metadata["reactions"].([]any)
+	require.True(t, ok)
+	require.Len(t, reactions, 1)
+}
+
+func TestIncomingReactionRejectsUnprovenAndSoftDeletedOwners(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		deterministic bool
+		softDelete    bool
+	}{
+		{name: "unproven", deterministic: false},
+		{name: "soft_deleted", deterministic: true, softDelete: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, account, contact := whatsappIdentityFixture(t)
+			wamid := "wamid.reaction-reject-" + uuid.NewString()
+			id := uuid.New()
+			if tc.deterministic {
+				id = uuid.NewSHA1(account.ID, []byte("coexistence-message:"+wamid))
+			}
+			message := models.Message{
+				BaseModel: models.BaseModel{ID: id}, OrganizationID: account.OrganizationID,
+				ContactID: contact.ID, WhatsAppAccount: account.Name, WhatsAppMessageID: wamid,
+				Direction: models.DirectionOutgoing, MessageType: models.MessageTypeText,
+				Content: "immutable owner", Status: models.MessageStatusSent, Metadata: models.JSONB{},
+			}
+			require.NoError(t, app.DB.Create(&message).Error)
+			if tc.softDelete {
+				require.NoError(t, app.DB.Delete(&message).Error)
+			}
+
+			app.handleIncomingReaction(account, contact.PhoneNumber, wamid, "🔥", "Patient")
+
+			var stored models.Message
+			require.NoError(t, app.DB.Unscoped().First(&stored, "id = ?", message.ID).Error)
+			assert.NotContains(t, stored.Metadata, "reactions")
+			assert.Equal(t, tc.softDelete, stored.DeletedAt.Valid)
+		})
+	}
+}
+
+func TestIncomingReactionSerializesMergedContactAliases(t *testing.T) {
+	app, account, canonical := whatsappIdentityFixture(t)
+	now := time.Now().UTC()
+	alias := testutil.CreateTestContact(t, app.DB, account.OrganizationID)
+	alias.PhoneNumber = "60" + testutil.NewTestGraphObjectID()
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where("id = ?", alias.ID).Updates(map[string]any{
+		"phone_number": alias.PhoneNumber, "merged_into_id": canonical.ID,
+		"merged_at": now, "deleted_at": now,
+	}).Error)
+
+	wamid := "wamid.reaction-concurrent-" + uuid.NewString()
+	message := models.Message{
+		BaseModel:      models.BaseModel{ID: uuid.NewSHA1(account.ID, []byte("coexistence-message:"+wamid))},
+		OrganizationID: account.OrganizationID, ContactID: canonical.ID,
+		WhatsAppAccount: account.Name, WhatsAppMessageID: wamid,
+		Direction: models.DirectionOutgoing, MessageType: models.MessageTypeText,
+		Content: "serialize reactions", Status: models.MessageStatusSent, Metadata: models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(&message).Error)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, input := range []struct{ phone, emoji string }{
+		{canonical.PhoneNumber, "👍"}, {alias.PhoneNumber, "❤️"},
+	} {
+		input := input
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			app.handleIncomingReaction(account, input.phone, wamid, input.emoji, "Patient")
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	var stored models.Message
+	require.NoError(t, app.DB.First(&stored, "id = ?", message.ID).Error)
+	reactions, ok := stored.Metadata["reactions"].([]any)
+	require.True(t, ok)
+	require.Len(t, reactions, 2, "row and WAMID locks must prevent a lost read/modify/write")
+	phones := map[string]bool{}
+	for _, raw := range reactions {
+		reaction, ok := raw.(map[string]any)
+		require.True(t, ok)
+		phones[getStringFromMap(reaction, "from_phone")] = true
+	}
+	assert.True(t, phones[normalizeCoexistencePhone(canonical.PhoneNumber)])
+	assert.True(t, phones[normalizeCoexistencePhone(alias.PhoneNumber)])
 }
 
 // =============================================================================

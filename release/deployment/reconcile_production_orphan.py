@@ -386,6 +386,7 @@ def _validate_original_receipt(
         or receipt["control"]["run_attempt"] != binding["run_attempt"]
         or receipt["lineage"] != intent["lineage"]
         or receipt["before"] != intent["before"]
+        or receipt["rollback"] != intent["rollback"]
         or receipt["provider_transition"]["mutation_fingerprint_sha256"]
         != intent["mutation"]["mutation_fingerprint_sha256"]
         or receipt["authorities"]["mutation_intent"]["sha256"] != intent_sha256

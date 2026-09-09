@@ -36,11 +36,16 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
+import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
 import { useOmnichannelUnreadStore } from '@/stores/omnichannelUnread'
 import { getErrorMessage, unwrapItemResponse, unwrapListResponse } from '@/lib/api-utils'
+import {
+  effectiveAIIsAllowed,
+  type ContactIdentityReviewEffectiveState,
+} from '@/services/api'
 import { compareMessageIngestionOrder } from '@/lib/messageOrdering'
 import {
   clearLegacyWhatsAppReplyAttempt,
@@ -129,6 +134,7 @@ const loadingMore = ref(false)
 const loadingOlderMessages = ref(false)
 const sending = ref(false)
 const aiStateUpdating = ref(false)
+const isIdentityReviewOpen = ref(false)
 const showConnect = ref(false)
 const accounts = ref<ChannelAccount[]>([])
 const conversations = ref<InboxConversation[]>([])
@@ -182,6 +188,13 @@ const canReconcileMetaInstagram = computed(
 )
 const canReadConversations = computed(() => authStore.hasPermission('conversations', 'read'))
 const canManageConversations = computed(() => authStore.hasPermission('conversations', 'write'))
+const canReviewContactIdentity = computed(() =>
+  authStore.hasPermission('contacts', 'write')
+  && authStore.hasPermission('contacts.identity_review', 'write')
+)
+const canViewStagedContactIdentity = computed(() =>
+  canReviewContactIdentity.value
+)
 const threadsPublicEngagementEntitlement = 'threads.public_engagement.enabled'
 const absoluteWebhookURL = computed(() => {
   if (!createdConnection.value) return ''
@@ -201,8 +214,11 @@ let syncDebounceTimer: number | null = null
 let filterDebounceTimer: number | null = null
 let refreshInFlight = false
 let refreshQueued = false
+let organizationReloadQueued = false
 let viewMounted = false
 let conversationViewSequence = 0
+let conversationProjectionGeneration = 0
+let organizationGeneration = 0
 let messageViewportScrollFrame: number | null = null
 let messagesContentResizeObserver: ResizeObserver | null = null
 let messagesContentObservedHeight = 0
@@ -220,6 +236,25 @@ const messageBottomThreshold = 80
 const activeOrganizationId = computed(
   () => organizationsStore.selectedOrgId || authStore.organizationId || null,
 )
+
+interface OrganizationRequestContext {
+  generation: number
+  organizationId: string | null
+}
+
+function captureOrganizationContext(): OrganizationRequestContext {
+  return {
+    generation: organizationGeneration,
+    organizationId: activeOrganizationId.value,
+  }
+}
+
+function isCurrentOrganizationContext(context: OrganizationRequestContext): boolean {
+  return (
+    context.generation === organizationGeneration
+    && context.organizationId === activeOrganizationId.value
+  )
+}
 const metaInstagramAvailability = computed(() =>
   metaInstagramState.value.organizationId === (activeOrganizationId.value ?? '')
     ? metaInstagramState.value.availability
@@ -246,8 +281,13 @@ const metaInstagramTeardownReady = computed(() =>
   metaInstagramTeardownAvailable(metaInstagramStatus.value),
 )
 
-function isCurrentConversationView(sequence: number, conversationId: string) {
+function isCurrentConversationView(
+  sequence: number,
+  conversationId: string,
+  organizationContext: OrganizationRequestContext,
+) {
   return (
+    isCurrentOrganizationContext(organizationContext) &&
     sequence === conversationViewSequence &&
     selectedConversation.value?.id === conversationId
   )
@@ -266,22 +306,23 @@ function refreshOmnichannelUnread(organizationId: string | null, userId: string 
 async function markOpenConversationRead(
   conversation: InboxConversation,
   viewSequence: number,
+  organizationContext: OrganizationRequestContext,
 ) {
   const lastVisibleMessageID = messages.value.at(-1)?.id
   if (
     conversation.unread_count <= 0
     || !canReadConversations.value
     || !lastVisibleMessageID
-    || !isCurrentConversationView(viewSequence, conversation.id)
+    || !isCurrentConversationView(viewSequence, conversation.id, organizationContext)
   ) return
 
-  const cursorKey = `${conversation.id}:${lastVisibleMessageID}`
+  const cursorKey = `${organizationContext.generation}:${conversation.id}:${lastVisibleMessageID}`
   if (readCursorInFlightKey !== null) {
     readCursorCheckQueued = true
     return
   }
 
-  const organizationId = activeOrganizationId.value
+  const organizationId = organizationContext.organizationId
   const userId = authStore.user?.id
   if (!organizationId) return
   readCursorInFlightKey = cursorKey
@@ -292,7 +333,7 @@ async function markOpenConversationRead(
     // Refresh the still-active tenant even if the operator changed threads while
     // the POST was in flight. A no-op cursor advance emits no websocket event.
     refreshOmnichannelUnread(organizationId, userId)
-    if (!isCurrentConversationView(viewSequence, conversation.id)) return
+    if (!isCurrentConversationView(viewSequence, conversation.id, organizationContext)) return
     const payload = response?.data?.data ?? response?.data
     if (Number.isSafeInteger(payload?.unread_count) && payload.unread_count >= 0) {
       const unreadCount = payload.unread_count as number
@@ -419,6 +460,21 @@ const canControlConversationAI = computed(
     ['instagram', 'messenger'].includes(selectedConversation.value?.channel ?? '') &&
     selectedAccount.value?.config?.ai_reply_enabled === true,
 )
+const selectedConversationAIBlocked = computed(() =>
+  !effectiveAIIsAllowed(selectedConversation.value?.identity_review_ai_state)
+)
+const selectedConversationHasOpenIdentityReview = computed(() =>
+  identityReviewIsOpen(selectedConversation.value?.identity_review_ai_state)
+)
+const conversationAIControlLabel = computed(() => {
+  if (!selectedConversation.value?.ai_paused) {
+    return aiStateUpdating.value ? 'Pausing AI' : 'Pause AI'
+  }
+  if (selectedConversationAIBlocked.value) {
+    return aiStateUpdating.value ? 'Ending conversation pause' : 'End conversation pause'
+  }
+  return aiStateUpdating.value ? 'Resuming AI' : 'Resume AI'
+})
 
 const selectedThreadsTarget = computed(() =>
   threadsPublicEngagementTarget(selectedConversation.value),
@@ -623,7 +679,11 @@ function stopMessagesContentResizeObserver() {
   messagesContentObservedHeight = 0
 }
 
-function startMessagesContentResizeObserver(sequence: number, conversationId: string) {
+function startMessagesContentResizeObserver(
+  sequence: number,
+  conversationId: string,
+  organizationContext: OrganizationRequestContext,
+) {
   stopMessagesContentResizeObserver()
   const content = messagesContent.value
   if (!content || typeof ResizeObserver === 'undefined') return
@@ -633,7 +693,7 @@ function startMessagesContentResizeObserver(sequence: number, conversationId: st
     if (
       messagesContentResizeObserver !== observer
       || messagesContent.value !== content
-      || !isCurrentConversationView(sequence, conversationId)
+      || !isCurrentConversationView(sequence, conversationId, organizationContext)
     ) return
 
     const entry = entries.find(candidate => candidate.target === content)
@@ -648,7 +708,7 @@ function startMessagesContentResizeObserver(sequence: number, conversationId: st
     void scrollMessagesToBottom(false, () =>
       messagesContentResizeObserver === observer
       && messagesContent.value === content
-      && isCurrentConversationView(sequence, conversationId)
+      && isCurrentConversationView(sequence, conversationId, organizationContext)
       && messageViewportFollowingBottom,
     )
   })
@@ -673,6 +733,44 @@ function totalFromResponse(response: any) {
   return typeof payload?.total === 'number' ? payload.total : 0
 }
 
+function unavailableIdentityReviewState(): ContactIdentityReviewEffectiveState {
+  return {
+    known: false,
+    ai_allowed: false,
+    blocked: true,
+    open_hold_count: 0,
+    reason: 'identity_review_state_unavailable',
+  }
+}
+
+function identityReviewIsOpen(
+  state: ContactIdentityReviewEffectiveState | null | undefined,
+): boolean {
+  return state?.known === true
+    && state.blocked === true
+    && state.open_hold_count > 0
+    && state.reason === 'identity_review_open'
+}
+
+function updateLocalConversationIdentityReviewState(
+  conversationId: string,
+  state: ContactIdentityReviewEffectiveState,
+) {
+  const selected = selectedConversation.value
+  if (selected?.id === conversationId) selected.identity_review_ai_state = state
+  const listed = conversations.value.find(conversation => conversation.id === conversationId)
+  if (listed && listed !== selected) listed.identity_review_ai_state = state
+}
+
+function replaceLocalConversationSnapshot(
+  conversationId: string,
+  snapshot: InboxConversation,
+) {
+  const index = conversations.value.findIndex(conversation => conversation.id === conversationId)
+  if (index >= 0) conversations.value[index] = snapshot
+  if (selectedConversation.value?.id === conversationId) selectedConversation.value = snapshot
+}
+
 async function load(silent = false, append = false) {
   if (refreshInFlight) {
     // Realtime events can arrive while the canonical fetch is in flight. Keep
@@ -680,6 +778,8 @@ async function load(silent = false, append = false) {
     if (!append) refreshQueued = true
     return
   }
+  const organizationContext = captureOrganizationContext()
+  const projectionGeneration = conversationProjectionGeneration
   refreshInFlight = true
   if (!silent) loading.value = true
   if (append) loadingMore.value = true
@@ -692,25 +792,28 @@ async function load(silent = false, append = false) {
       channelsService.accounts(),
       channelsService.conversations(conversationParams),
     ])
+    if (
+      !isCurrentOrganizationContext(organizationContext)
+      || projectionGeneration !== conversationProjectionGeneration
+    ) return
     accounts.value = unwrapListResponse<ChannelAccount>(accountResponse, 'accounts')
     if (settingsAccount.value) {
       settingsAccount.value =
         accounts.value.find(account => account.id === settingsAccount.value?.id) ?? null
     }
     const incoming = unwrapListResponse<InboxConversation>(conversationResponse, 'conversations')
+    const incomingIDs = new Set(incoming.map((item) => item.id))
     conversationTotal.value = totalFromResponse(conversationResponse)
     if (append) {
-      const incomingIDs = new Set(incoming.map((item) => item.id))
       conversations.value = [
         ...conversations.value.filter((item) => !incomingIDs.has(item.id)),
         ...incoming,
       ]
       conversationPage.value = page
     } else if (silent) {
-      const firstPageIDs = new Set(incoming.map((item) => item.id))
       conversations.value = [
         ...incoming,
-        ...conversations.value.filter((item) => !firstPageIDs.has(item.id)),
+        ...conversations.value.filter((item) => !incomingIDs.has(item.id)),
       ].slice(0, Math.max(conversationTotal.value, incoming.length))
     } else {
       conversations.value = incoming
@@ -719,18 +822,63 @@ async function load(silent = false, append = false) {
 
     if (selectedConversation.value) {
       const selectedConversationId = selectedConversation.value.id
-      selectedConversation.value =
-        conversations.value.find(item => item.id === selectedConversationId) ?? null
-      if (!selectedConversation.value) {
+      const refreshedSelection = conversations.value.find(item => item.id === selectedConversationId)
+      // A silent page-one refresh can legitimately trim an off-page selection.
+      // Retain it until the exact-ID canonical lookup below refreshes or fences it.
+      if (refreshedSelection) {
+        selectedConversation.value = refreshedSelection
+      } else if (!silent || append) {
+        selectedConversation.value = null
         stopMessagesContentResizeObserver()
         messageViewportFollowingBottom = true
+      }
+    }
+    if (
+      silent
+      && !append
+      && selectedConversation.value
+      && !incomingIDs.has(selectedConversation.value.id)
+    ) {
+      const conversationId = selectedConversation.value.id
+      const viewSequence = conversationViewSequence
+      let canonicalConversation: InboxConversation | null = null
+      let canonicalLookupSucceeded = false
+      try {
+        const selectedResponse = await channelsService.conversations({
+          conversation_id: conversationId,
+          page: 1,
+          limit: 1,
+        })
+        const selectedRows = unwrapListResponse<InboxConversation>(selectedResponse, 'conversations')
+        canonicalConversation = selectedRows.length === 1 && selectedRows[0]?.id === conversationId
+          ? selectedRows[0]
+          : null
+        canonicalLookupSucceeded = true
+      } catch {
+        // A selected conversation outside page one must never retain a stale
+        // allow decision when its canonical projection cannot be refreshed.
+      }
+      if (
+        !isCurrentConversationView(viewSequence, conversationId, organizationContext)
+        || projectionGeneration !== conversationProjectionGeneration
+      ) return
+      if (canonicalConversation) replaceLocalConversationSnapshot(conversationId, canonicalConversation)
+      else if (canonicalLookupSucceeded) {
+        selectedConversation.value = null
+        stopMessagesContentResizeObserver()
+        messageViewportFollowingBottom = true
+      } else {
+        updateLocalConversationIdentityReviewState(conversationId, unavailableIdentityReviewState())
       }
     }
     if (silent && selectedConversation.value) {
       const conversationId = selectedConversation.value.id
       const viewSequence = conversationViewSequence
       const messageResponse = await channelsService.messages(conversationId, { limit: 100 })
-      if (!isCurrentConversationView(viewSequence, conversationId)) return
+      if (
+        !isCurrentConversationView(viewSequence, conversationId, organizationContext)
+        || projectionGeneration !== conversationProjectionGeneration
+      ) return
       const latest = unwrapListResponse<InboxMessageEnvelope>(messageResponse, 'messages')
         .map(normalizeMessage)
         .reverse()
@@ -755,7 +903,11 @@ async function load(silent = false, append = false) {
         && isMessageViewportNearBottom()
       ) {
         try {
-          await markOpenConversationRead(selectedConversation.value, viewSequence)
+          await markOpenConversationRead(
+            selectedConversation.value,
+            viewSequence,
+            organizationContext,
+          )
         } catch {
           // Keep it unread when the cursor update fails. A later activity
           // event or poll will retry without creating repeated error toasts.
@@ -763,12 +915,18 @@ async function load(silent = false, append = false) {
       }
     }
   } catch (error) {
-    if (!silent) toast.error('Channels could not be loaded', getErrorMessage(error))
+    if (!silent && isCurrentOrganizationContext(organizationContext)) {
+      toast.error('Channels could not be loaded', getErrorMessage(error))
+    }
   } finally {
     if (!silent) loading.value = false
     loadingMore.value = false
     refreshInFlight = false
-    if (refreshQueued && viewMounted) {
+    if (organizationReloadQueued && viewMounted && activeOrganizationId.value) {
+      organizationReloadQueued = false
+      refreshQueued = false
+      void load()
+    } else if (refreshQueued && viewMounted) {
       refreshQueued = false
       void load(true)
     }
@@ -794,13 +952,14 @@ function scheduleMessageViewportReadCheck() {
     messageViewportScrollFrame = null
     const conversation = selectedConversation.value
     const viewSequence = conversationViewSequence
+    const organizationContext = captureOrganizationContext()
     if (
       !conversation
       || document.visibilityState !== 'visible'
       || !document.hasFocus()
       || !isMessageViewportNearBottom()
     ) return
-    void markOpenConversationRead(conversation, viewSequence).catch(() => {
+    void markOpenConversationRead(conversation, viewSequence, organizationContext).catch(() => {
       // Preserve the unread marker. Focus, realtime, polling, or another
       // bottom scroll will retry the exact visible boundary.
     })
@@ -843,6 +1002,7 @@ function handleOnline() {
 }
 
 async function selectConversation(conversation: InboxConversation) {
+  const organizationContext = captureOrganizationContext()
   const viewSequence = ++conversationViewSequence
   stopMessagesContentResizeObserver()
   messageViewportFollowingBottom = true
@@ -857,26 +1017,26 @@ async function selectConversation(conversation: InboxConversation) {
   let loaded = false
   try {
     const response = await channelsService.messages(conversation.id, { limit: 100 })
-    if (!isCurrentConversationView(viewSequence, conversation.id)) return
+    if (!isCurrentConversationView(viewSequence, conversation.id, organizationContext)) return
     messages.value = unwrapListResponse<InboxMessageEnvelope>(response, 'messages')
       .map(normalizeMessage)
       .reverse()
     messageTotal.value = totalFromResponse(response)
     loaded = true
   } catch (error) {
-    if (isCurrentConversationView(viewSequence, conversation.id)) {
+    if (isCurrentConversationView(viewSequence, conversation.id, organizationContext)) {
       toast.error('Messages could not be loaded', getErrorMessage(error))
     }
   } finally {
-    if (isCurrentConversationView(viewSequence, conversation.id)) {
+    if (isCurrentConversationView(viewSequence, conversation.id, organizationContext)) {
       loadingMessages.value = false
     }
   }
 
-  if (!loaded || !isCurrentConversationView(viewSequence, conversation.id)) return
+  if (!loaded || !isCurrentConversationView(viewSequence, conversation.id, organizationContext)) return
   await scrollMessagesToBottom()
-  if (!isCurrentConversationView(viewSequence, conversation.id)) return
-  startMessagesContentResizeObserver(viewSequence, conversation.id)
+  if (!isCurrentConversationView(viewSequence, conversation.id, organizationContext)) return
+  startMessagesContentResizeObserver(viewSequence, conversation.id, organizationContext)
 
   // A tab switch can happen while the transcript request is in flight. Keep
   // the viewport ready at the latest message, but do not acknowledge anything
@@ -889,8 +1049,8 @@ async function selectConversation(conversation: InboxConversation) {
 
   // Rendering and positioning the transcript must never wait on the cursor
   // mutation. The exact visible boundary is posted only after the scroll.
-  void markOpenConversationRead(conversation, viewSequence).catch(error => {
-    if (isCurrentConversationView(viewSequence, conversation.id)) {
+  void markOpenConversationRead(conversation, viewSequence, organizationContext).catch(error => {
+    if (isCurrentConversationView(viewSequence, conversation.id, organizationContext)) {
       toast.error('Read state could not be updated', getErrorMessage(error))
     }
   })
@@ -912,10 +1072,39 @@ function closeMobileConversation() {
   readCursorCheckQueued = false
 }
 
+function resetOrganizationScopedInboxState(organizationId: string | null) {
+  conversationProjectionGeneration += 1
+  conversationViewSequence += 1
+  stopMessagesContentResizeObserver()
+  messageViewportFollowingBottom = true
+  accounts.value = []
+  conversations.value = []
+  selectedConversation.value = null
+  messages.value = []
+  settingsAccount.value = null
+  createdConnection.value = null
+  isWorkspaceOpen.value = false
+  isIdentityReviewOpen.value = false
+  showConnect.value = false
+  conversationPage.value = 1
+  conversationTotal.value = 0
+  messageTotal.value = 0
+  composer.value = ''
+  loading.value = Boolean(organizationId)
+  loadingMessages.value = false
+  loadingMore.value = false
+  loadingOlderMessages.value = false
+  sending.value = false
+  aiStateUpdating.value = false
+  readCursorInFlightKey = null
+  readCursorCheckQueued = false
+}
+
 async function loadOlderMessages() {
   const conversation = selectedConversation.value
   const oldest = messages.value[0]
   if (!conversation || !oldest || loadingOlderMessages.value || !hasOlderMessages.value) return
+  const organizationContext = captureOrganizationContext()
   const viewSequence = conversationViewSequence
   const viewport = messagesViewport.value
   const previousScrollHeight = viewport?.scrollHeight ?? 0
@@ -926,7 +1115,7 @@ async function loadOlderMessages() {
       before: oldest.id,
       limit: 100,
     })
-    if (!isCurrentConversationView(viewSequence, conversation.id)) return
+    if (!isCurrentConversationView(viewSequence, conversation.id, organizationContext)) return
     const older = unwrapListResponse<InboxMessageEnvelope>(response, 'messages')
       .map(normalizeMessage)
       .reverse()
@@ -938,18 +1127,18 @@ async function loadOlderMessages() {
     ]
     await nextTick()
     if (
-      isCurrentConversationView(viewSequence, conversation.id) &&
+      isCurrentConversationView(viewSequence, conversation.id, organizationContext) &&
       viewport &&
       messagesViewport.value === viewport
     ) {
       viewport.scrollTop = previousScrollTop + (viewport.scrollHeight - previousScrollHeight)
     }
   } catch (error) {
-    if (isCurrentConversationView(viewSequence, conversation.id)) {
+    if (isCurrentConversationView(viewSequence, conversation.id, organizationContext)) {
       toast.error('Older messages could not be loaded', getErrorMessage(error))
     }
   } finally {
-    if (isCurrentConversationView(viewSequence, conversation.id)) {
+    if (isCurrentConversationView(viewSequence, conversation.id, organizationContext)) {
       loadingOlderMessages.value = false
     }
   }
@@ -970,11 +1159,12 @@ async function sendMessage() {
     return
   }
   if (!canSendText.value) return
+  const organizationContext = captureOrganizationContext()
   const viewSequence = conversationViewSequence
   sending.value = true
   try {
     if (conversation.channel === 'whatsapp') {
-      const organizationId = activeOrganizationId.value
+      const organizationId = organizationContext.organizationId
       const serviceWindowEndsAt = conversation.service_window_ends_at
       if (!organizationId || !serviceWindowEndsAt) return
       const attempt = await getOrCreateLegacyWhatsAppReplyAttempt({
@@ -984,7 +1174,7 @@ async function sendMessage() {
         serviceWindowEndsAt,
       })
       if (
-        !isCurrentConversationView(viewSequence, conversation.id) ||
+        !isCurrentConversationView(viewSequence, conversation.id, organizationContext) ||
         activeOrganizationId.value !== organizationId
       ) {
         // A newly-created key has not reached the server and is safe to drop.
@@ -1024,7 +1214,7 @@ async function sendMessage() {
       // operator switched away while it was in flight. Retire its retry key
       // before applying the view guard, otherwise a later same-body send could
       // replay the already-sent backend row. All UI mutations remain guarded.
-      if (!isCurrentConversationView(viewSequence, conversation.id)) return
+      if (!isCurrentConversationView(viewSequence, conversation.id, organizationContext)) return
       upsertInboxMessage(message)
       updateLocalConversationPreview(conversation.id, message)
       if (replyAcknowledged) {
@@ -1050,7 +1240,7 @@ async function sendMessage() {
       payload.reply_to_external_id = threadsTarget.externalId
     }
     const response = await channelsService.send(conversation.id, payload)
-    if (!isCurrentConversationView(viewSequence, conversation.id)) return
+    if (!isCurrentConversationView(viewSequence, conversation.id, organizationContext)) return
     const result = unwrapItemResponse<InboxMessageEnvelope>(response)
     const message = normalizeMessage(result)
     upsertInboxMessage(message)
@@ -1060,7 +1250,7 @@ async function sendMessage() {
     void scrollMessagesToBottom(true)
     scheduleChannelRefresh(0)
   } catch (error) {
-    if (isCurrentConversationView(viewSequence, conversation.id)) {
+    if (isCurrentConversationView(viewSequence, conversation.id, organizationContext)) {
       const status = (error as { response?: { status?: number } })?.response?.status
       if (
         conversation.channel === 'whatsapp' &&
@@ -1082,28 +1272,36 @@ async function sendMessage() {
       }
     }
   } finally {
-    if (isCurrentConversationView(viewSequence, conversation.id)) {
+    if (isCurrentConversationView(viewSequence, conversation.id, organizationContext)) {
       sending.value = false
     }
   }
 }
 
-function updateLocalConversationAIState(conversationId: string, paused: boolean, reason = '') {
+function updateLocalConversationAIState(
+  conversationId: string,
+  paused: boolean,
+  reason = '',
+  effectiveAIState?: ContactIdentityReviewEffectiveState,
+) {
   const selected = selectedConversation.value
   if (selected?.id === conversationId) {
     selected.ai_paused = paused
     selected.ai_pause_reason = reason || undefined
+    if (effectiveAIState) selected.identity_review_ai_state = effectiveAIState
   }
   const listed = conversations.value.find(conversation => conversation.id === conversationId)
   if (listed && listed !== selected) {
     listed.ai_paused = paused
     listed.ai_pause_reason = reason || undefined
+    if (effectiveAIState) listed.identity_review_ai_state = effectiveAIState
   }
 }
 
 async function toggleConversationAI() {
   const conversation = selectedConversation.value
   if (!conversation || !canControlConversationAI.value || aiStateUpdating.value) return
+  const organizationContext = captureOrganizationContext()
   const viewSequence = conversationViewSequence
   const paused = !conversation.ai_paused
   aiStateUpdating.value = true
@@ -1113,24 +1311,48 @@ async function toggleConversationAI() {
       conversation_id: string
       ai_paused: boolean
       ai_pause_reason?: string
+      identity_review_ai_state: ContactIdentityReviewEffectiveState
     }>(response)
-    if (!isCurrentConversationView(viewSequence, conversation.id)) return
-    updateLocalConversationAIState(conversation.id, state.ai_paused, state.ai_pause_reason)
-    toast.success(
-      state.ai_paused ? 'AI replies paused' : 'AI replies resumed',
-      state.ai_paused
-        ? 'Only human replies will be sent in this conversation.'
-        : 'The next eligible customer message can receive an automatic reply.',
+    if (!isCurrentConversationView(viewSequence, conversation.id, organizationContext)) return
+    updateLocalConversationAIState(
+      conversation.id,
+      state.ai_paused,
+      state.ai_pause_reason,
+      state.identity_review_ai_state,
     )
+    if (state.ai_paused) {
+      toast.success('AI replies paused', 'Only human replies will be sent in this conversation.')
+    } else if (effectiveAIIsAllowed(state.identity_review_ai_state)) {
+      toast.success('AI replies resumed', 'The next eligible customer message can receive an automatic reply.')
+    } else {
+      toast.warning(
+        'Conversation pause removed',
+        'Automated replies remain blocked until the identity review is resolved.',
+      )
+    }
   } catch (error) {
-    if (isCurrentConversationView(viewSequence, conversation.id)) {
+    if (isCurrentConversationView(viewSequence, conversation.id, organizationContext)) {
       toast.error('AI reply state was not changed', getErrorMessage(error))
     }
   } finally {
-    if (isCurrentConversationView(viewSequence, conversation.id)) {
+    if (isCurrentConversationView(viewSequence, conversation.id, organizationContext)) {
       aiStateUpdating.value = false
     }
   }
+}
+
+async function refreshAfterIdentityReview(state: ContactIdentityReviewEffectiveState) {
+  const conversationID = selectedConversation.value?.id
+  if (conversationID) {
+    // Invalidate any older same-organization list response before projecting
+    // the durable decision. The queued canonical refresh may then replace it.
+    conversationProjectionGeneration += 1
+    const selected = selectedConversation.value
+    if (selected?.id === conversationID) selected.identity_review_ai_state = state
+    const listed = conversations.value.find(conversation => conversation.id === conversationID)
+    if (listed) listed.identity_review_ai_state = state
+  }
+  await load(true)
 }
 
 async function connectAccount() {
@@ -1872,6 +2094,23 @@ watch(metaMessengerWorkspaceLocked, locked => {
 })
 
 watch(activeOrganizationId, (organizationId, previousOrganizationId) => {
+  organizationGeneration += 1
+  resetOrganizationScopedInboxState(organizationId)
+  if (syncDebounceTimer !== null) {
+    window.clearTimeout(syncDebounceTimer)
+    syncDebounceTimer = null
+  }
+  if (filterDebounceTimer !== null) {
+    window.clearTimeout(filterDebounceTimer)
+    filterDebounceTimer = null
+  }
+  refreshQueued = false
+  if (viewMounted && organizationId) {
+    if (refreshInFlight) organizationReloadQueued = true
+    else void load()
+  } else {
+    organizationReloadQueued = false
+  }
   metaMessengerAuthorizationController.value?.abort()
   metaMessengerAuthorizationController.value = null
   metaMessengerContextVersion += 1
@@ -1920,6 +2159,8 @@ watch(
 onBeforeUnmount(() => {
   viewMounted = false
   refreshQueued = false
+  organizationReloadQueued = false
+  organizationGeneration += 1
   metaMessengerAuthorizationController.value?.abort()
   metaMessengerAuthorizationController.value = null
   conversationViewSequence += 1
@@ -2558,6 +2799,18 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               </div>
               <p v-if="conversation.subject" class="mt-1 truncate text-xs font-medium text-white/50 light:text-slate-700">{{ conversation.subject }}</p>
               <p class="mt-1 truncate text-xs text-white/40 light:text-slate-600">{{ conversation.last_message_preview || 'No preview' }}</p>
+              <Badge
+                v-if="identityReviewIsOpen(conversation.identity_review_ai_state)"
+                class="mt-1 h-5 bg-amber-400/15 text-[10px] text-amber-200 light:bg-amber-100 light:text-amber-800"
+              >
+                AI blocked · review
+              </Badge>
+              <Badge
+                v-else-if="!effectiveAIIsAllowed(conversation.identity_review_ai_state)"
+                class="mt-1 h-5 bg-slate-400/15 text-[10px] text-slate-200 light:bg-slate-100 light:text-slate-700"
+              >
+                AI status unavailable
+              </Badge>
             </div>
           </button>
           <div v-if="filteredConversations.length === 0" class="p-8 text-center">
@@ -2611,6 +2864,18 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             </div>
             <div class="flex shrink-0 items-center gap-2">
               <Button
+                v-if="selectedConversationHasOpenIdentityReview && canReviewContactIdentity"
+                data-testid="channel-identity-review"
+                type="button"
+                variant="outline"
+                size="sm"
+                class="h-11 border-amber-300/20 bg-amber-300/[0.06] text-amber-100 hover:bg-amber-300/10 light:border-amber-200 light:bg-amber-50 light:text-amber-900 sm:h-8"
+                @click="isIdentityReviewOpen = true"
+              >
+                <AlertCircle class="h-3.5 w-3.5 sm:mr-2" />
+                <span class="hidden sm:inline">Identity review</span>
+              </Button>
+              <Button
                 v-if="canControlConversationAI"
                 data-testid="conversation-ai-toggle"
                 type="button"
@@ -2619,13 +2884,13 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
                 class="h-11 w-11 p-0 sm:h-8 sm:w-auto sm:px-3"
                 :disabled="aiStateUpdating"
                 :aria-pressed="selectedConversation.ai_paused"
-                :aria-label="selectedConversation.ai_paused ? 'Resume AI' : 'Pause AI'"
+                :aria-label="conversationAIControlLabel"
                 @click="toggleConversationAI"
               >
                 <Loader2 v-if="aiStateUpdating" class="h-3.5 w-3.5 animate-spin sm:mr-2" />
                 <Play v-else-if="selectedConversation.ai_paused" class="h-3.5 w-3.5 sm:mr-2" />
                 <PauseCircle v-else class="h-3.5 w-3.5 sm:mr-2" />
-                <span class="hidden sm:inline">{{ selectedConversation.ai_paused ? 'Resume AI' : 'Pause AI' }}</span>
+                <span class="hidden sm:inline">{{ conversationAIControlLabel }}</span>
               </Button>
               <Button
                 type="button"
@@ -2858,6 +3123,16 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
         />
       </SheetContent>
     </Sheet>
+
+    <ContactIdentityReviewDialog
+      v-model:open="isIdentityReviewOpen"
+      :contact-id="selectedConversation?.contact_id ?? null"
+      :contact-label="selectedConversation ? conversationName(selectedConversation) : undefined"
+      :effective-state="selectedConversation?.identity_review_ai_state"
+      :can-review="canReviewContactIdentity"
+      :can-view-staged="canViewStagedContactIdentity"
+      @resolved="refreshAfterIdentityReview"
+    />
 
     <div
       v-if="metaMessengerSelection"

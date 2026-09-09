@@ -455,7 +455,7 @@ func TestClient_DownloadMedia(t *testing.T) {
 			defer server.Close()
 
 			log := testutil.NopLogger()
-			client := whatsapp.NewWithTimeout(log, 5*time.Second)
+			client := whatsapp.NewWithBaseURL(log, server.URL)
 
 			ctx := testutil.TestContext(t)
 
@@ -470,6 +470,248 @@ func TestClient_DownloadMedia(t *testing.T) {
 			assert.Equal(t, tt.wantData, data)
 		})
 	}
+}
+
+func TestClient_DownloadMedia_AllowsMetaMediaHostsInProduction(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		mediaURL string
+	}{
+		{
+			name:     "WhatsApp attachment host",
+			mediaURL: "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=123&hash=signed-secret",
+		},
+		{
+			name:     "Facebook CDN host",
+			mediaURL: "https://scontent.example.fbcdn.net/media/123?hash=signed-secret",
+		},
+		{
+			name:     "WhatsApp CDN host",
+			mediaURL: "https://media-cdg4-1.cdn.whatsapp.net/media/123?hash=signed-secret",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "Bearer test-access-token", r.Header.Get("Authorization"))
+				assert.Contains(t, r.URL.RawQuery, "hash=signed-secret")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("media"))
+			}))
+			defer server.Close()
+
+			client := whatsapp.NewWithTimeout(testutil.NopLogger(), 5*time.Second)
+			client.HTTPClient = &http.Client{
+				Transport: &testServerTransport{serverURL: server.URL},
+			}
+
+			data, err := client.DownloadMedia(testutil.TestContext(t), tt.mediaURL, "test-access-token")
+			require.NoError(t, err)
+			assert.Equal(t, []byte("media"), data)
+		})
+	}
+}
+
+func TestClient_DownloadMedia_RejectsUntrustedProductionURLs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		mediaURL string
+	}{
+		{
+			name:     "HTTP Meta host",
+			mediaURL: "http://lookaside.fbsbx.com/media?hash=signed-secret",
+		},
+		{
+			name:     "untrusted host",
+			mediaURL: "https://attacker.example/media?hash=signed-secret",
+		},
+		{
+			name:     "misleading domain suffix",
+			mediaURL: "https://lookaside.fbsbx.com.attacker.example/media?hash=signed-secret",
+		},
+		{
+			name:     "private IPv4 literal",
+			mediaURL: "https://127.0.0.1/media?hash=signed-secret",
+		},
+		{
+			name:     "private IPv6 literal",
+			mediaURL: "https://[::1]/media?hash=signed-secret",
+		},
+		{
+			name:     "userinfo",
+			mediaURL: "https://user:password@lookaside.fbsbx.com/media?hash=signed-secret",
+		},
+		{
+			name:     "fragment",
+			mediaURL: "https://lookaside.fbsbx.com/media?hash=signed-secret#fragment",
+		},
+		{
+			name:     "non-default HTTPS port",
+			mediaURL: "https://lookaside.fbsbx.com:8443/media?hash=signed-secret",
+		},
+		{
+			name:     "malformed URL",
+			mediaURL: "https://lookaside.fbsbx.com/%zz?hash=signed-secret",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			called := false
+			client := whatsapp.NewWithTimeout(testutil.NopLogger(), 5*time.Second)
+			client.HTTPClient = &http.Client{Transport: mediaDownloadTransportFunc(func(*http.Request) (*http.Response, error) {
+				called = true
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+			})}
+
+			_, err := client.DownloadMedia(testutil.TestContext(t), tt.mediaURL, "test-access-token")
+			require.Error(t, err)
+			assert.False(t, called, "an untrusted URL must be rejected before the request is sent")
+			assert.NotContains(t, err.Error(), tt.mediaURL)
+			assert.NotContains(t, err.Error(), "signed-secret")
+		})
+	}
+}
+
+func TestClient_DownloadMedia_CustomBaseRequiresExactOrigin(t *testing.T) {
+	t.Parallel()
+
+	trusted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer test-access-token", r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer trusted.Close()
+
+	untrustedHit := make(chan struct{}, 1)
+	untrusted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		untrustedHit <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer untrusted.Close()
+
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), trusted.URL)
+	_, err := client.DownloadMedia(testutil.TestContext(t), trusted.URL+"/media", "test-access-token")
+	require.NoError(t, err)
+
+	_, err = client.DownloadMedia(testutil.TestContext(t), untrusted.URL+"/media?hash=signed-secret", "test-access-token")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "signed-secret")
+	select {
+	case <-untrustedHit:
+		t.Fatal("request escaped the configured base origin")
+	default:
+	}
+
+	_, err = client.DownloadMedia(
+		testutil.TestContext(t),
+		fmt.Sprintf("https://%s/media?hash=signed-secret", trusted.URL[len("http://"):]),
+		"test-access-token",
+	)
+	require.Error(t, err)
+}
+
+func TestClient_DownloadMedia_ProductionBaseDetectionUsesExactOrigin(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		configuredBase string
+		wantAllowed    bool
+	}{
+		{
+			name:           "explicit default HTTPS port is production",
+			configuredBase: "https://graph.facebook.com:443",
+			wantAllowed:    true,
+		},
+		{
+			name:           "non-default port is custom",
+			configuredBase: "https://graph.facebook.com:8443",
+		},
+		{
+			name:           "userinfo makes base invalid",
+			configuredBase: "https://user:password@graph.facebook.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			called := false
+			client := whatsapp.NewWithBaseURL(testutil.NopLogger(), tt.configuredBase)
+			client.HTTPClient = &http.Client{Transport: mediaDownloadTransportFunc(func(*http.Request) (*http.Response, error) {
+				called = true
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+			})}
+
+			_, err := client.DownloadMedia(
+				testutil.TestContext(t),
+				"https://lookaside.fbsbx.com/media?hash=signed-secret",
+				"test-access-token",
+			)
+			if tt.wantAllowed {
+				require.NoError(t, err)
+				assert.True(t, called)
+				return
+			}
+
+			require.Error(t, err)
+			assert.False(t, called)
+			assert.NotContains(t, err.Error(), "signed-secret")
+		})
+	}
+}
+
+func TestClient_DownloadMedia_RejectsRedirects(t *testing.T) {
+	t.Parallel()
+
+	redirectFollowed := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/media":
+			assert.Equal(t, "Bearer test-access-token", r.Header.Get("Authorization"))
+			http.Redirect(w, r, "/redirected?hash=signed-secret", http.StatusFound)
+		case "/redirected":
+			redirectFollowed <- struct{}{}
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+	_, err := client.DownloadMedia(testutil.TestContext(t), server.URL+"/media", "test-access-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "status 302")
+	assert.NotContains(t, err.Error(), "signed-secret")
+	select {
+	case <-redirectFollowed:
+		t.Fatal("media download followed a redirect")
+	default:
+	}
+}
+
+func TestClient_DownloadMedia_RedactsSignedURLFromTransportErrors(t *testing.T) {
+	t.Parallel()
+
+	const signedURL = "https://media.test/download?mid=123&hash=signed-secret"
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), "https://media.test")
+	client.HTTPClient = &http.Client{Transport: mediaDownloadTransportFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("transport failed for %s", req.URL.String())
+	})}
+
+	_, err := client.DownloadMedia(testutil.TestContext(t), signedURL, "test-access-token")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), signedURL)
+	assert.NotContains(t, err.Error(), "signed-secret")
 }
 
 func TestClient_MarkMessageRead(t *testing.T) {
@@ -953,6 +1195,12 @@ func TestIsDefiniteProviderRejectionClassifiesNonIdempotentFailuresConservativel
 // testServerTransport redirects all requests to the test server
 type testServerTransport struct {
 	serverURL string
+}
+
+type mediaDownloadTransportFunc func(*http.Request) (*http.Response, error)
+
+func (fn mediaDownloadTransportFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
 }
 
 func (t *testServerTransport) RoundTrip(req *http.Request) (*http.Response, error) {

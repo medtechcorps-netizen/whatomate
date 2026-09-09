@@ -1491,6 +1491,37 @@ func TestPlatformComplianceStartupVerificationRejectsContractDrift(t *testing.T)
 		assert.Contains(t, err.Error(), "does not match the platform compliance contract")
 	})
 
+	t.Run("identity review completeness trigger remains deferred", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		require.NoError(t, tx.Exec(`
+			DROP TRIGGER trg_whatsapp_identity_review_holds_complete
+			ON public.whatsapp_identity_review_holds;
+			CREATE TRIGGER trg_whatsapp_identity_review_holds_complete
+			AFTER INSERT OR UPDATE ON public.whatsapp_identity_review_holds
+			FOR EACH ROW
+			EXECUTE FUNCTION public.rereply_verify_whatsapp_identity_review_complete()
+		`).Error)
+		err := verifyAsRuntime(tx)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "product trigger")
+	})
+
+	t.Run("identity review completeness function is pinned", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		require.NoError(t, tx.Exec(`
+			CREATE OR REPLACE FUNCTION public.rereply_verify_whatsapp_identity_review_complete()
+			RETURNS trigger LANGUAGE plpgsql
+			AS $function$ BEGIN RETURN NULL; END $function$
+		`).Error)
+		err := verifyAsRuntime(tx)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not match the platform compliance contract")
+	})
+
 	t.Run("message ingestion trigger update column is exact", func(t *testing.T) {
 		tx := db.Begin()
 		require.NoError(t, tx.Error)
@@ -1659,6 +1690,139 @@ func TestPlatformComplianceStartupVerificationRejectsContractDrift(t *testing.T)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unreviewed platform compliance control markers")
 	})
+}
+
+func TestPlatformComplianceStartupVerificationAcceptsOnlyExactIdentityReviewRolloutProfiles(t *testing.T) {
+	db, runtimeRole := setupPlatformComplianceGuardTest(t)
+	verifyCompatibility := func(tx *gorm.DB) error {
+		return database.VerifyPlatformComplianceIdentityReviewCompatibilityForTest(tx, runtimeRole)
+	}
+	dropFuture := `
+		DROP TRIGGER rereply_identity_review_contact_selector_fence ON public.contacts;
+		DROP TRIGGER rereply_identity_review_message_wamid_owner ON public.messages;
+		DROP TRIGGER rereply_identity_review_event_wamid_owner ON public.inbound_events;
+		DROP TRIGGER trg_inbound_events_identity_review_guard ON public.inbound_events
+	`
+
+	require.NoError(t, verifyCompatibility(db), "the compatibility baseline must accept the exact future profile")
+
+	t.Run("exact legacy profile", func(t *testing.T) {
+		tx := db.Begin()
+		require.NoError(t, tx.Error)
+		defer tx.Rollback()
+		require.NoError(t, tx.Exec(dropFuture).Error)
+		require.NoError(t, verifyCompatibility(tx), "the compatibility baseline must accept the exact legacy profile")
+		err := database.VerifyPlatformComplianceIdentityReviewFutureForTest(tx, runtimeRole)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "requires the exact future trigger rollout")
+	})
+
+	for _, test := range []struct {
+		name string
+		ddl  string
+	}{
+		{
+			name: "partial contact profile",
+			ddl:  "DROP TRIGGER rereply_identity_review_contact_selector_fence ON public.contacts",
+		},
+		{
+			name: "partial message profile",
+			ddl:  "DROP TRIGGER rereply_identity_review_message_wamid_owner ON public.messages",
+		},
+		{
+			name: "partial inbound guard profile",
+			ddl:  "DROP TRIGGER trg_inbound_events_identity_review_guard ON public.inbound_events",
+		},
+		{
+			name: "partial inbound owner profile",
+			ddl:  "DROP TRIGGER rereply_identity_review_event_wamid_owner ON public.inbound_events",
+		},
+		{
+			name: "disabled future trigger",
+			ddl:  "ALTER TABLE public.messages DISABLE TRIGGER rereply_identity_review_message_wamid_owner",
+		},
+		{
+			name: "tampered future function",
+			ddl: `CREATE OR REPLACE FUNCTION public.rereply_guard_message_identity_review_wamid_owner()
+				RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN RETURN NEW; END $function$`,
+		},
+		{
+			name: "extra old-table trigger",
+			ddl: `CREATE FUNCTION public.zz_identity_review_extra()
+				RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN RETURN NEW; END $function$;
+				CREATE TRIGGER zz_identity_review_extra BEFORE INSERT ON public.contacts
+				FOR EACH ROW EXECUTE FUNCTION public.zz_identity_review_extra()`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tx := db.Begin()
+			require.NoError(t, tx.Error)
+			defer tx.Rollback()
+			require.NoError(t, tx.Exec(test.ddl).Error)
+			err := verifyCompatibility(tx)
+			require.Error(t, err)
+			assert.True(t,
+				strings.Contains(err.Error(), "neither exact legacy nor exact future") ||
+					strings.Contains(err.Error(), "does not match the platform compliance contract"),
+				err.Error(),
+			)
+		})
+	}
+}
+
+func TestBaselineRLSMigrationOnFutureProfileIsReadOnlyAndRepeatable(t *testing.T) {
+	db, runtimeRole := setupPlatformComplianceGuardTest(t)
+	runtimeDB := testutil.OpenTestDBAsRole(t, runtimeRole, guardRuntimePassword(runtimeRole))
+
+	catalogSnapshot := func() string {
+		t.Helper()
+		var snapshot string
+		require.NoError(t, db.Raw(`
+			SELECT pg_catalog.md5(pg_catalog.string_agg(item, E'\n' ORDER BY item))
+			FROM (
+				SELECT 'trigger:' || pg_catalog.pg_get_triggerdef(trigger.oid, true) AS item
+				FROM pg_catalog.pg_trigger AS trigger
+				JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+				JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+				WHERE namespace.nspname = 'public' AND NOT trigger.tgisinternal
+				UNION ALL
+				SELECT 'policy:' || policy.schemaname || '.' || policy.tablename || ':' ||
+					policy.policyname || ':' || COALESCE(policy.qual, '') || ':' || COALESCE(policy.with_check, '')
+				FROM pg_catalog.pg_policies AS policy WHERE policy.schemaname = 'public'
+				UNION ALL
+				SELECT 'function:' || procedure.oid::regprocedure::text || ':' || pg_catalog.pg_get_functiondef(procedure.oid)
+				FROM pg_catalog.pg_proc AS procedure
+				JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+				WHERE namespace.nspname = 'public' AND procedure.proname LIKE 'rereply_%'
+			) AS catalog
+		`).Scan(&snapshot).Error)
+		require.NotEmpty(t, snapshot)
+		return snapshot
+	}
+
+	before := catalogSnapshot()
+	backfillCalls := 0
+	verificationCalls := 0
+	for attempt := 1; attempt <= 2; attempt++ {
+		require.NoError(t, database.RunRLSMigrationCoordinatorForTest(
+			db,
+			&config.DefaultAdminConfig{},
+			runtimeRole,
+			"baseline",
+			func(*gorm.DB) error {
+				backfillCalls++
+				return errors.New("future-profile baseline reached a mutation callback")
+			},
+			func() error {
+				verificationCalls++
+				return database.VerifyTenantRLS(runtimeDB, runtimeRole)
+			},
+		), "future-profile baseline attempt %d", attempt)
+	}
+	assert.Zero(t, backfillCalls)
+	assert.Equal(t, 2, verificationCalls)
+	assert.Equal(t, before, catalogSnapshot(),
+		"two future-profile baseline executions must not rewrite catalog authority")
 }
 
 func setupPlatformComplianceGuardTest(t *testing.T) (*gorm.DB, string) {

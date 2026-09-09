@@ -1,6 +1,10 @@
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
-import { contactsService, messagesService } from '@/services/api'
+import {
+  contactsService,
+  messagesService,
+  type ContactIdentityReviewEffectiveState,
+} from '@/services/api'
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
 import { compareMessageIngestionOrder } from '@/lib/messageOrdering'
@@ -33,6 +37,7 @@ export interface Contact {
   assigned_user_id?: string
   whatsapp_account?: string
   marketing_opt_out?: boolean
+  identity_review_ai_state: ContactIdentityReviewEffectiveState
   created_at: string
   updated_at: string
 }
@@ -213,6 +218,11 @@ export const useContactsStore = defineStore('contacts', () => {
       // API returns { status: "success", data: { contacts: [...], total: number } }
       const data = response.data.data || response.data
       contacts.value = data.contacts || []
+      const selectedID = currentContact.value?.id
+      if (selectedID) {
+        const canonicalSelected = contacts.value.find(contact => contact.id === selectedID)
+        if (canonicalSelected) currentContact.value = canonicalSelected
+      }
       contactsTotal.value = data.total ?? contacts.value.length
       contactsPage.value = 1
     } catch (error) {

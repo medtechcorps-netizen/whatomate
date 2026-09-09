@@ -30,6 +30,15 @@ const (
 )
 
 func setEmbeddedSignupAuth(req *fastglue.Request, orgID, userID uuid.UUID) {
+	var payload map[string]any
+	if err := json.Unmarshal(req.RequestCtx.PostBody(), &payload); err == nil {
+		if _, exists := payload["signup_mode"]; !exists {
+			payload["signup_mode"] = "classic"
+			if encoded, marshalErr := json.Marshal(payload); marshalErr == nil {
+				req.RequestCtx.Request.SetBody(encoded)
+			}
+		}
+	}
 	testutil.SetAuthContext(req, orgID, userID)
 	testutil.SetHeader(req, "X-Organization-ID", orgID.String())
 }

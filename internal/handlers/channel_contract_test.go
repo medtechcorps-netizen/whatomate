@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 	"gorm.io/gorm"
 )
 
@@ -112,6 +115,198 @@ func TestChannelIdentifiersAreAllowlisted(t *testing.T) {
 	assert.True(t, channelProviderIdentifier.MatchString("microsoft_graph"))
 	assert.False(t, channelProviderIdentifier.MatchString("../provider"))
 	assert.False(t, channelProviderIdentifier.MatchString("Provider With Spaces"))
+}
+
+func TestListInboxConversationsFiltersByExactConversationID(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	role := testutil.CreateTestRoleWithKeys(
+		t,
+		db,
+		organization.ID,
+		"conversation-filter-"+uuid.NewString(),
+		[]string{models.ResourceConversations + ":" + models.ActionRead},
+	)
+	reader := testutil.CreateTestUser(t, db, organization.ID, testutil.WithRoleID(&role.ID))
+	enableBookingCommerceTestEntitlement(
+		t,
+		db,
+		organization.ID,
+		reader.ID,
+		"omnichannel.enabled",
+	)
+	contact := testutil.CreateTestContact(t, db, organization.ID)
+	account := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    organization.ID,
+		Channel:           models.ChannelInstagram,
+		Provider:          channelapi.RelayProvider,
+		Name:              "Exact conversation filter",
+		ExternalAccountID: "filter-" + uuid.NewString(),
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, db.Create(&account).Error)
+	selected := createAttentionConversation(
+		t,
+		db,
+		organization.ID,
+		account.ID,
+		contact.ID,
+		"selected",
+	)
+	createAttentionConversation(t, db, organization.ID, account.ID, contact.ID, "other")
+	otherOrganization := testutil.CreateTestOrganization(t, db)
+	otherContact := testutil.CreateTestContact(t, db, otherOrganization.ID)
+	otherAccount := models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    otherOrganization.ID,
+		Channel:           models.ChannelInstagram,
+		Provider:          channelapi.RelayProvider,
+		Name:              "Other tenant conversation filter",
+		ExternalAccountID: "other-filter-" + uuid.NewString(),
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{},
+		Config:            models.JSONB{},
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, db.Create(&otherAccount).Error)
+	otherConversation := createAttentionConversation(
+		t,
+		db,
+		otherOrganization.ID,
+		otherAccount.ID,
+		otherContact.ID,
+		"other-tenant",
+	)
+
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	request := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(request, organization.ID, reader.ID)
+	testutil.SetQueryParam(request, "conversation_id", selected.ID.String())
+	require.NoError(t, app.ListInboxConversations(request))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+
+	var response struct {
+		Data struct {
+			Conversations []InboxConversationResponse `json:"conversations"`
+			Total         int                         `json:"total"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(request), &response))
+	require.Len(t, response.Data.Conversations, 1)
+	assert.Equal(t, 1, response.Data.Total)
+	assert.Equal(t, selected.ID, response.Data.Conversations[0].ID)
+	assert.Equal(t, WhatsAppIdentityReviewEffectiveState{
+		Known:     true,
+		AIAllowed: true,
+		Blocked:   false,
+		Reason:    "no_open_identity_review",
+	}, response.Data.Conversations[0].IdentityReviewAIState)
+
+	whatsAppAccount := testutil.CreateTestWhatsAppAccount(t, db, organization.ID)
+	coexistenceState := models.WhatsAppCoexistenceState{
+		ID:                uuid.New(),
+		OrganizationID:    organization.ID,
+		WhatsAppAccountID: whatsAppAccount.ID,
+		OnboardingStatus:  models.CoexistenceOnboardingStatusConnected,
+		OnboardingCycle:   1,
+		SyncStatus:        models.CoexistenceSyncStatusNotRequested,
+		ContactSyncStatus: models.CoexistenceSyncStatusNotRequested,
+		HistoryConsent:    models.CoexistenceHistoryConsentUnknown,
+		HistorySyncStatus: models.CoexistenceSyncStatusNotRequested,
+		LifecycleStatus:   models.CoexistenceLifecycleStatusConnected,
+		LifecycleMetadata: models.JSONB{},
+		Version:           1,
+	}
+	require.NoError(t, db.Create(&coexistenceState).Error)
+	require.NoError(t, db.Model(contact).Update("bs_uid", "selected-contact-principal").Error)
+	claim := WhatsAppIdentityReviewClaim{
+		OrganizationID:          organization.ID,
+		WhatsAppAccountID:       whatsAppAccount.ID,
+		OnboardingCycle:         1,
+		DirectPrimaryBSUID:      "selected-contact-principal",
+		VerifiedEventProvenance: WhatsAppIdentityReviewVerifiedMetaEvent,
+		VerifiedEventDigest:     strings.Repeat("a", 64),
+		SelectorBodyDigest:      strings.Repeat("b", 64),
+	}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		_, _, err := app.CreateOrReuseWhatsAppIdentityReviewHold(tx, &claim)
+		return err
+	}))
+
+	openHold := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(openHold, organization.ID, reader.ID)
+	testutil.SetQueryParam(openHold, "conversation_id", selected.ID.String())
+	require.NoError(t, app.ListInboxConversations(openHold))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(openHold))
+	var openHoldResponse struct {
+		Data struct {
+			Conversations []InboxConversationResponse `json:"conversations"`
+			Total         int                         `json:"total"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(openHold), &openHoldResponse))
+	require.Len(t, openHoldResponse.Data.Conversations, 1)
+	assert.Equal(t, 1, openHoldResponse.Data.Total)
+	assert.Equal(t, selected.ID, openHoldResponse.Data.Conversations[0].ID)
+	openState := openHoldResponse.Data.Conversations[0].IdentityReviewAIState
+	assert.True(t, openState.Known)
+	assert.False(t, openState.AIAllowed)
+	assert.True(t, openState.Blocked)
+	assert.Positive(t, openState.OpenHoldCount)
+	assert.Equal(t, "identity_review_open", openState.Reason)
+
+	crossTenant := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(crossTenant, organization.ID, reader.ID)
+	testutil.SetQueryParam(crossTenant, "conversation_id", otherConversation.ID.String())
+	require.NoError(t, app.ListInboxConversations(crossTenant))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(crossTenant))
+	var crossTenantResponse struct {
+		Data struct {
+			Conversations []InboxConversationResponse `json:"conversations"`
+			Total         int                         `json:"total"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(crossTenant), &crossTenantResponse))
+	assert.Zero(t, crossTenantResponse.Data.Total)
+	assert.Empty(t, crossTenantResponse.Data.Conversations)
+
+	invalid := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(invalid, organization.ID, reader.ID)
+	testutil.SetQueryParam(invalid, "conversation_id", "not-a-uuid")
+	require.NoError(t, app.ListInboxConversations(invalid))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(invalid))
+
+	callbackName := "test:inbox_identity_review_read_failure_" + uuid.NewString()
+	require.NoError(t, db.Callback().Row().Before("gorm:row").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "member" || strings.Contains(tx.Statement.Table, "whatsapp_identity_review_members") {
+			_ = tx.AddError(errors.New("forced identity-review read failure"))
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Row().Remove(callbackName) })
+
+	fallback := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(fallback, organization.ID, reader.ID)
+	testutil.SetQueryParam(fallback, "conversation_id", selected.ID.String())
+	require.NoError(t, app.ListInboxConversations(fallback))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(fallback))
+	var fallbackResponse struct {
+		Data struct {
+			Conversations []InboxConversationResponse `json:"conversations"`
+			Total         int                         `json:"total"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(fallback), &fallbackResponse))
+	require.Len(t, fallbackResponse.Data.Conversations, 1)
+	assert.Equal(t, 1, fallbackResponse.Data.Total)
+	fallbackState := fallbackResponse.Data.Conversations[0].IdentityReviewAIState
+	assert.False(t, fallbackState.Known)
+	assert.False(t, fallbackState.AIAllowed)
+	assert.True(t, fallbackState.Blocked)
+	assert.Equal(t, "identity_review_read_failed", fallbackState.Reason)
 }
 
 func TestTenantConfigCannotEnableLocalhostRelay(t *testing.T) {

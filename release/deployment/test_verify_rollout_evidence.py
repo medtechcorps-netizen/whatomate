@@ -31,6 +31,9 @@ IMAGE_WORKFLOW_PATH = (
     ROOT / ".github" / "workflows" / "build-attest-exact-release-images.yml"
 )
 TEST_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "test.yml"
+DATABASE_PHASE_HARNESS_PATH = (
+    ROOT / "release" / "validation" / "verify_database_phase_compatibility.sh"
+)
 CONTROL_SHA = "a" * 40
 EXPECTED_FINAL_SOURCE = {
     "source_sha": "c6e16810b8dec7d54305be47f7f7fc12430a1f0a",
@@ -147,6 +150,14 @@ class RolloutEvidenceTests(unittest.TestCase):
         self.assertEqual(
             self.contract["migration"]["arguments"],
             ["rls-migrate", "-config", "config.toml"],
+        )
+        self.assertEqual(
+            self.manifest["validation"]["database_phase_compatibility"],
+            verifier.DATABASE_PHASE_COMPATIBILITY,
+        )
+        self.assertEqual(
+            hashlib.sha256(DATABASE_PHASE_HARNESS_PATH.read_bytes()).hexdigest(),
+            verifier.DATABASE_PHASE_COMPATIBILITY["harness_sha256"],
         )
         self.assertEqual(
             self.contract["rollback"]["ui"],
@@ -532,6 +543,28 @@ class RolloutEvidenceTests(unittest.TestCase):
         manifest["release"]["components"]["web"]["unexpected"] = "forbidden"
         with self.assertRaises(verifier.EvidenceError):
             verifier.validate_manifest(manifest)
+
+    def test_manifest_rejects_database_phase_authority_drift_or_shared_sources(self) -> None:
+        mutations = []
+        manifest = copy.deepcopy(self.manifest)
+        manifest["validation"]["database_phase_compatibility"][
+            "harness_sha256"
+        ] = "0" * 64
+        mutations.append(("harness hash", manifest))
+
+        manifest = copy.deepcopy(self.manifest)
+        manifest["validation"]["database_phase_compatibility"]["unexpected"] = True
+        mutations.append(("compatibility shape", manifest))
+
+        for key in ("source_sha", "root_tree", "internal_tree"):
+            manifest = copy.deepcopy(self.manifest)
+            manifest["phases"]["bridge"][key] = manifest["phases"]["baseline"][key]
+            mutations.append((f"shared {key}", manifest))
+
+        for label, manifest in mutations:
+            with self.subTest(label=label):
+                with self.assertRaises(verifier.EvidenceError):
+                    verifier.validate_manifest(manifest)
 
     def test_manifest_rejects_every_untyped_or_unreviewed_material_shape(self) -> None:
         def cases() -> list[tuple[str, dict]]:

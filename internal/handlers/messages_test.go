@@ -21,6 +21,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func synchronousNonAISendOptions() handlers.MessageSendOptions {
+	options := handlers.ChatbotSendOptions()
+	options.AutomaticAI = false
+	return options
+}
+
 // mockWhatsAppServer creates a mock WhatsApp API server for testing.
 // It handles various endpoints and returns configurable responses.
 type mockWhatsAppServer struct {
@@ -206,7 +212,7 @@ func TestApp_SendOutgoingMessage_TextMessage_Success(t *testing.T) {
 	}
 
 	// Use sync options to wait for result
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -236,6 +242,78 @@ func TestApp_SendOutgoingMessage_TextMessage_Success(t *testing.T) {
 	assert.Equal(t, mockServer.nextMessageID, dbMsg.WhatsAppMessageID)
 }
 
+func TestApp_SendOutgoingMessage_DisconnectedAccountDoesNotCallGraph(t *testing.T) {
+	mockServer := newMockWhatsAppServer()
+	defer mockServer.close()
+
+	app := newMsgTestApp(t, mockServer)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	account := createTestAccount(t, app, org.ID)
+	contact := testutil.CreateTestContactWith(t, app.DB, org.ID, testutil.WithContactAccount(account.Name))
+
+	// Keep the caller's projection active to exercise the final database fence,
+	// as happens when an offboarding webhook invalidates an already-loaded job.
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+		Where("id = ? AND organization_id = ?", account.ID, org.ID).
+		Update("status", "disconnected").Error)
+	require.Equal(t, "active", account.Status)
+
+	msg, err := app.SendOutgoingMessage(
+		testutil.TestContext(t),
+		handlers.OutgoingMessageRequest{
+			Account: account,
+			Contact: contact,
+			Type:    models.MessageTypeText,
+			Content: "must stay local after coexistence reconnect",
+		},
+		synchronousNonAISendOptions(),
+	)
+	require.ErrorContains(t, err, "not active for outbound messaging")
+	assert.Nil(t, msg)
+
+	paths, _ := mockServer.messageRequestSnapshot()
+	assert.Empty(t, paths, "a disconnected account must make zero Graph message requests")
+
+	var stored models.Message
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND content = ?",
+		org.ID,
+		"must stay local after coexistence reconnect",
+	).First(&stored).Error)
+	assert.Equal(t, models.MessageStatusFailed, stored.Status)
+	assert.Contains(t, stored.ErrorMessage, "not active for outbound messaging")
+}
+
+func TestApp_SendOutgoingMessage_UsesCredentialFromFinalLockedRow(t *testing.T) {
+	mockServer := newMockWhatsAppServer()
+	defer mockServer.close()
+
+	app := newMsgTestApp(t, mockServer)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	account := createTestAccount(t, app, org.ID)
+	contact := testutil.CreateTestContactWith(t, app.DB, org.ID, testutil.WithContactAccount(account.Name))
+
+	// Simulate a request/cache projection retained across a completed Embedded
+	// Signup credential refresh. The database row contains the current token.
+	account.AccessToken = "superseded-token"
+	msg, err := app.SendOutgoingMessage(
+		testutil.TestContext(t),
+		handlers.OutgoingMessageRequest{
+			Account: account,
+			Contact: contact,
+			Type:    models.MessageTypeText,
+			Content: "must use the locked credential generation",
+		},
+		synchronousNonAISendOptions(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+
+	paths, authorizations := mockServer.messageRequestSnapshot()
+	require.Len(t, paths, 1)
+	require.Equal(t, []string{"Bearer test-token"}, authorizations)
+}
+
 func TestApp_SendOutgoingMessage_TextMessage_APIError(t *testing.T) {
 	mockServer := newMockWhatsAppServer()
 	defer mockServer.close()
@@ -257,7 +335,7 @@ func TestApp_SendOutgoingMessage_TextMessage_APIError(t *testing.T) {
 		Content: "Hello!",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -292,7 +370,7 @@ func TestApp_SendOutgoingMessage_ImageMessage_WithMediaID(t *testing.T) {
 		Caption:       "Check this out!",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -333,7 +411,7 @@ func TestApp_SendOutgoingMessage_ImageMessage_WithMediaData(t *testing.T) {
 		Caption:       "Photo caption",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -373,7 +451,7 @@ func TestApp_SendOutgoingMessage_DocumentMessage(t *testing.T) {
 		Caption:       "Monthly report",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -411,7 +489,7 @@ func TestApp_SendOutgoingMessage_VideoMessage(t *testing.T) {
 		Caption:       "Watch this!",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -446,7 +524,7 @@ func TestApp_SendOutgoingMessage_AudioMessage(t *testing.T) {
 		MediaMimeType: "audio/ogg",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -484,7 +562,7 @@ func TestApp_SendOutgoingMessage_InteractiveButtons(t *testing.T) {
 		},
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -532,7 +610,7 @@ func TestApp_SendOutgoingMessage_InteractiveCTAURL(t *testing.T) {
 		URL:             "https://example.com",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -587,7 +665,7 @@ func TestApp_SendOutgoingMessage_TemplateMessage(t *testing.T) {
 		BodyParams: map[string]string{"1": "John", "2": "ORD-123"},
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -612,6 +690,122 @@ func TestApp_SendOutgoingMessage_TemplateMessage(t *testing.T) {
 	assert.Equal(t, "en", templateData["language"].(map[string]any)["code"])
 }
 
+func TestApp_SendOutgoingMessage_TemplateMessage_UploadsRawHeaderInsideDelivery(t *testing.T) {
+	mockServer := newMockWhatsAppServer()
+	defer mockServer.close()
+
+	app := newMsgTestApp(t, mockServer)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	account := createTestAccount(t, app, org.ID)
+	contact := testutil.CreateTestContactWith(
+		t,
+		app.DB,
+		org.ID,
+		testutil.WithContactAccount(account.Name),
+	)
+	template := &models.Template{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		Name:            "raw_header_" + uuid.NewString()[:8],
+		DisplayName:     "Raw Header",
+		Category:        "UTILITY",
+		Language:        "en",
+		Status:          string(models.TemplateStatusApproved),
+		HeaderType:      "IMAGE",
+		BodyContent:     "Header delivery",
+	}
+	require.NoError(t, app.DB.Create(template).Error)
+
+	message, err := app.SendOutgoingMessage(
+		testutil.TestContext(t),
+		handlers.OutgoingMessageRequest{
+			Account:             account,
+			Contact:             contact,
+			Type:                models.MessageTypeTemplate,
+			Template:            template,
+			MediaData:           []byte("synthetic header image"),
+			MediaMimeType:       "image/png",
+			HeaderMediaFilename: "header.png",
+		},
+		synchronousNonAISendOptions(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, message)
+	require.Len(t, mockServer.uploadedMedia, 1)
+	require.Len(t, mockServer.sentMessages, 1)
+
+	templatePayload := mockServer.sentMessages[0]["template"].(map[string]any)
+	components := templatePayload["components"].([]any)
+	require.Len(t, components, 1)
+	header := components[0].(map[string]any)
+	assert.Equal(t, "header", header["type"])
+	parameters := header["parameters"].([]any)
+	require.Len(t, parameters, 1)
+	image := parameters[0].(map[string]any)["image"].(map[string]any)
+	assert.Equal(t, mockServer.nextMediaID, image["id"])
+
+	var stored models.Message
+	require.NoError(t, app.DB.First(&stored, "id = ?", message.ID).Error)
+	assert.Equal(t, models.MessageStatusSent, stored.Status)
+}
+
+func TestApp_SendTemplateMessage_MarketingOptOutMakesNoHeaderUpload(t *testing.T) {
+	mockServer := newMockWhatsAppServer()
+	defer mockServer.close()
+	var mediaFetches atomic.Int64
+	mediaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mediaFetches.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("synthetic header image"))
+	}))
+	defer mediaServer.Close()
+
+	app := newMsgTestApp(t, mockServer)
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://media.example.com": mediaServer,
+	})
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	account := createTestAccount(t, app, org.ID)
+	contact := testutil.CreateTestContactWith(
+		t,
+		app.DB,
+		org.ID,
+		testutil.WithContactAccount(account.Name),
+	)
+	require.NoError(t, app.DB.Model(contact).Update("marketing_opt_out", true).Error)
+	template := &models.Template{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		Name:            "opted_out_header_" + uuid.NewString()[:8],
+		DisplayName:     "Opted Out Header",
+		Category:        "MARKETING",
+		Language:        "en",
+		Status:          string(models.TemplateStatusApproved),
+		HeaderType:      "IMAGE",
+		BodyContent:     "Must not upload",
+	}
+	require.NoError(t, app.DB.Create(template).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"contact_id":       contact.ID.String(),
+		"template_name":    template.Name,
+		"header_media_url": "https://media.example.com/header.png",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+
+	require.NoError(t, app.SendTemplateMessage(req))
+	assert.Equal(t, http.StatusBadRequest, testutil.GetResponseStatusCode(req))
+	app.WaitForBackgroundTasks()
+	assert.EqualValues(t, 1, mediaFetches.Load(), "the bounded source read may finish before policy evaluation")
+	assert.Empty(t, mockServer.uploadedMedia, "policy rejection must happen before any Meta upload")
+	assert.Equal(t, 0, mockServer.sentMessageCount())
+}
+
 func TestApp_SendOutgoingMessage_TemplateMessage_MissingTemplate(t *testing.T) {
 	mockServer := newMockWhatsAppServer()
 	defer mockServer.close()
@@ -631,7 +825,7 @@ func TestApp_SendOutgoingMessage_TemplateMessage_MissingTemplate(t *testing.T) {
 		BodyParams: map[string]string{"1": "param1"},
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -701,8 +895,8 @@ func TestApp_SendOutgoingMessage_SyncOption(t *testing.T) {
 		Content: "Sync message",
 	}
 
-	// Use sync options (ChatbotSendOptions has Async: false)
-	opts := handlers.ChatbotSendOptions()
+	// Use synchronous non-AI options for this generic delivery test.
+	opts := synchronousNonAISendOptions()
 	assert.False(t, opts.Async)
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
@@ -782,7 +976,7 @@ func TestApp_SendOutgoingMessage_UnsupportedType(t *testing.T) {
 		Content: "Some content",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	msg, err := app.SendOutgoingMessage(ctx, req, opts)
 
@@ -858,7 +1052,7 @@ func TestApp_SendOutgoingMessage_ContactLastMessageUpdated(t *testing.T) {
 		Content: "This is a test message for preview",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	_, err := app.SendOutgoingMessage(ctx, req, opts)
 	require.NoError(t, err)
@@ -890,7 +1084,7 @@ func TestApp_SendOutgoingMessage_MediaPreview(t *testing.T) {
 		MediaMimeType: "image/jpeg",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	_, err := app.SendOutgoingMessage(ctx, req, opts)
 	require.NoError(t, err)
@@ -919,7 +1113,7 @@ func TestApp_SendOutgoingMessage_DocumentPreview(t *testing.T) {
 		MediaFilename: "report.pdf",
 	}
 
-	opts := handlers.ChatbotSendOptions()
+	opts := synchronousNonAISendOptions()
 
 	_, err := app.SendOutgoingMessage(ctx, req, opts)
 	require.NoError(t, err)

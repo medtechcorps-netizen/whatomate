@@ -286,6 +286,7 @@ def _assert_phase_state_chain(
         or lineage["predecessor_state_sha256"] != receipt_hash
         or state["evidence"]["change_receipt_sha256"] != receipt_hash
         or state["provider_state"] != receipt["after"]
+        or state["rollback"] != receipt["rollback"]
         or state["control"]["workflow_sha"] != control["workflow_sha"]
         or state["control"]["release_policy_sha256"]
         != control["release_policy_sha256"]
@@ -327,6 +328,11 @@ def _assert_orphan_rollback_chain(
     control: Mapping[str, Any],
 ) -> None:
     reconciliation_hash = common.sha256_bytes(common.canonical_file_bytes(reconciliation))
+    expected_floor = common.derive_rollback_floor(
+        reconciliation["lineage"]["phase"],
+        reconciliation["rollback"],
+        orphan_intent["lineage"]["to"],
+    )
     original_lock = original_intent["lock"]
     inherited = orphan_intent["lock"]
     expected_owner_intent = (
@@ -357,7 +363,12 @@ def _assert_orphan_rollback_chain(
         != "reconciliation-receipt"
         or orphan_intent["lineage"]["predecessor_state_sha256"]
         != reconciliation_hash
+        or orphan_intent["lineage"]["from"]
+        != reconciliation["lineage"]["phase"]
+        or orphan_intent["lineage"]["event_sequence"]
+        != reconciliation["lineage"]["event_sequence"] + 1
         or orphan_intent["before"] != reconciliation["after"]
+        or orphan_intent["rollback"] != expected_floor
         or not _same_binding(
             _current_binding_as_full(
                 orphan_intent["authorities"]["current_state"],
@@ -374,6 +385,7 @@ def _assert_orphan_rollback_chain(
         orphan_receipt["control"]["workflow_sha"] != control["workflow_sha"]
         or orphan_receipt["lineage"] != orphan_intent["lineage"]
         or orphan_receipt["before"] != orphan_intent["before"]
+        or orphan_receipt["rollback"] != orphan_intent["rollback"]
         or orphan_receipt["canary"]["route_contract_sha256"]
         != reconciliation["canary"]["route_contract_sha256"]
         or not _same_binding(

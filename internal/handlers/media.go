@@ -215,14 +215,152 @@ func getMimeTypeFromExtension(ext string) string {
 // DownloadAndSaveMedia downloads media from Meta and saves it to the configured
 // tenant media store. It returns the object key or legacy local relative path.
 func (a *App) DownloadAndSaveMedia(ctx context.Context, orgID uuid.UUID, mediaID string, mimeType string, account *whatsapp.Account) (string, error) {
+	return a.downloadAndSaveMedia(ctx, orgID, mediaID, mimeType, account, uuid.NewString())
+}
+
+// downloadAndSaveCoexistenceMedia uses a stable object name for every
+// message/media pair. A retry after an uncertain database commit overwrites the
+// same object instead of leaving another random orphan. Including the media ID
+// digest also prevents an older edit hydration from overwriting a newer edit's
+// bytes when two provider calls briefly overlap.
+func (a *App) downloadAndSaveCoexistenceMedia(
+	ctx context.Context,
+	orgID, messageID uuid.UUID,
+	mediaID string,
+	mimeType string,
+	account *whatsapp.Account,
+) (string, error) {
+	if account == nil {
+		return "", errors.New("WhatsApp media account is required")
+	}
+	filename, err := coexistenceMediaFilename(messageID, mediaID)
+	if err != nil {
+		return "", err
+	}
+	client := a.whatsAppClient()
+	mediaURL, err := client.GetMediaURL(ctx, mediaID, account)
+	if err != nil {
+		return "", fmt.Errorf("failed to get media URL: %w", err)
+	}
+	data, err := client.DownloadMedia(ctx, mediaURL, account.AccessToken)
+	if err != nil {
+		return "", fmt.Errorf("failed to download media: %w", err)
+	}
+	return a.saveTenantMedia(
+		ctx,
+		orgID,
+		path.Join("messages", "coexistence"),
+		"coexistence",
+		filename,
+		data,
+		mimeType,
+	)
+}
+
+// coexistenceMediaFilename is the single source of truth for both writes and
+// cleanup retries. Keep it independent of mutable webhook MIME metadata.
+func coexistenceMediaFilename(messageID uuid.UUID, mediaID string) (string, error) {
+	mediaID = strings.TrimSpace(mediaID)
+	if messageID == uuid.Nil || mediaID == "" {
+		return "", errors.New("coexistence media storage identity is incomplete")
+	}
+	versionID := uuid.NewSHA1(messageID, []byte(mediaID))
+	return messageID.String() + "-" + versionID.String() + ".bin", nil
+}
+
+// coexistenceMediaStorageKey re-derives the exact deterministic key so a
+// durable job can retry an object deletion without persisting a provider URL.
+func (a *App) coexistenceMediaStorageKey(
+	orgID, messageID uuid.UUID,
+	mediaID string,
+) (string, error) {
+	if a == nil || orgID == uuid.Nil {
+		return "", errors.New("coexistence media storage identity is incomplete")
+	}
+	filename, err := coexistenceMediaFilename(messageID, mediaID)
+	if err != nil {
+		return "", err
+	}
+	if a.Config != nil && strings.EqualFold(a.Config.Storage.Type, "s3") {
+		return tenantObjectKey(orgID, "messages", "coexistence", filename), nil
+	}
+	return path.Join("coexistence", filename), nil
+}
+
+// deleteTenantMedia removes one exact tenant media key. It is intentionally
+// narrow: callers must have already proved that no committed message references
+// the key. Missing objects are an idempotent success.
+func (a *App) deleteTenantMedia(ctx context.Context, orgID uuid.UUID, key string) error {
+	if a == nil || orgID == uuid.Nil {
+		return errors.New("tenant media deletion identity is incomplete")
+	}
+	normalized := path.Clean(strings.ReplaceAll(strings.TrimSpace(key), "\\", "/"))
+	if normalized == "." || normalized == "" {
+		return errInvalidStoredMediaKey
+	}
+	if strings.HasPrefix(normalized, "organizations/") {
+		if !isTenantObjectKey(orgID, normalized) {
+			return errInvalidStoredMediaKey
+		}
+		if a.ObjectStore == nil {
+			return errors.New("object storage is not initialized")
+		}
+		if err := a.ObjectStore.Delete(ctx, normalized); err != nil &&
+			!errors.Is(err, storage.ErrObjectNotFound) {
+			return err
+		}
+		return nil
+	}
+
+	filePath := filepath.Clean(filepath.FromSlash(normalized))
+	baseDir, err := filepath.Abs(a.getMediaStoragePath())
+	if err != nil {
+		return fmt.Errorf("resolve media storage path: %w", err)
+	}
+	fullPath, err := filepath.Abs(filepath.Join(baseDir, filePath))
+	if err != nil || !strings.HasPrefix(fullPath, baseDir+string(os.PathSeparator)) {
+		return errInvalidStoredMediaKey
+	}
+	info, err := os.Lstat(fullPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errInvalidStoredMediaKey
+	}
+	if err := os.Remove(fullPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (a *App) downloadAndSaveMedia(
+	ctx context.Context,
+	orgID uuid.UUID,
+	mediaID string,
+	mimeType string,
+	account *whatsapp.Account,
+	filenameStem string,
+) (string, error) {
+	if account == nil {
+		return "", errors.New("WhatsApp media account is required")
+	}
+	filenameStem = strings.TrimSpace(filenameStem)
+	if filenameStem == "" {
+		return "", errors.New("media storage filename is required")
+	}
+	client := a.whatsAppClient()
 	// Get the media URL from Meta
-	mediaURL, err := a.WhatsApp.GetMediaURL(ctx, mediaID, account)
+	mediaURL, err := client.GetMediaURL(ctx, mediaID, account)
 	if err != nil {
 		return "", fmt.Errorf("failed to get media URL: %w", err)
 	}
 
 	// Download the media content
-	data, err := a.WhatsApp.DownloadMedia(ctx, mediaURL, account.AccessToken)
+	data, err := client.DownloadMedia(ctx, mediaURL, account.AccessToken)
 	if err != nil {
 		return "", fmt.Errorf("failed to download media: %w", err)
 	}
@@ -233,8 +371,7 @@ func (a *App) DownloadAndSaveMedia(ctx context.Context, orgID uuid.UUID, mediaID
 		ext = ".bin"
 	}
 
-	// Generate unique filename
-	filename := uuid.New().String() + ext
+	filename := filenameStem + ext
 
 	// Determine subdirectory based on media type
 	var subdir string

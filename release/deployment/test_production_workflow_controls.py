@@ -12,6 +12,9 @@ from release.deployment import verify_rollout_evidence
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
+DATABASE_PHASE_HARNESS = (
+    ROOT / "release" / "validation" / "verify_database_phase_compatibility.sh"
+)
 ACTIVE_PRODUCTION_CONTROLS = (
     "validate-exact-release-source.yml",
     "build-attest-exact-release-images.yml",
@@ -59,7 +62,7 @@ EXACT_IMAGE_BUILD_ACTION = (
     "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6"
 )
 EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
-    "6294953577854747b57c8e0aebe92e1af53b4a7a5679bb9e71de28d01c9f55de"
+    "f440843e777e32f4094735f2046fb25646494c4557e6ef54b5da71a880d3fcf2"
 )
 EXACT_CRM_CANARY_DRIVER_PUBLISHER_SHA256 = (
     "36501e78999f16f172615d920f559e1f91f1ea639e414db06258b4e343948304"
@@ -68,7 +71,7 @@ EXACT_IMAGE_GATE_STEP_SHA256 = (
     "1b4bf101f1756d43193ccc0050cf44bb9dd22df25302e084c9a9a91ede2db4a5"
 )
 EXACT_IMAGE_AUTHORITY_MATRIX_STEP_SHA256 = (
-    "196b5dfa7965b2763607f2273f908992cf52de1a01ccd946b7f39d7e57c1cb07"
+    "60c32afe775b5a942792048682dbecfc57227fda421a73a6ffaf5f28c000624c"
 )
 EXACT_RELEASE_WEB_SNAPSHOT_RUN = (
     "RUN set -eu; "
@@ -112,7 +115,7 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
     ),
 }
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "ab0fd29ec13b3aa973c3ab749f46dc216cbfcada0d71a753c2dfc22a33b1d1aa"
+    "55ed07aa32388f5d7bbd2553cab97cff9df080a88805bd40f66f66f5ae8db1bf"
 )
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
     "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
@@ -121,7 +124,7 @@ EXACT_CLEANUP_AUTHORITY_STEP_SHA256 = (
     "30096cb73e5db041a6120d3ed4dcf6bb29169134713e2515e9baf32ee3179232"
 )
 EXACT_GATE_B_TEST_JOB_SHA256 = {
-    "go-race": "0aa5bc14dd3d264191134048bc4e9dc6b50f77b58b13d3f596dadcd93a1c1a98",
+    "go-race": "4394f61230c01e1eb700956a99b26b1fd442e8fab2fd0004074aa78723e2a189",
     "lint": "02dd41096ca9d060d9f2f26be9588775356ab21856c1982a3d33a0559a28f3e1",
     "security": "ed9572d5895abf26417ce1ebf87970cc67b41be00379d42df75df58f73c8cbd4",
     "recovery-boundary-images": (
@@ -454,6 +457,19 @@ def assert_gate_b_test_workflow(source: str) -> None:
         require_active_source_line(run_tests, line)
     if "grep -v /test/" in run_tests or " -race " not in run_tests:
         raise AssertionError("root-module race coverage is weakened")
+    compatibility = step_block(
+        go_race, "Verify this checkout's compile-time UI database role"
+    )
+    for line in (
+        "bash release/validation/verify_database_phase_compatibility.sh \\",
+        "--phase ui \\",
+        "--workflow-path .github/workflows/test.yml \\",
+        '--workflow-repository "$GITHUB_WORKFLOW_REPOSITORY" \\',
+        'or evidence["compile_time"]["value"] != "rlsMigrationPhaseUI"',
+    ):
+        require_active_source_line(compatibility, line)
+    if "evidence for all four" not in compatibility:
+        raise AssertionError("integrated checkout database role boundary is missing")
 
     lint = step_block(
         job_block(source, "lint"), "Lint workflows and inert recovery templates"
@@ -930,6 +946,72 @@ def exact_yaml_mapping_active_lines(
     return normalized_active_lines("\n".join(lines[start:end]))
 
 
+def assert_ci_postgres17_service(source: str, job: str) -> None:
+    expected_image = (
+        "image: postgres:17@sha256:"
+        "e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449"
+    )
+    if job not in ("go-race", "e2e-shard"):
+        raise AssertionError("unexpected CI PostgreSQL job")
+    source = job_block(source, job)
+    # Preserve indentation until the exact services.postgres boundary is found.
+    for indent, key in ((4, "services"), (6, "postgres")):
+        pattern = rf"(?ms)^{' ' * indent}{key}:\s*$.*?(?=^\S|^ {{1,{indent}}}\S|\Z)"
+        matches = re.findall(pattern, source)
+        if len(matches) != 1:
+            raise AssertionError("CI PostgreSQL mapping is missing or duplicated")
+        source = matches[0]
+    expected_env = (
+        ("POSTGRES_USER: postgres", "POSTGRES_PASSWORD: postgres",
+         "POSTGRES_DB: whatomate_test")
+        if job == "go-race" else
+        ("POSTGRES_DB: whatomate_test", "POSTGRES_USER: test",
+         "POSTGRES_PASSWORD: test")
+    )
+    expected_health = (
+        "--health-cmd pg_isready" if job == "go-race"
+        else '--health-cmd "pg_isready -U test"'
+    )
+    if normalized_active_lines(source) != (
+        "postgres:", expected_image, "env:", *expected_env, "ports:",
+        "- 5432:5432", "options: >-", expected_health,
+        "--health-interval 10s", "--health-timeout 5s", "--health-retries 5",
+    ):
+        raise AssertionError("CI PostgreSQL service differs from the reviewed PG17 service")
+
+
+def assert_database_phase_harness_parity(
+    manifest: dict, verifier: dict, image_source: str, harness: bytes
+) -> None:
+    expected = {
+        "authority": "exact-database-phase-compatibility/v1",
+        "harness_path": "release/validation/verify_database_phase_compatibility.sh",
+        "harness_sha256": hashlib.sha256(harness).hexdigest(),
+        "job_name": "Exact database phase compatibility",
+    }
+    if manifest != expected or verifier != expected:
+        raise AssertionError("database phase harness consumer differs from immutable bytes")
+    authority = step_block(
+        job_block(image_source, "authority"),
+        "Resolve the reviewed source and component matrix",
+    )
+    expected_lines = (
+        ".validation.database_phase_compatibility == {",
+        f'authority: "{expected["authority"]}",',
+        f'harness_path: "{expected["harness_path"]}",',
+        f'harness_sha256: "{expected["harness_sha256"]}",',
+        f'job_name: "{expected["job_name"]}"',
+        "} and",
+    )
+    lines = normalized_active_lines(authority)
+    matches = sum(
+        lines[index:index + len(expected_lines)] == expected_lines
+        for index in range(len(lines))
+    )
+    if matches != 1:
+        raise AssertionError("image authority must actively compare exact harness metadata")
+
+
 def artifact_upload_use_count(source: str) -> int:
     return len(
         re.findall(
@@ -1048,6 +1130,34 @@ def assert_exact_release_image_artifact_controls(source: str) -> None:
         "      matrix: ${{ steps.source.outputs.matrix }}",
     ):
         raise AssertionError("authority matrix output binding differs")
+    compatibility = step_block(
+        authority, "Bind the pinned database phase compatibility evidence"
+    )
+    for line in (
+        "bash control/release/validation/verify_database_phase_compatibility.sh \\",
+        '--phase "$PHASE" \\',
+        "--workflow-path .github/workflows/build-attest-exact-release-images.yml \\",
+        '--workflow-repository "$REPOSITORY" \\',
+        "evidence_sha256=\"$(sha256sum \"$evidence\" | awk '{print $1}')\"",
+    ):
+        require_active_source_line(compatibility, line)
+    validation = step_block(authority, "Require a successful exact-source validation run")
+    for job_name in (
+        "Exact source validation gate",
+        "Exact database phase compatibility",
+    ):
+        if validation.count(job_name) != 2:
+            raise AssertionError(f"image validation job binding differs: {job_name}")
+    for step_name in (
+        "Record the published digest",
+        "Record scan and SBOM evidence",
+        "Build the exact source-binding predicate",
+        "Build the digest-authoritative release set",
+    ):
+        if "database_phase_compatibility" not in step_block(source, step_name):
+            raise AssertionError(
+                f"database compatibility evidence is not bound by {step_name}"
+            )
 
     def artifact_upload_names(block: str) -> tuple[str, ...]:
         names: list[str] = []
@@ -2923,6 +3033,144 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
         self.assertIn("FROM scratch", source)
         self.assertNotIn("ignore-unfixed", source)
         self.assertNotIn(".trivyignore", source)
+
+    def test_ci_postgres_services_require_exact_pg17_image(self) -> None:
+        image = (
+            "image: postgres:17@sha256:"
+            "e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449"
+        )
+        for filename, job in (("test.yml", "go-race"), ("e2e-tests.yml", "e2e-shard")):
+            source = workflow(filename)
+            block = job_block(source, job)
+            assert_ci_postgres17_service(source, job)
+            replacements = (
+                "image: postgres:16",
+                "image: postgres:15",
+                "image: postgres:17",
+                "image: postgres:17@sha256:" + "0" * 64,
+                "# " + image,
+                "image: postgres:16\n        # " + image,
+                image + "\n        image: postgres:16",
+                image + '\n        "image": postgres:16',
+                image.replace("image:", '"image":'),
+                "env:\n          APPROVED_IMAGE: " + image.removeprefix("image: "),
+            )
+            for replacement in replacements:
+                mutant_block = block.replace(image, replacement, 1)
+                mutant = source.replace(block, mutant_block, 1)
+                with self.subTest(workflow=filename, mutation=replacements.index(replacement)):
+                    self.assertNotEqual(mutant, source)
+                    with self.assertRaises(AssertionError):
+                        assert_ci_postgres17_service(mutant, job)
+            moved = block.replace(image, "image: postgres:16", 1).replace(
+                "      redis:\n", "      redis:\n        " + image + "\n", 1
+            )
+            self.assertNotEqual(moved, block)
+            with self.assertRaises(AssertionError):
+                assert_ci_postgres17_service(source.replace(block, moved, 1), job)
+
+    def test_database_phase_harness_three_consumer_parity_rejects_drift(self) -> None:
+        manifest = json.loads(
+            (ROOT / "release" / "exact-sources.json").read_text(encoding="utf-8")
+        )["validation"]["database_phase_compatibility"]
+        verifier = verify_rollout_evidence.DATABASE_PHASE_COMPATIBILITY
+        image = workflow("build-attest-exact-release-images.yml")
+        harness = DATABASE_PHASE_HARNESS.read_bytes()
+        assert_database_phase_harness_parity(manifest, verifier, image, harness)
+        digest = hashlib.sha256(harness).hexdigest()
+        stale = "0" * 64
+        self.assertNotEqual(stale, digest)
+        hash_line = f'harness_sha256: "{digest}",'
+        comparison = ".validation.database_phase_compatibility == {"
+        mutants = (
+            ({**manifest, "harness_sha256": stale}, verifier, image),
+            ({key: value for key, value in manifest.items() if key != "harness_sha256"},
+             verifier, image),
+            ({**manifest, "extra": digest}, verifier, image),
+            (manifest, {**verifier, "harness_sha256": stale}, image),
+            (manifest, verifier, image.replace(hash_line, f'harness_sha256: "{stale}",', 1)),
+            (manifest, verifier, image.replace(hash_line, "# " + hash_line, 1)),
+            (manifest, verifier, image.replace(comparison, "# " + comparison, 1)),
+            (manifest, verifier, image.replace(comparison, "true or {", 1)),
+            ({**manifest, "harness_sha256": stale},
+             {**verifier, "harness_sha256": stale}, image.replace(digest, stale)),
+        )
+        for index, mutant in enumerate(mutants):
+            with self.subTest(mutation=index):
+                self.assertNotEqual(mutant, (manifest, verifier, image))
+                with self.assertRaises(AssertionError):
+                    assert_database_phase_harness_parity(*mutant, harness)
+
+    def test_database_phase_compatibility_is_pinned_per_source_and_workflow(self) -> None:
+        manifest = json.loads(
+            (ROOT / "release" / "exact-sources.json").read_text(encoding="utf-8")
+        )
+        compatibility = manifest["validation"]["database_phase_compatibility"]
+        self.assertEqual(
+            compatibility,
+            verify_rollout_evidence.DATABASE_PHASE_COMPATIBILITY,
+        )
+        self.assertEqual(
+            hashlib.sha256(DATABASE_PHASE_HARNESS.read_bytes()).hexdigest(),
+            compatibility["harness_sha256"],
+        )
+        phase_sources = manifest["phases"]
+        for key in ("source_sha", "root_tree", "internal_tree"):
+            self.assertEqual(len({value[key] for value in phase_sources.values()}), 4)
+
+        harness = DATABASE_PHASE_HARNESS.read_text(encoding="utf-8")
+        for token in (
+            "rlsMigrationPhaseBaseline",
+            "rlsMigrationPhaseBridge",
+            "rlsMigrationPhaseBackend",
+            "rlsMigrationPhaseUI",
+            "prepare-legacy-without-future-activation",
+            "activate-complete-future-profile",
+            "reject-before-mutation",
+            "verify-future-read-only",
+        ):
+            self.assertIn(token, harness)
+        self.assertIn("production coordinator is not bound to compile-time phase authority", harness)
+
+        validation_source = workflow("validate-exact-release-source.yml")
+        validation_job = job_block(validation_source, "database_phase_compatibility")
+        self.assertIn("name: Exact database phase compatibility", validation_job)
+        self.assertIn("postgres:17@sha256:", validation_job)
+        self.assertIn(
+            "bash control/release/validation/verify_database_phase_compatibility.sh",
+            validation_job,
+        )
+        self.assertIn("--workflow-path .github/workflows/validate-exact-release-source.yml", validation_job)
+        self.assertIn("Upload immutable database phase compatibility evidence", validation_job)
+        validation_gate = job_block(validation_source, "gate")
+        self.assertIn("- database_phase_compatibility", validation_gate)
+        self.assertIn(
+            'require_success "database phase compatibility" "$DATABASE_PHASE_COMPATIBILITY_RESULT"',
+            validation_gate,
+        )
+
+        test_source = workflow("test.yml")
+        self.assertIn(
+            "bash release/validation/verify_database_phase_compatibility.sh",
+            job_block(test_source, "go-race"),
+        )
+
+        image_source = workflow("build-attest-exact-release-images.yml")
+        image_authority = job_block(image_source, "authority")
+        self.assertIn(
+            "bash control/release/validation/verify_database_phase_compatibility.sh",
+            image_authority,
+        )
+        self.assertIn("Exact database phase compatibility", image_authority)
+        for job_name, step_name in (
+            ("build", "Record the published digest"),
+            ("scan", "Record scan and SBOM evidence"),
+            ("attest", "Build the exact source-binding predicate"),
+        ):
+            self.assertIn(
+                "database_phase_compatibility",
+                step_block(job_block(image_source, job_name), step_name),
+            )
 
     def test_release_web_snapshot_retry_is_bounded_restored_and_hash_bound(self) -> None:
         dockerfile_path = ROOT / "docker" / "release" / "web.Dockerfile"

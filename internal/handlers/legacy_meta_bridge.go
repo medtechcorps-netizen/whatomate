@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -11,9 +14,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// mirrorLegacyWhatsAppMessage is deliberately best-effort on live delivery
-// paths. The established WhatsApp send/webhook flow remains authoritative and
-// the idempotent migration backfill repairs a transient mirror failure.
+// mirrorLegacyWhatsAppMessage is deliberately best-effort for inbound and
+// repair paths. Outbound delivery uses requireLegacyWhatsAppMessageMirror so a
+// provider attempt can never outrun the durable account provenance required by
+// later receipts and reactions.
 func (a *App) mirrorLegacyWhatsAppMessage(
 	account *models.WhatsAppAccount,
 	messageID uuid.UUID,
@@ -23,6 +27,37 @@ func (a *App) mirrorLegacyWhatsAppMessage(
 	}
 	err := persistLegacyWhatsAppMessageMirror(a.DB, account, messageID)
 	a.logLegacyWhatsAppMessageMirrorError(err, account, messageID)
+}
+
+// requireLegacyWhatsAppMessageMirror establishes the normalized WhatsApp
+// account/contact/conversation proof in its own committed transaction before
+// any provider call. Starting from the root pool preserves the bridge's global
+// ChannelAccount -> ContactIdentity -> InboxConversation -> Contact -> Message
+// lock order and keeps a mirror failure on the known-no-provider boundary.
+func (a *App) requireLegacyWhatsAppMessageMirror(
+	ctx context.Context,
+	account *models.WhatsAppAccount,
+	messageID uuid.UUID,
+) error {
+	if a == nil || account == nil || account.ID == uuid.Nil ||
+		account.OrganizationID == uuid.Nil || messageID == uuid.Nil {
+		return errors.New("outgoing WhatsApp mirror identity is incomplete")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	accountCopy := *account
+	err := a.outgoingCanonicalTransaction(
+		ctx,
+		account.OrganizationID,
+		func(tx *gorm.DB) error {
+			return persistLegacyWhatsAppMessageMirror(tx, &accountCopy, messageID)
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("establish outgoing WhatsApp receipt authority: %w", err)
+	}
+	return nil
 }
 
 // mirrorLegacyWhatsAppMessageAfterCommit gives every live legacy bridge call
