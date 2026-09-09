@@ -305,10 +305,10 @@ func TestWhatsAppIdentityReviewOpenHoldsAreSupersededByLaterOnboardingCycle(t *t
 	require.NoError(t, db.Model(&models.WhatsAppCoexistenceState{}).
 		Where("organization_id = ? AND whats_app_account_id = ?", organization.ID, account.ID).
 		Update("onboarding_cycle", 2).Error, "an idempotent same-cycle write remains valid")
-	requireIdentityReviewSQLState(t, db.Model(&models.WhatsAppCoexistenceState{}).
+	_ = requireIdentityReviewSQLState(t, db.Model(&models.WhatsAppCoexistenceState{}).
 		Where("organization_id = ? AND whats_app_account_id = ?", organization.ID, account.ID).
 		Update("onboarding_cycle", 1).Error, "23514")
-	requireIdentityReviewSQLState(t, db.Model(&models.WhatsAppCoexistenceState{}).
+	_ = requireIdentityReviewSQLState(t, db.Model(&models.WhatsAppCoexistenceState{}).
 		Where("organization_id = ? AND whats_app_account_id = ?", organization.ID, account.ID).
 		Update("onboarding_cycle", 4).Error, "23514")
 	var durableState models.WhatsAppCoexistenceState
@@ -1243,7 +1243,7 @@ func TestBaselineRLSMigrationAcceptsExactPreAdditiveLegacyPredecessor(t *testing
 		if allowed {
 			require.NoError(t, err)
 		} else {
-			requireIdentityReviewSQLState(t, err, "42501")
+			_ = requireIdentityReviewSQLState(t, err, "42501")
 		}
 		require.NoError(t, tx.Rollback().Error)
 	}
@@ -2282,9 +2282,9 @@ func TestApplyTenantRLSRevokesPublicSchemaCreateFromPublic(t *testing.T) {
 		require.NoError(t, fixture.AdminDB.Exec("ALTER SCHEMA public OWNER TO CURRENT_USER").Error)
 		requireSchemaOwner(t, fixture.DB, fixture.AdminOID)
 		require.NoError(t, fixture.AdminDB.Exec("REVOKE CREATE ON SCHEMA public FROM PUBLIC").Error)
-		require.NoError(t, fixture.AdminDB.Exec("REVOKE CREATE ON SCHEMA public FROM " + fixture.OwnerRole).Error)
-		require.NoError(t, fixture.AdminDB.Exec("REVOKE CREATE ON SCHEMA public FROM " + fixture.RuntimeRole).Error)
-		require.NoError(t, fixture.AdminDB.Exec("GRANT USAGE ON SCHEMA public TO " + fixture.OwnerRole).Error)
+		require.NoError(t, fixture.AdminDB.Exec("REVOKE CREATE ON SCHEMA public FROM "+fixture.OwnerRole).Error)
+		require.NoError(t, fixture.AdminDB.Exec("REVOKE CREATE ON SCHEMA public FROM "+fixture.RuntimeRole).Error)
+		require.NoError(t, fixture.AdminDB.Exec("GRANT USAGE ON SCHEMA public TO "+fixture.OwnerRole).Error)
 		grant := "GRANT CREATE ON SCHEMA public TO " + fixture.OwnerRole
 		if grantOption {
 			grant += " WITH GRANT OPTION"
@@ -2299,9 +2299,9 @@ func TestApplyTenantRLSRevokesPublicSchemaCreateFromPublic(t *testing.T) {
 	t.Run("schema_owner_revokes_seeded_public_and_runtime_grants", func(t *testing.T) {
 		fixture := newFixture(t)
 		require.NoError(t, fixture.DB.Exec("REVOKE CREATE ON SCHEMA public FROM PUBLIC").Error)
-		require.NoError(t, fixture.DB.Exec("REVOKE CREATE ON SCHEMA public FROM " + fixture.RuntimeRole).Error)
+		require.NoError(t, fixture.DB.Exec("REVOKE CREATE ON SCHEMA public FROM "+fixture.RuntimeRole).Error)
 		require.NoError(t, fixture.DB.Exec("GRANT CREATE ON SCHEMA public TO PUBLIC").Error)
-		require.NoError(t, fixture.DB.Exec("GRANT CREATE ON SCHEMA public TO " + fixture.RuntimeRole).Error)
+		require.NoError(t, fixture.DB.Exec("GRANT CREATE ON SCHEMA public TO "+fixture.RuntimeRole).Error)
 		before := readACL(t, fixture.DB)
 		require.Equal(t, []schemaGrant{{fixture.OwnerOID, 0, "CREATE", false}}, createGrantsFor(before, 0))
 		require.Equal(t, []schemaGrant{{fixture.OwnerOID, fixture.RuntimeOID, "CREATE", false}}, createGrantsFor(before, fixture.RuntimeOID))
@@ -2319,7 +2319,7 @@ func TestApplyTenantRLSRevokesPublicSchemaCreateFromPublic(t *testing.T) {
 	t.Run("foreign_owner_without_grant_option_is_rejected_without_acl_change", func(t *testing.T) {
 		fixture := newFixture(t)
 		prepareForeignOwner(t, fixture, false)
-		require.NoError(t, fixture.AdminDB.Exec("GRANT CREATE ON SCHEMA public TO " + fixture.RuntimeRole).Error)
+		require.NoError(t, fixture.AdminDB.Exec("GRANT CREATE ON SCHEMA public TO "+fixture.RuntimeRole).Error)
 		before := readACL(t, fixture.DB)
 		require.Equal(t, []schemaGrant{{fixture.AdminOID, 0, "CREATE", false}}, createGrantsFor(before, 0))
 		require.Equal(t, []schemaGrant{{fixture.AdminOID, fixture.RuntimeOID, "CREATE", false}}, createGrantsFor(before, fixture.RuntimeOID))
@@ -2334,7 +2334,7 @@ func TestApplyTenantRLSRevokesPublicSchemaCreateFromPublic(t *testing.T) {
 	t.Run("foreign_public_grant_rejection_rolls_back_owner_issued_runtime_revoke", func(t *testing.T) {
 		fixture := newFixture(t)
 		prepareForeignOwner(t, fixture, true)
-		require.NoError(t, fixture.DB.Exec("GRANT CREATE ON SCHEMA public TO " + fixture.RuntimeRole).Error)
+		require.NoError(t, fixture.DB.Exec("GRANT CREATE ON SCHEMA public TO "+fixture.RuntimeRole).Error)
 		before := readACL(t, fixture.DB)
 		require.Equal(t, []schemaGrant{{fixture.AdminOID, 0, "CREATE", false}}, createGrantsFor(before, 0))
 		ownerIssuedRuntimeGrant := []schemaGrant{{fixture.OwnerOID, fixture.RuntimeOID, "CREATE", false}}
@@ -3131,12 +3131,12 @@ func TestWhatsAppIdentityReviewWAMIDFenceFailsFastAndSerializesOwners(t *testing
 		started := time.Now()
 		event := newEvent(wamid)
 		err := db.Create(&event).Error
-		requireIdentityReviewSQLState(t, err, "55P03")
+		_ = requireIdentityReviewSQLState(t, err, "55P03")
 		assert.Less(t, time.Since(started), 2*time.Second, "the losing writer must fail promptly")
 		require.NoError(t, winner.Commit().Error)
 
 		retry := newEvent(wamid)
-		requireIdentityReviewSQLState(t, db.Create(&retry).Error, "23505")
+		_ = requireIdentityReviewSQLState(t, db.Create(&retry).Error, "23505")
 		var messageCount, eventCount int64
 		require.NoError(t, db.Unscoped().Model(&models.Message{}).
 			Where("organization_id = ? AND BTRIM(whats_app_message_id) = ?", organization.ID, wamid).
@@ -3160,12 +3160,12 @@ func TestWhatsAppIdentityReviewWAMIDFenceFailsFastAndSerializesOwners(t *testing
 		started := time.Now()
 		message := newMessage(wamid)
 		err := db.Create(&message).Error
-		requireIdentityReviewSQLState(t, err, "55P03")
+		_ = requireIdentityReviewSQLState(t, err, "55P03")
 		assert.Less(t, time.Since(started), 2*time.Second, "the losing writer must fail promptly")
 		require.NoError(t, winner.Commit().Error)
 
 		retry := newMessage(wamid)
-		requireIdentityReviewSQLState(t, db.Create(&retry).Error, "23505")
+		_ = requireIdentityReviewSQLState(t, db.Create(&retry).Error, "23505")
 		var messageCount, eventCount int64
 		require.NoError(t, db.Unscoped().Model(&models.Message{}).
 			Where("organization_id = ? AND BTRIM(whats_app_message_id) = ?", organization.ID, wamid).
@@ -3191,7 +3191,7 @@ func TestWhatsAppIdentityReviewWAMIDFenceFailsFastAndSerializesOwners(t *testing
 		err := db.Model(&models.Message{}).
 			Where("organization_id = ? AND id = ?", organization.ID, message.ID).
 			Update("whats_app_message_id", wamid).Error
-		requireIdentityReviewSQLState(t, err, "55P03")
+		_ = requireIdentityReviewSQLState(t, err, "55P03")
 		assert.Less(t, time.Since(started), 2*time.Second, "the tuple-owning update must fail promptly")
 		var unchanged models.Message
 		require.NoError(t, db.Unscoped().Where("organization_id = ? AND id = ?", organization.ID, message.ID).
@@ -3289,7 +3289,7 @@ func TestWhatsAppIdentityReviewWAMIDFenceBreaksRollingWriterLockInversion(t *tes
 		Status: models.MessageStatusReceived, Metadata: models.JSONB{},
 	}
 	started := time.Now()
-	requireIdentityReviewSQLState(t, predecessor.Create(&message).Error, "55P03")
+	_ = requireIdentityReviewSQLState(t, predecessor.Create(&message).Error, "55P03")
 	assert.Less(t, time.Since(started), 2*time.Second,
 		"the trigger must fail the reverse-order predecessor promptly instead of forming a deadlock")
 	require.NoError(t, predecessor.Rollback().Error)
@@ -3459,7 +3459,7 @@ func TestWhatsAppIdentityReviewMigrationLocksFailFastAndRetryCleanly(t *testing.
 
 			started := time.Now()
 			err := databasepkg.CreateIndexes(db)
-			requireIdentityReviewSQLState(t, err, "55P03")
+			_ = requireIdentityReviewSQLState(t, err, "55P03")
 			assert.Less(t, time.Since(started), 2*time.Second,
 				"migration lock contention must fail promptly instead of deadlocking")
 			require.NoError(t, holder.Rollback().Error)
@@ -3485,7 +3485,7 @@ func TestWhatsAppIdentityReviewActivationDeadlineRollsBackTheWholeStatement(t *t
 
 	started := time.Now()
 	err := databasepkg.ExecuteCoexistenceActivationForTest(db, statement)
-	requireIdentityReviewSQLState(t, err, "57014")
+	_ = requireIdentityReviewSQLState(t, err, "57014")
 	elapsed := time.Since(started)
 	assert.GreaterOrEqual(t, elapsed, 750*time.Millisecond)
 	assert.Less(t, elapsed, 3*time.Second,
@@ -3542,7 +3542,7 @@ func TestWhatsAppIdentityReviewMigrationRejectsExistingRowLockWithoutRetainingPr
 
 	started := time.Now()
 	err := databasepkg.CreateIndexes(db)
-	requireIdentityReviewSQLState(t, err, "55P03")
+	_ = requireIdentityReviewSQLState(t, err, "55P03")
 	assert.Less(t, time.Since(started), 2*time.Second,
 		"migration must reject an existing row lock before performing its marker backfill")
 	require.NoError(t, liveWriter.Model(&models.Message{}).

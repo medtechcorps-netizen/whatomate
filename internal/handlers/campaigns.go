@@ -1332,7 +1332,7 @@ func (a *App) UploadCampaignMedia(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Unsupported file type: "+mimeType, nil, "")
 	}
 
-	ctx := r.RequestCtx
+	ctx := requestContext(r)
 	var mediaID string
 	var mediaPath string
 	var cleanupCreatedCandidate bool
@@ -1778,41 +1778,6 @@ func (a *App) incrementCampaignStat(campaignID, organizationID uuid.UUID, status
 		})
 	}
 	return nil
-}
-
-// recalculateCampaignStats recalculates tenant-bound campaign stats from the
-// historical message projection. Callers must provide the campaign owner;
-// campaign_id metadata is not globally unique or trusted as tenant authority.
-func (a *App) recalculateCampaignStats(campaignID, organizationID uuid.UUID) {
-	var stats struct {
-		Sent      int64
-		Delivered int64
-		Read      int64
-		Failed    int64
-	}
-
-	if err := a.DB.Model(&models.Message{}).
-		Where("organization_id = ? AND metadata->>'campaign_id' = ?", organizationID, campaignID.String()).
-		Select(`
-			COUNT(CASE WHEN status IN ('sent','delivered','read') THEN 1 END) as sent,
-			COUNT(CASE WHEN status IN ('delivered','read') THEN 1 END) as delivered,
-			COUNT(CASE WHEN status = 'read' THEN 1 END) as read,
-			COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
-		`).Scan(&stats).Error; err != nil {
-		a.Log.Error("Failed to scan campaign message stats", "error", err, "campaign_id", campaignID)
-		return
-	}
-
-	if err := a.DB.Model(&models.BulkMessageCampaign{}).
-		Where("id = ? AND organization_id = ?", campaignID, organizationID).
-		Updates(map[string]any{
-			"sent_count":      stats.Sent,
-			"delivered_count": stats.Delivered,
-			"read_count":      stats.Read,
-			"failed_count":    stats.Failed,
-		}).Error; err != nil {
-		a.Log.Error("Failed to recalculate campaign stats", "error", err, "campaign_id", campaignID)
-	}
 }
 
 // sanitizeFilename removes path separators, dangerous characters, and truncates length.

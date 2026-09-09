@@ -1326,30 +1326,6 @@ func installTenantPolicyFingerprint(
 	return nil
 }
 
-func tenantPolicyFingerprintOwner(db *gorm.DB) (databaseRoleReference, error) {
-	var owner databaseRoleReference
-	if err := db.Raw(`
-		SELECT
-			function_owner.oid::bigint AS role_oid,
-			function_owner.rolname AS role_name
-		FROM pg_catalog.pg_proc AS fingerprint_function
-		JOIN pg_catalog.pg_namespace AS function_schema
-		  ON function_schema.oid = fingerprint_function.pronamespace
-		JOIN pg_catalog.pg_roles AS function_owner
-		  ON function_owner.oid = fingerprint_function.proowner
-		WHERE function_schema.nspname = 'public'
-		  AND fingerprint_function.proname = 'rereply_tenant_policy_fingerprint'
-		  AND fingerprint_function.pronargs = 0
-		  AND fingerprint_function.prokind = 'f'
-	`).Scan(&owner).Error; err != nil {
-		return databaseRoleReference{}, err
-	}
-	if owner.OID == 0 || owner.Name == "" {
-		return databaseRoleReference{}, errors.New("tenant policy fingerprint owner is missing")
-	}
-	return owner, nil
-}
-
 func verifyTenantPolicyFingerprint(
 	db *gorm.DB,
 	tables []string,

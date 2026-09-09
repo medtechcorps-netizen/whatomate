@@ -397,8 +397,9 @@ func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup wha
 		}
 		proven, result.Continuation = true, &jobs[i]
 	}
-	historicalLinkedOwner, _ := message.Metadata[database.WhatsAppWAMIDOwnerMetadataKey].(bool)
-	if message.InboxConversationID != nil && !(historicalLinkedOwner && message.ID == deterministicID) {
+	// Historical ownership reserves the WAMID; it does not authorize mutation
+	// through a linked projection that now contradicts the established owner.
+	if message.InboxConversationID != nil {
 		var conversation models.InboxConversation
 		conversationQuery := a.DB.Where("id = ? AND organization_id = ?", *message.InboxConversationID, account.OrganizationID)
 		if err := conversationQuery.First(&conversation).Error; err != nil {
@@ -2209,15 +2210,15 @@ type Reaction struct {
 
 // handleIncomingReaction handles incoming reaction messages from WhatsApp
 func (a *App) handleIncomingReaction(account *models.WhatsAppAccount, fromPhone, messageWAMID, emoji, profileName string) {
+	if a == nil || account == nil || account.OrganizationID == uuid.Nil || account.ID == uuid.Nil {
+		return
+	}
 	a.Log.Info("Handling incoming reaction",
 		"from", fromPhone,
 		"message_wamid", messageWAMID,
 		"emoji", emoji,
 	)
 
-	if a == nil || account == nil || account.OrganizationID == uuid.Nil || account.ID == uuid.Nil {
-		return
-	}
 	_ = profileName // A reaction may corroborate an existing contact; it never creates one.
 	messageWAMID = strings.TrimSpace(messageWAMID)
 	fromPhone = normalizeCoexistencePhone(fromPhone)

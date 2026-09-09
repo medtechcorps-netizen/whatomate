@@ -1911,6 +1911,12 @@ func TestWorker_HandleRecipientJob_WhatsAppError(t *testing.T) {
 	assert.Equal(t, 1, updatedCampaign.FailedCount)
 }
 
+func TestCampaignAmbiguousDeliveryErrorPreservesDurableMessage(t *testing.T) {
+	const want = "Provider delivery outcome is unknown; message was not retried to prevent a duplicate"
+	assert.Equal(t, want, campaignAmbiguousDeliveryMessage)
+	assert.EqualError(t, campaignAmbiguousDeliveryError{}, want)
+}
+
 func TestWorker_HandleRecipientJob_AmbiguousProviderResultNeverCountsSent(t *testing.T) {
 	for _, tc := range []struct {
 		name             string

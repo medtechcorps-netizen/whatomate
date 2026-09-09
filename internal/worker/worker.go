@@ -31,6 +31,12 @@ const campaignMarketingOptOutMessage = "Contact opted out of marketing messages"
 const campaignAmbiguousDeliveryMessage = "Provider delivery outcome is unknown; message was not retried to prevent a duplicate"
 const campaignInactiveBeforeDeliveryMessage = "Campaign became inactive before provider delivery"
 
+type campaignAmbiguousDeliveryError struct{}
+
+func (campaignAmbiguousDeliveryError) Error() string {
+	return campaignAmbiguousDeliveryMessage
+}
+
 func campaignJobHasCurrentGeneration(campaign *models.BulkMessageCampaign, job *queue.RecipientJob) bool {
 	if campaign == nil || job == nil || campaign.Status != models.CampaignStatusProcessing ||
 		campaign.StartedAt == nil || campaign.StartedAt.IsZero() || job.EnqueuedAt.IsZero() {
@@ -702,7 +708,7 @@ func (w *Worker) attemptPreparedCampaignDelivery(
 			)
 			waMessageID = strings.TrimSpace(waMessageID)
 			if sendErr == nil && waMessageID == "" {
-				sendErr = errors.New(campaignAmbiguousDeliveryMessage)
+				sendErr = campaignAmbiguousDeliveryError{}
 			}
 
 			status := models.MessageStatusSent
@@ -1233,7 +1239,7 @@ func (w *Worker) sendCampaignTemplateMessage(
 	defer func() {
 		if recover() != nil {
 			messageID = ""
-			sendErr = errors.New(campaignAmbiguousDeliveryMessage)
+			sendErr = campaignAmbiguousDeliveryError{}
 		}
 	}()
 	return w.sendTemplateMessage(

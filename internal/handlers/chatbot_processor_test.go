@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -1076,6 +1077,103 @@ func TestMatchFlowTrigger_Match(t *testing.T) {
 	// No match
 	noMatch := app.matchFlowTrigger(org.ID, "hello there")
 	assert.Nil(t, noMatch)
+}
+
+func TestIncomingReactionRejectsInvalidScopeWithoutDependencies(t *testing.T) {
+	validAccount := &models.WhatsAppAccount{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: uuid.New(),
+	}
+	for _, tc := range []struct {
+		name    string
+		app     *App
+		account *models.WhatsAppAccount
+	}{
+		{name: "nil_receiver", account: validAccount},
+		{name: "nil_account", app: &App{}},
+		{name: "missing_organization", app: &App{}, account: &models.WhatsAppAccount{BaseModel: models.BaseModel{ID: uuid.New()}}},
+		{name: "missing_account", app: &App{}, account: &models.WhatsAppAccount{OrganizationID: uuid.New()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.NotPanics(t, func() {
+				tc.app.handleIncomingReaction(tc.account, "60123456789", "wamid.invalid-scope", "👍", "Patient")
+			}, "invalid scope must return before using a logger, database, or provider")
+		})
+	}
+}
+
+func TestIncomingReactionHistoricalReservationDoesNotAuthorizeChangedProjection(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		column string
+		value  any
+	}{
+		{name: "conversation_binding", column: "external_conversation_id", value: "unrelated-conversation"},
+		{name: "conversation_channel", column: "channel", value: models.ChannelInstagram},
+		{name: "missing_contact_identity", column: "contact_identity_id", value: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, account, contact := whatsappIdentityFixture(t)
+			wamid := "wamid.reaction-reserved-" + uuid.NewString()
+			message := models.Message{
+				BaseModel:      models.BaseModel{ID: uuid.NewSHA1(account.ID, []byte("coexistence-message:"+wamid))},
+				OrganizationID: account.OrganizationID, ContactID: contact.ID,
+				WhatsAppAccount: account.Name, WhatsAppMessageID: wamid,
+				Direction: models.DirectionOutgoing, MessageType: models.MessageTypeText,
+				Content: "reserved owner", Status: models.MessageStatusSent, Metadata: models.JSONB{},
+			}
+			require.NoError(t, app.DB.Create(&message).Error)
+			mirror, err := channelapi.MirrorLegacyWhatsAppMessage(app.DB, channelapi.LegacyMetaAccountRef{
+				ID: account.ID, OrganizationID: account.OrganizationID, Name: account.Name, Status: account.Status,
+			}, message.ID)
+			require.NoError(t, err)
+			require.True(t, mirror.Linked)
+
+			// First prove that the real mirror is usable and its trigger-owned
+			// reservation is present, rather than hand-authoring either proof.
+			app.handleIncomingReaction(account, contact.PhoneNumber, wamid, "👍", "Patient")
+			var before models.Message
+			require.NoError(t, app.DB.First(&before, "id = ?", message.ID).Error)
+			require.NotNil(t, before.InboxConversationID)
+			require.Equal(t, true, before.Metadata[database.WhatsAppWAMIDOwnerMetadataKey])
+			reactions, ok := before.Metadata["reactions"].([]any)
+			require.True(t, ok)
+			require.Len(t, reactions, 1)
+			reaction, ok := reactions[0].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, "👍", reaction["emoji"])
+			require.NoError(t, app.DB.Model(&models.InboxConversation{}).
+				Where("id = ? AND organization_id = ?", mirror.ConversationID, account.OrganizationID).
+				Update(tc.column, tc.value).Error)
+			var projectionBefore models.InboxConversation
+			require.NoError(t, app.DB.First(&projectionBefore, "id = ?", mirror.ConversationID).Error)
+
+			app.handleIncomingReaction(account, contact.PhoneNumber, wamid, "🔥", "Patient")
+
+			var after models.Message
+			require.NoError(t, app.DB.First(&after, "id = ?", message.ID).Error)
+			assert.Equal(t, before, after, "historical reservation must not authorize a live mutation through a changed projection")
+			var projectionAfter models.InboxConversation
+			require.NoError(t, app.DB.First(&projectionAfter, "id = ?", mirror.ConversationID).Error)
+			assert.Equal(t, projectionBefore, projectionAfter, "rejection must not silently repair or relink the projection")
+			var claimed bool
+			require.NoError(t, app.WithCommittedTenantApp(account.OrganizationID, func(scoped *App) error {
+				if err := database.LockWhatsAppWAMIDScopes(scoped.DB, account.OrganizationID, wamid); err != nil {
+					return err
+				}
+				if err := database.LockOrganizationPolicyScope(scoped.DB, account.OrganizationID); err != nil {
+					return err
+				}
+				claimed, err = database.WhatsAppIdentityReviewWAMIDClaimed(scoped.DB, account.OrganizationID, wamid)
+				return err
+			}))
+			assert.True(t, claimed, "rejecting mutation must not release the historical WAMID reservation")
+			var owners int64
+			require.NoError(t, app.DB.Unscoped().Model(&models.Message{}).
+				Where("organization_id = ? AND whats_app_message_id = ?", account.OrganizationID, wamid).
+				Count(&owners).Error)
+			assert.EqualValues(t, 1, owners)
+		})
+	}
 }
 
 func TestIncomingReactionUsesStableOwnerAcrossAccountRename(t *testing.T) {

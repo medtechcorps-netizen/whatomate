@@ -1698,7 +1698,7 @@ func TestApp_UploadCampaignMedia_FailuresRespectCleanupAuthority(t *testing.T) {
 				callbackName := "campaign_media_commit_failure_" + suffix
 				require.NoError(t, fixture.app.DB.Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
 					if isCampaignMediaProjectionUpdate(tx) && fail.CompareAndSwap(true, false) {
-						_ = tx.AddError(tx.Exec(fmt.Sprintf("INSERT INTO %s (id) VALUES (1)", childTable)).Error)
+						_ = tx.AddError(tx.Session(&gorm.Session{NewDB: true}).Exec(fmt.Sprintf("INSERT INTO %s (id) VALUES (1)", childTable)).Error)
 					}
 				}))
 				t.Cleanup(func() { _ = fixture.app.DB.Callback().Update().Remove(callbackName) })

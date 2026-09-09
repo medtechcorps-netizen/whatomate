@@ -598,7 +598,7 @@ func verifyRLSMigrationRuntime(cfg *config.DatabaseConfig) error {
 	if err != nil {
 		return fmt.Errorf("open runtime database verifier pool: %w", err)
 	}
-	defer sqlDB.Close()
+	defer func() { _ = sqlDB.Close() }()
 	return database.VerifyTenantRLS(runtimeDB, cfg.RuntimeRole)
 }
 

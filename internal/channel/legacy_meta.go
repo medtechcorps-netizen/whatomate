@@ -647,6 +647,15 @@ func ensureLegacyMetaAccount(
 		return nil, err
 	}
 	ref = verifiedRef
+	// Refresh mutable shadow details only after its immutable binding agrees
+	// with the established account. A refresh must not bless a corrupt bridge.
+	boundAccountID, bindingErr := LegacyMetaWhatsAppAccountID(&persisted)
+	if bindingErr != nil || boundAccountID != ref.ID {
+		return nil, fmt.Errorf(
+			"%w: shadow account binding changed before refresh",
+			ErrLegacyMetaBridgeConflict,
+		)
+	}
 	status = models.ChannelAccountStatusSuspended
 	if strings.EqualFold(strings.TrimSpace(ref.Status), "active") {
 		status = models.ChannelAccountStatusActive
