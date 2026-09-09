@@ -1411,15 +1411,28 @@ func (a *App) getOrCreateSession(
 	if timeoutMins <= 0 {
 		timeoutMins = 30
 	}
-	now := time.Now()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	timeout := now.Add(-time.Duration(timeoutMins) * time.Minute)
 	var result models.ChatbotSession
 	isNew := false
 
 	write := func(tx *gorm.DB) error {
+		// Admission and every policy writer take the organization fence before
+		// contact/session locks. Recheck after that fence: the earlier transfer
+		// lookup is only an optimization, not permission to start another session.
+		if err := database.LockOrganizationPolicyScope(tx, orgID); err != nil {
+			return err
+		}
 		canonical, err := contactutil.ResolveCanonicalContactForUpdate(tx, orgID, contactID)
 		if err != nil {
 			return err
+		}
+		policy, err := database.EvaluateContactAutomaticReplyPolicy(tx, orgID, canonical.ID)
+		if err != nil {
+			return err
+		}
+		if !policy.Allowed {
+			return &inboundContinuationPolicyStop{Reason: policy.Reason}
 		}
 
 		var activeSessions []models.ChatbotSession
@@ -1474,6 +1487,12 @@ func (a *App) getOrCreateSession(
 
 		if chosen >= 0 {
 			result = activeSessions[chosen]
+			// PostgreSQL stores microsecond precision. Make each acquisition a
+			// distinct generation even when two messages arrive in one clock tick.
+			now = now.UTC().Truncate(time.Microsecond)
+			if !now.After(result.LastActivityAt) {
+				now = result.LastActivityAt.Add(time.Microsecond)
+			}
 			if err := tx.Model(&models.ChatbotSession{}).
 				Where("id = ? AND status = ?", result.ID, models.SessionStatusActive).
 				Update("last_activity_at", now).Error; err != nil {
@@ -1505,19 +1524,26 @@ func (a *App) getOrCreateSession(
 		isNew = true
 		return nil
 	}
-	var err error
+	db := a.DB
 	if a.inboundContinuation != nil {
 		// Release the canonical Contact/session locks before any subsequent
 		// physical AI provider attempt. The provider fence may open its own
 		// independently committed dispatch transaction through the root pool.
-		err = a.rootApp().WithCommittedTenantApp(
-			orgID,
-			func(scoped *App) error {
-				return canonicalContactWriteTransaction(scoped.DB, write)
-			},
-		)
-	} else {
-		err = canonicalContactWriteTransaction(a.DB, write)
+		db = a.rootApp().DB
+	}
+	var err error
+	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
+		// The policy query after a contended organization lock must see the
+		// writer's commit even if the pool defaults to REPEATABLE READ.
+		err = database.WithTenantReadCommitted(db, orgID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+				return err
+			}
+			return write(tx)
+		})
+		if !isRetryableCanonicalContactWrite(err) {
+			break
+		}
 	}
 	if err != nil {
 		return nil, false, err
@@ -1562,13 +1588,22 @@ func (a *App) matchFlowTrigger(orgID uuid.UUID, messageText string) *models.Chat
 
 // startFlow initiates a chatbot flow for a user
 func (a *App) exitFlow(session *models.ChatbotSession) {
+	query, err := a.activeChatSessionScope(session)
+	if err != nil {
+		return
+	}
 	now := time.Now()
-	a.DB.Model(session).Updates(map[string]any{
+	result := query.Updates(map[string]any{
 		"current_step": "",
 		"step_retries": 0,
 		"status":       models.SessionStatusCompleted,
 		"completed_at": now,
 	})
+	if result.Error != nil || result.RowsAffected != 1 {
+		// A stale missing-flow fallback has no authority to overwrite a Pause
+		// cancellation or clear tracking belonging to a newer session owner.
+		return
+	}
 
 	// Clear chatbot tracking so SLA doesn't fire after flow exit
 	a.ClearContactChatbotTracking(session.ContactID)

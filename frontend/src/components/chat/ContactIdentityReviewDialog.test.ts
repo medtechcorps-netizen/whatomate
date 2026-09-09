@@ -107,7 +107,7 @@ describe('ContactIdentityReviewDialog', () => {
   let wrapper: VueWrapper | null = null
 
   beforeEach(() => {
-    vi.clearAllMocks()
+    for (const mock of Object.values(mocks)) mock.mockReset()
     vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000123')
     mocks.getState.mockResolvedValue({ data: { data: blocked } })
     mocks.preview.mockResolvedValue({ data: { data: preview } })
@@ -185,9 +185,16 @@ describe('ContactIdentityReviewDialog', () => {
     const candidates = wrapper.findAll('input[name="identity-review-target"]')
     await candidates[1].setValue()
     await wrapper.get('[data-testid="identity-review-decision"]').trigger('click')
-    await flushPromises()
+    await vi.waitFor(() => {
+      expect(mocks.decide).toHaveBeenCalledTimes(1)
+      expect(wrapper!.get('[role="alert"]').text()).toContain('connection closed before confirmation')
+      expect(wrapper!.get('[data-testid="identity-review-decision"]').attributes('disabled')).toBeUndefined()
+    })
     await wrapper.get('[data-testid="identity-review-decision"]').trigger('click')
-    await flushPromises()
+    await vi.waitFor(() => {
+      expect(mocks.decide).toHaveBeenCalledTimes(2)
+      expect(wrapper!.get('[data-testid="identity-review-effective-state"]').text()).toBe('AI allowed')
+    })
 
     expect(mocks.decide).toHaveBeenCalledTimes(2)
     const first = mocks.decide.mock.calls[0][1]

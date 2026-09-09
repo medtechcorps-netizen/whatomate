@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
@@ -63,9 +64,8 @@ func (p *SLAProcessor) Stop() {
 func (p *SLAProcessor) processStaleTransfers() {
 	now := time.Now()
 
-	// Resolve organizations from the control plane, then enter one RLS
-	// transaction per organization. Background processors must never query
-	// tenant tables without an explicit tenant context.
+	// Resolve organizations from the control plane, then enter explicit tenant
+	// scopes for human SLA work and chatbot timer selection/attempts.
 	var organizationIDs []uuid.UUID
 	if err := p.app.rootApp().DB.Scopes(database.ExcludePlatformComplianceOrganizations).
 		Model(&models.Organization{}).
@@ -75,6 +75,7 @@ func (p *SLAProcessor) processStaleTransfers() {
 	}
 
 	for _, organizationID := range organizationIDs {
+		var inactivitySettings *models.ChatbotSettings
 		if err := p.app.WithTenantApp(organizationID, func(scoped *App) error {
 			settings, err := scoped.getChatbotSettingsCached(organizationID, "")
 			if err != nil {
@@ -86,12 +87,23 @@ func (p *SLAProcessor) processStaleTransfers() {
 			tenantProcessor := *p
 			tenantProcessor.app = scoped
 			tenantProcessor.processOrganizationSLA(*settings, now)
+			if settings.ClientInactivity.ReminderEnabled {
+				copiedSettings := *settings
+				inactivitySettings = &copiedSettings
+			}
 			return nil
 		}); err != nil {
 			p.app.Log.Error("Failed to process organization SLA",
 				"error", err,
 				"organization_id", organizationID,
 			)
+			continue
+		}
+		// Human SLA mutations may retain organization/contact locks until the
+		// tenant transaction commits. Never nest an independent timer attempt
+		// inside it, or pin a third connection while its sender needs the pool.
+		if inactivitySettings != nil {
+			p.processClientInactivity(organizationID, *inactivitySettings, now)
 		}
 	}
 }
@@ -113,11 +125,6 @@ func (p *SLAProcessor) processOrganizationSLA(settings models.ChatbotSettings, n
 	// 3. Mark SLA breached for transfers past response deadline
 	if settings.SLA.ResponseMinutes > 0 {
 		p.markSLABreached(orgID, now)
-	}
-
-	// 4. Handle client inactivity (reminders and auto-close)
-	if settings.ClientInactivity.ReminderEnabled {
-		p.processClientInactivity(orgID, settings, now)
 	}
 }
 
@@ -522,20 +529,17 @@ func (a *App) UpdateSLAOnFirstResponse(transfer *models.AgentTransfer) {
 func (p *SLAProcessor) processClientInactivity(orgID uuid.UUID, settings models.ChatbotSettings, now time.Time) {
 	// Find contacts where chatbot has sent a message and is waiting for client response
 	var contacts []models.Contact
-	if err := p.app.DB.Where(
-		"organization_id = ? AND chatbot_last_message_at IS NOT NULL",
-		orgID,
-	).Find(&contacts).Error; err != nil {
+	if err := p.app.rootApp().WithTenantApp(orgID, func(scoped *App) error {
+		return scoped.DB.Where(
+			"organization_id = ? AND chatbot_last_message_at IS NOT NULL AND merged_into_id IS NULL",
+			orgID,
+		).Find(&contacts).Error
+	}); err != nil {
 		p.app.Log.Error("Failed to find contacts for client inactivity check", "error", err, "org_id", orgID)
 		return
 	}
 
 	for _, contact := range contacts {
-		// Skip if contact has an active agent transfer
-		if p.app.hasActiveAgentTransfer(orgID, contact.ID) {
-			continue
-		}
-
 		// Calculate time since chatbot's last message
 		timeSinceChatbotMsg := now.Sub(*contact.ChatbotLastMessageAt)
 
@@ -558,38 +562,123 @@ func (p *SLAProcessor) processClientInactivity(orgID uuid.UUID, settings models.
 	}
 }
 
-// sendChatbotReminder sends a reminder message to an inactive client during chatbot conversation
-func (p *SLAProcessor) sendChatbotReminder(contact models.Contact, settings models.ChatbotSettings) {
-	if settings.ClientInactivity.ReminderMessage == "" {
-		return
-	}
+var errChatbotInactivityGenerationChanged = errors.New("chatbot inactivity generation changed")
 
-	// Get WhatsApp account
-	account, err := p.app.resolveWhatsAppAccount(contact.OrganizationID, contact.WhatsAppAccount)
-	if err != nil {
-		p.app.Log.Error("Failed to load WhatsApp account for chatbot reminder", "error", err)
-		return
+// withChatbotInactivityAttempt adds only an organization KEY SHARE lock across
+// the callback. The unchanged synchronous SLA sender independently owns its
+// existing account/contact/message locks; none are inherited from this guard.
+// Policy writers acquire organization UPDATE before those locks, so a committed
+// Pause/hold wins before admission and an admitted attempt makes the writer wait.
+// This is a policy/generation fence, not an exactly-once timer claim.
+func (p *SLAProcessor) withChatbotInactivityAttempt(
+	contact models.Contact,
+	attempt func(context.Context, *App, *models.Contact) error,
+) (bool, error) {
+	if p == nil || p.app == nil || p.app.DB == nil || p.app.rootApp().DB == nil || attempt == nil {
+		return false, errors.New("chatbot inactivity attempt requires an app database and callback")
 	}
-
-	// Send using unified message sender
+	if contact.ID == uuid.Nil || contact.OrganizationID == uuid.Nil ||
+		contact.ChatbotLastMessageAt == nil || contact.ChatbotLastMessageAt.IsZero() {
+		return false, nil
+	}
+	// An arbitrary caller transaction can already own a conflicting policy
+	// lock or the pool's other connection. Production timers run after their
+	// selection transaction commits; reject accidental nested use as well.
+	if _, transactional := p.app.DB.Statement.ConnPool.(gorm.TxCommitter); transactional {
+		return false, errors.New("chatbot inactivity attempt cannot inherit a caller transaction")
+	}
+	root := p.app.rootApp()
+	if err := database.RequireIndependentAIAttemptConnections(root.DB); err != nil {
+		return false, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	completed := false
+	err := database.WithTenantReadCommitted(root.DB.WithContext(ctx), contact.OrganizationID, func(guardTx *gorm.DB) error {
+		if err := database.LockOrganizationAIAttemptScope(guardTx, contact.OrganizationID); err != nil {
+			return err
+		}
+		if err := requireOrdinaryTenantOrganization(guardTx, contact.OrganizationID); err != nil {
+			return err
+		}
+		current, err := contactutil.ResolveCanonicalContact(guardTx, contact.OrganizationID, contact.ID)
+		if err != nil {
+			return err
+		}
+		// Never redirect an old timer onto a merged survivor or a new waiting
+		// period. Pause/Resume clears the timestamp; a later bot reply replaces it.
+		if current.ID != contact.ID || current.WhatsAppAccount != contact.WhatsAppAccount ||
+			current.ChatbotLastMessageAt == nil ||
+			!current.ChatbotLastMessageAt.Equal(*contact.ChatbotLastMessageAt) ||
+			current.ChatbotReminderSent != contact.ChatbotReminderSent {
+			return nil
+		}
+		policy, err := database.EvaluateContactAutomaticReplyPolicy(guardTx, contact.OrganizationID, current.ID)
+		if err != nil {
+			return err
+		}
+		if !policy.Allowed {
+			return nil
+		}
+		if err := attempt(ctx, root.scopedApp(guardTx, contact.OrganizationID), current); err != nil {
+			return err
+		}
+		completed = true
+		return nil
+	})
+	if errors.Is(err, errChatbotInactivityGenerationChanged) {
+		return false, nil
+	}
+	return completed && err == nil, err
+}
 
-	_, err = p.app.SendOutgoingMessage(ctx, OutgoingMessageRequest{
-		Account: account,
-		Contact: &contact,
-		Type:    models.MessageTypeText,
-		Content: settings.ClientInactivity.ReminderMessage,
-	}, SLASendOptions())
+// updateChatbotInactivityGeneration never retires a later bot reply or a
+// generation cleared/replaced while the independently committed sender ran.
+// Contact locks are acquired here only after provider I/O has finished.
+func updateChatbotInactivityGeneration(tx *gorm.DB, contact *models.Contact, updates map[string]any) error {
+	if tx == nil || contact == nil || contact.ChatbotLastMessageAt == nil {
+		return errChatbotInactivityGenerationChanged
+	}
+	result := tx.Model(&models.Contact{}).Where(
+		"id = ? AND organization_id = ? AND merged_into_id IS NULL AND whats_app_account = ? AND chatbot_last_message_at = ? AND chatbot_reminder_sent = ?",
+		contact.ID, contact.OrganizationID, contact.WhatsAppAccount,
+		*contact.ChatbotLastMessageAt, contact.ChatbotReminderSent,
+	).Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errChatbotInactivityGenerationChanged
+	}
+	return nil
+}
 
+// sendChatbotReminder sends a reminder message to an inactive client during chatbot conversation
+func (p *SLAProcessor) sendChatbotReminder(contact models.Contact, settings models.ChatbotSettings) {
+	if settings.ClientInactivity.ReminderMessage == "" || contact.ChatbotReminderSent {
+		return
+	}
+	completed, err := p.withChatbotInactivityAttempt(contact, func(ctx context.Context, scoped *App, current *models.Contact) error {
+		account, err := scoped.resolveWhatsAppAccount(current.OrganizationID, current.WhatsAppAccount)
+		if err != nil {
+			return err
+		}
+		if _, err := scoped.rootApp().SendOutgoingMessage(ctx, OutgoingMessageRequest{
+			Account: account,
+			Contact: current,
+			Type:    models.MessageTypeText,
+			Content: settings.ClientInactivity.ReminderMessage,
+		}, SLASendOptions()); err != nil {
+			return err
+		}
+		return updateChatbotInactivityGeneration(scoped.DB, current, map[string]any{"chatbot_reminder_sent": true})
+	})
 	if err != nil {
 		p.app.Log.Error("Failed to send chatbot reminder message", "error", err, "phone", contact.PhoneNumber)
 		return
 	}
-
-	// Mark reminder as sent
-	if err := p.app.DB.Model(&contact).Update("chatbot_reminder_sent", true).Error; err != nil {
-		p.app.Log.Error("Failed to update chatbot_reminder_sent", "error", err, "contact_id", contact.ID)
+	if !completed {
+		return
 	}
 
 	p.app.Log.Info("Chatbot reminder sent",
@@ -607,31 +696,33 @@ func (p *SLAProcessor) autoCloseChatbotSession(contact models.Contact, settings 
 		inactiveSince = *contact.ChatbotLastMessageAt
 	}
 
-	// Send auto-close message if configured
-	if settings.ClientInactivity.AutoCloseMessage != "" {
-		if account, err := p.app.resolveWhatsAppAccount(contact.OrganizationID, contact.WhatsAppAccount); err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-
-			_, err := p.app.SendOutgoingMessage(ctx, OutgoingMessageRequest{
+	completed, err := p.withChatbotInactivityAttempt(contact, func(ctx context.Context, scoped *App, current *models.Contact) error {
+		// A configured notice must reach the existing sender before this exact
+		// generation can close. Policy or pre-provider errors remain fail-closed.
+		if settings.ClientInactivity.AutoCloseMessage != "" {
+			account, err := scoped.resolveWhatsAppAccount(current.OrganizationID, current.WhatsAppAccount)
+			if err != nil {
+				return err
+			}
+			if _, err := scoped.rootApp().SendOutgoingMessage(ctx, OutgoingMessageRequest{
 				Account: account,
-				Contact: &contact,
+				Contact: current,
 				Type:    models.MessageTypeText,
 				Content: settings.ClientInactivity.AutoCloseMessage,
-			}, SLASendOptions())
-
-			if err != nil {
-				p.app.Log.Error("Failed to send chatbot auto-close message", "error", err, "phone", contact.PhoneNumber)
+			}, SLASendOptions()); err != nil {
+				return err
 			}
 		}
-	}
-
-	// Clear chatbot tracking fields to close the session
-	if err := p.app.DB.Model(&contact).Updates(map[string]any{
-		"chatbot_last_message_at": nil,
-		"chatbot_reminder_sent":   false,
-	}).Error; err != nil {
+		return updateChatbotInactivityGeneration(scoped.DB, current, map[string]any{
+			"chatbot_last_message_at": nil,
+			"chatbot_reminder_sent":   false,
+		})
+	})
+	if err != nil {
 		p.app.Log.Error("Failed to close chatbot session for client inactivity", "error", err, "contact_id", contact.ID)
+		return
+	}
+	if !completed {
 		return
 	}
 

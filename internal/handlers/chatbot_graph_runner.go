@@ -12,7 +12,9 @@ import (
 
 	"github.com/expr-lang/expr"
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"gorm.io/gorm"
 )
 
 // maxChatGraphIterations bounds non-blocking node chains within a single
@@ -51,6 +53,9 @@ type chatNodeCtx struct {
 type nodeOutcome struct {
 	outcome string
 	yield   bool
+	// finalized means this terminal node committed its exact session before
+	// a handover; the runner must not write that terminal session a second time.
+	finalized bool
 }
 
 // runChatGraph executes the v2 graph for a session against a single inbound
@@ -108,6 +113,9 @@ func (a *App) runChatGraph(
 	}
 
 	for range maxChatGraphIterations {
+		if err := a.requireActiveChatSession(session); err != nil {
+			return err
+		}
 		node := graph.Node(session.CurrentStep)
 		if node == nil {
 			a.Log.Error("chat graph node not found",
@@ -154,8 +162,14 @@ func (a *App) runChatGraph(
 		res, err := a.executeChatNode(node, ctx)
 		restoreActionScope()
 		if err != nil {
+			// Preserve the original action error, especially an uncertain remote
+			// result. A lost-session policy stop must not hide manual-review evidence.
 			_ = a.persistChatSession(session)
 			return err
+		}
+		if res.finalized {
+			a.notifyChatbotFlowCompletion(flow, session)
+			return nil
 		}
 
 		appendChatPath(session, node, res.outcome)
@@ -218,7 +232,15 @@ func (a *App) completeChatbotFlow(
 	if session == nil {
 		return errors.New("chatbot completion session is unavailable")
 	}
+	if err := a.requireActiveChatSession(session); err != nil {
+		return err
+	}
 	session.Status = models.SessionStatusCompleted
+	a.notifyChatbotFlowCompletion(flow, session)
+	return a.persistChatSession(session)
+}
+
+func (a *App) notifyChatbotFlowCompletion(flow *models.ChatbotFlow, session *models.ChatbotSession) {
 	if err := a.executeChatbotCompletionWebhook(flow, session); err != nil {
 		// Do not include the error: HTTP-library errors and tenant-authored
 		// configuration can contain credential material. Flow/session IDs are
@@ -233,7 +255,6 @@ func (a *App) completeChatbotFlow(
 			"session", session.ID,
 		)
 	}
-	return a.persistChatSession(session)
 }
 
 // executeChatbotCompletionWebhook executes a flow-level completion callback
@@ -1029,6 +1050,9 @@ func (a *App) execChatTransfer(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, e
 	if body := stringFromConfig(node.Config, "body", "message", "text"); body != "" {
 		message := processTemplate(body, ctx.session.SessionData)
 		if err := a.sendAndSaveTextMessage(ctx.account, ctx.contact, message); err != nil {
+			if inboundContinuationStoppedByPolicy(err) || inboundContinuationRequiresManualReview(err) {
+				return nodeOutcome{}, err
+			}
 			a.Log.Error("transfer node failed to send body",
 				"node", node.ID, "session", ctx.session.ID, "error", err)
 		} else {
@@ -1039,6 +1063,25 @@ func (a *App) execChatTransfer(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, e
 	notes := ""
 	if rawNotes := stringFromConfig(node.Config, "notes"); rawNotes != "" {
 		notes = processTemplate(rawNotes, ctx.session.SessionData)
+	}
+
+	// Complete only the session this runner still owns, before the handover
+	// cancels other active sessions. This is a short committed phase: keeping
+	// its row lock in the outer continuation transaction would deadlock the
+	// handover's independent organization/contact/session transaction.
+	appendChatPath(ctx.session, node, "")
+	ctx.session.Status = models.SessionStatusCompleted
+	if err := database.WithTenantReadCommitted(
+		a.rootApp().DB,
+		ctx.session.OrganizationID,
+		func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, ctx.session.OrganizationID); err != nil {
+				return err
+			}
+			return a.scopedApp(tx, ctx.session.OrganizationID).persistChatSession(ctx.session)
+		},
+	); err != nil {
+		return nodeOutcome{}, err
 	}
 
 	teamIDStr := stringFromConfig(node.Config, "team_id")
@@ -1054,8 +1097,7 @@ func (a *App) execChatTransfer(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, e
 		a.createTransferToQueue(ctx.account, ctx.contact, models.TransferSourceFlow)
 	}
 
-	ctx.session.Status = models.SessionStatusCompleted
-	return nodeOutcome{yield: true}, nil
+	return nodeOutcome{yield: true, finalized: true}, nil
 }
 
 // execChatWebhookDurable makes a webhook node at-most-once for one inbound
@@ -1297,19 +1339,92 @@ func (a *App) execChatEnd(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, error)
 	return nodeOutcome{}, nil
 }
 
+// activeChatSessionScope identifies the exact active session acquisition.
+// LastActivityAt is advanced by acquisition and persistence, so an older
+// runner cannot overwrite either a terminal state or a newer session owner.
+func (a *App) activeChatSessionScope(s *models.ChatbotSession) (*gorm.DB, error) {
+	if a == nil || a.DB == nil || s == nil || s.ID == uuid.Nil ||
+		s.OrganizationID == uuid.Nil || s.ContactID == uuid.Nil ||
+		s.WhatsAppAccount == "" || s.LastActivityAt.IsZero() {
+		return nil, &inboundContinuationPolicyStop{Reason: "chatbot session identity is unavailable"}
+	}
+	if execution := a.inboundContinuation; execution != nil &&
+		(execution.OrganizationID != s.OrganizationID || execution.ContactID != s.ContactID) {
+		return nil, &inboundContinuationPolicyStop{Reason: "chatbot session ownership changed"}
+	}
+	return a.DB.Model(&models.ChatbotSession{}).Where(
+		"id = ? AND organization_id = ? AND contact_id = ? AND whats_app_account = ? AND status = ? AND last_activity_at = ?",
+		s.ID, s.OrganizationID, s.ContactID, s.WhatsAppAccount, models.SessionStatusActive, s.LastActivityAt,
+	), nil
+}
+
+// requireActiveChatSession is a fresh, non-locking progression check. Provider
+// effects retain their independent organization attempt fence; no session or
+// organization lock is held across that separate provider connection here.
+func (a *App) requireActiveChatSession(s *models.ChatbotSession) error {
+	check := func(scoped *App) error {
+		query, err := scoped.activeChatSessionScope(s)
+		if err != nil {
+			return err
+		}
+		var count int64
+		if err := query.Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 1 {
+			return &inboundContinuationPolicyStop{Reason: "chatbot session is no longer active or owned by this runner"}
+		}
+		return nil
+	}
+	if a == nil || s == nil || a.inboundContinuation == nil {
+		return check(a)
+	}
+	// Do not reuse the continuation's possibly older transaction snapshot.
+	// This short read releases its connection before the provider/action fence.
+	return database.WithTenantReadCommitted(a.rootApp().DB, s.OrganizationID, func(tx *gorm.DB) error {
+		return check(a.scopedApp(tx, s.OrganizationID))
+	})
+}
+
 // persistChatSession writes the running session state back to the DB.
 // Variables, current node, and the __path__ trail all live in SessionData
 // + dedicated columns. Called after every yield and on the completion path.
 func (a *App) persistChatSession(s *models.ChatbotSession) error {
-	s.LastActivityAt = time.Now()
-	if s.Status == models.SessionStatusCompleted && s.CompletedAt == nil {
-		now := time.Now()
-		s.CompletedAt = &now
-	}
-	if err := a.DB.Save(s).Error; err != nil {
-		a.Log.Error("persist chat session", "session", s.ID, "error", err)
+	query, err := a.activeChatSessionScope(s)
+	if err != nil {
 		return err
 	}
+	if s.Status != models.SessionStatusActive && s.Status != models.SessionStatusCompleted {
+		return &inboundContinuationPolicyStop{Reason: "chatbot runner cannot persist a revoked session"}
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if !now.After(s.LastActivityAt) {
+		now = s.LastActivityAt.Add(time.Microsecond)
+	}
+	completedAt := s.CompletedAt
+	if s.Status == models.SessionStatusCompleted && completedAt == nil {
+		completedAt = &now
+	}
+	// Never use Save: its full-row update (and insert fallback) can resurrect
+	// a cancelled session or restore stale canonical contact ownership.
+	result := query.Updates(map[string]any{
+		"status":           s.Status,
+		"current_flow_id":  s.CurrentFlowID,
+		"current_step":     s.CurrentStep,
+		"step_retries":     s.StepRetries,
+		"session_data":     s.SessionData,
+		"last_activity_at": now,
+		"completed_at":     completedAt,
+	})
+	if result.Error != nil {
+		a.Log.Error("persist chat session", "session", s.ID, "error", result.Error)
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return &inboundContinuationPolicyStop{Reason: "chatbot session is no longer active or owned by this runner"}
+	}
+	s.LastActivityAt = now
+	s.CompletedAt = completedAt
 	return nil
 }
 

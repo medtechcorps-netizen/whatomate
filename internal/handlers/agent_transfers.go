@@ -790,7 +790,14 @@ func (a *App) ResumeFromTransfer(r *fastglue.Request) error {
 		transfer.Status = models.TransferStatusResumed
 		transfer.ResumedAt = &now
 		transfer.ResumedBy = &userID
-		return nil
+		// Clear only while Resume still owns the policy fence. A later inbound
+		// message may create a new inactivity generation as soon as it releases.
+		return tx.Model(&models.Contact{}).
+			Where("id = ? AND organization_id = ?", transfer.ContactID, orgID).
+			Updates(map[string]any{
+				"chatbot_last_message_at": nil,
+				"chatbot_reminder_sent":   false,
+			}).Error
 	})
 	switch {
 	case errors.Is(txErr, gorm.ErrRecordNotFound):
@@ -803,9 +810,6 @@ func (a *App) ResumeFromTransfer(r *fastglue.Request) error {
 		a.Log.Error("Failed to resume transfer", "error", txErr, "transfer_id", transferID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resume transfer", nil, "")
 	}
-
-	// Clear chatbot tracking so client inactivity SLA doesn't trigger after transfer is closed
-	a.ClearContactChatbotTracking(transfer.ContactID)
 
 	// Broadcast WebSocket notification
 	a.broadcastTransferResumed(&transfer)
@@ -900,6 +904,12 @@ func (a *App) AssignAgentTransfer(r *fastglue.Request) error {
 	errTransferNotActive := errors.New("transfer is not active")
 	var transfer models.AgentTransfer
 	txErr := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		// Assignment preserves active policy. Take its shared row fence before
+		// Contact/Transfer: block Resume's UPDATE without conflicting with the
+		// tenant write guard's SHARE lock in ordinary queue/availability writes.
+		if lockErr := database.LockOrganizationAIAttemptScope(tx, orgID); lockErr != nil {
+			return lockErr
+		}
 		canonicalContact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
 			tx,
 			orgID,
@@ -1384,6 +1394,21 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		if err := createActiveAgentTransferTx(tx, &candidate); err != nil {
 			return err
 		}
+		if err := suppressUnfinishedInboundForTransfer(tx, baseTransfer.OrganizationID, canonical.ID); err != nil {
+			return err
+		}
+		// Invalidate any timer selected before this handover in the same policy
+		// transaction. Resume must not make that old generation eligible again.
+		if err := tx.Model(&models.Contact{}).
+			Where("id = ? AND organization_id = ?", canonical.ID, baseTransfer.OrganizationID).
+			Updates(map[string]any{
+				"chatbot_last_message_at": nil,
+				"chatbot_reminder_sent":   false,
+			}).Error; err != nil {
+			return err
+		}
+		canonical.ChatbotLastMessageAt = nil
+		canonical.ChatbotReminderSent = false
 
 		// Update contact assignment if agent assigned, but only when
 		// AssignToSameAgent is enabled and no relationship manager is already
@@ -1452,6 +1477,31 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 	a.broadcastTransferCreated(transfer, contact)
 
 	return nil
+}
+
+// suppressUnfinishedInboundForTransfer runs under the organization policy and
+// canonical-contact locks. Admission takes the same policy lock, so the update
+// cuts off every previously committed unfinished native continuation without
+// suppressing a future post-Resume message. Jobs remain runnable for media and
+// inbox projection; action claims and uncertain outcomes are never rewritten.
+func suppressUnfinishedInboundForTransfer(tx *gorm.DB, organizationID, contactID uuid.UUID) error {
+	metadata, err := json.Marshal(models.JSONB{
+		incomingAutomaticAISuppressedKey:        true,
+		incomingAutomaticAISuppressionReasonKey: database.AutomaticReplyBlockedHumanHandover,
+		incomingAutomaticAISuppressedAtKey:      time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return err
+	}
+	continuations := tx.Model(&models.ScheduledJob{}).
+		Select("aggregate_id").
+		Where("organization_id = ? AND kind = ? AND aggregate_type = ?", organizationID, inboundContinuationJobKind, "message")
+	return tx.Model(&models.Message{}).
+		Where("organization_id = ? AND contact_id = ? AND direction = ?", organizationID, contactID, models.DirectionIncoming).
+		Where("id IN (?)", continuations).
+		Where("metadata->'inbound_continuation_completed' IS DISTINCT FROM 'true'::jsonb").
+		Where("metadata->? IS DISTINCT FROM 'true'::jsonb", incomingAutomaticAISuppressedKey).
+		Update("metadata", gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", string(metadata))).Error
 }
 
 // createTransferToQueue creates an unassigned agent transfer that goes to the queue

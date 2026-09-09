@@ -1003,6 +1003,32 @@ func (a *App) withInboundContinuationPhysicalAIAttempt(
 			if !policy.Allowed {
 				return &inboundContinuationPolicyStop{Reason: policy.Reason}
 			}
+			// The work object can predate Pause followed by Resume. Current
+			// contact policy alone cannot revive that exact inbound message: its
+			// committed suppression is the durable cutoff authority. Read without
+			// a message lock so only the organization fence spans provider I/O.
+			var inbound models.Message
+			if err := guardTx.Select("id", "organization_id", "contact_id", "direction", "whats_app_message_id", "metadata").
+				Where("id = ? AND organization_id = ?", execution.MessageID, execution.OrganizationID).
+				First(&inbound).Error; err != nil {
+				return &inboundContinuationPolicyStop{Reason: "durable inbound message is unavailable"}
+			}
+			if inbound.ContactID != execution.ContactID || inbound.Direction != models.DirectionIncoming ||
+				inbound.WhatsAppMessageID != execution.WAMID || strings.TrimSpace(execution.WAMID) == "" {
+				return &inboundContinuationPolicyStop{Reason: "durable inbound message identity changed"}
+			}
+			if raw, exists := inbound.Metadata[incomingAutomaticAISuppressedKey]; exists {
+				suppressed, valid := raw.(bool)
+				if !valid || suppressed {
+					return &inboundContinuationPolicyStop{Reason: "durable inbound message is suppressed"}
+				}
+			}
+			if raw, exists := inbound.Metadata["inbound_continuation_completed"]; exists {
+				completed, valid := raw.(bool)
+				if !valid || completed {
+					return &inboundContinuationPolicyStop{Reason: "durable inbound message is already terminal"}
+				}
+			}
 
 			execution.attemptGuarded = true
 			defer func() { execution.attemptGuarded = false }()

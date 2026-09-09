@@ -57,6 +57,34 @@ func loadInboundContinuationJob(
 	return job
 }
 
+// persistInboundContinuationActionMessage creates the durable inbound identity
+// that production installs before any guarded response, API, or webhook effect.
+// Intentional retries reuse the returned row; separate logical messages must
+// create separate rows so an action cannot borrow another WAMID's authority.
+func persistInboundContinuationActionMessage(
+	t *testing.T,
+	app *App,
+	account *models.WhatsAppAccount,
+	contact *models.Contact,
+	wamid string,
+) *models.Message {
+	t.Helper()
+	message := &models.Message{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    account.OrganizationID,
+		WhatsAppAccount:   account.Name,
+		ContactID:         contact.ID,
+		WhatsAppMessageID: wamid,
+		Direction:         models.DirectionIncoming,
+		MessageType:       models.MessageTypeText,
+		Content:           "Synthetic durable inbound action fixture",
+		Status:            models.MessageStatusReceived,
+		Metadata:          models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(message).Error)
+	return message
+}
+
 func TestInboundContinuation_CommittedNativeInboundPublishesRealtimeExactlyOnce(
 	t *testing.T,
 ) {
@@ -640,15 +668,20 @@ func TestInboundContinuation_ResponseActionMarkerSkipsReplay(t *testing.T) {
 	app := newProcessorTestApp(t)
 	organization, account := createProcessorTestOrg(t, app)
 	contact := testutil.CreateTestContact(t, app.DB, organization.ID)
-	inboundMessageID := uuid.New()
-	wamid := "wamid.action-marker-" + uuid.NewString()
+	inbound := persistInboundContinuationActionMessage(
+		t,
+		app,
+		account,
+		contact,
+		"wamid.action-marker-"+uuid.NewString(),
+	)
 
 	first := app.scopedApp(app.DB, organization.ID)
 	first.inboundContinuation = &inboundContinuationExecution{
 		OrganizationID: organization.ID,
 		ContactID:      contact.ID,
-		MessageID:      inboundMessageID,
-		WAMID:          wamid,
+		MessageID:      inbound.ID,
+		WAMID:          inbound.WhatsAppMessageID,
 	}
 	require.NoError(t, first.sendAndSaveTextMessage(
 		account,
@@ -660,8 +693,8 @@ func TestInboundContinuation_ResponseActionMarkerSkipsReplay(t *testing.T) {
 	replay.inboundContinuation = &inboundContinuationExecution{
 		OrganizationID: organization.ID,
 		ContactID:      contact.ID,
-		MessageID:      inboundMessageID,
-		WAMID:          wamid,
+		MessageID:      inbound.ID,
+		WAMID:          inbound.WhatsAppMessageID,
 	}
 	require.NoError(t, replay.sendAndSaveTextMessage(
 		account,
@@ -684,12 +717,12 @@ func TestInboundContinuation_ResponseActionMarkerSkipsReplay(t *testing.T) {
 	)
 	assert.Equal(
 		t,
-		inboundMessageID.String(),
+		inbound.ID.String(),
 		messages[0].Metadata["inbound_continuation_message_id"],
 	)
 	assert.Equal(
 		t,
-		wamid,
+		inbound.WhatsAppMessageID,
 		messages[0].Metadata["inbound_continuation_wamid"],
 	)
 
@@ -698,7 +731,7 @@ func TestInboundContinuation_ResponseActionMarkerSkipsReplay(t *testing.T) {
 		"organization_id = ? AND kind = ? AND aggregate_id = ?",
 		organization.ID,
 		inboundContinuationActionJobKind,
-		inboundMessageID,
+		inbound.ID,
 	).Find(&actions).Error)
 	require.Len(t, actions, 1)
 	assert.Equal(t, models.ScheduledJobStatusCompleted, actions[0].Status)
@@ -781,13 +814,20 @@ func TestInboundContinuation_ProviderAttemptFailureIsTerminalWithoutReplay(
 	))
 	t.Cleanup(failingProvider.Close)
 	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, failingProvider.URL)
+	inbound := persistInboundContinuationActionMessage(
+		t,
+		app,
+		account,
+		contact,
+		"wamid.provider-failure-"+uuid.NewString(),
+	)
 
 	execution := app.scopedApp(app.DB, organization.ID)
 	execution.inboundContinuation = &inboundContinuationExecution{
 		OrganizationID: organization.ID,
 		ContactID:      contact.ID,
-		MessageID:      uuid.New(),
-		WAMID:          "wamid.provider-failure-" + uuid.NewString(),
+		MessageID:      inbound.ID,
+		WAMID:          inbound.WhatsAppMessageID,
 	}
 	err := execution.sendAndSaveTextMessage(
 		account,
@@ -1468,9 +1508,15 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 	app := newProcessorTestApp(t)
 	organization, account := createProcessorTestOrg(t, app)
 	contact := testutil.CreateTestContact(t, app.DB, organization.ID)
-	inboundMessageID := uuid.New()
 
 	t.Run("api mapping is rehydrated without a second request", func(t *testing.T) {
+		inbound := persistInboundContinuationActionMessage(
+			t,
+			app,
+			account,
+			contact,
+			"wamid.graph-api-"+uuid.NewString(),
+		)
 		var apiCalls atomic.Int32
 		apiServer := httptest.NewServer(http.HandlerFunc(
 			func(w http.ResponseWriter, _ *http.Request) {
@@ -1515,8 +1561,8 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 		first.inboundContinuation = &inboundContinuationExecution{
 			OrganizationID: organization.ID,
 			ContactID:      contact.ID,
-			MessageID:      inboundMessageID,
-			WAMID:          "wamid.graph-api",
+			MessageID:      inbound.ID,
+			WAMID:          inbound.WhatsAppMessageID,
 		}
 		restore := first.pushInboundContinuationActionScope(
 			"chat-graph:flow-a:lookup-customer:visit:0",
@@ -1546,8 +1592,8 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 		replay.inboundContinuation = &inboundContinuationExecution{
 			OrganizationID: organization.ID,
 			ContactID:      contact.ID,
-			MessageID:      inboundMessageID,
-			WAMID:          "wamid.graph-api",
+			MessageID:      inbound.ID,
+			WAMID:          inbound.WhatsAppMessageID,
 		}
 		restore = replay.pushInboundContinuationActionScope(
 			"chat-graph:flow-a:lookup-customer:visit:0",
@@ -1572,7 +1618,7 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 			"organization_id = ? AND kind = ? AND aggregate_id = ? AND payload ->> 'effect_kind' = ?",
 			organization.ID,
 			inboundContinuationActionJobKind,
-			inboundMessageID,
+			inbound.ID,
 			"graph_api_call",
 		).First(&action).Error)
 		encoded, err := json.Marshal(action.Payload)
@@ -1582,6 +1628,13 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 	})
 
 	t.Run("webhook is attempted once per stable node visit", func(t *testing.T) {
+		inbound := persistInboundContinuationActionMessage(
+			t,
+			app,
+			account,
+			contact,
+			"wamid.graph-webhook-"+uuid.NewString(),
+		)
 		var webhookCalls atomic.Int32
 		webhookServer := httptest.NewServer(http.HandlerFunc(
 			func(w http.ResponseWriter, _ *http.Request) {
@@ -1616,8 +1669,8 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 			execution.inboundContinuation = &inboundContinuationExecution{
 				OrganizationID: organization.ID,
 				ContactID:      contact.ID,
-				MessageID:      inboundMessageID,
-				WAMID:          "wamid.graph-webhook",
+				MessageID:      inbound.ID,
+				WAMID:          inbound.WhatsAppMessageID,
 			}
 			restore := execution.pushInboundContinuationActionScope(
 				"chat-graph:flow-a:notify-crm:visit:1",
@@ -1643,7 +1696,7 @@ func TestInboundContinuation_GraphHTTPActionsReuseDurableNodeResults(
 			"organization_id = ? AND kind = ? AND aggregate_id = ? AND payload ->> 'effect_kind' = ?",
 			organization.ID,
 			inboundContinuationActionJobKind,
-			inboundMessageID,
+			inbound.ID,
 			"graph_webhook",
 		).First(&action).Error)
 		encoded, err := json.Marshal(action.Payload)
