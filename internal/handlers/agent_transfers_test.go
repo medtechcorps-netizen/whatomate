@@ -2,6 +2,7 @@ package handlers_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -302,13 +303,23 @@ func TestApp_ListAgentTransfers_ExactContactBeyondFirstFIFOPage(t *testing.T) {
 	baseTime := time.Now().UTC().Add(-3 * time.Hour)
 
 	for i := 0; i < 100; i++ {
-		contact := testutil.CreateTestContact(t, app.DB, org.ID)
+		contact := testutil.CreateTestContactWith(
+			t,
+			app.DB,
+			org.ID,
+			testutil.WithPhoneNumber(fmt.Sprintf("+155500%04d", i)),
+		)
 		transfer := createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, nil)
 		require.NoError(t, app.DB.Model(transfer).
 			Update("transferred_at", baseTime.Add(time.Duration(i)*time.Second)).Error)
 	}
 
-	targetContact := testutil.CreateTestContact(t, app.DB, org.ID)
+	targetContact := testutil.CreateTestContactWith(
+		t,
+		app.DB,
+		org.ID,
+		testutil.WithPhoneNumber("+1555999999"),
+	)
 	targetTransfer := createTestTransfer(t, app, org.ID, targetContact.ID, account.Name, models.TransferStatusActive, nil)
 	require.NoError(t, app.DB.Model(targetTransfer).
 		Update("transferred_at", baseTime.Add(2*time.Hour)).Error)
