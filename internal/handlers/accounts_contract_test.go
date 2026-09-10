@@ -238,6 +238,21 @@ func newWhatsAppContractMeta(t *testing.T, phoneID, wabaID string) *whatsappCont
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		case strings.HasSuffix(r.URL.Path, "/"+meta.phoneID+"/smb_app_data"):
+			var body struct {
+				MessagingProduct string `json:"messaging_product"`
+				SyncType         string `json:"sync_type"`
+			}
+			if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&body) != nil ||
+				body.MessagingProduct != "whatsapp" ||
+				(body.SyncType != "smb_app_state_sync" && body.SyncType != "history") {
+				http.Error(w, "invalid synthetic coexistence sync contract", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"messaging_product": "whatsapp",
+				"request_id":        "synthetic-" + body.SyncType + "-request",
+			})
 		case strings.HasSuffix(r.URL.Path, "/"+meta.phoneID):
 			if meta.onPhoneInfo != nil {
 				meta.onPhoneInfo(r)
@@ -355,6 +370,35 @@ func TestCreateAccountValidatesRelationshipPersistsPendingThenActivates(t *testi
 	require.NoError(t, app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&stored).Error)
 	assert.Equal(t, "active", stored.Status)
 	assert.True(t, appcrypto.IsEncrypted(stored.AccessToken))
+}
+
+func TestCreateAccountRejectsSMBNumberOutsideCoexistenceEmbeddedSignup(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.phoneIsOnBizApp = true
+	meta.phonePlatformType = "SMB_CLOUD_API"
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+
+	req := createContractAccountRequest(
+		t,
+		app,
+		org.ID,
+		user.ID,
+		"Manual SMB Bypass",
+		phoneID,
+		wabaID,
+		"synthetic-manual-smb-token",
+	)
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "Coexistence Embedded Signup")
+	assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+
+	var count int64
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+		Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).
+		Count(&count).Error)
+	assert.Zero(t, count, "manual creation must not persist an SMB account")
 }
 
 func TestCreateAccountNormalizesRoutingIdentifiersBeforeValidationAndPersistence(t *testing.T) {
@@ -626,9 +670,10 @@ func TestUpdateAccountActiveStalePUTCannotOverwriteEmbeddedSignupTokenRefresh(t 
 	}
 
 	exchangeReq := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "claim-during-put",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "claim-during-put",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(exchangeReq, org.ID, user.ID)
 	testutil.SetHeader(exchangeReq, "X-Organization-ID", org.ID.String())
@@ -1048,6 +1093,86 @@ func TestUpdateAccountContractChangeValidatesThenResubscribes(t *testing.T) {
 	assert.True(t, appcrypto.IsEncrypted(stored.AccessToken))
 }
 
+func TestUpdateAccountRejectsSMBCredentialRefreshOutsideEmbeddedSignup(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-existing-smb-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	account := &models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Existing Coexistence Account",
+		PhoneID:        phoneID,
+		BusinessID:     wabaID,
+		AccessToken:    oldToken,
+		APIVersion:     "v21.0",
+		Status:         "active",
+		IsSMB:          true,
+	}
+	require.NoError(t, app.DB.Create(account).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"name":         account.Name,
+		"access_token": "synthetic-manual-refresh-token",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", account.ID.String())
+	require.NoError(t, app.UpdateAccount(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "refreshed through Embedded Signup")
+	assert.Zero(t, meta.totalHits(), "an SMB manual refresh must fail before any Meta call")
+
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+	assert.Equal(t, oldToken, stored.AccessToken)
+	assert.Equal(t, "active", stored.Status)
+}
+
+func TestUpdateAccountRejectsManualClassicToSMBTransition(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.phoneIsOnBizApp = true
+	meta.phonePlatformType = "SMB_CLOUD_API"
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-existing-classic-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	account := &models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Existing Classic Account",
+		PhoneID:        "old-classic-phone",
+		BusinessID:     "old-classic-waba",
+		AccessToken:    oldToken,
+		APIVersion:     "v21.0",
+		Status:         "active",
+	}
+	require.NoError(t, app.DB.Create(account).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"name":         account.Name,
+		"phone_id":     phoneID,
+		"business_id":  wabaID,
+		"access_token": "synthetic-manual-transition-token",
+		"api_version":  "v21.0",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", account.ID.String())
+	require.NoError(t, app.UpdateAccount(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "Coexistence Embedded Signup")
+	assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+	assert.Equal(t, "old-classic-phone", stored.PhoneID)
+	assert.Equal(t, "old-classic-waba", stored.BusinessID)
+	assert.Equal(t, oldToken, stored.AccessToken)
+	assert.False(t, stored.IsSMB)
+}
+
 func TestEmbeddedSignupSuppliedIDsCannotBypassRelationshipValidation(t *testing.T) {
 	phoneID, wabaID := contractGraphIDs()
 	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
@@ -1057,9 +1182,10 @@ func TestEmbeddedSignupSuppliedIDsCannotBypassRelationshipValidation(t *testing.
 	user := contractWriter(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-authorization-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-authorization-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -1084,9 +1210,10 @@ func TestEmbeddedSignupSuppliedWABAMustBeGrantedByToken(t *testing.T) {
 	user := contractWriter(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-ungranted-waba-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-ungranted-waba-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -1111,9 +1238,10 @@ func TestEmbeddedSignupSuppliedWABAMustMatchMessagingGranularTarget(t *testing.T
 	user := contractWriter(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-ungranted-messaging-waba-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-ungranted-messaging-waba-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -1127,6 +1255,74 @@ func TestEmbeddedSignupSuppliedWABAMustMatchMessagingGranularTarget(t *testing.T
 		Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).
 		Count(&count).Error)
 	assert.Zero(t, count)
+}
+
+func TestEmbeddedSignupRequiresExplicitConnectionModeBeforeMeta(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+
+	for _, mode := range []any{nil, "", "unexpected"} {
+		body := map[string]any{
+			"code":     "synthetic-mode-validation-code",
+			"phone_id": phoneID,
+			"waba_id":  wabaID,
+		}
+		if mode != nil {
+			body["signup_mode"] = mode
+		}
+		req := testutil.NewJSONRequest(t, body)
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+		require.NoError(t, app.ExchangeToken(req))
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "signup_mode")
+	}
+	assert.Zero(t, meta.totalHits(), "invalid or missing mode must fail before exchanging the authorization code")
+}
+
+func TestEmbeddedSignupRejectsProviderModeMismatchBeforeMutation(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		mode        string
+		providerSMB bool
+	}{
+		{name: "coexistence selected but Meta returns classic", mode: "coexistence"},
+		{name: "classic selected but Meta returns coexistence", mode: "classic", providerSMB: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			if testCase.providerSMB {
+				meta.phoneIsOnBizApp = true
+				meta.phonePlatformType = "SMB_CLOUD_API"
+			}
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+
+			req := testutil.NewJSONRequest(t, map[string]any{
+				"code":        "synthetic-mode-mismatch-code",
+				"signup_mode": testCase.mode,
+				"phone_id":    phoneID,
+				"waba_id":     wabaID,
+			})
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+			require.NoError(t, app.ExchangeToken(req))
+			testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "does not match")
+
+			assert.Zero(t, meta.hit("/v21.0/"+phoneID+"/register"))
+			assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+			assert.Zero(t, meta.hit("/v21.0/"+phoneID+"/smb_app_data"))
+			var count int64
+			require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+				Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).
+				Count(&count).Error)
+			assert.Zero(t, count)
+		})
+	}
 }
 
 func TestEmbeddedSignupRegisterSuccessRetainsDurablePINWhenClaimIsSuperseded(t *testing.T) {
@@ -1169,9 +1365,10 @@ func TestEmbeddedSignupRegisterSuccessRetainsDurablePINWhenClaimIsSuperseded(t *
 	}
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-durable-pin-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-durable-pin-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -1213,9 +1410,10 @@ func TestEmbeddedSignupConcurrentClaimCannotOverwriteInFlightPINOrToken(t *testi
 		}
 	}
 	firstReq := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "first-inflight-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "first-inflight-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(firstReq, org.ID, user.ID)
 	testutil.SetHeader(firstReq, "X-Organization-ID", org.ID.String())
@@ -1234,9 +1432,10 @@ func TestEmbeddedSignupConcurrentClaimCannotOverwriteInFlightPINOrToken(t *testi
 	require.Len(t, acceptedCandidate, 6)
 
 	secondReq := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "second-inflight-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "second-inflight-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(secondReq, org.ID, user.ID)
 	testutil.SetHeader(secondReq, "X-Organization-ID", org.ID.String())
@@ -1280,9 +1479,10 @@ func TestEmbeddedSignupReusesAuthoritativeSMBValidationWithoutRegistration(t *te
 	user := contractWriter(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-authoritative-smb-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-authoritative-smb-code",
+		"signup_mode": "coexistence",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -1291,12 +1491,430 @@ func TestEmbeddedSignupReusesAuthoritativeSMBValidationWithoutRegistration(t *te
 	assert.Equal(t, 1, meta.hit("/v21.0/"+phoneID), "embedded signup must reuse the authoritative validation read")
 	assert.Equal(t, 0, meta.hit("/v21.0/"+phoneID+"/register"))
 	assert.Equal(t, 1, meta.hit("/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Equal(t, 2, meta.hit("/v21.0/"+phoneID+"/smb_app_data"))
 
 	var stored models.WhatsAppAccount
 	require.NoError(t, app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&stored).Error)
 	assert.True(t, stored.IsSMB)
 	assert.Empty(t, stored.Pin)
 	assert.Equal(t, "active", stored.Status)
+	var coexistence models.WhatsAppCoexistenceState
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND whats_app_account_id = ?",
+		org.ID,
+		stored.ID,
+	).First(&coexistence).Error)
+	assert.Equal(t, models.CoexistenceSyncStatusRequested, coexistence.ContactSyncStatus)
+	assert.Equal(t, models.CoexistenceSyncStatusRequested, coexistence.HistorySyncStatus)
+}
+
+type embeddedSignupBudgetTransport func(*http.Request) (*http.Response, error)
+
+func (fn embeddedSignupBudgetTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
+func TestEmbeddedSignupProviderPhasesShareDeadlineAndKeepAmbiguousState(t *testing.T) {
+	for _, phase := range []string{"discovery", "registration", "subscription", "contact_sync", "history_sync"} {
+		t.Run(phase, func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			meta.phoneIsOnBizApp = phase != "registration"
+			if meta.phoneIsOnBizApp {
+				meta.phonePlatformType = "SMB_CLOUD_API"
+			}
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+			var sharedDeadline time.Time
+			syncRequests, blockedRequests, providerRequests := 0, 0, 0
+			app.WhatsApp.HTTPClient.Transport = embeddedSignupBudgetTransport(func(request *http.Request) (*http.Response, error) {
+				providerRequests++
+				deadline, ok := request.Context().Deadline()
+				require.True(t, ok, "every Meta phase must have a deadline")
+				if sharedDeadline.IsZero() {
+					sharedDeadline = deadline
+				}
+				assert.True(t, deadline.Equal(sharedDeadline), "later phases must not renew the operation budget: %s", request.URL.Path)
+				if strings.HasSuffix(request.URL.Path, "/smb_app_data") {
+					syncRequests++
+				}
+				blocked := phase == "discovery" && request.URL.Path == "/debug_token" ||
+					phase == "registration" && strings.HasSuffix(request.URL.Path, "/register") ||
+					phase == "subscription" && request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/subscribed_apps") ||
+					phase == "contact_sync" && syncRequests == 1 ||
+					phase == "history_sync" && syncRequests == 2
+				response, err := http.DefaultTransport.RoundTrip(request)
+				if err != nil {
+					return response, err
+				}
+				if blocked {
+					// Meta accepted the request, but its acknowledgement is lost.
+					// A timeout must preserve uncertainty, never trigger a replay.
+					blockedRequests++
+					_ = response.Body.Close()
+					<-request.Context().Done()
+					return nil, request.Context().Err()
+				}
+				if strings.HasSuffix(request.URL.Path, "/oauth/access_token") || request.URL.Path == "/debug_token" {
+					// Consume budget in earlier serial phases before delaying the
+					// selected phase; the remaining deadline must still be shared.
+					timer := time.NewTimer(20 * time.Millisecond)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+					case <-request.Context().Done():
+						_ = response.Body.Close()
+						return nil, request.Context().Err()
+					}
+				}
+				return response, nil
+			})
+			mode := embeddedSignupModeCoexistence
+			if !meta.phoneIsOnBizApp {
+				mode = embeddedSignupModeClassic
+			}
+			req := testutil.NewJSONRequest(t, map[string]any{
+				"code": "synthetic-delayed-code", "signup_mode": mode, "phone_id": phoneID, "waba_id": wabaID,
+			})
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+			started := time.Now()
+			require.NoError(t, app.exchangeToken(req, 2*time.Second))
+			assert.Less(t, time.Since(started), 4*time.Second, "provider phases must return within one budget plus local settlement")
+			require.Equal(t, 1, blockedRequests)
+			assert.GreaterOrEqual(t, providerRequests, 2)
+
+			if phase == "discovery" {
+				assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+				var count int64
+				require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where("organization_id = ?", org.ID).Count(&count).Error)
+				assert.Zero(t, count, "read-only deadline exhaustion must not claim a phone")
+				return
+			}
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+			var account models.WhatsAppAccount
+			require.NoError(t, app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&account).Error)
+			assert.True(t, appcrypto.IsEncrypted(account.AccessToken))
+			assert.Contains(t, string(testutil.GetResponseBody(req)), "warning")
+			if phase == "registration" {
+				assert.Equal(t, "pending_registration", account.Status)
+				assert.True(t, appcrypto.IsEncrypted(account.Pin))
+				assert.Equal(t, 1, meta.hit("/v21.0/"+phoneID+"/register"))
+				assert.Zero(t, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+				return
+			}
+			assert.Equal(t, 1, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+			if phase == "subscription" {
+				assert.Equal(t, "subscription_failed", account.Status)
+				assert.Zero(t, syncRequests)
+				return
+			}
+			assert.Equal(t, "active", account.Status)
+			var state models.WhatsAppCoexistenceState
+			require.NoError(t, app.DB.Where("organization_id = ? AND whats_app_account_id = ?", org.ID, account.ID).First(&state).Error)
+			if phase == "contact_sync" {
+				assert.Equal(t, 1, syncRequests, "deadline exhaustion must not start history")
+				assert.Equal(t, models.CoexistenceSyncStatusRequesting, state.ContactSyncStatus)
+				assert.Equal(t, "request_timeout", state.ContactSyncErrorCode)
+				assert.Equal(t, models.CoexistenceSyncStatusPending, state.HistorySyncStatus)
+				assert.Zero(t, state.HistorySyncAttempts)
+			} else {
+				assert.Equal(t, 2, syncRequests)
+				assert.Equal(t, models.CoexistenceSyncStatusRequested, state.ContactSyncStatus)
+				assert.Equal(t, models.CoexistenceSyncStatusRequesting, state.HistorySyncStatus)
+				assert.Equal(t, "request_timeout", state.HistorySyncErrorCode)
+			}
+			// An explicit later recovery may request the untouched history stage,
+			// but cannot replay the ambiguous or already accepted one-time stage.
+			app.WhatsApp.HTTPClient.Transport = http.DefaultTransport
+			_, _, err := app.runCoexistenceSyncRequests(context.Background(), org.ID, account.ID, &whatsapp.Account{
+				PhoneID: phoneID, BusinessID: wabaID, AccessToken: "synthetic-embedded-token", APIVersion: "v21.0",
+			})
+			require.NoError(t, err)
+			assert.Equal(t, 2, meta.hit("/v21.0/"+phoneID+"/smb_app_data"), "recovery must never replay the ambiguous stage")
+		})
+	}
+}
+
+func TestEmbeddedSignupActiveSMBRefreshPreservesOneTimeSyncState(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.phoneIsOnBizApp = true
+	meta.phonePlatformType = "SMB_CLOUD_API"
+	meta.permanentToken = true
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-old-smb-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	existing := &models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Stable Coexistence Clinic",
+		PhoneID:        phoneID,
+		BusinessID:     wabaID,
+		AccessToken:    oldToken,
+		APIVersion:     "v21.0",
+		Status:         "active",
+		IsSMB:          true,
+	}
+	require.NoError(t, app.DB.Create(existing).Error)
+	onboardedAt := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	deadline := onboardedAt.Add(models.CoexistenceSyncWindow)
+	completedAt := onboardedAt.Add(time.Hour)
+	state := &models.WhatsAppCoexistenceState{
+		ID:                     uuid.New(),
+		OrganizationID:         org.ID,
+		WhatsAppAccountID:      existing.ID,
+		BusinessPhoneNumber:    "+60123456789",
+		OnboardingStatus:       models.CoexistenceOnboardingStatusReady,
+		OnboardedAt:            &onboardedAt,
+		SyncStatus:             models.CoexistenceSyncStatusCompleted,
+		SyncStartedAt:          &onboardedAt,
+		SyncCompletedAt:        &completedAt,
+		SyncDeadlineAt:         &deadline,
+		ContactSyncStatus:      models.CoexistenceSyncStatusCompleted,
+		ContactSyncAttempts:    1,
+		ContactSyncCompletedAt: &completedAt,
+		HistoryConsent:         models.CoexistenceHistoryConsentGranted,
+		HistorySyncStatus:      models.CoexistenceSyncStatusCompleted,
+		HistorySyncAttempts:    1,
+		HistoryProgressPercent: 100,
+		HistoryCompletedAt:     &completedAt,
+		LifecycleStatus:        models.CoexistenceLifecycleStatusConnected,
+		LifecycleMetadata:      models.JSONB{},
+		Version:                7,
+	}
+	require.NoError(t, app.DB.Create(state).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code":        "synthetic-active-smb-refresh-code",
+		"signup_mode": "coexistence",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ExchangeToken(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	assert.Equal(t, 0, meta.hit("/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 0, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Equal(t, 0, meta.hit("/v21.0/"+phoneID+"/smb_app_data"),
+		"an active token refresh must not replay Meta's one-time sync requests")
+
+	var preserved models.WhatsAppCoexistenceState
+	require.NoError(t, app.DB.Where("id = ?", state.ID).First(&preserved).Error)
+	assert.Equal(t, models.CoexistenceOnboardingStatusReady, preserved.OnboardingStatus)
+	assert.Equal(t, models.CoexistenceSyncStatusCompleted, preserved.SyncStatus)
+	assert.Equal(t, 1, preserved.ContactSyncAttempts)
+	assert.Equal(t, 1, preserved.HistorySyncAttempts)
+	require.NotNil(t, preserved.SyncDeadlineAt)
+	assert.Equal(t, deadline, preserved.SyncDeadlineAt.UTC())
+}
+
+func TestEmbeddedSignupActiveClassicAccountCanEnterCoexistence(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.phoneIsOnBizApp = true
+	meta.phonePlatformType = "SMB_CLOUD_API"
+	meta.permanentToken = true
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-classic-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	oldPIN, err := appcrypto.Encrypt("123456", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	existing := &models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Classic Account Moving To Coexistence",
+		PhoneID:        phoneID,
+		BusinessID:     wabaID,
+		AccessToken:    oldToken,
+		APIVersion:     "v21.0",
+		Status:         "active",
+		Pin:            oldPIN,
+		IsSMB:          false,
+	}
+	require.NoError(t, app.DB.Create(existing).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code":        "synthetic-active-classic-to-smb-code",
+		"signup_mode": "coexistence",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ExchangeToken(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	assert.Equal(t, 0, meta.hit("/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 0, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Equal(t, 2, meta.hit("/v21.0/"+phoneID+"/smb_app_data"))
+
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", existing.ID).First(&stored).Error)
+	assert.True(t, stored.IsSMB)
+	assert.Empty(t, stored.Pin)
+	assert.Equal(t, "active", stored.Status)
+	var state models.WhatsAppCoexistenceState
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND whats_app_account_id = ?",
+		org.ID,
+		existing.ID,
+	).First(&state).Error)
+	assert.Equal(t, models.CoexistenceSyncStatusRequested, state.ContactSyncStatus)
+	assert.Equal(t, models.CoexistenceSyncStatusRequested, state.HistorySyncStatus)
+}
+
+func TestEmbeddedSignupActiveExpiredSMBDoesNotReplayOneTimeSync(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.phoneIsOnBizApp = true
+	meta.phonePlatformType = "SMB_CLOUD_API"
+	meta.permanentToken = true
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-expired-smb-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	existing := &models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Expired Coexistence Account",
+		PhoneID:        phoneID,
+		BusinessID:     wabaID,
+		AccessToken:    oldToken,
+		APIVersion:     "v21.0",
+		Status:         "active",
+		IsSMB:          true,
+	}
+	require.NoError(t, app.DB.Create(existing).Error)
+	onboardedAt := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	deadline := onboardedAt.Add(models.CoexistenceSyncWindow)
+	state := &models.WhatsAppCoexistenceState{
+		ID:                uuid.New(),
+		OrganizationID:    org.ID,
+		WhatsAppAccountID: existing.ID,
+		OnboardingStatus:  models.CoexistenceOnboardingStatusExpired,
+		OnboardedAt:       &onboardedAt,
+		SyncStatus:        models.CoexistenceSyncStatusExpired,
+		SyncStartedAt:     &onboardedAt,
+		SyncDeadlineAt:    &deadline,
+		ContactSyncStatus: models.CoexistenceSyncStatusExpired,
+		HistoryConsent:    models.CoexistenceHistoryConsentUnknown,
+		HistorySyncStatus: models.CoexistenceSyncStatusExpired,
+		LifecycleStatus:   models.CoexistenceLifecycleStatusConnected,
+		LifecycleMetadata: models.JSONB{},
+		Version:           3,
+	}
+	require.NoError(t, app.DB.Create(state).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code":        "synthetic-expired-smb-refresh-code",
+		"signup_mode": "coexistence",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ExchangeToken(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Equal(t, 0, meta.hit("/v21.0/"+phoneID+"/smb_app_data"))
+
+	var preserved models.WhatsAppCoexistenceState
+	require.NoError(t, app.DB.Where("id = ?", state.ID).First(&preserved).Error)
+	require.NotNil(t, preserved.OnboardedAt)
+	assert.Equal(t, onboardedAt, preserved.OnboardedAt.UTC())
+	assert.Equal(t, models.CoexistenceOnboardingStatusExpired, preserved.OnboardingStatus)
+}
+
+func TestEmbeddedSignupAfterOffboardAndReconnectStartsFreshCoexistenceCycle(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.phoneIsOnBizApp = true
+	meta.phonePlatformType = "SMB_CLOUD_API"
+	meta.permanentToken = true
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-offboarded-smb-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	existing := &models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Reonboarding Coexistence Account",
+		PhoneID:        phoneID,
+		BusinessID:     wabaID,
+		AccessToken:    oldToken,
+		APIVersion:     "v21.0",
+		Status:         "disconnected",
+		IsSMB:          true,
+	}
+	require.NoError(t, app.DB.Create(existing).Error)
+	oldOnboardedAt := time.Now().UTC().Add(-72 * time.Hour).Truncate(time.Second)
+	offboardedAt := oldOnboardedAt.Add(48 * time.Hour)
+	reconnectedAt := offboardedAt.Add(time.Hour)
+	oldCompletedAt := oldOnboardedAt.Add(time.Hour)
+	oldDeadline := oldOnboardedAt.Add(models.CoexistenceSyncWindow)
+	state := &models.WhatsAppCoexistenceState{
+		ID:                     uuid.New(),
+		OrganizationID:         org.ID,
+		WhatsAppAccountID:      existing.ID,
+		OnboardingStatus:       models.CoexistenceOnboardingStatusReady,
+		OnboardedAt:            &oldOnboardedAt,
+		SyncStatus:             models.CoexistenceSyncStatusCompleted,
+		SyncStartedAt:          &oldOnboardedAt,
+		SyncCompletedAt:        &oldCompletedAt,
+		SyncDeadlineAt:         &oldDeadline,
+		ContactSyncStatus:      models.CoexistenceSyncStatusCompleted,
+		ContactSyncAttempts:    1,
+		ContactSyncCompletedAt: &oldCompletedAt,
+		HistoryConsent:         models.CoexistenceHistoryConsentGranted,
+		HistorySyncStatus:      models.CoexistenceSyncStatusCompleted,
+		HistorySyncAttempts:    1,
+		HistoryProgressPercent: 100,
+		HistoryCompletedAt:     &oldCompletedAt,
+		LifecycleStatus:        models.CoexistenceLifecycleStatusConnected,
+		LastLifecycleEvent:     "ACCOUNT_RECONNECTED",
+		LastLifecycleEventAt:   &reconnectedAt,
+		OffboardedAt:           &offboardedAt,
+		ReconnectedAt:          &reconnectedAt,
+		LifecycleMetadata:      models.JSONB{"event": "ACCOUNT_RECONNECTED"},
+		Version:                5,
+	}
+	require.NoError(t, app.DB.Create(state).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code":        "synthetic-post-offboard-smb-code",
+		"signup_mode": "coexistence",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ExchangeToken(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	assert.Zero(t, meta.hit("/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 1, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+	assert.Equal(t, 2, meta.hit("/v21.0/"+phoneID+"/smb_app_data"))
+
+	var reonboarded models.WhatsAppCoexistenceState
+	require.NoError(t, app.DB.Where("id = ?", state.ID).First(&reonboarded).Error)
+	require.NotNil(t, reonboarded.OnboardedAt)
+	assert.True(t, reonboarded.OnboardedAt.After(reconnectedAt))
+	assert.Equal(t, models.CoexistenceSyncStatusRequested, reonboarded.ContactSyncStatus)
+	assert.Equal(t, models.CoexistenceSyncStatusRequested, reonboarded.HistorySyncStatus)
+	assert.Equal(t, 1, reonboarded.ContactSyncAttempts)
+	assert.Equal(t, 1, reonboarded.HistorySyncAttempts)
+	assert.EqualValues(t, 2, reonboarded.OnboardingCycle)
+	assert.Nil(t, reonboarded.OffboardedAt)
+	assert.Equal(t, "EMBEDDED_SIGNUP_COMPLETED", reonboarded.LastLifecycleEvent)
 }
 
 func TestEmbeddedSignupActiveReconnectPreservesStableNameAndOperationalFlags(t *testing.T) {
@@ -1330,10 +1948,11 @@ func TestEmbeddedSignupActiveReconnectPreservesStableNameAndOperationalFlags(t *
 	require.NoError(t, app.DB.Create(existing).Error)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-active-reconnect-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
-		"name":     "Must Not Replace Stable Name",
+		"code":        "synthetic-active-reconnect-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
+		"name":        "Must Not Replace Stable Name",
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -1390,9 +2009,10 @@ func TestEmbeddedSignupActiveReconnectFailsClosedWhenCurrentAppIsNotSubscribed(t
 	require.NoError(t, app.DB.Create(existing).Error)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-unbound-reconnect-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-unbound-reconnect-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -1456,9 +2076,10 @@ func TestEmbeddedSignupActiveReconnectFencesConcurrentIntegrationCenterChange(t 
 	})
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-config-race-reconnect-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-config-race-reconnect-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -1553,10 +2174,11 @@ func TestEmbeddedSignupActiveReconnectDifferentWABARejectsBeforeMutation(t *test
 	require.NoError(t, app.DB.Create(existing).Error)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-rejected-reconnect-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
-		"name":     "Do Not Rename Rejected Clinic",
+		"code":        "synthetic-rejected-reconnect-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
+		"name":        "Do Not Rename Rejected Clinic",
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -1601,9 +2223,10 @@ func TestEmbeddedSignupActiveReconnectDifferentAPIRejectsBeforeMutation(t *testi
 	require.NoError(t, app.DB.Create(existing).Error)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-timeout-reconnect-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-timeout-reconnect-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -2092,10 +2715,11 @@ func TestEmbeddedSignupSoftDeletedReconnectRestoresAndNormalizesAccount(t *testi
 	require.NoError(t, app.DB.Delete(deleted).Error)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-soft-delete-reconnect-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
-		"name":     "Restored Clinic Name",
+		"code":        "synthetic-soft-delete-reconnect-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
+		"name":        "Restored Clinic Name",
 	})
 	testutil.SetAuthContext(req, org.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
@@ -2113,6 +2737,85 @@ func TestEmbeddedSignupSoftDeletedReconnectRestoresAndNormalizesAccount(t *testi
 	assert.False(t, stored.AutoReadReceipt)
 	assert.False(t, stored.BusinessCallingEnabled)
 	assert.Equal(t, "active", stored.Status)
+}
+
+func TestEmbeddedSignupSoftDeletedSMBRestoreDoesNotReopenOneTimeSyncCycle(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	meta.phoneIsOnBizApp = true
+	meta.phonePlatformType = "SMB_CLOUD_API"
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-deleted-smb-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	account := &models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Deleted Coexistence Clinic",
+		PhoneID:        phoneID,
+		BusinessID:     wabaID,
+		AccessToken:    oldToken,
+		APIVersion:     "v21.0",
+		Status:         "active",
+		IsSMB:          true,
+	}
+	require.NoError(t, app.DB.Create(account).Error)
+	onboardedAt := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	deadline := onboardedAt.Add(models.CoexistenceSyncWindow)
+	completedAt := onboardedAt.Add(time.Hour)
+	state := &models.WhatsAppCoexistenceState{
+		ID:                     uuid.New(),
+		OrganizationID:         org.ID,
+		WhatsAppAccountID:      account.ID,
+		OnboardingStatus:       models.CoexistenceOnboardingStatusReady,
+		OnboardedAt:            &onboardedAt,
+		OnboardingCycle:        1,
+		SyncStatus:             models.CoexistenceSyncStatusCompleted,
+		SyncStartedAt:          &onboardedAt,
+		SyncCompletedAt:        &completedAt,
+		SyncDeadlineAt:         &deadline,
+		ContactSyncStatus:      models.CoexistenceSyncStatusRequested,
+		ContactSyncAttempts:    1,
+		ContactSyncRequestedAt: &onboardedAt,
+		HistoryConsent:         models.CoexistenceHistoryConsentGranted,
+		HistorySyncStatus:      models.CoexistenceSyncStatusCompleted,
+		HistorySyncAttempts:    1,
+		HistoryProgressPercent: 100,
+		HistoryCompletedAt:     &completedAt,
+		LifecycleStatus:        models.CoexistenceLifecycleStatusConnected,
+		LifecycleMetadata:      models.JSONB{},
+		Version:                7,
+	}
+	require.NoError(t, app.DB.Create(state).Error)
+	require.NoError(t, app.DB.Delete(account).Error)
+
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"code":        "synthetic-soft-delete-smb-restore-code",
+		"signup_mode": "coexistence",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.ExchangeToken(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.Zero(t, meta.hit("/v21.0/"+phoneID+"/register"))
+	assert.Zero(t, meta.hit("/v21.0/"+phoneID+"/smb_app_data"),
+		"local soft deletion is not Meta offboarding and must not reopen one-time sync")
+
+	var restored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&restored).Error)
+	assert.Equal(t, "active", restored.Status)
+	assert.True(t, restored.IsSMB)
+	var preserved models.WhatsAppCoexistenceState
+	require.NoError(t, app.DB.Where("id = ?", state.ID).First(&preserved).Error)
+	assert.Equal(t, uint64(1), preserved.OnboardingCycle)
+	assert.Equal(t, onboardedAt, preserved.OnboardedAt.UTC())
+	assert.Equal(t, 1, preserved.ContactSyncAttempts)
+	assert.Equal(t, 1, preserved.HistorySyncAttempts)
+	assert.Equal(t, "EMBEDDED_SIGNUP_CREDENTIAL_REFRESH", preserved.LastLifecycleEvent)
+	assert.Equal(t, models.CoexistenceLifecycleStatusConnected, preserved.LifecycleStatus)
 }
 
 func TestEmbeddedSignupGlobalPhoneConflictRejectsBeforeProviderMutation(t *testing.T) {
@@ -2137,9 +2840,10 @@ func TestEmbeddedSignupGlobalPhoneConflictRejectsBeforeProviderMutation(t *testi
 	require.NoError(t, app.DB.Create(owner).Error)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-global-conflict-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-global-conflict-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, targetOrg.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", targetOrg.ID.String())
@@ -2185,9 +2889,10 @@ func TestEmbeddedSignupExplicitAlternateMembershipWritesOnlySelectedOrganization
 	}).Error)
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-alternate-member-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-alternate-member-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, homeOrg.ID, user.ID)
 	testutil.SetHeader(req, "X-Organization-ID", targetOrg.ID.String())
@@ -2214,9 +2919,10 @@ func TestEmbeddedSignupSuperAdminCanPinExistingTargetOrganization(t *testing.T) 
 	superAdmin := testutil.CreateTestUser(t, app.DB, homeOrg.ID, testutil.WithSuperAdmin())
 
 	req := testutil.NewJSONRequest(t, map[string]any{
-		"code":     "synthetic-superadmin-target-code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "synthetic-superadmin-target-code",
+		"signup_mode": "classic",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
 	})
 	testutil.SetAuthContext(req, homeOrg.ID, superAdmin.ID)
 	testutil.SetHeader(req, "X-Organization-ID", targetOrg.ID.String())
@@ -2266,9 +2972,10 @@ func TestEmbeddedSignupDeletedExplicitTargetFailsBeforeMeta(t *testing.T) {
 			require.NoError(t, app.DB.Delete(targetOrg).Error)
 
 			req := testutil.NewJSONRequest(t, map[string]any{
-				"code":     "must-not-exchange-deleted-target",
-				"phone_id": phoneID,
-				"waba_id":  wabaID,
+				"code":        "must-not-exchange-deleted-target",
+				"signup_mode": "classic",
+				"phone_id":    phoneID,
+				"waba_id":     wabaID,
 			})
 			testutil.SetAuthContext(req, homeOrg.ID, user.ID)
 			testutil.SetHeader(req, "X-Organization-ID", targetOrg.ID.String())

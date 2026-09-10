@@ -33,6 +33,7 @@ export default defineConfig({
             { label: 'Templates', slug: 'features/templates' },
             { label: 'Campaigns', slug: 'features/campaigns' },
             { label: 'WhatsApp Flows', slug: 'features/whatsapp-flows' },
+            { label: 'WhatsApp Coexistence', slug: 'features/whatsapp-coexistence' },
             { label: 'Calling', slug: 'features/calling' },
           ],
         },

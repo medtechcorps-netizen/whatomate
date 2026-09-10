@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/valyala/fasthttp"
@@ -925,38 +927,74 @@ func (a *App) MergeContact(r *fastglue.Request) error {
 	if req.SourceContactID == uuid.Nil || req.SourceContactID == targetID {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "source_contact_id must identify a different contact", nil, "")
 	}
-
-	if err := a.authorizeContactMergePair(a.DB, orgID, userID, targetID, req.SourceContactID); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Source or target contact not found", nil, "")
+	if req.Confirm {
+		req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
+		if req.IdempotencyKey == "" || len(req.IdempotencyKey) > 180 {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "idempotency_key is required for a confirmed merge", nil, "")
 		}
-		return a.customerWorkspaceLoadError(r, err)
-	}
-	preview, err := buildContactMergePreview(a.DB, orgID, targetID, req.SourceContactID)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Source or target contact not found", nil, "")
+	} else {
+		if err := a.authorizeContactMergePair(a.DB, orgID, userID, targetID, req.SourceContactID); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Source or target contact not found", nil, "")
+			}
+			return a.customerWorkspaceLoadError(r, err)
 		}
-		return a.customerWorkspaceLoadError(r, err)
-	}
-	if !req.Confirm {
+		preview, err := buildContactMergePreview(a.DB, orgID, targetID, req.SourceContactID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Source or target contact not found", nil, "")
+			}
+			return a.customerWorkspaceLoadError(r, err)
+		}
 		return r.SendEnvelope(preview)
-	}
-	req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
-	if req.IdempotencyKey == "" || len(req.IdempotencyKey) > 180 {
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "idempotency_key is required for a confirmed merge", nil, "")
-	}
-	if len(preview.Collisions) > 0 {
-		return r.SendErrorEnvelope(
-			fasthttp.StatusConflict,
-			"Merge has unresolved collisions; review the preview before retrying",
-			map[string]any{"collisions": preview.Collisions},
-			"",
-		)
 	}
 
 	var target models.Contact
+	responsePreserved := map[string]int64{}
+	var responseCollisions []string
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := database.LockOrganizationPolicyScope(tx, orgID); err != nil {
+			return fmt.Errorf("lock contact merge policy scope: %w", err)
+		}
+
+		var replay models.CustomerActivityEvent
+		replayErr := tx.Where(
+			"organization_id = ? AND idempotency_key = ?",
+			orgID,
+			"contact-merge:"+req.IdempotencyKey,
+		).First(&replay).Error
+		if replayErr == nil {
+			canonicalTarget, err := customerWorkspaceCanonicalContactForUpdate(tx, orgID, targetID)
+			if err != nil {
+				return err
+			}
+			targetVisible, err := a.customerWorkspaceCanAccessContact(tx, orgID, userID, canonicalTarget)
+			if err != nil {
+				return err
+			}
+			if !targetVisible {
+				return gorm.ErrRecordNotFound
+			}
+			if replay.ContactID != targetID ||
+				replay.EventType != models.CustomerActivityContactMerged ||
+				replay.SourceObjectType != "contact" ||
+				replay.SourceObjectID == nil ||
+				*replay.SourceObjectID != req.SourceContactID {
+				return newProductCRMClientError(
+					fasthttp.StatusConflict,
+					"Contact merge idempotency key was reused for a different merge",
+				)
+			}
+			responsePreserved, err = contactMergePreservedCounts(replay.Metadata)
+			if err != nil {
+				return fmt.Errorf("read contact merge replay metadata: %w", err)
+			}
+			return nil
+		}
+		if !errors.Is(replayErr, gorm.ErrRecordNotFound) {
+			return replayErr
+		}
+
 		targetFamilyIDs, err := customerWorkspaceContactFamilyIDs(tx, orgID, targetID)
 		if err != nil {
 			return err
@@ -1009,32 +1047,13 @@ func (a *App) MergeContact(r *fastglue.Request) error {
 		if !targetVisible {
 			return gorm.ErrRecordNotFound
 		}
+
 		if source.MergedIntoID != nil {
 			if *source.MergedIntoID == target.ID {
-				var replay models.CustomerActivityEvent
-				if err := tx.Where(
-					`organization_id = ?
-					 AND idempotency_key = ?
-					 AND contact_id = ?
-					 AND event_type = ?
-					 AND source_object_type = ?
-					 AND source_object_id = ?`,
-					orgID,
-					"contact-merge:"+req.IdempotencyKey,
-					target.ID,
-					models.CustomerActivityContactMerged,
-					"contact",
-					source.ID,
-				).First(&replay).Error; err != nil {
-					if errors.Is(err, gorm.ErrRecordNotFound) {
-						return newProductCRMClientError(
-							fasthttp.StatusConflict,
-							"Source contact is already merged; the idempotency key does not match the original merge",
-						)
-					}
-					return err
-				}
-				return nil
+				return newProductCRMClientError(
+					fasthttp.StatusConflict,
+					"Source contact is already merged; the idempotency key does not match the original merge",
+				)
 			}
 			return newProductCRMClientError(fasthttp.StatusConflict, "Source contact is already merged elsewhere")
 		}
@@ -1047,6 +1066,27 @@ func (a *App) MergeContact(r *fastglue.Request) error {
 		}
 		if !sourceVisible {
 			return gorm.ErrRecordNotFound
+		}
+
+		var openIdentityReviewMemberships int64
+		if err := tx.Table("whatsapp_identity_review_members AS member").
+			Joins(`JOIN whatsapp_identity_review_holds AS hold
+				ON hold.organization_id = member.organization_id
+				AND hold.id = member.hold_id`).
+			Where(
+				"member.organization_id = ? AND member.contact_id IN ? AND hold.disposition = ?",
+				orgID,
+				ids,
+				models.WhatsAppIdentityReviewDispositionOpen,
+			).
+			Count(&openIdentityReviewMemberships).Error; err != nil {
+			return fmt.Errorf("inspect contact merge identity-review holds: %w", err)
+		}
+		if openIdentityReviewMemberships > 0 {
+			return newProductCRMClientError(
+				fasthttp.StatusConflict,
+				"Contact merge is blocked while WhatsApp identity review is open",
+			)
 		}
 
 		contactFamilyIDs := append(append([]uuid.UUID{}, targetFamilyIDs...), sourceFamilyIDs...)
@@ -1084,8 +1124,13 @@ func (a *App) MergeContact(r *fastglue.Request) error {
 			return err
 		}
 		if len(freshPreview.Collisions) > 0 {
-			return newProductCRMClientError(fasthttp.StatusConflict, "Merge acquired new collisions; preview again")
+			responseCollisions = append([]string(nil), freshPreview.Collisions...)
+			return newProductCRMClientError(
+				fasthttp.StatusConflict,
+				"Merge has unresolved collisions; review the preview before retrying",
+			)
 		}
+		responsePreserved = freshPreview.Preserved
 
 		for _, table := range []string{
 			"messages",
@@ -1216,7 +1261,11 @@ func (a *App) MergeContact(r *fastglue.Request) error {
 	if err != nil {
 		var clientErr *productCRMClientError
 		if errors.As(err, &clientErr) {
-			return r.SendErrorEnvelope(clientErr.status, clientErr.message, nil, "")
+			var details any
+			if len(responseCollisions) > 0 {
+				details = map[string]any{"collisions": responseCollisions}
+			}
+			return r.SendErrorEnvelope(clientErr.status, clientErr.message, details, "")
 		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Source or target contact not found", nil, "")
@@ -1225,10 +1274,58 @@ func (a *App) MergeContact(r *fastglue.Request) error {
 	}
 	return r.SendEnvelope(map[string]any{
 		"merged":            true,
-		"target_contact_id": target.ID,
+		"target_contact_id": targetID,
 		"source_contact_id": req.SourceContactID,
-		"preserved":         preview.Preserved,
+		"preserved":         responsePreserved,
 	})
+}
+
+func customerWorkspaceCanonicalContactForUpdate(
+	tx *gorm.DB,
+	orgID, contactID uuid.UUID,
+) (*models.Contact, error) {
+	seen := make(map[uuid.UUID]struct{})
+	currentID := contactID
+	for len(seen) <= 10000 {
+		if _, exists := seen[currentID]; exists {
+			return nil, errors.New("contact merge chain contains a cycle")
+		}
+		seen[currentID] = struct{}{}
+
+		var contact models.Contact
+		if err := tx.Unscoped().Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("organization_id = ? AND id = ?", orgID, currentID).
+			First(&contact).Error; err != nil {
+			return nil, err
+		}
+		if contact.MergedIntoID == nil {
+			if contact.DeletedAt.Valid {
+				return nil, gorm.ErrRecordNotFound
+			}
+			return &contact, nil
+		}
+		currentID = *contact.MergedIntoID
+	}
+	return nil, errors.New("contact merge chain exceeds safety limit")
+}
+
+func contactMergePreservedCounts(metadata models.JSONB) (map[string]int64, error) {
+	preserved := map[string]int64{}
+	raw, exists := metadata["preserved"]
+	if !exists || raw == nil {
+		return preserved, nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(encoded, &preserved); err != nil {
+		return nil, err
+	}
+	if preserved == nil {
+		preserved = map[string]int64{}
+	}
+	return preserved, nil
 }
 
 func buildContactMergePreview(

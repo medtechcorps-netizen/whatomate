@@ -25,6 +25,7 @@ const (
 	defaultChannelAIReplyBatchSize    = 20
 	defaultChannelAIReplyPollInterval = time.Second
 	defaultChannelAIReplyLease        = 2 * time.Minute
+	defaultChannelAIAttemptTimeout    = 2 * time.Minute
 	maxChannelAIReplyTokens           = 160
 	maxChannelAIContextRunes          = 16000
 	maxChannelAIReplyRunes            = 4000
@@ -55,6 +56,8 @@ type channelAIReplyCheck struct {
 	ManagedInstagram bool
 	AlreadySettled   bool
 }
+
+const channelAIManagedGenerationDigestKey = "provider_attempt_managed_generation_sha256"
 
 // RunChannelAIReplies runs the durable Qwen reply loop until cancellation.
 func (w *Worker) RunChannelAIReplies(ctx context.Context) error {
@@ -206,11 +209,12 @@ func (w *Worker) claimChannelAIReplyJob(
 		now := time.Now().UTC()
 		staleBefore := now.Add(-defaultChannelAIReplyLease)
 		var candidate struct {
-			ID     uuid.UUID
-			Status models.ScheduledJobStatus
+			ID      uuid.UUID
+			Status  models.ScheduledJobStatus
+			Payload models.JSONB `gorm:"type:jsonb"`
 		}
 		if err := tx.Raw(`
-			SELECT id, status
+			SELECT id, status, payload
 			FROM scheduled_jobs
 			WHERE organization_id = ?
 			  AND deleted_at IS NULL
@@ -241,11 +245,36 @@ func (w *Worker) claimChannelAIReplyJob(
 			return nil
 		}
 		if candidate.Status == models.ScheduledJobStatusGenerating {
-			// `generating` means customer text may already have reached Qwen.
-			// Without a provider idempotency contract it is unsafe to replay that
-			// request after a crash or lease loss under any credential generation.
-			// Discover the stale row so it cannot stick forever, but terminally
-			// settle the ambiguity instead of reclaiming it to processing.
+			// A separately committed, digest-valid result can be finalized without
+			// another Qwen call. Every other stale generating state is terminally
+			// ambiguous and must never be replayed.
+			_, resolved := channelAIReplyDurableResolvedResult(candidate.Payload)
+			if resolved {
+				result := tx.Model(&models.ScheduledJob{}).
+					Where(
+						"id = ? AND organization_id = ? AND kind = ? AND status = ? AND (locked_at IS NULL OR locked_at < ?)",
+						candidate.ID,
+						organizationID,
+						models.ScheduledJobKindChannelAIReply,
+						models.ScheduledJobStatusGenerating,
+						staleBefore,
+					).
+					Updates(map[string]any{
+						"locked_at":  now,
+						"locked_by":  workerID,
+						"last_error": "",
+						"updated_at": now,
+					})
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return errors.New("channel AI resolved result recovery lost its lease")
+				}
+				jobID = candidate.ID
+				claimed = true
+				return nil
+			}
 			result := tx.Model(&models.ScheduledJob{}).
 				Where(
 					"id = ? AND organization_id = ? AND kind = ? AND status = ? AND (locked_at IS NULL OR locked_at < ?)",
@@ -258,10 +287,13 @@ func (w *Worker) claimChannelAIReplyJob(
 				Updates(map[string]any{
 					"status":       models.ScheduledJobStatusCancelled,
 					"completed_at": now,
-					"last_error":   "managed_instagram_generation_ambiguous_after_lease_loss",
-					"locked_at":    nil,
-					"locked_by":    "",
-					"updated_at":   now,
+					"last_error": channelAIReplyGenerationAmbiguityCode(
+						candidate.Payload,
+						"lease_loss",
+					),
+					"locked_at":  nil,
+					"locked_by":  "",
+					"updated_at": now,
 				})
 			if result.Error != nil {
 				return result.Error
@@ -301,12 +333,93 @@ func (w *Worker) processChannelAIReplyJob(
 	organizationID, jobID uuid.UUID,
 	workerID string,
 ) error {
-	check, err := w.authorizeChannelAIReplyGeneration(
-		organizationID,
-		jobID,
-		workerID,
-	)
+	recovered, recoveredResult, expectedManagedAccount, settled, err :=
+		w.loadClaimedChannelAIReplyResolvedResult(
+			organizationID,
+			jobID,
+			workerID,
+		)
 	if err != nil {
+		return err
+	}
+	if settled {
+		return nil
+	}
+	if recovered {
+		if expectedManagedAccount != nil {
+			return w.finalizeChannelAIReply(
+				organizationID,
+				jobID,
+				workerID,
+				recoveredResult,
+				expectedManagedAccount,
+			)
+		}
+		return w.finalizeChannelAIReply(
+			organizationID,
+			jobID,
+			workerID,
+			recoveredResult,
+		)
+	}
+	var (
+		check            channelAIReplyCheck
+		response         string
+		providerErr      error
+		attemptRecordErr error
+		attempted        bool
+	)
+	if err := w.withChannelAIPhysicalAttempt(
+		ctx,
+		organizationID,
+		func(attemptCtx context.Context) error {
+			var err error
+			check, err = w.authorizeChannelAIReplyGenerationWithinAttempt(
+				organizationID,
+				jobID,
+				workerID,
+			)
+			if err != nil || check.AlreadySettled || check.AlreadyQueued ||
+				check.CancelReason != "" {
+				return err
+			}
+
+			baseURL := qwenapi.DefaultBaseURL
+			if w.Config != nil && w.Config.AI.QwenBaseURL != "" {
+				baseURL = w.Config.AI.QwenBaseURL
+			}
+			if strings.TrimSpace(check.Snapshot.BaseURL) != "" {
+				baseURL = check.Snapshot.BaseURL
+			}
+			attempted = true
+			response, providerErr = qwenapi.Generate(
+				attemptCtx,
+				w.QwenHTTP,
+				qwenapi.Options{
+					APIKey:      check.Snapshot.APIKey,
+					BaseURL:     baseURL,
+					Model:       check.Snapshot.Settings.AI.Model,
+					MaxTokens:   check.Snapshot.MaxTokens,
+					Temperature: check.Snapshot.Settings.AI.Temperature,
+					Messages:    check.Snapshot.Messages,
+				},
+			)
+			if providerErr == nil {
+				response, providerErr = normalizeChannelAIReply(response)
+			}
+			attemptRecordErr = w.persistChannelAIReplyProviderAttemptResult(
+				organizationID,
+				jobID,
+				workerID,
+				response,
+				providerErr,
+			)
+			// The provider result or uncertainty is now a separate durable
+			// commit. Final message/outbox settlement follows after the outer
+			// organization attempt fence is released.
+			return nil
+		},
+	); err != nil {
 		return err
 	}
 	if check.AlreadySettled {
@@ -330,37 +443,29 @@ func (w *Worker) processChannelAIReplyJob(
 			check.CancelReason,
 		)
 	}
-
-	baseURL := qwenapi.DefaultBaseURL
-	if w.Config != nil && w.Config.AI.QwenBaseURL != "" {
-		baseURL = w.Config.AI.QwenBaseURL
+	if !attempted {
+		return errors.New("channel AI generation did not cross its durable attempt fence")
 	}
-	if strings.TrimSpace(check.Snapshot.BaseURL) != "" {
-		baseURL = check.Snapshot.BaseURL
-	}
-	response, err := qwenapi.Generate(ctx, w.QwenHTTP, qwenapi.Options{
-		APIKey:      check.Snapshot.APIKey,
-		BaseURL:     baseURL,
-		Model:       check.Snapshot.Settings.AI.Model,
-		MaxTokens:   check.Snapshot.MaxTokens,
-		Temperature: check.Snapshot.Settings.AI.Temperature,
-		Messages:    check.Snapshot.Messages,
-	})
-	if err != nil {
-		return w.failChannelAIReplyJob(
-			organizationID,
-			&check.Snapshot.Job,
-			workerID,
-			err,
+	if attemptRecordErr != nil {
+		recordFailure := errors.New(
+			"channel AI provider attempt result could not be recorded",
+		)
+		return errors.Join(
+			w.failChannelAIReplyJob(
+				organizationID,
+				&check.Snapshot.Job,
+				workerID,
+				recordFailure,
+			),
+			attemptRecordErr,
 		)
 	}
-	response, err = normalizeChannelAIReply(response)
-	if err != nil {
+	if providerErr != nil {
 		return w.failChannelAIReplyJob(
 			organizationID,
 			&check.Snapshot.Job,
 			workerID,
-			err,
+			providerErr,
 		)
 	}
 	if check.ManagedInstagram {
@@ -375,6 +480,252 @@ func (w *Worker) processChannelAIReplyJob(
 	return w.finalizeChannelAIReply(organizationID, jobID, workerID, response)
 }
 
+func (w *Worker) loadClaimedChannelAIReplyResolvedResult(
+	organizationID, jobID uuid.UUID,
+	workerID string,
+) (bool, string, *models.ChannelAccount, bool, error) {
+	var (
+		response               string
+		expectedManagedAccount *models.ChannelAccount
+		recovered              bool
+		settled                bool
+	)
+	err := database.WithTenantReadCommitted(w.DB, organizationID, func(tx *gorm.DB) error {
+		if err := lockChannelOutboxOrganizationScopeTx(tx, organizationID); err != nil {
+			return err
+		}
+		var job models.ScheduledJob
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+			"id = ? AND organization_id = ? AND kind = ? AND status = ? AND locked_by = ?",
+			jobID,
+			organizationID,
+			models.ScheduledJobKindChannelAIReply,
+			models.ScheduledJobStatusGenerating,
+			workerID,
+		).First(&job).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		var ok bool
+		response, ok = channelAIReplyDurableResolvedResult(job.Payload)
+		if !ok {
+			return errors.New("claimed channel AI recovery result is invalid")
+		}
+		account, managedInstagram, err := lockChannelAIReplyGenerationBindingTx(
+			tx,
+			organizationID,
+			&job,
+		)
+		if err != nil {
+			return err
+		}
+		if managedInstagram {
+			expectedDigest, _ := job.Payload[channelAIManagedGenerationDigestKey].(string)
+			currentDigest, valid := channelAIManagedGenerationDigest(account)
+			if !valid || strings.TrimSpace(expectedDigest) == "" ||
+				!strings.EqualFold(strings.TrimSpace(expectedDigest), currentDigest) {
+				if err := settleChannelAIReplyJobTx(
+					tx,
+					organizationID,
+					job.ID,
+					workerID,
+					models.ScheduledJobStatusCancelled,
+					"managed_instagram_generation_not_authorized",
+				); err != nil {
+					return err
+				}
+				settled = true
+				return nil
+			}
+			expectedManagedAccount = account
+		}
+		recovered = true
+		return nil
+	})
+	return recovered, response, expectedManagedAccount, settled, err
+}
+
+func channelAIReplyDurableResolvedResult(payload models.JSONB) (string, bool) {
+	if payload == nil {
+		return "", false
+	}
+	state, _ := payload["provider_attempt_state"].(string)
+	response, _ := payload["provider_result"].(string)
+	digest, _ := payload["provider_result_sha256"].(string)
+	response = strings.TrimSpace(response)
+	digest = strings.TrimSpace(digest)
+	if state != "resolved" || response == "" || len(digest) != sha256.Size*2 ||
+		digest != strings.ToLower(digest) {
+		return "", false
+	}
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != sha256.Size {
+		return "", false
+	}
+	want := sha256.Sum256([]byte(response))
+	if !strings.EqualFold(digest, hex.EncodeToString(want[:])) {
+		return "", false
+	}
+	return response, true
+}
+
+func channelAIManagedGenerationDigest(account *models.ChannelAccount) (string, bool) {
+	if account == nil {
+		return "", false
+	}
+	generation, ok := managedMetaCurrentCredentialGeneration(
+		account.Credentials,
+		time.Now().UTC(),
+	)
+	if !ok {
+		return "", false
+	}
+	canonical, err := json.Marshal(struct {
+		OrganizationID    uuid.UUID `json:"organization_id"`
+		AccountID         uuid.UUID `json:"account_id"`
+		Channel           string    `json:"channel"`
+		Provider          string    `json:"provider"`
+		ExternalAccountID string    `json:"external_account_id"`
+		PlatformAppID     string    `json:"platform_app_id"`
+		OAuthID           uuid.UUID `json:"oauth_id"`
+		OAuthVersion      int       `json:"oauth_version"`
+		WebhookID         uuid.UUID `json:"webhook_id"`
+		WebhookVersion    int       `json:"webhook_version"`
+	}{
+		OrganizationID:    account.OrganizationID,
+		AccountID:         account.ID,
+		Channel:           string(account.Channel),
+		Provider:          account.Provider,
+		ExternalAccountID: account.ExternalAccountID,
+		PlatformAppID:     channelOutboxText(account.Metadata["meta_platform_app_id"]),
+		OAuthID:           generation.OAuthID,
+		OAuthVersion:      generation.OAuthVersion,
+		WebhookID:         generation.WebhookID,
+		WebhookVersion:    generation.WebhookVersion,
+	})
+	if err != nil {
+		return "", false
+	}
+	digest := sha256.Sum256(canonical)
+	return hex.EncodeToString(digest[:]), true
+}
+
+func (w *Worker) persistChannelAIReplyProviderAttemptResult(
+	organizationID, jobID uuid.UUID,
+	workerID, response string,
+	providerErr error,
+) error {
+	return database.WithTenantReadCommitted(
+		w.DB,
+		organizationID,
+		func(tx *gorm.DB) error {
+			var job models.ScheduledJob
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+				"id = ? AND organization_id = ? AND kind = ? AND status = ? AND locked_by = ?",
+				jobID,
+				organizationID,
+				models.ScheduledJobKindChannelAIReply,
+				models.ScheduledJobStatusGenerating,
+				workerID,
+			).First(&job).Error; err != nil {
+				return err
+			}
+			payload := cloneChannelAIReplyPayload(job.Payload)
+			payload["provider_attempt_recorded_at"] =
+				time.Now().UTC().Format(time.RFC3339Nano)
+			if providerErr == nil && strings.TrimSpace(response) != "" {
+				digest := sha256.Sum256([]byte(response))
+				payload["provider_attempt_state"] = "resolved"
+				payload["provider_result"] = response
+				payload["provider_result_sha256"] = hex.EncodeToString(digest[:])
+			} else {
+				payload["provider_attempt_state"] = "uncertain"
+				delete(payload, "provider_result")
+				delete(payload, "provider_result_sha256")
+			}
+			now := time.Now().UTC()
+			result := tx.Model(&models.ScheduledJob{}).Where(
+				"id = ? AND organization_id = ? AND kind = ? AND status = ? AND locked_by = ?",
+				job.ID,
+				organizationID,
+				models.ScheduledJobKindChannelAIReply,
+				models.ScheduledJobStatusGenerating,
+				workerID,
+			).Updates(map[string]any{
+				"payload":    payload,
+				"locked_at":  now,
+				"updated_at": now,
+			})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errors.New("channel AI provider result record lost its lease")
+			}
+			return nil
+		},
+	)
+}
+
+func cloneChannelAIReplyPayload(source models.JSONB) models.JSONB {
+	result := make(models.JSONB, len(source)+4)
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func channelAIReplyGenerationAmbiguityCode(payload models.JSONB, cause string) string {
+	prefix := "channel_ai_generation"
+	if channelAIReplyHasManagedGenerationMarker(payload) {
+		prefix = "managed_instagram_generation"
+	}
+	return prefix + "_ambiguous_after_" + cause
+}
+
+func channelAIReplyHasManagedGenerationMarker(payload models.JSONB) bool {
+	digest, _ := payload[channelAIManagedGenerationDigestKey].(string)
+	return strings.TrimSpace(digest) != ""
+}
+
+// withChannelAIPhysicalAttempt holds only the tenant organization row across
+// one Qwen call. Generation authorization commits on a separate connection
+// before the call, and result/uncertainty settlement commits separately after
+// the call, so no Contact, ScheduledJob, account, credential, or outbox lock is
+// held over the network.
+func (w *Worker) withChannelAIPhysicalAttempt(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	attempt func(context.Context) error,
+) error {
+	if w == nil || w.DB == nil || organizationID == uuid.Nil || attempt == nil {
+		return errors.New("channel AI physical attempt identity is incomplete")
+	}
+	if err := database.RequireIndependentAIAttemptConnections(w.DB); err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultChannelAIAttemptTimeout)
+	defer cancel()
+	return database.WithTenantReadCommitted(
+		w.DB.WithContext(attemptCtx),
+		organizationID,
+		func(guardTx *gorm.DB) error {
+			if err := database.LockOrganizationAIAttemptScope(
+				guardTx,
+				organizationID,
+			); err != nil {
+				return err
+			}
+			return attempt(attemptCtx)
+		},
+	)
+}
+
 // authorizeChannelAIReplyGeneration is the last authorization boundary before
 // customer text may leave the process for Qwen. Managed Instagram uses the
 // same organizations.id mutex as lifecycle writers and takes locks in the
@@ -385,10 +736,37 @@ func (w *Worker) authorizeChannelAIReplyGeneration(
 	organizationID, jobID uuid.UUID,
 	workerID string,
 ) (channelAIReplyCheck, error) {
+	return w.authorizeChannelAIReplyGenerationWithFence(
+		organizationID,
+		jobID,
+		workerID,
+		false,
+	)
+}
+
+func (w *Worker) authorizeChannelAIReplyGenerationWithinAttempt(
+	organizationID, jobID uuid.UUID,
+	workerID string,
+) (channelAIReplyCheck, error) {
+	return w.authorizeChannelAIReplyGenerationWithFence(
+		organizationID,
+		jobID,
+		workerID,
+		true,
+	)
+}
+
+func (w *Worker) authorizeChannelAIReplyGenerationWithFence(
+	organizationID, jobID uuid.UUID,
+	workerID string,
+	physicalAttemptFenceHeld bool,
+) (channelAIReplyCheck, error) {
 	var check channelAIReplyCheck
 	err := database.WithTenantReadCommitted(w.DB, organizationID, func(tx *gorm.DB) error {
-		if err := lockChannelOutboxOrganizationScopeTx(tx, organizationID); err != nil {
-			return err
+		if !physicalAttemptFenceHeld {
+			if err := lockChannelOutboxOrganizationScopeTx(tx, organizationID); err != nil {
+				return err
+			}
 		}
 		var job models.ScheduledJob
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
@@ -429,46 +807,65 @@ func (w *Worker) authorizeChannelAIReplyGeneration(
 			return err
 		}
 		check = resolved
-		if !managedInstagram {
-			return nil
-		}
-		check.ManagedInstagram = true
+		if managedInstagram {
+			check.ManagedInstagram = true
 
-		settleManaged := func(status models.ScheduledJobStatus, reason string) error {
-			if err := settleChannelAIReplyJobTx(
-				tx,
-				organizationID,
-				job.ID,
-				workerID,
-				status,
-				reason,
-			); err != nil {
-				return err
+			settleManaged := func(status models.ScheduledJobStatus, reason string) error {
+				if err := settleChannelAIReplyJobTx(
+					tx,
+					organizationID,
+					job.ID,
+					workerID,
+					status,
+					reason,
+				); err != nil {
+					return err
+				}
+				check.AlreadySettled = true
+				return nil
 			}
-			check.AlreadySettled = true
+			if check.AlreadyQueued {
+				return settleManaged(models.ScheduledJobStatusCompleted, "")
+			}
+			if check.CancelReason != "" {
+				return settleManaged(models.ScheduledJobStatusCancelled, check.CancelReason)
+			}
+			if lockedAccount == nil ||
+				lockedAccount.ID != check.Snapshot.Account.ID ||
+				lockedAccount.OrganizationID != organizationID ||
+				!w.managedInstagramChannelAIGenerationAllowed(
+					lockedAccount,
+					time.Now().UTC(),
+				) {
+				check.CancelReason = "managed_instagram_generation_not_authorized"
+				return settleManaged(
+					models.ScheduledJobStatusCancelled,
+					check.CancelReason,
+				)
+			}
+		} else if check.AlreadyQueued || check.CancelReason != "" {
+			// Ordinary relay jobs retain their existing settlement path outside
+			// this authorization transaction. No provider call follows.
 			return nil
 		}
-		if check.AlreadyQueued {
-			return settleManaged(models.ScheduledJobStatusCompleted, "")
-		}
-		if check.CancelReason != "" {
-			return settleManaged(models.ScheduledJobStatusCancelled, check.CancelReason)
-		}
-		if lockedAccount == nil ||
-			lockedAccount.ID != check.Snapshot.Account.ID ||
-			lockedAccount.OrganizationID != organizationID ||
-			!w.managedInstagramChannelAIGenerationAllowed(
-				lockedAccount,
-				time.Now().UTC(),
-			) {
-			check.CancelReason = "managed_instagram_generation_not_authorized"
-			return settleManaged(
-				models.ScheduledJobStatusCancelled,
-				check.CancelReason,
-			)
-		}
 
+		// Every IG/Messenger Qwen request, not only managed Instagram, must
+		// durably cross the pre-attempt boundary before customer text leaves
+		// the process. A later lease recovery therefore cannot mistake an
+		// admitted physical attempt for work that never started.
 		now := time.Now().UTC()
+		payload := cloneChannelAIReplyPayload(job.Payload)
+		payload["provider_attempt_state"] = "started"
+		delete(payload, "provider_result")
+		delete(payload, "provider_result_sha256")
+		delete(payload, channelAIManagedGenerationDigestKey)
+		if managedInstagram {
+			generationDigest, valid := channelAIManagedGenerationDigest(lockedAccount)
+			if !valid {
+				return errors.New("managed Instagram generation identity is unavailable")
+			}
+			payload[channelAIManagedGenerationDigestKey] = generationDigest
+		}
 		result := tx.Model(&models.ScheduledJob{}).
 			Where(
 				"id = ? AND organization_id = ? AND kind = ? AND status = ? AND locked_by = ?",
@@ -480,6 +877,7 @@ func (w *Worker) authorizeChannelAIReplyGeneration(
 			).
 			Updates(map[string]any{
 				"status":     models.ScheduledJobStatusGenerating,
+				"payload":    payload,
 				"locked_at":  now,
 				"updated_at": now,
 			})
@@ -490,6 +888,7 @@ func (w *Worker) authorizeChannelAIReplyGeneration(
 			return errors.New("channel AI reply generation fence lost its lease")
 		}
 		check.Snapshot.Job.Status = models.ScheduledJobStatusGenerating
+		check.Snapshot.Job.Payload = payload
 		check.Snapshot.Job.LockedAt = &now
 		check.Snapshot.Account.Credentials = lockedAccount.Credentials
 		return nil
@@ -694,6 +1093,19 @@ func (w *Worker) checkChannelAIReplyEligibility(
 	}
 	if channelAIReplyBoolValue(conversation.Config[models.ConversationConfigAIPaused]) {
 		check.CancelReason = "conversation_ai_paused"
+		return check, nil
+	}
+	identityBlocked, identityErr := database.ContactHasBlockingIdentityReviewHold(
+		tx,
+		organizationID,
+		conversation.ContactID,
+	)
+	if identityErr != nil {
+		check.CancelReason = "identity_review_state_unavailable"
+		return check, nil
+	}
+	if identityBlocked {
+		check.CancelReason = "identity_review_active"
 		return check, nil
 	}
 
@@ -1104,7 +1516,7 @@ func (w *Worker) finalizeChannelAIReply(
 				check.CancelReason,
 			)
 		}
-		managedGeneration := job.Status == models.ScheduledJobStatusGenerating
+		managedGeneration := channelAIReplyHasManagedGenerationMarker(job.Payload)
 		if managedGeneration || freshManagedInstagram {
 			var expectedGeneration, currentGeneration managedMetaCredentialGeneration
 			expectedGenerationOK := false
@@ -1364,7 +1776,10 @@ func (w *Worker) failChannelAIReplyJob(
 			"updated_at": now,
 		}
 		if providerAttemptAmbiguous {
-			updates["last_error"] = "managed_instagram_generation_ambiguous_after_qwen_error: " + errorMessage
+			updates["last_error"] = channelAIReplyGenerationAmbiguityCode(
+				job.Payload,
+				"qwen_error",
+			) + ": " + errorMessage
 		}
 		if deadLetter {
 			updates["completed_at"] = now

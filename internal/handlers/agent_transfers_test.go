@@ -293,6 +293,172 @@ func TestApp_ListAgentTransfers_Pagination(t *testing.T) {
 	assert.Equal(t, 1, result.Data.Offset)
 }
 
+func TestApp_ListAgentTransfers_ExactContactBeyondFirstFIFOPage(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	baseTime := time.Now().UTC().Add(-3 * time.Hour)
+
+	for i := 0; i < 100; i++ {
+		contact := testutil.CreateTestContact(t, app.DB, org.ID)
+		transfer := createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, nil)
+		require.NoError(t, app.DB.Model(transfer).
+			Update("transferred_at", baseTime.Add(time.Duration(i)*time.Second)).Error)
+	}
+
+	targetContact := testutil.CreateTestContact(t, app.DB, org.ID)
+	targetTransfer := createTestTransfer(t, app, org.ID, targetContact.ID, account.Name, models.TransferStatusActive, nil)
+	require.NoError(t, app.DB.Model(targetTransfer).
+		Update("transferred_at", baseTime.Add(2*time.Hour)).Error)
+
+	firstPageReq := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(firstPageReq, org.ID, user.ID)
+	testutil.SetQueryParam(firstPageReq, "status", string(models.TransferStatusActive))
+	require.NoError(t, app.ListAgentTransfers(firstPageReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(firstPageReq))
+
+	var firstPage struct {
+		Data struct {
+			Transfers []handlers.AgentTransferResponse `json:"transfers"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(firstPageReq), &firstPage))
+	require.Len(t, firstPage.Data.Transfers, 100)
+	for _, transfer := range firstPage.Data.Transfers {
+		assert.NotEqual(t, targetTransfer.ID.String(), transfer.ID)
+	}
+
+	exactReq := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(exactReq, org.ID, user.ID)
+	testutil.SetQueryParam(exactReq, "status", string(models.TransferStatusActive))
+	testutil.SetQueryParam(exactReq, "contact_id", targetContact.ID.String())
+	testutil.SetQueryParam(exactReq, "limit", "1")
+	require.NoError(t, app.ListAgentTransfers(exactReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(exactReq))
+
+	var exactResult struct {
+		Data struct {
+			Transfers  []handlers.AgentTransferResponse `json:"transfers"`
+			TotalCount int64                            `json:"total_count"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(exactReq), &exactResult))
+	require.Len(t, exactResult.Data.Transfers, 1)
+	assert.Equal(t, targetTransfer.ID.String(), exactResult.Data.Transfers[0].ID)
+	assert.Equal(t, int64(1), exactResult.Data.TotalCount)
+}
+
+func TestApp_ListAgentTransfers_ExactContactIsTenantScoped(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+
+	otherOrg := testutil.CreateTestOrganization(t, app.DB)
+	otherAccount := testutil.CreateTestWhatsAppAccount(t, app.DB, otherOrg.ID)
+	otherContact := testutil.CreateTestContact(t, app.DB, otherOrg.ID)
+	createTestTransfer(t, app, otherOrg.ID, otherContact.ID, otherAccount.Name, models.TransferStatusActive, nil)
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetQueryParam(req, "status", string(models.TransferStatusActive))
+	testutil.SetQueryParam(req, "contact_id", otherContact.ID.String())
+	require.NoError(t, app.ListAgentTransfers(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	var result struct {
+		Data struct {
+			Transfers  []handlers.AgentTransferResponse `json:"transfers"`
+			TotalCount int64                            `json:"total_count"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &result))
+	assert.Empty(t, result.Data.Transfers)
+	assert.Zero(t, result.Data.TotalCount)
+}
+
+func TestApp_ListAgentTransfers_ExactContactIsVisibleToCreatorAfterAssignment(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	creator := createTestAgent(t, app, org.ID)
+	assignedAgent := createTestAgent(t, app, org.ID)
+	otherAgent := createTestAgent(t, app, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	transfer := createTestTransfer(
+		t,
+		app,
+		org.ID,
+		contact.ID,
+		"creator-visibility",
+		models.TransferStatusActive,
+		&assignedAgent.ID,
+	)
+	require.NoError(t, app.DB.Model(transfer).Updates(map[string]any{
+		"transferred_by_user_id": creator.ID,
+		"source":                 models.TransferSourceManual,
+	}).Error)
+
+	exactReq := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(exactReq, org.ID, creator.ID)
+	testutil.SetQueryParam(exactReq, "status", string(models.TransferStatusActive))
+	testutil.SetQueryParam(exactReq, "contact_id", contact.ID.String())
+	require.NoError(t, app.ListAgentTransfers(exactReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(exactReq))
+
+	var exactResult struct {
+		Data struct {
+			Transfers  []handlers.AgentTransferResponse `json:"transfers"`
+			TotalCount int64                            `json:"total_count"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(exactReq), &exactResult))
+	require.Len(t, exactResult.Data.Transfers, 1)
+	assert.Equal(t, transfer.ID.String(), exactResult.Data.Transfers[0].ID)
+	assert.Equal(t, int64(1), exactResult.Data.TotalCount)
+
+	queueReq := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(queueReq, org.ID, creator.ID)
+	testutil.SetQueryParam(queueReq, "status", string(models.TransferStatusActive))
+	require.NoError(t, app.ListAgentTransfers(queueReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(queueReq))
+	var queueResult struct {
+		Data struct {
+			Transfers []handlers.AgentTransferResponse `json:"transfers"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(queueReq), &queueResult))
+	assert.Empty(t, queueResult.Data.Transfers)
+
+	otherReq := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(otherReq, org.ID, otherAgent.ID)
+	testutil.SetQueryParam(otherReq, "status", string(models.TransferStatusActive))
+	testutil.SetQueryParam(otherReq, "contact_id", contact.ID.String())
+	require.NoError(t, app.ListAgentTransfers(otherReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(otherReq))
+	var otherResult struct {
+		Data struct {
+			Transfers []handlers.AgentTransferResponse `json:"transfers"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(otherReq), &otherResult))
+	assert.Empty(t, otherResult.Data.Transfers)
+}
+
+func TestApp_ListAgentTransfers_RejectsInvalidContactFilter(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+
+	req := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetQueryParam(req, "contact_id", "not-a-uuid")
+	require.NoError(t, app.ListAgentTransfers(req))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+}
+
 // --- CreateAgentTransfer Tests ---
 
 func TestApp_CreateAgentTransfer_Success(t *testing.T) {
@@ -697,6 +863,87 @@ func TestApp_ResumeFromTransfer_DefaultAgentCanOnlyResumeOwnTransfer(t *testing.
 	testutil.SetPathParam(ownReq, "id", ownTransfer.ID.String())
 	require.NoError(t, app.ResumeFromTransfer(ownReq))
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(ownReq))
+}
+
+func TestApp_ResumeFromTransfer_DefaultAgentCanResumeOwnUnassignedManualTransfer(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	agent := createTestAgent(t, app, org.ID)
+	otherAgent := createTestAgent(t, app, org.ID)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	createReq := testutil.NewJSONRequest(t, map[string]any{
+		"contact_id":       contact.ID.String(),
+		"whatsapp_account": account.Name,
+		"source":           models.TransferSourceManual,
+	})
+	testutil.SetAuthContext(createReq, org.ID, agent.ID)
+	require.NoError(t, app.CreateAgentTransfer(createReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(createReq))
+
+	var created struct {
+		Data struct {
+			Transfer handlers.AgentTransferResponse `json:"transfer"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(createReq), &created))
+	require.Nil(t, created.Data.Transfer.AgentID)
+	require.NotNil(t, created.Data.Transfer.TransferredBy)
+	require.Equal(t, agent.ID.String(), *created.Data.Transfer.TransferredBy)
+
+	otherReq := testutil.NewJSONRequest(t, nil)
+	testutil.SetAuthContext(otherReq, org.ID, otherAgent.ID)
+	testutil.SetPathParam(otherReq, "id", created.Data.Transfer.ID)
+	require.NoError(t, app.ResumeFromTransfer(otherReq))
+	require.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(otherReq))
+
+	var stillActive models.AgentTransfer
+	require.NoError(t, app.DB.First(&stillActive, "id = ?", created.Data.Transfer.ID).Error)
+	require.Equal(t, models.TransferStatusActive, stillActive.Status)
+
+	creatorReq := testutil.NewJSONRequest(t, nil)
+	testutil.SetAuthContext(creatorReq, org.ID, agent.ID)
+	testutil.SetPathParam(creatorReq, "id", created.Data.Transfer.ID)
+	require.NoError(t, app.ResumeFromTransfer(creatorReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(creatorReq))
+
+	var resumed models.AgentTransfer
+	require.NoError(t, app.DB.First(&resumed, "id = ?", created.Data.Transfer.ID).Error)
+	assert.Equal(t, models.TransferStatusResumed, resumed.Status)
+	require.NotNil(t, resumed.ResumedBy)
+	assert.Equal(t, agent.ID, *resumed.ResumedBy)
+}
+
+func TestApp_ResumeFromTransfer_DefaultAgentCannotResumeOwnManualTransferAssignedToAnotherAgent(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	creator := createTestAgent(t, app, org.ID)
+	assignedAgent := createTestAgent(t, app, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	transfer := createTestTransfer(
+		t,
+		app,
+		org.ID,
+		contact.ID,
+		"permission-test",
+		models.TransferStatusActive,
+		&assignedAgent.ID,
+	)
+	require.NoError(t, app.DB.Model(transfer).Updates(map[string]any{
+		"transferred_by_user_id": creator.ID,
+		"source":                 models.TransferSourceManual,
+	}).Error)
+
+	req := testutil.NewJSONRequest(t, nil)
+	testutil.SetAuthContext(req, org.ID, creator.ID)
+	testutil.SetPathParam(req, "id", transfer.ID.String())
+	require.NoError(t, app.ResumeFromTransfer(req))
+	require.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+	assert.Equal(t, models.TransferStatusActive, stored.Status)
 }
 
 func TestApp_ResumeFromTransfer_NotFound(t *testing.T) {

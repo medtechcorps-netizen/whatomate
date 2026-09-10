@@ -77,9 +77,35 @@ func (a *App) SetInboxConversationAIState(r *fastglue.Request) error {
 			"",
 		)
 	}
+	identityReviewState := FailClosedWhatsAppIdentityReviewEffectiveState(
+		"identity_review_read_failed",
+	)
+	identityStateErr := database.WithTenant(a.DB, organizationID, func(tx *gorm.DB) error {
+		var conversation models.InboxConversation
+		if err := tx.Select("contact_id").Where(
+			"id = ? AND organization_id = ?",
+			conversationID,
+			organizationID,
+		).First(&conversation).Error; err != nil {
+			return err
+		}
+		state, err := a.GetWhatsAppIdentityReviewEffectiveState(
+			tx,
+			organizationID,
+			conversation.ContactID,
+		)
+		identityReviewState = state
+		return err
+	})
+	if identityStateErr != nil {
+		identityReviewState = FailClosedWhatsAppIdentityReviewEffectiveState(
+			"identity_review_read_failed",
+		)
+	}
 	return r.SendEnvelope(map[string]any{
-		"conversation_id": conversationID,
-		"ai_paused":       inboxConversationAIIsPaused(config),
+		"conversation_id":          conversationID,
+		"ai_paused":                inboxConversationAIIsPaused(config),
+		"identity_review_ai_state": identityReviewState,
 		"ai_pause_reason": inboxConversationAIString(
 			config,
 			models.ConversationConfigAIPauseReason,

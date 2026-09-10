@@ -35,6 +35,10 @@ ROLLBACK_FLOORS = {
         "forbidden_targets": ["baseline"],
     },
 }
+HARDENED_BRIDGE_ROLLBACK_FLOOR = {
+    "allowed_targets": [],
+    "forbidden_targets": ["baseline"],
+}
 COMPONENT_COLLECTIONS = ("services", "jobs")
 EMPTY_COMPONENT_COLLECTIONS = ("workers", "static_sites", "functions")
 SOURCE_FIELDS = ("git", "dockerfile_path", "image")
@@ -848,23 +852,30 @@ def validate_change_schema(value: Any) -> dict[str, Any]:
         {name: {"const": True} for name in gate_required},
     )
 
-    rollback_conditions = [
-        {
-            "if": {
-                "properties": {
-                    "lineage": {
-                        "properties": {"phase": {"const": phase}}
+    rollback_conditions = []
+    for phase in PHASES:
+        rollback_constraint: dict[str, Any]
+        if phase == "bridge":
+            rollback_constraint = {
+                "oneOf": [
+                    {"const": ROLLBACK_FLOORS[phase]},
+                    {"const": HARDENED_BRIDGE_ROLLBACK_FLOOR},
+                ]
+            }
+        else:
+            rollback_constraint = {"const": ROLLBACK_FLOORS[phase]}
+        rollback_conditions.append(
+            {
+                "if": {
+                    "properties": {
+                        "lineage": {
+                            "properties": {"phase": {"const": phase}}
+                        }
                     }
-                }
-            },
-            "then": {
-                "properties": {
-                    "rollback": {"const": ROLLBACK_FLOORS[phase]}
-                }
-            },
-        }
-        for phase in PHASES
-    ]
+                },
+                "then": {"properties": {"rollback": rollback_constraint}},
+            }
+        )
     v1_receipt_conditions = [
         {
             "if": {
@@ -1780,6 +1791,68 @@ def validate_legacy_deployment_sources(
             fail(f"deployment {collection} source SHA differs")
 
 
+def validate_effective_rollback_floor(
+    value: Any,
+    phase: str,
+    label: str,
+) -> dict[str, list[str]]:
+    if phase not in PHASES:
+        fail(f"{label} phase is invalid")
+    rollback = exact_keys(
+        value,
+        {"allowed_targets", "forbidden_targets"},
+        label,
+    )
+    for key in ("allowed_targets", "forbidden_targets"):
+        targets = rollback[key]
+        if type(targets) is not list:
+            fail(f"{label} {key} must be an array")
+        if any(type(target) is not str or target not in PHASES for target in targets):
+            fail(f"{label} {key} contains an invalid phase")
+        if len(targets) != len(set(targets)):
+            fail(f"{label} {key} contains duplicates")
+        canonical = sorted(
+            targets,
+            key=PHASES.index,
+            reverse=key == "allowed_targets",
+        )
+        if targets != canonical:
+            fail(f"{label} {key} order differs")
+    if set(rollback["allowed_targets"]).intersection(rollback["forbidden_targets"]):
+        fail(f"{label} targets overlap")
+    expected = [ROLLBACK_FLOORS[phase]]
+    if phase == "bridge":
+        expected.append(HARDENED_BRIDGE_ROLLBACK_FLOOR)
+    if rollback not in expected:
+        fail(f"{label} differs")
+    return rollback
+
+
+def derived_rollback_floor(
+    source_phase: str,
+    target_phase: str,
+) -> dict[str, list[str]]:
+    """Carry an intrinsic source prohibition across a reviewed rollback edge."""
+
+    source = ROLLBACK_FLOORS[source_phase]
+    target = ROLLBACK_FLOORS[target_phase]
+    target_predecessors = PHASES[: PHASES.index(target_phase)]
+    forbidden = [
+        phase
+        for phase in target_predecessors
+        if phase in source["forbidden_targets"]
+        or phase in target["forbidden_targets"]
+    ]
+    return {
+        "allowed_targets": [
+            phase
+            for phase in target["allowed_targets"]
+            if phase not in forbidden
+        ],
+        "forbidden_targets": forbidden,
+    }
+
+
 def rollout_phase(
     value: Mapping[str, Any],
     contract: Mapping[str, Any],
@@ -1792,11 +1865,40 @@ def rollout_phase(
         fail("rollout phases differ")
     if [item.get("phase") if type(item) is dict else None for item in phases] != PHASES:
         fail("rollout phase order differs")
+    source_allocations: dict[str, dict[str, Any]] = {}
+    for phase_name, phase_entry in zip(PHASES, phases):
+        source = exact_keys(
+            phase_entry.get("source"),
+            {
+                "repository",
+                "commit",
+                "root_tree",
+                "frontend_tree",
+                "internal_tree",
+                "manifest_sha256",
+            },
+            f"{phase_name} rollout source",
+        )
+        if source["repository"] != contract["repository"]:
+            fail(f"{phase_name} rollout source repository differs")
+        for key in ("commit", "root_tree", "frontend_tree", "internal_tree"):
+            require_sha1(source[key], f"{phase_name} rollout source {key}")
+        require_sha256(
+            source["manifest_sha256"],
+            f"{phase_name} rollout source manifest hash",
+        )
+        source_allocations[phase_name] = source
+    if len({source["manifest_sha256"] for source in source_allocations.values()}) != 1:
+        fail("rollout source manifest authority differs across phases")
+    # Exercising all coordinator roles from one integrated checkout is not
+    # release evidence. Each role must name its independently compiled commit,
+    # root tree, and database-bearing internal tree. Frontend trees may be
+    # intentionally shared by phases that do not change the UI.
+    for key in ("commit", "root_tree", "internal_tree"):
+        if len({source[key] for source in source_allocations.values()}) != len(PHASES):
+            fail(f"database phase source allocation is not unique: {key}")
     target = phases[PHASES.index(phase)]
-    source = target.get("source")
-    if type(source) is not dict:
-        fail("rollout source is malformed")
-    require_sha1(source.get("commit"), "rollout source commit")
+    source = source_allocations[phase]
     images = target.get("images")
     if type(images) is not list or len(images) != 3:
         fail("rollout image set differs")
@@ -1828,21 +1930,11 @@ def rollout_phase(
     migration = target.get("migration")
     if type(migration) is not dict or migration.get("digest") != observed_images["web"]["digest"]:
         fail("rollout migration/web digest binding differs")
-    rollback = exact_keys(
+    rollback = validate_effective_rollback_floor(
         target.get("rollback"),
-        {"allowed_targets", "forbidden_targets"},
+        phase,
         "rollout rollback floor",
     )
-    for key in ("allowed_targets", "forbidden_targets"):
-        targets = rollback[key]
-        if (
-            type(targets) is not list
-            or len(targets) != len(set(targets))
-            or any(item not in PHASES for item in targets)
-        ):
-            fail("rollout rollback targets differ")
-    if set(rollback["allowed_targets"]).intersection(rollback["forbidden_targets"]):
-        fail("rollout rollback targets overlap")
     if rollback != ROLLBACK_FLOORS[phase]:
         fail("rollout rollback floor differs")
     return target, observed_images
@@ -2159,8 +2251,18 @@ def validate_phase_state(
     )
     if gates != {key: True for key in policy["phase_state"]["required_gates"]}:
         fail("phase-state success gates differ")
-    if state["rollback"] != rollout_phase_value["rollback"]:
-        fail("phase-state rollback floor differs")
+    rollback = validate_effective_rollback_floor(
+        state["rollback"],
+        phase,
+        "phase-state rollback floor",
+    )
+    expected_rollback = (
+        ROLLBACK_FLOORS[phase]
+        if operation == "activate"
+        else derived_rollback_floor(source_phase, phase)
+    )
+    if rollback != expected_rollback:
+        fail("phase-state rollback floor provenance differs")
     sanitize_plan(state, contract)
     return state
 

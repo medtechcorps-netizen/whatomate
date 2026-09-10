@@ -7,6 +7,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
+CHANGE_PATH = ROOT / "production-change.schema.json"
 INTENT_PATH = ROOT / "production-mutation-intent.schema.json"
 RECONCILIATION_PATH = ROOT / "production-orphan-reconciliation.schema.json"
 LOCK_ASSERTION_PATH = ROOT / "production-main-lock-assertion.schema.json"
@@ -279,6 +280,65 @@ class SharedStrictSchemaTests(unittest.TestCase):
                     self.intent["$defs"][name],
                     self.reconciliation["$defs"][name],
                 )
+
+    def test_bridge_floor_schema_allows_only_intrinsic_or_hardened(self) -> None:
+        weak = {
+            "allowed_targets": ["baseline"],
+            "forbidden_targets": [],
+        }
+        hardened = {
+            "allowed_targets": [],
+            "forbidden_targets": ["baseline"],
+        }
+        for path in (CHANGE_PATH, INTENT_PATH, RECONCILIATION_PATH):
+            schema = load_schema(path)
+            selector = "phase" if path == CHANGE_PATH else "to"
+            expected_if = {
+                "properties": {
+                    "lineage": {
+                        **({"required": [selector]} if selector == "to" else {}),
+                        "properties": {selector: {"const": "bridge"}},
+                    }
+                }
+            }
+            conditionals = [
+                (location, value)
+                for location, value in walk(schema)
+                if type(value) is dict
+                and value.get("if") == expected_if
+                and "then" in value
+            ]
+            matches = []
+            for location, value in walk(schema):
+                if type(value) is not dict or type(value.get("oneOf")) is not list:
+                    continue
+                constants = [
+                    item.get("const") for item in value["oneOf"] if type(item) is dict
+                ]
+                if weak in constants or hardened in constants:
+                    matches.append((location, constants))
+            with self.subTest(schema=path.name):
+                self.assertEqual(len(conditionals), 1)
+                conditional_location, conditional = conditionals[0]
+                self.assertEqual(
+                    conditional["then"],
+                    {
+                        "properties": {
+                            "rollback": {
+                                "oneOf": [
+                                    {"const": weak},
+                                    {"const": hardened},
+                                ]
+                            }
+                        }
+                    },
+                )
+                self.assertEqual(len(matches), 1)
+                self.assertEqual(
+                    matches[0][0],
+                    f"{conditional_location}.then.properties.rollback",
+                )
+                self.assertEqual(matches[0][1], [weak, hardened])
 
     def test_sanitized_state_and_artifact_bindings_are_exact(self) -> None:
         for schema in (self.intent, self.reconciliation):

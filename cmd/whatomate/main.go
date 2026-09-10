@@ -556,29 +556,50 @@ func runRLSMigration(args []string) {
 		return
 	}
 
-	if err := database.RunMigrationWithProgress(db, &cfg.DefaultAdmin); err != nil {
-		lo.Fatal("Schema migration failed", "error", err)
-	}
-	if err := handlers.BackfillChatbotFlowGraph(db, lo); err != nil {
-		lo.Fatal("Chatbot flow graph backfill failed", "error", err)
-	}
-	legacyMetaStats, err := channelapi.BackfillLegacyWhatsAppInbox(db, 500)
-	if err != nil {
-		lo.Fatal("Legacy WhatsApp omnichannel backfill failed", "error", err)
-	}
-	lo.Info(
-		"Legacy WhatsApp omnichannel backfill complete",
-		"accounts",
-		legacyMetaStats.Accounts,
-		"messages",
-		legacyMetaStats.Messages,
-		"linked",
-		legacyMetaStats.Linked,
-	)
-	if err := database.ApplyTenantRLS(db, cfg.Database.RuntimeRole); err != nil {
-		lo.Fatal("Tenant RLS migration failed", "error", err)
+	if err := database.RunRLSMigrationCoordinator(
+		db,
+		&cfg.DefaultAdmin,
+		cfg.Database.RuntimeRole,
+		func(session *gorm.DB) error {
+			if err := handlers.BackfillChatbotFlowGraph(session, lo); err != nil {
+				return fmt.Errorf("chatbot flow graph backfill: %w", err)
+			}
+			legacyMetaStats, err := channelapi.BackfillLegacyWhatsAppInbox(session, 500)
+			if err != nil {
+				return fmt.Errorf("legacy WhatsApp omnichannel backfill: %w", err)
+			}
+			lo.Info(
+				"Legacy WhatsApp omnichannel backfill complete",
+				"accounts",
+				legacyMetaStats.Accounts,
+				"messages",
+				legacyMetaStats.Messages,
+				"linked",
+				legacyMetaStats.Linked,
+			)
+			return nil
+		},
+		func() error { return verifyRLSMigrationRuntime(&cfg.Database) },
+	); err != nil {
+		lo.Fatal("RLS migration coordinator failed", "error", err)
 	}
 	lo.Info("Tenant RLS installed", "runtime_role", cfg.Database.RuntimeRole)
+}
+
+func verifyRLSMigrationRuntime(cfg *config.DatabaseConfig) error {
+	if cfg == nil {
+		return errors.New("runtime database configuration is required")
+	}
+	runtimeDB, err := database.NewPostgres(cfg, false)
+	if err != nil {
+		return fmt.Errorf("open runtime database verifier: %w", err)
+	}
+	sqlDB, err := runtimeDB.DB()
+	if err != nil {
+		return fmt.Errorf("open runtime database verifier pool: %w", err)
+	}
+	defer func() { _ = sqlDB.Close() }()
+	return database.VerifyTenantRLS(runtimeDB, cfg.RuntimeRole)
 }
 
 // ============================================================================
@@ -858,6 +879,14 @@ func runServer(args []string) {
 	go inboundProcessor.Start(inboundCtx)
 	lo.Info("Inbound continuation processor started")
 
+	// Hydrate media identifiers delivered by WhatsApp Coexistence history and
+	// companion-app echoes. The durable job lease recovers interrupted downloads
+	// without holding tenant database transactions across provider I/O.
+	coexistenceMediaProcessor := handlers.NewCoexistenceMediaProcessor(app, 2*time.Second)
+	coexistenceMediaCtx, coexistenceMediaCancel := context.WithCancel(context.Background())
+	go coexistenceMediaProcessor.Start(coexistenceMediaCtx)
+	lo.Info("Coexistence media processor started")
+
 	var metaLifecycleCancel context.CancelFunc
 	if cfg.MetaMessenger.Enabled {
 		var metaLifecycleCtx context.Context
@@ -949,6 +978,20 @@ func runServer(args []string) {
 		metaInstagramLifecycleCancel()
 		lo.Info("Instagram ownership lifecycle processor stopped")
 	}
+
+	// Stop Coexistence media recovery before closing the shared database pool.
+	lo.Info("Stopping Coexistence media processor...")
+	coexistenceMediaCancel()
+	coexistenceMediaProcessor.Stop()
+	coexistenceMediaShutdownCtx, coexistenceMediaShutdownCancel := context.WithTimeout(
+		context.Background(),
+		15*time.Second,
+	)
+	if err := coexistenceMediaProcessor.Wait(coexistenceMediaShutdownCtx); err != nil {
+		lo.Warn("Timed out waiting for Coexistence media processor", "error", err)
+	}
+	coexistenceMediaShutdownCancel()
+	lo.Info("Coexistence media processor stopped")
 
 	// Stop inbound continuation recovery.
 	lo.Info("Stopping inbound continuation processor...")
@@ -1448,6 +1491,9 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST("/api/accounts/{id}/test", tenant((*handlers.App).TestAccountConnection))
 	// Subscription recovery also uses short committed phases around Meta I/O.
 	g.POST("/api/accounts/{id}/subscribe", app.SubscribeApp)
+	// Coexistence sync uses one-time Meta mutations between durable tenant
+	// phases; never hold a request-long tenant transaction across those calls.
+	g.POST("/api/accounts/{id}/coexistence-sync", app.RetryCoexistenceSync)
 	// Meta synchronously verifies the callback during this network call. The
 	// handler uses short tenant phases around it, so do not wrap it in the
 	// transaction-spanning tenant adapter.
@@ -1537,6 +1583,12 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.PUT("/api/contacts/{id}/assign", tenant((*handlers.App).AssignContact))
 	g.PUT("/api/contacts/{id}/tags", tenant((*handlers.App).UpdateContactTags))
 	g.GET("/api/contacts/{id}/session-data", tenant((*handlers.App).GetContactSessionData))
+	g.GET("/api/contacts/{id}/identity-review", tenant((*handlers.App).GetContactIdentityReviewState))
+	g.GET("/api/contacts/{id}/identity-review/preview", tenant((*handlers.App).PreviewContactIdentityReview))
+	g.POST("/api/contacts/{id}/identity-review/decisions", tenant((*handlers.App).DecideContactIdentityReview))
+	g.GET("/api/identity-reviews/staged", tenant((*handlers.App).ListStagedContactIdentityReviews))
+	g.GET("/api/identity-reviews/staged/{id}", tenant((*handlers.App).GetStagedContactIdentityReview))
+	g.GET("/api/identity-reviews/staged/{id}/media/{revision}", tenant((*handlers.App).GetStagedContactIdentityReviewMedia))
 
 	// CRM pipeline and follow-up operations
 	g.GET("/api/crm/pipelines", tenant((*handlers.App).ListCRMPipelines))
@@ -1615,6 +1667,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		tenant((*handlers.App).DeleteResourceTimeOff),
 	)
 	g.GET("/api/booking/events", tenant((*handlers.App).ListBookingEvents))
+	g.GET("/api/booking/availability", tenant((*handlers.App).ListBookingAvailability))
 	g.POST("/api/booking/events", tenant((*handlers.App).CreateBookingEvent))
 	g.PUT("/api/booking/events/{id}", tenant((*handlers.App).UpdateBookingEvent))
 	g.GET("/api/bookings", tenant((*handlers.App).ListBookings))

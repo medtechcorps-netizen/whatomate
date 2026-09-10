@@ -42,6 +42,7 @@ const (
 	platformComplianceCreationEvidenceIndex   = "rereply_platform_compliance_creation_evidence_unique"
 	platformComplianceAuditRunIndex           = "rereply_platform_compliance_audit_run_unique"
 	platformComplianceGuardVersion            = 7
+	platformComplianceAdditiveVersion         = 1
 	platformComplianceOperatorRunIDSetting    = "app.platform_compliance_operator_run_id"
 	platformComplianceOperationIntentSetting  = "app.platform_compliance_operation_intent"
 	platformComplianceCreationIntentSetting   = "app.platform_compliance_creation_intent"
@@ -408,6 +409,30 @@ func PlatformComplianceTableRules() ([]PlatformComplianceTableRule, error) {
 	return result, nil
 }
 
+func platformComplianceRuleProfiles(
+	rules []PlatformComplianceTableRule,
+) (core, additive []PlatformComplianceTableRule, err error) {
+	additiveSet := make(map[string]struct{}, len(tenantRLSAdditiveProfileV1))
+	for _, table := range tenantRLSAdditiveProfileV1 {
+		additiveSet[table] = struct{}{}
+	}
+	for _, rule := range rules {
+		if _, optional := additiveSet[rule.Table]; optional {
+			if strings.TrimSpace(rule.AllowedRowPredicate) != "" {
+				return nil, nil, fmt.Errorf("additive platform compliance table %q cannot be writable", rule.Table)
+			}
+			additive = append(additive, rule)
+			delete(additiveSet, rule.Table)
+		} else {
+			core = append(core, rule)
+		}
+	}
+	if len(additiveSet) != 0 || len(additive) != len(tenantRLSAdditiveProfileV1) {
+		return nil, nil, fmt.Errorf("platform compliance additive profile v%d is incomplete", platformComplianceAdditiveVersion)
+	}
+	return core, additive, nil
+}
+
 func addPlatformComplianceTableRule(
 	rules map[string]PlatformComplianceTableRule,
 	table string,
@@ -551,12 +576,40 @@ func platformCompliancePredicate(rule PlatformComplianceTableRule, rowExpression
 // can see historical rows before any atomic-creation/bootstrap scan. It never
 // disables row security.
 func VerifyPlatformComplianceScanAuthority(db *gorm.DB) error {
+	return verifyPlatformComplianceScanAuthorityForScope(
+		db,
+		platformComplianceVerificationFull,
+	)
+}
+
+func verifyPlatformComplianceCoreScanAuthority(db *gorm.DB) error {
+	return verifyPlatformComplianceScanAuthorityForScope(
+		db,
+		platformComplianceVerificationCore,
+	)
+}
+
+func verifyPlatformComplianceScanAuthorityForScope(
+	db *gorm.DB,
+	scope platformComplianceVerificationScope,
+) error {
 	if db == nil {
 		return ErrPlatformComplianceScanAuthority
 	}
 	rules, err := PlatformComplianceTableRules()
 	if err != nil {
 		return err
+	}
+	coreRules, _, err := platformComplianceRuleProfiles(rules)
+	if err != nil {
+		return err
+	}
+	switch scope {
+	case platformComplianceVerificationFull:
+	case platformComplianceVerificationCore:
+		rules = coreRules
+	default:
+		return errors.New("platform compliance verification scope is invalid")
 	}
 	for _, rule := range rules {
 		var state struct {
@@ -987,6 +1040,10 @@ func installPlatformComplianceGuards(tx *gorm.DB, migrationRole, runtimeRole str
 	if err != nil {
 		return err
 	}
+	coreRules, _, err := platformComplianceRuleProfiles(rules)
+	if err != nil {
+		return err
+	}
 	organizations, err := inspectPublicTable(tx, "organizations")
 	if err != nil {
 		return err
@@ -1013,14 +1070,18 @@ func installPlatformComplianceGuards(tx *gorm.DB, migrationRole, runtimeRole str
 		}
 	}
 
-	scanSQL := platformComplianceScanGuardSQL(rules)
-	writeSQL := platformComplianceWriteGuardSQL(rules)
+	// Keep the version-7 SQL bodies and fingerprint byte-compatible with the
+	// previous binary. The three additive identity-review tables are still
+	// protected and verified below, but they must not make a version-7 rollback
+	// reject the otherwise unchanged core contract.
+	scanSQL := platformComplianceScanGuardSQL(coreRules)
+	writeSQL := platformComplianceWriteGuardSQL(coreRules)
 	identitySQL := platformComplianceIdentityRegistryGuardSQL()
-	classificationSQL := platformComplianceClassificationGuardSQL(rules)
+	classificationSQL := platformComplianceClassificationGuardSQL(coreRules)
 	creationAuditSQL := platformComplianceCreationAuditSQL()
-	creatorSQL := platformComplianceCreatorSQL(rules)
+	creatorSQL := platformComplianceCreatorSQL(coreRules)
 	contractFingerprint := platformComplianceContractFingerprint(
-		rules, scanSQL, writeSQL, identitySQL, classificationSQL, creationAuditSQL, creatorSQL,
+		coreRules, scanSQL, writeSQL, identitySQL, classificationSQL, creationAuditSQL, creatorSQL,
 	)
 	contractSQL := platformComplianceContractSQL(contractFingerprint)
 	if err := tx.Exec(scanSQL).Error; err != nil {
@@ -1205,7 +1266,11 @@ func installPlatformComplianceGuards(tx *gorm.DB, migrationRole, runtimeRole str
 	if err := verifyExistingPlatformComplianceOrganizations(tx); err != nil {
 		return err
 	}
-	return verifyPlatformComplianceGuards(tx, runtimeRole)
+	// The bridge publishes the old-core identity-review triggers only after all
+	// schema, seed, product backfill, and RLS work has completed. Verify the
+	// complete compatibility contract here; the coordinator performs the strict
+	// future-profile verification after the atomic activation boundary.
+	return verifyPlatformComplianceGuardsWithIdentityReviewRequirement(tx, runtimeRole, false)
 }
 
 func platformComplianceContractFingerprint(
@@ -2567,12 +2632,23 @@ func verifyPlatformComplianceIdentityRegistryContract(
 }
 
 type platformComplianceProductTrigger struct {
-	name          string
-	function      string
-	typeBits      int
-	updateColumns []string
-	functionBody  string
+	name               string
+	function           string
+	typeBits           int
+	updateColumns      []string
+	constraint         bool
+	deferrable         bool
+	initiallyDeferred  bool
+	functionBody       string
+	functionBodySHA256 string
 }
+
+type platformComplianceIdentityReviewTriggerProfile uint8
+
+const (
+	platformComplianceLegacyIdentityReviewTriggerProfile platformComplianceIdentityReviewTriggerProfile = iota
+	platformComplianceFutureIdentityReviewTriggerProfile
+)
 
 var platformComplianceProductTriggers = map[string][]platformComplianceProductTrigger{
 	"customer_activity_events": {
@@ -2669,17 +2745,196 @@ var platformComplianceProductTriggers = map[string][]platformComplianceProductTr
 			functionBody:  functionBodyFromCreateSQL(conversationReadIngestionOrderFunctionSQL),
 		},
 	},
+	"whatsapp_coexistence_states": {
+		{
+			name: "trg_whatsapp_coexistence_identity_review_cycle", function: "rereply_supersede_whatsapp_identity_review_prior_cycles", typeBits: 17,
+			updateColumns: []string{"onboarding_cycle"}, functionBody: whatsappIdentityReviewCycleSupersessionFunctionBody,
+		},
+	},
+	"whatsapp_identity_review_holds": {
+		{
+			name: "trg_whatsapp_identity_review_holds_guard", function: "rereply_guard_whatsapp_identity_review_hold", typeBits: 31,
+			functionBody: whatsappIdentityReviewHoldGuardFunctionBody,
+		},
+		{
+			name: "trg_whatsapp_identity_review_holds_complete", function: "rereply_verify_whatsapp_identity_review_complete", typeBits: 21,
+			constraint: true, deferrable: true, initiallyDeferred: true,
+			functionBody: whatsappIdentityReviewCompletenessFunctionBody,
+		},
+	},
+	"whatsapp_identity_review_members": {
+		{
+			name: "trg_whatsapp_identity_review_members_guard", function: "rereply_guard_whatsapp_identity_review_member", typeBits: 27,
+			functionBody: whatsappIdentityReviewMemberGuardFunctionBody,
+		},
+		{
+			name: "trg_whatsapp_identity_review_members_complete", function: "rereply_verify_whatsapp_identity_review_complete", typeBits: 29,
+			constraint: true, deferrable: true, initiallyDeferred: true,
+			functionBody: whatsappIdentityReviewCompletenessFunctionBody,
+		},
+	},
+}
+
+// platformComplianceFutureIdentityReviewTriggers is verifier-only rollout
+// metadata.  A compatibility baseline does not install these old-table
+// triggers, but it can verify their complete future profile after the bridge
+// commits.  Hashes deliberately avoid importing any bridge migration SQL into
+// the baseline source.
+var platformComplianceFutureIdentityReviewTriggers = map[string][]platformComplianceProductTrigger{
+	"contacts": {
+		{
+			name: "rereply_identity_review_contact_selector_fence", function: "rereply_lock_whatsapp_identity_review_contact_selector", typeBits: 31,
+			functionBodySHA256: "bb7b6fcf2b2dc9775a83a1fade3fd7eaf4e7c882a1df60ca2eacebd44ea3b99e",
+		},
+	},
+	"messages": {
+		{
+			name: "rereply_identity_review_message_wamid_owner", function: "rereply_guard_message_identity_review_wamid_owner", typeBits: 31,
+			functionBodySHA256: "304ccdaf324e50476d475e37032e3c29925a8711f1fd28fd5d66662356e39430",
+		},
+	},
+	"inbound_events": {
+		{
+			name: "trg_inbound_events_identity_review_guard", function: "rereply_guard_whatsapp_identity_review_inbound_event", typeBits: 31,
+			functionBodySHA256: "16717c2e3f66c5226cae2d8d4352351dc333aa18fbcd9e7ba99b6d7192f1ac66",
+		},
+		{
+			name: "rereply_identity_review_event_wamid_owner", function: "rereply_guard_identity_review_event_wamid_owner", typeBits: 23,
+			functionBodySHA256: "b053ad0a31e1e21a03492fdd5808ac25bb2427afac719811fbd89624a315c2a4",
+		},
+	},
+}
+
+func detectPlatformComplianceIdentityReviewTriggerProfile(
+	db *gorm.DB,
+) (platformComplianceIdentityReviewTriggerProfile, error) {
+	var state struct {
+		RelationCount   int64  `gorm:"column:relation_count"`
+		ContactTriggers string `gorm:"column:contact_triggers"`
+		MessageTriggers string `gorm:"column:message_triggers"`
+		InboundTriggers string `gorm:"column:inbound_triggers"`
+	}
+	result := db.Raw(`
+		SELECT
+			COUNT(DISTINCT relation.oid) AS relation_count,
+			COALESCE(
+				pg_catalog.string_agg(trigger.tgname, ',' ORDER BY trigger.tgname)
+					FILTER (WHERE relation.relname = 'contacts'),
+				''
+			) AS contact_triggers,
+			COALESCE(
+				pg_catalog.string_agg(trigger.tgname, ',' ORDER BY trigger.tgname)
+					FILTER (WHERE relation.relname = 'messages'),
+				''
+			) AS message_triggers,
+			COALESCE(
+				pg_catalog.string_agg(trigger.tgname, ',' ORDER BY trigger.tgname)
+					FILTER (WHERE relation.relname = 'inbound_events'),
+				''
+			) AS inbound_triggers
+		FROM pg_catalog.pg_class AS relation
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		LEFT JOIN pg_catalog.pg_trigger AS trigger
+		  ON trigger.tgrelid = relation.oid AND NOT trigger.tgisinternal
+		WHERE namespace.nspname = 'public'
+		  AND relation.relname IN ('contacts', 'messages', 'inbound_events')
+		  AND relation.relkind = 'r'
+	`).Scan(&state)
+	if result.Error != nil {
+		return platformComplianceLegacyIdentityReviewTriggerProfile,
+			fmt.Errorf("inspect identity-review trigger rollout profile: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return platformComplianceLegacyIdentityReviewTriggerProfile,
+			errors.New("identity-review trigger rollout profile is unavailable")
+	}
+	return classifyPlatformComplianceIdentityReviewTriggerProfile(
+		state.RelationCount,
+		state.ContactTriggers,
+		state.MessageTriggers,
+		state.InboundTriggers,
+	)
+}
+
+func classifyPlatformComplianceIdentityReviewTriggerProfile(
+	relationCount int64,
+	contactTriggers, messageTriggers, inboundTriggers string,
+) (platformComplianceIdentityReviewTriggerProfile, error) {
+	if relationCount != 3 {
+		return platformComplianceLegacyIdentityReviewTriggerProfile,
+			errors.New("identity-review trigger rollout relations are incomplete")
+	}
+
+	const legacyContactTriggers = "rereply_platform_compliance_write_guard"
+	const legacyMessageTriggers = "rereply_platform_compliance_write_guard," +
+		"trg_messages_cleanup_read_cursors,trg_messages_ingestion_order"
+	const legacyInboundTriggers = "rereply_platform_compliance_write_guard"
+	const futureContactTriggers = "rereply_identity_review_contact_selector_fence," +
+		legacyContactTriggers
+	const futureMessageTriggers = "rereply_identity_review_message_wamid_owner," +
+		legacyMessageTriggers
+	const futureInboundTriggers = "rereply_identity_review_event_wamid_owner," +
+		legacyInboundTriggers + ",trg_inbound_events_identity_review_guard"
+
+	switch {
+	case contactTriggers == legacyContactTriggers &&
+		messageTriggers == legacyMessageTriggers &&
+		inboundTriggers == legacyInboundTriggers:
+		return platformComplianceLegacyIdentityReviewTriggerProfile, nil
+	case contactTriggers == futureContactTriggers &&
+		messageTriggers == futureMessageTriggers &&
+		inboundTriggers == futureInboundTriggers:
+		return platformComplianceFutureIdentityReviewTriggerProfile, nil
+	default:
+		return platformComplianceLegacyIdentityReviewTriggerProfile, errors.New(
+			"identity-review trigger rollout state is neither exact legacy nor exact future",
+		)
+	}
+}
+
+func platformComplianceRequiresFutureIdentityReviewProfile(
+	rules []PlatformComplianceTableRule,
+) bool {
+	for _, rule := range rules {
+		if rule.Table == "whatsapp_identity_review_holds" ||
+			rule.Table == "whatsapp_identity_review_members" ||
+			rule.Table == "whatsapp_coexistence_states" {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizePlatformComplianceFunctionBody(value string) string {
 	return strings.Join(strings.Fields(value), " ")
 }
 
+func platformComplianceProductTriggerBodySHA256(
+	trigger platformComplianceProductTrigger,
+) string {
+	if trigger.functionBodySHA256 != "" {
+		return trigger.functionBodySHA256
+	}
+	normalized := normalizePlatformComplianceFunctionBody(trigger.functionBody)
+	digest := sha256.Sum256([]byte(normalized))
+	return hex.EncodeToString(digest[:])
+}
+
 func verifyPlatformComplianceExactTableTriggerSet(
 	db *gorm.DB,
 	table, expectedOwner string,
+	identityReviewProfile platformComplianceIdentityReviewTriggerProfile,
 ) error {
-	expectedProducts := platformComplianceProductTriggers[table]
+	expectedProducts := append(
+		[]platformComplianceProductTrigger(nil),
+		platformComplianceProductTriggers[table]...,
+	)
+	if identityReviewProfile == platformComplianceFutureIdentityReviewTriggerProfile {
+		expectedProducts = append(
+			expectedProducts,
+			platformComplianceFutureIdentityReviewTriggers[table]...,
+		)
+	}
 	var state struct {
 		TriggerCount int64 `gorm:"column:trigger_count"`
 		RuleCount    int64 `gorm:"column:rule_count"`
@@ -2709,7 +2964,15 @@ func verifyPlatformComplianceExactTableTriggerSet(
 			Source               string `gorm:"column:source"`
 			Owner                string `gorm:"column:owner_name"`
 			Language             string `gorm:"column:language"`
+			Kind                 string `gorm:"column:kind"`
+			Volatility           string `gorm:"column:volatility"`
+			Parallel             string `gorm:"column:parallel"`
 			SecurityDefiner      bool   `gorm:"column:security_definer"`
+			Leakproof            bool   `gorm:"column:leakproof"`
+			Strict               bool   `gorm:"column:strict"`
+			ReturnsSet           bool   `gorm:"column:returns_set"`
+			DefaultACL           bool   `gorm:"column:default_acl"`
+			NoConfiguration      bool   `gorm:"column:no_configuration"`
 			UpdateColumns        string `gorm:"column:update_columns"`
 			UpdateAttributeCount int    `gorm:"column:update_attribute_count"`
 			Valid                bool   `gorm:"column:valid"`
@@ -2719,7 +2982,15 @@ func verifyPlatformComplianceExactTableTriggerSet(
 				procedure.prosrc AS source,
 				owner.rolname::text AS owner_name,
 				language.lanname AS language,
+				procedure.prokind::text AS kind,
+				procedure.provolatile::text AS volatility,
+				procedure.proparallel::text AS parallel,
 				procedure.prosecdef AS security_definer,
+				procedure.proleakproof AS leakproof,
+				procedure.proisstrict AS strict,
+				procedure.proretset AS returns_set,
+				procedure.proacl IS NULL AS default_acl,
+				procedure.proconfig IS NULL AS no_configuration,
 				COALESCE(pg_catalog.cardinality(trigger.tgattr::smallint[]), 0) AS update_attribute_count,
 				COALESCE((
 					SELECT pg_catalog.string_agg(attribute.attname, ',' ORDER BY attribute.attname)
@@ -2735,10 +3006,10 @@ func verifyPlatformComplianceExactTableTriggerSet(
 					AND trigger.tgtype = CAST(? AS smallint)
 					AND trigger.tgnargs = 0
 					AND trigger.tgargs = ''::bytea
-					AND trigger.tgconstraint = 0
+					AND (trigger.tgconstraint <> 0) = CAST(? AS boolean)
 					AND trigger.tgconstrrelid = 0
-					AND NOT trigger.tgdeferrable
-					AND NOT trigger.tginitdeferred
+					AND trigger.tgdeferrable = CAST(? AS boolean)
+					AND trigger.tginitdeferred = CAST(? AS boolean)
 					AND trigger.tgqual IS NULL
 					AND trigger.tgoldtable IS NULL
 					AND trigger.tgnewtable IS NULL
@@ -2757,15 +3028,20 @@ func verifyPlatformComplianceExactTableTriggerSet(
 			  AND NOT trigger.tgisinternal
 			  AND procedure.pronamespace = namespace.oid
 			  AND procedure.proname = CAST(? AS text)
-		`, expected.typeBits, table, expected.name, expected.function).Scan(&actual)
+		`, expected.typeBits, expected.constraint, expected.deferrable, expected.initiallyDeferred,
+			table, expected.name, expected.function).Scan(&actual)
 		if result.Error != nil {
 			return fmt.Errorf("inspect product trigger %s on public.%s: %w", expected.name, table, result.Error)
 		}
+		actualBodyDigest := sha256.Sum256([]byte(normalizePlatformComplianceFunctionBody(actual.Source)))
 		if result.RowsAffected != 1 || !actual.Valid || actual.Owner != expectedOwner ||
-			actual.Language != "plpgsql" || actual.SecurityDefiner ||
+			actual.Language != "plpgsql" || actual.Kind != "f" ||
+			actual.Volatility != "v" || actual.Parallel != "u" ||
+			actual.SecurityDefiner || actual.Leakproof || actual.Strict || actual.ReturnsSet ||
+			!actual.DefaultACL || !actual.NoConfiguration ||
 			actual.UpdateAttributeCount != len(expectedUpdateColumns) ||
 			actual.UpdateColumns != strings.Join(expectedUpdateColumns, ",") ||
-			normalizePlatformComplianceFunctionBody(actual.Source) != normalizePlatformComplianceFunctionBody(expected.functionBody) {
+			hex.EncodeToString(actualBodyDigest[:]) != platformComplianceProductTriggerBodySHA256(expected) {
 			return fmt.Errorf("product trigger %q on public.%s does not match the platform compliance contract", expected.name, table)
 		}
 	}
@@ -2850,18 +3126,91 @@ func verifyPlatformComplianceAuditIndexes(db *gorm.DB) error {
 }
 
 func verifyPlatformComplianceGuards(db *gorm.DB, runtimeRole string) error {
+	if err := verifyPlatformComplianceGuardsWithIdentityReviewRequirement(
+		db,
+		runtimeRole,
+		compiledRLSMigrationPhase != rlsMigrationPhaseBaseline,
+	); err != nil {
+		return err
+	}
+	if err := verifyLegacyAdditiveSchemaContract(db); err != nil {
+		return fmt.Errorf("verify additive schema contract: %w", err)
+	}
+	if err := verifyRuntimeCanonicalTenantPolicyInventory(
+		db,
+		protectedTenantTableNames(),
+		runtimeRole,
+	); err != nil {
+		return fmt.Errorf("verify code-derived tenant policy contract: %w", err)
+	}
+	return nil
+}
+
+func verifyPlatformComplianceGuardsWithIdentityReviewRequirement(
+	db *gorm.DB,
+	runtimeRole string,
+	requireFutureIdentityReview bool,
+) error {
+	return verifyPlatformComplianceGuardsForScope(
+		db,
+		runtimeRole,
+		requireFutureIdentityReview,
+		platformComplianceVerificationFull,
+	)
+}
+
+type platformComplianceVerificationScope uint8
+
+const (
+	platformComplianceVerificationFull platformComplianceVerificationScope = iota
+	platformComplianceVerificationCore
+)
+
+func verifyPlatformComplianceCoreLegacyGuards(
+	db *gorm.DB,
+	runtimeRole string,
+) error {
+	return verifyPlatformComplianceGuardsForScope(
+		db,
+		runtimeRole,
+		false,
+		platformComplianceVerificationCore,
+	)
+}
+
+func verifyPlatformComplianceGuardsForScope(
+	db *gorm.DB,
+	runtimeRole string,
+	requireFutureIdentityReview bool,
+	scope platformComplianceVerificationScope,
+) error {
 	rules, err := PlatformComplianceTableRules()
 	if err != nil {
 		return err
 	}
-	scanSQL := platformComplianceScanGuardSQL(rules)
-	writeSQL := platformComplianceWriteGuardSQL(rules)
+	coreRules, _, err := platformComplianceRuleProfiles(rules)
+	if err != nil {
+		return err
+	}
+	verifiedRules := rules
+	switch scope {
+	case platformComplianceVerificationFull:
+	case platformComplianceVerificationCore:
+		if requireFutureIdentityReview {
+			return errors.New("core platform compliance verification cannot require the future identity-review profile")
+		}
+		verifiedRules = coreRules
+	default:
+		return errors.New("platform compliance verification scope is invalid")
+	}
+	scanSQL := platformComplianceScanGuardSQL(coreRules)
+	writeSQL := platformComplianceWriteGuardSQL(coreRules)
 	identitySQL := platformComplianceIdentityRegistryGuardSQL()
-	classificationSQL := platformComplianceClassificationGuardSQL(rules)
+	classificationSQL := platformComplianceClassificationGuardSQL(coreRules)
 	creationAuditSQL := platformComplianceCreationAuditSQL()
-	creatorSQL := platformComplianceCreatorSQL(rules)
+	creatorSQL := platformComplianceCreatorSQL(coreRules)
 	fingerprint := platformComplianceContractFingerprint(
-		rules, scanSQL, writeSQL, identitySQL, classificationSQL, creationAuditSQL, creatorSQL,
+		coreRules, scanSQL, writeSQL, identitySQL, classificationSQL, creationAuditSQL, creatorSQL,
 	)
 	contractSQL := platformComplianceContractSQL(fingerprint)
 	expectedFunctions := map[string]struct {
@@ -2918,7 +3267,7 @@ func verifyPlatformComplianceGuards(db *gorm.DB, runtimeRole string) error {
 		return errors.New("platform compliance guard functions are incomplete")
 	}
 	if err := verifyPlatformComplianceRelationOwnership(
-		db, rules, functionState.OwnerName, runtimeRole,
+		db, verifiedRules, functionState.OwnerName, runtimeRole,
 	); err != nil {
 		return err
 	}
@@ -3094,8 +3443,16 @@ func verifyPlatformComplianceGuards(db *gorm.DB, runtimeRole string) error {
 	if installedFingerprint != fingerprint {
 		return fmt.Errorf("platform compliance contract fingerprint mismatch: got %q", installedFingerprint)
 	}
+	identityReviewProfile, err := detectPlatformComplianceIdentityReviewTriggerProfile(db)
+	if err != nil {
+		return err
+	}
+	if requireFutureIdentityReview && platformComplianceRequiresFutureIdentityReviewProfile(rules) &&
+		identityReviewProfile != platformComplianceFutureIdentityReviewTriggerProfile {
+		return errors.New("identity-review additive profile requires the exact future trigger rollout")
+	}
 
-	for _, rule := range rules {
+	for _, rule := range verifiedRules {
 		var valid bool
 		if err := db.Raw(`
 			SELECT EXISTS (
@@ -3151,7 +3508,7 @@ func verifyPlatformComplianceGuards(db *gorm.DB, runtimeRole string) error {
 			return fmt.Errorf("platform compliance write guard is incomplete on %q", rule.Table)
 		}
 		if err := verifyPlatformComplianceExactTableTriggerSet(
-			db, rule.Table, functionState.OwnerName,
+			db, rule.Table, functionState.OwnerName, identityReviewProfile,
 		); err != nil {
 			return err
 		}

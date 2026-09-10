@@ -496,12 +496,24 @@
       "then": {
         "properties": {
           "rollback": {
-            "const": {
-              "allowed_targets": [
-                "baseline"
-              ],
-              "forbidden_targets": []
-            }
+            "oneOf": [
+              {
+                "const": {
+                  "allowed_targets": [
+                    "baseline"
+                  ],
+                  "forbidden_targets": []
+                }
+              },
+              {
+                "const": {
+                  "allowed_targets": [],
+                  "forbidden_targets": [
+                    "baseline"
+                  ]
+                }
+              }
+            ]
           }
         }
       }

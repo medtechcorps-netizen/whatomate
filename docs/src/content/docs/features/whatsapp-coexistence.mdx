@@ -1,0 +1,68 @@
+---
+title: WhatsApp Business App Coexistence
+description: Onboard one number to ReReply while continuing to use the WhatsApp Business mobile app
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+WhatsApp Business App Coexistence lets a business keep using its existing WhatsApp Business mobile app while ReReply uses the same number through the Cloud API. New mobile-app messages are mirrored into ReReply, and the business can choose whether to share its recent one-to-one chat history during Meta's onboarding flow.
+
+## Meta prerequisites
+
+Before offering Coexistence onboarding, confirm all of the following outside ReReply:
+
+- The business is using WhatsApp Business app version 2.24.17 or newer.
+- Your Meta app is operated by an eligible Solution Partner or Tech Provider.
+- The Embedded Signup configuration uses the current Coexistence flow (`whatsapp_business_app_onboarding`, session information version 3). Use Embedded Signup configuration version 4; Meta has announced version 2 deprecation for October 15, 2026.
+- The Meta app is subscribed to `messages`, `history`, `smb_app_state_sync`, `smb_message_echoes`, and `account_update` for the WABA.
+- Your production callback URL and verify token match the workspace's Integration Center configuration.
+
+See [Meta's Coexistence onboarding documentation](https://developers.facebook.com/documentation/business-messaging/whatsapp/embedded-signup/onboarding-business-app-users) for eligibility and the current restrictions.
+
+<Aside type="caution">
+  ReReply cannot configure the Meta App Dashboard or grant Tech Provider/Solution Partner eligibility. Complete those Meta-side steps before onboarding a production number.
+</Aside>
+
+## Connect a number
+
+1. In ReReply, go to **Settings → Integrations** and configure the Meta App ID, App Secret, Embedded Signup Config ID, and webhook verify token.
+2. Go to **Settings → WhatsApp Accounts**, select **Connect with Facebook**, then choose **Sync with Mobile App**.
+3. Complete Meta's Embedded Signup flow. The business decides in Meta's UI whether to share chat history.
+4. Keep the ReReply page open until the account is connected and the initial synchronization requests have been recorded.
+
+For a Coexistence number, ReReply skips the Cloud API `/register` call, subscribes the app to the WABA, then separately requests contact synchronization and history synchronization. Meta allows each initial request only once for that onboarding and requires the requests within 24 hours, so ReReply records an attempt before calling Meta and does not blindly replay an ambiguous request.
+
+## Synchronization status
+
+The account list shows the current mobile-app synchronization state. Contacts and history arrive asynchronously through signed Meta webhooks; large history imports may arrive in chunks and out of order.
+
+If Meta definitively rejects a request, an account administrator can retry the eligible stage from the account list. ReReply will not retry a request that may already have been accepted by Meta.
+
+The status shown beneath the account connection has the following meanings:
+
+- **Mobile sync complete** — Meta accepted the contact-sync request and all history it made available has finished importing.
+- **Connected · History not shared** — Meta accepted the contact-sync request and the number is ready for new messages, but the business declined history sharing.
+- **Initial sync requests accepted** — Meta accepted both requests. If there is no eligible history, Meta may send no history callback; otherwise import progress appears when callbacks begin.
+- **Mobile sync needs attention** — Meta definitively rejected an eligible initial request; use the retry control before the 24-hour deadline.
+- **Initial sync window expired** — offboard the number, then complete Embedded Signup again. Meta requires offboarding before it permits another one-time contact/history request.
+- **Reconnect required** — complete Embedded Signup again after Meta reconnects the number so ReReply can obtain fresh credentials.
+
+```bash
+POST /api/accounts/{id}/coexistence-sync
+X-Organization-ID: <workspace UUID>
+```
+
+Declining history sharing is a valid outcome: the number remains connected and new messages continue to flow, but old chat history is not imported. ReReply preserves existing CRM contacts if a contact is later removed from the mobile address book.
+
+## Lifecycle events
+
+ReReply records Meta `account_update` lifecycle events. Partner removal or account offboarding disables the affected connection. A reconnect event requires a fresh Embedded Signup credential exchange before ReReply treats the integration as ready again.
+
+## Current platform limits
+
+- Only one-to-one history is synchronized; WhatsApp group chats are excluded.
+- Coexistence traffic is limited by Meta to 20 messages per second.
+- A business can keep up to four companion devices linked. Unsupported companion clients may show a placeholder instead of some messages; check the primary phone when that occurs.
+- History availability is limited to the window Meta presents during onboarding (up to six months).
+- Historical media retrieval has a shorter availability window than text history, so older media may appear as unavailable placeholders.
+- The initial contact and history requests are one-time onboarding operations. New mobile-app messages subsequently arrive through `smb_message_echoes`.

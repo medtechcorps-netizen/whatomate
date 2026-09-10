@@ -146,6 +146,96 @@ jobs:
           git diff --exit-code
           [[ -z "$(git status --porcelain)" ]]
 
+  database_phase_compatibility:
+    name: Exact database phase compatibility
+    needs: source_identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: whatomate_phase_compatibility
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out protected compatibility controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source_identity.outputs.workflow_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+
+      - name: Check out exact phase source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source_identity.outputs.source_sha }}
+          fetch-depth: 1
+          path: source
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.6"
+          cache: false
+
+      - name: Download exact source dependencies
+        working-directory: source
+        run: go mod download
+
+      - name: Run the pinned database phase compatibility harness
+        env:
+          COMPATIBILITY_EVIDENCE: ${{ runner.temp }}/database-phase-compatibility.json
+          PHASE: ${{ needs.source_identity.outputs.phase }}
+          REPOSITORY: ${{ github.repository }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          SOURCE_SHA: ${{ needs.source_identity.outputs.source_sha }}
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_phase_compatibility?sslmode=disable
+          WORKFLOW_SHA: ${{ needs.source_identity.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          bash control/release/validation/verify_database_phase_compatibility.sh \
+            --phase "$PHASE" \
+            --source-dir source \
+            --manifest control/release/exact-sources.json \
+            --workflow-sha "$WORKFLOW_SHA" \
+            --workflow-path .github/workflows/validate-exact-release-source.yml \
+            --workflow-repository "$REPOSITORY" \
+            --runner-environment "$RUNNER_ENVIRONMENT" \
+            --output "$COMPATIBILITY_EVIDENCE"
+          python3 - "$COMPATIBILITY_EVIDENCE" "$PHASE" "$SOURCE_SHA" "$WORKFLOW_SHA" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          evidence = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          if (
+              evidence["phase"] != sys.argv[2]
+              or evidence["source"]["commit"] != sys.argv[3]
+              or evidence["workflow"]["sha"] != sys.argv[4]
+              or evidence["workflow"]["path"] != ".github/workflows/validate-exact-release-source.yml"
+              or evidence["tests"]["result"] != "passed"
+          ):
+              raise SystemExit("database phase compatibility evidence differs")
+          PY
+
+      - name: Upload immutable database phase compatibility evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: database-phase-compatibility-${{ needs.source_identity.outputs.phase }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/database-phase-compatibility.json
+          if-no-files-found: error
+          retention-days: 90
+
   full_go:
     name: Full Go race and service tests (PostgreSQL 17)
     needs: source_identity
@@ -938,6 +1028,7 @@ jobs:
     if: always()
     needs:
       - source_identity
+      - database_phase_compatibility
       - full_go
       - bridge_pg14
       - frontend
@@ -951,6 +1042,7 @@ jobs:
         env:
           PHASE: ${{ needs.source_identity.outputs.phase }}
           SOURCE_IDENTITY_RESULT: ${{ needs.source_identity.result }}
+          DATABASE_PHASE_COMPATIBILITY_RESULT: ${{ needs.database_phase_compatibility.result }}
           VALIDATION_WORKFLOW_SHA: ${{ needs.source_identity.outputs.workflow_sha }}
           FULL_GO_RESULT: ${{ needs.full_go.result }}
           BRIDGE_PG14_RESULT: ${{ needs.bridge_pg14.result }}
@@ -972,6 +1064,7 @@ jobs:
           }
 
           require_success "source identity" "$SOURCE_IDENTITY_RESULT"
+          require_success "database phase compatibility" "$DATABASE_PHASE_COMPATIBILITY_RESULT"
           if [[ ! "$VALIDATION_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::Protected-main workflow SHA is missing or malformed."
             failures=1

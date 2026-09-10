@@ -3,7 +3,13 @@
   "repository": "medtechcorps-netizen/whatomate",
   "validation": {
     "workflow_path": ".github/workflows/validate-exact-release-source.yml",
-    "gate_job_name": "Exact source validation gate"
+    "gate_job_name": "Exact source validation gate",
+    "database_phase_compatibility": {
+      "authority": "exact-database-phase-compatibility/v1",
+      "harness_path": "release/validation/verify_database_phase_compatibility.sh",
+      "harness_sha256": "55ac39dbf96314c3692bcd55595fe1a480ff535ec00b09d1650eb1aabb3c0bbc",
+      "job_name": "Exact database phase compatibility"
+    }
   },
   "phases": {
     "baseline": {

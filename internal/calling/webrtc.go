@@ -7,7 +7,6 @@ import (
 
 	"github.com/pion/webrtc/v4"
 	"github.com/shridarpatil/whatomate/internal/models"
-	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 )
 
 // negotiateWebRTC handles the SDP exchange and sets up WebRTC media.
@@ -29,7 +28,7 @@ func (m *Manager) negotiateWebRTC(session *CallSession, account *models.WhatsApp
 	pc, err := m.createPeerConnection()
 	if err != nil {
 		m.log.Error("Failed to create peer connection", "error", err, "call_id", session.ID)
-		m.rejectCall(ctx, waAccount, session.ID)
+		m.rejectCall(ctx, session, account)
 		return
 	}
 
@@ -41,7 +40,7 @@ func (m *Manager) negotiateWebRTC(session *CallSession, account *models.WhatsApp
 	audioTrack, err := createOpusTrack(pc, "ivr-audio")
 	if err != nil {
 		m.log.Error("Failed to create audio track", "error", err)
-		m.rejectCall(ctx, waAccount, session.ID)
+		m.rejectCall(ctx, session, account)
 		return
 	}
 
@@ -111,7 +110,7 @@ func (m *Manager) negotiateWebRTC(session *CallSession, account *models.WhatsApp
 		SDP:  sdpOffer,
 	}); err != nil {
 		m.log.Error("Failed to set remote description (consumer offer)", "error", err, "call_id", session.ID)
-		m.rejectCall(ctx, waAccount, session.ID)
+		m.rejectCall(ctx, session, account)
 		return
 	}
 
@@ -119,13 +118,13 @@ func (m *Manager) negotiateWebRTC(session *CallSession, account *models.WhatsApp
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		m.log.Error("Failed to create SDP answer", "error", err, "call_id", session.ID)
-		m.rejectCall(ctx, waAccount, session.ID)
+		m.rejectCall(ctx, session, account)
 		return
 	}
 
 	if err := pc.SetLocalDescription(answer); err != nil {
 		m.log.Error("Failed to set local description (answer)", "error", err, "call_id", session.ID)
-		m.rejectCall(ctx, waAccount, session.ID)
+		m.rejectCall(ctx, session, account)
 		return
 	}
 
@@ -133,21 +132,21 @@ func (m *Manager) negotiateWebRTC(session *CallSession, account *models.WhatsApp
 	localDesc, err := waitForICEGathering(pc, 15*time.Second)
 	if err != nil {
 		m.log.Error("ICE gathering failed", "error", err, "call_id", session.ID)
-		m.rejectCall(ctx, waAccount, session.ID)
+		m.rejectCall(ctx, session, account)
 		return
 	}
 
 	sdpAnswer := localDesc.SDP
 
 	// Step 3: Pre-accept with our SDP answer
-	if err := m.whatsapp.PreAcceptCall(ctx, waAccount, session.ID, sdpAnswer); err != nil {
+	if err := m.preAcceptActiveCall(ctx, session, account, sdpAnswer); err != nil {
 		m.log.Error("Failed to pre-accept call", "error", err, "call_id", session.ID)
-		m.rejectCall(ctx, waAccount, session.ID)
+		m.rejectCall(ctx, session, account)
 		return
 	}
 
 	// Step 4: Accept with the same SDP answer
-	if err := m.whatsapp.AcceptCall(ctx, waAccount, session.ID, sdpAnswer); err != nil {
+	if err := m.acceptActiveCall(ctx, session, account, sdpAnswer); err != nil {
 		m.log.Error("Failed to accept call via API", "error", err, "call_id", session.ID)
 		return
 	}
@@ -409,8 +408,8 @@ func (m *Manager) consumeAudioWithDTMF(session *CallSession, track *webrtc.Track
 }
 
 // rejectCall sends a reject action via the WhatsApp API
-func (m *Manager) rejectCall(ctx context.Context, account *whatsapp.Account, callID string) {
-	if err := m.whatsapp.RejectCall(ctx, account, callID); err != nil {
-		m.log.Error("Failed to reject call", "error", err, "call_id", callID)
+func (m *Manager) rejectCall(ctx context.Context, session *CallSession, account *models.WhatsAppAccount) {
+	if err := m.rejectActiveCall(ctx, session, account); err != nil {
+		m.log.Error("Failed to reject call", "error", err, "call_id", session.ID)
 	}
 }

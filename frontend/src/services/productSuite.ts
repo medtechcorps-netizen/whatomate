@@ -1,4 +1,5 @@
 import { api } from '@/services/api'
+import type { ContactIdentityReviewEffectiveState } from '@/services/api'
 import { unwrapListResponse } from '@/lib/api-utils'
 import type { AxiosResponse } from 'axios'
 
@@ -373,6 +374,32 @@ export interface BookingEvent {
   version: number
 }
 
+export interface BookingAvailabilitySlot extends BookingEvent {
+  remaining_capacity: number
+  timezone: string
+  local_starts_at: string
+  local_ends_at: string
+}
+
+export interface BookingAvailabilityParams {
+  service_id?: string
+  resource_id?: string
+  from?: string
+  to?: string
+  page?: number
+  limit?: number
+}
+
+export interface CreateBookingInput {
+  contact_id: string
+  quantity: number
+  status: 'reserved'
+  source: 'agent'
+  allow_waitlist: false
+  idempotency_key: string
+  notes?: string
+}
+
 export interface Booking {
   id: string
   event_id: string
@@ -466,6 +493,7 @@ export interface CustomerWorkspaceContact {
   metadata?: Record<string, unknown>
   assigned_user_id?: string
   marketing_opt_out?: boolean
+  identity_review_ai_state: ContactIdentityReviewEffectiveState
   created_at?: string
   updated_at?: string
 }
@@ -622,6 +650,7 @@ export interface InboxConversation {
   unread_count: number
   ai_paused: boolean
   ai_pause_reason?: string
+  identity_review_ai_state: ContactIdentityReviewEffectiveState
   assigned_user_id?: string
   metadata?: Record<string, unknown>
   contact?: {
@@ -837,6 +866,11 @@ export const bookingService = {
     fetchAllPages<BookingEvent>('events', (page, limit) =>
       api.get('/booking/events', { params: { ...params, page, limit } }),
     ),
+  availability: (params?: BookingAvailabilityParams) => api.get('/booking/availability', { params }),
+  allAvailability: (params?: Omit<BookingAvailabilityParams, 'page' | 'limit'>) =>
+    fetchAllPages<BookingAvailabilitySlot>('slots', (page, limit) =>
+      api.get('/booking/availability', { params: { ...params, page, limit } }),
+    ),
   createEvent: (
     data: Partial<BookingEvent> & {
       local_starts_at?: string
@@ -847,7 +881,7 @@ export const bookingService = {
   bookings: (params?: Record<string, string | number>) => api.get('/bookings', { params }),
   allBookings: (params?: Record<string, string | number>) =>
     fetchAllPages<Booking>('bookings', (page, limit) => api.get('/bookings', { params: { ...params, page, limit } })),
-  createBooking: (eventId: string, data: Record<string, unknown>) =>
+  createBooking: (eventId: string, data: CreateBookingInput | Record<string, unknown>) =>
     api.post(`/booking/events/${eventId}/bookings`, data),
   transitionBooking: (id: string, transition: string, data?: Record<string, unknown>) =>
     api.post(`/bookings/${id}/${encodeURIComponent(transition)}`, data ?? {}),

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ast
 import copy
 import datetime as dt
 import inspect
 import subprocess
 import sys
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -230,6 +232,134 @@ class RollbackControllerTests(unittest.TestCase):
         receipt["lineage"]["from"] = "backend"
         with self.assertRaises(common.ReleaseError):
             rollback.validate_rollback_receipt(receipt)
+
+    def test_backend_to_bridge_receipt_and_state_preserve_hardened_floor(self) -> None:
+        receipt = rollback_receipt()
+        receipt["lineage"].update(
+            {
+                "phase_ordinal": 2,
+                "from": "backend",
+                "to": "bridge",
+                "phase": "bridge",
+            }
+        )
+        receipt["rollback"] = {
+            "allowed_targets": [],
+            "forbidden_targets": ["baseline"],
+        }
+        rollback.validate_rollback_receipt(receipt)
+        receipt_hash = common.sha256_bytes(common.canonical_file_bytes(receipt))
+        final = common.build_phase_state(
+            receipt,
+            change_receipt_sha256=receipt_hash,
+            canary_sha256="4" * 64,
+            control={
+                "workflow_sha": "a" * 40,
+                "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
+                "run_id": "601",
+                "run_attempt": 1,
+                "runner_environment": "github-hosted",
+                "release_policy_sha256": "b" * 64,
+                "change_schema_sha256": "c" * 64,
+            },
+            completed_at="2026-08-27T00:03:00Z",
+        )
+        self.assertEqual(final["rollback"], receipt["rollback"])
+        with self.assertRaises(common.ReleaseError):
+            common.validate_rollback_transition(
+                "bridge", "baseline", current_floor=final["rollback"]
+            )
+        weak = copy.deepcopy(receipt)
+        weak["rollback"] = copy.deepcopy(common.ROLLBACK_FLOORS["bridge"])
+        with self.assertRaises(common.ReleaseError):
+            rollback.validate_rollback_receipt(weak)
+
+    def test_rollback_controller_derives_floor_and_never_copies_historical_target(self) -> None:
+        def is_current_floor(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "current_state"
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value == "rollback"
+            )
+
+        for function in (
+            rollback.prepare_rollback_mutation_intent,
+            rollback.rollback_change,
+        ):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+            derive_calls = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "common"
+                and node.func.attr == "derive_rollback_floor"
+            ]
+            transition_calls = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "common"
+                and node.func.attr == "validate_rollback_transition"
+            ]
+            target_floor_reads = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "target_state"
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value == "rollback"
+            ]
+            with self.subTest(function=function.__name__):
+                self.assertEqual(len(derive_calls), 1)
+                self.assertEqual(len(transition_calls), 1)
+                self.assertEqual(len(derive_calls[0].args), 3)
+                self.assertIsInstance(derive_calls[0].args[0], ast.Name)
+                self.assertEqual(derive_calls[0].args[0].id, "current_phase")
+                self.assertTrue(is_current_floor(derive_calls[0].args[1]))
+                self.assertIsInstance(derive_calls[0].args[2], ast.Name)
+                self.assertEqual(derive_calls[0].args[2].id, "target_phase")
+                self.assertEqual(len(transition_calls[0].args), 2)
+                self.assertEqual(
+                    [
+                        argument.id
+                        for argument in transition_calls[0].args
+                        if isinstance(argument, ast.Name)
+                    ],
+                    ["current_phase", "target_phase"],
+                )
+                self.assertEqual(len(transition_calls[0].keywords), 1)
+                self.assertEqual(
+                    transition_calls[0].keywords[0].arg, "current_floor"
+                )
+                self.assertTrue(
+                    is_current_floor(transition_calls[0].keywords[0].value)
+                )
+                self.assertLess(
+                    transition_calls[0].lineno, derive_calls[0].lineno
+                )
+                self.assertEqual(target_floor_reads, [])
+                if function is rollback.rollback_change:
+                    client_calls = [
+                        node
+                        for node in ast.walk(tree)
+                        if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in {"ProductionAppClient", "put_app_once"}
+                    ]
+                    self.assertGreaterEqual(len(client_calls), 2)
+                    self.assertTrue(
+                        all(
+                            derive_calls[0].lineno < call.lineno
+                            for call in client_calls
+                        )
+                    )
 
     def test_phase_state_from_another_rollout_plan_cannot_be_spliced(self) -> None:
         authorities = {"rollout_plan_sha256": "a" * 64}

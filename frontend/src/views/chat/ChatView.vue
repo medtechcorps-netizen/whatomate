@@ -15,7 +15,7 @@ import { useOmnichannelUnreadStore } from '@/stores/omnichannelUnread'
 import { useUsersStore } from '@/stores/users'
 import { useTransfersStore } from '@/stores/transfers'
 import { wsService } from '@/services/websocket'
-import { contactsService, chatbotService, messagesService, customActionsService, accountsService, cannedResponsesService, getRequestHeaders, type CustomAction, type ActionResult, type CannedResponse } from '@/services/api'
+import { contactsService, chatbotService, messagesService, customActionsService, accountsService, cannedResponsesService, effectiveAIIsAllowed, getRequestHeaders, type ContactIdentityReviewEffectiveState, type CustomAction, type ActionResult, type CannedResponse } from '@/services/api'
 import { useTagsStore } from '@/stores/tags'
 import { TagBadge } from '@/components/ui/tag-badge'
 import { getTagColorClass } from '@/lib/constants'
@@ -84,8 +84,8 @@ import {
   User,
   UserPlus,
   UserMinus,
-  UserX,
   Play,
+  PauseCircle,
   Reply,
   X,
   SmilePlus,
@@ -107,6 +107,7 @@ import { getInitials, getAvatarGradient } from '@/lib/utils'
 import { useColorMode } from '@/composables/useColorMode'
 import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
+import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
 import PreviewButtonGroup from '@/components/chatbot/flow-preview/PreviewButtonGroup.vue'
 import TemplatePicker from '@/components/chat/TemplatePicker.vue'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
@@ -131,7 +132,7 @@ const tagsStore = useTagsStore()
 const notesStore = useNotesStore()
 const { isDark } = useColorMode()
 
-const canWriteContacts = authStore.hasPermission('contacts', 'write')
+const canWriteContacts = computed(() => authStore.hasPermission('contacts', 'write'))
 
 const messageInput = ref('')
 const messagesEndRef = ref<HTMLElement | null>(null)
@@ -141,6 +142,9 @@ const isSending = ref(false)
 const isAssignDialogOpen = ref(false)
 const isTransferring = ref(false)
 const isResuming = ref(false)
+const isIdentityReviewOpen = ref(false)
+const conversationAIStateLoadingForContact = ref<string | null>(null)
+let conversationAIStateGeneration = 0
 // Tracks incoming messages that arrived while the chat is open.
 // Surfaced as a "N unread messages" pill at the top of the chat panel
 // (WhatsApp-style). Click the pill to jump up to the first message of
@@ -432,6 +436,68 @@ const canAssignContacts = computed(() => {
   }
   return role === 'admin' || role === 'manager'
 })
+
+// WhatsApp pauses chatbot processing through active agent transfers. Creation
+// needs transfers:write; resuming is deliberately narrower unless the user has
+// organization-wide conversation assignment authority.
+const canReadTransfers = computed(() =>
+  authStore.hasPermission('transfers', 'read')
+)
+const canCreateManualTransfer = computed(() =>
+  canReadTransfers.value && authStore.hasPermission('transfers', 'write')
+)
+const canManageTransfers = computed(() =>
+  canReadTransfers.value && authStore.hasPermission('chat.assign', 'write')
+)
+const canResumeActiveTransfer = computed(() => {
+  const transfer = activeTransfer.value
+  if (!transfer) return false
+  if (canManageTransfers.value) return true
+  if (!canCreateManualTransfer.value) return false
+
+  const userID = authStore.user?.id
+  if (!userID) return false
+  const ownsAssignedTransfer = transfer.agent_id === userID
+  const ownsUnassignedManualTransfer = !transfer.agent_id
+    && transfer.source === 'manual'
+    && transfer.transferred_by === userID
+  return ownsAssignedTransfer || ownsUnassignedManualTransfer
+})
+const canControlConversationAI = computed(() =>
+  activeTransfer.value ? canResumeActiveTransfer.value : canCreateManualTransfer.value
+)
+const canReviewContactIdentity = computed(() =>
+  canWriteContacts.value && authStore.hasPermission('contacts.identity_review', 'write')
+)
+const canViewStagedContactIdentity = computed(() =>
+  canReviewContactIdentity.value
+)
+const currentContactAIBlocked = computed(() =>
+  !effectiveAIIsAllowed(contactsStore.currentContact?.identity_review_ai_state)
+)
+const isConversationAIStateLoading = computed(() =>
+  conversationAIStateLoadingForContact.value === contactsStore.currentContact?.id
+)
+const isConversationAIUpdating = computed(() =>
+  isConversationAIStateLoading.value || isTransferring.value || isResuming.value
+)
+const conversationAIControlLabel = computed(() => {
+  if (isConversationAIStateLoading.value) return 'Checking AI status'
+  if (isTransferring.value) return 'Pausing AI'
+  if (isResuming.value) {
+    return currentContactAIBlocked.value ? 'Ending conversation pause' : 'Resuming AI'
+  }
+  if (activeTransferId.value) {
+    return currentContactAIBlocked.value ? 'End conversation pause' : 'Resume AI'
+  }
+  return 'Pause AI'
+})
+
+function toggleConversationAI() {
+  if (isConversationAIUpdating.value) return
+  if (activeTransferId.value) return resumeChatbot()
+  return transferToAgent()
+}
 
 // Get list of users for assignment
 const assignableUsers = computed(() => {
@@ -822,6 +888,8 @@ function startMessagesContentResizeObserver(generation: number, contactID: strin
 
 function invalidateContactSelection() {
   contactSelectionGeneration++
+  conversationAIStateGeneration++
+  conversationAIStateLoadingForContact.value = null
   cancelInitialConversationScroll()
   stopMessagesContentResizeObserver()
   readCursorCheckQueued = false
@@ -869,7 +937,24 @@ async function selectContact(id: string) {
     contactAccounts.value = []
     contactsStore.setAccountFilter(null)
 
+    const aiStateGeneration = ++conversationAIStateGeneration
+    conversationAIStateLoadingForContact.value = id
+    const transferStateRequest = (canReadTransfers.value
+      ? transfersStore.fetchActiveTransferForContact(id)
+      : Promise.resolve())
+      .finally(() => {
+        if (
+          aiStateGeneration === conversationAIStateGeneration &&
+          isContactSelectionRequested(selectionGeneration, id)
+        ) {
+          conversationAIStateLoadingForContact.value = null
+        }
+      })
+
     contactsStore.setCurrentContact(contact)
+    // Transfer state is supplementary header state. Do not let a slow status
+    // lookup hold up account resolution, the transcript, or WebSocket focus.
+    void transferStateRequest.catch(() => undefined)
     await contactsStore.fetchMessages(id)
     if (!isContactSelectionActive(selectionGeneration, id)) return
 
@@ -1542,45 +1627,63 @@ async function assignContactToUser(userId: string | null) {
 }
 
 async function transferToAgent() {
-  if (!contactsStore.currentContact) return
+  const contact = contactsStore.currentContact
+  if (!contact || !canCreateManualTransfer.value) return
 
   isTransferring.value = true
   try {
-    await chatbotService.createTransfer({
-      contact_id: contactsStore.currentContact.id,
-      whatsapp_account: (contactsStore.currentContact as any).whatsapp_account,
-      source: 'manual'
+    const response = await chatbotService.createTransfer({
+      contact_id: contact.id,
+      whatsapp_account: selectedAccount.value || (contact as any).whatsapp_account || '',
+      ...(authStore.user?.id ? { agent_id: authStore.user.id } : {}),
+      source: 'manual',
     })
-    toast.success(t('chat.transferSuccess'), {
-      description: t('chat.transferSuccessDesc')
+    const createdTransfer = response.data.data?.transfer || response.data.transfer
+    if (createdTransfer) transfersStore.upsertTransfer(createdTransfer)
+    toast.success('AI replies paused', {
+      description: 'This conversation is now handed over to a human.'
     })
-    // Refresh transfers store (WebSocket will also update, but this ensures immediate sync)
-    await transfersStore.fetchTransfers({ status: 'active' })
+    await transfersStore.fetchActiveTransferForContact(contact.id)
   } catch (error: any) {
-    const message = error.response?.data?.message || t('chat.transferFailed')
-    toast.error(message)
+    toast.error('AI replies were not paused', {
+      description: getErrorMessage(error, t('chat.transferFailed')),
+    })
   } finally {
     isTransferring.value = false
   }
 }
 
 async function resumeChatbot() {
-  if (!activeTransferId.value) return
+  const transferID = activeTransferId.value
+  if (!transferID || !canResumeActiveTransfer.value) return
 
   const currentContactId = contactsStore.currentContact?.id
   isResuming.value = true
   try {
-    await chatbotService.resumeTransfer(activeTransferId.value)
-    toast.success(t('chat.resumeSuccess'), {
-      description: t('chat.resumeSuccessDesc')
-    })
-    // Refresh transfers store to update UI
-    await transfersStore.fetchTransfers({ status: 'active' })
+    await chatbotService.resumeTransfer(transferID)
+    transfersStore.updateTransfer(transferID, { status: 'resumed' })
+    if (currentContactId) {
+      await transfersStore.fetchActiveTransferForContact(currentContactId)
+    }
     // Refresh contacts list (assignment may have changed)
     await contactsStore.fetchContacts()
 
+    if (
+      currentContactId
+      && contactsStore.currentContact?.id === currentContactId
+      && effectiveAIIsAllowed(contactsStore.currentContact.identity_review_ai_state)
+    ) {
+      toast.success('AI replies resumed', {
+        description: 'The next eligible customer message can receive an automated reply.'
+      })
+    } else {
+      toast.warning('Human handover ended', {
+        description: 'Automated replies remain blocked until the identity review is resolved.'
+      })
+    }
+
     // Check if current contact is still in the list (may have been unassigned)
-    if (currentContactId) {
+    if (currentContactId && contactsStore.currentContact?.id === currentContactId) {
       const stillExists = contactsStore.contacts.some(c => c.id === currentContactId)
       if (!stillExists) {
         // Contact no longer visible to this user, navigate away
@@ -1590,11 +1693,27 @@ async function resumeChatbot() {
       }
     }
   } catch (error: any) {
-    const message = error.response?.data?.message || t('chat.resumeFailed')
-    toast.error(message)
+    toast.error('AI replies were not resumed', {
+      description: getErrorMessage(error, t('chat.resumeFailed')),
+    })
   } finally {
     isResuming.value = false
   }
+}
+
+async function refreshAfterIdentityReview(state: ContactIdentityReviewEffectiveState) {
+  // Apply the exact durable response immediately, then re-read the canonical
+  // list so the selected record and list projection converge on server state.
+  const selectedID = contactsStore.currentContact?.id
+  if (selectedID) {
+    if (contactsStore.currentContact?.id === selectedID) {
+      contactsStore.currentContact.identity_review_ai_state = state
+    }
+    for (const contact of contactsStore.contacts) {
+      if (contact.id === selectedID) contact.identity_review_ai_state = state
+    }
+  }
+  await contactsStore.fetchContacts()
 }
 
 function scrollToBottom(instant = false, shouldScroll: () => boolean = () => true) {
@@ -2125,6 +2244,13 @@ async function sendMediaMessage() {
                 <Badge v-if="contact.unread_count > 0" class="flex-shrink-0 h-5 text-[10px] bg-emerald-500/20 text-emerald-400 light:bg-emerald-100 light:text-emerald-700">
                   {{ contact.unread_count }}
                 </Badge>
+                <Badge
+                  v-if="!effectiveAIIsAllowed(contact.identity_review_ai_state)"
+                  class="flex-shrink-0 h-5 text-[10px] bg-amber-500/20 text-amber-300 light:bg-amber-100 light:text-amber-800"
+                  title="Automated replies are blocked pending identity review"
+                >
+                  Review
+                </Badge>
               </div>
             </div>
           </div>
@@ -2175,8 +2301,20 @@ async function sendMediaMessage() {
                   {{ contactsStore.currentContact.name || contactsStore.currentContact.phone_number }}
                 </p>
                 <Badge v-if="activeTransferId" class="text-[10px] h-5 bg-orange-500/20 text-orange-400 light:bg-orange-100 light:text-orange-700">
-                  Paused
+                  AI paused
                 </Badge>
+                <button
+                  v-if="currentContactAIBlocked"
+                  type="button"
+                  data-testid="contact-identity-review"
+                  class="rounded-full"
+                  aria-label="Open identity review"
+                  @click="isIdentityReviewOpen = true"
+                >
+                  <Badge class="text-[10px] h-5 bg-amber-500/20 text-amber-300 light:bg-amber-100 light:text-amber-800">
+                    AI blocked · identity review
+                  </Badge>
+                </button>
                 <Badge v-if="contactsStore.currentContact?.marketing_opt_out" class="text-[10px] h-5 bg-red-500/20 text-red-400 light:bg-red-100 light:text-red-700" :title="$t('chat.marketingOptOut')">
                   {{ $t('chat.marketingOptOut', 'Marketing Opt-out') }}
                 </Badge>
@@ -2187,6 +2325,28 @@ async function sendMediaMessage() {
             </div>
           </div>
           <div class="flex items-center gap-1">
+            <Tooltip v-if="canControlConversationAI || isConversationAIStateLoading">
+              <TooltipTrigger as-child>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  class="min-h-11 min-w-11 gap-2 border-white/10 bg-white/[0.04] px-3 text-white/70 hover:bg-white/[0.08] hover:text-white light:border-gray-200 light:bg-white light:text-gray-700 light:hover:bg-gray-100 light:hover:text-gray-900"
+                  :class="activeTransferId && 'border-orange-500/30 bg-orange-500/10 text-orange-300 light:border-orange-200 light:bg-orange-50 light:text-orange-700'"
+                  :aria-label="conversationAIControlLabel"
+                  :aria-pressed="Boolean(activeTransferId)"
+                  :aria-busy="isConversationAIUpdating"
+                  :disabled="isConversationAIUpdating"
+                  data-testid="conversation-ai-toggle"
+                  @click="toggleConversationAI"
+                >
+                  <Loader2 v-if="isConversationAIUpdating" class="h-4 w-4 animate-spin" aria-hidden="true" />
+                  <Play v-else-if="activeTransferId" class="h-4 w-4" aria-hidden="true" />
+                  <PauseCircle v-else class="h-4 w-4" aria-hidden="true" />
+                  <span class="hidden xl:inline">{{ conversationAIControlLabel }}</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{{ conversationAIControlLabel }}</TooltipContent>
+            </Tooltip>
             <CallButton
               v-if="contactsStore.currentContact?.phone_number && selectedAccount"
               :contact-id="contactsStore.currentContact.id"
@@ -2201,14 +2361,6 @@ async function sendMediaMessage() {
                 </Button>
               </TooltipTrigger>
               <TooltipContent>{{ $t('chat.assignToAgent') }}</TooltipContent>
-            </Tooltip>
-            <Tooltip v-if="activeTransferId">
-              <TooltipTrigger as-child>
-                <Button variant="ghost" size="icon" class="h-9 w-9 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100" :aria-label="$t('chat.resumeChatbot')" :disabled="isResuming" @click="resumeChatbot">
-                  <Play class="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{{ $t('chat.resumeChatbot') }}</TooltipContent>
             </Tooltip>
             <!-- Custom Action Buttons -->
             <Tooltip v-for="action in customActions" :key="action.id">
@@ -2278,14 +2430,6 @@ async function sendMediaMessage() {
                 <DropdownMenuItem v-if="canAssignContacts" @click="isAssignDialogOpen = true">
                   <UserPlus class="mr-2 h-4 w-4" />
                   <span>{{ $t('chat.assignToAgent') }}</span>
-                </DropdownMenuItem>
-                <DropdownMenuItem v-if="!activeTransferId" @click="transferToAgent" :disabled="isTransferring">
-                  <UserX class="mr-2 h-4 w-4" />
-                  <span>{{ $t('chat.transferToAgent') }}</span>
-                </DropdownMenuItem>
-                <DropdownMenuItem v-if="activeTransferId" @click="resumeChatbot" :disabled="isResuming">
-                  <Play class="mr-2 h-4 w-4" />
-                  <span>{{ $t('chat.resumeChatbot') }}</span>
                 </DropdownMenuItem>
                 <DropdownMenuItem @click="toggleRevenueWorkspace">
                   <Info class="mr-2 h-4 w-4" />
@@ -3136,6 +3280,16 @@ async function sendMediaMessage() {
 
     <!-- Add Contact Dialog -->
     <CreateContactDialog v-model:open="isAddContactOpen" @created="onContactCreated" />
+
+    <ContactIdentityReviewDialog
+      v-model:open="isIdentityReviewOpen"
+      :contact-id="contactsStore.currentContact?.id ?? null"
+      :contact-label="contactsStore.currentContact?.name || contactsStore.currentContact?.phone_number"
+      :effective-state="contactsStore.currentContact?.identity_review_ai_state"
+      :can-review="canReviewContactIdentity"
+      :can-view-staged="canViewStagedContactIdentity"
+      @resolved="refreshAfterIdentityReview"
+    />
   </div>
 </template>
 

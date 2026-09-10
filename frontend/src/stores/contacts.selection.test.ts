@@ -58,6 +58,13 @@ function contact(id: string): Contact {
     tags: [],
     metadata: {},
     unread_count: 0,
+    identity_review_ai_state: {
+      known: true,
+      ai_allowed: true,
+      blocked: false,
+      open_hold_count: 0,
+      reason: 'no_open_identity_review',
+    },
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
   }
@@ -250,6 +257,35 @@ describe('contacts store conversation selection', () => {
     expect(store.contacts.map(item => item.id)).toEqual(['organization-b-contact'])
     expect(store.contactsTotal).toBe(1)
     expect(store.isLoading).toBe(false)
+  })
+
+  it('polls a newly arriving hold into the selected contact without changing selection', async () => {
+    const { useContactsStore } = await import('./contacts')
+    const store = useContactsStore()
+    const selected = contact('selected')
+    store.contacts = [selected]
+    store.setCurrentContact(selected)
+
+    const blocked = {
+      ...contact('selected'),
+      identity_review_ai_state: {
+        known: true,
+        ai_allowed: false,
+        blocked: true,
+        open_hold_count: 1,
+        reason: 'identity_review_open',
+        latest_hold_id: 'hold-new',
+        latest_generation: 2,
+      },
+    }
+    mocks.listContacts.mockResolvedValue({
+      data: { data: { contacts: [blocked], total: 1 } },
+    })
+
+    await store.fetchContacts()
+
+    expect(store.currentContact?.id).toBe('selected')
+    expect(store.currentContact?.identity_review_ai_state).toEqual(blocked.identity_review_ai_state)
   })
 
   it('preserves the normalized active search when callers use the default contact refresh', async () => {

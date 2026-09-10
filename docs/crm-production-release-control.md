@@ -24,6 +24,45 @@ an exact full-spec compare-and-swap, wait for the replacement deployment to be
 healthy and active, then rebaseline the production contract and regenerate all
 release evidence on the resulting control SHA.
 
+### Compile-time database phase authority
+
+The four PostgreSQL rollout roles are four independently compiled immutable
+sources. A test that exercises all four branches from one integrated checkout
+is useful coverage, but is not release evidence for four roles. Every reviewed
+phase must have a distinct commit, root tree, and `internal` tree in
+`release/exact-sources.json`; sharing a `frontend` tree is allowed when a phase
+has no UI delta. Production code has no environment, command-line, linker, or
+configuration selector for this role. Its sole authority is the package-private
+`const compiledRLSMigrationPhase` literal in
+`internal/database/postgres.go`.
+
+The required database behavior is:
+
+| Phase | Exact legacy database | Exact future database |
+| --- | --- | --- |
+| `baseline` | prepare/verify legacy only; never activate future | verify read-only and remain repeatable |
+| `bridge` | run the complete coordinator and terminal future activation | verify read-only and remain repeatable |
+| `backend` | reject before mutation; never bootstrap legacy | require and verify future read-only |
+| `ui` | reject before mutation; never bootstrap legacy | require and verify future read-only |
+
+The manifest pins `release/validation/verify_database_phase_compatibility.sh`
+by SHA-256. The ordinary Test workflow invokes it only for the literal compiled
+into that checkout. Exact source validation invokes the control checkout's
+pinned harness against the selected clean source and PostgreSQL 17, publishes
+the canonical evidence, and makes `Exact database phase compatibility` a
+required gate dependency. Image publication independently reruns that harness,
+requires the same named validation job in the referenced validation attempt,
+and binds the canonical result to `image.json`, `scan.json`, and the signed exact
+source predicate. The digest-only release-set schema and its exact 14-artifact
+boundary remain unchanged; aggregation accepts image identities only when all
+three carry the identical source/workflow-bound compatibility result.
+
+Do not dispatch source validation or image publication for the new database
+contract until all four complete dependency closures have been exported and the
+reviewed commit/tree tuples have replaced the existing pins together in the
+manifest and both release workflows. Placeholder hashes, a dirty checkout, or a
+literal-only source lacking the shared coordinator and tests fail closed.
+
 ## One-time protected CRM fixture setup
 
 The fixture controls are a one-time bootstrap, not a replacement release lane.

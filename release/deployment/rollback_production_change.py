@@ -190,7 +190,10 @@ def _validate_rollback_receipt(
             common.fail("rollback did not preserve production state")
     if receipt["gates"] != {"deployment_succeeded": True, "migration_succeeded": True}:
         common.fail("rollback gates are incomplete")
-    if receipt["rollback"] != common.ROLLBACK_FLOORS[target]:
+    expected_floor = common.derive_rollback_floor(
+        current, common.ROLLBACK_FLOORS[current], target
+    )
+    if receipt["rollback"] != expected_floor:
         common.fail("post-rollback floor differs")
     canary = common.exact_keys(
         receipt["canary"],
@@ -382,7 +385,12 @@ def prepare_rollback_mutation_intent(
     ):
         common.fail("rollback artifact authority differs")
     target_phase = target_state["lineage"]["phase"]
-    common.validate_rollback_transition(current_phase, target_phase)
+    common.validate_rollback_transition(
+        current_phase, target_phase, current_floor=current_state["rollback"]
+    )
+    derived_floor = common.derive_rollback_floor(
+        current_phase, current_state["rollback"], target_phase
+    )
     _require_rollout_plan_authority(authorities, current_kind, current_state, target_state)
     recovery = apply_control.validate_recovery(recovery, recovery_sha256, checked)
     _require_recovery_target_plan_authority(recovery, target_state)
@@ -477,7 +485,7 @@ def prepare_rollback_mutation_intent(
                 }
             ),
         },
-        "rollback": copy.deepcopy(target_state["rollback"]),
+        "rollback": copy.deepcopy(derived_floor),
         "canary": {
             "required": True,
             "completed": False,
@@ -606,7 +614,12 @@ def rollback_change(
     if common.sha256_bytes(common.canonical_file_bytes(target_state)) != common.require_sha256(target_state_sha256, "target state hash"):
         common.fail("target phase-state exact-file hash differs")
     target_phase = target_state["lineage"]["phase"]
-    common.validate_rollback_transition(current_phase, target_phase)
+    common.validate_rollback_transition(
+        current_phase, target_phase, current_floor=current_state["rollback"]
+    )
+    derived_floor = common.derive_rollback_floor(
+        current_phase, current_state["rollback"], target_phase
+    )
     if authorities["current_state"]["sha256"] != current_state_sha256 or authorities["target_state"]["sha256"] != target_state_sha256:
         common.fail("rollback phase-state authority differs")
     if authorities["recovery"]["sha256"] != recovery_sha256:
@@ -648,6 +661,7 @@ def rollback_change(
             != authorities["rollout_plan_sha256"]
             or mutation_intent["authorities"]["recovery"]["sha256"]
             != recovery_sha256
+            or mutation_intent["rollback"] != derived_floor
             or mutation_intent["canary"]["route_contract_sha256"]
             != reviewed_route_hash
         ):
@@ -732,7 +746,7 @@ def rollback_change(
             "before": before,
             "after": after,
             "gates": {"deployment_succeeded": True, "migration_succeeded": True},
-            "rollback": copy.deepcopy(target_state["rollback"]),
+            "rollback": copy.deepcopy(derived_floor),
             "canary": {
                 "required": True,
                 "completed": False,

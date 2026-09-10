@@ -199,7 +199,14 @@ def rollout_plan() -> dict[str, object]:
         phases.append(
             {
                 "phase": phase,
-                "source": {"commit": source_sha},
+                "source": {
+                    "repository": "medtechcorps-netizen/whatomate",
+                    "commit": source_sha,
+                    "root_tree": f"{index + 5:x}" * 40,
+                    "frontend_tree": "a" * 40,
+                    "internal_tree": f"{index + 9:x}" * 40,
+                    "manifest_sha256": "b" * 64,
+                },
                 "images": images,
                 "migration": {"digest": images[0]["digest"]},
                 "rollback": copy.deepcopy(verifier.ROLLBACK_FLOORS[phase]),
@@ -569,6 +576,25 @@ class ProductionPlanTests(unittest.TestCase):
         return normalized, state_sha256
 
     def test_change_schema_deep_constraints_fail_closed(self) -> None:
+        def rollback_constraint(schema: dict[str, object], phase: str) -> dict[str, object]:
+            matches = []
+            for condition in schema["$defs"]["phaseState"]["allOf"]:
+                try:
+                    anchored_phase = condition["if"]["properties"]["lineage"][
+                        "properties"
+                    ]["phase"]["const"]
+                    constraint = condition["then"]["properties"]["rollback"]
+                except (KeyError, TypeError):
+                    continue
+                if anchored_phase == phase:
+                    matches.append(constraint)
+            self.assertEqual(len(matches), 1)
+            return matches[0]
+
+        def duplicate_bridge_variant(schema: dict[str, object]) -> None:
+            variants = rollback_constraint(schema, "bridge")["oneOf"]
+            variants[1] = copy.deepcopy(variants[0])
+
         mutations = {
             "receipt kind allowlist": lambda schema: schema["$defs"]["phaseState"][
                 "properties"
@@ -609,11 +635,26 @@ class ProductionPlanTests(unittest.TestCase):
             "closed tuple": lambda schema: schema["$defs"]["phaseState"][
                 "properties"
             ]["provider_state"]["properties"]["images"].__setitem__("items", {}),
-            "rollback phase binding": lambda schema: schema["$defs"]["phaseState"][
-                "allOf"
-            ][1]["then"]["properties"]["rollback"]["const"].__setitem__(
-                "allowed_targets", []
+            "non-bridge rollback phase binding": lambda schema: rollback_constraint(
+                schema, "baseline"
+            )["const"]["allowed_targets"].append(
+                "baseline"
             ),
+            "bridge rollback variant missing": lambda schema: rollback_constraint(
+                schema, "bridge"
+            )["oneOf"].pop(),
+            "bridge rollback variant extra": lambda schema: rollback_constraint(
+                schema, "bridge"
+            )["oneOf"].append(
+                {"const": copy.deepcopy(verifier.ROLLBACK_FLOORS["baseline"])}
+            ),
+            "bridge rollback variant altered": lambda schema: rollback_constraint(
+                schema, "bridge"
+            )["oneOf"][1]["const"]["forbidden_targets"].__setitem__(0, "bridge"),
+            "bridge rollback variant dead": duplicate_bridge_variant,
+            "bridge rollback variants swapped": lambda schema: rollback_constraint(
+                schema, "bridge"
+            )["oneOf"].reverse(),
             "success gate": lambda schema: schema["$defs"]["phaseState"][
                 "properties"
             ]["gates"]["properties"]["canary_succeeded"].__setitem__(
@@ -1292,6 +1333,270 @@ class ProductionPlanTests(unittest.TestCase):
                 schema_sha256=self.schema_hash,
                 predecessor_state=None,
             )
+
+    def test_database_phase_sources_are_independently_allocated(self) -> None:
+        for key in ("commit", "root_tree", "internal_tree"):
+            with self.subTest(key=key):
+                rollout = copy.deepcopy(self.rollout)
+                rollout["phases"][1]["source"][key] = rollout["phases"][0][
+                    "source"
+                ][key]
+                with self.assertRaisesRegex(
+                    verifier.PlanError,
+                    rf"database phase source allocation is not unique: {key}",
+                ):
+                    verifier.validate_rollout_plan(
+                        rollout,
+                        self.contract,
+                        self.normalized,
+                        policy=self.policy,
+                        policy_sha256=self.policy_hash,
+                        schema_sha256=self.schema_hash,
+                        predecessor_state=None,
+                    )
+
+        rollout = copy.deepcopy(self.rollout)
+        rollout["phases"][3]["source"]["manifest_sha256"] = "c" * 64
+        with self.assertRaisesRegex(
+            verifier.PlanError,
+            "rollout source manifest authority differs across phases",
+        ):
+            verifier.validate_rollout_plan(
+                rollout,
+                self.contract,
+                self.normalized,
+                policy=self.policy,
+                policy_sha256=self.policy_hash,
+                schema_sha256=self.schema_hash,
+                predecessor_state=None,
+            )
+
+    def test_effective_rollback_floor_is_strict_and_canonical(self) -> None:
+        self.assertEqual(
+            verifier.validate_effective_rollback_floor(
+                copy.deepcopy(verifier.ROLLBACK_FLOORS["bridge"]),
+                "bridge",
+                "test rollback floor",
+            ),
+            verifier.ROLLBACK_FLOORS["bridge"],
+        )
+        self.assertEqual(
+            verifier.validate_effective_rollback_floor(
+                copy.deepcopy(verifier.HARDENED_BRIDGE_ROLLBACK_FLOOR),
+                "bridge",
+                "test rollback floor",
+            ),
+            verifier.HARDENED_BRIDGE_ROLLBACK_FLOOR,
+        )
+        invalid = {
+            "missing key": {"allowed_targets": []},
+            "extra key": {
+                "allowed_targets": [],
+                "forbidden_targets": ["baseline"],
+                "source_phase": "backend",
+            },
+            "allowed not list": {
+                "allowed_targets": "baseline",
+                "forbidden_targets": [],
+            },
+            "forbidden not list": {
+                "allowed_targets": [],
+                "forbidden_targets": ("baseline",),
+            },
+            "unknown phase": {
+                "allowed_targets": [],
+                "forbidden_targets": ["genesis"],
+            },
+            "duplicate": {
+                "allowed_targets": ["baseline", "baseline"],
+                "forbidden_targets": [],
+            },
+            "overlap": {
+                "allowed_targets": ["baseline"],
+                "forbidden_targets": ["baseline"],
+            },
+            "noncanonical order": {
+                "allowed_targets": ["bridge", "backend"],
+                "forbidden_targets": ["baseline"],
+            },
+            "unreviewed canonical floor": {
+                "allowed_targets": [],
+                "forbidden_targets": ["bridge"],
+            },
+        }
+        for label, rollback in invalid.items():
+            with self.subTest(label=label):
+                with self.assertRaises(verifier.PlanError):
+                    verifier.validate_effective_rollback_floor(
+                        rollback,
+                        "bridge" if label != "noncanonical order" else "ui",
+                        "test rollback floor",
+                    )
+
+    def test_hardened_bridge_state_advances_to_backend_intrinsic_floor(self) -> None:
+        state = self.phase_state(
+            "bridge",
+            event_sequence=7,
+            operation="rollback",
+            source_phase="backend",
+            predecessor_kind="rollback-receipt",
+        )
+        state["rollback"] = copy.deepcopy(
+            verifier.HARDENED_BRIDGE_ROLLBACK_FLOOR
+        )
+
+        _, bridge_images = verifier.rollout_phase(
+            self.rollout, self.contract, "bridge"
+        )
+        live_spec = verifier.build_logical_candidate(
+            self.spec,
+            self.contract,
+            bridge_images,
+            "legacy-git",
+        )
+        provider = state["provider_state"]
+        provider["active_deployment_identity_sha256"] = verifier.sha256_bytes(
+            ACTIVE_DEPLOYMENT_ID.encode("utf-8")
+        )
+        provider["canonical_spec_sha256"] = verifier.sha256_value(live_spec)
+        provider["environment_values_sha256"] = (
+            verifier.environment_value_fingerprint(live_spec)
+        )
+        provider["non_source_projection_sha256"] = verifier.non_source_fingerprint(
+            live_spec, self.contract
+        )
+
+        normalized, _ = self.input_for_state(state)
+        target, _images, transition, _predecessor = verifier.validate_rollout_plan(
+            self.rollout,
+            self.contract,
+            normalized,
+            policy=self.policy,
+            policy_sha256=self.policy_hash,
+            schema_sha256=self.schema_hash,
+            predecessor_state=state,
+        )
+        self.assertEqual(transition["from"], "bridge")
+        self.assertEqual(transition["operation"], "activate")
+        self.assertEqual(transition["ordinal"], 3)
+        self.assertEqual(target["phase"], "backend")
+        self.assertEqual(target["rollback"], verifier.ROLLBACK_FLOORS["backend"])
+
+        app, deployment = self.responses()
+        app["app"]["spec"] = copy.deepcopy(live_spec)
+        deployment["deployment"]["spec"] = copy.deepcopy(live_spec)
+        app_path, deployment_path = verifier.provider_paths(
+            self.contract, self.target, ACTIVE_DEPLOYMENT_ID
+        )
+        plan = verifier.build_plan(
+            contract=self.contract,
+            contract_sha256="a" * 64,
+            policy=self.policy,
+            policy_sha256=self.policy_hash,
+            schema_sha256=self.schema_hash,
+            verifier_sha256="b" * 64,
+            normalized_input=normalized,
+            target_descriptor=self.target,
+            rollout_plan=self.rollout,
+            predecessor_state=state,
+            first_app_response=app,
+            first_deployment_response=deployment,
+            second_app_response=copy.deepcopy(app),
+            second_deployment_response=copy.deepcopy(deployment),
+            workflow_run_id="303",
+            workflow_run_attempt=1,
+            request_log=[
+                ("GET", app_path),
+                ("GET", deployment_path),
+                ("GET", app_path),
+                ("GET", deployment_path),
+            ],
+            now=NOW,
+        )
+        self.assertEqual(plan["target"]["phase"], "backend")
+        self.assertEqual(plan["rollback"], verifier.ROLLBACK_FLOORS["backend"])
+        verifier.validate_plan(
+            plan,
+            self.contract,
+            "a" * 64,
+            self.policy,
+            self.policy_hash,
+            self.schema_hash,
+            "b" * 64,
+            self.rollout,
+            self.rollout_hash,
+            state,
+            now=NOW,
+        )
+
+    def test_hardened_bridge_floor_is_provenance_bound_and_fail_closed(self) -> None:
+        activation = self.phase_state("bridge")
+        activation["rollback"] = copy.deepcopy(
+            verifier.HARDENED_BRIDGE_ROLLBACK_FLOOR
+        )
+        activation_normalized, _ = self.input_for_state(activation)
+        with self.assertRaisesRegex(
+            verifier.PlanError,
+            "phase-state rollback floor provenance differs",
+        ):
+            verifier.validate_phase_state(
+                activation,
+                self.contract,
+                self.policy,
+                activation_normalized,
+                self.rollout,
+                self.policy_hash,
+                self.schema_hash,
+            )
+
+        mutations = {
+            "overlap": {
+                "allowed_targets": ["baseline"],
+                "forbidden_targets": ["baseline"],
+            },
+            "duplicate forbidden": {
+                "allowed_targets": [],
+                "forbidden_targets": ["baseline", "baseline"],
+            },
+            "forbidden not list": {
+                "allowed_targets": [],
+                "forbidden_targets": "baseline",
+            },
+            "unknown phase": {
+                "allowed_targets": [],
+                "forbidden_targets": ["genesis"],
+            },
+            "extra key": {
+                "allowed_targets": [],
+                "forbidden_targets": ["baseline"],
+                "source_phase": "backend",
+            },
+            "noncanonical order": {
+                "allowed_targets": [],
+                "forbidden_targets": ["bridge", "baseline"],
+            },
+        }
+        for label, rollback in mutations.items():
+            with self.subTest(label=label):
+                state = self.phase_state(
+                    "bridge",
+                    event_sequence=7,
+                    operation="rollback",
+                    source_phase="backend",
+                    predecessor_kind="rollback-receipt",
+                )
+                state["rollback"] = rollback
+                normalized, _ = self.input_for_state(state)
+                with self.assertRaises(verifier.PlanError):
+                    verifier.validate_phase_state(
+                        state,
+                        self.contract,
+                        self.policy,
+                        normalized,
+                        self.rollout,
+                        self.policy_hash,
+                        self.schema_hash,
+                    )
 
     def test_each_signed_phase_authorizes_only_the_next_activation(self) -> None:
         for current_phase, next_phase in zip(

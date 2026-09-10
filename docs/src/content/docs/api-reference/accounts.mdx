@@ -37,6 +37,26 @@ PUT /api/integrations/meta
 
 Use `GET /api/integrations` to retrieve the exact public callback from `config.webhook_callback_path` and to check each credential's `configured` flag. A shared platform Meta app instead reports `management_mode: "platform"`; its webhook verify token is deployment-managed and read-only to the workspace.
 
+## Complete Embedded Signup
+
+Exchange the authorization code returned by Meta. `signup_mode` is required and binds the operator's selected flow to Meta's authoritative phone classification; ReReply rejects a classic/Coexistence mismatch before registration, subscription, or account persistence.
+
+```bash
+POST /api/accounts/exchange-token
+X-Organization-ID: <workspace UUID>
+```
+
+```json
+{
+  "code": "Meta authorization code",
+  "signup_mode": "coexistence",
+  "phone_id": "optional phone number ID",
+  "waba_id": "optional WABA ID"
+}
+```
+
+Use `signup_mode: "classic"` for the direct Cloud API flow. Meta may omit the phone ID from a Coexistence completion event; ReReply discovers and verifies the selected phone and WABA from the exchanged token before making provider changes.
+
 ## List Accounts
 
 Retrieve all connected WhatsApp accounts.
@@ -59,6 +79,21 @@ GET /api/accounts
         "business_id": "987654321",
         "has_access_token": true,
         "status": "active",
+        "is_smb": true,
+        "coexistence": {
+          "onboarding_status": "syncing",
+          "sync_status": "in_progress",
+          "sync_started_at": "2026-09-04T01:00:00Z",
+          "sync_deadline_at": "2026-09-05T01:00:00Z",
+          "contact_sync_status": "requested",
+          "contact_sync_requested_at": "2026-09-04T01:00:02Z",
+          "history_consent": "unknown",
+          "history_sync_status": "in_progress",
+          "history_sync_requested_at": "2026-09-04T01:00:03Z",
+          "history_progress_percent": 40,
+          "lifecycle_status": "connected",
+          "updated_at": "2026-09-04T01:05:00Z"
+        },
         "created_at": "2024-01-01T00:00:00Z"
       }
     ]
@@ -86,10 +121,23 @@ GET /api/accounts/{id}
     "business_id": "987654321",
     "has_access_token": true,
     "status": "active",
+    "is_smb": false,
     "created_at": "2024-01-01T00:00:00Z"
   }
 }
 ```
+
+### Coexistence fields
+
+`is_smb: true` identifies a number connected through WhatsApp Business App Coexistence. Its `coexistence` object is returned when ReReply has durable onboarding state for the account; the object is omitted for standard Cloud API accounts and older records without that state.
+
+The aggregate `onboarding_status` is one of `pending`, `connected`, `syncing`, `ready`, `failed`, `expired`, or `offboarded`. Contact and history stages use `not_requested`, `pending`, `requesting`, `requested`, `in_progress`, `completed`, `failed`, `declined`, or `expired`. `history_consent` is `unknown`, `granted`, or `declined`, and `lifecycle_status` is `unknown`, `connected`, `disconnected`, or `offboarded`.
+
+For contact sync, `requested` is the successful terminal acknowledgement: Meta returns a request ID but does not correlate the ongoing `smb_app_state_sync` contact-delta stream with that one-time request. Older records may show `completed`; clients should treat both values as accepted. History has explicit progress and can reach `completed` or `declined`.
+
+When Meta accepts both one-time requests but emits no history callback, the aggregate settles at `onboarding_status: "connected"` and `sync_status: "requested"`. This is a successful, stable state rather than an incomplete retry: if eligible history later arrives, the aggregate advances through `in_progress` and then `completed`.
+
+Provider error details and request identifiers are intentionally not returned. Use the status fields and timestamps to drive operator UI without exposing Meta diagnostics or credentials.
 
 ## Create Account
 
@@ -145,6 +193,44 @@ PUT /api/accounts/{id}
 ```
 
 Sending `app_id`, `app_secret`, or `webhook_verify_token` to the create, update, or Embedded Signup account endpoints is rejected. Existing legacy account-column values are retained only as a non-destructive callback fallback and are never returned by the Accounts API.
+
+## Retry Coexistence synchronization
+
+Retry an eligible initial contact or chat-history request after Meta definitively rejects it, or resume a stage that was durably recorded but never attempted.
+
+```bash
+POST /api/accounts/{id}/coexistence-sync
+X-Organization-ID: <workspace UUID>
+```
+
+The request body is empty. The caller needs `accounts:write` permission, and the account must be an active Coexistence connection in the selected workspace.
+
+### Response
+
+```json
+{
+  "status": "success",
+  "data": {
+    "success": true,
+    "coexistence": {
+      "onboarding_status": "syncing",
+      "sync_status": "in_progress",
+      "contact_sync_status": "requested",
+      "history_consent": "unknown",
+      "history_sync_status": "requested",
+      "history_progress_percent": 0,
+      "lifecycle_status": "connected",
+      "sync_deadline_at": "2026-09-05T01:00:00Z",
+      "updated_at": "2026-09-04T01:05:00Z"
+    },
+    "warning": ""
+  }
+}
+```
+
+<Aside type="caution">
+  Meta allows each initial data request once and requires it within 24 hours of the original Embedded Signup completion. ReReply records that deadline before subscribing the WABA. Recovering a failed WABA subscription does not start a new 24-hour window. The endpoint therefore refuses expired, already accepted, or ambiguous one-time requests with `409 Conflict` instead of replaying them.
+</Aside>
 
 ## Delete Account
 

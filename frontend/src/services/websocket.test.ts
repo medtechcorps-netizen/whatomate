@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
     addTransfer: vi.fn(),
     updateTransfer: vi.fn(),
     fetchTransfers: vi.fn().mockResolvedValue(undefined),
+    fetchActiveTransferForContact: vi.fn().mockResolvedValue(undefined),
     resetForIdentityChange: vi.fn(),
   },
   callingStore: {
@@ -389,6 +390,101 @@ describe('WebSocketService realtime reliability', () => {
     expect(mocks.contactsStore.fetchContacts).toHaveBeenCalledTimes(1)
     expect(mocks.contactsStore.refreshCurrentMessages).toHaveBeenCalledTimes(1)
     expect(mocks.transfersStore.fetchTransfers).toHaveBeenCalledTimes(1)
+    expect(mocks.transfersStore.fetchActiveTransferForContact).toHaveBeenCalledWith('contact-1')
+  })
+
+  it('keeps the transfer creator identity in realtime pause state', async () => {
+    service = await loadService()
+    await service.connect(async () => 'ws-token')
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+
+    socket.receive({
+      type: 'agent_transfer',
+      payload: {
+        id: 'transfer-1',
+        contact_id: 'contact-1',
+        contact_name: 'Aina Rahman',
+        phone_number: '60123456789',
+        whatsapp_account: 'clinic-whatsapp',
+        status: 'active',
+        source: 'manual',
+        transferred_by: 'agent-1',
+        transferred_at: '2026-08-30T00:00:00Z',
+      },
+    })
+
+    expect(mocks.transfersStore.addTransfer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'transfer-1',
+        contact_id: 'contact-1',
+        transferred_by: 'agent-1',
+      }),
+    )
+  })
+
+  it('reconciles an uncached resume by authoritative event contact identity', async () => {
+    mocks.transfersStore.updateTransfer.mockReturnValueOnce(false)
+    service = await loadService()
+    await service.connect(async () => 'ws-token')
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+
+    socket.receive({
+      type: 'agent_transfer_resume',
+      payload: {
+        id: 'transfer-1',
+        contact_id: 'contact-1',
+        status: 'resumed',
+        resumed_at: '2026-08-30T01:00:00Z',
+        resumed_by: 'agent-2',
+      },
+    })
+
+    expect(mocks.transfersStore.updateTransfer).toHaveBeenCalledWith(
+      'transfer-1',
+      {
+        status: 'resumed',
+        resumed_at: '2026-08-30T01:00:00Z',
+        resumed_by: 'agent-2',
+      },
+      'contact-1',
+    )
+    expect(mocks.transfersStore.fetchActiveTransferForContact).toHaveBeenCalledWith('contact-1')
+    expect(mocks.transfersStore.fetchTransfers).toHaveBeenCalledTimes(1)
+    expect(
+      mocks.transfersStore.fetchActiveTransferForContact.mock.invocationCallOrder[0],
+    ).toBeLessThan(mocks.transfersStore.fetchTransfers.mock.invocationCallOrder[0])
+  })
+
+  it('reconciles an uncached reassignment by authoritative event contact identity', async () => {
+    mocks.transfersStore.updateTransfer.mockReturnValueOnce(false)
+    service = await loadService()
+    await service.connect(async () => 'ws-token')
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+
+    socket.receive({
+      type: 'agent_transfer_assign',
+      payload: {
+        id: 'transfer-1',
+        contact_id: 'contact-1',
+        status: 'active',
+        agent_id: 'agent-new',
+        team_id: 'team-1',
+      },
+    })
+
+    expect(mocks.transfersStore.updateTransfer).toHaveBeenCalledWith(
+      'transfer-1',
+      { agent_id: 'agent-new', team_id: 'team-1' },
+      'contact-1',
+    )
+    expect(mocks.transfersStore.fetchActiveTransferForContact).toHaveBeenCalledWith('contact-1')
+    expect(mocks.transfersStore.fetchTransfers).toHaveBeenCalledTimes(1)
+    expect(
+      mocks.transfersStore.fetchActiveTransferForContact.mock.invocationCallOrder[0],
+    ).toBeLessThan(mocks.transfersStore.fetchTransfers.mock.invocationCallOrder[0])
   })
 
   it('emits inbox activity for message, status, and canonical sync events', async () => {

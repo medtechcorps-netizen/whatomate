@@ -135,6 +135,15 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	// Query params
 	status := string(r.RequestCtx.QueryArgs().Peek("status"))
 	teamIDStr := string(r.RequestCtx.QueryArgs().Peek("team_id"))
+	contactIDStr := string(r.RequestCtx.QueryArgs().Peek("contact_id"))
+	var contactID *uuid.UUID
+	if contactIDStr != "" {
+		parsedContactID, parseErr := uuid.Parse(contactIDStr)
+		if parseErr != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid contact_id", nil, "")
+		}
+		contactID = &parsedContactID
+	}
 
 	// Pagination params
 	limit := 100 // Default limit
@@ -213,6 +222,9 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	if status != "" {
 		query = query.Where("agent_transfers.status = ?", status)
 	}
+	if contactID != nil {
+		query = query.Where("agent_transfers.contact_id = ?", *contactID)
+	}
 
 	// Filter by team if provided
 	if teamIDStr != "" {
@@ -241,12 +253,24 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 
 	// Filter based on permissions
 	if !hasFullAccess {
-		// Users without full access see their assigned transfers + unassigned in their team queues + general queue
+		// Users without full access see their assigned transfers + unassigned in
+		// their team queues + general queue. An exact contact lookup also lets the
+		// creator observe a transfer that assignment policy routed to somebody
+		// else, so the Chat header cannot falsely claim AI is active immediately
+		// after that user paused it. Resume authorization remains stricter.
 		if len(userTeamIDs) > 0 {
-			query = query.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userTeamIDs)
+			if contactID != nil {
+				query = query.Where("agent_transfers.transferred_by_user_id = ? OR agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userID, userTeamIDs)
+			} else {
+				query = query.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userTeamIDs)
+			}
 		} else {
 			// User not in any team - see own transfers + general queue only
-			query = query.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID)
+			if contactID != nil {
+				query = query.Where("agent_transfers.transferred_by_user_id = ? OR agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID, userID)
+			} else {
+				query = query.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID)
+			}
 		}
 	}
 	// Users with full access see all transfers (no filter applied)
@@ -257,6 +281,9 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	if status != "" {
 		countQuery = countQuery.Where("agent_transfers.status = ?", status)
 	}
+	if contactID != nil {
+		countQuery = countQuery.Where("agent_transfers.contact_id = ?", *contactID)
+	}
 	if teamIDStr != "" {
 		if teamIDStr == "general" {
 			countQuery = countQuery.Where("agent_transfers.team_id IS NULL")
@@ -266,9 +293,17 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	}
 	if !hasFullAccess {
 		if len(userTeamIDs) > 0 {
-			countQuery = countQuery.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userTeamIDs)
+			if contactID != nil {
+				countQuery = countQuery.Where("agent_transfers.transferred_by_user_id = ? OR agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userID, userTeamIDs)
+			} else {
+				countQuery = countQuery.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND (agent_transfers.team_id IS NULL OR agent_transfers.team_id IN ?))", userID, userTeamIDs)
+			}
 		} else {
-			countQuery = countQuery.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID)
+			if contactID != nil {
+				countQuery = countQuery.Where("agent_transfers.transferred_by_user_id = ? OR agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID, userID)
+			} else {
+				countQuery = countQuery.Where("agent_transfers.agent_id = ? OR (agent_transfers.agent_id IS NULL AND agent_transfers.team_id IS NULL)", userID)
+			}
 		}
 	}
 	countQuery.Count(&totalCount)
@@ -445,6 +480,12 @@ func createActiveAgentTransferTx(
 ) error {
 	if tx == nil || transfer == nil {
 		return errors.New("complete agent transfer transaction state is required")
+	}
+	if err := database.LockOrganizationPolicyScope(
+		tx,
+		transfer.OrganizationID,
+	); err != nil {
+		return fmt.Errorf("lock transfer organization policy scope: %w", err)
 	}
 	if err := database.LockContactPolicyScope(
 		tx,
@@ -705,6 +746,9 @@ func (a *App) ResumeFromTransfer(r *fastglue.Request) error {
 	errTransferAccessDenied := errors.New("transfer access denied")
 	var transfer models.AgentTransfer
 	txErr := a.DB.Transaction(func(tx *gorm.DB) error {
+		if lockErr := database.LockOrganizationPolicyScope(tx, orgID); lockErr != nil {
+			return lockErr
+		}
 		if lockErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND organization_id = ?", transferID, orgID).
 			First(&transfer).Error; lockErr != nil {
@@ -713,8 +757,14 @@ func (a *App) ResumeFromTransfer(r *fastglue.Request) error {
 		if transfer.Status != models.TransferStatusActive {
 			return errTransferNotActive
 		}
+		ownsAssignedTransfer := transfer.AgentID != nil && *transfer.AgentID == userID
+		ownsUnassignedManualTransfer := transfer.AgentID == nil &&
+			transfer.Source == models.TransferSourceManual &&
+			transfer.TransferredByUserID != nil &&
+			*transfer.TransferredByUserID == userID
 		if !hasManagementAccess &&
-			(transfer.AgentID == nil || *transfer.AgentID != userID) {
+			!ownsAssignedTransfer &&
+			!ownsUnassignedManualTransfer {
 			return errTransferAccessDenied
 		}
 
@@ -740,7 +790,14 @@ func (a *App) ResumeFromTransfer(r *fastglue.Request) error {
 		transfer.Status = models.TransferStatusResumed
 		transfer.ResumedAt = &now
 		transfer.ResumedBy = &userID
-		return nil
+		// Clear only while Resume still owns the policy fence. A later inbound
+		// message may create a new inactivity generation as soon as it releases.
+		return tx.Model(&models.Contact{}).
+			Where("id = ? AND organization_id = ?", transfer.ContactID, orgID).
+			Updates(map[string]any{
+				"chatbot_last_message_at": nil,
+				"chatbot_reminder_sent":   false,
+			}).Error
 	})
 	switch {
 	case errors.Is(txErr, gorm.ErrRecordNotFound):
@@ -748,14 +805,11 @@ func (a *App) ResumeFromTransfer(r *fastglue.Request) error {
 	case errors.Is(txErr, errTransferNotActive):
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Transfer is not active", nil, "")
 	case errors.Is(txErr, errTransferAccessDenied):
-		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You can only resume a transfer assigned to you", nil, "")
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You can only resume a transfer assigned to you or an unassigned manual transfer you created", nil, "")
 	case txErr != nil:
 		a.Log.Error("Failed to resume transfer", "error", txErr, "transfer_id", transferID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to resume transfer", nil, "")
 	}
-
-	// Clear chatbot tracking so client inactivity SLA doesn't trigger after transfer is closed
-	a.ClearContactChatbotTracking(transfer.ContactID)
 
 	// Broadcast WebSocket notification
 	a.broadcastTransferResumed(&transfer)
@@ -850,6 +904,12 @@ func (a *App) AssignAgentTransfer(r *fastglue.Request) error {
 	errTransferNotActive := errors.New("transfer is not active")
 	var transfer models.AgentTransfer
 	txErr := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		// Assignment preserves active policy. Take its shared row fence before
+		// Contact/Transfer: block Resume's UPDATE without conflicting with the
+		// tenant write guard's SHARE lock in ordinary queue/availability writes.
+		if lockErr := database.LockOrganizationAIAttemptScope(tx, orgID); lockErr != nil {
+			return lockErr
+		}
 		canonicalContact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
 			tx,
 			orgID,
@@ -1231,6 +1291,9 @@ func (a *App) broadcastTransferCreated(transfer *models.AgentTransfer, contact *
 	if transfer.TeamID != nil {
 		payload["team_id"] = transfer.TeamID.String()
 	}
+	if transfer.TransferredByUserID != nil {
+		payload["transferred_by"] = transfer.TransferredByUserID.String()
+	}
 
 	a.WSHub.BroadcastToOrg(transfer.OrganizationID, websocket.WSMessage{
 		Type:    websocket.TypeAgentTransfer,
@@ -1309,7 +1372,13 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 	var savedTransfer models.AgentTransfer
 	var canonicalContact models.Contact
 
-	err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+	write := func(tx *gorm.DB) error {
+		if lockErr := database.LockOrganizationPolicyScope(
+			tx,
+			baseTransfer.OrganizationID,
+		); lockErr != nil {
+			return lockErr
+		}
 		canonical, err := contactutil.ResolveCanonicalContactForUpdate(
 			tx,
 			baseTransfer.OrganizationID,
@@ -1325,6 +1394,21 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		if err := createActiveAgentTransferTx(tx, &candidate); err != nil {
 			return err
 		}
+		if err := suppressUnfinishedInboundForTransfer(tx, baseTransfer.OrganizationID, canonical.ID); err != nil {
+			return err
+		}
+		// Invalidate any timer selected before this handover in the same policy
+		// transaction. Resume must not make that old generation eligible again.
+		if err := tx.Model(&models.Contact{}).
+			Where("id = ? AND organization_id = ?", canonical.ID, baseTransfer.OrganizationID).
+			Updates(map[string]any{
+				"chatbot_last_message_at": nil,
+				"chatbot_reminder_sent":   false,
+			}).Error; err != nil {
+			return err
+		}
+		canonical.ChatbotLastMessageAt = nil
+		canonical.ChatbotReminderSent = false
 
 		// Update contact assignment if agent assigned, but only when
 		// AssignToSameAgent is enabled and no relationship manager is already
@@ -1366,7 +1450,22 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		savedTransfer = candidate
 		canonicalContact = *canonical
 		return nil
-	})
+	}
+	var err error
+	if a.inboundContinuation != nil {
+		// The continuation's outer RLS transaction may later execute a flow
+		// completion callback under the independent organization AI fence. Commit
+		// the transfer policy first so that callback cannot wait on an UPDATE lock
+		// held by its own outer transaction.
+		err = a.rootApp().WithCommittedTenantApp(
+			baseTransfer.OrganizationID,
+			func(scoped *App) error {
+				return canonicalContactWriteTransaction(scoped.DB, write)
+			},
+		)
+	} else {
+		err = canonicalContactWriteTransaction(a.DB, write)
+	}
 	if err != nil {
 		return err
 	}
@@ -1378,6 +1477,31 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 	a.broadcastTransferCreated(transfer, contact)
 
 	return nil
+}
+
+// suppressUnfinishedInboundForTransfer runs under the organization policy and
+// canonical-contact locks. Admission takes the same policy lock, so the update
+// cuts off every previously committed unfinished native continuation without
+// suppressing a future post-Resume message. Jobs remain runnable for media and
+// inbox projection; action claims and uncertain outcomes are never rewritten.
+func suppressUnfinishedInboundForTransfer(tx *gorm.DB, organizationID, contactID uuid.UUID) error {
+	metadata, err := json.Marshal(models.JSONB{
+		incomingAutomaticAISuppressedKey:        true,
+		incomingAutomaticAISuppressionReasonKey: database.AutomaticReplyBlockedHumanHandover,
+		incomingAutomaticAISuppressedAtKey:      time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return err
+	}
+	continuations := tx.Model(&models.ScheduledJob{}).
+		Select("aggregate_id").
+		Where("organization_id = ? AND kind = ? AND aggregate_type = ?", organizationID, inboundContinuationJobKind, "message")
+	return tx.Model(&models.Message{}).
+		Where("organization_id = ? AND contact_id = ? AND direction = ?", organizationID, contactID, models.DirectionIncoming).
+		Where("id IN (?)", continuations).
+		Where("metadata->'inbound_continuation_completed' IS DISTINCT FROM 'true'::jsonb").
+		Where("metadata->? IS DISTINCT FROM 'true'::jsonb", incomingAutomaticAISuppressedKey).
+		Update("metadata", gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", string(metadata))).Error
 }
 
 // createTransferToQueue creates an unassigned agent transfer that goes to the queue

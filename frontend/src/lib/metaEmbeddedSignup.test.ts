@@ -3,6 +3,7 @@ import {
   createMetaEmbeddedSignupSession,
   isAllowedMetaEmbeddedSignupOrigin,
   type MetaEmbeddedSignupAbortReason,
+  type MetaEmbeddedSignupMode,
   type MetaEmbeddedSignupResult,
 } from "./metaEmbeddedSignup";
 
@@ -22,6 +23,7 @@ function finishMessage(
 function createHarness(
   codeFallbackMs = 50,
   context?: { isCurrent: () => boolean },
+  mode: MetaEmbeddedSignupMode = "classic",
 ) {
   const completed: MetaEmbeddedSignupResult[] = [];
   const aborted: Array<{
@@ -31,6 +33,7 @@ function createHarness(
   let settledCount = 0;
   let contextChangedCount = 0;
   const session = createMetaEmbeddedSignupSession({
+    mode,
     codeFallbackMs,
     onComplete: (result) => completed.push(result),
     onAbort: (reason, detail) => aborted.push({ reason, detail }),
@@ -108,6 +111,7 @@ describe("createMetaEmbeddedSignupSession", () => {
     expect(harness.completed).toEqual([
       {
         code: "code-abc",
+        mode: "classic",
         phoneNumberId: "phone-123",
         wabaId: "waba-456",
       },
@@ -135,6 +139,7 @@ describe("createMetaEmbeddedSignupSession", () => {
     expect(harness.completed).toEqual([
       {
         code: "code-abc",
+        mode: "classic",
         phoneNumberId: "phone-123",
         wabaId: "waba-456",
       },
@@ -158,6 +163,7 @@ describe("createMetaEmbeddedSignupSession", () => {
     expect(harness.completed).toEqual([
       {
         code: "code-abc",
+        mode: "classic",
         phoneNumberId: undefined,
         wabaId: "waba-456",
       },
@@ -166,7 +172,7 @@ describe("createMetaEmbeddedSignupSession", () => {
 
   it("completes WhatsApp Business App onboarding with a WABA-only message", () => {
     vi.useFakeTimers();
-    const harness = createHarness();
+    const harness = createHarness(50, undefined, "coexistence");
 
     harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
     harness.session.handleMessage({
@@ -174,6 +180,7 @@ describe("createMetaEmbeddedSignupSession", () => {
       data: {
         type: "WA_EMBEDDED_SIGNUP",
         event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+        version: 3,
         data: { waba_id: "waba-789" },
       },
     });
@@ -182,6 +189,7 @@ describe("createMetaEmbeddedSignupSession", () => {
     expect(harness.completed).toEqual([
       {
         code: "code-abc",
+        mode: "coexistence",
         phoneNumberId: undefined,
         wabaId: "waba-789",
       },
@@ -209,6 +217,7 @@ describe("createMetaEmbeddedSignupSession", () => {
     expect(harness.completed).toEqual([
       {
         code: "code-abc",
+        mode: "classic",
         phoneNumberId: "phone-123",
         wabaId: undefined,
       },
@@ -233,6 +242,7 @@ describe("createMetaEmbeddedSignupSession", () => {
     expect(harness.completed).toEqual([
       {
         code: "code-abc",
+        mode: "classic",
         phoneNumberId: undefined,
         wabaId: undefined,
       },
@@ -256,9 +266,63 @@ describe("createMetaEmbeddedSignupSession", () => {
 
     expect(harness.completed[0]).toEqual({
       code: "code-abc",
+      mode: "classic",
       phoneNumberId: undefined,
       wabaId: undefined,
     });
+  });
+
+  it("ignores classic and wrong-version finish events in Coexistence mode", () => {
+    vi.useFakeTimers();
+    const harness = createHarness(50, undefined, "coexistence");
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+
+    harness.session.handleMessage(finishMessage());
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+        version: 2,
+        data: { waba_id: "wrong-version-waba" },
+      },
+    });
+    expect(harness.completed).toHaveLength(0);
+
+    vi.advanceTimersByTime(50);
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "coexistence",
+        phoneNumberId: undefined,
+        wabaId: undefined,
+      },
+    ]);
+  });
+
+  it("ignores a Coexistence finish event in classic mode", () => {
+    vi.useFakeTimers();
+    const harness = createHarness();
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+        version: 3,
+        data: { waba_id: "coexistence-waba" },
+      },
+    });
+
+    vi.advanceTimersByTime(50);
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "classic",
+        phoneNumberId: undefined,
+        wabaId: undefined,
+      },
+    ]);
   });
 
   it.each([

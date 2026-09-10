@@ -16,6 +16,45 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestEnsureLegacyMetaWhatsAppAccountCreatesOnlyCredentialFreeAccountShadow(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	testutil.TruncateTables(db)
+
+	organization := createLegacyMetaTestOrganization(t, db, "account-only")
+	otherOrganization := createLegacyMetaTestOrganization(t, db, "account-only-other")
+	account := createLegacyMetaTestAccount(t, db, organization.ID, "Identity Review")
+
+	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	require.NoError(t, err)
+	require.NotNil(t, shadow)
+	assert.Equal(t, organization.ID, shadow.OrganizationID)
+	assert.Equal(t, models.ChannelWhatsApp, shadow.Channel)
+	assert.Equal(t, channelapi.LegacyMetaProvider, shadow.Provider)
+	assert.Equal(t, false, shadow.Config["outbound_enabled"])
+	assert.Equal(t, true, shadow.Config["legacy_read_only"])
+
+	replayed, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	require.NoError(t, err)
+	assert.Equal(t, shadow.ID, replayed.ID)
+
+	for model, label := range map[any]string{
+		&models.Contact{}:           "contacts",
+		&models.Message{}:           "messages",
+		&models.InboxConversation{}: "conversations",
+		&models.OutboxJob{}:         "outbox jobs",
+		&models.ChannelCredential{}: "channel credentials",
+	} {
+		var count int64
+		require.NoError(t, db.Model(model).Where("organization_id = ?", organization.ID).Count(&count).Error)
+		assert.Zero(t, count, "account-only bridge must not create %s", label)
+	}
+
+	wrongTenant := legacyMetaRef(account)
+	wrongTenant.OrganizationID = otherOrganization.ID
+	_, err = channelapi.EnsureLegacyMetaWhatsAppAccount(db, wrongTenant)
+	require.Error(t, err)
+}
+
 func TestLegacyMetaMirrorIsTenantScopedIdempotentAndDeliveryNeutral(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 

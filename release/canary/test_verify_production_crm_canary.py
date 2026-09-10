@@ -727,6 +727,53 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(state["lineage"]["phase"], "backend")
         self.assertEqual(state["evidence"]["change_receipt_sha256"], receipt_hash)
 
+    def test_canary_preserves_hardened_backend_to_bridge_floor(self) -> None:
+        previous = sys.modules.pop("rollback_production_change", None)
+        try:
+            shared_release = canary.load_phase_state_release_module(
+                MODULE_PATH.parents[2], "rollback"
+            )
+            value = rollback_receipt()
+            value["lineage"].update(
+                {
+                    "phase_ordinal": 2,
+                    "from": "backend",
+                    "to": "bridge",
+                    "phase": "bridge",
+                }
+            )
+            value["rollback"] = {
+                "allowed_targets": [],
+                "forbidden_targets": ["baseline"],
+            }
+            receipt_hash = hashlib.sha256(
+                canary.canonical_file_bytes(value)
+            ).hexdigest()
+            evidence = descriptor(receipt_hash)
+            evidence["receipt_kind"] = "rollback"
+            state = canary.build_phase_state(
+                value,
+                evidence,
+                release=shared_release,
+                canary_sha256=digest("f"),
+                control_sha="a" * 40,
+                run_id="5003",
+                run_attempt=1,
+                completed_at="2026-08-27T01:02:00Z",
+                policy_sha256=value["control"]["release_policy_sha256"],  # type: ignore[index]
+                schema_sha256=value["control"]["change_schema_sha256"],  # type: ignore[index]
+            )
+            self.assertEqual(state["rollback"], value["rollback"])
+            shared_release.validate_phase_state(state)
+            with self.assertRaises(shared_release.ReleaseError):
+                shared_release.validate_rollback_transition(
+                    "bridge", "baseline", current_floor=state["rollback"]
+                )
+        finally:
+            sys.modules.pop("rollback_production_change", None)
+            if previous is not None:
+                sys.modules["rollback_production_change"] = previous
+
     def test_reconciled_rollback_preloads_canonical_module_in_clean_process(self) -> None:
         previous = sys.modules.pop("rollback_production_change", None)
         try:

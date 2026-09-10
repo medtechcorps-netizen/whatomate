@@ -247,7 +247,7 @@ def orphan_rollback_chain() -> dict[str, Any]:
         },
         "operation": "rollback",
         "lineage": {
-            "event_sequence": 2,
+            "event_sequence": 3,
             "phase_ordinal": 1,
             "operation": "rollback",
             "from": "bridge",
@@ -614,6 +614,181 @@ class FinalizeProductionOrphanLockTests(unittest.TestCase):
         )
         finalizer.validate_finalization_authorization(authorization, now=NOW)
         self.assertEqual(set(authorization), set(self.schema["required"]))
+
+    def test_phase_state_floor_must_equal_its_exact_change_receipt(self) -> None:
+        arguments = chain("committed")
+        receipt = arguments["reconciliation"]
+        receipt_hash = common.sha256_bytes(common.canonical_file_bytes(receipt))
+        finalizer._assert_phase_state_chain(
+            arguments["phase_state"],
+            receipt=receipt,
+            receipt_hash=receipt_hash,
+            receipt_kind="reconciliation-receipt",
+            control=arguments["control"],
+        )
+        drifted = copy.deepcopy(arguments["phase_state"])
+        drifted["rollback"] = {
+            "allowed_targets": [],
+            "forbidden_targets": ["baseline"],
+        }
+        with self.assertRaises(common.ReleaseError):
+            finalizer._assert_phase_state_chain(
+                drifted,
+                receipt=receipt,
+                receipt_hash=receipt_hash,
+                receipt_kind="reconciliation-receipt",
+                control=arguments["control"],
+            )
+
+    def test_orphan_rollback_floor_cannot_be_cross_spliced(self) -> None:
+        arguments = orphan_rollback_chain()
+        finalizer._assert_orphan_rollback_chain(
+            reconciliation=arguments["reconciliation"],
+            reconciliation_authority=arguments["reconciliation_authority"],
+            original_intent=arguments["mutation_intent"],
+            orphan_intent=arguments["orphan_rollback_intent"],
+            orphan_intent_authority=arguments["orphan_rollback_intent_authority"],
+            orphan_receipt=arguments["orphan_rollback"],
+            control=arguments["control"],
+        )
+        mutants = []
+        floor_drift = copy.deepcopy(arguments)
+        floor_drift["orphan_rollback"]["rollback"] = {
+            "allowed_targets": [],
+            "forbidden_targets": ["baseline"],
+        }
+        mutants.append(floor_drift)
+        source_drift = copy.deepcopy(arguments)
+        source_drift["orphan_rollback_intent"]["lineage"]["from"] = "ui"
+        mutants.append(source_drift)
+        sequence_drift = copy.deepcopy(arguments)
+        sequence_drift["orphan_rollback_intent"]["lineage"]["event_sequence"] = 99
+        mutants.append(sequence_drift)
+        for drifted in mutants:
+            with self.subTest(index=mutants.index(drifted)):
+                with self.assertRaises(common.ReleaseError):
+                    finalizer._assert_orphan_rollback_chain(
+                        reconciliation=drifted["reconciliation"],
+                        reconciliation_authority=drifted["reconciliation_authority"],
+                        original_intent=drifted["mutation_intent"],
+                        orphan_intent=drifted["orphan_rollback_intent"],
+                        orphan_intent_authority=drifted["orphan_rollback_intent_authority"],
+                        orphan_receipt=drifted["orphan_rollback"],
+                        control=drifted["control"],
+                    )
+
+    def test_finalization_rejects_fully_authenticated_orphan_lineage_splice(self) -> None:
+        arguments = orphan_rollback_chain()
+        original = arguments["mutation_intent"]
+        assertion = arguments["lock_assertion"]
+        reconciliation = arguments["reconciliation"]
+
+        original["lineage"].update({
+            "event_sequence": 3,
+            "phase_ordinal": 3,
+            "operation": "activate",
+            "from": "bridge",
+            "to": "backend",
+            "phase": "backend",
+        })
+        original["rollback"] = copy.deepcopy(common.ROLLBACK_FLOORS["backend"])
+        common.validate_mutation_intent(original)
+        original_hash = common.sha256_bytes(common.canonical_file_bytes(original))
+        arguments["mutation_intent_authority"]["binding"]["sha256"] = original_hash
+
+        assertion["mutation_intent_sha256"] = original_hash
+        assertion_hash = common.sha256_bytes(common.canonical_file_bytes(assertion))
+        arguments["lock_assertion_authority"]["binding"]["sha256"] = assertion_hash
+
+        reconciliation["intent"]["binding"]["sha256"] = original_hash
+        reconciliation["lock_assertion"]["mutation_intent_sha256"] = original_hash
+        reconciliation["lock_assertion"]["binding"]["sha256"] = assertion_hash
+        reconciliation["lineage"] = copy.deepcopy(original["lineage"])
+        reconciliation["authorities"]["upstream"] = copy.deepcopy(
+            original["authorities"]
+        )
+        reconciliation["rollback"] = copy.deepcopy(original["rollback"])
+        common.validate_reconciliation_receipt(reconciliation)
+        reconciliation_hash = common.sha256_bytes(
+            common.canonical_file_bytes(reconciliation)
+        )
+        arguments["reconciliation_authority"]["binding"]["sha256"] = (
+            reconciliation_hash
+        )
+
+        orphan_intent = arguments["orphan_rollback_intent"]
+        orphan_intent["lineage"].update({
+            "event_sequence": 99,
+            "phase_ordinal": 2,
+            "from": "ui",
+            "to": "bridge",
+            "phase": "bridge",
+            "predecessor_state_sha256": reconciliation_hash,
+        })
+        orphan_intent["authorities"]["current_state"]["sha256"] = (
+            reconciliation_hash
+        )
+        orphan_intent["lock"]["owner_intent_sha256"] = original_hash
+        orphan_intent["rollback"] = {
+            "allowed_targets": [],
+            "forbidden_targets": ["baseline"],
+        }
+        common.validate_mutation_intent(orphan_intent)
+        orphan_intent_hash = common.sha256_bytes(
+            common.canonical_file_bytes(orphan_intent)
+        )
+        arguments["orphan_rollback_intent_authority"]["binding"]["sha256"] = (
+            orphan_intent_hash
+        )
+
+        orphan_receipt = arguments["orphan_rollback"]
+        orphan_receipt["lineage"] = copy.deepcopy(orphan_intent["lineage"])
+        orphan_receipt["authorities"]["current_state"]["sha256"] = (
+            reconciliation_hash
+        )
+        orphan_receipt["authorities"]["mutation_intent"]["sha256"] = (
+            orphan_intent_hash
+        )
+        orphan_receipt["rollback"] = copy.deepcopy(orphan_intent["rollback"])
+        rollback = __import__("rollback_production_change")
+        rollback.validate_orphan_rollback_receipt(orphan_receipt)
+        orphan_receipt_hash = common.sha256_bytes(
+            common.canonical_file_bytes(orphan_receipt)
+        )
+        arguments["orphan_rollback_authority"]["binding"]["sha256"] = (
+            orphan_receipt_hash
+        )
+
+        phase = common.build_phase_state(
+            orphan_receipt,
+            change_receipt_sha256=orphan_receipt_hash,
+            canary_sha256=sha("8"),
+            control={
+                "workflow_sha": fixtures.RECONCILE_CONTROL_SHA,
+                "workflow_path": finalizer.CANARY_WORKFLOW_PATH,
+                "run_id": "402",
+                "run_attempt": 1,
+                "runner_environment": "github-hosted",
+                "release_policy_sha256": sha("c"),
+                "change_schema_sha256": sha("d"),
+            },
+            completed_at="2026-08-27T00:06:30Z",
+        )
+        arguments["phase_state"] = phase
+        phase_hash = common.sha256_bytes(common.canonical_file_bytes(phase))
+        arguments["phase_state_authority"]["binding"]["sha256"] = phase_hash
+        arguments["request"] = finalizer._expected_break_glass_request(
+            control=arguments["control"],
+            intent=original,
+            reconciliation=reconciliation,
+            closure_kind=finalizer.CLOSURE_ORPHAN_ROLLBACK,
+            closure_receipt_sha256=orphan_receipt_hash,
+            orphan_rollback_sha256=orphan_receipt_hash,
+            phase_state_sha256=phase_hash,
+        )
+
+        with self.assertRaises(common.ReleaseError):
+            finalizer.build_finalization_authorization(**arguments)
 
     def test_schema_objects_are_closed_and_require_every_property(self) -> None:
         def walk(value: object) -> None:

@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +15,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	qwenapi "github.com/shridarpatil/whatomate/internal/qwen"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
@@ -39,13 +42,16 @@ func redactURLForLog(raw string) string {
 
 // IncomingTextMessage represents a text, interactive, or media message from the webhook
 type IncomingTextMessage struct {
-	From       string `json:"from"`
-	FromUserID string `json:"from_user_id,omitempty"` // BSUID
-	To         string `json:"to,omitempty"`
-	ID         string `json:"id"`
-	Timestamp  string `json:"timestamp"`
-	Type       string `json:"type"`
-	Text       *struct {
+	From             string `json:"from"`
+	FromUserID       string `json:"from_user_id,omitempty"`        // BSUID
+	FromParentUserID string `json:"from_parent_user_id,omitempty"` // parent BSUID
+	To               string `json:"to,omitempty"`
+	ToUserID         string `json:"to_user_id,omitempty"`        // BSUID
+	ToParentUserID   string `json:"to_parent_user_id,omitempty"` // parent BSUID
+	ID               string `json:"id"`
+	Timestamp        string `json:"timestamp"`
+	Type             string `json:"type"`
+	Text             *struct {
 		Body string `json:"body"`
 	} `json:"text,omitempty"`
 	Interactive *struct {
@@ -145,6 +151,547 @@ type persistedIncomingMessage struct {
 	Persisted      models.Message
 }
 
+const (
+	incomingAutomaticAISuppressedKey          = "automatic_ai_suppressed"
+	incomingAutomaticAISuppressionReasonKey   = "automatic_ai_suppression_reason"
+	incomingAutomaticAISuppressedAtKey        = "automatic_ai_suppressed_at"
+	incomingIdentityReviewHoldIDKey           = "whatsapp_identity_review_hold_id"
+	incomingIdentityReviewReasonKey           = "whatsapp_identity_review_reason"
+	incomingIdentityReviewRouteModeKey        = "whatsapp_identity_review_route_mode"
+	incomingIdentityReviewSelectorDigestKey   = "whatsapp_identity_review_selector_digest"
+	incomingIdentityReviewRouteHeldDirect     = "held_direct"
+	incomingIdentityReviewRouteReviewedFuture = "reviewed_future"
+)
+
+// incomingMessageAdmissionPolicy is server-derived by the authenticated
+// WhatsApp identity admission wrapper. It accepts neither a tenant-authored
+// selector nor a client-chosen route. A nil value preserves legacy callers.
+type incomingMessageAdmissionPolicy struct {
+	CanonicalContactID         uuid.UUID
+	SuppressAutomaticAI        bool
+	SuppressionReason          string
+	IdentityReviewHoldID       uuid.UUID
+	IdentityReviewReason       string
+	IdentityReviewRouteMode    string
+	IdentityReviewSelectorHash string
+}
+
+// Message identity never comes from the mutable WhatsAppAccount display name.
+// Every durable proof must identify the same row; missing attribution is not a
+// license to backfill it from a phone/contact/name match.
+type whatsAppMessageLookup struct {
+	WAMID            string
+	MessageID        uuid.UUID
+	ContactID        uuid.UUID
+	Identity         coexistenceContactIdentity
+	Direction        models.Direction // Empty allows either proven reply-target direction.
+	Lock             bool
+	RepairProjection bool
+}
+
+type whatsAppMessageResolution struct {
+	Message          models.Message
+	Contact          models.Contact
+	IncomingActivity bool
+	Continuation     *models.ScheduledJob
+}
+
+var errWhatsAppMessageOwnerDeleted = errors.New("WhatsApp message owner is soft-deleted")
+
+type whatsAppMessageAuthorityKey struct{}
+type whatsAppMessageAuthority struct {
+	pool                  gorm.ConnPool
+	account               models.WhatsAppAccount
+	channelIDs            map[uuid.UUID]bool
+	accessTokenGeneration [sha256.Size]byte
+}
+
+// prepareWhatsAppMessageAuthority must precede state/contact/message locks.
+// Global order: ChannelAccount -> WhatsAppAccount -> canonical Contact path ->
+// Message -> continuation job. Joined conversations are read, never locked here;
+// the bridge's ChannelAccount -> Conversation -> Contact -> Message order must
+// not be inverted when this resolver is reentered from an already locked caller.
+// Mirror is always after commit.
+// The transaction-bound token prevents a nested target operation from taking
+// a NEW channel/account lock behind a contact/message already held by its caller.
+func (a *App) prepareWhatsAppMessageAuthority(account *models.WhatsAppAccount) error {
+	if a == nil || a.DB == nil || account == nil || account.ID == uuid.Nil || account.OrganizationID == uuid.Nil {
+		return errors.New("WhatsApp message account authority is required")
+	}
+	if _, ok := a.DB.Statement.ConnPool.(gorm.TxCommitter); !ok {
+		return errors.New("WhatsApp message authority requires a transaction")
+	}
+	if authority, ok := a.DB.Statement.Context.Value(whatsAppMessageAuthorityKey{}).(*whatsAppMessageAuthority); ok && authority.pool == a.DB.Statement.ConnPool {
+		if authority.account.ID != account.ID || authority.account.OrganizationID != account.OrganizationID {
+			return errors.New("WhatsApp message transaction account changed")
+		}
+		*account = authority.account
+		return nil
+	}
+	var shadows []models.ChannelAccount
+	if err := a.DB.Clauses(clause.Locking{Strength: "SHARE"}).Where(
+		"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+		account.OrganizationID, models.ChannelWhatsApp, channelapi.LegacyMetaProvider, "legacy-account:"+account.ID.String(),
+	).Order("id").Find(&shadows).Error; err != nil {
+		return err
+	}
+	if len(shadows) > 1 {
+		return errors.New("ambiguous WhatsApp message channel authority")
+	}
+	channelIDs := make(map[uuid.UUID]bool)
+	for i := range shadows {
+		boundID, err := channelapi.LegacyMetaWhatsAppAccountID(&shadows[i])
+		if err != nil || boundID != account.ID {
+			return errors.New("WhatsApp message channel authority mismatch")
+		}
+		channelIDs[shadows[i].ID] = true
+	}
+	var current models.WhatsAppAccount
+	if err := a.DB.Clauses(clause.Locking{Strength: "SHARE"}).Where(
+		"id = ? AND organization_id = ?", account.ID, account.OrganizationID,
+	).First(&current).Error; err != nil {
+		return err
+	}
+	if strings.TrimSpace(account.PhoneID) != "" && strings.TrimSpace(current.PhoneID) != strings.TrimSpace(account.PhoneID) {
+		return errors.New("WhatsApp message phone authority changed")
+	}
+	tokenGeneration := sha256.Sum256([]byte(current.AccessToken))
+	a.decryptAccountSecrets(&current)
+	authority := &whatsAppMessageAuthority{pool: a.DB.Statement.ConnPool, account: current, channelIDs: channelIDs, accessTokenGeneration: tokenGeneration}
+	a.DB = a.DB.WithContext(context.WithValue(a.DB.Statement.Context, whatsAppMessageAuthorityKey{}, authority))
+	*account = current
+	return nil
+}
+
+func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup whatsAppMessageLookup) (*whatsAppMessageResolution, error) {
+	if a == nil || a.DB == nil || account == nil || account.ID == uuid.Nil || account.OrganizationID == uuid.Nil || strings.TrimSpace(lookup.WAMID) == "" {
+		return nil, errors.New("WhatsApp message ownership lookup is incomplete")
+	}
+	lookup.WAMID = strings.TrimSpace(lookup.WAMID)
+	var authority *whatsAppMessageAuthority
+	if lookup.Lock || lookup.RepairProjection {
+		authority, _ = a.DB.Statement.Context.Value(whatsAppMessageAuthorityKey{}).(*whatsAppMessageAuthority)
+		if authority == nil || authority.pool != a.DB.Statement.ConnPool || authority.account.ID != account.ID || authority.account.OrganizationID != account.OrganizationID {
+			return nil, errors.New("WhatsApp message mutation lacks prelocked account authority")
+		}
+		if lookup.RepairProjection && !lookup.Lock {
+			return nil, errors.New("WhatsApp message projection repair requires a locked message")
+		}
+	}
+	var currentAccount models.WhatsAppAccount
+	if err := a.DB.Where("id = ? AND organization_id = ?", account.ID, account.OrganizationID).First(&currentAccount).Error; err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(currentAccount.PhoneID) != strings.TrimSpace(account.PhoneID) {
+		return nil, errors.New("WhatsApp message account phone mismatch")
+	}
+	activityKey := "message-incoming:" + uuid.NewSHA1(account.ID, []byte(lookup.WAMID)).String()
+	jobKey := "inbound-message-continuation:" + uuid.NewSHA1(account.ID, []byte(lookup.WAMID)).String()
+	deterministicID := uuid.NewSHA1(account.ID, []byte("coexistence-message:"+lookup.WAMID))
+	var candidates []models.Message
+	if err := a.DB.Unscoped().Where(`organization_id = ? AND (
+			id = ?
+			OR (
+				BTRIM(whats_app_message_id) = ?
+				AND (
+					inbox_conversation_id IS NULL
+					OR COALESCE(metadata, '{}'::jsonb) @> ?::jsonb
+				)
+			)
+		)`, account.OrganizationID, deterministicID, lookup.WAMID, database.WhatsAppWAMIDOwnerMetadataJSON).
+		Order("id").Find(&candidates).Error; err != nil {
+		return nil, err
+	}
+	ids := make([]uuid.UUID, 0, len(candidates)+1)
+	textIDs := make([]string, 0, len(candidates)+1)
+	for _, candidate := range candidates {
+		ids = append(ids, candidate.ID)
+		textIDs = append(textIDs, candidate.ID.String())
+	}
+	if lookup.MessageID != uuid.Nil {
+		ids = append(ids, lookup.MessageID)
+		textIDs = append(textIDs, lookup.MessageID.String())
+	}
+	var activities []models.CustomerActivityEvent
+	if err := a.DB.Where("organization_id = ? AND (idempotency_key = ? OR (source_object_id IN ? AND (event_type = ? OR idempotency_key LIKE ?)))",
+		account.OrganizationID, activityKey, ids, models.CustomerActivityMessageIncoming, "message-incoming:%").Find(&activities).Error; err != nil {
+		return nil, err
+	}
+	var jobs []models.ScheduledJob
+	if err := a.DB.Where("organization_id = ? AND (idempotency_key = ? OR ((kind = ? OR idempotency_key LIKE ?) AND (aggregate_id IN ? OR payload->>'wamid' = ? OR payload->>'message_id' IN ? OR payload->'message'->>'id' = ?)))",
+		account.OrganizationID, jobKey, inboundContinuationJobKind, "inbound-message-continuation:%", ids, lookup.WAMID, textIDs, lookup.WAMID).Find(&jobs).Error; err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
+		if len(activities) != 0 || len(jobs) != 0 || lookup.MessageID != uuid.Nil {
+			return nil, errors.New("WhatsApp message provenance references a missing winner")
+		}
+		return nil, gorm.ErrRecordNotFound
+	}
+	// More than one org/WAMID row is ambiguity, not permission to select the
+	// first linked/unlinked representation or manufacture a new execution ID.
+	if len(candidates) != 1 {
+		return nil, errors.New("ambiguous WhatsApp message winners")
+	}
+	message := candidates[0]
+	if message.WhatsAppMessageID != lookup.WAMID || (lookup.MessageID != uuid.Nil && lookup.MessageID != message.ID) ||
+		(message.Direction != models.DirectionIncoming && message.Direction != models.DirectionOutgoing) ||
+		(lookup.Direction != "" && message.Direction != lookup.Direction) {
+		return nil, errors.New("WhatsApp message winner identity or direction mismatch")
+	}
+	if message.DeletedAt.Valid {
+		// The WAMID remains durably reserved, but a replay or mutation may never
+		// revive, repair, or otherwise modify its soft-deleted first owner.
+		return nil, errWhatsAppMessageOwnerDeleted
+	}
+	reviewRouted, err := a.validatePersistedWhatsAppIdentityReviewRoute(account, &message, lookup.Identity)
+	if err != nil {
+		return nil, err
+	}
+	canonical, err := contactutil.ResolveCanonicalContact(a.DB, account.OrganizationID, message.ContactID)
+	if err != nil {
+		return nil, err
+	}
+	if lookup.ContactID != uuid.Nil {
+		expected, err := contactutil.ResolveCanonicalContact(a.DB, account.OrganizationID, lookup.ContactID)
+		if err != nil || expected.ID != canonical.ID {
+			return nil, errors.New("WhatsApp message canonical contact mismatch")
+		}
+	}
+	if !reviewRouted {
+		if err := a.validateWhatsAppMessageContactIdentity(account.OrganizationID, canonical, lookup.Identity); err != nil {
+			return nil, err
+		}
+	}
+	proven := message.ID == deterministicID
+	result := &whatsAppMessageResolution{Message: message, Contact: *canonical}
+	for _, activity := range activities {
+		if activity.IdempotencyKey != activityKey || activity.SourceObjectType != "message" || activity.SourceObjectID == nil || *activity.SourceObjectID != message.ID ||
+			activity.EventType != models.CustomerActivityMessageIncoming || activity.Category != models.CustomerActivityCategoryMessage || message.Direction != models.DirectionIncoming {
+			return nil, errors.New("conflicting WhatsApp incoming activity provenance")
+		}
+		activityContact, err := contactutil.ResolveCanonicalContact(a.DB, account.OrganizationID, activity.ContactID)
+		if err != nil || activityContact.ID != canonical.ID {
+			return nil, errors.New("WhatsApp activity canonical contact mismatch")
+		}
+		proven, result.IncomingActivity = true, true
+	}
+	for i := range jobs {
+		inbound, err := validateInboundContinuationJobProof(&jobs[i], &currentAccount, message.ID, lookup.WAMID)
+		if err != nil || message.Direction != models.DirectionIncoming {
+			return nil, errors.New("conflicting WhatsApp continuation provenance")
+		}
+		if !reviewRouted {
+			if err := a.validateWhatsAppMessageContactIdentity(account.OrganizationID, canonical, coexistenceContactIdentity{
+				Phone: inbound.From, UserID: inbound.FromUserID, ParentUserID: inbound.FromParentUserID,
+			}); err != nil {
+				return nil, err
+			}
+		} else if normalizeIdentityReviewPhone(inbound.From) != normalizeIdentityReviewPhone(lookup.Identity.Phone) ||
+			strings.TrimSpace(inbound.FromUserID) != strings.TrimSpace(lookup.Identity.primaryUserID()) ||
+			strings.TrimSpace(inbound.FromParentUserID) != strings.TrimSpace(lookup.Identity.ParentUserID) {
+			return nil, errors.New("WhatsApp reviewed continuation selector proof changed")
+		}
+		if result.Continuation != nil {
+			return nil, errors.New("multiple WhatsApp continuation winners")
+		}
+		proven, result.Continuation = true, &jobs[i]
+	}
+	// Historical ownership reserves the WAMID; it does not authorize mutation
+	// through a linked projection that now contradicts the established owner.
+	if message.InboxConversationID != nil {
+		var conversation models.InboxConversation
+		conversationQuery := a.DB.Where("id = ? AND organization_id = ?", *message.InboxConversationID, account.OrganizationID)
+		if err := conversationQuery.First(&conversation).Error; err != nil {
+			return nil, err
+		}
+		if conversation.Channel != models.ChannelWhatsApp || conversation.ContactIdentityID == nil {
+			return nil, errors.New("WhatsApp message conversation provider mismatch")
+		}
+		linkedContact, err := contactutil.ResolveCanonicalContact(a.DB, account.OrganizationID, conversation.ContactID)
+		if err != nil || linkedContact.ID != canonical.ID || conversation.ExternalConversationID != "legacy-contact:"+conversation.ContactID.String() {
+			return nil, errors.New("WhatsApp message conversation contact mismatch")
+		}
+		var shadow models.ChannelAccount
+		if err := a.DB.Where("id = ? AND organization_id = ?", conversation.ChannelAccountID, account.OrganizationID).First(&shadow).Error; err != nil {
+			return nil, err
+		}
+		boundID, err := channelapi.LegacyMetaWhatsAppAccountID(&shadow)
+		if err != nil || boundID != account.ID {
+			return nil, errors.New("WhatsApp message joined account provenance mismatch")
+		}
+		if lookup.Lock && !authority.channelIDs[shadow.ID] {
+			return nil, contactutil.ErrCanonicalContactChanged
+		}
+		var linkedIdentity models.ContactIdentity
+		if err := a.DB.Where("id = ? AND organization_id = ? AND channel_account_id = ? AND channel = ?",
+			*conversation.ContactIdentityID, account.OrganizationID, shadow.ID, models.ChannelWhatsApp).First(&linkedIdentity).Error; err != nil {
+			return nil, err
+		}
+		identityContact, err := contactutil.ResolveCanonicalContact(a.DB, account.OrganizationID, linkedIdentity.ContactID)
+		if err != nil || identityContact.ID != canonical.ID || linkedIdentity.ExternalID != "legacy-contact:"+conversation.ContactID.String() {
+			return nil, errors.New("WhatsApp message joined contact identity mismatch")
+		}
+		proven = true
+	}
+	if !proven {
+		return nil, errors.New("WhatsApp message lacks durable account provenance")
+	}
+	if lookup.Lock {
+		lockedContact, err := contactutil.ResolveCanonicalContactForUpdate(a.DB, account.OrganizationID, message.ContactID)
+		if err != nil || lockedContact.ID != canonical.ID {
+			return nil, contactutil.ErrCanonicalContactChanged
+		}
+		var locked models.Message
+		if err := a.DB.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND organization_id = ?", message.ID, account.OrganizationID).First(&locked).Error; err != nil {
+			return nil, err
+		}
+		if locked.ContactID != message.ContactID || locked.WhatsAppMessageID != message.WhatsAppMessageID || locked.Direction != message.Direction ||
+			!customerWorkspaceUUIDPointersEqual(locked.InboxConversationID, message.InboxConversationID) {
+			return nil, contactutil.ErrCanonicalContactChanged
+		}
+		// Validate every proof again after the lock; no earlier authority lock
+		// is acquired here, and a concurrent provenance conflict fails closed.
+		recheck := lookup
+		recheck.Lock, recheck.RepairProjection, recheck.MessageID = false, false, locked.ID
+		verified, err := a.resolveWhatsAppMessage(account, recheck)
+		if err != nil {
+			return nil, err
+		}
+		result = verified
+		if lookup.RepairProjection && result.Message.WhatsAppAccount != currentAccount.Name {
+			if err := a.DB.Model(&models.Message{}).Where("id = ? AND organization_id = ?", message.ID, account.OrganizationID).
+				UpdateColumn("whats_app_account", currentAccount.Name).Error; err != nil {
+				return nil, err
+			}
+			result.Message.WhatsAppAccount = currentAccount.Name
+		}
+		// Optional BSUID is learned only after independent account/WAMID
+		// authority and the SAME canonical contact/message have been locked and
+		// fully rechecked. A failed optional write must not make the unchanged
+		// enqueue/worker resolver reject an otherwise proven phone-only winner.
+		if !reviewRouted {
+			a.enrichProvenWhatsAppMessageBSUID(account, &result.Contact, lookup)
+		}
+	}
+	return result, nil
+}
+
+func (a *App) validatePersistedWhatsAppIdentityReviewRoute(
+	account *models.WhatsAppAccount,
+	message *models.Message,
+	identity coexistenceContactIdentity,
+) (bool, error) {
+	if account == nil || message == nil {
+		return false, errors.New("WhatsApp identity-review route identity is incomplete")
+	}
+	holdValue, hasHold := message.Metadata[incomingIdentityReviewHoldIDKey]
+	reasonValue, hasReason := message.Metadata[incomingIdentityReviewReasonKey]
+	modeValue, hasMode := message.Metadata[incomingIdentityReviewRouteModeKey]
+	digestValue, hasDigest := message.Metadata[incomingIdentityReviewSelectorDigestKey]
+	if !hasHold && !hasReason && !hasMode && !hasDigest {
+		return false, nil
+	}
+	if !hasHold || !hasReason || !hasMode || !hasDigest || message.Direction != models.DirectionIncoming ||
+		message.OrganizationID != account.OrganizationID || strings.TrimSpace(message.WhatsAppMessageID) == "" {
+		return false, errors.New("WhatsApp identity-review route proof is incomplete")
+	}
+	holdText, holdOK := holdValue.(string)
+	reason, reasonOK := reasonValue.(string)
+	routeMode, modeOK := modeValue.(string)
+	selectorDigest, digestOK := digestValue.(string)
+	if !holdOK || !reasonOK || !modeOK || !digestOK || holdText != strings.TrimSpace(holdText) ||
+		reason != strings.TrimSpace(reason) || selectorDigest != strings.ToLower(strings.TrimSpace(selectorDigest)) ||
+		!isSHA256Hex(selectorDigest) {
+		return false, errors.New("WhatsApp identity-review route proof is malformed")
+	}
+	holdID, err := uuid.Parse(holdText)
+	if err != nil || holdID == uuid.Nil || holdID.String() != holdText || !whatsAppIdentityReviewRouteReasonAllowed(reason) {
+		return false, errors.New("WhatsApp identity-review route proof is invalid")
+	}
+	var hold models.WhatsAppIdentityReviewHold
+	if err := a.DB.Where("id = ? AND organization_id = ?", holdID, account.OrganizationID).First(&hold).Error; err != nil {
+		return false, err
+	}
+	if hold.WhatsAppAccountID != account.ID || hold.OnboardingCycle == 0 ||
+		hold.ProtocolVersion != models.WhatsAppIdentityReviewProtocolVersion || !hold.Supported ||
+		hold.VerifiedEventProvenance != WhatsAppIdentityReviewVerifiedMetaEvent ||
+		!isSHA256Hex(hold.VerifiedEventDigest) || !isSHA256Hex(hold.SelectorBodyDigest) ||
+		hold.DirectPrimaryBSUID != strings.TrimSpace(identity.primaryUserID()) ||
+		hold.ParentBSUID != strings.TrimSpace(identity.ParentUserID) ||
+		hold.Phone != normalizeIdentityReviewPhone(identity.Phone) {
+		return false, errors.New("WhatsApp identity-review route authority changed")
+	}
+	expectedDigest, err := whatsappIdentityReviewBindingDigest(whatsAppIdentityReviewSelectorBinding{
+		Protocol:           models.WhatsAppIdentityReviewInboundProtocol,
+		OrganizationID:     account.OrganizationID,
+		WhatsAppAccountID:  account.ID,
+		OnboardingCycle:    hold.OnboardingCycle,
+		WAMID:              message.WhatsAppMessageID,
+		DirectPrimaryBSUID: strings.TrimSpace(identity.primaryUserID()),
+		ParentBSUID:        strings.TrimSpace(identity.ParentUserID),
+		Phone:              normalizeIdentityReviewPhone(identity.Phone),
+	})
+	if err != nil || expectedDigest != selectorDigest {
+		return false, errors.New("WhatsApp identity-review selector proof changed")
+	}
+	snapshot, err := loadWhatsAppIdentityReviewSnapshot(a.DB, &hold)
+	if err != nil {
+		return false, err
+	}
+	if identityReviewSemanticDigest(identityReviewClaimFromHold(hold), snapshot.MemberDigest) != hold.SemanticClaimDigest {
+		return false, errors.New("WhatsApp identity-review semantic authority changed")
+	}
+	if target, visible := whatsappIdentityReviewVisibleIntakeTarget(&message.ContactID, snapshot.Candidates); !visible || target != message.ContactID {
+		return false, errors.New("WhatsApp identity-review route target changed")
+	}
+	switch routeMode {
+	case incomingIdentityReviewRouteReviewedFuture:
+		if reason != "reviewed_future_route" && reason != "another_review_open" {
+			return false, errors.New("WhatsApp reviewed future route reason changed")
+		}
+		if hold.Disposition != models.WhatsAppIdentityReviewDispositionFutureRouting ||
+			hold.DecisionTargetContactID == nil || *hold.DecisionTargetContactID != message.ContactID ||
+			hold.DecisionResolvedByID == nil || hold.DecisionResolvedAt == nil ||
+			hold.DecisionRequestID == nil || !isSHA256Hex(hold.DecisionRequestDigest) ||
+			!isSHA256Hex(hold.DecisionChainDigest) {
+			return false, errors.New("WhatsApp reviewed future route changed")
+		}
+	case incomingIdentityReviewRouteHeldDirect:
+		if reason == "reviewed_future_route" || len(snapshot.Candidates) == 0 {
+			return false, errors.New("WhatsApp held direct route reason changed")
+		}
+		directOwners := make([]uuid.UUID, 0, 1)
+		for _, candidate := range snapshot.Candidates {
+			if candidate.SelectorReasons.Has(models.WhatsAppIdentityReviewSelectorPrimaryBSUID) {
+				directOwners = append(directOwners, candidate.ContactID)
+			}
+		}
+		allowed, _ := identityReviewDirectRouteAllowed(snapshot.Candidates, message.ContactID)
+		if len(directOwners) != 1 || directOwners[0] != message.ContactID || !allowed {
+			return false, errors.New("WhatsApp held direct route target changed")
+		}
+	default:
+		return false, errors.New("WhatsApp identity-review route mode is invalid")
+	}
+	if reason != "reviewed_future_route" {
+		suppressionReason, _ := message.Metadata[incomingAutomaticAISuppressionReasonKey].(string)
+		if !incomingMessageAutomaticAISuppressed(message) || suppressionReason != "whatsapp_identity_review:"+reason {
+			return false, errors.New("WhatsApp held identity-review route lost suppression")
+		}
+	}
+	return true, nil
+}
+
+func whatsAppIdentityReviewRouteReasonAllowed(reason string) bool {
+	switch reason {
+	case "phone_selector_conflict", "phone_selector_drift", "unique_direct_primary_drift",
+		"review_open", "another_review_open", "reviewed_future_route":
+		return true
+	default:
+		return false
+	}
+}
+
+// This is only a contact corroboration/enrichment predicate, NEVER message or
+// account provenance. In particular an old merged phone alias, absent phone or
+// non-dialable placeholder cannot authorize learning a new BSUID.
+func canEnrichProvenWhatsAppMessageBSUID(canonical *models.Contact, identity coexistenceContactIdentity) bool {
+	if canonical == nil || canonical.BSUID != "" || identity.primaryUserID() == "" || isCoexistencePlaceholderPhone(canonical.PhoneNumber) {
+		return false
+	}
+	phone := normalizeCoexistencePhone(identity.Phone)
+	return phone != "" && phone == normalizeCoexistencePhone(canonical.PhoneNumber)
+}
+
+// Called only from the post-lock/post-proof resolver branch. Retain a savepoint
+// around optional metadata so a trigger/constraint failure cannot poison the
+// transaction containing the required message, lifecycle and continuation fact.
+func (a *App) enrichProvenWhatsAppMessageBSUID(account *models.WhatsAppAccount, canonical *models.Contact, lookup whatsAppMessageLookup) {
+	if !canEnrichProvenWhatsAppMessageBSUID(canonical, lookup.Identity) {
+		return
+	}
+	userID := lookup.Identity.primaryUserID()
+	var updated bool
+	err := a.DB.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.Contact{}).Where(
+			"organization_id = ? AND id = ? AND phone_number = ? AND COALESCE(bs_uid, '') = '' AND merged_into_id IS NULL",
+			canonical.OrganizationID, canonical.ID, canonical.PhoneNumber,
+		).Update("bs_uid", userID)
+		updated = result.RowsAffected == 1
+		if result.Error != nil || !updated {
+			return result.Error
+		}
+		// Optional learning must not invalidate another durable proof (for
+		// example a queued payload whose optional identifier was never stored).
+		// Roll back only the enrichment if the full proof no longer agrees.
+		recheck := lookup
+		recheck.Lock, recheck.RepairProjection = false, false
+		scoped := a.scopedApp(tx, account.OrganizationID)
+		_, err := scoped.resolveWhatsAppMessage(account, recheck)
+		return err
+	})
+	if err != nil {
+		a.Log.Warn("Optional BSUID enrichment failed for proven incoming message", "error", err, "contact_id", canonical.ID)
+		return
+	}
+	if updated {
+		canonical.BSUID = userID
+	}
+}
+
+// Contact identity corroborates a separately proven account/message binding; it
+// is never an account proof itself. Historical sender aliases remain legitimate
+// only when their existing merge chain reaches the same canonical contact.
+func (a *App) validateWhatsAppMessageContactIdentity(orgID uuid.UUID, canonical *models.Contact, identity coexistenceContactIdentity) error {
+	if canonical == nil || canonical.OrganizationID != orgID {
+		return errors.New("WhatsApp message canonical contact is missing")
+	}
+	phone := normalizeCoexistencePhone(identity.Phone)
+	if phone != "" && phone != normalizeCoexistencePhone(canonical.PhoneNumber) {
+		var aliases []models.Contact
+		if err := a.DB.Unscoped().Where("organization_id = ? AND phone_number IN ?", orgID, []string{phone, "+" + phone}).Find(&aliases).Error; err != nil {
+			return err
+		}
+		// A BSUID placeholder may acquire its first real phone, but an existing
+		// phone belonging to a different canonical contact is not that proof.
+		placeholderReveal := isCoexistencePlaceholderPhone(canonical.PhoneNumber) &&
+			identity.primaryUserID() != "" && canonical.BSUID == identity.primaryUserID()
+		if len(aliases) == 0 && !placeholderReveal {
+			return errors.New("WhatsApp message sender phone mismatch")
+		}
+		for _, alias := range aliases {
+			resolved, err := contactutil.ResolveCanonicalContact(a.DB, orgID, alias.ID)
+			if err != nil || resolved.ID != canonical.ID {
+				return errors.New("WhatsApp message sender phone canonical mismatch")
+			}
+		}
+	}
+	userID, parentID := identity.primaryUserID(), strings.TrimSpace(identity.ParentUserID)
+	if userID != "" {
+		identifiers := []string{userID}
+		if parentID != "" && parentID != userID {
+			identifiers = append(identifiers, parentID)
+		}
+		var aliases []models.Contact
+		if err := a.DB.Unscoped().Where("organization_id = ? AND bs_uid IN ?", orgID, identifiers).Find(&aliases).Error; err != nil {
+			return err
+		}
+		matched := canonical.BSUID == userID || (parentID != "" && canonical.BSUID == parentID)
+		for _, alias := range aliases {
+			resolved, err := contactutil.ResolveCanonicalContact(a.DB, orgID, alias.ID)
+			if err != nil || resolved.ID != canonical.ID {
+				return errors.New("WhatsApp message sender user canonical mismatch")
+			}
+			matched = true
+		}
+		if !matched && !canEnrichProvenWhatsAppMessageBSUID(canonical, identity) {
+			return errors.New("WhatsApp message sender user identity mismatch")
+		}
+	}
+	return nil
+}
+
 // updateContactBSUID persists Meta's optional business-scoped user ID without
 // allowing a metadata-write failure to poison the surrounding inbound-message
 // transaction. GORM implements nested transactions with a PostgreSQL savepoint,
@@ -235,10 +782,25 @@ func (a *App) continuePersistedIncomingMessage(
 		return fmt.Errorf("resolve inbound continuation contact: %w", err)
 	}
 
-	a.hydratePersistedIncomingMedia(ctx, work, account)
+	if err := a.hydratePersistedIncomingMedia(ctx, work, account); err != nil {
+		return err
+	}
+	if work.Persisted.Metadata[coexistenceMediaRevokedMetadataKey] == true {
+		// A late live delivery cannot hydrate, rebroadcast or process the
+		// pre-deletion payload of an imported tombstone.
+		return nil
+	}
 	// Broadcast only after optional hydration so a media message reaches the UI
 	// once, with its durable object-store URL when download succeeded.
-	a.broadcastNewMessage(work.OrganizationID, &work.Persisted, contact)
+	// The inbound fact and optional media hydration are already durable. Publish
+	// through the root app so realtime delivery completes before the first
+	// automatic-action boundary instead of waiting for the continuation's
+	// bookkeeping transaction to finish after provider I/O.
+	a.rootApp().broadcastNewMessage(work.OrganizationID, &work.Persisted, contact)
+	if incomingMessageAutomaticAISuppressed(&work.Persisted) {
+		reason, _ := work.Persisted.Metadata[incomingAutomaticAISuppressionReasonKey].(string)
+		return &inboundContinuationPolicyStop{Reason: reason}
+	}
 
 	msg := work.Message
 	extracted := work.Extracted
@@ -246,8 +808,12 @@ func (a *App) continuePersistedIncomingMessage(
 	buttonID := extracted.ButtonID
 	flowResponseData := extracted.FlowResponseData
 
-	// Clear chatbot tracking since client has replied
-	a.ClearContactChatbotTracking(contact.ID)
+	// Clear chatbot tracking since this client message is newer than the bot
+	// message it acknowledges. An older continuation replay must not erase a
+	// newer bot reply from another committed continuation.
+	if err := a.clearContactChatbotTrackingForInbound(contact.ID); err != nil {
+		return fmt.Errorf("clear inbound chatbot tracking: %w", err)
+	}
 
 	// Check for active agent transfer - skip chatbot processing if transferred
 	if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
@@ -535,6 +1101,14 @@ func (a *App) continuePersistedIncomingMessage(
 		a.Log.Info("No fallback message configured for existing session")
 	}
 	return nil
+}
+
+func incomingMessageAutomaticAISuppressed(message *models.Message) bool {
+	if message == nil || message.Direction != models.DirectionIncoming {
+		return false
+	}
+	suppressed, _ := message.Metadata[incomingAutomaticAISuppressedKey].(bool)
+	return suppressed
 }
 
 // KeywordResponse holds the response content and optional buttons
@@ -837,15 +1411,28 @@ func (a *App) getOrCreateSession(
 	if timeoutMins <= 0 {
 		timeoutMins = 30
 	}
-	now := time.Now()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	timeout := now.Add(-time.Duration(timeoutMins) * time.Minute)
 	var result models.ChatbotSession
 	isNew := false
 
-	err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+	write := func(tx *gorm.DB) error {
+		// Admission and every policy writer take the organization fence before
+		// contact/session locks. Recheck after that fence: the earlier transfer
+		// lookup is only an optimization, not permission to start another session.
+		if err := database.LockOrganizationPolicyScope(tx, orgID); err != nil {
+			return err
+		}
 		canonical, err := contactutil.ResolveCanonicalContactForUpdate(tx, orgID, contactID)
 		if err != nil {
 			return err
+		}
+		policy, err := database.EvaluateContactAutomaticReplyPolicy(tx, orgID, canonical.ID)
+		if err != nil {
+			return err
+		}
+		if !policy.Allowed {
+			return &inboundContinuationPolicyStop{Reason: policy.Reason}
 		}
 
 		var activeSessions []models.ChatbotSession
@@ -900,6 +1487,12 @@ func (a *App) getOrCreateSession(
 
 		if chosen >= 0 {
 			result = activeSessions[chosen]
+			// PostgreSQL stores microsecond precision. Make each acquisition a
+			// distinct generation even when two messages arrive in one clock tick.
+			now = now.UTC().Truncate(time.Microsecond)
+			if !now.After(result.LastActivityAt) {
+				now = result.LastActivityAt.Add(time.Microsecond)
+			}
 			if err := tx.Model(&models.ChatbotSession{}).
 				Where("id = ? AND status = ?", result.ID, models.SessionStatusActive).
 				Update("last_activity_at", now).Error; err != nil {
@@ -930,7 +1523,28 @@ func (a *App) getOrCreateSession(
 		}
 		isNew = true
 		return nil
-	})
+	}
+	db := a.DB
+	if a.inboundContinuation != nil {
+		// Release the canonical Contact/session locks before any subsequent
+		// physical AI provider attempt. The provider fence may open its own
+		// independently committed dispatch transaction through the root pool.
+		db = a.rootApp().DB
+	}
+	var err error
+	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
+		// The policy query after a contended organization lock must see the
+		// writer's commit even if the pool defaults to REPEATABLE READ.
+		err = database.WithTenantReadCommitted(db, orgID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+				return err
+			}
+			return write(tx)
+		})
+		if !isRetryableCanonicalContactWrite(err) {
+			break
+		}
+	}
 	if err != nil {
 		return nil, false, err
 	}
@@ -974,13 +1588,22 @@ func (a *App) matchFlowTrigger(orgID uuid.UUID, messageText string) *models.Chat
 
 // startFlow initiates a chatbot flow for a user
 func (a *App) exitFlow(session *models.ChatbotSession) {
+	query, err := a.activeChatSessionScope(session)
+	if err != nil {
+		return
+	}
 	now := time.Now()
-	a.DB.Model(session).Updates(map[string]any{
+	result := query.Updates(map[string]any{
 		"current_step": "",
 		"step_retries": 0,
 		"status":       models.SessionStatusCompleted,
 		"completed_at": now,
 	})
+	if result.Error != nil || result.RowsAffected != 1 {
+		// A stale missing-flow fallback has no authority to overwrite a Pause
+		// cancellation or clear tracking belonging to a newer session owner.
+		return
+	}
 
 	// Clear chatbot tracking so SLA doesn't fire after flow exit
 	a.ClearContactChatbotTracking(session.ContactID)
@@ -1622,107 +2245,135 @@ type Reaction struct {
 
 // handleIncomingReaction handles incoming reaction messages from WhatsApp
 func (a *App) handleIncomingReaction(account *models.WhatsAppAccount, fromPhone, messageWAMID, emoji, profileName string) {
+	if a == nil || account == nil || account.OrganizationID == uuid.Nil || account.ID == uuid.Nil {
+		return
+	}
 	a.Log.Info("Handling incoming reaction",
 		"from", fromPhone,
 		"message_wamid", messageWAMID,
 		"emoji", emoji,
 	)
 
-	// Find the message being reacted to
-	// WhatsApp encodes phone numbers in the WAMID prefix, so the same message
-	// has different WAMIDs from sender vs recipient perspective.
-	// We match on the suffix after "FQIA" + 4 chars (type indicator like "ERgS" or "EhgU")
-	var message models.Message
-	if err := a.DB.Where(
-		"organization_id = ? AND whats_app_message_id = ?",
-		account.OrganizationID,
-		messageWAMID,
-	).First(&message).Error; err != nil {
-		// Try matching on WAMID suffix (the unique message ID part)
-		if idx := strings.Index(messageWAMID, "FQIA"); idx != -1 {
-			// Extract suffix after "FQIA" + 4 char type indicator (e.g., "ERgS", "EhgU")
-			suffixStart := idx + 8
-			if suffixStart < len(messageWAMID) {
-				suffix := messageWAMID[suffixStart:]
-				if err := a.DB.Where(
-					"organization_id = ? AND whats_app_message_id LIKE ?",
-					account.OrganizationID,
-					"%"+suffix,
-				).First(&message).Error; err != nil {
-					a.Log.Warn("Message not found for reaction", "wamid", messageWAMID, "suffix", suffix)
-					return
-				}
-			} else {
-				a.Log.Warn("Message not found for reaction - invalid WAMID format", "wamid", messageWAMID)
-				return
-			}
-		} else {
-			a.Log.Warn("Message not found for reaction - no FQIA pattern", "wamid", messageWAMID)
-			return
-		}
-	}
-
-	// Keep any newly discovered contact and its durable lifecycle event atomic.
-	contact, _, err := a.getOrCreateInboundContact(account, fromPhone, profileName, "")
-	if err != nil {
-		a.Log.Error("Failed to get or create reaction contact", "phone", fromPhone, "error", err)
+	_ = profileName // A reaction may corroborate an existing contact; it never creates one.
+	messageWAMID = strings.TrimSpace(messageWAMID)
+	fromPhone = normalizeCoexistencePhone(fromPhone)
+	if messageWAMID == "" || fromPhone == "" {
+		a.Log.Warn("Reaction identity is incomplete")
 		return
 	}
 
-	// Parse existing reactions from Metadata
-	var metadata map[string]any
-	if message.Metadata != nil {
-		metadata = message.Metadata
-	} else {
-		metadata = make(map[string]any)
-	}
+	root := a.rootApp()
+	accountCopy := *account
+	var updatedMessageID, contactID uuid.UUID
+	var newReactions []Reaction
+	err := root.WithCommittedTenantApp(account.OrganizationID, func(scoped *App) error {
+		// Find the exact WhatsApp-owner candidate without trusting the mutable
+		// account display name. The resolver below proves the stable account,
+		// canonical contact, direction, and durable message provenance.
+		loadOwnedTarget := func(wamid string, suffixOnly bool) ([]models.Message, error) {
+			var candidates []models.Message
+			query := scoped.DB.Unscoped().Where(`organization_id = ? AND (
+					inbox_conversation_id IS NULL
+					OR COALESCE(metadata, '{}'::jsonb) @> ?::jsonb
+				)`, account.OrganizationID, database.WhatsAppWAMIDOwnerMetadataJSON)
+			if suffixOnly {
+				query = query.Where("RIGHT(whats_app_message_id, LENGTH(?)) = ?", wamid, wamid)
+			} else {
+				query = query.Where("whats_app_message_id = ?", wamid)
+			}
+			err := query.Order("id").Limit(2).Find(&candidates).Error
+			return candidates, err
+		}
 
-	// Get or initialize reactions array
-	var reactions []Reaction
-	if reactionsRaw, ok := metadata["reactions"]; ok {
-		if reactionsArray, ok := reactionsRaw.([]any); ok {
-			for _, r := range reactionsArray {
-				if rMap, ok := r.(map[string]any); ok {
-					emoji, _ := rMap["emoji"].(string)
+		candidates, err := loadOwnedTarget(messageWAMID, false)
+		if err != nil {
+			return err
+		}
+		if len(candidates) > 1 {
+			return errors.New("ambiguous exact WhatsApp reaction target")
+		}
+		if len(candidates) == 0 {
+			idx := strings.Index(messageWAMID, "FQIA")
+			suffixStart := idx + 8
+			if idx < 0 || suffixStart >= len(messageWAMID) {
+				return gorm.ErrRecordNotFound
+			}
+			suffix := messageWAMID[suffixStart:]
+			candidates, err = loadOwnedTarget(suffix, true)
+			if err != nil {
+				return err
+			}
+			if len(candidates) != 1 {
+				if len(candidates) > 1 {
+					return errors.New("ambiguous WhatsApp reaction suffix")
+				}
+				return gorm.ErrRecordNotFound
+			}
+		}
+
+		candidate := candidates[0]
+		if err := database.LockWhatsAppWAMIDScopes(scoped.DB, account.OrganizationID, candidate.WhatsAppMessageID); err != nil {
+			return err
+		}
+		if err := scoped.prepareWhatsAppMessageAuthority(&accountCopy); err != nil {
+			return err
+		}
+		resolved, err := scoped.resolveWhatsAppMessage(&accountCopy, whatsAppMessageLookup{
+			WAMID: candidate.WhatsAppMessageID, MessageID: candidate.ID,
+			Identity: coexistenceContactIdentity{Phone: fromPhone},
+			Lock:     true, RepairProjection: true,
+		})
+		if errors.Is(err, errWhatsAppMessageOwnerDeleted) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		metadata := cloneMessageMetadata(resolved.Message.Metadata)
+		var reactions []Reaction
+		if reactionsArray, ok := metadata["reactions"].([]any); ok {
+			for _, raw := range reactionsArray {
+				if reactionMap, ok := raw.(map[string]any); ok {
+					reactionEmoji, _ := reactionMap["emoji"].(string)
 					reactions = append(reactions, Reaction{
-						Emoji:     emoji,
-						FromPhone: getStringFromMap(rMap, "from_phone"),
-						FromUser:  getStringFromMap(rMap, "from_user"),
+						Emoji: reactionEmoji, FromPhone: getStringFromMap(reactionMap, "from_phone"),
+						FromUser: getStringFromMap(reactionMap, "from_user"),
 					})
 				}
 			}
 		}
-	}
-
-	// Remove existing reaction from this contact (each contact can only have one reaction)
-	var newReactions []Reaction
-	for _, r := range reactions {
-		if r.FromPhone != fromPhone {
-			newReactions = append(newReactions, r)
+		newReactions = make([]Reaction, 0, len(reactions)+1)
+		for _, reaction := range reactions {
+			if normalizeCoexistencePhone(reaction.FromPhone) != fromPhone {
+				newReactions = append(newReactions, reaction)
+			}
 		}
-	}
-
-	// Add new reaction if emoji is not empty (empty = remove reaction)
-	if emoji != "" {
-		newReactions = append(newReactions, Reaction{
-			Emoji:     emoji,
-			FromPhone: fromPhone,
-		})
-	}
-
-	// Update metadata
-	metadata["reactions"] = newReactions
-
-	// Save to database
-	if err := a.DB.Model(&message).Update("metadata", metadata).Error; err != nil {
-		a.Log.Error("Failed to update message reactions", "error", err)
+		if emoji != "" {
+			newReactions = append(newReactions, Reaction{Emoji: emoji, FromPhone: fromPhone})
+		}
+		metadata["reactions"] = newReactions
+		if err := scoped.DB.Model(&models.Message{}).
+			Where("organization_id = ? AND id = ?", account.OrganizationID, resolved.Message.ID).
+			Update("metadata", metadata).Error; err != nil {
+			return err
+		}
+		updatedMessageID, contactID = resolved.Message.ID, resolved.Contact.ID
+		return nil
+	})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		a.Log.Warn("Message not found for reaction", "wamid", messageWAMID)
 		return
 	}
-
-	a.Log.Info("Updated message reaction", "message_id", message.ID, "reactions_count", len(newReactions))
-
-	// Broadcast via WebSocket
-	a.broadcastReactionUpdate(account.OrganizationID, message.ID, contact.ID, newReactions)
+	if err != nil {
+		a.Log.Error("Failed to update message reaction", "error", err, "wamid", messageWAMID)
+		return
+	}
+	if updatedMessageID == uuid.Nil {
+		return
+	}
+	a.Log.Info("Updated message reaction", "message_id", updatedMessageID, "reactions_count", len(newReactions))
+	a.broadcastReactionUpdate(account.OrganizationID, updatedMessageID, contactID, newReactions)
 }
 
 // Helper function to safely get string from map
@@ -1742,16 +2393,6 @@ type ExtractedMessage struct {
 	Media            *MediaInfo
 	ButtonID         string         // used by chatbot routing only
 	FlowResponseData map[string]any // used by chatbot routing only
-}
-
-// extractMessageContent walks an IncomingTextMessage and returns the derived
-// fields, including a best-effort media download. The regular inbound webhook
-// path uses extractMessageContentForPersistence directly so network I/O never
-// delays Meta's acknowledgement.
-func (a *App) extractMessageContent(ctx context.Context, msg IncomingTextMessage, account *models.WhatsAppAccount) ExtractedMessage {
-	extracted := a.extractMessageContentForPersistence(msg)
-	a.hydrateExtractedIncomingMedia(ctx, msg, account, &extracted)
-	return extracted
 }
 
 // extractMessageContentForPersistence normalizes only data already present in
@@ -2004,23 +2645,195 @@ func (a *App) persistIncomingMessageForAccount(
 	profileName string,
 	account *models.WhatsAppAccount,
 ) (*persistedIncomingMessage, bool, error) {
-	var err error
-	if account == nil {
-		account, err = a.getWhatsAppAccountCached(phoneNumberID)
-		if err != nil {
-			return nil, false, fmt.Errorf("load WhatsApp account: %w", err)
+	return a.persistIncomingMessageForAccountWithAdmission(
+		phoneNumberID,
+		msg,
+		profileName,
+		account,
+		nil,
+	)
+}
+
+func (a *App) persistIncomingMessageForAccountWithAdmission(
+	phoneNumberID string,
+	msg IncomingTextMessage,
+	profileName string,
+	account *models.WhatsAppAccount,
+	admission *incomingMessageAdmissionPolicy,
+) (*persistedIncomingMessage, bool, error) {
+	if a == nil || a.DB == nil || strings.TrimSpace(phoneNumberID) == "" || strings.TrimSpace(msg.ID) == "" {
+		return nil, false, errors.New("incoming message account and WAMID are required")
+	}
+	if _, transactional := a.DB.Statement.ConnPool.(gorm.TxCommitter); !transactional {
+		var work *persistedIncomingMessage
+		var duplicate bool
+		var nested *App
+		err := a.DB.Transaction(func(tx *gorm.DB) error {
+			nested = a.scopedApp(tx, a.tenantOrgID)
+			var err error
+			work, duplicate, err = nested.persistIncomingMessageForAccountWithAdmission(
+				phoneNumberID,
+				msg,
+				profileName,
+				account,
+				admission,
+			)
+			return err
+		})
+		if err == nil {
+			a.adoptAfterCommit(nested)
+		}
+		return work, duplicate, err
+	}
+	// Never use the mutable/global phone cache to establish tenant authority.
+	var accounts []models.WhatsAppAccount
+	query := a.DB.Where("BTRIM(phone_id) = ?", strings.TrimSpace(phoneNumberID))
+	if account != nil {
+		query = query.Where("id = ? AND organization_id = ?", account.ID, account.OrganizationID)
+	} else if a.tenantOrgID != uuid.Nil {
+		query = query.Where("organization_id = ?", a.tenantOrgID)
+	}
+	if err := query.Limit(2).Find(&accounts).Error; err != nil {
+		return nil, false, fmt.Errorf("load incoming account: %w", err)
+	}
+	if len(accounts) != 1 {
+		return nil, false, errors.New("incoming account is missing or ambiguous")
+	}
+	current := accounts[0]
+	account = &current
+	if err := database.LockWhatsAppWAMIDScopes(a.DB, account.OrganizationID, msg.ID); err != nil {
+		return nil, false, fmt.Errorf("lock incoming WhatsApp message admission: %w", err)
+	}
+	if err := database.LockOrganizationPolicyScope(
+		a.DB,
+		account.OrganizationID,
+	); err != nil {
+		return nil, false, fmt.Errorf(
+			"lock incoming organization admission: %w",
+			err,
+		)
+	}
+	if account.IsSMB {
+		if _, err := channelapi.EnsureLegacyMetaWhatsAppAccount(
+			a.DB,
+			channelapi.LegacyMetaAccountRef{
+				ID:             account.ID,
+				OrganizationID: account.OrganizationID,
+				Name:           account.Name,
+				Status:         account.Status,
+			},
+		); err != nil {
+			return nil, false, fmt.Errorf(
+				"ensure incoming legacy channel account: %w",
+				err,
+			)
 		}
 	}
-
-	// Existing merge aliases are locked and resolved before the message write.
-	contact, _, err := a.getOrCreateInboundContact(
-		account,
-		msg.From,
-		profileName,
-		msg.FromUserID,
+	if err := a.prepareWhatsAppMessageAuthority(account); err != nil {
+		return nil, false, err
+	}
+	winner, err := a.lookupWhatsAppAdmissionWinner(
+		account.OrganizationID,
+		msg.ID,
 	)
 	if err != nil {
-		return nil, false, fmt.Errorf("get or create inbound contact: %w", err)
+		return nil, false, err
+	}
+	if winner.Kind == whatsAppAdmissionWinnerReview {
+		// The reserved, contact-free review receipt is the immutable WAMID
+		// winner. It is a successful provider replay with no continuation.
+		return nil, true, nil
+	}
+	if winner.Kind == whatsAppAdmissionWinnerMessage && winner.Message != nil && winner.Message.DeletedAt.Valid {
+		// A soft-deleted Message remains the immutable first WAMID owner. A
+		// provider replay is successful but cannot revive the row, its contact,
+		// or its continuation side effects.
+		return nil, true, nil
+	}
+
+	// Resolve existing provenance before changing contact metadata or taking
+	// contact locks. A reused display name cannot adopt an unproven old row.
+	lookup := whatsAppMessageLookup{
+		WAMID: msg.ID, Direction: models.DirectionIncoming,
+		Identity: coexistenceContactIdentity{Phone: msg.From, UserID: msg.FromUserID, ParentUserID: msg.FromParentUserID},
+		Lock:     true, RepairProjection: true,
+	}
+	if admission != nil && admission.CanonicalContactID != uuid.Nil {
+		lookup.ContactID = admission.CanonicalContactID
+	}
+	resolved, err := a.resolveWhatsAppMessage(account, lookup)
+	var contact *models.Contact
+	switch {
+	case err == nil:
+		contact = &resolved.Contact
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		if admission != nil && admission.CanonicalContactID != uuid.Nil {
+			contact, err = contactutil.ResolveCanonicalContactForUpdate(
+				a.DB,
+				account.OrganizationID,
+				admission.CanonicalContactID,
+			)
+			if err != nil {
+				return nil, false, fmt.Errorf(
+					"resolve admitted inbound contact: %w",
+					err,
+				)
+			}
+		} else {
+			contact, _, err = a.getOrCreateInboundContact(
+				account,
+				msg.From,
+				profileName,
+				msg.FromUserID,
+			)
+			if err != nil {
+				return nil, false, fmt.Errorf(
+					"get or create inbound contact: %w",
+					err,
+				)
+			}
+		}
+	default:
+		return nil, false, fmt.Errorf("resolve incoming message: %w", err)
+	}
+
+	suppressAutomaticAI := admission != nil && admission.SuppressAutomaticAI
+	suppressionReason := ""
+	if admission != nil {
+		suppressionReason = strings.TrimSpace(admission.SuppressionReason)
+	}
+	policy, policyErr := database.EvaluateContactAutomaticReplyPolicy(
+		a.DB,
+		account.OrganizationID,
+		contact.ID,
+	)
+	switch {
+	case policyErr != nil:
+		suppressAutomaticAI = true
+		if suppressionReason == "" {
+			suppressionReason = "automatic_reply_policy_unavailable"
+		}
+	case !policy.Allowed:
+		suppressAutomaticAI = true
+		if suppressionReason == "" {
+			suppressionReason = policy.Reason
+		}
+	}
+	paused, pauseErr := a.incomingContactConversationAIIsPaused(
+		account.OrganizationID,
+		contact.ID,
+	)
+	switch {
+	case pauseErr != nil:
+		suppressAutomaticAI = true
+		if suppressionReason == "" {
+			suppressionReason = "conversation_ai_state_unavailable"
+		}
+	case paused:
+		suppressAutomaticAI = true
+		if suppressionReason == "" {
+			suppressionReason = "conversation_ai_paused"
+		}
 	}
 
 	extracted := a.extractMessageContentForPersistence(msg)
@@ -2028,113 +2841,268 @@ func (a *App) persistIncomingMessageForAccount(
 	if msg.Context != nil {
 		replyToWAMID = msg.Context.ID
 	}
-	message, err := a.persistIncomingMessageWithFlow(
-		account,
-		contact,
-		msg.ID,
-		extracted.Type,
-		extracted.Text,
-		extracted.Media,
-		replyToWAMID,
-		extracted.FlowResponseData,
-	)
-	if errors.Is(err, errIncomingMessageAlreadyProcessed) {
-		a.Log.Info("Ignored duplicate incoming message", "whatsapp_message_id", msg.ID)
-		var existing models.Message
-		if loadErr := a.DB.Where(
-			"organization_id = ? AND whats_app_account = ? AND whats_app_message_id = ?",
+	message, err := a.persistIncomingMessageWithFlow(account, contact, msg.ID, extracted.Type,
+		extracted.Text, extracted.Media, replyToWAMID, extracted.FlowResponseData)
+	duplicate := errors.Is(err, errIncomingMessageAlreadyProcessed)
+	if err != nil && !duplicate {
+		return nil, false, err
+	}
+	if message == nil {
+		return nil, false, errors.New("incoming message did not resolve a durable winner")
+	}
+	if !duplicate && (suppressAutomaticAI || (admission != nil && admission.IdentityReviewHoldID != uuid.Nil)) {
+		if err := applyIncomingMessageAdmissionPolicy(
+			a.DB,
 			account.OrganizationID,
-			account.Name,
-			msg.ID,
-		).First(&existing).Error; loadErr != nil {
-			return nil, false, fmt.Errorf(
-				"load duplicate incoming message for continuation: %w",
-				loadErr,
-			)
+			message,
+			admission,
+			suppressAutomaticAI,
+			suppressionReason,
+		); err != nil {
+			return nil, false, err
 		}
-		if queueErr := a.ensureInboundContinuationJob(
-			account,
-			&existing,
-			msg,
-			profileName,
-		); queueErr != nil {
-			return nil, false, queueErr
+	}
+	if !duplicate || admission == nil {
+		if err := a.ensureInboundContinuationJob(account, message, msg, profileName); err != nil {
+			return nil, false, err
 		}
-		return &persistedIncomingMessage{
-			OrganizationID: account.OrganizationID,
-			PhoneNumberID:  phoneNumberID,
-			Message:        msg,
-			Account:        *account,
-			Contact:        *contact,
-			Extracted:      extracted,
-			Persisted:      existing,
-		}, true, nil
 	}
-	if err != nil {
-		return nil, false, err
-	}
-
-	work := &persistedIncomingMessage{
-		OrganizationID: account.OrganizationID,
-		PhoneNumberID:  phoneNumberID,
-		Message:        msg,
-		Account:        *account,
-		Contact:        *contact,
-		Extracted:      extracted,
-		Persisted:      *message,
-	}
-	if err := a.ensureInboundContinuationJob(
-		account,
-		message,
-		msg,
-		profileName,
-	); err != nil {
-		return nil, false, err
-	}
-	return work, false, nil
+	return &persistedIncomingMessage{
+		OrganizationID: account.OrganizationID, PhoneNumberID: account.PhoneID,
+		Message: msg, Account: *account, Contact: *contact, Extracted: extracted, Persisted: *message,
+	}, duplicate, nil
 }
 
+// incomingContactConversationAIIsPaused projects the established legacy
+// inbox pause onto native WhatsApp admission. The account-authority step has
+// already locked and validated every eligible shadow account; an unexpected
+// or unreadable conversation projection therefore fails closed at admission.
+func (a *App) incomingContactConversationAIIsPaused(
+	organizationID, contactID uuid.UUID,
+) (bool, error) {
+	if a == nil || a.DB == nil || organizationID == uuid.Nil || contactID == uuid.Nil {
+		return false, errors.New("incoming conversation AI policy identity is incomplete")
+	}
+	authority, _ := a.DB.Statement.Context.Value(whatsAppMessageAuthorityKey{}).(*whatsAppMessageAuthority)
+	if authority == nil || authority.pool != a.DB.Statement.ConnPool ||
+		authority.account.OrganizationID != organizationID {
+		return false, errors.New("incoming conversation AI policy lacks account authority")
+	}
+	if len(authority.channelIDs) == 0 {
+		return false, nil
+	}
+	channelIDs := make([]uuid.UUID, 0, len(authority.channelIDs))
+	for channelID := range authority.channelIDs {
+		channelIDs = append(channelIDs, channelID)
+	}
+	var conversations []models.InboxConversation
+	if err := a.DB.Select("id", "config").Where(
+		"organization_id = ? AND contact_id = ? AND channel = ? AND channel_account_id IN ?",
+		organizationID,
+		contactID,
+		models.ChannelWhatsApp,
+		channelIDs,
+	).Find(&conversations).Error; err != nil {
+		return false, err
+	}
+	for i := range conversations {
+		if inboxConversationAIIsPaused(conversations[i].Config) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func applyIncomingMessageAdmissionPolicy(
+	tx *gorm.DB,
+	organizationID uuid.UUID,
+	message *models.Message,
+	admission *incomingMessageAdmissionPolicy,
+	suppressAutomaticAI bool,
+	reason string,
+) error {
+	if tx == nil || organizationID == uuid.Nil || message == nil ||
+		message.ID == uuid.Nil || message.OrganizationID != organizationID {
+		return errors.New("incoming AI suppression identity is incomplete")
+	}
+	metadata := cloneMessageMetadata(message.Metadata)
+	if suppressAutomaticAI {
+		// Suppression is monotonic per WAMID. A later Resume or identity decision
+		// affects only future provider attempts and never clears this fact.
+		metadata[incomingAutomaticAISuppressedKey] = true
+		if strings.TrimSpace(reason) == "" {
+			reason = "policy_blocked_at_admission"
+		}
+		metadata[incomingAutomaticAISuppressionReasonKey] = strings.TrimSpace(reason)
+		if _, exists := metadata[incomingAutomaticAISuppressedAtKey]; !exists {
+			metadata[incomingAutomaticAISuppressedAtKey] = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+	}
+	if admission != nil && admission.IdentityReviewHoldID != uuid.Nil {
+		if admission.IdentityReviewHoldID.String() == "" ||
+			!whatsAppIdentityReviewRouteReasonAllowed(admission.IdentityReviewReason) ||
+			(admission.IdentityReviewRouteMode != incomingIdentityReviewRouteHeldDirect &&
+				admission.IdentityReviewRouteMode != incomingIdentityReviewRouteReviewedFuture) ||
+			admission.IdentityReviewSelectorHash != strings.ToLower(strings.TrimSpace(admission.IdentityReviewSelectorHash)) ||
+			!isSHA256Hex(admission.IdentityReviewSelectorHash) {
+			return errors.New("incoming identity-review admission proof is invalid")
+		}
+		metadata[incomingIdentityReviewHoldIDKey] = admission.IdentityReviewHoldID.String()
+		metadata[incomingIdentityReviewReasonKey] = admission.IdentityReviewReason
+		metadata[incomingIdentityReviewRouteModeKey] = admission.IdentityReviewRouteMode
+		metadata[incomingIdentityReviewSelectorDigestKey] = admission.IdentityReviewSelectorHash
+	}
+	update := tx.Model(&models.Message{}).
+		Where(
+			"id = ? AND organization_id = ? AND direction = ?",
+			message.ID,
+			organizationID,
+			models.DirectionIncoming,
+		).
+		Update("metadata", metadata)
+	if update.Error != nil {
+		return update.Error
+	}
+	if update.RowsAffected != 1 {
+		return errors.New("incoming AI suppression lost its WAMID winner")
+	}
+	message.Metadata = metadata
+	return nil
+}
 func (a *App) hydratePersistedIncomingMedia(
 	ctx context.Context,
 	work *persistedIncomingMessage,
 	account *models.WhatsAppAccount,
-) {
+) error {
 	if work == nil || work.Extracted.Media == nil {
-		return
+		return nil
+	}
+	if account == nil || account.ID != work.Account.ID || account.OrganizationID != work.OrganizationID {
+		return errors.New("incoming media account authority changed")
+	}
+	lookup := whatsAppMessageLookup{
+		WAMID: work.Message.ID, MessageID: work.Persisted.ID, ContactID: work.Contact.ID,
+		Direction: models.DirectionIncoming,
+		Identity:  coexistenceContactIdentity{Phone: work.Message.From, UserID: work.Message.FromUserID, ParentUserID: work.Message.FromParentUserID},
+		Lock:      true, RepairProjection: true,
+	}
+	var before models.Message
+	var tokenGeneration [sha256.Size]byte
+	currentAccount := *account
+	err := a.WithCommittedTenantApp(work.OrganizationID, func(scoped *App) error {
+		if err := scoped.prepareWhatsAppMessageAuthority(&currentAccount); err != nil {
+			return err
+		}
+		resolved, err := scoped.resolveWhatsAppMessage(&currentAccount, lookup)
+		if err != nil {
+			return err
+		}
+		before, work.Persisted = resolved.Message, resolved.Message
+		if err := scoped.prepareWhatsAppAccountForOutbound(&currentAccount); err != nil {
+			return err
+		}
+		authority := scoped.DB.Statement.Context.Value(whatsAppMessageAuthorityKey{}).(*whatsAppMessageAuthority)
+		tokenGeneration = authority.accessTokenGeneration
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("validate incoming media before download: %w", err)
+	}
+	if before.Metadata[coexistenceMediaRevokedMetadataKey] == true {
+		return nil
+	}
+	mediaID, _ := coexistenceMediaIdentity(work.Message)
+	if mediaID == "" || before.MessageType != models.MessageType(work.Message.Type) {
+		return errors.New("incoming media type was replaced before hydration")
+	}
+	if expected := coexistenceMediaMetadataString(before.Metadata, coexistenceMediaProviderIDMetadataKey); expected != "" && expected != mediaID {
+		return errors.New("incoming media was replaced before hydration")
+	}
+	if before.MediaURL != "" {
+		work.Extracted.Media = &MediaInfo{MediaURL: before.MediaURL, MediaMimeType: before.MediaMimeType, MediaFilename: before.MediaFilename}
+		return nil
 	}
 
+	// No database authority locks span provider/object-store I/O.
 	hydrated := work.Extracted
 	hydratedMedia := *work.Extracted.Media
 	hydrated.Media = &hydratedMedia
-	a.hydrateExtractedIncomingMedia(ctx, work.Message, account, &hydrated)
+	a.hydrateExtractedIncomingMedia(ctx, work.Message, &currentAccount, &hydrated)
 	if hydrated.Media.MediaURL == "" {
-		return
+		return nil
 	}
-
-	updates := map[string]any{
-		"media_url":       hydrated.Media.MediaURL,
-		"media_mime_type": hydrated.Media.MediaMimeType,
-		"media_filename":  hydrated.Media.MediaFilename,
+	var discarded bool
+	var discardReason error
+	err = a.WithCommittedTenantApp(work.OrganizationID, func(scoped *App) error {
+		if err := scoped.prepareWhatsAppMessageAuthority(&currentAccount); err != nil {
+			return err
+		}
+		resolved, err := scoped.resolveWhatsAppMessage(&currentAccount, lookup)
+		if err != nil {
+			return err
+		}
+		message := resolved.Message
+		work.Persisted = message
+		// A discard decision commits before exact-key cleanup. No observer has
+		// been given this newly generated random key; still prove that it has
+		// no durable tenant reference before allowing deletion.
+		discard := func(reason error) error {
+			var references int64
+			if err := scoped.DB.Unscoped().Model(&models.Message{}).Where(
+				"organization_id = ? AND media_url = ?", work.OrganizationID, hydrated.Media.MediaURL,
+			).Count(&references).Error; err != nil {
+				return err
+			}
+			discarded, discardReason = references == 0, reason
+			return nil
+		}
+		authority := scoped.DB.Statement.Context.Value(whatsAppMessageAuthorityKey{}).(*whatsAppMessageAuthority)
+		if authority.accessTokenGeneration != tokenGeneration || currentAccount.IsSMB != account.IsSMB {
+			return discard(errors.New("incoming media credentials changed during hydration"))
+		}
+		if err := scoped.prepareWhatsAppAccountForOutbound(&currentAccount); err != nil {
+			return discard(errors.New("incoming media account became unavailable during hydration"))
+		}
+		if message.Metadata[coexistenceMediaRevokedMetadataKey] == true {
+			return discard(nil)
+		}
+		if message.MediaURL != "" {
+			work.Extracted.Media = &MediaInfo{MediaURL: message.MediaURL, MediaMimeType: message.MediaMimeType, MediaFilename: message.MediaFilename}
+			return discard(nil)
+		}
+		if message.MessageType != before.MessageType || !message.UpdatedAt.Equal(before.UpdatedAt) ||
+			coexistenceMediaMetadataString(message.Metadata, coexistenceMediaProviderIDMetadataKey) != coexistenceMediaMetadataString(before.Metadata, coexistenceMediaProviderIDMetadataKey) {
+			return discard(errors.New("incoming media changed during hydration"))
+		}
+		updates := map[string]any{
+			"media_url": hydrated.Media.MediaURL, "media_mime_type": hydrated.Media.MediaMimeType,
+			"media_filename": hydrated.Media.MediaFilename,
+		}
+		if err := scoped.DB.Model(&models.Message{}).Where("organization_id = ? AND id = ?", work.OrganizationID, message.ID).Updates(updates).Error; err != nil {
+			return err
+		}
+		work.Extracted = hydrated
+		work.Persisted.MediaURL, work.Persisted.MediaMimeType, work.Persisted.MediaFilename =
+			hydrated.Media.MediaURL, hydrated.Media.MediaMimeType, hydrated.Media.MediaFilename
+		return nil
+	})
+	if err != nil {
+		// A failed/uncertain commit is not proof that the uploaded key is
+		// unreferenced. Never delete media on that path.
+		return fmt.Errorf("validate and persist incoming media: %w", err)
 	}
-	if err := a.DB.Model(&models.Message{}).
-		Where(
-			"organization_id = ? AND id = ?",
-			work.OrganizationID,
-			work.Persisted.ID,
-		).
-		Updates(updates).Error; err != nil {
-		a.Log.Error(
-			"Failed to persist hydrated incoming media",
-			"error", err,
-			"message_id", work.Persisted.ID,
-		)
-		return
+	if discarded {
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelCleanup()
+		if err := a.rootApp().deleteTenantMedia(cleanupCtx, work.OrganizationID, hydrated.Media.MediaURL); err != nil {
+			return &inboundContinuationManualReviewError{Reason: "discarded incoming media cleanup requires review"}
+		}
 	}
-
-	work.Extracted = hydrated
-	work.Persisted.MediaURL = hydrated.Media.MediaURL
-	work.Persisted.MediaMimeType = hydrated.Media.MediaMimeType
-	work.Persisted.MediaFilename = hydrated.Media.MediaFilename
+	if discardReason != nil {
+		return discardReason
+	}
+	*account = currentAccount
+	return nil
 }
 
 // getOrCreateInboundContact keeps the contact row, immutable CRM activity, and
@@ -2263,213 +3231,153 @@ func (a *App) saveIncomingMessageWithFlow(account *models.WhatsAppAccount, conta
 // lifecycle/outbox fact but performs no provider or WebSocket work. Callers can
 // therefore place an acknowledgement boundary immediately after this returns.
 func (a *App) persistIncomingMessageWithFlow(account *models.WhatsAppAccount, contact *models.Contact, whatsappMsgID, msgType, content string, mediaInfo *MediaInfo, replyToWAMID string, flowResponseData map[string]any) (*models.Message, error) {
-	if account == nil || contact == nil {
-		return nil, errors.New("cannot save incoming message without account and contact")
+	if account == nil || contact == nil || account.OrganizationID != contact.OrganizationID || strings.TrimSpace(whatsappMsgID) == "" {
+		return nil, errors.New("cannot save incoming message without account, contact and WAMID")
 	}
-
-	message := models.Message{
-		BaseModel:         models.BaseModel{ID: uuid.New()},
-		OrganizationID:    account.OrganizationID,
-		WhatsAppAccount:   account.Name,
-		WhatsAppMessageID: whatsappMsgID,
-		Direction:         models.DirectionIncoming,
-		MessageType:       models.MessageType(msgType),
-		Content:           content,
-		Status:            models.MessageStatusReceived,
-	}
-	if len(flowResponseData) > 0 {
-		message.FlowResponse = models.JSONB(flowResponseData)
-	}
-
-	// Add media fields if present
-	if mediaInfo != nil {
-		message.MediaURL = mediaInfo.MediaURL
-		message.MediaMimeType = mediaInfo.MediaMimeType
-		message.MediaFilename = mediaInfo.MediaFilename
-	}
-
+	whatsappMsgID = strings.TrimSpace(whatsappMsgID)
 	now := time.Now().UTC()
-	preview := content
-	if len(preview) > 100 {
-		preview = preview[:97] + "..."
-	}
-	if msgType != "text" && msgType != "button_reply" && msgType != "nfm_reply" {
-		preview = "[" + msgType + "]"
-	}
-
-	idempotencyKey := "message-incoming:" +
-		uuid.NewSHA1(account.ID, []byte(strings.TrimSpace(whatsappMsgID))).String()
+	idempotencyKey := "message-incoming:" + uuid.NewSHA1(account.ID, []byte(whatsappMsgID)).String()
+	var message models.Message
 	var canonicalContact models.Contact
-	transactionErr := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
-		message.Status = models.MessageStatusReceived
-		message.IsReply = false
-		message.ReplyToMessageID = nil
+	var duplicate bool
+	var transactionErr error
 
-		canonical, err := contactutil.ResolveCanonicalContactForUpdate(
-			tx,
-			account.OrganizationID,
-			contact.ID,
-		)
-		if err != nil {
-			return err
-		}
-		canonicalContact = *canonical
-		message.ContactID = canonical.ID
-
-		var existingActivity models.CustomerActivityEvent
-		existingErr := tx.Where(
-			"organization_id = ? AND idempotency_key = ?",
-			account.OrganizationID,
-			idempotencyKey,
-		).First(&existingActivity).Error
-		if existingErr == nil {
-			existingCanonical, resolveExistingErr := contactutil.ResolveCanonicalContact(
-				tx,
-				account.OrganizationID,
-				existingActivity.ContactID,
-			)
-			if resolveExistingErr != nil {
-				return resolveExistingErr
-			}
-			if existingCanonical.ID != canonical.ID ||
-				existingActivity.EventType != models.CustomerActivityMessageIncoming ||
-				existingActivity.SourceObjectType != "message" {
-				return errors.New("incoming WhatsApp message ID was reused for a different contact or event")
-			}
-			return errIncomingMessageAlreadyProcessed
-		}
-		if !errors.Is(existingErr, gorm.ErrRecordNotFound) {
-			return existingErr
-		}
-
-		// Also suppress a legacy replay whose message predates the lifecycle
-		// event stream. New concurrent deliveries are still protected by the
-		// globally stable activity idempotency key below.
-		var existingMessage models.Message
-		existingMessageErr := tx.Where(
-			"organization_id = ? AND whats_app_account = ? AND whats_app_message_id = ?",
-			account.OrganizationID,
-			account.Name,
-			whatsappMsgID,
-		).First(&existingMessage).Error
-		if existingMessageErr == nil {
-			existingCanonical, resolveExistingErr := contactutil.ResolveCanonicalContact(
-				tx,
-				account.OrganizationID,
-				existingMessage.ContactID,
-			)
-			if resolveExistingErr != nil {
-				return resolveExistingErr
-			}
-			if existingCanonical.ID != canonical.ID {
-				return errors.New("incoming WhatsApp message ID was reused for a different contact")
-			}
-			return errIncomingMessageAlreadyProcessed
-		}
-		if !errors.Is(existingMessageErr, gorm.ErrRecordNotFound) {
-			return existingMessageErr
-		}
-
-		// Handle reply context within the same tenant and transaction.
-		if replyToWAMID != "" {
-			var replyToMsg models.Message
-			replyErr := tx.Where(
-				"organization_id = ? AND whats_app_message_id = ?",
-				account.OrganizationID,
-				replyToWAMID,
-			).First(&replyToMsg).Error
-			if replyErr == nil {
-				message.IsReply = true
-				message.ReplyToMessageID = &replyToMsg.ID
-			} else if !errors.Is(replyErr, gorm.ErrRecordNotFound) {
-				return replyErr
-			}
-		}
-
-		// Pre-mark bot-handled messages as read so the unread badge does not
-		// flash before the bot reply. Transfer state is checked transactionally
-		// against the canonical contact.
-		settings, settingsErr := a.getChatbotSettingsCached(
-			account.OrganizationID,
-			account.Name,
-		)
-		if settingsErr == nil && settings.IsEnabled {
-			var activeTransfers int64
-			if err := tx.Model(&models.AgentTransfer{}).
-				Where(
-					"organization_id = ? AND contact_id = ? AND status = ?",
-					account.OrganizationID,
-					canonical.ID,
-					models.TransferStatusActive,
-				).
-				Count(&activeTransfers).Error; err != nil {
+	// Every retry is a fresh transaction/savepoint. In particular PostgreSQL
+	// 23505 is rolled back BEFORE any winner lookup, never swallowed in an
+	// aborted transaction. This loop contains no provider work.
+	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
+		transactionErr = a.DB.Transaction(func(tx *gorm.DB) error {
+			scoped := a.scopedApp(tx, account.OrganizationID)
+			if err := scoped.prepareWhatsAppMessageAuthority(account); err != nil {
 				return err
 			}
-			if activeTransfers == 0 {
-				message.Status = models.MessageStatusRead
+			tx = scoped.DB
+			lookup := whatsAppMessageLookup{
+				WAMID: whatsappMsgID, ContactID: contact.ID, Direction: models.DirectionIncoming,
+				Lock: true, RepairProjection: true,
 			}
-		}
+			resolved, err := scoped.resolveWhatsAppMessage(account, lookup)
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				canonical, lockErr := contactutil.ResolveCanonicalContactForUpdate(tx, account.OrganizationID, contact.ID)
+				if lockErr != nil {
+					return lockErr
+				}
+				canonicalContact = *canonical
+				// A delivery waiting for this same contact may now have a
+				// committed winner. Resolve all proofs again after the wait.
+				resolved, err = scoped.resolveWhatsAppMessage(account, lookup)
+			}
+			newMessage := errors.Is(err, gorm.ErrRecordNotFound)
+			if err != nil && !newMessage {
+				return err
+			}
+			duplicate = false
+			if !newMessage {
+				message, canonicalContact = resolved.Message, resolved.Contact
+				duplicate = resolved.IncomingActivity || resolved.Continuation != nil
+				if duplicate {
+					return nil
+				}
+				// Imported history is not a live-processing completion fact.
+				// Keep its exact winning ID, payload and tombstone intact while
+				// recording the first live lifecycle fact and continuation.
+			} else {
+				message = models.Message{
+					BaseModel:      models.BaseModel{ID: uuid.New()},
+					OrganizationID: account.OrganizationID, ContactID: canonicalContact.ID,
+					WhatsAppAccount: account.Name, WhatsAppMessageID: whatsappMsgID,
+					Direction: models.DirectionIncoming, MessageType: models.MessageType(msgType),
+					Content: content, Status: models.MessageStatusReceived,
+				}
+				if len(flowResponseData) > 0 {
+					message.FlowResponse = models.JSONB(flowResponseData)
+				}
+				if mediaInfo != nil {
+					message.MediaURL, message.MediaMimeType, message.MediaFilename =
+						mediaInfo.MediaURL, mediaInfo.MediaMimeType, mediaInfo.MediaFilename
+				}
+			}
 
-		if err := tx.Create(&message).Error; err != nil {
-			return err
-		}
-		if err := tx.Model(canonical).Updates(map[string]any{
-			"last_message_at":      now,
-			"last_message_preview": preview,
-			"is_read":              false,
-			"whats_app_account":    account.Name,
-			"last_inbound_at":      now,
-		}).Error; err != nil {
-			return err
-		}
-
-		_, err = recordCustomerActivity(
-			tx,
-			account.OrganizationID,
-			customerActivityInput{
-				ContactID:        canonical.ID,
-				EventType:        models.CustomerActivityMessageIncoming,
-				Category:         models.CustomerActivityCategoryMessage,
-				Title:            "Message received",
-				Summary:          preview,
-				ActorType:        models.CustomerActivityActorContact,
-				SourceObjectType: "message",
-				SourceObjectID:   &message.ID,
-				OccurredAt:       now,
-				Metadata: models.JSONB{
-					"message_type":     msgType,
-					"message_status":   string(message.Status),
-					"whatsapp_account": account.Name,
-				},
+			// Referenced targets can be incoming OR outgoing, but must belong
+			// to this exact proven account and canonical contact. This is a
+			// read-only target lookup: never acquire Conversation after Contact.
+			if strings.TrimSpace(replyToWAMID) != "" {
+				reply, replyErr := scoped.resolveWhatsAppMessage(account, whatsAppMessageLookup{
+					WAMID: replyToWAMID, ContactID: canonicalContact.ID,
+				})
+				if replyErr == nil && newMessage {
+					message.IsReply, message.ReplyToMessageID = true, &reply.Message.ID
+				} else if replyErr != nil && !errors.Is(replyErr, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("resolve incoming reply target: %w", replyErr)
+				}
+			}
+			if newMessage {
+				settings, settingsErr := scoped.getChatbotSettingsCached(account.OrganizationID, account.Name)
+				if settingsErr == nil && settings.IsEnabled {
+					var activeTransfers int64
+					if err := tx.Model(&models.AgentTransfer{}).Where(
+						"organization_id = ? AND contact_id = ? AND status = ?",
+						account.OrganizationID, canonicalContact.ID, models.TransferStatusActive,
+					).Count(&activeTransfers).Error; err != nil {
+						return err
+					}
+					if activeTransfers == 0 {
+						message.Status = models.MessageStatusRead
+					}
+				}
+				if err := tx.Create(&message).Error; err != nil {
+					return err
+				}
+			}
+			preview := content
+			eventContent := content
+			if message.Metadata[coexistenceMediaRevokedMetadataKey] == true {
+				preview, eventContent = "[deleted]", ""
+			} else if msgType != "text" && msgType != "button_reply" && msgType != "nfm_reply" {
+				preview = "[" + msgType + "]"
+			} else if len(preview) > 100 {
+				preview = preview[:97] + "..."
+			}
+			if err := tx.Model(&canonicalContact).Updates(map[string]any{
+				"last_message_at": now, "last_message_preview": preview, "is_read": false,
+				"whats_app_account": account.Name, "last_inbound_at": now,
+			}).Error; err != nil {
+				return err
+			}
+			_, err = recordCustomerActivity(tx, account.OrganizationID, customerActivityInput{
+				ContactID: canonicalContact.ID, EventType: models.CustomerActivityMessageIncoming,
+				Category: models.CustomerActivityCategoryMessage, Title: "Message received", Summary: preview,
+				ActorType: models.CustomerActivityActorContact, SourceObjectType: "message", SourceObjectID: &message.ID,
+				OccurredAt: now, IdempotencyKey: idempotencyKey,
+				Metadata: models.JSONB{"message_type": msgType, "message_status": string(message.Status), "whatsapp_account": account.Name},
 				WebhookData: models.JSONB{
-					"message_id":       message.ID.String(),
-					"contact_phone":    canonical.PhoneNumber,
-					"contact_name":     canonical.ProfileName,
-					"message_type":     models.MessageType(msgType),
-					"content":          content,
-					"whatsapp_account": account.Name,
-					"direction":        models.DirectionIncoming,
+					"message_id": message.ID.String(), "contact_phone": canonicalContact.PhoneNumber,
+					"contact_name": canonicalContact.ProfileName, "message_type": models.MessageType(msgType),
+					"content": eventContent, "whatsapp_account": account.Name, "direction": models.DirectionIncoming,
 				},
-				IdempotencyKey: idempotencyKey,
-			},
-		)
-		return err
-	})
+			})
+			if err != nil {
+				return err
+			}
+			canonicalContact.LastMessageAt, canonicalContact.LastInboundAt = &now, &now
+			canonicalContact.LastMessagePreview, canonicalContact.IsRead, canonicalContact.WhatsAppAccount = preview, false, account.Name
+			return nil
+		})
+		if transactionErr == nil || (!isUniqueViolation(transactionErr) && !isRetryableCanonicalContactWrite(transactionErr)) {
+			break
+		}
+	}
 	if transactionErr != nil {
 		return nil, transactionErr
 	}
-
-	canonicalContact.LastMessageAt = &now
-	canonicalContact.LastMessagePreview = preview
-	canonicalContact.IsRead = false
-	canonicalContact.WhatsAppAccount = account.Name
-	canonicalContact.LastInboundAt = &now
 	*contact = canonicalContact
-	// The surrounding inbound transaction already owns canonical Contact and
-	// Message locks. Mirror only after it commits so the bridge can establish
-	// ChannelAccount -> InboxConversation -> Contact -> Message ordering.
 	a.mirrorLegacyWhatsAppMessageAfterCommit(account, message.ID)
-
+	if duplicate {
+		// Return the proven row; the caller must never rediscover it by name.
+		// The sentinel is OUTSIDE the successful transaction so projection
+		// repair isn't lost to a rollback of an otherwise accepted replay.
+		return &message, errIncomingMessageAlreadyProcessed
+	}
 	return &message, nil
 }
 
