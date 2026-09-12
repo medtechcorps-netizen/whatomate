@@ -8,10 +8,10 @@ release evidence, and changing production are three separate authorities.
 
 The final `ui` phase is bound to one immutable Git identity:
 
-- commit: `c6e16810b8dec7d54305be47f7f7fc12430a1f0a`
-- root tree: `2e300415c550f7fade95d16da8d1499ed3e0a5fd`
-- `frontend` tree: `b9e93e27948ef2287b3f35bb38f6399b7f0a05c6`
-- `internal` tree: `a1da97143c17f3d02e47250269d00f238ac0e38c`
+- commit: `20a4738407c499b767a238e06e596f2ea8b14f3a`
+- root tree: `7da7949a9d45991bc684629d992ebba2664cde12`
+- `frontend` tree: `09b0efe5124317d2d5561548f1082b8902144d58`
+- `internal` tree: `1b08a3f89ef52815d12658a10ab6b1824569f25d`
 
 The release contains Klinik-only WhatsApp reply hardening and the existing
 authorized-client realtime, unread-marker, and late-layout autoscroll fixes.
@@ -23,6 +23,33 @@ entry and keep the non-Klinik fixture excluded. Perform that one-value change by
 an exact full-spec compare-and-swap, wait for the replacement deployment to be
 healthy and active, then rebaseline the production contract and regenerate all
 release evidence on the resulting control SHA.
+
+### Reviewed fixed-source lineage
+
+Each selected phase is an additive child of its previously reviewed lock-fixed
+source. The exact parent, full changed-file/status/mode/before-and-after blob
+inventory, and root/frontend/internal trees are verified independently. Preserve
+both historical dependency layers: lock-only child to x/crypto-fixed source, then
+go.mod/go.sum-only child to the original source. The new UI lock belongs to this
+fixed snapshot, not a rewrite of either historical remediation.
+
+The bounded fixed scope includes inbox identity/Pause controls, Meta Coexistence
+source capability, staff Booking and lifecycle controls, individual lead-card
+Archive and packages, and default-OFF AI booking. Existing tenant/custom-role
+grants and real consenting Klinik/Meta delivery still require separate live
+acceptance; merging these sources does not activate AI booking.
+
+The UI validation harness applies only the reviewed completion patch to exact
+input blob 799804fd7846167f0bb7c0d1d3e5dad3cbc3eefd, producing
+eb5c656b2d4747bcfa6089cb361e4bd7bbea41e0. The common outcome-wait patch is
+already incorporated and must not be applied twice. Require the complete
+ChannelsView suite and all four delayed-WebCrypto selectors at 25 ms; only the
+single test file may differ from the selected immutable UI source.
+
+After the final protected control merge, regenerate all four source validations,
+image sets and aggregate/capsule authority. Local compatibility results and parent
+main CI do not replace exact new-source workflow evidence, production readiness,
+or the separately authorized coordinated rollout.
 
 ### Compile-time database phase authority
 

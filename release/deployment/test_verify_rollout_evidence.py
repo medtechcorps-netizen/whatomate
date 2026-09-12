@@ -36,10 +36,10 @@ DATABASE_PHASE_HARNESS_PATH = (
 )
 CONTROL_SHA = "a" * 40
 EXPECTED_FINAL_SOURCE = {
-    "source_sha": "c6e16810b8dec7d54305be47f7f7fc12430a1f0a",
-    "root_tree": "2e300415c550f7fade95d16da8d1499ed3e0a5fd",
-    "frontend_tree": "b9e93e27948ef2287b3f35bb38f6399b7f0a05c6",
-    "internal_tree": "a1da97143c17f3d02e47250269d00f238ac0e38c",
+    "source_sha": "20a4738407c499b767a238e06e596f2ea8b14f3a",
+    "root_tree": "7da7949a9d45991bc684629d992ebba2664cde12",
+    "frontend_tree": "09b0efe5124317d2d5561548f1082b8902144d58",
+    "internal_tree": "1b08a3f89ef52815d12658a10ab6b1824569f25d"
 }
 STALE_FINAL_SOURCE = {
     "source_sha": "ab44af2e7c093b4502c1928126c31306b2ba0389",
@@ -67,6 +67,67 @@ REVIEWED_FRONTEND_DEPENDENCY_BLOBS = {
     "frontend/package-lock.json": "12a47b71bd16057f76da532084003d3b7ecda935",
     "frontend/package.json": "9881717b4eda324598217a469295c629b28903ca",
 }
+
+
+LOCK_REMEDIATED_PHASE_SOURCE_SHA = {
+    "baseline": "fe0fc9e4f5ad8f3f8b98af945a78a7239e848f33",
+    "bridge": "45334bf62943885291a73c55788d18001b191be9",
+    "backend": "f90ae3b1713c76694680c0cb3b36114db1688f30",
+    "ui": "c6e16810b8dec7d54305be47f7f7fc12430a1f0a"
+}
+REVIEWED_SNAPSHOT_DIFF_SHA256 = {
+    "baseline": "a9dd5f67c9f02427089da2727c730c9be11784452b560c713eedbaf7699b350f",
+    "bridge": "585504eca545d933c932a8b27f254b9402689e61b3947d4fc3ba225eff5d5e58",
+    "backend": "ce69836fb3fda3d0105012a48f6968fcc6b83a8200e24dac372bc8033fd4954e",
+    "ui": "583225025dbff72b6994b5f3360202bf691d80729c212e46b866b04302eac1b6"
+}
+REVIEWED_SNAPSHOT_PATH_COUNTS = {
+    "baseline": 34,
+    "bridge": 35,
+    "backend": 111,
+    "ui": 141
+}
+
+
+def snapshot_diff_records(raw: bytes) -> list[dict[str, str]]:
+    """Decode complete NUL-delimited full-blob/mode records, never name-only evidence."""
+    if not raw.endswith(b"\0"):
+        raise AssertionError("snapshot diff is not NUL terminated")
+    fields = raw[:-1].split(b"\0")
+    if len(fields) % 2:
+        raise AssertionError("snapshot diff record pairing differs")
+    records = []
+    names = set()
+    for index in range(0, len(fields), 2):
+        header = re.fullmatch(
+            rb":(000000|100644|100755) (000000|100644|100755) "
+            rb"([0-9a-f]{40}) ([0-9a-f]{40}) ([AMD])", fields[index]
+        )
+        if header is None:
+            raise AssertionError("snapshot diff header differs")
+        path = fields[index + 1].decode("utf-8")
+        if (not path or path.startswith("/") or "\\" in path
+                or any(ord(char) < 32 for char in path)
+                or any(part in ("", ".", "..") for part in path.split("/"))
+                or path in names):
+            raise AssertionError("snapshot diff path differs")
+        names.add(path)
+        values = [value.decode("ascii") for value in header.groups()]
+        records.append(dict(zip(
+            ("old_mode", "new_mode", "before", "after", "status"), values
+        ), path=path))
+    return sorted(records, key=lambda record: record["path"])
+
+
+def require_reviewed_snapshot_diff(phase: str, raw: bytes) -> list[dict[str, str]]:
+    records = snapshot_diff_records(raw)
+    canonical = json.dumps(
+        records, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    if (len(records) != REVIEWED_SNAPSHOT_PATH_COUNTS[phase]
+            or hashlib.sha256(canonical).hexdigest() != REVIEWED_SNAPSHOT_DIFF_SHA256[phase]):
+        raise AssertionError("reviewed complete snapshot inventory differs")
+    return records
 
 
 def validation_workflow_sources(workflow: str) -> dict[str, dict[str, str]]:
@@ -198,10 +259,60 @@ class RolloutEvidenceTests(unittest.TestCase):
         )
         self.assertNotEqual(manifest_phases["ui"], STALE_FINAL_SOURCE)
 
-    def test_phase_sources_apply_only_the_reviewed_dependency_remediation(self) -> None:
+    def test_phase_sources_apply_only_the_reviewed_fixed_snapshot(self) -> None:
         for phase, source in self.manifest["phases"].items():
             with self.subTest(phase=phase):
                 commit = source["source_sha"]
+                parent = LOCK_REMEDIATED_PHASE_SOURCE_SHA[phase]
+                def git(*arguments: str) -> bytes:
+                    return subprocess.run(
+                        ["git", "-C", str(ROOT), *arguments],
+                        check=True, capture_output=True,
+                    ).stdout
+                self.assertEqual(
+                    git("rev-list", "--parents", "-n", "1", commit).decode().split(),
+                    [commit, parent],
+                )
+                raw = git("diff-tree", "--no-commit-id", "--raw", "--no-abbrev",
+                          "--no-renames", "-r", "-z", parent, commit)
+                records = require_reviewed_snapshot_diff(phase, raw)
+                deleted = [record["path"] for record in records if record["status"] == "D"]
+                self.assertEqual(deleted, [
+                    "internal/database/message_ingestion_trigger_contract_export_test.go",
+                    "internal/database/platform_compliance_trigger_profile_test.go",
+                ] if phase == "bridge" else [])
+                self.assertEqual(
+                    git("rev-parse", f"{commit}:frontend/package.json").decode().strip(),
+                    REVIEWED_FRONTEND_DEPENDENCY_BLOBS["frontend/package.json"],
+                )
+                self.assertEqual(
+                    git("rev-parse", f"{commit}:frontend/package-lock.json").decode().strip(),
+                    "7194311d2819a457e4a35167d71a84f8fa470a50" if phase == "ui"
+                    else REVIEWED_FRONTEND_DEPENDENCY_BLOBS["frontend/package-lock.json"],
+                )
+                # These mutations exercise complete records: filenames alone are insufficient.
+                fields = raw[:-1].split(b"\0")
+                header = fields[0].split(b" ")
+                changed_header = list(header)
+                changed_header[3] = (b"1" if header[3][:1] == b"0" else b"0") + header[3][1:]
+                changed_blob = b"\0".join([b" ".join(changed_header), *fields[1:]]) + b"\0"
+                changed_mode = b":100755" + raw[7:]
+                changed_path = b"\0".join([fields[0], b"unexpected-source-path", *fields[2:]]) + b"\0"
+                mutants = (
+                    changed_blob, changed_mode, changed_path,
+                    b"\0".join(fields[2:]) + b"\0",
+                    raw + b"\0".join(fields[:2]) + b"\0",
+                    raw[:-1], raw.replace(b"\0", b"\n", 1),
+                )
+                for mutant in mutants:
+                    self.assertNotEqual(mutant, raw)
+                    with self.assertRaises(AssertionError):
+                        require_reviewed_snapshot_diff(phase, mutant)
+
+    def test_phase_sources_apply_only_the_reviewed_dependency_remediation(self) -> None:
+        for phase, source in self.manifest["phases"].items():
+            with self.subTest(phase=phase):
+                commit = LOCK_REMEDIATED_PHASE_SOURCE_SHA[phase]
                 go_remediated_commit = GO_REMEDIATED_PHASE_SOURCE_SHA[phase]
                 ancestry = subprocess.run(
                     ["git", "-C", str(ROOT), "rev-list", "--parents", "-n", "1", commit],
@@ -286,7 +397,7 @@ class RolloutEvidenceTests(unittest.TestCase):
                     self.assertEqual(actual_blob, expected_blob)
                 self.assertEqual(
                     subprocess.run(
-                        ["git", "-C", str(ROOT), "rev-parse", f"{commit}^{{tree}}"],
+                        ["git", "-C", str(ROOT), "rev-parse", f"{source['source_sha']}^{{tree}}"],
                         check=True,
                         capture_output=True,
                         text=True,
@@ -296,7 +407,7 @@ class RolloutEvidenceTests(unittest.TestCase):
                 for subtree in ("frontend", "internal"):
                     self.assertEqual(
                         subprocess.run(
-                            ["git", "-C", str(ROOT), "rev-parse", f"{commit}:{subtree}"],
+                            ["git", "-C", str(ROOT), "rev-parse", f"{source['source_sha']}:{subtree}"],
                             check=True,
                             capture_output=True,
                             text=True,
@@ -324,11 +435,11 @@ class RolloutEvidenceTests(unittest.TestCase):
         self.assertEqual(
             assignments,
             {
-                "expected_original_blob": "906e09c8ebf43d4ba23fcd3caf856175c6ecc332",
-                "expected_common_blob": "906e09c8ebf43d4ba23fcd3caf856175c6ecc332",
+                "expected_original_blob": "799804fd7846167f0bb7c0d1d3e5dad3cbc3eefd",
+                "expected_common_blob": "799804fd7846167f0bb7c0d1d3e5dad3cbc3eefd",
                 "apply_common_patch": "false",
                 "completion_patch_relative_path": "$UI_COMPLETION_PATCH_RELATIVE_PATH",
-                "expected_patched_blob": "f9ae2342e236274db62dc50e9acd19dba7e03f2f",
+                "expected_patched_blob": "eb5c656b2d4747bcfa6089cb361e4bd7bbea41e0",
             },
         )
         self.assertIn('if [[ "$apply_common_patch" == "true" ]]; then', workflow)
@@ -363,7 +474,7 @@ class RolloutEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(completion_bytes).hexdigest(),
-            "be427efad3c9b2deffdab3dbd51691cf8d79f212ecbdd3dc250449c271a00dd9",
+            "ac2ef392ef5afe27ad4d2d2bb83d6616e2f12c56d90e749991d476b19e3f3ad6",
         )
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -388,7 +499,7 @@ class RolloutEvidenceTests(unittest.TestCase):
 
             self.assertEqual(
                 git("hash-object", target_relative.as_posix()).stdout.strip(),
-                "906e09c8ebf43d4ba23fcd3caf856175c6ecc332",
+                "799804fd7846167f0bb7c0d1d3e5dad3cbc3eefd",
             )
             common_check = git(
                 "apply",
@@ -414,7 +525,7 @@ class RolloutEvidenceTests(unittest.TestCase):
             )
             self.assertEqual(
                 git("hash-object", target_relative.as_posix()).stdout.strip(),
-                "f9ae2342e236274db62dc50e9acd19dba7e03f2f",
+                "eb5c656b2d4747bcfa6089cb361e4bd7bbea41e0",
             )
             self.assertEqual(
                 [path.relative_to(checkout).as_posix() for path in checkout.rglob("*") if path.is_file()],
