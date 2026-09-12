@@ -556,29 +556,50 @@ func runRLSMigration(args []string) {
 		return
 	}
 
-	if err := database.RunMigrationWithProgress(db, &cfg.DefaultAdmin); err != nil {
-		lo.Fatal("Schema migration failed", "error", err)
-	}
-	if err := handlers.BackfillChatbotFlowGraph(db, lo); err != nil {
-		lo.Fatal("Chatbot flow graph backfill failed", "error", err)
-	}
-	legacyMetaStats, err := channelapi.BackfillLegacyWhatsAppInbox(db, 500)
-	if err != nil {
-		lo.Fatal("Legacy WhatsApp omnichannel backfill failed", "error", err)
-	}
-	lo.Info(
-		"Legacy WhatsApp omnichannel backfill complete",
-		"accounts",
-		legacyMetaStats.Accounts,
-		"messages",
-		legacyMetaStats.Messages,
-		"linked",
-		legacyMetaStats.Linked,
-	)
-	if err := database.ApplyTenantRLS(db, cfg.Database.RuntimeRole); err != nil {
-		lo.Fatal("Tenant RLS migration failed", "error", err)
+	if err := database.RunRLSMigrationCoordinator(
+		db,
+		&cfg.DefaultAdmin,
+		cfg.Database.RuntimeRole,
+		func(session *gorm.DB) error {
+			if err := handlers.BackfillChatbotFlowGraph(session, lo); err != nil {
+				return fmt.Errorf("chatbot flow graph backfill: %w", err)
+			}
+			legacyMetaStats, err := channelapi.BackfillLegacyWhatsAppInbox(session, 500)
+			if err != nil {
+				return fmt.Errorf("legacy WhatsApp omnichannel backfill: %w", err)
+			}
+			lo.Info(
+				"Legacy WhatsApp omnichannel backfill complete",
+				"accounts",
+				legacyMetaStats.Accounts,
+				"messages",
+				legacyMetaStats.Messages,
+				"linked",
+				legacyMetaStats.Linked,
+			)
+			return nil
+		},
+		func() error { return verifyRLSMigrationRuntime(&cfg.Database) },
+	); err != nil {
+		lo.Fatal("RLS migration coordinator failed", "error", err)
 	}
 	lo.Info("Tenant RLS installed", "runtime_role", cfg.Database.RuntimeRole)
+}
+
+func verifyRLSMigrationRuntime(cfg *config.DatabaseConfig) error {
+	if cfg == nil {
+		return errors.New("runtime database configuration is required")
+	}
+	runtimeDB, err := database.NewPostgres(cfg, false)
+	if err != nil {
+		return fmt.Errorf("open runtime database verifier: %w", err)
+	}
+	sqlDB, err := runtimeDB.DB()
+	if err != nil {
+		return fmt.Errorf("open runtime database verifier pool: %w", err)
+	}
+	defer func() { _ = sqlDB.Close() }()
+	return database.VerifyTenantRLS(runtimeDB, cfg.RuntimeRole)
 }
 
 // ============================================================================
