@@ -14,6 +14,7 @@ import (
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
+	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
 	"gorm.io/gorm"
 )
 
@@ -364,6 +365,27 @@ func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount,
 		return nil, err
 	}
 	return &account, nil
+}
+
+// getWhatsAppAccountCachedForOutbound adds the account lifecycle gate to the
+// generic cached lookup. The generic lookup deliberately remains available to
+// inbound/reconciliation code while registration or subscription is pending.
+func (a *App) getWhatsAppAccountCachedForOutbound(phoneID string) (*models.WhatsAppAccount, error) {
+	account, err := a.getWhatsAppAccountCached(phoneID)
+	if err != nil {
+		return nil, err
+	}
+	if err := whatsappaccount.RequireActiveForOutbound(account); err != nil {
+		return nil, err
+	}
+	return account, nil
+}
+
+func (a *App) prepareWhatsAppAccountForOutbound(account *models.WhatsAppAccount) error {
+	if err := whatsappaccount.RequireActiveForOutbound(account); err != nil {
+		return err
+	}
+	return a.prepareWhatsAppAccountForRuntime(account)
 }
 
 func (a *App) prepareWhatsAppAccountForRuntime(account *models.WhatsAppAccount) error {

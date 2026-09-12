@@ -29,6 +29,7 @@ var (
 	// stored value cannot alter the Graph endpoint being called.
 	graphObjectIDPattern   = regexp.MustCompile(`^[0-9]{1,32}$`)
 	graphAPIVersionPattern = regexp.MustCompile(`^v[0-9]{1,3}\.[0-9]{1,3}$`)
+	metaMediaDomains       = []string{"fbsbx.com", "fbcdn.net", "whatsapp.net"}
 )
 
 func normalizeGraphObjectID(value, label string) (string, error) {
@@ -108,6 +109,87 @@ func (c *Client) doHTTP(req *http.Request) (*http.Response, error) {
 		return http.ErrUseLastResponse
 	}
 	return requestClient.Do(req)
+}
+
+func parseMediaDownloadURL(rawURL string) (*url.URL, bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Hostname() == "" ||
+		parsed.Opaque != "" || parsed.User != nil || parsed.Fragment != "" ||
+		strings.Contains(rawURL, "#") {
+		return nil, false
+	}
+
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		return parsed, true
+	default:
+		return nil, false
+	}
+}
+
+func effectiveURLPort(parsed *url.URL) string {
+	if port := parsed.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+func sameURLOrigin(left, right *url.URL) bool {
+	return strings.EqualFold(left.Scheme, right.Scheme) &&
+		strings.EqualFold(left.Hostname(), right.Hostname()) &&
+		effectiveURLPort(left) == effectiveURLPort(right)
+}
+
+func isTrustedMetaMediaHost(host string) bool {
+	host = strings.ToLower(host)
+	for _, domain := range metaMediaDomains {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// validatedMediaDownloadURL ensures the account bearer token can only be sent
+// to a Meta-owned media host in production. A custom Graph origin is supported
+// for local/test providers, but media must remain on that exact origin.
+func (c *Client) validatedMediaDownloadURL(rawURL string) (*url.URL, error) {
+	if c == nil {
+		return nil, errors.New("media download URL is not trusted")
+	}
+
+	target, ok := parseMediaDownloadURL(rawURL)
+	if !ok {
+		return nil, errors.New("media download URL is not trusted")
+	}
+	configuredBase, ok := parseMediaDownloadURL(c.getBaseURL())
+	if !ok {
+		return nil, errors.New("WhatsApp API base URL is invalid")
+	}
+	productionBase, ok := parseMediaDownloadURL(BaseURL)
+	if !ok {
+		return nil, errors.New("WhatsApp API base URL is invalid")
+	}
+
+	if sameURLOrigin(configuredBase, productionBase) {
+		if !strings.EqualFold(target.Scheme, "https") || effectiveURLPort(target) != "443" ||
+			!isTrustedMetaMediaHost(target.Hostname()) {
+			return nil, errors.New("media download URL is not trusted")
+		}
+		return target, nil
+	}
+
+	if !sameURLOrigin(target, configuredBase) {
+		return nil, errors.New("media download URL is not trusted")
+	}
+	return target, nil
 }
 
 // doRequest performs an HTTP request to the Meta API
@@ -321,9 +403,14 @@ func (c *Client) GetMediaURL(ctx context.Context, mediaID string, account *Accou
 
 // DownloadMedia downloads media content from Meta's CDN URL
 func (c *Client) DownloadMedia(ctx context.Context, mediaURL string, accessToken string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mediaURL, nil)
+	trustedURL, err := c.validatedMediaDownloadURL(mediaURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create download request: %w", err)
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trustedURL.String(), nil)
+	if err != nil {
+		return nil, errors.New("failed to create media download request")
 	}
 
 	// Meta requires Bearer token for media download
@@ -331,7 +418,7 @@ func (c *Client) DownloadMedia(ctx context.Context, mediaURL string, accessToken
 
 	resp, err := c.doHTTP(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to download media: %w", err)
+		return nil, errors.New("failed to download media")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -341,7 +428,7 @@ func (c *Client) DownloadMedia(ctx context.Context, mediaURL string, accessToken
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read media content: %w", err)
+		return nil, errors.New("failed to read media content")
 	}
 
 	return data, nil

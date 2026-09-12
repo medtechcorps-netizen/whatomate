@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -8,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -152,13 +155,14 @@ func (a *App) SendCallPermissionRequest(r *fastglue.Request) error {
 		return nil
 	}
 
-	waAccount := account.ToWAAccount()
-
 	// Send permission request via WhatsApp Messages API
 	ctx := r.RequestCtx
 	rcpt := whatsapp.Recipient{Phone: contact.PhoneNumber, BSUID: contact.BSUID}
-	messageID, err := a.WhatsApp.SendCallPermissionRequest(ctx, waAccount, rcpt, "")
+	messageID, err := a.sendCallPermissionRequestGuarded(ctx, account, rcpt)
 	if err != nil {
+		if errors.Is(err, whatsappaccount.ErrOutboundInactive) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account is not active for outbound messaging", nil, "")
+		}
 		a.Log.Error("Failed to send call permission request", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to send permission request", nil, "")
 	}
@@ -181,6 +185,23 @@ func (a *App) SendCallPermissionRequest(r *fastglue.Request) error {
 	return r.SendEnvelope(map[string]string{
 		"permission_id": permission.ID.String(),
 	})
+}
+
+func (a *App) sendCallPermissionRequestGuarded(
+	ctx context.Context,
+	account *models.WhatsAppAccount,
+	recipient whatsapp.Recipient,
+) (string, error) {
+	if account == nil || account.OrganizationID == uuid.Nil || account.ID == uuid.Nil {
+		return "", whatsappaccount.ErrOutboundInactive
+	}
+	var messageID string
+	err := a.withLockedWhatsAppAccountForOutbound(ctx, account.OrganizationID, account.ID, func(locked *models.WhatsAppAccount) error {
+		var err error
+		messageID, err = a.WhatsApp.SendCallPermissionRequest(ctx, locked.ToWAAccount(), recipient, "")
+		return err
+	})
+	return messageID, err
 }
 
 // GetICEServers handles GET /api/calls/ice-servers

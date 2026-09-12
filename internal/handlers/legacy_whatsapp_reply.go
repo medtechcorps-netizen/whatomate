@@ -204,7 +204,7 @@ func (a *App) SendLegacyWhatsAppConversationReply(r *fastglue.Request) error {
 				"WhatsApp account is not active for replies",
 			)
 		}
-		if credentialErr := scoped.prepareWhatsAppAccountForRuntime(&account); credentialErr != nil {
+		if credentialErr := scoped.prepareWhatsAppAccountForOutbound(&account); credentialErr != nil {
 			scoped.Log.Warn(
 				"WhatsApp account is not ready for an omnichannel reply",
 				"error", credentialErr,

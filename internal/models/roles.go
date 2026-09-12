@@ -72,43 +72,47 @@ const (
 	ResourceChat                    = "chat"
 	ResourceChatAssign              = "chat.assign"
 	ResourceContacts                = "contacts"
-	ResourceTags                    = "tags"
-	ResourceAnalytics               = "analytics"
-	ResourceAnalyticsAgents         = "analytics.agents"
-	ResourceTransfers               = "transfers"
-	ResourceWebhooks                = "webhooks"
-	ResourceAPIKeys                 = "api_keys"
-	ResourceCannedResponses         = "canned_responses"
-	ResourceCustomActions           = "custom_actions"
-	ResourceOrganizations           = "organizations"
-	ResourceCallLogs                = "call_logs"
-	ResourceIVRFlows                = "ivr_flows"
-	ResourceCallTransfers           = "call_transfers"
-	ResourceOutgoingCalls           = "outgoing_calls"
-	ResourceAuditLogs               = "audit_logs"
-	ResourceBilling                 = "billing"
-	ResourceEntitlements            = "entitlements"
-	ResourceOnboarding              = "onboarding"
-	ResourceWorkspaceTemplates      = "workspace_templates"
-	ResourcePrivacySettings         = "privacy.settings"
-	ResourcePrivacyConsents         = "privacy.consents"
-	ResourcePrivacyRequests         = "privacy.requests"
-	ResourcePrivacyIncidents        = "privacy.incidents"
-	ResourceSupport                 = "support"
-	ResourceOperations              = "operations"
-	ResourceCRMPipelines            = "crm.pipelines"
-	ResourceCRMLeads                = "crm.leads"
-	ResourceCRMAutomations          = "crm.automations"
-	ResourceTasks                   = "tasks"
-	ResourceBookings                = "bookings"
-	ResourceBookingSettings         = "booking.settings"
-	ResourcePackages                = "packages"
-	ResourceCredits                 = "credits"
-	ResourcePayments                = "payments"
-	ResourcePaymentRefunds          = "payments.refunds"
-	ResourceCopilot                 = "copilot"
-	ResourceChannelAccounts         = "channel_accounts"
-	ResourceConversations           = "conversations"
+	// ResourceContactsIdentityReview is intentionally separate from ordinary
+	// contact editing. Only administrators receive its write permission by
+	// default because a review decision can select future message ownership.
+	ResourceContactsIdentityReview = "contacts.identity_review"
+	ResourceTags                   = "tags"
+	ResourceAnalytics              = "analytics"
+	ResourceAnalyticsAgents        = "analytics.agents"
+	ResourceTransfers              = "transfers"
+	ResourceWebhooks               = "webhooks"
+	ResourceAPIKeys                = "api_keys"
+	ResourceCannedResponses        = "canned_responses"
+	ResourceCustomActions          = "custom_actions"
+	ResourceOrganizations          = "organizations"
+	ResourceCallLogs               = "call_logs"
+	ResourceIVRFlows               = "ivr_flows"
+	ResourceCallTransfers          = "call_transfers"
+	ResourceOutgoingCalls          = "outgoing_calls"
+	ResourceAuditLogs              = "audit_logs"
+	ResourceBilling                = "billing"
+	ResourceEntitlements           = "entitlements"
+	ResourceOnboarding             = "onboarding"
+	ResourceWorkspaceTemplates     = "workspace_templates"
+	ResourcePrivacySettings        = "privacy.settings"
+	ResourcePrivacyConsents        = "privacy.consents"
+	ResourcePrivacyRequests        = "privacy.requests"
+	ResourcePrivacyIncidents       = "privacy.incidents"
+	ResourceSupport                = "support"
+	ResourceOperations             = "operations"
+	ResourceCRMPipelines           = "crm.pipelines"
+	ResourceCRMLeads               = "crm.leads"
+	ResourceCRMAutomations         = "crm.automations"
+	ResourceTasks                  = "tasks"
+	ResourceBookings               = "bookings"
+	ResourceBookingSettings        = "booking.settings"
+	ResourcePackages               = "packages"
+	ResourceCredits                = "credits"
+	ResourcePayments               = "payments"
+	ResourcePaymentRefunds         = "payments.refunds"
+	ResourceCopilot                = "copilot"
+	ResourceChannelAccounts        = "channel_accounts"
+	ResourceConversations          = "conversations"
 )
 
 // PermissionAction constants for available actions
@@ -202,6 +206,7 @@ func DefaultPermissions() []Permission {
 		{Resource: ResourceContacts, Action: ActionDelete, Description: "Delete contacts"},
 		{Resource: ResourceContacts, Action: ActionImport, Description: "Import contacts"},
 		{Resource: ResourceContacts, Action: ActionExport, Description: "Export contacts"},
+		{Resource: ResourceContactsIdentityReview, Action: ActionWrite, Description: "Resolve WhatsApp identity ownership reviews"},
 
 		// Tags
 		{Resource: ResourceTags, Action: ActionRead, Description: "View tags"},
@@ -308,6 +313,7 @@ func DefaultPermissions() []Permission {
 		{Resource: ResourceBookings, Action: ActionDelete, Description: "Cancel booking records"},
 		{Resource: ResourceBookingSettings, Action: ActionRead, Description: "View services, resources, and availability"},
 		{Resource: ResourceBookingSettings, Action: ActionWrite, Description: "Manage services, resources, and availability"},
+		{Resource: ResourceBookingSettings, Action: ActionDelete, Description: "Delete unused inactive services and resources"},
 		{Resource: ResourcePackages, Action: ActionRead, Description: "View packages"},
 		{Resource: ResourcePackages, Action: ActionWrite, Description: "Manage packages and customer purchases"},
 		{Resource: ResourcePackages, Action: ActionDelete, Description: "Retire packages"},
@@ -386,8 +392,8 @@ func SystemRolePermissions() map[string][]string {
 		"crm.automations:delete", "crm.automations:execute",
 		"tasks:read", "tasks:write", "tasks:delete",
 		"bookings:read", "bookings:write", "bookings:delete",
-		"booking.settings:read", "booking.settings:write",
-		"packages:read", "packages:write",
+		"booking.settings:read", "booking.settings:write", "booking.settings:delete",
+		"packages:read", "packages:write", "packages:delete",
 		"credits:read",
 		"payments:read", "payments:write",
 		"copilot:read", "copilot:execute",

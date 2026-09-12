@@ -1,13 +1,17 @@
 package handlers
 
 import (
+	"context"
 	"errors"
+	"time"
 
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"gorm.io/gorm"
 )
 
-const canonicalContactWriteAttempts = 3
+const canonicalContactWriteAttempts = 6
+
+const canonicalContactWriteInitialRetryDelay = 25 * time.Millisecond
 
 var errActiveAgentTransferExists = errors.New("contact already has an active transfer")
 
@@ -24,8 +28,28 @@ func canonicalContactWriteTransaction(
 		if !isRetryableCanonicalContactWrite(err) {
 			return err
 		}
+		if attempt+1 < canonicalContactWriteAttempts {
+			if waitErr := waitForCanonicalContactWriteRetry(db.Statement.Context, attempt); waitErr != nil {
+				return waitErr
+			}
+		}
 	}
 	return err
+}
+
+func waitForCanonicalContactWriteRetry(ctx context.Context, attempt int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	delay := canonicalContactWriteInitialRetryDelay << attempt
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func isRetryableCanonicalContactWrite(err error) bool {
@@ -33,7 +57,7 @@ func isRetryableCanonicalContactWrite(err error) bool {
 		return true
 	}
 	switch postgresErrorCode(err) {
-	case "40001", "40P01":
+	case "40001", "40P01", "55P03":
 		return true
 	default:
 		return false

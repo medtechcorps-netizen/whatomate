@@ -59,8 +59,11 @@ type Options struct {
 
 // Generate calls Alibaba Cloud Model Studio's OpenAI-compatible Qwen endpoint.
 // Thinking is disabled because customer-service replies must be short and
-// predictable. The caller controls the transaction boundary; this function
-// performs network I/O and must never be called from a database transaction.
+// predictable. The caller controls the transaction boundary. Because this
+// function performs network I/O, callers must not hold ordinary business-row
+// transactions across it. A deliberately isolated, context-bounded database
+// transaction may be used only as a cross-process physical-attempt fence when
+// its sole retained lock is the dedicated policy mutex.
 func Generate(ctx context.Context, client *http.Client, options Options) (string, error) {
 	if ctx == nil {
 		return "", errors.New("qwen request context is required")
