@@ -76,27 +76,29 @@ type AccountRequest struct {
 
 // AccountResponse represents the response for an account (without sensitive data)
 type AccountResponse struct {
-	ID                     uuid.UUID  `json:"id"`
-	Name                   string     `json:"name"`
-	PhoneID                string     `json:"phone_id"`
-	BusinessID             string     `json:"business_id"`
-	APIVersion             string     `json:"api_version"`
-	IsDefaultIncoming      bool       `json:"is_default_incoming"`
-	IsDefaultOutgoing      bool       `json:"is_default_outgoing"`
-	AutoReadReceipt        bool       `json:"auto_read_receipt"`
-	BusinessCallingEnabled bool       `json:"business_calling_enabled"`
-	Status                 string     `json:"status"`
-	HasAccessToken         bool       `json:"has_access_token"`
-	AccessTokenExpiresAt   *time.Time `json:"access_token_expires_at,omitempty"`
-	PhoneNumber            string     `json:"phone_number,omitempty"`
-	DisplayName            string     `json:"display_name,omitempty"`
-	CreatedByID            *uuid.UUID `json:"created_by_id,omitempty"`
-	CreatedByName          string     `json:"created_by_name,omitempty"`
-	UpdatedByID            *uuid.UUID `json:"updated_by_id,omitempty"`
-	UpdatedByName          string     `json:"updated_by_name,omitempty"`
-	CreatedAt              string     `json:"created_at"`
-	UpdatedAt              string     `json:"updated_at"`
-	Warning                string     `json:"warning,omitempty"`
+	ID                     uuid.UUID                    `json:"id"`
+	Name                   string                       `json:"name"`
+	PhoneID                string                       `json:"phone_id"`
+	BusinessID             string                       `json:"business_id"`
+	APIVersion             string                       `json:"api_version"`
+	IsDefaultIncoming      bool                         `json:"is_default_incoming"`
+	IsDefaultOutgoing      bool                         `json:"is_default_outgoing"`
+	AutoReadReceipt        bool                         `json:"auto_read_receipt"`
+	BusinessCallingEnabled bool                         `json:"business_calling_enabled"`
+	Status                 string                       `json:"status"`
+	IsSMB                  bool                         `json:"is_smb"`
+	HasAccessToken         bool                         `json:"has_access_token"`
+	AccessTokenExpiresAt   *time.Time                   `json:"access_token_expires_at,omitempty"`
+	PhoneNumber            string                       `json:"phone_number,omitempty"`
+	DisplayName            string                       `json:"display_name,omitempty"`
+	CreatedByID            *uuid.UUID                   `json:"created_by_id,omitempty"`
+	CreatedByName          string                       `json:"created_by_name,omitempty"`
+	UpdatedByID            *uuid.UUID                   `json:"updated_by_id,omitempty"`
+	UpdatedByName          string                       `json:"updated_by_name,omitempty"`
+	CreatedAt              string                       `json:"created_at"`
+	UpdatedAt              string                       `json:"updated_at"`
+	Warning                string                       `json:"warning,omitempty"`
+	Coexistence            *WhatsAppCoexistenceResponse `json:"coexistence,omitempty"`
 }
 
 // ListAccounts returns all WhatsApp accounts for the organization
@@ -112,10 +114,25 @@ func (a *App) ListAccounts(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list accounts", nil, "")
 	}
 
-	// Convert to response format (hide sensitive data)
+	accountIDs := make([]uuid.UUID, len(accounts))
+	for i := range accounts {
+		accountIDs[i] = accounts[i].ID
+	}
+	coexistenceStates, err := a.loadCoexistenceStates(orgID, accountIDs)
+	if err != nil {
+		a.Log.Error("Failed to load WhatsApp Coexistence state", "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list accounts", nil, "")
+	}
+
+	// Convert to response format (hide sensitive data).
 	response := make([]AccountResponse, len(accounts))
 	for i, acc := range accounts {
-		response[i] = accountToResponse(acc)
+		state, ok := coexistenceStates[acc.ID]
+		if ok {
+			response[i] = accountToResponseWithCoexistence(acc, &state)
+		} else {
+			response[i] = accountToResponse(acc)
+		}
 	}
 
 	return r.SendEnvelope(map[string]any{
@@ -181,14 +198,23 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 	if apiVersion == "" {
 		apiVersion = strings.TrimSpace(a.defaultAPIVersion())
 	}
-	if _, err := a.validateWhatsAppAccountContract(
+	validation, err := a.validateWhatsAppAccountContract(
 		validationCtx,
 		req.PhoneID,
 		req.BusinessID,
 		req.AccessToken,
 		apiVersion,
-	); err != nil {
+	)
+	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+	if credentialsValidationIsSMB(validation) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"WhatsApp Business App numbers must be connected through Coexistence Embedded Signup",
+			nil,
+			"",
+		)
 	}
 
 	account := models.WhatsAppAccount{
@@ -284,7 +310,15 @@ func (a *App) GetAccount(r *fastglue.Request) error {
 		return nil
 	}
 
-	return r.SendEnvelope(accountToResponse(*account))
+	state, stateErr := a.loadCoexistenceState(orgID, account.ID)
+	if stateErr != nil && !errors.Is(stateErr, gorm.ErrRecordNotFound) {
+		a.Log.Error("Failed to load WhatsApp Coexistence state", "error", stateErr, "account_id", account.ID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load account", nil, "")
+	}
+	if errors.Is(stateErr, gorm.ErrRecordNotFound) {
+		state = nil
+	}
+	return r.SendEnvelope(accountToResponseWithCoexistence(*account, state))
 }
 
 // UpdateAccount updates a WhatsApp account
@@ -362,6 +396,14 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		req.AccessToken != "" ||
 		effectiveAPIVersion != currentAPIVersion
 	accountStatus := originalStatus
+	if accountContractChanged && account.IsSMB {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusConflict,
+			"WhatsApp Business App Coexistence credentials must be refreshed through Embedded Signup",
+			nil,
+			"",
+		)
+	}
 	if accountContractChanged && embeddedSignupRecoveryLockedStatus(accountStatus) {
 		// Registration/subscription recovery owns this provider tuple. A normal
 		// PUT must never skip /register, replace its durable token/PIN claim, or
@@ -484,14 +526,23 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		}
 		subscriptionCtx, cancelSubscription = context.WithTimeout(requestContext(r), 30*time.Second)
 		defer cancelSubscription()
-		if _, err := a.validateWhatsAppAccountContract(
+		validation, err := a.validateWhatsAppAccountContract(
 			subscriptionCtx,
 			effectivePhoneID,
 			effectiveBusinessID,
 			effectiveAccessToken,
 			effectiveAPIVersion,
-		); err != nil {
+		)
+		if err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+		}
+		if credentialsValidationIsSMB(validation) {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusBadRequest,
+				"WhatsApp Business App numbers must be connected through Coexistence Embedded Signup",
+				nil,
+				"",
+			)
 		}
 	}
 
@@ -843,6 +894,7 @@ func accountToResponse(acc models.WhatsAppAccount) AccountResponse {
 		AutoReadReceipt:        acc.AutoReadReceipt,
 		BusinessCallingEnabled: acc.BusinessCallingEnabled,
 		Status:                 acc.Status,
+		IsSMB:                  acc.IsSMB,
 		HasAccessToken:         acc.AccessToken != "",
 		AccessTokenExpiresAt:   acc.AccessTokenExpiresAt,
 		CreatedByID:            acc.CreatedByID,
@@ -976,6 +1028,7 @@ func (a *App) SubscribeApp(r *fastglue.Request) error {
 		accessToken           string
 		accessTokenCiphertext string
 		expectedStatus        string
+		isSMB                 bool
 	}
 	var snapshot subscriptionRecoverySnapshot
 	err = a.WithCommittedTenantApp(orgID, func(scoped *App) error {
@@ -997,6 +1050,9 @@ func (a *App) SubscribeApp(r *fastglue.Request) error {
 		expectedStatus := strings.TrimSpace(account.Status)
 		if expectedStatus != "pending_subscription" && expectedStatus != "subscription_failed" {
 			return errSubscriptionRecoveryStatus
+		}
+		if account.AccessTokenExpiresAt != nil && !account.AccessTokenExpiresAt.After(time.Now().UTC()) {
+			return errSubscriptionRecoveryCredentials
 		}
 		encryptionKey := strings.TrimSpace(scoped.integrationEncryptionKey())
 		if encryptionKey == "" {
@@ -1022,6 +1078,24 @@ func (a *App) SubscribeApp(r *fastglue.Request) error {
 				return errSubscriptionRecoverySuperseded
 			}
 		}
+		if account.IsSMB {
+			var state models.WhatsAppCoexistenceState
+			stateErr := scoped.DB.Where(
+				"organization_id = ? AND whats_app_account_id = ?",
+				orgID,
+				account.ID,
+			).First(&state).Error
+			if errors.Is(stateErr, gorm.ErrRecordNotFound) {
+				// A legacy SMB row has no exact Embedded Signup timestamp. Anchor
+				// its one-time request window to creation, never UpdatedAt: an
+				// unrelated account edit must not manufacture a fresh Meta window.
+				onboardedAt := account.CreatedAt.UTC()
+				_, stateErr = scoped.initializeCoexistenceState(orgID, account.ID, onboardedAt, "")
+			}
+			if stateErr != nil {
+				return stateErr
+			}
+		}
 
 		snapshot = subscriptionRecoverySnapshot{
 			accountID:             account.ID,
@@ -1031,6 +1105,7 @@ func (a *App) SubscribeApp(r *fastglue.Request) error {
 			accessToken:           strings.TrimSpace(accessToken),
 			accessTokenCiphertext: accessTokenCiphertext,
 			expectedStatus:        expectedStatus,
+			isSMB:                 account.IsSMB,
 		}
 		return nil
 	})
@@ -1107,12 +1182,46 @@ func (a *App) SubscribeApp(r *fastglue.Request) error {
 		})
 	}
 
+	var coexistenceState *models.WhatsAppCoexistenceState
+	var coexistenceErr error
+	if snapshot.isSMB {
+		syncCtx, cancelSync := context.WithTimeout(requestContext(r), 45*time.Second)
+		defer cancelSync()
+		coexistenceState, _, coexistenceErr = a.runCoexistenceSyncRequests(
+			syncCtx,
+			orgID,
+			snapshot.accountID,
+			&whatsapp.Account{
+				PhoneID:     snapshot.phoneID,
+				BusinessID:  snapshot.businessID,
+				APIVersion:  snapshot.apiVersion,
+				AccessToken: snapshot.accessToken,
+			},
+		)
+		if coexistenceErr != nil {
+			a.Log.Error(
+				"Failed to initialize WhatsApp Coexistence sync after subscription recovery",
+				"account_id", snapshot.accountID,
+				"organization_id", orgID,
+			)
+		}
+	}
+
 	a.Log.Info("App subscribed to webhooks successfully", "account_id", snapshot.accountID, "business_id", snapshot.businessID)
-	return r.SendEnvelope(map[string]any{
+	out := map[string]any{
 		"success": true,
 		"status":  "active",
 		"message": "App subscribed to webhooks successfully. You should now receive incoming messages.",
-	})
+	}
+	if snapshot.isSMB {
+		out["coexistence"] = coexistenceResponse(coexistenceState)
+		if coexistenceErr != nil {
+			out["warning"] = coexistenceWarning(nil)
+		} else if warning := coexistenceWarning(coexistenceState); warning != "" {
+			out["warning"] = warning
+		}
+	}
+	return r.SendEnvelope(out)
 }
 
 // ConfigurePhoneWebhookOverride configures Meta's alternate callback for one
@@ -1382,6 +1491,16 @@ type embeddedSignupMetaSnapshot struct {
 	apiVersion string
 }
 
+const (
+	embeddedSignupModeCoexistence = "coexistence"
+	embeddedSignupModeClassic     = "classic"
+	// All Meta phases share this budget; independent per-phase timeouts must
+	// never accumulate beyond the browser's 90-second response wait. Durable
+	// settlement runs after provider cancellation so an ambiguous mutation
+	// remains visible for reconciliation rather than being replayed.
+	embeddedSignupProviderBudget = 60 * time.Second
+)
+
 type embeddedSignupClaim struct {
 	account            *models.WhatsAppAccount
 	existing           bool
@@ -1389,12 +1508,26 @@ type embeddedSignupClaim struct {
 	priorStatus        string
 	priorPINCiphertext string
 	refreshOnly        bool
+	// skipProviderSetup is set for an already-active phone whose existing app
+	// subscription was proven before the claim. A classic active row can enter
+	// Coexistence through a fresh Embedded Signup without being registered or
+	// subscribed a second time.
+	skipProviderSetup bool
+	coexistenceFresh  bool
+	coexistenceState  *models.WhatsAppCoexistenceState
 }
 
 // ExchangeToken exchanges a temporary code and advances one exact workspace
 // through committed onboarding phases. Provider mutations never run before an
 // encrypted local phone claim has committed.
 func (a *App) ExchangeToken(r *fastglue.Request) error {
+	return a.exchangeToken(r, embeddedSignupProviderBudget)
+}
+
+func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) error {
+	providerCtx, cancelProvider := context.WithTimeout(requestContext(r), providerBudget)
+	defer cancelProvider()
+
 	orgID, err := a.requireExplicitOrganization(r)
 	if err != nil {
 		return nil
@@ -1437,6 +1570,7 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 
 	var req struct {
 		Code               string `json:"code" validate:"required"`
+		SignupMode         string `json:"signup_mode"`
 		PhoneID            string `json:"phone_id"` // Optional: Discovered via token if missing
 		WABAID             string `json:"waba_id"`  // Optional: Discovered via token if missing
 		Name               string `json:"name"`
@@ -1454,6 +1588,19 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	if strings.TrimSpace(req.Code) == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Code is required", nil, "")
 	}
+	signupMode := strings.ToLower(strings.TrimSpace(req.SignupMode))
+	if signupMode != embeddedSignupModeCoexistence && signupMode != embeddedSignupModeClassic {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"signup_mode must be coexistence or classic",
+			nil,
+			"",
+		)
+	}
+	// The browser posts immediately after Meta's Embedded Signup completion.
+	// Capture that boundary before any Graph round trips so the server never
+	// extends Meta's 24-hour one-time sync window by its own processing time.
+	coexistenceOnboardedAt := time.Now().UTC()
 	if strings.TrimSpace(req.WebhookVerifyToken) != "" {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusBadRequest,
@@ -1471,32 +1618,43 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 
 	// Provider read-only phase: exchange, validate the issuing app/scopes, and
 	// prove the exact WABA/phone relationship before claiming anything.
-	ctx, cancel := context.WithTimeout(requestContext(r), 60*time.Second)
-	defer cancel()
 	a.Log.Info("Exchanging code for access token")
 
+	exchangeCtx, exchangeCancel := context.WithTimeout(providerCtx, 60*time.Second)
 	accessToken, err := a.WhatsApp.ExchangeCodeForToken(
-		ctx,
+		exchangeCtx,
 		strings.TrimSpace(req.Code),
 		metaSnapshot.appID,
 		metaSnapshot.appSecret,
 		metaSnapshot.apiVersion,
 	)
+	exchangeCancel()
 	if err != nil {
 		a.Log.Warn("Meta authorization code exchange was rejected")
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Meta authorization code exchange failed", nil, "")
 	}
 
+	discoveryCtx, discoveryCancel := context.WithTimeout(providerCtx, 60*time.Second)
 	phoneID, wabaID, name, tokenExpiresAt, phoneInfo, err := a.discoverWABAAndPhone(
-		ctx,
+		discoveryCtx,
 		accessToken,
 		req.PhoneID,
 		req.WABAID,
 		req.Name,
 		metaSnapshot,
 	)
+	discoveryCancel()
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+	discoveredCoexistence := embeddedSignupPhoneIsSMB(phoneInfo)
+	if (signupMode == embeddedSignupModeCoexistence) != discoveredCoexistence {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"Meta completed an onboarding mode that does not match the selected ReReply connection mode; restart Embedded Signup with the correct configuration",
+			nil,
+			"",
+		)
 	}
 
 	// Reconnecting the exact active account is a credential rotation, not a
@@ -1516,13 +1674,15 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	}
 	activeAppSubscriptionProven := false
 	if activeRefreshCandidate {
+		subscriptionReadCtx, subscriptionReadCancel := context.WithTimeout(providerCtx, 30*time.Second)
 		activeAppSubscriptionProven, err = a.WhatsApp.IsAppSubscribed(
-			ctx,
+			subscriptionReadCtx,
 			wabaID,
 			metaSnapshot.appID,
 			accessToken,
 			metaSnapshot.apiVersion,
 		)
+		subscriptionReadCancel()
 		if err != nil {
 			a.Log.Warn("Failed to verify existing WABA app subscription", "organization_id", orgID)
 			return r.SendErrorEnvelope(fasthttp.StatusBadGateway, "Meta could not confirm the existing app subscription; the active account was not changed", nil, "")
@@ -1544,6 +1704,9 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 		}
 	}
 
+	if providerCtx.Err() != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusGatewayTimeout, "Meta connection timed out before account setup; reload accounts before starting a new connection", nil, "")
+	}
 	claim, err := a.claimEmbeddedSignupAccount(
 		orgID,
 		userID,
@@ -1557,6 +1720,8 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 		registrationPIN,
 		metaSnapshot,
 		activeAppSubscriptionProven,
+		coexistenceOnboardedAt,
+		phoneInfo.DisplayPhoneNumber,
 	)
 	if err != nil {
 		switch {
@@ -1568,7 +1733,7 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, "A WhatsApp connection for this number is already pending reconciliation", nil, "")
 		case errors.Is(err, errEmbeddedSignupAppSubscriptionNotProven):
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, "The existing WhatsApp app subscription could not be proven; the active account was not changed", nil, "")
-		case errors.Is(err, errEmbeddedSignupClaimSuperseded):
+		case errors.Is(err, errEmbeddedSignupClaimSuperseded), errors.Is(err, errCoexistenceStateSuperseded):
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp connection changed; reload and retry", nil, "")
 		}
 		a.Log.Error("Failed to persist embedded signup phone claim", "organization_id", orgID)
@@ -1584,13 +1749,34 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 		registrationPIN = ""
 	}
 
+	var coexistenceState *models.WhatsAppCoexistenceState
+	var coexistenceErr error
+	coexistenceFreshOnboarding := claim.coexistenceFresh
+	if coexistenceFreshOnboarding {
+		// The state was created in the same transaction as the phone claim. That
+		// atomic boundary prevents a failed state write from stranding an SMB row
+		// in pending_registration with no recovery path.
+		coexistenceState = claim.coexistenceState
+	} else if account.IsSMB {
+		// Re-running Embedded Signup for an already-active account is a token
+		// rotation, not proof that Meta opened another one-time data-sync window.
+		// Preserve the prior state and never replay accepted sync requests.
+		coexistenceState, coexistenceErr = a.loadCoexistenceStateCommitted(orgID, account.ID)
+		if errors.Is(coexistenceErr, gorm.ErrRecordNotFound) {
+			coexistenceState = nil
+			coexistenceErr = nil
+		}
+	}
+
 	var regErr error
-	if !claim.refreshOnly {
+	if !claim.refreshOnly && !claim.skipProviderSetup {
 		// Provider mutation phase 1. The committed pending_registration row above
 		// owns the phone and its encrypted PIN before Meta registration can change
 		// external state. An exact active-account token refresh never enters this
 		// branch: /register is non-idempotent and is unnecessary for that case.
-		regErr = a.attemptEmbeddedSignupRegistration(ctx, account, accessToken, registrationPIN)
+		registrationCtx, registrationCancel := context.WithTimeout(providerCtx, 30*time.Second)
+		regErr = a.attemptEmbeddedSignupRegistration(registrationCtx, account, accessToken, registrationPIN)
+		registrationCancel()
 		registrationStatus := "pending_registration"
 		var registrationPINOverride *string
 		if regErr == nil {
@@ -1620,7 +1806,7 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	}
 
 	var subscriptionErr error
-	if !claim.refreshOnly && regErr == nil {
+	if !claim.refreshOnly && !claim.skipProviderSetup && regErr == nil {
 		// Provider mutation phase 2. pending_subscription is already committed,
 		// so a successful subscription always has a durable reconciliation row.
 		runtimeAccount := &whatsapp.Account{
@@ -1629,7 +1815,9 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 			APIVersion:  metaSnapshot.apiVersion,
 			AccessToken: accessToken,
 		}
-		subscriptionErr = a.WhatsApp.SubscribeApp(ctx, runtimeAccount)
+		subscriptionCtx, subscriptionCancel := context.WithTimeout(providerCtx, 30*time.Second)
+		subscriptionErr = a.WhatsApp.SubscribeApp(subscriptionCtx, runtimeAccount)
+		subscriptionCancel()
 		finalStatus := "active"
 		if subscriptionErr != nil {
 			finalStatus = "subscription_failed"
@@ -1653,6 +1841,38 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	}
 
 	a.InvalidateWhatsAppAccountCache(account.PhoneID)
+
+	if account.IsSMB && coexistenceFreshOnboarding && strings.TrimSpace(account.Status) == "active" && regErr == nil && subscriptionErr == nil {
+		coexistenceState, _, coexistenceErr = a.runCoexistenceSyncRequests(
+			providerCtx,
+			orgID,
+			account.ID,
+			&whatsapp.Account{
+				PhoneID:     phoneID,
+				BusinessID:  wabaID,
+				APIVersion:  metaSnapshot.apiVersion,
+				AccessToken: accessToken,
+			},
+		)
+		if coexistenceErr != nil {
+			a.Log.Error(
+				"Failed to initialize WhatsApp Coexistence sync",
+				"account_id", account.ID,
+				"organization_id", orgID,
+			)
+		}
+	}
+	if account.IsSMB && !coexistenceFreshOnboarding && !claim.refreshOnly &&
+		strings.TrimSpace(account.Status) == "active" && regErr == nil && subscriptionErr == nil {
+		coexistenceState, coexistenceErr = a.restoreCoexistenceAfterCredentialExchange(orgID, account.ID)
+		if coexistenceErr != nil {
+			a.Log.Error(
+				"Failed to finalize WhatsApp Coexistence credential refresh",
+				"account_id", account.ID,
+				"organization_id", orgID,
+			)
+		}
+	}
 
 	a.Log.Info("WhatsApp account connected via embedded signup successfully",
 		"account_id", account.ID,
@@ -1678,14 +1898,21 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	}
 
 	out := map[string]any{
-		"account": accountToResponse(*account),
+		"account": accountToResponseWithCoexistence(*account, coexistenceState),
 	}
-	warnings := make([]string, 0, 2)
+	warnings := make([]string, 0, 3)
 	if regErr != nil {
 		warnings = append(warnings, "Registration could not be confirmed; keep this account pending and reconcile it before retrying")
 	}
 	if subscriptionErr != nil {
 		warnings = append(warnings, "Webhook subscription failed; use the account Subscribe action after checking Meta permissions")
+	}
+	if account.IsSMB && strings.TrimSpace(account.Status) == "active" {
+		if coexistenceErr != nil {
+			warnings = append(warnings, coexistenceWarning(nil))
+		} else if warning := coexistenceWarning(coexistenceState); warning != "" {
+			warnings = append(warnings, warning)
+		}
 	}
 	if len(warnings) > 0 {
 		out["warning"] = strings.Join(warnings, "; ")
@@ -1714,8 +1941,46 @@ func embeddedSignupAccountName(name, phoneID string, phoneInfo *whatsapp.PhoneNu
 }
 
 func embeddedSignupPhoneIsSMB(phoneInfo *whatsapp.PhoneNumberInfo) bool {
-	return phoneInfo != nil &&
-		(phoneInfo.IsOnBizApp || phoneInfo.PlatformType == "SMB" || phoneInfo.PlatformType == "SMB_CLOUD_API")
+	return phoneInfo != nil && providerPhoneIsSMB(phoneInfo.IsOnBizApp, phoneInfo.PlatformType)
+}
+
+func credentialsValidationIsSMB(validation *whatsapp.CredentialsValidationResult) bool {
+	return validation != nil && providerPhoneIsSMB(validation.IsOnBizApp, validation.PlatformType)
+}
+
+func providerPhoneIsSMB(isOnBizApp bool, platformType string) bool {
+	platformType = strings.ToUpper(strings.TrimSpace(platformType))
+	return isOnBizApp || platformType == "SMB" || platformType == "SMB_CLOUD_API"
+}
+
+// coexistenceSignupStartsFreshCycle distinguishes a credential refresh from a
+// Meta-authorized re-onboarding. In particular, ACCOUNT_RECONNECTED restores
+// the Business App companion link but intentionally leaves the API account
+// disconnected until Embedded Signup supplies fresh credentials. That flow is
+// eligible for another one-time sync only when it follows a real offboarding
+// in the currently stored onboarding cycle.
+func coexistenceSignupStartsFreshCycle(
+	accountWasSMB bool,
+	state *models.WhatsAppCoexistenceState,
+) bool {
+	if !accountWasSMB || state == nil || state.OnboardedAt == nil {
+		return true
+	}
+	if state.OffboardedAt == nil || state.OffboardedAt.UTC().Before(state.OnboardedAt.UTC()) {
+		return false
+	}
+	// Meta only grants another pair of one-time sync requests after the number
+	// was actually offboarded. PARTNER_REMOVED is merely a partner disconnect;
+	// reconnecting from it must preserve the prior request state.
+	if state.LifecycleStatus == models.CoexistenceLifecycleStatusOffboarded ||
+		state.OnboardingStatus == models.CoexistenceOnboardingStatusOffboarded ||
+		state.LastLifecycleEvent == "ACCOUNT_OFFBOARDED" {
+		return true
+	}
+	if state.LastLifecycleEvent != "ACCOUNT_RECONNECTED" || state.ReconnectedAt == nil {
+		return false
+	}
+	return !state.ReconnectedAt.UTC().Before(state.OffboardedAt.UTC())
 }
 
 func embeddedSignupPhoneClaimUniqueViolation(err error) bool {
@@ -1832,6 +2097,8 @@ func (a *App) claimEmbeddedSignupAccount(
 	registrationPIN string,
 	metaSnapshot embeddedSignupMetaSnapshot,
 	activeAppSubscriptionProven bool,
+	coexistenceOnboardedAt time.Time,
+	businessPhoneNumber string,
 ) (*embeddedSignupClaim, error) {
 	phoneID = strings.TrimSpace(phoneID)
 	wabaID = strings.TrimSpace(wabaID)
@@ -1903,12 +2170,59 @@ func (a *App) claimEmbeddedSignupAccount(
 				if strings.TrimSpace(scoped.integrationEncryptionKey()) == "" {
 					return errAccountEncryptionUnavailable
 				}
+				providerIsSMB := embeddedSignupPhoneIsSMB(phoneInfo)
+				freshCoexistence := false
+				var preservedCoexistenceState *models.WhatsAppCoexistenceState
+				if providerIsSMB {
+					var state models.WhatsAppCoexistenceState
+					stateErr := scoped.DB.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+						"organization_id = ? AND whats_app_account_id = ?",
+						orgID,
+						account.ID,
+					).First(&state).Error
+					switch {
+					case errors.Is(stateErr, gorm.ErrRecordNotFound):
+						freshCoexistence = !account.IsSMB
+						if account.IsSMB {
+							// A legacy SMB row without state has no evidence that
+							// this credential refresh opened another one-time Meta
+							// sync window. Anchor it conservatively to the original
+							// row creation time and do not issue sync requests here.
+							preservedCoexistenceState, stateErr = scoped.initializeCoexistenceState(
+								orgID,
+								account.ID,
+								account.CreatedAt.UTC(),
+								businessPhoneNumber,
+							)
+							if stateErr != nil {
+								return stateErr
+							}
+						}
+					case stateErr != nil:
+						return stateErr
+					default:
+						freshCoexistence = coexistenceSignupStartsFreshCycle(account.IsSMB, &state)
+						if !freshCoexistence {
+							stateCopy := state
+							preservedCoexistenceState = &stateCopy
+						}
+					}
+				}
 				accessTokenCiphertext, encryptErr := crypto.Encrypt(
 					strings.TrimSpace(accessToken),
 					scoped.integrationEncryptionKey(),
 				)
 				if encryptErr != nil || !crypto.IsEncrypted(accessTokenCiphertext) {
 					return errAccountEncryptionUnavailable
+				}
+				updates := map[string]any{
+					"access_token":            accessTokenCiphertext,
+					"access_token_expires_at": tokenExpiresAt,
+					"updated_by_id":           userID,
+				}
+				if providerIsSMB {
+					updates["is_smb"] = true
+					updates["pin"] = ""
 				}
 				result := scoped.DB.Model(&models.WhatsAppAccount{}).
 					Where(
@@ -1923,11 +2237,7 @@ func (a *App) claimEmbeddedSignupAccount(
 						account.AccessToken,
 						account.Pin,
 					).
-					Updates(map[string]any{
-						"access_token":            accessTokenCiphertext,
-						"access_token_expires_at": tokenExpiresAt,
-						"updated_by_id":           userID,
-					})
+					Updates(updates)
 				if result.Error != nil {
 					return result.Error
 				}
@@ -1941,8 +2251,24 @@ func (a *App) claimEmbeddedSignupAccount(
 				).First(&account).Error; loadErr != nil {
 					return loadErr
 				}
+				if freshCoexistence {
+					state, stateErr := scoped.initializeCoexistenceState(
+						orgID,
+						account.ID,
+						coexistenceOnboardedAt,
+						businessPhoneNumber,
+					)
+					if stateErr != nil {
+						return stateErr
+					}
+					claim.coexistenceFresh = true
+					claim.coexistenceState = state
+					claim.skipProviderSetup = true
+				} else if preservedCoexistenceState != nil {
+					claim.coexistenceState = preservedCoexistenceState
+				}
 				claim.account = &account
-				claim.refreshOnly = true
+				claim.refreshOnly = !freshCoexistence
 				return nil
 			}
 			initializeOperationalFields = account.DeletedAt.Valid
@@ -2015,6 +2341,60 @@ func (a *App) claimEmbeddedSignupAccount(
 				return errWhatsAppPhoneAlreadyClaimed
 			}
 			return saveErr
+		}
+		if account.IsSMB {
+			accountWasSMB := claim.old != nil && claim.old.IsSMB
+			freshCoexistence := !claim.existing || !accountWasSMB
+			var existingState models.WhatsAppCoexistenceState
+			stateFound := false
+			if claim.existing {
+				stateErr := scoped.DB.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+					"organization_id = ? AND whats_app_account_id = ?",
+					orgID,
+					account.ID,
+				).First(&existingState).Error
+				switch {
+				case errors.Is(stateErr, gorm.ErrRecordNotFound):
+					// A soft-deleted or otherwise non-active SMB row is still
+					// the same Meta onboarding cycle. Local deletion is not
+					// offboarding evidence and must never reopen the one-time
+					// contact/history request window.
+					freshCoexistence = !accountWasSMB
+				case stateErr != nil:
+					return stateErr
+				default:
+					stateFound = true
+					freshCoexistence = coexistenceSignupStartsFreshCycle(accountWasSMB, &existingState)
+				}
+			}
+			if freshCoexistence {
+				state, stateErr := scoped.initializeCoexistenceState(
+					orgID,
+					account.ID,
+					coexistenceOnboardedAt,
+					businessPhoneNumber,
+				)
+				if stateErr != nil {
+					return stateErr
+				}
+				claim.coexistenceFresh = true
+				claim.coexistenceState = state
+			} else if !stateFound {
+				legacyOnboardedAt := account.CreatedAt.UTC()
+				state, stateErr := scoped.initializeCoexistenceState(
+					orgID,
+					account.ID,
+					legacyOnboardedAt,
+					businessPhoneNumber,
+				)
+				if stateErr != nil {
+					return stateErr
+				}
+				claim.coexistenceState = state
+			} else {
+				stateCopy := existingState
+				claim.coexistenceState = &stateCopy
+			}
 		}
 		claim.account = &account
 		return nil

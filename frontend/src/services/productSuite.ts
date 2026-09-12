@@ -1,4 +1,5 @@
 import { api } from '@/services/api'
+import type { ContactIdentityReviewEffectiveState } from '@/services/api'
 import { unwrapListResponse } from '@/lib/api-utils'
 import type { AxiosResponse } from 'axios'
 
@@ -188,7 +189,14 @@ export interface SupportCase {
   description: string
   severity: 'low' | 'normal' | 'high' | 'critical'
   category?: string
-  status: 'open' | 'investigating' | 'waiting' | 'waiting_customer' | 'waiting_internal' | 'resolved' | 'closed'
+  status:
+    | 'open'
+    | 'investigating'
+    | 'waiting'
+    | 'waiting_customer'
+    | 'waiting_internal'
+    | 'resolved'
+    | 'closed'
   assigned_user_id?: string
   resolution?: string
   created_at: string
@@ -373,6 +381,32 @@ export interface BookingEvent {
   version: number
 }
 
+export interface BookingAvailabilitySlot extends BookingEvent {
+  remaining_capacity: number
+  timezone: string
+  local_starts_at: string
+  local_ends_at: string
+}
+
+export interface BookingAvailabilityParams {
+  service_id?: string
+  resource_id?: string
+  from?: string
+  to?: string
+  page?: number
+  limit?: number
+}
+
+export interface CreateBookingInput {
+  contact_id: string
+  quantity: number
+  status: 'reserved'
+  source: 'agent'
+  allow_waitlist: false
+  idempotency_key: string
+  notes?: string
+}
+
 export interface Booking {
   id: string
   event_id: string
@@ -403,6 +437,7 @@ export interface PackageDefinition {
   validity_days: number
   is_active: boolean
   version: number
+  metadata?: Record<string, unknown>
   entitlements?: Array<{
     id?: string
     booking_service_id: string
@@ -466,6 +501,7 @@ export interface CustomerWorkspaceContact {
   metadata?: Record<string, unknown>
   assigned_user_id?: string
   marketing_opt_out?: boolean
+  identity_review_ai_state: ContactIdentityReviewEffectiveState
   created_at?: string
   updated_at?: string
 }
@@ -622,6 +658,7 @@ export interface InboxConversation {
   unread_count: number
   ai_paused: boolean
   ai_pause_reason?: string
+  identity_review_ai_state: ContactIdentityReviewEffectiveState
   assigned_user_id?: string
   metadata?: Record<string, unknown>
   contact?: {
@@ -714,7 +751,8 @@ export const supportService = {
     fetchAllPages<SupportCase>('cases', (page, limit) =>
       api.get('/support/cases', { params: { ...params, page, limit } }),
     ),
-  createCase: (data: Pick<SupportCase, 'title' | 'description' | 'severity'>) => api.post('/support/cases', data),
+  createCase: (data: Pick<SupportCase, 'title' | 'description' | 'severity'>) =>
+    api.post('/support/cases', data),
   updateCase: (id: string, data: Partial<SupportCase>) => api.put(`/support/cases/${id}`, data),
   recovery: () => api.get('/support/recovery'),
 }
@@ -730,7 +768,9 @@ export const crmService = {
     api.delete(`/crm/pipelines/${pipelineId}/stages/${stageId}`),
   leads: (params?: Record<string, string | number | boolean>) => api.get('/crm/leads', { params }),
   allLeads: (params?: Record<string, string | number | boolean>) =>
-    fetchAllPages<CRMLead>('leads', (page, limit) => api.get('/crm/leads', { params: { ...params, page, limit } })),
+    fetchAllPages<CRMLead>('leads', (page, limit) =>
+      api.get('/crm/leads', { params: { ...params, page, limit } }),
+    ),
   createLead: (data: Partial<CRMLead>) => api.post('/crm/leads', data),
   updateLead: (
     id: string,
@@ -762,7 +802,9 @@ export const crmService = {
   ) => api.put(`/crm/leads/${id}/reopen`, data),
   tasks: (params?: Record<string, string | number | boolean>) => api.get('/tasks', { params }),
   allTasks: (params?: Record<string, string | number | boolean>) =>
-    fetchAllPages<FollowUpTask>('tasks', (page, limit) => api.get('/tasks', { params: { ...params, page, limit } })),
+    fetchAllPages<FollowUpTask>('tasks', (page, limit) =>
+      api.get('/tasks', { params: { ...params, page, limit } }),
+    ),
   createTask: (data: Partial<FollowUpTask>) => api.post('/tasks', data),
   updateTask: (
     id: string,
@@ -779,21 +821,40 @@ export const customerWorkspaceService = {
   get: (contactId: string) => api.get(`/contacts/${encodeURIComponent(contactId)}/workspace`),
 }
 
+// Pin catalogue mutations to the organization whose version the user reviewed.
+function bookingOrganization(organizationId?: string) {
+  return organizationId ? { headers: { 'X-Organization-ID': organizationId } } : undefined
+}
+
 export const bookingService = {
   services: () => api.get('/booking/services'),
   allServices: () =>
     fetchAllPages<BookingService>('services', (page, limit) =>
       api.get('/booking/services', { params: { page, limit } }),
     ),
-  createService: (data: Partial<BookingService>) => api.post('/booking/services', data),
-  updateService: (id: string, data: Partial<BookingService>) => api.put(`/booking/services/${id}`, data),
+  createService: (data: Partial<BookingService>, organizationId?: string) =>
+    api.post('/booking/services', data, bookingOrganization(organizationId)),
+  updateService: (id: string, data: Partial<BookingService>, organizationId?: string) =>
+    api.put(`/booking/services/${encodeURIComponent(id)}`, data, bookingOrganization(organizationId)),
+  deleteService: (id: string, version: number, organizationId?: string) =>
+    api.delete(`/booking/services/${encodeURIComponent(id)}`, {
+      ...bookingOrganization(organizationId),
+      data: { version, confirm_delete: true },
+    }),
   resources: () => api.get('/booking/resources'),
   allResources: () =>
     fetchAllPages<BookingResource>('resources', (page, limit) =>
       api.get('/booking/resources', { params: { page, limit } }),
     ),
-  createResource: (data: Partial<BookingResource>) => api.post('/booking/resources', data),
-  updateResource: (id: string, data: Partial<BookingResource>) => api.put(`/booking/resources/${id}`, data),
+  createResource: (data: Partial<BookingResource>, organizationId?: string) =>
+    api.post('/booking/resources', data, bookingOrganization(organizationId)),
+  updateResource: (id: string, data: Partial<BookingResource>, organizationId?: string) =>
+    api.put(`/booking/resources/${encodeURIComponent(id)}`, data, bookingOrganization(organizationId)),
+  deleteResource: (id: string, version: number, organizationId?: string) =>
+    api.delete(`/booking/resources/${encodeURIComponent(id)}`, {
+      ...bookingOrganization(organizationId),
+      data: { version, confirm_delete: true },
+    }),
   availabilityRules: (resourceId: string, params?: { page?: number; limit?: number }) =>
     api.get(`/booking/resources/${encodeURIComponent(resourceId)}/availability-rules`, { params }),
   allAvailabilityRules: (resourceId: string) =>
@@ -804,7 +865,11 @@ export const bookingService = {
     ),
   createAvailabilityRule: (resourceId: string, data: AvailabilityRuleInput) =>
     api.post(`/booking/resources/${encodeURIComponent(resourceId)}/availability-rules`, data),
-  updateAvailabilityRule: (resourceId: string, ruleId: string, data: AvailabilityRuleInput & { version: number }) =>
+  updateAvailabilityRule: (
+    resourceId: string,
+    ruleId: string,
+    data: AvailabilityRuleInput & { version: number },
+  ) =>
     api.put(
       `/booking/resources/${encodeURIComponent(resourceId)}/availability-rules/${encodeURIComponent(ruleId)}`,
       data,
@@ -827,15 +892,26 @@ export const bookingService = {
   createTimeOff: (resourceId: string, data: ResourceTimeOffInput) =>
     api.post(`/booking/resources/${encodeURIComponent(resourceId)}/time-off`, data),
   updateTimeOff: (resourceId: string, timeOffId: string, data: ResourceTimeOffInput & { version: number }) =>
-    api.put(`/booking/resources/${encodeURIComponent(resourceId)}/time-off/${encodeURIComponent(timeOffId)}`, data),
+    api.put(
+      `/booking/resources/${encodeURIComponent(resourceId)}/time-off/${encodeURIComponent(timeOffId)}`,
+      data,
+    ),
   deleteTimeOff: (resourceId: string, timeOffId: string, version: number) =>
-    api.delete(`/booking/resources/${encodeURIComponent(resourceId)}/time-off/${encodeURIComponent(timeOffId)}`, {
-      data: { version },
-    }),
+    api.delete(
+      `/booking/resources/${encodeURIComponent(resourceId)}/time-off/${encodeURIComponent(timeOffId)}`,
+      {
+        data: { version },
+      },
+    ),
   events: (params?: Record<string, string | number>) => api.get('/booking/events', { params }),
   allEvents: (params?: Record<string, string | number>) =>
     fetchAllPages<BookingEvent>('events', (page, limit) =>
       api.get('/booking/events', { params: { ...params, page, limit } }),
+    ),
+  availability: (params?: BookingAvailabilityParams) => api.get('/booking/availability', { params }),
+  allAvailability: (params?: Omit<BookingAvailabilityParams, 'page' | 'limit'>) =>
+    fetchAllPages<BookingAvailabilitySlot>('slots', (page, limit) =>
+      api.get('/booking/availability', { params: { ...params, page, limit } }),
     ),
   createEvent: (
     data: Partial<BookingEvent> & {
@@ -846,8 +922,10 @@ export const bookingService = {
   ) => api.post('/booking/events', data),
   bookings: (params?: Record<string, string | number>) => api.get('/bookings', { params }),
   allBookings: (params?: Record<string, string | number>) =>
-    fetchAllPages<Booking>('bookings', (page, limit) => api.get('/bookings', { params: { ...params, page, limit } })),
-  createBooking: (eventId: string, data: Record<string, unknown>) =>
+    fetchAllPages<Booking>('bookings', (page, limit) =>
+      api.get('/bookings', { params: { ...params, page, limit } }),
+    ),
+  createBooking: (eventId: string, data: CreateBookingInput | Record<string, unknown>) =>
     api.post(`/booking/events/${eventId}/bookings`, data),
   transitionBooking: (id: string, transition: string, data?: Record<string, unknown>) =>
     api.post(`/bookings/${id}/${encodeURIComponent(transition)}`, data ?? {}),
@@ -856,9 +934,13 @@ export const bookingService = {
 export const commerceService = {
   summary: () => api.get('/commerce/summary'),
   packages: () => api.get('/packages'),
-  allPackages: () =>
-    fetchAllPages<PackageDefinition>('packages', (page, limit) => api.get('/packages', { params: { page, limit } })),
+  allPackages: (params?: { active?: boolean }) =>
+    fetchAllPages<PackageDefinition>('packages', (page, limit) =>
+      api.get('/packages', { params: { ...params, page, limit } }),
+    ),
   createPackage: (data: Partial<PackageDefinition>) => api.post('/packages', data),
+  updatePackage: (id: string, data: Partial<PackageDefinition>) =>
+    api.put(`/packages/${encodeURIComponent(id)}`, data),
   contactPackages: (params?: Record<string, string | number>) => api.get('/contact-packages', { params }),
   allContactPackages: (params?: Record<string, string | number>) =>
     fetchAllPages<ContactPackage>('contact_packages', (page, limit) =>
@@ -878,14 +960,18 @@ export const commerceService = {
     api.post(`/invoices/${invoiceId}/manual-payments`, data),
   payments: (params?: Record<string, string | number>) => api.get('/payments', { params }),
   allPayments: <T = Record<string, unknown>>(params?: Record<string, string | number>) =>
-    fetchAllPages<T>('payments', (page, limit) => api.get('/payments', { params: { ...params, page, limit } })),
+    fetchAllPages<T>('payments', (page, limit) =>
+      api.get('/payments', { params: { ...params, page, limit } }),
+    ),
 }
 
 export const copilotService = {
   run: (contactId: string, taskType: CopilotRun['task_type'], data?: Record<string, unknown>) =>
     api.post(`/contacts/${contactId}/copilot/${taskType}`, data ?? {}),
-  runs: (params?: { contact_id?: string; page?: number; limit?: number }) => api.get('/copilot/runs', { params }),
-  feedback: (runId: string, data: Record<string, unknown>) => api.post(`/copilot/runs/${runId}/feedback`, data),
+  runs: (params?: { contact_id?: string; page?: number; limit?: number }) =>
+    api.get('/copilot/runs', { params }),
+  feedback: (runId: string, data: Record<string, unknown>) =>
+    api.post(`/copilot/runs/${runId}/feedback`, data),
 }
 
 export const channelsService = {
@@ -894,7 +980,8 @@ export const channelsService = {
   updateAccount: (id: string, data: Record<string, unknown>) => api.put(`/channel-accounts/${id}`, data),
   testAccount: (id: string) => api.post(`/channel-accounts/${id}/test`),
   disconnectAccount: (id: string) => api.delete(`/channel-accounts/${id}`),
-  conversations: (params?: Record<string, string | number | boolean>) => api.get('/conversations', { params }),
+  conversations: (params?: Record<string, string | number | boolean>) =>
+    api.get('/conversations', { params }),
   allConversations: (params?: Record<string, string | number | boolean>) =>
     fetchAllPages<InboxConversation>('conversations', (page, limit) =>
       api.get('/conversations', { params: { ...params, page, limit } }),

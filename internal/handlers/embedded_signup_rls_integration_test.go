@@ -5,8 +5,10 @@ import (
 	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -17,6 +19,60 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+// RLS policy installation changes shared test schema, so this must remain
+// serial alongside the other runtime-role integration tests.
+func TestPrepareCoexistenceRequestCommitsExpiryWithRuntimeRoleRLS(t *testing.T) {
+	adminDB := testutil.SetupTestDB(t)
+	testutil.TruncateTables(adminDB)
+	runtimeRole := "rereply_expiry_" + uuid.NewString()[:8]
+	runtimePassword := "synthetic" + uuid.NewString()[:8]
+	require.NoError(t, adminDB.Exec(fmt.Sprintf(
+		"CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS",
+		runtimeRole,
+		runtimePassword,
+	)).Error)
+	t.Cleanup(func() {
+		_ = database.RemoveTenantRLS(adminDB)
+		_ = adminDB.Exec("DROP OWNED BY " + runtimeRole).Error
+		_ = adminDB.Exec("DROP ROLE IF EXISTS " + runtimeRole).Error
+		testutil.TruncateTables(adminDB)
+	})
+
+	reseller := testutil.CreateTestReseller(t, adminDB)
+	organization := testutil.CreateTestOrganizationForReseller(t, adminDB, reseller.ID)
+	otherOrganization := testutil.CreateTestOrganizationForReseller(t, adminDB, reseller.ID)
+	account := testutil.CreateTestWhatsAppAccount(t, adminDB, organization.ID)
+	require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
+	runtimeDB := openRuntimeRoleTestDB(t, runtimeRole, runtimePassword)
+	require.NoError(t, database.VerifyTenantRLS(runtimeDB, runtimeRole))
+	app := &App{Config: &config.Config{}, DB: runtimeDB, Log: testutil.NopLogger()}
+	app.Config.Database.RLSEnabled = true
+	app.Config.Database.RuntimeRole = runtimeRole
+
+	for _, stage := range []coexistenceSyncStage{coexistenceContactStage, coexistenceHistoryStage} {
+		t.Run(string(stage), func(t *testing.T) {
+			assertCoexistenceExpiryCommitted(t, app, *account, adminDB, stage)
+		})
+	}
+
+	var persisted models.WhatsAppCoexistenceState
+	require.NoError(t, adminDB.Where("whats_app_account_id = ?", account.ID).First(&persisted).Error)
+	_, err := app.prepareCoexistenceRequest(otherOrganization.ID, account.ID, coexistenceContactStage, time.Now())
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	var afterCrossTenant models.WhatsAppCoexistenceState
+	require.NoError(t, adminDB.Where("id = ?", persisted.ID).First(&afterCrossTenant).Error)
+	assert.Equal(t, persisted.Version, afterCrossTenant.Version, "another tenant must not mutate the expired state")
+
+	var unscopedCount int64
+	require.NoError(t, runtimeDB.Model(&models.WhatsAppCoexistenceState{}).Count(&unscopedCount).Error)
+	assert.Zero(t, unscopedCount, "the committed expiry must leave no tenant setting on pooled connections")
+	var otherTenantCount int64
+	require.NoError(t, database.WithTenant(runtimeDB, otherOrganization.ID, func(tx *gorm.DB) error {
+		return tx.Model(&models.WhatsAppCoexistenceState{}).Count(&otherTenantCount).Error
+	}))
+	assert.Zero(t, otherTenantCount)
+}
 
 // TestExchangeTokenRuntimeRoleRLSDirectRoute exercises the direct Embedded
 // Signup handler through the same restricted PostgreSQL role and transaction-
@@ -104,9 +160,10 @@ func TestExchangeTokenRuntimeRoleRLSDirectRoute(t *testing.T) {
 		app.Config.Database.RuntimeRole = runtimeRole
 
 		req := testutil.NewJSONRequest(t, map[string]any{
-			"code":     code,
-			"phone_id": meta.phoneID,
-			"waba_id":  meta.wabaID,
+			"code":        code,
+			"signup_mode": "classic",
+			"phone_id":    meta.phoneID,
+			"waba_id":     meta.wabaID,
 		})
 		testutil.SetAuthContext(req, homeOrg.ID, userID)
 		testutil.SetHeader(req, "X-Organization-ID", targetOrgID.String())

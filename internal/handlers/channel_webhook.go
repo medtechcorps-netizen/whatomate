@@ -811,6 +811,12 @@ func persistOrClaimRawInboundEvent(tx *gorm.DB, rawEvent *models.InboundEvent) (
 	if tx == nil || rawEvent == nil {
 		return false, false, errors.New("raw inbound event and database transaction are required")
 	}
+	if reservedWhatsAppIdentityReviewEvent(rawEvent) {
+		// This inbox is owned only by the identity-review reconciliation
+		// protocol. Generic channel retries must never normalize, reclaim, or
+		// mutate its contact-free staged records.
+		return false, false, nil
+	}
 	now := time.Now().UTC()
 	rawEvent.Status = models.InboundEventStatusProcessing
 	rawEvent.ProcessingStartedAt = &now
@@ -847,6 +853,9 @@ func persistOrClaimRawInboundEvent(tx *gorm.DB, rawEvent *models.InboundEvent) (
 		return false, false, err
 	}
 	*rawEvent = existing
+	if reservedWhatsAppIdentityReviewEvent(&existing) {
+		return false, false, nil
+	}
 	staleBefore := now.Add(-rawInboundProcessingLease)
 	staleLease := (existing.Status == models.InboundEventStatusPending ||
 		existing.Status == models.InboundEventStatusProcessing) &&
@@ -885,6 +894,15 @@ func persistOrClaimRawInboundEvent(tx *gorm.DB, rawEvent *models.InboundEvent) (
 	return claimed, claimed, nil
 }
 
+func reservedWhatsAppIdentityReviewEvent(event *models.InboundEvent) bool {
+	if event == nil {
+		return false
+	}
+	return event.Protocol == models.WhatsAppIdentityReviewInboundProtocol ||
+		event.EventType == models.WhatsAppIdentityReviewPendingEvent ||
+		event.ReviewHoldID != nil
+}
+
 func processNormalizedChannelEvent(
 	tx *gorm.DB,
 	account *models.ChannelAccount,
@@ -895,6 +913,9 @@ func processNormalizedChannelEvent(
 		acceptedAt = time.Now().UTC()
 	} else {
 		acceptedAt = acceptedAt.UTC()
+	}
+	if event == nil {
+		return errors.New("normalized channel event is required")
 	}
 	eventPayload, err := valueToJSONB(event)
 	if err != nil {
@@ -995,6 +1016,23 @@ func persistInboundChannelMessage(
 	if err != nil {
 		return err
 	}
+	automaticReplySuppressed := inboxConversationAIIsPaused(conversation.Config)
+	automaticReplySuppressionReason := "conversation_ai_paused"
+	if !automaticReplySuppressed {
+		policy, policyErr := database.EvaluateContactAutomaticReplyPolicy(
+			tx,
+			account.OrganizationID,
+			contact.ID,
+		)
+		switch {
+		case policyErr != nil:
+			automaticReplySuppressed = true
+			automaticReplySuppressionReason = "identity_review_state_unavailable"
+		case !policy.Allowed:
+			automaticReplySuppressed = true
+			automaticReplySuppressionReason = policy.Reason
+		}
+	}
 
 	var existing models.Message
 	if err := tx.
@@ -1023,6 +1061,13 @@ func persistInboundChannelMessage(
 	message.Metadata = models.JSONB{
 		"channel":  account.Channel,
 		"provider": account.Provider,
+	}
+	if automaticReplySuppressed {
+		message.Metadata[incomingAutomaticAISuppressedKey] = true
+		message.Metadata[incomingAutomaticAISuppressionReasonKey] =
+			automaticReplySuppressionReason
+		message.Metadata[incomingAutomaticAISuppressedAtKey] =
+			acceptedAt.Format(time.RFC3339Nano)
 	}
 	if inbound.ReplyToExternalID != "" {
 		var reply models.Message

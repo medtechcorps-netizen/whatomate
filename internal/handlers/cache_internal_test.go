@@ -11,6 +11,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -160,6 +161,35 @@ func TestGetWhatsAppAccountCached_NotFoundReturnsError(t *testing.T) {
 	app := cacheTestApp(t)
 	_, err := app.getWhatsAppAccountCached("phone-does-not-exist-" + uuid.New().String()[:8])
 	require.Error(t, err)
+}
+
+func TestGetWhatsAppAccountCachedForOutboundRejectsInactiveWithoutBlockingRecoveryLookup(t *testing.T) {
+	app := cacheTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+
+	for _, status := range []string{
+		"pending_registration",
+		"pending_subscription",
+		"subscription_failed",
+		"disconnected",
+	} {
+		t.Run(status, func(t *testing.T) {
+			phoneID := "phone-outbound-" + uuid.New().String()[:8]
+			account := makeAccount(t, app, org.ID, phoneID, "recovery-token", "recovery-secret")
+			require.NoError(t, app.DB.Model(account).Update("status", status).Error)
+			app.InvalidateWhatsAppAccountCache(phoneID)
+
+			// Inbound delivery and pending registration/subscription recovery still
+			// need credentials while the account is deliberately non-sendable.
+			generic, err := app.getWhatsAppAccountCached(phoneID)
+			require.NoError(t, err)
+			assert.Equal(t, status, generic.Status)
+
+			outbound, err := app.getWhatsAppAccountCachedForOutbound(phoneID)
+			require.ErrorIs(t, err, whatsappaccount.ErrOutboundInactive)
+			assert.Nil(t, outbound)
+		})
+	}
 }
 
 func TestResolveWhatsAppOrganization_NonRLSNormalizesPhoneID(t *testing.T) {

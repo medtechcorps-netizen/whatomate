@@ -20,6 +20,23 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+type channelOutboxAttemptAdapter struct {
+	channelapi.Adapter
+	send func(
+		context.Context,
+		*models.ChannelAccount,
+		channelapi.OutboundMessage,
+	) (channelapi.SendResult, error)
+}
+
+func (adapter *channelOutboxAttemptAdapter) Send(
+	ctx context.Context,
+	account *models.ChannelAccount,
+	message channelapi.OutboundMessage,
+) (channelapi.SendResult, error) {
+	return adapter.send(ctx, account, message)
+}
+
 func TestChannelOutboxBackoffIsBounded(t *testing.T) {
 	t.Parallel()
 
@@ -1004,6 +1021,111 @@ func TestChannelAIOutboxDispatchAllowsUnchangedEligibleJob(t *testing.T) {
 		Update("status", models.OutboxJobStatusCancelled)
 	require.NoError(t, result.Error)
 	assert.Zero(t, result.RowsAffected)
+}
+
+func TestStaticMetaAutomaticAIDeliveryUncertaintyIsNeverRetried(t *testing.T) {
+	tests := []struct {
+		name      string
+		channel   models.Channel
+		send      func() (channelapi.SendResult, error)
+		wantCause string
+	}{
+		{
+			name:    "Instagram transport error",
+			channel: models.ChannelInstagram,
+			send: func() (channelapi.SendResult, error) {
+				return channelapi.SendResult{}, errors.New("transport ended after dispatch")
+			},
+			wantCause: "transport ended after dispatch",
+		},
+		{
+			name:    "Instagram accepted without ID",
+			channel: models.ChannelInstagram,
+			send: func() (channelapi.SendResult, error) {
+				return channelapi.SendResult{}, nil
+			},
+			wantCause: "without a message ID",
+		},
+		{
+			name:    "Messenger transport error",
+			channel: models.ChannelMessenger,
+			send: func() (channelapi.SendResult, error) {
+				return channelapi.SendResult{}, errors.New("transport ended after dispatch")
+			},
+			wantCause: "transport ended after dispatch",
+		},
+		{
+			name:    "Messenger accepted without ID",
+			channel: models.ChannelMessenger,
+			send: func() (channelapi.SendResult, error) {
+				return channelapi.SendResult{}, nil
+			},
+			wantCause: "without a message ID",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			fixture := createChannelAIReplyWorkerFixture(t, db)
+			fixture.Account.Channel = test.channel
+			require.NoError(t, db.Model(&models.ChannelAccount{}).
+				Where("id = ?", fixture.Account.ID).
+				Update("channel", test.channel).Error)
+			require.NoError(t, db.Model(&models.ContactIdentity{}).
+				Where("id = ?", fixture.Identity.ID).
+				Update("channel", test.channel).Error)
+			require.NoError(t, db.Model(&models.InboxConversation{}).
+				Where("id = ?", fixture.Conversation.ID).
+				Update("channel", test.channel).Error)
+			job, message := createChannelAIOutboxDispatchFixture(
+				t,
+				db,
+				fixture,
+				time.Now().UTC().Add(time.Hour),
+				"static-meta-uncertainty",
+			)
+			calls := 0
+			adapter := &channelOutboxAttemptAdapter{send: func(
+				_ context.Context,
+				_ *models.ChannelAccount,
+				_ channelapi.OutboundMessage,
+			) (channelapi.SendResult, error) {
+				calls++
+				return test.send()
+			}}
+			outbound, err := channelOutboundMessageForJob(job)
+			require.NoError(t, err)
+			worker := &Worker{DB: db, Log: testutil.NopLogger()}
+
+			require.NoError(t, worker.deliverChannelAIOutboxPhysicalAttempt(
+				context.Background(),
+				fixture.Organization.ID,
+				job,
+				fixture.Account,
+				job.LockedBy,
+				outbound,
+				adapter,
+			))
+			assert.Equal(t, 1, calls)
+			require.NoError(t, db.First(job, "id = ?", job.ID).Error)
+			assert.Equal(t, models.OutboxJobStatusFailed, job.Status)
+			assert.Equal(t, 1, job.AttemptCount)
+			assert.Equal(t, "channel_ai_delivery_state_ambiguous", job.LastErrorCode)
+			assert.Contains(t, job.LastError, test.wantCause)
+			require.NoError(t, db.First(message, "id = ?", message.ID).Error)
+			assert.Equal(t, models.MessageStatusFailed, message.Status)
+
+			claimedID, claimed, err := worker.claimChannelOutboxJob(
+				fixture.Organization.ID,
+				"replacement-worker",
+			)
+			require.NoError(t, err)
+			assert.False(t, claimed)
+			assert.Equal(t, uuid.Nil, claimedID)
+			assert.Equal(t, 1, calls)
+		})
+	}
 }
 
 func TestChannelAIOutboxDispatchUsesCentralQwenForBoundDefaultProvider(t *testing.T) {

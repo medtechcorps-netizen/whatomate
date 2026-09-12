@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"path"
 	"sort"
@@ -19,6 +20,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
+	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -28,24 +30,25 @@ import (
 
 // ContactResponse represents a contact with additional fields for the frontend
 type ContactResponse struct {
-	ID                 uuid.UUID  `json:"id"`
-	PhoneNumber        string     `json:"phone_number"`
-	Name               string     `json:"name"`
-	ProfileName        string     `json:"profile_name"`
-	AvatarURL          string     `json:"avatar_url"`
-	Status             string     `json:"status"`
-	Tags               []string   `json:"tags"`
-	Metadata           any        `json:"metadata"`
-	LastMessageAt      *time.Time `json:"last_message_at"`
-	LastMessagePreview string     `json:"last_message_preview"`
-	UnreadCount        int        `json:"unread_count"`
-	AssignedUserID     *uuid.UUID `json:"assigned_user_id,omitempty"`
-	WhatsAppAccount    string     `json:"whatsapp_account,omitempty"`
-	LastInboundAt      *time.Time `json:"last_inbound_at,omitempty"`
-	ServiceWindowOpen  bool       `json:"service_window_open"`
-	MarketingOptOut    bool       `json:"marketing_opt_out"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	ID                    uuid.UUID                            `json:"id"`
+	PhoneNumber           string                               `json:"phone_number"`
+	Name                  string                               `json:"name"`
+	ProfileName           string                               `json:"profile_name"`
+	AvatarURL             string                               `json:"avatar_url"`
+	Status                string                               `json:"status"`
+	Tags                  []string                             `json:"tags"`
+	Metadata              any                                  `json:"metadata"`
+	LastMessageAt         *time.Time                           `json:"last_message_at"`
+	LastMessagePreview    string                               `json:"last_message_preview"`
+	UnreadCount           int                                  `json:"unread_count"`
+	AssignedUserID        *uuid.UUID                           `json:"assigned_user_id,omitempty"`
+	WhatsAppAccount       string                               `json:"whatsapp_account,omitempty"`
+	LastInboundAt         *time.Time                           `json:"last_inbound_at,omitempty"`
+	ServiceWindowOpen     bool                                 `json:"service_window_open"`
+	MarketingOptOut       bool                                 `json:"marketing_opt_out"`
+	IdentityReviewAIState WhatsAppIdentityReviewEffectiveState `json:"identity_review_ai_state"`
+	CreatedAt             time.Time                            `json:"created_at"`
+	UpdatedAt             time.Time                            `json:"updated_at"`
 }
 
 // MessageResponse represents a message for the frontend
@@ -86,6 +89,377 @@ type ReactionInfo struct {
 	Emoji     string `json:"emoji"`
 	FromPhone string `json:"from_phone,omitempty"`
 	FromUser  string `json:"from_user,omitempty"`
+}
+
+type whatsAppIdentityReviewDecisionRequest struct {
+	HoldID               uuid.UUID `json:"hold_id"`
+	TargetContactID      uuid.UUID `json:"target_contact_id"`
+	ExpectedVersion      uint64    `json:"expected_version"`
+	ExpectedMemberDigest string    `json:"expected_member_digest"`
+	ExpectedChainDigest  string    `json:"expected_chain_digest"`
+	RequestID            uuid.UUID `json:"request_id"`
+	RequestDigest        string    `json:"request_digest"`
+}
+
+type stagedWhatsAppIdentityReviewItem struct {
+	ID              uuid.UUID                 `json:"id"`
+	HoldID          uuid.UUID                 `json:"hold_id"`
+	ProtocolVersion uint16                    `json:"protocol_version"`
+	Revision        string                    `json:"revision,omitempty"`
+	Status          models.InboundEventStatus `json:"status"`
+	MessageType     string                    `json:"message_type"`
+	MediaStatus     string                    `json:"media_status,omitempty"`
+	ReceivedAt      time.Time                 `json:"received_at"`
+}
+
+type stagedWhatsAppIdentityReviewDetail struct {
+	stagedWhatsAppIdentityReviewItem
+	Content        string `json:"content"`
+	MediaMimeType  string `json:"media_mime_type,omitempty"`
+	MediaFilename  string `json:"media_filename,omitempty"`
+	MediaAvailable bool   `json:"media_available"`
+}
+
+// GetContactIdentityReviewState returns only the non-identifying effective AI
+// policy for one contact. Failed policy reads are intentionally represented as
+// a successful, known=false blocked projection so a UI outage cannot become an
+// accidental AI allow decision.
+func (a *App) GetContactIdentityReviewState(r *fastglue.Request) error {
+	orgID, userID, err := a.getOrgAndUserID(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	contactID, ok := a.requireVisibleIdentityReviewContact(r, orgID, userID)
+	if !ok {
+		return nil
+	}
+	state, err := a.GetWhatsAppIdentityReviewEffectiveState(a.DB, orgID, contactID)
+	if err != nil {
+		a.Log.Error("Failed to load contact identity-review state", "error", err, "organization_id", orgID, "contact_id", contactID)
+		state = FailClosedWhatsAppIdentityReviewEffectiveState("identity_review_read_failed")
+	}
+	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	return r.SendEnvelope(state)
+}
+
+// PreviewContactIdentityReview returns the complete candidate union only after
+// the storage authority proves contacts:write, the dedicated identity-review
+// permission, and access to every candidate in the complete union.
+func (a *App) PreviewContactIdentityReview(r *fastglue.Request) error {
+	orgID, userID, err := a.getOrgAndUserID(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	contactID, ok := a.requireVisibleIdentityReviewContact(r, orgID, userID)
+	if !ok {
+		return nil
+	}
+	if !a.HasPermission(userID, models.ResourceContacts, models.ActionWrite, orgID) ||
+		!a.HasPermission(userID, models.ResourceContactsIdentityReview, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+	}
+	state, err := a.GetWhatsAppIdentityReviewEffectiveState(a.DB, orgID, contactID)
+	if err != nil || !state.Known || !state.Blocked || state.LatestHoldID == nil {
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Identity review state changed; reload and try again", nil, "")
+	}
+	preview, err := a.PreviewWhatsAppIdentityReviewDecision(a.DB, WhatsAppIdentityReviewPreviewInput{
+		OrganizationID: orgID,
+		HoldID:         *state.LatestHoldID,
+		ResolverUserID: userID,
+	})
+	if err != nil {
+		return a.sendWhatsAppIdentityReviewError(r, err, "preview")
+	}
+	if !identityReviewContainsContact(preview.UnionCandidates, contactID) {
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Identity review state changed; reload and try again", nil, "")
+	}
+	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	return r.SendEnvelope(preview)
+}
+
+// DecideContactIdentityReview records one future-routing decision. The body
+// digest is recomputed by the server so request-id replay is bound to the exact
+// hold, CAS values, and selected member rather than to caller-supplied metadata.
+func (a *App) DecideContactIdentityReview(r *fastglue.Request) error {
+	orgID, userID, err := a.getOrgAndUserID(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	contactID, ok := a.requireVisibleIdentityReviewContact(r, orgID, userID)
+	if !ok {
+		return nil
+	}
+	if !a.HasPermission(userID, models.ResourceContacts, models.ActionWrite, orgID) ||
+		!a.HasPermission(userID, models.ResourceContactsIdentityReview, models.ActionWrite, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+	}
+	var request whatsAppIdentityReviewDecisionRequest
+	if err := a.decodeRequest(r, &request); err != nil {
+		return nil
+	}
+	request.ExpectedMemberDigest = strings.ToLower(strings.TrimSpace(request.ExpectedMemberDigest))
+	request.ExpectedChainDigest = strings.ToLower(strings.TrimSpace(request.ExpectedChainDigest))
+	request.RequestDigest = strings.ToLower(strings.TrimSpace(request.RequestDigest))
+	if request.HoldID == uuid.Nil || request.TargetContactID == uuid.Nil || request.RequestID == uuid.Nil ||
+		request.ExpectedVersion == 0 || !isSHA256Hex(request.ExpectedMemberDigest) ||
+		!isSHA256Hex(request.ExpectedChainDigest) || !isSHA256Hex(request.RequestDigest) {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid identity review decision", nil, "")
+	}
+	decisionInput := WhatsAppIdentityReviewDecisionInput{
+		OrganizationID:       orgID,
+		HoldID:               request.HoldID,
+		ResolverUserID:       userID,
+		TargetContactID:      request.TargetContactID,
+		ExpectedVersion:      request.ExpectedVersion,
+		ExpectedMemberDigest: request.ExpectedMemberDigest,
+		ExpectedChainDigest:  request.ExpectedChainDigest,
+		RequestID:            request.RequestID,
+		RequestDigest:        request.RequestDigest,
+	}
+	if request.RequestDigest != WhatsAppIdentityReviewDecisionRequestDigest(decisionInput) {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid identity review decision", nil, "")
+	}
+	snapshot, err := a.LoadWhatsAppIdentityReviewSnapshot(a.DB, orgID, request.HoldID)
+	if err != nil {
+		return a.sendWhatsAppIdentityReviewError(r, err, "load decision")
+	}
+	if !identityReviewContainsContact(snapshot.Candidates, contactID) {
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Identity review state changed; reload and try again", nil, "")
+	}
+	var result *WhatsAppIdentityReviewDecisionResult
+	err = a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		var decisionErr error
+		result, decisionErr = scoped.DecideWhatsAppIdentityReview(scoped.DB, decisionInput)
+		return decisionErr
+	})
+	if err != nil {
+		return a.sendWhatsAppIdentityReviewError(r, err, "decision")
+	}
+	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	return r.SendEnvelope(result)
+}
+
+// ListStagedContactIdentityReviews returns only sanitized queue metadata. It is
+// a full-tenant surface because contact-free arrivals have no safe assignment
+// boundary until a reviewer resolves identity.
+func (a *App) ListStagedContactIdentityReviews(r *fastglue.Request) error {
+	orgID, _, ok := a.requireStagedIdentityReviewAccess(r)
+	if !ok {
+		return nil
+	}
+	pg := parsePagination(r)
+	query := a.stagedIdentityReviewEventsQuery(orgID)
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		a.Log.Error("Failed to count staged identity reviews", "error", err, "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list staged identity reviews", nil, "")
+	}
+	var events []models.InboundEvent
+	if err := query.Order("received_at DESC, id DESC").Offset(pg.Offset).Limit(pg.Limit).Find(&events).Error; err != nil {
+		a.Log.Error("Failed to list staged identity reviews", "error", err, "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list staged identity reviews", nil, "")
+	}
+	items := make([]stagedWhatsAppIdentityReviewItem, len(events))
+	for i := range events {
+		items[i] = stagedWhatsAppIdentityReviewItemFromEvent(&events[i])
+	}
+	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	return r.SendEnvelope(listEnvelope("reviews", items, total, pg))
+}
+
+func (a *App) GetStagedContactIdentityReview(r *fastglue.Request) error {
+	orgID, _, ok := a.requireStagedIdentityReviewAccess(r)
+	if !ok {
+		return nil
+	}
+	eventID, err := parsePathUUID(r, "id", "staged identity review")
+	if err != nil {
+		return nil
+	}
+	event, err := a.loadStagedIdentityReviewEvent(orgID, eventID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Staged identity review not found", nil, "")
+		}
+		a.Log.Error("Failed to load staged identity review", "error", err, "organization_id", orgID, "event_id", eventID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load staged identity review", nil, "")
+	}
+	if _, err := a.LoadWhatsAppIdentityReviewSnapshot(a.DB, orgID, *event.ReviewHoldID); err != nil {
+		a.Log.Error("Failed to verify staged identity-review hold", "error", err, "organization_id", orgID, "event_id", eventID)
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Staged identity review is unavailable", nil, "")
+	}
+	detail := stagedWhatsAppIdentityReviewDetail{
+		stagedWhatsAppIdentityReviewItem: stagedWhatsAppIdentityReviewItemFromEvent(event),
+		Content:                          coexistenceMediaPayloadString(event.Payload, "content"),
+		MediaMimeType:                    coexistenceMediaPayloadString(event.Payload, "media_mime_type"),
+		MediaFilename:                    coexistenceMediaPayloadString(event.Payload, "media_filename"),
+	}
+	detail.MediaAvailable = detail.Revision != "" && detail.MediaStatus == "ready" &&
+		coexistenceMediaPayloadString(event.Payload, "media_url") != ""
+	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	return r.SendEnvelope(detail)
+}
+
+func (a *App) GetStagedContactIdentityReviewMedia(r *fastglue.Request) error {
+	orgID, _, ok := a.requireStagedIdentityReviewAccess(r)
+	if !ok {
+		return nil
+	}
+	eventID, err := parsePathUUID(r, "id", "staged identity review")
+	if err != nil {
+		return nil
+	}
+	revision, _ := r.RequestCtx.UserValue("revision").(string)
+	revision = strings.ToLower(strings.TrimSpace(revision))
+	if !isSHA256Hex(revision) {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid staged media revision", nil, "")
+	}
+	event, err := a.loadStagedIdentityReviewEvent(orgID, eventID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Staged identity review not found", nil, "")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load staged identity review", nil, "")
+	}
+	if _, err := a.LoadWhatsAppIdentityReviewSnapshot(a.DB, orgID, *event.ReviewHoldID); err != nil {
+		a.Log.Error("Failed to verify staged identity-review hold for media", "error", err, "organization_id", orgID, "event_id", eventID)
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Staged identity review is unavailable", nil, "")
+	}
+	_, currentRevision, expectedMimeType, _, supported := coexistenceStagedMediaRevision(event)
+	mediaURL := coexistenceMediaPayloadString(event.Payload, "media_url")
+	if !supported || currentRevision != revision ||
+		coexistenceMediaPayloadString(event.Payload, "media_status") != "ready" || mediaURL == "" {
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Staged media changed or is not ready", nil, "")
+	}
+	data, storedContentType, err := a.loadTenantMedia(r.RequestCtx, orgID, mediaURL)
+	if err != nil {
+		a.Log.Error("Failed to read protected staged media", "error", err, "organization_id", orgID, "event_id", eventID)
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Staged media is unavailable", nil, "")
+	}
+	contentType := safeStagedIdentityReviewContentType(storedContentType, expectedMimeType)
+	r.RequestCtx.Response.Header.Set("Content-Type", contentType)
+	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	r.RequestCtx.Response.Header.Set("X-Content-Type-Options", "nosniff")
+	r.RequestCtx.Response.Header.Set("Content-Disposition", "attachment")
+	r.RequestCtx.SetBody(data)
+	return nil
+}
+
+func (a *App) requireVisibleIdentityReviewContact(
+	r *fastglue.Request,
+	organizationID, userID uuid.UUID,
+) (uuid.UUID, bool) {
+	contactID, err := parsePathUUID(r, "id", "contact")
+	if err != nil {
+		return uuid.Nil, false
+	}
+	var count int64
+	query := a.scopeAssignedContact(
+		a.DB.Model(&models.Contact{}).Where("organization_id = ? AND id = ?", organizationID, contactID),
+		userID,
+		organizationID,
+	)
+	if err := query.Count(&count).Error; err != nil {
+		a.Log.Error("Failed to authorize identity-review contact", "error", err, "organization_id", organizationID, "contact_id", contactID)
+		_ = r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to authorize contact", nil, "")
+		return uuid.Nil, false
+	}
+	if count != 1 {
+		_ = r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		return uuid.Nil, false
+	}
+	return contactID, true
+}
+
+func (a *App) requireStagedIdentityReviewAccess(r *fastglue.Request) (uuid.UUID, uuid.UUID, bool) {
+	orgID, userID, err := a.requireAuth(r, models.ResourceContactsIdentityReview, models.ActionWrite)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, false
+	}
+	if !a.HasPermission(userID, models.ResourceContacts, models.ActionWrite, orgID) {
+		_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+		return uuid.Nil, uuid.Nil, false
+	}
+	return orgID, userID, true
+}
+
+func (a *App) loadStagedIdentityReviewEvent(
+	organizationID, eventID uuid.UUID,
+) (*models.InboundEvent, error) {
+	var event models.InboundEvent
+	if err := a.stagedIdentityReviewEventsQuery(organizationID).
+		Where("inbound_events.id = ?", eventID).
+		First(&event).Error; err != nil {
+		return nil, err
+	}
+	return &event, nil
+}
+
+// stagedIdentityReviewEventsQuery deliberately joins the tenant-bound hold
+// authority. Inbound receipts are immutable audit records, but only receipts
+// backed by an open hold are actionable queue/detail/media surfaces.
+func (a *App) stagedIdentityReviewEventsQuery(organizationID uuid.UUID) *gorm.DB {
+	return a.DB.Model(&models.InboundEvent{}).
+		Select("inbound_events.*").
+		Joins(`JOIN whatsapp_identity_review_holds AS review_holds
+			ON review_holds.organization_id = inbound_events.organization_id
+			AND review_holds.id = inbound_events.review_hold_id`).
+		Where(
+			"inbound_events.organization_id = ? AND inbound_events.protocol = ? AND inbound_events.event_type = ? AND inbound_events.review_hold_id IS NOT NULL AND review_holds.disposition = ?",
+			organizationID,
+			models.WhatsAppIdentityReviewInboundProtocol,
+			models.WhatsAppIdentityReviewPendingEvent,
+			models.WhatsAppIdentityReviewDispositionOpen,
+		)
+}
+
+func stagedWhatsAppIdentityReviewItemFromEvent(event *models.InboundEvent) stagedWhatsAppIdentityReviewItem {
+	item := stagedWhatsAppIdentityReviewItem{
+		ProtocolVersion: models.WhatsAppIdentityReviewProtocolVersion,
+		MessageType:     "unavailable",
+	}
+	if event == nil || event.ReviewHoldID == nil {
+		return item
+	}
+	item.ID = event.ID
+	item.HoldID = *event.ReviewHoldID
+	item.Status = event.Status
+	item.ReceivedAt = event.ReceivedAt
+	if messageType := coexistenceMediaPayloadString(event.Payload, "message_type"); messageType != "" {
+		item.MessageType = messageType
+	}
+	item.MediaStatus = coexistenceMediaPayloadString(event.Payload, "media_status")
+	if _, revision, _, _, supported := coexistenceStagedMediaRevision(event); supported {
+		item.Revision = revision
+	}
+	return item
+}
+
+func safeStagedIdentityReviewContentType(values ...string) string {
+	for _, value := range values {
+		mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(value))
+		if err == nil && (strings.HasPrefix(mediaType, "image/") || strings.HasPrefix(mediaType, "audio/") ||
+			strings.HasPrefix(mediaType, "video/") || mediaType == "application/pdf" || mediaType == "application/octet-stream") {
+			return mediaType
+		}
+	}
+	return "application/octet-stream"
+}
+
+func (a *App) sendWhatsAppIdentityReviewError(r *fastglue.Request, err error, operation string) error {
+	switch {
+	case errors.Is(err, ErrWhatsAppIdentityReviewUnauthorized):
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+	case errors.Is(err, ErrWhatsAppIdentityReviewInvalid):
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid identity review request", nil, "")
+	case errors.Is(err, ErrWhatsAppIdentityReviewConflict):
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Identity review state changed; reload and try again", nil, "")
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Identity review not found", nil, "")
+	default:
+		a.Log.Error("Identity review operation failed", "error", err, "operation", operation)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Identity review operation failed", nil, "")
+	}
 }
 
 // ListContacts returns all contacts for the organization
@@ -154,6 +528,21 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 	shouldMask := a.ShouldMaskPhoneNumbers(orgID)
 
 	// Convert to response format
+	contactIDs := make([]uuid.UUID, len(contacts))
+	for i := range contacts {
+		contactIDs[i] = contacts[i].ID
+	}
+	effectiveStates := make(map[uuid.UUID]WhatsAppIdentityReviewEffectiveState, len(contacts))
+	if len(contactIDs) > 0 {
+		effectiveStates, err = a.GetWhatsAppIdentityReviewEffectiveStates(a.DB, orgID, contactIDs)
+		if err != nil {
+			a.Log.Error("Failed to load contact identity-review states", "error", err, "organization_id", orgID)
+			effectiveStates = make(map[uuid.UUID]WhatsAppIdentityReviewEffectiveState, len(contacts))
+			for _, contactID := range contactIDs {
+				effectiveStates[contactID] = FailClosedWhatsAppIdentityReviewEffectiveState("identity_review_read_failed")
+			}
+		}
+	}
 	response := make([]ContactResponse, len(contacts))
 	for i, c := range contacts {
 		// Count unread messages
@@ -180,24 +569,29 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 
 		serviceWindowOpen := c.LastInboundAt != nil && time.Since(*c.LastInboundAt) < 24*time.Hour
 
+		effectiveState, exists := effectiveStates[c.ID]
+		if !exists {
+			effectiveState = FailClosedWhatsAppIdentityReviewEffectiveState("identity_review_read_failed")
+		}
 		response[i] = ContactResponse{
-			ID:                 c.ID,
-			PhoneNumber:        phoneNumber,
-			Name:               profileName,
-			ProfileName:        profileName,
-			Status:             "active",
-			Tags:               tags,
-			Metadata:           c.Metadata,
-			LastMessageAt:      c.LastMessageAt,
-			LastMessagePreview: c.LastMessagePreview,
-			UnreadCount:        int(unreadCount),
-			AssignedUserID:     c.AssignedUserID,
-			WhatsAppAccount:    c.WhatsAppAccount,
-			LastInboundAt:      c.LastInboundAt,
-			ServiceWindowOpen:  serviceWindowOpen,
-			MarketingOptOut:    c.MarketingOptOut,
-			CreatedAt:          c.CreatedAt,
-			UpdatedAt:          c.UpdatedAt,
+			ID:                    c.ID,
+			PhoneNumber:           phoneNumber,
+			Name:                  profileName,
+			ProfileName:           profileName,
+			Status:                "active",
+			Tags:                  tags,
+			Metadata:              c.Metadata,
+			LastMessageAt:         c.LastMessageAt,
+			LastMessagePreview:    c.LastMessagePreview,
+			UnreadCount:           int(unreadCount),
+			AssignedUserID:        c.AssignedUserID,
+			WhatsAppAccount:       c.WhatsAppAccount,
+			LastInboundAt:         c.LastInboundAt,
+			ServiceWindowOpen:     serviceWindowOpen,
+			MarketingOptOut:       c.MarketingOptOut,
+			IdentityReviewAIState: effectiveState,
+			CreatedAt:             c.CreatedAt,
+			UpdatedAt:             c.UpdatedAt,
 		}
 	}
 
@@ -595,6 +989,24 @@ func (a *App) MarkContactRead(r *fastglue.Request) error {
 
 // markMessagesAsRead marks messages as read and sends read receipts
 func (a *App) markMessagesAsRead(orgID uuid.UUID, contactID uuid.UUID, contact *models.Contact) {
+	if a != nil && a.inboundContinuation != nil {
+		if err := a.rootApp().WithCommittedTenantApp(orgID, func(scoped *App) error {
+			return scoped.markMessagesAsReadInCurrentScope(orgID, contactID, contact)
+		}); err != nil {
+			a.Log.Error("Failed to mark independently committed inbound messages as read", "error", err, "organization_id", orgID)
+		}
+		return
+	}
+	if err := a.markMessagesAsReadInCurrentScope(orgID, contactID, contact); err != nil {
+		a.Log.Error("Failed to mark messages as read", "error", err, "organization_id", orgID)
+	}
+}
+
+func (a *App) markMessagesAsReadInCurrentScope(
+	orgID uuid.UUID,
+	contactID uuid.UUID,
+	contact *models.Contact,
+) error {
 	var unreadMessages []models.Message
 	if err := a.DB.Where(
 		"organization_id = ? AND contact_id = ? AND direction = ? AND status != ?",
@@ -603,12 +1015,9 @@ func (a *App) markMessagesAsRead(orgID uuid.UUID, contactID uuid.UUID, contact *
 		models.DirectionIncoming,
 		models.MessageStatusRead,
 	).Find(&unreadMessages).Error; err != nil {
-		a.Log.Error("Failed to load unread messages", "error", err, "organization_id", orgID)
-		return
+		return err
 	}
-	if err := a.markSelectedMessagesAsRead(orgID, contactID, contact, unreadMessages, true); err != nil {
-		a.Log.Error("Failed to mark messages as read", "error", err, "organization_id", orgID)
-	}
+	return a.markSelectedMessagesAsRead(orgID, contactID, contact, unreadMessages, true)
 }
 
 // markMessagesAsReadThrough acknowledges incoming rows no newer than the exact
@@ -781,23 +1190,46 @@ func (a *App) markSelectedMessagesAsRead(
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 
-				waAccount := a.toWhatsAppAccount(&accountCopy)
-				for i := range messageBatch {
-					message := messageBatch[i]
-					if ctx.Err() != nil {
-						a.Log.Warn("Read receipt sending cancelled", "reason", ctx.Err())
+				if err := root.sendWhatsAppReadReceipts(ctx, &accountCopy, messageBatch); err != nil {
+					if errors.Is(err, whatsappaccount.ErrOutboundInactive) {
+						root.Log.Info("Skipped read receipts for inactive WhatsApp account", "account_id", accountCopy.ID)
 						return
 					}
-					if message.WhatsAppMessageID != "" {
-						if err := a.WhatsApp.MarkMessageRead(ctx, waAccount, message.WhatsAppMessageID); err != nil {
-							a.Log.Error("Failed to send read receipt", "error", err, "message_id", message.WhatsAppMessageID)
-						}
-					}
+					root.Log.Error("Failed to send read receipts", "error", err, "account_id", accountCopy.ID)
 				}
 			}()
 		})
 	}
 	return nil
+}
+
+// sendWhatsAppReadReceipts holds the account lifecycle read lock across the
+// batch. A disconnect committed before the lock is acquired suppresses every
+// Graph call; a disconnect arriving later waits for this already-started batch.
+func (a *App) sendWhatsAppReadReceipts(
+	ctx context.Context,
+	account *models.WhatsAppAccount,
+	messages []models.Message,
+) error {
+	if account == nil || account.OrganizationID == uuid.Nil || account.ID == uuid.Nil {
+		return whatsappaccount.ErrOutboundInactive
+	}
+	return a.withLockedWhatsAppAccountForOutbound(ctx, account.OrganizationID, account.ID, func(locked *models.WhatsAppAccount) error {
+		waAccount := a.toWhatsAppAccount(locked)
+		for i := range messages {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			message := messages[i]
+			if message.WhatsAppMessageID == "" {
+				continue
+			}
+			if err := a.WhatsApp.MarkMessageRead(ctx, waAccount, message.WhatsAppMessageID); err != nil {
+				a.Log.Error("Failed to send read receipt", "error", err, "message_id", message.WhatsAppMessageID)
+			}
+		}
+		return nil
+	})
 }
 
 // SendMessageRequest represents a send message request
@@ -1044,7 +1476,7 @@ func (a *App) resolveWhatsAppAccount(orgID uuid.UUID, accountName string) (*mode
 		if err := a.DB.Where("name = ? AND organization_id = ?", accountName, orgID).First(&account).Error; err != nil {
 			return nil, fmt.Errorf("WhatsApp account not found")
 		}
-		if err := a.prepareWhatsAppAccountForRuntime(&account); err != nil {
+		if err := a.prepareWhatsAppAccountForOutbound(&account); err != nil {
 			return nil, err
 		}
 		return &account, nil
@@ -1057,7 +1489,7 @@ func (a *App) resolveWhatsAppAccount(orgID uuid.UUID, accountName string) (*mode
 			return nil, fmt.Errorf("no WhatsApp account configured")
 		}
 	}
-	if err := a.prepareWhatsAppAccountForRuntime(&account); err != nil {
+	if err := a.prepareWhatsAppAccountForOutbound(&account); err != nil {
 		return nil, err
 	}
 	return &account, nil
@@ -1375,8 +1807,19 @@ func (a *App) SendReaction(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update reaction", nil, "")
 	}
 
-	// Send reaction to WhatsApp API
-	go a.sendWhatsAppReaction(account, &contact, &message, req.Emoji)
+	// Send only after the tenant write commits. The goroutine always uses the
+	// root pool, never the request-scoped transaction that is being released.
+	accountCopy := *account
+	contactCopy := contact
+	messageCopy := message
+	a.afterTenantCommit(func() {
+		root := a.rootApp()
+		root.wg.Add(1)
+		go func() {
+			defer root.wg.Done()
+			root.sendWhatsAppReaction(&accountCopy, &contactCopy, &messageCopy, req.Emoji)
+		}()
+	})
 
 	// Broadcast via WebSocket
 	a.broadcastReactionUpdate(orgID, message.ID, contact.ID, newReactions)
@@ -1389,12 +1832,31 @@ func (a *App) SendReaction(r *fastglue.Request) error {
 
 // sendWhatsAppReaction sends a reaction to WhatsApp
 func (a *App) sendWhatsAppReaction(account *models.WhatsAppAccount, contact *models.Contact, message *models.Message, emoji string) {
-	if message.WhatsAppMessageID == "" {
-		a.Log.Warn("Cannot send reaction - message has no WhatsApp ID", "message_id", message.ID)
+	err := a.sendWhatsAppReactionGuarded(account, contact, message, emoji)
+	if errors.Is(err, whatsappaccount.ErrOutboundInactive) {
+		var accountID, messageID uuid.UUID
+		if account != nil {
+			accountID = account.ID
+		}
+		if message != nil {
+			messageID = message.ID
+		}
+		a.Log.Info("Skipped reaction for inactive WhatsApp account", "account_id", accountID, "message_id", messageID)
 		return
 	}
+	if err != nil {
+		a.Log.Error("Failed to send reaction", "error", err, "message_id", message.ID)
+	}
+}
 
-	url := fmt.Sprintf("%s/%s/%s/messages", a.Config.WhatsApp.BaseURL, account.APIVersion, account.PhoneID)
+func (a *App) sendWhatsAppReactionGuarded(account *models.WhatsAppAccount, contact *models.Contact, message *models.Message, emoji string) error {
+	if account == nil || contact == nil || message == nil || account.OrganizationID == uuid.Nil || account.ID == uuid.Nil {
+		return whatsappaccount.ErrOutboundInactive
+	}
+	if message.WhatsAppMessageID == "" {
+		a.Log.Warn("Cannot send reaction - message has no WhatsApp ID", "message_id", message.ID)
+		return nil
+	}
 
 	payload := map[string]any{
 		"messaging_product": "whatsapp",
@@ -1409,33 +1871,33 @@ func (a *App) sendWhatsAppReaction(account *models.WhatsAppAccount, contact *mod
 
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		a.Log.Error("Failed to marshal reaction payload", "error", err)
-		return
+		return fmt.Errorf("marshal reaction payload: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		a.Log.Error("Failed to create reaction request", "error", err)
-		return
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return a.withLockedWhatsAppAccountForOutbound(ctx, account.OrganizationID, account.ID, func(locked *models.WhatsAppAccount) error {
+		url := fmt.Sprintf("%s/%s/%s/messages", a.Config.WhatsApp.BaseURL, locked.APIVersion, locked.PhoneID)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonPayload))
+		if err != nil {
+			return fmt.Errorf("create reaction request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+locked.AccessToken)
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
+		resp, err := a.HTTPClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("send reaction: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("WhatsApp API reaction status %d: %s", resp.StatusCode, truncateString(string(body), 512))
+		}
 
-	resp, err := a.HTTPClient.Do(req)
-	if err != nil {
-		a.Log.Error("Failed to send reaction", "error", err)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		a.Log.Error("WhatsApp API reaction error", "status", resp.StatusCode, "body", string(body))
-		return
-	}
-
-	a.Log.Info("Reaction sent successfully", "message_id", message.WhatsAppMessageID, "emoji", emoji)
+		a.Log.Info("Reaction sent successfully", "message_id", message.WhatsAppMessageID, "emoji", emoji)
+		return nil
+	})
 }
 
 // AssignContactRequest represents the request to assign a contact to a user
@@ -1844,7 +2306,7 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 			}
 			updates["deleted_at"] = nil
 			activityKey := "contact-restored:" + existingContact.ID.String() + ":" + uuid.NewString()
-			if err := a.DB.Transaction(func(tx *gorm.DB) error {
+			if err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
 				if err := tx.Unscoped().Model(&existingContact).Updates(updates).Error; err != nil {
 					return err
 				}
@@ -1899,7 +2361,7 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 		contact.Metadata = models.JSONB(req.Metadata)
 	}
 
-	if err := a.DB.Transaction(func(tx *gorm.DB) error {
+	if err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
 		if err := tx.Create(&contact).Error; err != nil {
 			return err
 		}
@@ -2088,20 +2550,24 @@ func (a *App) DeleteContact(r *fastglue.Request) error {
 		return nil
 	}
 
-	// Get contact
-	contact, err := findByIDAndOrg[models.Contact](a.DB, r, contactID, orgID, "Contact")
+	var contact models.Contact
+	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		if loadErr := tx.Where("id = ? AND organization_id = ?", contactID, orgID).
+			First(&contact).Error; loadErr != nil {
+			return loadErr
+		}
+		return tx.Delete(&contact).Error
+	})
 	if err != nil {
-		return nil
-	}
-
-	// Soft delete the contact
-	if err := a.DB.Delete(contact).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
 		a.Log.Error("Failed to delete contact", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete contact", nil, "")
 	}
 
 	a.logAudit(orgID, userID,
-		"contact", contactID, models.AuditActionDeleted, contact, nil)
+		"contact", contactID, models.AuditActionDeleted, &contact, nil)
 
 	return r.SendEnvelope(map[string]any{
 		"message": "Contact deleted successfully",
@@ -2135,24 +2601,30 @@ func (a *App) buildContactResponse(contact *models.Contact, orgID uuid.UUID) Con
 
 	// 24-hour service window: open if customer messaged within the last 24 hours.
 	serviceWindowOpen := contact.LastInboundAt != nil && time.Since(*contact.LastInboundAt) < 24*time.Hour
+	effectiveState, err := a.GetWhatsAppIdentityReviewEffectiveState(a.DB, orgID, contact.ID)
+	if err != nil {
+		a.Log.Error("Failed to load contact identity-review state", "error", err, "organization_id", orgID, "contact_id", contact.ID)
+		effectiveState = FailClosedWhatsAppIdentityReviewEffectiveState("identity_review_read_failed")
+	}
 
 	return ContactResponse{
-		ID:                 contact.ID,
-		PhoneNumber:        phoneNumber,
-		Name:               profileName,
-		ProfileName:        profileName,
-		Status:             "active",
-		Tags:               tags,
-		Metadata:           contact.Metadata,
-		LastMessageAt:      contact.LastMessageAt,
-		LastMessagePreview: contact.LastMessagePreview,
-		UnreadCount:        int(unreadCount),
-		AssignedUserID:     contact.AssignedUserID,
-		WhatsAppAccount:    contact.WhatsAppAccount,
-		LastInboundAt:      contact.LastInboundAt,
-		ServiceWindowOpen:  serviceWindowOpen,
-		MarketingOptOut:    contact.MarketingOptOut,
-		CreatedAt:          contact.CreatedAt,
-		UpdatedAt:          contact.UpdatedAt,
+		ID:                    contact.ID,
+		PhoneNumber:           phoneNumber,
+		Name:                  profileName,
+		ProfileName:           profileName,
+		Status:                "active",
+		Tags:                  tags,
+		Metadata:              contact.Metadata,
+		LastMessageAt:         contact.LastMessageAt,
+		LastMessagePreview:    contact.LastMessagePreview,
+		UnreadCount:           int(unreadCount),
+		AssignedUserID:        contact.AssignedUserID,
+		WhatsAppAccount:       contact.WhatsAppAccount,
+		LastInboundAt:         contact.LastInboundAt,
+		ServiceWindowOpen:     serviceWindowOpen,
+		MarketingOptOut:       contact.MarketingOptOut,
+		IdentityReviewAIState: effectiveState,
+		CreatedAt:             contact.CreatedAt,
+		UpdatedAt:             contact.UpdatedAt,
 	}
 }

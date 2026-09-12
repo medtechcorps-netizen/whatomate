@@ -105,6 +105,12 @@ const (
 	InboundEventStatusProcessed  InboundEventStatus = "processed"
 	InboundEventStatusIgnored    InboundEventStatus = "ignored"
 	InboundEventStatusFailed     InboundEventStatus = "failed"
+
+	// WhatsAppIdentityReviewInboundProtocol is a reserved, contact-free inbox
+	// protocol. These rows are durable review receipts, not generic channel
+	// webhook work, and must never enter normal claim/normalize/dispatch flows.
+	WhatsAppIdentityReviewInboundProtocol = "whatsapp_identity_review_v1"
+	WhatsAppIdentityReviewPendingEvent    = "review_pending"
 )
 
 type MessageEventType string
@@ -443,8 +449,14 @@ type InboundEvent struct {
 	AttemptCount        int                `gorm:"not null;default:0" json:"attempt_count"`
 	ErrorCode           string             `gorm:"size:100" json:"error_code,omitempty"`
 	ErrorMessage        string             `gorm:"type:text" json:"error_message,omitempty"`
-	Headers             JSONB              `gorm:"type:jsonb;not null;default:'{}'" json:"headers"`
-	Payload             JSONB              `gorm:"type:jsonb;not null;default:'{}'" json:"payload"`
+	// Protocol and ReviewHoldID are populated together only for the reserved
+	// WhatsApp identity-review inbox. ReviewHoldID is deliberately typed and
+	// tenant-bound by the installed database constraint; Payload remains a
+	// sanitized content projection and is never identity authority.
+	Protocol     string     `gorm:"size:64;not null;default:''" json:"protocol,omitempty"`
+	ReviewHoldID *uuid.UUID `gorm:"type:uuid" json:"review_hold_id,omitempty"`
+	Headers      JSONB      `gorm:"type:jsonb;not null;default:'{}'" json:"headers"`
+	Payload      JSONB      `gorm:"type:jsonb;not null;default:'{}'" json:"payload"`
 
 	Organization   *Organization   `gorm:"foreignKey:OrganizationID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"organization,omitempty"`
 	ChannelAccount *ChannelAccount `gorm:"foreignKey:ChannelAccountID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT" json:"channel_account,omitempty"`

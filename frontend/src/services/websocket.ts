@@ -477,6 +477,7 @@ class WebSocketService {
       source: payload.source || 'manual',
       agent_id: payload.agent_id,
       team_id: payload.team_id,
+      transferred_by: payload.transferred_by,
       notes: payload.notes,
       transferred_at: payload.transferred_at,
       // Default SLA values - will be updated on next fetch
@@ -513,11 +514,15 @@ class WebSocketService {
       status: payload.status,
       resumed_at: payload.resumed_at,
       resumed_by: payload.resumed_by
-    })
+    }, payload.contact_id)
 
-    // If transfer wasn't found in store, refresh to get latest data
+    // An event can reference a transfer outside the bounded queue. Reconcile
+    // that contact exactly; the global refresh remains for queue/count state.
     if (!updated) {
-      transfersStore.fetchTransfers()
+      if (payload.contact_id) {
+        void transfersStore.fetchActiveTransferForContact(payload.contact_id)
+      }
+      void transfersStore.fetchTransfers()
     }
   }
 
@@ -526,13 +531,17 @@ class WebSocketService {
     const authStore = useAuthStore()
 
     // Try to update existing transfer
-    transfersStore.updateTransfer(payload.id, {
+    const updated = transfersStore.updateTransfer(payload.id, {
       agent_id: payload.agent_id,
       team_id: payload.team_id
-    })
+    }, payload.contact_id)
+
+    if (!updated && payload.contact_id) {
+      void transfersStore.fetchActiveTransferForContact(payload.contact_id)
+    }
 
     // Always refresh to ensure UI is in sync (queue counts, etc.)
-    transfersStore.fetchTransfers()
+    void transfersStore.fetchTransfers()
 
     // Notify if assigned to current user
     const currentUserId = authStore.user?.id
@@ -949,7 +958,10 @@ class WebSocketService {
 
     // Refresh transfers
     const transfersStore = useTransfersStore()
-    transfersStore.fetchTransfers()
+    void transfersStore.fetchTransfers()
+    if (contactsStore.currentContact?.id) {
+      void transfersStore.fetchActiveTransferForContact(contactsStore.currentContact.id)
+    }
     const payload = { reason: 'reconnected' }
     this.emitChannelSync(payload)
     this.emitInboxActivity(WS_TYPE_CHANNEL_SYNC, payload)

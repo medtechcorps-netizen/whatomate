@@ -25,35 +25,36 @@ import (
 )
 
 type InboxConversationResponse struct {
-	ID                     uuid.UUID                      `json:"id"`
-	OrganizationID         uuid.UUID                      `json:"organization_id"`
-	ChannelAccountID       uuid.UUID                      `json:"channel_account_id"`
-	ChannelAccount         *ChannelAccountResponse        `json:"channel_account,omitempty"`
-	ContactID              uuid.UUID                      `json:"contact_id"`
-	Contact                *models.Contact                `json:"contact,omitempty"`
-	ContactIdentityID      *uuid.UUID                     `json:"contact_identity_id,omitempty"`
-	ContactIdentity        *models.ContactIdentity        `json:"contact_identity,omitempty"`
-	Channel                models.Channel                 `json:"channel"`
-	ExternalConversationID string                         `json:"external_conversation_id"`
-	Status                 models.InboxConversationStatus `json:"status"`
-	Subject                string                         `json:"subject,omitempty"`
-	Priority               int                            `json:"priority"`
-	AssignedUserID         *uuid.UUID                     `json:"assigned_user_id,omitempty"`
-	AssignedTeamID         *uuid.UUID                     `json:"assigned_team_id,omitempty"`
-	UnreadCount            int                            `json:"unread_count"`
-	LastMessagePreview     string                         `json:"last_message_preview,omitempty"`
-	OpenedAt               time.Time                      `json:"opened_at"`
-	LastMessageAt          *time.Time                     `json:"last_message_at,omitempty"`
-	LastInboundAt          *time.Time                     `json:"last_inbound_at,omitempty"`
-	LastOutboundAt         *time.Time                     `json:"last_outbound_at,omitempty"`
-	ServiceWindowEndsAt    *time.Time                     `json:"service_window_ends_at,omitempty"`
-	AIPaused               bool                           `json:"ai_paused"`
-	AIPauseReason          string                         `json:"ai_pause_reason,omitempty"`
-	SnoozedUntil           *time.Time                     `json:"snoozed_until,omitempty"`
-	ResolvedAt             *time.Time                     `json:"resolved_at,omitempty"`
-	Metadata               models.JSONB                   `json:"metadata"`
-	CreatedAt              time.Time                      `json:"created_at"`
-	UpdatedAt              time.Time                      `json:"updated_at"`
+	ID                     uuid.UUID                            `json:"id"`
+	OrganizationID         uuid.UUID                            `json:"organization_id"`
+	ChannelAccountID       uuid.UUID                            `json:"channel_account_id"`
+	ChannelAccount         *ChannelAccountResponse              `json:"channel_account,omitempty"`
+	ContactID              uuid.UUID                            `json:"contact_id"`
+	Contact                *models.Contact                      `json:"contact,omitempty"`
+	ContactIdentityID      *uuid.UUID                           `json:"contact_identity_id,omitempty"`
+	ContactIdentity        *models.ContactIdentity              `json:"contact_identity,omitempty"`
+	Channel                models.Channel                       `json:"channel"`
+	ExternalConversationID string                               `json:"external_conversation_id"`
+	Status                 models.InboxConversationStatus       `json:"status"`
+	Subject                string                               `json:"subject,omitempty"`
+	Priority               int                                  `json:"priority"`
+	AssignedUserID         *uuid.UUID                           `json:"assigned_user_id,omitempty"`
+	AssignedTeamID         *uuid.UUID                           `json:"assigned_team_id,omitempty"`
+	UnreadCount            int                                  `json:"unread_count"`
+	LastMessagePreview     string                               `json:"last_message_preview,omitempty"`
+	OpenedAt               time.Time                            `json:"opened_at"`
+	LastMessageAt          *time.Time                           `json:"last_message_at,omitempty"`
+	LastInboundAt          *time.Time                           `json:"last_inbound_at,omitempty"`
+	LastOutboundAt         *time.Time                           `json:"last_outbound_at,omitempty"`
+	ServiceWindowEndsAt    *time.Time                           `json:"service_window_ends_at,omitempty"`
+	AIPaused               bool                                 `json:"ai_paused"`
+	AIPauseReason          string                               `json:"ai_pause_reason,omitempty"`
+	IdentityReviewAIState  WhatsAppIdentityReviewEffectiveState `json:"identity_review_ai_state"`
+	SnoozedUntil           *time.Time                           `json:"snoozed_until,omitempty"`
+	ResolvedAt             *time.Time                           `json:"resolved_at,omitempty"`
+	Metadata               models.JSONB                         `json:"metadata"`
+	CreatedAt              time.Time                            `json:"created_at"`
+	UpdatedAt              time.Time                            `json:"updated_at"`
 }
 
 type InboxMessageResponse struct {
@@ -142,6 +143,13 @@ func (a *App) ListInboxConversations(r *fastglue.Request) error {
 		  ))`
 
 	query := a.DB.Model(&models.InboxConversation{}).Where("organization_id = ?", orgID)
+	if conversationID := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("conversation_id"))); conversationID != "" {
+		parsed, parseErr := uuid.Parse(conversationID)
+		if parseErr != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid conversation ID", nil, "")
+		}
+		query = query.Where("id = ?", parsed)
+	}
 	if status := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("status"))); status != "" {
 		query = query.Where("status = ?", strings.ToLower(status))
 	}
@@ -215,9 +223,31 @@ func (a *App) ListInboxConversations(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list inbox conversations", nil, "")
 	}
 
+	contactIDs := make([]uuid.UUID, len(conversations))
+	for i := range conversations {
+		contactIDs[i] = conversations[i].ContactID
+	}
+	effectiveStates := make(map[uuid.UUID]WhatsAppIdentityReviewEffectiveState, len(conversations))
+	if len(contactIDs) > 0 {
+		effectiveStates, err = a.GetWhatsAppIdentityReviewEffectiveStates(a.DB, orgID, contactIDs)
+		if err != nil {
+			a.Log.Error("Failed to load inbox identity-review states", "error", err, "organization_id", orgID)
+			effectiveStates = make(map[uuid.UUID]WhatsAppIdentityReviewEffectiveState, len(conversations))
+			for _, contactID := range contactIDs {
+				effectiveStates[contactID] = FailClosedWhatsAppIdentityReviewEffectiveState("identity_review_read_failed")
+			}
+		}
+	}
 	response := make([]InboxConversationResponse, len(conversations))
 	for i := range conversations {
-		response[i] = a.inboxConversationToResponse(&conversations[i])
+		effectiveState, exists := effectiveStates[conversations[i].ContactID]
+		if !exists {
+			effectiveState = FailClosedWhatsAppIdentityReviewEffectiveState("identity_review_read_failed")
+		}
+		response[i] = a.inboxConversationToResponseWithEffectiveState(
+			&conversations[i],
+			effectiveState,
+		)
 	}
 	return r.SendEnvelope(listEnvelope("conversations", response, total, pagination))
 }
@@ -1583,6 +1613,7 @@ func inboxConversationToResponse(conversation *models.InboxConversation) InboxCo
 		ServiceWindowEndsAt:    conversation.ServiceWindowEndsAt,
 		AIPaused:               inboxConversationAIIsPaused(conversation.Config),
 		AIPauseReason:          inboxConversationAIString(conversation.Config, models.ConversationConfigAIPauseReason),
+		IdentityReviewAIState:  FailClosedWhatsAppIdentityReviewEffectiveState("identity_review_not_loaded"),
 		SnoozedUntil:           conversation.SnoozedUntil,
 		ResolvedAt:             conversation.ResolvedAt,
 		Metadata:               cloneJSONB(conversation.Metadata),
@@ -1591,8 +1622,12 @@ func inboxConversationToResponse(conversation *models.InboxConversation) InboxCo
 	}
 }
 
-func (a *App) inboxConversationToResponse(conversation *models.InboxConversation) InboxConversationResponse {
+func (a *App) inboxConversationToResponseWithEffectiveState(
+	conversation *models.InboxConversation,
+	effectiveState WhatsAppIdentityReviewEffectiveState,
+) InboxConversationResponse {
 	response := inboxConversationToResponse(conversation)
+	response.IdentityReviewAIState = effectiveState
 	if conversation != nil && conversation.ChannelAccount != nil {
 		account := a.channelAccountToResponse(conversation.ChannelAccount)
 		response.ChannelAccount = &account

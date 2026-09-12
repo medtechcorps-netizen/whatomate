@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import {
+  Archive,
   Banknote,
   CheckCircle2,
   CircleDollarSign,
   Loader2,
   Package,
+  Pencil,
   Plus,
   Receipt,
   RefreshCw,
@@ -15,6 +17,23 @@ import PageHeader from '@/components/shared/PageHeader.vue'
 import ContactPicker from '@/components/shared/ContactPicker.vue'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import { getErrorMessage, unwrapItemResponse, unwrapListResponse } from '@/lib/api-utils'
@@ -49,6 +68,23 @@ const saving = ref(false)
 const loadingMore = ref(false)
 const tab = ref<'packages' | 'customer-plans' | 'invoices' | 'payments'>('packages')
 const packages = ref<PackageDefinition[]>([])
+const salePackages = ref<PackageDefinition[]>([])
+const packageFilter = ref<'active' | 'retired'>('active')
+const packageLoadError = ref('')
+const packageEditOpen = ref(false)
+const editingPackage = ref<PackageDefinition | null>(null)
+const packageToRetire = ref<PackageDefinition | null>(null)
+const packageSaving = ref(false)
+const packageEditError = ref('')
+const packageRetireError = ref('')
+const packageEditDraft = ref({
+  name: '',
+  description: '',
+  price: '',
+  currency: 'MYR',
+  validity_days: 30,
+})
+let loadSequence = 0
 const contactPackages = ref<ContactPackage[]>([])
 const bookingServices = ref<BookingService[]>([])
 const invoices = ref<CommerceInvoice[]>([])
@@ -100,6 +136,7 @@ const canReadPayments = computed(() => authStore.hasPermission('payments', 'read
 const canWritePayments = computed(() => authStore.hasPermission('payments', 'write'))
 const canReadPackages = computed(() => authStore.hasPermission('packages', 'read'))
 const canWritePackages = computed(() => authStore.hasPermission('packages', 'write'))
+const canRetirePackages = computed(() => canWritePackages.value && authStore.hasPermission('packages', 'delete'))
 const canReadBookingSettings = computed(() => authStore.hasPermission('booking.settings', 'read'))
 const canReadContacts = computed(() => authStore.hasPermission('contacts', 'read'))
 const canCreatePackages = computed(() => canWritePackages.value && canReadBookingSettings.value)
@@ -116,7 +153,11 @@ const commerceTabs = computed(() => [
   ...(canReadPackages.value
     ? [
         { key: 'packages' as const, label: 'Packages', icon: Package },
-        { key: 'customer-plans' as const, label: 'Customer plans', icon: ShieldCheck },
+        {
+          key: 'customer-plans' as const,
+          label: 'Customer plans',
+          icon: ShieldCheck,
+        },
       ]
     : []),
   ...(canReadPayments.value
@@ -128,15 +169,17 @@ const commerceTabs = computed(() => [
 ])
 
 const activePackages = computed(() =>
-  summary.value?.packages_visible
-    ? summary.value.active_packages
-    : packages.value.filter((item) => item.is_active).length,
+  summary.value?.packages_visible ? summary.value.active_packages : salePackages.value.length,
+)
+const visiblePackages = computed(() =>
+  packages.value.filter((item) => item.is_active === (packageFilter.value === 'active')),
+)
+const selectedSalePackage = computed(() =>
+  salePackages.value.find((item) => item.id === packageSaleDraft.value.package_definition_id && item.is_active),
 )
 const outstandingValues = computed(() =>
   summary.value
-    ? summary.value.outstanding.map(
-        (item) => [item.currency, item.amount_minor] as [string, number],
-      )
+    ? summary.value.outstanding.map((item) => [item.currency, item.amount_minor] as [string, number])
     : currencyTotals(
         invoices.value.map((invoice) => ({
           amount_minor: Math.max(0, invoice.due_minor || 0),
@@ -146,14 +189,8 @@ const outstandingValues = computed(() =>
 )
 const collectedValues = computed(() =>
   summary.value
-    ? summary.value.collected_charges.map(
-        (item) => [item.currency, item.amount_minor] as [string, number],
-      )
-    : currencyTotals(
-        payments.value.filter(
-          (payment) => payment.status === 'succeeded' && payment.type === 'charge',
-        ),
-      ),
+    ? summary.value.collected_charges.map((item) => [item.currency, item.amount_minor] as [string, number])
+    : currencyTotals(payments.value.filter((payment) => payment.status === 'succeeded' && payment.type === 'charge')),
 )
 
 function money(amountMinor: number, currency = 'MYR') {
@@ -178,7 +215,11 @@ function moneyTotals(items: Array<[string, number]>) {
 
 function date(value?: string) {
   if (!value) return '—'
-  return new Intl.DateTimeFormat('en-MY', { day: 'numeric', month: 'short', year: 'numeric' }).format(new Date(value))
+  return new Intl.DateTimeFormat('en-MY', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  }).format(new Date(value))
 }
 
 function totalFromResponse(response: any) {
@@ -217,29 +258,40 @@ function paymentAmount(payment: PaymentRecord) {
 }
 
 async function load() {
+  const sequence = ++loadSequence
   loading.value = true
+  packageLoadError.value = ''
   try {
-    const [packageResponse, contactPackageResponse, bookingServiceResponse, invoiceResponse, paymentResponse, summaryResponse] = await Promise.all([
-      canReadPackages.value
-        ? commerceService.allPackages()
-        : Promise.resolve(null),
-      canReadPackages.value
-        ? commerceService.contactPackages({ limit: 100 })
-        : Promise.resolve(null),
-      canCreatePackages.value
-        ? bookingService.allServices()
-        : Promise.resolve(null),
-      canReadPayments.value
-        ? commerceService.invoices({ limit: 100 })
-        : Promise.resolve(null),
-      canReadPayments.value
-        ? commerceService.payments({ limit: 100 })
-        : Promise.resolve(null),
-      canReadPayments.value
-        ? commerceService.summary()
-        : Promise.resolve(null),
+    const packageRequest = canReadPackages.value
+      ? commerceService.allPackages({
+          active: packageFilter.value === 'active',
+        })
+      : Promise.resolve(null)
+    // The catalogue filter must not remove active choices from customer sales.
+    const salePackageRequest =
+      canReadPackages.value && packageFilter.value === 'retired'
+        ? commerceService.allPackages({ active: true })
+        : packageRequest
+    const [
+      packageResponse,
+      salePackageResponse,
+      contactPackageResponse,
+      bookingServiceResponse,
+      invoiceResponse,
+      paymentResponse,
+      summaryResponse,
+    ] = await Promise.all([
+      packageRequest,
+      salePackageRequest,
+      canReadPackages.value ? commerceService.contactPackages({ limit: 100 }) : Promise.resolve(null),
+      canCreatePackages.value ? bookingService.allServices() : Promise.resolve(null),
+      canReadPayments.value ? commerceService.invoices({ limit: 100 }) : Promise.resolve(null),
+      canReadPayments.value ? commerceService.payments({ limit: 100 }) : Promise.resolve(null),
+      canReadPayments.value ? commerceService.summary() : Promise.resolve(null),
     ])
+    if (sequence !== loadSequence) return
     packages.value = packageResponse ?? []
+    salePackages.value = (salePackageResponse ?? []).filter((item) => item.is_active)
     contactPackages.value = contactPackageResponse
       ? unwrapListResponse<ContactPackage>(contactPackageResponse, 'contact_packages')
       : []
@@ -251,25 +303,138 @@ async function load() {
     }
     if (
       !packageSaleDraft.value.package_definition_id ||
-      !packages.value.some((item) => item.id === packageSaleDraft.value.package_definition_id && item.is_active)
+      !salePackages.value.some((item) => item.id === packageSaleDraft.value.package_definition_id)
     ) {
-      packageSaleDraft.value.package_definition_id = packages.value.find((item) => item.is_active)?.id ?? ''
+      packageSaleDraft.value.package_definition_id = salePackages.value[0]?.id ?? ''
     }
-    invoices.value = invoiceResponse
-      ? unwrapListResponse<CommerceInvoice>(invoiceResponse, 'invoices')
-      : []
+    invoices.value = invoiceResponse ? unwrapListResponse<CommerceInvoice>(invoiceResponse, 'invoices') : []
     invoiceTotal.value = invoiceResponse ? totalFromResponse(invoiceResponse) : 0
     invoicePage.value = 1
-    payments.value = paymentResponse
-      ? unwrapListResponse<PaymentRecord>(paymentResponse, 'payments')
-      : []
+    payments.value = paymentResponse ? unwrapListResponse<PaymentRecord>(paymentResponse, 'payments') : []
     paymentTotal.value = paymentResponse ? totalFromResponse(paymentResponse) : 0
     paymentPage.value = 1
     summary.value = summaryResponse ? unwrapItemResponse<CommerceSummary>(summaryResponse) : null
   } catch (error) {
+    if (sequence !== loadSequence) return
+    packageLoadError.value = getErrorMessage(error)
     toast.error('Commerce desk could not be loaded', getErrorMessage(error))
   } finally {
-    loading.value = false
+    if (sequence === loadSequence) loading.value = false
+  }
+}
+
+function startPackageEdit(pkg: PackageDefinition) {
+  if (!canWritePackages.value || packageSaving.value) return
+  editingPackage.value = { ...pkg, metadata: { ...pkg.metadata } }
+  packageEditDraft.value = {
+    name: pkg.name,
+    description: pkg.description ?? '',
+    price: (pkg.price_minor / 100).toFixed(2),
+    currency: pkg.currency,
+    validity_days: pkg.validity_days,
+  }
+  packageEditError.value = ''
+  packageEditOpen.value = true
+}
+
+function setPackageEditOpen(open: boolean) {
+  if (packageSaving.value) return
+  packageEditOpen.value = open
+  if (!open) editingPackage.value = null
+}
+
+async function savePackageEdit() {
+  const pkg = editingPackage.value
+  if (!pkg || packageSaving.value) return
+  if (!canWritePackages.value) {
+    packageEditError.value = 'Package write access is required to save changes.'
+    return
+  }
+  const priceMinor = Math.round(Number(packageEditDraft.value.price) * 100)
+  const currency = packageEditDraft.value.currency.trim().toUpperCase()
+  const validityDays = Number(packageEditDraft.value.validity_days)
+  if (
+    !packageEditDraft.value.name.trim() ||
+    !String(packageEditDraft.value.price).trim() ||
+    !Number.isSafeInteger(priceMinor) ||
+    priceMinor < 0 ||
+    !/^[A-Z]{3}$/.test(currency) ||
+    !Number.isInteger(validityDays) ||
+    validityDays < 1 ||
+    validityDays > 3650
+  ) {
+    packageEditError.value =
+      'Enter a name, a valid non-negative price, a three-letter currency and 1–3650 days validity.'
+    return
+  }
+  packageSaving.value = true
+  packageEditError.value = ''
+  try {
+    await commerceService.updatePackage(pkg.id, {
+      name: packageEditDraft.value.name.trim(),
+      description: packageEditDraft.value.description.trim(),
+      price_minor: priceMinor,
+      currency,
+      validity_days: validityDays,
+      version: pkg.version,
+      metadata: pkg.metadata ?? {},
+      // Omit is_active and entitlements: editing never retires, restores or
+      // rewrites service-credit rules, including for previously sold packages.
+    })
+    packageEditOpen.value = false
+    editingPackage.value = null
+    toast.success('Package updated', 'Existing customer plans, credit rules and ledger records are unchanged.')
+    await load()
+  } catch (error) {
+    packageEditError.value = getErrorMessage(error, 'Package could not be updated. Your draft is still here.')
+  } finally {
+    packageSaving.value = false
+  }
+}
+
+function startPackageRetirement(pkg: PackageDefinition) {
+  if (!canRetirePackages.value || !pkg.is_active || packageSaving.value) return
+  packageToRetire.value = { ...pkg, metadata: { ...pkg.metadata } }
+  packageRetireError.value = ''
+}
+
+function setPackageRetirementOpen(open: boolean) {
+  if (!open && !packageSaving.value) packageToRetire.value = null
+}
+
+async function retirePackage() {
+  const pkg = packageToRetire.value
+  if (!pkg || packageSaving.value) return
+  if (!canRetirePackages.value) {
+    packageRetireError.value = 'Package write and delete access are both required to retire this package.'
+    return
+  }
+  packageSaving.value = true
+  packageRetireError.value = ''
+  try {
+    await commerceService.updatePackage(pkg.id, {
+      name: pkg.name,
+      description: pkg.description ?? '',
+      price_minor: pkg.price_minor,
+      currency: pkg.currency,
+      validity_days: pkg.validity_days,
+      version: pkg.version,
+      metadata: pkg.metadata ?? {},
+      is_active: false,
+    })
+    // Remove it from new-sale choices immediately, even if the refresh fails.
+    salePackages.value = salePackages.value.filter((item) => item.id !== pkg.id)
+    packages.value = packages.value.map((item) => (item.id === pkg.id ? { ...item, is_active: false } : item))
+    if (packageSaleDraft.value.package_definition_id === pkg.id) {
+      packageSaleDraft.value.package_definition_id = salePackages.value[0]?.id ?? ''
+    }
+    packageToRetire.value = null
+    toast.success('Package retired', 'New sales are blocked. Existing customer plans, credits and history are kept.')
+    await load()
+  } catch (error) {
+    packageRetireError.value = getErrorMessage(error, 'Package could not be retired. Refresh and retry.')
+  } finally {
+    packageSaving.value = false
   }
 }
 
@@ -279,7 +444,10 @@ async function loadMoreCommerce(kind: 'contact-packages' | 'invoices' | 'payment
   try {
     if (kind === 'contact-packages') {
       const nextPage = contactPackagePage.value + 1
-      const response = await commerceService.contactPackages({ page: nextPage, limit: 100 })
+      const response = await commerceService.contactPackages({
+        page: nextPage,
+        limit: 100,
+      })
       const incoming = unwrapListResponse<ContactPackage>(response, 'contact_packages')
       const existing = new Set(contactPackages.value.map((item) => item.id))
       contactPackages.value.push(...incoming.filter((item) => !existing.has(item.id)))
@@ -289,7 +457,10 @@ async function loadMoreCommerce(kind: 'contact-packages' | 'invoices' | 'payment
     }
     if (kind === 'invoices') {
       const nextPage = invoicePage.value + 1
-      const response = await commerceService.invoices({ page: nextPage, limit: 100 })
+      const response = await commerceService.invoices({
+        page: nextPage,
+        limit: 100,
+      })
       const incoming = unwrapListResponse<CommerceInvoice>(response, 'invoices')
       const existing = new Set(invoices.value.map((item) => item.id))
       invoices.value.push(...incoming.filter((item) => !existing.has(item.id)))
@@ -298,7 +469,10 @@ async function loadMoreCommerce(kind: 'contact-packages' | 'invoices' | 'payment
       return
     }
     const nextPage = paymentPage.value + 1
-    const response = await commerceService.payments({ page: nextPage, limit: 100 })
+    const response = await commerceService.payments({
+      page: nextPage,
+      limit: 100,
+    })
     const incoming = unwrapListResponse<PaymentRecord>(response, 'payments')
     const existing = new Set(payments.value.map((item) => item.id))
     payments.value.push(...incoming.filter((item) => !existing.has(item.id)))
@@ -312,8 +486,9 @@ async function loadMoreCommerce(kind: 'contact-packages' | 'invoices' | 'payment
 }
 
 async function sellOrGrantPackage() {
-  const definition = packages.value.find((item) => item.id === packageSaleDraft.value.package_definition_id)
-  if (!definition || !packageSaleDraft.value.contact_id || !canAssignPackages.value) {
+  const definition = selectedSalePackage.value
+  if (saving.value || loading.value || packageSaving.value) return
+  if (!definition?.is_active || !packageSaleDraft.value.contact_id || !canAssignPackages.value) {
     toast.warning('Choose an active package and customer')
     return
   }
@@ -541,7 +716,9 @@ onMounted(() => {
     </PageHeader>
 
     <main class="mx-auto max-w-[1500px] space-y-6 p-5 md:p-7">
-      <section class="relative overflow-hidden rounded-[28px] border border-emerald-300/15 bg-[#10201a] px-6 py-6 light:border-emerald-200 light:bg-[#123e32]">
+      <section
+        class="relative overflow-hidden rounded-[28px] border border-emerald-300/15 bg-[#10201a] px-6 py-6 light:border-emerald-200 light:bg-[#123e32]"
+      >
         <div class="absolute -right-16 -top-24 h-64 w-64 rounded-full bg-emerald-300/15 blur-3xl" />
         <div class="relative grid gap-5 md:grid-cols-[1.2fr_repeat(3,.6fr)] md:items-end">
           <div>
@@ -550,38 +727,74 @@ onMounted(() => {
               Sell care plans with a ledger your team can trust.
             </h2>
             <p class="mt-2 max-w-lg text-sm leading-6 text-emerald-50/50">
-              Money is stored in minor units, payment retries are idempotent, and every organization keeps its own ledger.
+              Money is stored in minor units, payment retries are idempotent, and every organization keeps its own
+              ledger.
             </p>
           </div>
-          <div v-for="metric in [
-            { label: 'Active packages', value: activePackages, text: '' },
-            { label: 'Tenant outstanding', value: moneyTotals(outstandingValues), text: '' },
-            { label: 'Tenant collected charges', value: moneyTotals(collectedValues), text: '' },
-          ]" :key="metric.label" class="rounded-2xl border border-white/10 bg-black/15 p-4">
-            <p class="text-[10px] uppercase tracking-[0.17em] text-white/40">{{ metric.label }}</p>
-            <p class="mt-2 text-xl font-semibold text-white">{{ metric.value }}</p>
+          <div
+            v-for="metric in [
+              { label: 'Active packages', value: activePackages, text: '' },
+              {
+                label: 'Tenant outstanding',
+                value: moneyTotals(outstandingValues),
+                text: '',
+              },
+              {
+                label: 'Tenant collected charges',
+                value: moneyTotals(collectedValues),
+                text: '',
+              },
+            ]"
+            :key="metric.label"
+            class="rounded-2xl border border-white/10 bg-black/15 p-4"
+          >
+            <p class="text-[10px] uppercase tracking-[0.17em] text-white/40">
+              {{ metric.label }}
+            </p>
+            <p class="mt-2 text-xl font-semibold text-white">
+              {{ metric.value }}
+            </p>
           </div>
         </div>
       </section>
 
-      <div
-        class="grid gap-6"
-        :class="showCommerceAside ? 'xl:grid-cols-[minmax(0,1fr)_390px]' : 'xl:grid-cols-1'"
-      >
-        <section class="min-w-0 overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.025] light:border-black/10 light:bg-white">
-          <div class="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.07] px-5 py-4 light:border-black/10">
+      <div class="grid gap-6" :class="showCommerceAside ? 'xl:grid-cols-[minmax(0,1fr)_390px]' : 'xl:grid-cols-1'">
+        <section
+          class="min-w-0 overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.025] light:border-black/10 light:bg-white"
+        >
+          <div
+            class="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.07] px-5 py-4 light:border-black/10"
+          >
             <div class="flex rounded-lg bg-black/20 p-1 light:bg-gray-100">
               <button
                 v-for="item in commerceTabs"
                 :key="item.key"
                 class="flex items-center gap-2 rounded-md px-3 py-2 text-xs font-medium transition"
-                :class="tab === item.key ? 'bg-white text-gray-950 shadow-sm' : 'text-white/45 hover:text-white light:text-gray-500'"
+                :class="
+                  tab === item.key
+                    ? 'bg-white text-gray-950 shadow-sm'
+                    : 'text-white/45 hover:text-white light:text-gray-500'
+                "
                 @click="tab = item.key as typeof tab"
               >
                 <component :is="item.icon" class="h-3.5 w-3.5" />
                 {{ item.label }}
               </button>
             </div>
+            <label v-if="tab === 'packages'" class="flex items-center gap-2 text-xs text-white/70 light:text-gray-700">
+              <span>Package status</span>
+              <select
+                v-model="packageFilter"
+                data-testid="package-status-filter"
+                aria-label="Package status"
+                class="h-11 cursor-pointer rounded-lg border border-white/15 bg-[#15201c] px-3 text-sm text-white outline-none focus-visible:ring-2 focus-visible:ring-emerald-300 light:border-gray-300 light:bg-white light:text-gray-900"
+                :disabled="packageSaving"
+                @change="load"
+              >
+                <option value="active">Active</option>
+                <option value="retired">Retired</option>
+              </select>
+            </label>
             <div class="flex items-center gap-2 text-[11px] text-white/35 light:text-gray-500">
               <ShieldCheck class="h-3.5 w-3.5 text-emerald-300" />
               Tenant-isolated ledger
@@ -593,18 +806,37 @@ onMounted(() => {
           </div>
 
           <div v-else-if="tab === 'packages'" class="grid gap-4 p-5 md:grid-cols-2">
+            <p
+              v-if="packageLoadError"
+              role="alert"
+              class="col-span-full rounded-xl border border-amber-300/25 p-3 text-sm text-amber-100 light:border-amber-300 light:text-amber-900"
+            >
+              {{ packageLoadError }} Use Refresh to try again.
+            </p>
+            <p
+              v-if="packageFilter === 'retired'"
+              class="col-span-full text-sm leading-6 text-white/65 light:text-gray-600"
+            >
+              Retired packages cannot be sold or granted again. Existing customer plans, credits, invoices and booking
+              history are kept.
+            </p>
             <article
-              v-for="item in packages"
+              v-for="item in visiblePackages"
               :key="item.id"
+              :data-testid="`package-card-${item.id}`"
               class="rounded-2xl border border-white/[0.08] bg-gradient-to-br from-white/[0.04] to-transparent p-5 light:border-black/10 light:from-gray-50"
             >
               <div class="flex items-start justify-between gap-3">
                 <div>
-                  <p class="font-semibold text-white light:text-gray-900">{{ item.name }}</p>
-                  <p class="mt-1 line-clamp-2 text-xs leading-5 text-white/40 light:text-gray-500">{{ item.description || 'No description' }}</p>
+                  <p class="font-semibold text-white light:text-gray-900">
+                    {{ item.name }}
+                  </p>
+                  <p class="mt-1 line-clamp-2 text-xs leading-5 text-white/40 light:text-gray-500">
+                    {{ item.description || 'No description' }}
+                  </p>
                 </div>
                 <Badge variant="outline" :class="item.is_active ? 'border-emerald-400/25 text-emerald-300' : ''">
-                  {{ item.is_active ? 'Active' : 'Inactive' }}
+                  {{ item.is_active ? 'Active' : 'Retired' }}
                 </Badge>
               </div>
               <p class="mt-6 text-2xl font-semibold tracking-tight text-white light:text-gray-950">
@@ -614,11 +846,50 @@ onMounted(() => {
                 <span>{{ item.validity_days }} days validity</span>
                 <span>{{ item.entitlements?.length || 0 }} credit rules</span>
               </div>
+              <div
+                v-if="canWritePackages"
+                class="mt-5 flex flex-wrap gap-2 border-t border-white/10 pt-4 light:border-gray-200"
+              >
+                <Button
+                  type="button"
+                  variant="outline"
+                  class="min-h-11 cursor-pointer gap-2"
+                  :aria-label="`Edit ${item.name}`"
+                  :disabled="packageSaving"
+                  @click="startPackageEdit(item)"
+                >
+                  <Pencil class="h-4 w-4" />
+                  Edit
+                </Button>
+                <Button
+                  v-if="item.is_active && canRetirePackages"
+                  type="button"
+                  variant="outline"
+                  class="min-h-11 cursor-pointer gap-2 border-rose-300/30 text-rose-200 hover:bg-rose-300/10 light:border-rose-300 light:text-rose-700 light:hover:bg-rose-50"
+                  :aria-label="`Retire ${item.name}`"
+                  :disabled="packageSaving"
+                  @click="startPackageRetirement(item)"
+                >
+                  <Archive class="h-4 w-4" />
+                  Retire
+                </Button>
+              </div>
             </article>
-            <div v-if="!packages.length" class="col-span-full flex h-64 flex-col items-center justify-center text-center">
+            <div
+              v-if="!visiblePackages.length && !packageLoadError"
+              class="col-span-full flex h-64 flex-col items-center justify-center text-center"
+            >
               <Package class="h-8 w-8 text-white/20 light:text-gray-300" />
-              <p class="mt-3 text-sm font-medium text-white light:text-gray-900">No packages yet</p>
-              <p class="mt-1 text-xs text-white/40 light:text-gray-500">Create your first sellable care plan from the panel.</p>
+              <p class="mt-3 text-sm font-medium text-white light:text-gray-900">
+                {{ packageFilter === 'retired' ? 'No retired packages' : 'No active packages' }}
+              </p>
+              <p class="mt-1 text-xs text-white/40 light:text-gray-500">
+                {{
+                  packageFilter === 'retired'
+                    ? 'Retired offerings will remain available here for reference.'
+                    : 'Create a sellable care plan from the panel, or view Retired packages.'
+                }}
+              </p>
             </div>
           </div>
 
@@ -626,6 +897,7 @@ onMounted(() => {
             <article
               v-for="item in contactPackages"
               :key="item.id"
+              :data-testid="`customer-plan-${item.id}`"
               class="rounded-2xl border border-white/[0.08] bg-gradient-to-br from-white/[0.04] to-transparent p-5 light:border-black/10 light:from-gray-50"
             >
               <div class="flex items-start justify-between gap-3">
@@ -648,17 +920,24 @@ onMounted(() => {
                 </div>
                 <div class="rounded-xl bg-black/10 p-3 light:bg-white">
                   <p class="text-white/35 light:text-gray-500">Expires</p>
-                  <p class="mt-1 font-medium text-white light:text-gray-900">{{ date(item.expires_at) }}</p>
+                  <p class="mt-1 font-medium text-white light:text-gray-900">
+                    {{ date(item.expires_at) }}
+                  </p>
                 </div>
               </div>
               <p class="mt-3 text-[10px] text-white/30 light:text-gray-400">
                 {{ item.invoice_id ? 'Invoice-backed sale' : 'Complimentary / manual grant' }}
               </p>
             </article>
-            <div v-if="!contactPackages.length" class="col-span-full flex h-64 flex-col items-center justify-center text-center">
+            <div
+              v-if="!contactPackages.length"
+              class="col-span-full flex h-64 flex-col items-center justify-center text-center"
+            >
               <ShieldCheck class="h-8 w-8 text-white/20 light:text-gray-300" />
               <p class="mt-3 text-sm font-medium text-white light:text-gray-900">No customer plans yet</p>
-              <p class="mt-1 text-xs text-white/40 light:text-gray-500">Sell or grant an active package from the panel.</p>
+              <p class="mt-1 text-xs text-white/40 light:text-gray-500">
+                Sell or grant an active package from the panel.
+              </p>
             </div>
             <div v-if="contactPackages.length < contactPackageTotal" class="col-span-full text-center">
               <Button variant="outline" :disabled="loadingMore" @click="loadMoreCommerce('contact-packages')">
@@ -670,7 +949,9 @@ onMounted(() => {
 
           <div v-else-if="tab === 'invoices'" class="overflow-x-auto">
             <table class="w-full min-w-[720px] text-left">
-              <thead class="border-b border-white/[0.07] text-[10px] uppercase tracking-[0.18em] text-white/35 light:border-black/10 light:text-gray-500">
+              <thead
+                class="border-b border-white/[0.07] text-[10px] uppercase tracking-[0.18em] text-white/35 light:border-black/10 light:text-gray-500"
+              >
                 <tr>
                   <th class="px-5 py-3 font-medium">Invoice</th>
                   <th class="px-5 py-3 font-medium">Issued</th>
@@ -682,11 +963,21 @@ onMounted(() => {
               </thead>
               <tbody class="divide-y divide-white/[0.06] light:divide-black/[0.06]">
                 <tr v-for="invoice in invoices" :key="invoice.id" class="text-sm">
-                  <td class="px-5 py-4 font-medium text-white light:text-gray-900">{{ invoice.invoice_number }}</td>
-                  <td class="px-5 py-4 text-white/45 light:text-gray-500">{{ date(invoice.issued_at) }}</td>
-                  <td class="px-5 py-4 text-white light:text-gray-900">{{ money(invoice.total_minor, invoice.currency) }}</td>
-                  <td class="px-5 py-4 text-white/55 light:text-gray-600">{{ money(invoice.due_minor, invoice.currency) }}</td>
-                  <td class="px-5 py-4"><Badge variant="outline" class="capitalize">{{ invoice.status }}</Badge></td>
+                  <td class="px-5 py-4 font-medium text-white light:text-gray-900">
+                    {{ invoice.invoice_number }}
+                  </td>
+                  <td class="px-5 py-4 text-white/45 light:text-gray-500">
+                    {{ date(invoice.issued_at) }}
+                  </td>
+                  <td class="px-5 py-4 text-white light:text-gray-900">
+                    {{ money(invoice.total_minor, invoice.currency) }}
+                  </td>
+                  <td class="px-5 py-4 text-white/55 light:text-gray-600">
+                    {{ money(invoice.due_minor, invoice.currency) }}
+                  </td>
+                  <td class="px-5 py-4">
+                    <Badge variant="outline" class="capitalize">{{ invoice.status }}</Badge>
+                  </td>
                   <td v-if="canWritePayments" class="px-5 py-4">
                     <Button
                       v-if="invoice.status === 'open' && invoice.due_minor > 0"
@@ -701,7 +992,9 @@ onMounted(() => {
                 </tr>
               </tbody>
             </table>
-            <p v-if="!invoices.length" class="py-24 text-center text-sm text-white/35 light:text-gray-500">No invoices recorded.</p>
+            <p v-if="!invoices.length" class="py-24 text-center text-sm text-white/35 light:text-gray-500">
+              No invoices recorded.
+            </p>
             <div v-if="invoices.length < invoiceTotal" class="p-4 text-center">
               <Button variant="outline" :disabled="loadingMore" @click="loadMoreCommerce('invoices')">
                 <Loader2 v-if="loadingMore" class="mr-2 h-4 w-4 animate-spin" />
@@ -717,19 +1010,25 @@ onMounted(() => {
                 <RefreshCw v-else class="h-5 w-5" />
               </div>
               <div class="min-w-0 flex-1">
-                <p class="text-sm font-medium text-white light:text-gray-900">{{ paymentProvider(payment) }}</p>
+                <p class="text-sm font-medium text-white light:text-gray-900">
+                  {{ paymentProvider(payment) }}
+                </p>
                 <p class="mt-0.5 text-xs capitalize text-white/35 light:text-gray-500">
                   {{ payment.type }} · {{ date(payment.occurred_at) }}
                 </p>
               </div>
               <div class="text-right">
-                <p class="text-sm font-semibold text-white light:text-gray-900">{{ paymentAmount(payment) }}</p>
+                <p class="text-sm font-semibold text-white light:text-gray-900">
+                  {{ paymentAmount(payment) }}
+                </p>
                 <p class="mt-0.5 text-[10px] uppercase tracking-wider" :class="paymentTone(payment).status">
                   {{ payment.status }}
                 </p>
               </div>
             </article>
-            <p v-if="!payments.length" class="py-24 text-center text-sm text-white/35 light:text-gray-500">No payments recorded.</p>
+            <p v-if="!payments.length" class="py-24 text-center text-sm text-white/35 light:text-gray-500">
+              No payments recorded.
+            </p>
             <div v-if="payments.length < paymentTotal" class="p-4 text-center">
               <Button variant="outline" :disabled="loadingMore" @click="loadMoreCommerce('payments')">
                 <Loader2 v-if="loadingMore" class="mr-2 h-4 w-4 animate-spin" />
@@ -739,29 +1038,57 @@ onMounted(() => {
           </div>
         </section>
 
-        <aside v-if="tab === 'packages' && canCreatePackages" class="h-fit rounded-[24px] border border-emerald-300/15 bg-emerald-300/[0.045] p-5 light:border-emerald-200 light:bg-emerald-50">
-          <p class="text-[10px] font-semibold uppercase tracking-[0.22em] text-emerald-300 light:text-emerald-700">New offering</p>
+        <aside
+          v-if="tab === 'packages' && canCreatePackages"
+          class="h-fit rounded-[24px] border border-emerald-300/15 bg-emerald-300/[0.045] p-5 light:border-emerald-200 light:bg-emerald-50"
+        >
+          <p class="text-[10px] font-semibold uppercase tracking-[0.22em] text-emerald-300 light:text-emerald-700">
+            New offering
+          </p>
           <h3 class="mt-2 text-xl font-semibold text-white light:text-gray-950">Create a package</h3>
           <p class="mt-2 text-xs leading-5 text-white/40 light:text-gray-600">
             Every package starts with an explicit service-credit rule so it cannot be sold without a deliverable.
           </p>
-          <form class="mt-6 space-y-4" @submit.prevent="createPackage">
+          <form data-testid="package-create-form" class="mt-6 space-y-4" @submit.prevent="createPackage">
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Package name</span>
-              <input v-model="draft.name" required maxlength="255" placeholder="Pilates starter · 5 sessions" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none placeholder:text-white/25 focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+              <input
+                v-model="draft.name"
+                required
+                maxlength="255"
+                placeholder="Pilates starter · 5 sessions"
+                class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none placeholder:text-white/25 focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+              />
             </label>
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Description</span>
-              <textarea v-model="draft.description" rows="3" maxlength="2000" placeholder="Who this is for and what it includes…" class="w-full resize-none rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm text-white outline-none placeholder:text-white/25 focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+              <textarea
+                v-model="draft.description"
+                rows="3"
+                maxlength="2000"
+                placeholder="Who this is for and what it includes…"
+                class="w-full resize-none rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm text-white outline-none placeholder:text-white/25 focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+              />
             </label>
             <div class="grid grid-cols-[1fr_90px] gap-3">
               <label>
                 <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Price</span>
-                <input v-model="draft.price" required min="0" step="0.01" type="number" placeholder="399.00" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                <input
+                  v-model="draft.price"
+                  required
+                  min="0"
+                  step="0.01"
+                  type="number"
+                  placeholder="399.00"
+                  class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                />
               </label>
               <label>
                 <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Currency</span>
-                <select v-model="draft.currency" class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-2 text-sm text-white outline-none light:border-gray-200 light:bg-white light:text-gray-900">
+                <select
+                  v-model="draft.currency"
+                  class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-2 text-sm text-white outline-none light:border-gray-200 light:bg-white light:text-gray-900"
+                >
                   <option value="MYR">MYR</option>
                   <option value="SGD">SGD</option>
                   <option value="USD">USD</option>
@@ -770,11 +1097,22 @@ onMounted(() => {
             </div>
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Validity (days)</span>
-              <input v-model.number="draft.validity_days" required min="1" max="3650" type="number" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+              <input
+                v-model.number="draft.validity_days"
+                required
+                min="1"
+                max="3650"
+                type="number"
+                class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+              />
             </label>
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Included service</span>
-              <select v-model="draft.booking_service_id" required class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-3 text-sm text-white outline-none light:border-gray-200 light:bg-white light:text-gray-900">
+              <select
+                v-model="draft.booking_service_id"
+                required
+                class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-3 text-sm text-white outline-none light:border-gray-200 light:bg-white light:text-gray-900"
+              >
                 <option value="" disabled>Select a service</option>
                 <option v-for="service in bookingServices" :key="service.id" :value="service.id">
                   {{ service.name }}
@@ -784,17 +1122,34 @@ onMounted(() => {
             <div class="grid grid-cols-[1fr_auto] items-end gap-3">
               <label>
                 <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Credits</span>
-                <input v-model.number="draft.credits" :disabled="draft.is_unlimited" required min="1" max="100000" type="number" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none disabled:opacity-45 focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                <input
+                  v-model.number="draft.credits"
+                  :disabled="draft.is_unlimited"
+                  required
+                  min="1"
+                  max="100000"
+                  type="number"
+                  class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none disabled:opacity-45 focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                />
               </label>
-              <label class="flex h-11 items-center gap-2 rounded-xl border border-white/10 bg-black/15 px-3 text-xs text-white/65 light:border-gray-200 light:bg-white light:text-gray-700">
+              <label
+                class="flex h-11 items-center gap-2 rounded-xl border border-white/10 bg-black/15 px-3 text-xs text-white/65 light:border-gray-200 light:bg-white light:text-gray-700"
+              >
                 <input v-model="draft.is_unlimited" type="checkbox" class="accent-emerald-400" />
                 Unlimited
               </label>
             </div>
-            <p v-if="!bookingServices.length" class="rounded-xl border border-amber-300/15 bg-amber-300/[0.04] p-3 text-xs leading-5 text-amber-100/65">
+            <p
+              v-if="!bookingServices.length"
+              class="rounded-xl border border-amber-300/15 bg-amber-300/[0.04] p-3 text-xs leading-5 text-amber-100/65"
+            >
               Create and activate a booking service before creating a package.
             </p>
-            <Button type="submit" class="h-11 w-full gap-2 bg-emerald-500 text-gray-950 hover:bg-emerald-400" :disabled="saving || !draft.name.trim() || !draft.price || !draft.booking_service_id">
+            <Button
+              type="submit"
+              class="h-11 w-full gap-2 bg-emerald-500 text-gray-950 hover:bg-emerald-400"
+              :disabled="saving || !draft.name.trim() || !draft.price || !draft.booking_service_id"
+            >
               <Loader2 v-if="saving" class="h-4 w-4 animate-spin" />
               <Plus v-else class="h-4 w-4" />
               Create package
@@ -805,7 +1160,8 @@ onMounted(() => {
           v-else-if="tab === 'packages' && canWritePackages"
           class="rounded-2xl border border-amber-300/15 bg-amber-300/[0.035] p-4 text-xs leading-5 text-amber-100/65"
         >
-          Package creation also requires read access to booking settings so every package can be tied to a valid service.
+          Package creation also requires read access to booking settings so every package can be tied to a valid
+          service.
         </aside>
         <aside
           v-else-if="tab === 'customer-plans' && canAssignPackages"
@@ -818,38 +1174,62 @@ onMounted(() => {
           <p class="mt-2 text-xs leading-5 text-white/40 light:text-gray-600">
             Invoice-backed credits remain pending until payment. Complimentary grants activate immediately.
           </p>
-          <form class="mt-6 space-y-4" @submit.prevent="sellOrGrantPackage">
+          <form data-testid="package-sale-form" class="mt-6 space-y-4" @submit.prevent="sellOrGrantPackage">
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Customer</span>
               <ContactPicker v-model="packageSaleDraft.contact_id" />
             </label>
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Package</span>
-              <select v-model="packageSaleDraft.package_definition_id" required class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900">
+              <select
+                v-model="packageSaleDraft.package_definition_id"
+                data-testid="package-sale-selection"
+                required
+                class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
+              >
                 <option value="" disabled>Select a package</option>
-                <option v-for="item in packages.filter((entry) => entry.is_active)" :key="item.id" :value="item.id">
+                <option v-for="item in salePackages" :key="item.id" :value="item.id">
                   {{ item.name }} · {{ money(item.price_minor, item.currency) }}
                 </option>
               </select>
             </label>
             <label class="block">
               <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Fulfillment mode</span>
-              <select v-model="packageSaleDraft.mode" class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900">
+              <select
+                v-model="packageSaleDraft.mode"
+                class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
+              >
                 <option value="invoice" :disabled="!canSellPackages">Create invoice (recommended)</option>
                 <option value="grant">Complimentary grant</option>
               </select>
             </label>
             <label v-if="packageSaleDraft.mode === 'invoice'" class="block">
-              <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Due date (optional)</span>
-              <input v-model="packageSaleDraft.due_date" type="date" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900" />
+              <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700"
+                >Due date (optional)</span
+              >
+              <input
+                v-model="packageSaleDraft.due_date"
+                type="date"
+                class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
+              />
             </label>
-            <label v-else class="flex items-start gap-3 rounded-xl border border-amber-300/15 bg-amber-300/[0.04] p-3 text-xs leading-5 text-amber-100/70">
+            <label
+              v-else
+              class="flex items-start gap-3 rounded-xl border border-amber-300/15 bg-amber-300/[0.04] p-3 text-xs leading-5 text-amber-100/70"
+            >
               Complimentary grants create live credits without collecting payment. Use only with documented approval.
             </label>
             <Button
               type="submit"
               class="h-11 w-full bg-emerald-500 text-gray-950 hover:bg-emerald-400"
-              :disabled="saving || !packageSaleDraft.contact_id || !packageSaleDraft.package_definition_id"
+              :disabled="
+                saving ||
+                loading ||
+                packageSaving ||
+                !packageSaleDraft.contact_id ||
+                !selectedSalePackage ||
+                (packageSaleDraft.mode === 'invoice' && !canSellPackages)
+              "
             >
               <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
               {{ packageSaleDraft.mode === 'invoice' ? 'Create sale' : 'Grant package' }}
@@ -873,30 +1253,61 @@ onMounted(() => {
             <h3 class="mt-2 text-xl font-semibold text-white light:text-gray-950">Record a manual payment</h3>
             <p class="mt-2 text-xs leading-5 text-white/40 light:text-gray-600">
               {{ manualPaymentInvoice.invoice_number }} has
-              {{ money(manualPaymentInvoice.due_minor, manualPaymentInvoice.currency) }} outstanding.
-              Use this only after independently confirming the funds were received.
+              {{ money(manualPaymentInvoice.due_minor, manualPaymentInvoice.currency) }}
+              outstanding. Use this only after independently confirming the funds were received.
             </p>
             <form class="mt-6 space-y-4" @submit.prevent="recordManualPayment">
               <label class="block">
                 <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Amount received</span>
-                <input v-model="manualPaymentDraft.amount" required min="0.01" step="0.01" type="number" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                <input
+                  v-model="manualPaymentDraft.amount"
+                  required
+                  min="0.01"
+                  step="0.01"
+                  type="number"
+                  class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                />
               </label>
               <label class="block">
-                <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Bank / receipt reference</span>
-                <input v-model="manualPaymentDraft.reference" required maxlength="255" placeholder="Unique transaction reference" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none placeholder:text-white/25 focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700"
+                  >Bank / receipt reference</span
+                >
+                <input
+                  v-model="manualPaymentDraft.reference"
+                  required
+                  maxlength="255"
+                  placeholder="Unique transaction reference"
+                  class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none placeholder:text-white/25 focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                />
               </label>
               <label class="block">
                 <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Notes</span>
-                <textarea v-model="manualPaymentDraft.notes" rows="3" maxlength="2000" class="w-full resize-none rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                <textarea
+                  v-model="manualPaymentDraft.notes"
+                  rows="3"
+                  maxlength="2000"
+                  class="w-full resize-none rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                />
               </label>
-              <label class="flex items-start gap-3 rounded-xl border border-amber-300/15 bg-amber-300/[0.04] p-3 text-xs leading-5 text-amber-100/70 light:text-amber-900">
-                <input v-model="manualPaymentDraft.confirm_manual" required type="checkbox" class="mt-1 accent-emerald-400" />
+              <label
+                class="flex items-start gap-3 rounded-xl border border-amber-300/15 bg-amber-300/[0.04] p-3 text-xs leading-5 text-amber-100/70 light:text-amber-900"
+              >
+                <input
+                  v-model="manualPaymentDraft.confirm_manual"
+                  required
+                  type="checkbox"
+                  class="mt-1 accent-emerald-400"
+                />
                 I independently confirmed that these funds were received. This action updates the financial ledger and
                 cannot impersonate a provider callback.
               </label>
               <div class="grid grid-cols-2 gap-3">
                 <Button type="button" variant="outline" @click="manualPaymentInvoice = null">Cancel</Button>
-                <Button type="submit" class="bg-emerald-500 text-gray-950 hover:bg-emerald-400" :disabled="saving || !manualPaymentDraft.confirm_manual">
+                <Button
+                  type="submit"
+                  class="bg-emerald-500 text-gray-950 hover:bg-emerald-400"
+                  :disabled="saving || !manualPaymentDraft.confirm_manual"
+                >
                   <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
                   Record
                 </Button>
@@ -918,20 +1329,43 @@ onMounted(() => {
               </label>
               <label class="block">
                 <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Line description</span>
-                <input v-model="invoiceDraft.description" required maxlength="2000" placeholder="Assessment, service or product" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none placeholder:text-white/25 focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                <input
+                  v-model="invoiceDraft.description"
+                  required
+                  maxlength="2000"
+                  placeholder="Assessment, service or product"
+                  class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none placeholder:text-white/25 focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                />
               </label>
               <div class="grid grid-cols-[90px_1fr_90px] gap-3">
                 <label>
                   <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Qty</span>
-                  <input v-model.number="invoiceDraft.quantity" required min="1" max="100000" type="number" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                  <input
+                    v-model.number="invoiceDraft.quantity"
+                    required
+                    min="1"
+                    max="100000"
+                    type="number"
+                    class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                  />
                 </label>
                 <label>
                   <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Unit price</span>
-                  <input v-model="invoiceDraft.unit_price" required min="0" step="0.01" type="number" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                  <input
+                    v-model="invoiceDraft.unit_price"
+                    required
+                    min="0"
+                    step="0.01"
+                    type="number"
+                    class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                  />
                 </label>
                 <label>
                   <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Currency</span>
-                  <select v-model="invoiceDraft.currency" class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-2 text-sm text-white outline-none light:border-gray-200 light:bg-white light:text-gray-900">
+                  <select
+                    v-model="invoiceDraft.currency"
+                    class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-2 text-sm text-white outline-none light:border-gray-200 light:bg-white light:text-gray-900"
+                  >
                     <option value="MYR">MYR</option>
                     <option value="SGD">SGD</option>
                     <option value="USD">USD</option>
@@ -941,30 +1375,195 @@ onMounted(() => {
               <div class="grid grid-cols-2 gap-3">
                 <label>
                   <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Tax</span>
-                  <input v-model="invoiceDraft.tax" min="0" step="0.01" type="number" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                  <input
+                    v-model="invoiceDraft.tax"
+                    min="0"
+                    step="0.01"
+                    type="number"
+                    class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                  />
                 </label>
                 <label>
                   <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Discount</span>
-                  <input v-model="invoiceDraft.discount" min="0" step="0.01" type="number" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                  <input
+                    v-model="invoiceDraft.discount"
+                    min="0"
+                    step="0.01"
+                    type="number"
+                    class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                  />
                 </label>
               </div>
               <label class="block">
-                <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Due date (optional)</span>
-                <input v-model="invoiceDraft.due_date" type="date" class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900" />
+                <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700"
+                  >Due date (optional)</span
+                >
+                <input
+                  v-model="invoiceDraft.due_date"
+                  type="date"
+                  class="h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-emerald-300/50 light:border-gray-200 light:bg-white light:text-gray-900"
+                />
               </label>
-              <Button type="submit" class="h-11 w-full gap-2 bg-emerald-500 text-gray-950 hover:bg-emerald-400" :disabled="saving || !invoiceDraft.contact_id || !invoiceDraft.description.trim()">
+              <Button
+                type="submit"
+                class="h-11 w-full gap-2 bg-emerald-500 text-gray-950 hover:bg-emerald-400"
+                :disabled="saving || !invoiceDraft.contact_id || !invoiceDraft.description.trim()"
+              >
                 <Loader2 v-if="saving" class="h-4 w-4 animate-spin" />
                 <Receipt v-else class="h-4 w-4" />
                 Issue invoice
               </Button>
             </form>
           </template>
-          <div v-else class="rounded-xl border border-amber-300/15 bg-amber-300/[0.04] p-4 text-xs leading-5 text-amber-100/70">
+          <div
+            v-else
+            class="rounded-xl border border-amber-300/15 bg-amber-300/[0.04] p-4 text-xs leading-5 text-amber-100/70"
+          >
             You can review invoices and record verified payments, but issuing a customer invoice requires contact read
             access.
           </div>
         </aside>
       </div>
     </main>
+    <Dialog :open="packageEditOpen" @update:open="setPackageEditOpen">
+      <DialogContent class="max-h-[90vh] overflow-y-auto sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Edit package</DialogTitle>
+          <DialogDescription>
+            Change commercial details without changing purchased service-credit rules or existing customer balances.
+          </DialogDescription>
+        </DialogHeader>
+        <form v-if="editingPackage" id="package-edit-form" class="space-y-4" @submit.prevent="savePackageEdit">
+          <p class="text-sm text-muted-foreground">
+            {{ editingPackage.is_active ? 'Active package' : 'Retired package — saving does not reactivate it.' }}
+          </p>
+          <label class="block space-y-1.5">
+            <span class="text-sm font-medium">Package name</span>
+            <input
+              v-model="packageEditDraft.name"
+              data-testid="package-edit-name"
+              :disabled="packageSaving"
+              required
+              maxlength="255"
+              class="h-11 w-full rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          </label>
+          <label class="block space-y-1.5">
+            <span class="text-sm font-medium">Description</span>
+            <textarea
+              v-model="packageEditDraft.description"
+              data-testid="package-edit-description"
+              :disabled="packageSaving"
+              rows="3"
+              maxlength="10000"
+              class="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          </label>
+          <div class="grid grid-cols-2 gap-3">
+            <label class="block space-y-1.5">
+              <span class="text-sm font-medium">Price</span>
+              <input
+                v-model="packageEditDraft.price"
+                data-testid="package-edit-price"
+                :disabled="packageSaving"
+                required
+                type="number"
+                min="0"
+                step="0.01"
+                class="h-11 w-full rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+            </label>
+            <label class="block space-y-1.5">
+              <span class="text-sm font-medium">Currency</span>
+              <input
+                v-model="packageEditDraft.currency"
+                data-testid="package-edit-currency"
+                :disabled="packageSaving"
+                required
+                minlength="3"
+                maxlength="3"
+                pattern="[A-Za-z]{3}"
+                class="h-11 w-full rounded-lg border border-input bg-background px-3 text-sm uppercase outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+            </label>
+          </div>
+          <label class="block space-y-1.5">
+            <span class="text-sm font-medium">Validity (days)</span>
+            <input
+              v-model.number="packageEditDraft.validity_days"
+              data-testid="package-edit-validity"
+              :disabled="packageSaving"
+              required
+              type="number"
+              min="1"
+              max="3650"
+              step="1"
+              class="h-11 w-full rounded-lg border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          </label>
+          <p class="text-xs leading-5 text-muted-foreground">
+            Service-credit rules are retained. Purchased entitlements cannot be replaced.
+          </p>
+          <p
+            v-if="packageEditError"
+            role="alert"
+            class="rounded-lg border border-destructive/30 p-3 text-sm text-destructive"
+          >
+            {{ packageEditError }}
+          </p>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              class="min-h-11 cursor-pointer"
+              :disabled="packageSaving"
+              @click="setPackageEditOpen(false)"
+              >Cancel edit</Button
+            >
+            <Button type="submit" class="min-h-11 cursor-pointer" :disabled="packageSaving || !canWritePackages">
+              <Loader2 v-if="packageSaving" class="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />
+              Save package
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+
+    <AlertDialog :open="packageToRetire !== null" @update:open="setPackageRetirementOpen">
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Retire {{ packageToRetire?.name }}?</AlertDialogTitle>
+          <AlertDialogDescription>
+            This stops new sales and grants. Existing customer plans, usable credits, invoices, bookings and history are
+            retained. Nothing is deleted.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <p
+          v-if="packageRetireError"
+          role="alert"
+          class="rounded-lg border border-destructive/30 p-3 text-sm text-destructive"
+        >
+          {{ packageRetireError }}
+        </p>
+        <AlertDialogFooter>
+          <AlertDialogCancel
+            class="min-h-11 cursor-pointer"
+            :disabled="packageSaving"
+            @click="setPackageRetirementOpen(false)"
+            >Keep package active</AlertDialogCancel
+          >
+          <Button
+            type="button"
+            variant="destructive"
+            class="min-h-11 cursor-pointer"
+            :disabled="packageSaving || !canRetirePackages"
+            @click="retirePackage"
+          >
+            <Loader2 v-if="packageSaving" class="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />
+            Retire package
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   </div>
 </template>

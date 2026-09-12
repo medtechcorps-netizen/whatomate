@@ -39,7 +39,9 @@ import { getErrorMessage } from "@/lib/api-utils";
 import { formatDate } from "@/lib/utils";
 import {
   createMetaEmbeddedSignupSession,
+  META_COEXISTENCE_SESSION_INFO_VERSION,
   type MetaEmbeddedSignupAbortReason,
+  type MetaEmbeddedSignupMode,
   type MetaEmbeddedSignupSession,
 } from "@/lib/metaEmbeddedSignup";
 import {
@@ -53,6 +55,7 @@ import {
   Smartphone,
   Network,
   PlugZap,
+  RefreshCw,
   X,
 } from "lucide-vue-next";
 
@@ -75,8 +78,30 @@ interface WhatsAppAccount {
   is_default_incoming: boolean;
   is_default_outgoing: boolean;
   status: string;
+  is_smb?: boolean;
   has_access_token: boolean;
   created_at: string;
+  coexistence?: WhatsAppCoexistenceStatus;
+}
+
+interface WhatsAppCoexistenceStatus {
+  onboarding_status: string;
+  sync_status: string;
+  contact_sync_status: string;
+  contact_sync_requested_at?: string;
+  contact_sync_completed_at?: string;
+  history_consent: string;
+  history_sync_status: string;
+  lifecycle_status: string;
+  history_progress_percent?: number;
+  history_sync_requested_at?: string;
+  history_completed_at?: string;
+  sync_started_at?: string;
+  sync_completed_at?: string;
+  sync_deadline_at?: string;
+  last_lifecycle_event?: string;
+  last_lifecycle_event_at?: string;
+  updated_at: string;
 }
 
 const accounts = ref<WhatsAppAccount[]>([]);
@@ -85,6 +110,7 @@ const fetchError = ref(false);
 const deleteDialogOpen = ref(false);
 const accountToDelete = ref<WhatsAppAccount | null>(null);
 const isDeleting = ref(false);
+const syncingAccountId = ref<string | null>(null);
 
 // Facebook Embedded Signup State
 const whatsappConfig = ref<{
@@ -188,9 +214,7 @@ watch(isConnectingFB, (isConnecting) => {
       embeddedSignupSwitchLockMessage,
     );
   } else {
-    organizationsStore.unblockOrganizationSwitch(
-      embeddedSignupSwitchLockOwner,
-    );
+    organizationsStore.unblockOrganizationSwitch(embeddedSignupSwitchLockOwner);
   }
 });
 onMounted(async () => {
@@ -378,6 +402,9 @@ function loadFacebookSDK() {
 }
 
 function launchWhatsAppSignup(isCoexistence: boolean = true) {
+  const signupMode: MetaEmbeddedSignupMode = isCoexistence
+    ? "coexistence"
+    : "classic";
   const signupOrganizationId = activeOrganizationId.value;
   if (!signupOrganizationId) {
     toast.error("Select a workspace before connecting WhatsApp.");
@@ -425,7 +452,7 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
     loginOptions.extras = {
       setup: {},
       featureType: "whatsapp_business_app_onboarding",
-      sessionInfoVersion: "3",
+      sessionInfoVersion: META_COEXISTENCE_SESSION_INFO_VERSION,
     };
   } else {
     loginOptions.extras = {
@@ -451,12 +478,19 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
   };
 
   session = createMetaEmbeddedSignupSession({
-    onComplete: ({ code, phoneNumberId, wabaId }) => {
+    mode: signupMode,
+    onComplete: ({ code, mode, phoneNumberId, wabaId }) => {
       if (!isEmbeddedSignupOrganizationCurrent(signupOrganizationId)) {
         cancelPendingEmbeddedSignup(true);
         return;
       }
-      exchangeCodeForToken(code, signupOrganizationId, phoneNumberId, wabaId);
+      exchangeCodeForToken(
+        code,
+        mode,
+        signupOrganizationId,
+        phoneNumberId,
+        wabaId,
+      );
     },
     onAbort: handleAbort,
     isContextCurrent: () =>
@@ -489,6 +523,7 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
 
 async function exchangeCodeForToken(
   code: string,
+  signupMode: MetaEmbeddedSignupMode,
   organizationId: string,
   phoneNumberId?: string,
   wabaId?: string,
@@ -509,14 +544,14 @@ async function exchangeCodeForToken(
       "/accounts/exchange-token",
       {
         code,
+        signup_mode: signupMode,
         phone_id: phoneNumberId,
         waba_id: wabaId,
       },
       {
         headers: { "X-Organization-ID": organizationId },
-        // The server performs bounded Meta validation, registration and
-        // subscription phases under a 60-second deadline. Keep the browser
-        // alive long enough to receive the durable final state.
+        // All server Meta phases, including one-time sync, share 60 seconds.
+        // Allow another 30 seconds for durable settlement and the response.
         timeout: 90_000,
       },
     );
@@ -537,7 +572,11 @@ async function exchangeCodeForToken(
         "Account created, but webhook subscription needs attention. Open the account and use Subscribe.",
       );
     } else if (account.status === "active") {
-      toast.success("WhatsApp account connected successfully!");
+      toast.success(
+        account.coexistence
+          ? t("accounts.coexistenceConnected")
+          : t("accounts.connectedSuccess"),
+      );
     }
 
     if (
@@ -555,12 +594,230 @@ async function exchangeCodeForToken(
     ) {
       return;
     }
-    toast.error(getErrorMessage(error, "Failed to connect WhatsApp account"));
+    if (!error.response || error.response.status >= 500) {
+      // A lost response cannot prove whether Meta accepted a mutation. Read
+      // the committed state; never replay the code or start signup again here.
+      toast.warning(
+        "Connection result could not be confirmed. Check the refreshed account status and reconcile any pending connection before starting again.",
+      );
+      await fetchAccounts();
+    } else {
+      toast.error(getErrorMessage(error, "Failed to connect WhatsApp account"));
+    }
   } finally {
     if (activeEmbeddedSignupExchange === exchange) {
       activeEmbeddedSignupExchange = null;
       isConnectingFB.value = false;
     }
+  }
+}
+
+const retryableCoexistenceStatuses = new Set([
+  "not_requested",
+  "pending",
+  "failed",
+]);
+
+function hasAcceptedCoexistenceContactSync(sync: WhatsAppCoexistenceStatus) {
+  return (
+    sync.contact_sync_status === "requested" ||
+    sync.contact_sync_status === "completed"
+  );
+}
+
+function hasFinishedCoexistenceSync(sync: WhatsAppCoexistenceStatus) {
+  return (
+    hasAcceptedCoexistenceContactSync(sync) &&
+    (sync.history_sync_status === "completed" ||
+      sync.history_sync_status === "declined")
+  );
+}
+
+function isCoexistenceWindowExpired(sync: WhatsAppCoexistenceStatus) {
+  const historyRequestAccepted = [
+    "requested",
+    "in_progress",
+    "completed",
+    "declined",
+  ].includes(sync.history_sync_status);
+  if (
+    hasFinishedCoexistenceSync(sync) ||
+    (hasAcceptedCoexistenceContactSync(sync) && historyRequestAccepted) ||
+    !sync.sync_deadline_at
+  ) {
+    return false;
+  }
+  const deadline = Date.parse(sync.sync_deadline_at);
+  return Number.isFinite(deadline) && deadline <= Date.now();
+}
+
+function coexistenceNeedsReconnect(account: WhatsAppAccount) {
+  const sync = account.coexistence;
+  return (
+    account.status !== "active" ||
+    sync?.onboarding_status === "offboarded" ||
+    sync?.lifecycle_status === "disconnected" ||
+    sync?.lifecycle_status === "offboarded"
+  );
+}
+
+function coexistenceHasFailure(sync: WhatsAppCoexistenceStatus) {
+  return (
+    sync.onboarding_status === "failed" ||
+    sync.contact_sync_status === "failed" ||
+    sync.history_sync_status === "failed"
+  );
+}
+
+function coexistenceStatusLabel(account: WhatsAppAccount) {
+  const sync = account.coexistence;
+  // A reconnect event does not reactivate the API credential. The account's
+  // operational status stays authoritative until fresh Embedded Signup.
+  if (coexistenceNeedsReconnect(account)) {
+    return t("accounts.coexistenceStatusReconnect");
+  }
+  if (!sync) {
+    return account.is_smb ? t("accounts.coexistenceStatusNotStarted") : "";
+  }
+  // Lifecycle loss always wins over a stale aggregate sync result.
+  if (
+    sync.onboarding_status === "expired" ||
+    isCoexistenceWindowExpired(sync)
+  ) {
+    return t("accounts.coexistenceStatusExpired");
+  }
+  if (coexistenceHasFailure(sync)) {
+    return t("accounts.coexistenceStatusAttention");
+  }
+  if (
+    hasAcceptedCoexistenceContactSync(sync) &&
+    sync.history_sync_status === "declined"
+  ) {
+    return t("accounts.coexistenceStatusHistorySkipped");
+  }
+  if (
+    hasAcceptedCoexistenceContactSync(sync) &&
+    sync.history_sync_status === "requested"
+  ) {
+    return t("accounts.coexistenceStatusAccepted");
+  }
+  if (sync.onboarding_status === "ready" || hasFinishedCoexistenceSync(sync)) {
+    return t("accounts.coexistenceStatusComplete");
+  }
+  if (
+    typeof sync.history_progress_percent === "number" &&
+    sync.history_progress_percent > 0
+  ) {
+    return t("accounts.coexistenceStatusProgress", {
+      percent: Math.max(
+        0,
+        Math.min(100, Math.round(sync.history_progress_percent)),
+      ),
+    });
+  }
+  if (
+    retryableCoexistenceStatuses.has(sync.contact_sync_status) ||
+    retryableCoexistenceStatuses.has(sync.history_sync_status)
+  ) {
+    return t("accounts.coexistenceStatusPending");
+  }
+  return t("accounts.coexistenceStatusInProgress");
+}
+
+function coexistenceStatusDescription(account: WhatsAppAccount) {
+  const sync = account.coexistence;
+  if (coexistenceNeedsReconnect(account)) {
+    return t("accounts.coexistenceDescriptionReconnect");
+  }
+  if (!sync) return t("accounts.coexistenceDescriptionNotStarted");
+  if (
+    sync.onboarding_status === "expired" ||
+    isCoexistenceWindowExpired(sync)
+  ) {
+    return t("accounts.coexistenceDescriptionExpired");
+  }
+  if (coexistenceHasFailure(sync)) {
+    return t("accounts.coexistenceDescriptionAttention");
+  }
+  if (
+    hasAcceptedCoexistenceContactSync(sync) &&
+    sync.history_sync_status === "declined"
+  ) {
+    return t("accounts.coexistenceDescriptionHistorySkipped");
+  }
+  if (
+    hasAcceptedCoexistenceContactSync(sync) &&
+    sync.history_sync_status === "requested"
+  ) {
+    return t("accounts.coexistenceDescriptionAccepted");
+  }
+  if (sync.onboarding_status === "ready" || hasFinishedCoexistenceSync(sync)) {
+    return t("accounts.coexistenceDescriptionComplete");
+  }
+  return t("accounts.coexistenceDescriptionInProgress");
+}
+
+function coexistenceStatusClasses(account: WhatsAppAccount) {
+  const sync = account.coexistence;
+  if (coexistenceNeedsReconnect(account)) return "text-destructive";
+  if (!sync) return "text-amber-400 light:text-amber-600";
+  if (
+    sync.onboarding_status === "expired" ||
+    isCoexistenceWindowExpired(sync)
+  ) {
+    return "text-amber-400 light:text-amber-600";
+  }
+  if (coexistenceHasFailure(sync)) return "text-destructive";
+  if (sync.onboarding_status === "ready" || hasFinishedCoexistenceSync(sync)) {
+    return "text-emerald-400 light:text-emerald-600";
+  }
+  return "text-blue-400 light:text-blue-600";
+}
+
+function canRetryCoexistence(account: WhatsAppAccount) {
+  const sync = account.coexistence;
+  if (!account.is_smb || account.status !== "active") return false;
+  if (!sync) return true;
+  if (
+    coexistenceNeedsReconnect(account) ||
+    sync.onboarding_status === "expired" ||
+    isCoexistenceWindowExpired(sync)
+  ) {
+    return false;
+  }
+  return (
+    retryableCoexistenceStatuses.has(sync.contact_sync_status) ||
+    retryableCoexistenceStatuses.has(sync.history_sync_status)
+  );
+}
+
+async function retryCoexistenceSync(account: WhatsAppAccount) {
+  const organizationId = activeOrganizationId.value;
+  if (!organizationId || syncingAccountId.value) return;
+
+  syncingAccountId.value = account.id;
+  try {
+    const response = await api.post(
+      `/accounts/${account.id}/coexistence-sync`,
+      {},
+      {
+        headers: { "X-Organization-ID": organizationId },
+        timeout: 60_000,
+      },
+    );
+    if (activeOrganizationId.value !== organizationId) return;
+    const warning = response.data.data?.warning;
+    if (typeof warning === "string" && warning.trim()) {
+      toast.warning(warning.trim());
+    } else {
+      toast.success(t("accounts.coexistenceRetrySuccess"));
+    }
+    await fetchAccounts();
+  } catch (error: any) {
+    if (activeOrganizationId.value !== organizationId) return;
+    toast.error(getErrorMessage(error, t("accounts.coexistenceRetryFailed")));
+  } finally {
+    syncingAccountId.value = null;
   }
 }
 
@@ -752,16 +1009,30 @@ async function confirmDelete() {
                   </div>
                 </template>
                 <template #cell-status="{ item: account }">
-                  <Badge
-                    variant="outline"
-                    :class="
-                      account.status === 'active'
-                        ? 'border-green-600 text-green-600'
-                        : ''
-                    "
-                  >
-                    {{ account.status }}
-                  </Badge>
+                  <div class="flex flex-col items-start gap-1">
+                    <Badge
+                      variant="outline"
+                      :class="
+                        account.status === 'active'
+                          ? 'border-green-600 text-green-600'
+                          : ''
+                      "
+                    >
+                      {{ account.status }}
+                    </Badge>
+                    <span
+                      v-if="account.is_smb"
+                      class="inline-flex max-w-48 items-center gap-1.5 text-[11px] font-medium leading-tight"
+                      :class="coexistenceStatusClasses(account)"
+                      :title="coexistenceStatusDescription(account)"
+                    >
+                      <span
+                        class="h-1.5 w-1.5 shrink-0 rounded-full bg-current"
+                        aria-hidden="true"
+                      />
+                      {{ coexistenceStatusLabel(account) }}
+                    </span>
+                  </div>
                 </template>
                 <template #cell-created="{ item: account }">
                   <span class="text-muted-foreground">{{
@@ -770,6 +1041,31 @@ async function confirmDelete() {
                 </template>
                 <template #cell-actions="{ item: account }">
                   <div class="flex items-center justify-end gap-1">
+                    <Tooltip v-if="canWrite && canRetryCoexistence(account)">
+                      <TooltipTrigger as-child>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          class="h-8 w-8"
+                          :disabled="syncingAccountId === account.id"
+                          :aria-label="
+                            $t('accounts.coexistenceRetryFor', {
+                              account: account.name,
+                            })
+                          "
+                          @click="retryCoexistenceSync(account)"
+                        >
+                          <Loader2
+                            v-if="syncingAccountId === account.id"
+                            class="h-4 w-4 animate-spin"
+                          />
+                          <RefreshCw v-else class="h-4 w-4" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>{{
+                        $t("accounts.coexistenceRetry")
+                      }}</TooltipContent>
+                    </Tooltip>
                     <Tooltip>
                       <TooltipTrigger as-child>
                         <RouterLink :to="`/settings/accounts/${account.id}`">
@@ -828,90 +1124,129 @@ async function confirmDelete() {
 
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4 my-4">
           <!-- Coexistence Option Card -->
-          <div
+          <button
+            type="button"
+            aria-describedby="coexistence-mode-description"
             @click="launchWhatsAppSignup(true)"
-            class="relative group cursor-pointer flex flex-col p-5 rounded-xl border border-emerald-500/20 bg-[#141419] hover:bg-[#181822] hover:border-emerald-500/50 hover:shadow-[0_0_20px_rgba(16,185,129,0.1)] light:bg-gray-50/50 light:border-emerald-200 light:hover:bg-gray-100/70 light:hover:border-emerald-400 light:hover:shadow-[0_0_20px_rgba(16,185,129,0.05)] transition-all duration-300 overflow-hidden"
+            class="relative group flex flex-col overflow-hidden rounded-xl border border-emerald-500/20 bg-[#141419] p-5 text-left transition-all duration-300 hover:border-emerald-500/50 hover:bg-[#181822] hover:shadow-[0_0_20px_rgba(16,185,129,0.1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0e0e11] light:bg-gray-50/50 light:border-emerald-200 light:hover:bg-gray-100/70 light:hover:border-emerald-400 light:hover:shadow-[0_0_20px_rgba(16,185,129,0.05)] light:focus-visible:ring-emerald-600 light:focus-visible:ring-offset-white"
           >
             <!-- Badge -->
-            <div class="absolute top-3 right-3">
+            <span class="absolute top-3 right-3">
               <span
                 class="text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2 py-0.5 rounded-full font-medium light:bg-emerald-50 light:text-emerald-600 light:border-emerald-200"
               >
                 {{ $t("accounts.coexistenceRecommend") }}
               </span>
-            </div>
+            </span>
 
-            <div
+            <span
               class="h-10 w-10 rounded-lg bg-emerald-500/10 light:bg-emerald-100/60 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform duration-300"
             >
               <Smartphone
                 class="h-5 w-5 text-emerald-400 light:text-emerald-600"
               />
-            </div>
+            </span>
 
-            <h3
-              class="text-base font-semibold text-white light:text-gray-900 group-hover:text-emerald-400 light:group-hover:text-emerald-600 transition-colors duration-200"
+            <span
+              class="block text-base font-semibold text-white light:text-gray-900 group-hover:text-emerald-400 light:group-hover:text-emerald-600 transition-colors duration-200"
             >
               {{ $t("accounts.coexistenceTitle") }}
-            </h3>
-            <p
-              class="text-xs text-gray-400 light:text-gray-600 mt-2 flex-grow leading-relaxed"
+            </span>
+            <span
+              id="coexistence-mode-description"
+              class="mt-2 block flex-grow text-xs leading-relaxed text-gray-400 light:text-gray-600"
             >
               {{ $t("accounts.coexistenceDesc") }}
-            </p>
+            </span>
 
-            <div
-              class="mt-5 flex items-center justify-between text-xs font-medium text-emerald-400 light:text-emerald-600"
+            <span
+              class="mt-4 block space-y-1.5 text-[11px] leading-relaxed text-gray-500 light:text-gray-600"
+            >
+              <span class="flex gap-2">
+                <Check
+                  class="mt-0.5 h-3 w-3 shrink-0 text-emerald-500"
+                  aria-hidden="true"
+                />
+                <span>{{ $t("accounts.coexistenceRequirementVersion") }}</span>
+              </span>
+              <span class="flex gap-2">
+                <Check
+                  class="mt-0.5 h-3 w-3 shrink-0 text-emerald-500"
+                  aria-hidden="true"
+                />
+                <span>{{ $t("accounts.coexistenceRequirementHistory") }}</span>
+              </span>
+              <span class="flex gap-2">
+                <Check
+                  class="mt-0.5 h-3 w-3 shrink-0 text-emerald-500"
+                  aria-hidden="true"
+                />
+                <span>{{ $t("accounts.coexistenceRequirementLimits") }}</span>
+              </span>
+              <span class="flex gap-2">
+                <Check
+                  class="mt-0.5 h-3 w-3 shrink-0 text-emerald-500"
+                  aria-hidden="true"
+                />
+                <span>{{ $t("accounts.coexistenceRequirementDevices") }}</span>
+              </span>
+            </span>
+
+            <span
+              class="mt-5 flex w-full items-center justify-between text-xs font-medium text-emerald-400 light:text-emerald-600"
             >
               <span>{{ $t("accounts.selectMode") }}</span>
               <span
                 class="group-hover:translate-x-1 transition-transform duration-200"
+                aria-hidden="true"
                 >→</span
               >
-            </div>
-          </div>
+            </span>
+          </button>
 
           <!-- Classic Option Card -->
-          <div
+          <button
+            type="button"
             @click="launchWhatsAppSignup(false)"
-            class="relative group cursor-pointer flex flex-col p-5 rounded-xl border border-[#222227] bg-[#141419] hover:bg-[#181822] hover:border-blue-500/50 hover:shadow-[0_0_20px_rgba(59,130,246,0.1)] light:bg-gray-50/50 light:border-gray-200 light:hover:bg-gray-100/70 light:hover:border-blue-400 light:hover:shadow-[0_0_20px_rgba(59,130,246,0.05)] transition-all duration-300 overflow-hidden"
+            class="relative group flex flex-col overflow-hidden rounded-xl border border-[#222227] bg-[#141419] p-5 text-left transition-all duration-300 hover:border-blue-500/50 hover:bg-[#181822] hover:shadow-[0_0_20px_rgba(59,130,246,0.1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0e0e11] light:bg-gray-50/50 light:border-gray-200 light:hover:bg-gray-100/70 light:hover:border-blue-400 light:hover:shadow-[0_0_20px_rgba(59,130,246,0.05)] light:focus-visible:ring-blue-600 light:focus-visible:ring-offset-white"
           >
             <!-- Badge -->
-            <div class="absolute top-3 right-3">
+            <span class="absolute top-3 right-3">
               <span
                 class="text-[10px] bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-0.5 rounded-full font-medium light:bg-blue-50 light:text-blue-600 light:border-blue-200"
               >
                 {{ $t("accounts.classicRecommend") }}
               </span>
-            </div>
+            </span>
 
-            <div
+            <span
               class="h-10 w-10 rounded-lg bg-blue-500/10 light:bg-blue-100/60 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform duration-300"
             >
               <Network class="h-5 w-5 text-blue-400 light:text-blue-600" />
-            </div>
+            </span>
 
-            <h3
+            <span
               class="text-base font-semibold text-white light:text-gray-900 group-hover:text-blue-400 light:group-hover:text-blue-600 transition-colors duration-200"
             >
               {{ $t("accounts.classicTitle") }}
-            </h3>
-            <p
-              class="text-xs text-gray-400 light:text-gray-600 mt-2 flex-grow leading-relaxed"
+            </span>
+            <span
+              class="mt-2 block flex-grow text-xs leading-relaxed text-gray-400 light:text-gray-600"
             >
               {{ $t("accounts.classicDesc") }}
-            </p>
+            </span>
 
-            <div
-              class="mt-5 flex items-center justify-between text-xs font-medium text-blue-400 light:text-blue-600"
+            <span
+              class="mt-5 flex w-full items-center justify-between text-xs font-medium text-blue-400 light:text-blue-600"
             >
               <span>{{ $t("accounts.selectMode") }}</span>
               <span
                 class="group-hover:translate-x-1 transition-transform duration-200"
+                aria-hidden="true"
                 >→</span
               >
-            </div>
-          </div>
+            </span>
+          </button>
         </div>
       </DialogContent>
     </Dialog>

@@ -15,13 +15,26 @@ import (
 )
 
 const (
-	tenantSetting                    = "app.current_organization_id"
-	tenantPolicyFingerprintSignature = "public.rereply_tenant_policy_fingerprint()"
+	tenantSetting                            = "app.current_organization_id"
+	tenantPolicyFingerprintSignature         = "public.rereply_tenant_policy_fingerprint()"
+	tenantAdditivePolicyFingerprintSignature = "public.rereply_tenant_policy_additive_fingerprint_v1()"
 	// Keep version 5 for binary rollback compatibility. Additional optional
 	// resolvers are verified by name so an older binary can still roll back
 	// after the migration without rejecting the unchanged core contract.
-	tenantRLSRoutingVersion = 5
+	tenantRLSRoutingVersion         = 5
+	tenantRLSAdditiveProfileVersion = 1
 )
+
+// tenantRLSAdditiveProfileV1 is deliberately outside the version-5 core
+// fingerprint. A prior version-5 binary therefore continues to verify the
+// unchanged core after these additive tables are installed, while the current
+// binary separately requires this complete, versioned profile and its exact
+// fingerprint. Never add a core table here merely to make a mismatch pass.
+var tenantRLSAdditiveProfileV1 = []string{
+	"whatsapp_coexistence_states",
+	"whatsapp_identity_review_holds",
+	"whatsapp_identity_review_members",
+}
 
 var (
 	// ErrMissingTenant is returned before any database work when a request or
@@ -137,7 +150,10 @@ var DirectTenantTables = []string{
 	"user_availability_logs",
 	"webhooks",
 	"whatsapp_accounts",
+	"whatsapp_coexistence_states",
 	"whatsapp_flows",
+	"whatsapp_identity_review_holds",
+	"whatsapp_identity_review_members",
 	"widgets",
 	"workspace_template_applications",
 	"workspace_template_resource_maps",
@@ -164,17 +180,17 @@ var RelatedTenantTables = map[string]string{
 	"bulk_message_recipients": `EXISTS (
 		SELECT 1 FROM public.bulk_message_campaigns parent
 		WHERE parent.id = bulk_message_recipients.campaign_id
-		  AND parent.organization_id = NULLIF(current_setting('app.current_organization_id', true), '')::uuid
+		  AND parent.organization_id = NULLIF(pg_catalog.current_setting('app.current_organization_id', true), '')::uuid
 	)`,
 	"chatbot_flow_steps": `EXISTS (
 		SELECT 1 FROM public.chatbot_flows parent
 		WHERE parent.id = chatbot_flow_steps.flow_id
-		  AND parent.organization_id = NULLIF(current_setting('app.current_organization_id', true), '')::uuid
+		  AND parent.organization_id = NULLIF(pg_catalog.current_setting('app.current_organization_id', true), '')::uuid
 	)`,
 	"chatbot_session_messages": `EXISTS (
 		SELECT 1 FROM public.chatbot_sessions parent
 		WHERE parent.id = chatbot_session_messages.session_id
-		  AND parent.organization_id = NULLIF(current_setting('app.current_organization_id', true), '')::uuid
+		  AND parent.organization_id = NULLIF(pg_catalog.current_setting('app.current_organization_id', true), '')::uuid
 	)`,
 }
 
@@ -190,7 +206,7 @@ func SetTenantContext(tx *gorm.DB, organizationID uuid.UUID) error {
 		return ErrMissingTenant
 	}
 	if err := tx.Exec(
-		"SELECT set_config(?, ?, true)",
+		"SELECT pg_catalog.set_config(?, ?, true)",
 		tenantSetting,
 		organizationID.String(),
 	).Error; err != nil {
@@ -253,7 +269,7 @@ func withTenantTransaction(
 // ApplyTenantRLS installs fail-closed row-security policies for the CRM tables.
 // It must run with the migration/table-owner connection, never the runtime
 // application connection. runtimeRole must already exist and must not be a
-// superuser, BYPASSRLS, REPLICATION, or a direct/indirect member of any
+// superuser, CREATEROLE, BYPASSRLS, REPLICATION, or a direct/indirect member of any
 // migration, privileged, or protected-table-owner role.
 func ApplyTenantRLS(db *gorm.DB, runtimeRole string) error {
 	if db == nil {
@@ -261,6 +277,15 @@ func ApplyTenantRLS(db *gorm.DB, runtimeRole string) error {
 	}
 	if err := validateIdentifier(runtimeRole); err != nil {
 		return fmt.Errorf("invalid runtime role: %w", err)
+	}
+	var sessionReplicationRole string
+	if err := db.Raw(
+		"SELECT pg_catalog.current_setting('session_replication_role')",
+	).Scan(&sessionReplicationRole).Error; err != nil {
+		return fmt.Errorf("inspect migration session_replication_role: %w", err)
+	}
+	if sessionReplicationRole != "origin" {
+		return fmt.Errorf("migration session_replication_role is %q; expected origin", sessionReplicationRole)
 	}
 
 	var migrationRole string
@@ -275,15 +300,19 @@ func ApplyTenantRLS(db *gorm.DB, runtimeRole string) error {
 	}
 
 	var roleState struct {
-		Exists      bool
-		Superuser   bool
-		BypassRLS   bool
-		Replication bool
+		OID         int64 `gorm:"column:role_oid"`
+		Exists      bool  `gorm:"column:role_exists"`
+		Superuser   bool  `gorm:"column:superuser"`
+		CreateRole  bool  `gorm:"column:create_role"`
+		BypassRLS   bool  `gorm:"column:bypass_rls"`
+		Replication bool  `gorm:"column:replication"`
 	}
 	if err := db.Raw(`
 		SELECT
-			COUNT(*) = 1 AS exists,
+			COUNT(*) = 1 AS role_exists,
+			COALESCE(min(oid::bigint), 0) AS role_oid,
 			COALESCE(bool_or(rolsuper), false) AS superuser,
+			COALESCE(bool_or(rolcreaterole), false) AS create_role,
 			COALESCE(bool_or(rolbypassrls), false) AS bypass_rls,
 			COALESCE(bool_or(rolreplication), false) AS replication
 		FROM pg_catalog.pg_roles
@@ -291,14 +320,21 @@ func ApplyTenantRLS(db *gorm.DB, runtimeRole string) error {
 	`, runtimeRole).Scan(&roleState).Error; err != nil {
 		return fmt.Errorf("inspect runtime role: %w", err)
 	}
-	if !roleState.Exists {
+	if !roleState.Exists || roleState.OID == 0 {
 		return fmt.Errorf("runtime role %q does not exist", runtimeRole)
 	}
-	if roleState.Superuser || roleState.BypassRLS || roleState.Replication {
+	if roleState.Superuser || roleState.CreateRole || roleState.BypassRLS || roleState.Replication {
 		return fmt.Errorf(
-			"runtime role %q must be NOSUPERUSER, NOBYPASSRLS, and NOREPLICATION",
+			"runtime role %q must be NOSUPERUSER, NOCREATEROLE, NOBYPASSRLS, and NOREPLICATION",
 			runtimeRole,
 		)
+	}
+	canDisableTriggers, err := roleCanSetSessionReplicationRole(db, roleState.OID)
+	if err != nil {
+		return fmt.Errorf("inspect runtime session-replication authority: %w", err)
+	}
+	if canDisableTriggers {
+		return fmt.Errorf("runtime role %q has unauthorized session_replication_role authority or configuration", runtimeRole)
 	}
 
 	var migrationRoleOID int64
@@ -357,6 +393,20 @@ func ApplyTenantRLS(db *gorm.DB, runtimeRole string) error {
 			strings.Join(tableOwnerMemberships, ", "),
 		)
 	}
+	if err := verifyNoDangerousRuntimeDefaultTablePrivileges(
+		db,
+		migrationRoleOID,
+		roleState.OID,
+	); err != nil {
+		return fmt.Errorf("inspect runtime default-table authority: %w", err)
+	}
+	if err := verifyNoDangerousProtectedRuntimeTablePrivileges(
+		db,
+		installedTenantTables,
+		runtimeRole,
+	); err != nil {
+		return fmt.Errorf("inspect runtime protected-table authority: %w", err)
+	}
 	installedTenantTableSet := make(map[string]struct{}, len(installedTenantTables))
 	for _, table := range installedTenantTables {
 		installedTenantTableSet[table] = struct{}{}
@@ -366,11 +416,64 @@ func ApplyTenantRLS(db *gorm.DB, runtimeRole string) error {
 	migrator := quoteIdentifier(migrationRole)
 
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		// PostgreSQL 14 grants CREATE on public to PUBLIC in a fresh database.
+		// Runtime principals need USAGE only; retaining CREATE would let them add
+		// search-path shadows for policy functions, operators, or relations.
+		if err := tx.Exec("REVOKE CREATE ON SCHEMA public FROM PUBLIC").Error; err != nil {
+			return err
+		}
+		if err := tx.Exec(fmt.Sprintf(
+			"REVOKE CREATE ON SCHEMA public FROM %s", runtime,
+		)).Error; err != nil {
+			return err
+		}
+		// REVOKE may only warn when the migrator cannot remove another
+		// grantor's privilege. Prove the resulting authority before any later
+		// grants or policy work; a failed observation rolls back both revokes.
+		var schemaAuthority struct {
+			NamespaceCount   int64 `gorm:"column:namespace_count"`
+			PublicCanCreate  bool  `gorm:"column:public_can_create"`
+			RuntimeCanCreate bool  `gorm:"column:runtime_can_create"`
+		}
+		observation := tx.Raw(`
+			SELECT pg_catalog.count(*) AS namespace_count,
+				COALESCE(pg_catalog.bool_or(EXISTS (
+					SELECT 1
+					FROM pg_catalog.aclexplode(COALESCE(
+						namespace.nspacl,
+						pg_catalog.acldefault('n', namespace.nspowner)
+					)) AS privilege
+					WHERE privilege.grantee = 0
+					  AND privilege.privilege_type = 'CREATE'
+				)), true) AS public_can_create,
+				COALESCE(pg_catalog.bool_or(pg_catalog.has_schema_privilege(
+					CAST(? AS pg_catalog.oid), namespace.oid, 'CREATE'
+				)), true) AS runtime_can_create
+			FROM pg_catalog.pg_namespace AS namespace
+			WHERE namespace.nspname = 'public'
+		`, roleState.OID).Scan(&schemaAuthority)
+		if observation.Error != nil {
+			return fmt.Errorf("inspect public schema CREATE revocation: %w", observation.Error)
+		}
+		if observation.RowsAffected != 1 || schemaAuthority.NamespaceCount != 1 ||
+			schemaAuthority.PublicCanCreate || schemaAuthority.RuntimeCanCreate {
+			return errors.New("public schema CREATE revocation postcondition failed")
+		}
 		// The runtime process needs ordinary DML rights, while RLS determines
 		// which rows are visible. Future tables inherit the same grants.
 		if err := tx.Exec(fmt.Sprintf(
 			"GRANT USAGE ON SCHEMA public TO %s", runtime,
 		)).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec(fmt.Sprintf(
+			"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM %s", runtime,
+		)).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec(
+			"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM PUBLIC",
+		).Error; err != nil {
 			return err
 		}
 		if err := tx.Exec(fmt.Sprintf(
@@ -380,6 +483,18 @@ func ApplyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		}
 		if err := tx.Exec(fmt.Sprintf(
 			"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s", runtime,
+		)).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec(fmt.Sprintf(
+			"ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA public REVOKE ALL PRIVILEGES ON TABLES FROM %s",
+			migrator, runtime,
+		)).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec(fmt.Sprintf(
+			"ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA public REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC",
+			migrator,
 		)).Error; err != nil {
 			return err
 		}
@@ -396,7 +511,7 @@ func ApplyTenantRLS(db *gorm.DB, runtimeRole string) error {
 			return err
 		}
 
-		tenantExpr := "organization_id = NULLIF(current_setting('app.current_organization_id', true), '')::uuid"
+		tenantExpr := "organization_id = NULLIF(pg_catalog.current_setting('app.current_organization_id', true), '')::uuid"
 		for _, table := range DirectTenantTables {
 			if _, exists := installedTenantTableSet[table]; !exists {
 				continue
@@ -421,6 +536,13 @@ func ApplyTenantRLS(db *gorm.DB, runtimeRole string) error {
 			return err
 		}
 		if err := installPlatformComplianceGuards(tx, migrationRole, runtimeRole); err != nil {
+			return err
+		}
+		if err := verifyExactProtectedRuntimeTablePrivileges(
+			tx,
+			installedTenantTables,
+			runtimeRole,
+		); err != nil {
 			return err
 		}
 
@@ -511,15 +633,26 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		)
 	}
 	currentRole := identity.CurrentRole
+	var sessionReplicationRole string
+	if err := db.Raw(
+		"SELECT pg_catalog.current_setting('session_replication_role')",
+	).Scan(&sessionReplicationRole).Error; err != nil {
+		return fmt.Errorf("inspect runtime session_replication_role: %w", err)
+	}
+	if sessionReplicationRole != "origin" {
+		return fmt.Errorf("runtime session_replication_role is %q; expected origin", sessionReplicationRole)
+	}
 
 	var roleState struct {
 		Superuser   bool
+		CreateRole  bool
 		BypassRLS   bool
 		Replication bool
 	}
 	if err := db.Raw(`
 		SELECT
 			rolsuper AS superuser,
+			rolcreaterole AS create_role,
 			rolbypassrls AS bypass_rls,
 			rolreplication AS replication
 		FROM pg_catalog.pg_roles
@@ -527,22 +660,95 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 	`).Scan(&roleState).Error; err != nil {
 		return fmt.Errorf("inspect current database role: %w", err)
 	}
-	if roleState.Superuser || roleState.BypassRLS || roleState.Replication {
+	if roleState.Superuser || roleState.CreateRole || roleState.BypassRLS || roleState.Replication {
 		return fmt.Errorf(
-			"runtime role %q must be NOSUPERUSER, NOBYPASSRLS, and NOREPLICATION",
+			"runtime role %q must be NOSUPERUSER, NOCREATEROLE, NOBYPASSRLS, and NOREPLICATION",
 			currentRole,
 		)
+	}
+	canDisableTriggers, err := roleCanSetSessionReplicationRole(db, identity.RuntimeRoleOID)
+	if err != nil {
+		return fmt.Errorf("inspect runtime session-replication authority: %w", err)
+	}
+	if canDisableTriggers {
+		return fmt.Errorf("runtime role %q has unauthorized session_replication_role authority or configuration", currentRole)
 	}
 
 	var staleTenant bool
 	if err := db.Raw(
-		"SELECT NULLIF(current_setting(?, true), '') IS NOT NULL",
+		"SELECT NULLIF(pg_catalog.current_setting(?, true), '') IS NOT NULL",
 		tenantSetting,
 	).Scan(&staleTenant).Error; err != nil {
 		return fmt.Errorf("inspect tenant connection state: %w", err)
 	}
 	if staleTenant {
 		return errors.New("database pool contains a session-level tenant context")
+	}
+	var runtimeCanCreatePublic bool
+	if err := db.Raw(
+		"SELECT pg_catalog.has_schema_privilege(current_user, 'public', 'CREATE')",
+	).Scan(&runtimeCanCreatePublic).Error; err != nil {
+		return fmt.Errorf("inspect runtime public-schema authority: %w", err)
+	}
+	if runtimeCanCreatePublic {
+		return fmt.Errorf("runtime role %q must not have CREATE on schema public", currentRole)
+	}
+	var settablePublicCreator bool
+	if err := db.Raw(`
+		WITH RECURSIVE settable_role(role_oid, path, can_set) AS (
+			SELECT role.oid, ARRAY[role.oid]::oid[], true
+			FROM pg_catalog.pg_roles AS role
+			WHERE role.rolname = current_user
+			UNION ALL
+			SELECT membership.roleid,
+				settable_role.path || membership.roleid,
+				settable_role.can_set AND COALESCE(
+					(pg_catalog.to_jsonb(membership)->>'set_option')::boolean,
+					true
+				)
+			FROM settable_role
+			JOIN pg_catalog.pg_auth_members AS membership
+			  ON membership.member = settable_role.role_oid
+			WHERE NOT membership.roleid = ANY(settable_role.path)
+		)
+		SELECT EXISTS (
+			SELECT 1
+			FROM settable_role
+			WHERE can_set
+			  AND role_oid <> (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)
+			  AND pg_catalog.has_schema_privilege(role_oid, 'public', 'CREATE')
+		)
+	`).Scan(&settablePublicCreator).Error; err != nil {
+		return fmt.Errorf("inspect settable public-schema creator authority: %w", err)
+	}
+	if settablePublicCreator {
+		return fmt.Errorf("runtime role %q can SET ROLE to a public-schema creator", currentRole)
+	}
+
+	// Prove the complete relation and policy catalogue before any query against
+	// an application table can evaluate a tampered RLS expression.
+	existingTenantTables, err := existingProtectedTenantTables(db)
+	if err != nil {
+		return fmt.Errorf("inspect protected tenant tables: %w", err)
+	}
+	if err := requireExactExistingProtectedTenantTables(
+		db,
+		protectedTenantTableNames(),
+	); err != nil {
+		return fmt.Errorf("verify protected tenant relation inventory: %w", err)
+	}
+	if err := verifyRuntimeCanonicalTenantPolicyInventory(
+		db,
+		existingTenantTables,
+		currentRole,
+	); err != nil {
+		return fmt.Errorf("verify canonical tenant policy inventory: %w", err)
+	}
+	if err := verifyLegacyAdditiveSchemaContract(db); err != nil {
+		return fmt.Errorf("verify identity-review schema contract: %w", err)
+	}
+	if err := verifyTenantPolicyFingerprint(db, existingTenantTables, currentRole); err != nil {
+		return err
 	}
 
 	// Every active organization must belong to a reseller portfolio. This
@@ -578,10 +784,6 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		}
 	}
 
-	existingTenantTables, err := existingProtectedTenantTables(db)
-	if err != nil {
-		return fmt.Errorf("inspect protected tenant tables: %w", err)
-	}
 	permissivePolicyMembershipByRoleOID := make(map[int64]bool)
 	for _, table := range existingTenantTables {
 		var policyState struct {
@@ -670,9 +872,6 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 			}
 		}
 	}
-	if err := verifyTenantPolicyFingerprint(db, existingTenantTables, currentRole); err != nil {
-		return err
-	}
 	tableOwnerMemberships, err := protectedTableOwnerMemberships(
 		db,
 		currentRole,
@@ -703,33 +902,16 @@ func VerifyTenantRLS(db *gorm.DB, runtimeRole string) error {
 		return fmt.Errorf("verify platform compliance write barrier: %w", err)
 	}
 
-	var whatsappPhoneRoutingIndexValid bool
-	if err := db.Raw(`
-		SELECT EXISTS (
-			SELECT 1
-			FROM pg_catalog.pg_index AS index_state
-			JOIN pg_catalog.pg_class AS index_relation
-			  ON index_relation.oid = index_state.indexrelid
-			JOIN pg_catalog.pg_class AS table_relation
-			  ON table_relation.oid = index_state.indrelid
-			JOIN pg_catalog.pg_namespace AS table_namespace
-			  ON table_namespace.oid = table_relation.relnamespace
-			WHERE table_namespace.nspname = 'public'
-			  AND table_relation.relname = 'whatsapp_accounts'
-			  AND index_relation.relname = 'uq_whatsapp_accounts_live_phone_id'
-			  AND index_state.indisunique
-			  AND index_state.indisvalid
-			  AND index_state.indisready
-			  AND index_state.indnkeyatts = 1
-			  AND index_state.indnatts = 1
-			  AND pg_catalog.pg_get_expr(index_state.indexprs, index_state.indrelid) = 'btrim((phone_id)::text)'
-			  AND pg_catalog.pg_get_expr(index_state.indpred, index_state.indrelid) = '(deleted_at IS NULL)'
-		)
-	`).Scan(&whatsappPhoneRoutingIndexValid).Error; err != nil {
-		return fmt.Errorf("inspect WhatsApp Phone ID routing index: %w", err)
-	}
-	if !whatsappPhoneRoutingIndexValid {
-		return errors.New("WhatsApp Phone ID routing index is missing or invalid")
+	if err := verifyLegacyAdditiveIndex(db, legacyAdditiveIndexContract{
+		name:                 "uq_whatsapp_accounts_live_phone_id",
+		table:                "whatsapp_accounts",
+		columns:              "btrim(phone_id::text)",
+		predicate:            "deleted_at IS NULL",
+		dependencyColumns:    "deleted_at,phone_id",
+		tableDependencyCount: 1,
+		unique:               true,
+	}); err != nil {
+		return fmt.Errorf("WhatsApp Phone ID routing index is missing or invalid: %w", err)
 	}
 
 	for _, signature := range []string{
@@ -795,6 +977,7 @@ func privilegedRoleMemberships(db *gorm.DB, memberRole string) ([]string, error)
 		FROM pg_catalog.pg_roles AS privileged_role
 		WHERE (
 			privileged_role.rolsuper
+			OR privileged_role.rolcreaterole
 			OR privileged_role.rolbypassrls
 			OR privileged_role.rolreplication
 		)
@@ -862,6 +1045,42 @@ func existingProtectedTenantTables(db *gorm.DB) ([]string, error) {
 		}
 	}
 	return existing, nil
+}
+
+func tenantPolicyFingerprintProfiles(tables []string) (core, additive []string, err error) {
+	additiveSet := make(map[string]struct{}, len(tenantRLSAdditiveProfileV1))
+	for _, table := range tenantRLSAdditiveProfileV1 {
+		if err := validateIdentifier(table); err != nil {
+			return nil, nil, fmt.Errorf("invalid additive tenant table %q: %w", table, err)
+		}
+		if _, duplicate := additiveSet[table]; duplicate {
+			return nil, nil, fmt.Errorf("duplicate additive tenant table %q", table)
+		}
+		additiveSet[table] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(tables))
+	for _, table := range tables {
+		if _, duplicate := seen[table]; duplicate {
+			return nil, nil, fmt.Errorf("duplicate protected tenant table %q", table)
+		}
+		seen[table] = struct{}{}
+		if _, optional := additiveSet[table]; optional {
+			additive = append(additive, table)
+		} else {
+			core = append(core, table)
+		}
+	}
+	sort.Strings(core)
+	sort.Strings(additive)
+	return core, additive, nil
+}
+
+func tenantPolicyAdditiveFingerprint(db *gorm.DB, tables []string) (string, error) {
+	fingerprint, err := tenantPolicyFingerprint(db, tables)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("v%d:%s", tenantRLSAdditiveProfileVersion, fingerprint), nil
 }
 
 func protectedTableOwnerMemberships(
@@ -1051,9 +1270,23 @@ func installTenantPolicyFingerprint(
 	tables []string,
 	runtimeRole string,
 ) error {
-	fingerprint, err := tenantPolicyFingerprint(tx, tables)
+	coreTables, additiveTables, err := tenantPolicyFingerprintProfiles(tables)
 	if err != nil {
-		return fmt.Errorf("compute tenant policy fingerprint: %w", err)
+		return fmt.Errorf("partition tenant policy fingerprint profiles: %w", err)
+	}
+	if len(additiveTables) != len(tenantRLSAdditiveProfileV1) {
+		return fmt.Errorf(
+			"additive tenant policy profile v%d is incomplete: got %d table(s), expected %d",
+			tenantRLSAdditiveProfileVersion, len(additiveTables), len(tenantRLSAdditiveProfileV1),
+		)
+	}
+	fingerprint, err := tenantPolicyFingerprint(tx, coreTables)
+	if err != nil {
+		return fmt.Errorf("compute version-5 tenant policy fingerprint: %w", err)
+	}
+	additiveFingerprint, err := tenantPolicyAdditiveFingerprint(tx, additiveTables)
+	if err != nil {
+		return fmt.Errorf("compute additive tenant policy fingerprint: %w", err)
 	}
 	statements := []string{
 		"DROP FUNCTION IF EXISTS public.rereply_tenant_policy_fingerprint()",
@@ -1070,6 +1303,20 @@ func installTenantPolicyFingerprint(
 			"GRANT EXECUTE ON FUNCTION public.rereply_tenant_policy_fingerprint() TO %s",
 			runtimeRole,
 		),
+		"DROP FUNCTION IF EXISTS public.rereply_tenant_policy_additive_fingerprint_v1()",
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1()
+			RETURNS text
+			LANGUAGE sql
+			IMMUTABLE
+			SET search_path = pg_catalog, public
+			AS $function$
+			  SELECT '%s'::text
+			$function$`, additiveFingerprint),
+		"REVOKE ALL ON FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1() FROM PUBLIC",
+		fmt.Sprintf(
+			"GRANT EXECUTE ON FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1() TO %s",
+			runtimeRole,
+		),
 	}
 	for _, statement := range statements {
 		if err := tx.Exec(statement).Error; err != nil {
@@ -1079,84 +1326,108 @@ func installTenantPolicyFingerprint(
 	return nil
 }
 
-func tenantPolicyFingerprintOwner(db *gorm.DB) (databaseRoleReference, error) {
-	var owner databaseRoleReference
-	if err := db.Raw(`
-		SELECT
-			function_owner.oid::bigint AS role_oid,
-			function_owner.rolname AS role_name
-		FROM pg_catalog.pg_proc AS fingerprint_function
-		JOIN pg_catalog.pg_namespace AS function_schema
-		  ON function_schema.oid = fingerprint_function.pronamespace
-		JOIN pg_catalog.pg_roles AS function_owner
-		  ON function_owner.oid = fingerprint_function.proowner
-		WHERE function_schema.nspname = 'public'
-		  AND fingerprint_function.proname = 'rereply_tenant_policy_fingerprint'
-		  AND fingerprint_function.pronargs = 0
-		  AND fingerprint_function.prokind = 'f'
-	`).Scan(&owner).Error; err != nil {
-		return databaseRoleReference{}, err
-	}
-	if owner.OID == 0 || owner.Name == "" {
-		return databaseRoleReference{}, errors.New("tenant policy fingerprint owner is missing")
-	}
-	return owner, nil
-}
-
 func verifyTenantPolicyFingerprint(
 	db *gorm.DB,
 	tables []string,
 	runtimeRole string,
 ) error {
-	var exists bool
-	if err := db.Raw(
-		"SELECT to_regprocedure(?) IS NOT NULL",
-		tenantPolicyFingerprintSignature,
-	).Scan(&exists).Error; err != nil {
-		return fmt.Errorf("inspect tenant policy fingerprint function: %w", err)
-	}
-	if !exists {
-		return errors.New("tenant policy fingerprint is missing (run rereply rls-migrate before deployment)")
-	}
-
-	var executable bool
-	if err := db.Raw(
-		"SELECT has_function_privilege(current_user, ?, 'EXECUTE')",
-		tenantPolicyFingerprintSignature,
-	).Scan(&executable).Error; err != nil {
-		return fmt.Errorf("inspect tenant policy fingerprint privilege: %w", err)
-	}
-	if !executable {
-		return errors.New("runtime role cannot execute the tenant policy fingerprint function")
-	}
-	owner, err := tenantPolicyFingerprintOwner(db)
+	coreTables, additiveTables, err := tenantPolicyFingerprintProfiles(tables)
 	if err != nil {
-		return fmt.Errorf("inspect tenant policy fingerprint owner: %w", err)
+		return fmt.Errorf("partition tenant policy fingerprint profiles: %w", err)
 	}
-	runtimeIsOwnerMember, err := roleHasMembership(db, runtimeRole, owner.OID)
-	if err != nil {
-		return fmt.Errorf("inspect runtime membership in tenant policy fingerprint owner: %w", err)
-	}
-	if runtimeRole == owner.Name || runtimeIsOwnerMember {
+	if len(additiveTables) != len(tenantRLSAdditiveProfileV1) {
 		return fmt.Errorf(
-			"runtime role %q must not be a member of tenant policy fingerprint owner role %q",
-			runtimeRole,
-			owner.Name,
+			"additive tenant policy profile v%d is incomplete: got %d table(s), expected %d",
+			tenantRLSAdditiveProfileVersion, len(additiveTables), len(tenantRLSAdditiveProfileV1),
 		)
 	}
-
-	var expected string
-	if err := db.Raw(
-		"SELECT public.rereply_tenant_policy_fingerprint()",
-	).Scan(&expected).Error; err != nil {
-		return fmt.Errorf("read expected tenant policy fingerprint: %w", err)
-	}
-	actual, err := tenantPolicyFingerprint(db, tables)
+	actual, err := tenantPolicyFingerprint(db, coreTables)
 	if err != nil {
 		return fmt.Errorf("compute current tenant policy fingerprint: %w", err)
 	}
-	if actual != expected {
-		return errors.New("tenant RLS policy fingerprint does not match the applied contract")
+	owner, err := verifyExactLegacyTenantFingerprintFunction(
+		db,
+		tenantPolicyFingerprintSignature,
+		"rereply_tenant_policy_fingerprint",
+		actual,
+		runtimeRole,
+		nil,
+		false,
+	)
+	if err != nil {
+		return fmt.Errorf("verify tenant policy fingerprint contract: %w", err)
+	}
+	if err := verifyProtectedTableFingerprintOwner(db, tables, owner.OID); err != nil {
+		return err
+	}
+	runtimeRoleOID, err := exactDatabaseRoleOID(db, runtimeRole)
+	if err != nil {
+		return err
+	}
+	if err := verifyNoDangerousRuntimeDefaultTablePrivileges(db, owner.OID, runtimeRoleOID); err != nil {
+		return err
+	}
+	return verifyTenantAdditivePolicyFingerprint(db, additiveTables, runtimeRole, owner)
+}
+
+func verifyProtectedTableFingerprintOwner(db *gorm.DB, tables []string, ownerOID int64) error {
+	if len(tables) == 0 || ownerOID == 0 {
+		return errors.New("protected-table fingerprint owner binding is missing")
+	}
+	placeholders := make([]string, len(tables))
+	arguments := make([]any, 0, len(tables)+1)
+	arguments = append(arguments, ownerOID)
+	for index, table := range tables {
+		if err := validateIdentifier(table); err != nil {
+			return err
+		}
+		placeholders[index] = "?"
+		arguments = append(arguments, table)
+	}
+	var count int64
+	query := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM pg_catalog.pg_class AS relation
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		WHERE relation.relowner = CAST(? AS oid)
+		  AND namespace.nspname = 'public'
+		  AND relation.relkind = 'r'
+		  AND relation.relpersistence = 'p'
+		  AND relation.relname IN (%s)
+	`, strings.Join(placeholders, ", "))
+	if err := db.Raw(query, arguments...).Scan(&count).Error; err != nil {
+		return fmt.Errorf("inspect protected-table fingerprint owner binding: %w", err)
+	}
+	if count != int64(len(tables)) {
+		return errors.New("tenant fingerprint owner does not own every protected table")
+	}
+	return nil
+}
+
+func verifyTenantAdditivePolicyFingerprint(
+	db *gorm.DB,
+	tables []string,
+	runtimeRole string,
+	coreOwner databaseRoleReference,
+) error {
+	expected, err := tenantPolicyAdditiveFingerprint(db, tables)
+	if err != nil {
+		return fmt.Errorf("compute additive tenant policy fingerprint: %w", err)
+	}
+	if _, err := verifyExactLegacyTenantFingerprintFunction(
+		db,
+		tenantAdditivePolicyFingerprintSignature,
+		"rereply_tenant_policy_additive_fingerprint_v1",
+		expected,
+		runtimeRole,
+		&coreOwner,
+		false,
+	); err != nil {
+		return fmt.Errorf(
+			"additive tenant policy profile v%d fingerprint contract is invalid: %w",
+			tenantRLSAdditiveProfileVersion,
+			err,
+		)
 	}
 	return nil
 }
@@ -1561,6 +1832,7 @@ func RemoveTenantRLS(db *gorm.DB) error {
 			"public.rereply_meta_deauth_targets(text,text)",
 			"public.rereply_meta_deauth_target_page(text,text,uuid,integer)",
 			"public.rereply_tenant_policy_fingerprint()",
+			"public.rereply_tenant_policy_additive_fingerprint_v1()",
 			"public.rereply_rls_routing_version()",
 		} {
 			if err := tx.Exec("DROP FUNCTION IF EXISTS " + signature).Error; err != nil {

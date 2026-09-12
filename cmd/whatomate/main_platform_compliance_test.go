@@ -300,6 +300,13 @@ func TestValidateServerMigrationMode(t *testing.T) {
 	}
 }
 
+func TestVerifyRLSMigrationRuntimeRejectsMissingConfigurationBeforeConnection(t *testing.T) {
+	t.Parallel()
+
+	err := verifyRLSMigrationRuntime(nil)
+	require.ErrorContains(t, err, "runtime database configuration is required")
+}
+
 func TestDispatchPlatformComplianceBootstrapAcceptsCanonicalFalseBoolean(t *testing.T) {
 	t.Parallel()
 
