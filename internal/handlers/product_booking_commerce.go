@@ -367,6 +367,20 @@ func (a *App) CreateBookingService(r *fastglue.Request) error {
 		if err := tx.Create(&service).Error; err != nil {
 			return err
 		}
+		// GORM replaces false with this model's true default during Create.
+		// Restore an explicit inactive request in the same transaction before
+		// links, audit, or the response can observe the defaulted value.
+		if !active {
+			result := tx.Model(&service).Where("organization_id = ?", orgID).
+				UpdateColumn("is_active", false)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errors.New("booking service active state was not persisted")
+			}
+			service.IsActive = false
+		}
 		if err := replaceBookingServiceResources(tx, orgID, service.ID, req.ResourceIDs); err != nil {
 			return err
 		}
@@ -588,6 +602,19 @@ func (a *App) CreateBookingResource(r *fastglue.Request) error {
 		}
 		if err := tx.Create(&resource).Error; err != nil {
 			return err
+		}
+		// Keep the model's active default, but persist an explicit false
+		// atomically with creation and its audit record.
+		if !active {
+			result := tx.Model(&resource).Where("organization_id = ?", orgID).
+				UpdateColumn("is_active", false)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errors.New("booking resource active state was not persisted")
+			}
+			resource.IsActive = false
 		}
 		return audit.LogAudit(
 			tx, orgID, userID, audit.GetUserName(tx, userID),
@@ -1548,6 +1575,13 @@ func (a *App) UpdatePackage(r *fastglue.Request) error {
 	}
 	if err := validatePackageRequest(&req, true); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+	// Commercial editing still requires write; explicitly retiring a package
+	// also requires delete, including when sent through this generic update.
+	if req.IsActive != nil && !*req.IsActive {
+		if err := a.requirePermission(r, userID, models.ResourcePackages, models.ActionDelete); err != nil {
+			return nil
+		}
 	}
 	var updated models.PackageDefinition
 	err = a.DB.Transaction(func(tx *gorm.DB) error {

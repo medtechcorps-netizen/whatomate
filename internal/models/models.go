@@ -404,23 +404,28 @@ type Message struct {
 	// InboxConversationID is the provider-neutral conversation bridge. The
 	// legacy string ConversationID remains intact for WhatsApp compatibility
 	// while channels are migrated incrementally.
-	InboxConversationID *uuid.UUID    `gorm:"type:uuid;index" json:"inbox_conversation_id,omitempty"`
-	Direction           Direction     `gorm:"size:10;not null" json:"direction"`
-	MessageType         MessageType   `gorm:"size:20;not null" json:"message_type"`
-	Content             string        `gorm:"type:text" json:"content"`
-	MediaURL            string        `gorm:"type:text" json:"media_url"`
-	MediaMimeType       string        `gorm:"size:100" json:"media_mime_type"`
-	MediaFilename       string        `gorm:"size:255" json:"media_filename"`
-	TemplateName        string        `gorm:"size:255" json:"template_name"`
-	TemplateParams      JSONB         `gorm:"type:jsonb" json:"template_params"`
-	InteractiveData     JSONB         `gorm:"type:jsonb" json:"interactive_data"`
-	FlowResponse        JSONB         `gorm:"type:jsonb" json:"flow_response"`
-	Status              MessageStatus `gorm:"size:20;default:'pending'" json:"status"`
-	ErrorMessage        string        `gorm:"type:text" json:"error_message"`
-	IsReply             bool          `gorm:"default:false" json:"is_reply"`
-	ReplyToMessageID    *uuid.UUID    `gorm:"type:uuid" json:"reply_to_message_id,omitempty"`
-	SentByUserID        *uuid.UUID    `gorm:"type:uuid;index" json:"sent_by_user_id,omitempty"` // User who sent outgoing message
-	Metadata            JSONB         `gorm:"type:jsonb;default:'{}'" json:"metadata"`
+	InboxConversationID *uuid.UUID `gorm:"type:uuid;index" json:"inbox_conversation_id,omitempty"`
+	// IngestedAt is the server-side persistence order used by read cursors. It
+	// intentionally remains nullable during the additive rolling migration;
+	// readers fall back to CreatedAt for rows written by an older binary.
+	// CreatedAt remains the provider/display timestamp.
+	IngestedAt       *time.Time    `gorm:"default:clock_timestamp()" json:"ingested_at,omitempty"`
+	Direction        Direction     `gorm:"size:10;not null" json:"direction"`
+	MessageType      MessageType   `gorm:"size:20;not null" json:"message_type"`
+	Content          string        `gorm:"type:text" json:"content"`
+	MediaURL         string        `gorm:"type:text" json:"media_url"`
+	MediaMimeType    string        `gorm:"size:100" json:"media_mime_type"`
+	MediaFilename    string        `gorm:"size:255" json:"media_filename"`
+	TemplateName     string        `gorm:"size:255" json:"template_name"`
+	TemplateParams   JSONB         `gorm:"type:jsonb" json:"template_params"`
+	InteractiveData  JSONB         `gorm:"type:jsonb" json:"interactive_data"`
+	FlowResponse     JSONB         `gorm:"type:jsonb" json:"flow_response"`
+	Status           MessageStatus `gorm:"size:20;default:'pending'" json:"status"`
+	ErrorMessage     string        `gorm:"type:text" json:"error_message"`
+	IsReply          bool          `gorm:"default:false" json:"is_reply"`
+	ReplyToMessageID *uuid.UUID    `gorm:"type:uuid" json:"reply_to_message_id,omitempty"`
+	SentByUserID     *uuid.UUID    `gorm:"type:uuid;index" json:"sent_by_user_id,omitempty"` // User who sent outgoing message
+	Metadata         JSONB         `gorm:"type:jsonb;default:'{}'" json:"metadata"`
 
 	// Relations
 	Organization   *Organization `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`
@@ -431,6 +436,18 @@ type Message struct {
 
 func (Message) TableName() string {
 	return "messages"
+}
+
+// EffectiveIngestedAt preserves rolling compatibility with messages created
+// before the nullable ingestion-order column existed.
+func (m *Message) EffectiveIngestedAt() time.Time {
+	if m != nil && m.IngestedAt != nil && !m.IngestedAt.IsZero() {
+		return m.IngestedAt.UTC()
+	}
+	if m == nil {
+		return time.Time{}
+	}
+	return m.CreatedAt.UTC()
 }
 
 // Template represents a WhatsApp message template

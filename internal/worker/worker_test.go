@@ -3,15 +3,20 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
@@ -22,6 +27,407 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+type campaignContactWriteSQLStateError struct {
+	code string
+}
+
+func (err campaignContactWriteSQLStateError) Error() string {
+	return "postgres test error " + err.code
+}
+
+func (err campaignContactWriteSQLStateError) SQLState() string {
+	return err.code
+}
+
+func TestCampaignContactWriteRetryPolicyIncludesSelectorFenceContention(t *testing.T) {
+	wrapped := fmt.Errorf("wrapped selector fence contention: %w", campaignContactWriteSQLStateError{code: "55P03"})
+	assert.True(t, retryableCampaignContactWrite(wrapped))
+	assert.False(t, retryableCampaignContactWrite(
+		fmt.Errorf("wrapped deliberate failure: %w", campaignContactWriteSQLStateError{code: "P0001"}),
+	))
+	assert.Equal(t, 6, campaignCanonicalContactAttempts)
+	assert.Equal(t, [...]time.Duration{
+		25 * time.Millisecond,
+		50 * time.Millisecond,
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+	}, campaignCanonicalContactRetryBackoffs)
+}
+
+type campaignContactWriteAttempt struct {
+	number        int32
+	transactionID string
+	probeErr      error
+	release       func()
+}
+
+type campaignContactWriteObserver struct {
+	organizationID uuid.UUID
+	phoneNumber    string
+	nextAttempt    atomic.Int32
+	attempts       chan campaignContactWriteAttempt
+	results        chan error
+}
+
+func newCampaignContactWriteObserver(organizationID uuid.UUID, phoneNumber string) *campaignContactWriteObserver {
+	return &campaignContactWriteObserver{
+		organizationID: organizationID,
+		phoneNumber:    phoneNumber,
+		attempts:       make(chan campaignContactWriteAttempt, campaignCanonicalContactAttempts+1),
+		results:        make(chan error, campaignCanonicalContactAttempts+1),
+	}
+}
+
+func (observer *campaignContactWriteObserver) matches(tx *gorm.DB) bool {
+	if tx == nil || tx.Statement == nil || tx.Statement.Schema == nil ||
+		tx.Statement.Schema.Table != "contacts" {
+		return false
+	}
+	contact, ok := tx.Statement.Model.(*models.Contact)
+	return ok && contact.OrganizationID == observer.organizationID &&
+		contact.PhoneNumber == observer.phoneNumber
+}
+
+func (observer *campaignContactWriteObserver) before(tx *gorm.DB) {
+	if !observer.matches(tx) {
+		return
+	}
+	var transactionID string
+	probe := tx.Session(&gorm.Session{NewDB: true}).
+		Raw("SELECT pg_catalog.pg_current_xact_id()::text").
+		Scan(&transactionID)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	observer.attempts <- campaignContactWriteAttempt{
+		number:        observer.nextAttempt.Add(1),
+		transactionID: transactionID,
+		probeErr:      probe.Error,
+		release: func() {
+			releaseOnce.Do(func() { close(release) })
+		},
+	}
+	ctx := tx.Statement.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-release:
+	case <-ctx.Done():
+		_ = tx.AddError(ctx.Err())
+	}
+}
+
+func (observer *campaignContactWriteObserver) after(tx *gorm.DB) {
+	if observer.matches(tx) {
+		observer.results <- tx.Error
+	}
+}
+
+func registerCampaignContactWriteObserver(
+	t *testing.T,
+	db *gorm.DB,
+	operation string,
+	organizationID uuid.UUID,
+	phoneNumber string,
+) *campaignContactWriteObserver {
+	t.Helper()
+	observer := newCampaignContactWriteObserver(organizationID, phoneNumber)
+	callbackID := uuid.NewString()
+	beforeName := "test:campaign-contact-before:" + callbackID
+	afterName := "test:campaign-contact-after:" + callbackID
+	switch operation {
+	case "create":
+		require.NoError(t, db.Callback().Create().Before("gorm:create").Register(beforeName, observer.before))
+		t.Cleanup(func() { _ = db.Callback().Create().Remove(beforeName) })
+		require.NoError(t, db.Callback().Create().After("gorm:create").Register(afterName, observer.after))
+		t.Cleanup(func() { _ = db.Callback().Create().Remove(afterName) })
+	case "update":
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register(beforeName, observer.before))
+		t.Cleanup(func() { _ = db.Callback().Update().Remove(beforeName) })
+		require.NoError(t, db.Callback().Update().After("gorm:update").Register(afterName, observer.after))
+		t.Cleanup(func() { _ = db.Callback().Update().Remove(afterName) })
+	default:
+		t.Fatalf("unsupported contact observer operation %q", operation)
+	}
+	return observer
+}
+
+func awaitCampaignContactWriteAttempt(t *testing.T, observer *campaignContactWriteObserver) campaignContactWriteAttempt {
+	t.Helper()
+	select {
+	case attempt := <-observer.attempts:
+		if attempt.probeErr != nil || attempt.transactionID == "" {
+			attempt.release()
+		}
+		require.NoError(t, attempt.probeErr)
+		require.NotEmpty(t, attempt.transactionID)
+		return attempt
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for campaign contact write attempt")
+		return campaignContactWriteAttempt{}
+	}
+}
+
+func awaitCampaignContactWriteResult(t *testing.T, observer *campaignContactWriteObserver) error {
+	t.Helper()
+	select {
+	case err := <-observer.results:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for campaign contact write result")
+		return nil
+	}
+}
+
+func holdCampaignContactSelectorFence(t *testing.T, db *gorm.DB, organizationID uuid.UUID) *gorm.DB {
+	t.Helper()
+	holder := db.Begin()
+	require.NoError(t, holder.Error)
+	t.Cleanup(func() { _ = holder.Rollback().Error })
+	require.NoError(t, holder.Exec(
+		"SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(?, 0))",
+		database.WhatsAppIdentityReviewContactSelectorFenceKey(organizationID),
+	).Error)
+	return holder
+}
+
+func requireCampaignSelectorFenceError(t *testing.T, err error) *pgconn.PgError {
+	t.Helper()
+	require.Error(t, err)
+	var pgErr *pgconn.PgError
+	require.True(t, errors.As(err, &pgErr), "expected PostgreSQL error, got %T: %v", err, err)
+	require.Equal(t, "55P03", pgErr.Code)
+	return pgErr
+}
+
+func startCampaignSelectorFenceJob(t *testing.T, w *Worker, job *queue.RecipientJob) <-chan error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	result := make(chan error, 1)
+	finished := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Error("campaign recipient worker did not stop after cancellation")
+		}
+	})
+	go func() {
+		defer close(finished)
+		result <- w.HandleRecipientJob(ctx, job)
+	}()
+	return result
+}
+
+func TestWorker_HandleRecipientJob_RetriesRealSelectorFenceInFreshTransaction(t *testing.T) {
+	w := testWorker(t)
+	organization, account, _, campaign, recipient := createTestCampaignData(t, w)
+	require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
+
+	observer := registerCampaignContactWriteObserver(
+		t,
+		w.DB,
+		"create",
+		organization.ID,
+		recipient.PhoneNumber,
+	)
+	holder := holdCampaignContactSelectorFence(t, w.DB, organization.ID)
+
+	var providerCalls atomic.Int32
+	providerChecks := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, request *http.Request) {
+		providerCalls.Add(1)
+		ctx, cancel := context.WithTimeout(request.Context(), 5*time.Second)
+		defer cancel()
+		providerDB := w.DB.WithContext(ctx)
+		var contacts int64
+		checkErr := providerDB.Unscoped().Model(&models.Contact{}).
+			Where("organization_id = ? AND phone_number = ?", organization.ID, recipient.PhoneNumber).
+			Count(&contacts).Error
+		if checkErr == nil && contacts != 1 {
+			checkErr = fmt.Errorf("provider observed %d committed contacts; expected 1", contacts)
+		}
+		var storedRecipient models.BulkMessageRecipient
+		if checkErr == nil {
+			checkErr = providerDB.First(&storedRecipient, recipient.ID).Error
+		}
+		if checkErr == nil && (storedRecipient.Status != models.MessageStatusPending || storedRecipient.MessageID == nil) {
+			checkErr = fmt.Errorf("provider observed recipient before its pending claim committed")
+		}
+		if checkErr == nil {
+			var storedMessage models.Message
+			checkErr = providerDB.First(&storedMessage, *storedRecipient.MessageID).Error
+			if checkErr == nil && (storedMessage.OrganizationID != organization.ID || storedMessage.Status != models.MessageStatusPending) {
+				checkErr = fmt.Errorf("provider observed an invalid committed pending campaign message")
+			}
+		}
+		// Keep an unexpected duplicate provider call observable without blocking
+		// the handler (and therefore server shutdown) on this diagnostic channel.
+		select {
+		case providerChecks <- checkErr:
+		default:
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.selector-retry"}},
+		})
+	}))
+	t.Cleanup(server.Close)
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	job := &queue.RecipientJob{
+		CampaignID:     campaign.ID,
+		RecipientID:    recipient.ID,
+		OrganizationID: organization.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		RecipientName:  recipient.RecipientName,
+		TemplateParams: recipient.TemplateParams,
+	}
+	result := startCampaignSelectorFenceJob(t, w, job)
+
+	first := awaitCampaignContactWriteAttempt(t, observer)
+	defer first.release()
+	require.Equal(t, int32(1), first.number)
+	first.release()
+	requireCampaignSelectorFenceError(t, awaitCampaignContactWriteResult(t, observer))
+
+	second := awaitCampaignContactWriteAttempt(t, observer)
+	defer second.release()
+	require.Equal(t, int32(2), second.number)
+	require.NotEqual(t, first.transactionID, second.transactionID, "retry reused the failed transaction")
+	require.Zero(t, providerCalls.Load(), "provider called before selector fence release")
+	require.NoError(t, holder.Commit().Error)
+	second.release()
+	require.NoError(t, awaitCampaignContactWriteResult(t, observer))
+
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("campaign recipient did not complete after selector fence release")
+	}
+	require.Equal(t, int32(2), observer.nextAttempt.Load())
+	require.Equal(t, int32(1), providerCalls.Load())
+	select {
+	case err := <-providerChecks:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider commit-boundary check was not observed")
+	}
+
+	var contacts []models.Contact
+	require.NoError(t, w.DB.Unscoped().
+		Where("organization_id = ? AND phone_number = ?", organization.ID, recipient.PhoneNumber).
+		Find(&contacts).Error)
+	require.Len(t, contacts, 1)
+	assert.Nil(t, contacts[0].MergedIntoID)
+	assert.False(t, contacts[0].DeletedAt.Valid)
+	assert.Equal(t, recipient.RecipientName, contacts[0].ProfileName)
+
+	var storedRecipient models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusSent, storedRecipient.Status)
+	assert.Equal(t, "wamid.selector-retry", storedRecipient.WhatsAppMessageID)
+	var storedCampaign models.BulkMessageCampaign
+	require.NoError(t, w.DB.First(&storedCampaign, campaign.ID).Error)
+	assert.Equal(t, 1, storedCampaign.SentCount)
+	assert.Zero(t, storedCampaign.FailedCount)
+}
+
+func TestWorker_HandleRecipientJob_RealSelectorFenceExhaustionStaysPending(t *testing.T) {
+	w := testWorker(t)
+	organization, _, _, campaign, recipient := createTestCampaignData(t, w)
+	existing := &models.Contact{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: organization.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		ProfileName:    "Profile before restore",
+	}
+	require.NoError(t, w.DB.Create(existing).Error)
+	require.NoError(t, w.DB.Delete(existing).Error)
+
+	// The real restore UPDATE exercises the contactutil error propagation added
+	// for selector-fence failures; every retry must receive the original 55P03.
+	observer := registerCampaignContactWriteObserver(
+		t,
+		w.DB,
+		"update",
+		organization.ID,
+		recipient.PhoneNumber,
+	)
+	holdCampaignContactSelectorFence(t, w.DB, organization.ID)
+
+	var providerCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		providerCalls.Add(1)
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.must-not-send"}},
+		})
+	}))
+	t.Cleanup(server.Close)
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	job := &queue.RecipientJob{
+		CampaignID:     campaign.ID,
+		RecipientID:    recipient.ID,
+		OrganizationID: organization.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		RecipientName:  recipient.RecipientName,
+		TemplateParams: recipient.TemplateParams,
+	}
+	result := startCampaignSelectorFenceJob(t, w, job)
+
+	transactionIDs := make(map[string]struct{}, campaignCanonicalContactAttempts)
+	for expected := int32(1); expected <= campaignCanonicalContactAttempts; expected++ {
+		attempt := awaitCampaignContactWriteAttempt(t, observer)
+		defer attempt.release()
+		require.Equal(t, expected, attempt.number)
+		transactionIDs[attempt.transactionID] = struct{}{}
+		attempt.release()
+		requireCampaignSelectorFenceError(t, awaitCampaignContactWriteResult(t, observer))
+	}
+	require.Len(t, transactionIDs, campaignCanonicalContactAttempts, "a retry reused an aborted transaction")
+
+	var handleErr error
+	select {
+	case handleErr = <-result:
+	case <-time.After(10 * time.Second):
+		t.Fatal("campaign selector-fence retries did not exhaust")
+	}
+	requireCampaignSelectorFenceError(t, handleErr)
+	assert.Equal(t, int32(campaignCanonicalContactAttempts), observer.nextAttempt.Load())
+	// RedisConsumer ACKs only nil handler results. Returning this error is the
+	// worker-side no-XACK boundary covered by the queue consumer regression.
+	assert.Equal(t, int32(0), providerCalls.Load())
+
+	var storedRecipient models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusPending, storedRecipient.Status)
+	assert.Nil(t, storedRecipient.MessageID)
+	assert.Empty(t, storedRecipient.WhatsAppMessageID)
+	assert.Empty(t, storedRecipient.ErrorMessage)
+	assert.Nil(t, storedRecipient.SentAt)
+	var messageCount int64
+	require.NoError(t, w.DB.Unscoped().Model(&models.Message{}).
+		Where("organization_id = ?", organization.ID).
+		Count(&messageCount).Error)
+	assert.Zero(t, messageCount, "exhausted contact retries created a campaign message")
+
+	var storedCampaign models.BulkMessageCampaign
+	require.NoError(t, w.DB.First(&storedCampaign, campaign.ID).Error)
+	assert.Equal(t, models.CampaignStatusProcessing, storedCampaign.Status)
+	assert.Zero(t, storedCampaign.SentCount)
+	assert.Zero(t, storedCampaign.FailedCount)
+
+	var storedContact models.Contact
+	require.NoError(t, w.DB.Unscoped().First(&storedContact, existing.ID).Error)
+	assert.True(t, storedContact.DeletedAt.Valid)
+	assert.Equal(t, "Profile before restore", storedContact.ProfileName)
+}
 
 func testWorker(t *testing.T) *Worker {
 	t.Helper()

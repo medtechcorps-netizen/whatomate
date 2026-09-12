@@ -15,6 +15,36 @@ func TestGetIndexesEnforcesOneActiveTransferPerContact(t *testing.T) {
 	assert.Contains(t, statements, "WHERE status = 'active' AND deleted_at IS NULL")
 }
 
+func TestGetIndexesSupportsPerUserInboxAttentionSummary(t *testing.T) {
+	statements := strings.Join(getIndexes(), "\n")
+	assert.Contains(t, statements, "idx_messages_org_inbox_incoming_ingested")
+	assert.Contains(t, statements, "NOT index_state.indisvalid")
+	assert.Contains(t, statements, "must be dropped concurrently before retrying migration")
+	assert.Contains(t, statements, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_inbox_incoming_ingested")
+	assert.Contains(t, statements, "messages(organization_id, inbox_conversation_id, (COALESCE(ingested_at, created_at)), id)")
+	assert.Contains(t, statements, "inbox_conversation_id IS NOT NULL")
+	assert.Contains(t, statements, "direction = 'incoming'")
+	assert.Contains(t, statements, "deleted_at IS NULL")
+}
+
+func TestGetIndexesSupportsEffectiveIngestionTranscriptPagination(t *testing.T) {
+	statements := strings.Join(getIndexes(), "\n")
+	assert.Contains(t, statements, "idx_messages_org_inbox_ingested")
+	assert.Contains(t, statements, "idx_messages_org_inbox_ingested_highwater")
+	assert.Contains(t, statements, "idx_messages_org_contact_ingested")
+	assert.Contains(t, statements, "idx_messages_org_contact_account_ingested")
+	assert.Contains(t, statements, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_inbox_ingested")
+	assert.Contains(t, statements, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_inbox_ingested_highwater")
+	assert.Contains(t, statements, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_contact_ingested")
+	assert.Contains(t, statements, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_contact_account_ingested")
+	assert.Contains(t, statements, "organization_id, inbox_conversation_id, (COALESCE(ingested_at, created_at)), id")
+	assert.Contains(t, statements, "organization_id, inbox_conversation_id, ingested_at DESC")
+	assert.Contains(t, statements, "WHERE ingested_at IS NOT NULL")
+	assert.Contains(t, statements, "organization_id, contact_id, (COALESCE(ingested_at, created_at)), id")
+	assert.Contains(t, statements, "organization_id, contact_id, whats_app_account, (COALESCE(ingested_at, created_at)), id")
+	assert.Contains(t, statements, "invalid message ingestion-order pagination index")
+}
+
 func TestGetIndexesEnforcesOneOwnerForGloballyRoutedChannelIdentities(t *testing.T) {
 	statements := strings.Join(getIndexes(), "\n")
 	assert.Contains(t, statements, "uq_channel_accounts_global_routable_identity")
@@ -51,7 +81,7 @@ func TestGetIndexesEnforcesOneOwnerForNormalizedLiveWhatsAppPhoneIDs(t *testing.
 		case strings.Contains(statement, "cannot enforce unique live WhatsApp Phone IDs"):
 			preflightPosition = position
 			assert.Contains(t, statement, "WHERE deleted_at IS NULL")
-			assert.Contains(t, statement, "GROUP BY BTRIM(phone_id)")
+			assert.Contains(t, statement, "GROUP BY pg_catalog.btrim(phone_id::text)")
 			assert.Contains(t, statement, "HAVING COUNT(*) > 1")
 			assert.NotContains(t, statement, "UPDATE whatsapp_accounts")
 			assert.NotContains(t, statement, "DELETE FROM whatsapp_accounts")
@@ -59,11 +89,11 @@ func TestGetIndexesEnforcesOneOwnerForNormalizedLiveWhatsAppPhoneIDs(t *testing.
 		case strings.Contains(statement, "uq_whatsapp_accounts_live_phone_id"):
 			indexPosition = position
 			assert.Contains(t, statement, "CREATE UNIQUE INDEX")
-			assert.Contains(t, statement, "ON whatsapp_accounts(BTRIM(phone_id))")
+			assert.Contains(t, statement, "ON whatsapp_accounts(pg_catalog.btrim(phone_id::text))")
 			assert.Contains(t, statement, "WHERE deleted_at IS NULL")
-		case strings.Contains(statement, "SET phone_id = BTRIM(phone_id)"):
+		case strings.Contains(statement, "SET phone_id = pg_catalog.btrim(phone_id::text)"):
 			normalizationPosition = position
-			assert.Contains(t, statement, "WHERE phone_id <> BTRIM(phone_id)")
+			assert.Contains(t, statement, "WHERE phone_id <> pg_catalog.btrim(phone_id::text)")
 		case strings.Contains(statement, "idx_whatsapp_accounts_org_phone"):
 			legacyIndexPosition = position
 			assert.Contains(t, statement, "DROP INDEX IF EXISTS")

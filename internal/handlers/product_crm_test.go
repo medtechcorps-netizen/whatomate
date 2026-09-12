@@ -948,7 +948,7 @@ func assertProductCRMAtomicCounts(
 	wantHistory, wantOutbox, wantAudit int64,
 ) {
 	t.Helper()
-	var historyCount, outboxCount, auditCount int64
+	var historyCount, outboxCount, auditCount, activityCount int64
 	require.NoError(t, db.Model(&models.CRMStageHistory{}).
 		Where("organization_id = ? AND lead_id = ?", orgID, leadID).
 		Count(&historyCount).Error)
@@ -966,4 +966,353 @@ func assertProductCRMAtomicCounts(
 	assert.Equal(t, wantHistory, historyCount)
 	assert.Equal(t, wantOutbox, outboxCount)
 	assert.Equal(t, wantAudit, auditCount)
+	require.NoError(t, db.Model(&models.CustomerActivityEvent{}).
+		Where("organization_id = ? AND lead_id = ?", orgID, leadID).
+		Count(&activityCount).Error)
+	assert.Equal(t, wantOutbox, activityCount, "each CRM activity must retain its matching outbox event")
+}
+func TestApp_CRMLeadLifecyclePermissionMatrix(t *testing.T) {
+	app := newProductCRMDatabaseTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	owner := createProductCRMTestUserWithLeadPermissions(t, app, org.ID, models.ActionWrite, models.ActionDelete)
+	enableBookingCommerceTestEntitlement(t, app.DB, org.ID, owner.ID, "crm.enabled")
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	pipeline, stage := createProductCRMTestPipeline(t, app.DB, org.ID, owner.ID)
+
+	// The default frontline role may edit/reopen, but it must not archive.
+	defaults := models.SystemRolePermissions()
+	require.Contains(t, defaults["agent"], "crm.leads:write")
+	require.NotContains(t, defaults["agent"], "crm.leads:delete")
+	require.Contains(t, defaults["manager"], "crm.leads:delete")
+
+	for _, permissions := range []struct {
+		name    string
+		actions []string
+	}{
+		{name: "none"},
+		{name: "read", actions: []string{models.ActionRead}},
+		{name: "write", actions: []string{models.ActionWrite}},
+		{name: "delete", actions: []string{models.ActionDelete}},
+		{name: "read_write", actions: []string{models.ActionRead, models.ActionWrite}},
+		{name: "read_delete", actions: []string{models.ActionRead, models.ActionDelete}},
+		{name: "write_delete", actions: []string{models.ActionWrite, models.ActionDelete}},
+		{name: "read_write_delete", actions: []string{models.ActionRead, models.ActionWrite, models.ActionDelete}},
+	} {
+		t.Run(permissions.name, func(t *testing.T) {
+			user := createProductCRMTestUserWithLeadPermissions(t, app, org.ID, permissions.actions...)
+			for _, transition := range []struct {
+				name       string
+				permission string
+				initial    models.CRMLeadStatus
+				target     models.CRMLeadStatus
+				call       func(*fastglue.Request) error
+			}{
+				{"archive", models.ActionDelete, models.CRMLeadStatusOpen, models.CRMLeadStatusArchived, app.ArchiveCRMLead},
+				{"reopen", models.ActionWrite, models.CRMLeadStatusArchived, models.CRMLeadStatusOpen, app.ReopenCRMLead},
+			} {
+				t.Run(transition.name, func(t *testing.T) {
+					lead := createProductCRMTestLead(t, app.DB, org.ID, owner.ID, contact.ID, pipeline.ID, stage.ID, transition.initial)
+					var before models.CRMLead
+					require.NoError(t, app.DB.First(&before, "id = ?", lead.ID).Error)
+					req := newProductCRMLifecycleRequest(t, org.ID, user.ID, lead.ID, CRMLeadLifecycleRequest{
+						Version: 1, IdempotencyKey: uuid.NewString(),
+					})
+					require.NoError(t, transition.call(req))
+					allowed := false
+					for _, action := range permissions.actions {
+						allowed = allowed || action == transition.permission
+					}
+					if !allowed {
+						testutil.AssertErrorResponse(t, req, fasthttp.StatusForbidden, "Insufficient permissions")
+						assertProductCRMLeadUnchanged(t, app.DB, &before)
+						assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 0, 0, 0)
+						return
+					}
+					require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+					var response CRMLeadResponse
+					testutil.ParseEnvelopeResponse(t, req, &response)
+					require.Equal(t, transition.target, response.Status)
+					require.EqualValues(t, 2, response.Version)
+					assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 0, 1, 1)
+				})
+			}
+		})
+	}
+}
+
+func TestApp_CRMLeadLifecycleAuthorizedRejectionsDoNotMutate(t *testing.T) {
+	for _, action := range []string{"archive", "reopen"} {
+		for _, rejection := range []string{"unlicensed", "wrong_tenant", "stale_version"} {
+			t.Run(action+"/"+rejection, func(t *testing.T) {
+				app := newProductCRMDatabaseTestApp(t)
+				org := testutil.CreateTestOrganization(t, app.DB)
+				permission := models.ActionDelete
+				initial := models.CRMLeadStatusOpen
+				call := app.ArchiveCRMLead
+				if action == "reopen" {
+					permission = models.ActionWrite
+					initial = models.CRMLeadStatusArchived
+					call = app.ReopenCRMLead
+				}
+				user := createProductCRMTestUserWithLeadPermissions(t, app, org.ID, permission)
+				if rejection != "unlicensed" {
+					enableBookingCommerceTestEntitlement(t, app.DB, org.ID, user.ID, "crm.enabled")
+				}
+				leadOrg, leadOwner := org, user
+				if rejection == "wrong_tenant" {
+					leadOrg = testutil.CreateTestOrganization(t, app.DB)
+					leadOwner = createProductCRMTestUserWithLeadPermissions(t, app, leadOrg.ID, permission)
+				}
+				contact := testutil.CreateTestContact(t, app.DB, leadOrg.ID)
+				pipeline, stage := createProductCRMTestPipeline(t, app.DB, leadOrg.ID, leadOwner.ID)
+				lead := createProductCRMTestLead(t, app.DB, leadOrg.ID, leadOwner.ID, contact.ID, pipeline.ID, stage.ID, initial)
+				var before models.CRMLead
+				require.NoError(t, app.DB.First(&before, "id = ?", lead.ID).Error)
+				body := CRMLeadLifecycleRequest{Version: 1, IdempotencyKey: uuid.NewString()}
+				wantStatus := fasthttp.StatusPaymentRequired
+				wantMessage := "Feature is not included in the organization's active plan"
+				switch rejection {
+				case "wrong_tenant":
+					wantStatus, wantMessage = fasthttp.StatusNotFound, "CRM lead not found"
+				case "stale_version":
+					body.Version = 2
+					wantStatus, wantMessage = fasthttp.StatusConflict, "CRM lead was modified; refresh and retry"
+				}
+				req := newProductCRMLifecycleRequest(t, org.ID, user.ID, lead.ID, body)
+				require.NoError(t, call(req))
+				testutil.AssertErrorResponse(t, req, wantStatus, wantMessage)
+				assertProductCRMLeadUnchanged(t, app.DB, &before)
+				assertProductCRMAtomicCounts(t, app.DB, leadOrg.ID, lead.ID, 0, 0, 0)
+			})
+		}
+	}
+}
+
+func TestApp_CRMLeadLifecycleReplayRequiresCurrentPermission(t *testing.T) {
+	app := newProductCRMDatabaseTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	archiver := createProductCRMTestUserWithLeadPermissions(t, app, org.ID, models.ActionDelete)
+	writer := createProductCRMTestUserWithLeadPermissions(t, app, org.ID, models.ActionWrite)
+	enableBookingCommerceTestEntitlement(t, app.DB, org.ID, archiver.ID, "crm.enabled")
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	pipeline, stage := createProductCRMTestPipeline(t, app.DB, org.ID, archiver.ID)
+	lead := createProductCRMTestLead(t, app.DB, org.ID, archiver.ID, contact.ID, pipeline.ID, stage.ID, models.CRMLeadStatusOpen)
+	archiveBody := CRMLeadLifecycleRequest{Version: 1, IdempotencyKey: uuid.NewString(), Reason: "Retain duplicate history"}
+	archive := newProductCRMLifecycleRequest(t, org.ID, archiver.ID, lead.ID, archiveBody)
+	require.NoError(t, app.ArchiveCRMLead(archive))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(archive))
+	var archived models.CRMLead
+	require.NoError(t, app.DB.First(&archived, "id = ?", lead.ID).Error)
+
+	var deletePermission models.Permission
+	require.NoError(t, app.DB.Where("resource = ? AND action = ?", models.ResourceCRMLeads, models.ActionDelete).First(&deletePermission).Error)
+	grant := models.RolePermission{CustomRoleID: *archiver.RoleID, PermissionID: deletePermission.ID}
+	require.NoError(t, app.DB.Where("custom_role_id = ? AND permission_id = ?", grant.CustomRoleID, grant.PermissionID).
+		Delete(&models.RolePermission{}).Error)
+	replayWithoutPermission := newProductCRMLifecycleRequest(t, org.ID, archiver.ID, lead.ID, archiveBody)
+	require.NoError(t, app.ArchiveCRMLead(replayWithoutPermission))
+	testutil.AssertErrorResponse(t, replayWithoutPermission, fasthttp.StatusForbidden, "Insufficient permissions")
+	assertProductCRMLeadUnchanged(t, app.DB, &archived)
+	assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 0, 1, 1)
+
+	require.NoError(t, app.DB.Create(&grant).Error)
+	replay := newProductCRMLifecycleRequest(t, org.ID, archiver.ID, lead.ID, archiveBody)
+	require.NoError(t, app.ArchiveCRMLead(replay))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(replay))
+	assertProductCRMLeadUnchanged(t, app.DB, &archived)
+	assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 0, 1, 1)
+
+	changedBody := archiveBody
+	changedBody.Reason = "A different request must not reuse the successful key"
+	conflictingReplay := newProductCRMLifecycleRequest(t, org.ID, archiver.ID, lead.ID, changedBody)
+	require.NoError(t, app.ArchiveCRMLead(conflictingReplay))
+	require.Equal(t, fasthttp.StatusConflict, testutil.GetResponseStatusCode(conflictingReplay))
+	assertProductCRMLeadUnchanged(t, app.DB, &archived)
+	assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 0, 1, 1)
+
+	reopenBody := CRMLeadLifecycleRequest{Version: 2, IdempotencyKey: uuid.NewString()}
+	deleteOnlyReopen := newProductCRMLifecycleRequest(t, org.ID, archiver.ID, lead.ID, reopenBody)
+	require.NoError(t, app.ReopenCRMLead(deleteOnlyReopen))
+	testutil.AssertErrorResponse(t, deleteOnlyReopen, fasthttp.StatusForbidden, "Insufficient permissions")
+	assertProductCRMLeadUnchanged(t, app.DB, &archived)
+	assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 0, 1, 1)
+
+	reopen := newProductCRMLifecycleRequest(t, org.ID, writer.ID, lead.ID, reopenBody)
+	require.NoError(t, app.ReopenCRMLead(reopen))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(reopen))
+	var reopened CRMLeadResponse
+	testutil.ParseEnvelopeResponse(t, reopen, &reopened)
+	require.Equal(t, models.CRMLeadStatusOpen, reopened.Status)
+	require.EqualValues(t, 3, reopened.Version)
+	assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 0, 2, 2)
+}
+
+func TestApp_CRMLeadGenericUpdateCannotBypassLifecyclePermissions(t *testing.T) {
+	app := newProductCRMDatabaseTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	writer := createProductCRMTestUserWithLeadPermissions(t, app, org.ID, models.ActionWrite)
+	archiver := createProductCRMTestUserWithLeadPermissions(t, app, org.ID, models.ActionDelete)
+	enableBookingCommerceTestEntitlement(t, app.DB, org.ID, writer.ID, "crm.enabled")
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	pipeline, stage := createProductCRMTestPipeline(t, app.DB, org.ID, writer.ID)
+	lead := createProductCRMTestLead(t, app.DB, org.ID, writer.ID, contact.ID, pipeline.ID, stage.ID, models.CRMLeadStatusOpen)
+	update := func(userID uuid.UUID, body map[string]any) *fastglue.Request {
+		req := testutil.NewJSONRequest(t, body)
+		testutil.SetAuthContext(req, org.ID, userID)
+		testutil.SetPathParam(req, "id", lead.ID.String())
+		require.NoError(t, app.UpdateCRMLead(req))
+		return req
+	}
+
+	// Unknown lifecycle fields cannot become ordinary editable lead fields.
+	injectedArchive := update(writer.ID, map[string]any{
+		"version": 1, "title": "Ordinary edit", "status": "archived",
+	})
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(injectedArchive))
+	var edited models.CRMLead
+	require.NoError(t, app.DB.First(&edited, "id = ?", lead.ID).Error)
+	require.Equal(t, "Ordinary edit", edited.Title)
+	require.Equal(t, models.CRMLeadStatusOpen, edited.Status)
+	require.EqualValues(t, 2, edited.Version)
+	assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 0, 1, 1)
+
+	statusOnly := update(writer.ID, map[string]any{"version": 2, "status": "archived"})
+	testutil.AssertErrorResponse(t, statusOnly, fasthttp.StatusBadRequest, "at least one lead field must be supplied")
+	deleteOnlyEdit := update(archiver.ID, map[string]any{"version": 2, "title": "Delete is not write"})
+	testutil.AssertErrorResponse(t, deleteOnlyEdit, fasthttp.StatusForbidden, "Insufficient permissions")
+	assertProductCRMLeadUnchanged(t, app.DB, &edited)
+	assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 0, 1, 1)
+
+	archive := newProductCRMLifecycleRequest(t, org.ID, archiver.ID, lead.ID, CRMLeadLifecycleRequest{Version: 2})
+	require.NoError(t, app.ArchiveCRMLead(archive))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(archive))
+	var archived models.CRMLead
+	require.NoError(t, app.DB.First(&archived, "id = ?", lead.ID).Error)
+	injectedReopen := update(writer.ID, map[string]any{
+		"version": 3, "title": "Bypass reopen", "status": "open",
+	})
+	testutil.AssertErrorResponse(t, injectedReopen, fasthttp.StatusConflict, "Archived CRM leads must be reopened before editing")
+	moveArchived := newProductCRMMoveRequest(t, org.ID, writer.ID, lead.ID, stage.ID, 3)
+	require.NoError(t, app.MoveCRMLead(moveArchived))
+	testutil.AssertErrorResponse(t, moveArchived, fasthttp.StatusConflict, "Archived CRM leads must be reopened before moving stages")
+	assertProductCRMLeadUnchanged(t, app.DB, &archived)
+	assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 0, 2, 2)
+}
+
+func createProductCRMTestUserWithLeadPermissions(
+	t *testing.T,
+	app *App,
+	orgID uuid.UUID,
+	actions ...string,
+) *models.User {
+	t.Helper()
+	var permissions []models.Permission
+	for _, action := range actions {
+		permission := models.Permission{Resource: models.ResourceCRMLeads, Action: action}
+		require.NoError(t, app.DB.Where("resource = ? AND action = ?", permission.Resource, permission.Action).
+			FirstOrCreate(&permission).Error)
+		permissions = append(permissions, permission)
+	}
+	role := testutil.CreateTestRole(t, app.DB, orgID, "CRM lifecycle", permissions)
+	user := testutil.CreateTestUser(t, app.DB, orgID, testutil.WithRoleID(&role.ID))
+	require.False(t, user.IsSuperAdmin, "permission regressions must exercise the real role boundary")
+	return user
+}
+
+func assertProductCRMLeadUnchanged(t *testing.T, db *gorm.DB, before *models.CRMLead) {
+	t.Helper()
+	var after models.CRMLead
+	require.NoError(t, db.Unscoped().Where("id = ? AND organization_id = ?", before.ID, before.OrganizationID).
+		First(&after).Error)
+	require.Equal(t, *before, after, "a rejected or replayed request must not mutate any lead field")
+}
+
+func TestApp_CRMLeadArchiveReopenPreservesLinkedRecords(t *testing.T) {
+	app := newProductCRMDatabaseTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createProductCRMTestUserWithLeadPermissions(t, app, org.ID, models.ActionWrite, models.ActionDelete)
+	enableBookingCommerceTestEntitlement(t, app.DB, org.ID, user.ID, "crm.enabled")
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	pipeline, stage := createProductCRMTestPipeline(t, app.DB, org.ID, user.ID)
+	lead := createProductCRMTestLead(t, app.DB, org.ID, user.ID, contact.ID, pipeline.ID, stage.ID, models.CRMLeadStatusOpen)
+	message := &models.Message{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		ContactID: contact.ID, WhatsAppAccount: account.Name,
+		WhatsAppMessageID: "wamid." + uuid.NewString(),
+		Direction:         models.DirectionIncoming, MessageType: models.MessageTypeText,
+		Content: "Existing customer conversation", Metadata: models.JSONB{},
+	}
+	task := &models.FollowUpTask{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		ContactID: &contact.ID, LeadID: &lead.ID, Title: "Existing follow-up",
+		Status: models.FollowUpTaskStatusOpen, Priority: models.FollowUpTaskPriorityNormal,
+		CreatedByID: &user.ID, Version: 1, Metadata: models.JSONB{},
+	}
+	history := &models.CRMStageHistory{
+		ID: uuid.New(), OrganizationID: org.ID, LeadID: lead.ID, ToStageID: stage.ID,
+		ChangedByID: &user.ID, Reason: "Original stage assignment", Metadata: models.JSONB{},
+	}
+	invoice := &models.CommerceInvoice{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID, ContactID: contact.ID,
+		InvoiceNumber: "CRM-" + uuid.NewString(), IdempotencyKey: uuid.NewString(),
+		Status: models.CommerceInvoiceStatusPaid, Currency: "MYR",
+		SubtotalMinor: 10000, TotalMinor: 10000, PaidMinor: 10000,
+		Version: 1, CreatedByID: &user.ID, Metadata: models.JSONB{},
+	}
+	for _, record := range []any{message, task, history, invoice} {
+		require.NoError(t, app.DB.Create(record).Error)
+	}
+	records := []struct {
+		id     uuid.UUID
+		before any
+		after  any
+	}{
+		{contact.ID, contact, &models.Contact{}},
+		{message.ID, message, &models.Message{}},
+		{task.ID, task, &models.FollowUpTask{}},
+		{history.ID, history, &models.CRMStageHistory{}},
+		{invoice.ID, invoice, &models.CommerceInvoice{}},
+	}
+	for _, record := range records {
+		require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", record.id, org.ID).First(record.before).Error)
+	}
+	for _, transition := range []struct {
+		version int64
+		status  models.CRMLeadStatus
+		call    func(*fastglue.Request) error
+	}{
+		{1, models.CRMLeadStatusArchived, app.ArchiveCRMLead},
+		{2, models.CRMLeadStatusOpen, app.ReopenCRMLead},
+	} {
+		req := newProductCRMLifecycleRequest(t, org.ID, user.ID, lead.ID, CRMLeadLifecycleRequest{
+			Version: transition.version, IdempotencyKey: uuid.NewString(),
+		})
+		require.NoError(t, transition.call(req))
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+		var response CRMLeadResponse
+		testutil.ParseEnvelopeResponse(t, req, &response)
+		require.Equal(t, transition.status, response.Status)
+		require.Equal(t, contact.ID, response.ContactID)
+		require.Equal(t, pipeline.ID, response.PipelineID)
+		require.Equal(t, stage.ID, response.StageID)
+		require.Equal(t, lead.ValueMinor, response.ValueMinor)
+		require.Equal(t, lead.Currency, response.Currency)
+		for _, record := range records {
+			require.NoError(t, app.DB.Unscoped().Where("id = ? AND organization_id = ?", record.id, org.ID).First(record.after).Error)
+			require.Equal(t, record.before, record.after, "Archive/Reopen must preserve linked record %s", record.id)
+		}
+		assertProductCRMAtomicCounts(t, app.DB, org.ID, lead.ID, 1, transition.version, transition.version)
+	}
+}
+
+func TestProductCRMDestructiveRoleDefaults(t *testing.T) {
+	t.Parallel()
+	defaults := models.SystemRolePermissions()
+	require.Contains(t, defaults["manager"], "crm.leads:delete")
+	require.NotContains(t, defaults["manager"], "packages:delete", "pre-Backend phases must preserve their existing manager defaults")
+	require.NotContains(t, defaults["manager"], "crm.pipelines:delete", "whole-pipeline retirement is outside this change")
+	for _, permission := range []string{"crm.leads:delete", "crm.pipelines:delete", "packages:delete"} {
+		require.NotContains(t, defaults["agent"], permission, "frontline defaults must not acquire destructive authority")
+	}
 }
