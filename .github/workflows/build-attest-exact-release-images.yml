@@ -198,28 +198,28 @@ jobs:
             } and
             (.phases | keys) == ["backend", "baseline", "bridge", "ui"] and
             .phases.baseline == {
-              source_sha: "fe0fc9e4f5ad8f3f8b98af945a78a7239e848f33",
-              root_tree: "f43c28bd4c712d2f3a5610a567fdc358ced899c6",
+              source_sha: "712dc929efd9a0f7ebf5d811e0c8f18d26e207e3",
+              root_tree: "d2d17c4720f8c6480a1ad08060f17a29bf81e49b",
               frontend_tree: "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
-              internal_tree: "f70860bcee374d507b7e6443f4f21df2855b217f"
+              internal_tree: "10d2e48d8650c2f751187a2914dc9f29ea8e90ce"
             } and
             .phases.bridge == {
-              source_sha: "45334bf62943885291a73c55788d18001b191be9",
-              root_tree: "693cc853fa1e0ec5ec894884b9d7b88f61902222",
+              source_sha: "dbda639b557dcae72754a8d395d133167a9221db",
+              root_tree: "941a8c691314fbfa9f4ba724ae811fbcd800c61f",
               frontend_tree: "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
-              internal_tree: "32763888c556305e8aee180183c92f36ddf5d195"
+              internal_tree: "1a659b7f8f9bd5872536262f2924e1c362701287"
             } and
             .phases.backend == {
-              source_sha: "f90ae3b1713c76694680c0cb3b36114db1688f30",
-              root_tree: "1346a39805919f5a0d690200cd0f02fab3cbfba0",
+              source_sha: "1382847de16fb7e9c8c0ed33a12c2d3f1bb89979",
+              root_tree: "795c2a0af17c133bddad18827f2797d5f1dcecd6",
               frontend_tree: "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
-              internal_tree: "494d3957ff3559375f406886be45646049ec9378"
+              internal_tree: "fc530acd0c19cf971d67ac2e9e94e48151de5428"
             } and
             .phases.ui == {
-              source_sha: "c6e16810b8dec7d54305be47f7f7fc12430a1f0a",
-              root_tree: "2e300415c550f7fade95d16da8d1499ed3e0a5fd",
-              frontend_tree: "b9e93e27948ef2287b3f35bb38f6399b7f0a05c6",
-              internal_tree: "a1da97143c17f3d02e47250269d00f238ac0e38c"
+              source_sha: "20a4738407c499b767a238e06e596f2ea8b14f3a",
+              root_tree: "7da7949a9d45991bc684629d992ebba2664cde12",
+              frontend_tree: "09b0efe5124317d2d5561548f1082b8902144d58",
+              internal_tree: "1b08a3f89ef52815d12658a10ab6b1824569f25d"
             } and
             ([.phases[].source_sha] | unique | length) == 4 and
             ([.phases[].root_tree] | unique | length) == 4 and

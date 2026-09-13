@@ -1,8 +1,8 @@
 diff --git a/frontend/src/views/channels/ChannelsView.test.ts b/frontend/src/views/channels/ChannelsView.test.ts
-index 906e09c8e..f9ae2342e 100644
+index 760b2c383..6ee6fd00a 100644
 --- a/frontend/src/views/channels/ChannelsView.test.ts
 +++ b/frontend/src/views/channels/ChannelsView.test.ts
-@@ -341,4 +341,6 @@ describe('ChannelsView messaging behavior', () => {
+@@ -389,4 +389,6 @@ describe('ChannelsView messaging behavior', () => {
 -    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
 -    await flushPromises()
 -
@@ -13,7 +13,7 @@ index 906e09c8e..f9ae2342e 100644
 +      expect((composer.element as HTMLTextAreaElement).value).toBe('')
 +    })
 +
-@@ -369,6 +371,13 @@ describe('ChannelsView messaging behavior', () => {
+@@ -417,6 +419,13 @@ describe('ChannelsView messaging behavior', () => {
 -    await send.trigger('click')
 -    await flushPromises()
 -    await send.trigger('click')
@@ -33,7 +33,7 @@ index 906e09c8e..f9ae2342e 100644
 +      expect((composer.element as HTMLTextAreaElement).value).toBe('')
 +    })
 +
-@@ -385,5 +394,6 @@ describe('ChannelsView messaging behavior', () => {
+@@ -433,5 +442,6 @@ describe('ChannelsView messaging behavior', () => {
 -    await send.trigger('click')
 -    await flushPromises()
 -    expect(mocks.sendLegacyWhatsAppReply.mock.calls[2]?.[1]?.idempotency_key).toBe(
@@ -45,7 +45,7 @@ index 906e09c8e..f9ae2342e 100644
 +        '00000000-0000-4000-8000-000000000012',
 +      )
 +    })
-@@ -416,5 +426,5 @@ describe('ChannelsView messaging behavior', () => {
+@@ -464,5 +474,5 @@ describe('ChannelsView messaging behavior', () => {
 -      await send.trigger('click')
 -      await flushPromises()
 -
@@ -56,7 +56,7 @@ index 906e09c8e..f9ae2342e 100644
 +        expect(storedLegacyReplyAttempts()).toHaveLength(0)
 +        expect((composer.element as HTMLTextAreaElement).value).toBe('')
 +      })
-@@ -423,9 +433,9 @@ describe('ChannelsView messaging behavior', () => {
+@@ -471,9 +481,9 @@ describe('ChannelsView messaging behavior', () => {
 -      await send.trigger('click')
 -      await flushPromises()
 -
@@ -75,7 +75,7 @@ index 906e09c8e..f9ae2342e 100644
 +          '00000000-0000-4000-8000-000000000032',
 +        )
 +      })
-@@ -467,3 +477,5 @@ describe('ChannelsView messaging behavior', () => {
+@@ -515,3 +525,5 @@ describe('ChannelsView messaging behavior', () => {
 -    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
 -    await flushPromises()
 -    expect(storedLegacyReplyAttempts()).toHaveLength(1)
@@ -84,7 +84,7 @@ index 906e09c8e..f9ae2342e 100644
 +      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
 +      expect(storedLegacyReplyAttempts()).toHaveLength(1)
 +    })
-@@ -490,4 +502,4 @@ describe('ChannelsView messaging behavior', () => {
+@@ -538,4 +550,4 @@ describe('ChannelsView messaging behavior', () => {
 -    await flushPromises()
 -
 -    expect(storedLegacyReplyAttempts()).toHaveLength(0)
@@ -93,7 +93,7 @@ index 906e09c8e..f9ae2342e 100644
 +      expect(storedLegacyReplyAttempts()).toHaveLength(0)
 +      expect(view.text()).not.toContain('Settled while switching')
 +    })
-@@ -502,6 +514,8 @@ describe('ChannelsView messaging behavior', () => {
+@@ -550,6 +562,8 @@ describe('ChannelsView messaging behavior', () => {
 -    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
 -    await flushPromises()
 -
@@ -108,7 +108,7 @@ index 906e09c8e..f9ae2342e 100644
 +
 +    const firstKey = mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key
 +    const stored = storedLegacyReplyAttempts()
-@@ -522,5 +536,5 @@ describe('ChannelsView messaging behavior', () => {
+@@ -570,5 +584,5 @@ describe('ChannelsView messaging behavior', () => {
 -    await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
 -    await flushPromises()
 -
@@ -119,7 +119,7 @@ index 906e09c8e..f9ae2342e 100644
 +      expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(firstKey)
 +      expect(storedLegacyReplyAttempts()).toHaveLength(0)
 +    })
-@@ -546,5 +560,5 @@ describe('ChannelsView messaging behavior', () => {
+@@ -594,5 +608,5 @@ describe('ChannelsView messaging behavior', () => {
 -    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
 -    await flushPromises()
 -
@@ -130,7 +130,15 @@ index 906e09c8e..f9ae2342e 100644
 +      expect(storedLegacyReplyAttempts()).toHaveLength(1)
 +      expect((composer.element as HTMLTextAreaElement).value).toBe('Keep this attempt')
 +    })
-@@ -624,2 +638,5 @@ describe('ChannelsView messaging behavior', () => {
+@@ -664,10 +678,13 @@ describe('ChannelsView messaging behavior', () => {
+   it('does not reuse a persisted WhatsApp attempt for another organization', async () => {
+     vi.mocked(crypto.randomUUID)
+       .mockReturnValueOnce('00000000-0000-4000-8000-000000000051')
+       .mockReturnValueOnce('00000000-0000-4000-8000-000000000052')
+     setInbox()
+     mocks.sendLegacyWhatsAppReply.mockRejectedValueOnce(new Error('network timeout'))
+     const firstView = await mountAndSelectConversation()
+     await firstView.get('[data-testid="omnichannel-reply-composer"]').setValue('Scoped draft')
 -    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
 -    await flushPromises()
 +    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
@@ -138,7 +146,7 @@ index 906e09c8e..f9ae2342e 100644
 +      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
 +      expect(storedLegacyReplyAttempts()).toHaveLength(1)
 +    })
-@@ -633,9 +650,9 @@ describe('ChannelsView messaging behavior', () => {
+@@ -681,9 +698,9 @@ describe('ChannelsView messaging behavior', () => {
 -    await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
 -    await flushPromises()
 -
