@@ -175,7 +175,9 @@ jobs:
           script: |
             const {spawnSync} = require('node:child_process');
             const env = {...process.env, CLAIM_NODE:process.execPath};
-            const result = spawnSync('/usr/bin/python3', ['-I','-S','-B','control/release/deployment/provision_production_crm_canary_fixture.py','execute','--control-root','control','--upload-bundle','claim-upload/dist/upload/index.js','--output-dir',process.env.RUNNER_TEMP+'/fixture-result'], {env,stdio:['ignore','ignore','ignore'],timeout:2100000});
+            const result = spawnSync('/usr/bin/python3', ['-I','-S','-B','control/release/deployment/provision_production_crm_canary_fixture.py','execute','--control-root','control','--upload-bundle','claim-upload/dist/upload/index.js','--output-dir',process.env.RUNNER_TEMP+'/fixture-result'], {env,stdio:['ignore','pipe','pipe'],timeout:2100000});
+            if (result.stdout) core.info('fixture stdout: ' + result.stdout.toString());
+            if (result.stderr) core.error('fixture stderr: ' + result.stderr.toString());
             if (result.error || result.signal || result.status !== 0) core.setFailed('Fixture execution stopped; inspect content-free burn evidence, never rerun');
       - name: Attest content-free fixture result provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
