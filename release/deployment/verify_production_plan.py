@@ -86,13 +86,13 @@ BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
 BOOTSTRAP_SOURCE_SHA = "974bb998f6d4c94ce750a92bf23f4550f8e45a2f"
 BASELINE_TARGET_SOURCE_SHA = "712dc929efd9a0f7ebf5d811e0c8f18d26e207e3"
 BOOTSTRAP_CANONICAL_SPEC_SHA256 = (
-    "d0a159a049ab2b2f146574f301725ee272641cc8ee4969b786b02cfacb9c296c"
+    "dc758943902680a142fd30dc1b27bd484cea3f8155e564d08b6dfa8025d0d874"
 )
 BOOTSTRAP_ENVIRONMENT_SHA256 = (
     "c7e20ec77021f8b90b6ff0bb79080ee13b010eab121687ac5e391a43b2365b23"
 )
 BOOTSTRAP_NON_SOURCE_SHA256 = (
-    "5159277bfffd8e6de6f599e43bf4a1bac104bc6cf5d50141aa5228a74f5a9fda"
+    "1c46d577dd13e43f9eb0be9ce1b9c1f292530bc6f0950d9e30f4196ecbc6aad9"
 )
 PRODUCTION_VPC_ID_SHA256 = (
     "aaaf98cef6beb658509d644dc8c56b559a38f79344739cd0edd1442070ec207e"
@@ -1654,11 +1654,10 @@ def validate_topology(spec: Mapping[str, Any], contract: Mapping[str, Any]) -> N
             fail(f"unexpected production {collection} component")
 
     vpc = spec.get("vpc")
-    if vpc is not None:
-        if type(vpc) is not dict or type(vpc.get("id")) is not str:
-            fail("production VPC binding is malformed")
-        if sha256_bytes(vpc["id"].encode("utf-8")) != topology["vpc_id_sha256"]:
-            fail("production VPC binding differs")
+    if type(vpc) is not dict or type(vpc.get("id")) is not str:
+        fail("production VPC binding is malformed")
+    if sha256_bytes(vpc["id"].encode("utf-8")) != topology["vpc_id_sha256"]:
+        fail("production VPC binding differs")
 
     if normalized_ingress(spec) != topology["ingress"]:
         fail("production ingress differs")
@@ -1679,38 +1678,41 @@ def validate_topology(spec: Mapping[str, Any], contract: Mapping[str, Any]) -> N
         PRODUCTION_DATABASE_INVENTORY
     ):
         fail("production database bindings differ")
-    observed_names = []
-    full_metadata_present = True
+    observed_databases = []
     for database in databases:
         if type(database) is not dict:
             fail("production database entry is malformed")
-        observed_names.append(
-            sha256_bytes(
-                exact_string(database.get("name"), "database binding name").encode("utf-8")
-            )
+        name = exact_string(database.get("name"), "database binding name")
+        cluster = exact_string(database.get("cluster_name"), "database cluster name")
+        observed_databases.append(
+            {
+                "engine": exact_string(database.get("engine"), "database engine"),
+                "version": exact_string(database.get("version"), "database version"),
+                "production": exact_bool(database.get("production"), "database production flag"),
+                "name_sha256": sha256_bytes(name.encode("utf-8")),
+                "cluster_sha256": sha256_bytes(cluster.encode("utf-8")),
+            }
         )
-        if not (
-            type(database.get("engine")) is str
-            and type(database.get("version")) is str
-            and type(database.get("production")) is bool
-            and type(database.get("cluster_name")) is str
-        ):
-            full_metadata_present = False
-
-    if {item["name_sha256"] for item in topology["databases"]} != set(observed_names):
+    if {
+        (
+            item["engine"],
+            item["version"],
+            item["production"],
+            item["name_sha256"],
+            item["cluster_sha256"],
+        )
+        for item in observed_databases
+    } != {
+        (
+            item["engine"],
+            item["version"],
+            item["production"],
+            item["name_sha256"],
+            item["cluster_sha256"],
+        )
+        for item in topology["databases"]
+    }:
         fail("production database bindings differ")
-
-    if full_metadata_present:
-        observed_set = {
-            (d["engine"], d["version"], d["production"], sha256_bytes(d["name"].encode("utf-8")), sha256_bytes(d["cluster_name"].encode("utf-8")))
-            for d in databases
-        }
-        expected_set = {
-            (d["engine"], d["version"], d["production"], d["name_sha256"], d["cluster_sha256"])
-            for d in topology["databases"]
-        }
-        if observed_set != expected_set:
-            fail("production database bindings differ")
 
 
 def validate_legacy_component_sources(
