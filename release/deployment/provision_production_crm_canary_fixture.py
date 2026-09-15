@@ -1735,6 +1735,10 @@ def observe_prestate(root: Path) -> dict[str, Any]:
         "schema_version": 1, "kind": "crm-canary-fixture-provider-prestate",
         "provider_prestate_sha256": common.sha256_value(state),
         "spec_sha256": common.sha256_value(spec),
+        # The contract rebaseline that follows a completed allowlist append needs
+        # exactly these two fingerprints, taken from the same provider read.
+        "environment_values_sha256": common.environment_value_fingerprint(spec),
+        "non_source_projection_sha256": common.non_source_fingerprint(spec),
         "app_updated_at_sha256": common.sha256_bytes(updated_at.encode("utf-8")),
         "active_deployment_sha256": common.sha256_bytes(
             common.require_uuid(observed.get("active_deployment", {}).get("id"),

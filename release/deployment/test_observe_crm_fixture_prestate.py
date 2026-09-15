@@ -30,7 +30,10 @@ class TestObservePrestateRunner(unittest.TestCase):
                     "provider_prestate_sha256": "a" * 64,
                     "spec_sha256": "b" * 64, "app_updated_at_sha256": "c" * 64,
                     "active_deployment_sha256": "d" * 64,
-                    "deployment_sha256": "e" * 64, "allowlist_members": 3}
+                    "deployment_sha256": "e" * 64,
+                    "environment_values_sha256": "f" * 64,
+                    "non_source_projection_sha256": "0" * 64,
+                    "allowlist_members": 3}
         with mock.patch.object(observer.fixture, "observe_prestate",
                                lambda root: dict(observed)), \
                 mock.patch.dict(os.environ, {"GITHUB_SHA": "f" * 40,
@@ -79,7 +82,11 @@ class TestObservePrestateRunner(unittest.TestCase):
         with mock.patch.dict(os.environ, environment), \
                 mock.patch.object(fixture, "ProviderFixture", FakeProvider), \
                 mock.patch.object(planner, "provider_state",
-                                  lambda *args, **kwargs: (state, spec)):
+                                  lambda *args, **kwargs: (state, spec)), \
+                mock.patch.object(common, "environment_value_fingerprint",
+                                  lambda value: "7" * 64), \
+                mock.patch.object(common, "non_source_fingerprint",
+                                  lambda value: "8" * 64):
             observed = fixture.observe_prestate(root)
         self.assertEqual(observed["provider_prestate_sha256"], common.sha256_value(state))
         self.assertEqual(observed["spec_sha256"], common.sha256_value(spec))
@@ -87,6 +94,8 @@ class TestObservePrestateRunner(unittest.TestCase):
                          common.sha256_bytes(UPDATED_AT.encode("utf-8")))
         self.assertEqual(observed["active_deployment_sha256"],
                          common.sha256_bytes(ACTIVE_DEPLOYMENT.encode("utf-8")))
+        self.assertEqual(observed["environment_values_sha256"], "7" * 64)
+        self.assertEqual(observed["non_source_projection_sha256"], "8" * 64)
         self.assertEqual(observed["allowlist_members"], 3)
         self.assertEqual(observed["kind"], "crm-canary-fixture-provider-prestate")
         self.assertIs(observed_position["spec"], spec)
