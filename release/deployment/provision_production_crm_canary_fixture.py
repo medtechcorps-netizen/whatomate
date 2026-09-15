@@ -1360,7 +1360,8 @@ class ProviderFixture:
                  is not None,
                  "provider GET path differs")
         return common.loads_strict(_wire(self.opener,common.API_ORIGIN+path,
-                    headers={"Authorization":"Bearer "+self.__read_token},maximum=common.MAX_JSON_BYTES))
+                    headers={"Authorization":"Bearer "+self.__read_token,
+                             "Accept":"application/json"},maximum=common.MAX_JSON_BYTES))
 
     def current(self) -> tuple[Any,Any,Any]:
         path = "/v2/apps/"+self.target["app_id"]
