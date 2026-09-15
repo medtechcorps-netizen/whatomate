@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 try:
@@ -233,6 +236,30 @@ class TestProductInverse(unittest.TestCase):
             stale, _ = authority_for(self.protected, self.transport, expires_in=3 * 24 * 3600)
             with self.assertRaises(common.ReleaseError):
                 inverse.validate_authority(stale, None, None, request, self.protected)
+
+    def test_stopped_run_publishes_a_content_free_attempt_journal(self):
+        transport = FakeTransport(self.protected, fail_delete_at=1)
+        authority, _ = authority_for(self.protected, transport)
+        controller = self.controller(transport)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "inverse-result"
+            with self.assertRaises(inverse.AmbiguousInverse) as error:
+                controller.apply(authority)
+            inverse._record_attempt(output, self.request, controller, error.exception)
+            journal = json.loads((output / "inverse-attempt.json").read_text("utf-8"))
+        self.assertEqual(journal["kind"], "crm-canary-fixture-inverse-attempt")
+        self.assertEqual(
+            journal["reason"],
+            "inverse deletion is ambiguous at delete_klinik_user: "
+            "bounded HTTP operation failed: status 500",
+        )
+        self.assertEqual([stage["action"] for stage in journal["stages"]], ["ambiguous"])
+        rendered = json.dumps(journal)
+        for role in inverse.ROLES:
+            self.assertNotIn(self.registration_email(role), rendered)
+        for key, value in self.protected["credentials"].items():
+            self.assertNotIn(value["password"] if key == "super_admin_login" else value,
+                             rendered)
 
 
 class TestInverseTransportCapability(unittest.TestCase):
