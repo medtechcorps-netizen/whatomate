@@ -1684,35 +1684,38 @@ def validate_topology(spec: Mapping[str, Any], contract: Mapping[str, Any]) -> N
         if type(database) is not dict:
             fail("production database entry is malformed")
         name = exact_string(database.get("name"), "database binding name")
-        cluster = exact_string(database.get("cluster_name"), "database cluster name")
-        observed_databases.append(
-            {
-                "engine": exact_string(database.get("engine"), "database engine"),
-                "version": exact_string(database.get("version"), "database version"),
-                "production": exact_bool(database.get("production"), "database production flag"),
-                "name_sha256": sha256_bytes(name.encode("utf-8")),
-                "cluster_sha256": sha256_bytes(cluster.encode("utf-8")),
-            }
-        )
-    if {
-        (
-            item["engine"],
-            item["version"],
-            item["production"],
-            item["name_sha256"],
-            item["cluster_sha256"],
-        )
-        for item in observed_databases
-    } != {
-        (
-            item["engine"],
-            item["version"],
-            item["production"],
-            item["name_sha256"],
-            item["cluster_sha256"],
-        )
-        for item in topology["databases"]
-    }:
+        item = {
+            "engine": exact_string(database.get("engine"), "database engine"),
+            "version": exact_string(database.get("version"), "database version"),
+            "production": exact_bool(database.get("production"), "database production flag"),
+            "name_sha256": sha256_bytes(name.encode("utf-8")),
+        }
+        cluster = database.get("cluster_name")
+        if cluster is not None:
+            item["cluster_sha256"] = sha256_bytes(
+                exact_string(cluster, "database cluster name").encode("utf-8")
+            )
+        observed_databases.append(item)
+
+    if any("cluster_sha256" not in item for item in observed_databases):
+        observed_set = {
+            (item["engine"], item["version"], item["production"], item["name_sha256"])
+            for item in observed_databases
+        }
+        expected_set = {
+            (item["engine"], item["version"], item["production"], item["name_sha256"])
+            for item in topology["databases"]
+        }
+    else:
+        observed_set = {
+            (item["engine"], item["version"], item["production"], item["name_sha256"], item["cluster_sha256"])
+            for item in observed_databases
+        }
+        expected_set = {
+            (item["engine"], item["version"], item["production"], item["name_sha256"], item["cluster_sha256"])
+            for item in topology["databases"]
+        }
+    if observed_set != expected_set:
         fail("production database bindings differ")
 
 
