@@ -232,9 +232,12 @@ class ProductProvisioner:
             return projection(result)
         try:
             result = self.gate.once(stage, method, path, raw, send, nested_budget=nested_budget)
-        except Exception:
+        except Exception as exc:
             self.failed = True
-            raise common.AmbiguousMutation("fixture mutation requires protected reconciliation") from None
+            raise common.AmbiguousMutation(
+                f"fixture mutation requires protected reconciliation at {stage}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from None
         self.stages.append({"stage": stage, "request_sha256": common.sha256_bytes(raw),
                             "response_sha256": common.sha256_value(result),
                             "wrapper_upper_bound": 1, "nested_upper_bound": nested_budget})
