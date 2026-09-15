@@ -14,6 +14,11 @@ on:
         description: Canonical public fixture request containing schema, control, operation and descriptor hashes
         required: true
         type: string
+      retired_organizations_json:
+        description: Optional JSON list of canary organizations a previous reviewed inverse already retired, whose live accounts still hold the fixture number
+        required: false
+        default: '[]'
+        type: string
 
 permissions:
   contents: read
@@ -60,6 +65,7 @@ jobs:
           REF_PROTECTED: ${{ github.ref_protected }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
           REQUEST_JSON: ${{ inputs.request_json }}
+          RETIRED_ORGANIZATIONS_JSON: ${{ inputs.retired_organizations_json }}
           CRM_CANARY_FIXTURE_INPUT_JSON: ${{ secrets.CRM_CANARY_FIXTURE_INPUT_JSON }}
         run: |
           set -euo pipefail

@@ -34,6 +34,9 @@ class FakeTransport:
         self.home = self.d["super_admin_home_org_id"]
         self.klinik_org, self.non_klinik_org = uid(200), uid(300)
         self.klinik_user, self.non_klinik_user = uid(201), uid(301)
+        self.retired_org, self.retired_account = uid(500), uid(501)
+        self.klinik_account = uid(202)
+        self.phone_id = self.d["meta"]["phone_number_id"]
         self.organizations = [
             {"id": self.home, "name": "Home", "slug": "home",
              "reseller_id": self.d["reseller_id"]},
@@ -54,6 +57,12 @@ class FakeTransport:
                                    "email": self.registration["non_klinik_email"],
                                    "organization_id": self.non_klinik_org,
                                    "is_super_admin": False}],
+        }
+        self.accounts = {
+            self.klinik_org: [{"id": self.klinik_account, "phone_id": self.phone_id,
+                               "organization_id": self.klinik_org, "status": "active"}],
+            self.retired_org: [{"id": self.retired_account, "phone_id": self.phone_id,
+                                "organization_id": self.retired_org, "status": "active"}],
         }
         self.calls = []
         self.deletes = []
@@ -79,6 +88,9 @@ class FakeTransport:
             rows = copy.deepcopy(self.users.get(organization_id, []))
             return result({"users": rows, "total": len(rows), "page": 1, "limit": 100,
                            "online_count": 0})
+        if route == "/api/accounts":
+            rows = copy.deepcopy(self.accounts.get(organization_id, []))
+            return result({"accounts": rows, "total": len(rows), "page": 1, "limit": 100})
         raise AssertionError("unexpected inverse route " + route)
 
     def delete(self, path, *, session, organization_id=None):
@@ -89,12 +101,15 @@ class FakeTransport:
         if route == "users":
             for org, rows in self.users.items():
                 self.users[org] = [row for row in rows if row["id"] != identity]
+        elif route == "accounts":
+            for org, rows in self.accounts.items():
+                self.accounts[org] = [row for row in rows if row["id"] != identity]
         else:
             self.organizations = [row for row in self.organizations if row["id"] != identity]
             self.users.pop(identity, None)
 
 
-def authority_for(protected, transport, *, expires_in=3600, overrides=None):
+def authority_for(protected, transport, *, expires_in=3600, retired=None, overrides=None):
     request = {"schema_version": 1, "control_sha": "a" * 40, "operation_sha256": "b" * 64,
                "descriptor_sha256": common.sha256_value(protected["descriptor"])}
     value = {
@@ -112,6 +127,7 @@ def authority_for(protected, transport, *, expires_in=3600, overrides=None):
             "non_klinik": {"organization_id": transport.non_klinik_org,
                            "user_id": transport.non_klinik_user},
         },
+        "retired_organization_ids": list(retired or []),
         "expires_at": common.format_timestamp(
             dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expires_in)),
     }
@@ -130,11 +146,16 @@ class TestProductInverse(unittest.TestCase):
                                       transport or self.transport)
 
     def test_plan_selects_only_the_two_reserved_tenants(self):
-        plan = self.controller().plan()
+        with mock.patch.dict("os.environ",
+                             {"RETIRED_ORGANIZATIONS_JSON":
+                              json.dumps([self.transport.retired_org])}):
+            plan = self.controller().plan()
         self.assertEqual(plan["kind"], "crm-canary-fixture-inverse-plan")
         self.assertEqual(plan["organization_count"], 4)
         self.assertEqual(plan["reserved_organization_count"], 2)
         self.assertEqual(plan["issued_login_count"], 2)
+        self.assertEqual(plan["fixture_account_count"], 2)
+        self.assertEqual(plan["retired_organization_ids"], [self.transport.retired_org])
         self.assertEqual(plan["targets"]["klinik"],
                          {"organization_id": self.transport.klinik_org,
                           "user_id": self.transport.klinik_user})
@@ -144,44 +165,59 @@ class TestProductInverse(unittest.TestCase):
         rendered = str(plan) + str(self.transport.calls)
         for role in inverse.ROLES:
             self.assertNotIn(self.registration_email(role), rendered)
+        self.assertNotIn(self.transport.phone_id, rendered)
 
     def registration_email(self, role):
         return self.protected["registration"][role + "_email"]
 
     def test_apply_retires_users_before_organizations_and_verifies(self):
-        authority, _ = authority_for(self.protected, self.transport)
+        authority, _ = authority_for(self.protected, self.transport,
+                                     retired=[self.transport.retired_org])
         result = self.controller().apply(authority)
         self.assertEqual([path for path, _ in self.transport.deletes], [
+            "/api/accounts/" + self.transport.klinik_account,
+            "/api/accounts/" + self.transport.retired_account,
             "/api/users/" + self.transport.klinik_user,
             "/api/organizations/" + self.transport.klinik_org,
             "/api/users/" + self.transport.non_klinik_user,
             "/api/organizations/" + self.transport.non_klinik_org,
         ])
         self.assertEqual([org for _, org in self.transport.deletes], [
+            self.transport.klinik_org, self.transport.retired_org,
             self.transport.klinik_org, self.transport.home,
             self.transport.non_klinik_org, self.transport.home,
         ])
         self.assertEqual(result["state"], "inverse_verified")
         self.assertFalse(result["reserved_organization_present"])
         self.assertFalse(result["issued_login_present"])
+        self.assertFalse(result["fixture_account_present"])
         self.assertEqual([stage["action"] for stage in result["stages"]],
-                         ["deleted"] * 4)
+                         ["deleted"] * 5)
         self.assertEqual([stage["stage"] for stage in result["stages"]],
                          list(inverse.STAGES))
+        self.assertEqual(result["stages"][0]["accounts"],
+                         [{"organization_sha256": common.sha256_value(self.transport.klinik_org),
+                           "account_sha256": common.sha256_value(self.transport.klinik_account),
+                           "action": "deleted", "status": "absent"},
+                          {"organization_sha256": common.sha256_value(self.transport.retired_org),
+                           "account_sha256": common.sha256_value(self.transport.retired_account),
+                           "action": "deleted", "status": "absent"}])
         for key, value in self.protected["credentials"].items():
             self.assertNotIn(value["password"] if key == "super_admin_login" else value,
                              str(result))
 
     def test_second_reviewed_run_is_an_idempotent_no_op(self):
-        authority, _ = authority_for(self.protected, self.transport)
+        authority, _ = authority_for(self.protected, self.transport,
+                                     retired=[self.transport.retired_org])
         self.controller().apply(authority)
         attempts = len(self.transport.deletes)
         result = self.controller().apply(authority)
         self.assertEqual(result["state"], "inverse_already_absent")
         self.assertEqual(len(self.transport.deletes), attempts)
         self.assertEqual([stage["action"] for stage in result["stages"]],
-                         ["already_absent"] * 4)
+                         ["already_absent"] * 5)
         self.assertFalse(result["reserved_organization_present"])
+        self.assertFalse(result["fixture_account_present"])
 
     def test_apply_refuses_an_identity_that_differs_from_the_authority(self):
         authority, _ = authority_for(self.protected, self.transport)
@@ -192,19 +228,20 @@ class TestProductInverse(unittest.TestCase):
         self.assertEqual(self.transport.deletes, [])
 
     def test_ambiguous_deletion_stops_without_repeating_anything(self):
-        transport = FakeTransport(self.protected, fail_delete_at=2)
+        transport = FakeTransport(self.protected, fail_delete_at=1)
         authority, _ = authority_for(self.protected, transport)
         controller = self.controller(transport)
         with self.assertRaises(inverse.AmbiguousInverse) as error:
             controller.apply(authority)
         self.assertIn("status 500", str(error.exception))
-        self.assertEqual(len(transport.deletes), 2)
+        self.assertEqual(len(transport.deletes), 1)
         self.assertEqual([stage["action"] for stage in controller.stages],
-                         ["deleted", "ambiguous"])
+                         ["ambiguous"])
+        self.assertEqual(controller.stages[0]["stage"], inverse.ACCOUNT_STAGE)
         with self.assertRaises(common.ReleaseError) as second:
             controller.apply(authority)
         self.assertIn("already used", str(second.exception))
-        self.assertEqual(len(transport.deletes), 2)
+        self.assertEqual(len(transport.deletes), 1)
 
     def test_authority_binding_window_and_distinctness(self):
         authority, request = authority_for(self.protected, self.transport)
@@ -250,7 +287,7 @@ class TestProductInverse(unittest.TestCase):
         self.assertEqual(journal["kind"], "crm-canary-fixture-inverse-attempt")
         self.assertEqual(
             journal["reason"],
-            "inverse deletion is ambiguous at delete_klinik_user: "
+            "inverse account deletion is ambiguous: "
             "bounded HTTP operation failed: status 500",
         )
         self.assertEqual([stage["action"] for stage in journal["stages"]], ["ambiguous"])
@@ -263,17 +300,19 @@ class TestProductInverse(unittest.TestCase):
 
 
 class TestInverseTransportCapability(unittest.TestCase):
-    def test_delete_is_limited_to_the_two_reviewed_routes(self):
+    def test_delete_is_limited_to_the_three_reviewed_routes(self):
         transport = fixture.ProductHTTP("SyntheticMetaToken123")
         for path in ("/api/users/not-a-uuid", "/api/organizations",
-                     "/api/users/../../etc", "/api/accounts/" + uid(5),
+                     "/api/users/../../etc", "/api/accounts",
+                     "/api/webhook?workspace=" + uid(5),
                      "/api/users/8da8b3e1-1111-4111-8111-111111111111/../x"):
             with self.assertRaises(common.ReleaseError) as error:
                 transport.delete(path, session="unknown")
             self.assertIn("inverse delete route differs", str(error.exception))
-        with self.assertRaises(common.ReleaseError) as error:
-            transport.delete("/api/users/" + uid(5), session="unknown")
-        self.assertIn("unknown product session", str(error.exception))
+        for route in ("users", "organizations", "accounts"):
+            with self.assertRaises(common.ReleaseError) as error:
+                transport.delete("/api/" + route + "/" + uid(5), session="unknown")
+            self.assertIn("unknown product session", str(error.exception))
 
     def test_forward_sequence_still_cannot_issue_delete(self):
         transport = fixture.ProductHTTP("SyntheticMetaToken123")
