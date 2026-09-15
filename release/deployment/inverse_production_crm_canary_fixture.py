@@ -49,17 +49,20 @@ ORDER = (
     ("delete_non_klinik_user", "non_klinik", "user"),
     ("delete_non_klinik_org", "non_klinik", "organization"),
 )
-STAGES = tuple(stage for stage, _, _ in ORDER)
+ACCOUNT_STAGE = "retire_fixture_accounts"
+STAGES = (ACCOUNT_STAGE,) + tuple(stage for stage, _, _ in ORDER)
 USER_PAGE_LIMIT = 100
 USER_PAGE_BOUND = 20
 MAX_AUTHORITY_LIFETIME_SECONDS = 24 * 60 * 60
+MAX_RETIRED_ORGANIZATIONS = 8
 RESERVED_PREFIX = "rereply-canary"
 ROUTE_RE = re.compile(
-    r"/api/(?:users|organizations)/"
+    r"/api/(?:users|organizations|accounts)/"
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 AUTHORITY_KEYS = {
     "schema_version", "kind", "control_sha", "request_sha256", "operation_sha256",
-    "descriptor_sha256", "registration_sha256", "origin", "targets", "expires_at",
+    "descriptor_sha256", "registration_sha256", "origin", "targets",
+    "retired_organization_ids", "expires_at",
 }
 ORIGIN_KEYS = {"run_id", "control_sha", "artifact_id", "artifact_digest", "intent_sha256"}
 TARGET_KEYS = {"organization_id", "user_id"}
@@ -67,13 +70,17 @@ PLAN_KEYS = {
     "schema_version", "kind", "control_sha", "request_sha256", "operation_sha256",
     "descriptor_sha256", "registration_sha256", "organization_count",
     "reserved_organization_count", "issued_login_count", "targets",
+    "fixture_account_count", "retired_organization_ids",
 }
 RESULT_KEYS = {
     "schema_version", "kind", "control_sha", "request_sha256", "operation_sha256",
     "descriptor_sha256", "origin", "targets_sha256", "stages", "state",
-    "reserved_organization_present", "issued_login_present", "organization_count",
+    "reserved_organization_present", "issued_login_present", "fixture_account_present",
+    "organization_count",
 }
 STAGE_KEYS = {"stage", "route", "target_sha256", "action", "status"}
+ACCOUNT_STAGE_KEYS = {"stage", "route", "target_sha256", "action", "status", "accounts"}
+ACCOUNT_KEYS = {"organization_sha256", "account_sha256", "action", "status"}
 
 
 class AmbiguousInverse(common.ReleaseError):
@@ -88,6 +95,17 @@ def protected_from_environment(request: Any) -> dict[str, Any]:
     return fixture.validate_protected_input(
         common.loads_strict(os.environ["CRM_CANARY_FIXTURE_INPUT_JSON"]), request
     )
+
+
+def retired_from_environment() -> list[str]:
+    """Organizations a reviewed inverse already retired, whose live accounts
+    still hold the fixture number against the global unique phone index."""
+    value = common.loads_strict(os.environ.get("RETIRED_ORGANIZATIONS_JSON") or "[]")
+    _require(type(value) is list and len(value) <= MAX_RETIRED_ORGANIZATIONS,
+             "retired organizations differ")
+    checked = [common.require_uuid(item, "retired organization") for item in value]
+    _require(len(set(checked)) == len(checked), "retired organizations are not distinct")
+    return checked
 
 
 class ProductInverse:
@@ -149,6 +167,21 @@ class ProductInverse:
         _require(len(set(identities)) == len(identities),
                  "inverse organization identities differ")
         return rows
+
+    def accounts_for(self, tenant: str) -> list[dict[str, Any]]:
+        """Live accounts holding the fixture number under one tenant.
+
+        The product enforces a global unique index on live phone IDs, so the
+        selection is the descriptor's own number only.
+        """
+        rows = self._rows(
+            self._get(f"/api/accounts?page=1&limit={USER_PAGE_LIMIT}", org=tenant),
+            "accounts")
+        identities = [common.require_inventory_uuid(row.get("id"), "inverse account identity")
+                      for row in rows]
+        _require(len(set(identities)) == len(identities), "inverse account identities differ")
+        return [row for row in rows
+                if row.get("phone_id") == self.d["meta"]["phone_number_id"]]
 
     def users(self, org: str) -> list[dict[str, Any]]:
         """Every listed user of one organization; multi-page inventories fail closed."""
@@ -214,6 +247,7 @@ class ProductInverse:
     def plan(self) -> dict[str, Any]:
         self._once()
         survey = self.survey()
+        retired = retired_from_environment()
         targets = {}
         for role in ROLES:
             entry = survey["roles"][role]
@@ -227,6 +261,8 @@ class ProductInverse:
         _require(targets["klinik"]["organization_id"] != targets["non_klinik"]["organization_id"]
                  and targets["klinik"]["user_id"] != targets["non_klinik"]["user_id"],
                  "inverse targets are not distinct")
+        accounts = self._fixture_accounts(targets={
+            role: targets[role]["organization_id"] for role in ROLES}, retired=retired)
         return _schema({
             "schema_version": 1, "kind": "crm-canary-fixture-inverse-plan",
             "control_sha": self.request["control_sha"],
@@ -239,25 +275,96 @@ class ProductInverse:
             "issued_login_count": sum(
                 1 for role in ROLES if survey["roles"][role]["user"] is not None),
             "targets": targets,
+            "fixture_account_count": len(accounts),
+            "retired_organization_ids": retired,
         }, PLAN_KEYS, "inverse plan")
 
     # --- mutation ---------------------------------------------------------
 
-    def _residual(self) -> dict[str, Any]:
+    def _fixture_accounts(self, targets: Any, retired: Any) -> list[dict[str, Any]]:
+        """Every live account holding the fixture number, with its tenant."""
+        found: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        tenants = [targets[role] for role in ROLES] + list(retired)
+        for tenant in tenants:
+            for account in self.accounts_for(tenant):
+                identity = common.require_uuid(account["id"], "inverse account")
+                _require(identity not in seen, "inverse account identity is not unique")
+                seen.add(identity)
+                found.append({"tenant": tenant, "account": account})
+        return found
+
+    def _residual(self, retired: Any) -> dict[str, Any]:
         """Post-condition scan that never requires either target to exist."""
         organizations = self.organizations()
         issued = {self.registration[role + "_email"] for role in ROLES}
         emails = [row.get("email") for organization in organizations
                   for row in self.users(common.require_uuid(organization["id"],
                                                             "inverse organization"))]
+        tenants = [common.require_uuid(row["id"], "inverse organization")
+                   for row in organizations
+                   if str(row.get("name", "")).lower().startswith(RESERVED_PREFIX)
+                   or str(row.get("slug", "")).lower().startswith(RESERVED_PREFIX)]
+        for tenant in retired:
+            if tenant not in tenants:
+                tenants.append(tenant)
+        fixture_account = any(self.accounts_for(tenant) for tenant in tenants)
         return {
             "reserved_organization_present": any(
                 str(row.get("name", "")).lower().startswith(RESERVED_PREFIX)
                 or str(row.get("slug", "")).lower().startswith(RESERVED_PREFIX)
                 for row in organizations),
             "issued_login_present": any(email in issued for email in emails),
+            "fixture_account_present": fixture_account,
             "organization_count": len(organizations),
         }
+
+    @staticmethod
+    def _account_stage(records: list[dict[str, Any]]) -> dict[str, Any]:
+        if any(record["action"] == "ambiguous" for record in records):
+            action = "ambiguous"
+        elif any(record["action"] == "deleted" for record in records):
+            action = "deleted"
+        else:
+            action = "already_absent"
+        settled = all(record["status"] == "absent" for record in records)
+        return _schema({
+            "stage": ACCOUNT_STAGE, "route": "accounts",
+            "action": action,
+            "status": "absent" if settled else "unknown",
+            "target_sha256": common.sha256_value(
+                [record["account_sha256"] for record in records]),
+            "accounts": records,
+        }, ACCOUNT_STAGE_KEYS, "inverse account stage")
+
+    def _retire_accounts(self, targets: Any, retired: Any) -> None:
+        """Retire the fixture number's live accounts before any tenant removal."""
+        records: list[dict[str, Any]] = []
+        for entry in self._fixture_accounts(targets=targets, retired=retired):
+            tenant = entry["tenant"]
+            identity = common.require_uuid(entry["account"]["id"], "inverse account")
+            record = _schema({"organization_sha256": common.sha256_value(tenant),
+                              "account_sha256": common.sha256_value(identity),
+                              "action": "observed", "status": "present"},
+                             ACCOUNT_KEYS, "inverse account")
+            try:
+                self.transport.delete("/api/accounts/" + identity, session=self.session,
+                                      organization_id=tenant)
+            except Exception as exc:
+                record["action"] = "ambiguous"
+                record["status"] = "unknown"
+                records.append(record)
+                self.stages.append(self._account_stage(records))
+                raise AmbiguousInverse(
+                    "inverse account deletion is ambiguous: " + fixture._reason(exc)
+                ) from None
+            record["action"] = "deleted"
+            remaining = [row["id"] for row in self.accounts_for(tenant)]
+            record["status"] = "present" if identity in remaining else "absent"
+            _require(record["status"] == "absent",
+                     "inverse account deletion did not retire the account")
+            records.append(record)
+        self.stages.append(self._account_stage(records))
 
     def _retire(self, stage: str, role: str, resource: str, pinned: Any, home: str,
                 survey: Any) -> None:
@@ -310,13 +417,26 @@ class ProductInverse:
         self._once()
         survey = self.survey()
         home = survey["home"]
+        # Nothing may be deleted until every live identity matches the reviewed
+        # authority, because a partial match is a reconciliation problem.
+        for role in ROLES:
+            for resource, key in (("organization", "organization_id"), ("user", "user_id")):
+                live = survey["roles"][role][resource]
+                if live is not None:
+                    _require(common.require_uuid(live["id"], "inverse live identity")
+                             == authority["targets"][role][key],
+                             "inverse target differs from the reviewed authority")
+        targets = {role: authority["targets"][role]["organization_id"] for role in ROLES}
+        self._retire_accounts(targets=targets,
+                              retired=authority["retired_organization_ids"])
         for stage, role, resource in ORDER:
             self._retire(stage, role, resource, authority["targets"], home, survey)
         _require(tuple(record["stage"] for record in self.stages) == STAGES,
                  "inverse stage inventory differs")
-        final = self._residual()
+        final = self._residual(authority["retired_organization_ids"])
         _require(final["reserved_organization_present"] is False
-                 and final["issued_login_present"] is False,
+                 and final["issued_login_present"] is False
+                 and final["fixture_account_present"] is False,
                  "inverse verification found residual fixture state")
         retired = sum(1 for record in self.stages if record["action"] == "deleted")
         return _schema({
@@ -331,6 +451,7 @@ class ProductInverse:
             "state": "inverse_verified" if retired else "inverse_already_absent",
             "reserved_organization_present": final["reserved_organization_present"],
             "issued_login_present": final["issued_login_present"],
+            "fixture_account_present": final["fixture_account_present"],
             "organization_count": final["organization_count"],
         }, RESULT_KEYS, "inverse result")
 
@@ -414,8 +535,18 @@ def validate_authority(value: Any, api: Any, root: Path, request: Any, protected
     _require(checked["klinik"]["organization_id"] != checked["non_klinik"]["organization_id"]
              and checked["klinik"]["user_id"] != checked["non_klinik"]["user_id"],
              "inverse authority targets are not distinct")
+    retired = a["retired_organization_ids"]
+    _require(type(retired) is list and len(retired) <= MAX_RETIRED_ORGANIZATIONS,
+             "inverse retired organizations differ")
+    checked_retired = [common.require_uuid(item, "inverse retired organization")
+                       for item in retired]
+    _require(len(set(checked_retired)) == len(checked_retired)
+             and all(checked[role]["organization_id"] not in checked_retired
+                     for role in ROLES),
+             "inverse retired organizations differ")
     result = copy.deepcopy(a)
     result["targets"] = checked
+    result["retired_organization_ids"] = checked_retired
     result["origin"] = verify_origin(api, root, a["origin"], request)
     return result
 

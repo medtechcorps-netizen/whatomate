@@ -978,7 +978,7 @@ class ProductHTTP:
                           headers=headers, graph=graph)
 
     _DELETE_ROUTE = re.compile(
-        r"/api/(?:users|organizations)/"
+        r"/api/(?:users|organizations|accounts)/"
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
     def delete(self, path: str, *, session: Any, organization_id: str | None = None) -> Any:
