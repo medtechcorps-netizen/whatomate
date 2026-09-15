@@ -265,7 +265,7 @@ class ProductProvisioner:
                              and (row["parts"] is None or type(row["parts"]) is list),
                              "message wrapper differs")
                     row = row["message"]
-                identity = common.require_uuid(row.get("id"), "inventory identity")
+                identity = common.require_uuid(row.get("id"), f"{key} inventory identity")
                 _require(identity not in seen, "duplicate inventory identity")
                 seen.add(identity)
                 rows.append(row)
@@ -278,7 +278,7 @@ class ProductProvisioner:
     def _list(data: Any, key: str) -> list[dict[str, Any]]:
         _require(type(data) is dict and type(data.get(key)) is list, "inventory shape differs")
         rows = data[key]
-        identities = [common.require_uuid(r.get("id"), "inventory identity")
+        identities = [common.require_uuid(r.get("id"), f"{key} inventory identity")
                       for r in rows if type(r) is dict]
         _require(len(rows) == len(identities) == len(set(identities)), "inventory identities differ")
         return rows
