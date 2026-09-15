@@ -38,4 +38,4 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$GITHUB_REF" == refs/heads/main ]]
-          python3 -I -S -B "$CONTROLLER_PATH"
+          python3 -I -S -B "control/$CONTROLLER_PATH"
