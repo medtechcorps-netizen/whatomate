@@ -1784,8 +1784,8 @@ def main(argv: list[str] | None = None) -> int:
                         expected_origin_artifact_id=descriptor["artifact_id"],expected_origin_artifact_digest=descriptor["artifact_digest"])
                     (args.output_dir/"reconciliation.json").write_bytes(common.canonical_file_bytes(report))
         return 0
-    except Exception:
-        print("fixture control stopped; no repeat execution is authorized",file=sys.stderr)
+    except Exception as exc:
+        print(f"fixture control stopped; no repeat execution is authorized: {type(exc).__name__}: {exc}",file=sys.stderr)
         return 1
 
 
