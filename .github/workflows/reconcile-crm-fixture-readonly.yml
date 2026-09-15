@@ -1,0 +1,25 @@
+name: Reconcile CRM Fixture Read Only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    environment: rereply-production-crm-fixture
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read only fixture presence check
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          CRM_FIXTURE_OPERATION_SHA256: a4993eca137ccf4236c2bf1955c9ca0cbdf8e30be4d4157c35841918ad88c274
+          CRM_FIXTURE_DESCRIPTOR_SHA256: 1189864ba33d4936c2e20896d0fa6c45e3cbe2dbb0ced730f549423c86caf853
+          CRM_CANARY_FIXTURE_INPUT_JSON: ${{ secrets.CRM_CANARY_FIXTURE_INPUT_JSON }}
+        run: |
+          python3 -I -S -B release/deployment/reconcile_crm_fixture_readonly.py
