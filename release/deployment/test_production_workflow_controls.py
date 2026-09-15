@@ -2135,8 +2135,14 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
                 block, "const env = {...process.env, CLAIM_NODE:process.execPath};"
             )
             self.assertIn("spawnSync('/usr/bin/python3'", block)
-            self.assertIn("stdio:['ignore','ignore','ignore']", block)
             self.assertNotRegex(block, r"(?m)^        continue-on-error:")
+        # The claim adapter probe holds no product credential and stays silent.
+        self.assertIn("stdio:['ignore','ignore','ignore']", job_block(source, "claim-test"))
+        # The executor deliberately pipes its stdout/stderr: the controller only
+        # ever emits fixed content-free labels, and a protected reconciliation
+        # stop has to be diagnosable from the run log. Keep this exact form so a
+        # silent change to the executor's output handling still fails closed.
+        self.assertIn("stdio:['ignore','pipe','pipe']", job_block(source, "execute"))
         claim = job_block(source, "claim-test")
         self.assertNotIn("environment:", claim)
         self.assertNotIn("id-token: write", claim)
