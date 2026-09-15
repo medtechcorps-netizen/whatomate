@@ -615,9 +615,12 @@ class ProductProvisioner:
                             ("control_sha", "operation_sha256", "descriptor_sha256")},
                             "fixture_descriptor_sha256": common.sha256_value(driver), "stages": copy.deepcopy(self.stages),
                             "state": "fixture_rows_verified"}
-        except Exception:
+        except Exception as exc:
             self.failed = True
-            raise common.ReleaseError("fixture provisioning stopped; protected reconciliation is required") from None
+            raise common.ReleaseError(
+                "fixture provisioning stopped; protected reconciliation is required: "
+                f"{type(exc).__name__}: {exc}"
+            ) from None
 
     def rehydrate(self, terminal_receipt: Any) -> dict[str, Any]:
         """Reconstruct protected fixture data with authentication and GETs only.
