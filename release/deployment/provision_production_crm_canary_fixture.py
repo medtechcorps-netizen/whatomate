@@ -1709,13 +1709,14 @@ def observe_prestate(root: Path) -> dict[str, Any]:
     state, spec = provider.planner.provider_state(
         app, deployment, provider.contract, provider.target, provider.expected, None)
     observed = app["app"]
+    # Mirror provider_state exactly: it hashes the planner's raw timestamp text.
+    updated_at = provider.planner.require_timestamp(observed.get("updated_at"),
+                                                   "observed app updated_at")
     return {
         "schema_version": 1, "kind": "crm-canary-fixture-provider-prestate",
         "provider_prestate_sha256": common.sha256_value(state),
         "spec_sha256": common.sha256_value(spec),
-        "app_updated_at_sha256": common.sha256_bytes(
-            common.require_timestamp(observed.get("updated_at"), "observed app updated_at")
-            .encode("utf-8")),
+        "app_updated_at_sha256": common.sha256_bytes(updated_at.encode("utf-8")),
         "active_deployment_sha256": common.sha256_bytes(
             common.require_uuid(observed.get("active_deployment", {}).get("id"),
                                 "active deployment").encode("utf-8")),
