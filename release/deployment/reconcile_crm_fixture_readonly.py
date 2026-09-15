@@ -30,7 +30,19 @@ session = transport.login(
     credentials["super_admin_login"]["password"],
 )
 
-organizations = transport.request("GET", "/api/organizations", session=session)
+def unwrap(value: object) -> object:
+    if (
+        isinstance(value, dict)
+        and value.get("status") == "success"
+        and "data" in value
+    ):
+        return value["data"]
+    return value
+
+
+organizations = unwrap(
+    transport.request("GET", "/api/organizations", session=session)
+)
 if isinstance(organizations, list):
     organization_rows = organizations
 elif isinstance(organizations, dict) and isinstance(
@@ -55,11 +67,13 @@ organization_names = {
     row.get("name") for row in organization_rows if isinstance(row, dict)
 }
 
-users = transport.request(
-    "GET",
-    "/api/users?page=1&limit=100",
-    session=session,
-    organization_id=descriptor["super_admin_home_org_id"],
+users = unwrap(
+    transport.request(
+        "GET",
+        "/api/users?page=1&limit=100",
+        session=session,
+        organization_id=descriptor["super_admin_home_org_id"],
+    )
 )
 if isinstance(users, list):
     user_rows = users
