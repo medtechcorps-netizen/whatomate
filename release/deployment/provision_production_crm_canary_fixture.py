@@ -104,9 +104,17 @@ def _identity_shape(value: Any) -> str:
 
 
 def _require_identity(value: Any, label: str) -> str:
-    """Canonical UUID identity, or a protected failure carrying only its shape."""
+    """Canonical inventory identity, or a failure carrying only its shape.
+
+    Inventory rows are product-owned serialisations of PostgreSQL `uuid`
+    columns, which are not required to carry an RFC 4122 version nibble. The
+    identity contract here is therefore the canonical lowercase 8-4-4-4-12
+    text form plus uniqueness within the inventory. Strict RFC 4122 identities
+    remain enforced for every authority-bearing value (descriptor targets,
+    provider ids, and resources this operation creates).
+    """
     try:
-        return common.require_uuid(value, label)
+        return common.require_inventory_uuid(value, label)
     except common.ReleaseError as exc:
         raise common.ReleaseError(f"{exc} [{_identity_shape(value)}]") from None
 

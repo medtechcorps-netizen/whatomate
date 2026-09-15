@@ -299,6 +299,54 @@ class TestProductProvisioner(unittest.TestCase):
         with self.assertRaises(common.ReleaseError):
             controller._pages("/api/synthetic", "rows", org=uid(2))
 
+    def test_inventory_identity_accepts_live_postgres_uuid_without_rfc_version(self):
+        # Live production evidence (2026-09-15): a product user row carries a
+        # PostgreSQL uuid whose version nibble is "a". Inventory deduplication
+        # must accept the canonical text form while the general RFC 4122
+        # identity contract stays strict for authority-bearing values.
+        live = "aaaaaaaa-1111-a111-8111-111111111111"
+        rows = [{"id": live}, {"id": uid(7)}]
+
+        def paginated(method, path, body, **kwargs):
+            return {"status": "success",
+                    "data": {"rows": rows, "total": 2, "page": 1, "limit": 100}}
+
+        self.transport.request = paginated
+        controller = self.controller()
+        self.assertEqual([row["id"] for row in controller._pages("/api/synthetic", "rows", org=uid(2))],
+                         [live, uid(7)])
+        self.assertEqual([row["id"] for row in controller._list({"rows": rows}, "rows")],
+                         [live, uid(7)])
+        with self.assertRaises(common.ReleaseError):
+            common.require_uuid(live, "protected identity")
+        self.assertEqual(common.require_inventory_uuid(live, "rows inventory identity"), live)
+
+    def test_inventory_identity_rejections_keep_form_uniqueness_and_shape_only(self):
+        live = "aaaaaaaa-1111-a111-8111-111111111111"
+
+        def paginated(rows):
+            return lambda method, path, body, **kwargs: {
+                "status": "success",
+                "data": {"rows": rows, "total": len(rows), "page": 1, "limit": 100}}
+
+        for rejected in ("AAAAAAAA-1111-A111-8111-111111111111", live.replace("-", ""),
+                         live + "0", "zzz", 17, None):
+            controller = self.controller()
+            self.transport.request = paginated([{"id": rejected}])
+            with self.assertRaises(common.ReleaseError) as error:
+                controller._pages("/api/synthetic", "rows", org=uid(2))
+            self.assertIn("inventory identity", str(error.exception))
+            if rejected == "zzz":
+                message = str(error.exception)
+                self.assertIn("rows inventory identity has an invalid format", message)
+                self.assertIn("type:str length:3 relaxed:false digest:", message)
+                self.assertNotIn("zzz", message)
+        controller = self.controller()
+        self.transport.request = paginated([{"id": live}, {"id": live}])
+        with self.assertRaises(common.ReleaseError) as error:
+            controller._pages("/api/synthetic", "rows", org=uid(2))
+        self.assertEqual(str(error.exception), "duplicate inventory identity")
+
     def test_account_default_or_tenant_binding_drift_is_rejected(self):
         original = self.transport.request
         for field, value in (("is_default_incoming", True), ("status", "subscription_failed")):

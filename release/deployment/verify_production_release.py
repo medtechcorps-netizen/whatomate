@@ -113,6 +113,16 @@ DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+# Product rows live in PostgreSQL `uuid` columns, which store any 128-bit value
+# and do not enforce the RFC 4122 version and variant nibbles. Live evidence
+# (2026-09-15) shows a product user whose canonical text form is a valid UUID
+# with a version nibble of "a". Inventory deduplication therefore requires the
+# canonical lowercase 8-4-4-4-12 text form and uniqueness, while authority
+# bearing identities (descriptor targets, provider ids, created resources) keep
+# the strict RFC 4122 form above.
+INVENTORY_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,14}$")
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 256 * 1024
@@ -240,6 +250,10 @@ def require_digest(value: Any, label: str) -> str:
 
 def require_uuid(value: Any, label: str) -> str:
     return exact_string(value, label, UUID_RE)
+
+
+def require_inventory_uuid(value: Any, label: str) -> str:
+    return exact_string(value, label, INVENTORY_UUID_RE)
 
 
 def require_run_id(value: Any, label: str) -> str:
