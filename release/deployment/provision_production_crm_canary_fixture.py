@@ -80,6 +80,37 @@ def _require(condition: bool, label: str) -> None:
         common.fail(label)
 
 
+def _identity_shape(value: Any) -> str:
+    """Content-free description of a rejected inventory identity.
+
+    Never returns the identity itself: only its JSON type, string length, the
+    RFC 4122 version/variant nibbles when the relaxed 8-4-4-4-12 form matches,
+    and a truncated digest that a separate read-only inspection can correlate.
+    """
+    if value is None:
+        return "type:none"
+    if type(value) is not str:
+        return "type:" + type(value).__name__
+    parts = [f"type:str", f"length:{len(value)}"]
+    relaxed = re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value)
+    parts.append("relaxed:true" if relaxed is not None else "relaxed:false")
+    if relaxed is not None:
+        parts.append("version:" + value[14])
+        parts.append("variant:" + value[19])
+        parts.append("upper:" + ("true" if value != value.lower() else "false"))
+    parts.append("digest:" + hashlib.sha256(
+        value.encode("utf-8", "surrogatepass")).hexdigest()[:16])
+    return " ".join(parts)
+
+
+def _require_identity(value: Any, label: str) -> str:
+    """Canonical UUID identity, or a protected failure carrying only its shape."""
+    try:
+        return common.require_uuid(value, label)
+    except common.ReleaseError as exc:
+        raise common.ReleaseError(f"{exc} [{_identity_shape(value)}]") from None
+
+
 def _schema(value: Any, keys: set[str], label: str) -> dict[str, Any]:
     return common.exact_keys(value, keys, label)
 
@@ -265,7 +296,7 @@ class ProductProvisioner:
                              and (row["parts"] is None or type(row["parts"]) is list),
                              "message wrapper differs")
                     row = row["message"]
-                identity = common.require_uuid(row.get("id"), f"{key} inventory identity")
+                identity = _require_identity(row.get("id"), f"{key} inventory identity")
                 _require(identity not in seen, "duplicate inventory identity")
                 seen.add(identity)
                 rows.append(row)
@@ -278,7 +309,7 @@ class ProductProvisioner:
     def _list(data: Any, key: str) -> list[dict[str, Any]]:
         _require(type(data) is dict and type(data.get(key)) is list, "inventory shape differs")
         rows = data[key]
-        identities = [common.require_uuid(r.get("id"), f"{key} inventory identity")
+        identities = [_require_identity(r.get("id"), f"{key} inventory identity")
                       for r in rows if type(r) is dict]
         _require(len(rows) == len(identities) == len(set(identities)), "inventory identities differ")
         return rows
