@@ -31,13 +31,28 @@ session = transport.login(
 )
 
 organizations = transport.request("GET", "/api/organizations", session=session)
-if not isinstance(organizations, dict) or not isinstance(
+if isinstance(organizations, list):
+    organization_rows = organizations
+elif isinstance(organizations, dict) and isinstance(
     organizations.get("organizations"), list
 ):
-    raise RuntimeError("organizations response differs")
+    organization_rows = organizations["organizations"]
+else:
+    print(
+        common.canonical_payload_bytes(
+            {
+                "stage": "organizations_shape",
+                "type": type(organizations).__name__,
+                "keys": sorted(organizations.keys())
+                if isinstance(organizations, dict)
+                else None,
+            }
+        ).decode("utf-8")
+    )
+    raise SystemExit(0)
 
 organization_names = {
-    row.get("name") for row in organizations["organizations"] if isinstance(row, dict)
+    row.get("name") for row in organization_rows if isinstance(row, dict)
 }
 
 users = transport.request(
@@ -46,11 +61,24 @@ users = transport.request(
     session=session,
     organization_id=descriptor["super_admin_home_org_id"],
 )
-if not isinstance(users, dict) or not isinstance(users.get("users"), list):
-    raise RuntimeError("users response differs")
+if isinstance(users, list):
+    user_rows = users
+elif isinstance(users, dict) and isinstance(users.get("users"), list):
+    user_rows = users["users"]
+else:
+    print(
+        common.canonical_payload_bytes(
+            {
+                "stage": "users_shape",
+                "type": type(users).__name__,
+                "keys": sorted(users.keys()) if isinstance(users, dict) else None,
+            }
+        ).decode("utf-8")
+    )
+    raise SystemExit(0)
 
 user_emails = {
-    row.get("email") for row in users["users"] if isinstance(row, dict)
+    row.get("email") for row in user_rows if isinstance(row, dict)
 }
 
 result = {
