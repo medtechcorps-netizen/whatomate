@@ -80,6 +80,22 @@ def _require(condition: bool, label: str) -> None:
         common.fail(label)
 
 
+def _reason(exc: BaseException) -> str:
+    """Printable-only, bounded rendering of an internal control failure.
+
+    Every ReleaseError raised by this module and by its fixed transport is a
+    literal label, an HTTP status code, or a strict-JSON verdict, so a bounded
+    rendering is safe to carry into quarantine evidence. Anything else falls
+    back to the exception type alone.
+    """
+    if not isinstance(exc, common.ReleaseError):
+        return type(exc).__name__
+    text = str(exc)[:160]
+    if not text or any(ord(c) < 32 or ord(c) > 126 for c in text):
+        return "ReleaseError"
+    return text
+
+
 def _identity_shape(value: Any) -> str:
     """Content-free description of a rejected inventory identity.
 
@@ -249,9 +265,11 @@ class ProductProvisioner:
             _require(set(result) <= {"status", "data"} and result.get("status") == "success"
                      and "data" in result, "product response envelope differs")
             return result["data"]
-        except Exception:
+        except Exception as exc:
             self.failed = True
-            raise common.ReleaseError("fixture transport did not complete cleanly") from None
+            raise common.ReleaseError(
+                "fixture transport did not complete cleanly: " + _reason(exc)
+            ) from None
 
     def _get(self, path: str, *, org: str | None = None, session: Any = None, graph: bool = False) -> Any:
         return self._request("GET", path, org=org, session=self.admin if session is None else session, graph=graph)
@@ -921,6 +939,10 @@ def _wire(opener: Any, url: str, *, method: str = "GET", headers: Any = None,
             raw = response.read(maximum + 1)
             _require(len(raw) <= maximum, "HTTP response exceeds bound")
             return raw
+    except urllib.error.HTTPError as exc:
+        # The status is content-free and is the only way to distinguish a
+        # rejected request from a transport failure after quarantine.
+        raise common.ReleaseError(f"bounded HTTP operation failed: status {exc.code}") from None
     except Exception:
         raise common.ReleaseError("bounded HTTP operation failed") from None
 
@@ -1230,6 +1252,13 @@ class ClaimGate:
         self.records.append({**record,"artifact_id":fields["artifact-id"],"artifact_digest":meta["digest"]})
         try:
             return callback()
+        except common.ReleaseError as exc:
+            # Every ReleaseError raised on this path is one of this module's own
+            # fixed, content-free labels or a content-free HTTP status, so the
+            # quarantine classification can carry a reason without any secret.
+            raise common.AmbiguousMutation(
+                "issued fixture effect requires quarantine: " + _reason(exc)
+            ) from None
         except Exception:
             raise common.AmbiguousMutation("issued fixture effect requires quarantine") from None
 
