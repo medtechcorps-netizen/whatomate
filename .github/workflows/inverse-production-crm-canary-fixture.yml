@@ -104,6 +104,7 @@ jobs:
           ref: ${{ github.sha }}
           path: control
           persist-credentials: false
+          fetch-depth: 0
       - name: Retire exact pinned identities once, without repeating a deletion
         env:
           GH_TOKEN: ${{ github.token }}
@@ -118,12 +119,10 @@ jobs:
           [[ "$GITHUB_REF" == refs/heads/main && "$REF_PROTECTED" == true ]]
           python3 -I -S -B "control/$CONTROLLER_PATH" apply --control-root control --output-dir "$RUNNER_TEMP/inverse-result"
       - name: Attest exact inverse result provenance
-        if: ${{ always() }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: ${{ runner.temp }}/inverse-result/inverse-result.json
       - name: Attest exact inverse result policy
-        if: ${{ always() }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: ${{ runner.temp }}/inverse-result/inverse-result.json

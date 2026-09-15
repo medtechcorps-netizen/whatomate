@@ -424,12 +424,24 @@ def _reason_text(exc: BaseException) -> str:
     return fixture._reason(exc)
 
 
+def write_attempt(directory: Path, request: Any, stages: Any, reason: str) -> None:
+    """Content-free journal for a stopped inverse, so evidence survives the run."""
+    fixture._write_public(directory, "inverse-attempt", {
+        "schema_version": 1, "kind": "crm-canary-fixture-inverse-attempt",
+        "control_sha": request["control_sha"],
+        "request_sha256": common.sha256_value(request),
+        "stages": copy.deepcopy(stages), "reason": reason,
+    })
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Reviewed CRM canary fixture inverse")
     parser.add_argument("command", choices=["plan", "apply"])
     parser.add_argument("--control-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
+    request = None
+    inverse = None
     try:
         root = args.control_root.resolve(strict=True)
         api = fixture.GitHubRead(os.environ["GH_TOKEN"])
@@ -446,13 +458,26 @@ def main(argv: list[str] | None = None) -> int:
                 common.loads_strict(os.environ["CRM_CANARY_FIXTURE_INVERSE_AUTHORITY_JSON"]),
                 api, root, request, protected,
             )
-            fixture._write_public(args.output_dir, "inverse-result",
-                                  inverse.apply(authority))
+            try:
+                result = inverse.apply(authority)
+            except Exception as exc:
+                _record_attempt(args.output_dir, request, inverse, exc)
+                raise
+            fixture._write_public(args.output_dir, "inverse-result", result)
         return 0
     except Exception as exc:
         print("fixture inverse stopped; no deletion is repeated: "
               f"{type(exc).__name__}: {_reason_text(exc)}", file=sys.stderr)
         return 1
+
+
+def _record_attempt(directory: Path, request: Any, inverse: Any, exc: BaseException) -> None:
+    """Best-effort journal; a failed run must still publish what it attempted."""
+    try:
+        if request is not None and inverse is not None:
+            write_attempt(directory, request, inverse.stages, _reason_text(exc))
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
