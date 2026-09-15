@@ -136,8 +136,14 @@ class ProductInverse:
                      and "data" in result, "inverse response envelope differs")
             return result["data"]
         except Exception as exc:
+            # Route and tenant hash only: both are content-free, and without
+            # them a read-only stop cannot be localised.
+            where = f" at {method} {path.split('?', 1)[0]}"
+            if org is not None:
+                where += " under tenant " + common.sha256_value(org)[:8]
             raise common.ReleaseError(
-                "inverse transport did not complete cleanly: " + fixture._reason(exc)
+                "inverse transport did not complete cleanly" + where + ": "
+                + fixture._reason(exc)
             ) from None
 
     def _get(self, path: str, *, org: str | None = None) -> Any:
