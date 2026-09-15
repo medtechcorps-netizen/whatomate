@@ -1689,6 +1689,43 @@ def _require_effect_window(intent: Any, authority: Any, now: dt.datetime) -> Non
              "protected execution approval expired")
 
 
+def observe_prestate(root: Path) -> dict[str, Any]:
+    """Read-only provider prestate observation; no authority, burn, or write.
+
+    The execution authority pins the provider prestate, and the provider moves
+    incidentally (for example ``app.updated_at`` advances without an app
+    event). Building a fresh authority therefore needs one read-only
+    observation of the exact state an execution would compare against. This
+    function performs only the contract-pinned GETs and returns content-free
+    facts plus the prestate hash.
+    """
+    read_token = os.environ.pop("DO_PRODUCTION_FIXTURE_READ_TOKEN")
+    target = _schema(common.loads_strict(os.environ["PROVIDER_TARGET_JSON"]),
+                     {"app_id", "default_ingress"}, "provider target")
+    provider = ProviderFixture(root, {"provider_target": target,
+                                      "provider_prestate_sha256": "0" * 64},
+                               read_token, read_token)
+    app, deployment, _ = provider.current()
+    state, spec = provider.planner.provider_state(
+        app, deployment, provider.contract, provider.target, provider.expected, None)
+    observed = app["app"]
+    return {
+        "schema_version": 1, "kind": "crm-canary-fixture-provider-prestate",
+        "provider_prestate_sha256": common.sha256_value(state),
+        "spec_sha256": common.sha256_value(spec),
+        "app_updated_at_sha256": common.sha256_bytes(
+            common.require_timestamp(observed.get("updated_at"), "observed app updated_at")
+            .encode("utf-8")),
+        "active_deployment_sha256": common.sha256_bytes(
+            common.require_uuid(observed.get("active_deployment", {}).get("id"),
+                                "active deployment").encode("utf-8")),
+        "deployment_sha256": common.sha256_bytes(
+            common.require_uuid(deployment["deployment"].get("id"),
+                                "deployment identity").encode("utf-8")),
+        "allowlist_members": len(provider.allowlist_control(spec)["value"].split(",")),
+    }
+
+
 def _hosted_claim_test(api: GitHubRead,root: Path,bundle: Path,gh: Path) -> None:
     _current_guard(api,root)
     descriptor,_ = _intent_from_current(api)

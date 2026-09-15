@@ -1,0 +1,41 @@
+name: Observe CRM Fixture Prestate
+
+run-name: Observe the exact provider prestate a CRM fixture execution would pin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  CONTROLLER_PATH: release/deployment/observe_crm_fixture_prestate.py
+
+jobs:
+  observe:
+    name: Observe exact provider prestate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: rereply-production-crm-fixture
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: control
+      - name: Observe the contract-pinned provider state with reads only
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          CONTROL_ROOT: control
+          DO_PRODUCTION_FIXTURE_READ_TOKEN: ${{ secrets.DO_PRODUCTION_FIXTURE_READ_TOKEN }}
+          PROVIDER_TARGET_JSON: '{"app_id":"54bc0d92-73e9-4f8b-86cd-c3fd96e06beb","default_ingress":"https://omnitech-3rilx.ondigitalocean.app"}'
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          python3 -I -S -B "$CONTROLLER_PATH"
