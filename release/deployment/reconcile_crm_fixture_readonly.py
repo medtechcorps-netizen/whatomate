@@ -42,6 +42,7 @@ protected = fixture.validate_protected_input(
     request,
 )
 descriptor = protected["descriptor"]
+registration = protected["registration"]
 credentials = protected["credentials"]
 transport = fixture.ProductHTTP(credentials["meta_access_token"])
 session = transport.login(
@@ -143,7 +144,18 @@ def paged_endpoint(path: str, key: str, org: str | None = None) -> dict[str, obj
         }
     rows = data.get(key) if isinstance(data, dict) else None
     result["rows"] = row_shapes(rows, key)
+    result["values"] = rows if isinstance(rows, list) else []
     return result
+
+
+def emails(rows: object) -> set[str]:
+    if not isinstance(rows, list):
+        return set()
+    return {
+        row["email"]
+        for row in rows
+        if isinstance(row, dict) and type(row.get("email")) is str
+    }
 
 
 report: dict[str, object] = {
@@ -161,22 +173,53 @@ org_rows = organizations.get("organizations") if isinstance(organizations, dict)
 report["organizations"]["rows"] = row_shapes(org_rows, "organizations")
 
 org_reports: list[dict[str, object]] = []
+canary_prefix_orgs: list[int] = []
+klinik_name_orgs: list[int] = []
+non_klinik_name_orgs: list[int] = []
+all_emails: set[str] = set()
 if isinstance(org_rows, list):
     for index, org in enumerate(org_rows):
         if not isinstance(org, dict):
             org_reports.append({"index": index, "type": type(org).__name__})
             continue
         org_id = org.get("id")
+        name = org.get("name") if type(org.get("name")) is str else ""
+        slug = org.get("slug") if type(org.get("slug")) is str else ""
+        if name.lower().startswith("rereply-canary") or slug.lower().startswith("rereply-canary"):
+            canary_prefix_orgs.append(index)
+        if name == descriptor["klinik"]["organization_name"]:
+            klinik_name_orgs.append(index)
+        if name == descriptor["non_klinik"]["organization_name"]:
+            non_klinik_name_orgs.append(index)
+        users = paged_endpoint("/api/users", "users", org_id)
+        org_emails = emails(users.pop("values", []))
+        all_emails |= org_emails
         entry: dict[str, object] = {
             "index": index,
             "id": classify(org_id),
             "home_org": org_id == descriptor["super_admin_home_org_id"],
             "reseller_bound": org.get("reseller_id") is not None,
-            "users": paged_endpoint("/api/users", "users", org_id),
+            "canary_prefix": index in canary_prefix_orgs,
+            "users": users,
             "accounts": list_endpoint("/api/accounts", "accounts", org_id),
+            "registration_users": {
+                "klinik": registration["klinik_email"] in org_emails,
+                "non_klinik": registration["non_klinik_email"] in org_emails,
+            },
         }
         org_reports.append(entry)
 report["org_count"] = len(org_reports)
 report["orgs"] = org_reports
+report["fixture_presence"] = {
+    "organization_count": len(org_rows) if isinstance(org_rows, list) else None,
+    "canary_prefix_orgs": canary_prefix_orgs,
+    "klinik_name_orgs": klinik_name_orgs,
+    "non_klinik_name_orgs": non_klinik_name_orgs,
+    "klinik_organization_present": bool(klinik_name_orgs),
+    "non_klinik_organization_present": bool(non_klinik_name_orgs),
+    "klinik_user_present": registration["klinik_email"] in all_emails,
+    "non_klinik_user_present": registration["non_klinik_email"] in all_emails,
+    "canary_prefix_present": bool(canary_prefix_orgs),
+}
 
 print(json.dumps(report, sort_keys=True, separators=(",", ":")))

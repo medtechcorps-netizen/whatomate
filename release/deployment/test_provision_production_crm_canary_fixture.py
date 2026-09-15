@@ -299,6 +299,24 @@ class TestProductProvisioner(unittest.TestCase):
         with self.assertRaises(common.ReleaseError):
             controller._pages("/api/synthetic", "rows", org=uid(2))
 
+    def test_quarantine_carries_only_a_content_free_reason(self):
+        controller = self.controller()
+        original = self.transport.request
+
+        def reject(method, path, *args, **kwargs):
+            if (method, path) == ("POST", "/api/organizations"):
+                raise common.ReleaseError("bounded HTTP operation failed: status 400")
+            return original(method, path, *args, **kwargs)
+
+        self.transport.request = reject
+        with self.assertRaises(common.ReleaseError) as error:
+            controller.provision()
+        message = str(error.exception)
+        self.assertIn("protected reconciliation is required", message)
+        self.assertIn("status 400", message)
+        for key, value in self.protected["credentials"].items():
+            self.assertNotIn(value["password"] if key == "super_admin_login" else value, message)
+
     def test_inventory_identity_accepts_live_postgres_uuid_without_rfc_version(self):
         # Live production evidence (2026-09-15): a product user row carries a
         # PostgreSQL uuid whose version nibble is "a". Inventory deduplication
