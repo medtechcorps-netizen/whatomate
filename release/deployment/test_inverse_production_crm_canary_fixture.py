@@ -60,12 +60,15 @@ class FakeTransport:
         }
         self.accounts = {
             self.klinik_org: [{"id": self.klinik_account, "phone_id": self.phone_id,
-                               "organization_id": self.klinik_org, "status": "active"}],
+                               "organization_id": self.klinik_org, "status": "active",
+                               "name": self.d["meta"]["account_name"]}],
             self.retired_org: [{"id": self.retired_account, "phone_id": self.phone_id,
-                                "organization_id": self.retired_org, "status": "active"}],
+                                "organization_id": self.retired_org, "status": "active",
+                                "name": self.d["meta"]["account_name"]}],
         }
         self.calls = []
         self.deletes = []
+        self.renames = []
         self.fail_delete_at = fail_delete_at
 
     def login(self, email, password):
@@ -107,6 +110,14 @@ class FakeTransport:
         else:
             self.organizations = [row for row in self.organizations if row["id"] != identity]
             self.users.pop(identity, None)
+
+    def rename_account(self, path, name, *, session, organization_id):
+        self.renames.append((path, name, organization_id))
+        identity = path.rsplit("/", 1)[1]
+        for org, rows in self.accounts.items():
+            for row in rows:
+                if row["id"] == identity:
+                    row["name"] = name
 
 
 def authority_for(protected, transport, *, expires_in=3600, retired=None, overrides=None):
@@ -198,10 +209,18 @@ class TestProductInverse(unittest.TestCase):
         self.assertEqual(result["stages"][0]["accounts"],
                          [{"organization_sha256": common.sha256_value(self.transport.klinik_org),
                            "account_sha256": common.sha256_value(self.transport.klinik_account),
-                           "action": "deleted", "status": "absent"},
+                           "action": "deleted", "status": "absent", "renamed": True},
                           {"organization_sha256": common.sha256_value(self.transport.retired_org),
                            "account_sha256": common.sha256_value(self.transport.retired_account),
-                           "action": "deleted", "status": "absent"}])
+                           "action": "deleted", "status": "absent", "renamed": True}])
+        self.assertEqual([path for path, _, _ in self.transport.renames], [
+            "/api/accounts/" + self.transport.klinik_account,
+            "/api/accounts/" + self.transport.retired_account,
+        ])
+        for _, name, _ in self.transport.renames:
+            self.assertTrue(name.startswith(self.protected["descriptor"]["meta"]["account_name"]))
+            self.assertIn("(retired ", name)
+            self.assertLessEqual(len(name), 100)
         for key, value in self.protected["credentials"].items():
             self.assertNotIn(value["password"] if key == "super_admin_login" else value,
                              str(result))

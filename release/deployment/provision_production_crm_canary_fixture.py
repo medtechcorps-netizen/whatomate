@@ -993,6 +993,25 @@ class ProductHTTP:
         return self._send("DELETE", path, None, session=session,
                           organization_id=organization_id, headers=None, graph=False)
 
+    def rename_account(self, path: str, name: str, *, session: Any,
+                       organization_id: str) -> Any:
+        """Reviewed inverse capability: release one account's unique name.
+
+        The product enforces a global unique index on account names with no
+        soft-delete predicate, so retiring an account must also free its name.
+        The capability is bound to ``/api/accounts/<uuid>`` and to a single
+        ``name`` field, and it cannot be widened by a caller.
+        """
+        _require(type(path) is str
+                 and re.fullmatch(r"/api/accounts/"
+                                  r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                                  path) is not None, "inverse update route differs")
+        _require(type(name) is str and 1 <= len(name) <= 100 and name == name.strip()
+                 and not any(ord(c) < 32 or ord(c) > 126 for c in name),
+                 "inverse account name differs")
+        return self._send("PUT", path, {"name": name}, session=session,
+                          organization_id=organization_id, headers=None, graph=False)
+
     def _send(self, method: str, path: str, body: Any = None, *, session: Any = None,
               organization_id: str | None = None, headers: Any = None, graph: bool = False) -> Any:
         _require(type(path) is str and path.startswith("/") and not path.startswith("//")

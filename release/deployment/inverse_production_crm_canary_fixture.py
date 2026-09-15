@@ -80,7 +80,7 @@ RESULT_KEYS = {
 }
 STAGE_KEYS = {"stage", "route", "target_sha256", "action", "status"}
 ACCOUNT_STAGE_KEYS = {"stage", "route", "target_sha256", "action", "status", "accounts"}
-ACCOUNT_KEYS = {"organization_sha256", "account_sha256", "action", "status"}
+ACCOUNT_KEYS = {"organization_sha256", "account_sha256", "action", "status", "renamed"}
 
 
 class AmbiguousInverse(common.ReleaseError):
@@ -344,15 +344,36 @@ class ProductInverse:
         }, ACCOUNT_STAGE_KEYS, "inverse account stage")
 
     def _retire_accounts(self, targets: Any, retired: Any) -> None:
-        """Retire the fixture number's live accounts before any tenant removal."""
+        """Retire the fixture number's live accounts before any tenant removal.
+
+        The product keeps a global unique index on account names with no
+        soft-delete predicate, so the name is released first and the account is
+        deleted second; both steps happen under the account's own tenant.
+        """
         records: list[dict[str, Any]] = []
         for entry in self._fixture_accounts(targets=targets, retired=retired):
             tenant = entry["tenant"]
             identity = common.require_uuid(entry["account"]["id"], "inverse account")
+            name = entry["account"].get("name")
+            _require(type(name) is str and name.startswith(self.d["meta"]["account_name"]),
+                     "inverse account name differs")
             record = _schema({"organization_sha256": common.sha256_value(tenant),
                               "account_sha256": common.sha256_value(identity),
-                              "action": "observed", "status": "present"},
+                              "action": "observed", "status": "present", "renamed": False},
                              ACCOUNT_KEYS, "inverse account")
+            released_name = f"{name[:70]} (retired {self.request['control_sha'][:8]})"
+            try:
+                self.transport.rename_account("/api/accounts/" + identity, released_name,
+                                              session=self.session, organization_id=tenant)
+            except Exception as exc:
+                record["action"] = "ambiguous"
+                record["status"] = "unknown"
+                records.append(record)
+                self.stages.append(self._account_stage(records))
+                raise AmbiguousInverse(
+                    "inverse account rename is ambiguous: " + fixture._reason(exc)
+                ) from None
+            record["renamed"] = True
             try:
                 self.transport.delete("/api/accounts/" + identity, session=self.session,
                                       organization_id=tenant)
