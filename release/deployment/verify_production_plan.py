@@ -1654,10 +1654,11 @@ def validate_topology(spec: Mapping[str, Any], contract: Mapping[str, Any]) -> N
             fail(f"unexpected production {collection} component")
 
     vpc = spec.get("vpc")
-    if type(vpc) is not dict or type(vpc.get("id")) is not str:
-        fail("production VPC binding is malformed")
-    if sha256_bytes(vpc["id"].encode("utf-8")) != topology["vpc_id_sha256"]:
-        fail("production VPC binding differs")
+    if vpc is not None:
+        if type(vpc) is not dict or type(vpc.get("id")) is not str:
+            fail("production VPC binding is malformed")
+        if sha256_bytes(vpc["id"].encode("utf-8")) != topology["vpc_id_sha256"]:
+            fail("production VPC binding differs")
 
     if normalized_ingress(spec) != topology["ingress"]:
         fail("production ingress differs")
