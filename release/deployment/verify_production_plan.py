@@ -1679,44 +1679,38 @@ def validate_topology(spec: Mapping[str, Any], contract: Mapping[str, Any]) -> N
         PRODUCTION_DATABASE_INVENTORY
     ):
         fail("production database bindings differ")
-    observed_databases = []
+    observed_names = []
+    full_metadata_present = True
     for database in databases:
         if type(database) is not dict:
             fail("production database entry is malformed")
-        name = exact_string(database.get("name"), "database binding name")
-        item = {
-            "engine": exact_string(database.get("engine"), "database engine"),
-            "version": exact_string(database.get("version"), "database version"),
-            "production": exact_bool(database.get("production"), "database production flag"),
-            "name_sha256": sha256_bytes(name.encode("utf-8")),
-        }
-        cluster = database.get("cluster_name")
-        if cluster is not None:
-            item["cluster_sha256"] = sha256_bytes(
-                exact_string(cluster, "database cluster name").encode("utf-8")
+        observed_names.append(
+            sha256_bytes(
+                exact_string(database.get("name"), "database binding name").encode("utf-8")
             )
-        observed_databases.append(item)
+        )
+        if not (
+            type(database.get("engine")) is str
+            and type(database.get("version")) is str
+            and type(database.get("production")) is bool
+            and type(database.get("cluster_name")) is str
+        ):
+            full_metadata_present = False
 
-    if any("cluster_sha256" not in item for item in observed_databases):
-        observed_set = {
-            (item["engine"], item["version"], item["production"], item["name_sha256"])
-            for item in observed_databases
-        }
-        expected_set = {
-            (item["engine"], item["version"], item["production"], item["name_sha256"])
-            for item in topology["databases"]
-        }
-    else:
-        observed_set = {
-            (item["engine"], item["version"], item["production"], item["name_sha256"], item["cluster_sha256"])
-            for item in observed_databases
-        }
-        expected_set = {
-            (item["engine"], item["version"], item["production"], item["name_sha256"], item["cluster_sha256"])
-            for item in topology["databases"]
-        }
-    if observed_set != expected_set:
+    if {item["name_sha256"] for item in topology["databases"]} != set(observed_names):
         fail("production database bindings differ")
+
+    if full_metadata_present:
+        observed_set = {
+            (d["engine"], d["version"], d["production"], sha256_bytes(d["name"].encode("utf-8")), sha256_bytes(d["cluster_name"].encode("utf-8")))
+            for d in databases
+        }
+        expected_set = {
+            (d["engine"], d["version"], d["production"], d["name_sha256"], d["cluster_sha256"])
+            for d in topology["databases"]
+        }
+        if observed_set != expected_set:
+            fail("production database bindings differ")
 
 
 def validate_legacy_component_sources(
