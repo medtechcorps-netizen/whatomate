@@ -33,11 +33,11 @@
     ]
   },
   "bootstrap_state": {
-    "genesis_state_sha256": "877890003191e14d2e2a5154017324df34698fb8f2c86eb93a86ded9af5f5def",
+    "genesis_state_sha256": "6e0e214a11873a7a4a5d05b381ffaa3beefa175ed7e9c9340b1f3399a32c8e6f",
     "active_deployment_id_sha256": "2ca45627f9ff37404814d2a0bdacd8f2a1b3bbcd4e477f553db8454afc9d798b",
-    "canonical_spec_sha256": "dc758943902680a142fd30dc1b27bd484cea3f8155e564d08b6dfa8025d0d874",
+    "canonical_spec_sha256": "d0a159a049ab2b2f146574f301725ee272641cc8ee4969b786b02cfacb9c296c",
     "environment_values_sha256": "c7e20ec77021f8b90b6ff0bb79080ee13b010eab121687ac5e391a43b2365b23",
-    "non_source_projection_sha256": "1c46d577dd13e43f9eb0be9ce1b9c1f292530bc6f0950d9e30f4196ecbc6aad9",
+    "non_source_projection_sha256": "5159277bfffd8e6de6f599e43bf4a1bac104bc6cf5d50141aa5228a74f5a9fda",
     "source_mode": "legacy-git",
     "source_sha": "974bb998f6d4c94ce750a92bf23f4550f8e45a2f"
   },
