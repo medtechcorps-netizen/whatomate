@@ -974,6 +974,27 @@ class ProductHTTP:
     def request(self, method: str, path: str, body: Any = None, *, session: Any = None,
                 organization_id: str | None = None, headers: Any = None, graph: bool = False) -> Any:
         _require(method in ("GET","POST","PUT"), "product method differs")
+        return self._send(method, path, body, session=session, organization_id=organization_id,
+                          headers=headers, graph=graph)
+
+    _DELETE_ROUTE = re.compile(
+        r"/api/(?:users|organizations)/"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+    def delete(self, path: str, *, session: Any, organization_id: str | None = None) -> Any:
+        """Reviewed inverse capability: retire exactly one fixture identity.
+
+        The forward fixture sequence never deletes. This capability is bound to
+        the two product resources a reviewed inverse may retire, so a caller
+        cannot widen it, and it carries no body.
+        """
+        _require(type(path) is str and self._DELETE_ROUTE.fullmatch(path) is not None,
+                 "inverse delete route differs")
+        return self._send("DELETE", path, None, session=session,
+                          organization_id=organization_id, headers=None, graph=False)
+
+    def _send(self, method: str, path: str, body: Any = None, *, session: Any = None,
+              organization_id: str | None = None, headers: Any = None, graph: bool = False) -> Any:
         _require(type(path) is str and path.startswith("/") and not path.startswith("//")
                  and not any(c in path for c in ("#", "\r", "\n", "\\", "\x00"))
                  and ".." not in urllib.parse.unquote(path), "product path differs")

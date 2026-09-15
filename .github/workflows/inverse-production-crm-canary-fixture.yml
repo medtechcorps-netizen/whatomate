@@ -1,0 +1,162 @@
+name: Invert Production CRM Canary Fixture
+
+run-name: Retire the reserved canary tenant state of one quarantined CRM fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Read-only inverse plan, or the reviewed single-pass inverse
+        required: true
+        type: choice
+        options: [plan, apply]
+      request_json:
+        description: Canonical public fixture request containing schema, control, operation and descriptor hashes
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rereply-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  RELEASE_REPOSITORY: medtechcorps-netizen/whatomate
+  WORKFLOW_PATH: .github/workflows/inverse-production-crm-canary-fixture.yml
+  CONTROLLER_PATH: release/deployment/inverse_production_crm_canary_fixture.py
+  PLAN_PREDICATE: https://rereply.app/attestations/crm-canary-fixture-inverse-plan/v1
+  RESULT_PREDICATE: https://rereply.app/attestations/crm-canary-fixture-inverse-result/v1
+
+jobs:
+  plan:
+    name: Plan exact CRM canary fixture inverse
+    if: ${{ inputs.mode == 'plan' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: rereply-production-crm-fixture
+    permissions:
+      actions: read
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Discover the two reserved tenants with reads only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_SHA: ${{ github.sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REQUEST_JSON: ${{ inputs.request_json }}
+          CRM_CANARY_FIXTURE_INPUT_JSON: ${{ secrets.CRM_CANARY_FIXTURE_INPUT_JSON }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main && "$REF_PROTECTED" == true ]]
+          python3 -I -S -B "control/$CONTROLLER_PATH" plan --control-root control --output-dir "$RUNNER_TEMP/inverse-plan"
+      - name: Attest exact inverse plan provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/inverse-plan/inverse-plan.json
+      - name: Attest exact inverse plan policy
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/inverse-plan/inverse-plan.json
+          predicate-type: ${{ env.PLAN_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/inverse-plan/inverse-plan.json
+      - name: Upload immutable inverse plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: crm-canary-fixture-inverse-plan-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/inverse-plan
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+          compression-level: 0
+          retention-days: 90
+
+  apply:
+    name: Apply exact CRM canary fixture inverse
+    if: ${{ inputs.mode == 'apply' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: rereply-production-crm-fixture
+    permissions:
+      actions: read
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Retire exact pinned identities once, without repeating a deletion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_SHA: ${{ github.sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REQUEST_JSON: ${{ inputs.request_json }}
+          CRM_CANARY_FIXTURE_INPUT_JSON: ${{ secrets.CRM_CANARY_FIXTURE_INPUT_JSON }}
+          CRM_CANARY_FIXTURE_INVERSE_AUTHORITY_JSON: ${{ secrets.CRM_CANARY_FIXTURE_INVERSE_AUTHORITY_JSON }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main && "$REF_PROTECTED" == true ]]
+          python3 -I -S -B "control/$CONTROLLER_PATH" apply --control-root control --output-dir "$RUNNER_TEMP/inverse-result"
+      - name: Attest exact inverse result provenance
+        if: ${{ always() }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/inverse-result/inverse-result.json
+      - name: Attest exact inverse result policy
+        if: ${{ always() }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/inverse-result/inverse-result.json
+          predicate-type: ${{ env.RESULT_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/inverse-result/inverse-result.json
+      - name: Upload only content-free inverse result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: crm-canary-fixture-inverse-result-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/inverse-result
+          if-no-files-found: warn
+          overwrite: false
+          include-hidden-files: false
+          compression-level: 0
+          retention-days: 90
+
+  gate:
+    name: Exact CRM fixture inverse gate
+    if: ${{ always() }}
+    needs: [plan, apply]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the one selected path and no unexpected skip
+        env:
+          MODE: ${{ inputs.mode }}
+          PLAN: ${{ needs.plan.result }}
+          APPLY: ${{ needs.apply.result }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            plan) [[ "$PLAN/$APPLY" == success/skipped ]] ;;
+            apply) [[ "$PLAN/$APPLY" == skipped/success ]] ;;
+            *) exit 1 ;;
+          esac

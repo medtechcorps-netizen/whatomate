@@ -46,7 +46,7 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "33e97fb2b723e34c4539022b07433ac410deda40e33af0d61985a9c2c0361663"
     ),
     "finalize-production-orphan-lock.yml": (
-        "00530cec41dbdcf7d6a5f02b5e383c65c7427020f5f71234619476fc79697f54"
+        "19706d8b48b074ca3803bc9d39149dce73f867db8d0918fbb0b9a16c1075ac5e"
     ),
     "reconcile-production-orphan.yml": (
         "97abfef7db4cfa729aba1e491ea45e4a4b1e63fa33e3908f6d86c9fa76b346da"
