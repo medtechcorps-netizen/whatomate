@@ -38,6 +38,17 @@ type ImportConfig struct {
 	BeforeCreate    func(db *gorm.DB, orgID uuid.UUID, record map[string]any) error
 }
 
+func importRowWrite(
+	db *gorm.DB,
+	tableName string,
+	write func(tx *gorm.DB) error,
+) error {
+	if tableName == "contacts" {
+		return canonicalContactWriteTransaction(db, write)
+	}
+	return write(db)
+}
+
 // Supported export/import configurations
 var exportConfigs = map[string]ExportConfig{
 	"contacts": {
@@ -561,7 +572,9 @@ func (a *App) ImportData(r *fastglue.Request) error {
 					delete(recordMap, "organization_id")
 					delete(recordMap, config.UniqueColumn)
 					if len(recordMap) > 0 {
-						if err := a.DB.Model(existing).Updates(recordMap).Error; err != nil {
+						if err := importRowWrite(a.DB, tableName, func(tx *gorm.DB) error {
+							return tx.Model(existing).Updates(recordMap).Error
+						}); err != nil {
 							errors++
 							errorMessages = append(errorMessages, fmt.Sprintf("Row %d: failed to update", rowNum))
 						} else {
@@ -615,7 +628,9 @@ func (a *App) ImportData(r *fastglue.Request) error {
 
 		// Use GORM to create the populated struct - this handles PostgreSQL properly
 		newRecord := newRecordVal.Addr().Interface()
-		if err := a.DB.Create(newRecord).Error; err != nil {
+		if err := importRowWrite(a.DB, tableName, func(tx *gorm.DB) error {
+			return tx.Create(newRecord).Error
+		}); err != nil {
 			errors++
 			errorMessages = append(errorMessages, fmt.Sprintf("Row %d: failed to create - %s", rowNum, err.Error()))
 			continue

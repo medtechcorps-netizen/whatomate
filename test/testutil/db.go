@@ -178,6 +178,38 @@ func OpenIsolatedTestDatabaseOwnedByRole(t *testing.T) (*gorm.DB, *gorm.DB, stri
 	isolatedAdminSQLDB, err = isolatedAdminDB.DB()
 	require.NoError(t, err)
 
+	// PostgreSQL 14 leaves public owned by the bootstrap administrator even
+	// when a new database has a different owner. Establish this disposable
+	// fixture's schema authority explicitly before non-superuser migrations.
+	var isolatedIdentity struct {
+		DatabaseName string `gorm:"column:database_name"`
+		NamespaceOID int64  `gorm:"column:namespace_oid"`
+		OwnerRole    string `gorm:"column:owner_role"`
+	}
+	identityQuery := `
+		SELECT pg_catalog.current_database()::text AS database_name,
+			namespace.oid::bigint AS namespace_oid,
+			owner.rolname::text AS owner_role
+		FROM pg_catalog.pg_namespace AS namespace
+		JOIN pg_catalog.pg_roles AS owner ON owner.oid = namespace.nspowner
+		WHERE namespace.nspname = 'public'
+	`
+	identity := isolatedAdminDB.Raw(identityQuery).Scan(&isolatedIdentity)
+	require.NoError(t, identity.Error)
+	require.EqualValues(t, 1, identity.RowsAffected)
+	require.Equal(t, databaseName, isolatedIdentity.DatabaseName)
+	require.Positive(t, isolatedIdentity.NamespaceOID)
+	publicNamespaceOID := isolatedIdentity.NamespaceOID
+	require.NoError(t, isolatedAdminDB.Exec(
+		"ALTER SCHEMA public OWNER TO "+ownerRole,
+	).Error)
+	identity = isolatedAdminDB.Raw(identityQuery).Scan(&isolatedIdentity)
+	require.NoError(t, identity.Error)
+	require.EqualValues(t, 1, identity.RowsAffected)
+	require.Equal(t, databaseName, isolatedIdentity.DatabaseName)
+	require.Equal(t, publicNamespaceOID, isolatedIdentity.NamespaceOID)
+	require.Equal(t, ownerRole, isolatedIdentity.OwnerRole)
+
 	ownerURL := *baseURL
 	ownerURL.User = url.UserPassword(ownerRole, ownerPassword)
 	ownerDB, err := gorm.Open(postgres.Open(ownerURL.String()), &gorm.Config{
@@ -344,7 +376,13 @@ func runMigrations(db *gorm.DB) error {
 	if err := database.PrepareProviderIntegrationManagementMode(db); err != nil {
 		return err
 	}
+	if err := database.PrepareMessageIngestionOrder(db); err != nil {
+		return err
+	}
 	if err := db.AutoMigrate(modelsToMigrate...); err != nil {
+		return err
+	}
+	if err := database.InstallMessageIngestionOrderTrigger(db); err != nil {
 		return err
 	}
 	// The shared local PostgreSQL container can contain rows from an interrupted

@@ -23,7 +23,15 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-const campaignCanonicalContactAttempts = 3
+const campaignCanonicalContactAttempts = 6
+
+var campaignCanonicalContactRetryBackoffs = [...]time.Duration{
+	25 * time.Millisecond,
+	50 * time.Millisecond,
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	400 * time.Millisecond,
+}
 
 const campaignMarketingOptOutMessage = "Contact opted out of marketing messages"
 const campaignAmbiguousDeliveryMessage = "Provider delivery outcome is unknown; message was not retried to prevent a duplicate"
@@ -131,7 +139,7 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 	var account models.WhatsAppAccount
 	var contact *models.Contact
 	terminal := false
-	if err := w.withRecipientTenantTransaction(ctx, job.OrganizationID, func(tx *gorm.DB) error {
+	if err := w.campaignCanonicalContactTransaction(ctx, job.OrganizationID, func(tx *gorm.DB, _ *bool) error {
 		scoped := *w
 		scoped.DB = tx
 
@@ -169,6 +177,9 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 			job.PhoneNumber,
 			job.RecipientName,
 		)
+		if err != nil && retryableCampaignContactWrite(err) {
+			return err
+		}
 		if err != nil || resolved == nil {
 			w.Log.Error("Failed to get or create contact", "error", err, "phone", job.PhoneNumber)
 			scoped.updateRecipientStatus(job.RecipientID, models.MessageStatusFailed, "", "Failed to create contact")
@@ -750,11 +761,26 @@ func (w *Worker) campaignCanonicalContactTransaction(
 		err = w.withRecipientTenantTransaction(ctx, organizationID, func(tx *gorm.DB) error {
 			return write(tx, &deliveryAttempted)
 		})
-		if err == nil || deliveryAttempted || !retryableCampaignContactWrite(err) {
+		if err == nil || deliveryAttempted || !retryableCampaignContactWrite(err) ||
+			attempt == campaignCanonicalContactAttempts-1 {
 			return err
+		}
+		if waitErr := waitForCampaignCanonicalContactRetry(ctx, attempt); waitErr != nil {
+			return waitErr
 		}
 	}
 	return err
+}
+
+func waitForCampaignCanonicalContactRetry(ctx context.Context, failedAttempt int) error {
+	timer := time.NewTimer(campaignCanonicalContactRetryBackoffs[failedAttempt])
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // withRecipientTenantTransaction always begins a top-level phase from the
@@ -783,7 +809,7 @@ func retryableCampaignContactWrite(err error) bool {
 		return false
 	}
 	switch sqlState.SQLState() {
-	case "40001", "40P01":
+	case "40001", "40P01", "55P03":
 		return true
 	default:
 		return false

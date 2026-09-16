@@ -154,7 +154,7 @@ func (a *App) updateContactBSUID(contact *models.Contact, bsuid string) {
 		return
 	}
 
-	err := a.DB.Transaction(func(tx *gorm.DB) error {
+	err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
 		return tx.Model(&models.Contact{}).
 			Where("id = ?", contact.ID).
 			Update("bs_uid", bsuid).Error
@@ -2143,9 +2143,9 @@ func (a *App) getOrCreateInboundContact(
 
 	var result models.Contact
 	var isNew bool
-	var err error
-	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
-		err = a.DB.Transaction(func(tx *gorm.DB) error {
+	err := canonicalContactWriteTransactionWithRetry(
+		a.DB,
+		func(tx *gorm.DB) error {
 			contact, created, createErr := contactutil.GetOrCreateContact(
 				tx,
 				account.OrganizationID,
@@ -2203,17 +2203,17 @@ func (a *App) getOrCreateInboundContact(
 			result = *canonical
 			isNew = created
 			return nil
-		})
-		if err == nil {
-			// BSUID is optional metadata. Isolate its update behind a
-			// savepoint so a failure cannot roll back the durable contact,
-			// CRM activity, or the inbound message written by the caller.
-			a.updateContactBSUID(&result, bsuid)
-			return &result, isNew, nil
-		}
-		if !isUniqueViolation(err) && !isRetryableCanonicalContactWrite(err) {
-			return nil, false, err
-		}
+		},
+		func(writeErr error) bool {
+			return isUniqueViolation(writeErr) || isRetryableCanonicalContactWrite(writeErr)
+		},
+	)
+	if err == nil {
+		// BSUID is optional metadata. Isolate its update behind a
+		// savepoint so a failure cannot roll back the durable contact,
+		// CRM activity, or the inbound message written by the caller.
+		a.updateContactBSUID(&result, bsuid)
+		return &result, isNew, nil
 	}
 	return nil, false, err
 }

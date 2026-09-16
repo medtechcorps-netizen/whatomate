@@ -226,13 +226,40 @@ func TestBootstrapAtomicallyCreatesPurposeOrganizationAndIsExactlyIdempotent(t *
 	// concurrent transaction owns the reseller row lock, and writes no evidence.
 	holder := db.Begin()
 	require.NoError(t, holder.Error)
+	// The row lock must never outlive this test: a leaked transaction keeps the
+	// reseller row locked and a pooled connection checked out, which made every
+	// later test in this package block until the whole package hit its timeout.
+	// Releasing it on every path keeps a flake local to this test.
+	defer func() { _ = holder.Rollback() }()
 	require.NoError(t, holder.Exec(
 		"SELECT id FROM public.resellers WHERE id = ? FOR UPDATE", organization.ResellerID,
 	).Error)
-	dryRunContext, cancelDryRun := context.WithTimeout(context.Background(), 2*time.Second)
+	// The property under test is that an idempotent dry-run does not take the
+	// reseller row lock, not that its footprint scan fits in a tight budget: a
+	// lock wait would still exceed this window while race-and-coverage scans on
+	// a slow hosted runner legitimately need more than a couple of seconds.
+	dryRunContext, cancelDryRun := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelDryRun()
 	options.Apply = false
-	idempotentDryRun, err := Bootstrap(dryRunContext, db, options)
+	// Guard the whole call: if a dry run ever blocks on the held lock (rather
+	// than failing, as it did in hosted race runs), this test must fail on its
+	// own instead of leaving the package hung until the binary timeout.
+	type dryRunOutcome struct {
+		report Report
+		err    error
+	}
+	outcome := make(chan dryRunOutcome, 1)
+	go func() {
+		report, err := Bootstrap(dryRunContext, db, options)
+		outcome <- dryRunOutcome{report: report, err: err}
+	}()
+	var idempotentDryRun Report
+	select {
+	case result := <-outcome:
+		idempotentDryRun, err = result.report, result.err
+	case <-time.After(90 * time.Second):
+		t.Fatal("idempotent dry run did not return while a reseller row lock was held")
+	}
 	require.NoError(t, err)
 	assert.True(t, idempotentDryRun.PurposeUnchanged)
 	assert.False(t, idempotentDryRun.AuditWritten)

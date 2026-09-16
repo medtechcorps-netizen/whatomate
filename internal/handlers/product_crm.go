@@ -91,7 +91,8 @@ type CreateCRMLeadRequest struct {
 }
 
 // UpdateCRMLeadRequest deliberately excludes stage and status. Stage/status
-// transitions must use MoveCRMLead so history and the outbox remain atomic.
+// transitions must use MoveCRMLead or the explicit lifecycle endpoints so
+// authorization, history, and the outbox remain atomic.
 type UpdateCRMLeadRequest struct {
 	Version                int64                 `json:"version"`
 	ContactID              *uuid.UUID            `json:"contact_id,omitempty"`
@@ -1492,7 +1493,11 @@ func (a *App) transitionCRMLeadLifecycle(
 	r *fastglue.Request,
 	action string,
 ) error {
-	orgID, userID, err := a.requireAuth(r, models.ResourceCRMLeads, models.ActionWrite)
+	permission := models.ActionWrite
+	if action == "archive" {
+		permission = models.ActionDelete
+	}
+	orgID, userID, err := a.requireAuth(r, models.ResourceCRMLeads, permission)
 	if err != nil {
 		return nil
 	}
