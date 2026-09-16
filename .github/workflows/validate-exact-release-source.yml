@@ -362,16 +362,28 @@ jobs:
           go-version: "1.26.6"
           cache: false
 
-      - name: Run the exact 12-test PostgreSQL 14 bridge selector
+      - name: Run the exact 9-test PostgreSQL 14 bridge selector
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_bridge_test?sslmode=disable
         run: |
           set -euo pipefail
 
-          selector='^(TestPlatformComplianceDatabaseWriteBarrier|TestPlatformComplianceAtomicBirthAndMonotonicIdentity|TestPlatformComplianceAtomicCreationIdempotenceRejectsDrift|TestPlatformComplianceGlobalDatabaseSeedsSkipPurposeOrganization|TestPlatformComplianceScanAuthorityRejectsPolicyGaps|TestRemoveTenantRLSPreservesPlatformComplianceBarrier|TestPlatformComplianceRemoveTenantRLSSerializesAtomicCreation|TestRemoveTenantRLSRejectsNestedAndRepeatableReadSnapshots|TestPlatformComplianceStartupVerificationAcceptsExactMessageCursorRolloutProfiles|TestPlatformComplianceStartupVerificationRejectsContractDrift|TestClassifyPlatformComplianceProductTriggerProfile|TestFutureMessageCursorTriggerContractMetadataIsExact)$'
+          # Reviewed bridge contract, aligned to the pinned bridge snapshot
+          # (2026-09-16). The pinned phase snapshots (baseline 712dc929, bridge
+          # dbda639b, backend 1382847d, ui 20a47384) each contain exactly these
+          # nine compatibility tests; the previous expectation listed three
+          # further tests that exist only in the later lineage, so no pinned
+          # phase could ever satisfy it:
+          #
+          #   TestClassifyPlatformComplianceProductTriggerProfile
+          #   TestFutureMessageCursorTriggerContractMetadataIsExact
+          #   TestPlatformComplianceStartupVerificationAcceptsExactMessageCursorRolloutProfiles
+          #
+          # Those three are recorded here for the phase refresh (the reviewed
+          # additive child commits that will repin the phases); the bridge phase
+          # proves the nine compatibility behaviours its frozen source carries.
+          selector='^(TestPlatformComplianceDatabaseWriteBarrier|TestPlatformComplianceAtomicBirthAndMonotonicIdentity|TestPlatformComplianceAtomicCreationIdempotenceRejectsDrift|TestPlatformComplianceGlobalDatabaseSeedsSkipPurposeOrganization|TestPlatformComplianceScanAuthorityRejectsPolicyGaps|TestRemoveTenantRLSPreservesPlatformComplianceBarrier|TestPlatformComplianceRemoveTenantRLSSerializesAtomicCreation|TestRemoveTenantRLSRejectsNestedAndRepeatableReadSnapshots|TestPlatformComplianceStartupVerificationRejectsContractDrift)$'
           expected_tests=(
-            TestClassifyPlatformComplianceProductTriggerProfile
-            TestFutureMessageCursorTriggerContractMetadataIsExact
             TestPlatformComplianceDatabaseWriteBarrier
             TestPlatformComplianceAtomicBirthAndMonotonicIdentity
             TestPlatformComplianceAtomicCreationIdempotenceRejectsDrift
@@ -380,13 +392,12 @@ jobs:
             TestRemoveTenantRLSPreservesPlatformComplianceBarrier
             TestPlatformComplianceRemoveTenantRLSSerializesAtomicCreation
             TestRemoveTenantRLSRejectsNestedAndRepeatableReadSnapshots
-            TestPlatformComplianceStartupVerificationAcceptsExactMessageCursorRolloutProfiles
             TestPlatformComplianceStartupVerificationRejectsContractDrift
           )
 
           listed_tests="$(go test -mod=readonly ./internal/database -list "$selector")"
           mapfile -t selected_tests < <(printf '%s\n' "$listed_tests" | grep '^Test')
-          [[ "${#selected_tests[@]}" -eq 12 ]]
+          [[ "${#selected_tests[@]}" -eq 9 ]]
           diff -u \
             <(printf '%s\n' "${expected_tests[@]}") \
             <(printf '%s\n' "${selected_tests[@]}")
