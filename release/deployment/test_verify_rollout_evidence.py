@@ -36,10 +36,10 @@ DATABASE_PHASE_HARNESS_PATH = (
 )
 CONTROL_SHA = "a" * 40
 EXPECTED_FINAL_SOURCE = {
-    "source_sha": "20a4738407c499b767a238e06e596f2ea8b14f3a",
-    "root_tree": "7da7949a9d45991bc684629d992ebba2664cde12",
+    "source_sha": "96793290a3bc286f0a9335101aace98be3307482",
+    "root_tree": "b131d9ecd468085749fc1e46aa57cc01b06f15ca",
     "frontend_tree": "09b0efe5124317d2d5561548f1082b8902144d58",
-    "internal_tree": "1b08a3f89ef52815d12658a10ab6b1824569f25d"
+    "internal_tree": "0cb24df10bfe95852b67db834768d28d7ef3e380"
 }
 STALE_FINAL_SOURCE = {
     "source_sha": "ab44af2e7c093b4502c1928126c31306b2ba0389",
@@ -78,14 +78,14 @@ LOCK_REMEDIATED_PHASE_SOURCE_SHA = {
 REVIEWED_SNAPSHOT_DIFF_SHA256 = {
     "baseline": "a9dd5f67c9f02427089da2727c730c9be11784452b560c713eedbaf7699b350f",
     "bridge": "585504eca545d933c932a8b27f254b9402689e61b3947d4fc3ba225eff5d5e58",
-    "backend": "ce69836fb3fda3d0105012a48f6968fcc6b83a8200e24dac372bc8033fd4954e",
-    "ui": "583225025dbff72b6994b5f3360202bf691d80729c212e46b866b04302eac1b6"
+    "backend": "46f0de2fa16b70bb49548eb2c0d8e41acb8848f5fa5cb1d7c879d00cf41dde95",
+    "ui": "a366bbde9742d017cb2860d3ec50cecc13a30e3ecae62693b294f13765028d84"
 }
 REVIEWED_SNAPSHOT_PATH_COUNTS = {
     "baseline": 34,
     "bridge": 35,
-    "backend": 111,
-    "ui": 141
+    "backend": 112,
+    "ui": 142
 }
 
 
