@@ -204,7 +204,10 @@ jobs:
             if(crypto.createHash('sha256').update(process.env.RULE_ID,'utf8').digest('hex')!==process.env.RULE_IDENTITY_SHA256) throw new Error('rule identity hash differs');
             const operation=process.env.OPERATION;
             const workflow=operation==='apply'?process.env.APPLY_WORKFLOW_PATH:operation==='rollback'?process.env.ROLLBACK_WORKFLOW_PATH:operation==='orphan-rollback'?process.env.ORPHAN_ROLLBACK_WORKFLOW_PATH:null;
-            const workflowName=operation==='apply'?'Apply Production Phase':operation==='rollback'?'Rollback Production Phase':operation==='orphan-rollback'?'Rollback Production Orphan':null;
+            // GitHub reports a run's `name` as the workflow's run-name when one is
+            // declared, so the identity check binds the run-name (display title),
+            // exactly as every other terminal parity lane does.
+            const workflowName=operation==='apply'?'Apply one exact production phase from signed evidence':operation==='rollback'?'Roll back one exact production phase from signed evidence':operation==='orphan-rollback'?'Roll back one reconciled production orphan while retaining its exact main lock':null;
             if(!workflow) throw new Error('operation differs');
             const expectedJobs=operation==='apply'?
               ['Authenticate exact production apply authority','Prepare exact production apply pre-lock authority','Prepare and attest exact production mutation intent','Acquire exact production apply main lock','Attest exact production apply main lock proof','Apply exact production phase','Exact production apply receipt gate','Authorize exact production apply main lock release','Release exact production apply main lock']:
@@ -215,7 +218,7 @@ jobs:
             const latest=await github.rest.actions.getWorkflowRun({owner,repo,run_id:Number(intent.run_id)});
             const exact=await github.rest.actions.getWorkflowRunAttempt({owner,repo,run_id:Number(intent.run_id),attempt_number:1});
             for(const run of [latest.data,exact.data]) {
-              if(run.run_attempt!==1 || run.head_sha!==process.env.CONTROL_SHA || run.head_branch!=='main' || run.event!=='workflow_dispatch' || run.path!==workflow || run.name!==workflowName || run.status!=='completed') throw new Error('original run authority differs');
+              if(run.run_attempt!==1 || run.head_sha!==process.env.CONTROL_SHA || run.head_branch!=='main' || run.event!=='workflow_dispatch' || run.path!==workflow || run.display_title!==workflowName || run.status!=='completed') throw new Error('original run authority differs');
             }
             const jobs=await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs',{owner,repo,run_id:Number(intent.run_id),attempt_number:1,per_page:100});
             if(JSON.stringify(jobs.map(j=>j.name).sort())!==JSON.stringify([...expectedJobs].sort())) throw new Error('original job inventory differs');

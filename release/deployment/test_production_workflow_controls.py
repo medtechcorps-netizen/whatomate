@@ -49,7 +49,7 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "19706d8b48b074ca3803bc9d39149dce73f867db8d0918fbb0b9a16c1075ac5e"
     ),
     "reconcile-production-orphan.yml": (
-        "97abfef7db4cfa729aba1e491ea45e4a4b1e63fa33e3908f6d86c9fa76b346da"
+        "a702f615d9721c6c175985a7e494a1173523fe98d076ffcede552c744763a065"
     ),
     "reconcile-production-main-lock-release.yml": (
         "069c7eefa27b3a9159bb41d870f1c871db55b37e4b052061392b0306617b5a99"
