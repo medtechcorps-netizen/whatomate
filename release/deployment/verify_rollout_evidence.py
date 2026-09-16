@@ -173,16 +173,16 @@ DATABASE_PHASE_POLICIES = {
 
 EXPECTED_PHASE_SOURCES = {
     "baseline": {
-        "source_sha": "712dc929efd9a0f7ebf5d811e0c8f18d26e207e3",
-        "root_tree": "d2d17c4720f8c6480a1ad08060f17a29bf81e49b",
+        "source_sha": "4f65abeb1c03c8fca018aa92cc987fae25ef4000",
+        "root_tree": "653c21b4a6b984c12e124ffb709c3b69eb028e52",
         "frontend_tree": "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
-        "internal_tree": "10d2e48d8650c2f751187a2914dc9f29ea8e90ce"
+        "internal_tree": "c116aecaf5fe3e76c28ff08a6cc23da84d5e5db9"
     },
     "bridge": {
-        "source_sha": "dbda639b557dcae72754a8d395d133167a9221db",
-        "root_tree": "941a8c691314fbfa9f4ba724ae811fbcd800c61f",
+        "source_sha": "e403bab279644963e13e5bf653956a492404fc06",
+        "root_tree": "dfda4c1ddf844ca85818247501f9a31127e846a1",
         "frontend_tree": "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
-        "internal_tree": "1a659b7f8f9bd5872536262f2924e1c362701287"
+        "internal_tree": "b79fbe49ffd192b1a2c0fad95338e391ff0d019d"
     },
     "backend": {
         "source_sha": "7cd028cbd6e2c9d704f34e47a631f748f481c37d",
