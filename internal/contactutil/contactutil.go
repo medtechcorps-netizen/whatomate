@@ -179,12 +179,17 @@ func GetOrCreateContact(db *gorm.DB, orgID uuid.UUID, phoneNumber, profileName s
 				}
 				return canonical, false, nil
 			}
-			db.Unscoped().Model(&contact).Update("deleted_at", nil)
+			if err := db.Unscoped().Model(&contact).Update("deleted_at", nil).Error; err != nil {
+				return nil, false, err
+			}
 			contact.DeletedAt.Valid = false
 		}
 		// Update profile name if changed
 		if profileName != "" && contact.ProfileName != profileName {
-			db.Model(&contact).Update("profile_name", profileName)
+			if err := db.Model(&contact).Update("profile_name", profileName).Error; err != nil {
+				return nil, false, err
+			}
+			contact.ProfileName = profileName
 		}
 		return &contact, false, nil
 	}
@@ -206,11 +211,16 @@ func GetOrCreateContact(db *gorm.DB, orgID uuid.UUID, phoneNumber, profileName s
 				}
 				return canonical, false, nil
 			}
-			db.Unscoped().Model(&contact).Update("deleted_at", nil)
+			if err := db.Unscoped().Model(&contact).Update("deleted_at", nil).Error; err != nil {
+				return nil, false, err
+			}
 			contact.DeletedAt.Valid = false
 		}
 		if profileName != "" && contact.ProfileName != profileName {
-			db.Model(&contact).Update("profile_name", profileName)
+			if err := db.Model(&contact).Update("profile_name", profileName).Error; err != nil {
+				return nil, false, err
+			}
+			contact.ProfileName = profileName
 		}
 		return &contact, false, nil
 	}
@@ -234,7 +244,9 @@ func GetOrCreateContact(db *gorm.DB, orgID uuid.UUID, phoneNumber, profileName s
 					}
 					return canonical, false, nil
 				}
-				db.Unscoped().Model(&contact).Update("deleted_at", nil)
+				if restoreErr := db.Unscoped().Model(&contact).Update("deleted_at", nil).Error; restoreErr != nil {
+					return nil, false, restoreErr
+				}
 				contact.DeletedAt.Valid = false
 			}
 			return &contact, false, nil

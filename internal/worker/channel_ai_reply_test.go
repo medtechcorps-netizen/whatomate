@@ -164,15 +164,13 @@ func TestChannelAIReplyOutboxFreezesOriginatingInboundWindow(t *testing.T) {
 	assert.NotEqual(t, reopenedWindowEnd.UTC(), outbound.ServiceWindowEndsAt.UTC())
 }
 
-func TestChannelAIReplyRetryUsesStableIdempotency(t *testing.T) {
+func TestChannelAIReplyQwenTransportUncertaintyIsTerminal(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	fixture := createChannelAIReplyWorkerFixture(t, db)
 	var requestCount atomic.Int32
 	worker := channelAIReplyTestWorker(db, func(_ *http.Request) (*http.Response, error) {
-		if requestCount.Add(1) == 1 {
-			return nil, errors.New("temporary DashScope failure")
-		}
-		return channelAIReplyQwenResponse("A short reply"), nil
+		requestCount.Add(1)
+		return nil, errors.New("DashScope response became uncertain after dispatch")
 	})
 
 	jobID, claimed, err := worker.claimChannelAIReplyJob(
@@ -190,29 +188,23 @@ func TestChannelAIReplyRetryUsesStableIdempotency(t *testing.T) {
 
 	var persistedJob models.ScheduledJob
 	require.NoError(t, db.First(&persistedJob, "id = ?", fixture.Job.ID).Error)
-	assert.Equal(t, models.ScheduledJobStatusPending, persistedJob.Status)
+	assert.Equal(t, models.ScheduledJobStatusFailed, persistedJob.Status)
 	assert.Equal(t, 1, persistedJob.Attempts)
+	assert.NotNil(t, persistedJob.CompletedAt)
+	assert.Contains(t, persistedJob.LastError, "channel_ai_generation_ambiguous_after_qwen_error")
+	assert.NotContains(t, persistedJob.LastError, "managed_instagram_generation")
 	require.NoError(t, db.Model(&models.ScheduledJob{}).
 		Where("id = ?", fixture.Job.ID).
 		Update("run_at", time.Now().UTC().Add(-time.Second)).Error)
 
-	jobID, claimed, err = worker.claimChannelAIReplyJob(
+	retryID, retryClaimed, err := worker.claimChannelAIReplyJob(
 		fixture.Organization.ID,
 		"ai-retry-2",
 	)
 	require.NoError(t, err)
-	require.True(t, claimed)
-	require.NoError(t, worker.processChannelAIReplyJob(
-		context.Background(),
-		fixture.Organization.ID,
-		jobID,
-		"ai-retry-2",
-	))
-
-	require.NoError(t, db.First(&persistedJob, "id = ?", fixture.Job.ID).Error)
-	assert.Equal(t, models.ScheduledJobStatusCompleted, persistedJob.Status)
-	assert.Equal(t, 2, persistedJob.Attempts)
-	assert.EqualValues(t, 2, requestCount.Load())
+	assert.False(t, retryClaimed)
+	assert.Equal(t, uuid.Nil, retryID)
+	assert.EqualValues(t, 1, requestCount.Load())
 
 	idempotencyKey := models.ChannelAIReplyIdempotencyKey(fixture.Inbound.ID)
 	var outboxCount, messageCount int64
@@ -227,8 +219,186 @@ func TestChannelAIReplyRetryUsesStableIdempotency(t *testing.T) {
 		fixture.Organization.ID,
 		channelAIReplyMessageID(idempotencyKey),
 	).Count(&messageCount).Error)
-	assert.EqualValues(t, 1, outboxCount)
-	assert.EqualValues(t, 1, messageCount)
+	assert.Zero(t, outboxCount)
+	assert.Zero(t, messageCount)
+}
+
+func TestChannelAIReplyGenerationAmbiguityCodeUsesManagedMarkerOnly(t *testing.T) {
+	t.Parallel()
+	assert.False(t, channelAIReplyHasManagedGenerationMarker(nil))
+	assert.False(t, channelAIReplyHasManagedGenerationMarker(models.JSONB{}))
+	assert.False(t, channelAIReplyHasManagedGenerationMarker(models.JSONB{
+		channelAIManagedGenerationDigestKey: "   ",
+	}))
+	assert.True(t, channelAIReplyHasManagedGenerationMarker(models.JSONB{
+		channelAIManagedGenerationDigestKey: strings.Repeat("a", 64),
+	}))
+
+	assert.Equal(
+		t,
+		"channel_ai_generation_ambiguous_after_qwen_error",
+		channelAIReplyGenerationAmbiguityCode(models.JSONB{}, "qwen_error"),
+	)
+	assert.Equal(
+		t,
+		"channel_ai_generation_ambiguous_after_lease_loss",
+		channelAIReplyGenerationAmbiguityCode(models.JSONB{
+			channelAIManagedGenerationDigestKey: "   ",
+		}, "lease_loss"),
+	)
+	assert.Equal(
+		t,
+		"managed_instagram_generation_ambiguous_after_lease_loss",
+		channelAIReplyGenerationAmbiguityCode(models.JSONB{
+			channelAIManagedGenerationDigestKey: strings.Repeat("a", 64),
+		}, "lease_loss"),
+	)
+}
+
+func TestChannelAIReplyRecoversDurableResolvedResultWithoutQwenReplay(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	fixture := createChannelAIReplyWorkerFixture(t, db)
+	var requestCount atomic.Int32
+	worker := channelAIReplyTestWorker(db, func(_ *http.Request) (*http.Response, error) {
+		requestCount.Add(1)
+		return channelAIReplyQwenResponse("must not be called"), nil
+	})
+	const firstWorker = "crashed-after-resolved-result"
+	jobID, claimed, err := worker.claimChannelAIReplyJob(
+		fixture.Organization.ID,
+		firstWorker,
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	check, err := worker.authorizeChannelAIReplyGeneration(
+		fixture.Organization.ID,
+		jobID,
+		firstWorker,
+	)
+	require.NoError(t, err)
+	require.False(t, check.AlreadySettled)
+	const resolvedResponse = "Durably resolved answer"
+	require.NoError(t, worker.persistChannelAIReplyProviderAttemptResult(
+		fixture.Organization.ID,
+		jobID,
+		firstWorker,
+		resolvedResponse,
+		nil,
+	))
+	stale := time.Now().UTC().Add(-defaultChannelAIReplyLease - time.Second)
+	require.NoError(t, db.Model(&models.ScheduledJob{}).
+		Where("id = ?", jobID).
+		Update("locked_at", stale).Error)
+
+	const recoveryWorker = "resolved-result-recovery"
+	recoveredID, recovered, err := worker.claimChannelAIReplyJob(
+		fixture.Organization.ID,
+		recoveryWorker,
+	)
+	require.NoError(t, err)
+	require.True(t, recovered)
+	require.Equal(t, jobID, recoveredID)
+	require.NoError(t, worker.processChannelAIReplyJob(
+		context.Background(),
+		fixture.Organization.ID,
+		recoveredID,
+		recoveryWorker,
+	))
+	assert.Zero(t, requestCount.Load())
+
+	var persisted models.ScheduledJob
+	require.NoError(t, db.First(&persisted, "id = ?", jobID).Error)
+	assert.Equal(t, models.ScheduledJobStatusCompleted, persisted.Status)
+	assert.Equal(t, 1, persisted.Attempts)
+	var messages int64
+	require.NoError(t, db.Model(&models.Message{}).Where(
+		"organization_id = ? AND id = ?",
+		fixture.Organization.ID,
+		channelAIReplyMessageID(models.ChannelAIReplyIdempotencyKey(fixture.Inbound.ID)),
+	).Count(&messages).Error)
+	assert.EqualValues(t, 1, messages)
+}
+
+func TestChannelAIReplyStaleMissingUncertainOrInvalidResultIsTerminal(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		record func(*testing.T, *Worker, *channelAIReplyFixture, uuid.UUID, string)
+	}{
+		{name: "missing"},
+		{
+			name: "uncertain",
+			record: func(t *testing.T, worker *Worker, fixture *channelAIReplyFixture, jobID uuid.UUID, workerID string) {
+				require.NoError(t, worker.persistChannelAIReplyProviderAttemptResult(
+					fixture.Organization.ID,
+					jobID,
+					workerID,
+					"",
+					errors.New("transport uncertainty"),
+				))
+			},
+		},
+		{
+			name: "invalid digest",
+			record: func(t *testing.T, worker *Worker, fixture *channelAIReplyFixture, jobID uuid.UUID, workerID string) {
+				require.NoError(t, worker.persistChannelAIReplyProviderAttemptResult(
+					fixture.Organization.ID,
+					jobID,
+					workerID,
+					"resolved before crash",
+					nil,
+				))
+				var job models.ScheduledJob
+				require.NoError(t, worker.DB.First(&job, "id = ?", jobID).Error)
+				payload := cloneChannelAIReplyPayload(job.Payload)
+				payload["provider_result_sha256"] = strings.Repeat("0", 64)
+				require.NoError(t, worker.DB.Model(&models.ScheduledJob{}).
+					Where("id = ?", jobID).
+					Update("payload", payload).Error)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			fixture := createChannelAIReplyWorkerFixture(t, db)
+			worker := channelAIReplyTestWorker(db, func(_ *http.Request) (*http.Response, error) {
+				t.Fatal("terminal stale attempt called Qwen")
+				return nil, nil
+			})
+			const crashedWorker = "crashed-provider-attempt"
+			jobID, claimed, err := worker.claimChannelAIReplyJob(
+				fixture.Organization.ID,
+				crashedWorker,
+			)
+			require.NoError(t, err)
+			require.True(t, claimed)
+			_, err = worker.authorizeChannelAIReplyGeneration(
+				fixture.Organization.ID,
+				jobID,
+				crashedWorker,
+			)
+			require.NoError(t, err)
+			if test.record != nil {
+				test.record(t, worker, fixture, jobID, crashedWorker)
+			}
+			stale := time.Now().UTC().Add(-defaultChannelAIReplyLease - time.Second)
+			require.NoError(t, db.Model(&models.ScheduledJob{}).
+				Where("id = ?", jobID).
+				Update("locked_at", stale).Error)
+
+			retryID, retryClaimed, err := worker.claimChannelAIReplyJob(
+				fixture.Organization.ID,
+				"must-not-call-qwen",
+			)
+			require.NoError(t, err)
+			assert.False(t, retryClaimed)
+			assert.Equal(t, uuid.Nil, retryID)
+			var persisted models.ScheduledJob
+			require.NoError(t, db.First(&persisted, "id = ?", jobID).Error)
+			assert.Equal(t, models.ScheduledJobStatusCancelled, persisted.Status)
+			assert.NotNil(t, persisted.CompletedAt)
+			assert.Equal(t, "channel_ai_generation_ambiguous_after_lease_loss", persisted.LastError)
+		})
+	}
 }
 
 func TestChannelAIReplyPolicyCancellationBeforeGeneration(t *testing.T) {
@@ -401,18 +571,18 @@ func TestChannelAIReplyFinalRecheckStopsHumanRace(t *testing.T) {
 	assert.Zero(t, outboxCount)
 }
 
-func TestChannelAIReplyCommittedCancellationBlocksProcessingFinalizer(t *testing.T) {
+func TestChannelAIReplyCommittedCancellationBlocksGeneratingFinalizer(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	fixture := createChannelAIReplyWorkerFixture(t, db)
 	workerID := "ai-cancel-race"
 	worker := channelAIReplyTestWorker(db, func(_ *http.Request) (*http.Response, error) {
 		now := time.Now().UTC()
-		require.NoError(t, db.Model(&models.ScheduledJob{}).
+		result := db.Model(&models.ScheduledJob{}).
 			Where(
 				"id = ? AND organization_id = ? AND status = ? AND locked_by = ?",
 				fixture.Job.ID,
 				fixture.Organization.ID,
-				models.ScheduledJobStatusProcessing,
+				models.ScheduledJobStatusGenerating,
 				workerID,
 			).
 			Updates(map[string]any{
@@ -421,7 +591,9 @@ func TestChannelAIReplyCommittedCancellationBlocksProcessingFinalizer(t *testing
 				"last_error":   "conversation_ai_paused",
 				"locked_at":    nil,
 				"locked_by":    "",
-			}).Error)
+			})
+		require.NoError(t, result.Error)
+		require.EqualValues(t, 1, result.RowsAffected)
 		return channelAIReplyQwenResponse("must not be queued"), nil
 	})
 

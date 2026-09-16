@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -19,14 +20,7 @@ func lockChannelAIOrganizationScopeTx(
 	tx *gorm.DB,
 	organizationID uuid.UUID,
 ) error {
-	if tx == nil || organizationID == uuid.Nil {
-		return errors.New("tenant organization AI transaction is required")
-	}
-	var organization models.Organization
-	return tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Select("id").
-		Where("id = ?", organizationID).
-		First(&organization).Error
+	return database.LockOrganizationPolicyScope(tx, organizationID)
 }
 
 // enqueueChannelAIReply creates only a durable scheduled job. Generation and
@@ -52,7 +46,8 @@ func enqueueChannelAIReply(
 		account.Status != models.ChannelAccountStatusActive ||
 		!boolConfigValue(account.Config, "outbound_enabled") ||
 		!boolConfigValue(account.Config, "ai_reply_enabled") ||
-		inboxConversationAIIsPaused(conversation.Config) {
+		inboxConversationAIIsPaused(conversation.Config) ||
+		incomingMessageAutomaticAISuppressed(message) {
 		return nil
 	}
 	if message.Direction != models.DirectionIncoming || strings.TrimSpace(messagePreview(parts)) == "" {

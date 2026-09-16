@@ -196,7 +196,14 @@ func (m *Manager) InitiateOutgoingCall(
 	callCtx, callCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer callCancel()
 
-	callID, err := m.whatsapp.InitiateCall(callCtx, waAccount, whatsapp.Recipient{Phone: contactPhone}, waLocalDesc.SDP)
+	callID, err := m.initiateActiveCall(
+		callCtx,
+		orgID,
+		accountName,
+		waAccount,
+		whatsapp.Recipient{Phone: contactPhone},
+		waLocalDesc.SDP,
+	)
 	if err != nil {
 		_ = agentPC.Close()
 		_ = waPC.Close()

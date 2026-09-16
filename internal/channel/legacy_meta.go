@@ -1,6 +1,8 @@
 package channel
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -32,6 +34,8 @@ type LegacyMetaAccountRef struct {
 	OrganizationID uuid.UUID
 	Name           string
 	Status         string
+	PhoneID        string
+	BusinessID     string
 }
 
 type LegacyMetaMirrorResult struct {
@@ -44,6 +48,28 @@ type LegacyMetaBackfillStats struct {
 	Accounts int
 	Messages int
 	Linked   int
+}
+
+// EnsureLegacyMetaWhatsAppAccount resolves the real read-only ChannelAccount
+// shadow for an established WhatsApp account without manufacturing a contact,
+// conversation, message, or credential. Callers must already be inside the
+// tenant transaction whose organization/account authority they are extending.
+//
+// Identity-review staging uses this narrow entry point because InboundEvent
+// requires a genuine ChannelAccountID even when no physical Contact can yet be
+// selected safely.
+func EnsureLegacyMetaWhatsAppAccount(
+	db *gorm.DB,
+	ref LegacyMetaAccountRef,
+) (*models.ChannelAccount, error) {
+	if db == nil || ref.ID == uuid.Nil || ref.OrganizationID == uuid.Nil {
+		return nil, errors.New("legacy Meta account-only bridge scope is required")
+	}
+	verified, err := verifiedLegacyMetaAccountRef(db, ref)
+	if err != nil {
+		return nil, err
+	}
+	return ensureLegacyMetaAccount(db, verified)
 }
 
 // LegacyMetaWhatsAppAccountID resolves the immutable established WhatsApp
@@ -67,6 +93,39 @@ func LegacyMetaWhatsAppAccountID(account *models.ChannelAccount) (uuid.UUID, err
 		return uuid.Nil, errors.New("legacy Meta WhatsApp account binding is inconsistent")
 	}
 	return accountID, nil
+}
+
+// LegacyMetaAIBookingRouteBinding binds physical routing, never mutable display
+// names or credentials. Callers must load the current native row from the tenant.
+func LegacyMetaAIBookingRouteBinding(account *models.WhatsAppAccount) string {
+	if account == nil || account.ID == uuid.Nil || account.OrganizationID == uuid.Nil ||
+		account.DeletedAt.Valid || strings.TrimSpace(account.PhoneID) == "" ||
+		strings.TrimSpace(account.BusinessID) == "" {
+		return ""
+	}
+	body, _ := json.Marshal([]string{"rereply:ai-booking:native-route:v1",
+		account.OrganizationID.String(), account.ID.String(), account.PhoneID, account.BusinessID})
+	return fmt.Sprintf("%x", sha256.Sum256(body))
+}
+
+// LegacyMetaAIBookingAuthority verifies an existing shadow against the current
+// native account. The caller separately proves exactly one live matching shadow;
+// this function never creates a shadow or grants generic channel outbound access.
+func LegacyMetaAIBookingAuthority(shadow *models.ChannelAccount, native *models.WhatsAppAccount) (string, bool) {
+	revision, ok := models.AIBookingAuthority(shadow)
+	if !ok || native == nil || native.Status != "active" ||
+		native.OrganizationID != shadow.OrganizationID ||
+		shadow.Config["legacy_read_only"] != true || shadow.Config["outbound_enabled"] != false ||
+		shadow.Config["reply_route"] != "chat" {
+		return "", false
+	}
+	boundID, err := LegacyMetaWhatsAppAccountID(shadow)
+	binding := LegacyMetaAIBookingRouteBinding(native)
+	if err != nil || boundID != native.ID || binding == "" ||
+		shadow.Config[models.ChannelConfigAIBookingRouteBinding] != binding {
+		return "", false
+	}
+	return revision, true
 }
 
 // StageLegacyMetaWhatsAppAccountRename refreshes the mutable display-name
@@ -460,7 +519,7 @@ func BackfillLegacyWhatsAppInbox(
 
 	var accounts []LegacyMetaAccountRef
 	if err := db.Table("whatsapp_accounts").
-		Select("id, organization_id, name, status").
+		Select("id, organization_id, name, status, phone_id, business_id").
 		Where("deleted_at IS NULL").
 		Order("organization_id, id").
 		Scan(&accounts).Error; err != nil {
@@ -529,7 +588,7 @@ func verifiedLegacyMetaAccountRefWithLock(
 		query = query.Clauses(clause.Locking{Strength: "SHARE"})
 	}
 	result := query.
-		Select("id, organization_id, name, status").
+		Select("id, organization_id, name, status, phone_id, business_id").
 		Where(
 			"id = ? AND organization_id = ? AND deleted_at IS NULL",
 			supplied.ID,
@@ -593,28 +652,53 @@ func ensureLegacyMetaAccount(
 		},
 		ConnectedAt: &now,
 	}
-	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&account).Error; err != nil {
-		return nil, fmt.Errorf("create legacy Meta channel account: %w", err)
+	// Active-only uniqueness permits another insert beside a soft-deleted
+	// shadow. Resolve retained identity first so revival never manufactures a
+	// competing row, and never choose arbitrarily among historical bindings.
+	lockShadow := func() (models.ChannelAccount, bool, error) {
+		var candidates []models.ChannelAccount
+		if err := db.Unscoped().
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(
+				"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+				ref.OrganizationID,
+				models.ChannelWhatsApp,
+				LegacyMetaProvider,
+				externalID,
+			).
+			Order("id").Limit(2).Find(&candidates).Error; err != nil {
+			return models.ChannelAccount{}, false, fmt.Errorf("load legacy Meta channel account: %w", err)
+		}
+		if len(candidates) > 1 {
+			return models.ChannelAccount{}, false, fmt.Errorf(
+				"%w: shadow account binding is ambiguous", ErrLegacyMetaBridgeConflict,
+			)
+		}
+		if len(candidates) == 0 {
+			return models.ChannelAccount{}, false, nil
+		}
+		return candidates[0], true, nil
 	}
-
-	var persisted models.ChannelAccount
-	if err := db.Unscoped().
-		Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where(
-			"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
-			ref.OrganizationID,
-			models.ChannelWhatsApp,
-			LegacyMetaProvider,
-			externalID,
-		).
-		First(&persisted).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+	persisted, found, err := lockShadow()
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		// Concurrent first mirrors may both observe absence. Keep the existing
+		// unique-index arbitration, then lock the one committed winner.
+		if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&account).Error; err != nil {
+			return nil, fmt.Errorf("create legacy Meta channel account: %w", err)
+		}
+		persisted, found, err = lockShadow()
+		if err != nil {
+			return nil, err
+		}
+		if !found {
 			return nil, fmt.Errorf(
 				"%w: shadow account name is already in use",
 				ErrLegacyMetaBridgeConflict,
 			)
 		}
-		return nil, fmt.Errorf("load legacy Meta channel account: %w", err)
 	}
 	// Revalidate the established account only after owning the shadow lock.
 	// Account renames take this same ChannelAccount -> WhatsAppAccount order;
@@ -625,6 +709,15 @@ func ensureLegacyMetaAccount(
 		return nil, err
 	}
 	ref = verifiedRef
+	// Refresh mutable shadow details only after its immutable binding agrees
+	// with the established account. A refresh must not bless a corrupt bridge.
+	boundAccountID, bindingErr := LegacyMetaWhatsAppAccountID(&persisted)
+	if bindingErr != nil || boundAccountID != ref.ID {
+		return nil, fmt.Errorf(
+			"%w: shadow account binding changed before refresh",
+			ErrLegacyMetaBridgeConflict,
+		)
+	}
 	status = models.ChannelAccountStatusSuspended
 	if strings.EqualFold(strings.TrimSpace(ref.Status), "active") {
 		status = models.ChannelAccountStatusActive
@@ -632,6 +725,30 @@ func ensureLegacyMetaAccount(
 	account.Name = legacyMetaAccountName(ref.Name, ref.ID)
 	account.Status = status
 	account.Metadata["legacy_account_name"] = ref.Name
+	native := &models.WhatsAppAccount{
+		BaseModel: models.BaseModel{ID: ref.ID}, OrganizationID: ref.OrganizationID,
+		PhoneID: ref.PhoneID, BusinessID: ref.BusinessID, Status: ref.Status,
+	}
+	if _, allowed := LegacyMetaAIBookingAuthority(&persisted, native); allowed {
+		// Preserve only the four reserved, verified booking fields. Arbitrary
+		// config, credentials and outbound approval are never mirrored back.
+		for _, key := range []string{models.ChannelConfigAIBookingEnabled,
+			models.ChannelConfigAIBookingRevision, models.ChannelConfigAIBookingEnabledAt,
+			models.ChannelConfigAIBookingRouteBinding} {
+			account.Config[key] = persisted.Config[key]
+		}
+	} else {
+		account.Config[models.ChannelConfigAIBookingEnabled] = false
+		// Keep an existing disabled generation stable across ordinary mirrors.
+		// A revoked live grant/revival/route change must never resurrect it.
+		if enabled, _ := persisted.Config[models.ChannelConfigAIBookingEnabled].(bool); enabled {
+			account.Config[models.ChannelConfigAIBookingRevision] = uuid.NewString()
+		} else if revision, ok := persisted.Config[models.ChannelConfigAIBookingRevision].(string); ok {
+			if id, err := uuid.Parse(revision); err == nil && id != uuid.Nil && id.String() == revision {
+				account.Config[models.ChannelConfigAIBookingRevision] = revision
+			}
+		}
+	}
 	if err := db.Unscoped().Model(&models.ChannelAccount{}).
 		Where("id = ? AND organization_id = ?", persisted.ID, ref.OrganizationID).
 		Updates(map[string]any{

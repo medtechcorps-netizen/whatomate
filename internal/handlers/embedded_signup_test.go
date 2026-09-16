@@ -125,9 +125,10 @@ func TestApp_ExchangeToken_Success_AutoRegistration(t *testing.T) {
 	require.NoError(t, app.Redis.Set(context.Background(), "whatsapp:account:"+phoneID, "stale-account", time.Hour).Err())
 
 	req := testutil.NewJSONRequest(t, map[string]interface{}{
-		"code":     "test_auth_code_123",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "test_auth_code_123",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
+		"signup_mode": "classic",
 	})
 	setEmbeddedSignupAuth(req, org.ID, user.ID)
 
@@ -252,9 +253,10 @@ func TestApp_ExchangeToken_Success_PendingRegistration(t *testing.T) {
 	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
 
 	req := testutil.NewJSONRequest(t, map[string]interface{}{
-		"code":     "test_code",
-		"phone_id": phoneID,
-		"waba_id":  wabaID,
+		"code":        "test_code",
+		"phone_id":    phoneID,
+		"waba_id":     wabaID,
+		"signup_mode": "classic",
 	})
 	setEmbeddedSignupAuth(req, org.ID, user.ID)
 
@@ -312,9 +314,10 @@ func TestApp_ExchangeToken_InvalidCode(t *testing.T) {
 	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
 
 	req := testutil.NewJSONRequest(t, map[string]interface{}{
-		"code":     "invalid_code",
-		"phone_id": "123456789",
-		"waba_id":  "987654321",
+		"code":        "invalid_code",
+		"phone_id":    "123456789",
+		"waba_id":     "987654321",
+		"signup_mode": "classic",
 	})
 	setEmbeddedSignupAuth(req, org.ID, user.ID)
 
@@ -414,7 +417,8 @@ func TestApp_ExchangeToken_Success_CodeOnly_Discovery(t *testing.T) {
 
 	// Omit phone_id and waba_id
 	req := testutil.NewJSONRequest(t, map[string]interface{}{
-		"code": "test_code_only",
+		"code":        "test_code_only",
+		"signup_mode": "classic",
 	})
 	setEmbeddedSignupAuth(req, org.ID, user.ID)
 
@@ -524,7 +528,7 @@ func TestApp_ExchangeToken_CodeOnlyDiscoveryRejectsAmbiguousAssets(t *testing.T)
 			app.Config.WhatsApp.APIVersion = "v21.0"
 			app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, metaServer.URL)
 
-			req := testutil.NewJSONRequest(t, map[string]any{"code": "ambiguous-code"})
+			req := testutil.NewJSONRequest(t, map[string]any{"code": "ambiguous-code", "signup_mode": "classic"})
 			setEmbeddedSignupAuth(req, org.ID, user.ID)
 
 			require.NoError(t, app.ExchangeToken(req))
@@ -549,8 +553,9 @@ func TestApp_ExchangeToken_MissingFields(t *testing.T) {
 	user := createAdminUser(t, app, org.ID)
 
 	req := testutil.NewJSONRequest(t, map[string]interface{}{
-		"phone_id": "123",
-		"waba_id":  "456",
+		"phone_id":    "123",
+		"waba_id":     "456",
+		"signup_mode": "classic",
 	}) // missing code
 	setEmbeddedSignupAuth(req, org.ID, user.ID)
 
@@ -571,6 +576,7 @@ func TestApp_ExchangeToken_RejectsDuplicateAccountWebhookVerifyToken(t *testing.
 		"phone_id":             "duplicate-token-phone-id",
 		"waba_id":              "duplicate-token-waba-id",
 		"webhook_verify_token": "must-be-configured-centrally",
+		"signup_mode":          "classic",
 	})
 	setEmbeddedSignupAuth(req, org.ID, user.ID)
 
