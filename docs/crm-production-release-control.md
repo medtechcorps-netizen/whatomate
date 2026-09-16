@@ -8,10 +8,18 @@ release evidence, and changing production are three separate authorities.
 
 The final `ui` phase is bound to one immutable Git identity:
 
-- commit: `20a4738407c499b767a238e06e596f2ea8b14f3a`
-- root tree: `7da7949a9d45991bc684629d992ebba2664cde12`
+- commit: `96793290a3bc286f0a9335101aace98be3307482`
+- root tree: `b131d9ecd468085749fc1e46aa57cc01b06f15ca`
 - `frontend` tree: `09b0efe5124317d2d5561548f1082b8902144d58`
-- `internal` tree: `1b08a3f89ef52815d12658a10ab6b1824569f25d`
+- `internal` tree: `0cb24df10bfe95852b67db834768d28d7ef3e380`
+
+Refreshed 2026-09-16: the previous binding `20a47384` hung the full Go race job
+for 40 minutes in
+`internal/platformcompliance.TestBootstrapAtomicallyCreatesPurposeOrganizationAndIsExactlyIdempotent`
+(ui validation run 35093373191). The refreshed identity is the same reviewed ui
+release tree rebuilt on its lock-remediated base with the reviewed bounded
+bootstrap dry-run lock test fix `50303c11`, so only
+`internal/platformcompliance/bootstrap_test.go` differs from `20a47384`.
 
 The release contains Klinik-only WhatsApp reply hardening and the existing
 authorized-client realtime, unread-marker, and late-layout autoscroll fixes.
