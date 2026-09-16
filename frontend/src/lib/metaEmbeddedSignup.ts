@@ -1,4 +1,7 @@
 export const META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS = 5_000;
+export const META_COEXISTENCE_SESSION_INFO_VERSION = "3";
+
+export type MetaEmbeddedSignupMode = "coexistence" | "classic";
 
 const META_EMBEDDED_SIGNUP_MESSAGE_HOSTS = new Set([
   "www.facebook.com",
@@ -9,6 +12,7 @@ const META_EMBEDDED_SIGNUP_MESSAGE_HOSTS = new Set([
 
 export interface MetaEmbeddedSignupResult {
   code: string;
+  mode: MetaEmbeddedSignupMode;
   phoneNumberId?: string;
   wabaId?: string;
 }
@@ -16,6 +20,7 @@ export interface MetaEmbeddedSignupResult {
 export type MetaEmbeddedSignupAbortReason = "cancelled" | "error";
 
 interface MetaEmbeddedSignupSessionOptions {
+  mode: MetaEmbeddedSignupMode;
   onComplete: (result: MetaEmbeddedSignupResult) => void;
   onAbort: (reason: MetaEmbeddedSignupAbortReason, detail?: string) => void;
   onSettled?: () => void;
@@ -33,6 +38,7 @@ export interface MetaEmbeddedSignupSession {
 interface EmbeddedSignupMessage {
   type: "WA_EMBEDDED_SIGNUP";
   event: string;
+  version?: number | string;
   data?: Record<string, unknown>;
 }
 
@@ -92,8 +98,26 @@ export function parseMetaEmbeddedSignupMessage(
   return {
     type: "WA_EMBEDDED_SIGNUP",
     event: payload.event,
+    version:
+      typeof payload.version === "number" || typeof payload.version === "string"
+        ? payload.version
+        : undefined,
     data: isRecord(payload.data) ? payload.data : undefined,
   };
+}
+
+function isExpectedFinishMessage(
+  message: EmbeddedSignupMessage,
+  mode: MetaEmbeddedSignupMode,
+): boolean {
+  const event = message.event.toUpperCase();
+  if (mode === "coexistence") {
+    return (
+      event === "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING" &&
+      String(message.version) === META_COEXISTENCE_SESSION_INFO_VERSION
+    );
+  }
+  return event === "FINISH" || event === "FINISH_ONLY_WABA";
 }
 
 function loginErrorMessage(
@@ -151,7 +175,12 @@ export function createMetaEmbeddedSignupSession(
       return;
     }
 
-    options.onComplete({ code, phoneNumberId, wabaId });
+    options.onComplete({
+      code,
+      mode: options.mode,
+      phoneNumberId,
+      wabaId,
+    });
   };
 
   const scheduleCodeOnlyFallback = () => {
@@ -172,24 +201,25 @@ export function createMetaEmbeddedSignupSession(
     const message = parseMetaEmbeddedSignupMessage(event);
     if (!message) return;
 
-    switch (message.event.toUpperCase()) {
-      case "FINISH":
-      case "FINISH_ONLY_WABA":
-      case "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING":
-        phoneNumberId = nonEmptyString(message.data?.phone_number_id);
-        wabaId = nonEmptyString(message.data?.waba_id);
-        complete(false);
-        break;
+    const eventName = message.event.toUpperCase();
+    if (isExpectedFinishMessage(message, options.mode)) {
+      phoneNumberId = nonEmptyString(message.data?.phone_number_id);
+      wabaId = nonEmptyString(message.data?.waba_id);
+      complete(false);
+      return;
+    }
+
+    switch (eventName) {
       case "CANCEL":
         abort("cancelled", nonEmptyString(message.data?.current_step));
-        break;
+        return;
       case "ERROR":
         abort(
           "error",
           nonEmptyString(message.data?.error_message) ||
             nonEmptyString(message.data?.message),
         );
-        break;
+        return;
     }
   };
 

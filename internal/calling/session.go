@@ -589,7 +589,7 @@ func (m *Manager) terminateCall(session *CallSession, waAccount *whatsapp.Accoun
 	c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := m.whatsapp.TerminateCall(c, waAccount, session.ID); err != nil {
+	if err := m.terminateActiveCall(c, session, waAccount); err != nil {
 		m.log.Error("Failed to terminate call via API", "error", err, "call_id", session.ID)
 	}
 }

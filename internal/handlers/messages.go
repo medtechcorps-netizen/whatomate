@@ -19,6 +19,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/templateutil"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/shridarpatil/whatomate/internal/websocket"
+	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -46,7 +47,9 @@ type OutgoingMessageRequest struct {
 	// Text messages
 	Content string
 
-	// Media messages (image, video, audio, document)
+	// Media messages (image, video, audio, document). MediaData and
+	// MediaMimeType also carry a template's raw header media into the fenced
+	// provider phase when HeaderMediaID is not already available.
 	MediaID       string // WhatsApp media ID (if already uploaded)
 	MediaData     []byte // Raw media data (if upload needed)
 	MediaURL      string // Local media URL (for storage)
@@ -116,13 +119,33 @@ type MessageSendOptions struct {
 	// successful send. Used for chatbot replies so a bot-handled exchange
 	// doesn't leave an "unread" badge in the agent's contact list.
 	MarkIncomingRead bool
+
+	// AutomaticAI identifies a provider attempt governed by the inbound
+	// Pause/Resume fence. Only the server-owned chatbot continuation may set
+	// it. Manual/API/campaign/SLA delivery remains outside this policy.
+	AutomaticAI bool
 }
 
 var (
-	errOutgoingContactNotFound      = errors.New("outgoing message contact not found")
-	errOutgoingContactAccessRevoked = errors.New("outgoing message contact access revoked")
-	errOutgoingReplyInvalid         = errors.New("outgoing reply message is invalid")
+	errOutgoingContactNotFound        = errors.New("outgoing message contact not found")
+	errOutgoingContactAccessRevoked   = errors.New("outgoing message contact access revoked")
+	errOutgoingReplyInvalid           = errors.New("outgoing reply message is invalid")
+	errOutgoingProviderReceiptMissing = errors.New(
+		"provider returned success without a WhatsApp message ID",
+	)
 )
+
+type outgoingProviderPanicError struct {
+	value             any
+	providerAttempted bool
+}
+
+func (e *outgoingProviderPanicError) Error() string {
+	if e == nil {
+		return "outgoing provider operation panicked"
+	}
+	return fmt.Sprintf("outgoing provider operation panicked: %v", e.value)
+}
 
 // OutgoingConsentError identifies an outbound message rejected by the
 // canonical contact's current consent state. Callers can use errors.As to map
@@ -153,6 +176,7 @@ func ChatbotSendOptions() MessageSendOptions {
 		TrackSLA:           true,
 		Async:              false,
 		MarkIncomingRead:   true,
+		AutomaticAI:        true,
 	}
 }
 
@@ -182,11 +206,28 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	if req.Account == nil || req.Account.OrganizationID == uuid.Nil {
 		return nil, errors.New("WhatsApp account is required")
 	}
+	if err := whatsappaccount.RequireActiveForOutbound(req.Account); err != nil {
+		return nil, err
+	}
 	if req.Contact == nil || req.Contact.ID == uuid.Nil {
 		return nil, fmt.Errorf("%w: contact is required", errOutgoingContactNotFound)
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if opts.AutomaticAI {
+		if a.inboundContinuation == nil ||
+			!a.inboundContinuation.attemptGuarded {
+			return nil, errors.New(
+				"automatic AI send requires the physical organization attempt fence",
+			)
+		}
+		if opts.Async || opts.SentByUserID != nil ||
+			req.legacyWhatsAppReply != nil {
+			return nil, errors.New(
+				"automatic AI send cannot use async, agent, or legacy-reply delivery",
+			)
+		}
 	}
 
 	organizationID := req.Account.OrganizationID
@@ -370,16 +411,17 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 
 	req.Contact = &canonicalContact
 	req.ReplyToMessage = validatedReply
-	if req.legacyWhatsAppReply == nil {
-		a.mirrorLegacyWhatsAppMessageAfterCommit(req.Account, msg.ID)
-	}
 
 	// 2. Define the send function based on message type
-	sendFn := func(sendCtx context.Context, deliveryContact *models.Contact) (string, error) {
+	sendFn := func(
+		sendCtx context.Context,
+		deliveryContact *models.Contact,
+		lockedAccount *models.WhatsAppAccount,
+	) (string, error) {
 		if req.deliveryOverride != nil {
 			return req.deliveryOverride(sendCtx, deliveryContact)
 		}
-		waAccount := a.toWhatsAppAccount(req.Account)
+		waAccount := a.toWhatsAppAccount(lockedAccount)
 		rcpt := whatsapp.Recipient{Phone: deliveryContact.PhoneNumber, BSUID: deliveryContact.BSUID}
 
 		// Get reply-to message ID if this is a reply
@@ -428,11 +470,25 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 			if req.Template == nil {
 				return "", fmt.Errorf("template is required for template messages")
 			}
+			headerMediaID := req.HeaderMediaID
+			if headerMediaID == "" && len(req.MediaData) > 0 {
+				var err error
+				headerMediaID, err = a.WhatsApp.UploadMedia(
+					sendCtx,
+					waAccount,
+					req.MediaData,
+					req.MediaMimeType,
+					"header",
+				)
+				if err != nil {
+					return "", fmt.Errorf("failed to upload template header media: %w", err)
+				}
+			}
 			components, err := whatsapp.BuildTemplateComponents(
 				req.BodyParams,
 				req.Template.HeaderType, req.Template.HeaderContent,
 				req.HeaderParams,
-				req.HeaderMediaID, req.HeaderMediaFilename,
+				headerMediaID, req.HeaderMediaFilename,
 			)
 			if err != nil {
 				return "", fmt.Errorf("failed to build template components: %w", err)
@@ -609,11 +665,24 @@ func (a *App) deliverOutgoingMessage(
 	msg *models.Message,
 	req OutgoingMessageRequest,
 	opts MessageSendOptions,
-	sendFn func(context.Context, *models.Contact) (string, error),
+	sendFn func(context.Context, *models.Contact, *models.WhatsAppAccount) (string, error),
 ) (outgoingDeliveryResult, error) {
 	var result outgoingDeliveryResult
 	if msg == nil || msg.ID == uuid.Nil {
 		return result, errors.New("pending outgoing message is required")
+	}
+	if req.legacyWhatsAppReply == nil {
+		if err := a.requireLegacyWhatsAppMessageMirror(ctx, req.Account, msg.ID); err != nil {
+			return result, err
+		}
+	}
+	if opts.AutomaticAI {
+		return a.deliverAutomaticAIOutgoingMessage(
+			ctx,
+			msg,
+			req,
+			sendFn,
+		)
 	}
 
 	err := a.outgoingProviderTransaction(
@@ -628,6 +697,21 @@ func (a *App) deliverOutgoingMessage(
 				); lockErr != nil {
 					return lockErr
 				}
+			}
+			// Hold a shared account lock across the final provider attempt so a
+			// committed Coexistence disconnect always wins before Graph is called.
+			// For legacy replies this follows their established ChannelAccount
+			// prefix and precedes the Contact lock.
+			lockedAccount, err := whatsappaccount.LockAndLoadActiveForOutbound(
+				tx,
+				req.Account.OrganizationID,
+				req.Account.ID,
+			)
+			if err != nil {
+				return err
+			}
+			if err := a.prepareWhatsAppAccountForRuntime(lockedAccount); err != nil {
+				return err
 			}
 			contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(
 				tx,
@@ -713,7 +797,9 @@ func (a *App) deliverOutgoingMessage(
 
 			*providerAttempted = true
 			result.providerAttempted = true
-			result.whatsAppMessageID, result.sendErr = sendFn(ctx, contact)
+			result.whatsAppMessageID, result.sendErr = normalizeOutgoingProviderResult(
+				sendFn(ctx, contact, lockedAccount),
+			)
 			return persistOutgoingDeliveryResult(
 				tx,
 				&stored,
@@ -723,6 +809,7 @@ func (a *App) deliverOutgoingMessage(
 			)
 		},
 	)
+	result.captureProviderPanic(err)
 	if err == nil || !result.providerAttempted {
 		return result, err
 	}
@@ -740,6 +827,336 @@ func (a *App) deliverOutgoingMessage(
 		)
 	}
 	return result, nil
+}
+
+const (
+	automaticAIDispatchStateMetadataKey = "automatic_ai_dispatch_state"
+	automaticAIDispatchStartedAtKey     = "automatic_ai_dispatch_started_at"
+	automaticAIDispatchSettledAtKey     = "automatic_ai_dispatch_settled_at"
+	automaticAIDispatchStateDispatching = "dispatching"
+	automaticAIDispatchStateResolved    = "resolved"
+	automaticAIDispatchStateRejected    = "rejected"
+	automaticAIDispatchStateUncertain   = "uncertain"
+)
+
+// deliverAutomaticAIOutgoingMessage uses three physical phases:
+//
+//  1. independently commit the exact pending-message/policy decision;
+//  2. invoke Meta while the caller holds the organization NO KEY UPDATE fence
+//     and this function holds a fresh shared account-lifecycle lock (no
+//     Contact or Message lock crosses the network);
+//  3. independently commit the provider result or uncertainty.
+//
+// The surrounding inbound action ledger is the durable at-most-once identity.
+// A committed dispatching marker can never be reclaimed as a fresh attempt.
+func (a *App) deliverAutomaticAIOutgoingMessage(
+	ctx context.Context,
+	msg *models.Message,
+	req OutgoingMessageRequest,
+	sendFn func(context.Context, *models.Contact, *models.WhatsAppAccount) (string, error),
+) (outgoingDeliveryResult, error) {
+	var result outgoingDeliveryResult
+	if a == nil || a.inboundContinuation == nil ||
+		!a.inboundContinuation.attemptGuarded {
+		return result, errors.New("automatic AI provider attempt is not fenced")
+	}
+	if req.Account == nil || req.Contact == nil || sendFn == nil ||
+		req.Account.OrganizationID == uuid.Nil {
+		return result, errors.New("automatic AI provider attempt identity is incomplete")
+	}
+	organizationID := req.Account.OrganizationID
+	startedAt := time.Now().UTC()
+
+	preflightErr := a.outgoingCanonicalTransaction(
+		ctx,
+		organizationID,
+		func(tx *gorm.DB) error {
+			if err := a.validateNativeBookingDispatchTx(tx, msg); err != nil {
+				return err
+			}
+			account, err := whatsappaccount.LockAndLoadActiveForOutbound(
+				tx,
+				organizationID,
+				req.Account.ID,
+			)
+			if err != nil {
+				return err
+			}
+			if err := a.prepareWhatsAppAccountForRuntime(account); err != nil {
+				return err
+			}
+			contact, err := contactutil.ResolveCanonicalContactForUpdate(
+				tx,
+				organizationID,
+				req.Contact.ID,
+			)
+			if err != nil {
+				return err
+			}
+			policy, err := database.EvaluateContactAutomaticReplyPolicy(
+				tx,
+				organizationID,
+				contact.ID,
+			)
+			if err != nil {
+				return err
+			}
+			if !policy.Allowed {
+				result.policyErr = &inboundContinuationPolicyStop{
+					Reason: policy.Reason,
+				}
+				return result.policyErr
+			}
+
+			var stored models.Message
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where(
+					"id = ? AND organization_id = ? AND direction = ?",
+					msg.ID,
+					organizationID,
+					models.DirectionOutgoing,
+				).
+				First(&stored).Error; err != nil {
+				return err
+			}
+			if stored.Status != models.MessageStatusPending {
+				return errors.New("automatic AI message is no longer pending")
+			}
+			if err := validateNativeBookingMessageIdentity(&stored, msg); err != nil {
+				return err
+			}
+			if state, _ := stored.Metadata[automaticAIDispatchStateMetadataKey].(string); strings.TrimSpace(state) != "" {
+				return errors.New(
+					"automatic AI message already has a physical attempt",
+				)
+			}
+			metadata := cloneOutgoingMessageMetadata(stored.Metadata)
+			if err := a.claimNativeBookingDispatchTx(tx, &stored); err != nil {
+				return err
+			}
+			metadata[automaticAIDispatchStateMetadataKey] =
+				automaticAIDispatchStateDispatching
+			metadata[automaticAIDispatchStartedAtKey] =
+				startedAt.Format(time.RFC3339Nano)
+			update := tx.Model(&models.Message{}).
+				Where(
+					"id = ? AND organization_id = ? AND status = ?",
+					stored.ID,
+					organizationID,
+					models.MessageStatusPending,
+				).
+				Update("metadata", metadata)
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected != 1 {
+				return errors.New(
+					"automatic AI dispatch claim changed before commit",
+				)
+			}
+			result.contact = *contact
+			return nil
+		},
+	)
+	if preflightErr != nil {
+		return result, preflightErr
+	}
+
+	// Reacquire the account from durable state and retain its shared lock for
+	// the complete provider call. The independently committed dispatch marker
+	// remains the at-most-once crash boundary, while this second transaction
+	// closes the preflight-to-provider gap in which a disconnect or credential
+	// rotation could otherwise commit and leave the copied account usable.
+	attemptErr := a.outgoingProviderTransaction(
+		ctx,
+		organizationID,
+		func(tx *gorm.DB, providerAttempted *bool) error {
+			if err := a.validateNativeBookingDispatchTx(tx, msg); err != nil {
+				return err
+			}
+			account, err := whatsappaccount.LockAndLoadActiveForOutbound(
+				tx,
+				organizationID,
+				req.Account.ID,
+			)
+			if err != nil {
+				return err
+			}
+			if err := a.prepareWhatsAppAccountForRuntime(account); err != nil {
+				return err
+			}
+			*providerAttempted = true
+			result.providerAttempted = true
+			result.whatsAppMessageID, result.sendErr = normalizeOutgoingProviderResult(
+				sendFn(
+					ctx,
+					&result.contact,
+					account,
+				),
+			)
+			return nil
+		},
+	)
+	result.captureProviderPanic(attemptErr)
+	if attemptErr != nil && !result.providerAttempted {
+		// Admission failed after the durable attempt was claimed, but before the
+		// provider boundary. Settle that known result instead of leaving the
+		// message in dispatching or allowing the action ledger to reclaim it.
+		result.sendErr = fmt.Errorf(
+			"automatic AI provider admission failed: %w",
+			attemptErr,
+		)
+	}
+
+	settlementErr := a.settleAutomaticAIOutgoingMessage(
+		context.Background(),
+		msg,
+		&result,
+	)
+	if settlementErr != nil {
+		// Reconcile only the database result. The provider call above is never
+		// repeated after its durable dispatching marker was committed.
+		reconcileErr := a.settleAutomaticAIOutgoingMessage(
+			context.Background(),
+			msg,
+			&result,
+		)
+		if reconcileErr != nil {
+			return result, errors.Join(settlementErr, reconcileErr)
+		}
+	}
+	return result, nil
+}
+
+func (a *App) settleAutomaticAIOutgoingMessage(
+	ctx context.Context,
+	pendingMessage *models.Message,
+	result *outgoingDeliveryResult,
+) error {
+	if pendingMessage == nil || result == nil {
+		return errors.New("automatic AI settlement identity is incomplete")
+	}
+	settlementCtx, cancel := context.WithTimeout(
+		ctx,
+		outgoingDeliveryRecoveryTimeout,
+	)
+	defer cancel()
+	return a.outgoingTenantTransaction(
+		settlementCtx,
+		pendingMessage.OrganizationID,
+		func(tx *gorm.DB) error {
+			var stored models.Message
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where(
+					"id = ? AND organization_id = ? AND direction = ?",
+					pendingMessage.ID,
+					pendingMessage.OrganizationID,
+					models.DirectionOutgoing,
+				).
+				First(&stored).Error; err != nil {
+				return err
+			}
+			state, _ := stored.Metadata[automaticAIDispatchStateMetadataKey].(string)
+			if stored.Status != models.MessageStatusPending {
+				if state == automaticAIDispatchStateResolved ||
+					state == automaticAIDispatchStateRejected ||
+					state == automaticAIDispatchStateUncertain {
+					result.whatsAppMessageID = stored.WhatsAppMessageID
+					if stored.Status == models.MessageStatusFailed {
+						result.sendErr = errors.New(stored.ErrorMessage)
+					}
+					return nil
+				}
+				return errors.New(
+					"automatic AI settlement reached an unrelated terminal state",
+				)
+			}
+			if state != automaticAIDispatchStateDispatching {
+				return errors.New(
+					"automatic AI settlement lost its dispatching authority",
+				)
+			}
+			metadata := cloneOutgoingMessageMetadata(stored.Metadata)
+			if !result.providerAttempted {
+				metadata[automaticAIDispatchStateMetadataKey] =
+					automaticAIDispatchStateRejected
+			} else if result.sendErr == nil &&
+				strings.TrimSpace(result.whatsAppMessageID) != "" {
+				metadata[automaticAIDispatchStateMetadataKey] =
+					automaticAIDispatchStateResolved
+			} else {
+				metadata[automaticAIDispatchStateMetadataKey] =
+					automaticAIDispatchStateUncertain
+			}
+			metadata[automaticAIDispatchSettledAtKey] =
+				time.Now().UTC().Format(time.RFC3339Nano)
+			update := tx.Model(&models.Message{}).
+				Where(
+					"id = ? AND organization_id = ? AND status = ?",
+					stored.ID,
+					stored.OrganizationID,
+					models.MessageStatusPending,
+				).
+				Updates(map[string]any{
+					"contact_id":           result.contact.ID,
+					"status":               outgoingMessageResultStatus(result.sendErr),
+					"whats_app_message_id": result.whatsAppMessageID,
+					"error_message":        outgoingMessageResultError(result.sendErr),
+					"metadata":             metadata,
+				})
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected != 1 {
+				return errors.New("automatic AI settlement was lost")
+			}
+			return nil
+		},
+	)
+}
+
+func cloneOutgoingMessageMetadata(source models.JSONB) models.JSONB {
+	result := make(models.JSONB, len(source)+3)
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func outgoingMessageResultStatus(sendErr error) models.MessageStatus {
+	if sendErr != nil {
+		return models.MessageStatusFailed
+	}
+	return models.MessageStatusSent
+}
+
+func outgoingMessageResultError(sendErr error) string {
+	if sendErr == nil {
+		return ""
+	}
+	return sendErr.Error()
+}
+
+func normalizeOutgoingProviderResult(
+	whatsAppMessageID string,
+	sendErr error,
+) (string, error) {
+	whatsAppMessageID = strings.TrimSpace(whatsAppMessageID)
+	if sendErr == nil && whatsAppMessageID == "" {
+		return "", errOutgoingProviderReceiptMissing
+	}
+	return whatsAppMessageID, sendErr
+}
+
+func (result *outgoingDeliveryResult) captureProviderPanic(err error) {
+	if result == nil || !result.providerAttempted || result.sendErr != nil ||
+		strings.TrimSpace(result.whatsAppMessageID) != "" {
+		return
+	}
+	var panicErr *outgoingProviderPanicError
+	if errors.As(err, &panicErr) {
+		result.sendErr = panicErr
+	}
 }
 
 func persistOutgoingDeliveryResult(
@@ -930,13 +1347,31 @@ func (a *App) outgoingProviderTransaction(
 	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
 		providerAttempted := false
 		err = a.outgoingTenantTransaction(ctx, organizationID, func(tx *gorm.DB) error {
-			return deliver(tx, &providerAttempted)
+			return containOutgoingProviderPanic(&providerAttempted, func() error {
+				return deliver(tx, &providerAttempted)
+			})
 		})
 		if err == nil || providerAttempted || !isRetryableCanonicalContactWrite(err) {
 			return err
 		}
 	}
 	return err
+}
+
+func containOutgoingProviderPanic(providerAttempted *bool, operation func() error) (resultErr error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			attempted := providerAttempted != nil && *providerAttempted
+			resultErr = &outgoingProviderPanicError{
+				value:             recovered,
+				providerAttempted: attempted,
+			}
+		}
+	}()
+	if operation == nil {
+		return errors.New("outgoing provider operation is required")
+	}
+	return operation()
 }
 
 func (a *App) outgoingCanonicalTransaction(
@@ -993,27 +1428,14 @@ func (a *App) usesCurrentTenantPreProvider(organizationID uuid.UUID) bool {
 // Tenant transaction, so a provider attempt cannot be made durable or
 // ambiguous only at the mercy of a later outer commit. Async request callers
 // use outgoingPreProviderTransaction only for their pending state, then start
-// provider delivery after that request commits. The inbound continuation
-// exception below uses its current transaction because a separately committed
-// action claim already provides its crash boundary.
+// provider delivery after that request commits. Automatic AI delivery also
+// starts from the root pool so its pending/dispatch/result facts are real
+// commits rather than savepoints inside the continuation transaction.
 func (a *App) outgoingTenantTransaction(
 	ctx context.Context,
 	organizationID uuid.UUID,
 	write func(tx *gorm.DB) error,
 ) error {
-	// Inbound continuation processing already owns an RLS tenant transaction
-	// and may hold the canonical Contact lock before a chatbot response is
-	// sent. Re-entering through the root pool would wait on our own outer lock.
-	// Its separately committed action claim is the at-most-once boundary, so
-	// keep the pending Message, provider attempt, and result in that current
-	// transaction.
-	if a.inboundContinuation != nil &&
-		a.rlsEnabled() &&
-		a.tenantOrgID == organizationID &&
-		a.DB != nil {
-		return write(a.DB.WithContext(ctx))
-	}
-
 	root := a.rootApp()
 	db := root.DB.WithContext(ctx)
 	if root.rlsEnabled() {
@@ -1844,17 +2266,9 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 			headerMediaData = headerFileData
 			headerMimeType = headerFileMimeType
 		}
-
-		// Upload to WhatsApp if we have raw data (options 2 & 3)
-		if len(headerMediaData) > 0 {
-			waAcct := a.toWhatsAppAccount(account)
-			mediaID, err := a.WhatsApp.UploadMedia(context.Background(), waAcct, headerMediaData, headerMimeType, "header")
-			if err != nil {
-				a.Log.Error("Failed to upload template header media", "error", err)
-				return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to upload header media to WhatsApp", nil, "")
-			}
-			headerMediaID = mediaID
-		}
+		// Keep raw bytes local to the request here. The unified sender uploads
+		// them only after the pending message/receipt mirror is durable and the
+		// final account, visibility, and contact-policy checks have succeeded.
 	}
 
 	// Persist header media so it can be served for chat preview.
@@ -1907,6 +2321,7 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 		HeaderParams:        req.HeaderParams,
 		HeaderMediaID:       headerMediaID,
 		HeaderMediaFilename: headerMediaFilename,
+		MediaData:           headerMediaData,
 		MediaURL:            headerMediaPath,
 		MediaMimeType:       headerMimeType,
 		ButtonURLParams:     buttonParams,

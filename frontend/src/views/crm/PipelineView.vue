@@ -11,6 +11,7 @@ import {
   Filter,
   GripVertical,
   Loader2,
+  MoreHorizontal,
   Pencil,
   Plus,
   RefreshCw,
@@ -25,6 +26,16 @@ import PipelineSettingsDialog from '@/components/crm/PipelineSettingsDialog.vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import { getErrorMessage, unwrapListResponse } from '@/lib/api-utils'
@@ -44,8 +55,16 @@ const showCreate = ref(false)
 const pipelineSettingsOpen = ref(false)
 const leadEditorOpen = ref(false)
 const editingLead = ref<CRMLead | null>(null)
+const openLeadMenuId = ref('')
 const movingLeadId = ref('')
 const showArchived = ref(false)
+const archiveOpen = ref(false)
+const archiving = ref(false)
+const archivingLead = ref<CRMLead | null>(null)
+const archiveReason = ref('')
+const archiveError = ref('')
+const archiveIdempotencyKey = ref('')
+let archiveReturnFocus: HTMLButtonElement | null = null
 const newLead = reactive({
   title: '',
   contact_id: '',
@@ -55,6 +74,8 @@ const newLead = reactive({
 const canReadTasks = computed(() => authStore.hasPermission('tasks', 'read'))
 const canWriteTasks = computed(() => authStore.hasPermission('tasks', 'write'))
 const canWriteLeads = computed(() => authStore.hasPermission('crm.leads', 'write'))
+const canReadLeads = computed(() => authStore.hasPermission('crm.leads', 'read'))
+const canArchiveLeads = computed(() => authStore.hasPermission('crm.leads', 'delete'))
 const canWritePipelines = computed(() => authStore.hasPermission('crm.pipelines', 'write'))
 const canDeletePipelineStages = computed(() => authStore.hasPermission('crm.pipelines', 'delete'))
 const canReadContacts = computed(() => authStore.hasPermission('contacts', 'read'))
@@ -188,8 +209,62 @@ function moveLeadByOffset(lead: CRMLead, direction: -1 | 1) {
 }
 
 function openLeadEditor(lead: CRMLead) {
+  if (!canWriteLeads.value || archiving.value) return
   editingLead.value = lead
   leadEditorOpen.value = true
+}
+
+function requestArchive(lead: CRMLead) {
+  if (!canArchiveLeads.value || lead.status === 'archived' || archiving.value || movingLeadId.value) return
+  archiveReturnFocus = document.querySelector<HTMLButtonElement>(`[data-lead-actions="${CSS.escape(lead.id)}"]`)
+  archivingLead.value = { ...lead }
+  archiveReason.value = ''
+  archiveError.value = ''
+  archiveIdempotencyKey.value = crypto.randomUUID()
+  archiveOpen.value = true
+}
+
+function restoreArchiveFocus(event: Event) {
+  event.preventDefault()
+  const target = archiveReturnFocus?.isConnected
+    ? archiveReturnFocus
+    : document.querySelector<HTMLButtonElement>('[aria-label="Refresh pipeline"]')
+  archiveReturnFocus = null
+  target?.focus()
+}
+
+function setArchiveOpen(value: boolean) {
+  if (!archiving.value) archiveOpen.value = value
+}
+
+async function archiveLead() {
+  const lead = archivingLead.value
+  if (!lead || !archiveOpen.value || archiving.value || !canArchiveLeads.value || lead.status === 'archived') return
+  archiving.value = true
+  archiveError.value = ''
+  try {
+    await crmService.archiveLead(lead.id, {
+      version: lead.version,
+      reason: archiveReason.value.trim() || undefined,
+      idempotency_key: archiveIdempotencyKey.value,
+      metadata: { source: 'crm_pipeline' },
+    })
+    // The mutation is acknowledged even if the subsequent board refresh fails.
+    for (const column of columns.value) {
+      column.leads = column.leads.filter((item) => item.id !== lead.id)
+    }
+    archiveOpen.value = false
+    toast.success('Lead archived')
+    try {
+      await loadLeads()
+    } catch (error) {
+      toast.error('Lead archived, but the board could not be refreshed', getErrorMessage(error))
+    }
+  } catch (error) {
+    archiveError.value = getErrorMessage(error, 'Lead could not be archived')
+  } finally {
+    archiving.value = false
+  }
 }
 
 async function handleLeadSaved(action: 'updated' | 'archived' | 'reopened' = 'updated') {
@@ -314,11 +389,11 @@ onMounted(load)
               {{ pipeline.name }}
             </option>
           </select>
-          <Button variant="outline" size="icon" title="Refresh pipeline" @click="load">
+          <Button variant="outline" size="icon" title="Refresh pipeline" aria-label="Refresh pipeline" @click="load">
             <RefreshCw class="h-4 w-4" />
           </Button>
           <Button
-            v-if="canWriteLeads"
+            v-if="canReadLeads"
             variant="outline"
             class="gap-2"
             :aria-pressed="showArchived"
@@ -439,7 +514,9 @@ onMounted(load)
                 v-model="column.leads"
                 item-key="id"
                 group="pipeline-leads"
-                :disabled="showArchived || !canWriteLeads || Boolean(movingLeadId)"
+                :disabled="showArchived || !canWriteLeads || Boolean(movingLeadId) || archiving"
+                filter="button, input, select, textarea, [role=menuitem]"
+                :prevent-on-filter="false"
                 class="min-h-28 flex-1 space-y-2 overflow-y-auto p-2.5"
                 ghost-class="opacity-30"
                 drag-class="rotate-1"
@@ -463,17 +540,47 @@ onMounted(load)
                           }}</span>
                         </div>
                       </div>
-                      <Button
-                        v-if="canWriteLeads"
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        class="-mr-1 -mt-1 h-8 w-8 shrink-0 text-white/35 hover:text-cyan-200 light:text-slate-500 light:hover:text-cyan-700"
-                        :aria-label="`Edit ${lead.title}`"
-                        @click="openLeadEditor(lead)"
+                      <DropdownMenu
+                        v-if="canWriteLeads || (canArchiveLeads && lead.status !== 'archived')"
+                        :open="openLeadMenuId === lead.id"
+                        @update:open="
+                          openLeadMenuId = $event ? lead.id : openLeadMenuId === lead.id ? '' : openLeadMenuId
+                        "
                       >
-                        <Pencil class="h-3.5 w-3.5" />
-                      </Button>
+                        <DropdownMenuTrigger as-child>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            class="-mr-1 -mt-1 h-11 w-11 shrink-0 cursor-pointer text-white/55 focus-visible:ring-2 focus-visible:ring-cyan-300 light:text-slate-600"
+                            :aria-label="`Actions for ${lead.title}`"
+                            :data-lead-actions="lead.id"
+                            :disabled="archiving || Boolean(movingLeadId)"
+                          >
+                            <MoreHorizontal class="h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem
+                            v-if="canWriteLeads"
+                            :aria-label="`Edit ${lead.title}`"
+                            class="min-h-11 cursor-pointer"
+                            @select="openLeadEditor(lead)"
+                          >
+                            <Pencil class="mr-2 h-4 w-4" />
+                            {{ lead.status === 'archived' ? 'Review and reopen' : 'Edit lead' }}
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            v-if="canArchiveLeads && lead.status !== 'archived'"
+                            :aria-label="`Archive ${lead.title}`"
+                            class="min-h-11 cursor-pointer text-destructive focus:text-destructive"
+                            @select="requestArchive(lead)"
+                          >
+                            <Archive class="mr-2 h-4 w-4" />
+                            Archive lead
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </div>
                     <div
                       class="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.06] pt-2.5 light:border-slate-300"
@@ -603,5 +710,44 @@ onMounted(load)
       @saved="refreshPipelineConfiguration"
     />
     <LeadEditDialog v-model="leadEditorOpen" :lead="editingLead" @saved="handleLeadSaved" />
+    <AlertDialog :open="archiveOpen" @update:open="setArchiveOpen">
+      <AlertDialogContent @close-auto-focus="restoreArchiveFocus">
+        <AlertDialogHeader>
+          <AlertDialogTitle>Archive this lead?</AlertDialogTitle>
+          <AlertDialogDescription>
+            {{ archivingLead?.title }} will leave the active board. Its customer, messages, tasks and stage history stay
+            intact. A staff member with lead-write permission can reopen it later.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <p
+          v-if="archiveError"
+          role="alert"
+          class="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive"
+        >
+          {{ archiveError }}
+        </p>
+        <label class="block">
+          <span class="mb-1.5 block text-sm font-medium">Reason (optional)</span>
+          <textarea
+            v-model="archiveReason"
+            rows="3"
+            maxlength="2000"
+            :disabled="archiving"
+            class="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+        </label>
+        <AlertDialogFooter>
+          <AlertDialogCancel :disabled="archiving">Keep as is</AlertDialogCancel>
+          <Button
+            class="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            :disabled="archiving || !canArchiveLeads"
+            @click.prevent="archiveLead"
+          >
+            <Loader2 v-if="archiving" class="mr-2 h-4 w-4 animate-spin" />
+            Archive lead
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   </div>
 </template>

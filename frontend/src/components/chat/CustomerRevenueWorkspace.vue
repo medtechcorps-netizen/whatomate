@@ -58,10 +58,16 @@ import {
   type Pipeline,
 } from '@/services/productSuite'
 import ContactInfoPanel from '@/components/chat/ContactInfoPanel.vue'
+import ContactBookingDialog from '@/components/booking/ContactBookingDialog.vue'
 
 type WorkspaceTab = 'overview' | 'timeline' | 'details' | 'copilot'
 type CopilotAction = Extract<CopilotRun['task_type'], 'summary' | 'qualify' | 'extract_actions'>
 type ContactInfoSessionData = InstanceType<typeof ContactInfoPanel>['$props']['sessionData']
+type WorkspaceMutationContext = {
+  generation: number
+  selectedContactId: string
+  canonicalContactId: string
+}
 
 const props = withDefaults(defineProps<{
   contactId: string
@@ -86,12 +92,18 @@ const loading = ref(true)
 const refreshing = ref(false)
 const error = ref('')
 const activeTab = ref<WorkspaceTab>('overview')
+const workspaceSelectionContactId = ref('')
 let loadSequence = 0
+let copilotSequence = 0
+let mutationContextGeneration = 0
 
 const showJourneyDialog = ref(false)
 const showTaskDialog = ref(false)
+const showBookingDialog = ref(false)
 const savingJourney = ref(false)
 const savingTask = ref(false)
+const journeyMutationContext = ref<WorkspaceMutationContext | null>(null)
+const taskMutationContext = ref<WorkspaceMutationContext | null>(null)
 const pipelines = ref<Pipeline[]>([])
 const pipelinesLoading = ref(false)
 const journeyDraft = ref({
@@ -114,6 +126,7 @@ const copilotRun = ref<CopilotRun | null>(null)
 const copilotResult = ref('')
 
 const contactRecord = computed(() => workspace.value?.contact ?? props.contact)
+const canonicalContactId = computed(() => contactRecord.value?.id || props.contactId)
 const contactName = computed(() =>
   contactRecord.value?.profile_name ||
   contactRecord.value?.name ||
@@ -207,9 +220,76 @@ const canCreateJourney = computed(() =>
 const canCreateTask = computed(() =>
   canViewTasks.value && authStore.hasPermission('tasks', 'write'),
 )
+const canCreateBooking = computed(() =>
+  canViewBookings.value && authStore.hasPermission('bookings', 'write'),
+)
+
+function resetJourneyDraft() {
+  journeyDraft.value = {
+    title: '',
+    pipeline_id: pipelines.value.find(item => item.is_default)?.id ?? pipelines.value[0]?.id ?? '',
+    value: '',
+    currency: 'MYR',
+    source: props.surface === 'chat' ? 'whatsapp' : 'other',
+  }
+}
+
+function resetTaskDraft() {
+  taskDraft.value = {
+    title: '',
+    description: '',
+    priority: 'normal',
+    due_at: '',
+    lead_id: '',
+  }
+}
+
+function invalidateWorkspaceMutationDialogs() {
+  mutationContextGeneration += 1
+  journeyMutationContext.value = null
+  taskMutationContext.value = null
+  showJourneyDialog.value = false
+  showTaskDialog.value = false
+  showBookingDialog.value = false
+  savingJourney.value = false
+  savingTask.value = false
+  resetJourneyDraft()
+  resetTaskDraft()
+}
+
+function captureWorkspaceMutationContext(): WorkspaceMutationContext | null {
+  const selectedContactId = props.contactId.trim()
+  const resolvedContactId = workspace.value?.contact?.id?.trim()
+  if (
+    !selectedContactId
+    || !resolvedContactId
+    || loading.value
+    || workspaceSelectionContactId.value !== selectedContactId
+  ) return null
+
+  return {
+    generation: ++mutationContextGeneration,
+    selectedContactId,
+    canonicalContactId: resolvedContactId,
+  }
+}
+
+function mutationContextIsCurrent(
+  context: WorkspaceMutationContext,
+  active: WorkspaceMutationContext | null,
+) {
+  return (
+    active?.generation === context.generation
+    && active.selectedContactId === context.selectedContactId
+    && active.canonicalContactId === context.canonicalContactId
+    && props.contactId === context.selectedContactId
+    && workspaceSelectionContactId.value === context.selectedContactId
+    && canonicalContactId.value === context.canonicalContactId
+  )
+}
 
 const detailContact = computed<Contact>(() => ({
-  id: props.contactId,
+  id: canonicalContactId.value,
   phone_number: contactPhone.value,
   name: contactName.value,
   profile_name: contactRecord.value?.profile_name,
@@ -220,6 +300,13 @@ const detailContact = computed<Contact>(() => ({
   unread_count: props.contact?.unread_count ?? 0,
   assigned_user_id: contactRecord.value?.assigned_user_id,
   marketing_opt_out: contactRecord.value?.marketing_opt_out,
+  identity_review_ai_state: contactRecord.value?.identity_review_ai_state ?? {
+    known: false,
+    ai_allowed: false,
+    blocked: true,
+    open_hold_count: 0,
+    reason: 'identity_review_state_unavailable',
+  },
   created_at: contactRecord.value?.created_at || '',
   updated_at: contactRecord.value?.updated_at || '',
 }))
@@ -259,12 +346,16 @@ const summary = computed(() => {
 
 async function loadWorkspace(silent = false) {
   const sequence = ++loadSequence
+  const selectedContactId = props.contactId
   if (silent) refreshing.value = true
-  else loading.value = true
+  else {
+    loading.value = true
+    workspaceSelectionContactId.value = ''
+  }
   error.value = ''
   try {
-    const response = await customerWorkspaceService.get(props.contactId)
-    if (sequence !== loadSequence) return
+    const response = await customerWorkspaceService.get(selectedContactId)
+    if (sequence !== loadSequence || props.contactId !== selectedContactId) return
     const result = unwrapItemResponse<CustomerWorkspace>(response)
     workspace.value = {
       ...result,
@@ -277,8 +368,9 @@ async function loadWorkspace(silent = false) {
       payments: result.payments ?? [],
       timeline: result.timeline ?? [],
     }
+    workspaceSelectionContactId.value = selectedContactId
   } catch (cause) {
-    if (sequence !== loadSequence) return
+    if (sequence !== loadSequence || props.contactId !== selectedContactId) return
     error.value = getErrorMessage(cause)
   } finally {
     if (sequence === loadSequence) {
@@ -304,6 +396,9 @@ async function ensurePipelines() {
 }
 
 async function openJourney() {
+  const context = captureWorkspaceMutationContext()
+  if (!context) return
+  journeyMutationContext.value = context
   showJourneyDialog.value = true
   journeyDraft.value.title = `${contactName.value} enquiry`
   journeyDraft.value.source = props.surface === 'chat' ? 'whatsapp' : 'other'
@@ -311,11 +406,18 @@ async function openJourney() {
 }
 
 async function createJourney() {
-  if (!journeyDraft.value.title.trim() || !firstOpenStage.value) return
+  const context = journeyMutationContext.value
+  if (
+    !context
+    || !showJourneyDialog.value
+    || !mutationContextIsCurrent(context, journeyMutationContext.value)
+    || !journeyDraft.value.title.trim()
+    || !firstOpenStage.value
+  ) return
   savingJourney.value = true
   try {
     await crmService.createLead({
-      contact_id: props.contactId,
+      contact_id: context.canonicalContactId,
       pipeline_id: journeyDraft.value.pipeline_id,
       stage_id: firstOpenStage.value.id,
       title: journeyDraft.value.title.trim(),
@@ -325,29 +427,45 @@ async function createJourney() {
       currency: journeyDraft.value.currency,
       idempotency_key: crypto.randomUUID(),
     })
+    if (!mutationContextIsCurrent(context, journeyMutationContext.value)) return
+    savingJourney.value = false
     showJourneyDialog.value = false
+    journeyMutationContext.value = null
     journeyDraft.value.value = ''
     toast.success('Journey created', 'It is now visible in the revenue pipeline.')
     await loadWorkspace(true)
   } catch (cause) {
-    toast.error('Journey was not created', getErrorMessage(cause))
+    if (mutationContextIsCurrent(context, journeyMutationContext.value)) {
+      toast.error('Journey was not created', getErrorMessage(cause))
+    }
   } finally {
-    savingJourney.value = false
+    if (mutationContextIsCurrent(context, journeyMutationContext.value)) {
+      savingJourney.value = false
+    }
   }
 }
 
 function openFollowUp() {
+  const context = captureWorkspaceMutationContext()
+  if (!context) return
+  taskMutationContext.value = context
   taskDraft.value.title = `Follow up with ${contactName.value}`
   taskDraft.value.lead_id = openJourneys.value[0]?.id ?? ''
   showTaskDialog.value = true
 }
 
 async function createFollowUp() {
-  if (!taskDraft.value.title.trim()) return
+  const context = taskMutationContext.value
+  if (
+    !context
+    || !showTaskDialog.value
+    || !mutationContextIsCurrent(context, taskMutationContext.value)
+    || !taskDraft.value.title.trim()
+  ) return
   savingTask.value = true
   try {
     await crmService.createTask({
-      contact_id: props.contactId,
+      contact_id: context.canonicalContactId,
       lead_id: taskDraft.value.lead_id || undefined,
       title: taskDraft.value.title.trim(),
       description: taskDraft.value.description.trim(),
@@ -358,16 +476,28 @@ async function createFollowUp() {
       source: `${props.surface}_workspace`,
       idempotency_key: crypto.randomUUID(),
     })
+    if (!mutationContextIsCurrent(context, taskMutationContext.value)) return
+    savingTask.value = false
     showTaskDialog.value = false
+    taskMutationContext.value = null
     taskDraft.value.description = ''
     taskDraft.value.due_at = ''
     toast.success('Follow-up scheduled')
     await loadWorkspace(true)
   } catch (cause) {
-    toast.error('Follow-up was not created', getErrorMessage(cause))
+    if (mutationContextIsCurrent(context, taskMutationContext.value)) {
+      toast.error('Follow-up was not created', getErrorMessage(cause))
+    }
   } finally {
-    savingTask.value = false
+    if (mutationContextIsCurrent(context, taskMutationContext.value)) {
+      savingTask.value = false
+    }
   }
+}
+
+async function bookingCreated() {
+  toast.success('Appointment reserved', `${contactName.value}'s booking is now visible in the care timeline.`)
+  await loadWorkspace(true)
 }
 
 function copilotLabel(action: CopilotAction) {
@@ -380,14 +510,17 @@ function copilotLabel(action: CopilotAction) {
 
 async function runCopilot(action: CopilotAction) {
   if (!canUseCopilot.value || copilotRunning.value) return
+  const sequence = ++copilotSequence
+  const contactId = canonicalContactId.value
   copilotRunning.value = action
   copilotRun.value = null
   copilotResult.value = ''
   try {
-    const response = await copilotService.run(props.contactId, action, {
+    const response = await copilotService.run(contactId, action, {
       message_limit: 30,
       idempotency_key: crypto.randomUUID(),
     })
+    if (sequence !== copilotSequence || canonicalContactId.value !== contactId) return
     copilotRun.value = unwrapItemResponse<CopilotRun>(response)
     copilotResult.value =
       copilotRun.value.result_text ||
@@ -395,9 +528,11 @@ async function runCopilot(action: CopilotAction) {
         ? JSON.stringify(copilotRun.value.structured_result, null, 2)
         : 'No suggestion was returned.')
   } catch (cause) {
-    toast.error('Copilot could not complete this review', getErrorMessage(cause))
+    if (sequence === copilotSequence && canonicalContactId.value === contactId) {
+      toast.error('Copilot could not complete this review', getErrorMessage(cause))
+    }
   } finally {
-    copilotRunning.value = null
+    if (sequence === copilotSequence) copilotRunning.value = null
   }
 }
 
@@ -470,7 +605,10 @@ function identityLabel(identity: CustomerIdentity) {
 watch(
   () => props.contactId,
   () => {
+    copilotSequence += 1
+    invalidateWorkspaceMutationDialogs()
     activeTab.value = 'overview'
+    copilotRunning.value = null
     copilotRun.value = null
     copilotResult.value = ''
     void loadWorkspace()
@@ -687,28 +825,40 @@ onMounted(() => void loadWorkspace())
                 <LockKeyhole class="mr-2 inline h-3.5 w-3.5" />
                 Booking details are hidden by your permissions.
               </div>
-              <div v-else-if="upcomingBookings.length || recentBookings.length" class="space-y-2">
-                <article v-for="booking in upcomingBookings" :key="booking.id" class="rounded-xl border border-fuchsia-300/12 bg-fuchsia-300/[0.03] p-3">
-                  <div class="flex items-start justify-between gap-2">
-                    <div class="min-w-0">
-                      <p class="truncate text-xs font-medium">{{ bookingName(booking) }}</p>
-                      <p class="mt-1 text-[10px] text-white/40 light:text-gray-500">{{ dateTime(booking.event?.starts_at) }}</p>
-                      <p v-if="booking.event?.resource?.name" class="mt-1 truncate text-[10px] text-white/30 light:text-gray-400">{{ booking.event.resource.name }}</p>
+              <div v-else class="space-y-2">
+                <Button
+                  v-if="canCreateBooking"
+                  type="button"
+                  variant="outline"
+                  class="h-11 w-full justify-center border-fuchsia-300/20 text-fuchsia-100 hover:bg-fuchsia-300/[0.08] light:text-fuchsia-800"
+                  @click="showBookingDialog = true"
+                >
+                  <Plus class="mr-2 h-4 w-4" />
+                  Book appointment
+                </Button>
+                <template v-if="upcomingBookings.length || recentBookings.length">
+                  <article v-for="booking in upcomingBookings" :key="booking.id" class="rounded-xl border border-fuchsia-300/12 bg-fuchsia-300/[0.03] p-3">
+                    <div class="flex items-start justify-between gap-2">
+                      <div class="min-w-0">
+                        <p class="truncate text-xs font-medium">{{ bookingName(booking) }}</p>
+                        <p class="mt-1 text-[10px] text-white/40 light:text-gray-500">{{ dateTime(booking.event?.starts_at) }}</p>
+                        <p v-if="booking.event?.resource?.name" class="mt-1 truncate text-[10px] text-white/30 light:text-gray-400">{{ booking.event.resource.name }}</p>
+                      </div>
+                      <Badge variant="outline" class="shrink-0 capitalize text-[9px]">{{ booking.status.replace('_', ' ') }}</Badge>
                     </div>
-                    <Badge variant="outline" class="shrink-0 capitalize text-[9px]">{{ booking.status.replace('_', ' ') }}</Badge>
-                  </div>
-                </article>
-                <details v-if="recentBookings.length" class="rounded-xl border border-white/[0.06] px-3 py-2 light:border-gray-200">
-                  <summary class="cursor-pointer text-[10px] font-medium text-white/45 light:text-gray-600">Recent attendance</summary>
-                  <div class="mt-2 space-y-2">
-                    <div v-for="booking in recentBookings" :key="booking.id" class="flex items-center justify-between gap-2 text-[10px]">
-                      <span class="truncate">{{ bookingName(booking) }} · {{ shortDate(booking.event?.starts_at) }}</span>
-                      <Badge variant="secondary" class="capitalize text-[9px]">{{ booking.status.replace('_', ' ') }}</Badge>
+                  </article>
+                  <details v-if="recentBookings.length" class="rounded-xl border border-white/[0.06] px-3 py-2 light:border-gray-200">
+                    <summary class="cursor-pointer text-[10px] font-medium text-white/45 light:text-gray-600">Recent attendance</summary>
+                    <div class="mt-2 space-y-2">
+                      <div v-for="booking in recentBookings" :key="booking.id" class="flex items-center justify-between gap-2 text-[10px]">
+                        <span class="truncate">{{ bookingName(booking) }} · {{ shortDate(booking.event?.starts_at) }}</span>
+                        <Badge variant="secondary" class="capitalize text-[9px]">{{ booking.status.replace('_', ' ') }}</Badge>
+                      </div>
                     </div>
-                  </div>
-                </details>
+                  </details>
+                </template>
+                <p v-else class="rounded-xl border border-dashed border-white/[0.08] p-3 text-xs text-white/35 light:border-gray-200 light:text-gray-500">No bookings found.</p>
               </div>
-              <p v-else class="rounded-xl border border-dashed border-white/[0.08] p-3 text-xs text-white/35 light:border-gray-200 light:text-gray-500">No bookings found.</p>
             </section>
 
             <section aria-labelledby="workspace-revenue-title">
@@ -940,5 +1090,13 @@ onMounted(() => void loadWorkspace())
         </DialogFooter>
       </DialogContent>
     </Dialog>
+
+    <ContactBookingDialog
+      v-model:open="showBookingDialog"
+      :contact-id="canonicalContactId"
+      :contact-name="contactName"
+      :surface="props.surface"
+      @booked="bookingCreated"
+    />
   </section>
 </template>

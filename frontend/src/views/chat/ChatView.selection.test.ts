@@ -10,6 +10,9 @@ const mocks = vi.hoisted(() => ({
   route: null as { params: { contactId?: string } } | null,
   routerPush: vi.fn(),
   contactsStore: null as Record<string, any> | null,
+  authStore: null as Record<string, any> | null,
+  transfersStore: null as Record<string, any> | null,
+  hasPermission: vi.fn(),
   fetchContacts: vi.fn(),
   fetchContact: vi.fn(),
   fetchMessages: vi.fn(),
@@ -18,6 +21,11 @@ const mocks = vi.hoisted(() => ({
   setAccountFilter: vi.fn(),
   clearMessages: vi.fn(),
   fetchTransfers: vi.fn(),
+  fetchActiveTransferForContact: vi.fn(),
+  upsertTransfer: vi.fn(),
+  updateTransfer: vi.fn(),
+  createTransfer: vi.fn(),
+  resumeTransfer: vi.fn(),
   fetchTags: vi.fn(),
   fetchNotes: vi.fn(),
   clearNotes: vi.fn(),
@@ -28,6 +36,8 @@ const mocks = vi.hoisted(() => ({
   organizationStore: { selectedOrgId: null as string | null },
   setWebSocketContact: vi.fn(),
   scrollIntoView: vi.fn(),
+  toastSuccess: vi.fn(),
+  toastWarning: vi.fn(),
   resizeObservers: [] as Array<{
     callback: ResizeObserverCallback
     observe: ReturnType<typeof vi.fn>
@@ -142,16 +152,23 @@ vi.mock('@/stores/contacts', async () => {
   }
 })
 
-vi.mock('@/stores/auth', () => ({
-  useAuthStore: () => ({
+vi.mock('@/stores/auth', async () => {
+  const { reactive } = await import('vue')
+  const store = reactive({
     isAuthenticated: true,
     organizationId: 'organization-1',
     userRole: 'agent',
     user: { id: 'agent-1' },
-    hasPermission: () => false,
+    permissionRevision: 0,
+    hasPermission: (resource: string, action: string) => {
+      void store.permissionRevision
+      return mocks.hasPermission(resource, action)
+    },
     restoreSession: vi.fn(),
-  }),
-}))
+  })
+  mocks.authStore = store
+  return { useAuthStore: () => store }
+})
 
 vi.mock('@/stores/omnichannelUnread', () => ({
   useOmnichannelUnreadStore: () => ({ refresh: mocks.refreshUnread }),
@@ -165,12 +182,19 @@ vi.mock('@/stores/users', () => ({
   useUsersStore: () => ({ users: [], fetchUsers: vi.fn() }),
 }))
 
-vi.mock('@/stores/transfers', () => ({
-  useTransfersStore: () => ({
+vi.mock('@/stores/transfers', async () => {
+  const { reactive } = await import('vue')
+  const store = reactive({
+    activeByContact: {} as Record<string, Record<string, any> | undefined>,
     fetchTransfers: mocks.fetchTransfers,
-    getActiveTransferForContact: () => null,
-  }),
-}))
+    fetchActiveTransferForContact: mocks.fetchActiveTransferForContact,
+    upsertTransfer: mocks.upsertTransfer,
+    updateTransfer: mocks.updateTransfer,
+    getActiveTransferForContact: (contactId: string) => store.activeByContact[contactId],
+  })
+  mocks.transfersStore = store
+  return { useTransfersStore: () => store }
+})
 
 vi.mock('@/stores/tags', () => ({
   useTagsStore: () => ({
@@ -196,12 +220,18 @@ vi.mock('@/services/websocket', () => ({
 }))
 
 vi.mock('@/services/api', () => ({
+  effectiveAIIsAllowed: (state: { known?: boolean; ai_allowed?: boolean; blocked?: boolean } | null | undefined) => (
+    state?.known === true && state.ai_allowed === true && state.blocked === false
+  ),
   contactsService: {
     getSessionData: mocks.getSessionData,
     markRead: mocks.markRead,
     assign: vi.fn(),
   },
-  chatbotService: { createTransfer: vi.fn(), resumeTransfer: vi.fn() },
+  chatbotService: {
+    createTransfer: mocks.createTransfer,
+    resumeTransfer: mocks.resumeTransfer,
+  },
   messagesService: { sendReaction: vi.fn() },
   customActionsService: { list: vi.fn(), execute: vi.fn() },
   accountsService: { list: mocks.listAccounts },
@@ -210,7 +240,7 @@ vi.mock('@/services/api', () => ({
 }))
 
 vi.mock('vue-sonner', () => ({
-  toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
+  toast: { error: vi.fn(), success: mocks.toastSuccess, info: vi.fn(), warning: mocks.toastWarning },
 }))
 
 function deferred() {
@@ -238,6 +268,13 @@ function contact(id: string) {
     tags: [],
     metadata: {},
     unread_count: 0,
+    identity_review_ai_state: {
+      known: true,
+      ai_allowed: true,
+      blocked: false,
+      open_hold_count: 0,
+      reason: 'no_open_identity_review',
+    },
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
   }
@@ -253,6 +290,11 @@ function mountChatView() {
         ScrollArea: { template: '<div><slot /></div>' },
         Transition: { template: '<div><slot /></div>' },
         Teleport: true,
+        Tooltip: { template: '<div><slot /></div>' },
+        TooltipTrigger: { template: '<div><slot /></div>' },
+        TooltipContent: { template: '<div><slot /></div>' },
+        Button: { template: '<button><slot /></button>' },
+        Badge: { template: '<span><slot /></span>' },
       },
     },
   })
@@ -280,10 +322,36 @@ describe('ChatView conversation selection', () => {
       searchQuery: '',
       isLoadingMessages: false,
     })
+    mocks.transfersStore!.activeByContact = {}
     mocks.setCurrentContact.mockImplementation(value => {
       mocks.contactsStore!.currentContact = value
     })
+    mocks.hasPermission.mockReturnValue(false)
+    mocks.authStore!.permissionRevision += 1
     mocks.fetchContacts.mockResolvedValue(undefined)
+    mocks.fetchActiveTransferForContact.mockImplementation(async (contactId: string) =>
+      mocks.transfersStore!.activeByContact[contactId],
+    )
+    mocks.upsertTransfer.mockImplementation(transfer => {
+      mocks.transfersStore!.activeByContact[transfer.contact_id] = transfer
+      return transfer
+    })
+    mocks.updateTransfer.mockImplementation((transferId: string, updates: Record<string, any>) => {
+      const activeByContact = mocks.transfersStore!.activeByContact as Record<
+        string,
+        Record<string, any> | undefined
+      >
+      const entry = Object.entries(activeByContact)
+        .find(([, transfer]) => transfer?.id === transferId)
+      if (!entry) return false
+      const [contactId, transfer] = entry
+      const updated = { ...transfer!, ...updates }
+      mocks.transfersStore!.activeByContact[contactId] =
+        updated.status === 'active' ? updated : undefined
+      return true
+    })
+    mocks.createTransfer.mockResolvedValue({ data: { data: {} } })
+    mocks.resumeTransfer.mockResolvedValue({ data: { data: {} } })
     mocks.refreshCurrentMessages.mockResolvedValue(undefined)
     mocks.fetchNotes.mockResolvedValue(undefined)
     mocks.listAccounts.mockResolvedValue({ data: { data: { accounts: [] } } })
@@ -319,6 +387,72 @@ describe('ChatView conversation selection', () => {
     vi.runOnlyPendingTimers()
     vi.useRealTimers()
     vi.unstubAllGlobals()
+  })
+
+  it('exposes stable contact and message identity selectors', async () => {
+    mocks.contactsStore!.messages = [{
+      id: 'message-selector-1',
+      direction: 'incoming',
+      message_type: 'text',
+      content: { body: 'Selector-bound message' },
+      status: 'received',
+      created_at: '2026-08-24T04:00:00Z',
+    }]
+    mocks.fetchMessages.mockResolvedValue(undefined)
+
+    wrapper = mountChatView()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+
+    const contacts = wrapper.findAll('[data-testid="chat-contact"]')
+    expect(contacts).toHaveLength(2)
+    expect(contacts[0].attributes('data-contact-id')).toBe('first')
+    expect(contacts[1].attributes('data-contact-id')).toBe('second')
+
+    const transcript = wrapper.get('[data-testid="chat-message-list"]')
+    expect(transcript.attributes('data-contact-id')).toBe('first')
+    const message = transcript.get('[data-testid="chat-message"]')
+    expect(message.attributes('data-message-id')).toBe('message-selector-1')
+    expect(message.attributes('data-message-direction')).toBe('incoming')
+  })
+
+  it('finishes account and conversation selection while AI status is still loading', async () => {
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      resource === 'transfers' && action === 'read',
+    )
+    mocks.contactsStore!.contacts[0].whatsapp_account = 'clinic-account'
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    const transferLookup = deferred()
+    mocks.fetchActiveTransferForContact.mockReturnValueOnce(transferLookup.promise)
+
+    wrapper = mountChatView()
+    await flushPromises()
+
+    expect((wrapper.vm as any).selectedAccount).toBe('clinic-account')
+    expect(mocks.setWebSocketContact).toHaveBeenCalledWith('first')
+    expect(wrapper.find('[data-testid="conversation-ai-toggle"]').attributes('aria-label'))
+      .toBe('Checking AI status')
+
+    transferLookup.resolve()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="conversation-ai-toggle"]').exists()).toBe(false)
+  })
+
+  it('keeps conversation selection usable when AI status lookup rejects unexpectedly', async () => {
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      resource === 'transfers' && action === 'read',
+    )
+    mocks.contactsStore!.contacts[0].whatsapp_account = 'clinic-account'
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.fetchActiveTransferForContact.mockRejectedValueOnce(new Error('transfer lookup failed'))
+
+    wrapper = mountChatView()
+    await flushPromises()
+
+    expect((wrapper.vm as any).selectedAccount).toBe('clinic-account')
+    expect(mocks.setWebSocketContact).toHaveBeenCalledWith('first')
+    expect(wrapper.find('[data-testid="conversation-ai-toggle"]').exists()).toBe(false)
   })
 
   it('lets only the current contact completion schedule the initial bottom scroll', async () => {
@@ -977,5 +1111,190 @@ describe('ChatView conversation selection', () => {
     expect((wrapper.vm as any).contactSessionData).toEqual({
       private_value: 'contact-b',
     })
+  })
+
+  it('reacts only after both contact-write and dedicated review authority are granted', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    wrapper = mountChatView()
+    await flushPromises()
+
+    const dialog = wrapper.findComponent({ name: 'ContactIdentityReviewDialog' })
+    expect(dialog.props('canReview')).toBe(false)
+
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      resource === 'contacts' && action === 'write',
+    )
+    mocks.authStore!.permissionRevision += 1
+    await nextTick()
+
+    expect(dialog.props('canReview')).toBe(false)
+
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      action === 'write'
+      && (resource === 'contacts' || resource === 'contacts.identity_review'),
+    )
+    mocks.authStore!.permissionRevision += 1
+    await nextTick()
+
+    expect(dialog.props('canReview')).toBe(true)
+  })
+
+  it('projects a resolved identity state before the canonical contact refresh completes', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    wrapper = mountChatView()
+    await flushPromises()
+    const canonicalRefresh = deferred()
+    mocks.fetchContacts.mockReturnValueOnce(canonicalRefresh.promise)
+    const resolvedState = {
+      known: true,
+      ai_allowed: false,
+      blocked: true,
+      open_hold_count: 1,
+      latest_generation: 7,
+      reason: 'identity_review_open',
+    }
+
+    wrapper.findComponent({ name: 'ContactIdentityReviewDialog' }).vm.$emit('resolved', resolvedState)
+    await nextTick()
+
+    expect(mocks.contactsStore!.currentContact.identity_review_ai_state).toEqual(resolvedState)
+    expect(mocks.contactsStore!.contacts[0].identity_review_ai_state).toEqual(resolvedState)
+    canonicalRefresh.resolve()
+    await flushPromises()
+  })
+
+  it('pauses AI for the selected contact and immediately exposes the resume state', async () => {
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      resource === 'transfers' && (action === 'read' || action === 'write'),
+    )
+    mocks.contactsStore!.contacts[0].whatsapp_account = 'clinic-account'
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    const transfer = {
+      id: 'transfer-first',
+      contact_id: 'first',
+      contact_name: 'Contact first',
+      phone_number: 'phone-first',
+      whatsapp_account: 'clinic-account',
+      status: 'active',
+      source: 'manual',
+      transferred_by: 'agent-1',
+      transferred_at: '2026-01-01T00:00:00Z',
+      sla_breached: false,
+      escalation_level: 0,
+    }
+    mocks.createTransfer.mockResolvedValue({
+      data: { data: { transfer } },
+    })
+
+    wrapper = mountChatView()
+    await flushPromises()
+
+    const toggle = wrapper.find('[data-testid="conversation-ai-toggle"]')
+    expect(toggle.exists()).toBe(true)
+    expect(toggle.attributes('aria-label')).toBe('Pause AI')
+
+    await toggle.trigger('click')
+    await flushPromises()
+
+    expect(mocks.createTransfer).toHaveBeenCalledWith(expect.objectContaining({
+      contact_id: 'first',
+      agent_id: 'agent-1',
+      whatsapp_account: 'clinic-account',
+      source: 'manual',
+    }))
+    expect(mocks.upsertTransfer).toHaveBeenCalledWith(transfer)
+    expect(wrapper.text()).toContain('AI paused')
+    expect(wrapper.find('[data-testid="conversation-ai-toggle"]').attributes('aria-label'))
+      .toBe('Resume AI')
+  })
+
+  it('resumes a selected contact transfer owned by the current agent', async () => {
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      resource === 'transfers' && (action === 'read' || action === 'write'),
+    )
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.transfersStore!.activeByContact.first = {
+      id: 'transfer-first',
+      contact_id: 'first',
+      status: 'active',
+      source: 'manual',
+      transferred_by: 'agent-1',
+    }
+
+    wrapper = mountChatView()
+    await flushPromises()
+
+    const toggle = wrapper.find('[data-testid="conversation-ai-toggle"]')
+    expect(toggle.attributes('aria-label')).toBe('Resume AI')
+    await toggle.trigger('click')
+    await flushPromises()
+
+    expect(mocks.resumeTransfer).toHaveBeenCalledWith('transfer-first')
+    expect(mocks.updateTransfer).toHaveBeenCalledWith('transfer-first', {
+      status: 'resumed',
+    })
+    expect(wrapper.find('[data-testid="conversation-ai-toggle"]').attributes('aria-label'))
+      .toBe('Pause AI')
+  })
+
+  it('does not claim AI resumed when durable identity review still blocks the contact', async () => {
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      resource === 'transfers' && (action === 'read' || action === 'write'),
+    )
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.contactsStore!.contacts[0].identity_review_ai_state = {
+      known: true,
+      ai_allowed: false,
+      blocked: true,
+      open_hold_count: 1,
+      reason: 'identity_review_open',
+      latest_hold_id: 'hold-1',
+    }
+    mocks.transfersStore!.activeByContact.first = {
+      id: 'transfer-first',
+      contact_id: 'first',
+      status: 'active',
+      source: 'manual',
+      transferred_by: 'agent-1',
+    }
+
+    wrapper = mountChatView()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="conversation-ai-toggle"]').attributes('aria-label'))
+      .toBe('End conversation pause')
+    await wrapper.get('[data-testid="conversation-ai-toggle"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.resumeTransfer).toHaveBeenCalledWith('transfer-first')
+    expect(mocks.toastSuccess).not.toHaveBeenCalledWith(
+      'AI replies resumed',
+      expect.anything(),
+    )
+    expect(mocks.toastWarning).toHaveBeenCalledWith(
+      'Human handover ended',
+      expect.objectContaining({
+        description: expect.stringContaining('identity review'),
+      }),
+    )
+  })
+
+  it('shows that AI is paused without allowing an agent to resume another user transfer', async () => {
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      resource === 'transfers' && (action === 'read' || action === 'write'),
+    )
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.transfersStore!.activeByContact.first = {
+      id: 'transfer-first',
+      contact_id: 'first',
+      status: 'active',
+      source: 'manual',
+      transferred_by: 'agent-2',
+    }
+
+    wrapper = mountChatView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('AI paused')
+    expect(wrapper.find('[data-testid="conversation-ai-toggle"]').exists()).toBe(false)
   })
 })

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/metaregistry"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -229,13 +230,29 @@ func TestManagedInstagramChannelAIGenerationDowngradeWinsOrganizationMutex(t *te
 				return nil
 			}
 			workerPID <- backendPID
-			threadWorker := *fixture.worker
-			threadWorker.DB = connection
-			workerDone <- threadWorker.processChannelAIReplyJob(
-				context.Background(),
+			workerDone <- database.WithTenantReadCommitted(
+				connection,
 				fixture.fixture.Organization.ID,
-				jobID,
-				workerID,
+				func(guardTx *gorm.DB) error {
+					if err := database.LockOrganizationAIAttemptScope(
+						guardTx,
+						fixture.fixture.Organization.ID,
+					); err != nil {
+						return err
+					}
+					check, err := fixture.worker.authorizeChannelAIReplyGenerationWithinAttempt(
+						fixture.fixture.Organization.ID,
+						jobID,
+						workerID,
+					)
+					if err != nil {
+						return err
+					}
+					if !check.AlreadySettled {
+						return errors.New("lifecycle downgrade did not settle the generation")
+					}
+					return nil
+				},
 			)
 			return nil
 		})
@@ -261,64 +278,12 @@ func TestManagedInstagramChannelAIGenerationDowngradeWinsOrganizationMutex(t *te
 
 func TestManagedInstagramChannelAIFinalizationRejectsPostQwenDrift(t *testing.T) {
 	var qwenCalls atomic.Int32
-	var statusAtQwen models.ScheduledJobStatus
-	var fixture managedInstagramAIGenerationFixture
-	fixture = createManagedInstagramAIGenerationFixture(
+	fixture := createManagedInstagramAIGenerationFixture(
 		t,
 		func(_ *http.Request) (*http.Response, error) {
 			qwenCalls.Add(1)
-			var observedJob models.ScheduledJob
-			require.NoError(t, fixture.db.Select("status").Where(
-				"id = ? AND organization_id = ?",
-				fixture.fixture.Job.ID,
-				fixture.fixture.Organization.ID,
-			).First(&observedJob).Error)
-			statusAtQwen = observedJob.Status
-			require.NoError(t, fixture.db.Transaction(func(tx *gorm.DB) error {
-				if err := lockChannelOutboxOrganizationScopeTx(
-					tx,
-					fixture.fixture.Organization.ID,
-				); err != nil {
-					return err
-				}
-				var account models.ChannelAccount
-				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
-					"id = ? AND organization_id = ?",
-					fixture.fixture.Account.ID,
-					fixture.fixture.Organization.ID,
-				).First(&account).Error; err != nil {
-					return err
-				}
-				metadata := cloneChannelOutboxTestJSONB(account.Metadata)
-				metadata["meta_ownership_state"] = metaregistry.OwnershipStale
-				metadata["meta_ownership_reason"] = "synthetic_post_qwen_downgrade"
-				accountConfig := cloneChannelOutboxTestJSONB(account.Config)
-				accountConfig["outbound_enabled"] = false
-				accountConfig["ai_reply_enabled"] = false
-				if err := tx.Model(&models.ChannelAccount{}).Where(
-					"id = ? AND organization_id = ?",
-					account.ID,
-					fixture.fixture.Organization.ID,
-				).Updates(map[string]any{
-					"status":   models.ChannelAccountStatusDegraded,
-					"config":   accountConfig,
-					"metadata": metadata,
-				}).Error; err != nil {
-					return err
-				}
-				cancel := tx.Model(&models.ScheduledJob{}).Where(
-					"id = ? AND organization_id = ? AND status = ?",
-					fixture.fixture.Job.ID,
-					fixture.fixture.Organization.ID,
-					models.ScheduledJobStatusProcessing,
-				).Update("status", models.ScheduledJobStatusCancelled)
-				if cancel.Error != nil {
-					return cancel.Error
-				}
-				require.Zero(t, cancel.RowsAffected, "generating is the Qwen point of no return")
-				return nil
-			}))
-			return channelAIReplyQwenResponse("must not be persisted"), nil
+			t.Fatal("staged finalization test must not call Qwen")
+			return nil, nil
 		},
 	)
 	const workerID = "managed-instagram-ai-final-drift"
@@ -328,15 +293,57 @@ func TestManagedInstagramChannelAIFinalizationRejectsPostQwenDrift(t *testing.T)
 	)
 	require.NoError(t, err)
 	require.True(t, claimed)
-	require.NoError(t, fixture.worker.processChannelAIReplyJob(
-		context.Background(),
+	check := recordChannelAIAttemptForTest(
+		t,
+		&fixture,
+		jobID,
+		workerID,
+		"must not be persisted",
+		nil,
+	)
+	require.True(t, check.ManagedInstagram)
+	require.NotEmpty(t, check.Snapshot.Job.Payload[channelAIManagedGenerationDigestKey])
+
+	require.NoError(t, fixture.db.Transaction(func(tx *gorm.DB) error {
+		if err := lockChannelOutboxOrganizationScopeTx(
+			tx,
+			fixture.fixture.Organization.ID,
+		); err != nil {
+			return err
+		}
+		var account models.ChannelAccount
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+			"id = ? AND organization_id = ?",
+			fixture.fixture.Account.ID,
+			fixture.fixture.Organization.ID,
+		).First(&account).Error; err != nil {
+			return err
+		}
+		metadata := cloneChannelOutboxTestJSONB(account.Metadata)
+		metadata["meta_ownership_state"] = metaregistry.OwnershipStale
+		metadata["meta_ownership_reason"] = "synthetic_post_qwen_downgrade"
+		accountConfig := cloneChannelOutboxTestJSONB(account.Config)
+		accountConfig["outbound_enabled"] = false
+		accountConfig["ai_reply_enabled"] = false
+		return tx.Model(&models.ChannelAccount{}).Where(
+			"id = ? AND organization_id = ?",
+			account.ID,
+			fixture.fixture.Organization.ID,
+		).Updates(map[string]any{
+			"status":   models.ChannelAccountStatusDegraded,
+			"config":   accountConfig,
+			"metadata": metadata,
+		}).Error
+	}))
+	require.NoError(t, fixture.worker.finalizeChannelAIReply(
 		fixture.fixture.Organization.ID,
 		jobID,
 		workerID,
+		"must not be persisted",
+		&check.Snapshot.Account,
 	))
 
-	assert.EqualValues(t, 1, qwenCalls.Load())
-	assert.Equal(t, models.ScheduledJobStatusGenerating, statusAtQwen)
+	assert.Zero(t, qwenCalls.Load())
 	assertManagedInstagramAIGenerationProducedNothing(t, fixture)
 	var job models.ScheduledJob
 	require.NoError(t, fixture.db.First(&job, "id = ?", jobID).Error)
@@ -350,30 +357,40 @@ func TestManagedInstagramStaleGeneratingAfterRotationIsTerminal(t *testing.T) {
 		t,
 		func(_ *http.Request) (*http.Response, error) {
 			qwenCalls.Add(1)
-			return channelAIReplyQwenResponse("must not be generated twice"), nil
+			t.Fatal("stale attempt setup must not call Qwen")
+			return nil, nil
 		},
 	)
+	const deadWorker = "dead-worker"
+	jobID, claimed, err := fixture.worker.claimChannelAIReplyJob(
+		fixture.fixture.Organization.ID,
+		deadWorker,
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	check := authorizeChannelAIAttemptForTest(t, &fixture, jobID, deadWorker)
+	require.True(t, check.ManagedInstagram)
+	require.NotEmpty(t, check.Snapshot.Job.Payload[channelAIManagedGenerationDigestKey])
+
 	staleAt := time.Now().UTC().Add(-defaultChannelAIReplyLease - time.Minute)
 	require.NoError(t, fixture.db.Model(&models.ScheduledJob{}).Where(
 		"id = ? AND organization_id = ?",
-		fixture.fixture.Job.ID,
+		jobID,
 		fixture.fixture.Organization.ID,
 	).Updates(map[string]any{
-		"status":    models.ScheduledJobStatusGenerating,
 		"locked_at": staleAt,
-		"locked_by": "dead-worker",
 	}).Error)
 	rotateManagedInstagramAIGeneration(t, &fixture)
 
-	jobID, claimed, err := fixture.worker.claimChannelAIReplyJob(
+	retryID, retryClaimed, err := fixture.worker.claimChannelAIReplyJob(
 		fixture.fixture.Organization.ID,
 		"replacement-worker",
 	)
 	require.NoError(t, err)
-	require.False(t, claimed)
-	assert.Equal(t, uuid.Nil, jobID)
+	require.False(t, retryClaimed)
+	assert.Equal(t, uuid.Nil, retryID)
 	var job models.ScheduledJob
-	require.NoError(t, fixture.db.First(&job, "id = ?", fixture.fixture.Job.ID).Error)
+	require.NoError(t, fixture.db.First(&job, "id = ?", jobID).Error)
 	assert.Equal(t, models.ScheduledJobStatusCancelled, job.Status)
 	assert.Equal(t, "managed_instagram_generation_ambiguous_after_lease_loss", job.LastError)
 	assert.Empty(t, job.LockedBy)
@@ -383,13 +400,12 @@ func TestManagedInstagramStaleGeneratingAfterRotationIsTerminal(t *testing.T) {
 
 func TestManagedInstagramQwenErrorAfterRotationIsTerminal(t *testing.T) {
 	var qwenCalls atomic.Int32
-	var fixture managedInstagramAIGenerationFixture
-	fixture = createManagedInstagramAIGenerationFixture(
+	fixture := createManagedInstagramAIGenerationFixture(
 		t,
 		func(_ *http.Request) (*http.Response, error) {
 			qwenCalls.Add(1)
-			rotateManagedInstagramAIGeneration(t, &fixture)
-			return nil, errors.New("synthetic Qwen transport ambiguity")
+			t.Fatal("staged Qwen error test must not call Qwen")
+			return nil, nil
 		},
 	)
 	const workerID = "managed-instagram-ai-error-rotation"
@@ -399,14 +415,29 @@ func TestManagedInstagramQwenErrorAfterRotationIsTerminal(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.True(t, claimed)
-	require.NoError(t, fixture.worker.processChannelAIReplyJob(
-		context.Background(),
-		fixture.fixture.Organization.ID,
+	providerErr := errors.New("synthetic Qwen transport ambiguity")
+	check := recordChannelAIAttemptForTest(
+		t,
+		&fixture,
 		jobID,
 		workerID,
+		"",
+		providerErr,
+	)
+	require.True(t, check.ManagedInstagram)
+	var attemptJob models.ScheduledJob
+	require.NoError(t, fixture.db.First(&attemptJob, "id = ?", jobID).Error)
+	assert.Equal(t, "uncertain", attemptJob.Payload["provider_attempt_state"])
+	require.NotEmpty(t, attemptJob.Payload[channelAIManagedGenerationDigestKey])
+	rotateManagedInstagramAIGeneration(t, &fixture)
+	require.NoError(t, fixture.worker.failChannelAIReplyJob(
+		fixture.fixture.Organization.ID,
+		&attemptJob,
+		workerID,
+		providerErr,
 	))
 
-	assert.EqualValues(t, 1, qwenCalls.Load())
+	assert.Zero(t, qwenCalls.Load())
 	var job models.ScheduledJob
 	require.NoError(t, fixture.db.First(&job, "id = ?", jobID).Error)
 	assert.Equal(t, models.ScheduledJobStatusFailed, job.Status)
@@ -422,7 +453,7 @@ func TestManagedInstagramQwenErrorAfterRotationIsTerminal(t *testing.T) {
 	assert.Equal(t, uuid.Nil, retryID)
 }
 
-func TestStaticInstagramAndMessengerKeepProcessingRetrySemantics(t *testing.T) {
+func TestStaticInstagramAndMessengerQwenUncertaintyIsTerminal(t *testing.T) {
 	for _, channel := range []models.Channel{models.ChannelInstagram, models.ChannelMessenger} {
 		t.Run(string(channel), func(t *testing.T) {
 			db := testutil.SetupTestDB(t)
@@ -468,13 +499,252 @@ func TestStaticInstagramAndMessengerKeepProcessingRetrySemantics(t *testing.T) {
 				jobID,
 				workerID,
 			))
-			assert.Equal(t, models.ScheduledJobStatusProcessing, statusAtQwen)
+			assert.Equal(t, models.ScheduledJobStatusGenerating, statusAtQwen)
 			var job models.ScheduledJob
 			require.NoError(t, db.First(&job, "id = ?", jobID).Error)
-			assert.Equal(t, models.ScheduledJobStatusPending, job.Status)
-			assert.Nil(t, job.CompletedAt)
+			assert.Equal(t, models.ScheduledJobStatusFailed, job.Status)
+			assert.NotNil(t, job.CompletedAt)
+			assert.Equal(t, 1, job.Attempts)
+			assert.Equal(t, "uncertain", job.Payload["provider_attempt_state"])
+			assert.NotContains(t, job.Payload, channelAIManagedGenerationDigestKey)
+			assert.Contains(t, job.LastError, "channel_ai_generation_ambiguous_after_qwen_error")
+			assert.NotContains(t, job.LastError, "managed_instagram_generation")
+
+			retryID, retryClaimed, err := worker.claimChannelAIReplyJob(
+				fixture.Organization.ID,
+				workerID+"-retry",
+			)
+			require.NoError(t, err)
+			assert.False(t, retryClaimed)
+			assert.Equal(t, uuid.Nil, retryID)
+			idempotencyKey := models.ChannelAIReplyIdempotencyKey(fixture.Inbound.ID)
+			var outboxCount, messageCount int64
+			require.NoError(t, db.Model(&models.OutboxJob{}).Where(
+				"organization_id = ? AND idempotency_key = ?",
+				fixture.Organization.ID,
+				idempotencyKey,
+			).Count(&outboxCount).Error)
+			require.NoError(t, db.Model(&models.Message{}).Where(
+				"organization_id = ? AND id = ?",
+				fixture.Organization.ID,
+				channelAIReplyMessageID(idempotencyKey),
+			).Count(&messageCount).Error)
+			assert.Zero(t, outboxCount)
+			assert.Zero(t, messageCount)
 		})
 	}
+}
+
+func TestOrdinaryInstagramAttemptRejectsManagedFinalizationDrift(t *testing.T) {
+	var qwenCalls atomic.Int32
+	fixture := createManagedInstagramAIGenerationFixture(
+		t,
+		func(_ *http.Request) (*http.Response, error) {
+			qwenCalls.Add(1)
+			t.Fatal("staged ordinary-to-managed test must not call Qwen")
+			return nil, nil
+		},
+	)
+	managedConfig := cloneChannelOutboxTestJSONB(fixture.fixture.Account.Config)
+	managedMetadata := cloneChannelOutboxTestJSONB(fixture.fixture.Account.Metadata)
+	ordinaryConfig := cloneChannelOutboxTestJSONB(managedConfig)
+	for _, key := range []string{
+		"meta_registry_managed",
+		"meta_management_mode",
+		"instagram_api_mode",
+		"rereply_webhook_url",
+		"relay_url",
+	} {
+		delete(ordinaryConfig, key)
+	}
+	ordinaryMetadata := cloneChannelOutboxTestJSONB(managedMetadata)
+	for _, key := range []string{
+		"meta_platform_app_id",
+		"meta_webhook_app",
+		"meta_subscription_operation_id",
+	} {
+		delete(ordinaryMetadata, key)
+	}
+	require.NoError(t, fixture.db.Model(&models.ChannelAccount{}).Where(
+		"id = ? AND organization_id = ?",
+		fixture.fixture.Account.ID,
+		fixture.fixture.Organization.ID,
+	).Updates(map[string]any{
+		"config":   ordinaryConfig,
+		"metadata": ordinaryMetadata,
+	}).Error)
+
+	const workerID = "ordinary-to-managed-finalization-drift"
+	jobID, claimed, err := fixture.worker.claimChannelAIReplyJob(
+		fixture.fixture.Organization.ID,
+		workerID,
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	check := recordChannelAIAttemptForTest(
+		t,
+		&fixture,
+		jobID,
+		workerID,
+		"must not be persisted",
+		nil,
+	)
+	require.False(t, check.ManagedInstagram)
+	assert.NotContains(t, check.Snapshot.Job.Payload, channelAIManagedGenerationDigestKey)
+
+	require.NoError(t, fixture.db.Model(&models.ChannelAccount{}).Where(
+		"id = ? AND organization_id = ?",
+		fixture.fixture.Account.ID,
+		fixture.fixture.Organization.ID,
+	).Updates(map[string]any{
+		"config":   managedConfig,
+		"metadata": managedMetadata,
+	}).Error)
+	require.NoError(t, fixture.worker.finalizeChannelAIReply(
+		fixture.fixture.Organization.ID,
+		jobID,
+		workerID,
+		"must not be persisted",
+	))
+
+	assert.Zero(t, qwenCalls.Load())
+	assertManagedInstagramAIGenerationProducedNothing(t, fixture)
+	var job models.ScheduledJob
+	require.NoError(t, fixture.db.First(&job, "id = ?", jobID).Error)
+	assert.Equal(t, models.ScheduledJobStatusCancelled, job.Status)
+	assert.Equal(t, "managed_instagram_generation_not_authorized", job.LastError)
+}
+
+func TestManagedInstagramResolvedResultRecoveryRejectsCredentialRotation(t *testing.T) {
+	var qwenCalls atomic.Int32
+	fixture := createManagedInstagramAIGenerationFixture(
+		t,
+		func(_ *http.Request) (*http.Response, error) {
+			qwenCalls.Add(1)
+			t.Fatal("resolved-result recovery must not replay Qwen")
+			return nil, nil
+		},
+	)
+	const firstWorker = "managed-result-before-rotation"
+	jobID, claimed, err := fixture.worker.claimChannelAIReplyJob(
+		fixture.fixture.Organization.ID,
+		firstWorker,
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	check := recordChannelAIAttemptForTest(
+		t,
+		&fixture,
+		jobID,
+		firstWorker,
+		"resolved before credential rotation",
+		nil,
+	)
+	require.True(t, check.ManagedInstagram)
+	require.NotEmpty(t, check.Snapshot.Job.Payload[channelAIManagedGenerationDigestKey])
+	rotateManagedInstagramAIGeneration(t, &fixture)
+	staleAt := time.Now().UTC().Add(-defaultChannelAIReplyLease - time.Minute)
+	require.NoError(t, fixture.db.Model(&models.ScheduledJob{}).Where(
+		"id = ? AND organization_id = ?",
+		jobID,
+		fixture.fixture.Organization.ID,
+	).Update("locked_at", staleAt).Error)
+
+	const recoveryWorker = "managed-result-after-rotation"
+	recoveredID, recovered, err := fixture.worker.claimChannelAIReplyJob(
+		fixture.fixture.Organization.ID,
+		recoveryWorker,
+	)
+	require.NoError(t, err)
+	require.True(t, recovered)
+	require.Equal(t, jobID, recoveredID)
+	require.NoError(t, fixture.worker.processChannelAIReplyJob(
+		context.Background(),
+		fixture.fixture.Organization.ID,
+		recoveredID,
+		recoveryWorker,
+	))
+
+	assert.Zero(t, qwenCalls.Load())
+	assertManagedInstagramAIGenerationProducedNothing(t, fixture)
+	var job models.ScheduledJob
+	require.NoError(t, fixture.db.First(&job, "id = ?", jobID).Error)
+	assert.Equal(t, models.ScheduledJobStatusCancelled, job.Status)
+	assert.Equal(t, "managed_instagram_generation_not_authorized", job.LastError)
+}
+
+func authorizeChannelAIAttemptForTest(
+	t *testing.T,
+	fixture *managedInstagramAIGenerationFixture,
+	jobID uuid.UUID,
+	workerID string,
+) channelAIReplyCheck {
+	t.Helper()
+	return stageChannelAIAttemptForTest(t, fixture, jobID, workerID, "", nil, false)
+}
+
+func recordChannelAIAttemptForTest(
+	t *testing.T,
+	fixture *managedInstagramAIGenerationFixture,
+	jobID uuid.UUID,
+	workerID, response string,
+	providerErr error,
+) channelAIReplyCheck {
+	t.Helper()
+	return stageChannelAIAttemptForTest(
+		t,
+		fixture,
+		jobID,
+		workerID,
+		response,
+		providerErr,
+		true,
+	)
+}
+
+func stageChannelAIAttemptForTest(
+	t *testing.T,
+	fixture *managedInstagramAIGenerationFixture,
+	jobID uuid.UUID,
+	workerID, response string,
+	providerErr error,
+	recordResult bool,
+) channelAIReplyCheck {
+	t.Helper()
+	require.NotNil(t, fixture)
+	require.NotNil(t, fixture.worker)
+	var check channelAIReplyCheck
+	err := fixture.worker.withChannelAIPhysicalAttempt(
+		context.Background(),
+		fixture.fixture.Organization.ID,
+		func(context.Context) error {
+			var err error
+			check, err = fixture.worker.authorizeChannelAIReplyGenerationWithinAttempt(
+				fixture.fixture.Organization.ID,
+				jobID,
+				workerID,
+			)
+			if err != nil {
+				return err
+			}
+			if check.AlreadySettled || check.AlreadyQueued || check.CancelReason != "" {
+				return errors.New("test channel AI attempt was not authorized")
+			}
+			if !recordResult {
+				return nil
+			}
+			return fixture.worker.persistChannelAIReplyProviderAttemptResult(
+				fixture.fixture.Organization.ID,
+				jobID,
+				workerID,
+				response,
+				providerErr,
+			)
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, models.ScheduledJobStatusGenerating, check.Snapshot.Job.Status)
+	return check
 }
 
 func createManagedInstagramAIGenerationFixture(

@@ -3,18 +3,26 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/config"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
+	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -22,6 +30,307 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+type campaignStatsCaptureHook struct {
+	payloads chan []byte
+}
+
+type campaignContactSQLStateError string
+
+func (err campaignContactSQLStateError) Error() string    { return string(err) }
+func (err campaignContactSQLStateError) SQLState() string { return string(err) }
+
+type campaignContactAttempt struct {
+	xid string
+	err error
+}
+
+func campaignContactErrorSQLState(err error) string {
+	var sqlState interface {
+		SQLState() string
+	}
+	if errors.As(err, &sqlState) {
+		return sqlState.SQLState()
+	}
+	return ""
+}
+
+func campaignRecipientJob(
+	organization *models.Organization,
+	campaign *models.BulkMessageCampaign,
+	recipient *models.BulkMessageRecipient,
+) *queue.RecipientJob {
+	return &queue.RecipientJob{
+		CampaignID:     campaign.ID,
+		RecipientID:    recipient.ID,
+		OrganizationID: organization.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		RecipientName:  recipient.RecipientName,
+		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
+	}
+}
+
+func holdCampaignContactSelectorFence(
+	t *testing.T,
+	db *gorm.DB,
+	organizationID uuid.UUID,
+) *gorm.DB {
+	t.Helper()
+	holder := db.Begin()
+	require.NoError(t, holder.Error)
+	require.NoError(t, holder.Exec(
+		"SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(?, 0))",
+		database.WhatsAppIdentityReviewContactSelectorFenceKey(organizationID),
+	).Error)
+	return holder
+}
+
+func TestRetryableCampaignContactWriteIncludesWrappedSelectorContention(t *testing.T) {
+	assert.Equal(t, 6, campaignCanonicalContactAttempts)
+	assert.Equal(t, 25*time.Millisecond, campaignCanonicalContactInitialRetryDelay)
+	err := errors.Join(errors.New("wrapped campaign contact"), campaignContactSQLStateError("55P03"))
+	assert.True(t, retryableCampaignContactWrite(err))
+}
+
+func TestHandleRecipientSelectorFenceReleaseRetriesWithFreshTransaction(t *testing.T) {
+	w := testWorker(t)
+	organization, account, _, campaign, recipient := createTestCampaignData(t, w)
+	require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
+
+	existing := testutil.CreateTestContactWith(
+		t,
+		w.DB,
+		organization.ID,
+		testutil.WithPhoneNumber(recipient.PhoneNumber),
+	)
+	require.NoError(t, w.DB.Model(existing).Update("profile_name", "stale campaign profile").Error)
+	require.NoError(t, w.DB.Delete(existing).Error)
+
+	holder := holdCampaignContactSelectorFence(t, w.DB, organization.ID)
+	holderOpen := true
+	t.Cleanup(func() {
+		if holderOpen {
+			_ = holder.Rollback().Error
+		}
+	})
+
+	firstFailure := make(chan campaignContactAttempt, 1)
+	var firstFailureReported atomic.Bool
+	var attemptXIDs []string
+	w.getOrCreateCampaignContact = func(
+		tx *gorm.DB,
+		organizationID uuid.UUID,
+		phoneNumber, profileName string,
+	) (*models.Contact, bool, error) {
+		var xid string
+		if err := tx.Raw("SELECT pg_catalog.pg_current_xact_id()::text").Scan(&xid).Error; err != nil {
+			return nil, false, err
+		}
+		contact, created, err := contactutil.GetOrCreateContact(
+			tx,
+			organizationID,
+			phoneNumber,
+			profileName,
+		)
+		attemptXIDs = append(attemptXIDs, xid)
+		if err != nil && firstFailureReported.CompareAndSwap(false, true) {
+			firstFailure <- campaignContactAttempt{xid: xid, err: err}
+		}
+		return contact, created, err
+	}
+
+	var providerRequests atomic.Int32
+	providerVisibility := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		requestNumber := providerRequests.Add(1)
+		var visible models.Contact
+		err := w.DB.Where(
+			"organization_id = ? AND phone_number = ?",
+			organization.ID,
+			recipient.PhoneNumber,
+		).First(&visible).Error
+		if err == nil && visible.ID != existing.ID {
+			err = fmt.Errorf("provider observed contact %s; want restored contact %s", visible.ID, existing.ID)
+		}
+		if err == nil && visible.ProfileName != recipient.RecipientName {
+			err = fmt.Errorf("provider observed profile %q; want %q", visible.ProfileName, recipient.RecipientName)
+		}
+		if requestNumber == 1 {
+			providerVisibility <- err
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.selector-release"}},
+		})
+	}))
+	t.Cleanup(server.Close)
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- w.HandleRecipientJob(ctx, campaignRecipientJob(organization, campaign, recipient))
+	}()
+
+	var collision campaignContactAttempt
+	select {
+	case collision = <-firstFailure:
+	case <-ctx.Done():
+		t.Fatalf("campaign contact write did not reach the held selector fence: %v", ctx.Err())
+	}
+	require.Equal(t, "55P03", campaignContactErrorSQLState(collision.err))
+	var collisionPGError *pgconn.PgError
+	require.ErrorAs(t, collision.err, &collisionPGError)
+	require.Equal(t, "55P03", collisionPGError.Code)
+	require.NotEmpty(t, collision.xid)
+	assert.Zero(t, providerRequests.Load(), "provider must not run before the contact transaction commits")
+	require.NoError(t, holder.Rollback().Error)
+	holderOpen = false
+
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatalf("campaign contact retry did not finish after selector fence release: %v", ctx.Err())
+	}
+
+	require.GreaterOrEqual(t, len(attemptXIDs), 2)
+	assert.Equal(t, collision.xid, attemptXIDs[0])
+	assert.NotEqual(t, attemptXIDs[0], attemptXIDs[len(attemptXIDs)-1],
+		"selector retry must start a fresh PostgreSQL transaction")
+	assert.Equal(t, int32(1), providerRequests.Load())
+	select {
+	case visibilityErr := <-providerVisibility:
+		require.NoError(t, visibilityErr,
+			"provider must observe the restored contact committed with its new profile")
+	case <-ctx.Done():
+		t.Fatalf("provider did not report committed contact visibility: %v", ctx.Err())
+	}
+
+	var canonicalCount int64
+	require.NoError(t, w.DB.Unscoped().Model(&models.Contact{}).
+		Where("organization_id = ? AND phone_number = ? AND merged_into_id IS NULL",
+			organization.ID, recipient.PhoneNumber).
+		Count(&canonicalCount).Error)
+	assert.EqualValues(t, 1, canonicalCount)
+
+	var restored models.Contact
+	require.NoError(t, w.DB.First(&restored, existing.ID).Error)
+	assert.Equal(t, recipient.RecipientName, restored.ProfileName)
+	assert.False(t, restored.DeletedAt.Valid)
+
+	var storedRecipient models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusSent, storedRecipient.Status)
+	assert.Equal(t, "wamid.selector-release", storedRecipient.WhatsAppMessageID)
+}
+
+func TestHandleRecipientSelectorFenceExhaustionLeavesJobPending(t *testing.T) {
+	w := testWorker(t)
+	organization, account, _, campaign, recipient := createTestCampaignData(t, w)
+	require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
+
+	holder := holdCampaignContactSelectorFence(t, w.DB, organization.ID)
+	holderOpen := true
+	t.Cleanup(func() {
+		if holderOpen {
+			_ = holder.Rollback().Error
+		}
+	})
+
+	var attempts atomic.Int32
+	var attemptResults []campaignContactAttempt
+	w.getOrCreateCampaignContact = func(
+		tx *gorm.DB,
+		organizationID uuid.UUID,
+		phoneNumber, profileName string,
+	) (*models.Contact, bool, error) {
+		attempts.Add(1)
+		var xid string
+		if err := tx.Raw("SELECT pg_catalog.pg_current_xact_id()::text").Scan(&xid).Error; err != nil {
+			return nil, false, err
+		}
+		contact, created, err := contactutil.GetOrCreateContact(tx, organizationID, phoneNumber, profileName)
+		attemptResults = append(attemptResults, campaignContactAttempt{xid: xid, err: err})
+		return contact, created, err
+	}
+
+	var providerRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		providerRequests.Add(1)
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.must-not-send"}},
+		})
+	}))
+	t.Cleanup(server.Close)
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	handlerErr := w.HandleRecipientJob(ctx, campaignRecipientJob(organization, campaign, recipient))
+	require.Error(t, handlerErr)
+	assert.Equal(t, "55P03", campaignContactErrorSQLState(handlerErr))
+	assert.True(t, retryableCampaignContactWrite(handlerErr))
+	require.NoError(t, holder.Rollback().Error)
+	holderOpen = false
+
+	assert.Equal(t, int32(campaignCanonicalContactAttempts), attempts.Load())
+	require.Len(t, attemptResults, campaignCanonicalContactAttempts)
+	xids := make(map[string]bool, campaignCanonicalContactAttempts)
+	for _, attempt := range attemptResults {
+		var pgError *pgconn.PgError
+		require.ErrorAs(t, attempt.err, &pgError)
+		assert.Equal(t, "55P03", pgError.Code)
+		require.NotEmpty(t, attempt.xid)
+		assert.False(t, xids[attempt.xid], "each retry must use a distinct top-level transaction")
+		xids[attempt.xid] = true
+	}
+	assert.Zero(t, providerRequests.Load(), "provider must not run while contact selection is fenced")
+
+	var storedRecipient models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusPending, storedRecipient.Status)
+	assert.Nil(t, storedRecipient.MessageID)
+	assert.Empty(t, storedRecipient.ErrorMessage)
+	assert.Nil(t, storedRecipient.SentAt)
+	var storedCampaign models.BulkMessageCampaign
+	require.NoError(t, w.DB.First(&storedCampaign, campaign.ID).Error)
+	assert.Zero(t, storedCampaign.FailedCount)
+	assert.Zero(t, storedCampaign.SentCount)
+
+	var contactCount int64
+	require.NoError(t, w.DB.Unscoped().Model(&models.Contact{}).
+		Where("organization_id = ? AND phone_number = ?", organization.ID, recipient.PhoneNumber).
+		Count(&contactCount).Error)
+	assert.Zero(t, contactCount, "every failed insert attempt must roll back")
+}
+
+func (h *campaignStatsCaptureHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h *campaignStatsCaptureHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		args := cmd.Args()
+		if cmd.Name() != "publish" || len(args) != 3 || args[1] != queue.CampaignStatsChannel {
+			return next(ctx, cmd)
+		}
+		payload, ok := args[2].([]byte)
+		if !ok {
+			return errors.New("campaign stats payload is not bytes")
+		}
+		h.payloads <- append([]byte(nil), payload...)
+		cmd.SetErr(nil)
+		return nil
+	}
+}
+
+func (h *campaignStatsCaptureHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
 
 func testWorker(t *testing.T) *Worker {
 	t.Helper()
@@ -207,12 +516,14 @@ func createTestCampaignData(t *testing.T, w *Worker) (*models.Organization, *mod
 	require.NoError(t, w.DB.Create(template).Error)
 
 	// Create campaign with CreatedBy
+	startedAt := time.Now().UTC()
 	campaign := &models.BulkMessageCampaign{
 		OrganizationID:  org.ID,
 		Name:            "Test Campaign " + uniqueID,
 		WhatsAppAccount: accountName,
 		TemplateID:      template.ID,
 		Status:          models.CampaignStatusProcessing,
+		StartedAt:       &startedAt,
 		TotalRecipients: 1,
 		CreatedBy:       user.ID,
 	}
@@ -237,6 +548,42 @@ func createTestCampaignData(t *testing.T, w *Worker) (*models.Organization, *mod
 	return org, account, template, campaign, recipient
 }
 
+func TestCampaignJobHasCurrentGeneration(t *testing.T) {
+	startedAt := time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC)
+	currentCampaign := &models.BulkMessageCampaign{
+		Status:    models.CampaignStatusProcessing,
+		StartedAt: &startedAt,
+	}
+
+	for _, tc := range []struct {
+		name     string
+		campaign *models.BulkMessageCampaign
+		job      *queue.RecipientJob
+		want     bool
+	}{
+		{
+			name:     "zero job generation fails closed",
+			campaign: currentCampaign,
+			job:      &queue.RecipientJob{},
+		},
+		{
+			name:     "stale job generation fails closed",
+			campaign: currentCampaign,
+			job:      &queue.RecipientJob{EnqueuedAt: startedAt.Add(-time.Nanosecond)},
+		},
+		{
+			name:     "current job generation proceeds",
+			campaign: currentCampaign,
+			job:      &queue.RecipientJob{EnqueuedAt: startedAt},
+			want:     true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, campaignJobHasCurrentGeneration(tc.campaign, tc.job))
+		})
+	}
+}
+
 func TestWorker_HandleRecipientJob_CampaignPaused(t *testing.T) {
 	w := testWorker(t)
 	org, _, _, campaign, recipient := createTestCampaignData(t, w)
@@ -250,6 +597,7 @@ func TestWorker_HandleRecipientJob_CampaignPaused(t *testing.T) {
 		OrganizationID: org.ID,
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 
 	err := w.HandleRecipientJob(context.Background(), job)
@@ -274,6 +622,7 @@ func TestWorker_HandleRecipientJob_CampaignCancelled(t *testing.T) {
 		OrganizationID: org.ID,
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 
 	err := w.HandleRecipientJob(context.Background(), job)
@@ -299,6 +648,7 @@ func TestWorker_HandleRecipientJob_AccountNotFound(t *testing.T) {
 		OrganizationID: org.ID,
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 
 	err := w.HandleRecipientJob(context.Background(), job)
@@ -311,6 +661,53 @@ func TestWorker_HandleRecipientJob_AccountNotFound(t *testing.T) {
 	assert.Contains(t, updatedRecipient.ErrorMessage, "WhatsApp account not found")
 }
 
+func TestWorker_HandleRecipientJob_DisconnectedAccountDoesNotCallGraph(t *testing.T) {
+	w := testWorker(t)
+	org, account, _, campaign, recipient := createTestCampaignData(t, w)
+	require.NoError(t, w.DB.Model(&models.WhatsAppAccount{}).
+		Where("id = ? AND organization_id = ?", account.ID, org.ID).
+		Update("status", "disconnected").Error)
+
+	var providerRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		providerRequests.Add(1)
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.must-not-send"}},
+		})
+	}))
+	defer server.Close()
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	job := &queue.RecipientJob{
+		CampaignID:     campaign.ID,
+		RecipientID:    recipient.ID,
+		OrganizationID: org.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		RecipientName:  recipient.RecipientName,
+		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
+	}
+	require.NoError(t, w.HandleRecipientJob(context.Background(), job))
+	assert.Zero(t, providerRequests.Load(), "a disconnected account must make zero Graph requests")
+
+	var storedRecipient models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusFailed, storedRecipient.Status)
+	assert.Equal(t, whatsappaccount.ErrOutboundInactive.Error(), storedRecipient.ErrorMessage)
+
+	var storedCampaign models.BulkMessageCampaign
+	require.NoError(t, w.DB.First(&storedCampaign, campaign.ID).Error)
+	assert.Equal(t, 1, storedCampaign.FailedCount)
+	assert.Zero(t, storedCampaign.SentCount)
+
+	var messageCount int64
+	require.NoError(t, w.DB.Model(&models.Message{}).
+		Where("organization_id = ?", org.ID).
+		Count(&messageCount).Error)
+	assert.Zero(t, messageCount)
+}
+
 func TestWorker_HandleRecipientJob_CampaignNotFound(t *testing.T) {
 	w := testWorker(t)
 
@@ -320,6 +717,7 @@ func TestWorker_HandleRecipientJob_CampaignNotFound(t *testing.T) {
 		OrganizationID: uuid.New(),
 		PhoneNumber:    "1234567890",
 		RecipientName:  "Test",
+		EnqueuedAt:     time.Now().UTC(),
 	}
 
 	err := w.HandleRecipientJob(context.Background(), job)
@@ -339,6 +737,7 @@ func TestWorker_HandleRecipientJob_RejectsCrossTenantCampaignJob(t *testing.T) {
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
 		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 
 	err := w.HandleRecipientJob(context.Background(), job)
@@ -508,7 +907,10 @@ func TestWorker_checkCampaignCompletion_CompletesWhenAllProcessed(t *testing.T) 
 	require.NoError(t, w.DB.Create(recipient2).Error)
 
 	// Check completion - should complete since no pending recipients
-	w.checkCampaignCompletion(context.Background(), campaign.ID, org.ID)
+	update, err := w.checkCampaignCompletion(context.Background(), campaign.ID, org.ID)
+	require.NoError(t, err)
+	require.NotNil(t, update)
+	assert.Equal(t, models.CampaignStatusCompleted, update.Status)
 
 	var updated models.BulkMessageCampaign
 	require.NoError(t, w.DB.First(&updated, campaign.ID).Error)
@@ -543,7 +945,10 @@ func TestWorker_checkCampaignCompletion_DoesNotCompleteWithPending(t *testing.T)
 	require.NoError(t, w.DB.Create(recipient2).Error)
 
 	// Check completion - should NOT complete since there's a pending recipient
-	w.checkCampaignCompletion(context.Background(), campaign.ID, org.ID)
+	update, err := w.checkCampaignCompletion(context.Background(), campaign.ID, org.ID)
+	require.NoError(t, err)
+	require.NotNil(t, update)
+	assert.Equal(t, models.CampaignStatusProcessing, update.Status)
 
 	var updated models.BulkMessageCampaign
 	require.NoError(t, w.DB.First(&updated, campaign.ID).Error)
@@ -558,11 +963,159 @@ func TestWorker_checkCampaignCompletion_NotProcessingStatus(t *testing.T) {
 	org, _, _, campaign := createMinimalCampaignData(t, w, models.CampaignStatusPaused)
 
 	// Should not change status since it's not models.CampaignStatusProcessing
-	w.checkCampaignCompletion(context.Background(), campaign.ID, org.ID)
+	update, err := w.checkCampaignCompletion(context.Background(), campaign.ID, org.ID)
+	require.NoError(t, err)
+	assert.Nil(t, update)
 
 	var updated models.BulkMessageCampaign
 	require.NoError(t, w.DB.First(&updated, campaign.ID).Error)
 	assert.Equal(t, models.CampaignStatusPaused, updated.Status)
+}
+
+func TestWorkerCampaignStatsPublishOnlyAfterRecipientTransactionCommits(t *testing.T) {
+	w := testWorker(t)
+	organization, _, _, campaign := createMinimalCampaignData(t, w, models.CampaignStatusProcessing)
+	require.NoError(t, w.DB.Model(campaign).Updates(map[string]any{
+		"total_recipients": 1,
+		"sent_count":       1,
+	}).Error)
+
+	capture := &campaignStatsCaptureHook{payloads: make(chan []byte, 2)}
+	redisClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	redisClient.AddHook(capture)
+	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+	w.Publisher = queue.NewPublisher(redisClient, w.Log)
+
+	forcedRollback := errors.New("force recipient finalization rollback")
+	err := w.withRecipientTenantTransactionAndCampaignStats(
+		context.Background(),
+		organization.ID,
+		func(tx *gorm.DB) (*queue.CampaignStatsUpdate, error) {
+			scoped := *w
+			scoped.DB = tx
+			update, completionErr := scoped.checkCampaignCompletion(context.Background(), campaign.ID, organization.ID)
+			require.NoError(t, completionErr)
+			require.NotNil(t, update)
+			select {
+			case payload := <-capture.payloads:
+				t.Fatalf("campaign stats published before rollback: %s", payload)
+			default:
+			}
+			return update, forcedRollback
+		},
+	)
+	require.ErrorIs(t, err, forcedRollback)
+	select {
+	case payload := <-capture.payloads:
+		t.Fatalf("rolled-back campaign stats were published: %s", payload)
+	default:
+	}
+
+	var rolledBack models.BulkMessageCampaign
+	require.NoError(t, w.DB.First(&rolledBack, campaign.ID).Error)
+	assert.Equal(t, models.CampaignStatusProcessing, rolledBack.Status)
+	assert.Nil(t, rolledBack.CompletedAt)
+
+	err = w.withRecipientTenantTransactionAndCampaignStats(
+		context.Background(),
+		organization.ID,
+		func(tx *gorm.DB) (*queue.CampaignStatsUpdate, error) {
+			scoped := *w
+			scoped.DB = tx
+			update, completionErr := scoped.checkCampaignCompletion(context.Background(), campaign.ID, organization.ID)
+			require.NoError(t, completionErr)
+			require.NotNil(t, update)
+			select {
+			case payload := <-capture.payloads:
+				t.Fatalf("campaign stats published before commit: %s", payload)
+			default:
+			}
+			return update, nil
+		},
+	)
+	require.NoError(t, err)
+
+	select {
+	case payload := <-capture.payloads:
+		var update queue.CampaignStatsUpdate
+		require.NoError(t, json.Unmarshal(payload, &update))
+		assert.Equal(t, campaign.ID.String(), update.CampaignID)
+		assert.Equal(t, organization.ID, update.OrganizationID)
+		assert.Equal(t, models.CampaignStatusCompleted, update.Status)
+		assert.Equal(t, 1, update.SentCount)
+	default:
+		t.Fatal("committed campaign stats were not published")
+	}
+
+	var committed models.BulkMessageCampaign
+	require.NoError(t, w.DB.First(&committed, campaign.ID).Error)
+	assert.Equal(t, models.CampaignStatusCompleted, committed.Status)
+	assert.NotNil(t, committed.CompletedAt)
+}
+
+func TestWorkerCampaignCompletionErrorsRollbackWithoutPublication(t *testing.T) {
+	for _, stage := range []string{"count", "conditional update", "reload"} {
+		t.Run(stage, func(t *testing.T) {
+			w := testWorker(t)
+			organization, _, _, campaign := createMinimalCampaignData(t, w, models.CampaignStatusProcessing)
+			capture := &campaignStatsCaptureHook{payloads: make(chan []byte, 1)}
+			redisClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+			redisClient.AddHook(capture)
+			t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+			w.Publisher = queue.NewPublisher(redisClient, w.Log)
+
+			forced := errors.New("forced campaign completion " + stage + " failure")
+			callbackName := "test:campaign_completion_" + strings.ReplaceAll(stage, " ", "_") + ":" + uuid.NewString()
+			var campaignQueries atomic.Int32
+			var removeCallback func() error
+			switch stage {
+			case "count":
+				require.NoError(t, w.DB.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+					if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "bulk_message_recipients" {
+						_ = tx.AddError(forced)
+					}
+				}))
+				removeCallback = func() error { return w.DB.Callback().Query().Remove(callbackName) }
+			case "conditional update":
+				require.NoError(t, w.DB.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+					if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "bulk_message_campaigns" {
+						_ = tx.AddError(forced)
+					}
+				}))
+				removeCallback = func() error { return w.DB.Callback().Update().Remove(callbackName) }
+			case "reload":
+				require.NoError(t, w.DB.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+					if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "bulk_message_campaigns" &&
+						campaignQueries.Add(1) == 2 {
+						_ = tx.AddError(forced)
+					}
+				}))
+				removeCallback = func() error { return w.DB.Callback().Query().Remove(callbackName) }
+			}
+
+			err := w.withRecipientTenantTransactionAndCampaignStats(
+				context.Background(),
+				organization.ID,
+				func(tx *gorm.DB) (*queue.CampaignStatsUpdate, error) {
+					scoped := *w
+					scoped.DB = tx
+					return scoped.checkCampaignCompletion(context.Background(), campaign.ID, organization.ID)
+				},
+			)
+			require.NoError(t, removeCallback())
+			require.ErrorIs(t, err, forced)
+			select {
+			case payload := <-capture.payloads:
+				t.Fatalf("failed campaign completion published stats: %s", payload)
+			default:
+			}
+
+			var stored models.BulkMessageCampaign
+			require.NoError(t, w.DB.First(&stored, campaign.ID).Error)
+			assert.Equal(t, models.CampaignStatusProcessing, stored.Status)
+			assert.Nil(t, stored.CompletedAt)
+		})
+	}
 }
 
 func TestWorker_sendTemplateMessage_BuildsComponents(t *testing.T) {
@@ -810,6 +1363,7 @@ func TestWorker_HandleRecipientJob_Success(t *testing.T) {
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
 		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 
 	err := w.HandleRecipientJob(context.Background(), job)
@@ -832,6 +1386,462 @@ func TestWorker_HandleRecipientJob_Success(t *testing.T) {
 	assert.Equal(t, models.MessageStatusSent, message.Status)
 	assert.Equal(t, models.DirectionOutgoing, message.Direction)
 	assert.Equal(t, models.MessageTypeTemplate, message.MessageType)
+}
+
+func TestWorker_HandleRecipientJob_RepairsMirrorBeforeProviderAttempt(t *testing.T) {
+	w := testWorker(t)
+	organization, account, template, campaign, recipient := createTestCampaignData(t, w)
+	require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
+
+	var providerRequests atomic.Int32
+	mirrorVisibility := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		providerRequests.Add(1)
+		// This query runs through the root DB while the provider transaction owns
+		// its connection. It can observe the link only if the mirror committed in
+		// the preceding independent transaction.
+		var visible models.Message
+		visibilityErr := w.DB.Select("id", "inbox_conversation_id").
+			Where("organization_id = ? AND template_name = ?", organization.ID, template.Name).
+			First(&visible).Error
+		if visibilityErr == nil && visible.InboxConversationID == nil {
+			visibilityErr = errors.New("provider observed an uncommitted campaign inbox mirror")
+		}
+		mirrorVisibility <- visibilityErr
+		if visibilityErr != nil {
+			http.Error(rw, "mirror not committed", http.StatusConflict)
+			return
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.mirror-repair"}},
+		})
+	}))
+	defer server.Close()
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	forcedMirrorFailure := errors.New("forced pre-provider mirror failure")
+	var rejectMirror atomic.Bool
+	rejectMirror.Store(true)
+	callbackName := "test:reject_campaign_pre_provider_mirror:" + uuid.NewString()
+	require.NoError(t, w.DB.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if rejectMirror.Load() && tx.Statement.Schema != nil && tx.Statement.Schema.Table == "channel_accounts" {
+			_ = tx.AddError(forcedMirrorFailure)
+		}
+	}))
+	t.Cleanup(func() { _ = w.DB.Callback().Create().Remove(callbackName) })
+
+	job := &queue.RecipientJob{
+		CampaignID:     campaign.ID,
+		RecipientID:    recipient.ID,
+		OrganizationID: organization.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		RecipientName:  recipient.RecipientName,
+		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
+	}
+	err := w.HandleRecipientJob(context.Background(), job)
+	require.ErrorIs(t, err, forcedMirrorFailure)
+	assert.Zero(t, providerRequests.Load(), "Graph must not run when the inbox mirror fails")
+
+	var released models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&released, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusPending, released.Status)
+	assert.Nil(t, released.MessageID)
+	var abandoned int64
+	require.NoError(t, w.DB.Unscoped().Model(&models.Message{}).
+		Where("organization_id = ? AND template_name = ?", organization.ID, template.Name).
+		Count(&abandoned).Error)
+	assert.Zero(t, abandoned)
+
+	rejectMirror.Store(false)
+	require.NoError(t, w.HandleRecipientJob(context.Background(), job))
+	assert.Equal(t, int32(1), providerRequests.Load())
+	require.NoError(t, <-mirrorVisibility)
+
+	var message models.Message
+	require.NoError(t, w.DB.Where(
+		"organization_id = ? AND template_name = ?",
+		organization.ID,
+		template.Name,
+	).First(&message).Error)
+	assert.Equal(t, models.MessageStatusSent, message.Status)
+	assert.Equal(t, "wamid.mirror-repair", message.WhatsAppMessageID)
+	assert.NotNil(t, message.InboxConversationID)
+}
+
+func TestWorker_MirrorPreparedCampaignDelivery_ReleasesClaimAfterCallerCancellation(t *testing.T) {
+	w := testWorker(t)
+	organization, account, template, campaign, recipient := createTestCampaignData(t, w)
+	contact := &models.Contact{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  organization.ID,
+		PhoneNumber:     recipient.PhoneNumber,
+		ProfileName:     recipient.RecipientName,
+		WhatsAppAccount: account.Name,
+	}
+	require.NoError(t, w.DB.Create(contact).Error)
+	job := &queue.RecipientJob{
+		CampaignID:     campaign.ID,
+		RecipientID:    recipient.ID,
+		OrganizationID: organization.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		RecipientName:  recipient.RecipientName,
+		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
+	}
+	prepared, err := w.prepareCampaignRecipient(context.Background(), job, campaign, contact.ID)
+	require.NoError(t, err)
+	require.NotNil(t, prepared.message)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	prepared, err = w.mirrorPreparedCampaignDelivery(cancelled, job, account, prepared)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, prepared.message)
+
+	var storedRecipient models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusPending, storedRecipient.Status)
+	assert.Nil(t, storedRecipient.MessageID)
+	var messageCount int64
+	require.NoError(t, w.DB.Unscoped().Model(&models.Message{}).
+		Where("organization_id = ? AND template_name = ?", organization.ID, template.Name).
+		Count(&messageCount).Error)
+	assert.Zero(t, messageCount)
+}
+
+func TestWorker_AttemptPreparedCampaignDelivery_RecoversAfterCallerCancellation(t *testing.T) {
+	w := testWorker(t)
+	organization, account, _, campaign, recipient := createTestCampaignData(t, w)
+	require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
+	contact := &models.Contact{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  organization.ID,
+		PhoneNumber:     recipient.PhoneNumber,
+		ProfileName:     recipient.RecipientName,
+		WhatsAppAccount: account.Name,
+	}
+	require.NoError(t, w.DB.Create(contact).Error)
+	job := &queue.RecipientJob{
+		CampaignID:     campaign.ID,
+		RecipientID:    recipient.ID,
+		OrganizationID: organization.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		RecipientName:  recipient.RecipientName,
+		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
+	}
+	prepared, err := w.prepareCampaignRecipient(context.Background(), job, campaign, contact.ID)
+	require.NoError(t, err)
+	prepared, err = w.mirrorPreparedCampaignDelivery(context.Background(), job, account, prepared)
+	require.NoError(t, err)
+
+	var providerRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		providerRequests.Add(1)
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.cancelled-settlement"}},
+		})
+	}))
+	defer server.Close()
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	forcedOuterFailure := errors.New("forced post-provider transaction failure")
+	var failSettlement atomic.Bool
+	failSettlement.Store(true)
+	callbackName := "test:cancel_post_provider_settlement:" + uuid.NewString()
+	require.NoError(t, w.DB.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "messages" &&
+			failSettlement.CompareAndSwap(true, false) {
+			cancel()
+			_ = tx.AddError(forcedOuterFailure)
+		}
+	}))
+	t.Cleanup(func() { _ = w.DB.Callback().Update().Remove(callbackName) })
+
+	delivery, err := w.attemptPreparedCampaignDelivery(
+		ctx,
+		job,
+		campaign,
+		account,
+		contact.ID,
+		prepared,
+	)
+	require.NoError(t, err)
+	require.NoError(t, delivery.sendErr)
+	require.NotNil(t, delivery.message)
+	assert.Equal(t, "wamid.cancelled-settlement", delivery.message.WhatsAppMessageID)
+	assert.Equal(t, int32(1), providerRequests.Load())
+
+	var storedRecipient models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusSent, storedRecipient.Status)
+	assert.Equal(t, "wamid.cancelled-settlement", storedRecipient.WhatsAppMessageID)
+	var storedCampaign models.BulkMessageCampaign
+	require.NoError(t, w.DB.First(&storedCampaign, campaign.ID).Error)
+	assert.Equal(t, 1, storedCampaign.SentCount)
+	assert.Zero(t, storedCampaign.FailedCount)
+}
+
+func TestWorker_AttemptPreparedCampaignDelivery_DisconnectedAccountDoesNotCallGraph(t *testing.T) {
+	w := testWorker(t)
+	org, account, _, campaign, recipient := createTestCampaignData(t, w)
+	contact := &models.Contact{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		PhoneNumber:     recipient.PhoneNumber,
+		ProfileName:     recipient.RecipientName,
+		WhatsAppAccount: account.Name,
+	}
+	require.NoError(t, w.DB.Create(contact).Error)
+
+	job := &queue.RecipientJob{
+		CampaignID:     campaign.ID,
+		RecipientID:    recipient.ID,
+		OrganizationID: org.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		RecipientName:  recipient.RecipientName,
+		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
+	}
+	prepared, err := w.prepareCampaignRecipient(
+		context.Background(),
+		job,
+		campaign,
+		contact.ID,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, prepared.message)
+	prepared, err = w.mirrorPreparedCampaignDelivery(context.Background(), job, account, prepared)
+	require.NoError(t, err)
+	require.NotEqual(t, uuid.Nil, prepared.mirrorConversationID)
+
+	// Simulate an offboarding/reconnect lifecycle event after the durable mirror
+	// but before the provider phase starts.
+	require.NoError(t, w.DB.Model(&models.WhatsAppAccount{}).
+		Where("id = ? AND organization_id = ?", account.ID, org.ID).
+		Update("status", "disconnected").Error)
+
+	var providerRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		providerRequests.Add(1)
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.must-not-send"}},
+		})
+	}))
+	defer server.Close()
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	delivery, err := w.attemptPreparedCampaignDelivery(
+		context.Background(),
+		job,
+		campaign,
+		account,
+		contact.ID,
+		prepared,
+	)
+	require.NoError(t, err)
+	require.ErrorIs(t, delivery.sendErr, whatsappaccount.ErrOutboundInactive)
+	assert.Zero(t, providerRequests.Load(), "a disconnected account must make zero Graph requests")
+
+	var storedMessage models.Message
+	require.NoError(t, w.DB.First(&storedMessage, prepared.message.ID).Error)
+	assert.Equal(t, models.MessageStatusFailed, storedMessage.Status)
+	assert.Equal(t, whatsappaccount.ErrOutboundInactive.Error(), storedMessage.ErrorMessage)
+
+	var storedRecipient models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusFailed, storedRecipient.Status)
+	assert.Equal(t, whatsappaccount.ErrOutboundInactive.Error(), storedRecipient.ErrorMessage)
+
+	var storedCampaign models.BulkMessageCampaign
+	require.NoError(t, w.DB.First(&storedCampaign, campaign.ID).Error)
+	assert.Equal(t, 1, storedCampaign.FailedCount)
+	assert.Zero(t, storedCampaign.SentCount)
+}
+
+func TestWorker_AttemptPreparedCampaignDelivery_UsesCredentialFromFinalLockedRow(t *testing.T) {
+	w := testWorker(t)
+	org, account, _, campaign, recipient := createTestCampaignData(t, w)
+	contact := &models.Contact{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		PhoneNumber:     recipient.PhoneNumber,
+		ProfileName:     recipient.RecipientName,
+		WhatsAppAccount: account.Name,
+	}
+	require.NoError(t, w.DB.Create(contact).Error)
+
+	job := &queue.RecipientJob{
+		CampaignID:     campaign.ID,
+		RecipientID:    recipient.ID,
+		OrganizationID: org.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		RecipientName:  recipient.RecipientName,
+		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
+	}
+	prepared, err := w.prepareCampaignRecipient(
+		context.Background(),
+		job,
+		campaign,
+		contact.ID,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, prepared.message)
+	prepared, err = w.mirrorPreparedCampaignDelivery(context.Background(), job, account, prepared)
+	require.NoError(t, err)
+	require.NotEqual(t, uuid.Nil, prepared.mirrorConversationID)
+
+	// The worker's earlier projection is stale, while the locked database row
+	// contains the credential generation established by Embedded Signup.
+	account.AccessToken = "superseded-token"
+	observedAuthorization := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		observedAuthorization <- r.Header.Get("Authorization")
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.current-credential"}},
+		})
+	}))
+	defer server.Close()
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	delivery, err := w.attemptPreparedCampaignDelivery(
+		context.Background(),
+		job,
+		campaign,
+		account,
+		contact.ID,
+		prepared,
+	)
+	require.NoError(t, err)
+	require.NoError(t, delivery.sendErr)
+	assert.Equal(t, "Bearer test-token", <-observedAuthorization)
+}
+
+func TestWorker_AttemptPreparedCampaignDelivery_SerializesPauseAndCancel(t *testing.T) {
+	for _, status := range []models.CampaignStatus{
+		models.CampaignStatusPaused,
+		models.CampaignStatusCancelled,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			w := testWorker(t)
+			organization, account, _, campaign, recipient := createTestCampaignData(t, w)
+			require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
+			contact := &models.Contact{
+				BaseModel:       models.BaseModel{ID: uuid.New()},
+				OrganizationID:  organization.ID,
+				PhoneNumber:     recipient.PhoneNumber,
+				ProfileName:     recipient.RecipientName,
+				WhatsAppAccount: account.Name,
+			}
+			require.NoError(t, w.DB.Create(contact).Error)
+			job := &queue.RecipientJob{
+				CampaignID:     campaign.ID,
+				RecipientID:    recipient.ID,
+				OrganizationID: organization.ID,
+				PhoneNumber:    recipient.PhoneNumber,
+				RecipientName:  recipient.RecipientName,
+				TemplateParams: recipient.TemplateParams,
+				EnqueuedAt:     campaign.StartedAt.UTC(),
+			}
+			prepared, err := w.prepareCampaignRecipient(
+				context.Background(),
+				job,
+				campaign,
+				contact.ID,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, prepared.message)
+			prepared, err = w.mirrorPreparedCampaignDelivery(context.Background(), job, account, prepared)
+			require.NoError(t, err)
+			require.NotEqual(t, uuid.Nil, prepared.mirrorConversationID)
+
+			var providerRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+				providerRequests.Add(1)
+				rw.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(rw).Encode(map[string]any{
+					"messages": []map[string]any{{"id": "wamid.must-not-send"}},
+				})
+			}))
+			defer server.Close()
+			w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+			statusTx := w.DB.Begin()
+			require.NoError(t, statusTx.Error)
+			t.Cleanup(func() { _ = statusTx.Rollback().Error })
+			require.NoError(t, statusTx.Model(&models.BulkMessageCampaign{}).
+				Where("id = ? AND organization_id = ?", campaign.ID, organization.ID).
+				Update("status", status).Error)
+
+			type attemptResult struct {
+				delivery campaignRecipientDelivery
+				err      error
+			}
+			result := make(chan attemptResult, 1)
+			go func() {
+				delivery, attemptErr := w.attemptPreparedCampaignDelivery(
+					context.Background(),
+					job,
+					campaign,
+					account,
+					contact.ID,
+					prepared,
+				)
+				result <- attemptResult{delivery: delivery, err: attemptErr}
+			}()
+
+			select {
+			case attempt := <-result:
+				t.Fatalf("provider phase bypassed pending %s commit: %#v", status, attempt)
+			case <-time.After(75 * time.Millisecond):
+			}
+			assert.Zero(t, providerRequests.Load())
+			require.NoError(t, statusTx.Commit().Error)
+
+			select {
+			case attempt := <-result:
+				require.NoError(t, attempt.err)
+				assert.True(t, attempt.delivery.campaignInactive)
+				require.NotNil(t, attempt.delivery.message)
+				assert.Equal(t, models.MessageStatusFailed, attempt.delivery.message.Status)
+				assert.Equal(t, campaignInactiveBeforeDeliveryMessage, attempt.delivery.message.ErrorMessage)
+				assert.Equal(t, prepared.mirrorConversationID, *attempt.delivery.message.InboxConversationID)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("provider phase did not observe committed %s status", status)
+			}
+			assert.Zero(t, providerRequests.Load(), "inactive campaign must make zero Graph requests")
+
+			var storedRecipient models.BulkMessageRecipient
+			require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+			assert.Equal(t, models.MessageStatusFailed, storedRecipient.Status)
+			require.NotNil(t, storedRecipient.MessageID)
+			assert.Equal(t, prepared.message.ID, *storedRecipient.MessageID)
+			assert.Equal(t, campaignInactiveBeforeDeliveryMessage, storedRecipient.ErrorMessage)
+
+			var storedMessage models.Message
+			require.NoError(t, w.DB.First(&storedMessage, prepared.message.ID).Error)
+			assert.Equal(t, models.MessageStatusFailed, storedMessage.Status)
+			require.NotNil(t, storedMessage.InboxConversationID)
+			assert.Equal(t, prepared.mirrorConversationID, *storedMessage.InboxConversationID)
+			var linkedMessages int64
+			require.NoError(t, w.DB.Model(&models.Message{}).
+				Where("organization_id = ? AND inbox_conversation_id = ?", organization.ID, prepared.mirrorConversationID).
+				Count(&linkedMessages).Error)
+			assert.Equal(t, int64(1), linkedMessages, "terminal mirror must retain its exact message")
+
+			var storedCampaign models.BulkMessageCampaign
+			require.NoError(t, w.DB.First(&storedCampaign, campaign.ID).Error)
+			assert.Equal(t, 1, storedCampaign.FailedCount)
+			assert.Zero(t, storedCampaign.SentCount)
+		})
+	}
 }
 
 func startPendingWorkerContactMerge(
@@ -903,6 +1913,7 @@ func TestWorker_HandleRecipientJob_WaitsForMergeAndHonorsCanonicalMarketingOptOu
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
 		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 	result := make(chan error, 1)
 	go func() {
@@ -965,6 +1976,7 @@ func TestWorker_HandleRecipientJob_DeadLettersUnresolvedClaimWithoutResend(t *te
 			PhoneNumber:    recipient.PhoneNumber,
 			RecipientName:  recipient.RecipientName,
 			TemplateParams: recipient.TemplateParams,
+			EnqueuedAt:     campaign.StartedAt.UTC(),
 		},
 		campaign,
 		contact.ID,
@@ -991,6 +2003,7 @@ func TestWorker_HandleRecipientJob_DeadLettersUnresolvedClaimWithoutResend(t *te
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
 		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 	require.NoError(t, w.HandleRecipientJob(context.Background(), job))
 	assert.Zero(t, providerRequests.Load())
@@ -1058,6 +2071,7 @@ func TestWorker_HandleRecipientJob_WaitsForMergeAndPersistsCanonicalMessage(t *t
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
 		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 	result := make(chan error, 1)
 	go func() {
@@ -1156,6 +2170,7 @@ func TestWorker_HandleRecipientJob_WhatsAppError(t *testing.T) {
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
 		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 
 	err := w.HandleRecipientJob(context.Background(), job)
@@ -1171,6 +2186,91 @@ func TestWorker_HandleRecipientJob_WhatsAppError(t *testing.T) {
 	var updatedCampaign models.BulkMessageCampaign
 	require.NoError(t, w.DB.First(&updatedCampaign, campaign.ID).Error)
 	assert.Equal(t, 1, updatedCampaign.FailedCount)
+}
+
+func TestCampaignAmbiguousDeliveryErrorPreservesDurableMessage(t *testing.T) {
+	const want = "Provider delivery outcome is unknown; message was not retried to prevent a duplicate"
+	assert.Equal(t, want, campaignAmbiguousDeliveryMessage)
+	assert.EqualError(t, campaignAmbiguousDeliveryError{}, want)
+}
+
+func TestWorker_HandleRecipientJob_AmbiguousProviderResultNeverCountsSent(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		configure        func(*testing.T, *Worker, *atomic.Int32)
+		wantProviderCall int32
+	}{
+		{
+			name: "blank provider message ID",
+			configure: func(t *testing.T, w *Worker, requests *atomic.Int32) {
+				server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+					requests.Add(1)
+					rw.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(rw).Encode(map[string]any{
+						"messages": []map[string]any{{"id": "   "}},
+					})
+				}))
+				t.Cleanup(server.Close)
+				w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+			},
+			wantProviderCall: 1,
+		},
+		{
+			name: "provider panic",
+			configure: func(_ *testing.T, w *Worker, _ *atomic.Int32) {
+				w.WhatsApp = nil
+			},
+			wantProviderCall: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := testWorker(t)
+			organization, account, _, campaign, recipient := createTestCampaignData(t, w)
+			require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
+			var providerRequests atomic.Int32
+			tc.configure(t, w, &providerRequests)
+
+			job := &queue.RecipientJob{
+				CampaignID:     campaign.ID,
+				RecipientID:    recipient.ID,
+				OrganizationID: organization.ID,
+				PhoneNumber:    recipient.PhoneNumber,
+				RecipientName:  recipient.RecipientName,
+				TemplateParams: recipient.TemplateParams,
+				EnqueuedAt:     campaign.StartedAt.UTC(),
+			}
+			require.NotPanics(t, func() {
+				require.NoError(t, w.HandleRecipientJob(context.Background(), job))
+			})
+
+			var storedRecipient models.BulkMessageRecipient
+			require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+			assert.Equal(t, models.MessageStatusFailed, storedRecipient.Status)
+			assert.Empty(t, storedRecipient.WhatsAppMessageID)
+			assert.Equal(t, campaignAmbiguousDeliveryMessage, storedRecipient.ErrorMessage)
+			require.NotNil(t, storedRecipient.MessageID)
+
+			var storedMessage models.Message
+			require.NoError(t, w.DB.First(&storedMessage, *storedRecipient.MessageID).Error)
+			assert.Equal(t, models.MessageStatusFailed, storedMessage.Status)
+			assert.Empty(t, storedMessage.WhatsAppMessageID)
+			assert.Equal(t, campaignAmbiguousDeliveryMessage, storedMessage.ErrorMessage)
+			assert.NotNil(t, storedMessage.InboxConversationID)
+
+			var storedCampaign models.BulkMessageCampaign
+			require.NoError(t, w.DB.First(&storedCampaign, campaign.ID).Error)
+			assert.Zero(t, storedCampaign.SentCount)
+			assert.Equal(t, 1, storedCampaign.FailedCount)
+			assert.Equal(t, tc.wantProviderCall, providerRequests.Load())
+
+			// The durable terminal settlement is the no-resend fence.
+			require.NoError(t, w.HandleRecipientJob(context.Background(), job))
+			assert.Equal(t, tc.wantProviderCall, providerRequests.Load())
+			require.NoError(t, w.DB.First(&storedCampaign, campaign.ID).Error)
+			assert.Zero(t, storedCampaign.SentCount)
+			assert.Equal(t, 1, storedCampaign.FailedCount)
+		})
+	}
 }
 
 func TestWorker_HandleRecipientJob_CreatesContact(t *testing.T) {
@@ -1200,6 +2300,7 @@ func TestWorker_HandleRecipientJob_CreatesContact(t *testing.T) {
 		PhoneNumber:    newPhone,
 		RecipientName:  "New Contact",
 		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 
 	err := w.HandleRecipientJob(context.Background(), job)
@@ -1236,6 +2337,7 @@ func TestWorker_HandleRecipientJob_CampaignCompletion(t *testing.T) {
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
 		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 
 	err := w.HandleRecipientJob(context.Background(), job)
@@ -1276,6 +2378,7 @@ func TestWorker_HandleRecipientJob_TemplateParamSubstitution(t *testing.T) {
 			"1": "Alice",
 			"2": "ORD-456",
 		},
+		EnqueuedAt: campaign.StartedAt.UTC(),
 	}
 
 	err := w.HandleRecipientJob(context.Background(), job)
@@ -1375,6 +2478,7 @@ func TestWorker_HandleRecipientJob_WithEncryptedToken(t *testing.T) {
 		PhoneNumber:    recipient.PhoneNumber,
 		RecipientName:  recipient.RecipientName,
 		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
 	}
 
 	err = w.HandleRecipientJob(context.Background(), job)

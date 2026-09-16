@@ -255,6 +255,90 @@ export const accountsService = {
   list: () => api.get("/accounts"),
 };
 
+// This projection is deliberately smaller than the protected review preview.
+// Contact and channel list responses may expose it without disclosing another
+// candidate's identity or any authenticated selector values.
+export interface ContactIdentityReviewEffectiveState {
+  known: boolean;
+  ai_allowed: boolean;
+  blocked: boolean;
+  open_hold_count: number;
+  latest_hold_id?: string;
+  latest_generation?: number;
+  reason: string;
+}
+
+export function effectiveAIIsAllowed(
+  state: ContactIdentityReviewEffectiveState | null | undefined,
+): boolean {
+  return state?.known === true
+    && state.ai_allowed === true
+    && state.blocked === false;
+}
+
+export interface ContactIdentityReviewCandidate {
+  contact_id: string;
+  selector_reasons: number;
+}
+
+export interface ContactIdentityReviewSnapshot {
+  hold_id: string;
+  whatsapp_account_id: string;
+  onboarding_cycle: number;
+  protocol_version: number;
+  supported: boolean;
+  principal_generation: number;
+  disposition: string;
+  version: number;
+  member_count: number;
+  member_digest: string;
+  candidates: ContactIdentityReviewCandidate[];
+  decision_target_contact_id?: string;
+  decision_request_id?: string;
+  decision_chain_digest?: string;
+}
+
+export interface ContactIdentityReviewPreview {
+  snapshot: ContactIdentityReviewSnapshot;
+  chain_digest: string;
+  union_candidates: ContactIdentityReviewCandidate[];
+  open_generations: number[];
+}
+
+export interface ContactIdentityReviewDecisionRequest {
+  request_id: string;
+  hold_id: string;
+  target_contact_id: string;
+  expected_version: number;
+  expected_member_digest: string;
+  expected_chain_digest: string;
+  request_digest: string;
+}
+
+export interface ContactIdentityReviewDecisionResult {
+  snapshot: ContactIdentityReviewSnapshot;
+  superseded_generations: number[];
+  idempotent_replay: boolean;
+}
+
+export interface StagedIdentityReviewItem {
+  id: string;
+  hold_id: string;
+  protocol_version: number;
+  revision?: string;
+  status: string;
+  message_type: string;
+  media_status?: string;
+  received_at: string;
+}
+
+export interface StagedIdentityReviewDetail extends StagedIdentityReviewItem {
+  content: string;
+  media_mime_type?: string;
+  media_filename?: string;
+  media_available: boolean;
+}
+
 export const contactsService = {
   list: (params?: {
     search?: string;
@@ -271,6 +355,38 @@ export const contactsService = {
   updateTags: (id: string, tags: string[]) =>
     api.put(`/contacts/${id}/tags`, { tags }),
   getSessionData: (id: string) => api.get(`/contacts/${id}/session-data`),
+  getIdentityReviewState: (id: string, signal?: AbortSignal) =>
+    api.get<ContactIdentityReviewEffectiveState>(
+      `/contacts/${encodeURIComponent(id)}/identity-review`,
+      { signal },
+    ),
+  previewIdentityReview: (id: string, signal?: AbortSignal) =>
+    api.get<ContactIdentityReviewPreview>(
+      `/contacts/${encodeURIComponent(id)}/identity-review/preview`,
+      { signal },
+    ),
+  decideIdentityReview: (id: string, data: ContactIdentityReviewDecisionRequest) =>
+    api.post<ContactIdentityReviewDecisionResult>(
+      `/contacts/${encodeURIComponent(id)}/identity-review/decisions`,
+      data,
+    ),
+  listStagedIdentityReviews: (
+    params?: { page?: number; limit?: number },
+    signal?: AbortSignal,
+  ) => api.get<{ reviews: StagedIdentityReviewItem[]; total: number }>(
+    "/identity-reviews/staged",
+    { params, signal },
+  ),
+  getStagedIdentityReview: (id: string, signal?: AbortSignal) =>
+    api.get<StagedIdentityReviewDetail>(
+      `/identity-reviews/staged/${encodeURIComponent(id)}`,
+      { signal },
+    ),
+  getStagedIdentityReviewMedia: (id: string, revision: string, signal?: AbortSignal) =>
+    api.get<Blob>(
+      `/identity-reviews/staged/${encodeURIComponent(id)}/media/${encodeURIComponent(String(revision))}`,
+      { responseType: "blob", signal },
+    ),
   markRead: (id: string, lastVisibleMessageId: string, organizationId: string) => {
     const explicitOrganizationId = organizationId.trim();
     if (!explicitOrganizationId) {
@@ -562,6 +678,7 @@ export const chatbotService = {
     status?: string;
     agent_id?: string;
     team_id?: string;
+    contact_id?: string;
     limit?: number;
     offset?: number;
     include?: string; // 'all' | 'contact,agent,team' etc.

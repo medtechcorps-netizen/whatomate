@@ -17,16 +17,34 @@ import (
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
+	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/zerodha/logf"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
-const campaignCanonicalContactAttempts = 3
+const campaignCanonicalContactAttempts = 6
+const campaignCanonicalContactInitialRetryDelay = 25 * time.Millisecond
+const campaignDurableSettlementTimeout = 10 * time.Second
 
 const campaignMarketingOptOutMessage = "Contact opted out of marketing messages"
 const campaignAmbiguousDeliveryMessage = "Provider delivery outcome is unknown; message was not retried to prevent a duplicate"
+const campaignInactiveBeforeDeliveryMessage = "Campaign became inactive before provider delivery"
+
+type campaignAmbiguousDeliveryError struct{}
+
+func (campaignAmbiguousDeliveryError) Error() string {
+	return campaignAmbiguousDeliveryMessage
+}
+
+func campaignJobHasCurrentGeneration(campaign *models.BulkMessageCampaign, job *queue.RecipientJob) bool {
+	if campaign == nil || job == nil || campaign.Status != models.CampaignStatusProcessing ||
+		campaign.StartedAt == nil || campaign.StartedAt.IsZero() || job.EnqueuedAt.IsZero() {
+		return false
+	}
+	return !job.EnqueuedAt.Before(campaign.StartedAt.UTC())
+}
 
 // Worker processes jobs from the queue
 type Worker struct {
@@ -42,6 +60,9 @@ type Worker struct {
 	// the complete outbox authorization/send/settlement path in package tests.
 	// Production workers leave it nil and use the built-in provider adapters.
 	channelAdapterFactory func(*models.ChannelAccount) (channelapi.Adapter, error)
+	// getOrCreateCampaignContact is a package-test seam. Production workers
+	// leave it nil and use contactutil.GetOrCreateContact.
+	getOrCreateCampaignContact func(*gorm.DB, uuid.UUID, string, string) (*models.Contact, bool, error)
 }
 
 // Ensure Worker implements JobHandler interface
@@ -131,10 +152,7 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 	var account models.WhatsAppAccount
 	var contact *models.Contact
 	terminal := false
-	if err := w.withRecipientTenantTransaction(ctx, job.OrganizationID, func(tx *gorm.DB) error {
-		scoped := *w
-		scoped.DB = tx
-
+	if err := w.campaignCanonicalContactTransaction(ctx, job.OrganizationID, func(tx *gorm.DB, _ *bool) error {
 		if err := tx.
 			Where("id = ? AND organization_id = ?", job.CampaignID, job.OrganizationID).
 			Preload("Template", "organization_id = ?", job.OrganizationID).
@@ -142,10 +160,9 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 			w.Log.Error("Failed to load campaign", "error", err, "campaign_id", job.CampaignID)
 			return fmt.Errorf("failed to load campaign: %w", err)
 		}
-		if campaign.Status == models.CampaignStatusPaused ||
-			campaign.Status == models.CampaignStatusCancelled {
+		if !campaignJobHasCurrentGeneration(&campaign, job) {
 			w.Log.Info(
-				"Campaign not active, skipping recipient",
+				"Campaign job is not active for the current generation, skipping recipient",
 				"campaign_id", job.CampaignID,
 				"status", campaign.Status,
 				"recipient_id", job.RecipientID,
@@ -157,22 +174,51 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 			Where("name = ? AND organization_id = ?", campaign.WhatsAppAccount, job.OrganizationID).
 			First(&account).Error; err != nil {
 			w.Log.Error("Failed to load WhatsApp account", "error", err, "account_name", campaign.WhatsAppAccount)
-			scoped.updateRecipientStatus(job.RecipientID, models.MessageStatusFailed, "", "WhatsApp account not found")
-			scoped.incrementCampaignCount(job.CampaignID, "failed_count")
+			if failErr := failCampaignRecipientBeforeClaimTx(
+				tx,
+				job,
+				"WhatsApp account not found",
+			); failErr != nil {
+				return failErr
+			}
+			terminal = true
+			return nil
+		}
+		if err := whatsappaccount.RequireActiveForOutbound(&account); err != nil {
+			w.Log.Warn(
+				"WhatsApp account is inactive; campaign recipient will not be sent",
+				"account_id", account.ID,
+				"campaign_id", job.CampaignID,
+			)
+			if failErr := failCampaignRecipientBeforeClaimTx(
+				tx,
+				job,
+				whatsappaccount.ErrOutboundInactive.Error(),
+			); failErr != nil {
+				return failErr
+			}
 			terminal = true
 			return nil
 		}
 
-		resolved, _, err := contactutil.GetOrCreateContact(
+		resolved, _, err := w.resolveCampaignContact(
 			tx,
 			job.OrganizationID,
 			job.PhoneNumber,
 			job.RecipientName,
 		)
 		if err != nil || resolved == nil {
+			if err != nil && retryableCampaignContactWrite(err) {
+				return err
+			}
 			w.Log.Error("Failed to get or create contact", "error", err, "phone", job.PhoneNumber)
-			scoped.updateRecipientStatus(job.RecipientID, models.MessageStatusFailed, "", "Failed to create contact")
-			scoped.incrementCampaignCount(job.CampaignID, "failed_count")
+			if failErr := failCampaignRecipientBeforeClaimTx(
+				tx,
+				job,
+				"Failed to create contact",
+			); failErr != nil {
+				return failErr
+			}
 			terminal = true
 			return nil
 		}
@@ -196,7 +242,13 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 	if err != nil {
 		return fmt.Errorf("deliver campaign recipient: %w", err)
 	}
-	if delivery.alreadyProcessed {
+	if delivery.campaignInactive {
+		w.Log.Info(
+			"Campaign became inactive before provider delivery",
+			"campaign_id", job.CampaignID,
+			"recipient_id", job.RecipientID,
+		)
+	} else if delivery.alreadyProcessed {
 		w.Log.Info(
 			"Campaign recipient was already processed",
 			"campaign_id", job.CampaignID,
@@ -225,33 +277,10 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 		)
 	}
 
-	if err := w.withRecipientTenantTransaction(ctx, job.OrganizationID, func(tx *gorm.DB) error {
+	if err := w.withRecipientTenantTransactionAndCampaignStats(ctx, job.OrganizationID, func(tx *gorm.DB) (*queue.CampaignStatsUpdate, error) {
 		scoped := *w
 		scoped.DB = tx
-		// The durable legacy message is authoritative. The idempotent
-		// migration backfill can repair a transient omnichannel mirror failure
-		// without resending.
-		if delivery.message != nil {
-			if _, err := channelapi.MirrorLegacyWhatsAppMessage(
-				tx,
-				channelapi.LegacyMetaAccountRef{
-					ID:             account.ID,
-					OrganizationID: account.OrganizationID,
-					Name:           account.Name,
-					Status:         account.Status,
-				},
-				delivery.message.ID,
-			); err != nil {
-				w.Log.Error(
-					"Failed to mirror campaign message into omnichannel inbox",
-					"error", err,
-					"organization_id", account.OrganizationID,
-					"message_id", delivery.message.ID,
-				)
-			}
-		}
-		scoped.checkCampaignCompletion(ctx, job.CampaignID, job.OrganizationID)
-		return nil
+		return scoped.checkCampaignCompletion(ctx, job.CampaignID, job.OrganizationID)
 	}); err != nil {
 		return fmt.Errorf("finalize campaign recipient tenant phase: %w", err)
 	}
@@ -260,12 +289,14 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 }
 
 type campaignRecipientDelivery struct {
-	message          *models.Message
-	contactID        uuid.UUID
-	sendErr          error
-	consentRejected  bool
-	ambiguous        bool
-	alreadyProcessed bool
+	message              *models.Message
+	contactID            uuid.UUID
+	sendErr              error
+	consentRejected      bool
+	ambiguous            bool
+	campaignInactive     bool
+	alreadyProcessed     bool
+	mirrorConversationID uuid.UUID
 }
 
 // deliverCampaignRecipient uses a two-phase, at-most-once protocol for legacy
@@ -292,7 +323,94 @@ func (w *Worker) deliverCampaignRecipient(
 		delivery.ambiguous || delivery.message == nil {
 		return delivery, err
 	}
+	delivery, err = w.mirrorPreparedCampaignDelivery(ctx, job, account, delivery)
+	if err != nil {
+		return delivery, err
+	}
 	return w.attemptPreparedCampaignDelivery(ctx, job, campaign, account, requestedContactID, delivery)
+}
+
+// mirrorPreparedCampaignDelivery commits the provider-neutral inbox linkage
+// before the Graph side-effect boundary. A provider request must never depend
+// on a mirror that is visible only inside its own still-uncommitted transaction.
+func (w *Worker) mirrorPreparedCampaignDelivery(
+	ctx context.Context,
+	job *queue.RecipientJob,
+	account *models.WhatsAppAccount,
+	prepared campaignRecipientDelivery,
+) (campaignRecipientDelivery, error) {
+	delivery := prepared
+	if job == nil || account == nil || prepared.message == nil || prepared.message.ID == uuid.Nil {
+		return delivery, errors.New("prepared campaign mirror authority is incomplete")
+	}
+
+	var conversationID uuid.UUID
+	err := w.withRecipientTenantTransaction(ctx, job.OrganizationID, func(tx *gorm.DB) error {
+		var recipient models.BulkMessageRecipient
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND campaign_id = ?", job.RecipientID, job.CampaignID).
+			First(&recipient).Error; err != nil {
+			return fmt.Errorf("lock campaign recipient before inbox mirror: %w", err)
+		}
+		if recipient.Status != models.MessageStatusPending ||
+			recipient.MessageID == nil || *recipient.MessageID != prepared.message.ID {
+			return errors.New("campaign delivery claim changed before inbox mirror")
+		}
+
+		result, err := channelapi.MirrorLegacyWhatsAppMessage(
+			tx,
+			channelapi.LegacyMetaAccountRef{
+				ID:             account.ID,
+				OrganizationID: account.OrganizationID,
+				Name:           account.Name,
+				Status:         account.Status,
+			},
+			prepared.message.ID,
+		)
+		if err != nil {
+			return fmt.Errorf("mirror campaign message before provider delivery: %w", err)
+		}
+		if result.ConversationID == uuid.Nil {
+			return errors.New("campaign inbox mirror returned no conversation")
+		}
+
+		var mirrored models.Message
+		if err := tx.Select("id", "inbox_conversation_id").
+			Where("id = ? AND organization_id = ?", prepared.message.ID, job.OrganizationID).
+			First(&mirrored).Error; err != nil {
+			return fmt.Errorf("reload committed campaign inbox mirror: %w", err)
+		}
+		if mirrored.InboxConversationID == nil || *mirrored.InboxConversationID != result.ConversationID {
+			return errors.New("campaign inbox mirror projection is inconsistent")
+		}
+		conversationID = result.ConversationID
+		return nil
+	})
+	if err != nil {
+		// The mirror transaction did not report a commit, so no provider call has
+		// occurred. Reconcile/release using a fresh bounded context even when the
+		// queue lease or caller was cancelled. A commit-ambiguous linked message
+		// is rejected by releasePreparedCampaignDeliveryTx and stays fail-closed.
+		settlementCtx, cancel := context.WithTimeout(context.Background(), campaignDurableSettlementTimeout)
+		defer cancel()
+		if cleanupErr := w.releasePreparedCampaignDelivery(
+			settlementCtx,
+			job,
+			prepared.message.ID,
+		); cleanupErr != nil {
+			return delivery, fmt.Errorf(
+				"release unattempted campaign delivery after mirror failure: %w (mirror error: %v)",
+				cleanupErr,
+				err,
+			)
+		}
+		delivery.message = nil
+		return delivery, err
+	}
+
+	delivery.mirrorConversationID = conversationID
+	delivery.message.InboxConversationID = &conversationID
+	return delivery, nil
 }
 
 func (w *Worker) prepareCampaignRecipient(
@@ -432,6 +550,10 @@ func (w *Worker) attemptPreparedCampaignDelivery(
 	prepared campaignRecipientDelivery,
 ) (campaignRecipientDelivery, error) {
 	delivery := prepared
+	if job == nil || account == nil || prepared.message == nil ||
+		prepared.mirrorConversationID == uuid.Nil {
+		return delivery, errors.New("committed campaign inbox mirror is required")
+	}
 	providerAttempted := false
 	var waMessageID string
 	var sendErr error
@@ -439,6 +561,16 @@ func (w *Worker) attemptPreparedCampaignDelivery(
 		ctx,
 		job.OrganizationID,
 		func(tx *gorm.DB, deliveryAttempted *bool) error {
+			// Serialize pause/cancel with the complete provider attempt. The inbox
+			// mirror is already committed, so a transition that wins this lock is
+			// settled terminally rather than deleting a linked projection.
+			var lockedCampaign models.BulkMessageCampaign
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("id", "organization_id", "status", "started_at").
+				Where("id = ? AND organization_id = ?", job.CampaignID, job.OrganizationID).
+				First(&lockedCampaign).Error; err != nil {
+				return fmt.Errorf("lock campaign before provider delivery: %w", err)
+			}
 			var storedRecipient models.BulkMessageRecipient
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 				Where("id = ? AND campaign_id = ?", job.RecipientID, job.CampaignID).
@@ -452,15 +584,37 @@ func (w *Worker) attemptPreparedCampaignDelivery(
 				return nil
 			}
 
-			contact, err := contactutil.ResolveCanonicalContactForUpdate(
-				tx,
-				job.OrganizationID,
-				requestedContactID,
-			)
-			if err != nil {
-				return fmt.Errorf("resolve canonical claimed contact: %w", err)
+			var lockedAccount *models.WhatsAppAccount
+			var accountGuardErr error
+			var contact *models.Contact
+			if campaignJobHasCurrentGeneration(&lockedCampaign, job) {
+				// Keep WhatsAppAccount before contact/message in the established
+				// outbound lock order. This provider-only phase never reacquires
+				// ChannelAccount authority from the committed mirror phase.
+				lockedAccount, accountGuardErr = whatsappaccount.LockAndLoadActiveForOutbound(
+					tx,
+					job.OrganizationID,
+					account.ID,
+				)
+				if accountGuardErr != nil &&
+					!errors.Is(accountGuardErr, whatsappaccount.ErrOutboundInactive) {
+					return accountGuardErr
+				}
+				if accountGuardErr == nil {
+					w.decryptAccountSecrets(lockedAccount)
+				}
+
+				var err error
+				contact, err = contactutil.ResolveCanonicalContactForUpdate(
+					tx,
+					job.OrganizationID,
+					requestedContactID,
+				)
+				if err != nil {
+					return fmt.Errorf("resolve canonical claimed contact: %w", err)
+				}
+				delivery.contactID = contact.ID
 			}
-			delivery.contactID = contact.ID
 
 			var message models.Message
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -473,13 +627,54 @@ func (w *Worker) attemptPreparedCampaignDelivery(
 				delivery.alreadyProcessed = true
 				return nil
 			}
-			if message.ContactID != contact.ID {
-				if err := tx.Model(&models.Message{}).
-					Where("id = ? AND organization_id = ?", message.ID, job.OrganizationID).
-					Update("contact_id", contact.ID).Error; err != nil {
-					return fmt.Errorf("move claimed campaign message to canonical contact: %w", err)
+			if message.InboxConversationID == nil ||
+				*message.InboxConversationID != prepared.mirrorConversationID {
+				return errors.New("committed campaign inbox mirror changed before provider delivery")
+			}
+
+			if !campaignJobHasCurrentGeneration(&lockedCampaign, job) {
+				if err := finalizePreparedCampaignDeliveryTx(
+					tx,
+					job,
+					&message,
+					models.MessageStatusFailed,
+					"",
+					campaignInactiveBeforeDeliveryMessage,
+					"failed_count",
+				); err != nil {
+					return err
 				}
-				message.ContactID = contact.ID
+				message.Status = models.MessageStatusFailed
+				message.ErrorMessage = campaignInactiveBeforeDeliveryMessage
+				delivery.message = &message
+				delivery.campaignInactive = true
+				return nil
+			}
+
+			// Repointing after the independent mirror commit would make the
+			// provider request authoritative for a projection that was never
+			// committed. Fail closed and let redelivery dead-letter the claim.
+			if message.ContactID != contact.ID {
+				return errors.New("campaign contact changed after committed inbox mirror")
+			}
+
+			if accountGuardErr != nil {
+				if err := finalizePreparedCampaignDeliveryTx(
+					tx,
+					job,
+					&message,
+					models.MessageStatusFailed,
+					"",
+					whatsappaccount.ErrOutboundInactive.Error(),
+					"failed_count",
+				); err != nil {
+					return err
+				}
+				message.Status = models.MessageStatusFailed
+				message.ErrorMessage = whatsappaccount.ErrOutboundInactive.Error()
+				delivery.message = &message
+				delivery.sendErr = whatsappaccount.ErrOutboundInactive
+				return nil
 			}
 
 			if strings.EqualFold(campaign.Template.Category, "MARKETING") &&
@@ -510,14 +705,18 @@ func (w *Worker) attemptPreparedCampaignDelivery(
 			}
 			*deliveryAttempted = true
 			providerAttempted = true
-			waMessageID, sendErr = w.sendTemplateMessage(
+			waMessageID, sendErr = w.sendCampaignTemplateMessage(
 				ctx,
-				account,
+				lockedAccount,
 				campaign.Template,
 				recipient,
 				campaign.HeaderMediaID,
 				campaign.HeaderMediaFilename,
 			)
+			waMessageID = strings.TrimSpace(waMessageID)
+			if sendErr == nil && waMessageID == "" {
+				sendErr = campaignAmbiguousDeliveryError{}
+			}
 
 			status := models.MessageStatusSent
 			counter := "sent_count"
@@ -550,11 +749,16 @@ func (w *Worker) attemptPreparedCampaignDelivery(
 		return delivery, nil
 	}
 	if !providerAttempted {
+		// The inbox mirror is already independently committed. Retain the exact
+		// claim on an unexpected pre-provider error; a redelivery will settle it
+		// ambiguous instead of risking a send after a crash window.
 		return delivery, err
 	}
 
+	recoveryCtx, cancel := context.WithTimeout(context.Background(), campaignDurableSettlementTimeout)
+	defer cancel()
 	recovered, recoveryErr := w.recoverCampaignDelivery(
-		ctx,
+		recoveryCtx,
 		job,
 		prepared.message.ID,
 		waMessageID,
@@ -637,6 +841,80 @@ func (w *Worker) recoverCampaignDelivery(
 	return delivery, err
 }
 
+func (w *Worker) releasePreparedCampaignDelivery(
+	ctx context.Context,
+	job *queue.RecipientJob,
+	messageID uuid.UUID,
+) error {
+	return w.withRecipientTenantTransaction(ctx, job.OrganizationID, func(tx *gorm.DB) error {
+		return releasePreparedCampaignDeliveryTx(tx, job, messageID)
+	})
+}
+
+// releasePreparedCampaignDeliveryTx removes only a provably unattempted claim.
+// A linked message or provider ID fails closed because either can indicate that
+// the side-effect boundary was crossed.
+func releasePreparedCampaignDeliveryTx(
+	tx *gorm.DB,
+	job *queue.RecipientJob,
+	messageID uuid.UUID,
+) error {
+	var recipient models.BulkMessageRecipient
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND campaign_id = ?", job.RecipientID, job.CampaignID).
+		First(&recipient).Error; err != nil {
+		return fmt.Errorf("lock unattempted campaign recipient: %w", err)
+	}
+	if recipient.Status != models.MessageStatusPending ||
+		recipient.MessageID == nil || *recipient.MessageID != messageID {
+		return errors.New("unattempted campaign delivery claim changed")
+	}
+
+	var message models.Message
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND organization_id = ?", messageID, job.OrganizationID).
+		First(&message).Error; err != nil {
+		return fmt.Errorf("lock unattempted campaign message: %w", err)
+	}
+	if message.Status != models.MessageStatusPending ||
+		strings.TrimSpace(message.WhatsAppMessageID) != "" ||
+		message.InboxConversationID != nil {
+		return errors.New("campaign delivery may already have crossed the provider boundary")
+	}
+
+	result := tx.Model(&models.BulkMessageRecipient{}).
+		Where(
+			"id = ? AND campaign_id = ? AND status = ? AND message_id = ?",
+			job.RecipientID,
+			job.CampaignID,
+			models.MessageStatusPending,
+			messageID,
+		).
+		Updates(map[string]any{
+			"message_id":           nil,
+			"whats_app_message_id": "",
+			"error_message":        "",
+			"sent_at":              nil,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("release unattempted campaign recipient: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("unattempted campaign recipient changed before release")
+	}
+
+	deleted := tx.Unscoped().
+		Where("id = ? AND organization_id = ?", messageID, job.OrganizationID).
+		Delete(&models.Message{})
+	if deleted.Error != nil {
+		return fmt.Errorf("delete unattempted campaign message: %w", deleted.Error)
+	}
+	if deleted.RowsAffected != 1 {
+		return errors.New("unattempted campaign message changed before deletion")
+	}
+	return nil
+}
+
 func finalizePreparedCampaignDeliveryTx(
 	tx *gorm.DB,
 	job *queue.RecipientJob,
@@ -687,6 +965,40 @@ func finalizePreparedCampaignDeliveryTx(
 		job.OrganizationID,
 		job.CampaignID,
 		counter,
+	)
+}
+
+// failCampaignRecipientBeforeClaimTx settles only the pending recipient bound
+// to this exact campaign. Queue payload IDs are not trusted across tenants, and
+// a duplicate terminal job must not increment the campaign twice.
+func failCampaignRecipientBeforeClaimTx(
+	tx *gorm.DB,
+	job *queue.RecipientJob,
+	errorMessage string,
+) error {
+	result := tx.Model(&models.BulkMessageRecipient{}).
+		Where(
+			"id = ? AND campaign_id = ? AND status = ? AND message_id IS NULL",
+			job.RecipientID,
+			job.CampaignID,
+			models.MessageStatusPending,
+		).
+		Updates(map[string]any{
+			"status":               models.MessageStatusFailed,
+			"whats_app_message_id": "",
+			"error_message":        errorMessage,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("fail campaign recipient before claim: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return nil
+	}
+	return incrementCampaignCountTx(
+		tx,
+		job.OrganizationID,
+		job.CampaignID,
+		"failed_count",
 	)
 }
 
@@ -753,8 +1065,39 @@ func (w *Worker) campaignCanonicalContactTransaction(
 		if err == nil || deliveryAttempted || !retryableCampaignContactWrite(err) {
 			return err
 		}
+		if attempt+1 < campaignCanonicalContactAttempts {
+			if waitErr := waitForCampaignContactWriteRetry(ctx, attempt); waitErr != nil {
+				return waitErr
+			}
+		}
 	}
 	return err
+}
+
+func (w *Worker) resolveCampaignContact(
+	tx *gorm.DB,
+	organizationID uuid.UUID,
+	phoneNumber, profileName string,
+) (*models.Contact, bool, error) {
+	if w.getOrCreateCampaignContact != nil {
+		return w.getOrCreateCampaignContact(tx, organizationID, phoneNumber, profileName)
+	}
+	return contactutil.GetOrCreateContact(tx, organizationID, phoneNumber, profileName)
+}
+
+func waitForCampaignContactWriteRetry(ctx context.Context, attempt int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	delay := campaignCanonicalContactInitialRetryDelay << attempt
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // withRecipientTenantTransaction always begins a top-level phase from the
@@ -772,6 +1115,26 @@ func (w *Worker) withRecipientTenantTransaction(
 	return db.Transaction(write)
 }
 
+// withRecipientTenantTransactionAndCampaignStats publishes the transaction's
+// campaign projection only after a successful commit. A failed callback or
+// commit discards the captured projection together with the database changes.
+func (w *Worker) withRecipientTenantTransactionAndCampaignStats(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	write func(tx *gorm.DB) (*queue.CampaignStatsUpdate, error),
+) error {
+	var update *queue.CampaignStatsUpdate
+	if err := w.withRecipientTenantTransaction(ctx, organizationID, func(tx *gorm.DB) error {
+		var err error
+		update, err = write(tx)
+		return err
+	}); err != nil {
+		return err
+	}
+	w.publishCampaignStats(ctx, update)
+	return nil
+}
+
 func retryableCampaignContactWrite(err error) bool {
 	if errors.Is(err, contactutil.ErrCanonicalContactChanged) {
 		return true
@@ -783,7 +1146,7 @@ func retryableCampaignContactWrite(err error) bool {
 		return false
 	}
 	switch sqlState.SQLState() {
-	case "40001", "40P01":
+	case "40001", "40P01", "55P03":
 		return true
 	default:
 		return false
@@ -812,17 +1175,85 @@ func (w *Worker) incrementCampaignCount(campaignID uuid.UUID, column string) {
 		Update(column, gorm.Expr(column+" + 1"))
 }
 
-// publishCampaignStats publishes campaign stats for real-time updates
-func (w *Worker) publishCampaignStats(ctx context.Context, campaignID, organizationID uuid.UUID) {
-	if w.Publisher == nil {
+// publishCampaignStats publishes a committed campaign projection for real-time
+// updates.
+func (w *Worker) publishCampaignStats(ctx context.Context, update *queue.CampaignStatsUpdate) {
+	if w.Publisher == nil || update == nil {
 		return
 	}
-	var campaign models.BulkMessageCampaign
-	if err := w.DB.Where("id = ?", campaignID).First(&campaign).Error; err != nil {
-		return
+	_ = w.Publisher.PublishCampaignStats(ctx, update)
+}
+
+// checkCampaignCompletion checks if all recipients are processed and returns
+// the transaction's campaign projection. The caller owns publication after
+// commit.
+func (w *Worker) checkCampaignCompletion(_ context.Context, campaignID, organizationID uuid.UUID) (*queue.CampaignStatsUpdate, error) {
+	// Count pending recipients
+	var pendingCount int64
+	if err := w.DB.Model(&models.BulkMessageRecipient{}).
+		Where("campaign_id = ? AND status = ?", campaignID, models.MessageStatusPending).
+		Count(&pendingCount).Error; err != nil {
+		return nil, fmt.Errorf("count pending campaign recipients: %w", err)
 	}
 
-	_ = w.Publisher.PublishCampaignStats(ctx, &queue.CampaignStatsUpdate{
+	// If no pending recipients, mark campaign as completed
+	if pendingCount == 0 {
+		var campaign models.BulkMessageCampaign
+		if err := w.DB.Where("id = ? AND organization_id = ?", campaignID, organizationID).
+			First(&campaign).Error; err != nil {
+			return nil, fmt.Errorf("load campaign before completion: %w", err)
+		}
+
+		// Only complete if currently processing
+		if campaign.Status != models.CampaignStatusProcessing {
+			return nil, nil
+		}
+
+		now := time.Now().UTC()
+		updated := w.DB.Model(&models.BulkMessageCampaign{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ?",
+				campaignID,
+				organizationID,
+				models.CampaignStatusProcessing,
+			).
+			Updates(map[string]any{
+				"status":       models.CampaignStatusCompleted,
+				"completed_at": now,
+			})
+		if updated.Error != nil {
+			return nil, fmt.Errorf("complete campaign: %w", updated.Error)
+		}
+		if updated.RowsAffected != 1 {
+			return nil, errors.New("campaign changed before completion")
+		}
+		if err := w.DB.Where("id = ? AND organization_id = ?", campaignID, organizationID).
+			First(&campaign).Error; err != nil {
+			return nil, fmt.Errorf("reload completed campaign: %w", err)
+		}
+		if campaign.Status != models.CampaignStatusCompleted || campaign.CompletedAt == nil {
+			return nil, errors.New("completed campaign projection is inconsistent")
+		}
+
+		w.Log.Info("Campaign completed", "campaign_id", campaignID, "sent", campaign.SentCount, "failed", campaign.FailedCount)
+
+		return &queue.CampaignStatsUpdate{
+			CampaignID:     campaignID.String(),
+			OrganizationID: organizationID,
+			Status:         campaign.Status,
+			SentCount:      campaign.SentCount,
+			DeliveredCount: campaign.DeliveredCount,
+			ReadCount:      campaign.ReadCount,
+			FailedCount:    campaign.FailedCount,
+		}, nil
+	}
+
+	var campaign models.BulkMessageCampaign
+	if err := w.DB.Where("id = ? AND organization_id = ?", campaignID, organizationID).
+		First(&campaign).Error; err != nil {
+		return nil, fmt.Errorf("load active campaign stats: %w", err)
+	}
+	return &queue.CampaignStatsUpdate{
 		CampaignID:     campaignID.String(),
 		OrganizationID: organizationID,
 		Status:         campaign.Status,
@@ -830,53 +1261,33 @@ func (w *Worker) publishCampaignStats(ctx context.Context, campaignID, organizat
 		DeliveredCount: campaign.DeliveredCount,
 		ReadCount:      campaign.ReadCount,
 		FailedCount:    campaign.FailedCount,
-	})
+	}, nil
 }
 
-// checkCampaignCompletion checks if all recipients are processed and marks campaign as completed
-func (w *Worker) checkCampaignCompletion(ctx context.Context, campaignID, organizationID uuid.UUID) {
-	// Count pending recipients
-	var pendingCount int64
-	w.DB.Model(&models.BulkMessageRecipient{}).
-		Where("campaign_id = ? AND status = ?", campaignID, models.MessageStatusPending).
-		Count(&pendingCount)
-
-	// If no pending recipients, mark campaign as completed
-	if pendingCount == 0 {
-		var campaign models.BulkMessageCampaign
-		if err := w.DB.Where("id = ?", campaignID).First(&campaign).Error; err != nil {
-			return
+// sendCampaignTemplateMessage contains provider panics at the same durable
+// no-resend boundary as an ambiguous transport result. Panic payloads are not
+// copied into logs or persisted errors because they may contain provider data.
+func (w *Worker) sendCampaignTemplateMessage(
+	ctx context.Context,
+	account *models.WhatsAppAccount,
+	template *models.Template,
+	recipient *models.BulkMessageRecipient,
+	campaignHeaderMediaID, campaignHeaderMediaFilename string,
+) (messageID string, sendErr error) {
+	defer func() {
+		if recover() != nil {
+			messageID = ""
+			sendErr = campaignAmbiguousDeliveryError{}
 		}
-
-		// Only complete if currently processing
-		if campaign.Status != models.CampaignStatusProcessing {
-			return
-		}
-
-		now := time.Now()
-		w.DB.Model(&campaign).Updates(map[string]any{
-			"status":       models.CampaignStatusCompleted,
-			"completed_at": now,
-		})
-
-		w.Log.Info("Campaign completed", "campaign_id", campaignID, "sent", campaign.SentCount, "failed", campaign.FailedCount)
-
-		// Publish completion status
-		if w.Publisher != nil {
-			_ = w.Publisher.PublishCampaignStats(ctx, &queue.CampaignStatsUpdate{
-				CampaignID:     campaignID.String(),
-				OrganizationID: organizationID,
-				Status:         models.CampaignStatusCompleted,
-				SentCount:      campaign.SentCount,
-				DeliveredCount: campaign.DeliveredCount,
-				ReadCount:      campaign.ReadCount,
-				FailedCount:    campaign.FailedCount,
-			})
-		}
-	} else {
-		// Publish current stats
-		w.publishCampaignStats(ctx, campaignID, organizationID)
-	}
+	}()
+	return w.sendTemplateMessage(
+		ctx,
+		account,
+		template,
+		recipient,
+		campaignHeaderMediaID,
+		campaignHeaderMediaFilename,
+	)
 }
 
 // sendTemplateMessage sends a template message via WhatsApp Cloud API

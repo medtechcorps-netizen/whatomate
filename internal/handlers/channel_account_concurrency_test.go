@@ -23,6 +23,179 @@ type channelAccountConcurrencyFixture struct {
 	Account      *models.ChannelAccount
 }
 
+func TestChannelAIBookingUpdateStrictBody(t *testing.T) {
+	for _, body := range []string{`{"ai_booking_enabled":true}`, `{ "ai_booking_enabled" : false }`} {
+		require.True(t, bookingOnlyChannelUpdate([]byte(body)), body)
+	}
+	for _, body := range []string{
+		`{}`, `{"ai_booking_enabled":null}`, `{"ai_booking_enabled":"true"}`,
+		`{"ai_booking_enabled":1}`, `{"AI_BOOKING_ENABLED":true}`,
+		`{"ai_booking_enabled":true,"ai_booking_enabled":false}`,
+		`{"ai_booking_enabled":true,"name":"renamed"}`,
+		`{"ai_booking_enabled":true,"config":{}}`, `{"ai_booking_enabled":true,"unknown":1}`,
+		`{"ai_booking_enabled":true} {}`,
+	} {
+		require.False(t, bookingOnlyChannelUpdate([]byte(body)), body)
+	}
+	for _, key := range channelAIBookingConfigKeys {
+		require.NotEmpty(t, unsafeConfigKey(models.JSONB{key: true}), key)
+	}
+}
+
+func TestChannelAIBookingUpdateEpochAndRouteReset(t *testing.T) {
+	fixture := newChannelAccountConcurrencyFixture(t, true)
+	db := fixture.App.DB
+	updateChannelAccountForConcurrencyTest(t, fixture, map[string]any{"ai_booking_enabled": true})
+	var account models.ChannelAccount
+	require.NoError(t, db.First(&account, "id = ?", fixture.Account.ID).Error)
+	firstRevision, ok := models.AIBookingAuthority(&account)
+	require.True(t, ok)
+	firstEpoch := account.Config[models.ChannelConfigAIBookingEnabledAt].(string)
+	epoch, err := time.Parse(time.RFC3339Nano, firstEpoch)
+	require.NoError(t, err)
+	_, ok = models.AIBookingAuthorityForInbound(&account, epoch.Add(-time.Nanosecond))
+	require.False(t, ok)
+	_, ok = models.AIBookingAuthorityForInbound(&account, epoch)
+	require.True(t, ok)
+	updateChannelAccountForConcurrencyTest(t, fixture, map[string]any{"name": "renamed-booking-channel"})
+	require.NoError(t, db.First(&account, "id = ?", fixture.Account.ID).Error)
+	require.Equal(t, firstRevision, account.Config[models.ChannelConfigAIBookingRevision])
+	updateChannelAccountForConcurrencyTest(t, fixture, map[string]any{"ai_booking_enabled": false})
+	require.NoError(t, db.First(&account, "id = ?", fixture.Account.ID).Error)
+	require.Equal(t, true, account.Config["ai_reply_enabled"], "booking OFF must not disable ordinary AI")
+	_, ok = models.AIBookingAuthority(&account)
+	require.False(t, ok)
+	updateChannelAccountForConcurrencyTest(t, fixture, map[string]any{"ai_booking_enabled": true})
+	require.NoError(t, db.First(&account, "id = ?", fixture.Account.ID).Error)
+	require.NotEqual(t, firstRevision, account.Config[models.ChannelConfigAIBookingRevision])
+	_, ok = models.AIBookingAuthorityForInbound(&account, epoch)
+	require.False(t, ok, "OFF -> ON must not authorize an old queued inbound")
+	updateChannelAccountForConcurrencyTest(t, fixture, map[string]any{"config": map[string]any{"relay_url": "https://relay-new.example.test/meta"}})
+	require.NoError(t, db.First(&account, "id = ?", fixture.Account.ID).Error)
+	require.Equal(t, false, account.Config[models.ChannelConfigAIBookingEnabled])
+	require.NotContains(t, account.Config, models.ChannelConfigAIBookingEnabledAt)
+}
+
+func TestChannelAIBookingUpdateRequiresAllPermissions(t *testing.T) {
+	for _, missing := range []string{"channel_accounts:write", "chatbot.ai:write", "booking.settings:write", ""} {
+		t.Run("missing_"+missing, func(t *testing.T) {
+			fixture := newChannelAccountConcurrencyFixture(t, true)
+			var keys []string
+			for _, key := range []string{"channel_accounts:write", "chatbot.ai:write", "booking.settings:write"} {
+				if key != missing {
+					keys = append(keys, key)
+				}
+			}
+			role := testutil.CreateTestRoleWithKeys(t, fixture.App.DB, fixture.Organization.ID, "booking-channel", keys)
+			user := testutil.CreateTestUser(t, fixture.App.DB, fixture.Organization.ID, testutil.WithRoleID(&role.ID))
+			request := testutil.NewJSONRequest(t, map[string]any{"ai_booking_enabled": true})
+			testutil.SetFullAuthContext(request, fixture.Organization.ID, user.ID, &role.ID, false)
+			testutil.SetPathParam(request, "id", fixture.Account.ID.String())
+			require.NoError(t, fixture.App.UpdateChannelAccount(request))
+			expected := fasthttp.StatusForbidden
+			if missing == "" {
+				expected = fasthttp.StatusOK
+			}
+			require.Equal(t, expected, testutil.GetResponseStatusCode(request), string(testutil.GetResponseBody(request)))
+		})
+	}
+}
+
+func TestChannelAIBookingNativeUpdateIsBookingOnly(t *testing.T) {
+	fixture := newChannelAccountConcurrencyFixture(t, true)
+	native := testutil.CreateTestWhatsAppAccount(t, fixture.App.DB, fixture.Organization.ID)
+	require.NoError(t, fixture.App.DB.Transaction(func(tx *gorm.DB) error {
+		shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(tx, channelapi.LegacyMetaAccountRef{
+			ID: native.ID, OrganizationID: native.OrganizationID, Name: native.Name, Status: native.Status,
+		})
+		if err == nil {
+			fixture.Account = shadow
+		}
+		return err
+	}))
+	before := cloneJSONB(fixture.Account.Config)
+	updateChannelAccountForConcurrencyTest(t, fixture, map[string]any{"ai_booking_enabled": true})
+	var shadow models.ChannelAccount
+	require.NoError(t, fixture.App.DB.First(&shadow, "id = ?", fixture.Account.ID).Error)
+	_, ok := channelapi.LegacyMetaAIBookingAuthority(&shadow, native)
+	require.True(t, ok)
+	require.Equal(t, false, shadow.Config["outbound_enabled"])
+	require.Equal(t, before["reply_route"], shadow.Config["reply_route"])
+	require.Equal(t, fixture.Account.Name, shadow.Name)
+	for _, body := range []map[string]any{
+		{"ai_booking_enabled": true, "name": "not-allowed"},
+		{"ai_booking_enabled": true, "config": map[string]any{}},
+		{"ai_booking_enabled": true, "outbound_enabled": true},
+		{"name": "not-allowed"},
+	} {
+		request := testutil.NewJSONRequest(t, body)
+		testutil.SetFullAuthContext(request, fixture.Organization.ID, fixture.User.ID, fixture.User.RoleID, true)
+		testutil.SetPathParam(request, "id", shadow.ID.String())
+		require.NoError(t, fixture.App.UpdateChannelAccount(request))
+		require.NotEqual(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+	}
+	shadow.Config["outbound_enabled"] = true
+	require.NoError(t, fixture.App.DB.Model(&shadow).Update("config", shadow.Config).Error)
+	request := testutil.NewJSONRequest(t, map[string]any{"ai_booking_enabled": true})
+	testutil.SetFullAuthContext(request, fixture.Organization.ID, fixture.User.ID, fixture.User.RoleID, true)
+	testutil.SetPathParam(request, "id", shadow.ID.String())
+	require.NoError(t, fixture.App.UpdateChannelAccount(request))
+	require.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(request))
+}
+
+func TestChannelAIBookingUpdateRejectsShadowDeletedWhileWaiting(t *testing.T) {
+	fixture := newChannelAccountConcurrencyFixture(t, true)
+	db := fixture.App.DB
+	native := testutil.CreateTestWhatsAppAccount(t, db, fixture.Organization.ID)
+	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, channelapi.LegacyMetaAccountRef{
+		ID: native.ID, OrganizationID: native.OrganizationID, Name: native.Name, Status: native.Status,
+	})
+	require.NoError(t, err)
+	holder := db.Begin()
+	require.NoError(t, holder.Error)
+	t.Cleanup(func() { _ = holder.Rollback().Error })
+	require.NoError(t, lockChannelAIOrganizationScopeTx(holder, fixture.Organization.ID))
+	require.NoError(t, holder.Delete(shadow).Error)
+	pid := make(chan int, 1)
+	done := make(chan error, 1)
+	status := make(chan int, 1)
+	go func() {
+		done <- db.Connection(func(connection *gorm.DB) error {
+			session := connection.Session(&gorm.Session{NewDB: true})
+			var backendPID int
+			if err := session.Raw("SELECT pg_backend_pid()").Scan(&backendPID).Error; err != nil {
+				pid <- 0
+				return err
+			}
+			pid <- backendPID
+			app := &App{DB: session, Log: testutil.NopLogger()}
+			request := testutil.NewJSONRequest(t, map[string]any{"ai_booking_enabled": true})
+			testutil.SetFullAuthContext(request, fixture.Organization.ID, fixture.User.ID, fixture.User.RoleID, true)
+			testutil.SetPathParam(request, "id", shadow.ID.String())
+			err := app.UpdateChannelAccount(request)
+			status <- testutil.GetResponseStatusCode(request)
+			return err
+		})
+	}()
+	backendPID := <-pid
+	require.Positive(t, backendPID)
+	testutil.RequirePostgresBackendWaitingForLock(t, db, backendPID)
+	require.NoError(t, holder.Commit().Error)
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+		require.Equal(t, fasthttp.StatusNotFound, <-status)
+	case <-time.After(5 * time.Second):
+		t.Fatal("booking update did not settle after the exact shadow deletion")
+	}
+	revived, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, channelapi.LegacyMetaAccountRef{
+		ID: native.ID, OrganizationID: native.OrganizationID, Name: native.Name, Status: native.Status,
+	})
+	require.NoError(t, err)
+	require.Equal(t, shadow.ID, revived.ID)
+	require.Equal(t, false, revived.Config[models.ChannelConfigAIBookingEnabled])
+}
+
 func TestChannelMessageEnqueueWaitsForDisconnectAndFailsClosed(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	organization := testutil.CreateTestOrganization(t, db)

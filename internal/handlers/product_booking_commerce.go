@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	bookingcore "github.com/shridarpatil/whatomate/internal/booking"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -32,6 +33,10 @@ const (
 	paymentIntentAuditResource   = "payment_intent"
 	paymentAuditResource         = "payment_transaction"
 )
+
+// bookingReservationNow is an internal clock seam for deterministic tests of
+// the post-lock booking boundary. Production always leaves it as time.Now.
+var bookingReservationNow = time.Now
 
 type bookingCommerceClientError struct {
 	status  int
@@ -53,7 +58,17 @@ func (a *App) sendBookingCommerceError(
 ) error {
 	var clientErr *bookingCommerceClientError
 	var crmClientErr *productCRMClientError
+	var domainErr *bookingcore.Error
 	switch {
+	case errors.As(err, &domainErr):
+		status := fasthttp.StatusConflict
+		if domainErr.Kind == "invalid" {
+			status = fasthttp.StatusBadRequest
+		}
+		if domainErr.Kind == "forbidden" {
+			status = fasthttp.StatusPaymentRequired
+		}
+		return r.SendErrorEnvelope(status, domainErr.Message, nil, "")
 	case errors.As(err, &clientErr):
 		return r.SendErrorEnvelope(clientErr.status, clientErr.message, nil, "")
 	case errors.As(err, &crmClientErr):
@@ -98,6 +113,19 @@ type BookingResourceRequest struct {
 	IsActive    *bool                      `json:"is_active,omitempty"`
 	Metadata    models.JSONB               `json:"metadata,omitempty"`
 	Version     int64                      `json:"version,omitempty"`
+}
+
+// DeleteBookingDefinitionRequest requires an explicit confirmation and the
+// version the operator reviewed. Deletion is a history-preserving tombstone.
+type DeleteBookingDefinitionRequest struct {
+	Version       int64 `json:"version"`
+	ConfirmDelete bool  `json:"confirm_delete"`
+}
+
+type DeleteBookingDefinitionResponse struct {
+	ID      uuid.UUID `json:"id"`
+	Version int64     `json:"version"`
+	Deleted bool      `json:"deleted"`
 }
 
 // BookingEventRequest creates or updates one concrete calendar slot.
@@ -367,6 +395,20 @@ func (a *App) CreateBookingService(r *fastglue.Request) error {
 		if err := tx.Create(&service).Error; err != nil {
 			return err
 		}
+		// GORM replaces false with this model's true default during Create.
+		// Restore an explicit inactive request in the same transaction before
+		// links, audit, or the response can observe the defaulted value.
+		if !active {
+			result := tx.Model(&service).Where("organization_id = ?", orgID).
+				UpdateColumn("is_active", false)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errors.New("booking service active state was not persisted")
+			}
+			service.IsActive = false
+		}
 		if err := replaceBookingServiceResources(tx, orgID, service.ID, req.ResourceIDs); err != nil {
 			return err
 		}
@@ -589,6 +631,19 @@ func (a *App) CreateBookingResource(r *fastglue.Request) error {
 		if err := tx.Create(&resource).Error; err != nil {
 			return err
 		}
+		// Keep the model's active default, but persist an explicit false
+		// atomically with creation and its audit record.
+		if !active {
+			result := tx.Model(&resource).Where("organization_id = ?", orgID).
+				UpdateColumn("is_active", false)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errors.New("booking resource active state was not persisted")
+			}
+			resource.IsActive = false
+		}
 		return audit.LogAudit(
 			tx, orgID, userID, audit.GetUserName(tx, userID),
 			bookingResourceAuditResource, resource.ID,
@@ -694,6 +749,216 @@ func (a *App) UpdateBookingResource(r *fastglue.Request) error {
 		return a.sendBookingCommerceError(r, "update booking resource", err)
 	}
 	return r.SendEnvelope(updated)
+}
+
+// DeleteBookingService soft-deletes only inactive definitions without business
+// history or remaining dependencies. It never deletes their related records.
+func (a *App) DeleteBookingService(r *fastglue.Request) error {
+	return a.deleteBookingDefinition(r, true)
+}
+
+// DeleteBookingResource uses the same lifecycle boundary for resources.
+func (a *App) DeleteBookingResource(r *fastglue.Request) error {
+	return a.deleteBookingDefinition(r, false)
+}
+
+func (a *App) deleteBookingDefinition(r *fastglue.Request, service bool) error {
+	orgID, userID, err := a.requireAuth(r, models.ResourceBookingSettings, models.ActionDelete)
+	if err != nil {
+		return nil
+	}
+	label, auditResource := "booking resource", bookingResourceAuditResource
+	if service {
+		label, auditResource = "booking service", bookingServiceAuditResource
+	}
+	id, err := parsePathUUID(r, "id", label)
+	if err != nil {
+		return nil
+	}
+	var req DeleteBookingDefinitionRequest
+	if err := a.decodeRequest(r, &req); err != nil {
+		return nil
+	}
+	if req.Version < 1 || !req.ConfirmDelete {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest,
+			"version must be at least 1 and confirm_delete must be true", nil, "")
+	}
+	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		var model any
+		var active bool
+		var version int64
+		if service {
+			record := &models.BookingService{}
+			err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND organization_id = ?", id, orgID).First(record).Error
+			model, active, version = record, record.IsActive, record.Version
+		} else {
+			record := &models.BookingResource{}
+			err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND organization_id = ?", id, orgID).First(record).Error
+			model, active, version = record, record.IsActive, record.Version
+		}
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return newBookingCommerceClientError(fasthttp.StatusNotFound, label+" not found")
+			}
+			return err
+		}
+		if version != req.Version {
+			return newBookingCommerceClientError(fasthttp.StatusConflict,
+				label+" was modified; refresh and retry")
+		}
+		if active {
+			return newBookingCommerceClientError(fasthttp.StatusConflict,
+				"Deactivate this "+label+" before deleting it")
+		}
+		if err := ensureBookingDefinitionUnused(tx, orgID, id, service); err != nil {
+			return err
+		}
+		// UPDATE deliberately sets the soft-delete timestamp and version
+		// together. No Unscoped Delete, association delete or cascade occurs.
+		result := tx.Model(model).
+			Where("id = ? AND organization_id = ? AND version = ? AND is_active = ?", id, orgID, req.Version, false).
+			Updates(map[string]any{
+				"deleted_at": time.Now().UTC(), "updated_by_id": userID,
+				"version": gorm.Expr("version + 1"),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return newBookingCommerceClientError(fasthttp.StatusConflict,
+				label+" was modified; refresh and retry")
+		}
+		return audit.LogAudit(tx, orgID, userID, audit.GetUserName(tx, userID),
+			auditResource, id, models.AuditActionDeleted, model, nil)
+	})
+	if err != nil {
+		return a.sendBookingCommerceError(r, "delete "+label, err)
+	}
+	return r.SendEnvelope(DeleteBookingDefinitionResponse{ID: id, Version: req.Version + 1, Deleted: true})
+}
+
+// A retained schedule is business history even if cancelled or soft-deleted.
+// Setup-only links may be removed explicitly, but this operation cannot remove
+// any surviving link, entitlement, availability rule or time-off record.
+func ensureBookingDefinitionUnused(tx *gorm.DB, orgID, id uuid.UUID, service bool) error {
+	type dependency struct {
+		model  any
+		column string
+	}
+	dependencies := []dependency{
+		{&models.BookingEvent{}, "resource_id"},
+		{&models.BookingServiceResource{}, "resource_id"},
+		{&models.AvailabilityRule{}, "resource_id"},
+		{&models.ResourceTimeOff{}, "resource_id"},
+	}
+	field := "resource_id"
+	if service {
+		field = "service_id"
+		dependencies = []dependency{
+			{&models.BookingEvent{}, "service_id"},
+			{&models.BookingServiceResource{}, "service_id"},
+			{&models.PackageEntitlement{}, "booking_service_id"},
+		}
+	}
+	for _, dep := range dependencies {
+		var count int64
+		if err := tx.Unscoped().Model(dep.model).
+			Where("organization_id = ? AND "+dep.column+" = ?", orgID, id).Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 0 {
+			return newBookingCommerceClientError(fasthttp.StatusConflict,
+				"This definition has booking/schedule history or remaining dependencies; keep it deactivated")
+		}
+	}
+	// An event can be reassigned. Its original definition remains protected by
+	// the same transaction's audit even when the current event IDs differ.
+	types := []string{bookingEventAuditResource}
+	if service {
+		types = append(types, packageAuditResource)
+	}
+	var logs []models.AuditLog
+	if err := tx.Where("organization_id = ? AND resource_type IN ?", orgID, types).
+		Select("resource_type", "resource_id", "changes").Find(&logs).Error; err != nil {
+		return err
+	}
+	for _, log := range logs {
+		if len(log.Changes) == 0 {
+			return newBookingCommerceClientError(fasthttp.StatusConflict,
+				"Business history cannot be verified; keep this definition deactivated")
+		}
+		for _, raw := range log.Changes {
+			change, ok := raw.(map[string]any)
+			if !ok {
+				return newBookingCommerceClientError(fasthttp.StatusConflict,
+					"Business history cannot be verified; keep this definition deactivated")
+			}
+			if name, ok := change["field"].(string); !ok || name == "" {
+				return newBookingCommerceClientError(fasthttp.StatusConflict,
+					"Business history cannot be verified; keep this definition deactivated")
+			}
+			if log.ResourceType == bookingEventAuditResource && change["field"] == field {
+				for _, value := range []any{change["old_value"], change["new_value"]} {
+					if value == nil {
+						continue
+					}
+					rawID, ok := value.(string)
+					parsed, parseErr := uuid.Parse(rawID)
+					if !ok || parseErr != nil || parsed == uuid.Nil {
+						return newBookingCommerceClientError(fasthttp.StatusConflict,
+							"Business history cannot be verified; keep this definition deactivated")
+					}
+					if parsed == id {
+						return newBookingCommerceClientError(fasthttp.StatusConflict,
+							"This definition has retained schedule history; keep it deactivated")
+					}
+				}
+			}
+			if service && log.ResourceType == packageAuditResource && change["field"] == "entitlements" {
+				for _, value := range []any{change["old_value"], change["new_value"]} {
+					if value == nil {
+						continue
+					}
+					entries, ok := value.([]any)
+					if !ok {
+						return newBookingCommerceClientError(fasthttp.StatusConflict,
+							"Purchase history cannot be verified; keep this definition deactivated")
+					}
+					for _, rawEntry := range entries {
+						entry, ok := rawEntry.(map[string]any)
+						if !ok {
+							return newBookingCommerceClientError(fasthttp.StatusConflict,
+								"Purchase history cannot be verified; keep this definition deactivated")
+						}
+						rawID, ok := entry["booking_service_id"].(string)
+						parsed, parseErr := uuid.Parse(rawID)
+						if !ok || parseErr != nil || parsed == uuid.Nil {
+							return newBookingCommerceClientError(fasthttp.StatusConflict,
+								"Purchase history cannot be verified; keep this definition deactivated")
+						}
+						if parsed != id {
+							continue
+						}
+						for _, purchased := range []any{&models.ContactPackage{}, &models.InvoiceLine{}} {
+							var count int64
+							if err := tx.Unscoped().Model(purchased).
+								Where("organization_id = ? AND package_definition_id = ?", orgID, log.ResourceID).
+								Count(&count).Error; err != nil {
+								return err
+							}
+							if count != 0 {
+								return newBookingCommerceClientError(fasthttp.StatusConflict,
+									"This definition has retained purchase history; keep it deactivated")
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // ListBookingEvents lists concrete calendar slots with date/resource filters.
@@ -1102,108 +1367,21 @@ func (a *App) CreateBooking(r *fastglue.Request) error {
 	}
 	var booking models.Booking
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
-		err := tx.Where(
-			"organization_id = ? AND idempotency_key = ?",
-			orgID,
-			req.IdempotencyKey,
-		).First(&booking).Error
-		if err == nil {
-			if booking.EventID != req.EventID ||
-				booking.ContactID != req.ContactID ||
-				booking.Quantity != req.Quantity ||
-				!bookingCommerceUUIDPointersEqual(
-					booking.ContactPackageID,
-					req.ContactPackageID,
-				) {
-				return newBookingCommerceClientError(
-					fasthttp.StatusConflict,
-					"Idempotency key was already used for a different booking",
-				)
-			}
-			return nil
-		}
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-		if err := ensureProductCRMTenantRecord(
-			tx, &models.Contact{}, orgID, req.ContactID, "contact_id",
-		); err != nil {
-			return err
-		}
-		var event models.BookingEvent
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where(
-				"id = ? AND organization_id = ? AND status = ?",
-				req.EventID, orgID, models.BookingEventStatusScheduled,
-			).
-			First(&event).Error; err != nil {
-			return newBookingCommerceClientError(
-				fasthttp.StatusBadRequest,
-				"event_id does not belong to an active scheduled event",
-			)
-		}
-		err = tx.Where(
-			"organization_id = ? AND idempotency_key = ?",
-			orgID,
-			req.IdempotencyKey,
-		).First(&booking).Error
-		if err == nil {
-			if booking.EventID != req.EventID ||
-				booking.ContactID != req.ContactID ||
-				booking.Quantity != req.Quantity ||
-				!bookingCommerceUUIDPointersEqual(
-					booking.ContactPackageID,
-					req.ContactPackageID,
-				) {
-				return newBookingCommerceClientError(
-					fasthttp.StatusConflict,
-					"Idempotency key was already used for a different booking",
-				)
-			}
-			return nil
-		}
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-
-		status := req.Status
-		occupied, err := bookingEventOccupiedQuantity(tx, orgID, event.ID, uuid.Nil)
+		result, err := bookingcore.ReserveTx(tx, orgID, bookingcore.ReserveInput{
+			EventID: req.EventID, ContactID: req.ContactID, Quantity: req.Quantity,
+			Status: req.Status, Source: req.Source, Notes: req.Notes,
+			ContactPackageID: req.ContactPackageID, AllowWaitlist: req.AllowWaitlist,
+			IdempotencyKey: req.IdempotencyKey, Metadata: bookingCommerceJSON(req.Metadata),
+			ActorUserID: &userID,
+		}, bookingReservationNow)
 		if err != nil {
 			return err
 		}
-		if bookingStatusOccupiesCapacity(status) && occupied+req.Quantity > event.Capacity {
-			if !req.AllowWaitlist {
-				return newBookingCommerceClientError(
-					fasthttp.StatusConflict,
-					"Booking event does not have enough remaining capacity",
-				)
-			}
-			status = models.BookingStatusWaitlisted
+		booking = result.Booking
+		if !result.Created {
+			return nil
 		}
-
-		now := time.Now().UTC()
-		booking = models.Booking{
-			BaseModel:        models.BaseModel{ID: uuid.New()},
-			OrganizationID:   orgID,
-			EventID:          event.ID,
-			ContactID:        req.ContactID,
-			Status:           status,
-			Quantity:         req.Quantity,
-			Source:           req.Source,
-			Notes:            strings.TrimSpace(req.Notes),
-			ContactPackageID: req.ContactPackageID,
-			BookedByID:       &userID,
-			IdempotencyKey:   strings.TrimSpace(req.IdempotencyKey),
-			Metadata:         bookingCommerceJSON(req.Metadata),
-			Version:          1,
-			UpdatedByID:      &userID,
-		}
-		if status == models.BookingStatusConfirmed {
-			booking.ConfirmedAt = &now
-		}
-		if err := tx.Create(&booking).Error; err != nil {
-			return err
-		}
+		event, now, status := &result.Event, result.Now, booking.Status
 		if bookingStatusOccupiesCapacity(status) && booking.ContactPackageID != nil {
 			if err := reserveBookingPackageCredit(
 				tx, orgID, &booking, event.ServiceID, userID, now,
@@ -1214,11 +1392,6 @@ func (a *App) CreateBooking(r *fastglue.Request) error {
 			if err := validateBookingContactPackage(
 				tx, orgID, &booking, event.ServiceID, false,
 			); err != nil {
-				return err
-			}
-		}
-		if bookingStatusOccupiesCapacity(status) {
-			if err := bumpBookingEventVersion(tx, orgID, event.ID); err != nil {
 				return err
 			}
 		}
@@ -1548,6 +1721,13 @@ func (a *App) UpdatePackage(r *fastglue.Request) error {
 	}
 	if err := validatePackageRequest(&req, true); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+	// Commercial editing still requires write; explicitly retiring a package
+	// also requires delete, including when sent through this generic update.
+	if req.IsActive != nil && !*req.IsActive {
+		if err := a.requirePermission(r, userID, models.ResourcePackages, models.ActionDelete); err != nil {
+			return nil
+		}
 	}
 	var updated models.PackageDefinition
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
@@ -3475,13 +3655,16 @@ func validateBookingResourceIDs(
 	if len(resourceIDs) == 0 {
 		return nil
 	}
-	var count int64
-	if err := tx.Model(&models.BookingResource{}).
+	// Reference writers share-lock definitions in a stable order. The delete
+	// boundary's UPDATE lock must either observe their committed references or
+	// make the writer reject the newly tombstoned definition.
+	var resources []models.BookingResource
+	if err := tx.Select("id").Clauses(clause.Locking{Strength: "SHARE"}).
 		Where("organization_id = ? AND id IN ?", orgID, resourceIDs).
-		Count(&count).Error; err != nil {
+		Order("id").Find(&resources).Error; err != nil {
 		return err
 	}
-	if int(count) != len(resourceIDs) {
+	if len(resources) != len(resourceIDs) {
 		return newBookingCommerceClientError(
 			fasthttp.StatusBadRequest,
 			"One or more resource_ids do not belong to the organization",
@@ -3548,7 +3731,7 @@ func validateBookingEventReferences(
 	orgID, serviceID, resourceID uuid.UUID,
 ) (*models.BookingService, *models.BookingResource, error) {
 	var service models.BookingService
-	if err := tx.Where(
+	if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).Where(
 		"id = ? AND organization_id = ? AND is_active = ?",
 		serviceID, orgID, true,
 	).First(&service).Error; err != nil {
@@ -3817,16 +4000,18 @@ func validatePackageEntitlementReferences(
 	for i := range inputs {
 		serviceIDs[i] = inputs[i].BookingServiceID
 	}
-	var count int64
-	if err := tx.Model(&models.BookingService{}).
+	// Package commercial semantics are unchanged; this lock only fences a
+	// concurrently removed service definition before publishing its reference.
+	var services []models.BookingService
+	if err := tx.Select("id").Clauses(clause.Locking{Strength: "SHARE"}).
 		Where(
 			"organization_id = ? AND id IN ? AND is_active = ?",
 			orgID, serviceIDs, true,
 		).
-		Count(&count).Error; err != nil {
+		Order("id").Find(&services).Error; err != nil {
 		return err
 	}
-	if int(count) != len(serviceIDs) {
+	if len(services) != len(serviceIDs) {
 		return newBookingCommerceClientError(
 			fasthttp.StatusBadRequest,
 			"One or more entitlement services are inactive or outside the organization",

@@ -300,7 +300,7 @@ func (a *App) validateLegacyReplyPolicyTx(
 		strings.TrimSpace(account.PhoneID) == "" {
 		return nil, fmt.Errorf("%w: established account is inactive", errLegacyReplyBindingUnavailable)
 	}
-	if err := a.prepareWhatsAppAccountForRuntime(&account); err != nil {
+	if err := a.prepareWhatsAppAccountForOutbound(&account); err != nil {
 		return nil, fmt.Errorf("%w: runtime credentials: %v", errLegacyReplyBindingUnavailable, err)
 	}
 
