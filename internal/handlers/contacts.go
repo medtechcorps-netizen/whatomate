@@ -1546,7 +1546,7 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 			}
 			updates["deleted_at"] = nil
 			activityKey := "contact-restored:" + existingContact.ID.String() + ":" + uuid.NewString()
-			if err := a.DB.Transaction(func(tx *gorm.DB) error {
+			if err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
 				if err := tx.Unscoped().Model(&existingContact).Updates(updates).Error; err != nil {
 					return err
 				}
@@ -1601,7 +1601,7 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 		contact.Metadata = models.JSONB(req.Metadata)
 	}
 
-	if err := a.DB.Transaction(func(tx *gorm.DB) error {
+	if err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
 		if err := tx.Create(&contact).Error; err != nil {
 			return err
 		}
@@ -1797,7 +1797,10 @@ func (a *App) DeleteContact(r *fastglue.Request) error {
 	}
 
 	// Soft delete the contact
-	if err := a.DB.Delete(contact).Error; err != nil {
+	if err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		return tx.Where("id = ? AND organization_id = ?", contactID, orgID).
+			Delete(&models.Contact{}).Error
+	}); err != nil {
 		a.Log.Error("Failed to delete contact", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete contact", nil, "")
 	}

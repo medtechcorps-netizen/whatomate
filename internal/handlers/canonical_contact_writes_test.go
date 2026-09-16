@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -12,6 +14,38 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm/clause"
 )
+
+type canonicalContactWriteSQLStateError struct {
+	code string
+}
+
+func (err canonicalContactWriteSQLStateError) Error() string {
+	return "postgres test error " + err.code
+}
+
+func (err canonicalContactWriteSQLStateError) SQLState() string {
+	return err.code
+}
+
+func TestCanonicalContactWriteRetryPolicyIncludesSelectorFenceContention(t *testing.T) {
+	wrapped := fmt.Errorf("wrapped selector fence contention: %w", canonicalContactWriteSQLStateError{code: "55P03"})
+	assert.True(t, isRetryableCanonicalContactWrite(wrapped))
+	assert.False(t, isRetryableCanonicalContactWrite(
+		fmt.Errorf("wrapped deliberate failure: %w", canonicalContactWriteSQLStateError{code: "P0001"}),
+	))
+	assert.Equal(t, 6, canonicalContactWriteAttempts)
+	assert.Equal(t, [...]time.Duration{
+		25 * time.Millisecond,
+		50 * time.Millisecond,
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+	}, canonicalContactWriteRetryBackoffs)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.ErrorIs(t, waitForCanonicalContactWriteRetry(ctx, 0), context.Canceled)
+}
 
 func TestSaveAndFinalizeTransfer_ConcurrentAliasCreatorsUseOneCanonicalTransfer(t *testing.T) {
 	app := newProcessorTestApp(t)

@@ -189,6 +189,21 @@ func runAsTenantRLSTestRole(
 
 func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 	adminDB := testutil.SetupTestDB(t)
+	var fixtureState struct {
+		Superuser        bool `gorm:"column:superuser"`
+		ServerVersionNum int  `gorm:"column:server_version_num"`
+	}
+	require.NoError(t, adminDB.Raw(`
+		SELECT role.rolsuper AS superuser,
+			pg_catalog.current_setting('server_version_num')::integer AS server_version_num
+		FROM pg_catalog.pg_roles AS role
+		WHERE role.rolname = current_user
+	`).Scan(&fixtureState).Error)
+	require.True(t, fixtureState.Superuser,
+		"the shared privilege-escape fixture requires a superuser migration role")
+	postgresMajor := fixtureState.ServerVersionNum / 10000
+	require.Contains(t, []int{14, 17}, postgresMajor,
+		"privilege-escape expectations are defined only for PostgreSQL 14 and 17")
 	require.NoError(t, database.RemoveTenantRLS(adminDB))
 
 	var migrationRole string
@@ -203,6 +218,23 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 	bridge := quoteTenantRLSTestIdentifier(bridgeRole)
 	privileged := quoteTenantRLSTestIdentifier(privilegedRole)
 	replication := quoteTenantRLSTestIdentifier(replicationRole)
+	expectedApplyMigrationMembershipError := fmt.Sprintf(
+		"runtime role %q must not be a member of migration role %q",
+		runtimeRole, migrationRole,
+	)
+	expectedVerifyMigrationEscapeError := fmt.Sprintf(
+		"runtime role %q can SET ROLE to a public-schema creator", runtimeRole,
+	)
+	if postgresMajor == 17 {
+		// SET ROLE into this superuser fixture also grants parameter authority,
+		// which is rejected before the migration/schema-specific guards on PG17.
+		expectedParameterAuthorityError := fmt.Sprintf(
+			"runtime role %q has unauthorized session_replication_role authority or configuration",
+			runtimeRole,
+		)
+		expectedApplyMigrationMembershipError = expectedParameterAuthorityError
+		expectedVerifyMigrationEscapeError = expectedParameterAuthorityError
+	}
 	var resellerID uuid.UUID
 	var preexistingUnassignedOrganizationIDs []uuid.UUID
 	var organizationIDs []uuid.UUID
@@ -327,25 +359,20 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		).Error)
 
 		var membership struct {
-			Member   bool `gorm:"column:member"`
-			Usage    bool `gorm:"column:usage"`
-			Settable bool `gorm:"column:settable"`
+			Member bool `gorm:"column:member"`
+			Usage  bool `gorm:"column:usage"`
 		}
 		require.NoError(t, adminDB.Raw(`
 			SELECT
 				pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'MEMBER') AS member,
-				pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'USAGE') AS usage,
-				pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'SET') AS settable
+				pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'USAGE') AS usage
 		`,
-			runtimeRole, migrationRole,
 			runtimeRole, migrationRole,
 			runtimeRole, migrationRole,
 		).Scan(&membership).Error)
 		require.True(t, membership.Member)
 		require.False(t, membership.Usage,
 			"NOINHERIT membership should require SET ROLE")
-		require.True(t, membership.Settable,
-			"NOINHERIT membership still retains SET ROLE capability")
 
 		require.NoError(t, runAsTenantRLSTestRole(
 			runtimeDB,
@@ -374,7 +401,7 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		before := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
 		err := database.ApplyTenantRLS(adminDB, runtimeRole)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "must not be a member of migration role")
+		require.EqualError(t, err, expectedApplyMigrationMembershipError)
 		after := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
 		require.Equal(t, before, after,
 			"a rejected ApplyTenantRLS call must not grant or install anything")
@@ -406,7 +433,7 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		before := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
 		err := database.ApplyTenantRLS(adminDB, runtimeRole)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "must not be a member of migration role")
+		require.EqualError(t, err, expectedApplyMigrationMembershipError)
 		after := readTenantRLSApplyMutationState(t, adminDB, runtimeRole)
 		require.Equal(t, before, after)
 
@@ -419,6 +446,145 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		).Error)
 		grantedMigrationToBridge = false
 	})
+
+	// Keep the later migration-membership guard reachable on both supported
+	// majors without the shared superuser fixture's parameter authority.
+	{
+		ownerDB, isolatedAdminDB, ownerRole, isolatedRuntimeRole := testutil.OpenIsolatedTestDatabaseOwnedByRole(t)
+		var ownerState struct {
+			CurrentRole       string `gorm:"column:current_role"`
+			SessionRole       string `gorm:"column:session_role"`
+			AuthenticatedRole string `gorm:"column:authenticated_role"`
+			Superuser         bool   `gorm:"column:superuser"`
+			ServerVersionNum  int    `gorm:"column:server_version_num"`
+		}
+		require.NoError(t, ownerDB.Raw(`
+			SELECT current_user::text AS current_role,
+				session_user::text AS session_role,
+				activity.usename::text AS authenticated_role,
+				role.rolsuper AS superuser,
+				pg_catalog.current_setting('server_version_num')::integer AS server_version_num
+			FROM pg_catalog.pg_roles AS role
+			JOIN pg_catalog.pg_stat_activity AS activity
+			  ON activity.pid = pg_catalog.pg_backend_pid()
+			WHERE role.rolname = current_user
+		`).Scan(&ownerState).Error)
+		require.Equal(t, ownerRole, ownerState.CurrentRole)
+		require.Equal(t, ownerRole, ownerState.SessionRole)
+		require.Equal(t, ownerRole, ownerState.AuthenticatedRole)
+		require.False(t, ownerState.Superuser)
+		require.Equal(t, fixtureState.ServerVersionNum, ownerState.ServerVersionNum)
+
+		assertMembership := func(t *testing.T, memberRole, grantedRole string, direct bool) {
+			t.Helper()
+			var membership struct {
+				Member      bool `gorm:"column:member"`
+				Usage       bool `gorm:"column:usage"`
+				DirectGrant bool `gorm:"column:direct_grant"`
+			}
+			require.NoError(t, isolatedAdminDB.Raw(`
+				SELECT
+					pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'MEMBER') AS member,
+					pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'USAGE') AS usage,
+					EXISTS (
+						SELECT 1 FROM pg_catalog.pg_auth_members AS membership
+						WHERE membership.roleid = (
+							SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ?
+						) AND membership.member = (
+							SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ?
+						)
+					) AS direct_grant
+			`, memberRole, grantedRole, memberRole, grantedRole,
+				grantedRole, memberRole).Scan(&membership).Error)
+			require.True(t, membership.Member)
+			require.False(t, membership.Usage)
+			require.Equal(t, direct, membership.DirectGrant)
+		}
+
+		for _, testCase := range []struct {
+			name     string
+			indirect bool
+		}{
+			{name: "Apply rejects direct nonsuperuser migration-owner membership before mutation"},
+			{name: "Apply rejects indirect nonsuperuser migration-owner membership before mutation", indirect: true},
+		} {
+			testCase := testCase
+			t.Run(testCase.name, func(t *testing.T) {
+				type membershipGrant struct {
+					grantedRole string
+					memberRole  string
+				}
+				var grants []membershipGrant
+				isolatedBridgeRole := "rereply_rls_owner_bridge_" + uuid.NewString()[:8]
+				bridgeCreated := false
+				t.Cleanup(func() {
+					for index := len(grants) - 1; index >= 0; index-- {
+						grant := grants[index]
+						if err := isolatedAdminDB.Exec(
+							"REVOKE " + quoteTenantRLSTestIdentifier(grant.grantedRole) +
+								" FROM " + quoteTenantRLSTestIdentifier(grant.memberRole),
+						).Error; err != nil {
+							t.Errorf("revoke isolated migration-owner membership: %v", err)
+						}
+					}
+					if bridgeCreated {
+						if err := isolatedAdminDB.Exec(
+							"DROP ROLE IF EXISTS " + quoteTenantRLSTestIdentifier(isolatedBridgeRole),
+						).Error; err != nil {
+							t.Errorf("drop isolated migration-owner bridge: %v", err)
+						}
+					}
+				})
+				grantMembership := func(grantedRole, memberRole string) {
+					grants = append(grants, membershipGrant{grantedRole: grantedRole, memberRole: memberRole})
+					require.NoError(t, isolatedAdminDB.Exec(
+						"GRANT "+quoteTenantRLSTestIdentifier(grantedRole)+
+							" TO "+quoteTenantRLSTestIdentifier(memberRole),
+					).Error)
+				}
+				rolesWithoutParameterAuthority := []string{ownerRole, isolatedRuntimeRole}
+				if testCase.indirect {
+					require.NoError(t, isolatedAdminDB.Exec(
+						"CREATE ROLE "+quoteTenantRLSTestIdentifier(isolatedBridgeRole)+
+							" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION",
+					).Error)
+					bridgeCreated = true
+					grantMembership(ownerRole, isolatedBridgeRole)
+					grantMembership(isolatedBridgeRole, isolatedRuntimeRole)
+					assertMembership(t, isolatedBridgeRole, ownerRole, true)
+					assertMembership(t, isolatedRuntimeRole, isolatedBridgeRole, true)
+					rolesWithoutParameterAuthority = append(rolesWithoutParameterAuthority, isolatedBridgeRole)
+				} else {
+					grantMembership(ownerRole, isolatedRuntimeRole)
+				}
+				assertMembership(t, isolatedRuntimeRole, ownerRole, !testCase.indirect)
+				if postgresMajor == 17 {
+					for _, role := range rolesWithoutParameterAuthority {
+						var parameterAuthority bool
+						require.NoError(t, isolatedAdminDB.Raw(`
+							SELECT pg_catalog.has_parameter_privilege(
+								CAST(? AS name), 'session_replication_role', 'SET'
+							) OR pg_catalog.has_parameter_privilege(
+								CAST(? AS name), 'session_replication_role', 'ALTER SYSTEM'
+							)
+						`, role, role).Scan(&parameterAuthority).Error)
+						require.False(t, parameterAuthority,
+							"the isolated membership fixture must not reach the earlier parameter-authority guard")
+					}
+				}
+
+				before := readTenantRLSApplyMutationState(t, isolatedAdminDB, isolatedRuntimeRole)
+				err := database.ApplyTenantRLS(ownerDB, isolatedRuntimeRole)
+				require.EqualError(t, err, fmt.Sprintf(
+					"runtime role %q must not be a member of migration role %q",
+					isolatedRuntimeRole, ownerRole,
+				))
+				after := readTenantRLSApplyMutationState(t, isolatedAdminDB, isolatedRuntimeRole)
+				require.Equal(t, before, after,
+					"a rejected nonsuperuser-owner ApplyTenantRLS call must not grant or install anything")
+			})
+		}
+	}
 
 	t.Run("Apply rejects membership in an unrelated BYPASSRLS role before mutation", func(t *testing.T) {
 		granted := true
@@ -924,8 +1090,9 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 			},
 		)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "fingerprint owner")
-		require.Contains(t, err.Error(), bridgeRole)
+		require.ErrorContains(t, err, "verify tenant policy fingerprint contract")
+		require.ErrorContains(t, err, "runtime role controls the tenant fingerprint owner")
+		require.NotContains(t, err.Error(), bridgeRole)
 
 		require.NoError(t, adminDB.Exec(
 			"REVOKE "+bridge+" FROM "+runtime,
@@ -971,8 +1138,8 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 			},
 		)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "protected table owner")
-		require.Contains(t, err.Error(), bridgeRole)
+		require.ErrorContains(t, err, "verify canonical tenant policy inventory")
+		require.ErrorContains(t, err, `runtime role has dangerous table authority on protected table "contacts"`)
 
 		require.NoError(t, adminDB.Exec(
 			"REVOKE "+bridge+" FROM "+runtime,
@@ -1109,7 +1276,43 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		contactIDs = append(contactIDs, contact.ID)
 	}
 
-	t.Run("Verify rejects direct drift and revocation restores isolation", func(t *testing.T) {
+	hasDirectRoleGrant := func(grantedRole, memberRole string) bool {
+		var directGrant struct {
+			Present bool `gorm:"column:direct_grant"`
+		}
+		require.NoError(t, adminDB.Raw(`
+			SELECT COUNT(*) = 1 AS direct_grant
+			FROM pg_catalog.pg_auth_members AS membership
+			JOIN pg_catalog.pg_roles AS granted_role
+			  ON granted_role.oid = membership.roleid
+			JOIN pg_catalog.pg_roles AS member_role
+			  ON member_role.oid = membership.member
+			WHERE granted_role.rolname = ?
+			  AND member_role.rolname = ?
+		`, grantedRole, memberRole).Scan(&directGrant).Error)
+		return directGrant.Present
+	}
+	type migrationEscapeState struct {
+		Member  bool `gorm:"column:member"`
+		Usage   bool `gorm:"column:usage"`
+		Creator bool `gorm:"column:creator"`
+	}
+	readMigrationEscapeState := func() migrationEscapeState {
+		var state migrationEscapeState
+		require.NoError(t, adminDB.Raw(`
+			SELECT
+				pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'MEMBER') AS member,
+				pg_catalog.pg_has_role(CAST(? AS name), CAST(? AS name), 'USAGE') AS usage,
+				pg_catalog.has_schema_privilege(CAST(? AS name), 'public', 'CREATE') AS creator
+		`,
+			runtimeRole, migrationRole,
+			runtimeRole, migrationRole,
+			migrationRole,
+		).Scan(&state).Error)
+		return state
+	}
+
+	t.Run("Verify rejects direct migration-owner escape and revocation restores isolation", func(t *testing.T) {
 		granted := true
 		t.Cleanup(func() {
 			if granted {
@@ -1119,6 +1322,13 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		require.NoError(t, adminDB.Exec(
 			"GRANT "+migration+" TO "+runtime,
 		).Error)
+		require.True(t, hasDirectRoleGrant(migrationRole, runtimeRole))
+		escapeState := readMigrationEscapeState()
+		require.True(t, escapeState.Member)
+		require.False(t, escapeState.Usage,
+			"NOINHERIT membership should remain tenant-scoped until SET ROLE")
+		require.True(t, escapeState.Creator,
+			"the migration role must retain the public-schema authority under test")
 		err := runAsTenantRLSTestRole(
 			runtimeDB,
 			runtimeRole,
@@ -1127,10 +1337,11 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 			},
 		)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "permissive RLS policy")
+		require.EqualError(t, err, expectedVerifyMigrationEscapeError)
 
 		var visibleBeforeSetRole int64
 		var visibleAfterSetRole int64
+		var roleAfterSetRole string
 		require.NoError(t, runAsTenantRLSTestRole(
 			runtimeDB,
 			runtimeRole,
@@ -1148,11 +1359,16 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 				).Error; err != nil {
 					return err
 				}
+				if err := runtimeDB.Raw("SELECT current_user").Scan(&roleAfterSetRole).Error; err != nil {
+					return err
+				}
 				return runtimeDB.Model(&models.Contact{}).
 					Where("id IN ?", contactIDs).
 					Count(&visibleAfterSetRole).Error
 			},
 		))
+		require.Equal(t, migrationRole, roleAfterSetRole,
+			"SET ROLE must select the migration authority")
 		require.Equal(t, int64(1), visibleBeforeSetRole,
 			"NOINHERIT runtime access should remain tenant-scoped before SET ROLE")
 		require.Equal(t, int64(2), visibleAfterSetRole,
@@ -1165,7 +1381,7 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		verifyClean(t)
 	})
 
-	t.Run("Verify rejects indirect drift and accepts a clean revoke", func(t *testing.T) {
+	t.Run("Verify rejects indirect migration-owner escape and revocation restores isolation", func(t *testing.T) {
 		grantedMigrationToBridge := true
 		grantedBridgeToRuntime := true
 		t.Cleanup(func() {
@@ -1182,6 +1398,15 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 		require.NoError(t, adminDB.Exec(
 			"GRANT "+bridge+" TO "+runtime,
 		).Error)
+		require.False(t, hasDirectRoleGrant(migrationRole, runtimeRole))
+		require.True(t, hasDirectRoleGrant(migrationRole, bridgeRole))
+		require.True(t, hasDirectRoleGrant(bridgeRole, runtimeRole))
+		escapeState := readMigrationEscapeState()
+		require.True(t, escapeState.Member)
+		require.False(t, escapeState.Usage,
+			"NOINHERIT membership should remain tenant-scoped until SET ROLE")
+		require.True(t, escapeState.Creator,
+			"the migration role must retain the public-schema authority under test")
 		err := runAsTenantRLSTestRole(
 			runtimeDB,
 			runtimeRole,
@@ -1190,7 +1415,42 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 			},
 		)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "permissive RLS policy")
+		require.EqualError(t, err, expectedVerifyMigrationEscapeError)
+
+		var visibleBeforeSetRole int64
+		var visibleAfterSetRole int64
+		var roleAfterSetRole string
+		require.NoError(t, runAsTenantRLSTestRole(
+			runtimeDB,
+			runtimeRole,
+			func(runtimeDB *gorm.DB) error {
+				if err := database.SetTenantContext(runtimeDB, orgA.ID); err != nil {
+					return err
+				}
+				if err := runtimeDB.Model(&models.Contact{}).
+					Where("id IN ?", contactIDs).
+					Count(&visibleBeforeSetRole).Error; err != nil {
+					return err
+				}
+				if err := runtimeDB.Exec(
+					"SET LOCAL ROLE " + migration,
+				).Error; err != nil {
+					return err
+				}
+				if err := runtimeDB.Raw("SELECT current_user").Scan(&roleAfterSetRole).Error; err != nil {
+					return err
+				}
+				return runtimeDB.Model(&models.Contact{}).
+					Where("id IN ?", contactIDs).
+					Count(&visibleAfterSetRole).Error
+			},
+		))
+		require.Equal(t, migrationRole, roleAfterSetRole,
+			"transitive SET ROLE must select the migration authority")
+		require.Equal(t, int64(1), visibleBeforeSetRole,
+			"NOINHERIT transitive access should remain tenant-scoped before SET ROLE")
+		require.Equal(t, int64(2), visibleAfterSetRole,
+			"transitive SET ROLE into the permissive migration policy exposes both tenants")
 
 		require.NoError(t, adminDB.Exec(
 			"REVOKE "+bridge+" FROM "+runtime,
@@ -1236,8 +1496,8 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 			},
 		)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), renamedPolicy)
-		require.Contains(t, err.Error(), "contacts")
+		require.ErrorContains(t, err, "verify canonical tenant policy inventory")
+		require.ErrorContains(t, err, `protected runtime tenant policy inventory on "contacts" is not exact`)
 
 		require.NoError(t, adminDB.Exec(
 			"ALTER POLICY "+renamedPolicy+" ON public.contacts TO "+migration,
@@ -1274,8 +1534,8 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 			},
 		)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), extraPolicy)
-		require.Contains(t, err.Error(), "chatbot_flow_steps")
+		require.ErrorContains(t, err, "verify canonical tenant policy inventory")
+		require.ErrorContains(t, err, `protected runtime tenant policy inventory on "chatbot_flow_steps" is not exact`)
 
 		require.NoError(t, adminDB.Exec(
 			"DROP POLICY "+extraPolicy+" ON public.chatbot_flow_steps",
@@ -1309,7 +1569,8 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 			},
 		)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "platform compliance write guard is incomplete")
+		require.ErrorContains(t, err, "verify canonical tenant policy inventory")
+		require.ErrorContains(t, err, `protected runtime tenant policy inventory on "contacts" is not exact`)
 		require.NoError(t, adminDB.Exec(
 			"CREATE POLICY rereply_migration_access ON public.contacts TO "+migration+
 				" USING (true) WITH CHECK (true)",
@@ -1343,7 +1604,8 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 			},
 		)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "fingerprint does not match")
+		require.ErrorContains(t, err, `tenant policy on "contacts" does not match the code-derived canonical contract`)
+		require.ErrorContains(t, err, "metadata=true roles=true using=false check=false")
 
 		require.NoError(t, adminDB.Exec(
 			"ALTER POLICY rereply_tenant_isolation ON public.contacts USING ("+
@@ -1382,7 +1644,8 @@ func TestTenantRLS_RejectsRuntimePrivilegeEscapes(t *testing.T) {
 			},
 		)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "must not apply to PUBLIC")
+		require.ErrorContains(t, err, "verify canonical tenant policy inventory")
+		require.ErrorContains(t, err, `protected runtime tenant policy inventory on "contacts" is not exact`)
 
 		require.NoError(t, adminDB.Exec(
 			"DROP POLICY rereply_migration_access ON public.contacts",
