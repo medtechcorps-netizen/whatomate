@@ -76,14 +76,14 @@ LOCK_REMEDIATED_PHASE_SOURCE_SHA = {
     "ui": "c6e16810b8dec7d54305be47f7f7fc12430a1f0a"
 }
 REVIEWED_SNAPSHOT_DIFF_SHA256 = {
-    "baseline": "a9dd5f67c9f02427089da2727c730c9be11784452b560c713eedbaf7699b350f",
-    "bridge": "585504eca545d933c932a8b27f254b9402689e61b3947d4fc3ba225eff5d5e58",
+    "baseline": "89853139e27533073431fa59744187dba525a555984e73ba0da298f4d54bdcdc",
+    "bridge": "26fb15a3362cf13f8cb0435266a578c80be962e6980b99c4dee11c964fd946e5",
     "backend": "46f0de2fa16b70bb49548eb2c0d8e41acb8848f5fa5cb1d7c879d00cf41dde95",
     "ui": "a366bbde9742d017cb2860d3ec50cecc13a30e3ecae62693b294f13765028d84"
 }
 REVIEWED_SNAPSHOT_PATH_COUNTS = {
-    "baseline": 34,
-    "bridge": 35,
+    "baseline": 35,
+    "bridge": 36,
     "backend": 112,
     "ui": 142
 }
