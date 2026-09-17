@@ -606,7 +606,37 @@ def deployment_response(spec: Mapping[str, Any]) -> dict[str, Any]:
             "id": DEPLOYMENT_ID,
             "phase": "ACTIVE",
             "spec": copy.deepcopy(spec),
-            "jobs": [{"name": "rereply-rls-migrate", "phase": "SUCCEEDED"}],
+            # DigitalOcean reports the job inventory without a phase and the
+            # outcome through the deployment progress tree.
+            "jobs": [{"name": "rereply-rls-migrate", "source_image_digest": "sha256:" + "1" * 64}],
+            "progress": {
+                "steps": [
+                    {
+                        "name": "deploy",
+                        "status": "SUCCESS",
+                        "steps": [
+                            {
+                                "name": "components",
+                                "status": "SUCCESS",
+                                "steps": [
+                                    {
+                                        "name": "rereply-rls-migrate",
+                                        "status": "SUCCESS",
+                                        "component_name": "rereply-rls-migrate",
+                                        "steps": [
+                                            {
+                                                "name": "wait",
+                                                "status": "SUCCESS",
+                                                "component_name": "rereply-rls-migrate",
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            },
         }
     }
 

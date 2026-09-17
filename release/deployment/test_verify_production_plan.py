@@ -241,6 +241,29 @@ def phase_images(
     return verifier.target_image_records(contract, observed)
 
 
+def digest_source_spec() -> dict[str, object]:
+    """The reviewed production app with digest-image sources instead of git."""
+    spec = fake_spec()
+    records = {record["component"]: record for record in verifier.BOOTSTRAP_IMAGES}
+    for collection in ("services", "jobs"):
+        for component in spec[collection]:
+            component.pop("git", None)
+            component.pop("dockerfile_path", None)
+            release_component = (
+                "web"
+                if component["name"] in {"omnitech-web", "rereply-rls-migrate"}
+                else component["name"]
+            )
+            record = records[release_component]
+            component["image"] = {
+                "registry_type": "GHCR",
+                "registry": "ghcr.io",
+                "repository": record["repository"].removeprefix("ghcr.io/"),
+                "digest": record["digest"],
+            }
+    return spec
+
+
 class FakeResponse:
     def __init__(self, value: object, url: str, *, status: int = 200) -> None:
         self.raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
@@ -306,6 +329,10 @@ class ProductionPlanTests(unittest.TestCase):
         self.contract["bootstrap_state"]["active_deployment_id_sha256"] = (
             active_deployment_hash
         )
+        # The synthetic production app is git-sourced, so the fixture models the
+        # legacy bootstrap shape explicitly.
+        self.contract["bootstrap_state"]["source_mode"] = "legacy-git"
+        self.contract["bootstrap_state"].pop("images", None)
         vpc_hash = verifier.sha256_bytes(self.spec["vpc"]["id"].encode("utf-8"))
         db_inventory = database_inventory(self.spec)
         self.contract["expected_topology"]["vpc_id_sha256"] = vpc_hash
@@ -335,6 +362,9 @@ class ProductionPlanTests(unittest.TestCase):
         patches = [
             mock.patch.object(verifier, "PRODUCTION_VPC_ID_SHA256", vpc_hash),
             mock.patch.object(verifier, "PRODUCTION_DATABASE_INVENTORY", db_inventory),
+            # The synthetic production app is still git-sourced, so the fixture
+            # pins the bootstrap's mode to the legacy lineage it models.
+            mock.patch.object(verifier, "BOOTSTRAP_SOURCE_MODE", "legacy-git"),
             mock.patch.object(
                 verifier, "BOOTSTRAP_CANONICAL_SPEC_SHA256", canonical_hash
             ),
@@ -1301,9 +1331,10 @@ class ProductionPlanTests(unittest.TestCase):
         self.assertEqual(
             target["source"]["commit"], verifier.BASELINE_TARGET_SOURCE_SHA
         )
-        self.assertNotEqual(
-            verifier.BASELINE_TARGET_SOURCE_SHA, verifier.BOOTSTRAP_SOURCE_SHA
-        )
+        # The synthetic fixture models the legacy bootstrap shape; the reviewed
+        # production contract is re-baselined onto image authority and is
+        # asserted separately in ReviewedProductionContractTests.
+        self.assertEqual(verifier.BOOTSTRAP_SOURCE_MODE, "legacy-git")
         self.assertEqual(
             transition,
             {
@@ -1320,18 +1351,18 @@ class ProductionPlanTests(unittest.TestCase):
             self.contract["bootstrap_state"]["genesis_state_sha256"],
         )
 
-    def test_genesis_rejects_the_unpatched_predecessor_as_baseline_target(self) -> None:
-        rollout = copy.deepcopy(self.rollout)
-        rollout["phases"][0]["source"]["commit"] = verifier.BOOTSTRAP_SOURCE_SHA
-        with self.assertRaises(verifier.PlanError):
+    def test_genesis_rejects_a_phase_state_predecessor(self) -> None:
+        with self.assertRaisesRegex(
+            verifier.PlanError, "genesis input unexpectedly contains a phase state"
+        ):
             verifier.validate_rollout_plan(
-                rollout,
+                self.rollout,
                 self.contract,
                 self.normalized,
                 policy=self.policy,
                 policy_sha256=self.policy_hash,
                 schema_sha256=self.schema_hash,
-                predecessor_state=None,
+                predecessor_state=self.phase_state("baseline"),
             )
 
     def test_database_phase_sources_are_independently_allocated(self) -> None:
@@ -2274,6 +2305,46 @@ class ProductionPlanTests(unittest.TestCase):
 
 
 class ReviewedProductionContractTests(unittest.TestCase):
+    def test_digest_bootstrap_authority_is_pinned_and_enforced(self) -> None:
+        contract = verifier.validate_contract(
+            verifier.load_json(CONTRACT_PATH, "contract"),
+            verifier.load_json(POLICY_PATH, "policy"),
+            verifier.load_json(SCHEMA_PATH, "schema"),
+        )
+        expected_state, images = verifier.predecessor_provider_expectation(
+            contract, rollout_plan(), None
+        )
+        self.assertEqual(expected_state["source_mode"], "digest-images")
+        self.assertEqual(set(images), {"web", "meta-relay", "gmail-relay"})
+        for record in verifier.BOOTSTRAP_IMAGES:
+            self.assertEqual(images[record["component"]]["digest"], record["digest"])
+            self.assertEqual(
+                images[record["component"]]["repository"],
+                record["repository"].removeprefix("ghcr.io/"),
+            )
+            self.assertEqual(
+                images[record["component"]]["subject"], record["subject"]
+            )
+
+        spec = digest_source_spec()
+        verifier.validate_digest_component_sources(spec, contract, images)
+        tampered = copy.deepcopy(spec)
+        web = next(item for item in tampered["services"] if item["name"] == "omnitech-web")
+        web["image"]["digest"] = digest("tampered")
+        with self.assertRaises(verifier.PlanError):
+            verifier.validate_digest_component_sources(tampered, contract, images)
+
+    def test_bootstrap_image_authority_is_pinned_to_the_reviewed_constant(self) -> None:
+        contract = verifier.load_json(CONTRACT_PATH, "contract")
+        contract["bootstrap_state"]["images"] = copy.deepcopy(
+            verifier.BOOTSTRAP_IMAGES
+        )
+        contract["bootstrap_state"]["images"][0]["digest"] = digest("tampered")
+        with self.assertRaisesRegex(
+            verifier.PlanError, "bootstrap image authority differs"
+        ):
+            verifier.validate_contract(contract)
+
     def test_reviewed_contract_is_valid_against_unpatched_constants(self) -> None:
         production_contract = verifier.load_json(CONTRACT_PATH, "contract")
         verifier.validate_contract(production_contract)
@@ -2282,11 +2353,34 @@ class ReviewedProductionContractTests(unittest.TestCase):
         )
         self.assertEqual(
             production_contract["bootstrap_state"]["genesis_state_sha256"],
-            "994438c89c979a692d2633a4ae593db7ed01e972e5cccf1cf41ab2535c116aee",
+            "ce184421d9da6905c7b19e4b7f2dc5b38e16ff621335b8d8bffe232fc0dbe935",
         )
         self.assertEqual(
             verifier.genesis_state_sha256(production_contract),
             production_contract["bootstrap_state"]["genesis_state_sha256"],
+        )
+        # 2026-09-18: production was re-baselined onto the already-applied
+        # baseline phase, so the bootstrap is pinned to image authority rather
+        # than to the retired legacy git sources.
+        bootstrap = production_contract["bootstrap_state"]
+        self.assertEqual(bootstrap["source_mode"], "digest-images")
+        self.assertEqual(bootstrap["source_mode"], verifier.BOOTSTRAP_SOURCE_MODE)
+        self.assertEqual(bootstrap["source_sha"], verifier.BASELINE_TARGET_SOURCE_SHA)
+        self.assertEqual(bootstrap["source_sha"], verifier.BOOTSTRAP_SOURCE_SHA)
+        self.assertEqual(bootstrap["images"], verifier.BOOTSTRAP_IMAGES)
+        self.assertEqual(
+            [record["component"] for record in bootstrap["images"]],
+            ["web", "meta-relay", "gmail-relay"],
+        )
+        self.assertEqual(
+            bootstrap["active_deployment_id_sha256"],
+            verifier.BOOTSTRAP_DEPLOYMENT_ID_SHA256,
+        )
+        # The reviewed contract is canonical on disk so that the strict
+        # reconciliation loader accepts the same bytes the plan hashes.
+        self.assertEqual(
+            CONTRACT_PATH.read_bytes(),
+            verifier.canonical_file_bytes(production_contract),
         )
 
 

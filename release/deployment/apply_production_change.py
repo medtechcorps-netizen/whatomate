@@ -256,28 +256,74 @@ def observe_stable(client: ProductionAppClient) -> tuple[dict[str, Any], dict[st
 
 
 def _deployment_candidate(app: Mapping[str, Any], desired_spec: Mapping[str, Any]) -> str | None:
-    candidates: list[str] = []
-    for key in ("in_progress_deployment", "pending_deployment", "active_deployment"):
+    """Select the single deployment that carries the exact desired state.
+
+    A deployment that is still in flight always wins: the app spec is updated by
+    the mutation `PUT` before that deployment settles, so the previous active
+    deployment can transiently look like a match through the app-level spec.
+    The active deployment is a candidate only when nothing is in flight.
+    """
+    inflight: list[str] = []
+    for key in ("in_progress_deployment", "pending_deployment"):
         value = app.get(key)
         if type(value) is not dict:
             continue
-        candidate_spec = value.get("spec")
-        if candidate_spec == desired_spec:
-            candidates.append(common.require_uuid(value.get("id"), f"{key} identity"))
-        elif key == "active_deployment" and app.get("spec") == desired_spec:
-            candidates.append(common.require_uuid(value.get("id"), "active deployment identity"))
-    unique = set(candidates)
-    if len(unique) > 1:
-        common.fail("multiple candidate deployments match the exact mutation")
-    return next(iter(unique)) if unique else None
+        if value.get("spec") == desired_spec:
+            inflight.append(common.require_uuid(value.get("id"), f"{key} identity"))
+    unique_inflight = set(inflight)
+    if len(unique_inflight) > 1:
+        common.fail("multiple in-flight deployments match the exact mutation")
+    if unique_inflight:
+        return next(iter(unique_inflight))
+    active = app.get("active_deployment")
+    if type(active) is dict and (
+        active.get("spec") == desired_spec or app.get("spec") == desired_spec
+    ):
+        return common.require_uuid(active.get("id"), "active deployment identity")
+    return None
 
 
 def _migration_succeeded(deployment: Mapping[str, Any]) -> bool:
+    """Assert the pre-deploy migration job succeeded exactly once.
+
+    DigitalOcean's Apps API no longer reports a per-component phase on
+    `services`/`jobs` (only the name and the source digest); the component
+    outcome arrives through `progress`. An explicit `phase` is still honoured so
+    an older provider response continues to verify.
+    """
     jobs = deployment.get("jobs")
     if type(jobs) is not list:
         common.fail("deployment job inventory is malformed")
     matches = [item for item in jobs if type(item) is dict and item.get("name") == "rereply-rls-migrate"]
-    if len(matches) != 1 or matches[0].get("phase") != "SUCCEEDED":
+    if len(matches) != 1:
+        common.fail("production migration job inventory differs")
+    reported = matches[0].get("phase")
+    if reported is not None:
+        if reported != "SUCCEEDED":
+            common.fail("production migration job did not succeed exactly once")
+        return True
+    statuses: list[str] = []
+
+    def walk(steps: Any) -> None:
+        if type(steps) is not list:
+            return
+        for step in steps:
+            if type(step) is not dict:
+                continue
+            if step.get("component_name") == "rereply-rls-migrate":
+                status = step.get("status")
+                if status is not None:
+                    statuses.append(status)
+            walk(step.get("steps"))
+
+    progress = deployment.get("progress")
+    if type(progress) is not dict:
+        common.fail("deployment progress is malformed")
+    walk(progress.get("steps"))
+    # The provider reports one entry per job lifecycle step (deploy, wait), all
+    # bound to the same component name; the job counts as succeeded only when
+    # every reported step succeeded.
+    if not statuses or set(statuses) != {"SUCCESS"}:
         common.fail("production migration job did not succeed exactly once")
     return True
 
@@ -728,7 +774,7 @@ def _validate_predecessor(
         if (
             predecessor is not None
             or predecessor_sha256 is not None
-            or before["source_mode"] != "legacy-git"
+            or before["source_mode"] not in {"legacy-git", "digest-images"}
         ):
             common.fail("baseline genesis state differs")
         common.require_sha256(signed_predecessor_sha256, "signed genesis state hash")
@@ -851,8 +897,39 @@ def _full_binding(value: Mapping[str, Any], artifact_name: str) -> dict[str, Any
     return common.validate_full_artifact_binding(binding, "mutation intent artifact authority")
 
 
+CONTRACT_PATH = Path(__file__).resolve().with_name("production-app-contract.json")
+
+
+def _bootstrap_images(
+    plan: Mapping[str, Any], *, contract_path: Path | None = None
+) -> list[dict[str, str]]:
+    """Return the re-baselined bootstrap image authority the plan was built on."""
+    path = contract_path or CONTRACT_PATH
+    raw = path.read_bytes()
+    contract = common.loads_strict(raw.decode("utf-8"))
+    control = plan.get("control")
+    if type(control) is not dict:
+        common.fail("production plan control is malformed")
+    if common.sha256_bytes(raw) != common.require_sha256(
+        control.get("contract_sha256"), "plan contract hash"
+    ):
+        common.fail("production contract differs from the signed plan")
+    bootstrap = contract.get("bootstrap_state")
+    if type(bootstrap) is not dict:
+        common.fail("production contract bootstrap state is malformed")
+    if bootstrap.get("source_mode") != "digest-images":
+        common.fail("production bootstrap does not carry image authority")
+    images = bootstrap.get("images")
+    if type(images) is not list or len(images) != 3:
+        common.fail("production bootstrap image authority differs")
+    return [dict(item) for item in images]
+
+
 def _plan_before_state(
-    plan: Mapping[str, Any], predecessor: Mapping[str, Any] | None
+    plan: Mapping[str, Any],
+    predecessor: Mapping[str, Any] | None,
+    *,
+    contract_path: Path | None = None,
 ) -> dict[str, Any]:
     observation = plan.get("provider_observation")
     if type(observation) is not dict:
@@ -862,9 +939,14 @@ def _plan_before_state(
         images: list[dict[str, str]] = []
     elif mode == "digest-images":
         if predecessor is None:
-            common.fail("digest-image mutation intent requires a predecessor")
-        predecessor = common.validate_phase_state(predecessor)
-        images = copy.deepcopy(predecessor["provider_state"]["images"])
+            # Re-baselined genesis: the contract carries the image authority of
+            # the state production is actually in.
+            images = copy.deepcopy(
+                _bootstrap_images(plan, contract_path=contract_path)
+            )
+        else:
+            predecessor = common.validate_phase_state(predecessor)
+            images = copy.deepcopy(predecessor["provider_state"]["images"])
     else:
         common.fail("production plan source mode differs")
     before = {
@@ -926,6 +1008,7 @@ def prepare_apply_mutation_intent(
     mutation_intent_schema_sha256: str,
     controller_sha256: str,
     route_contract_sha256: str,
+    contract_path: Path | None = None,
     now: dt.datetime,
 ) -> dict[str, Any]:
     """Build the sanitized authority in a job with no provider mutation token."""
@@ -955,7 +1038,7 @@ def prepare_apply_mutation_intent(
     if recovery_sha256 != authorities["recovery"]["sha256"]:
         common.fail("recovery authority differs")
     _require_recovery_plan_authority(recovery, authorities["production_plan"])
-    before = _plan_before_state(plan, predecessor)
+    before = _plan_before_state(plan, predecessor, contract_path=contract_path)
     authoritative_predecessor_hash = authorities["predecessor_state_sha256"]
     _validate_predecessor(
         predecessor, predecessor_sha256, source_phase, before,
