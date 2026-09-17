@@ -33,8 +33,8 @@
     ]
   },
   "bootstrap_state": {
-    "genesis_state_sha256": "ae63fb07437bb7b0616fa4f46232e1d933c1d1d21749dfed83b4c1f53813c94c",
-    "active_deployment_id_sha256": "9d56a2b4c48f67f6b2521ba97c5c268f78784d0645f320625bef2e60f5281747",
+    "genesis_state_sha256": "994438c89c979a692d2633a4ae593db7ed01e972e5cccf1cf41ab2535c116aee",
+    "active_deployment_id_sha256": "ac6262aba471f7de0d9ea8ce311f2caec8b5a7e6b10213c09c65bb70333f6afe",
     "canonical_spec_sha256": "9267b22020a7617eaba4faf3214b7ce61e3e0e32b546095c94b9e1b65465d695",
     "environment_values_sha256": "5f69a8b23f044ece64cb5472f373747985ba36c36de14773e015a488db0b1c0b",
     "non_source_projection_sha256": "f89497e26b4de9f9504b2efaf48b0dea7042f4b922ac60fa724bb2de023ec671",
