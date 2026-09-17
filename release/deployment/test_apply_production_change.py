@@ -127,15 +127,75 @@ def app_response(spec: dict[str, object], deployment_id: str, *, pinned: bool = 
     }
 
 
-def deployment_response(spec: dict[str, object], deployment_id: str) -> dict[str, object]:
+def migration_progress(status: str) -> dict[str, object]:
+    """The component inventory DigitalOcean's Apps API actually returns.
+
+    `jobs`/`services` carry only the name and the source digest; the outcome is
+    reported through the deployment `progress` tree.
+    """
     return {
-        "deployment": {
-            "id": deployment_id,
-            "phase": "ACTIVE",
-            "spec": copy.deepcopy(spec),
-            "jobs": [{"name": "rereply-rls-migrate", "phase": "SUCCEEDED"}],
-        }
+        "steps": [
+            {
+                "name": "build",
+                "status": "SUCCESS",
+                "steps": [{"name": "components", "status": "SUCCESS", "steps": []}],
+            },
+            {
+                "name": "deploy",
+                "status": "SUCCESS" if status == "SUCCESS" else "ERROR",
+                "steps": [
+                    {
+                        "name": "components",
+                        "status": "SUCCESS" if status == "SUCCESS" else "ERROR",
+                        "steps": [
+                            {
+                                "name": "rereply-rls-migrate",
+                                "status": status,
+                                "component_name": "rereply-rls-migrate",
+                                "steps": [
+                                    {
+                                        "name": "deploy",
+                                        "status": status,
+                                        "component_name": "rereply-rls-migrate",
+                                    },
+                                    {
+                                        "name": "wait",
+                                        "status": status,
+                                        "component_name": "rereply-rls-migrate",
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
     }
+
+
+def deployment_response(
+    spec: dict[str, object],
+    deployment_id: str,
+    *,
+    migration_status: str = "SUCCESS",
+    legacy_job_phase: str | None = None,
+) -> dict[str, object]:
+    deployment: dict[str, object] = {
+        "id": deployment_id,
+        "phase": "ACTIVE",
+        "spec": copy.deepcopy(spec),
+        "jobs": [
+            {
+                "name": "rereply-rls-migrate",
+                "source_image_digest": common.extract_image_digests(spec)["web"],
+            }
+        ],
+        "progress": migration_progress(migration_status),
+    }
+    if legacy_job_phase is not None:
+        deployment["jobs"] = [{"name": "rereply-rls-migrate", "phase": legacy_job_phase}]
+        deployment.pop("progress")
+    return {"deployment": deployment}
 
 
 def recovery_contract() -> dict[str, object]:
@@ -1062,6 +1122,143 @@ class ApplyControllerTests(unittest.TestCase):
             }
         )
         self.assertEqual(request["predecessor_state_sha256"], genesis)
+
+
+class RebaselinedProviderObservationTests(unittest.TestCase):
+    """The production bootstrap now carries image authority, and DigitalOcean
+    reports component outcomes through `progress` rather than `jobs[].phase`."""
+
+    def test_inflight_deployment_wins_over_the_stale_active_deployment(self) -> None:
+        before = digest_spec("1")
+        desired = digest_spec("2")
+        app = {
+            "spec": copy.deepcopy(desired),
+            "active_deployment": {
+                "id": OLD_DEPLOYMENT,
+                "phase": "SUPERSEDED",
+                "spec": copy.deepcopy(before),
+            },
+            "in_progress_deployment": {
+                "id": NEW_DEPLOYMENT,
+                "phase": "DEPLOYING",
+                "spec": copy.deepcopy(desired),
+            },
+            "pending_deployment": None,
+        }
+        self.assertEqual(apply._deployment_candidate(app, desired), NEW_DEPLOYMENT)
+
+    def test_two_inflight_candidates_fail_closed(self) -> None:
+        desired = digest_spec("2")
+        app = {
+            "spec": copy.deepcopy(desired),
+            "active_deployment": {"id": OLD_DEPLOYMENT, "spec": copy.deepcopy(desired)},
+            "in_progress_deployment": {"id": NEW_DEPLOYMENT, "spec": copy.deepcopy(desired)},
+            "pending_deployment": {
+                "id": "44444444-4444-4444-8444-444444444444",
+                "spec": copy.deepcopy(desired),
+            },
+        }
+        with self.assertRaisesRegex(
+            common.ReleaseError, "multiple in-flight deployments"
+        ):
+            apply._deployment_candidate(app, desired)
+
+    def test_active_deployment_is_selected_when_nothing_is_in_flight(self) -> None:
+        desired = digest_spec("2")
+        app = {
+            "spec": copy.deepcopy(desired),
+            "active_deployment": {"id": OLD_DEPLOYMENT, "spec": copy.deepcopy(desired)},
+            "in_progress_deployment": None,
+            "pending_deployment": None,
+        }
+        self.assertEqual(apply._deployment_candidate(app, desired), OLD_DEPLOYMENT)
+
+    def test_migration_state_reads_the_provider_progress_tree(self) -> None:
+        spec = digest_spec("1")
+        succeeded = deployment_response(spec, NEW_DEPLOYMENT)["deployment"]
+        self.assertTrue(apply._migration_succeeded(succeeded))
+        failed = deployment_response(spec, NEW_DEPLOYMENT, migration_status="ERROR")[
+            "deployment"
+        ]
+        with self.assertRaisesRegex(
+            common.ReleaseError, "production migration job did not succeed exactly once"
+        ):
+            apply._migration_succeeded(failed)
+
+    def test_legacy_job_phase_shape_still_verifies(self) -> None:
+        spec = digest_spec("1")
+        legacy_ok = deployment_response(
+            spec, NEW_DEPLOYMENT, legacy_job_phase="SUCCEEDED"
+        )["deployment"]
+        self.assertTrue(apply._migration_succeeded(legacy_ok))
+        legacy_failed = deployment_response(
+            spec, NEW_DEPLOYMENT, legacy_job_phase="FAILED"
+        )["deployment"]
+        with self.assertRaises(common.ReleaseError):
+            apply._migration_succeeded(legacy_failed)
+
+    def test_migration_job_inventory_still_fails_closed(self) -> None:
+        spec = digest_spec("1")
+        deployment = deployment_response(spec, NEW_DEPLOYMENT)["deployment"]
+        deployment["jobs"] = []
+        with self.assertRaisesRegex(
+            common.ReleaseError, "production migration job inventory differs"
+        ):
+            apply._migration_succeeded(deployment)
+
+    def test_digest_genesis_before_state_uses_the_bootstrap_images(self) -> None:
+        digests = {
+            "web": digest("a"),
+            "meta-relay": digest("b"),
+            "gmail-relay": digest("c"),
+        }
+        images = common.sanitized_image_records(digests)
+        contract = {
+            "bootstrap_state": {"source_mode": "digest-images", "images": images}
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "production-app-contract.json"
+            path.write_bytes(common.canonical_file_bytes(contract))
+            plan = {
+                "control": {"contract_sha256": common.sha256_bytes(path.read_bytes())},
+                "provider_observation": {
+                    "source_mode": "digest-images",
+                    "app_identity_sha256": "a" * 64,
+                    "default_ingress_sha256": "b" * 64,
+                    "app_updated_at_sha256": "c" * 64,
+                    "active_deployment_identity_sha256": "d" * 64,
+                    "live_canonical_spec_sha256": "e" * 64,
+                    "environment_values_sha256": "f" * 64,
+                    "non_source_projection_sha256": "0" * 64,
+                },
+            }
+            before = apply._plan_before_state(plan, None, contract_path=path)
+            self.assertEqual(before["source_mode"], "digest-images")
+            self.assertEqual(before["images"], images)
+            self.assertEqual(before["canonical_spec_sha256"], "e" * 64)
+
+    def test_digest_genesis_before_state_binds_the_contract_hash(self) -> None:
+        images = common.sanitized_image_records(
+            {
+                "web": digest("a"),
+                "meta-relay": digest("b"),
+                "gmail-relay": digest("c"),
+            }
+        )
+        contract = {
+            "bootstrap_state": {"source_mode": "digest-images", "images": images}
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "production-app-contract.json"
+            path.write_bytes(common.canonical_file_bytes(contract))
+            plan = {
+                "control": {"contract_sha256": "1" * 64},
+                "provider_observation": {"source_mode": "digest-images"},
+            }
+            with self.assertRaisesRegex(
+                common.ReleaseError, "production contract differs from the signed plan"
+            ):
+                apply._bootstrap_images(plan, contract_path=path)
 
 
 if __name__ == "__main__":

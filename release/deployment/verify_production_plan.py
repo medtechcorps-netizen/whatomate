@@ -80,19 +80,43 @@ PRODUCTION_APP_ID_SHA256 = (
 PRODUCTION_DEFAULT_INGRESS_SHA256 = (
     "05ab4f90194ad37c6926138e9aafbd49c73aa75d08da92b0b1309bfce207cfa8"
 )
-BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
-    "ac6262aba471f7de0d9ea8ce311f2caec8b5a7e6b10213c09c65bb70333f6afe"
-)
-BOOTSTRAP_SOURCE_SHA = "974bb998f6d4c94ce750a92bf23f4550f8e45a2f"
 BASELINE_TARGET_SOURCE_SHA = "4f65abeb1c03c8fca018aa92cc987fae25ef4000"
+# The production bootstrap is the state the platform is actually in. It was
+# re-baselined on 2026-09-18 onto the already-applied baseline phase, so it now
+# carries immutable image authority instead of the retired legacy git sources.
+BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
+    "c2ce996d6af7527b449ec40a8e92d28a2b9b8a2ea66b8e9e51e1f6da41257335"
+)
+BOOTSTRAP_SOURCE_SHA = BASELINE_TARGET_SOURCE_SHA
+BOOTSTRAP_SOURCE_MODE = "digest-images"
+BOOTSTRAP_IMAGES = [
+    {
+        "component": "web",
+        "repository": "ghcr.io/medtechcorps-netizen/rereply-release-web",
+        "digest": "sha256:545124fb0c64b8c2e126f35c35540c72060c18cecf186cb482b8de37276bbd4f",
+        "subject": "ghcr.io/medtechcorps-netizen/rereply-release-web@sha256:545124fb0c64b8c2e126f35c35540c72060c18cecf186cb482b8de37276bbd4f",
+    },
+    {
+        "component": "meta-relay",
+        "repository": "ghcr.io/medtechcorps-netizen/rereply-release-meta-relay",
+        "digest": "sha256:0631ff00bb12ee9c3e5951896f4d8da6a2763c962d3d9bf03cf5909c7b9e1f63",
+        "subject": "ghcr.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:0631ff00bb12ee9c3e5951896f4d8da6a2763c962d3d9bf03cf5909c7b9e1f63",
+    },
+    {
+        "component": "gmail-relay",
+        "repository": "ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay",
+        "digest": "sha256:f42b9266f5bd930270573d58e7037a257b5cb1dee2f6f6d7ab46c909b1df8fd0",
+        "subject": "ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:f42b9266f5bd930270573d58e7037a257b5cb1dee2f6f6d7ab46c909b1df8fd0",
+    },
+]
 BOOTSTRAP_CANONICAL_SPEC_SHA256 = (
-    "9267b22020a7617eaba4faf3214b7ce61e3e0e32b546095c94b9e1b65465d695"
+    "f224a0349223bd758c9fe3aeac0c0c07bd13128f0e08053e3c30633272990f4f"
 )
 BOOTSTRAP_ENVIRONMENT_SHA256 = (
-    "5f69a8b23f044ece64cb5472f373747985ba36c36de14773e015a488db0b1c0b"
+    "e4a9eb41e54a256b2b9c8b008354d730147a4229f5aa06c7625970cd9b7db3e8"
 )
 BOOTSTRAP_NON_SOURCE_SHA256 = (
-    "f89497e26b4de9f9504b2efaf48b0dea7042f4b922ac60fa724bb2de023ec671"
+    "d70b6908503707d8070a7d26524d495ba630e141c40466169dba24ab4e352701"
 )
 PRODUCTION_VPC_ID_SHA256 = (
     "aaaf98cef6beb658509d644dc8c56b559a38f79344739cd0edd1442070ec207e"
@@ -1178,19 +1202,23 @@ def validate_contract(
     ]:
         fail("provider read-only token scopes differ")
 
-    bootstrap = exact_keys(
-        contract["bootstrap_state"],
-        {
-            "genesis_state_sha256",
-            "active_deployment_id_sha256",
-            "canonical_spec_sha256",
-            "environment_values_sha256",
-            "non_source_projection_sha256",
-            "source_mode",
-            "source_sha",
-        },
-        "bootstrap state",
-    )
+    bootstrap_value = contract["bootstrap_state"]
+    if type(bootstrap_value) is not dict:
+        fail("bootstrap state is malformed")
+    bootstrap_keys = {
+        "genesis_state_sha256",
+        "active_deployment_id_sha256",
+        "canonical_spec_sha256",
+        "environment_values_sha256",
+        "non_source_projection_sha256",
+        "source_mode",
+        "source_sha",
+    }
+    # A re-baselined bootstrap pins image authority as well; the legacy bootstrap
+    # carries none.
+    if bootstrap_value.get("source_mode") == "digest-images":
+        bootstrap_keys.add("images")
+    bootstrap = exact_keys(bootstrap_value, bootstrap_keys, "bootstrap state")
     if require_sha256(
         bootstrap["genesis_state_sha256"], "bootstrap genesis state hash"
     ) != genesis_state_sha256(contract):
@@ -1212,10 +1240,33 @@ def validate_contract(
         fail("bootstrap environment hash differs")
     if bootstrap["non_source_projection_sha256"] != BOOTSTRAP_NON_SOURCE_SHA256:
         fail("bootstrap non-source hash differs")
-    if bootstrap["source_mode"] != "legacy-git":
+    if bootstrap["source_mode"] not in {"legacy-git", "digest-images"}:
         fail("bootstrap source mode differs")
+    if bootstrap["source_mode"] != BOOTSTRAP_SOURCE_MODE:
+        fail("bootstrap source mode differs from the pinned bootstrap lineage")
     if require_sha1(bootstrap["source_sha"], "bootstrap source SHA") != BOOTSTRAP_SOURCE_SHA:
         fail("bootstrap source SHA differs")
+    if bootstrap["source_mode"] == "digest-images":
+        if bootstrap["images"] != BOOTSTRAP_IMAGES:
+            fail("bootstrap image authority differs")
+        for index, record in enumerate(bootstrap["images"]):
+            image = exact_keys(
+                record,
+                {"component", "repository", "digest", "subject"},
+                f"bootstrap image {index}",
+            )
+            component = exact_string(image["component"], "bootstrap image component")
+            if component not in {"web", "meta-relay", "gmail-relay"}:
+                fail("bootstrap image component differs")
+            if exact_string(
+                image["repository"], "bootstrap image repository"
+            ) != f"ghcr.io/medtechcorps-netizen/rereply-release-{component}":
+                fail("bootstrap image repository differs")
+            digest = require_digest(image["digest"], "bootstrap image digest")
+            if exact_string(image["subject"], "bootstrap image subject") != (
+                f"ghcr.io/medtechcorps-netizen/rereply-release-{component}@{digest}"
+            ):
+                fail("bootstrap image subject differs")
 
     components = contract["components"]
     if type(components) is not list or len(components) != 4:
@@ -2479,6 +2530,19 @@ def predecessor_provider_expectation(
 ) -> tuple[dict[str, Any], dict[str, dict[str, str]] | None]:
     if predecessor_state is None:
         bootstrap = contract["bootstrap_state"]
+        bootstrap_images = None
+        if bootstrap["source_mode"] == "digest-images":
+            # A re-baselined bootstrap pins the exact digests production already
+            # runs, so the predecessor assertion is the same strength as the
+            # phase-state path.
+            bootstrap_images = {
+                record["component"]: {
+                    "repository": record["repository"].removeprefix("ghcr.io/"),
+                    "digest": record["digest"],
+                    "subject": record["subject"],
+                }
+                for record in bootstrap["images"]
+            }
         return (
             {
                 "active_deployment_identity_sha256": bootstrap[
@@ -2493,7 +2557,7 @@ def predecessor_provider_expectation(
                 ],
                 "source_mode": bootstrap["source_mode"],
             },
-            None,
+            bootstrap_images,
         )
     phase = predecessor_state["lineage"]["phase"]
     _, images = rollout_phase(rollout_plan, contract, phase)
