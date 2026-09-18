@@ -285,6 +285,40 @@ def observe_settled(
     common.fail("production did not settle across the two exact reads")
 
 
+def _require_materially_unchanged(
+    first_state: Mapping[str, Any],
+    settled_state: Mapping[str, Any],
+    first_spec: Mapping[str, Any],
+    settled_spec: Mapping[str, Any],
+    first_deployment: Mapping[str, Any],
+    settled_deployment: Mapping[str, Any],
+) -> None:
+    """Fail when anything material changed across the post-mutation reads.
+
+    The first snapshot is taken while the deployment DigitalOcean created for
+    the mutation may still be settling, so it can legitimately carry an older
+    `app.updated_at`. Everything else - the provider state ignoring that one
+    volatile timestamp, the live spec, and the deployment identity, phase and
+    spec - must be identical.
+    """
+    if not common.provider_states_share_semantic_lineage(
+        first_state, settled_state, allow_legacy=False
+    ):
+        common.fail("production changed during final double-read")
+    if first_spec != settled_spec:
+        common.fail("production spec changed during final double-read")
+    if (
+        first_deployment.get("id"),
+        first_deployment.get("phase"),
+        first_deployment.get("spec"),
+    ) != (
+        settled_deployment.get("id"),
+        settled_deployment.get("phase"),
+        settled_deployment.get("spec"),
+    ):
+        common.fail("production deployment changed during final double-read")
+
+
 def _deployment_candidate(app: Mapping[str, Any], desired_spec: Mapping[str, Any]) -> str | None:
     """Select the single deployment that carries the exact desired state.
 
@@ -1398,8 +1432,14 @@ def apply_change(
         final_first, final_spec, final_deployment = observe_settled(
             client, sleeper=sleeper, poll_limit=poll_limit
         )
-        if after != final_first or after_spec != final_spec or after_deployment != final_deployment:
-            common.fail("production changed during final double-read")
+        _require_materially_unchanged(
+            after,
+            final_first,
+            after_spec,
+            final_spec,
+            after_deployment,
+            final_deployment,
+        )
         if common.extract_image_digests(after_spec) != dict(target_digests):
             common.fail("active production image tuple differs")
         if before["environment_values_sha256"] != after["environment_values_sha256"]:
