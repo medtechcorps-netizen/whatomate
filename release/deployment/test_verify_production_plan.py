@@ -2353,7 +2353,7 @@ class ReviewedProductionContractTests(unittest.TestCase):
         )
         self.assertEqual(
             production_contract["bootstrap_state"]["genesis_state_sha256"],
-            "e802352c1a354b97cde863bca0f2304a3bb7dbaaa4ce037a849c5998b3cfca74",
+            "8b19b4d317d4ec2020267be50b734a216763dea3fedf2526ea2cb6efe992d6ec",
         )
         self.assertEqual(
             verifier.genesis_state_sha256(production_contract),

@@ -1312,6 +1312,72 @@ class RebaselinedProviderObservationTests(unittest.TestCase):
         ):
             apply.observe_settled(client, sleeper=lambda _seconds: None, poll_limit=2)
 
+    def _material_arguments(self, *, settled_updated_at: str, settled_spec_changes: bool):
+        spec = digest_spec("2")
+        settled_spec = digest_spec("3") if settled_spec_changes else spec
+        first_state = {
+            "app_identity_sha256": "a" * 64,
+            "default_ingress_sha256": "b" * 64,
+            "app_updated_at_sha256": common.sha256_bytes(b"2026-08-27T00:00:00Z"),
+            "active_deployment_identity_sha256": common.sha256_bytes(
+                NEW_DEPLOYMENT.encode("utf-8")
+            ),
+            "canonical_spec_sha256": common.sha256_value(spec),
+            "environment_values_sha256": common.environment_value_fingerprint(spec),
+            "non_source_projection_sha256": common.non_source_fingerprint(spec),
+            "source_mode": "digest-images",
+            "images": common.sanitized_image_records(common.extract_image_digests(spec)),
+        }
+        settled_state = dict(first_state)
+        settled_state["app_updated_at_sha256"] = common.sha256_bytes(
+            settled_updated_at.encode("utf-8")
+        )
+        settled_state["canonical_spec_sha256"] = common.sha256_value(settled_spec)
+        settled_state["images"] = common.sanitized_image_records(
+            common.extract_image_digests(settled_spec)
+        )
+        first_deployment = {"id": NEW_DEPLOYMENT, "phase": "ACTIVE", "spec": spec}
+        settled_deployment = {
+            "id": NEW_DEPLOYMENT,
+            "phase": "ACTIVE",
+            "spec": settled_spec,
+        }
+        return (
+            first_state,
+            settled_state,
+            spec,
+            settled_spec,
+            first_deployment,
+            settled_deployment,
+        )
+
+    def test_settling_timestamp_is_accepted_as_materially_unchanged(self) -> None:
+        arguments = self._material_arguments(
+            settled_updated_at="2026-08-27T00:02:00Z", settled_spec_changes=False
+        )
+        apply._require_materially_unchanged(*arguments)
+
+    def test_material_spec_change_is_rejected(self) -> None:
+        arguments = self._material_arguments(
+            settled_updated_at="2026-08-27T00:02:00Z", settled_spec_changes=True
+        )
+        with self.assertRaisesRegex(
+            common.ReleaseError, "production changed during final double-read"
+        ):
+            apply._require_materially_unchanged(*arguments)
+
+    def test_deployment_identity_change_is_rejected(self) -> None:
+        arguments = list(
+            self._material_arguments(
+                settled_updated_at="2026-08-27T00:02:00Z", settled_spec_changes=False
+            )
+        )
+        arguments[5] = {"id": NEW_DEPLOYMENT, "phase": "SUPERSEDED", "spec": arguments[2]}
+        with self.assertRaisesRegex(
+            common.ReleaseError, "production deployment changed during final double-read"
+        ):
+            apply._require_materially_unchanged(*arguments)
+
 
 if __name__ == "__main__":
     unittest.main()
