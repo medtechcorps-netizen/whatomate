@@ -1089,6 +1089,9 @@ jobs:
           [[ "$GITHUB_RUN_ATTEMPT" == 1 && "$GITHUB_SHA" == "$CONTROL_SHA" ]]
           cd "$RUNNER_TEMP/receipt"
           [[ "$(cat production-phase-rollback-receipt.sha256)" == "$(sha256sum production-phase-rollback-receipt.json | awk '{print $1}')" ]]
+          # Re-enter the checkout: the gate imports the sibling control modules
+          # through a path relative to the repository root.
+          cd "$GITHUB_WORKSPACE"
           /usr/bin/python3 -I -S -B -c 'import sys,pathlib; sys.path.insert(0,"control/release/deployment"); import rollback_production_change as r, verify_production_release as v; p=pathlib.Path("'"$RUNNER_TEMP"'/receipt/production-phase-rollback-receipt.json"); r.validate_rollback_receipt(v.load_json(p,"rollback receipt"))'
       - name: Attest rollback provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
