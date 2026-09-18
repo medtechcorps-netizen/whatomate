@@ -39,7 +39,7 @@ WORKFLOW_NAME = "Verify Production CRM Canary"
 RECEIPT_KINDS = {
     "apply": {
         "workflow_path": ".github/workflows/apply-production-phase.yml",
-        "workflow_name": "Apply Production Phase",
+        "workflow_name": "Apply one exact production phase from signed evidence",
         "gate_job": "Exact production apply receipt gate",
         "artifact_prefix": "production-phase-apply",
         "stem": "production-phase-apply-receipt",
@@ -49,7 +49,7 @@ RECEIPT_KINDS = {
     },
     "rollback": {
         "workflow_path": ".github/workflows/rollback-production-phase.yml",
-        "workflow_name": "Rollback Production Phase",
+        "workflow_name": "Roll back one exact production phase from signed evidence",
         "gate_job": "Exact production rollback receipt gate",
         "artifact_prefix": "production-phase-rollback",
         "stem": "production-phase-rollback-receipt",
@@ -59,7 +59,7 @@ RECEIPT_KINDS = {
     },
     "apply-reconciled": {
         "workflow_path": ".github/workflows/apply-production-phase.yml",
-        "workflow_name": "Apply Production Phase",
+        "workflow_name": "Apply one exact production phase from signed evidence",
         "gate_job": "Exact production apply receipt gate",
         "artifact_prefix": "production-phase-apply",
         "stem": "production-phase-apply-receipt",
@@ -71,7 +71,7 @@ RECEIPT_KINDS = {
     },
     "rollback-reconciled": {
         "workflow_path": ".github/workflows/rollback-production-phase.yml",
-        "workflow_name": "Rollback Production Phase",
+        "workflow_name": "Roll back one exact production phase from signed evidence",
         "gate_job": "Exact production rollback receipt gate",
         "artifact_prefix": "production-phase-rollback",
         "stem": "production-phase-rollback-receipt",
@@ -83,7 +83,7 @@ RECEIPT_KINDS = {
     },
     "reconciliation": {
         "workflow_path": ".github/workflows/reconcile-production-orphan.yml",
-        "workflow_name": "Reconcile Production Orphan",
+        "workflow_name": "Classify one locked production mutation orphan without changing production",
         "gate_job": "Exact production orphan reconciliation gate",
         "artifact_prefix": "production-orphan-reconciliation",
         "stem": "production-orphan-reconciliation",
@@ -93,7 +93,7 @@ RECEIPT_KINDS = {
     },
     "orphan-rollback": {
         "workflow_path": ".github/workflows/rollback-production-orphan.yml",
-        "workflow_name": "Rollback Production Orphan",
+        "workflow_name": "Roll back one reconciled production orphan while retaining its exact main lock",
         "gate_job": "Exact production orphan rollback receipt gate",
         "artifact_prefix": "production-orphan-rollback",
         "stem": "production-orphan-rollback-receipt",

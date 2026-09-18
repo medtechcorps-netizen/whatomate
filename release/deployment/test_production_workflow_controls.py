@@ -57,7 +57,9 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "069c7eefa27b3a9159bb41d870f1c871db55b37e4b052061392b0306617b5a99"
     ),
     "verify-production-crm-canary.yml": (
-        "590c0b744f269e70918be19f0f6390679a5aa968b78b7d458a0fb32f4703536e"
+        # 2026-09-19: the receipt-run identity check now binds the exact run-name
+        # GitHub reports for each workflow instead of the workflow's `name`.
+        "98e2e7f33c98135d82f2ef76dddeec9ad5e06fe5a582ff2e898a2d97ebc0fdb4"
     ),
 }
 EXACT_IMAGE_BUILD_ACTION = (

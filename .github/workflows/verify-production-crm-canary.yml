@@ -174,7 +174,9 @@ jobs:
           case "$RECEIPT_KIND" in
             apply|apply-reconciled)
               workflow_path=".github/workflows/apply-production-phase.yml"
-              workflow_name="Apply Production Phase"
+              # GitHub reports a run's `name` as the workflow `run-name` when one
+              # is declared, so the identity check binds that exact title.
+              workflow_name="Apply one exact production phase from signed evidence"
               artifact_prefix="production-phase-apply"
               receipt_stem="production-phase-apply-receipt"
               predicate="https://rereply.app/attestations/production-phase-apply-receipt/v1"
@@ -185,7 +187,7 @@ jobs:
               ;;
             rollback|rollback-reconciled)
               workflow_path=".github/workflows/rollback-production-phase.yml"
-              workflow_name="Rollback Production Phase"
+              workflow_name="Roll back one exact production phase from signed evidence"
               artifact_prefix="production-phase-rollback"
               receipt_stem="production-phase-rollback-receipt"
               predicate="https://rereply.app/attestations/production-phase-rollback-receipt/v1"
@@ -196,7 +198,7 @@ jobs:
               ;;
             reconciliation)
               workflow_path=".github/workflows/reconcile-production-orphan.yml"
-              workflow_name="Reconcile Production Orphan"
+              workflow_name="Classify one locked production mutation orphan without changing production"
               artifact_prefix="production-orphan-reconciliation"
               receipt_stem="production-orphan-reconciliation"
               predicate="https://rereply.app/attestations/production-orphan-reconciliation/v1"
@@ -205,7 +207,7 @@ jobs:
               ;;
             orphan-rollback)
               workflow_path=".github/workflows/rollback-production-orphan.yml"
-              workflow_name="Rollback Production Orphan"
+              workflow_name="Roll back one reconciled production orphan while retaining its exact main lock"
               artifact_prefix="production-orphan-rollback"
               receipt_stem="production-orphan-rollback-receipt"
               predicate="https://rereply.app/attestations/production-orphan-rollback-receipt/v1"
@@ -283,7 +285,7 @@ jobs:
           if [[ "$reconciled" == true ]]; then
             [[ -n "$RECONCILIATION_RUN_ID" && -n "$RECONCILIATION_ARTIFACT_ID" && -n "$RECONCILIATION_ARTIFACT_DIGEST" && -n "$RECONCILIATION_SHA256" ]]
             gh api "/repos/$REPOSITORY/actions/runs/$RECONCILIATION_RUN_ID" > "$RUNNER_TEMP/reconciliation-run.json"
-            jq -e --arg sha "$CONTROL_SHA" '.path == ".github/workflows/reconcile-production-main-lock-release.yml" and .name == "Reconcile Production Main Lock Release" and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and .run_attempt == 1 and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/reconciliation-run.json" > /dev/null
+            jq -e --arg sha "$CONTROL_SHA" '.path == ".github/workflows/reconcile-production-main-lock-release.yml" and .name == "Observe one incomplete normal main-lock release without mutating main or production" and .head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and .run_attempt == 1 and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/reconciliation-run.json" > /dev/null
             gh api "/repos/$REPOSITORY/actions/runs/$RECONCILIATION_RUN_ID/attempts/1/jobs?per_page=100" > "$RUNNER_TEMP/reconciliation-jobs.json"
             jq -e '.total_count == 3 and (.jobs|length) == 3 and ([.jobs[].name]|sort) == (["Authenticate and attest failed normal lock release assertion","Observe exact normal main lock release with read-only capability","Exact normal main lock release reconciliation gate"]|sort) and all(.jobs[]; .status == "completed" and .conclusion == "success")' "$RUNNER_TEMP/reconciliation-jobs.json" > /dev/null
             gh api "/repos/$REPOSITORY/actions/runs/$RECONCILIATION_RUN_ID/artifacts?per_page=100" > "$RUNNER_TEMP/reconciliation-artifacts.json"
