@@ -1,0 +1,36 @@
+name: Codex Control Test Probe
+
+# Temporary probe: runs the production-control suites against one exact revision
+# and reports the result, so a control-plane change can be evidenced in CI
+# without waiting on the product test jobs. Remove after use.
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  control-suites:
+    name: Control suites at the pinned revision
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the exact revision under test
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 3a162f4955caad357f06f630b59c733156e7221e
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Report the revision
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          sha256sum release/deployment/production-app-contract.json
+      - name: Produce the production control suites
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            release/deployment/verify_production_plan.py \
+            release/deployment/test_verify_production_plan.py
+          python3 -m unittest discover -s release/deployment -p 'test_*.py'
+          python3 -B -m unittest discover -s release/canary -p 'test_*.py'
