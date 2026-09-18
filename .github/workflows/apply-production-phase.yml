@@ -1311,6 +1311,9 @@ jobs:
           [[ "$GITHUB_RUN_ATTEMPT" == 1 && "$GITHUB_SHA" == "$CONTROL_SHA" ]]
           cd "$RUNNER_TEMP/receipt"
           [[ "$(cat production-phase-apply-receipt.sha256)" == "$(sha256sum production-phase-apply-receipt.json | awk '{print $1}')" ]]
+          # Re-enter the checkout: the gate imported the sibling control
+          # modules through a path relative to the repository root.
+          cd "$GITHUB_WORKSPACE"
           /usr/bin/python3 -I -S -B -c 'import sys,pathlib; sys.path.insert(0,"control/release/deployment"); import verify_production_release as v; p=pathlib.Path("'"$RUNNER_TEMP"'/receipt/production-phase-apply-receipt.json"); v.validate_apply_receipt(v.load_json(p,"apply receipt"))'
       - name: Attest apply provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4

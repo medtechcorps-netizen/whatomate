@@ -40,10 +40,12 @@ AUXILIARY_PRODUCTION_CONTROLS = (
 PINNED_ACTION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}(?:\s+#.*)?$")
 TERMINAL_PARITY_WORKFLOW_SHA256 = {
     "apply-production-phase.yml": (
-        "8e4facad9a22b9154f1e1f9c5365e7ac7830c84e3ae509cab661beb5a5b47386"
+        # 2026-09-18: the receipt gate re-enters the checkout before importing
+        # the sibling control modules through a checkout-relative path.
+        "b167284cfab5fa321cc65dc7526885a825303bd6685c158200edffe4a6bb0ca3"
     ),
     "rollback-production-phase.yml": (
-        "33e97fb2b723e34c4539022b07433ac410deda40e33af0d61985a9c2c0361663"
+        "b9f36ed7b6dccf1249876d4beda46424a620cb8f554aa0dfdd7f7e21e920ed71"
     ),
     "finalize-production-orphan-lock.yml": (
         "19706d8b48b074ca3803bc9d39149dce73f867db8d0918fbb0b9a16c1075ac5e"

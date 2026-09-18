@@ -85,7 +85,7 @@ BASELINE_TARGET_SOURCE_SHA = "4f65abeb1c03c8fca018aa92cc987fae25ef4000"
 # re-baselined on 2026-09-18 onto the already-applied baseline phase, so it now
 # carries immutable image authority instead of the retired legacy git sources.
 BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
-    "ac385ffd5f024232d48949201b6e1216acd1035512db7cf3bba2bd3c27975785"
+    "216b38c0225ad2175076436ee554fb4185c2215b6ab7db2b6b7a4b70c90dfeaf"
 )
 BOOTSTRAP_SOURCE_SHA = BASELINE_TARGET_SOURCE_SHA
 BOOTSTRAP_SOURCE_MODE = "digest-images"
@@ -93,24 +93,24 @@ BOOTSTRAP_IMAGES = [
     {
         "component": 'web',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-web',
-        "digest": 'sha256:8fa96f3bffadf214ad5355b59a5a3e7d12841cf8b68fcd1cbabbb8ebc578a9af',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-web@sha256:8fa96f3bffadf214ad5355b59a5a3e7d12841cf8b68fcd1cbabbb8ebc578a9af',
+        "digest": 'sha256:f0442bd53ab5045a2189fe5c8194193586c3fee1e39635376b7b5912b0599805',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-web@sha256:f0442bd53ab5045a2189fe5c8194193586c3fee1e39635376b7b5912b0599805',
     },
     {
         "component": 'meta-relay',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay',
-        "digest": 'sha256:4d55ebf41294b7b2ae0e6f1e8bf61bd1adcdb5530308f7bbd3410c0159e3e513',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:4d55ebf41294b7b2ae0e6f1e8bf61bd1adcdb5530308f7bbd3410c0159e3e513',
+        "digest": 'sha256:7cf70af125932b10ae8fe1f97654ccc54cf95241a5c8350052c0043439c4f5ca',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:7cf70af125932b10ae8fe1f97654ccc54cf95241a5c8350052c0043439c4f5ca',
     },
     {
         "component": 'gmail-relay',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay',
-        "digest": 'sha256:c003649e9f1366451943b0fcdc95a93d9f4fb163d2f8d2646989b63e734af52a',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:c003649e9f1366451943b0fcdc95a93d9f4fb163d2f8d2646989b63e734af52a',
+        "digest": 'sha256:fa98b3a87b93caca504791c7359ef84f8366b4c51b7d7ca31c58f56c8f80f3d1',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:fa98b3a87b93caca504791c7359ef84f8366b4c51b7d7ca31c58f56c8f80f3d1',
     },
 ]
 BOOTSTRAP_CANONICAL_SPEC_SHA256 = (
-    "2bb72ec7621b3378217b09831945920800afde737d4be5c0b722dc9f5aa55005"
+    "cfa5166436aa2c464bed966cfcaaf259ddde5cbfcebd1b92a18e387bbe2e4827"
 )
 BOOTSTRAP_ENVIRONMENT_SHA256 = (
     "e4a9eb41e54a256b2b9c8b008354d730147a4229f5aa06c7625970cd9b7db3e8"

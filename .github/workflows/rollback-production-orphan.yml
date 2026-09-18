@@ -778,6 +778,9 @@ jobs:
           [[ "$(find . -maxdepth 1 -type f -printf '%f\n' | sort)" == $'production-orphan-rollback-receipt.json\nproduction-orphan-rollback-receipt.sha256' ]]
           [[ -z "$(find . -mindepth 1 \( -type l -o -type d \) -print -quit)" ]]
           [[ "$(cat production-orphan-rollback-receipt.sha256)" == "$(sha256sum production-orphan-rollback-receipt.json | awk '{print $1}')" ]]
+          # Re-enter the checkout: the gate imports the sibling control modules
+          # through a path relative to the repository root.
+          cd "$GITHUB_WORKSPACE"
           /usr/bin/python3 -I -S -B -c 'import pathlib,sys; sys.path.insert(0,"control/release/deployment"); import rollback_production_change as r, verify_production_release as v; p=pathlib.Path("'"$RUNNER_TEMP"'/receipt/production-orphan-rollback-receipt.json"); r.validate_orphan_rollback_receipt(v.load_json(p,"orphan rollback receipt"))'
 
       - name: Attest orphan rollback provenance
