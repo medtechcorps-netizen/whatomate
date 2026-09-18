@@ -1260,6 +1260,58 @@ class RebaselinedProviderObservationTests(unittest.TestCase):
             ):
                 apply._bootstrap_images(plan, contract_path=path)
 
+    def settling_app(self, spec, updated_at: str):
+        value = app_response(spec, NEW_DEPLOYMENT)
+        value["app"]["updated_at"] = updated_at
+        return value
+
+    def test_post_mutation_observation_retries_until_the_provider_settles(self) -> None:
+        desired = digest_spec("2")
+        opener = QueueOpener(
+            [
+                # attempt 1: the two reads straddle the active-deployment flip
+                self.settling_app(desired, "2026-08-27T00:02:00Z"),
+                deployment_response(desired, NEW_DEPLOYMENT),
+                self.settling_app(desired, "2026-08-27T00:03:00Z"),
+                deployment_response(desired, NEW_DEPLOYMENT),
+                # attempt 2: the provider is settled
+                self.settling_app(desired, "2026-08-27T00:03:00Z"),
+                deployment_response(desired, NEW_DEPLOYMENT),
+                self.settling_app(desired, "2026-08-27T00:03:00Z"),
+                deployment_response(desired, NEW_DEPLOYMENT),
+            ]
+        )
+        sleeps: list[float] = []
+        client = apply.ProductionAppClient(APP_ID, "t" * 24, opener=opener)
+        state, spec, deployment = apply.observe_settled(
+            client, sleeper=sleeps.append, poll_limit=3
+        )
+        self.assertEqual(sleeps, [apply.POLL_SECONDS])
+        self.assertEqual(spec, desired)
+        self.assertEqual(
+            state["active_deployment_identity_sha256"],
+            common.sha256_bytes(NEW_DEPLOYMENT.encode("utf-8")),
+        )
+        self.assertEqual(deployment["id"], NEW_DEPLOYMENT)
+
+    def test_post_mutation_observation_fails_closed_when_never_stable(self) -> None:
+        desired = digest_spec("2")
+        values: list[object] = []
+        for index in range(2):
+            values.extend(
+                [
+                    self.settling_app(desired, f"2026-08-27T00:0{index + 2}:00Z"),
+                    deployment_response(desired, NEW_DEPLOYMENT),
+                    self.settling_app(desired, f"2026-08-27T00:0{index + 3}:00Z"),
+                    deployment_response(desired, NEW_DEPLOYMENT),
+                ]
+            )
+        client = apply.ProductionAppClient(APP_ID, "t" * 24, opener=QueueOpener(values))
+        with self.assertRaisesRegex(
+            common.ReleaseError, "production did not settle across the two exact reads"
+        ):
+            apply.observe_settled(client, sleeper=lambda _seconds: None, poll_limit=2)
+
 
 if __name__ == "__main__":
     unittest.main()

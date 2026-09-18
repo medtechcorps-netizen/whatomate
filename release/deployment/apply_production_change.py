@@ -255,6 +255,36 @@ def observe_stable(client: ProductionAppClient) -> tuple[dict[str, Any], dict[st
     return first
 
 
+def observe_settled(
+    client: ProductionAppClient,
+    *,
+    sleeper: Callable[[float], None] = time.sleep,
+    poll_limit: int = POLL_LIMIT,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Observe a quiescent provider *after* the mutation.
+
+    DigitalOcean updates `app.updated_at` and flips `active_deployment` while the
+    deployment it created for the mutation finishes settling, so a single
+    double-read can straddle that transition. The state is still required to be
+    identical across two consecutive reads; those reads are retried within the
+    same bounded poll budget instead of failing closed on the first racing pair.
+    """
+    for attempt in range(poll_limit):
+        first_app = client.get_app()
+        first_id = _active_id(_app_object(first_app))
+        first_deployment = client.get_deployment(first_id)
+        second_app = client.get_app()
+        second_id = _active_id(_app_object(second_app))
+        second_deployment = client.get_deployment(second_id)
+        first = provider_snapshot(first_app, first_deployment, client.app_id)
+        second = provider_snapshot(second_app, second_deployment, client.app_id)
+        if first == second and first_id == second_id:
+            return first
+        if attempt + 1 < poll_limit:
+            sleeper(POLL_SECONDS)
+    common.fail("production did not settle across the two exact reads")
+
+
 def _deployment_candidate(app: Mapping[str, Any], desired_spec: Mapping[str, Any]) -> str | None:
     """Select the single deployment that carries the exact desired state.
 
@@ -1365,7 +1395,9 @@ def apply_change(
         after, after_spec, after_deployment = provider_snapshot(
             active_app, active_deployment, client.app_id
         )
-        final_first, final_spec, final_deployment = observe_stable(client)
+        final_first, final_spec, final_deployment = observe_settled(
+            client, sleeper=sleeper, poll_limit=poll_limit
+        )
         if after != final_first or after_spec != final_spec or after_deployment != final_deployment:
             common.fail("production changed during final double-read")
         if common.extract_image_digests(after_spec) != dict(target_digests):
