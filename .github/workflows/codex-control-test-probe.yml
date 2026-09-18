@@ -19,7 +19,9 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: 3a162f4955caad357f06f630b59c733156e7221e
-          fetch-depth: 1
+          # The control suites read pinned release blobs out of history, so the
+          # probe needs the same full checkout the repository's own gate uses.
+          fetch-depth: 0
           persist-credentials: false
       - name: Report the revision
         run: |
