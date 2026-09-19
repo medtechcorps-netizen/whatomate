@@ -54,7 +54,9 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "a702f615d9721c6c175985a7e494a1173523fe98d076ffcede552c744763a065"
     ),
     "reconcile-production-main-lock-release.yml": (
-        "069c7eefa27b3a9159bb41d870f1c871db55b37e4b052061392b0306617b5a99"
+        # 2026-09-19: the observed normal-release run is matched by its exact
+        # run-name instead of the workflow `name`.
+        "2b6db9a1db1678e105f343828b25c3f260217d67aff4ea25fb131d7225241925"
     ),
     "verify-production-crm-canary.yml": (
         # 2026-09-19: the receipt-run identity check now binds the exact run-name

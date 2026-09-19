@@ -206,7 +206,9 @@ jobs:
           gh api "/repos/$REPOSITORY/actions/runs/$SOURCE_RUN_ID" > "$evidence/current-run.json"
           gh api "/repos/$REPOSITORY/actions/runs/$SOURCE_RUN_ID/attempts/1" > "$evidence/run.json"
           source_path=".github/workflows/$OPERATION-production-phase.yml"
-          source_name="$(if [[ "$OPERATION" == apply ]]; then printf 'Apply Production Phase'; else printf 'Rollback Production Phase'; fi)"
+          # GitHub reports the run-name, not the workflow `name`, for both of
+          # these workflows.
+          source_name="$(if [[ "$OPERATION" == apply ]]; then printf 'Apply one exact production phase from signed evidence'; else printf 'Roll back one exact production phase from signed evidence'; fi)"
           jq -e --slurp --arg sha "$CONTROL_SHA" --arg id "$SOURCE_RUN_ID" --arg path "$source_path" --arg name "$source_name" '
             length == 2 and .[0].id == .[1].id and all(.[];
               (.id|tostring) == $id and .head_sha == $sha and .head_branch == "main" and

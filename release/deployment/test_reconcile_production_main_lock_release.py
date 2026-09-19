@@ -95,7 +95,7 @@ def context() -> tuple[dict, dict, dict]:
     source = {
         "workflow_sha": authorization["control"]["workflow_sha"],
         "workflow_path": auth.WORKFLOWS["apply"]["path"],
-        "workflow_name": "Apply Production Phase",
+        "workflow_name": "Apply one exact production phase from signed evidence",
         "run_id": run_id,
         "run_attempt": 1,
         "event": "workflow_dispatch",
@@ -284,7 +284,7 @@ class MainLockReleaseReconciliationTests(unittest.TestCase):
         )
         mutations = {
             "workflow name": lambda candidate: candidate["source"].__setitem__(
-                "workflow_name", "Rollback Production Phase"
+                "workflow_name", "Roll back one exact production phase from signed evidence"
             ),
             "attestation verification hash": lambda candidate: candidate[
                 "authorities"

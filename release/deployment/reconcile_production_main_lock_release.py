@@ -260,7 +260,12 @@ def _source(
     if (
         source["workflow_sha"] != authorization["control"]["workflow_sha"]
         or source["workflow_path"] != policy["path"]
-        or source["workflow_name"] != ("Apply Production Phase" if operation == "apply" else "Rollback Production Phase")
+        or source["workflow_name"]
+        != (
+            "Apply one exact production phase from signed evidence"
+            if operation == "apply"
+            else "Roll back one exact production phase from signed evidence"
+        )
         or source["run_attempt"] != 1
         or source["event"] != "workflow_dispatch"
         or source["head_branch"] != "main"
@@ -648,7 +653,11 @@ def validate_reconciliation(value: Any) -> dict[str, Any]:
         or source["workflow_sha"] != control["workflow_sha"]
         or source["workflow_path"] != policy["path"]
         or source["workflow_name"]
-        != ("Apply Production Phase" if operation == "apply" else "Rollback Production Phase")
+        != (
+            "Apply one exact production phase from signed evidence"
+            if operation == "apply"
+            else "Roll back one exact production phase from signed evidence"
+        )
         or source["run_attempt"] != 1
         or source["event"] != "workflow_dispatch"
         or source["head_branch"] != "main"

@@ -38,7 +38,11 @@ env:
   PRODUCTION_CHANGE_SCHEMA_PATH: release/deployment/production-change.schema.json
   PRODUCTION_PLAN_VERIFIER_PATH: release/deployment/verify_production_plan.py
   PRODUCTION_PHASE_STATE_WORKFLOW_PATH: .github/workflows/verify-production-crm-canary.yml
-  PRODUCTION_PHASE_STATE_WORKFLOW_NAME: Verify Production CRM Canary
+  # GitHub reports a run's `name` as the workflow `run-name` when one is
+  # declared, so the predecessor authentication must bind that exact title. The
+  # step only runs once a phase-state predecessor exists, which is why the
+  # mismatch survived the genesis-only baseline chain.
+  PRODUCTION_PHASE_STATE_WORKFLOW_NAME: Verify the exact applied production phase and CRM canary
   PRODUCTION_PHASE_STATE_GATE_NAME: Exact production phase gate
   ROLLOUT_PLAN_PREDICATE: https://rereply.app/attestations/exact-four-phase-rollout/v1
   PRODUCTION_PLAN_PREDICATE: https://rereply.app/attestations/observation-only-production-plan/v2
