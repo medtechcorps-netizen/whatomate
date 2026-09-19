@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -2197,6 +2198,50 @@ class ProductionPlanTests(unittest.TestCase):
                 output_path.read_bytes(), verifier.canonical_file_bytes(exported)
             )
 
+    def test_isolated_predecessor_cli_all_transitions_and_required_output(self) -> None:
+        # Unlike the in-process synthetic provider tests, use the real compiled
+        # contract pins and a fresh isolated Python process from a different cwd.
+        # No provider observation or credential is needed by this command.
+        self.contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        for phase in ("genesis", "baseline", "bridge", "backend"):
+            with self.subTest(predecessor=phase), tempfile.TemporaryDirectory(prefix="predecessor-cli-") as name:
+                root = Path(name)
+                state = None if phase == "genesis" else self.phase_state(phase)
+                normalized = self.normalized if state is None else self.input_for_state(state)[0]
+                (root / "normalized.json").write_bytes(verifier.canonical_file_bytes(normalized))
+                (root / "rollout.json").write_bytes(verifier.canonical_file_bytes(self.rollout))
+                args = [sys.executable, "-I", "-S", "-B", str(VERIFIER_PATH), "validate-predecessor",
+                        "--contract", str(CONTRACT_PATH), "--policy", str(POLICY_PATH),
+                        "--schema", str(SCHEMA_PATH), "--normalized-input", str(root / "normalized.json"),
+                        "--rollout-plan", str(root / "rollout.json"), "--control-sha", CONTROL_SHA]
+                if state is not None:
+                    raw = verifier.canonical_file_bytes(state)
+                    (root / "state.json").write_bytes(raw)
+                    (root / "state.sha256").write_bytes((verifier.sha256_bytes(raw) + "\n").encode("ascii"))
+                    args += ["--predecessor-state", str(root / "state.json"),
+                             "--predecessor-sha256", str(root / "state.sha256")]
+                args += ["--target-images-output", str(root / "target-images.json")]
+                env = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
+                result = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                target = "baseline" if phase == "genesis" else verifier.PHASES[verifier.PHASES.index(phase) + 1]
+                exported = json.loads((root / "target-images.json").read_text(encoding="utf-8"))
+                self.assertEqual(exported["phase"], target)
+                self.assertEqual(exported["images"], phase_images(self.rollout, target, self.contract))
+                missing_output = subprocess.run(args[:-2], cwd=root, env=env,
+                                                capture_output=True, text=True, timeout=15)
+                self.assertEqual(missing_output.returncode, 2)
+                self.assertIn("--target-images-output", missing_output.stderr)
+                if state is not None:
+                    (root / "state.sha256").write_bytes(("0" * 64 + "\n").encode("ascii"))
+                    tampered_output = root / "tampered-target-images.json"
+                    tampered_args = args[:-1] + [str(tampered_output)]
+                    tampered = subprocess.run(tampered_args, cwd=root, env=env,
+                                              capture_output=True, text=True, timeout=15)
+                    self.assertNotEqual(tampered.returncode, 0)
+                    self.assertIn("production phase-state predecessor exact-file hash differs", tampered.stderr)
+                    self.assertFalse(tampered_output.exists())
+
     def test_workflow_is_manual_observation_only_and_capability_separated(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
         trigger = workflow.split("\non:\n", 1)[1].split("\n# This workflow", 1)[0]
@@ -2300,8 +2345,9 @@ class ProductionPlanTests(unittest.TestCase):
         ):
             self.assertNotIn(mutation, lower)
         protected_ci = TEST_WORKFLOW_PATH.read_text(encoding="utf-8")
-        self.assertIn("release/deployment/verify_production_plan.py", protected_ci)
-        self.assertIn("release/deployment/test_verify_production_plan.py", protected_ci)
+        self.assertIn("  release-controls:\n", protected_ci)
+        self.assertIn("      - release-controls\n", protected_ci)
+        self.assertIn("python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v", protected_ci)
 
 
 class ReviewedProductionContractTests(unittest.TestCase):
@@ -2353,7 +2399,7 @@ class ReviewedProductionContractTests(unittest.TestCase):
         )
         self.assertEqual(
             production_contract["bootstrap_state"]["genesis_state_sha256"],
-            "6d63bce04b1b3cdb54163344a5c8b55e8ea31ea32ecb0d4df79e54b4b11c62c4",
+            "d8a7ffe6f19062d10dfa6cd843bc799cd34465b77202b23ac0c9a2cde73b8846",
         )
         self.assertEqual(
             verifier.genesis_state_sha256(production_contract),

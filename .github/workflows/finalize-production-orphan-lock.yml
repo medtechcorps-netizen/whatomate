@@ -261,24 +261,31 @@ jobs:
             jq -e --arg run_id "$RUN_ID" '
               .total_count == (.workflow_runs | length) and
               all(.workflow_runs[];
-                (.id | tostring) == $run_id or
-                (.name | IN(
-                  "Assemble and Attest Exact Four-Phase Rollout",
-                  "Apply Production Phase", "Rollback Production Phase",
-                  "Prepare Production Valkey Recovery Fork",
-                  "Cleanup Production Valkey Recovery Fork",
-                  "Provision Production CRM Canary Fixture",
-                  "Cleanup Production CRM Canary Fixture",
-                  "Invert Production CRM Canary Fixture",
-                  "Build and Attest Exact Release Images",
-                  "Rollback Production Orphan", "Reconcile Production Orphan",
-                  "Reconcile Production Orphan Lock Release",
-                  "Reconcile Production Main Lock Release",
-                  "Finalize Production Orphan Lock", "Verify Production CRM Canary",
-                  "Verify Production Recovery Readiness", "Validate Exact Release Source",
-                  "Plan Production Rollout (Observation Only)",
-                  "Production Deploy - Disabled Safety Gate"
-                ) | not)
+                (.id | type) == "number" and .id > 0 and
+                (.path | type) == "string" and (.path | length) > 0 and
+                ((.id | tostring) == $run_id or
+                (.path | IN(
+                  ".github/workflows/aggregate-exact-four-phase-rollout.yml",
+                  ".github/workflows/apply-production-phase.yml",
+                  ".github/workflows/build-attest-exact-release-images.yml",
+                  ".github/workflows/deploy-production.yml",
+                  ".github/workflows/plan-production-rollout.yml",
+                  ".github/workflows/prepare-production-valkey-recovery-fork.yml",
+                  ".github/workflows/cleanup-production-valkey-recovery-fork.yml",
+                  ".github/workflows/provision-production-crm-canary-fixture.yml",
+                  ".github/workflows/bootstrap-production-crm-canary-driver.yml",
+                  ".github/workflows/cleanup-production-crm-canary-fixture.yml",
+                  ".github/workflows/inverse-production-crm-canary-fixture.yml",
+                  ".github/workflows/rollback-production-phase.yml",
+                  ".github/workflows/rollback-production-orphan.yml",
+                  ".github/workflows/reconcile-production-orphan.yml",
+                  ".github/workflows/reconcile-production-orphan-lock-release.yml",
+                  ".github/workflows/reconcile-production-main-lock-release.yml",
+                  ".github/workflows/finalize-production-orphan-lock.yml",
+                  ".github/workflows/validate-exact-release-source.yml",
+                  ".github/workflows/verify-production-crm-canary.yml",
+                  ".github/workflows/verify-production-recovery-readiness.yml"
+                ) | not))
               )
             ' "$RUNNER_TEMP/$status-runs.json" > /dev/null
           }
@@ -447,11 +454,11 @@ jobs:
             if [[ "$artifact_name" == "production-main-lock-apply-$run_id-1" ]]; then
               marker_stem=apply-main-lock
               workflow_path=.github/workflows/apply-production-phase.yml
-              workflow_name="Apply Production Phase"
+              workflow_name="Apply one exact production phase from signed evidence"
             elif [[ "$artifact_name" == "production-main-lock-rollback-$run_id-1" ]]; then
               marker_stem=rollback-main-lock
               workflow_path=.github/workflows/rollback-production-phase.yml
-              workflow_name="Rollback Production Phase"
+              workflow_name="Roll back one exact production phase from signed evidence"
             else
               exit 1
             fi
@@ -499,7 +506,7 @@ jobs:
             ' "$input_dir/reconciliation-evidence.json" > "$evidence_dir/reconciliation-binding.json"
           authenticate_subject \
             "$evidence_dir/reconciliation-binding.json" \
-            "$RECONCILE_WORKFLOW_PATH" "Reconcile Production Orphan" \
+            "$RECONCILE_WORKFLOW_PATH" "Classify one locked production mutation orphan without changing production" \
             '["Authenticate and attest the single-operator lock assertion","Classify exact production orphan with GET-only capability","Exact production orphan reconciliation gate"]' \
             '["production-main-lock-assertion","unsigned-production-orphan-reconciliation","production-orphan-reconciliation"]' \
             production-orphan-reconciliation "$RECONCILIATION_PREDICATE" \
@@ -511,19 +518,19 @@ jobs:
           jq -S '.intent.binding' "$reconciliation" > "$evidence_dir/intent-binding.json"
           if [[ "$intent_operation" == "activate" && "$intent_workflow_path" == ".github/workflows/apply-production-phase.yml" ]]; then
               intent_slug=apply
-              original_workflow_name="Apply Production Phase"
+              original_workflow_name="Apply one exact production phase from signed evidence"
               original_jobs='["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Authorize exact production apply main lock release","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority","Release exact production apply main lock"]'
               original_artifacts='["production-main-lock-apply","production-mutation-intent-apply","production-main-lock-proof-apply","unsigned-production-phase-apply","production-phase-apply","production-main-lock-release-authorization-apply"]'
               original_prerequisites='["Authenticate exact production apply authority","Prepare exact production apply pre-lock authority","Prepare and attest exact production mutation intent"]'
           elif [[ "$intent_operation" == "rollback" && "$intent_workflow_path" == ".github/workflows/rollback-production-phase.yml" ]]; then
               intent_slug=rollback
-              original_workflow_name="Rollback Production Phase"
+              original_workflow_name="Roll back one exact production phase from signed evidence"
               original_jobs='["Acquire exact production rollback main lock","Attest exact production rollback main lock proof","Authenticate exact production rollback authority","Authorize exact production rollback main lock release","Exact production rollback receipt gate","Prepare and attest exact production rollback mutation intent","Prepare exact production rollback pre-lock authority","Release exact production rollback main lock","Roll back exact production phase"]'
               original_artifacts='["production-main-lock-rollback","production-mutation-intent-rollback","production-main-lock-proof-rollback","unsigned-production-phase-rollback","production-phase-rollback","production-main-lock-release-authorization-rollback"]'
               original_prerequisites='["Authenticate exact production rollback authority","Prepare exact production rollback pre-lock authority","Prepare and attest exact production rollback mutation intent"]'
           elif [[ "$intent_operation" == "rollback" && "$intent_workflow_path" == "$ORPHAN_ROLLBACK_WORKFLOW_PATH" ]]; then
               intent_slug=orphan-rollback
-              original_workflow_name="Rollback Production Orphan"
+              original_workflow_name="Roll back one reconciled production orphan while retaining its exact main lock"
               original_jobs='["Attest exact production orphan rollback main lock proof","Authenticate exact production orphan rollback authority","Exact production orphan rollback receipt gate","Prepare and attest exact production orphan rollback mutation intent","Roll back exact production orphan"]'
               original_artifacts='["production-mutation-intent-orphan-rollback","production-main-lock-proof-orphan-rollback","unsigned-production-orphan-rollback","production-orphan-rollback"]'
               original_prerequisites='["Authenticate exact production orphan rollback authority","Prepare and attest exact production orphan rollback mutation intent"]'
@@ -542,7 +549,7 @@ jobs:
           jq -S '.lock_assertion.binding' "$reconciliation" > "$evidence_dir/lock-assertion-binding.json"
           authenticate_subject \
             "$evidence_dir/lock-assertion-binding.json" \
-            "$RECONCILE_WORKFLOW_PATH" "Reconcile Production Orphan" \
+            "$RECONCILE_WORKFLOW_PATH" "Classify one locked production mutation orphan without changing production" \
             '["Authenticate and attest the single-operator lock assertion","Classify exact production orphan with GET-only capability","Exact production orphan reconciliation gate"]' \
             '["production-main-lock-assertion","unsigned-production-orphan-reconciliation","production-orphan-reconciliation"]' \
             production-main-lock-assertion "$ASSERTION_PREDICATE" \
@@ -556,7 +563,7 @@ jobs:
               ' "$phase_descriptor" > "$evidence_dir/phase-state-binding.json"
             authenticate_subject \
               "$evidence_dir/phase-state-binding.json" \
-              "$CANARY_WORKFLOW_PATH" "Verify Production CRM Canary" \
+              "$CANARY_WORKFLOW_PATH" "Verify the exact applied production phase and CRM canary" \
               '["Authenticate exact change receipt authority","Exact production phase gate","Run content-free production and synthetic canaries"]' \
               '["production-crm-canary","production-phase-state"]' \
               production-phase-state "$PHASE_STATE_PREDICATE" \
@@ -580,7 +587,7 @@ jobs:
             orphan_artifacts='["production-mutation-intent-orphan-rollback","production-main-lock-proof-orphan-rollback","unsigned-production-orphan-rollback","production-orphan-rollback"]'
             authenticate_subject \
               "$evidence_dir/orphan-rollback-binding.json" \
-              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Rollback Production Orphan" \
+              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Roll back one reconciled production orphan while retaining its exact main lock" \
               "$orphan_jobs" "$orphan_artifacts" \
               production-orphan-rollback "$ORPHAN_ROLLBACK_PREDICATE" \
               "$evidence_dir/orphan-rollback" terminal '[]'
@@ -599,7 +606,7 @@ jobs:
               "$evidence_dir/orphan-rollback/production-orphan-rollback-receipt.json" > /dev/null
             authenticate_subject \
               "$evidence_dir/orphan-rollback-intent-binding.json" \
-              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Rollback Production Orphan" \
+              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Roll back one reconciled production orphan while retaining its exact main lock" \
               "$orphan_jobs" "$orphan_artifacts" \
               production-mutation-intent-orphan-rollback "$INTENT_PREDICATE" \
               "$evidence_dir/orphan-rollback-intent" terminal '[]'
@@ -855,11 +862,11 @@ jobs:
             if [[ "$artifact_name" == "production-main-lock-apply-$run_id-1" ]]; then
               marker_stem=apply-main-lock
               workflow_path=.github/workflows/apply-production-phase.yml
-              workflow_name="Apply Production Phase"
+              workflow_name="Apply one exact production phase from signed evidence"
             elif [[ "$artifact_name" == "production-main-lock-rollback-$run_id-1" ]]; then
               marker_stem=rollback-main-lock
               workflow_path=.github/workflows/rollback-production-phase.yml
-              workflow_name="Rollback Production Phase"
+              workflow_name="Roll back one exact production phase from signed evidence"
             else
               exit 1
             fi
@@ -896,25 +903,25 @@ jobs:
 
           [[ "$(gh api "/repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" == "$CONTROL_SHA" ]]
           reacquire_subject "$RECONCILIATION_BINDING_JSON" \
-            "$RECONCILE_WORKFLOW_PATH" "Reconcile Production Orphan" \
+            "$RECONCILE_WORKFLOW_PATH" "Classify one locked production mutation orphan without changing production" \
             production-orphan-reconciliation "$RECONCILIATION_PREDICATE" "$sources/reconciliation" terminal \
             '["Authenticate and attest the single-operator lock assertion","Classify exact production orphan with GET-only capability","Exact production orphan reconciliation gate"]' '[]'
           case "$ORIGINAL_INTENT_SLUG" in
             apply)
               [[ "$ORIGINAL_OPERATION" == "activate" && "$ORIGINAL_WORKFLOW_PATH" == ".github/workflows/apply-production-phase.yml" ]]
-              original_name="Apply Production Phase"
+              original_name="Apply one exact production phase from signed evidence"
               original_jobs='["Acquire exact production apply main lock","Apply exact production phase","Attest exact production apply main lock proof","Authenticate exact production apply authority","Authorize exact production apply main lock release","Exact production apply receipt gate","Prepare and attest exact production mutation intent","Prepare exact production apply pre-lock authority","Release exact production apply main lock"]'
               original_prerequisites='["Authenticate exact production apply authority","Prepare exact production apply pre-lock authority","Prepare and attest exact production mutation intent"]'
               ;;
             rollback)
               [[ "$ORIGINAL_OPERATION" == "rollback" && "$ORIGINAL_WORKFLOW_PATH" == ".github/workflows/rollback-production-phase.yml" ]]
-              original_name="Rollback Production Phase"
+              original_name="Roll back one exact production phase from signed evidence"
               original_jobs='["Acquire exact production rollback main lock","Attest exact production rollback main lock proof","Authenticate exact production rollback authority","Authorize exact production rollback main lock release","Exact production rollback receipt gate","Prepare and attest exact production rollback mutation intent","Prepare exact production rollback pre-lock authority","Release exact production rollback main lock","Roll back exact production phase"]'
               original_prerequisites='["Authenticate exact production rollback authority","Prepare exact production rollback pre-lock authority","Prepare and attest exact production rollback mutation intent"]'
               ;;
             orphan-rollback)
               [[ "$ORIGINAL_OPERATION" == "rollback" && "$ORIGINAL_WORKFLOW_PATH" == "$ORPHAN_ROLLBACK_WORKFLOW_PATH" ]]
-              original_name="Rollback Production Orphan"
+              original_name="Roll back one reconciled production orphan while retaining its exact main lock"
               original_jobs='["Attest exact production orphan rollback main lock proof","Authenticate exact production orphan rollback authority","Exact production orphan rollback receipt gate","Prepare and attest exact production orphan rollback mutation intent","Roll back exact production orphan"]'
               original_prerequisites='["Authenticate exact production orphan rollback authority","Prepare and attest exact production orphan rollback mutation intent"]'
               ;;
@@ -928,22 +935,22 @@ jobs:
             "$sources/mutation-intent/production-mutation-intent-$ORIGINAL_INTENT_SLUG.json" \
             "$sources/root-marker"
           reacquire_subject "$LOCK_ASSERTION_BINDING_JSON" \
-            "$RECONCILE_WORKFLOW_PATH" "Reconcile Production Orphan" \
+            "$RECONCILE_WORKFLOW_PATH" "Classify one locked production mutation orphan without changing production" \
             production-main-lock-assertion "$ASSERTION_PREDICATE" "$sources/lock-assertion" terminal \
             '["Authenticate and attest the single-operator lock assertion","Classify exact production orphan with GET-only capability","Exact production orphan reconciliation gate"]' '[]'
           if [[ "$CLOSURE_KIND" != "no-mutation-never-started" ]]; then
             reacquire_subject "$PHASE_STATE_BINDING_JSON" \
-              "$CANARY_WORKFLOW_PATH" "Verify Production CRM Canary" \
+              "$CANARY_WORKFLOW_PATH" "Verify the exact applied production phase and CRM canary" \
               production-phase-state "$PHASE_STATE_PREDICATE" "$sources/phase-state" terminal \
               '["Authenticate exact change receipt authority","Exact production phase gate","Run content-free production and synthetic canaries"]' '[]'
           fi
           if [[ "$CLOSURE_KIND" == "orphan-rollback-canary" ]]; then
             reacquire_subject "$ORPHAN_ROLLBACK_BINDING_JSON" \
-              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Rollback Production Orphan" \
+              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Roll back one reconciled production orphan while retaining its exact main lock" \
               production-orphan-rollback "$ORPHAN_ROLLBACK_PREDICATE" "$sources/orphan-rollback" terminal \
               '["Attest exact production orphan rollback main lock proof","Authenticate exact production orphan rollback authority","Exact production orphan rollback receipt gate","Prepare and attest exact production orphan rollback mutation intent","Roll back exact production orphan"]' '[]'
             reacquire_subject "$ORPHAN_ROLLBACK_INTENT_BINDING_JSON" \
-              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Rollback Production Orphan" \
+              "$ORPHAN_ROLLBACK_WORKFLOW_PATH" "Roll back one reconciled production orphan while retaining its exact main lock" \
               production-mutation-intent-orphan-rollback "$INTENT_PREDICATE" "$sources/orphan-rollback-intent" terminal \
               '["Attest exact production orphan rollback main lock proof","Authenticate exact production orphan rollback authority","Exact production orphan rollback receipt gate","Prepare and attest exact production orphan rollback mutation intent","Roll back exact production orphan"]' '[]'
           fi
@@ -1248,7 +1255,7 @@ jobs:
           gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/current-finalizer-run.json"
           jq -e --arg sha "$CONTROL_SHA" '
             .path == ".github/workflows/finalize-production-orphan-lock.yml" and
-            .name == "Finalize Production Orphan Lock" and .event == "workflow_dispatch" and
+            .name == "Finalize one reconciled production orphan lock without changing production" and .event == "workflow_dispatch" and
             .head_branch == "main" and .head_sha == $sha and .run_attempt == 1 and
             .status == "in_progress"
           ' "$RUNNER_TEMP/current-finalizer-run.json" > /dev/null
@@ -1358,7 +1365,10 @@ jobs:
           GH_TOKEN="$github_read_token" gh api "/repos/$REPOSITORY/actions/runs?status=in_progress&per_page=100" > "$RUNNER_TEMP/release-active.json"
           jq -e --arg run_id "$RUN_ID" '
             .total_count == (.workflow_runs | length) and
-            all(.workflow_runs[]; (.id | tostring) == $run_id or
+            all(.workflow_runs[];
+              (.id | type) == "number" and .id > 0 and
+              (.path | type) == "string" and (.path | length) > 0 and
+              ((.id | tostring) == $run_id or
               (.path | IN(
                 ".github/workflows/aggregate-exact-four-phase-rollout.yml",
                 ".github/workflows/apply-production-phase.yml",
@@ -1367,7 +1377,8 @@ jobs:
                 ".github/workflows/plan-production-rollout.yml",
                 ".github/workflows/prepare-production-valkey-recovery-fork.yml",
                 ".github/workflows/cleanup-production-valkey-recovery-fork.yml",
-                ".github/workflows/provision-production-crm-canary-fixture.yml",
+                  ".github/workflows/provision-production-crm-canary-fixture.yml",
+                  ".github/workflows/bootstrap-production-crm-canary-driver.yml",
                 ".github/workflows/cleanup-production-crm-canary-fixture.yml",
                 ".github/workflows/inverse-production-crm-canary-fixture.yml",
                 ".github/workflows/rollback-production-phase.yml",
@@ -1379,11 +1390,14 @@ jobs:
                 ".github/workflows/validate-exact-release-source.yml",
                 ".github/workflows/verify-production-crm-canary.yml",
                 ".github/workflows/verify-production-recovery-readiness.yml"
-              ) | not))
+              ) | not)))
           ' "$RUNNER_TEMP/release-queued.json" > /dev/null
           jq -e --arg run_id "$RUN_ID" '
             .total_count == (.workflow_runs | length) and
-            all(.workflow_runs[]; (.id | tostring) == $run_id or
+            all(.workflow_runs[];
+              (.id | type) == "number" and .id > 0 and
+              (.path | type) == "string" and (.path | length) > 0 and
+              ((.id | tostring) == $run_id or
               (.path | IN(
                 ".github/workflows/aggregate-exact-four-phase-rollout.yml",
                 ".github/workflows/apply-production-phase.yml",
@@ -1392,7 +1406,8 @@ jobs:
                 ".github/workflows/plan-production-rollout.yml",
                 ".github/workflows/prepare-production-valkey-recovery-fork.yml",
                 ".github/workflows/cleanup-production-valkey-recovery-fork.yml",
-                ".github/workflows/provision-production-crm-canary-fixture.yml",
+                  ".github/workflows/provision-production-crm-canary-fixture.yml",
+                  ".github/workflows/bootstrap-production-crm-canary-driver.yml",
                 ".github/workflows/cleanup-production-crm-canary-fixture.yml",
                 ".github/workflows/inverse-production-crm-canary-fixture.yml",
                 ".github/workflows/rollback-production-phase.yml",
@@ -1404,7 +1419,7 @@ jobs:
                 ".github/workflows/validate-exact-release-source.yml",
                 ".github/workflows/verify-production-crm-canary.yml",
                 ".github/workflows/verify-production-recovery-readiness.yml"
-              ) | not))
+              ) | not)))
           ' "$RUNNER_TEMP/release-active.json" > /dev/null
 
           rule_query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){branchProtectionRules(first:100){nodes{id pattern lockBranch isAdminEnforced lockAllowsFetchAndMerge} pageInfo{hasNextPage}}}}'
@@ -1711,7 +1726,7 @@ jobs:
           gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/gate-current-run.json"
           jq -e --arg sha "$CONTROL_SHA" '
             .path == ".github/workflows/finalize-production-orphan-lock.yml" and
-            .name == "Finalize Production Orphan Lock" and .event == "workflow_dispatch" and
+            .name == "Finalize one reconciled production orphan lock without changing production" and .event == "workflow_dispatch" and
             .head_branch == "main" and .head_sha == $sha and .run_attempt == 1 and
             .status == "in_progress"
           ' "$RUNNER_TEMP/gate-current-run.json" > /dev/null

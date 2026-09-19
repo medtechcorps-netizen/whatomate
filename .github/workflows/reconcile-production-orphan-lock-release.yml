@@ -160,7 +160,7 @@ jobs:
           jq -e --slurp --arg sha "$CONTROL_SHA" --arg run_id "$FINALIZER_RUN_ID" '
             length == 2 and .[0].id == .[1].id and all(.[];
               (.id | tostring) == $run_id and .path == ".github/workflows/finalize-production-orphan-lock.yml" and
-              .name == "Finalize Production Orphan Lock" and .head_sha == $sha and .head_branch == "main" and
+              .name == "Finalize one reconciled production orphan lock without changing production" and .head_sha == $sha and .head_branch == "main" and
               .event == "workflow_dispatch" and .run_attempt == 1 and .status == "completed" and
               (.conclusion | IN("failure","cancelled","timed_out")))
           ' "$evidence/current-run.json" "$evidence/run.json" > /dev/null
@@ -579,7 +579,7 @@ jobs:
           gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/observe-current-run.json"
           jq -e --arg sha "$CONTROL_SHA" '
             .path == ".github/workflows/reconcile-production-orphan-lock-release.yml" and
-            .name == "Reconcile Production Orphan Lock Release" and .event == "workflow_dispatch" and
+            .name == "Observe one incomplete orphan-lock finalizer without mutating main or production" and .event == "workflow_dispatch" and
             .head_branch == "main" and .head_sha == $sha and .run_attempt == 1 and .status == "in_progress"
           ' "$RUNNER_TEMP/observe-current-run.json" > /dev/null
           gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/1/jobs?per_page=100" > "$RUNNER_TEMP/observe-current-jobs.json"
@@ -676,7 +676,7 @@ jobs:
           jq -e --arg sha "$CONTROL_SHA" --arg run_id "$FINALIZER_RUN_ID" '
             (.id | tostring) == $run_id and .run_attempt == 1 and
             .path == ".github/workflows/finalize-production-orphan-lock.yml" and
-            .name == "Finalize Production Orphan Lock" and .head_sha == $sha and .head_branch == "main" and
+            .name == "Finalize one reconciled production orphan lock without changing production" and .head_sha == $sha and .head_branch == "main" and
             .event == "workflow_dispatch" and .status == "completed" and
             (.conclusion | IN("failure","cancelled","timed_out"))
           ' "$evidence/run.json" > /dev/null
@@ -1037,7 +1037,7 @@ jobs:
           gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/gate-current-run.json"
           jq -e --arg sha "$CONTROL_SHA" '
             .path == ".github/workflows/reconcile-production-orphan-lock-release.yml" and
-            .name == "Reconcile Production Orphan Lock Release" and .event == "workflow_dispatch" and
+            .name == "Observe one incomplete orphan-lock finalizer without mutating main or production" and .event == "workflow_dispatch" and
             .head_branch == "main" and .head_sha == $sha and .run_attempt == 1 and .status == "in_progress"
           ' "$RUNNER_TEMP/gate-current-run.json" > /dev/null
           gh api "/repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/1/jobs?per_page=100" > "$RUNNER_TEMP/gate-current-jobs.json"
@@ -1116,7 +1116,7 @@ jobs:
           jq -e --arg sha "$CONTROL_SHA" --arg run_id "$FINALIZER_RUN_ID" '
             (.id | tostring) == $run_id and .run_attempt == 1 and
             .path == ".github/workflows/finalize-production-orphan-lock.yml" and
-            .name == "Finalize Production Orphan Lock" and .head_sha == $sha and .head_branch == "main" and
+            .name == "Finalize one reconciled production orphan lock without changing production" and .head_sha == $sha and .head_branch == "main" and
             .event == "workflow_dispatch" and .status == "completed" and
             (.conclusion | IN("failure","cancelled","timed_out"))
           ' "$evidence/run.json" > /dev/null

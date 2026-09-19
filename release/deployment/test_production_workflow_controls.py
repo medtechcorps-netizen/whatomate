@@ -33,6 +33,7 @@ ACTIVE_PRODUCTION_CONTROLS = (
     "cleanup-production-valkey-recovery-fork.yml",
     "provision-production-crm-canary-fixture.yml",
     "cleanup-production-crm-canary-fixture.yml",
+    "bootstrap-production-crm-canary-driver.yml",
 )
 AUXILIARY_PRODUCTION_CONTROLS = (
     "publish-attest-production-crm-canary-driver.yml",
@@ -48,7 +49,7 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "b9f36ed7b6dccf1249876d4beda46424a620cb8f554aa0dfdd7f7e21e920ed71"
     ),
     "finalize-production-orphan-lock.yml": (
-        "19706d8b48b074ca3803bc9d39149dce73f867db8d0918fbb0b9a16c1075ac5e"
+        "117a9b7c053f663609fa31774ccb76bd7bf1d0b1ce3d319b34797086939ceef9"
     ),
     "reconcile-production-orphan.yml": (
         "a702f615d9721c6c175985a7e494a1173523fe98d076ffcede552c744763a065"
@@ -121,7 +122,7 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
     ),
 }
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "55ed07aa32388f5d7bbd2553cab97cff9df080a88805bd40f66f66f5ae8db1bf"
+    "3942b427904a6d7878f97c5cc62185ae00d62a4a2aa4b6b5589ac6f602921595"
 )
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
     "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
@@ -130,13 +131,14 @@ EXACT_CLEANUP_AUTHORITY_STEP_SHA256 = (
     "30096cb73e5db041a6120d3ed4dcf6bb29169134713e2515e9baf32ee3179232"
 )
 EXACT_GATE_B_TEST_JOB_SHA256 = {
+    "release-controls": "79645bf97ed1574bcb760af561a525ffc028e2ea34e27b9ca51af177ba59590a",
     "go-race": "4394f61230c01e1eb700956a99b26b1fd442e8fab2fd0004074aa78723e2a189",
-    "lint": "02dd41096ca9d060d9f2f26be9588775356ab21856c1982a3d33a0559a28f3e1",
+    "lint": "6f5c645c69d975a28cfb9a265ebf2df8ac84a3e9cfb2d79974d302b5b6e95406",
     "security": "ed9572d5895abf26417ce1ebf87970cc67b41be00379d42df75df58f73c8cbd4",
     "recovery-boundary-images": (
         "90daa97f1350ea5ec53dfc0b86416138fc4737928e6a7d089c33276aa36eaea2"
     ),
-    "test": "4cb797b5003caf4dcc2599733d839093b3874c60a17eb9eab1c2620e91d97c1f",
+    "test": "66dd04560886c6c51f965dc61f65d4bdd254d764bbb211bb8ec62055b1adc081",
 }
 
 
@@ -425,6 +427,7 @@ def assert_gate_b_test_workflow(source: str) -> None:
         raise AssertionError("Test workflow permissions differ from contents:read")
 
     expected_jobs = (
+        "release-controls",
         "tenant-isolation",
         "go-race",
         "lint",
@@ -485,6 +488,7 @@ def assert_gate_b_test_workflow(source: str) -> None:
         "actionlint .github/workflows/test.yml",
         "actionlint .github/workflows/provision-production-crm-canary-fixture.yml "
         ".github/workflows/cleanup-production-crm-canary-fixture.yml",
+        "actionlint .github/workflows/bootstrap-production-crm-canary-driver.yml",
         "actionlint -ignore '\"on\" section should not be empty' "
         "prototype/recovery-boundary/workflows/*.tmpl",
     ):
@@ -651,6 +655,7 @@ def assert_gate_b_test_workflow(source: str) -> None:
 
     aggregate = job_block(source, "test")
     expected_needs = (
+        "release-controls",
         "tenant-isolation",
         "go-race",
         "lint",
@@ -678,12 +683,27 @@ def assert_gate_b_test_workflow(source: str) -> None:
     aggregate_checkout = step_block(aggregate, "Checkout repository")
     require_active_source_line(aggregate_checkout, "fetch-depth: 0")
     require_active_source_line(aggregate_checkout, "persist-credentials: false")
+    controls = job_block(source, "release-controls")
+    require_active_source_line(controls, "fetch-depth: 0")
+    require_active_source_line(controls, "persist-credentials: false")
+    require_active_source_line(controls, "runs-on: ubuntu-24.04")
+    if re.search(r"(?m)^    (?:needs|if|continue-on-error|environment):", controls):
+        raise AssertionError("release controls must run early, unconditionally and without an environment")
+    if "secrets." in controls or "continue-on-error:" in controls:
+        raise AssertionError("release rehearsal must be secret-free and fail closed")
+    require_active_source_line(
+        controls,
+        "PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f",
+    )
+    require_active_source_line(
+        controls,
+        '[[ "$("$RUNNER_TEMP/release-rehearsal-jq" --version)" == "jq-1.8.2" ]]',
+    )
     for line in (
-        "python3 -m py_compile \\",
-        "python3 -m unittest discover -s release/deployment -p 'test_*.py' -v",
+        "python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v",
         "python3 -B -m unittest discover -s release/canary -p 'test_*.py' -v",
     ):
-        require_active_source_line(aggregate, line)
+        require_active_source_line(controls, line)
     for dependency in expected_needs:
         env_name = dependency.replace("-", "_").upper() + "_RESULT"
         require_active_source_line(
@@ -2079,11 +2099,11 @@ def assert_crm_canary_driver_publisher(source: str) -> None:
 class WorkflowAuthorityPolicyTests(unittest.TestCase):
     def test_fixture_controllers_are_covered_by_existing_protected_test_discovery(self) -> None:
         source = workflow("test.yml")
-        gate = job_block(source, "test")
+        gate = job_block(source, "release-controls")
         discovery = step_block(gate, "Test exact rollout evidence controls")
         require_active_source_line(
             discovery,
-            "python3 -m unittest discover -s release/deployment -p 'test_*.py' -v",
+            "python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v",
         )
         self.assertNotRegex(discovery, r"(?m)^        (?:if|continue-on-error):")
         discovered = {
@@ -2267,6 +2287,43 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
             self.assertNotEqual(mutant, source)
             with self.assertRaises(AssertionError):
                 assert_exact_pin(mutant)
+
+    def test_driver_bootstrap_has_one_reviewed_private_job_and_public_receipt_only(self) -> None:
+        source = workflow("bootstrap-production-crm-canary-driver.yml")
+        self.assertEqual(job_ids(source), ("authority", "install", "gate"))
+        authority = job_block(source, "authority")
+        install = job_block(source, "install")
+        gate = job_block(source, "gate")
+        self.assertNotIn("secrets.", authority)
+        self.assertNotIn("environment:", authority)
+        self.assertNotIn("secrets.", gate)
+        self.assertIn("    needs: authority", install)
+        self.assertIn("    environment: rereply-production-crm-fixture", install)
+        self.assertEqual(set(re.findall(r"secrets\.([A-Z0-9_]+)", source)), {
+            "CRM_CANARY_FIXTURE_INPUT_JSON", "CRM_CANARY_DRIVER_BOOTSTRAP_JSON",
+            "DO_DRIVER_BOOTSTRAP_READ_TOKEN", "DO_DRIVER_BOOTSTRAP_CREATE_TOKEN",
+            "GH_CANARY_ENVIRONMENT_WRITE_TOKEN", "GH_DRIVER_BOOTSTRAP_READ_TOKEN",
+        })
+        self.assertEqual(source.count("persist-credentials: false"), 2)
+        self.assertEqual(source.count("fetch-depth: 0"), 2)
+        self.assertEqual(source.count('[[ "$GITHUB_RUN_ATTEMPT" == 1 && "$WORKFLOW_SHA" == "$CONTROL_SHA" ]]'), 2)
+        self.assertIn("bootstrap_production_crm_canary_driver.py validate --control-root control", authority)
+        self.assertIn("bootstrap_production_crm_canary_driver.py install --control-root control", install)
+        self.assertEqual(install.count("uses: actions/attest@"), 2)
+        self.assertLess(install.index("- name: Attest exact driver setup policy"),
+                        install.index("- name: Upload public driver setup receipt only"))
+        self.assertIn("path: ${{ runner.temp }}/driver-bootstrap-receipt", install)
+        self.assertNotIn("if: ${{ always() }}", install)
+        self.assertIn("    if: ${{ always() }}", gate)
+        self.assertIn('[[ "$AUTHORITY_RESULT" == success && "$INSTALL_RESULT" == success ]]', gate)
+        for forbidden in ("continue-on-error:", "set -x", "pull_request:",
+                          "CRM_CANARY_SYNTHETIC_DRIVER_JSON:", "DO_PRODUCTION_APPLY_TOKEN",
+                          "DO_PRODUCTION_FIXTURE_UPDATE_TOKEN", "gh workflow run", "/v1/execute"):
+            self.assertNotIn(forbidden, source)
+        lint = step_block(job_block(workflow("test.yml"), "lint"),
+                          "Lint workflows and inert recovery templates")
+        require_active_source_line(lint,
+            "actionlint .github/workflows/bootstrap-production-crm-canary-driver.yml")
 
     def test_every_active_release_control_is_manual_exact_main_and_serialized(self) -> None:
         for name in ACTIVE_PRODUCTION_CONTROLS:
@@ -2678,6 +2735,17 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
         )
 
         mutations = {
+            "release-controls-delayed": source.replace(
+                "  release-controls:\n    name: release-controls\n",
+                "  release-controls:\n    name: release-controls\n    needs: go-race\n", 1,
+            ),
+            "release-controls-not-required": source.replace("      - release-controls\n", "", 1),
+            "release-controls-ignored": source.replace(
+                '[[ "$RELEASE_CONTROLS_RESULT" == "success" ]]', "true", 1,
+            ),
+            "release-controls-jq-unpinned": source.replace(
+                "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f", "0" * 64, 1,
+            ),
             "push-removed": source.replace(
                 "  push:\n    branches:\n      - main\n",
                 "",
@@ -4833,12 +4901,12 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
             ".github/workflows/prepare-production-valkey-recovery-fork.yml",
             ".github/workflows/cleanup-production-valkey-recovery-fork.yml",
         ):
-            self.assertEqual(finalizer.count(path), 3)
+            self.assertEqual(finalizer.count(path), 4)
         for name in (
             "Prepare Production Valkey Recovery Fork",
             "Cleanup Production Valkey Recovery Fork",
         ):
-            self.assertEqual(finalizer.count(name), 1)
+            self.assertNotIn(f'"{name}"', finalizer)
 
     def test_cleanup_pre_mutation_failure_rejects_each_control_weakening(
         self,
@@ -5391,27 +5459,25 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
 
     def test_orphan_finalizer_competing_set_matches_shared_concurrency_workflows(self) -> None:
         source = workflow("finalize-production-orphan-lock.yml")
-        self.assertIn('"Reconcile Production Main Lock Release"', source)
         self.assertEqual(
             source.count(
                 '".github/workflows/reconcile-production-main-lock-release.yml"'
             ),
-            2,
+            3,
         )
-        expected_names = {
-            workflow(path.name).splitlines()[0].removeprefix("name: ")
-            for path in WORKFLOWS.glob("*.yml")
-            if "group: rereply-production" in workflow(path.name)
-        }
         expected_paths = {
             f'.github/workflows/{path.name}'
             for path in WORKFLOWS.glob("*.yml")
             if "group: rereply-production" in workflow(path.name)
         }
-        for name in expected_names:
-            self.assertIn(f'"{name}"', source)
-        for path in expected_paths:
-            self.assertIn(f'"{path}"', source)
+        inventories = re.findall(r"(?s)\.path \| IN\((.*?)\) \| not", source)
+        self.assertEqual(len(inventories), 3)
+        for inventory in inventories:
+            paths = re.findall(r'"([^"]+)"', inventory)
+            self.assertEqual(len(paths), len(set(paths)))
+            self.assertEqual(set(paths), expected_paths)
+        self.assertEqual(source.count(".path | IN("), 3)
+        self.assertNotIn(".name | IN(", source)
 
     def test_orphan_finalizer_revalidates_signed_pre_and_post_authorities(self) -> None:
         source = workflow("finalize-production-orphan-lock.yml")
