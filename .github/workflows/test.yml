@@ -16,6 +16,38 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  release-controls:
+    name: release-controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install exact release-rehearsal jq
+        env:
+          PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+          PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "$PINNED_JQ_URL" -o "$RUNNER_TEMP/release-rehearsal-jq"
+          printf '%s  %s\n' "$PINNED_JQ_SHA256" "$RUNNER_TEMP/release-rehearsal-jq" | sha256sum --check --strict
+          chmod 0700 "$RUNNER_TEMP/release-rehearsal-jq"
+          [[ "$("$RUNNER_TEMP/release-rehearsal-jq" --version)" == "jq-1.8.2" ]]
+          printf 'RELEASE_TEST_JQ=%s\n' "$RUNNER_TEMP/release-rehearsal-jq" >> "$GITHUB_ENV"
+
+      - name: Test exact rollout evidence controls
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v
+          python3 -B -m unittest discover -s release/canary -p 'test_*.py' -v
+
   tenant-isolation:
     name: tenant-isolation
     runs-on: ubuntu-24.04
@@ -234,6 +266,7 @@ jobs:
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
           actionlint .github/workflows/test.yml
           actionlint .github/workflows/provision-production-crm-canary-fixture.yml .github/workflows/cleanup-production-crm-canary-fixture.yml
+          actionlint .github/workflows/bootstrap-production-crm-canary-driver.yml
           actionlint -ignore '"on" section should not be empty' prototype/recovery-boundary/workflows/*.tmpl
 
   build:
@@ -398,6 +431,7 @@ jobs:
     name: test
     if: ${{ always() }}
     needs:
+      - release-controls
       - tenant-isolation
       - go-race
       - lint
@@ -413,18 +447,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Test exact rollout evidence controls
-        run: |
-          python3 -m py_compile \
-            release/deployment/verify_rollout_evidence.py \
-            release/deployment/test_verify_rollout_evidence.py \
-            release/deployment/verify_production_plan.py \
-            release/deployment/test_verify_production_plan.py
-          python3 -m unittest discover -s release/deployment -p 'test_*.py' -v
-          python3 -B -m unittest discover -s release/canary -p 'test_*.py' -v
-
       - name: Require every Test job to succeed
         env:
+          RELEASE_CONTROLS_RESULT: ${{ needs.release-controls.result }}
           TENANT_ISOLATION_RESULT: ${{ needs.tenant-isolation.result }}
           GO_RACE_RESULT: ${{ needs.go-race.result }}
           LINT_RESULT: ${{ needs.lint.result }}
@@ -433,6 +458,7 @@ jobs:
           RECOVERY_BOUNDARY_IMAGES_RESULT: ${{ needs.recovery-boundary-images.result }}
         run: |
           set -euo pipefail
+          [[ "$RELEASE_CONTROLS_RESULT" == "success" ]]
           [[ "$TENANT_ISOLATION_RESULT" == "success" ]]
           [[ "$GO_RACE_RESULT" == "success" ]]
           [[ "$LINT_RESULT" == "success" ]]

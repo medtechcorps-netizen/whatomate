@@ -558,9 +558,11 @@ class RolloutEvidenceTests(unittest.TestCase):
         test_workflow = TEST_WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertNotIn("  release-control:", test_workflow)
         required_test_job = test_workflow.split("  test:\n", 1)[1].split("\n  lint:", 1)[0]
-        self.assertIn("python3 -m unittest discover -s release/deployment", required_test_job)
-        self.assertIn("python3 -m py_compile", required_test_job)
-        self.assertIn("release/deployment/verify_rollout_evidence.py", required_test_job)
+        self.assertIn("      - release-controls\n", required_test_job)
+        self.assertIn('[[ "$RELEASE_CONTROLS_RESULT" == "success" ]]', required_test_job)
+        control_job = test_workflow.split("  release-controls:\n", 1)[1].split("\n  tenant-isolation:", 1)[0]
+        self.assertIn("python3 -B -m unittest discover -s release/deployment", control_job)
+        self.assertNotIn("    needs:", control_job)
 
     def test_input_requires_exact_order_and_exact_keys(self) -> None:
         value = self.valid_input_value()

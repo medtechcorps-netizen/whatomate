@@ -450,31 +450,26 @@ class FinalizeProductionOrphanLockTests(unittest.TestCase):
         source = (workflows / "finalize-production-orphan-lock.yml").read_text(
             encoding="utf-8"
         )
-        names: set[str] = set()
         paths: set[str] = set()
         for path in workflows.glob("*.yml"):
             content = path.read_text(encoding="utf-8")
             if not re.search(r"(?m)^  group: rereply-production$", content):
                 continue
-            name = re.fullmatch(r"name: ([^\r\n]+)", content.splitlines()[0])
-            self.assertIsNotNone(name)
-            names.add(name.group(1))
             paths.add(f".github/workflows/{path.name}")
         additions = {
-            "Provision Production CRM Canary Fixture":
-                ".github/workflows/provision-production-crm-canary-fixture.yml",
-            "Cleanup Production CRM Canary Fixture":
-                ".github/workflows/cleanup-production-crm-canary-fixture.yml",
+            ".github/workflows/provision-production-crm-canary-fixture.yml",
+            ".github/workflows/cleanup-production-crm-canary-fixture.yml",
+            ".github/workflows/bootstrap-production-crm-canary-driver.yml",
         }
-        self.assertTrue(set(additions).issubset(names))
-        self.assertTrue(set(additions.values()).issubset(paths))
+        self.assertTrue(additions.issubset(paths))
 
         def require_exact_inventories(candidate: str) -> None:
             active = "\n".join(
                 line for line in candidate.splitlines()
                 if not line.lstrip().startswith("#")
             )
-            for field, expected, copies in (("name", names, 1), ("path", paths, 2)):
+            self.assertNotRegex(active, r"\(\.name \| IN\(")
+            for field, expected, copies in (("path", paths, 3),):
                 blocks = re.findall(
                     rf"\(\.{field} \| IN\(\s*(.*?)\s*\) \| not\)",
                     active,
@@ -487,8 +482,8 @@ class FinalizeProductionOrphanLockTests(unittest.TestCase):
                     self.assertEqual(set(inventory), expected)
 
         require_exact_inventories(source)
-        for name, path in additions.items():
-            for value, copies in ((name, 1), (path, 2)):
+        for path in additions:
+            for value, copies in ((path, 3),):
                 needle = f'"{value}",'
                 positions = [match.start() for match in re.finditer(re.escape(needle), source)]
                 self.assertEqual(len(positions), copies)

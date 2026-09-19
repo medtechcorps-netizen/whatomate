@@ -925,6 +925,70 @@ synthetic check is mandatory. `production-crm-canary.json` and the final
 `production-phase-state.json` contain only sanitized hashes, semantic labels,
 booleans, phase lineage, and rollback floors.
 
+### One-time private driver installation
+
+`bootstrap-production-crm-canary-driver.yml` is a separately approved, manual
+setup lane, not a rollout or a synthetic test. Publishing or merging its code
+does not authorize its execution. Use it only after reviewing an exact public
+authorization packet and installing its matching protected setup descriptor in
+the approval-required, main-only `rereply-production-crm-fixture` environment.
+The descriptor freezes the separate driver target, one instance, size/cost
+ceiling, existing dedicated ledger binding, and credential scope review. No
+target, credential, or resource-size default is installation authority.
+
+The public packet must bind the current control, the existing signed fixture
+receipt, the successful immutable driver publisher, the private descriptor hash,
+and the exact allowed effects. Private provider identifiers and the generated
+HMAC key stay in the protected descriptor. The installer rehydrates only the
+already-created synthetic fixture using `CRM_CANARY_FIXTURE_INPUT_JSON`; it
+does not retrieve GitHub secret values or recreate missing fixtures.
+
+The setup job uses separate protected `GH_DRIVER_BOOTSTRAP_READ_TOKEN`,
+`DO_DRIVER_BOOTSTRAP_READ_TOKEN`, `DO_DRIVER_BOOTSTRAP_CREATE_TOKEN`, and
+`GH_CANARY_ENVIRONMENT_WRITE_TOKEN` capabilities. These are not the existing
+fixture-update or production-apply tokens. The read authority must cover the
+exact GitHub evidence, branch/environment metadata, and provider target checks.
+No token's display name proves its scopes. Review the declared scope envelope
+at issuance; no provider mutation is used to test a token. Keep all capability
+tokens out of the driver runtime.
+
+Only one attempt-1 setup run is accepted on the packet's exact control SHA.
+Any earlier or duplicate setup run on that control, deleted history, or rerun
+is outside the one-shot operating contract. The workflow shares
+`rereply-production` concurrency. It creates at most one new app, never updates
+the production app, never creates a cluster/database/user, and never manually
+rewrites a database firewall. The existing driver may initialize its dedicated
+ledger table. Managed attachment must produce the exact reviewed trusted-source
+addition, verified through provider reads; undocumented automatic behavior is
+not assumed. Ledger credentials remain a provider-resolved, GENERAL bindable,
+not an encrypted literal. Runtime secrets remain encrypted private values.
+
+After stable ACTIVE deployment, immutable image/spec checks and two health
+observations, the installer writes only `CRM_CANARY_SYNTHETIC_DRIVER_JSON` to
+the canary environment through a nonlogging in-memory transfer. The five-field
+configuration contains only schema, execution URL, driver-version hash,
+fixture-descriptor hash and the shared HMAC key. The public-target secret and
+environment protections must remain unchanged. Only a content-free signed
+receipt and SHA sidecar may be published. Setup never calls `/v1/execute` and
+does not satisfy the later UI canary.
+
+Timeout, transport ambiguity, conflicting resource, unexpected provider
+normalization, failed readiness or uncertain secret installation stops setup.
+Never repeat app creation or roll back to an old spec. Keep any partial resource
+quarantined for read-only reconciliation and a separately approved cleanup;
+this installer has no delete or resume capability.
+
+The operator's `launch_production_prerequisites.py` reader checks genuine public
+GitHub evidence and protected secret-name metadata before any phase starts. Its
+`audit-public` mode can review a local candidate but grants no launch or bootstrap
+authority. Normal checks require a clean checkout at current protected main.
+The sanitized provider adapter requires explicit private runtime injection of
+`DO_PRODUCTION_TARGET_JSON` and `DO_PRODUCTION_READ_TOKEN`; it never falls back
+to a broad ambient provider context or raw-provider files. It compares two
+complete app/active-deployment observations with independently authenticated
+predecessor evidence. These checks do not replace protected workflow approval
+or the workflow's immediate pre-mutation checks.
+
 ## Immediate stop conditions
 
 Invalidate the release and stop if any of these occurs:

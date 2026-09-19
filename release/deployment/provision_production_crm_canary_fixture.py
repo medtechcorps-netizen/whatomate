@@ -1837,6 +1837,80 @@ def validate_terminal_result(result: Any) -> dict[str,Any]:
     return copy.deepcopy(r)
 
 
+def _verify_fixture_producer_compatibility(path: str, old: dict[str, Any],
+                                         new: dict[str, Any], descriptor: dict[str, Any]) -> None:
+    """One reviewed receipt may cross the PR156 read-only fingerprint addition.
+
+    This is not a producer-version allowlist: the exception names one origin,
+    its exact workflow/controller blobs, and the entire reviewed post-PR156
+    source. Reconstructing that source removes only this consumer-side helper
+    and restores its one exact call site. Nothing in the executor, globals,
+    existing verifier, or other source is omitted. Future drift fails closed.
+
+    The helper is protected control code, not recursively self-hashed policy.
+    Its API source must equal the executing checkout; only the rest of the
+    source is compared with the already-audited immutable Git blob.
+    """
+    import ast
+
+    controller = "release/deployment/provision_production_crm_canary_fixture.py"
+    _require(path in (WORKFLOW_PATH, controller), "fixture producer path differs")
+    old_sha = common.require_sha1(old.get("sha"), "old fixture producer blob")
+    new_sha = common.require_sha1(new.get("sha"), "current fixture producer blob")
+    reviewed_origin = (descriptor.get("control_sha") == "974c875ec554df996986bb369e2900a9a79ff0cd"
+                       and common.require_run_id(descriptor.get("run_id"), "fixture run") == "35004135116")
+    if path == WORKFLOW_PATH:
+        _require(old_sha == new_sha, "fixture producer changed after receipt")
+        if reviewed_origin:
+            _require(old_sha == "d2cd700bdf31f999b25563fd906cf1354f0d8feb",
+                     "reviewed fixture workflow differs")
+        return
+    if old_sha == new_sha:
+        return
+    _require(reviewed_origin and old_sha == "e18a9d20279105f4a016ea062f86bb713fdb2ba3",
+             "fixture producer changed after receipt")
+    encoded = new.get("content")
+    _require(new.get("encoding") == "base64" and type(encoded) is str
+             and len(encoded) <= 350000, "fixture producer source encoding differs")
+    try:
+        source = base64.b64decode(encoded.replace("\n", ""), validate=True)
+        _require(len(source) <= 256 * 1024, "fixture producer source exceeds bound")
+        _require(hashlib.sha1(b"blob " + str(len(source)).encode() + b"\0" + source).hexdigest() == new_sha,
+                 "fixture producer source blob differs")
+        # Git content is LF; a Windows checkout may use CRLF without changing
+        # the Git blob. Do not otherwise normalize source bytes.
+        _require(source == Path(__file__).read_bytes().replace(b"\r\n", b"\n"),
+                 "fixture producer source differs from executing checkout")
+        tree = ast.parse(source.decode("utf-8"))
+        helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                   and n.name == "_verify_fixture_producer_compatibility"]
+        verifiers = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                     and n.name == "verify_fixture_result"]
+        _require(len(helpers) == len(verifiers) == 1 and not helpers[0].decorator_list,
+                 "fixture compatibility source boundaries differ")
+        helper = helpers[0]
+        calls = [n for n in ast.walk(verifiers[0]) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name) and n.func.id == helper.name]
+        _require(len(calls) == 1 and calls[0].lineno == calls[0].end_lineno,
+                 "fixture compatibility call site differs")
+        lines = source.splitlines(keepends=True)
+        call = calls[0].lineno - 1
+        _require(lines[call] == b"        _verify_fixture_producer_compatibility(path, old, new, d)\n",
+                 "fixture compatibility call site differs")
+        _require(lines[helper.end_lineno:helper.end_lineno + 2] == [b"\n", b"\n"],
+                 "fixture compatibility source boundaries differ")
+        lines[call] = b'        _require(old.get("sha") == new.get("sha"),"fixture producer changed after receipt")\n'
+        del lines[helper.lineno - 1:helper.end_lineno + 2]
+        reviewed = b"".join(lines)
+        _require(hashlib.sha1(b"blob " + str(len(reviewed)).encode() + b"\0" + reviewed).hexdigest()
+                 == "4302ab0c8942bf318a385cc48af7b79541b3217a",
+                 "fixture producer drift exceeds reviewed compatibility")
+    except common.ReleaseError:
+        raise
+    except (ValueError, SyntaxError, UnicodeError, OSError):
+        raise common.ReleaseError("fixture compatibility source invalid") from None
+
+
 def verify_fixture_result(api: GitHubRead,root: Path,gh: Path) -> dict[str,Any]:
     d = _schema(common.loads_strict(os.environ["FIXTURE_EVIDENCE_JSON"]),
                 {"control_sha","run_id","artifact_id","artifact_digest","result_sha256"},"fixture result descriptor")
@@ -1849,7 +1923,7 @@ def verify_fixture_result(api: GitHubRead,root: Path,gh: Path) -> dict[str,Any]:
     for path in (WORKFLOW_PATH,"release/deployment/provision_production_crm_canary_fixture.py"):
         old=api.get(API_PREFIX+"/contents/"+path+"?ref="+d["control_sha"])
         new=api.get(API_PREFIX+"/contents/"+path+"?ref="+current)
-        _require(old.get("sha") == new.get("sha"),"fixture producer changed after receipt")
+        _verify_fixture_producer_compatibility(path, old, new, d)
     run_id=common.require_run_id(d["run_id"],"fixture run")
     run=api.get(API_PREFIX+"/actions/runs/"+run_id)
     _require(run.get("head_sha") == d["control_sha"] and run.get("head_branch") == "main"

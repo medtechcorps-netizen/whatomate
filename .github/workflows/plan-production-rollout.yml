@@ -415,7 +415,7 @@ jobs:
           gh api "/repos/$REPOSITORY/actions/runs/$predecessor_run_id/attempts/$predecessor_run_attempt/jobs?per_page=100" \
             > "$RUNNER_TEMP/predecessor-jobs.json"
           jq -e --arg gate "$PRODUCTION_PHASE_STATE_GATE_NAME" --argjson attempt "$predecessor_run_attempt" '
-            [.jobs[] | select(.name == $gate)] | length == 1 and
+            ([.jobs[] | select(.name == $gate)] | length) == 1 and
             ([.jobs[] | select(.name == $gate)][0] |
               .run_attempt == $attempt and .status == "completed" and
               .conclusion == "success" and .runner_name != null)
@@ -456,7 +456,8 @@ jobs:
             --rollout-plan "$RUNNER_TEMP/capsule/rollout-plan.json" \
             --control-sha "$CONTROL_SHA" \
             --predecessor-state "$RUNNER_TEMP/predecessor/production-phase-state.json" \
-            --predecessor-sha256 "$RUNNER_TEMP/predecessor/production-phase-state.sha256"
+            --predecessor-sha256 "$RUNNER_TEMP/predecessor/production-phase-state.sha256" \
+            --target-images-output "$RUNNER_TEMP/predecessor-target-images.json"
 
           signer="$RELEASE_REPOSITORY/$PRODUCTION_PHASE_STATE_WORKFLOW_PATH"
           flags=(--repo "$RELEASE_REPOSITORY" --signer-workflow "$signer" \
