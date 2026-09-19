@@ -18,7 +18,7 @@ jobs:
       - name: Check out the exact revision under test
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: c912f1be084f300a2cc83d1592249e8187401545
+          ref: ec25d95d6d2a0a5df14f2d9e18678da176518281
           # The control suites read pinned release blobs out of history, so the
           # probe needs the same full checkout the repository's own gate uses.
           fetch-depth: 0
