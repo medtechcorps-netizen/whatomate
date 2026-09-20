@@ -86,6 +86,24 @@ PRIVATE_NAMES = (
     "DO_DRIVER_BOOTSTRAP_READ_TOKEN", "DO_DRIVER_BOOTSTRAP_CREATE_TOKEN",
     "GH_CANARY_ENVIRONMENT_WRITE_TOKEN",
 )
+MODE_ENV = "BOOTSTRAP_MODE"
+MODES = frozenset({"check", "install"})
+RUN_TITLES = {
+    "check": "Check exact private CRM driver prerequisites",
+    "install": "Install exact private CRM canary driver",
+}
+CHECK_PRIVATE_NAMES = PRIVATE_NAMES[:3]
+STAGES = frozenset({
+    "INITIALIZATION", "MODE", "AUTHORIZATION", "PRIVATE_INPUTS", "CURRENT_AUTHORITY",
+    "PINNED_CLI", "PUBLIC_EVIDENCE_READER", "ADAPTERS", "ENVIRONMENT_PRESTATE",
+    "FIXTURE_AUTHENTICATION", "IMAGE_AUTHENTICATION", "FIXTURE_INPUT_VALIDATION",
+    "PROVIDER_ACCOUNT", "PROVIDER_SIZE", "PROVIDER_REGION", "PROVIDER_LEDGER_METADATA",
+    "PROVIDER_LEDGER_DATABASE", "PROVIDER_FIREWALL", "PROVIDER_APPS",
+    "FIXTURE_REHYDRATION", "RUNTIME_SPEC", "SECOND_CAS", "CHECK_COMPLETE",
+    "CREATE_APP", "OBSERVE_CREATED", "HEALTH", "STABLE_HEALTH",
+    "INSTALL_ENVIRONMENT", "FINAL_AUTHORITY", "RECEIPT_WRITE",
+})
+_diagnostic_stage = "INITIALIZATION"
 LABEL = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$")
 DB_LABEL = re.compile(r"^[a-z][a-z0-9_]{1,62}$")
@@ -97,6 +115,41 @@ MAX_PUBLIC = 64 * 1024 * 1024
 def require(ok: bool, message: str) -> None:
     if not ok:
         common.fail(message)
+
+
+def mark_stage(name: str) -> None:
+    global _diagnostic_stage
+    require(name in STAGES, "diagnostic stage differs")
+    _diagnostic_stage = name
+
+
+class LedgerCredentialResponseRejected(common.ReleaseError):
+    def __init__(self, *, uri: bool):
+        super().__init__("ledger response contains forbidden credentials")
+        self.code = "LEDGER_URI_RESPONSE_REJECTED" if uri else "LEDGER_CREDENTIAL_RESPONSE_REJECTED"
+
+
+def failure_report(error: Exception) -> dict[str, Any]:
+    """Only reviewed constants escape; never format upstream/private objects."""
+    code = "BOOTSTRAP_CHECK_FAILED"
+    if isinstance(error, common.ReleaseError):
+        try:
+            message = str(error)
+        except Exception:
+            message = ""
+        if (type(error) is LedgerCredentialResponseRejected
+                and error.code in ("LEDGER_URI_RESPONSE_REJECTED", "LEDGER_CREDENTIAL_RESPONSE_REJECTED")):
+            code = error.code
+        elif message == "ledger response contains forbidden credentials":
+            code = "LEDGER_CREDENTIAL_RESPONSE_REJECTED"
+        elif re.fullmatch(r"bounded HTTP operation failed: status [1-5][0-9]{2}", message):
+            status = int(message.rsplit(" ", 1)[1])
+            code = ({401: "HTTP_UNAUTHORIZED", 403: "HTTP_FORBIDDEN",
+                     404: "HTTP_NOT_FOUND", 429: "HTTP_RATE_LIMITED"}.get(status)
+                    or ("HTTP_SERVER_ERROR" if status >= 500 else "HTTP_REJECTED"))
+    return {"schema_version": 1, "outcome": "ERROR",
+            "stage": _diagnostic_stage if _diagnostic_stage in STAGES else "INITIALIZATION",
+            "code": code}
 
 
 def public_packet_hash(authorization: dict[str, Any]) -> str:
@@ -174,23 +227,47 @@ def validate_descriptor(value: Any, authorization: dict[str, Any]) -> dict[str, 
     return copy.deepcopy(d)
 
 
-def require_unique_run(api: Any, control_sha: str, run_id: str) -> None:
-    """Complete exact-control history is the conservative one-shot latch.
+def require_unique_run(api: Any, control_sha: str, run_id: str, mode: str = "install") -> None:
+    """Complete history permits read-only checks, but only one install per control.
 
-    A second dispatch burns this control even if it failed before any mutation.
-    This cannot detect deleted history; deleting workflow runs is outside the
-    operator contract. The shared workflow concurrency is an additional boundary.
+    Fixed titles derive solely from the reviewed workflow's explicit mode choice.
+    Every run must be attempt one. Unknown titles, deleted history, or reruns are
+    not recovery mechanisms; a prior install burns this control regardless of its
+    conclusion. Checks must complete before another check or install may proceed.
     """
+    require(mode in MODES, "bootstrap mode differs")
     path = fixture.API_PREFIX + "/actions/workflows/" + WORKFLOW.rsplit("/", 1)[1]
+    workflow = api.get(path)
+    identity = workflow.get("id")
+    require(type(identity) is int and identity > 0 and workflow.get("path") == WORKFLOW,
+            "bootstrap workflow identity differs")
     result = api.pages(path + "/runs?head_sha=" + control_sha, "workflow_runs")
     runs = result["workflow_runs"]
-    require(result["total_count"] == 1 and len(runs) == 1, "bootstrap control is not unused")
-    run = runs[0]
-    require(str(run.get("id")) == run_id and run.get("head_sha") == control_sha
-            and run.get("run_attempt") == 1 and run.get("head_branch") == "main"
-            and run.get("event") == "workflow_dispatch" and run.get("path") == WORKFLOW
-            and run.get("status") in ("queued", "in_progress", "waiting", "pending"),
+    require(type(runs) is list and result["total_count"] == len(runs) and 0 < len(runs) <= 10000,
             "bootstrap run inventory differs")
+    ids, installs, current = set(), [], []
+    for run in runs:
+        rid = common.require_run_id(run.get("id"), "bootstrap history run")
+        require(rid not in ids and run.get("workflow_id") == identity
+                and run.get("head_sha") == control_sha and run.get("head_branch") == "main"
+                and run.get("event") == "workflow_dispatch" and run.get("path") == WORKFLOW
+                and type(run.get("run_attempt")) is int and run["run_attempt"] == 1
+                and run.get("display_title") in RUN_TITLES.values(), "bootstrap run inventory differs")
+        ids.add(rid)
+        if run["display_title"] == RUN_TITLES["install"]:
+            installs.append(rid)
+        if rid == run_id:
+            current.append(run)
+            require(run["display_title"] == RUN_TITLES[mode]
+                    and run.get("status") in ("queued", "in_progress", "waiting", "pending", "requested")
+                    and run.get("conclusion") is None, "bootstrap current mode or status differs")
+        else:
+            require(run["display_title"] == RUN_TITLES["check"] and run.get("status") == "completed"
+                    and run.get("conclusion") in ("success", "failure", "cancelled", "timed_out",
+                        "action_required", "neutral", "skipped", "startup_failure", "stale"),
+                    "bootstrap prior run is not a terminal check")
+    require(len(current) == 1 and installs == ([run_id] if mode == "install" else []),
+            "bootstrap install authority was already consumed")
 
 
 def runtime_spec(a: dict[str, Any], d: dict[str, Any], protected: dict[str, Any],
@@ -444,22 +521,20 @@ def reject_database_credentials(value: Any) -> None:
         for key, child in value.items():
             if any(word in key.lower() for word in ("password", "secret", "token")) or key.lower() in (
                     "uri", "url", "connection_string"):
-                require(child in (None, ""), "ledger response contains forbidden credentials")
+                if child not in (None, ""):
+                    raise LedgerCredentialResponseRejected(uri=key.lower() in ("uri", "url", "connection_string"))
             reject_database_credentials(child)
     elif type(value) is list:
         for child in value:
             reject_database_credentials(child)
 
 
-class Provider:
-    """One app POST, fixed GET allowlist. No DB write/user API or app update."""
-    def __init__(self, plan: dict[str, Any], read_token: str, create_token: str):
+class ReadOnlyProvider:
+    """Fixed GET allowlist only; no creation method or mutation credential."""
+    def __init__(self, plan: dict[str, Any], read_token: str):
         self.plan = copy.deepcopy(plan)
         self.__read_token = fixture._secret(read_token)
-        self.__create_token = fixture._secret(create_token)
-        require(self.__read_token != self.__create_token, "provider credential roles are not separate")
         self.opener = fixture._opener()
-        self.created = False
         self.app_id: str | None = None
         self.deployment_id: str | None = None
 
@@ -505,30 +580,46 @@ class Provider:
 
     def preflight(self) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
         p, ledger = self.plan, self.plan["ledger"]
+        mark_stage("PROVIDER_ACCOUNT")
         account = self.get("/v2/account").get("account", {})
         require(account.get("uuid") == p["provider_account_uuid"] and account.get("status") == "active",
                 "provider account differs")
+        mark_stage("PROVIDER_SIZE")
         size = self.get("/v2/apps/tiers/instance_sizes/" + p["instance_size_slug"]).get("instance_size", {})
         require(size.get("slug") == p["instance_size_slug"] and size.get("usd_per_month") == p["monthly_usd"],
                 "driver size or current monthly cost differs")
+        mark_stage("PROVIDER_REGION")
         regions = self.get("/v2/apps/regions").get("regions")
         require(type(regions) is list, "app region inventory missing")
         matches = [r for r in regions if r.get("slug") == p["region"] and r.get("disabled", False) is False]
         require(len(matches) == 1, "driver region differs")
+        mark_stage("PROVIDER_LEDGER_METADATA")
         cluster = self.get("/v2/databases/" + ledger["cluster_id"]).get("database", {})
         require(cluster.get("id") == ledger["cluster_id"] and cluster.get("name") == ledger["cluster_name"]
                 and cluster.get("engine") == "pg" and cluster.get("version") == ledger["version"]
                 and cluster.get("status") == "online" and cluster.get("region") in matches[0].get("data_centers", []),
                 "selected existing ledger metadata differs")
+        mark_stage("PROVIDER_LEDGER_DATABASE")
         require(self.get("/v2/databases/" + ledger["cluster_id"] + "/dbs/" + ledger["database"])
                 .get("db") == {"name": ledger["database"]}, "selected ledger database is not existing")
         # User existence/least privilege is independently reviewed in the
         # protected packet. No user-list, user-detail, credential or SQL API.
+        mark_stage("PROVIDER_FIREWALL")
         rules = firewall_projection(self.get("/v2/databases/" + ledger["cluster_id"] + "/firewall"))
         require(common.sha256_value(rules) == ledger["firewall_sha256"], "ledger firewall prestate differs")
+        mark_stage("PROVIDER_APPS")
         apps = self.apps()
         require(all(app["name"] != p["app_name"] for app in apps), "driver app already exists")
         return apps, rules
+
+
+class Provider(ReadOnlyProvider):
+    """Install-only adapter: one app POST; no DB write/user API or app update."""
+    def __init__(self, plan: dict[str, Any], read_token: str, create_token: str):
+        super().__init__(plan, read_token)
+        self.__create_token = fixture._secret(create_token)
+        require(read_token != self.__create_token, "provider credential roles are not separate")
+        self.created = False
 
     def create(self, spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
         require(not self.created, "app creation was already attempted")
@@ -624,12 +715,10 @@ def health(origin: str) -> None:
         connection.close()
 
 
-class EnvironmentWriter:
-    def __init__(self, token: str, gh: Path, expected_metadata_sha256: str):
-        self.__token = fixture._secret(token)
-        self.api = fixture.GitHubRead(self.__token)
-        self.gh = gh
-        self.attempted = False
+class EnvironmentReader:
+    """Environment metadata checks only; no secret installation method."""
+    def __init__(self, token: str, expected_metadata_sha256: str):
+        self.api = fixture.GitHubRead(fixture._secret(token))
         self.expected_metadata_sha256 = common.require_sha256(expected_metadata_sha256, "environment metadata digest")
         self.initial: Any = None
 
@@ -680,6 +769,14 @@ class EnvironmentWriter:
         if self.initial is None:
             self.initial = value
         require(value == self.initial, "environment metadata changed before installation")
+
+
+class EnvironmentWriter(EnvironmentReader):
+    def __init__(self, token: str, gh: Path, expected_metadata_sha256: str):
+        super().__init__(token, expected_metadata_sha256)
+        self.__token = fixture._secret(token)
+        self.gh = gh
+        self.attempted = False
 
     def install(self, config: dict[str, Any]) -> None:
         require(not self.attempted, "environment installation was already attempted")
@@ -748,100 +845,185 @@ def observe_created(provider: Any, spec: dict[str, Any], initial_spec: dict[str,
     return driver_origin(app, provider.plan["app_name"])
 
 
-def install_once(a: dict[str, Any], d: dict[str, Any], protected: Any, *, provider: Any, writer: Any,
-                 authenticate_fixture: Any, authenticate_image: Any, current_guard: Any,
-                 rehydrate: Any, transport: Any, sleep: Any = time.sleep, probe: Any = health,
-                 now: Any = lambda: dt.datetime.now(dt.timezone.utc)) -> dict[str, Any]:
-    """Injected boundaries are tests only; CLI binds fixed real adapters below."""
+class ReadOnlyProductTransport:
+    """Authentication sessions and resource GETs only; no fixture writes."""
+    def __init__(self, meta_token: str):
+        self.__transport = fixture.ProductHTTP(meta_token)
+
+    def login(self, email: str, password: str) -> str:
+        return self.__transport.login(email, password)
+
+    def request(self, method: str, path: str, body: Any = None, *, session: Any = None,
+                organization_id: str | None = None, headers: Any = None, graph: bool = False) -> Any:
+        require(method == "GET" and body is None, "bootstrap fixture mutation prohibited")
+        return self.__transport.request(method, path, None, session=session,
+            organization_id=organization_id, headers=headers, graph=graph)
+
+
+def preflight(a: dict[str, Any], d: dict[str, Any], protected: Any, *, provider: Any, reader: Any,
+              authenticate_fixture: Any, authenticate_image: Any, current_guard: Any,
+              rehydrate: Any, transport: Any,
+              now: Any = lambda: dt.datetime.now(dt.timezone.utc)) -> tuple[dict[str, Any], Any, Any]:
+    """The entire shared pre-create path; the private spec never becomes output.
+
+    Injected boundaries are tests only. Both CLI modes bind the same read-only
+    evidence and fixture path, including the second provider/environment CAS.
+    """
+    mark_stage("AUTHORIZATION")
     validate_authorization(a, control_sha=a["control_sha"], now=now())
+    mark_stage("PRIVATE_INPUTS")
     validate_descriptor(d, a)
+    mark_stage("CURRENT_AUTHORITY")
     current_guard()
-    writer.require_absent()
+    mark_stage("ENVIRONMENT_PRESTATE")
+    reader.require_absent()
     # Genuine signature/artifact checks must finish before any fixture login.
+    mark_stage("FIXTURE_AUTHENTICATION")
     raw = authenticate_fixture()
     require(common.sha256_bytes(raw) == a["fixture_evidence"]["result_sha256"], "authenticated fixture file differs")
     result = fixture.validate_terminal_result(common.loads_strict(raw))
     require(result["fixture_descriptor_sha256"] == d["fixture_descriptor_sha256"], "fixture runtime authority differs")
+    mark_stage("IMAGE_AUTHENTICATION")
     authenticate_image()
+    mark_stage("FIXTURE_INPUT_VALIDATION")
     request = {key: result[key] for key in fixture.REQUEST_KEYS}
     checked = fixture.validate_protected_input(protected, request)
     before_apps, before_rules = provider.preflight()
+    mark_stage("FIXTURE_REHYDRATION")
     reconstructed = rehydrate(request, checked, result, transport)
+    mark_stage("RUNTIME_SPEC")
     spec = runtime_spec(a, d, checked, reconstructed)
+    mark_stage("CURRENT_AUTHORITY")
     current_guard()
+    mark_stage("AUTHORIZATION")
     validate_authorization(a, control_sha=a["control_sha"], now=now())
-    writer.require_absent()
-    require(provider.preflight() == (before_apps, before_rules), "driver prestate changed before creation")
+    mark_stage("ENVIRONMENT_PRESTATE")
+    reader.require_absent()
+    repeated_prestate = provider.preflight()
+    mark_stage("SECOND_CAS")
+    require(repeated_prestate == (before_apps, before_rules), "driver prestate changed before creation")
+    mark_stage("CURRENT_AUTHORITY")
     current_guard()
+    mark_stage("AUTHORIZATION")
     validate_authorization(a, control_sha=a["control_sha"], now=now())
+    return spec, before_apps, before_rules
+
+
+def check_once(a: dict[str, Any], d: dict[str, Any], protected: Any, *, provider: Any, reader: Any,
+               authenticate_fixture: Any, authenticate_image: Any, current_guard: Any,
+               rehydrate: Any, transport: Any,
+               now: Any = lambda: dt.datetime.now(dt.timezone.utc)) -> dict[str, Any]:
+    require(not hasattr(provider, "create") and not hasattr(reader, "install"),
+            "check received mutation-capable adapters")
+    preflight(a, d, protected, provider=provider, reader=reader,
+        authenticate_fixture=authenticate_fixture, authenticate_image=authenticate_image,
+        current_guard=current_guard, rehydrate=rehydrate, transport=transport, now=now)
+    mark_stage("CHECK_COMPLETE")
+    return {"schema_version": 1, "state": "private-driver-prerequisites-verified", "mutation_performed": False}
+
+
+def install_once(a: dict[str, Any], d: dict[str, Any], protected: Any, *, provider: Any, writer: Any,
+                 authenticate_fixture: Any, authenticate_image: Any, current_guard: Any,
+                 rehydrate: Any, transport: Any, sleep: Any = time.sleep, probe: Any = health,
+                 now: Any = lambda: dt.datetime.now(dt.timezone.utc)) -> dict[str, Any]:
+    """One mutation sequence, preceded by exactly the check mode's preflight."""
+    spec, before_apps, before_rules = preflight(a, d, protected, provider=provider, reader=writer,
+        authenticate_fixture=authenticate_fixture, authenticate_image=authenticate_image,
+        current_guard=current_guard, rehydrate=rehydrate, transport=transport, now=now)
+    mark_stage("CREATE_APP")
     _, _, app = provider.create(spec)
     initial = spec_projection(app.get("spec"), spec)
     origin = None
     for _ in range(30):
+        mark_stage("AUTHORIZATION")
         validate_authorization(a, control_sha=a["control_sha"], now=now())
+        mark_stage("OBSERVE_CREATED")
         origin = observe_created(provider, spec, initial, before_apps, before_rules)
         if origin is not None:
             break
         sleep(10)
     require(origin is not None, "driver did not become ACTIVE within bound")
+    mark_stage("HEALTH")
     probe(origin)
     sleep(30)
+    mark_stage("CURRENT_AUTHORITY")
     current_guard()
+    mark_stage("AUTHORIZATION")
     validate_authorization(a, control_sha=a["control_sha"], now=now())
+    mark_stage("STABLE_HEALTH")
     require(observe_created(provider, spec, initial, before_apps, before_rules) == origin,
             "driver was not stably ACTIVE")
     probe(origin)
+    mark_stage("CURRENT_AUTHORITY")
     current_guard()
+    mark_stage("AUTHORIZATION")
     validate_authorization(a, control_sha=a["control_sha"], now=now())
+    mark_stage("INSTALL_ENVIRONMENT")
     writer.install({"schema_version": 1, "url": origin + "/v1/execute",
                     "driver_version_sha256": a["driver_evidence"]["driver_version_sha256"],
                     "fixture_descriptor_sha256": d["fixture_descriptor_sha256"],
                     "hmac_key_base64": d["hmac_key_base64"]})
+    mark_stage("FINAL_AUTHORITY")
     current_guard()
     validate_authorization(a, control_sha=a["control_sha"], now=now())
     return public_receipt(a, provider.app_id, provider.deployment_id, origin)
 
 
-def current_guard(api: Any, root: Path) -> str:
+def current_guard(api: Any, root: Path, mode: str = "install") -> str:
     sha = fixture._current_guard(api, root, workflow=WORKFLOW)
     branch = api.get(fixture.API_PREFIX + "/branches/main")
     require(branch.get("protected") is True and branch.get("commit", {}).get("sha") == sha,
             "bootstrap main is not protected")
-    require_unique_run(api, sha, common.require_run_id(os.environ.get("GITHUB_RUN_ID"), "bootstrap run"))
+    require_unique_run(api, sha, common.require_run_id(os.environ.get("GITHUB_RUN_ID"), "bootstrap run"), mode)
     return sha
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("validate", "install"))
+    parser.add_argument("command", choices=("validate", "check", "install"))
     parser.add_argument("--control-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args(argv)
     try:
+        mark_stage("INITIALIZATION")
         # Remove private values before any subprocess/imported adapter can run.
         private = {name: os.environ.pop(name, None) for name in PRIVATE_NAMES}
+        mark_stage("MODE")
+        mode = os.environ.get(MODE_ENV)
+        require(mode in MODES and (args.command == "validate" or args.command == mode),
+                "bootstrap command mode differs")
+        mark_stage("AUTHORIZATION")
         raw = os.environ.get("BOOTSTRAP_AUTHORIZATION_JSON")
         require(type(raw) is str and len(raw.encode()) <= 32768, "public authorization missing")
         sha = common.require_sha1(os.environ.get("CONTROL_SHA"), "bootstrap control")
         a = validate_authorization(common.loads_strict(raw), control_sha=sha, now=dt.datetime.now(dt.timezone.utc))
         require(raw.encode() == common.canonical_payload_bytes(a), "public authorization is not canonical")
         token = fixture._secret(os.environ.get("GH_TOKEN"))
-        if args.command == "install":
-            require(all(type(private[n]) is str and private[n] for n in PRIVATE_NAMES), "protected setup inputs missing")
+        mark_stage("PRIVATE_INPUTS")
+        if args.command in MODES:
+            required_names = CHECK_PRIVATE_NAMES if mode == "check" else PRIVATE_NAMES
+            require(all(type(private[n]) is str and private[n] for n in required_names), "protected setup inputs missing")
+            if mode == "check":
+                require(all(private[n] is None for n in PRIVATE_NAMES if n not in CHECK_PRIVATE_NAMES),
+                        "check received mutation credentials")
             require(len(private["CRM_CANARY_DRIVER_BOOTSTRAP_JSON"].encode()) <= 32768
                     and len(private["CRM_CANARY_FIXTURE_INPUT_JSON"].encode()) <= fixture.MAX_BODY_BYTES,
                     "protected setup input exceeds bound")
             d = validate_descriptor(common.loads_strict(private["CRM_CANARY_DRIVER_BOOTSTRAP_JSON"]), a)
             protected = common.loads_strict(private["CRM_CANARY_FIXTURE_INPUT_JSON"])
-            require(args.output_dir is not None, "public receipt output missing")
-            output = args.output_dir.resolve()
-            runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
-            require(output.parent == runner_temp and not output.exists(), "public receipt location differs")
+            if mode == "install":
+                require(args.output_dir is not None, "public receipt output missing")
+                output = args.output_dir.resolve()
+                runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+                require(output.parent == runner_temp and not output.exists(), "public receipt location differs")
+            else:
+                require(args.output_dir is None, "check cannot write a public receipt")
         else:
             require(not any(private.values()) and args.output_dir is None, "public validation received private authority")
         root = args.control_root.resolve(strict=True)
         api = GitHubRead(token)
-        current_guard(api, root)
+        mark_stage("CURRENT_AUTHORITY")
+        current_guard(api, root, mode)
         if args.command == "validate":
             print(common.canonical_payload_bytes({"state": "public-authority-validated",
                                                  "authorization_sha256": common.sha256_value(a)}).decode())
@@ -852,24 +1034,35 @@ def main(argv: list[str] | None = None) -> int:
             from . import launch_production_prerequisites as prerequisites
         except ImportError:
             import launch_production_prerequisites as prerequisites
+        mark_stage("PINNED_CLI")
         gh = fixture._pinned_gh()
-        reader = prerequisites.GitHubEvidence(root, transport=prerequisites.GitHubGetOnly(gh=str(gh)))
+        mark_stage("PUBLIC_EVIDENCE_READER")
+        evidence = prerequisites.GitHubEvidence(root, transport=prerequisites.GitHubGetOnly(gh=str(gh)))
+        mark_stage("ADAPTERS")
+        transport = ReadOnlyProductTransport(protected["credentials"]["meta_access_token"])
+        shared = dict(
+            authenticate_fixture=lambda: evidence.authenticate_public_fixture(common.canonical_payload_bytes(a["fixture_evidence"]), sha),
+            authenticate_image=lambda: authenticate_driver(api, root, gh, a["driver_evidence"], sha, gh_token=token),
+            current_guard=lambda: current_guard(api, root, mode), rehydrate=fixture.rehydrate, transport=transport)
+        if mode == "check":
+            provider = ReadOnlyProvider(d["plan"], private["DO_DRIVER_BOOTSTRAP_READ_TOKEN"])
+            reader = EnvironmentReader(token, d["plan"]["github_environment_sha256"])
+            checked = check_once(a, d, protected, provider=provider, reader=reader, **shared)
+            print(common.canonical_payload_bytes(checked).decode())
+            return 0
         provider = Provider(d["plan"], private["DO_DRIVER_BOOTSTRAP_READ_TOKEN"], private["DO_DRIVER_BOOTSTRAP_CREATE_TOKEN"])
         writer = EnvironmentWriter(private["GH_CANARY_ENVIRONMENT_WRITE_TOKEN"], gh, d["plan"]["github_environment_sha256"])
-        transport = fixture.ProductHTTP(protected["credentials"]["meta_access_token"])
-        receipt = install_once(a, d, protected, provider=provider, writer=writer,
-            authenticate_fixture=lambda: reader.authenticate_public_fixture(common.canonical_payload_bytes(a["fixture_evidence"]), sha),
-            authenticate_image=lambda: authenticate_driver(api, root, gh, a["driver_evidence"], sha, gh_token=token),
-            current_guard=lambda: current_guard(api, root), rehydrate=fixture.rehydrate, transport=transport)
+        receipt = install_once(a, d, protected, provider=provider, writer=writer, **shared)
+        mark_stage("RECEIPT_WRITE")
         output.mkdir(mode=0o700, parents=False, exist_ok=False)
         receipt_bytes = common.canonical_file_bytes(receipt)
         (output / "receipt.json").write_bytes(receipt_bytes)
         (output / "receipt.sha256").write_text(common.sha256_bytes(receipt_bytes) + "\n", encoding="ascii")
         print(common.canonical_payload_bytes(receipt).decode())
         return 0
-    except Exception:
+    except Exception as error:
         # Never include exception/provider/CLI text: it may contain private data.
-        print("driver bootstrap stopped; no retry or further mutation is authorized", file=sys.stderr)
+        print(common.canonical_payload_bytes(failure_report(error)).decode(), file=sys.stderr)
         return 1
 
 
