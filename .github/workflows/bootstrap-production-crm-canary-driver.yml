@@ -1,9 +1,17 @@
 name: Bootstrap Production CRM Canary Driver
-run-name: Install exact private CRM canary driver
+run-name: ${{ inputs.mode == 'install' && 'Install exact private CRM canary driver' || 'Check exact private CRM driver prerequisites' }}
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Check prerequisites without write credentials, or consume the one-time installation authority
+        required: true
+        type: choice
+        default: check
+        options:
+          - check
+          - install
       authorization_json:
         description: Reviewed public packet binding this control, private setup hash, fixture and image evidence
         required: true
@@ -23,6 +31,7 @@ env:
   WORKFLOW_SHA: ${{ github.workflow_sha }}
   REF_PROTECTED: ${{ github.ref_protected }}
   BOOTSTRAP_AUTHORIZATION_JSON: ${{ inputs.authorization_json }}
+  BOOTSTRAP_MODE: ${{ inputs.mode }}
 
 jobs:
   authority:
@@ -50,9 +59,41 @@ jobs:
           [[ "$GITHUB_RUN_ATTEMPT" == 1 && "$WORKFLOW_SHA" == "$CONTROL_SHA" ]]
           python3 -I -S -B control/release/deployment/bootstrap_production_crm_canary_driver.py validate --control-root control
 
+  check:
+    name: Check exact private CRM driver prerequisites without writes
+    needs: authority
+    if: ${{ inputs.mode == 'check' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: rereply-production-crm-fixture
+    permissions:
+      actions: read
+      contents: read
+      attestations: read
+    steps:
+      - name: Check out exact protected controls
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: control
+          persist-credentials: false
+      - name: Check private prerequisites without create or secret-write credentials
+        env:
+          GH_TOKEN: ${{ secrets.GH_DRIVER_BOOTSTRAP_READ_TOKEN }}
+          CRM_CANARY_FIXTURE_INPUT_JSON: ${{ secrets.CRM_CANARY_FIXTURE_INPUT_JSON }}
+          CRM_CANARY_DRIVER_BOOTSTRAP_JSON: ${{ secrets.CRM_CANARY_DRIVER_BOOTSTRAP_JSON }}
+          DO_DRIVER_BOOTSTRAP_READ_TOKEN: ${{ secrets.DO_DRIVER_BOOTSTRAP_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main && "$REF_PROTECTED" == true ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 && "$WORKFLOW_SHA" == "$CONTROL_SHA" ]]
+          python3 -I -S -B control/release/deployment/bootstrap_production_crm_canary_driver.py check --control-root control
+
   install:
     name: Install exact isolated CRM canary driver once
     needs: authority
+    if: ${{ inputs.mode == 'install' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     environment: rereply-production-crm-fixture
@@ -105,7 +146,7 @@ jobs:
 
   gate:
     name: Exact private CRM canary driver setup gate
-    needs: [authority, install]
+    needs: [authority, check, install]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -114,7 +155,15 @@ jobs:
       - name: Require both exact setup jobs
         env:
           AUTHORITY_RESULT: ${{ needs.authority.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
           INSTALL_RESULT: ${{ needs.install.result }}
         run: |
           set -euo pipefail
-          [[ "$AUTHORITY_RESULT" == success && "$INSTALL_RESULT" == success ]]
+          [[ "$AUTHORITY_RESULT" == success ]]
+          if [[ "$BOOTSTRAP_MODE" == check ]]; then
+            [[ "$CHECK_RESULT" == success && "$INSTALL_RESULT" == skipped ]]
+          elif [[ "$BOOTSTRAP_MODE" == install ]]; then
+            [[ "$CHECK_RESULT" == skipped && "$INSTALL_RESULT" == success ]]
+          else
+            exit 1
+          fi

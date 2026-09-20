@@ -2288,10 +2288,11 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 assert_exact_pin(mutant)
 
-    def test_driver_bootstrap_has_one_reviewed_private_job_and_public_receipt_only(self) -> None:
+    def test_driver_bootstrap_separates_readonly_check_from_one_time_install(self) -> None:
         source = workflow("bootstrap-production-crm-canary-driver.yml")
-        self.assertEqual(job_ids(source), ("authority", "install", "gate"))
+        self.assertEqual(job_ids(source), ("authority", "check", "install", "gate"))
         authority = job_block(source, "authority")
+        check = job_block(source, "check")
         install = job_block(source, "install")
         gate = job_block(source, "gate")
         self.assertNotIn("secrets.", authority)
@@ -2304,10 +2305,11 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
             "DO_DRIVER_BOOTSTRAP_READ_TOKEN", "DO_DRIVER_BOOTSTRAP_CREATE_TOKEN",
             "GH_CANARY_ENVIRONMENT_WRITE_TOKEN", "GH_DRIVER_BOOTSTRAP_READ_TOKEN",
         })
-        self.assertEqual(source.count("persist-credentials: false"), 2)
-        self.assertEqual(source.count("fetch-depth: 0"), 2)
-        self.assertEqual(source.count('[[ "$GITHUB_RUN_ATTEMPT" == 1 && "$WORKFLOW_SHA" == "$CONTROL_SHA" ]]'), 2)
+        self.assertEqual(source.count("persist-credentials: false"), 3)
+        self.assertEqual(source.count("fetch-depth: 0"), 3)
+        self.assertEqual(source.count('[[ "$GITHUB_RUN_ATTEMPT" == 1 && "$WORKFLOW_SHA" == "$CONTROL_SHA" ]]'), 3)
         self.assertIn("bootstrap_production_crm_canary_driver.py validate --control-root control", authority)
+        self.assertIn("bootstrap_production_crm_canary_driver.py check --control-root control", check)
         self.assertIn("bootstrap_production_crm_canary_driver.py install --control-root control", install)
         self.assertEqual(install.count("uses: actions/attest@"), 2)
         self.assertLess(install.index("- name: Attest exact driver setup policy"),
@@ -2315,7 +2317,13 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
         self.assertIn("path: ${{ runner.temp }}/driver-bootstrap-receipt", install)
         self.assertNotIn("if: ${{ always() }}", install)
         self.assertIn("    if: ${{ always() }}", gate)
-        self.assertIn('[[ "$AUTHORITY_RESULT" == success && "$INSTALL_RESULT" == success ]]', gate)
+        self.assertIn("    needs: [authority, check, install]", gate)
+        self.assertIn('[[ "$AUTHORITY_RESULT" == success ]]', gate)
+        self.assertIn('[[ "$CHECK_RESULT" == success && "$INSTALL_RESULT" == skipped ]]', gate)
+        self.assertIn('[[ "$CHECK_RESULT" == skipped && "$INSTALL_RESULT" == success ]]', gate)
+        self.assertIn('if [[ "$BOOTSTRAP_MODE" == check ]]; then', gate)
+        self.assertIn('elif [[ "$BOOTSTRAP_MODE" == install ]]; then', gate)
+        self.assertIn("          else\n            exit 1\n          fi", gate)
         for forbidden in ("continue-on-error:", "set -x", "pull_request:",
                           "CRM_CANARY_SYNTHETIC_DRIVER_JSON:", "DO_PRODUCTION_APPLY_TOKEN",
                           "DO_PRODUCTION_FIXTURE_UPDATE_TOKEN", "gh workflow run", "/v1/execute"):
@@ -2324,6 +2332,43 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
                           "Lint workflows and inert recovery templates")
         require_active_source_line(lint,
             "actionlint .github/workflows/bootstrap-production-crm-canary-driver.yml")
+
+        def assert_readonly_boundary(candidate: str) -> None:
+            check_job = job_block(candidate, "check")
+            install_job = job_block(candidate, "install")
+            self.assertIn("run-name: ${{ inputs.mode == 'install' && 'Install exact private CRM canary driver' || 'Check exact private CRM driver prerequisites' }}", candidate)
+            self.assertIn("        type: choice\n        default: check\n        options:\n          - check\n          - install", candidate)
+            self.assertIn("  BOOTSTRAP_MODE: ${{ inputs.mode }}", candidate)
+            self.assertIn("    if: ${{ inputs.mode == 'check' }}", check_job)
+            self.assertIn("    if: ${{ inputs.mode == 'install' }}", install_job)
+            self.assertIn("    needs: authority", check_job)
+            self.assertIn("    environment: rereply-production-crm-fixture", check_job)
+            self.assertIn("      attestations: read", check_job)
+            self.assertNotIn("id-token:", check_job)
+            self.assertNotRegex(check_job, r"(?m)^\s+[a-z-]+: write\s*$")
+            self.assertEqual(set(re.findall(r"secrets\.([A-Z0-9_]+)", check_job)), {
+                "CRM_CANARY_FIXTURE_INPUT_JSON", "CRM_CANARY_DRIVER_BOOTSTRAP_JSON",
+                "DO_DRIVER_BOOTSTRAP_READ_TOKEN", "GH_DRIVER_BOOTSTRAP_READ_TOKEN",
+            })
+            for forbidden in ("actions/attest@", "actions/upload-artifact@", "--output-dir",
+                              "DO_DRIVER_BOOTSTRAP_CREATE_TOKEN", "GH_CANARY_ENVIRONMENT_WRITE_TOKEN",
+                              "driver.py install ", "continue-on-error:"):
+                self.assertNotIn(forbidden, check_job)
+
+        assert_readonly_boundary(source)
+        mutants = (
+            source.replace("        default: check", "        default: install", 1),
+            source.replace("Check exact private CRM driver prerequisites' }}", "arbitrary' }}", 1),
+            source.replace("    if: ${{ inputs.mode == 'check' }}", "    if: ${{ always() }}", 1),
+            source.replace("    if: ${{ inputs.mode == 'install' }}", "    if: ${{ always() }}", 1),
+            source.replace(check, check.replace("      attestations: read", "      attestations: write"), 1),
+            source.replace(check, check.replace("    permissions:\n", "    permissions:\n      id-token: write\n"), 1),
+            source.replace(check, check.replace("DO_DRIVER_BOOTSTRAP_READ_TOKEN", "DO_DRIVER_BOOTSTRAP_CREATE_TOKEN"), 1),
+            source.replace(check, check.replace("GH_DRIVER_BOOTSTRAP_READ_TOKEN", "GH_CANARY_ENVIRONMENT_WRITE_TOKEN"), 1),
+        )
+        for mutant in mutants:
+            with self.subTest(mutant=mutants.index(mutant)), self.assertRaises(AssertionError):
+                assert_readonly_boundary(mutant)
 
     def test_every_active_release_control_is_manual_exact_main_and_serialized(self) -> None:
         for name in ACTIVE_PRODUCTION_CONTROLS:
