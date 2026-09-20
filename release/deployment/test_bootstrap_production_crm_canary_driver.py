@@ -992,7 +992,7 @@ class LedgerMetadataProjectionTests(unittest.TestCase):
         self.assertEqual(value, before)
         self.assertEqual(out.getvalue() + err.getvalue(), '')
         public = common.canonical_payload_bytes(report).decode()
-        for received in ('RAW_FIELD_NAME', 'RAW_SENTINEL', self.HOST, 'postgres://',
+        for received in ('RAW_FIELD_NAME', 'RAW_SENTINEL', self.HOST, 'postgres://', 'postgresql://',
                          self.plan['ledger']['cluster_id']):
             self.assertNotIn(received, public)
             self.assertNotIn(received, str(rejected.exception))
@@ -1003,13 +1003,13 @@ class LedgerMetadataProjectionTests(unittest.TestCase):
             value['database'][name].pop('uri')
         return value
 
-    def test_optional_sdk_fields_accept_only_absent_null_empty_combinations(self):
+    def test_optional_sdk_fields_accept_exact_protocol_and_empty_ports_combinations(self):
         self.assertEqual(set(boot.CONNECTION_FIELDS), {'uri', 'database', 'host', 'port', 'user', 'password', 'ssl'})
         self.assertEqual(set(boot.CONNECTION_OPTIONAL_FIELDS), {'protocol', 'application_ports'})
         omitted = object()
         for name in self.CONNECTIONS:
             for uri in ('absent', None, '', self.connection()['uri']):
-                for protocol in (omitted, None, ''):
+                for protocol in (omitted, None, '', 'postgresql'):
                     for ports in (omitted, None, {}):
                         options = {key: setting for key, setting in (('protocol', protocol), ('application_ports', ports))
                                    if setting is not omitted}
@@ -1022,14 +1022,14 @@ class LedgerMetadataProjectionTests(unittest.TestCase):
                             self.assertEqual(value, before)
                             self.assertEqual(out.getvalue() + err.getvalue(), '')
 
-    def test_optional_protocol_type_and_nonempty_values_rejected_before_uri_bypass(self):
+    def test_optional_protocol_type_and_unsupported_values_rejected_before_uri_bypass(self):
         for name in self.CONNECTIONS:
             for uri in ('absent', None, '', self.connection()['uri']):
                 for protocol in (False, True, 0, 1, 1.5, [], {}, [''], {'RAW_FIELD_NAME': ''}):
                     with self.subTest(name=name, uri=uri, protocol=protocol):
                         self.assert_projection_code(self.optional_payload(name, uri, protocol=protocol),
                                                     'LEDGER_PROTOCOL_TYPE_REJECTED')
-                for protocol in ('postgres', 'postgresql', 'redis', 'RAW_SENTINEL', ' ', '\x00', 'é', '\u200b', '{}', 'null'):
+                for protocol in ('postgres', 'pg', 'redis', 'RAW_SENTINEL', ' ', '\x00', 'é', '\u200b', '{}', 'null'):
                     with self.subTest(name=name, uri=uri, protocol=protocol):
                         self.assert_projection_code(self.optional_payload(name, uri, protocol=protocol),
                                                     'LEDGER_PROTOCOL_VALUE_REJECTED')
@@ -1123,6 +1123,112 @@ class LedgerMetadataProjectionTests(unittest.TestCase):
             for changes, code in cases:
                 with self.subTest(name=name, code=code):
                     self.assert_projection_code(self.payload(name, protocol='', application_ports={}, **changes), code)
+
+    def test_both_literal_uri_aliases_and_exact_protocol_preserve_projection(self):
+        omitted = object()
+        for name in self.CONNECTIONS:
+            for protocol in (omitted, None, '', 'postgresql'):
+                for scheme in ('postgres', 'postgresql'):
+                    for prefix in ('', '@', ':@'):
+                        for sibling in (omitted, None, ''):
+                            value = self.payload(name, uri=f'{scheme}://{prefix}{self.HOST}:25060/defaultdb?sslmode=require')
+                            connection = value['database'][name]
+                            if protocol is not omitted:
+                                connection['protocol'] = protocol
+                            for field in ('user', 'password'):
+                                if sibling is omitted:
+                                    connection.pop(field)
+                                else:
+                                    connection[field] = sibling
+                            before = copy.deepcopy(value)
+                            legacy = copy.deepcopy(value)
+                            legacy['database'][name]['protocol'] = ''
+                            legacy['database'][name]['uri'] = f'postgres://{prefix}{self.HOST}:25060/defaultdb?sslmode=require'
+                            with (self.subTest(name=name, protocol=protocol, scheme=scheme, prefix=prefix),
+                                  mock.patch('sys.stdout', new_callable=io.StringIO) as out,
+                                  mock.patch('sys.stderr', new_callable=io.StringIO) as err):
+                                self.assertEqual(self.project(value), self.base)
+                                self.assertEqual(self.project(value), self.project(legacy))
+                                self.assertEqual(value, before)
+                                self.assertEqual(out.getvalue() + err.getvalue(), '')
+
+    def test_only_exact_lowercase_postgresql_protocol_is_newly_accepted(self):
+        invalid = ('postgres', 'pg', 'PostgreSQL', 'POSTGRESQL', 'Postgresql', 'postgresql ', ' postgresql',
+                   'postgresql\t', '\npostgresql', 'postgresql\x00', 'postgre%73ql', 'postgreｓql',
+                   'REDACTED', '********', 'RAW_SENTINEL', 'https', 'mysql', 'postgresql://')
+        for name in self.CONNECTIONS:
+            for scheme in ('postgres', 'postgresql'):
+                uri = f'{scheme}://{self.HOST}:25060/defaultdb?sslmode=require'
+                for protocol in invalid:
+                    with self.subTest(name=name, scheme=scheme, protocol=protocol):
+                        self.assert_projection_code(self.payload(name, uri=uri, protocol=protocol),
+                                                    'LEDGER_PROTOCOL_VALUE_REJECTED')
+                for protocol in (False, 0, [], {}, ['postgresql']):
+                    self.assert_projection_code(self.payload(name, uri=uri, protocol=protocol),
+                                                'LEDGER_PROTOCOL_TYPE_REJECTED')
+
+    def test_both_uri_aliases_report_same_fixed_userinfo_and_canonical_failures(self):
+        for name in self.CONNECTIONS:
+            for scheme in ('postgres', 'postgresql'):
+                uri = f'{scheme}://{self.HOST}:25060/defaultdb?sslmode=require'
+                for prefix in ('user@', 'user:@', ':password@', 'user:password@', '@@', '::@',
+                               'REDACTED@', '%40@', '%3A@', 'é:@', '\t:@'):
+                    with self.subTest(name=name, scheme=scheme, prefix=prefix):
+                        self.assert_projection_code(self.payload(name, protocol='postgresql',
+                            uri=f'{scheme}://{prefix}{self.HOST}:25060/defaultdb?sslmode=require'),
+                            'LEDGER_URI_USERINFO_REJECTED')
+                malformed = (uri + ' ', ' ' + uri, uri + '\x00', uri + '#RAW_SENTINEL', uri + '&extra=1',
+                    uri + '&sslmode=require', uri.replace('sslmode=require', 'sslmode=disable'),
+                    uri.replace('sslmode=require', 'sslmode=verify-full'),
+                    uri.replace(':25060', ':025060'), uri.replace('/defaultdb', '/default%64b'),
+                    uri.replace(self.HOST, self.HOST.upper()), uri.replace(self.HOST, self.HOST + '.'),
+                    uri.replace(scheme + '://', scheme.upper() + '://'),
+                    uri.replace(scheme + '://', 'pgsql://'), uri.replace(scheme + '://', 'https://'))
+                for candidate in malformed:
+                    with self.subTest(name=name, scheme=scheme, uri=candidate):
+                        self.assert_projection_code(self.payload(name, protocol='postgresql', uri=candidate),
+                                                    'LEDGER_URI_NONCANONICAL_REJECTED')
+
+    def test_new_alias_and_protocol_do_not_bypass_siblings_tls_ports_or_secret_scan(self):
+        changes = (
+            ({'host': 'other.db.ondigitalocean.com'}, 'LEDGER_URI_NONCANONICAL_REJECTED'),
+            ({'port': 25061}, 'LEDGER_URI_NONCANONICAL_REJECTED'),
+            ({'database': 'otherdb'}, 'LEDGER_URI_NONCANONICAL_REJECTED'),
+            ({'host': False}, 'LEDGER_HOST_REJECTED'), ({'port': True}, 'LEDGER_PORT_REJECTED'),
+            ({'ssl': False}, 'LEDGER_SSL_FLAG_REJECTED'), ({'ssl': 1}, 'LEDGER_SSL_FLAG_REJECTED'),
+            ({'user': 'REDACTED'}, 'LEDGER_CONNECTION_CREDENTIALS_REJECTED'),
+            ({'password': 'RAW_SENTINEL'}, 'LEDGER_CREDENTIAL_RESPONSE_REJECTED'),
+            ({'RAW_FIELD_NAME': ''}, 'LEDGER_CONNECTION_FIELDS_REJECTED'),
+            ({'application_ports': False}, 'LEDGER_APPLICATION_PORTS_TYPE_REJECTED'),
+            ({'application_ports': {'postgresql': 25060}}, 'LEDGER_APPLICATION_PORTS_NONEMPTY_REJECTED'),
+        )
+        for name in self.CONNECTIONS:
+            for scheme in ('postgres', 'postgresql'):
+                uri = f'{scheme}://{self.HOST}:25060/defaultdb?sslmode=require'
+                for change, code in changes:
+                    value = self.payload(name, protocol='postgresql', uri=uri, **change)
+                    with self.subTest(name=name, scheme=scheme, code=code):
+                        self.assert_projection_code(value, code)
+                        value['late'] = {'nested': [{'secret': 'RAW_SENTINEL'}]}
+                        self.assert_projection_code(value, 'LEDGER_CREDENTIAL_RESPONSE_REJECTED')
+                self.assert_projection_code(self.payload(name, protocol='postgresql', uri=uri,
+                    application_ports={'nested': {'uri': uri}}), 'LEDGER_URI_RESPONSE_REJECTED')
+
+    def test_postgresql_metadata_never_selects_request_or_enters_projection(self):
+        value = copy.deepcopy(self.base)
+        value['database'].update({name: self.connection(protocol='postgresql', application_ports={},
+            uri='postgresql://' + self.HOST + ':25060/defaultdb?sslmode=require') for name in self.CONNECTIONS})
+        before = copy.deepcopy(value)
+        for provider in (boot.ReadOnlyProvider(self.plan, 'synthetic-reader-token'),
+                         boot.Provider(self.plan, 'synthetic-reader-token', 'synthetic-create-token')):
+            with mock.patch.object(boot.fixture, '_wire', return_value=common.canonical_payload_bytes(value)) as wire:
+                self.assertEqual(provider.get(self.route), self.base)
+                wire.assert_called_once()
+                self.assertEqual(wire.call_args.args[1], common.API_ORIGIN + self.route)
+                self.assertEqual(wire.call_args.kwargs.get('method', 'GET'), 'GET')
+                self.assertNotIn('postgresql', repr(wire.call_args))
+                self.assertNotIn(self.HOST, repr(wire.call_args))
+            self.assertEqual(value, before)
 
     def test_precise_response_database_and_cluster_identity_codes(self):
         for response in (None, [], '', 'RAW_SENTINEL', False, 1, 1.5):
@@ -1287,7 +1393,7 @@ class LedgerMetadataProjectionTests(unittest.TestCase):
     def test_uri_parser_normalization_userinfo_query_and_control_adversaries_rejected(self):
         uri = self.connection()['uri']
         bad = (
-            uri.replace('postgres:', 'postgresql:'), uri.replace('postgres:', 'POSTGRES:'),
+            uri.replace('postgres:', 'pgsql:'), uri.replace('postgres:', 'POSTGRES:'),
             uri.replace(self.HOST, self.HOST.upper()), uri.replace(self.HOST, self.HOST + '.'),
             uri.replace(self.HOST, 'user@' + self.HOST), uri.replace(self.HOST, 'user:password@' + self.HOST),
             uri.replace(self.HOST, '%40' + self.HOST), uri.replace('defaultdb', 'default%64b'),
