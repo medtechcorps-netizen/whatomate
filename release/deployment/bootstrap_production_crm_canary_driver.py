@@ -112,12 +112,15 @@ DB_LABEL = re.compile(r"^[a-z][a-z0-9_]{1,62}$")
 MAX_PUBLIC = 64 * 1024 * 1024
 CONNECTION_NAMES = ("connection", "private_connection", "standby_connection", "standby_private_connection")
 CONNECTION_FIELDS = frozenset({"uri", "database", "host", "port", "user", "password", "ssl"})
+CONNECTION_OPTIONAL_FIELDS = frozenset({"protocol", "application_ports"})
 LEDGER_METADATA_CODES = frozenset({"LEDGER_CONNECTION_SHAPE_REJECTED", "LEDGER_CONNECTION_CREDENTIALS_REJECTED",
     "LEDGER_URI_USERINFO_REJECTED", "LEDGER_URI_NONCANONICAL_REJECTED",
     "LEDGER_RESPONSE_TYPE_REJECTED", "LEDGER_DATABASE_TYPE_REJECTED", "LEDGER_CLUSTER_ID_REJECTED",
     "LEDGER_CONNECTION_TYPE_REJECTED", "LEDGER_CONNECTION_FIELDS_REJECTED",
     "LEDGER_URI_TYPE_REJECTED", "LEDGER_URI_LENGTH_REJECTED", "LEDGER_HOST_REJECTED",
-    "LEDGER_PORT_REJECTED", "LEDGER_DATABASE_LABEL_REJECTED", "LEDGER_SSL_FLAG_REJECTED"})
+    "LEDGER_PORT_REJECTED", "LEDGER_DATABASE_LABEL_REJECTED", "LEDGER_SSL_FLAG_REJECTED",
+    "LEDGER_PROTOCOL_TYPE_REJECTED", "LEDGER_PROTOCOL_VALUE_REJECTED",
+    "LEDGER_APPLICATION_PORTS_TYPE_REJECTED", "LEDGER_APPLICATION_PORTS_NONEMPTY_REJECTED"})
 LEDGER_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+db\.ondigitalocean\.com")
 MAX_LEDGER_URI = 1024
 
@@ -555,15 +558,21 @@ def project_ledger_metadata(value: Any, cluster_id: str) -> dict[str, Any]:
     its schema does not promise an empty URI without view_credentials. Admit
     only literal reconstruction with zero credential characters, never a parsed
     or redacted credential. These URIs are not authority or network selectors.
-    specification/resources/databases/models/database_connection.yml in
-    github.com/digitalocean/openapi documents these seven connection fields.
+    DigitalOcean OpenAPI a06aa8a675a047af2db0865f51b7e81e2e972a23,
+    specification/resources/databases/models/database_connection.yml, lists
+    seven fields. Godo 22aca23972064d6a96366a8c19ae847b30a6b267,
+    databases.go DatabaseConnection, also declares protocol:string and
+    application_ports:map[string]uint32 (introduced for Kafka). Accept only
+    absent/null/typed-empty forms of those unused extensions, not arbitrary
+    strings/maps or a presumed PostgreSQL protocol enum. Neither public source
+    establishes which fields a live credential-redacted response contains.
     """
     def check(ok: bool, code: str) -> None:
         if not ok:
             raise LedgerMetadataRejected(code)
 
     # Fixed predicate names only: never include received keys, values or lengths.
-    # Preserve the original short-circuit order and all acceptance conditions.
+    # Preserve the original guard order; validate SDK extensions before dropping.
     check(type(value) is dict, "LEDGER_RESPONSE_TYPE_REJECTED")
     check(type(value.get("database")) is dict, "LEDGER_DATABASE_TYPE_REJECTED")
     database = value["database"]
@@ -583,9 +592,21 @@ def project_ledger_metadata(value: Any, cluster_id: str) -> dict[str, Any]:
         if connection is None:
             continue
         check(type(connection) is dict, "LEDGER_CONNECTION_TYPE_REJECTED")
-        check(set(connection) <= CONNECTION_FIELDS, "LEDGER_CONNECTION_FIELDS_REJECTED")
+        check(set(connection) <= CONNECTION_FIELDS | CONNECTION_OPTIONAL_FIELDS,
+              "LEDGER_CONNECTION_FIELDS_REJECTED")
         check(all(connection.get(key) in (None, "") for key in ("user", "password")),
               "LEDGER_CONNECTION_CREDENTIALS_REJECTED")
+        # These shared-SDK fields carry no accepted content and never influence
+        # connections, provider requests, the runtime spec or ledger authority.
+        # Do not use generic falsiness: False, 0, [] and wrong-type empties fail.
+        protocol = connection.get("protocol")
+        check(protocol is None or type(protocol) is str, "LEDGER_PROTOCOL_TYPE_REJECTED")
+        check(protocol is None or protocol == "", "LEDGER_PROTOCOL_VALUE_REJECTED")
+        application_ports = connection.get("application_ports")
+        check(application_ports is None or type(application_ports) is dict,
+              "LEDGER_APPLICATION_PORTS_TYPE_REJECTED")
+        check(application_ports is None or not application_ports,
+              "LEDGER_APPLICATION_PORTS_NONEMPTY_REJECTED")
         uri = connection.get("uri")
         if uri in (None, ""):
             continue  # Preserve the already allowed missing/redacted-empty case.
