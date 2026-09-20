@@ -113,7 +113,11 @@ MAX_PUBLIC = 64 * 1024 * 1024
 CONNECTION_NAMES = ("connection", "private_connection", "standby_connection", "standby_private_connection")
 CONNECTION_FIELDS = frozenset({"uri", "database", "host", "port", "user", "password", "ssl"})
 LEDGER_METADATA_CODES = frozenset({"LEDGER_CONNECTION_SHAPE_REJECTED", "LEDGER_CONNECTION_CREDENTIALS_REJECTED",
-    "LEDGER_URI_USERINFO_REJECTED", "LEDGER_URI_NONCANONICAL_REJECTED"})
+    "LEDGER_URI_USERINFO_REJECTED", "LEDGER_URI_NONCANONICAL_REJECTED",
+    "LEDGER_RESPONSE_TYPE_REJECTED", "LEDGER_DATABASE_TYPE_REJECTED", "LEDGER_CLUSTER_ID_REJECTED",
+    "LEDGER_CONNECTION_TYPE_REJECTED", "LEDGER_CONNECTION_FIELDS_REJECTED",
+    "LEDGER_URI_TYPE_REJECTED", "LEDGER_URI_LENGTH_REJECTED", "LEDGER_HOST_REJECTED",
+    "LEDGER_PORT_REJECTED", "LEDGER_DATABASE_LABEL_REJECTED", "LEDGER_SSL_FLAG_REJECTED"})
 LEDGER_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+db\.ondigitalocean\.com")
 MAX_LEDGER_URI = 1024
 
@@ -554,13 +558,17 @@ def project_ledger_metadata(value: Any, cluster_id: str) -> dict[str, Any]:
     specification/resources/databases/models/database_connection.yml in
     github.com/digitalocean/openapi documents these seven connection fields.
     """
-    def check(ok: bool, code: str = "LEDGER_CONNECTION_SHAPE_REJECTED") -> None:
+    def check(ok: bool, code: str) -> None:
         if not ok:
             raise LedgerMetadataRejected(code)
 
-    check(type(value) is dict and type(value.get("database")) is dict)
+    # Fixed predicate names only: never include received keys, values or lengths.
+    # Preserve the original short-circuit order and all acceptance conditions.
+    check(type(value) is dict, "LEDGER_RESPONSE_TYPE_REJECTED")
+    check(type(value.get("database")) is dict, "LEDGER_DATABASE_TYPE_REJECTED")
     database = value["database"]
-    check(database.get("id") == common.require_uuid(cluster_id, "selected ledger cluster"))
+    check(database.get("id") == common.require_uuid(cluster_id, "selected ledger cluster"),
+          "LEDGER_CLUSTER_ID_REJECTED")
     projected = copy.deepcopy(value)
     # Keep every object present during the full recursive guard. Only the four
     # exact string URI slots are quarantined for stricter validation below;
@@ -574,17 +582,21 @@ def project_ledger_metadata(value: Any, cluster_id: str) -> dict[str, Any]:
         connection = database.get(name)
         if connection is None:
             continue
-        check(type(connection) is dict and set(connection) <= CONNECTION_FIELDS)
+        check(type(connection) is dict, "LEDGER_CONNECTION_TYPE_REJECTED")
+        check(set(connection) <= CONNECTION_FIELDS, "LEDGER_CONNECTION_FIELDS_REJECTED")
         check(all(connection.get(key) in (None, "") for key in ("user", "password")),
               "LEDGER_CONNECTION_CREDENTIALS_REJECTED")
         uri = connection.get("uri")
         if uri in (None, ""):
             continue  # Preserve the already allowed missing/redacted-empty case.
-        check(type(uri) is str and 0 < len(uri) <= MAX_LEDGER_URI)
+        check(type(uri) is str, "LEDGER_URI_TYPE_REJECTED")
+        check(0 < len(uri) <= MAX_LEDGER_URI, "LEDGER_URI_LENGTH_REJECTED")
         host, port, db = connection.get("host"), connection.get("port"), connection.get("database")
-        check(type(host) is str and 0 < len(host) <= 253 and LEDGER_HOST.fullmatch(host) is not None
-              and type(port) is int and 1 <= port <= 65535
-              and type(db) is str and DB_LABEL.fullmatch(db) is not None and connection.get("ssl") is True)
+        check(type(host) is str and 0 < len(host) <= 253 and LEDGER_HOST.fullmatch(host) is not None,
+              "LEDGER_HOST_REJECTED")
+        check(type(port) is int and 1 <= port <= 65535, "LEDGER_PORT_REJECTED")
+        check(type(db) is str and DB_LABEL.fullmatch(db) is not None, "LEDGER_DATABASE_LABEL_REJECTED")
+        check(connection.get("ssl") is True, "LEDGER_SSL_FLAG_REJECTED")
         # Empty userinfo punctuation carries no credential bits. Do not use a
         # URL parser, percent decoding, normalization or any redaction marker.
         expected = {f"postgres://{prefix}{host}:{port}/{db}?sslmode=require" for prefix in ("", "@", ":@")}
