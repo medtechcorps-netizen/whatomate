@@ -562,10 +562,14 @@ def project_ledger_metadata(value: Any, cluster_id: str) -> dict[str, Any]:
     specification/resources/databases/models/database_connection.yml, lists
     seven fields. Godo 22aca23972064d6a96366a8c19ae847b30a6b267,
     databases.go DatabaseConnection, also declares protocol:string and
-    application_ports:map[string]uint32 (introduced for Kafka). Accept only
-    absent/null/typed-empty forms of those unused extensions, not arbitrary
-    strings/maps or a presumed PostgreSQL protocol enum. Neither public source
-    establishes which fields a live credential-redacted response contains.
+    application_ports:map[string]uint32 (introduced for Kafka). DigitalOcean's
+    published PostgreSQL metadata example uses the exact protocol "postgresql":
+    https://www.digitalocean.com/community/tutorials/how-to-collect-scrapable-metrics-for-managed-dbaas-on-digitalocean
+    Admit that literal plus absent/null/empty protocol, never arbitrary strings;
+    application_ports remains absent/null/empty-map only. PostgreSQL documents
+    postgres:// and postgresql:// as URI aliases in libpq-connect.html's
+    LIBPQ-CONNSTRING-URIS section. Neither source proves the live payload value;
+    both aliases still require literal zero-credential sibling reconstruction.
     """
     def check(ok: bool, code: str) -> None:
         if not ok:
@@ -596,12 +600,13 @@ def project_ledger_metadata(value: Any, cluster_id: str) -> dict[str, Any]:
               "LEDGER_CONNECTION_FIELDS_REJECTED")
         check(all(connection.get(key) in (None, "") for key in ("user", "password")),
               "LEDGER_CONNECTION_CREDENTIALS_REJECTED")
-        # These shared-SDK fields carry no accepted content and never influence
-        # connections, provider requests, the runtime spec or ledger authority.
+        # These unused shared-SDK fields never influence connections, provider
+        # requests, the runtime spec or ledger authority. Only the documented
+        # PostgreSQL protocol literal can carry nonempty metadata content.
         # Do not use generic falsiness: False, 0, [] and wrong-type empties fail.
         protocol = connection.get("protocol")
         check(protocol is None or type(protocol) is str, "LEDGER_PROTOCOL_TYPE_REJECTED")
-        check(protocol is None or protocol == "", "LEDGER_PROTOCOL_VALUE_REJECTED")
+        check(protocol is None or protocol in ("", "postgresql"), "LEDGER_PROTOCOL_VALUE_REJECTED")
         application_ports = connection.get("application_ports")
         check(application_ports is None or type(application_ports) is dict,
               "LEDGER_APPLICATION_PORTS_TYPE_REJECTED")
@@ -620,9 +625,12 @@ def project_ledger_metadata(value: Any, cluster_id: str) -> dict[str, Any]:
         check(connection.get("ssl") is True, "LEDGER_SSL_FLAG_REJECTED")
         # Empty userinfo punctuation carries no credential bits. Do not use a
         # URL parser, percent decoding, normalization or any redaction marker.
-        expected = {f"postgres://{prefix}{host}:{port}/{db}?sslmode=require" for prefix in ("", "@", ":@")}
+        schemes = ("postgres://", "postgresql://")
+        expected = {f"{scheme}{prefix}{host}:{port}/{db}?sslmode=require"
+                    for scheme in schemes for prefix in ("", "@", ":@")}
         if uri not in expected:
-            authority = uri[len("postgres://"):].split("/", 1)[0] if uri.startswith("postgres://") else ""
+            scheme = next((candidate for candidate in schemes if uri.startswith(candidate)), None)
+            authority = uri[len(scheme):].split("/", 1)[0] if scheme is not None else ""
             nonempty_userinfo = "@" in authority and (authority.count("@") != 1 or authority.split("@", 1)[0] not in ("", ":"))
             raise LedgerMetadataRejected("LEDGER_URI_USERINFO_REJECTED" if nonempty_userinfo
                                          else "LEDGER_URI_NONCANONICAL_REJECTED")
