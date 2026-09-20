@@ -952,7 +952,9 @@ class LedgerMetadataProjectionTests(unittest.TestCase):
                           'LEDGER_RESPONSE_TYPE_REJECTED', 'LEDGER_DATABASE_TYPE_REJECTED', 'LEDGER_CLUSTER_ID_REJECTED',
                           'LEDGER_CONNECTION_TYPE_REJECTED', 'LEDGER_CONNECTION_FIELDS_REJECTED',
                           'LEDGER_URI_TYPE_REJECTED', 'LEDGER_URI_LENGTH_REJECTED', 'LEDGER_HOST_REJECTED',
-                          'LEDGER_PORT_REJECTED', 'LEDGER_DATABASE_LABEL_REJECTED', 'LEDGER_SSL_FLAG_REJECTED'}
+                          'LEDGER_PORT_REJECTED', 'LEDGER_DATABASE_LABEL_REJECTED', 'LEDGER_SSL_FLAG_REJECTED',
+                          'LEDGER_PROTOCOL_TYPE_REJECTED', 'LEDGER_PROTOCOL_VALUE_REJECTED',
+                          'LEDGER_APPLICATION_PORTS_TYPE_REJECTED', 'LEDGER_APPLICATION_PORTS_NONEMPTY_REJECTED'}
         self.assertEqual(set(boot.LEDGER_METADATA_CODES), expected_codes)
         cases = (
             (self.payload(extra=''), 'LEDGER_CONNECTION_FIELDS_REJECTED'),
@@ -994,6 +996,133 @@ class LedgerMetadataProjectionTests(unittest.TestCase):
                          self.plan['ledger']['cluster_id']):
             self.assertNotIn(received, public)
             self.assertNotIn(received, str(rejected.exception))
+
+    def optional_payload(self, name, uri, **options):
+        value = self.payload(name, uri=uri, **options)
+        if uri == 'absent':
+            value['database'][name].pop('uri')
+        return value
+
+    def test_optional_sdk_fields_accept_only_absent_null_empty_combinations(self):
+        self.assertEqual(set(boot.CONNECTION_FIELDS), {'uri', 'database', 'host', 'port', 'user', 'password', 'ssl'})
+        self.assertEqual(set(boot.CONNECTION_OPTIONAL_FIELDS), {'protocol', 'application_ports'})
+        omitted = object()
+        for name in self.CONNECTIONS:
+            for uri in ('absent', None, '', self.connection()['uri']):
+                for protocol in (omitted, None, ''):
+                    for ports in (omitted, None, {}):
+                        options = {key: setting for key, setting in (('protocol', protocol), ('application_ports', ports))
+                                   if setting is not omitted}
+                        value = self.optional_payload(name, uri, **options)
+                        before = copy.deepcopy(value)
+                        with (self.subTest(name=name, uri=uri, options=options),
+                              mock.patch('sys.stdout', new_callable=io.StringIO) as out,
+                              mock.patch('sys.stderr', new_callable=io.StringIO) as err):
+                            self.assertEqual(self.project(value), self.base)
+                            self.assertEqual(value, before)
+                            self.assertEqual(out.getvalue() + err.getvalue(), '')
+
+    def test_optional_protocol_type_and_nonempty_values_rejected_before_uri_bypass(self):
+        for name in self.CONNECTIONS:
+            for uri in ('absent', None, '', self.connection()['uri']):
+                for protocol in (False, True, 0, 1, 1.5, [], {}, [''], {'RAW_FIELD_NAME': ''}):
+                    with self.subTest(name=name, uri=uri, protocol=protocol):
+                        self.assert_projection_code(self.optional_payload(name, uri, protocol=protocol),
+                                                    'LEDGER_PROTOCOL_TYPE_REJECTED')
+                for protocol in ('postgres', 'postgresql', 'redis', 'RAW_SENTINEL', ' ', '\x00', 'é', '\u200b', '{}', 'null'):
+                    with self.subTest(name=name, uri=uri, protocol=protocol):
+                        self.assert_projection_code(self.optional_payload(name, uri, protocol=protocol),
+                                                    'LEDGER_PROTOCOL_VALUE_REJECTED')
+
+    def test_optional_application_ports_types_and_nonempty_maps_rejected_before_uri_bypass(self):
+        for name in self.CONNECTIONS:
+            for uri in ('absent', None, '', self.connection()['uri']):
+                for ports in (False, True, 0, 1, 1.5, [], '', 'RAW_SENTINEL', 'é', ['']):
+                    with self.subTest(name=name, uri=uri, ports=ports):
+                        self.assert_projection_code(self.optional_payload(name, uri, application_ports=ports),
+                                                    'LEDGER_APPLICATION_PORTS_TYPE_REJECTED')
+                for ports in ({'postgresql': 25060}, {'25060': 25060}, {'RAW_FIELD_NAME': 'RAW_SENTINEL'},
+                              {'empty': {}}, {'port': None}, {'port': ''}):
+                    with self.subTest(name=name, uri=uri, ports=ports):
+                        self.assert_projection_code(self.optional_payload(name, uri, application_ports=ports),
+                                                    'LEDGER_APPLICATION_PORTS_NONEMPTY_REJECTED')
+
+    def test_optional_fields_do_not_allow_other_extra_or_case_variant_names(self):
+        for name in self.CONNECTIONS:
+            for extra in ('RAW_FIELD_NAME', 'Protocol', 'applicationPorts', 'application_ports_extra', 'protocol_version'):
+                for uri in ('absent', None, '', self.connection()['uri']):
+                    value = self.optional_payload(name, uri, protocol='', application_ports={}, **{extra: ''})
+                    with self.subTest(name=name, uri=uri, extra=extra):
+                        self.assert_projection_code(value, 'LEDGER_CONNECTION_FIELDS_REJECTED')
+
+    def test_optional_field_order_and_recursive_secret_scan_precedence(self):
+        cases = (
+            ({'RAW_FIELD_NAME': '', 'protocol': False}, 'LEDGER_CONNECTION_FIELDS_REJECTED'),
+            ({'user': 'RAW_SENTINEL', 'protocol': False}, 'LEDGER_CONNECTION_CREDENTIALS_REJECTED'),
+            ({'protocol': False, 'application_ports': False}, 'LEDGER_PROTOCOL_TYPE_REJECTED'),
+            ({'protocol': 'postgres', 'application_ports': False}, 'LEDGER_PROTOCOL_VALUE_REJECTED'),
+            ({'protocol': '', 'application_ports': False}, 'LEDGER_APPLICATION_PORTS_TYPE_REJECTED'),
+            ({'protocol': '', 'application_ports': {'RAW_FIELD_NAME': ''}}, 'LEDGER_APPLICATION_PORTS_NONEMPTY_REJECTED'),
+        )
+        for name in self.CONNECTIONS:
+            for uri in ('absent', None, '', self.connection()['uri']):
+                for options, code in cases:
+                    value = self.optional_payload(name, uri, **options)
+                    with self.subTest(name=name, uri=uri, code=code):
+                        self.assert_projection_code(value, code)
+                        value['late_metadata'] = {'access_token': 'RAW_SENTINEL'}
+                        self.assert_projection_code(value, 'LEDGER_CREDENTIAL_RESPONSE_REJECTED')
+                for field in ('password', 'secret', 'access_token'):
+                    for option in ('protocol', 'application_ports'):
+                        nested = {'nested': [{field: 'RAW_SENTINEL'}]}
+                        value = self.optional_payload(name, uri, **{option: nested})
+                        with self.subTest(name=name, uri=uri, option=option, nested=field):
+                            self.assert_projection_code(value, 'LEDGER_CREDENTIAL_RESPONSE_REJECTED')
+                value = self.optional_payload(name, uri, protocol=False,
+                    application_ports={'nested': {'uri': 'postgres://RAW_SENTINEL'}})
+                self.assert_projection_code(value, 'LEDGER_URI_RESPONSE_REJECTED')
+            self.assert_projection_code(self.payload(name, uri=False, protocol=False), 'LEDGER_URI_RESPONSE_REJECTED')
+            self.assert_projection_code(self.payload(name, uri='x' * 1025, protocol=False), 'LEDGER_PROTOCOL_TYPE_REJECTED')
+
+    def test_all_optional_connections_are_dropped_by_shared_provider_get_only(self):
+        value = copy.deepcopy(self.base)
+        value['database'].update({name: self.connection(protocol='', application_ports={}) for name in self.CONNECTIONS})
+        before = copy.deepcopy(value)
+        for provider in (boot.ReadOnlyProvider(self.plan, 'synthetic-reader-token'),
+                         boot.Provider(self.plan, 'synthetic-reader-token', 'synthetic-create-token')):
+            with (mock.patch.object(boot.fixture, '_wire', return_value=common.canonical_payload_bytes(value)) as wire,
+                  mock.patch('sys.stdout', new_callable=io.StringIO) as out,
+                  mock.patch('sys.stderr', new_callable=io.StringIO) as err):
+                projected = provider.get(self.route)
+                self.assertEqual(projected, self.base)
+                self.assertEqual(value, before)
+                self.assertEqual(out.getvalue() + err.getvalue(), '')
+                wire.assert_called_once()
+                self.assertEqual(wire.call_args.args[1], common.API_ORIGIN + self.route)
+                self.assertEqual(wire.call_args.kwargs.get('method', 'GET'), 'GET')
+                self.assertNotIn(self.HOST, repr(wire.call_args))
+                public = common.canonical_payload_bytes(projected).decode()
+                for removed in (*self.CONNECTIONS, 'protocol', 'application_ports', self.HOST, 'postgres://'):
+                    self.assertNotIn(removed, public)
+
+    def test_typed_empty_sdk_extensions_do_not_bypass_existing_uri_or_credential_checks(self):
+        cases = (
+            ({'user': 'RAW_SENTINEL'}, 'LEDGER_CONNECTION_CREDENTIALS_REJECTED'),
+            ({'password': 'RAW_SENTINEL'}, 'LEDGER_CREDENTIAL_RESPONSE_REJECTED'),
+            ({'uri': False}, 'LEDGER_URI_RESPONSE_REJECTED'),
+            ({'uri': 'x' * 1025}, 'LEDGER_URI_LENGTH_REJECTED'),
+            ({'uri': 'postgres://RAW_SENTINEL@' + self.HOST + ':25060/defaultdb?sslmode=require'},
+             'LEDGER_URI_USERINFO_REJECTED'),
+            ({'uri': self.connection()['uri'] + '#RAW_SENTINEL'}, 'LEDGER_URI_NONCANONICAL_REJECTED'),
+            ({'host': None}, 'LEDGER_HOST_REJECTED'),
+            ({'port': False}, 'LEDGER_PORT_REJECTED'),
+            ({'database': 'RAW_SENTINEL'}, 'LEDGER_DATABASE_LABEL_REJECTED'),
+            ({'ssl': False}, 'LEDGER_SSL_FLAG_REJECTED'),
+        )
+        for name in self.CONNECTIONS:
+            for changes, code in cases:
+                with self.subTest(name=name, code=code):
+                    self.assert_projection_code(self.payload(name, protocol='', application_ports={}, **changes), code)
 
     def test_precise_response_database_and_cluster_identity_codes(self):
         for response in (None, [], '', 'RAW_SENTINEL', False, 1, 1.5):
