@@ -808,6 +808,269 @@ class FakeEnvironment:
         return {"total_count": len(self.value["branch_policies"]), "branch_policies": copy.deepcopy(self.value["branch_policies"])}
 
 
+class LedgerMetadataProjectionTests(unittest.TestCase):
+    CONNECTIONS = ('connection', 'private_connection', 'standby_connection', 'standby_private_connection')
+    HOST = 'ledger-unit-test.db.ondigitalocean.com'
+
+    def setUp(self):
+        _, descriptor, _, _, _, _ = packets()
+        self.plan = descriptor['plan']
+        self.route = '/v2/databases/' + self.plan['ledger']['cluster_id']
+        self.base = provider_responses(self.plan)[self.route]
+
+    def connection(self, **changes):
+        value = {'host': self.HOST, 'port': 25060, 'database': 'defaultdb', 'ssl': True,
+                 'user': None, 'password': '',
+                 'uri': 'postgres://' + self.HOST + ':25060/defaultdb?sslmode=require'}
+        value.update(changes)
+        return value
+
+    def payload(self, name='connection', **changes):
+        value = copy.deepcopy(self.base)
+        value['database'][name] = self.connection(**changes)
+        return value
+
+    def project(self, value):
+        return boot.project_ledger_metadata(value, self.plan['ledger']['cluster_id'])
+
+    def assert_rejected(self, value):
+        before = copy.deepcopy(value)
+        provider = boot.ReadOnlyProvider(self.plan, 'synthetic-reader-token')
+        with (mock.patch.object(boot.fixture, '_wire', return_value=common.canonical_payload_bytes(value)) as wire,
+              mock.patch('sys.stdout', new_callable=io.StringIO) as out,
+              mock.patch('sys.stderr', new_callable=io.StringIO) as err,
+              self.assertRaises(common.ReleaseError) as rejected):
+            provider.get(self.route)
+        wire.assert_called_once()
+        self.assertEqual(wire.call_args.args[1], common.API_ORIGIN + self.route)
+        self.assertEqual(wire.call_args.kwargs.get('method', 'GET'), 'GET')
+        self.assertNotIn('body', wire.call_args.kwargs)
+        self.assertEqual(value, before)
+        self.assertEqual(out.getvalue() + err.getvalue(), '')
+        for private in (self.HOST, 'postgres://', 'postgresql://', 'RAW_SENTINEL', 'REDACTED'):
+            self.assertNotIn(private, str(rejected.exception))
+        return rejected.exception
+
+    def test_four_documented_connections_project_to_metadata_without_mutating_input(self):
+        self.assertEqual(tuple(boot.CONNECTION_NAMES), self.CONNECTIONS)
+        for name in self.CONNECTIONS:
+            value = self.payload(name)
+            before = copy.deepcopy(value)
+            projected = self.project(value)
+            self.assertEqual(projected, self.base)
+            self.assertEqual(value, before)
+            self.assertIsNot(projected, value)
+            self.assertIsNot(projected['database'], value['database'])
+            self.assertNotIn(self.HOST, common.canonical_payload_bytes(projected).decode())
+        all_connections = copy.deepcopy(self.base)
+        all_connections['database'].update({name: self.connection() for name in self.CONNECTIONS})
+        before = copy.deepcopy(all_connections)
+        self.assertEqual(self.project(all_connections), self.base)
+        self.assertEqual(all_connections, before)
+
+    def test_optional_connections_and_empty_uri_preserve_original_noncredential_acceptance(self):
+        self.assertEqual(self.project(self.base), self.base)
+        for name in self.CONNECTIONS:
+            for optional in (None, {}, {'uri': None}, {'uri': ''}, {'uri': '', 'user': '', 'password': None}):
+                value = copy.deepcopy(self.base)
+                value['database'][name] = optional
+                self.assertEqual(self.project(value), self.base)
+        # A generic cluster connection describes defaultdb, not necessarily the
+        # dedicated selected database checked separately by the /dbs endpoint.
+        self.assertNotEqual(self.plan['ledger']['database'], 'defaultdb')
+        self.assertEqual(self.project(self.payload()), self.base)
+
+    def test_only_three_literal_empty_userinfo_forms_with_empty_credential_siblings_pass(self):
+        for name in self.CONNECTIONS:
+            for prefix in ('', '@', ':@'):
+                for user in ('absent', None, ''):
+                    for password in ('absent', None, ''):
+                        value = self.payload(name, uri='postgres://' + prefix + self.HOST + ':25060/defaultdb?sslmode=require')
+                        connection = value['database'][name]
+                        for field, setting in (('user', user), ('password', password)):
+                            if setting == 'absent':
+                                connection.pop(field)
+                            else:
+                                connection[field] = setting
+                        before = copy.deepcopy(value)
+                        with self.subTest(name=name, prefix=prefix, user=user, password=password):
+                            self.assertEqual(self.project(value), self.base)
+                            self.assertEqual(value, before)
+
+    def test_any_inserted_ascii_or_unicode_userinfo_character_is_rejected(self):
+        for character in [chr(number) for number in range(128)] + ['é', '＠', '%40', '%3A', '%00']:
+            for prefix in (character + ':@', ':' + character + '@'):
+                with self.subTest(prefix=prefix):
+                    self.assert_rejected(self.payload(uri='postgres://' + prefix + self.HOST + ':25060/defaultdb?sslmode=require'))
+
+    def test_nonempty_credentials_rejected_in_every_connection_even_literal_redaction(self):
+        for name in self.CONNECTIONS:
+            for field in ('user', 'password', 'access_token', 'secret', 'client_secret'):
+                for value in ('RAW_SENTINEL', 'REDACTED', '********', 0, False, [], {}):
+                    with self.subTest(name=name, field=field, value=value):
+                        self.assert_rejected(self.payload(name, **{field: value}))
+
+    def test_known_connection_unknown_keys_and_unknown_uri_locations_never_get_exempted(self):
+        for field in ('username', 'url', 'connection_string', 'options', 'extra', 'URI'):
+            with self.subTest(field=field):
+                self.assert_rejected(self.payload(**{field: ''}))
+        uri = self.connection()['uri']
+        cases = (
+            {'outside': {'uri': uri}},
+            {'database': {'other_connection': {'uri': uri}}},
+            {'database': {'connection': {'nested': {'uri': uri}}}},
+            {'database': {'Connection': {'uri': uri}}},
+            {'database': {'users': [{'uri': uri}]}},
+            {'connection': {'uri': uri}},
+        )
+        for extra in cases:
+            value = copy.deepcopy(self.base)
+            if 'database' in extra:
+                value['database'].update(extra['database'])
+            else:
+                value.update(extra)
+            with self.subTest(extra=extra):
+                self.assert_rejected(value)
+
+    def test_full_payload_late_credential_overrides_earlier_valid_or_null_connection(self):
+        for connection in (self.connection(), None):
+            for field in ('password', 'access_token', 'client_secret'):
+                value = copy.deepcopy(self.base)
+                value['database']['connection'] = connection
+                value['database']['late_metadata'] = [{'nested': {field: 'RAW_SENTINEL'}}]
+                self.assert_rejected(value)
+                value = self.payload()
+                value['late_response_metadata'] = {field: 'RAW_SENTINEL'}
+                self.assert_rejected(value)
+        value = self.payload()
+        value['database']['standby_private_connection'] = self.connection(password='RAW_SENTINEL')
+        self.assert_rejected(value)
+
+    def test_fixed_projection_diagnostics_never_emit_rejected_fields_or_raw_uri(self):
+        expected_codes = {'LEDGER_CONNECTION_SHAPE_REJECTED', 'LEDGER_CONNECTION_CREDENTIALS_REJECTED',
+                          'LEDGER_URI_USERINFO_REJECTED', 'LEDGER_URI_NONCANONICAL_REJECTED'}
+        self.assertEqual(set(boot.LEDGER_METADATA_CODES), expected_codes)
+        cases = (
+            (self.payload(extra=''), 'LEDGER_CONNECTION_SHAPE_REJECTED'),
+            (self.payload(user='RAW_SENTINEL'), 'LEDGER_CONNECTION_CREDENTIALS_REJECTED'),
+            (self.payload(uri='postgres://RAW_SENTINEL@' + self.HOST + ':25060/defaultdb?sslmode=require'),
+             'LEDGER_URI_USERINFO_REJECTED'),
+            (self.payload(uri=self.connection()['uri'] + '#RAW_SENTINEL'), 'LEDGER_URI_NONCANONICAL_REJECTED'),
+            (self.payload(password='RAW_SENTINEL'), 'LEDGER_CREDENTIAL_RESPONSE_REJECTED'),
+        )
+        boot.mark_stage('PROVIDER_LEDGER_METADATA')
+        for value, code in cases:
+            report = boot.failure_report(self.assert_rejected(value))
+            self.assertEqual(report, {'schema_version': 1, 'outcome': 'ERROR',
+                                     'stage': 'PROVIDER_LEDGER_METADATA', 'code': code})
+            self.assertNotIn('RAW_SENTINEL', common.canonical_payload_bytes(report).decode())
+        value = self.payload(uri='postgres://RAW_SENTINEL@' + self.HOST + ':25060/defaultdb?sslmode=require')
+        value['late'] = {'password': 'RAW_SENTINEL'}
+        self.assertEqual(boot.failure_report(self.assert_rejected(value))['code'], 'LEDGER_CREDENTIAL_RESPONSE_REJECTED')
+        with self.assertRaises(common.ReleaseError):
+            boot.LedgerMetadataRejected('RAW_SENTINEL')
+        forged = boot.LedgerMetadataRejected('LEDGER_CONNECTION_SHAPE_REJECTED')
+        forged.code = 'RAW_SENTINEL'
+        self.assertEqual(boot.failure_report(forged)['code'], 'BOOTSTRAP_CHECK_FAILED')
+
+    def test_sibling_host_port_database_ssl_and_required_field_drift_rejected(self):
+        changes = (
+            {'host': 'different.db.ondigitalocean.com'}, {'port': 25061}, {'database': 'differentdb'}, {'ssl': False},
+            {'host': None}, {'host': True}, {'host': ''}, {'port': '25060'}, {'port': 25060.0}, {'port': True},
+            {'port': 0}, {'port': -1}, {'port': 65536}, {'database': None}, {'database': True}, {'database': ''},
+            {'ssl': 'true'}, {'ssl': 1}, {'ssl': None}, {'uri': True}, {'uri': 1}, {'uri': []}, {'uri': {}},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                self.assert_rejected(self.payload(**change))
+        for missing in ('host', 'port', 'database', 'ssl'):
+            value = self.payload()
+            value['database']['connection'].pop(missing)
+            self.assert_rejected(value)
+        for malformed in ('', 'RAW_SENTINEL', [], 1, True):
+            value = copy.deepcopy(self.base)
+            value['database']['connection'] = malformed
+            self.assert_rejected(value)
+
+    def test_mutually_matching_but_invalid_host_database_or_port_forms_rejected(self):
+        hosts = ('localhost', '127.0.0.1', '[::1]', 'foreign.example.test', 'notdb.ondigitalocean.com',
+                 'ledger.db.ondigitalocean.com.evil.test', 'UPPER.db.ondigitalocean.com',
+                 'ledger.db.ondigitalocean.com.', '-ledger.db.ondigitalocean.com',
+                 'ledger-.db.ondigitalocean.com', 'ledger..db.ondigitalocean.com',
+                 'ledger_name.db.ondigitalocean.com', 'lédger.db.ondigitalocean.com',
+                 'a' * 64 + '.db.ondigitalocean.com', '.'.join(['a' * 63] * 4) + '.db.ondigitalocean.com')
+        for host in hosts:
+            with self.subTest(host=host):
+                self.assert_rejected(self.payload(host=host, uri='postgres://' + host + ':25060/defaultdb?sslmode=require'))
+        for database in ('UPPER', '_leading', '1leading', 'has-dash', 'has.dot', 'db/name', 'db name', 'déb', 'a' * 64):
+            with self.subTest(database=database):
+                self.assert_rejected(self.payload(database=database,
+                    uri='postgres://' + self.HOST + ':25060/' + database + '?sslmode=require'))
+
+    def test_uri_parser_normalization_userinfo_query_and_control_adversaries_rejected(self):
+        uri = self.connection()['uri']
+        bad = (
+            uri.replace('postgres:', 'postgresql:'), uri.replace('postgres:', 'POSTGRES:'),
+            uri.replace(self.HOST, self.HOST.upper()), uri.replace(self.HOST, self.HOST + '.'),
+            uri.replace(self.HOST, 'user@' + self.HOST), uri.replace(self.HOST, 'user:password@' + self.HOST),
+            uri.replace(self.HOST, '%40' + self.HOST), uri.replace('defaultdb', 'default%64b'),
+            uri.replace(':25060', ':025060'), uri.replace(':25060', ':+25060'), uri.replace(':25060', ':25060.0'),
+            uri.replace(':25060', ''), uri.replace('/defaultdb', '//defaultdb'),
+            uri.replace('?sslmode=require', ''), uri.replace('sslmode=require', 'sslmode=verify-full'),
+            uri.replace('sslmode=require', 'sslmode=disable'), uri.replace('sslmode=require', 'SSLMode=require'),
+            uri + '&x=1', uri + '&sslmode=require', uri + '#fragment', uri + '#', uri + '?x=1',
+            uri + ' ', ' ' + uri, '\t' + uri, '\r\n' + uri, uri + '\x00',
+            uri.replace('postgres://', 'postgres:\\'), uri.replace('ledger', 'led\nger', 1),
+            uri.replace('ledger', 'lédger', 1), uri.replace('ledger', 'led%67er', 1),
+            'postgres://' + 'x' * 1025,
+        )
+        for candidate in bad:
+            with self.subTest(uri=candidate):
+                self.assert_rejected(self.payload(uri=candidate))
+
+    def test_selected_cluster_only_and_both_check_install_adapters_share_same_get(self):
+        self.assertIs(boot.Provider.get, boot.ReadOnlyProvider.get)
+        for provider in (boot.ReadOnlyProvider(self.plan, 'synthetic-reader-token'),
+                         boot.Provider(self.plan, 'synthetic-reader-token', 'synthetic-create-token')):
+            value = self.payload()
+            with (mock.patch.object(boot.fixture, '_wire', return_value=common.canonical_payload_bytes(value)) as wire,
+                  mock.patch.object(boot, 'project_ledger_metadata', wraps=boot.project_ledger_metadata) as project):
+                self.assertEqual(provider.get(self.route), self.base)
+                project.assert_called_once_with(value, self.plan['ledger']['cluster_id'])
+                wire.assert_called_once()
+                self.assertEqual(wire.call_args.args[1], common.API_ORIGIN + self.route)
+                self.assertNotIn(self.HOST, repr(wire.call_args))
+            for route in (self.route + '/firewall', self.route + '/dbs/' + self.plan['ledger']['database']):
+                with (mock.patch.object(boot.fixture, '_wire', return_value=common.canonical_payload_bytes(value)),
+                      mock.patch.object(boot, 'project_ledger_metadata') as project,
+                      self.assertRaises(common.ReleaseError)):
+                    provider.get(route)
+                project.assert_not_called()
+            with mock.patch.object(boot.fixture, '_wire') as wire:
+                for route in ('/v2/databases/' + uid(99), self.route + '/users', self.route + '?x=1'):
+                    with self.assertRaises(common.ReleaseError):
+                        provider.get(route)
+                wire.assert_not_called()
+
+    def test_cluster_envelope_identity_and_nonconnection_fields_are_not_hidden(self):
+        for value in ({}, {'database': None}, {'database': []}, {'database': 'RAW_SENTINEL'}):
+            self.assert_rejected(value)
+        value = self.payload()
+        value['database']['id'] = uid(99)
+        self.assert_rejected(value)
+        value = self.payload()
+        value['database']['version'] = '99'
+        projected = self.project(value)
+        self.assertEqual(projected['database']['version'], '99')
+        self.assertNotIn('connection', projected['database'])
+        # Projection does not conceal ordinary metadata drift from preflight.
+        provider = boot.ReadOnlyProvider(self.plan, 'synthetic-reader-token')
+        responses = provider_responses(self.plan)
+        responses[self.route] = projected
+        with mock.patch.object(provider, 'get', side_effect=lambda path: responses[path]), self.assertRaises(common.ReleaseError):
+            provider.preflight()
+
+
 class ReadOnlyBoundaryTests(unittest.TestCase):
     def test_product_read_adapter_allows_only_login_and_bodyless_get(self):
         with mock.patch.object(boot.fixture, "ProductHTTP") as constructor:

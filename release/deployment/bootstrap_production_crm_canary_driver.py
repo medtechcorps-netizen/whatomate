@@ -110,6 +110,12 @@ DB_LABEL = re.compile(r"^[a-z][a-z0-9_]{1,62}$")
 # The real attested publisher archive contains a ~21 MiB SBOM bundle and
 # ~16 MiB SPDX document. Keep a bounded aggregate that admits that exact shape.
 MAX_PUBLIC = 64 * 1024 * 1024
+CONNECTION_NAMES = ("connection", "private_connection", "standby_connection", "standby_private_connection")
+CONNECTION_FIELDS = frozenset({"uri", "database", "host", "port", "user", "password", "ssl"})
+LEDGER_METADATA_CODES = frozenset({"LEDGER_CONNECTION_SHAPE_REJECTED", "LEDGER_CONNECTION_CREDENTIALS_REJECTED",
+    "LEDGER_URI_USERINFO_REJECTED", "LEDGER_URI_NONCANONICAL_REJECTED"})
+LEDGER_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+db\.ondigitalocean\.com")
+MAX_LEDGER_URI = 1024
 
 
 def require(ok: bool, message: str) -> None:
@@ -129,6 +135,13 @@ class LedgerCredentialResponseRejected(common.ReleaseError):
         self.code = "LEDGER_URI_RESPONSE_REJECTED" if uri else "LEDGER_CREDENTIAL_RESPONSE_REJECTED"
 
 
+class LedgerMetadataRejected(common.ReleaseError):
+    def __init__(self, code: str):
+        require(code in LEDGER_METADATA_CODES, "ledger diagnostic code differs")
+        super().__init__("ledger metadata compatibility rejected")
+        self.code = code
+
+
 def failure_report(error: Exception) -> dict[str, Any]:
     """Only reviewed constants escape; never format upstream/private objects."""
     code = "BOOTSTRAP_CHECK_FAILED"
@@ -137,7 +150,9 @@ def failure_report(error: Exception) -> dict[str, Any]:
             message = str(error)
         except Exception:
             message = ""
-        if (type(error) is LedgerCredentialResponseRejected
+        if type(error) is LedgerMetadataRejected and error.code in LEDGER_METADATA_CODES:
+            code = error.code
+        elif (type(error) is LedgerCredentialResponseRejected
                 and error.code in ("LEDGER_URI_RESPONSE_REJECTED", "LEDGER_CREDENTIAL_RESPONSE_REJECTED")):
             code = error.code
         elif message == "ledger response contains forbidden credentials":
@@ -529,6 +544,60 @@ def reject_database_credentials(value: Any) -> None:
             reject_database_credentials(child)
 
 
+def project_ledger_metadata(value: Any, cluster_id: str) -> dict[str, Any]:
+    """Drop only validated, unused connections from the exact selected cluster.
+
+    DigitalOcean's documented connection URI is assembled from sibling fields;
+    its schema does not promise an empty URI without view_credentials. Admit
+    only literal reconstruction with zero credential characters, never a parsed
+    or redacted credential. These URIs are not authority or network selectors.
+    specification/resources/databases/models/database_connection.yml in
+    github.com/digitalocean/openapi documents these seven connection fields.
+    """
+    def check(ok: bool, code: str = "LEDGER_CONNECTION_SHAPE_REJECTED") -> None:
+        if not ok:
+            raise LedgerMetadataRejected(code)
+
+    check(type(value) is dict and type(value.get("database")) is dict)
+    database = value["database"]
+    check(database.get("id") == common.require_uuid(cluster_id, "selected ledger cluster"))
+    projected = copy.deepcopy(value)
+    # Keep every object present during the full recursive guard. Only the four
+    # exact string URI slots are quarantined for stricter validation below;
+    # unknown URI locations and later nested secrets cannot disappear in a drop.
+    for name in CONNECTION_NAMES:
+        connection = projected["database"].get(name)
+        if type(connection) is dict and type(connection.get("uri")) is str:
+            connection["uri"] = ""
+    reject_database_credentials(projected)
+    for name in CONNECTION_NAMES:
+        connection = database.get(name)
+        if connection is None:
+            continue
+        check(type(connection) is dict and set(connection) <= CONNECTION_FIELDS)
+        check(all(connection.get(key) in (None, "") for key in ("user", "password")),
+              "LEDGER_CONNECTION_CREDENTIALS_REJECTED")
+        uri = connection.get("uri")
+        if uri in (None, ""):
+            continue  # Preserve the already allowed missing/redacted-empty case.
+        check(type(uri) is str and 0 < len(uri) <= MAX_LEDGER_URI)
+        host, port, db = connection.get("host"), connection.get("port"), connection.get("database")
+        check(type(host) is str and 0 < len(host) <= 253 and LEDGER_HOST.fullmatch(host) is not None
+              and type(port) is int and 1 <= port <= 65535
+              and type(db) is str and DB_LABEL.fullmatch(db) is not None and connection.get("ssl") is True)
+        # Empty userinfo punctuation carries no credential bits. Do not use a
+        # URL parser, percent decoding, normalization or any redaction marker.
+        expected = {f"postgres://{prefix}{host}:{port}/{db}?sslmode=require" for prefix in ("", "@", ":@")}
+        if uri not in expected:
+            authority = uri[len("postgres://"):].split("/", 1)[0] if uri.startswith("postgres://") else ""
+            nonempty_userinfo = "@" in authority and (authority.count("@") != 1 or authority.split("@", 1)[0] not in ("", ":"))
+            raise LedgerMetadataRejected("LEDGER_URI_USERINFO_REJECTED" if nonempty_userinfo
+                                         else "LEDGER_URI_NONCANONICAL_REJECTED")
+    for name in CONNECTION_NAMES:
+        projected["database"].pop(name, None)
+    return projected
+
+
 class ReadOnlyProvider:
     """Fixed GET allowlist only; no creation method or mutation credential."""
     def __init__(self, plan: dict[str, Any], read_token: str):
@@ -555,6 +624,8 @@ class ReadOnlyProvider:
                             headers={"Authorization": "Bearer " + self.__read_token, "Accept": "application/json"},
                             maximum=MAX_PUBLIC)
         value = common.loads_strict(raw)
+        if path == "/v2/databases/" + ledger["cluster_id"]:
+            return project_ledger_metadata(value, ledger["cluster_id"])
         if path.startswith("/v2/databases/"):
             reject_database_credentials(value)
         return value
