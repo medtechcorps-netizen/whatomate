@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -99,7 +100,7 @@ STAGES = frozenset({
     "FIXTURE_AUTHENTICATION", "IMAGE_AUTHENTICATION", "FIXTURE_INPUT_VALIDATION",
     "PROVIDER_ACCOUNT", "PROVIDER_SIZE", "PROVIDER_REGION", "PROVIDER_LEDGER_METADATA",
     "PROVIDER_LEDGER_DATABASE", "PROVIDER_FIREWALL", "PROVIDER_APPS",
-    "FIXTURE_REHYDRATION", "RUNTIME_SPEC", "SECOND_CAS", "CHECK_COMPLETE",
+    "FIXTURE_REHYDRATION", "RUNTIME_SPEC", "SECOND_CAS", "PROPOSE_APP", "PROPOSAL_POSTSTATE", "CHECK_COMPLETE",
     "CREATE_APP", "OBSERVE_CREATED", "HEALTH", "STABLE_HEALTH",
     "INSTALL_ENVIRONMENT", "FINAL_AUTHORITY", "RECEIPT_WRITE",
 })
@@ -123,6 +124,33 @@ LEDGER_METADATA_CODES = frozenset({"LEDGER_CONNECTION_SHAPE_REJECTED", "LEDGER_C
     "LEDGER_APPLICATION_PORTS_TYPE_REJECTED", "LEDGER_APPLICATION_PORTS_NONEMPTY_REJECTED"})
 LEDGER_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+db\.ondigitalocean\.com")
 MAX_LEDGER_URI = 1024
+MAX_PROPOSAL_BYTES = 256 * 1024
+PROPOSAL_URL = common.API_ORIGIN + "/v2/apps/propose"
+PROPOSAL_CODES = frozenset({
+    "PROPOSAL_HTTP_REJECTED", "PROPOSAL_REDIRECT_REJECTED", "PROPOSAL_TRANSPORT_FAILED",
+    "PROPOSAL_RESPONSE_BOUND_REJECTED", "PROPOSAL_RESPONSE_SHAPE_REJECTED",
+    "PROPOSAL_NAME_UNAVAILABLE", "PROPOSAL_RESPONSE_IDENTITY_REJECTED",
+})
+# These are mentions, not causal conclusions. Never copy a received field or
+# message, or emit indexes, lengths, hashes, request IDs or normalized specs.
+PROPOSAL_FIELDS = {
+    "spec.name": "APP_NAME", "spec.region": "REGION",
+    "spec.databases": "DATABASE_BINDING", "spec.services": "SERVICE",
+    "instance_size_slug": "INSTANCE_SIZE", "instance_count": "INSTANCE_COUNT",
+    "health_check": "HEALTH_CHECK", "deploy_on_push": "DEPLOY_ON_PUSH",
+    "image.digest": "IMAGE_DIGEST", "image.registry": "IMAGE_REGISTRY",
+    "image.repository": "IMAGE_REPOSITORY", "http_port": "HTTP_PORT",
+    "envs": "ENVIRONMENT", "routes": "ROUTES", "cluster_name": "LEDGER_CLUSTER",
+    "db_name": "LEDGER_DATABASE", "db_user": "LEDGER_USER",
+    "CRM_CANARY_HMAC_KEY_BASE64": "ENV_HMAC",
+    "CRM_CANARY_FIXTURE_DESCRIPTOR_JSON": "ENV_FIXTURE_DESCRIPTOR",
+    "CRM_CANARY_KLINIK_LOGIN_JSON": "ENV_KLINIK_LOGIN",
+    "CRM_CANARY_NON_KLINIK_LOGIN_JSON": "ENV_NON_KLINIK_LOGIN",
+    "CRM_CANARY_META_APP_SECRET": "ENV_META_SECRET",
+    "CRM_CANARY_LEDGER_DATABASE_URL": "ENV_LEDGER_BINDING",
+    "CRM_CANARY_DRIVER_VERSION_SHA256": "ENV_DRIVER_VERSION",
+}
+PROPOSAL_FIELD_CODES = frozenset(PROPOSAL_FIELDS.values())
 
 
 def require(ok: bool, message: str) -> None:
@@ -149,8 +177,27 @@ class LedgerMetadataRejected(common.ReleaseError):
         self.code = code
 
 
+class ProposalRejected(common.ReleaseError):
+    def __init__(self, code: str, http_status: int | None = None, field_mentions: tuple[str, ...] = ()):
+        super().__init__("app spec proposal rejected")
+        self.code, self.http_status, self.field_mentions = code, http_status, field_mentions
+
+
 def failure_report(error: Exception) -> dict[str, Any]:
     """Only reviewed constants escape; never format upstream/private objects."""
+    if type(error) is ProposalRejected:
+        # Revalidate even our exception: injected/modified attributes must not
+        # become a side channel around the closed diagnostic vocabulary.
+        code = getattr(error, "code", None)
+        status = getattr(error, "http_status", None)
+        fields = getattr(error, "field_mentions", None)
+        if (type(code) is str and code in PROPOSAL_CODES
+                and (status is None or type(status) is int and 100 <= status <= 599)
+                and type(fields) is tuple and len(fields) <= len(PROPOSAL_FIELD_CODES)
+                and all(type(v) is str and v in PROPOSAL_FIELD_CODES for v in fields)
+                and fields == tuple(sorted(set(fields)))):
+            return {"schema_version": 1, "outcome": "ERROR", "stage": "PROPOSE_APP", "code": code,
+                    "proposal": {"http_status": status, "field_mentions": list(fields)}}
     code = "BOOTSTRAP_CHECK_FAILED"
     if isinstance(error, common.ReleaseError):
         try:
@@ -639,6 +686,80 @@ def project_ledger_metadata(value: Any, cluster_id: str) -> dict[str, Any]:
     return projected
 
 
+class _ProposalNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: Any, headers: Any, newurl: Any) -> None:
+        raise ProposalRejected("PROPOSAL_REDIRECT_REJECTED", code) from None
+
+
+class AppSpecProposer:
+    """One non-creating validation POST, with only the app:read credential.
+
+    Kept separate from the GET-only provider and the installation adapter.
+    DigitalOcean apps/propose validates a spec; no existing app ID is supplied.
+    Private request/response bytes live only in memory and are never output.
+    """
+    def __init__(self, read_token: str):
+        require(not any(name in os.environ for name in ("SSLKEYLOGFILE", "SSL_CERT_FILE", "SSL_CERT_DIR")),
+                "proposal TLS environment override prohibited")
+        self.__read_token = fixture._secret(read_token)
+        context = ssl.create_default_context()
+        require(context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
+                and context.keylog_filename is None, "proposal TLS configuration differs")
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+            _ProposalNoRedirect(), urllib.request.HTTPSHandler(context=context))
+        self.attempted = False
+
+    def propose(self, spec: dict[str, Any]) -> None:
+        require(not self.attempted, "app spec proposal already attempted")
+        self.attempted = True  # Uncertain transport is consumed, never retried.
+        body = common.canonical_payload_bytes({"spec": spec})
+        require(len(body) <= MAX_PROPOSAL_BYTES, "app spec proposal request exceeds bound")
+        request = urllib.request.Request(PROPOSAL_URL, data=body, method="POST", headers={
+            "Authorization": "Bearer " + self.__read_token, "Content-Type": "application/json",
+            "Accept": "application/json"})
+        status = None
+        try:
+            try:
+                response = self.opener.open(request, timeout=30)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                status = response.getcode()
+                if type(status) is not int or not 100 <= status <= 599:
+                    raise ProposalRejected("PROPOSAL_RESPONSE_SHAPE_REJECTED")
+                if response.geturl() != PROPOSAL_URL or 300 <= status < 400:
+                    raise ProposalRejected("PROPOSAL_REDIRECT_REJECTED", status)
+                raw = response.read(MAX_PROPOSAL_BYTES + 1)
+            if type(raw) is not bytes or len(raw) > MAX_PROPOSAL_BYTES:
+                raise ProposalRejected("PROPOSAL_RESPONSE_BOUND_REJECTED", status)
+            try:
+                value = common.loads_strict(raw)
+            except Exception:
+                raise ProposalRejected("PROPOSAL_RESPONSE_SHAPE_REJECTED", status) from None
+            if status != 200:
+                message = value.get("message") if type(value) is dict else None
+                mentions = ()
+                if type(message) is str:
+                    mentions = tuple(sorted({code for literal, code in PROPOSAL_FIELDS.items()
+                        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(literal) + r"(?![A-Za-z0-9_])", message)}))
+                raise ProposalRejected("PROPOSAL_HTTP_REJECTED", status, mentions)
+            if type(value) is not dict or type(value.get("spec")) is not dict:
+                raise ProposalRejected("PROPOSAL_RESPONSE_SHAPE_REJECTED", status)
+            if value.get("app_name_available") is not True:
+                raise ProposalRejected("PROPOSAL_NAME_UNAVAILABLE", status)
+            returned = value["spec"]
+            services = returned.get("services")
+            if (returned.get("name") != spec["name"] or type(services) is not list or len(services) != 1
+                    or type(services[0]) is not dict or services[0].get("name") != spec["services"][0]["name"]
+                    or type(services[0].get("image")) is not dict
+                    or services[0]["image"].get("digest") != spec["services"][0]["image"]["digest"]):
+                raise ProposalRejected("PROPOSAL_RESPONSE_IDENTITY_REJECTED", status)
+        except ProposalRejected:
+            raise
+        except Exception:
+            raise ProposalRejected("PROPOSAL_TRANSPORT_FAILED", status) from None
+
+
 class ReadOnlyProvider:
     """Fixed GET allowlist only; no creation method or mutation credential."""
     def __init__(self, plan: dict[str, Any], read_token: str):
@@ -1021,17 +1142,35 @@ def preflight(a: dict[str, Any], d: dict[str, Any], protected: Any, *, provider:
     return spec, before_apps, before_rules
 
 
-def check_once(a: dict[str, Any], d: dict[str, Any], protected: Any, *, provider: Any, reader: Any,
+def check_once(a: dict[str, Any], d: dict[str, Any], protected: Any, *, provider: Any, reader: Any, proposer: Any,
                authenticate_fixture: Any, authenticate_image: Any, current_guard: Any,
                rehydrate: Any, transport: Any,
                now: Any = lambda: dt.datetime.now(dt.timezone.utc)) -> dict[str, Any]:
-    require(not hasattr(provider, "create") and not hasattr(reader, "install"),
+    require(not hasattr(provider, "create") and not hasattr(reader, "install")
+            and not any(hasattr(proposer, name) for name in ("create", "install", "update", "delete", "get")),
             "check received mutation-capable adapters")
-    preflight(a, d, protected, provider=provider, reader=reader,
+    spec, before_apps, before_rules = preflight(a, d, protected, provider=provider, reader=reader,
         authenticate_fixture=authenticate_fixture, authenticate_image=authenticate_image,
         current_guard=current_guard, rehydrate=rehydrate, transport=transport, now=now)
+    try:
+        mark_stage("PROPOSE_APP")
+        proposer.propose(spec)
+    finally:
+        # Reconcile even on rejection, timeout or malformed output. A proposal
+        # result cannot override state/authority drift, and never falls through
+        # to installation. These are the same narrowly scoped read adapters.
+        repeated_prestate = provider.preflight()
+        mark_stage("PROPOSAL_POSTSTATE")
+        require(repeated_prestate == (before_apps, before_rules), "driver prestate changed during proposal")
+        mark_stage("ENVIRONMENT_PRESTATE")
+        reader.require_absent()
+        mark_stage("CURRENT_AUTHORITY")
+        current_guard()
+        mark_stage("AUTHORIZATION")
+        validate_authorization(a, control_sha=a["control_sha"], now=now())
     mark_stage("CHECK_COMPLETE")
-    return {"schema_version": 1, "state": "private-driver-prerequisites-verified", "mutation_performed": False}
+    return {"schema_version": 1, "state": "private-driver-prerequisites-verified", "mutation_performed": False,
+            "app_spec_proposal": "accepted"}
 
 
 def install_once(a: dict[str, Any], d: dict[str, Any], protected: Any, *, provider: Any, writer: Any,
@@ -1159,7 +1298,8 @@ def main(argv: list[str] | None = None) -> int:
         if mode == "check":
             provider = ReadOnlyProvider(d["plan"], private["DO_DRIVER_BOOTSTRAP_READ_TOKEN"])
             reader = EnvironmentReader(token, d["plan"]["github_environment_sha256"])
-            checked = check_once(a, d, protected, provider=provider, reader=reader, **shared)
+            proposer = AppSpecProposer(private["DO_DRIVER_BOOTSTRAP_READ_TOKEN"])
+            checked = check_once(a, d, protected, provider=provider, reader=reader, proposer=proposer, **shared)
             print(common.canonical_payload_bytes(checked).decode())
             return 0
         provider = Provider(d["plan"], private["DO_DRIVER_BOOTSTRAP_READ_TOKEN"], private["DO_DRIVER_BOOTSTRAP_CREATE_TOKEN"])

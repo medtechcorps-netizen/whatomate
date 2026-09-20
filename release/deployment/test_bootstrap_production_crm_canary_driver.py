@@ -8,11 +8,14 @@ import datetime as dt
 import io
 import os
 from pathlib import Path
+import ssl
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
+import urllib.error
+import urllib.request
 import zipfile
 
 try:
@@ -163,6 +166,21 @@ class FakeMetadataReader:
         return self.writer.require_absent()
 
 
+class FakeProposer:
+    def __init__(self):
+        self.attempted = False
+        self.calls = []
+        self.error = None
+
+    def propose(self, spec):
+        if self.attempted:
+            raise AssertionError("synthetic proposal was already attempted")
+        self.attempted = True
+        self.calls.append(copy.deepcopy(spec))
+        if self.error is not None:
+            raise self.error
+
+
 class BootstrapTests(unittest.TestCase):
     def setUp(self):
         self.a, self.d, self.protected, self.receipt, self.transport, self.driver = packets()
@@ -170,6 +188,7 @@ class BootstrapTests(unittest.TestCase):
         self.writer = FakeWriter()
         self.read_provider = FakeProviderReader(self.provider)
         self.read_environment = FakeMetadataReader(self.writer)
+        self.proposer = FakeProposer()
         self.probe = mock.Mock()
         self.current = mock.Mock()
         self.authenticate = mock.Mock(return_value=self.receipt)
@@ -183,6 +202,7 @@ class BootstrapTests(unittest.TestCase):
 
     def check(self):
         return boot.check_once(self.a, self.d, self.protected, provider=self.read_provider, reader=self.read_environment,
+            proposer=self.proposer,
             authenticate_fixture=self.authenticate, authenticate_image=self.image, current_guard=self.current,
             rehydrate=boot.fixture.rehydrate, transport=self.transport, now=lambda: NOW)
 
@@ -193,15 +213,17 @@ class BootstrapTests(unittest.TestCase):
               mock.patch.object(self.writer, "install", side_effect=AssertionError("check must not install"))):
             result = self.check()
         self.assertEqual(result, {"schema_version": 1, "state": "private-driver-prerequisites-verified",
-                                  "mutation_performed": False})
+                                  "mutation_performed": False, "app_spec_proposal": "accepted"})
         self.assertGreater(len(self.transport.calls), before)
         self.assertTrue(all(call[0] == "GET" for call in self.transport.calls[before:]))
-        self.assertEqual(self.provider.calls, ["preflight", "preflight"])
-        self.assertEqual(self.writer.calls, ["absent", "absent"])
-        self.assertEqual(self.current.call_count, 3)
+        self.assertEqual(self.provider.calls, ["preflight", "preflight", "preflight"])
+        self.assertEqual(self.writer.calls, ["absent", "absent", "absent"])
+        self.assertEqual(self.current.call_count, 4)
         self.authenticate.assert_called_once_with()
         self.image.assert_called_once_with()
         spec.assert_called_once_with(self.a, self.d, self.protected, self.driver)
+        self.assertEqual(self.proposer.calls, [boot.runtime_spec(self.a, self.d, self.protected, self.driver)])
+        self.assertTrue(self.proposer.attempted)
         self.probe.assert_not_called()
         public = common.canonical_payload_bytes(result).decode()
         for value in (self.d["hmac_key_base64"], self.protected["credentials"]["klinik_password"],
@@ -228,10 +250,26 @@ class BootstrapTests(unittest.TestCase):
         for provider, reader in ((self.provider, self.read_environment), (self.read_provider, self.writer)):
             with self.subTest(provider=type(provider).__name__, reader=type(reader).__name__), self.assertRaises(common.ReleaseError):
                 boot.check_once(self.a, self.d, self.protected, provider=provider, reader=reader,
+                    proposer=self.proposer,
                     authenticate_fixture=self.authenticate, authenticate_image=self.image, current_guard=self.current,
                     rehydrate=boot.fixture.rehydrate, transport=self.transport, now=lambda: NOW)
             self.assertEqual(self.provider.calls, [])
             self.assertEqual(self.writer.calls, [])
+            self.authenticate.assert_not_called()
+            self.assertEqual(self.proposer.calls, [])
+
+    def test_check_rejects_proposer_with_unrelated_capabilities_before_preflight(self):
+        for capability in ("create", "install", "update", "delete", "get"):
+            proposer = FakeProposer()
+            setattr(proposer, capability, mock.Mock())
+            with self.subTest(capability=capability), self.assertRaises(common.ReleaseError):
+                boot.check_once(self.a, self.d, self.protected, provider=self.read_provider,
+                    reader=self.read_environment, proposer=proposer,
+                    authenticate_fixture=self.authenticate, authenticate_image=self.image,
+                    current_guard=self.current, rehydrate=boot.fixture.rehydrate,
+                    transport=self.transport, now=lambda: NOW)
+            self.assertEqual(proposer.calls, [])
+            self.assertEqual(self.provider.calls, [])
             self.authenticate.assert_not_called()
 
     def test_check_second_cas_changes_and_last_authority_failure_never_mutate(self):
@@ -250,6 +288,65 @@ class BootstrapTests(unittest.TestCase):
                     self.check()
                 self.assertEqual(self.provider.create_count, 0)
                 self.assertEqual(self.writer.installed, [])
+                self.assertEqual(self.proposer.calls, [])
+
+    def test_check_proposal_failure_still_reconciles_without_any_mutation(self):
+        for error in (common.ReleaseError("synthetic proposal rejected"), TimeoutError("PRIVATE-DO-NOT-EMIT")):
+            self.setUp()
+            self.proposer.error = error
+            with self.subTest(kind=type(error).__name__), self.assertRaises(type(error)):
+                self.check()
+            self.assertEqual(len(self.proposer.calls), 1)
+            self.assertEqual(self.provider.calls, ["preflight"] * 3)
+            self.assertEqual(self.writer.calls, ["absent"] * 3)
+            self.assertEqual(self.current.call_count, 4)
+            self.assertEqual(self.provider.create_count, 0)
+            self.assertEqual(self.writer.installed, [])
+            self.probe.assert_not_called()
+
+    def test_check_postproposal_drift_or_authority_failure_cannot_succeed(self):
+        for boundary in ("provider", "environment", "authority", "expiry"):
+            self.setUp()
+            with self.subTest(boundary=boundary), ExitStack() as stack:
+                if boundary == "provider":
+                    first = ([{"id": uid(10), "name": "production-app"}],
+                             [{"type": "app", "value": uid(10)}])
+                    stack.enter_context(mock.patch.object(self.provider, "preflight",
+                        side_effect=[first, first, ([], first[1])]))
+                elif boundary == "environment":
+                    stack.enter_context(mock.patch.object(self.writer, "require_absent",
+                        side_effect=[None, None, common.ReleaseError("synthetic metadata drift")]))
+                elif boundary == "authority":
+                    self.current.side_effect = [None, None, None, common.ReleaseError("synthetic authority drift")]
+                now = mock.Mock(side_effect=[NOW, NOW, NOW, NOW + dt.timedelta(hours=2)]) if boundary == "expiry" else lambda: NOW
+                with self.assertRaises(common.ReleaseError):
+                    boot.check_once(self.a, self.d, self.protected, provider=self.read_provider,
+                        reader=self.read_environment, proposer=self.proposer,
+                        authenticate_fixture=self.authenticate, authenticate_image=self.image,
+                        current_guard=self.current, rehydrate=boot.fixture.rehydrate,
+                        transport=self.transport, now=now)
+            self.assertEqual(len(self.proposer.calls), 1)
+            self.assertEqual(self.provider.create_count, 0)
+            self.assertEqual(self.writer.installed, [])
+
+    def test_check_postproposal_drift_overrides_proposal_rejection(self):
+        self.proposer.error = boot.ProposalRejected("PROPOSAL_HTTP_REJECTED", 422, ("APP_NAME",))
+        first = ([{"id": uid(10), "name": "production-app"}], [{"type": "app", "value": uid(10)}])
+        with (mock.patch.object(self.provider, "preflight", side_effect=[first, first, ([], first[1])]),
+              self.assertRaises(common.ReleaseError) as caught):
+            self.check()
+        self.assertNotIsInstance(caught.exception, boot.ProposalRejected)
+        self.assertEqual(boot.failure_report(caught.exception), {"schema_version": 1, "outcome": "ERROR",
+            "stage": "PROPOSAL_POSTSTATE", "code": "BOOTSTRAP_CHECK_FAILED"})
+        self.assertEqual(len(self.proposer.calls), 1)
+        self.assertEqual(self.provider.create_count, 0)
+        self.assertEqual(self.writer.installed, [])
+
+    def test_install_path_does_not_call_proposal_adapter(self):
+        with mock.patch.object(boot, "AppSpecProposer") as proposer:
+            self.execute()
+        proposer.assert_not_called()
+        self.assertEqual(self.proposer.calls, [])
 
     def test_every_provider_preflight_stage_failure_blocks_create_and_install(self):
         plan = self.d["plan"]
@@ -665,16 +762,19 @@ class BootstrapTests(unittest.TestCase):
                   mock.patch.object(boot, "current_guard") as guard,
                   mock.patch.object(boot, "ReadOnlyProvider") as reader,
                   mock.patch.object(boot, "Provider") as provider,
+                  mock.patch.object(boot, "AppSpecProposer") as proposer,
                   mock.patch.object(boot.fixture, "_pinned_gh") as gh,
                   mock.patch("sys.stdout", new_callable=io.StringIO)):
                 self.assertEqual(boot.main(["validate", "--control-root", "."]), 0)
                 guard.assert_called_once_with(api.return_value, Path(".").resolve(), mode)
                 reader.assert_not_called()
                 provider.assert_not_called()
+                proposer.assert_not_called()
                 gh.assert_not_called()
 
     def test_check_cli_constructs_only_read_adapters_and_emits_no_artifact(self):
-        result = {"schema_version": 1, "state": "private-driver-prerequisites-verified", "mutation_performed": False}
+        result = {"schema_version": 1, "state": "private-driver-prerequisites-verified",
+                  "mutation_performed": False, "app_spec_proposal": "accepted"}
         with (mock.patch.dict(os.environ, self.cli_env("check", private=True), clear=True),
               mock.patch.object(boot, "GitHubRead"), mock.patch.object(boot, "current_guard") as guard,
               mock.patch.object(boot.fixture, "_pinned_gh", return_value=Path("mocked-pinned-gh")),
@@ -682,6 +782,7 @@ class BootstrapTests(unittest.TestCase):
               mock.patch.object(boot, "ReadOnlyProductTransport") as transport,
               mock.patch.object(boot, "ReadOnlyProvider") as provider,
               mock.patch.object(boot, "EnvironmentReader") as reader,
+              mock.patch.object(boot, "AppSpecProposer") as proposer,
               mock.patch.object(boot, "Provider") as mutable_provider,
               mock.patch.object(boot, "EnvironmentWriter") as writer,
               mock.patch.object(boot, "check_once", return_value=result) as check,
@@ -694,10 +795,12 @@ class BootstrapTests(unittest.TestCase):
               mock.patch("sys.stderr", new_callable=io.StringIO) as err):
             self.assertEqual(boot.main(["check", "--control-root", "."]), 0)
             provider.assert_called_once_with(self.d["plan"], "synthetic-provider-reader")
+            proposer.assert_called_once_with("synthetic-provider-reader")
             reader.assert_called_once_with("synthetic-read-token", self.d["plan"]["github_environment_sha256"])
             transport.assert_called_once_with(self.protected["credentials"]["meta_access_token"])
             self.assertIs(check.call_args.kwargs["provider"], provider.return_value)
             self.assertIs(check.call_args.kwargs["reader"], reader.return_value)
+            self.assertIs(check.call_args.kwargs["proposer"], proposer.return_value)
             self.assertIs(check.call_args.kwargs["transport"], transport.return_value)
             check.call_args.kwargs["current_guard"]()
             self.assertEqual(guard.call_args.args[-1], "check")
@@ -722,12 +825,14 @@ class BootstrapTests(unittest.TestCase):
         for label, env, args in cases:
             with (self.subTest(label=label), mock.patch.dict(os.environ, env, clear=True),
                   mock.patch.object(boot, "GitHubRead") as api,
+                  mock.patch.object(boot, "AppSpecProposer") as proposer,
                   mock.patch.object(boot, "check_once") as check,
                   mock.patch("sys.stdout", new_callable=io.StringIO) as out,
                   mock.patch("sys.stderr", new_callable=io.StringIO) as err):
                 self.assertEqual(boot.main(["check", "--control-root", ".", *args]), 1)
                 api.assert_not_called()
                 check.assert_not_called()
+                proposer.assert_not_called()
                 self.assertEqual(out.getvalue(), "")
                 report = common.loads_strict(err.getvalue())
                 self.assertEqual(set(report), {"schema_version", "outcome", "stage", "code"})
@@ -741,6 +846,7 @@ class BootstrapTests(unittest.TestCase):
             env.pop(missing)
             with (self.subTest(missing=missing), mock.patch.dict(os.environ, env, clear=True),
                   mock.patch.object(boot, "GitHubRead") as api,
+                  mock.patch.object(boot, "AppSpecProposer") as proposer,
                   mock.patch.object(boot, "check_once") as check,
                   mock.patch.object(boot, "install_once") as install,
                   mock.patch("sys.stderr", new_callable=io.StringIO)):
@@ -748,6 +854,57 @@ class BootstrapTests(unittest.TestCase):
                 api.assert_not_called()
                 check.assert_not_called()
                 install.assert_not_called()
+                proposer.assert_not_called()
+
+    def test_install_cli_never_constructs_proposal_adapter(self):
+        env = self.cli_env("install", private=True)
+        env.update(DO_DRIVER_BOOTSTRAP_CREATE_TOKEN="synthetic-create",
+                   GH_CANARY_ENVIRONMENT_WRITE_TOKEN="synthetic-write", RUNNER_TEMP=str(Path.cwd()))
+        receipt = boot.public_receipt(self.a, uid(14), uid(15), "https://synthetic.ondigitalocean.app")
+        with (mock.patch.dict(os.environ, env, clear=True),
+              mock.patch.object(boot, "GitHubRead"), mock.patch.object(boot, "current_guard"),
+              mock.patch.object(boot.fixture, "_pinned_gh", return_value=Path("mocked-pinned-gh")),
+              mock.patch.object(prerequisites, "GitHubEvidence"),
+              mock.patch.object(boot, "ReadOnlyProductTransport"),
+              mock.patch.object(boot, "AppSpecProposer") as proposer,
+              mock.patch.object(boot, "Provider"), mock.patch.object(boot, "EnvironmentWriter"),
+              mock.patch.object(boot, "check_once") as check,
+              mock.patch.object(boot, "install_once", return_value=receipt) as install,
+              mock.patch.object(Path, "exists", return_value=False),
+              mock.patch.object(Path, "mkdir"), mock.patch.object(Path, "write_bytes"),
+              mock.patch.object(Path, "write_text"),
+              mock.patch("sys.stdout", new_callable=io.StringIO),
+              mock.patch("sys.stderr", new_callable=io.StringIO) as err):
+            self.assertEqual(boot.main(["install", "--control-root", ".", "--output-dir",
+                str(Path.cwd() / "synthetic-unused-bootstrap-receipt")]), 0, err.getvalue())
+        proposer.assert_not_called()
+        check.assert_not_called()
+        install.assert_called_once()
+
+    def test_cli_proposal_diagnostic_never_serializes_private_exception_or_response(self):
+        sentinel = "RAW-PROPOSAL-PASSWORD-TOKEN-URL-DO-NOT-EMIT"
+        failure = boot.ProposalRejected("PROPOSAL_HTTP_REJECTED", 422, ("ENV_KLINIK_LOGIN",))
+        failure.args = (sentinel,)
+        with (mock.patch.dict(os.environ, self.cli_env("check", private=True), clear=True),
+              mock.patch.object(boot, "GitHubRead"), mock.patch.object(boot, "current_guard"),
+              mock.patch.object(boot.fixture, "_pinned_gh", return_value=Path("mocked-pinned-gh")),
+              mock.patch.object(prerequisites, "GitHubEvidence"),
+              mock.patch.object(boot, "ReadOnlyProductTransport"), mock.patch.object(boot, "ReadOnlyProvider"),
+              mock.patch.object(boot, "EnvironmentReader"), mock.patch.object(boot, "AppSpecProposer"),
+              mock.patch.object(boot, "check_once", side_effect=failure),
+              mock.patch.object(boot, "Provider") as create, mock.patch.object(boot, "EnvironmentWriter") as writer,
+              mock.patch.object(Path, "mkdir") as mkdir, mock.patch.object(Path, "write_bytes") as write_bytes,
+              mock.patch.object(Path, "write_text") as write_text,
+              mock.patch("sys.stdout", new_callable=io.StringIO) as out,
+              mock.patch("sys.stderr", new_callable=io.StringIO) as err):
+            self.assertEqual(boot.main(["check", "--control-root", "."]), 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(common.loads_strict(err.getvalue()), {"schema_version": 1, "outcome": "ERROR",
+            "stage": "PROPOSE_APP", "code": "PROPOSAL_HTTP_REJECTED",
+            "proposal": {"http_status": 422, "field_mentions": ["ENV_KLINIK_LOGIN"]}})
+        self.assertNotIn(sentinel, err.getvalue())
+        for unused in (create, writer, mkdir, write_bytes, write_text):
+            unused.assert_not_called()
 
     def test_cli_failure_never_serializes_private_exception_or_writes_artifacts(self):
         sentinel = 'RAW_KEY=RAW_VALUE token=RAW_TOKEN postgresql://RAW_USER:RAW_PASSWORD@RAW_HOST/db RAW_EXCEPTION'
@@ -760,6 +917,7 @@ class BootstrapTests(unittest.TestCase):
               mock.patch.object(prerequisites, "GitHubEvidence"),
               mock.patch.object(boot, "ReadOnlyProductTransport"),
               mock.patch.object(boot, "ReadOnlyProvider"), mock.patch.object(boot, "EnvironmentReader"),
+              mock.patch.object(boot, "AppSpecProposer"),
               mock.patch.object(boot, "check_once", side_effect=fail),
               mock.patch.object(boot.fixture, "_wire") as wire,
               mock.patch.object(Path, "mkdir") as mkdir,
@@ -1620,6 +1778,272 @@ class EnvironmentWriterTests(unittest.TestCase):
               self.assertRaisesRegex(common.ReleaseError, "encryption key changed")):
             self.writer.install(self.config)
         wire.assert_not_called()
+
+
+class ProposalResponse(io.BytesIO):
+    def __init__(self, raw, *, status=200, url=None):
+        super().__init__(raw)
+        self.status = status
+        self.url = boot.PROPOSAL_URL if url is None else url
+        self.read_sizes = []
+
+    def getcode(self):
+        return self.status
+
+    def geturl(self):
+        return self.url
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        return super().read(size)
+
+
+class AppSpecProposalTests(unittest.TestCase):
+    def setUp(self):
+        self.a, self.d, self.protected, _, _, self.driver = packets()
+        self.spec = boot.runtime_spec(self.a, self.d, self.protected, self.driver)
+        self.accepted = {"app_name_available": True, "spec": copy.deepcopy(self.spec)}
+        # The adapter transport is mocked; do not initialize host OpenSSL after
+        # clearing Windows runtime variables just to exercise HTTP boundaries.
+        self.tls_context = mock.Mock(check_hostname=True, verify_mode=ssl.CERT_REQUIRED, keylog_filename=None)
+
+    def proposer(self, response=None):
+        with (mock.patch.dict(os.environ, {}, clear=True),
+              mock.patch.object(boot.ssl, "create_default_context", return_value=self.tls_context)):
+            proposer = boot.AppSpecProposer("SYNTHETIC-PROPOSAL-READ-TOKEN")
+        proposer.opener = mock.Mock()
+        if response is not None:
+            proposer.opener.open.return_value = response
+        return proposer
+
+    def reject(self, response):
+        proposer = self.proposer(response)
+        with self.assertRaises(boot.ProposalRejected) as caught:
+            proposer.propose(self.spec)
+        self.assertTrue(proposer.attempted)
+        self.assertEqual(proposer.opener.open.call_count, 1)
+        self.assertTrue(response.closed)
+        return boot.failure_report(caught.exception)
+
+    def test_exact_real_runtime_wrapper_route_headers_and_single_attempt(self):
+        response = ProposalResponse(common.canonical_payload_bytes(self.accepted))
+        proposer = self.proposer(response)
+        original = copy.deepcopy(self.spec)
+        def observed(request, *, timeout):
+            self.assertTrue(proposer.attempted)
+            self.assertEqual(request.full_url, "https://api.digitalocean.com/v2/apps/propose")
+            self.assertEqual(request.get_method(), "POST")
+            self.assertEqual(timeout, 30)
+            self.assertEqual(request.get_header("Authorization"), "Bearer SYNTHETIC-PROPOSAL-READ-TOKEN")
+            self.assertEqual(request.get_header("Content-type"), "application/json")
+            self.assertEqual(request.data, common.canonical_payload_bytes({"spec": original}))
+            self.assertEqual(set(common.loads_strict(request.data)), {"spec"})
+            return response
+        proposer.opener.open.side_effect = observed
+        with (mock.patch("sys.stdout", new_callable=io.StringIO) as out,
+              mock.patch("sys.stderr", new_callable=io.StringIO) as err,
+              mock.patch.object(Path, "write_bytes") as write,
+              mock.patch.object(boot.subprocess, "run") as child):
+            self.assertIsNone(proposer.propose(self.spec))
+        self.assertEqual(self.spec, original)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(response.read_sizes, [boot.MAX_PROPOSAL_BYTES + 1])
+        self.assertTrue(response.closed)
+        write.assert_not_called()
+        child.assert_not_called()
+        with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
+            proposer.propose(self.spec)
+        self.assertEqual(proposer.opener.open.call_count, 1)
+        for capability in ("create", "install", "update", "delete", "get"):
+            self.assertFalse(hasattr(proposer, capability))
+        self.assertFalse(issubclass(boot.AppSpecProposer, boot.ReadOnlyProvider))
+        self.assertFalse(issubclass(boot.AppSpecProposer, boot.Provider))
+
+    def test_request_bound_and_serialization_failure_burn_before_transport(self):
+        variants = ({**self.spec, "oversized": "x" * boot.MAX_PROPOSAL_BYTES},
+                    {**self.spec, "nonfinite": float("nan")}, {**self.spec, "unserializable": object()})
+        for spec in variants:
+            proposer = self.proposer()
+            with self.subTest(kind=next(reversed(spec))), self.assertRaises(Exception):
+                proposer.propose(spec)
+            self.assertTrue(proposer.attempted)
+            proposer.opener.open.assert_not_called()
+            with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
+                proposer.propose(self.spec)
+
+    def test_http_error_exact_status_closed_fields_and_no_echo(self):
+        sentinel = "RAW_PRIVATE_PASSWORD_OR_TOKEN_DO_NOT_EMIT"
+        message = sentinel + " spec.services[0].envs.CRM_CANARY_KLINIK_LOGIN_JSON spec.name spec.name"
+        stream = io.BytesIO(common.canonical_payload_bytes({"message": message, "request_id": sentinel}))
+        error = urllib.error.HTTPError(boot.PROPOSAL_URL, 422, sentinel, {"X-Request-ID": sentinel}, stream)
+        proposer = self.proposer()
+        proposer.opener.open.side_effect = error
+        with self.assertRaises(boot.ProposalRejected) as caught:
+            proposer.propose(self.spec)
+        report = boot.failure_report(caught.exception)
+        self.assertEqual(report, {"schema_version": 1, "outcome": "ERROR", "stage": "PROPOSE_APP",
+            "code": "PROPOSAL_HTTP_REJECTED", "proposal": {"http_status": 422,
+                "field_mentions": ["APP_NAME", "ENVIRONMENT", "ENV_KLINIK_LOGIN", "SERVICE"]}})
+        self.assertNotIn(sentinel, common.canonical_payload_bytes(report).decode())
+        self.assertNotIn(sentinel, str(caught.exception))
+        self.assertTrue(stream.closed)
+        with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
+            proposer.propose(self.spec)
+        self.assertEqual(proposer.opener.open.call_count, 1)
+
+    def test_all_http_statuses_are_exact_and_never_become_create_authority(self):
+        raw = common.canonical_payload_bytes({"message": "PRIVATE spec.name health_check"})
+        for status in range(100, 600):
+            if status == 200:
+                continue
+            with self.subTest(status=status):
+                report = self.reject(ProposalResponse(raw, status=status))
+                self.assertEqual(report["proposal"]["http_status"], status)
+                expected = "PROPOSAL_REDIRECT_REJECTED" if 300 <= status < 400 else "PROPOSAL_HTTP_REJECTED"
+                self.assertEqual(report["code"], expected)
+                self.assertNotIn("PRIVATE", common.canonical_payload_bytes(report).decode())
+
+    def test_unknown_or_nonliteral_field_messages_are_not_echoed_or_promoted(self):
+        messages = ("PRIVATE_UNKNOWN_FIELD=value", "xspec.name spec.nameX Xhealth_check health_check_",
+                    "SPEC.NAME", ["spec.name"], {"spec.name": "private"}, None)
+        for message in messages:
+            with self.subTest(kind=type(message).__name__):
+                report = self.reject(ProposalResponse(common.canonical_payload_bytes({"message": message}), status=400))
+                self.assertEqual(report["proposal"]["field_mentions"], [])
+                self.assertEqual(report["code"], "PROPOSAL_HTTP_REJECTED")
+
+    def test_every_reviewed_public_field_literal_maps_only_to_closed_mentions(self):
+        for literal, expected in boot.PROPOSAL_FIELDS.items():
+            with self.subTest(field=literal):
+                raw = common.canonical_payload_bytes({"message": literal + " PRIVATE-DO-NOT-EMIT " + literal})
+                report = self.reject(ProposalResponse(raw, status=422))
+                self.assertEqual(report["proposal"]["field_mentions"], [expected])
+                raw = common.canonical_payload_bytes({"message": "X" + literal + " " + literal + "_PRIVATE"})
+                self.assertEqual(self.reject(ProposalResponse(raw, status=422))["proposal"]["field_mentions"], [])
+
+    def test_invalid_json_duplicate_keys_nonfinite_and_oversize_fail_closed(self):
+        for raw in (b"<html>PRIVATE</html>", b'{"message":"first","message":"PRIVATE"}',
+                    b'{"message":NaN}', b"\xff", b""):
+            with self.subTest(raw_size=len(raw)):
+                report = self.reject(ProposalResponse(raw, status=422))
+                self.assertEqual(report["code"], "PROPOSAL_RESPONSE_SHAPE_REJECTED")
+                self.assertEqual(report["proposal"]["http_status"], 422)
+        response = ProposalResponse(b"x" * (boot.MAX_PROPOSAL_BYTES + 1), status=422)
+        report = self.reject(response)
+        self.assertEqual(report["code"], "PROPOSAL_RESPONSE_BOUND_REJECTED")
+        self.assertEqual(response.read_sizes, [boot.MAX_PROPOSAL_BYTES + 1])
+
+    def test_transport_exceptions_are_closed_and_never_retried(self):
+        for error in (TimeoutError("PRIVATE-TIMEOUT"), OSError("PRIVATE-SOCKET"),
+                      ssl.SSLError("PRIVATE-TLS"), RuntimeError("PRIVATE-TRANSPORT")):
+            proposer = self.proposer()
+            proposer.opener.open.side_effect = error
+            with self.subTest(kind=type(error).__name__), self.assertRaises(boot.ProposalRejected) as caught:
+                proposer.propose(self.spec)
+            self.assertEqual(boot.failure_report(caught.exception), {"schema_version": 1, "outcome": "ERROR",
+                "stage": "PROPOSE_APP", "code": "PROPOSAL_TRANSPORT_FAILED",
+                "proposal": {"http_status": None, "field_mentions": []}})
+            self.assertTrue(proposer.attempted)
+            with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
+                proposer.propose(self.spec)
+            self.assertEqual(proposer.opener.open.call_count, 1)
+
+    def test_redirect_handler_and_response_url_guard_never_read_redirect_body(self):
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status), self.assertRaises(boot.ProposalRejected) as caught:
+                boot._ProposalNoRedirect().redirect_request(None, None, status, "PRIVATE", {}, "https://other.invalid")
+            self.assertEqual(boot.failure_report(caught.exception)["code"], "PROPOSAL_REDIRECT_REJECTED")
+        for status, url in ((302, boot.PROPOSAL_URL), (200, "https://other.invalid/propose"),
+                            (200, boot.PROPOSAL_URL + "?unexpected=1")):
+            response = ProposalResponse(b"PRIVATE-REDIRECT", status=status, url=url)
+            report = self.reject(response)
+            self.assertEqual(report["code"], "PROPOSAL_REDIRECT_REJECTED")
+            self.assertEqual(response.read_sizes, [])
+
+    def test_invalid_response_status_type_or_range_has_no_dynamic_output(self):
+        for status in (True, "200", None, 99, 600):
+            report = self.reject(ProposalResponse(b"PRIVATE", status=status))
+            self.assertEqual(report["code"], "PROPOSAL_RESPONSE_SHAPE_REJECTED")
+            self.assertIsNone(report["proposal"]["http_status"])
+
+    def test_accepted_response_must_match_exact_name_service_and_digest(self):
+        variants = (
+            lambda v: v.update(spec=None),
+            lambda v: v.update(app_name_available=False),
+            lambda v: v.update(app_name_available=1),
+            lambda v: v["spec"].update(name="foreign"),
+            lambda v: v["spec"].update(services=[]),
+            lambda v: v["spec"]["services"].append(copy.deepcopy(v["spec"]["services"][0])),
+            lambda v: v["spec"]["services"].__setitem__(0, "PRIVATE"),
+            lambda v: v["spec"]["services"][0].update(name="foreign"),
+            lambda v: v["spec"]["services"][0].update(image=None),
+            lambda v: v["spec"]["services"][0]["image"].update(digest="sha256:" + "0" * 64),
+        )
+        expected = ["PROPOSAL_RESPONSE_SHAPE_REJECTED", "PROPOSAL_NAME_UNAVAILABLE", "PROPOSAL_NAME_UNAVAILABLE"]
+        for index, change in enumerate(variants):
+            value = copy.deepcopy(self.accepted)
+            change(value)
+            with self.subTest(index=index):
+                report = self.reject(ProposalResponse(common.canonical_payload_bytes(value)))
+                self.assertEqual(report["code"], expected[index] if index < len(expected) else "PROPOSAL_RESPONSE_IDENTITY_REJECTED")
+                self.assertEqual(report["proposal"]["http_status"], 200)
+
+    def test_success_discards_provider_normalized_secret_values(self):
+        value = copy.deepcopy(self.accepted)
+        value["spec"]["services"][0]["envs"][0]["value"] = "EV[PRIVATE-NORMALIZED-DO-NOT-EMIT]"
+        proposer = self.proposer(ProposalResponse(common.canonical_payload_bytes(value)))
+        with (mock.patch("sys.stdout", new_callable=io.StringIO) as out,
+              mock.patch("sys.stderr", new_callable=io.StringIO) as err):
+            self.assertIsNone(proposer.propose(self.spec))
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+        self.assertNotIn("PRIVATE-NORMALIZED", common.canonical_payload_bytes(self.spec).decode())
+
+    def test_tls_environment_override_and_insecure_context_rejected_before_transport(self):
+        for name in ("SSLKEYLOGFILE", "SSL_CERT_FILE", "SSL_CERT_DIR"):
+            with (self.subTest(name=name), mock.patch.dict(os.environ, {name: "PRIVATE"}, clear=True),
+                  mock.patch.object(boot.ssl, "create_default_context") as context,
+                  self.assertRaises(common.ReleaseError)):
+                boot.AppSpecProposer("synthetic-token")
+            context.assert_not_called()
+        for attributes in ({"check_hostname": False}, {"verify_mode": ssl.CERT_NONE}, {"keylog_filename": "PRIVATE"}):
+            context = mock.Mock(check_hostname=True, verify_mode=ssl.CERT_REQUIRED, keylog_filename=None)
+            for name, value in attributes.items():
+                setattr(context, name, value)
+            with (self.subTest(attributes=tuple(attributes)), mock.patch.dict(os.environ, {}, clear=True),
+                  mock.patch.object(boot.ssl, "create_default_context", return_value=context),
+                  mock.patch.object(boot.urllib.request, "build_opener") as build,
+                  self.assertRaises(common.ReleaseError)):
+                boot.AppSpecProposer("synthetic-token")
+            build.assert_not_called()
+        with (mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://private.invalid"}, clear=True),
+              mock.patch.object(boot.ssl, "create_default_context", return_value=self.tls_context) as context,
+              mock.patch.object(boot.urllib.request, "build_opener") as build):
+            boot.AppSpecProposer("synthetic-token")
+        context.assert_called_once_with()
+        handlers = build.call_args.args
+        self.assertEqual(next(h.proxies for h in handlers if isinstance(h, urllib.request.ProxyHandler)), {})
+        self.assertTrue(any(isinstance(h, boot._ProposalNoRedirect) for h in handlers))
+        self.assertIs(next(h._context for h in handlers if isinstance(h, urllib.request.HTTPSHandler)), self.tls_context)
+
+    def test_forged_diagnostic_attributes_and_subclasses_cannot_escape_closed_report(self):
+        changes = ({"code": "PRIVATE"}, {"http_status": True}, {"http_status": "PRIVATE"},
+                   {"http_status": 600}, {"field_mentions": ["APP_NAME"]},
+                   {"field_mentions": ("PRIVATE",)}, {"field_mentions": ("APP_NAME", "APP_NAME")},
+                   {"field_mentions": ("SERVICE", "APP_NAME")})
+        boot.mark_stage("PROPOSE_APP")
+        for values in changes:
+            error = boot.ProposalRejected("PROPOSAL_HTTP_REJECTED", 422, ("APP_NAME",))
+            error.__dict__.update(values)
+            with self.subTest(attributes=tuple(values)):
+                report = boot.failure_report(error)
+                self.assertEqual(report, {"schema_version": 1, "outcome": "ERROR", "stage": "PROPOSE_APP",
+                                          "code": "BOOTSTRAP_CHECK_FAILED"})
+                self.assertNotIn("PRIVATE", common.canonical_payload_bytes(report).decode())
+        class Forged(boot.ProposalRejected):
+            pass
+        self.assertNotIn("proposal", boot.failure_report(Forged("PROPOSAL_HTTP_REJECTED", 422, ("APP_NAME",))))
 
 
 class PublisherBoundaryTests(unittest.TestCase):
