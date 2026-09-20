@@ -151,6 +151,16 @@ PROPOSAL_FIELDS = {
     "CRM_CANARY_DRIVER_VERSION_SHA256": "ENV_DRIVER_VERSION",
 }
 PROPOSAL_FIELD_CODES = frozenset(PROPOSAL_FIELDS.values())
+CREATE_URL = common.API_ORIGIN + "/v2/apps"
+MAX_CREATE_ERROR_BYTES = 256 * 1024
+CREATE_CODES = frozenset({
+    "CREATE_REQUEST_REJECTED", "CREATE_HTTP_REJECTED", "CREATE_REDIRECT_REJECTED",
+    "CREATE_TRANSPORT_AMBIGUOUS", "CREATE_RESPONSE_BOUND_AMBIGUOUS",
+    "CREATE_RESPONSE_SHAPE_AMBIGUOUS", "CREATE_RESPONSE_IDENTITY_AMBIGUOUS",
+})
+# The same reviewed literal mentions, never an interpretation of the cause.
+CREATE_FIELDS = dict(PROPOSAL_FIELDS)
+CREATE_FIELD_CODES = frozenset(CREATE_FIELDS.values())
 
 
 def require(ok: bool, message: str) -> None:
@@ -183,8 +193,25 @@ class ProposalRejected(common.ReleaseError):
         self.code, self.http_status, self.field_mentions = code, http_status, field_mentions
 
 
+class CreateRejected(common.ReleaseError):
+    def __init__(self, code: str, http_status: int | None = None, field_mentions: tuple[str, ...] = ()):
+        super().__init__("app creation did not complete cleanly; read-only reconciliation required")
+        self.code, self.http_status, self.field_mentions = code, http_status, field_mentions
+
+
 def failure_report(error: Exception) -> dict[str, Any]:
     """Only reviewed constants escape; never format upstream/private objects."""
+    if type(error) is CreateRejected:
+        code = getattr(error, "code", None)
+        status = getattr(error, "http_status", None)
+        fields = getattr(error, "field_mentions", None)
+        if (type(code) is str and code in CREATE_CODES
+                and (status is None or type(status) is int and 100 <= status <= 599)
+                and type(fields) is tuple and len(fields) <= len(CREATE_FIELD_CODES)
+                and all(type(v) is str and v in CREATE_FIELD_CODES for v in fields)
+                and fields == tuple(sorted(set(fields)))):
+            return {"schema_version": 1, "outcome": "ERROR", "stage": "CREATE_APP", "code": code,
+                    "create": {"http_status": status, "field_mentions": list(fields)}}
     if type(error) is ProposalRejected:
         # Revalidate even our exception: injected/modified attributes must not
         # become a side channel around the closed diagnostic vocabulary.
@@ -846,9 +873,28 @@ class ReadOnlyProvider:
         return apps, rules
 
 
+class _CreateNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: Any, headers: Any, newurl: Any) -> None:
+        # urllib turns this into HTTPError; create then closes it without reading
+        # its body. Never construct a redirected request containing the token.
+        return None
+
+
+def _create_opener() -> Any:
+    require(not any(name in os.environ for name in ("SSLKEYLOGFILE", "SSL_CERT_FILE", "SSL_CERT_DIR")),
+            "create TLS environment override prohibited")
+    context = ssl.create_default_context()
+    require(context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
+            and context.keylog_filename is None, "create TLS configuration differs")
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}),
+        _CreateNoRedirect(), urllib.request.HTTPSHandler(context=context))
+
+
 class Provider(ReadOnlyProvider):
     """Install-only adapter: one app POST; no DB write/user API or app update."""
     def __init__(self, plan: dict[str, Any], read_token: str, create_token: str):
+        # Reject TLS environment overrides before either opener initializes TLS.
+        self.create_opener = _create_opener()
         super().__init__(plan, read_token)
         self.__create_token = fixture._secret(create_token)
         require(read_token != self.__create_token, "provider credential roles are not separate")
@@ -857,17 +903,63 @@ class Provider(ReadOnlyProvider):
     def create(self, spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
         require(not self.created, "app creation was already attempted")
         self.created = True  # Burn before transport, including timeout/HTTP error.
-        raw = fixture._wire(self.opener, common.API_ORIGIN + "/v2/apps", method="POST",
-                            headers={"Authorization": "Bearer " + self.__create_token,
-                                     "Accept": "application/json", "Content-Type": "application/json"},
-                            body=common.canonical_payload_bytes({"spec": spec}), maximum=MAX_PUBLIC)
-        app = common.loads_strict(raw).get("app", {})
-        self.app_id = common.require_uuid(app.get("id"), "created driver app")
-        # Strict acceptance requirement: capture this create's associated
-        # deployment, never guess by selecting a later latest deployment.
-        self.deployment_id = common.require_uuid(app.get("pending_deployment", {}).get("id"), "created driver deployment")
-        require(app.get("owner_uuid") == self.plan["provider_account_uuid"], "created driver owner differs")
-        return self.app_id, self.deployment_id, app
+        try:
+            request = urllib.request.Request(CREATE_URL, method="POST",
+                headers={"Authorization": "Bearer " + self.__create_token,
+                         "Accept": "application/json", "Content-Type": "application/json"},
+                data=common.canonical_payload_bytes({"spec": spec}))
+        except Exception:
+            raise CreateRejected("CREATE_REQUEST_REJECTED") from None
+        status = None
+        try:
+            try:
+                response = self.create_opener.open(request, timeout=30)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                observed_status = response.getcode()
+                if type(observed_status) is not int or not 100 <= observed_status <= 599:
+                    raise CreateRejected("CREATE_RESPONSE_SHAPE_AMBIGUOUS")
+                status = observed_status
+                if response.geturl() != CREATE_URL or 300 <= status < 400:
+                    raise CreateRejected("CREATE_REDIRECT_REJECTED", status)
+                # Preserve the original success status/size acceptance. Only
+                # rejected-response diagnostics use the smaller in-memory bound.
+                accepted_status = status in (200, 201, 202, 204)
+                maximum = MAX_PUBLIC if accepted_status else MAX_CREATE_ERROR_BYTES
+                raw = response.read(maximum + 1)
+            if type(raw) is not bytes or len(raw) > maximum:
+                raise CreateRejected("CREATE_RESPONSE_BOUND_AMBIGUOUS", status)
+            try:
+                value = common.loads_strict(raw)
+            except Exception:
+                raise CreateRejected("CREATE_RESPONSE_SHAPE_AMBIGUOUS", status) from None
+            if not accepted_status:
+                message = value.get("message") if type(value) is dict else None
+                mentions = ()
+                if type(message) is str:
+                    mentions = tuple(sorted({code for literal, code in CREATE_FIELDS.items()
+                        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(literal) + r"(?![A-Za-z0-9_])", message)}))
+                raise CreateRejected("CREATE_HTTP_REJECTED", status, mentions)
+            if type(value) is not dict or type(value.get("app", {})) is not dict:
+                raise CreateRejected("CREATE_RESPONSE_SHAPE_AMBIGUOUS", status)
+            app = value.get("app", {})
+            try:
+                self.app_id = common.require_uuid(app.get("id"), "created driver app")
+                # Capture this create's associated deployment; never select a
+                # later latest deployment to recover an ambiguous response.
+                self.deployment_id = common.require_uuid(app.get("pending_deployment", {}).get("id"), "created driver deployment")
+                require(app.get("owner_uuid") == self.plan["provider_account_uuid"], "created driver owner differs")
+            except Exception:
+                raise CreateRejected("CREATE_RESPONSE_IDENTITY_AMBIGUOUS", status) from None
+            return self.app_id, self.deployment_id, app
+        except CreateRejected:
+            raise
+        except Exception:
+            # A known HTTP status survives a later read/close/transport error.
+            # Every attempted create is consumed; only later GET reconciliation
+            # is allowed, never a retry, secret installation, update or cleanup.
+            raise CreateRejected("CREATE_TRANSPORT_AMBIGUOUS", status) from None
 
 
 def spec_projection(actual: Any, expected: dict[str, Any]) -> dict[str, Any]:

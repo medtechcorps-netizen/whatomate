@@ -519,6 +519,25 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(create.call_count, 1)
         self.assertEqual(self.writer.installed, [])
 
+    def test_every_typed_create_failure_stops_without_reconciliation_or_later_mutation(self):
+        for code in boot.CREATE_CODES:
+            self.setUp()
+            failure = boot.CreateRejected(code, 422, ("APP_NAME",))
+            with (self.subTest(code=code),
+                  mock.patch.object(self.provider, "create", side_effect=failure) as create,
+                  mock.patch.object(boot, "observe_created") as observe,
+                  mock.patch.object(boot, "public_receipt") as receipt,
+                  self.assertRaises(boot.CreateRejected) as caught):
+                self.execute()
+            self.assertIs(caught.exception, failure)
+            create.assert_called_once()
+            self.assertEqual(self.provider.calls, ["preflight", "preflight"])
+            self.assertEqual(self.writer.calls, ["absent", "absent"])
+            self.assertEqual(self.writer.installed, [])
+            self.probe.assert_not_called()
+            observe.assert_not_called()
+            receipt.assert_not_called()
+
     def test_terminal_failed_deployment_is_not_redeployed(self):
         self.provider.phase = "ERROR"
         with self.assertRaisesRegex(common.ReleaseError, "progress safely"):
@@ -688,13 +707,14 @@ class BootstrapTests(unittest.TestCase):
 
     def test_real_provider_post_burns_before_uncertain_transport(self):
         provider = boot.Provider(self.d["plan"], "synthetic-read-token", "synthetic-create-token")
-        with mock.patch.object(boot.fixture, "_wire", side_effect=TimeoutError()) as wire:
-            with self.assertRaises(TimeoutError):
+        with mock.patch.object(provider.create_opener, "open", side_effect=TimeoutError()) as wire:
+            with self.assertRaises(boot.CreateRejected) as caught:
                 provider.create({})
             with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
                 provider.create({})
             self.assertEqual(wire.call_count, 1)
-            self.assertEqual(wire.call_args.kwargs["method"], "POST")
+            self.assertEqual(wire.call_args.args[0].get_method(), "POST")
+            self.assertEqual(boot.failure_report(caught.exception)["code"], "CREATE_TRANSPORT_AMBIGUOUS")
 
     def test_child_environment_excludes_private_credentials_and_debug(self):
         with mock.patch.dict(os.environ, {"GH_DEBUG": "api", "HTTP_PROXY": "bad", "GH_TOKEN": "not-inherited",
@@ -904,6 +924,38 @@ class BootstrapTests(unittest.TestCase):
             "proposal": {"http_status": 422, "field_mentions": ["ENV_KLINIK_LOGIN"]}})
         self.assertNotIn(sentinel, err.getvalue())
         for unused in (create, writer, mkdir, write_bytes, write_text):
+            unused.assert_not_called()
+
+    def test_cli_create_diagnostic_never_serializes_private_data_or_writes_receipt(self):
+        env = self.cli_env("install", private=True)
+        env.update(DO_DRIVER_BOOTSTRAP_CREATE_TOKEN="synthetic-create",
+                   GH_CANARY_ENVIRONMENT_WRITE_TOKEN="synthetic-write", RUNNER_TEMP=str(Path.cwd()))
+        sentinel = "RAW-CREATE-PASSWORD-TOKEN-REQUEST-ID-URL-DO-NOT-EMIT"
+        failure = boot.CreateRejected("CREATE_HTTP_REJECTED", 422, ("ENV_KLINIK_LOGIN",))
+        failure.args = (sentinel,)
+        failure.private_body = sentinel
+        with (mock.patch.dict(os.environ, env, clear=True),
+              mock.patch.object(boot, "GitHubRead"), mock.patch.object(boot, "current_guard"),
+              mock.patch.object(boot.fixture, "_pinned_gh", return_value=Path("mocked-pinned-gh")),
+              mock.patch.object(prerequisites, "GitHubEvidence"),
+              mock.patch.object(boot, "ReadOnlyProductTransport"),
+              mock.patch.object(boot, "Provider"), mock.patch.object(boot, "EnvironmentWriter"),
+              mock.patch.object(boot, "AppSpecProposer") as proposer,
+              mock.patch.object(boot, "install_once", side_effect=failure),
+              mock.patch.object(Path, "exists", return_value=False),
+              mock.patch.object(Path, "mkdir") as mkdir, mock.patch.object(Path, "write_bytes") as write_bytes,
+              mock.patch.object(Path, "write_text") as write_text,
+              mock.patch.object(boot.subprocess, "run") as child,
+              mock.patch("sys.stdout", new_callable=io.StringIO) as out,
+              mock.patch("sys.stderr", new_callable=io.StringIO) as err):
+            self.assertEqual(boot.main(["install", "--control-root", ".", "--output-dir",
+                str(Path.cwd() / "synthetic-unused-bootstrap-receipt")]), 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(common.loads_strict(err.getvalue()), {"schema_version": 1, "outcome": "ERROR",
+            "stage": "CREATE_APP", "code": "CREATE_HTTP_REJECTED",
+            "create": {"http_status": 422, "field_mentions": ["ENV_KLINIK_LOGIN"]}})
+        self.assertNotIn(sentinel, err.getvalue())
+        for unused in (proposer, mkdir, write_bytes, write_text, child):
             unused.assert_not_called()
 
     def test_cli_failure_never_serializes_private_exception_or_writes_artifacts(self):
@@ -1796,6 +1848,335 @@ class ProposalResponse(io.BytesIO):
     def read(self, size=-1):
         self.read_sizes.append(size)
         return super().read(size)
+
+
+class AppCreateDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        self.a, self.d, self.protected, _, _, self.driver = packets()
+        self.spec = boot.runtime_spec(self.a, self.d, self.protected, self.driver)
+        self.accepted = {"app": {"id": uid(14), "pending_deployment": {"id": uid(15)},
+            "owner_uuid": self.d["plan"]["provider_account_uuid"], "spec": copy.deepcopy(self.spec)}}
+        self.tls_context = mock.Mock(check_hostname=True, verify_mode=ssl.CERT_REQUIRED, keylog_filename=None)
+
+    def provider(self, response=None):
+        with (mock.patch.dict(os.environ, {}, clear=True),
+              mock.patch.object(boot.ssl, "create_default_context", return_value=self.tls_context)):
+            provider = boot.Provider(self.d["plan"], "SYNTHETIC-READ-TOKEN", "SYNTHETIC-CREATE-TOKEN")
+        provider.create_opener = mock.Mock()
+        if response is not None:
+            provider.create_opener.open.return_value = response
+        return provider
+
+    def response(self, raw, *, status=201, url=None):
+        return ProposalResponse(raw, status=status, url=boot.CREATE_URL if url is None else url)
+
+    def reject(self, response):
+        provider = self.provider(response)
+        with self.assertRaises(boot.CreateRejected) as caught:
+            provider.create(self.spec)
+        self.assertTrue(provider.created)
+        self.assertEqual(provider.create_opener.open.call_count, 1)
+        self.assertTrue(response.closed)
+        with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
+            provider.create(self.spec)
+        self.assertEqual(provider.create_opener.open.call_count, 1)
+        return boot.failure_report(caught.exception)
+
+    def test_exact_request_success_acceptance_and_create_only_transport(self):
+        for status in (200, 201, 202, 204):
+            response = self.response(common.canonical_payload_bytes(self.accepted), status=status)
+            provider = self.provider(response)
+            original = copy.deepcopy(self.spec)
+            def observed(request, *, timeout):
+                self.assertTrue(provider.created)
+                self.assertEqual(request.full_url, "https://api.digitalocean.com/v2/apps")
+                self.assertEqual(request.get_method(), "POST")
+                self.assertEqual(timeout, 30)
+                self.assertEqual(request.get_header("Authorization"), "Bearer SYNTHETIC-CREATE-TOKEN")
+                self.assertEqual(request.get_header("Content-type"), "application/json")
+                self.assertEqual(request.get_header("Accept"), "application/json")
+                self.assertEqual(request.data, common.canonical_payload_bytes({"spec": original}))
+                return response
+            provider.create_opener.open.side_effect = observed
+            with (self.subTest(status=status), mock.patch.object(boot.fixture, "_wire") as shared,
+                  mock.patch.object(boot.subprocess, "run") as child,
+                  mock.patch.object(Path, "write_bytes") as write,
+                  mock.patch("sys.stdout", new_callable=io.StringIO) as out,
+                  mock.patch("sys.stderr", new_callable=io.StringIO) as err):
+                self.assertEqual(provider.create(self.spec), (uid(14), uid(15), self.accepted["app"]))
+            self.assertEqual(self.spec, original)
+            self.assertEqual(response.read_sizes, [boot.MAX_PUBLIC + 1])
+            self.assertTrue(response.closed)
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(err.getvalue(), "")
+            for unused in (shared, child, write):
+                unused.assert_not_called()
+            with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
+                provider.create(self.spec)
+            self.assertEqual(provider.create_opener.open.call_count, 1)
+            self.assertEqual((provider.app_id, provider.deployment_id), (uid(14), uid(15)))
+            for capability in ("update", "delete", "install", "retry"):
+                self.assertFalse(hasattr(provider, capability))
+
+    def test_get_read_credential_and_success_extra_fields_remain_unchanged(self):
+        value = copy.deepcopy(self.accepted)
+        value["extra"] = "PRIVATE-ENVELOPE"
+        value["app"]["extra"] = "PRIVATE-APP"
+        provider = self.provider(self.response(common.canonical_payload_bytes(value)))
+        with mock.patch.object(boot.fixture, "_wire", return_value=b'{"account":{}}') as wire:
+            self.assertEqual(provider.get("/v2/account"), {"account": {}})
+        self.assertEqual(wire.call_args.kwargs["headers"]["Authorization"], "Bearer SYNTHETIC-READ-TOKEN")
+        self.assertNotIn("body", wire.call_args.kwargs)
+        self.assertEqual(wire.call_args.kwargs.get("method", "GET"), "GET")
+        self.assertEqual(provider.create(self.spec)[2], value["app"])
+
+    def test_serialization_failure_burns_before_transport_and_never_emits(self):
+        for spec in ({"nonfinite": float("nan")}, {"unserializable": object()}):
+            provider = self.provider()
+            with (self.subTest(field=next(iter(spec))), self.assertRaises(boot.CreateRejected) as caught):
+                provider.create(spec)
+            self.assertEqual(boot.failure_report(caught.exception), {"schema_version": 1, "outcome": "ERROR",
+                "stage": "CREATE_APP", "code": "CREATE_REQUEST_REJECTED",
+                "create": {"http_status": None, "field_mentions": []}})
+            self.assertTrue(provider.created)
+            with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
+                provider.create(self.spec)
+            provider.create_opener.open.assert_not_called()
+
+    def test_all_rejected_http_statuses_are_exact_and_never_retry(self):
+        raw = common.canonical_payload_bytes({"message": "PRIVATE spec.name health_check"})
+        for status in range(100, 600):
+            if status in (200, 201, 202, 204):
+                continue
+            with self.subTest(status=status):
+                report = self.reject(self.response(raw, status=status))
+                redirect = 300 <= status < 400
+                self.assertEqual(report, {"schema_version": 1, "outcome": "ERROR", "stage": "CREATE_APP",
+                    "code": "CREATE_REDIRECT_REJECTED" if redirect else "CREATE_HTTP_REJECTED",
+                    "create": {"http_status": status, "field_mentions": [] if redirect else ["APP_NAME", "HEALTH_CHECK"]}})
+                self.assertNotIn("PRIVATE", common.canonical_payload_bytes(report).decode())
+
+    def test_http_error_closes_stream_keeps_exact_status_and_only_literal_mentions(self):
+        sentinel = "RAW_PRIVATE_PASSWORD_TOKEN_REQUEST_ID_HEADER_DO_NOT_EMIT"
+        raw = common.canonical_payload_bytes({"message": sentinel + " spec.services[0].envs.CRM_CANARY_KLINIK_LOGIN_JSON spec.name spec.name",
+            "id": sentinel, "request_id": sentinel, "spec": self.spec})
+        stream = io.BytesIO(raw)
+        error = urllib.error.HTTPError(boot.CREATE_URL, 422, sentinel, {"X-Request-ID": sentinel}, stream)
+        provider = self.provider()
+        provider.create_opener.open.side_effect = error
+        with self.assertRaises(boot.CreateRejected) as caught:
+            provider.create(self.spec)
+        report = boot.failure_report(caught.exception)
+        self.assertEqual(report, {"schema_version": 1, "outcome": "ERROR", "stage": "CREATE_APP",
+            "code": "CREATE_HTTP_REJECTED", "create": {"http_status": 422,
+                "field_mentions": ["APP_NAME", "ENVIRONMENT", "ENV_KLINIK_LOGIN", "SERVICE"]}})
+        self.assertNotIn(sentinel, common.canonical_payload_bytes(report).decode())
+        self.assertNotIn(sentinel, str(caught.exception))
+        self.assertTrue(stream.closed)
+        with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
+            provider.create(self.spec)
+        self.assertEqual(provider.create_opener.open.call_count, 1)
+
+    def test_reviewed_field_vocabulary_is_identical_and_never_causal(self):
+        self.assertEqual(boot.CREATE_FIELDS, boot.PROPOSAL_FIELDS)
+        self.assertIsNot(boot.CREATE_FIELDS, boot.PROPOSAL_FIELDS)
+        self.assertEqual(boot.CREATE_FIELD_CODES, boot.PROPOSAL_FIELD_CODES)
+        for literal, expected in boot.CREATE_FIELDS.items():
+            with self.subTest(field=literal):
+                raw = common.canonical_payload_bytes({"message": literal + " PRIVATE " + literal})
+                self.assertEqual(self.reject(self.response(raw, status=422))["create"]["field_mentions"], [expected])
+                raw = common.canonical_payload_bytes({"message": "X" + literal + " " + literal + "_PRIVATE"})
+                self.assertEqual(self.reject(self.response(raw, status=422))["create"]["field_mentions"], [])
+        for message in ("PRIVATE_UNKNOWN_FIELD=value", "SPEC.NAME", ["spec.name"], {"spec.name": "PRIVATE"}, None):
+            with self.subTest(kind=type(message).__name__):
+                raw = common.canonical_payload_bytes({"message": message})
+                report = self.reject(self.response(raw, status=400))
+                self.assertEqual(report["create"]["field_mentions"], [])
+                self.assertEqual(report["code"], "CREATE_HTTP_REJECTED")
+
+    def test_decode_failures_keep_status_and_empty_mentions(self):
+        for status in (201, 400, 403, 422, 500):
+            for raw in (b"<html>PRIVATE</html>", b'{"message":"spec.name","message":"PRIVATE"}',
+                        b'{"message":NaN}', b"\xff", b""):
+                with self.subTest(status=status, raw_size=len(raw)):
+                    report = self.reject(self.response(raw, status=status))
+                    self.assertEqual(report["code"], "CREATE_RESPONSE_SHAPE_AMBIGUOUS")
+                    self.assertEqual(report["create"], {"http_status": status, "field_mentions": []})
+
+    def test_response_bounds_and_nonbytes_keep_status(self):
+        with mock.patch.object(boot, "MAX_PUBLIC", 64), mock.patch.object(boot, "MAX_CREATE_ERROR_BYTES", 32):
+            for status, maximum in ((201, 64), (422, 32)):
+                response = self.response(b"x" * (maximum + 1), status=status)
+                report = self.reject(response)
+                self.assertEqual(report["code"], "CREATE_RESPONSE_BOUND_AMBIGUOUS")
+                self.assertEqual(report["create"], {"http_status": status, "field_mentions": []})
+                self.assertEqual(response.read_sizes, [maximum + 1])
+        response = self.response(b"", status=422)
+        response.read = mock.Mock(return_value="PRIVATE-NONBYTES")
+        report = self.reject(response)
+        self.assertEqual(report["code"], "CREATE_RESPONSE_BOUND_AMBIGUOUS")
+        self.assertEqual(report["create"]["http_status"], 422)
+
+    def test_success_envelope_and_identity_failures_keep_success_status(self):
+        for value in (None, [], "PRIVATE", {"app": None}, {"app": []}):
+            with self.subTest(kind=type(value).__name__):
+                report = self.reject(self.response(common.canonical_payload_bytes(value)))
+                self.assertEqual(report["code"], "CREATE_RESPONSE_SHAPE_AMBIGUOUS")
+                self.assertEqual(report["create"]["http_status"], 201)
+        changes = (lambda v: v.clear(), lambda v: v["app"].pop("id"),
+            lambda v: v["app"].update(id="PRIVATE"), lambda v: v["app"].pop("pending_deployment"),
+            lambda v: v["app"].update(pending_deployment=None),
+            lambda v: v["app"].update(pending_deployment={"id": "PRIVATE"}),
+            lambda v: v["app"].update(owner_uuid=uid(99)))
+        for change in changes:
+            value = copy.deepcopy(self.accepted)
+            change(value)
+            report = self.reject(self.response(common.canonical_payload_bytes(value)))
+            self.assertEqual(report["code"], "CREATE_RESPONSE_IDENTITY_AMBIGUOUS")
+            self.assertEqual(report["create"], {"http_status": 201, "field_mentions": []})
+
+    def test_ambiguous_transport_never_retries_or_exposes_exception(self):
+        for error in (TimeoutError("PRIVATE-TIMEOUT"), OSError("PRIVATE-SOCKET"),
+                      ssl.SSLError("PRIVATE-TLS"), RuntimeError("PRIVATE-TRANSPORT")):
+            provider = self.provider()
+            provider.create_opener.open.side_effect = error
+            with self.subTest(kind=type(error).__name__), self.assertRaises(boot.CreateRejected) as caught:
+                provider.create(self.spec)
+            self.assertEqual(boot.failure_report(caught.exception), {"schema_version": 1, "outcome": "ERROR",
+                "stage": "CREATE_APP", "code": "CREATE_TRANSPORT_AMBIGUOUS",
+                "create": {"http_status": None, "field_mentions": []}})
+            self.assertTrue(provider.created)
+            with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
+                provider.create(self.spec)
+            self.assertEqual(provider.create_opener.open.call_count, 1)
+
+    def test_read_url_and_close_failures_preserve_observed_status(self):
+        class CloseFailure(ProposalResponse):
+            def __exit__(self, *args):
+                self.close()
+                raise OSError("PRIVATE-CLOSE")
+        for status in (201, 403, 422, 500):
+            for boundary in ("read", "url", "close"):
+                response = (CloseFailure(b"{}", status=status, url=boot.CREATE_URL) if boundary == "close"
+                            else self.response(b"{}", status=status))
+                if boundary in ("read", "url"):
+                    setattr(response, "read" if boundary == "read" else "geturl", mock.Mock(side_effect=TimeoutError("PRIVATE")))
+                with self.subTest(status=status, boundary=boundary):
+                    report = self.reject(response)
+                    self.assertEqual(report["code"], "CREATE_TRANSPORT_AMBIGUOUS")
+                    self.assertEqual(report["create"], {"http_status": status, "field_mentions": []})
+
+    def test_redirects_do_not_follow_or_read_body(self):
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                self.assertIsNone(boot._CreateNoRedirect().redirect_request(None, None, status, "PRIVATE", {}, "https://other.invalid"))
+                stream = io.BytesIO(b"PRIVATE-REDIRECT")
+                provider = self.provider()
+                provider.create_opener.open.side_effect = urllib.error.HTTPError(boot.CREATE_URL, status, "PRIVATE", {}, stream)
+                with self.assertRaises(boot.CreateRejected) as caught:
+                    provider.create(self.spec)
+                self.assertEqual(boot.failure_report(caught.exception)["code"], "CREATE_REDIRECT_REJECTED")
+                self.assertTrue(stream.closed)
+                self.assertEqual(provider.create_opener.open.call_count, 1)
+        for status, url in ((302, boot.CREATE_URL), (201, "https://other.invalid/apps"),
+                            (201, boot.CREATE_URL + "?unexpected=1")):
+            response = self.response(b"PRIVATE-REDIRECT", status=status, url=url)
+            report = self.reject(response)
+            self.assertEqual(report["code"], "CREATE_REDIRECT_REJECTED")
+            self.assertEqual(report["create"]["http_status"], status)
+            self.assertEqual(response.read_sizes, [])
+
+    def test_real_urllib_redirect_chain_issues_one_request_and_does_not_read_body(self):
+        for status in (301, 302, 303, 307, 308):
+            response = self.response(b"PRIVATE-REDIRECT", status=status)
+            response.code, response.msg = status, "PRIVATE-REASON"
+            response.info = lambda: {"location": "https://other.invalid/PRIVATE-LOCATION"}
+            class SyntheticHTTPS(urllib.request.HTTPSHandler):
+                def __init__(self):
+                    self.requests = []
+
+                def https_open(self, request):
+                    self.requests.append(request)
+                    return response
+            handler = SyntheticHTTPS()
+            provider = self.provider()
+            provider.create_opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), boot._CreateNoRedirect(), handler)
+            with (self.subTest(status=status), self.assertRaises(boot.CreateRejected) as caught):
+                provider.create(self.spec)
+            report = boot.failure_report(caught.exception)
+            self.assertEqual(report["code"], "CREATE_REDIRECT_REJECTED")
+            self.assertEqual(report["create"], {"http_status": status, "field_mentions": []})
+            self.assertEqual(len(handler.requests), 1)
+            self.assertEqual(handler.requests[0].full_url, boot.CREATE_URL)
+            self.assertEqual(handler.requests[0].get_method(), "POST")
+            self.assertEqual(response.read_sizes, [])
+            self.assertTrue(response.closed)
+            with self.assertRaisesRegex(common.ReleaseError, "already attempted"):
+                provider.create(self.spec)
+            self.assertEqual(len(handler.requests), 1)
+
+    def test_invalid_status_type_or_range_is_not_serialized(self):
+        for status in (True, "201", None, 99, 600, 201.0):
+            response = self.response(b"PRIVATE", status=status)
+            report = self.reject(response)
+            self.assertEqual(report["code"], "CREATE_RESPONSE_SHAPE_AMBIGUOUS")
+            self.assertEqual(report["create"], {"http_status": None, "field_mentions": []})
+            self.assertEqual(response.read_sizes, [])
+
+    def test_tls_overrides_rejected_before_either_opener_and_proxy_ignored(self):
+        for name in ("SSLKEYLOGFILE", "SSL_CERT_FILE", "SSL_CERT_DIR"):
+            with (self.subTest(name=name), mock.patch.dict(os.environ, {name: "PRIVATE"}, clear=True),
+                  mock.patch.object(boot.ssl, "create_default_context") as context,
+                  mock.patch.object(boot.fixture, "_opener") as read_opener,
+                  self.assertRaises(common.ReleaseError)):
+                boot.Provider(self.d["plan"], "read-token", "create-token")
+            context.assert_not_called()
+            read_opener.assert_not_called()
+        for attributes in ({"check_hostname": False}, {"verify_mode": ssl.CERT_NONE}, {"keylog_filename": "PRIVATE"}):
+            context = mock.Mock(check_hostname=True, verify_mode=ssl.CERT_REQUIRED, keylog_filename=None)
+            for name, value in attributes.items():
+                setattr(context, name, value)
+            with (mock.patch.dict(os.environ, {}, clear=True),
+                  mock.patch.object(boot.ssl, "create_default_context", return_value=context),
+                  mock.patch.object(boot.urllib.request, "build_opener") as build,
+                  mock.patch.object(boot.fixture, "_opener") as read_opener,
+                  self.assertRaises(common.ReleaseError)):
+                boot.Provider(self.d["plan"], "read-token", "create-token")
+            build.assert_not_called()
+            read_opener.assert_not_called()
+        with (mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://private.invalid"}, clear=True),
+              mock.patch.object(boot.ssl, "create_default_context", return_value=self.tls_context) as context,
+              mock.patch.object(boot.urllib.request, "build_opener") as build):
+            boot._create_opener()
+        context.assert_called_once_with()
+        handlers = build.call_args.args
+        self.assertEqual(next(h.proxies for h in handlers if isinstance(h, urllib.request.ProxyHandler)), {})
+        self.assertTrue(any(isinstance(h, boot._CreateNoRedirect) for h in handlers))
+        self.assertIs(next(h._context for h in handlers if isinstance(h, urllib.request.HTTPSHandler)), self.tls_context)
+        with self.assertRaisesRegex(common.ReleaseError, "roles are not separate"):
+            boot.Provider(self.d["plan"], "SYNTHETIC-SAME-TOKEN", "SYNTHETIC-SAME-TOKEN")
+
+    def test_closed_report_codes_and_forged_attributes_cannot_escape(self):
+        for code in boot.CREATE_CODES:
+            self.assertEqual(boot.failure_report(boot.CreateRejected(code, 422, ("APP_NAME",))),
+                {"schema_version": 1, "outcome": "ERROR", "stage": "CREATE_APP", "code": code,
+                 "create": {"http_status": 422, "field_mentions": ["APP_NAME"]}})
+        changes = ({"code": "PRIVATE"}, {"code": []}, {"http_status": True}, {"http_status": "PRIVATE"},
+                   {"http_status": 600}, {"http_status": 99}, {"field_mentions": ["APP_NAME"]},
+                   {"field_mentions": ("PRIVATE",)}, {"field_mentions": ("APP_NAME", "APP_NAME")},
+                   {"field_mentions": ("SERVICE", "APP_NAME")})
+        boot.mark_stage("CREATE_APP")
+        for values in changes:
+            error = boot.CreateRejected("CREATE_HTTP_REJECTED", 422, ("APP_NAME",))
+            error.__dict__.update(values)
+            with self.subTest(attributes=tuple(values)):
+                self.assertEqual(boot.failure_report(error), {"schema_version": 1, "outcome": "ERROR",
+                    "stage": "CREATE_APP", "code": "BOOTSTRAP_CHECK_FAILED"})
+        class Forged(boot.CreateRejected):
+            def __str__(self):
+                raise RuntimeError("PRIVATE-EXCEPTION")
+        self.assertNotIn("create", boot.failure_report(Forged("CREATE_HTTP_REJECTED", 422, ("APP_NAME",))))
 
 
 class AppSpecProposalTests(unittest.TestCase):
