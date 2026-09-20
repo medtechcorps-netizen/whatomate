@@ -948,10 +948,14 @@ class LedgerMetadataProjectionTests(unittest.TestCase):
 
     def test_fixed_projection_diagnostics_never_emit_rejected_fields_or_raw_uri(self):
         expected_codes = {'LEDGER_CONNECTION_SHAPE_REJECTED', 'LEDGER_CONNECTION_CREDENTIALS_REJECTED',
-                          'LEDGER_URI_USERINFO_REJECTED', 'LEDGER_URI_NONCANONICAL_REJECTED'}
+                          'LEDGER_URI_USERINFO_REJECTED', 'LEDGER_URI_NONCANONICAL_REJECTED',
+                          'LEDGER_RESPONSE_TYPE_REJECTED', 'LEDGER_DATABASE_TYPE_REJECTED', 'LEDGER_CLUSTER_ID_REJECTED',
+                          'LEDGER_CONNECTION_TYPE_REJECTED', 'LEDGER_CONNECTION_FIELDS_REJECTED',
+                          'LEDGER_URI_TYPE_REJECTED', 'LEDGER_URI_LENGTH_REJECTED', 'LEDGER_HOST_REJECTED',
+                          'LEDGER_PORT_REJECTED', 'LEDGER_DATABASE_LABEL_REJECTED', 'LEDGER_SSL_FLAG_REJECTED'}
         self.assertEqual(set(boot.LEDGER_METADATA_CODES), expected_codes)
         cases = (
-            (self.payload(extra=''), 'LEDGER_CONNECTION_SHAPE_REJECTED'),
+            (self.payload(extra=''), 'LEDGER_CONNECTION_FIELDS_REJECTED'),
             (self.payload(user='RAW_SENTINEL'), 'LEDGER_CONNECTION_CREDENTIALS_REJECTED'),
             (self.payload(uri='postgres://RAW_SENTINEL@' + self.HOST + ':25060/defaultdb?sslmode=require'),
              'LEDGER_URI_USERINFO_REJECTED'),
@@ -972,6 +976,150 @@ class LedgerMetadataProjectionTests(unittest.TestCase):
         forged = boot.LedgerMetadataRejected('LEDGER_CONNECTION_SHAPE_REJECTED')
         forged.code = 'RAW_SENTINEL'
         self.assertEqual(boot.failure_report(forged)['code'], 'BOOTSTRAP_CHECK_FAILED')
+
+    def assert_projection_code(self, value, code):
+        before = copy.deepcopy(value)
+        boot.mark_stage('PROVIDER_LEDGER_METADATA')
+        with (mock.patch('sys.stdout', new_callable=io.StringIO) as out,
+              mock.patch('sys.stderr', new_callable=io.StringIO) as err,
+              self.assertRaises(common.ReleaseError) as rejected):
+            self.project(value)
+        report = boot.failure_report(rejected.exception)
+        self.assertEqual(report, {'schema_version': 1, 'outcome': 'ERROR',
+                                 'stage': 'PROVIDER_LEDGER_METADATA', 'code': code})
+        self.assertEqual(value, before)
+        self.assertEqual(out.getvalue() + err.getvalue(), '')
+        public = common.canonical_payload_bytes(report).decode()
+        for received in ('RAW_FIELD_NAME', 'RAW_SENTINEL', self.HOST, 'postgres://',
+                         self.plan['ledger']['cluster_id']):
+            self.assertNotIn(received, public)
+            self.assertNotIn(received, str(rejected.exception))
+
+    def test_precise_response_database_and_cluster_identity_codes(self):
+        for response in (None, [], '', 'RAW_SENTINEL', False, 1, 1.5):
+            with self.subTest(response=response):
+                self.assert_projection_code(response, 'LEDGER_RESPONSE_TYPE_REJECTED')
+        self.assert_projection_code({}, 'LEDGER_DATABASE_TYPE_REJECTED')
+        for database in (None, [], '', 'RAW_SENTINEL', False, 1, 1.5):
+            with self.subTest(database=database):
+                self.assert_projection_code({'database': database}, 'LEDGER_DATABASE_TYPE_REJECTED')
+        self.assert_projection_code({'database': {}}, 'LEDGER_CLUSTER_ID_REJECTED')
+        for cluster in (None, '', 'RAW_SENTINEL', uid(99), False, 1, 1.5, [], {}):
+            value = self.payload()
+            value['database']['id'] = cluster
+            with self.subTest(cluster=cluster):
+                self.assert_projection_code(value, 'LEDGER_CLUSTER_ID_REJECTED')
+
+    def test_precise_connection_field_codes_in_all_four_documented_locations(self):
+        missing = object()
+        fields = (
+            ('host', (missing, None, False, 1, 1.5, [], {}, '', 'RAW_SENTINEL',
+                      'UPPER.db.ondigitalocean.com', 'a' * 254), 'LEDGER_HOST_REJECTED'),
+            ('port', (missing, None, False, True, '25060', 1.0, [], {}, -1, 0, 65536), 'LEDGER_PORT_REJECTED'),
+            ('database', (missing, None, False, 1, 1.5, [], {}, '', 'a', '1db', 'db-name', 'déb', 'a' * 64),
+             'LEDGER_DATABASE_LABEL_REJECTED'),
+            ('ssl', (missing, None, False, 1, 1.0, 'true', [], {}), 'LEDGER_SSL_FLAG_REJECTED'),
+        )
+        for name in self.CONNECTIONS:
+            for malformed in ('', 'RAW_SENTINEL', [], False, 1, 1.5):
+                value = copy.deepcopy(self.base)
+                value['database'][name] = malformed
+                with self.subTest(name=name, connection=malformed):
+                    self.assert_projection_code(value, 'LEDGER_CONNECTION_TYPE_REJECTED')
+            self.assert_projection_code(self.payload(name, RAW_FIELD_NAME='RAW_SENTINEL'),
+                                        'LEDGER_CONNECTION_FIELDS_REJECTED')
+            self.assert_projection_code(self.payload(name, user='RAW_SENTINEL'),
+                                        'LEDGER_CONNECTION_CREDENTIALS_REJECTED')
+            for field, rejected_values, code in fields:
+                for rejected in rejected_values:
+                    value = self.payload(name)
+                    if rejected is missing:
+                        value['database'][name].pop(field)
+                    else:
+                        value['database'][name][field] = rejected
+                    with self.subTest(name=name, field=field, value='missing' if rejected is missing else rejected):
+                        self.assert_projection_code(value, code)
+
+    def test_nonstring_uri_still_rejected_by_earlier_recursive_credential_guard(self):
+        # The defensive URI_TYPE code is not reached for malformed JSON values:
+        # their nonempty uri slot remains visible to the unchanged earlier guard.
+        for name in self.CONNECTIONS:
+            for uri in (False, True, 0, 1, 1.5, [], {}, ['RAW_SENTINEL'], {'RAW_FIELD_NAME': 'RAW_SENTINEL'}):
+                with self.subTest(name=name, uri=uri):
+                    self.assert_projection_code(self.payload(name, uri=uri), 'LEDGER_URI_RESPONSE_REJECTED')
+            self.assert_projection_code(self.payload(name, uri='x' * 1025), 'LEDGER_URI_LENGTH_REJECTED')
+            self.assert_projection_code(self.payload(name, uri='x' * 1024), 'LEDGER_URI_NONCANONICAL_REJECTED')
+            self.assert_projection_code(self.payload(name, uri='x'), 'LEDGER_URI_NONCANONICAL_REJECTED')
+
+    def test_valid_port_host_and_database_boundaries_remain_accepted(self):
+        suffix = '.db.ondigitalocean.com'
+        prefix = '.'.join(['a' * 63] * 3)
+        host_253 = prefix + '.' + 'b' * (253 - len(prefix) - 1 - len(suffix)) + suffix
+        self.assertEqual(len(host_253), 253)
+        for name in self.CONNECTIONS:
+            for port in (1, 65535):
+                for database in ('ab', 'a' * 63):
+                    value = self.payload(name, host=host_253, port=port, database=database,
+                        uri=f'postgres://{host_253}:{port}/{database}?sslmode=require')
+                    with self.subTest(name=name, port=port, database_length=len(database)):
+                        self.assertEqual(self.project(value), self.base)
+
+    def test_missing_empty_null_uri_bypass_keeps_original_sibling_acceptance(self):
+        for name in self.CONNECTIONS:
+            for absent in ('missing', None, ''):
+                value = self.payload(name, uri=absent, host=['RAW_SENTINEL'], port=False,
+                                     database={'RAW_FIELD_NAME': 'RAW_SENTINEL'}, ssl=False)
+                if absent == 'missing':
+                    value['database'][name].pop('uri')
+                before = copy.deepcopy(value)
+                with self.subTest(name=name, uri=absent):
+                    self.assertEqual(self.project(value), self.base)
+                    self.assertEqual(value, before)
+                value['database'][name]['password'] = 'RAW_SENTINEL'
+                self.assert_projection_code(value, 'LEDGER_CREDENTIAL_RESPONSE_REJECTED')
+
+    def test_precise_diagnostic_order_and_full_payload_credential_precedence(self):
+        pairs = (
+            ({'RAW_FIELD_NAME': '', 'user': 'RAW_SENTINEL'}, 'LEDGER_CONNECTION_FIELDS_REJECTED'),
+            ({'user': 'RAW_SENTINEL', 'host': None}, 'LEDGER_CONNECTION_CREDENTIALS_REJECTED'),
+            ({'uri': 'x' * 1025, 'host': None}, 'LEDGER_URI_LENGTH_REJECTED'),
+            ({'host': None, 'port': False}, 'LEDGER_HOST_REJECTED'),
+            ({'port': False, 'database': None}, 'LEDGER_PORT_REJECTED'),
+            ({'database': None, 'ssl': False}, 'LEDGER_DATABASE_LABEL_REJECTED'),
+            ({'ssl': False, 'uri': 'postgres://RAW_SENTINEL@' + self.HOST + ':25060/defaultdb?sslmode=require'},
+             'LEDGER_SSL_FLAG_REJECTED'),
+        )
+        for name in self.CONNECTIONS:
+            for changes, code in pairs:
+                value = self.payload(name, **changes)
+                with self.subTest(name=name, first=code):
+                    self.assert_projection_code(value, code)
+                    value['late_response_metadata'] = {'access_token': 'RAW_SENTINEL'}
+                    self.assert_projection_code(value, 'LEDGER_CREDENTIAL_RESPONSE_REJECTED')
+        self.assert_projection_code({'database': None, 'late': {'password': 'RAW_SENTINEL'}},
+                                    'LEDGER_DATABASE_TYPE_REJECTED')
+        value = self.payload()
+        value['database']['id'] = uid(99)
+        value['late'] = {'password': 'RAW_SENTINEL'}
+        self.assert_projection_code(value, 'LEDGER_CLUSTER_ID_REJECTED')
+        value = self.payload('connection', host=None)
+        value['database']['standby_private_connection'] = self.connection(user='RAW_SENTINEL')
+        self.assert_projection_code(value, 'LEDGER_HOST_REJECTED')
+        value['database']['standby_private_connection']['password'] = 'RAW_SENTINEL'
+        self.assert_projection_code(value, 'LEDGER_CREDENTIAL_RESPONSE_REJECTED')
+
+    def test_all_fixed_diagnostic_codes_keep_four_key_schema_and_reject_forgery(self):
+        boot.mark_stage('PROVIDER_LEDGER_METADATA')
+        for code in boot.LEDGER_METADATA_CODES:
+            error = boot.LedgerMetadataRejected(code)
+            report = boot.failure_report(error)
+            self.assertEqual(report, {'schema_version': 1, 'outcome': 'ERROR',
+                                     'stage': 'PROVIDER_LEDGER_METADATA', 'code': code})
+            error.code = 'RAW_SENTINEL'
+            self.assertEqual(boot.failure_report(error)['code'], 'BOOTSTRAP_CHECK_FAILED')
+        for forged in ('RAW_SENTINEL', '', None, 1):
+            with self.subTest(forged=forged), self.assertRaises(common.ReleaseError):
+                boot.LedgerMetadataRejected(forged)
 
     def test_sibling_host_port_database_ssl_and_required_field_drift_rejected(self):
         changes = (
