@@ -31,6 +31,15 @@ jobs:
       - name: Produce the production control suites
         run: |
           set -euo pipefail
+          # The runtime suites assert the workflow's pinned jq, so the probe
+          # must install that exact binary instead of the runner's distro jq.
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64 -o "$RUNNER_TEMP/jq"
+          echo "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f  $RUNNER_TEMP/jq" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/jq"
+          "$RUNNER_TEMP/jq" --version
+          export RELEASE_TEST_JQ="$RUNNER_TEMP/jq"
+          export RELEASE_TEST_BASH="/usr/bin/bash"
           python3 -m py_compile \
             release/deployment/verify_production_plan.py \
             release/deployment/test_verify_production_plan.py
