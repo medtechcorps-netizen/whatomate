@@ -457,7 +457,9 @@ class BootstrapTests(unittest.TestCase):
             lambda d: d["plan"]["ledger"].update(user="doadmin"),
             lambda d: d["plan"]["ledger"].update(dedicated_synthetic_ledger=False),
             lambda d: d["scope_review"]["read"].append("database:view_credentials"),
+            lambda d: d["scope_review"]["create"].remove("database:view_credentials"),
             lambda d: d["scope_review"]["create"].append("database:view_credentials"),
+            lambda d: d["scope_review"]["create"].append("app:update"),
             lambda d: d.update(hmac_key_base64=base64.b64encode(b"x" * 31).decode()),
         )
         for variation in variations:
@@ -562,8 +564,19 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(self.writer.installed, [])
 
     def test_runtime_spec_has_only_five_secret_values_and_literal_managed_binding(self):
-        spec = boot.runtime_spec(self.a, self.d, self.protected, self.driver)
+        provider_tokens = {"DO_DRIVER_BOOTSTRAP_READ_TOKEN": "SYNTHETIC-READ-NOT-RUNTIME",
+                           "DO_DRIVER_BOOTSTRAP_CREATE_TOKEN": "SYNTHETIC-CREATE-NOT-RUNTIME"}
+        with mock.patch.dict(os.environ, provider_tokens):
+            spec = boot.runtime_spec(self.a, self.d, self.protected, self.driver)
         env = {item["key"]: item for item in spec["services"][0]["envs"]}
+        self.assertEqual(set(env), {"CRM_CANARY_HMAC_KEY_BASE64", "CRM_CANARY_FIXTURE_DESCRIPTOR_JSON",
+                                   "CRM_CANARY_KLINIK_LOGIN_JSON", "CRM_CANARY_NON_KLINIK_LOGIN_JSON",
+                                   "CRM_CANARY_META_APP_SECRET", "CRM_CANARY_LEDGER_DATABASE_URL",
+                                   "CRM_CANARY_DRIVER_VERSION_SHA256"})
+        serialized = common.canonical_payload_bytes(spec).decode()
+        for name, value in provider_tokens.items():
+            self.assertNotIn(name, serialized)
+            self.assertNotIn(value, serialized)
         self.assertEqual(sum(item["type"] == "SECRET" for item in env.values()), 5)
         self.assertEqual(env["CRM_CANARY_LEDGER_DATABASE_URL"]["type"], "GENERAL")
         self.assertEqual(env["CRM_CANARY_LEDGER_DATABASE_URL"]["value"], boot.LEDGER_EXPRESSION)
@@ -590,10 +603,12 @@ class BootstrapTests(unittest.TestCase):
             with self.subTest(kind=kind, change=change), self.assertRaises(common.ReleaseError):
                 boot.spec_projection(observed, spec)
 
-    def test_reviewed_read_scope_dependencies_and_no_credential_view(self):
+    def test_reviewed_scopes_allow_credential_view_only_for_create(self):
         self.assertEqual(boot.SCOPE_REVIEW["read"], ["account:read", "actions:read", "app:read", "database:read", "regions:read", "sizes:read"])
         self.assertNotIn("database:view_credentials", boot.SCOPE_REVIEW["read"])
-        self.assertNotIn("database:view_credentials", boot.SCOPE_REVIEW["create"])
+        self.assertEqual(boot.SCOPE_REVIEW["create"], ["actions:read", "app:create", "app:read", "database:read",
+                                                    "database:update", "database:view_credentials", "regions:read", "sizes:read"])
+        boot.validate_descriptor(self.d, self.a)
 
     def test_health_rejects_private_dns_before_connect_and_redirect_response(self):
         origin = "https://rereply-canary-driver-test-abc.ondigitalocean.app"
@@ -697,13 +712,19 @@ class BootstrapTests(unittest.TestCase):
         boot.reject_database_credentials({"database": {"id": uid(12), "connection": {"password": None, "uri": ""}}})
 
     def test_provider_get_allowlist_denies_user_credentials_and_all_foreign_targets(self):
-        provider = boot.Provider(self.d["plan"], "synthetic-read-token", "synthetic-create-token")
-        with mock.patch.object(boot.fixture, "_wire") as wire:
-            for path in ("/v2/databases/" + uid(12) + "/users", "/v2/apps/" + uid(10),
-                         "/v2/databases/" + uid(99), "/v2/databases", "/v2/account?token=bad"):
-                with self.subTest(path=path), self.assertRaises(common.ReleaseError):
-                    provider.get(path)
-            wire.assert_not_called()
+        providers = (boot.ReadOnlyProvider(self.d["plan"], "synthetic-read-token"),
+                     boot.Provider(self.d["plan"], "synthetic-read-token", "synthetic-create-token"))
+        for provider in providers:
+            with (mock.patch.object(boot.fixture, "_wire") as wire,
+                  mock.patch.object(providers[1].create_opener, "open") as create):
+                for path in ("/v2/databases/" + uid(12) + "/users",
+                             "/v2/databases/" + uid(12) + "/users/crm_canary_driver",
+                             "/v2/databases/" + uid(12) + "/users/doadmin", "/v2/apps/" + uid(10),
+                             "/v2/databases/" + uid(99), "/v2/databases", "/v2/account?token=bad"):
+                    with self.subTest(provider=type(provider).__name__, path=path), self.assertRaises(common.ReleaseError):
+                        provider.get(path)
+                wire.assert_not_called()
+                create.assert_not_called()
 
     def test_real_provider_post_burns_before_uncertain_transport(self):
         provider = boot.Provider(self.d["plan"], "synthetic-read-token", "synthetic-create-token")
