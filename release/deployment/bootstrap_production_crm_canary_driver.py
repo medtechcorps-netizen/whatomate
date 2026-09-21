@@ -789,6 +789,34 @@ class AppSpecProposer:
             raise ProposalRejected("PROPOSAL_TRANSPORT_FAILED", status) from None
 
 
+def expected_app_owner_uuid(account: dict[str, Any], plan: dict[str, Any]) -> str:
+    """The UUID a created driver app must be owned by.
+
+    DigitalOcean sets a created app's `owner_uuid` to the account's *team* UUID,
+    while `/v2/account` reports the authenticated *user* UUID that the plan
+    pins. The ownership unit is therefore the team whenever the account response
+    carries one, and the pinned account UUID otherwise.
+    """
+    team = account.get("team")
+    if team is None:
+        return plan["provider_account_uuid"]
+    require(type(team) is dict, "provider team shape differs")
+    team_uuid = team.get("uuid")
+    if team_uuid is None:
+        return plan["provider_account_uuid"]
+    return common.require_uuid(team_uuid, "provider team")
+
+
+def planned_owner_uuid(provider: Any) -> str:
+    """The owner a created app must carry, once the account has been read.
+
+    `preflight` records the ownership unit; before it runs - as in the
+    create-only diagnostics - the pinned account UUID is the only known unit.
+    """
+    owner = getattr(provider, "owner_uuid", None)
+    return provider.plan["provider_account_uuid"] if owner is None else owner
+
+
 class ReadOnlyProvider:
     """Fixed GET allowlist only; no creation method or mutation credential."""
     def __init__(self, plan: dict[str, Any], read_token: str):
@@ -797,6 +825,7 @@ class ReadOnlyProvider:
         self.opener = fixture._opener()
         self.app_id: str | None = None
         self.deployment_id: str | None = None
+        self.owner_uuid: str | None = None
 
     def get(self, path: str) -> Any:
         ledger = self.plan["ledger"]
@@ -846,6 +875,7 @@ class ReadOnlyProvider:
         account = self.get("/v2/account").get("account", {})
         require(account.get("uuid") == p["provider_account_uuid"] and account.get("status") == "active",
                 "provider account differs")
+        self.owner_uuid = expected_app_owner_uuid(account, p)
         mark_stage("PROVIDER_SIZE")
         size = self.get("/v2/apps/tiers/instance_sizes/" + p["instance_size_slug"]).get("instance_size", {})
         require(size.get("slug") == p["instance_size_slug"] and size.get("usd_per_month") == p["monthly_usd"],
@@ -951,7 +981,7 @@ class Provider(ReadOnlyProvider):
                 # Capture this create's associated deployment; never select a
                 # later latest deployment to recover an ambiguous response.
                 self.deployment_id = common.require_uuid(app.get("pending_deployment", {}).get("id"), "created driver deployment")
-                require(app.get("owner_uuid") == self.plan["provider_account_uuid"], "created driver owner differs")
+                require(app.get("owner_uuid") == planned_owner_uuid(self), "created driver owner differs")
             except Exception:
                 raise CreateRejected("CREATE_RESPONSE_IDENTITY_AMBIGUOUS", status) from None
             return self.app_id, self.deployment_id, app
@@ -1149,7 +1179,8 @@ def observe_created(provider: Any, spec: dict[str, Any], initial_spec: dict[str,
     app_id, deployment_id = provider.app_id, provider.deployment_id
     app = provider.get("/v2/apps/" + app_id).get("app", {})
     dep = provider.get("/v2/apps/" + app_id + "/deployments/" + deployment_id).get("deployment", {})
-    require(app.get("id") == app_id and app.get("owner_uuid") == provider.plan["provider_account_uuid"]
+    require(app.get("id") == app_id
+            and app.get("owner_uuid") == planned_owner_uuid(provider)
             and dep.get("id") == deployment_id, "created driver identity changed")
     require(spec_projection(app.get("spec"), spec) == initial_spec, "created driver spec changed")
     phase = dep.get("phase")
