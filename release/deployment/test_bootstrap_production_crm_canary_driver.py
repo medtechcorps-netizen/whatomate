@@ -95,6 +95,9 @@ def provider_responses(plan):
 class FakeProvider:
     def __init__(self, plan):
         self.plan = plan
+        # Mirrors ReadOnlyProvider: without a team in the account response the
+        # ownership unit is the pinned account UUID itself.
+        self.owner_uuid = plan["provider_account_uuid"]
         self.app_id, self.deployment_id = uid(14), uid(15)
         self.calls = []
         self.created = False
@@ -1902,6 +1905,37 @@ class AppCreateDiagnosticsTests(unittest.TestCase):
             provider.create(self.spec)
         self.assertEqual(provider.create_opener.open.call_count, 1)
         return boot.failure_report(caught.exception)
+
+    def test_create_binds_the_team_owner_recorded_by_preflight(self):
+        """The created app is owned by the account's team, not by the user.
+
+        DigitalOcean sets owner_uuid to the team UUID while the plan pins the
+        authenticated account UUID, so comparing the two directly rejected a
+        create that had already succeeded.
+        """
+        account_uuid = self.d["plan"]["provider_account_uuid"]
+        team_uuid = uid(70)
+        self.assertNotEqual(team_uuid, account_uuid)
+
+        team_owned = copy.deepcopy(self.accepted)
+        team_owned["app"]["owner_uuid"] = team_uuid
+        account_owned = copy.deepcopy(self.accepted)
+        account_owned["app"]["owner_uuid"] = account_uuid
+
+        # With the ownership unit known, only the team owner is accepted.
+        provider = self.provider(self.response(common.canonical_payload_bytes(team_owned)))
+        provider.owner_uuid = team_uuid
+        self.assertEqual(provider.create(self.spec), (uid(14), uid(15), team_owned["app"]))
+
+        provider = self.provider(self.response(common.canonical_payload_bytes(account_owned)))
+        provider.owner_uuid = team_uuid
+        with self.assertRaises(boot.CreateRejected) as caught:
+            provider.create(self.spec)
+        self.assertEqual(caught.exception.code, "CREATE_RESPONSE_IDENTITY_AMBIGUOUS")
+
+        # Before preflight records a team, the pinned account UUID is the unit.
+        provider = self.provider(self.response(common.canonical_payload_bytes(account_owned)))
+        self.assertEqual(provider.create(self.spec), (uid(14), uid(15), account_owned["app"]))
 
     def test_exact_request_success_acceptance_and_create_only_transport(self):
         for status in (200, 201, 202, 204):
