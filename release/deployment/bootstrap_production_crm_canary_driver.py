@@ -76,8 +76,10 @@ DRIVER_EVIDENCE_KEYS = {"control_sha", "run_id", "artifact_id", "artifact_digest
                         "digest", "driver_version_sha256"}
 SCOPE_REVIEW = {
     "read": ["account:read", "actions:read", "app:read", "database:read", "regions:read", "sizes:read"],
+    # App creation resolves the existing db_user through this credential only.
+    # Never add credential-view to READ or use CREATE for database GET requests.
     "create": ["actions:read", "app:create", "app:read", "database:read",
-               "database:update", "regions:read", "sizes:read"],
+               "database:update", "database:view_credentials", "regions:read", "sizes:read"],
     "github": ["environments:write"],
     "github_read": ["actions:read", "administration:read", "attestations:read", "contents:read", "environments:read"],
     "ledger_user": "existing-dedicated-database-table-initialization-only",
