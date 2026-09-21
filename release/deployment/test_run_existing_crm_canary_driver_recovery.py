@@ -366,6 +366,65 @@ class CheckExecutionTests(RunnerFixtures):
             self.assertFalse(test["state"]["written"])
 
 
+class PrestateDiagnosticTests(RunnerFixtures):
+    def test_each_read_only_orchestration_boundary_has_fixed_code_and_no_effects(self):
+        for failure, expected in (("canary", "CANARY_ABSENCE"), ("first", "FIRST_SNAPSHOT"),
+                                  ("second", "SECOND_SNAPSHOT"), ("guard", "PRESTATE_GUARD")):
+            test = self.execution()
+            callbacks = test["callbacks"]
+            if failure == "canary":
+                callbacks["reader"].require_absent = mock.Mock(side_effect=RuntimeError(PRIVATE))
+            elif failure in ("first", "second"):
+                results = [RuntimeError(PRIVATE)] if failure == "first" else [copy.deepcopy(self.case["first"]), RuntimeError(PRIVATE)]
+                callbacks["provider"].snapshot = mock.Mock(side_effect=results)
+            else:
+                callbacks["current_guard"] = mock.Mock(side_effect=[None, RuntimeError(PRIVATE)])
+            with self.subTest(failure=failure), self.assertRaises(kernel.PrestateRejected) as caught:
+                self.run_execution(test)
+            report = runner.failure_report(caught.exception)
+            self.assertEqual(report, {"schema_version": 1, "state": "existing-driver-recovery-stopped",
+                "code": "RECOVERY_STOPPED_RECONCILE_ONLY", "stage": "PROVIDER_PRESTATE",
+                "retry_authorized": False, "diagnostic_code": expected})
+            self.assertEqual(test["state"]["update_count"], 0)
+            self.assertEqual(test["state"]["configs"], [])
+            self.assert_no_private_report(report)
+
+    def test_inner_prestate_diagnostic_is_not_erased_by_outer_snapshot_boundary(self):
+        test = self.execution()
+        test["callbacks"]["provider"].snapshot = mock.Mock(side_effect=kernel.PrestateRejected("ACCOUNT_READ"))
+        with self.assertRaises(kernel.PrestateRejected) as caught:
+            self.run_execution(test)
+        self.assertEqual(runner.failure_report(caught.exception)["diagnostic_code"], "ACCOUNT_READ")
+        self.assertEqual(test["state"]["update_count"], 0)
+
+    def test_public_diagnostic_ignores_hostile_subclasses_unknown_codes_and_other_stages(self):
+        class Hostile(kernel.PrestateRejected):
+            @property
+            def code(self):
+                raise AssertionError("private property read")
+            def __str__(self):
+                raise AssertionError("private exception formatted")
+        hostile = Hostile.__new__(Hostile)
+        Exception.__init__(hostile, PRIVATE)
+        with mock.patch.object(runner, "CURRENT_STAGE", "PROVIDER_PRESTATE"):
+            for error in (hostile, RuntimeError(PRIVATE)):
+                self.assertNotIn("diagnostic_code", runner.failure_report(error))
+            for value in (PRIVATE, None, True, object(), [PRIVATE], {PRIVATE: PRIVATE}):
+                error = kernel.PrestateRejected("ACCOUNT_READ")
+                error.code = value
+                report = runner.failure_report(error)
+                self.assertNotIn("diagnostic_code", report)
+                self.assert_no_private_report(report)
+            for code in kernel.PRESTATE_DIAGNOSTICS:
+                report = runner.failure_report(kernel.PrestateRejected(code))
+                self.assertEqual(report["diagnostic_code"], code)
+                self.assertFalse(report["retry_authorized"])
+                self.assert_no_private_report(report)
+        for stage in runner.STAGES - {"PROVIDER_PRESTATE"}:
+            with mock.patch.object(runner, "CURRENT_STAGE", stage):
+                self.assertNotIn("diagnostic_code", runner.failure_report(kernel.PrestateRejected("ACCOUNT_READ")))
+
+
 class RecoveryExecutionTests(RunnerFixtures):
     def test_last_prewrite_snapshot_drift_stops_before_consuming_put(self):
         test = self.execution("recover")
@@ -690,9 +749,9 @@ class ProviderBoundaryTests(RunnerFixtures):
                 runner.ProviderRead(Path("."), self.packet(), self.case["descriptor"], PRIVATE, None, None)
             opener.assert_not_called()
 
-    def test_read_snapshot_selects_exact_existing_app_two_failed_deployments_and_cost(self):
+    def snapshot_fixture(self):
         provider = self.provider()
-        descriptor, before = self.case["descriptor"], self.case["second"]
+        descriptor, before = self.case["descriptor"], copy.deepcopy(self.case["second"])
         metadata = {"synthetic": "fixed-environment-metadata"}
         provider.a["fixture_environment_sha256"] = common.sha256_value(metadata)
         routes = {
@@ -709,6 +768,11 @@ class ProviderBoundaryTests(RunnerFixtures):
         for row in before["deployments"]["deployments"]:
             routes["/v2/apps/" + self.app_id + "/deployments/" + row["id"]] = {"deployment": row}
         provider.reader.snapshot.return_value = before["canary_environment"]
+        return provider, routes, metadata
+
+    def test_read_snapshot_selects_exact_existing_app_two_failed_deployments_and_cost(self):
+        provider, routes, metadata = self.snapshot_fixture()
+        descriptor, before = self.case["descriptor"], self.case["second"]
         with (mock.patch.object(provider, "_get", side_effect=lambda path: copy.deepcopy(routes[path])),
               mock.patch.object(provider, "_production", return_value=before["production_state_sha256"]),
               mock.patch.object(runner, "fixture_metadata", return_value=metadata)):
@@ -723,6 +787,53 @@ class ProviderBoundaryTests(RunnerFixtures):
             size["instance_size"]["usd_per_month"] = "999"
             with self.assertRaises(common.ReleaseError):
                 provider.snapshot()
+
+    def test_snapshot_read_failures_emit_only_exact_closed_boundary_codes(self):
+        cases = [("/v2/apps/tiers/instance_sizes/" + self.case["descriptor"]["plan"]["instance_size_slug"], "SIZE_READ"),
+                 ("/v2/apps/regions", "REGIONS_READ"), ("/v2/apps?per_page=200&page=1", "APPS_READ"),
+                 ("/v2/apps/" + self.app_id + "/deployments?per_page=200&page=1", "DRIVER_HISTORY_READ"),
+                 ("/v2/apps/" + self.app_id, "DRIVER_APP_READ"),
+                 ("/v2/apps/" + self.app_id + "/deployments/" + self.deployment_id, "DRIVER_DEPLOYMENT_READ"),
+                 ("/v2/account", "ACCOUNT_READ"),
+                 ("/v2/databases/" + self.case["descriptor"]["plan"]["ledger"]["cluster_id"] + "/firewall", "FIREWALL_READ")]
+        for path, code in cases:
+            provider, routes, metadata = self.snapshot_fixture()
+            def get(selected):
+                if selected == path:
+                    raise RuntimeError(PRIVATE)
+                return copy.deepcopy(routes[selected])
+            with (self.subTest(code=code), mock.patch.object(provider, "_get", side_effect=get),
+                  mock.patch.object(provider, "_production", return_value=self.case["second"]["production_state_sha256"]),
+                  mock.patch.object(runner, "fixture_metadata", return_value=metadata),
+                  self.assertRaises(kernel.PrestateRejected) as caught):
+                provider.snapshot()
+            self.assertEqual(caught.exception.code, code)
+            with mock.patch.object(runner, "CURRENT_STAGE", "PROVIDER_PRESTATE"):
+                self.assert_no_private_report(runner.failure_report(caught.exception))
+
+    def test_snapshot_policy_failures_are_not_confused_with_transport_failures(self):
+        for mutation, code in (("size", "SIZE_POLICY"), ("region", "REGIONS_POLICY"),
+                               ("inventory", "APPS_INVENTORY"), ("selection", "APP_SELECTION"),
+                               ("idle", "APP_IDLE"), ("fixture", "FIXTURE_METADATA_BINDING")):
+            provider, routes, metadata = self.snapshot_fixture()
+            if mutation == "size":
+                routes["/v2/apps/tiers/instance_sizes/" + self.case["descriptor"]["plan"]["instance_size_slug"]]["instance_size"]["usd_per_month"] = PRIVATE
+            elif mutation == "region":
+                routes["/v2/apps/regions"]["regions"] = []
+            elif mutation == "inventory":
+                routes["/v2/apps?per_page=200&page=1"]["meta"]["total"] = 4
+            elif mutation == "selection":
+                provider.app_id = uid(40)
+            elif mutation == "idle":
+                routes["/v2/apps?per_page=200&page=1"]["apps"][0]["pending_deployment"] = {"id": uid(40)}
+            else:
+                provider.a["fixture_environment_sha256"] = "0" * 64
+            with (self.subTest(code=code), mock.patch.object(provider, "_get", side_effect=lambda path: copy.deepcopy(routes[path])),
+                  mock.patch.object(provider, "_production", return_value=self.case["second"]["production_state_sha256"]),
+                  mock.patch.object(runner, "fixture_metadata", return_value=metadata),
+                  self.assertRaises(kernel.PrestateRejected) as caught):
+                provider.snapshot()
+            self.assertEqual(caught.exception.code, code)
 
     def test_production_snapshot_requires_exact_active_state_and_complete_164_record_history(self):
         provider = self.provider()
@@ -779,7 +890,7 @@ class ProviderBoundaryTests(RunnerFixtures):
 class HostedGuardTests(RunnerFixtures):
     def guard_fixture(self, mode="recover", job=None):
         packet = self.packet(mode)
-        current_id, workflow_id = "87654", 92837
+        current_id, workflow_id = "87654", 363575080
         prefix = runner.fixture.API_PREFIX
         endpoint = prefix + "/actions/workflows/" + runner.WORKFLOW.rsplit("/", 1)[1]
         def run(identity, title, status, conclusion, created, updated):
@@ -832,11 +943,45 @@ class HostedGuardTests(RunnerFixtures):
             data[prefix + "/actions/runs?status=" + status] = {
                 "total_count": 1 if status == "in_progress" else 0,
                 "workflow_runs": [current] if status == "in_progress" else []}
+        quarantined = {
+            "id": 35643414394, "workflow_id": workflow_id,
+            "head_sha": "f4b94fdc82a8c2914c356e2644f7632be4e4851e",
+            "head_branch": "main", "path": runner.WORKFLOW, "event": "workflow_dispatch",
+            "run_attempt": 1, "previous_attempt_url": None,
+            "repository": {"full_name": common.REPOSITORY},
+            "display_title": "Check existing CRM driver 627c314e-14c9-4750-a832-926956bc2324 "
+                "205f27d01a8eb98f8e44c404158f1c83aecd3ca1cb616f78dde94c685a52a080",
+            "status": "completed", "conclusion": "failure",
+            "created_at": "2026-09-21T19:13:05Z", "updated_at": "2026-09-21T19:16:53Z",
+        }
+        quarantined_jobs = []
+        for key, (identity, conclusion, started, completed) in runner.FAILED_CHECK_JOBS.items():
+            if key == "recover":
+                steps = []
+            elif key == "gate":
+                steps = [("Set up job", "success"), ("Require exactly the selected recovery mode", "failure"),
+                         ("Complete job", "success")]
+            else:
+                step = "Validate public authority without private credentials" if key == "authority" \
+                    else "Rehydrate and inspect only inside the protected boundary"
+                steps = [("Set up job", "success"), ("Check out exact protected controls", "success"),
+                         (step, conclusion), ("Post Check out exact protected controls", "success"),
+                         ("Complete job", "success")]
+            quarantined_jobs.append({"id": identity, "run_id": 35643414394, "run_attempt": 1,
+                "name": runner.JOB_NAMES[key], "status": "completed", "conclusion": conclusion,
+                "started_at": started, "completed_at": completed,
+                "steps": [{"name": name, "status": "completed", "conclusion": result} for name, result in steps]})
+        data[endpoint + "/runs"]["workflow_runs"].append(quarantined)
+        data[endpoint + "/runs"]["total_count"] += 1
+        data[prefix + "/actions/runs/35643414394"] = copy.deepcopy(quarantined)
+        data[prefix + "/actions/runs/35643414394/attempts/1/jobs"] = {"total_count": 4, "jobs": quarantined_jobs}
+        data[prefix + "/actions/runs/35643414394/artifacts"] = {"total_count": 0, "artifacts": []}
         api = mock.Mock(spec=["get", "pages"])
         api.get.side_effect = lambda path: copy.deepcopy(data[path])
         api.pages.side_effect = lambda path, key: copy.deepcopy(data[path])
         return {"packet": packet, "api": api, "data": data, "current": current,
                 "predecessor": predecessor, "current_jobs": current_jobs, "previous_jobs": previous_jobs,
+                "quarantined": quarantined, "quarantined_jobs": quarantined_jobs,
                 "endpoint": endpoint, "env": {"RECOVERY_MODE": mode, "GITHUB_RUN_ID": current_id,
                                               "GITHUB_JOB": selected_job}}
 
@@ -850,6 +995,61 @@ class HostedGuardTests(RunnerFixtures):
             for job in ("authority", mode):
                 with self.subTest(mode=mode, job=job):
                     self.assertEqual(self.guard(self.guard_fixture(mode, job)), CONTROL)
+
+    def test_frozen_failed_check_is_retained_but_never_a_recovery_predecessor(self):
+        test = self.guard_fixture()
+        test["packet"]["check_run_id"] = "35643414394"
+        with self.assertRaises(common.ReleaseError):
+            self.guard(test)
+        for mutation in ("missing", "duplicate", "other_old_head", "rerun_latest", "artifact", "recover_steps"):
+            test = self.guard_fixture("check")
+            inventory = test["data"][test["endpoint"] + "/runs"]
+            if mutation == "missing":
+                inventory["workflow_runs"].remove(test["quarantined"])
+                inventory["total_count"] -= 1
+            elif mutation == "duplicate":
+                inventory["workflow_runs"].append(copy.deepcopy(test["quarantined"]))
+                inventory["total_count"] += 1
+            elif mutation == "other_old_head":
+                test["quarantined"]["id"] += 1
+            elif mutation == "rerun_latest":
+                test["data"][runner.fixture.API_PREFIX + "/actions/runs/35643414394"]["run_attempt"] = 2
+            elif mutation == "artifact":
+                test["data"][runner.fixture.API_PREFIX + "/actions/runs/35643414394/artifacts"] = {
+                    "total_count": 1, "artifacts": [{"id": 123}]}
+            else:
+                test["quarantined_jobs"][2]["steps"] = [{"name": "unexpected write", "status": "completed", "conclusion": "success"}]
+            with self.subTest(mutation=mutation), self.assertRaises(common.ReleaseError):
+                self.guard(test)
+
+    def test_quarantined_run_identity_and_terminal_metadata_are_frozen(self):
+        for key, value in (("head_sha", CONTROL), ("head_branch", "other"), ("event", "push"),
+                           ("run_attempt", 2), ("run_attempt", True), ("previous_attempt_url", "present"),
+                           ("display_title", "Recover existing CRM driver " + uid(40) + " " + "f" * 64),
+                           ("status", "in_progress"), ("conclusion", "success"),
+                           ("created_at", fixtures.stamp(NOW)), ("updated_at", fixtures.stamp(NOW)),
+                           ("path", boot.WORKFLOW), ("workflow_id", 1), ("repository", {"full_name": "other/repo"})):
+            for source in ("inventory", "latest"):
+                test = self.guard_fixture("check")
+                row = test["quarantined"] if source == "inventory" else test["data"][
+                    runner.fixture.API_PREFIX + "/actions/runs/35643414394"]
+                row[key] = value
+                with self.subTest(field=key, source=source), self.assertRaises(common.ReleaseError):
+                    self.guard(test)
+
+    def test_quarantined_jobs_are_exact_and_cannot_mask_prior_write(self):
+        for index in range(4):
+            for key, value in (("id", 1), ("run_id", 1), ("run_attempt", 2), ("run_attempt", True),
+                               ("status", "in_progress"), ("conclusion", "cancelled"),
+                               ("started_at", fixtures.stamp(NOW)), ("completed_at", fixtures.stamp(NOW))):
+                test = self.guard_fixture("check")
+                test["quarantined_jobs"][index][key] = value
+                with self.subTest(index=index, field=key), self.assertRaises(common.ReleaseError):
+                    self.guard(test)
+        test = self.guard_fixture("check")
+        test["quarantined_jobs"][1]["steps"][2]["conclusion"] = "success"
+        with self.assertRaises(common.ReleaseError):
+            self.guard(test)
 
     def test_public_authority_does_not_request_administration_protection_endpoint(self):
         test = self.guard_fixture("check", "authority")

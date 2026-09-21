@@ -9,10 +9,37 @@ from __future__ import annotations
 import ast
 import base64
 import copy
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import datetime as dt
+import hashlib
 import io
 from pathlib import Path
 import unittest
+
+
+def stable_ast_projection(node):
+    """Version-stable projection of an AST node.
+
+    Fields whose value is None or empty are omitted, so an interpreter that adds
+    a newly defaulted field does not change the projection. Digests taken from
+    this projection therefore do not depend on which Python produced them, which
+    is what made the previous frozen digests fail on a different interpreter.
+    """
+    if isinstance(node, ast.AST):
+        items = []
+        for field, value in ast.iter_fields(node):
+            projected = stable_ast_projection(value)
+            if projected is None or projected == []:
+                continue
+            items.append((field, projected))
+        return (type(node).__name__, tuple(items))
+    if isinstance(node, list):
+        return [stable_ast_projection(item) for item in node]
+    if isinstance(node, bytes):
+        return node.decode("utf-8", "replace")
+    if isinstance(node, (str, int, float, bool)) or node is None:
+        return node
+    return repr(node)
 from unittest import mock
 
 try:
@@ -1427,7 +1454,219 @@ class DiagnosticAndCapabilityTests(unittest.TestCase):
             if isinstance(node, ast.Import):
                 self.assertTrue({a.name for a in node.names} <= {"copy", "datetime", "os", "bootstrap_production_crm_canary_driver"})
             elif isinstance(node, ast.ImportFrom):
-                self.assertIn(node.module, (None, "__future__", "typing"))
+                self.assertIn(node.module, (None, "__future__", "typing", "contextlib"))
+
+
+class PrestateDiagnosticTests(RecoveryFixtures):
+    def test_closed_codes_accept_only_exact_allowlisted_strings(self):
+        for code in recovery.PRESTATE_DIAGNOSTICS:
+            error = recovery.PrestateRejected(code)
+            self.assertIs(type(error), recovery.PrestateRejected)
+            self.assertEqual(error.code, code)
+            self.assertEqual(error.args, ("existing-driver prestate rejected",))
+            with recovery.prestate_diagnostic(code):
+                pass
+
+        class Hostile:
+            def __str__(self):
+                raise AssertionError("formatted diagnostic input")
+            def __eq__(self, other):
+                raise AssertionError("compared diagnostic input")
+            def __hash__(self):
+                raise AssertionError("hashed diagnostic input")
+        class TextSubclass(str):
+            def __hash__(self):
+                raise AssertionError("hashed diagnostic subclass")
+        for code in (None, True, 1, [], {}, PRIVATE, Hostile(), TextSubclass("APP_IDENTITY")):
+            with self.subTest(kind=type(code).__name__):
+                with self.assertRaises(common.ReleaseError) as caught:
+                    recovery.PrestateRejected(code)
+                self.assertIsNot(type(caught.exception), recovery.PrestateRejected)
+                entered = False
+                with self.assertRaises(common.ReleaseError):
+                    with recovery.prestate_diagnostic(code):
+                        entered = True
+                self.assertFalse(entered)
+
+    def test_arbitrary_and_hostile_exceptions_are_content_free_and_chainless(self):
+        class HostileError(Exception):
+            def __str__(self):
+                raise AssertionError("exception formatted")
+            @property
+            def code(self):
+                raise AssertionError("exception code inspected")
+            @property
+            def status(self):
+                raise AssertionError("exception status inspected")
+        class DiagnosticSubclass(recovery.PrestateRejected):
+            @property
+            def code(self):
+                raise AssertionError("subclass code inspected")
+            @code.setter
+            def code(self, value):
+                pass
+        for error in (RuntimeError(PRIVATE), ValueError({PRIVATE: PRIVATE}),
+                      HostileError(PRIVATE), DiagnosticSubclass("ACCOUNT_OWNER")):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err), self.assertRaises(recovery.PrestateRejected) as caught:
+                with recovery.prestate_diagnostic("SPEC_PROJECTION"):
+                    raise error
+            result = caught.exception
+            self.assertIs(type(result), recovery.PrestateRejected)
+            self.assertEqual(result.code, "SPEC_PROJECTION")
+            self.assertEqual(result.args, ("existing-driver prestate rejected",))
+            self.assertIsNone(result.__cause__)
+            self.assertTrue(result.__suppress_context__)
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(err.getvalue(), "")
+
+    def test_exact_nested_diagnostic_preserves_innermost_fixed_code(self):
+        inner = recovery.PrestateRejected("SPEC_PUBLIC_EQUALITY")
+        with self.assertRaises(recovery.PrestateRejected) as caught:
+            with recovery.prestate_diagnostic("APP_SPEC"):
+                with recovery.prestate_diagnostic("FIRST_SNAPSHOT"):
+                    raise inner
+        self.assertIs(caught.exception, inner)
+        self.assertEqual(caught.exception.code, "SPEC_PUBLIC_EQUALITY")
+
+    def test_tampered_exact_diagnostic_is_sanitized_and_base_exceptions_are_not_swallowed(self):
+        for bad in (None, PRIVATE, [], {}, object()):
+            error = recovery.PrestateRejected("SPEC_PROJECTION")
+            error.code = bad
+            with self.assertRaises(recovery.PrestateRejected) as caught:
+                with recovery.prestate_diagnostic("APP_SPEC"):
+                    raise error
+            self.assertEqual(caught.exception.code, "APP_SPEC")
+        missing = recovery.PrestateRejected("SPEC_PROJECTION")
+        del missing.code
+        with self.assertRaises(recovery.PrestateRejected) as caught:
+            with recovery.prestate_diagnostic("APP_SPEC"):
+                raise missing
+        self.assertEqual(caught.exception.code, "APP_SPEC")
+        for error in (KeyboardInterrupt(), SystemExit(1)):
+            with self.assertRaises(type(error)) as caught:
+                with recovery.prestate_diagnostic("APP_SPEC"):
+                    raise error
+            self.assertIs(caught.exception, error)
+
+    def test_diagnostic_wrappers_preserve_the_four_original_function_asts(self):
+        # Digests of the published parent f4b94fdc's four functions, produced with
+        # stable_ast_projection so the constants are interpreter-independent.
+        # Removing only literal diagnostic contexts must leave every acceptance
+        # predicate and execution order untouched.
+        expected = {
+            "_exact_spec": "a7e3779db34887d5e33c3bc9b5d85973ed4d33f1784043629afbc53ef365f533",
+            "target_update_plan": "71b49d83dcbfaad969e4d6877e9cddf495600587664fca832fbe8fd634ed7b43",
+            "_snapshot": "1a0c514784411dac405e42d73ff1ecbf69e3638dcb62d7f0849f0d2bc04f2c77",
+            "inspect_pair": "92409baa31a1a4e19f4296fbd7f6dda1224e969be74f79a3cdfcf79fe53aa140",
+        }
+        owner = self
+        class Unwrap(ast.NodeTransformer):
+            def visit_With(self, node):
+                self.generic_visit(node)
+                owner.assertEqual(len(node.items), 1)
+                item = node.items[0]
+                owner.assertIsNone(item.optional_vars)
+                call = item.context_expr
+                owner.assertIsInstance(call, ast.Call)
+                owner.assertIsInstance(call.func, ast.Name)
+                owner.assertEqual(call.func.id, "prestate_diagnostic")
+                owner.assertEqual(len(call.args), 1)
+                owner.assertEqual(call.keywords, [])
+                owner.assertIsInstance(call.args[0], ast.Constant)
+                owner.assertIs(type(call.args[0].value), str)
+                owner.assertIn(call.args[0].value, recovery.PRESTATE_DIAGNOSTICS)
+                return node.body
+        tree = ast.parse(Path(recovery.__file__).read_text(encoding="utf-8"))
+        functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+        for name, digest in expected.items():
+            with self.subTest(function=name):
+                unwrapped = Unwrap().visit(functions[name])
+                self.assertEqual(
+                    hashlib.sha256(
+                        repr(stable_ast_projection(unwrapped)).encode()
+                    ).hexdigest(),
+                    digest,
+                )
+
+    def test_specific_policy_assertion_families_have_closed_diagnostics(self):
+        changes = (
+            (lambda c: c["first"].update(observed_at=stamp(NOW - dt.timedelta(hours=3))), "OBSERVATION_WINDOW"),
+            (lambda c: c["first"].update(production_state_sha256="0" * 64), "SNAPSHOT_BINDINGS"),
+            (lambda c: c["first"]["account"].update(status=PRIVATE), "ACCOUNT_OWNER"),
+            (lambda c: c["first"]["app"].update(id=uid(99)), "APP_IDENTITY"),
+            (lambda c: c["first"]["apps"]["apps"].pop(), "APP_INVENTORY_BINDING"),
+            (lambda c: c["first"]["deployments"]["deployments"][0].update(phase=PRIVATE), "DEPLOYMENT_IDENTITIES"),
+            (lambda c: c["first"]["app"].update(updated_at=stamp(NOW)), "DRIVER_METADATA_BINDING"),
+            (lambda c: c["first"]["app"].update(pending_deployment={"id": uid(99)}), "APP_DEPLOYMENT_SLOTS"),
+            (lambda c: c["first"]["app"]["spec"].update(region=PRIVATE), "SPEC_PROJECTION"),
+            (lambda c: c["first"]["firewall"]["rules"].pop(), "FIREWALL_ADMISSION_BINDING"),
+            (lambda c: c["first"]["canary_environment"].update(variables=[PRIVATE]), "CANARY_METADATA_BINDING"),
+            (lambda c: c["second"].update(observed_at=c["first"]["observed_at"]), "PAIR_TIME"),
+        )
+        for change, code in changes:
+            case = copy.deepcopy(self.case)
+            change(case)
+            with self.subTest(code=code), self.assertRaises(recovery.PrestateRejected) as caught:
+                self.inspect(case)
+            self.assertEqual(caught.exception.code, code)
+            self.assertNotIn(PRIVATE, str(caught.exception))
+
+    def test_spec_projection_and_final_public_equality_remain_distinct(self):
+        expected = self.case["expected_spec"]
+        actual = self.case["first"]["app"]["spec"]
+        with mock.patch.object(boot, "spec_projection", side_effect=RuntimeError(PRIVATE)):
+            with self.assertRaises(recovery.PrestateRejected) as caught:
+                recovery._exact_spec(actual, expected)
+            self.assertEqual(caught.exception.code, "SPEC_PROJECTION")
+        projected = copy.deepcopy(actual)
+        projected["region"] = PRIVATE
+        with mock.patch.object(boot, "spec_projection", return_value=projected):
+            with self.assertRaises(recovery.PrestateRejected) as caught:
+                recovery._exact_spec(actual, expected)
+            self.assertEqual(caught.exception.code, "SPEC_PUBLIC_EQUALITY")
+
+    def test_secret_fuzz_rejections_match_unwrapped_acceptance_without_output(self):
+        @contextmanager
+        def no_diagnostic(_code):
+            yield
+        paths = (
+            ("first", "app", "spec", "name"),
+            ("first", "app", "spec", "services", 0, "envs", 0, "value"),
+            ("first", "account", "uuid"), ("first", "account", "team", "uuid"),
+            ("first", "app", "id"), ("first", "app", "owner_uuid"),
+            ("first", "app", "created_at"), ("first", "app", "pending_deployment"),
+            ("first", "canary_environment", "secrets"), ("first", "firewall", "rules"),
+            ("second", "observed_at"), ("authorization", "production_state_sha256"),
+        )
+        values = (None, True, 0, -1, 1.0, PRIVATE, "https://private.invalid/" + PRIVATE,
+                  {PRIVATE: PRIVATE}, [PRIVATE])
+        cases = [copy.deepcopy(self.case)]
+        for path in paths:
+            for value in values:
+                case = copy.deepcopy(self.case)
+                put(case, path, value)
+                cases.append(case)
+        for index, case in enumerate(cases):
+            out, err = io.StringIO(), io.StringIO()
+            with self.subTest(case=index), redirect_stdout(out), redirect_stderr(err):
+                try:
+                    result = self.inspect(case)
+                    actual = (True, common.canonical_payload_bytes(result))
+                except recovery.PrestateRejected as error:
+                    self.assertIs(type(error), recovery.PrestateRejected)
+                    self.assertIn(error.code, recovery.PRESTATE_DIAGNOSTICS)
+                    self.assertEqual(error.args, ("existing-driver prestate rejected",))
+                    actual = (False, None)
+                with mock.patch.object(recovery, "prestate_diagnostic", no_diagnostic):
+                    try:
+                        result = self.inspect(case)
+                        expected = (True, common.canonical_payload_bytes(result))
+                    except Exception:
+                        expected = (False, None)
+                self.assertEqual(actual, expected)
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(err.getvalue(), "")
 
 
 if __name__ == "__main__":
