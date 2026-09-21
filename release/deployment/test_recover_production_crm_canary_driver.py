@@ -15,6 +15,31 @@ import hashlib
 import io
 from pathlib import Path
 import unittest
+
+
+def stable_ast_projection(node):
+    """Version-stable projection of an AST node.
+
+    Fields whose value is None or empty are omitted, so an interpreter that adds
+    a newly defaulted field does not change the projection. Digests taken from
+    this projection therefore do not depend on which Python produced them, which
+    is what made the previous frozen digests fail on a different interpreter.
+    """
+    if isinstance(node, ast.AST):
+        items = []
+        for field, value in ast.iter_fields(node):
+            projected = stable_ast_projection(value)
+            if projected is None or projected == []:
+                continue
+            items.append((field, projected))
+        return (type(node).__name__, tuple(items))
+    if isinstance(node, list):
+        return [stable_ast_projection(item) for item in node]
+    if isinstance(node, bytes):
+        return node.decode("utf-8", "replace")
+    if isinstance(node, (str, int, float, bool)) or node is None:
+        return node
+    return repr(node)
 from unittest import mock
 
 try:
@@ -1525,13 +1550,15 @@ class PrestateDiagnosticTests(RecoveryFixtures):
             self.assertIs(caught.exception, error)
 
     def test_diagnostic_wrappers_preserve_the_four_original_function_asts(self):
-        # Frozen from published f4b94fdc. Removing only literal diagnostic
-        # contexts must leave every acceptance predicate and execution order.
+        # Digests of the published parent f4b94fdc's four functions, produced with
+        # stable_ast_projection so the constants are interpreter-independent.
+        # Removing only literal diagnostic contexts must leave every acceptance
+        # predicate and execution order untouched.
         expected = {
-            "_exact_spec": "9ab25dacd0fe91e35eb65ca157924cc7072403978baf77eae42fcbb247267d95",
-            "target_update_plan": "7abde705f2b4bdad1b328d5f6a0b40e76570a86f5cd318c4fc4fe1cd4782f2d0",
-            "_snapshot": "26b59bdbd219d01377e05161c5066416b78dadf85b407fed76320d686d478e00",
-            "inspect_pair": "f27a440c325cc79da6d921196de0401fa5438c04afa2514d7b465cabde1a68f6",
+            "_exact_spec": "a7e3779db34887d5e33c3bc9b5d85973ed4d33f1784043629afbc53ef365f533",
+            "target_update_plan": "71b49d83dcbfaad969e4d6877e9cddf495600587664fca832fbe8fd634ed7b43",
+            "_snapshot": "1a0c514784411dac405e42d73ff1ecbf69e3638dcb62d7f0849f0d2bc04f2c77",
+            "inspect_pair": "92409baa31a1a4e19f4296fbd7f6dda1224e969be74f79a3cdfcf79fe53aa140",
         }
         owner = self
         class Unwrap(ast.NodeTransformer):
@@ -1555,7 +1582,12 @@ class PrestateDiagnosticTests(RecoveryFixtures):
         for name, digest in expected.items():
             with self.subTest(function=name):
                 unwrapped = Unwrap().visit(functions[name])
-                self.assertEqual(hashlib.sha256(ast.dump(unwrapped, include_attributes=False).encode()).hexdigest(), digest)
+                self.assertEqual(
+                    hashlib.sha256(
+                        repr(stable_ast_projection(unwrapped)).encode()
+                    ).hexdigest(),
+                    digest,
+                )
 
     def test_specific_policy_assertion_families_have_closed_diagnostics(self):
         changes = (
