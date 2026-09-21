@@ -8,6 +8,7 @@ import datetime as dt
 import io
 import os
 from pathlib import Path
+import shutil
 import ssl
 import subprocess
 import sys
@@ -606,12 +607,220 @@ class BootstrapTests(unittest.TestCase):
             with self.subTest(kind=kind, change=change), self.assertRaises(common.ReleaseError):
                 boot.spec_projection(observed, spec)
 
+    def test_generated_login_payloads_pass_real_node_runtime_configuration(self):
+        node = shutil.which("node")
+        if node is None:
+            if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+                self.fail("Node is required for the cross-component runtime regression in CI")
+            self.skipTest("Node unavailable locally; cross-component runtime regression is required in CI")
+        spec = boot.runtime_spec(self.a, self.d, self.protected, self.driver)
+        environment = {entry["key"]: entry["value"] for entry in spec["services"][0]["envs"]}
+        # Only this provider-interpolated connection expression is replaced.
+        # Every other runtime value comes from the actual synthetic generator.
+        environment["CRM_CANARY_LEDGER_DATABASE_URL"] = (
+            "postgresql://ledger:synthetic-password@ledger.invalid/canary"
+            "?sslmode=require&uselibpqcompat=true")
+        login_bindings = (
+            ("CRM_CANARY_KLINIK_LOGIN_JSON", "klinik_email", "klinik_password"),
+            ("CRM_CANARY_NON_KLINIK_LOGIN_JSON", "non_klinik_email", "non_klinik_password"),
+        )
+        for key, email_key, password_key in login_bindings:
+            login = common.loads_strict(environment[key])
+            self.assertTrue(set(login) == {"schema_version", "email", "password"},
+                            "generated login schema fields differ")
+            self.assertTrue(type(login["schema_version"]) is int and login["schema_version"] == 1,
+                            "generated login schema version differs")
+            self.assertTrue(login["email"] == self.protected["registration"][email_key],
+                            "generated login email changed")
+            self.assertTrue(login["password"] == self.protected["credentials"][password_key],
+                            "generated login password changed")
+        cases = [{"environment": environment, "accepted": True}]
+        legacy = copy.deepcopy(environment)
+        for key, _, _ in login_bindings:
+            login = common.loads_strict(legacy[key])
+            del login["schema_version"]
+            legacy[key] = common.canonical_payload_bytes(login).decode()
+        cases.append({"environment": legacy, "accepted": False})
+        for key, _, _ in login_bindings:
+            for schema in (None, True, False, 0, 2, "1", 1.0, [], {}):
+                changed = copy.deepcopy(environment)
+                login = common.loads_strict(changed[key])
+                login["schema_version"] = schema
+                changed[key] = common.canonical_payload_bytes(login).decode()
+                cases.append({"environment": changed, "accepted": False})
+            changed = copy.deepcopy(environment)
+            login = common.loads_strict(changed[key])
+            del login["schema_version"]
+            changed[key] = common.canonical_payload_bytes(login).decode()
+            cases.append({"environment": changed, "accepted": False})
+        script = r"""
+import fs from 'node:fs';
+import net from 'node:net';
+import http from 'node:http';
+import https from 'node:https';
+import tls from 'node:tls';
+import dns from 'node:dns';
+import childProcess from 'node:child_process';
+const output = process.stdout.write.bind(process.stdout);
+let forbidden = false;
+const deny = () => { forbidden = true; throw new Error('FORBIDDEN_TEST_EFFECT'); };
+const suppress = () => { forbidden = true; return true; };
+process.stdout.write = suppress;
+process.stderr.write = suppress;
+globalThis.fetch = deny;
+net.connect = net.createConnection = net.Socket.prototype.connect = deny;
+net.Server.prototype.listen = deny;
+http.request = http.get = http.createServer = deny;
+https.request = https.get = https.createServer = tls.connect = deny;
+dns.lookup = dns.resolve = dns.promises.lookup = dns.promises.resolve = deny;
+for (const key of ['exec', 'execFile', 'spawn', 'fork', 'execSync', 'execFileSync', 'spawnSync']) {
+  childProcess[key] = deny;
+}
+try {
+  const cases = JSON.parse(fs.readFileSync(0, 'utf8'));
+  const { loadRuntimeConfig } = await import('./frontend/canary-driver/index.mjs');
+  for (const fixture of cases) {
+    let accepted = false;
+    try {
+      loadRuntimeConfig(fixture.environment);
+      accepted = true;
+    } catch {}
+    if (accepted !== fixture.accepted || forbidden) throw new Error('CONFIG_EXPECTATION_DIFFERED');
+  }
+  output('PASS\n');
+} catch {
+  process.exitCode = 1;
+}
+"""
+        try:
+            result = subprocess.run(
+                [node, "--input-type=module", "--eval", script],
+                input=common.canonical_payload_bytes(cases), capture_output=True,
+                cwd=Path(boot.__file__).resolve().parents[2], env=boot.subprocess_environment(), timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            self.fail("cross-component runtime validator could not complete")
+        # Do not include captured output, exceptions, or the stdin payload in failures.
+        self.assertTrue(result.returncode == 0, "cross-component runtime validator rejected its expectations")
+        self.assertTrue(result.stdout == b"PASS\n", "cross-component runtime validator output differed")
+        self.assertTrue(result.stderr == b"", "cross-component runtime validator emitted unexpected diagnostics")
+
+    def test_exact_image_ingress_and_inert_feature_readbacks(self):
+        spec = boot.runtime_spec(self.a, self.d, self.protected, self.driver)
+        self.provider.create(spec)
+        original = copy.deepcopy(self.provider.spec)
+        baseline = boot.spec_projection(original, spec)
+        for modern, feature in ((False, False), (True, False), (False, True), (True, True)):
+            observed = copy.deepcopy(original)
+            if modern:
+                observed["services"][0].pop("routes")
+                observed["ingress"] = {"rules": [{"component": {"name": "driver"},
+                                                "match": {"path": {"prefix": "/"}}}]}
+            if feature:
+                observed["features"] = ["buildpack-stack=ubuntu-22"]
+            unchanged = copy.deepcopy(observed)
+            with self.subTest(modern=modern, feature=feature):
+                self.assertEqual(boot.spec_projection(observed, spec), baseline)
+                self.assertEqual(observed, unchanged)
+                self.assertEqual(self.provider.spec, original)
+                secrets = [e["value"] for e in baseline["services"][0]["envs"] if e["type"] == "SECRET"]
+                self.assertEqual(len(secrets), 5)
+                self.assertTrue(all(v.startswith("EV[") for v in secrets))
+
+    def test_unknown_features_and_non_image_context_fail_closed(self):
+        spec = boot.runtime_spec(self.a, self.d, self.protected, self.driver)
+        self.provider.create(spec)
+        for feature in (None, {}, "buildpack-stack=ubuntu-22", ["buildpack-stack=ubuntu-24"],
+                        ["buildpack-stack=ubuntu-22", "extra"], ["buildpack-stack=ubuntu-22"] * 2,
+                        [True], ["buildpack-stack=ubuntu-22 "]):
+            observed = copy.deepcopy(self.provider.spec)
+            observed["features"] = feature
+            with self.subTest(feature=feature), self.assertRaises(common.ReleaseError):
+                boot.spec_projection(observed, spec)
+        for key in ("git", "github", "gitlab", "bitbucket", "dockerfile_path"):
+            observed = copy.deepcopy(self.provider.spec)
+            observed["features"] = ["buildpack-stack=ubuntu-22"]
+            observed["services"][0][key] = {}
+            with self.subTest(key=key), self.assertRaises(common.ReleaseError):
+                boot.spec_projection(observed, spec)
+
+    def test_ingress_variants_and_mixed_routes_rejected(self):
+        spec = boot.runtime_spec(self.a, self.d, self.protected, self.driver)
+        self.provider.create(spec)
+        exact = {"rules": [{"component": {"name": "driver"}, "match": {"path": {"prefix": "/"}}}]}
+        variants = [None, [], {}, {"rules": []}, {"rules": exact["rules"] * 2},
+                    {**exact, "extra": True}]
+        for key, value in (("redirect", {}), ("cors", {}), ("rewrite", "/"),
+                           ("preserve_path_prefix", True), ("authority", {})):
+            changed = copy.deepcopy(exact)
+            changed["rules"][0][key] = value
+            variants.append(changed)
+        for component in ({"name": "other"}, {"name": "driver", "preserve_path_prefix": True},
+                          {"name": "driver", "rewrite": "/"}):
+            changed = copy.deepcopy(exact)
+            changed["rules"][0]["component"] = component
+            variants.append(changed)
+        for match in ({"path": {"prefix": "/other"}}, {"path": {"exact": "/"}},
+                      {"path": {"prefix": "/"}, "authority": {"exact": "example.test"}}):
+            changed = copy.deepcopy(exact)
+            changed["rules"][0]["match"] = match
+            variants.append(changed)
+        for ingress in variants:
+            observed = copy.deepcopy(self.provider.spec)
+            observed["services"][0].pop("routes")
+            observed["ingress"] = ingress
+            with self.subTest(ingress=ingress), self.assertRaises(common.ReleaseError):
+                boot.spec_projection(observed, spec)
+        observed = copy.deepcopy(self.provider.spec)
+        observed["ingress"] = exact
+        with self.assertRaises(common.ReleaseError):
+            boot.spec_projection(observed, spec)
+
+    def test_normalization_preserves_numeric_resource_and_secret_guards(self):
+        spec = boot.runtime_spec(self.a, self.d, self.protected, self.driver)
+        self.provider.create(spec)
+        for key, value in (("instance_count", True), ("instance_count", 1.0),
+                           ("http_port", 8080.0), ("http_port", 8081)):
+            observed = copy.deepcopy(self.provider.spec)
+            observed["features"] = ["buildpack-stack=ubuntu-22"]
+            observed["services"][0][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(common.ReleaseError):
+                boot.spec_projection(observed, spec)
+        for value in ("plaintext-sentinel", "EV[short]", None, True):
+            observed = copy.deepcopy(self.provider.spec)
+            observed["features"] = ["buildpack-stack=ubuntu-22"]
+            next(e for e in observed["services"][0]["envs"] if e["type"] == "SECRET")["value"] = value
+            with self.subTest(value=value), self.assertRaises(common.ReleaseError):
+                boot.spec_projection(observed, spec)
+
     def test_reviewed_scopes_allow_credential_view_only_for_create(self):
         self.assertEqual(boot.SCOPE_REVIEW["read"], ["account:read", "actions:read", "app:read", "database:read", "regions:read", "sizes:read"])
         self.assertNotIn("database:view_credentials", boot.SCOPE_REVIEW["read"])
         self.assertEqual(boot.SCOPE_REVIEW["create"], ["actions:read", "app:create", "app:read", "database:read",
                                                     "database:update", "database:view_credentials", "regions:read", "sizes:read"])
         boot.validate_descriptor(self.d, self.a)
+
+    def test_real_preflight_resolves_team_without_substituting_user_identity(self):
+        plan = self.d["plan"]
+        responses = provider_responses(plan)
+        responses["/v2/account"]["account"]["team"] = {"uuid": uid(81)}
+        provider = boot.ReadOnlyProvider(plan, "synthetic-read-token")
+        with mock.patch.object(provider, "get", side_effect=lambda path: copy.deepcopy(responses[path])):
+            provider.preflight()
+        self.assertEqual(boot.planned_owner_uuid(provider), uid(81))
+        self.assertNotEqual(provider.owner_uuid, plan["provider_account_uuid"])
+        responses["/v2/account"]["account"]["uuid"] = uid(82)
+        with (mock.patch.object(provider, "get", side_effect=lambda path: copy.deepcopy(responses[path])),
+              self.assertRaises(common.ReleaseError)):
+            provider.preflight()
+
+    def test_real_preflight_rejects_malformed_team_before_other_provider_reads(self):
+        for team in ([], "team", True, {"uuid": "not-a-uuid"}, {"uuid": True}):
+            provider = boot.ReadOnlyProvider(self.d["plan"], "synthetic-read-token")
+            account = {"uuid": self.d["plan"]["provider_account_uuid"], "status": "active", "team": team}
+            with (mock.patch.object(provider, "get", return_value={"account": account}) as get,
+                  self.subTest(team=team), self.assertRaises(common.ReleaseError)):
+                provider.preflight()
+            get.assert_called_once_with("/v2/account")
 
     def test_health_rejects_private_dns_before_connect_and_redirect_response(self):
         origin = "https://rereply-canary-driver-test-abc.ondigitalocean.app"

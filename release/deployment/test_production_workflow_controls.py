@@ -34,6 +34,7 @@ ACTIVE_PRODUCTION_CONTROLS = (
     "provision-production-crm-canary-fixture.yml",
     "cleanup-production-crm-canary-fixture.yml",
     "bootstrap-production-crm-canary-driver.yml",
+    "recover-production-crm-canary-driver.yml",
 )
 AUXILIARY_PRODUCTION_CONTROLS = (
     "publish-attest-production-crm-canary-driver.yml",
@@ -49,7 +50,8 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "b9f36ed7b6dccf1249876d4beda46424a620cb8f554aa0dfdd7f7e21e920ed71"
     ),
     "finalize-production-orphan-lock.yml": (
-        "117a9b7c053f663609fa31774ccb76bd7bf1d0b1ce3d319b34797086939ceef9"
+        # 2026-09-22: all three competing-run filters include existing-driver recovery.
+        "6baeb8309f56c056e8f516f060ce1e33f53418fb49501ddaecac3a0c7083010b"
     ),
     "reconcile-production-orphan.yml": (
         "a702f615d9721c6c175985a7e494a1173523fe98d076ffcede552c744763a065"
@@ -122,7 +124,7 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
     ),
 }
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "3942b427904a6d7878f97c5cc62185ae00d62a4a2aa4b6b5589ac6f602921595"
+    "ca2ca3dbe07f72b80e0331fad3ca8478f9ef4e138ceb14cd06eeacaa8dec385b"
 )
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
     "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
@@ -133,7 +135,7 @@ EXACT_CLEANUP_AUTHORITY_STEP_SHA256 = (
 EXACT_GATE_B_TEST_JOB_SHA256 = {
     "release-controls": "79645bf97ed1574bcb760af561a525ffc028e2ea34e27b9ca51af177ba59590a",
     "go-race": "4394f61230c01e1eb700956a99b26b1fd442e8fab2fd0004074aa78723e2a189",
-    "lint": "6f5c645c69d975a28cfb9a265ebf2df8ac84a3e9cfb2d79974d302b5b6e95406",
+    "lint": "a2402a41b92ca872b93b87e2e24cdd3d4b3703bfcf3534d1e1bf410bf0fe619c",
     "security": "ed9572d5895abf26417ce1ebf87970cc67b41be00379d42df75df58f73c8cbd4",
     "recovery-boundary-images": (
         "90daa97f1350ea5ec53dfc0b86416138fc4737928e6a7d089c33276aa36eaea2"
@@ -489,6 +491,7 @@ def assert_gate_b_test_workflow(source: str) -> None:
         "actionlint .github/workflows/provision-production-crm-canary-fixture.yml "
         ".github/workflows/cleanup-production-crm-canary-fixture.yml",
         "actionlint .github/workflows/bootstrap-production-crm-canary-driver.yml",
+        "actionlint .github/workflows/recover-production-crm-canary-driver.yml",
         "actionlint -ignore '\"on\" section should not be empty' "
         "prototype/recovery-boundary/workflows/*.tmpl",
     ):

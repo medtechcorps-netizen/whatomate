@@ -267,6 +267,7 @@ jobs:
           actionlint .github/workflows/test.yml
           actionlint .github/workflows/provision-production-crm-canary-fixture.yml .github/workflows/cleanup-production-crm-canary-fixture.yml
           actionlint .github/workflows/bootstrap-production-crm-canary-driver.yml
+          actionlint .github/workflows/recover-production-crm-canary-driver.yml
           actionlint -ignore '"on" section should not be empty' prototype/recovery-boundary/workflows/*.tmpl
 
   build:

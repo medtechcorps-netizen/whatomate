@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
+import { EventEmitter } from "node:events";
 import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
@@ -14,6 +15,7 @@ import {
   parseCanonicalJson,
   processAuthenticatedRequest,
   requestHmacPayload,
+  startDriver,
 } from "./index.mjs";
 import {
   UI_CHECKS,
@@ -959,7 +961,7 @@ test("HTTP boundary emits only a constant redacted error", async (t) => {
   );
 });
 
-test("driver sources disable diagnostic capture and contain no logging calls", async () => {
+test("driver sources disable sensitive capture and console logging", async () => {
   const indexSource = await readFile(
     new URL("./index.mjs", import.meta.url),
     "utf8",
@@ -994,4 +996,545 @@ test("driver sources disable diagnostic capture and contain no logging calls", a
     /DIGITALOCEAN|DO_TOKEN|doctl/u.test(indexSource + runnerSource),
     false,
   );
+});
+
+function startupEnvironment() {
+  return {
+    CRM_CANARY_HMAC_KEY_BASE64: HMAC_KEY.toString("base64"),
+    CRM_CANARY_DRIVER_VERSION_SHA256: DRIVER_VERSION,
+    CRM_CANARY_LEDGER_DATABASE_URL:
+      "postgresql://ledger:password@ledger.invalid/canary?sslmode=require&uselibpqcompat=true",
+    CRM_CANARY_FIXTURE_DESCRIPTOR_JSON: canonicalJson(descriptor),
+    CRM_CANARY_KLINIK_LOGIN_JSON: canonicalJson(klinikLogin),
+    CRM_CANARY_NON_KLINIK_LOGIN_JSON: canonicalJson(nonKlinikLogin),
+    CRM_CANARY_META_APP_SECRET: "dedicated-synthetic-meta-secret",
+  };
+}
+
+const STARTUP_PRIVATE =
+  "private-postgresql://user:password@private.invalid/HMAC";
+
+function startupHarness(options = {}) {
+  const events = [];
+  const lines = [];
+  const processLike = new EventEmitter();
+  processLike.exitCode = undefined;
+  processLike.exit = (code) => events.push(["exit", code]);
+  const pool = new EventEmitter();
+  pool.query = (...args) => {
+    events.push(["query", ...args]);
+    return options.query ? options.query() : Promise.resolve({});
+  };
+  pool.end = () => {
+    events.push(["pool.end"]);
+    return options.end ? options.end() : Promise.resolve();
+  };
+  const server = new EventEmitter();
+  server.listening = false;
+  server.listen = (port, host, callback) => {
+    events.push(["listen", port, host]);
+    server.finishListen = () => {
+      server.listening = true;
+      callback();
+    };
+    if (options.listen) return options.listen(server);
+    queueMicrotask(server.finishListen);
+  };
+  server.close = (callback) => {
+    events.push(["server.close"]);
+    if (options.close) return options.close(callback, server);
+    server.listening = false;
+    callback();
+  };
+  server.closeAllConnections = () =>
+    events.push(["server.closeAllConnections"]);
+  const dependencies = {
+    loadPg: async () => {
+      events.push(["loadPg"]);
+      if (options.importFailure) throw options.failure;
+      return {
+        Pool: class {
+          constructor(config) {
+            events.push(["Pool", config]);
+            if (options.poolFailure) throw options.failure;
+            return pool;
+          }
+        },
+      };
+    },
+    createServer: (handler) => {
+      events.push(["createServer"]);
+      if (options.serverFailure) throw options.failure;
+      server.handler = handler;
+      return server;
+    },
+    processLike,
+    writeDiagnostic: (line) => {
+      lines.push(line);
+      if (options.write) return options.write();
+    },
+    ...(options.timers || {}),
+  };
+  return { events, lines, processLike, pool, server, dependencies };
+}
+
+function startupDiagnostics(harness) {
+  const stages = new Set([
+    "CONFIG",
+    "PG_IMPORT",
+    "POOL_CREATE",
+    "LEDGER_INITIALIZE",
+    "LISTEN",
+    "READY",
+    "RUNTIME",
+    "SERVER_CLEANUP",
+    "POOL_CLEANUP",
+    "CLEANUP",
+  ]);
+  const codes = new Set([
+    "NONE",
+    "UNKNOWN",
+    "LEDGER_PERMISSION_DENIED",
+    "LEDGER_AUTH_REJECTED",
+    "LEDGER_DATABASE_MISSING",
+    "TLS_VERIFICATION_FAILED",
+    "NAME_RESOLUTION_FAILED",
+    "CONNECTION_REFUSED",
+    "CONNECTION_TIMEOUT",
+  ]);
+  return harness.lines.map((line) => {
+    assert.equal(line.endsWith("\n"), true);
+    const record = JSON.parse(line);
+    assert.deepEqual(Object.keys(record), [
+      "schema_version",
+      "event",
+      "stage",
+      "outcome",
+      "code",
+    ]);
+    assert.equal(record.schema_version, 1);
+    assert.equal(record.event, "crm_canary_driver_startup");
+    assert.equal(stages.has(record.stage), true);
+    assert.equal(
+      ["STARTED", "ERROR", "SUCCESS"].includes(record.outcome),
+      true,
+    );
+    assert.equal(codes.has(record.code), true);
+    assert.equal(record.code === "NONE", record.outcome !== "ERROR");
+    for (const privateValue of [
+      STARTUP_PRIVATE,
+      ...Object.values(startupEnvironment()),
+      klinikLogin.password,
+      nonKlinikLogin.password,
+    ])
+      assert.equal(line.includes(privateValue), false);
+    return [record.stage, record.outcome];
+  });
+}
+
+async function rejectStartup(harness, environment = startupEnvironment()) {
+  await assert.rejects(
+    startDriver(environment, harness.dependencies),
+    (error) => {
+      assert.equal(error instanceof DriverRequestError, true);
+      assert.equal(error.message, "driver startup failed");
+      assert.equal(error.status, 503);
+      assert.equal("cause" in error, false);
+      return true;
+    },
+  );
+  assert.equal(
+    startupDiagnostics(harness).some(([stage]) => stage === "READY"),
+    false,
+  );
+  assert.equal(harness.processLike.listenerCount("SIGTERM"), 0);
+  assert.equal(harness.processLike.listenerCount("SIGINT"), 0);
+}
+
+async function startupSettled() {
+  // Flush only fake-resource promises; never open a socket or load pg.
+  for (let count = 0; count < 30; count += 1) await Promise.resolve();
+}
+
+test("startup emits exact stages and stays unready until fake listen completes", async () => {
+  const h = startupHarness({ listen: () => {} });
+  const started = startDriver(startupEnvironment(), h.dependencies);
+  await startupSettled();
+  assert.deepEqual(startupDiagnostics(h), [
+    ["CONFIG", "STARTED"],
+    ["PG_IMPORT", "STARTED"],
+    ["POOL_CREATE", "STARTED"],
+    ["LEDGER_INITIALIZE", "STARTED"],
+    ["LISTEN", "STARTED"],
+  ]);
+  h.server.finishListen();
+  assert.deepEqual(await started, { server: h.server, pool: h.pool });
+  assert.deepEqual(startupDiagnostics(h).at(-1), ["READY", "SUCCESS"]);
+  assert.deepEqual(
+    h.events.map(([event]) => event),
+    ["loadPg", "Pool", "query", "createServer", "listen"],
+  );
+  assert.deepEqual(h.events.at(-1), ["listen", 8080, "0.0.0.0"]);
+  assert.match(
+    h.events.find(([event]) => event === "query")[1],
+    /CREATE TABLE IF NOT EXISTS crm_canary_execution_ledger/u,
+  );
+  assert.equal(h.processLike.listenerCount("SIGTERM"), 1);
+  assert.equal(h.processLike.listenerCount("SIGINT"), 1);
+  const response = {
+    writeHead: (status) => assert.equal(status, 204),
+    end: () => {},
+  };
+  await h.server.handler({ method: "GET", url: "/healthz" }, response);
+  h.processLike.emit("SIGTERM");
+  await startupSettled();
+  assert.equal(h.processLike.exitCode, 0);
+});
+
+for (const [stage, options, environment] of [
+  ["CONFIG", {}, {}],
+  ["PG_IMPORT", { importFailure: true }, startupEnvironment()],
+  ["POOL_CREATE", { poolFailure: true }, startupEnvironment()],
+  [
+    "LEDGER_INITIALIZE",
+    { query: () => Promise.reject(STARTUP_PRIVATE) },
+    startupEnvironment(),
+  ],
+  ["LISTEN", { serverFailure: true }, startupEnvironment()],
+]) {
+  test("startup failure is closed at " + stage, async () => {
+    const h = startupHarness({
+      ...options,
+      failure: new Error(STARTUP_PRIVATE),
+    });
+    await rejectStartup(h, environment);
+    assert.deepEqual(
+      startupDiagnostics(h).filter(([, outcome]) => outcome === "ERROR"),
+      [[stage, "ERROR"]],
+    );
+    assert.equal(
+      h.events.some(([event]) => event === "listen"),
+      false,
+    );
+    const hasPool = ["LEDGER_INITIALIZE", "LISTEN"].includes(stage);
+    assert.equal(
+      h.events.filter(([event]) => event === "pool.end").length,
+      hasPool ? 1 : 0,
+    );
+    if (stage === "CONFIG") assert.deepEqual(h.events, []);
+  });
+}
+
+test("startup never reads hostile thrown properties or logs thrown strings", async () => {
+  let propertyReads = 0;
+  const hostile = new Error(STARTUP_PRIVATE);
+  for (const key of [
+    "message",
+    "stack",
+    "code",
+    "detail",
+    "cause",
+    "toJSON",
+    Symbol.toPrimitive,
+    Symbol.for("nodejs.util.inspect.custom"),
+  ]) {
+    Object.defineProperty(hostile, key, {
+      get: () => {
+        propertyReads += 1;
+        throw STARTUP_PRIVATE;
+      },
+    });
+  }
+  for (const failure of [hostile, STARTUP_PRIVATE, null, undefined]) {
+    const h = startupHarness({ importFailure: true, failure });
+    await rejectStartup(h);
+  }
+  assert.equal(propertyReads, 0);
+});
+
+test("startup handles both synchronous and emitted listener failure", async () => {
+  for (const listen of [
+    () => {
+      throw STARTUP_PRIVATE;
+    },
+    (server) =>
+      queueMicrotask(() => server.emit("error", new Error(STARTUP_PRIVATE))),
+  ]) {
+    const h = startupHarness({ listen });
+    await rejectStartup(h);
+    assert.deepEqual(startupDiagnostics(h).at(-1), ["LISTEN", "ERROR"]);
+    assert.equal(
+      h.events.filter(([event]) => event === "server.close").length,
+      1,
+    );
+    assert.equal(h.events.filter(([event]) => event === "pool.end").length, 1);
+  }
+});
+
+test("startup pool error interrupts pending initialization without readiness", async () => {
+  const h = startupHarness({ query: () => new Promise(() => {}) });
+  const started = rejectStartup(h);
+  await startupSettled();
+  h.pool.emit("error", new Error(STARTUP_PRIVATE));
+  await started;
+  assert.deepEqual(startupDiagnostics(h).at(-1), [
+    "LEDGER_INITIALIZE",
+    "ERROR",
+  ]);
+});
+
+test("startup resource error racing listening callback never emits readiness", async () => {
+  const h = startupHarness({
+    listen: (server) => {
+      server.finishListen();
+      server.emit("error", STARTUP_PRIVATE);
+    },
+  });
+  await rejectStartup(h);
+  assert.deepEqual(startupDiagnostics(h).at(-1), ["LISTEN", "ERROR"]);
+});
+
+test("startup cleans both resources despite close throws and pool rejection", async () => {
+  const h = startupHarness({
+    listen: () => {
+      throw STARTUP_PRIVATE;
+    },
+    close: () => {
+      throw STARTUP_PRIVATE;
+    },
+    end: () => Promise.reject(new Error(STARTUP_PRIVATE)),
+  });
+  await rejectStartup(h);
+  assert.deepEqual(startupDiagnostics(h).slice(-3), [
+    ["LISTEN", "ERROR"],
+    ["SERVER_CLEANUP", "ERROR"],
+    ["POOL_CLEANUP", "ERROR"],
+  ]);
+  assert.equal(h.events.filter(([event]) => event === "pool.end").length, 1);
+});
+
+test("startup catches synchronous pool cleanup failure", async () => {
+  const h = startupHarness({
+    query: () => Promise.reject(STARTUP_PRIVATE),
+    end: () => {
+      throw STARTUP_PRIVATE;
+    },
+  });
+  await rejectStartup(h);
+  assert.deepEqual(startupDiagnostics(h).at(-1), ["POOL_CLEANUP", "ERROR"]);
+});
+
+test("startup cleanup is bounded and late rejection remains handled", async () => {
+  const timers = [];
+  const cleared = [];
+  let rejectEnd;
+  const h = startupHarness({
+    listen: () => {
+      throw STARTUP_PRIVATE;
+    },
+    close: () => {},
+    end: () =>
+      new Promise((_resolve, reject) => {
+        rejectEnd = reject;
+      }),
+    timers: {
+      scheduleTimeout: (callback, delay) => {
+        assert.equal(delay, 5_000);
+        timers.push(callback);
+        return callback;
+      },
+      cancelTimeout: (timer) => cleared.push(timer),
+    },
+  });
+  const started = rejectStartup(h);
+  await startupSettled();
+  assert.equal(timers.length, 1);
+  timers[0]();
+  await startupSettled();
+  assert.equal(timers.length, 2);
+  timers[1]();
+  await started;
+  assert.deepEqual(cleared, timers);
+  rejectEnd(new Error(STARTUP_PRIVATE));
+  await startupSettled();
+  assert.deepEqual(startupDiagnostics(h).slice(-2), [
+    ["SERVER_CLEANUP", "ERROR"],
+    ["POOL_CLEANUP", "ERROR"],
+  ]);
+});
+
+test("startup diagnostic sink throws and rejections never escape", async () => {
+  for (const write of [
+    () => {
+      throw STARTUP_PRIVATE;
+    },
+    () => Promise.reject(new Error(STARTUP_PRIVATE)),
+  ]) {
+    const h = startupHarness({
+      importFailure: true,
+      failure: STARTUP_PRIVATE,
+      write,
+    });
+    await rejectStartup(h);
+    await startupSettled();
+  }
+});
+
+test("startup permanent resource error handlers fail closed after readiness", async () => {
+  for (const resource of ["pool", "server"]) {
+    const h = startupHarness();
+    await startDriver(startupEnvironment(), h.dependencies);
+    h[resource].emit("error", new Error(STARTUP_PRIVATE));
+    h[resource].emit("error", STARTUP_PRIVATE);
+    h.processLike.emit("SIGTERM");
+    h.processLike.emit("SIGINT");
+    await startupSettled();
+    assert.equal(h.processLike.exitCode, 1);
+    assert.deepEqual(
+      h.events.filter(([event]) => event === "exit"),
+      [["exit", 1]],
+    );
+    assert.equal(h.events.filter(([event]) => event === "pool.end").length, 1);
+    assert.equal(
+      h.events.filter(([event]) => event === "server.close").length,
+      1,
+    );
+    assert.deepEqual(
+      startupDiagnostics(h).filter(([, outcome]) => outcome === "ERROR"),
+      [["RUNTIME", "ERROR"]],
+    );
+  }
+});
+
+test("startup duplicate shutdown signals cannot hide cleanup failure", async () => {
+  const h = startupHarness({ end: () => Promise.reject(STARTUP_PRIVATE) });
+  await startDriver(startupEnvironment(), h.dependencies);
+  h.processLike.emit("SIGTERM");
+  h.processLike.emit("SIGINT");
+  await startupSettled();
+  assert.equal(h.processLike.exitCode, 1);
+  assert.deepEqual(
+    h.events.filter(([event]) => event === "exit"),
+    [["exit", 1]],
+  );
+  assert.equal(h.events.filter(([event]) => event === "pool.end").length, 1);
+  assert.deepEqual(startupDiagnostics(h).at(-1), ["POOL_CLEANUP", "ERROR"]);
+});
+
+test("startup ledger errors map only finite own string data codes", async () => {
+  const cases = [
+    ["42501", "LEDGER_PERMISSION_DENIED"],
+    ["28P01", "LEDGER_AUTH_REJECTED"],
+    ["28000", "LEDGER_AUTH_REJECTED"],
+    ["3D000", "LEDGER_DATABASE_MISSING"],
+    ...[
+      "DEPTH_ZERO_SELF_SIGNED_CERT",
+      "SELF_SIGNED_CERT_IN_CHAIN",
+      "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+      "CERT_HAS_EXPIRED",
+      "CERT_NOT_YET_VALID",
+      "ERR_TLS_CERT_ALTNAME_INVALID",
+    ].map((code) => [code, "TLS_VERIFICATION_FAILED"]),
+    ["ENOTFOUND", "NAME_RESOLUTION_FAILED"],
+    ["EAI_AGAIN", "NAME_RESOLUTION_FAILED"],
+    ["ECONNREFUSED", "CONNECTION_REFUSED"],
+    ["ETIMEDOUT", "CONNECTION_TIMEOUT"],
+  ];
+  for (const [code, label] of cases) {
+    const error = new Error(STARTUP_PRIVATE);
+    error.code = code;
+    error.detail = STARTUP_PRIVATE;
+    const h = startupHarness({ query: () => Promise.reject(error) });
+    await rejectStartup(h);
+    assert.equal(JSON.parse(h.lines.at(-1)).code, label);
+    assert.equal(h.lines.join("").includes(code), false);
+  }
+});
+
+test("startup ledger codes never invoke getters proxies or coercion", async () => {
+  let propertyReads = 0;
+  const getter = {};
+  Object.defineProperty(getter, "code", {
+    get: () => {
+      propertyReads += 1;
+      throw new Error(STARTUP_PRIVATE);
+    },
+  });
+  const proxy = new Proxy(
+    {},
+    {
+      getOwnPropertyDescriptor: () => {
+        propertyReads += 1;
+        throw STARTUP_PRIVATE;
+      },
+      get: () => {
+        propertyReads += 1;
+        throw STARTUP_PRIVATE;
+      },
+    },
+  );
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+  const coercible = {
+    toString: () => {
+      propertyReads += 1;
+      throw STARTUP_PRIVATE;
+    },
+  };
+  for (const error of [
+    getter,
+    proxy,
+    revoked.proxy,
+    Object.create({ code: "42501" }),
+    { code: STARTUP_PRIVATE },
+    { code: coercible },
+    { code: 42501 },
+    { code: "__proto__" },
+    { code: "constructor" },
+    null,
+    STARTUP_PRIVATE,
+  ]) {
+    const h = startupHarness({ query: () => Promise.reject(error) });
+    await rejectStartup(h);
+    assert.equal(JSON.parse(h.lines.at(-1)).code, "UNKNOWN");
+  }
+  assert.equal(propertyReads, 0);
+});
+
+test("startup emitted ledger error preserves mapped label without raw error", async () => {
+  const h = startupHarness({ query: () => new Promise(() => {}) });
+  const started = rejectStartup(h);
+  await startupSettled();
+  const error = new Error(STARTUP_PRIVATE);
+  error.code = "42501";
+  h.pool.emit("error", error);
+  await started;
+  assert.equal(JSON.parse(h.lines.at(-1)).code, "LEDGER_PERMISSION_DENIED");
+});
+
+test("startup nonledger errors cannot claim a ledger cause", async () => {
+  const error = new Error(STARTUP_PRIVATE);
+  error.code = "42501";
+  const h = startupHarness({ importFailure: true, failure: error });
+  await rejectStartup(h);
+  assert.equal(JSON.parse(h.lines.at(-1)).code, "UNKNOWN");
+});
+
+test("startup rejects unversioned login payloads before pg import", async () => {
+  for (const key of [
+    "CRM_CANARY_KLINIK_LOGIN_JSON",
+    "CRM_CANARY_NON_KLINIK_LOGIN_JSON",
+  ]) {
+    const environment = startupEnvironment();
+    const login = JSON.parse(environment[key]);
+    delete login.schema_version;
+    environment[key] = canonicalJson(login);
+    const h = startupHarness();
+    await rejectStartup(h, environment);
+    assert.deepEqual(h.events, []);
+    assert.deepEqual(startupDiagnostics(h), [
+      ["CONFIG", "STARTED"],
+      ["CONFIG", "ERROR"],
+    ]);
+  }
 });

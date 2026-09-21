@@ -1,9 +1,11 @@
 /* eslint-env node */
 
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { writeSync } from "node:fs";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { types as utilTypes } from "node:util";
 
 import {
   UI_CHECKS,
@@ -666,39 +668,242 @@ export function createHttpHandler(dependencies) {
   };
 }
 
-export async function main(environment = process.env) {
-  const config = loadRuntimeConfig(environment);
-  const { Pool } = await import("pg");
-  const pool = new Pool({
-    connectionString: config.ledgerDatabaseUrl,
-    max: 2,
-    idleTimeoutMillis: 10_000,
-    connectionTimeoutMillis: 10_000,
-    application_name: "rereply-crm-canary-driver",
-  });
-  const ledger = new PostgresExecutionLedger(pool);
-  await ledger.initialize();
-  const server = http.createServer(createHttpHandler({ config, ledger }));
-  server.on("clientError", (_error, socket) => socket.destroy());
-  await new Promise((resolveListen, rejectListen) => {
-    server.once("error", rejectListen);
-    server.listen(config.port, "0.0.0.0", resolveListen);
-  });
-  const shutdown = () => {
-    server.close(() => {
-      pool.end().finally(() => {
-        process.exitCode = 0;
-      });
-    });
+function ledgerStartupCode(error) {
+  // Only an own data property may select a reviewed label. Never read code via
+  // property access, coerce it, or inspect messages, stacks, causes or details.
+  const codes = {
+    42501: "LEDGER_PERMISSION_DENIED",
+    "28P01": "LEDGER_AUTH_REJECTED",
+    28000: "LEDGER_AUTH_REJECTED",
+    "3D000": "LEDGER_DATABASE_MISSING",
+    DEPTH_ZERO_SELF_SIGNED_CERT: "TLS_VERIFICATION_FAILED",
+    SELF_SIGNED_CERT_IN_CHAIN: "TLS_VERIFICATION_FAILED",
+    UNABLE_TO_VERIFY_LEAF_SIGNATURE: "TLS_VERIFICATION_FAILED",
+    CERT_HAS_EXPIRED: "TLS_VERIFICATION_FAILED",
+    CERT_NOT_YET_VALID: "TLS_VERIFICATION_FAILED",
+    ERR_TLS_CERT_ALTNAME_INVALID: "TLS_VERIFICATION_FAILED",
+    ENOTFOUND: "NAME_RESOLUTION_FAILED",
+    EAI_AGAIN: "NAME_RESOLUTION_FAILED",
+    ECONNREFUSED: "CONNECTION_REFUSED",
+    ETIMEDOUT: "CONNECTION_TIMEOUT",
   };
-  process.once("SIGTERM", shutdown);
-  process.once("SIGINT", shutdown);
-  return { server, pool };
+  try {
+    if (
+      error === null ||
+      typeof error !== "object" ||
+      utilTypes.isProxy(error)
+    ) {
+      return "UNKNOWN";
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+    if (
+      !descriptor ||
+      !Object.hasOwn(descriptor, "value") ||
+      typeof descriptor.value !== "string" ||
+      !Object.hasOwn(codes, descriptor.value)
+    )
+      return "UNKNOWN";
+    return codes[descriptor.value];
+  } catch {
+    // Includes hostile/revoked proxies; never expose descriptor/trap failures.
+    return "UNKNOWN";
+  }
+}
+
+// Dependency seams are for offline tests. The entrypoint below supplies only
+// the production defaults; no runtime environment value selects an adapter.
+export async function startDriver(
+  environment,
+  {
+    loadPg = () => import("pg"),
+    createServer = (handler) => http.createServer(handler),
+    processLike = process,
+    // Fixed small records use synchronous stderr so fatal exit cannot truncate
+    // an asynchronous diagnostic write. No file path or runtime data is used.
+    writeDiagnostic = (line) => writeSync(2, line),
+    scheduleTimeout = setTimeout,
+    cancelTimeout = clearTimeout,
+  } = {},
+) {
+  let stage = "CONFIG";
+  let pool;
+  let server;
+  let ready = false;
+  let fatal = false;
+  let resourceCode = "UNKNOWN";
+  let cleanupPromise;
+  let stopping = false;
+  let rejectResourceFailure;
+  const resourceFailure = new Promise((_resolve, reject) => {
+    rejectResourceFailure = reject;
+  });
+  // An error can arrive synchronously before its startup race is installed.
+  resourceFailure.catch(() => {});
+
+  const diagnostic = (
+    fixedStage,
+    outcome,
+    code = outcome === "ERROR" ? "UNKNOWN" : "NONE",
+  ) => {
+    // All output values are fixed labels, never an Error or environment value.
+    try {
+      Promise.resolve(
+        writeDiagnostic(
+          JSON.stringify({
+            schema_version: 1,
+            event: "crm_canary_driver_startup",
+            stage: fixedStage,
+            outcome,
+            code,
+          }) + "\n",
+        ),
+      ).catch(() => {});
+    } catch {
+      // Diagnostic sink failure must not become an unhandled exception.
+    }
+  };
+  const begin = (fixedStage) => {
+    stage = fixedStage;
+    diagnostic(stage, "STARTED");
+  };
+  const closeResource = async (fixedStage, close) => {
+    let timer;
+    try {
+      const closed = await Promise.race([
+        Promise.resolve()
+          .then(close)
+          .then(
+            () => true,
+            () => false,
+          ),
+        new Promise((resolveTimeout) => {
+          timer = scheduleTimeout(() => resolveTimeout(false), 5_000);
+        }),
+      ]);
+      if (!closed) {
+        fatal = true;
+        diagnostic(fixedStage, "ERROR");
+      }
+    } catch {
+      fatal = true;
+      diagnostic(fixedStage, "ERROR");
+    } finally {
+      cancelTimeout(timer);
+    }
+  };
+  const cleanup = () => {
+    if (!cleanupPromise) {
+      cleanupPromise = (async () => {
+        processLike.removeListener("SIGTERM", shutdown);
+        processLike.removeListener("SIGINT", shutdown);
+        if (server) {
+          await closeResource(
+            "SERVER_CLEANUP",
+            () =>
+              new Promise((resolveClose, rejectClose) => {
+                server.close((error) => {
+                  if (error && server.listening) rejectClose();
+                  else resolveClose();
+                });
+                if (fatal) server.closeAllConnections();
+              }),
+          );
+        }
+        if (pool) await closeResource("POOL_CLEANUP", () => pool.end());
+      })();
+    }
+    return cleanupPromise;
+  };
+  const shutdown = () => {
+    if (stopping) return;
+    stopping = true;
+    void cleanup().then(
+      () => {
+        processLike.exitCode = fatal ? 1 : 0;
+        // A failed close can retain handles. Fatal termination remains bounded.
+        if (fatal) processLike.exit(1);
+      },
+      () => {
+        processLike.exitCode = 1;
+        processLike.exit(1);
+      },
+    );
+  };
+  const resourceError = (error) => {
+    if (fatal) return;
+    fatal = true;
+    if (stage === "LEDGER_INITIALIZE") resourceCode = ledgerStartupCode(error);
+    if (ready) {
+      diagnostic("RUNTIME", "ERROR");
+      shutdown();
+    } else {
+      rejectResourceFailure(
+        new DriverRequestError("driver startup failed", 503),
+      );
+    }
+  };
+
+  try {
+    begin("CONFIG");
+    const config = loadRuntimeConfig(environment);
+    begin("PG_IMPORT");
+    const { Pool } = await loadPg();
+    begin("POOL_CREATE");
+    pool = new Pool({
+      connectionString: config.ledgerDatabaseUrl,
+      max: 2,
+      idleTimeoutMillis: 10_000,
+      connectionTimeoutMillis: 10_000,
+      application_name: "rereply-crm-canary-driver",
+    });
+    pool.on("error", resourceError);
+    const ledger = new PostgresExecutionLedger(pool);
+    begin("LEDGER_INITIALIZE");
+    await Promise.race([ledger.initialize(), resourceFailure]);
+    if (fatal) throw new DriverRequestError("driver startup failed", 503);
+    begin("LISTEN");
+    server = createServer(createHttpHandler({ config, ledger }));
+    server.on("error", resourceError);
+    server.on("clientError", (_error, socket) => socket.destroy());
+    await Promise.race([
+      new Promise((resolveListen) => {
+        server.listen(config.port, "0.0.0.0", resolveListen);
+      }),
+      resourceFailure,
+    ]);
+    if (fatal) throw new DriverRequestError("driver startup failed", 503);
+    processLike.once("SIGTERM", shutdown);
+    processLike.once("SIGINT", shutdown);
+    ready = true;
+    diagnostic("READY", "SUCCESS");
+    return { server, pool };
+  } catch (error) {
+    const code =
+      stage === "LEDGER_INITIALIZE"
+        ? fatal
+          ? resourceCode
+          : ledgerStartupCode(error)
+        : "UNKNOWN";
+    fatal = true;
+    diagnostic(stage, "ERROR", code);
+    try {
+      await cleanup();
+    } catch {
+      diagnostic("CLEANUP", "ERROR");
+    }
+    // The rejection itself is fixed too, with no original exception/cause.
+    throw new DriverRequestError("driver startup failed", 503);
+  }
+}
+
+export async function main(environment = process.env) {
+  return startDriver(environment);
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
 if (invokedPath && fileURLToPath(import.meta.url) === invokedPath) {
   main().catch(() => {
-    process.exitCode = 1;
+    // Cleanup is bounded before rejection; do not retain failed pool handles.
+    process.exit(1);
   });
 }

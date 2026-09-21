@@ -376,9 +376,11 @@ def runtime_spec(a: dict[str, Any], d: dict[str, Any], protected: dict[str, Any]
     values = {
         "CRM_CANARY_FIXTURE_DESCRIPTOR_JSON": common.canonical_payload_bytes(driver_descriptor).decode(),
         "CRM_CANARY_KLINIK_LOGIN_JSON": common.canonical_payload_bytes({
+            "schema_version": 1,
             "email": protected["registration"]["klinik_email"],
             "password": protected["credentials"]["klinik_password"]}).decode(),
         "CRM_CANARY_NON_KLINIK_LOGIN_JSON": common.canonical_payload_bytes({
+            "schema_version": 1,
             "email": protected["registration"]["non_klinik_email"],
             "password": protected["credentials"]["non_klinik_password"]}).decode(),
         "CRM_CANARY_META_APP_SECRET": protected["credentials"]["meta_app_secret"],
@@ -994,14 +996,53 @@ class Provider(ReadOnlyProvider):
             raise CreateRejected("CREATE_TRANSPORT_AMBIGUOUS", status) from None
 
 
+def normalize_provider_representation(actual: Any, expected: dict[str, Any]) -> dict[str, Any]:
+    """Normalize only the reviewed image-app defaults, in memory.
+
+    DigitalOcean ticket 12831879 (2026-09-21) confirms the exact stack feature
+    below is automatically applied and inert for image components. The single
+    root ingress is the equivalent representation of our sole legacy route.
+    This is not a general ingress/feature allowlist or permission to rewrite
+    provider state. All remaining fields still pass spec_projection unchanged.
+    """
+    require(type(actual) is dict and type(expected) is dict, "driver spec missing")
+    require(type(expected.get("services")) is list and len(expected["services"]) == 1
+            and type(expected["services"][0]) is dict, "expected driver service differs")
+    wanted = expected["services"][0]
+    observed = copy.deepcopy(actual)
+    require(type(observed.get("services")) is list and len(observed["services"]) == 1
+            and type(observed["services"][0]) is dict, "driver service inventory differs")
+    if observed.get("features") == ["buildpack-stack=ubuntu-22"]:
+        image = wanted.get("image")
+        require(type(image) is dict and image.get("registry_type") == "GHCR"
+                and image.get("registry") == "medtechcorps-netizen"
+                and image.get("repository") == "rereply-crm-canary-driver"
+                and type(image.get("digest")) is str
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", image["digest"]) is not None
+                and not any(key in wanted or key in observed["services"][0]
+                            for key in ("git", "github", "gitlab", "bitbucket", "dockerfile_path")),
+                "driver feature context differs")
+        observed.pop("features")
+    if "ingress" in observed:
+        require(type(wanted.get("name")) is str and wanted["name"]
+                and common.canonical_payload_bytes(wanted.get("routes")) == b'[{"path":"/"}]'
+                and "routes" not in observed["services"][0], "driver route representation differs")
+        ingress = {"rules": [{"component": {"name": wanted["name"]},
+                               "match": {"path": {"prefix": "/"}}}]}
+        require(common.canonical_payload_bytes(observed["ingress"])
+                == common.canonical_payload_bytes(ingress), "driver ingress differs")
+        observed.pop("ingress")
+        observed["services"][0]["routes"] = copy.deepcopy(wanted["routes"])
+    return observed
+
+
 def spec_projection(actual: Any, expected: dict[str, Any]) -> dict[str, Any]:
     """Strict public shape plus opaque initial secret ciphertext equality.
 
     The provider is trusted to store submitted secrets. Readback proves stable
     ciphertext/spec identity, not independent decryption or image measurement.
     """
-    observed = copy.deepcopy(actual)
-    require(type(observed) is dict, "driver spec missing")
+    observed = normalize_provider_representation(actual, expected)
     # Only explicitly benign empty API defaults may be added.
     for key in ("alerts", "domains", "envs", "features", "jobs", "workers", "static_sites", "functions"):
         if observed.get(key) == []:
@@ -1031,7 +1072,8 @@ def spec_projection(actual: Any, expected: dict[str, Any]) -> dict[str, Any]:
             require(value == env["value"], "public runtime version differs")
     projection = copy.deepcopy(observed)
     projection["services"][0]["envs"] = copy.deepcopy(expected_service["envs"])
-    require(projection == expected, "driver spec policy differs")
+    require(common.canonical_payload_bytes(projection) == common.canonical_payload_bytes(expected),
+            "driver spec policy differs")
     service["envs"] = sorted(envs, key=lambda item: item["key"])
     return observed
 
