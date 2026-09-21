@@ -240,15 +240,21 @@ def run_once(a: Any, original: Any, descriptor: Any, protected: Any, *, provider
     reconstructed = rehydrate(request, checked, result, transport)
     expected = policy.historical_expected_spec(original, d, checked, reconstructed)
     mark_stage("PROVIDER_PRESTATE")
-    reader.require_absent()
-    first = provider.snapshot()
+    with policy.prestate_diagnostic("CANARY_ABSENCE"):
+        reader.require_absent()
+    with policy.prestate_diagnostic("FIRST_SNAPSHOT"):
+        first = provider.snapshot()
     sleep(3)
-    current_guard()
-    second = provider.snapshot()
+    with policy.prestate_diagnostic("PRESTATE_GUARD"):
+        current_guard()
+    with policy.prestate_diagnostic("SECOND_SNAPSHOT"):
+        second = provider.snapshot()
     report = policy.inspect_pair(inspection_authorization(a), original, d, run, artifacts,
         first, second, control_sha=a["control_sha"], expected_spec=expected, now=now())
-    validate_authorization(a, control_sha=a["control_sha"], now=now())
-    current_guard()
+    with policy.prestate_diagnostic("PRESTATE_AUTHORIZATION"):
+        validate_authorization(a, control_sha=a["control_sha"], now=now())
+    with policy.prestate_diagnostic("PRESTATE_GUARD"):
+        current_guard()
     if a["mode"] == "check":
         return {**report, "state": "existing-driver-check-complete",
                 "authorization_sha256": common.sha256_value(a), "binding_sha256": a["binding_sha256"]}
@@ -343,6 +349,10 @@ def failure_report(error: Exception) -> dict[str, Any]:
     stage = CURRENT_STAGE if type(CURRENT_STAGE) is str and CURRENT_STAGE in STAGES else "AUTHORIZATION"
     result = {"schema_version": 1, "state": "existing-driver-recovery-stopped",
               "code": "RECOVERY_STOPPED_RECONCILE_ONLY", "stage": stage, "retry_authorized": False}
+    if stage == "PROVIDER_PRESTATE" and type(error) is policy.PrestateRejected:
+        code = vars(error).get("code")
+        if type(code) is str and code in policy.PRESTATE_DIAGNOSTICS:
+            result["diagnostic_code"] = code
     if type(error) is UpdateRejected and type(error.status) is int and 100 <= error.status <= 599:
         result["http_status"] = error.status
     return result
@@ -436,74 +446,102 @@ class ProviderRead:
         return policy._complete_inventory(raw, "deployments", count)
 
     def _production(self, summary: Any) -> str:
-        app = self._get("/v2/apps/" + self.production_id).get("app")
-        require(type(app) is dict and type(app.get("active_deployment")) is dict)
-        active = common.require_uuid(app["active_deployment"].get("id"), "production active")
+        with policy.prestate_diagnostic("PRODUCTION_APP_READ"):
+            app = self._get("/v2/apps/" + self.production_id).get("app")
+        with policy.prestate_diagnostic("PRODUCTION_ACTIVE_IDENTITY"):
+            require(type(app) is dict and type(app.get("active_deployment")) is dict)
+            active = common.require_uuid(app["active_deployment"].get("id"), "production active")
         self.production_deployment_ids.add(active)
-        dep = self._get("/v2/apps/" + self.production_id + "/deployments/" + active).get("deployment")
-        target = self.planner.normalize_target_descriptor(common.canonical_payload_bytes({"app_id": self.production_id,
+        with policy.prestate_diagnostic("PRODUCTION_DEPLOYMENT_READ"):
+            dep = self._get("/v2/apps/" + self.production_id + "/deployments/" + active).get("deployment")
+        with policy.prestate_diagnostic("PRODUCTION_STATE"):
+            target = self.planner.normalize_target_descriptor(common.canonical_payload_bytes({"app_id": self.production_id,
                                                            "default_ingress": app.get("default_ingress")}).decode(), self.contract)
-        expected, images = self.planner.predecessor_provider_expectation(self.contract, {}, None)
-        state, _ = self.planner.provider_state({"app": app}, {"deployment": dep}, self.contract, target, expected, images)
-        require(common.sha256_value(state) == self.a["production_state_sha256"])
-        history = self._inventory(self.production_id, 164)
-        records = []
-        for row in history:
-            require(row.get("phase") in {"ACTIVE", "SUPERSEDED", "CANCELED", "ERROR"})
-            require(common.require_timestamp(row.get("created_at"), "production history time")
+            expected, images = self.planner.predecessor_provider_expectation(self.contract, {}, None)
+            state, _ = self.planner.provider_state({"app": app}, {"deployment": dep}, self.contract, target, expected, images)
+            require(common.sha256_value(state) == self.a["production_state_sha256"])
+        with policy.prestate_diagnostic("PRODUCTION_HISTORY_READ"):
+            history = self._inventory(self.production_id, 164)
+        with policy.prestate_diagnostic("PRODUCTION_HISTORY_POLICY"):
+            records = []
+            for row in history:
+                require(row.get("phase") in {"ACTIVE", "SUPERSEDED", "CANCELED", "ERROR"})
+                require(common.require_timestamp(row.get("created_at"), "production history time")
                     <= common.require_timestamp(dep.get("created_at"), "production active time"))
-            common.require_timestamp(row.get("updated_at"), "production history update")
-            records.append({key: row[key] for key in ("id", "created_at", "updated_at", "phase")})
-        require({row["id"] for row in records if row["phase"] == "ACTIVE"} == {active})
-        require(common.sha256_value(sorted(records, key=lambda row: row["id"])) == self.a["production_history_sha256"])
+                common.require_timestamp(row.get("updated_at"), "production history update")
+                records.append({key: row[key] for key in ("id", "created_at", "updated_at", "phase")})
+            require({row["id"] for row in records if row["phase"] == "ACTIVE"} == {active})
+            require(common.sha256_value(sorted(records, key=lambda row: row["id"])) == self.a["production_history_sha256"])
         return common.sha256_value(state)
 
     def _snapshot(self, deployment_id: str | None = None) -> dict[str, Any]:
-        size = self._get("/v2/apps/tiers/instance_sizes/" + self.d["plan"]["instance_size_slug"]).get("instance_size")
-        require(type(size) is dict and size.get("slug") == self.d["plan"]["instance_size_slug"]
+        with policy.prestate_diagnostic("SIZE_READ"):
+            size = self._get("/v2/apps/tiers/instance_sizes/" + self.d["plan"]["instance_size_slug"]).get("instance_size")
+        with policy.prestate_diagnostic("SIZE_POLICY"):
+            require(type(size) is dict and size.get("slug") == self.d["plan"]["instance_size_slug"]
                 and size.get("usd_per_month") == self.d["plan"]["monthly_usd"])
-        regions = self._get("/v2/apps/regions").get("regions")
-        require(type(regions) is list and len([row for row in regions if type(row) is dict
+        with policy.prestate_diagnostic("REGIONS_READ"):
+            regions = self._get("/v2/apps/regions").get("regions")
+        with policy.prestate_diagnostic("REGIONS_POLICY"):
+            require(type(regions) is list and len([row for row in regions if type(row) is dict
             and row.get("slug") == self.d["plan"]["region"] and row.get("disabled", False) is False]) == 1)
-        apps_raw = self._get("/v2/apps?per_page=200&page=1")
-        apps = policy._complete_inventory(apps_raw, "apps", 3)
-        matches = [row for row in apps if policy._hash_id(row["id"]) == policy.IDENTITY_PINS["app_id_sha256"]]
-        productions = [row for row in apps if policy._hash_id(row["id"]) == self.contract["provider"]["app_id_sha256"]]
-        require(len(matches) == 1 and len(productions) == 1 and matches[0]["id"] != productions[0]["id"])
-        if self.app_id is not None:
-            require(self.app_id == matches[0]["id"] and self.production_id == productions[0]["id"])
+        with policy.prestate_diagnostic("APPS_READ"):
+            apps_raw = self._get("/v2/apps?per_page=200&page=1")
+        with policy.prestate_diagnostic("APPS_INVENTORY"):
+            apps = policy._complete_inventory(apps_raw, "apps", 3)
+        with policy.prestate_diagnostic("APP_SELECTION"):
+            matches = [row for row in apps if policy._hash_id(row["id"]) == policy.IDENTITY_PINS["app_id_sha256"]]
+            productions = [row for row in apps if policy._hash_id(row["id"]) == self.contract["provider"]["app_id_sha256"]]
+            require(len(matches) == 1 and len(productions) == 1 and matches[0]["id"] != productions[0]["id"])
+            if self.app_id is not None:
+                require(self.app_id == matches[0]["id"] and self.production_id == productions[0]["id"])
         self.app_id, self.production_id = matches[0]["id"], productions[0]["id"]
-        for row in apps:
-            if row["id"] != self.app_id or deployment_id is None:
-                require(not any(row.get(key) for key in ("pending_deployment", "in_progress_deployment", "pinned_deployment")))
-        inventory = self._inventory(self.app_id, 3 if deployment_id is not None else 2)
-        ids = {row["id"] for row in inventory}
-        old_ids = ids if deployment_id is None else ids - {deployment_id}
-        require({policy._hash_id(identity) for identity in old_ids} == {
+        with policy.prestate_diagnostic("APP_IDLE"):
+            for row in apps:
+                if row["id"] != self.app_id or deployment_id is None:
+                    require(not any(row.get(key) for key in ("pending_deployment", "in_progress_deployment", "pinned_deployment")))
+        with policy.prestate_diagnostic("DRIVER_HISTORY_READ"):
+            inventory = self._inventory(self.app_id, 3 if deployment_id is not None else 2)
+        with policy.prestate_diagnostic("DRIVER_HISTORY_POLICY"):
+            ids = {row["id"] for row in inventory}
+            old_ids = ids if deployment_id is None else ids - {deployment_id}
+            require({policy._hash_id(identity) for identity in old_ids} == {
             policy.IDENTITY_PINS["failed_deployment_id_sha256"], policy.IDENTITY_PINS["redeployed_deployment_id_sha256"]})
-        if deployment_id is not None:
-            require(deployment_id in ids and self.new_deployment_id == deployment_id)
+            if deployment_id is not None:
+                require(deployment_id in ids and self.new_deployment_id == deployment_id)
         self.driver_deployment_ids.update(ids)
-        app = self._get("/v2/apps/" + self.app_id).get("app")
+        with policy.prestate_diagnostic("DRIVER_APP_READ"):
+            app = self._get("/v2/apps/" + self.app_id).get("app")
         deps = []
         for row in sorted(inventory, key=lambda item: item["id"]):
-            full = self._get("/v2/apps/" + self.app_id + "/deployments/" + row["id"]).get("deployment")
-            require(full.get("id") == row["id"])
-            if deployment_id == row["id"]:
-                require(row.get("phase") in PHASE_RANK and full.get("phase") in PHASE_RANK
+            with policy.prestate_diagnostic("DRIVER_DEPLOYMENT_READ"):
+                full = self._get("/v2/apps/" + self.app_id + "/deployments/" + row["id"]).get("deployment")
+            with policy.prestate_diagnostic("DRIVER_DEPLOYMENT_POLICY"):
+                require(full.get("id") == row["id"])
+                if deployment_id == row["id"]:
+                    require(row.get("phase") in PHASE_RANK and full.get("phase") in PHASE_RANK
                         and PHASE_RANK[full["phase"]] >= PHASE_RANK[row["phase"]])
-            else:
-                require(full.get("phase") == row.get("phase"))
-            deps.append(_deployment_row(full))
+                else:
+                    require(full.get("phase") == row.get("phase"))
+                deps.append(_deployment_row(full))
         production = self._production(productions[0])
-        metadata = fixture_metadata(self.api)
-        require(common.sha256_value(metadata) == self.a["fixture_environment_sha256"])
+        with policy.prestate_diagnostic("FIXTURE_METADATA_READ"):
+            metadata = fixture_metadata(self.api)
+        with policy.prestate_diagnostic("FIXTURE_METADATA_BINDING"):
+            require(common.sha256_value(metadata) == self.a["fixture_environment_sha256"])
         app_rows = [{"id": row["id"], "spec": {"name": row["spec"]["name"]}} for row in apps]
-        return {"observed_at": common.format_timestamp(self.now()), "account": self._get("/v2/account").get("account"),
+        observed_at = common.format_timestamp(self.now())
+        with policy.prestate_diagnostic("ACCOUNT_READ"):
+            account = self._get("/v2/account").get("account")
+        with policy.prestate_diagnostic("FIREWALL_READ"):
+            firewall = self._get("/v2/databases/" + self.d["plan"]["ledger"]["cluster_id"] + "/firewall")
+        with policy.prestate_diagnostic("CANARY_METADATA_READ"):
+            canary = self.reader.snapshot()
+        return {"observed_at": observed_at, "account": account,
                 "apps": {"apps": sorted(app_rows, key=lambda row: row["id"]), "meta": {"total": 3}, "links": {}},
                 "app": app, "deployments": {"deployments": deps, "meta": {"total": len(deps)}, "links": {}},
-                "firewall": self._get("/v2/databases/" + self.d["plan"]["ledger"]["cluster_id"] + "/firewall"),
-                "canary_environment": self.reader.snapshot(), "fixture_environment_sha256": common.sha256_value(metadata),
+                "firewall": firewall,
+                "canary_environment": canary, "fixture_environment_sha256": common.sha256_value(metadata),
                 "production_state_sha256": production}
 
     def snapshot(self) -> dict[str, Any]:
@@ -610,6 +648,55 @@ def _artifact_zero(api: Any, run_id: str) -> None:
             == {"total_count": 0, "artifacts": []})
 
 
+# This is quarantined historical evidence, NEVER a passing predecessor. A
+# control repair must not erase burned history or generically admit other heads.
+FAILED_CHECK_ID = "35643414394"
+FAILED_CHECK_CONTROL = "f4b94fdc82a8c2914c356e2644f7632be4e4851e"
+FAILED_CHECK_TITLE = ("Check existing CRM driver 627c314e-14c9-4750-a832-926956bc2324 "
+                      "205f27d01a8eb98f8e44c404158f1c83aecd3ca1cb616f78dde94c685a52a080")
+FAILED_CHECK_TIMES = {"created_at": "2026-09-21T19:13:05Z", "updated_at": "2026-09-21T19:16:53Z"}
+FAILED_CHECK_JOBS = {
+    "authority": (106477986928, "success", "2026-09-21T19:13:09Z", "2026-09-21T19:13:20Z"),
+    "check": (106478062554, "failure", "2026-09-21T19:15:36Z", "2026-09-21T19:16:46Z"),
+    "recover": (106478064026, "skipped", "2026-09-21T19:13:20Z", "2026-09-21T19:13:20Z"),
+    "gate": (106479272066, "failure", "2026-09-21T19:16:49Z", "2026-09-21T19:16:52Z"),
+}
+
+
+def _quarantined_failed_check(api: Any, item: Any, workflow_id: int) -> None:
+    """Authenticate only the frozen failed read-only run, including no writes."""
+    require(type(workflow_id) is int and workflow_id == 363575080)
+    latest = api.get(fixture.API_PREFIX + "/actions/runs/" + FAILED_CHECK_ID)
+    for run in (item, latest):
+        require(_run_identity(run, control_sha=FAILED_CHECK_CONTROL, workflow_id=workflow_id,
+                              title=FAILED_CHECK_TITLE) == FAILED_CHECK_ID)
+        require(run.get("status") == "completed" and run.get("conclusion") == "failure"
+                and all(run.get(key) == value for key, value in FAILED_CHECK_TIMES.items()))
+    jobs = _jobs(api, FAILED_CHECK_ID)
+    require(len(jobs) == 4)
+    by_name = {row["name"]: row for row in jobs}
+    for key, (identity, conclusion, started, completed) in FAILED_CHECK_JOBS.items():
+        row = by_name[JOB_NAMES[key]]
+        require(row["id"] == identity and row.get("status") == "completed"
+                and row.get("conclusion") == conclusion and row.get("started_at") == started
+                and row.get("completed_at") == completed)
+        if key == "recover":
+            expected_steps = []
+        elif key == "gate":
+            expected_steps = [("Set up job", "success"), ("Require exactly the selected recovery mode", "failure"),
+                              ("Complete job", "success")]
+        else:
+            middle = "Validate public authority without private credentials" if key == "authority" \
+                else "Rehydrate and inspect only inside the protected boundary"
+            expected_steps = [("Set up job", "success"), ("Check out exact protected controls", "success"),
+                              (middle, conclusion), ("Post Check out exact protected controls", "success"),
+                              ("Complete job", "success")]
+        steps = row.get("steps")
+        require(type(steps) is list and all(type(step) is dict and step.get("status") == "completed" for step in steps)
+                and [(step.get("name"), step.get("conclusion")) for step in steps] == expected_steps)
+    _artifact_zero(api, FAILED_CHECK_ID)
+
+
 def current_guard(api: Any, root: Path, a: Any, *, now: Any = lambda: dt.datetime.now(dt.timezone.utc)) -> str:
     """Current hosted identity, complete burned history and predecessor binding."""
     validate_authorization(a, control_sha=a["control_sha"], now=now())
@@ -655,6 +742,14 @@ def current_guard(api: Any, root: Path, a: Any, *, now: Any = lambda: dt.datetim
     predecessor = None
     current = None
     for item in inventory["workflow_runs"]:
+        policy._json_tree(item)
+        require(type(item) is dict)
+        if common.require_run_id(item.get("id"), "history identity") == FAILED_CHECK_ID:
+            require(FAILED_CHECK_ID not in seen and current_id != FAILED_CHECK_ID
+                    and a["check_run_id"] != FAILED_CHECK_ID)
+            _quarantined_failed_check(api, item, workflow["id"])
+            seen.add(FAILED_CHECK_ID)
+            continue
         rid = _run_identity(item, control_sha=sha, workflow_id=workflow["id"])
         require(rid not in seen)
         seen.add(rid)
@@ -669,7 +764,7 @@ def current_guard(api: Any, root: Path, a: Any, *, now: Any = lambda: dt.datetim
                     and item.get("status") == "completed")
             if rid == a["check_run_id"]:
                 predecessor = item
-    require(current is not None)
+    require(current is not None and FAILED_CHECK_ID in seen)
     created = common.require_timestamp(current.get("created_at"), "recovery run creation")
     require(common.require_timestamp(a["issued_at"], "authority issue") <= created
             < common.require_timestamp(a["expires_at"], "authority expiry") and created <= now())
