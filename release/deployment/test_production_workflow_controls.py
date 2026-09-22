@@ -71,10 +71,10 @@ EXACT_IMAGE_BUILD_ACTION = (
     "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6"
 )
 EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
-    "780ec6e53f1cffae0b7c71939ad0c00a77a79f132f198cdcb1c23d806952d740"
+    "ab748e391ea4afa630d6ec87a32704cf29955d7f38fb2386e4c3307df89ae49e"
 )
 EXACT_CRM_CANARY_DRIVER_PUBLISHER_SHA256 = (
-    "20d9810c1f3f68e188ee152cd9d42efa17ae43e128345e3f5b1f5d4baf0fa382"
+    "9e7d0b83d55adbfa19f121787b254ed724c22c90d0426d33a9f0de3c41260bb4"
 )
 EXACT_IMAGE_GATE_STEP_SHA256 = (
     "1b4bf101f1756d43193ccc0050cf44bb9dd22df25302e084c9a9a91ede2db4a5"
@@ -2698,6 +2698,10 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
     def test_release_publishers_share_the_reviewed_trivy_database_pin(self) -> None:
         reviewed_database = (
             "ghcr.io/aquasecurity/trivy-db@"
+            "sha256:ed0b90ef4ea613093ac2419fda3c27c283895b77de7e0ea6631328f3251b25cc"
+        )
+        expired_database = (
+            "ghcr.io/aquasecurity/trivy-db@"
             "sha256:befb776797d9b92af6c4f1119dd48506eb4ac780dd958eda08eca1c98e76b3c7"
         )
         stale_database = (
@@ -2714,6 +2718,7 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
                 self.assertEqual(
                     active.count(f"PINNED_TRIVY_DB: {reviewed_database}"), 1
                 )
+                self.assertNotIn(expired_database, source)
                 self.assertNotIn(stale_database, source)
 
     def test_every_artifact_id_download_flattens_the_exact_selection(self) -> None:
