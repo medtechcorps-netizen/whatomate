@@ -625,7 +625,8 @@ def _run_identity(run: Any, *, control_sha: str, workflow_id: int, title: str | 
     return identity
 
 
-def _jobs(api: Any, run_id: str) -> list[dict[str, Any]]:
+def _jobs(api: Any, run_id: str, *, mode: str) -> list[dict[str, Any]]:
+    require(mode in ("check", "recover"))
     result = api.pages(fixture.API_PREFIX + "/actions/runs/" + run_id + "/attempts/1/jobs", "jobs")
     rows = result["jobs"]
     require(result["total_count"] == len(rows) and 0 < len(rows) <= 4
@@ -635,11 +636,21 @@ def _jobs(api: Any, run_id: str) -> list[dict[str, Any]]:
                 and row["run_attempt"] == 1)
         common.require_run_id(row.get("id"), "recovery job identity")
         require(common.require_run_id(row.get("run_id"), "recovery job run") == run_id)
+        opposite = "recover" if mode == "check" else "check"
+        if row.get("status") == "completed" and row.get("conclusion") == "skipped":
+            require(row["name"] == JOB_NAMES[opposite] and row.get("steps") == [])
         if row.get("started_at") is not None:
             _timestamp(row["started_at"])
         if row.get("completed_at") is not None:
-            require(row.get("started_at") is not None
-                    and _timestamp(row["completed_at"]) >= _timestamp(row["started_at"]))
+            require(row.get("started_at") is not None)
+            started, completed = _timestamp(row["started_at"]), _timestamp(row["completed_at"])
+            if completed < started:
+                # GitHub can report a one-second clock inversion for a job
+                # skipped by the selected mode. It cannot represent a write.
+                require(row["name"] == JOB_NAMES[opposite]
+                        and row.get("status") == "completed" and row.get("conclusion") == "skipped"
+                        and row.get("steps") == []
+                        and started - completed <= dt.timedelta(seconds=1))
     return rows
 
 
@@ -662,20 +673,38 @@ FAILED_CHECK_JOBS = {
     "gate": (106479272066, "failure", "2026-09-21T19:16:49Z", "2026-09-21T19:16:52Z"),
 }
 
+FAILED_CHECK_2_ID = "35785166926"
+FAILED_CHECK_2_CONTROL = "2edb431f7665f725657b1c947b2d9c7bd85340f5"
+FAILED_CHECK_2_TITLE = ("Check existing CRM driver bbcffd0e-4c11-47bb-84a6-ca0d5a810d5f "
+                        "413f503e9ee1bfe52c97e1a1890fa0a9f774d9ddf72cfaa55345708aae786020")
+FAILED_CHECK_2_TIMES = {"created_at": "2026-09-22T21:12:15Z", "updated_at": "2026-09-22T21:21:10Z"}
+FAILED_CHECK_2_JOBS = {
+    "authority": (106940102160, "success", "2026-09-22T21:12:19Z", "2026-09-22T21:12:31Z"),
+    "check": (106940191697, "failure", "2026-09-22T21:20:54Z", "2026-09-22T21:21:03Z"),
+    "recover": (106940193638, "skipped", "2026-09-22T21:12:32Z", "2026-09-22T21:12:31Z"),
+    "gate": (106943141218, "failure", "2026-09-22T21:21:06Z", "2026-09-22T21:21:09Z"),
+}
+FAILED_CHECKS = {
+    FAILED_CHECK_ID: (FAILED_CHECK_CONTROL, FAILED_CHECK_TITLE, FAILED_CHECK_TIMES, FAILED_CHECK_JOBS),
+    FAILED_CHECK_2_ID: (FAILED_CHECK_2_CONTROL, FAILED_CHECK_2_TITLE, FAILED_CHECK_2_TIMES, FAILED_CHECK_2_JOBS),
+}
 
-def _quarantined_failed_check(api: Any, item: Any, workflow_id: int) -> None:
+
+def _quarantined_failed_check(api: Any, item: Any, workflow_id: int, failed_id: str) -> None:
     """Authenticate only the frozen failed read-only run, including no writes."""
     require(type(workflow_id) is int and workflow_id == 363575080)
-    latest = api.get(fixture.API_PREFIX + "/actions/runs/" + FAILED_CHECK_ID)
+    require(failed_id in FAILED_CHECKS)
+    control, title, times, jobs_expected = FAILED_CHECKS[failed_id]
+    latest = api.get(fixture.API_PREFIX + "/actions/runs/" + failed_id)
     for run in (item, latest):
-        require(_run_identity(run, control_sha=FAILED_CHECK_CONTROL, workflow_id=workflow_id,
-                              title=FAILED_CHECK_TITLE) == FAILED_CHECK_ID)
+        require(_run_identity(run, control_sha=control, workflow_id=workflow_id,
+                              title=title) == failed_id)
         require(run.get("status") == "completed" and run.get("conclusion") == "failure"
-                and all(run.get(key) == value for key, value in FAILED_CHECK_TIMES.items()))
-    jobs = _jobs(api, FAILED_CHECK_ID)
+                and all(run.get(key) == value for key, value in times.items()))
+    jobs = _jobs(api, failed_id, mode="check")
     require(len(jobs) == 4)
     by_name = {row["name"]: row for row in jobs}
-    for key, (identity, conclusion, started, completed) in FAILED_CHECK_JOBS.items():
+    for key, (identity, conclusion, started, completed) in jobs_expected.items():
         row = by_name[JOB_NAMES[key]]
         require(row["id"] == identity and row.get("status") == "completed"
                 and row.get("conclusion") == conclusion and row.get("started_at") == started
@@ -694,7 +723,7 @@ def _quarantined_failed_check(api: Any, item: Any, workflow_id: int) -> None:
         steps = row.get("steps")
         require(type(steps) is list and all(type(step) is dict and step.get("status") == "completed" for step in steps)
                 and [(step.get("name"), step.get("conclusion")) for step in steps] == expected_steps)
-    _artifact_zero(api, FAILED_CHECK_ID)
+    _artifact_zero(api, failed_id)
 
 
 def current_guard(api: Any, root: Path, a: Any, *, now: Any = lambda: dt.datetime.now(dt.timezone.utc)) -> str:
@@ -729,8 +758,11 @@ def current_guard(api: Any, root: Path, a: Any, *, now: Any = lambda: dt.datetim
                 and type(reviews.get("required_approving_review_count")) is int
                 and reviews["required_approving_review_count"] == 0
                 and protection.get("restrictions") is None)
-        bypass = reviews.get("bypass_pull_request_allowances", {})
-        require(type(bypass) is dict and all(bypass.get(key, []) == [] for key in ("users", "teams", "apps")))
+        # GitHub omits this optional field when no bypass is configured; some
+        # API representations emit null. Any populated allowance fails closed.
+        bypass = reviews.get("bypass_pull_request_allowances")
+        require(bypass is None or (type(bypass) is dict and set(bypass) == {"users", "teams", "apps"}
+                and all(type(bypass[key]) is list and bypass[key] == [] for key in ("users", "teams", "apps"))))
     endpoint = fixture.API_PREFIX + "/actions/workflows/" + WORKFLOW.rsplit("/", 1)[1]
     workflow = api.get(endpoint)
     require(type(workflow.get("id")) is int and workflow["id"] > 0
@@ -744,11 +776,12 @@ def current_guard(api: Any, root: Path, a: Any, *, now: Any = lambda: dt.datetim
     for item in inventory["workflow_runs"]:
         policy._json_tree(item)
         require(type(item) is dict)
-        if common.require_run_id(item.get("id"), "history identity") == FAILED_CHECK_ID:
-            require(FAILED_CHECK_ID not in seen and current_id != FAILED_CHECK_ID
-                    and a["check_run_id"] != FAILED_CHECK_ID)
-            _quarantined_failed_check(api, item, workflow["id"])
-            seen.add(FAILED_CHECK_ID)
+        failed_id = common.require_run_id(item.get("id"), "history identity")
+        if failed_id in FAILED_CHECKS:
+            require(failed_id not in seen and current_id != failed_id
+                    and a["check_run_id"] != failed_id)
+            _quarantined_failed_check(api, item, workflow["id"], failed_id)
+            seen.add(failed_id)
             continue
         rid = _run_identity(item, control_sha=sha, workflow_id=workflow["id"])
         require(rid not in seen)
@@ -764,12 +797,12 @@ def current_guard(api: Any, root: Path, a: Any, *, now: Any = lambda: dt.datetim
                     and item.get("status") == "completed")
             if rid == a["check_run_id"]:
                 predecessor = item
-    require(current is not None and FAILED_CHECK_ID in seen)
+    require(current is not None and set(FAILED_CHECKS).issubset(seen))
     created = common.require_timestamp(current.get("created_at"), "recovery run creation")
     require(common.require_timestamp(a["issued_at"], "authority issue") <= created
             < common.require_timestamp(a["expires_at"], "authority expiry") and created <= now())
     _artifact_zero(api, current_id)
-    jobs = _jobs(api, current_id)
+    jobs = _jobs(api, current_id, mode=a["mode"])
     own = [row for row in jobs if row["name"] == JOB_NAMES[job_key]]
     require(len(own) == 1 and own[0].get("status") == "in_progress" and own[0].get("conclusion") is None)
     if job_key != "authority":
@@ -787,7 +820,7 @@ def current_guard(api: Any, root: Path, a: Any, *, now: Any = lambda: dt.datetim
         _run_identity(latest, control_sha=sha, workflow_id=workflow["id"], title=check_title)
         require(latest.get("status") == "completed" and latest.get("conclusion") == "success")
         require(all(latest.get(key) == predecessor.get(key) for key in ("created_at", "updated_at")))
-        check_jobs = _jobs(api, a["check_run_id"])
+        check_jobs = _jobs(api, a["check_run_id"], mode="check")
         require(len(check_jobs) == 4)
         for row in check_jobs:
             conclusion = "skipped" if row["name"] == JOB_NAMES["recover"] else "success"

@@ -917,6 +917,7 @@ class HostedGuardTests(RunnerFixtures):
             current_jobs.insert(0, row("authority", "completed", "success", current_id, 11))
         previous_jobs = [row(key, "completed", "skipped" if key == "recover" else "success", "76543", index + 20)
                          for index, key in enumerate(runner.JOB_NAMES)]
+        next(item for item in previous_jobs if item["name"] == runner.JOB_NAMES["recover"])["steps"] = []
         data = {
             prefix + "/branches/main": {"protected": True, "commit": {"sha": CONTROL}},
             prefix + "/branches/main/protection": {
@@ -976,12 +977,42 @@ class HostedGuardTests(RunnerFixtures):
         data[prefix + "/actions/runs/35643414394"] = copy.deepcopy(quarantined)
         data[prefix + "/actions/runs/35643414394/attempts/1/jobs"] = {"total_count": 4, "jobs": quarantined_jobs}
         data[prefix + "/actions/runs/35643414394/artifacts"] = {"total_count": 0, "artifacts": []}
+        quarantined2 = copy.deepcopy(quarantined)
+        quarantined2.update({"id": int(runner.FAILED_CHECK_2_ID),
+                             "head_sha": runner.FAILED_CHECK_2_CONTROL,
+                             "display_title": runner.FAILED_CHECK_2_TITLE,
+                             **runner.FAILED_CHECK_2_TIMES})
+        quarantined2_jobs = []
+        for key, (identity, conclusion, started, completed) in runner.FAILED_CHECK_2_JOBS.items():
+            if key == "recover":
+                steps = []
+            elif key == "gate":
+                steps = [("Set up job", "success"), ("Require exactly the selected recovery mode", "failure"),
+                         ("Complete job", "success")]
+            else:
+                step = "Validate public authority without private credentials" if key == "authority" \
+                    else "Rehydrate and inspect only inside the protected boundary"
+                steps = [("Set up job", "success"), ("Check out exact protected controls", "success"),
+                         (step, conclusion), ("Post Check out exact protected controls", "success"),
+                         ("Complete job", "success")]
+            quarantined2_jobs.append({"id": identity, "run_id": int(runner.FAILED_CHECK_2_ID), "run_attempt": 1,
+                "name": runner.JOB_NAMES[key], "status": "completed", "conclusion": conclusion,
+                "started_at": started, "completed_at": completed,
+                "steps": [{"name": name, "status": "completed", "conclusion": result} for name, result in steps]})
+        data[endpoint + "/runs"]["workflow_runs"].append(quarantined2)
+        data[endpoint + "/runs"]["total_count"] += 1
+        data[prefix + "/actions/runs/" + runner.FAILED_CHECK_2_ID] = copy.deepcopy(quarantined2)
+        data[prefix + "/actions/runs/" + runner.FAILED_CHECK_2_ID + "/attempts/1/jobs"] = {
+            "total_count": 4, "jobs": quarantined2_jobs}
+        data[prefix + "/actions/runs/" + runner.FAILED_CHECK_2_ID + "/artifacts"] = {
+            "total_count": 0, "artifacts": []}
         api = mock.Mock(spec=["get", "pages"])
         api.get.side_effect = lambda path: copy.deepcopy(data[path])
         api.pages.side_effect = lambda path, key: copy.deepcopy(data[path])
         return {"packet": packet, "api": api, "data": data, "current": current,
                 "predecessor": predecessor, "current_jobs": current_jobs, "previous_jobs": previous_jobs,
                 "quarantined": quarantined, "quarantined_jobs": quarantined_jobs,
+                "quarantined2": quarantined2, "quarantined2_jobs": quarantined2_jobs,
                 "endpoint": endpoint, "env": {"RECOVERY_MODE": mode, "GITHUB_RUN_ID": current_id,
                                               "GITHUB_JOB": selected_job}}
 
@@ -1051,6 +1082,55 @@ class HostedGuardTests(RunnerFixtures):
         with self.assertRaises(common.ReleaseError):
             self.guard(test)
 
+    def test_second_failed_check_is_retained_but_never_a_recovery_predecessor(self):
+        test = self.guard_fixture()
+        test["packet"]["check_run_id"] = runner.FAILED_CHECK_2_ID
+        test["packet"]["binding_sha256"] = runner.binding_hash(test["packet"])
+        with self.assertRaises(common.ReleaseError):
+            self.guard(test)
+        for mutation in ("missing", "duplicate", "foreign_id", "rerun_latest", "artifact", "write_step"):
+            test = self.guard_fixture("check")
+            inventory = test["data"][test["endpoint"] + "/runs"]
+            if mutation == "missing":
+                inventory["workflow_runs"].remove(test["quarantined2"])
+                inventory["total_count"] -= 1
+            elif mutation == "duplicate":
+                inventory["workflow_runs"].append(copy.deepcopy(test["quarantined2"]))
+                inventory["total_count"] += 1
+            elif mutation == "foreign_id":
+                test["quarantined2"]["id"] += 1
+            elif mutation == "rerun_latest":
+                test["data"][runner.fixture.API_PREFIX + "/actions/runs/" +
+                             runner.FAILED_CHECK_2_ID]["run_attempt"] = 2
+            elif mutation == "artifact":
+                test["data"][runner.fixture.API_PREFIX + "/actions/runs/" +
+                             runner.FAILED_CHECK_2_ID + "/artifacts"] = {
+                    "total_count": 1, "artifacts": [{"id": 123}]}
+            else:
+                test["quarantined2_jobs"][2]["steps"] = [
+                    {"name": "unexpected write", "status": "completed", "conclusion": "success"}]
+            with self.subTest(mutation=mutation), self.assertRaises(common.ReleaseError):
+                self.guard(test)
+
+    def test_second_failed_check_identity_jobs_and_skipped_clock_are_frozen(self):
+        for source in ("inventory", "latest"):
+            for key, value in (("head_sha", CONTROL), ("run_attempt", 2),
+                               ("previous_attempt_url", "present"), ("conclusion", "success"),
+                               ("updated_at", fixtures.stamp(NOW))):
+                test = self.guard_fixture("check")
+                row = test["quarantined2"] if source == "inventory" else test["data"][
+                    runner.fixture.API_PREFIX + "/actions/runs/" + runner.FAILED_CHECK_2_ID]
+                row[key] = value
+                with self.subTest(source=source, key=key), self.assertRaises(common.ReleaseError):
+                    self.guard(test)
+        for key, value in (("id", 1), ("run_attempt", 2), ("conclusion", "success"),
+                           ("completed_at", "2026-09-22T21:12:32Z"),
+                           ("started_at", "2026-09-22T21:12:31Z")):
+            test = self.guard_fixture("check")
+            test["quarantined2_jobs"][2][key] = value
+            with self.subTest(key=key), self.assertRaises(common.ReleaseError):
+                self.guard(test)
+
     def test_public_authority_does_not_request_administration_protection_endpoint(self):
         test = self.guard_fixture("check", "authority")
         del test["data"][runner.fixture.API_PREFIX + "/branches/main/protection"]
@@ -1074,6 +1154,86 @@ class HostedGuardTests(RunnerFixtures):
                 protection["restrictions"] = {}
             with self.subTest(failure=failure), self.assertRaises(common.ReleaseError):
                 self.guard(test)
+
+    def test_private_guard_accepts_only_omitted_null_or_exact_empty_bypass(self):
+        for mode in ("check", "recover"):
+            for bypass in ("omitted", None, {"users": [], "teams": [], "apps": []}):
+                test = self.guard_fixture(mode)
+                reviews = test["data"][runner.fixture.API_PREFIX + "/branches/main/protection"][
+                    "required_pull_request_reviews"]
+                if bypass == "omitted":
+                    del reviews["bypass_pull_request_allowances"]
+                else:
+                    reviews["bypass_pull_request_allowances"] = bypass
+                with self.subTest(mode=mode, bypass=bypass):
+                    self.assertEqual(self.guard(test), CONTROL)
+
+    def test_private_guard_rejects_malformed_or_nonempty_bypass(self):
+        invalid = (True, False, 0, "", [], {}, {"users": []},
+                   {"users": [], "teams": [], "apps": [], "extra": []},
+                   {"users": (), "teams": [], "apps": []},
+                   {"users": [{"id": 5}], "teams": [], "apps": []},
+                   {"users": [], "teams": [{"id": 5}], "apps": []},
+                   {"users": [], "teams": [], "apps": [{"id": 5}]})
+        for bypass in invalid:
+            test = self.guard_fixture("check")
+            test["data"][runner.fixture.API_PREFIX + "/branches/main/protection"][
+                "required_pull_request_reviews"]["bypass_pull_request_allowances"] = bypass
+            with self.subTest(bypass=bypass), self.assertRaises(common.ReleaseError):
+                self.guard(test)
+
+    def test_skipped_opposite_job_accepts_only_one_second_clock_inversion(self):
+        for mode in ("check", "recover"):
+            opposite = "recover" if mode == "check" else "check"
+            test = self.guard_fixture(mode)
+            row = copy.deepcopy(test["current_jobs"][0])
+            row.update(id=44, name=runner.JOB_NAMES[opposite], status="completed",
+                       conclusion="skipped", steps=[],
+                       started_at=fixtures.stamp(NOW - dt.timedelta(seconds=1)),
+                       completed_at=fixtures.stamp(NOW - dt.timedelta(seconds=2)))
+            test["current_jobs"].append(row)
+            test["data"][runner.fixture.API_PREFIX + "/actions/runs/87654/attempts/1/jobs"]["total_count"] += 1
+            with self.subTest(mode=mode, case="exact"):
+                self.assertEqual(self.guard(test), CONTROL)
+            for key, value in (("name", runner.JOB_NAMES["gate"]), ("status", "in_progress"),
+                               ("conclusion", "success"), ("steps", [{"name": "unexpected"}]),
+                               ("completed_at", fixtures.stamp(NOW - dt.timedelta(seconds=3)))):
+                invalid = self.guard_fixture(mode)
+                changed = copy.deepcopy(row)
+                changed[key] = value
+                invalid["current_jobs"].append(changed)
+                invalid["data"][runner.fixture.API_PREFIX + "/actions/runs/87654/attempts/1/jobs"]["total_count"] += 1
+                with self.subTest(mode=mode, key=key), self.assertRaises(common.ReleaseError):
+                    self.guard(invalid)
+        predecessor = self.guard_fixture("recover")
+        skipped = next(row for row in predecessor["previous_jobs"]
+                       if row["name"] == runner.JOB_NAMES["recover"])
+        skipped.update(steps=[], started_at=fixtures.stamp(NOW - dt.timedelta(seconds=1)),
+                       completed_at=fixtures.stamp(NOW - dt.timedelta(seconds=2)))
+        self.assertEqual(self.guard(predecessor), CONTROL)
+
+    def test_normal_clock_skipped_job_cannot_hide_steps_or_wrong_mode(self):
+        for mode in ("check", "recover"):
+            opposite = "recover" if mode == "check" else "check"
+            test = self.guard_fixture(mode)
+            row = copy.deepcopy(test["current_jobs"][0])
+            row.update(id=44, name=runner.JOB_NAMES[opposite], status="completed",
+                       conclusion="skipped", steps=[],
+                       started_at=fixtures.stamp(NOW - dt.timedelta(seconds=2)),
+                       completed_at=fixtures.stamp(NOW - dt.timedelta(seconds=1)))
+            test["current_jobs"].append(row)
+            test["data"][runner.fixture.API_PREFIX + "/actions/runs/87654/attempts/1/jobs"]["total_count"] += 1
+            self.assertEqual(self.guard(test), CONTROL)
+            for key, value in (("steps", [{"name": "unexpected", "status": "completed",
+                                           "conclusion": "success"}]),
+                               ("name", runner.JOB_NAMES["gate"])):
+                invalid = self.guard_fixture(mode)
+                changed = copy.deepcopy(row)
+                changed[key] = value
+                invalid["current_jobs"].append(changed)
+                invalid["data"][runner.fixture.API_PREFIX + "/actions/runs/87654/attempts/1/jobs"]["total_count"] += 1
+                with self.subTest(mode=mode, key=key), self.assertRaises(common.ReleaseError):
+                    self.guard(invalid)
 
     def test_job_run_ids_attempts_and_duplicate_names_fail_closed(self):
         for key, value in (("run_id", 87653), ("run_attempt", True), ("id", 0),
