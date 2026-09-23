@@ -1047,6 +1047,35 @@ class HostedGuardTests(RunnerFixtures):
             "total_count": 4, "jobs": quarantined2_jobs}
         data[prefix + "/actions/runs/" + runner.FAILED_CHECK_2_ID + "/artifacts"] = {
             "total_count": 0, "artifacts": []}
+        quarantined3 = copy.deepcopy(quarantined)
+        quarantined3.update({"id": int(runner.FAILED_CHECK_3_ID),
+                             "head_sha": runner.FAILED_CHECK_3_CONTROL,
+                             "display_title": runner.FAILED_CHECK_3_TITLE,
+                             **runner.FAILED_CHECK_3_TIMES})
+        quarantined3_jobs = []
+        for key, (identity, conclusion, started, completed) in runner.FAILED_CHECK_3_JOBS.items():
+            if key == "recover":
+                steps = []
+            elif key == "gate":
+                steps = [("Set up job", "success"), ("Require exactly the selected recovery mode", "failure"),
+                         ("Complete job", "success")]
+            else:
+                step = "Validate public authority without private credentials" if key == "authority" \
+                    else "Rehydrate and inspect only inside the protected boundary"
+                steps = [("Set up job", "success"), ("Check out exact protected controls", "success"),
+                         (step, conclusion), ("Post Check out exact protected controls", "success"),
+                         ("Complete job", "success")]
+            quarantined3_jobs.append({"id": identity, "run_id": int(runner.FAILED_CHECK_3_ID), "run_attempt": 1,
+                "name": runner.JOB_NAMES[key], "status": "completed", "conclusion": conclusion,
+                "started_at": started, "completed_at": completed,
+                "steps": [{"name": name, "status": "completed", "conclusion": result} for name, result in steps]})
+        data[endpoint + "/runs"]["workflow_runs"].append(quarantined3)
+        data[endpoint + "/runs"]["total_count"] += 1
+        data[prefix + "/actions/runs/" + runner.FAILED_CHECK_3_ID] = copy.deepcopy(quarantined3)
+        data[prefix + "/actions/runs/" + runner.FAILED_CHECK_3_ID + "/attempts/1/jobs"] = {
+            "total_count": 4, "jobs": quarantined3_jobs}
+        data[prefix + "/actions/runs/" + runner.FAILED_CHECK_3_ID + "/artifacts"] = {
+            "total_count": 0, "artifacts": []}
         api = mock.Mock(spec=["get", "pages"])
         api.get.side_effect = lambda path: copy.deepcopy(data[path])
         api.pages.side_effect = lambda path, key: copy.deepcopy(data[path])
@@ -1054,6 +1083,7 @@ class HostedGuardTests(RunnerFixtures):
                 "predecessor": predecessor, "current_jobs": current_jobs, "previous_jobs": previous_jobs,
                 "quarantined": quarantined, "quarantined_jobs": quarantined_jobs,
                 "quarantined2": quarantined2, "quarantined2_jobs": quarantined2_jobs,
+                "quarantined3": quarantined3, "quarantined3_jobs": quarantined3_jobs,
                 "endpoint": endpoint, "env": {"RECOVERY_MODE": mode, "GITHUB_RUN_ID": current_id,
                                               "GITHUB_JOB": selected_job}}
 
@@ -1169,6 +1199,55 @@ class HostedGuardTests(RunnerFixtures):
                            ("started_at", "2026-09-22T21:12:31Z")):
             test = self.guard_fixture("check")
             test["quarantined2_jobs"][2][key] = value
+            with self.subTest(key=key), self.assertRaises(common.ReleaseError):
+                self.guard(test)
+
+    def test_third_failed_check_is_exactly_quarantined_and_never_a_predecessor(self):
+        test = self.guard_fixture()
+        test["packet"]["check_run_id"] = runner.FAILED_CHECK_3_ID
+        test["packet"]["binding_sha256"] = runner.binding_hash(test["packet"])
+        with self.assertRaises(common.ReleaseError):
+            self.guard(test)
+        for mutation in ("missing", "duplicate", "foreign_id", "rerun_latest", "artifact", "write_step"):
+            test = self.guard_fixture("check")
+            inventory = test["data"][test["endpoint"] + "/runs"]
+            if mutation == "missing":
+                inventory["workflow_runs"].remove(test["quarantined3"])
+                inventory["total_count"] -= 1
+            elif mutation == "duplicate":
+                inventory["workflow_runs"].append(copy.deepcopy(test["quarantined3"]))
+                inventory["total_count"] += 1
+            elif mutation == "foreign_id":
+                test["quarantined3"]["id"] += 1
+            elif mutation == "rerun_latest":
+                test["data"][runner.fixture.API_PREFIX + "/actions/runs/" +
+                             runner.FAILED_CHECK_3_ID]["run_attempt"] = 2
+            elif mutation == "artifact":
+                test["data"][runner.fixture.API_PREFIX + "/actions/runs/" +
+                             runner.FAILED_CHECK_3_ID + "/artifacts"] = {
+                    "total_count": 1, "artifacts": [{"id": 123}]}
+            else:
+                test["quarantined3_jobs"][2]["steps"] = [
+                    {"name": "unexpected write", "status": "completed", "conclusion": "success"}]
+            with self.subTest(mutation=mutation), self.assertRaises(common.ReleaseError):
+                self.guard(test)
+
+    def test_third_failed_check_identity_jobs_and_skipped_clock_are_frozen(self):
+        for source in ("inventory", "latest"):
+            for key, value in (("head_sha", CONTROL), ("run_attempt", 2),
+                               ("previous_attempt_url", "present"), ("conclusion", "success"),
+                               ("updated_at", fixtures.stamp(NOW))):
+                test = self.guard_fixture("check")
+                row = test["quarantined3"] if source == "inventory" else test["data"][
+                    runner.fixture.API_PREFIX + "/actions/runs/" + runner.FAILED_CHECK_3_ID]
+                row[key] = value
+                with self.subTest(source=source, key=key), self.assertRaises(common.ReleaseError):
+                    self.guard(test)
+        for key, value in (("id", 1), ("run_attempt", 2), ("conclusion", "success"),
+                           ("completed_at", "2026-09-23T06:53:33Z"),
+                           ("started_at", "2026-09-23T06:53:30Z")):
+            test = self.guard_fixture("check")
+            test["quarantined3_jobs"][2][key] = value
             with self.subTest(key=key), self.assertRaises(common.ReleaseError):
                 self.guard(test)
 
