@@ -9,6 +9,7 @@ GET route exists. All runtime specs and private inputs remain in memory.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import copy
 import datetime as dt
 import os
@@ -47,12 +48,40 @@ PHASE_RANK = {"PENDING_BUILD": 0, "BUILDING": 1, "PENDING_DEPLOY": 2, "DEPLOYING
 STAGES = frozenset({"AUTHORIZATION", "ORIGIN_AUTHORITY", "FIXTURE_AUTHORITY", "IMAGE_AUTHORITY",
     "PRIVATE_REHYDRATION", "PROVIDER_PRESTATE", "UPDATE_APP", "DEPLOYMENT_READBACK", "HEALTH", "CANARY_INSTALL", "POSTSTATE"})
 CURRENT_STAGE = "AUTHORIZATION"
+AUTHORIZATION_DIAGNOSTICS = frozenset({
+    "PUBLIC_AUTHORITY", "PRIVATE_INPUT_PRESENCE", "CURRENT_GUARD_TOKEN",
+    "CURRENT_GUARD_HEAD", "CURRENT_GUARD_PROTECTION", "CURRENT_GUARD_HISTORY",
+    "CURRENT_GUARD_OWN_JOB",
+    "DESCRIPTOR_VALIDATION", "PINNED_GH_ACQUISITION", "PRE_RUN_ONCE_SETUP",
+    "RUN_ONCE_AUTHORIZATION",
+})
 
 
 def mark_stage(stage: str) -> None:
     global CURRENT_STAGE
     require(stage in STAGES)
     CURRENT_STAGE = stage
+
+
+class AuthorizationRejected(common.ReleaseError):
+    """A reviewed source-literal boundary, never an exception or input value."""
+    def __init__(self, code: str):
+        require(type(code) is str and code in AUTHORIZATION_DIAGNOSTICS)
+        super().__init__("existing-driver authorization rejected")
+        self.code = code
+
+
+@contextmanager
+def authorization_diagnostic(code: str):
+    require(type(code) is str and code in AUTHORIZATION_DIAGNOSTICS)
+    try:
+        yield
+    except Exception as error:
+        if type(error) is AuthorizationRejected:
+            inner = vars(error).get("code")
+            if type(inner) is str and inner in AUTHORIZATION_DIAGNOSTICS:
+                raise
+        raise AuthorizationRejected(code) from None
 
 
 class UpdateRejected(common.ReleaseError):
@@ -219,10 +248,12 @@ def run_once(a: Any, original: Any, descriptor: Any, protected: Any, *, provider
              sleep: Any = time.sleep, health: Any = boot.health) -> dict[str, Any]:
     """All injected boundaries are offline-test seams; CLI supplies fixed adapters."""
     mark_stage("AUTHORIZATION")
-    a = validate_authorization(a, control_sha=a["control_sha"], now=now())
-    require((a["mode"] == "check" and writer is None and not hasattr(provider, "update"))
-            or (a["mode"] == "recover" and writer is not None and hasattr(provider, "update")))
-    current_guard()
+    with authorization_diagnostic("RUN_ONCE_AUTHORIZATION"):
+        a = validate_authorization(a, control_sha=a["control_sha"], now=now())
+        require((a["mode"] == "check" and writer is None and not hasattr(provider, "update"))
+                or (a["mode"] == "recover" and writer is not None and hasattr(provider, "update")))
+        with authorization_diagnostic("CURRENT_GUARD_HISTORY"):
+            current_guard()
     mark_stage("ORIGIN_AUTHORITY")
     run, artifacts = authenticate_origin()
     d = policy.validate_origin(original, descriptor, run, artifacts)
@@ -352,6 +383,10 @@ def failure_report(error: Exception) -> dict[str, Any]:
     if stage == "PROVIDER_PRESTATE" and type(error) is policy.PrestateRejected:
         code = vars(error).get("code")
         if type(code) is str and code in policy.PRESTATE_DIAGNOSTICS:
+            result["diagnostic_code"] = code
+    if stage == "AUTHORIZATION" and type(error) is AuthorizationRejected:
+        code = vars(error).get("code")
+        if type(code) is str and code in AUTHORIZATION_DIAGNOSTICS:
             result["diagnostic_code"] = code
     if type(error) is UpdateRejected and type(error.status) is int and 100 <= error.status <= 599:
         result["http_status"] = error.status
@@ -699,10 +734,22 @@ FAILED_CHECK_3_JOBS = {
     "recover": (107076719437, "skipped", "2026-09-23T06:53:32Z", "2026-09-23T06:53:31Z"),
     "gate": (107077304221, "failure", "2026-09-23T06:55:50Z", "2026-09-23T06:55:52Z"),
 }
+FAILED_CHECK_4_ID = "35923321107"
+FAILED_CHECK_4_CONTROL = "5f1b0851ca3fbefceef307b001e031ad51dcab97"
+FAILED_CHECK_4_TITLE = ("Check existing CRM driver edd940e0-a992-47cb-a591-755e6a461697 "
+                        "b791b9bd4a88befffc98ddaa3e025f4e9f76e4060e4889d74a928599b98adcdd")
+FAILED_CHECK_4_TIMES = {"created_at": "2026-09-23T21:34:49Z", "updated_at": "2026-09-23T21:36:59Z"}
+FAILED_CHECK_4_JOBS = {
+    "authority": (107392335979, "success", "2026-09-23T21:34:53Z", "2026-09-23T21:35:03Z"),
+    "check": (107392401976, "failure", "2026-09-23T21:36:40Z", "2026-09-23T21:36:53Z"),
+    "recover": (107392403404, "skipped", "2026-09-23T21:35:03Z", "2026-09-23T21:35:03Z"),
+    "gate": (107393024946, "failure", "2026-09-23T21:36:55Z", "2026-09-23T21:36:58Z"),
+}
 FAILED_CHECKS = {
     FAILED_CHECK_ID: (FAILED_CHECK_CONTROL, FAILED_CHECK_TITLE, FAILED_CHECK_TIMES, FAILED_CHECK_JOBS),
     FAILED_CHECK_2_ID: (FAILED_CHECK_2_CONTROL, FAILED_CHECK_2_TITLE, FAILED_CHECK_2_TIMES, FAILED_CHECK_2_JOBS),
     FAILED_CHECK_3_ID: (FAILED_CHECK_3_CONTROL, FAILED_CHECK_3_TITLE, FAILED_CHECK_3_TIMES, FAILED_CHECK_3_JOBS),
+    FAILED_CHECK_4_ID: (FAILED_CHECK_4_CONTROL, FAILED_CHECK_4_TITLE, FAILED_CHECK_4_TIMES, FAILED_CHECK_4_JOBS),
 }
 
 
@@ -744,41 +791,43 @@ def _quarantined_failed_check(api: Any, item: Any, workflow_id: int, failed_id: 
 
 def current_guard(api: Any, root: Path, a: Any, *, now: Any = lambda: dt.datetime.now(dt.timezone.utc)) -> str:
     """Current hosted identity, complete burned history and predecessor binding."""
-    validate_authorization(a, control_sha=a["control_sha"], now=now())
-    sha = fixture._current_guard(api, root, workflow=WORKFLOW)
-    require(sha == a["control_sha"] and os.environ.get("RECOVERY_MODE") == a["mode"])
-    job_key = os.environ.get("GITHUB_JOB")
-    require(job_key in ("authority", a["mode"]))
-    branch = api.get(fixture.API_PREFIX + "/branches/main")
-    require(branch.get("protected") is True and branch.get("commit", {}).get("sha") == sha)
+    with authorization_diagnostic("CURRENT_GUARD_HEAD"):
+        validate_authorization(a, control_sha=a["control_sha"], now=now())
+        sha = fixture._current_guard(api, root, workflow=WORKFLOW)
+        require(sha == a["control_sha"] and os.environ.get("RECOVERY_MODE") == a["mode"])
+        job_key = os.environ.get("GITHUB_JOB")
+        require(job_key in ("authority", a["mode"]))
+        branch = api.get(fixture.API_PREFIX + "/branches/main")
+        require(branch.get("protected") is True and branch.get("commit", {}).get("sha") == sha)
     if job_key != "authority":
         # The public github.token has no administration-read grant. Full
         # protection is checked by the existing private read token before any
         # fixture login or provider action, never by broadening public authority.
-        protection = api.get(fixture.API_PREFIX + "/branches/main/protection")
-        required = protection.get("required_status_checks")
-        contexts = {"test", "lint", "build", "security", "e2e", "tenant-isolation"}
-        require(protection.get("enforce_admins", {}).get("enabled") is True
-                and type(required) is dict and required.get("strict") is True
-                and set(required.get("contexts", [])) == contexts
-                and type(required.get("checks")) is list and len(required["checks"]) == 6
-                and {row.get("context") for row in required["checks"]} == contexts
-                and all(type(row.get("app_id")) is int and row["app_id"] == 15368 for row in required["checks"])
-                and protection.get("required_conversation_resolution", {}).get("enabled") is True
-                and protection.get("allow_force_pushes", {}).get("enabled") is False
-                and protection.get("allow_deletions", {}).get("enabled") is False)
-        reviews = protection.get("required_pull_request_reviews")
-        require(type(reviews) is dict and reviews.get("dismiss_stale_reviews") is True
-                and reviews.get("require_code_owner_reviews") is False
-                and reviews.get("require_last_push_approval") is False
-                and type(reviews.get("required_approving_review_count")) is int
-                and reviews["required_approving_review_count"] == 0
-                and protection.get("restrictions") is None)
-        # GitHub omits this optional field when no bypass is configured; some
-        # API representations emit null. Any populated allowance fails closed.
-        bypass = reviews.get("bypass_pull_request_allowances")
-        require(bypass is None or (type(bypass) is dict and set(bypass) == {"users", "teams", "apps"}
-                and all(type(bypass[key]) is list and bypass[key] == [] for key in ("users", "teams", "apps"))))
+        with authorization_diagnostic("CURRENT_GUARD_PROTECTION"):
+            protection = api.get(fixture.API_PREFIX + "/branches/main/protection")
+            required = protection.get("required_status_checks")
+            contexts = {"test", "lint", "build", "security", "e2e", "tenant-isolation"}
+            require(protection.get("enforce_admins", {}).get("enabled") is True
+                    and type(required) is dict and required.get("strict") is True
+                    and set(required.get("contexts", [])) == contexts
+                    and type(required.get("checks")) is list and len(required["checks"]) == 6
+                    and {row.get("context") for row in required["checks"]} == contexts
+                    and all(type(row.get("app_id")) is int and row["app_id"] == 15368 for row in required["checks"])
+                    and protection.get("required_conversation_resolution", {}).get("enabled") is True
+                    and protection.get("allow_force_pushes", {}).get("enabled") is False
+                    and protection.get("allow_deletions", {}).get("enabled") is False)
+            reviews = protection.get("required_pull_request_reviews")
+            require(type(reviews) is dict and reviews.get("dismiss_stale_reviews") is True
+                    and reviews.get("require_code_owner_reviews") is False
+                    and reviews.get("require_last_push_approval") is False
+                    and type(reviews.get("required_approving_review_count")) is int
+                    and reviews["required_approving_review_count"] == 0
+                    and protection.get("restrictions") is None)
+            # GitHub omits this optional field when no bypass is configured; some
+            # API representations emit null. Any populated allowance fails closed.
+            bypass = reviews.get("bypass_pull_request_allowances")
+            require(bypass is None or (type(bypass) is dict and set(bypass) == {"users", "teams", "apps"}
+                    and all(type(bypass[key]) is list and bypass[key] == [] for key in ("users", "teams", "apps"))))
     endpoint = fixture.API_PREFIX + "/actions/workflows/" + WORKFLOW.rsplit("/", 1)[1]
     workflow = api.get(endpoint)
     require(type(workflow.get("id")) is int and workflow["id"] > 0
@@ -814,17 +863,18 @@ def current_guard(api: Any, root: Path, a: Any, *, now: Any = lambda: dt.datetim
             if rid == a["check_run_id"]:
                 predecessor = item
     require(current is not None and set(FAILED_CHECKS).issubset(seen))
-    created = common.require_timestamp(current.get("created_at"), "recovery run creation")
-    require(common.require_timestamp(a["issued_at"], "authority issue") <= created
-            < common.require_timestamp(a["expires_at"], "authority expiry") and created <= now())
-    _artifact_zero(api, current_id)
-    jobs = _jobs(api, current_id, mode=a["mode"])
-    own = [row for row in jobs if row["name"] == JOB_NAMES[job_key]]
-    require(len(own) == 1 and own[0].get("status") == "in_progress" and own[0].get("conclusion") is None)
-    if job_key != "authority":
-        authority = [row for row in jobs if row["name"] == JOB_NAMES["authority"]]
-        require(len(authority) == 1 and authority[0].get("status") == "completed"
-                and authority[0].get("conclusion") == "success")
+    with authorization_diagnostic("CURRENT_GUARD_OWN_JOB"):
+        created = common.require_timestamp(current.get("created_at"), "recovery run creation")
+        require(common.require_timestamp(a["issued_at"], "authority issue") <= created
+                < common.require_timestamp(a["expires_at"], "authority expiry") and created <= now())
+        _artifact_zero(api, current_id)
+        jobs = _jobs(api, current_id, mode=a["mode"])
+        own = [row for row in jobs if row["name"] == JOB_NAMES[job_key]]
+        require(len(own) == 1 and own[0].get("status") == "in_progress" and own[0].get("conclusion") is None)
+        if job_key != "authority":
+            authority = [row for row in jobs if row["name"] == JOB_NAMES["authority"]]
+            require(len(authority) == 1 and authority[0].get("status") == "completed"
+                    and authority[0].get("conclusion") == "success")
     if a["mode"] == "recover":
         require(predecessor is not None and a["check_run_id"] != current_id)
         check_title = "Check existing CRM driver " + a["check_operation_id"] + " " + a["binding_sha256"]
@@ -880,55 +930,66 @@ def main(argv: list[str] | None = None) -> int:
         # Pop ALL private inputs, including both mutation tokens, before any
         # current-guard git command or public-evidence subprocess can run.
         private = {key: os.environ.pop(key, None) for key in PRIVATE_NAMES}
-        require(os.environ.get("DO_DRIVER_BOOTSTRAP_CREATE_TOKEN") is None)
-        mode = os.environ.get("RECOVERY_MODE")
-        require(mode in ("check", "recover") and (args.command == "validate" or args.command == mode))
-        raw = os.environ.get("RECOVERY_AUTHORIZATION_JSON")
-        origin_raw = os.environ.get("ORIGIN_AUTHORIZATION_JSON")
-        require(type(raw) is str and len(raw.encode()) <= 32768
-                and type(origin_raw) is str and len(origin_raw.encode()) <= 32768)
-        sha = common.require_sha1(os.environ.get("CONTROL_SHA"), "recovery control")
-        a = validate_authorization(common.loads_strict(raw), control_sha=sha, now=dt.datetime.now(dt.timezone.utc))
-        require(a["mode"] == mode and common.canonical_payload_bytes(a) == raw.encode())
-        original = common.loads_strict(origin_raw)
-        common.exact_keys(original, boot.AUTH_KEYS, "historical packet")
-        require(common.canonical_payload_bytes(original) == origin_raw.encode()
-                and common.sha256_value(original) == policy.ORIGIN_PACKET_SHA256
-                and original["control_sha"] == policy.ORIGIN_CONTROL)
-        if args.command == "validate":
-            require(all(value is None for value in private.values()) and args.output_dir is None)
-        else:
-            required = CHECK_PRIVATE_NAMES if mode == "check" else PRIVATE_NAMES
-            require(all(type(private[key]) is str and private[key] for key in required)
-                    and all(private[key] is None for key in PRIVATE_NAMES - required))
-            require((mode == "recover") == (args.output_dir is not None))
-        root = args.control_root.resolve(strict=True)
-        token = fixture._secret(os.environ.get("GH_TOKEN"))
-        api = boot.GitHubRead(token)
-        current_guard(api, root, a)
+        with authorization_diagnostic("PRIVATE_INPUT_PRESENCE"):
+            require(os.environ.get("DO_DRIVER_BOOTSTRAP_CREATE_TOKEN") is None)
+        with authorization_diagnostic("PUBLIC_AUTHORITY"):
+            mode = os.environ.get("RECOVERY_MODE")
+            require(mode in ("check", "recover") and (args.command == "validate" or args.command == mode))
+            raw = os.environ.get("RECOVERY_AUTHORIZATION_JSON")
+            origin_raw = os.environ.get("ORIGIN_AUTHORIZATION_JSON")
+            require(type(raw) is str and len(raw.encode()) <= 32768
+                    and type(origin_raw) is str and len(origin_raw.encode()) <= 32768)
+            sha = common.require_sha1(os.environ.get("CONTROL_SHA"), "recovery control")
+            a = validate_authorization(common.loads_strict(raw), control_sha=sha, now=dt.datetime.now(dt.timezone.utc))
+            require(a["mode"] == mode and common.canonical_payload_bytes(a) == raw.encode())
+            original = common.loads_strict(origin_raw)
+            common.exact_keys(original, boot.AUTH_KEYS, "historical packet")
+            require(common.canonical_payload_bytes(original) == origin_raw.encode()
+                    and common.sha256_value(original) == policy.ORIGIN_PACKET_SHA256
+                    and original["control_sha"] == policy.ORIGIN_CONTROL)
+        with authorization_diagnostic("PRIVATE_INPUT_PRESENCE"):
+            if args.command == "validate":
+                require(all(value is None for value in private.values()) and args.output_dir is None)
+            else:
+                required = CHECK_PRIVATE_NAMES if mode == "check" else PRIVATE_NAMES
+                require(all(type(private[key]) is str and private[key] for key in required)
+                        and all(private[key] is None for key in PRIVATE_NAMES - required))
+                require((mode == "recover") == (args.output_dir is not None))
+        with authorization_diagnostic("CURRENT_GUARD_HEAD"):
+            root = args.control_root.resolve(strict=True)
+        with authorization_diagnostic("CURRENT_GUARD_TOKEN"):
+            token = fixture._secret(os.environ.get("GH_TOKEN"))
+            api = boot.GitHubRead(token)
+        with authorization_diagnostic("CURRENT_GUARD_HISTORY"):
+            current_guard(api, root, a)
         if args.command == "validate":
             return_record = {"schema_version": 1, "state": "existing-driver-public-authority-validated",
                              "authorization_sha256": common.sha256_value(a), "binding_sha256": a["binding_sha256"]}
         else:
-            require(len(private["CRM_CANARY_DRIVER_BOOTSTRAP_JSON"].encode()) <= 32768
-                    and len(private["CRM_CANARY_FIXTURE_INPUT_JSON"].encode()) <= fixture.MAX_BODY_BYTES)
-            d = boot.validate_descriptor(common.loads_strict(private["CRM_CANARY_DRIVER_BOOTSTRAP_JSON"]), original)
-            protected = common.loads_strict(private["CRM_CANARY_FIXTURE_INPUT_JSON"])
-            if args.output_dir is not None:
-                output = args.output_dir.resolve()
-                require(output.parent == Path(os.environ["RUNNER_TEMP"]).resolve(strict=True) and not output.exists())
-            try:
-                from . import launch_production_prerequisites as prerequisites
-            except ImportError:
-                import launch_production_prerequisites as prerequisites
-            gh = fixture._pinned_gh()
-            evidence = prerequisites.GitHubEvidence(root, transport=prerequisites.GitHubGetOnly(gh=str(gh)))
-            reader = boot.EnvironmentReader(token, d["plan"]["github_environment_sha256"])
-            provider_args = (root, a, d, private["DO_DRIVER_BOOTSTRAP_READ_TOKEN"], api, reader)
-            provider = ProviderRead(*provider_args) if mode == "check" else ProviderUpdate(
-                *provider_args, update_token=private["DO_DRIVER_RECOVERY_UPDATE_TOKEN"])
-            writer = None if mode == "check" else boot.EnvironmentWriter(
-                private["GH_CANARY_ENVIRONMENT_WRITE_TOKEN"], gh, d["plan"]["github_environment_sha256"])
+            with authorization_diagnostic("DESCRIPTOR_VALIDATION"):
+                require(len(private["CRM_CANARY_DRIVER_BOOTSTRAP_JSON"].encode()) <= 32768
+                        and len(private["CRM_CANARY_FIXTURE_INPUT_JSON"].encode()) <= fixture.MAX_BODY_BYTES)
+                d = boot.validate_descriptor(common.loads_strict(private["CRM_CANARY_DRIVER_BOOTSTRAP_JSON"]), original)
+                protected = common.loads_strict(private["CRM_CANARY_FIXTURE_INPUT_JSON"])
+            with authorization_diagnostic("PRE_RUN_ONCE_SETUP"):
+                if args.output_dir is not None:
+                    output = args.output_dir.resolve()
+                    require(output.parent == Path(os.environ["RUNNER_TEMP"]).resolve(strict=True) and not output.exists())
+                try:
+                    from . import launch_production_prerequisites as prerequisites
+                except ImportError:
+                    import launch_production_prerequisites as prerequisites
+            with authorization_diagnostic("PINNED_GH_ACQUISITION"):
+                gh = fixture._pinned_gh()
+            with authorization_diagnostic("PRE_RUN_ONCE_SETUP"):
+                evidence = prerequisites.GitHubEvidence(root, transport=prerequisites.GitHubGetOnly(gh=str(gh)))
+                reader = boot.EnvironmentReader(token, d["plan"]["github_environment_sha256"])
+                provider_args = (root, a, d, private["DO_DRIVER_BOOTSTRAP_READ_TOKEN"], api, reader)
+                provider = ProviderRead(*provider_args) if mode == "check" else ProviderUpdate(
+                    *provider_args, update_token=private["DO_DRIVER_RECOVERY_UPDATE_TOKEN"])
+                writer = None if mode == "check" else boot.EnvironmentWriter(
+                    private["GH_CANARY_ENVIRONMENT_WRITE_TOKEN"], gh, d["plan"]["github_environment_sha256"])
+                transport = boot.ReadOnlyProductTransport(protected["credentials"]["meta_access_token"])
             return_record = run_once(a, original, d, protected, provider=provider, reader=reader, writer=writer,
                 authenticate_origin=lambda: authenticate_origin(api),
                 authenticate_fixture=lambda: evidence.authenticate_public_fixture(
@@ -936,7 +997,7 @@ def main(argv: list[str] | None = None) -> int:
                 authenticate_image=lambda: boot.authenticate_driver(api, root, gh, a["target_driver_evidence"], sha,
                                                                     gh_token=token),
                 current_guard=lambda: current_guard(api, root, a), rehydrate=fixture.rehydrate,
-                transport=boot.ReadOnlyProductTransport(protected["credentials"]["meta_access_token"]))
+                transport=transport)
             if mode == "recover":
                 output.mkdir(mode=0o700, parents=False, exist_ok=False)
                 receipt = common.canonical_file_bytes(return_record)
