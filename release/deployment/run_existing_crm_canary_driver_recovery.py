@@ -454,11 +454,14 @@ class ProviderRead:
         self.production_deployment_ids.add(active)
         with policy.prestate_diagnostic("PRODUCTION_DEPLOYMENT_READ"):
             dep = self._get("/v2/apps/" + self.production_id + "/deployments/" + active).get("deployment")
-        with policy.prestate_diagnostic("PRODUCTION_STATE"):
+        with policy.prestate_diagnostic("PRODUCTION_TARGET_DESCRIPTOR"):
             target = self.planner.normalize_target_descriptor(common.canonical_payload_bytes({"app_id": self.production_id,
                                                            "default_ingress": app.get("default_ingress")}).decode(), self.contract)
+        with policy.prestate_diagnostic("PRODUCTION_PREDECESSOR"):
             expected, images = self.planner.predecessor_provider_expectation(self.contract, {}, None)
+        with policy.prestate_diagnostic("PRODUCTION_PROVIDER_VALIDATION"):
             state, _ = self.planner.provider_state({"app": app}, {"deployment": dep}, self.contract, target, expected, images)
+        with policy.prestate_diagnostic("PRODUCTION_STATE_DIGEST"):
             require(common.sha256_value(state) == self.a["production_state_sha256"])
         with policy.prestate_diagnostic("PRODUCTION_HISTORY_READ"):
             history = self._inventory(self.production_id, 164)
@@ -684,9 +687,22 @@ FAILED_CHECK_2_JOBS = {
     "recover": (106940193638, "skipped", "2026-09-22T21:12:32Z", "2026-09-22T21:12:31Z"),
     "gate": (106943141218, "failure", "2026-09-22T21:21:06Z", "2026-09-22T21:21:09Z"),
 }
+
+FAILED_CHECK_3_ID = "35828881657"
+FAILED_CHECK_3_CONTROL = "92d1e96964511008e5d5fee12ba8377cb7d6ad01"
+FAILED_CHECK_3_TITLE = ("Check existing CRM driver 52b20524-7165-4d3e-af9b-24ff09f59951 "
+                        "59e2847c542c356b35b7bcaab8262e575ee041318cada021ca0ac6aaf78241dc")
+FAILED_CHECK_3_TIMES = {"created_at": "2026-09-23T06:53:14Z", "updated_at": "2026-09-23T06:55:52Z"}
+FAILED_CHECK_3_JOBS = {
+    "authority": (107076655961, "success", "2026-09-23T06:53:18Z", "2026-09-23T06:53:31Z"),
+    "check": (107076718516, "failure", "2026-09-23T06:54:14Z", "2026-09-23T06:55:48Z"),
+    "recover": (107076719437, "skipped", "2026-09-23T06:53:32Z", "2026-09-23T06:53:31Z"),
+    "gate": (107077304221, "failure", "2026-09-23T06:55:50Z", "2026-09-23T06:55:52Z"),
+}
 FAILED_CHECKS = {
     FAILED_CHECK_ID: (FAILED_CHECK_CONTROL, FAILED_CHECK_TITLE, FAILED_CHECK_TIMES, FAILED_CHECK_JOBS),
     FAILED_CHECK_2_ID: (FAILED_CHECK_2_CONTROL, FAILED_CHECK_2_TITLE, FAILED_CHECK_2_TIMES, FAILED_CHECK_2_JOBS),
+    FAILED_CHECK_3_ID: (FAILED_CHECK_3_CONTROL, FAILED_CHECK_3_TITLE, FAILED_CHECK_3_TIMES, FAILED_CHECK_3_JOBS),
 }
 
 
