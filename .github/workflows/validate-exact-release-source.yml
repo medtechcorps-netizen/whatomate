@@ -77,29 +77,31 @@ jobs:
 
           case "$REQUESTED_PHASE" in
             baseline)
-              # Refreshed 2026-09-17: 4f65abeb is the reviewed baseline release
+              # Historical parent 2026-09-17: 4f65abeb is the reviewed baseline
               # snapshot rebuilt from the lock-remediated base fe0fc9e4 with the
               # same tree as the previous pin 712dc929 plus the reviewed bounded
               # bootstrap dry-run lock test fix (50303c11). The previous pin hung
               # the full Go race job for 40 minutes in the same test (baseline
               # validation run 35154343269).
-              source_sha="4f65abeb1c03c8fca018aa92cc987fae25ef4000"
-              root_tree="653c21b4a6b984c12e124ffb709c3b69eb028e52"
+              # Current child adds only the reviewed Embedded Signup name fix.
+              source_sha="3cedc58fad2cabe7c63646f6ad10ca4d8dc1f2b9"
+              root_tree="e68b752b45361dcd2d91ed4be91f509a3aa1719b"
               frontend_tree="3a05b5d1ab184bb1cd674d02e1bf14f834d266ae"
-              internal_tree="c116aecaf5fe3e76c28ff08a6cc23da84d5e5db9"
+              internal_tree="1a66931fc6b9d91daae09f71f092c294215815b3"
               ;;
             bridge)
-              # Refreshed 2026-09-17: e403bab2 is the reviewed bridge release
+              # Historical parent 2026-09-17: e403bab2 is the reviewed bridge
               # snapshot rebuilt from the lock-remediated base 45334bf6 with the
               # same tree as the previous pin dbda639b plus the reviewed bounded
               # bootstrap dry-run lock test fix (50303c11).
-              source_sha="e403bab279644963e13e5bf653956a492404fc06"
-              root_tree="dfda4c1ddf844ca85818247501f9a31127e846a1"
+              # Current child adds only the reviewed Embedded Signup name fix.
+              source_sha="0e805531cf8b1dd3f1df0f637b214c28b169a30f"
+              root_tree="4da989a2f2dbff05021532891e20136a15c1778c"
               frontend_tree="3a05b5d1ab184bb1cd674d02e1bf14f834d266ae"
-              internal_tree="b79fbe49ffd192b1a2c0fad95338e391ff0d019d"
+              internal_tree="353617ae6a72adc0c896434d2dfe97cf903245c8"
               ;;
             backend)
-              # Refreshed 2026-09-16: 7cd028cb is the reviewed backend release
+              # Historical parent 2026-09-16: 7cd028cb is the reviewed backend
               # snapshot rebuilt from the lock-remediated base f90ae3b1 with the
               # same tree as the previous pin 1382847d plus the reviewed bounded
               # bootstrap dry-run lock test fix (50303c11). Product source,
@@ -108,23 +110,25 @@ jobs:
               # minutes in
               # TestBootstrapAtomicallyCreatesPurposeOrganizationAndIsExactlyIdempotent,
               # twice, which no retry could clear.
-              source_sha="7cd028cbd6e2c9d704f34e47a631f748f481c37d"
-              root_tree="47e316a579db224d6c951eed3f23863a311ffacc"
+              # Current child adds only the reviewed Embedded Signup name fix.
+              source_sha="2cd616279c2548e0483e8e6b545812e98aefebbf"
+              root_tree="5a16091bef92d9d25d39014cd90844fc240d34f6"
               frontend_tree="3a05b5d1ab184bb1cd674d02e1bf14f834d266ae"
-              internal_tree="1d5b6825eea198bb768bc15d95e34e0c823a21a8"
+              internal_tree="6db4f94130788bdb236ede130a0601fa7d4163c1"
               ;;
             ui)
-              # Refreshed 2026-09-16: 96793290 is the reviewed ui release
+              # Historical parent 2026-09-16: 96793290 is the reviewed ui
               # snapshot rebuilt from the lock-remediated base c6e16810 with the
               # same tree as the previous pin 20a47384 plus the reviewed bounded
               # bootstrap dry-run lock test fix (50303c11). Product source,
               # internal packages and the frontend tree are otherwise
               # identical. The previous pin hung the full Go race job for 40
               # minutes in the same test (ui validation run 35093373191).
-              source_sha="96793290a3bc286f0a9335101aace98be3307482"
-              root_tree="b131d9ecd468085749fc1e46aa57cc01b06f15ca"
+              # Current child adds only the reviewed Embedded Signup name fix.
+              source_sha="1911174a746e0cc70fd246e6c1f45bc65ba12946"
+              root_tree="eaba0b104abc04500776aafb680993d3d7065748"
               frontend_tree="09b0efe5124317d2d5561548f1082b8902144d58"
-              internal_tree="0cb24df10bfe95852b67db834768d28d7ef3e380"
+              internal_tree="a43572db8ee7e5a7cf2ccaf3e880a181c91ed183"
               ;;
             *)
               echo "::error::The requested phase is not allowlisted."
@@ -394,10 +398,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Reviewed bridge contract, aligned to the pinned bridge snapshot
-          # (2026-09-16). The pinned phase snapshots (baseline 4f65abeb, bridge
-          # e403bab2, backend 7cd028cb, ui 96793290) each contain exactly these
-          # nine compatibility tests; the previous expectation listed three
+          # Reviewed bridge contract, aligned to the pinned phase snapshots
+          # and their 2026-09-23 two-file Embedded Signup name-fix children.
+          # Each source contains exactly these nine compatibility tests; the
+          # previous expectation listed three
           # further tests that exist only in the later lineage, so no pinned
           # phase could ever satisfy it:
           #
@@ -405,9 +409,9 @@ jobs:
           #   TestFutureMessageCursorTriggerContractMetadataIsExact
           #   TestPlatformComplianceStartupVerificationAcceptsExactMessageCursorRolloutProfiles
           #
-          # Those three are recorded here for the phase refresh (the reviewed
-          # additive child commits that will repin the phases); the bridge phase
-          # proves the nine compatibility behaviours its frozen source carries.
+          # Those three require a separate future source refresh; the name-fix
+          # children do not change database tests. The bridge phase proves the
+          # nine compatibility behaviours its frozen source carries.
           selector='^(TestPlatformComplianceDatabaseWriteBarrier|TestPlatformComplianceAtomicBirthAndMonotonicIdentity|TestPlatformComplianceAtomicCreationIdempotenceRejectsDrift|TestPlatformComplianceGlobalDatabaseSeedsSkipPurposeOrganization|TestPlatformComplianceScanAuthorityRejectsPolicyGaps|TestRemoveTenantRLSPreservesPlatformComplianceBarrier|TestPlatformComplianceRemoveTenantRLSSerializesAtomicCreation|TestRemoveTenantRLSRejectsNestedAndRepeatableReadSnapshots|TestPlatformComplianceStartupVerificationRejectsContractDrift)$'
           expected_tests=(
             TestPlatformComplianceDatabaseWriteBarrier

@@ -36,10 +36,10 @@ DATABASE_PHASE_HARNESS_PATH = (
 )
 CONTROL_SHA = "a" * 40
 EXPECTED_FINAL_SOURCE = {
-    "source_sha": "96793290a3bc286f0a9335101aace98be3307482",
-    "root_tree": "b131d9ecd468085749fc1e46aa57cc01b06f15ca",
+    "source_sha": "1911174a746e0cc70fd246e6c1f45bc65ba12946",
+    "root_tree": "eaba0b104abc04500776aafb680993d3d7065748",
     "frontend_tree": "09b0efe5124317d2d5561548f1082b8902144d58",
-    "internal_tree": "0cb24df10bfe95852b67db834768d28d7ef3e380"
+    "internal_tree": "a43572db8ee7e5a7cf2ccaf3e880a181c91ed183"
 }
 STALE_FINAL_SOURCE = {
     "source_sha": "ab44af2e7c093b4502c1928126c31306b2ba0389",
@@ -74,6 +74,30 @@ LOCK_REMEDIATED_PHASE_SOURCE_SHA = {
     "bridge": "45334bf62943885291a73c55788d18001b191be9",
     "backend": "f90ae3b1713c76694680c0cb3b36114db1688f30",
     "ui": "c6e16810b8dec7d54305be47f7f7fc12430a1f0a"
+}
+REVIEWED_PHASE_SNAPSHOT_SHA = {
+    "baseline": "4f65abeb1c03c8fca018aa92cc987fae25ef4000",
+    "bridge": "e403bab279644963e13e5bf653956a492404fc06",
+    "backend": "7cd028cbd6e2c9d704f34e47a631f748f481c37d",
+    "ui": "96793290a3bc286f0a9335101aace98be3307482",
+}
+REVIEWED_NAME_FIX_BLOBS = {
+    "baseline": {
+        "internal/handlers/accounts.go": "a4236060df09253359da511df002da6814c0ab0f",
+        "internal/handlers/accounts_contract_test.go": "54c087981afed306390156b43169a73b7a801b26",
+    },
+    "bridge": {
+        "internal/handlers/accounts.go": "a4236060df09253359da511df002da6814c0ab0f",
+        "internal/handlers/accounts_contract_test.go": "54c087981afed306390156b43169a73b7a801b26",
+    },
+    "backend": {
+        "internal/handlers/accounts.go": "507952b64c8aa343db94b2aa7b47ea7db39565b9",
+        "internal/handlers/accounts_contract_test.go": "97fed1b28de132026a6b37d01f4692e204ed594c",
+    },
+    "ui": {
+        "internal/handlers/accounts.go": "507952b64c8aa343db94b2aa7b47ea7db39565b9",
+        "internal/handlers/accounts_contract_test.go": "97fed1b28de132026a6b37d01f4692e204ed594c",
+    },
 }
 REVIEWED_SNAPSHOT_DIFF_SHA256 = {
     "baseline": "89853139e27533073431fa59744187dba525a555984e73ba0da298f4d54bdcdc",
@@ -260,9 +284,9 @@ class RolloutEvidenceTests(unittest.TestCase):
         self.assertNotEqual(manifest_phases["ui"], STALE_FINAL_SOURCE)
 
     def test_phase_sources_apply_only_the_reviewed_fixed_snapshot(self) -> None:
-        for phase, source in self.manifest["phases"].items():
+        for phase in verifier.PHASES:
             with self.subTest(phase=phase):
-                commit = source["source_sha"]
+                commit = REVIEWED_PHASE_SNAPSHOT_SHA[phase]
                 parent = LOCK_REMEDIATED_PHASE_SOURCE_SHA[phase]
                 def git(*arguments: str) -> bytes:
                     return subprocess.run(
@@ -308,6 +332,40 @@ class RolloutEvidenceTests(unittest.TestCase):
                     self.assertNotEqual(mutant, raw)
                     with self.assertRaises(AssertionError):
                         require_reviewed_snapshot_diff(phase, mutant)
+
+    def test_phase_source_children_apply_only_the_reviewed_name_fix(self) -> None:
+        for phase, source in self.manifest["phases"].items():
+            with self.subTest(phase=phase):
+                commit = source["source_sha"]
+                parent = REVIEWED_PHASE_SNAPSHOT_SHA[phase]
+
+                def git(*arguments: str) -> bytes:
+                    return subprocess.run(
+                        ["git", "-C", str(ROOT), *arguments],
+                        check=True, capture_output=True,
+                    ).stdout
+
+                self.assertEqual(
+                    git("rev-list", "--parents", "-n", "1", commit).decode().split(),
+                    [commit, parent],
+                )
+                raw = git("diff-tree", "--no-commit-id", "--raw", "--no-abbrev",
+                          "--no-renames", "-r", "-z", parent, commit)
+                records = snapshot_diff_records(raw)
+                self.assertEqual(
+                    {record["path"]: record["after"] for record in records},
+                    REVIEWED_NAME_FIX_BLOBS[phase],
+                )
+                self.assertTrue(all(
+                    record["status"] == "M"
+                    and record["old_mode"] == record["new_mode"] == "100644"
+                    for record in records
+                ))
+                for unchanged in ("frontend", "internal/database/postgres.go"):
+                    self.assertEqual(
+                        git("rev-parse", f"{commit}:{unchanged}"),
+                        git("rev-parse", f"{parent}:{unchanged}"),
+                    )
 
     def test_phase_sources_apply_only_the_reviewed_dependency_remediation(self) -> None:
         for phase, source in self.manifest["phases"].items():
