@@ -1076,6 +1076,35 @@ class HostedGuardTests(RunnerFixtures):
             "total_count": 4, "jobs": quarantined3_jobs}
         data[prefix + "/actions/runs/" + runner.FAILED_CHECK_3_ID + "/artifacts"] = {
             "total_count": 0, "artifacts": []}
+        quarantined4 = copy.deepcopy(quarantined)
+        quarantined4.update({"id": int(runner.FAILED_CHECK_4_ID),
+                             "head_sha": runner.FAILED_CHECK_4_CONTROL,
+                             "display_title": runner.FAILED_CHECK_4_TITLE,
+                             **runner.FAILED_CHECK_4_TIMES})
+        quarantined4_jobs = []
+        for key, (identity, conclusion, started, completed) in runner.FAILED_CHECK_4_JOBS.items():
+            if key == "recover":
+                steps = []
+            elif key == "gate":
+                steps = [("Set up job", "success"), ("Require exactly the selected recovery mode", "failure"),
+                         ("Complete job", "success")]
+            else:
+                step = "Validate public authority without private credentials" if key == "authority" \
+                    else "Rehydrate and inspect only inside the protected boundary"
+                steps = [("Set up job", "success"), ("Check out exact protected controls", "success"),
+                         (step, conclusion), ("Post Check out exact protected controls", "success"),
+                         ("Complete job", "success")]
+            quarantined4_jobs.append({"id": identity, "run_id": int(runner.FAILED_CHECK_4_ID), "run_attempt": 1,
+                "name": runner.JOB_NAMES[key], "status": "completed", "conclusion": conclusion,
+                "started_at": started, "completed_at": completed,
+                "steps": [{"name": name, "status": "completed", "conclusion": result} for name, result in steps]})
+        data[endpoint + "/runs"]["workflow_runs"].append(quarantined4)
+        data[endpoint + "/runs"]["total_count"] += 1
+        data[prefix + "/actions/runs/" + runner.FAILED_CHECK_4_ID] = copy.deepcopy(quarantined4)
+        data[prefix + "/actions/runs/" + runner.FAILED_CHECK_4_ID + "/attempts/1/jobs"] = {
+            "total_count": 4, "jobs": quarantined4_jobs}
+        data[prefix + "/actions/runs/" + runner.FAILED_CHECK_4_ID + "/artifacts"] = {
+            "total_count": 0, "artifacts": []}
         api = mock.Mock(spec=["get", "pages"])
         api.get.side_effect = lambda path: copy.deepcopy(data[path])
         api.pages.side_effect = lambda path, key: copy.deepcopy(data[path])
@@ -1084,6 +1113,7 @@ class HostedGuardTests(RunnerFixtures):
                 "quarantined": quarantined, "quarantined_jobs": quarantined_jobs,
                 "quarantined2": quarantined2, "quarantined2_jobs": quarantined2_jobs,
                 "quarantined3": quarantined3, "quarantined3_jobs": quarantined3_jobs,
+                "quarantined4": quarantined4, "quarantined4_jobs": quarantined4_jobs,
                 "endpoint": endpoint, "env": {"RECOVERY_MODE": mode, "GITHUB_RUN_ID": current_id,
                                               "GITHUB_JOB": selected_job}}
 
@@ -1250,6 +1280,55 @@ class HostedGuardTests(RunnerFixtures):
             test["quarantined3_jobs"][2][key] = value
             with self.subTest(key=key), self.assertRaises(common.ReleaseError):
                 self.guard(test)
+
+    def test_fourth_failed_check_is_exact_quarantined_history_not_a_predecessor(self):
+        self.assertEqual(self.guard(self.guard_fixture("check")), CONTROL)
+        self.assertEqual(self.guard(self.guard_fixture("recover")), CONTROL)
+        predecessor = self.guard_fixture("recover")
+        predecessor["packet"]["check_run_id"] = runner.FAILED_CHECK_4_ID
+        with self.assertRaises(common.ReleaseError):
+            self.guard(predecessor)
+        for mutation in ("missing", "duplicate", "foreign", "rerun", "artifact", "write_step"):
+            test = self.guard_fixture("check")
+            inventory = test["data"][test["endpoint"] + "/runs"]
+            latest = test["data"][runner.fixture.API_PREFIX + "/actions/runs/" + runner.FAILED_CHECK_4_ID]
+            if mutation == "missing":
+                inventory["workflow_runs"].remove(test["quarantined4"])
+                inventory["total_count"] -= 1
+            elif mutation == "duplicate":
+                inventory["workflow_runs"].append(copy.deepcopy(test["quarantined4"]))
+                inventory["total_count"] += 1
+            elif mutation == "foreign":
+                test["quarantined4"]["id"] += 1
+            elif mutation == "rerun":
+                latest["run_attempt"] = 2
+            elif mutation == "artifact":
+                test["data"][runner.fixture.API_PREFIX + "/actions/runs/" + runner.FAILED_CHECK_4_ID
+                             + "/artifacts"] = {"total_count": 1, "artifacts": [{"id": 123}]}
+            else:
+                test["quarantined4_jobs"][2]["steps"] = [
+                    {"name": "unexpected write", "status": "completed", "conclusion": "success"}]
+            with self.subTest(mutation=mutation), self.assertRaises(common.ReleaseError):
+                self.guard(test)
+
+    def test_fourth_failed_check_run_and_job_metadata_are_frozen(self):
+        for source in ("inventory", "latest"):
+            for key, value in (("head_sha", CONTROL), ("run_attempt", 2),
+                               ("previous_attempt_url", "present"), ("conclusion", "success"),
+                               ("updated_at", fixtures.stamp(NOW))):
+                test = self.guard_fixture("check")
+                row = test["quarantined4"] if source == "inventory" else test["data"][
+                    runner.fixture.API_PREFIX + "/actions/runs/" + runner.FAILED_CHECK_4_ID]
+                row[key] = value
+                with self.subTest(source=source, key=key), self.assertRaises(common.ReleaseError):
+                    self.guard(test)
+        for job_index in range(4):
+            for key, value in (("id", 1), ("run_attempt", 2), ("conclusion", "cancelled"),
+                               ("completed_at", "2026-09-24T00:00:00Z")):
+                test = self.guard_fixture("check")
+                test["quarantined4_jobs"][job_index][key] = value
+                with self.subTest(job=job_index, key=key), self.assertRaises(common.ReleaseError):
+                    self.guard(test)
 
     def test_public_authority_does_not_request_administration_protection_endpoint(self):
         test = self.guard_fixture("check", "authority")
@@ -1439,6 +1518,26 @@ class HostedGuardTests(RunnerFixtures):
             with self.subTest(failure=failure), self.assertRaises(common.ReleaseError):
                 self.guard(test)
 
+    def test_private_guard_diagnostics_separate_head_protection_and_own_job(self):
+        for boundary, expected in (("head", "CURRENT_GUARD_HEAD"),
+                                   ("protection", "CURRENT_GUARD_PROTECTION"),
+                                   ("own_job", "CURRENT_GUARD_OWN_JOB")):
+            test = self.guard_fixture("check")
+            prefix = runner.fixture.API_PREFIX
+            if boundary == "head":
+                test["data"][prefix + "/branches/main"]["protected"] = False
+            elif boundary == "protection":
+                test["data"][prefix + "/branches/main/protection"]["enforce_admins"]["enabled"] = False
+            else:
+                test["current_jobs"][-1]["status"] = "queued"
+            with self.subTest(boundary=boundary), self.assertRaises(runner.AuthorizationRejected) as caught:
+                self.guard(test)
+            self.assertEqual(caught.exception.code, expected)
+            with mock.patch.object(runner, "CURRENT_STAGE", "AUTHORIZATION"):
+                report = runner.failure_report(caught.exception)
+            self.assertEqual(report["diagnostic_code"], expected)
+            self.assert_no_private_report(report)
+
 
 class CliBoundaryTests(RunnerFixtures):
     def environment(self, command="check"):
@@ -1454,7 +1553,7 @@ class CliBoundaryTests(RunnerFixtures):
             env["CRM_CANARY_FIXTURE_INPUT_JSON"] = common.canonical_payload_bytes(self.protected).decode()
         return env
 
-    def cli(self, command="validate", env=None, invoke=None, extra=()):
+    def cli(self, command="validate", env=None, invoke=None, extra=(), fail_at=None):
         try:
             from . import launch_production_prerequisites as prerequisites
         except ImportError:
@@ -1480,10 +1579,10 @@ class CliBoundaryTests(RunnerFixtures):
                                                             timedelta=dt.timedelta)),
               mock.patch.object(boot, "GitHubRead") as api,
               mock.patch.object(runner, "current_guard", side_effect=guarded) as guard,
-              mock.patch.object(runner.fixture, "_pinned_gh", return_value=Path("synthetic-gh")),
+              mock.patch.object(runner.fixture, "_pinned_gh", return_value=Path("synthetic-gh")) as pinned_gh,
               mock.patch.object(prerequisites, "GitHubEvidence") as evidence,
               mock.patch.object(prerequisites, "GitHubGetOnly"),
-              mock.patch.object(boot, "EnvironmentReader"),
+              mock.patch.object(boot, "EnvironmentReader") as environment_reader,
               mock.patch.object(boot, "EnvironmentWriter") as writer,
               mock.patch.object(runner, "ProviderRead") as provider_read,
               mock.patch.object(runner, "ProviderUpdate") as provider_update,
@@ -1493,6 +1592,9 @@ class CliBoundaryTests(RunnerFixtures):
               mock.patch.object(runner, "run_once", side_effect=executing) as execute,
               mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
               mock.patch("sys.stderr", new_callable=io.StringIO) as stderr):
+            if fail_at is not None:
+                {"guard": guard, "pinned_gh": pinned_gh, "setup": evidence,
+                 "reader": environment_reader}[fail_at].side_effect = RuntimeError(PRIVATE)
             result = runner.main([command, "--control-root", str(Path(__file__).resolve().parents[2]), *extra])
             output, error = stdout.getvalue(), stderr.getvalue()
             private_removed = all(key not in os.environ for key in runner.PRIVATE_NAMES)
@@ -1602,6 +1704,88 @@ class CliBoundaryTests(RunnerFixtures):
             self.assertEqual(report.get("http_status"), 403 if type(error) is runner.UpdateRejected and error.status == 403 else None)
         with mock.patch.object(runner, "CURRENT_STAGE", PRIVATE):
             self.assertEqual(runner.failure_report(RuntimeError(PRIVATE))["stage"], "AUTHORIZATION")
+
+    def test_early_authorization_boundaries_emit_only_allowlisted_content_free_codes(self):
+        cases = []
+        env = self.environment("check")
+        env.pop("DO_DRIVER_BOOTSTRAP_READ_TOKEN")
+        cases.append(("private_missing", env, None, "PRIVATE_INPUT_PRESENCE"))
+        env = self.environment("check")
+        env["DO_DRIVER_BOOTSTRAP_CREATE_TOKEN"] = PRIVATE
+        cases.append(("create_token_present", env, None, "PRIVATE_INPUT_PRESENCE"))
+        env = self.environment("check")
+        env["RECOVERY_AUTHORIZATION_JSON"] += "\n"
+        cases.append(("public_packet", env, None, "PUBLIC_AUTHORITY"))
+        env = self.environment("check")
+        env.pop("GH_TOKEN")
+        cases.append(("gh_token", env, None, "CURRENT_GUARD_TOKEN"))
+        env = self.environment("check")
+        cases.append(("guard_history", env, "guard", "CURRENT_GUARD_HISTORY"))
+        env = self.environment("check")
+        env["CRM_CANARY_DRIVER_BOOTSTRAP_JSON"] = "{"
+        cases.append(("descriptor", env, None, "DESCRIPTOR_VALIDATION"))
+        cases.append(("pinned_gh", self.environment("check"), "pinned_gh", "PINNED_GH_ACQUISITION"))
+        cases.append(("setup", self.environment("check"), "setup", "PRE_RUN_ONCE_SETUP"))
+        cases.append(("reader", self.environment("check"), "reader", "PRE_RUN_ONCE_SETUP"))
+        for label, env, fault, expected in cases:
+            with self.subTest(label=label):
+                result = self.cli("check", env, fail_at=fault)
+                self.assertEqual(result["code"], 1)
+                self.assertEqual(result["output"], "")
+                self.assertTrue(result["removed"])
+                report = common.loads_strict(result["error"])
+                self.assertEqual(report, {"schema_version": 1, "state": "existing-driver-recovery-stopped",
+                    "code": "RECOVERY_STOPPED_RECONCILE_ONLY", "stage": "AUTHORIZATION",
+                    "retry_authorized": False, "diagnostic_code": expected})
+                self.assert_no_private_report(report)
+                result["execute"].assert_not_called()
+
+    def test_run_once_auth_diagnostic_and_hostile_codes_do_not_escape(self):
+        test = self.execution("check")
+        test["callbacks"]["writer"] = object()
+        with self.assertRaises(runner.AuthorizationRejected) as caught:
+            self.run_execution(test)
+        self.assertEqual(caught.exception.code, "RUN_ONCE_AUTHORIZATION")
+        self.assertEqual(test["state"]["update_count"], 0)
+        with self.assertRaises(runner.AuthorizationRejected) as caught:
+            with runner.authorization_diagnostic("PRE_RUN_ONCE_SETUP"):
+                with runner.authorization_diagnostic("PINNED_GH_ACQUISITION"):
+                    raise RuntimeError(PRIVATE)
+        self.assertEqual(caught.exception.code, "PINNED_GH_ACQUISITION")
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        with self.assertRaises(runner.AuthorizationRejected) as caught:
+            with runner.authorization_diagnostic("PRE_RUN_ONCE_SETUP"):
+                error = runner.AuthorizationRejected("PUBLIC_AUTHORITY")
+                error.code = PRIVATE
+                raise error
+        self.assertEqual(caught.exception.code, "PRE_RUN_ONCE_SETUP")
+        class Hostile(runner.AuthorizationRejected):
+            @property
+            def code(self):
+                raise AssertionError("private property read")
+            def __str__(self):
+                raise AssertionError("private exception formatted")
+        hostile = Hostile.__new__(Hostile)
+        Exception.__init__(hostile, PRIVATE)
+        with mock.patch.object(runner, "CURRENT_STAGE", "AUTHORIZATION"):
+            self.assertNotIn("diagnostic_code", runner.failure_report(hostile))
+            self.assertNotIn("diagnostic_code", runner.failure_report(RuntimeError(PRIVATE)))
+            for value in (PRIVATE, None, True, object(), [PRIVATE], {PRIVATE: PRIVATE}):
+                error = runner.AuthorizationRejected("PUBLIC_AUTHORITY")
+                error.code = value
+                report = runner.failure_report(error)
+                self.assertNotIn("diagnostic_code", report)
+                self.assert_no_private_report(report)
+            for code in runner.AUTHORIZATION_DIAGNOSTICS:
+                report = runner.failure_report(runner.AuthorizationRejected(code))
+                self.assertEqual(report["diagnostic_code"], code)
+                self.assert_no_private_report(report)
+        for stage in runner.STAGES - {"AUTHORIZATION"}:
+            with mock.patch.object(runner, "CURRENT_STAGE", stage):
+                self.assertNotIn("diagnostic_code", runner.failure_report(
+                    runner.AuthorizationRejected("PRIVATE_INPUT_PRESENCE")))
 
     def test_recover_cli_writes_only_two_public_receipt_files_after_successful_run(self):
         root = Path(__file__).resolve().parents[2]
