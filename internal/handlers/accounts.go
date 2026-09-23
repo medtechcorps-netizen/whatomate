@@ -1630,23 +1630,35 @@ func (a *App) ExchangeToken(r *fastglue.Request) error {
 	return r.SendEnvelope(out)
 }
 
-func embeddedSignupAccountName(name, phoneID string, phoneInfo *whatsapp.PhoneNumberInfo) (string, error) {
+func embeddedSignupAccountName(name string, accountID uuid.UUID, phoneInfo *whatsapp.PhoneNumberInfo) (string, error) {
 	name = strings.TrimSpace(name)
 	if name != "" {
 		return name, nil
 	}
-	if phoneInfo != nil && strings.TrimSpace(phoneInfo.VerifiedName) != "" {
-		suffix, err := generateNumericPIN(4)
-		if err != nil {
-			return "", err
+	if accountID == uuid.Nil {
+		return "", errors.New("embedded signup account ID is required for a generated name")
+	}
+	// Names are globally unique in the current schema. A random four-digit
+	// suffix can collide with another tenant's account, while a phone suffix
+	// can collide with a soft-deleted account. The assigned account ID remains
+	// stable across reconnects and uniquely identifies every generated name.
+	prefix := "WhatsApp Account"
+	if phoneInfo != nil {
+		if verifiedName := strings.TrimSpace(phoneInfo.VerifiedName); verifiedName != "" {
+			prefix = verifiedName
 		}
-		return fmt.Sprintf("%s %s", strings.TrimSpace(phoneInfo.VerifiedName), suffix), nil
+		if displayNumber := strings.TrimSpace(phoneInfo.DisplayPhoneNumber); displayNumber != "" {
+			prefix += " (" + displayNumber + ")"
+		}
 	}
-	suffix := strings.TrimSpace(phoneID)
-	if len(suffix) > 4 {
-		suffix = suffix[len(suffix)-4:]
+	const maxNameRunes = 100 // WhatsAppAccount.Name is varchar(100).
+	suffix := accountID.String()
+	maxPrefixRunes := maxNameRunes - 1 - len([]rune(suffix))
+	prefixRunes := []rune(prefix)
+	if len(prefixRunes) > maxPrefixRunes {
+		prefix = strings.TrimSpace(string(prefixRunes[:maxPrefixRunes]))
 	}
-	return "WhatsApp Account " + suffix, nil
+	return prefix + " " + suffix, nil
 }
 
 func embeddedSignupPhoneIsSMB(phoneInfo *whatsapp.PhoneNumberInfo) bool {
@@ -1905,7 +1917,7 @@ func (a *App) claimEmbeddedSignupAccount(
 		}
 
 		if !claim.existing || strings.TrimSpace(account.Name) == "" {
-			preparedName, nameErr := embeddedSignupAccountName(name, phoneID, phoneInfo)
+			preparedName, nameErr := embeddedSignupAccountName(name, account.ID, phoneInfo)
 			if nameErr != nil {
 				return nameErr
 			}
@@ -2083,7 +2095,6 @@ func (a *App) discoverWABAAndPhone(
 		if phoneID == "" {
 			return "", "", "", nil, nil, fmt.Errorf("meta returned a phone number without an ID")
 		}
-		name = fmt.Sprintf("%s (%s)", phone.VerifiedName, phone.DisplayPhoneNumber)
 		a.Log.Info("Discovered Phone ID", "phone_id", phoneID)
 	}
 

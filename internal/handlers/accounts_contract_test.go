@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
@@ -36,6 +37,40 @@ const (
 func contractGraphIDs() (string, string) {
 	sequence := contractGraphIDSequence.Add(1)
 	return fmt.Sprintf("110000000%06d", sequence), fmt.Sprintf("220000000%06d", sequence)
+}
+
+func TestEmbeddedSignupGeneratedAccountNameUsesFullID(t *testing.T) {
+	firstID := uuid.MustParse("11111111-2222-4333-8444-555555555555")
+	secondID := uuid.MustParse("66666666-7777-4888-8999-aaaaaaaaaaaa")
+	phoneInfo := &whatsapp.PhoneNumberInfo{
+		VerifiedName:       "Synthetic Clinic",
+		DisplayPhoneNumber: "+60123456789",
+	}
+
+	first, err := embeddedSignupAccountName("", firstID, phoneInfo)
+	require.NoError(t, err)
+	second, err := embeddedSignupAccountName("", secondID, phoneInfo)
+	require.NoError(t, err)
+	assert.Equal(t, "Synthetic Clinic (+60123456789) "+firstID.String(), first)
+	assert.Equal(t, "Synthetic Clinic (+60123456789) "+secondID.String(), second)
+	assert.NotEqual(t, first, second, "a repeated Meta name must not collide across accounts")
+
+	longName, err := embeddedSignupAccountName("", firstID, &whatsapp.PhoneNumberInfo{
+		VerifiedName: strings.Repeat("診", 80),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, strings.Repeat("診", 63)+" "+firstID.String(), longName)
+	assert.Equal(t, 100, utf8.RuneCountInString(longName))
+
+	fallback, err := embeddedSignupAccountName("", firstID, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "WhatsApp Account "+firstID.String(), fallback)
+
+	explicit, err := embeddedSignupAccountName("  Chosen Account  ", uuid.Nil, phoneInfo)
+	require.NoError(t, err)
+	assert.Equal(t, "Chosen Account", explicit)
+	_, err = embeddedSignupAccountName("", uuid.Nil, phoneInfo)
+	require.Error(t, err)
 }
 
 func TestValidateWhatsAppAccountContractProviderLookupCases(t *testing.T) {
@@ -2183,6 +2218,57 @@ func TestEmbeddedSignupExplicitAlternateMembershipWritesOnlySelectedOrganization
 		Count(&homeCount).Error)
 	assert.Equal(t, int64(1), targetCount)
 	assert.Zero(t, homeCount)
+}
+
+func TestEmbeddedSignupGeneratedNamesAcrossOrganizationsAndDiscovery(t *testing.T) {
+	// Skip the entire contract when a disposable PostgreSQL test database is
+	// unavailable; skipped subtests must not trip the final cross-org assertion.
+	testutil.SetupTestDB(t)
+	var generatedNames []string
+	for _, testCase := range []struct {
+		name         string
+		provideIDs   bool
+		explicitName string
+	}{
+		{name: "supplied IDs", provideIDs: true},
+		{name: "discovered IDs"},
+		{name: "discovered IDs with explicit name", explicitName: "Selected Clinic Account"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+
+			body := map[string]any{
+				"code": "synthetic-generated-name-code",
+			}
+			if testCase.provideIDs {
+				body["phone_id"] = phoneID
+				body["waba_id"] = wabaID
+			}
+			if testCase.explicitName != "" {
+				body["name"] = "  " + testCase.explicitName + "  "
+			}
+			req := testutil.NewJSONRequest(t, body)
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+			require.NoError(t, app.ExchangeToken(req))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+			var stored models.WhatsAppAccount
+			require.NoError(t, app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&stored).Error)
+			if testCase.explicitName != "" {
+				assert.Equal(t, testCase.explicitName, stored.Name)
+				return
+			}
+			assert.Equal(t, "Synthetic Clinic (+60123456789) "+stored.ID.String(), stored.Name)
+			generatedNames = append(generatedNames, stored.Name)
+		})
+	}
+	require.Len(t, generatedNames, 2)
+	assert.NotEqual(t, generatedNames[0], generatedNames[1])
 }
 
 func TestEmbeddedSignupSuperAdminCanPinExistingTargetOrganization(t *testing.T) {
