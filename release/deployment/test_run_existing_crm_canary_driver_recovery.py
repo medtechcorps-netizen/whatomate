@@ -874,6 +874,47 @@ class ProviderBoundaryTests(RunnerFixtures):
                     provider._production({})
                 history[:] = baseline
 
+    def test_production_state_failure_boundaries_are_exact_and_content_free(self):
+        production_id, active_id = uid(10), uid(100)
+        app = {"id": production_id, "active_deployment": {"id": active_id},
+               "default_ingress": "https://production.invalid"}
+        deployment = {"id": active_id}
+        routes = {"/v2/apps/" + production_id: {"app": app},
+                  "/v2/apps/" + production_id + "/deployments/" + active_id:
+                      {"deployment": deployment}}
+        state = {"synthetic": "fixed-current-production-state"}
+        cases = (
+            ("target", "PRODUCTION_TARGET_DESCRIPTOR"),
+            ("predecessor", "PRODUCTION_PREDECESSOR"),
+            ("provider", "PRODUCTION_PROVIDER_VALIDATION"),
+            ("digest", "PRODUCTION_STATE_DIGEST"),
+        )
+        for failure, code in cases:
+            provider = self.provider()
+            provider.production_id = production_id
+            provider.a["production_state_sha256"] = (
+                "0" * 64 if failure == "digest" else common.sha256_value(state)
+            )
+            target = mock.Mock(return_value={})
+            predecessor = mock.Mock(return_value=({}, {}))
+            projection = mock.Mock(return_value=(state, None))
+            selected = {"target": target, "predecessor": predecessor,
+                        "provider": projection}.get(failure)
+            if selected is not None:
+                selected.side_effect = RuntimeError(PRIVATE)
+            with (self.subTest(failure=failure),
+                  mock.patch.object(provider, "_get", side_effect=lambda path: copy.deepcopy(routes[path])),
+                  mock.patch.object(provider.planner, "normalize_target_descriptor", target),
+                  mock.patch.object(provider.planner, "predecessor_provider_expectation", predecessor),
+                  mock.patch.object(provider.planner, "provider_state", projection),
+                  self.assertRaises(kernel.PrestateRejected) as caught):
+                provider._production({})
+            self.assertEqual(caught.exception.code, code)
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertTrue(caught.exception.__suppress_context__)
+            with mock.patch.object(runner, "CURRENT_STAGE", "PROVIDER_PRESTATE"):
+                self.assert_no_private_report(runner.failure_report(caught.exception))
+
     def test_cross_app_deployment_id_cannot_be_used_on_other_apps_route(self):
         provider = self.provider()
         provider.app_id, provider.production_id = self.app_id, uid(10)

@@ -454,11 +454,14 @@ class ProviderRead:
         self.production_deployment_ids.add(active)
         with policy.prestate_diagnostic("PRODUCTION_DEPLOYMENT_READ"):
             dep = self._get("/v2/apps/" + self.production_id + "/deployments/" + active).get("deployment")
-        with policy.prestate_diagnostic("PRODUCTION_STATE"):
+        with policy.prestate_diagnostic("PRODUCTION_TARGET_DESCRIPTOR"):
             target = self.planner.normalize_target_descriptor(common.canonical_payload_bytes({"app_id": self.production_id,
                                                            "default_ingress": app.get("default_ingress")}).decode(), self.contract)
+        with policy.prestate_diagnostic("PRODUCTION_PREDECESSOR"):
             expected, images = self.planner.predecessor_provider_expectation(self.contract, {}, None)
+        with policy.prestate_diagnostic("PRODUCTION_PROVIDER_VALIDATION"):
             state, _ = self.planner.provider_state({"app": app}, {"deployment": dep}, self.contract, target, expected, images)
+        with policy.prestate_diagnostic("PRODUCTION_STATE_DIGEST"):
             require(common.sha256_value(state) == self.a["production_state_sha256"])
         with policy.prestate_diagnostic("PRODUCTION_HISTORY_READ"):
             history = self._inventory(self.production_id, 164)

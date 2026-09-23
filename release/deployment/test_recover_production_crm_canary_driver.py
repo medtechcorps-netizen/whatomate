@@ -1459,6 +1459,10 @@ class DiagnosticAndCapabilityTests(unittest.TestCase):
 
 class PrestateDiagnosticTests(RecoveryFixtures):
     def test_closed_codes_accept_only_exact_allowlisted_strings(self):
+        self.assertTrue({
+            "PRODUCTION_TARGET_DESCRIPTOR", "PRODUCTION_PREDECESSOR",
+            "PRODUCTION_PROVIDER_VALIDATION", "PRODUCTION_STATE_DIGEST",
+        } <= recovery.PRESTATE_DIAGNOSTICS)
         for code in recovery.PRESTATE_DIAGNOSTICS:
             error = recovery.PrestateRejected(code)
             self.assertIs(type(error), recovery.PrestateRejected)
