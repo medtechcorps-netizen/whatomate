@@ -2411,8 +2411,11 @@ class ReviewedProductionContractTests(unittest.TestCase):
         bootstrap = production_contract["bootstrap_state"]
         self.assertEqual(bootstrap["source_mode"], "digest-images")
         self.assertEqual(bootstrap["source_mode"], verifier.BOOTSTRAP_SOURCE_MODE)
-        self.assertEqual(bootstrap["source_sha"], verifier.BASELINE_TARGET_SOURCE_SHA)
+        self.assertEqual(
+            bootstrap["source_sha"], "4f65abeb1c03c8fca018aa92cc987fae25ef4000"
+        )
         self.assertEqual(bootstrap["source_sha"], verifier.BOOTSTRAP_SOURCE_SHA)
+        self.assertNotEqual(bootstrap["source_sha"], verifier.BASELINE_TARGET_SOURCE_SHA)
         self.assertEqual(bootstrap["images"], verifier.BOOTSTRAP_IMAGES)
         self.assertEqual(
             [record["component"] for record in bootstrap["images"]],

@@ -80,14 +80,16 @@ PRODUCTION_APP_ID_SHA256 = (
 PRODUCTION_DEFAULT_INGRESS_SHA256 = (
     "05ab4f90194ad37c6926138e9aafbd49c73aa75d08da92b0b1309bfce207cfa8"
 )
-BASELINE_TARGET_SOURCE_SHA = "4f65abeb1c03c8fca018aa92cc987fae25ef4000"
+BASELINE_TARGET_SOURCE_SHA = "3cedc58fad2cabe7c63646f6ad10ca4d8dc1f2b9"
 # The production bootstrap is the state the platform is actually in. It was
 # re-baselined on 2026-09-18 onto the already-applied baseline phase, so it now
 # carries immutable image authority instead of the retired legacy git sources.
 BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
     "9452af265114a21c4c4cd52ce3e34a2109b9a87c8cd8bcce39946bafbbf4b76e"
 )
-BOOTSTRAP_SOURCE_SHA = BASELINE_TARGET_SOURCE_SHA
+# Historical, already-applied production source. A later baseline target
+# rebaseline must not rewrite the observed bootstrap identity.
+BOOTSTRAP_SOURCE_SHA = "4f65abeb1c03c8fca018aa92cc987fae25ef4000"
 BOOTSTRAP_SOURCE_MODE = "digest-images"
 BOOTSTRAP_IMAGES = [
     {

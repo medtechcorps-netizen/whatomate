@@ -8,10 +8,10 @@ release evidence, and changing production are three separate authorities.
 
 The final `ui` phase is bound to one immutable Git identity:
 
-- commit: `96793290a3bc286f0a9335101aace98be3307482`
-- root tree: `b131d9ecd468085749fc1e46aa57cc01b06f15ca`
+- commit: `1911174a746e0cc70fd246e6c1f45bc65ba12946`
+- root tree: `eaba0b104abc04500776aafb680993d3d7065748`
 - `frontend` tree: `09b0efe5124317d2d5561548f1082b8902144d58`
-- `internal` tree: `0cb24df10bfe95852b67db834768d28d7ef3e380`
+- `internal` tree: `a43572db8ee7e5a7cf2ccaf3e880a181c91ed183`
 
 Refreshed 2026-09-16: the previous binding `20a47384` hung the full Go race job
 for 40 minutes in
@@ -20,6 +20,19 @@ for 40 minutes in
 release tree rebuilt on its lock-remediated base with the reviewed bounded
 bootstrap dry-run lock test fix `50303c11`, so only
 `internal/platformcompliance/bootstrap_test.go` differs from `20a47384`.
+
+Refreshed 2026-09-23: four new immutable phase children carry only the
+reviewed Embedded Signup generated-account-name fix and its regression tests.
+Their respective parents remain the bounded snapshots `4f65abeb` (baseline),
+`e403bab2` (bridge), `7cd028cb` (backend), and `96793290` (UI). The child
+commits are `3cedc58f`, `0e805531`, `2cd61627`, and `1911174a` in that
+order. They retain each phase's compile-time database role, unchanged frontend
+tree, and the final UI's Booking, Commerce, Coexistence, and default-OFF AI
+booking source. Do not substitute current control `main` for a phase source:
+that checkout does not contain the complete reviewed final UI product tree.
+The already-live production bootstrap remains bound to the old `4f65abeb`
+source and its deployed image digests; the new baseline child is a target, not
+a rewrite of observed production history.
 
 The release contains Klinik-only WhatsApp reply hardening and the existing
 authorized-client realtime, unread-marker, and late-layout autoscroll fixes.
