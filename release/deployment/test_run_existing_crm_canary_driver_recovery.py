@@ -19,9 +19,11 @@ from unittest import mock
 try:
     from . import run_existing_crm_canary_driver_recovery as runner
     from . import test_recover_production_crm_canary_driver as fixtures
+    from . import test_verify_production_plan as plan_fixtures
 except ImportError:
     import run_existing_crm_canary_driver_recovery as runner
     import test_recover_production_crm_canary_driver as fixtures
+    import test_verify_production_plan as plan_fixtures
 
 common = fixtures.common
 boot = fixtures.boot
@@ -659,6 +661,146 @@ class ProviderBoundaryTests(RunnerFixtures):
                          now=lambda: NOW, **kwargs)
         return result
 
+    def production_rest_fixture(self):
+        """Synthetic REST envelopes exercising the actual digest-image planner."""
+        base = plan_fixtures.ProductionPlanTests()
+        base.setUp()
+        self.addCleanup(base.doCleanups)
+        base.spec = plan_fixtures.digest_source_spec()
+        planner = plan_fixtures.verifier
+        app, deployment = base.responses()
+        active_id = plan_fixtures.ACTIVE_DEPLOYMENT_ID
+        deployment["deployment"]["created_at"] = "2026-08-27T05:00:00Z"
+        images = {
+            row["component"]: {
+                "repository": row["repository"].removeprefix("ghcr.io/"),
+                "digest": row["digest"], "subject": row["subject"],
+            }
+            for row in planner.BOOTSTRAP_IMAGES
+        }
+        expected = {
+            "active_deployment_identity_sha256": planner.sha256_bytes(active_id.encode("ascii")),
+            "canonical_spec_sha256": planner.sha256_value(base.spec),
+            "environment_values_sha256": planner.environment_value_fingerprint(base.spec),
+            "non_source_projection_sha256": planner.non_source_fingerprint(base.spec, base.contract),
+            "source_mode": "digest-images",
+        }
+        state, _ = planner.provider_state(app, deployment, base.contract, base.target, expected, images)
+        history = [{"id": active_id, "phase": "ACTIVE", "created_at": "2026-08-26T00:00:00Z",
+                    "updated_at": "2026-08-26T01:00:00Z"}]
+        history.extend({"id": uid(index + 1000), "phase": "SUPERSEDED",
+                        "created_at": "2026-08-26T00:00:00Z", "updated_at": "2026-08-26T01:00:00Z"}
+                       for index in range(163))
+        return base, app, deployment, expected, images, state, history
+
+    def invoke_production_rest(self, base, app, deployment, expected, images, state, history):
+        provider = self.provider()
+        provider.planner = plan_fixtures.verifier
+        provider.production_id = base.target["app_id"]
+        provider.contract = base.contract
+        provider.a["production_state_sha256"] = common.sha256_value(state)
+        provider.a["production_history_sha256"] = common.sha256_value(
+            sorted(history, key=lambda row: row["id"]))
+        app_path = "/v2/apps/" + provider.production_id
+        deployment_path = app_path + "/deployments/" + plan_fixtures.ACTIVE_DEPLOYMENT_ID
+        routes = {app_path: app, deployment_path: deployment,
+                  app_path + "/deployments?per_page=200&page=1":
+                  {"deployments": history, "meta": {"total": 164}}}
+        with (mock.patch.object(provider, "_get", side_effect=lambda path: copy.deepcopy(routes[path])) as get,
+              mock.patch.object(provider.planner, "normalize_target_descriptor", return_value=base.target),
+              mock.patch.object(provider.planner, "predecessor_provider_expectation", return_value=(expected, images))):
+            try:
+                result = provider._production({})
+            except Exception as error:
+                return error, [call.args[0] for call in get.call_args_list]
+        return result, [call.args[0] for call in get.call_args_list]
+
+    def test_real_planner_acceptance_is_unchanged_for_synthetic_rest_envelopes(self):
+        baseline = self.production_rest_fixture()
+        result, paths = self.invoke_production_rest(*baseline)
+        self.assertEqual(result, common.sha256_value(baseline[5]))
+        self.assertEqual(len(paths), 3)
+        self.assertTrue(all(path.startswith("/v2/apps/") for path in paths))
+
+    def test_real_planner_rejections_are_precise_fixed_codes_without_extra_gets(self):
+        base, baseline_app, baseline_dep, baseline_expected, baseline_images, state, history = self.production_rest_fixture()
+        planner = plan_fixtures.verifier
+        for failure, code in (
+            ("app_id_format", "PRODUCTION_PROVIDER_APP_IDENTITY"),
+            ("app_updated_at", "PRODUCTION_PROVIDER_APP_UPDATED_AT"),
+            ("active_phase", "PRODUCTION_PROVIDER_ACTIVE_PHASE"),
+            ("pending_slot", "PRODUCTION_PROVIDER_NOT_IDLE"),
+            ("deployment_id_format", "PRODUCTION_PROVIDER_DEPLOYMENT_IDENTITY"),
+            ("embedded_spec", "PRODUCTION_PROVIDER_EMBEDDED_SPEC_EQUALITY"),
+            ("live_spec", "PRODUCTION_PROVIDER_LIVE_SPEC_EQUALITY"),
+            ("raw_spec", "PRODUCTION_PROVIDER_RAW_SPEC_DIGEST"),
+            ("env_structure", "PRODUCTION_PROVIDER_ENVIRONMENT_STRUCTURE"),
+            ("env_key_invalid", "PRODUCTION_PROVIDER_ENVIRONMENT_STRUCTURE"),
+            ("env_digest", "PRODUCTION_PROVIDER_ENVIRONMENT_DIGEST"),
+            ("non_source_structure", "PRODUCTION_PROVIDER_NON_SOURCE_STRUCTURE"),
+            ("non_source_digest", "PRODUCTION_PROVIDER_NON_SOURCE_DIGEST"),
+            ("topology_region", "PRODUCTION_PROVIDER_TOPOLOGY_REGION"),
+            ("topology_ingress", "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS"),
+            ("topology_databases", "PRODUCTION_PROVIDER_TOPOLOGY_DATABASES"),
+            ("digest_source", "PRODUCTION_PROVIDER_SOURCE_AUTHORITY"),
+            ("digest_source_keys", "PRODUCTION_PROVIDER_SOURCE_AUTHORITY"),
+        ):
+            app, dep = copy.deepcopy(baseline_app), copy.deepcopy(baseline_dep)
+            expected, images = copy.deepcopy(baseline_expected), copy.deepcopy(baseline_images)
+            if failure == "app_id_format":
+                app["app"]["id"] = "synthetic-invalid-uuid"
+            elif failure == "app_updated_at":
+                app["app"]["updated_at"] = "synthetic-invalid-timestamp"
+            elif failure == "active_phase":
+                app["app"]["active_deployment"]["phase"] = "DEPLOYING"
+            elif failure == "pending_slot":
+                app["app"]["pending_deployment"] = {}
+            elif failure == "deployment_id_format":
+                dep["deployment"]["id"] = "synthetic-invalid-uuid"
+            elif failure == "embedded_spec":
+                app["app"]["active_deployment"]["spec"] = {}
+            elif failure == "live_spec":
+                dep["deployment"]["spec"]["name"] = "synthetic-other-app"
+            else:
+                spec = app["app"]["spec"]
+                if failure in ("raw_spec", "env_digest"):
+                    spec["services"][0]["envs"][0]["value"] = "synthetic-changed-value"
+                elif failure == "env_structure":
+                    spec["services"][0]["envs"] = {}
+                elif failure == "env_key_invalid":
+                    spec["services"][0]["envs"][0]["key"] = ""
+                elif failure == "non_source_structure":
+                    spec["services"][0]["name"] = "synthetic-unreviewed-component"
+                elif failure in ("non_source_digest", "topology_region"):
+                    spec["region"] = "synthetic-other-region"
+                elif failure == "topology_ingress":
+                    spec["ingress"] = None
+                elif failure == "topology_databases":
+                    spec["databases"].pop()
+                elif failure == "digest_source":
+                    spec["services"][0]["image"]["repository"] = "synthetic-other-image"
+                elif failure == "digest_source_keys":
+                    spec["services"][0]["image"].pop("registry")
+                dep["deployment"]["spec"] = copy.deepcopy(spec)
+                if failure in ("env_digest", "non_source_digest", "topology_region",
+                               "topology_ingress", "topology_databases", "digest_source",
+                               "digest_source_keys"):
+                    expected["canonical_spec_sha256"] = planner.sha256_value(spec)
+                if failure in ("non_source_digest", "topology_region", "topology_ingress",
+                               "topology_databases", "digest_source", "digest_source_keys"):
+                    expected["environment_values_sha256"] = planner.environment_value_fingerprint(spec)
+                if failure in ("topology_region", "topology_ingress", "topology_databases",
+                               "digest_source", "digest_source_keys"):
+                    expected["non_source_projection_sha256"] = planner.non_source_fingerprint(spec, base.contract)
+            result, paths = self.invoke_production_rest(base, app, dep, expected, images, state, history)
+            with self.subTest(failure=failure):
+                self.assertIs(type(result), kernel.PrestateRejected)
+                self.assertEqual(result.code, code)
+                self.assertEqual(len(paths), 2)
+                self.assertTrue(all(path.startswith("/v2/apps/") for path in paths))
+                with mock.patch.object(runner, "CURRENT_STAGE", "PROVIDER_PRESTATE"):
+                    self.assert_no_private_report(runner.failure_report(result))
+
     def test_read_transport_permits_only_bound_fixed_gets_and_never_update_token(self):
         provider = self.provider()
         provider.app_id, provider.production_id = self.app_id, uid(10)
@@ -910,6 +1052,57 @@ class ProviderBoundaryTests(RunnerFixtures):
                   self.assertRaises(kernel.PrestateRejected) as caught):
                 provider._production({})
             self.assertEqual(caught.exception.code, code)
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertTrue(caught.exception.__suppress_context__)
+            with mock.patch.object(runner, "CURRENT_STAGE", "PROVIDER_PRESTATE"):
+                self.assert_no_private_report(runner.failure_report(caught.exception))
+
+    def test_provider_plan_error_mapping_rejects_unknown_hostile_and_nonexact_messages(self):
+        self.assertTrue(set(runner._PROVIDER_PLAN_REJECTIONS.values()) <= kernel.PRESTATE_DIAGNOSTICS)
+        self.assertTrue(all(type(message) is str and type(code) is str
+                            for message, code in runner._PROVIDER_PLAN_REJECTIONS.items()))
+
+        class TextSubclass(str):
+            def __hash__(self):
+                raise AssertionError("untrusted text hashed")
+            def __str__(self):
+                raise AssertionError("untrusted text formatted")
+
+        class HostilePlanError(plan_fixtures.verifier.PlanError):
+            @property
+            def args(self):
+                raise AssertionError("untrusted error args inspected")
+            def __str__(self):
+                raise AssertionError("untrusted error formatted")
+
+        cases = (
+            (plan_fixtures.verifier.PlanError("live and active deployment specs differ"),
+             "PRODUCTION_PROVIDER_LIVE_SPEC_EQUALITY"),
+            (plan_fixtures.verifier.PlanError(PRIVATE), "PRODUCTION_PROVIDER_UNCLASSIFIED"),
+            (plan_fixtures.verifier.PlanError(TextSubclass("live and active deployment specs differ")),
+             "PRODUCTION_PROVIDER_UNCLASSIFIED"),
+            (plan_fixtures.verifier.PlanError(PRIVATE, PRIVATE), "PRODUCTION_PROVIDER_UNCLASSIFIED"),
+            (HostilePlanError(PRIVATE), "PRODUCTION_PROVIDER_UNCLASSIFIED"),
+            (RuntimeError(PRIVATE), "PRODUCTION_PROVIDER_VALIDATION"),
+        )
+        for error, code in cases:
+            provider = self.provider()
+            provider.planner = plan_fixtures.verifier
+            provider.production_id = uid(10)
+            app = {"id": uid(10), "active_deployment": {"id": uid(100)},
+                   "default_ingress": "https://production.invalid"}
+            routes = {"/v2/apps/" + uid(10): {"app": app},
+                      "/v2/apps/" + uid(10) + "/deployments/" + uid(100):
+                          {"deployment": {"id": uid(100)}}}
+            with (self.subTest(error_type=type(error).__name__, code=code),
+                  mock.patch.object(provider, "_get", side_effect=lambda path: copy.deepcopy(routes[path])) as get,
+                  mock.patch.object(provider.planner, "normalize_target_descriptor", return_value={}),
+                  mock.patch.object(provider.planner, "predecessor_provider_expectation", return_value=({}, {})),
+                  mock.patch.object(provider.planner, "provider_state", side_effect=error),
+                  self.assertRaises(kernel.PrestateRejected) as caught):
+                provider._production({})
+            self.assertEqual(caught.exception.code, code)
+            self.assertEqual(len(get.call_args_list), 2)
             self.assertIsNone(caught.exception.__cause__)
             self.assertTrue(caught.exception.__suppress_context__)
             with mock.patch.object(runner, "CURRENT_STAGE", "PROVIDER_PRESTATE"):

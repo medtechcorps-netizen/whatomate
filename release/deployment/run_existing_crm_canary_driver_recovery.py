@@ -56,6 +56,114 @@ AUTHORIZATION_DIAGNOSTICS = frozenset({
     "RUN_ONCE_AUTHORIZATION",
 })
 
+# These are exact messages emitted by the checked-in planner's provider_state
+# path. Never publish the exception, received field, value, key or hash. The
+# closed codes only locate the acceptance predicate that rejected the REST
+# envelopes; they do not relax that predicate or infer a provider root cause.
+_PROVIDER_PLAN_REJECTIONS = {
+    "provider app response is malformed": "PRODUCTION_PROVIDER_APP_ENVELOPE",
+    "provider deployment response is malformed": "PRODUCTION_PROVIDER_DEPLOYMENT_ENVELOPE",
+    "observed app ID differs": "PRODUCTION_PROVIDER_APP_IDENTITY",
+    "observed app spec is malformed": "PRODUCTION_PROVIDER_APP_SPEC_SHAPE",
+    "observed app name differs": "PRODUCTION_PROVIDER_APP_NAME",
+    "observed provider default ingress differs": "PRODUCTION_PROVIDER_DEFAULT_INGRESS",
+    "production ingress is malformed": "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS",
+    "production ingress rule is malformed": "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS",
+    "production ingress must use exact prefix matches": "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS",
+    "ingress rule must have exactly one destination": "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS",
+    "ingress component destination is malformed": "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS",
+    "ingress preserve_path_prefix must be boolean": "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS",
+    "ingress redirect destination is malformed": "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS",
+    "redirect authority match is malformed": "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS",
+    "active deployment is missing": "PRODUCTION_PROVIDER_ACTIVE_MISSING",
+    "active deployment differs from the signed predecessor": "PRODUCTION_PROVIDER_ACTIVE_IDENTITY",
+    "active deployment is not ACTIVE": "PRODUCTION_PROVIDER_ACTIVE_PHASE",
+    "provider reports a pending, in-progress, or pinned deployment": "PRODUCTION_PROVIDER_NOT_IDLE",
+    "deployment response ID differs from the active deployment": "PRODUCTION_PROVIDER_DEPLOYMENT_IDENTITY",
+    "deployment response is not ACTIVE": "PRODUCTION_PROVIDER_DEPLOYMENT_PHASE",
+    "provider response is missing an app spec": "PRODUCTION_PROVIDER_DEPLOYMENT_SPEC_SHAPE",
+    "embedded active spec differs from the live spec": "PRODUCTION_PROVIDER_EMBEDDED_SPEC_EQUALITY",
+    "live and active deployment specs differ": "PRODUCTION_PROVIDER_LIVE_SPEC_EQUALITY",
+    "raw production spec differs from the signed predecessor": "PRODUCTION_PROVIDER_RAW_SPEC_DIGEST",
+    "production environment values differ from the signed predecessor": "PRODUCTION_PROVIDER_ENVIRONMENT_DIGEST",
+    "production non-source projection differs from the signed predecessor": "PRODUCTION_PROVIDER_NON_SOURCE_DIGEST",
+    "production spec app name differs": "PRODUCTION_PROVIDER_TOPOLOGY_NAME",
+    "production region differs": "PRODUCTION_PROVIDER_TOPOLOGY_REGION",
+    "production VPC binding is malformed": "PRODUCTION_PROVIDER_TOPOLOGY_VPC",
+    "production VPC binding differs": "PRODUCTION_PROVIDER_TOPOLOGY_VPC",
+    "production ingress differs": "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS",
+    "production domains are malformed": "PRODUCTION_PROVIDER_TOPOLOGY_DOMAINS",
+    "production domain entry is malformed": "PRODUCTION_PROVIDER_TOPOLOGY_DOMAINS",
+    "production domains differ": "PRODUCTION_PROVIDER_TOPOLOGY_DOMAINS",
+    "production database bindings differ": "PRODUCTION_PROVIDER_TOPOLOGY_DATABASES",
+    "production database entry is malformed": "PRODUCTION_PROVIDER_TOPOLOGY_DATABASES",
+    "environment list is malformed": "PRODUCTION_PROVIDER_ENVIRONMENT_STRUCTURE",
+    "environment entry is malformed": "PRODUCTION_PROVIDER_ENVIRONMENT_STRUCTURE",
+    "duplicate environment key": "PRODUCTION_PROVIDER_ENVIRONMENT_STRUCTURE",
+    "environment scope is outside the reviewed contract": "PRODUCTION_PROVIDER_ENVIRONMENT_STRUCTURE",
+    "environment value is missing": "PRODUCTION_PROVIDER_ENVIRONMENT_STRUCTURE",
+    "environment type is outside the reviewed contract": "PRODUCTION_PROVIDER_ENVIRONMENT_STRUCTURE",
+    "database production flag must be boolean": "PRODUCTION_PROVIDER_TOPOLOGY_DATABASES",
+    "observed app updated_at is not UTC": "PRODUCTION_PROVIDER_APP_UPDATED_AT",
+    "migration job kind differs": "PRODUCTION_PROVIDER_SOURCE_AUTHORITY",
+    "migration job run command differs": "PRODUCTION_PROVIDER_SOURCE_AUTHORITY",
+    "genesis predecessor unexpectedly contains image authority": "PRODUCTION_PROVIDER_SOURCE_AUTHORITY",
+    "phase predecessor image authority is missing": "PRODUCTION_PROVIDER_SOURCE_AUTHORITY",
+    "predecessor source mode differs": "PRODUCTION_PROVIDER_SOURCE_AUTHORITY",
+}
+
+# The planner constructs these messages from only these reviewed, fixed labels
+# and suffixes. This expands an exact-match table, not a prefix/regex matcher
+# over untrusted text; any other label, component or message is UNCLASSIFIED.
+for _label, _code in (
+    ("observed app ID", "PRODUCTION_PROVIDER_APP_IDENTITY"),
+    ("observed app updated_at", "PRODUCTION_PROVIDER_APP_UPDATED_AT"),
+    ("active deployment ID", "PRODUCTION_PROVIDER_ACTIVE_IDENTITY"),
+    ("deployment response ID", "PRODUCTION_PROVIDER_DEPLOYMENT_IDENTITY"),
+):
+    for _suffix in (" is invalid", " contains control characters", " format is invalid"):
+        _PROVIDER_PLAN_REJECTIONS[_label + _suffix] = _code
+
+for _label, _code in (
+    ("environment key", "PRODUCTION_PROVIDER_ENVIRONMENT_STRUCTURE"),
+    ("production domain", "PRODUCTION_PROVIDER_TOPOLOGY_DOMAINS"),
+    ("database binding name", "PRODUCTION_PROVIDER_TOPOLOGY_DATABASES"),
+    ("database cluster name", "PRODUCTION_PROVIDER_TOPOLOGY_DATABASES"),
+    ("database engine", "PRODUCTION_PROVIDER_TOPOLOGY_DATABASES"),
+    ("database version", "PRODUCTION_PROVIDER_TOPOLOGY_DATABASES"),
+    ("ingress path prefix", "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS"),
+    ("ingress component", "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS"),
+    ("redirect match authority", "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS"),
+    ("redirect authority", "PRODUCTION_PROVIDER_TOPOLOGY_INGRESS"),
+):
+    for _suffix in (" is invalid", " contains control characters"):
+        _PROVIDER_PLAN_REJECTIONS[_label + _suffix] = _code
+
+for _collection in ("services", "jobs", "workers", "static_sites", "functions"):
+    for _message in (f"spec {_collection} must be an array",
+                     f"spec {_collection} entry is malformed",
+                     f"duplicate spec component in {_collection}"):
+        _PROVIDER_PLAN_REJECTIONS[_message] = "PRODUCTION_PROVIDER_NON_SOURCE_STRUCTURE"
+    for _suffix in (" is invalid", " contains control characters"):
+        _PROVIDER_PLAN_REJECTIONS[f"spec {_collection} component name" + _suffix] = (
+            "PRODUCTION_PROVIDER_NON_SOURCE_STRUCTURE")
+    _PROVIDER_PLAN_REJECTIONS[f"spec {_collection} component set differs"] = (
+        "PRODUCTION_PROVIDER_NON_SOURCE_STRUCTURE")
+for _collection in ("services", "jobs"):
+    _PROVIDER_PLAN_REJECTIONS[f"production {_collection} component set differs"] = (
+        "PRODUCTION_PROVIDER_SOURCE_AUTHORITY")
+for _collection in ("workers", "static_sites", "functions"):
+    _PROVIDER_PLAN_REJECTIONS[f"unexpected production {_collection} component"] = (
+        "PRODUCTION_PROVIDER_TOPOLOGY_COMPONENTS")
+
+for _name in ("omnitech-web", "meta-relay", "gmail-relay", "rereply-rls-migrate"):
+    for _message in (f"digest image source selector is not exact for {_name}",
+                     f"digest image component retains a Dockerfile for {_name}",
+                     f"digest image source for {_name} keys differ",
+                     f"digest image source differs for {_name}",
+                     f"HTTP port differs for {_name}", f"health path differs for {_name}"):
+        _PROVIDER_PLAN_REJECTIONS[_message] = "PRODUCTION_PROVIDER_SOURCE_AUTHORITY"
+
 
 def mark_stage(stage: str) -> None:
     global CURRENT_STAGE
@@ -495,7 +603,17 @@ class ProviderRead:
         with policy.prestate_diagnostic("PRODUCTION_PREDECESSOR"):
             expected, images = self.planner.predecessor_provider_expectation(self.contract, {}, None)
         with policy.prestate_diagnostic("PRODUCTION_PROVIDER_VALIDATION"):
-            state, _ = self.planner.provider_state({"app": app}, {"deployment": dep}, self.contract, target, expected, images)
+            try:
+                state, _ = self.planner.provider_state({"app": app}, {"deployment": dep}, self.contract, target, expected, images)
+            except self.planner.PlanError as error:
+                code = "PRODUCTION_PROVIDER_UNCLASSIFIED"
+                # Only an exact planner exception with one exact built-in string
+                # may select a fixed source-literal code. Never format error.
+                if type(error) is self.planner.PlanError:
+                    args = error.args
+                    if type(args) is tuple and len(args) == 1 and type(args[0]) is str:
+                        code = _PROVIDER_PLAN_REJECTIONS.get(args[0], code)
+                raise policy.PrestateRejected(code) from None
         with policy.prestate_diagnostic("PRODUCTION_STATE_DIGEST"):
             require(common.sha256_value(state) == self.a["production_state_sha256"])
         with policy.prestate_diagnostic("PRODUCTION_HISTORY_READ"):
