@@ -1298,6 +1298,42 @@ class HostedGuardTests(RunnerFixtures):
             "total_count": 4, "jobs": quarantined4_jobs}
         data[prefix + "/actions/runs/" + runner.FAILED_CHECK_4_ID + "/artifacts"] = {
             "total_count": 0, "artifacts": []}
+        added = {}
+        for number in (5, 6):
+            failed_id = getattr(runner, f"FAILED_CHECK_{number}_ID")
+            frozen = copy.deepcopy(quarantined)
+            frozen.update({"id": int(failed_id),
+                           "head_sha": getattr(runner, f"FAILED_CHECK_{number}_CONTROL"),
+                           "display_title": getattr(runner, f"FAILED_CHECK_{number}_TITLE"),
+                           **getattr(runner, f"FAILED_CHECK_{number}_TIMES")})
+            frozen_jobs = []
+            for key, (identity, conclusion, started, completed) in getattr(
+                    runner, f"FAILED_CHECK_{number}_JOBS").items():
+                if key == "recover":
+                    steps = []
+                elif key == "gate":
+                    steps = [("Set up job", "success"),
+                             ("Require exactly the selected recovery mode", "failure"),
+                             ("Complete job", "success")]
+                else:
+                    middle = "Validate public authority without private credentials" if key == "authority" \
+                        else "Rehydrate and inspect only inside the protected boundary"
+                    steps = [("Set up job", "success"), ("Check out exact protected controls", "success"),
+                             (middle, conclusion), ("Post Check out exact protected controls", "success"),
+                             ("Complete job", "success")]
+                frozen_jobs.append({"id": identity, "run_id": int(failed_id), "run_attempt": 1,
+                    "name": runner.JOB_NAMES[key], "status": "completed", "conclusion": conclusion,
+                    "started_at": started, "completed_at": completed,
+                    "steps": [{"name": name, "status": "completed", "conclusion": result}
+                              for name, result in steps]})
+            data[endpoint + "/runs"]["workflow_runs"].append(frozen)
+            data[endpoint + "/runs"]["total_count"] += 1
+            data[prefix + "/actions/runs/" + failed_id] = copy.deepcopy(frozen)
+            data[prefix + "/actions/runs/" + failed_id + "/attempts/1/jobs"] = {
+                "total_count": 4, "jobs": frozen_jobs}
+            data[prefix + "/actions/runs/" + failed_id + "/artifacts"] = {
+                "total_count": 0, "artifacts": []}
+            added[number] = (frozen, frozen_jobs)
         api = mock.Mock(spec=["get", "pages"])
         api.get.side_effect = lambda path: copy.deepcopy(data[path])
         api.pages.side_effect = lambda path, key: copy.deepcopy(data[path])
@@ -1307,6 +1343,8 @@ class HostedGuardTests(RunnerFixtures):
                 "quarantined2": quarantined2, "quarantined2_jobs": quarantined2_jobs,
                 "quarantined3": quarantined3, "quarantined3_jobs": quarantined3_jobs,
                 "quarantined4": quarantined4, "quarantined4_jobs": quarantined4_jobs,
+                "quarantined5": added[5][0], "quarantined5_jobs": added[5][1],
+                "quarantined6": added[6][0], "quarantined6_jobs": added[6][1],
                 "endpoint": endpoint, "env": {"RECOVERY_MODE": mode, "GITHUB_RUN_ID": current_id,
                                               "GITHUB_JOB": selected_job}}
 
@@ -1522,6 +1560,95 @@ class HostedGuardTests(RunnerFixtures):
                 test["quarantined4_jobs"][job_index][key] = value
                 with self.subTest(job=job_index, key=key), self.assertRaises(common.ReleaseError):
                     self.guard(test)
+
+    def test_six_exact_failed_checks_are_quarantined_without_a_retry(self):
+        self.assertEqual(set(runner.FAILED_CHECKS), {
+            runner.FAILED_CHECK_ID, runner.FAILED_CHECK_2_ID, runner.FAILED_CHECK_3_ID,
+            runner.FAILED_CHECK_4_ID, runner.FAILED_CHECK_5_ID, runner.FAILED_CHECK_6_ID})
+        for mode in ("check", "recover"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.guard(self.guard_fixture(mode)), CONTROL)
+        for number in (5, 6):
+            failed_id = getattr(runner, f"FAILED_CHECK_{number}_ID")
+            test = self.guard_fixture("recover")
+            test["packet"]["check_run_id"] = failed_id
+            test["packet"]["binding_sha256"] = runner.binding_hash(test["packet"])
+            with self.subTest(predecessor=failed_id), self.assertRaises(common.ReleaseError):
+                self.guard(test)
+
+    def test_b28_failed_checks_reject_run_identity_and_history_drift(self):
+        for number in (5, 6):
+            failed_id = getattr(runner, f"FAILED_CHECK_{number}_ID")
+            for mutation in ("missing", "duplicate", "unknown_old_head"):
+                test = self.guard_fixture("check")
+                inventory = test["data"][test["endpoint"] + "/runs"]
+                frozen = test[f"quarantined{number}"]
+                if mutation == "missing":
+                    inventory["workflow_runs"].remove(frozen)
+                    inventory["total_count"] -= 1
+                elif mutation == "duplicate":
+                    inventory["workflow_runs"].append(copy.deepcopy(frozen))
+                    inventory["total_count"] += 1
+                else:
+                    frozen["id"] += 1
+                with self.subTest(run=failed_id, mutation=mutation), self.assertRaises(common.ReleaseError):
+                    self.guard(test)
+            for source in ("inventory", "latest"):
+                for key, wrong in (("head_sha", CONTROL), ("workflow_id", 1),
+                                   ("run_attempt", 2), ("previous_attempt_url", "non-null"),
+                                   ("display_title", "Check existing CRM driver other"),
+                                   ("created_at", fixtures.stamp(NOW)),
+                                   ("updated_at", fixtures.stamp(NOW)),
+                                   ("conclusion", "success")):
+                    test = self.guard_fixture("check")
+                    row = test[f"quarantined{number}"] if source == "inventory" else test["data"][
+                        runner.fixture.API_PREFIX + "/actions/runs/" + failed_id]
+                    row[key] = wrong
+                    with self.subTest(run=failed_id, source=source, key=key), \
+                         self.assertRaises(common.ReleaseError):
+                        self.guard(test)
+
+    def test_b28_failed_checks_reject_job_step_or_artifact_drift(self):
+        for number in (5, 6):
+            failed_id = getattr(runner, f"FAILED_CHECK_{number}_ID")
+            for job_index in range(4):
+                for key, wrong in (("id", 1), ("run_id", 1), ("run_attempt", 2),
+                                   ("started_at", fixtures.stamp(NOW)),
+                                   ("completed_at", fixtures.stamp(NOW)),
+                                   ("conclusion", "cancelled")):
+                    test = self.guard_fixture("check")
+                    test[f"quarantined{number}_jobs"][job_index][key] = wrong
+                    with self.subTest(run=failed_id, job=job_index, key=key), \
+                         self.assertRaises(common.ReleaseError):
+                        self.guard(test)
+            for mutation in ("authority_step", "check_step", "recover_step", "gate_step", "artifact"):
+                test = self.guard_fixture("check")
+                jobs = test[f"quarantined{number}_jobs"]
+                if mutation == "authority_step":
+                    jobs[0]["steps"][2]["conclusion"] = "failure"
+                elif mutation == "check_step":
+                    jobs[1]["steps"][2]["conclusion"] = "success"
+                elif mutation == "recover_step":
+                    jobs[2]["steps"] = [{"name": "unexpected write", "status": "completed",
+                                          "conclusion": "success"}]
+                elif mutation == "gate_step":
+                    jobs[3]["steps"][1]["conclusion"] = "success"
+                else:
+                    test["data"][runner.fixture.API_PREFIX + "/actions/runs/" + failed_id
+                                 + "/artifacts"] = {"total_count": 1, "artifacts": [{"id": 123}]}
+                with self.subTest(run=failed_id, mutation=mutation), self.assertRaises(common.ReleaseError):
+                    self.guard(test)
+
+    def test_any_previous_recover_still_consumes_the_incident(self):
+        test = self.guard_fixture("check")
+        prior = copy.deepcopy(test["quarantined6"])
+        prior.update({"id": 98765, "head_sha": CONTROL,
+                      "display_title": "Recover existing CRM driver " + uid(41) + " " + "a" * 64})
+        inventory = test["data"][test["endpoint"] + "/runs"]
+        inventory["workflow_runs"].append(prior)
+        inventory["total_count"] += 1
+        with self.assertRaises(common.ReleaseError):
+            self.guard(test)
 
     def test_public_authority_does_not_request_administration_protection_endpoint(self):
         test = self.guard_fixture("check", "authority")
