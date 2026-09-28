@@ -925,10 +925,37 @@ class ProviderBoundaryTests(RunnerFixtures):
             self.assertTrue(all(row["phase"] == "ERROR" for row in result["deployments"]["deployments"]))
             self.assertEqual(provider.app_id, self.app_id)
             self.assertEqual(provider.production_id, uid(10))
+            self.assertEqual(result["apps"]["meta"]["total"],
+                             len(result["apps"]["apps"]))
             size = routes["/v2/apps/tiers/instance_sizes/" + descriptor["plan"]["instance_size_slug"]]
             size["instance_size"]["usd_per_month"] = "999"
             with self.assertRaises(common.ReleaseError):
                 provider.snapshot()
+
+    def test_read_snapshot_accepts_and_reports_a_five_app_inventory(self):
+        """A complete hash-rebound five-app inventory must be accepted.
+
+        The account gained two unrelated apps after bootstrap; the emitted
+        snapshot has to report the true size instead of the historical three.
+        """
+        provider, routes, metadata = self.snapshot_fixture()
+        inventory = routes["/v2/apps?per_page=200&page=1"]
+        inventory["apps"] = inventory["apps"] + [
+            {"id": uid(31), "spec": {"name": "sahabat-doktor-production"}},
+            {"id": uid(32), "spec": {"name": "sahabat-doktor-pilot-staging"}},
+        ]
+        inventory["meta"]["total"] = 5
+        rows = sorted([{"id": row["id"], "spec": {"name": row["spec"]["name"]}}
+                       for row in inventory["apps"]], key=lambda row: row["id"])
+        provider.a["apps_inventory_sha256"] = common.sha256_value(rows)
+        with (mock.patch.object(provider, "_get", side_effect=lambda path: copy.deepcopy(routes[path])),
+              mock.patch.object(provider, "_production", return_value=self.case["second"]["production_state_sha256"]),
+              mock.patch.object(runner, "fixture_metadata", return_value=metadata)):
+            result = provider.snapshot()
+        self.assertEqual(result["apps"]["meta"]["total"], 5)
+        self.assertEqual(len(result["apps"]["apps"]), 5)
+        self.assertEqual({row["id"] for row in result["apps"]["apps"]},
+                         {uid(10), uid(17), self.app_id, uid(31), uid(32)})
 
     def test_snapshot_read_failures_emit_only_exact_closed_boundary_codes(self):
         cases = [("/v2/apps/tiers/instance_sizes/" + self.case["descriptor"]["plan"]["instance_size_slug"], "SIZE_READ"),
