@@ -301,6 +301,15 @@ class ExistingAppReader:
         return common.loads_strict(raw)
 
 
+# The bootstrap-era ``3`` was a point-in-time fact about the account, not a
+# security property. The inventory is still authenticated exactly: the packet
+# carries ``apps_inventory_sha256`` over the complete sorted rows, and the
+# driver/production apps stay pinned by hashed identity. So the guard has to
+# prove completeness and bounds, not a frozen size.
+MIN_APPS_INVENTORY = 3
+MAX_APPS_INVENTORY = 200
+
+
 def _complete_inventory(value: Any, key: str, count: int) -> list[dict[str, Any]]:
     require(type(value) is dict and type(value.get(key)) is list
             and type(value.get("meta")) is dict
@@ -314,6 +323,32 @@ def _complete_inventory(value: Any, key: str, count: int) -> list[dict[str, Any]
     require(all(type(row) is dict for row in rows))
     ids = [common.require_uuid(row.get("id"), "recovery inventory ID") for row in rows]
     require(len(set(ids)) == count)
+    return rows
+
+
+def _complete_apps_inventory(value: Any) -> list[dict[str, Any]]:
+    """Complete app inventory: exact on shape, bounded rather than frozen.
+
+    Identical to ``_complete_inventory`` except that the size is verified as a
+    bounded complete set instead of the historical literal three. Unrelated
+    apps added to the account after bootstrap must not fail a read-only CHECK,
+    while a truncated page, a lying ``meta.total``, a duplicate identity or an
+    unreviewed page link still fails closed. The exact set remains bound by the
+    authority's ``apps_inventory_sha256``.
+    """
+    require(type(value) is dict and type(value.get("apps")) is list
+            and type(value.get("meta")) is dict
+            and type(value["meta"].get("total")) is int)
+    total = value["meta"]["total"]
+    rows = value["apps"]
+    require(MIN_APPS_INVENTORY <= total <= MAX_APPS_INVENTORY and len(rows) == total)
+    links = value.get("links", {})
+    require(type(links) is dict)
+    pages = links.get("pages", {})
+    require(type(pages) is dict and ("next" not in pages or pages["next"] is None))
+    require(all(type(row) is dict for row in rows))
+    ids = [common.require_uuid(row.get("id"), "recovery inventory ID") for row in rows]
+    require(len(set(ids)) == total)
     return rows
 
 
@@ -556,7 +591,7 @@ def _snapshot(a: dict[str, Any], d: dict[str, Any], value: Any,
     with prestate_diagnostic("APP_IDENTITY"):
         require(_hash_id(app.get("id")) == IDENTITY_PINS["app_id_sha256"])
     with prestate_diagnostic("APP_INVENTORY_BINDING"):
-        apps = _complete_inventory(s["apps"], "apps", 3)
+        apps = _complete_apps_inventory(s["apps"])
         require(all(type(row.get("spec")) is dict for row in apps))
         app_rows = sorted([{"id": row["id"], "name": row.get("spec", {}).get("name")} for row in apps],
                           key=lambda row: row["id"])

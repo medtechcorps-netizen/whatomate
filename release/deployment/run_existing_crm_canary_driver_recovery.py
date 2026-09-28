@@ -644,7 +644,7 @@ class ProviderRead:
         with policy.prestate_diagnostic("APPS_READ"):
             apps_raw = self._get("/v2/apps?per_page=200&page=1")
         with policy.prestate_diagnostic("APPS_INVENTORY"):
-            apps = policy._complete_inventory(apps_raw, "apps", 3)
+            apps = policy._complete_apps_inventory(apps_raw)
         with policy.prestate_diagnostic("APP_SELECTION"):
             matches = [row for row in apps if policy._hash_id(row["id"]) == policy.IDENTITY_PINS["app_id_sha256"]]
             productions = [row for row in apps if policy._hash_id(row["id"]) == self.contract["provider"]["app_id_sha256"]]
@@ -694,7 +694,8 @@ class ProviderRead:
         with policy.prestate_diagnostic("CANARY_METADATA_READ"):
             canary = self.reader.snapshot()
         return {"observed_at": observed_at, "account": account,
-                "apps": {"apps": sorted(app_rows, key=lambda row: row["id"]), "meta": {"total": 3}, "links": {}},
+                "apps": {"apps": sorted(app_rows, key=lambda row: row["id"]),
+                         "meta": {"total": len(app_rows)}, "links": {}},
                 "app": app, "deployments": {"deployments": deps, "meta": {"total": len(deps)}, "links": {}},
                 "firewall": firewall,
                 "canary_environment": canary, "fixture_environment_sha256": common.sha256_value(metadata),

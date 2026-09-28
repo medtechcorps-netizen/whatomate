@@ -500,6 +500,52 @@ class OwnerAndInventoryTests(RecoveryFixtures):
             with self.subTest(case=index):
                 self.reject_snapshot(change, both=True)
 
+    def test_complete_app_inventory_accepts_bounded_unrelated_apps(self):
+        """Apps added to the account after bootstrap must not fail a read-only CHECK.
+
+        The exact set is still authenticated: the authority's
+        ``apps_inventory_sha256`` is compared over every row. Only the frozen
+        bootstrap-era size of three is replaced by a bounded complete set.
+        """
+        case = copy.deepcopy(self.case)
+        extras = [
+            {"id": uid(31), "spec": {"name": "sahabat-doktor-production"}},
+            {"id": uid(32), "spec": {"name": "sahabat-doktor-pilot-staging"}},
+        ]
+        for key in ("first", "second"):
+            case[key]["apps"]["apps"].extend(copy.deepcopy(extras))
+            case[key]["apps"]["meta"]["total"] = 5
+        rows = sorted([{"id": row["id"], "name": row["spec"]["name"]}
+                       for row in case["first"]["apps"]["apps"]], key=lambda row: row["id"])
+        case["authorization"]["apps_inventory_sha256"] = common.sha256_value(rows)
+        self.assertEqual(self.inspect(case)["state"], "existing-driver-inspection-complete")
+
+    def test_complete_app_inventory_still_rejects_incomplete_or_unbounded_sets(self):
+        """Completeness, uniqueness and bounds survive the size relax."""
+        def resized(count):
+            def mutate(case):
+                rows = case["first"]["apps"]["apps"]
+                while len(rows) < count:
+                    extra = {"id": uid(100 + len(rows)),
+                             "spec": {"name": "unrelated-%d" % len(rows)}}
+                    rows.append(extra)
+                while len(rows) > count:
+                    rows.pop()
+                case["second"]["apps"]["apps"] = copy.deepcopy(rows)
+                for key in ("first", "second"):
+                    case[key]["apps"]["meta"]["total"] = count
+                rebound = sorted([{"id": row["id"], "name": row["spec"]["name"]}
+                                  for row in case["first"]["apps"]["apps"]],
+                                 key=lambda row: row["id"])
+                case["authorization"]["apps_inventory_sha256"] = common.sha256_value(rebound)
+            return mutate
+        for count in (recovery.MIN_APPS_INVENTORY - 1,
+                      recovery.MAX_APPS_INVENTORY + 1):
+            with self.subTest(count=count):
+                self.reject(resized(count))
+        self.reject_snapshot(lambda s: s["apps"].update(links={"pages": {"next": PRIVATE}}), both=True)
+        self.reject_snapshot(lambda s: s["apps"]["meta"].update(total=4), both=True)
+
     def test_deployment_inventory_requires_exactly_two_complete_unique_originals(self):
         changes = (
             lambda s: s["deployments"]["meta"].update(total=0),
@@ -1558,10 +1604,16 @@ class PrestateDiagnosticTests(RecoveryFixtures):
         # stable_ast_projection so the constants are interpreter-independent.
         # Removing only literal diagnostic contexts must leave every acceptance
         # predicate and execution order untouched.
+        #
+        # "_snapshot" is deliberately re-pinned: the reviewed inventory-bound
+        # change replaces the frozen three-app assertion with a bounded complete
+        # set inside that one function. The other three digests must stay equal
+        # to the parent, which is what proves the change is confined to the app
+        # inventory binding rather than to any other acceptance predicate.
         expected = {
             "_exact_spec": "a7e3779db34887d5e33c3bc9b5d85973ed4d33f1784043629afbc53ef365f533",
             "target_update_plan": "71b49d83dcbfaad969e4d6877e9cddf495600587664fca832fbe8fd634ed7b43",
-            "_snapshot": "1a0c514784411dac405e42d73ff1ecbf69e3638dcb62d7f0849f0d2bc04f2c77",
+            "_snapshot": "b4590fda677c03a69d6aab933c33adee2faba3e5cea978b0b9f195f8cb97498a",
             "inspect_pair": "92409baa31a1a4e19f4296fbd7f6dda1224e969be74f79a3cdfcf79fe53aa140",
         }
         owner = self

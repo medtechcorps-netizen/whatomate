@@ -35,7 +35,9 @@ Current reviewed history is exactly two failed deployments: original
 `4266646b-064d-4e31-87a6-580a0110c64a` and the later same-app deployment
 `a2e5b32c-f54e-475e-aa5e-0bac83b052c2`. Both must be ERROR, with no active,
 pending, in-progress, pinned, third, or replacement deployment. Inventory is
-exactly three apps, including one selected driver. The later deployment is
+exactly the reviewed complete app set, which always contains the one selected
+driver and the one production app, both pinned by hashed identity and bound
+exactly by the authority's `apps_inventory_sha256`. The later deployment is
 acknowledged history, not a retry authorized by the original packet.
 Original deployment creation/update are pinned to 10:14:36Z/10:17:57Z;
 the later deployment to 11:55:18Z/11:58:47Z, all on 2026-09-21.
