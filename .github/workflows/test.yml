@@ -87,7 +87,11 @@ jobs:
   go-race:
     name: go-race
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # The race suite is variable on shared runners: the same tree has completed
+    # in about 47 minutes and has also been killed by the old 120-minute cap.
+    # 360 is the GitHub-hosted per-job ceiling, so a slow-but-progressing run is
+    # never reported as a failure by our own budget.
+    timeout-minutes: 360
 
     services:
       postgres:
