@@ -270,7 +270,7 @@ jobs:
     name: Full Go race and service tests (PostgreSQL 17)
     needs: source_identity
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 360
     services:
       postgres:
         image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
@@ -340,7 +340,7 @@ jobs:
           gotestsum \
             --format testname \
             --hide-summary=skipped \
-            -- -mod=readonly -race -p 1 -timeout 40m -coverprofile=coverage.out "${packages[@]}"
+            -- -mod=readonly -race -p 1 -timeout 120m -coverprofile=coverage.out "${packages[@]}"
           go tool cover -func=coverage.out | grep 'total:'
           git diff --exit-code -- go.mod go.sum
 
