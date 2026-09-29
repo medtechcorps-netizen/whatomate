@@ -819,7 +819,11 @@ def _jobs(api: Any, run_id: str, *, mode: str) -> list[dict[str, Any]]:
         require(common.require_run_id(row.get("run_id"), "recovery job run") == run_id)
         opposite = "recover" if mode == "check" else "check"
         if row.get("status") == "completed" and row.get("conclusion") == "skipped":
-            require(row["name"] == JOB_NAMES[opposite] and row.get("steps") == [])
+            # A skipped job must expose no steps at all, so it cannot hide work.
+            # The opposite-mode job is the normal case; the selected-mode job is
+            # additionally skipped when the authority job already failed.
+            require(row.get("steps") == []
+                    and row["name"] in (JOB_NAMES[opposite], JOB_NAMES[mode]))
         if row.get("started_at") is not None:
             _timestamp(row["started_at"])
         if row.get("completed_at") is not None:
@@ -828,7 +832,7 @@ def _jobs(api: Any, run_id: str, *, mode: str) -> list[dict[str, Any]]:
             if completed < started:
                 # GitHub can report a one-second clock inversion for a job
                 # skipped by the selected mode. It cannot represent a write.
-                require(row["name"] == JOB_NAMES[opposite]
+                require(row["name"] in (JOB_NAMES[opposite], JOB_NAMES[mode])
                         and row.get("status") == "completed" and row.get("conclusion") == "skipped"
                         and row.get("steps") == []
                         and started - completed <= dt.timedelta(seconds=1))
@@ -910,6 +914,28 @@ FAILED_CHECK_6_JOBS = {
     "recover": (107583933904, "skipped", "2026-09-24T09:58:49Z", "2026-09-24T09:58:48Z"),
     "gate": (107586722596, "failure", "2026-09-24T10:07:29Z", "2026-09-24T10:07:32Z"),
 }
+FAILED_CHECK_7_ID = "36549339473"
+FAILED_CHECK_7_CONTROL = "ac8a87a93bb9d42ffdcd85b25b03d0e0c001e95b"
+FAILED_CHECK_7_TITLE = ("Check existing CRM driver e86bde1e-971c-4be2-8d9f-ea65636170c6 "
+                        "fabfc205b52bdd7aecc5dd2e2a0ee7eec9e349e01135f1505aa699e61ccdfc27")
+FAILED_CHECK_7_TIMES = {"created_at": "2026-09-29T09:27:54Z", "updated_at": "2026-09-29T09:54:45Z"}
+FAILED_CHECK_7_JOBS = {
+    "authority": (109343384310, "success", "2026-09-29T09:27:59Z", "2026-09-29T09:28:11Z"),
+    "check": (109343466443, "failure", "2026-09-29T09:53:11Z", "2026-09-29T09:54:39Z"),
+    "recover": (109343468374, "skipped", "2026-09-29T09:28:12Z", "2026-09-29T09:28:11Z"),
+    "gate": (109352800753, "failure", "2026-09-29T09:54:42Z", "2026-09-29T09:54:44Z"),
+}
+FAILED_CHECK_8_ID = "36567856918"
+FAILED_CHECK_8_CONTROL = "cfbf3cc976294a98ff5c76002d5aa313d94cc11f"
+FAILED_CHECK_8_TITLE = ("Check existing CRM driver 05408cf7-fd34-4066-bf42-45250a9226fe "
+                        "2dbcff2d8ed79c8c52fb408bb28b9781fcec49f559ce1ee2299d1fb7507a4739")
+FAILED_CHECK_8_TIMES = {"created_at": "2026-09-29T12:24:07Z", "updated_at": "2026-09-29T12:24:25Z"}
+FAILED_CHECK_8_JOBS = {
+    "authority": (109404153513, "failure", "2026-09-29T12:24:11Z", "2026-09-29T12:24:17Z"),
+    "check": (109404208938, "skipped", "2026-09-29T12:24:18Z", "2026-09-29T12:24:18Z"),
+    "recover": (109404209995, "skipped", "2026-09-29T12:24:18Z", "2026-09-29T12:24:18Z"),
+    "gate": (109404208681, "failure", "2026-09-29T12:24:20Z", "2026-09-29T12:24:24Z"),
+}
 FAILED_CHECKS = {
     FAILED_CHECK_ID: (FAILED_CHECK_CONTROL, FAILED_CHECK_TITLE, FAILED_CHECK_TIMES, FAILED_CHECK_JOBS),
     FAILED_CHECK_2_ID: (FAILED_CHECK_2_CONTROL, FAILED_CHECK_2_TITLE, FAILED_CHECK_2_TIMES, FAILED_CHECK_2_JOBS),
@@ -917,6 +943,8 @@ FAILED_CHECKS = {
     FAILED_CHECK_4_ID: (FAILED_CHECK_4_CONTROL, FAILED_CHECK_4_TITLE, FAILED_CHECK_4_TIMES, FAILED_CHECK_4_JOBS),
     FAILED_CHECK_5_ID: (FAILED_CHECK_5_CONTROL, FAILED_CHECK_5_TITLE, FAILED_CHECK_5_TIMES, FAILED_CHECK_5_JOBS),
     FAILED_CHECK_6_ID: (FAILED_CHECK_6_CONTROL, FAILED_CHECK_6_TITLE, FAILED_CHECK_6_TIMES, FAILED_CHECK_6_JOBS),
+    FAILED_CHECK_7_ID: (FAILED_CHECK_7_CONTROL, FAILED_CHECK_7_TITLE, FAILED_CHECK_7_TIMES, FAILED_CHECK_7_JOBS),
+    FAILED_CHECK_8_ID: (FAILED_CHECK_8_CONTROL, FAILED_CHECK_8_TITLE, FAILED_CHECK_8_TIMES, FAILED_CHECK_8_JOBS),
 }
 
 
@@ -939,7 +967,10 @@ def _quarantined_failed_check(api: Any, item: Any, workflow_id: int, failed_id: 
         require(row["id"] == identity and row.get("status") == "completed"
                 and row.get("conclusion") == conclusion and row.get("started_at") == started
                 and row.get("completed_at") == completed)
-        if key == "recover":
+        # A skipped job reports no steps at all, whichever job it is: RECOVER is
+        # always skipped in CHECK mode, and a failed authority job skips CHECK
+        # and RECOVER together.
+        if conclusion == "skipped":
             expected_steps = []
         elif key == "gate":
             expected_steps = [("Set up job", "success"), ("Require exactly the selected recovery mode", "failure"),
