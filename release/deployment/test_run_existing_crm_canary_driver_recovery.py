@@ -1362,7 +1362,7 @@ class HostedGuardTests(RunnerFixtures):
         data[prefix + "/actions/runs/" + runner.FAILED_CHECK_4_ID + "/artifacts"] = {
             "total_count": 0, "artifacts": []}
         added = {}
-        for number in (5, 6):
+        for number in (5, 6, 7, 8):
             failed_id = getattr(runner, f"FAILED_CHECK_{number}_ID")
             frozen = copy.deepcopy(quarantined)
             frozen.update({"id": int(failed_id),
@@ -1372,7 +1372,7 @@ class HostedGuardTests(RunnerFixtures):
             frozen_jobs = []
             for key, (identity, conclusion, started, completed) in getattr(
                     runner, f"FAILED_CHECK_{number}_JOBS").items():
-                if key == "recover":
+                if conclusion == "skipped":
                     steps = []
                 elif key == "gate":
                     steps = [("Set up job", "success"),
@@ -1408,6 +1408,8 @@ class HostedGuardTests(RunnerFixtures):
                 "quarantined4": quarantined4, "quarantined4_jobs": quarantined4_jobs,
                 "quarantined5": added[5][0], "quarantined5_jobs": added[5][1],
                 "quarantined6": added[6][0], "quarantined6_jobs": added[6][1],
+                "quarantined7": added[7][0], "quarantined7_jobs": added[7][1],
+                "quarantined8": added[8][0], "quarantined8_jobs": added[8][1],
                 "endpoint": endpoint, "env": {"RECOVERY_MODE": mode, "GITHUB_RUN_ID": current_id,
                                               "GITHUB_JOB": selected_job}}
 
@@ -1624,14 +1626,15 @@ class HostedGuardTests(RunnerFixtures):
                 with self.subTest(job=job_index, key=key), self.assertRaises(common.ReleaseError):
                     self.guard(test)
 
-    def test_six_exact_failed_checks_are_quarantined_without_a_retry(self):
+    def test_eight_exact_failed_checks_are_quarantined_without_a_retry(self):
         self.assertEqual(set(runner.FAILED_CHECKS), {
             runner.FAILED_CHECK_ID, runner.FAILED_CHECK_2_ID, runner.FAILED_CHECK_3_ID,
-            runner.FAILED_CHECK_4_ID, runner.FAILED_CHECK_5_ID, runner.FAILED_CHECK_6_ID})
+            runner.FAILED_CHECK_4_ID, runner.FAILED_CHECK_5_ID, runner.FAILED_CHECK_6_ID,
+            runner.FAILED_CHECK_7_ID, runner.FAILED_CHECK_8_ID})
         for mode in ("check", "recover"):
             with self.subTest(mode=mode):
                 self.assertEqual(self.guard(self.guard_fixture(mode)), CONTROL)
-        for number in (5, 6):
+        for number in (5, 6, 7, 8):
             failed_id = getattr(runner, f"FAILED_CHECK_{number}_ID")
             test = self.guard_fixture("recover")
             test["packet"]["check_run_id"] = failed_id
@@ -1639,8 +1642,8 @@ class HostedGuardTests(RunnerFixtures):
             with self.subTest(predecessor=failed_id), self.assertRaises(common.ReleaseError):
                 self.guard(test)
 
-    def test_b28_failed_checks_reject_run_identity_and_history_drift(self):
-        for number in (5, 6):
+    def test_later_failed_checks_reject_run_identity_and_history_drift(self):
+        for number in (5, 6, 7, 8):
             failed_id = getattr(runner, f"FAILED_CHECK_{number}_ID")
             for mutation in ("missing", "duplicate", "unknown_old_head"):
                 test = self.guard_fixture("check")
