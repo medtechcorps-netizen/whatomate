@@ -50,8 +50,8 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "b9f36ed7b6dccf1249876d4beda46424a620cb8f554aa0dfdd7f7e21e920ed71"
     ),
     "finalize-production-orphan-lock.yml": (
-        # 2026-09-22: all three competing-run filters include existing-driver recovery.
-        "6baeb8309f56c056e8f516f060ce1e33f53418fb49501ddaecac3a0c7083010b"
+        # 2026-09-30: all three competing-run filters include the driver login repair.
+        "18f2119360bd3e0c222e67d84e4255fbef2d952620922e868d6935bf95e3197e"
     ),
     "reconcile-production-orphan.yml": (
         "a702f615d9721c6c175985a7e494a1173523fe98d076ffcede552c744763a065"
