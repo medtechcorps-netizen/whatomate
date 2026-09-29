@@ -107,13 +107,51 @@ CODES = frozenset({"MODE", "PRIVATE_INPUTS", "OUTPUT", "ORIGIN_PACKET", "FIXTURE
                    "DEPLOYMENT_SPEC", "DEPLOYMENT_TIMEOUT", "HEALTH", "POSTSTATE", "TOKEN_VIEW",
                    "ACTIVE_SPEC", "CANARY_STATE", "WRITER_PREFLIGHT"})
 STAGE = "AUTHORIZATION"
+# A rejected update reports only its HTTP status, the provider's short error id
+# and which of these fixed words its message contains; never the message itself.
+PROVIDER_ERROR_ID = re.compile(r"[a-z_]{1,64}")
+MESSAGE_KEYWORDS = ("credential", "database", "db_user", "decrypt", "encrypt", "forbidden", "invalid",
+                    "permission", "project", "scope", "secret", "spec", "token", "unauthorized")
+MAX_ERROR_BODY = 4096
 
 
 class Stopped(common.ReleaseError):
     """Carries only a fixed source-literal code, never a received message."""
-    def __init__(self, code: str):
+    def __init__(self, code: str, detail: dict[str, Any] | None = None):
         super().__init__("driver login repair stopped")
         self.code = code if code in CODES else None
+        self.detail = detail if type(detail) is dict else None
+
+
+def rejection_detail(status: Any, body: Any) -> dict[str, Any]:
+    """Content-free classification of a provider rejection."""
+    error_id, keywords = "unrecognized", []
+    try:
+        value = common.loads_strict(body) if type(body) is bytes and 0 < len(body) <= MAX_ERROR_BODY else None
+    except Exception:
+        value = None
+    if type(value) is dict:
+        if type(value.get("id")) is str and PROVIDER_ERROR_ID.fullmatch(value["id"]):
+            error_id = value["id"]
+        if type(value.get("message")) is str:
+            message = value["message"].lower()
+            keywords = [word for word in MESSAGE_KEYWORDS if word in message]
+    return {"http_status": status if type(status) is int and 100 <= status <= 599 else None,
+            "provider_error_id": error_id, "message_keywords": keywords}
+
+
+def spec_fingerprints(spec: Any, prefix: str) -> dict[str, str]:
+    """Whole-spec digest and a digest with every SECRET value blanked.
+
+    Comparing these with an out-of-band full-access read separates a different
+    secret representation from a different public spec, without revealing either.
+    """
+    public = copy.deepcopy(spec)
+    for service in (public.get("services") or []) if type(public) is dict else []:
+        for row in (service.get("envs") or []) if type(service) is dict else []:
+            if type(row) is dict and row.get("type") == "SECRET":
+                row["value"] = ""
+    return {prefix + "_spec_sha256": common.sha256_value(spec), prefix + "_public_spec_sha256": common.sha256_value(public)}
 
 
 def check(ok: Any, code: str) -> None:
@@ -468,15 +506,22 @@ class DriverProvider:
                 headers={"Authorization": "Bearer " + self.__token, "Accept": "application/json",
                          "Content-Type": "application/json"})
             with self.__opener.open(request, timeout=60) as response:
-                check(response.status == 200, "UPDATE_REJECTED")
+                if response.status != 200:
+                    raise Stopped("UPDATE_REJECTED", rejection_detail(response.status, None))
                 raw = response.read(boot.MAX_PUBLIC + 1)
         except urllib.error.HTTPError as error:
+            try:
+                body = error.read(MAX_ERROR_BODY + 1)
+            except Exception:
+                body = None
+            status = error.code
             error.close()
-            raise Stopped("UPDATE_REJECTED") from None
+            raise Stopped("UPDATE_REJECTED", rejection_detail(status, body)) from None
         except Stopped:
             raise
         except Exception:
-            raise Stopped("UPDATE_REJECTED") from None
+            raise Stopped("UPDATE_REJECTED", {"http_status": None, "provider_error_id": "transport",
+                                              "message_keywords": []}) from None
         check(len(raw) <= boot.MAX_PUBLIC, "UPDATE_REJECTED")
         value = common.loads_strict(raw)
         policy._json_tree(value)
@@ -505,6 +550,21 @@ def failure_report(error: Exception) -> dict[str, Any]:
     code = vars(error).get("code") if type(error) is Stopped else None
     if type(code) is str and code in CODES:
         result["code"] = code
+    detail = vars(error).get("detail") if type(error) is Stopped else None
+    if code == "UPDATE_REJECTED" and type(detail) is dict:
+        # Re-validate every field; anything unexpected is dropped, never copied.
+        status = detail.get("http_status")
+        if status is None or (type(status) is int and 100 <= status <= 599):
+            result["http_status"] = status
+        error_id = detail.get("provider_error_id")
+        if type(error_id) is str and (PROVIDER_ERROR_ID.fullmatch(error_id) or error_id == "unrecognized"):
+            result["provider_error_id"] = error_id
+        words = detail.get("message_keywords")
+        if type(words) is list and all(type(w) is str and w in MESSAGE_KEYWORDS for w in words):
+            result["message_keywords"] = sorted(set(words))
+        for key in ("update_view_spec_sha256", "update_view_public_spec_sha256"):
+            if policy._is_sha256_hex(detail.get(key)):
+                result[key] = detail[key]
     return result
 
 
@@ -549,7 +609,8 @@ def run(mode: str, root: Path, private: dict[str, Any], gh_token: str, origin_ra
               "changed_env_keys": sorted(LOGIN_KEYS) if active_id is None else [],
               "carried_secret_keys": sorted(SECRET_KEYS - LOGIN_KEYS),
               "deployments": len(known), "driver_already_active": active_id is not None,
-              "canary_configuration_present": canary == "present"}
+              "canary_configuration_present": canary == "present",
+              **spec_fingerprints(seen["spec"], "read_view")}
     if mode == "plan":
         return {**report, "state": "driver-login-repair-planned"}
     mark("PRE_UPDATE")
@@ -569,7 +630,13 @@ def run(mode: str, root: Path, private: dict[str, Any], gh_token: str, origin_ra
         writer_preflight(writer)
     if active_id is None:
         mark("UPDATE_APP")
-        identity = validate_update_response(provider.update(proposal), before, known, logins)
+        try:
+            response = provider.update(proposal)
+        except Stopped as error:
+            if error.code == "UPDATE_REJECTED" and error.detail is not None:
+                error.detail.update(spec_fingerprints(before["spec"], "update_view"))
+            raise
+        identity = validate_update_response(response, before, known, logins)
         mark("DEPLOYMENT_READBACK")
         await_active(provider, before, identity, logins)
     else:
