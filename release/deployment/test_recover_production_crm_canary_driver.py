@@ -1437,6 +1437,38 @@ class ReadOnlyAdapterTests(RecoveryFixtures):
 
 
 class DiagnosticAndCapabilityTests(unittest.TestCase):
+    def test_spec_digest_detail_is_bounded_to_one_rejection_family(self):
+        """Only the raw-spec comparison may carry two strict SHA-256 digests."""
+        observed, expected = "a" * 64, "b" * 64
+        error = recovery.PrestateRejected("PRODUCTION_PROVIDER_RAW_SPEC_DIGEST",
+                                          {"observed_spec_sha256": observed,
+                                           "expected_spec_sha256": expected})
+        self.assertEqual(vars(error)["detail"],
+                         {"observed_spec_sha256": observed, "expected_spec_sha256": expected})
+        self.assertEqual(vars(error)["code"], "PRODUCTION_PROVIDER_RAW_SPEC_DIGEST")
+        # A plain rejection carries no detail attribute value at all.
+        self.assertIsNone(vars(recovery.PrestateRejected("ACCOUNT_READ")).get("detail"))
+        bad_details = (
+            {"observed_spec_sha256": observed},
+            {"observed_spec_sha256": observed, "expected_spec_sha256": expected, "extra": expected},
+            {"observed_spec_sha256": observed.upper(), "expected_spec_sha256": expected},
+            {"observed_spec_sha256": observed[:63], "expected_spec_sha256": expected},
+            {"observed_spec_sha256": observed, "expected_spec_sha256": True},
+            {"observed_spec_sha256": observed, "expected_spec_sha256": None},
+            [observed, expected],
+            PRIVATE,
+        )
+        for detail in bad_details:
+            with self.subTest(detail=repr(detail)[:40]):
+                with self.assertRaises(common.ReleaseError):
+                    recovery.PrestateRejected("PRODUCTION_PROVIDER_RAW_SPEC_DIGEST", detail)
+        # The same detail is refused for every other diagnostic code.
+        for code in ("ACCOUNT_READ", "PRODUCTION_PROVIDER_VALIDATION", PRIVATE):
+            with self.subTest(code=code):
+                with self.assertRaises(common.ReleaseError):
+                    recovery.PrestateRejected(code, {"observed_spec_sha256": observed,
+                                                     "expected_spec_sha256": expected})
+
     def test_historical_regeneration_uses_wrapper_not_current_generator_directly(self):
         tree = ast.parse(Path(recovery.__file__).read_text(encoding="utf-8"))
         validator = next(node for node in tree.body

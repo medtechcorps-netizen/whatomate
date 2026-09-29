@@ -111,12 +111,35 @@ def require(ok: bool) -> None:
         raise common.ReleaseError("existing-driver recovery inspection rejected")
 
 
+def _is_sha256_hex(value: Any) -> bool:
+    """True only for an exact, lowercase, 64-character SHA-256 hex digest."""
+    return (type(value) is str and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value))
+
+
 class PrestateRejected(common.ReleaseError):
-    """Only a reviewed, content-free code may leave a diagnostic boundary."""
-    def __init__(self, code: str):
+    """Only a reviewed, content-free code may leave a diagnostic boundary.
+
+    ``detail`` is an optional, strictly bounded pair of SHA-256 digests used by
+    exactly one rejection family (the raw production spec digest comparison).
+    It carries no provider value, key, ciphertext or specification: only two
+    validated 64-character lowercase hex digests, one of which the checked-in
+    contract already publishes. Anything else is refused.
+    """
+    DETAIL_KEYS = frozenset({"observed_spec_sha256", "expected_spec_sha256"})
+
+    def __init__(self, code: str, detail: dict[str, str] | None = None):
         require(type(code) is str and code in PRESTATE_DIAGNOSTICS)
+        if detail is not None:
+            # Exactly one rejection family may carry a detail at all.
+            require(code == "PRODUCTION_PROVIDER_RAW_SPEC_DIGEST"
+                    and type(detail) is dict and set(detail) == self.DETAIL_KEYS
+                    and all(type(key) is str and _is_sha256_hex(value)
+                            for key, value in detail.items()))
         super().__init__("existing-driver prestate rejected")
         self.code = code
+        if detail is not None:
+            self.detail = dict(detail)
 
 
 @contextmanager
