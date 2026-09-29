@@ -492,6 +492,15 @@ def failure_report(error: Exception) -> dict[str, Any]:
         code = vars(error).get("code")
         if type(code) is str and code in policy.PRESTATE_DIAGNOSTICS:
             result["diagnostic_code"] = code
+            # Only the raw production spec digest family may add its two
+            # comparison digests, and only when both validate as strict
+            # lowercase SHA-256 hex. Nothing else from the spec is ever copied.
+            if code == "PRODUCTION_PROVIDER_RAW_SPEC_DIGEST":
+                detail = vars(error).get("detail")
+                if type(detail) is dict and set(detail) == policy.PrestateRejected.DETAIL_KEYS:
+                    for key in sorted(detail):
+                        if policy._is_sha256_hex(detail[key]):
+                            result[key] = detail[key]
     if stage == "AUTHORIZATION" and type(error) is AuthorizationRejected:
         code = vars(error).get("code")
         if type(code) is str and code in AUTHORIZATION_DIAGNOSTICS:
@@ -613,7 +622,22 @@ class ProviderRead:
                     args = error.args
                     if type(args) is tuple and len(args) == 1 and type(args[0]) is str:
                         code = _PROVIDER_PLAN_REJECTIONS.get(args[0], code)
-                raise policy.PrestateRejected(code) from None
+                # Exactly one rejection family may carry a bounded, non-private
+                # comparison detail: the two SHA-256 digests whose inequality
+                # produced the raw production spec mismatch. The expected digest
+                # is already published by the checked-in contract; the observed
+                # digest is a digest of the live spec, never its content. Both
+                # are validated as strict lowercase SHA-256 hex before leaving.
+                detail = None
+                if code == "PRODUCTION_PROVIDER_RAW_SPEC_DIGEST":
+                    live_spec = app.get("spec")
+                    expected_digest = expected.get("canonical_spec_sha256")
+                    if type(live_spec) is dict and policy._is_sha256_hex(expected_digest):
+                        observed_digest = common.sha256_value(live_spec)
+                        if policy._is_sha256_hex(observed_digest):
+                            detail = {"observed_spec_sha256": observed_digest,
+                                      "expected_spec_sha256": expected_digest}
+                raise policy.PrestateRejected(code, detail) from None
         with policy.prestate_diagnostic("PRODUCTION_STATE_DIGEST"):
             require(common.sha256_value(state) == self.a["production_state_sha256"])
         with policy.prestate_diagnostic("PRODUCTION_HISTORY_READ"):

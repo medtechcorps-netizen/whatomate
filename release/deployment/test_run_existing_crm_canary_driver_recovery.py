@@ -369,6 +369,29 @@ class CheckExecutionTests(RunnerFixtures):
 
 
 class PrestateDiagnosticTests(RunnerFixtures):
+    def test_only_the_raw_spec_rejection_publishes_its_two_digests(self):
+        observed, expected = "c" * 64, "d" * 64
+        detail = {"observed_spec_sha256": observed, "expected_spec_sha256": expected}
+        with mock.patch.object(runner, "CURRENT_STAGE", "PROVIDER_PRESTATE"):
+            report = runner.failure_report(
+                kernel.PrestateRejected("PRODUCTION_PROVIDER_RAW_SPEC_DIGEST", detail))
+        self.assertEqual(report["diagnostic_code"], "PRODUCTION_PROVIDER_RAW_SPEC_DIGEST")
+        self.assertEqual(report["observed_spec_sha256"], observed)
+        self.assertEqual(report["expected_spec_sha256"], expected)
+        self.assertEqual(set(report), {"schema_version", "state", "code", "stage",
+                                       "retry_authorized", "diagnostic_code",
+                                       "observed_spec_sha256", "expected_spec_sha256"})
+        self.assert_no_private_report(report)
+        fixed = {"schema_version", "state", "code", "stage", "retry_authorized",
+                 "diagnostic_code"}
+        for code in ("ACCOUNT_READ", "PRODUCTION_PROVIDER_VALIDATION",
+                     "PRODUCTION_PROVIDER_LIVE_SPEC_EQUALITY",
+                     "PRODUCTION_PROVIDER_ENVIRONMENT_DIGEST"):
+            with self.subTest(code=code):
+                with mock.patch.object(runner, "CURRENT_STAGE", "PROVIDER_PRESTATE"):
+                    other = runner.failure_report(kernel.PrestateRejected(code))
+                self.assertEqual(set(other), fixed)
+
     def test_each_read_only_orchestration_boundary_has_fixed_code_and_no_effects(self):
         for failure, expected in (("canary", "CANARY_ABSENCE"), ("first", "FIRST_SNAPSHOT"),
                                   ("second", "SECOND_SNAPSHOT"), ("guard", "PRESTATE_GUARD")):
@@ -796,6 +819,19 @@ class ProviderBoundaryTests(RunnerFixtures):
             with self.subTest(failure=failure):
                 self.assertIs(type(result), kernel.PrestateRejected)
                 self.assertEqual(result.code, code)
+                detail = vars(result).get("detail")
+                if failure == "raw_spec":
+                    # The one diagnostic that carries a bounded comparison pair.
+                    self.assertEqual(set(detail), kernel.PrestateRejected.DETAIL_KEYS)
+                    self.assertNotEqual(detail["observed_spec_sha256"],
+                                        detail["expected_spec_sha256"])
+                    self.assertEqual(detail["expected_spec_sha256"],
+                                     expected["canonical_spec_sha256"])
+                    self.assertEqual(detail["observed_spec_sha256"],
+                                     planner.sha256_value(app["app"]["spec"]))
+                else:
+                    # Every other planner rejection stays exactly as before.
+                    self.assertIsNone(detail)
                 self.assertEqual(len(paths), 2)
                 self.assertTrue(all(path.startswith("/v2/apps/") for path in paths))
                 with mock.patch.object(runner, "CURRENT_STAGE", "PROVIDER_PRESTATE"):
