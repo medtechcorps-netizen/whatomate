@@ -777,7 +777,7 @@ class RolloutEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             bad_manifest = Path(temporary) / "manifest.json"
             bad_manifest.write_text(
-                MANIFEST_PATH.read_text(encoding="utf-8").replace('"20260824T000000Z"', "NaN", 1),
+                MANIFEST_PATH.read_text(encoding="utf-8").replace('"20260930T000000Z"', "NaN", 1),
                 encoding="utf-8",
             )
             with self.assertRaises(verifier.EvidenceError):
