@@ -124,7 +124,7 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
     ),
 }
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "c2ff0d80701c5bfc268d07c572916a2167ff4e2bef5fe036bb87407da6752c0b"
+    "921891fa1c2dc314dffaeafe57d4b94440cbb4e04e10cfe537b3bc53bceae257"
 )
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
     "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
@@ -136,7 +136,7 @@ EXACT_GATE_B_TEST_JOB_SHA256 = {
     "release-controls": "79645bf97ed1574bcb760af561a525ffc028e2ea34e27b9ca51af177ba59590a",
     "go-race": "863b563a974a7050c7061eaeb80b6c5bd96ca88e0a95e6666bad511da636e192",
     "lint": "a2402a41b92ca872b93b87e2e24cdd3d4b3703bfcf3534d1e1bf410bf0fe619c",
-    "security": "ed9572d5895abf26417ce1ebf87970cc67b41be00379d42df75df58f73c8cbd4",
+    "security": "405c4f39062f37db3e2965d55fe8734a6fd5ba6b3ffbf618468772bf1493ce1b",
     "recovery-boundary-images": (
         "90daa97f1350ea5ec53dfc0b86416138fc4737928e6a7d089c33276aa36eaea2"
     ),
