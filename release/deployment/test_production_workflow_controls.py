@@ -62,9 +62,9 @@ TERMINAL_PARITY_WORKFLOW_SHA256 = {
         "2b6db9a1db1678e105f343828b25c3f260217d67aff4ea25fb131d7225241925"
     ),
     "verify-production-crm-canary.yml": (
-        # 2026-09-19: the receipt-run identity check now binds the exact run-name
-        # GitHub reports for each workflow instead of the workflow's `name`.
-        "98e2e7f33c98135d82f2ef76dddeec9ad5e06fe5a582ff2e898a2d97ebc0fdb4"
+        # 2026-09-30: the ui fixture binding runs through the canary-side
+        # comparison-capable reader, and the observer may read attestations.
+        "375b6ae1b4164e66da423b07a1e0f2afdbbe98602a9304e3157535f67b269960"
     ),
 }
 EXACT_IMAGE_BUILD_ACTION = (
@@ -4309,6 +4309,7 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
                 observer,
                 "    permissions:\n"
                 "      actions: read\n"
+                "      attestations: read\n"
                 "      contents: read\n",
             ),
             (
@@ -4334,7 +4335,12 @@ class PermissionAndCredentialIsolationTests(unittest.TestCase):
         self.assertEqual(source.count("secrets.CRM_CANARY_SYNTHETIC_DRIVER_JSON"), 2)
         binding_step = observer.split("- name: Bind UI runtime fixture to the exact signed setup result", 1)[1].split("- name:", 1)[0]
         self.assertIn("if: ${{ needs.authority.outputs.phase == 'ui' }}", binding_step)
-        self.assertIn("verify-fixture-result --control-root control", binding_step)
+        self.assertIn(
+            "python3 -I -S -B control/release/deployment/verify_crm_canary_fixture_binding.py "
+            "verify-fixture-result --control-root control",
+            binding_step,
+        )
+        self.assertNotIn("provision_production_crm_canary_fixture.py", binding_step)
         self.assertIn("FIXTURE_EVIDENCE_JSON: ${{ inputs.fixture_evidence_json }}", binding_step)
         self.assertNotRegex(
             source,

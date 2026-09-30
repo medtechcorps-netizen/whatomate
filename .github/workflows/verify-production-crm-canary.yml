@@ -338,6 +338,7 @@ jobs:
     environment: rereply-production-canary
     permissions:
       actions: read
+      attestations: read
       contents: read
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
@@ -469,7 +470,7 @@ jobs:
           CRM_CANARY_SYNTHETIC_DRIVER_JSON: ${{ secrets.CRM_CANARY_SYNTHETIC_DRIVER_JSON }}
         run: |
           set -euo pipefail
-          python3 -I -S -B control/release/deployment/provision_production_crm_canary_fixture.py verify-fixture-result --control-root control
+          python3 -I -S -B control/release/deployment/verify_crm_canary_fixture_binding.py verify-fixture-result --control-root control
 
       - name: Run tokenless public and controlled synthetic CRM probes
         env:
