@@ -71,7 +71,7 @@ EXACT_IMAGE_BUILD_ACTION = (
     "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6"
 )
 EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
-    "750b613f6c5789ab1acefed20670e9e18545343aa42ed2ae8470e5bae1c04cd9"
+    "5ca6565f32d4bf64d7dce4c36b09011cf6ed9fb9e7a68069014d730a43bac0cd"
 )
 EXACT_CRM_CANARY_DRIVER_PUBLISHER_SHA256 = (
     "e221060ea125b6bd4e35eb0c1111311e8932a23de4dc4e59bb5671115cc7a510"
@@ -80,7 +80,7 @@ EXACT_IMAGE_GATE_STEP_SHA256 = (
     "1b4bf101f1756d43193ccc0050cf44bb9dd22df25302e084c9a9a91ede2db4a5"
 )
 EXACT_IMAGE_AUTHORITY_MATRIX_STEP_SHA256 = (
-    "dfc480d4ac0adcee8b70235662b597fb72be74fdd3eb941e13028b3f6c87f20f"
+    "3a8061a32008502c4e7c8f5a36fe9a32b773c33b093a15913e606a0328079021"
 )
 EXACT_RELEASE_WEB_SNAPSHOT_RUN = (
     "RUN set -eu; "
@@ -94,7 +94,8 @@ EXACT_RELEASE_WEB_SNAPSHOT_RUN = (
     "espeak-ng=1.51+dfsg-12build1 "
     "opus-tools=0.2-1build3 "
     "ffmpeg=7:6.1.1-3ubuntu5 "
-    "&& for package in ca-certificates tzdata espeak-ng opus-tools ffmpeg; do "
+    "libssl3t64=3.0.13-0ubuntu3.16 "
+    "&& for package in ca-certificates tzdata espeak-ng opus-tools ffmpeg libssl3t64; do "
     "apt-cache policy \"$package\" | grep -F 'snapshot.ubuntu.com' "
     "> /dev/null || exit 1; done "
     "&& printf 'APT::Snapshot \"%s\";\\n' \"$UBUNTU_SNAPSHOT\" "
@@ -3326,11 +3327,12 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
         self.assertEqual(
             manifest["release"]["materials"]["ubuntu_snapshot"],
             {
-                "id": "20260824T000000Z",
+                "id": "20260930T000000Z",
                 "packages": {
                     "ca-certificates": "20260601~24.04.1",
                     "espeak-ng": "1.51+dfsg-12build1",
                     "ffmpeg": "7:6.1.1-3ubuntu5",
+                    "libssl3t64": "3.0.13-0ubuntu3.16",
                     "opus-tools": "0.2-1build3",
                     "tzdata": "2026c-0ubuntu0.24.04.1",
                 },

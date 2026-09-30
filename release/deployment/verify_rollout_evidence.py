@@ -224,7 +224,7 @@ EXPECTED_COMPONENTS = {
     "web": {
         "image": "ghcr.io/medtechcorps-netizen/rereply-release-web",
         "dockerfile": "docker/release/web.Dockerfile",
-        "dockerfile_sha256": "f441cbd45867a32a509af11c246f2c4e6d81104db99b728d7ccd865c7f9ad381",
+        "dockerfile_sha256": "aa0d9b302bc7afe81d6dab96e82ba711e24918dc960ceabcd83ffccae4aa355a",
         "user": "rereply",
         "working_dir": "/app",
         "entrypoint": ["./rereply"],
@@ -236,11 +236,12 @@ EXPECTED_COMPONENTS = {
 
 EXPECTED_MATERIALS = {
     "ubuntu_snapshot": {
-        "id": "20260824T000000Z",
+        "id": "20260930T000000Z",
         "packages": {
             "ca-certificates": "20260601~24.04.1",
             "espeak-ng": "1.51+dfsg-12build1",
             "ffmpeg": "7:6.1.1-3ubuntu5",
+            "libssl3t64": "3.0.13-0ubuntu3.16",
             "opus-tools": "0.2-1build3",
             "tzdata": "2026c-0ubuntu0.24.04.1",
         },

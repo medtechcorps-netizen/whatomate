@@ -38,7 +38,7 @@ RUN chmod 0644 \
 FROM --platform=linux/amd64 docker.io/library/ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-ARG UBUNTU_SNAPSHOT=20260824T000000Z
+ARG UBUNTU_SNAPSHOT=20260930T000000Z
 WORKDIR /app
 RUN set -eu; \
     printf 'APT::Snapshot "%s";\nAcquire::Retries "10";\n' "$UBUNTU_SNAPSHOT" > /etc/apt/apt.conf.d/50snapshot \
@@ -49,7 +49,8 @@ RUN set -eu; \
       espeak-ng=1.51+dfsg-12build1 \
       opus-tools=0.2-1build3 \
       ffmpeg=7:6.1.1-3ubuntu5 \
-    && for package in ca-certificates tzdata espeak-ng opus-tools ffmpeg; do \
+      libssl3t64=3.0.13-0ubuntu3.16 \
+    && for package in ca-certificates tzdata espeak-ng opus-tools ffmpeg libssl3t64; do \
          apt-cache policy "$package" | grep -F 'snapshot.ubuntu.com' > /dev/null || exit 1; \
        done \
     && printf 'APT::Snapshot "%s";\n' "$UBUNTU_SNAPSHOT" > /etc/apt/apt.conf.d/50snapshot \
