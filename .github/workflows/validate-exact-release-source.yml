@@ -779,12 +779,42 @@ jobs:
           # bundle, and the newer ui snapshot's lockfile already resolves it,
           # so the exception is explicitly listed and tracked for the next
           # phase refresh. Every other high or critical advisory still fails.
+          #
+          # 2026-09-30: three brace-expansion 5.0.9 advisories (quadratic
+          # `{a},b}` rewrite; unbounded recursion on nested brace groups and
+          # in parseCommaParts) were published after the reviewed snapshots.
+          # brace-expansion is a dev-only transitive build dependency in every
+          # phase lockfile (3a05b5d1... and 09b0efe5...) and never ships in the
+          # built bundle; it is tracked for the next phase refresh as well.
+          # Any allowed advisory must also be dev-only in this exact lockfile.
           ALLOWED = {
               (
                   "js-yaml",
                   "maxTotalMergeKeys does not limit CPU use for empty merge sources",
               ),
+              (
+                  "brace-expansion",
+                  "Quadratic-time expansion of the `{a},b}` rewrite causes CPU denial of service",
+              ),
+              (
+                  "brace-expansion",
+                  "DoS via uncontrolled recursion on nested brace groups causing stack exhaustion",
+              ),
+              (
+                  "brace-expansion",
+                  "DoS via uncontrolled recursion in parseCommaParts causing stack exhaustion",
+              ),
           }
+          LOCK = json.load(open("package-lock.json", encoding="utf-8"))
+
+          def dev_only(package):
+              rows = [
+                  meta
+                  for path, meta in LOCK.get("packages", {}).items()
+                  if path == "node_modules/" + package
+                  or path.endswith("/node_modules/" + package)
+              ]
+              return bool(rows) and all(meta.get("dev") is True for meta in rows)
 
           def allowed(advisory_name, title):
               for package, phrase in ALLOWED:
@@ -802,7 +832,7 @@ jobs:
                   if not isinstance(item, dict):
                       continue
                   key = (item.get("name"), item.get("title"))
-                  if allowed(item.get("name"), item.get("title")):
+                  if allowed(item.get("name"), item.get("title")) and dev_only(package):
                       allowed_hits.append((package, key))
                   else:
                       blocking.append((entry.get("severity"), package, key))

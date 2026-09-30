@@ -325,8 +325,49 @@ jobs:
       - name: Audit frontend dependencies
         working-directory: frontend
         run: |
+          set -euo pipefail
           npm ci
-          npm audit --audit-level=high
+          npm audit --audit-level=high --json > "$RUNNER_TEMP/frontend-audit.json" || true
+          python3 - "$RUNNER_TEMP/frontend-audit.json" <<'AUDIT'
+          import json, sys
+
+          # 2026-09-30: three brace-expansion advisories (GHSA-q2hr-2g5m-vwhr,
+          # GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p) affect the locked 5.0.9,
+          # a dev-only transitive build dependency that never ships in the
+          # built bundle. They are allowed only while every locked instance is
+          # dev-only; any other high or critical advisory still fails. Remove
+          # this list with the next lockfile refresh.
+          ALLOWED = {
+              ("brace-expansion", "Quadratic-time expansion of the `{a},b}` rewrite causes CPU denial of service"),
+              ("brace-expansion", "DoS via uncontrolled recursion on nested brace groups causing stack exhaustion"),
+              ("brace-expansion", "DoS via uncontrolled recursion in parseCommaParts causing stack exhaustion"),
+          }
+          LOCK = json.load(open("package-lock.json", encoding="utf-8"))
+
+          def dev_only(package):
+              rows = [meta for path, meta in LOCK.get("packages", {}).items()
+                      if path == "node_modules/" + package or path.endswith("/node_modules/" + package)]
+              return bool(rows) and all(meta.get("dev") is True for meta in rows)
+
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          blocking = []
+          for package, entry in sorted(report.get("vulnerabilities", {}).items()):
+              if entry.get("severity") not in ("high", "critical"):
+                  continue
+              for item in entry.get("via", []):
+                  if not isinstance(item, dict):
+                      continue
+                  if any(item.get("name") == name and phrase in str(item.get("title"))
+                         for name, phrase in ALLOWED) and dev_only(package):
+                      print("allowed dev-only advisory: %s <- %s" % (package, item.get("name")))
+                  else:
+                      blocking.append((entry.get("severity"), package, item.get("name"), item.get("title")))
+          for severity, package, name, title in blocking:
+              print("unexpected %s advisory: %s <- %s: %s" % (severity, package, name, title))
+          if blocking:
+              sys.exit(1)
+          print("frontend audit policy satisfied")
+          AUDIT
 
       - name: Test frontend unit suite
         working-directory: frontend
