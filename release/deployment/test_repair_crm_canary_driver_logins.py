@@ -401,6 +401,66 @@ class Provider(Pinned):
         self.assertFalse(provider.attempted)
 
 
+class RejectionDiagnostics(Pinned):
+    def test_rejection_detail_is_a_fixed_content_free_classification(self) -> None:
+        body = json.dumps({"id": "bad_request", "message": "Validation of db_user credential failed for crm-x"}).encode()
+        detail = repair.rejection_detail(400, body)
+        self.assertEqual(detail, {"http_status": 400, "provider_error_id": "bad_request",
+                                  "message_keywords": ["credential", "db_user"]})
+        self.assertNotIn("crm-x", json.dumps(detail))
+        self.assertEqual(repair.rejection_detail(403, b'{"id":"Forbidden <x>","message":7}'),
+                         {"http_status": 403, "provider_error_id": "unrecognized", "message_keywords": []})
+        self.assertEqual(repair.rejection_detail(999, b"not json")["http_status"], None)
+        self.assertEqual(repair.rejection_detail(400, b"x" * (repair.MAX_ERROR_BODY + 1))["provider_error_id"],
+                         "unrecognized")
+
+    def test_failure_report_revalidates_every_detail_field(self) -> None:
+        good = repair.Stopped("UPDATE_REJECTED", {"http_status": 403, "provider_error_id": "forbidden",
+                                                  "message_keywords": ["scope", "scope"],
+                                                  "update_view_spec_sha256": "a" * 64,
+                                                  "update_view_public_spec_sha256": "b" * 64})
+        with mock.patch.object(repair, "STAGE", "UPDATE_APP"):
+            report = repair.failure_report(good)
+            self.assertEqual(report, {"schema_version": 1, "state": "driver-login-repair-stopped", "stage": "UPDATE_APP",
+                                      "code": "UPDATE_REJECTED", "retry_authorized": False, "http_status": 403,
+                                      "provider_error_id": "forbidden", "message_keywords": ["scope"],
+                                      "update_view_spec_sha256": "a" * 64, "update_view_public_spec_sha256": "b" * 64})
+            hostile = repair.Stopped("UPDATE_REJECTED", {"http_status": "403", "provider_error_id": "a b",
+                                                         "message_keywords": ["password=x"], "message": "leak",
+                                                         "update_view_spec_sha256": "leak"})
+            self.assertEqual(set(repair.failure_report(hostile)),
+                             {"schema_version", "state", "stage", "code", "retry_authorized"})
+            other = repair.Stopped("DEPLOYMENT_ERROR", {"http_status": 400})
+            self.assertNotIn("http_status", repair.failure_report(other))
+
+    def test_http_rejection_is_classified_without_retry(self) -> None:
+        import io
+        import urllib.error
+        provider = repair.DriverProvider("t" * 40, allow_update=True)
+        provider.app_id = APP_ID
+        error = urllib.error.HTTPError("https://example.invalid", 400, "Bad Request", {},
+                                       io.BytesIO(b'{"id":"bad_request","message":"invalid spec"}'))
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(provider, "_DriverProvider__opener", opener):
+            with self.assertRaises(repair.Stopped) as caught:
+                provider.update(spec())
+        self.assertEqual(caught.exception.detail, {"http_status": 400, "provider_error_id": "bad_request",
+                                                   "message_keywords": ["invalid", "spec"]})
+        self.assertEqual(opener.open.call_count, 1)
+
+    def test_spec_fingerprints_blank_only_secret_values(self) -> None:
+        base = repair.spec_fingerprints(spec(), "read_view")
+        self.assertEqual(set(base), {"read_view_spec_sha256", "read_view_public_spec_sha256"})
+        rotated = repair.spec_fingerprints(relogged(spec()), "read_view")
+        self.assertNotEqual(base["read_view_spec_sha256"], rotated["read_view_spec_sha256"])
+        self.assertEqual(base["read_view_public_spec_sha256"], rotated["read_view_public_spec_sha256"])
+        moved = spec()
+        moved["services"][0]["image"]["digest"] = "sha256:" + "3" * 64
+        self.assertNotEqual(base["read_view_public_spec_sha256"],
+                            repair.spec_fingerprints(moved, "read_view")["read_view_public_spec_sha256"])
+
+
 class Reporting(unittest.TestCase):
     def test_failure_report_is_content_free(self) -> None:
         with mock.patch.object(repair, "STAGE", "UPDATE_APP"):
