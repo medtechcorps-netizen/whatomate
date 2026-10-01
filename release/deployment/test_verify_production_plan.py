@@ -2409,7 +2409,7 @@ class ProductionPlanTests(unittest.TestCase):
         self.assertIn("python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v", protected_ci)
 
 
-GENESIS_PIN = "b7892b2caaaf66ef132791b19c2a69dc200b40197a1420f4aae0b207ef0ae793"
+GENESIS_PIN = "38a0ff29e1fde9ee44092643b14ad888110bedabb0196177b553c6f5bbcae875"
 LIVE_EVIDENCE_DIR = ROOT / "release" / "deployment" / "live-evidence"
 REPOSITORY_URL = "https://github.com/medtechcorps-netizen/whatomate"
 SLSA_PREDICATE = "https://slsa.dev/provenance/v1"
@@ -2972,12 +2972,13 @@ class GenesisReentryTests(unittest.TestCase):
         evidence = verifier.BOOTSTRAP_LIVE_EVIDENCE
         stem = f"production-phase-apply-receipt-{evidence['run_id']}-{evidence['run_attempt']}"
         documents = classify_live_evidence(LIVE_EVIDENCE_DIR)
-        self.assertEqual(sorted(path.name for path in LIVE_EVIDENCE_DIR.iterdir()), [
+        # Older committed evidence stays committed beside the current receipt.
+        self.assertLessEqual({
             stem + ".json",
             stem + ".predicate-receipt-v1.sigstore.json",
             stem + ".predicate-slsa-provenance-v1.sigstore.json",
             stem + ".sha256",
-        ])
+        }, {path.name for path in LIVE_EVIDENCE_DIR.iterdir()})
         document = documents[stem + ".json"]
         self.assertEqual(set(document["statements"]), {SLSA_PREDICATE, evidence["predicate_type"]})
         for statement in document["statements"].values():

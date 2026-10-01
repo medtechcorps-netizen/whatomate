@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Callable
 
 
-VERIFIER_SHA256 = "0b2f1e71c21eba0c49362ad2b9b789e9411335d2008f09b63d08e76d3d7155a8"
-CONTRACT_SHA256 = "2298736cb0bcaa6bd73bcfcd93ddec4b8b8ab7cf1e4c1687fc4696011ab89c28"
+VERIFIER_SHA256 = "ba87790ff6d93e1d0b80e7c8d87fd37eb58019ee340150fa0c3a23549f838e2e"
+CONTRACT_SHA256 = "1a3e385b34a85f32096f2610792b93b72856a8b4e3e3f08eb33132ac3d5a24ea"
 PHASES = ("baseline", "bridge", "backend", "ui")
 STATE_WORKFLOW = ".github/workflows/verify-production-crm-canary.yml"
 ERROR_CODE = "provider-parity-read-or-verification-failed"

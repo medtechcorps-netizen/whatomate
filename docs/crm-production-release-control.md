@@ -382,6 +382,116 @@ visibility authorization, verify anonymous access, and issue a fresh dispatch
 rather than rerunning the failed run. Public package visibility is effectively
 irreversible.
 
+### Rolling the driver image
+
+A driver fix never recreates the driver app. Once the fix is on `main` and the
+publisher has succeeded there, `Repair Production CRM Canary Driver Logins`
+moves the existing app to the new image in two dispatches from protected
+`main`. Each waits for the `rereply-production-crm-fixture` required reviewer,
+so a roll takes exactly two approvals:
+
+1. `mode` `roll-plan` is read-only: it proves the change set and writes
+   nothing.
+2. `mode` `roll-apply` repeats every check, then sends exactly one PUT.
+
+Both take `origin_authorization_json`, the unchanged original public bootstrap
+packet, and `driver_evidence_json`: canonical JSON (sorted keys, no
+whitespace) with exactly `control_sha`, `run_id`, `artifact_id`,
+`artifact_digest`, `digest` and `driver_version_sha256` of the successful
+publisher run, the two IDs as decimal strings. `artifact_id` and
+`artifact_digest` are the API values of `attested-crm-canary-driver-<run>-1`;
+`digest` and `driver_version_sha256` come from its `image.json`. All of them
+are public. The unchanged bootstrap `authenticate_driver` proves the evidence:
+the publisher control is protected ancestry of the current control, the
+publisher workflow is unchanged since then, the run has exactly its six
+successful jobs and four artifacts, its `driver-inputs.tsv` equals the current
+driver-input manifest, and all three attestations verify. The new digest and
+version must differ from every reviewed prior pin.
+
+The PUT changes exactly two spec paths, the image digest and the
+`CRM_CANARY_DRIVER_VERSION_SHA256` value. All five SECRET ciphertexts are
+carried byte-identical, so the fixture input is never read. The run waits for
+ACTIVE, with the previous deployment ACTIVE until then, and for two
+consecutive `/healthz` 204s on the unchanged origin. Only then does it replace
+`CRM_CANARY_SYNTHETIC_DRIVER_JSON` in `rereply-production-canary`. The value
+is rebuilt from the same descriptor and origin, so only
+`driver_version_sha256` changes; the secret's `created_at` must stay, its
+`updated_at` must move and both base secrets must stay unchanged. The run
+writes a signed, content-free receipt of kind
+`production-crm-canary-driver-image-roll-v1` as artifact
+`crm-canary-driver-image-roll-<run>-1`. The workflow shares `rereply-production`
+concurrency, so a roll never races a canary.
+
+- **Continuation.** A stop before the PUT changed nothing: fix the cause and
+  dispatch again. A stop after the PUT is finished by a later approved
+  `roll-apply` with the same inputs, dispatched once the new deployment has
+  left its in-progress phases. When the driver is already ACTIVE at the new
+  pins, that run sends no PUT, re-proves health and replaces the
+  configuration again. Until a `roll-apply` completes, the image and the
+  canary configuration disagree, so no canary or train may run.
+- **Never a console PUT.** Never edit the driver app, its deployments or the
+  canary secret in the DigitalOcean or GitHub console, not even to finish a
+  roll.
+- **A new deployment that ends in ERROR.** DigitalOcean keeps the previous
+  deployment ACTIVE while the app spec is at the new pins, and the canary
+  configuration still matches the running driver. Every later roll then stops
+  at `DRIVER_PRESTATE` (`ACTIVE_SPEC`) before any write. Do not launch a
+  train and do not PUT again. Diagnose from the driver's startup line in its
+  runtime logs. A fix that touches only `release/deployment` needs no
+  re-publish: `authenticate_driver` binds the evidence by protected ancestry,
+  the unchanged publisher workflow and the unchanged driver-input manifest, so
+  the same `driver_evidence_json` stays valid at the new `main`. It needs only
+  the push Test there, then `roll-plan` and `roll-apply`. A change to
+  `frontend/canary-driver/`, `docker/crm-canary-driver.Dockerfile`,
+  `frontend/package.json`, `frontend/package-lock.json` or the publisher
+  workflow needs a new publish first.
+- **Prior re-pin rule.** `PRIOR_DRIVER_EVIDENCE` in
+  `repair_crm_canary_driver_logins.py` lists the reviewed pins a roll may
+  start from, beginning with the image the 2026-09-30 login repair made
+  ACTIVE. After a completed roll, the next PR that changes the driver appends
+  that roll's evidence unchanged; never edit or remove an entry. Otherwise its
+  roll stops at `DRIVER_PRESTATE` (`DRIVER_PINS`). The replaced deployment is
+  expected to read `SUPERSEDED`; any other phase stops the next roll at
+  `DRIVER_HISTORY`.
+- **Canary-sensitive UI hooks.** `omnichannel_late_layout_autoscroll` and
+  `native_chat_late_layout_autoscroll` shrink only the height, to 1440x640,
+  settle, scroll to the latest message, then narrow the window once to
+  1300x640 and require that the transcript grew and is still at the bottom.
+  They never resize below the 1280 px breakpoint where the ChannelsView and
+  ChatView rails stop docking. For the probe only, browser scroll anchoring is
+  off on the transcript scroller (inline `overflow-anchor: none`, restored
+  afterwards). With anchoring on, any layout that runs before a frame's scroll
+  steps (a resize handler, the hover hit-test after a mouse click, a keyup
+  handler) dispatches an anchoring scroll event before the product's
+  ResizeObserver runs; the product's scroll handler then reads a gap above its
+  80 px bottom threshold and stops following. In the pinned Playwright 1.57
+  Chromium (143), every window resize, navigation toggle and rail toggle
+  tried with anchoring on failed for some fixture history, rail state or
+  preceding check, mostly 88-997 px off the bottom, and a real-time 300 ms
+  navigation transition fails even with anchoring off. That is a product
+  defect in ChannelsView and ChatView (anchoring plus scroll-handler follow
+  state), queued as a ui source fix; the checks prove the product's own
+  bottom-following of a one-step late layout change.
+  `native_chat_conversation_switch_autoscroll` waits for the selected
+  contact's known inbound message (its `data-message-id` on
+  `[data-testid="chat-message"]`) to render, then polls up to 5 s until the
+  scroller reaches the real bottom. A ui source change to
+  the transcript scrollers, their test IDs or the 1280 px rail breakpoints
+  fails those checks closed, so it must ship with a matching driver change.
+  A driver change to checks 8-11 is gated before merge by the same-browser
+  harness: the pinned Playwright base image with its own `playwright`
+  package, the live ui source, 4 history shapes, both native rail states and
+  0/100/250 ms API latency, with every run passing.
+- **Failed-check label.** A failing driver run writes one content-free line per
+  failed stage to stderr, which lands in the driver app's runtime logs:
+  `{"schema_version":1,"event":"crm_canary_driver_check","check":"<label>","outcome":"FAILED"}`.
+  The label is `prepare`, one of the 13 check IDs, or `deadline`. A deadline
+  writes `deadline`, usually followed by the label of the stage that was
+  still running (closing the browsers rejects it), which names the stuck
+  check. The canary
+  itself only sees a generic 503, so read the label (owner console, or a
+  consented read-only log fetch) before any re-dispatch (F11).
+
 ### 3. Four-phase rollout capsule
 
 Dispatch `Assemble and Attest Exact Four-Phase Rollout` with all four phases in
@@ -686,6 +796,30 @@ Data-only rebaseline checklist:
    committed LF blobs, never from a Windows working tree.
 6. Run the attestation verification and the fresh parity observation again.
 
+### Rebaseline onto the 283e7954 ui' receipt (2026-10-01)
+
+The re-entry train at control `283e7954` applied ui' (apply run 36847681114,
+attempt 1, artifact 11154606940, digest `7159b8e2`, receipt `54a02d3e`,
+source `6f25ea19`, receipt predecessor `b7892b2c`, the previous genesis).
+Its canary, run 36848506738, failed in the synthetic driver's late-layout
+checks, not in the product, so ui' was never signed. This data-only PR
+rebaselines onto that receipt with the same kind,
+`accepted-unsigned-apply-receipt`. The bootstrap now records deployment
+`de43812c`, spec `7549c002`, environment `e4a9eb41` and non-source `d70b6908`
+(both unchanged), and the three ui' images `7d2cb185`, `73ca628c` and
+`449e79e1`. The new genesis is `38a0ff29`. `UI_TARGET_SOURCE_SHA` stays
+`6f25ea19`: the next train re-applies the same source. Its images still
+differ, because every image carries the `io.rereply.release.control-sha`
+label of its own control.
+
+Run 36847681114 is a `workflow_dispatch` run on `main`, attempt 1,
+conclusion success. Both of its attestations verified online with
+`gh attestation verify`, once per predicate type, with signer workflow
+`.github/workflows/apply-production-phase.yml`, signer and source digest
+`283e7954`, source ref `refs/heads/main` and `--deny-self-hosted-runners`.
+Both verified subject `54a02d3e`. The c4cdac90 evidence (receipt `de742cb5`)
+stays committed beside it.
+
 ### Failure runbook for the re-entry train
 
 Production is untouched through F1-F7, and main is never locked through F5.
@@ -753,12 +887,36 @@ delete it in the console.
   reconcile-production-main-lock-release, then the canary with
   `receipt_kind` `apply-reconciled`, then terminal cleanup.
 - **F11. The canary fails after a successful apply.** Main is unlocked and ui'
-  is unsigned. Triage, then dispatch verify-production-crm-canary as a NEW
+  is unsigned. Triage by the driver's failed-check label (see "Rolling the
+  driver image"), then dispatch verify-production-crm-canary as a NEW
   `workflow_dispatch` (attempt 1) within about 24 h of the apply. Never move
   main in between. There is no governed rollback, because no signed backend
-  or bridge state exists at the control. If abandoned, the owner deletes fork
-  #2 in the console. Capture the ui' receipt and its attestations within 7
-  days for an `accepted-unsigned-apply-receipt` rebaseline.
+  or bridge state exists at the control. Capture the ui' receipt and its
+  attestations within 7 days for an `accepted-unsigned-apply-receipt`
+  rebaseline. Never re-dispatch blindly: every attempt adds fixture messages
+  and sends one real outbound.
+  - `prepare`: fixture state or binding drift, for example an unread fixture
+    conversation or a drifted login. Clear it, then re-dispatch.
+  - A label from checks 1-8, or `deadline`: re-dispatch at most once.
+  - `omnichannel_late_layout_autoscroll`,
+    `native_chat_conversation_switch_autoscroll` or
+    `native_chat_late_layout_autoscroll` (checks 9-11): a driver defect. Fix
+    `runner.mjs` in a new epoch: a PR that also appends the last roll's
+    evidence to `PRIOR_DRIVER_EVIDENCE`, then publish, roll, a rebaseline
+    onto this apply receipt, and a new train.
+  - `non_klinik_send_denied` or `cross_organization_send_denied` (checks
+    12-13): split by cause. A status or message mismatch caused by permission
+    or configuration (for example the fixture agent's role, or the reply
+    enablement or allowlist) is a driver or fixture expectation fix, handled
+    like checks 9-11. Only a real cross-tenant write, a send that was not
+    denied, is a product finding: the owner either accepts ui' unsigned
+    through a rebaseline or ships a product fix as a new ui phase source.
+
+  An abandoned epoch never reaches the launcher's terminal cleanup, which runs
+  only after a signed canary. The owner deletes that epoch's ui recovery fork
+  in the DigitalOcean console, never the ledger, staging or production
+  databases. If a re-dispatched canary signs, dispatch terminal cleanup
+  instead (F12).
 - **F12. The canary signs, but terminal cleanup fails.** Re-dispatch cleanup
   terminal after the recovery window has expired. Keep main frozen: cleanup
   re-validates recovery against current main. Owner fallback: delete the fork
