@@ -528,6 +528,22 @@ run 36773451426 attempt 1. Run 36773451426 is a `workflow_dispatch` run on
 merging any rebaseline: the committed bundles below are bound offline but are
 not cryptographically re-verified by the tests.
 
+The committed bundle files themselves were then verified the same way, using
+their bytes instead of the attestations API, once per predicate type:
+
+```sh
+gh attestation verify release/deployment/live-evidence/production-phase-apply-receipt-36773451426-1.json \
+  --bundle release/deployment/live-evidence/production-phase-apply-receipt-36773451426-1.predicate-<receipt-v1|slsa-provenance-v1>.sigstore.json \
+  --repo medtechcorps-netizen/whatomate \
+  --signer-workflow medtechcorps-netizen/whatomate/.github/workflows/apply-production-phase.yml \
+  --signer-digest <full c4cdac90 SHA> --source-digest <full c4cdac90 SHA> \
+  --source-ref refs/heads/main --deny-self-hosted-runners \
+  --predicate-type <predicate type> --format json
+```
+
+Both verified subject `de742cb5` for run 36773451426 attempt 1. Run the same
+command on every future rebaseline's committed evidence before merging it.
+
 A fresh GET-only observation on 2026-10-01 (two identical reads 60 s apart)
 matched the receipt after-state: deployment `b7de68d8`, spec `abd19b50`,
 environment `e4a9eb41`, non-source `d70b6908` and all three images, with no
