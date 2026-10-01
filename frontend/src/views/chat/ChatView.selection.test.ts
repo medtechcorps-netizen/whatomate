@@ -1208,6 +1208,74 @@ describe('ChatView conversation selection', () => {
       .toBe('Resume AI')
   })
 
+  it.each([
+    [404, 'Agent not found'],
+    [400, 'Agent is currently away'],
+  ])('retries a pause without self-assignment when the backend answers %s %s', async (status, message) => {
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      resource === 'transfers' && (action === 'read' || action === 'write'),
+    )
+    mocks.contactsStore!.contacts[0].whatsapp_account = 'clinic-account'
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    const transfer = {
+      id: 'transfer-first',
+      contact_id: 'first',
+      status: 'active',
+      source: 'manual',
+      transferred_by: 'agent-1',
+      transferred_at: '2026-01-01T00:00:00Z',
+      sla_breached: false,
+      escalation_level: 0,
+    }
+    mocks.createTransfer
+      .mockRejectedValueOnce({ response: { status, data: { message } } })
+      .mockResolvedValueOnce({ data: { data: { transfer } } })
+
+    wrapper = mountChatView()
+    await flushPromises()
+
+    await wrapper.find('[data-testid="conversation-ai-toggle"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.createTransfer).toHaveBeenCalledTimes(2)
+    expect(mocks.createTransfer.mock.calls[0][0]).toMatchObject({ agent_id: 'agent-1' })
+    expect(mocks.createTransfer.mock.calls[1][0]).not.toHaveProperty('agent_id')
+    expect(mocks.createTransfer.mock.calls[1][0]).toMatchObject({
+      contact_id: 'first',
+      whatsapp_account: 'clinic-account',
+      source: 'manual',
+    })
+    expect(mocks.upsertTransfer).toHaveBeenCalledWith(transfer)
+    expect(mocks.toastSuccess).toHaveBeenCalledWith('AI replies paused', {
+      description: 'This conversation is now in the team handover queue.',
+    })
+    expect(wrapper.find('[data-testid="conversation-ai-toggle"]').attributes('aria-label'))
+      .toBe('Resume AI')
+  })
+
+  it.each([
+    [404, 'Contact not found'],
+    [409, 'Contact already has an active transfer'],
+    [403, "You don't have permission to create transfers"],
+  ])('does not retry a pause rejected with %s %s', async (status, message) => {
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      resource === 'transfers' && (action === 'read' || action === 'write'),
+    )
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.createTransfer.mockRejectedValueOnce({ response: { status, data: { message } } })
+
+    wrapper = mountChatView()
+    await flushPromises()
+
+    await wrapper.find('[data-testid="conversation-ai-toggle"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.createTransfer).toHaveBeenCalledTimes(1)
+    expect(mocks.upsertTransfer).not.toHaveBeenCalled()
+    expect(wrapper.find('[data-testid="conversation-ai-toggle"]').attributes('aria-label'))
+      .toBe('Pause AI')
+  })
+
   it('resumes a selected contact transfer owned by the current agent', async () => {
     mocks.hasPermission.mockImplementation((resource: string, action: string) =>
       resource === 'transfers' && (action === 'read' || action === 'write'),

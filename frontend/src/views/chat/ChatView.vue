@@ -1626,23 +1626,48 @@ async function assignContactToUser(userId: string | null) {
   }
 }
 
+// The backend checks a self-assigned pause against the user's home organization
+// and availability. Members working in another clinic organization, or marked
+// away, get one of these rejections before anything is written, so the pause is
+// retried once without agent_id; the user still owns it through transferred_by.
+function isSelfAssignmentRejected(error: any): boolean {
+  const status = error?.response?.status
+  const message = error?.response?.data?.message
+  return (status === 404 && message === 'Agent not found')
+    || (status === 400 && message === 'Agent is currently away')
+}
+
 async function transferToAgent() {
   const contact = contactsStore.currentContact
   if (!contact || !canCreateManualTransfer.value) return
 
   isTransferring.value = true
   try {
-    const response = await chatbotService.createTransfer({
+    const request = {
       contact_id: contact.id,
       whatsapp_account: selectedAccount.value || (contact as any).whatsapp_account || '',
-      ...(authStore.user?.id ? { agent_id: authStore.user.id } : {}),
       source: 'manual',
-    })
+    }
+    const selfID = authStore.user?.id
+    let response
+    try {
+      response = await chatbotService.createTransfer({
+        ...request,
+        ...(selfID ? { agent_id: selfID } : {}),
+      })
+    } catch (error) {
+      if (!selfID || !isSelfAssignmentRejected(error)) throw error
+      response = await chatbotService.createTransfer(request)
+    }
     const createdTransfer = response.data.data?.transfer || response.data.transfer
     if (createdTransfer) transfersStore.upsertTransfer(createdTransfer)
-    toast.success('AI replies paused', {
-      description: 'This conversation is now handed over to a human.'
-    })
+    let description = 'This conversation is now handed over to a human.'
+    if (createdTransfer && !createdTransfer.agent_id) {
+      description = 'This conversation is now in the team handover queue.'
+    } else if (createdTransfer?.agent_id && selfID && createdTransfer.agent_id !== selfID) {
+      description = "This conversation was handed to the customer's assigned team member."
+    }
+    toast.success('AI replies paused', { description })
     await transfersStore.fetchActiveTransferForContact(contact.id)
   } catch (error: any) {
     toast.error('AI replies were not paused', {
