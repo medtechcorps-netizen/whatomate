@@ -78,8 +78,10 @@ EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
 )
 # 2026-10-01: the release gate's frontend audit policy (empty allow-list,
 # fail-closed on an incomplete npm audit report) is pinned byte for byte.
+# Re-pinned (was ebcfa2c6) only because step_block() now stops at the next job
+# header: the old digest also covered the following `containers:` job header.
 EXACT_RELEASE_FRONTEND_AUDIT_STEP_SHA256 = (
-    "ebcfa2c6bb286870d9685a5b5d70d0cd8bf12f759a1b8dbcedb2e0cf9a70a6b5"
+    "1b2b2ac7d5a1929e1dde7b276549ca9ded673d79af9d4237568e44ffbd0ab33f"
 )
 EXACT_CRM_CANARY_DRIVER_PUBLISHER_SHA256 = (
     "e221060ea125b6bd4e35eb0c1111311e8932a23de4dc4e59bb5671115cc7a510"
@@ -138,8 +140,11 @@ EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
     "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
 )
+# Re-pinned (was 30096cb7) only because step_block() now stops at the next job
+# header: the old digest also covered the following `cleanup:` job header. The
+# cleanup workflow bytes themselves are unchanged (EXACT_CLEANUP_WORKFLOW_SHA256).
 EXACT_CLEANUP_AUTHORITY_STEP_SHA256 = (
-    "30096cb73e5db041a6120d3ed4dcf6bb29169134713e2515e9baf32ee3179232"
+    "03840d7f1bbe901df5fd695f2365597a28d3572010325087450debbcd51cd056"
 )
 EXACT_GATE_B_TEST_JOB_SHA256 = {
     "release-controls": "79645bf97ed1574bcb760af561a525ffc028e2ea34e27b9ca51af177ba59590a",
@@ -171,8 +176,10 @@ def job_block(source: str, job: str) -> str:
 
 
 def step_block(source: str, name: str) -> str:
+    # A job's last step ends at the next job header, not at the next job's
+    # first step (which would fold that job's header into this step's bytes).
     match = re.search(
-        rf"(?ms)^      - name: {re.escape(name)}\s*$.*?(?=^      - name: |\Z)",
+        rf"(?ms)^      - name: {re.escape(name)}\s*$.*?(?=^      - name: |^  [A-Za-z0-9_-]+:\s*$|\Z)",
         source,
     )
     if match is None:
@@ -3487,7 +3494,11 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
             "high dev-only": (report(**{"build-tool": advisory("build-tool", "high")}), 1, 1),
             "registry error": ({"error": {"code": "E503", "summary": "unavailable"}}, 1, 1),
             "error beside an empty report": (dict(report(), error={"code": "E500"}), 1, 1),
+            "error object with exit 0": ({"error": {"code": "E503", "summary": "unavailable"}}, 0, 1),
+            "error beside an empty report with exit 0": (dict(report(), error={"code": "E500"}), 0, 1),
             "missing vulnerabilities": ({"auditReportVersion": 2, "metadata": {}}, 0, 1),
+            "empty vulnerabilities without metadata": (
+                {"auditReportVersion": 2, "vulnerabilities": {}}, 0, 1),
             "old report version": (dict(report(), auditReportVersion=1), 0, 1),
             "npm crashed": (report(), 2, 1),
             "exit 1 without findings": (report(), 1, 1),
