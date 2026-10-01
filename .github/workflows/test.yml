@@ -331,17 +331,11 @@ jobs:
           python3 - "$RUNNER_TEMP/frontend-audit.json" <<'AUDIT'
           import json, sys
 
-          # 2026-09-30: three brace-expansion advisories (GHSA-q2hr-2g5m-vwhr,
-          # GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p) affect the locked 5.0.9,
-          # a dev-only transitive build dependency that never ships in the
-          # built bundle. They are allowed only while every locked instance is
-          # dev-only; any other high or critical advisory still fails. Remove
-          # this list with the next lockfile refresh.
-          ALLOWED = {
-              ("brace-expansion", "Quadratic-time expansion of the `{a},b}` rewrite causes CPU denial of service"),
-              ("brace-expansion", "DoS via uncontrolled recursion on nested brace groups causing stack exhaustion"),
-              ("brace-expansion", "DoS via uncontrolled recursion in parseCommaParts causing stack exhaustion"),
-          }
+          # 2026-10-01: the lockfile refresh (axios 1.20.0, brace-expansion
+          # 5.0.12) retired the 2026-09-30 brace-expansion exceptions, so the
+          # list is empty and every high or critical advisory fails. A future
+          # exception must name the advisory here and stay dev-only.
+          ALLOWED = set()
           LOCK = json.load(open("package-lock.json", encoding="utf-8"))
 
           def dev_only(package):

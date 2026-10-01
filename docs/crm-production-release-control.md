@@ -8,9 +8,9 @@ release evidence, and changing production are three separate authorities.
 
 The final `ui` phase is bound to one immutable Git identity:
 
-- commit: `1911174a746e0cc70fd246e6c1f45bc65ba12946`
-- root tree: `eaba0b104abc04500776aafb680993d3d7065748`
-- `frontend` tree: `09b0efe5124317d2d5561548f1082b8902144d58`
+- commit: `6f25ea1919ee28856dee59d5fd121671214087e3`
+- root tree: `2a2c14e83f4524d860a65a8735c16111178e7fd3`
+- `frontend` tree: `4e027a24fcb34c2b4951d2c628dd63a3c67cc87e`
 - `internal` tree: `a43572db8ee7e5a7cf2ccaf3e880a181c91ed183`
 
 Refreshed 2026-09-16: the previous binding `20a47384` hung the full Go race job
@@ -33,6 +33,18 @@ that checkout does not contain the complete reviewed final UI product tree.
 The already-live production bootstrap remains bound to the old `4f65abeb`
 source and its deployed image digests; the new baseline child is a target, not
 a rewrite of observed production history.
+
+Refreshed 2026-10-01: twelve axios advisories published 2026-09-30 failed every
+phase source's frontend audit (axios is a production dependency, so it cannot
+be allow-listed). Four new immutable children of `3cedc58f`, `0e805531`,
+`2cd61627`, and `1911174a` change only `frontend/package.json` and
+`frontend/package-lock.json`: axios 1.18.1 to 1.20.0, dompurify 3.4.13 to
+3.4.16, brace-expansion 5.0.9 to 5.0.12, and, for the baseline, bridge and
+backend lockfile, js-yaml 4.3.1 to 4.3.2. The children are `0267981e`,
+`0804f91e`, `78632dc4`, and `6f25ea19`, kept on the
+`claude/rebaseline-<phase>-deps-20261001` branches. Their `internal` trees are
+unchanged, so every phase keeps its compile-time database role and Go source.
+The frontend audit allow-lists are now empty.
 
 The release contains Klinik-only WhatsApp reply hardening and the existing
 authorized-client realtime, unread-marker, and late-layout autoscroll fixes.

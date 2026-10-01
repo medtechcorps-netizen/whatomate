@@ -84,9 +84,9 @@ jobs:
               # the full Go race job for 40 minutes in the same test (baseline
               # validation run 35154343269).
               # Current child adds only the reviewed Embedded Signup name fix.
-              source_sha="3cedc58fad2cabe7c63646f6ad10ca4d8dc1f2b9"
-              root_tree="e68b752b45361dcd2d91ed4be91f509a3aa1719b"
-              frontend_tree="3a05b5d1ab184bb1cd674d02e1bf14f834d266ae"
+              source_sha="0267981e3396178a8b343fd7a091ca98f631d0f4"
+              root_tree="6f9b6eb60306461b55cdb4d77412ea6c751f012f"
+              frontend_tree="6974feb5616df9758ab6d2456a94106da8b9bc6b"
               internal_tree="1a66931fc6b9d91daae09f71f092c294215815b3"
               ;;
             bridge)
@@ -95,9 +95,9 @@ jobs:
               # same tree as the previous pin dbda639b plus the reviewed bounded
               # bootstrap dry-run lock test fix (50303c11).
               # Current child adds only the reviewed Embedded Signup name fix.
-              source_sha="0e805531cf8b1dd3f1df0f637b214c28b169a30f"
-              root_tree="4da989a2f2dbff05021532891e20136a15c1778c"
-              frontend_tree="3a05b5d1ab184bb1cd674d02e1bf14f834d266ae"
+              source_sha="0804f91e4f40065406e9343149b578133519a962"
+              root_tree="9dd1ba3d8f711fbce826f4aea6b7a53cf25579c3"
+              frontend_tree="6974feb5616df9758ab6d2456a94106da8b9bc6b"
               internal_tree="353617ae6a72adc0c896434d2dfe97cf903245c8"
               ;;
             backend)
@@ -111,9 +111,9 @@ jobs:
               # TestBootstrapAtomicallyCreatesPurposeOrganizationAndIsExactlyIdempotent,
               # twice, which no retry could clear.
               # Current child adds only the reviewed Embedded Signup name fix.
-              source_sha="2cd616279c2548e0483e8e6b545812e98aefebbf"
-              root_tree="5a16091bef92d9d25d39014cd90844fc240d34f6"
-              frontend_tree="3a05b5d1ab184bb1cd674d02e1bf14f834d266ae"
+              source_sha="78632dc4ff23e10bf8b78abb543b14dce511bca3"
+              root_tree="52689d59ba7f4349bd619e00d9c55a028e505aeb"
+              frontend_tree="6974feb5616df9758ab6d2456a94106da8b9bc6b"
               internal_tree="6db4f94130788bdb236ede130a0601fa7d4163c1"
               ;;
             ui)
@@ -125,9 +125,9 @@ jobs:
               # identical. The previous pin hung the full Go race job for 40
               # minutes in the same test (ui validation run 35093373191).
               # Current child adds only the reviewed Embedded Signup name fix.
-              source_sha="1911174a746e0cc70fd246e6c1f45bc65ba12946"
-              root_tree="eaba0b104abc04500776aafb680993d3d7065748"
-              frontend_tree="09b0efe5124317d2d5561548f1082b8902144d58"
+              source_sha="6f25ea1919ee28856dee59d5fd121671214087e3"
+              root_tree="2a2c14e83f4524d860a65a8735c16111178e7fd3"
+              frontend_tree="4e027a24fcb34c2b4951d2c628dd63a3c67cc87e"
               internal_tree="a43572db8ee7e5a7cf2ccaf3e880a181c91ed183"
               ;;
             *)
@@ -770,41 +770,15 @@ jobs:
           python3 - "$RUNNER_TEMP/frontend-audit.json" <<'AUDIT'
           import json, sys
 
-          # Reviewed phase-source audit policy (2026-09-16).
+          # Reviewed phase-source audit policy.
           #
-          # The baseline, bridge and backend snapshots pin frontend lockfile
-          # tree 3a05b5d1..., which carries one high advisory in a dev-only,
-          # transitive build dependency: js-yaml 4.3.1 (fixed in 4.3.2),
-          # maximum merge-key CPU exhaustion. It never ships in the built
-          # bundle, and the newer ui snapshot's lockfile already resolves it,
-          # so the exception is explicitly listed and tracked for the next
-          # phase refresh. Every other high or critical advisory still fails.
-          #
-          # 2026-09-30: three brace-expansion 5.0.9 advisories (quadratic
-          # `{a},b}` rewrite; unbounded recursion on nested brace groups and
-          # in parseCommaParts) were published after the reviewed snapshots.
-          # brace-expansion is a dev-only transitive build dependency in every
-          # phase lockfile (3a05b5d1... and 09b0efe5...) and never ships in the
-          # built bundle; it is tracked for the next phase refresh as well.
-          # Any allowed advisory must also be dev-only in this exact lockfile.
-          ALLOWED = {
-              (
-                  "js-yaml",
-                  "maxTotalMergeKeys does not limit CPU use for empty merge sources",
-              ),
-              (
-                  "brace-expansion",
-                  "Quadratic-time expansion of the `{a},b}` rewrite causes CPU denial of service",
-              ),
-              (
-                  "brace-expansion",
-                  "DoS via uncontrolled recursion on nested brace groups causing stack exhaustion",
-              ),
-              (
-                  "brace-expansion",
-                  "DoS via uncontrolled recursion in parseCommaParts causing stack exhaustion",
-              ),
-          }
+          # 2026-10-01: every phase source was refreshed to axios 1.20.0,
+          # dompurify 3.4.16, brace-expansion 5.0.12 and js-yaml 4.3.2, which
+          # retires the earlier js-yaml (2026-09-16) and brace-expansion
+          # (2026-09-30) dev-only exceptions. The allow-list is empty: every
+          # high or critical advisory fails. A future exception must name the
+          # advisory here and must also be dev-only in this exact lockfile.
+          ALLOWED = set()
           LOCK = json.load(open("package-lock.json", encoding="utf-8"))
 
           def dev_only(package):

@@ -80,7 +80,7 @@ PRODUCTION_APP_ID_SHA256 = (
 PRODUCTION_DEFAULT_INGRESS_SHA256 = (
     "05ab4f90194ad37c6926138e9aafbd49c73aa75d08da92b0b1309bfce207cfa8"
 )
-BASELINE_TARGET_SOURCE_SHA = "3cedc58fad2cabe7c63646f6ad10ca4d8dc1f2b9"
+BASELINE_TARGET_SOURCE_SHA = "0267981e3396178a8b343fd7a091ca98f631d0f4"
 # The production bootstrap is the state the platform is actually in. It was
 # re-baselined on 2026-09-18 onto the already-applied baseline phase, so it now
 # carries immutable image authority instead of the retired legacy git sources.
