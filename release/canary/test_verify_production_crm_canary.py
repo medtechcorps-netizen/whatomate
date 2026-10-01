@@ -671,6 +671,38 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(state["evidence"]["canary_sha256"], digest("f"))
         self.assertEqual(state["control"]["workflow_path"], canary.WORKFLOW_PATH)
 
+    def test_genesis_reentry_receipt_signs_a_ui_phase_state(self) -> None:
+        value = receipt("ui")
+        value["lineage"].update(
+            {"event_sequence": 1, "from": "genesis", "predecessor_kind": "genesis"}
+        )
+        value["before"] = provider_state(legacy=False)
+        receipt_hash = hashlib.sha256(canary.canonical_file_bytes(value)).hexdigest()
+        state = canary.build_phase_state(
+            value,
+            descriptor(receipt_hash),
+            release=release,
+            canary_sha256=digest("f"),
+            control_sha="a" * 40,
+            run_id="4001",
+            run_attempt=1,
+            completed_at="2026-08-27T01:02:00Z",
+            policy_sha256=value["control"]["release_policy_sha256"],  # type: ignore[index]
+            schema_sha256=value["control"]["change_schema_sha256"],  # type: ignore[index]
+        )
+        self.assertEqual(
+            {key: state["lineage"][key] for key in ("event_sequence", "phase_ordinal", "from", "to", "predecessor_kind")},
+            {"event_sequence": 1, "phase_ordinal": 4, "from": "genesis", "to": "ui", "predecessor_kind": "apply-receipt"},
+        )
+        release.validate_phase_state(state)
+        for change in ({"event_sequence": 2}, {"from": "backend", "predecessor_kind": "phase-state"}):
+            bad = copy.deepcopy(value)
+            bad["lineage"].update(change)  # type: ignore[union-attr]
+            if change.get("from") == "backend":
+                bad["lineage"]["event_sequence"] = 1  # type: ignore[index]
+            with self.assertRaises(release.ReleaseError):
+                release.validate_apply_receipt(bad)
+
     def test_reconciled_phase_state_binds_original_receipt_and_reconciliation(self) -> None:
         value = receipt("baseline")
         receipt_hash = hashlib.sha256(canary.canonical_file_bytes(value)).hexdigest()

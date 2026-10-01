@@ -50,6 +50,7 @@ class FakeReader:
         self.signature_valid = True
         self.signatures = []
         self.latest_state = "20"
+        self.genesis = "baseline"
         self.fixture_body = encoded({"kind": "crm-canary-fixture-provisioning",
             "state": "allowlist_deployment_verified", "control_sha": ORIGIN,
             "origin": {"run_id": "10"}, "fixture_descriptor_sha256": "c" * 64})
@@ -82,8 +83,10 @@ class FakeReader:
 
     def context(self, phase="baseline"):
         return guard.LaunchContext(CONTROL, phase, encoded(self.fixture),
-            None if phase == "baseline" else encoded(self.predecessor),
-            None if phase == "baseline" else self.state_body)
+            None if phase == self.genesis else encoded(self.predecessor),
+            None if phase == self.genesis else self.state_body)
+
+    def reviewed_genesis_phase(self): return self.genesis
 
     def current_main_sha(self): return self.main
     def worktree_sha(self): return self.worktree
@@ -228,6 +231,68 @@ class GuardTests(unittest.TestCase):
         self.reader.inventory = guard.RunInventory([], guard.BLOCKING_STATUSES, True)
         self.reader.identities.pop(self.reader.canary_id)
         with self.assertRaises(guard.LaunchBlocked): guard.production_lock_busy(self.reader)
+
+    def test_live_ui_genesis_launch_supplies_no_predecessor(self):
+        self.reader.genesis = "ui"
+        guard.require_launch_ready(self.reader, self.reader.context("ui"))
+        self.assertEqual(len(self.reader.signatures), 2)
+        with self.assertRaisesRegex(guard.LaunchBlocked, "genesis-must-not-supply-predecessor"):
+            guard.require_launch_ready(self.reader, guard.LaunchContext(CONTROL, "ui", encoded(self.reader.fixture),
+                encoded(self.reader.predecessor), self.reader.state_body))
+
+    def record_reads(self):
+        """Record every adapter read in order; evidence reads are distinguished."""
+        calls = []
+
+        def recorded(name, method):
+            def call(*args, **kwargs):
+                calls.append(name)
+                return method(*args, **kwargs)
+            return call
+
+        for name in ("current_main_sha", "worktree_sha", "reviewed_genesis_phase",
+                     "canary_secret_metadata", "workflow_identities", "active_runs",
+                     "fixture_public_authority", "artifact_metadata", "artifact_archive",
+                     "run_metadata", "run_jobs", "latest_successful_state_run_id",
+                     "verify_attestation"):
+            setattr(self.reader, name, recorded(name, getattr(self.reader, name)))
+        return calls
+
+    def test_phase_below_the_reviewed_live_phase_is_refused_before_evidence_reads(self):
+        for phase in ("baseline", "bridge", "backend"):
+            for with_predecessor in (False, True):
+                with self.subTest(phase=phase, predecessor=with_predecessor):
+                    self.reader = FakeReader()
+                    self.reader.genesis = "ui"
+                    calls = self.record_reads()
+                    context = guard.LaunchContext(CONTROL, phase, encoded(self.reader.fixture),
+                        *((encoded(self.reader.predecessor), self.reader.state_body)
+                          if with_predecessor else (None, None)))
+                    with self.assertRaisesRegex(guard.LaunchBlocked, "phase-precedes-reviewed-live-phase"):
+                        guard.require_launch_ready(self.reader, context)
+                    # Only the checkout authentication precedes the refusal: no
+                    # secret metadata, lock, fixture, predecessor or signature read.
+                    self.assertEqual(calls, ["current_main_sha", "worktree_sha", "reviewed_genesis_phase"])
+                    self.assertEqual(self.reader.signatures, [])
+
+    def test_control_is_authenticated_before_the_reviewed_live_phase_is_read(self):
+        calls = self.record_reads()
+        guard.require_launch_ready(self.reader, self.reader.context())
+        self.assertEqual(calls[:3], ["current_main_sha", "worktree_sha", "reviewed_genesis_phase"])
+        self.assertEqual(calls.count("reviewed_genesis_phase"), 1)
+        for field in ("main", "worktree"):
+            with self.subTest(field=field):
+                self.reader = FakeReader()
+                setattr(self.reader, field, ORIGIN)
+                calls = self.record_reads()
+                with self.assertRaisesRegex(guard.LaunchBlocked, "control-mismatch"):
+                    guard.require_launch_ready(self.reader, self.reader.context())
+                # An unauthenticated checkout's code is never executed.
+                self.assertNotIn("reviewed_genesis_phase", calls)
+
+    def test_reviewed_genesis_phase_must_be_a_phase(self):
+        self.reader.genesis = "genesis"
+        self.blocked()
 
     def test_bridge_authenticates_predecessor_signatures_control_and_latest_run(self):
         guard.require_launch_ready(self.reader, self.reader.context("bridge"))
@@ -486,11 +551,58 @@ class AdapterTests(unittest.TestCase):
         self.adapter._fixture._verify_fixture_producer_compatibility.assert_not_called()
 
     def test_predecessor_callback_reauthenticates_before_return(self):
+        self.adapter.reviewed_genesis_phase = Mock(return_value="baseline")
         context = guard.LaunchContext(CONTROL, "bridge", b"{}", b"{}", b"state")
         with patch.object(guard, "require_current_control") as control, patch.object(guard, "descriptor", return_value={}), patch.object(guard, "_predecessor") as verify:
             self.assertEqual(self.adapter.authenticate_predecessor(context), b"state")
             self.assertEqual(control.call_count, 2)
             verify.assert_called_once_with(self.adapter, context, {})
+
+    def test_genesis_callback_follows_the_reviewed_live_phase(self):
+        self.adapter.reviewed_genesis_phase = Mock(return_value="ui")
+        with patch.object(guard, "require_current_control"), patch.object(guard, "_predecessor") as verify:
+            self.assertIsNone(self.adapter.authenticate_predecessor(guard.LaunchContext(CONTROL, "ui", b"{}")))
+            verify.assert_not_called()
+            with self.assertRaises(guard.LaunchBlocked):
+                self.adapter.authenticate_predecessor(guard.LaunchContext(CONTROL, "ui", b"{}", b"{}", b"state"))
+            # A phase below the reviewed live phase never reaches predecessor reads.
+            for phase in ("baseline", "bridge", "backend"):
+                with self.subTest(phase=phase), self.assertRaisesRegex(
+                        guard.LaunchBlocked, "phase-precedes-reviewed-live-phase"):
+                    self.adapter.authenticate_predecessor(
+                        guard.LaunchContext(CONTROL, phase, b"{}", b"{}", b"state"))
+            verify.assert_not_called()
+
+    def test_genesis_callback_authenticates_control_before_the_live_phase(self):
+        order = []
+        self.adapter.reviewed_genesis_phase = Mock(side_effect=lambda: order.append("genesis") or "ui")
+        with patch.object(guard, "require_current_control",
+                          side_effect=lambda *args: order.append("control")):
+            self.adapter.authenticate_predecessor(guard.LaunchContext(CONTROL, "ui", b"{}"))
+        self.assertEqual(order, ["control", "genesis"])
+
+    def test_reviewed_genesis_phase_comes_from_the_pinned_parity_loader(self):
+        self.adapter.root = Path(__file__).resolve().parents[2]
+        self.adapter._parity = None
+        self.adapter._read_private_inputs = None
+        self.adapter.worktree_sha = Mock(return_value=CONTROL)
+        self.adapter.current_main_sha = Mock(return_value=CONTROL)
+        self.assertEqual(self.adapter.reviewed_genesis_phase(), "ui")
+
+    def test_reviewed_genesis_phase_authenticates_the_checkout_before_executing_it(self):
+        self.adapter.root = Path(__file__).resolve().parents[2]
+        self.adapter._parity = None
+        self.adapter._read_private_inputs = None
+        self.adapter._load_parity = Mock(side_effect=AssertionError("checkout code executed"))
+        self.adapter.worktree_sha = Mock(return_value=CONTROL)
+        self.adapter.current_main_sha = Mock(return_value="b" * 40)
+        with self.assertRaisesRegex(guard.LaunchBlocked, "launch-checkout-is-not-current-main"):
+            self.adapter.reviewed_genesis_phase()
+        del self.adapter.worktree_sha
+        self.adapter.candidate_audit = True
+        with self.assertRaisesRegex(guard.LaunchBlocked, "candidate-audit-is-not-launch-authority"):
+            self.adapter.reviewed_genesis_phase()
+        self.adapter._load_parity.assert_not_called()
 
     def test_public_fixture_api_returns_authenticated_bytes_and_rechecks_control(self):
         with patch.object(guard, "require_current_control") as control, patch.object(guard, "descriptor", return_value={}), patch.object(guard, "_fixture", return_value=b"signed-public-result") as verify:

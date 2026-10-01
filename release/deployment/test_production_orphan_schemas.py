@@ -805,5 +805,77 @@ class ReconciliationSchemaTests(unittest.TestCase):
             self.assertEqual(gates["migration_succeeded"], {"const": False})
 
 
+class GenesisReentrySchemaTests(unittest.TestCase):
+    """The schemas' activate branches must agree with the runtime edge rule."""
+
+    @staticmethod
+    def matches(branch: dict, lineage: dict) -> bool:
+        for key, rule in branch["properties"].items():
+            value = lineage[key]
+            if "const" in rule and value != rule["const"]:
+                return False
+            if rule.get("type") == "integer" and type(value) is not int:
+                return False
+            if "minimum" in rule and value < rule["minimum"]:
+                return False
+        return True
+
+    def test_activate_branches_agree_with_the_runtime_validator(self) -> None:
+        import sys as _sys
+        _sys.path.insert(0, str(ROOT))
+        import verify_production_release as release
+
+        expected_reentry = {"properties": {
+            "event_sequence": {"const": 1}, "from": {"const": "genesis"}, "phase": {"const": "ui"},
+            "phase_ordinal": {"const": 4}, "predecessor_kind": {"const": "genesis"}, "to": {"const": "ui"},
+        }}
+        for path, index in ((INTENT_PATH, 0), (RECONCILIATION_PATH, 3)):
+            schema = load_schema(path)
+            refs = schema["allOf"][index]["then"]["properties"]["lineage"]["oneOf"]
+            self.assertEqual([item["$ref"].rsplit("/", 1)[1] for item in refs], [
+                "activateBaselineLineage", "activateBridgeLineage", "activateBackendLineage",
+                "activateUiLineage", "activateUiFromGenesisLineage",
+            ])
+            self.assertEqual(schema["$defs"]["activateUiFromGenesisLineage"], expected_reentry)
+            branches = [schema["$defs"][item["$ref"].rsplit("/", 1)[1]] for item in refs]
+            for source in ("genesis", "baseline", "bridge", "backend", "ui"):
+                for target in release.PHASES:
+                    for sequence in (1, 2, 5):
+                        for kind in ("genesis", "phase-state"):
+                            lineage = {
+                                "event_sequence": sequence, "phase_ordinal": release.PHASES.index(target) + 1,
+                                "operation": "activate", "from": source, "to": target,
+                                "predecessor_kind": kind, "predecessor_state_sha256": "a" * 64,
+                                "phase": target, "phase_source_sha": "b" * 40,
+                            }
+                            try:
+                                release._validate_intent_lineage(dict(lineage), "activate")
+                                runtime = True
+                            except release.ReleaseError:
+                                runtime = False
+                            hits = sum(self.matches(branch, lineage) for branch in branches)
+                            with self.subTest(schema=path.name, lineage=(source, target, sequence, kind)):
+                                self.assertEqual(hits, 1 if runtime else 0)
+        self.assertEqual(
+            {k: v for k, v in load_schema(INTENT_PATH)["$defs"].items() if k.startswith(("activate", "rollback"))},
+            {k: v for k, v in load_schema(RECONCILIATION_PATH)["$defs"].items() if k.startswith(("activate", "rollback"))},
+        )
+
+    def test_reentry_lineage_validates_under_json_schema_when_available(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is unavailable")
+        schema = load_schema(INTENT_PATH)
+        branch = {"$defs": schema["$defs"], **schema["allOf"][0]["then"]["properties"]["lineage"]}
+        good = {"event_sequence": 1, "phase_ordinal": 4, "operation": "activate", "from": "genesis", "to": "ui",
+                "predecessor_kind": "genesis", "predecessor_state_sha256": "a" * 64, "phase": "ui",
+                "phase_source_sha": "b" * 40}
+        jsonschema.Draft202012Validator(branch).validate(good)
+        for change in ({"event_sequence": 2}, {"from": "backend"}, {"predecessor_kind": "phase-state"}):
+            with self.subTest(change=change), self.assertRaises(jsonschema.ValidationError):
+                jsonschema.Draft202012Validator(branch).validate({**good, **change})
+
+
 if __name__ == "__main__":
     unittest.main()

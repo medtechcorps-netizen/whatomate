@@ -33,8 +33,10 @@ def binding(run_id: str, artifact_id: str, name: str, sha256: str = HASH) -> dic
     }
 
 
-def request_and_receipt(operation: str = "apply") -> tuple[dict, dict]:
-    receipt = release_fixtures.apply_receipt()
+def request_and_receipt(
+    operation: str = "apply", receipt_factory=release_fixtures.apply_receipt
+) -> tuple[dict, dict]:
+    receipt = receipt_factory()
     if operation == "rollback":
         receipt["authority"] = "production-phase-rollback-receipt"
         receipt["control"]["workflow_path"] = ".github/workflows/rollback-production-phase.yml"
@@ -111,6 +113,19 @@ class ReleaseAuthorizationTests(unittest.TestCase):
         self.assertIs(
             authorization.validate_authorization(
                 value, receipt=receipt, now=ISSUED + dt.timedelta(seconds=599, microseconds=999999)
+            ),
+            value,
+        )
+
+    def test_builds_apply_authorization_for_a_genesis_reentry_receipt(self) -> None:
+        request, receipt = request_and_receipt(receipt_factory=release_fixtures.reentry_receipt)
+        self.assertEqual((receipt["lineage"]["from"], receipt["lineage"]["to"]), ("genesis", "ui"))
+        value = authorization.build_authorization(
+            request, receipt, now=ISSUED + dt.timedelta(seconds=1)
+        )
+        self.assertIs(
+            authorization.validate_authorization(
+                value, receipt=receipt, now=ISSUED + dt.timedelta(seconds=2)
             ),
             value,
         )

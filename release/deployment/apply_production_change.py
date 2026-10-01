@@ -777,13 +777,29 @@ def _require_recovery_plan_authority(
         common.fail("recovery production plan authority differs")
 
 
-def _plan_images(plan: Mapping[str, Any], rollout: Mapping[str, Any]) -> tuple[str, str, str, dict[str, str]]:
+def _plan_images(
+    plan: Mapping[str, Any],
+    rollout: Mapping[str, Any],
+    *,
+    contract_path: Path | None = None,
+) -> tuple[str, str, str, dict[str, str]]:
     transition = common.exact_keys(plan.get("transition"), {"operation", "from", "to", "ordinal"}, "production plan transition")
     if transition["operation"] != "activate":
         common.fail("production plan operation differs")
     target = common.validate_phase(transition["to"], "target phase")
     source = common.exact_string(transition["from"], "source phase")
-    if source != common.PREDECESSOR[target] or transition["ordinal"] != common.PHASES.index(target) + 1:
+    # Independent of the plan verifier: every activation of this genesis epoch,
+    # from any source, is at or above the live phase pinned by the exact
+    # contract the plan signed, and genesis enters exactly at that phase.
+    live = contract_genesis_phase(_signed_contract(plan, contract_path=contract_path))
+    if common.PHASES.index(target) < common.PHASES.index(live):
+        common.fail("production activation precedes the reviewed live phase")
+    if source == "genesis":
+        if target != live:
+            common.fail("production activation sequence differs")
+    elif source != common.PREDECESSOR[target]:
+        common.fail("production activation sequence differs")
+    if transition["ordinal"] != common.PHASES.index(target) + 1:
         common.fail("production activation sequence differs")
     target_object = plan.get("target")
     if type(target_object) is not dict or target_object.get("phase") != target:
@@ -840,7 +856,7 @@ def _validate_predecessor(
             or predecessor_sha256 is not None
             or before["source_mode"] not in {"legacy-git", "digest-images"}
         ):
-            common.fail("baseline genesis state differs")
+            common.fail("genesis predecessor state differs")
         common.require_sha256(signed_predecessor_sha256, "signed genesis state hash")
         return
     if predecessor is None or predecessor_sha256 is None:
@@ -962,15 +978,18 @@ def _full_binding(value: Mapping[str, Any], artifact_name: str) -> dict[str, Any
 
 
 CONTRACT_PATH = Path(__file__).resolve().with_name("production-app-contract.json")
+# The live phase the reviewed production contract pins. It mirrors
+# verify_production_plan.BOOTSTRAP_LIVE_PHASE (cross-tested), so apply refuses a
+# digest contract that claims any other live phase even if a plan signed it.
+APPLY_REVIEWED_LIVE_PHASE = "ui"
 
 
-def _bootstrap_images(
+def _signed_contract(
     plan: Mapping[str, Any], *, contract_path: Path | None = None
-) -> list[dict[str, str]]:
-    """Return the re-baselined bootstrap image authority the plan was built on."""
+) -> dict[str, Any]:
+    """Load the production contract only if it is the exact one the plan signed."""
     path = contract_path or CONTRACT_PATH
     raw = path.read_bytes()
-    contract = common.loads_strict(raw.decode("utf-8"))
     control = plan.get("control")
     if type(control) is not dict:
         common.fail("production plan control is malformed")
@@ -978,9 +997,36 @@ def _bootstrap_images(
         control.get("contract_sha256"), "plan contract hash"
     ):
         common.fail("production contract differs from the signed plan")
-    bootstrap = contract.get("bootstrap_state")
-    if type(bootstrap) is not dict:
+    contract = common.loads_strict(raw)
+    if type(contract) is not dict or type(contract.get("bootstrap_state")) is not dict:
         common.fail("production contract bootstrap state is malformed")
+    return contract
+
+
+def contract_genesis_phase(contract: Mapping[str, Any]) -> str:
+    """The only phase a genesis activation may target under this contract.
+
+    A legacy git bootstrap predates every phase and enters at baseline. A
+    re-baselined digest bootstrap enters exactly at its reviewed live phase,
+    which must be APPLY_REVIEWED_LIVE_PHASE; it never re-enters at baseline.
+    """
+    bootstrap = contract["bootstrap_state"]
+    mode = bootstrap.get("source_mode")
+    if mode == "legacy-git" and "live_phase" not in bootstrap:
+        return common.PHASES[0]
+    if mode != "digest-images":
+        common.fail("production bootstrap source mode differs")
+    live = common.validate_phase(bootstrap.get("live_phase"), "production contract live phase")
+    if live != APPLY_REVIEWED_LIVE_PHASE or live not in common.GENESIS_ACTIVATION_TARGETS:
+        common.fail("production contract live phase is not the reviewed live phase")
+    return live
+
+
+def _bootstrap_images(
+    plan: Mapping[str, Any], *, contract_path: Path | None = None
+) -> list[dict[str, str]]:
+    """Return the re-baselined bootstrap image authority the plan was built on."""
+    bootstrap = _signed_contract(plan, contract_path=contract_path)["bootstrap_state"]
     if bootstrap.get("source_mode") != "digest-images":
         common.fail("production bootstrap does not carry image authority")
     images = bootstrap.get("images")
@@ -1088,7 +1134,9 @@ def prepare_apply_mutation_intent(
         plan, control, authorities["production_plan"],
         release_policy_sha256, change_schema_sha256,
     )
-    source_phase, target_phase, source_sha, target_digests = _plan_images(plan, rollout)
+    source_phase, target_phase, source_sha, target_digests = _plan_images(
+        plan, rollout, contract_path=contract_path
+    )
     if common.sha256_bytes(common.canonical_file_bytes(rollout)) != common.require_sha256(
         rollout_sha256, "rollout plan hash"
     ):
@@ -1263,6 +1311,7 @@ def apply_change(
     opener: Any | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     poll_limit: int = POLL_LIMIT,
+    contract_path: Path | None = None,
 ) -> dict[str, Any]:
     time_source = clock or (
         (lambda fixed=now: fixed)
@@ -1337,7 +1386,9 @@ def apply_change(
         release_policy_sha256,
         change_schema_sha256,
     )
-    source_phase, target_phase, source_sha, target_digests = _plan_images(plan, rollout)
+    source_phase, target_phase, source_sha, target_digests = _plan_images(
+        plan, rollout, contract_path=contract_path
+    )
     if plan.get("rollback") != common.ROLLBACK_FLOORS[target_phase]:
         common.fail("production plan rollback floor differs")
     recovery = validate_recovery(recovery, recovery_sha256, checked)

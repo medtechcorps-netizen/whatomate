@@ -42,6 +42,27 @@ ROLLBACK_FLOORS = {
     "backend": {"allowed_targets": ["bridge"], "forbidden_targets": ["baseline"]},
     "ui": {"allowed_targets": ["backend", "bridge"], "forbidden_targets": ["baseline"]},
 }
+# Genesis has no signed predecessor. A genesis activation enters at the phase the
+# reviewed production contract pins as live: baseline for the legacy-git
+# bootstrap only, or ui for a re-baselined digest bootstrap (the 2026-10-01
+# re-entry onto the accepted live ui phase). This module never sees the
+# contract, so it admits both structurally: baseline is kept for the legacy
+# bootstrap and the linear evidence lineages its validators still accept. The
+# exact binding, target == contract live phase, with a digest bootstrap
+# admitting ui only, is enforced by the plan verifier and by the apply
+# controller, the only receipt producer, which both hold the hash-bound
+# contract. Evidence validators here admit only these genesis edges, each
+# starting a new event chain at 1.
+GENESIS_ACTIVATION_TARGETS = ("baseline", "ui")
+
+
+def require_activation_edge(source: Any, target: str, sequence: int, message: str) -> None:
+    """The one activation-edge rule shared by intents, receipts and phase states."""
+    if source == "genesis":
+        if target not in GENESIS_ACTIVATION_TARGETS or sequence != 1:
+            fail(message)
+    elif PREDECESSOR.get(target) != source or sequence < 2:
+        fail(message)
 
 
 def validate_rollback_floor(
@@ -922,12 +943,9 @@ def _validate_intent_lineage(value: Any, operation: str) -> dict[str, Any]:
     if ordinal != PHASES.index(target) + 1:
         fail("mutation intent phase ordinal differs")
     if operation == "activate":
-        if (
-            source != PREDECESSOR[target]
-            or (source == "genesis" and sequence != 1)
-            or (source != "genesis" and sequence < 2)
-        ):
-            fail("mutation intent activation lineage differs")
+        require_activation_edge(
+            source, target, sequence, "mutation intent activation lineage differs"
+        )
         expected_kind = "genesis" if source == "genesis" else "phase-state"
         if lineage["predecessor_kind"] != expected_kind:
             fail("mutation intent activation predecessor differs")
@@ -2012,12 +2030,10 @@ def validate_apply_receipt(value: Any) -> dict[str, Any]:
     if (
         lineage["operation"] != "activate"
         or lineage["phase"] != target
-        or source != PREDECESSOR[target]
         or ordinal != PHASES.index(target) + 1
-        or (source == "genesis" and sequence != 1)
-        or (source != "genesis" and sequence < 2)
     ):
         fail("apply lineage sequence differs")
+    require_activation_edge(source, target, sequence, "apply lineage sequence differs")
     expected_kind = "genesis" if source == "genesis" else "phase-state"
     if lineage["predecessor_kind"] != expected_kind:
         fail("apply predecessor kind differs")
@@ -2258,12 +2274,7 @@ def validate_phase_state(value: Any, *, now: dt.datetime | None = None) -> dict[
     if phase != target or ordinal != PHASES.index(target) + 1:
         fail("phase state target differs")
     if operation == "activate":
-        if (
-            source != PREDECESSOR[target]
-            or (source == "genesis" and sequence != 1)
-            or (source != "genesis" and sequence < 2)
-        ):
-            fail("phase activation lineage differs")
+        require_activation_edge(source, target, sequence, "phase activation lineage differs")
         expected_kinds = {"apply-receipt", "apply-reconciled-receipt", "reconciliation-receipt"}
     elif operation == "rollback":
         validate_rollback_transition(source, target)

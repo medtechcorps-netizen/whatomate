@@ -30,9 +30,10 @@ order. They retain each phase's compile-time database role, unchanged frontend
 tree, and the final UI's Booking, Commerce, Coexistence, and default-OFF AI
 booking source. Do not substitute current control `main` for a phase source:
 that checkout does not contain the complete reviewed final UI product tree.
-The already-live production bootstrap remains bound to the old `4f65abeb`
-source and its deployed image digests; the new baseline child is a target, not
-a rewrite of observed production history.
+The already-live production bootstrap keeps the historical `4f65abeb` source
+identity, while its images and live phase describe the accepted c4cdac90 ui
+deployment (see "Genesis re-entry at the accepted live phase"). The new
+children are targets, not a rewrite of observed production history.
 
 Refreshed 2026-10-01: twelve axios advisories published 2026-09-30 failed every
 phase source's frontend audit (axios is a production dependency, so it cannot
@@ -475,6 +476,272 @@ run/attempt/artifact/digest, active deployment identity hash, current spec hash,
 phase, three image digests, and rollback floor. It contains no full app spec or
 arbitrary patch. A separate signing job may attest only the sanitized plan and
 must not receive DigitalOcean credentials.
+
+## Genesis re-entry at the accepted live phase (2026-10-01)
+
+### Why production runs an unsigned ui phase
+
+The 2026-09-30 train at control `c4cdac90` applied ui (apply run 36773451426,
+attempt 1, receipt `de742cb5`, source `1911174a`). Its canary, run 36774347298,
+failed on a fixture-reader defect (fixed by #203) before any CRM call, so that
+ui phase was never signed. A phase state is valid only at its own control, so
+it can never be signed later. The owner accepted the unsigned c4cdac90 ui on
+2026-09-30 after a manual smoke test. That acceptance is a recorded human
+decision, not machine evidence.
+
+### The rebaselined bootstrap
+
+`production-app-contract.json` `bootstrap_state` now describes the exact live
+state recorded by that apply receipt: deployment `b7de68d8`, spec `abd19b50`,
+environment `e4a9eb41` and non-source `d70b6908` (both unchanged), and the
+three ui images `c392aa3d`, `de88e5b8` and `d67dcce8`. It keeps the historical
+`4f65abeb` `source_sha`. Two keys are new:
+
+- `live_phase` is `ui`;
+- `live_evidence` is static data naming the receipt: kind
+  `accepted-unsigned-apply-receipt`, run 36773451426 attempt 1, artifact
+  11125905071 (digest `f175ba94`), predicate
+  `production-phase-apply-receipt/v1`, receipt `de742cb5`, phase source
+  `1911174a`, and receipt predecessor `139bf5d1` (the c4cdac90 backend state).
+
+In digest mode the genesis hash also binds the images, the live phase and the
+hash of `live_evidence`, so the new epoch's genesis is `b7892b2c`. The
+verifier constants `BOOTSTRAP_LIVE_PHASE` and `BOOTSTRAP_LIVE_EVIDENCE` pin
+both values, and `sanitized_provider_parity.py` pins the verifier and contract
+bytes. `live_evidence` is never fetched (the receipt artifact expires
+2026-10-07T20:39Z).
+
+### Required pre-merge verification (recorded)
+
+Before this rebaseline was proposed, the main session verified both
+attestations of the receipt online with `gh attestation verify` against the
+exact receipt bytes, once per predicate type
+(`https://rereply.app/attestations/production-phase-apply-receipt/v1` and
+`https://slsa.dev/provenance/v1`), for repository
+`medtechcorps-netizen/whatomate` and signer workflow
+`.github/workflows/apply-production-phase.yml`. Both verified subject
+`de742cb5`. Their verified certificates name the signer workflow at
+`refs/heads/main`, signer and source digest `c4cdac90`, source ref
+`refs/heads/main`, a GitHub-hosted runner, trigger `workflow_dispatch`, and
+run 36773451426 attempt 1. Run 36773451426 is a `workflow_dispatch` run on
+`main`, attempt 1, conclusion success. This online check is mandatory before
+merging any rebaseline: the committed bundles below are bound offline but are
+not cryptographically re-verified by the tests.
+
+A fresh GET-only observation on 2026-10-01 (two identical reads 60 s apart)
+matched the receipt after-state: deployment `b7de68d8`, spec `abd19b50`,
+environment `e4a9eb41`, non-source `d70b6908` and all three images, with no
+pending, in-progress or pinned deployment. Only the provider `app_updated_at`
+metadata had moved, which the bootstrap never binds. Repeat this observation
+with the reviewed parity module of the PR head (`require_provider_parity`,
+phase `ui`, no predecessor) before merging. If production has redeployed, do
+not merge: this evidence no longer describes live.
+
+### Committed live evidence (test-only)
+
+`release/deployment/live-evidence/` holds the receipt, its `.sha256` sidecar and
+its two Sigstore bundles. The receipt and sidecar are byte-exact copies of the
+archived artifact. Each bundle is the exact bytes of one `bundle` member of
+the GitHub attestations API response for that subject. The wrapper's
+`repository_id`, `initiator` and its time-limited signed `bundle_url` are
+not committed. `.gitattributes` marks the directory `-text`, so line endings
+are never converted.
+
+Tests bind these files offline: the sidecar and canonical bytes; every bundle's
+in-toto subject equals the receipt hash; the two predicate types; the custom
+predicate equals the receipt; the SLSA workflow, commit and run; and the
+transparency-log entry's payload hash, signature and certificate, plus the
+signer identity in that certificate. Signature, certificate-chain and
+inclusion verification is the online check above. No runtime controller or
+workflow reads this directory.
+
+Evidence is permanent. Every live-evidence file stays committed, byte for
+byte: a git-history test fails if one is modified or deleted. The live phase
+is monotonic: `BOOTSTRAP_LIVE_PHASE`, and every digest-mode genesis entry,
+must be at or above the highest phase any committed evidence records (today
+ui).
+
+### Genesis enters exactly at the live phase
+
+Genesis has no signed predecessor, so its target is computed from the contract
+and is never an input:
+
+- a legacy-git bootstrap enters at baseline;
+- a digest bootstrap enters exactly at `live_phase`, which must be in
+  `GENESIS_ENTRY_PHASES` (`ui` only).
+
+Production has run ui, so a digest bootstrap can never again re-enter at
+baseline. The policy admits exactly the linear chain plus one reviewed
+re-entry edge, `{genesis, ui, 4}`.
+
+The next train is `genesis -> ui'` at source `6f25ea19` (`UI_TARGET_SOURCE_SHA`;
+it descends from the live `1911174a`). It is one apply whose event chain
+restarts at 1 under the new genesis hash: plan predecessor genesis (event 0),
+transition ordinal 4, intent and receipt lineage `{event 1, ordinal 4, from
+genesis, kind genesis}`, and phase state `{event 1, ordinal 4,
+apply-receipt}`.
+
+The downgrade guard is enforced in these lanes:
+
+- **Plan**: genesis targets the live phase (`verify_production_plan.py:2575`)
+  through the reviewed policy edge (`:2590`) with its source pinned
+  (`:2600`). A predecessor state below the live phase is rejected (`:2320`),
+  and an initial state must activate the live phase (`:2363`).
+- **Apply**: in `_plan_images` (`apply_production_change.py:780-803`), every
+  activation from any source must target at or above the live phase of the
+  exact contract the plan signed, and genesis must target exactly that phase.
+  It runs in the intent job before the lock (`:1137`) and in the apply job
+  before `ProductionAppClient` and the PUT (`:1389`). The live phase itself
+  must equal `APPLY_REVIEWED_LIVE_PHASE` (`:984`, cross-tested against the
+  plan verifier).
+- **Parity**: phases below the reviewed live phase are refused before any
+  callback, private input or provider request
+  (`sanitized_provider_parity.py:226-228`).
+- **Launch helper**: the checkout is authenticated as clean current main
+  before any of its code reads the live phase (`launch_production_prerequisites.py:369-371`,
+  `:582`), and the predecessor callback applies the same floor (`:684`).
+
+`verify_production_release.GENESIS_ACTIVATION_TARGETS` keeps baseline, because
+that module never sees the contract and the legacy linear lineages still use
+it. A test proves that the plan and apply refuse `genesis -> baseline` for
+every digest-mode contract.
+
+### Live-phase floor induction
+
+The remaining lanes have no live-phase rule of their own: rollback, orphan
+rollback, canary signing, cleanup, finalize, and both lock-release lanes.
+They rely on this induction over the events at one control:
+
+1. **Base.** At a new control no phase state exists. Plans and phase states
+   carry the control SHA and the release-policy hash
+   (`verify_production_plan.py:2257-2276`), so no earlier epoch's state is a
+   predecessor.
+2. **Plans.** The plan refuses every predecessor below the live phase, so
+   the only plan at this control is `genesis -> ui`.
+3. **Receipts.** Apply is the only receipt producer, and it refuses every
+   activation below the live phase. Orphan reconciliation classifies an intent
+   apply already signed (`reconcile_production_orphan.py:287`, `:411`, `:674`,
+   through `verify_production_release.py:1811`).
+4. **States.** A phase state is built only from a change receipt and inherits
+   its target: `build_phase_state` copies the receipt lineage and after-state
+   (`verify_production_release.py:2144`, `:2219`). The canary signer
+   (`release/canary/verify_production_crm_canary.py:1374`) and terminal
+   cleanup (`cleanup-production-valkey-recovery-fork.yml:394`) accept only
+   such states. Finalize (`finalize_production_orphan_lock.py:859-888`) and
+   the lock-release lanes (`authorize_production_main_lock_release.py:32`,
+   `reconcile_production_main_lock_release.py:134`) consume the same
+   receipts and states. So every state signable at this control is ui.
+5. **Rollback.** A rollback target must be a phase state signed at this
+   control in the same rollout plan: `rollback-production-phase.yml:114`
+   and `rollback-production-orphan.yml:114`, then
+   `rollback_production_change.py:257` and `:394` for the rollout plan, and
+   `:372` and `:602` for the state. The only such state is ui, and ui cannot
+   roll back to itself (`:388`).
+
+So there is **no governed rollback after ui'**. ui's floor targets (backend,
+bridge) are unreachable, because no state below ui can exist at the control.
+`test_apply_production_change.LiveFloorInductionTests` proves steps 2-5.
+
+### Every future release must rebaseline
+
+ui is terminal, phase states are bound to their control, and the plan's
+genesis gate counts canary successes per control. So the next release cannot
+chain from the signed ui' state; every future release must rebaseline again.
+That is a data-only PR using `live_evidence` kind `signed-phase-state`, whose
+shape is already defined. It also records `receipt_predecessor_state_sha256`
+and `canary_sha256` to keep the epoch link.
+
+Capture the ui' apply receipt and its attestations within 7 days, and the
+phase state and its attestations within 30 days. Commit both, with sidecars
+and bundles; never delete the existing evidence.
+
+Data-only rebaseline checklist:
+
+1. Update the constants: `BOOTSTRAP_DEPLOYMENT_ID_SHA256`, `BOOTSTRAP_IMAGES`,
+   `BOOTSTRAP_CANONICAL_SPEC_SHA256` (and environment or non-source if they
+   moved), `BOOTSTRAP_LIVE_PHASE`, `BOOTSTRAP_LIVE_EVIDENCE`, and any target
+   source pin.
+2. Update the contract `bootstrap_state` to match, and recompute
+   `genesis_state_sha256`.
+3. Move the genesis pin in `test_verify_production_plan.py`.
+4. Re-pin parity `VERIFIER_SHA256` and `CONTRACT_SHA256`, and the Codex
+   launcher's `LAUNCH_HELPER_SHA256` if the helper changed.
+5. Compute every pin from `git show HEAD:<path> | sha256sum` of the
+   committed LF blobs, never from a Windows working tree.
+6. Run the attestation verification and the fresh parity observation again.
+
+### Failure runbook for the re-entry train
+
+Production is untouched through F1-F7, and main is never locked through F5.
+Never relaunch the launcher after an apply has been dispatched; use the
+orphan and lock lanes instead. If the apply outcome is unknown (for example,
+its approvals wait past the launcher's 5400 s), the launcher logs the apply
+run ID and drops the plan and recovery bindings. It records the unresolved
+apply, prints `do not relaunch; use the orphan lanes`, and exits non-zero.
+
+- **F1. Validation, image or aggregate fails.** The launcher retries a
+  validation or image job once, then stops. A relaunch at the same control
+  reuses the evidence. Image Trivy DB freshness is about 2026-10-06T19:09Z.
+- **F2. Fork prepare fails, or a later pre-apply stage fails** (plan,
+  recovery, launcher crash). Use cleanup's never-started mode if no apply,
+  rollback or reconcile run exists after the fork create. Use quarantine if
+  only the create intent exists. Fork creation precedes planning, so a
+  plan-time genesis error costs a fork plus a never-started cleanup. Owner
+  fallback: delete the fork in the DigitalOcean console.
+- **F3. Plan rejected** (drift, verifier defect, or a successful canary
+  already at the control). Same as F2. Keep the fork at most about 24 h old
+  and the production backup at most 36 h old.
+- **F4. The apply authority job fails before the lock.** Use cleanup's
+  pre-mutation-failure mode. Main was never locked.
+- **F5. Prelock, intent or the lock job fails before the branch mutation**
+  (for example the apply live-phase guard, a plan or recovery past 900 s, or a
+  rejected approval). Main is unlocked. Relaunch: the launcher drops plan and
+  recovery and re-plans. Owner fallback if abandoned: delete the fork in the
+  console.
+- **F6. The lock is held, but the proof or lock job fails after mutating.**
+  Run reconcile-production-orphan (no-mutation), then
+  finalize-production-orphan-lock, then
+  reconcile-production-orphan-lock-release and confirm, then cleanup's
+  no-mutation mode. All accept `genesis -> ui`. Owner fallback: turn branch
+  protection "Lock branch" off.
+- **F7. The apply job fails before or without the PUT** (900 s expiry, CAS or
+  plan observation). Production is unchanged, but reconcile returns
+  indeterminate and there is no governed unlock. The owner turns "Lock
+  branch" off. Approve every gate within 900 s of the plan.
+- **F8. The PUT was sent and the deploy fails or times out.** There is no
+  governed unlock. The owner restores the previous ui spec or deployment in
+  the console, then turns "Lock branch" off. A new deployment ID makes the
+  bootstrap stale, and every plan then fails closed until a reviewed
+  rebaseline. Production must never be re-pointed to an unattested
+  deployment.
+- **F9. Deployed, but receipt validation, the gate or release authorization
+  fails.** Main is locked and production runs ui'. Run, in order:
+  reconcile-production-orphan (committed); verify-production-crm-canary with
+  `receipt_kind` `reconciliation`; the reconciliation phase state; finalize;
+  orphan lock release; terminal fork cleanup. Use manual `workflow_dispatch`
+  at the same control: the launcher hard-codes `receipt_kind` `apply`.
+- **F10. The unlock job's runner dies.** Run
+  reconcile-production-main-lock-release, then the canary with
+  `receipt_kind` `apply-reconciled`, then terminal cleanup.
+- **F11. The canary fails after a successful apply.** Main is unlocked and ui'
+  is unsigned. Triage, then dispatch verify-production-crm-canary as a NEW
+  `workflow_dispatch` (attempt 1) within about 24 h of the apply. Never move
+  main in between. There is no governed rollback, because no signed backend
+  or bridge state exists at the control. If abandoned, the owner deletes fork
+  #2 in the console. Capture the ui' receipt and its attestations within 7
+  days for an `accepted-unsigned-apply-receipt` rebaseline.
+- **F12. The canary signs, but terminal cleanup fails.** Re-dispatch cleanup
+  terminal after the recovery window has expired. Keep main frozen: cleanup
+  re-validates recovery against current main. Owner fallback: delete the fork
+  in the console.
+- **F13. Credentials or tokens expire mid-train.** Stop at the current stage.
+  The owner rotates them through the environment secret UI.
+
+Deadlines: plan and recovery 900 s; intent 15 min; fork 24 h; backup 36 h or
+less; canary about 24 h after the apply; signed receipt 7 days; phase state
+30 days; receipt artifact 11125905071 expires 2026-10-07T20:39Z; fixture
+evidence 2026-12-14T17:54Z. After a successful train, unfreeze `main`,
+archive the chain-state files, and schedule the ui' rebaseline PR.
 
 ## Single-operator phase control
 

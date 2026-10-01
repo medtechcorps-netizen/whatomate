@@ -81,39 +81,123 @@ PRODUCTION_DEFAULT_INGRESS_SHA256 = (
     "05ab4f90194ad37c6926138e9aafbd49c73aa75d08da92b0b1309bfce207cfa8"
 )
 BASELINE_TARGET_SOURCE_SHA = "0267981e3396178a8b343fd7a091ca98f631d0f4"
+# A genesis activation has no signed predecessor phase state, so the source of
+# each reviewed genesis target is pinned here as well as by the capsule's
+# reviewed source manifest (release/exact-sources.json).
+UI_TARGET_SOURCE_SHA = "6f25ea1919ee28856dee59d5fd121671214087e3"
+# The live phases a re-baselined (digest-images) bootstrap may carry, and so the
+# only phases a digest-mode genesis activation may enter: exactly the
+# bootstrap's live phase. Production has run ui (2026-10-01 re-entry onto the
+# accepted live ui phase), so a digest bootstrap can never again legitimately
+# be live below ui. Only the legacy-git bootstrap, which predates every phase,
+# enters at PHASES[0] (baseline); see genesis_target_phase.
+GENESIS_ENTRY_PHASES = ("ui",)
 # The production bootstrap is the state the platform is actually in. It was
-# re-baselined on 2026-09-18 onto the already-applied baseline phase, so it now
+# re-baselined on 2026-09-18 onto the already-applied baseline phase and on
+# 2026-10-01 onto the already-applied ui phase (control c4cdac90), so it
 # carries immutable image authority instead of the retired legacy git sources.
 BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
-    "9452af265114a21c4c4cd52ce3e34a2109b9a87c8cd8bcce39946bafbbf4b76e"
+    "b7de68d8785d7ed2dcb9a50b2b64bf2fed3d26b78f0a6bc609a6fab3b53d13ab"
 )
-# Historical, already-applied production source. A later baseline target
-# rebaseline must not rewrite the observed bootstrap identity.
+# Historical, already-applied production source. A rebaseline must not rewrite
+# the observed bootstrap identity; the live phase's own source is recorded in
+# BOOTSTRAP_LIVE_EVIDENCE and bound into the genesis hash with the images.
 BOOTSTRAP_SOURCE_SHA = "4f65abeb1c03c8fca018aa92cc987fae25ef4000"
 BOOTSTRAP_SOURCE_MODE = "digest-images"
 BOOTSTRAP_IMAGES = [
     {
         "component": 'web',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-web',
-        "digest": 'sha256:124cfbb30bd73e4179f50ba0da702fbc58ff564ec7ae6a145f8898a18477607d',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-web@sha256:124cfbb30bd73e4179f50ba0da702fbc58ff564ec7ae6a145f8898a18477607d',
+        "digest": 'sha256:c392aa3dff590464fb9d8e10aadb0dd94726ea3e741003f4cb9d48d4cfe7f78e',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-web@sha256:c392aa3dff590464fb9d8e10aadb0dd94726ea3e741003f4cb9d48d4cfe7f78e',
     },
     {
         "component": 'meta-relay',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay',
-        "digest": 'sha256:5c8309386454ee4d523948f984d3cea1f8195251758ffbf42031ec6412c1b0d4',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:5c8309386454ee4d523948f984d3cea1f8195251758ffbf42031ec6412c1b0d4',
+        "digest": 'sha256:de88e5b884890f1afb59dee933085bbe0c40aec3329e34af824e542bdc776da3',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:de88e5b884890f1afb59dee933085bbe0c40aec3329e34af824e542bdc776da3',
     },
     {
         "component": 'gmail-relay',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay',
-        "digest": 'sha256:98f37ba04dcca2e49bce27d2c60e6d4ead4ab2cbaf2860314ad5487ca07c58e6',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:98f37ba04dcca2e49bce27d2c60e6d4ead4ab2cbaf2860314ad5487ca07c58e6',
+        "digest": 'sha256:d67dcce8799480172013b8be462a9426bf23d974961f7b5df3ba60cc072a9016',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:d67dcce8799480172013b8be462a9426bf23d974961f7b5df3ba60cc072a9016',
     },
 ]
 BOOTSTRAP_CANONICAL_SPEC_SHA256 = (
-    "784300b6886725695a5f5085bff98b423446f5fa250fe8f110367e5420265a44"
+    "abd19b50177ebf6362ba2e3b49d997e9f104b881a6d78d2a5b86bd6456e9f095"
 )
+# Genesis is phase-less, so the phase production runs is pinned here. The ui
+# phase applied at control c4cdac90 (receipt de742cb5) can never be signed: its
+# canary failed on a fixture-reader defect (fixed by #203) before any CRM call,
+# and a phase state is valid only at its own control. It is accepted from its
+# attested apply receipt. This evidence is static data bound into the genesis
+# hash; it is never fetched (the receipt artifact expires 2026-10-07). The
+# receipt bytes and both of its attestation bundles are committed as test-only
+# evidence next to this verifier (runtime controls never read them). Every
+# committed evidence file stays committed, and the live phase may never fall
+# below the highest phase that committed evidence records.
+BOOTSTRAP_LIVE_PHASE = "ui"
+BOOTSTRAP_LIVE_EVIDENCE = {
+    "kind": "accepted-unsigned-apply-receipt",
+    "phase": "ui",
+    "workflow_path": ".github/workflows/apply-production-phase.yml",
+    "control_sha": "c4cdac90d2fd87276a145a8b902eae1fd317314f",
+    "run_id": "36773451426",
+    "run_attempt": 1,
+    "artifact_id": "11125905071",
+    "artifact_name": "production-phase-apply-36773451426-1",
+    "artifact_digest": (
+        "sha256:f175ba94762471314da6ff748ba419f556324eab0ca82fe98cdf3256397fa237"
+    ),
+    "predicate_type": (
+        "https://rereply.app/attestations/production-phase-apply-receipt/v1"
+    ),
+    "receipt_sha256": (
+        "de742cb5f24d814b78eb9665b266e1dadd33883bde1c84e73e9d7b328934281e"
+    ),
+    "phase_source_sha": "1911174a746e0cc70fd246e6c1f45bc65ba12946",
+    "receipt_predecessor_state_sha256": (
+        "139bf5d108b25b14be36fd065cb73b897ddbeefc815fac702afbed7e58e5f0ac"
+    ),
+}
+# Static evidence shapes a rebaselined bootstrap may carry for its live phase.
+LIVE_EVIDENCE_SHAPES = {
+    "accepted-unsigned-apply-receipt": {
+        "keys": (
+            "kind", "phase", "workflow_path", "control_sha", "run_id",
+            "run_attempt", "artifact_id", "artifact_name", "artifact_digest",
+            "predicate_type", "receipt_sha256", "phase_source_sha",
+            "receipt_predecessor_state_sha256",
+        ),
+        "workflow_path": ".github/workflows/apply-production-phase.yml",
+        "artifact_prefix": "production-phase-apply",
+        "predicate_type": (
+            "https://rereply.app/attestations/production-phase-apply-receipt/v1"
+        ),
+        "hashes": ("receipt_sha256", "receipt_predecessor_state_sha256"),
+    },
+    # For the next rebaseline onto a signed phase. A phase state overwrites its
+    # predecessor hash with its change receipt's hash, so the receipt's own
+    # predecessor (the genesis or phase state it applied from) and the canary
+    # result are recorded here to keep the epoch link in the reviewed evidence.
+    "signed-phase-state": {
+        "keys": (
+            "kind", "phase", "workflow_path", "control_sha", "run_id",
+            "run_attempt", "artifact_id", "artifact_name", "artifact_digest",
+            "predicate_type", "phase_state_sha256", "phase_source_sha",
+            "change_receipt_sha256", "receipt_predecessor_state_sha256",
+            "canary_sha256",
+        ),
+        "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
+        "artifact_prefix": "production-phase-state",
+        "predicate_type": "https://rereply.app/attestations/production-phase-state/v1",
+        "hashes": (
+            "phase_state_sha256", "change_receipt_sha256",
+            "receipt_predecessor_state_sha256", "canary_sha256",
+        ),
+    },
+}
 BOOTSTRAP_ENVIRONMENT_SHA256 = (
     "e4a9eb41e54a256b2b9c8b008354d730147a4229f5aa06c7625970cd9b7db3e8"
 )
@@ -484,6 +568,14 @@ def validate_release_policy(value: Any) -> dict[str, Any]:
         {"from": STATES[index], "to": STATES[index + 1], "ordinal": index + 1}
         for index in range(len(STATES) - 1)
     ]
+    # Reviewed genesis re-entry edges, each at its target's own phase ordinal.
+    # genesis->baseline stays in the linear chain for the legacy-git bootstrap
+    # only; a digest bootstrap enters exactly at its live phase (ui).
+    expected_transitions.extend(
+        {"from": "genesis", "to": phase, "ordinal": PHASES.index(phase) + 1}
+        for phase in GENESIS_ENTRY_PHASES
+        if phase != PHASES[0]
+    )
     transitions = policy["activation_transitions"]
     if transitions != expected_transitions:
         fail("activation transitions differ")
@@ -1216,15 +1308,13 @@ def validate_contract(
         "source_mode",
         "source_sha",
     }
-    # A re-baselined bootstrap pins image authority as well; the legacy bootstrap
-    # carries none.
+    # A re-baselined bootstrap pins image authority, its live phase and the
+    # static evidence that phase was accepted from; the legacy bootstrap carries
+    # none of them.
     if bootstrap_value.get("source_mode") == "digest-images":
-        bootstrap_keys.add("images")
+        bootstrap_keys |= {"images", "live_phase", "live_evidence"}
     bootstrap = exact_keys(bootstrap_value, bootstrap_keys, "bootstrap state")
-    if require_sha256(
-        bootstrap["genesis_state_sha256"], "bootstrap genesis state hash"
-    ) != genesis_state_sha256(contract):
-        fail("bootstrap genesis state hash differs")
+    require_sha256(bootstrap["genesis_state_sha256"], "bootstrap genesis state hash")
     if require_sha256(
         bootstrap["active_deployment_id_sha256"],
         "bootstrap active deployment ID hash",
@@ -1269,6 +1359,15 @@ def validate_contract(
                 f"ghcr.io/medtechcorps-netizen/rereply-release-{component}@{digest}"
             ):
                 fail("bootstrap image subject differs")
+        live_phase = bootstrap["live_phase"]
+        if live_phase not in GENESIS_ENTRY_PHASES or live_phase != BOOTSTRAP_LIVE_PHASE:
+            fail("bootstrap live phase differs")
+        validate_live_evidence(bootstrap["live_evidence"], live_phase)
+        if bootstrap["live_evidence"] != BOOTSTRAP_LIVE_EVIDENCE:
+            fail("bootstrap live-state evidence differs")
+    # Checked last so a tampered pinned field reports its own reason.
+    if bootstrap["genesis_state_sha256"] != genesis_state_sha256(contract):
+        fail("bootstrap genesis state hash differs")
 
     components = contract["components"]
     if type(components) is not list or len(components) != 4:
@@ -1995,8 +2094,22 @@ def rollout_phase(
 
 def genesis_state_sha256(contract: Mapping[str, Any]) -> str:
     bootstrap = contract["bootstrap_state"]
+    live_state: dict[str, Any] = {}
+    if bootstrap["source_mode"] == "digest-images":
+        # A re-baselined genesis is the exact live state, so its image authority,
+        # live phase and acceptance evidence are part of its identity. The legacy
+        # preimage below is unchanged.
+        for key in ("images", "live_phase", "live_evidence"):
+            if key not in bootstrap:
+                fail("bootstrap live state is incomplete")
+        live_state = {
+            "images": bootstrap["images"],
+            "live_phase": bootstrap["live_phase"],
+            "live_evidence_sha256": sha256_value(bootstrap["live_evidence"]),
+        }
     return sha256_value(
         {
+            **live_state,
             "kind": "genesis",
             "event_sequence": 0,
             "phase_ordinal": 0,
@@ -2017,6 +2130,54 @@ def genesis_state_sha256(contract: Mapping[str, Any]) -> str:
             "source_sha": bootstrap["source_sha"],
         }
     )
+
+
+def genesis_target_phase(contract: Mapping[str, Any]) -> str:
+    """The only phase a genesis activation may target under this contract.
+
+    A legacy git bootstrap predates every phase and enters at baseline. A
+    re-baselined digest bootstrap enters exactly at its reviewed live phase,
+    which must be one of GENESIS_ENTRY_PHASES (ui only), so genesis can never
+    move production below the phase it already runs and a digest bootstrap can
+    never re-enter at baseline.
+    """
+    bootstrap = contract["bootstrap_state"]
+    mode = bootstrap.get("source_mode")
+    if mode == "legacy-git" and "live_phase" not in bootstrap:
+        return PHASES[0]
+    if mode != "digest-images":
+        fail("bootstrap source mode differs")
+    live_phase = bootstrap.get("live_phase")
+    if type(live_phase) is not str or live_phase not in GENESIS_ENTRY_PHASES:
+        fail("bootstrap live phase is not a reviewed genesis entry")
+    return live_phase
+
+
+def validate_live_evidence(value: Any, live_phase: str) -> dict[str, Any]:
+    """Validate the static, never-fetched evidence for the accepted live phase."""
+
+    kind = value.get("kind") if type(value) is dict else None
+    if kind not in LIVE_EVIDENCE_SHAPES:
+        fail("bootstrap live-state evidence kind differs")
+    shape = LIVE_EVIDENCE_SHAPES[kind]
+    evidence = exact_keys(value, set(shape["keys"]), "bootstrap live-state evidence")
+    if evidence["phase"] != live_phase:
+        fail("bootstrap live-state evidence phase differs")
+    require_sha1(evidence["control_sha"], "live-state evidence control SHA")
+    run_id = require_run_id(evidence["run_id"], "live-state evidence run ID")
+    exact_int(evidence["run_attempt"], "live-state evidence run attempt", 1, 1)
+    require_run_id(evidence["artifact_id"], "live-state evidence artifact ID")
+    require_digest(evidence["artifact_digest"], "live-state evidence artifact digest")
+    require_sha1(evidence["phase_source_sha"], "live-state evidence phase source")
+    for key in shape["hashes"]:
+        require_sha256(evidence[key], f"live-state evidence {key}")
+    if (
+        evidence["workflow_path"] != shape["workflow_path"]
+        or evidence["artifact_name"] != f"{shape['artifact_prefix']}-{run_id}-1"
+        or evidence["predicate_type"] != shape["predicate_type"]
+    ):
+        fail("bootstrap live-state evidence authority differs")
+    return evidence
 
 
 def validate_full_artifact_binding(value: Any, label: str) -> dict[str, Any]:
@@ -2152,8 +2313,13 @@ def validate_phase_state(
         or phase_ordinal != PHASES.index(phase) + 1
     ):
         fail("phase-state current phase differs")
+    genesis_target = genesis_target_phase(contract)
+    # Every event of this genesis epoch is at or above the live phase it
+    # re-entered at, so a state below it cannot exist and is never a predecessor.
+    if PHASES.index(phase) < PHASES.index(genesis_target):
+        fail("phase state precedes the reviewed live phase")
     if operation == "activate":
-        expected_source = "genesis" if phase == "baseline" else PHASES[
+        expected_source = "genesis" if phase == genesis_target else PHASES[
             PHASES.index(phase) - 1
         ]
         if source_phase != expected_source:
@@ -2189,8 +2355,12 @@ def validate_phase_state(
         lineage["predecessor_state_sha256"], "phase-state predecessor hash"
     )
     if event_sequence == 1:
-        if operation != "activate" or source_phase != "genesis" or phase != "baseline":
-            fail("initial phase state does not activate baseline")
+        if (
+            operation != "activate"
+            or source_phase != "genesis"
+            or phase != genesis_target
+        ):
+            fail("initial phase state does not activate the reviewed live phase")
     elif source_phase == "genesis":
         fail("non-initial phase state cannot start from genesis")
 
@@ -2400,9 +2570,11 @@ def validate_rollout_plan(
             "artifact_id": evidence["artifact_id"],
             "artifact_digest": evidence["artifact_digest"],
         }
-    phase_ordinal = 0 if predecessor_phase == "genesis" else (
-        PHASES.index(predecessor_phase) + 1
-    )
+    if predecessor_phase == "genesis":
+        # Genesis enters exactly at the reviewed live phase, never below it.
+        phase_ordinal = PHASES.index(genesis_target_phase(contract))
+    else:
+        phase_ordinal = PHASES.index(predecessor_phase) + 1
     if phase_ordinal >= len(PHASES):
         fail("the signed UI phase is terminal")
     target_phase = PHASES[phase_ordinal]
@@ -2412,15 +2584,20 @@ def validate_rollout_plan(
         "to": target_phase,
         "ordinal": phase_ordinal + 1,
     }
-    expected_transition = policy["activation_transitions"][phase_ordinal]
-    if transition != {"operation": "activate", **expected_transition}:
+    edge = {key: transition[key] for key in ("from", "to", "ordinal")}
+    if (
+        transition["operation"] != "activate"
+        or edge not in policy["activation_transitions"]
+    ):
         fail("production activation transition differs")
     target, observed_images = rollout_phase(value, contract, target_phase)
-    if (
-        target_phase == "baseline"
-        and target["source"]["commit"] != BASELINE_TARGET_SOURCE_SHA
-    ):
-        fail("baseline rollout source differs from the reviewed target")
+    if predecessor_phase == "genesis":
+        reviewed_source = {
+            "baseline": BASELINE_TARGET_SOURCE_SHA,
+            "ui": UI_TARGET_SOURCE_SHA,
+        }.get(target_phase)
+        if target["source"]["commit"] != reviewed_source:
+            fail("genesis rollout source differs from the reviewed target")
     return target, observed_images, transition, predecessor_authority
 
 

@@ -1338,5 +1338,47 @@ class RolloutEvidenceTests(unittest.TestCase):
                 verifier.inspect_capsule_archive(archive, self.contract, None)
 
 
+class LiveEvidenceHistoryTests(unittest.TestCase):
+    """Git-history rules for the genesis re-entry evidence (needs full history)."""
+
+    @staticmethod
+    def git(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(["git", "-C", str(ROOT), *arguments], check=check, capture_output=True)
+
+    def test_genesis_reentry_source_descends_from_the_live_phase_source(self) -> None:
+        # A re-entry target must never be older code than the phase already live.
+        import verify_production_plan as plan_verifier
+
+        live_source = plan_verifier.BOOTSTRAP_LIVE_EVIDENCE["phase_source_sha"]
+        self.assertEqual(live_source, NAME_FIX_PHASE_SOURCE_SHA["ui"])
+        self.assertEqual(plan_verifier.UI_TARGET_SOURCE_SHA, EXPECTED_FINAL_SOURCE["source_sha"])
+        ancestry = self.git("merge-base", "--is-ancestor", live_source,
+                            plan_verifier.UI_TARGET_SOURCE_SHA, check=False)
+        self.assertEqual(ancestry.returncode, 0, ancestry.stderr.decode(errors="replace"))
+        reverse = self.git("merge-base", "--is-ancestor", plan_verifier.UI_TARGET_SOURCE_SHA,
+                           live_source, check=False)
+        self.assertEqual(reverse.returncode, 1)
+
+    def test_committed_live_evidence_is_never_removed_or_rewritten(self) -> None:
+        # Every committed live-evidence file stays committed, byte for byte:
+        # the monotonic live-phase floor is computed over all of them.
+        directory = "release/deployment/live-evidence"
+        history = self.git("log", "--format=", "--name-status", "--no-renames", "HEAD", "--", directory)
+        records = [line.split("\t") for line in history.stdout.decode("utf-8").splitlines() if line]
+        self.assertTrue(all(len(record) == 2 for record in records), records)
+        statuses = {status for status, _path in records}
+        self.assertLessEqual(statuses, {"A"}, "committed live evidence was modified or deleted")
+        added = {path for _status, path in records}
+        for path in sorted(added):
+            with self.subTest(path=path):
+                blob = self.git("show", f"HEAD:{path}").stdout
+                self.assertEqual((ROOT / path).read_bytes(), blob)
+        committed = {
+            line for line in self.git("ls-tree", "-r", "--name-only", "HEAD", "--", directory)
+            .stdout.decode("utf-8").splitlines() if line
+        }
+        self.assertEqual(committed, added)
+
+
 if __name__ == "__main__":
     unittest.main()

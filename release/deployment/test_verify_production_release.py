@@ -122,6 +122,38 @@ def apply_receipt() -> dict[str, object]:
     }
 
 
+def reentry_receipt() -> dict[str, object]:
+    """A genesis re-entry at the live ui phase: event 1, ordinal 4."""
+    receipt = apply_receipt()
+    receipt["lineage"] = {
+        "event_sequence": 1,
+        "phase_ordinal": 4,
+        "operation": "activate",
+        "from": "genesis",
+        "to": "ui",
+        "predecessor_kind": "genesis",
+        "predecessor_state_sha256": "e" * 64,
+        "phase": "ui",
+        "phase_source_sha": "f" * 40,
+    }
+    receipt["before"] = provider_state()
+    receipt["after"] = provider_state()
+    receipt["after"]["active_deployment_identity_sha256"] = "9" * 64
+    receipt["rollback"] = copy.deepcopy(release.ROLLBACK_FLOORS["ui"])
+    return receipt
+
+
+STATE_CONTROL = {
+    "workflow_sha": SHA,
+    "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
+    "run_id": "401",
+    "run_attempt": 1,
+    "runner_environment": "github-hosted",
+    "release_policy_sha256": HASH,
+    "change_schema_sha256": "c" * 64,
+}
+
+
 def full_binding(run_id: str, artifact_id: str, name: str, digest: str) -> dict[str, object]:
     return {
         "run_id": run_id,
@@ -408,6 +440,155 @@ class ProductionReleaseVerifierTests(unittest.TestCase):
         rollback["lineage"]["predecessor_kind"] = "apply-receipt"
         with self.assertRaises(release.ReleaseError):
             release.validate_phase_state(rollback)
+
+    def test_genesis_reentry_is_accepted_by_every_lineage_validator(self) -> None:
+        receipt = reentry_receipt()
+        self.assertIs(release.validate_apply_receipt(receipt), receipt)
+        receipt_hash = release.sha256_bytes(release.canonical_file_bytes(receipt))
+        state = release.build_phase_state(
+            receipt, change_receipt_sha256=receipt_hash, canary_sha256="9" * 64,
+            control=STATE_CONTROL, completed_at="2026-08-27T00:01:00Z",
+        )
+        self.assertEqual(
+            {key: state["lineage"][key] for key in ("event_sequence", "phase_ordinal", "from", "to", "predecessor_kind")},
+            {"event_sequence": 1, "phase_ordinal": 4, "from": "genesis", "to": "ui", "predecessor_kind": "apply-receipt"},
+        )
+        self.assertEqual(state["rollback"], release.ROLLBACK_FLOORS["ui"])
+        release.validate_phase_state(state)
+        release._validate_intent_lineage(copy.deepcopy(receipt["lineage"]), "activate")
+
+    def test_activation_edges_are_one_rule_across_validators(self) -> None:
+        cases = (
+            ("genesis", "baseline", 1, True),
+            ("genesis", "ui", 1, True),
+            ("backend", "ui", 4, True),
+            ("baseline", "bridge", 2, True),
+            ("genesis", "bridge", 1, False),
+            ("genesis", "backend", 1, False),
+            ("genesis", "ui", 2, False),
+            ("genesis", "baseline", 2, False),
+            ("backend", "ui", 1, False),
+            ("bridge", "ui", 4, False),
+            ("ui", "ui", 5, False),
+            ("baseline", "ui", 4, False),
+        )
+        for source, target, sequence, accepted in cases:
+            lineage = {
+                "event_sequence": sequence,
+                "phase_ordinal": release.PHASES.index(target) + 1,
+                "operation": "activate",
+                "from": source,
+                "to": target,
+                "predecessor_kind": "genesis" if source == "genesis" else "phase-state",
+                "predecessor_state_sha256": "e" * 64,
+                "phase": target,
+                "phase_source_sha": "f" * 40,
+            }
+            receipt = reentry_receipt()
+            receipt["lineage"] = copy.deepcopy(lineage)
+            receipt["rollback"] = copy.deepcopy(release.ROLLBACK_FLOORS[target])
+            state = None
+            if accepted:
+                receipt_hash = release.sha256_bytes(release.canonical_file_bytes(receipt))
+                state = release.build_phase_state(
+                    receipt, change_receipt_sha256=receipt_hash, canary_sha256="9" * 64,
+                    control=STATE_CONTROL, completed_at="2026-08-27T00:01:00Z",
+                )
+            for label, check in (
+                ("intent", lambda: release._validate_intent_lineage(copy.deepcopy(lineage), "activate")),
+                ("receipt", lambda: release.validate_apply_receipt(copy.deepcopy(receipt))),
+            ):
+                with self.subTest(edge=(source, target, sequence), validator=label):
+                    if accepted:
+                        check()
+                    else:
+                        with self.assertRaises(release.ReleaseError):
+                            check()
+            forged = copy.deepcopy(state) if state is not None else None
+            if forged is None:
+                receipt_ok = reentry_receipt()
+                receipt_hash = release.sha256_bytes(release.canonical_file_bytes(receipt_ok))
+                forged = release.build_phase_state(
+                    receipt_ok, change_receipt_sha256=receipt_hash, canary_sha256="9" * 64,
+                    control=STATE_CONTROL, completed_at="2026-08-27T00:01:00Z",
+                )
+                forged["lineage"].update({key: lineage[key] for key in ("event_sequence", "phase_ordinal", "from", "to", "phase")})
+                forged["rollback"] = copy.deepcopy(release.ROLLBACK_FLOORS[target])
+            with self.subTest(edge=(source, target, sequence), validator="phase-state"):
+                if accepted:
+                    release.validate_phase_state(forged)
+                else:
+                    with self.assertRaises(release.ReleaseError):
+                        release.validate_phase_state(forged)
+        wrong_kind = reentry_receipt()
+        wrong_kind["lineage"]["predecessor_kind"] = "phase-state"
+        with self.assertRaises(release.ReleaseError):
+            release.validate_apply_receipt(wrong_kind)
+        with self.assertRaises(release.ReleaseError):
+            release._validate_intent_lineage(copy.deepcopy(wrong_kind["lineage"]), "activate")
+
+    def test_genesis_targets_match_policy_plan_and_contract(self) -> None:
+        import verify_production_plan as planner
+
+        root = Path(__file__).resolve().parents[2]
+        policy = json.loads((root / "release/deployment/production-release-policy.json").read_text(encoding="utf-8"))
+        contract = json.loads((root / "release/deployment/production-app-contract.json").read_text(encoding="utf-8"))
+        # The structural set is the legacy entry plus every digest entry phase.
+        self.assertEqual(
+            release.GENESIS_ACTIVATION_TARGETS, (planner.PHASES[0], *planner.GENESIS_ENTRY_PHASES)
+        )
+        self.assertEqual(planner.GENESIS_ENTRY_PHASES, ("ui",))
+        self.assertEqual(
+            tuple(edge["to"] for edge in policy["activation_transitions"] if edge["from"] == "genesis"),
+            release.GENESIS_ACTIVATION_TARGETS,
+        )
+        self.assertEqual(planner.genesis_target_phase(contract), "ui")
+        self.assertIn(planner.genesis_target_phase(contract), release.GENESIS_ACTIVATION_TARGETS)
+
+    def test_baseline_genesis_edge_is_kept_only_for_the_legacy_bootstrap(self) -> None:
+        """Why GENESIS_ACTIVATION_TARGETS keeps baseline, and why that is safe.
+
+        This module never sees the contract. The legacy-git bootstrap enters at
+        baseline and every linear evidence lineage these validators accept (the
+        apply_receipt() fixtures used across the orphan, finalize, lock-release,
+        rollback and canary suites) starts genesis->baseline at event 1, so the
+        structural rule must keep it. The exact live-phase binding lives in the
+        two lanes that hold the hash-bound contract: for EVERY digest-mode
+        bootstrap the plan verifier and the apply controller (the only receipt
+        producer) refuse a genesis->baseline activation.
+        """
+        import tempfile as temporary_files
+        import apply_production_change as apply
+        import verify_production_plan as planner
+
+        receipt = apply_receipt()
+        self.assertEqual((receipt["lineage"]["from"], receipt["lineage"]["to"]), ("genesis", "baseline"))
+        release.validate_apply_receipt(receipt)
+        for live in (*release.PHASES, "genesis", None):
+            for with_live in (True, False):
+                bootstrap = {"source_mode": "digest-images", "images": []}
+                if with_live:
+                    bootstrap["live_phase"] = live
+                elif live is not None:
+                    continue
+                contract = {"bootstrap_state": bootstrap}
+                with self.subTest(live_phase=bootstrap.get("live_phase", "absent")):
+                    try:
+                        planned = planner.genesis_target_phase(contract)
+                    except planner.PlanError:
+                        planned = None
+                    self.assertNotEqual(planned, "baseline")
+                    with temporary_files.TemporaryDirectory() as directory:
+                        path = Path(directory) / "production-app-contract.json"
+                        raw = release.canonical_file_bytes(contract)
+                        path.write_bytes(raw)
+                        plan = {
+                            "control": {"contract_sha256": release.sha256_bytes(raw)},
+                            "transition": {"operation": "activate", "from": "genesis", "to": "baseline", "ordinal": 1},
+                            "target": {"phase": "baseline"},
+                        }
+                        with self.assertRaisesRegex(release.ReleaseError, "live phase"):
+                            apply._plan_images(plan, {"phases": []}, contract_path=path)
 
     def test_rollback_floors_are_exact(self) -> None:
         release.validate_rollback_transition("bridge", "baseline")

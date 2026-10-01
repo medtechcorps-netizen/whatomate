@@ -174,6 +174,11 @@ class ReadOnlyEvidence(Protocol):
     API errors must not be converted to empty lists or successful proof results.
     Secret access is metadata-only, scoped to the protected canary environment.
 
+    reviewed_genesis_phase must return the genesis entry phase computed by the
+    raw-byte-pinned reviewed verifier and contract at the authenticated checkout,
+    never a launcher input. The gate calls it only after require_current_control,
+    and it must not execute checkout code before authenticating that checkout.
+
     fixture_public_authority must enforce the reviewed fixture verifier's public
     ancestry/producer compatibility, terminal-result schema, exact five-job and
     fourteen-artifact inventories, latest attempt, protected producer run, and
@@ -196,6 +201,7 @@ class ReadOnlyEvidence(Protocol):
     def latest_successful_state_run_id(self, control_sha: str) -> str | None: ...
     def verify_attestation(self, subject: bytes, predicate: str,
                            signer_path: str, control_sha: str) -> bool: ...
+    def reviewed_genesis_phase(self) -> str: ...
 
 
 def _workflow_identities(reader: ReadOnlyEvidence) -> Mapping[int, str]:
@@ -297,6 +303,21 @@ def _fixture(reader: ReadOnlyEvidence, d: Mapping, control: str) -> bytes:
     return subject
 
 
+def _genesis_phase(reader: ReadOnlyEvidence) -> str:
+    """The reviewed live (genesis entry) phase; callers authenticate control first."""
+    entry = reader.reviewed_genesis_phase()
+    require(entry in PHASES, "reviewed-genesis-phase-invalid")
+    return entry
+
+
+def _require_at_or_above_genesis(reader: ReadOnlyEvidence, context: LaunchContext) -> str:
+    """Refuse a launch below the reviewed live phase; return that phase."""
+    entry = _genesis_phase(reader)
+    require(PHASES.index(context.phase) >= PHASES.index(entry),
+            "phase-precedes-reviewed-live-phase")
+    return entry
+
+
 def _predecessor(reader: ReadOnlyEvidence, context: LaunchContext, d: Mapping) -> None:
     current = context.control_sha
     previous = PHASES[PHASES.index(context.phase) - 1]
@@ -343,14 +364,18 @@ def require_launch_ready(reader: ReadOnlyEvidence | None, context: LaunchContext
     try:
         # Reject absent future UI requirements before any remote read or dispatch.
         fixture = descriptor(context.fixture_descriptor, fixture=True)
+        # Authenticate the checkout as clean current protected main BEFORE any
+        # of its reviewed code is executed to read the live phase.
+        require_current_control(reader, context.control_sha)
+        # Genesis is exactly the reviewed live phase; nothing below it may launch.
+        entry = _require_at_or_above_genesis(reader, context)
         predecessor = None
-        if context.phase != "baseline":
+        if context.phase != entry:
             predecessor = descriptor(context.predecessor_descriptor, fixture=False)
             require(context.predecessor_state is not None, "predecessor-state-required")
         else:
             require(context.predecessor_descriptor is None and context.predecessor_state is None,
                     "genesis-must-not-supply-predecessor")
-        require_current_control(reader, context.control_sha)
         metadata = reader.canary_secret_metadata()
         require(metadata.environment == CANARY_ENVIRONMENT and metadata.complete is True
                 and metadata.protected_environment_verified is True,
@@ -534,9 +559,8 @@ class GitHubEvidence:
         guard.require(not status.strip(), "launch-checkout-has-uncommitted-changes")
         return self._head()
 
-    def require_provider_parity(self, context):
-        """Explicit live read-only parity; audit mode cannot enter this path."""
-        guard.require_current_control(self, context.control_sha)
+    def _load_parity(self):
+        """Execute the checkout's parity module; callers authenticate it first."""
         if self._parity is None:
             path = self.root / "release/deployment/sanitized_provider_parity.py"
             name = "rereply_launch_provider_" + hashlib.sha256(str(self.root).encode()).hexdigest()[:16]
@@ -547,6 +571,25 @@ class GitHubEvidence:
             spec.loader.exec_module(module)
             self._parity = module
             self._read_private_inputs = module.make_environment_private_input_reader()
+        return self._parity
+
+    def reviewed_genesis_phase(self):
+        """Genesis entry phase from the raw-byte-pinned verifier and contract only.
+
+        The checkout is authenticated as clean current protected main before its
+        parity module is executed, so a candidate audit never reaches it.
+        """
+        guard.require(self.worktree_sha() == self.current_main_sha(), "launch-checkout-is-not-current-main")
+        parity = self._load_parity()
+        try:
+            return parity.reviewed_genesis_phase(worktree=self.root)
+        except parity.ProviderParityError:
+            raise guard.LaunchBlocked("reviewed-genesis-phase-unavailable") from None
+
+    def require_provider_parity(self, context):
+        """Explicit live read-only parity; audit mode cannot enter this path."""
+        guard.require_current_control(self, context.control_sha)
+        self._load_parity()
         try:
             return self._parity.require_provider_parity(
                 worktree=self.root, control_sha=context.control_sha, phase=context.phase,
@@ -638,7 +681,7 @@ class GitHubEvidence:
     def authenticate_predecessor(self, context):
         """Fresh authenticated bytes for the in-memory provider parity checker."""
         guard.require_current_control(self, context.control_sha)
-        if context.phase == "baseline":
+        if context.phase == guard._require_at_or_above_genesis(self, context):
             guard.require(context.predecessor_descriptor is None and context.predecessor_state is None,
                           "genesis-predecessor-not-empty")
             return None
@@ -836,7 +879,7 @@ def main(argv=None):
     parser.add_argument("command", choices=("audit-public", "check-launch"))
     parser.add_argument("--control-root", required=True, type=Path)
     parser.add_argument("--fixture-evidence", required=True, type=Path)
-    parser.add_argument("--phase", choices=guard.PHASES, default="baseline")
+    parser.add_argument("--phase", choices=guard.PHASES)
     parser.add_argument("--predecessor-evidence", type=Path)
     parser.add_argument("--predecessor-state", type=Path)
     args = parser.parse_args(argv)
@@ -848,6 +891,7 @@ def main(argv=None):
         if args.command == "audit-public":
             outcome = adapter.audit_public(fixture, predecessor, state)
         else:
+            guard.require(args.phase is not None, "launch-phase-required")
             context = guard.LaunchContext(adapter.current_main_sha(), args.phase, fixture, predecessor, state)
             guard.require_launch_ready(adapter, context)
             adapter.require_provider_parity(context)
