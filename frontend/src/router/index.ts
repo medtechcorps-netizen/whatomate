@@ -127,6 +127,15 @@ const router = createRouter({
           }
         },
         {
+          path: 'today',
+          name: 'today',
+          component: () => import('@/views/today/TodayView.vue'),
+          meta: {
+            anyPermissions: ['crm.leads', 'tasks', 'bookings', 'packages', 'payments'],
+            entitlement: 'crm.enabled'
+          }
+        },
+        {
           path: 'crm/automations',
           name: 'crm-automations',
           component: () => import('@/views/crm/AutomationPoliciesView.vue'),
