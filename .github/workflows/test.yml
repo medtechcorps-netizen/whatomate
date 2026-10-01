@@ -327,8 +327,9 @@ jobs:
         run: |
           set -euo pipefail
           npm ci
-          npm audit --audit-level=high --json > "$RUNNER_TEMP/frontend-audit.json" || true
-          python3 - "$RUNNER_TEMP/frontend-audit.json" <<'AUDIT'
+          audit_rc=0
+          npm audit --audit-level=high --json > "$RUNNER_TEMP/frontend-audit.json" || audit_rc=$?
+          python3 - "$RUNNER_TEMP/frontend-audit.json" "$audit_rc" <<'AUDIT'
           import json, sys
 
           # 2026-10-01: the lockfile refresh (axios 1.20.0, brace-expansion
@@ -344,6 +345,23 @@ jobs:
               return bool(rows) and all(meta.get("dev") is True for meta in rows)
 
           report = json.load(open(sys.argv[1], encoding="utf-8"))
+          # npm audit exits 1 exactly when a high or critical advisory exists;
+          # any other exit status, an error object, or an incomplete report
+          # (for example a registry outage) fails closed instead of passing.
+          audit_rc = int(sys.argv[2])
+          if (audit_rc not in (0, 1) or type(report) is not dict or "error" in report
+                  or report.get("auditReportVersion") != 2
+                  or type(report.get("vulnerabilities")) is not dict
+                  or type(report.get("metadata")) is not dict):
+              print("npm audit did not produce a complete report; failing closed")
+              sys.exit(1)
+          high_or_critical = [
+              package for package, entry in report["vulnerabilities"].items()
+              if type(entry) is not dict or entry.get("severity") in ("high", "critical")
+          ]
+          if (audit_rc == 1) != bool(high_or_critical):
+              print("npm audit exit status contradicts its report; failing closed")
+              sys.exit(1)
           blocking = []
           for package, entry in sorted(report.get("vulnerabilities", {}).items()):
               if entry.get("severity") not in ("high", "critical"):

@@ -59,8 +59,9 @@ release evidence on the resulting control SHA.
 
 ### Reviewed fixed-source lineage
 
-Each selected phase is an additive child of its previously reviewed lock-fixed
-source. The exact parent, full changed-file/status/mode/before-and-after blob
+Each selected phase descends, one additive child at a time, from its previously
+reviewed lock-fixed source: lock-fixed source, bounded snapshot, 2026-09-23
+name-fix child, then the 2026-10-01 frontend dependency-refresh child. The exact parent, full changed-file/status/mode/before-and-after blob
 inventory, and root/frontend/internal trees are verified independently. Preserve
 both historical dependency layers: lock-only child to x/crypto-fixed source, then
 go.mod/go.sum-only child to the original source. The new UI lock belongs to this
