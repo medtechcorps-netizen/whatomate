@@ -36,16 +36,16 @@ DATABASE_PHASE_HARNESS_PATH = (
 )
 CONTROL_SHA = "a" * 40
 EXPECTED_FINAL_SOURCE = {
-    "source_sha": "1911174a746e0cc70fd246e6c1f45bc65ba12946",
-    "root_tree": "eaba0b104abc04500776aafb680993d3d7065748",
-    "frontend_tree": "09b0efe5124317d2d5561548f1082b8902144d58",
+    "source_sha": "6f25ea1919ee28856dee59d5fd121671214087e3",
+    "root_tree": "2a2c14e83f4524d860a65a8735c16111178e7fd3",
+    "frontend_tree": "4e027a24fcb34c2b4951d2c628dd63a3c67cc87e",
     "internal_tree": "a43572db8ee7e5a7cf2ccaf3e880a181c91ed183"
 }
 STALE_FINAL_SOURCE = {
-    "source_sha": "ab44af2e7c093b4502c1928126c31306b2ba0389",
-    "root_tree": "3553b783d5cfdcbda2ffcee332a2aa392a897bc5",
-    "frontend_tree": "2f92a064f2f3d7f1867c835ef3be7f41e2f30444",
-    "internal_tree": "494d3957ff3559375f406886be45646049ec9378",
+    "source_sha": "1911174a746e0cc70fd246e6c1f45bc65ba12946",
+    "root_tree": "eaba0b104abc04500776aafb680993d3d7065748",
+    "frontend_tree": "09b0efe5124317d2d5561548f1082b8902144d58",
+    "internal_tree": "a43572db8ee7e5a7cf2ccaf3e880a181c91ed183",
 }
 ORIGINAL_PHASE_SOURCE_SHA = {
     "baseline": "974bb998f6d4c94ce750a92bf23f4550f8e45a2f",
@@ -99,6 +99,27 @@ REVIEWED_NAME_FIX_BLOBS = {
         "internal/handlers/accounts_contract_test.go": "97fed1b28de132026a6b37d01f4692e204ed594c",
     },
 }
+# 2026-09-23 name-fix children: the parents of the 2026-10-01 dependency refresh.
+NAME_FIX_PHASE_SOURCE_SHA = {
+    "baseline": "3cedc58fad2cabe7c63646f6ad10ca4d8dc1f2b9",
+    "bridge": "0e805531cf8b1dd3f1df0f637b214c28b169a30f",
+    "backend": "2cd616279c2548e0483e8e6b545812e98aefebbf",
+    "ui": "1911174a746e0cc70fd246e6c1f45bc65ba12946",
+}
+# 2026-10-01 dependency refresh: axios 1.20.0, dompurify 3.4.16,
+# brace-expansion 5.0.12, plus js-yaml 4.3.2 in the shared pre-ui lockfile.
+REFRESHED_PACKAGE_JSON_BLOB = "667f883b0ea26c6db453e245f0102b114a56eae3"
+REFRESHED_PRE_UI_LOCK_BLOB = "379ad59f4ff3bc7aab83de7b82f9e49fba371a7a"
+REVIEWED_DEPENDENCY_REFRESH_BLOBS = {
+    phase: {
+        "frontend/package-lock.json": (
+            "e5a30d345ff985cd97f4c3a5f19f4bcdafbe2c0d" if phase == "ui"
+            else REFRESHED_PRE_UI_LOCK_BLOB
+        ),
+        "frontend/package.json": REFRESHED_PACKAGE_JSON_BLOB,
+    }
+    for phase in ("baseline", "bridge", "backend", "ui")
+}
 REVIEWED_SNAPSHOT_DIFF_SHA256 = {
     "baseline": "89853139e27533073431fa59744187dba525a555984e73ba0da298f4d54bdcdc",
     "bridge": "26fb15a3362cf13f8cb0435266a578c80be962e6980b99c4dee11c964fd946e5",
@@ -151,6 +172,18 @@ def require_reviewed_snapshot_diff(phase: str, raw: bytes) -> list[dict[str, str
     if (len(records) != REVIEWED_SNAPSHOT_PATH_COUNTS[phase]
             or hashlib.sha256(canonical).hexdigest() != REVIEWED_SNAPSHOT_DIFF_SHA256[phase]):
         raise AssertionError("reviewed complete snapshot inventory differs")
+    return records
+
+
+def require_reviewed_dependency_refresh(phase: str, raw: bytes) -> list[dict[str, str]]:
+    """The 2026-10-01 children change exactly the two frontend manifests, in place."""
+    records = snapshot_diff_records(raw)
+    if ({record["path"]: record["after"] for record in records}
+            != REVIEWED_DEPENDENCY_REFRESH_BLOBS[phase]
+            or not all(record["status"] == "M"
+                       and record["old_mode"] == record["new_mode"] == "100644"
+                       for record in records)):
+        raise AssertionError("reviewed dependency refresh differs")
     return records
 
 
@@ -334,9 +367,9 @@ class RolloutEvidenceTests(unittest.TestCase):
                         require_reviewed_snapshot_diff(phase, mutant)
 
     def test_phase_source_children_apply_only_the_reviewed_name_fix(self) -> None:
-        for phase, source in self.manifest["phases"].items():
+        for phase in self.manifest["phases"]:
             with self.subTest(phase=phase):
-                commit = source["source_sha"]
+                commit = NAME_FIX_PHASE_SOURCE_SHA[phase]
                 parent = REVIEWED_PHASE_SNAPSHOT_SHA[phase]
 
                 def git(*arguments: str) -> bytes:
@@ -366,6 +399,54 @@ class RolloutEvidenceTests(unittest.TestCase):
                         git("rev-parse", f"{commit}:{unchanged}"),
                         git("rev-parse", f"{parent}:{unchanged}"),
                     )
+
+    def test_phase_sources_apply_only_the_reviewed_dependency_refresh(self) -> None:
+        for phase, source in self.manifest["phases"].items():
+            with self.subTest(phase=phase):
+                commit = source["source_sha"]
+                parent = NAME_FIX_PHASE_SOURCE_SHA[phase]
+
+                def git(*arguments: str) -> bytes:
+                    return subprocess.run(
+                        ["git", "-C", str(ROOT), *arguments],
+                        check=True, capture_output=True,
+                    ).stdout
+
+                self.assertEqual(
+                    git("rev-list", "--parents", "-n", "1", commit).decode().split(),
+                    [commit, parent],
+                )
+                raw = git("diff-tree", "--no-commit-id", "--raw", "--no-abbrev",
+                          "--no-renames", "-r", "-z", parent, commit)
+                records = require_reviewed_dependency_refresh(phase, raw)
+                self.assertEqual(
+                    [record["before"] for record in records],
+                    [git("rev-parse", f"{parent}:{record['path']}").decode().strip()
+                     for record in records],
+                )
+                self.assertEqual(
+                    git("rev-parse", f"{commit}:internal"),
+                    git("rev-parse", f"{parent}:internal"),
+                )
+                self.assertEqual(git("rev-parse", f"{commit}:internal").decode().strip(),
+                                 source["internal_tree"])
+                # Complete-record mutations: blob, mode, path, missing and extra records.
+                fields = raw[:-1].split(b"\0")
+                header = fields[0].split(b" ")
+                changed_header = list(header)
+                changed_header[3] = (b"1" if header[3][:1] == b"0" else b"0") + header[3][1:]
+                mutants = (
+                    b"\0".join([b" ".join(changed_header), *fields[1:]]) + b"\0",
+                    b":100755" + raw[7:],
+                    b"\0".join([fields[0], b"frontend/unexpected.json", *fields[2:]]) + b"\0",
+                    b"\0".join(fields[2:]) + b"\0",
+                    raw + b":100644 100644 " + b"0" * 40 + b" " + b"1" * 40
+                    + b" M\0internal/database/postgres.go\0",
+                )
+                for mutant in mutants:
+                    self.assertNotEqual(mutant, raw)
+                    with self.assertRaises(AssertionError):
+                        require_reviewed_dependency_refresh(phase, mutant)
 
     def test_phase_sources_apply_only_the_reviewed_dependency_remediation(self) -> None:
         for phase, source in self.manifest["phases"].items():

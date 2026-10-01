@@ -173,27 +173,27 @@ DATABASE_PHASE_POLICIES = {
 
 EXPECTED_PHASE_SOURCES = {
     "baseline": {
-        "source_sha": "3cedc58fad2cabe7c63646f6ad10ca4d8dc1f2b9",
-        "root_tree": "e68b752b45361dcd2d91ed4be91f509a3aa1719b",
-        "frontend_tree": "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
+        "source_sha": "0267981e3396178a8b343fd7a091ca98f631d0f4",
+        "root_tree": "6f9b6eb60306461b55cdb4d77412ea6c751f012f",
+        "frontend_tree": "6974feb5616df9758ab6d2456a94106da8b9bc6b",
         "internal_tree": "1a66931fc6b9d91daae09f71f092c294215815b3"
     },
     "bridge": {
-        "source_sha": "0e805531cf8b1dd3f1df0f637b214c28b169a30f",
-        "root_tree": "4da989a2f2dbff05021532891e20136a15c1778c",
-        "frontend_tree": "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
+        "source_sha": "0804f91e4f40065406e9343149b578133519a962",
+        "root_tree": "9dd1ba3d8f711fbce826f4aea6b7a53cf25579c3",
+        "frontend_tree": "6974feb5616df9758ab6d2456a94106da8b9bc6b",
         "internal_tree": "353617ae6a72adc0c896434d2dfe97cf903245c8"
     },
     "backend": {
-        "source_sha": "2cd616279c2548e0483e8e6b545812e98aefebbf",
-        "root_tree": "5a16091bef92d9d25d39014cd90844fc240d34f6",
-        "frontend_tree": "3a05b5d1ab184bb1cd674d02e1bf14f834d266ae",
+        "source_sha": "78632dc4ff23e10bf8b78abb543b14dce511bca3",
+        "root_tree": "52689d59ba7f4349bd619e00d9c55a028e505aeb",
+        "frontend_tree": "6974feb5616df9758ab6d2456a94106da8b9bc6b",
         "internal_tree": "6db4f94130788bdb236ede130a0601fa7d4163c1"
     },
     "ui": {
-        "source_sha": "1911174a746e0cc70fd246e6c1f45bc65ba12946",
-        "root_tree": "eaba0b104abc04500776aafb680993d3d7065748",
-        "frontend_tree": "09b0efe5124317d2d5561548f1082b8902144d58",
+        "source_sha": "6f25ea1919ee28856dee59d5fd121671214087e3",
+        "root_tree": "2a2c14e83f4524d860a65a8735c16111178e7fd3",
+        "frontend_tree": "4e027a24fcb34c2b4951d2c628dd63a3c67cc87e",
         "internal_tree": "a43572db8ee7e5a7cf2ccaf3e880a181c91ed183"
     }
 }

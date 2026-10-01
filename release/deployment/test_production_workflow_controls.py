@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
+import sys
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -71,7 +74,12 @@ EXACT_IMAGE_BUILD_ACTION = (
     "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6"
 )
 EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
-    "5ca6565f32d4bf64d7dce4c36b09011cf6ed9fb9e7a68069014d730a43bac0cd"
+    "9bab2c323f9ac956d4e85034943e979224b3a3789eb2b5e3364080a983e9aeb8"
+)
+# 2026-10-01: the release gate's frontend audit policy (empty allow-list,
+# fail-closed on an incomplete npm audit report) is pinned byte for byte.
+EXACT_RELEASE_FRONTEND_AUDIT_STEP_SHA256 = (
+    "ebcfa2c6bb286870d9685a5b5d70d0cd8bf12f759a1b8dbcedb2e0cf9a70a6b5"
 )
 EXACT_CRM_CANARY_DRIVER_PUBLISHER_SHA256 = (
     "e221060ea125b6bd4e35eb0c1111311e8932a23de4dc4e59bb5671115cc7a510"
@@ -80,7 +88,7 @@ EXACT_IMAGE_GATE_STEP_SHA256 = (
     "1b4bf101f1756d43193ccc0050cf44bb9dd22df25302e084c9a9a91ede2db4a5"
 )
 EXACT_IMAGE_AUTHORITY_MATRIX_STEP_SHA256 = (
-    "3a8061a32008502c4e7c8f5a36fe9a32b773c33b093a15913e606a0328079021"
+    "97a6bdda7ebb11b1f6322e42a57562ad6483cf190552e2dad45b924b69a4ada6"
 )
 EXACT_RELEASE_WEB_SNAPSHOT_RUN = (
     "RUN set -eu; "
@@ -125,7 +133,7 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
     ),
 }
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "921891fa1c2dc314dffaeafe57d4b94440cbb4e04e10cfe537b3bc53bceae257"
+    "0eb4da2054d0cdf3496028870afd120b12cdc08ba313e607c3e9e88f7eab4e81"
 )
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
     "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
@@ -137,7 +145,7 @@ EXACT_GATE_B_TEST_JOB_SHA256 = {
     "release-controls": "79645bf97ed1574bcb760af561a525ffc028e2ea34e27b9ca51af177ba59590a",
     "go-race": "863b563a974a7050c7061eaeb80b6c5bd96ca88e0a95e6666bad511da636e192",
     "lint": "a2402a41b92ca872b93b87e2e24cdd3d4b3703bfcf3534d1e1bf410bf0fe619c",
-    "security": "405c4f39062f37db3e2965d55fe8734a6fd5ba6b3ffbf618468772bf1493ce1b",
+    "security": "8058851a94355f512f8e850e295f56f15cfb46921c990332177bd1eb39e58073",
     "recovery-boundary-images": (
         "90daa97f1350ea5ec53dfc0b86416138fc4737928e6a7d089c33276aa36eaea2"
     ),
@@ -170,6 +178,22 @@ def step_block(source: str, name: str) -> str:
     if match is None:
         raise AssertionError(f"step not found: {name}")
     return match.group(0)
+
+
+def run_frontend_audit_policy(step: str, report: object, rc: int, lock: dict) -> int:
+    """Run a workflow's embedded frontend audit policy against a synthetic report."""
+    script = textwrap.dedent(step.split("<<'AUDIT'\n", 1)[1].split("\n          AUDIT", 1)[0])
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "policy.py").write_text(script, encoding="utf-8")
+        (root / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
+        report_path = root / "report.json"
+        report_path.write_text(report if type(report) is str else json.dumps(report),
+                               encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, "-I", "-S", "policy.py", str(report_path), str(rc)],
+            cwd=root, capture_output=True, text=True, timeout=60,
+        ).returncode
 
 
 def shell_function_block(source: str, name: str) -> str:
@@ -3431,6 +3455,55 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
         self.assertRegex(gate, r"(?m)^\s+- verify_set\s*$")
         self.assertIn("VERIFY_SET_RESULT: ${{ needs.verify_set.result }}", gate)
         self.assertIn('"$VERIFY_SET_RESULT"', gate)
+
+    def test_frontend_audit_policies_have_no_exceptions_and_fail_closed(self) -> None:
+        release_step = step_block(
+            workflow("validate-exact-release-source.yml"), "Audit locked frontend dependencies"
+        )
+        self.assertEqual(
+            hashlib.sha256(release_step.encode("utf-8")).hexdigest(),
+            EXACT_RELEASE_FRONTEND_AUDIT_STEP_SHA256,
+        )
+        gate_step = step_block(workflow("test.yml"), "Audit frontend dependencies")
+        lock = {"packages": {
+            "": {"name": "fixture"},
+            "node_modules/runtime-lib": {"version": "1.0.0"},
+            "node_modules/build-tool": {"version": "1.0.0", "dev": True},
+        }}
+
+        def report(**vulnerabilities: dict) -> dict:
+            return {"auditReportVersion": 2, "vulnerabilities": vulnerabilities,
+                    "metadata": {"vulnerabilities": {}}}
+
+        def advisory(package: str, severity: str) -> dict:
+            return {"name": package, "severity": severity, "via": [{
+                "name": package, "title": "synthetic advisory", "severity": severity}]}
+
+        cases = {
+            "clean": (report(), 0, 0),
+            "moderate only": (report(**{"build-tool": advisory("build-tool", "moderate")}), 0, 0),
+            "high production": (report(**{"runtime-lib": advisory("runtime-lib", "high")}), 1, 1),
+            "critical production": (report(**{"runtime-lib": advisory("runtime-lib", "critical")}), 1, 1),
+            "high dev-only": (report(**{"build-tool": advisory("build-tool", "high")}), 1, 1),
+            "registry error": ({"error": {"code": "E503", "summary": "unavailable"}}, 1, 1),
+            "error beside an empty report": (dict(report(), error={"code": "E500"}), 1, 1),
+            "missing vulnerabilities": ({"auditReportVersion": 2, "metadata": {}}, 0, 1),
+            "old report version": (dict(report(), auditReportVersion=1), 0, 1),
+            "npm crashed": (report(), 2, 1),
+            "exit 1 without findings": (report(), 1, 1),
+            "exit 0 with a high finding": (
+                report(**{"runtime-lib": advisory("runtime-lib", "high")}), 0, 1),
+            "not json": ("npm ERR! network", 1, 1),
+            "not an object": ([], 0, 1),
+        }
+        for label, step in (("release gate", release_step), ("ci gate", gate_step)):
+            self.assertRegex(step, r"(?m)^          ALLOWED = set\(\)$")
+            self.assertIn('|| audit_rc=$?', step)
+            self.assertNotIn("|| true", step)
+            for name, (body, rc, expected) in cases.items():
+                with self.subTest(gate=label, case=name):
+                    returned = run_frontend_audit_policy(step, body, rc, lock)
+                    self.assertEqual(returned != 0, expected == 1, returned)
 
     def test_release_image_producer_requires_stable_exact_artifact_inventory(self) -> None:
         source = workflow("build-attest-exact-release-images.yml")

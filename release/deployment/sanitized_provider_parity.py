@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Callable
 
 
-VERIFIER_SHA256 = "1c36fbb582207bb7d62646d6086cac2d13b9ed3e559a589f8f27fe7d22f64cab"
+VERIFIER_SHA256 = "c117601c8f45f223231bc84d4b63c064217d4fa2d52e7c8bae9af66f97e545b3"
 CONTRACT_SHA256 = "0cda6325a566aca3aa5f2d78c4152f708d5aad5c7feb116a67bde7234b1c4c27"
 PHASES = ("baseline", "bridge", "backend", "ui")
 STATE_WORKFLOW = ".github/workflows/verify-production-crm-canary.yml"
