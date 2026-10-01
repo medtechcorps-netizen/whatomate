@@ -241,6 +241,32 @@ def valid_intent() -> dict[str, Any]:
     return common.validate_mutation_intent(intent)
 
 
+def valid_reentry_intent() -> dict[str, Any]:
+    """A genesis re-entry at the live ui phase (event 1, ordinal 4)."""
+    intent = valid_intent()
+    intent["lineage"].update(
+        {"event_sequence": 1, "phase_ordinal": 4, "from": "genesis", "to": "ui", "phase": "ui"}
+    )
+    before = before_state()
+    before["source_mode"] = "digest-images"
+    before["images"] = image_records("8")
+    intent["before"] = before
+    before_hash = common.sha256_value(before)
+    desired_hash = common.sha256_value(intent["desired"])
+    intent["mutation"]["before_sha256"] = before_hash
+    intent["mutation"]["mutation_fingerprint_sha256"] = common.sha256_value(
+        {
+            "before_sha256": before_hash,
+            "desired_sha256": desired_hash,
+            "http_method": "PUT",
+            "endpoint_label": "app",
+            "update_all_source_versions": False,
+        }
+    )
+    intent["rollback"] = copy.deepcopy(common.ROLLBACK_FLOORS["ui"])
+    return common.validate_mutation_intent(intent)
+
+
 def valid_hardened_rollback_intent() -> dict[str, Any]:
     intent = valid_intent()
     before = desired_public_state()
@@ -892,6 +918,44 @@ class ReconcileProductionOrphanTests(unittest.TestCase):
             )],
             [True, True, False, False, False],
         )
+
+    def test_genesis_reentry_orphan_reconciles_through_every_outcome(self) -> None:
+        intent = valid_reentry_intent()
+        committed = build_receipt(public=desired_public_state(), migration_succeeded=True, intent=intent)
+        already = build_receipt(
+            public=desired_public_state(), migration_succeeded=True,
+            with_original_receipt=True, intent=intent,
+        )
+        no_mutation = build_receipt(public=intent["before"], migration_succeeded=False, intent=intent)
+        self.assertEqual(
+            [receipt["classification"]["outcome"] for receipt in (committed, already, no_mutation)],
+            ["committed", "already-receipted", "no-mutation"],
+        )
+        for receipt in (committed, already, no_mutation):
+            common.validate_reconciliation_receipt(receipt)
+            self.assertEqual(
+                {key: receipt["lineage"][key] for key in ("event_sequence", "phase_ordinal", "from", "to")},
+                {"event_sequence": 1, "phase_ordinal": 4, "from": "genesis", "to": "ui"},
+            )
+            self.assertEqual(receipt["rollback"], common.ROLLBACK_FLOORS["ui"])
+        receipt_hash = common.sha256_bytes(common.canonical_file_bytes(committed))
+        state = common.build_phase_state(
+            committed,
+            change_receipt_sha256=receipt_hash,
+            canary_sha256=sha("9"),
+            control={
+                "workflow_sha": RECONCILE_CONTROL_SHA,
+                "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
+                "run_id": "701",
+                "run_attempt": 1,
+                "runner_environment": "github-hosted",
+                "release_policy_sha256": committed["control"]["release_policy_sha256"],
+                "change_schema_sha256": committed["control"]["change_schema_sha256"],
+            },
+            completed_at="2026-08-27T00:09:00Z",
+        )
+        self.assertEqual(state["lineage"]["predecessor_kind"], "reconciliation-receipt")
+        common.validate_phase_state(state)
 
     def test_original_receipt_floor_must_equal_the_signed_intent(self) -> None:
         intent = valid_intent()

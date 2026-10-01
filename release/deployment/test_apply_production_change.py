@@ -1379,5 +1379,236 @@ class RebaselinedProviderObservationTests(unittest.TestCase):
             apply._require_materially_unchanged(*arguments)
 
 
+def rollout_capsule() -> dict[str, object]:
+    phases = []
+    for index, phase in enumerate(common.PHASES):
+        images = [
+            {
+                "component": component,
+                "image": f"ghcr.io/medtechcorps-netizen/rereply-release-{component}",
+                "digest": digest(str(index + 1)),
+                "platform": "linux/amd64",
+                "tag": f"{phase}-{component}",
+                "tag_is_authority": False,
+                "dockerfile": "docker/release/x.Dockerfile",
+                "dockerfile_sha256": "0" * 64,
+            }
+            for component in ("web", "meta-relay", "gmail-relay")
+        ]
+        phases.append({
+            "phase": phase,
+            "images": images,
+            "migration": {"digest": digest(str(index + 1))},
+            "rollback": copy.deepcopy(common.ROLLBACK_FLOORS[phase]),
+        })
+    return {"activation_order": list(common.PHASES), "phases": phases}
+
+
+def genesis_plan(contract_raw: bytes, source: str, target: str, ordinal: int) -> dict[str, object]:
+    index = common.PHASES.index(target)
+    return {
+        "control": {"contract_sha256": common.sha256_bytes(contract_raw)},
+        "transition": {"operation": "activate", "from": source, "to": target, "ordinal": ordinal},
+        "target": {
+            "phase": target,
+            "source_sha": "1" * 40,
+            "images": common.sanitized_image_records(
+                {component: digest(str(index + 1)) for component in ("web", "meta-relay", "gmail-relay")}
+            ),
+            "migration": {"digest": digest(str(index + 1))},
+        },
+    }
+
+
+class GenesisEntryGuardTests(unittest.TestCase):
+    def contract_file(self, temporary: str, bootstrap: dict[str, object]) -> tuple[Path, bytes]:
+        path = Path(temporary) / "production-app-contract.json"
+        raw = common.canonical_file_bytes({"bootstrap_state": bootstrap})
+        path.write_bytes(raw)
+        return path, raw
+
+    def test_genesis_must_target_the_contract_live_phase(self) -> None:
+        rollout = rollout_capsule()
+        digest_ui = {"source_mode": "digest-images", "images": [], "live_phase": "ui"}
+        digest_baseline = {"source_mode": "digest-images", "images": [], "live_phase": "baseline"}
+        legacy = {"source_mode": "legacy-git"}
+        cases = (
+            (digest_ui, "genesis", "ui", 4, True),
+            (digest_ui, "genesis", "baseline", 1, False),
+            (digest_ui, "genesis", "ui", 1, False),
+            (digest_ui, "genesis", "backend", 3, False),
+            (digest_ui, "backend", "ui", 4, True),
+            (digest_ui, "bridge", "ui", 4, False),
+            # Below the live phase from a non-genesis source (defense in depth).
+            (digest_ui, "baseline", "bridge", 2, False),
+            (digest_ui, "bridge", "backend", 3, False),
+            # A digest bootstrap is never live at baseline (ui only).
+            (digest_baseline, "genesis", "baseline", 1, False),
+            (digest_baseline, "genesis", "ui", 4, False),
+            (legacy, "genesis", "baseline", 1, True),
+            (legacy, "baseline", "bridge", 2, True),
+            (legacy, "genesis", "ui", 4, False),
+            ({"source_mode": "digest-images", "live_phase": "bridge"}, "genesis", "bridge", 2, False),
+            ({"source_mode": "digest-images"}, "genesis", "ui", 4, False),
+            ({"source_mode": "legacy-git", "live_phase": "ui"}, "genesis", "ui", 4, False),
+        )
+        for bootstrap, source, target, ordinal, accepted in cases:
+            with self.subTest(bootstrap=bootstrap, edge=(source, target, ordinal)):
+                with tempfile.TemporaryDirectory() as temporary:
+                    path, raw = self.contract_file(temporary, bootstrap)
+                    plan = genesis_plan(raw, source, target, ordinal)
+                    if accepted:
+                        result = apply._plan_images(plan, rollout, contract_path=path)
+                        self.assertEqual(result[:2], (source, target))
+                    else:
+                        with self.assertRaisesRegex(common.ReleaseError, "production activation sequence differs|live phase|source mode"):
+                            apply._plan_images(plan, rollout, contract_path=path)
+
+    def test_genesis_guard_binds_the_signed_contract_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path, raw = self.contract_file(temporary, {"source_mode": "digest-images", "images": [], "live_phase": "ui"})
+            plan = genesis_plan(raw, "genesis", "ui", 4)
+            plan["control"]["contract_sha256"] = "1" * 64
+            with self.assertRaisesRegex(common.ReleaseError, "production contract differs from the signed plan"):
+                apply._plan_images(plan, rollout_capsule(), contract_path=path)
+
+    def test_genesis_guard_runs_before_the_lock_and_before_the_put(self) -> None:
+        prepare = inspect.getsource(apply.prepare_apply_mutation_intent)
+        self.assertIn("_plan_images(\n        plan, rollout, contract_path=contract_path\n    )", prepare)
+        source = inspect.getsource(apply.apply_change)
+        self.assertIn("_plan_images(\n        plan, rollout, contract_path=contract_path\n    )", source)
+        self.assertLess(source.index("_plan_images("), source.index("ProductionAppClient("))
+        self.assertLess(source.index("_plan_images("), source.index("put_app_once"))
+
+    def test_reviewed_contract_admits_only_the_ui_reentry(self) -> None:
+        contract = common.loads_strict(apply.CONTRACT_PATH.read_bytes())
+        self.assertEqual(apply.contract_genesis_phase(contract), "ui")
+
+    def test_apply_reviewed_live_phase_is_the_plan_verifier_live_phase(self) -> None:
+        contract = common.loads_strict(apply.CONTRACT_PATH.read_bytes())
+        self.assertEqual(apply.APPLY_REVIEWED_LIVE_PHASE, planner.BOOTSTRAP_LIVE_PHASE)
+        self.assertEqual(apply.APPLY_REVIEWED_LIVE_PHASE, contract["bootstrap_state"]["live_phase"])
+        self.assertIn(apply.APPLY_REVIEWED_LIVE_PHASE, planner.GENESIS_ENTRY_PHASES)
+        self.assertIn(apply.APPLY_REVIEWED_LIVE_PHASE, common.GENESIS_ACTIVATION_TARGETS)
+        # A digest contract claiming any other live phase is refused even if a
+        # plan signed it (the plan verifier would refuse it too).
+        for live in ("baseline", "bridge", "backend"):
+            with self.subTest(live=live), self.assertRaisesRegex(
+                    common.ReleaseError, "production contract live phase is not the reviewed live phase"):
+                apply.contract_genesis_phase({"bootstrap_state": {"source_mode": "digest-images", "live_phase": live}})
+
+    def test_every_activation_is_floored_at_the_contract_live_phase(self) -> None:
+        rollout = rollout_capsule()
+        live_ui = {"source_mode": "digest-images", "images": [], "live_phase": "ui"}
+        for source in ("genesis", *common.PHASES):
+            for target in common.PHASES[:common.PHASES.index("ui")]:
+                for ordinal in (common.PHASES.index(target) + 1, 4):
+                    with self.subTest(edge=(source, target, ordinal)), tempfile.TemporaryDirectory() as temporary:
+                        path, raw = self.contract_file(temporary, live_ui)
+                        with self.assertRaisesRegex(common.ReleaseError, "production activation precedes the reviewed live phase"):
+                            apply._plan_images(genesis_plan(raw, source, target, ordinal), rollout, contract_path=path)
+
+    def test_apply_and_plan_agree_on_the_genesis_entry(self) -> None:
+        bootstraps = [
+            {"source_mode": "legacy-git"},
+            {"source_mode": "legacy-git", "live_phase": "ui"},
+            {"source_mode": "digest-images"},
+            *({"source_mode": "digest-images", "live_phase": phase}
+              for phase in ("genesis", "baseline", "bridge", "backend", "ui", None, 4)),
+            {"source_mode": "unknown", "live_phase": "ui"},
+        ]
+        for bootstrap in bootstraps:
+            with self.subTest(bootstrap=bootstrap):
+                contract = {"bootstrap_state": bootstrap}
+                try:
+                    expected = planner.genesis_target_phase(contract)
+                except planner.PlanError:
+                    expected = None
+                try:
+                    actual = apply.contract_genesis_phase(contract)
+                except common.ReleaseError:
+                    actual = None
+                self.assertEqual(actual, expected)
+
+
+class LiveFloorInductionTests(unittest.TestCase):
+    """No phase state below the reviewed live phase can be produced at a control.
+
+    Rollback, orphan rollback, canary signing, cleanup, finalize and both
+    lock-release lanes have no live-phase rule of their own; they accept only
+    evidence signed at the current control (docs: "Live-phase floor
+    induction"). This proves the induction step those lanes rely on: the plan
+    refuses every predecessor below the live phase, apply (the only receipt
+    producer) refuses every activation below it, and a phase state can only be
+    signed from a change receipt whose target it inherits.
+    """
+
+    def reviewed_plan(self, source: str, target: str) -> tuple[dict[str, object], Path]:
+        raw = apply.CONTRACT_PATH.read_bytes()
+        return genesis_plan(raw, source, target, common.PHASES.index(target) + 1), apply.CONTRACT_PATH
+
+    def test_apply_produces_only_activations_at_or_above_the_live_phase(self) -> None:
+        live = apply.contract_genesis_phase(common.loads_strict(apply.CONTRACT_PATH.read_bytes()))
+        self.assertEqual(live, "ui")
+        accepted = set()
+        for source in ("genesis", *common.PHASES):
+            for target in common.PHASES:
+                plan, path = self.reviewed_plan(source, target)
+                try:
+                    apply._plan_images(plan, rollout_capsule(), contract_path=path)
+                except common.ReleaseError:
+                    continue
+                accepted.add((source, target))
+        # genesis->ui is the only activation without a signed predecessor.
+        self.assertEqual(accepted, {("genesis", "ui"), ("backend", "ui")})
+        self.assertTrue(all(common.PHASES.index(target) >= common.PHASES.index(live) for _, target in accepted))
+
+    def test_plan_refuses_every_predecessor_below_the_live_phase(self) -> None:
+        import test_verify_production_plan as plan_fixtures
+
+        base = plan_fixtures.reentry_fixture(self, "ui")
+        states = [base.phase_state(phase) for phase in ("baseline", "bridge", "backend")]
+        states += [
+            base.phase_state(phase, event_sequence=7, operation="rollback", source_phase="ui",
+                             predecessor_kind="rollback-receipt")
+            for phase in common.ROLLBACK_FLOORS["ui"]["allowed_targets"]
+        ]
+        for state in states:
+            with self.subTest(phase=state["lineage"]["phase"], operation=state["lineage"]["operation"]):
+                normalized, _ = base.input_for_state(state)
+                with self.assertRaisesRegex(planner.PlanError, "phase state precedes the reviewed live phase"):
+                    planner.validate_rollout_plan(
+                        base.rollout, base.contract, normalized, policy=base.policy,
+                        policy_sha256=base.policy_hash, schema_sha256=base.schema_hash,
+                        predecessor_state=state,
+                    )
+        # So the backend->ui activation apply admits has no signable source in
+        # this epoch, and the only plan apply can receive is genesis->ui.
+        target, _images, transition, _predecessor = planner.validate_rollout_plan(
+            base.rollout, base.contract, base.normalized, policy=base.policy,
+            policy_sha256=base.policy_hash, schema_sha256=base.schema_hash,
+            predecessor_state=None,
+        )
+        self.assertEqual((transition["from"], target["phase"]), ("genesis", "ui"))
+
+    def test_phase_states_inherit_their_receipt_target_so_rollback_has_no_target(self) -> None:
+        import test_verify_production_release as release_fixtures
+
+        receipt = release_fixtures.reentry_receipt()
+        receipt_hash = common.sha256_bytes(common.canonical_file_bytes(receipt))
+        state = common.build_phase_state(
+            receipt, change_receipt_sha256=receipt_hash, canary_sha256="9" * 64,
+            control=release_fixtures.STATE_CONTROL, completed_at="2026-08-27T00:01:00Z",
+        )
+        self.assertEqual(state["lineage"]["phase"], receipt["lineage"]["to"])
+        self.assertEqual(state["lineage"]["phase"], "ui")
+        # The only state signable at the control is ui, and ui cannot roll back to
+        # itself; ui's floor targets (backend, bridge) need a state below the live
+        # phase, which the two tests above show can never be produced.
+        with self.assertRaisesRegex(common.ReleaseError, "rollback target violates the signed floor"):
+            common.validate_rollback_transition("ui", state["lineage"]["phase"])
+        self.assertEqual(common.ROLLBACK_FLOORS["ui"]["allowed_targets"], ["backend", "bridge"])
+
+
 if __name__ == "__main__":
     unittest.main()

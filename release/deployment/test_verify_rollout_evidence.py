@@ -1338,5 +1338,85 @@ class RolloutEvidenceTests(unittest.TestCase):
                 verifier.inspect_capsule_archive(archive, self.contract, None)
 
 
+# sha256 of each committed live-evidence blob (LF bytes, never converted).
+COMMITTED_LIVE_EVIDENCE_SHA256 = {
+    "production-phase-apply-receipt-36773451426-1.json":
+        "de742cb5f24d814b78eb9665b266e1dadd33883bde1c84e73e9d7b328934281e",
+    "production-phase-apply-receipt-36773451426-1.predicate-receipt-v1.sigstore.json":
+        "2ef19ba92a543a7f9d82257b967647a42c59f52ad47327c5adb42e2be39fe781",
+    "production-phase-apply-receipt-36773451426-1.predicate-slsa-provenance-v1.sigstore.json":
+        "185db243c5097da8dbf9533f85bdc6aeebb8f467784ddbd8b47dbd9eac8802f2",
+    "production-phase-apply-receipt-36773451426-1.sha256":
+        "764c5a791601b47f3a48660987f25a76286e99ec68fe27f15d692559c9c6cfd0",
+}
+
+
+class LiveEvidenceHistoryTests(unittest.TestCase):
+    """Git-history rules for the genesis re-entry evidence (needs full history)."""
+
+    @staticmethod
+    def git(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(["git", "-C", str(ROOT), *arguments], check=check, capture_output=True)
+
+    def test_genesis_reentry_source_descends_from_the_live_phase_source(self) -> None:
+        # A re-entry target must never be older code than the phase already live.
+        import verify_production_plan as plan_verifier
+
+        live_source = plan_verifier.BOOTSTRAP_LIVE_EVIDENCE["phase_source_sha"]
+        self.assertEqual(live_source, NAME_FIX_PHASE_SOURCE_SHA["ui"])
+        self.assertEqual(plan_verifier.UI_TARGET_SOURCE_SHA, EXPECTED_FINAL_SOURCE["source_sha"])
+        ancestry = self.git("merge-base", "--is-ancestor", live_source,
+                            plan_verifier.UI_TARGET_SOURCE_SHA, check=False)
+        self.assertEqual(ancestry.returncode, 0, ancestry.stderr.decode(errors="replace"))
+        reverse = self.git("merge-base", "--is-ancestor", plan_verifier.UI_TARGET_SOURCE_SHA,
+                           live_source, check=False)
+        self.assertEqual(reverse.returncode, 1)
+
+    def test_committed_live_evidence_is_never_removed_or_rewritten(self) -> None:
+        # Every committed live-evidence file stays committed, byte for byte:
+        # the monotonic live-phase floor is computed over all of them.
+        directory = "release/deployment/live-evidence"
+        # Walk first parents only and diff every merge against its first parent.
+        # Default history simplification would otherwise follow a TREESAME
+        # parent that never had the evidence (hiding a merge that drops or
+        # replaces it), and a plain `git log` shows no merge diffs at all (hiding
+        # a merge that rewrites it). This also holds for CI's synthetic
+        # pull_request merge ref, whose first parent is the base branch.
+        first_parent = ("--first-parent", "--diff-merges=first-parent")
+        history = self.git("log", *first_parent, "--format=", "--name-status", "--no-renames",
+                           "HEAD", "--", directory)
+        records = [line.split("\t") for line in history.stdout.decode("utf-8").splitlines() if line]
+        self.assertTrue(all(len(record) == 2 for record in records), records)
+        statuses = {status for status, _path in records}
+        self.assertLessEqual(statuses, {"A"}, "committed live evidence was modified or deleted")
+        added = [path for _status, path in records]
+        self.assertEqual(len(added), len(set(added)), "live evidence was added more than once")
+        committed = {
+            line for line in self.git("ls-tree", "-r", "--name-only", "HEAD", "--", directory)
+            .stdout.decode("utf-8").splitlines() if line
+        }
+        self.assertEqual(committed, set(added))
+        for path in sorted(committed):
+            with self.subTest(path=path):
+                # The blob first committed on the first-parent line is the blob at HEAD.
+                # An explicit --name-status keeps first-parent merge diffs from
+                # printing patches; only the commit lines are 40-hex.
+                adding = self.git("log", *first_parent, "--diff-filter=A", "--format=%H",
+                                  "--name-status", "--no-renames", "HEAD", "--", path)
+                adders = [line for line in adding.stdout.decode("utf-8").splitlines()
+                          if re.fullmatch(r"[0-9a-f]{40}", line)]
+                self.assertEqual(len(adders), 1, adders)
+                first = self.git("rev-parse", f"{adders[0]}:{path}").stdout.strip()
+                self.assertEqual(first, self.git("rev-parse", f"HEAD:{path}").stdout.strip())
+        # Pinned evidence is never rewritten or dropped, whatever the history
+        # shows. Append every newly committed evidence file to the pin table.
+        for name, digest in COMMITTED_LIVE_EVIDENCE_SHA256.items():
+            with self.subTest(pinned=name):
+                path = f"{directory}/{name}"
+                self.assertIn(path, committed)
+                blob = self.git("show", f"HEAD:{path}").stdout
+                self.assertEqual(hashlib.sha256(blob).hexdigest(), digest)
+
+
 if __name__ == "__main__":
     unittest.main()

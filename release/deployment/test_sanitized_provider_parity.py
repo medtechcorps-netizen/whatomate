@@ -29,7 +29,15 @@ CONTROL = "a" * 40
 SECRET_SENTINEL = "synthetic-sensitive-token-not-live-123456789"
 
 
-class ProviderParityTests(unittest.TestCase):
+class ParityFixture:
+    """The synthetic production as a re-baselined digest bootstrap.
+
+    A digest bootstrap may only be live at ui (GENESIS_ENTRY_PHASES), so its
+    genesis launch is the ui phase and no lower phase can launch at all.
+    """
+
+    GENESIS = "ui"
+
     def setUp(self):
         base = fixtures.ProductionPlanTests()
         base.setUp()
@@ -40,6 +48,8 @@ class ProviderParityTests(unittest.TestCase):
         bootstrap = self.contract["bootstrap_state"]
         bootstrap["source_mode"] = "digest-images"
         bootstrap["images"] = copy.deepcopy(v.BOOTSTRAP_IMAGES)
+        bootstrap["live_phase"] = "ui"
+        bootstrap["live_evidence"] = copy.deepcopy(v.BOOTSTRAP_LIVE_EVIDENCE)
         bootstrap["canonical_spec_sha256"] = v.sha256_value(base.spec)
         bootstrap["environment_values_sha256"] = v.environment_value_fingerprint(base.spec)
         bootstrap["non_source_projection_sha256"] = v.non_source_fingerprint(base.spec, self.contract)
@@ -59,18 +69,18 @@ class ProviderParityTests(unittest.TestCase):
             values = [self.app, self.deployment, copy.deepcopy(self.app), copy.deepcopy(self.deployment)]
         return fixtures.FakeOpener(values, [origin + app_path, origin + active_path] * 2)
 
-    def invoke(self, *, opener=None, phase="baseline", authenticate=None):
+    def invoke(self, *, opener=None, phase=None, authenticate=None):
         selected = opener or self.opener()
         with mock.patch.object(v.urllib.request, "build_opener", return_value=selected) as build, \
                 mock.patch.object(parity.time, "sleep") as sleep:
             result = parity.require_provider_parity(
-                worktree=WORKTREE, control_sha=CONTROL, phase=phase,
+                worktree=WORKTREE, control_sha=CONTROL, phase=self.GENESIS if phase is None else phase,
                 authenticate_predecessor=authenticate or self.authenticate,
                 read_private_inputs=self.private,
             )
         return result, selected, sleep, build
 
-    def assert_blocked(self, *, opener=None, phase="baseline", authenticate=None):
+    def assert_blocked(self, *, opener=None, phase=None, authenticate=None):
         with self.assertRaises(parity.ProviderParityError) as captured:
             self.invoke(opener=opener, phase=phase, authenticate=authenticate)
         self.assertIs(type(captured.exception), parity.ProviderParityError)
@@ -94,9 +104,13 @@ class ProviderParityTests(unittest.TestCase):
                 "canonical_spec_sha256": bootstrap["canonical_spec_sha256"],
                 "environment_values_sha256": bootstrap["environment_values_sha256"],
                 "non_source_projection_sha256": bootstrap["non_source_projection_sha256"],
-                "source_mode": "digest-images", "images": copy.deepcopy(bootstrap["images"]),
+                "source_mode": "digest-images", "images": copy.deepcopy(v.BOOTSTRAP_IMAGES),
             },
         }
+
+
+class ProviderParityTests(ParityFixture, unittest.TestCase):
+    """Genesis launches at the reviewed live ui phase of a digest bootstrap."""
 
     def test_genesis_four_fixed_gets_and_exact_sixty_second_delay(self):
         result, opener, sleep, build = self.invoke()
@@ -221,7 +235,7 @@ class ProviderParityTests(unittest.TestCase):
         with mock.patch.object(v.urllib.request, "build_opener", return_value=opener), \
                 mock.patch.object(parity.time, "sleep", side_effect=lambda seconds: events.append(seconds)):
             with self.assertRaises(parity.ProviderNotQuiescent):
-                parity.require_provider_parity(worktree=WORKTREE, control_sha=CONTROL, phase="baseline",
+                parity.require_provider_parity(worktree=WORKTREE, control_sha=CONTROL, phase=self.GENESIS,
                     authenticate_predecessor=authenticate, read_private_inputs=self.private)
         self.assertEqual(events, ["authenticated", 60, "authenticated"])
         self.assertEqual(len(opener.requests), 4)
@@ -281,6 +295,126 @@ class ProviderParityTests(unittest.TestCase):
                 self.assert_blocked(opener=opener)
                 self.assertEqual(len(opener.requests), 1)
 
+    def test_topology_rejected_even_if_authority_spec_fingerprint_matches(self):
+        app, dep = copy.deepcopy(self.app), copy.deepcopy(self.deployment)
+        app["app"]["spec"]["services"][0]["http_port"] = 9999
+        dep["deployment"]["spec"] = copy.deepcopy(app["app"]["spec"])
+        bootstrap = self.contract["bootstrap_state"]
+        bootstrap["canonical_spec_sha256"] = v.sha256_value(app["app"]["spec"])
+        bootstrap["non_source_projection_sha256"] = v.non_source_fingerprint(app["app"]["spec"], self.contract)
+        bootstrap["genesis_state_sha256"] = v.genesis_state_sha256(self.contract)
+        self.assert_blocked(opener=self.opener([app, dep, app, dep]))
+
+    def test_live_environment_and_non_source_drift_rejected_with_matching_spec_hash(self):
+        for field in ("environment", "non_source"):
+            with self.subTest(field=field):
+                app, dep = copy.deepcopy(self.app), copy.deepcopy(self.deployment)
+                spec = app["app"]["spec"]
+                if field == "environment":
+                    spec["services"][0]["envs"][0]["value"] = "synthetic-environment-drift"
+                else:
+                    spec["services"][0]["instance_count"] += 1
+                dep["deployment"]["spec"] = copy.deepcopy(spec)
+                bootstrap = self.contract["bootstrap_state"]
+                bootstrap["canonical_spec_sha256"] = v.sha256_value(spec)
+                bootstrap["genesis_state_sha256"] = v.genesis_state_sha256(self.contract)
+                self.assert_blocked(opener=self.opener([app, dep, app, dep]))
+
+    def test_second_authentication_change_or_error_fails_after_four_gets(self):
+        for refreshed in (RuntimeError(SECRET_SENTINEL), b"changed"):
+            with self.subTest(refreshed=type(refreshed).__name__):
+                authenticate = mock.Mock(side_effect=[None, refreshed])
+                opener = self.opener()
+                self.assert_blocked(opener=opener, authenticate=authenticate)
+                self.assertEqual(len(opener.requests), 4)
+
+    def test_every_predecessor_launch_is_blocked_at_the_live_ui_entry(self):
+        # ui is both the live phase and terminal: no predecessor launch exists.
+        raw = v.canonical_file_bytes(self.signed_state("backend"))
+        for phase in parity.PHASES:
+            with self.subTest(phase=phase):
+                self.assert_blocked(phase=phase, authenticate=mock.Mock(return_value=raw))
+
+    def test_no_predecessor_file_flag_or_genesis_fallback_at_the_live_ui_entry(self):
+        for phase, payload in (("ui", v.canonical_file_bytes(self.signed_state("backend"))), ("ui", b"{}"),
+                               ("ui", {"verified": True}), ("backend", None), ("bridge", None),
+                               ("baseline", None)):
+            with self.subTest(phase=phase, payload_type=type(payload).__name__):
+                self.assert_blocked(phase=phase, authenticate=mock.Mock(return_value=payload))
+
+    def test_ui_genesis_binds_the_rebaselined_genesis_hash(self):
+        result, _, _, _ = self.invoke()
+        self.assertEqual(result["status"], "provider-parity-verified")
+        self.assertEqual(result["predecessor_state_sha256"], self.contract["bootstrap_state"]["genesis_state_sha256"])
+        self.assertEqual(result["predecessor_state_sha256"], v.genesis_state_sha256(self.contract))
+
+    def test_lower_phase_launches_are_refused_before_any_read(self):
+        for phase in ("baseline", "bridge", "backend"):
+            for payload in (None, v.canonical_file_bytes(self.signed_state("baseline"))):
+                with self.subTest(phase=phase, payload_type=type(payload).__name__):
+                    self.private.reset_mock()
+                    authenticate = mock.Mock(return_value=payload)
+                    with mock.patch.object(v.urllib.request, "build_opener") as build:
+                        with self.assertRaises(parity.ProviderParityError):
+                            parity.require_provider_parity(
+                                worktree=WORKTREE, control_sha=CONTROL, phase=phase,
+                                authenticate_predecessor=authenticate,
+                                read_private_inputs=self.private)
+                    # Refused before the predecessor callback, private inputs or
+                    # any provider request.
+                    authenticate.assert_not_called()
+                    build.assert_not_called()
+                    self.private.assert_not_called()
+
+    def test_a_digest_bootstrap_live_below_ui_is_refused_before_any_read(self):
+        # Re-sealing a digest contract at a lower live phase never yields a
+        # genesis launch: a digest bootstrap enters at ui only.
+        for live in ("baseline", "bridge", "backend"):
+            bootstrap = self.contract["bootstrap_state"]
+            bootstrap["live_phase"] = live
+            bootstrap["live_evidence"] = {**copy.deepcopy(v.BOOTSTRAP_LIVE_EVIDENCE), "phase": live}
+            bootstrap["genesis_state_sha256"] = v.genesis_state_sha256(self.contract)
+            for phase in (live, "ui"):
+                with self.subTest(live=live, phase=phase):
+                    self.private.reset_mock()
+                    authenticate = mock.Mock(return_value=None)
+                    with mock.patch.object(v.urllib.request, "build_opener") as build:
+                        with self.assertRaises(parity.ProviderParityError):
+                            parity.require_provider_parity(
+                                worktree=WORKTREE, control_sha=CONTROL, phase=phase,
+                                authenticate_predecessor=authenticate,
+                                read_private_inputs=self.private)
+                    authenticate.assert_not_called()
+                    build.assert_not_called()
+                    self.private.assert_not_called()
+
+
+class LegacyEntryPredecessorParityTests(ParityFixture, unittest.TestCase):
+    """The predecessor branch, reachable only under a legacy-git bootstrap.
+
+    A legacy-git bootstrap predates every phase and enters at baseline, so it is
+    the only contract shape under which a predecessor launch (bridge, backend or
+    ui after its signed predecessor) remains reachable; these tests keep that
+    branch covered. Parity has no genesis launch for a legacy bootstrap, because
+    a genesis observation requires digest image authority.
+    """
+
+    GENESIS = "baseline"
+
+    def setUp(self):
+        super().setUp()
+        bootstrap = self.contract["bootstrap_state"]
+        bootstrap["source_mode"] = "legacy-git"
+        for key in ("images", "live_phase", "live_evidence"):
+            bootstrap.pop(key)
+        bootstrap["genesis_state_sha256"] = v.genesis_state_sha256(self.contract)
+        self.assertEqual(v.genesis_target_phase(self.contract), "baseline")
+
+    def test_legacy_bootstrap_has_no_parity_genesis_launch(self):
+        opener = self.opener()
+        self.assert_blocked(opener=opener)
+        self.assertEqual(opener.requests, [])
+
     def test_each_authenticated_predecessor_phase_accepted(self):
         for index, phase in enumerate(parity.PHASES[1:], 1):
             with self.subTest(phase=phase):
@@ -336,39 +470,6 @@ class ProviderParityTests(unittest.TestCase):
         self.assert_blocked(phase="bridge", authenticate=mock.Mock(return_value=v.canonical_file_bytes(state)),
                             opener=self.opener([app, dep, app, dep]))
 
-    def test_topology_rejected_even_if_authority_spec_fingerprint_matches(self):
-        app, dep = copy.deepcopy(self.app), copy.deepcopy(self.deployment)
-        app["app"]["spec"]["services"][0]["http_port"] = 9999
-        dep["deployment"]["spec"] = copy.deepcopy(app["app"]["spec"])
-        bootstrap = self.contract["bootstrap_state"]
-        bootstrap["canonical_spec_sha256"] = v.sha256_value(app["app"]["spec"])
-        bootstrap["non_source_projection_sha256"] = v.non_source_fingerprint(app["app"]["spec"], self.contract)
-        bootstrap["genesis_state_sha256"] = v.genesis_state_sha256(self.contract)
-        self.assert_blocked(opener=self.opener([app, dep, app, dep]))
-
-    def test_live_environment_and_non_source_drift_rejected_with_matching_spec_hash(self):
-        for field in ("environment", "non_source"):
-            with self.subTest(field=field):
-                app, dep = copy.deepcopy(self.app), copy.deepcopy(self.deployment)
-                spec = app["app"]["spec"]
-                if field == "environment":
-                    spec["services"][0]["envs"][0]["value"] = "synthetic-environment-drift"
-                else:
-                    spec["services"][0]["instance_count"] += 1
-                dep["deployment"]["spec"] = copy.deepcopy(spec)
-                bootstrap = self.contract["bootstrap_state"]
-                bootstrap["canonical_spec_sha256"] = v.sha256_value(spec)
-                bootstrap["genesis_state_sha256"] = v.genesis_state_sha256(self.contract)
-                self.assert_blocked(opener=self.opener([app, dep, app, dep]))
-
-    def test_second_authentication_change_or_error_fails_after_four_gets(self):
-        for refreshed in (RuntimeError(SECRET_SENTINEL), b"changed"):
-            with self.subTest(refreshed=type(refreshed).__name__):
-                authenticate = mock.Mock(side_effect=[None, refreshed])
-                opener = self.opener()
-                self.assert_blocked(opener=opener, authenticate=authenticate)
-                self.assertEqual(len(opener.requests), 4)
-
     def test_no_predecessor_file_flag_or_genesis_fallback(self):
         for phase, payload in (("bridge", None), ("bridge", {"verified": True}),
                                ("bridge", b'{}'), ("bridge", b' ' * 131073),
@@ -378,6 +479,17 @@ class ProviderParityTests(unittest.TestCase):
 
 
 class PinnedLoadingTests(unittest.TestCase):
+    def test_reviewed_genesis_phase_reads_only_the_pinned_bytes(self):
+        with mock.patch("urllib.request.build_opener", side_effect=AssertionError("network forbidden")):
+            self.assertEqual(parity.reviewed_genesis_phase(worktree=WORKTREE), "ui")
+        source = (DEPLOYMENT / "verify_production_plan.py").read_bytes()
+        contract = (DEPLOYMENT / "production-app-contract.json").read_bytes()
+        with mock.patch.object(Path, "open", side_effect=[io.BytesIO(source), io.BytesIO(contract + b"\n")]), \
+                mock.patch("builtins.exec", side_effect=AssertionError("must not execute")) as execute:
+            with self.assertRaisesRegex(parity.ProviderParityError, "^" + parity.ERROR_CODE + "$"):
+                parity.reviewed_genesis_phase(worktree=WORKTREE)
+            execute.assert_not_called()
+
     def test_private_environment_reader_is_lazy_consuming_and_memory_cached(self):
         inputs = {"DO_PRODUCTION_TARGET_JSON": "synthetic-target-json", "DO_PRODUCTION_READ_TOKEN": SECRET_SENTINEL}
         with mock.patch.dict(parity.os.environ, inputs, clear=True):

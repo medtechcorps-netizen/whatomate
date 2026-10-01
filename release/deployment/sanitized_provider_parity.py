@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Callable
 
 
-VERIFIER_SHA256 = "c117601c8f45f223231bc84d4b63c064217d4fa2d52e7c8bae9af66f97e545b3"
-CONTRACT_SHA256 = "0cda6325a566aca3aa5f2d78c4152f708d5aad5c7feb116a67bde7234b1c4c27"
+VERIFIER_SHA256 = "0b2f1e71c21eba0c49362ad2b9b789e9411335d2008f09b63d08e76d3d7155a8"
+CONTRACT_SHA256 = "2298736cb0bcaa6bd73bcfcd93ddec4b8b8ab7cf1e4c1687fc4696011ab89c28"
 PHASES = ("baseline", "bridge", "backend", "ui")
 STATE_WORKFLOW = ".github/workflows/verify-production-crm-canary.yml"
 ERROR_CODE = "provider-parity-read-or-verification-failed"
@@ -116,9 +116,28 @@ def _image_authority(verifier, contract, records):
     return images
 
 
+def reviewed_genesis_phase(*, worktree: Path) -> str:
+    """The genesis entry phase pinned by the reviewed verifier and contract bytes.
+
+    Reads only the two raw-byte-pinned local files: no network, credentials,
+    callbacks or writes.
+    """
+    try:
+        verifier, contract = _load_reviewed_verifier(worktree)
+        phase = verifier.genesis_target_phase(contract)
+        _require(phase in PHASES)
+        return phase
+    except Exception:
+        raise ProviderParityError(ERROR_CODE) from None
+
+
 def _expectation(verifier, contract, control_sha, phase, authenticated):
     bootstrap = contract["bootstrap_state"]
-    if phase == "baseline":
+    entry = verifier.genesis_target_phase(contract)
+    # A launch never targets a phase below the reviewed live phase; genesis is
+    # exactly that phase and every later phase needs its signed predecessor.
+    _require(entry in PHASES and PHASES.index(phase) >= PHASES.index(entry))
+    if phase == entry:
         _require(authenticated is None)
         expected, images = verifier.predecessor_provider_expectation(contract, {}, None)
         _require(expected["source_mode"] == "digest-images")
@@ -204,6 +223,9 @@ def require_provider_parity(
         verifier, contract = _load_reviewed_verifier(worktree)
         verifier.require_sha1(control_sha, "current control")
         _require(phase in PHASES and callable(authenticate_predecessor) and callable(read_private_inputs))
+        # Refuse a phase below the reviewed live phase before any callback runs.
+        entry = verifier.genesis_target_phase(contract)
+        _require(entry in PHASES and PHASES.index(phase) >= PHASES.index(entry))
         authenticated = authenticate_predecessor()
         expected, images, predecessor_hash = _expectation(verifier, contract, control_sha, phase, authenticated)
         private = read_private_inputs()

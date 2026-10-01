@@ -74,15 +74,18 @@ def control() -> dict[str, Any]:
 
 
 def chain(
-    outcome: str, *, timestamp_only_mismatch: bool = False
+    outcome: str,
+    *,
+    timestamp_only_mismatch: bool = False,
+    intent_factory=fixtures.valid_intent,
 ) -> dict[str, Any]:
-    intent = fixtures.valid_intent()
+    intent = intent_factory()
     intent["lock"]["root_acquire_intent"]["artifact_name"] = (
         "production-main-lock-apply-101-1"
     )
     common.validate_mutation_intent(intent)
     provider_job = None
-    public = fixtures.before_state()
+    public = copy.deepcopy(intent["before"])
     migration = False
     original = None
     original_binding = None
@@ -577,6 +580,19 @@ class FinalizeProductionOrphanLockTests(unittest.TestCase):
                     finalizer.validate_finalization_authorization(
                         authorization, now=checked
                     )
+
+    def test_genesis_reentry_orphan_finalizes_committed_and_no_mutation(self) -> None:
+        for outcome, closure in (
+            ("committed", finalizer.CLOSURE_RECONCILIATION),
+            ("no-mutation", finalizer.CLOSURE_NO_MUTATION),
+        ):
+            with self.subTest(outcome=outcome):
+                arguments = chain(outcome, intent_factory=fixtures.valid_reentry_intent)
+                self.assertEqual(arguments["mutation_intent"]["lineage"]["from"], "genesis")
+                self.assertEqual(arguments["mutation_intent"]["lineage"]["to"], "ui")
+                authorization = finalizer.build_finalization_authorization(**arguments)
+                self.assertEqual(authorization["resolution"]["closure_kind"], closure)
+                finalizer.validate_finalization_authorization(authorization, now=NOW)
 
     def test_committed_requires_exact_canary_phase_state(self) -> None:
         arguments = chain("committed")

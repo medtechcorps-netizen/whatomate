@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import copy
 import datetime as dt
+import hashlib
 import io
 import json
 import os
@@ -182,9 +184,10 @@ def database_inventory(spec: dict[str, object]) -> set[tuple[object, ...]]:
 def rollout_plan() -> dict[str, object]:
     phases = []
     for index, phase in enumerate(verifier.PHASES):
-        source_sha = verifier.BASELINE_TARGET_SOURCE_SHA if phase == "baseline" else (
-            f"{index + 1:x}" * 40
-        )
+        source_sha = {
+            "baseline": verifier.BASELINE_TARGET_SOURCE_SHA,
+            "ui": verifier.UI_TARGET_SOURCE_SHA,
+        }.get(phase, f"{index + 1:x}" * 40)
         images = []
         for component in ("web", "meta-relay", "gmail-relay"):
             repository = f"ghcr.io/medtechcorps-netizen/rereply-release-{component}"
@@ -333,7 +336,8 @@ class ProductionPlanTests(unittest.TestCase):
         # The synthetic production app is git-sourced, so the fixture models the
         # legacy bootstrap shape explicitly.
         self.contract["bootstrap_state"]["source_mode"] = "legacy-git"
-        self.contract["bootstrap_state"].pop("images", None)
+        for key in ("images", "live_phase", "live_evidence"):
+            self.contract["bootstrap_state"].pop(key, None)
         vpc_hash = verifier.sha256_bytes(self.spec["vpc"]["id"].encode("utf-8"))
         db_inventory = database_inventory(self.spec)
         self.contract["expected_topology"]["vpc_id_sha256"] = vpc_hash
@@ -2199,48 +2203,103 @@ class ProductionPlanTests(unittest.TestCase):
             )
 
     def test_isolated_predecessor_cli_all_transitions_and_required_output(self) -> None:
-        # Unlike the in-process synthetic provider tests, use the real compiled
-        # contract pins and a fresh isolated Python process from a different cwd.
-        # No provider observation or credential is needed by this command.
-        self.contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
-        for phase in ("genesis", "baseline", "bridge", "backend"):
-            with self.subTest(predecessor=phase), tempfile.TemporaryDirectory(prefix="predecessor-cli-") as name:
-                root = Path(name)
-                state = None if phase == "genesis" else self.phase_state(phase)
-                normalized = self.normalized if state is None else self.input_for_state(state)[0]
-                (root / "normalized.json").write_bytes(verifier.canonical_file_bytes(normalized))
-                (root / "rollout.json").write_bytes(verifier.canonical_file_bytes(self.rollout))
-                args = [sys.executable, "-I", "-S", "-B", str(VERIFIER_PATH), "validate-predecessor",
-                        "--contract", str(CONTRACT_PATH), "--policy", str(POLICY_PATH),
+        # Unlike the in-process synthetic provider tests, run a fresh isolated
+        # Python process from a different cwd. No provider observation or
+        # credential is needed by this command. The real reviewed contract (with
+        # its real compiled pins) re-entered at the live ui phase, so its genesis
+        # targets ui and no signed state below ui is a predecessor. A synthetic
+        # legacy-git contract, which enters at baseline, keeps every predecessor
+        # transition and the CLI's exact-file sidecar binding covered end to end:
+        # it runs the same verifier file through an isolated wrapper that sets
+        # only the synthetic fixture's pinned provider and bootstrap constants.
+        legacy = copy.deepcopy(self.contract)
+        legacy_pins = {name: getattr(verifier, name) for name in (
+            "PRODUCTION_VPC_ID_SHA256", "PRODUCTION_DATABASE_INVENTORY", "BOOTSTRAP_SOURCE_MODE",
+            "BOOTSTRAP_CANONICAL_SPEC_SHA256", "BOOTSTRAP_ENVIRONMENT_SHA256", "PRODUCTION_APP_ID_SHA256",
+            "PRODUCTION_DEFAULT_INGRESS_SHA256", "BOOTSTRAP_DEPLOYMENT_ID_SHA256", "BOOTSTRAP_NON_SOURCE_SHA256",
+        )}
+        legacy_pins["PRODUCTION_DATABASE_INVENTORY"] = sorted(
+            list(item) for item in legacy_pins["PRODUCTION_DATABASE_INVENTORY"]
+        )
+        wrapper_source = (
+            "import importlib.util, json, sys\n"
+            "verifier_path, pins_path = sys.argv[1], sys.argv[2]\n"
+            "spec = importlib.util.spec_from_file_location('verify_production_plan', verifier_path)\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "sys.modules[spec.name] = module\n"
+            "spec.loader.exec_module(module)\n"
+            "pins = json.load(open(pins_path, encoding='utf-8'))\n"
+            "pins['PRODUCTION_DATABASE_INVENTORY'] = {tuple(item) for item in pins['PRODUCTION_DATABASE_INVENTORY']}\n"
+            "for name, value in pins.items():\n"
+            "    assert hasattr(module, name), name\n"
+            "    setattr(module, name, value)\n"
+            "sys.argv = [verifier_path, *sys.argv[3:]]\n"
+            "raise SystemExit(module.main())\n"
+        )
+        reviewed = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        env = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
+        for label, contract in (("reviewed", reviewed), ("legacy", legacy)):
+            for phase in ("genesis", "baseline", "bridge", "backend"):
+                with self.subTest(contract=label, predecessor=phase), \
+                        tempfile.TemporaryDirectory(prefix="predecessor-cli-") as name:
+                    root = Path(name)
+                    self.contract = contract
+                    command = [sys.executable, "-I", "-S", "-B", str(VERIFIER_PATH)]
+                    contract_path = CONTRACT_PATH
+                    if label == "legacy":
+                        contract_path = root / "contract.json"
+                        contract_path.write_bytes(verifier.canonical_file_bytes(contract))
+                        (root / "pins.json").write_text(json.dumps(legacy_pins), encoding="utf-8")
+                        (root / "run_verifier.py").write_text(wrapper_source, encoding="utf-8")
+                        command = [sys.executable, "-I", "-S", "-B", str(root / "run_verifier.py"),
+                                   str(VERIFIER_PATH), str(root / "pins.json")]
+                    state = None if phase == "genesis" else self.phase_state(phase)
+                    normalized = self.normalized if state is None else self.input_for_state(state)[0]
+                    (root / "normalized.json").write_bytes(verifier.canonical_file_bytes(normalized))
+                    (root / "rollout.json").write_bytes(verifier.canonical_file_bytes(self.rollout))
+                    args = command + [
+                        "validate-predecessor",
+                        "--contract", str(contract_path), "--policy", str(POLICY_PATH),
                         "--schema", str(SCHEMA_PATH), "--normalized-input", str(root / "normalized.json"),
                         "--rollout-plan", str(root / "rollout.json"), "--control-sha", CONTROL_SHA]
-                if state is not None:
-                    raw = verifier.canonical_file_bytes(state)
-                    (root / "state.json").write_bytes(raw)
-                    (root / "state.sha256").write_bytes((verifier.sha256_bytes(raw) + "\n").encode("ascii"))
-                    args += ["--predecessor-state", str(root / "state.json"),
-                             "--predecessor-sha256", str(root / "state.sha256")]
-                args += ["--target-images-output", str(root / "target-images.json")]
-                env = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
-                result = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True, timeout=15)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                target = "baseline" if phase == "genesis" else verifier.PHASES[verifier.PHASES.index(phase) + 1]
-                exported = json.loads((root / "target-images.json").read_text(encoding="utf-8"))
-                self.assertEqual(exported["phase"], target)
-                self.assertEqual(exported["images"], phase_images(self.rollout, target, self.contract))
-                missing_output = subprocess.run(args[:-2], cwd=root, env=env,
-                                                capture_output=True, text=True, timeout=15)
-                self.assertEqual(missing_output.returncode, 2)
-                self.assertIn("--target-images-output", missing_output.stderr)
-                if state is not None:
-                    (root / "state.sha256").write_bytes(("0" * 64 + "\n").encode("ascii"))
-                    tampered_output = root / "tampered-target-images.json"
-                    tampered_args = args[:-1] + [str(tampered_output)]
-                    tampered = subprocess.run(tampered_args, cwd=root, env=env,
-                                              capture_output=True, text=True, timeout=15)
-                    self.assertNotEqual(tampered.returncode, 0)
-                    self.assertIn("production phase-state predecessor exact-file hash differs", tampered.stderr)
-                    self.assertFalse(tampered_output.exists())
+                    if state is not None:
+                        raw = verifier.canonical_file_bytes(state)
+                        (root / "state.json").write_bytes(raw)
+                        (root / "state.sha256").write_bytes((verifier.sha256_bytes(raw) + "\n").encode("ascii"))
+                        args += ["--predecessor-state", str(root / "state.json"),
+                                 "--predecessor-sha256", str(root / "state.sha256")]
+                    args += ["--target-images-output", str(root / "target-images.json")]
+                    result = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True, timeout=15)
+                    missing_output = subprocess.run(args[:-2], cwd=root, env=env,
+                                                    capture_output=True, text=True, timeout=15)
+                    self.assertEqual(missing_output.returncode, 2)
+                    self.assertIn("--target-images-output", missing_output.stderr)
+                    if label == "reviewed" and state is not None:
+                        # No signed state below the reviewed live ui phase can be
+                        # a predecessor of this genesis epoch.
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn("phase state precedes the reviewed live phase", result.stderr)
+                        self.assertFalse((root / "target-images.json").exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        if state is None:
+                            target = verifier.genesis_target_phase(contract)
+                            self.assertEqual(target, "ui" if label == "reviewed" else "baseline")
+                        else:
+                            target = verifier.PHASES[verifier.PHASES.index(phase) + 1]
+                        exported = json.loads((root / "target-images.json").read_text(encoding="utf-8"))
+                        self.assertEqual(exported["phase"], target)
+                        self.assertEqual(exported["images"], phase_images(self.rollout, target, contract))
+                    if state is not None:
+                        # The exact-file sidecar is bound before any lineage rule.
+                        (root / "state.sha256").write_bytes(("0" * 64 + "\n").encode("ascii"))
+                        tampered_output = root / "tampered-target-images.json"
+                        tampered_args = args[:-1] + [str(tampered_output)]
+                        tampered = subprocess.run(tampered_args, cwd=root, env=env,
+                                                  capture_output=True, text=True, timeout=15)
+                        self.assertNotEqual(tampered.returncode, 0)
+                        self.assertIn("production phase-state predecessor exact-file hash differs", tampered.stderr)
+                        self.assertFalse(tampered_output.exists())
 
     def test_workflow_is_manual_observation_only_and_capability_separated(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -2350,6 +2409,804 @@ class ProductionPlanTests(unittest.TestCase):
         self.assertIn("python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v", protected_ci)
 
 
+GENESIS_PIN = "b7892b2caaaf66ef132791b19c2a69dc200b40197a1420f4aae0b207ef0ae793"
+LIVE_EVIDENCE_DIR = ROOT / "release" / "deployment" / "live-evidence"
+REPOSITORY_URL = "https://github.com/medtechcorps-netizen/whatomate"
+SLSA_PREDICATE = "https://slsa.dev/provenance/v1"
+SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
+IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
+# Every committed evidence document kind: its exact-file name prefix, signed
+# subject file name, producing workflow and custom attestation predicate.
+EVIDENCE_AUTHORITIES = {
+    "production-phase-apply-receipt": {
+        "prefix": "production-phase-apply-receipt",
+        "subject": "production-phase-apply-receipt.json",
+        "workflow_path": ".github/workflows/apply-production-phase.yml",
+        "predicate_type": "https://rereply.app/attestations/production-phase-apply-receipt/v1",
+    },
+    "production-phase-state": {
+        "prefix": "production-phase-state",
+        "subject": "production-phase-state.json",
+        "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
+        "predicate_type": "https://rereply.app/attestations/production-phase-state/v1",
+    },
+}
+
+
+def reentry_fixture(test: unittest.TestCase, live_phase: object) -> "ProductionPlanTests":
+    """The synthetic plan fixture as a digest bootstrap re-entered at live_phase."""
+    base = legacy_fixture(test)
+    bootstrap = base.contract["bootstrap_state"]
+    bootstrap["source_mode"] = "digest-images"
+    bootstrap["images"] = copy.deepcopy(verifier.BOOTSTRAP_IMAGES)
+    bootstrap["live_phase"] = live_phase
+    bootstrap["live_evidence"] = {**copy.deepcopy(verifier.BOOTSTRAP_LIVE_EVIDENCE), "phase": live_phase}
+    bootstrap["genesis_state_sha256"] = verifier.genesis_state_sha256(base.contract)
+    return base
+
+
+def legacy_fixture(test: unittest.TestCase) -> "ProductionPlanTests":
+    """The synthetic legacy-git plan fixture; its genesis enters at baseline."""
+    base = ProductionPlanTests()
+    try:
+        base.setUp()
+    except BaseException:
+        base.doCleanups()
+        raise
+    test.addCleanup(base.doCleanups)
+    return base
+
+
+def _certificate_pem(der: bytes) -> str:
+    body = base64.b64encode(der).decode("ascii")
+    lines = [body[index:index + 64] for index in range(0, len(body), 64)]
+    return "-----BEGIN CERTIFICATE-----\n" + "\n".join(lines) + "\n-----END CERTIFICATE-----\n"
+
+
+def attestation_statement(raw: bytes, *, subject: str, subject_sha256: str,
+                          control: dict[str, object]) -> dict[str, object]:
+    """Offline binding of one committed Sigstore bundle to its committed subject.
+
+    This is not cryptographic verification: the signature, Fulcio chain and
+    Rekor inclusion were verified online with `gh attestation verify` (recorded
+    in docs/crm-production-release-control.md). It proves that the committed
+    bundle is the one over these exact bytes: the in-toto subject, the Rekor
+    entry's payload hash, signature and certificate, and the signer identity
+    the certificate carries.
+    """
+    import verify_production_release as release
+
+    bundle = release.loads_strict(raw)
+    if type(bundle) is not dict or set(bundle) != {"mediaType", "verificationMaterial", "dsseEnvelope"}:
+        raise AssertionError("attestation bundle shape differs")
+    if bundle["mediaType"] != SIGSTORE_BUNDLE_MEDIA_TYPE:
+        raise AssertionError("attestation bundle media type differs")
+    envelope = bundle["dsseEnvelope"]
+    if (type(envelope) is not dict or set(envelope) != {"payload", "payloadType", "signatures"}
+            or envelope["payloadType"] != "application/vnd.in-toto+json"
+            or type(envelope["signatures"]) is not list or len(envelope["signatures"]) != 1
+            or set(envelope["signatures"][0]) != {"sig"} or not envelope["signatures"][0]["sig"]):
+        raise AssertionError("attestation envelope differs")
+    payload = base64.b64decode(envelope["payload"], validate=True)
+    statement = release.loads_strict(payload)
+    if type(statement) is not dict or set(statement) != {"_type", "subject", "predicateType", "predicate"}:
+        raise AssertionError("attestation statement shape differs")
+    if statement["_type"] != IN_TOTO_STATEMENT_TYPE:
+        raise AssertionError("attestation statement type differs")
+    if statement["subject"] != [{"name": subject, "digest": {"sha256": subject_sha256}}]:
+        raise AssertionError("attestation subject differs")
+    material = bundle["verificationMaterial"]
+    if (type(material) is not dict
+            or set(material) != {"tlogEntries", "timestampVerificationData", "certificate"}
+            or type(material["tlogEntries"]) is not list or len(material["tlogEntries"]) != 1
+            or set(material["certificate"]) != {"rawBytes"}):
+        raise AssertionError("attestation verification material differs")
+    certificate = base64.b64decode(material["certificate"]["rawBytes"], validate=True)
+    entry = material["tlogEntries"][0]
+    body = release.loads_strict(base64.b64decode(entry["canonicalizedBody"], validate=True))
+    if (entry["kindVersion"] != {"kind": "dsse", "version": "0.0.1"}
+            or body.get("kind") != "dsse" or body.get("apiVersion") != "0.0.1"
+            or body["spec"]["payloadHash"] != {"algorithm": "sha256", "value": hashlib.sha256(payload).hexdigest()}
+            or body["spec"]["signatures"] != [{
+                "signature": envelope["signatures"][0]["sig"],
+                "verifier": base64.b64encode(_certificate_pem(certificate).encode("ascii")).decode("ascii"),
+            }]):
+        raise AssertionError("attestation transparency-log entry differs")
+    workflow = control["workflow_path"]
+    identity = (
+        f"{REPOSITORY_URL}/{workflow}@refs/heads/main",
+        str(control["workflow_sha"]),
+        "refs/heads/main",
+        "workflow_dispatch",
+        "github-hosted",
+        f"{REPOSITORY_URL}/actions/runs/{control['run_id']}/attempts/{control['run_attempt']}",
+    )
+    if not all(value.encode("ascii") in certificate for value in identity):
+        raise AssertionError("attestation signer identity differs")
+    return statement
+
+
+def classify_live_evidence(directory: Path) -> dict[str, dict[str, object]]:
+    """Validate every committed live-evidence file; an unreviewed file fails closed.
+
+    Each evidence document is a canonical apply receipt or phase state named by
+    its own control run, with an exact-hash sidecar and exactly two attestation
+    bundles over its exact bytes: SLSA provenance and its custom predicate.
+    """
+    import verify_production_release as release
+
+    documents: dict[str, bytes] = {}
+    sidecars: dict[str, bytes] = {}
+    bundles: dict[str, bytes] = {}
+    for path in sorted(directory.iterdir()):
+        if path.is_symlink() or not path.is_file():
+            raise AssertionError(f"live evidence is not a regular file: {path.name}")
+        if path.name.endswith(".sigstore.json"):
+            bundles[path.name] = path.read_bytes()
+        elif path.name.endswith(".sha256"):
+            sidecars[path.name] = path.read_bytes()
+        elif path.name.endswith(".json"):
+            documents[path.name] = path.read_bytes()
+        else:
+            raise AssertionError(f"unreviewed live-evidence file: {path.name}")
+    result: dict[str, dict[str, object]] = {}
+    for name, raw in documents.items():
+        value = release.loads_strict(raw)
+        if raw != release.canonical_file_bytes(value):
+            raise AssertionError(f"live evidence is not canonical: {name}")
+        authority = value.get("authority") if type(value) is dict else None
+        if authority == "production-phase-apply-receipt":
+            release.validate_apply_receipt(value)
+        elif authority == "production-phase-state":
+            release.validate_phase_state(value)
+        else:
+            raise AssertionError(f"live evidence authority differs: {name}")
+        reviewed = EVIDENCE_AUTHORITIES[authority]
+        control = value["control"]
+        stem = f"{reviewed['prefix']}-{control['run_id']}-{control['run_attempt']}"
+        if name != stem + ".json" or control["workflow_path"] != reviewed["workflow_path"]:
+            raise AssertionError(f"live evidence name or producer differs: {name}")
+        digest = hashlib.sha256(raw).hexdigest()
+        if sidecars.pop(stem + ".sha256", None) != (digest + "\n").encode("ascii"):
+            raise AssertionError(f"live evidence sidecar differs: {name}")
+        statements: dict[str, dict[str, object]] = {}
+        for bundle_name in sorted(item for item in bundles if item.startswith(stem + ".")):
+            statement = attestation_statement(bundles.pop(bundle_name), subject=reviewed["subject"],
+                                              subject_sha256=digest, control=control)
+            if statement["predicateType"] in statements:
+                raise AssertionError(f"live evidence attestation is duplicated: {bundle_name}")
+            statements[statement["predicateType"]] = statement
+        if set(statements) != {SLSA_PREDICATE, reviewed["predicate_type"]}:
+            if set(statements) - {SLSA_PREDICATE, reviewed["predicate_type"]}:
+                raise AssertionError(f"attestation predicate type differs: {name}")
+            raise AssertionError(f"live evidence attestation bundles differ: {name}")
+        custom = statements[reviewed["predicate_type"]]["predicate"]
+        if custom != value or release.canonical_file_bytes(custom) != raw:
+            raise AssertionError(f"attested predicate differs from the committed evidence: {name}")
+        provenance = statements[SLSA_PREDICATE]["predicate"]
+        definition, run = provenance["buildDefinition"], provenance["runDetails"]
+        if (definition["externalParameters"]["workflow"] != {
+                "ref": "refs/heads/main", "repository": REPOSITORY_URL, "path": reviewed["workflow_path"]}
+                or definition["resolvedDependencies"][0]["digest"] != {"gitCommit": control["workflow_sha"]}
+                or definition["internalParameters"]["github"]["event_name"] != "workflow_dispatch"
+                or definition["internalParameters"]["github"]["runner_environment"] != "github-hosted"
+                or run["builder"]["id"] != f"{REPOSITORY_URL}/{reviewed['workflow_path']}@refs/heads/main"
+                or run["metadata"]["invocationId"]
+                != f"{REPOSITORY_URL}/actions/runs/{control['run_id']}/attempts/{control['run_attempt']}"):
+            raise AssertionError(f"attested provenance differs: {name}")
+        result[name] = {
+            "raw": raw, "value": value, "sha256": digest, "authority": authority,
+            "phase": value["lineage"]["phase"], "statements": statements,
+        }
+    if sidecars or bundles:
+        raise AssertionError(f"orphaned live-evidence files: {sorted(sidecars) + sorted(bundles)}")
+    return result
+
+
+def require_live_phase_floor(documents: dict[str, dict[str, object]]) -> int:
+    """The live phase never falls below the highest phase committed evidence records."""
+    if not documents:
+        raise AssertionError("no committed live evidence")
+    floor = max(verifier.PHASES.index(document["phase"]) for document in documents.values())
+    if verifier.PHASES.index(verifier.BOOTSTRAP_LIVE_PHASE) < floor:
+        raise AssertionError("bootstrap live phase is below the committed live-evidence floor")
+    if any(verifier.PHASES.index(phase) < floor for phase in verifier.GENESIS_ENTRY_PHASES):
+        raise AssertionError("a digest genesis entry is below the committed live-evidence floor")
+    return floor
+
+
+def bind_live_evidence(evidence: dict[str, object], bootstrap: dict[str, object],
+                       documents: dict[str, dict[str, object]]) -> dict[str, object]:
+    """Bind the contract's static live evidence to committed bytes, per kind."""
+    import verify_production_release as release
+
+    phase = bootstrap["live_phase"]
+    verifier.validate_live_evidence(copy.deepcopy(evidence), phase)
+    kind = evidence["kind"]
+    if kind == "accepted-unsigned-apply-receipt":
+        name = f"production-phase-apply-receipt-{evidence['run_id']}-{evidence['run_attempt']}.json"
+        document = documents.get(name)
+        if document is None or document["authority"] != "production-phase-apply-receipt":
+            raise AssertionError("committed apply receipt is missing")
+        if document["sha256"] != evidence["receipt_sha256"]:
+            raise AssertionError("committed apply receipt hash differs")
+        receipt = document["value"]
+        lineage, observed = receipt["lineage"], receipt["after"]
+        if lineage["predecessor_state_sha256"] != evidence["receipt_predecessor_state_sha256"]:
+            raise AssertionError("committed apply receipt predecessor differs")
+    elif kind == "signed-phase-state":
+        name = f"production-phase-state-{evidence['run_id']}-{evidence['run_attempt']}.json"
+        document = documents.get(name)
+        if document is None or document["authority"] != "production-phase-state":
+            raise AssertionError("committed phase state is missing")
+        if document["sha256"] != evidence["phase_state_sha256"]:
+            raise AssertionError("committed phase state hash differs")
+        state = release.validate_phase_state(copy.deepcopy(document["value"]))
+        lineage, observed = state["lineage"], state["provider_state"]
+        if (state["evidence"]["change_receipt_sha256"] != evidence["change_receipt_sha256"]
+                or state["evidence"]["canary_sha256"] != evidence["canary_sha256"]
+                or lineage["predecessor_state_sha256"] != evidence["change_receipt_sha256"]):
+            raise AssertionError("committed phase state evidence differs")
+        receipts = [item for item in documents.values()
+                    if item["sha256"] == evidence["change_receipt_sha256"]]
+        if len(receipts) != 1:
+            raise AssertionError("committed change receipt is missing")
+        change = receipts[0]["value"]
+        if (change["lineage"]["predecessor_state_sha256"] != evidence["receipt_predecessor_state_sha256"]
+                or change["after"] != observed):
+            raise AssertionError("committed change receipt differs from the phase state")
+    else:
+        raise AssertionError("live evidence kind differs")
+    control = document["value"]["control"]
+    if (control["workflow_sha"], control["workflow_path"], control["run_id"], control["run_attempt"]) != (
+            evidence["control_sha"], evidence["workflow_path"], evidence["run_id"], evidence["run_attempt"]):
+        raise AssertionError("committed live evidence control differs")
+    if (lineage["phase"], lineage["to"]) != (phase, phase) or evidence["phase"] != phase:
+        raise AssertionError("committed live evidence phase differs")
+    if lineage["phase_source_sha"] != evidence["phase_source_sha"]:
+        raise AssertionError("committed live evidence source differs")
+    if observed["active_deployment_identity_sha256"] != bootstrap["active_deployment_id_sha256"] or any(
+            observed[key] != bootstrap[key] for key in (
+                "canonical_spec_sha256", "environment_values_sha256",
+                "non_source_projection_sha256", "source_mode", "images")):
+        raise AssertionError("committed live evidence provider state differs from the bootstrap")
+    if document["value"]["rollback"] != verifier.ROLLBACK_FLOORS[phase]:
+        raise AssertionError("committed live evidence rollback floor differs")
+    return document
+
+
+class GenesisReentryTests(unittest.TestCase):
+    def plan(self, base, *, state=None, normalized=None, policy=None, rollout=None):
+        return verifier.validate_rollout_plan(
+            rollout or base.rollout,
+            base.contract,
+            normalized or base.normalized,
+            policy=policy or base.policy,
+            policy_sha256=base.policy_hash,
+            schema_sha256=base.schema_hash,
+            predecessor_state=state,
+        )
+
+    def test_genesis_enters_exactly_at_the_live_phase(self) -> None:
+        # A digest bootstrap enters at its live phase (ui); only the legacy-git
+        # bootstrap, which predates every phase, enters at baseline.
+        self.assertEqual(verifier.GENESIS_ENTRY_PHASES, ("ui",))
+        for live, base in (("ui", reentry_fixture(self, "ui")), ("baseline", legacy_fixture(self))):
+            with self.subTest(live=live, mode=base.contract["bootstrap_state"]["source_mode"]):
+                self.assertEqual(verifier.genesis_target_phase(base.contract), live)
+                target, _images, transition, predecessor = self.plan(base)
+                ordinal = verifier.PHASES.index(live) + 1
+                self.assertEqual(target["phase"], live)
+                self.assertEqual(transition, {"operation": "activate", "from": "genesis", "to": live, "ordinal": ordinal})
+                self.assertEqual(predecessor, {
+                    "kind": "genesis", "event_sequence": 0, "phase_ordinal": 0, "phase": "genesis",
+                    "state_sha256": verifier.genesis_state_sha256(base.contract),
+                    "run_id": None, "run_attempt": None, "artifact_id": None, "artifact_digest": None,
+                })
+                self.assertEqual(target["rollback"], verifier.ROLLBACK_FLOORS[live])
+
+    def test_a_live_phase_outside_the_reviewed_entries_fails_closed(self) -> None:
+        # Baseline is no digest-mode entry: production has run ui.
+        for live in ("baseline", "bridge", "backend", "genesis", None, 4):
+            with self.subTest(live=live):
+                base = reentry_fixture(self, live)
+                with self.assertRaisesRegex(verifier.PlanError, "bootstrap live phase is not a reviewed genesis entry"):
+                    self.plan(base)
+        base = reentry_fixture(self, "ui")
+        del base.contract["bootstrap_state"]["live_phase"]
+        with self.assertRaisesRegex(verifier.PlanError, "bootstrap live state is incomplete"):
+            self.plan(base)
+        legacy = legacy_fixture(self)
+        legacy.contract["bootstrap_state"]["live_phase"] = "baseline"
+        with self.assertRaisesRegex(verifier.PlanError, "bootstrap source mode differs"):
+            verifier.genesis_target_phase(legacy.contract)
+
+    def test_a_digest_bootstrap_never_re_enters_at_baseline(self) -> None:
+        # Even a PR that moved BOOTSTRAP_LIVE_PHASE together with the contract
+        # cannot re-enter a digest bootstrap below ui without also widening
+        # GENESIS_ENTRY_PHASES, which the committed live-evidence floor forbids.
+        import apply_production_change as apply
+
+        contract = verifier.load_json(CONTRACT_PATH, "contract")
+        for lower in ("baseline", "bridge", "backend"):
+            with self.subTest(live=lower):
+                tampered = copy.deepcopy(contract)
+                bootstrap = tampered["bootstrap_state"]
+                bootstrap["live_phase"] = lower
+                bootstrap["live_evidence"]["phase"] = lower
+                bootstrap["genesis_state_sha256"] = verifier.genesis_state_sha256(tampered)
+                with mock.patch.object(verifier, "BOOTSTRAP_LIVE_PHASE", lower), \
+                        mock.patch.object(verifier, "BOOTSTRAP_LIVE_EVIDENCE", bootstrap["live_evidence"]):
+                    with self.assertRaisesRegex(verifier.PlanError, "bootstrap live phase differs"):
+                        verifier.validate_contract(copy.deepcopy(tampered))
+                    with self.assertRaisesRegex(verifier.PlanError, "bootstrap live phase is not a reviewed genesis entry"):
+                        verifier.genesis_target_phase(tampered)
+                with self.assertRaisesRegex(apply.common.ReleaseError, "live phase"):
+                    apply.contract_genesis_phase(tampered)
+        with mock.patch.object(verifier, "GENESIS_ENTRY_PHASES", ("baseline", "ui")):
+            with self.assertRaisesRegex(AssertionError, "below the committed live-evidence floor"):
+                require_live_phase_floor(classify_live_evidence(LIVE_EVIDENCE_DIR))
+
+    def test_plan_transition_must_be_a_reviewed_policy_edge(self) -> None:
+        base = reentry_fixture(self, "ui")
+        policy = copy.deepcopy(base.policy)
+        policy["activation_transitions"] = [
+            edge for edge in policy["activation_transitions"]
+            if edge != {"from": "genesis", "to": "ui", "ordinal": 4}
+        ]
+        with self.assertRaisesRegex(verifier.PlanError, "production activation transition differs"):
+            self.plan(base, policy=policy)
+
+    def test_genesis_reentry_source_is_pinned_to_the_reviewed_ui_source(self) -> None:
+        manifest = json.loads(SOURCE_MANIFEST_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["phases"]["ui"]["source_sha"], verifier.UI_TARGET_SOURCE_SHA)
+        base = reentry_fixture(self, "ui")
+        rollout = copy.deepcopy(base.rollout)
+        rollout["phases"][3]["source"]["commit"] = "9" * 40
+        with self.assertRaisesRegex(verifier.PlanError, "genesis rollout source differs from the reviewed target"):
+            self.plan(base, rollout=rollout)
+
+    def test_live_ui_rejects_every_predecessor_below_the_live_phase(self) -> None:
+        base = reentry_fixture(self, "ui")
+        states = [
+            base.phase_state("baseline"),
+            base.phase_state("bridge"),
+            base.phase_state("backend"),
+            base.phase_state("backend", event_sequence=7, operation="rollback", source_phase="ui", predecessor_kind="rollback-receipt"),
+            base.phase_state("bridge", event_sequence=7, operation="rollback", source_phase="ui", predecessor_kind="rollback-receipt"),
+        ]
+        for state in states:
+            with self.subTest(phase=state["lineage"]["phase"], operation=state["lineage"]["operation"]):
+                normalized, _ = base.input_for_state(state)
+                with self.assertRaisesRegex(verifier.PlanError, "phase state precedes the reviewed live phase"):
+                    self.plan(base, state=state, normalized=normalized)
+
+    def test_signed_reentry_state_is_valid_and_terminal(self) -> None:
+        base = reentry_fixture(self, "ui")
+        state = base.phase_state("ui", event_sequence=1, source_phase="genesis")
+        normalized, _ = base.input_for_state(state)
+        verifier.validate_phase_state(state, base.contract, base.policy, normalized, base.rollout, base.policy_hash, base.schema_hash)
+        with self.assertRaisesRegex(verifier.PlanError, "the signed UI phase is terminal"):
+            self.plan(base, state=state, normalized=normalized)
+        for label, kwargs, message in (
+            ("genesis at sequence 2", {"event_sequence": 2, "source_phase": "genesis"}, "non-initial phase state cannot start from genesis"),
+            ("linear backend edge", {"event_sequence": 4, "source_phase": "backend"}, "phase-state activation edge differs"),
+            ("backend at sequence 1", {"event_sequence": 1, "source_phase": "backend"}, "phase-state activation edge differs"),
+        ):
+            with self.subTest(label=label):
+                mutated = base.phase_state("ui", **kwargs)
+                normalized, _ = base.input_for_state(mutated)
+                with self.assertRaisesRegex(verifier.PlanError, message):
+                    verifier.validate_phase_state(mutated, base.contract, base.policy, normalized, base.rollout, base.policy_hash, base.schema_hash)
+
+    def test_legacy_entry_still_rejects_a_genesis_ui_state(self) -> None:
+        base = legacy_fixture(self)
+        state = base.phase_state("ui", event_sequence=1, source_phase="genesis")
+        normalized, _ = base.input_for_state(state)
+        with self.assertRaisesRegex(verifier.PlanError, "phase-state activation edge differs"):
+            verifier.validate_phase_state(state, base.contract, base.policy, normalized, base.rollout, base.policy_hash, base.schema_hash)
+
+    def test_policy_admits_exactly_the_reviewed_genesis_edges(self) -> None:
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        verifier.validate_release_policy(policy)
+        self.assertEqual(
+            [edge for edge in policy["activation_transitions"] if edge["from"] == "genesis"],
+            [{"from": "genesis", "to": "baseline", "ordinal": 1}, {"from": "genesis", "to": "ui", "ordinal": 4}],
+        )
+        self.assertEqual(POLICY_PATH.read_bytes(), verifier.canonical_file_bytes(policy))
+        mutations = {
+            "genesis->bridge": lambda edges: edges.append({"from": "genesis", "to": "bridge", "ordinal": 2}),
+            "genesis->backend": lambda edges: edges.append({"from": "genesis", "to": "backend", "ordinal": 3}),
+            "second genesis->baseline": lambda edges: edges.append({"from": "genesis", "to": "baseline", "ordinal": 1}),
+            "genesis->ui ordinal 1": lambda edges: edges.__setitem__(4, {"from": "genesis", "to": "ui", "ordinal": 1}),
+            "ui->baseline": lambda edges: edges.append({"from": "ui", "to": "baseline", "ordinal": 1}),
+            "backend->bridge": lambda edges: edges.append({"from": "backend", "to": "bridge", "ordinal": 2}),
+            "missing re-entry": lambda edges: edges.pop(4),
+            "missing genesis->baseline": lambda edges: edges.pop(0),
+            "reordered": lambda edges: edges.reverse(),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                tampered = copy.deepcopy(policy)
+                mutate(tampered["activation_transitions"])
+                with self.assertRaisesRegex(verifier.PlanError, "activation transitions differ"):
+                    verifier.validate_release_policy(tampered)
+
+    def test_digest_genesis_hash_binds_images_live_phase_and_evidence(self) -> None:
+        contract = verifier.load_json(CONTRACT_PATH, "contract")
+        original = verifier.genesis_state_sha256(contract)
+        bootstrap = contract["bootstrap_state"]
+        for key, value in (
+            ("live_phase", "baseline"),
+            ("live_evidence", {**bootstrap["live_evidence"], "run_id": "1"}),
+            ("images", list(reversed(bootstrap["images"]))),
+        ):
+            with self.subTest(key=key):
+                tampered = copy.deepcopy(contract)
+                tampered["bootstrap_state"][key] = value
+                self.assertNotEqual(verifier.genesis_state_sha256(tampered), original)
+        missing = copy.deepcopy(contract)
+        del missing["bootstrap_state"]["live_evidence"]
+        with self.assertRaisesRegex(verifier.PlanError, "bootstrap live state is incomplete"):
+            verifier.genesis_state_sha256(missing)
+        legacy = copy.deepcopy(contract)
+        legacy_bootstrap = legacy["bootstrap_state"]
+        legacy_bootstrap["source_mode"] = "legacy-git"
+        for key in ("images", "live_phase", "live_evidence"):
+            legacy_bootstrap.pop(key)
+        self.assertEqual(verifier.genesis_state_sha256(legacy), verifier.sha256_value({
+            "kind": "genesis", "event_sequence": 0, "phase_ordinal": 0, "phase": "genesis",
+            "app_identity_sha256": legacy["provider"]["app_id_sha256"],
+            "default_ingress_sha256": legacy["provider"]["default_ingress_sha256"],
+            "active_deployment_identity_sha256": legacy_bootstrap["active_deployment_id_sha256"],
+            "canonical_spec_sha256": legacy_bootstrap["canonical_spec_sha256"],
+            "environment_values_sha256": legacy_bootstrap["environment_values_sha256"],
+            "non_source_projection_sha256": legacy_bootstrap["non_source_projection_sha256"],
+            "source_mode": "legacy-git", "source_sha": legacy_bootstrap["source_sha"],
+        }))
+        self.assertEqual(verifier.genesis_target_phase(legacy), "baseline")
+
+    def test_bootstrap_live_phase_and_evidence_are_pinned(self) -> None:
+        contract = verifier.load_json(CONTRACT_PATH, "contract")
+        verifier.validate_contract(copy.deepcopy(contract))
+
+        def reseal(value):
+            value["bootstrap_state"]["genesis_state_sha256"] = verifier.genesis_state_sha256(value)
+            return value
+
+        for phase in ("baseline", "bridge", "backend", "genesis"):
+            with self.subTest(live_phase=phase):
+                tampered = copy.deepcopy(contract)
+                tampered["bootstrap_state"]["live_phase"] = phase
+                tampered["bootstrap_state"]["live_evidence"]["phase"] = phase
+                with self.assertRaisesRegex(verifier.PlanError, "bootstrap live phase differs"):
+                    verifier.validate_contract(reseal(tampered))
+        cases = (
+            ("receipt hash", lambda e: e.__setitem__("receipt_sha256", "0" * 64), "bootstrap live-state evidence differs"),
+            ("evidence phase", lambda e: e.__setitem__("phase", "backend"), "bootstrap live-state evidence phase differs"),
+            ("evidence kind", lambda e: e.__setitem__("kind", "owner-smoke-test"), "bootstrap live-state evidence kind differs"),
+            ("extra key", lambda e: e.__setitem__("url", "https://example.invalid"), "bootstrap live-state evidence keys differ"),
+            ("workflow", lambda e: e.__setitem__("workflow_path", ".github/workflows/deploy-production.yml"), "bootstrap live-state evidence authority differs"),
+        )
+        for label, mutate, message in cases:
+            with self.subTest(case=label):
+                tampered = copy.deepcopy(contract)
+                mutate(tampered["bootstrap_state"]["live_evidence"])
+                with self.assertRaisesRegex(verifier.PlanError, message):
+                    verifier.validate_contract(reseal(tampered))
+        for key in ("live_phase", "live_evidence"):
+            with self.subTest(missing=key):
+                tampered = copy.deepcopy(contract)
+                del tampered["bootstrap_state"][key]
+                with self.assertRaisesRegex(verifier.PlanError, "bootstrap state keys differ"):
+                    verifier.validate_contract(tampered)
+        stale = copy.deepcopy(contract)
+        stale["bootstrap_state"]["genesis_state_sha256"] = "0" * 64
+        with self.assertRaisesRegex(verifier.PlanError, "bootstrap genesis state hash differs"):
+            verifier.validate_contract(stale)
+
+    def test_live_evidence_shapes_are_exact(self) -> None:
+        verifier.validate_live_evidence(copy.deepcopy(verifier.BOOTSTRAP_LIVE_EVIDENCE), "ui")
+        signed = {
+            "kind": "signed-phase-state", "phase": "ui",
+            "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
+            "control_sha": "a" * 40, "run_id": "123", "run_attempt": 1, "artifact_id": "456",
+            "artifact_name": "production-phase-state-123-1", "artifact_digest": "sha256:" + "b" * 64,
+            "predicate_type": "https://rereply.app/attestations/production-phase-state/v1",
+            "phase_state_sha256": "c" * 64, "phase_source_sha": "d" * 40, "change_receipt_sha256": "e" * 64,
+            "receipt_predecessor_state_sha256": "1" * 64, "canary_sha256": "2" * 64,
+        }
+        verifier.validate_live_evidence(copy.deepcopy(signed), "ui")
+        self.assertEqual(set(verifier.LIVE_EVIDENCE_SHAPES["signed-phase-state"]["keys"]), set(signed))
+        for label, key, value in (
+            ("artifact name", "artifact_name", "production-phase-state-999-1"),
+            ("attempt", "run_attempt", 2),
+            ("predicate", "predicate_type", "https://slsa.dev/provenance/v1"),
+            ("hash", "phase_state_sha256", "z" * 64),
+            ("receipt predecessor", "receipt_predecessor_state_sha256", "z" * 64),
+            ("canary", "canary_sha256", "z" * 64),
+            ("receipt kind key", "receipt_sha256", "c" * 64),
+        ):
+            with self.subTest(case=label):
+                tampered = {**copy.deepcopy(signed), key: value}
+                with self.assertRaises(verifier.PlanError):
+                    verifier.validate_live_evidence(tampered, "ui")
+        for missing in ("receipt_predecessor_state_sha256", "canary_sha256"):
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                    verifier.PlanError, "bootstrap live-state evidence keys differ"):
+                verifier.validate_live_evidence({k: v for k, v in signed.items() if k != missing}, "ui")
+        with self.assertRaises(verifier.PlanError):
+            verifier.validate_live_evidence(copy.deepcopy(signed), "backend")
+
+    def test_live_evidence_matches_the_committed_attested_receipt(self) -> None:
+        documents = classify_live_evidence(LIVE_EVIDENCE_DIR)
+        bootstrap = verifier.load_json(CONTRACT_PATH, "contract")["bootstrap_state"]
+        self.assertEqual(bootstrap["live_evidence"], verifier.BOOTSTRAP_LIVE_EVIDENCE)
+        document = bind_live_evidence(verifier.BOOTSTRAP_LIVE_EVIDENCE, bootstrap, documents)
+        evidence = verifier.BOOTSTRAP_LIVE_EVIDENCE
+        self.assertEqual(document["sha256"], evidence["receipt_sha256"])
+        self.assertEqual(document["value"]["lineage"]["phase"], verifier.BOOTSTRAP_LIVE_PHASE)
+        for key, mutation, message in (
+            ("receipt_sha256", "0" * 64, "committed apply receipt hash differs"),
+            ("receipt_predecessor_state_sha256", "0" * 64, "committed apply receipt predecessor differs"),
+            ("phase_source_sha", "0" * 40, "committed live evidence source differs"),
+            ("control_sha", "0" * 40, "committed live evidence control differs"),
+            ("run_id", "36773451427", "committed apply receipt is missing"),
+        ):
+            with self.subTest(evidence=key):
+                tampered = {**copy.deepcopy(evidence), key: mutation}
+                if key == "run_id":
+                    tampered["artifact_name"] = f"production-phase-apply-{mutation}-1"
+                with self.assertRaisesRegex(AssertionError, message):
+                    bind_live_evidence(tampered, bootstrap, documents)
+        for key in ("active_deployment_id_sha256", "canonical_spec_sha256", "images"):
+            with self.subTest(bootstrap=key):
+                tampered = copy.deepcopy(bootstrap)
+                tampered[key] = "0" * 64 if key != "images" else list(reversed(tampered["images"]))
+                with self.assertRaisesRegex(AssertionError, "provider state differs from the bootstrap"):
+                    bind_live_evidence(evidence, tampered, documents)
+
+    def test_attestation_bundles_bind_the_committed_receipt(self) -> None:
+        import verify_production_release as release
+
+        evidence = verifier.BOOTSTRAP_LIVE_EVIDENCE
+        stem = f"production-phase-apply-receipt-{evidence['run_id']}-{evidence['run_attempt']}"
+        documents = classify_live_evidence(LIVE_EVIDENCE_DIR)
+        self.assertEqual(sorted(path.name for path in LIVE_EVIDENCE_DIR.iterdir()), [
+            stem + ".json",
+            stem + ".predicate-receipt-v1.sigstore.json",
+            stem + ".predicate-slsa-provenance-v1.sigstore.json",
+            stem + ".sha256",
+        ])
+        document = documents[stem + ".json"]
+        self.assertEqual(set(document["statements"]), {SLSA_PREDICATE, evidence["predicate_type"]})
+        for statement in document["statements"].values():
+            self.assertEqual(statement["subject"], [{
+                "name": "production-phase-apply-receipt.json",
+                "digest": {"sha256": evidence["receipt_sha256"]},
+            }])
+        custom = document["statements"][evidence["predicate_type"]]["predicate"]
+        self.assertEqual(release.canonical_file_bytes(custom), document["raw"])
+
+        def tamper(*edits):
+            with tempfile.TemporaryDirectory(prefix="live-evidence-") as temporary:
+                directory = Path(temporary)
+                for path in LIVE_EVIDENCE_DIR.iterdir():
+                    (directory / path.name).write_bytes(path.read_bytes())
+                for name, edit in edits:
+                    target = directory / name
+                    if edit is None:
+                        target.unlink()
+                    elif name.endswith(".sigstore.json"):
+                        bundle = json.loads(target.read_bytes())
+                        edit(bundle)
+                        target.write_bytes(json.dumps(bundle).encode("utf-8"))
+                    else:
+                        target.write_bytes(edit(target.read_bytes()))
+                classify_live_evidence(directory)
+
+        def rekor(bundle, change):
+            entry = bundle["verificationMaterial"]["tlogEntries"][0]
+            body = json.loads(base64.b64decode(entry["canonicalizedBody"]))
+            change(body)
+            entry["canonicalizedBody"] = base64.b64encode(json.dumps(body).encode("utf-8")).decode("ascii")
+
+        def restate(change, *, consistent_log=False):
+            def edit(bundle):
+                envelope = bundle["dsseEnvelope"]
+                statement = json.loads(base64.b64decode(envelope["payload"]))
+                change(statement)
+                payload = json.dumps(statement).encode("utf-8")
+                envelope["payload"] = base64.b64encode(payload).decode("ascii")
+                if consistent_log:
+                    # Isolate the predicate binding from the log-entry check.
+                    rekor(bundle, lambda body: body["spec"]["payloadHash"].update(
+                        value=hashlib.sha256(payload).hexdigest()))
+            return edit
+
+        def recanonicalized_receipt(raw):
+            value = json.loads(raw)
+            value["completed_at"] = "2026-09-30T20:39:18Z"
+            return release.canonical_file_bytes(value)
+
+        receipt_raw = (LIVE_EVIDENCE_DIR / (stem + ".json")).read_bytes()
+        self.assertNotEqual(recanonicalized_receipt(receipt_raw), receipt_raw)
+        receipt_bundle = stem + ".predicate-receipt-v1.sigstore.json"
+        slsa_bundle = stem + ".predicate-slsa-provenance-v1.sigstore.json"
+        cases = (
+            ("subject digest", [(receipt_bundle,
+             restate(lambda s: s["subject"][0]["digest"].update(sha256="0" * 64)))], "attestation subject differs"),
+            ("subject name", [(slsa_bundle,
+             restate(lambda s: s["subject"][0].update(name="other.json")))], "attestation subject differs"),
+            ("predicate content without a log entry", [(receipt_bundle,
+             restate(lambda s: s["predicate"]["lineage"].update(phase="backend")))],
+             "transparency-log entry differs"),
+            ("predicate content", [(receipt_bundle, restate(
+             lambda s: s["predicate"].update(completed_at="2026-09-30T20:39:18Z"), consistent_log=True))],
+             "attested predicate differs from the committed evidence"),
+            ("rekor payload hash", [(slsa_bundle, lambda b: rekor(
+             b, lambda body: body["spec"]["payloadHash"].update(value="0" * 64)))],
+             "transparency-log entry differs"),
+            ("rekor signature", [(slsa_bundle, lambda b: rekor(
+             b, lambda body: body["spec"]["signatures"][0].update(signature="AAAA")))],
+             "transparency-log entry differs"),
+            ("missing bundle", [(slsa_bundle, None)], "attestation bundles differ"),
+            ("media type", [(receipt_bundle, lambda b: b.update(mediaType="application/json"))], "media type differs"),
+            ("sidecar", [(stem + ".sha256", lambda raw: ("0" * 64 + "\n").encode("ascii"))], "sidecar differs"),
+            ("receipt not canonical", [(stem + ".json", lambda raw: raw[:-1] + b" \n")], "not canonical"),
+            ("receipt changed with a matching sidecar", [
+                (stem + ".json", recanonicalized_receipt),
+                (stem + ".sha256", lambda raw: (hashlib.sha256(recanonicalized_receipt(receipt_raw)).hexdigest()
+                                                 + "\n").encode("ascii")),
+             ], "attestation subject differs"),
+        )
+        for label, edits, message in cases:
+            with self.subTest(case=label), self.assertRaisesRegex(AssertionError, message):
+                tamper(*edits)
+        with tempfile.TemporaryDirectory(prefix="live-evidence-") as temporary:
+            directory = Path(temporary)
+            for path in LIVE_EVIDENCE_DIR.iterdir():
+                (directory / path.name).write_bytes(path.read_bytes())
+            (directory / "notes.md").write_text("unreviewed\n", encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "unreviewed live-evidence file"):
+                classify_live_evidence(directory)
+            (directory / "notes.md").unlink()
+            (directory / (stem + ".predicate-extra.sigstore.json")).write_bytes(
+                (LIVE_EVIDENCE_DIR / slsa_bundle).read_bytes())
+            with self.assertRaisesRegex(AssertionError, "duplicated"):
+                classify_live_evidence(directory)
+
+    def test_committed_live_evidence_sets_a_monotonic_live_phase_floor(self) -> None:
+        documents = classify_live_evidence(LIVE_EVIDENCE_DIR)
+        floor = require_live_phase_floor(documents)
+        self.assertEqual(verifier.PHASES[floor], "ui")
+        self.assertGreaterEqual(verifier.PHASES.index(verifier.BOOTSTRAP_LIVE_PHASE), floor)
+        for lower in verifier.PHASES[:floor]:
+            with self.subTest(live_phase=lower), mock.patch.object(verifier, "BOOTSTRAP_LIVE_PHASE", lower):
+                with self.assertRaisesRegex(AssertionError, "below the committed live-evidence floor"):
+                    require_live_phase_floor(documents)
+
+    def test_signed_phase_state_evidence_binds_committed_state_bytes(self) -> None:
+        # The next rebaseline (onto the signed ui' state) is data-only; this is
+        # the same binder exercised on a synthetic signed re-entry.
+        import test_verify_production_release as release_fixtures
+        import verify_production_release as release
+
+        receipt = release_fixtures.reentry_receipt()
+        receipt_raw = release.canonical_file_bytes(receipt)
+        receipt_hash = hashlib.sha256(receipt_raw).hexdigest()
+        state = release.build_phase_state(
+            receipt, change_receipt_sha256=receipt_hash, canary_sha256="9" * 64,
+            control=release_fixtures.STATE_CONTROL, completed_at="2026-08-27T00:01:00Z",
+        )
+        state_raw = release.canonical_file_bytes(state)
+        control = state["control"]
+        documents = {
+            f"production-phase-apply-receipt-{receipt['control']['run_id']}-1.json": {
+                "raw": receipt_raw, "value": receipt, "sha256": receipt_hash,
+                "authority": "production-phase-apply-receipt", "phase": "ui", "statements": {},
+            },
+            f"production-phase-state-{control['run_id']}-1.json": {
+                "raw": state_raw, "value": state, "sha256": hashlib.sha256(state_raw).hexdigest(),
+                "authority": "production-phase-state", "phase": "ui", "statements": {},
+            },
+        }
+        evidence = {
+            "kind": "signed-phase-state", "phase": "ui",
+            "workflow_path": control["workflow_path"], "control_sha": control["workflow_sha"],
+            "run_id": control["run_id"], "run_attempt": 1, "artifact_id": "402",
+            "artifact_name": f"production-phase-state-{control['run_id']}-1",
+            "artifact_digest": "sha256:" + "4" * 64,
+            "predicate_type": "https://rereply.app/attestations/production-phase-state/v1",
+            "phase_state_sha256": hashlib.sha256(state_raw).hexdigest(),
+            "phase_source_sha": state["lineage"]["phase_source_sha"],
+            "change_receipt_sha256": receipt_hash,
+            "receipt_predecessor_state_sha256": receipt["lineage"]["predecessor_state_sha256"],
+            "canary_sha256": "9" * 64,
+        }
+        provider = state["provider_state"]
+        bootstrap = {
+            "active_deployment_id_sha256": provider["active_deployment_identity_sha256"],
+            **{key: copy.deepcopy(provider[key]) for key in (
+                "canonical_spec_sha256", "environment_values_sha256",
+                "non_source_projection_sha256", "source_mode", "images")},
+            "live_phase": "ui",
+        }
+        self.assertIs(bind_live_evidence(evidence, bootstrap, documents)["value"], state)
+        for key, value, message in (
+            ("phase_state_sha256", "0" * 64, "committed phase state hash differs"),
+            ("canary_sha256", "0" * 64, "committed phase state evidence differs"),
+            ("change_receipt_sha256", "0" * 64, "committed phase state evidence differs"),
+            ("receipt_predecessor_state_sha256", "0" * 64, "committed change receipt differs"),
+            ("phase_source_sha", "0" * 40, "committed live evidence source differs"),
+        ):
+            with self.subTest(evidence=key), self.assertRaisesRegex(AssertionError, message):
+                bind_live_evidence({**evidence, key: value}, bootstrap, documents)
+        with self.assertRaisesRegex(AssertionError, "committed change receipt is missing"):
+            bind_live_evidence(evidence, bootstrap, {
+                name: item for name, item in documents.items() if item["authority"] != "production-phase-apply-receipt"})
+        with self.assertRaisesRegex(AssertionError, "provider state differs from the bootstrap"):
+            bind_live_evidence(evidence, {**bootstrap, "active_deployment_id_sha256": "0" * 64}, documents)
+        with self.assertRaisesRegex(verifier.PlanError, "phase differs"):
+            bind_live_evidence(evidence, {**bootstrap, "live_phase": "backend"}, documents)
+
+    def test_runtime_controls_never_read_the_committed_live_evidence(self) -> None:
+        runtime = [path for path in (ROOT / "release").rglob("*.py") if not path.name.startswith("test_")]
+        runtime += sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        for path in runtime:
+            with self.subTest(path=path.name):
+                self.assertNotIn("live-evidence", path.read_text(encoding="utf-8"))
+        with mock.patch.object(verifier.urllib.request, "build_opener", side_effect=AssertionError("network forbidden")), \
+                mock.patch.object(verifier.urllib.request, "urlopen", side_effect=AssertionError("network forbidden")):
+            verifier.validate_contract(verifier.load_json(CONTRACT_PATH, "contract"))
+
+    def test_committed_live_evidence_is_never_line_ending_converted(self) -> None:
+        attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
+        self.assertIn("release/deployment/live-evidence/** -text", attributes)
+        for path in LIVE_EVIDENCE_DIR.iterdir():
+            with self.subTest(path=path.name):
+                self.assertNotIn(b"\r", path.read_bytes())
+
+    def test_runbook_records_the_reentry_rules(self) -> None:
+        runbook = (ROOT / "docs" / "crm-production-release-control.md").read_text(encoding="utf-8")
+        section = runbook.split("## Genesis re-entry at the accepted live phase (2026-10-01)\n", 1)[1]
+        section = section.split("\n## ", 1)[0]
+        evidence = verifier.BOOTSTRAP_LIVE_EVIDENCE
+        for required in (
+            "### Required pre-merge verification (recorded)",
+            "`gh attestation verify`",
+            evidence["predicate_type"],
+            "https://slsa.dev/provenance/v1",
+            f"Run {evidence['run_id']} is a",
+            "The owner accepted the unsigned c4cdac90 ui on\n2026-09-30 after a manual smoke test.",
+            "### Live-phase floor induction",
+            "**no governed rollback after ui'**",
+            "every future release must rebaseline again",
+            "Every live-evidence file stays committed",
+            "`do not relaunch; triage it (runbook F14)`",
+            "`main-branch-locked-by-an-earlier-apply`",
+            "Never relaunch for F4",
+            "Data-only rebaseline checklist:",
+            "LiveFloorInductionTests",
+        ):
+            self.assertIn(required, section)
+        for incident in range(1, 15):
+            self.assertIn(f"- **F{incident}. ", section)
+        genesis = verifier.genesis_state_sha256(verifier.load_json(CONTRACT_PATH, "contract"))
+        self.assertIn(f"`{genesis[:8]}`", section)
+        for value in (evidence["receipt_sha256"], evidence["receipt_predecessor_state_sha256"],
+                      evidence["phase_source_sha"], verifier.UI_TARGET_SOURCE_SHA):
+            self.assertIn(f"`{value[:8]}`", section)
+
+    def test_rollback_floors_only_point_below_their_phase(self) -> None:
+        for phase, floor in verifier.ROLLBACK_FLOORS.items():
+            below = set(verifier.PHASES[: verifier.PHASES.index(phase)])
+            self.assertLessEqual(set(floor["allowed_targets"]), below)
+            self.assertLessEqual(set(floor["forbidden_targets"]), below)
+        for live in (verifier.PHASES[0], *verifier.GENESIS_ENTRY_PHASES):
+            self.assertNotIn(live, verifier.ROLLBACK_FLOORS[live]["forbidden_targets"])
+
+
 class ReviewedProductionContractTests(unittest.TestCase):
     def test_digest_bootstrap_authority_is_pinned_and_enforced(self) -> None:
         contract = verifier.validate_contract(
@@ -2399,7 +3256,7 @@ class ReviewedProductionContractTests(unittest.TestCase):
         )
         self.assertEqual(
             production_contract["bootstrap_state"]["genesis_state_sha256"],
-            "d8a7ffe6f19062d10dfa6cd843bc799cd34465b77202b23ac0c9a2cde73b8846",
+            GENESIS_PIN,
         )
         self.assertEqual(
             verifier.genesis_state_sha256(production_contract),
@@ -2416,6 +3273,11 @@ class ReviewedProductionContractTests(unittest.TestCase):
         )
         self.assertEqual(bootstrap["source_sha"], verifier.BOOTSTRAP_SOURCE_SHA)
         self.assertNotEqual(bootstrap["source_sha"], verifier.BASELINE_TARGET_SOURCE_SHA)
+        # 2026-10-01: re-entered at the accepted live ui phase.
+        self.assertEqual(bootstrap["live_phase"], "ui")
+        self.assertEqual(bootstrap["live_phase"], verifier.BOOTSTRAP_LIVE_PHASE)
+        self.assertEqual(bootstrap["live_evidence"], verifier.BOOTSTRAP_LIVE_EVIDENCE)
+        self.assertEqual(verifier.genesis_target_phase(production_contract), "ui")
         self.assertEqual(bootstrap["images"], verifier.BOOTSTRAP_IMAGES)
         self.assertEqual(
             [record["component"] for record in bootstrap["images"]],
