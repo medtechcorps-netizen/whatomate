@@ -472,18 +472,23 @@ concurrency, so a roll never races a canary.
   defect in ChannelsView and ChatView (anchoring plus scroll-handler follow
   state), queued as a ui source fix; the checks prove the product's own
   bottom-following of a one-step late layout change.
-  `native_chat_conversation_switch_autoscroll` waits for the exact message's
-  `data-message-id` on `[data-testid="chat-message"]`. A ui source change to
+  `native_chat_conversation_switch_autoscroll` waits for the selected
+  contact's known inbound message (its `data-message-id` on
+  `[data-testid="chat-message"]`) to render, then polls up to 5 s until the
+  scroller reaches the real bottom. A ui source change to
   the transcript scrollers, their test IDs or the 1280 px rail breakpoints
   fails those checks closed, so it must ship with a matching driver change.
   A driver change to checks 8-11 is gated before merge by the same-browser
   harness: the pinned Playwright base image with its own `playwright`
   package, the live ui source, 4 history shapes, both native rail states and
   0/100/250 ms API latency, with every run passing.
-- **Failed-check label.** A failing driver run writes one content-free line to
-  stderr, which lands in the driver app's runtime logs:
+- **Failed-check label.** A failing driver run writes one content-free line per
+  failed stage to stderr, which lands in the driver app's runtime logs:
   `{"schema_version":1,"event":"crm_canary_driver_check","check":"<label>","outcome":"FAILED"}`.
-  The label is `prepare`, one of the 13 check IDs, or `deadline`. The canary
+  The label is `prepare`, one of the 13 check IDs, or `deadline`. A deadline
+  writes `deadline`, usually followed by the label of the stage that was
+  still running (closing the browsers rejects it), which names the stuck
+  check. The canary
   itself only sees a generic 503, so read the label (owner console, or a
   consented read-only log fetch) before any re-dispatch (F11).
 
