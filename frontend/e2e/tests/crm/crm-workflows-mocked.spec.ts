@@ -619,6 +619,26 @@ test('lead can be moved with the keyboard on a mobile viewport', async ({ page }
   await expect(page.getByText('Moved to Qualified')).toBeVisible()
 })
 
+test('follow-ups open in a side sheet scoped to the pipeline, with an all follow-ups toggle', async ({ page }) => {
+  await installBaseMocks(page)
+  await installPipelineReads(page)
+
+  await page.goto('/crm/pipeline')
+  await expect(page.getByText('Website enquiry', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('pipeline-kpi-follow-ups')).toContainText('Open follow-ups')
+  await expect(page.getByTestId('pipeline-kpi-overdue')).toHaveText('0 overdue')
+  await page.getByRole('button', { name: 'Follow-ups, 0 open, 0 overdue' }).click()
+
+  const sheet = page.getByRole('dialog', { name: 'Follow-ups' })
+  await expect(sheet).toBeVisible()
+  // The synthetic task is not linked to a lead, so the pipeline view is empty.
+  await expect(sheet.getByText('No open follow-ups for this pipeline.')).toBeVisible()
+  await expect(sheet.getByText('Confirm consultation slot')).toHaveCount(0)
+  await sheet.getByRole('button', { name: 'All follow-ups' }).click()
+  await expect(sheet.getByText('Confirm consultation slot')).toBeVisible()
+  await expect(sheet.getByRole('link', { name: 'Open follow-ups page' })).toBeVisible()
+})
+
 test('task edit failure is recoverable and cancellation uses the audited update endpoint', async ({
   page,
 }) => {
