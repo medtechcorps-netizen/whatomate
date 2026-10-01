@@ -8,6 +8,7 @@ import { useOmnichannelUnreadStore } from '@/stores/omnichannelUnread'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Menu,
@@ -24,7 +25,7 @@ import OrganizationSwitcher from './OrganizationSwitcher.vue'
 import UserMenu from './UserMenu.vue'
 import ActiveCallPanel from '@/components/calling/ActiveCallPanel.vue'
 import { ScrollToTop } from '@/components/shared'
-import { navigationSections, type NavSection } from './navigation'
+import { MORE_TOOLS_STORAGE_KEY, navigationSections, type NavSection } from './navigation'
 import ReReplyLogo from '@/components/brand/ReReplyLogo.vue'
 import NavUnreadBadge from './NavUnreadBadge.vue'
 
@@ -124,6 +125,74 @@ const navSections = computed(() => {
 
 const mainSections = computed(() => navSections.value.filter(s => !s.pinBottom))
 const bottomSections = computed(() => navSections.value.filter(s => s.pinBottom))
+
+// "More tools" keeps setup and occasional pages out of the way. It starts
+// closed, remembers the last choice, and opens by itself while one of its
+// pages is open or anywhere in Settings (see autoOpenPathPrefixes). The collapsed icon rail ignores it and shows every icon.
+function readMoreToolsPreference() {
+  try {
+    return window.localStorage.getItem(MORE_TOOLS_STORAGE_KEY) === 'open'
+  } catch {
+    return false
+  }
+}
+
+function writeMoreToolsPreference(open: boolean) {
+  try {
+    window.localStorage.setItem(MORE_TOOLS_STORAGE_KEY, open ? 'open' : 'closed')
+  } catch {
+    // Storage can be blocked (private mode, policies); the toggle still works.
+  }
+}
+
+const moreToolsPreferenceOpen = ref(readMoreToolsPreference())
+// Path on which the person closed the group while it was auto-opened.
+const moreToolsDismissedOnPath = ref<string | null>(null)
+watch(
+  () => route.path,
+  path => {
+    if (path !== moreToolsDismissedOnPath.value) moreToolsDismissedOnPath.value = null
+  },
+)
+
+type CollapsibleSectionState = {
+  collapsible?: boolean
+  autoOpenPathPrefixes?: string[]
+  items: Array<{ active: boolean }>
+}
+
+function sectionShouldAutoOpen(section: CollapsibleSectionState) {
+  if (section.items.some(item => item.active)) return true
+  return (section.autoOpenPathPrefixes ?? []).some(
+    prefix => route.path === prefix || route.path.startsWith(`${prefix}/`),
+  )
+}
+
+function isSectionOpen(section: CollapsibleSectionState) {
+  if (!section.collapsible || isCollapsed.value) return true
+  if (moreToolsPreferenceOpen.value) return true
+  return sectionShouldAutoOpen(section) && moreToolsDismissedOnPath.value !== route.path
+}
+
+function toggleSection(section: CollapsibleSectionState) {
+  if (!section.collapsible) return
+  const open = !isSectionOpen(section)
+  moreToolsPreferenceOpen.value = open
+  moreToolsDismissedOnPath.value = open ? null : route.path
+  writeMoreToolsPreference(open)
+}
+
+function sectionDomId(section: { id?: string; label: string }) {
+  return `nav-section-${section.id ?? section.label.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`
+}
+
+function sectionItemsId(section: { id?: string; label: string }) {
+  return `${sectionDomId(section)}-items`
+}
+
+function sectionToggleId(section: { id?: string; label: string }) {
+  return `${sectionDomId(section)}-toggle`
+}
 
 // Mobile is intentionally a focused companion experience. Keep the full
 // workspace available on desktop while exposing only the three workflows that
@@ -445,7 +514,27 @@ onBeforeUnmount(() => {
           <template v-for="(section, sIdx) in mainSections" :key="section.label">
             <!-- Section header -->
             <div
-              v-if="section.label && !isCollapsed"
+              v-if="section.label && !isCollapsed && section.collapsible"
+              :class="['pt-3 pb-1', sIdx === 0 && 'pt-1']"
+            >
+              <button
+                :id="sectionToggleId(section)"
+                type="button"
+                class="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-white/40 transition-colors hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30 light:text-gray-500 light:hover:bg-gray-50 light:hover:text-gray-900 light:focus-visible:ring-gray-400"
+                :aria-expanded="isSectionOpen(section)"
+                :aria-controls="sectionItemsId(section)"
+                :data-testid="`nav-section-toggle-${section.id ?? ''}`"
+                @click="toggleSection(section)"
+              >
+                <span>{{ $t(section.label) }}</span>
+                <ChevronDown
+                  :class="['h-3.5 w-3.5 shrink-0 transition-transform duration-200', isSectionOpen(section) && 'rotate-180']"
+                  aria-hidden="true"
+                />
+              </button>
+            </div>
+            <div
+              v-else-if="section.label && !isCollapsed"
               :class="['px-2.5 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-white/30 light:text-gray-400', sIdx === 0 && 'pt-1']"
             >
               {{ $t(section.label) }}
@@ -453,7 +542,14 @@ onBeforeUnmount(() => {
             <div v-else-if="sIdx > 0" :class="['my-2 mx-2.5 border-t border-white/[0.06] light:border-gray-200', isCollapsed && 'mx-1']" />
 
             <!-- Section items -->
-            <div class="space-y-0.5">
+            <div
+              v-show="isSectionOpen(section)"
+              :id="sectionItemsId(section)"
+              :role="section.collapsible ? 'group' : undefined"
+              :aria-labelledby="section.collapsible && !isCollapsed ? sectionToggleId(section) : undefined"
+              class="space-y-0.5"
+              :data-nav-section="section.id ?? section.label"
+            >
               <template v-for="item in section.items" :key="item.path">
                 <RouterLink
                   :to="item.path"
