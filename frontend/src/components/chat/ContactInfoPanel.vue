@@ -30,6 +30,7 @@ import { getTagColorClass } from '@/lib/constants'
 import { useTagsStore } from '@/stores/tags'
 import { useAuthStore } from '@/stores/auth'
 import { contactsService, type Tag } from '@/services/api'
+import { contactAddressDisplay, contactDisplayName } from '@/lib/contactAddress'
 import { toast } from 'vue-sonner'
 import type { Contact } from '@/stores/contacts'
 
@@ -67,6 +68,7 @@ const props = defineProps<{
   contact: Contact
   sessionData?: SessionData | null
   embedded?: boolean
+  channel?: string | null
 }>()
 
 const emit = defineEmits<{
@@ -164,6 +166,27 @@ const sortedSections = computed(() => {
   if (!props.sessionData?.panel_config?.sections) return []
   return [...props.sessionData.panel_config.sections].sort((a, b) => a.order - b.order)
 })
+
+const contactAddress = computed(() =>
+  contactAddressDisplay(props.contact, { channel: props.channel }),
+)
+
+// The saved name comes first here (then the profile name, phone number or a
+// plain channel description), and a raw placeholder such as "bsuid:..." is
+// never shown as the customer's name.
+const displayName = computed(() =>
+  contactDisplayName(
+    { ...props.contact, name: props.contact.profile_name, profile_name: props.contact.name },
+    { channel: props.channel },
+  ),
+)
+
+// The empty-state hint is aimed at whoever configures chatbot flows; inside the
+// customer workspace rail it is noise for front-desk staff, so it is only shown
+// in the standalone panel.
+const showPanelConfigHint = computed(() =>
+  !props.embedded && (!props.sessionData || sortedSections.value.length === 0),
+)
 
 // Get tags from contact
 const contactTags = computed(() => {
@@ -270,17 +293,36 @@ async function updateContactTags(tags: string[]) {
         <div class="flex flex-col items-center text-center pb-4 border-b">
           <Avatar class="h-16 w-16 mb-3">
             <AvatarImage :src="contact.avatar_url" />
-            <AvatarFallback :class="'text-lg bg-gradient-to-br text-white ' + getAvatarGradient(contact.name || contact.phone_number)">
-              {{ getInitials(contact.name || contact.phone_number) }}
+            <AvatarFallback :class="'text-lg bg-gradient-to-br text-white ' + getAvatarGradient(displayName)">
+              {{ getInitials(displayName) }}
             </AvatarFallback>
           </Avatar>
-          <h4 class="font-medium">
-            {{ contact.name || contact.phone_number }}
+          <h4 class="font-medium" data-testid="contact-display-name">
+            {{ displayName }}
           </h4>
-          <div class="flex items-center gap-1 text-sm text-muted-foreground mt-1">
+          <div
+            v-if="contactAddress.kind === 'phone'"
+            class="flex items-center gap-1 text-sm text-muted-foreground mt-1"
+          >
             <Phone class="h-3 w-3" />
-            <span>{{ contact.phone_number }}</span>
+            <span>{{ contactAddress.text }}</span>
           </div>
+          <Badge
+            v-else
+            variant="secondary"
+            class="mt-1 font-normal text-muted-foreground"
+            data-testid="contact-address-hidden"
+            :title="contactAddress.hint || undefined"
+          >
+            {{ contactAddress.text }}
+          </Badge>
+          <p
+            v-if="contactAddress.kind !== 'phone' && contactAddress.hint"
+            class="mt-1 max-w-xs text-xs text-muted-foreground"
+            data-testid="contact-address-hint"
+          >
+            {{ contactAddress.hint }}
+          </p>
         </div>
 
         <!-- Tags Section (always shown) -->
@@ -368,15 +410,15 @@ async function updateContactTags(tags: string[]) {
           />
         </div>
 
-        <!-- No Session Data or no panel config -->
-        <div v-if="!props.sessionData || sortedSections.length === 0" class="text-center py-6 text-muted-foreground border-t">
+        <!-- No Session Data or no panel config (standalone panel only) -->
+        <div v-if="showPanelConfigHint" class="text-center py-6 text-muted-foreground border-t">
           <User class="h-8 w-8 mx-auto mb-2 opacity-50" />
           <p class="text-sm">No data configured</p>
           <p class="text-xs mt-1">Configure panel display in the chatbot flow settings.</p>
         </div>
 
         <!-- Session Data with panel config -->
-        <template v-else>
+        <template v-else-if="props.sessionData && sortedSections.length > 0">
           <!-- Flow Name Badge -->
           <div v-if="props.sessionData?.flow_name" class="flex items-center gap-2">
             <Badge variant="outline" class="text-xs">
