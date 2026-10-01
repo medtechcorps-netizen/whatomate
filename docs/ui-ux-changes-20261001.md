@@ -23,6 +23,7 @@ release for those. All other entries leave the canary hooks untouched.
 | 5 | Lead pipeline: follow-ups drawer, New lead dialog, explicit Won/Lost, invoice | no |
 | 6 | Chat header "Next step" menu and hidden-number display | **yes - adjacent** (`chat-contact` row text for blank/placeholder numbers only) |
 | 7 | Contacts, Follow-ups and Invoices pages: hidden numbers, links, plain copy | no |
+| 8 | Inbox keeps following the newest message after a window resize | **yes** (message-pane scrolling) |
 
 ### What the canary driver owner must know (items 4 and 6)
 
@@ -299,6 +300,31 @@ and in the built-in browser.
   extended.
 - **Verified:** batch verification above.
 - **Canary-sensitive:** no.
+
+### 8. Inbox keeps following the newest message after a window resize
+
+- **Owner asked:** approved the fix reported by the release session: when the
+  window is resized while the omnichannel transcript holds several long
+  messages, the pane stopped following the latest message.
+- **Root cause:** on resize the transcript reflows; the browser's scroll
+  anchoring adjusts `scrollTop` and fires a scroll event *before* the
+  transcript `ResizeObserver` runs. `handleMessageViewportScroll` then measures
+  the pane as "not near the bottom" and turns bottom-following off, so the
+  observer no longer scrolls down (reproduced: 127 px above the bottom).
+- **Changed:** `frontend/src/views/channels/ChannelsView.vue` - the
+  `omnichannel-message-viewport` element gets `overflow-anchor: none` (Tailwind
+  `[overflow-anchor:none]`). No script, threshold or data-testid change.
+  The native chat (`ChatView`, reka ScrollArea viewport) does not show the
+  problem under the same test, so it is left unchanged.
+- **Tests:** new mocked Playwright spec
+  `frontend/e2e/tests/channels/message-pane-resize.spec.ts` (inbox and native
+  chat: at the bottom at 1600px, narrow to 1300px, still within the 80px
+  follow threshold; inbox also widened back). The inbox case fails without the
+  fix (127 px) and passes with it (3/3 repeats); the chat case passes as a
+  guard.
+- **Canary-sensitive:** **yes - message-pane scrolling** (omnichannel inbox).
+  The release session should re-verify the canary driver's resize / late-layout
+  checks against this build.
 
 ## Backend follow-ups (not done on this branch - owner decision needed)
 

@@ -2976,7 +2976,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             ref="messagesViewport"
             data-testid="omnichannel-message-viewport"
             :data-conversation-id="selectedConversation.id"
-            class="flex-1 overflow-y-auto p-3 sm:p-5 md:p-7"
+            class="flex-1 overflow-y-auto p-3 [overflow-anchor:none] sm:p-5 md:p-7"
             @scroll.passive="handleMessageViewportScroll"
           >
             <div
