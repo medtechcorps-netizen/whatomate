@@ -22,6 +22,7 @@ import {
   LiveProductScenario,
   SyntheticCanaryFailure,
   buildSignedWebhook,
+  checkDiagnosticLine,
   executeCheckPlan,
   executeCheckPlanWithinDeadline,
   isExactProductUrl,
@@ -1537,4 +1538,353 @@ test("startup rejects unversioned login payloads before pg import", async () => 
       ["CONFIG", "ERROR"],
     ]);
   }
+});
+
+function diagnosticSink() {
+  const lines = [];
+  return { lines, writeDiagnostic: (line) => lines.push(line) };
+}
+
+function passingScenario() {
+  const scenario = { async prepare() {}, async close() {} };
+  for (const key of UI_CHECKS) scenario[key] = async () => true;
+  return scenario;
+}
+
+test("a failed check emits one fixed content-free diagnostic naming it", async () => {
+  const sink = diagnosticSink();
+  const scenario = passingScenario();
+  scenario.omnichannel_late_layout_autoscroll = async () => {
+    throw new Error("private-runtime-detail https://private.invalid/x");
+  };
+  await assert.rejects(
+    executeCheckPlan(scenario, { writeDiagnostic: sink.writeDiagnostic }),
+    /private-runtime-detail/u,
+  );
+  assert.deepEqual(sink.lines, [
+    '{"schema_version":1,"event":"crm_canary_driver_check","check":"omnichannel_late_layout_autoscroll","outcome":"FAILED"}\n',
+  ]);
+});
+
+test("prepare failure and false check results name their stage", async () => {
+  const prepareSink = diagnosticSink();
+  const failingPrepare = passingScenario();
+  failingPrepare.prepare = async () => {
+    throw new SyntheticCanaryFailure("synthetic login failed");
+  };
+  await assert.rejects(
+    executeCheckPlan(failingPrepare, {
+      writeDiagnostic: prepareSink.writeDiagnostic,
+    }),
+    SyntheticCanaryFailure,
+  );
+  assert.deepEqual(
+    prepareSink.lines.map((line) => JSON.parse(line).check),
+    ["prepare"],
+  );
+
+  const falseSink = diagnosticSink();
+  const falseCheck = passingScenario();
+  falseCheck.cross_organization_send_denied = async () => false;
+  await assert.rejects(
+    executeCheckPlan(falseCheck, { writeDiagnostic: falseSink.writeDiagnostic }),
+    SyntheticCanaryFailure,
+  );
+  assert.deepEqual(
+    falseSink.lines.map((line) => JSON.parse(line)),
+    [
+      {
+        schema_version: 1,
+        event: "crm_canary_driver_check",
+        check: "cross_organization_send_denied",
+        outcome: "FAILED",
+      },
+    ],
+  );
+});
+
+test("a passing check plan emits no diagnostic", async () => {
+  const sink = diagnosticSink();
+  assert.deepEqual(
+    await executeCheckPlan(passingScenario(), {
+      writeDiagnostic: sink.writeDiagnostic,
+    }),
+    passingChecks(),
+  );
+  assert.deepEqual(sink.lines, []);
+});
+
+test("diagnostic sink failures never replace the check failure", async () => {
+  for (const writeDiagnostic of [
+    () => {
+      throw new Error("sink");
+    },
+    () => Promise.reject(new Error("sink")),
+  ]) {
+    const scenario = passingScenario();
+    scenario.navbar_unread_clear = async () => {
+      throw new SyntheticCanaryFailure("navbar unread count did not clear");
+    };
+    await assert.rejects(
+      executeCheckPlan(scenario, { writeDiagnostic }),
+      /navbar unread count did not clear/u,
+    );
+  }
+});
+
+test("check diagnostics accept only reviewed labels", () => {
+  for (const label of ["prepare", "deadline", ...UI_CHECKS]) {
+    assert.deepEqual(JSON.parse(checkDiagnosticLine(label)), {
+      schema_version: 1,
+      event: "crm_canary_driver_check",
+      check: label,
+      outcome: "FAILED",
+    });
+  }
+  for (const label of [
+    "",
+    "__proto__",
+    "constructor",
+    "private-runtime-detail",
+    "prepare\n",
+    undefined,
+    null,
+    1,
+  ]) {
+    assert.equal(checkDiagnosticLine(label), null);
+  }
+});
+
+test("driver deadline emits the fixed deadline diagnostic", async () => {
+  const sink = diagnosticSink();
+  const scenario = passingScenario();
+  scenario.abort = () => {};
+  scenario.prepare = () => new Promise(() => {});
+  await assert.rejects(
+    executeCheckPlanWithinDeadline(scenario, 10, {
+      writeDiagnostic: sink.writeDiagnostic,
+    }),
+    SyntheticCanaryFailure,
+  );
+  assert.deepEqual(
+    sink.lines.map((line) => JSON.parse(line).check),
+    ["deadline"],
+  );
+});
+
+function fakeLateLayoutPage({
+  grows = true,
+  followsBottom = true,
+  failRestore = false,
+} = {}) {
+  const events = [];
+  let width = 1440;
+  let anchor = "";
+  const transcript = {
+    async evaluate(fn, arg) {
+      if (arg !== undefined) {
+        // setScrollAnchoring: the inline overflow-anchor of the scroller.
+        events.push(["anchor", arg]);
+        if (failRestore && arg !== "none") throw new Error("synthetic restore");
+        const previous = anchor;
+        anchor = arg;
+        return previous;
+      }
+      // The narrower 1300 px viewport narrows the transcript, so its
+      // content grows; the probe must see it at the bottom afterwards.
+      const scrollHeight = width === 1300 ? (grows ? 1400 : 900) : 1000;
+      const clientHeight = 500;
+      return {
+        clientHeight,
+        scrollHeight,
+        scrollTop:
+          followsBottom || width !== 1300 ? scrollHeight - clientHeight : 0,
+      };
+    },
+  };
+  const page = {
+    events,
+    anchor: () => anchor,
+    getByTestId(id) {
+      events.push(["testid", id]);
+      return transcript;
+    },
+    locator(selector) {
+      events.push(["locator", selector]);
+      throw new Error("late layout probes use no other page binding");
+    },
+    async setViewportSize(size) {
+      events.push(["viewport", size]);
+      width = size.width;
+    },
+    async waitForTimeout(milliseconds) {
+      events.push(["wait", milliseconds]);
+    },
+  };
+  return page;
+}
+
+test("late layout checks stay in the docked-rail band with anchoring off", async () => {
+  for (const [method, pageKey, testId] of [
+    [
+      "omnichannel_late_layout_autoscroll",
+      "omniPrimary",
+      "omnichannel-message-viewport",
+    ],
+    ["native_chat_late_layout_autoscroll", "native", "chat-message-list"],
+  ]) {
+    const page = fakeLateLayoutPage();
+    const scenario = new LiveProductScenario({ descriptor });
+    scenario.pages = { [pageKey]: page };
+    assert.equal(await scenario[method](), true);
+    assert.deepEqual(page.events[0], ["testid", testId]);
+    const steps = page.events.filter(
+      ([kind]) => kind === "viewport" || kind === "anchor",
+    );
+    // Anchoring is off before the first resize and restored after the last.
+    assert.deepEqual(steps, [
+      ["anchor", "none"],
+      ["viewport", { width: 1440, height: 640 }],
+      ["viewport", { width: 1300, height: 640 }],
+      ["anchor", ""],
+    ]);
+    assert.ok(
+      steps
+        .filter(([kind]) => kind === "viewport")
+        .every(([, size]) => size.width >= 1280),
+    );
+    assert.equal(page.anchor(), "");
+
+    for (const options of [{ grows: false }, { followsBottom: false }]) {
+      const failingPage = fakeLateLayoutPage(options);
+      const failing = new LiveProductScenario({ descriptor });
+      failing.pages = { [pageKey]: failingPage };
+      await assert.rejects(failing[method](), SyntheticCanaryFailure);
+      assert.deepEqual(failingPage.events.at(-1), ["anchor", ""]);
+      assert.equal(failingPage.anchor(), "");
+    }
+  }
+});
+
+test("late layout probe restores anchoring when a step fails", async () => {
+  const page = fakeLateLayoutPage();
+  page.setViewportSize = async () => {
+    throw new Error("synthetic resize failure");
+  };
+  const scenario = new LiveProductScenario({ descriptor });
+  scenario.pages = { omniPrimary: page };
+  await assert.rejects(
+    scenario.omnichannel_late_layout_autoscroll(),
+    /synthetic resize failure/u,
+  );
+  assert.equal(page.anchor(), "");
+  // A failed restore never replaces the probe result.
+  const sticky = fakeLateLayoutPage({ failRestore: true });
+  const passing = new LiveProductScenario({ descriptor });
+  passing.pages = { native: sticky };
+  assert.equal(await passing.native_chat_late_layout_autoscroll(), true);
+});
+
+test("driver never resizes across the workspace rail breakpoint", async () => {
+  const runnerSource = await readFile(
+    new URL("./runner.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.equal(/width:\s*860/u.test(runnerSource), false);
+  for (const match of runnerSource.matchAll(/width:\s*([0-9_]+)/gu)) {
+    assert.ok(Number(match[1].replaceAll("_", "")) >= 1280, match[0]);
+  }
+  assert.match(
+    runnerSource,
+    /LATE_LAYOUT_VIEWPORT = Object\.freeze\(\{ width: 1440, height: 640 \}\)/u,
+  );
+  assert.match(
+    runnerSource,
+    /LATE_LAYOUT_NARROW_VIEWPORT = Object\.freeze\(\{ width: 1300, height: 640 \}\)/u,
+  );
+  // The only product-page change is the probe's inline overflow-anchor; no
+  // DevTools session, injected stylesheet or navigation toggle is used.
+  assert.equal(/newCDPSession|addStyleTag/u.test(runnerSource), false);
+  assert.equal(/Main navigation/u.test(runnerSource), false);
+  assert.deepEqual(
+    [...runnerSource.matchAll(/style\.([A-Za-z]+)\s*=/gu)].map((m) => m[1]),
+    ["overflowAnchor"],
+  );
+});
+
+function fakeNativeSwitchPage(origin, positionsBeforeBottom) {
+  const waitedFor = [];
+  let reads = 0;
+  let currentPath = "/chat/none";
+  const list = {
+    async waitFor() {},
+    locator(selector) {
+      return {
+        async waitFor(options) {
+          waitedFor.push([selector, options.state]);
+        },
+      };
+    },
+    async evaluate() {
+      reads += 1;
+      const atBottom = reads > positionsBeforeBottom;
+      return { clientHeight: 500, scrollHeight: 1400, scrollTop: atBottom ? 900 : 502 };
+    },
+  };
+  const contact = (selector) => ({
+    first() {
+      return this;
+    },
+    async waitFor() {},
+    async count() {
+      return 1;
+    },
+    async click() {
+      currentPath = "/chat/" + /data-contact-id="([^"]+)"/u.exec(selector)[1];
+      reads = 0;
+    },
+  });
+  return {
+    waitedFor,
+    locator: contact,
+    getByTestId(id) {
+      assert.equal(id, "chat-message-list");
+      return list;
+    },
+    async waitForURL(predicate) {
+      assert.equal(predicate(new URL(origin + currentPath)), true);
+    },
+  };
+}
+
+test("native conversation switch waits for the exact latest message boundary", async () => {
+  const a = descriptor.klinik.conversations.a;
+  const b = descriptor.klinik.conversations.b;
+  const page = fakeNativeSwitchPage(descriptor.product_origin, 1);
+  const scenario = new LiveProductScenario({ descriptor });
+  scenario.pages = { native: page };
+  scenario.state = {
+    inboundAID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    inboundBID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  };
+  assert.equal(await scenario.native_chat_conversation_switch_autoscroll(), true);
+  assert.deepEqual(page.waitedFor, [
+    [
+      '[data-testid="chat-message"][data-message-id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]',
+      "attached",
+    ],
+    [
+      '[data-testid="chat-message"][data-message-id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]',
+      "attached",
+    ],
+  ]);
+  assert.notEqual(a.contact_id, b.contact_id);
+
+  const missing = new LiveProductScenario({ descriptor });
+  missing.pages = { native: fakeNativeSwitchPage(descriptor.product_origin, 0) };
+  missing.state = {};
+  await assert.rejects(
+    missing.native_chat_conversation_switch_autoscroll(),
+    /native selection dependency is unavailable/u,
+  );
 });

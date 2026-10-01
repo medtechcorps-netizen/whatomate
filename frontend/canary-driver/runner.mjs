@@ -1,5 +1,6 @@
 import { createHmac } from "node:crypto";
 import { lookup as defaultDnsLookup } from "node:dns/promises";
+import { writeSync } from "node:fs";
 import { isIP } from "node:net";
 
 export const UI_CHECKS = Object.freeze([
@@ -47,6 +48,36 @@ const DEFAULT_TIMEOUT_MS = 45_000;
 const DRIVER_EXECUTION_TIMEOUT_MS = 210_000;
 const DEADLINE_CLEANUP_GRACE_MS = 1_000;
 const BOTTOM_TOLERANCE_PX = 12;
+// Late-layout probes keep the viewport inside the >=1280 px band where the
+// customer workspace rails stay docked: crossing 1280 px turns the rails into
+// drawers and widens the transcript, so its content shrinks. A height-only
+// shrink to 1440x640 makes every fixture transcript overflow; a width-only
+// step to 1300x640 then narrows the transcript in one layout, so its content
+// grows while the reader is at the latest message.
+//
+// For the probe only, browser scroll anchoring is switched off on the
+// transcript scroller (inline overflow-anchor: none, restored afterwards).
+// With anchoring on, any layout that runs before the frame's scroll steps (a
+// resize handler, a hover hit-test after a click, a keyup handler) moves
+// scrollTop to keep the anchor node in place and dispatches a scroll event
+// before the product's ResizeObserver runs; the product's scroll handler then
+// reads a gap above its 80 px bottom threshold and stops following. In the
+// pinned Chromium every window resize, navigation toggle and rail toggle tried
+// with anchoring on failed for some fixture history, rail state or preceding
+// check, mostly 88-997 px above the latest message. That is a product defect in
+// ChannelsView and ChatView, queued as a ui source fix. With anchoring off, the
+// growth itself never moves scrollTop, so the probe checks exactly the
+// product's own bottom-following of a one-step late layout change.
+const LATE_LAYOUT_VIEWPORT = Object.freeze({ width: 1440, height: 640 });
+const LATE_LAYOUT_NARROW_VIEWPORT = Object.freeze({ width: 1300, height: 640 });
+const LATE_LAYOUT_SETTLE_MS = 1_000;
+const LATE_LAYOUT_FRAME_SETTLE_MS = 250;
+// Native Chat positions a newly selected transcript on a short timer after it
+// renders, so the latest-message boundary is polled for a bounded interval.
+const NATIVE_SELECTION_SETTLE_TIMEOUT_MS = 5_000;
+const CHECK_DIAGNOSTIC_LABELS = Object.freeze(
+  new Set(["prepare", ...CHECK_EXECUTION_ORDER, "deadline"]),
+);
 const MAX_WEBHOOK_RESPONSE_BYTES = 4096;
 const PRODUCT_ORIGIN = "https://app.rereply.app";
 
@@ -804,6 +835,73 @@ async function requireAtBottom(locator) {
     fail("message viewport is not at the latest message");
 }
 
+async function requireNativeSelectionAtBottom(page, messageID, timeout) {
+  if (typeof messageID !== "string" || !UUID_RE.test(messageID))
+    fail("native selection dependency is unavailable");
+  const list = page.getByTestId("chat-message-list");
+  await list
+    .locator(
+      '[data-testid="chat-message"][data-message-id="' + messageID + '"]',
+    )
+    .waitFor({ state: "attached", timeout });
+  await pollValue(
+    async () => metricsAtBottom(await scrollMetrics(list)),
+    (value) => value === true,
+    NATIVE_SELECTION_SETTLE_TIMEOUT_MS,
+    "message viewport is not at the latest message",
+  );
+}
+
+// Sets the transcript scroller's inline overflow-anchor (the same scroller
+// scrollMetrics measures) and returns the previous inline value.
+async function setScrollAnchoring(locator, value) {
+  return locator.evaluate((root, wanted) => {
+    const ancestors = [];
+    let parent = root.parentElement;
+    while (parent && ancestors.length < 6) {
+      ancestors.push(parent);
+      parent = parent.parentElement;
+    }
+    const candidates = [root, ...ancestors, ...root.querySelectorAll("*")];
+    const scrollable = candidates.find((node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const style = getComputedStyle(node);
+      return /(auto|scroll)/u.test(style.overflowY) && node.clientHeight > 0;
+    });
+    const node = scrollable instanceof HTMLElement ? scrollable : root;
+    if (!(node instanceof HTMLElement))
+      throw new Error("scroll viewport is unavailable");
+    const previous = node.style.overflowAnchor;
+    node.style.overflowAnchor = wanted;
+    return previous;
+  }, value);
+}
+
+async function requireLateLayoutPreservesLatest(page, viewport) {
+  const previous = await setScrollAnchoring(viewport, "none");
+  if (typeof previous !== "string") fail("scroll viewport binding differs");
+  try {
+    await page.setViewportSize(LATE_LAYOUT_VIEWPORT);
+    await page.waitForTimeout(LATE_LAYOUT_SETTLE_MS);
+    await scrollToBottom(viewport);
+    await page.waitForTimeout(LATE_LAYOUT_FRAME_SETTLE_MS);
+    const before = await scrollMetrics(viewport);
+    await page.setViewportSize(LATE_LAYOUT_NARROW_VIEWPORT);
+    await page.waitForTimeout(LATE_LAYOUT_SETTLE_MS);
+    const after = await scrollMetrics(viewport);
+    return (
+      after.scrollHeight > before.scrollHeight + 0.5 && metricsAtBottom(after)
+    );
+  } finally {
+    try {
+      await setScrollAnchoring(viewport, previous);
+    } catch {
+      // A failed restore never replaces the probe result; later checks do
+      // not depend on scroll anchoring.
+    }
+  }
+}
+
 async function waitForApiMessage(
   page,
   conversationID,
@@ -1451,14 +1549,8 @@ export class LiveProductScenario {
     const viewport = this.pages.omniPrimary.getByTestId(
       "omnichannel-message-viewport",
     );
-    await scrollToBottom(viewport);
-    const before = await scrollMetrics(viewport);
-    await this.pages.omniPrimary.setViewportSize({ width: 860, height: 900 });
-    await this.pages.omniPrimary.waitForTimeout(500);
-    const after = await scrollMetrics(viewport);
     if (
-      after.scrollHeight <= before.scrollHeight + 0.5 ||
-      !metricsAtBottom(after)
+      !(await requireLateLayoutPreservesLatest(this.pages.omniPrimary, viewport))
     ) {
       fail("Omnichannel late layout did not preserve the latest message");
     }
@@ -1474,27 +1566,29 @@ export class LiveProductScenario {
       b.contact_id,
       this.timeout,
     );
-    await requireAtBottom(this.pages.native.getByTestId("chat-message-list"));
+    await requireNativeSelectionAtBottom(
+      this.pages.native,
+      this.state.inboundBID,
+      this.timeout,
+    );
     await selectNativeContact(
       this.pages.native,
       this.descriptor.product_origin,
       a.contact_id,
       this.timeout,
     );
-    await requireAtBottom(this.pages.native.getByTestId("chat-message-list"));
+    await requireNativeSelectionAtBottom(
+      this.pages.native,
+      this.state.inboundAID,
+      this.timeout,
+    );
     return true;
   }
 
   async native_chat_late_layout_autoscroll() {
     const viewport = this.pages.native.getByTestId("chat-message-list");
-    await scrollToBottom(viewport);
-    const before = await scrollMetrics(viewport);
-    await this.pages.native.setViewportSize({ width: 860, height: 900 });
-    await this.pages.native.waitForTimeout(500);
-    const after = await scrollMetrics(viewport);
     if (
-      after.scrollHeight <= before.scrollHeight + 0.5 ||
-      !metricsAtBottom(after)
+      !(await requireLateLayoutPreservesLatest(this.pages.native, viewport))
     ) {
       fail("native Chat late layout did not preserve the latest message");
     }
@@ -1550,7 +1644,39 @@ export class LiveProductScenario {
   }
 }
 
-export async function executeCheckPlan(scenario) {
+function defaultWriteDiagnostic(line) {
+  writeSync(2, line);
+}
+
+// One fixed stderr record per failed stage. The label is always one of the
+// reviewed constants; no error, message, URL, identifier or runtime value is
+// ever written.
+export function checkDiagnosticLine(label) {
+  if (!CHECK_DIAGNOSTIC_LABELS.has(label)) return null;
+  return (
+    JSON.stringify({
+      schema_version: 1,
+      event: "crm_canary_driver_check",
+      check: label,
+      outcome: "FAILED",
+    }) + "\n"
+  );
+}
+
+function emitCheckDiagnostic(writeDiagnostic, label) {
+  try {
+    const line = checkDiagnosticLine(label);
+    if (line === null) return;
+    Promise.resolve(writeDiagnostic(line)).catch(() => {});
+  } catch {
+    // Diagnostic sink failure must never replace the check failure.
+  }
+}
+
+export async function executeCheckPlan(
+  scenario,
+  { writeDiagnostic = defaultWriteDiagnostic } = {},
+) {
   if (
     !scenario ||
     typeof scenario.prepare !== "function" ||
@@ -1559,14 +1685,20 @@ export async function executeCheckPlan(scenario) {
     fail("synthetic scenario contract differs");
   }
   const checks = Object.fromEntries(UI_CHECKS.map((key) => [key, false]));
+  let stage = "prepare";
   try {
     await scenario.prepare();
     for (const key of CHECK_EXECUTION_ORDER) {
+      stage = key;
       if (typeof scenario[key] !== "function")
         fail("synthetic scenario contract differs");
       if ((await scenario[key]()) !== true) fail("synthetic CRM check failed");
       checks[key] = true;
     }
+    stage = null;
+  } catch (error) {
+    if (stage !== null) emitCheckDiagnostic(writeDiagnostic, stage);
+    throw error;
   } finally {
     await scenario.close();
   }
@@ -1582,6 +1714,7 @@ export async function executeCheckPlan(scenario) {
 export async function executeCheckPlanWithinDeadline(
   scenario,
   timeoutMilliseconds = DRIVER_EXECUTION_TIMEOUT_MS,
+  { writeDiagnostic = defaultWriteDiagnostic } = {},
 ) {
   if (
     !Number.isSafeInteger(timeoutMilliseconds) ||
@@ -1600,6 +1733,7 @@ export async function executeCheckPlanWithinDeadline(
   let deadlineTimer;
   const deadline = new Promise((_, reject) => {
     deadlineTimer = setTimeout(() => {
+      emitCheckDiagnostic(writeDiagnostic, "deadline");
       try {
         Promise.resolve(scenario.abort()).catch(() => {});
       } catch {
@@ -1621,7 +1755,10 @@ export async function executeCheckPlanWithinDeadline(
     }, timeoutMilliseconds);
   });
   try {
-    return await Promise.race([executeCheckPlan(scenario), deadline]);
+    return await Promise.race([
+      executeCheckPlan(scenario, { writeDiagnostic }),
+      deadline,
+    ]);
   } finally {
     clearTimeout(deadlineTimer);
   }
@@ -1664,5 +1801,11 @@ export async function executeCanary(config, dependencies = {}) {
     now,
     chromium,
   });
-  return executeCheckPlanWithinDeadline(scenario);
+  return executeCheckPlanWithinDeadline(
+    scenario,
+    DRIVER_EXECUTION_TIMEOUT_MS,
+    dependencies.writeDiagnostic
+      ? { writeDiagnostic: dependencies.writeDiagnostic }
+      : {},
+  );
 }
