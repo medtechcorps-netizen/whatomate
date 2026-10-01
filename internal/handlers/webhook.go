@@ -501,13 +501,19 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 					continue
 				}
 
-				// Get contact profile name (match by phone or BSUID).
+				// Get contact profile name (match by phone or BSUID). The matched
+				// entry's wa_id and profile.username also travel with the message
+				// so a sender without "from" (WhatsApp username user) resolves
+				// to their own contact rather than an empty-phone one.
 				profileName := ""
-				for _, contact := range change.Value.Contacts {
+				inbound := msg.IncomingTextMessage
+				for i := range change.Value.Contacts {
+					contact := &change.Value.Contacts[i]
 					if (msg.From != "" && contact.WaID == msg.From) ||
 						(msg.FromUserID != "" && contact.UserID == msg.FromUserID) ||
 						(msg.FromParentUserID != "" && contact.ParentUserID == msg.FromParentUserID) {
 						profileName = contact.Profile.Name
+						inbound = inbound.withWebhookSenderContact(contact)
 						break
 					}
 				}
@@ -539,9 +545,22 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 					continue
 				}
 
+				// A message that names no sender at all (no from, wa_id, BSUID
+				// or username) cannot be attributed or answered. Skip it, as
+				// call_webhook does for sender-less calls, instead of failing
+				// persistence and asking Meta to retry the delivery forever.
+				if !inbound.hasSenderIdentity() {
+					a.Log.Warn("Skipping incoming message without a sender identity",
+						"phone_number_id", phoneNumberID,
+						"message_id", msg.ID,
+						"type", msg.Type,
+					)
+					continue
+				}
+
 				work, duplicate, err := a.persistAuthenticatedIncomingMessageBeforeAck(
 					phoneNumberID,
-					msg.IncomingTextMessage,
+					inbound,
 					profileName,
 					webhookBodySHA256,
 				)

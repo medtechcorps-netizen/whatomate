@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1293,3 +1294,545 @@ func TestIncomingReactionSerializesMergedContactAliases(t *testing.T) {
 // =============================================================================
 // evaluateExpression (package-level, not on App)
 // =============================================================================
+
+// =============================================================================
+// BSUID-only inbound senders on regular (non-Coexistence) accounts
+// =============================================================================
+
+func TestContactHasDialablePhone(t *testing.T) {
+	t.Parallel()
+	for _, phone := range []string{"60123456789", "+60123456789", "120363000000000000@g.us"} {
+		assert.True(t, contactHasDialablePhone(&models.Contact{PhoneNumber: phone}), phone)
+	}
+	for _, phone := range []string{"", "+", " ", "bsuid:abc", "user:abc", "event:abc", "id:abc"} {
+		assert.False(t, contactHasDialablePhone(&models.Contact{PhoneNumber: phone}), phone)
+	}
+	assert.False(t, contactHasDialablePhone(nil))
+}
+
+// Pure unit test: the refusal happens before any database access, so a nil DB
+// proves no write was attempted.
+func TestUpdateContactBSUIDNeverChangesContactWithoutDialablePhone(t *testing.T) {
+	t.Parallel()
+	app := &App{Log: testutil.NopLogger()}
+	for _, phone := range []string{"", "+", "bsuid:0123", "user:0123", "event:0123", "id:0123"} {
+		owned := &models.Contact{BaseModel: models.BaseModel{ID: uuid.New()}, PhoneNumber: phone, BSUID: "US.first-customer"}
+		app.updateContactBSUID(owned, "US.second-customer")
+		assert.Equal(t, "US.first-customer", owned.BSUID, "phone %q", phone)
+
+		unowned := &models.Contact{BaseModel: models.BaseModel{ID: uuid.New()}, PhoneNumber: phone}
+		app.updateContactBSUID(unowned, "US.second-customer")
+		assert.Empty(t, unowned.BSUID, "phone %q", phone)
+	}
+}
+
+func TestInboundSenderIdentityUsesWebhookContact(t *testing.T) {
+	t.Parallel()
+	webhookContact := &CoexistenceWebhookContact{WaID: "+60111111111", UserID: "US.sender"}
+	webhookContact.Profile.Name = "Sender"
+	webhookContact.Profile.Username = " sender_username "
+
+	bsuidOnly := IncomingTextMessage{ID: "wamid.a", FromUserID: "US.sender", FromParentUserID: "US.parent"}
+	bsuidOnly = bsuidOnly.withWebhookSenderContact(webhookContact)
+	identity := inboundSenderIdentity(bsuidOnly, " Sender ")
+	assert.Equal(t, "60111111111", identity.Phone, "wa_id stands in for an omitted from")
+	assert.Equal(t, "US.sender", identity.UserID)
+	assert.Equal(t, "US.parent", identity.ParentUserID)
+	assert.Equal(t, "sender_username", identity.Username)
+	assert.Equal(t, "Sender", identity.ProfileName)
+	assert.True(t, bsuidOnly.hasSenderIdentity())
+
+	withFrom := IncomingTextMessage{ID: "wamid.b", From: "60122222222", FromUserID: "US.sender"}
+	withFrom = withFrom.withWebhookSenderContact(webhookContact)
+	assert.Empty(t, withFrom.senderWaID, "wa_id never overrides an explicit from")
+	assert.Equal(t, "60122222222", inboundSenderIdentity(withFrom, "").Phone)
+
+	// The sidecar is never serialized into the durable continuation payload.
+	encoded, err := json.Marshal(bsuidOnly)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "sender_username")
+	assert.NotContains(t, string(encoded), "60111111111")
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
+	assert.Equal(t, "", decoded["from"])
+	assert.Equal(t, "US.sender", decoded["from_user_id"])
+
+	assert.False(t, IncomingTextMessage{ID: "wamid.c"}.hasSenderIdentity())
+	assert.Equal(t, IncomingTextMessage{ID: "wamid.d"}, IncomingTextMessage{ID: "wamid.d"}.withWebhookSenderContact(nil))
+}
+
+// Pure unit test: a message without any sender identity is rejected before
+// any database access instead of reaching GetOrCreateContact with "".
+func TestGetOrCreateNewInboundSenderContactRejectsAnonymousSender(t *testing.T) {
+	t.Parallel()
+	app := &App{Log: testutil.NopLogger()}
+	account := &models.WhatsAppAccount{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: uuid.New()}
+	contact, err := app.getOrCreateNewInboundSenderContact(account, IncomingTextMessage{ID: "wamid.anonymous"}, "Name")
+	require.ErrorIs(t, err, errInboundSenderIdentityMissing)
+	assert.Nil(t, contact)
+}
+
+func bsuidOnlyInboundMessage(t *testing.T, wamid, from, userID, body string) IncomingTextMessage {
+	t.Helper()
+	var message IncomingTextMessage
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"from": "`+from+`",
+		"from_user_id": "`+userID+`",
+		"id": "`+wamid+`",
+		"timestamp": "1722222222",
+		"type": "text",
+		"text": {"body": "`+body+`"}
+	}`), &message))
+	return message
+}
+
+func persistNonSMBInbound(t *testing.T, app *App, account *models.WhatsAppAccount, message IncomingTextMessage, profileName string) *persistedIncomingMessage {
+	t.Helper()
+	work, duplicate, err := app.persistAuthenticatedIncomingMessageBeforeAck(
+		account.PhoneID,
+		message,
+		profileName,
+		strings.Repeat("a", 64),
+	)
+	require.NoError(t, err)
+	require.False(t, duplicate)
+	require.NotNil(t, work)
+	return work
+}
+
+func TestNonSMBBSUIDOnlySendersGetDistinctPlaceholderContacts(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	require.False(t, account.IsSMB)
+	uid := uuid.NewString()[:8]
+	firstUserID := "US.first-" + uid
+	secondUserID := "US.second-" + uid
+
+	firstContactSidecar := &CoexistenceWebhookContact{UserID: firstUserID}
+	firstContactSidecar.Profile.Name = "First Username User"
+	firstContactSidecar.Profile.Username = "first_" + uid
+	first := bsuidOnlyInboundMessage(t, "wamid.bsuid-first-"+uid, "", firstUserID, "Hai").
+		withWebhookSenderContact(firstContactSidecar)
+	firstWork := persistNonSMBInbound(t, app, account, first, "First Username User")
+
+	second := bsuidOnlyInboundMessage(t, "wamid.bsuid-second-"+uid, "", secondUserID, "Hello")
+	secondWork := persistNonSMBInbound(t, app, account, second, "Second Username User")
+
+	require.NotEqual(t, firstWork.Contact.ID, secondWork.Contact.ID)
+
+	var firstContact, secondContact models.Contact
+	require.NoError(t, app.DB.First(&firstContact, "id = ?", firstWork.Contact.ID).Error)
+	require.NoError(t, app.DB.First(&secondContact, "id = ?", secondWork.Contact.ID).Error)
+	assert.Equal(t, firstUserID, firstContact.BSUID, "the first sender's BSUID is never overwritten")
+	assert.Equal(t, secondUserID, secondContact.BSUID)
+	assert.Equal(t, coexistenceIdentityPlaceholder(coexistenceContactIdentity{UserID: firstUserID}), firstContact.PhoneNumber)
+	assert.Equal(t, coexistenceIdentityPlaceholder(coexistenceContactIdentity{UserID: secondUserID}), secondContact.PhoneNumber)
+	assert.True(t, strings.HasPrefix(firstContact.PhoneNumber, "bsuid:"))
+	assert.Equal(t, "First Username User", firstContact.ProfileName)
+	assert.Equal(t, "Second Username User", secondContact.ProfileName)
+	assert.Equal(t, true, firstContact.Metadata["coexistence_phone_unavailable"])
+	assert.Equal(t, true, firstContact.Metadata["coexistence_phone_placeholder"])
+	assert.Equal(t, "first_"+uid, firstContact.Metadata["coexistence_username"])
+	assert.Equal(t, account.Name, firstContact.WhatsAppAccount)
+
+	var emptyPhoneCount int64
+	require.NoError(t, app.DB.Unscoped().Model(&models.Contact{}).
+		Where("organization_id = ? AND phone_number IN ?", org.ID, []string{"", "+"}).
+		Count(&emptyPhoneCount).Error)
+	assert.Zero(t, emptyPhoneCount)
+
+	// A second message from the first sender stays on the first contact.
+	again := bsuidOnlyInboundMessage(t, "wamid.bsuid-first-again-"+uid, "", firstUserID, "Again")
+	againWork := persistNonSMBInbound(t, app, account, again, "First Username User")
+	assert.Equal(t, firstContact.ID, againWork.Contact.ID)
+
+	// Outbound to a placeholder contact carries only the BSUID.
+	payload := map[string]any{}
+	whatsapp.Recipient{Phone: secondContact.PhoneNumber, BSUID: secondContact.BSUID}.SetOnPayload(payload)
+	_, hasTo := payload["to"]
+	assert.False(t, hasTo)
+	assert.Equal(t, secondUserID, payload["recipient"])
+}
+
+func TestNonSMBBSUIDPhoneRevealUpgradesPlaceholder(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	uid := uuid.NewString()[:8]
+	userID := "US.reveal-" + uid
+	phone := "6019" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+
+	firstWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.reveal-first-"+uid, "", userID, "Hai"), "Reveal User")
+	require.True(t, strings.HasPrefix(firstWork.Contact.PhoneNumber, "bsuid:"))
+
+	revealWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.reveal-phone-"+uid, phone, userID, "Now with phone"), "Reveal User")
+	assert.Equal(t, firstWork.Contact.ID, revealWork.Contact.ID, "the placeholder is upgraded, not duplicated")
+
+	var upgraded models.Contact
+	require.NoError(t, app.DB.First(&upgraded, "id = ?", firstWork.Contact.ID).Error)
+	assert.Equal(t, phone, upgraded.PhoneNumber)
+	assert.Equal(t, userID, upgraded.BSUID)
+	assert.Equal(t, false, upgraded.Metadata["coexistence_phone_unavailable"])
+	assert.Equal(t, false, upgraded.Metadata["coexistence_phone_placeholder"])
+
+	var sharing int64
+	require.NoError(t, app.DB.Model(&models.Contact{}).
+		Where("organization_id = ? AND bs_uid = ?", org.ID, userID).
+		Count(&sharing).Error)
+	assert.EqualValues(t, 1, sharing, "no second contact shares the BSUID")
+
+	payload := map[string]any{}
+	whatsapp.Recipient{Phone: upgraded.PhoneNumber, BSUID: upgraded.BSUID}.SetOnPayload(payload)
+	assert.Equal(t, phone, payload["to"])
+}
+
+func TestNonSMBBSUIDOnlyUsesWaIDOnlyWhenItDoesNotBelongToAnotherBSUID(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	uid := uuid.NewString()[:8]
+
+	// wa_id for a phone nobody owns yet: the contact gets the real phone.
+	freePhone := "6017" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+	freeUserID := "US.wa-free-" + uid
+	freeSidecar := &CoexistenceWebhookContact{WaID: freePhone, UserID: freeUserID}
+	freeWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.wa-free-"+uid, "", freeUserID, "Hai").withWebhookSenderContact(freeSidecar),
+		"WaID User")
+	assert.Equal(t, freePhone, freeWork.Contact.PhoneNumber)
+	assert.Equal(t, freeUserID, freeWork.Contact.BSUID)
+
+	// wa_id for a phone whose contact belongs to another BSUID: never attach
+	// this sender to it; use the per-sender placeholder instead.
+	owner := testutil.CreateTestContact(t, app.DB, org.ID)
+	require.NoError(t, app.DB.Model(owner).Update("bs_uid", "US.owner-"+uid).Error)
+	otherUserID := "US.wa-other-" + uid
+	otherSidecar := &CoexistenceWebhookContact{WaID: owner.PhoneNumber, UserID: otherUserID}
+	otherWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.wa-other-"+uid, "", otherUserID, "Hai").withWebhookSenderContact(otherSidecar),
+		"Other User")
+	assert.NotEqual(t, owner.ID, otherWork.Contact.ID)
+	assert.True(t, strings.HasPrefix(otherWork.Contact.PhoneNumber, "bsuid:"))
+
+	var reloadedOwner models.Contact
+	require.NoError(t, app.DB.First(&reloadedOwner, "id = ?", owner.ID).Error)
+	assert.Equal(t, "US.owner-"+uid, reloadedOwner.BSUID)
+	assert.Equal(t, owner.ProfileName, reloadedOwner.ProfileName)
+}
+
+func TestUpdateContactBSUIDDoesNotOverwriteBSUIDOfContactWithoutDialablePhone(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, _ := createProcessorTestOrg(t, app)
+	uid := uuid.NewString()[:8]
+	for _, phone := range []string{"", "bsuid:" + uid} {
+		contact := &models.Contact{
+			BaseModel:      models.BaseModel{ID: uuid.New()},
+			OrganizationID: org.ID,
+			PhoneNumber:    phone,
+			BSUID:          "US.original-" + uid,
+		}
+		require.NoError(t, app.DB.Create(contact).Error)
+
+		app.updateContactBSUID(contact, "US.intruder-"+uid)
+
+		var saved models.Contact
+		require.NoError(t, app.DB.First(&saved, "id = ?", contact.ID).Error)
+		assert.Equal(t, "US.original-"+uid, saved.BSUID, "phone %q", phone)
+		assert.Equal(t, "US.original-"+uid, contact.BSUID, "phone %q", phone)
+	}
+}
+
+func TestInboundSenderMatchesUserIDs(t *testing.T) {
+	t.Parallel()
+	identity := coexistenceContactIdentity{UserID: "US.child", ParentUserID: "US.parent"}
+	assert.True(t, inboundSenderMatchesUserIDs([]string{"US.child"}, identity))
+	assert.True(t, inboundSenderMatchesUserIDs([]string{"US.child", "US.parent"}, identity))
+	assert.False(t, inboundSenderMatchesUserIDs(nil, identity), "no proven inbound message")
+	assert.False(t, inboundSenderMatchesUserIDs([]string{"US.child", ""}, identity), "a message without a recorded sender")
+	assert.False(t, inboundSenderMatchesUserIDs([]string{"US.child", "US.other"}, identity), "a second sender")
+	assert.False(t, inboundSenderMatchesUserIDs([]string{""}, coexistenceContactIdentity{}))
+}
+
+func TestLegacyEmptyPhoneAndSenderUserIDHelpers(t *testing.T) {
+	t.Parallel()
+	for _, phone := range []string{"", "+", " + "} {
+		assert.True(t, isLegacyEmptyPhoneContact(&models.Contact{PhoneNumber: phone}), "phone %q", phone)
+	}
+	for _, phone := range []string{"bsuid:abc", "60123456789"} {
+		assert.False(t, isLegacyEmptyPhoneContact(&models.Contact{PhoneNumber: phone}), "phone %q", phone)
+	}
+	assert.False(t, isLegacyEmptyPhoneContact(nil))
+
+	identity := coexistenceContactIdentity{UserID: "US.child", ParentUserID: "US.parent"}
+	assert.True(t, contactHoldsSenderUserID(&models.Contact{BSUID: "US.child"}, identity))
+	assert.True(t, contactHoldsSenderUserID(&models.Contact{BSUID: "US.parent"}, identity))
+	assert.False(t, contactHoldsSenderUserID(&models.Contact{BSUID: "US.other"}, identity))
+	assert.False(t, contactHoldsSenderUserID(&models.Contact{}, coexistenceContactIdentity{}))
+	assert.False(t, contactHoldsSenderUserID(nil, identity))
+}
+
+// Pure unit test: a "+"-only "from" is no phone. It must neither reach
+// GetOrCreateContact (ErrEmptyPhoneNumber would make /api/webhook answer 503
+// on every retry) nor hide the webhook contact's wa_id.
+func TestPlusOnlyFromIsTreatedAsAbsentPhone(t *testing.T) {
+	t.Parallel()
+	app := &App{Log: testutil.NopLogger()}
+	account := &models.WhatsAppAccount{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: uuid.New()}
+	contact, err := app.getOrCreateNewInboundSenderContact(account, IncomingTextMessage{ID: "wamid.plus", From: " + "}, "Name")
+	require.ErrorIs(t, err, errInboundSenderIdentityMissing)
+	assert.Nil(t, contact)
+	assert.False(t, IncomingTextMessage{ID: "wamid.plus", From: "+"}.hasSenderIdentity())
+
+	withWaID := IncomingTextMessage{ID: "wamid.plus-wa", From: "+", FromUserID: "US.sender"}.
+		withWebhookSenderContact(&CoexistenceWebhookContact{WaID: "60133333333", UserID: "US.sender"})
+	assert.Equal(t, "60133333333", inboundSenderIdentity(withWaID, "").Phone)
+}
+
+func persistNonSMBInboundError(t *testing.T, app *App, account *models.WhatsAppAccount, message IncomingTextMessage, profileName string) error {
+	t.Helper()
+	work, _, err := app.persistAuthenticatedIncomingMessageBeforeAck(
+		account.PhoneID,
+		message,
+		profileName,
+		strings.Repeat("a", 64),
+	)
+	require.Error(t, err)
+	assert.Nil(t, work)
+	return err
+}
+
+func testRevealedPhone() string {
+	return "6016" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+}
+
+func createLegacyEmptyPhoneContact(t *testing.T, app *App, orgID uuid.UUID, bsuid string) *models.Contact {
+	t.Helper()
+	contact := &models.Contact{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: orgID,
+		PhoneNumber:    "",
+		BSUID:          bsuid,
+		ProfileName:    "Legacy empty-phone contact",
+	}
+	require.NoError(t, app.DB.Create(contact).Error)
+	return contact
+}
+
+func countContactsWithPhone(t *testing.T, app *App, orgID uuid.UUID, phone string) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, app.DB.Unscoped().Model(&models.Contact{}).
+		Where("organization_id = ? AND phone_number IN ?", orgID, []string{phone, "+" + phone}).
+		Count(&count).Error)
+	return count
+}
+
+// Route (b) with a legacy empty-phone contact that, under the old bug, holds
+// two BSUID-only customers' messages: a phone reveal by the current bs_uid
+// holder must not give that mixed row a real phone (it would drop out of the
+// repair audit). The webhook keeps answering 503, as before the fix, until
+// the row is repaired with the runbook.
+func TestNonSMBPhoneRevealDoesNotUpgradeSharedLegacyEmptyPhoneContact(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	uid := uuid.NewString()[:8]
+	firstUserID, secondUserID := "US.legacy-first-"+uid, "US.legacy-second-"+uid
+	legacy := createLegacyEmptyPhoneContact(t, app, org.ID, firstUserID)
+
+	firstWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.legacy-first-"+uid, "", firstUserID, "Hai"), "First")
+	require.Equal(t, legacy.ID, firstWork.Contact.ID)
+	// Reproduce the pre-fix overwrite by a second BSUID-only sender.
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where("id = ?", legacy.ID).Update("bs_uid", secondUserID).Error)
+	secondWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.legacy-second-"+uid, "", secondUserID, "Hello"), "Second")
+	require.Equal(t, legacy.ID, secondWork.Contact.ID)
+
+	phone := testRevealedPhone()
+	err := persistNonSMBInboundError(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.legacy-reveal-"+uid, phone, secondUserID, "Now with phone"), "Second")
+	assert.ErrorIs(t, err, errEmptyPhoneContactNeedsRepair)
+
+	var reloaded models.Contact
+	require.NoError(t, app.DB.First(&reloaded, "id = ?", legacy.ID).Error)
+	assert.Equal(t, "", reloaded.PhoneNumber, "the shared row stays visible to the runbook audit")
+	assert.Equal(t, secondUserID, reloaded.BSUID)
+	assert.Nil(t, reloaded.Metadata[emptyPhoneUpgradedFromKey])
+	assert.Zero(t, countContactsWithPhone(t, app, org.ID, phone))
+
+	// The same applies when the phone arrives only as contacts[].wa_id.
+	sidecar := &CoexistenceWebhookContact{WaID: phone, UserID: secondUserID}
+	waWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.legacy-waid-"+uid, "", secondUserID, "wa_id").withWebhookSenderContact(sidecar),
+		"Second")
+	assert.Equal(t, legacy.ID, waWork.Contact.ID, "wa_id is dropped; the message stays with the current bs_uid holder")
+	require.NoError(t, app.DB.First(&reloaded, "id = ?", legacy.ID).Error)
+	assert.Equal(t, "", reloaded.PhoneNumber)
+	assert.Zero(t, countContactsWithPhone(t, app, org.ID, phone))
+}
+
+// Route (b) with a legacy empty-phone contact whose every inbound message is
+// proven to come from this sender: the phone reveal upgrades it and records
+// the original empty phone so the runbook audit still lists it.
+func TestNonSMBPhoneRevealUpgradesSingleSenderLegacyEmptyPhoneContact(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	uid := uuid.NewString()[:8]
+	userID := "US.legacy-single-" + uid
+	legacy := createLegacyEmptyPhoneContact(t, app, org.ID, userID)
+
+	firstWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.legacy-single-"+uid, "", userID, "Hai"), "Single")
+	require.Equal(t, legacy.ID, firstWork.Contact.ID)
+
+	phone := testRevealedPhone()
+	revealWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.legacy-single-reveal-"+uid, phone, userID, "Now with phone"), "Single")
+	assert.Equal(t, legacy.ID, revealWork.Contact.ID)
+
+	var upgraded models.Contact
+	require.NoError(t, app.DB.First(&upgraded, "id = ?", legacy.ID).Error)
+	assert.Equal(t, phone, upgraded.PhoneNumber)
+	assert.Equal(t, userID, upgraded.BSUID)
+	assert.Equal(t, "", upgraded.Metadata[emptyPhoneUpgradedFromKey])
+	assert.NotEmpty(t, upgraded.Metadata[emptyPhoneUpgradedAtKey])
+	assert.EqualValues(t, 1, countContactsWithPhone(t, app, org.ID, phone))
+}
+
+// Route (b) reconciliation: the BSUID is on a placeholder and the revealed
+// phone belongs to a contact without a BSUID. The phone contact takes the
+// BSUID and the placeholder releases it.
+func TestNonSMBPhoneRevealReconcilesPlaceholderWithPhoneOwner(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	uid := uuid.NewString()[:8]
+	userID := "US.reconcile-" + uid
+
+	placeholderWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.reconcile-first-"+uid, "", userID, "Hai"), "Reconcile User")
+	require.True(t, strings.HasPrefix(placeholderWork.Contact.PhoneNumber, "bsuid:"))
+	phoneOwner := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	revealWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.reconcile-phone-"+uid, strings.TrimPrefix(phoneOwner.PhoneNumber, "+"), userID, "Phone"),
+		"Reconcile User")
+	assert.Equal(t, phoneOwner.ID, revealWork.Contact.ID)
+
+	var owner, placeholder models.Contact
+	require.NoError(t, app.DB.First(&owner, "id = ?", phoneOwner.ID).Error)
+	require.NoError(t, app.DB.First(&placeholder, "id = ?", placeholderWork.Contact.ID).Error)
+	assert.Equal(t, userID, owner.BSUID)
+	assert.Empty(t, placeholder.BSUID)
+	assert.Equal(t, phoneOwner.ID.String(), placeholder.Metadata["coexistence_reconciled_contact_id"])
+	assert.Equal(t, placeholderWork.Contact.PhoneNumber, placeholder.PhoneNumber)
+
+	var holders int64
+	require.NoError(t, app.DB.Model(&models.Contact{}).
+		Where("organization_id = ? AND bs_uid = ?", org.ID, userID).Count(&holders).Error)
+	assert.EqualValues(t, 1, holders)
+}
+
+// Route (b) phone conflict: the revealed phone belongs to a contact with a
+// different BSUID. Nothing is attached or rewritten; the admission fails
+// identity validation and rolls back (503, Meta retries) for manual review.
+func TestNonSMBPhoneRevealConflictRollsBack(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	uid := uuid.NewString()[:8]
+	userID, otherUserID := "US.conflict-"+uid, "US.conflict-owner-"+uid
+
+	placeholderWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.conflict-first-"+uid, "", userID, "Hai"), "Conflict User")
+	phoneOwner := testutil.CreateTestContact(t, app.DB, org.ID)
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where("id = ?", phoneOwner.ID).Update("bs_uid", otherUserID).Error)
+
+	persistNonSMBInboundError(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.conflict-phone-"+uid, strings.TrimPrefix(phoneOwner.PhoneNumber, "+"), userID, "Phone"),
+		"Conflict User")
+
+	var owner, placeholder models.Contact
+	require.NoError(t, app.DB.First(&owner, "id = ?", phoneOwner.ID).Error)
+	require.NoError(t, app.DB.First(&placeholder, "id = ?", placeholderWork.Contact.ID).Error)
+	assert.Equal(t, otherUserID, owner.BSUID)
+	assert.Equal(t, userID, placeholder.BSUID)
+	assert.Equal(t, placeholderWork.Contact.PhoneNumber, placeholder.PhoneNumber)
+	assert.Nil(t, placeholder.Metadata["coexistence_phone_conflict"], "the conflict note rolled back with the admission")
+}
+
+// Route (a): a contacts[].wa_id must never rewrite the phone of the
+// established contact that already holds the sender's BSUID.
+func TestNonSMBWaIDDoesNotRewritePhoneOfBSUIDOwner(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	uid := uuid.NewString()[:8]
+	userID := "US.wa-owner-" + uid
+	owner := testutil.CreateTestContact(t, app.DB, org.ID)
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where("id = ?", owner.ID).Update("bs_uid", userID).Error)
+
+	otherPhone := testRevealedPhone()
+	sidecar := &CoexistenceWebhookContact{WaID: otherPhone, UserID: userID}
+	work := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.wa-owner-"+uid, "", userID, "Hai").withWebhookSenderContact(sidecar),
+		"Owner")
+	assert.Equal(t, owner.ID, work.Contact.ID)
+
+	var reloaded models.Contact
+	require.NoError(t, app.DB.First(&reloaded, "id = ?", owner.ID).Error)
+	assert.Equal(t, owner.PhoneNumber, reloaded.PhoneNumber)
+	assert.Equal(t, userID, reloaded.BSUID)
+	assert.Zero(t, countContactsWithPhone(t, app, org.ID, otherPhone))
+}
+
+// Route (c): the sender's phone is a merge alias of a "WhatsApp number
+// hidden" placeholder whose bs_uid is empty. The placeholder learns the
+// BSUID instead of failing identity validation (503) on every retry.
+func TestNonSMBPhoneMergedIntoPlaceholderFillsEmptyBSUID(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	uid := uuid.NewString()[:8]
+	userID := "US.merged-" + uid
+	placeholder := &models.Contact{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		PhoneNumber:    coexistenceIdentityPlaceholder(coexistenceContactIdentity{UserID: "US.earlier-" + uid}),
+		ProfileName:    "Hidden number",
+	}
+	require.NoError(t, app.DB.Create(placeholder).Error)
+	alias := testutil.CreateTestContact(t, app.DB, org.ID)
+	aliasPhone := testRevealedPhone()
+	now := time.Now().UTC()
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where("id = ?", alias.ID).Updates(map[string]any{
+		"phone_number": aliasPhone, "merged_into_id": placeholder.ID,
+		"merged_at": now, "deleted_at": now,
+	}).Error)
+
+	work := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.merged-"+uid, aliasPhone, userID, "Hai"), "Merged")
+	assert.Equal(t, placeholder.ID, work.Contact.ID)
+
+	var reloaded models.Contact
+	require.NoError(t, app.DB.First(&reloaded, "id = ?", placeholder.ID).Error)
+	assert.Equal(t, userID, reloaded.BSUID)
+	assert.Equal(t, placeholder.PhoneNumber, reloaded.PhoneNumber)
+}
+
+// updateContactBSUID never gives a second live contact a BSUID that another
+// contact already holds (the call webhook path matches by phone first).
+func TestUpdateContactBSUIDSkipsBSUIDHeldByAnotherContact(t *testing.T) {
+	app := newProcessorTestApp(t)
+	org, account := createProcessorTestOrg(t, app)
+	uid := uuid.NewString()[:8]
+	userID := "US.held-" + uid
+	placeholderWork := persistNonSMBInbound(t, app, account,
+		bsuidOnlyInboundMessage(t, "wamid.held-"+uid, "", userID, "Hai"), "Held")
+
+	phoneContact := testutil.CreateTestContact(t, app.DB, org.ID)
+	app.updateContactBSUID(phoneContact, userID)
+	assert.Empty(t, phoneContact.BSUID)
+
+	var reloaded models.Contact
+	require.NoError(t, app.DB.First(&reloaded, "id = ?", phoneContact.ID).Error)
+	assert.Empty(t, reloaded.BSUID)
+	require.NoError(t, app.DB.First(&reloaded, "id = ?", placeholderWork.Contact.ID).Error)
+	assert.Equal(t, userID, reloaded.BSUID)
+}

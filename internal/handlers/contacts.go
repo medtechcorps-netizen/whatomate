@@ -2254,6 +2254,11 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 	if len(normalizedPhone) > 0 && normalizedPhone[0] == '+' {
 		normalizedPhone = normalizedPhone[1:]
 	}
+	// "+" (or whitespace) passes the raw check above but normalizes to an
+	// empty phone, which would collide with every other empty-phone row.
+	if contactutil.IsEmptyPhone(normalizedPhone) {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "phone_number is required", nil, "")
+	}
 
 	// Check if contact exists (including soft-deleted)
 	var existingContact models.Contact

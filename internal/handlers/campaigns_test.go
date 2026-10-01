@@ -2024,3 +2024,36 @@ func TestApp_UploadCampaignMedia_RevalidatesLockedTemplateAndAccount(t *testing.
 		})
 	}
 }
+
+// A blank phone ("" or "+") would make the campaign worker resolve the row to
+// one shared empty-phone contact. The whole import is rejected before any
+// recipient is stored.
+func TestApp_ImportRecipients_RejectsBlankPhone(t *testing.T) {
+	for _, blank := range []string{"", "+", "  "} {
+		mockQueue := testutil.NewMockQueue()
+		app := newTestApp(t, withQueue(mockQueue))
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithEmail(testutil.UniqueEmail("import-blank-phone")), testutil.WithPassword("password"))
+		account := testutil.CreateTestWhatsAppAccountWith(t, app.DB, org.ID, testutil.WithAccountName("import-blank-phone-"+uuid.NewString()[:8]))
+		template := testutil.CreateTestTemplate(t, app.DB, org.ID, account.Name)
+		campaign := createTestCampaign(t, app, org.ID, template.ID, user.ID, account.Name, models.CampaignStatusDraft)
+
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"recipients": []map[string]any{
+				{"phone_number": "+1234567890", "recipient_name": "Valid"},
+				{"phone_number": blank, "recipient_name": "Blank"},
+			},
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetPathParam(req, "id", campaign.ID.String())
+
+		require.NoError(t, app.ImportRecipients(req))
+		assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req), "phone %q", blank)
+		assert.Contains(t, string(testutil.GetResponseBody(req)), "recipient 2")
+
+		var stored int64
+		require.NoError(t, app.DB.Model(&models.BulkMessageRecipient{}).
+			Where("campaign_id = ?", campaign.ID).Count(&stored).Error)
+		assert.Zero(t, stored, "phone %q", blank)
+	}
+}
