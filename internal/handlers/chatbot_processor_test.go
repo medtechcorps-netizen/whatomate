@@ -1833,6 +1833,9 @@ func TestUpdateContactBSUIDSkipsBSUIDHeldByAnotherContact(t *testing.T) {
 	var reloaded models.Contact
 	require.NoError(t, app.DB.First(&reloaded, "id = ?", phoneContact.ID).Error)
 	assert.Empty(t, reloaded.BSUID)
-	require.NoError(t, app.DB.First(&reloaded, "id = ?", placeholderWork.Contact.ID).Error)
-	assert.Equal(t, userID, reloaded.BSUID)
+	// A fresh struct: GORM's First adds a non-zero primary key already held by
+	// the destination as an extra condition.
+	var placeholder models.Contact
+	require.NoError(t, app.DB.First(&placeholder, "id = ?", placeholderWork.Contact.ID).Error)
+	assert.Equal(t, userID, placeholder.BSUID)
 }
