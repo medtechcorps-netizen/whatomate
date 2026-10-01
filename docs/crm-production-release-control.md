@@ -689,11 +689,23 @@ Data-only rebaseline checklist:
 ### Failure runbook for the re-entry train
 
 Production is untouched through F1-F7, and main is never locked through F5.
-Never relaunch the launcher after an apply has been dispatched; use the
-orphan and lock lanes instead. If the apply outcome is unknown (for example,
-its approvals wait past the launcher's 5400 s), the launcher logs the apply
-run ID and drops the plan and recovery bindings. It records the unresolved
-apply, prints `do not relaunch; use the orphan lanes`, and exits non-zero.
+Relaunch only where an incident below says so. The launcher enforces two
+cases itself:
+
+- `require_launch_ready` refuses while main's branch rule has "Lock branch"
+  on (`main-branch-locked-by-an-earlier-apply`). An earlier apply locked main
+  and no governed unlock has run (F6-F10), so a relaunch would only build a
+  fresh plan and recovery that the next apply's prelock refuses.
+- After an apply whose outcome is unknown (F14), every relaunch at that
+  control refuses before any read or dispatch.
+
+After any other terminal apply failure, relaunch only for F5, or for F7 once
+the owner has turned "Lock branch" off. Never relaunch for F4; use cleanup's
+pre-mutation-failure mode. A relaunch dispatches a second plan, recovery and
+apply against the same fork, so that fork is no longer eligible for
+pre-mutation-failure cleanup (it requires exactly one apply and one
+recovery). Retire it through terminal cleanup after a successful relaunch, or
+delete it in the console.
 
 - **F1. Validation, image or aggregate fails.** The launcher retries a
   validation or image job once, then stops. A relaunch at the same control
@@ -712,8 +724,9 @@ apply, prints `do not relaunch; use the orphan lanes`, and exits non-zero.
 - **F5. Prelock, intent or the lock job fails before the branch mutation**
   (for example the apply live-phase guard, a plan or recovery past 900 s, or a
   rejected approval). Main is unlocked. Relaunch: the launcher drops plan and
-  recovery and re-plans. Owner fallback if abandoned: delete the fork in the
-  console.
+  recovery and re-plans; the fork is then retired by terminal cleanup, not by
+  pre-mutation-failure cleanup. Owner fallback if abandoned: delete the fork
+  in the console.
 - **F6. The lock is held, but the proof or lock job fails after mutating.**
   Run reconcile-production-orphan (no-mutation), then
   finalize-production-orphan-lock, then
@@ -752,6 +765,27 @@ apply, prints `do not relaunch; use the orphan lanes`, and exits non-zero.
   in the console.
 - **F13. Credentials or tokens expire mid-train.** Stop at the current stage.
   The owner rotates them through the environment secret UI.
+- **F14. The apply outcome is unknown.** The launcher lost sight of a
+  dispatched apply: a wait past its 5400 s, one failed read-only poll (its
+  reads are never retried), or an ambiguous materialization. It moves the
+  plan and recovery bindings, with the apply run ID, into
+  `apply_outcome_unknown` in the chain-state file, prints
+  `do not relaunch; triage it (runbook F14)`, and exits non-zero. Every
+  relaunch at that control then refuses. Wait until the apply run is
+  completed, then triage it:
+  - Success, main unlocked: production runs ui' unsigned, as in F11. Within
+    about 24 h, dispatch verify-production-crm-canary manually (a NEW
+    `workflow_dispatch`, attempt 1) with `receipt_kind` `apply`, the apply
+    run's receipt artifact (ID, digest and receipt sha256) and the ui fixture
+    evidence. Once the recovery window has closed, dispatch cleanup's terminal
+    mode with the fork create binding, the kept recovery binding and the
+    signed phase state.
+  - Failure with main still locked: use F6-F10, by the failing job.
+  - Failure before the main lock: use F4 or F5.
+
+  Remove `apply_outcome_unknown` only once the run is resolved. If the apply
+  never materialized, look for an apply run dispatched at the control first;
+  if none exists, nothing was applied (F5).
 
 Deadlines: plan and recovery 900 s; intent 15 min; fork 24 h; backup 36 h or
 less; canary about 24 h after the apply; signed receipt 7 days; phase state

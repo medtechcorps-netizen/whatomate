@@ -3183,12 +3183,14 @@ class GenesisReentryTests(unittest.TestCase):
             "**no governed rollback after ui'**",
             "every future release must rebaseline again",
             "Every live-evidence file stays committed",
-            "`do not relaunch; use the orphan lanes`",
+            "`do not relaunch; triage it (runbook F14)`",
+            "`main-branch-locked-by-an-earlier-apply`",
+            "Never relaunch for F4",
             "Data-only rebaseline checklist:",
             "LiveFloorInductionTests",
         ):
             self.assertIn(required, section)
-        for incident in range(1, 14):
+        for incident in range(1, 15):
             self.assertIn(f"- **F{incident}. ", section)
         genesis = verifier.genesis_state_sha256(verifier.load_json(CONTRACT_PATH, "contract"))
         self.assertIn(f"`{genesis[:8]}`", section)

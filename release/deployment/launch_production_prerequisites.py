@@ -186,6 +186,11 @@ class ReadOnlyEvidence(Protocol):
     verify_attestation must run real cryptographic verification binding repository,
     signer path/digest, source digest/ref main, deny-self-hosted, exact subject hash,
     predicate type and (for custom predicates) equality to the public JSON subject.
+
+    main_branch_locked must return the exact boolean "Lock branch" state of
+    main's branch protection, read GET-only; an absent or malformed value is an
+    error, never "unlocked". A locked main means an earlier apply locked it and
+    no governed unlock has run, so no new launch may plan or dispatch over it.
     """
 
     def current_main_sha(self) -> str: ...
@@ -202,6 +207,7 @@ class ReadOnlyEvidence(Protocol):
     def verify_attestation(self, subject: bytes, predicate: str,
                            signer_path: str, control_sha: str) -> bool: ...
     def reviewed_genesis_phase(self) -> str: ...
+    def main_branch_locked(self) -> bool: ...
 
 
 def _workflow_identities(reader: ReadOnlyEvidence) -> Mapping[int, str]:
@@ -382,6 +388,11 @@ def require_launch_ready(reader: ReadOnlyEvidence | None, context: LaunchContext
                 "protected-canary-secret-metadata-unavailable")
         require(REQUIRED_CANARY_SECRET_NAMES <= metadata.names, "protected-ui-driver-secret-metadata-missing")
         require(not production_lock_busy(reader), "production-lock-conflict")
+        # A main still locked by an earlier apply (its proof, lock or apply job
+        # failed after the lock, with no governed unlock) is an incident for the
+        # orphan and lock lanes; a relaunch would only build a fresh plan and
+        # recovery that the next apply's prelock refuses.
+        require(reader.main_branch_locked() is False, "main-branch-locked-by-an-earlier-apply")
         _fixture(reader, fixture, context.control_sha)
         if predecessor is not None:
             _predecessor(reader, context, predecessor)
@@ -605,6 +616,14 @@ class GitHubEvidence:
                       and protection.get("enforce_admins", {}).get("enabled") is True
                       and type(protection.get("required_status_checks")) is dict,
                       "protected-main-metadata-invalid")
+
+    def main_branch_locked(self):
+        """Exact "Lock branch" state of main's protection rule, GET-only."""
+        protection = self.api.get(PREFIX + "/branches/main/protection")
+        lock = protection.get("lock_branch") if type(protection) is dict else None
+        guard.require(type(lock) is dict and type(lock.get("enabled")) is bool,
+                      "main-lock-state-invalid")
+        return lock["enabled"]
 
     def source(self, path, control):
         guard.require(path in PUBLIC_SOURCE_PATHS or re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", path),

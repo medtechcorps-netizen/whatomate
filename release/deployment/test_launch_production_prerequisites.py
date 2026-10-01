@@ -51,6 +51,7 @@ class FakeReader:
         self.signatures = []
         self.latest_state = "20"
         self.genesis = "baseline"
+        self.main_locked = False
         self.fixture_body = encoded({"kind": "crm-canary-fixture-provisioning",
             "state": "allowlist_deployment_verified", "control_sha": ORIGIN,
             "origin": {"run_id": "10"}, "fixture_descriptor_sha256": "c" * 64})
@@ -87,6 +88,7 @@ class FakeReader:
             None if phase == self.genesis else self.state_body)
 
     def reviewed_genesis_phase(self): return self.genesis
+    def main_branch_locked(self): return self.main_locked
 
     def current_main_sha(self): return self.main
     def worktree_sha(self): return self.worktree
@@ -231,6 +233,32 @@ class GuardTests(unittest.TestCase):
         self.reader.inventory = guard.RunInventory([], guard.BLOCKING_STATUSES, True)
         self.reader.identities.pop(self.reader.canary_id)
         with self.assertRaises(guard.LaunchBlocked): guard.production_lock_busy(self.reader)
+
+    def test_main_locked_by_an_earlier_apply_refuses_the_launch(self):
+        # F6-F9: an earlier apply locked main and no governed unlock ran. A
+        # relaunch must stop before any fixture or predecessor evidence is read,
+        # instead of planning again for an apply whose prelock would refuse.
+        for genesis, phase in (("baseline", "baseline"), ("ui", "ui")):
+            with self.subTest(phase=phase):
+                reader = FakeReader()
+                reader.genesis = genesis
+                reader.main_locked = True
+                with self.assertRaisesRegex(guard.LaunchBlocked, "main-branch-locked-by-an-earlier-apply"):
+                    guard.require_launch_ready(reader, reader.context(phase))
+                self.assertEqual(reader.signatures, [])
+
+    def test_main_lock_state_must_be_an_exact_false(self):
+        for value in (None, 0, "false", object()):
+            with self.subTest(value=value):
+                self.reader.main_locked = value
+                self.blocked()
+        self.reader.main_locked = False
+        guard.require_launch_ready(self.reader, self.reader.context())
+
+    def test_main_lock_read_failure_fails_closed(self):
+        self.reader.main_branch_locked = Mock(side_effect=OSError("transient"))
+        with self.assertRaisesRegex(guard.LaunchBlocked, "readonly-evidence-read-or-verification-failed"):
+            guard.require_launch_ready(self.reader, self.reader.context())
 
     def test_live_ui_genesis_launch_supplies_no_predecessor(self):
         self.reader.genesis = "ui"
@@ -469,6 +497,22 @@ class AdapterTests(unittest.TestCase):
         second = {"id": 1, "status": "in_progress"}
         self.adapter.api.pages.side_effect = [{"workflow_runs": [first]}, {"workflow_runs": [second]}]
         with self.assertRaises(guard.LaunchBlocked): self.adapter.active_runs(guard.BLOCKING_STATUSES)
+
+    def test_main_branch_lock_state_is_read_get_only_and_exactly(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                self.adapter.api.get.reset_mock()
+                self.adapter.api.get.return_value = {"lock_branch": {"enabled": enabled},
+                                                     "enforce_admins": {"enabled": True}}
+                self.assertIs(self.adapter.main_branch_locked(), enabled)
+                self.adapter.api.get.assert_called_once_with(evidence.PREFIX + "/branches/main/protection")
+        for protection in ({}, {"lock_branch": None}, {"lock_branch": {}},
+                           {"lock_branch": {"enabled": "false"}}, {"lock_branch": {"enabled": 0}}, []):
+            with self.subTest(protection=protection):
+                self.adapter.api.get.return_value = protection
+                with self.assertRaisesRegex(guard.LaunchBlocked, "main-lock-state-invalid"):
+                    self.adapter.main_branch_locked()
+        evidence.GitHubGetOnly.allowed(evidence.PREFIX + "/branches/main/protection")
 
     def test_candidate_mode_cannot_authorize_launch(self):
         self.adapter.candidate_audit = True
