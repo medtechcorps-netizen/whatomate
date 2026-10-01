@@ -1348,6 +1348,14 @@ COMMITTED_LIVE_EVIDENCE_SHA256 = {
         "185db243c5097da8dbf9533f85bdc6aeebb8f467784ddbd8b47dbd9eac8802f2",
     "production-phase-apply-receipt-36773451426-1.sha256":
         "764c5a791601b47f3a48660987f25a76286e99ec68fe27f15d692559c9c6cfd0",
+    "production-phase-apply-receipt-36847681114-1.json":
+        "54a02d3eb5c26328a5ae7f13c1827581504b3ed259dd091e53fc59372cce5c4b",
+    "production-phase-apply-receipt-36847681114-1.predicate-receipt-v1.sigstore.json":
+        "840b7b4bfa2ebe112e04d3dde263033cb43edb05f0e39de1d371b14e604768c6",
+    "production-phase-apply-receipt-36847681114-1.predicate-slsa-provenance-v1.sigstore.json":
+        "24da719a2976eb6eedffa0280730da3d1ac4a215ac812189f361a64c6a92d664",
+    "production-phase-apply-receipt-36847681114-1.sha256":
+        "8c790cfb23ea74eb5b47738d58e7291d7f5ffd1ef639ec0194d87765d296193b",
 }
 
 
@@ -1360,17 +1368,31 @@ class LiveEvidenceHistoryTests(unittest.TestCase):
 
     def test_genesis_reentry_source_descends_from_the_live_phase_source(self) -> None:
         # A re-entry target must never be older code than the phase already live.
+        # Re-applying the live source itself (re-entry at the accepted ui') is
+        # allowed; any other target must strictly descend from it.
         import verify_production_plan as plan_verifier
 
         live_source = plan_verifier.BOOTSTRAP_LIVE_EVIDENCE["phase_source_sha"]
-        self.assertEqual(live_source, NAME_FIX_PHASE_SOURCE_SHA["ui"])
+        self.assertEqual(live_source, EXPECTED_FINAL_SOURCE["source_sha"])
         self.assertEqual(plan_verifier.UI_TARGET_SOURCE_SHA, EXPECTED_FINAL_SOURCE["source_sha"])
         ancestry = self.git("merge-base", "--is-ancestor", live_source,
                             plan_verifier.UI_TARGET_SOURCE_SHA, check=False)
         self.assertEqual(ancestry.returncode, 0, ancestry.stderr.decode(errors="replace"))
-        reverse = self.git("merge-base", "--is-ancestor", plan_verifier.UI_TARGET_SOURCE_SHA,
-                           live_source, check=False)
-        self.assertEqual(reverse.returncode, 1)
+        if live_source != plan_verifier.UI_TARGET_SOURCE_SHA:
+            reverse = self.git("merge-base", "--is-ancestor", plan_verifier.UI_TARGET_SOURCE_SHA,
+                               live_source, check=False)
+            self.assertEqual(reverse.returncode, 1)
+        # Every committed receipt's source is the target or one of its ancestors.
+        directory = ROOT / "release" / "deployment" / "live-evidence"
+        for path in sorted(directory.glob("production-phase-apply-receipt-*.json")):
+            if path.name.endswith(".sigstore.json"):
+                continue
+            source = json.loads(path.read_bytes())["lineage"]["phase_source_sha"]
+            with self.subTest(evidence=path.name):
+                result = self.git("merge-base", "--is-ancestor", source,
+                                  plan_verifier.UI_TARGET_SOURCE_SHA, check=False)
+                self.assertEqual(result.returncode, 0)
+        self.assertEqual(NAME_FIX_PHASE_SOURCE_SHA["ui"], STALE_FINAL_SOURCE["source_sha"])
 
     def test_committed_live_evidence_is_never_removed_or_rewritten(self) -> None:
         # Every committed live-evidence file stays committed, byte for byte:

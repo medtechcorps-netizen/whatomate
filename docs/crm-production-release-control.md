@@ -686,6 +686,30 @@ Data-only rebaseline checklist:
    committed LF blobs, never from a Windows working tree.
 6. Run the attestation verification and the fresh parity observation again.
 
+### Rebaseline onto the 283e7954 ui' receipt (2026-10-01)
+
+The re-entry train at control `283e7954` applied ui' (apply run 36847681114,
+attempt 1, artifact 11154606940, digest `7159b8e2`, receipt `54a02d3e`,
+source `6f25ea19`, receipt predecessor `b7892b2c`, the previous genesis).
+Its canary, run 36848506738, failed in the synthetic driver's late-layout
+checks, not in the product, so ui' was never signed. This data-only PR
+rebaselines onto that receipt with the same kind,
+`accepted-unsigned-apply-receipt`. The bootstrap now records deployment
+`de43812c`, spec `7549c002`, environment `e4a9eb41` and non-source `d70b6908`
+(both unchanged), and the three ui' images `7d2cb185`, `73ca628c` and
+`449e79e1`. The new genesis is `38a0ff29`. `UI_TARGET_SOURCE_SHA` stays
+`6f25ea19`: the next train re-applies the same source. Its images still
+differ, because every image carries the `io.rereply.release.control-sha`
+label of its own control.
+
+Run 36847681114 is a `workflow_dispatch` run on `main`, attempt 1,
+conclusion success. Both of its attestations verified online with
+`gh attestation verify`, once per predicate type, with signer workflow
+`.github/workflows/apply-production-phase.yml`, signer and source digest
+`283e7954`, source ref `refs/heads/main` and `--deny-self-hosted-runners`.
+Both verified subject `54a02d3e`. The c4cdac90 evidence (receipt `de742cb5`)
+stays committed beside it.
+
 ### Failure runbook for the re-entry train
 
 Production is untouched through F1-F7, and main is never locked through F5.

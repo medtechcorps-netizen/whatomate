@@ -97,7 +97,7 @@ GENESIS_ENTRY_PHASES = ("ui",)
 # 2026-10-01 onto the already-applied ui phase (control c4cdac90), so it
 # carries immutable image authority instead of the retired legacy git sources.
 BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
-    "b7de68d8785d7ed2dcb9a50b2b64bf2fed3d26b78f0a6bc609a6fab3b53d13ab"
+    "de43812c679b9093711e324ff6f184a0b8ebfe369b14585e8762c85a65b95320"
 )
 # Historical, already-applied production source. A rebaseline must not rewrite
 # the observed bootstrap identity; the live phase's own source is recorded in
@@ -108,24 +108,24 @@ BOOTSTRAP_IMAGES = [
     {
         "component": 'web',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-web',
-        "digest": 'sha256:c392aa3dff590464fb9d8e10aadb0dd94726ea3e741003f4cb9d48d4cfe7f78e',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-web@sha256:c392aa3dff590464fb9d8e10aadb0dd94726ea3e741003f4cb9d48d4cfe7f78e',
+        "digest": 'sha256:7d2cb185c757c3065701fa0752e7cd4f393f6ab28f95ba163bc222c502f583aa',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-web@sha256:7d2cb185c757c3065701fa0752e7cd4f393f6ab28f95ba163bc222c502f583aa',
     },
     {
         "component": 'meta-relay',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay',
-        "digest": 'sha256:de88e5b884890f1afb59dee933085bbe0c40aec3329e34af824e542bdc776da3',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:de88e5b884890f1afb59dee933085bbe0c40aec3329e34af824e542bdc776da3',
+        "digest": 'sha256:73ca628cebc61adbb21585f1b7c77fa552b5e4013252147a1965337c0e9491c9',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:73ca628cebc61adbb21585f1b7c77fa552b5e4013252147a1965337c0e9491c9',
     },
     {
         "component": 'gmail-relay',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay',
-        "digest": 'sha256:d67dcce8799480172013b8be462a9426bf23d974961f7b5df3ba60cc072a9016',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:d67dcce8799480172013b8be462a9426bf23d974961f7b5df3ba60cc072a9016',
+        "digest": 'sha256:449e79e14d9488ebb2eaf12fc89a6d3ec75391ed089c28a7421e3ebd419804bf',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:449e79e14d9488ebb2eaf12fc89a6d3ec75391ed089c28a7421e3ebd419804bf',
     },
 ]
 BOOTSTRAP_CANONICAL_SPEC_SHA256 = (
-    "abd19b50177ebf6362ba2e3b49d997e9f104b881a6d78d2a5b86bd6456e9f095"
+    "7549c0029636f80cb7ef31b1b9400f2be48e9f6b9f6ea460562accb6dc133185"
 )
 # Genesis is phase-less, so the phase production runs is pinned here. The ui
 # phase applied at control c4cdac90 (receipt de742cb5) can never be signed: its
@@ -142,23 +142,23 @@ BOOTSTRAP_LIVE_EVIDENCE = {
     "kind": "accepted-unsigned-apply-receipt",
     "phase": "ui",
     "workflow_path": ".github/workflows/apply-production-phase.yml",
-    "control_sha": "c4cdac90d2fd87276a145a8b902eae1fd317314f",
-    "run_id": "36773451426",
+    "control_sha": "283e795471b3aee04766f52debc6bd27fea0c3dc",
+    "run_id": "36847681114",
     "run_attempt": 1,
-    "artifact_id": "11125905071",
-    "artifact_name": "production-phase-apply-36773451426-1",
+    "artifact_id": "11154606940",
+    "artifact_name": "production-phase-apply-36847681114-1",
     "artifact_digest": (
-        "sha256:f175ba94762471314da6ff748ba419f556324eab0ca82fe98cdf3256397fa237"
+        "sha256:7159b8e24461b7ceac5c5665e15a41f8fa51075a77aff5d3bdb64bdb6fd6cb7d"
     ),
     "predicate_type": (
         "https://rereply.app/attestations/production-phase-apply-receipt/v1"
     ),
     "receipt_sha256": (
-        "de742cb5f24d814b78eb9665b266e1dadd33883bde1c84e73e9d7b328934281e"
+        "54a02d3eb5c26328a5ae7f13c1827581504b3ed259dd091e53fc59372cce5c4b"
     ),
-    "phase_source_sha": "1911174a746e0cc70fd246e6c1f45bc65ba12946",
+    "phase_source_sha": "6f25ea1919ee28856dee59d5fd121671214087e3",
     "receipt_predecessor_state_sha256": (
-        "139bf5d108b25b14be36fd065cb73b897ddbeefc815fac702afbed7e58e5f0ac"
+        "b7892b2caaaf66ef132791b19c2a69dc200b40197a1420f4aae0b207ef0ae793"
     ),
 }
 # Static evidence shapes a rebaselined bootstrap may carry for its live phase.
