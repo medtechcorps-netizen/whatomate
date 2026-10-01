@@ -24,6 +24,8 @@ release for those. All other entries leave the canary hooks untouched.
 | 6 | Chat header "Next step" menu and hidden-number display | **yes - adjacent** (`chat-contact` row text for blank/placeholder numbers only) |
 | 7 | Contacts, Follow-ups and Invoices pages: hidden numbers, links, plain copy | no |
 | 8 | Inbox keeps following the newest message after a window resize | **yes** (message-pane scrolling) |
+| 9 | "Today" page for clinic staff | no |
+| 10 | Simpler sidebar: Daily work / Reports / More tools | **yes - adjacent** (navbar sections around the Inbox item; collapse toggle unchanged) |
 
 ### What the canary driver owner must know (items 4 and 6)
 
@@ -326,7 +328,75 @@ and in the built-in browser.
   The release session should re-verify the canary driver's resize / late-layout
   checks against this build.
 
-## Backend follow-ups (not done on this branch - owner decision needed)
+### 9. "Today" page for clinic staff
+
+- **Owner asked:** ideas to make the CRM simpler without losing features;
+  approved a "Today" home page.
+- **Changed:** new route `/today` (`frontend/src/router/index.ts`, same
+  permission/entitlement gate as CRM Insights; post-login landing and
+  `navigationOrder` unchanged) and `frontend/src/views/today/TodayView.vue`.
+  Cards, each permission-gated, loaded independently, with its own empty/error
+  state and "Try again":
+  - **Unread conversations** - reads the existing omnichannel unread store only
+    (no new `/api/conversations*` calls, no extra refresh);
+  - **Follow-ups due** - overdue and due today (open + in-progress), with
+    customer and "Open chat";
+  - **Leads without a follow-up** - open leads with no active follow-up;
+  - **Won, not invoiced** - wins in the last 30 days without a linked
+    (non-void) invoice, with **Create invoice**;
+  - **Unpaid invoices** - totals per currency;
+  - **Appointments today**.
+  Links only render when the user can open the target page.
+- **Tests:** new `frontend/src/views/today/TodayView.test.ts` (gating, no
+  requests for hidden cards, date split, matching rules, retries).
+- **Verified:** see item 10.
+- **Canary-sensitive:** no.
+
+### 10. Simpler sidebar: Daily work / Reports / More tools
+
+- **Owner asked:** approved regrouping the 27 sidebar items.
+- **Changed:** `frontend/src/components/layout/navigation.ts`,
+  `AppLayout.vue` (section rendering only), nav keys in
+  `frontend/src/i18n/locales/{en,ar,es,hi,ta}.json`.
+  - **Daily work** (always open): Today, Omnichannel Inbox, Chat, Lead
+    Pipeline, Follow-ups, Bookings, Packages & Payments, Contacts.
+  - **Reports**: Dashboard, CRM Insights, Agent Analytics, Meta Insights,
+    Search Visibility.
+  - **More tools** (collapsed by default; opens by itself on any of its pages
+    and on Settings pages; choice remembered per browser): Launchpad,
+    Automation Studio, AI Copilot, Accounts, Chatbot (+children), Campaigns,
+    Templates, Canned Responses, WhatsApp Flows, Tags, Teams, Call Logs, IVR
+    Flows, Call Transfers.
+  - No destination removed; routes, permissions, entitlements, router
+    `navigationOrder`, landing page and the 3-item mobile navigation unchanged.
+    On the collapsed icon rail every item is shown, as before.
+- **Tests:** new `frontend/src/components/layout/AppLayout.navigation.test.ts`;
+  `AppLayout.unread.test.ts` / `AppLayout.logout.test.ts` unchanged and passing;
+  `frontend/e2e/tests/settings/navigation-cleanup-mocked.spec.ts` updated for
+  More tools.
+- **Verified (items 8-10):** typecheck clean; vitest 43 files / 572 tests passed;
+  build passed; locale JSON valid; package files unchanged. All 13 fully mocked
+  Playwright specs run against the dev server: 99/100 passed. The one failure,
+  `settings/embedded-signup-pin-safety-mocked.spec.ts` "a client timeout
+  refreshes durable accounts and warns against replay", fails identically on the
+  untouched pinned source `6f25ea19` (pre-existing, unrelated). Screenshots of
+  the Today page, the expanded More tools group and the collapsed icon rail
+  checked against the local mock API.
+- **Canary-sensitive:** **yes - adjacent.** The Inbox nav item (same object,
+  label key `nav.omnichannel`, path, desktop/mobile badge testids, describedby
+  wiring) now sits under the always-open "Daily work" header instead of
+  "Main". The left "Main navigation" collapse/expand toggle (accessible name,
+  role, `aria-expanded`, 300 ms width transition) is unchanged, and the new
+  "More tools" button is not rendered on the collapsed rail. Re-run the
+  driver's navbar badge and collapse/expand checks.
+
+## Backend follow-ups (separate branch `claude/backend-fixes-20261001`)
+
+Items 1 and 2 below were approved by the owner and are implemented on the
+separate branch `claude/backend-fixes-20261001` (cut from `6f25ea19`, backend
+only), so the release session can ship or hold them as their own backend phase,
+ideally before this UI batch. Its database-backed tests still need a run
+against a test Postgres/Redis before the canary.
 
 1. **Pause AI root cause** - make the agent lookups in
    `internal/handlers/agent_transfers.go` (create and assign), `teams.go` and
