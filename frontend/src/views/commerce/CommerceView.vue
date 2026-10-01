@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, inject, onMounted, ref, watch } from 'vue'
+import { routeLocationKey } from 'vue-router'
 import {
   Archive,
   Banknote,
@@ -61,12 +62,17 @@ interface PaymentRecord {
   }
 }
 
+type CommerceTab = 'packages' | 'customer-plans' | 'invoices' | 'payments'
+
 const toast = useAppToast()
 const authStore = useAuthStore()
+// Optional so the view still mounts without a router (unit tests); links
+// such as /commerce?tab=invoices select the tab when a route is present.
+const route = inject(routeLocationKey, null)
 const loading = ref(true)
 const saving = ref(false)
 const loadingMore = ref(false)
-const tab = ref<'packages' | 'customer-plans' | 'invoices' | 'payments'>('packages')
+const tab = ref<CommerceTab>('packages')
 const packages = ref<PackageDefinition[]>([])
 const salePackages = ref<PackageDefinition[]>([])
 const packageFilter = ref<'active' | 'retired'>('active')
@@ -228,7 +234,7 @@ function totalFromResponse(response: any) {
 }
 
 function paymentProvider(payment: PaymentRecord) {
-  return payment.provider_account?.name || payment.provider_account?.provider || 'Payment ledger'
+  return payment.provider_account?.name || payment.provider_account?.provider || 'Payment'
 }
 
 function paymentTone(payment: PaymentRecord) {
@@ -317,7 +323,7 @@ async function load() {
   } catch (error) {
     if (sequence !== loadSequence) return
     packageLoadError.value = getErrorMessage(error)
-    toast.error('Commerce desk could not be loaded', getErrorMessage(error))
+    toast.error('Invoices and payments could not be loaded', getErrorMessage(error))
   } finally {
     if (sequence === loadSequence) loading.value = false
   }
@@ -383,7 +389,7 @@ async function savePackageEdit() {
     })
     packageEditOpen.value = false
     editingPackage.value = null
-    toast.success('Package updated', 'Existing customer plans, credit rules and ledger records are unchanged.')
+    toast.success('Package updated', 'Existing customer plans, credits and payment records are unchanged.')
     await load()
   } catch (error) {
     packageEditError.value = getErrorMessage(error, 'Package could not be updated. Your draft is still here.')
@@ -684,7 +690,7 @@ async function recordManualPayment() {
       confirm_manual: true,
     })
     manualPaymentInvoice.value = null
-    toast.success('Manual payment recorded', 'The invoice ledger and balance were updated together.')
+    toast.success('Manual payment recorded', 'The invoice balance was updated.')
     await load()
   } catch (error) {
     toast.error('Payment was not recorded', getErrorMessage(error))
@@ -693,8 +699,25 @@ async function recordManualPayment() {
   }
 }
 
+function requestedTab(): CommerceTab | null {
+  const raw = route?.query?.tab
+  const value = Array.isArray(raw) ? raw[0] : raw
+  if (typeof value !== 'string') return null
+  return commerceTabs.value.find((item) => item.key === value)?.key ?? null
+}
+
+watch(
+  () => route?.query?.tab,
+  () => {
+    const requested = requestedTab()
+    if (requested) tab.value = requested
+  },
+)
+
 onMounted(() => {
   if (!canReadPackages.value && canReadPayments.value) tab.value = 'invoices'
+  const requested = requestedTab()
+  if (requested) tab.value = requested
   void load()
 })
 </script>
@@ -702,8 +725,8 @@ onMounted(() => {
 <template>
   <div class="h-full overflow-y-auto bg-[#0a0c0b] light:bg-[#f4f5f1]">
     <PageHeader
-      title="Revenue desk"
-      description="Packages, invoices and provider-neutral payment records without spreadsheet drift."
+      title="Invoices & payments"
+      description="Sell packages, send invoices and record payments in one place."
       :icon="CircleDollarSign"
       icon-gradient="bg-gradient-to-br from-emerald-400 to-teal-700 shadow-emerald-500/20"
     >
@@ -722,25 +745,24 @@ onMounted(() => {
         <div class="absolute -right-16 -top-24 h-64 w-64 rounded-full bg-emerald-300/15 blur-3xl" />
         <div class="relative grid gap-5 md:grid-cols-[1.2fr_repeat(3,.6fr)] md:items-end">
           <div>
-            <p class="text-[10px] font-semibold uppercase tracking-[0.25em] text-emerald-200/70">Commercial pulse</p>
+            <p class="text-[10px] font-semibold uppercase tracking-[0.25em] text-emerald-200/70">Overview</p>
             <h2 class="mt-2 max-w-xl text-2xl font-semibold tracking-tight text-white md:text-3xl">
-              Sell care plans with a ledger your team can trust.
+              See what is unpaid and what has been collected.
             </h2>
             <p class="mt-2 max-w-lg text-sm leading-6 text-emerald-50/50">
-              Money is stored in minor units, payment retries are idempotent, and every organization keeps its own
-              ledger.
+              Sell packages, send invoices and record payments. Only your clinic can see these records.
             </p>
           </div>
           <div
             v-for="metric in [
               { label: 'Active packages', value: activePackages, text: '' },
               {
-                label: 'Tenant outstanding',
+                label: 'Unpaid',
                 value: moneyTotals(outstandingValues),
                 text: '',
               },
               {
-                label: 'Tenant collected charges',
+                label: 'Collected',
                 value: moneyTotals(collectedValues),
                 text: '',
               },
@@ -797,7 +819,7 @@ onMounted(() => {
             </label>
             <div class="flex items-center gap-2 text-[11px] text-white/35 light:text-gray-500">
               <ShieldCheck class="h-3.5 w-3.5 text-emerald-300" />
-              Tenant-isolated ledger
+              Private to your clinic
             </div>
           </div>
 
@@ -1032,7 +1054,7 @@ onMounted(() => {
             <div v-if="payments.length < paymentTotal" class="p-4 text-center">
               <Button variant="outline" :disabled="loadingMore" @click="loadMoreCommerce('payments')">
                 <Loader2 v-if="loadingMore" class="mr-2 h-4 w-4 animate-spin" />
-                Load older ledger entries
+                Load older payments
               </Button>
             </div>
           </div>
@@ -1047,7 +1069,7 @@ onMounted(() => {
           </p>
           <h3 class="mt-2 text-xl font-semibold text-white light:text-gray-950">Create a package</h3>
           <p class="mt-2 text-xs leading-5 text-white/40 light:text-gray-600">
-            Every package starts with an explicit service-credit rule so it cannot be sold without a deliverable.
+            Every package includes a service, so customers always know what they are paying for.
           </p>
           <form data-testid="package-create-form" class="mt-6 space-y-4" @submit.prevent="createPackage">
             <label class="block">
@@ -1194,7 +1216,7 @@ onMounted(() => {
               </select>
             </label>
             <label class="block">
-              <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">Fulfillment mode</span>
+              <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-gray-700">How to add it</span>
               <select
                 v-model="packageSaleDraft.mode"
                 class="h-11 w-full rounded-xl border border-white/10 bg-[#15201c] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
@@ -1298,8 +1320,7 @@ onMounted(() => {
                   type="checkbox"
                   class="mt-1 accent-emerald-400"
                 />
-                I independently confirmed that these funds were received. This action updates the financial ledger and
-                cannot impersonate a provider callback.
+                I confirmed that this money was received. Recording it updates the invoice balance.
               </label>
               <div class="grid grid-cols-2 gap-3">
                 <Button type="button" variant="outline" @click="manualPaymentInvoice = null">Cancel</Button>
@@ -1320,7 +1341,7 @@ onMounted(() => {
             </p>
             <h3 class="mt-2 text-xl font-semibold text-white light:text-gray-950">Issue a customer invoice</h3>
             <p class="mt-2 text-xs leading-5 text-white/40 light:text-gray-600">
-              Enter amounts in the selected currency. The server recalculates all totals in minor units.
+              Enter amounts in the selected currency. Totals are calculated for you.
             </p>
             <form class="mt-6 space-y-4" @submit.prevent="createInvoice">
               <label class="block">
@@ -1430,7 +1451,7 @@ onMounted(() => {
         <DialogHeader>
           <DialogTitle>Edit package</DialogTitle>
           <DialogDescription>
-            Change commercial details without changing purchased service-credit rules or existing customer balances.
+            Change the name, price or validity. Credits customers already bought stay the same.
           </DialogDescription>
         </DialogHeader>
         <form v-if="editingPackage" id="package-edit-form" class="space-y-4" @submit.prevent="savePackageEdit">
@@ -1502,7 +1523,7 @@ onMounted(() => {
             />
           </label>
           <p class="text-xs leading-5 text-muted-foreground">
-            Service-credit rules are retained. Purchased entitlements cannot be replaced.
+            The included services and credits stay the same.
           </p>
           <p
             v-if="packageEditError"

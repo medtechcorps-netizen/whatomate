@@ -3,6 +3,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { defineComponent, nextTick, reactive } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { routeLocationKey } from 'vue-router'
 import type { PackageDefinition } from '@/services/productSuite'
 import CommerceView from './CommerceView.vue'
 
@@ -55,9 +56,11 @@ const ContactPickerStub = defineComponent({
     '<input data-testid="contact-picker" :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" />',
 })
 
-function mountCommerce() {
+function mountCommerce(route?: { query: Record<string, unknown> }) {
   return mount(CommerceView, {
     global: {
+      // Most cases mount without vue-router; the view must tolerate that.
+      provide: route ? { [routeLocationKey as symbol]: route } : {},
       stubs: {
         PageHeader: defineComponent({
           template: '<header><slot name="actions" /></header>',
@@ -541,5 +544,47 @@ describe('Commerce package management', () => {
       entitlements: [{ booking_service_id: 'service-1', credits: 5, is_unlimited: false }],
     })
     expect(form.find('input[name="is_active"]').exists()).toBe(false)
+  })
+
+  it('uses plain-language copy for clinic staff', async () => {
+    const view = await openCommerce()
+    const text = view.text()
+    expect(text).toContain('Unpaid')
+    expect(text).toContain('Collected')
+    for (const jargon of ['minor units', 'idempotent', 'provider-neutral', 'Tenant', 'ledger']) {
+      expect(text).not.toContain(jargon)
+    }
+  })
+
+  it('opens the Invoices tab from ?tab=invoices', async () => {
+    wrapper = mountCommerce(reactive({ query: { tab: 'invoices' } }))
+    const view = wrapper
+    await vi.waitFor(() => expect(view.text()).toContain('No invoices recorded.'))
+    expect(view.find('[data-testid="package-card-package-active"]').exists()).toBe(false)
+    expect(view.text()).toContain('Issue a customer invoice')
+  })
+
+  it('follows a later ?tab change and ignores tabs the user cannot see', async () => {
+    const route = reactive<{ query: Record<string, unknown> }>({ query: { tab: 'invoices' } })
+    wrapper = mountCommerce(route)
+    const view = wrapper
+    await vi.waitFor(() => expect(view.text()).toContain('No invoices recorded.'))
+    route.query = { tab: 'packages' }
+    await vi.waitFor(() =>
+      expect(view.find('[data-testid="package-card-package-active"]').exists()).toBe(true),
+    )
+    route.query = { tab: 'not-a-tab' }
+    await nextTick()
+    expect(view.find('[data-testid="package-card-package-active"]').exists()).toBe(true)
+  })
+
+  it('keeps the default tab when ?tab names a tab without permission', async () => {
+    permissions.delete('payments:read')
+    wrapper = mountCommerce(reactive({ query: { tab: 'invoices' } }))
+    const view = wrapper
+    await vi.waitFor(() =>
+      expect(view.find('[data-testid="package-card-package-active"]').exists()).toBe(true),
+    )
+    expect(view.text()).not.toContain('No invoices recorded.')
   })
 })
