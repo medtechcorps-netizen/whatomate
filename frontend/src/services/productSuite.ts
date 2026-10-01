@@ -253,10 +253,14 @@ export interface CRMLead {
   next_action_at?: string
   expected_close_date?: string
   last_activity_at?: string
+  won_at?: string
+  lost_at?: string
   lost_reason?: string
   metadata?: Record<string, unknown>
   idempotency_key?: string
   version: number
+  created_at?: string
+  updated_at?: string
   contact?: {
     id: string
     profile_name?: string
@@ -296,6 +300,21 @@ export interface FollowUpTask {
   metadata?: Record<string, unknown>
   idempotency_key?: string
   version: number
+  // GET /api/tasks preloads a contact reference and the full linked lead
+  // (FollowUpTaskResponse in internal/handlers/product_crm.go); only the
+  // fields the UI reads are typed here.
+  contact?: {
+    id: string
+    profile_name?: string
+    phone_number?: string
+  }
+  lead?: {
+    id: string
+    title?: string
+    pipeline_id?: string
+    stage_id?: string
+    status?: string
+  }
 }
 
 export interface BookingService {
@@ -488,6 +507,12 @@ export interface CommerceInvoice {
   due_at?: string
   paid_at?: string
   version: number
+  metadata?: Record<string, unknown>
+  lines?: Array<{
+    description?: string
+    quantity?: number
+    unit_amount_minor?: number
+  }>
 }
 
 export interface CustomerWorkspaceContact {
@@ -780,8 +805,13 @@ export const crmService = {
       clear_expected_close_date?: boolean
     },
   ) => api.put(`/crm/leads/${id}`, data),
-  moveLead: (id: string, stageId: string, version: number) =>
-    api.put(`/crm/leads/${id}/move`, { stage_id: stageId, version }),
+  moveLead: (id: string, stageId: string, version: number, reason?: string) =>
+    api.put(
+      `/crm/leads/${id}/move`,
+      typeof reason === 'string' && reason.trim()
+        ? { stage_id: stageId, version, reason }
+        : { stage_id: stageId, version },
+    ),
   archiveLead: (
     id: string,
     data: {
