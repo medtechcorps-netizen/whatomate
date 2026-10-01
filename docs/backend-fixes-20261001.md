@@ -82,11 +82,25 @@ a data-safety fix).
   ./internal/worker/ -count=1` - pass. All pure unit tests ran and passed
   (recipient payloads, empty-phone guard, membership SQL and fail-closed rules,
   sender identity helpers).
-- **Not yet executed:** the new database-backed tests (cross-org self-pause,
-  suspended reseller membership, removed members, analytics scoping; two
-  BSUID-only senders get two contacts, phone-reveal upgrade, shared legacy row
-  refusal, wa_id handling, campaign/manual create rejection). They skip without
-  `TEST_DATABASE_URL` / `TEST_REDIS_URL` and must be run against a test
-  Postgres and Redis before the canary.
+- **Database-backed run (2026-10-02, owner-approved local containers):** the
+  full suite (`go test -p 1 -count=1 -timeout 30m` over every package except
+  `/test/`, no `-race`) against throwaway local containers from the CI-pinned
+  images `postgres:17@sha256:e384…0449` and `redis:7@sha256:91d0…ab`:
+  - 31 packages passed, including `internal/assignment`,
+    `internal/contactutil`, `internal/worker`, `pkg/whatsapp` and every new
+    database-backed test (cross-org self-pause, suspended reseller membership,
+    removed members, analytics scoping; two BSUID-only senders get two
+    contacts, phone-reveal upgrade, shared legacy row refusal, wa_id handling,
+    campaign/manual create rejection).
+  - The run found one test bug (a reused GORM destination struct), fixed in
+    `3f475b23`.
+  - `internal/handlers`: one failure, `TestApp_ServeMedia_RejectsSymlink`
+    ("A required privilege is not held by the client" - Windows symlink
+    privilege; media code untouched by this branch). Everything else passed.
+  - `internal/database` (untouched by this branch) hit the 30-minute package
+    timeout in its RLS suite on Docker Desktop, with no failing test before
+    the cutoff. CI runs it with the same timeout on Linux.
+  - Postgres 16 is not usable for these tests: `supportedPostgresMajor` only
+    authorizes 14 and 17 (the general CI test job file still pins 16).
 - Each change got two adversarial code reviews; every major finding was fixed
   (see commit messages).
