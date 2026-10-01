@@ -325,8 +325,9 @@ and in the built-in browser.
   fix (127 px) and passes with it (3/3 repeats); the chat case passes as a
   guard.
 - **Canary-sensitive:** **yes - message-pane scrolling** (omnichannel inbox).
-  The release session should re-verify the canary driver's resize / late-layout
-  checks against this build.
+  Release-session update (2026-10-02): the fixed canary driver passes 120/120
+  against the 6f25ea19 UI both with and without this `overflow-anchor` change,
+  so it is compatible with the driver.
 
 ### 9. "Today" page for clinic staff
 
@@ -388,7 +389,10 @@ and in the built-in browser.
   "Main". The left "Main navigation" collapse/expand toggle (accessible name,
   role, `aria-expanded`, 300 ms width transition) is unchanged, and the new
   "More tools" button is not rendered on the collapsed rail. Re-run the
-  driver's navbar badge and collapse/expand checks.
+  driver's navbar badge checks. (Release-session update 2026-10-02: the
+  main-navigation toggle is no longer a canary hook; the transcript scrollers
+  `omnichannel-message-viewport` / `chat-message-list`, the 1280px rail
+  breakpoints and `chat-message` `data-message-id` still are.)
 
 ## Backend follow-ups (separate branch `claude/backend-fixes-20261001`)
 
