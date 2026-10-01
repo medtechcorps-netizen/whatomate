@@ -1,7 +1,7 @@
 /** @vitest-environment happy-dom */
 
 import { flushPromises, shallowMount, type VueWrapper } from '@vue/test-utils'
-import { nextTick } from 'vue'
+import { defineComponent, nextTick } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ChatViewComponent from './ChatView.vue'
 
@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   authStore: null as Record<string, any> | null,
   transfersStore: null as Record<string, any> | null,
   hasPermission: vi.fn(),
+  hasProductEntitlement: vi.fn(),
   fetchContacts: vi.fn(),
   fetchContact: vi.fn(),
   fetchMessages: vi.fn(),
@@ -163,6 +164,10 @@ vi.mock('@/stores/auth', async () => {
     hasPermission: (resource: string, action: string) => {
       void store.permissionRevision
       return mocks.hasPermission(resource, action)
+    },
+    hasProductEntitlement: (key: string) => {
+      void store.permissionRevision
+      return mocks.hasProductEntitlement(key)
     },
     restoreSession: vi.fn(),
   })
@@ -327,6 +332,7 @@ describe('ChatView conversation selection', () => {
       mocks.contactsStore!.currentContact = value
     })
     mocks.hasPermission.mockReturnValue(false)
+    mocks.hasProductEntitlement.mockReturnValue(false)
     mocks.authStore!.permissionRevision += 1
     mocks.fetchContacts.mockResolvedValue(undefined)
     mocks.fetchActiveTransferForContact.mockImplementation(async (contactId: string) =>
@@ -1364,5 +1370,409 @@ describe('ChatView conversation selection', () => {
 
     expect(wrapper.text()).toContain('AI paused')
     expect(wrapper.find('[data-testid="conversation-ai-toggle"]').exists()).toBe(false)
+  })
+})
+
+const WorkspaceStub = defineComponent({
+  name: 'CustomerRevenueWorkspace',
+  props: {
+    contactId: { type: String, default: '' },
+    contact: { type: Object, default: null },
+    sessionData: { type: Object, default: null },
+    surface: { type: String, default: 'chat' },
+    channel: { type: String, default: null },
+    requestedAction: { type: Object, default: null },
+  },
+  emits: ['action-consumed', 'close', 'tags-updated'],
+  template: '<div data-testid="workspace-stub" />',
+})
+
+function mountChatViewWithMenu(extraStubs: Record<string, unknown> = {}) {
+  const slotStub = { template: '<div><slot /></div>' }
+  return shallowMount(ChatViewComponent, {
+    global: {
+      mocks: {
+        $t: (key: string, fallback?: string) => fallback ?? key,
+      },
+      stubs: {
+        ScrollArea: slotStub,
+        Transition: slotStub,
+        Teleport: true,
+        Tooltip: slotStub,
+        TooltipTrigger: slotStub,
+        TooltipContent: slotStub,
+        Button: { template: '<button><slot /></button>' },
+        Badge: { template: '<span><slot /></span>' },
+        DropdownMenu: slotStub,
+        DropdownMenuTrigger: slotStub,
+        DropdownMenuContent: slotStub,
+        DropdownMenuItem: slotStub,
+        DropdownMenuLabel: slotStub,
+        DropdownMenuSeparator: { template: '<hr />' },
+        Sheet: slotStub,
+        SheetContent: slotStub,
+        SheetTitle: slotStub,
+        SheetDescription: slotStub,
+        CustomerRevenueWorkspace: WorkspaceStub,
+        ...extraStubs,
+      },
+    },
+  })
+}
+
+describe('ChatView next-step menu', () => {
+  let wrapper: VueWrapper | null = null
+  const grantedPermissions = new Set<string>()
+  const grantedEntitlements = new Set<string>()
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.clearAllMocks()
+    mocks.infiniteControllers = []
+    mocks.resizeObservers = []
+    mocks.routeSource.params.contactId = 'first'
+    mocks.organizationStore.selectedOrgId = null
+    if (mocks.route) mocks.route.params.contactId = 'first'
+
+    const first = contact('first')
+    const second = contact('second')
+    Object.assign(mocks.contactsStore!, {
+      contacts: [first, second],
+      sortedContacts: [first, second],
+      currentContact: null,
+      messages: [],
+      searchQuery: '',
+      isLoadingMessages: false,
+    })
+    mocks.transfersStore!.activeByContact = {}
+    mocks.setCurrentContact.mockImplementation(value => {
+      mocks.contactsStore!.currentContact = value
+    })
+    grantedPermissions.clear()
+    grantedEntitlements.clear()
+    mocks.hasPermission.mockImplementation((resource: string, action: string) =>
+      grantedPermissions.has(`${resource}:${action}`),
+    )
+    mocks.hasProductEntitlement.mockImplementation((key: string) => grantedEntitlements.has(key))
+    mocks.authStore!.permissionRevision += 1
+    mocks.fetchContacts.mockResolvedValue(undefined)
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.fetchActiveTransferForContact.mockResolvedValue(undefined)
+    mocks.fetchNotes.mockResolvedValue(undefined)
+    mocks.listAccounts.mockResolvedValue({ data: { data: { accounts: [] } } })
+    mocks.getSessionData.mockRejectedValue(new Error('not configured'))
+    mocks.markRead.mockResolvedValue({ data: { data: { cursor_synced: true } } })
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0)
+      return 1
+    })
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: mocks.scrollIntoView,
+    })
+    vi.stubGlobal('ResizeObserver', class {
+      observe = vi.fn()
+      unobserve = vi.fn()
+      disconnect = vi.fn()
+    })
+  })
+
+  afterEach(() => {
+    wrapper?.unmount()
+    wrapper = null
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  function grantAllNextSteps() {
+    for (const permission of [
+      'crm.leads:write',
+      'crm.pipelines:read',
+      'tasks:write',
+      'bookings:write',
+      'contacts:read',
+    ]) grantedPermissions.add(permission)
+    grantedEntitlements.add('crm.enabled')
+    grantedEntitlements.add('bookings.enabled')
+    mocks.authStore!.permissionRevision += 1
+  }
+
+  async function mountReady(extraStubs: Record<string, unknown> = {}) {
+    wrapper = mountChatViewWithMenu(extraStubs)
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    await nextTick()
+    return wrapper
+  }
+
+  it('shows the gated next-step items only when permission and entitlement allow them', async () => {
+    const view = await mountReady()
+    expect(view.text()).not.toContain('Next step')
+    expect(view.find('[data-testid="chat-next-step-lead"]').exists()).toBe(false)
+    expect(view.find('[data-testid="chat-next-step-follow-up"]').exists()).toBe(false)
+    expect(view.find('[data-testid="chat-next-step-booking"]').exists()).toBe(false)
+    expect(view.find('[data-testid="chat-menu-contact-record"]').exists()).toBe(false)
+    expect(view.get('[data-testid="chat-menu-workspace"]').text()).toBe('Show customer workspace')
+    expect(view.text()).not.toContain('View contact details')
+
+    grantedPermissions.add('crm.leads:write')
+    grantedPermissions.add('crm.pipelines:read')
+    grantedPermissions.add('tasks:write')
+    mocks.authStore!.permissionRevision += 1
+    await nextTick()
+    // Permissions alone are not enough without the CRM entitlement.
+    expect(view.find('[data-testid="chat-next-step-lead"]').exists()).toBe(false)
+
+    grantAllNextSteps()
+    await nextTick()
+    expect(view.text()).toContain('Next step')
+    expect(view.get('[data-testid="chat-next-step-lead"]').text()).toBe('Add to pipeline')
+    expect(view.get('[data-testid="chat-next-step-follow-up"]').text()).toBe('Schedule follow-up')
+    expect(view.get('[data-testid="chat-next-step-booking"]').text()).toBe('Book appointment')
+    expect(view.get('[data-testid="chat-menu-contact-record"]').text()).toBe('Open contact record')
+    expect(view.get('[data-testid="chat-menu-copy-phone"]').text()).toBe('Copy phone number')
+
+    await view.get('[data-testid="chat-menu-contact-record"]').trigger('select')
+    expect(mocks.routerPush).toHaveBeenCalledWith('/settings/contacts/first')
+  })
+
+  it('opens the workspace with a lead request and clears it once consumed', async () => {
+    grantAllNextSteps()
+    const view = await mountReady()
+    expect(view.findComponent(WorkspaceStub).exists()).toBe(false)
+
+    await view.get('[data-testid="chat-next-step-lead"]').trigger('select')
+    await nextTick()
+
+    const workspace = view.findComponent(WorkspaceStub)
+    expect(workspace.exists()).toBe(true)
+    expect(workspace.props('channel')).toBe('whatsapp')
+    const request = workspace.props('requestedAction') as { kind: string; nonce: number }
+    expect(request).toMatchObject({ kind: 'lead' })
+    expect(view.get('[data-testid="chat-menu-workspace"]').text()).toBe('Hide customer workspace')
+
+    // A second request keeps the workspace open and issues a fresh nonce.
+    await view.get('[data-testid="chat-next-step-booking"]').trigger('select')
+    await nextTick()
+    const second = view.findComponent(WorkspaceStub).props('requestedAction') as {
+      kind: string
+      nonce: number
+    }
+    expect(second.kind).toBe('booking')
+    expect(second.nonce).toBeGreaterThan(request.nonce)
+    expect(view.findComponent(WorkspaceStub).exists()).toBe(true)
+
+    // A stale nonce does not clear the newer request.
+    view.findComponent(WorkspaceStub).vm.$emit('action-consumed', request.nonce)
+    await nextTick()
+    expect(view.findComponent(WorkspaceStub).props('requestedAction')).toMatchObject({ kind: 'booking' })
+
+    view.findComponent(WorkspaceStub).vm.$emit('action-consumed', second.nonce)
+    await nextTick()
+    expect(view.findComponent(WorkspaceStub).props('requestedAction')).toBeNull()
+    expect(view.findComponent(WorkspaceStub).exists()).toBe(true)
+  })
+
+  it('drops an unconsumed request when the workspace is closed', async () => {
+    grantAllNextSteps()
+    const view = await mountReady()
+
+    await view.get('[data-testid="chat-next-step-follow-up"]').trigger('select')
+    await nextTick()
+    expect(view.findComponent(WorkspaceStub).props('requestedAction')).toMatchObject({
+      kind: 'follow-up',
+    })
+
+    view.findComponent(WorkspaceStub).vm.$emit('close')
+    await nextTick()
+    expect(view.findComponent(WorkspaceStub).exists()).toBe(false)
+
+    await view.get('[data-testid="chat-menu-workspace"]').trigger('select')
+    await nextTick()
+    expect(view.findComponent(WorkspaceStub).exists()).toBe(true)
+    expect(view.findComponent(WorkspaceStub).props('requestedAction')).toBeNull()
+  })
+
+  it('copies a real phone number to the clipboard', async () => {
+    grantAllNextSteps()
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    const original = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    try {
+      const view = await mountReady()
+      await view.get('[data-testid="chat-menu-copy-phone"]').trigger('select')
+      await flushPromises()
+      expect(writeText).toHaveBeenCalledWith('phone-first')
+      expect(mocks.toastSuccess).toHaveBeenCalledWith('Phone number copied')
+    } finally {
+      if (original) Object.defineProperty(navigator, 'clipboard', original)
+      else delete (navigator as unknown as Record<string, unknown>).clipboard
+    }
+  })
+
+  it('hides copy and call for a contact whose WhatsApp number is hidden', async () => {
+    grantAllNextSteps()
+    const hidden = {
+      ...contact('first'),
+      phone_number: 'bsuid:contact-1',
+      whatsapp_account: 'clinic-account',
+      metadata: { coexistence_phone_placeholder: true },
+    }
+    Object.assign(mocks.contactsStore!, {
+      contacts: [hidden, contact('second')],
+      sortedContacts: [hidden, contact('second')],
+    })
+
+    const view = await mountReady()
+
+    expect((view.vm as any).selectedAccount).toBe('clinic-account')
+    expect(view.find('[data-testid="chat-menu-copy-phone"]').exists()).toBe(false)
+    expect(view.findComponent({ name: 'CallButton' }).exists()).toBe(false)
+    expect(view.text()).toContain('WhatsApp number hidden')
+    // The next-step items still work for this customer.
+    expect(view.find('[data-testid="chat-next-step-lead"]').exists()).toBe(true)
+  })
+
+  it('shows the call button when the contact has a real number and an account', async () => {
+    const withAccount = { ...contact('first'), whatsapp_account: 'clinic-account' }
+    Object.assign(mocks.contactsStore!, {
+      contacts: [withAccount, contact('second')],
+      sortedContacts: [withAccount, contact('second')],
+    })
+
+    const view = await mountReady()
+    const callButton = view.findComponent({ name: 'CallButton' })
+    expect(callButton.exists()).toBe(true)
+    expect(callButton.props('contactPhone')).toBe('phone-first')
+  })
+
+  it('names the three-dots menu by what it offers and gives it a matching title', async () => {
+    const view = await mountReady()
+    const trigger = view.get('[data-testid="chat-more-options"]')
+    expect(trigger.attributes('aria-label')).toBe('More options')
+    expect(trigger.attributes('title')).toBe('More options')
+
+    grantAllNextSteps()
+    await nextTick()
+    const granted = view.get('[data-testid="chat-more-options"]')
+    expect(granted.attributes('aria-label')).toBe('Next step and more')
+    expect(granted.attributes('title')).toBe('Next step and more')
+    // The neighbouring workspace button keeps its id and name.
+    expect(view.get('#info-button').attributes('aria-label')).toBe('Open customer revenue workspace')
+  })
+
+  it('shows a hidden-number customer as "WhatsApp user" in the header and list, never a placeholder', async () => {
+    const hidden = {
+      ...contact('first'),
+      name: '',
+      phone_number: 'bsuid:contact-1',
+      whatsapp_account: 'clinic-account',
+      metadata: { coexistence_phone_placeholder: true },
+    }
+    Object.assign(mocks.contactsStore!, {
+      contacts: [hidden, contact('second')],
+      sortedContacts: [hidden, contact('second')],
+    })
+    const slotStub = { template: '<div><slot /></div>' }
+
+    const view = await mountReady({ Avatar: slotStub, AvatarFallback: slotStub })
+
+    expect(view.get('[data-testid="chat-header-name"]').text()).toBe('WhatsApp user')
+    expect(view.text()).not.toContain('bsuid:')
+    const hiddenRow = view.get('[data-testid="chat-contact"][data-contact-id="first"]')
+    expect(hiddenRow.text()).toContain('WhatsApp user')
+    expect(hiddenRow.text()).toContain('WhatsApp number hidden')
+    expect(hiddenRow.get('[title]').attributes('title')).toBe('WhatsApp user')
+    // Avatar initials follow the display name (header and list row).
+    expect(view.findAll('div').some(el => el.text() === 'WU')).toBe(true)
+    // The other row keeps its saved name and number.
+    const plainRow = view.get('[data-testid="chat-contact"][data-contact-id="second"]')
+    expect(plainRow.text()).toContain('Contact second')
+    expect(plainRow.text()).toContain('phone-second')
+  })
+
+  it('prefers the WhatsApp profile name for a hidden-number customer', async () => {
+    const hidden = {
+      ...contact('first'),
+      name: '',
+      profile_name: 'Clinic Patient',
+      phone_number: 'bsuid:contact-1',
+      metadata: { coexistence_phone_placeholder: true },
+    }
+    Object.assign(mocks.contactsStore!, {
+      contacts: [hidden, contact('second')],
+      sortedContacts: [hidden, contact('second')],
+    })
+
+    const view = await mountReady()
+    expect(view.get('[data-testid="chat-header-name"]').text()).toBe('Clinic Patient')
+  })
+
+  it('keeps the original name and number output for contacts that have them', async () => {
+    // The chat-contact rows are canary-visible: a saved name still wins over a
+    // differing WhatsApp profile name, and a real number is shown verbatim.
+    const named = {
+      ...contact('first'),
+      name: 'Saved Name',
+      profile_name: 'Profile Name',
+      phone_number: 'phone-first',
+    }
+    Object.assign(mocks.contactsStore!, {
+      contacts: [named, contact('second')],
+      sortedContacts: [named, contact('second')],
+    })
+
+    const view = await mountReady()
+
+    expect(view.get('[data-testid="chat-header-name"]').text()).toBe('Saved Name')
+    const row = view.get('[data-testid="chat-contact"][data-contact-id="first"]')
+    expect(row.text()).toContain('Saved Name')
+    expect(row.text()).not.toContain('Profile Name')
+    expect(row.text()).toContain('phone-first')
+  })
+
+  it('gives screen readers the hidden-number hint and keeps the title', async () => {
+    const hidden = {
+      ...contact('first'),
+      phone_number: 'bsuid:contact-1',
+      whatsapp_account: 'clinic-account',
+      metadata: { coexistence_phone_placeholder: true },
+    }
+    Object.assign(mocks.contactsStore!, {
+      contacts: [hidden, contact('second')],
+      sortedContacts: [hidden, contact('second')],
+    })
+
+    const view = await mountReady()
+    const address = view.get('[data-testid="chat-header-address"]')
+    const hint = "WhatsApp did not share this customer's number (they message with a WhatsApp username)."
+    expect(address.text()).toContain('WhatsApp number hidden')
+    expect(address.attributes('title')).toBe(hint)
+    const srHint = address.get('[data-testid="chat-header-address-hint"]')
+    expect(srHint.classes()).toContain('sr-only')
+    expect(srHint.text()).toBe(hint)
+  })
+
+  it('keeps a real number dialable when a stale coexistence flag is still set', async () => {
+    const stale = {
+      ...contact('first'),
+      whatsapp_account: 'clinic-account',
+      metadata: { coexistence_phone_unavailable: true },
+    }
+    Object.assign(mocks.contactsStore!, {
+      contacts: [stale, contact('second')],
+      sortedContacts: [stale, contact('second')],
+    })
+
+    const view = await mountReady()
+    const callButton = view.findComponent({ name: 'CallButton' })
+    expect(callButton.exists()).toBe(true)
+    expect(callButton.props('contactPhone')).toBe('phone-first')
+    const address = view.get('[data-testid="chat-header-address"]')
+    expect(address.text()).toBe('phone-first')
+    expect(address.attributes('title')).toBeUndefined()
+    expect(address.find('[data-testid="chat-header-address-hint"]').exists()).toBe(false)
+    expect(view.text()).not.toContain('WhatsApp number hidden')
   })
 })
