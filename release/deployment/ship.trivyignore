@@ -1,0 +1,18 @@
+# Reviewed, expiring Trivy vulnerability exceptions for the Release workflow
+# (.github/workflows/ship.yml). Passed explicitly with --ignorefile to the
+# HIGH/CRITICAL vulnerability scan only; the secret scan never reads it.
+#
+# Policy (owner decision): every new HIGH or CRITICAL finding fails the run,
+# except an entry below that a reviewed pull request added. Each entry is
+#
+#   # reason: <10 to 200 characters: why it is safe to ship, and the fix plan>
+#   CVE-YYYY-NNNNN exp:YYYY-MM-DD
+#
+# (or a GHSA-xxxx-xxxx-xxxx identifier). The reason line sits in the comment
+# block directly above its entry. exp: is Trivy's own syntax: after that date
+# Trivy stops honouring the entry, and release/deployment/trivy_policy.py
+# fails every run until a reviewed PR removes or renews it. The date must be
+# after today and at most 90 days ahead. No duplicates, at most 50 entries,
+# ASCII with LF line endings. Secret findings can never be excepted.
+#
+# This file starts with no entries.
