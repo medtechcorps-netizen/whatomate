@@ -197,6 +197,96 @@ test.describe("Message pane follows the newest message across window resizes", (
     await expect.poll(() => distanceFromBottom(page, viewport)).toBeLessThan(80);
   });
 
+  test("native chat keeps the reader's place when older messages load", async ({ page }) => {
+    // With scroll anchoring disabled on the chat viewport, prepending history
+    // relies on useInfiniteScroll.preserveScrollPosition alone.
+    const nativeMessage = (id: string, index: number, body: string) => ({
+      id,
+      contact_id: contactId,
+      direction: index % 2 === 0 ? "incoming" : "outgoing",
+      message_type: "text",
+      content: { body },
+      status: "delivered",
+      created_at: at(index),
+      updated_at: at(index),
+    });
+    const latest = Array.from({ length: messageCount }, (_, index) =>
+      nativeMessage(
+        `d0000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        index,
+        longText(index),
+      ),
+    );
+    const older = Array.from({ length: 12 }, (_, index) =>
+      nativeMessage(
+        `e0000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        index - 100,
+        `Earlier message ${index + 1}: ${longText(index)}`,
+      ),
+    );
+    let releaseOlder!: () => void;
+    const olderGate = new Promise<void>((resolve) => {
+      releaseOlder = resolve;
+    });
+    await page.route(new RegExp(`/api/contacts/${contactId}/messages(?:\\?.*)?$`), async (route) => {
+      const isOlderPage = new URL(route.request().url()).searchParams.has("before_id");
+      if (isOlderPage) await olderGate;
+      await route.fulfill({
+        json: {
+          data: isOlderPage
+            ? { messages: older, has_more: false }
+            : { messages: latest, has_more: true },
+        },
+      });
+    });
+
+    const scroller = '[data-reka-scroll-area-viewport]:has([data-testid="chat-message-list"])';
+    const anchorMessage = page.locator(`[data-testid="chat-message"][data-message-id="${latest[0].id}"]`);
+    const anchorOffset = () =>
+      page.evaluate(
+        ({ target, id }) => {
+          const viewport = document.querySelector(target);
+          const message = document.querySelector(
+            `[data-testid="chat-message"][data-message-id="${id}"]`,
+          );
+          if (!viewport || !message) return Number.NaN;
+          return message.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+        },
+        { target: scroller, id: latest[0].id },
+      );
+
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await page.goto(`/chat/${contactId}`);
+    await expect(anchorMessage).toBeAttached();
+    await expect.poll(() => distanceFromBottom(page, scroller)).toBeLessThan(2);
+
+    // Scroll to the top to request older history; hold the response so the
+    // reader's position can be measured before the prepend lands.
+    await page.evaluate((target) => {
+      const viewport = document.querySelector(target);
+      if (viewport instanceof HTMLElement) viewport.scrollTop = 0;
+    }, scroller);
+    await page.waitForTimeout(300);
+    const before = await anchorOffset();
+    expect(Number.isFinite(before)).toBe(true);
+
+    releaseOlder();
+    await expect(
+      page.locator(`[data-testid="chat-message"][data-message-id="${older[0].id}"]`),
+    ).toBeAttached();
+    await page.waitForTimeout(400);
+
+    const after = await anchorOffset();
+    // The message the reader was looking at stays roughly where it was (the
+    // transient "loading older messages" row may account for a few pixels).
+    expect(Math.abs(after - before)).toBeLessThan(60);
+    // And the newly loaded history sits above it, out of view until scrolled.
+    expect(await page.evaluate((target) => {
+      const viewport = document.querySelector(target);
+      return viewport instanceof HTMLElement ? viewport.scrollTop : -1;
+    }, scroller)).toBeGreaterThan(100);
+  });
+
   test("native chat stays at the bottom after narrowing the window", async ({ page }) => {
     const viewport = '[data-testid="chat-message-list"]';
     const scroller = `[data-reka-scroll-area-viewport]:has(${viewport})`;

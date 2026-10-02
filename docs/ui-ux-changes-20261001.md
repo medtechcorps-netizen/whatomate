@@ -26,6 +26,7 @@ release for those. All other entries leave the canary hooks untouched.
 | 8 | Inbox keeps following the newest message after a window resize | **yes** (message-pane scrolling) |
 | 9 | "Today" page for clinic staff | no |
 | 10 | Simpler sidebar: Daily work / Reports / More tools | **yes - adjacent** (navbar sections around the Inbox item; collapse toggle unchanged) |
+| 11 | Native chat keeps following the newest message after a window resize | **yes** (native chat message-pane scrolling, `chat-message-list` scroller) |
 
 ### What the canary driver owner must know (items 4 and 6)
 
@@ -316,14 +317,19 @@ and in the built-in browser.
 - **Changed:** `frontend/src/views/channels/ChannelsView.vue` - the
   `omnichannel-message-viewport` element gets `overflow-anchor: none` (Tailwind
   `[overflow-anchor:none]`). No script, threshold or data-testid change.
-  The native chat (`ChatView`, reka ScrollArea viewport) does not show the
-  problem under the same test, so it is left unchanged.
+  ~~The native chat (`ChatView`, reka ScrollArea viewport) does not show the
+  problem under the same test, so it is left unchanged.~~ **Correction
+  (2026-10-02):** that conclusion was wrong - see item 11.
 - **Tests:** new mocked Playwright spec
   `frontend/e2e/tests/channels/message-pane-resize.spec.ts` (inbox and native
   chat: at the bottom at 1600px, narrow to 1300px, still within the 80px
   follow threshold; inbox also widened back). The inbox case fails without the
-  fix (127 px) and passes with it (3/3 repeats); the chat case passes as a
-  guard.
+  fix (127 px) and passes with it (3/3 repeats). **Correction:** the claim that
+  the native chat case "passes as a guard" was based only on a Vite dev-server
+  run on Windows/Edge. The release session ran it against a production build
+  with the real backend and it fails deterministically there (280 px off the
+  bottom, 3/3; also on `6f25ea19`), which would block validation E2E shard 1/4.
+  Fixed in item 11.
 - **Canary-sensitive:** **yes - message-pane scrolling** (omnichannel inbox).
   Release-session update (2026-10-02): the fixed canary driver passes 120/120
   against the 6f25ea19 UI both with and without this `overflow-anchor` change,
@@ -393,6 +399,49 @@ and in the built-in browser.
   main-navigation toggle is no longer a canary hook; the transcript scrollers
   `omnichannel-message-viewport` / `chat-message-list`, the 1280px rail
   breakpoints and `chat-message` `data-message-id` still are.)
+
+### 11. Native chat keeps following the newest message after a window resize
+
+- **Owner asked:** covered by the owner's approval for item 8 ("the inbox and,
+  if it has the same problem, the native chat"); requested by the release
+  session (owner-approved) as a CI blocker fix.
+- **Problem:** the native chat case in `message-pane-resize.spec.ts` fails
+  against a production build with the real backend: 280 px off the bottom
+  versus the 80 px follow threshold, deterministically (also on `6f25ea19`).
+  Same mechanism as item 8: scroll anchoring on the reka ScrollArea viewport
+  shifts `scrollTop` during the resize reflow before the transcript
+  ResizeObserver can keep the reader pinned.
+- **Changed:** `frontend/src/assets/index.css` -
+  `.chat-background [data-reka-scroll-area-viewport] { overflow-anchor: none; }`
+  (`.chat-background` is only used on the native transcript ScrollArea in
+  `ChatView.vue`). No script, threshold, data-testid or `data-message-id` change.
+- **Side effect checked:** with anchoring off, prepending older history relies
+  only on `useInfiniteScroll.preserveScrollPosition`. New Playwright case
+  "native chat keeps the reader's place when older messages load" (same spec):
+  scrolls to the top, holds the older-page response, then asserts the message
+  the reader was looking at stays within 60 px and the new history sits above
+  it. It fails if `preserveScrollPosition` is disabled (a 1,326 px jump in a
+  mutation check) and passes with the fix.
+- **Verified:**
+  - Production `vite build` served the way `internal/frontend/embed.go` serves
+    it (`<base href="/">`, SPA fallback), all `/api` mocked by the spec:
+    `message-pane-resize.spec.ts --repeat-each=3` - 9/9 passed (inbox resize,
+    native chat resize, older-messages position).
+  - Not reproducible on this Windows machine: with Edge and Chrome the native
+    chat stays at 0 px from the bottom at 1300/1100/900/760/1440px both with
+    and without the rule, so the failure is environment-dependent (likely
+    Linux font metrics); the release session reproduced it (280 px) and
+    verified the fix: spec 6/6 on the production build, canary driver harness
+    4x120/120.
+  - typecheck clean; vitest 43 files / 572 tests passed (one run showed an
+    intermittent failure in the untouched, pinned
+    `ChannelsView.test.ts` "persists an ambiguous WhatsApp attempt across
+    remount without storing its body"; it passed 3/3 on its own and in the next
+    full run); build passed; `frontend/package*.json` and
+    `ChannelsView.test.ts` (blob `799804fd`) untouched.
+- **Canary-sensitive:** **yes - native chat message-pane scrolling**
+  (`chat-message-list` transcript scroller). Release session verified the
+  canary driver harness 4x120/120 with this rule.
 
 ## Backend follow-ups (separate branch `claude/backend-fixes-20261001`)
 
