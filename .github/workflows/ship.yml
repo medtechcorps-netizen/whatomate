@@ -547,7 +547,9 @@ jobs:
       - attest
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.plan.result == 'success' && ((inputs.mode == 'rollback' && needs.attest.result == 'skipped') || (inputs.mode != 'rollback' && needs.attest.result == 'success')) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Above the worst-case deploy + rollback path (ship.py
+    # production_worst_case_seconds, checked by test_ship_workflow).
+    timeout-minutes: 120
     environment: production
     concurrency:
       group: ship-production

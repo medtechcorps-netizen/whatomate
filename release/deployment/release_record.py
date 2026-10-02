@@ -54,6 +54,7 @@ BOOTSTRAP_KEYS = frozenset(
     }
 )
 ACTIVE_RUN_STATUSES = ("in_progress", "pending", "queued", "requested", "waiting")
+SOURCE_REF = "refs/heads/main"
 
 
 class Entry(NamedTuple):
@@ -179,6 +180,29 @@ class Gh:
             output.extend(page[key])
         return output
 
+    def api_object(self, path: str, *, code: str) -> dict[str, Any]:
+        value = self._json(["api", path], code=code)
+        if type(value) is not dict:
+            common.fail(code)
+        return value
+
+    def production_environment(self) -> dict[str, Any]:
+        return self.api_object(
+            f"/repos/{self.repo}/environments/{common.PRODUCTION_ENVIRONMENT}", code="gh-failed:environment"
+        )
+
+    def production_branch_policies(self) -> list[Any]:
+        return self.api_pages(
+            f"/repos/{self.repo}/environments/{common.PRODUCTION_ENVIRONMENT}/deployment-branch-policies?per_page=100",
+            "branch_policies",
+            code="gh-failed:environment",
+        )
+
+    def run_approvals(self, run_id: str) -> list[Any]:
+        if type(run_id) is not str or re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None:
+            common.fail("internal-error:run-id")
+        return self.api_list(f"/repos/{self.repo}/actions/runs/{run_id}/approvals", code="gh-failed:approvals")
+
     def releases(self) -> list[Any]:
         return self.api_list(f"/repos/{self.repo}/releases?per_page=100", code="gh-failed:releases")
 
@@ -232,11 +256,44 @@ class Gh:
             common.fail("record-chain-invalid:asset-size")
         return raw
 
-    def _verify(self, subject: str, flags: Sequence[str], *, code: str) -> list[dict[str, Any]]:
+    def _verify(
+        self,
+        subject: str,
+        flags: Sequence[str],
+        identity: Mapping[str, str],
+        *,
+        code: str,
+    ) -> list[dict[str, Any]]:
         value = self._json(["attestation", "verify", subject, *flags, "--format", "json"], code=code)
         if type(value) is not list or not value or any(type(item) is not dict for item in value):
             common.fail(code)
+        # gh already matched these, but --signer-workflow is only a prefix
+        # regex in gh, so the exact signing certificate is re-checked here
+        # for every returned attestation.
+        for item in value:
+            if not certificate_matches(item, identity):
+                common.fail(code)
         return value
+
+    def signer_identity(
+        self,
+        signer_workflow: str,
+        signer_digest: str,
+        source_digest: str,
+    ) -> dict[str, str]:
+        common.require_sha1(signer_digest, "internal-error:signer-digest")
+        common.require_sha1(source_digest, "internal-error:source-digest")
+        if re.fullmatch(r"\.github/workflows/[a-z0-9-]+\.yml", signer_workflow) is None:
+            common.fail("internal-error:signer-workflow")
+        uri = f"https://github.com/{self.repo}/{signer_workflow}@{SOURCE_REF}"
+        return {
+            "buildSignerURI": uri,
+            "subjectAlternativeName": uri,
+            "buildSignerDigest": signer_digest,
+            "sourceRepositoryDigest": source_digest,
+            "sourceRepositoryRef": SOURCE_REF,
+            "runnerEnvironment": "github-hosted",
+        }
 
     def signer_flags(
         self,
@@ -245,16 +302,15 @@ class Gh:
         source_digest: str,
         predicate_type: str,
     ) -> list[str]:
-        common.require_sha1(signer_digest, "internal-error:signer-digest")
-        common.require_sha1(source_digest, "internal-error:source-digest")
-        if re.fullmatch(r"\.github/workflows/[a-z0-9-]+\.yml", signer_workflow) is None:
-            common.fail("internal-error:signer-workflow")
+        identity = self.signer_identity(signer_workflow, signer_digest, source_digest)
         return [
             "--repo", self.repo,
-            "--signer-workflow", f"{self.repo}/{signer_workflow}",
+            # The exact certificate identity (gh treats --signer-workflow as
+            # a regex anchored only at the start).
+            "--cert-identity", identity["buildSignerURI"],
             "--signer-digest", signer_digest,
             "--source-digest", source_digest,
-            "--source-ref", "refs/heads/main",
+            "--source-ref", SOURCE_REF,
             "--deny-self-hosted-runners",
             "--predicate-type", predicate_type,
         ]
@@ -263,6 +319,7 @@ class Gh:
         return self._verify(
             str(path),
             self.signer_flags(SHIP_SIGNER, signer_digest, source_digest, SLSA_PREDICATE),
+            self.signer_identity(SHIP_SIGNER, signer_digest, source_digest),
             code="attestation-unverified:record",
         )
 
@@ -283,11 +340,90 @@ class Gh:
         flags = self.signer_flags(signer_workflow, signer_digest, source_digest, predicate_type)
         if bundle is not None:
             flags += ["--bundle", bundle]
-        return self._verify(f"oci://{image}@{digest}", flags, code="attestation-unverified:image")
+        return self._verify(
+            f"oci://{image}@{digest}",
+            flags,
+            self.signer_identity(signer_workflow, signer_digest, source_digest),
+            code="attestation-unverified:image",
+        )
 
     def run(self, args: Sequence[str], *, code: str) -> bytes:
         """A reviewed write (the record job only)."""
         return self._run(args, code=code)
+
+
+def certificate_matches(item: Mapping[str, Any], identity: Mapping[str, str]) -> bool:
+    """Every identity field of the verified signing certificate, exactly."""
+    try:
+        certificate = item["verificationResult"]["signature"]["certificate"]
+    except (KeyError, TypeError):
+        return False
+    if type(certificate) is not dict:
+        return False
+    return all(type(certificate.get(key)) is str and certificate[key] == value for key, value in identity.items())
+
+
+# --------------------------------------------------------------------------
+# The owner-only approval gate
+# --------------------------------------------------------------------------
+
+
+def require_approval_gate(gh: Gh) -> None:
+    """The production environment must require exactly one reviewer, the
+    owner, with administrator bypass off and deployments limited to main
+    (the shape provision_production_crm_canary_fixture.py:1437-1448 checks
+    for the old lane). Without this the environment would release its
+    secrets to any dispatch with no click at all."""
+    code = "approval-gate-misconfigured"
+    environment = gh.production_environment()
+    if environment.get("name") != common.PRODUCTION_ENVIRONMENT:
+        common.fail(f"{code}:environment")
+    if environment.get("can_admins_bypass") is not False:
+        common.fail(f"{code}:admin-bypass")
+    rules = environment.get("protection_rules")
+    if type(rules) is not list or any(type(rule) is not dict for rule in rules):
+        common.fail(f"{code}:rules")
+    reviewer_rules = [rule for rule in rules if rule.get("type") == "required_reviewers"]
+    if len(reviewer_rules) != 1:
+        common.fail(f"{code}:reviewers")
+    reviewers = reviewer_rules[0].get("reviewers")
+    if (
+        type(reviewers) is not list
+        or len(reviewers) != 1
+        or type(reviewers[0]) is not dict
+        or reviewers[0].get("type") != "User"
+        or type(reviewers[0].get("reviewer")) is not dict
+        or reviewers[0]["reviewer"].get("login") != common.APPROVER_LOGIN
+    ):
+        common.fail(f"{code}:reviewers")
+    if environment.get("deployment_branch_policy") != {"protected_branches": False, "custom_branch_policies": True}:
+        common.fail(f"{code}:branch-policy")
+    policies = gh.production_branch_policies()
+    if (
+        len(policies) != 1
+        or type(policies[0]) is not dict
+        or policies[0].get("name") != "main"
+        or policies[0].get("type") != "branch"
+    ):
+        common.fail(f"{code}:branch-policy")
+
+
+def require_owner_approval(gh: Gh, run_id: str) -> None:
+    """This run's production environment was approved by the owner."""
+    for item in gh.run_approvals(run_id):
+        if type(item) is not dict:
+            common.fail("gh-failed:approvals")
+        user = item.get("user")
+        environments = item.get("environments")
+        if (
+            item.get("state") == "approved"
+            and type(user) is dict
+            and user.get("login") == common.APPROVER_LOGIN
+            and type(environments) is list
+            and any(type(entry) is dict and entry.get("name") == common.PRODUCTION_ENVIRONMENT for entry in environments)
+        ):
+            return
+    common.fail("approval-missing")
 
 
 def git(repo_dir: Path, args: Sequence[str], *, code: str, runner: Callable[..., Any] = subprocess.run) -> Any:
@@ -698,11 +834,19 @@ def rollback_plan(chain: Chain, tag: str) -> tuple[Entry, tuple[Entry, ...]]:
     return target, intermediates
 
 
-def decide_rollback_case(live: Mapping[str, str], latest: Entry, target: Entry) -> str:
+def decide_rollback_case(live: Mapping[str, str], chain: Chain, target: Entry) -> str:
+    """rollback (live == latest, PUT the target), reconcile (live already ==
+    target, no PUT) or restore (target is the latest record and live matches
+    NO record, PUT the latest digests back). A live state equal to an older
+    record is a deliberate rollback, so restore refuses it: reconcile with
+    that record instead."""
     live_images = dict(live)
+    latest = chain.latest
     if target.release == latest.release:
         if live_images == latest.images:
             common.fail("nothing-to-roll-back")
+        if any(entry.images == live_images for entry in chain.entries):
+            common.fail("drift:live-matches-record")
         return "restore"
     if live_images == target.images:
         return "reconcile"

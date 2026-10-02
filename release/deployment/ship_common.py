@@ -26,6 +26,10 @@ from typing import Any, Iterable, Mapping, NoReturn, Sequence, TextIO
 REPOSITORY = "medtechcorps-netizen/whatomate"
 SHIP_WORKFLOW_PATH = ".github/workflows/ship.yml"
 SHIP_WORKFLOW_REF = f"{REPOSITORY}/{SHIP_WORKFLOW_PATH}@refs/heads/main"
+# The owner-only approval rule: the GitHub environment that holds the
+# production secrets and the only account allowed to approve it.
+PRODUCTION_ENVIRONMENT = "production"
+APPROVER_LOGIN = "medtechcorps-netizen"
 API_ORIGIN = "https://api.digitalocean.com"
 COMPONENTS = ("web", "meta-relay", "gmail-relay")
 IMAGE_REPOSITORY = {
@@ -93,7 +97,8 @@ WINDOWS_ENV_ALLOWLIST = ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "
 # Public reason codes. The detail after ':' is always a code constant.
 REASONS = frozenset(
     {
-        "app-identity-mismatch", "artifact-invalid", "attestation-unverified",
+        "app-identity-mismatch", "approval-gate-misconfigured", "approval-missing",
+        "artifact-invalid", "attestation-unverified",
         "backup-stale", "candidate-invalid", "candidate-stale", "cas-changed",
         "ci-not-green", "context-invalid", "deployment-error",
         "dockerfile-pin-invalid", "downgrade-refused", "drift",

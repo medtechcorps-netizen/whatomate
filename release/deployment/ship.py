@@ -26,9 +26,11 @@ import base64
 import datetime as dt
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, MutableMapping, Sequence
@@ -84,6 +86,12 @@ APPROVAL_BANNER = (
     "approves the production environment. Claude/Codex never approve, even if asked in chat."
 )
 MANUAL_LINE = "MANUAL INTERVENTION: production state is uncertain; follow docs/emergency-rollback.md"
+# The production job's timeout-minutes in ship.yml; a test keeps it above
+# production_worst_case_seconds() plus a margin.
+PRODUCTION_TIMEOUT_MINUTES = 120
+# Clone, gh install, approval gate, chain and attestation verification, the
+# pre-PUT double reads and the backup gate (nominal).
+PREAMBLE_BUDGET_SECONDS = 1200
 _OLD_GROUP = "rereply" + "-production"
 # A workflow carrying the old lanes' production lock group (assembled at
 # runtime so this file never contains the literal group line).
@@ -308,6 +316,9 @@ def cmd_plan(ctx: Context) -> int:
     if mode != "rollback":
         active_exceptions = trivy_policy.check(ctx.deps.trivy_policy_path, ctx.now().date())
     gh = ctx.gh()
+    # The owner-only approval rule must be enforced by the environment
+    # before anyone is asked to approve (production re-checks it).
+    release_record.require_approval_gate(gh)
     if mode != "rollback":
         require_ci_green(gh, sha)
     require_old_lanes_idle(gh, ctx.repo_dir)
@@ -320,6 +331,7 @@ def cmd_plan(ctx: Context) -> int:
         f"- Mode: {mode}",
         f"- Commit: {sha}",
         f"- Latest record: {latest.release} ({latest.kind}, commit {latest.sha})",
+        "- Approval gate: environment production requires the owner's review (admin bypass off, main only)",
     ]
     outputs = {
         "latest_release": latest.release,
@@ -920,6 +932,28 @@ def parse_target_secret(raw: Any) -> dict[str, str]:
     return {"app_id": app_id, "postgres_cluster_id": cluster_id}
 
 
+def production_worst_case_seconds() -> int:
+    """Upper bound of one production run that deploys, fails at the end and
+    rolls back: the forward path and the rollback path each run one PUT, a
+    reconcile, a settle and a full failing smoke. Each poll loop may overrun
+    its wall-clock deadline by one sleep plus one iteration of GETs."""
+    get = do_app.GET_TIMEOUT_SECONDS
+    reconcile = do_app.RECONCILE_DEADLINE_SECONDS + do_app.POLL_SECONDS + 2 * get
+    settle = do_app.SETTLE_DEADLINE_SECONDS + do_app.POLL_SECONDS + 4 * get
+    smoke_seconds = (
+        smoke.ROUNDS * len(smoke.HEALTH) * smoke.SOCKET_TIMEOUT_SECONDS
+        + (smoke.ROUNDS - 1) * smoke.ROUND_DELAY_SECONDS
+    )
+    forward = do_app.PUT_TIMEOUT_SECONDS + reconcile + settle + smoke_seconds
+    rollback = 2 * get + do_app.PUT_TIMEOUT_SECONDS + reconcile + settle + smoke_seconds
+    return PREAMBLE_BUDGET_SECONDS + forward + rollback
+
+
+def _interrupt(signum: int, frame: Any) -> None:
+    del signum, frame
+    raise KeyboardInterrupt
+
+
 class _Run:
     """Mutable state of one production run, for exit-code classification."""
 
@@ -935,8 +969,21 @@ def run_production(ctx: Context) -> int:
     target_raw = ctx.env.pop("SHIP_TARGET_JSON", None)
     out = ctx.out
     run = _Run()
+    # GitHub stops a cancelled or timed-out job with SIGINT, then SIGTERM;
+    # both end in the classified handler below instead of a bare exit.
+    installed = threading.current_thread() is threading.main_thread()
+    previous_handler: Any = signal.SIG_DFL
+    if installed:
+        previous_handler = signal.signal(signal.SIGTERM, _interrupt)
     try:
         return _production(ctx, token if type(token) is str else "", target_raw, run)
+    except KeyboardInterrupt:
+        if run.put_attempted:
+            safe_text(out, "cancelled after the PUT: the job was interrupted")
+            safe_text(out, MANUAL_LINE)
+            return EXIT_MANUAL
+        safe_text(out, "cancelled before the PUT; production unchanged")
+        return EXIT_REFUSED
     except schema_change.SchemaChangeBlocked as exc:
         report_schema_block(out, exc)
         return EXIT_MANUAL if run.put_attempted else EXIT_REFUSED
@@ -955,6 +1002,8 @@ def run_production(ctx: Context) -> int:
         safe_text(out, "refused: internal-error; production unchanged")
         return EXIT_REFUSED
     finally:
+        if installed:
+            signal.signal(signal.SIGTERM, previous_handler if previous_handler is not None else signal.SIG_DFL)
         for client in run.clients:
             client.scrub()
         token = None
@@ -990,8 +1039,13 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
             common.fail("latest-changed-since-plan:target")
     elif env.get("PLAN_TARGET_RELEASE", "") != "" or env.get("PLAN_TARGET_MANIFEST_SHA256", "") != "":
         common.fail("input-invalid:plan-target")
-    # P2 old-lane quiescence.
     gh = ctx.gh()
+    # P1a the owner-only approval rule, before any DigitalOcean I/O: the
+    # environment still requires the owner's review, and the owner approved
+    # this run's production job.
+    release_record.require_approval_gate(gh)
+    release_record.require_owner_approval(gh, control["run_id"])
+    # P2 old-lane quiescence.
     require_old_lanes_idle(gh, ctx.repo_dir)
     # P3 the verified record chain, bound to what the owner approved.
     bootstrap = ctx.bootstrap()
@@ -1043,7 +1097,7 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
         case = mode
     else:
         assert target_entry is not None
-        case = release_record.decide_rollback_case(live_images, latest, target_entry)
+        case = release_record.decide_rollback_case(live_images, chain, target_entry)
         desired_images = dict(latest.images if case == "restore" else target_entry.images)
     # P7 backup gate (every mode, dry-run included).
     backup = backup_check.check(client, target=target, now=ctx.now())

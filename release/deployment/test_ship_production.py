@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -127,6 +128,41 @@ class PromoteTests(ProductionCase):
         self.assertEqual(methods, {"GET", "PUT"})
         self.assert_sanitized()
 
+    def assert_masked_before_use(self, values: tuple) -> None:
+        lines = self.h.text().splitlines()
+        for value in values:
+            with self.subTest(value=value[:12]):
+                mask = f"::add-mask::{value}"
+                self.assertIn(mask, lines)
+                index = lines.index(mask)
+                self.assertEqual([line for line in lines[:index] if value in line], [])
+
+    def test_identifiers_are_masked_and_the_token_is_private(self) -> None:
+        outputs: list[common.Output] = []
+        original = common.Output
+
+        def recording(*args: object, **kwargs: object) -> common.Output:
+            instance = original(*args, **kwargs)
+            outputs.append(instance)
+            return instance
+
+        with mock.patch.object(common, "Output", side_effect=recording):
+            self.assertEqual(self.production(), ship.EXIT_OK, self.h.text())
+        self.assert_masked_before_use((
+            support.APP_ID, support.PG_ID, support.CLUSTER_NAME, "rereply-fake.example.invalid", support.INGRESS,
+            support.VPC_ID, support.ACTIVE_ID, support.NEW_DEPLOYMENT_IDS[0],
+        ))
+        self.assertEqual(len(outputs), 1)
+        self.assertIn(support.DO_TOKEN, outputs[0].private)
+        self.assertNotIn(f"::add-mask::{support.DO_TOKEN}", self.h.text())
+        self.assert_sanitized()
+
+    def test_failed_and_rollback_deployment_ids_are_masked(self) -> None:
+        self.h.do = support.FakeDO(scenarios=["error", "accept"])
+        self.assertEqual(self.production(), ship.EXIT_ROLLED_BACK, self.h.text())
+        self.assert_masked_before_use((support.ACTIVE_ID, support.NEW_DEPLOYMENT_IDS[0]))
+        self.assert_sanitized()
+
     def test_first_run_binds_to_the_bootstrap_record(self) -> None:
         self.h.production_env()
         self.h.env["PLAN_LATEST_RELEASE"] = "prod-20261003T000000Z-00000000"
@@ -233,6 +269,76 @@ class PromoteTests(ProductionCase):
         self.h.do.digest_plan = [support.digest("9")]
         self.assertEqual(self.production(), ship.EXIT_ROLLED_BACK, self.h.text())
         self.assertEqual(self.h.do.put_count(), 2)
+
+    def settled_variant(self, change: object) -> int:
+        """The first settled read returns a changed snapshot and the final
+        equality check is relaxed, so each later post-deploy guard is the
+        only thing between the change and a success."""
+        original = do_app.observe_settled
+        calls = {"n": 0}
+
+        def settled(*args: object, **kwargs: object) -> do_app.Snapshot:
+            snapshot = original(*args, **kwargs)
+            calls["n"] += 1
+            return change(snapshot) if calls["n"] == 1 else snapshot  # type: ignore[operator]
+
+        with mock.patch.object(do_app, "observe_settled", side_effect=settled), \
+                mock.patch.object(do_app, "require_materially_unchanged", return_value=None):
+            return self.production()
+
+    def assert_guard_rolled_back(self, code: int) -> None:
+        self.assertEqual(code, ship.EXIT_ROLLED_BACK, self.h.text())
+        self.assertIn("post-deploy-guard: starting the automatic rollback", self.h.text())
+        self.assertEqual(self.h.do.put_count(), 2)
+        self.assertEqual(self.h.do.put_bodies[1]["spec"], support.make_spec())
+        self.assertEqual([client.put_count() for client in self.clients], [1, 1])
+        self.assertEqual(self.h.outputs(), {})
+        self.assert_sanitized()
+
+    def test_post_deploy_guard_catches_wrong_settled_digests(self) -> None:
+        self.assert_guard_rolled_back(self.settled_variant(
+            lambda snap: snap._replace(spec=spec_images.set_images(snap.spec, support.OTHER))))
+
+    def changed_fingerprint(self, key: str) -> None:
+        self.assert_guard_rolled_back(self.settled_variant(
+            lambda snap: snap._replace(public=dict(snap.public, **{key: "0" * 64}))))
+
+    def test_post_deploy_guard_catches_a_changed_environment_fingerprint(self) -> None:
+        self.changed_fingerprint("environment_values_sha256")
+
+    def test_post_deploy_guard_catches_a_changed_non_source_fingerprint(self) -> None:
+        self.changed_fingerprint("non_source_projection_sha256")
+
+    def test_post_deploy_guard_catches_a_lost_vpc(self) -> None:
+        def without_vpc(snap: do_app.Snapshot) -> do_app.Snapshot:
+            spec = copy.deepcopy(snap.spec)
+            del spec["vpc"]
+            return snap._replace(spec=spec)
+
+        self.assert_guard_rolled_back(self.settled_variant(without_vpc))
+
+    def tampered_desired_spec(self, label: str, change: object) -> None:
+        real_set_images = spec_images.set_images
+
+        def tampered(spec: dict, images: dict) -> dict:
+            desired = real_set_images(spec, images)
+            change(desired)  # type: ignore[operator]
+            return desired
+
+        def image_only(before: dict, after: dict) -> list:
+            return sorted(spec_images.image_digest_pointers(before))
+
+        with mock.patch.object(spec_images, "set_images", side_effect=tampered), \
+                mock.patch.object(spec_images, "require_image_only_change", side_effect=image_only):
+            self.assertEqual(self.production(), ship.EXIT_REFUSED, self.h.text())
+        self.assertIn(f"refused: topology-differs:{label}", self.h.text())
+        self.assertEqual(self.h.do.put_count(), 0)
+
+    def test_desired_spec_environment_fingerprint_is_checked_before_the_put(self) -> None:
+        self.tampered_desired_spec("environment", lambda spec: spec["envs"][1].update(value="changed-value"))
+
+    def test_desired_spec_non_source_fingerprint_is_checked_before_the_put(self) -> None:
+        self.tampered_desired_spec("non-source", lambda spec: spec["services"][0].update(instance_count=5))
 
     def test_cas_change_right_before_the_put_refuses(self) -> None:
         def change(provider: support.FakeDO, path: str) -> None:
@@ -384,6 +490,26 @@ class RefusalTests(ProductionCase):
                     self.h.env.pop(name, None)
                 self.h.env.update(support.context_env(self.head, self.root))
 
+    def test_approval_gate_is_rechecked_before_any_provider_request(self) -> None:
+        for label, mutate in {**support.APPROVAL_GATE_MUTATIONS, **support.APPROVAL_MUTATIONS}.items():
+            with self.subTest(case=label):
+                self.h.gh = support.FakeGh()
+                self.h.gh.attest_legacy_images(support.LIVE, self.base)
+                self.h.do = support.FakeDO()
+                mutate(self.h.gh)
+                self.h.stdout.truncate(0)
+                self.h.stdout.seek(0)
+                self.h.production_env()
+                expected = "approval-missing" if label in support.APPROVAL_MUTATIONS else "approval-gate-misconfigured"
+                self.refused(expected, requests=False)
+
+    def test_approval_is_read_for_this_run(self) -> None:
+        self.assertEqual(self.production(), ship.EXIT_OK, self.h.text())
+        paths = [argv[-1] for argv, _ in self.h.gh.calls if argv[1:2] == ["api"]]
+        self.assertIn(f"/repos/{common.REPOSITORY}/actions/runs/{support.RUN_ID}/approvals", paths)
+        self.assertIn(f"/repos/{common.REPOSITORY}/environments/production", paths)
+        self.assertFalse(any("pending_deployments" in " ".join(argv) for argv, _ in self.h.gh.calls))
+
     def test_old_lane_active(self) -> None:
         self.h.gh.active["in_progress"] = [support.run_record(".github/workflows/old-lane.yml", status="in_progress",
                                                               conclusion=None, run_id=9)]
@@ -429,7 +555,7 @@ class RollbackModeTests(ProductionCase):
         self.assertEqual(outputs["reconciled"], "false")
         self.assertEqual(outputs["built_at"], "")
         legacy = [argv for argv, _ in self.h.gh.calls
-                  if "attestation" in argv and f"{common.REPOSITORY}/.github/workflows/build-attest-exact-release-images.yml" in argv]
+                  if "attestation" in argv and f"https://github.com/{common.REPOSITORY}/.github/workflows/build-attest-exact-release-images.yml@refs/heads/main" in argv]
         self.assertEqual(len(legacy), 6)
         self.assert_sanitized()
 
@@ -449,6 +575,22 @@ class RollbackModeTests(ProductionCase):
         self.assertEqual(spec_images.extract_image_digests(self.h.do.spec), support.NEW)
         outputs = self.h.outputs()
         self.assertEqual((outputs["kind"], outputs["sha"], outputs["rolled_back_from"]), ("restore", self.head, ""))
+
+    def test_restore_refuses_when_live_equals_an_older_record(self) -> None:
+        # A console rollback from the latest record to release #0, then a
+        # restore dispatch: it must not re-deploy the release just rolled away.
+        self.rollback_env(self.record["release"], support.hashlib.sha256(self.raw).hexdigest())
+        self.assertEqual(self.h.run("production"), ship.EXIT_REFUSED, self.h.text())
+        self.assertIn("refused: drift:live-matches-record", self.h.text())
+        self.assertEqual(self.h.do.put_count(), 0)
+        self.assertEqual(self.h.outputs(), {})
+        # The supported route: reconcile to the record that is live.
+        self.h.stdout.truncate(0)
+        self.h.stdout.seek(0)
+        self.rollback_env("prod-0000", self.h.bootstrap_sha256)
+        self.assertEqual(self.h.run("production"), ship.EXIT_OK, self.h.text())
+        self.assertEqual(self.h.do.put_count(), 0)
+        self.assertEqual(self.h.outputs()["reconciled"], "true")
 
     def test_nothing_to_roll_back(self) -> None:
         self.h.do = support.FakeDO(spec=support.make_spec(support.NEW))
@@ -471,11 +613,54 @@ class RollbackModeTests(ProductionCase):
         self.assertEqual(self.h.run("production"), ship.EXIT_REFUSED)
         self.assertIn("rollback-target-invalid", self.h.text())
 
+    def test_production_rechecks_the_schema_guard_for_rollback(self) -> None:
+        self.h.do = support.FakeDO(spec=support.make_spec(support.NEW))
+        self.rollback_env("prod-0000", self.h.bootstrap_sha256)
+        blocked = ship.schema_change.SchemaChangeBlocked(["guarded-tree:internal/models/example.go"])
+        with mock.patch.object(ship.schema_change, "guard", side_effect=blocked) as guard:
+            self.assertEqual(self.h.run("production"), ship.EXIT_REFUSED, self.h.text())
+        self.assertEqual(guard.call_args.args[1:], (self.base, self.head))
+        self.assertIn("schema-change-blocked", self.h.text())
+        self.assertEqual(self.h.do.put_count(), 0)
+        self.assertEqual(self.h.do.requests, [])
+
     def test_failed_rollback_put_is_itself_rolled_back(self) -> None:
         self.h.do = support.FakeDO(spec=support.make_spec(support.NEW), scenarios=["error", "accept"])
         self.rollback_env("prod-0000", self.h.bootstrap_sha256)
         self.assertEqual(self.h.run("production"), ship.EXIT_ROLLED_BACK, self.h.text())
         self.assertEqual(spec_images.extract_image_digests(self.h.do.spec), support.NEW)
+
+
+class InterruptTests(ProductionCase):
+    def test_cancel_after_the_put_is_manual(self) -> None:
+        with mock.patch.object(do_app, "reconcile_until_active", side_effect=KeyboardInterrupt):
+            self.assertEqual(self.production(), ship.EXIT_MANUAL, self.h.text())
+        self.assertEqual(self.h.do.put_count(), 1)
+        self.assertIn("cancelled after the PUT", self.h.text())
+        self.assertIn(ship.MANUAL_LINE, self.h.text())
+        self.assertEqual(self.h.outputs(), {})
+        self.assertTrue(all(client._token == "" for client in self.clients))
+
+    def test_cancel_before_the_put_is_refused(self) -> None:
+        with mock.patch.object(ship.release_record, "resolve_chain", side_effect=KeyboardInterrupt):
+            self.assertEqual(self.production(), ship.EXIT_REFUSED, self.h.text())
+        self.assertIn("cancelled before the PUT; production unchanged", self.h.text())
+        self.assertEqual(self.h.do.put_count(), 0)
+
+    def test_sigterm_is_routed_to_the_handler_and_restored(self) -> None:
+        before = signal.getsignal(signal.SIGTERM)
+        seen: list[object] = []
+
+        def check_handler(*args: object, **kwargs: object) -> object:
+            seen.append(signal.getsignal(signal.SIGTERM))
+            raise KeyboardInterrupt
+
+        with mock.patch.object(ship.release_record, "resolve_chain", side_effect=check_handler):
+            self.assertEqual(self.production(), ship.EXIT_REFUSED)
+        self.assertEqual(seen, [ship._interrupt])
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+        with self.assertRaises(KeyboardInterrupt):
+            ship._interrupt(signal.SIGTERM, None)
 
 
 class EntrypointTests(unittest.TestCase):

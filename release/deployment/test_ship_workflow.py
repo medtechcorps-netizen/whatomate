@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import do_app
+import ship
 import ship_common as common
 
 
@@ -320,7 +322,16 @@ class JobShapeTests(unittest.TestCase):
                 self.assertEqual(job["runs-on"], "ubuntu-24.04")
                 self.assertIs(type(job["timeout-minutes"]), int)
                 self.assertNotIn(job["name"], required_contexts)
-        self.assertEqual(JOBS["production"]["timeout-minutes"], 60)
+        self.assertEqual(JOBS["production"]["timeout-minutes"], ship.PRODUCTION_TIMEOUT_MINUTES)
+
+    def test_production_timeout_covers_the_worst_case_deploy_and_rollback(self) -> None:
+        budget = ship.production_worst_case_seconds()
+        # At least ten minutes of margin over the computed bound.
+        self.assertGreaterEqual(ship.PRODUCTION_TIMEOUT_MINUTES * 60, budget + 600)
+        self.assertLessEqual(ship.PRODUCTION_TIMEOUT_MINUTES, 360)
+        # The bound really covers both reconciles, both settles and both smokes.
+        self.assertGreater(budget, 2 * (do_app.RECONCILE_DEADLINE_SECONDS + do_app.SETTLE_DEADLINE_SECONDS))
+        self.assertGreaterEqual(do_app.RECONCILE_DEADLINE_SECONDS, do_app.POLL_LIMIT * do_app.POLL_SECONDS)
 
     def test_least_privilege_permissions(self) -> None:
         expected = {
@@ -615,7 +626,7 @@ class RepositoryFileTests(unittest.TestCase):
         emergency = (ROOT / "docs" / "emergency-rollback.md").read_text(encoding="ascii")
         self.assertIn("Claude/Codex never approve", release)
         self.assertIn("Approve and deploy", release)
-        for code in ("ci-not-green", "old-lane-active", "record-chain-invalid", "latest-changed-since-plan",
+        for code in ("approval-gate-misconfigured", "approval-missing", "ci-not-green", "old-lane-active", "record-chain-invalid", "latest-changed-since-plan",
                      "downgrade-refused", "schema-change-blocked", "trivy-exception-invalid", "candidate-stale",
                      "attestation-unverified", "app-identity-mismatch", "vpc-missing-or-differs", "topology-differs",
                      "forbidden-image-field", "drift", "backup-stale", "cas-changed", "provider-rejected",
@@ -623,8 +634,12 @@ class RepositoryFileTests(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertIn(f"`{code}`", release)
                 self.assertIn(code, common.REASONS)
-        for fragment in ("Rollback", "Commit", "rls-migrate -rollback", "target_release"):
+        for fragment in ("Rollback", "Commit", "rls-migrate -rollback", "target_release", "`previous`",
+                         "timed out", "nothing-to-roll-back", "drift:live-matches-record"):
             self.assertIn(fragment, emergency)
+        self.assertIn("timed out", release)
+        # The newest record is not automatically the known-good one.
+        self.assertIn("It is not always the newest", " ".join(emergency.split()))
 
 
 if __name__ == "__main__":

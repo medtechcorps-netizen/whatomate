@@ -479,6 +479,21 @@ class FakeGh:
         self.writes: list[list[str]] = []
         self.next_release_id = 100
         self.drafts_hidden = False
+        # The owner-only approval gate, configured as docs/release.md asks.
+        self.environment: dict[str, Any] = {
+            "id": 9001, "name": "production", "can_admins_bypass": False,
+            "protection_rules": [
+                {"id": 1, "type": "required_reviewers", "prevent_self_review": False,
+                 "reviewers": [{"type": "User", "reviewer": {"login": "medtechcorps-netizen", "id": 7}}]},
+                {"id": 2, "type": "branch_policy"},
+            ],
+            "deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True},
+        }
+        self.branch_policies: list[dict[str, Any]] = [{"id": 3, "name": "main", "type": "branch"}]
+        self.approvals: dict[str, list[dict[str, Any]]] = {
+            RUN_ID: [{"state": "approved", "comment": "", "user": {"login": "medtechcorps-netizen", "id": 7},
+                      "environments": [{"id": 9001, "name": "production"}]}],
+        }
 
     # -- scenario builders --------------------------------------------------
 
@@ -550,6 +565,10 @@ class FakeGh:
             return self._result(argv, 0, f"gh version {self.version} (2026-09-01)\nhttps://github.com/cli/cli/releases/tag/v{self.version}\n".encode())
         if args[:3] == ["api", "--paginate", "--slurp"] and len(args) == 4:
             return self._api(argv, args[3])
+        if args[:1] == ["api"] and len(args) == 2:
+            if args[1] == f"/repos/{REPO}/environments/production":
+                return self._json(argv, self.environment)
+            return self._result(argv, 1)
         if args[:2] == ["release", "download"]:
             return self._download(argv, args)
         if args[:2] == ["attestation", "verify"]:
@@ -574,6 +593,12 @@ class FakeGh:
         if parsed.path == f"/repos/{REPO}/actions/runs":
             runs = self.active.get(query.get("status", ""), [])
             return self._json(argv, [{"total_count": len(runs), "workflow_runs": runs}])
+        if parsed.path == f"/repos/{REPO}/environments/production/deployment-branch-policies":
+            return self._json(argv, [{"total_count": len(self.branch_policies), "branch_policies": self.branch_policies}])
+        approvals_prefix = f"/repos/{REPO}/actions/runs/"
+        if parsed.path.startswith(approvals_prefix) and parsed.path.endswith("/approvals"):
+            run_id = parsed.path[len(approvals_prefix):-len("/approvals")]
+            return self._json(argv, [self.approvals.get(run_id, [])])
         return self._result(argv, 1)
 
     def _download(self, argv: list[str], args: list[str]) -> subprocess.CompletedProcess:
@@ -588,40 +613,72 @@ class FakeGh:
     def _flag(args: list[str], name: str) -> str | None:
         return args[args.index(name) + 1] if name in args else None
 
+    @staticmethod
+    def identity(workflow: str) -> str:
+        return f"https://github.com/{REPO}/{workflow}@refs/heads/main"
+
+    @staticmethod
+    def _certificate(uri: str, signer: str, source: str) -> dict[str, str]:
+        return {
+            "buildSignerURI": uri,
+            "subjectAlternativeName": uri,
+            "buildSignerDigest": signer,
+            "sourceRepositoryDigest": source,
+            "sourceRepositoryRef": "refs/heads/main",
+            "runnerEnvironment": "github-hosted",
+        }
+
     def _verify(self, argv: list[str], args: list[str]) -> subprocess.CompletedProcess:
         subject = args[2]
-        required = ("--repo", "--signer-workflow", "--signer-digest", "--source-digest", "--source-ref", "--predicate-type")
+        required = ("--repo", "--cert-identity", "--signer-digest", "--source-digest", "--source-ref", "--predicate-type")
         if any(name not in args for name in required) or "--deny-self-hosted-runners" not in args:
+            return self._result(argv, 1)
+        if "--signer-workflow" in args or "--cert-identity-regex" in args:
             return self._result(argv, 1)
         if self._flag(args, "--repo") != REPO or self._flag(args, "--source-ref") != "refs/heads/main":
             return self._result(argv, 1)
         if self._flag(args, "--format") != "json":
             return self._result(argv, 1)
-        workflow = self._flag(args, "--signer-workflow")
+        identity = self._flag(args, "--cert-identity")
         signer = self._flag(args, "--signer-digest")
         source = self._flag(args, "--source-digest")
         predicate_type = self._flag(args, "--predicate-type")
         if subject.startswith("oci://"):
             image, _, value = subject[len("oci://"):].partition("@")
+            # "matched_as" lets a test model gh matching a certificate whose
+            # real identity ("workflow") differs from the requested one.
             matches = [
                 item for item in self.image_attestations.get((image, value), [])
-                if f"{REPO}/{item['workflow']}" == workflow and item["signer"] == signer
+                if self.identity(item.get("matched_as", item["workflow"])) == identity and item["signer"] == signer
                 and item["source"] == source and item["predicate_type"] == predicate_type
             ]
             if not matches:
                 return self._result(argv, 1)
-            return self._json(argv, [{"verificationResult": {"statement": {"predicate": item["predicate"]}}} for item in matches])
+            return self._json(argv, [
+                {
+                    "verificationResult": {
+                        "statement": {"predicate": item["predicate"]},
+                        "signature": {"certificate": self._certificate(self.identity(item["workflow"]), signer, source)},
+                    }
+                }
+                for item in matches
+            ])
         data = Path(subject).read_bytes()
         expected = self.attested_files.get(hashlib.sha256(data).hexdigest())
         if (
             expected is None
-            or workflow != f"{REPO}/.github/workflows/ship.yml"
+            or identity != self.identity(".github/workflows/ship.yml")
             or signer != expected
             or source != expected
             or predicate_type != "https://slsa.dev/provenance/v1"
         ):
             return self._result(argv, 1)
-        return self._json(argv, [{"verificationResult": {"statement": {"predicate": {"buildType": "fake"}}}}])
+        return self._json(argv, [{
+            "verificationResult": {
+                "statement": {"predicate": {"buildType": "fake"}},
+                "signature": {"certificate": self._certificate(identity, signer, source)},
+            }
+        }])
 
     def _write(self, argv: list[str], args: list[str]) -> subprocess.CompletedProcess:
         self.writes.append(list(args))
@@ -648,6 +705,42 @@ class FakeGh:
             release["draft"] = False
             self.tags.append({"ref": f"refs/tags/{tag}", "object": {"type": "commit", "sha": release["target_commitish"]}})
         return self._result(argv, 0)
+
+
+def _reviewers(fake: "FakeGh") -> list[dict[str, Any]]:
+    return [rule for rule in fake.environment["protection_rules"] if rule["type"] == "required_reviewers"][0]["reviewers"]
+
+
+# Each mutation breaks the owner-only approval gate in one way (the live
+# environment on 2026-10-03 had no reviewer and admin bypass on).
+APPROVAL_GATE_MUTATIONS: dict[str, Callable[["FakeGh"], None]] = {
+    "no-reviewer-rule": lambda fake: fake.environment.update(
+        protection_rules=[rule for rule in fake.environment["protection_rules"] if rule["type"] != "required_reviewers"]),
+    "empty-reviewers": lambda fake: _reviewers(fake).clear(),
+    "two-reviewers": lambda fake: _reviewers(fake).append({"type": "User", "reviewer": {"login": "someone-else", "id": 8}}),
+    "wrong-login": lambda fake: _reviewers(fake)[0]["reviewer"].update(login="someone-else"),
+    "team-reviewer": lambda fake: _reviewers(fake)[0].update(type="Team"),
+    "two-reviewer-rules": lambda fake: fake.environment["protection_rules"].append(
+        copy.deepcopy([rule for rule in fake.environment["protection_rules"] if rule["type"] == "required_reviewers"][0])),
+    "admin-bypass-on": lambda fake: fake.environment.update(can_admins_bypass=True),
+    "admin-bypass-missing": lambda fake: fake.environment.pop("can_admins_bypass"),
+    "protected-branches-policy": lambda fake: fake.environment.update(
+        deployment_branch_policy={"protected_branches": True, "custom_branch_policies": False}),
+    "no-branch-policy": lambda fake: fake.environment.update(deployment_branch_policy=None),
+    "extra-branch-policy": lambda fake: fake.branch_policies.append({"id": 4, "name": "release/*", "type": "branch"}),
+    "tag-policy": lambda fake: fake.branch_policies[0].update(type="tag"),
+    "other-branch": lambda fake: fake.branch_policies[0].update(name="develop"),
+    "no-branch-rules": lambda fake: fake.branch_policies.clear(),
+    "environment-unreadable": lambda fake: fake.environment.clear(),
+}
+
+APPROVAL_MUTATIONS: dict[str, Callable[["FakeGh"], None]] = {
+    "no-approval": lambda fake: fake.approvals[RUN_ID].clear(),
+    "rejected": lambda fake: fake.approvals[RUN_ID][0].update(state="rejected"),
+    "other-user": lambda fake: fake.approvals[RUN_ID][0]["user"].update(login="someone-else"),
+    "other-environment": lambda fake: fake.approvals[RUN_ID][0].update(environments=[{"id": 1, "name": "staging"}]),
+    "other-run": lambda fake: fake.approvals.update({"1": fake.approvals.pop(RUN_ID)}),
+}
 
 
 # --------------------------------------------------------------------------

@@ -245,7 +245,7 @@ class ChainTests(unittest.TestCase):
         argv = verify[0]
         self.assertEqual(argv[4:], [
             "--repo", common.REPOSITORY,
-            "--signer-workflow", f"{common.REPOSITORY}/.github/workflows/ship.yml",
+            "--cert-identity", f"https://github.com/{common.REPOSITORY}/.github/workflows/ship.yml@refs/heads/main",
             "--signer-digest", SHA_1, "--source-digest", SHA_1, "--source-ref", "refs/heads/main",
             "--deny-self-hosted-runners", "--predicate-type", "https://slsa.dev/provenance/v1", "--format", "json",
         ])
@@ -285,7 +285,7 @@ class ImageVerificationTests(unittest.TestCase):
         self.verify(dict(support.LIVE), BASE)
         legacy_calls = [argv for argv, _ in self.fake.calls if "attestation" in argv]
         self.assertEqual(len(legacy_calls), 6)
-        self.assertTrue(all(f"{common.REPOSITORY}/.github/workflows/build-attest-exact-release-images.yml" in argv
+        self.assertTrue(all(f"https://github.com/{common.REPOSITORY}/.github/workflows/build-attest-exact-release-images.yml@refs/heads/main" in argv
                             for argv in legacy_calls))
 
     def test_bootstrap_digest_under_another_component_fails(self) -> None:
@@ -318,6 +318,48 @@ class ImageVerificationTests(unittest.TestCase):
             self.verify(dict(support.NEW), SHA_2)
         mixed = dict(support.NEW, web=support.LIVE["web"])
         self.verify(mixed, SHA_1)
+
+    def test_image_flags_use_the_exact_certificate_identity(self) -> None:
+        self.fake.attest_ship_images(support.NEW, SHA_1)
+        self.verify(dict(support.NEW), SHA_1)
+        argv = [argv for argv, _ in self.fake.calls if argv[1:3] == ["attestation", "verify"]][0]
+        self.assertEqual(argv[4:-2], [
+            "--repo", common.REPOSITORY,
+            "--cert-identity", f"https://github.com/{common.REPOSITORY}/.github/workflows/ship.yml@refs/heads/main",
+            "--signer-digest", SHA_1, "--source-digest", SHA_1, "--source-ref", "refs/heads/main",
+            "--deny-self-hosted-runners", "--predicate-type", "https://slsa.dev/provenance/v1",
+        ])
+        self.assertNotIn("--signer-workflow", argv)
+
+    def test_a_prefix_matched_signer_is_refused(self) -> None:
+        # gh's --signer-workflow is a prefix regex: a certificate from
+        # ship.yml-x.yml would satisfy "ship.yml". Model gh returning such a
+        # certificate and require the exact identity check to refuse it.
+        for workflow in (".github/workflows/ship.yml-x.yml", ".github/workflows/shipXyml"):
+            fake = support.FakeGh()
+            fake.attest_ship_images(support.NEW, SHA_1)
+            for entries in fake.image_attestations.values():
+                for item in entries:
+                    item["matched_as"] = item["workflow"]
+                    item["workflow"] = workflow
+            self.fake = fake
+            with self.subTest(workflow=workflow), self.assertRaisesRegex(common.ReleaseError, "^attestation-unverified:image$"):
+                self.verify(dict(support.NEW), SHA_1)
+
+    def test_every_certificate_field_is_bound(self) -> None:
+        identity = gh_client(self.fake, self.root).signer_identity(".github/workflows/ship.yml", SHA_1, SHA_1)
+        item = {"verificationResult": {"signature": {"certificate": dict(identity)}}}
+        self.assertTrue(release_record.certificate_matches(item, identity))
+        for key in identity:
+            changed = copy.deepcopy(item)
+            changed["verificationResult"]["signature"]["certificate"][key] = "other"
+            with self.subTest(key=key):
+                self.assertFalse(release_record.certificate_matches(changed, identity))
+            missing = copy.deepcopy(item)
+            del missing["verificationResult"]["signature"]["certificate"][key]
+            self.assertFalse(release_record.certificate_matches(missing, identity))
+        self.assertFalse(release_record.certificate_matches({"verificationResult": {}}, identity))
+        self.assertFalse(release_record.certificate_matches({"verificationResult": {"signature": {"certificate": []}}}, identity))
 
 
 class AncestryTests(unittest.TestCase):
@@ -366,13 +408,23 @@ class RollbackPlanningTests(unittest.TestCase):
         chain = self.chain()
         latest = chain.latest
         older = chain.entries[1]
-        self.assertEqual(release_record.decide_rollback_case(latest.images, latest, older), "rollback")
-        self.assertEqual(release_record.decide_rollback_case(older.images, latest, older), "reconcile")
-        self.assertEqual(release_record.decide_rollback_case(support.LIVE, latest, latest), "restore")
+        unrecorded = {"web": support.digest("7"), "meta-relay": support.digest("8"), "gmail-relay": support.digest("9")}
+        self.assertEqual(release_record.decide_rollback_case(latest.images, chain, older), "rollback")
+        self.assertEqual(release_record.decide_rollback_case(older.images, chain, older), "reconcile")
+        self.assertEqual(release_record.decide_rollback_case(unrecorded, chain, latest), "restore")
+        partly = dict(latest.images, web=support.LIVE["web"])
+        self.assertEqual(release_record.decide_rollback_case(partly, chain, latest), "restore")
         with self.assertRaisesRegex(common.ReleaseError, "^nothing-to-roll-back$"):
-            release_record.decide_rollback_case(latest.images, latest, latest)
+            release_record.decide_rollback_case(latest.images, chain, latest)
         with self.assertRaisesRegex(common.ReleaseError, "^drift$"):
-            release_record.decide_rollback_case(support.LIVE, latest, older)
+            release_record.decide_rollback_case(unrecorded, chain, older)
+
+    def test_restore_never_undoes_a_rollback_to_an_older_record(self) -> None:
+        chain = self.chain()
+        latest = chain.latest
+        for label, live in (("bootstrap", support.LIVE), ("intermediate", chain.entries[1].images)):
+            with self.subTest(live=label), self.assertRaisesRegex(common.ReleaseError, "^drift:live-matches-record$"):
+                release_record.decide_rollback_case(dict(live), chain, latest)
 
 
 if __name__ == "__main__":

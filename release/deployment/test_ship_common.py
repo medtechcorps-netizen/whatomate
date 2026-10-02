@@ -211,6 +211,24 @@ class OutputTests(unittest.TestCase):
             with self.assertRaises(common.ReleaseError):
                 output.summary(["leak " + support.PG_ID])
 
+    def test_emit_refuses_private_values_uuids_and_app_hostnames(self) -> None:
+        stdout = io.StringIO()
+        output = common.Output(stdout=stdout)
+        output.add_private("fake-pg-cluster-name")
+        for value in (
+            "fake-pg-cluster-name",
+            "prefix fake-pg-cluster-name suffix",
+            support.APP_ID,
+            "rereply-abc12." + "ondigitalocean" + ".app",
+            "https://api.digitalocean.com/v2/apps",
+        ):
+            for shape, payload in (("value", {"x": value}), ("list", {"x": [value]}),
+                                   ("nested", {"x": {"y": value}}), ("key", {value: 1})):
+                with self.subTest(value=value[:24], shape=shape):
+                    with self.assertRaisesRegex(common.ReleaseError, "^output-unsafe"):
+                        output.emit(payload)
+        self.assertEqual(stdout.getvalue(), "")
+
 
 class EnvironmentTests(unittest.TestCase):
     def test_scrubbed_env_never_carries_the_deploy_token(self) -> None:

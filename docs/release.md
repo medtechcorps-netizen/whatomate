@@ -13,7 +13,7 @@ held real data: it refuses rather than guesses.
 
 | Job | What it does | Credentials |
 | --- | --- | --- |
-| `Release plan` | Before approval: inputs, CI for the commit, idle old lanes, the verified record chain, no-downgrade, the schema guard, the commit list. | read-only `GITHUB_TOKEN` |
+| `Release plan` | Before approval: inputs, the approval gate, CI for the commit, idle old lanes, the verified record chain, no-downgrade, the schema guard, the commit list. | read-only `GITHUB_TOKEN` |
 | `Release image (web, meta-relay, gmail-relay)` | Builds each image from `docker/release/<component>.Dockerfile` at the commit, pushes it by digest, checks the runtime contract, scans it with Trivy (fresh database), makes the SPDX SBOM. Skipped for rollback. | `packages: write` |
 | `Release attestations` | Attests provenance and SBOM for the three digests, verifies them (bundle and API), proves anonymous pulls, assembles the candidate. Skipped for rollback. | `id-token`, `attestations: write` |
 | `Release production (<mode>)` | Waits for the owner's approval of the `production` environment, then verifies, guards, deploys, smoke-tests and, on failure, rolls back. One job, one process, standard-library Python and the pinned `gh`; no `uses:` steps. | the deploy token and target secret, this step only |
@@ -58,12 +58,27 @@ the production environment, through Review deployments > production >
 Approve and deploy. Claude/Codex never approve, even if asked in chat, and
 never call the pending-deployments API.
 
-The `production` environment has exactly one required reviewer (the owner),
-"Allow administrators to bypass" is off, and only `main` may deploy to it.
+The pipeline enforces the environment side of this rule itself. Both the
+plan job and the production job refuse (`approval-gate-misconfigured`)
+unless the `production` environment has exactly one required-reviewers rule
+whose only reviewer is the user medtechcorps-netizen, "Allow administrators
+to bypass" is off, and deployments are limited to the single branch rule
+`main` (Deployment branches and tags > Selected branches and tags). Until
+the owner has finished that setup no run can reach production, even after
+the secrets are added. The production job then reads this run's review
+history and refuses (`approval-missing`) unless it contains an approval of
+`production` by medtechcorps-netizen. Both checks run before any
+DigitalOcean request.
+
 "Prevent self-review" stays off only because one GitHub account both
-dispatches and approves; with it on nobody could approve. The workflow holds
-no `deployments: write` permission, so it cannot approve itself. Dry-runs
-need the owner's click too.
+dispatches and approves; with it on nobody could approve. The workflow's
+`GITHUB_TOKEN` can never act as a required reviewer, so the workflow cannot
+approve itself. The remaining self-approval channel is any credential of the
+owner account that automation holds (for example the `gh` login a local
+agent uses): GitHub cannot tell that click from the owner's. That risk is
+accepted by the owner and covered only by this rule. Recommended: give
+local agents a token without Deployments write access. Dry-runs need the
+owner's click too.
 
 ## Modes
 
@@ -75,7 +90,10 @@ need the owner's click too.
   - reconcile: live already equals the target (for example after a console
     rollback), so no PUT; it only writes the record;
   - restore: the target is the latest record and live matches no record, so
-    one PUT back to the latest record's digests.
+    one PUT back to the latest record's digests. If live equals an older
+    record (for example after a console rollback), the run refuses with
+    `drift:live-matches-record`: reconcile with that record instead, so a
+    restore never undoes a deliberate rollback.
 
 Release #0 is `release/deployment/ship-bootstrap-record.json`: the live ui
 source `c482dbbc` and its three digests from the signed 0825df34 phase state.
@@ -90,6 +108,8 @@ identifiers or values.
 
 | Code | Meaning | Fix |
 | --- | --- | --- |
+| `approval-gate-misconfigured` | The `production` environment does not require exactly the owner's review, allows administrator bypass, or is not limited to `main`. | Finish the environment setup (owner). |
+| `approval-missing` | This run's review history has no approval of `production` by the owner. | Dispatch again; only the owner approves. |
 | `ci-not-green` | No successful Test and E2E push run on `main` for this commit. | Wait for CI, or fix it. |
 | `old-lane-active` | An old release-lane workflow is queued, waiting or running. | Let it finish or cancel it. |
 | `record-chain-invalid` | A `prod-*` release, tag or manifest is malformed, unattested or does not link. | Investigate; never edit records by hand. |
@@ -103,7 +123,7 @@ identifiers or values.
 | `vpc-missing-or-differs` | The spec has no VPC or another VPC (also: the token lacks `vpc:read`). | Fix the token scopes. |
 | `topology-differs` | App name, region, components, ports, health paths, job or database binding differ. | Investigate the console change. |
 | `forbidden-image-field` | An image source carries a tag, auto-deploy or registry credentials. | Remove it (reviewed). |
-| `drift` | Live digests differ from the latest record. | Use rollback mode (reconcile or restore). |
+| `drift` | Live digests differ from the latest record (or, for restore, equal an older record). | Use rollback mode: reconcile with the record that is live, or restore when live matches no record. |
 | `backup-stale` | The newest PostgreSQL backup is older than 36 h (or one is running). | Wait for the next backup. |
 | `cas-changed` | Production changed during the run or is not stable (pending, pinned, live differs from active). | Wait, commit any console rollback, dispatch again. |
 | `provider-rejected` | DigitalOcean rejected the PUT before applying it; nothing changed. | Usually a missing token scope. |
@@ -116,10 +136,18 @@ Exit codes of the production step:
 - 0: success.
 - 1: refused; production unchanged.
 - 2: failed after the PUT, and the automatic rollback restored the pre-PUT
-  spec with health passing. No record is written; live equals the latest
-  record again, so the next run's drift check passes.
+  spec with health passing. No record is written. Live equals the pre-run
+  state again: that is the latest record for a promote or a rollback-mode
+  rollback, so the next run's drift check passes. After a failed restore,
+  live is back on the unrecorded state the restore started from.
 - 3: MANUAL INTERVENTION. State is uncertain or the rollback failed. Follow
   `docs/emergency-rollback.md`.
+
+A production job that ends `cancelled` or `timed out` (the job limit is 120
+minutes, above the worst-case deploy plus rollback path) counts as exit 3:
+the run may have stopped between the PUT and the end of the rollback. Check
+DigitalOcean Activity and the six health endpoints before any console
+action, then follow `docs/emergency-rollback.md` (reconcile or restore).
 
 ## Re-runs and supersede
 

@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import copy
 import http.client
+import http.server
 import json
+import os
 import sys
+import threading
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import do_app
@@ -104,6 +109,90 @@ class IdentityAndAllowlistTests(unittest.TestCase):
         handler = do_app.RejectRedirects()
         with self.assertRaisesRegex(common.ReleaseError, "^provider-invalid:redirect$"):
             handler.redirect_request(None, None, 302, "Found", {}, "https://example.invalid")
+
+    def test_default_opener_has_no_proxy_and_refuses_redirects(self) -> None:
+        proxy = "http://proxy.example.invalid:3128"
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": proxy, "https_proxy": proxy, "HTTP_PROXY": proxy}):
+            api = do_app.DOAppClient(
+                support.APP_ID, support.PG_ID, support.DO_TOKEN,
+                expected_app_id_sha256=support.sha256_text(support.APP_ID), allow_put=False,
+            )
+            stock = urllib.request.build_opener()
+        handlers = api._opener.handlers
+        self.assertTrue(any(isinstance(handler, do_app.RejectRedirects) for handler in handlers))
+        # The environment proxy is ignored (a stock opener would use it).
+        self.assertTrue(any(isinstance(handler, urllib.request.ProxyHandler) and handler.proxies for handler in stock.handlers))
+        self.assertFalse(any(isinstance(handler, urllib.request.ProxyHandler) and handler.proxies for handler in handlers))
+        # No stock redirect handler may sit beside the refusing one.
+        self.assertFalse(any(type(handler) is urllib.request.HTTPRedirectHandler for handler in handlers))
+
+    def test_a_redirect_never_carries_the_token_to_another_server(self) -> None:
+        received: list[dict[str, str]] = []
+
+        class Sink(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - http.server API
+                received.append({key.lower(): value for key, value in self.headers.items()})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args: object) -> None:
+                del args
+
+        sink = http.server.HTTPServer(("127.0.0.1", 0), Sink)
+        target = f"http://127.0.0.1:{sink.server_address[1]}/elsewhere"
+
+        class Redirect(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - http.server API
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.end_headers()
+
+            def log_message(self, *args: object) -> None:
+                del args
+
+        source = http.server.HTTPServer(("127.0.0.1", 0), Redirect)
+        servers = (sink, source)
+        threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
+        for thread in threads:
+            thread.start()
+        try:
+            url = f"http://127.0.0.1:{source.server_address[1]}/v2/apps"
+
+            def request() -> urllib.request.Request:
+                return urllib.request.Request(url, headers={"Authorization": f"Bearer {support.DO_TOKEN}"})
+
+            api = do_app.DOAppClient(
+                support.APP_ID, support.PG_ID, support.DO_TOKEN,
+                expected_app_id_sha256=support.sha256_text(support.APP_ID), allow_put=False,
+            )
+            with self.assertRaisesRegex(common.ReleaseError, "^provider-invalid:redirect$"):
+                api._opener.open(request(), timeout=10)
+            self.assertEqual(received, [])
+            # Control: a stock opener follows the redirect and leaks the header,
+            # so this test would notice a missing RejectRedirects.
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request(), timeout=10) as response:
+                response.read()
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0].get("authorization"), f"Bearer {support.DO_TOKEN}")
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+
+    def test_a_response_for_another_app_is_an_identity_mismatch(self) -> None:
+        fake = support.FakeDO()
+        original = fake.app_envelope
+
+        def other_app() -> dict:
+            envelope = original()
+            envelope["app"]["id"] = "99999999-9999-4999-8999-999999999999"
+            return envelope
+
+        fake.app_envelope = other_app  # type: ignore[method-assign]
+        with self.assertRaisesRegex(common.ReleaseError, "^app-identity-mismatch$"):
+            do_app.observe_stable(client(fake))
 
     def test_requests_carry_the_token_only_in_the_authorization_header(self) -> None:
         fake = support.FakeDO()
@@ -324,6 +413,48 @@ class ReconcileTests(unittest.TestCase):
         with self.assertRaises(do_app.ReconcileTimeout) as caught:
             self.run_reconcile(support.FakeDO(scenarios=["ambiguous-not-applied"]), poll_limit=3)
         self.assertIsNone(caught.exception.deployment_id)
+
+    def test_wall_clock_deadline_ends_reconcile_before_the_poll_count(self) -> None:
+        api = client(support.FakeDO(scenarios=["stall"]))
+        desired = spec_images.set_images(support.make_spec(), support.NEW)
+        api.put_app_once(desired)
+        clock = {"now": 0.0}
+        sleeps: list[float] = []
+
+        def slow_get_clock() -> float:
+            clock["now"] += 100.0  # every check sees 100 s more (slow GETs)
+            return clock["now"]
+
+        with self.assertRaises(do_app.ReconcileTimeout):
+            do_app.reconcile_until_active(
+                api, desired, job_name="rereply-rls-migrate", web_digest=support.NEW["web"],
+                exclude_ids={support.ACTIVE_ID}, sleeper=sleeps.append, poll_limit=90,
+                deadline_seconds=1000, monotonic=slow_get_clock,
+            )
+        self.assertLess(len(sleeps), 15)
+        self.assertEqual(api.put_count(), 1)
+
+    def test_wall_clock_deadline_ends_settle(self) -> None:
+        fake = support.FakeDO()
+        counter = {"n": 0}
+
+        def bump(provider: support.FakeDO, path: str) -> None:
+            if path.endswith(support.APP_ID):
+                counter["n"] += 1
+                provider.updated_at = f"2026-10-04T11:{counter['n'] % 60:02d}:00Z"
+
+        fake.get_hooks.append(bump)
+        clock = {"now": 0.0}
+
+        def ticking() -> float:
+            clock["now"] += 60.0
+            return clock["now"]
+
+        sleeps: list[float] = []
+        with self.assertRaisesRegex(common.ReleaseError, "^post-deploy-guard:not-settled$"):
+            do_app.observe_settled(client(fake), sleeper=sleeps.append, poll_limit=90,
+                                   deadline_seconds=300, monotonic=ticking)
+        self.assertLess(len(sleeps), 10)
 
     def test_migration_failure_at_active_carries_the_candidate(self) -> None:
         fake = support.FakeDO(migration_status="ERROR")

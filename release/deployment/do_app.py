@@ -37,6 +37,14 @@ import spec_images
 
 POLL_LIMIT = 90
 POLL_SECONDS = 10
+GET_TIMEOUT_SECONDS = 20
+PUT_TIMEOUT_SECONDS = 30
+# Wall-clock bounds on top of the reviewed poll counts, so slow (but
+# successful) GETs can never stretch a loop past the production job's
+# timeout-minutes (ship.py production_worst_case_seconds). With normal GETs
+# the poll count ends each loop first (90 x 10 s = 15 min of sleeps).
+RECONCILE_DEADLINE_SECONDS = 1200
+SETTLE_DEADLINE_SECONDS = 300
 USER_AGENT = "rereply-ship/1"
 BACKUPS_QUERY = "page=1&per_page=200"
 DEFINITIVE_REJECTIONS = frozenset({400, 401, 403, 404, 405, 409, 415, 422})
@@ -183,7 +191,7 @@ class DOAppClient:
             },
         )
         try:
-            with self._opener.open(request, timeout=20) as response:
+            with self._opener.open(request, timeout=GET_TIMEOUT_SECONDS) as response:
                 value = self._decode(response, url, {200}, decimals=decimals)
         except common.ReleaseError:
             raise
@@ -234,7 +242,7 @@ class DOAppClient:
         )
         self.request_log.append(("PUT", "app"))
         try:
-            with self._opener.open(request, timeout=30) as response:
+            with self._opener.open(request, timeout=PUT_TIMEOUT_SECONDS) as response:
                 try:
                     return self._decode(response, url, {200}, decimals=False)
                 except common.ReleaseError as exc:
@@ -357,14 +365,20 @@ def observe_settled(
     *,
     sleeper: Callable[[float], None] = time.sleep,
     poll_limit: int = POLL_LIMIT,
+    deadline_seconds: float = SETTLE_DEADLINE_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> Snapshot:
     """apply_production_change.py:258-285: the same equality, retried within a
-    bounded budget while the new deployment settles."""
+    bounded budget (poll count and wall clock) while the new deployment
+    settles."""
+    deadline = monotonic() + deadline_seconds
     for attempt in range(poll_limit):
         first, second = _double_read(client)
         if first == second:
             return first
         if attempt + 1 < poll_limit:
+            if monotonic() >= deadline:
+                break
             sleeper(POLL_SECONDS)
     common.fail("post-deploy-guard:not-settled")
 
@@ -500,11 +514,14 @@ def reconcile_until_active(
     exclude_ids: Iterable[str] = (),
     sleeper: Callable[[float], None] = time.sleep,
     poll_limit: int = POLL_LIMIT,
+    deadline_seconds: float = RECONCILE_DEADLINE_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[Any, Any, bool, str]:
     """apply_production_change.py:395-428. ERROR/CANCELED raises
-    TerminalDeployment, the deadline raises ReconcileTimeout, a failed
-    migration at ACTIVE raises PostDeployGuard."""
+    TerminalDeployment, the deadline (poll count or wall clock) raises
+    ReconcileTimeout, a failed migration at ACTIVE raises PostDeployGuard."""
     excluded = frozenset(exclude_ids)
+    deadline = monotonic() + deadline_seconds
     candidate_id: str | None = None
     for attempt in range(poll_limit):
         app_response = client.get_app()
@@ -540,6 +557,8 @@ def reconcile_until_active(
                     raise
                 return app_response, deployment_response, client.mutation_ambiguous, candidate_id
         if attempt + 1 < poll_limit:
+            if monotonic() >= deadline:
+                break
             sleeper(POLL_SECONDS)
     raise ReconcileTimeout("reconcile-timeout", candidate_id)
 

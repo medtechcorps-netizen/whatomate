@@ -79,6 +79,31 @@ class PlanTests(StageCase):
         self.h.gh.ci_runs["e2e-tests.yml"] = []
         self.assertEqual(self.plan(), ship.EXIT_REFUSED)
 
+    def test_approval_gate_must_be_configured_before_anyone_approves(self) -> None:
+        for label, mutate in support.APPROVAL_GATE_MUTATIONS.items():
+            for mode, target in (("promote", ""), ("dry-run", ""), ("rollback", "prod-0000")):
+                with self.subTest(case=label, mode=mode):
+                    self.h.gh = support.FakeGh()
+                    self.h.gh.ci_green(self.head)
+                    mutate(self.h.gh)
+                    self.h.stdout.truncate(0)
+                    self.h.stdout.seek(0)
+                    self.assertEqual(self.plan(mode, target), ship.EXIT_REFUSED)
+                    self.assertIn("refused: approval-gate-misconfigured", self.h.text())
+                    self.assert_clean_output()
+        self.h.gh = support.FakeGh()
+        self.h.gh.ci_green(self.head)
+        self.assertEqual(self.plan(), ship.EXIT_OK, self.h.text())
+        self.assertIn("Approval gate: environment production requires the owner's review", self.h.summary())
+
+    def test_approval_gate_reads_only_the_environment(self) -> None:
+        self.assertEqual(self.plan(), ship.EXIT_OK, self.h.text())
+        paths = [argv[-1] for argv, _ in self.h.gh.calls if argv[1:2] == ["api"]]
+        self.assertIn(f"/repos/{common.REPOSITORY}/environments/production", paths)
+        self.assertIn(f"/repos/{common.REPOSITORY}/environments/production/deployment-branch-policies?per_page=100", paths)
+        self.assertFalse(any("/approvals" in path for path in paths))
+        self.assertFalse(any("pending_deployments" in " ".join(argv) for argv, _ in self.h.gh.calls))
+
     def test_ci_gate_is_skipped_for_rollback(self) -> None:
         self.h.gh.ci_runs = {"test.yml": [], "e2e-tests.yml": []}
         self.assertEqual(self.plan("rollback", "prod-0000"), ship.EXIT_OK, self.h.text())
@@ -371,7 +396,8 @@ class CandidateStageTests(StageCase):
         self.assertEqual(len(verify), 9)
         self.assertEqual(sum("--bundle" in argv for argv in verify), 6)
         for argv in verify:
-            self.assertIn(f"{common.REPOSITORY}/.github/workflows/ship.yml", argv)
+            self.assertIn(f"https://github.com/{common.REPOSITORY}/.github/workflows/ship.yml@refs/heads/main", argv)
+            self.assertNotIn("--signer-workflow", argv)
             self.assertEqual(argv[argv.index("--signer-digest") + 1], self.head)
             self.assertEqual(argv[argv.index("--source-digest") + 1], self.head)
 
