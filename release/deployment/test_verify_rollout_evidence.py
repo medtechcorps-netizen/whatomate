@@ -36,6 +36,14 @@ DATABASE_PHASE_HARNESS_PATH = (
 )
 CONTROL_SHA = "a" * 40
 EXPECTED_FINAL_SOURCE = {
+    "source_sha": "c482dbbc287ae29ea0f6fe11081d4cc16d8ca525",
+    "root_tree": "f890fecb24d34648d5f978f12141d12a46fbe9b5",
+    "frontend_tree": "4e2add53f07fd7e0d0391614b80260d4d84e3fcf",
+    "internal_tree": "b032214101b463cc42a7949893ed2804d455019f"
+}
+# The ui source production runs (signed 2026-10-02, phase state d2839f33) and
+# the sole parent of EXPECTED_FINAL_SOURCE.
+LIVE_UI_PHASE_SOURCE = {
     "source_sha": "6f25ea1919ee28856dee59d5fd121671214087e3",
     "root_tree": "2a2c14e83f4524d860a65a8735c16111178e7fd3",
     "frontend_tree": "4e027a24fcb34c2b4951d2c628dd63a3c67cc87e",
@@ -120,6 +128,28 @@ REVIEWED_DEPENDENCY_REFRESH_BLOBS = {
     }
     for phase in ("baseline", "bridge", "backend", "ui")
 }
+# 2026-10-01 dependency-refresh children. Baseline, bridge and backend are the
+# manifest sources; the ui child 6f25ea19 is the parent of the 2026-10-02
+# reviewed ui release child.
+DEPENDENCY_REFRESH_PHASE_SOURCE_SHA = {
+    "baseline": "0267981e3396178a8b343fd7a091ca98f631d0f4",
+    "bridge": "0804f91e4f40065406e9343149b578133519a962",
+    "backend": "78632dc4ff23e10bf8b78abb543b14dce511bca3",
+    "ui": LIVE_UI_PHASE_SOURCE["source_sha"],
+}
+# 2026-10-02 ui release child: 6f25ea19 plus the complete diffs of
+# claude/ui-ux-20261001 @ fd13dbae and claude/backend-fixes-20261001 @ 527e36a2
+# (disjoint paths). The complete full-blob/mode record inventory is pinned.
+REVIEWED_UI_RELEASE_CHILD_DIFF_SHA256 = (
+    "d66808e9df64506016ab3646769ebe0205bdf797a61150021a9b4b65ccbb8be0"
+)
+REVIEWED_UI_RELEASE_CHILD_PATH_COUNT = 68
+# Paths the ui release child must leave byte-identical to its parent.
+UI_RELEASE_CHILD_FROZEN_PATHS = (
+    "go.mod", "go.sum", "frontend/package.json", "frontend/package-lock.json",
+    "internal/database", "internal/frontend", "cmd", "docker", "release",
+    ".github", "frontend/src/views/channels/ChannelsView.test.ts",
+)
 REVIEWED_SNAPSHOT_DIFF_SHA256 = {
     "baseline": "89853139e27533073431fa59744187dba525a555984e73ba0da298f4d54bdcdc",
     "bridge": "26fb15a3362cf13f8cb0435266a578c80be962e6980b99c4dee11c964fd946e5",
@@ -172,6 +202,17 @@ def require_reviewed_snapshot_diff(phase: str, raw: bytes) -> list[dict[str, str
     if (len(records) != REVIEWED_SNAPSHOT_PATH_COUNTS[phase]
             or hashlib.sha256(canonical).hexdigest() != REVIEWED_SNAPSHOT_DIFF_SHA256[phase]):
         raise AssertionError("reviewed complete snapshot inventory differs")
+    return records
+
+
+def require_reviewed_ui_release_child(raw: bytes) -> list[dict[str, str]]:
+    records = snapshot_diff_records(raw)
+    canonical = json.dumps(
+        records, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    if (len(records) != REVIEWED_UI_RELEASE_CHILD_PATH_COUNT
+            or hashlib.sha256(canonical).hexdigest() != REVIEWED_UI_RELEASE_CHILD_DIFF_SHA256):
+        raise AssertionError("reviewed ui release child inventory differs")
     return records
 
 
@@ -315,6 +356,7 @@ class RolloutEvidenceTests(unittest.TestCase):
             manifest_phases,
         )
         self.assertNotEqual(manifest_phases["ui"], STALE_FINAL_SOURCE)
+        self.assertNotEqual(manifest_phases["ui"], LIVE_UI_PHASE_SOURCE)
 
     def test_phase_sources_apply_only_the_reviewed_fixed_snapshot(self) -> None:
         for phase in verifier.PHASES:
@@ -401,9 +443,11 @@ class RolloutEvidenceTests(unittest.TestCase):
                     )
 
     def test_phase_sources_apply_only_the_reviewed_dependency_refresh(self) -> None:
-        for phase, source in self.manifest["phases"].items():
+        for phase, commit in DEPENDENCY_REFRESH_PHASE_SOURCE_SHA.items():
             with self.subTest(phase=phase):
-                commit = source["source_sha"]
+                source = (LIVE_UI_PHASE_SOURCE if phase == "ui"
+                          else self.manifest["phases"][phase])
+                self.assertEqual(source["source_sha"], commit)
                 parent = NAME_FIX_PHASE_SOURCE_SHA[phase]
 
                 def git(*arguments: str) -> bytes:
@@ -447,6 +491,63 @@ class RolloutEvidenceTests(unittest.TestCase):
                     self.assertNotEqual(mutant, raw)
                     with self.assertRaises(AssertionError):
                         require_reviewed_dependency_refresh(phase, mutant)
+
+    def test_ui_release_source_applies_only_the_reviewed_release_child(self) -> None:
+        commit = self.manifest["phases"]["ui"]["source_sha"]
+        parent = LIVE_UI_PHASE_SOURCE["source_sha"]
+        self.assertEqual(commit, EXPECTED_FINAL_SOURCE["source_sha"])
+
+        def git(*arguments: str) -> bytes:
+            return subprocess.run(
+                ["git", "-C", str(ROOT), *arguments],
+                check=True, capture_output=True,
+            ).stdout
+
+        self.assertEqual(
+            git("rev-list", "--parents", "-n", "1", commit).decode().split(),
+            [commit, parent],
+        )
+        for key in ("root_tree", "frontend_tree", "internal_tree"):
+            self.assertEqual(
+                git("rev-parse", f"{parent}^{{tree}}" if key == "root_tree"
+                    else f"{parent}:{key.split('_')[0]}").decode().strip(),
+                LIVE_UI_PHASE_SOURCE[key],
+            )
+        raw = git("diff-tree", "--no-commit-id", "--raw", "--no-abbrev",
+                  "--no-renames", "-r", "-z", parent, commit)
+        records = require_reviewed_ui_release_child(raw)
+        self.assertTrue(all(
+            (record["status"], record["old_mode"], record["new_mode"]) in (
+                ("M", "100644", "100644"), ("A", "000000", "100644"))
+            for record in records
+        ))
+        self.assertTrue(all(
+            record["path"].startswith(("docs/", "frontend/src/", "frontend/e2e/",
+                                       "internal/handlers/", "internal/contactutil/",
+                                       "pkg/whatsapp/"))
+            for record in records
+        ))
+        for frozen in UI_RELEASE_CHILD_FROZEN_PATHS:
+            with self.subTest(frozen=frozen):
+                self.assertEqual(git("rev-parse", f"{commit}:{frozen}"),
+                                 git("rev-parse", f"{parent}:{frozen}"))
+        # Complete-record mutations: blob, mode, path, missing and extra records.
+        fields = raw[:-1].split(b"\0")
+        header = fields[0].split(b" ")
+        changed_header = list(header)
+        changed_header[3] = (b"1" if header[3][:1] == b"0" else b"0") + header[3][1:]
+        mutants = (
+            b"\0".join([b" ".join(changed_header), *fields[1:]]) + b"\0",
+            b":100755" + raw[7:],
+            b"\0".join([fields[0], b"frontend/unexpected.ts", *fields[2:]]) + b"\0",
+            b"\0".join(fields[2:]) + b"\0",
+            raw + b":100644 100644 " + b"0" * 40 + b" " + b"1" * 40
+            + b" M\0internal/database/postgres.go\0",
+        )
+        for mutant in mutants:
+            self.assertNotEqual(mutant, raw)
+            with self.assertRaises(AssertionError):
+                require_reviewed_ui_release_child(mutant)
 
     def test_phase_sources_apply_only_the_reviewed_dependency_remediation(self) -> None:
         for phase, source in self.manifest["phases"].items():
@@ -1356,6 +1457,22 @@ COMMITTED_LIVE_EVIDENCE_SHA256 = {
         "24da719a2976eb6eedffa0280730da3d1ac4a215ac812189f361a64c6a92d664",
     "production-phase-apply-receipt-36847681114-1.sha256":
         "8c790cfb23ea74eb5b47738d58e7291d7f5ffd1ef639ec0194d87765d296193b",
+    "production-phase-apply-receipt-36951366794-1.json":
+        "7e5d67f96395af4f5b5b4297e5c01addbc3107877b1ed817520d00bc972cdabd",
+    "production-phase-apply-receipt-36951366794-1.predicate-receipt-v1.sigstore.json":
+        "35046652b31e92308269da287e89b517327b054fc18ea3d40e52745141136b00",
+    "production-phase-apply-receipt-36951366794-1.predicate-slsa-provenance-v1.sigstore.json":
+        "8cf5a134544a9422ff06e020b7dbb155d7a619820fbbc91e0766dd42bf746aa6",
+    "production-phase-apply-receipt-36951366794-1.sha256":
+        "e2f99923723853cd8b5a3ca3ab17ccfc8fc0bbbe5e195d5c9afcf3fb8f9e1995",
+    "production-phase-state-36951942755-1.json":
+        "d2839f338f6c4bc1cd78d2f13a32cdfa7097511c51e40245562e9fce212249ac",
+    "production-phase-state-36951942755-1.predicate-phase-state-v1.sigstore.json":
+        "ba1abacd8498bc796e228331f54d3b4242319c17ec8d20358dcd7edea5deede0",
+    "production-phase-state-36951942755-1.predicate-slsa-provenance-v1.sigstore.json":
+        "9aff2e49838521a13322500348def8075761de0781b94cfbcd21a505781303e8",
+    "production-phase-state-36951942755-1.sha256":
+        "c43294630f596da9ae9516858ad9d23297695427e9134d4f78d8fbb61f4111f9",
 }
 
 
@@ -1368,29 +1485,41 @@ class LiveEvidenceHistoryTests(unittest.TestCase):
 
     def test_genesis_reentry_source_descends_from_the_live_phase_source(self) -> None:
         # A re-entry target must never be older code than the phase already live.
-        # Re-applying the live source itself (re-entry at the accepted ui') is
-        # allowed; any other target must strictly descend from it.
+        # Re-applying the live source itself is allowed; any other target (the
+        # next ui phase-source child, once UI_TARGET_SOURCE_SHA moves to it) must
+        # strictly descend from it. Nothing here pins either SHA: the live source
+        # comes from the committed evidence the contract binds, the target from
+        # the reviewed source manifest.
         import verify_production_plan as plan_verifier
 
-        live_source = plan_verifier.BOOTSTRAP_LIVE_EVIDENCE["phase_source_sha"]
-        self.assertEqual(live_source, EXPECTED_FINAL_SOURCE["source_sha"])
-        self.assertEqual(plan_verifier.UI_TARGET_SOURCE_SHA, EXPECTED_FINAL_SOURCE["source_sha"])
-        ancestry = self.git("merge-base", "--is-ancestor", live_source,
-                            plan_verifier.UI_TARGET_SOURCE_SHA, check=False)
-        self.assertEqual(ancestry.returncode, 0, ancestry.stderr.decode(errors="replace"))
-        if live_source != plan_verifier.UI_TARGET_SOURCE_SHA:
-            reverse = self.git("merge-base", "--is-ancestor", plan_verifier.UI_TARGET_SOURCE_SHA,
-                               live_source, check=False)
-            self.assertEqual(reverse.returncode, 1)
-        # Every committed receipt's source is the target or one of its ancestors.
+        evidence = plan_verifier.BOOTSTRAP_LIVE_EVIDENCE
         directory = ROOT / "release" / "deployment" / "live-evidence"
-        for path in sorted(directory.glob("production-phase-apply-receipt-*.json")):
-            if path.name.endswith(".sigstore.json"):
-                continue
+        prefix = {
+            "accepted-unsigned-apply-receipt": "production-phase-apply-receipt",
+            "signed-phase-state": "production-phase-state",
+        }[evidence["kind"]]
+        bound = json.loads((directory / f"{prefix}-{evidence['run_id']}-{evidence['run_attempt']}.json").read_bytes())
+        live_source = evidence["phase_source_sha"]
+        self.assertEqual(live_source, bound["lineage"]["phase_source_sha"])
+        manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        target = plan_verifier.UI_TARGET_SOURCE_SHA
+        self.assertEqual(target, manifest["phases"]["ui"]["source_sha"])
+        for commit in (live_source, target):
+            self.assertEqual(self.git("cat-file", "-t", commit).stdout.strip(), b"commit")
+        ancestry = self.git("merge-base", "--is-ancestor", live_source, target, check=False)
+        self.assertEqual(ancestry.returncode, 0, ancestry.stderr.decode(errors="replace"))
+        if live_source != target:
+            reverse = self.git("merge-base", "--is-ancestor", target, live_source, check=False)
+            self.assertEqual(reverse.returncode, 1)
+        # Every committed receipt's and phase state's source is the target or
+        # one of its ancestors.
+        documents = [path for path in sorted(directory.glob("production-phase-*.json"))
+                     if not path.name.endswith(".sigstore.json")]
+        self.assertTrue(any(path.name.startswith("production-phase-state-") for path in documents))
+        for path in documents:
             source = json.loads(path.read_bytes())["lineage"]["phase_source_sha"]
             with self.subTest(evidence=path.name):
-                result = self.git("merge-base", "--is-ancestor", source,
-                                  plan_verifier.UI_TARGET_SOURCE_SHA, check=False)
+                result = self.git("merge-base", "--is-ancestor", source, target, check=False)
                 self.assertEqual(result.returncode, 0)
         self.assertEqual(NAME_FIX_PHASE_SOURCE_SHA["ui"], STALE_FINAL_SOURCE["source_sha"])
 

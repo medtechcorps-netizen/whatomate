@@ -84,7 +84,7 @@ BASELINE_TARGET_SOURCE_SHA = "0267981e3396178a8b343fd7a091ca98f631d0f4"
 # A genesis activation has no signed predecessor phase state, so the source of
 # each reviewed genesis target is pinned here as well as by the capsule's
 # reviewed source manifest (release/exact-sources.json).
-UI_TARGET_SOURCE_SHA = "6f25ea1919ee28856dee59d5fd121671214087e3"
+UI_TARGET_SOURCE_SHA = "c482dbbc287ae29ea0f6fe11081d4cc16d8ca525"
 # The live phases a re-baselined (digest-images) bootstrap may carry, and so the
 # only phases a digest-mode genesis activation may enter: exactly the
 # bootstrap's live phase. Production has run ui (2026-10-01 re-entry onto the
@@ -93,11 +93,13 @@ UI_TARGET_SOURCE_SHA = "6f25ea1919ee28856dee59d5fd121671214087e3"
 # enters at PHASES[0] (baseline); see genesis_target_phase.
 GENESIS_ENTRY_PHASES = ("ui",)
 # The production bootstrap is the state the platform is actually in. It was
-# re-baselined on 2026-09-18 onto the already-applied baseline phase and on
-# 2026-10-01 onto the already-applied ui phase (control c4cdac90), so it
-# carries immutable image authority instead of the retired legacy git sources.
+# re-baselined on 2026-09-18 onto the already-applied baseline phase, on
+# 2026-10-01 onto the already-applied ui phase (controls c4cdac90, then
+# 283e7954) and on 2026-10-02 onto the signed ui phase (control 02231089), so
+# it carries immutable image authority instead of the retired legacy git
+# sources.
 BOOTSTRAP_DEPLOYMENT_ID_SHA256 = (
-    "de43812c679b9093711e324ff6f184a0b8ebfe369b14585e8762c85a65b95320"
+    "b95ce75e0302452e44b29812de5d54549d2dbf33d43d77359013eb7c1da53818"
 )
 # Historical, already-applied production source. A rebaseline must not rewrite
 # the observed bootstrap identity; the live phase's own source is recorded in
@@ -108,57 +110,62 @@ BOOTSTRAP_IMAGES = [
     {
         "component": 'web',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-web',
-        "digest": 'sha256:7d2cb185c757c3065701fa0752e7cd4f393f6ab28f95ba163bc222c502f583aa',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-web@sha256:7d2cb185c757c3065701fa0752e7cd4f393f6ab28f95ba163bc222c502f583aa',
+        "digest": 'sha256:7a4a186cfbb657d62bb1afc3c3c3c862d907a70aa6c82a1f510af8569fea6e23',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-web@sha256:7a4a186cfbb657d62bb1afc3c3c3c862d907a70aa6c82a1f510af8569fea6e23',
     },
     {
         "component": 'meta-relay',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay',
-        "digest": 'sha256:73ca628cebc61adbb21585f1b7c77fa552b5e4013252147a1965337c0e9491c9',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:73ca628cebc61adbb21585f1b7c77fa552b5e4013252147a1965337c0e9491c9',
+        "digest": 'sha256:400d21f6b7dedd6b3b174aaa7f1b9e77ac8c5a7d8c4004803aa649966528808f',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-meta-relay@sha256:400d21f6b7dedd6b3b174aaa7f1b9e77ac8c5a7d8c4004803aa649966528808f',
     },
     {
         "component": 'gmail-relay',
         "repository": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay',
-        "digest": 'sha256:449e79e14d9488ebb2eaf12fc89a6d3ec75391ed089c28a7421e3ebd419804bf',
-        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:449e79e14d9488ebb2eaf12fc89a6d3ec75391ed089c28a7421e3ebd419804bf',
+        "digest": 'sha256:4a975aaf0cab069dfb96c02888f66df49c2e916ca399fc9faba74109fcd4540a',
+        "subject": 'ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay@sha256:4a975aaf0cab069dfb96c02888f66df49c2e916ca399fc9faba74109fcd4540a',
     },
 ]
 BOOTSTRAP_CANONICAL_SPEC_SHA256 = (
-    "7549c0029636f80cb7ef31b1b9400f2be48e9f6b9f6ea460562accb6dc133185"
+    "9b6e8bd6f1c1ac451d4e2e8f3583d8d6ae3af11a60e1cf0f60182d951ad96011"
 )
 # Genesis is phase-less, so the phase production runs is pinned here. The ui
-# phase applied at control c4cdac90 (receipt de742cb5) can never be signed: its
-# canary failed on a fixture-reader defect (fixed by #203) before any CRM call,
-# and a phase state is valid only at its own control. It is accepted from its
-# attested apply receipt. This evidence is static data bound into the genesis
-# hash; it is never fetched (the receipt artifact expires 2026-10-07). The
-# receipt bytes and both of its attestation bundles are committed as test-only
-# evidence next to this verifier (runtime controls never read them). Every
-# committed evidence file stays committed, and the live phase may never fall
-# below the highest phase that committed evidence records.
+# phase applied at control 02231089 (apply run 36951366794, receipt 7e5d67f9)
+# passed its canary and was signed by run 36951942755 (phase state d2839f33).
+# A phase state is valid only at its own control and ui is terminal, so the
+# next release cannot chain from it and rebaselines onto it instead. This
+# evidence is static data bound into the genesis hash; it is never fetched (the
+# phase-state artifact expires 2026-11-01). The phase state, its change receipt
+# and both attestation bundles of each are committed as test-only evidence next
+# to this verifier (runtime controls never read them). Every committed evidence
+# file stays committed, and the live phase may never fall below the highest
+# phase that committed evidence records.
 BOOTSTRAP_LIVE_PHASE = "ui"
 BOOTSTRAP_LIVE_EVIDENCE = {
-    "kind": "accepted-unsigned-apply-receipt",
+    "kind": "signed-phase-state",
     "phase": "ui",
-    "workflow_path": ".github/workflows/apply-production-phase.yml",
-    "control_sha": "283e795471b3aee04766f52debc6bd27fea0c3dc",
-    "run_id": "36847681114",
+    "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
+    "control_sha": "02231089dc72476fe36c313ce6d4a9256204cdc5",
+    "run_id": "36951942755",
     "run_attempt": 1,
-    "artifact_id": "11154606940",
-    "artifact_name": "production-phase-apply-36847681114-1",
+    "artifact_id": "11204383551",
+    "artifact_name": "production-phase-state-36951942755-1",
     "artifact_digest": (
-        "sha256:7159b8e24461b7ceac5c5665e15a41f8fa51075a77aff5d3bdb64bdb6fd6cb7d"
+        "sha256:f5fca0ccdb6639631ca34387f7f43129cfce3d38fe0cd453e4b4f12d6630f855"
     ),
-    "predicate_type": (
-        "https://rereply.app/attestations/production-phase-apply-receipt/v1"
-    ),
-    "receipt_sha256": (
-        "54a02d3eb5c26328a5ae7f13c1827581504b3ed259dd091e53fc59372cce5c4b"
+    "predicate_type": "https://rereply.app/attestations/production-phase-state/v1",
+    "phase_state_sha256": (
+        "d2839f338f6c4bc1cd78d2f13a32cdfa7097511c51e40245562e9fce212249ac"
     ),
     "phase_source_sha": "6f25ea1919ee28856dee59d5fd121671214087e3",
+    "change_receipt_sha256": (
+        "7e5d67f96395af4f5b5b4297e5c01addbc3107877b1ed817520d00bc972cdabd"
+    ),
     "receipt_predecessor_state_sha256": (
-        "b7892b2caaaf66ef132791b19c2a69dc200b40197a1420f4aae0b207ef0ae793"
+        "38a0ff29e1fde9ee44092643b14ad888110bedabb0196177b553c6f5bbcae875"
+    ),
+    "canary_sha256": (
+        "19984c22139a420de087f30de03ddf5283694d989a5489fc85e621401852f32a"
     ),
 }
 # Static evidence shapes a rebaselined bootstrap may carry for its live phase.

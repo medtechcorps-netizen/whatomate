@@ -191,10 +191,10 @@ EXPECTED_PHASE_SOURCES = {
         "internal_tree": "6db4f94130788bdb236ede130a0601fa7d4163c1"
     },
     "ui": {
-        "source_sha": "6f25ea1919ee28856dee59d5fd121671214087e3",
-        "root_tree": "2a2c14e83f4524d860a65a8735c16111178e7fd3",
-        "frontend_tree": "4e027a24fcb34c2b4951d2c628dd63a3c67cc87e",
-        "internal_tree": "a43572db8ee7e5a7cf2ccaf3e880a181c91ed183"
+        "source_sha": "c482dbbc287ae29ea0f6fe11081d4cc16d8ca525",
+        "root_tree": "f890fecb24d34648d5f978f12141d12a46fbe9b5",
+        "frontend_tree": "4e2add53f07fd7e0d0391614b80260d4d84e3fcf",
+        "internal_tree": "b032214101b463cc42a7949893ed2804d455019f"
     }
 }
 

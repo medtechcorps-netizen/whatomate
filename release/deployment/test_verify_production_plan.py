@@ -2409,7 +2409,7 @@ class ProductionPlanTests(unittest.TestCase):
         self.assertIn("python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v", protected_ci)
 
 
-GENESIS_PIN = "38a0ff29e1fde9ee44092643b14ad888110bedabb0196177b553c6f5bbcae875"
+GENESIS_PIN = "bc8ac0419f4f58c41856e190400180bbf95c9c91e978b99093c140479a4816b5"
 LIVE_EVIDENCE_DIR = ROOT / "release" / "deployment" / "live-evidence"
 REPOSITORY_URL = "https://github.com/medtechcorps-netizen/whatomate"
 SLSA_PREDICATE = "https://slsa.dev/provenance/v1"
@@ -2423,14 +2423,48 @@ EVIDENCE_AUTHORITIES = {
         "subject": "production-phase-apply-receipt.json",
         "workflow_path": ".github/workflows/apply-production-phase.yml",
         "predicate_type": "https://rereply.app/attestations/production-phase-apply-receipt/v1",
+        "bundle": "predicate-receipt-v1",
     },
     "production-phase-state": {
         "prefix": "production-phase-state",
         "subject": "production-phase-state.json",
         "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
         "predicate_type": "https://rereply.app/attestations/production-phase-state/v1",
+        "bundle": "predicate-phase-state-v1",
     },
 }
+# Every genesis an epoch has started from, oldest first. A committed apply
+# receipt that activated from genesis must name one of them, and the bound live
+# evidence's receipt predecessor is the newest: the epoch this contract leaves.
+PREVIOUS_GENESIS_PINS = (
+    "b7892b2caaaf66ef132791b19c2a69dc200b40197a1420f4aae0b207ef0ae793",
+    "38a0ff29e1fde9ee44092643b14ad888110bedabb0196177b553c6f5bbcae875",
+)
+# The exact-file hash key that names the bound document, per live-evidence kind.
+LIVE_EVIDENCE_DOCUMENT_HASH = {
+    "accepted-unsigned-apply-receipt": "receipt_sha256",
+    "signed-phase-state": "phase_state_sha256",
+}
+
+
+def bound_live_evidence_documents(documents: dict[str, dict[str, object]],
+                                  evidence: dict[str, object]) -> list[tuple[str, dict[str, object]]]:
+    """The committed documents the static live evidence names, as (stem, document).
+
+    An accepted unsigned receipt names one document. A signed phase state names
+    itself and its change receipt, which the state binds only by hash.
+    """
+    wanted = [evidence[LIVE_EVIDENCE_DOCUMENT_HASH[evidence["kind"]]]]
+    if evidence["kind"] == "signed-phase-state":
+        wanted.append(evidence["change_receipt_sha256"])
+    result = []
+    for digest in wanted:
+        matches = [(name.removesuffix(".json"), document) for name, document in documents.items()
+                   if document["sha256"] == digest]
+        if len(matches) != 1:
+            raise AssertionError("bound live evidence is not committed exactly once")
+        result.append(matches[0])
+    return result
 
 
 def reentry_fixture(test: unittest.TestCase, live_phase: object) -> "ProductionPlanTests":
@@ -2881,8 +2915,12 @@ class GenesisReentryTests(unittest.TestCase):
                 tampered["bootstrap_state"]["live_evidence"]["phase"] = phase
                 with self.assertRaisesRegex(verifier.PlanError, "bootstrap live phase differs"):
                     verifier.validate_contract(reseal(tampered))
+        document_hash = LIVE_EVIDENCE_DOCUMENT_HASH[verifier.BOOTSTRAP_LIVE_EVIDENCE["kind"]]
         cases = (
-            ("receipt hash", lambda e: e.__setitem__("receipt_sha256", "0" * 64), "bootstrap live-state evidence differs"),
+            ("document hash", lambda e: e.__setitem__(document_hash, "0" * 64), "bootstrap live-state evidence differs"),
+            ("other kind's hash key", lambda e: e.__setitem__(
+                "receipt_sha256" if document_hash != "receipt_sha256" else "phase_state_sha256", "0" * 64),
+             "bootstrap live-state evidence keys differ"),
             ("evidence phase", lambda e: e.__setitem__("phase", "backend"), "bootstrap live-state evidence phase differs"),
             ("evidence kind", lambda e: e.__setitem__("kind", "owner-smoke-test"), "bootstrap live-state evidence kind differs"),
             ("extra key", lambda e: e.__setitem__("url", "https://example.invalid"), "bootstrap live-state evidence keys differ"),
@@ -2907,6 +2945,26 @@ class GenesisReentryTests(unittest.TestCase):
 
     def test_live_evidence_shapes_are_exact(self) -> None:
         verifier.validate_live_evidence(copy.deepcopy(verifier.BOOTSTRAP_LIVE_EVIDENCE), "ui")
+        self.assertEqual(set(verifier.LIVE_EVIDENCE_SHAPES), set(LIVE_EVIDENCE_DOCUMENT_HASH))
+        # Both kinds stay valid shapes whichever one the bootstrap carries today.
+        unsigned = {
+            "kind": "accepted-unsigned-apply-receipt", "phase": "ui",
+            "workflow_path": ".github/workflows/apply-production-phase.yml",
+            "control_sha": "a" * 40, "run_id": "123", "run_attempt": 1, "artifact_id": "456",
+            "artifact_name": "production-phase-apply-123-1", "artifact_digest": "sha256:" + "b" * 64,
+            "predicate_type": "https://rereply.app/attestations/production-phase-apply-receipt/v1",
+            "receipt_sha256": "c" * 64, "phase_source_sha": "d" * 40,
+            "receipt_predecessor_state_sha256": "1" * 64,
+        }
+        verifier.validate_live_evidence(copy.deepcopy(unsigned), "ui")
+        self.assertEqual(set(verifier.LIVE_EVIDENCE_SHAPES["accepted-unsigned-apply-receipt"]["keys"]), set(unsigned))
+        for label, key, value in (
+            ("artifact prefix", "artifact_name", "production-phase-state-123-1"),
+            ("workflow", "workflow_path", ".github/workflows/verify-production-crm-canary.yml"),
+            ("canary key", "canary_sha256", "2" * 64),
+        ):
+            with self.subTest(unsigned=label), self.assertRaises(verifier.PlanError):
+                verifier.validate_live_evidence({**copy.deepcopy(unsigned), key: value}, "ui")
         signed = {
             "kind": "signed-phase-state", "phase": "ui",
             "workflow_path": ".github/workflows/verify-production-crm-canary.yml",
@@ -2938,25 +2996,52 @@ class GenesisReentryTests(unittest.TestCase):
         with self.assertRaises(verifier.PlanError):
             verifier.validate_live_evidence(copy.deepcopy(signed), "backend")
 
-    def test_live_evidence_matches_the_committed_attested_receipt(self) -> None:
+    def test_live_evidence_matches_the_committed_attested_evidence(self) -> None:
+        # Kind-generic: the contract's static evidence binds committed bytes
+        # whichever reviewed kind the current rebaseline used.
         documents = classify_live_evidence(LIVE_EVIDENCE_DIR)
         bootstrap = verifier.load_json(CONTRACT_PATH, "contract")["bootstrap_state"]
         self.assertEqual(bootstrap["live_evidence"], verifier.BOOTSTRAP_LIVE_EVIDENCE)
         document = bind_live_evidence(verifier.BOOTSTRAP_LIVE_EVIDENCE, bootstrap, documents)
         evidence = verifier.BOOTSTRAP_LIVE_EVIDENCE
-        self.assertEqual(document["sha256"], evidence["receipt_sha256"])
+        kind = evidence["kind"]
+        self.assertEqual(document["sha256"], evidence[LIVE_EVIDENCE_DOCUMENT_HASH[kind]])
         self.assertEqual(document["value"]["lineage"]["phase"], verifier.BOOTSTRAP_LIVE_PHASE)
-        for key, mutation, message in (
-            ("receipt_sha256", "0" * 64, "committed apply receipt hash differs"),
-            ("receipt_predecessor_state_sha256", "0" * 64, "committed apply receipt predecessor differs"),
+        # The epoch link: the live phase was applied from the previous genesis.
+        self.assertEqual(evidence["receipt_predecessor_state_sha256"], PREVIOUS_GENESIS_PINS[-1])
+        self.assertNotEqual(evidence["receipt_predecessor_state_sha256"], bootstrap["genesis_state_sha256"])
+        self.assertNotIn(bootstrap["genesis_state_sha256"], PREVIOUS_GENESIS_PINS)
+        for item in documents.values():
+            lineage = item["value"]["lineage"]
+            if item["authority"] == "production-phase-apply-receipt" and lineage["predecessor_kind"] == "genesis":
+                with self.subTest(genesis_receipt=item["sha256"][:8]):
+                    self.assertIn(lineage["predecessor_state_sha256"], PREVIOUS_GENESIS_PINS)
+        missing_run = str(int(evidence["run_id"]) + 1)
+        if kind == "signed-phase-state":
+            cases = (
+                ("phase_state_sha256", "0" * 64, "committed phase state hash differs"),
+                ("change_receipt_sha256", "0" * 64, "committed phase state evidence differs"),
+                ("canary_sha256", "0" * 64, "committed phase state evidence differs"),
+                ("receipt_predecessor_state_sha256", "0" * 64, "committed change receipt differs"),
+                ("run_id", missing_run, "committed phase state is missing"),
+            )
+            artifact_prefix = "production-phase-state"
+        else:
+            cases = (
+                ("receipt_sha256", "0" * 64, "committed apply receipt hash differs"),
+                ("receipt_predecessor_state_sha256", "0" * 64, "committed apply receipt predecessor differs"),
+                ("run_id", missing_run, "committed apply receipt is missing"),
+            )
+            artifact_prefix = "production-phase-apply"
+        cases += (
             ("phase_source_sha", "0" * 40, "committed live evidence source differs"),
             ("control_sha", "0" * 40, "committed live evidence control differs"),
-            ("run_id", "36773451427", "committed apply receipt is missing"),
-        ):
+        )
+        for key, mutation, message in cases:
             with self.subTest(evidence=key):
                 tampered = {**copy.deepcopy(evidence), key: mutation}
                 if key == "run_id":
-                    tampered["artifact_name"] = f"production-phase-apply-{mutation}-1"
+                    tampered["artifact_name"] = f"{artifact_prefix}-{mutation}-1"
                 with self.assertRaisesRegex(AssertionError, message):
                     bind_live_evidence(tampered, bootstrap, documents)
         for key in ("active_deployment_id_sha256", "canonical_spec_sha256", "images"):
@@ -2966,29 +3051,39 @@ class GenesisReentryTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "provider state differs from the bootstrap"):
                     bind_live_evidence(evidence, tampered, documents)
 
-    def test_attestation_bundles_bind_the_committed_receipt(self) -> None:
+    def test_attestation_bundles_bind_the_committed_evidence(self) -> None:
         import verify_production_release as release
 
         evidence = verifier.BOOTSTRAP_LIVE_EVIDENCE
-        stem = f"production-phase-apply-receipt-{evidence['run_id']}-{evidence['run_attempt']}"
         documents = classify_live_evidence(LIVE_EVIDENCE_DIR)
-        # Older committed evidence stays committed beside the current receipt.
-        self.assertLessEqual({
-            stem + ".json",
-            stem + ".predicate-receipt-v1.sigstore.json",
-            stem + ".predicate-slsa-provenance-v1.sigstore.json",
-            stem + ".sha256",
-        }, {path.name for path in LIVE_EVIDENCE_DIR.iterdir()})
-        document = documents[stem + ".json"]
-        self.assertEqual(set(document["statements"]), {SLSA_PREDICATE, evidence["predicate_type"]})
-        for statement in document["statements"].values():
-            self.assertEqual(statement["subject"], [{
-                "name": "production-phase-apply-receipt.json",
-                "digest": {"sha256": evidence["receipt_sha256"]},
-            }])
-        custom = document["statements"][evidence["predicate_type"]]["predicate"]
-        self.assertEqual(release.canonical_file_bytes(custom), document["raw"])
+        bound = bound_live_evidence_documents(documents, evidence)
+        self.assertEqual(len(bound), 2 if evidence["kind"] == "signed-phase-state" else 1)
+        self.assertEqual(bound[0][1]["value"]["control"]["run_id"], evidence["run_id"])
+        names = {path.name for path in LIVE_EVIDENCE_DIR.iterdir()}
+        stems = []
+        for stem, document in bound:
+            reviewed = EVIDENCE_AUTHORITIES[document["authority"]]
+            with self.subTest(document=stem):
+                # Older committed evidence stays committed beside the current evidence.
+                self.assertLessEqual({
+                    stem + ".json",
+                    f"{stem}.{reviewed['bundle']}.sigstore.json",
+                    stem + ".predicate-slsa-provenance-v1.sigstore.json",
+                    stem + ".sha256",
+                }, names)
+                self.assertEqual(set(document["statements"]), {SLSA_PREDICATE, reviewed["predicate_type"]})
+                for statement in document["statements"].values():
+                    self.assertEqual(statement["subject"], [{
+                        "name": reviewed["subject"], "digest": {"sha256": document["sha256"]},
+                    }])
+                custom = document["statements"][reviewed["predicate_type"]]["predicate"]
+                self.assertEqual(release.canonical_file_bytes(custom), document["raw"])
+            stems.append((stem, f"{stem}.{reviewed['bundle']}.sigstore.json"))
+        self.assertEqual(evidence["predicate_type"], EVIDENCE_AUTHORITIES[bound[0][1]["authority"]]["predicate_type"])
+        for stem, custom_bundle in stems:
+            self._tamper_bound_evidence(release, stem, custom_bundle)
 
+    def _tamper_bound_evidence(self, release, stem: str, receipt_bundle: str) -> None:
         def tamper(*edits):
             with tempfile.TemporaryDirectory(prefix="live-evidence-") as temporary:
                 directory = Path(temporary)
@@ -3032,7 +3127,6 @@ class GenesisReentryTests(unittest.TestCase):
 
         receipt_raw = (LIVE_EVIDENCE_DIR / (stem + ".json")).read_bytes()
         self.assertNotEqual(recanonicalized_receipt(receipt_raw), receipt_raw)
-        receipt_bundle = stem + ".predicate-receipt-v1.sigstore.json"
         slsa_bundle = stem + ".predicate-slsa-provenance-v1.sigstore.json"
         cases = (
             ("subject digest", [(receipt_bundle,
@@ -3062,7 +3156,7 @@ class GenesisReentryTests(unittest.TestCase):
              ], "attestation subject differs"),
         )
         for label, edits, message in cases:
-            with self.subTest(case=label), self.assertRaisesRegex(AssertionError, message):
+            with self.subTest(document=stem, case=label), self.assertRaisesRegex(AssertionError, message):
                 tamper(*edits)
         with tempfile.TemporaryDirectory(prefix="live-evidence-") as temporary:
             directory = Path(temporary)
@@ -3086,10 +3180,26 @@ class GenesisReentryTests(unittest.TestCase):
             with self.subTest(live_phase=lower), mock.patch.object(verifier, "BOOTSTRAP_LIVE_PHASE", lower):
                 with self.assertRaisesRegex(AssertionError, "below the committed live-evidence floor"):
                     require_live_phase_floor(documents)
+        # The floor counts every committed document kind, signed phase states
+        # included, and each one alone already sets the ui floor.
+        self.assertEqual({item["authority"] for item in documents.values()}, set(EVIDENCE_AUTHORITIES))
+        for name, item in documents.items():
+            with self.subTest(document=name):
+                self.assertEqual(require_live_phase_floor({name: item}), verifier.PHASES.index("ui"))
+
+    def test_committed_bundle_names_follow_the_reviewed_convention(self) -> None:
+        # stem.<custom predicate>.sigstore.json and stem.predicate-slsa-provenance-v1.sigstore.json.
+        documents = classify_live_evidence(LIVE_EVIDENCE_DIR)
+        expected = set()
+        for name, item in documents.items():
+            stem = name.removesuffix(".json")
+            expected |= {name, stem + ".sha256", stem + ".predicate-slsa-provenance-v1.sigstore.json",
+                         f"{stem}.{EVIDENCE_AUTHORITIES[item['authority']]['bundle']}.sigstore.json"}
+        self.assertEqual({path.name for path in LIVE_EVIDENCE_DIR.iterdir()}, expected)
 
     def test_signed_phase_state_evidence_binds_committed_state_bytes(self) -> None:
-        # The next rebaseline (onto the signed ui' state) is data-only; this is
-        # the same binder exercised on a synthetic signed re-entry.
+        # The same binder the committed signed ui' evidence uses, exercised on a
+        # synthetic signed re-entry so each mismatch reports its own reason.
         import test_verify_production_release as release_fixtures
         import verify_production_release as release
 
@@ -3195,9 +3305,13 @@ class GenesisReentryTests(unittest.TestCase):
             self.assertIn(f"- **F{incident}. ", section)
         genesis = verifier.genesis_state_sha256(verifier.load_json(CONTRACT_PATH, "contract"))
         self.assertIn(f"`{genesis[:8]}`", section)
-        for value in (evidence["receipt_sha256"], evidence["receipt_predecessor_state_sha256"],
+        # Every hash the current evidence kind records, its source, and the target.
+        hashes = verifier.LIVE_EVIDENCE_SHAPES[evidence["kind"]]["hashes"]
+        for value in (*(evidence[key] for key in hashes),
                       evidence["phase_source_sha"], verifier.UI_TARGET_SOURCE_SHA):
             self.assertIn(f"`{value[:8]}`", section)
+        self.assertIn(f"`{evidence['kind']}`", section)
+        self.assertIn(f"`{evidence['workflow_path']}`", section)
 
     def test_rollback_floors_only_point_below_their_phase(self) -> None:
         for phase, floor in verifier.ROLLBACK_FLOORS.items():
